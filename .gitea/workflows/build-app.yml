@@ -12,6 +12,10 @@ on:
       - "app/**"
   workflow_dispatch:
 
+env:
+  GITEA_URL: ${{ gitea.server_url }}
+  REPO: ${{ gitea.repository }}
+
 jobs:
   build-linux:
     runs-on: ubuntu-latest
@@ -63,15 +67,39 @@ jobs:
         working-directory: ./app
         run: npx tauri build
 
-      - name: Upload Linux artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: triple-c-linux
-          path: |
-            app/src-tauri/target/release/bundle/appimage/*.AppImage
-            app/src-tauri/target/release/bundle/deb/*.deb
-            app/src-tauri/target/release/bundle/rpm/*.rpm
-          if-no-files-found: warn
+      - name: Collect artifacts
+        run: |
+          mkdir -p artifacts
+          cp app/src-tauri/target/release/bundle/appimage/*.AppImage artifacts/ 2>/dev/null || true
+          cp app/src-tauri/target/release/bundle/deb/*.deb artifacts/ 2>/dev/null || true
+          cp app/src-tauri/target/release/bundle/rpm/*.rpm artifacts/ 2>/dev/null || true
+          ls -la artifacts/
+
+      - name: Upload to Gitea release
+        if: gitea.event_name == 'push'
+        env:
+          TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          TAG="build-$(echo ${{ gitea.sha }} | cut -c1-7)"
+          # Create release
+          curl -s -X POST \
+            -H "Authorization: token ${TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"tag_name\": \"${TAG}\", \"name\": \"Linux Build ${TAG}\", \"body\": \"Automated build from commit ${{ gitea.sha }}\"}" \
+            "${GITEA_URL}/api/v1/repos/${REPO}/releases" > release.json
+          RELEASE_ID=$(cat release.json | grep -o '"id":[0-9]*' | head -1 | grep -o '[0-9]*')
+          echo "Release ID: ${RELEASE_ID}"
+          # Upload each artifact
+          for file in artifacts/*; do
+            [ -f "$file" ] || continue
+            filename=$(basename "$file")
+            echo "Uploading ${filename}..."
+            curl -s -X POST \
+              -H "Authorization: token ${TOKEN}" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary "@${file}" \
+              "${GITEA_URL}/api/v1/repos/${REPO}/releases/${RELEASE_ID}/assets?name=${filename}"
+          done
 
   build-windows:
     runs-on: windows-latest
@@ -144,11 +172,37 @@ jobs:
           set "PATH=%USERPROFILE%\.cargo\bin;C:\Program Files\nodejs;%PATH%"
           cargo tauri build
 
-      - name: Upload Windows artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: triple-c-windows
-          path: |
-            app/src-tauri/target/release/bundle/msi/*.msi
-            app/src-tauri/target/release/bundle/nsis/*.exe
-          if-no-files-found: warn
+      - name: Collect artifacts
+        run: |
+          set "PATH=%USERPROFILE%\.cargo\bin;C:\Program Files\nodejs;%PATH%"
+          mkdir artifacts
+          copy app\src-tauri\target\release\bundle\msi\*.msi artifacts\ 2>nul
+          copy app\src-tauri\target\release\bundle\nsis\*.exe artifacts\ 2>nul
+          dir artifacts\
+
+      - name: Upload to Gitea release
+        if: gitea.event_name == 'push'
+        shell: bash
+        env:
+          TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          TAG="build-win-$(echo ${{ gitea.sha }} | cut -c1-7)"
+          # Create release
+          curl -s -X POST \
+            -H "Authorization: token ${TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"tag_name\": \"${TAG}\", \"name\": \"Windows Build ${TAG}\", \"body\": \"Automated build from commit ${{ gitea.sha }}\"}" \
+            "${GITEA_URL}/api/v1/repos/${REPO}/releases" > release.json
+          RELEASE_ID=$(cat release.json | grep -o '"id":[0-9]*' | head -1 | grep -o '[0-9]*')
+          echo "Release ID: ${RELEASE_ID}"
+          # Upload each artifact
+          for file in artifacts/*; do
+            [ -f "$file" ] || continue
+            filename=$(basename "$file")
+            echo "Uploading ${filename}..."
+            curl -s -X POST \
+              -H "Authorization: token ${TOKEN}" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary "@${file}" \
+              "${GITEA_URL}/api/v1/repos/${REPO}/releases/${RELEASE_ID}/assets?name=${filename}"
+          done
