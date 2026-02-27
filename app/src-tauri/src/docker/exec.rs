@@ -72,6 +72,7 @@ impl ExecSessionManager {
                     attach_stderr: Some(true),
                     tty: Some(true),
                     cmd: Some(cmd),
+                    user: Some("claude".to_string()),
                     working_dir: Some("/workspace".to_string()),
                     ..Default::default()
                 },

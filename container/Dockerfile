@@ -88,7 +88,9 @@ RUN mkdir -p /home/claude/.claude /home/claude/.ssh
 
 WORKDIR /workspace
 
-COPY --chown=claude:claude entrypoint.sh /home/claude/entrypoint.sh
-RUN chmod +x /home/claude/entrypoint.sh
+# ── Switch back to root for entrypoint (handles UID/GID remapping) ─────────
+USER root
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
 
-ENTRYPOINT ["/home/claude/entrypoint.sh"]
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

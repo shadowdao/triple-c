@@ -49,6 +49,21 @@ pub async fn create_container(
 
     let mut env_vars: Vec<String> = Vec::new();
 
+    // Pass host UID/GID so the entrypoint can remap the container user
+    #[cfg(unix)]
+    {
+        let uid = std::process::Command::new("id").arg("-u").output();
+        let gid = std::process::Command::new("id").arg("-g").output();
+        if let Ok(out) = uid {
+            let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            env_vars.push(format!("HOST_UID={}", val));
+        }
+        if let Ok(out) = gid {
+            let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            env_vars.push(format!("HOST_GID={}", val));
+        }
+    }
+
     if let Some(key) = api_key {
         env_vars.push(format!("ANTHROPIC_API_KEY={}", key));
     }
@@ -82,10 +97,10 @@ pub async fn create_container(
         },
     ];
 
-    // SSH keys mount (read-only)
+    // SSH keys mount (read-only staging; entrypoint copies to ~/.ssh with correct perms)
     if let Some(ref ssh_path) = project.ssh_key_path {
         mounts.push(Mount {
-            target: Some("/home/claude/.ssh".to_string()),
+            target: Some("/tmp/.host-ssh".to_string()),
             source: Some(ssh_path.clone()),
             typ: Some(MountTypeEnum::BIND),
             read_only: Some(true),
