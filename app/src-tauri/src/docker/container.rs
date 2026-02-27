@@ -288,6 +288,27 @@ pub async fn remove_container(container_id: &str) -> Result<(), String> {
         .map_err(|e| format!("Failed to remove container: {}", e))
 }
 
+/// Check whether an existing container has docker socket mounted.
+pub async fn container_has_docker_socket(container_id: &str) -> Result<bool, String> {
+    let docker = get_docker()?;
+    let info = docker
+        .inspect_container(container_id, None)
+        .await
+        .map_err(|e| format!("Failed to inspect container: {}", e))?;
+
+    let has_socket = info
+        .host_config
+        .and_then(|hc| hc.mounts)
+        .map(|mounts| {
+            mounts.iter().any(|m| {
+                m.target.as_deref() == Some("/var/run/docker.sock")
+            })
+        })
+        .unwrap_or(false);
+
+    Ok(has_socket)
+}
+
 pub async fn get_container_info(project: &Project) -> Result<Option<ContainerInfo>, String> {
     if let Some(ref container_id) = project.container_id {
         let docker = get_docker()?;
