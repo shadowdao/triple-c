@@ -182,27 +182,17 @@ jobs:
 
       - name: Upload to Gitea release
         if: gitea.event_name == 'push'
-        shell: bash
         env:
           TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          COMMIT_SHA: ${{ gitea.sha }}
         run: |
-          TAG="build-win-$(echo ${{ gitea.sha }} | cut -c1-7)"
-          # Create release
-          curl -s -X POST \
-            -H "Authorization: token ${TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d "{\"tag_name\": \"${TAG}\", \"name\": \"Windows Build ${TAG}\", \"body\": \"Automated build from commit ${{ gitea.sha }}\"}" \
-            "${GITEA_URL}/api/v1/repos/${REPO}/releases" > release.json
-          RELEASE_ID=$(cat release.json | grep -o '"id":[0-9]*' | head -1 | grep -o '[0-9]*')
-          echo "Release ID: ${RELEASE_ID}"
-          # Upload each artifact
-          for file in artifacts/*; do
-            [ -f "$file" ] || continue
-            filename=$(basename "$file")
-            echo "Uploading ${filename}..."
-            curl -s -X POST \
-              -H "Authorization: token ${TOKEN}" \
-              -H "Content-Type: application/octet-stream" \
-              --data-binary "@${file}" \
-              "${GITEA_URL}/api/v1/repos/${REPO}/releases/${RELEASE_ID}/assets?name=${filename}"
-          done
+          set "TAG=build-win-%COMMIT_SHA:~0,7%"
+          echo Creating release %TAG%...
+          curl -s -X POST -H "Authorization: token %TOKEN%" -H "Content-Type: application/json" -d "{\"tag_name\": \"%TAG%\", \"name\": \"Windows Build %TAG%\", \"body\": \"Automated build from commit %COMMIT_SHA%\"}" "%GITEA_URL%/api/v1/repos/%REPO%/releases" > release.json
+          for /f "tokens=2 delims=:," %%a in ('findstr /c:"\"id\"" release.json') do set "RELEASE_ID=%%a" & goto :found
+          :found
+          echo Release ID: %RELEASE_ID%
+          for %%f in (artifacts\*) do (
+            echo Uploading %%~nxf...
+            curl -s -X POST -H "Authorization: token %TOKEN%" -H "Content-Type: application/octet-stream" --data-binary "@%%f" "%GITEA_URL%/api/v1/repos/%REPO%/releases/%RELEASE_ID%/assets?name=%%~nxf"
+          )
