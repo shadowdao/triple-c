@@ -288,25 +288,82 @@ pub async fn remove_container(container_id: &str) -> Result<(), String> {
         .map_err(|e| format!("Failed to remove container: {}", e))
 }
 
-/// Check whether an existing container has docker socket mounted.
-pub async fn container_has_docker_socket(container_id: &str) -> Result<bool, String> {
+/// Check whether the existing container's configuration still matches the
+/// current project settings.  Returns `true` when the container must be
+/// recreated (mounts or env vars differ).
+pub async fn container_needs_recreation(container_id: &str, project: &Project) -> Result<bool, String> {
     let docker = get_docker()?;
     let info = docker
         .inspect_container(container_id, None)
         .await
         .map_err(|e| format!("Failed to inspect container: {}", e))?;
 
-    let has_socket = info
+    let mounts = info
         .host_config
-        .and_then(|hc| hc.mounts)
-        .map(|mounts| {
-            mounts.iter().any(|m| {
-                m.target.as_deref() == Some("/var/run/docker.sock")
-            })
+        .as_ref()
+        .and_then(|hc| hc.mounts.as_ref());
+
+    // ── Docker socket mount ──────────────────────────────────────────────
+    let has_socket = mounts
+        .map(|m| {
+            m.iter()
+                .any(|mount| mount.target.as_deref() == Some("/var/run/docker.sock"))
         })
         .unwrap_or(false);
+    if has_socket != project.allow_docker_access {
+        log::info!("Docker socket mismatch (container={}, project={})", has_socket, project.allow_docker_access);
+        return Ok(true);
+    }
 
-    Ok(has_socket)
+    // ── SSH key path mount ───────────────────────────────────────────────
+    let ssh_mount_source = mounts
+        .and_then(|m| {
+            m.iter()
+                .find(|mount| mount.target.as_deref() == Some("/tmp/.host-ssh"))
+        })
+        .and_then(|mount| mount.source.as_deref());
+    let project_ssh = project.ssh_key_path.as_deref();
+    if ssh_mount_source != project_ssh {
+        log::info!(
+            "SSH key path mismatch (container={:?}, project={:?})",
+            ssh_mount_source,
+            project_ssh
+        );
+        return Ok(true);
+    }
+
+    // ── Git environment variables ────────────────────────────────────────
+    let env_vars = info
+        .config
+        .as_ref()
+        .and_then(|c| c.env.as_ref());
+
+    let get_env = |name: &str| -> Option<String> {
+        env_vars.and_then(|vars| {
+            vars.iter()
+                .find(|v| v.starts_with(&format!("{}=", name)))
+                .map(|v| v[name.len() + 1..].to_string())
+        })
+    };
+
+    let container_git_name = get_env("GIT_USER_NAME");
+    let container_git_email = get_env("GIT_USER_EMAIL");
+    let container_git_token = get_env("GIT_TOKEN");
+
+    if container_git_name.as_deref() != project.git_user_name.as_deref() {
+        log::info!("GIT_USER_NAME mismatch (container={:?}, project={:?})", container_git_name, project.git_user_name);
+        return Ok(true);
+    }
+    if container_git_email.as_deref() != project.git_user_email.as_deref() {
+        log::info!("GIT_USER_EMAIL mismatch (container={:?}, project={:?})", container_git_email, project.git_user_email);
+        return Ok(true);
+    }
+    if container_git_token.as_deref() != project.git_token.as_deref() {
+        log::info!("GIT_TOKEN mismatch");
+        return Ok(true);
+    }
+
+    Ok(false)
 }
 
 pub async fn get_container_info(project: &Project) -> Result<Option<ContainerInfo>, String> {

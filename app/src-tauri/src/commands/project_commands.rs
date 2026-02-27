@@ -102,20 +102,16 @@ pub async fn start_project_container(
 
     // Check for existing container
     let container_id = if let Some(existing_id) = docker::find_existing_container(&project).await? {
-        // Check if docker socket mount matches the current project setting.
-        // If the user toggled "Allow container spawning" after the container was
-        // created, we need to recreate the container for the mount change to take
-        // effect.
-        let has_socket = docker::container_has_docker_socket(&existing_id).await.unwrap_or(false);
-        if has_socket != project.allow_docker_access {
-            log::info!(
-                "Docker socket mismatch (container has_socket={}, project wants={}), recreating container",
-                has_socket, project.allow_docker_access
-            );
-            // Safe to remove and recreate: the claude config named volume is
-            // keyed by project ID (not container ID) so it persists across
-            // container recreation. Bind mounts (workspace, SSH, AWS) are
-            // host paths and are unaffected.
+        // Compare the running container's configuration (mounts, env vars)
+        // against the current project settings. If anything changed (SSH key
+        // path, git config, docker socket, etc.) we recreate the container.
+        // Safe to recreate: the claude config named volume is keyed by
+        // project ID (not container ID) so it persists across recreation.
+        let needs_recreation = docker::container_needs_recreation(&existing_id, &project)
+            .await
+            .unwrap_or(false);
+        if needs_recreation {
+            log::info!("Container config changed, recreating container for project {}", project.id);
             let _ = docker::stop_container(&existing_id).await;
             docker::remove_container(&existing_id).await?;
             let new_id = docker::create_container(
