@@ -74,22 +74,43 @@ jobs:
 
   build-windows:
     runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        run: |
+          if (!(Get-Command rustup -ErrorAction SilentlyContinue)) {
+            Invoke-WebRequest -Uri https://win.rustup.rs/x86_64 -OutFile rustup-init.exe
+            .\rustup-init.exe -y --default-toolchain stable
+            Remove-Item rustup-init.exe
+          } else {
+            rustup update stable
+            rustup default stable
+          }
+          # Add cargo to PATH for subsequent steps
+          echo "$env:USERPROFILE\.cargo\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: "./app/src-tauri -> target"
+      - name: Verify Rust
+        run: |
+          rustc --version
+          cargo --version
 
       - name: Install Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
+        run: |
+          if (!(Get-Command node -ErrorAction SilentlyContinue) -or !((node --version) -match 'v22')) {
+            # Download and install Node.js 22 LTS
+            Invoke-WebRequest -Uri "https://nodejs.org/dist/v22.14.0/node-v22.14.0-x64.msi" -OutFile node-install.msi
+            Start-Process msiexec.exe -ArgumentList '/i', 'node-install.msi', '/quiet', '/norestart' -Wait
+            Remove-Item node-install.msi
+            # Refresh PATH
+            $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
+          }
+          node --version
+          npm --version
 
       - name: Install frontend dependencies
         working-directory: ./app
@@ -97,7 +118,8 @@ jobs:
 
       - name: Install Tauri CLI
         working-directory: ./app
-        run: npx tauri --version || npm install @tauri-apps/cli
+        run: |
+          try { npx tauri --version } catch { npm install @tauri-apps/cli }
 
       - name: Build Tauri app
         working-directory: ./app
