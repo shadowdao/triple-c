@@ -7,6 +7,11 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import "@xterm/xterm/css/xterm.css";
 import { useTerminal } from "../../hooks/useTerminal";
 
+/** Strip ANSI escape sequences from a string. */
+function stripAnsi(s: string): string {
+  return s.replace(/\x1b\[[0-9;]*[A-Za-z]|\x1b\][^\x07]*\x07/g, "");
+}
+
 interface Props {
   sessionId: string;
   active: boolean;
@@ -52,10 +57,13 @@ export default function TerminalView({ sessionId, active }: Props) {
     const fitAddon = new FitAddon();
     term.loadAddon(fitAddon);
 
-    // Web links addon — opens URLs in host browser via Tauri
+    // Web links addon — opens URLs in host browser via Tauri, with a permissive regex
+    // that matches URLs even if they lack trailing path segments (the default regex
+    // misses OAuth URLs that end mid-line).
+    const urlRegex = /https?:\/\/[^\s'"\x07]+/;
     const webLinksAddon = new WebLinksAddon((_event, uri) => {
       openUrl(uri).catch((e) => console.error("Failed to open URL:", e));
-    });
+    }, { urlRegex });
     term.loadAddon(webLinksAddon);
 
     term.open(containerRef.current);
@@ -80,12 +88,49 @@ export default function TerminalView({ sessionId, active }: Props) {
       sendInput(sessionId, data);
     });
 
+    // ── URL accumulator ──────────────────────────────────────────────
+    // Claude Code login emits a long OAuth URL that gets split across
+    // hard newlines (\n / \r\n).  The WebLinksAddon only joins
+    // soft-wrapped lines (the `isWrapped` flag), so the URL match is
+    // truncated and the link fails when clicked.
+    //
+    // Fix: buffer recent output, strip ANSI codes, and after a short
+    // debounce check for a URL that spans multiple lines.  When found,
+    // write a single clean clickable copy to the terminal.
+    let outputBuffer = "";
+    let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const flushUrlBuffer = () => {
+      const plain = stripAnsi(outputBuffer);
+      // Reassemble: strip hard newlines and carriage returns to join
+      // fragments that were split across terminal lines.
+      const joined = plain.replace(/[\r\n]+/g, "");
+      // Look for a long OAuth/auth URL (Claude login URLs contain
+      // "oauth" or "console.anthropic.com" or "/authorize").
+      const match = joined.match(/https?:\/\/[^\s'"\x07]{80,}/);
+      if (match) {
+        const url = match[0];
+        term.write("\r\n\x1b[36m🔗 Clickable login URL:\x1b[0m\r\n");
+        term.write(`\x1b[4;34m${url}\x1b[0m\r\n`);
+      }
+      outputBuffer = "";
+    };
+
     // Handle backend output -> terminal
     let unlistenOutput: (() => void) | null = null;
     let unlistenExit: (() => void) | null = null;
 
     onOutput(sessionId, (data) => {
       term.write(data);
+
+      // Accumulate for URL detection
+      outputBuffer += data;
+      // Cap buffer size to avoid memory growth
+      if (outputBuffer.length > 8192) {
+        outputBuffer = outputBuffer.slice(-4096);
+      }
+      if (debounceTimer) clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(flushUrlBuffer, 150);
     }).then((unlisten) => {
       unlistenOutput = unlisten;
     });
@@ -104,6 +149,7 @@ export default function TerminalView({ sessionId, active }: Props) {
     resizeObserver.observe(containerRef.current);
 
     return () => {
+      if (debounceTimer) clearTimeout(debounceTimer);
       inputDisposable.dispose();
       unlistenOutput?.();
       unlistenExit?.();

@@ -69,6 +69,15 @@ pub async fn start_project_container(
             // Auth state persists in the .claude config volume.
             None
         }
+        AuthMode::Bedrock => {
+            // Bedrock mode: no Anthropic API key needed, uses AWS credentials.
+            let bedrock = project.bedrock_config.as_ref()
+                .ok_or_else(|| "Bedrock auth mode selected but no Bedrock configuration found.".to_string())?;
+            if bedrock.aws_region.is_empty() {
+                return Err("AWS region is required for Bedrock auth mode.".to_string());
+            }
+            None
+        }
     };
 
     // Update status to starting

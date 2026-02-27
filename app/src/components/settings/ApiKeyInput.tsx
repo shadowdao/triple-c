@@ -25,7 +25,7 @@ export default function ApiKeyInput() {
     <div>
       <label className="block text-sm font-medium mb-1">Authentication</label>
       <p className="text-xs text-[var(--text-secondary)] mb-3">
-        Each project can use either <strong>claude login</strong> (OAuth, run inside the terminal) or an <strong>API key</strong>. Set auth mode per-project.
+        Each project can use <strong>claude login</strong> (OAuth, run inside the terminal), an <strong>API key</strong>, or <strong>AWS Bedrock</strong>. Set auth mode per-project.
       </p>
 
       <label className="block text-xs text-[var(--text-secondary)] mb-1 mt-3">

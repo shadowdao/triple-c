@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import type { Project, AuthMode } from "../../lib/types";
+import type { Project, AuthMode, BedrockConfig, BedrockAuthMethod } from "../../lib/types";
 import { useProjects } from "../../hooks/useProjects";
 import { useTerminal } from "../../hooks/useTerminal";
 import { useAppState } from "../../store/appState";
@@ -51,12 +51,35 @@ export default function ProjectCard({ project }: Props) {
     }
   };
 
+  const defaultBedrockConfig: BedrockConfig = {
+    auth_method: "static_credentials",
+    aws_region: "us-east-1",
+    aws_access_key_id: null,
+    aws_secret_access_key: null,
+    aws_session_token: null,
+    aws_profile: null,
+    aws_bearer_token: null,
+    model_id: null,
+    disable_prompt_caching: false,
+  };
+
   const handleAuthModeChange = async (mode: AuthMode) => {
     try {
-      await update({ ...project, auth_mode: mode });
+      const updates: Partial<Project> = { auth_mode: mode };
+      if (mode === "bedrock" && !project.bedrock_config) {
+        updates.bedrock_config = defaultBedrockConfig;
+      }
+      await update({ ...project, ...updates });
     } catch (e) {
       setError(String(e));
     }
+  };
+
+  const updateBedrockConfig = async (patch: Partial<BedrockConfig>) => {
+    try {
+      const current = project.bedrock_config ?? defaultBedrockConfig;
+      await update({ ...project, bedrock_config: { ...current, ...patch } });
+    } catch {}
   };
 
   const handleBrowseSSH = async () => {
@@ -122,16 +145,24 @@ export default function ProjectCard({ project }: Props) {
             >
               API key
             </button>
+            <button
+              onClick={(e) => { e.stopPropagation(); handleAuthModeChange("bedrock"); }}
+              disabled={!isStopped}
+              className={`px-2 py-0.5 rounded transition-colors ${
+                project.auth_mode === "bedrock"
+                  ? "bg-[var(--accent)] text-white"
+                  : "text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-primary)]"
+              } disabled:opacity-50`}
+            >
+              Bedrock
+            </button>
           </div>
 
           {/* Action buttons */}
           <div className="flex items-center gap-1">
             {isStopped ? (
-              <ActionButton onClick={handleStart} disabled={loading} label="Start" />
-            ) : project.status === "running" ? (
               <>
-                <ActionButton onClick={handleStop} disabled={loading} label="Stop" />
-                <ActionButton onClick={handleOpenTerminal} disabled={loading} label="Terminal" accent />
+                <ActionButton onClick={handleStart} disabled={loading} label="Start" />
                 <ActionButton
                   onClick={async () => {
                     setLoading(true);
@@ -141,6 +172,11 @@ export default function ProjectCard({ project }: Props) {
                   disabled={loading}
                   label="Reset"
                 />
+              </>
+            ) : project.status === "running" ? (
+              <>
+                <ActionButton onClick={handleStop} disabled={loading} label="Stop" />
+                <ActionButton onClick={handleOpenTerminal} disabled={loading} label="Terminal" accent />
               </>
             ) : (
               <span className="text-xs text-[var(--text-secondary)]">
@@ -250,6 +286,124 @@ export default function ProjectCard({ project }: Props) {
                   {project.allow_docker_access ? "ON" : "OFF"}
                 </button>
               </div>
+
+              {/* Bedrock config */}
+              {project.auth_mode === "bedrock" && (() => {
+                const bc = project.bedrock_config ?? defaultBedrockConfig;
+                const inputCls = "w-full px-2 py-1 bg-[var(--bg-primary)] border border-[var(--border-color)] rounded text-xs text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)] disabled:opacity-50";
+                return (
+                  <div className="space-y-2 pt-1 border-t border-[var(--border-color)]">
+                    <label className="block text-xs font-medium text-[var(--text-primary)]">AWS Bedrock</label>
+
+                    {/* Sub-method selector */}
+                    <div className="flex items-center gap-1 text-xs">
+                      <span className="text-[var(--text-secondary)] mr-1">Method:</span>
+                      {(["static_credentials", "profile", "bearer_token"] as BedrockAuthMethod[]).map((m) => (
+                        <button
+                          key={m}
+                          onClick={() => updateBedrockConfig({ auth_method: m })}
+                          disabled={!isStopped}
+                          className={`px-2 py-0.5 rounded transition-colors ${
+                            bc.auth_method === m
+                              ? "bg-[var(--accent)] text-white"
+                              : "text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-primary)]"
+                          } disabled:opacity-50`}
+                        >
+                          {m === "static_credentials" ? "Keys" : m === "profile" ? "Profile" : "Token"}
+                        </button>
+                      ))}
+                    </div>
+
+                    {/* AWS Region (always shown) */}
+                    <div>
+                      <label className="block text-xs text-[var(--text-secondary)] mb-0.5">AWS Region</label>
+                      <input
+                        value={bc.aws_region}
+                        onChange={(e) => updateBedrockConfig({ aws_region: e.target.value })}
+                        placeholder="us-east-1"
+                        disabled={!isStopped}
+                        className={inputCls}
+                      />
+                    </div>
+
+                    {/* Static credentials fields */}
+                    {bc.auth_method === "static_credentials" && (
+                      <>
+                        <div>
+                          <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Access Key ID</label>
+                          <input
+                            value={bc.aws_access_key_id ?? ""}
+                            onChange={(e) => updateBedrockConfig({ aws_access_key_id: e.target.value || null })}
+                            placeholder="AKIA..."
+                            disabled={!isStopped}
+                            className={inputCls}
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Secret Access Key</label>
+                          <input
+                            type="password"
+                            value={bc.aws_secret_access_key ?? ""}
+                            onChange={(e) => updateBedrockConfig({ aws_secret_access_key: e.target.value || null })}
+                            disabled={!isStopped}
+                            className={inputCls}
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Session Token (optional)</label>
+                          <input
+                            type="password"
+                            value={bc.aws_session_token ?? ""}
+                            onChange={(e) => updateBedrockConfig({ aws_session_token: e.target.value || null })}
+                            disabled={!isStopped}
+                            className={inputCls}
+                          />
+                        </div>
+                      </>
+                    )}
+
+                    {/* Profile field */}
+                    {bc.auth_method === "profile" && (
+                      <div>
+                        <label className="block text-xs text-[var(--text-secondary)] mb-0.5">AWS Profile</label>
+                        <input
+                          value={bc.aws_profile ?? ""}
+                          onChange={(e) => updateBedrockConfig({ aws_profile: e.target.value || null })}
+                          placeholder="default"
+                          disabled={!isStopped}
+                          className={inputCls}
+                        />
+                      </div>
+                    )}
+
+                    {/* Bearer token field */}
+                    {bc.auth_method === "bearer_token" && (
+                      <div>
+                        <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Bearer Token</label>
+                        <input
+                          type="password"
+                          value={bc.aws_bearer_token ?? ""}
+                          onChange={(e) => updateBedrockConfig({ aws_bearer_token: e.target.value || null })}
+                          disabled={!isStopped}
+                          className={inputCls}
+                        />
+                      </div>
+                    )}
+
+                    {/* Model override */}
+                    <div>
+                      <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Model ID (optional)</label>
+                      <input
+                        value={bc.model_id ?? ""}
+                        onChange={(e) => updateBedrockConfig({ model_id: e.target.value || null })}
+                        placeholder="anthropic.claude-sonnet-4-20250514-v1:0"
+                        disabled={!isStopped}
+                        className={inputCls}
+                      />
+                    </div>
+                  </div>
+                );
+              })()}
             </div>
           )}
         </div>

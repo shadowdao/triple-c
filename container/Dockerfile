@@ -60,6 +60,10 @@ RUN install -m 0755 -d /etc/apt/keyrings \
     && apt-get update && apt-get install -y docker-ce-cli \
     && rm -rf /var/lib/apt/lists/*
 
+# ── AWS CLI v2 ───────────────────────────────────────────────────────────────
+RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" \
+    && unzip awscliv2.zip && ./aws/install && rm -rf awscliv2.zip aws
+
 # ── Non-root user with passwordless sudo ─────────────────────────────────────
 RUN useradd -m -s /bin/bash claude \
     && echo "claude ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/claude \

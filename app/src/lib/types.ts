@@ -5,6 +5,7 @@ export interface Project {
   container_id: string | null;
   status: ProjectStatus;
   auth_mode: AuthMode;
+  bedrock_config: BedrockConfig | null;
   allow_docker_access: boolean;
   ssh_key_path: string | null;
   git_token: string | null;
@@ -21,7 +22,21 @@ export type ProjectStatus =
   | "stopping"
   | "error";
 
-export type AuthMode = "login" | "api_key";
+export type AuthMode = "login" | "api_key" | "bedrock";
+
+export type BedrockAuthMethod = "static_credentials" | "profile" | "bearer_token";
+
+export interface BedrockConfig {
+  auth_method: BedrockAuthMethod;
+  aws_region: string;
+  aws_access_key_id: string | null;
+  aws_secret_access_key: string | null;
+  aws_session_token: string | null;
+  aws_profile: string | null;
+  aws_bearer_token: string | null;
+  model_id: string | null;
+  disable_prompt_caching: boolean;
+}
 
 export interface ContainerInfo {
   container_id: string;

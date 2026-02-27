@@ -6,7 +6,7 @@ use bollard::models::{ContainerSummary, HostConfig, Mount, MountTypeEnum};
 use std::collections::HashMap;
 
 use super::client::get_docker;
-use crate::models::{container_config, ContainerInfo, Project};
+use crate::models::{container_config, AuthMode, BedrockAuthMethod, ContainerInfo, Project};
 
 pub async fn find_existing_container(project: &Project) -> Result<Option<String>, String> {
     let docker = get_docker()?;
@@ -78,6 +78,46 @@ pub async fn create_container(
         env_vars.push(format!("GIT_USER_EMAIL={}", email));
     }
 
+    // Bedrock configuration
+    if project.auth_mode == AuthMode::Bedrock {
+        if let Some(ref bedrock) = project.bedrock_config {
+            env_vars.push("CLAUDE_CODE_USE_BEDROCK=1".to_string());
+            env_vars.push(format!("AWS_REGION={}", bedrock.aws_region));
+
+            match bedrock.auth_method {
+                BedrockAuthMethod::StaticCredentials => {
+                    if let Some(ref key_id) = bedrock.aws_access_key_id {
+                        env_vars.push(format!("AWS_ACCESS_KEY_ID={}", key_id));
+                    }
+                    if let Some(ref secret) = bedrock.aws_secret_access_key {
+                        env_vars.push(format!("AWS_SECRET_ACCESS_KEY={}", secret));
+                    }
+                    if let Some(ref token) = bedrock.aws_session_token {
+                        env_vars.push(format!("AWS_SESSION_TOKEN={}", token));
+                    }
+                }
+                BedrockAuthMethod::Profile => {
+                    if let Some(ref profile) = bedrock.aws_profile {
+                        env_vars.push(format!("AWS_PROFILE={}", profile));
+                    }
+                }
+                BedrockAuthMethod::BearerToken => {
+                    if let Some(ref token) = bedrock.aws_bearer_token {
+                        env_vars.push(format!("AWS_BEARER_TOKEN_BEDROCK={}", token));
+                    }
+                }
+            }
+
+            if let Some(ref model) = bedrock.model_id {
+                env_vars.push(format!("ANTHROPIC_MODEL={}", model));
+            }
+
+            if bedrock.disable_prompt_caching {
+                env_vars.push("DISABLE_PROMPT_CACHING=1".to_string());
+            }
+        }
+    }
+
     let mut mounts = vec![
         // Project directory -> /workspace
         Mount {
@@ -106,6 +146,26 @@ pub async fn create_container(
             read_only: Some(true),
             ..Default::default()
         });
+    }
+
+    // AWS config mount (read-only, for profile-based auth)
+    if project.auth_mode == AuthMode::Bedrock {
+        if let Some(ref bedrock) = project.bedrock_config {
+            if bedrock.auth_method == BedrockAuthMethod::Profile {
+                if let Some(home) = dirs::home_dir() {
+                    let aws_dir = home.join(".aws");
+                    if aws_dir.exists() {
+                        mounts.push(Mount {
+                            target: Some("/home/claude/.aws".to_string()),
+                            source: Some(aws_dir.to_string_lossy().to_string()),
+                            typ: Some(MountTypeEnum::BIND),
+                            read_only: Some(true),
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+        }
     }
 
     // Docker socket (only if allowed)
