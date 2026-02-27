@@ -113,7 +113,7 @@ jobs:
       - name: Install Tauri CLI via cargo
         run: |
           set "PATH=%USERPROFILE%\.cargo\bin;C:\Program Files\nodejs;%PATH%"
-          cargo install tauri-cli --version ^2
+          cargo install tauri-cli --version "^2"
 
       - name: Install frontend dependencies
         working-directory: ./app
