@@ -212,9 +212,17 @@ pub async fn create_container(
 
     // Docker socket (only if allowed)
     if project.allow_docker_access {
+        // On Windows, the named pipe (//./pipe/docker_engine) cannot be
+        // bind-mounted into a Linux container. Docker Desktop exposes the
+        // daemon socket as /var/run/docker.sock for container mounts.
+        let mount_source = if docker_socket_path == "//./pipe/docker_engine" {
+            "/var/run/docker.sock".to_string()
+        } else {
+            docker_socket_path.to_string()
+        };
         mounts.push(Mount {
             target: Some("/var/run/docker.sock".to_string()),
-            source: Some(docker_socket_path.to_string()),
+            source: Some(mount_source),
             typ: Some(MountTypeEnum::BIND),
             read_only: Some(false),
             ..Default::default()
