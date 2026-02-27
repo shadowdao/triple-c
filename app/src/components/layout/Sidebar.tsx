@@ -6,7 +6,7 @@ export default function Sidebar() {
   const { sidebarView, setSidebarView } = useAppState();
 
   return (
-    <div className="flex flex-col h-full w-64 bg-[var(--bg-secondary)] border border-[var(--border-color)] rounded-lg overflow-hidden">
+    <div className="flex flex-col h-full w-[25%] min-w-56 max-w-80 bg-[var(--bg-secondary)] border border-[var(--border-color)] rounded-lg overflow-hidden">
       {/* Nav tabs */}
       <div className="flex border-b border-[var(--border-color)]">
         <button
@@ -32,7 +32,7 @@ export default function Sidebar() {
       </div>
 
       {/* Content */}
-      <div className="flex-1 overflow-y-auto">
+      <div className="flex-1 overflow-y-auto p-1">
         {sidebarView === "projects" ? <ProjectList /> : <SettingsPanel />}
       </div>
     </div>

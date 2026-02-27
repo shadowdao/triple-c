@@ -12,13 +12,9 @@
   --success: #3fb950;
   --warning: #d29922;
   --error: #f85149;
+  color-scheme: dark;
 }
 
-* {
-  margin: 0;
-  padding: 0;
-  box-sizing: border-box;
-}
 
 html, body, #root {
   height: 100%;

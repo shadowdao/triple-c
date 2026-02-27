@@ -170,7 +170,7 @@ export default function TerminalView({ sessionId, active }: Props) {
     <div
       ref={containerRef}
       className={`w-full h-full ${active ? "" : "hidden"}`}
-      style={{ padding: "4px" }}
+      style={{ padding: "8px" }}
     />
   );
 }

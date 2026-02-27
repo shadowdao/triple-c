@@ -6,10 +6,10 @@ export default function TopBar() {
 
   return (
     <div className="flex items-center h-10 bg-[var(--bg-secondary)] border border-[var(--border-color)] rounded-lg overflow-hidden">
-      <div className="flex-1 overflow-x-auto">
+      <div className="flex-1 overflow-x-auto pl-2">
         <TerminalTabs />
       </div>
-      <div className="flex items-center gap-2 px-3 text-xs text-[var(--text-secondary)]">
+      <div className="flex items-center gap-2 px-4 flex-shrink-0 text-xs text-[var(--text-secondary)]">
         <StatusDot ok={dockerAvailable === true} label="Docker" />
         <StatusDot ok={imageExists === true} label="Image" />
       </div>

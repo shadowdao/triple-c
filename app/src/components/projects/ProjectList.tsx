@@ -8,7 +8,7 @@ export default function ProjectList() {
   const [showAdd, setShowAdd] = useState(false);
 
   return (
-    <div className="p-2">
+    <div className="p-3">
       <div className="flex items-center justify-between px-2 py-1 mb-2">
         <span className="text-xs font-semibold uppercase text-[var(--text-secondary)]">
           Projects

@@ -83,7 +83,7 @@ export default function AwsSettings() {
           <select
             value={globalAws.aws_profile ?? ""}
             onChange={(e) => handleChange("aws_profile", e.target.value)}
-            className="w-full px-2 py-1.5 text-xs bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:outline-none focus:border-[var(--accent)]"
+            className="w-full px-2 py-1.5 text-xs bg-[var(--bg-primary)] text-[var(--text-primary)] border border-[var(--border-color)] rounded focus:outline-none focus:border-[var(--accent)]"
           >
             <option value="">None (use default)</option>
             {profiles.map((p) => (

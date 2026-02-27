@@ -159,7 +159,7 @@ export default function ProjectCard({ project }: Props) {
           </div>
 
           {/* Action buttons */}
-          <div className="flex items-center gap-1">
+          <div className="flex items-center gap-1 flex-wrap">
             {isStopped ? (
               <>
                 <ActionButton onClick={handleStart} disabled={loading} label="Start" />
