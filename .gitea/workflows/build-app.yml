@@ -124,8 +124,16 @@ jobs:
           if exist package-lock.json del package-lock.json
           npm install
 
+      - name: Build frontend
+        working-directory: ./app
+        run: |
+          set "PATH=%USERPROFILE%\.cargo\bin;C:\Program Files\nodejs;%PATH%"
+          npm run build
+
       - name: Build Tauri app
         working-directory: ./app
+        env:
+          TAURI_CONFIG: "{\"build\":{\"beforeBuildCommand\":\"\"}}"
         run: |
           set "PATH=%USERPROFILE%\.cargo\bin;C:\Program Files\nodejs;%PATH%"
           cargo tauri build
