@@ -9,6 +9,7 @@ use super::client::get_docker;
 
 pub struct ExecSession {
     pub exec_id: String,
+    pub container_id: String,
     pub input_tx: mpsc::UnboundedSender<Vec<u8>>,
     shutdown_tx: mpsc::Sender<()>,
 }
@@ -140,6 +141,7 @@ impl ExecSessionManager {
 
         let session = ExecSession {
             exec_id,
+            container_id: container_id.to_string(),
             input_tx,
             shutdown_tx,
         };
@@ -172,6 +174,20 @@ impl ExecSessionManager {
         let mut sessions = self.sessions.lock().await;
         if let Some(session) = sessions.remove(session_id) {
             session.shutdown();
+        }
+    }
+
+    pub async fn close_sessions_for_container(&self, container_id: &str) {
+        let mut sessions = self.sessions.lock().await;
+        let ids_to_close: Vec<String> = sessions
+            .iter()
+            .filter(|(_, s)| s.container_id == container_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids_to_close {
+            if let Some(session) = sessions.remove(&id) {
+                session.shutdown();
+            }
         }
     }
 

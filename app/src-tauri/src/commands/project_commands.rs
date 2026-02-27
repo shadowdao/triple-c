@@ -28,13 +28,11 @@ pub async fn remove_project(
     // Stop and remove container if it exists
     if let Some(project) = state.projects_store.get(&project_id) {
         if let Some(ref container_id) = project.container_id {
+            state.exec_manager.close_sessions_for_container(container_id).await;
             let _ = docker::stop_container(container_id).await;
             let _ = docker::remove_container(container_id).await;
         }
     }
-
-    // Close any exec sessions
-    state.exec_manager.close_all_sessions().await;
 
     state.projects_store.remove(&project_id)
 }
@@ -166,7 +164,7 @@ pub async fn stop_project_container(
         state.projects_store.update_status(&project_id, ProjectStatus::Stopping)?;
 
         // Close exec sessions for this project
-        state.exec_manager.close_all_sessions().await;
+        state.exec_manager.close_sessions_for_container(container_id).await;
 
         docker::stop_container(container_id).await?;
         state.projects_store.update_status(&project_id, ProjectStatus::Stopped)?;
@@ -187,7 +185,7 @@ pub async fn rebuild_project_container(
 
     // Remove existing container
     if let Some(ref container_id) = project.container_id {
-        state.exec_manager.close_all_sessions().await;
+        state.exec_manager.close_sessions_for_container(container_id).await;
         let _ = docker::stop_container(container_id).await;
         docker::remove_container(container_id).await?;
         state.projects_store.set_container_id(&project_id, None)?;
