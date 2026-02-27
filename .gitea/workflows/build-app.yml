@@ -110,17 +110,22 @@ jobs:
           node --version
           npm --version
 
+      - name: Install Tauri CLI via cargo
+        run: |
+          set "PATH=%USERPROFILE%\.cargo\bin;C:\Program Files\nodejs;%PATH%"
+          cargo install tauri-cli --version ^2
+
       - name: Install frontend dependencies
         working-directory: ./app
         run: |
           set "PATH=%USERPROFILE%\.cargo\bin;C:\Program Files\nodejs;%PATH%"
-          npm ci
+          npm install
 
       - name: Build Tauri app
         working-directory: ./app
         run: |
           set "PATH=%USERPROFILE%\.cargo\bin;C:\Program Files\nodejs;%PATH%"
-          npx tauri build
+          cargo tauri build
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
