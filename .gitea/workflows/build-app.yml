@@ -116,6 +116,12 @@ jobs:
           set "PATH=%USERPROFILE%\.cargo\bin;C:\Program Files\nodejs;%PATH%"
           cargo install tauri-cli --version "^2"
 
+      - name: Fix npm platform detection
+        run: |
+          set "PATH=%USERPROFILE%\.cargo\bin;C:\Program Files\nodejs;%PATH%"
+          npm config set os win32
+          npm config list
+
       - name: Install frontend dependencies
         working-directory: ./app
         run: |
@@ -123,7 +129,6 @@ jobs:
           if exist node_modules rmdir /s /q node_modules
           if exist package-lock.json del package-lock.json
           npm install
-          npm install @rollup/rollup-win32-x64-msvc @esbuild/win32-x64 --no-save
 
       - name: Build frontend
         working-directory: ./app
