@@ -123,6 +123,7 @@ jobs:
           if exist node_modules rmdir /s /q node_modules
           if exist package-lock.json del package-lock.json
           npm install
+          npm install @rollup/rollup-win32-x64-msvc @esbuild/win32-x64 --no-save
 
       - name: Build frontend
         working-directory: ./app
