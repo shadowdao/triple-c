@@ -22,6 +22,24 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute version
+        id: version
+        run: |
+          COMMIT_COUNT=$(git rev-list --count HEAD)
+          VERSION="0.1.${COMMIT_COUNT}"
+          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Computed version: ${VERSION}"
+
+      - name: Set app version
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          sed -i "s/\"version\": \".*\"/\"version\": \"${VERSION}\"/" app/src-tauri/tauri.conf.json
+          sed -i "s/\"version\": \".*\"/\"version\": \"${VERSION}\"/" app/package.json
+          sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" app/src-tauri/Cargo.toml
+          echo "Patched version to ${VERSION}"
 
       - name: Install system dependencies
         run: |
@@ -80,12 +98,12 @@ jobs:
         env:
           TOKEN: ${{ secrets.REGISTRY_TOKEN }}
         run: |
-          TAG="build-$(echo ${{ gitea.sha }} | cut -c1-7)"
+          TAG="v${{ steps.version.outputs.VERSION }}"
           # Create release
           curl -s -X POST \
             -H "Authorization: token ${TOKEN}" \
             -H "Content-Type: application/json" \
-            -d "{\"tag_name\": \"${TAG}\", \"name\": \"Linux Build ${TAG}\", \"body\": \"Automated build from commit ${{ gitea.sha }}\"}" \
+            -d "{\"tag_name\": \"${TAG}\", \"name\": \"Triple-C ${TAG} (Linux)\", \"body\": \"Automated build from commit ${{ gitea.sha }}\"}" \
             "${GITEA_URL}/api/v1/repos/${REPO}/releases" > release.json
           RELEASE_ID=$(cat release.json | grep -o '"id":[0-9]*' | head -1 | grep -o '[0-9]*')
           echo "Release ID: ${RELEASE_ID}"
@@ -109,6 +127,25 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute version
+        id: version
+        run: |
+          for /f %%i in ('git rev-list --count HEAD') do set "COMMIT_COUNT=%%i"
+          set "VERSION=0.1.%COMMIT_COUNT%"
+          echo VERSION=%VERSION%>> %GITHUB_OUTPUT%
+          echo Computed version: %VERSION%
+
+      - name: Set app version
+        shell: powershell
+        run: |
+          $version = "${{ steps.version.outputs.VERSION }}"
+          (Get-Content app/src-tauri/tauri.conf.json) -replace '"version": ".*?"', "`"version`": `"$version`"" | Set-Content app/src-tauri/tauri.conf.json
+          (Get-Content app/package.json) -replace '"version": ".*?"', "`"version`": `"$version`"" | Set-Content app/package.json
+          (Get-Content app/src-tauri/Cargo.toml) -replace '^version = ".*?"', "version = `"$version`"" | Set-Content app/src-tauri/Cargo.toml
+          Write-Host "Patched version to $version"
 
       - name: Install Rust stable
         run: |
@@ -186,9 +223,9 @@ jobs:
           TOKEN: ${{ secrets.REGISTRY_TOKEN }}
           COMMIT_SHA: ${{ gitea.sha }}
         run: |
-          set "TAG=build-win-%COMMIT_SHA:~0,7%"
+          set "TAG=v${{ steps.version.outputs.VERSION }}-win"
           echo Creating release %TAG%...
-          curl -s -X POST -H "Authorization: token %TOKEN%" -H "Content-Type: application/json" -d "{\"tag_name\": \"%TAG%\", \"name\": \"Windows Build %TAG%\", \"body\": \"Automated build from commit %COMMIT_SHA%\"}" "%GITEA_URL%/api/v1/repos/%REPO%/releases" > release.json
+          curl -s -X POST -H "Authorization: token %TOKEN%" -H "Content-Type: application/json" -d "{\"tag_name\": \"%TAG%\", \"name\": \"Triple-C v${{ steps.version.outputs.VERSION }} (Windows)\", \"body\": \"Automated build from commit %COMMIT_SHA%\"}" "%GITEA_URL%/api/v1/repos/%REPO%/releases" > release.json
           for /f "tokens=2 delims=:," %%a in ('findstr /c:"\"id\"" release.json') do set "RELEASE_ID=%%a" & goto :found
           :found
           echo Release ID: %RELEASE_ID%
