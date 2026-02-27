@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import type { Project, TerminalSession } from "../lib/types";
+import type { Project, TerminalSession, AppSettings } from "../lib/types";
 
 interface AppState {
   // Projects
@@ -26,6 +26,10 @@ interface AppState {
   setImageExists: (exists: boolean | null) => void;
   hasKey: boolean | null;
   setHasKey: (has: boolean | null) => void;
+
+  // App settings
+  appSettings: AppSettings | null;
+  setAppSettings: (settings: AppSettings) => void;
 }
 
 export const useAppState = create<AppState>((set) => ({
@@ -77,4 +81,8 @@ export const useAppState = create<AppState>((set) => ({
   setImageExists: (exists) => set({ imageExists: exists }),
   hasKey: null,
   setHasKey: (has) => set({ hasKey: has }),
+
+  // App settings
+  appSettings: null,
+  setAppSettings: (settings) => set({ appSettings: settings }),
 }));

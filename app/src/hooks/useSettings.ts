@@ -1,9 +1,10 @@
 import { useCallback } from "react";
 import { useAppState } from "../store/appState";
 import * as commands from "../lib/tauri-commands";
+import type { AppSettings } from "../lib/types";
 
 export function useSettings() {
-  const { hasKey, setHasKey } = useAppState();
+  const { hasKey, setHasKey, appSettings, setAppSettings } = useAppState();
 
   const checkApiKey = useCallback(async () => {
     try {
@@ -29,10 +30,33 @@ export function useSettings() {
     setHasKey(false);
   }, [setHasKey]);
 
+  const loadSettings = useCallback(async () => {
+    try {
+      const settings = await commands.getSettings();
+      setAppSettings(settings);
+      return settings;
+    } catch (e) {
+      console.error("Failed to load settings:", e);
+      return null;
+    }
+  }, [setAppSettings]);
+
+  const saveSettings = useCallback(
+    async (settings: AppSettings) => {
+      const updated = await commands.updateSettings(settings);
+      setAppSettings(updated);
+      return updated;
+    },
+    [setAppSettings],
+  );
+
   return {
     hasKey,
     checkApiKey,
     saveApiKey,
     removeApiKey,
+    appSettings,
+    loadSettings,
+    saveSettings,
   };
 }

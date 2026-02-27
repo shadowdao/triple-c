@@ -1,7 +1,7 @@
 use tauri::State;
 
 use crate::docker;
-use crate::models::{AuthMode, Project, ProjectStatus};
+use crate::models::{container_config, AuthMode, Project, ProjectStatus};
 use crate::storage::secure;
 use crate::AppState;
 
@@ -57,6 +57,10 @@ pub async fn start_project_container(
         .get(&project_id)
         .ok_or_else(|| format!("Project {} not found", project_id))?;
 
+    // Load settings for image resolution and global AWS
+    let settings = state.settings_store.get();
+    let image_name = container_config::resolve_image_name(&settings.image_source, &settings.custom_image_name);
+
     // Get API key only if auth mode requires it
     let api_key = match project.auth_mode {
         AuthMode::ApiKey => {
@@ -65,16 +69,14 @@ pub async fn start_project_container(
             Some(key)
         }
         AuthMode::Login => {
-            // Login mode: no API key needed, user runs `claude login` in the container.
-            // Auth state persists in the .claude config volume.
             None
         }
         AuthMode::Bedrock => {
-            // Bedrock mode: no Anthropic API key needed, uses AWS credentials.
             let bedrock = project.bedrock_config.as_ref()
                 .ok_or_else(|| "Bedrock auth mode selected but no Bedrock configuration found.".to_string())?;
-            if bedrock.aws_region.is_empty() {
-                return Err("AWS region is required for Bedrock auth mode.".to_string());
+            // Region can come from per-project or global
+            if bedrock.aws_region.is_empty() && settings.global_aws.aws_region.is_none() {
+                return Err("AWS region is required for Bedrock auth mode. Set it per-project or in global AWS settings.".to_string());
             }
             None
         }
@@ -84,12 +86,19 @@ pub async fn start_project_container(
     state.projects_store.update_status(&project_id, ProjectStatus::Starting)?;
 
     // Ensure image exists
-    if !docker::image_exists().await? {
-        return Err("Docker image not built. Please build the image first.".to_string());
+    if !docker::image_exists(&image_name).await? {
+        state.projects_store.update_status(&project_id, ProjectStatus::Stopped)?;
+        return Err(format!("Docker image '{}' not found. Please pull or build the image first.", image_name));
     }
 
     // Determine docker socket path
-    let docker_socket = default_docker_socket();
+    let docker_socket = settings.docker_socket_path
+        .as_deref()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| default_docker_socket());
+
+    // AWS config path from global settings
+    let aws_config_path = settings.global_aws.aws_config_path.clone();
 
     // Check for existing container
     let container_id = if let Some(existing_id) = docker::find_existing_container(&project).await? {
@@ -98,7 +107,14 @@ pub async fn start_project_container(
         existing_id
     } else {
         // Create new container
-        let new_id = docker::create_container(&project, api_key.as_deref(), &docker_socket).await?;
+        let new_id = docker::create_container(
+            &project,
+            api_key.as_deref(),
+            &docker_socket,
+            &image_name,
+            aws_config_path.as_deref(),
+            &settings.global_aws,
+        ).await?;
         docker::start_container(&new_id).await?;
         new_id
     };

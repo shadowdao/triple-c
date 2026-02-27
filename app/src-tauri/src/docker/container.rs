@@ -6,7 +6,7 @@ use bollard::models::{ContainerSummary, HostConfig, Mount, MountTypeEnum};
 use std::collections::HashMap;
 
 use super::client::get_docker;
-use crate::models::{container_config, AuthMode, BedrockAuthMethod, ContainerInfo, Project};
+use crate::models::{AuthMode, BedrockAuthMethod, ContainerInfo, GlobalAwsSettings, Project};
 
 pub async fn find_existing_container(project: &Project) -> Result<Option<String>, String> {
     let docker = get_docker()?;
@@ -42,10 +42,12 @@ pub async fn create_container(
     project: &Project,
     api_key: Option<&str>,
     docker_socket_path: &str,
+    image_name: &str,
+    aws_config_path: Option<&str>,
+    global_aws: &GlobalAwsSettings,
 ) -> Result<String, String> {
     let docker = get_docker()?;
     let container_name = project.container_name();
-    let image = container_config::full_image_name();
 
     let mut env_vars: Vec<String> = Vec::new();
 
@@ -55,13 +57,31 @@ pub async fn create_container(
         let uid = std::process::Command::new("id").arg("-u").output();
         let gid = std::process::Command::new("id").arg("-g").output();
         if let Ok(out) = uid {
-            let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            env_vars.push(format!("HOST_UID={}", val));
+            if out.status.success() {
+                let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !val.is_empty() {
+                    log::debug!("Host UID detected: {}", val);
+                    env_vars.push(format!("HOST_UID={}", val));
+                }
+            } else {
+                log::debug!("Failed to detect host UID (exit code {:?})", out.status.code());
+            }
         }
         if let Ok(out) = gid {
-            let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            env_vars.push(format!("HOST_GID={}", val));
+            if out.status.success() {
+                let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !val.is_empty() {
+                    log::debug!("Host GID detected: {}", val);
+                    env_vars.push(format!("HOST_GID={}", val));
+                }
+            } else {
+                log::debug!("Failed to detect host GID (exit code {:?})", out.status.code());
+            }
         }
+    }
+    #[cfg(windows)]
+    {
+        log::debug!("Skipping HOST_UID/HOST_GID on Windows — Docker Desktop's Linux VM handles user mapping");
     }
 
     if let Some(key) = api_key {
@@ -82,7 +102,16 @@ pub async fn create_container(
     if project.auth_mode == AuthMode::Bedrock {
         if let Some(ref bedrock) = project.bedrock_config {
             env_vars.push("CLAUDE_CODE_USE_BEDROCK=1".to_string());
-            env_vars.push(format!("AWS_REGION={}", bedrock.aws_region));
+
+            // AWS region: per-project overrides global
+            let region = if !bedrock.aws_region.is_empty() {
+                Some(bedrock.aws_region.clone())
+            } else {
+                global_aws.aws_region.clone()
+            };
+            if let Some(ref r) = region {
+                env_vars.push(format!("AWS_REGION={}", r));
+            }
 
             match bedrock.auth_method {
                 BedrockAuthMethod::StaticCredentials => {
@@ -97,8 +126,11 @@ pub async fn create_container(
                     }
                 }
                 BedrockAuthMethod::Profile => {
-                    if let Some(ref profile) = bedrock.aws_profile {
-                        env_vars.push(format!("AWS_PROFILE={}", profile));
+                    // Per-project profile overrides global
+                    let profile = bedrock.aws_profile.as_ref()
+                        .or(global_aws.aws_profile.as_ref());
+                    if let Some(p) = profile {
+                        env_vars.push(format!("AWS_PROFILE={}", p));
                     }
                 }
                 BedrockAuthMethod::BearerToken => {
@@ -148,22 +180,32 @@ pub async fn create_container(
         });
     }
 
-    // AWS config mount (read-only, for profile-based auth)
-    if project.auth_mode == AuthMode::Bedrock {
+    // AWS config mount (read-only)
+    // Mount if: Bedrock profile auth needs it, OR a global aws_config_path is set
+    let should_mount_aws = if project.auth_mode == AuthMode::Bedrock {
         if let Some(ref bedrock) = project.bedrock_config {
-            if bedrock.auth_method == BedrockAuthMethod::Profile {
-                if let Some(home) = dirs::home_dir() {
-                    let aws_dir = home.join(".aws");
-                    if aws_dir.exists() {
-                        mounts.push(Mount {
-                            target: Some("/home/claude/.aws".to_string()),
-                            source: Some(aws_dir.to_string_lossy().to_string()),
-                            typ: Some(MountTypeEnum::BIND),
-                            read_only: Some(true),
-                            ..Default::default()
-                        });
-                    }
-                }
+            bedrock.auth_method == BedrockAuthMethod::Profile
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    if should_mount_aws || aws_config_path.is_some() {
+        let aws_dir = aws_config_path
+            .map(|p| std::path::PathBuf::from(p))
+            .or_else(|| dirs::home_dir().map(|h| h.join(".aws")));
+
+        if let Some(ref aws_path) = aws_dir {
+            if aws_path.exists() {
+                mounts.push(Mount {
+                    target: Some("/home/claude/.aws".to_string()),
+                    source: Some(aws_path.to_string_lossy().to_string()),
+                    typ: Some(MountTypeEnum::BIND),
+                    read_only: Some(true),
+                    ..Default::default()
+                });
             }
         }
     }
@@ -190,7 +232,7 @@ pub async fn create_container(
     };
 
     let config = Config {
-        image: Some(image),
+        image: Some(image_name.to_string()),
         hostname: Some("triple-c".to_string()),
         env: Some(env_vars),
         labels: Some(labels),
@@ -257,11 +299,17 @@ pub async fn get_container_info(project: &Project) -> Result<Option<ContainerInf
                     .map(|s| format!("{:?}", s))
                     .unwrap_or_else(|| "unknown".to_string());
 
+                // Read actual image from Docker inspect
+                let image = info
+                    .config
+                    .and_then(|c| c.image)
+                    .unwrap_or_else(|| "unknown".to_string());
+
                 Ok(Some(ContainerInfo {
                     container_id: container_id.clone(),
                     project_id: project.id.clone(),
                     status,
-                    image: container_config::full_image_name(),
+                    image,
                 }))
             }
             Err(_) => Ok(None),
@@ -282,7 +330,6 @@ pub async fn list_sibling_containers() -> Result<Vec<ContainerSummary>, String> 
         .await
         .map_err(|e| format!("Failed to list containers: {}", e))?;
 
-    // Filter out Triple-C managed containers
     let siblings: Vec<ContainerSummary> = all_containers
         .into_iter()
         .filter(|c| {

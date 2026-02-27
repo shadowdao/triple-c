@@ -58,3 +58,21 @@ export interface TerminalSession {
   projectId: string;
   projectName: string;
 }
+
+export type ImageSource = "registry" | "local_build" | "custom";
+
+export interface GlobalAwsSettings {
+  aws_config_path: string | null;
+  aws_profile: string | null;
+  aws_region: string | null;
+}
+
+export interface AppSettings {
+  default_ssh_key_path: string | null;
+  default_git_user_name: string | null;
+  default_git_user_email: string | null;
+  docker_socket_path: string | null;
+  image_source: ImageSource;
+  custom_image_name: string | null;
+  global_aws: GlobalAwsSettings;
+}

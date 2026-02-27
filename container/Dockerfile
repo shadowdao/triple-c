@@ -21,6 +21,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# Remove default ubuntu user to free UID 1000 for host-user remapping
+RUN if id ubuntu >/dev/null 2>&1; then userdel -r ubuntu 2>/dev/null || userdel ubuntu; fi \
+    && if getent group ubuntu >/dev/null 2>&1; then groupdel ubuntu 2>/dev/null || true; fi
+
 # Set UTF-8 locale
 RUN locale-gen en_US.UTF-8
 ENV LANG=en_US.UTF-8
@@ -65,7 +69,7 @@ RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2
     && unzip awscliv2.zip && ./aws/install && rm -rf awscliv2.zip aws
 
 # ── Non-root user with passwordless sudo ─────────────────────────────────────
-RUN useradd -m -s /bin/bash claude \
+RUN useradd -m -s /bin/bash -u 1000 claude \
     && echo "claude ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/claude \
     && chmod 0440 /etc/sudoers.d/claude
 

@@ -1,15 +1,49 @@
 #!/bin/bash
-set -e
+# NOTE: set -e is intentionally omitted. A failing usermod/groupmod must not
+# kill the entire entrypoint — SSH setup, git config, and the final exec
+# must still run so the container is usable even if remapping fails.
 
 # ── UID/GID remapping ──────────────────────────────────────────────────────
 # Match the container's claude user to the host user's UID/GID so that
 # bind-mounted files (project dir, docker socket) have correct ownership.
-if [ -n "$HOST_UID" ] && [ "$HOST_UID" != "$(id -u claude)" ]; then
-    usermod -u "$HOST_UID" claude
-fi
-if [ -n "$HOST_GID" ] && [ "$HOST_GID" != "$(id -g claude)" ]; then
-    groupmod -g "$HOST_GID" claude
-fi
+remap_uid_gid() {
+    local target_uid="${HOST_UID}"
+    local target_gid="${HOST_GID}"
+    local current_uid
+    local current_gid
+    current_uid=$(id -u claude 2>/dev/null) || { echo "entrypoint: claude user not found"; return 1; }
+    current_gid=$(id -g claude 2>/dev/null) || { echo "entrypoint: claude group not found"; return 1; }
+
+    # ── GID remapping ──
+    if [ -n "$target_gid" ] && [ "$target_gid" != "$current_gid" ]; then
+        # If another group already holds the target GID, move it out of the way
+        local blocking_group
+        blocking_group=$(getent group "$target_gid" 2>/dev/null | cut -d: -f1)
+        if [ -n "$blocking_group" ] && [ "$blocking_group" != "claude" ]; then
+            echo "entrypoint: moving group '$blocking_group' from GID $target_gid to 65533"
+            groupmod -g 65533 "$blocking_group" || echo "entrypoint: warning — failed to relocate group '$blocking_group'"
+        fi
+        groupmod -g "$target_gid" claude \
+            && echo "entrypoint: claude GID -> $target_gid" \
+            || echo "entrypoint: warning — groupmod -g $target_gid claude failed"
+    fi
+
+    # ── UID remapping ──
+    if [ -n "$target_uid" ] && [ "$target_uid" != "$current_uid" ]; then
+        # If another user already holds the target UID, move it out of the way
+        local blocking_user
+        blocking_user=$(getent passwd "$target_uid" 2>/dev/null | cut -d: -f1)
+        if [ -n "$blocking_user" ] && [ "$blocking_user" != "claude" ]; then
+            echo "entrypoint: moving user '$blocking_user' from UID $target_uid to 65533"
+            usermod -u 65533 "$blocking_user" || echo "entrypoint: warning — failed to relocate user '$blocking_user'"
+        fi
+        usermod -u "$target_uid" claude \
+            && echo "entrypoint: claude UID -> $target_uid" \
+            || echo "entrypoint: warning — usermod -u $target_uid claude failed"
+    fi
+}
+
+remap_uid_gid
 
 # Fix ownership of home directory after UID/GID change
 chown -R claude:claude /home/claude

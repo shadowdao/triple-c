@@ -1,7 +1,7 @@
 use tauri::State;
 
 use crate::docker;
-use crate::models::ContainerInfo;
+use crate::models::{container_config, ContainerInfo};
 use crate::AppState;
 
 #[tauri::command]
@@ -10,8 +10,10 @@ pub async fn check_docker() -> Result<bool, String> {
 }
 
 #[tauri::command]
-pub async fn check_image_exists() -> Result<bool, String> {
-    docker::image_exists().await
+pub async fn check_image_exists(state: State<'_, AppState>) -> Result<bool, String> {
+    let settings = state.settings_store.get();
+    let image_name = container_config::resolve_image_name(&settings.image_source, &settings.custom_image_name);
+    docker::image_exists(&image_name).await
 }
 
 #[tauri::command]

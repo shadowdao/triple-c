@@ -10,12 +10,13 @@ import { useAppState } from "./store/appState";
 
 export default function App() {
   const { checkDocker, checkImage } = useDocker();
-  const { checkApiKey } = useSettings();
+  const { checkApiKey, loadSettings } = useSettings();
   const { refresh } = useProjects();
   const { sessions, activeSessionId } = useAppState();
 
   // Initialize on mount
   useEffect(() => {
+    loadSettings();
     checkDocker();
     checkImage();
     checkApiKey();

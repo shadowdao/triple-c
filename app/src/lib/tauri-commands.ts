@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ContainerInfo, SiblingContainer } from "./types";
+import type { Project, ContainerInfo, SiblingContainer, AppSettings } from "./types";
 
 // Docker
 export const checkDocker = () => invoke<boolean>("check_docker");
@@ -30,6 +30,15 @@ export const setApiKey = (key: string) =>
   invoke<void>("set_api_key", { key });
 export const hasApiKey = () => invoke<boolean>("has_api_key");
 export const deleteApiKey = () => invoke<void>("delete_api_key");
+export const getSettings = () => invoke<AppSettings>("get_settings");
+export const updateSettings = (settings: AppSettings) =>
+  invoke<AppSettings>("update_settings", { settings });
+export const pullImage = (imageName: string) =>
+  invoke<void>("pull_image", { imageName });
+export const detectAwsConfig = () =>
+  invoke<string | null>("detect_aws_config");
+export const listAwsProfiles = () =>
+  invoke<string[]>("list_aws_profiles");
 
 // Terminal
 export const openTerminalSession = (projectId: string, sessionId: string) =>

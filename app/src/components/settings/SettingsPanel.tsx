@@ -1,5 +1,6 @@
 import ApiKeyInput from "./ApiKeyInput";
 import DockerSettings from "./DockerSettings";
+import AwsSettings from "./AwsSettings";
 
 export default function SettingsPanel() {
   return (
@@ -9,6 +10,7 @@ export default function SettingsPanel() {
       </h2>
       <ApiKeyInput />
       <DockerSettings />
+      <AwsSettings />
     </div>
   );
 }

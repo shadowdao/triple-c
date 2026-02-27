@@ -5,9 +5,11 @@ mod storage;
 
 use docker::exec::ExecSessionManager;
 use storage::projects_store::ProjectsStore;
+use storage::settings_store::SettingsStore;
 
 pub struct AppState {
     pub projects_store: ProjectsStore,
+    pub settings_store: SettingsStore,
     pub exec_manager: ExecSessionManager,
 }
 
@@ -20,6 +22,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(AppState {
             projects_store: ProjectsStore::new(),
+            settings_store: SettingsStore::new(),
             exec_manager: ExecSessionManager::new(),
         })
         .invoke_handler(tauri::generate_handler![
@@ -41,6 +44,11 @@ pub fn run() {
             commands::settings_commands::set_api_key,
             commands::settings_commands::has_api_key,
             commands::settings_commands::delete_api_key,
+            commands::settings_commands::get_settings,
+            commands::settings_commands::update_settings,
+            commands::settings_commands::pull_image,
+            commands::settings_commands::detect_aws_config,
+            commands::settings_commands::list_aws_profiles,
             // Terminal
             commands::terminal_commands::open_terminal_session,
             commands::terminal_commands::terminal_input,

@@ -51,11 +51,30 @@ export function useDocker() {
     [setImageExists],
   );
 
+  const pullImage = useCallback(
+    async (imageName: string, onProgress?: (msg: string) => void) => {
+      const unlisten = onProgress
+        ? await listen<string>("image-pull-progress", (event) => {
+            onProgress(event.payload);
+          })
+        : null;
+
+      try {
+        await commands.pullImage(imageName);
+        setImageExists(true);
+      } finally {
+        unlisten?.();
+      }
+    },
+    [setImageExists],
+  );
+
   return {
     dockerAvailable,
     imageExists,
     checkDocker,
     checkImage,
     buildImage,
+    pullImage,
   };
 }
