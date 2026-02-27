@@ -1,0 +1,157 @@
+use tauri::State;
+
+use crate::docker;
+use crate::models::{AuthMode, Project, ProjectStatus};
+use crate::storage::secure;
+use crate::AppState;
+
+#[tauri::command]
+pub async fn list_projects(state: State<'_, AppState>) -> Result<Vec<Project>, String> {
+    Ok(state.projects_store.list())
+}
+
+#[tauri::command]
+pub async fn add_project(
+    name: String,
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<Project, String> {
+    let project = Project::new(name, path);
+    state.projects_store.add(project)
+}
+
+#[tauri::command]
+pub async fn remove_project(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    // Stop and remove container if it exists
+    if let Some(project) = state.projects_store.get(&project_id) {
+        if let Some(ref container_id) = project.container_id {
+            let _ = docker::stop_container(container_id).await;
+            let _ = docker::remove_container(container_id).await;
+        }
+    }
+
+    // Close any exec sessions
+    state.exec_manager.close_all_sessions().await;
+
+    state.projects_store.remove(&project_id)
+}
+
+#[tauri::command]
+pub async fn update_project(
+    project: Project,
+    state: State<'_, AppState>,
+) -> Result<Project, String> {
+    state.projects_store.update(project)
+}
+
+#[tauri::command]
+pub async fn start_project_container(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<Project, String> {
+    let mut project = state
+        .projects_store
+        .get(&project_id)
+        .ok_or_else(|| format!("Project {} not found", project_id))?;
+
+    // Get API key only if auth mode requires it
+    let api_key = match project.auth_mode {
+        AuthMode::ApiKey => {
+            let key = secure::get_api_key()?
+                .ok_or_else(|| "No API key configured. Please set your Anthropic API key in Settings.".to_string())?;
+            Some(key)
+        }
+        AuthMode::Login => {
+            // Login mode: no API key needed, user runs `claude login` in the container.
+            // Auth state persists in the .claude config volume.
+            None
+        }
+    };
+
+    // Update status to starting
+    state.projects_store.update_status(&project_id, ProjectStatus::Starting)?;
+
+    // Ensure image exists
+    if !docker::image_exists().await? {
+        return Err("Docker image not built. Please build the image first.".to_string());
+    }
+
+    // Determine docker socket path
+    let docker_socket = default_docker_socket();
+
+    // Check for existing container
+    let container_id = if let Some(existing_id) = docker::find_existing_container(&project).await? {
+        // Start existing container
+        docker::start_container(&existing_id).await?;
+        existing_id
+    } else {
+        // Create new container
+        let new_id = docker::create_container(&project, api_key.as_deref(), &docker_socket).await?;
+        docker::start_container(&new_id).await?;
+        new_id
+    };
+
+    // Update project with container info
+    state.projects_store.set_container_id(&project_id, Some(container_id.clone()))?;
+    state.projects_store.update_status(&project_id, ProjectStatus::Running)?;
+
+    project.container_id = Some(container_id);
+    project.status = ProjectStatus::Running;
+    Ok(project)
+}
+
+#[tauri::command]
+pub async fn stop_project_container(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let project = state
+        .projects_store
+        .get(&project_id)
+        .ok_or_else(|| format!("Project {} not found", project_id))?;
+
+    if let Some(ref container_id) = project.container_id {
+        state.projects_store.update_status(&project_id, ProjectStatus::Stopping)?;
+
+        // Close exec sessions for this project
+        state.exec_manager.close_all_sessions().await;
+
+        docker::stop_container(container_id).await?;
+        state.projects_store.update_status(&project_id, ProjectStatus::Stopped)?;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn rebuild_project_container(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<Project, String> {
+    let project = state
+        .projects_store
+        .get(&project_id)
+        .ok_or_else(|| format!("Project {} not found", project_id))?;
+
+    // Remove existing container
+    if let Some(ref container_id) = project.container_id {
+        state.exec_manager.close_all_sessions().await;
+        let _ = docker::stop_container(container_id).await;
+        docker::remove_container(container_id).await?;
+        state.projects_store.set_container_id(&project_id, None)?;
+    }
+
+    // Start fresh
+    start_project_container(project_id, state).await
+}
+
+fn default_docker_socket() -> String {
+    if cfg!(target_os = "windows") {
+        "//./pipe/docker_engine".to_string()
+    } else {
+        "/var/run/docker.sock".to_string()
+    }
+}

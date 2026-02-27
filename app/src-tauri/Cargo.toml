@@ -1,0 +1,38 @@
+[package]
+name = "triple-c"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "triple_c_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[[bin]]
+name = "triple-c"
+path = "src/main.rs"
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-store = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bollard = "0.18"
+keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+dirs = "6"
+log = "0.4"
+env_logger = "0.11"
+tar = "0.4"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

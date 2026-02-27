@@ -1,0 +1,5 @@
+node_modules/
+app/dist/
+app/src-tauri/target/
+Screenshot*.png
+code-review.md
