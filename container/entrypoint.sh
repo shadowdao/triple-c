@@ -94,6 +94,14 @@ if [ -n "$GIT_USER_EMAIL" ]; then
     su -s /bin/bash claude -c "git config --global user.email '$GIT_USER_EMAIL'"
 fi
 
+# ── Claude instructions ──────────────────────────────────────────────────────
+if [ -n "$CLAUDE_INSTRUCTIONS" ]; then
+    mkdir -p /home/claude/.claude
+    printf '%s\n' "$CLAUDE_INSTRUCTIONS" > /home/claude/.claude/CLAUDE.md
+    chown claude:claude /home/claude/.claude/CLAUDE.md
+    unset CLAUDE_INSTRUCTIONS
+fi
+
 # ── Docker socket permissions ────────────────────────────────────────────────
 if [ -S /var/run/docker.sock ]; then
     DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)

@@ -1,3 +1,8 @@
+export interface EnvVar {
+  key: string;
+  value: string;
+}
+
 export interface Project {
   id: string;
   name: string;
@@ -11,6 +16,8 @@ export interface Project {
   git_token: string | null;
   git_user_name: string | null;
   git_user_email: string | null;
+  custom_env_vars: EnvVar[];
+  claude_instructions: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -75,4 +82,5 @@ export interface AppSettings {
   image_source: ImageSource;
   custom_image_name: string | null;
   global_aws: GlobalAwsSettings;
+  global_claude_instructions: string | null;
 }

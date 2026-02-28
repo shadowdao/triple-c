@@ -45,6 +45,7 @@ pub async fn create_container(
     image_name: &str,
     aws_config_path: Option<&str>,
     global_aws: &GlobalAwsSettings,
+    global_claude_instructions: Option<&str>,
 ) -> Result<String, String> {
     let docker = get_docker()?;
     let container_name = project.container_name();
@@ -148,6 +149,37 @@ pub async fn create_container(
                 env_vars.push("DISABLE_PROMPT_CACHING=1".to_string());
             }
         }
+    }
+
+    // Custom environment variables
+    let reserved_prefixes = ["ANTHROPIC_", "AWS_", "GIT_", "HOST_", "CLAUDE_", "TRIPLE_C_"];
+    let mut custom_env_fingerprint_parts: Vec<String> = Vec::new();
+    for env_var in &project.custom_env_vars {
+        let key = env_var.key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        let is_reserved = reserved_prefixes.iter().any(|p| key.to_uppercase().starts_with(p));
+        if is_reserved {
+            log::warn!("Skipping reserved env var: {}", key);
+            continue;
+        }
+        env_vars.push(format!("{}={}", key, env_var.value));
+        custom_env_fingerprint_parts.push(format!("{}={}", key, env_var.value));
+    }
+    custom_env_fingerprint_parts.sort();
+    let custom_env_fingerprint = custom_env_fingerprint_parts.join(",");
+    env_vars.push(format!("TRIPLE_C_CUSTOM_ENV={}", custom_env_fingerprint));
+
+    // Claude instructions (global + per-project)
+    let combined_instructions = match (global_claude_instructions, project.claude_instructions.as_deref()) {
+        (Some(g), Some(p)) => Some(format!("{}\n\n{}", g, p)),
+        (Some(g), None) => Some(g.to_string()),
+        (None, Some(p)) => Some(p.to_string()),
+        (None, None) => None,
+    };
+    if let Some(ref instructions) = combined_instructions {
+        env_vars.push(format!("CLAUDE_INSTRUCTIONS={}", instructions));
     }
 
     let mut mounts = vec![
@@ -288,6 +320,7 @@ pub async fn remove_container(container_id: &str) -> Result<(), String> {
         .remove_container(
             container_id,
             Some(RemoveContainerOptions {
+                v: false, // preserve named volumes (claude config)
                 force: true,
                 ..Default::default()
             }),
@@ -299,7 +332,11 @@ pub async fn remove_container(container_id: &str) -> Result<(), String> {
 /// Check whether the existing container's configuration still matches the
 /// current project settings.  Returns `true` when the container must be
 /// recreated (mounts or env vars differ).
-pub async fn container_needs_recreation(container_id: &str, project: &Project) -> Result<bool, String> {
+pub async fn container_needs_recreation(
+    container_id: &str,
+    project: &Project,
+    global_claude_instructions: Option<&str>,
+) -> Result<bool, String> {
     let docker = get_docker()?;
     let info = docker
         .inspect_container(container_id, None)
@@ -312,16 +349,10 @@ pub async fn container_needs_recreation(container_id: &str, project: &Project) -
         .and_then(|hc| hc.mounts.as_ref());
 
     // ── Docker socket mount ──────────────────────────────────────────────
-    let has_socket = mounts
-        .map(|m| {
-            m.iter()
-                .any(|mount| mount.target.as_deref() == Some("/var/run/docker.sock"))
-        })
-        .unwrap_or(false);
-    if has_socket != project.allow_docker_access {
-        log::info!("Docker socket mismatch (container={}, project={})", has_socket, project.allow_docker_access);
-        return Ok(true);
-    }
+    // Intentionally NOT checked here. Toggling "Allow container spawning"
+    // should not trigger a full container recreation (which loses Claude
+    // Code settings stored in the named volume). The change takes effect
+    // on the next explicit rebuild instead.
 
     // ── SSH key path mount ───────────────────────────────────────────────
     let ssh_mount_source = mounts
@@ -368,6 +399,41 @@ pub async fn container_needs_recreation(container_id: &str, project: &Project) -
     }
     if container_git_token.as_deref() != project.git_token.as_deref() {
         log::info!("GIT_TOKEN mismatch");
+        return Ok(true);
+    }
+
+    // ── Custom environment variables ──────────────────────────────────────
+    let reserved_prefixes = ["ANTHROPIC_", "AWS_", "GIT_", "HOST_", "CLAUDE_", "TRIPLE_C_"];
+    let mut expected_parts: Vec<String> = Vec::new();
+    for env_var in &project.custom_env_vars {
+        let key = env_var.key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        let is_reserved = reserved_prefixes.iter().any(|p| key.to_uppercase().starts_with(p));
+        if is_reserved {
+            continue;
+        }
+        expected_parts.push(format!("{}={}", key, env_var.value));
+    }
+    expected_parts.sort();
+    let expected_fingerprint = expected_parts.join(",");
+    let container_fingerprint = get_env("TRIPLE_C_CUSTOM_ENV").unwrap_or_default();
+    if container_fingerprint != expected_fingerprint {
+        log::info!("Custom env vars mismatch (container={:?}, expected={:?})", container_fingerprint, expected_fingerprint);
+        return Ok(true);
+    }
+
+    // ── Claude instructions ───────────────────────────────────────────────
+    let expected_instructions = match (global_claude_instructions, project.claude_instructions.as_deref()) {
+        (Some(g), Some(p)) => Some(format!("{}\n\n{}", g, p)),
+        (Some(g), None) => Some(g.to_string()),
+        (None, Some(p)) => Some(p.to_string()),
+        (None, None) => None,
+    };
+    let container_instructions = get_env("CLAUDE_INSTRUCTIONS");
+    if container_instructions.as_deref() != expected_instructions.as_deref() {
+        log::info!("CLAUDE_INSTRUCTIONS mismatch");
         return Ok(true);
     }
 

@@ -1,5 +1,11 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EnvVar {
+    pub key: String,
+    pub value: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub id: String,
@@ -14,6 +20,10 @@ pub struct Project {
     pub git_token: Option<String>,
     pub git_user_name: Option<String>,
     pub git_user_email: Option<String>,
+    #[serde(default)]
+    pub custom_env_vars: Vec<EnvVar>,
+    #[serde(default)]
+    pub claude_instructions: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -91,6 +101,8 @@ impl Project {
             git_token: None,
             git_user_name: None,
             git_user_email: None,
+            custom_env_vars: Vec::new(),
+            claude_instructions: None,
             created_at: now.clone(),
             updated_at: now,
         }

@@ -105,7 +105,11 @@ pub async fn start_project_container(
         // path, git config, docker socket, etc.) we recreate the container.
         // Safe to recreate: the claude config named volume is keyed by
         // project ID (not container ID) so it persists across recreation.
-        let needs_recreation = docker::container_needs_recreation(&existing_id, &project)
+        let needs_recreation = docker::container_needs_recreation(
+                &existing_id,
+                &project,
+                settings.global_claude_instructions.as_deref(),
+            )
             .await
             .unwrap_or(false);
         if needs_recreation {
@@ -119,6 +123,7 @@ pub async fn start_project_container(
                 &image_name,
                 aws_config_path.as_deref(),
                 &settings.global_aws,
+                settings.global_claude_instructions.as_deref(),
             ).await?;
             docker::start_container(&new_id).await?;
             new_id
@@ -136,6 +141,7 @@ pub async fn start_project_container(
             &image_name,
             aws_config_path.as_deref(),
             &settings.global_aws,
+            settings.global_claude_instructions.as_deref(),
         ).await?;
         docker::start_container(&new_id).await?;
         new_id

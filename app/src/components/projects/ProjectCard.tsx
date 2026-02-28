@@ -287,6 +287,72 @@ export default function ProjectCard({ project }: Props) {
                 </button>
               </div>
 
+              {/* Environment Variables */}
+              <div>
+                <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Environment Variables</label>
+                {(project.custom_env_vars ?? []).map((ev, i) => (
+                  <div key={i} className="flex gap-1 mb-1">
+                    <input
+                      value={ev.key}
+                      onChange={async (e) => {
+                        const vars = [...(project.custom_env_vars ?? [])];
+                        vars[i] = { ...vars[i], key: e.target.value };
+                        try { await update({ ...project, custom_env_vars: vars }); } catch {}
+                      }}
+                      placeholder="KEY"
+                      disabled={!isStopped}
+                      className="w-1/3 px-2 py-1 bg-[var(--bg-primary)] border border-[var(--border-color)] rounded text-xs text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)] disabled:opacity-50 font-mono"
+                    />
+                    <input
+                      value={ev.value}
+                      onChange={async (e) => {
+                        const vars = [...(project.custom_env_vars ?? [])];
+                        vars[i] = { ...vars[i], value: e.target.value };
+                        try { await update({ ...project, custom_env_vars: vars }); } catch {}
+                      }}
+                      placeholder="value"
+                      disabled={!isStopped}
+                      className="flex-1 px-2 py-1 bg-[var(--bg-primary)] border border-[var(--border-color)] rounded text-xs text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)] disabled:opacity-50 font-mono"
+                    />
+                    <button
+                      onClick={async () => {
+                        const vars = (project.custom_env_vars ?? []).filter((_, j) => j !== i);
+                        try { await update({ ...project, custom_env_vars: vars }); } catch {}
+                      }}
+                      disabled={!isStopped}
+                      className="px-1.5 py-1 text-xs text-[var(--error)] hover:bg-[var(--bg-primary)] rounded disabled:opacity-50 transition-colors"
+                    >
+                      x
+                    </button>
+                  </div>
+                ))}
+                <button
+                  onClick={async () => {
+                    const vars = [...(project.custom_env_vars ?? []), { key: "", value: "" }];
+                    try { await update({ ...project, custom_env_vars: vars }); } catch {}
+                  }}
+                  disabled={!isStopped}
+                  className="text-xs text-[var(--accent)] hover:text-[var(--accent-hover)] disabled:opacity-50 transition-colors"
+                >
+                  + Add variable
+                </button>
+              </div>
+
+              {/* Claude Instructions */}
+              <div>
+                <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Claude Instructions</label>
+                <textarea
+                  value={project.claude_instructions ?? ""}
+                  onChange={async (e) => {
+                    try { await update({ ...project, claude_instructions: e.target.value || null }); } catch {}
+                  }}
+                  placeholder="Per-project instructions for Claude Code (written to ~/.claude/CLAUDE.md in container)"
+                  disabled={!isStopped}
+                  rows={3}
+                  className="w-full px-2 py-1 bg-[var(--bg-primary)] border border-[var(--border-color)] rounded text-xs text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)] disabled:opacity-50 resize-y font-mono"
+                />
+              </div>
+
               {/* Bedrock config */}
               {project.auth_mode === "bedrock" && (() => {
                 const bc = project.bedrock_config ?? defaultBedrockConfig;

@@ -50,6 +50,8 @@ pub struct AppSettings {
     pub custom_image_name: Option<String>,
     #[serde(default)]
     pub global_aws: GlobalAwsSettings,
+    #[serde(default)]
+    pub global_claude_instructions: Option<String>,
 }
 
 impl Default for AppSettings {
@@ -62,6 +64,7 @@ impl Default for AppSettings {
             image_source: ImageSource::default(),
             custom_image_name: None,
             global_aws: GlobalAwsSettings::default(),
+            global_claude_instructions: None,
         }
     }
 }
