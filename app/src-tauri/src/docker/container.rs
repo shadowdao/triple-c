@@ -120,6 +120,9 @@ pub async fn create_container(
 
     let mut env_vars: Vec<String> = Vec::new();
 
+    // Tell CLI tools the terminal supports 24-bit RGB color
+    env_vars.push("COLORTERM=truecolor".to_string());
+
     // Pass host UID/GID so the entrypoint can remap the container user
     #[cfg(unix)]
     {
