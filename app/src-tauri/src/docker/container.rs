@@ -392,6 +392,10 @@ pub async fn stop_container(container_id: &str) -> Result<(), String> {
 
 pub async fn remove_container(container_id: &str) -> Result<(), String> {
     let docker = get_docker()?;
+    log::info!(
+        "Removing container {} (v=false: named volumes such as claude config are preserved)",
+        container_id
+    );
     docker
         .remove_container(
             container_id,

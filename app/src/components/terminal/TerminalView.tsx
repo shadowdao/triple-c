@@ -7,11 +7,6 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import "@xterm/xterm/css/xterm.css";
 import { useTerminal } from "../../hooks/useTerminal";
 
-/** Strip ANSI escape sequences from a string. */
-function stripAnsi(s: string): string {
-  return s.replace(/\x1b\[[0-9;]*[A-Za-z]|\x1b\][^\x07]*\x07/g, "");
-}
-
 interface Props {
   sessionId: string;
   active: boolean;
@@ -84,50 +79,12 @@ export default function TerminalView({ sessionId, active }: Props) {
       sendInput(sessionId, data);
     });
 
-    // ── URL accumulator ──────────────────────────────────────────────
-    // Claude Code login emits a long OAuth URL that gets split across
-    // hard newlines (\n / \r\n).  The WebLinksAddon only joins
-    // soft-wrapped lines (the `isWrapped` flag), so the URL match is
-    // truncated and the link fails when clicked.
-    //
-    // Fix: buffer recent output, strip ANSI codes, and after a short
-    // debounce check for a URL that spans multiple lines.  When found,
-    // write a single clean clickable copy to the terminal.
-    const textDecoder = new TextDecoder();
-    let outputBuffer = "";
-    let debounceTimer: ReturnType<typeof setTimeout> | null = null;
-
-    const flushUrlBuffer = () => {
-      const plain = stripAnsi(outputBuffer);
-      // Reassemble: strip hard newlines and carriage returns to join
-      // fragments that were split across terminal lines.
-      const joined = plain.replace(/[\r\n]+/g, "");
-      // Look for a long OAuth/auth URL (Claude login URLs contain
-      // "oauth" or "console.anthropic.com" or "/authorize").
-      const match = joined.match(/https?:\/\/[^\s'"\x07]{80,}/);
-      if (match) {
-        const url = match[0];
-        term.write("\r\n\x1b[36m🔗 Clickable login URL:\x1b[0m\r\n");
-        term.write(`\x1b[4;34m${url}\x1b[0m\r\n`);
-      }
-      outputBuffer = "";
-    };
-
     // Handle backend output -> terminal
     let aborted = false;
 
     const outputPromise = onOutput(sessionId, (data) => {
       if (aborted) return;
       term.write(data);
-
-      // Accumulate for URL detection (data is a Uint8Array, so decode it)
-      outputBuffer += textDecoder.decode(data);
-      // Cap buffer size to avoid memory growth
-      if (outputBuffer.length > 8192) {
-        outputBuffer = outputBuffer.slice(-4096);
-      }
-      if (debounceTimer) clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(flushUrlBuffer, 150);
     }).then((unlisten) => {
       if (aborted) unlisten();
       return unlisten;
@@ -159,7 +116,6 @@ export default function TerminalView({ sessionId, active }: Props) {
 
     return () => {
       aborted = true;
-      if (debounceTimer) clearTimeout(debounceTimer);
       inputDisposable.dispose();
       outputPromise.then((fn) => fn?.());
       exitPromise.then((fn) => fn?.());

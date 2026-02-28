@@ -269,8 +269,6 @@ export default function ProjectCard({ project }: Props) {
         {project.paths.map((pp, i) => (
           <div key={i} className="text-xs text-[var(--text-secondary)] truncate">
             <span className="font-mono">/workspace/{pp.mount_name}</span>
-            <span className="mx-1">&larr;</span>
-            <span>{pp.host_path}</span>
           </div>
         ))}
       </div>
