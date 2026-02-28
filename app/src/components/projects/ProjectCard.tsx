@@ -255,7 +255,7 @@ export default function ProjectCard({ project }: Props) {
   return (
     <div
       onClick={() => setSelectedProject(project.id)}
-      className={`px-3 py-2 rounded cursor-pointer transition-colors ${
+      className={`px-3 py-2 rounded cursor-pointer transition-colors min-w-0 overflow-hidden ${
         isSelected
           ? "bg-[var(--bg-tertiary)]"
           : "hover:bg-[var(--bg-tertiary)]"
@@ -274,7 +274,7 @@ export default function ProjectCard({ project }: Props) {
       </div>
 
       {isSelected && (
-        <div className="mt-2 ml-4 space-y-2">
+        <div className="mt-2 ml-4 space-y-2 min-w-0 overflow-hidden">
           {/* Auth mode selector */}
           <div className="flex items-center gap-1 text-xs">
             <span className="text-[var(--text-secondary)] mr-1">Auth:</span>
@@ -357,78 +357,82 @@ export default function ProjectCard({ project }: Props) {
 
           {/* Config panel */}
           {showConfig && (
-            <div className="space-y-2 pt-1 border-t border-[var(--border-color)]" onClick={(e) => e.stopPropagation()}>
+            <div className="space-y-2 pt-1 border-t border-[var(--border-color)] min-w-0 overflow-hidden" onClick={(e) => e.stopPropagation()}>
               {/* Folder paths */}
               <div>
                 <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Folders</label>
                 {paths.map((pp, i) => (
-                  <div key={i} className="flex gap-1 mb-1 items-center">
-                    <input
-                      value={pp.host_path}
-                      onChange={(e) => {
-                        const updated = [...paths];
-                        updated[i] = { ...updated[i], host_path: e.target.value };
-                        setPaths(updated);
-                      }}
-                      onBlur={async () => {
-                        try { await update({ ...project, paths }); } catch (err) {
-                          console.error("Failed to update paths:", err);
-                        }
-                      }}
-                      placeholder="/path/to/folder"
-                      disabled={!isStopped}
-                      className="flex-1 px-2 py-1 bg-[var(--bg-primary)] border border-[var(--border-color)] rounded text-xs text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)] disabled:opacity-50"
-                    />
-                    <button
-                      onClick={async () => {
-                        const selected = await open({ directory: true, multiple: false });
-                        if (typeof selected === "string") {
+                  <div key={i} className="mb-1">
+                    <div className="flex gap-1 items-center min-w-0">
+                      <input
+                        value={pp.host_path}
+                        onChange={(e) => {
                           const updated = [...paths];
-                          const basename = selected.replace(/[/\\]$/, "").split(/[/\\]/).pop() || "";
-                          updated[i] = { host_path: selected, mount_name: updated[i].mount_name || basename };
+                          updated[i] = { ...updated[i], host_path: e.target.value };
                           setPaths(updated);
-                          try { await update({ ...project, paths: updated }); } catch (err) {
+                        }}
+                        onBlur={async () => {
+                          try { await update({ ...project, paths }); } catch (err) {
                             console.error("Failed to update paths:", err);
                           }
-                        }
-                      }}
-                      disabled={!isStopped}
-                      className="px-2 py-1 text-xs bg-[var(--bg-primary)] border border-[var(--border-color)] rounded hover:bg-[var(--border-color)] disabled:opacity-50 transition-colors"
-                    >
-                      ...
-                    </button>
-                    <span className="text-xs text-[var(--text-secondary)] flex-shrink-0">/workspace/</span>
-                    <input
-                      value={pp.mount_name}
-                      onChange={(e) => {
-                        const updated = [...paths];
-                        updated[i] = { ...updated[i], mount_name: e.target.value };
-                        setPaths(updated);
-                      }}
-                      onBlur={async () => {
-                        try { await update({ ...project, paths }); } catch (err) {
-                          console.error("Failed to update paths:", err);
-                        }
-                      }}
-                      placeholder="name"
-                      disabled={!isStopped}
-                      className="w-20 px-2 py-1 bg-[var(--bg-primary)] border border-[var(--border-color)] rounded text-xs text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)] disabled:opacity-50 font-mono"
-                    />
-                    {paths.length > 1 && (
+                        }}
+                        placeholder="/path/to/folder"
+                        disabled={!isStopped}
+                        className="flex-1 min-w-0 px-2 py-1 bg-[var(--bg-primary)] border border-[var(--border-color)] rounded text-xs text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)] disabled:opacity-50"
+                      />
                       <button
                         onClick={async () => {
-                          const updated = paths.filter((_, j) => j !== i);
-                          setPaths(updated);
-                          try { await update({ ...project, paths: updated }); } catch (err) {
-                            console.error("Failed to remove path:", err);
+                          const selected = await open({ directory: true, multiple: false });
+                          if (typeof selected === "string") {
+                            const updated = [...paths];
+                            const basename = selected.replace(/[/\\]$/, "").split(/[/\\]/).pop() || "";
+                            updated[i] = { host_path: selected, mount_name: updated[i].mount_name || basename };
+                            setPaths(updated);
+                            try { await update({ ...project, paths: updated }); } catch (err) {
+                              console.error("Failed to update paths:", err);
+                            }
                           }
                         }}
                         disabled={!isStopped}
-                        className="px-1.5 py-1 text-xs text-[var(--error)] hover:bg-[var(--bg-primary)] rounded disabled:opacity-50 transition-colors"
+                        className="flex-shrink-0 px-2 py-1 text-xs bg-[var(--bg-primary)] border border-[var(--border-color)] rounded hover:bg-[var(--border-color)] disabled:opacity-50 transition-colors"
                       >
-                        x
+                        ...
                       </button>
-                    )}
+                      {paths.length > 1 && (
+                        <button
+                          onClick={async () => {
+                            const updated = paths.filter((_, j) => j !== i);
+                            setPaths(updated);
+                            try { await update({ ...project, paths: updated }); } catch (err) {
+                              console.error("Failed to remove path:", err);
+                            }
+                          }}
+                          disabled={!isStopped}
+                          className="flex-shrink-0 px-1.5 py-1 text-xs text-[var(--error)] hover:bg-[var(--bg-primary)] rounded disabled:opacity-50 transition-colors"
+                        >
+                          x
+                        </button>
+                      )}
+                    </div>
+                    <div className="flex gap-1 items-center mt-0.5 min-w-0">
+                      <span className="text-xs text-[var(--text-secondary)]">/workspace/</span>
+                      <input
+                        value={pp.mount_name}
+                        onChange={(e) => {
+                          const updated = [...paths];
+                          updated[i] = { ...updated[i], mount_name: e.target.value };
+                          setPaths(updated);
+                        }}
+                        onBlur={async () => {
+                          try { await update({ ...project, paths }); } catch (err) {
+                            console.error("Failed to update paths:", err);
+                          }
+                        }}
+                        placeholder="name"
+                        disabled={!isStopped}
+                        className="flex-1 min-w-0 px-2 py-1 bg-[var(--bg-primary)] border border-[var(--border-color)] rounded text-xs text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)] disabled:opacity-50 font-mono"
+                      />
+                    </div>
                   </div>
                 ))}
                 <button

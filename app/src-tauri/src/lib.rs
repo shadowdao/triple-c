@@ -18,6 +18,7 @@ pub fn run() {
     env_logger::init();
 
     tauri::Builder::default()
+        .default_window_icon(tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png")).expect("Failed to load window icon"))
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
