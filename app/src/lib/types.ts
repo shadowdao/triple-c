@@ -3,10 +3,15 @@ export interface EnvVar {
   value: string;
 }
 
+export interface ProjectPath {
+  host_path: string;
+  mount_name: string;
+}
+
 export interface Project {
   id: string;
   name: string;
-  path: string;
+  paths: ProjectPath[];
   container_id: string | null;
   status: ProjectStatus;
   auth_mode: AuthMode;
@@ -83,4 +88,21 @@ export interface AppSettings {
   custom_image_name: string | null;
   global_aws: GlobalAwsSettings;
   global_claude_instructions: string | null;
+  auto_check_updates: boolean;
+  dismissed_update_version: string | null;
+}
+
+export interface UpdateInfo {
+  version: string;
+  tag_name: string;
+  release_url: string;
+  body: string;
+  assets: ReleaseAsset[];
+  published_at: string;
+}
+
+export interface ReleaseAsset {
+  name: string;
+  browser_download_url: string;
+  size: number;
 }

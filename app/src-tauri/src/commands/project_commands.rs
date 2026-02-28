@@ -1,7 +1,7 @@
 use tauri::State;
 
 use crate::docker;
-use crate::models::{container_config, AuthMode, Project, ProjectStatus};
+use crate::models::{container_config, AuthMode, Project, ProjectPath, ProjectStatus};
 use crate::storage::secure;
 use crate::AppState;
 
@@ -51,10 +51,26 @@ pub async fn list_projects(state: State<'_, AppState>) -> Result<Vec<Project>, S
 #[tauri::command]
 pub async fn add_project(
     name: String,
-    path: String,
+    paths: Vec<ProjectPath>,
     state: State<'_, AppState>,
 ) -> Result<Project, String> {
-    let project = Project::new(name, path);
+    // Validate paths
+    if paths.is_empty() {
+        return Err("At least one folder path is required.".to_string());
+    }
+    let mut seen_names = std::collections::HashSet::new();
+    for p in &paths {
+        if p.mount_name.is_empty() {
+            return Err("Mount name cannot be empty.".to_string());
+        }
+        if !p.mount_name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.') {
+            return Err(format!("Mount name '{}' contains invalid characters. Use alphanumeric, dash, underscore, or dot.", p.mount_name));
+        }
+        if !seen_names.insert(p.mount_name.clone()) {
+            return Err(format!("Duplicate mount name '{}'.", p.mount_name));
+        }
+    }
+    let project = Project::new(name, paths);
     store_secrets_for_project(&project)?;
     state.projects_store.add(project)
 }

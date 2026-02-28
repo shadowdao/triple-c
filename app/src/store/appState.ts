@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import type { Project, TerminalSession, AppSettings } from "../lib/types";
+import type { Project, TerminalSession, AppSettings, UpdateInfo } from "../lib/types";
 
 interface AppState {
   // Projects
@@ -30,6 +30,12 @@ interface AppState {
   // App settings
   appSettings: AppSettings | null;
   setAppSettings: (settings: AppSettings) => void;
+
+  // Update info
+  updateInfo: UpdateInfo | null;
+  setUpdateInfo: (info: UpdateInfo | null) => void;
+  appVersion: string;
+  setAppVersion: (version: string) => void;
 }
 
 export const useAppState = create<AppState>((set) => ({
@@ -85,4 +91,10 @@ export const useAppState = create<AppState>((set) => ({
   // App settings
   appSettings: null,
   setAppSettings: (settings) => set({ appSettings: settings }),
+
+  // Update info
+  updateInfo: null,
+  setUpdateInfo: (info) => set({ updateInfo: info }),
+  appVersion: "",
+  setAppVersion: (version) => set({ appVersion: version }),
 }));

@@ -8,7 +8,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use super::client::get_docker;
-use crate::models::{AuthMode, BedrockAuthMethod, ContainerInfo, EnvVar, GlobalAwsSettings, Project};
+use crate::models::{AuthMode, BedrockAuthMethod, ContainerInfo, EnvVar, GlobalAwsSettings, Project, ProjectPath};
 
 /// Compute a fingerprint string for the custom environment variables.
 /// Sorted alphabetically so order changes do not cause spurious recreation.
@@ -60,6 +60,20 @@ fn compute_bedrock_fingerprint(project: &Project) -> String {
     } else {
         String::new()
     }
+}
+
+/// Compute a fingerprint for the project paths so we can detect changes.
+/// Sorted by mount_name so order changes don't cause spurious recreation.
+fn compute_paths_fingerprint(paths: &[ProjectPath]) -> String {
+    let mut parts: Vec<String> = paths
+        .iter()
+        .map(|p| format!("{}:{}", p.mount_name, p.host_path))
+        .collect();
+    parts.sort();
+    let joined = parts.join(",");
+    let mut hasher = DefaultHasher::new();
+    joined.hash(&mut hasher);
+    format!("{:x}", hasher.finish())
 }
 
 pub async fn find_existing_container(project: &Project) -> Result<Option<String>, String> {
@@ -231,24 +245,27 @@ pub async fn create_container(
         env_vars.push(format!("CLAUDE_INSTRUCTIONS={}", instructions));
     }
 
-    let mut mounts = vec![
-        // Project directory -> /workspace
-        Mount {
-            target: Some("/workspace".to_string()),
-            source: Some(project.path.clone()),
+    let mut mounts: Vec<Mount> = Vec::new();
+
+    // Project directories -> /workspace/{mount_name}
+    for pp in &project.paths {
+        mounts.push(Mount {
+            target: Some(format!("/workspace/{}", pp.mount_name)),
+            source: Some(pp.host_path.clone()),
             typ: Some(MountTypeEnum::BIND),
             read_only: Some(false),
             ..Default::default()
-        },
-        // Named volume for claude config persistence
-        Mount {
-            target: Some("/home/claude/.claude".to_string()),
-            source: Some(format!("triple-c-claude-config-{}", project.id)),
-            typ: Some(MountTypeEnum::VOLUME),
-            read_only: Some(false),
-            ..Default::default()
-        },
-    ];
+        });
+    }
+
+    // Named volume for claude config persistence
+    mounts.push(Mount {
+        target: Some("/home/claude/.claude".to_string()),
+        source: Some(format!("triple-c-claude-config-{}", project.id)),
+        typ: Some(MountTypeEnum::VOLUME),
+        read_only: Some(false),
+        ..Default::default()
+    });
 
     // SSH keys mount (read-only staging; entrypoint copies to ~/.ssh with correct perms)
     if let Some(ref ssh_path) = project.ssh_key_path {
@@ -315,7 +332,7 @@ pub async fn create_container(
     labels.insert("triple-c.project-id".to_string(), project.id.clone());
     labels.insert("triple-c.project-name".to_string(), project.name.clone());
     labels.insert("triple-c.auth-mode".to_string(), format!("{:?}", project.auth_mode));
-    labels.insert("triple-c.project-path".to_string(), project.path.clone());
+    labels.insert("triple-c.paths-fingerprint".to_string(), compute_paths_fingerprint(&project.paths));
     labels.insert("triple-c.bedrock-fingerprint".to_string(), compute_bedrock_fingerprint(project));
     labels.insert("triple-c.image".to_string(), image_name.to_string());
 
@@ -324,12 +341,18 @@ pub async fn create_container(
         ..Default::default()
     };
 
+    let working_dir = if project.paths.len() == 1 {
+        format!("/workspace/{}", project.paths[0].mount_name)
+    } else {
+        "/workspace".to_string()
+    };
+
     let config = Config {
         image: Some(image_name.to_string()),
         hostname: Some("triple-c".to_string()),
         env: Some(env_vars),
         labels: Some(labels),
-        working_dir: Some("/workspace".to_string()),
+        working_dir: Some(working_dir),
         host_config: Some(host_config),
         tty: Some(true),
         ..Default::default()
@@ -425,10 +448,18 @@ pub async fn container_needs_recreation(
         }
     }
 
-    // ── Project path ─────────────────────────────────────────────────────
-    if let Some(container_path) = get_label("triple-c.project-path") {
-        if container_path != project.path {
-            log::info!("Project path mismatch (container={:?}, project={:?})", container_path, project.path);
+    // ── Project paths fingerprint ──────────────────────────────────────────
+    let expected_paths_fp = compute_paths_fingerprint(&project.paths);
+    match get_label("triple-c.paths-fingerprint") {
+        Some(container_fp) => {
+            if container_fp != expected_paths_fp {
+                log::info!("Paths fingerprint mismatch (container={:?}, expected={:?})", container_fp, expected_paths_fp);
+                return Ok(true);
+            }
+        }
+        None => {
+            // Old container without paths-fingerprint label -> force recreation for migration
+            log::info!("Container missing paths-fingerprint label, triggering recreation for migration");
             return Ok(true);
         }
     }

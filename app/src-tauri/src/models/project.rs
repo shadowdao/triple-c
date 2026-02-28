@@ -6,11 +6,17 @@ pub struct EnvVar {
     pub value: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProjectPath {
+    pub host_path: String,
+    pub mount_name: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub id: String,
     pub name: String,
-    pub path: String,
+    pub paths: Vec<ProjectPath>,
     pub container_id: Option<String>,
     pub status: ProjectStatus,
     pub auth_mode: AuthMode,
@@ -91,12 +97,12 @@ pub struct BedrockConfig {
 }
 
 impl Project {
-    pub fn new(name: String, path: String) -> Self {
+    pub fn new(name: String, paths: Vec<ProjectPath>) -> Self {
         let now = chrono::Utc::now().to_rfc3339();
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             name,
-            path,
+            paths,
             container_id: None,
             status: ProjectStatus::Stopped,
             auth_mode: AuthMode::default(),
@@ -115,5 +121,30 @@ impl Project {
 
     pub fn container_name(&self) -> String {
         format!("triple-c-{}", self.id)
+    }
+
+    /// Migrate a project JSON value from old single-`path` format to new `paths` format.
+    /// If the value already has `paths`, it is returned unchanged.
+    pub fn migrate_from_value(mut val: serde_json::Value) -> serde_json::Value {
+        if let Some(obj) = val.as_object_mut() {
+            if obj.contains_key("paths") {
+                return val;
+            }
+            if let Some(path_val) = obj.remove("path") {
+                let path_str = path_val.as_str().unwrap_or("").to_string();
+                let mount_name = path_str
+                    .trim_end_matches(['/', '\\'])
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .unwrap_or("workspace")
+                    .to_string();
+                let project_path = serde_json::json!([{
+                    "host_path": path_str,
+                    "mount_name": if mount_name.is_empty() { "workspace".to_string() } else { mount_name },
+                }]);
+                obj.insert("paths".to_string(), project_path);
+            }
+        }
+        val
     }
 }

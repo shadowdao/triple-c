@@ -7,12 +7,14 @@ import TerminalView from "./components/terminal/TerminalView";
 import { useDocker } from "./hooks/useDocker";
 import { useSettings } from "./hooks/useSettings";
 import { useProjects } from "./hooks/useProjects";
+import { useUpdates } from "./hooks/useUpdates";
 import { useAppState } from "./store/appState";
 
 export default function App() {
   const { checkDocker, checkImage } = useDocker();
   const { checkApiKey, loadSettings } = useSettings();
   const { refresh } = useProjects();
+  const { loadVersion, checkForUpdates, startPeriodicCheck } = useUpdates();
   const { sessions, activeSessionId } = useAppState(
     useShallow(s => ({ sessions: s.sessions, activeSessionId: s.activeSessionId }))
   );
@@ -25,6 +27,15 @@ export default function App() {
     });
     checkApiKey();
     refresh();
+
+    // Update detection
+    loadVersion();
+    const updateTimer = setTimeout(() => checkForUpdates(), 3000);
+    const cleanup = startPeriodicCheck();
+    return () => {
+      clearTimeout(updateTimer);
+      cleanup?.();
+    };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (

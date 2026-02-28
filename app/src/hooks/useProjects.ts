@@ -2,6 +2,7 @@ import { useCallback } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { useAppState } from "../store/appState";
 import * as commands from "../lib/tauri-commands";
+import type { ProjectPath } from "../lib/types";
 
 export function useProjects() {
   const {
@@ -30,8 +31,8 @@ export function useProjects() {
   }, [setProjects]);
 
   const add = useCallback(
-    async (name: string, path: string) => {
-      const project = await commands.addProject(name, path);
+    async (name: string, paths: ProjectPath[]) => {
+      const project = await commands.addProject(name, paths);
       // Refresh from backend to avoid stale closure issues
       const list = await commands.listProjects();
       setProjects(list);

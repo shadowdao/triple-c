@@ -19,33 +19,72 @@ impl ProjectsStore {
 
         let file_path = data_dir.join("projects.json");
 
-        let projects = if file_path.exists() {
+        let (projects, needs_save) = if file_path.exists() {
             match fs::read_to_string(&file_path) {
-                Ok(data) => match serde_json::from_str(&data) {
-                    Ok(parsed) => parsed,
-                    Err(e) => {
-                        log::error!("Failed to parse projects.json: {}. Starting with empty list.", e);
-                        // Back up the corrupted file
-                        let backup = file_path.with_extension("json.bak");
-                        if let Err(be) = fs::copy(&file_path, &backup) {
-                            log::error!("Failed to back up corrupted projects.json: {}", be);
+                Ok(data) => {
+                    // First try to parse as Vec<Value> to run migration
+                    match serde_json::from_str::<Vec<serde_json::Value>>(&data) {
+                        Ok(raw_values) => {
+                            let mut migrated = false;
+                            let migrated_values: Vec<serde_json::Value> = raw_values
+                                .into_iter()
+                                .map(|v| {
+                                    let has_path = v.as_object().map_or(false, |o| o.contains_key("path") && !o.contains_key("paths"));
+                                    if has_path {
+                                        migrated = true;
+                                    }
+                                    crate::models::Project::migrate_from_value(v)
+                                })
+                                .collect();
+
+                            // Now deserialize the migrated values
+                            let json_str = serde_json::to_string(&migrated_values).unwrap_or_default();
+                            match serde_json::from_str::<Vec<crate::models::Project>>(&json_str) {
+                                Ok(parsed) => (parsed, migrated),
+                                Err(e) => {
+                                    log::error!("Failed to parse migrated projects.json: {}. Starting with empty list.", e);
+                                    let backup = file_path.with_extension("json.bak");
+                                    if let Err(be) = fs::copy(&file_path, &backup) {
+                                        log::error!("Failed to back up corrupted projects.json: {}", be);
+                                    }
+                                    (Vec::new(), false)
+                                }
+                            }
                         }
-                        Vec::new()
+                        Err(e) => {
+                            log::error!("Failed to parse projects.json: {}. Starting with empty list.", e);
+                            let backup = file_path.with_extension("json.bak");
+                            if let Err(be) = fs::copy(&file_path, &backup) {
+                                log::error!("Failed to back up corrupted projects.json: {}", be);
+                            }
+                            (Vec::new(), false)
+                        }
                     }
-                },
+                }
                 Err(e) => {
                     log::error!("Failed to read projects.json: {}", e);
-                    Vec::new()
+                    (Vec::new(), false)
                 }
             }
         } else {
-            Vec::new()
+            (Vec::new(), false)
         };
 
-        Ok(Self {
+        let store = Self {
             projects: Mutex::new(projects),
             file_path,
-        })
+        };
+
+        // Persist migrated format back to disk
+        if needs_save {
+            log::info!("Migrated projects.json from single-path to multi-path format");
+            let projects = store.lock();
+            if let Err(e) = store.save(&projects) {
+                log::error!("Failed to save migrated projects: {}", e);
+            }
+        }
+
+        Ok(store)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Project>> {

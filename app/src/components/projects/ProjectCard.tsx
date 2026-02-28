@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import type { Project, AuthMode, BedrockConfig, BedrockAuthMethod } from "../../lib/types";
+import type { Project, ProjectPath, AuthMode, BedrockConfig, BedrockAuthMethod } from "../../lib/types";
 import { useProjects } from "../../hooks/useProjects";
 import { useTerminal } from "../../hooks/useTerminal";
 import { useAppState } from "../../store/appState";
@@ -21,6 +21,7 @@ export default function ProjectCard({ project }: Props) {
   const isStopped = project.status === "stopped" || project.status === "error";
 
   // Local state for text fields (save on blur, not on every keystroke)
+  const [paths, setPaths] = useState<ProjectPath[]>(project.paths ?? []);
   const [sshKeyPath, setSshKeyPath] = useState(project.ssh_key_path ?? "");
   const [gitName, setGitName] = useState(project.git_user_name ?? "");
   const [gitEmail, setGitEmail] = useState(project.git_user_email ?? "");
@@ -39,6 +40,7 @@ export default function ProjectCard({ project }: Props) {
 
   // Sync local state when project prop changes (e.g., after save or external update)
   useEffect(() => {
+    setPaths(project.paths ?? []);
     setSshKeyPath(project.ssh_key_path ?? "");
     setGitName(project.git_user_name ?? "");
     setGitEmail(project.git_user_email ?? "");
@@ -263,8 +265,14 @@ export default function ProjectCard({ project }: Props) {
         <span className={`w-2 h-2 rounded-full flex-shrink-0 ${statusColor}`} />
         <span className="text-sm font-medium truncate flex-1">{project.name}</span>
       </div>
-      <div className="text-xs text-[var(--text-secondary)] truncate mt-0.5 ml-4">
-        {project.path}
+      <div className="mt-0.5 ml-4 space-y-0.5">
+        {project.paths.map((pp, i) => (
+          <div key={i} className="text-xs text-[var(--text-secondary)] truncate">
+            <span className="font-mono">/workspace/{pp.mount_name}</span>
+            <span className="mx-1">&larr;</span>
+            <span>{pp.host_path}</span>
+          </div>
+        ))}
       </div>
 
       {isSelected && (
@@ -352,6 +360,91 @@ export default function ProjectCard({ project }: Props) {
           {/* Config panel */}
           {showConfig && (
             <div className="space-y-2 pt-1 border-t border-[var(--border-color)]" onClick={(e) => e.stopPropagation()}>
+              {/* Folder paths */}
+              <div>
+                <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Folders</label>
+                {paths.map((pp, i) => (
+                  <div key={i} className="flex gap-1 mb-1 items-center">
+                    <input
+                      value={pp.host_path}
+                      onChange={(e) => {
+                        const updated = [...paths];
+                        updated[i] = { ...updated[i], host_path: e.target.value };
+                        setPaths(updated);
+                      }}
+                      onBlur={async () => {
+                        try { await update({ ...project, paths }); } catch (err) {
+                          console.error("Failed to update paths:", err);
+                        }
+                      }}
+                      placeholder="/path/to/folder"
+                      disabled={!isStopped}
+                      className="flex-1 px-2 py-1 bg-[var(--bg-primary)] border border-[var(--border-color)] rounded text-xs text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)] disabled:opacity-50"
+                    />
+                    <button
+                      onClick={async () => {
+                        const selected = await open({ directory: true, multiple: false });
+                        if (typeof selected === "string") {
+                          const updated = [...paths];
+                          const basename = selected.replace(/[/\\]$/, "").split(/[/\\]/).pop() || "";
+                          updated[i] = { host_path: selected, mount_name: updated[i].mount_name || basename };
+                          setPaths(updated);
+                          try { await update({ ...project, paths: updated }); } catch (err) {
+                            console.error("Failed to update paths:", err);
+                          }
+                        }
+                      }}
+                      disabled={!isStopped}
+                      className="px-2 py-1 text-xs bg-[var(--bg-primary)] border border-[var(--border-color)] rounded hover:bg-[var(--border-color)] disabled:opacity-50 transition-colors"
+                    >
+                      ...
+                    </button>
+                    <span className="text-xs text-[var(--text-secondary)] flex-shrink-0">/workspace/</span>
+                    <input
+                      value={pp.mount_name}
+                      onChange={(e) => {
+                        const updated = [...paths];
+                        updated[i] = { ...updated[i], mount_name: e.target.value };
+                        setPaths(updated);
+                      }}
+                      onBlur={async () => {
+                        try { await update({ ...project, paths }); } catch (err) {
+                          console.error("Failed to update paths:", err);
+                        }
+                      }}
+                      placeholder="name"
+                      disabled={!isStopped}
+                      className="w-20 px-2 py-1 bg-[var(--bg-primary)] border border-[var(--border-color)] rounded text-xs text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)] disabled:opacity-50 font-mono"
+                    />
+                    {paths.length > 1 && (
+                      <button
+                        onClick={async () => {
+                          const updated = paths.filter((_, j) => j !== i);
+                          setPaths(updated);
+                          try { await update({ ...project, paths: updated }); } catch (err) {
+                            console.error("Failed to remove path:", err);
+                          }
+                        }}
+                        disabled={!isStopped}
+                        className="px-1.5 py-1 text-xs text-[var(--error)] hover:bg-[var(--bg-primary)] rounded disabled:opacity-50 transition-colors"
+                      >
+                        x
+                      </button>
+                    )}
+                  </div>
+                ))}
+                <button
+                  onClick={async () => {
+                    const updated = [...paths, { host_path: "", mount_name: "" }];
+                    setPaths(updated);
+                  }}
+                  disabled={!isStopped}
+                  className="text-xs text-[var(--accent)] hover:text-[var(--accent-hover)] disabled:opacity-50 transition-colors"
+                >
+                  + Add folder
+                </button>
+              </div>
+
               {/* SSH Key */}
               <div>
                 <label className="block text-xs text-[var(--text-secondary)] mb-0.5">SSH Key Directory</label>

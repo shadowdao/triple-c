@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ContainerInfo, SiblingContainer, AppSettings } from "./types";
+import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo } from "./types";
 
 // Docker
 export const checkDocker = () => invoke<boolean>("check_docker");
@@ -12,8 +12,8 @@ export const listSiblingContainers = () =>
 
 // Projects
 export const listProjects = () => invoke<Project[]>("list_projects");
-export const addProject = (name: string, path: string) =>
-  invoke<Project>("add_project", { name, path });
+export const addProject = (name: string, paths: ProjectPath[]) =>
+  invoke<Project>("add_project", { name, paths });
 export const removeProject = (projectId: string) =>
   invoke<void>("remove_project", { projectId });
 export const updateProject = (project: Project) =>
@@ -49,3 +49,8 @@ export const terminalResize = (sessionId: string, cols: number, rows: number) =>
   invoke<void>("terminal_resize", { sessionId, cols, rows });
 export const closeTerminalSession = (sessionId: string) =>
   invoke<void>("close_terminal_session", { sessionId });
+
+// Updates
+export const getAppVersion = () => invoke<string>("get_app_version");
+export const checkForUpdates = () =>
+  invoke<UpdateInfo | null>("check_for_updates");

@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ImageSource {
@@ -52,6 +56,10 @@ pub struct AppSettings {
     pub global_aws: GlobalAwsSettings,
     #[serde(default)]
     pub global_claude_instructions: Option<String>,
+    #[serde(default = "default_true")]
+    pub auto_check_updates: bool,
+    #[serde(default)]
+    pub dismissed_update_version: Option<String>,
 }
 
 impl Default for AppSettings {
@@ -65,6 +73,8 @@ impl Default for AppSettings {
             custom_image_name: None,
             global_aws: GlobalAwsSettings::default(),
             global_claude_instructions: None,
+            auto_check_updates: true,
+            dismissed_update_version: None,
         }
     }
 }
