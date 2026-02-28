@@ -97,6 +97,7 @@ export default function TerminalView({ sessionId, active }: Props) {
     // Fix: buffer recent output, strip ANSI codes, and after a short
     // debounce check for a URL that spans multiple lines.  When found,
     // write a single clean clickable copy to the terminal.
+    const textDecoder = new TextDecoder();
     let outputBuffer = "";
     let debounceTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -117,14 +118,14 @@ export default function TerminalView({ sessionId, active }: Props) {
     };
 
     // Handle backend output -> terminal
-    let unlistenOutput: (() => void) | null = null;
-    let unlistenExit: (() => void) | null = null;
+    let aborted = false;
 
-    onOutput(sessionId, (data) => {
+    const outputPromise = onOutput(sessionId, (data) => {
+      if (aborted) return;
       term.write(data);
 
-      // Accumulate for URL detection
-      outputBuffer += data;
+      // Accumulate for URL detection (data is a Uint8Array, so decode it)
+      outputBuffer += textDecoder.decode(data);
       // Cap buffer size to avoid memory growth
       if (outputBuffer.length > 8192) {
         outputBuffer = outputBuffer.slice(-4096);
@@ -132,27 +133,37 @@ export default function TerminalView({ sessionId, active }: Props) {
       if (debounceTimer) clearTimeout(debounceTimer);
       debounceTimer = setTimeout(flushUrlBuffer, 150);
     }).then((unlisten) => {
-      unlistenOutput = unlisten;
+      if (aborted) unlisten();
+      return unlisten;
     });
 
-    onExit(sessionId, () => {
+    const exitPromise = onExit(sessionId, () => {
+      if (aborted) return;
       term.write("\r\n\x1b[33m[Session ended]\x1b[0m\r\n");
     }).then((unlisten) => {
-      unlistenExit = unlisten;
+      if (aborted) unlisten();
+      return unlisten;
     });
 
-    // Handle resize
+    // Handle resize (throttled via requestAnimationFrame to avoid excessive calls)
+    let resizeRafId: number | null = null;
     const resizeObserver = new ResizeObserver(() => {
-      fitAddon.fit();
-      resize(sessionId, term.cols, term.rows);
+      if (resizeRafId !== null) return;
+      resizeRafId = requestAnimationFrame(() => {
+        resizeRafId = null;
+        fitAddon.fit();
+        resize(sessionId, term.cols, term.rows);
+      });
     });
     resizeObserver.observe(containerRef.current);
 
     return () => {
+      aborted = true;
       if (debounceTimer) clearTimeout(debounceTimer);
       inputDisposable.dispose();
-      unlistenOutput?.();
-      unlistenExit?.();
+      outputPromise.then((fn) => fn?.());
+      exitPromise.then((fn) => fn?.());
+      if (resizeRafId !== null) cancelAnimationFrame(resizeRafId);
       resizeObserver.disconnect();
       term.dispose();
     };
