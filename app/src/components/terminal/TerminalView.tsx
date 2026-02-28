@@ -21,6 +21,7 @@ export default function TerminalView({ sessionId, active }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
+  const webglRef = useRef<WebglAddon | null>(null);
   const { sendInput, resize, onOutput, onExit } = useTerminal();
 
   useEffect(() => {
@@ -68,13 +69,8 @@ export default function TerminalView({ sessionId, active }: Props) {
 
     term.open(containerRef.current);
 
-    // Try WebGL renderer, fall back silently
-    try {
-      const webglAddon = new WebglAddon();
-      term.loadAddon(webglAddon);
-    } catch {
-      // WebGL not available, canvas renderer is fine
-    }
+    // WebGL addon is loaded/disposed dynamically in the active effect
+    // to avoid exhausting the browser's limited WebGL context pool.
 
     fitAddon.fit();
     termRef.current = term;
@@ -145,12 +141,16 @@ export default function TerminalView({ sessionId, active }: Props) {
       return unlisten;
     });
 
-    // Handle resize (throttled via requestAnimationFrame to avoid excessive calls)
+    // Handle resize (throttled via requestAnimationFrame to avoid excessive calls).
+    // Skip resize work for hidden terminals — containerRef will have 0 dimensions.
     let resizeRafId: number | null = null;
     const resizeObserver = new ResizeObserver(() => {
       if (resizeRafId !== null) return;
+      const el = containerRef.current;
+      if (!el || el.offsetWidth === 0 || el.offsetHeight === 0) return;
       resizeRafId = requestAnimationFrame(() => {
         resizeRafId = null;
+        if (!containerRef.current || containerRef.current.offsetWidth === 0) return;
         fitAddon.fit();
         resize(sessionId, term.cols, term.rows);
       });
@@ -165,15 +165,42 @@ export default function TerminalView({ sessionId, active }: Props) {
       exitPromise.then((fn) => fn?.());
       if (resizeRafId !== null) cancelAnimationFrame(resizeRafId);
       resizeObserver.disconnect();
+      try { webglRef.current?.dispose(); } catch { /* may already be disposed */ }
+      webglRef.current = null;
       term.dispose();
     };
   }, [sessionId]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Re-fit when tab becomes active
+  // Manage WebGL lifecycle and re-fit when tab becomes active.
+  // Only the active terminal holds a WebGL context to avoid exhausting
+  // the browser's limited pool (~8-16 contexts).
   useEffect(() => {
-    if (active && fitRef.current && termRef.current) {
-      fitRef.current.fit();
-      termRef.current.focus();
+    const term = termRef.current;
+    if (!term) return;
+
+    if (active) {
+      // Attach WebGL renderer
+      if (!webglRef.current) {
+        try {
+          const addon = new WebglAddon();
+          addon.onContextLoss(() => {
+            try { addon.dispose(); } catch { /* ignore */ }
+            webglRef.current = null;
+          });
+          term.loadAddon(addon);
+          webglRef.current = addon;
+        } catch {
+          // WebGL not available, canvas renderer is fine
+        }
+      }
+      fitRef.current?.fit();
+      term.focus();
+    } else {
+      // Release WebGL context for inactive terminals
+      if (webglRef.current) {
+        try { webglRef.current.dispose(); } catch { /* ignore */ }
+        webglRef.current = null;
+      }
     }
   }, [active]);
 
