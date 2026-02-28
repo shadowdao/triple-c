@@ -10,9 +10,9 @@ pub struct SettingsStore {
 }
 
 impl SettingsStore {
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self, String> {
         let data_dir = dirs::data_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
+            .ok_or_else(|| "Could not determine data directory. Set XDG_DATA_HOME on Linux.".to_string())?
             .join("triple-c");
 
         fs::create_dir_all(&data_dir).ok();
@@ -41,10 +41,10 @@ impl SettingsStore {
             AppSettings::default()
         };
 
-        Self {
+        Ok(Self {
             settings: Mutex::new(settings),
             file_path,
-        }
+        })
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, AppSettings> {

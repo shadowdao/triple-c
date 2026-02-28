@@ -5,6 +5,44 @@ use crate::models::{container_config, AuthMode, Project, ProjectStatus};
 use crate::storage::secure;
 use crate::AppState;
 
+/// Extract secret fields from a project and store them in the OS keychain.
+fn store_secrets_for_project(project: &Project) -> Result<(), String> {
+    if let Some(ref token) = project.git_token {
+        secure::store_project_secret(&project.id, "git-token", token)?;
+    }
+    if let Some(ref bedrock) = project.bedrock_config {
+        if let Some(ref v) = bedrock.aws_access_key_id {
+            secure::store_project_secret(&project.id, "aws-access-key-id", v)?;
+        }
+        if let Some(ref v) = bedrock.aws_secret_access_key {
+            secure::store_project_secret(&project.id, "aws-secret-access-key", v)?;
+        }
+        if let Some(ref v) = bedrock.aws_session_token {
+            secure::store_project_secret(&project.id, "aws-session-token", v)?;
+        }
+        if let Some(ref v) = bedrock.aws_bearer_token {
+            secure::store_project_secret(&project.id, "aws-bearer-token", v)?;
+        }
+    }
+    Ok(())
+}
+
+/// Populate secret fields on a project struct from the OS keychain.
+fn load_secrets_for_project(project: &mut Project) {
+    project.git_token = secure::get_project_secret(&project.id, "git-token")
+        .unwrap_or(None);
+    if let Some(ref mut bedrock) = project.bedrock_config {
+        bedrock.aws_access_key_id = secure::get_project_secret(&project.id, "aws-access-key-id")
+            .unwrap_or(None);
+        bedrock.aws_secret_access_key = secure::get_project_secret(&project.id, "aws-secret-access-key")
+            .unwrap_or(None);
+        bedrock.aws_session_token = secure::get_project_secret(&project.id, "aws-session-token")
+            .unwrap_or(None);
+        bedrock.aws_bearer_token = secure::get_project_secret(&project.id, "aws-bearer-token")
+            .unwrap_or(None);
+    }
+}
+
 #[tauri::command]
 pub async fn list_projects(state: State<'_, AppState>) -> Result<Vec<Project>, String> {
     Ok(state.projects_store.list())
@@ -17,6 +55,7 @@ pub async fn add_project(
     state: State<'_, AppState>,
 ) -> Result<Project, String> {
     let project = Project::new(name, path);
+    store_secrets_for_project(&project)?;
     state.projects_store.add(project)
 }
 
@@ -34,6 +73,11 @@ pub async fn remove_project(
         }
     }
 
+    // Clean up keychain secrets for this project
+    if let Err(e) = secure::delete_project_secrets(&project_id) {
+        log::warn!("Failed to delete keychain secrets for project {}: {}", project_id, e);
+    }
+
     state.projects_store.remove(&project_id)
 }
 
@@ -42,6 +86,7 @@ pub async fn update_project(
     project: Project,
     state: State<'_, AppState>,
 ) -> Result<Project, String> {
+    store_secrets_for_project(&project)?;
     state.projects_store.update(project)
 }
 
@@ -54,6 +99,10 @@ pub async fn start_project_container(
         .projects_store
         .get(&project_id)
         .ok_or_else(|| format!("Project {} not found", project_id))?;
+
+    // Populate secret fields from the OS keychain so they are available
+    // in memory when building environment variables for the container.
+    load_secrets_for_project(&mut project);
 
     // Load settings for image resolution and global AWS
     let settings = state.settings_store.get();
@@ -83,39 +132,51 @@ pub async fn start_project_container(
     // Update status to starting
     state.projects_store.update_status(&project_id, ProjectStatus::Starting)?;
 
-    // Ensure image exists
-    if !docker::image_exists(&image_name).await? {
-        state.projects_store.update_status(&project_id, ProjectStatus::Stopped)?;
-        return Err(format!("Docker image '{}' not found. Please pull or build the image first.", image_name));
-    }
+    // Wrap container operations so that any failure resets status to Stopped.
+    let result: Result<String, String> = async {
+        // Ensure image exists
+        if !docker::image_exists(&image_name).await? {
+            return Err(format!("Docker image '{}' not found. Please pull or build the image first.", image_name));
+        }
 
-    // Determine docker socket path
-    let docker_socket = settings.docker_socket_path
-        .as_deref()
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| default_docker_socket());
+        // Determine docker socket path
+        let docker_socket = settings.docker_socket_path
+            .as_deref()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| default_docker_socket());
 
-    // AWS config path from global settings
-    let aws_config_path = settings.global_aws.aws_config_path.clone();
+        // AWS config path from global settings
+        let aws_config_path = settings.global_aws.aws_config_path.clone();
 
-    // Check for existing container
-    let container_id = if let Some(existing_id) = docker::find_existing_container(&project).await? {
-        // Compare the running container's configuration (mounts, env vars)
-        // against the current project settings. If anything changed (SSH key
-        // path, git config, docker socket, etc.) we recreate the container.
-        // Safe to recreate: the claude config named volume is keyed by
-        // project ID (not container ID) so it persists across recreation.
-        let needs_recreation = docker::container_needs_recreation(
-                &existing_id,
-                &project,
-                settings.global_claude_instructions.as_deref(),
-            )
-            .await
-            .unwrap_or(false);
-        if needs_recreation {
-            log::info!("Container config changed, recreating container for project {}", project.id);
-            let _ = docker::stop_container(&existing_id).await;
-            docker::remove_container(&existing_id).await?;
+        // Check for existing container
+        let container_id = if let Some(existing_id) = docker::find_existing_container(&project).await? {
+            let needs_recreation = docker::container_needs_recreation(
+                    &existing_id,
+                    &project,
+                    settings.global_claude_instructions.as_deref(),
+                )
+                .await
+                .unwrap_or(false);
+            if needs_recreation {
+                log::info!("Container config changed, recreating container for project {}", project.id);
+                let _ = docker::stop_container(&existing_id).await;
+                docker::remove_container(&existing_id).await?;
+                let new_id = docker::create_container(
+                    &project,
+                    api_key.as_deref(),
+                    &docker_socket,
+                    &image_name,
+                    aws_config_path.as_deref(),
+                    &settings.global_aws,
+                    settings.global_claude_instructions.as_deref(),
+                ).await?;
+                docker::start_container(&new_id).await?;
+                new_id
+            } else {
+                docker::start_container(&existing_id).await?;
+                existing_id
+            }
+        } else {
             let new_id = docker::create_container(
                 &project,
                 api_key.as_deref(),
@@ -127,27 +188,20 @@ pub async fn start_project_container(
             ).await?;
             docker::start_container(&new_id).await?;
             new_id
-        } else {
-            // Start existing container as-is
-            docker::start_container(&existing_id).await?;
-            existing_id
-        }
-    } else {
-        // Create new container
-        let new_id = docker::create_container(
-            &project,
-            api_key.as_deref(),
-            &docker_socket,
-            &image_name,
-            aws_config_path.as_deref(),
-            &settings.global_aws,
-            settings.global_claude_instructions.as_deref(),
-        ).await?;
-        docker::start_container(&new_id).await?;
-        new_id
-    };
+        };
 
-    // Update project with container info
+        Ok(container_id)
+    }.await;
+
+    // On failure, reset status to Stopped so the project doesn't get stuck.
+    if let Err(ref e) = result {
+        log::error!("Failed to start container for project {}: {}", project_id, e);
+        let _ = state.projects_store.update_status(&project_id, ProjectStatus::Stopped);
+    }
+
+    let container_id = result?;
+
+    // Update project with container info using granular methods (Issue 14: TOCTOU)
     state.projects_store.set_container_id(&project_id, Some(container_id.clone()))?;
     state.projects_store.update_status(&project_id, ProjectStatus::Running)?;
 

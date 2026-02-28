@@ -17,6 +17,7 @@ pub struct Project {
     pub bedrock_config: Option<BedrockConfig>,
     pub allow_docker_access: bool,
     pub ssh_key_path: Option<String>,
+    #[serde(skip_serializing)]
     pub git_token: Option<String>,
     pub git_user_name: Option<String>,
     pub git_user_email: Option<String>,
@@ -76,10 +77,14 @@ impl Default for BedrockAuthMethod {
 pub struct BedrockConfig {
     pub auth_method: BedrockAuthMethod,
     pub aws_region: String,
+    #[serde(skip_serializing)]
     pub aws_access_key_id: Option<String>,
+    #[serde(skip_serializing)]
     pub aws_secret_access_key: Option<String>,
+    #[serde(skip_serializing)]
     pub aws_session_token: Option<String>,
     pub aws_profile: Option<String>,
+    #[serde(skip_serializing)]
     pub aws_bearer_token: Option<String>,
     pub model_id: Option<String>,
     pub disable_prompt_caching: bool,

@@ -4,9 +4,63 @@ use bollard::container::{
 };
 use bollard::models::{ContainerSummary, HostConfig, Mount, MountTypeEnum};
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 use super::client::get_docker;
-use crate::models::{AuthMode, BedrockAuthMethod, ContainerInfo, GlobalAwsSettings, Project};
+use crate::models::{AuthMode, BedrockAuthMethod, ContainerInfo, EnvVar, GlobalAwsSettings, Project};
+
+/// Compute a fingerprint string for the custom environment variables.
+/// Sorted alphabetically so order changes do not cause spurious recreation.
+fn compute_env_fingerprint(custom_env_vars: &[EnvVar]) -> String {
+    let reserved_prefixes = ["ANTHROPIC_", "AWS_", "GIT_", "HOST_", "CLAUDE_", "TRIPLE_C_"];
+    let mut parts: Vec<String> = Vec::new();
+    for env_var in custom_env_vars {
+        let key = env_var.key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        let is_reserved = reserved_prefixes.iter().any(|p| key.to_uppercase().starts_with(p));
+        if is_reserved {
+            continue;
+        }
+        parts.push(format!("{}={}", key, env_var.value));
+    }
+    parts.sort();
+    parts.join(",")
+}
+
+/// Merge global and per-project Claude instructions into a single string.
+fn merge_claude_instructions(
+    global_instructions: Option<&str>,
+    project_instructions: Option<&str>,
+) -> Option<String> {
+    match (global_instructions, project_instructions) {
+        (Some(g), Some(p)) => Some(format!("{}\n\n{}", g, p)),
+        (Some(g), None) => Some(g.to_string()),
+        (None, Some(p)) => Some(p.to_string()),
+        (None, None) => None,
+    }
+}
+
+/// Compute a fingerprint for the Bedrock configuration so we can detect changes.
+fn compute_bedrock_fingerprint(project: &Project) -> String {
+    if let Some(ref bedrock) = project.bedrock_config {
+        let mut hasher = DefaultHasher::new();
+        format!("{:?}", bedrock.auth_method).hash(&mut hasher);
+        bedrock.aws_region.hash(&mut hasher);
+        bedrock.aws_access_key_id.hash(&mut hasher);
+        bedrock.aws_secret_access_key.hash(&mut hasher);
+        bedrock.aws_session_token.hash(&mut hasher);
+        bedrock.aws_profile.hash(&mut hasher);
+        bedrock.aws_bearer_token.hash(&mut hasher);
+        bedrock.model_id.hash(&mut hasher);
+        bedrock.disable_prompt_caching.hash(&mut hasher);
+        format!("{:x}", hasher.finish())
+    } else {
+        String::new()
+    }
+}
 
 pub async fn find_existing_container(project: &Project) -> Result<Option<String>, String> {
     let docker = get_docker()?;
@@ -153,7 +207,6 @@ pub async fn create_container(
 
     // Custom environment variables
     let reserved_prefixes = ["ANTHROPIC_", "AWS_", "GIT_", "HOST_", "CLAUDE_", "TRIPLE_C_"];
-    let mut custom_env_fingerprint_parts: Vec<String> = Vec::new();
     for env_var in &project.custom_env_vars {
         let key = env_var.key.trim();
         if key.is_empty() {
@@ -165,19 +218,15 @@ pub async fn create_container(
             continue;
         }
         env_vars.push(format!("{}={}", key, env_var.value));
-        custom_env_fingerprint_parts.push(format!("{}={}", key, env_var.value));
     }
-    custom_env_fingerprint_parts.sort();
-    let custom_env_fingerprint = custom_env_fingerprint_parts.join(",");
+    let custom_env_fingerprint = compute_env_fingerprint(&project.custom_env_vars);
     env_vars.push(format!("TRIPLE_C_CUSTOM_ENV={}", custom_env_fingerprint));
 
     // Claude instructions (global + per-project)
-    let combined_instructions = match (global_claude_instructions, project.claude_instructions.as_deref()) {
-        (Some(g), Some(p)) => Some(format!("{}\n\n{}", g, p)),
-        (Some(g), None) => Some(g.to_string()),
-        (None, Some(p)) => Some(p.to_string()),
-        (None, None) => None,
-    };
+    let combined_instructions = merge_claude_instructions(
+        global_claude_instructions,
+        project.claude_instructions.as_deref(),
+    );
     if let Some(ref instructions) = combined_instructions {
         env_vars.push(format!("CLAUDE_INSTRUCTIONS={}", instructions));
     }
@@ -265,6 +314,10 @@ pub async fn create_container(
     labels.insert("triple-c.managed".to_string(), "true".to_string());
     labels.insert("triple-c.project-id".to_string(), project.id.clone());
     labels.insert("triple-c.project-name".to_string(), project.name.clone());
+    labels.insert("triple-c.auth-mode".to_string(), format!("{:?}", project.auth_mode));
+    labels.insert("triple-c.project-path".to_string(), project.path.clone());
+    labels.insert("triple-c.bedrock-fingerprint".to_string(), compute_bedrock_fingerprint(project));
+    labels.insert("triple-c.image".to_string(), image_name.to_string());
 
     let host_config = HostConfig {
         mounts: Some(mounts),
@@ -343,6 +396,15 @@ pub async fn container_needs_recreation(
         .await
         .map_err(|e| format!("Failed to inspect container: {}", e))?;
 
+    let labels = info
+        .config
+        .as_ref()
+        .and_then(|c| c.labels.as_ref());
+
+    let get_label = |name: &str| -> Option<String> {
+        labels.and_then(|l| l.get(name).cloned())
+    };
+
     let mounts = info
         .host_config
         .as_ref()
@@ -353,6 +415,50 @@ pub async fn container_needs_recreation(
     // should not trigger a full container recreation (which loses Claude
     // Code settings stored in the named volume). The change takes effect
     // on the next explicit rebuild instead.
+
+    // ── Auth mode ────────────────────────────────────────────────────────
+    let current_auth_mode = format!("{:?}", project.auth_mode);
+    if let Some(container_auth_mode) = get_label("triple-c.auth-mode") {
+        if container_auth_mode != current_auth_mode {
+            log::info!("Auth mode mismatch (container={:?}, project={:?})", container_auth_mode, current_auth_mode);
+            return Ok(true);
+        }
+    }
+
+    // ── Project path ─────────────────────────────────────────────────────
+    if let Some(container_path) = get_label("triple-c.project-path") {
+        if container_path != project.path {
+            log::info!("Project path mismatch (container={:?}, project={:?})", container_path, project.path);
+            return Ok(true);
+        }
+    }
+
+    // ── Bedrock config fingerprint ───────────────────────────────────────
+    let expected_bedrock_fp = compute_bedrock_fingerprint(project);
+    let container_bedrock_fp = get_label("triple-c.bedrock-fingerprint").unwrap_or_default();
+    if container_bedrock_fp != expected_bedrock_fp {
+        log::info!("Bedrock config mismatch");
+        return Ok(true);
+    }
+
+    // ── Image ────────────────────────────────────────────────────────────
+    // The image label is set at creation time; if the user changed the
+    // configured image we need to recreate.  We only compare when the
+    // label exists (containers created before this change won't have it).
+    if let Some(container_image) = get_label("triple-c.image") {
+        // The caller doesn't pass the image name, but we can read the
+        // container's actual image from Docker inspect.
+        let actual_image = info
+            .config
+            .as_ref()
+            .and_then(|c| c.image.as_ref());
+        if let Some(actual) = actual_image {
+            if *actual != container_image {
+                log::info!("Image mismatch (actual={:?}, label={:?})", actual, container_image);
+                return Ok(true);
+            }
+        }
+    }
 
     // ── SSH key path mount ───────────────────────────────────────────────
     let ssh_mount_source = mounts
@@ -403,21 +509,7 @@ pub async fn container_needs_recreation(
     }
 
     // ── Custom environment variables ──────────────────────────────────────
-    let reserved_prefixes = ["ANTHROPIC_", "AWS_", "GIT_", "HOST_", "CLAUDE_", "TRIPLE_C_"];
-    let mut expected_parts: Vec<String> = Vec::new();
-    for env_var in &project.custom_env_vars {
-        let key = env_var.key.trim();
-        if key.is_empty() {
-            continue;
-        }
-        let is_reserved = reserved_prefixes.iter().any(|p| key.to_uppercase().starts_with(p));
-        if is_reserved {
-            continue;
-        }
-        expected_parts.push(format!("{}={}", key, env_var.value));
-    }
-    expected_parts.sort();
-    let expected_fingerprint = expected_parts.join(",");
+    let expected_fingerprint = compute_env_fingerprint(&project.custom_env_vars);
     let container_fingerprint = get_env("TRIPLE_C_CUSTOM_ENV").unwrap_or_default();
     if container_fingerprint != expected_fingerprint {
         log::info!("Custom env vars mismatch (container={:?}, expected={:?})", container_fingerprint, expected_fingerprint);
@@ -425,12 +517,10 @@ pub async fn container_needs_recreation(
     }
 
     // ── Claude instructions ───────────────────────────────────────────────
-    let expected_instructions = match (global_claude_instructions, project.claude_instructions.as_deref()) {
-        (Some(g), Some(p)) => Some(format!("{}\n\n{}", g, p)),
-        (Some(g), None) => Some(g.to_string()),
-        (None, Some(p)) => Some(p.to_string()),
-        (None, None) => None,
-    };
+    let expected_instructions = merge_claude_instructions(
+        global_claude_instructions,
+        project.claude_instructions.as_deref(),
+    );
     let container_instructions = get_env("CLAUDE_INSTRUCTIONS");
     if container_instructions.as_deref() != expected_instructions.as_deref() {
         log::info!("CLAUDE_INSTRUCTIONS mismatch");

@@ -6,6 +6,7 @@ mod storage;
 use docker::exec::ExecSessionManager;
 use storage::projects_store::ProjectsStore;
 use storage::settings_store::SettingsStore;
+use tauri::Manager;
 
 pub struct AppState {
     pub projects_store: ProjectsStore,
@@ -21,9 +22,17 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(AppState {
-            projects_store: ProjectsStore::new(),
-            settings_store: SettingsStore::new(),
+            projects_store: ProjectsStore::new().expect("Failed to initialize projects store"),
+            settings_store: SettingsStore::new().expect("Failed to initialize settings store"),
             exec_manager: ExecSessionManager::new(),
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                let state = window.state::<AppState>();
+                tauri::async_runtime::block_on(async {
+                    state.exec_manager.close_all_sessions().await;
+                });
+            }
         })
         .invoke_handler(tauri::generate_handler![
             // Docker

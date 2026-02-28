@@ -163,11 +163,26 @@ impl ExecSessionManager {
     }
 
     pub async fn resize(&self, session_id: &str, cols: u16, rows: u16) -> Result<(), String> {
-        let sessions = self.sessions.lock().await;
-        let session = sessions
-            .get(session_id)
-            .ok_or_else(|| format!("Session {} not found", session_id))?;
-        session.resize(cols, rows).await
+        // Clone the exec_id under the lock, then drop the lock before the
+        // async Docker API call to avoid holding the mutex across await.
+        let exec_id = {
+            let sessions = self.sessions.lock().await;
+            let session = sessions
+                .get(session_id)
+                .ok_or_else(|| format!("Session {} not found", session_id))?;
+            session.exec_id.clone()
+        };
+        let docker = get_docker()?;
+        docker
+            .resize_exec(
+                &exec_id,
+                ResizeExecOptions {
+                    width: cols,
+                    height: rows,
+                },
+            )
+            .await
+            .map_err(|e| format!("Failed to resize exec: {}", e))
     }
 
     pub async fn close_session(&self, session_id: &str) {
