@@ -50,9 +50,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
     python3-venv \
-    && rm -rf /var/lib/apt/lists/* \
-    && curl -LsSf https://astral.sh/uv/install.sh | sh \
-    && curl -LsSf https://astral.sh/ruff/install.sh | sh
+    && rm -rf /var/lib/apt/lists/*
 
 # ── Docker CLI (not daemon) ─────────────────────────────────────────────────
 RUN install -m 0755 -d /etc/apt/keyrings \
@@ -65,8 +63,11 @@ RUN install -m 0755 -d /etc/apt/keyrings \
     && rm -rf /var/lib/apt/lists/*
 
 # ── AWS CLI v2 ───────────────────────────────────────────────────────────────
-RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" \
-    && unzip awscliv2.zip && ./aws/install && rm -rf awscliv2.zip aws
+RUN ARCH=$(uname -m) && \
+    curl "https://awscli.amazonaws.com/awscli-exe-linux-${ARCH}.zip" -o "awscliv2.zip" && \
+    unzip -q awscliv2.zip && \
+    ./aws/install && \
+    rm -rf awscliv2.zip aws
 
 # ── Non-root user with passwordless sudo ─────────────────────────────────────
 RUN useradd -m -s /bin/bash -u 1000 claude \
@@ -83,7 +84,7 @@ WORKDIR /home/claude
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/home/claude/.cargo/bin:${PATH}"
 
-# Add uv/ruff to PATH (installed to /root by default, reinstall for claude user)
+# Install uv and ruff for claude user
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
     && curl -LsSf https://astral.sh/ruff/install.sh | sh
 ENV PATH="/home/claude/.local/bin:/home/claude/.cargo/bin:${PATH}"
