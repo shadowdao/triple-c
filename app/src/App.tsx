@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import { useShallow } from "zustand/react/shallow";
 import Sidebar from "./components/layout/Sidebar";
 import TopBar from "./components/layout/TopBar";
 import StatusBar from "./components/layout/StatusBar";
@@ -12,13 +13,16 @@ export default function App() {
   const { checkDocker, checkImage } = useDocker();
   const { checkApiKey, loadSettings } = useSettings();
   const { refresh } = useProjects();
-  const { sessions, activeSessionId } = useAppState();
+  const { sessions, activeSessionId } = useAppState(
+    useShallow(s => ({ sessions: s.sessions, activeSessionId: s.activeSessionId }))
+  );
 
   // Initialize on mount
   useEffect(() => {
     loadSettings();
-    checkDocker();
-    checkImage();
+    checkDocker().then((available) => {
+      if (available) checkImage();
+    });
     checkApiKey();
     refresh();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps

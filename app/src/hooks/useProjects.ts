@@ -1,4 +1,5 @@
 import { useCallback } from "react";
+import { useShallow } from "zustand/react/shallow";
 import { useAppState } from "../store/appState";
 import * as commands from "../lib/tauri-commands";
 
@@ -10,7 +11,16 @@ export function useProjects() {
     setSelectedProject,
     updateProjectInList,
     removeProjectFromList,
-  } = useAppState();
+  } = useAppState(
+    useShallow(s => ({
+      projects: s.projects,
+      selectedProjectId: s.selectedProjectId,
+      setProjects: s.setProjects,
+      setSelectedProject: s.setSelectedProject,
+      updateProjectInList: s.updateProjectInList,
+      removeProjectFromList: s.removeProjectFromList,
+    }))
+  );
 
   const selectedProject = projects.find((p) => p.id === selectedProjectId) ?? null;
 

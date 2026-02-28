@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { Project, AuthMode, BedrockConfig, BedrockAuthMethod } from "../../lib/types";
 import { useProjects } from "../../hooks/useProjects";
@@ -10,7 +10,8 @@ interface Props {
 }
 
 export default function ProjectCard({ project }: Props) {
-  const { selectedProjectId, setSelectedProject } = useAppState();
+  const selectedProjectId = useAppState(s => s.selectedProjectId);
+  const setSelectedProject = useAppState(s => s.setSelectedProject);
   const { start, stop, rebuild, remove, update } = useProjects();
   const { open: openTerminal } = useTerminal();
   const [loading, setLoading] = useState(false);
@@ -18,6 +19,40 @@ export default function ProjectCard({ project }: Props) {
   const [showConfig, setShowConfig] = useState(false);
   const isSelected = selectedProjectId === project.id;
   const isStopped = project.status === "stopped" || project.status === "error";
+
+  // Local state for text fields (save on blur, not on every keystroke)
+  const [sshKeyPath, setSshKeyPath] = useState(project.ssh_key_path ?? "");
+  const [gitName, setGitName] = useState(project.git_user_name ?? "");
+  const [gitEmail, setGitEmail] = useState(project.git_user_email ?? "");
+  const [gitToken, setGitToken] = useState(project.git_token ?? "");
+  const [claudeInstructions, setClaudeInstructions] = useState(project.claude_instructions ?? "");
+  const [envVars, setEnvVars] = useState(project.custom_env_vars ?? []);
+
+  // Bedrock local state for text fields
+  const [bedrockRegion, setBedrockRegion] = useState(project.bedrock_config?.aws_region ?? "us-east-1");
+  const [bedrockAccessKeyId, setBedrockAccessKeyId] = useState(project.bedrock_config?.aws_access_key_id ?? "");
+  const [bedrockSecretKey, setBedrockSecretKey] = useState(project.bedrock_config?.aws_secret_access_key ?? "");
+  const [bedrockSessionToken, setBedrockSessionToken] = useState(project.bedrock_config?.aws_session_token ?? "");
+  const [bedrockProfile, setBedrockProfile] = useState(project.bedrock_config?.aws_profile ?? "");
+  const [bedrockBearerToken, setBedrockBearerToken] = useState(project.bedrock_config?.aws_bearer_token ?? "");
+  const [bedrockModelId, setBedrockModelId] = useState(project.bedrock_config?.model_id ?? "");
+
+  // Sync local state when project prop changes (e.g., after save or external update)
+  useEffect(() => {
+    setSshKeyPath(project.ssh_key_path ?? "");
+    setGitName(project.git_user_name ?? "");
+    setGitEmail(project.git_user_email ?? "");
+    setGitToken(project.git_token ?? "");
+    setClaudeInstructions(project.claude_instructions ?? "");
+    setEnvVars(project.custom_env_vars ?? []);
+    setBedrockRegion(project.bedrock_config?.aws_region ?? "us-east-1");
+    setBedrockAccessKeyId(project.bedrock_config?.aws_access_key_id ?? "");
+    setBedrockSecretKey(project.bedrock_config?.aws_secret_access_key ?? "");
+    setBedrockSessionToken(project.bedrock_config?.aws_session_token ?? "");
+    setBedrockProfile(project.bedrock_config?.aws_profile ?? "");
+    setBedrockBearerToken(project.bedrock_config?.aws_bearer_token ?? "");
+    setBedrockModelId(project.bedrock_config?.model_id ?? "");
+  }, [project]);
 
   const handleStart = async () => {
     setLoading(true);
@@ -79,7 +114,9 @@ export default function ProjectCard({ project }: Props) {
     try {
       const current = project.bedrock_config ?? defaultBedrockConfig;
       await update({ ...project, bedrock_config: { ...current, ...patch } });
-    } catch {}
+    } catch (err) {
+      console.error("Failed to update Bedrock config:", err);
+    }
   };
 
   const handleBrowseSSH = async () => {
@@ -90,6 +127,118 @@ export default function ProjectCard({ project }: Props) {
       } catch (e) {
         setError(String(e));
       }
+    }
+  };
+
+  // Blur handlers for text fields
+  const handleSshKeyPathBlur = async () => {
+    try {
+      await update({ ...project, ssh_key_path: sshKeyPath || null });
+    } catch (err) {
+      console.error("Failed to update SSH key path:", err);
+    }
+  };
+
+  const handleGitNameBlur = async () => {
+    try {
+      await update({ ...project, git_user_name: gitName || null });
+    } catch (err) {
+      console.error("Failed to update Git name:", err);
+    }
+  };
+
+  const handleGitEmailBlur = async () => {
+    try {
+      await update({ ...project, git_user_email: gitEmail || null });
+    } catch (err) {
+      console.error("Failed to update Git email:", err);
+    }
+  };
+
+  const handleGitTokenBlur = async () => {
+    try {
+      await update({ ...project, git_token: gitToken || null });
+    } catch (err) {
+      console.error("Failed to update Git token:", err);
+    }
+  };
+
+  const handleClaudeInstructionsBlur = async () => {
+    try {
+      await update({ ...project, claude_instructions: claudeInstructions || null });
+    } catch (err) {
+      console.error("Failed to update Claude instructions:", err);
+    }
+  };
+
+  const handleEnvVarBlur = async () => {
+    try {
+      await update({ ...project, custom_env_vars: envVars });
+    } catch (err) {
+      console.error("Failed to update environment variables:", err);
+    }
+  };
+
+  const handleBedrockRegionBlur = async () => {
+    try {
+      const current = project.bedrock_config ?? defaultBedrockConfig;
+      await update({ ...project, bedrock_config: { ...current, aws_region: bedrockRegion } });
+    } catch (err) {
+      console.error("Failed to update Bedrock region:", err);
+    }
+  };
+
+  const handleBedrockAccessKeyIdBlur = async () => {
+    try {
+      const current = project.bedrock_config ?? defaultBedrockConfig;
+      await update({ ...project, bedrock_config: { ...current, aws_access_key_id: bedrockAccessKeyId || null } });
+    } catch (err) {
+      console.error("Failed to update Bedrock access key:", err);
+    }
+  };
+
+  const handleBedrockSecretKeyBlur = async () => {
+    try {
+      const current = project.bedrock_config ?? defaultBedrockConfig;
+      await update({ ...project, bedrock_config: { ...current, aws_secret_access_key: bedrockSecretKey || null } });
+    } catch (err) {
+      console.error("Failed to update Bedrock secret key:", err);
+    }
+  };
+
+  const handleBedrockSessionTokenBlur = async () => {
+    try {
+      const current = project.bedrock_config ?? defaultBedrockConfig;
+      await update({ ...project, bedrock_config: { ...current, aws_session_token: bedrockSessionToken || null } });
+    } catch (err) {
+      console.error("Failed to update Bedrock session token:", err);
+    }
+  };
+
+  const handleBedrockProfileBlur = async () => {
+    try {
+      const current = project.bedrock_config ?? defaultBedrockConfig;
+      await update({ ...project, bedrock_config: { ...current, aws_profile: bedrockProfile || null } });
+    } catch (err) {
+      console.error("Failed to update Bedrock profile:", err);
+    }
+  };
+
+  const handleBedrockBearerTokenBlur = async () => {
+    try {
+      const current = project.bedrock_config ?? defaultBedrockConfig;
+      await update({ ...project, bedrock_config: { ...current, aws_bearer_token: bedrockBearerToken || null } });
+    } catch (err) {
+      console.error("Failed to update Bedrock bearer token:", err);
+    }
+  };
+
+  const handleBedrockModelIdBlur = async () => {
+    try {
+      const current = project.bedrock_config ?? defaultBedrockConfig;
+      await update({ ...project, bedrock_config: { ...current, model_id: bedrockModelId || null } });
+    } catch (err) {
+      console.error("Failed to update Bedrock model ID:", err);
     }
   };
 
@@ -208,10 +357,9 @@ export default function ProjectCard({ project }: Props) {
                 <label className="block text-xs text-[var(--text-secondary)] mb-0.5">SSH Key Directory</label>
                 <div className="flex gap-1">
                   <input
-                    value={project.ssh_key_path ?? ""}
-                    onChange={async (e) => {
-                      try { await update({ ...project, ssh_key_path: e.target.value || null }); } catch {}
-                    }}
+                    value={sshKeyPath}
+                    onChange={(e) => setSshKeyPath(e.target.value)}
+                    onBlur={handleSshKeyPathBlur}
                     placeholder="~/.ssh"
                     disabled={!isStopped}
                     className="flex-1 px-2 py-1 bg-[var(--bg-primary)] border border-[var(--border-color)] rounded text-xs text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)] disabled:opacity-50"
@@ -230,10 +378,9 @@ export default function ProjectCard({ project }: Props) {
               <div>
                 <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Git Name</label>
                 <input
-                  value={project.git_user_name ?? ""}
-                  onChange={async (e) => {
-                    try { await update({ ...project, git_user_name: e.target.value || null }); } catch {}
-                  }}
+                  value={gitName}
+                  onChange={(e) => setGitName(e.target.value)}
+                  onBlur={handleGitNameBlur}
                   placeholder="Your Name"
                   disabled={!isStopped}
                   className="w-full px-2 py-1 bg-[var(--bg-primary)] border border-[var(--border-color)] rounded text-xs text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)] disabled:opacity-50"
@@ -244,10 +391,9 @@ export default function ProjectCard({ project }: Props) {
               <div>
                 <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Git Email</label>
                 <input
-                  value={project.git_user_email ?? ""}
-                  onChange={async (e) => {
-                    try { await update({ ...project, git_user_email: e.target.value || null }); } catch {}
-                  }}
+                  value={gitEmail}
+                  onChange={(e) => setGitEmail(e.target.value)}
+                  onBlur={handleGitEmailBlur}
                   placeholder="you@example.com"
                   disabled={!isStopped}
                   className="w-full px-2 py-1 bg-[var(--bg-primary)] border border-[var(--border-color)] rounded text-xs text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)] disabled:opacity-50"
@@ -259,10 +405,9 @@ export default function ProjectCard({ project }: Props) {
                 <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Git HTTPS Token</label>
                 <input
                   type="password"
-                  value={project.git_token ?? ""}
-                  onChange={async (e) => {
-                    try { await update({ ...project, git_token: e.target.value || null }); } catch {}
-                  }}
+                  value={gitToken}
+                  onChange={(e) => setGitToken(e.target.value)}
+                  onBlur={handleGitTokenBlur}
                   placeholder="ghp_..."
                   disabled={!isStopped}
                   className="w-full px-2 py-1 bg-[var(--bg-primary)] border border-[var(--border-color)] rounded text-xs text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)] disabled:opacity-50"
@@ -274,7 +419,9 @@ export default function ProjectCard({ project }: Props) {
                 <label className="text-xs text-[var(--text-secondary)]">Allow container spawning</label>
                 <button
                   onClick={async () => {
-                    try { await update({ ...project, allow_docker_access: !project.allow_docker_access }); } catch {}
+                    try { await update({ ...project, allow_docker_access: !project.allow_docker_access }); } catch (err) {
+                      console.error("Failed to update Docker access setting:", err);
+                    }
                   }}
                   disabled={!isStopped}
                   className={`px-2 py-0.5 text-xs rounded transition-colors disabled:opacity-50 ${
@@ -290,34 +437,39 @@ export default function ProjectCard({ project }: Props) {
               {/* Environment Variables */}
               <div>
                 <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Environment Variables</label>
-                {(project.custom_env_vars ?? []).map((ev, i) => (
+                {envVars.map((ev, i) => (
                   <div key={i} className="flex gap-1 mb-1">
                     <input
                       value={ev.key}
-                      onChange={async (e) => {
-                        const vars = [...(project.custom_env_vars ?? [])];
+                      onChange={(e) => {
+                        const vars = [...envVars];
                         vars[i] = { ...vars[i], key: e.target.value };
-                        try { await update({ ...project, custom_env_vars: vars }); } catch {}
+                        setEnvVars(vars);
                       }}
+                      onBlur={handleEnvVarBlur}
                       placeholder="KEY"
                       disabled={!isStopped}
                       className="w-1/3 px-2 py-1 bg-[var(--bg-primary)] border border-[var(--border-color)] rounded text-xs text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)] disabled:opacity-50 font-mono"
                     />
                     <input
                       value={ev.value}
-                      onChange={async (e) => {
-                        const vars = [...(project.custom_env_vars ?? [])];
+                      onChange={(e) => {
+                        const vars = [...envVars];
                         vars[i] = { ...vars[i], value: e.target.value };
-                        try { await update({ ...project, custom_env_vars: vars }); } catch {}
+                        setEnvVars(vars);
                       }}
+                      onBlur={handleEnvVarBlur}
                       placeholder="value"
                       disabled={!isStopped}
                       className="flex-1 px-2 py-1 bg-[var(--bg-primary)] border border-[var(--border-color)] rounded text-xs text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)] disabled:opacity-50 font-mono"
                     />
                     <button
                       onClick={async () => {
-                        const vars = (project.custom_env_vars ?? []).filter((_, j) => j !== i);
-                        try { await update({ ...project, custom_env_vars: vars }); } catch {}
+                        const vars = envVars.filter((_, j) => j !== i);
+                        setEnvVars(vars);
+                        try { await update({ ...project, custom_env_vars: vars }); } catch (err) {
+                          console.error("Failed to remove environment variable:", err);
+                        }
                       }}
                       disabled={!isStopped}
                       className="px-1.5 py-1 text-xs text-[var(--error)] hover:bg-[var(--bg-primary)] rounded disabled:opacity-50 transition-colors"
@@ -328,8 +480,11 @@ export default function ProjectCard({ project }: Props) {
                 ))}
                 <button
                   onClick={async () => {
-                    const vars = [...(project.custom_env_vars ?? []), { key: "", value: "" }];
-                    try { await update({ ...project, custom_env_vars: vars }); } catch {}
+                    const vars = [...envVars, { key: "", value: "" }];
+                    setEnvVars(vars);
+                    try { await update({ ...project, custom_env_vars: vars }); } catch (err) {
+                      console.error("Failed to add environment variable:", err);
+                    }
                   }}
                   disabled={!isStopped}
                   className="text-xs text-[var(--accent)] hover:text-[var(--accent-hover)] disabled:opacity-50 transition-colors"
@@ -342,10 +497,9 @@ export default function ProjectCard({ project }: Props) {
               <div>
                 <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Claude Instructions</label>
                 <textarea
-                  value={project.claude_instructions ?? ""}
-                  onChange={async (e) => {
-                    try { await update({ ...project, claude_instructions: e.target.value || null }); } catch {}
-                  }}
+                  value={claudeInstructions}
+                  onChange={(e) => setClaudeInstructions(e.target.value)}
+                  onBlur={handleClaudeInstructionsBlur}
                   placeholder="Per-project instructions for Claude Code (written to ~/.claude/CLAUDE.md in container)"
                   disabled={!isStopped}
                   rows={3}
@@ -384,8 +538,9 @@ export default function ProjectCard({ project }: Props) {
                     <div>
                       <label className="block text-xs text-[var(--text-secondary)] mb-0.5">AWS Region</label>
                       <input
-                        value={bc.aws_region}
-                        onChange={(e) => updateBedrockConfig({ aws_region: e.target.value })}
+                        value={bedrockRegion}
+                        onChange={(e) => setBedrockRegion(e.target.value)}
+                        onBlur={handleBedrockRegionBlur}
                         placeholder="us-east-1"
                         disabled={!isStopped}
                         className={inputCls}
@@ -398,8 +553,9 @@ export default function ProjectCard({ project }: Props) {
                         <div>
                           <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Access Key ID</label>
                           <input
-                            value={bc.aws_access_key_id ?? ""}
-                            onChange={(e) => updateBedrockConfig({ aws_access_key_id: e.target.value || null })}
+                            value={bedrockAccessKeyId}
+                            onChange={(e) => setBedrockAccessKeyId(e.target.value)}
+                            onBlur={handleBedrockAccessKeyIdBlur}
                             placeholder="AKIA..."
                             disabled={!isStopped}
                             className={inputCls}
@@ -409,8 +565,9 @@ export default function ProjectCard({ project }: Props) {
                           <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Secret Access Key</label>
                           <input
                             type="password"
-                            value={bc.aws_secret_access_key ?? ""}
-                            onChange={(e) => updateBedrockConfig({ aws_secret_access_key: e.target.value || null })}
+                            value={bedrockSecretKey}
+                            onChange={(e) => setBedrockSecretKey(e.target.value)}
+                            onBlur={handleBedrockSecretKeyBlur}
                             disabled={!isStopped}
                             className={inputCls}
                           />
@@ -419,8 +576,9 @@ export default function ProjectCard({ project }: Props) {
                           <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Session Token (optional)</label>
                           <input
                             type="password"
-                            value={bc.aws_session_token ?? ""}
-                            onChange={(e) => updateBedrockConfig({ aws_session_token: e.target.value || null })}
+                            value={bedrockSessionToken}
+                            onChange={(e) => setBedrockSessionToken(e.target.value)}
+                            onBlur={handleBedrockSessionTokenBlur}
                             disabled={!isStopped}
                             className={inputCls}
                           />
@@ -433,8 +591,9 @@ export default function ProjectCard({ project }: Props) {
                       <div>
                         <label className="block text-xs text-[var(--text-secondary)] mb-0.5">AWS Profile</label>
                         <input
-                          value={bc.aws_profile ?? ""}
-                          onChange={(e) => updateBedrockConfig({ aws_profile: e.target.value || null })}
+                          value={bedrockProfile}
+                          onChange={(e) => setBedrockProfile(e.target.value)}
+                          onBlur={handleBedrockProfileBlur}
                           placeholder="default"
                           disabled={!isStopped}
                           className={inputCls}
@@ -448,8 +607,9 @@ export default function ProjectCard({ project }: Props) {
                         <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Bearer Token</label>
                         <input
                           type="password"
-                          value={bc.aws_bearer_token ?? ""}
-                          onChange={(e) => updateBedrockConfig({ aws_bearer_token: e.target.value || null })}
+                          value={bedrockBearerToken}
+                          onChange={(e) => setBedrockBearerToken(e.target.value)}
+                          onBlur={handleBedrockBearerTokenBlur}
                           disabled={!isStopped}
                           className={inputCls}
                         />
@@ -460,8 +620,9 @@ export default function ProjectCard({ project }: Props) {
                     <div>
                       <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Model ID (optional)</label>
                       <input
-                        value={bc.model_id ?? ""}
-                        onChange={(e) => updateBedrockConfig({ model_id: e.target.value || null })}
+                        value={bedrockModelId}
+                        onChange={(e) => setBedrockModelId(e.target.value)}
+                        onBlur={handleBedrockModelIdBlur}
                         placeholder="anthropic.claude-sonnet-4-20250514-v1:0"
                         disabled={!isStopped}
                         className={inputCls}

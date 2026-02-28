@@ -1,11 +1,20 @@
 import { useCallback } from "react";
+import { useShallow } from "zustand/react/shallow";
 import { listen } from "@tauri-apps/api/event";
 import { useAppState } from "../store/appState";
 import * as commands from "../lib/tauri-commands";
 
 export function useTerminal() {
   const { sessions, activeSessionId, addSession, removeSession, setActiveSession } =
-    useAppState();
+    useAppState(
+      useShallow(s => ({
+        sessions: s.sessions,
+        activeSessionId: s.activeSessionId,
+        addSession: s.addSession,
+        removeSession: s.removeSession,
+        setActiveSession: s.setActiveSession,
+      }))
+    );
 
   const open = useCallback(
     async (projectId: string, projectName: string) => {

@@ -1,4 +1,5 @@
 import { useCallback } from "react";
+import { useShallow } from "zustand/react/shallow";
 import { listen } from "@tauri-apps/api/event";
 import { useAppState } from "../store/appState";
 import * as commands from "../lib/tauri-commands";
@@ -9,7 +10,14 @@ export function useDocker() {
     setDockerAvailable,
     imageExists,
     setImageExists,
-  } = useAppState();
+  } = useAppState(
+    useShallow(s => ({
+      dockerAvailable: s.dockerAvailable,
+      setDockerAvailable: s.setDockerAvailable,
+      imageExists: s.imageExists,
+      setImageExists: s.setImageExists,
+    }))
+  );
 
   const checkDocker = useCallback(async () => {
     try {

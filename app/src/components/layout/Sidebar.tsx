@@ -1,9 +1,12 @@
+import { useShallow } from "zustand/react/shallow";
 import { useAppState } from "../../store/appState";
 import ProjectList from "../projects/ProjectList";
 import SettingsPanel from "../settings/SettingsPanel";
 
 export default function Sidebar() {
-  const { sidebarView, setSidebarView } = useAppState();
+  const { sidebarView, setSidebarView } = useAppState(
+    useShallow(s => ({ sidebarView: s.sidebarView, setSidebarView: s.setSidebarView }))
+  );
 
   return (
     <div className="flex flex-col h-full w-[25%] min-w-56 max-w-80 bg-[var(--bg-secondary)] border border-[var(--border-color)] rounded-lg overflow-hidden">

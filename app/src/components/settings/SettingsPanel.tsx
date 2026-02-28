@@ -1,3 +1,4 @@
+import { useState, useEffect } from "react";
 import ApiKeyInput from "./ApiKeyInput";
 import DockerSettings from "./DockerSettings";
 import AwsSettings from "./AwsSettings";
@@ -5,6 +6,17 @@ import { useSettings } from "../../hooks/useSettings";
 
 export default function SettingsPanel() {
   const { appSettings, saveSettings } = useSettings();
+  const [globalInstructions, setGlobalInstructions] = useState(appSettings?.global_claude_instructions ?? "");
+
+  // Sync local state when appSettings change
+  useEffect(() => {
+    setGlobalInstructions(appSettings?.global_claude_instructions ?? "");
+  }, [appSettings?.global_claude_instructions]);
+
+  const handleInstructionsBlur = async () => {
+    if (!appSettings) return;
+    await saveSettings({ ...appSettings, global_claude_instructions: globalInstructions || null });
+  };
 
   return (
     <div className="p-4 space-y-6">
@@ -20,11 +32,9 @@ export default function SettingsPanel() {
           Global instructions applied to all projects (written to ~/.claude/CLAUDE.md in containers)
         </p>
         <textarea
-          value={appSettings?.global_claude_instructions ?? ""}
-          onChange={async (e) => {
-            if (!appSettings) return;
-            await saveSettings({ ...appSettings, global_claude_instructions: e.target.value || null });
-          }}
+          value={globalInstructions}
+          onChange={(e) => setGlobalInstructions(e.target.value)}
+          onBlur={handleInstructionsBlur}
           placeholder="Instructions for Claude Code in all project containers..."
           rows={4}
           className="w-full px-2 py-1.5 text-xs bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:outline-none focus:border-[var(--accent)] resize-y font-mono"

@@ -1,10 +1,18 @@
 import { useCallback } from "react";
+import { useShallow } from "zustand/react/shallow";
 import { useAppState } from "../store/appState";
 import * as commands from "../lib/tauri-commands";
 import type { AppSettings } from "../lib/types";
 
 export function useSettings() {
-  const { hasKey, setHasKey, appSettings, setAppSettings } = useAppState();
+  const { hasKey, setHasKey, appSettings, setAppSettings } = useAppState(
+    useShallow(s => ({
+      hasKey: s.hasKey,
+      setHasKey: s.setHasKey,
+      appSettings: s.appSettings,
+      setAppSettings: s.setAppSettings,
+    }))
+  );
 
   const checkApiKey = useCallback(async () => {
     try {

@@ -1,7 +1,10 @@
+import { useShallow } from "zustand/react/shallow";
 import { useAppState } from "../../store/appState";
 
 export default function StatusBar() {
-  const { projects, sessions } = useAppState();
+  const { projects, sessions } = useAppState(
+    useShallow(s => ({ projects: s.projects, sessions: s.sessions }))
+  );
   const running = projects.filter((p) => p.status === "running").length;
 
   return (

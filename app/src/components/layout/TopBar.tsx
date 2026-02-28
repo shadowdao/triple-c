@@ -1,8 +1,11 @@
+import { useShallow } from "zustand/react/shallow";
 import TerminalTabs from "../terminal/TerminalTabs";
 import { useAppState } from "../../store/appState";
 
 export default function TopBar() {
-  const { dockerAvailable, imageExists } = useAppState();
+  const { dockerAvailable, imageExists } = useAppState(
+    useShallow(s => ({ dockerAvailable: s.dockerAvailable, imageExists: s.imageExists }))
+  );
 
   return (
     <div className="flex items-center h-10 bg-[var(--bg-secondary)] border border-[var(--border-color)] rounded-lg overflow-hidden">

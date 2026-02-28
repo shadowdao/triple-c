@@ -33,8 +33,7 @@ export default function DockerSettings() {
   const handleSourceChange = async (source: ImageSource) => {
     if (!appSettings) return;
     await saveSettings({ ...appSettings, image_source: source });
-    // Re-check image existence after changing source
-    setTimeout(() => checkImage(), 100);
+    await checkImage();
   };
 
   const handleCustomChange = async (value: string) => {
