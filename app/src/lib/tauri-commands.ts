@@ -47,6 +47,8 @@ export const terminalResize = (sessionId: string, cols: number, rows: number) =>
   invoke<void>("terminal_resize", { sessionId, cols, rows });
 export const closeTerminalSession = (sessionId: string) =>
   invoke<void>("close_terminal_session", { sessionId });
+export const pasteImageToTerminal = (sessionId: string, imageData: number[]) =>
+  invoke<string>("paste_image_to_terminal", { sessionId, imageData });
 
 // Updates
 export const getAppVersion = () => invoke<string>("get_app_version");

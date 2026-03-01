@@ -49,6 +49,14 @@ export function useTerminal() {
     [],
   );
 
+  const pasteImage = useCallback(
+    async (sessionId: string, imageData: Uint8Array) => {
+      const bytes = Array.from(imageData);
+      return commands.pasteImageToTerminal(sessionId, bytes);
+    },
+    [],
+  );
+
   const onOutput = useCallback(
     (sessionId: string, callback: (data: Uint8Array) => void) => {
       const eventName = `terminal-output-${sessionId}`;
@@ -76,6 +84,7 @@ export function useTerminal() {
     open,
     close,
     sendInput,
+    pasteImage,
     resize,
     onOutput,
     onExit,

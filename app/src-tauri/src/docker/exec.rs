@@ -1,3 +1,4 @@
+use bollard::container::UploadToContainerOptions;
 use bollard::exec::{CreateExecOptions, ResizeExecOptions, StartExecResults};
 use futures_util::StreamExt;
 use std::collections::HashMap;
@@ -211,5 +212,52 @@ impl ExecSessionManager {
         for (_, session) in sessions.drain() {
             session.shutdown();
         }
+    }
+
+    pub async fn get_container_id(&self, session_id: &str) -> Result<String, String> {
+        let sessions = self.sessions.lock().await;
+        let session = sessions
+            .get(session_id)
+            .ok_or_else(|| format!("Session {} not found", session_id))?;
+        Ok(session.container_id.clone())
+    }
+
+    pub async fn write_file_to_container(
+        &self,
+        container_id: &str,
+        file_name: &str,
+        data: &[u8],
+    ) -> Result<String, String> {
+        let docker = get_docker()?;
+
+        // Build a tar archive in memory containing the file
+        let mut tar_buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_buf);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, file_name, data)
+                .map_err(|e| format!("Failed to create tar entry: {}", e))?;
+            builder
+                .finish()
+                .map_err(|e| format!("Failed to finalize tar: {}", e))?;
+        }
+
+        docker
+            .upload_to_container(
+                container_id,
+                Some(UploadToContainerOptions {
+                    path: "/tmp".to_string(),
+                    ..Default::default()
+                }),
+                tar_buf.into(),
+            )
+            .await
+            .map_err(|e| format!("Failed to upload file to container: {}", e))?;
+
+        Ok(format!("/tmp/{}", file_name))
     }
 }

@@ -21,9 +21,10 @@ export default function TerminalView({ sessionId, active }: Props) {
   const fitRef = useRef<FitAddon | null>(null);
   const webglRef = useRef<WebglAddon | null>(null);
   const detectorRef = useRef<UrlDetector | null>(null);
-  const { sendInput, resize, onOutput, onExit } = useTerminal();
+  const { sendInput, pasteImage, resize, onOutput, onExit } = useTerminal();
 
   const [detectedUrl, setDetectedUrl] = useState<string | null>(null);
+  const [imagePasteMsg, setImagePasteMsg] = useState<string | null>(null);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -85,6 +86,40 @@ export default function TerminalView({ sessionId, active }: Props) {
       sendInput(sessionId, data);
     });
 
+    // Handle image paste: intercept paste events with image data,
+    // upload to the container, and inject the file path into terminal input.
+    const handlePaste = (e: ClipboardEvent) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+
+      for (const item of Array.from(items)) {
+        if (item.type.startsWith("image/")) {
+          e.preventDefault();
+          e.stopPropagation();
+
+          const blob = item.getAsFile();
+          if (!blob) return;
+
+          blob.arrayBuffer().then(async (buf) => {
+            try {
+              setImagePasteMsg("Uploading image...");
+              const data = new Uint8Array(buf);
+              const filePath = await pasteImage(sessionId, data);
+              // Inject the file path into terminal stdin
+              sendInput(sessionId, filePath);
+              setImagePasteMsg(`Image saved to ${filePath}`);
+            } catch (err) {
+              console.error("Image paste failed:", err);
+              setImagePasteMsg("Image paste failed");
+            }
+          });
+          return; // Only handle the first image
+        }
+      }
+    };
+
+    containerRef.current.addEventListener("paste", handlePaste, { capture: true });
+
     // Handle backend output -> terminal
     let aborted = false;
 
@@ -129,6 +164,7 @@ export default function TerminalView({ sessionId, active }: Props) {
       detector.dispose();
       detectorRef.current = null;
       inputDisposable.dispose();
+      containerRef.current?.removeEventListener("paste", handlePaste, { capture: true });
       outputPromise.then((fn) => fn?.());
       exitPromise.then((fn) => fn?.());
       if (resizeRafId !== null) cancelAnimationFrame(resizeRafId);
@@ -179,6 +215,13 @@ export default function TerminalView({ sessionId, active }: Props) {
     return () => clearTimeout(timer);
   }, [detectedUrl]);
 
+  // Auto-dismiss image paste message after 3 seconds
+  useEffect(() => {
+    if (!imagePasteMsg) return;
+    const timer = setTimeout(() => setImagePasteMsg(null), 3_000);
+    return () => clearTimeout(timer);
+  }, [imagePasteMsg]);
+
   const handleOpenUrl = useCallback(() => {
     if (detectedUrl) {
       openUrl(detectedUrl).catch((e) =>
@@ -199,6 +242,14 @@ export default function TerminalView({ sessionId, active }: Props) {
           onOpen={handleOpenUrl}
           onDismiss={() => setDetectedUrl(null)}
         />
+      )}
+      {imagePasteMsg && (
+        <div
+          className="absolute top-2 left-1/2 -translate-x-1/2 z-50 px-3 py-1.5 rounded-md text-xs font-medium bg-[#1f2937] text-[#e6edf3] border border-[#30363d] shadow-lg"
+          onClick={() => setImagePasteMsg(null)}
+        >
+          {imagePasteMsg}
+        </div>
       )}
       <div
         ref={containerRef}

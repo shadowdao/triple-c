@@ -72,3 +72,23 @@ pub async fn close_terminal_session(
     state.exec_manager.close_session(&session_id).await;
     Ok(())
 }
+
+#[tauri::command]
+pub async fn paste_image_to_terminal(
+    session_id: String,
+    image_data: Vec<u8>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let container_id = state.exec_manager.get_container_id(&session_id).await?;
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let file_name = format!("clipboard_{}.png", timestamp);
+
+    state
+        .exec_manager
+        .write_file_to_container(&container_id, &file_name, &image_data)
+        .await
+}
