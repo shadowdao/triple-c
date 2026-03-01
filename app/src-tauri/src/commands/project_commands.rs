@@ -125,7 +125,7 @@ pub async fn start_project_container(
     let image_name = container_config::resolve_image_name(&settings.image_source, &settings.custom_image_name);
 
     // Get API key only if auth mode requires it
-    let api_key = match project.auth_mode {
+    let api_key: Option<String> = match project.auth_mode {
         AuthMode::Anthropic => {
             None
         }
