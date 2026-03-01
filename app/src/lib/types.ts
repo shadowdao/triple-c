@@ -8,6 +8,12 @@ export interface ProjectPath {
   mount_name: string;
 }
 
+export interface PortMapping {
+  host_port: number;
+  container_port: number;
+  protocol: string;
+}
+
 export interface Project {
   id: string;
   name: string;
@@ -22,6 +28,7 @@ export interface Project {
   git_user_name: string | null;
   git_user_email: string | null;
   custom_env_vars: EnvVar[];
+  port_mappings: PortMapping[];
   claude_instructions: string | null;
   created_at: string;
   updated_at: string;

@@ -12,6 +12,18 @@ pub struct ProjectPath {
     pub mount_name: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PortMapping {
+    pub host_port: u16,
+    pub container_port: u16,
+    #[serde(default = "default_protocol")]
+    pub protocol: String,
+}
+
+fn default_protocol() -> String {
+    "tcp".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub id: String,
@@ -29,6 +41,8 @@ pub struct Project {
     pub git_user_email: Option<String>,
     #[serde(default)]
     pub custom_env_vars: Vec<EnvVar>,
+    #[serde(default)]
+    pub port_mappings: Vec<PortMapping>,
     #[serde(default)]
     pub claude_instructions: Option<String>,
     pub created_at: String,
@@ -114,6 +128,7 @@ impl Project {
             git_user_name: None,
             git_user_email: None,
             custom_env_vars: Vec::new(),
+            port_mappings: Vec::new(),
             claude_instructions: None,
             created_at: now.clone(),
             updated_at: now,

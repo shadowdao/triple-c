@@ -7,7 +7,7 @@ fn default_true() -> bool {
 }
 
 fn default_global_instructions() -> Option<String> {
-    Some("If the project is not initialized with git, recommend to the user to initialize and use git to track changes. This makes it easier to revert should something break.".to_string())
+    Some("If the project is not initialized with git, recommend to the user to initialize and use git to track changes. This makes it easier to revert should something break.\n\nUse subagents frequently. For long-running tasks, break the work into parallel subagents where possible. When handling multiple separate tasks, delegate each to its own subagent so they can run concurrently.".to_string())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

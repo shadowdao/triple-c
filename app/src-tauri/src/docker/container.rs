@@ -2,13 +2,13 @@ use bollard::container::{
     Config, CreateContainerOptions, ListContainersOptions, RemoveContainerOptions,
     StartContainerOptions, StopContainerOptions,
 };
-use bollard::models::{ContainerSummary, HostConfig, Mount, MountTypeEnum};
+use bollard::models::{ContainerSummary, HostConfig, Mount, MountTypeEnum, PortBinding};
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use super::client::get_docker;
-use crate::models::{AuthMode, BedrockAuthMethod, ContainerInfo, EnvVar, GlobalAwsSettings, Project, ProjectPath};
+use crate::models::{AuthMode, BedrockAuthMethod, ContainerInfo, EnvVar, GlobalAwsSettings, PortMapping, Project, ProjectPath};
 
 /// Compute a fingerprint string for the custom environment variables.
 /// Sorted alphabetically so order changes do not cause spurious recreation.
@@ -87,6 +87,20 @@ fn compute_paths_fingerprint(paths: &[ProjectPath]) -> String {
     let mut parts: Vec<String> = paths
         .iter()
         .map(|p| format!("{}:{}", p.mount_name, p.host_path))
+        .collect();
+    parts.sort();
+    let joined = parts.join(",");
+    let mut hasher = DefaultHasher::new();
+    joined.hash(&mut hasher);
+    format!("{:x}", hasher.finish())
+}
+
+/// Compute a fingerprint for port mappings so we can detect changes.
+/// Sorted so order changes don't cause spurious recreation.
+fn compute_ports_fingerprint(port_mappings: &[PortMapping]) -> String {
+    let mut parts: Vec<String> = port_mappings
+        .iter()
+        .map(|p| format!("{}:{}:{}", p.host_port, p.container_port, p.protocol))
         .collect();
     parts.sort();
     let joined = parts.join(",");
@@ -255,11 +269,27 @@ pub async fn create_container(
     let custom_env_fingerprint = compute_env_fingerprint(&merged_env);
     env_vars.push(format!("TRIPLE_C_CUSTOM_ENV={}", custom_env_fingerprint));
 
-    // Claude instructions (global + per-project)
-    let combined_instructions = merge_claude_instructions(
+    // Claude instructions (global + per-project, plus port mapping info)
+    let mut combined_instructions = merge_claude_instructions(
         global_claude_instructions,
         project.claude_instructions.as_deref(),
     );
+    if !project.port_mappings.is_empty() {
+        let mut port_lines: Vec<String> = Vec::new();
+        port_lines.push("## Available Port Mappings".to_string());
+        port_lines.push("The following ports are mapped from the host to this container. Use these container ports when starting services that need to be accessible from the host:".to_string());
+        for pm in &project.port_mappings {
+            port_lines.push(format!(
+                "- Host port {} -> Container port {} ({})",
+                pm.host_port, pm.container_port, pm.protocol
+            ));
+        }
+        let port_info = port_lines.join("\n");
+        combined_instructions = Some(match combined_instructions {
+            Some(existing) => format!("{}\n\n{}", existing, port_info),
+            None => port_info,
+        });
+    }
     if let Some(ref instructions) = combined_instructions {
         env_vars.push(format!("CLAUDE_INSTRUCTIONS={}", instructions));
     }
@@ -346,6 +376,21 @@ pub async fn create_container(
         });
     }
 
+    // Port mappings
+    let mut exposed_ports: HashMap<String, HashMap<(), ()>> = HashMap::new();
+    let mut port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
+    for pm in &project.port_mappings {
+        let container_key = format!("{}/{}", pm.container_port, pm.protocol);
+        exposed_ports.insert(container_key.clone(), HashMap::new());
+        port_bindings.insert(
+            container_key,
+            Some(vec![PortBinding {
+                host_ip: Some("0.0.0.0".to_string()),
+                host_port: Some(pm.host_port.to_string()),
+            }]),
+        );
+    }
+
     let mut labels = HashMap::new();
     labels.insert("triple-c.managed".to_string(), "true".to_string());
     labels.insert("triple-c.project-id".to_string(), project.id.clone());
@@ -353,10 +398,12 @@ pub async fn create_container(
     labels.insert("triple-c.auth-mode".to_string(), format!("{:?}", project.auth_mode));
     labels.insert("triple-c.paths-fingerprint".to_string(), compute_paths_fingerprint(&project.paths));
     labels.insert("triple-c.bedrock-fingerprint".to_string(), compute_bedrock_fingerprint(project));
+    labels.insert("triple-c.ports-fingerprint".to_string(), compute_ports_fingerprint(&project.port_mappings));
     labels.insert("triple-c.image".to_string(), image_name.to_string());
 
     let host_config = HostConfig {
         mounts: Some(mounts),
+        port_bindings: if port_bindings.is_empty() { None } else { Some(port_bindings) },
         ..Default::default()
     };
 
@@ -373,6 +420,7 @@ pub async fn create_container(
         labels: Some(labels),
         working_dir: Some(working_dir),
         host_config: Some(host_config),
+        exposed_ports: if exposed_ports.is_empty() { None } else { Some(exposed_ports) },
         tty: Some(true),
         ..Default::default()
     };
@@ -486,6 +534,14 @@ pub async fn container_needs_recreation(
             log::info!("Container missing paths-fingerprint label, triggering recreation for migration");
             return Ok(true);
         }
+    }
+
+    // ── Port mappings fingerprint ──────────────────────────────────────────
+    let expected_ports_fp = compute_ports_fingerprint(&project.port_mappings);
+    let container_ports_fp = get_label("triple-c.ports-fingerprint").unwrap_or_default();
+    if container_ports_fp != expected_ports_fp {
+        log::info!("Port mappings fingerprint mismatch (container={:?}, expected={:?})", container_ports_fp, expected_ports_fp);
+        return Ok(true);
     }
 
     // ── Bedrock config fingerprint ───────────────────────────────────────

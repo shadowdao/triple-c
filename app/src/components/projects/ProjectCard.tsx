@@ -5,6 +5,7 @@ import { useProjects } from "../../hooks/useProjects";
 import { useTerminal } from "../../hooks/useTerminal";
 import { useAppState } from "../../store/appState";
 import EnvVarsModal from "./EnvVarsModal";
+import PortMappingsModal from "./PortMappingsModal";
 import ClaudeInstructionsModal from "./ClaudeInstructionsModal";
 
 interface Props {
@@ -20,6 +21,7 @@ export default function ProjectCard({ project }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [showConfig, setShowConfig] = useState(false);
   const [showEnvVarsModal, setShowEnvVarsModal] = useState(false);
+  const [showPortMappingsModal, setShowPortMappingsModal] = useState(false);
   const [showClaudeInstructionsModal, setShowClaudeInstructionsModal] = useState(false);
   const isSelected = selectedProjectId === project.id;
   const isStopped = project.status === "stopped" || project.status === "error";
@@ -32,6 +34,7 @@ export default function ProjectCard({ project }: Props) {
   const [gitToken, setGitToken] = useState(project.git_token ?? "");
   const [claudeInstructions, setClaudeInstructions] = useState(project.claude_instructions ?? "");
   const [envVars, setEnvVars] = useState(project.custom_env_vars ?? []);
+  const [portMappings, setPortMappings] = useState(project.port_mappings ?? []);
 
   // Bedrock local state for text fields
   const [bedrockRegion, setBedrockRegion] = useState(project.bedrock_config?.aws_region ?? "us-east-1");
@@ -51,6 +54,7 @@ export default function ProjectCard({ project }: Props) {
     setGitToken(project.git_token ?? "");
     setClaudeInstructions(project.claude_instructions ?? "");
     setEnvVars(project.custom_env_vars ?? []);
+    setPortMappings(project.port_mappings ?? []);
     setBedrockRegion(project.bedrock_config?.aws_region ?? "us-east-1");
     setBedrockAccessKeyId(project.bedrock_config?.aws_access_key_id ?? "");
     setBedrockSecretKey(project.bedrock_config?.aws_secret_access_key ?? "");
@@ -524,6 +528,19 @@ export default function ProjectCard({ project }: Props) {
                 </button>
               </div>
 
+              {/* Port Mappings */}
+              <div className="flex items-center justify-between">
+                <label className="text-xs text-[var(--text-secondary)]">
+                  Port Mappings{portMappings.length > 0 && ` (${portMappings.length})`}
+                </label>
+                <button
+                  onClick={() => setShowPortMappingsModal(true)}
+                  className="text-xs px-2 py-0.5 text-[var(--accent)] hover:text-[var(--accent-hover)] hover:bg-[var(--bg-primary)] rounded transition-colors"
+                >
+                  Edit
+                </button>
+              </div>
+
               {/* Claude Instructions */}
               <div className="flex items-center justify-between">
                 <label className="text-xs text-[var(--text-secondary)]">
@@ -679,6 +696,18 @@ export default function ProjectCard({ project }: Props) {
             await update({ ...project, custom_env_vars: vars });
           }}
           onClose={() => setShowEnvVarsModal(false)}
+        />
+      )}
+
+      {showPortMappingsModal && (
+        <PortMappingsModal
+          portMappings={portMappings}
+          disabled={!isStopped}
+          onSave={async (mappings) => {
+            setPortMappings(mappings);
+            await update({ ...project, port_mappings: mappings });
+          }}
+          onClose={() => setShowPortMappingsModal(false)}
         />
       )}
 
