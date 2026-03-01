@@ -2,12 +2,13 @@
  * Detects long URLs that span multiple hard-wrapped lines in PTY output.
  *
  * The Linux PTY hard-wraps long lines with \r\n at the terminal column width,
- * which breaks xterm.js WebLinksAddon URL detection. This class reassembles
- * those wrapped URLs and fires a callback for ones >= 100 chars.
+ * which breaks xterm.js WebLinksAddon URL detection. This class flattens
+ * the buffer (stripping PTY wraps, converting blank lines to spaces) and
+ * matches URLs with a single regex, firing a callback for ones >= 100 chars.
  *
- * Two-phase approach: when a URL candidate extends to the end of the buffer,
- * emission is deferred (the rest of the URL may arrive in the next PTY chunk).
- * A confirmation timer emits the pending URL if no further data arrives.
+ * When a URL match extends to the end of the flattened buffer, emission is
+ * deferred (more chunks may still be arriving). A confirmation timer emits
+ * the pending URL if no further data arrives within 500 ms.
  */
 
 const ANSI_RE =
@@ -57,38 +58,31 @@ export class UrlDetector {
   }
 
   private scan(): void {
+    // 1. Strip ANSI escape sequences
     const clean = this.buffer.replace(ANSI_RE, "");
-    const lines = clean.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
 
-    // Remove trailing empty elements (artifacts of trailing \n from split)
-    while (lines.length > 0 && lines[lines.length - 1] === "") {
-      lines.pop();
-    }
+    // 2. Flatten the buffer:
+    //    - Blank lines (2+ consecutive line breaks) → space (real paragraph break / URL terminator)
+    //    - Remaining \r and \n → removed (PTY hard-wrap artifacts)
+    const flat = clean
+      .replace(/(\r?\n){2,}/g, " ")
+      .replace(/[\r\n]/g, "");
 
-    if (lines.length === 0) return;
+    if (!flat) return;
 
-    for (let i = 0; i < lines.length; i++) {
-      const match = lines[i].match(/https?:\/\/[^\s'"]+/);
-      if (!match) continue;
+    // 3. Match URLs on the flattened string — spans across wrapped lines naturally
+    const urlRe = /https?:\/\/[^\s'"<>\x07]+/g;
+    let m: RegExpExecArray | null;
 
-      // Start with the URL fragment found on this line
-      let url = match[0];
-      let lastLineIndex = i;
+    while ((m = urlRe.exec(flat)) !== null) {
+      const url = m[0];
 
-      // Concatenate subsequent continuation lines (non-empty, no spaces, no leading whitespace)
-      for (let j = i + 1; j < lines.length; j++) {
-        const next = lines[j];
-        if (!next || next.startsWith(" ") || next.includes(" ")) break;
-        url += next;
-        lastLineIndex = j;
-        i = j; // skip this line in the outer loop
-      }
-
+      // 4. Filter by length
       if (url.length < MIN_URL_LENGTH) continue;
 
-      // If the URL reaches the last line of the buffer, the rest may still
-      // be arriving in the next PTY chunk — defer emission.
-      if (lastLineIndex >= lines.length - 1) {
+      // 5. If the match extends to the very end of the flattened string,
+      //    more chunks may still be arriving — defer emission.
+      if (m.index + url.length >= flat.length) {
         this.pendingUrl = url;
         this.confirmTimer = setTimeout(() => {
           this.confirmTimer = null;
@@ -97,7 +91,7 @@ export class UrlDetector {
         return;
       }
 
-      // URL is clearly complete (more content follows it in the buffer)
+      // 6. URL is clearly complete (more content follows) — dedup + emit
       this.pendingUrl = null;
       if (url !== this.lastEmitted) {
         this.lastEmitted = url;
@@ -105,7 +99,7 @@ export class UrlDetector {
       }
     }
 
-    // Scan finished without finding a URL reaching the buffer end.
+    // Scan finished without a URL at the buffer end.
     // If we had a pending URL from a previous scan, it's now confirmed complete.
     if (this.pendingUrl) {
       this.emitPending();
