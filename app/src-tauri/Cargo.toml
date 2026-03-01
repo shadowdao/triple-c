@@ -12,7 +12,7 @@ name = "triple-c"
 path = "src/main.rs"
 
 [dependencies]
-tauri = { version = "2", features = ["image-png"] }
+tauri = { version = "2", features = ["image-png", "image-ico"] }
 tauri-plugin-store = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
@@ -26,7 +26,7 @@ uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 log = "0.4"
-env_logger = "0.11"
+fern = { version = "0.7", features = ["date-based"] }
 tar = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 

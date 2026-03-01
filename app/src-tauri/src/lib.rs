@@ -1,5 +1,6 @@
 mod commands;
 mod docker;
+mod logging;
 mod models;
 mod storage;
 
@@ -15,22 +16,42 @@ pub struct AppState {
 }
 
 pub fn run() {
-    env_logger::init();
+    logging::init();
+
+    let projects_store = match ProjectsStore::new() {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("Failed to initialize projects store: {}", e);
+            panic!("Failed to initialize projects store: {}", e);
+        }
+    };
+    let settings_store = match SettingsStore::new() {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("Failed to initialize settings store: {}", e);
+            panic!("Failed to initialize settings store: {}", e);
+        }
+    };
 
     tauri::Builder::default()
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(AppState {
-            projects_store: ProjectsStore::new().expect("Failed to initialize projects store"),
-            settings_store: SettingsStore::new().expect("Failed to initialize settings store"),
+            projects_store,
+            settings_store,
             exec_manager: ExecSessionManager::new(),
         })
         .setup(|app| {
-            let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/icon.ico"))
-                .expect("Failed to load window icon");
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.set_icon(icon);
+            match tauri::image::Image::from_bytes(include_bytes!("../icons/icon.ico")) {
+                Ok(icon) => {
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.set_icon(icon);
+                    }
+                }
+                Err(e) => {
+                    log::error!("Failed to load window icon: {}", e);
+                }
             }
             Ok(())
         })
