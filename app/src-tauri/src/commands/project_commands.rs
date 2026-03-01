@@ -160,6 +160,7 @@ pub async fn start_project_container(
                     &project,
                     settings.global_claude_instructions.as_deref(),
                     &settings.global_custom_env_vars,
+                    settings.timezone.as_deref(),
                 )
                 .await
                 .unwrap_or(false);
@@ -175,6 +176,7 @@ pub async fn start_project_container(
                     &settings.global_aws,
                     settings.global_claude_instructions.as_deref(),
                     &settings.global_custom_env_vars,
+                    settings.timezone.as_deref(),
                 ).await?;
                 docker::start_container(&new_id).await?;
                 new_id
@@ -191,6 +193,7 @@ pub async fn start_project_container(
                 &settings.global_aws,
                 settings.global_claude_instructions.as_deref(),
                 &settings.global_custom_env_vars,
+                settings.timezone.as_deref(),
             ).await?;
             docker::start_container(&new_id).await?;
             new_id

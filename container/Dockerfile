@@ -19,6 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     unzip \
     pkg-config \
     libssl-dev \
+    cron \
     && rm -rf /var/lib/apt/lists/*
 
 # Remove default ubuntu user to free UID 1000 for host-user remapping
@@ -101,5 +102,9 @@ WORKDIR /workspace
 USER root
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
+COPY triple-c-scheduler /usr/local/bin/triple-c-scheduler
+RUN chmod +x /usr/local/bin/triple-c-scheduler
+COPY triple-c-task-runner /usr/local/bin/triple-c-task-runner
+RUN chmod +x /usr/local/bin/triple-c-task-runner
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

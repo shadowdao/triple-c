@@ -4675,6 +4675,7 @@ dependencies = [
  "dirs",
  "fern",
  "futures-util",
+ "iana-time-zone",
  "keyring",
  "log",
  "reqwest 0.12.28",

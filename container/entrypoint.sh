@@ -113,6 +113,59 @@ if [ -S /var/run/docker.sock ]; then
     usermod -aG "$DOCKER_GROUP" claude
 fi
 
+# ── Timezone setup ───────────────────────────────────────────────────────────
+if [ -n "${TZ:-}" ]; then
+    if [ -f "/usr/share/zoneinfo/$TZ" ]; then
+        ln -sf "/usr/share/zoneinfo/$TZ" /etc/localtime
+        echo "$TZ" > /etc/timezone
+        echo "entrypoint: timezone set to $TZ"
+    else
+        echo "entrypoint: warning — timezone '$TZ' not found in /usr/share/zoneinfo"
+    fi
+fi
+
+# ── Scheduler setup ─────────────────────────────────────────────────────────
+SCHEDULER_DIR="/home/claude/.claude/scheduler"
+mkdir -p "$SCHEDULER_DIR/tasks" "$SCHEDULER_DIR/logs" "$SCHEDULER_DIR/notifications"
+chown -R claude:claude "$SCHEDULER_DIR"
+
+# Start cron daemon (runs as root, executes jobs per user crontab)
+cron
+
+# Save environment variables for cron jobs (cron runs with a minimal env)
+ENV_FILE="$SCHEDULER_DIR/.env"
+: > "$ENV_FILE"
+env | while IFS='=' read -r key value; do
+    case "$key" in
+        ANTHROPIC_*|AWS_*|CLAUDE_CODE_*|PATH|HOME|LANG|TZ|COLORTERM)
+            # Escape single quotes in value and write as KEY='VALUE'
+            escaped_value=$(printf '%s' "$value" | sed "s/'/'\\\\''/g")
+            printf "%s='%s'\n" "$key" "$escaped_value" >> "$ENV_FILE"
+            ;;
+    esac
+done
+chown claude:claude "$ENV_FILE"
+chmod 600 "$ENV_FILE"
+
+# Restore crontab from persisted task JSON files (survives container recreation)
+if ls "$SCHEDULER_DIR/tasks/"*.json >/dev/null 2>&1; then
+    CRON_TMP=$(mktemp)
+    echo "# Triple-C scheduled tasks — managed by triple-c-scheduler" > "$CRON_TMP"
+    echo "# Do not edit manually; changes will be overwritten." >> "$CRON_TMP"
+    echo "" >> "$CRON_TMP"
+    for task_file in "$SCHEDULER_DIR/tasks/"*.json; do
+        [ -f "$task_file" ] || continue
+        enabled=$(jq -r '.enabled' "$task_file")
+        [ "$enabled" = "true" ] || continue
+        schedule=$(jq -r '.schedule' "$task_file")
+        id=$(jq -r '.id' "$task_file")
+        echo "$schedule /usr/local/bin/triple-c-task-runner $id" >> "$CRON_TMP"
+    done
+    crontab -u claude "$CRON_TMP" 2>/dev/null || true
+    rm -f "$CRON_TMP"
+    echo "entrypoint: restored crontab from persisted tasks"
+fi
+
 # ── Stay alive as claude ─────────────────────────────────────────────────────
 echo "Triple-C container ready."
 exec su -s /bin/bash claude -c "exec sleep infinity"

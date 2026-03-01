@@ -68,6 +68,8 @@ pub struct AppSettings {
     pub auto_check_updates: bool,
     #[serde(default)]
     pub dismissed_update_version: Option<String>,
+    #[serde(default)]
+    pub timezone: Option<String>,
 }
 
 impl Default for AppSettings {
@@ -84,6 +86,7 @@ impl Default for AppSettings {
             global_custom_env_vars: Vec::new(),
             auto_check_updates: true,
             dismissed_update_version: None,
+            timezone: None,
         }
     }
 }

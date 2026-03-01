@@ -9,6 +9,8 @@ use crate::models::container_config;
 
 const DOCKERFILE: &str = include_str!("../../../../container/Dockerfile");
 const ENTRYPOINT: &str = include_str!("../../../../container/entrypoint.sh");
+const SCHEDULER: &str = include_str!("../../../../container/triple-c-scheduler");
+const TASK_RUNNER: &str = include_str!("../../../../container/triple-c-task-runner");
 
 pub async fn image_exists(image_name: &str) -> Result<bool, String> {
     let docker = get_docker()?;
@@ -134,6 +136,20 @@ fn create_build_context() -> Result<Vec<u8>, std::io::Error> {
         header.set_mode(0o755);
         header.set_cksum();
         archive.append_data(&mut header, "entrypoint.sh", entrypoint_bytes)?;
+
+        let scheduler_bytes = SCHEDULER.as_bytes();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(scheduler_bytes.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        archive.append_data(&mut header, "triple-c-scheduler", scheduler_bytes)?;
+
+        let task_runner_bytes = TASK_RUNNER.as_bytes();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(task_runner_bytes.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        archive.append_data(&mut header, "triple-c-task-runner", task_runner_bytes)?;
 
         archive.finish()?;
     }

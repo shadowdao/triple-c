@@ -30,6 +30,33 @@ pub async fn pull_image(
 }
 
 #[tauri::command]
+pub async fn detect_host_timezone() -> Result<String, String> {
+    // Try the iana-time-zone crate first (cross-platform)
+    match iana_time_zone::get_timezone() {
+        Ok(tz) => return Ok(tz),
+        Err(e) => log::debug!("iana_time_zone::get_timezone() failed: {}", e),
+    }
+
+    // Fallback: check TZ env var
+    if let Ok(tz) = std::env::var("TZ") {
+        if !tz.is_empty() {
+            return Ok(tz);
+        }
+    }
+
+    // Fallback: read /etc/timezone (Linux)
+    if let Ok(tz) = std::fs::read_to_string("/etc/timezone") {
+        let tz = tz.trim().to_string();
+        if !tz.is_empty() {
+            return Ok(tz);
+        }
+    }
+
+    // Default to UTC if detection fails
+    Ok("UTC".to_string())
+}
+
+#[tauri::command]
 pub async fn detect_aws_config() -> Result<Option<String>, String> {
     if let Some(home) = dirs::home_dir() {
         let aws_dir = home.join(".aws");

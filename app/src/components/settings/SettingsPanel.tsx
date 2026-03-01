@@ -6,6 +6,7 @@ import { useSettings } from "../../hooks/useSettings";
 import { useUpdates } from "../../hooks/useUpdates";
 import ClaudeInstructionsModal from "../projects/ClaudeInstructionsModal";
 import EnvVarsModal from "../projects/EnvVarsModal";
+import { detectHostTimezone } from "../../lib/tauri-commands";
 import type { EnvVar } from "../../lib/types";
 
 export default function SettingsPanel() {
@@ -14,6 +15,7 @@ export default function SettingsPanel() {
   const [globalInstructions, setGlobalInstructions] = useState(appSettings?.global_claude_instructions ?? "");
   const [globalEnvVars, setGlobalEnvVars] = useState<EnvVar[]>(appSettings?.global_custom_env_vars ?? []);
   const [checkingUpdates, setCheckingUpdates] = useState(false);
+  const [timezone, setTimezone] = useState(appSettings?.timezone ?? "");
   const [showInstructionsModal, setShowInstructionsModal] = useState(false);
   const [showEnvVarsModal, setShowEnvVarsModal] = useState(false);
 
@@ -21,7 +23,18 @@ export default function SettingsPanel() {
   useEffect(() => {
     setGlobalInstructions(appSettings?.global_claude_instructions ?? "");
     setGlobalEnvVars(appSettings?.global_custom_env_vars ?? []);
-  }, [appSettings?.global_claude_instructions, appSettings?.global_custom_env_vars]);
+    setTimezone(appSettings?.timezone ?? "");
+  }, [appSettings?.global_claude_instructions, appSettings?.global_custom_env_vars, appSettings?.timezone]);
+
+  // Auto-detect timezone on first load if not yet set
+  useEffect(() => {
+    if (appSettings && !appSettings.timezone) {
+      detectHostTimezone().then((tz) => {
+        setTimezone(tz);
+        saveSettings({ ...appSettings, timezone: tz });
+      }).catch(() => {});
+    }
+  }, [appSettings?.timezone]);
 
   const handleCheckNow = async () => {
     setCheckingUpdates(true);
@@ -45,6 +58,26 @@ export default function SettingsPanel() {
       <ApiKeyInput />
       <DockerSettings />
       <AwsSettings />
+
+      {/* Container Timezone */}
+      <div>
+        <label className="block text-sm font-medium mb-1">Container Timezone</label>
+        <p className="text-xs text-[var(--text-secondary)] mb-1.5">
+          Timezone for containers — affects scheduled task timing (IANA format, e.g. America/New_York)
+        </p>
+        <input
+          type="text"
+          value={timezone}
+          onChange={(e) => setTimezone(e.target.value)}
+          onBlur={async () => {
+            if (appSettings) {
+              await saveSettings({ ...appSettings, timezone: timezone || null });
+            }
+          }}
+          placeholder="UTC"
+          className="w-full px-2 py-1 text-sm bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:outline-none focus:border-[var(--accent)]"
+        />
+      </div>
 
       {/* Global Claude Instructions */}
       <div>

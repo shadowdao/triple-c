@@ -98,6 +98,7 @@ export interface AppSettings {
   global_custom_env_vars: EnvVar[];
   auto_check_updates: boolean;
   dismissed_update_version: string | null;
+  timezone: string | null;
 }
 
 export interface UpdateInfo {

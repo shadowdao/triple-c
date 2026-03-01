@@ -1,0 +1,142 @@
+#!/bin/bash
+# triple-c-task-runner — Executes a scheduled task via Claude Code agent
+# Called by cron with a task ID argument. Handles locking, logging,
+# notifications, one-time task cleanup, and log pruning.
+
+set -uo pipefail
+
+SCHEDULER_DIR="${HOME}/.claude/scheduler"
+TASKS_DIR="${SCHEDULER_DIR}/tasks"
+LOGS_DIR="${SCHEDULER_DIR}/logs"
+NOTIFICATIONS_DIR="${SCHEDULER_DIR}/notifications"
+ENV_FILE="${SCHEDULER_DIR}/.env"
+
+TASK_ID="${1:-}"
+
+if [ -z "$TASK_ID" ]; then
+    echo "Usage: triple-c-task-runner <task-id>" >&2
+    exit 1
+fi
+
+TASK_FILE="${TASKS_DIR}/${TASK_ID}.json"
+LOCK_FILE="${SCHEDULER_DIR}/.lock-${TASK_ID}"
+
+if [ ! -f "$TASK_FILE" ]; then
+    echo "Task file not found: $TASK_FILE" >&2
+    exit 1
+fi
+
+# ── Acquire lock (prevent overlapping runs of the same task) ─────────────────
+exec 200>"$LOCK_FILE"
+if ! flock -n 200; then
+    echo "Task $TASK_ID is already running, skipping." >&2
+    exit 0
+fi
+
+# ── Source saved environment ─────────────────────────────────────────────────
+if [ -f "$ENV_FILE" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+    set +a
+fi
+
+# ── Read task definition ────────────────────────────────────────────────────
+PROMPT=$(jq -r '.prompt' "$TASK_FILE")
+WORKING_DIR=$(jq -r '.working_dir // "/workspace"' "$TASK_FILE")
+TASK_NAME=$(jq -r '.name' "$TASK_FILE")
+TASK_TYPE=$(jq -r '.type' "$TASK_FILE")
+
+# ── Prepare log directory ───────────────────────────────────────────────────
+TASK_LOG_DIR="${LOGS_DIR}/${TASK_ID}"
+mkdir -p "$TASK_LOG_DIR"
+
+TIMESTAMP=$(date +"%Y%m%d-%H%M%S")
+LOG_FILE="${TASK_LOG_DIR}/${TIMESTAMP}.log"
+
+# ── Execute Claude agent ────────────────────────────────────────────────────
+{
+    echo "=== Task: $TASK_NAME ($TASK_ID) ==="
+    echo "=== Started: $(date) ==="
+    echo "=== Working dir: $WORKING_DIR ==="
+    echo "=== Prompt: $PROMPT ==="
+    echo ""
+} > "$LOG_FILE"
+
+EXIT_CODE=0
+if [ -d "$WORKING_DIR" ]; then
+    cd "$WORKING_DIR"
+    claude -p "$PROMPT" --dangerously-skip-permissions >> "$LOG_FILE" 2>&1 || EXIT_CODE=$?
+else
+    echo "Error: working directory '$WORKING_DIR' does not exist" >> "$LOG_FILE"
+    EXIT_CODE=1
+fi
+
+{
+    echo ""
+    echo "=== Finished: $(date) ==="
+    echo "=== Exit code: $EXIT_CODE ==="
+} >> "$LOG_FILE"
+
+# ── Write notification ──────────────────────────────────────────────────────
+mkdir -p "$NOTIFICATIONS_DIR"
+NOTIFY_FILE="${NOTIFICATIONS_DIR}/${TASK_ID}_${TIMESTAMP}.notify"
+
+if [ $EXIT_CODE -eq 0 ]; then
+    STATUS="SUCCESS"
+else
+    STATUS="FAILED (exit code $EXIT_CODE)"
+fi
+
+# Extract a summary (last 10 meaningful lines before the footer)
+SUMMARY=$(grep -v "^===" "$LOG_FILE" | grep -v "^$" | tail -n 10)
+
+cat > "$NOTIFY_FILE" <<NOTIFY
+Task:    $TASK_NAME ($TASK_ID)
+Status:  $STATUS
+Time:    $(date)
+Type:    $TASK_TYPE
+
+Summary:
+$SUMMARY
+NOTIFY
+
+# ── One-time task cleanup ───────────────────────────────────────────────────
+if [ "$TASK_TYPE" = "once" ]; then
+    rm -f "$TASK_FILE"
+    # Rebuild crontab to remove the completed one-time task
+    /usr/local/bin/triple-c-scheduler list > /dev/null 2>&1 || true
+    # Direct crontab rebuild (in case scheduler list doesn't trigger it)
+    TMP_CRON=$(mktemp)
+    echo "# Triple-C scheduled tasks — managed by triple-c-scheduler" > "$TMP_CRON"
+    echo "# Do not edit manually; changes will be overwritten." >> "$TMP_CRON"
+    echo "" >> "$TMP_CRON"
+    for tf in "$TASKS_DIR"/*.json; do
+        [ -f "$tf" ] || continue
+        local_enabled=$(jq -r '.enabled' "$tf")
+        [ "$local_enabled" = "true" ] || continue
+        local_schedule=$(jq -r '.schedule' "$tf")
+        local_id=$(jq -r '.id' "$tf")
+        echo "$local_schedule /usr/local/bin/triple-c-task-runner $local_id" >> "$TMP_CRON"
+    done
+    crontab "$TMP_CRON" 2>/dev/null || true
+    rm -f "$TMP_CRON"
+fi
+
+# ── Prune old logs (keep 20 per task) ───────────────────────────────────────
+LOG_COUNT=$(find "$TASK_LOG_DIR" -name "*.log" -type f 2>/dev/null | wc -l)
+if [ "$LOG_COUNT" -gt 20 ]; then
+    find "$TASK_LOG_DIR" -name "*.log" -type f | sort | head -n $((LOG_COUNT - 20)) | xargs rm -f
+fi
+
+# ── Prune old notifications (keep 50 total) ─────────────────────────────────
+NOTIFY_COUNT=$(find "$NOTIFICATIONS_DIR" -name "*.notify" -type f 2>/dev/null | wc -l)
+if [ "$NOTIFY_COUNT" -gt 50 ]; then
+    find "$NOTIFICATIONS_DIR" -name "*.notify" -type f | sort | head -n $((NOTIFY_COUNT - 50)) | xargs rm -f
+fi
+
+# Release lock
+flock -u 200
+rm -f "$LOCK_FILE"
+
+exit $EXIT_CODE

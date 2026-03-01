@@ -10,6 +10,36 @@ use std::hash::{Hash, Hasher};
 use super::client::get_docker;
 use crate::models::{AuthMode, BedrockAuthMethod, ContainerInfo, EnvVar, GlobalAwsSettings, PortMapping, Project, ProjectPath};
 
+const SCHEDULER_INSTRUCTIONS: &str = r#"## Scheduled Tasks
+
+This container supports scheduled tasks via `triple-c-scheduler`. You can set up recurring or one-time tasks that run as separate Claude Code agents.
+
+### Commands
+- `triple-c-scheduler add --name "NAME" --schedule "CRON" --prompt "TASK"` — Add a recurring task
+- `triple-c-scheduler add --name "NAME" --at "YYYY-MM-DD HH:MM" --prompt "TASK"` — Add a one-time task
+- `triple-c-scheduler list` — List all scheduled tasks
+- `triple-c-scheduler remove --id ID` — Remove a task
+- `triple-c-scheduler enable --id ID` / `triple-c-scheduler disable --id ID` — Toggle tasks
+- `triple-c-scheduler logs [--id ID] [--tail N]` — View execution logs
+- `triple-c-scheduler run --id ID` — Manually trigger a task immediately
+- `triple-c-scheduler notifications [--clear]` — View or clear completion notifications
+
+### Cron format
+Standard 5-field cron: `minute hour day-of-month month day-of-week`
+Examples: `*/30 * * * *` (every 30 min), `0 9 * * 1-5` (9am weekdays), `0 */2 * * *` (every 2 hours)
+
+### One-time tasks
+Use `--at "YYYY-MM-DD HH:MM"` instead of `--schedule`. The task automatically removes itself after execution.
+
+### Working directory
+Use `--working-dir /workspace/project` to set where the task runs (default: /workspace).
+
+### Checking results
+After tasks run, check notifications with `triple-c-scheduler notifications` and detailed output with `triple-c-scheduler logs`.
+
+### Timezone
+Scheduled times use the container's configured timezone (check with `date`). If no timezone is configured, UTC is used."#;
+
 /// Compute a fingerprint string for the custom environment variables.
 /// Sorted alphabetically so order changes do not cause spurious recreation.
 fn compute_env_fingerprint(custom_env_vars: &[EnvVar]) -> String {
@@ -147,6 +177,7 @@ pub async fn create_container(
     global_aws: &GlobalAwsSettings,
     global_claude_instructions: Option<&str>,
     global_custom_env_vars: &[EnvVar],
+    timezone: Option<&str>,
 ) -> Result<String, String> {
     let docker = get_docker()?;
     let container_name = project.container_name();
@@ -269,6 +300,13 @@ pub async fn create_container(
     let custom_env_fingerprint = compute_env_fingerprint(&merged_env);
     env_vars.push(format!("TRIPLE_C_CUSTOM_ENV={}", custom_env_fingerprint));
 
+    // Container timezone
+    if let Some(tz) = timezone {
+        if !tz.is_empty() {
+            env_vars.push(format!("TZ={}", tz));
+        }
+    }
+
     // Claude instructions (global + per-project, plus port mapping info)
     let mut combined_instructions = merge_claude_instructions(
         global_claude_instructions,
@@ -290,6 +328,13 @@ pub async fn create_container(
             None => port_info,
         });
     }
+    // Scheduler instructions (always appended so all containers get scheduling docs)
+    let scheduler_docs = SCHEDULER_INSTRUCTIONS;
+    combined_instructions = Some(match combined_instructions {
+        Some(existing) => format!("{}\n\n{}", existing, scheduler_docs),
+        None => scheduler_docs.to_string(),
+    });
+
     if let Some(ref instructions) = combined_instructions {
         env_vars.push(format!("CLAUDE_INSTRUCTIONS={}", instructions));
     }
@@ -400,10 +445,12 @@ pub async fn create_container(
     labels.insert("triple-c.bedrock-fingerprint".to_string(), compute_bedrock_fingerprint(project));
     labels.insert("triple-c.ports-fingerprint".to_string(), compute_ports_fingerprint(&project.port_mappings));
     labels.insert("triple-c.image".to_string(), image_name.to_string());
+    labels.insert("triple-c.timezone".to_string(), timezone.unwrap_or("").to_string());
 
     let host_config = HostConfig {
         mounts: Some(mounts),
         port_bindings: if port_bindings.is_empty() { None } else { Some(port_bindings) },
+        init: Some(true),
         ..Default::default()
     };
 
@@ -484,6 +531,7 @@ pub async fn container_needs_recreation(
     project: &Project,
     global_claude_instructions: Option<&str>,
     global_custom_env_vars: &[EnvVar],
+    timezone: Option<&str>,
 ) -> Result<bool, String> {
     let docker = get_docker()?;
     let info = docker
@@ -569,6 +617,14 @@ pub async fn container_needs_recreation(
                 return Ok(true);
             }
         }
+    }
+
+    // ── Timezone ─────────────────────────────────────────────────────────
+    let expected_tz = timezone.unwrap_or("");
+    let container_tz = get_label("triple-c.timezone").unwrap_or_default();
+    if container_tz != expected_tz {
+        log::info!("Timezone mismatch (container={:?}, expected={:?})", container_tz, expected_tz);
+        return Ok(true);
     }
 
     // ── SSH key path mount ───────────────────────────────────────────────

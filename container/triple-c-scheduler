@@ -1,0 +1,436 @@
+#!/bin/bash
+# triple-c-scheduler — CLI for managing scheduled tasks in Triple-C containers
+# Tasks are stored as JSON files and crontab is rebuilt from them as the source of truth.
+
+set -euo pipefail
+
+SCHEDULER_DIR="${HOME}/.claude/scheduler"
+TASKS_DIR="${SCHEDULER_DIR}/tasks"
+LOGS_DIR="${SCHEDULER_DIR}/logs"
+NOTIFICATIONS_DIR="${SCHEDULER_DIR}/notifications"
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+ensure_dirs() {
+    mkdir -p "$TASKS_DIR" "$LOGS_DIR" "$NOTIFICATIONS_DIR"
+}
+
+generate_id() {
+    head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n'
+}
+
+rebuild_crontab() {
+    local tmp
+    tmp=$(mktemp)
+    # Header
+    echo "# Triple-C scheduled tasks — managed by triple-c-scheduler" > "$tmp"
+    echo "# Do not edit manually; changes will be overwritten." >> "$tmp"
+    echo "" >> "$tmp"
+
+    for task_file in "$TASKS_DIR"/*.json; do
+        [ -f "$task_file" ] || continue
+        local enabled schedule id
+        enabled=$(jq -r '.enabled' "$task_file")
+        [ "$enabled" = "true" ] || continue
+        schedule=$(jq -r '.schedule' "$task_file")
+        id=$(jq -r '.id' "$task_file")
+        echo "$schedule /usr/local/bin/triple-c-task-runner $id" >> "$tmp"
+    done
+
+    crontab "$tmp" 2>/dev/null || true
+    rm -f "$tmp"
+}
+
+usage() {
+    cat <<'EOF'
+Usage: triple-c-scheduler <command> [options]
+
+Commands:
+  add          Add a new scheduled task
+  remove       Remove a task
+  enable       Enable a disabled task
+  disable      Disable a task
+  list         List all tasks
+  logs         Show execution logs
+  run          Manually trigger a task now
+  notifications  Show or clear completion notifications
+
+Add options:
+  --name NAME          Task name (required)
+  --prompt "TASK"      Task prompt for Claude (required)
+  --schedule "CRON"    Cron schedule expression (for recurring tasks)
+  --at "DATETIME"      Target datetime as "YYYY-MM-DD HH:MM" (for one-time tasks)
+  --working-dir DIR    Working directory (default: /workspace)
+
+Remove/Enable/Disable/Run options:
+  --id ID              Task ID (required)
+
+Logs options:
+  --id ID              Show logs for a specific task (optional)
+  --tail N             Show last N lines (default: 50)
+
+Notifications options:
+  --clear              Clear all notifications
+
+Examples:
+  triple-c-scheduler add --name "run-tests" --schedule "*/30 * * * *" --prompt "Run the test suite and report results"
+  triple-c-scheduler add --name "friday-commit" --at "2026-03-06 16:00" --prompt "Commit all changes with a descriptive message"
+  triple-c-scheduler list
+  triple-c-scheduler logs --id a1b2c3d4 --tail 20
+  triple-c-scheduler run --id a1b2c3d4
+EOF
+}
+
+# ── Commands ─────────────────────────────────────────────────────────────────
+
+cmd_add() {
+    local name="" prompt="" schedule="" at="" working_dir="/workspace"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name)     name="$2"; shift 2 ;;
+            --prompt)   prompt="$2"; shift 2 ;;
+            --schedule) schedule="$2"; shift 2 ;;
+            --at)       at="$2"; shift 2 ;;
+            --working-dir) working_dir="$2"; shift 2 ;;
+            *) echo "Unknown option: $1" >&2; return 1 ;;
+        esac
+    done
+
+    if [ -z "$name" ]; then
+        echo "Error: --name is required" >&2
+        return 1
+    fi
+    if [ -z "$prompt" ]; then
+        echo "Error: --prompt is required" >&2
+        return 1
+    fi
+    if [ -z "$schedule" ] && [ -z "$at" ]; then
+        echo "Error: either --schedule or --at is required" >&2
+        return 1
+    fi
+    if [ -n "$schedule" ] && [ -n "$at" ]; then
+        echo "Error: use either --schedule or --at, not both" >&2
+        return 1
+    fi
+
+    local id task_type cron_expr
+    id=$(generate_id)
+
+    if [ -n "$at" ]; then
+        task_type="once"
+        # Parse "YYYY-MM-DD HH:MM" into cron expression
+        local year month day hour minute
+        if ! [[ "$at" =~ ^([0-9]{4})-([0-9]{2})-([0-9]{2})\ ([0-9]{2}):([0-9]{2})$ ]]; then
+            echo "Error: --at must be in format 'YYYY-MM-DD HH:MM'" >&2
+            return 1
+        fi
+        year="${BASH_REMATCH[1]}"
+        month="${BASH_REMATCH[2]}"
+        day="${BASH_REMATCH[3]}"
+        hour="${BASH_REMATCH[4]}"
+        minute="${BASH_REMATCH[5]}"
+        # Remove leading zeros for cron
+        month=$((10#$month))
+        day=$((10#$day))
+        hour=$((10#$hour))
+        minute=$((10#$minute))
+        cron_expr="$minute $hour $day $month *"
+    else
+        task_type="recurring"
+        cron_expr="$schedule"
+    fi
+
+    local created_at
+    created_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    local task_json
+    task_json=$(jq -n \
+        --arg id "$id" \
+        --arg name "$name" \
+        --arg prompt "$prompt" \
+        --arg schedule "$cron_expr" \
+        --arg type "$task_type" \
+        --arg at "$at" \
+        --arg created_at "$created_at" \
+        --argjson enabled true \
+        --arg working_dir "$working_dir" \
+        '{
+            id: $id,
+            name: $name,
+            prompt: $prompt,
+            schedule: $schedule,
+            type: $type,
+            at: $at,
+            created_at: $created_at,
+            enabled: $enabled,
+            working_dir: $working_dir
+        }')
+
+    echo "$task_json" > "$TASKS_DIR/${id}.json"
+    rebuild_crontab
+
+    echo "Task created:"
+    echo "  ID:       $id"
+    echo "  Name:     $name"
+    echo "  Type:     $task_type"
+    if [ "$task_type" = "once" ]; then
+        echo "  At:       $at"
+    fi
+    echo "  Schedule: $cron_expr"
+    echo "  Prompt:   $prompt"
+}
+
+cmd_remove() {
+    local id=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --id) id="$2"; shift 2 ;;
+            *) echo "Unknown option: $1" >&2; return 1 ;;
+        esac
+    done
+
+    if [ -z "$id" ]; then
+        echo "Error: --id is required" >&2
+        return 1
+    fi
+
+    local task_file="$TASKS_DIR/${id}.json"
+    if [ ! -f "$task_file" ]; then
+        echo "Error: task '$id' not found" >&2
+        return 1
+    fi
+
+    local name
+    name=$(jq -r '.name' "$task_file")
+    rm -f "$task_file"
+    rebuild_crontab
+    echo "Removed task '$name' ($id)"
+}
+
+cmd_enable() {
+    local id=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --id) id="$2"; shift 2 ;;
+            *) echo "Unknown option: $1" >&2; return 1 ;;
+        esac
+    done
+
+    if [ -z "$id" ]; then
+        echo "Error: --id is required" >&2
+        return 1
+    fi
+
+    local task_file="$TASKS_DIR/${id}.json"
+    if [ ! -f "$task_file" ]; then
+        echo "Error: task '$id' not found" >&2
+        return 1
+    fi
+
+    local tmp
+    tmp=$(mktemp)
+    jq '.enabled = true' "$task_file" > "$tmp" && mv "$tmp" "$task_file"
+    rebuild_crontab
+
+    local name
+    name=$(jq -r '.name' "$task_file")
+    echo "Enabled task '$name' ($id)"
+}
+
+cmd_disable() {
+    local id=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --id) id="$2"; shift 2 ;;
+            *) echo "Unknown option: $1" >&2; return 1 ;;
+        esac
+    done
+
+    if [ -z "$id" ]; then
+        echo "Error: --id is required" >&2
+        return 1
+    fi
+
+    local task_file="$TASKS_DIR/${id}.json"
+    if [ ! -f "$task_file" ]; then
+        echo "Error: task '$id' not found" >&2
+        return 1
+    fi
+
+    local tmp
+    tmp=$(mktemp)
+    jq '.enabled = false' "$task_file" > "$tmp" && mv "$tmp" "$task_file"
+    rebuild_crontab
+
+    local name
+    name=$(jq -r '.name' "$task_file")
+    echo "Disabled task '$name' ($id)"
+}
+
+cmd_list() {
+    local found=false
+    printf "%-10s %-20s %-10s %-9s %-20s %s\n" "ID" "NAME" "TYPE" "ENABLED" "SCHEDULE" "PROMPT"
+    printf "%-10s %-20s %-10s %-9s %-20s %s\n" "──────────" "────────────────────" "──────────" "─────────" "────────────────────" "──────────────────────────────"
+
+    for task_file in "$TASKS_DIR"/*.json; do
+        [ -f "$task_file" ] || continue
+        found=true
+        local id name type enabled schedule at prompt
+        id=$(jq -r '.id' "$task_file")
+        name=$(jq -r '.name' "$task_file")
+        type=$(jq -r '.type' "$task_file")
+        enabled=$(jq -r '.enabled' "$task_file")
+        schedule=$(jq -r '.schedule' "$task_file")
+        at=$(jq -r '.at // ""' "$task_file")
+        prompt=$(jq -r '.prompt' "$task_file")
+
+        local display_schedule="$schedule"
+        if [ "$type" = "once" ] && [ -n "$at" ]; then
+            display_schedule="at $at"
+        fi
+
+        # Truncate long fields for display
+        [ ${#name} -gt 20 ] && name="${name:0:17}..."
+        [ ${#display_schedule} -gt 20 ] && display_schedule="${display_schedule:0:17}..."
+        [ ${#prompt} -gt 30 ] && prompt="${prompt:0:27}..."
+
+        printf "%-10s %-20s %-10s %-9s %-20s %s\n" "$id" "$name" "$type" "$enabled" "$display_schedule" "$prompt"
+    done
+
+    if [ "$found" = "false" ]; then
+        echo "No scheduled tasks."
+    fi
+}
+
+cmd_logs() {
+    local id="" tail_n=50
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --id)   id="$2"; shift 2 ;;
+            --tail) tail_n="$2"; shift 2 ;;
+            *) echo "Unknown option: $1" >&2; return 1 ;;
+        esac
+    done
+
+    if [ -n "$id" ]; then
+        local log_dir="$LOGS_DIR/$id"
+        if [ ! -d "$log_dir" ]; then
+            echo "No logs found for task '$id'"
+            return 0
+        fi
+        # Show the most recent log file
+        local latest
+        latest=$(ls -t "$log_dir"/*.log 2>/dev/null | head -1)
+        if [ -z "$latest" ]; then
+            echo "No logs found for task '$id'"
+            return 0
+        fi
+        echo "=== Latest log for task $id: $(basename "$latest") ==="
+        tail -n "$tail_n" "$latest"
+    else
+        # Show recent logs across all tasks
+        local all_logs
+        all_logs=$(find "$LOGS_DIR" -name "*.log" -type f 2>/dev/null | sort -r | head -n 10)
+        if [ -z "$all_logs" ]; then
+            echo "No logs found."
+            return 0
+        fi
+        for log_file in $all_logs; do
+            local task_id
+            task_id=$(basename "$(dirname "$log_file")")
+            echo "=== Task $task_id: $(basename "$log_file") ==="
+            tail -n 5 "$log_file"
+            echo ""
+        done
+    fi
+}
+
+cmd_run() {
+    local id=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --id) id="$2"; shift 2 ;;
+            *) echo "Unknown option: $1" >&2; return 1 ;;
+        esac
+    done
+
+    if [ -z "$id" ]; then
+        echo "Error: --id is required" >&2
+        return 1
+    fi
+
+    local task_file="$TASKS_DIR/${id}.json"
+    if [ ! -f "$task_file" ]; then
+        echo "Error: task '$id' not found" >&2
+        return 1
+    fi
+
+    local name
+    name=$(jq -r '.name' "$task_file")
+    echo "Manually triggering task '$name' ($id)..."
+    /usr/local/bin/triple-c-task-runner "$id"
+}
+
+cmd_notifications() {
+    local clear=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --clear) clear=true; shift ;;
+            *) echo "Unknown option: $1" >&2; return 1 ;;
+        esac
+    done
+
+    if [ "$clear" = "true" ]; then
+        rm -f "$NOTIFICATIONS_DIR"/*.notify
+        echo "Notifications cleared."
+        return 0
+    fi
+
+    local found=false
+    for notify_file in $(ls -t "$NOTIFICATIONS_DIR"/*.notify 2>/dev/null); do
+        [ -f "$notify_file" ] || continue
+        found=true
+        cat "$notify_file"
+        echo "---"
+    done
+
+    if [ "$found" = "false" ]; then
+        echo "No notifications."
+    fi
+}
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+ensure_dirs
+
+if [ $# -eq 0 ]; then
+    usage
+    exit 1
+fi
+
+command="$1"
+shift
+
+case "$command" in
+    add)           cmd_add "$@" ;;
+    remove)        cmd_remove "$@" ;;
+    enable)        cmd_enable "$@" ;;
+    disable)       cmd_disable "$@" ;;
+    list)          cmd_list ;;
+    logs)          cmd_logs "$@" ;;
+    run)           cmd_run "$@" ;;
+    notifications) cmd_notifications "$@" ;;
+    help|--help|-h) usage ;;
+    *)
+        echo "Unknown command: $command" >&2
+        usage
+        exit 1
+        ;;
+esac

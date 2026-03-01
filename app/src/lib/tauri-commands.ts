@@ -35,6 +35,8 @@ export const detectAwsConfig = () =>
   invoke<string | null>("detect_aws_config");
 export const listAwsProfiles = () =>
   invoke<string[]>("list_aws_profiles");
+export const detectHostTimezone = () =>
+  invoke<string>("detect_host_timezone");
 
 // Terminal
 export const openTerminalSession = (projectId: string, sessionId: string) =>

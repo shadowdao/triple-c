@@ -29,6 +29,7 @@ log = "0.4"
 fern = { version = "0.7", features = ["date-based"] }
 tar = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+iana-time-zone = "0.1"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
