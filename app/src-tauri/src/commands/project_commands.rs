@@ -169,6 +169,7 @@ pub async fn start_project_container(
             let needs_recreation = docker::container_needs_recreation(
                     &existing_id,
                     &project,
+                    api_key.as_deref(),
                     settings.global_claude_instructions.as_deref(),
                     &settings.global_custom_env_vars,
                 )

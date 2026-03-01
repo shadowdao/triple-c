@@ -51,6 +51,7 @@ export default function AwsSettings() {
       <div className="space-y-3 text-sm">
         <p className="text-xs text-[var(--text-secondary)]">
           Global AWS defaults for Bedrock projects. Per-project settings override these.
+          Changes here require a container rebuild to take effect.
         </p>
 
         {/* AWS Config Path */}
