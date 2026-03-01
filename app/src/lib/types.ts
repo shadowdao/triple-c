@@ -88,6 +88,7 @@ export interface AppSettings {
   custom_image_name: string | null;
   global_aws: GlobalAwsSettings;
   global_claude_instructions: string | null;
+  global_custom_env_vars: EnvVar[];
   auto_check_updates: boolean;
   dismissed_update_version: string | null;
 }

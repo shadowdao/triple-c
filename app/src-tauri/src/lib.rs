@@ -27,7 +27,7 @@ pub fn run() {
             exec_manager: ExecSessionManager::new(),
         })
         .setup(|app| {
-            let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png"))
+            let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/icon.ico"))
                 .expect("Failed to load window icon");
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_icon(icon);

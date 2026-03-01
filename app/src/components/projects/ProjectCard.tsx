@@ -4,6 +4,8 @@ import type { Project, ProjectPath, AuthMode, BedrockConfig, BedrockAuthMethod }
 import { useProjects } from "../../hooks/useProjects";
 import { useTerminal } from "../../hooks/useTerminal";
 import { useAppState } from "../../store/appState";
+import EnvVarsModal from "./EnvVarsModal";
+import ClaudeInstructionsModal from "./ClaudeInstructionsModal";
 
 interface Props {
   project: Project;
@@ -17,6 +19,8 @@ export default function ProjectCard({ project }: Props) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showConfig, setShowConfig] = useState(false);
+  const [showEnvVarsModal, setShowEnvVarsModal] = useState(false);
+  const [showClaudeInstructionsModal, setShowClaudeInstructionsModal] = useState(false);
   const isSelected = selectedProjectId === project.id;
   const isStopped = project.status === "stopped" || project.status === "error";
 
@@ -162,22 +166,6 @@ export default function ProjectCard({ project }: Props) {
       await update({ ...project, git_token: gitToken || null });
     } catch (err) {
       console.error("Failed to update Git token:", err);
-    }
-  };
-
-  const handleClaudeInstructionsBlur = async () => {
-    try {
-      await update({ ...project, claude_instructions: claudeInstructions || null });
-    } catch (err) {
-      console.error("Failed to update Claude instructions:", err);
-    }
-  };
-
-  const handleEnvVarBlur = async () => {
-    try {
-      await update({ ...project, custom_env_vars: envVars });
-    } catch (err) {
-      console.error("Failed to update environment variables:", err);
     }
   };
 
@@ -358,6 +346,11 @@ export default function ProjectCard({ project }: Props) {
           {/* Config panel */}
           {showConfig && (
             <div className="space-y-2 pt-1 border-t border-[var(--border-color)] min-w-0 overflow-hidden" onClick={(e) => e.stopPropagation()}>
+              {!isStopped && (
+                <div className="px-2 py-1.5 bg-[var(--warning)]/15 border border-[var(--warning)]/30 rounded text-xs text-[var(--warning)]">
+                  Container must be stopped to change settings.
+                </div>
+              )}
               {/* Folder paths */}
               <div>
                 <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Folders</label>
@@ -530,76 +523,29 @@ export default function ProjectCard({ project }: Props) {
               </div>
 
               {/* Environment Variables */}
-              <div>
-                <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Environment Variables</label>
-                {envVars.map((ev, i) => (
-                  <div key={i} className="flex gap-1 mb-1">
-                    <input
-                      value={ev.key}
-                      onChange={(e) => {
-                        const vars = [...envVars];
-                        vars[i] = { ...vars[i], key: e.target.value };
-                        setEnvVars(vars);
-                      }}
-                      onBlur={handleEnvVarBlur}
-                      placeholder="KEY"
-                      disabled={!isStopped}
-                      className="w-1/3 px-2 py-1 bg-[var(--bg-primary)] border border-[var(--border-color)] rounded text-xs text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)] disabled:opacity-50 font-mono"
-                    />
-                    <input
-                      value={ev.value}
-                      onChange={(e) => {
-                        const vars = [...envVars];
-                        vars[i] = { ...vars[i], value: e.target.value };
-                        setEnvVars(vars);
-                      }}
-                      onBlur={handleEnvVarBlur}
-                      placeholder="value"
-                      disabled={!isStopped}
-                      className="flex-1 px-2 py-1 bg-[var(--bg-primary)] border border-[var(--border-color)] rounded text-xs text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)] disabled:opacity-50 font-mono"
-                    />
-                    <button
-                      onClick={async () => {
-                        const vars = envVars.filter((_, j) => j !== i);
-                        setEnvVars(vars);
-                        try { await update({ ...project, custom_env_vars: vars }); } catch (err) {
-                          console.error("Failed to remove environment variable:", err);
-                        }
-                      }}
-                      disabled={!isStopped}
-                      className="px-1.5 py-1 text-xs text-[var(--error)] hover:bg-[var(--bg-primary)] rounded disabled:opacity-50 transition-colors"
-                    >
-                      x
-                    </button>
-                  </div>
-                ))}
+              <div className="flex items-center justify-between">
+                <label className="text-xs text-[var(--text-secondary)]">
+                  Environment Variables{envVars.length > 0 && ` (${envVars.length})`}
+                </label>
                 <button
-                  onClick={async () => {
-                    const vars = [...envVars, { key: "", value: "" }];
-                    setEnvVars(vars);
-                    try { await update({ ...project, custom_env_vars: vars }); } catch (err) {
-                      console.error("Failed to add environment variable:", err);
-                    }
-                  }}
-                  disabled={!isStopped}
-                  className="text-xs text-[var(--accent)] hover:text-[var(--accent-hover)] disabled:opacity-50 transition-colors"
+                  onClick={() => setShowEnvVarsModal(true)}
+                  className="text-xs px-2 py-0.5 text-[var(--accent)] hover:text-[var(--accent-hover)] hover:bg-[var(--bg-primary)] rounded transition-colors"
                 >
-                  + Add variable
+                  Edit
                 </button>
               </div>
 
               {/* Claude Instructions */}
-              <div>
-                <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Claude Instructions</label>
-                <textarea
-                  value={claudeInstructions}
-                  onChange={(e) => setClaudeInstructions(e.target.value)}
-                  onBlur={handleClaudeInstructionsBlur}
-                  placeholder="Per-project instructions for Claude Code (written to ~/.claude/CLAUDE.md in container)"
-                  disabled={!isStopped}
-                  rows={3}
-                  className="w-full px-2 py-1 bg-[var(--bg-primary)] border border-[var(--border-color)] rounded text-xs text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)] disabled:opacity-50 resize-y font-mono"
-                />
+              <div className="flex items-center justify-between">
+                <label className="text-xs text-[var(--text-secondary)]">
+                  Claude Instructions{claudeInstructions ? " (set)" : ""}
+                </label>
+                <button
+                  onClick={() => setShowClaudeInstructionsModal(true)}
+                  className="text-xs px-2 py-0.5 text-[var(--accent)] hover:text-[var(--accent-hover)] hover:bg-[var(--bg-primary)] rounded transition-colors"
+                >
+                  Edit
+                </button>
               </div>
 
               {/* Bedrock config */}
@@ -733,6 +679,30 @@ export default function ProjectCard({ project }: Props) {
 
       {error && (
         <div className="text-xs text-[var(--error)] mt-1 ml-4">{error}</div>
+      )}
+
+      {showEnvVarsModal && (
+        <EnvVarsModal
+          envVars={envVars}
+          disabled={!isStopped}
+          onSave={async (vars) => {
+            setEnvVars(vars);
+            await update({ ...project, custom_env_vars: vars });
+          }}
+          onClose={() => setShowEnvVarsModal(false)}
+        />
+      )}
+
+      {showClaudeInstructionsModal && (
+        <ClaudeInstructionsModal
+          instructions={claudeInstructions}
+          disabled={!isStopped}
+          onSave={async (instructions) => {
+            setClaudeInstructions(instructions);
+            await update({ ...project, claude_instructions: instructions || null });
+          }}
+          onClose={() => setShowClaudeInstructionsModal(false)}
+        />
       )}
     </div>
   );

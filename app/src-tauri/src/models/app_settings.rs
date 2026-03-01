@@ -1,7 +1,13 @@
 use serde::{Deserialize, Serialize};
 
+use super::project::EnvVar;
+
 fn default_true() -> bool {
     true
+}
+
+fn default_global_instructions() -> Option<String> {
+    Some("If the project is not initialized with git, recommend to the user to initialize and use git to track changes. This makes it easier to revert should something break.".to_string())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -54,8 +60,10 @@ pub struct AppSettings {
     pub custom_image_name: Option<String>,
     #[serde(default)]
     pub global_aws: GlobalAwsSettings,
-    #[serde(default)]
+    #[serde(default = "default_global_instructions")]
     pub global_claude_instructions: Option<String>,
+    #[serde(default)]
+    pub global_custom_env_vars: Vec<EnvVar>,
     #[serde(default = "default_true")]
     pub auto_check_updates: bool,
     #[serde(default)]
@@ -72,7 +80,8 @@ impl Default for AppSettings {
             image_source: ImageSource::default(),
             custom_image_name: None,
             global_aws: GlobalAwsSettings::default(),
-            global_claude_instructions: None,
+            global_claude_instructions: default_global_instructions(),
+            global_custom_env_vars: Vec::new(),
             auto_check_updates: true,
             dismissed_update_version: None,
         }

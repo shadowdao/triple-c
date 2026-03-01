@@ -30,6 +30,25 @@ fn compute_env_fingerprint(custom_env_vars: &[EnvVar]) -> String {
     parts.join(",")
 }
 
+/// Merge global and per-project custom environment variables.
+/// Per-project variables override global variables with the same key.
+fn merge_custom_env_vars(global: &[EnvVar], project: &[EnvVar]) -> Vec<EnvVar> {
+    let mut merged: std::collections::HashMap<String, EnvVar> = std::collections::HashMap::new();
+    for ev in global {
+        let key = ev.key.trim().to_string();
+        if !key.is_empty() {
+            merged.insert(key, ev.clone());
+        }
+    }
+    for ev in project {
+        let key = ev.key.trim().to_string();
+        if !key.is_empty() {
+            merged.insert(key, ev.clone());
+        }
+    }
+    merged.into_values().collect()
+}
+
 /// Merge global and per-project Claude instructions into a single string.
 fn merge_claude_instructions(
     global_instructions: Option<&str>,
@@ -114,6 +133,7 @@ pub async fn create_container(
     aws_config_path: Option<&str>,
     global_aws: &GlobalAwsSettings,
     global_claude_instructions: Option<&str>,
+    global_custom_env_vars: &[EnvVar],
 ) -> Result<String, String> {
     let docker = get_docker()?;
     let container_name = project.container_name();
@@ -222,9 +242,10 @@ pub async fn create_container(
         }
     }
 
-    // Custom environment variables
+    // Custom environment variables (global + per-project, project overrides global for same key)
+    let merged_env = merge_custom_env_vars(global_custom_env_vars, &project.custom_env_vars);
     let reserved_prefixes = ["ANTHROPIC_", "AWS_", "GIT_", "HOST_", "CLAUDE_", "TRIPLE_C_"];
-    for env_var in &project.custom_env_vars {
+    for env_var in &merged_env {
         let key = env_var.key.trim();
         if key.is_empty() {
             continue;
@@ -236,7 +257,7 @@ pub async fn create_container(
         }
         env_vars.push(format!("{}={}", key, env_var.value));
     }
-    let custom_env_fingerprint = compute_env_fingerprint(&project.custom_env_vars);
+    let custom_env_fingerprint = compute_env_fingerprint(&merged_env);
     env_vars.push(format!("TRIPLE_C_CUSTOM_ENV={}", custom_env_fingerprint));
 
     // Claude instructions (global + per-project)
@@ -419,6 +440,7 @@ pub async fn container_needs_recreation(
     container_id: &str,
     project: &Project,
     global_claude_instructions: Option<&str>,
+    global_custom_env_vars: &[EnvVar],
 ) -> Result<bool, String> {
     let docker = get_docker()?;
     let info = docker
@@ -547,7 +569,8 @@ pub async fn container_needs_recreation(
     }
 
     // ── Custom environment variables ──────────────────────────────────────
-    let expected_fingerprint = compute_env_fingerprint(&project.custom_env_vars);
+    let merged_env = merge_custom_env_vars(global_custom_env_vars, &project.custom_env_vars);
+    let expected_fingerprint = compute_env_fingerprint(&merged_env);
     let container_fingerprint = get_env("TRIPLE_C_CUSTOM_ENV").unwrap_or_default();
     if container_fingerprint != expected_fingerprint {
         log::info!("Custom env vars mismatch (container={:?}, expected={:?})", container_fingerprint, expected_fingerprint);

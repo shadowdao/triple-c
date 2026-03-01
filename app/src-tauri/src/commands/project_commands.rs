@@ -170,6 +170,7 @@ pub async fn start_project_container(
                     &existing_id,
                     &project,
                     settings.global_claude_instructions.as_deref(),
+                    &settings.global_custom_env_vars,
                 )
                 .await
                 .unwrap_or(false);
@@ -185,6 +186,7 @@ pub async fn start_project_container(
                     aws_config_path.as_deref(),
                     &settings.global_aws,
                     settings.global_claude_instructions.as_deref(),
+                    &settings.global_custom_env_vars,
                 ).await?;
                 docker::start_container(&new_id).await?;
                 new_id
@@ -201,6 +203,7 @@ pub async fn start_project_container(
                 aws_config_path.as_deref(),
                 &settings.global_aws,
                 settings.global_claude_instructions.as_deref(),
+                &settings.global_custom_env_vars,
             ).await?;
             docker::start_container(&new_id).await?;
             new_id

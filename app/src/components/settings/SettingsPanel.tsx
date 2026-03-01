@@ -4,22 +4,24 @@ import DockerSettings from "./DockerSettings";
 import AwsSettings from "./AwsSettings";
 import { useSettings } from "../../hooks/useSettings";
 import { useUpdates } from "../../hooks/useUpdates";
+import ClaudeInstructionsModal from "../projects/ClaudeInstructionsModal";
+import EnvVarsModal from "../projects/EnvVarsModal";
+import type { EnvVar } from "../../lib/types";
 
 export default function SettingsPanel() {
   const { appSettings, saveSettings } = useSettings();
   const { appVersion, checkForUpdates } = useUpdates();
   const [globalInstructions, setGlobalInstructions] = useState(appSettings?.global_claude_instructions ?? "");
+  const [globalEnvVars, setGlobalEnvVars] = useState<EnvVar[]>(appSettings?.global_custom_env_vars ?? []);
   const [checkingUpdates, setCheckingUpdates] = useState(false);
+  const [showInstructionsModal, setShowInstructionsModal] = useState(false);
+  const [showEnvVarsModal, setShowEnvVarsModal] = useState(false);
 
   // Sync local state when appSettings change
   useEffect(() => {
     setGlobalInstructions(appSettings?.global_claude_instructions ?? "");
-  }, [appSettings?.global_claude_instructions]);
-
-  const handleInstructionsBlur = async () => {
-    if (!appSettings) return;
-    await saveSettings({ ...appSettings, global_claude_instructions: globalInstructions || null });
-  };
+    setGlobalEnvVars(appSettings?.global_custom_env_vars ?? []);
+  }, [appSettings?.global_claude_instructions, appSettings?.global_custom_env_vars]);
 
   const handleCheckNow = async () => {
     setCheckingUpdates(true);
@@ -43,19 +45,43 @@ export default function SettingsPanel() {
       <ApiKeyInput />
       <DockerSettings />
       <AwsSettings />
+
+      {/* Global Claude Instructions */}
       <div>
-        <label className="block text-sm font-medium mb-2">Claude Instructions</label>
+        <label className="block text-sm font-medium mb-1">Claude Instructions</label>
         <p className="text-xs text-[var(--text-secondary)] mb-1.5">
           Global instructions applied to all projects (written to ~/.claude/CLAUDE.md in containers)
         </p>
-        <textarea
-          value={globalInstructions}
-          onChange={(e) => setGlobalInstructions(e.target.value)}
-          onBlur={handleInstructionsBlur}
-          placeholder="Instructions for Claude Code in all project containers..."
-          rows={4}
-          className="w-full px-2 py-1.5 text-xs bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:outline-none focus:border-[var(--accent)] resize-y font-mono"
-        />
+        <div className="flex items-center justify-between">
+          <span className="text-xs text-[var(--text-secondary)]">
+            {globalInstructions ? "Configured" : "Not set"}
+          </span>
+          <button
+            onClick={() => setShowInstructionsModal(true)}
+            className="text-xs px-2 py-0.5 text-[var(--accent)] hover:text-[var(--accent-hover)] hover:bg-[var(--bg-primary)] rounded transition-colors"
+          >
+            Edit
+          </button>
+        </div>
+      </div>
+
+      {/* Global Environment Variables */}
+      <div>
+        <label className="block text-sm font-medium mb-1">Global Environment Variables</label>
+        <p className="text-xs text-[var(--text-secondary)] mb-1.5">
+          Applied to all project containers. Per-project variables override global ones with the same key.
+        </p>
+        <div className="flex items-center justify-between">
+          <span className="text-xs text-[var(--text-secondary)]">
+            {globalEnvVars.length > 0 ? `${globalEnvVars.length} variable${globalEnvVars.length === 1 ? "" : "s"}` : "None"}
+          </span>
+          <button
+            onClick={() => setShowEnvVarsModal(true)}
+            className="text-xs px-2 py-0.5 text-[var(--accent)] hover:text-[var(--accent-hover)] hover:bg-[var(--bg-primary)] rounded transition-colors"
+          >
+            Edit
+          </button>
+        </div>
       </div>
 
       {/* Updates section */}
@@ -89,6 +115,34 @@ export default function SettingsPanel() {
           </button>
         </div>
       </div>
+
+      {showInstructionsModal && (
+        <ClaudeInstructionsModal
+          instructions={globalInstructions}
+          disabled={false}
+          onSave={async (instructions) => {
+            setGlobalInstructions(instructions);
+            if (appSettings) {
+              await saveSettings({ ...appSettings, global_claude_instructions: instructions || null });
+            }
+          }}
+          onClose={() => setShowInstructionsModal(false)}
+        />
+      )}
+
+      {showEnvVarsModal && (
+        <EnvVarsModal
+          envVars={globalEnvVars}
+          disabled={false}
+          onSave={async (vars) => {
+            setGlobalEnvVars(vars);
+            if (appSettings) {
+              await saveSettings({ ...appSettings, global_custom_env_vars: vars });
+            }
+          }}
+          onClose={() => setShowEnvVarsModal(false)}
+        />
+      )}
     </div>
   );
 }
