@@ -126,12 +126,7 @@ pub async fn start_project_container(
 
     // Get API key only if auth mode requires it
     let api_key = match project.auth_mode {
-        AuthMode::ApiKey => {
-            let key = secure::get_api_key()?
-                .ok_or_else(|| "No API key configured. Please set your Anthropic API key in Settings.".to_string())?;
-            Some(key)
-        }
-        AuthMode::Login => {
+        AuthMode::Anthropic => {
             None
         }
         AuthMode::Bedrock => {

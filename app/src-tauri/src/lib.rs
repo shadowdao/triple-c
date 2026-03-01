@@ -43,7 +43,7 @@ pub fn run() {
             exec_manager: ExecSessionManager::new(),
         })
         .setup(|app| {
-            match tauri::image::Image::from_bytes(include_bytes!("../icons/icon.ico")) {
+            match tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png")) {
                 Ok(icon) => {
                     if let Some(window) = app.get_webview_window("main") {
                         let _ = window.set_icon(icon);

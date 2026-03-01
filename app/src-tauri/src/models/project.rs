@@ -46,20 +46,21 @@ pub enum ProjectStatus {
 }
 
 /// How the project authenticates with Claude.
-/// - `Login`: User runs `claude login` inside the container (OAuth, persisted via config volume)
-/// - `ApiKey`: Uses the API key stored in the OS keychain
+/// - `Anthropic`: User runs `claude login` inside the container (OAuth via Anthropic Console,
+///   persisted in the config volume)
 /// - `Bedrock`: Uses AWS Bedrock with per-project AWS credentials
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthMode {
-    Login,
-    ApiKey,
+    /// Backward compat: old projects stored as "login" or "api_key" map to Anthropic.
+    #[serde(alias = "login", alias = "api_key")]
+    Anthropic,
     Bedrock,
 }
 
 impl Default for AuthMode {
     fn default() -> Self {
-        Self::Login
+        Self::Anthropic
     }
 }
 

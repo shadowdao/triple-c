@@ -47,8 +47,7 @@ Triple-C is a cross-platform desktop application that sandboxes Claude Code insi
 
 Each project can independently use one of:
 
-- **`/login`** (OAuth): User runs `claude login` inside the terminal. Token persisted in the config volume.
-- **API Key**: Stored in the OS keychain, injected as `ANTHROPIC_API_KEY` env var.
+- **Anthropic** (OAuth): User runs `claude login` inside the terminal on first use. Token persisted in the config volume across restarts and resets.
 - **AWS Bedrock**: Per-project AWS credentials (static keys, profile, or bearer token).
 
 ### Container Spawning (Sibling Containers)

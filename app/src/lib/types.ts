@@ -34,7 +34,7 @@ export type ProjectStatus =
   | "stopping"
   | "error";
 
-export type AuthMode = "login" | "api_key" | "bedrock";
+export type AuthMode = "anthropic" | "bedrock";
 
 export type BedrockAuthMethod = "static_credentials" | "profile" | "bearer_token";
 

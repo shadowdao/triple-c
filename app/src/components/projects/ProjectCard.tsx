@@ -267,26 +267,15 @@ export default function ProjectCard({ project }: Props) {
           <div className="flex items-center gap-1 text-xs">
             <span className="text-[var(--text-secondary)] mr-1">Auth:</span>
             <button
-              onClick={(e) => { e.stopPropagation(); handleAuthModeChange("login"); }}
+              onClick={(e) => { e.stopPropagation(); handleAuthModeChange("anthropic"); }}
               disabled={!isStopped}
               className={`px-2 py-0.5 rounded transition-colors ${
-                project.auth_mode === "login"
+                project.auth_mode === "anthropic"
                   ? "bg-[var(--accent)] text-white"
                   : "text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-primary)]"
               } disabled:opacity-50`}
             >
-              /login
-            </button>
-            <button
-              onClick={(e) => { e.stopPropagation(); handleAuthModeChange("api_key"); }}
-              disabled={!isStopped}
-              className={`px-2 py-0.5 rounded transition-colors ${
-                project.auth_mode === "api_key"
-                  ? "bg-[var(--accent)] text-white"
-                  : "text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-primary)]"
-              } disabled:opacity-50`}
-            >
-              API key
+              Anthropic
             </button>
             <button
               onClick={(e) => { e.stopPropagation(); handleAuthModeChange("bedrock"); }}
