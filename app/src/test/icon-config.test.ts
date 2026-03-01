@@ -5,10 +5,15 @@ import { resolve } from "path";
 describe("Window icon configuration", () => {
   const srcTauriDir = resolve(__dirname, "../../src-tauri");
 
-  it("lib.rs sets default_window_icon using the app icon", () => {
+  it("lib.rs sets window icon using set_icon in setup hook", () => {
     const libRs = readFileSync(resolve(srcTauriDir, "src/lib.rs"), "utf-8");
-    expect(libRs).toContain("default_window_icon");
+    expect(libRs).toContain("set_icon");
     expect(libRs).toContain("icon.png");
+  });
+
+  it("Cargo.toml enables image-png feature for icon loading", () => {
+    const cargoToml = readFileSync(resolve(srcTauriDir, "Cargo.toml"), "utf-8");
+    expect(cargoToml).toContain("image-png");
   });
 
   it("icon.png exists in the icons directory", () => {

@@ -18,7 +18,6 @@ pub fn run() {
     env_logger::init();
 
     tauri::Builder::default()
-        .default_window_icon(tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png")).expect("Failed to load window icon"))
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
@@ -26,6 +25,14 @@ pub fn run() {
             projects_store: ProjectsStore::new().expect("Failed to initialize projects store"),
             settings_store: SettingsStore::new().expect("Failed to initialize settings store"),
             exec_manager: ExecSessionManager::new(),
+        })
+        .setup(|app| {
+            let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png"))
+                .expect("Failed to load window icon");
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_icon(icon);
+            }
+            Ok(())
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
