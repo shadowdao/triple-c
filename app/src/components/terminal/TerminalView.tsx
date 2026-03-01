@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
@@ -6,6 +6,8 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import "@xterm/xterm/css/xterm.css";
 import { useTerminal } from "../../hooks/useTerminal";
+import { UrlDetector } from "../../lib/urlDetector";
+import UrlToast from "./UrlToast";
 
 interface Props {
   sessionId: string;
@@ -14,10 +16,14 @@ interface Props {
 
 export default function TerminalView({ sessionId, active }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const terminalContainerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const webglRef = useRef<WebglAddon | null>(null);
+  const detectorRef = useRef<UrlDetector | null>(null);
   const { sendInput, resize, onOutput, onExit } = useTerminal();
+
+  const [detectedUrl, setDetectedUrl] = useState<string | null>(null);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -82,9 +88,13 @@ export default function TerminalView({ sessionId, active }: Props) {
     // Handle backend output -> terminal
     let aborted = false;
 
+    const detector = new UrlDetector((url) => setDetectedUrl(url));
+    detectorRef.current = detector;
+
     const outputPromise = onOutput(sessionId, (data) => {
       if (aborted) return;
       term.write(data);
+      detector.feed(data);
     }).then((unlisten) => {
       if (aborted) unlisten();
       return unlisten;
@@ -116,6 +126,8 @@ export default function TerminalView({ sessionId, active }: Props) {
 
     return () => {
       aborted = true;
+      detector.dispose();
+      detectorRef.current = null;
       inputDisposable.dispose();
       outputPromise.then((fn) => fn?.());
       exitPromise.then((fn) => fn?.());
@@ -160,11 +172,39 @@ export default function TerminalView({ sessionId, active }: Props) {
     }
   }, [active]);
 
+  // Auto-dismiss toast after 30 seconds
+  useEffect(() => {
+    if (!detectedUrl) return;
+    const timer = setTimeout(() => setDetectedUrl(null), 30_000);
+    return () => clearTimeout(timer);
+  }, [detectedUrl]);
+
+  const handleOpenUrl = useCallback(() => {
+    if (detectedUrl) {
+      openUrl(detectedUrl).catch((e) =>
+        console.error("Failed to open URL:", e),
+      );
+      setDetectedUrl(null);
+    }
+  }, [detectedUrl]);
+
   return (
     <div
-      ref={containerRef}
-      className={`w-full h-full ${active ? "" : "hidden"}`}
-      style={{ padding: "8px" }}
-    />
+      ref={terminalContainerRef}
+      className={`w-full h-full relative ${active ? "" : "hidden"}`}
+    >
+      {detectedUrl && (
+        <UrlToast
+          url={detectedUrl}
+          onOpen={handleOpenUrl}
+          onDismiss={() => setDetectedUrl(null)}
+        />
+      )}
+      <div
+        ref={containerRef}
+        className="w-full h-full"
+        style={{ padding: "8px" }}
+      />
+    </div>
   );
 }
