@@ -5,38 +5,12 @@ import * as commands from "../lib/tauri-commands";
 import type { AppSettings } from "../lib/types";
 
 export function useSettings() {
-  const { hasKey, setHasKey, appSettings, setAppSettings } = useAppState(
+  const { appSettings, setAppSettings } = useAppState(
     useShallow(s => ({
-      hasKey: s.hasKey,
-      setHasKey: s.setHasKey,
       appSettings: s.appSettings,
       setAppSettings: s.setAppSettings,
     }))
   );
-
-  const checkApiKey = useCallback(async () => {
-    try {
-      const has = await commands.hasApiKey();
-      setHasKey(has);
-      return has;
-    } catch {
-      setHasKey(false);
-      return false;
-    }
-  }, [setHasKey]);
-
-  const saveApiKey = useCallback(
-    async (key: string) => {
-      await commands.setApiKey(key);
-      setHasKey(true);
-    },
-    [setHasKey],
-  );
-
-  const removeApiKey = useCallback(async () => {
-    await commands.deleteApiKey();
-    setHasKey(false);
-  }, [setHasKey]);
 
   const loadSettings = useCallback(async () => {
     try {
@@ -59,10 +33,6 @@ export function useSettings() {
   );
 
   return {
-    hasKey,
-    checkApiKey,
-    saveApiKey,
-    removeApiKey,
     appSettings,
     loadSettings,
     saveSettings,

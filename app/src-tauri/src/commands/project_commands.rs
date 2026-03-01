@@ -124,21 +124,15 @@ pub async fn start_project_container(
     let settings = state.settings_store.get();
     let image_name = container_config::resolve_image_name(&settings.image_source, &settings.custom_image_name);
 
-    // Get API key only if auth mode requires it
-    let api_key: Option<String> = match project.auth_mode {
-        AuthMode::Anthropic => {
-            None
+    // Validate auth mode requirements
+    if project.auth_mode == AuthMode::Bedrock {
+        let bedrock = project.bedrock_config.as_ref()
+            .ok_or_else(|| "Bedrock auth mode selected but no Bedrock configuration found.".to_string())?;
+        // Region can come from per-project or global
+        if bedrock.aws_region.is_empty() && settings.global_aws.aws_region.is_none() {
+            return Err("AWS region is required for Bedrock auth mode. Set it per-project or in global AWS settings.".to_string());
         }
-        AuthMode::Bedrock => {
-            let bedrock = project.bedrock_config.as_ref()
-                .ok_or_else(|| "Bedrock auth mode selected but no Bedrock configuration found.".to_string())?;
-            // Region can come from per-project or global
-            if bedrock.aws_region.is_empty() && settings.global_aws.aws_region.is_none() {
-                return Err("AWS region is required for Bedrock auth mode. Set it per-project or in global AWS settings.".to_string());
-            }
-            None
-        }
-    };
+    }
 
     // Update status to starting
     state.projects_store.update_status(&project_id, ProjectStatus::Starting)?;
@@ -164,7 +158,6 @@ pub async fn start_project_container(
             let needs_recreation = docker::container_needs_recreation(
                     &existing_id,
                     &project,
-                    api_key.as_deref(),
                     settings.global_claude_instructions.as_deref(),
                     &settings.global_custom_env_vars,
                 )
@@ -176,7 +169,6 @@ pub async fn start_project_container(
                 docker::remove_container(&existing_id).await?;
                 let new_id = docker::create_container(
                     &project,
-                    api_key.as_deref(),
                     &docker_socket,
                     &image_name,
                     aws_config_path.as_deref(),
@@ -193,7 +185,6 @@ pub async fn start_project_container(
         } else {
             let new_id = docker::create_container(
                 &project,
-                api_key.as_deref(),
                 &docker_socket,
                 &image_name,
                 aws_config_path.as_deref(),

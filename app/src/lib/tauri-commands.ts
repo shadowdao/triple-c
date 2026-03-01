@@ -26,10 +26,6 @@ export const rebuildProjectContainer = (projectId: string) =>
   invoke<Project>("rebuild_project_container", { projectId });
 
 // Settings
-export const setApiKey = (key: string) =>
-  invoke<void>("set_api_key", { key });
-export const hasApiKey = () => invoke<boolean>("has_api_key");
-export const deleteApiKey = () => invoke<void>("delete_api_key");
 export const getSettings = () => invoke<AppSettings>("get_settings");
 export const updateSettings = (settings: AppSettings) =>
   invoke<AppSettings>("update_settings", { settings });

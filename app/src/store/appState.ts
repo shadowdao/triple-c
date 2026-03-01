@@ -24,9 +24,6 @@ interface AppState {
   setDockerAvailable: (available: boolean | null) => void;
   imageExists: boolean | null;
   setImageExists: (exists: boolean | null) => void;
-  hasKey: boolean | null;
-  setHasKey: (has: boolean | null) => void;
-
   // App settings
   appSettings: AppSettings | null;
   setAppSettings: (settings: AppSettings) => void;
@@ -85,9 +82,6 @@ export const useAppState = create<AppState>((set) => ({
   setDockerAvailable: (available) => set({ dockerAvailable: available }),
   imageExists: null,
   setImageExists: (exists) => set({ imageExists: exists }),
-  hasKey: null,
-  setHasKey: (has) => set({ hasKey: has }),
-
   // App settings
   appSettings: null,
   setAppSettings: (settings) => set({ appSettings: settings }),

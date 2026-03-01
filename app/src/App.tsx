@@ -12,7 +12,7 @@ import { useAppState } from "./store/appState";
 
 export default function App() {
   const { checkDocker, checkImage } = useDocker();
-  const { checkApiKey, loadSettings } = useSettings();
+  const { loadSettings } = useSettings();
   const { refresh } = useProjects();
   const { loadVersion, checkForUpdates, startPeriodicCheck } = useUpdates();
   const { sessions, activeSessionId } = useAppState(
@@ -25,7 +25,6 @@ export default function App() {
     checkDocker().then((available) => {
       if (available) checkImage();
     });
-    checkApiKey();
     refresh();
 
     // Update detection

@@ -79,9 +79,6 @@ pub fn run() {
             commands::project_commands::stop_project_container,
             commands::project_commands::rebuild_project_container,
             // Settings
-            commands::settings_commands::set_api_key,
-            commands::settings_commands::has_api_key,
-            commands::settings_commands::delete_api_key,
             commands::settings_commands::get_settings,
             commands::settings_commands::update_settings,
             commands::settings_commands::pull_image,

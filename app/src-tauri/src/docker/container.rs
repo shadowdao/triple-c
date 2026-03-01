@@ -10,19 +10,6 @@ use std::hash::{Hash, Hasher};
 use super::client::get_docker;
 use crate::models::{AuthMode, BedrockAuthMethod, ContainerInfo, EnvVar, GlobalAwsSettings, Project, ProjectPath};
 
-/// Compute a fingerprint for the API key so we can detect when it changes
-/// without storing the actual key in Docker labels.
-fn compute_api_key_fingerprint(api_key: Option<&str>) -> String {
-    match api_key {
-        Some(key) => {
-            let mut hasher = DefaultHasher::new();
-            key.hash(&mut hasher);
-            format!("{:x}", hasher.finish())
-        }
-        None => String::new(),
-    }
-}
-
 /// Compute a fingerprint string for the custom environment variables.
 /// Sorted alphabetically so order changes do not cause spurious recreation.
 fn compute_env_fingerprint(custom_env_vars: &[EnvVar]) -> String {
@@ -140,7 +127,6 @@ pub async fn find_existing_container(project: &Project) -> Result<Option<String>
 
 pub async fn create_container(
     project: &Project,
-    api_key: Option<&str>,
     docker_socket_path: &str,
     image_name: &str,
     aws_config_path: Option<&str>,
@@ -187,10 +173,6 @@ pub async fn create_container(
     #[cfg(windows)]
     {
         log::debug!("Skipping HOST_UID/HOST_GID on Windows — Docker Desktop's Linux VM handles user mapping");
-    }
-
-    if let Some(key) = api_key {
-        env_vars.push(format!("ANTHROPIC_API_KEY={}", key));
     }
 
     if let Some(ref token) = project.git_token {
@@ -369,7 +351,6 @@ pub async fn create_container(
     labels.insert("triple-c.project-id".to_string(), project.id.clone());
     labels.insert("triple-c.project-name".to_string(), project.name.clone());
     labels.insert("triple-c.auth-mode".to_string(), format!("{:?}", project.auth_mode));
-    labels.insert("triple-c.api-key-fingerprint".to_string(), compute_api_key_fingerprint(api_key));
     labels.insert("triple-c.paths-fingerprint".to_string(), compute_paths_fingerprint(&project.paths));
     labels.insert("triple-c.bedrock-fingerprint".to_string(), compute_bedrock_fingerprint(project));
     labels.insert("triple-c.image".to_string(), image_name.to_string());
@@ -453,7 +434,6 @@ pub async fn remove_container(container_id: &str) -> Result<(), String> {
 pub async fn container_needs_recreation(
     container_id: &str,
     project: &Project,
-    api_key: Option<&str>,
     global_claude_instructions: Option<&str>,
     global_custom_env_vars: &[EnvVar],
 ) -> Result<bool, String> {
@@ -490,14 +470,6 @@ pub async fn container_needs_recreation(
             log::info!("Auth mode mismatch (container={:?}, project={:?})", container_auth_mode, current_auth_mode);
             return Ok(true);
         }
-    }
-
-    // ── API key fingerprint ─────────────────────────────────────────────
-    let expected_api_key_fp = compute_api_key_fingerprint(api_key);
-    let container_api_key_fp = get_label("triple-c.api-key-fingerprint").unwrap_or_default();
-    if container_api_key_fp != expected_api_key_fp {
-        log::info!("API key fingerprint mismatch, triggering recreation");
-        return Ok(true);
     }
 
     // ── Project paths fingerprint ──────────────────────────────────────────
