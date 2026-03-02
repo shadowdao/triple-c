@@ -1,5 +1,6 @@
 FROM ubuntu:24.04
 
+# Multi-arch: builds for linux/amd64 and linux/arm64 (Apple Silicon)
 # Avoid interactive prompts during package install
 ENV DEBIAN_FRONTEND=noninteractive
 
