@@ -87,7 +87,9 @@ jobs:
 
       - name: Install frontend dependencies
         working-directory: ./app
-        run: npm ci
+        run: |
+          rm -rf node_modules
+          npm install
 
       - name: Install Tauri CLI
         working-directory: ./app
@@ -187,7 +189,9 @@ jobs:
 
       - name: Install frontend dependencies
         working-directory: ./app
-        run: npm ci
+        run: |
+          rm -rf node_modules
+          npm install
 
       - name: Install Tauri CLI
         working-directory: ./app
