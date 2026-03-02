@@ -81,8 +81,7 @@ jobs:
           else
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
           fi
-          . "$HOME/.cargo/env"
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          export PATH="$HOME/.cargo/bin:$PATH"
           rustc --version
           cargo --version
 
@@ -92,11 +91,15 @@ jobs:
 
       - name: Install Tauri CLI
         working-directory: ./app
-        run: npx tauri --version || npm install @tauri-apps/cli
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          npx tauri --version || npm install @tauri-apps/cli
 
       - name: Build Tauri app
         working-directory: ./app
-        run: npx tauri build
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          npx tauri build
 
       - name: Collect artifacts
         run: |
@@ -137,7 +140,7 @@ jobs:
     steps:
       - name: Install Node.js
         run: |
-          if command -v node &>/dev/null; then
+          if command -v node >/dev/null 2>&1; then
             echo "Node.js already installed: $(node --version)"
           else
             echo "Installing Node.js 22 via Homebrew..."
@@ -177,8 +180,7 @@ jobs:
           else
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
           fi
-          . "$HOME/.cargo/env"
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          export PATH="$HOME/.cargo/bin:$PATH"
           rustup target add aarch64-apple-darwin x86_64-apple-darwin
           rustc --version
           cargo --version
@@ -189,11 +191,15 @@ jobs:
 
       - name: Install Tauri CLI
         working-directory: ./app
-        run: npx tauri --version || npm install @tauri-apps/cli
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          npx tauri --version || npm install @tauri-apps/cli
 
       - name: Build Tauri app (universal)
         working-directory: ./app
-        run: npx tauri build --target universal-apple-darwin
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          npx tauri build --target universal-apple-darwin
 
       - name: Collect artifacts
         run: |
