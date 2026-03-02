@@ -61,17 +61,29 @@ jobs:
             xdg-utils
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: "./app/src-tauri -> target"
+        run: |
+          if command -v rustup &>/dev/null; then
+            echo "Rust already installed: $(rustc --version)"
+            rustup update stable
+            rustup default stable
+          else
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+            . "$HOME/.cargo/env"
+          fi
+          rustc --version
+          cargo --version
 
       - name: Install Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
+        run: |
+          if command -v node &>/dev/null; then
+            echo "Node.js already installed: $(node --version)"
+          else
+            echo "Installing Node.js 22..."
+            curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+            sudo apt-get install -y nodejs
+          fi
+          node --version
+          npm --version
 
       - name: Install frontend dependencies
         working-directory: ./app
