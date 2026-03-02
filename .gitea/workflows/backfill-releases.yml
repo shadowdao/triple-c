@@ -61,9 +61,10 @@ jobs:
               ASSET_ID=$(echo "$asset" | jq -r '.id')
 
               echo "  ==> Downloading $ASSET_NAME..."
+              DOWNLOAD_URL=$(echo "$asset" | jq -r '.browser_download_url')
               curl -sfL -o "/tmp/$ASSET_NAME" \
                 -H "Authorization: token $GITEA_TOKEN" \
-                "$GITEA_API/repos/$GITEA_REPO/releases/assets/$ASSET_ID"
+                "$DOWNLOAD_URL"
 
               echo "  ==> Uploading $ASSET_NAME to GitHub..."
               ENCODED_NAME=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1]))" "$ASSET_NAME")
