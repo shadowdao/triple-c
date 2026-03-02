@@ -81,6 +81,7 @@ jobs:
           else
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
           fi
+          . "$HOME/.cargo/env"
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           rustc --version
           cargo --version
@@ -176,6 +177,7 @@ jobs:
           else
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
           fi
+          . "$HOME/.cargo/env"
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           rustup target add aarch64-apple-darwin x86_64-apple-darwin
           rustc --version
