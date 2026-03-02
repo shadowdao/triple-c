@@ -25,9 +25,11 @@ jobs:
           NEED_INSTALL=false
           if command -v node >/dev/null 2>&1; then
             NODE_MAJOR=$(node --version | sed 's/v\([0-9]*\).*/\1/')
-            echo "Found Node.js $(node --version) (major: ${NODE_MAJOR})"
+            echo "Found Node.js $(node --version) at $(which node) (major: ${NODE_MAJOR})"
             if [ "$NODE_MAJOR" -lt 22 ]; then
-              echo "Node.js ${NODE_MAJOR} is too old, upgrading to 22..."
+              echo "Node.js ${NODE_MAJOR} is too old, removing before installing 22..."
+              sudo rm -f /usr/local/bin/node /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack
+              hash -r
               NEED_INSTALL=true
             fi
           else
@@ -37,7 +39,9 @@ jobs:
           if [ "$NEED_INSTALL" = true ]; then
             curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
             sudo apt-get install -y nodejs
+            hash -r
           fi
+          echo "Node.js at: $(which node)"
           node --version
           npm --version
 
@@ -97,7 +101,7 @@ jobs:
       - name: Install frontend dependencies
         working-directory: ./app
         run: |
-          rm -rf node_modules
+          rm -rf node_modules package-lock.json
           npm install
 
       - name: Install Tauri CLI
