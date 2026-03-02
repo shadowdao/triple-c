@@ -19,6 +19,8 @@ env:
 jobs:
   build-linux:
     runs-on: ubuntu-latest
+    env:
+      PATH: /home/runner/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -62,20 +64,20 @@ jobs:
 
       - name: Install Rust stable
         run: |
-          if command -v rustup &>/dev/null; then
+          if command -v rustup >/dev/null 2>&1; then
             echo "Rust already installed: $(rustc --version)"
             rustup update stable
             rustup default stable
           else
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-            . "$HOME/.cargo/env"
           fi
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           rustc --version
           cargo --version
 
       - name: Install Node.js
         run: |
-          if command -v node &>/dev/null; then
+          if command -v node >/dev/null 2>&1; then
             echo "Node.js already installed: $(node --version)"
           else
             echo "Installing Node.js 22..."
@@ -169,13 +171,14 @@ jobs:
 
       - name: Install Rust stable
         run: |
-          if command -v rustup &>/dev/null; then
+          if command -v rustup >/dev/null 2>&1; then
+            echo "Rust already installed: $(rustc --version)"
             rustup update stable
             rustup default stable
           else
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-            . "$HOME/.cargo/env"
           fi
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           rustup target add aarch64-apple-darwin x86_64-apple-darwin
           rustc --version
           cargo --version
@@ -190,8 +193,6 @@ jobs:
 
       - name: Build Tauri app (universal)
         working-directory: ./app
-        env:
-          PATH: ${{ format('{0}/.cargo/bin:{1}', env.HOME, env.PATH) }}
         run: npx tauri build --target universal-apple-darwin
 
       - name: Collect artifacts
