@@ -25,10 +25,11 @@ jobs:
           NEED_INSTALL=false
           if command -v node >/dev/null 2>&1; then
             NODE_MAJOR=$(node --version | sed 's/v\([0-9]*\).*/\1/')
+            OLD_NODE_DIR=$(dirname "$(which node)")
             echo "Found Node.js $(node --version) at $(which node) (major: ${NODE_MAJOR})"
             if [ "$NODE_MAJOR" -lt 22 ]; then
               echo "Node.js ${NODE_MAJOR} is too old, removing before installing 22..."
-              sudo rm -f /usr/local/bin/node /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack
+              sudo rm -f "${OLD_NODE_DIR}/node" "${OLD_NODE_DIR}/npm" "${OLD_NODE_DIR}/npx" "${OLD_NODE_DIR}/corepack"
               hash -r
               NEED_INSTALL=true
             fi
