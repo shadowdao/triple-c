@@ -19,9 +19,19 @@ env:
 jobs:
   build-linux:
     runs-on: ubuntu-latest
-    env:
-      PATH: /home/runner/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     steps:
+      - name: Install Node.js
+        run: |
+          if command -v node >/dev/null 2>&1; then
+            echo "Node.js already installed: $(node --version)"
+          else
+            echo "Installing Node.js 22..."
+            curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+            sudo apt-get install -y nodejs
+          fi
+          node --version
+          npm --version
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -74,18 +84,6 @@ jobs:
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           rustc --version
           cargo --version
-
-      - name: Install Node.js
-        run: |
-          if command -v node >/dev/null 2>&1; then
-            echo "Node.js already installed: $(node --version)"
-          else
-            echo "Installing Node.js 22..."
-            curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
-            sudo apt-get install -y nodejs
-          fi
-          node --version
-          npm --version
 
       - name: Install frontend dependencies
         working-directory: ./app
