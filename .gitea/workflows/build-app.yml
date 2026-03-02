@@ -122,6 +122,18 @@ jobs:
   build-macos:
     runs-on: macos-latest
     steps:
+      - name: Install Node.js
+        run: |
+          if command -v node &>/dev/null; then
+            echo "Node.js already installed: $(node --version)"
+          else
+            echo "Installing Node.js 22 via Homebrew..."
+            brew install node@22
+            brew link --overwrite node@22
+          fi
+          node --version
+          npm --version
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -144,19 +156,17 @@ jobs:
           echo "Patched version to ${VERSION}"
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
-
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: "./app/src-tauri -> target"
-
-      - name: Install Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
+        run: |
+          if command -v rustup &>/dev/null; then
+            rustup update stable
+            rustup default stable
+          else
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+            . "$HOME/.cargo/env"
+          fi
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          rustc --version
+          cargo --version
 
       - name: Install frontend dependencies
         working-directory: ./app
@@ -168,6 +178,8 @@ jobs:
 
       - name: Build Tauri app (universal)
         working-directory: ./app
+        env:
+          PATH: ${{ format('{0}/.cargo/bin:{1}', env.HOME, env.PATH) }}
         run: npx tauri build --target universal-apple-darwin
 
       - name: Collect artifacts

@@ -1,6 +1,6 @@
 # Building Triple-C
 
-Triple-C is a Tauri v2 desktop application with a React/TypeScript frontend and a Rust backend. This guide covers building the app from source on Linux and Windows.
+Triple-C is a Tauri v2 desktop application with a React/TypeScript frontend and a Rust backend. This guide covers building the app from source on Linux, macOS, and Windows.
 
 ## Prerequisites (All Platforms)
 
@@ -78,6 +78,57 @@ Build artifacts are located in `app/src-tauri/target/release/bundle/`:
 | AppImage   | `appimage/*.AppImage`         |
 | Debian pkg | `deb/*.deb`                   |
 | RPM pkg    | `rpm/*.rpm`                   |
+
+## macOS
+
+### 1. Install prerequisites
+
+- **Xcode Command Line Tools** — required for the C/C++ toolchain and system headers:
+
+```bash
+xcode-select --install
+```
+
+No additional system libraries are needed — macOS includes WebKit natively.
+
+### 2. Install Rust targets (universal binary)
+
+To build a universal binary that runs on both Apple Silicon and Intel Macs:
+
+```bash
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+```
+
+### 3. Install frontend dependencies
+
+```bash
+cd app
+npm ci
+```
+
+### 4. Build
+
+For a universal binary (recommended for distribution):
+
+```bash
+npx tauri build --target universal-apple-darwin
+```
+
+For the current architecture only (faster, for local development):
+
+```bash
+npx tauri build
+```
+
+Build artifacts are located in `app/src-tauri/target/universal-apple-darwin/release/bundle/` (or `target/release/bundle/` for single-arch builds):
+
+| Format | Path |
+|--------|------|
+| DMG | `dmg/*.dmg` |
+| macOS App | `macos/*.app` |
+| macOS App (compressed) | `macos/*.app.tar.gz` |
+
+> **Note:** The app is not signed or notarized. On first launch, macOS Gatekeeper may block it. Right-click the app and select "Open" to bypass, or remove the quarantine attribute: `xattr -cr /Applications/Triple-C.app`
 
 ## Windows
 
