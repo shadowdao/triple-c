@@ -1,23 +1,28 @@
 use bollard::Docker;
-use std::sync::OnceLock;
+use std::sync::Mutex;
 
-static DOCKER: OnceLock<Result<Docker, String>> = OnceLock::new();
+static DOCKER: Mutex<Option<Docker>> = Mutex::new(None);
 
-pub fn get_docker() -> Result<&'static Docker, String> {
-    let result = DOCKER.get_or_init(|| {
-        Docker::connect_with_local_defaults()
-            .map_err(|e| format!("Failed to connect to Docker daemon: {}", e))
-    });
-    match result {
-        Ok(docker) => Ok(docker),
-        Err(e) => Err(e.clone()),
+pub fn get_docker() -> Result<Docker, String> {
+    let mut guard = DOCKER.lock().map_err(|e| format!("Lock poisoned: {}", e))?;
+    if let Some(docker) = guard.as_ref() {
+        return Ok(docker.clone());
     }
+    let docker = Docker::connect_with_local_defaults()
+        .map_err(|e| format!("Failed to connect to Docker daemon: {}", e))?;
+    guard.replace(docker.clone());
+    Ok(docker)
 }
 
 pub async fn check_docker_available() -> Result<bool, String> {
     let docker = get_docker()?;
     match docker.ping().await {
         Ok(_) => Ok(true),
-        Err(e) => Err(format!("Docker daemon not responding: {}", e)),
+        Err(_) => {
+            // Connection object exists but daemon not responding — clear cache
+            let mut guard = DOCKER.lock().map_err(|e| format!("Lock poisoned: {}", e))?;
+            *guard = None;
+            Ok(false)
+        }
     }
 }

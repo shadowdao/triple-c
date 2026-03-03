@@ -11,7 +11,7 @@ import { useUpdates } from "./hooks/useUpdates";
 import { useAppState } from "./store/appState";
 
 export default function App() {
-  const { checkDocker, checkImage } = useDocker();
+  const { checkDocker, checkImage, startDockerPolling } = useDocker();
   const { loadSettings } = useSettings();
   const { refresh } = useProjects();
   const { loadVersion, checkForUpdates, startPeriodicCheck } = useUpdates();
@@ -22,8 +22,13 @@ export default function App() {
   // Initialize on mount
   useEffect(() => {
     loadSettings();
+    let stopPolling: (() => void) | undefined;
     checkDocker().then((available) => {
-      if (available) checkImage();
+      if (available) {
+        checkImage();
+      } else {
+        stopPolling = startDockerPolling();
+      }
     });
     refresh();
 
@@ -34,6 +39,7 @@ export default function App() {
     return () => {
       clearTimeout(updateTimer);
       cleanup?.();
+      stopPolling?.();
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
