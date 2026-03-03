@@ -40,6 +40,42 @@ After tasks run, check notifications with `triple-c-scheduler notifications` and
 ### Timezone
 Scheduled times use the container's configured timezone (check with `date`). If no timezone is configured, UTC is used."#;
 
+/// Build the full CLAUDE_INSTRUCTIONS value by merging global + project
+/// instructions, appending port mapping docs, and appending scheduler docs.
+/// Used by both create_container() and container_needs_recreation() to ensure
+/// the same value is produced in both paths.
+fn build_claude_instructions(
+    global_instructions: Option<&str>,
+    project_instructions: Option<&str>,
+    port_mappings: &[PortMapping],
+) -> Option<String> {
+    let mut combined = merge_claude_instructions(global_instructions, project_instructions);
+
+    if !port_mappings.is_empty() {
+        let mut port_lines: Vec<String> = Vec::new();
+        port_lines.push("## Available Port Mappings".to_string());
+        port_lines.push("The following ports are mapped from the host to this container. Use these container ports when starting services that need to be accessible from the host:".to_string());
+        for pm in port_mappings {
+            port_lines.push(format!(
+                "- Host port {} -> Container port {} ({})",
+                pm.host_port, pm.container_port, pm.protocol
+            ));
+        }
+        let port_info = port_lines.join("\n");
+        combined = Some(match combined {
+            Some(existing) => format!("{}\n\n{}", existing, port_info),
+            None => port_info,
+        });
+    }
+
+    combined = Some(match combined {
+        Some(existing) => format!("{}\n\n{}", existing, SCHEDULER_INSTRUCTIONS),
+        None => SCHEDULER_INSTRUCTIONS.to_string(),
+    });
+
+    combined
+}
+
 /// Compute a fingerprint string for the custom environment variables.
 /// Sorted alphabetically so order changes do not cause spurious recreation.
 fn compute_env_fingerprint(custom_env_vars: &[EnvVar]) -> String {
@@ -307,33 +343,12 @@ pub async fn create_container(
         }
     }
 
-    // Claude instructions (global + per-project, plus port mapping info)
-    let mut combined_instructions = merge_claude_instructions(
+    // Claude instructions (global + per-project, plus port mapping info + scheduler docs)
+    let combined_instructions = build_claude_instructions(
         global_claude_instructions,
         project.claude_instructions.as_deref(),
+        &project.port_mappings,
     );
-    if !project.port_mappings.is_empty() {
-        let mut port_lines: Vec<String> = Vec::new();
-        port_lines.push("## Available Port Mappings".to_string());
-        port_lines.push("The following ports are mapped from the host to this container. Use these container ports when starting services that need to be accessible from the host:".to_string());
-        for pm in &project.port_mappings {
-            port_lines.push(format!(
-                "- Host port {} -> Container port {} ({})",
-                pm.host_port, pm.container_port, pm.protocol
-            ));
-        }
-        let port_info = port_lines.join("\n");
-        combined_instructions = Some(match combined_instructions {
-            Some(existing) => format!("{}\n\n{}", existing, port_info),
-            None => port_info,
-        });
-    }
-    // Scheduler instructions (always appended so all containers get scheduling docs)
-    let scheduler_docs = SCHEDULER_INSTRUCTIONS;
-    combined_instructions = Some(match combined_instructions {
-        Some(existing) => format!("{}\n\n{}", existing, scheduler_docs),
-        None => scheduler_docs.to_string(),
-    });
 
     if let Some(ref instructions) = combined_instructions {
         env_vars.push(format!("CLAUDE_INSTRUCTIONS={}", instructions));
@@ -685,9 +700,10 @@ pub async fn container_needs_recreation(
     }
 
     // ── Claude instructions ───────────────────────────────────────────────
-    let expected_instructions = merge_claude_instructions(
+    let expected_instructions = build_claude_instructions(
         global_claude_instructions,
         project.claude_instructions.as_deref(),
+        &project.port_mappings,
     );
     let container_instructions = get_env("CLAUDE_INSTRUCTIONS");
     if container_instructions.as_deref() != expected_instructions.as_deref() {
