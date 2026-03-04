@@ -50,31 +50,45 @@ export function useProjects() {
     [removeProjectFromList],
   );
 
+  const setOptimisticStatus = useCallback(
+    (id: string, status: "starting" | "stopping") => {
+      const { projects } = useAppState.getState();
+      const project = projects.find((p) => p.id === id);
+      if (project) {
+        updateProjectInList({ ...project, status });
+      }
+    },
+    [updateProjectInList],
+  );
+
   const start = useCallback(
     async (id: string) => {
+      setOptimisticStatus(id, "starting");
       const updated = await commands.startProjectContainer(id);
       updateProjectInList(updated);
       return updated;
     },
-    [updateProjectInList],
+    [updateProjectInList, setOptimisticStatus],
   );
 
   const stop = useCallback(
     async (id: string) => {
+      setOptimisticStatus(id, "stopping");
       await commands.stopProjectContainer(id);
       const list = await commands.listProjects();
       setProjects(list);
     },
-    [setProjects],
+    [setProjects, setOptimisticStatus],
   );
 
   const rebuild = useCallback(
     async (id: string) => {
+      setOptimisticStatus(id, "starting");
       const updated = await commands.rebuildProjectContainer(id);
       updateProjectInList(updated);
       return updated;
     },
-    [updateProjectInList],
+    [updateProjectInList, setOptimisticStatus],
   );
 
   const update = useCallback(

@@ -25,6 +25,7 @@ export default function TerminalView({ sessionId, active }: Props) {
 
   const [detectedUrl, setDetectedUrl] = useState<string | null>(null);
   const [imagePasteMsg, setImagePasteMsg] = useState<string | null>(null);
+  const [isAtBottom, setIsAtBottom] = useState(true);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -84,6 +85,12 @@ export default function TerminalView({ sessionId, active }: Props) {
     // Handle user input -> backend
     const inputDisposable = term.onData((data) => {
       sendInput(sessionId, data);
+    });
+
+    // Track scroll position to show "Jump to Current" button
+    const scrollDisposable = term.onScroll(() => {
+      const buf = term.buffer.active;
+      setIsAtBottom(buf.viewportY >= buf.baseY);
     });
 
     // Handle image paste: intercept paste events with image data,
@@ -164,6 +171,7 @@ export default function TerminalView({ sessionId, active }: Props) {
       detector.dispose();
       detectorRef.current = null;
       inputDisposable.dispose();
+      scrollDisposable.dispose();
       containerRef.current?.removeEventListener("paste", handlePaste, { capture: true });
       outputPromise.then((fn) => fn?.());
       exitPromise.then((fn) => fn?.());
@@ -231,6 +239,11 @@ export default function TerminalView({ sessionId, active }: Props) {
     }
   }, [detectedUrl]);
 
+  const handleScrollToBottom = useCallback(() => {
+    termRef.current?.scrollToBottom();
+    setIsAtBottom(true);
+  }, []);
+
   return (
     <div
       ref={terminalContainerRef}
@@ -250,6 +263,14 @@ export default function TerminalView({ sessionId, active }: Props) {
         >
           {imagePasteMsg}
         </div>
+      )}
+      {!isAtBottom && (
+        <button
+          onClick={handleScrollToBottom}
+          className="absolute bottom-4 right-4 z-50 px-3 py-1.5 rounded-md text-xs font-medium bg-[#1f2937] text-[#58a6ff] border border-[#30363d] shadow-lg hover:bg-[#2d3748] transition-colors cursor-pointer"
+        >
+          Jump to Current ↓
+        </button>
       )}
       <div
         ref={containerRef}

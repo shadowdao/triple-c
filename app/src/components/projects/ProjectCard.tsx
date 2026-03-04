@@ -8,6 +8,7 @@ import { useAppState } from "../../store/appState";
 import EnvVarsModal from "./EnvVarsModal";
 import PortMappingsModal from "./PortMappingsModal";
 import ClaudeInstructionsModal from "./ClaudeInstructionsModal";
+import ContainerProgressModal from "./ContainerProgressModal";
 
 interface Props {
   project: Project;
@@ -25,6 +26,8 @@ export default function ProjectCard({ project }: Props) {
   const [showPortMappingsModal, setShowPortMappingsModal] = useState(false);
   const [showClaudeInstructionsModal, setShowClaudeInstructionsModal] = useState(false);
   const [progressMsg, setProgressMsg] = useState<string | null>(null);
+  const [activeOperation, setActiveOperation] = useState<"starting" | "stopping" | "resetting" | null>(null);
+  const [operationCompleted, setOperationCompleted] = useState(false);
   const isSelected = selectedProjectId === project.id;
   const isStopped = project.status === "stopped" || project.status === "error";
 
@@ -79,16 +82,25 @@ export default function ProjectCard({ project }: Props) {
     return () => { unlisten.then((f) => f()); };
   }, [project.id]);
 
-  // Clear progress when status settles
+  // Mark operation completed when status settles
   useEffect(() => {
     if (project.status === "running" || project.status === "stopped" || project.status === "error") {
-      setProgressMsg(null);
+      if (activeOperation) {
+        setOperationCompleted(true);
+      }
+      // Clear progress if no modal is managing it
+      if (!activeOperation) {
+        setProgressMsg(null);
+      }
     }
-  }, [project.status]);
+  }, [project.status, activeOperation]);
 
   const handleStart = async () => {
     setLoading(true);
     setError(null);
+    setProgressMsg(null);
+    setOperationCompleted(false);
+    setActiveOperation("starting");
     try {
       await start(project.id);
     } catch (e) {
@@ -101,6 +113,9 @@ export default function ProjectCard({ project }: Props) {
   const handleStop = async () => {
     setLoading(true);
     setError(null);
+    setProgressMsg(null);
+    setOperationCompleted(false);
+    setActiveOperation("stopping");
     try {
       await stop(project.id);
     } catch (e) {
@@ -116,6 +131,21 @@ export default function ProjectCard({ project }: Props) {
     } catch (e) {
       setError(String(e));
     }
+  };
+
+  const handleForceStop = async () => {
+    try {
+      await stop(project.id);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const closeModal = () => {
+    setActiveOperation(null);
+    setOperationCompleted(false);
+    setProgressMsg(null);
+    setError(null);
   };
 
   const defaultBedrockConfig: BedrockConfig = {
@@ -324,6 +354,10 @@ export default function ProjectCard({ project }: Props) {
                 <ActionButton
                   onClick={async () => {
                     setLoading(true);
+                    setError(null);
+                    setProgressMsg(null);
+                    setOperationCompleted(false);
+                    setActiveOperation("resetting");
                     try { await rebuild(project.id); } catch (e) { setError(String(e)); }
                     setLoading(false);
                   }}
@@ -745,6 +779,18 @@ export default function ProjectCard({ project }: Props) {
             await update({ ...project, claude_instructions: instructions || null });
           }}
           onClose={() => setShowClaudeInstructionsModal(false)}
+        />
+      )}
+
+      {activeOperation && (
+        <ContainerProgressModal
+          projectName={project.name}
+          operation={activeOperation}
+          progressMsg={progressMsg}
+          error={error}
+          completed={operationCompleted}
+          onForceStop={handleForceStop}
+          onClose={closeModal}
         />
       )}
     </div>
