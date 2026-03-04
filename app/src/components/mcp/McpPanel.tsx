@@ -26,7 +26,10 @@ export default function McpPanel() {
   return (
     <div className="space-y-3 p-2">
       <div>
-        <h2 className="text-sm font-semibold text-[var(--text-primary)]">MCP Servers</h2>
+        <h2 className="text-sm font-semibold text-[var(--text-primary)]">
+          MCP Servers{" "}
+          <span className="text-xs px-1.5 py-0.5 rounded bg-yellow-500/20 text-yellow-400">Beta</span>
+        </h2>
         <p className="text-xs text-[var(--text-secondary)] mt-0.5">
           Define MCP servers globally, then enable them per-project.
         </p>

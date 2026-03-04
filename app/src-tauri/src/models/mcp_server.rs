@@ -5,8 +5,8 @@ use std::collections::HashMap;
 #[serde(rename_all = "snake_case")]
 pub enum McpTransportType {
     Stdio,
+    #[serde(alias = "sse")]
     Http,
-    Sse,
 }
 
 impl Default for McpTransportType {
@@ -29,6 +29,10 @@ pub struct McpServer {
     pub url: Option<String>,
     #[serde(default)]
     pub headers: HashMap<String, String>,
+    #[serde(default)]
+    pub docker_image: Option<String>,
+    #[serde(default)]
+    pub container_port: Option<u16>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -45,8 +49,22 @@ impl McpServer {
             env: HashMap::new(),
             url: None,
             headers: HashMap::new(),
+            docker_image: None,
+            container_port: None,
             created_at: now.clone(),
             updated_at: now,
         }
+    }
+
+    pub fn is_docker(&self) -> bool {
+        self.docker_image.is_some()
+    }
+
+    pub fn mcp_container_name(&self) -> String {
+        format!("triple-c-mcp-{}", self.id)
+    }
+
+    pub fn effective_container_port(&self) -> u16 {
+        self.container_port.unwrap_or(3000)
     }
 }

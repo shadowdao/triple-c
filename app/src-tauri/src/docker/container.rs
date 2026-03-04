@@ -178,6 +178,12 @@ fn compute_ports_fingerprint(port_mappings: &[PortMapping]) -> String {
 
 /// Build the JSON value for MCP servers config to be injected into ~/.claude.json.
 /// Produces `{"mcpServers": {"name": {"type": "stdio", ...}, ...}}`.
+///
+/// Handles 4 modes:
+/// - Stdio+Docker: `docker exec -i <mcp-container-name> <command> ...args`
+/// - Stdio+Manual: `<command> ...args` (existing behavior)
+/// - HTTP+Docker: `streamableHttp` URL pointing to `http://<mcp-container-name>:<port>/mcp`
+/// - HTTP+Manual: `streamableHttp` with user-provided URL + headers
 fn build_mcp_servers_json(servers: &[McpServer]) -> String {
     let mut mcp_map = serde_json::Map::new();
     for server in servers {
@@ -185,32 +191,50 @@ fn build_mcp_servers_json(servers: &[McpServer]) -> String {
         match server.transport_type {
             McpTransportType::Stdio => {
                 entry.insert("type".to_string(), serde_json::json!("stdio"));
-                if let Some(ref cmd) = server.command {
-                    entry.insert("command".to_string(), serde_json::json!(cmd));
-                }
-                if !server.args.is_empty() {
-                    entry.insert("args".to_string(), serde_json::json!(server.args));
+                if server.is_docker() {
+                    // Stdio+Docker: use `docker exec` to communicate with MCP container
+                    entry.insert("command".to_string(), serde_json::json!("docker"));
+                    let mut args = vec![
+                        "exec".to_string(),
+                        "-i".to_string(),
+                        server.mcp_container_name(),
+                    ];
+                    if let Some(ref cmd) = server.command {
+                        args.push(cmd.clone());
+                    }
+                    args.extend(server.args.iter().cloned());
+                    entry.insert("args".to_string(), serde_json::json!(args));
+                } else {
+                    // Stdio+Manual: existing behavior
+                    if let Some(ref cmd) = server.command {
+                        entry.insert("command".to_string(), serde_json::json!(cmd));
+                    }
+                    if !server.args.is_empty() {
+                        entry.insert("args".to_string(), serde_json::json!(server.args));
+                    }
                 }
                 if !server.env.is_empty() {
                     entry.insert("env".to_string(), serde_json::json!(server.env));
                 }
             }
             McpTransportType::Http => {
-                entry.insert("type".to_string(), serde_json::json!("http"));
-                if let Some(ref url) = server.url {
+                entry.insert("type".to_string(), serde_json::json!("streamableHttp"));
+                if server.is_docker() {
+                    // HTTP+Docker: point to MCP container by name on the shared network
+                    let url = format!(
+                        "http://{}:{}/mcp",
+                        server.mcp_container_name(),
+                        server.effective_container_port()
+                    );
                     entry.insert("url".to_string(), serde_json::json!(url));
-                }
-                if !server.headers.is_empty() {
-                    entry.insert("headers".to_string(), serde_json::json!(server.headers));
-                }
-            }
-            McpTransportType::Sse => {
-                entry.insert("type".to_string(), serde_json::json!("sse"));
-                if let Some(ref url) = server.url {
-                    entry.insert("url".to_string(), serde_json::json!(url));
-                }
-                if !server.headers.is_empty() {
-                    entry.insert("headers".to_string(), serde_json::json!(server.headers));
+                } else {
+                    // HTTP+Manual: user-provided URL + headers
+                    if let Some(ref url) = server.url {
+                        entry.insert("url".to_string(), serde_json::json!(url));
+                    }
+                    if !server.headers.is_empty() {
+                        entry.insert("headers".to_string(), serde_json::json!(server.headers));
+                    }
                 }
             }
         }
@@ -271,6 +295,7 @@ pub async fn create_container(
     global_custom_env_vars: &[EnvVar],
     timezone: Option<&str>,
     mcp_servers: &[McpServer],
+    network_name: Option<&str>,
 ) -> Result<String, String> {
     let docker = get_docker()?;
     let container_name = project.container_name();
@@ -492,8 +517,12 @@ pub async fn create_container(
         }
     }
 
-    // Docker socket (only if allowed)
-    if project.allow_docker_access {
+    // Docker socket (if allowed, or auto-enabled for stdio+Docker MCP servers)
+    let needs_docker_for_mcp = any_stdio_docker_mcp(mcp_servers);
+    if project.allow_docker_access || needs_docker_for_mcp {
+        if needs_docker_for_mcp && !project.allow_docker_access {
+            log::info!("Auto-enabling Docker socket access for stdio+Docker MCP servers");
+        }
         // On Windows, the named pipe (//./pipe/docker_engine) cannot be
         // bind-mounted into a Linux container. Docker Desktop exposes the
         // daemon socket as /var/run/docker.sock for container mounts.
@@ -542,6 +571,8 @@ pub async fn create_container(
         mounts: Some(mounts),
         port_bindings: if port_bindings.is_empty() { None } else { Some(port_bindings) },
         init: Some(true),
+        // Connect to project network if specified (for MCP container communication)
+        network_mode: network_name.map(|n| n.to_string()),
         ..Default::default()
     };
 
@@ -930,4 +961,179 @@ pub async fn list_sibling_containers() -> Result<Vec<ContainerSummary>, String> 
         .collect();
 
     Ok(siblings)
+}
+
+// ── MCP Container Lifecycle ─────────────────────────────────────────────
+
+/// Returns true if any MCP server uses stdio transport with Docker.
+pub fn any_stdio_docker_mcp(servers: &[McpServer]) -> bool {
+    servers.iter().any(|s| s.is_docker() && s.transport_type == McpTransportType::Stdio)
+}
+
+/// Returns true if any MCP server uses Docker.
+pub fn any_docker_mcp(servers: &[McpServer]) -> bool {
+    servers.iter().any(|s| s.is_docker())
+}
+
+/// Find an existing MCP container by its expected name.
+pub async fn find_mcp_container(server: &McpServer) -> Result<Option<String>, String> {
+    let docker = get_docker()?;
+    let container_name = server.mcp_container_name();
+
+    let filters: HashMap<String, Vec<String>> = HashMap::from([
+        ("name".to_string(), vec![container_name.clone()]),
+    ]);
+
+    let containers: Vec<ContainerSummary> = docker
+        .list_containers(Some(ListContainersOptions {
+            all: true,
+            filters,
+            ..Default::default()
+        }))
+        .await
+        .map_err(|e| format!("Failed to list MCP containers: {}", e))?;
+
+    let expected = format!("/{}", container_name);
+    for c in &containers {
+        if let Some(names) = &c.names {
+            if names.iter().any(|n| n == &expected) {
+                return Ok(c.id.clone());
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// Create a Docker container for an MCP server.
+pub async fn create_mcp_container(
+    server: &McpServer,
+    network_name: &str,
+) -> Result<String, String> {
+    let docker = get_docker()?;
+    let container_name = server.mcp_container_name();
+
+    let image = server
+        .docker_image
+        .as_ref()
+        .ok_or_else(|| format!("MCP server '{}' has no docker_image", server.name))?;
+
+    let mut env_vars: Vec<String> = Vec::new();
+    for (k, v) in &server.env {
+        env_vars.push(format!("{}={}", k, v));
+    }
+
+    // Build command + args as Cmd
+    let mut cmd: Vec<String> = Vec::new();
+    if let Some(ref command) = server.command {
+        cmd.push(command.clone());
+    }
+    cmd.extend(server.args.iter().cloned());
+
+    let mut labels = HashMap::new();
+    labels.insert("triple-c.managed".to_string(), "true".to_string());
+    labels.insert("triple-c.mcp-server".to_string(), server.id.clone());
+
+    let host_config = HostConfig {
+        network_mode: Some(network_name.to_string()),
+        ..Default::default()
+    };
+
+    let config = Config {
+        image: Some(image.clone()),
+        env: if env_vars.is_empty() { None } else { Some(env_vars) },
+        cmd: if cmd.is_empty() { None } else { Some(cmd) },
+        labels: Some(labels),
+        host_config: Some(host_config),
+        ..Default::default()
+    };
+
+    let options = CreateContainerOptions {
+        name: container_name.clone(),
+        ..Default::default()
+    };
+
+    let response = docker
+        .create_container(Some(options), config)
+        .await
+        .map_err(|e| format!("Failed to create MCP container '{}': {}", container_name, e))?;
+
+    log::info!(
+        "Created MCP container {} (image: {}) on network {}",
+        container_name,
+        image,
+        network_name
+    );
+    Ok(response.id)
+}
+
+/// Start all Docker-based MCP server containers. Finds or creates each one.
+pub async fn start_mcp_containers(
+    servers: &[McpServer],
+    network_name: &str,
+) -> Result<(), String> {
+    for server in servers {
+        if !server.is_docker() {
+            continue;
+        }
+
+        let container_id = if let Some(existing_id) = find_mcp_container(server).await? {
+            log::debug!("Found existing MCP container for '{}'", server.name);
+            existing_id
+        } else {
+            create_mcp_container(server, network_name).await?
+        };
+
+        // Start the container (ignore already-started errors)
+        if let Err(e) = start_container(&container_id).await {
+            let err_str = e.to_string();
+            if err_str.contains("already started") || err_str.contains("304") {
+                log::debug!("MCP container '{}' already running", server.name);
+            } else {
+                return Err(format!(
+                    "Failed to start MCP container '{}': {}",
+                    server.name, e
+                ));
+            }
+        }
+
+        log::info!("MCP container '{}' started", server.name);
+    }
+
+    Ok(())
+}
+
+/// Stop all Docker-based MCP server containers (best-effort).
+pub async fn stop_mcp_containers(servers: &[McpServer]) -> Result<(), String> {
+    for server in servers {
+        if !server.is_docker() {
+            continue;
+        }
+        if let Ok(Some(container_id)) = find_mcp_container(server).await {
+            if let Err(e) = stop_container(&container_id).await {
+                log::warn!("Failed to stop MCP container '{}': {}", server.name, e);
+            } else {
+                log::info!("Stopped MCP container '{}'", server.name);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Stop and remove all Docker-based MCP server containers (best-effort).
+pub async fn remove_mcp_containers(servers: &[McpServer]) -> Result<(), String> {
+    for server in servers {
+        if !server.is_docker() {
+            continue;
+        }
+        if let Ok(Some(container_id)) = find_mcp_container(server).await {
+            let _ = stop_container(&container_id).await;
+            if let Err(e) = remove_container(&container_id).await {
+                log::warn!("Failed to remove MCP container '{}': {}", server.name, e);
+            } else {
+                log::info!("Removed MCP container '{}'", server.name);
+            }
+        }
+    }
+    Ok(())
 }

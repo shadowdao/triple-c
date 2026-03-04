@@ -117,7 +117,7 @@ export interface ReleaseAsset {
   size: number;
 }
 
-export type McpTransportType = "stdio" | "http" | "sse";
+export type McpTransportType = "stdio" | "http";
 
 export interface McpServer {
   id: string;
@@ -128,6 +128,8 @@ export interface McpServer {
   env: Record<string, string>;
   url: string | null;
   headers: Record<string, string>;
+  docker_image: string | null;
+  container_port: number | null;
   created_at: string;
   updated_at: string;
 }

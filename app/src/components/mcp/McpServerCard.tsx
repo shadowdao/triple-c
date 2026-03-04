@@ -16,6 +16,8 @@ export default function McpServerCard({ server, onUpdate, onRemove }: Props) {
   const [envPairs, setEnvPairs] = useState<[string, string][]>(Object.entries(server.env));
   const [url, setUrl] = useState(server.url ?? "");
   const [headerPairs, setHeaderPairs] = useState<[string, string][]>(Object.entries(server.headers));
+  const [dockerImage, setDockerImage] = useState(server.docker_image ?? "");
+  const [containerPort, setContainerPort] = useState(server.container_port?.toString() ?? "3000");
 
   useEffect(() => {
     setName(server.name);
@@ -25,6 +27,8 @@ export default function McpServerCard({ server, onUpdate, onRemove }: Props) {
     setEnvPairs(Object.entries(server.env));
     setUrl(server.url ?? "");
     setHeaderPairs(Object.entries(server.headers));
+    setDockerImage(server.docker_image ?? "");
+    setContainerPort(server.container_port?.toString() ?? "3000");
   }, [server]);
 
   const saveServer = async (patch: Partial<McpServer>) => {
@@ -57,6 +61,15 @@ export default function McpServerCard({ server, onUpdate, onRemove }: Props) {
     saveServer({ url: url || null });
   };
 
+  const handleDockerImageBlur = () => {
+    saveServer({ docker_image: dockerImage || null });
+  };
+
+  const handleContainerPortBlur = () => {
+    const port = parseInt(containerPort, 10);
+    saveServer({ container_port: isNaN(port) ? null : port });
+  };
+
   const saveEnv = (pairs: [string, string][]) => {
     const env: Record<string, string> = {};
     for (const [k, v] of pairs) {
@@ -75,11 +88,14 @@ export default function McpServerCard({ server, onUpdate, onRemove }: Props) {
 
   const inputCls = "w-full px-2 py-1 bg-[var(--bg-primary)] border border-[var(--border-color)] rounded text-xs text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]";
 
+  const isDocker = !!dockerImage;
+
   const transportBadge = {
     stdio: "Stdio",
     http: "HTTP",
-    sse: "SSE",
   }[transportType];
+
+  const modeBadge = isDocker ? "Docker" : "Manual";
 
   return (
     <div className="border border-[var(--border-color)] rounded bg-[var(--bg-primary)]">
@@ -93,6 +109,9 @@ export default function McpServerCard({ server, onUpdate, onRemove }: Props) {
           <span className="text-sm font-medium truncate">{server.name}</span>
           <span className="text-xs px-1.5 py-0.5 rounded bg-[var(--bg-secondary)] text-[var(--text-secondary)]">
             {transportBadge}
+          </span>
+          <span className={`text-xs px-1.5 py-0.5 rounded ${isDocker ? "bg-blue-500/20 text-blue-400" : "bg-[var(--bg-secondary)] text-[var(--text-secondary)]"}`}>
+            {modeBadge}
           </span>
         </button>
         <button
@@ -117,11 +136,26 @@ export default function McpServerCard({ server, onUpdate, onRemove }: Props) {
             />
           </div>
 
+          {/* Docker Image (primary field — determines Docker vs Manual mode) */}
+          <div>
+            <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Docker Image</label>
+            <input
+              value={dockerImage}
+              onChange={(e) => setDockerImage(e.target.value)}
+              onBlur={handleDockerImageBlur}
+              placeholder="e.g. mcp/filesystem:latest (leave empty for manual mode)"
+              className={inputCls}
+            />
+            <p className="text-xs text-[var(--text-secondary)] mt-0.5 opacity-60">
+              Set a Docker image to run this MCP server as a container. Leave empty for manual mode.
+            </p>
+          </div>
+
           {/* Transport type */}
           <div>
             <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Transport</label>
             <div className="flex items-center gap-1">
-              {(["stdio", "http", "sse"] as McpTransportType[]).map((t) => (
+              {(["stdio", "http"] as McpTransportType[]).map((t) => (
                 <button
                   key={t}
                   onClick={() => handleTransportChange(t)}
@@ -131,11 +165,28 @@ export default function McpServerCard({ server, onUpdate, onRemove }: Props) {
                       : "text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-secondary)]"
                   }`}
                 >
-                  {t === "stdio" ? "Stdio" : t === "http" ? "HTTP" : "SSE"}
+                  {t === "stdio" ? "Stdio" : "HTTP"}
                 </button>
               ))}
             </div>
           </div>
+
+          {/* Container Port (HTTP+Docker only) */}
+          {transportType === "http" && isDocker && (
+            <div>
+              <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Container Port</label>
+              <input
+                value={containerPort}
+                onChange={(e) => setContainerPort(e.target.value)}
+                onBlur={handleContainerPortBlur}
+                placeholder="3000"
+                className={inputCls}
+              />
+              <p className="text-xs text-[var(--text-secondary)] mt-0.5 opacity-60">
+                Port inside the MCP container (default: 3000)
+              </p>
+            </div>
+          )}
 
           {/* Stdio fields */}
           {transportType === "stdio" && (
@@ -146,7 +197,7 @@ export default function McpServerCard({ server, onUpdate, onRemove }: Props) {
                   value={command}
                   onChange={(e) => setCommand(e.target.value)}
                   onBlur={handleCommandBlur}
-                  placeholder="npx"
+                  placeholder={isDocker ? "Command inside container" : "npx"}
                   className={inputCls}
                 />
               </div>
@@ -169,8 +220,8 @@ export default function McpServerCard({ server, onUpdate, onRemove }: Props) {
             </>
           )}
 
-          {/* HTTP/SSE fields */}
-          {(transportType === "http" || transportType === "sse") && (
+          {/* HTTP fields (only for manual mode — Docker mode auto-generates URL) */}
+          {transportType === "http" && !isDocker && (
             <>
               <div>
                 <label className="block text-xs text-[var(--text-secondary)] mb-0.5">URL</label>
@@ -189,6 +240,16 @@ export default function McpServerCard({ server, onUpdate, onRemove }: Props) {
                 onSave={saveHeaders}
               />
             </>
+          )}
+
+          {/* Environment variables for HTTP+Docker */}
+          {transportType === "http" && isDocker && (
+            <KeyValueEditor
+              label="Environment Variables"
+              pairs={envPairs}
+              onChange={(pairs) => { setEnvPairs(pairs); }}
+              onSave={saveEnv}
+            />
           )}
         </div>
       )}

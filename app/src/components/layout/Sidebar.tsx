@@ -24,7 +24,7 @@ export default function Sidebar() {
           Projects
         </button>
         <button onClick={() => setSidebarView("mcp")} className={tabCls("mcp")}>
-          MCP
+          MCP <span className="text-[0.6rem] px-1 py-0.5 rounded bg-yellow-500/20 text-yellow-400 ml-0.5">Beta</span>
         </button>
         <button onClick={() => setSidebarView("settings")} className={tabCls("settings")}>
           Settings

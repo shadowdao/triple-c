@@ -622,6 +622,7 @@ export default function ProjectCard({ project }: Props) {
                   <div className="space-y-1">
                     {mcpServers.map((server) => {
                       const enabled = project.enabled_mcp_servers.includes(server.id);
+                      const isDocker = !!server.docker_image;
                       return (
                         <label key={server.id} className="flex items-center gap-2 cursor-pointer">
                           <input
@@ -642,10 +643,18 @@ export default function ProjectCard({ project }: Props) {
                           />
                           <span className="text-xs text-[var(--text-primary)]">{server.name}</span>
                           <span className="text-xs text-[var(--text-secondary)]">({server.transport_type})</span>
+                          <span className={`text-xs px-1 py-0.5 rounded ${isDocker ? "bg-blue-500/20 text-blue-400" : "bg-[var(--bg-secondary)] text-[var(--text-secondary)]"}`}>
+                            {isDocker ? "Docker" : "Manual"}
+                          </span>
                         </label>
                       );
                     })}
                   </div>
+                  {mcpServers.some((s) => s.docker_image && s.transport_type === "stdio" && project.enabled_mcp_servers.includes(s.id)) && (
+                    <p className="text-xs text-[var(--text-secondary)] mt-1 opacity-70">
+                      Docker access will be auto-enabled for stdio+Docker MCP servers.
+                    </p>
+                  )}
                 </div>
               )}
 
