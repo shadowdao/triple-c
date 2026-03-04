@@ -70,17 +70,38 @@ impl ProjectsStore {
             (Vec::new(), false)
         };
 
+        // Reconcile stale transient statuses: on a cold app start no Docker
+        // operations can be in flight, so Starting/Stopping are always stale.
+        let mut projects = projects;
+        let mut needs_save = needs_save;
+        for p in projects.iter_mut() {
+            match p.status {
+                crate::models::ProjectStatus::Starting | crate::models::ProjectStatus::Stopping => {
+                    log::warn!(
+                        "Reconciling stale '{}' status for project '{}' ({}) → Stopped",
+                        serde_json::to_string(&p.status).unwrap_or_default().trim_matches('"'),
+                        p.name,
+                        p.id
+                    );
+                    p.status = crate::models::ProjectStatus::Stopped;
+                    p.updated_at = chrono::Utc::now().to_rfc3339();
+                    needs_save = true;
+                }
+                _ => {}
+            }
+        }
+
         let store = Self {
             projects: Mutex::new(projects),
             file_path,
         };
 
-        // Persist migrated format back to disk
+        // Persist migrated/reconciled format back to disk
         if needs_save {
-            log::info!("Migrated projects.json from single-path to multi-path format");
+            log::info!("Saving reconciled/migrated projects.json to disk");
             let projects = store.lock();
             if let Err(e) = store.save(&projects) {
-                log::error!("Failed to save migrated projects: {}", e);
+                log::error!("Failed to save projects: {}", e);
             }
         }
 

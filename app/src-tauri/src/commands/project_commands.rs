@@ -259,16 +259,18 @@ pub async fn stop_project_container(
         .get(&project_id)
         .ok_or_else(|| format!("Project {} not found", project_id))?;
 
-    if let Some(ref container_id) = project.container_id {
-        state.projects_store.update_status(&project_id, ProjectStatus::Stopping)?;
+    state.projects_store.update_status(&project_id, ProjectStatus::Stopping)?;
 
+    if let Some(ref container_id) = project.container_id {
         // Close exec sessions for this project
         state.exec_manager.close_sessions_for_container(container_id).await;
 
-        docker::stop_container(container_id).await?;
-        state.projects_store.update_status(&project_id, ProjectStatus::Stopped)?;
+        if let Err(e) = docker::stop_container(container_id).await {
+            log::warn!("Docker stop failed for container {} (project {}): {} — resetting to Stopped anyway", container_id, project_id, e);
+        }
     }
 
+    state.projects_store.update_status(&project_id, ProjectStatus::Stopped)?;
     Ok(())
 }
 

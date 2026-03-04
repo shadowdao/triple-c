@@ -315,9 +315,12 @@ export default function ProjectCard({ project }: Props) {
                 <ActionButton onClick={handleOpenTerminal} disabled={loading} label="Terminal" accent />
               </>
             ) : (
-              <span className="text-xs text-[var(--text-secondary)]">
-                {project.status}...
-              </span>
+              <>
+                <span className="text-xs text-[var(--text-secondary)]">
+                  {project.status}...
+                </span>
+                <ActionButton onClick={handleStop} disabled={loading} label="Force Stop" danger />
+              </>
             )}
             <ActionButton
               onClick={(e) => { e?.stopPropagation?.(); setShowConfig(!showConfig); }}
