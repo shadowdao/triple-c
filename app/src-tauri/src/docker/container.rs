@@ -2,6 +2,7 @@ use bollard::container::{
     Config, CreateContainerOptions, ListContainersOptions, RemoveContainerOptions,
     StartContainerOptions, StopContainerOptions,
 };
+use bollard::image::{CommitContainerOptions, RemoveImageOptions};
 use bollard::models::{ContainerSummary, HostConfig, Mount, MountTypeEnum, PortBinding};
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
@@ -367,7 +368,19 @@ pub async fn create_container(
         });
     }
 
-    // Named volume for claude config persistence
+    // Named volume for the entire home directory — preserves ~/.claude.json,
+    // ~/.local (pip/npm globals), and any other user-level state across
+    // container stop/start cycles.
+    mounts.push(Mount {
+        target: Some("/home/claude".to_string()),
+        source: Some(format!("triple-c-home-{}", project.id)),
+        typ: Some(MountTypeEnum::VOLUME),
+        read_only: Some(false),
+        ..Default::default()
+    });
+
+    // Named volume for claude config persistence — mounted as a nested volume
+    // inside the home volume; Docker gives the more-specific mount precedence.
     mounts.push(Mount {
         target: Some("/home/claude/.claude".to_string()),
         source: Some(format!("triple-c-claude-config-{}", project.id)),
@@ -536,6 +549,83 @@ pub async fn remove_container(container_id: &str) -> Result<(), String> {
         )
         .await
         .map_err(|e| format!("Failed to remove container: {}", e))
+}
+
+/// Return the snapshot image name for a project.
+pub fn get_snapshot_image_name(project: &Project) -> String {
+    format!("triple-c-snapshot-{}:latest", project.id)
+}
+
+/// Commit the container's filesystem to a snapshot image so that system-level
+/// changes (apt/pip/npm installs, ~/.claude.json, etc.) survive container
+/// removal. The Config is left empty so that secrets injected as env vars are
+/// NOT baked into the image.
+pub async fn commit_container_snapshot(container_id: &str, project: &Project) -> Result<(), String> {
+    let docker = get_docker()?;
+    let image_name = get_snapshot_image_name(project);
+
+    // Parse repo:tag
+    let (repo, tag) = match image_name.rsplit_once(':') {
+        Some((r, t)) => (r.to_string(), t.to_string()),
+        None => (image_name.clone(), "latest".to_string()),
+    };
+
+    let options = CommitContainerOptions {
+        container: container_id.to_string(),
+        repo: repo.clone(),
+        tag: tag.clone(),
+        pause: true,
+        ..Default::default()
+    };
+
+    // Empty config — no env vars / cmd baked in
+    let config = Config::<String> {
+        ..Default::default()
+    };
+
+    docker
+        .commit_container(options, config)
+        .await
+        .map_err(|e| format!("Failed to commit container snapshot: {}", e))?;
+
+    log::info!("Committed container {} as snapshot {}:{}", container_id, repo, tag);
+    Ok(())
+}
+
+/// Remove the snapshot image for a project (used on Reset / project removal).
+pub async fn remove_snapshot_image(project: &Project) -> Result<(), String> {
+    let docker = get_docker()?;
+    let image_name = get_snapshot_image_name(project);
+
+    docker
+        .remove_image(
+            &image_name,
+            Some(RemoveImageOptions {
+                force: true,
+                noprune: false,
+            }),
+            None,
+        )
+        .await
+        .map_err(|e| format!("Failed to remove snapshot image {}: {}", image_name, e))?;
+
+    log::info!("Removed snapshot image {}", image_name);
+    Ok(())
+}
+
+/// Remove both named volumes for a project (used on Reset / project removal).
+pub async fn remove_project_volumes(project: &Project) -> Result<(), String> {
+    let docker = get_docker()?;
+    for vol in [
+        format!("triple-c-home-{}", project.id),
+        format!("triple-c-claude-config-{}", project.id),
+    ] {
+        match docker.remove_volume(&vol, None).await {
+            Ok(_) => log::info!("Removed volume {}", vol),
+            Err(e) => log::warn!("Failed to remove volume {} (may not exist): {}", vol, e),
+        }
+    }
+    Ok(())
 }
 
 /// Check whether the existing container's configuration still matches the

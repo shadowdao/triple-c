@@ -81,11 +81,18 @@ pub async fn remove_project(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     // Stop and remove container if it exists
-    if let Some(project) = state.projects_store.get(&project_id) {
+    if let Some(ref project) = state.projects_store.get(&project_id) {
         if let Some(ref container_id) = project.container_id {
             state.exec_manager.close_sessions_for_container(container_id).await;
             let _ = docker::stop_container(container_id).await;
             let _ = docker::remove_container(container_id).await;
+        }
+        // Clean up the snapshot image + volumes
+        if let Err(e) = docker::remove_snapshot_image(project).await {
+            log::warn!("Failed to remove snapshot image for project {}: {}", project_id, e);
+        }
+        if let Err(e) = docker::remove_project_volumes(project).await {
+            log::warn!("Failed to remove project volumes for project {}: {}", project_id, e);
         }
     }
 
@@ -153,25 +160,37 @@ pub async fn start_project_container(
         // AWS config path from global settings
         let aws_config_path = settings.global_aws.aws_config_path.clone();
 
-        // Check for existing container
         let container_id = if let Some(existing_id) = docker::find_existing_container(&project).await? {
-            let needs_recreation = docker::container_needs_recreation(
-                    &existing_id,
-                    &project,
-                    settings.global_claude_instructions.as_deref(),
-                    &settings.global_custom_env_vars,
-                    settings.timezone.as_deref(),
-                )
-                .await
-                .unwrap_or(false);
-            if needs_recreation {
-                log::info!("Container config changed, recreating container for project {}", project.id);
+            // Check if config changed — if so, snapshot + recreate
+            let needs_recreate = docker::container_needs_recreation(
+                &existing_id,
+                &project,
+                settings.global_claude_instructions.as_deref(),
+                &settings.global_custom_env_vars,
+                settings.timezone.as_deref(),
+            ).await.unwrap_or(false);
+
+            if needs_recreate {
+                log::info!("Container config changed for project {} — committing snapshot and recreating", project.id);
+                // Snapshot the filesystem before destroying
+                if let Err(e) = docker::commit_container_snapshot(&existing_id, &project).await {
+                    log::warn!("Failed to snapshot container before recreation: {}", e);
+                }
                 let _ = docker::stop_container(&existing_id).await;
                 docker::remove_container(&existing_id).await?;
+
+                // Create from snapshot image (preserves system-level changes)
+                let snapshot_image = docker::get_snapshot_image_name(&project);
+                let create_image = if docker::image_exists(&snapshot_image).await.unwrap_or(false) {
+                    snapshot_image
+                } else {
+                    image_name.clone()
+                };
+
                 let new_id = docker::create_container(
                     &project,
                     &docker_socket,
-                    &image_name,
+                    &create_image,
                     aws_config_path.as_deref(),
                     &settings.global_aws,
                     settings.global_claude_instructions.as_deref(),
@@ -185,10 +204,21 @@ pub async fn start_project_container(
                 existing_id
             }
         } else {
+            // Container doesn't exist (first start, or Docker pruned it).
+            // Check for a snapshot image first — it preserves system-level
+            // changes (apt/pip/npm installs) from the previous session.
+            let snapshot_image = docker::get_snapshot_image_name(&project);
+            let create_image = if docker::image_exists(&snapshot_image).await.unwrap_or(false) {
+                log::info!("Creating container from snapshot image for project {}", project.id);
+                snapshot_image
+            } else {
+                image_name.clone()
+            };
+
             let new_id = docker::create_container(
                 &project,
                 &docker_socket,
-                &image_name,
+                &create_image,
                 aws_config_path.as_deref(),
                 &settings.global_aws,
                 settings.global_claude_instructions.as_deref(),
@@ -258,6 +288,14 @@ pub async fn rebuild_project_container(
         let _ = docker::stop_container(container_id).await;
         docker::remove_container(container_id).await?;
         state.projects_store.set_container_id(&project_id, None)?;
+    }
+
+    // Remove snapshot image + volumes so Reset creates from the clean base image
+    if let Err(e) = docker::remove_snapshot_image(&project).await {
+        log::warn!("Failed to remove snapshot image for project {}: {}", project_id, e);
+    }
+    if let Err(e) = docker::remove_project_volumes(&project).await {
+        log::warn!("Failed to remove project volumes for project {}: {}", project_id, e);
     }
 
     // Start fresh
