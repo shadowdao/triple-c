@@ -73,6 +73,19 @@ su -s /bin/bash claude -c '
     sort -u -o /home/claude/.ssh/known_hosts /home/claude/.ssh/known_hosts
 '
 
+# ── AWS config setup ──────────────────────────────────────────────────────────
+# Host AWS dir is mounted read-only at /tmp/.host-aws.
+# Copy to /home/claude/.aws so AWS CLI can write to sso/cache and cli/cache.
+if [ -d /tmp/.host-aws ]; then
+    rm -rf /home/claude/.aws
+    cp -a /tmp/.host-aws /home/claude/.aws
+    chown -R claude:claude /home/claude/.aws
+    chmod 700 /home/claude/.aws
+    # Ensure writable cache directories exist
+    mkdir -p /home/claude/.aws/sso/cache /home/claude/.aws/cli/cache
+    chown -R claude:claude /home/claude/.aws/sso /home/claude/.aws/cli
+fi
+
 # ── Git credential helper (for HTTPS token) ─────────────────────────────────
 if [ -n "$GIT_TOKEN" ]; then
     CRED_FILE="/home/claude/.git-credentials"

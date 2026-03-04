@@ -1,6 +1,73 @@
 use tauri::{AppHandle, Emitter, State};
 
+use crate::models::{AuthMode, BedrockAuthMethod, Project};
 use crate::AppState;
+
+/// Build the command to run in the container terminal.
+///
+/// For Bedrock Profile projects, wraps `claude` in a bash script that validates
+/// the AWS session first. If the SSO session is expired, runs `aws sso login`
+/// so the user can re-authenticate (the URL is clickable via xterm.js WebLinksAddon).
+fn build_terminal_cmd(project: &Project, state: &AppState) -> Vec<String> {
+    let is_bedrock_profile = project.auth_mode == AuthMode::Bedrock
+        && project
+            .bedrock_config
+            .as_ref()
+            .map(|b| b.auth_method == BedrockAuthMethod::Profile)
+            .unwrap_or(false);
+
+    if !is_bedrock_profile {
+        return vec![
+            "claude".to_string(),
+            "--dangerously-skip-permissions".to_string(),
+        ];
+    }
+
+    // Resolve AWS profile: project-level → global settings → "default"
+    let profile = project
+        .bedrock_config
+        .as_ref()
+        .and_then(|b| b.aws_profile.clone())
+        .or_else(|| state.settings_store.get().global_aws.aws_profile.clone())
+        .unwrap_or_else(|| "default".to_string());
+
+    // Build a bash wrapper that validates credentials, re-auths if needed,
+    // then exec's into claude.
+    let script = format!(
+        r#"
+echo "Validating AWS session for profile '{profile}'..."
+if aws sts get-caller-identity --profile '{profile}' >/dev/null 2>&1; then
+    echo "AWS session valid."
+else
+    echo "AWS session expired or invalid."
+    # Check if this profile uses SSO (has sso_start_url configured)
+    if aws configure get sso_start_url --profile '{profile}' >/dev/null 2>&1; then
+        echo "Starting SSO login — click the URL below to authenticate:"
+        echo ""
+        aws sso login --profile '{profile}'
+        if [ $? -ne 0 ]; then
+            echo ""
+            echo "SSO login failed or was cancelled. Starting Claude anyway..."
+            echo "You may see authentication errors."
+            echo ""
+        fi
+    else
+        echo "Profile '{profile}' does not use SSO. Check your AWS credentials."
+        echo "Starting Claude anyway..."
+        echo ""
+    fi
+fi
+exec claude --dangerously-skip-permissions
+"#,
+        profile = profile
+    );
+
+    vec![
+        "bash".to_string(),
+        "-c".to_string(),
+        script,
+    ]
+}
 
 #[tauri::command]
 pub async fn open_terminal_session(
@@ -19,10 +86,7 @@ pub async fn open_terminal_session(
         .as_ref()
         .ok_or_else(|| "Container not running".to_string())?;
 
-    let cmd = vec![
-        "claude".to_string(),
-        "--dangerously-skip-permissions".to_string(),
-    ];
+    let cmd = build_terminal_cmd(&project, &state);
 
     let output_event = format!("terminal-output-{}", session_id);
     let exit_event = format!("terminal-exit-{}", session_id);

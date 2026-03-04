@@ -508,7 +508,7 @@ pub async fn create_container(
         if let Some(ref aws_path) = aws_dir {
             if aws_path.exists() {
                 mounts.push(Mount {
-                    target: Some("/home/claude/.aws".to_string()),
+                    target: Some("/tmp/.host-aws".to_string()),
                     source: Some(aws_path.to_string_lossy().to_string()),
                     typ: Some(MountTypeEnum::BIND),
                     read_only: Some(true),
