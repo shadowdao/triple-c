@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import type { Project, TerminalSession, AppSettings, UpdateInfo } from "../lib/types";
+import type { Project, TerminalSession, AppSettings, UpdateInfo, McpServer } from "../lib/types";
 
 interface AppState {
   // Projects
@@ -17,9 +17,15 @@ interface AppState {
   removeSession: (id: string) => void;
   setActiveSession: (id: string | null) => void;
 
+  // MCP servers
+  mcpServers: McpServer[];
+  setMcpServers: (servers: McpServer[]) => void;
+  updateMcpServerInList: (server: McpServer) => void;
+  removeMcpServerFromList: (id: string) => void;
+
   // UI state
-  sidebarView: "projects" | "settings";
-  setSidebarView: (view: "projects" | "settings") => void;
+  sidebarView: "projects" | "mcp" | "settings";
+  setSidebarView: (view: "projects" | "mcp" | "settings") => void;
   dockerAvailable: boolean | null;
   setDockerAvailable: (available: boolean | null) => void;
   imageExists: boolean | null;
@@ -74,6 +80,20 @@ export const useAppState = create<AppState>((set) => ({
       };
     }),
   setActiveSession: (id) => set({ activeSessionId: id }),
+
+  // MCP servers
+  mcpServers: [],
+  setMcpServers: (servers) => set({ mcpServers: servers }),
+  updateMcpServerInList: (server) =>
+    set((state) => ({
+      mcpServers: state.mcpServers.map((s) =>
+        s.id === server.id ? server : s,
+      ),
+    })),
+  removeMcpServerFromList: (id) =>
+    set((state) => ({
+      mcpServers: state.mcpServers.filter((s) => s.id !== id),
+    })),
 
   // UI state
   sidebarView: "projects",

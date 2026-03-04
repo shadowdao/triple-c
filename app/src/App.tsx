@@ -7,6 +7,7 @@ import TerminalView from "./components/terminal/TerminalView";
 import { useDocker } from "./hooks/useDocker";
 import { useSettings } from "./hooks/useSettings";
 import { useProjects } from "./hooks/useProjects";
+import { useMcpServers } from "./hooks/useMcpServers";
 import { useUpdates } from "./hooks/useUpdates";
 import { useAppState } from "./store/appState";
 
@@ -14,6 +15,7 @@ export default function App() {
   const { checkDocker, checkImage, startDockerPolling } = useDocker();
   const { loadSettings } = useSettings();
   const { refresh } = useProjects();
+  const { refresh: refreshMcp } = useMcpServers();
   const { loadVersion, checkForUpdates, startPeriodicCheck } = useUpdates();
   const { sessions, activeSessionId } = useAppState(
     useShallow(s => ({ sessions: s.sessions, activeSessionId: s.activeSessionId }))
@@ -31,6 +33,7 @@ export default function App() {
       }
     });
     refresh();
+    refreshMcp();
 
     // Update detection
     loadVersion();

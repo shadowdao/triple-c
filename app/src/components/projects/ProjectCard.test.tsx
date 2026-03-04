@@ -31,6 +31,16 @@ vi.mock("../../hooks/useTerminal", () => ({
   }),
 }));
 
+vi.mock("../../hooks/useMcpServers", () => ({
+  useMcpServers: () => ({
+    mcpServers: [],
+    refresh: vi.fn(),
+    add: vi.fn(),
+    update: vi.fn(),
+    remove: vi.fn(),
+  }),
+}));
+
 let mockSelectedProjectId: string | null = null;
 vi.mock("../../store/appState", () => ({
   useAppState: vi.fn((selector) =>
@@ -55,7 +65,9 @@ const mockProject: Project = {
   git_user_name: null,
   git_user_email: null,
   custom_env_vars: [],
+  port_mappings: [],
   claude_instructions: null,
+  enabled_mcp_servers: [],
   created_at: "2026-01-01T00:00:00Z",
   updated_at: "2026-01-01T00:00:00Z",
 };

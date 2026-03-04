@@ -19,6 +19,9 @@ vi.mock("../projects/ProjectList", () => ({
 vi.mock("../settings/SettingsPanel", () => ({
   default: () => <div data-testid="settings-panel">SettingsPanel</div>,
 }));
+vi.mock("../mcp/McpPanel", () => ({
+  default: () => <div data-testid="mcp-panel">McpPanel</div>,
+}));
 
 describe("Sidebar", () => {
   beforeEach(() => {

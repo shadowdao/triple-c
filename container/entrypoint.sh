@@ -103,6 +103,27 @@ if [ -n "$CLAUDE_INSTRUCTIONS" ]; then
     unset CLAUDE_INSTRUCTIONS
 fi
 
+# ── MCP server configuration ────────────────────────────────────────────────
+# Merge MCP server config into ~/.claude.json (preserves existing keys like
+# OAuth tokens). Creates the file if it doesn't exist.
+if [ -n "$MCP_SERVERS_JSON" ]; then
+    CLAUDE_JSON="/home/claude/.claude.json"
+    if [ -f "$CLAUDE_JSON" ]; then
+        # Merge: existing config + MCP config (MCP keys override on conflict)
+        MERGED=$(jq -s '.[0] * .[1]' "$CLAUDE_JSON" <(printf '%s' "$MCP_SERVERS_JSON") 2>/dev/null)
+        if [ -n "$MERGED" ]; then
+            printf '%s\n' "$MERGED" > "$CLAUDE_JSON"
+        else
+            echo "entrypoint: warning — failed to merge MCP config into $CLAUDE_JSON"
+        fi
+    else
+        printf '%s\n' "$MCP_SERVERS_JSON" > "$CLAUDE_JSON"
+    fi
+    chown claude:claude "$CLAUDE_JSON"
+    chmod 600 "$CLAUDE_JSON"
+    unset MCP_SERVERS_JSON
+fi
+
 # ── Docker socket permissions ────────────────────────────────────────────────
 if [ -S /var/run/docker.sock ]; then
     DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)

@@ -7,11 +7,13 @@ mod storage;
 use docker::exec::ExecSessionManager;
 use storage::projects_store::ProjectsStore;
 use storage::settings_store::SettingsStore;
+use storage::mcp_store::McpStore;
 use tauri::Manager;
 
 pub struct AppState {
     pub projects_store: ProjectsStore,
     pub settings_store: SettingsStore,
+    pub mcp_store: McpStore,
     pub exec_manager: ExecSessionManager,
 }
 
@@ -32,6 +34,13 @@ pub fn run() {
             panic!("Failed to initialize settings store: {}", e);
         }
     };
+    let mcp_store = match McpStore::new() {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("Failed to initialize MCP store: {}", e);
+            panic!("Failed to initialize MCP store: {}", e);
+        }
+    };
 
     tauri::Builder::default()
         .plugin(tauri_plugin_store::Builder::default().build())
@@ -40,6 +49,7 @@ pub fn run() {
         .manage(AppState {
             projects_store,
             settings_store,
+            mcp_store,
             exec_manager: ExecSessionManager::new(),
         })
         .setup(|app| {
@@ -91,6 +101,11 @@ pub fn run() {
             commands::terminal_commands::terminal_resize,
             commands::terminal_commands::close_terminal_session,
             commands::terminal_commands::paste_image_to_terminal,
+            // MCP
+            commands::mcp_commands::list_mcp_servers,
+            commands::mcp_commands::add_mcp_server,
+            commands::mcp_commands::update_mcp_server,
+            commands::mcp_commands::remove_mcp_server,
             // Updates
             commands::update_commands::get_app_version,
             commands::update_commands::check_for_updates,

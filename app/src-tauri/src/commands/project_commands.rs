@@ -1,7 +1,7 @@
 use tauri::{Emitter, State};
 
 use crate::docker;
-use crate::models::{container_config, AuthMode, Project, ProjectPath, ProjectStatus};
+use crate::models::{container_config, AuthMode, McpServer, Project, ProjectPath, ProjectStatus};
 use crate::storage::secure;
 use crate::AppState;
 
@@ -142,6 +142,12 @@ pub async fn start_project_container(
     let settings = state.settings_store.get();
     let image_name = container_config::resolve_image_name(&settings.image_source, &settings.custom_image_name);
 
+    // Resolve enabled MCP servers for this project
+    let all_mcp_servers = state.mcp_store.list();
+    let enabled_mcp: Vec<McpServer> = project.enabled_mcp_servers.iter()
+        .filter_map(|id| all_mcp_servers.iter().find(|s| &s.id == id).cloned())
+        .collect();
+
     // Validate auth mode requirements
     if project.auth_mode == AuthMode::Bedrock {
         let bedrock = project.bedrock_config.as_ref()
@@ -180,6 +186,7 @@ pub async fn start_project_container(
                 settings.global_claude_instructions.as_deref(),
                 &settings.global_custom_env_vars,
                 settings.timezone.as_deref(),
+                &enabled_mcp,
             ).await.unwrap_or(false);
 
             if needs_recreate {
@@ -210,6 +217,7 @@ pub async fn start_project_container(
                     settings.global_claude_instructions.as_deref(),
                     &settings.global_custom_env_vars,
                     settings.timezone.as_deref(),
+                    &enabled_mcp,
                 ).await?;
                 emit_progress(&app_handle, &project_id, "Starting container...");
                 docker::start_container(&new_id).await?;
@@ -241,6 +249,7 @@ pub async fn start_project_container(
                 settings.global_claude_instructions.as_deref(),
                 &settings.global_custom_env_vars,
                 settings.timezone.as_deref(),
+                &enabled_mcp,
             ).await?;
             emit_progress(&app_handle, &project_id, "Starting container...");
             docker::start_container(&new_id).await?;

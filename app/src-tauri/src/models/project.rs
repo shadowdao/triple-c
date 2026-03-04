@@ -45,6 +45,8 @@ pub struct Project {
     pub port_mappings: Vec<PortMapping>,
     #[serde(default)]
     pub claude_instructions: Option<String>,
+    #[serde(default)]
+    pub enabled_mcp_servers: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -130,6 +132,7 @@ impl Project {
             custom_env_vars: Vec::new(),
             port_mappings: Vec::new(),
             claude_instructions: None,
+            enabled_mcp_servers: Vec::new(),
             created_at: now.clone(),
             updated_at: now,
         }

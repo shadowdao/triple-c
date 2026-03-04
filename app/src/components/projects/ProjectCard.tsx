@@ -3,6 +3,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import type { Project, ProjectPath, AuthMode, BedrockConfig, BedrockAuthMethod } from "../../lib/types";
 import { useProjects } from "../../hooks/useProjects";
+import { useMcpServers } from "../../hooks/useMcpServers";
 import { useTerminal } from "../../hooks/useTerminal";
 import { useAppState } from "../../store/appState";
 import EnvVarsModal from "./EnvVarsModal";
@@ -18,6 +19,7 @@ export default function ProjectCard({ project }: Props) {
   const selectedProjectId = useAppState(s => s.selectedProjectId);
   const setSelectedProject = useAppState(s => s.setSelectedProject);
   const { start, stop, rebuild, remove, update } = useProjects();
+  const { mcpServers } = useMcpServers();
   const { open: openTerminal } = useTerminal();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -612,6 +614,40 @@ export default function ProjectCard({ project }: Props) {
                   Edit
                 </button>
               </div>
+
+              {/* MCP Servers */}
+              {mcpServers.length > 0 && (
+                <div>
+                  <label className="block text-xs text-[var(--text-secondary)] mb-1">MCP Servers</label>
+                  <div className="space-y-1">
+                    {mcpServers.map((server) => {
+                      const enabled = project.enabled_mcp_servers.includes(server.id);
+                      return (
+                        <label key={server.id} className="flex items-center gap-2 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={enabled}
+                            disabled={!isStopped}
+                            onChange={async () => {
+                              const updated = enabled
+                                ? project.enabled_mcp_servers.filter((id) => id !== server.id)
+                                : [...project.enabled_mcp_servers, server.id];
+                              try {
+                                await update({ ...project, enabled_mcp_servers: updated });
+                              } catch (err) {
+                                console.error("Failed to update MCP servers:", err);
+                              }
+                            }}
+                            className="rounded border-[var(--border-color)] disabled:opacity-50"
+                          />
+                          <span className="text-xs text-[var(--text-primary)]">{server.name}</span>
+                          <span className="text-xs text-[var(--text-secondary)]">({server.transport_type})</span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
 
               {/* Bedrock config */}
               {project.auth_mode === "bedrock" && (() => {

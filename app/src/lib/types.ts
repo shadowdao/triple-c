@@ -30,6 +30,7 @@ export interface Project {
   custom_env_vars: EnvVar[];
   port_mappings: PortMapping[];
   claude_instructions: string | null;
+  enabled_mcp_servers: string[];
   created_at: string;
   updated_at: string;
 }
@@ -114,4 +115,19 @@ export interface ReleaseAsset {
   name: string;
   browser_download_url: string;
   size: number;
+}
+
+export type McpTransportType = "stdio" | "http" | "sse";
+
+export interface McpServer {
+  id: string;
+  name: string;
+  transport_type: McpTransportType;
+  command: string | null;
+  args: string[];
+  env: Record<string, string>;
+  url: string | null;
+  headers: Record<string, string>;
+  created_at: string;
+  updated_at: string;
 }

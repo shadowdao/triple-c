@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo } from "./types";
+import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, McpServer } from "./types";
 
 // Docker
 export const checkDocker = () => invoke<boolean>("check_docker");
@@ -49,6 +49,15 @@ export const closeTerminalSession = (sessionId: string) =>
   invoke<void>("close_terminal_session", { sessionId });
 export const pasteImageToTerminal = (sessionId: string, imageData: number[]) =>
   invoke<string>("paste_image_to_terminal", { sessionId, imageData });
+
+// MCP Servers
+export const listMcpServers = () => invoke<McpServer[]>("list_mcp_servers");
+export const addMcpServer = (name: string) =>
+  invoke<McpServer>("add_mcp_server", { name });
+export const updateMcpServer = (server: McpServer) =>
+  invoke<McpServer>("update_mcp_server", { server });
+export const removeMcpServer = (serverId: string) =>
+  invoke<void>("remove_mcp_server", { serverId });
 
 // Updates
 export const getAppVersion = () => invoke<string>("get_app_version");

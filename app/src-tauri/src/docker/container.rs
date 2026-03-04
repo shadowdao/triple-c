@@ -9,7 +9,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use super::client::get_docker;
-use crate::models::{AuthMode, BedrockAuthMethod, ContainerInfo, EnvVar, GlobalAwsSettings, PortMapping, Project, ProjectPath};
+use crate::models::{AuthMode, BedrockAuthMethod, ContainerInfo, EnvVar, GlobalAwsSettings, McpServer, McpTransportType, PortMapping, Project, ProjectPath};
 
 const SCHEDULER_INSTRUCTIONS: &str = r#"## Scheduled Tasks
 
@@ -176,6 +176,61 @@ fn compute_ports_fingerprint(port_mappings: &[PortMapping]) -> String {
     format!("{:x}", hasher.finish())
 }
 
+/// Build the JSON value for MCP servers config to be injected into ~/.claude.json.
+/// Produces `{"mcpServers": {"name": {"type": "stdio", ...}, ...}}`.
+fn build_mcp_servers_json(servers: &[McpServer]) -> String {
+    let mut mcp_map = serde_json::Map::new();
+    for server in servers {
+        let mut entry = serde_json::Map::new();
+        match server.transport_type {
+            McpTransportType::Stdio => {
+                entry.insert("type".to_string(), serde_json::json!("stdio"));
+                if let Some(ref cmd) = server.command {
+                    entry.insert("command".to_string(), serde_json::json!(cmd));
+                }
+                if !server.args.is_empty() {
+                    entry.insert("args".to_string(), serde_json::json!(server.args));
+                }
+                if !server.env.is_empty() {
+                    entry.insert("env".to_string(), serde_json::json!(server.env));
+                }
+            }
+            McpTransportType::Http => {
+                entry.insert("type".to_string(), serde_json::json!("http"));
+                if let Some(ref url) = server.url {
+                    entry.insert("url".to_string(), serde_json::json!(url));
+                }
+                if !server.headers.is_empty() {
+                    entry.insert("headers".to_string(), serde_json::json!(server.headers));
+                }
+            }
+            McpTransportType::Sse => {
+                entry.insert("type".to_string(), serde_json::json!("sse"));
+                if let Some(ref url) = server.url {
+                    entry.insert("url".to_string(), serde_json::json!(url));
+                }
+                if !server.headers.is_empty() {
+                    entry.insert("headers".to_string(), serde_json::json!(server.headers));
+                }
+            }
+        }
+        mcp_map.insert(server.name.clone(), serde_json::Value::Object(entry));
+    }
+    let wrapper = serde_json::json!({ "mcpServers": mcp_map });
+    serde_json::to_string(&wrapper).unwrap_or_default()
+}
+
+/// Compute a fingerprint for MCP server configuration so we can detect changes.
+fn compute_mcp_fingerprint(servers: &[McpServer]) -> String {
+    if servers.is_empty() {
+        return String::new();
+    }
+    let json = build_mcp_servers_json(servers);
+    let mut hasher = DefaultHasher::new();
+    json.hash(&mut hasher);
+    format!("{:x}", hasher.finish())
+}
+
 pub async fn find_existing_container(project: &Project) -> Result<Option<String>, String> {
     let docker = get_docker()?;
     let container_name = project.container_name();
@@ -215,6 +270,7 @@ pub async fn create_container(
     global_claude_instructions: Option<&str>,
     global_custom_env_vars: &[EnvVar],
     timezone: Option<&str>,
+    mcp_servers: &[McpServer],
 ) -> Result<String, String> {
     let docker = get_docker()?;
     let container_name = project.container_name();
@@ -355,6 +411,12 @@ pub async fn create_container(
         env_vars.push(format!("CLAUDE_INSTRUCTIONS={}", instructions));
     }
 
+    // MCP servers config
+    if !mcp_servers.is_empty() {
+        let mcp_json = build_mcp_servers_json(mcp_servers);
+        env_vars.push(format!("MCP_SERVERS_JSON={}", mcp_json));
+    }
+
     let mut mounts: Vec<Mount> = Vec::new();
 
     // Project directories -> /workspace/{mount_name}
@@ -474,6 +536,7 @@ pub async fn create_container(
     labels.insert("triple-c.ports-fingerprint".to_string(), compute_ports_fingerprint(&project.port_mappings));
     labels.insert("triple-c.image".to_string(), image_name.to_string());
     labels.insert("triple-c.timezone".to_string(), timezone.unwrap_or("").to_string());
+    labels.insert("triple-c.mcp-fingerprint".to_string(), compute_mcp_fingerprint(mcp_servers));
 
     let host_config = HostConfig {
         mounts: Some(mounts),
@@ -637,6 +700,7 @@ pub async fn container_needs_recreation(
     global_claude_instructions: Option<&str>,
     global_custom_env_vars: &[EnvVar],
     timezone: Option<&str>,
+    mcp_servers: &[McpServer],
 ) -> Result<bool, String> {
     let docker = get_docker()?;
     let info = docker
@@ -798,6 +862,14 @@ pub async fn container_needs_recreation(
     let container_instructions = get_env("CLAUDE_INSTRUCTIONS");
     if container_instructions.as_deref() != expected_instructions.as_deref() {
         log::info!("CLAUDE_INSTRUCTIONS mismatch");
+        return Ok(true);
+    }
+
+    // ── MCP servers fingerprint ─────────────────────────────────────────
+    let expected_mcp_fp = compute_mcp_fingerprint(mcp_servers);
+    let container_mcp_fp = get_label("triple-c.mcp-fingerprint").unwrap_or_default();
+    if container_mcp_fp != expected_mcp_fp {
+        log::info!("MCP servers fingerprint mismatch (container={:?}, expected={:?})", container_mcp_fp, expected_mcp_fp);
         return Ok(true);
     }
 
