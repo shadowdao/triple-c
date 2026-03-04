@@ -1,9 +1,19 @@
-use tauri::State;
+use tauri::{Emitter, State};
 
 use crate::docker;
 use crate::models::{container_config, AuthMode, Project, ProjectPath, ProjectStatus};
 use crate::storage::secure;
 use crate::AppState;
+
+fn emit_progress(app_handle: &tauri::AppHandle, project_id: &str, message: &str) {
+    let _ = app_handle.emit(
+        "container-progress",
+        serde_json::json!({
+            "project_id": project_id,
+            "message": message,
+        }),
+    );
+}
 
 /// Extract secret fields from a project and store them in the OS keychain.
 fn store_secrets_for_project(project: &Project) -> Result<(), String> {
@@ -116,6 +126,7 @@ pub async fn update_project(
 #[tauri::command]
 pub async fn start_project_container(
     project_id: String,
+    app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Project, String> {
     let mut project = state
@@ -147,6 +158,7 @@ pub async fn start_project_container(
     // Wrap container operations so that any failure resets status to Stopped.
     let result: Result<String, String> = async {
         // Ensure image exists
+        emit_progress(&app_handle, &project_id, "Checking image...");
         if !docker::image_exists(&image_name).await? {
             return Err(format!("Docker image '{}' not found. Please pull or build the image first.", image_name));
         }
@@ -173,9 +185,11 @@ pub async fn start_project_container(
             if needs_recreate {
                 log::info!("Container config changed for project {} — committing snapshot and recreating", project.id);
                 // Snapshot the filesystem before destroying
+                emit_progress(&app_handle, &project_id, "Saving container state...");
                 if let Err(e) = docker::commit_container_snapshot(&existing_id, &project).await {
                     log::warn!("Failed to snapshot container before recreation: {}", e);
                 }
+                emit_progress(&app_handle, &project_id, "Recreating container...");
                 let _ = docker::stop_container(&existing_id).await;
                 docker::remove_container(&existing_id).await?;
 
@@ -197,9 +211,11 @@ pub async fn start_project_container(
                     &settings.global_custom_env_vars,
                     settings.timezone.as_deref(),
                 ).await?;
+                emit_progress(&app_handle, &project_id, "Starting container...");
                 docker::start_container(&new_id).await?;
                 new_id
             } else {
+                emit_progress(&app_handle, &project_id, "Starting container...");
                 docker::start_container(&existing_id).await?;
                 existing_id
             }
@@ -215,6 +231,7 @@ pub async fn start_project_container(
                 image_name.clone()
             };
 
+            emit_progress(&app_handle, &project_id, "Creating container...");
             let new_id = docker::create_container(
                 &project,
                 &docker_socket,
@@ -225,6 +242,7 @@ pub async fn start_project_container(
                 &settings.global_custom_env_vars,
                 settings.timezone.as_deref(),
             ).await?;
+            emit_progress(&app_handle, &project_id, "Starting container...");
             docker::start_container(&new_id).await?;
             new_id
         };
@@ -252,6 +270,7 @@ pub async fn start_project_container(
 #[tauri::command]
 pub async fn stop_project_container(
     project_id: String,
+    app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let project = state
@@ -263,6 +282,7 @@ pub async fn stop_project_container(
 
     if let Some(ref container_id) = project.container_id {
         // Close exec sessions for this project
+        emit_progress(&app_handle, &project_id, "Stopping container...");
         state.exec_manager.close_sessions_for_container(container_id).await;
 
         if let Err(e) = docker::stop_container(container_id).await {
@@ -277,6 +297,7 @@ pub async fn stop_project_container(
 #[tauri::command]
 pub async fn rebuild_project_container(
     project_id: String,
+    app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Project, String> {
     let project = state
@@ -301,7 +322,7 @@ pub async fn rebuild_project_container(
     }
 
     // Start fresh
-    start_project_container(project_id, state).await
+    start_project_container(project_id, app_handle, state).await
 }
 
 fn default_docker_socket() -> String {

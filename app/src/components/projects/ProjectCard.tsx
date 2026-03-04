@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
+import { listen } from "@tauri-apps/api/event";
 import type { Project, ProjectPath, AuthMode, BedrockConfig, BedrockAuthMethod } from "../../lib/types";
 import { useProjects } from "../../hooks/useProjects";
 import { useTerminal } from "../../hooks/useTerminal";
@@ -23,6 +24,7 @@ export default function ProjectCard({ project }: Props) {
   const [showEnvVarsModal, setShowEnvVarsModal] = useState(false);
   const [showPortMappingsModal, setShowPortMappingsModal] = useState(false);
   const [showClaudeInstructionsModal, setShowClaudeInstructionsModal] = useState(false);
+  const [progressMsg, setProgressMsg] = useState<string | null>(null);
   const isSelected = selectedProjectId === project.id;
   const isStopped = project.status === "stopped" || project.status === "error";
 
@@ -63,6 +65,26 @@ export default function ProjectCard({ project }: Props) {
     setBedrockBearerToken(project.bedrock_config?.aws_bearer_token ?? "");
     setBedrockModelId(project.bedrock_config?.model_id ?? "");
   }, [project]);
+
+  // Listen for container progress events
+  useEffect(() => {
+    const unlisten = listen<{ project_id: string; message: string }>(
+      "container-progress",
+      (event) => {
+        if (event.payload.project_id === project.id) {
+          setProgressMsg(event.payload.message);
+        }
+      }
+    );
+    return () => { unlisten.then((f) => f()); };
+  }, [project.id]);
+
+  // Clear progress when status settles
+  useEffect(() => {
+    if (project.status === "running" || project.status === "stopped" || project.status === "error") {
+      setProgressMsg(null);
+    }
+  }, [project.status]);
 
   const handleStart = async () => {
     setLoading(true);
@@ -317,7 +339,7 @@ export default function ProjectCard({ project }: Props) {
             ) : (
               <>
                 <span className="text-xs text-[var(--text-secondary)]">
-                  {project.status}...
+                  {progressMsg ?? `${project.status}...`}
                 </span>
                 <ActionButton onClick={handleStop} disabled={loading} label="Force Stop" danger />
               </>
