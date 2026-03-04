@@ -19,6 +19,8 @@ env:
 jobs:
   build-linux:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.VERSION }}
     steps:
       - name: Install Node.js 22
         run: |
@@ -374,3 +376,96 @@ jobs:
             echo Uploading %%~nxf...
             curl -s -X POST -H "Authorization: token %TOKEN%" -H "Content-Type: application/octet-stream" --data-binary "@%%f" "%GITEA_URL%/api/v1/repos/%REPO%/releases/%RELEASE_ID%/assets?name=%%~nxf"
           )
+
+  sync-to-github:
+    runs-on: ubuntu-latest
+    needs: [build-linux, build-macos, build-windows]
+    if: gitea.event_name == 'push'
+    env:
+      GH_PAT: ${{ secrets.GH_PAT }}
+      GITHUB_REPO: shadowdao/triple-c
+    steps:
+      - name: Download artifacts from Gitea releases
+        env:
+          TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          VERSION: ${{ needs.build-linux.outputs.version }}
+        run: |
+          set -e
+          mkdir -p artifacts
+
+          # Download assets from all 3 platform releases
+          for TAG_SUFFIX in "" "-mac" "-win"; do
+            TAG="v${VERSION}${TAG_SUFFIX}"
+            echo "==> Fetching assets for release ${TAG}..."
+
+            RELEASE_JSON=$(curl -sf \
+              -H "Authorization: token ${TOKEN}" \
+              "${GITEA_URL}/api/v1/repos/${REPO}/releases/tags/${TAG}" 2>/dev/null || echo "{}")
+
+            echo "$RELEASE_JSON" | jq -r '.assets[]? | "\(.name) \(.browser_download_url)"' | while read -r NAME URL; do
+              [ -z "$NAME" ] && continue
+              echo "    Downloading ${NAME}..."
+              curl -sfL \
+                -H "Authorization: token ${TOKEN}" \
+                -o "artifacts/${NAME}" \
+                "$URL"
+            done
+          done
+
+          echo "==> All downloaded artifacts:"
+          ls -la artifacts/
+
+      - name: Create GitHub release and upload artifacts
+        env:
+          VERSION: ${{ needs.build-linux.outputs.version }}
+          COMMIT_SHA: ${{ gitea.sha }}
+        run: |
+          set -e
+          TAG="v${VERSION}"
+
+          echo "==> Creating unified release ${TAG} on GitHub..."
+
+          # Delete existing release if present (idempotent re-runs)
+          EXISTING=$(curl -sf \
+            -H "Authorization: Bearer ${GH_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPO}/releases/tags/${TAG}" 2>/dev/null || echo "{}")
+          EXISTING_ID=$(echo "$EXISTING" | jq -r '.id // empty')
+          if [ -n "$EXISTING_ID" ]; then
+            echo "    Deleting existing GitHub release ${TAG} (id: ${EXISTING_ID})..."
+            curl -sf -X DELETE \
+              -H "Authorization: Bearer ${GH_PAT}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_REPO}/releases/${EXISTING_ID}"
+          fi
+
+          RESPONSE=$(curl -sf -X POST \
+            -H "Authorization: Bearer ${GH_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/repos/${GITHUB_REPO}/releases" \
+            -d "{
+              \"tag_name\": \"${TAG}\",
+              \"name\": \"Triple-C ${TAG}\",
+              \"body\": \"Automated build from commit ${COMMIT_SHA}\n\nIncludes Linux, macOS, and Windows artifacts.\",
+              \"draft\": false,
+              \"prerelease\": false
+            }")
+
+          UPLOAD_URL=$(echo "$RESPONSE" | jq -r '.upload_url' | sed 's/{?name,label}//')
+          echo "==> Upload URL: ${UPLOAD_URL}"
+
+          for file in artifacts/*; do
+            [ -f "$file" ] || continue
+            FILENAME=$(basename "$file")
+            MIME="application/octet-stream"
+            echo "==> Uploading ${FILENAME}..."
+            curl -sf -X POST \
+              -H "Authorization: Bearer ${GH_PAT}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "Content-Type: ${MIME}" \
+              --data-binary "@${file}" \
+              "${UPLOAD_URL}?name=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1]))" "${FILENAME}")"
+          done
+
+          echo "==> GitHub release sync complete."
