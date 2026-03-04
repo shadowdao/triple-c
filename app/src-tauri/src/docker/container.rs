@@ -5,8 +5,7 @@ use bollard::container::{
 use bollard::image::{CommitContainerOptions, RemoveImageOptions};
 use bollard::models::{ContainerSummary, HostConfig, Mount, MountTypeEnum, PortBinding};
 use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use sha2::{Sha256, Digest};
 
 use super::client::get_docker;
 use crate::models::{AuthMode, BedrockAuthMethod, ContainerInfo, EnvVar, GlobalAwsSettings, McpServer, McpTransportType, PortMapping, Project, ProjectPath};
@@ -129,20 +128,28 @@ fn merge_claude_instructions(
     }
 }
 
+/// Hash a string with SHA-256 and return the hex digest.
+fn sha256_hex(input: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 /// Compute a fingerprint for the Bedrock configuration so we can detect changes.
 fn compute_bedrock_fingerprint(project: &Project) -> String {
     if let Some(ref bedrock) = project.bedrock_config {
-        let mut hasher = DefaultHasher::new();
-        format!("{:?}", bedrock.auth_method).hash(&mut hasher);
-        bedrock.aws_region.hash(&mut hasher);
-        bedrock.aws_access_key_id.hash(&mut hasher);
-        bedrock.aws_secret_access_key.hash(&mut hasher);
-        bedrock.aws_session_token.hash(&mut hasher);
-        bedrock.aws_profile.hash(&mut hasher);
-        bedrock.aws_bearer_token.hash(&mut hasher);
-        bedrock.model_id.hash(&mut hasher);
-        bedrock.disable_prompt_caching.hash(&mut hasher);
-        format!("{:x}", hasher.finish())
+        let parts = vec![
+            format!("{:?}", bedrock.auth_method),
+            bedrock.aws_region.clone(),
+            bedrock.aws_access_key_id.as_deref().unwrap_or("").to_string(),
+            bedrock.aws_secret_access_key.as_deref().unwrap_or("").to_string(),
+            bedrock.aws_session_token.as_deref().unwrap_or("").to_string(),
+            bedrock.aws_profile.as_deref().unwrap_or("").to_string(),
+            bedrock.aws_bearer_token.as_deref().unwrap_or("").to_string(),
+            bedrock.model_id.as_deref().unwrap_or("").to_string(),
+            format!("{}", bedrock.disable_prompt_caching),
+        ];
+        sha256_hex(&parts.join("|"))
     } else {
         String::new()
     }
@@ -157,9 +164,7 @@ fn compute_paths_fingerprint(paths: &[ProjectPath]) -> String {
         .collect();
     parts.sort();
     let joined = parts.join(",");
-    let mut hasher = DefaultHasher::new();
-    joined.hash(&mut hasher);
-    format!("{:x}", hasher.finish())
+    sha256_hex(&joined)
 }
 
 /// Compute a fingerprint for port mappings so we can detect changes.
@@ -171,9 +176,7 @@ fn compute_ports_fingerprint(port_mappings: &[PortMapping]) -> String {
         .collect();
     parts.sort();
     let joined = parts.join(",");
-    let mut hasher = DefaultHasher::new();
-    joined.hash(&mut hasher);
-    format!("{:x}", hasher.finish())
+    sha256_hex(&joined)
 }
 
 /// Build the JSON value for MCP servers config to be injected into ~/.claude.json.
@@ -250,9 +253,7 @@ fn compute_mcp_fingerprint(servers: &[McpServer]) -> String {
         return String::new();
     }
     let json = build_mcp_servers_json(servers);
-    let mut hasher = DefaultHasher::new();
-    json.hash(&mut hasher);
-    format!("{:x}", hasher.finish())
+    sha256_hex(&json)
 }
 
 pub async fn find_existing_container(project: &Project) -> Result<Option<String>, String> {
