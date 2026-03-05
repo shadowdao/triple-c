@@ -101,6 +101,16 @@ WORKDIR /workspace
 
 # ── Switch back to root for entrypoint (handles UID/GID remapping) ─────────
 USER root
+
+# ── OSC 52 clipboard support ─────────────────────────────────────────────
+# Provides xclip/xsel/pbcopy shims that emit OSC 52 escape sequences,
+# allowing programs inside the container to copy to the host clipboard.
+COPY osc52-clipboard /usr/local/bin/osc52-clipboard
+RUN chmod +x /usr/local/bin/osc52-clipboard \
+    && ln -sf /usr/local/bin/osc52-clipboard /usr/local/bin/xclip \
+    && ln -sf /usr/local/bin/osc52-clipboard /usr/local/bin/xsel \
+    && ln -sf /usr/local/bin/osc52-clipboard /usr/local/bin/pbcopy
+
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 COPY triple-c-scheduler /usr/local/bin/triple-c-scheduler

@@ -1,0 +1,26 @@
+#!/bin/bash
+# OSC 52 clipboard provider — sends clipboard data to the host system clipboard
+# via OSC 52 terminal escape sequences. Installed as xclip/xsel/pbcopy so that
+# programs inside the container (e.g. Claude Code) can copy to clipboard.
+#
+# Supports common invocations:
+#   echo "text" | xclip -selection clipboard
+#   echo "text" | xsel --clipboard --input
+#   echo "text" | pbcopy
+#
+# Paste/output requests exit silently (not supported via OSC 52).
+
+# Detect paste/output mode — exit silently since we can't read the host clipboard
+for arg in "$@"; do
+    case "$arg" in
+        -o|--output) exit 0 ;;
+    esac
+done
+
+# Read all input from stdin
+data=$(cat)
+[ -z "$data" ] && exit 0
+
+# Base64 encode and write OSC 52 escape sequence to the controlling terminal
+encoded=$(printf '%s' "$data" | base64 | tr -d '\n')
+printf '\033]52;c;%s\a' "$encoded" > /dev/tty 2>/dev/null

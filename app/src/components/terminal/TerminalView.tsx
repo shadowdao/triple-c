@@ -82,6 +82,25 @@ export default function TerminalView({ sessionId, active }: Props) {
     // Send initial size
     resize(sessionId, term.cols, term.rows);
 
+    // Handle OSC 52 clipboard write sequences from programs inside the container.
+    // When a program (e.g. Claude Code) copies text via xclip/xsel/pbcopy, the
+    // container's shim emits an OSC 52 escape sequence which xterm.js routes here.
+    const osc52Disposable = term.parser.registerOscHandler(52, (data) => {
+      const idx = data.indexOf(";");
+      if (idx === -1) return false;
+      const payload = data.substring(idx + 1);
+      if (payload === "?") return false; // clipboard read request, not supported
+      try {
+        const decoded = atob(payload);
+        navigator.clipboard.writeText(decoded).catch((e) =>
+          console.error("OSC 52 clipboard write failed:", e),
+        );
+      } catch (e) {
+        console.error("OSC 52 decode failed:", e);
+      }
+      return true;
+    });
+
     // Handle user input -> backend
     const inputDisposable = term.onData((data) => {
       sendInput(sessionId, data);
@@ -170,6 +189,7 @@ export default function TerminalView({ sessionId, active }: Props) {
       aborted = true;
       detector.dispose();
       detectorRef.current = null;
+      osc52Disposable.dispose();
       inputDisposable.dispose();
       scrollDisposable.dispose();
       containerRef.current?.removeEventListener("paste", handlePaste, { capture: true });
