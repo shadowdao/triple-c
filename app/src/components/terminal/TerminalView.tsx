@@ -6,8 +6,6 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import "@xterm/xterm/css/xterm.css";
 import { useTerminal } from "../../hooks/useTerminal";
-import { useSettings } from "../../hooks/useSettings";
-import { useVoice } from "../../hooks/useVoice";
 import { UrlDetector } from "../../lib/urlDetector";
 import UrlToast from "./UrlToast";
 
@@ -24,9 +22,6 @@ export default function TerminalView({ sessionId, active }: Props) {
   const webglRef = useRef<WebglAddon | null>(null);
   const detectorRef = useRef<UrlDetector | null>(null);
   const { sendInput, pasteImage, resize, onOutput, onExit } = useTerminal();
-  const { appSettings } = useSettings();
-
-  const voice = useVoice(sessionId, appSettings?.default_microphone);
 
   const [detectedUrl, setDetectedUrl] = useState<string | null>(null);
   const [imagePasteMsg, setImagePasteMsg] = useState<string | null>(null);
@@ -205,7 +200,6 @@ export default function TerminalView({ sessionId, active }: Props) {
       try { webglRef.current?.dispose(); } catch { /* may already be disposed */ }
       webglRef.current = null;
       term.dispose();
-      voice.stop();
     };
   }, [sessionId]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -290,32 +284,6 @@ export default function TerminalView({ sessionId, active }: Props) {
           {imagePasteMsg}
         </div>
       )}
-      <button
-        onClick={voice.toggle}
-        title={
-          voice.state === "active"
-            ? "Voice active — click to stop"
-            : voice.error
-              ? `Voice error: ${voice.error}`
-              : "Enable voice input for /voice mode"
-        }
-        className={`absolute bottom-4 left-4 z-50 px-3 py-1.5 rounded-md text-xs font-medium border shadow-lg transition-colors cursor-pointer ${
-          voice.state === "active"
-            ? "bg-[#1a3a2a] text-[#3fb950] border-[#238636] hover:bg-[#243b2a]"
-            : voice.state === "starting"
-              ? "bg-[#1f2937] text-[#d29922] border-[#30363d] opacity-75"
-              : voice.state === "error"
-                ? "bg-[#3a1a1a] text-[#ff7b72] border-[#da3633] hover:bg-[#4a2020]"
-                : "bg-[#1f2937] text-[#b1bac4] border-[#30363d] hover:bg-[#2d3748] hover:text-[#e6edf3]"
-        }`}
-        disabled={voice.state === "starting"}
-      >
-        {voice.state === "active"
-          ? "Mic On"
-          : voice.state === "starting"
-            ? "Mic..."
-            : "Mic Off"}
-      </button>
       {!isAtBottom && (
         <button
           onClick={handleScrollToBottom}
