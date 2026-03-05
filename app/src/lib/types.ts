@@ -100,6 +100,7 @@ export interface AppSettings {
   auto_check_updates: boolean;
   dismissed_update_version: string | null;
   timezone: string | null;
+  default_microphone: string | null;
 }
 
 export interface UpdateInfo {

@@ -3,7 +3,7 @@ import * as commands from "../lib/tauri-commands";
 
 type VoiceState = "inactive" | "starting" | "active" | "error";
 
-export function useVoice(sessionId: string) {
+export function useVoice(sessionId: string, deviceId?: string | null) {
   const [state, setState] = useState<VoiceState>("inactive");
   const [error, setError] = useState<string | null>(null);
 
@@ -20,14 +20,19 @@ export function useVoice(sessionId: string) {
       // 1. Start the audio bridge in the container (creates FIFO writer)
       await commands.startAudioBridge(sessionId);
 
-      // 2. Get microphone access
+      // 2. Get microphone access (use specific device if configured)
+      const audioConstraints: MediaTrackConstraints = {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      };
+      if (deviceId) {
+        audioConstraints.deviceId = { exact: deviceId };
+      }
+
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
+        audio: audioConstraints,
       });
       streamRef.current = stream;
 
@@ -62,7 +67,7 @@ export function useVoice(sessionId: string) {
       // Clean up on failure
       await commands.stopAudioBridge(sessionId).catch(() => {});
     }
-  }, [sessionId, state]);
+  }, [sessionId, state, deviceId]);
 
   const stop = useCallback(async () => {
     // Tear down audio pipeline

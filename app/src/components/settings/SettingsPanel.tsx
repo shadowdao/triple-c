@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import ApiKeyInput from "./ApiKeyInput";
 import DockerSettings from "./DockerSettings";
 import AwsSettings from "./AwsSettings";
+import MicrophoneSettings from "./MicrophoneSettings";
 import { useSettings } from "../../hooks/useSettings";
 import { useUpdates } from "../../hooks/useUpdates";
 import ClaudeInstructionsModal from "../projects/ClaudeInstructionsModal";
@@ -58,6 +59,8 @@ export default function SettingsPanel() {
       <ApiKeyInput />
       <DockerSettings />
       <AwsSettings />
+
+      <MicrophoneSettings />
 
       {/* Container Timezone */}
       <div>

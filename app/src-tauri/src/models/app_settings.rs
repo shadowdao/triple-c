@@ -70,6 +70,8 @@ pub struct AppSettings {
     pub dismissed_update_version: Option<String>,
     #[serde(default)]
     pub timezone: Option<String>,
+    #[serde(default)]
+    pub default_microphone: Option<String>,
 }
 
 impl Default for AppSettings {
@@ -87,6 +89,7 @@ impl Default for AppSettings {
             auto_check_updates: true,
             dismissed_update_version: None,
             timezone: None,
+            default_microphone: None,
         }
     }
 }

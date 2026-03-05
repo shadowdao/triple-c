@@ -6,6 +6,7 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import "@xterm/xterm/css/xterm.css";
 import { useTerminal } from "../../hooks/useTerminal";
+import { useSettings } from "../../hooks/useSettings";
 import { useVoice } from "../../hooks/useVoice";
 import { UrlDetector } from "../../lib/urlDetector";
 import UrlToast from "./UrlToast";
@@ -23,8 +24,9 @@ export default function TerminalView({ sessionId, active }: Props) {
   const webglRef = useRef<WebglAddon | null>(null);
   const detectorRef = useRef<UrlDetector | null>(null);
   const { sendInput, pasteImage, resize, onOutput, onExit } = useTerminal();
+  const { appSettings } = useSettings();
 
-  const voice = useVoice(sessionId);
+  const voice = useVoice(sessionId, appSettings?.default_microphone);
 
   const [detectedUrl, setDetectedUrl] = useState<string | null>(null);
   const [imagePasteMsg, setImagePasteMsg] = useState<string | null>(null);
