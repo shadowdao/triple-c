@@ -5,8 +5,6 @@ import type { Project, ProjectPath, AuthMode, BedrockConfig, BedrockAuthMethod }
 import { useProjects } from "../../hooks/useProjects";
 import { useMcpServers } from "../../hooks/useMcpServers";
 import { useTerminal } from "../../hooks/useTerminal";
-import { useSettings } from "../../hooks/useSettings";
-import { useVoice } from "../../hooks/useVoice";
 import { useAppState } from "../../store/appState";
 import EnvVarsModal from "./EnvVarsModal";
 import PortMappingsModal from "./PortMappingsModal";
@@ -23,15 +21,6 @@ export default function ProjectCard({ project }: Props) {
   const { start, stop, rebuild, remove, update } = useProjects();
   const { mcpServers } = useMcpServers();
   const { open: openTerminal } = useTerminal();
-  const { appSettings } = useSettings();
-  const sessions = useAppState(s => s.sessions);
-  const activeSessionId = useAppState(s => s.activeSessionId);
-
-  // Find the active terminal session for this project (prefer the currently viewed one)
-  const projectSession = sessions.find(s => s.projectId === project.id && s.id === activeSessionId)
-    ?? sessions.find(s => s.projectId === project.id);
-  const voice = useVoice(projectSession?.id ?? "", appSettings?.default_microphone);
-
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showConfig, setShowConfig] = useState(false);
@@ -382,9 +371,6 @@ export default function ProjectCard({ project }: Props) {
               <>
                 <ActionButton onClick={handleStop} disabled={loading} label="Stop" />
                 <ActionButton onClick={handleOpenTerminal} disabled={loading} label="Terminal" accent />
-                {projectSession && (
-                  <MicButton voice={voice} />
-                )}
               </>
             ) : (
               <>
@@ -884,34 +870,3 @@ function ActionButton({
   );
 }
 
-function MicButton({ voice }: { voice: ReturnType<typeof useVoice> }) {
-  const color =
-    voice.state === "active"
-      ? "text-[var(--success)] hover:text-[var(--success)]"
-      : voice.state === "starting"
-        ? "text-[var(--warning)] opacity-75"
-        : voice.state === "error"
-          ? "text-[var(--error)] hover:text-[var(--error)]"
-          : "text-[var(--text-secondary)] hover:text-[var(--text-primary)]";
-
-  return (
-    <button
-      onClick={(e) => { e.stopPropagation(); voice.toggle(); }}
-      disabled={voice.state === "starting"}
-      title={
-        voice.state === "active"
-          ? "Voice active — click to stop"
-          : voice.error
-            ? `Voice error: ${voice.error}`
-            : "Enable voice input for /voice mode"
-      }
-      className={`text-xs px-2 py-0.5 rounded transition-colors disabled:opacity-50 ${color} hover:bg-[var(--bg-primary)]`}
-    >
-      {voice.state === "active"
-        ? "Mic On"
-        : voice.state === "starting"
-          ? "Mic..."
-          : "Mic Off"}
-    </button>
-  );
-}
