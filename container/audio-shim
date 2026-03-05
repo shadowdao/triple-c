@@ -1,0 +1,16 @@
+#!/bin/bash
+# Audio capture shim for Triple-C voice mode.
+# Claude Code spawns `rec` or `arecord` to capture mic audio.
+# Inside Docker there is no mic, so this shim reads PCM data from a
+# FIFO that the Tauri host app writes to, and outputs it on stdout.
+
+FIFO=/tmp/triple-c-audio-input
+
+# Create the FIFO if it doesn't already exist
+[ -p "$FIFO" ] || mkfifo "$FIFO" 2>/dev/null
+
+# Clean exit on SIGTERM (Claude Code sends this when recording stops)
+trap 'exit 0' TERM INT
+
+# Stream PCM from the FIFO to stdout until we get a signal or EOF
+cat "$FIFO"

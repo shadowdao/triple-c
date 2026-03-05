@@ -101,6 +101,9 @@ pub fn run() {
             commands::terminal_commands::terminal_resize,
             commands::terminal_commands::close_terminal_session,
             commands::terminal_commands::paste_image_to_terminal,
+            commands::terminal_commands::start_audio_bridge,
+            commands::terminal_commands::send_audio_data,
+            commands::terminal_commands::stop_audio_bridge,
             // MCP
             commands::mcp_commands::list_mcp_servers,
             commands::mcp_commands::add_mcp_server,

@@ -111,6 +111,14 @@ RUN chmod +x /usr/local/bin/osc52-clipboard \
     && ln -sf /usr/local/bin/osc52-clipboard /usr/local/bin/xsel \
     && ln -sf /usr/local/bin/osc52-clipboard /usr/local/bin/pbcopy
 
+# ── Audio capture shim (voice mode) ────────────────────────────────────────
+# Provides fake rec/arecord that read PCM from a FIFO instead of a real mic,
+# allowing Claude Code voice mode to work inside the container.
+COPY audio-shim /usr/local/bin/audio-shim
+RUN chmod +x /usr/local/bin/audio-shim \
+    && ln -sf /usr/local/bin/audio-shim /usr/local/bin/rec \
+    && ln -sf /usr/local/bin/audio-shim /usr/local/bin/arecord
+
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 COPY triple-c-scheduler /usr/local/bin/triple-c-scheduler

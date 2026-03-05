@@ -133,6 +133,10 @@ pub async fn close_terminal_session(
     session_id: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    // Close audio bridge if it exists
+    let audio_session_id = format!("audio-{}", session_id);
+    state.exec_manager.close_session(&audio_session_id).await;
+    // Close terminal session
     state.exec_manager.close_session(&session_id).await;
     Ok(())
 }
@@ -155,4 +159,54 @@ pub async fn paste_image_to_terminal(
         .exec_manager
         .write_file_to_container(&container_id, &file_name, &image_data)
         .await
+}
+
+#[tauri::command]
+pub async fn start_audio_bridge(
+    session_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    // Get container_id from the terminal session
+    let container_id = state.exec_manager.get_container_id(&session_id).await?;
+
+    // Create audio bridge exec session with ID "audio-{session_id}"
+    // The loop handles reconnection when the FIFO reader (fake rec) is killed and restarted
+    let audio_session_id = format!("audio-{}", session_id);
+    let cmd = vec![
+        "bash".to_string(),
+        "-c".to_string(),
+        "FIFO=/tmp/triple-c-audio-input; [ -p \"$FIFO\" ] || mkfifo \"$FIFO\"; trap '' PIPE; while true; do cat > \"$FIFO\" 2>/dev/null; sleep 0.1; done".to_string(),
+    ];
+
+    state
+        .exec_manager
+        .create_session_with_tty(
+            &container_id,
+            &audio_session_id,
+            cmd,
+            false,
+            |_data| { /* ignore output from the audio bridge */ },
+            Box::new(|| { /* no exit handler needed */ }),
+        )
+        .await
+}
+
+#[tauri::command]
+pub async fn send_audio_data(
+    session_id: String,
+    data: Vec<u8>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let audio_session_id = format!("audio-{}", session_id);
+    state.exec_manager.send_input(&audio_session_id, data).await
+}
+
+#[tauri::command]
+pub async fn stop_audio_bridge(
+    session_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let audio_session_id = format!("audio-{}", session_id);
+    state.exec_manager.close_session(&audio_session_id).await;
+    Ok(())
 }

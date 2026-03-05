@@ -63,6 +63,22 @@ impl ExecSessionManager {
     where
         F: Fn(Vec<u8>) + Send + 'static,
     {
+        self.create_session_with_tty(container_id, session_id, cmd, true, on_output, on_exit)
+            .await
+    }
+
+    pub async fn create_session_with_tty<F>(
+        &self,
+        container_id: &str,
+        session_id: &str,
+        cmd: Vec<String>,
+        tty: bool,
+        on_output: F,
+        on_exit: Box<dyn FnOnce() + Send>,
+    ) -> Result<(), String>
+    where
+        F: Fn(Vec<u8>) + Send + 'static,
+    {
         let docker = get_docker()?;
 
         let exec = docker
@@ -72,7 +88,7 @@ impl ExecSessionManager {
                     attach_stdin: Some(true),
                     attach_stdout: Some(true),
                     attach_stderr: Some(true),
-                    tty: Some(true),
+                    tty: Some(tty),
                     cmd: Some(cmd),
                     user: Some("claude".to_string()),
                     working_dir: Some("/workspace".to_string()),

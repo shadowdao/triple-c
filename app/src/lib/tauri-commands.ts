@@ -49,6 +49,12 @@ export const closeTerminalSession = (sessionId: string) =>
   invoke<void>("close_terminal_session", { sessionId });
 export const pasteImageToTerminal = (sessionId: string, imageData: number[]) =>
   invoke<string>("paste_image_to_terminal", { sessionId, imageData });
+export const startAudioBridge = (sessionId: string) =>
+  invoke<void>("start_audio_bridge", { sessionId });
+export const sendAudioData = (sessionId: string, data: number[]) =>
+  invoke<void>("send_audio_data", { sessionId, data });
+export const stopAudioBridge = (sessionId: string) =>
+  invoke<void>("stop_audio_bridge", { sessionId });
 
 // MCP Servers
 export const listMcpServers = () => invoke<McpServer[]>("list_mcp_servers");
