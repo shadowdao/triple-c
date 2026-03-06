@@ -36,11 +36,10 @@ pub async fn list_container_files(
     let cmd = vec![
         "find".to_string(),
         path.clone(),
+        "-mindepth".to_string(),
+        "1".to_string(),
         "-maxdepth".to_string(),
         "1".to_string(),
-        "-not".to_string(),
-        "-name".to_string(),
-        ".".to_string(),
         "-printf".to_string(),
         "%f\t%y\t%s\t%T@\t%m\n".to_string(),
     ];
