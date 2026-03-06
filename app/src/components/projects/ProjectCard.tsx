@@ -342,6 +342,7 @@ export default function ProjectCard({ project }: Props) {
         ) : (
           <span
             className="text-sm font-medium truncate flex-1 cursor-text"
+            title="Double-click to rename"
             onDoubleClick={(e) => { e.stopPropagation(); setIsEditingName(true); }}
           >
             {project.name}
