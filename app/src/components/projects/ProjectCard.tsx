@@ -11,6 +11,7 @@ import PortMappingsModal from "./PortMappingsModal";
 import ClaudeInstructionsModal from "./ClaudeInstructionsModal";
 import ContainerProgressModal from "./ContainerProgressModal";
 import FileManagerModal from "./FileManagerModal";
+import ConfirmRemoveModal from "./ConfirmRemoveModal";
 
 interface Props {
   project: Project;
@@ -32,7 +33,7 @@ export default function ProjectCard({ project }: Props) {
   const [progressMsg, setProgressMsg] = useState<string | null>(null);
   const [activeOperation, setActiveOperation] = useState<"starting" | "stopping" | "resetting" | null>(null);
   const [operationCompleted, setOperationCompleted] = useState(false);
-  const [showRemoveConfirm, setShowRemoveConfirm] = useState(false);
+  const [showRemoveModal, setShowRemoveModal] = useState(false);
   const [isEditingName, setIsEditingName] = useState(false);
   const [editName, setEditName] = useState(project.name);
   const isSelected = selectedProjectId === project.id;
@@ -435,34 +436,12 @@ export default function ProjectCard({ project }: Props) {
               disabled={false}
               label={showConfig ? "Hide" : "Config"}
             />
-            {showRemoveConfirm ? (
-              <span className="inline-flex items-center gap-1 text-xs">
-                <span className="text-[var(--text-secondary)]">Remove?</span>
-                <button
-                  onClick={async (e) => {
-                    e.stopPropagation();
-                    setShowRemoveConfirm(false);
-                    await remove(project.id);
-                  }}
-                  className="px-1.5 py-0.5 rounded text-white bg-[var(--error)] hover:opacity-80 transition-colors"
-                >
-                  Yes
-                </button>
-                <button
-                  onClick={(e) => { e.stopPropagation(); setShowRemoveConfirm(false); }}
-                  className="px-1.5 py-0.5 rounded text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-primary)] transition-colors"
-                >
-                  No
-                </button>
-              </span>
-            ) : (
-              <ActionButton
-                onClick={() => setShowRemoveConfirm(true)}
-                disabled={loading}
-                label="Remove"
-                danger
-              />
-            )}
+            <ActionButton
+              onClick={() => setShowRemoveModal(true)}
+              disabled={loading}
+              label="Remove"
+              danger
+            />
           </div>
 
           {/* Config panel */}
@@ -922,6 +901,17 @@ export default function ProjectCard({ project }: Props) {
           projectId={project.id}
           projectName={project.name}
           onClose={() => setShowFileManager(false)}
+        />
+      )}
+
+      {showRemoveModal && (
+        <ConfirmRemoveModal
+          projectName={project.name}
+          onConfirm={async () => {
+            setShowRemoveModal(false);
+            await remove(project.id);
+          }}
+          onCancel={() => setShowRemoveModal(false)}
         />
       )}
 
