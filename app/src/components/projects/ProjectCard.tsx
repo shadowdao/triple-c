@@ -30,6 +30,9 @@ export default function ProjectCard({ project }: Props) {
   const [progressMsg, setProgressMsg] = useState<string | null>(null);
   const [activeOperation, setActiveOperation] = useState<"starting" | "stopping" | "resetting" | null>(null);
   const [operationCompleted, setOperationCompleted] = useState(false);
+  const [showRemoveConfirm, setShowRemoveConfirm] = useState(false);
+  const [isEditingName, setIsEditingName] = useState(false);
+  const [editName, setEditName] = useState(project.name);
   const isSelected = selectedProjectId === project.id;
   const isStopped = project.status === "stopped" || project.status === "error";
 
@@ -54,6 +57,7 @@ export default function ProjectCard({ project }: Props) {
 
   // Sync local state when project prop changes (e.g., after save or external update)
   useEffect(() => {
+    setEditName(project.name);
     setPaths(project.paths ?? []);
     setSshKeyPath(project.ssh_key_path ?? "");
     setGitName(project.git_user_name ?? "");
@@ -309,7 +313,40 @@ export default function ProjectCard({ project }: Props) {
     >
       <div className="flex items-center gap-2">
         <span className={`w-2 h-2 rounded-full flex-shrink-0 ${statusColor}`} />
-        <span className="text-sm font-medium truncate flex-1">{project.name}</span>
+        {isEditingName ? (
+          <input
+            autoFocus
+            value={editName}
+            onChange={(e) => setEditName(e.target.value)}
+            onBlur={async () => {
+              setIsEditingName(false);
+              const trimmed = editName.trim();
+              if (trimmed && trimmed !== project.name) {
+                try {
+                  await update({ ...project, name: trimmed });
+                } catch (err) {
+                  console.error("Failed to rename project:", err);
+                  setEditName(project.name);
+                }
+              } else {
+                setEditName(project.name);
+              }
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+              if (e.key === "Escape") { setEditName(project.name); setIsEditingName(false); }
+            }}
+            onClick={(e) => e.stopPropagation()}
+            className="text-sm font-medium flex-1 min-w-0 px-1 py-0 bg-[var(--bg-primary)] border border-[var(--accent)] rounded text-[var(--text-primary)] focus:outline-none"
+          />
+        ) : (
+          <span
+            className="text-sm font-medium truncate flex-1 cursor-text"
+            onDoubleClick={(e) => { e.stopPropagation(); setIsEditingName(true); }}
+          >
+            {project.name}
+          </span>
+        )}
       </div>
       <div className="mt-0.5 ml-4 space-y-0.5">
         {project.paths.map((pp, i) => (
@@ -385,16 +422,34 @@ export default function ProjectCard({ project }: Props) {
               disabled={false}
               label={showConfig ? "Hide" : "Config"}
             />
-            <ActionButton
-              onClick={async () => {
-                if (confirm(`Remove project "${project.name}"?`)) {
-                  await remove(project.id);
-                }
-              }}
-              disabled={loading}
-              label="Remove"
-              danger
-            />
+            {showRemoveConfirm ? (
+              <span className="inline-flex items-center gap-1 text-xs">
+                <span className="text-[var(--text-secondary)]">Remove?</span>
+                <button
+                  onClick={async (e) => {
+                    e.stopPropagation();
+                    setShowRemoveConfirm(false);
+                    await remove(project.id);
+                  }}
+                  className="px-1.5 py-0.5 rounded text-white bg-[var(--error)] hover:opacity-80 transition-colors"
+                >
+                  Yes
+                </button>
+                <button
+                  onClick={(e) => { e.stopPropagation(); setShowRemoveConfirm(false); }}
+                  className="px-1.5 py-0.5 rounded text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-primary)] transition-colors"
+                >
+                  No
+                </button>
+              </span>
+            ) : (
+              <ActionButton
+                onClick={() => setShowRemoveConfirm(true)}
+                disabled={loading}
+                label="Remove"
+                danger
+              />
+            )}
           </div>
 
           {/* Config panel */}
