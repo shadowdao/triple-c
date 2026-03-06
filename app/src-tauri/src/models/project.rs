@@ -34,6 +34,8 @@ pub struct Project {
     pub auth_mode: AuthMode,
     pub bedrock_config: Option<BedrockConfig>,
     pub allow_docker_access: bool,
+    #[serde(default)]
+    pub mission_control_enabled: bool,
     pub ssh_key_path: Option<String>,
     #[serde(skip_serializing, default)]
     pub git_token: Option<String>,
@@ -125,6 +127,7 @@ impl Project {
             auth_mode: AuthMode::default(),
             bedrock_config: None,
             allow_docker_access: false,
+            mission_control_enabled: false,
             ssh_key_path: None,
             git_token: None,
             git_user_name: None,

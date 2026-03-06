@@ -116,6 +116,24 @@ if [ -n "$CLAUDE_INSTRUCTIONS" ]; then
     unset CLAUDE_INSTRUCTIONS
 fi
 
+# ── Mission Control setup ───────────────────────────────────────────────────
+if [ "$MISSION_CONTROL_ENABLED" = "1" ]; then
+    MC_HOME="/home/claude/mission-control"
+    MC_LINK="/workspace/mission-control"
+    if [ ! -d "$MC_HOME/.git" ]; then
+        echo "entrypoint: cloning mission-control..."
+        su -s /bin/bash claude -c \
+            'git clone https://github.com/msieurthenardier/mission-control.git /home/claude/mission-control' \
+            || echo "entrypoint: warning — failed to clone mission-control"
+    else
+        echo "entrypoint: mission-control already present, skipping clone"
+    fi
+    # Symlink into workspace so Claude sees it at /workspace/mission-control
+    ln -sfn "$MC_HOME" "$MC_LINK"
+    chown -h claude:claude "$MC_LINK"
+    unset MISSION_CONTROL_ENABLED
+fi
+
 # ── MCP server configuration ────────────────────────────────────────────────
 # Merge MCP server config into ~/.claude.json (preserves existing keys like
 # OAuth tokens). Creates the file if it doesn't exist.

@@ -23,6 +23,7 @@ export interface Project {
   auth_mode: AuthMode;
   bedrock_config: BedrockConfig | null;
   allow_docker_access: boolean;
+  mission_control_enabled: boolean;
   ssh_key_path: string | null;
   git_token: string | null;
   git_user_name: string | null;

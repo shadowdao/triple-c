@@ -40,6 +40,54 @@ After tasks run, check notifications with `triple-c-scheduler notifications` and
 ### Timezone
 Scheduled times use the container's configured timezone (check with `date`). If no timezone is configured, UTC is used."#;
 
+const MISSION_CONTROL_GLOBAL_INSTRUCTIONS: &str = r#"## Mission Control
+
+The `/workspace/mission-control/` directory contains **Flight Control** — an AI-first development methodology for structured project management. Use it for all project work.
+
+### How It Works
+
+- **Mission Control is a tool, not a project.** It provides skills and methodology for managing other projects.
+- All Flight Control skills live in `/workspace/mission-control/.claude/skills/`
+- The projects registry at `/workspace/mission-control/projects.md` lists all active projects
+
+### When to Use
+
+When working on any project that has a `.flightops/` directory, follow the Flight Control methodology:
+1. Read the project's `.flightops/ARTIFACTS.md` to understand artifact storage
+2. Read `.flightops/FLIGHT_OPERATIONS.md` for the implementation workflow
+3. Use Mission Control skills for planning and execution
+
+### Available Skills
+
+| Skill | When to Use |
+|-------|-------------|
+| `/init-project` | Setting up a new project for Flight Control |
+| `/mission` | Defining new work outcomes (days-to-weeks scope) |
+| `/flight` | Creating technical specs from missions (hours-to-days scope) |
+| `/leg` | Generating implementation steps from flights (minutes-to-hours scope) |
+| `/agentic-workflow` | Executing legs with multi-agent workflow (implement, review, commit) |
+| `/flight-debrief` | Post-flight analysis after a flight lands |
+| `/mission-debrief` | Post-mission retrospective after completion |
+| `/daily-briefing` | Cross-project status report |
+
+### Key Rules
+
+- **Planning skills produce artifacts only** — never modify source code directly
+- **Phase gates require human confirmation** — missions before flights, flights before legs
+- **Legs are immutable once in-flight** — create new ones instead of modifying
+- **`/agentic-workflow` orchestrates implementation** — it spawns separate Developer and Reviewer agents
+- **Artifacts live in the target project** — not in mission-control"#;
+
+const MISSION_CONTROL_PROJECT_INSTRUCTIONS: &str = r#"## Flight Operations
+
+This project uses [Flight Control](https://github.com/msieurthenardier/mission-control) for structured development.
+
+**Before any mission/flight/leg work, read these files in order:**
+1. `.flightops/README.md` — What the flightops directory contains
+2. `.flightops/FLIGHT_OPERATIONS.md` — **The workflow you MUST follow**
+3. `.flightops/ARTIFACTS.md` — Where all artifacts are stored
+4. `.flightops/agent-crews/` — Project crew definitions for each phase (read the relevant crew file)"#;
+
 /// Build the full CLAUDE_INSTRUCTIONS value by merging global + project
 /// instructions, appending port mapping docs, and appending scheduler docs.
 /// Used by both create_container() and container_needs_recreation() to ensure
@@ -48,8 +96,13 @@ fn build_claude_instructions(
     global_instructions: Option<&str>,
     project_instructions: Option<&str>,
     port_mappings: &[PortMapping],
+    mission_control_enabled: bool,
 ) -> Option<String> {
-    let mut combined = merge_claude_instructions(global_instructions, project_instructions);
+    let mut combined = merge_claude_instructions(
+        global_instructions,
+        project_instructions,
+        mission_control_enabled,
+    );
 
     if !port_mappings.is_empty() {
         let mut port_lines: Vec<String> = Vec::new();
@@ -116,14 +169,37 @@ fn merge_custom_env_vars(global: &[EnvVar], project: &[EnvVar]) -> Vec<EnvVar> {
 }
 
 /// Merge global and per-project Claude instructions into a single string.
+/// When mission_control_enabled is true, appends Mission Control global
+/// instructions after global and project instructions after project.
 fn merge_claude_instructions(
     global_instructions: Option<&str>,
     project_instructions: Option<&str>,
+    mission_control_enabled: bool,
 ) -> Option<String> {
-    match (global_instructions, project_instructions) {
+    // Build the global portion (user global + optional MC global)
+    let global_part = if mission_control_enabled {
+        match global_instructions {
+            Some(g) => Some(format!("{}\n\n{}", g, MISSION_CONTROL_GLOBAL_INSTRUCTIONS)),
+            None => Some(MISSION_CONTROL_GLOBAL_INSTRUCTIONS.to_string()),
+        }
+    } else {
+        global_instructions.map(|g| g.to_string())
+    };
+
+    // Build the project portion (user project + optional MC project)
+    let project_part = if mission_control_enabled {
+        match project_instructions {
+            Some(p) => Some(format!("{}\n\n{}", p, MISSION_CONTROL_PROJECT_INSTRUCTIONS)),
+            None => Some(MISSION_CONTROL_PROJECT_INSTRUCTIONS.to_string()),
+        }
+    } else {
+        project_instructions.map(|p| p.to_string())
+    };
+
+    match (global_part, project_part) {
         (Some(g), Some(p)) => Some(format!("{}\n\n{}", g, p)),
-        (Some(g), None) => Some(g.to_string()),
-        (None, Some(p)) => Some(p.to_string()),
+        (Some(g), None) => Some(g),
+        (None, Some(p)) => Some(p),
         (None, None) => None,
     }
 }
@@ -426,11 +502,17 @@ pub async fn create_container(
         }
     }
 
+    // Mission Control env var
+    if project.mission_control_enabled {
+        env_vars.push("MISSION_CONTROL_ENABLED=1".to_string());
+    }
+
     // Claude instructions (global + per-project, plus port mapping info + scheduler docs)
     let combined_instructions = build_claude_instructions(
         global_claude_instructions,
         project.claude_instructions.as_deref(),
         &project.port_mappings,
+        project.mission_control_enabled,
     );
 
     if let Some(ref instructions) = combined_instructions {
@@ -567,6 +649,7 @@ pub async fn create_container(
     labels.insert("triple-c.image".to_string(), image_name.to_string());
     labels.insert("triple-c.timezone".to_string(), timezone.unwrap_or("").to_string());
     labels.insert("triple-c.mcp-fingerprint".to_string(), compute_mcp_fingerprint(mcp_servers));
+    labels.insert("triple-c.mission-control".to_string(), project.mission_control_enabled.to_string());
 
     let host_config = HostConfig {
         mounts: Some(mounts),
@@ -885,11 +968,20 @@ pub async fn container_needs_recreation(
         return Ok(true);
     }
 
+    // ── Mission Control ────────────────────────────────────────────────────
+    let expected_mc = project.mission_control_enabled.to_string();
+    let container_mc = get_label("triple-c.mission-control").unwrap_or_else(|| "false".to_string());
+    if container_mc != expected_mc {
+        log::info!("Mission Control mismatch (container={:?}, expected={:?})", container_mc, expected_mc);
+        return Ok(true);
+    }
+
     // ── Claude instructions ───────────────────────────────────────────────
     let expected_instructions = build_claude_instructions(
         global_claude_instructions,
         project.claude_instructions.as_deref(),
         &project.port_mappings,
+        project.mission_control_enabled,
     );
     let container_instructions = get_env("CLAUDE_INSTRUCTIONS");
     if container_instructions.as_deref() != expected_instructions.as_deref() {

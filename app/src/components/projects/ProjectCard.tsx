@@ -632,6 +632,28 @@ export default function ProjectCard({ project }: Props) {
                 </button>
               </div>
 
+              {/* Mission Control toggle */}
+              <div className="flex items-center gap-2">
+                <label className="text-xs text-[var(--text-secondary)]">Mission Control</label>
+                <button
+                  onClick={async () => {
+                    try {
+                      await update({ ...project, mission_control_enabled: !project.mission_control_enabled });
+                    } catch (err) {
+                      console.error("Failed to update Mission Control setting:", err);
+                    }
+                  }}
+                  disabled={!isStopped}
+                  className={`px-2 py-0.5 text-xs rounded transition-colors disabled:opacity-50 ${
+                    project.mission_control_enabled
+                      ? "bg-[var(--success)] text-white"
+                      : "bg-[var(--bg-primary)] border border-[var(--border-color)] text-[var(--text-secondary)]"
+                  }`}
+                >
+                  {project.mission_control_enabled ? "ON" : "OFF"}
+                </button>
+              </div>
+
               {/* Environment Variables */}
               <div className="flex items-center justify-between">
                 <label className="text-xs text-[var(--text-secondary)]">
