@@ -78,6 +78,7 @@ export interface TerminalSession {
   id: string;
   projectId: string;
   projectName: string;
+  sessionType: "claude" | "bash";
 }
 
 export type ImageSource = "registry" | "local_build" | "custom";
@@ -134,4 +135,13 @@ export interface McpServer {
   container_port: number | null;
   created_at: string;
   updated_at: string;
+}
+
+export interface FileEntry {
+  name: string;
+  path: string;
+  is_directory: boolean;
+  size: number;
+  modified: string;
+  permissions: string;
 }

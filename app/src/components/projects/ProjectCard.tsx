@@ -10,6 +10,7 @@ import EnvVarsModal from "./EnvVarsModal";
 import PortMappingsModal from "./PortMappingsModal";
 import ClaudeInstructionsModal from "./ClaudeInstructionsModal";
 import ContainerProgressModal from "./ContainerProgressModal";
+import FileManagerModal from "./FileManagerModal";
 
 interface Props {
   project: Project;
@@ -27,6 +28,7 @@ export default function ProjectCard({ project }: Props) {
   const [showEnvVarsModal, setShowEnvVarsModal] = useState(false);
   const [showPortMappingsModal, setShowPortMappingsModal] = useState(false);
   const [showClaudeInstructionsModal, setShowClaudeInstructionsModal] = useState(false);
+  const [showFileManager, setShowFileManager] = useState(false);
   const [progressMsg, setProgressMsg] = useState<string | null>(null);
   const [activeOperation, setActiveOperation] = useState<"starting" | "stopping" | "resetting" | null>(null);
   const [operationCompleted, setOperationCompleted] = useState(false);
@@ -134,6 +136,14 @@ export default function ProjectCard({ project }: Props) {
   const handleOpenTerminal = async () => {
     try {
       await openTerminal(project.id, project.name);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const handleOpenBashShell = async () => {
+    try {
+      await openTerminal(project.id, project.name, "bash");
     } catch (e) {
       setError(String(e));
     }
@@ -409,6 +419,8 @@ export default function ProjectCard({ project }: Props) {
               <>
                 <ActionButton onClick={handleStop} disabled={loading} label="Stop" />
                 <ActionButton onClick={handleOpenTerminal} disabled={loading} label="Terminal" accent />
+                <ActionButton onClick={handleOpenBashShell} disabled={loading} label="Shell" />
+                <ActionButton onClick={() => setShowFileManager(true)} disabled={loading} label="Files" />
               </>
             ) : (
               <>
@@ -902,6 +914,14 @@ export default function ProjectCard({ project }: Props) {
             await update({ ...project, claude_instructions: instructions || null });
           }}
           onClose={() => setShowClaudeInstructionsModal(false)}
+        />
+      )}
+
+      {showFileManager && (
+        <FileManagerModal
+          projectId={project.id}
+          projectName={project.name}
+          onClose={() => setShowFileManager(false)}
         />
       )}
 

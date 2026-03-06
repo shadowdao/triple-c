@@ -277,3 +277,41 @@ impl ExecSessionManager {
         Ok(format!("/tmp/{}", file_name))
     }
 }
+
+/// Run a one-shot (non-interactive) exec command in a container and collect stdout.
+pub async fn exec_oneshot(container_id: &str, cmd: Vec<String>) -> Result<String, String> {
+    let docker = get_docker()?;
+
+    let exec = docker
+        .create_exec(
+            container_id,
+            CreateExecOptions {
+                attach_stdout: Some(true),
+                attach_stderr: Some(true),
+                cmd: Some(cmd),
+                user: Some("claude".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|e| format!("Failed to create exec: {}", e))?;
+
+    let result = docker
+        .start_exec(&exec.id, None)
+        .await
+        .map_err(|e| format!("Failed to start exec: {}", e))?;
+
+    match result {
+        StartExecResults::Attached { mut output, .. } => {
+            let mut stdout = String::new();
+            while let Some(msg) = output.next().await {
+                match msg {
+                    Ok(data) => stdout.push_str(&String::from_utf8_lossy(&data.into_bytes())),
+                    Err(e) => return Err(format!("Exec output error: {}", e)),
+                }
+            }
+            Ok(stdout)
+        }
+        StartExecResults::Detached => Err("Exec started in detached mode".to_string()),
+    }
+}

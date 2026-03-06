@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, McpServer } from "./types";
+import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, McpServer, FileEntry } from "./types";
 
 // Docker
 export const checkDocker = () => invoke<boolean>("check_docker");
@@ -39,8 +39,8 @@ export const detectHostTimezone = () =>
   invoke<string>("detect_host_timezone");
 
 // Terminal
-export const openTerminalSession = (projectId: string, sessionId: string) =>
-  invoke<void>("open_terminal_session", { projectId, sessionId });
+export const openTerminalSession = (projectId: string, sessionId: string, sessionType?: string) =>
+  invoke<void>("open_terminal_session", { projectId, sessionId, sessionType });
 export const terminalInput = (sessionId: string, data: number[]) =>
   invoke<void>("terminal_input", { sessionId, data });
 export const terminalResize = (sessionId: string, cols: number, rows: number) =>
@@ -64,6 +64,14 @@ export const updateMcpServer = (server: McpServer) =>
   invoke<McpServer>("update_mcp_server", { server });
 export const removeMcpServer = (serverId: string) =>
   invoke<void>("remove_mcp_server", { serverId });
+
+// Files
+export const listContainerFiles = (projectId: string, path: string) =>
+  invoke<FileEntry[]>("list_container_files", { projectId, path });
+export const downloadContainerFile = (projectId: string, containerPath: string, hostPath: string) =>
+  invoke<void>("download_container_file", { projectId, containerPath, hostPath });
+export const uploadFileToContainer = (projectId: string, hostPath: string, containerDir: string) =>
+  invoke<void>("upload_file_to_container", { projectId, hostPath, containerDir });
 
 // Updates
 export const getAppVersion = () => invoke<string>("get_app_version");

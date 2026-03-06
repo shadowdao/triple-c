@@ -73,6 +73,7 @@ exec claude --dangerously-skip-permissions
 pub async fn open_terminal_session(
     project_id: String,
     session_id: String,
+    session_type: Option<String>,
     app_handle: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
@@ -86,7 +87,10 @@ pub async fn open_terminal_session(
         .as_ref()
         .ok_or_else(|| "Container not running".to_string())?;
 
-    let cmd = build_terminal_cmd(&project, &state);
+    let cmd = match session_type.as_deref() {
+        Some("bash") => vec!["bash".to_string(), "-l".to_string()],
+        _ => build_terminal_cmd(&project, &state),
+    };
 
     let output_event = format!("terminal-output-{}", session_id);
     let exit_event = format!("terminal-exit-{}", session_id);

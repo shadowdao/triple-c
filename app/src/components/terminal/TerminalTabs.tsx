@@ -23,7 +23,9 @@ export default function TerminalTabs() {
               : "text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
           }`}
         >
-          <span className="truncate max-w-[120px]">{session.projectName}</span>
+          <span className="truncate max-w-[120px]">
+            {session.projectName}{session.sessionType === "bash" ? " (bash)" : ""}
+          </span>
           <button
             onClick={(e) => {
               e.stopPropagation();
