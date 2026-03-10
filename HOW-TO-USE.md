@@ -225,6 +225,17 @@ Click **Edit** to write per-project instructions for Claude Code. These are writ
 
 Triple-C supports [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) servers, which extend Claude Code with access to external tools and data sources. MCP servers are configured in a **global library** and **enabled per-project**.
 
+### How It Works
+
+There are two dimensions to MCP server configuration:
+
+| | **Manual** (no Docker image) | **Docker** (Docker image specified) |
+|---|---|---|
+| **Stdio** | Command runs inside the project container | Command runs in a separate MCP container via `docker exec` |
+| **HTTP** | Connects to a URL you provide | Runs in a separate container, reached by hostname on a shared Docker network |
+
+**Docker images are pulled automatically** if not already present when the project starts.
+
 ### Accessing MCP Configuration
 
 Click the **MCP** tab in the sidebar to open the MCP server library. This is where you define all available MCP servers.
@@ -232,43 +243,103 @@ Click the **MCP** tab in the sidebar to open the MCP server library. This is whe
 ### Adding an MCP Server
 
 1. Type a name in the input field and click **Add**.
-2. Configure the server in its card:
+2. Expand the server card and configure it.
 
-| Setting | Description |
-|---------|-------------|
-| **Docker Image** | Optional. If provided, the server runs as an isolated Docker container. |
-| **Transport Type** | **Stdio** (command-line) or **HTTP** (network endpoint) |
+The key decision is whether to set a **Docker Image**:
+- **With Docker image** — The MCP server runs in its own isolated container. Best for servers that need specific dependencies or system-level packages.
+- **Without Docker image** (manual) — The command runs directly inside your project container. Best for lightweight npx-based servers that just need Node.js.
 
-#### Stdio Mode (Manual)
-- **Command** — The executable to run (e.g., `npx`)
-- **Arguments** — Space-separated arguments
-- **Environment Variables** — Key-value pairs passed to the command
+Then choose the **Transport Type**:
+- **Stdio** — The MCP server communicates over stdin/stdout. This is the most common type.
+- **HTTP** — The MCP server exposes an HTTP endpoint (streamable HTTP transport).
 
-#### HTTP Mode (Manual)
-- **URL** — The MCP endpoint (e.g., `http://localhost:3000/mcp`)
-- **Headers** — Custom HTTP headers
+### Configuration Examples
 
-#### Docker Mode
-When a Docker image is specified, the server runs as a container on a per-project network:
-- **Container Port** — Port the MCP server listens on inside its container (default: 3000)
-- **Environment Variables** — Injected into the Docker container
+#### Example 1: Filesystem Server (Stdio, Manual)
+
+A simple npx-based server that runs inside the project container. No Docker image needed since Node.js is already installed.
+
+| Field | Value |
+|-------|-------|
+| **Docker Image** | *(empty)* |
+| **Transport** | Stdio |
+| **Command** | `npx` |
+| **Arguments** | `-y @modelcontextprotocol/server-filesystem /workspace` |
+
+This gives Claude Code access to browse and read files via MCP. The command runs directly inside the project container using the pre-installed Node.js.
+
+#### Example 2: GitHub Server (Stdio, Manual)
+
+Another npx-based server, with an environment variable for authentication.
+
+| Field | Value |
+|-------|-------|
+| **Docker Image** | *(empty)* |
+| **Transport** | Stdio |
+| **Command** | `npx` |
+| **Arguments** | `-y @modelcontextprotocol/server-github` |
+| **Environment Variables** | `GITHUB_PERSONAL_ACCESS_TOKEN` = `ghp_your_token` |
+
+#### Example 3: Custom MCP Server (HTTP, Docker)
+
+An MCP server packaged as a Docker image that exposes an HTTP endpoint.
+
+| Field | Value |
+|-------|-------|
+| **Docker Image** | `myregistry/my-mcp-server:latest` |
+| **Transport** | HTTP |
+| **Container Port** | `8080` |
+| **Environment Variables** | `API_KEY` = `your_key` |
+
+Triple-C will:
+1. Pull the image automatically if not present
+2. Start the container on the project's bridge network
+3. Configure Claude Code to reach it at `http://triple-c-mcp-{id}:8080/mcp`
+
+The hostname is the MCP container's name on the Docker network — **not** `localhost`.
+
+#### Example 4: Database Server (Stdio, Docker)
+
+An MCP server that needs its own runtime environment, communicating over stdio.
+
+| Field | Value |
+|-------|-------|
+| **Docker Image** | `mcp/postgres-server:latest` |
+| **Transport** | Stdio |
+| **Command** | `node` |
+| **Arguments** | `dist/index.js` |
+| **Environment Variables** | `DATABASE_URL` = `postgresql://user:pass@host:5432/db` |
+
+Triple-C will:
+1. Pull the image and start it on the project network
+2. Configure Claude Code to communicate via `docker exec -i triple-c-mcp-{id} node dist/index.js`
+3. Automatically enable Docker socket access on the project container (required for `docker exec`)
 
 ### Enabling MCP Servers Per-Project
 
-In a project's configuration panel, the **MCP Servers** section shows checkboxes for all globally defined servers. Toggle each server on or off for that project. Changes require a container restart.
+In a project's configuration panel (click **Config**), the **MCP Servers** section shows checkboxes for all globally defined servers. Toggle each server on or off for that project. Changes take effect on the next container start.
 
 ### How Docker-Based MCP Works
 
 When a project with Docker-based MCP servers starts:
 
-1. A dedicated **bridge network** is created for the project (`triple-c-net-{projectId}`)
-2. Each enabled Docker MCP server gets its own container on that network
-3. The main project container is connected to the same network
-4. MCP server configuration is injected into Claude Code's config file
+1. Missing Docker images are **automatically pulled** (progress shown in the progress modal)
+2. A dedicated **bridge network** is created for the project (`triple-c-net-{projectId}`)
+3. Each enabled Docker MCP server gets its own container on that network
+4. The main project container is connected to the same network
+5. MCP server configuration is written to `~/.claude.json` inside the container
 
-**Stdio + Docker** servers communicate via `docker exec`, which automatically enables Docker socket access on the main container. **HTTP + Docker** servers are reached by hostname on the shared network (e.g., `http://triple-c-mcp-{serverId}:3000/mcp`).
+**Networking**: Docker-based MCP containers are reached by their container name as a hostname (e.g., `triple-c-mcp-{serverId}`), not by `localhost`. Docker DNS resolves these names automatically on the shared bridge network.
 
-When MCP configuration changes (servers added/removed/modified), the container is automatically recreated on the next start to apply the new configuration.
+**Stdio + Docker**: The project container uses `docker exec` to communicate with the MCP container over stdin/stdout. This automatically enables Docker socket access on the project container.
+
+**HTTP + Docker**: The project container connects to the MCP container's HTTP endpoint using the container hostname and port (e.g., `http://triple-c-mcp-{serverId}:3000/mcp`).
+
+**Manual (no Docker image)**: Stdio commands run directly inside the project container. HTTP URLs connect to wherever you point them (could be an external service or something running on the host).
+
+### Configuration Change Detection
+
+MCP server configuration is tracked via SHA-256 fingerprints stored as Docker labels. If you add, remove, or modify MCP servers for a project, the container is automatically recreated on the next start to apply the new configuration. The container filesystem is snapshotted first, so installed packages are preserved.
 
 ---
 

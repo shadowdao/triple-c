@@ -60,11 +60,22 @@ If the Docker access setting is toggled after a container already exists, the co
 
 Triple-C supports [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) servers as a Beta feature. MCP servers extend Claude Code with external tools and data sources.
 
+**Modes**: Each MCP server operates in one of four modes based on transport type and whether a Docker image is specified:
+
+| Mode | Where It Runs | How It Communicates |
+|------|--------------|---------------------|
+| Stdio + Manual | Inside the project container | Direct stdin/stdout (e.g., `npx -y @mcp/server`) |
+| Stdio + Docker | Separate MCP container | `docker exec -i <mcp-container> <command>` from the project container |
+| HTTP + Manual | External / user-provided | Connects to the URL you specify |
+| HTTP + Docker | Separate MCP container | `http://<mcp-container>:<port>/mcp` via Docker DNS on a shared bridge network |
+
+**Key behaviors**:
 - **Global library**: MCP servers are defined globally in the MCP sidebar tab and stored in `mcp_servers.json`
 - **Per-project toggles**: Each project enables/disables individual servers via checkboxes
-- **Docker isolation**: MCP servers can run as isolated Docker containers on a per-project bridge network (`triple-c-net-{projectId}`)
-- **Transport types**: Stdio (command-line) and HTTP (network endpoint), each with manual or Docker mode
+- **Auto-pull**: Docker images for MCP servers are pulled automatically if not present when the project starts
+- **Docker networking**: Docker-based MCP containers run on a per-project bridge network (`triple-c-net-{projectId}`), reachable by container name — not localhost
 - **Auto-detection**: Config changes are detected via SHA-256 fingerprints and trigger automatic container recreation
+- **Config injection**: MCP server configuration is written to `~/.claude.json` inside the container via the `MCP_SERVERS_JSON` environment variable, merged by the entrypoint using `jq`
 
 ### Mission Control Integration
 
