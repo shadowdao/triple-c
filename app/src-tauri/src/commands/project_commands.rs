@@ -202,6 +202,28 @@ pub async fn start_project_container(
 
         // Set up Docker network and MCP containers if needed
         let network_name = if !docker_mcp.is_empty() {
+            // Pull any missing MCP Docker images before starting containers
+            for server in &docker_mcp {
+                if let Some(ref image) = server.docker_image {
+                    if !docker::image_exists(image).await.unwrap_or(false) {
+                        emit_progress(
+                            &app_handle,
+                            &project_id,
+                            &format!("Pulling MCP image for '{}'...", server.name),
+                        );
+                        let image_clone = image.clone();
+                        let app_clone = app_handle.clone();
+                        let pid_clone = project_id.clone();
+                        let sname = server.name.clone();
+                        docker::pull_image(&image_clone, move |msg| {
+                            emit_progress(&app_clone, &pid_clone, &format!("[{}] {}", sname, msg));
+                        }).await.map_err(|e| {
+                            format!("Failed to pull MCP image '{}' for '{}': {}", image, server.name, e)
+                        })?;
+                    }
+                }
+            }
+
             emit_progress(&app_handle, &project_id, "Setting up MCP network...");
             let net = docker::ensure_project_network(&project.id).await?;
             emit_progress(&app_handle, &project_id, "Starting MCP containers...");

@@ -147,7 +147,7 @@ export default function McpServerCard({ server, onUpdate, onRemove }: Props) {
               className={inputCls}
             />
             <p className="text-xs text-[var(--text-secondary)] mt-0.5 opacity-60">
-              Set a Docker image to run this MCP server as a container. Leave empty for manual mode.
+              Set a Docker image to run this MCP server in its own container. Leave empty to run commands inside the project container. Images are pulled automatically if not present.
             </p>
           </div>
 
@@ -171,6 +171,14 @@ export default function McpServerCard({ server, onUpdate, onRemove }: Props) {
             </div>
           </div>
 
+          {/* Mode description */}
+          <p className="text-xs text-[var(--text-secondary)] opacity-60">
+            {transportType === "stdio" && isDocker && "Runs via docker exec in a separate MCP container."}
+            {transportType === "stdio" && !isDocker && "Runs inside the project container (e.g. npx commands)."}
+            {transportType === "http" && isDocker && "Runs in a separate container, reached by hostname on the project network."}
+            {transportType === "http" && !isDocker && "Connects to an MCP server at the URL you specify."}
+          </p>
+
           {/* Container Port (HTTP+Docker only) */}
           {transportType === "http" && isDocker && (
             <div>
@@ -183,7 +191,7 @@ export default function McpServerCard({ server, onUpdate, onRemove }: Props) {
                 className={inputCls}
               />
               <p className="text-xs text-[var(--text-secondary)] mt-0.5 opacity-60">
-                Port inside the MCP container (default: 3000)
+                Port the MCP server listens on inside its container. The URL is auto-generated as http://&lt;container&gt;:&lt;port&gt;/mcp on the project network.
               </p>
             </div>
           )}
