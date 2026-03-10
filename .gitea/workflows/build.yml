@@ -5,10 +5,12 @@ on:
     branches: [main]
     paths:
       - "container/**"
+      - ".gitea/workflows/build.yml"
   pull_request:
     branches: [main]
     paths:
       - "container/**"
+      - ".gitea/workflows/build.yml"
 
 env:
   REGISTRY: repo.anhonesthost.net

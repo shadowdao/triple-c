@@ -24,6 +24,8 @@ export const stopProjectContainer = (projectId: string) =>
   invoke<void>("stop_project_container", { projectId });
 export const rebuildProjectContainer = (projectId: string) =>
   invoke<Project>("rebuild_project_container", { projectId });
+export const reconcileProjectStatuses = () =>
+  invoke<Project[]>("reconcile_project_statuses");
 
 // Settings
 export const getSettings = () => invoke<AppSettings>("get_settings");

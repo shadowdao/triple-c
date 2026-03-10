@@ -154,13 +154,12 @@ The `.claude` configuration directory uses a **named Docker volume** (`triple-c-
 
 ### Authentication Modes
 
-Each project independently chooses one of three authentication methods:
+Each project independently chooses one of two authentication methods:
 
 | Mode | How It Works | When to Use |
 |------|-------------|-------------|
-| **Login (OAuth)** | User runs `claude login` or `/login` inside the terminal. OAuth URL opens in host browser via the web links addon. Token persists in the `.claude` config volume. | Personal use, interactive sessions |
-| **API Key** | Key stored in OS keychain, injected as `ANTHROPIC_API_KEY` env var at container creation. | Automated workflows, team-shared keys |
-| **AWS Bedrock** | Per-project AWS credentials (static, profile, or bearer token) injected as env vars. `~/.aws` config optionally bind-mounted read-only. | Enterprise environments using Bedrock |
+| **Anthropic (OAuth)** | User runs `claude login` or `/login` inside the terminal. OAuth URL opens in host browser via URL detection. Token persists in the `.claude` config volume. | Default — personal and team use |
+| **AWS Bedrock** | Per-project AWS credentials (static keys, profile, or bearer token) injected as env vars. `~/.aws` config optionally bind-mounted read-only. | Enterprise environments using Bedrock |
 
 ### UID/GID Remapping
 
@@ -213,66 +212,93 @@ The `TerminalView` component works around this with a **URL accumulator**:
 
 ```
 triple-c/
-├── LICENSE                     # MIT
-├── TECHNICAL.md                # This document
-├── Triple-C.md                 # Project overview
+├── README.md                      # Architecture overview
+├── TECHNICAL.md                   # This document
+├── HOW-TO-USE.md                  # User guide
+├── BUILDING.md                    # Build instructions
+├── CLAUDE.md                      # Claude Code instructions
 │
 ├── container/
-│   ├── Dockerfile              # Ubuntu 24.04 + all dev tools + Claude Code
-│   └── entrypoint.sh           # UID/GID remap, SSH setup, git config
+│   ├── Dockerfile                 # Ubuntu 24.04 + all dev tools + Claude Code
+│   ├── entrypoint.sh              # UID/GID remap, SSH setup, git config, MCP injection
+│   ├── osc52-clipboard            # Clipboard shim (xclip/xsel/pbcopy via OSC 52)
+│   ├── audio-shim                 # Audio capture shim (rec/arecord via FIFO)
+│   ├── triple-c-scheduler         # Bash-based cron task system
+│   └── triple-c-task-runner       # Task execution runner for scheduler
 │
-└── app/                        # Tauri v2 desktop application
-    ├── package.json            # React, xterm.js, zustand, tailwindcss
-    ├── vite.config.ts          # Vite bundler config
-    ├── index.html              # HTML entry point
+├── .gitea/
+│   └── workflows/
+│       ├── build-app.yml          # Build Tauri app (Linux/macOS/Windows)
+│       ├── build.yml              # Build container image (multi-arch)
+│       ├── sync-release.yml       # Mirror releases to GitHub
+│       └── backfill-releases.yml  # Bulk copy releases to GitHub
+│
+└── app/                           # Tauri v2 desktop application
+    ├── package.json               # React, xterm.js, zustand, tailwindcss
+    ├── vite.config.ts             # Vite bundler config
+    ├── index.html                 # HTML entry point
     │
-    ├── src/                    # React frontend
-    │   ├── main.tsx            # React DOM root
-    │   ├── App.tsx             # Top-level layout
-    │   ├── index.css           # CSS variables, dark theme, scrollbars
+    ├── src/                       # React frontend
+    │   ├── main.tsx               # React DOM root
+    │   ├── App.tsx                # Top-level layout
+    │   ├── index.css              # CSS variables, dark theme, scrollbars
     │   ├── store/
-    │   │   └── appState.ts     # Zustand store (projects, sessions, UI)
+    │   │   └── appState.ts        # Zustand store (projects, sessions, MCP, UI)
     │   ├── hooks/
-    │   │   ├── useDocker.ts    # Docker status, image build
-    │   │   ├── useProjects.ts  # Project CRUD operations
-    │   │   ├── useSettings.ts  # API key, app settings
-    │   │   └── useTerminal.ts  # Terminal I/O, resize, session events
+    │   │   ├── useDocker.ts       # Docker status, image build/pull
+    │   │   ├── useFileManager.ts  # File manager operations
+    │   │   ├── useMcpServers.ts   # MCP server CRUD
+    │   │   ├── useProjects.ts     # Project CRUD operations
+    │   │   ├── useSettings.ts     # App settings
+    │   │   ├── useTerminal.ts     # Terminal I/O, resize, session events
+    │   │   ├── useUpdates.ts      # App update checking
+    │   │   └── useVoice.ts        # Voice mode audio capture
     │   ├── lib/
-    │   │   ├── types.ts        # TypeScript interfaces matching Rust models
-    │   │   ├── tauri-commands.ts # Typed invoke() wrappers
-    │   │   └── constants.ts    # App-wide constants
+    │   │   ├── types.ts           # TypeScript interfaces matching Rust models
+    │   │   ├── tauri-commands.ts  # Typed invoke() wrappers
+    │   │   └── constants.ts       # App-wide constants
     │   └── components/
-    │       ├── layout/         # Sidebar, TopBar, StatusBar
-    │       ├── projects/       # ProjectList, ProjectCard, AddProjectDialog
-    │       ├── terminal/       # TerminalView (xterm.js), TerminalTabs
-    │       ├── settings/       # ApiKeyInput, DockerSettings, AwsSettings
-    │       └── containers/     # SiblingContainers
+    │       ├── layout/            # Sidebar, TopBar, StatusBar
+    │       ├── mcp/               # McpPanel, McpServerCard
+    │       ├── projects/          # ProjectCard, ProjectList, AddProjectDialog,
+    │       │                      # FileManagerModal, ContainerProgressModal, modals
+    │       ├── settings/          # SettingsPanel, DockerSettings, AwsSettings,
+    │       │                      # UpdateDialog
+    │       └── terminal/          # TerminalView (xterm.js), TerminalTabs, UrlToast
     │
-    └── src-tauri/              # Rust backend
-        ├── Cargo.toml          # Rust dependencies
-        ├── tauri.conf.json     # Tauri app configuration
+    └── src-tauri/                 # Rust backend
+        ├── Cargo.toml             # Rust dependencies
+        ├── tauri.conf.json        # Tauri app configuration
         ├── capabilities/
-        │   └── default.json    # Tauri v2 permission grants
+        │   └── default.json       # Tauri v2 permission grants
         └── src/
-            ├── lib.rs          # App builder, plugin + command registration
-            ├── main.rs         # Entry point
-            ├── commands/       # Tauri command handlers
-            │   ├── docker_commands.rs
-            │   ├── project_commands.rs
-            │   ├── settings_commands.rs
-            │   └── terminal_commands.rs
-            ├── docker/         # Docker API layer
-            │   ├── client.rs   # bollard singleton connection
-            │   ├── container.rs # Create, start, stop, remove, inspect
-            │   ├── exec.rs     # PTY exec sessions with bidirectional streaming
-            │   ├── image.rs    # Build from embedded Dockerfile, pull from registry
-            │   └── sibling.rs  # List non-Triple-C containers
-            ├── models/         # Data structures
-            │   ├── project.rs  # Project, AuthMode, BedrockConfig
-            │   └── container_config.rs
-            └── storage/        # Persistence
+            ├── lib.rs             # App builder, plugin + command registration
+            ├── main.rs            # Entry point
+            ├── logging.rs         # Log configuration
+            ├── commands/          # Tauri command handlers
+            │   ├── docker_commands.rs   # Docker status, image ops
+            │   ├── file_commands.rs     # File manager (list/download/upload)
+            │   ├── mcp_commands.rs      # MCP server CRUD
+            │   ├── project_commands.rs  # Start/stop/rebuild containers
+            │   ├── settings_commands.rs # Settings CRUD
+            │   ├── terminal_commands.rs # Terminal I/O, resize
+            │   └── update_commands.rs   # App update checking
+            ├── docker/            # Docker API layer
+            │   ├── client.rs      # bollard singleton connection
+            │   ├── container.rs   # Create, start, stop, remove, fingerprinting
+            │   ├── exec.rs        # PTY exec sessions with bidirectional streaming
+            │   ├── image.rs       # Build from Dockerfile, pull from registry
+            │   └── network.rs     # Per-project bridge networks for MCP
+            ├── models/            # Data structures
+            │   ├── project.rs     # Project, AuthMode, BedrockConfig
+            │   ├── mcp_server.rs  # MCP server configuration
+            │   ├── app_settings.rs # Global settings (image source, AWS, etc.)
+            │   ├── container_config.rs # Image name resolution
+            │   └── update_info.rs # Update metadata
+            └── storage/           # Persistence
                 ├── projects_store.rs  # JSON file with atomic writes
-                ├── settings_store.rs  # App settings
+                ├── mcp_store.rs       # MCP server persistence
+                ├── settings_store.rs  # App settings (Tauri plugin-store)
                 └── secure.rs          # OS keychain via keyring
 ```
 

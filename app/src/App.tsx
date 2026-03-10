@@ -10,6 +10,7 @@ import { useProjects } from "./hooks/useProjects";
 import { useMcpServers } from "./hooks/useMcpServers";
 import { useUpdates } from "./hooks/useUpdates";
 import { useAppState } from "./store/appState";
+import { reconcileProjectStatuses } from "./lib/tauri-commands";
 
 export default function App() {
   const { checkDocker, checkImage, startDockerPolling } = useDocker();
@@ -17,8 +18,8 @@ export default function App() {
   const { refresh } = useProjects();
   const { refresh: refreshMcp } = useMcpServers();
   const { loadVersion, checkForUpdates, startPeriodicCheck } = useUpdates();
-  const { sessions, activeSessionId } = useAppState(
-    useShallow(s => ({ sessions: s.sessions, activeSessionId: s.activeSessionId }))
+  const { sessions, activeSessionId, setProjects } = useAppState(
+    useShallow(s => ({ sessions: s.sessions, activeSessionId: s.activeSessionId, setProjects: s.setProjects }))
   );
 
   // Initialize on mount
@@ -28,6 +29,14 @@ export default function App() {
     checkDocker().then((available) => {
       if (available) {
         checkImage();
+        // Reconcile project statuses against actual Docker container state,
+        // then refresh the project list so the UI reflects reality.
+        reconcileProjectStatuses().then((projects) => {
+          setProjects(projects);
+        }).catch(() => {
+          // If reconciliation fails (e.g. Docker hiccup), just load from store
+          refresh();
+        });
       } else {
         stopPolling = startDockerPolling();
       }

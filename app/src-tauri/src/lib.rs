@@ -88,6 +88,7 @@ pub fn run() {
             commands::project_commands::start_project_container,
             commands::project_commands::stop_project_container,
             commands::project_commands::rebuild_project_container,
+            commands::project_commands::reconcile_project_statuses,
             // Settings
             commands::settings_commands::get_settings,
             commands::settings_commands::update_settings,

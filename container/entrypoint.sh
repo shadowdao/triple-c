@@ -131,6 +131,15 @@ if [ "$MISSION_CONTROL_ENABLED" = "1" ]; then
     # Symlink into workspace so Claude sees it at /workspace/mission-control
     ln -sfn "$MC_HOME" "$MC_LINK"
     chown -h claude:claude "$MC_LINK"
+
+    # Install skills to ~/.claude/skills/ so Claude Code discovers them automatically
+    if [ -d "$MC_HOME/.claude/skills" ]; then
+        mkdir -p /home/claude/.claude/skills
+        cp -r "$MC_HOME/.claude/skills/"* /home/claude/.claude/skills/ 2>/dev/null
+        chown -R claude:claude /home/claude/.claude/skills
+        echo "entrypoint: mission-control skills installed to ~/.claude/skills/"
+    fi
+
     unset MISSION_CONTROL_ENABLED
 fi
 

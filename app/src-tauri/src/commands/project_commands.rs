@@ -386,6 +386,46 @@ pub async fn rebuild_project_container(
     start_project_container(project_id, app_handle, state).await
 }
 
+/// Reconcile project statuses against actual Docker container state.
+/// Called by the frontend after Docker is confirmed available. Projects
+/// marked as Running whose containers are no longer running get reset
+/// to Stopped.
+#[tauri::command]
+pub async fn reconcile_project_statuses(
+    state: State<'_, AppState>,
+) -> Result<Vec<Project>, String> {
+    let projects = state.projects_store.list();
+
+    for project in &projects {
+        if project.status != ProjectStatus::Running && project.status != ProjectStatus::Error {
+            continue;
+        }
+
+        let is_running = if let Some(ref container_id) = project.container_id {
+            docker::is_container_running(container_id).await.unwrap_or(false)
+        } else {
+            false
+        };
+
+        if is_running {
+            log::info!(
+                "Project '{}' ({}) container is still running — keeping Running status",
+                project.name,
+                project.id
+            );
+        } else {
+            log::info!(
+                "Project '{}' ({}) container is not running — setting to Stopped",
+                project.name,
+                project.id
+            );
+            let _ = state.projects_store.update_status(&project.id, ProjectStatus::Stopped);
+        }
+    }
+
+    Ok(state.projects_store.list())
+}
+
 fn default_docker_socket() -> String {
     if cfg!(target_os = "windows") {
         "//./pipe/docker_engine".to_string()

@@ -47,8 +47,8 @@ The `/workspace/mission-control/` directory contains **Flight Control** — an A
 ### How It Works
 
 - **Mission Control is a tool, not a project.** It provides skills and methodology for managing other projects.
-- All Flight Control skills live in `/workspace/mission-control/.claude/skills/`
-- The projects registry at `/workspace/mission-control/projects.md` lists all active projects
+- All Flight Control skills are installed as personal skills in `~/.claude/skills/` and are automatically available as `/slash-commands`
+- The methodology docs and project registry live in `/workspace/mission-control/`
 
 ### When to Use
 
@@ -1028,6 +1028,16 @@ pub async fn get_container_info(project: &Project) -> Result<Option<ContainerInf
         }
     } else {
         Ok(None)
+    }
+}
+
+/// Check whether a Docker container is currently running.
+/// Returns false if the container doesn't exist or Docker is unavailable.
+pub async fn is_container_running(container_id: &str) -> Result<bool, String> {
+    let docker = get_docker()?;
+    match docker.inspect_container(container_id, None).await {
+        Ok(info) => Ok(info.state.and_then(|s| s.running).unwrap_or(false)),
+        Err(_) => Ok(false),
     }
 }
 

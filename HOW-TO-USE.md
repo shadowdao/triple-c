@@ -65,11 +65,11 @@ Switch to the **Projects** tab in the sidebar and click the **+** button.
 
 ### 3. Start the Container
 
-Select your project in the sidebar and click **Start**. The status dot changes from gray (stopped) to orange (starting) to green (running).
+Select your project in the sidebar and click **Start**. A progress modal appears showing real-time status as the container starts. The status dot changes from gray (stopped) to orange (starting) to green (running). The modal auto-closes on success.
 
 ### 4. Open a Terminal
 
-Click the **Terminal** button (highlighted in accent color) to open an interactive terminal session. A new tab appears in the top bar and an xterm.js terminal loads in the main area.
+Click the **Terminal** button to open an interactive terminal session. A new tab appears in the top bar and an xterm.js terminal loads in the main area.
 
 Claude Code launches automatically with `--dangerously-skip-permissions` inside the sandboxed container.
 
@@ -99,16 +99,16 @@ Claude Code launches automatically with `--dangerously-skip-permissions` inside 
 │  Sidebar   │                                        │
 │            │          Terminal View                  │
 │  Projects  │         (xterm.js)                     │
+│  MCP       │                                        │
 │  Settings  │                                        │
-│            │                                        │
 ├────────────┴────────────────────────────────────────┤
 │  StatusBar   X projects · X running · X terminals   │
 └─────────────────────────────────────────────────────┘
 ```
 
-- **TopBar** — Terminal tabs for switching between sessions. Status dots on the right show Docker connection (green = connected) and image availability (green = ready).
-- **Sidebar** — Toggle between the **Projects** list and **Settings** panel.
-- **Terminal View** — Interactive terminal powered by xterm.js with WebGL rendering.
+- **TopBar** — Terminal tabs for switching between sessions. Bash shell tabs show a "(bash)" suffix. Status dots on the right show Docker connection (green = connected) and image availability (green = ready).
+- **Sidebar** — Toggle between the **Projects** list, **MCP** server configuration, and **Settings** panel.
+- **Terminal View** — Interactive terminal powered by xterm.js with WebGL rendering. Includes a **Jump to Current** button that appears when you scroll up, so you can quickly return to the latest output.
 - **StatusBar** — Counts of total projects, running containers, and open terminal sessions.
 
 ---
@@ -134,10 +134,16 @@ Select a project in the sidebar to see its action buttons:
 |--------|---------------|--------------|
 | **Start** | Stopped | Creates (if needed) and starts the container |
 | **Stop** | Running | Stops the container but preserves its state |
-| **Terminal** | Running | Opens a new terminal session in this container |
+| **Terminal** | Running | Opens a new Claude Code terminal session |
+| **Shell** | Running | Opens a bash login shell in the container (no Claude Code) |
+| **Files** | Running | Opens the file manager to browse, download, and upload files |
 | **Reset** | Stopped | Destroys and recreates the container from scratch |
 | **Config** | Always | Toggles the configuration panel |
 | **Remove** | Stopped | Deletes the project and its container (with confirmation) |
+
+### Renaming a Project
+
+Double-click the project name in the sidebar to rename it inline. Press **Enter** to confirm or **Escape** to cancel.
 
 ### Container Lifecycle
 
@@ -146,6 +152,10 @@ Containers use a **stop/start** model. When you stop a container, everything ins
 **Reset** removes the container and creates a fresh one. However, your Claude Code configuration (including OAuth tokens from `claude login`) is stored in a separate Docker volume and survives resets.
 
 Only **Remove** deletes everything, including the config volume and any stored credentials.
+
+### Container Progress Feedback
+
+When starting, stopping, or resetting a container, a progress modal shows real-time status messages (e.g., "Setting up MCP network...", "Starting MCP containers...", "Creating container..."). If an error occurs, the modal displays the error with a **Close** button. A **Force Stop** option is available if the operation stalls. The modal auto-closes on success.
 
 ---
 
@@ -177,6 +187,19 @@ When enabled, the host Docker socket is mounted into the container so Claude Cod
 
 > Toggling this requires stopping and restarting the container to take effect.
 
+### Mission Control
+
+Toggle **Mission Control** to integrate [Flight Control](https://github.com/msieurthenardier/mission-control) — an AI-first development methodology — into the project. When enabled:
+
+- The Flight Control repository is automatically cloned into the container
+- Flight Control skills are installed to Claude Code's skill directory (`~/.claude/skills/`)
+- Project instructions are appended with Flight Control workflow guidance
+- The repository is symlinked at `/workspace/mission-control`
+
+Available skills include `/mission`, `/flight`, `/leg`, `/agentic-workflow`, `/flight-debrief`, `/mission-debrief`, `/daily-briefing`, and `/init-project`.
+
+> This setting can only be changed when the container is stopped. Toggling it triggers a container recreation on the next start.
+
 ### Environment Variables
 
 Click **Edit** to open the environment variables modal. Add key-value pairs that will be injected into the container. Per-project variables override global variables with the same key.
@@ -188,13 +211,64 @@ Click **Edit** to open the environment variables modal. Add key-value pairs that
 Click **Edit** to map host ports to container ports. This is useful when Claude Code starts a web server or other service inside the container and you want to access it from your host browser.
 
 Each mapping specifies:
-- **Host Port** — The port on your machine (1–65535)
-- **Container Port** — The port inside the container (1–65535)
+- **Host Port** — The port on your machine (1-65535)
+- **Container Port** — The port inside the container (1-65535)
 - **Protocol** — TCP (default) or UDP
 
 ### Claude Instructions
 
 Click **Edit** to write per-project instructions for Claude Code. These are written to `~/.claude/CLAUDE.md` inside the container and provide project-specific context. If you also have global instructions (in Settings), the global instructions come first, followed by the per-project instructions.
+
+---
+
+## MCP Servers (Beta)
+
+Triple-C supports [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) servers, which extend Claude Code with access to external tools and data sources. MCP servers are configured in a **global library** and **enabled per-project**.
+
+### Accessing MCP Configuration
+
+Click the **MCP** tab in the sidebar to open the MCP server library. This is where you define all available MCP servers.
+
+### Adding an MCP Server
+
+1. Type a name in the input field and click **Add**.
+2. Configure the server in its card:
+
+| Setting | Description |
+|---------|-------------|
+| **Docker Image** | Optional. If provided, the server runs as an isolated Docker container. |
+| **Transport Type** | **Stdio** (command-line) or **HTTP** (network endpoint) |
+
+#### Stdio Mode (Manual)
+- **Command** — The executable to run (e.g., `npx`)
+- **Arguments** — Space-separated arguments
+- **Environment Variables** — Key-value pairs passed to the command
+
+#### HTTP Mode (Manual)
+- **URL** — The MCP endpoint (e.g., `http://localhost:3000/mcp`)
+- **Headers** — Custom HTTP headers
+
+#### Docker Mode
+When a Docker image is specified, the server runs as a container on a per-project network:
+- **Container Port** — Port the MCP server listens on inside its container (default: 3000)
+- **Environment Variables** — Injected into the Docker container
+
+### Enabling MCP Servers Per-Project
+
+In a project's configuration panel, the **MCP Servers** section shows checkboxes for all globally defined servers. Toggle each server on or off for that project. Changes require a container restart.
+
+### How Docker-Based MCP Works
+
+When a project with Docker-based MCP servers starts:
+
+1. A dedicated **bridge network** is created for the project (`triple-c-net-{projectId}`)
+2. Each enabled Docker MCP server gets its own container on that network
+3. The main project container is connected to the same network
+4. MCP server configuration is injected into Claude Code's config file
+
+**Stdio + Docker** servers communicate via `docker exec`, which automatically enables Docker socket access on the main container. **HTTP + Docker** servers are reached by hostname on the shared network (e.g., `http://triple-c-mcp-{serverId}:3000/mcp`).
+
+When MCP configuration changes (servers added/removed/modified), the container is automatically recreated on the next start to apply the new configuration.
 
 ---
 
@@ -264,7 +338,11 @@ When an update is available, a pulsing **Update** button appears in the top bar.
 
 ### Multiple Sessions
 
-You can open multiple terminal sessions (even for the same project). Each session gets its own tab in the top bar. Click a tab to switch, or click the **x** on a tab to close it.
+You can open multiple terminal sessions (even for the same project). Each session gets its own tab in the top bar. Click a tab to switch, or click the **x** on a tab to close it. Tabs show the project name, with a "(bash)" suffix for shell sessions.
+
+### Bash Shell Sessions
+
+In addition to Claude Code terminals, you can open a plain **bash login shell** in any running container by clicking the **Shell** button. This is useful for manual inspection, package installation, debugging, or running commands that don't need Claude Code.
 
 ### URL Detection
 
@@ -272,9 +350,28 @@ When Claude Code prints a long URL (e.g., during `claude login`), Triple-C detec
 
 Shorter URLs in terminal output are also clickable directly.
 
+### Clipboard Support (OSC 52)
+
+Programs inside the container can copy text to your host clipboard. When a container program uses `xclip`, `xsel`, or `pbcopy`, the text is transparently forwarded to your host clipboard via OSC 52 escape sequences. No additional configuration is required — this works out of the box.
+
 ### Image Paste
 
-You can paste images from your clipboard into the terminal (Ctrl+V / Cmd+V). The image is uploaded to the container and the file path is injected into the terminal input so Claude Code can reference it.
+You can paste images from your clipboard into the terminal (Ctrl+V / Cmd+V). The image is uploaded to the container as `/tmp/clipboard_<timestamp>.png` and the file path is injected into the terminal input so Claude Code can reference it. A toast notification confirms the upload.
+
+### Jump to Current
+
+When you scroll up in the terminal to review previous output, a **Jump to Current** button appears in the bottom-right corner. Click it to scroll back to the latest output.
+
+### File Manager
+
+Click the **Files** button on a running project to open the file manager modal. You can:
+
+- **Browse** the container filesystem starting from `/workspace`, with breadcrumb navigation
+- **Download** any file to your host machine via the download button on each file entry
+- **Upload** files from your host into the current container directory
+- **Refresh** the directory listing at any time
+
+The file manager shows file names, sizes, and modification dates.
 
 ### Terminal Rendering
 
@@ -356,6 +453,8 @@ The sandbox container (Ubuntu 24.04) comes pre-installed with:
 | build-essential | — | C/C++ compiler toolchain |
 | openssh-client | — | SSH for git and remote access |
 
+The container also includes **clipboard shims** (`xclip`, `xsel`, `pbcopy`) that forward copy operations to the host via OSC 52, and an **audio shim** (`rec`, `arecord`) for future voice mode support.
+
 You can install additional tools at runtime with `sudo apt install`, `pip install`, `npm install -g`, etc. Installed packages persist across container stops (but not across resets).
 
 ---
@@ -378,7 +477,7 @@ You can install additional tools at runtime with `sudo apt install`, `pip instal
 
 - Check that the Docker image is "Ready" in Settings.
 - Verify that the mounted folder paths exist on your host.
-- Look at the error message displayed in red below the project card.
+- Look at the error message displayed in the progress modal.
 
 ### OAuth Login URL Not Opening
 
@@ -394,4 +493,10 @@ You can install additional tools at runtime with `sudo apt install`, `pip instal
 ### Settings Won't Save
 
 - Most project settings can only be changed when the container is **stopped**. Stop the container first, make your changes, then start it again.
-- Some changes (like toggling Docker access or changing mounted folders) trigger an automatic container recreation on the next start.
+- Some changes (like toggling Docker access, Mission Control, or changing mounted folders) trigger an automatic container recreation on the next start.
+
+### MCP Containers Not Starting
+
+- Ensure the Docker image for the MCP server exists (pull it first if needed).
+- Check that Docker socket access is available (stdio + Docker MCP servers auto-enable this).
+- Try resetting the project container to force a clean recreation.

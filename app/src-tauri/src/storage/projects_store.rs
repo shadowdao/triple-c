@@ -72,6 +72,8 @@ impl ProjectsStore {
 
         // Reconcile stale transient statuses: on a cold app start no Docker
         // operations can be in flight, so Starting/Stopping are always stale.
+        // Running/Error are left as-is and reconciled against Docker later
+        // via the reconcile_project_statuses command.
         let mut projects = projects;
         let mut needs_save = needs_save;
         for p in projects.iter_mut() {
