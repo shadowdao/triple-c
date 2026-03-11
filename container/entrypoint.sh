@@ -84,6 +84,31 @@ if [ -d /tmp/.host-aws ]; then
     # Ensure writable cache directories exist
     mkdir -p /home/claude/.aws/sso/cache /home/claude/.aws/cli/cache
     chown -R claude:claude /home/claude/.aws/sso /home/claude/.aws/cli
+
+    # Inline sso_session properties into profile sections so AWS SDKs that don't
+    # support the sso_session indirection format can resolve sso_region, etc.
+    if [ -f /home/claude/.aws/config ]; then
+        python3 -c '
+import configparser, sys
+c = configparser.ConfigParser()
+c.read(sys.argv[1])
+for sec in c.sections():
+    if not sec.startswith("profile ") and sec != "default":
+        continue
+    session = c.get(sec, "sso_session", fallback=None)
+    if not session or c.has_option(sec, "sso_start_url"):
+        continue
+    ss = f"sso-session {session}"
+    if not c.has_section(ss):
+        continue
+    for key in ("sso_start_url", "sso_region", "sso_registration_scopes"):
+        val = c.get(ss, key, fallback=None)
+        if val:
+            c.set(sec, key, val)
+with open(sys.argv[1], "w") as f:
+    c.write(f)
+' /home/claude/.aws/config 2>/dev/null || true
+    fi
 fi
 
 # ── Git credential helper (for HTTPS token) ─────────────────────────────────
@@ -162,6 +187,24 @@ if [ -n "$MCP_SERVERS_JSON" ]; then
     chown claude:claude "$CLAUDE_JSON"
     chmod 600 "$CLAUDE_JSON"
     unset MCP_SERVERS_JSON
+fi
+
+# ── AWS SSO auth refresh command ──────────────────────────────────────────────
+# When set, inject awsAuthRefresh into ~/.claude.json so Claude Code calls
+# triple-c-sso-refresh when AWS credentials expire mid-session.
+if [ -n "$AWS_SSO_AUTH_REFRESH_CMD" ]; then
+    CLAUDE_JSON="/home/claude/.claude.json"
+    if [ -f "$CLAUDE_JSON" ]; then
+        MERGED=$(jq --arg cmd "$AWS_SSO_AUTH_REFRESH_CMD" '.awsAuthRefresh = $cmd' "$CLAUDE_JSON" 2>/dev/null)
+        if [ -n "$MERGED" ]; then
+            printf '%s\n' "$MERGED" > "$CLAUDE_JSON"
+        fi
+    else
+        printf '{"awsAuthRefresh":"%s"}\n' "$AWS_SSO_AUTH_REFRESH_CMD" > "$CLAUDE_JSON"
+    fi
+    chown claude:claude "$CLAUDE_JSON"
+    chmod 600 "$CLAUDE_JSON"
+    unset AWS_SSO_AUTH_REFRESH_CMD
 fi
 
 # ── Docker socket permissions ────────────────────────────────────────────────

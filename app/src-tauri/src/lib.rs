@@ -114,6 +114,8 @@ pub fn run() {
             commands::mcp_commands::add_mcp_server,
             commands::mcp_commands::update_mcp_server,
             commands::mcp_commands::remove_mcp_server,
+            // AWS
+            commands::aws_commands::aws_sso_refresh,
             // Updates
             commands::update_commands::get_app_version,
             commands::update_commands::check_for_updates,

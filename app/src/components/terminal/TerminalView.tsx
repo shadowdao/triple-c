@@ -6,6 +6,8 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import "@xterm/xterm/css/xterm.css";
 import { useTerminal } from "../../hooks/useTerminal";
+import { useAppState } from "../../store/appState";
+import { awsSsoRefresh } from "../../lib/tauri-commands";
 import { UrlDetector } from "../../lib/urlDetector";
 import UrlToast from "./UrlToast";
 
@@ -22,6 +24,12 @@ export default function TerminalView({ sessionId, active }: Props) {
   const webglRef = useRef<WebglAddon | null>(null);
   const detectorRef = useRef<UrlDetector | null>(null);
   const { sendInput, pasteImage, resize, onOutput, onExit } = useTerminal();
+
+  const ssoBufferRef = useRef("");
+  const ssoTriggeredRef = useRef(false);
+  const projectId = useAppState(
+    (s) => s.sessions.find((sess) => sess.id === sessionId)?.projectId
+  );
 
   const [detectedUrl, setDetectedUrl] = useState<string | null>(null);
   const [imagePasteMsg, setImagePasteMsg] = useState<string | null>(null);
@@ -152,10 +160,30 @@ export default function TerminalView({ sessionId, active }: Props) {
     const detector = new UrlDetector((url) => setDetectedUrl(url));
     detectorRef.current = detector;
 
+    const SSO_MARKER = "###TRIPLE_C_SSO_REFRESH###";
+    const textDecoder = new TextDecoder();
+
     const outputPromise = onOutput(sessionId, (data) => {
       if (aborted) return;
       term.write(data);
       detector.feed(data);
+
+      // Scan for SSO refresh marker in terminal output
+      if (!ssoTriggeredRef.current && projectId) {
+        const text = textDecoder.decode(data, { stream: true });
+        // Combine with overlap from previous chunk to handle marker spanning chunks
+        const combined = ssoBufferRef.current + text;
+        if (combined.includes(SSO_MARKER)) {
+          ssoTriggeredRef.current = true;
+          ssoBufferRef.current = "";
+          awsSsoRefresh(projectId).catch((e) =>
+            console.error("AWS SSO refresh failed:", e)
+          );
+        } else {
+          // Keep last N chars as overlap for next chunk
+          ssoBufferRef.current = combined.slice(-SSO_MARKER.length);
+        }
+      }
     }).then((unlisten) => {
       if (aborted) unlisten();
       return unlisten;
@@ -189,6 +217,8 @@ export default function TerminalView({ sessionId, active }: Props) {
       aborted = true;
       detector.dispose();
       detectorRef.current = null;
+      ssoTriggeredRef.current = false;
+      ssoBufferRef.current = "";
       osc52Disposable.dispose();
       inputDisposable.dispose();
       scrollDisposable.dispose();

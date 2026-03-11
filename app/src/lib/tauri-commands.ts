@@ -40,6 +40,10 @@ export const listAwsProfiles = () =>
 export const detectHostTimezone = () =>
   invoke<string>("detect_host_timezone");
 
+// AWS
+export const awsSsoRefresh = (projectId: string) =>
+  invoke<void>("aws_sso_refresh", { projectId });
+
 // Terminal
 export const openTerminalSession = (projectId: string, sessionId: string, sessionType?: string) =>
   invoke<void>("open_terminal_session", { projectId, sessionId, sessionType });

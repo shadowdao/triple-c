@@ -1,3 +1,4 @@
+pub mod aws_commands;
 pub mod docker_commands;
 pub mod file_commands;
 pub mod mcp_commands;

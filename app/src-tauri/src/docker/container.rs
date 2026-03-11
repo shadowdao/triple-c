@@ -459,6 +459,7 @@ pub async fn create_container(
                     if let Some(p) = profile {
                         env_vars.push(format!("AWS_PROFILE={}", p));
                     }
+                    env_vars.push("AWS_SSO_AUTH_REFRESH_CMD=triple-c-sso-refresh".to_string());
                 }
                 BedrockAuthMethod::BearerToken => {
                     if let Some(ref token) = bedrock.aws_bearer_token {

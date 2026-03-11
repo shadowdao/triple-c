@@ -40,11 +40,12 @@ if aws sts get-caller-identity --profile '{profile}' >/dev/null 2>&1; then
     echo "AWS session valid."
 else
     echo "AWS session expired or invalid."
-    # Check if this profile uses SSO (has sso_start_url configured)
-    if aws configure get sso_start_url --profile '{profile}' >/dev/null 2>&1; then
-        echo "Starting SSO login — click the URL below to authenticate:"
+    # Check if this profile uses SSO (has sso_start_url or sso_session configured)
+    if aws configure get sso_start_url --profile '{profile}' >/dev/null 2>&1 || \
+       aws configure get sso_session --profile '{profile}' >/dev/null 2>&1; then
+        echo "Starting SSO login..."
         echo ""
-        aws sso login --profile '{profile}'
+        triple-c-sso-refresh
         if [ $? -ne 0 ]; then
             echo ""
             echo "SSO login failed or was cancelled. Starting Claude anyway..."

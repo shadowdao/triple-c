@@ -119,6 +119,9 @@ RUN chmod +x /usr/local/bin/audio-shim \
     && ln -sf /usr/local/bin/audio-shim /usr/local/bin/rec \
     && ln -sf /usr/local/bin/audio-shim /usr/local/bin/arecord
 
+COPY triple-c-sso-refresh /usr/local/bin/triple-c-sso-refresh
+RUN chmod +x /usr/local/bin/triple-c-sso-refresh
+
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 COPY triple-c-scheduler /usr/local/bin/triple-c-scheduler
