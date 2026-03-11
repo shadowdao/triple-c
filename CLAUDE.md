@@ -72,7 +72,7 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   - `container.rs` — Container lifecycle (create, start, stop, remove, inspect)
   - `exec.rs` — PTY exec sessions with bidirectional stdin/stdout streaming
   - `image.rs` — Image build/pull with progress streaming
-- **`models/`** — Serde structs (`Project`, `AuthMode`, `BedrockConfig`, `ContainerInfo`, `AppSettings`). These define the IPC contract with the frontend.
+- **`models/`** — Serde structs (`Project`, `AuthMode`, `BedrockConfig`, `OllamaConfig`, `LiteLlmConfig`, `ContainerInfo`, `AppSettings`). These define the IPC contract with the frontend.
 - **`storage/`** — Persistence: `projects_store.rs` (JSON file with atomic writes), `secure.rs` (OS keychain via `keyring` crate), `settings_store.rs`
 
 ### Container (`container/`)
@@ -90,6 +90,8 @@ Containers use a **stop/start** model (not create/destroy). Installed packages p
 Per-project, independently configured:
 - **Anthropic (OAuth)** — `claude login` in terminal, token persists in config volume
 - **AWS Bedrock** — Static keys, profile, or bearer token injected as env vars
+- **Ollama** — Connect to a local or remote Ollama server via `ANTHROPIC_BASE_URL` (e.g., `http://host.docker.internal:11434`)
+- **LiteLLM** — Connect through a LiteLLM proxy gateway via `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` to access 100+ model providers
 
 ## Styling
 

@@ -33,6 +33,8 @@ pub struct Project {
     pub status: ProjectStatus,
     pub auth_mode: AuthMode,
     pub bedrock_config: Option<BedrockConfig>,
+    pub ollama_config: Option<OllamaConfig>,
+    pub litellm_config: Option<LiteLlmConfig>,
     pub allow_docker_access: bool,
     #[serde(default)]
     pub mission_control_enabled: bool,
@@ -74,6 +76,9 @@ pub enum AuthMode {
     #[serde(alias = "login", alias = "api_key")]
     Anthropic,
     Bedrock,
+    Ollama,
+    #[serde(alias = "litellm")]
+    LiteLlm,
 }
 
 impl Default for AuthMode {
@@ -115,6 +120,29 @@ pub struct BedrockConfig {
     pub disable_prompt_caching: bool,
 }
 
+/// Ollama configuration for a project.
+/// Ollama exposes an Anthropic-compatible API endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OllamaConfig {
+    /// The base URL of the Ollama server (e.g., "http://host.docker.internal:11434" or "http://192.168.1.100:11434")
+    pub base_url: String,
+    /// Optional model override (e.g., "qwen3.5:27b")
+    pub model_id: Option<String>,
+}
+
+/// LiteLLM gateway configuration for a project.
+/// LiteLLM translates Anthropic API calls to 100+ model providers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiteLlmConfig {
+    /// The base URL of the LiteLLM proxy (e.g., "http://host.docker.internal:4000" or "https://litellm.example.com")
+    pub base_url: String,
+    /// API key for the LiteLLM proxy
+    #[serde(skip_serializing, default)]
+    pub api_key: Option<String>,
+    /// Optional model override
+    pub model_id: Option<String>,
+}
+
 impl Project {
     pub fn new(name: String, paths: Vec<ProjectPath>) -> Self {
         let now = chrono::Utc::now().to_rfc3339();
@@ -126,6 +154,8 @@ impl Project {
             status: ProjectStatus::Stopped,
             auth_mode: AuthMode::default(),
             bedrock_config: None,
+            ollama_config: None,
+            litellm_config: None,
             allow_docker_access: false,
             mission_control_enabled: false,
             ssh_key_path: None,

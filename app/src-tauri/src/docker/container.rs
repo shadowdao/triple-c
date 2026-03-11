@@ -231,6 +231,33 @@ fn compute_bedrock_fingerprint(project: &Project) -> String {
     }
 }
 
+/// Compute a fingerprint for the Ollama configuration so we can detect changes.
+fn compute_ollama_fingerprint(project: &Project) -> String {
+    if let Some(ref ollama) = project.ollama_config {
+        let parts = vec![
+            ollama.base_url.clone(),
+            ollama.model_id.as_deref().unwrap_or("").to_string(),
+        ];
+        sha256_hex(&parts.join("|"))
+    } else {
+        String::new()
+    }
+}
+
+/// Compute a fingerprint for the LiteLLM configuration so we can detect changes.
+fn compute_litellm_fingerprint(project: &Project) -> String {
+    if let Some(ref litellm) = project.litellm_config {
+        let parts = vec![
+            litellm.base_url.clone(),
+            litellm.api_key.as_deref().unwrap_or("").to_string(),
+            litellm.model_id.as_deref().unwrap_or("").to_string(),
+        ];
+        sha256_hex(&parts.join("|"))
+    } else {
+        String::new()
+    }
+}
+
 /// Compute a fingerprint for the project paths so we can detect changes.
 /// Sorted by mount_name so order changes don't cause spurious recreation.
 fn compute_paths_fingerprint(paths: &[ProjectPath]) -> String {
@@ -478,6 +505,30 @@ pub async fn create_container(
         }
     }
 
+    // Ollama configuration
+    if project.auth_mode == AuthMode::Ollama {
+        if let Some(ref ollama) = project.ollama_config {
+            env_vars.push(format!("ANTHROPIC_BASE_URL={}", ollama.base_url));
+            env_vars.push("ANTHROPIC_AUTH_TOKEN=ollama".to_string());
+            if let Some(ref model) = ollama.model_id {
+                env_vars.push(format!("ANTHROPIC_MODEL={}", model));
+            }
+        }
+    }
+
+    // LiteLLM configuration
+    if project.auth_mode == AuthMode::LiteLlm {
+        if let Some(ref litellm) = project.litellm_config {
+            env_vars.push(format!("ANTHROPIC_BASE_URL={}", litellm.base_url));
+            if let Some(ref key) = litellm.api_key {
+                env_vars.push(format!("ANTHROPIC_AUTH_TOKEN={}", key));
+            }
+            if let Some(ref model) = litellm.model_id {
+                env_vars.push(format!("ANTHROPIC_MODEL={}", model));
+            }
+        }
+    }
+
     // Custom environment variables (global + per-project, project overrides global for same key)
     let merged_env = merge_custom_env_vars(global_custom_env_vars, &project.custom_env_vars);
     let reserved_prefixes = ["ANTHROPIC_", "AWS_", "GIT_", "HOST_", "CLAUDE_", "TRIPLE_C_"];
@@ -646,6 +697,8 @@ pub async fn create_container(
     labels.insert("triple-c.auth-mode".to_string(), format!("{:?}", project.auth_mode));
     labels.insert("triple-c.paths-fingerprint".to_string(), compute_paths_fingerprint(&project.paths));
     labels.insert("triple-c.bedrock-fingerprint".to_string(), compute_bedrock_fingerprint(project));
+    labels.insert("triple-c.ollama-fingerprint".to_string(), compute_ollama_fingerprint(project));
+    labels.insert("triple-c.litellm-fingerprint".to_string(), compute_litellm_fingerprint(project));
     labels.insert("triple-c.ports-fingerprint".to_string(), compute_ports_fingerprint(&project.port_mappings));
     labels.insert("triple-c.image".to_string(), image_name.to_string());
     labels.insert("triple-c.timezone".to_string(), timezone.unwrap_or("").to_string());
@@ -882,6 +935,22 @@ pub async fn container_needs_recreation(
     let container_bedrock_fp = get_label("triple-c.bedrock-fingerprint").unwrap_or_default();
     if container_bedrock_fp != expected_bedrock_fp {
         log::info!("Bedrock config mismatch");
+        return Ok(true);
+    }
+
+    // ── Ollama config fingerprint ────────────────────────────────────────
+    let expected_ollama_fp = compute_ollama_fingerprint(project);
+    let container_ollama_fp = get_label("triple-c.ollama-fingerprint").unwrap_or_default();
+    if container_ollama_fp != expected_ollama_fp {
+        log::info!("Ollama config mismatch");
+        return Ok(true);
+    }
+
+    // ── LiteLLM config fingerprint ───────────────────────────────────────
+    let expected_litellm_fp = compute_litellm_fingerprint(project);
+    let container_litellm_fp = get_label("triple-c.litellm-fingerprint").unwrap_or_default();
+    if container_litellm_fp != expected_litellm_fp {
+        log::info!("LiteLLM config mismatch");
         return Ok(true);
     }
 

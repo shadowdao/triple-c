@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
-import type { Project, ProjectPath, AuthMode, BedrockConfig, BedrockAuthMethod } from "../../lib/types";
+import type { Project, ProjectPath, AuthMode, BedrockConfig, BedrockAuthMethod, OllamaConfig, LiteLlmConfig } from "../../lib/types";
 import { useProjects } from "../../hooks/useProjects";
 import { useMcpServers } from "../../hooks/useMcpServers";
 import { useTerminal } from "../../hooks/useTerminal";
@@ -58,6 +58,15 @@ export default function ProjectCard({ project }: Props) {
   const [bedrockBearerToken, setBedrockBearerToken] = useState(project.bedrock_config?.aws_bearer_token ?? "");
   const [bedrockModelId, setBedrockModelId] = useState(project.bedrock_config?.model_id ?? "");
 
+  // Ollama local state
+  const [ollamaBaseUrl, setOllamaBaseUrl] = useState(project.ollama_config?.base_url ?? "http://host.docker.internal:11434");
+  const [ollamaModelId, setOllamaModelId] = useState(project.ollama_config?.model_id ?? "");
+
+  // LiteLLM local state
+  const [litellmBaseUrl, setLitellmBaseUrl] = useState(project.litellm_config?.base_url ?? "http://host.docker.internal:4000");
+  const [litellmApiKey, setLitellmApiKey] = useState(project.litellm_config?.api_key ?? "");
+  const [litellmModelId, setLitellmModelId] = useState(project.litellm_config?.model_id ?? "");
+
   // Sync local state when project prop changes (e.g., after save or external update)
   useEffect(() => {
     setEditName(project.name);
@@ -76,6 +85,11 @@ export default function ProjectCard({ project }: Props) {
     setBedrockProfile(project.bedrock_config?.aws_profile ?? "");
     setBedrockBearerToken(project.bedrock_config?.aws_bearer_token ?? "");
     setBedrockModelId(project.bedrock_config?.model_id ?? "");
+    setOllamaBaseUrl(project.ollama_config?.base_url ?? "http://host.docker.internal:11434");
+    setOllamaModelId(project.ollama_config?.model_id ?? "");
+    setLitellmBaseUrl(project.litellm_config?.base_url ?? "http://host.docker.internal:4000");
+    setLitellmApiKey(project.litellm_config?.api_key ?? "");
+    setLitellmModelId(project.litellm_config?.model_id ?? "");
   }, [project]);
 
   // Listen for container progress events
@@ -177,11 +191,28 @@ export default function ProjectCard({ project }: Props) {
     disable_prompt_caching: false,
   };
 
+  const defaultOllamaConfig: OllamaConfig = {
+    base_url: "http://host.docker.internal:11434",
+    model_id: null,
+  };
+
+  const defaultLiteLlmConfig: LiteLlmConfig = {
+    base_url: "http://host.docker.internal:4000",
+    api_key: null,
+    model_id: null,
+  };
+
   const handleAuthModeChange = async (mode: AuthMode) => {
     try {
       const updates: Partial<Project> = { auth_mode: mode };
       if (mode === "bedrock" && !project.bedrock_config) {
         updates.bedrock_config = defaultBedrockConfig;
+      }
+      if (mode === "ollama" && !project.ollama_config) {
+        updates.ollama_config = defaultOllamaConfig;
+      }
+      if (mode === "lit_llm" && !project.litellm_config) {
+        updates.litellm_config = defaultLiteLlmConfig;
       }
       await update({ ...project, ...updates });
     } catch (e) {
@@ -305,6 +336,51 @@ export default function ProjectCard({ project }: Props) {
     }
   };
 
+  const handleOllamaBaseUrlBlur = async () => {
+    try {
+      const current = project.ollama_config ?? defaultOllamaConfig;
+      await update({ ...project, ollama_config: { ...current, base_url: ollamaBaseUrl } });
+    } catch (err) {
+      console.error("Failed to update Ollama base URL:", err);
+    }
+  };
+
+  const handleOllamaModelIdBlur = async () => {
+    try {
+      const current = project.ollama_config ?? defaultOllamaConfig;
+      await update({ ...project, ollama_config: { ...current, model_id: ollamaModelId || null } });
+    } catch (err) {
+      console.error("Failed to update Ollama model ID:", err);
+    }
+  };
+
+  const handleLitellmBaseUrlBlur = async () => {
+    try {
+      const current = project.litellm_config ?? defaultLiteLlmConfig;
+      await update({ ...project, litellm_config: { ...current, base_url: litellmBaseUrl } });
+    } catch (err) {
+      console.error("Failed to update LiteLLM base URL:", err);
+    }
+  };
+
+  const handleLitellmApiKeyBlur = async () => {
+    try {
+      const current = project.litellm_config ?? defaultLiteLlmConfig;
+      await update({ ...project, litellm_config: { ...current, api_key: litellmApiKey || null } });
+    } catch (err) {
+      console.error("Failed to update LiteLLM API key:", err);
+    }
+  };
+
+  const handleLitellmModelIdBlur = async () => {
+    try {
+      const current = project.litellm_config ?? defaultLiteLlmConfig;
+      await update({ ...project, litellm_config: { ...current, model_id: litellmModelId || null } });
+    } catch (err) {
+      console.error("Failed to update LiteLLM model ID:", err);
+    }
+  };
+
   const statusColor = {
     stopped: "bg-[var(--text-secondary)]",
     starting: "bg-[var(--warning)]",
@@ -394,6 +470,28 @@ export default function ProjectCard({ project }: Props) {
               } disabled:opacity-50`}
             >
               Bedrock
+            </button>
+            <button
+              onClick={(e) => { e.stopPropagation(); handleAuthModeChange("ollama"); }}
+              disabled={!isStopped}
+              className={`px-2 py-0.5 rounded transition-colors ${
+                project.auth_mode === "ollama"
+                  ? "bg-[var(--accent)] text-white"
+                  : "text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-primary)]"
+              } disabled:opacity-50`}
+            >
+              Ollama
+            </button>
+            <button
+              onClick={(e) => { e.stopPropagation(); handleAuthModeChange("lit_llm"); }}
+              disabled={!isStopped}
+              className={`px-2 py-0.5 rounded transition-colors ${
+                project.auth_mode === "lit_llm"
+                  ? "bg-[var(--accent)] text-white"
+                  : "text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-primary)]"
+              } disabled:opacity-50`}
+            >
+              LiteLLM
             </button>
           </div>
 
@@ -844,6 +942,99 @@ export default function ProjectCard({ project }: Props) {
                         onChange={(e) => setBedrockModelId(e.target.value)}
                         onBlur={handleBedrockModelIdBlur}
                         placeholder="anthropic.claude-sonnet-4-20250514-v1:0"
+                        disabled={!isStopped}
+                        className={inputCls}
+                      />
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* Ollama config */}
+              {project.auth_mode === "ollama" && (() => {
+                const inputCls = "w-full px-2 py-1 bg-[var(--bg-primary)] border border-[var(--border-color)] rounded text-xs text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)] disabled:opacity-50";
+                return (
+                  <div className="space-y-2 pt-1 border-t border-[var(--border-color)]">
+                    <label className="block text-xs font-medium text-[var(--text-primary)]">Ollama</label>
+                    <p className="text-xs text-[var(--text-secondary)]">
+                      Connect to an Ollama server running locally or on a remote host.
+                    </p>
+
+                    <div>
+                      <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Base URL</label>
+                      <input
+                        value={ollamaBaseUrl}
+                        onChange={(e) => setOllamaBaseUrl(e.target.value)}
+                        onBlur={handleOllamaBaseUrlBlur}
+                        placeholder="http://host.docker.internal:11434"
+                        disabled={!isStopped}
+                        className={inputCls}
+                      />
+                      <p className="text-xs text-[var(--text-secondary)] mt-0.5 opacity-70">
+                        Use host.docker.internal for the host machine, or an IP/hostname for remote.
+                      </p>
+                    </div>
+
+                    <div>
+                      <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Model (optional)</label>
+                      <input
+                        value={ollamaModelId}
+                        onChange={(e) => setOllamaModelId(e.target.value)}
+                        onBlur={handleOllamaModelIdBlur}
+                        placeholder="qwen3.5:27b"
+                        disabled={!isStopped}
+                        className={inputCls}
+                      />
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* LiteLLM config */}
+              {project.auth_mode === "lit_llm" && (() => {
+                const inputCls = "w-full px-2 py-1 bg-[var(--bg-primary)] border border-[var(--border-color)] rounded text-xs text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)] disabled:opacity-50";
+                return (
+                  <div className="space-y-2 pt-1 border-t border-[var(--border-color)]">
+                    <label className="block text-xs font-medium text-[var(--text-primary)]">LiteLLM Gateway</label>
+                    <p className="text-xs text-[var(--text-secondary)]">
+                      Connect through a LiteLLM proxy to use 100+ model providers.
+                    </p>
+
+                    <div>
+                      <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Base URL</label>
+                      <input
+                        value={litellmBaseUrl}
+                        onChange={(e) => setLitellmBaseUrl(e.target.value)}
+                        onBlur={handleLitellmBaseUrlBlur}
+                        placeholder="http://host.docker.internal:4000"
+                        disabled={!isStopped}
+                        className={inputCls}
+                      />
+                      <p className="text-xs text-[var(--text-secondary)] mt-0.5 opacity-70">
+                        Use host.docker.internal for local, or a URL for remote/containerized LiteLLM.
+                      </p>
+                    </div>
+
+                    <div>
+                      <label className="block text-xs text-[var(--text-secondary)] mb-0.5">API Key</label>
+                      <input
+                        type="password"
+                        value={litellmApiKey}
+                        onChange={(e) => setLitellmApiKey(e.target.value)}
+                        onBlur={handleLitellmApiKeyBlur}
+                        placeholder="sk-..."
+                        disabled={!isStopped}
+                        className={inputCls}
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Model (optional)</label>
+                      <input
+                        value={litellmModelId}
+                        onChange={(e) => setLitellmModelId(e.target.value)}
+                        onBlur={handleLitellmModelIdBlur}
+                        placeholder="gpt-4o / gemini-pro / etc."
                         disabled={!isStopped}
                         className={inputCls}
                       />

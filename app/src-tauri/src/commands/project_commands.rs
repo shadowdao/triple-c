@@ -34,6 +34,11 @@ fn store_secrets_for_project(project: &Project) -> Result<(), String> {
             secure::store_project_secret(&project.id, "aws-bearer-token", v)?;
         }
     }
+    if let Some(ref litellm) = project.litellm_config {
+        if let Some(ref v) = litellm.api_key {
+            secure::store_project_secret(&project.id, "litellm-api-key", v)?;
+        }
+    }
     Ok(())
 }
 
@@ -49,6 +54,10 @@ fn load_secrets_for_project(project: &mut Project) {
         bedrock.aws_session_token = secure::get_project_secret(&project.id, "aws-session-token")
             .unwrap_or(None);
         bedrock.aws_bearer_token = secure::get_project_secret(&project.id, "aws-bearer-token")
+            .unwrap_or(None);
+    }
+    if let Some(ref mut litellm) = project.litellm_config {
+        litellm.api_key = secure::get_project_secret(&project.id, "litellm-api-key")
             .unwrap_or(None);
     }
 }
@@ -177,6 +186,22 @@ pub async fn start_project_container(
         // Region can come from per-project or global
         if bedrock.aws_region.is_empty() && settings.global_aws.aws_region.is_none() {
             return Err("AWS region is required for Bedrock auth mode. Set it per-project or in global AWS settings.".to_string());
+        }
+    }
+
+    if project.auth_mode == AuthMode::Ollama {
+        let ollama = project.ollama_config.as_ref()
+            .ok_or_else(|| "Ollama auth mode selected but no Ollama configuration found.".to_string())?;
+        if ollama.base_url.is_empty() {
+            return Err("Ollama base URL is required.".to_string());
+        }
+    }
+
+    if project.auth_mode == AuthMode::LiteLlm {
+        let litellm = project.litellm_config.as_ref()
+            .ok_or_else(|| "LiteLLM auth mode selected but no LiteLLM configuration found.".to_string())?;
+        if litellm.base_url.is_empty() {
+            return Err("LiteLLM base URL is required.".to_string());
         }
     }
 

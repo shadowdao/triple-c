@@ -22,6 +22,8 @@ export interface Project {
   status: ProjectStatus;
   auth_mode: AuthMode;
   bedrock_config: BedrockConfig | null;
+  ollama_config: OllamaConfig | null;
+  litellm_config: LiteLlmConfig | null;
   allow_docker_access: boolean;
   mission_control_enabled: boolean;
   ssh_key_path: string | null;
@@ -43,7 +45,7 @@ export type ProjectStatus =
   | "stopping"
   | "error";
 
-export type AuthMode = "anthropic" | "bedrock";
+export type AuthMode = "anthropic" | "bedrock" | "ollama" | "lit_llm";
 
 export type BedrockAuthMethod = "static_credentials" | "profile" | "bearer_token";
 
@@ -57,6 +59,17 @@ export interface BedrockConfig {
   aws_bearer_token: string | null;
   model_id: string | null;
   disable_prompt_caching: boolean;
+}
+
+export interface OllamaConfig {
+  base_url: string;
+  model_id: string | null;
+}
+
+export interface LiteLlmConfig {
+  base_url: string;
+  api_key: string | null;
+  model_id: string | null;
 }
 
 export interface ContainerInfo {
