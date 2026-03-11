@@ -22,6 +22,7 @@ impl ExecSession {
             .map_err(|e| format!("Failed to send input: {}", e))
     }
 
+    #[allow(dead_code)]
     pub async fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
         let docker = get_docker()?;
         docker

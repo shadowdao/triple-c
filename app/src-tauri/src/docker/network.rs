@@ -48,6 +48,7 @@ pub async fn ensure_project_network(project_id: &str) -> Result<String, String> 
 }
 
 /// Connect a container to the project network.
+#[allow(dead_code)]
 pub async fn connect_container_to_network(
     container_id: &str,
     network_name: &str,

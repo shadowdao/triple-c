@@ -1143,11 +1143,6 @@ pub fn any_stdio_docker_mcp(servers: &[McpServer]) -> bool {
     servers.iter().any(|s| s.is_docker() && s.transport_type == McpTransportType::Stdio)
 }
 
-/// Returns true if any MCP server uses Docker.
-pub fn any_docker_mcp(servers: &[McpServer]) -> bool {
-    servers.iter().any(|s| s.is_docker())
-}
-
 /// Find an existing MCP container by its expected name.
 pub async fn find_mcp_container(server: &McpServer) -> Result<Option<String>, String> {
     let docker = get_docker()?;
