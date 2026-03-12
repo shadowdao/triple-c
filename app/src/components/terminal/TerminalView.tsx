@@ -7,7 +7,6 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import "@xterm/xterm/css/xterm.css";
 import { useTerminal } from "../../hooks/useTerminal";
 import { useAppState } from "../../store/appState";
-import { useShallow } from "zustand/react/shallow";
 import { awsSsoRefresh } from "../../lib/tauri-commands";
 import { UrlDetector } from "../../lib/urlDetector";
 import UrlToast from "./UrlToast";
