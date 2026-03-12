@@ -113,8 +113,9 @@ Claude Code launches automatically with `--dangerously-skip-permissions` inside 
 
 1. Stop the container first (settings can only be changed while stopped).
 2. In the project card, switch the backend to **Ollama**.
-3. Expand the **Config** panel and set the base URL of your Ollama server (defaults to `http://host.docker.internal:11434` for a local instance). Optionally set a model ID.
-4. Start the container again.
+3. Expand the **Config** panel and set the base URL of your Ollama server (defaults to `http://host.docker.internal:11434` for a local instance). Set the **Model ID** to the model you want to use (required).
+4. Make sure the model has been pulled in Ollama (e.g., `ollama pull qwen3.5:27b`) or used via Ollama cloud before starting.
+5. Start the container again.
 
 **LiteLLM:**
 
@@ -414,13 +415,15 @@ To use Claude Code with a local or remote Ollama server, switch the backend to *
 ### Settings
 
 - **Base URL** — The URL of your Ollama server. Defaults to `http://host.docker.internal:11434`, which reaches a locally running Ollama instance from inside the container. For a remote server, use its IP or hostname (e.g., `http://192.168.1.100:11434`).
-- **Model ID** — Optional. Override the model to use (e.g., `qwen3.5:27b`).
+- **Model ID** — **Required.** The model to use (e.g., `qwen3.5:27b`). The model must be pulled in Ollama before use — run `ollama pull <model>` or use it via Ollama cloud so it is available when the container starts.
 
 ### How It Works
 
 Triple-C sets `ANTHROPIC_BASE_URL` to point Claude Code at your Ollama server instead of Anthropic's API. The `ANTHROPIC_AUTH_TOKEN` is set to `ollama` (required by Claude Code but not used for actual authentication).
 
 > **Note:** Ollama support is best-effort. Claude Code is designed for Anthropic models, so some features (tool use, extended thinking, prompt caching, etc.) may not work as expected with non-Anthropic models.
+
+> **Important:** The model must already be available in Ollama before starting the container. If using a local Ollama instance, pull the model first with `ollama pull <model-name>`. If using Ollama's cloud service, ensure the model has been used at least once so it is cached.
 
 ---
 

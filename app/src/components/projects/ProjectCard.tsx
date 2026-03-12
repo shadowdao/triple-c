@@ -942,7 +942,7 @@ export default function ProjectCard({ project }: Props) {
                     </div>
 
                     <div>
-                      <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Model (optional)<Tooltip text="Ollama model name to use (e.g. qwen3.5:27b). Leave blank for the server default." /></label>
+                      <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Model (required)<Tooltip text="Ollama model name to use (e.g. qwen3.5:27b). The model must be pulled in Ollama before starting the container." /></label>
                       <input
                         value={ollamaModelId}
                         onChange={(e) => setOllamaModelId(e.target.value)}
