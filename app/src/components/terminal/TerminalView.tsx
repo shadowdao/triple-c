@@ -80,6 +80,22 @@ export default function TerminalView({ sessionId, active }: Props) {
 
     term.open(containerRef.current);
 
+    // Ctrl+Shift+C copies selected terminal text to clipboard.
+    // This prevents the keystroke from reaching the container (where
+    // Ctrl+C would send SIGINT and cancel running work).
+    term.attachCustomKeyEventHandler((event) => {
+      if (event.type === "keydown" && event.ctrlKey && event.shiftKey && event.key === "C") {
+        const sel = term.getSelection();
+        if (sel) {
+          navigator.clipboard.writeText(sel).catch((e) =>
+            console.error("Ctrl+Shift+C clipboard write failed:", e),
+          );
+        }
+        return false; // prevent xterm from processing this key
+      }
+      return true;
+    });
+
     // WebGL addon is loaded/disposed dynamically in the active effect
     // to avoid exhausting the browser's limited WebGL context pool.
 
