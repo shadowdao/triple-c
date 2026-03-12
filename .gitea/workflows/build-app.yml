@@ -58,7 +58,7 @@ jobs:
         id: version
         run: |
           COMMIT_COUNT=$(git rev-list --count HEAD)
-          VERSION="0.1.${COMMIT_COUNT}"
+          VERSION="0.2.${COMMIT_COUNT}"
           echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
           echo "Computed version: ${VERSION}"
 
@@ -187,7 +187,7 @@ jobs:
         id: version
         run: |
           COMMIT_COUNT=$(git rev-list --count HEAD)
-          VERSION="0.1.${COMMIT_COUNT}"
+          VERSION="0.2.${COMMIT_COUNT}"
           echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
           echo "Computed version: ${VERSION}"
 
@@ -279,7 +279,7 @@ jobs:
         id: version
         run: |
           for /f %%i in ('git rev-list --count HEAD') do set "COMMIT_COUNT=%%i"
-          set "VERSION=0.1.%COMMIT_COUNT%"
+          set "VERSION=0.2.%COMMIT_COUNT%"
           echo VERSION=%VERSION%>> %GITHUB_OUTPUT%
           echo Computed version: %VERSION%
 
