@@ -4,6 +4,25 @@ Triple-C (Claude-Code-Container) is a desktop application that runs Claude Code 
 
 ---
 
+## Table of Contents
+
+- [Prerequisites](#prerequisites)
+- [First Launch](#first-launch)
+- [The Interface](#the-interface)
+- [Project Management](#project-management)
+- [Project Configuration](#project-configuration)
+- [MCP Servers (Beta)](#mcp-servers-beta)
+- [AWS Bedrock Configuration](#aws-bedrock-configuration)
+- [Ollama Configuration](#ollama-configuration)
+- [LiteLLM Configuration](#litellm-configuration)
+- [Settings](#settings)
+- [Terminal Features](#terminal-features)
+- [Scheduled Tasks (Inside the Container)](#scheduled-tasks-inside-the-container)
+- [What's Inside the Container](#whats-inside-the-container)
+- [Troubleshooting](#troubleshooting)
+
+---
+
 ## Prerequisites
 
 ### Docker
@@ -622,3 +641,13 @@ You can install additional tools at runtime with `sudo apt install`, `pip instal
 - Ensure the Docker image for the MCP server exists (pull it first if needed).
 - Check that Docker socket access is available (stdio + Docker MCP servers auto-enable this).
 - Try resetting the project container to force a clean recreation.
+
+### "Failed to install Anthropic marketplace" Error
+
+If Claude Code shows **"Failed to install Anthropic marketplace - Will retry on next startup"** repeatedly, the marketplace metadata in `~/.claude.json` may be corrupted. To fix this, open a **Shell** session in the project and run:
+
+```bash
+cp ~/.claude.json ~/.claude.json.bak && jq 'with_entries(select(.key | startswith("officialMarketplace") | not))' ~/.claude.json.bak > ~/.claude.json
+```
+
+This backs up your config and removes the corrupted marketplace entries. Claude Code will re-download them cleanly on the next startup.

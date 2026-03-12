@@ -85,3 +85,6 @@ export const checkForUpdates = () =>
   invoke<UpdateInfo | null>("check_for_updates");
 export const checkImageUpdate = () =>
   invoke<ImageUpdateInfo | null>("check_image_update");
+
+// Help
+export const getHelpContent = () => invoke<string>("get_help_content");
