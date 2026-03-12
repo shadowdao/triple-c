@@ -494,6 +494,10 @@ When Claude Code prints a long URL (e.g., during `claude login`), Triple-C detec
 
 Shorter URLs in terminal output are also clickable directly.
 
+### Copying and Pasting
+
+Use **Ctrl+Shift+C** (or **Cmd+C** on macOS) to copy selected text from the terminal, and **Ctrl+Shift+V** (or **Cmd+V** on macOS) to paste. This follows standard terminal emulator conventions since Ctrl+C is reserved for sending SIGINT.
+
 ### Clipboard Support (OSC 52)
 
 Programs inside the container can copy text to your host clipboard. When a container program uses `xclip`, `xsel`, or `pbcopy`, the text is transparently forwarded to your host clipboard via OSC 52 escape sequences. No additional configuration is required — this works out of the box.
