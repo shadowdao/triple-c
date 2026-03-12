@@ -12,6 +12,7 @@ import ClaudeInstructionsModal from "./ClaudeInstructionsModal";
 import ContainerProgressModal from "./ContainerProgressModal";
 import FileManagerModal from "./FileManagerModal";
 import ConfirmRemoveModal from "./ConfirmRemoveModal";
+import Tooltip from "../ui/Tooltip";
 
 interface Props {
   project: Project;
@@ -448,7 +449,7 @@ export default function ProjectCard({ project }: Props) {
         <div className="mt-2 ml-4 space-y-2 min-w-0 overflow-hidden">
           {/* Backend selector */}
           <div className="flex items-center gap-1 text-xs">
-            <span className="text-[var(--text-secondary)] mr-1">Backend:</span>
+            <span className="text-[var(--text-secondary)] mr-1">Backend:<Tooltip text="Anthropic = direct Claude API via OAuth. Bedrock = AWS Bedrock. Ollama = local models. LiteLLM = proxy gateway for 100+ providers." /></span>
             <select
               value={project.backend}
               onChange={(e) => { e.stopPropagation(); handleBackendChange(e.target.value as Backend); }}
@@ -609,7 +610,7 @@ export default function ProjectCard({ project }: Props) {
 
               {/* SSH Key */}
               <div>
-                <label className="block text-xs text-[var(--text-secondary)] mb-0.5">SSH Key Directory</label>
+                <label className="block text-xs text-[var(--text-secondary)] mb-0.5">SSH Key Directory<Tooltip text="Path to your .ssh directory. Mounted into the container so Claude can authenticate with Git remotes over SSH." /></label>
                 <div className="flex gap-1">
                   <input
                     value={sshKeyPath}
@@ -631,7 +632,7 @@ export default function ProjectCard({ project }: Props) {
 
               {/* Git Name */}
               <div>
-                <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Git Name</label>
+                <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Git Name<Tooltip text="Sets git user.name inside the container for commit authorship." /></label>
                 <input
                   value={gitName}
                   onChange={(e) => setGitName(e.target.value)}
@@ -644,7 +645,7 @@ export default function ProjectCard({ project }: Props) {
 
               {/* Git Email */}
               <div>
-                <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Git Email</label>
+                <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Git Email<Tooltip text="Sets git user.email inside the container for commit authorship." /></label>
                 <input
                   value={gitEmail}
                   onChange={(e) => setGitEmail(e.target.value)}
@@ -657,7 +658,7 @@ export default function ProjectCard({ project }: Props) {
 
               {/* Git Token (HTTPS) */}
               <div>
-                <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Git HTTPS Token</label>
+                <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Git HTTPS Token<Tooltip text="A personal access token (e.g. GitHub PAT) for HTTPS git operations inside the container." /></label>
                 <input
                   type="password"
                   value={gitToken}
@@ -671,7 +672,7 @@ export default function ProjectCard({ project }: Props) {
 
               {/* Docker access toggle */}
               <div className="flex items-center gap-2">
-                <label className="text-xs text-[var(--text-secondary)]">Allow container spawning</label>
+                <label className="text-xs text-[var(--text-secondary)]">Allow container spawning<Tooltip text="Mounts the Docker socket so Claude can build and run Docker containers from inside the sandbox." /></label>
                 <button
                   onClick={async () => {
                     try { await update({ ...project, allow_docker_access: !project.allow_docker_access }); } catch (err) {
@@ -691,7 +692,7 @@ export default function ProjectCard({ project }: Props) {
 
               {/* Mission Control toggle */}
               <div className="flex items-center gap-2">
-                <label className="text-xs text-[var(--text-secondary)]">Mission Control</label>
+                <label className="text-xs text-[var(--text-secondary)]">Mission Control<Tooltip text="Enables a web dashboard for monitoring and managing Claude sessions remotely." /></label>
                 <button
                   onClick={async () => {
                     try {
@@ -714,7 +715,7 @@ export default function ProjectCard({ project }: Props) {
               {/* Environment Variables */}
               <div className="flex items-center justify-between">
                 <label className="text-xs text-[var(--text-secondary)]">
-                  Environment Variables{envVars.length > 0 && ` (${envVars.length})`}
+                  Environment Variables{envVars.length > 0 && ` (${envVars.length})`}<Tooltip text="Custom env vars injected into this project's container. Useful for API keys or tool configuration." />
                 </label>
                 <button
                   onClick={() => setShowEnvVarsModal(true)}
@@ -727,7 +728,7 @@ export default function ProjectCard({ project }: Props) {
               {/* Port Mappings */}
               <div className="flex items-center justify-between">
                 <label className="text-xs text-[var(--text-secondary)]">
-                  Port Mappings{portMappings.length > 0 && ` (${portMappings.length})`}
+                  Port Mappings{portMappings.length > 0 && ` (${portMappings.length})`}<Tooltip text="Map container ports to host ports so you can access dev servers running inside the container." />
                 </label>
                 <button
                   onClick={() => setShowPortMappingsModal(true)}
@@ -740,7 +741,7 @@ export default function ProjectCard({ project }: Props) {
               {/* Claude Instructions */}
               <div className="flex items-center justify-between">
                 <label className="text-xs text-[var(--text-secondary)]">
-                  Claude Instructions{claudeInstructions ? " (set)" : ""}
+                  Claude Instructions{claudeInstructions ? " (set)" : ""}<Tooltip text="Project-specific instructions written to CLAUDE.md. Guides Claude's behavior for this project." />
                 </label>
                 <button
                   onClick={() => setShowClaudeInstructionsModal(true)}
@@ -753,7 +754,7 @@ export default function ProjectCard({ project }: Props) {
               {/* MCP Servers */}
               {mcpServers.length > 0 && (
                 <div>
-                  <label className="block text-xs text-[var(--text-secondary)] mb-1">MCP Servers</label>
+                  <label className="block text-xs text-[var(--text-secondary)] mb-1">MCP Servers<Tooltip text="Model Context Protocol servers give Claude access to external tools and data sources." /></label>
                   <div className="space-y-1">
                     {mcpServers.map((server) => {
                       const enabled = project.enabled_mcp_servers.includes(server.id);
@@ -819,7 +820,7 @@ export default function ProjectCard({ project }: Props) {
 
                     {/* AWS Region (always shown) */}
                     <div>
-                      <label className="block text-xs text-[var(--text-secondary)] mb-0.5">AWS Region</label>
+                      <label className="block text-xs text-[var(--text-secondary)] mb-0.5">AWS Region<Tooltip text="The AWS region where your Bedrock endpoint is available (e.g. us-east-1)." /></label>
                       <input
                         value={bedrockRegion}
                         onChange={(e) => setBedrockRegion(e.target.value)}
@@ -834,7 +835,7 @@ export default function ProjectCard({ project }: Props) {
                     {bc.auth_method === "static_credentials" && (
                       <>
                         <div>
-                          <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Access Key ID</label>
+                          <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Access Key ID<Tooltip text="Your AWS IAM access key ID for Bedrock API authentication." /></label>
                           <input
                             value={bedrockAccessKeyId}
                             onChange={(e) => setBedrockAccessKeyId(e.target.value)}
@@ -845,7 +846,7 @@ export default function ProjectCard({ project }: Props) {
                           />
                         </div>
                         <div>
-                          <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Secret Access Key</label>
+                          <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Secret Access Key<Tooltip text="Your AWS IAM secret key. Stored locally and injected as an env var into the container." /></label>
                           <input
                             type="password"
                             value={bedrockSecretKey}
@@ -856,7 +857,7 @@ export default function ProjectCard({ project }: Props) {
                           />
                         </div>
                         <div>
-                          <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Session Token (optional)</label>
+                          <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Session Token (optional)<Tooltip text="Temporary session token for assumed-role or MFA-based AWS credentials." /></label>
                           <input
                             type="password"
                             value={bedrockSessionToken}
@@ -872,7 +873,7 @@ export default function ProjectCard({ project }: Props) {
                     {/* Profile field */}
                     {bc.auth_method === "profile" && (
                       <div>
-                        <label className="block text-xs text-[var(--text-secondary)] mb-0.5">AWS Profile</label>
+                        <label className="block text-xs text-[var(--text-secondary)] mb-0.5">AWS Profile<Tooltip text="Named profile from your AWS config/credentials files (e.g. 'default' or 'prod')." /></label>
                         <input
                           value={bedrockProfile}
                           onChange={(e) => setBedrockProfile(e.target.value)}
@@ -887,7 +888,7 @@ export default function ProjectCard({ project }: Props) {
                     {/* Bearer token field */}
                     {bc.auth_method === "bearer_token" && (
                       <div>
-                        <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Bearer Token</label>
+                        <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Bearer Token<Tooltip text="An SSO or identity-center bearer token for Bedrock authentication." /></label>
                         <input
                           type="password"
                           value={bedrockBearerToken}
@@ -901,7 +902,7 @@ export default function ProjectCard({ project }: Props) {
 
                     {/* Model override */}
                     <div>
-                      <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Model ID (optional)</label>
+                      <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Model ID (optional)<Tooltip text="Override the default Bedrock model. Leave blank to use Claude's default." /></label>
                       <input
                         value={bedrockModelId}
                         onChange={(e) => setBedrockModelId(e.target.value)}
@@ -926,7 +927,7 @@ export default function ProjectCard({ project }: Props) {
                     </p>
 
                     <div>
-                      <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Base URL</label>
+                      <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Base URL<Tooltip text="URL of your Ollama server. Use host.docker.internal to reach the host machine from inside the container." /></label>
                       <input
                         value={ollamaBaseUrl}
                         onChange={(e) => setOllamaBaseUrl(e.target.value)}
@@ -941,7 +942,7 @@ export default function ProjectCard({ project }: Props) {
                     </div>
 
                     <div>
-                      <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Model (optional)</label>
+                      <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Model (optional)<Tooltip text="Ollama model name to use (e.g. qwen3.5:27b). Leave blank for the server default." /></label>
                       <input
                         value={ollamaModelId}
                         onChange={(e) => setOllamaModelId(e.target.value)}
@@ -966,7 +967,7 @@ export default function ProjectCard({ project }: Props) {
                     </p>
 
                     <div>
-                      <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Base URL</label>
+                      <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Base URL<Tooltip text="URL of your LiteLLM proxy server. Use host.docker.internal for a locally running proxy." /></label>
                       <input
                         value={litellmBaseUrl}
                         onChange={(e) => setLitellmBaseUrl(e.target.value)}
@@ -981,7 +982,7 @@ export default function ProjectCard({ project }: Props) {
                     </div>
 
                     <div>
-                      <label className="block text-xs text-[var(--text-secondary)] mb-0.5">API Key</label>
+                      <label className="block text-xs text-[var(--text-secondary)] mb-0.5">API Key<Tooltip text="Authentication key for your LiteLLM proxy, if required." /></label>
                       <input
                         type="password"
                         value={litellmApiKey}
@@ -994,7 +995,7 @@ export default function ProjectCard({ project }: Props) {
                     </div>
 
                     <div>
-                      <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Model (optional)</label>
+                      <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Model (optional)<Tooltip text="Model identifier as configured in your LiteLLM proxy (e.g. gpt-4o, gemini-pro)." /></label>
                       <input
                         value={litellmModelId}
                         onChange={(e) => setLitellmModelId(e.target.value)}

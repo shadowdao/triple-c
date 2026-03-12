@@ -5,6 +5,7 @@ import { useAppState } from "../../store/appState";
 import { useSettings } from "../../hooks/useSettings";
 import UpdateDialog from "../settings/UpdateDialog";
 import ImageUpdateDialog from "../settings/ImageUpdateDialog";
+import HelpDialog from "./HelpDialog";
 
 export default function TopBar() {
   const { dockerAvailable, imageExists, updateInfo, imageUpdateInfo, appVersion, setUpdateInfo, setImageUpdateInfo } = useAppState(
@@ -21,6 +22,7 @@ export default function TopBar() {
   const { appSettings, saveSettings } = useSettings();
   const [showUpdateDialog, setShowUpdateDialog] = useState(false);
   const [showImageUpdateDialog, setShowImageUpdateDialog] = useState(false);
+  const [showHelpDialog, setShowHelpDialog] = useState(false);
 
   const handleDismiss = async () => {
     if (appSettings && updateInfo) {
@@ -70,6 +72,13 @@ export default function TopBar() {
           )}
           <StatusDot ok={dockerAvailable === true} label="Docker" />
           <StatusDot ok={imageExists === true} label="Image" />
+          <button
+            onClick={() => setShowHelpDialog(true)}
+            title="Help"
+            className="ml-1 w-5 h-5 flex items-center justify-center rounded-full border border-[var(--border-color)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:border-[var(--text-secondary)] transition-colors text-xs font-semibold leading-none"
+          >
+            ?
+          </button>
         </div>
       </div>
       {showUpdateDialog && updateInfo && (
@@ -86,6 +95,9 @@ export default function TopBar() {
           onDismiss={handleImageUpdateDismiss}
           onClose={() => setShowImageUpdateDialog(false)}
         />
+      )}
+      {showHelpDialog && (
+        <HelpDialog onClose={() => setShowHelpDialog(false)} />
       )}
     </>
   );

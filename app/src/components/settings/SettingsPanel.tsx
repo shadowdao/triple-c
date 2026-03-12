@@ -7,6 +7,7 @@ import ClaudeInstructionsModal from "../projects/ClaudeInstructionsModal";
 import EnvVarsModal from "../projects/EnvVarsModal";
 import { detectHostTimezone } from "../../lib/tauri-commands";
 import type { EnvVar } from "../../lib/types";
+import Tooltip from "../ui/Tooltip";
 
 export default function SettingsPanel() {
   const { appSettings, saveSettings } = useSettings();
@@ -59,7 +60,7 @@ export default function SettingsPanel() {
 
       {/* Container Timezone */}
       <div>
-        <label className="block text-sm font-medium mb-1">Container Timezone</label>
+        <label className="block text-sm font-medium mb-1">Container Timezone<Tooltip text="Sets the timezone inside containers. Affects scheduled task timing and log timestamps." /></label>
         <p className="text-xs text-[var(--text-secondary)] mb-1.5">
           Timezone for containers — affects scheduled task timing (IANA format, e.g. America/New_York)
         </p>
@@ -79,7 +80,7 @@ export default function SettingsPanel() {
 
       {/* Global Claude Instructions */}
       <div>
-        <label className="block text-sm font-medium mb-1">Claude Instructions</label>
+        <label className="block text-sm font-medium mb-1">Claude Instructions<Tooltip text="Global instructions applied to all projects. Written to ~/.claude/CLAUDE.md in every container." /></label>
         <p className="text-xs text-[var(--text-secondary)] mb-1.5">
           Global instructions applied to all projects (written to ~/.claude/CLAUDE.md in containers)
         </p>
@@ -98,7 +99,7 @@ export default function SettingsPanel() {
 
       {/* Global Environment Variables */}
       <div>
-        <label className="block text-sm font-medium mb-1">Global Environment Variables</label>
+        <label className="block text-sm font-medium mb-1">Global Environment Variables<Tooltip text="Env vars injected into all containers. Per-project vars with the same key take precedence." /></label>
         <p className="text-xs text-[var(--text-secondary)] mb-1.5">
           Applied to all project containers. Per-project variables override global ones with the same key.
         </p>
@@ -117,7 +118,7 @@ export default function SettingsPanel() {
 
       {/* Updates section */}
       <div>
-        <label className="block text-sm font-medium mb-2">Updates</label>
+        <label className="block text-sm font-medium mb-2">Updates<Tooltip text="Check for new versions of the Triple-C app and container image." /></label>
         <div className="space-y-2">
           {appVersion && (
             <p className="text-xs text-[var(--text-secondary)]">

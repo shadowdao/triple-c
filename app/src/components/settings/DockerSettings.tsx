@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useDocker } from "../../hooks/useDocker";
 import { useSettings } from "../../hooks/useSettings";
 import type { ImageSource } from "../../lib/types";
+import Tooltip from "../ui/Tooltip";
 
 const REGISTRY_IMAGE = "repo.anhonesthost.net/cybercovellc/triple-c/triple-c-sandbox:latest";
 
@@ -87,7 +88,7 @@ export default function DockerSettings() {
 
         {/* Image Source Selector */}
         <div>
-          <span className="text-[var(--text-secondary)] text-xs block mb-1.5">Image Source</span>
+          <span className="text-[var(--text-secondary)] text-xs block mb-1.5">Image Source<Tooltip text="Registry pulls the pre-built image. Local Build compiles from the bundled Dockerfile. Custom lets you specify any image." /></span>
           <div className="flex gap-1">
             {IMAGE_SOURCE_OPTIONS.map((opt) => (
               <button
@@ -109,7 +110,7 @@ export default function DockerSettings() {
         {/* Custom image input */}
         {imageSource === "custom" && (
           <div>
-            <span className="text-[var(--text-secondary)] text-xs block mb-1">Custom Image</span>
+            <span className="text-[var(--text-secondary)] text-xs block mb-1">Custom Image<Tooltip text="Full image name including registry and tag (e.g. myregistry.com/image:tag)." /></span>
             <input
               type="text"
               value={customInput}

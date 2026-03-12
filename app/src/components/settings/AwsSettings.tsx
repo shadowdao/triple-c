@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import { useSettings } from "../../hooks/useSettings";
 import * as commands from "../../lib/tauri-commands";
+import Tooltip from "../ui/Tooltip";
 
 export default function AwsSettings() {
   const { appSettings, saveSettings } = useSettings();
@@ -56,7 +57,7 @@ export default function AwsSettings() {
 
         {/* AWS Config Path */}
         <div>
-          <span className="text-[var(--text-secondary)] text-xs block mb-1">AWS Config Path</span>
+          <span className="text-[var(--text-secondary)] text-xs block mb-1">AWS Config Path<Tooltip text="Path to your AWS config/credentials directory. Mounted into containers for Bedrock auth." /></span>
           <div className="flex gap-2">
             <input
               type="text"
@@ -80,7 +81,7 @@ export default function AwsSettings() {
 
         {/* AWS Profile */}
         <div>
-          <span className="text-[var(--text-secondary)] text-xs block mb-1">Default Profile</span>
+          <span className="text-[var(--text-secondary)] text-xs block mb-1">Default Profile<Tooltip text="AWS named profile to use by default. Per-project settings can override this." /></span>
           <select
             value={globalAws.aws_profile ?? ""}
             onChange={(e) => handleChange("aws_profile", e.target.value)}
@@ -95,7 +96,7 @@ export default function AwsSettings() {
 
         {/* AWS Region */}
         <div>
-          <span className="text-[var(--text-secondary)] text-xs block mb-1">Default Region</span>
+          <span className="text-[var(--text-secondary)] text-xs block mb-1">Default Region<Tooltip text="Default AWS region for Bedrock API calls (e.g. us-east-1). Can be overridden per project." /></span>
           <input
             type="text"
             value={globalAws.aws_region ?? ""}
