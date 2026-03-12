@@ -449,7 +449,7 @@ export default function ProjectCard({ project }: Props) {
         <div className="mt-2 ml-4 space-y-2 min-w-0 overflow-hidden">
           {/* Backend selector */}
           <div className="flex items-center gap-1 text-xs">
-            <span className="text-[var(--text-secondary)] mr-1">Backend:<Tooltip text="Anthropic = direct Claude API via OAuth. Bedrock = AWS Bedrock. Ollama = local models. LiteLLM = proxy gateway for 100+ providers." /></span>
+            <span className="text-[var(--text-secondary)] mr-1">Backend:<Tooltip text="Choose the AI model provider for this project. Anthropic: Connect directly to Claude via OAuth login (run 'claude login' in terminal). Bedrock: Route through AWS Bedrock using your AWS credentials. Ollama: Use locally-hosted open-source models (Llama, Mistral, etc.) via an Ollama server. LiteLLM: Connect through a LiteLLM proxy gateway to access 100+ model providers (OpenAI, Azure, Gemini, etc.)." /></span>
             <select
               value={project.backend}
               onChange={(e) => { e.stopPropagation(); handleBackendChange(e.target.value as Backend); }}

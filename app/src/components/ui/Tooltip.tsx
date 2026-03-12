@@ -1,4 +1,5 @@
-import { useState, useRef, useEffect, type ReactNode } from "react";
+import { useState, useRef, useLayoutEffect, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 
 interface TooltipProps {
   text: string;
@@ -7,53 +8,44 @@ interface TooltipProps {
 
 /**
  * A small circled question-mark icon that shows a tooltip on hover.
- * Renders inline and automatically repositions to stay within the viewport.
+ * Uses a portal to render at `document.body` so the tooltip is never
+ * clipped by ancestor `overflow: hidden` containers.
  */
 export default function Tooltip({ text, children }: TooltipProps) {
   const [visible, setVisible] = useState(false);
-  const [position, setPosition] = useState<"top" | "bottom">("top");
-  const [align, setAlign] = useState<"center" | "left" | "right">("center");
+  const [coords, setCoords] = useState({ top: 0, left: 0 });
+  const [, setPlacement] = useState<"top" | "bottom">("top");
   const triggerRef = useRef<HTMLSpanElement>(null);
   const tooltipRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!visible || !triggerRef.current || !tooltipRef.current) return;
 
-    const triggerRect = triggerRef.current.getBoundingClientRect();
-    const tooltipRect = tooltipRef.current.getBoundingClientRect();
+    const trigger = triggerRef.current.getBoundingClientRect();
+    const tooltip = tooltipRef.current.getBoundingClientRect();
+    const gap = 6;
 
-    // Decide vertical position: prefer top, fall back to bottom
-    if (triggerRect.top - tooltipRect.height - 6 < 4) {
-      setPosition("bottom");
-    } else {
-      setPosition("top");
-    }
+    // Vertical: prefer above, fall back to below
+    const above = trigger.top - tooltip.height - gap >= 4;
+    const pos = above ? "top" : "bottom";
+    setPlacement(pos);
 
-    // Decide horizontal alignment
-    const centerLeft = triggerRect.left + triggerRect.width / 2 - tooltipRect.width / 2;
-    const centerRight = centerLeft + tooltipRect.width;
-    if (centerLeft < 4) {
-      setAlign("left");
-    } else if (centerRight > window.innerWidth - 4) {
-      setAlign("right");
-    } else {
-      setAlign("center");
-    }
+    const top =
+      pos === "top"
+        ? trigger.top - tooltip.height - gap
+        : trigger.bottom + gap;
+
+    // Horizontal: center on trigger, clamp to viewport
+    let left = trigger.left + trigger.width / 2 - tooltip.width / 2;
+    left = Math.max(4, Math.min(left, window.innerWidth - tooltip.width - 4));
+
+    setCoords({ top, left });
   }, [visible]);
-
-  const positionClasses = position === "top" ? "bottom-full mb-1.5" : "top-full mt-1.5";
-
-  const alignClasses =
-    align === "left"
-      ? "left-0"
-      : align === "right"
-        ? "right-0"
-        : "left-1/2 -translate-x-1/2";
 
   return (
     <span
       ref={triggerRef}
-      className="relative inline-flex items-center ml-1"
+      className="inline-flex items-center ml-1"
       onMouseEnter={() => setVisible(true)}
       onMouseLeave={() => setVisible(false)}
     >
@@ -65,14 +57,22 @@ export default function Tooltip({ text, children }: TooltipProps) {
           ?
         </span>
       )}
-      {visible && (
-        <div
-          ref={tooltipRef}
-          className={`absolute z-50 ${positionClasses} ${alignClasses} px-2.5 py-1.5 text-[11px] leading-snug text-[var(--text-primary)] bg-[var(--bg-tertiary)] border border-[var(--border-color)] rounded shadow-lg whitespace-normal max-w-[220px] w-max pointer-events-none`}
-        >
-          {text}
-        </div>
-      )}
+      {visible &&
+        createPortal(
+          <div
+            ref={tooltipRef}
+            style={{
+              position: "fixed",
+              top: coords.top,
+              left: coords.left,
+              zIndex: 9999,
+            }}
+            className={`px-2.5 py-1.5 text-[11px] leading-snug text-[var(--text-primary)] bg-[var(--bg-tertiary)] border border-[var(--border-color)] rounded shadow-lg whitespace-normal max-w-[280px] w-max pointer-events-none`}
+          >
+            {text}
+          </div>,
+          document.body
+        )}
     </span>
   );
 }
