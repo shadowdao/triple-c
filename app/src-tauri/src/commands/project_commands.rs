@@ -1,7 +1,7 @@
 use tauri::{Emitter, State};
 
 use crate::docker;
-use crate::models::{container_config, AuthMode, McpServer, Project, ProjectPath, ProjectStatus};
+use crate::models::{container_config, Backend, McpServer, Project, ProjectPath, ProjectStatus};
 use crate::storage::secure;
 use crate::AppState;
 
@@ -179,27 +179,27 @@ pub async fn start_project_container(
     // Resolve enabled MCP servers for this project
     let (enabled_mcp, docker_mcp) = resolve_mcp_servers(&project, &state);
 
-    // Validate auth mode requirements
-    if project.auth_mode == AuthMode::Bedrock {
+    // Validate backend requirements
+    if project.backend == Backend::Bedrock {
         let bedrock = project.bedrock_config.as_ref()
-            .ok_or_else(|| "Bedrock auth mode selected but no Bedrock configuration found.".to_string())?;
+            .ok_or_else(|| "Bedrock backend selected but no Bedrock configuration found.".to_string())?;
         // Region can come from per-project or global
         if bedrock.aws_region.is_empty() && settings.global_aws.aws_region.is_none() {
-            return Err("AWS region is required for Bedrock auth mode. Set it per-project or in global AWS settings.".to_string());
+            return Err("AWS region is required for Bedrock backend. Set it per-project or in global AWS settings.".to_string());
         }
     }
 
-    if project.auth_mode == AuthMode::Ollama {
+    if project.backend == Backend::Ollama {
         let ollama = project.ollama_config.as_ref()
-            .ok_or_else(|| "Ollama auth mode selected but no Ollama configuration found.".to_string())?;
+            .ok_or_else(|| "Ollama backend selected but no Ollama configuration found.".to_string())?;
         if ollama.base_url.is_empty() {
             return Err("Ollama base URL is required.".to_string());
         }
     }
 
-    if project.auth_mode == AuthMode::LiteLlm {
+    if project.backend == Backend::LiteLlm {
         let litellm = project.litellm_config.as_ref()
-            .ok_or_else(|| "LiteLLM auth mode selected but no LiteLLM configuration found.".to_string())?;
+            .ok_or_else(|| "LiteLLM backend selected but no LiteLLM configuration found.".to_string())?;
         if litellm.base_url.is_empty() {
             return Err("LiteLLM base URL is required.".to_string());
         }

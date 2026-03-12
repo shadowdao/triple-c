@@ -4,19 +4,23 @@ import TerminalTabs from "../terminal/TerminalTabs";
 import { useAppState } from "../../store/appState";
 import { useSettings } from "../../hooks/useSettings";
 import UpdateDialog from "../settings/UpdateDialog";
+import ImageUpdateDialog from "../settings/ImageUpdateDialog";
 
 export default function TopBar() {
-  const { dockerAvailable, imageExists, updateInfo, appVersion, setUpdateInfo } = useAppState(
+  const { dockerAvailable, imageExists, updateInfo, imageUpdateInfo, appVersion, setUpdateInfo, setImageUpdateInfo } = useAppState(
     useShallow(s => ({
       dockerAvailable: s.dockerAvailable,
       imageExists: s.imageExists,
       updateInfo: s.updateInfo,
+      imageUpdateInfo: s.imageUpdateInfo,
       appVersion: s.appVersion,
       setUpdateInfo: s.setUpdateInfo,
+      setImageUpdateInfo: s.setImageUpdateInfo,
     }))
   );
   const { appSettings, saveSettings } = useSettings();
   const [showUpdateDialog, setShowUpdateDialog] = useState(false);
+  const [showImageUpdateDialog, setShowImageUpdateDialog] = useState(false);
 
   const handleDismiss = async () => {
     if (appSettings && updateInfo) {
@@ -27,6 +31,17 @@ export default function TopBar() {
     }
     setUpdateInfo(null);
     setShowUpdateDialog(false);
+  };
+
+  const handleImageUpdateDismiss = async () => {
+    if (appSettings && imageUpdateInfo) {
+      await saveSettings({
+        ...appSettings,
+        dismissed_image_digest: imageUpdateInfo.remote_digest,
+      });
+    }
+    setImageUpdateInfo(null);
+    setShowImageUpdateDialog(false);
   };
 
   return (
@@ -44,6 +59,15 @@ export default function TopBar() {
               Update
             </button>
           )}
+          {imageUpdateInfo && (
+            <button
+              onClick={() => setShowImageUpdateDialog(true)}
+              className="px-2 py-0.5 rounded text-xs font-medium bg-[var(--warning,#f59e0b)] text-white hover:opacity-80 transition-colors"
+              title="A newer container image is available"
+            >
+              Image Update
+            </button>
+          )}
           <StatusDot ok={dockerAvailable === true} label="Docker" />
           <StatusDot ok={imageExists === true} label="Image" />
         </div>
@@ -54,6 +78,13 @@ export default function TopBar() {
           currentVersion={appVersion}
           onDismiss={handleDismiss}
           onClose={() => setShowUpdateDialog(false)}
+        />
+      )}
+      {showImageUpdateDialog && imageUpdateInfo && (
+        <ImageUpdateDialog
+          imageUpdateInfo={imageUpdateInfo}
+          onDismiss={handleImageUpdateDismiss}
+          onClose={() => setShowImageUpdateDialog(false)}
         />
       )}
     </>

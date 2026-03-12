@@ -86,21 +86,21 @@ Claude Code launches automatically with `--dangerously-skip-permissions` inside 
 **AWS Bedrock:**
 
 1. Stop the container first (settings can only be changed while stopped).
-2. In the project card, switch the auth mode to **Bedrock**.
+2. In the project card, switch the backend to **Bedrock**.
 3. Expand the **Config** panel and fill in your AWS credentials (see [AWS Bedrock Configuration](#aws-bedrock-configuration) below).
 4. Start the container again.
 
 **Ollama:**
 
 1. Stop the container first (settings can only be changed while stopped).
-2. In the project card, switch the auth mode to **Ollama**.
+2. In the project card, switch the backend to **Ollama**.
 3. Expand the **Config** panel and set the base URL of your Ollama server (defaults to `http://host.docker.internal:11434` for a local instance). Optionally set a model ID.
 4. Start the container again.
 
 **LiteLLM:**
 
 1. Stop the container first (settings can only be changed while stopped).
-2. In the project card, switch the auth mode to **LiteLLM**.
+2. In the project card, switch the backend to **LiteLLM**.
 3. Expand the **Config** panel and set the base URL of your LiteLLM proxy (defaults to `http://host.docker.internal:4000`). Optionally set an API key and model ID.
 4. Start the container again.
 
@@ -361,7 +361,7 @@ MCP server configuration is tracked via SHA-256 fingerprints stored as Docker la
 
 ## AWS Bedrock Configuration
 
-To use Claude via AWS Bedrock instead of Anthropic's API, switch the auth mode to **Bedrock** on the project card.
+To use Claude via AWS Bedrock instead of Anthropic's API, switch the backend to **Bedrock** on the project card.
 
 ### Authentication Methods
 
@@ -390,7 +390,7 @@ Per-project settings always override these global defaults.
 
 ## Ollama Configuration
 
-To use Claude Code with a local or remote Ollama server, switch the auth mode to **Ollama** on the project card.
+To use Claude Code with a local or remote Ollama server, switch the backend to **Ollama** on the project card.
 
 ### Settings
 
@@ -407,7 +407,7 @@ Triple-C sets `ANTHROPIC_BASE_URL` to point Claude Code at your Ollama server in
 
 ## LiteLLM Configuration
 
-To use Claude Code through a [LiteLLM](https://docs.litellm.ai/) proxy gateway, switch the auth mode to **LiteLLM** on the project card. LiteLLM supports 100+ model providers (OpenAI, Gemini, Anthropic, and more) through a single proxy.
+To use Claude Code through a [LiteLLM](https://docs.litellm.ai/) proxy gateway, switch the backend to **LiteLLM** on the project card. LiteLLM supports 100+ model providers (OpenAI, Gemini, Anthropic, and more) through a single proxy.
 
 ### Settings
 

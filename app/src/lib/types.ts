@@ -20,7 +20,7 @@ export interface Project {
   paths: ProjectPath[];
   container_id: string | null;
   status: ProjectStatus;
-  auth_mode: AuthMode;
+  backend: Backend;
   bedrock_config: BedrockConfig | null;
   ollama_config: OllamaConfig | null;
   litellm_config: LiteLlmConfig | null;
@@ -45,7 +45,7 @@ export type ProjectStatus =
   | "stopping"
   | "error";
 
-export type AuthMode = "anthropic" | "bedrock" | "ollama" | "lit_llm";
+export type Backend = "anthropic" | "bedrock" | "ollama" | "lite_llm";
 
 export type BedrockAuthMethod = "static_credentials" | "profile" | "bearer_token";
 
@@ -116,6 +116,7 @@ export interface AppSettings {
   dismissed_update_version: string | null;
   timezone: string | null;
   default_microphone: string | null;
+  dismissed_image_digest: string | null;
 }
 
 export interface UpdateInfo {
@@ -131,6 +132,12 @@ export interface ReleaseAsset {
   name: string;
   browser_download_url: string;
   size: number;
+}
+
+export interface ImageUpdateInfo {
+  remote_digest: string;
+  local_digest: string | null;
+  remote_updated_at: string | null;
 }
 
 export type McpTransportType = "stdio" | "http";

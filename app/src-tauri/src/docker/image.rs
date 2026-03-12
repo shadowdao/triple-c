@@ -31,6 +31,38 @@ pub async fn image_exists(image_name: &str) -> Result<bool, String> {
     Ok(!images.is_empty())
 }
 
+/// Returns the first repo digest (e.g. "sha256:abc...") for the given image,
+/// or None if the image doesn't exist locally or has no repo digests.
+pub async fn get_local_image_digest(image_name: &str) -> Result<Option<String>, String> {
+    let docker = get_docker()?;
+
+    let filters: HashMap<String, Vec<String>> = HashMap::from([(
+        "reference".to_string(),
+        vec![image_name.to_string()],
+    )]);
+
+    let images: Vec<ImageSummary> = docker
+        .list_images(Some(ListImagesOptions {
+            filters,
+            ..Default::default()
+        }))
+        .await
+        .map_err(|e| format!("Failed to list images: {}", e))?;
+
+    if let Some(img) = images.first() {
+        // RepoDigests contains entries like "registry/repo@sha256:abc..."
+        if let Some(digest_str) = img.repo_digests.first() {
+            // Extract the sha256:... part after '@'
+            if let Some(pos) = digest_str.find('@') {
+                return Ok(Some(digest_str[pos + 1..].to_string()));
+            }
+            return Ok(Some(digest_str.clone()));
+        }
+    }
+
+    Ok(None)
+}
+
 pub async fn pull_image<F>(image_name: &str, on_progress: F) -> Result<(), String>
 where
     F: Fn(String) + Send + 'static,

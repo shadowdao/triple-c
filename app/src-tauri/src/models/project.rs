@@ -31,7 +31,8 @@ pub struct Project {
     pub paths: Vec<ProjectPath>,
     pub container_id: Option<String>,
     pub status: ProjectStatus,
-    pub auth_mode: AuthMode,
+    #[serde(alias = "auth_mode")]
+    pub backend: Backend,
     pub bedrock_config: Option<BedrockConfig>,
     pub ollama_config: Option<OllamaConfig>,
     pub litellm_config: Option<LiteLlmConfig>,
@@ -65,13 +66,14 @@ pub enum ProjectStatus {
     Error,
 }
 
-/// How the project authenticates with Claude.
-/// - `Anthropic`: User runs `claude login` inside the container (OAuth via Anthropic Console,
-///   persisted in the config volume)
-/// - `Bedrock`: Uses AWS Bedrock with per-project AWS credentials
+/// Which AI model backend/provider the project uses.
+/// - `Anthropic`: Direct Anthropic API (user runs `claude login` inside the container)
+/// - `Bedrock`: AWS Bedrock with per-project AWS credentials
+/// - `Ollama`: Local or remote Ollama server
+/// - `LiteLlm`: LiteLLM proxy gateway for 100+ model providers
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
-pub enum AuthMode {
+pub enum Backend {
     /// Backward compat: old projects stored as "login" or "api_key" map to Anthropic.
     #[serde(alias = "login", alias = "api_key")]
     Anthropic,
@@ -81,7 +83,7 @@ pub enum AuthMode {
     LiteLlm,
 }
 
-impl Default for AuthMode {
+impl Default for Backend {
     fn default() -> Self {
         Self::Anthropic
     }
@@ -152,7 +154,7 @@ impl Project {
             paths,
             container_id: None,
             status: ProjectStatus::Stopped,
-            auth_mode: AuthMode::default(),
+            backend: Backend::default(),
             bedrock_config: None,
             ollama_config: None,
             litellm_config: None,

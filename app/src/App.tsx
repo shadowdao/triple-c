@@ -17,7 +17,7 @@ export default function App() {
   const { loadSettings } = useSettings();
   const { refresh } = useProjects();
   const { refresh: refreshMcp } = useMcpServers();
-  const { loadVersion, checkForUpdates, startPeriodicCheck } = useUpdates();
+  const { loadVersion, checkForUpdates, checkImageUpdate, startPeriodicCheck } = useUpdates();
   const { sessions, activeSessionId, setProjects } = useAppState(
     useShallow(s => ({ sessions: s.sessions, activeSessionId: s.activeSessionId, setProjects: s.setProjects }))
   );
@@ -46,7 +46,10 @@ export default function App() {
 
     // Update detection
     loadVersion();
-    const updateTimer = setTimeout(() => checkForUpdates(), 3000);
+    const updateTimer = setTimeout(() => {
+      checkForUpdates();
+      checkImageUpdate();
+    }, 3000);
     const cleanup = startPeriodicCheck();
     return () => {
       clearTimeout(updateTimer);

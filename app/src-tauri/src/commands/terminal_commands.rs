@@ -1,6 +1,6 @@
 use tauri::{AppHandle, Emitter, State};
 
-use crate::models::{AuthMode, BedrockAuthMethod, Project};
+use crate::models::{Backend, BedrockAuthMethod, Project};
 use crate::AppState;
 
 /// Build the command to run in the container terminal.
@@ -9,7 +9,7 @@ use crate::AppState;
 /// the AWS session first. If the SSO session is expired, runs `aws sso login`
 /// so the user can re-authenticate (the URL is clickable via xterm.js WebLinksAddon).
 fn build_terminal_cmd(project: &Project, state: &AppState) -> Vec<String> {
-    let is_bedrock_profile = project.auth_mode == AuthMode::Bedrock
+    let is_bedrock_profile = project.backend == Backend::Bedrock
         && project
             .bedrock_config
             .as_ref()

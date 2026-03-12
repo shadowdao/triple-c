@@ -1,5 +1,4 @@
 import { useState, useEffect } from "react";
-import ApiKeyInput from "./ApiKeyInput";
 import DockerSettings from "./DockerSettings";
 import AwsSettings from "./AwsSettings";
 import { useSettings } from "../../hooks/useSettings";
@@ -11,7 +10,7 @@ import type { EnvVar } from "../../lib/types";
 
 export default function SettingsPanel() {
   const { appSettings, saveSettings } = useSettings();
-  const { appVersion, checkForUpdates } = useUpdates();
+  const { appVersion, imageUpdateInfo, checkForUpdates, checkImageUpdate } = useUpdates();
   const [globalInstructions, setGlobalInstructions] = useState(appSettings?.global_claude_instructions ?? "");
   const [globalEnvVars, setGlobalEnvVars] = useState<EnvVar[]>(appSettings?.global_custom_env_vars ?? []);
   const [checkingUpdates, setCheckingUpdates] = useState(false);
@@ -39,7 +38,7 @@ export default function SettingsPanel() {
   const handleCheckNow = async () => {
     setCheckingUpdates(true);
     try {
-      await checkForUpdates();
+      await Promise.all([checkForUpdates(), checkImageUpdate()]);
     } finally {
       setCheckingUpdates(false);
     }
@@ -55,7 +54,6 @@ export default function SettingsPanel() {
       <h2 className="text-xs font-semibold uppercase text-[var(--text-secondary)]">
         Settings
       </h2>
-      <ApiKeyInput />
       <DockerSettings />
       <AwsSettings />
 
@@ -146,6 +144,12 @@ export default function SettingsPanel() {
           >
             {checkingUpdates ? "Checking..." : "Check now"}
           </button>
+          {imageUpdateInfo && (
+            <div className="flex items-center gap-2 px-3 py-2 text-xs bg-[var(--bg-primary)] border border-[var(--warning,#f59e0b)] rounded">
+              <span className="inline-block w-2 h-2 rounded-full bg-[var(--warning,#f59e0b)]" />
+              <span>A newer container image is available. Re-pull the image in Docker settings above to update.</span>
+            </div>
+          )}
         </div>
       </div>
 

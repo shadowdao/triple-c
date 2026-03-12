@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, McpServer, FileEntry } from "./types";
+import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, ImageUpdateInfo, McpServer, FileEntry } from "./types";
 
 // Docker
 export const checkDocker = () => invoke<boolean>("check_docker");
@@ -83,3 +83,5 @@ export const uploadFileToContainer = (projectId: string, hostPath: string, conta
 export const getAppVersion = () => invoke<string>("get_app_version");
 export const checkForUpdates = () =>
   invoke<UpdateInfo | null>("check_for_updates");
+export const checkImageUpdate = () =>
+  invoke<ImageUpdateInfo | null>("check_image_update");

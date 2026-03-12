@@ -102,7 +102,7 @@ Users can override this in Settings via the global `docker_socket_path` option.
 | `app/src/components/layout/TopBar.tsx` | Terminal tabs + Docker/Image status indicators |
 | `app/src/components/layout/Sidebar.tsx` | Responsive sidebar (25% width, min 224px, max 320px) |
 | `app/src/components/layout/StatusBar.tsx` | Running project/terminal counts |
-| `app/src/components/projects/ProjectCard.tsx` | Project config, auth mode, action buttons |
+| `app/src/components/projects/ProjectCard.tsx` | Project config, backend selector, action buttons |
 | `app/src/components/projects/ProjectList.tsx` | Project list in sidebar |
 | `app/src/components/projects/FileManagerModal.tsx` | File browser modal (browse, download, upload) |
 | `app/src/components/projects/ContainerProgressModal.tsx` | Real-time container operation progress |
@@ -122,7 +122,7 @@ Users can override this in Settings via the global `docker_socket_path` option.
 | `app/src-tauri/src/commands/project_commands.rs` | Start/stop/rebuild Tauri command handlers |
 | `app/src-tauri/src/commands/file_commands.rs` | File manager Tauri commands (list, download, upload) |
 | `app/src-tauri/src/commands/mcp_commands.rs` | MCP server CRUD Tauri commands |
-| `app/src-tauri/src/models/project.rs` | Project struct (auth mode, Docker access, MCP servers, Mission Control) |
+| `app/src-tauri/src/models/project.rs` | Project struct (backend, Docker access, MCP servers, Mission Control) |
 | `app/src-tauri/src/models/mcp_server.rs` | MCP server struct (transport, Docker image, env vars) |
 | `app/src-tauri/src/models/app_settings.rs` | Global settings (image source, Docker socket, AWS, microphone) |
 | `app/src-tauri/src/storage/mcp_store.rs` | MCP server persistence (JSON with atomic writes) |

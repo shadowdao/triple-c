@@ -57,7 +57,7 @@ const mockProject: Project = {
   paths: [{ host_path: "/home/user/project", mount_name: "project" }],
   container_id: null,
   status: "stopped",
-  auth_mode: "anthropic",
+  backend: "anthropic",
   bedrock_config: null,
   allow_docker_access: false,
   ssh_key_path: null,

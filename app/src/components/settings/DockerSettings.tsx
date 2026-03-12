@@ -121,9 +121,9 @@ export default function DockerSettings() {
         )}
 
         {/* Resolved image display */}
-        <div className="flex items-center justify-between">
+        <div>
           <span className="text-[var(--text-secondary)]">Image</span>
-          <span className="text-xs text-[var(--text-secondary)] truncate max-w-[200px]" title={resolvedImageName}>
+          <span className="block text-xs text-[var(--text-secondary)] font-mono mt-0.5 truncate" title={resolvedImageName}>
             {resolvedImageName}
           </span>
         </div>

@@ -290,7 +290,7 @@ triple-c/
             │   ├── image.rs       # Build from Dockerfile, pull from registry
             │   └── network.rs     # Per-project bridge networks for MCP
             ├── models/            # Data structures
-            │   ├── project.rs     # Project, AuthMode, BedrockConfig
+            │   ├── project.rs     # Project, Backend, BedrockConfig
             │   ├── mcp_server.rs  # MCP server configuration
             │   ├── app_settings.rs # Global settings (image source, AWS, etc.)
             │   ├── container_config.rs # Image name resolution

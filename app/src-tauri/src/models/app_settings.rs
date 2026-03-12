@@ -72,6 +72,8 @@ pub struct AppSettings {
     pub timezone: Option<String>,
     #[serde(default)]
     pub default_microphone: Option<String>,
+    #[serde(default)]
+    pub dismissed_image_digest: Option<String>,
 }
 
 impl Default for AppSettings {
@@ -90,6 +92,7 @@ impl Default for AppSettings {
             dismissed_update_version: None,
             timezone: None,
             default_microphone: None,
+            dismissed_image_digest: None,
         }
     }
 }

@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
-import type { Project, ProjectPath, AuthMode, BedrockConfig, BedrockAuthMethod, OllamaConfig, LiteLlmConfig } from "../../lib/types";
+import type { Project, ProjectPath, Backend, BedrockConfig, BedrockAuthMethod, OllamaConfig, LiteLlmConfig } from "../../lib/types";
 import { useProjects } from "../../hooks/useProjects";
 import { useMcpServers } from "../../hooks/useMcpServers";
 import { useTerminal } from "../../hooks/useTerminal";
@@ -202,16 +202,16 @@ export default function ProjectCard({ project }: Props) {
     model_id: null,
   };
 
-  const handleAuthModeChange = async (mode: AuthMode) => {
+  const handleBackendChange = async (mode: Backend) => {
     try {
-      const updates: Partial<Project> = { auth_mode: mode };
+      const updates: Partial<Project> = { backend: mode };
       if (mode === "bedrock" && !project.bedrock_config) {
         updates.bedrock_config = defaultBedrockConfig;
       }
       if (mode === "ollama" && !project.ollama_config) {
         updates.ollama_config = defaultOllamaConfig;
       }
-      if (mode === "lit_llm" && !project.litellm_config) {
+      if (mode === "lite_llm" && !project.litellm_config) {
         updates.litellm_config = defaultLiteLlmConfig;
       }
       await update({ ...project, ...updates });
@@ -446,12 +446,12 @@ export default function ProjectCard({ project }: Props) {
 
       {isSelected && (
         <div className="mt-2 ml-4 space-y-2 min-w-0 overflow-hidden">
-          {/* Auth mode selector */}
+          {/* Backend selector */}
           <div className="flex items-center gap-1 text-xs">
-            <span className="text-[var(--text-secondary)] mr-1">Auth:</span>
+            <span className="text-[var(--text-secondary)] mr-1">Backend:</span>
             <select
-              value={project.auth_mode}
-              onChange={(e) => { e.stopPropagation(); handleAuthModeChange(e.target.value as AuthMode); }}
+              value={project.backend}
+              onChange={(e) => { e.stopPropagation(); handleBackendChange(e.target.value as Backend); }}
               onClick={(e) => e.stopPropagation()}
               disabled={!isStopped}
               className="px-2 py-0.5 rounded bg-[var(--bg-primary)] border border-[var(--border-color)] text-xs text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)] disabled:opacity-50"
@@ -459,7 +459,7 @@ export default function ProjectCard({ project }: Props) {
               <option value="anthropic">Anthropic</option>
               <option value="bedrock">Bedrock</option>
               <option value="ollama">Ollama</option>
-              <option value="lit_llm">LiteLLM</option>
+              <option value="lite_llm">LiteLLM</option>
             </select>
           </div>
 
@@ -794,7 +794,7 @@ export default function ProjectCard({ project }: Props) {
               )}
 
               {/* Bedrock config */}
-              {project.auth_mode === "bedrock" && (() => {
+              {project.backend === "bedrock" && (() => {
                 const bc = project.bedrock_config ?? defaultBedrockConfig;
                 const inputCls = "w-full px-2 py-1 bg-[var(--bg-primary)] border border-[var(--border-color)] rounded text-xs text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)] disabled:opacity-50";
                 return (
@@ -916,7 +916,7 @@ export default function ProjectCard({ project }: Props) {
               })()}
 
               {/* Ollama config */}
-              {project.auth_mode === "ollama" && (() => {
+              {project.backend === "ollama" && (() => {
                 const inputCls = "w-full px-2 py-1 bg-[var(--bg-primary)] border border-[var(--border-color)] rounded text-xs text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)] disabled:opacity-50";
                 return (
                   <div className="space-y-2 pt-1 border-t border-[var(--border-color)]">
@@ -956,7 +956,7 @@ export default function ProjectCard({ project }: Props) {
               })()}
 
               {/* LiteLLM config */}
-              {project.auth_mode === "lit_llm" && (() => {
+              {project.backend === "lite_llm" && (() => {
                 const inputCls = "w-full px-2 py-1 bg-[var(--bg-primary)] border border-[var(--border-color)] rounded text-xs text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)] disabled:opacity-50";
                 return (
                   <div className="space-y-2 pt-1 border-t border-[var(--border-color)]">

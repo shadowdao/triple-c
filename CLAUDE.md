@@ -72,7 +72,7 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   - `container.rs` — Container lifecycle (create, start, stop, remove, inspect)
   - `exec.rs` — PTY exec sessions with bidirectional stdin/stdout streaming
   - `image.rs` — Image build/pull with progress streaming
-- **`models/`** — Serde structs (`Project`, `AuthMode`, `BedrockConfig`, `OllamaConfig`, `LiteLlmConfig`, `ContainerInfo`, `AppSettings`). These define the IPC contract with the frontend.
+- **`models/`** — Serde structs (`Project`, `Backend`, `BedrockConfig`, `OllamaConfig`, `LiteLlmConfig`, `ContainerInfo`, `AppSettings`). These define the IPC contract with the frontend.
 - **`storage/`** — Persistence: `projects_store.rs` (JSON file with atomic writes), `secure.rs` (OS keychain via `keyring` crate), `settings_store.rs`
 
 ### Container (`container/`)

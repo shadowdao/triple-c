@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use sha2::{Sha256, Digest};
 
 use super::client::get_docker;
-use crate::models::{AuthMode, BedrockAuthMethod, ContainerInfo, EnvVar, GlobalAwsSettings, McpServer, McpTransportType, PortMapping, Project, ProjectPath};
+use crate::models::{Backend, BedrockAuthMethod, ContainerInfo, EnvVar, GlobalAwsSettings, McpServer, McpTransportType, PortMapping, Project, ProjectPath};
 
 const SCHEDULER_INSTRUCTIONS: &str = r#"## Scheduled Tasks
 
@@ -453,7 +453,7 @@ pub async fn create_container(
     }
 
     // Bedrock configuration
-    if project.auth_mode == AuthMode::Bedrock {
+    if project.backend == Backend::Bedrock {
         if let Some(ref bedrock) = project.bedrock_config {
             env_vars.push("CLAUDE_CODE_USE_BEDROCK=1".to_string());
 
@@ -506,7 +506,7 @@ pub async fn create_container(
     }
 
     // Ollama configuration
-    if project.auth_mode == AuthMode::Ollama {
+    if project.backend == Backend::Ollama {
         if let Some(ref ollama) = project.ollama_config {
             env_vars.push(format!("ANTHROPIC_BASE_URL={}", ollama.base_url));
             env_vars.push("ANTHROPIC_AUTH_TOKEN=ollama".to_string());
@@ -517,7 +517,7 @@ pub async fn create_container(
     }
 
     // LiteLLM configuration
-    if project.auth_mode == AuthMode::LiteLlm {
+    if project.backend == Backend::LiteLlm {
         if let Some(ref litellm) = project.litellm_config {
             env_vars.push(format!("ANTHROPIC_BASE_URL={}", litellm.base_url));
             if let Some(ref key) = litellm.api_key {
@@ -624,7 +624,7 @@ pub async fn create_container(
 
     // AWS config mount (read-only)
     // Mount if: Bedrock profile auth needs it, OR a global aws_config_path is set
-    let should_mount_aws = if project.auth_mode == AuthMode::Bedrock {
+    let should_mount_aws = if project.backend == Backend::Bedrock {
         if let Some(ref bedrock) = project.bedrock_config {
             bedrock.auth_method == BedrockAuthMethod::Profile
         } else {
@@ -694,7 +694,7 @@ pub async fn create_container(
     labels.insert("triple-c.managed".to_string(), "true".to_string());
     labels.insert("triple-c.project-id".to_string(), project.id.clone());
     labels.insert("triple-c.project-name".to_string(), project.name.clone());
-    labels.insert("triple-c.auth-mode".to_string(), format!("{:?}", project.auth_mode));
+    labels.insert("triple-c.backend".to_string(), format!("{:?}", project.backend));
     labels.insert("triple-c.paths-fingerprint".to_string(), compute_paths_fingerprint(&project.paths));
     labels.insert("triple-c.bedrock-fingerprint".to_string(), compute_bedrock_fingerprint(project));
     labels.insert("triple-c.ollama-fingerprint".to_string(), compute_ollama_fingerprint(project));
@@ -897,11 +897,13 @@ pub async fn container_needs_recreation(
     // Code settings stored in the named volume). The change takes effect
     // on the next explicit rebuild instead.
 
-    // ── Auth mode ────────────────────────────────────────────────────────
-    let current_auth_mode = format!("{:?}", project.auth_mode);
-    if let Some(container_auth_mode) = get_label("triple-c.auth-mode") {
-        if container_auth_mode != current_auth_mode {
-            log::info!("Auth mode mismatch (container={:?}, project={:?})", container_auth_mode, current_auth_mode);
+    // ── Backend ──────────────────────────────────────────────────────────
+    let current_backend = format!("{:?}", project.backend);
+    // Check new label name, falling back to old "triple-c.auth-mode" for pre-rename containers
+    let container_backend = get_label("triple-c.backend").or_else(|| get_label("triple-c.auth-mode"));
+    if let Some(container_backend) = container_backend {
+        if container_backend != current_backend {
+            log::info!("Backend mismatch (container={:?}, project={:?})", container_backend, current_backend);
             return Ok(true);
         }
     }

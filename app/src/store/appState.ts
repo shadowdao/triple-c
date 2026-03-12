@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import type { Project, TerminalSession, AppSettings, UpdateInfo, McpServer } from "../lib/types";
+import type { Project, TerminalSession, AppSettings, UpdateInfo, ImageUpdateInfo, McpServer } from "../lib/types";
 
 interface AppState {
   // Projects
@@ -39,6 +39,10 @@ interface AppState {
   setUpdateInfo: (info: UpdateInfo | null) => void;
   appVersion: string;
   setAppVersion: (version: string) => void;
+
+  // Image update info
+  imageUpdateInfo: ImageUpdateInfo | null;
+  setImageUpdateInfo: (info: ImageUpdateInfo | null) => void;
 }
 
 export const useAppState = create<AppState>((set) => ({
@@ -111,4 +115,8 @@ export const useAppState = create<AppState>((set) => ({
   setUpdateInfo: (info) => set({ updateInfo: info }),
   appVersion: "",
   setAppVersion: (version) => set({ appVersion: version }),
+
+  // Image update info
+  imageUpdateInfo: null,
+  setImageUpdateInfo: (info) => set({ imageUpdateInfo: info }),
 }));

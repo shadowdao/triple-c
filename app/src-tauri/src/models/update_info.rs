@@ -35,3 +35,14 @@ pub struct GiteaAsset {
     pub browser_download_url: String,
     pub size: u64,
 }
+
+/// Info returned to the frontend about an available container image update.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageUpdateInfo {
+    /// The remote digest (e.g. sha256:abc...)
+    pub remote_digest: String,
+    /// The local digest, if available
+    pub local_digest: Option<String>,
+    /// When the remote image was last updated (if known)
+    pub remote_updated_at: Option<String>,
+}
