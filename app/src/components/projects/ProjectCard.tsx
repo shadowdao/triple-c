@@ -449,50 +449,18 @@ export default function ProjectCard({ project }: Props) {
           {/* Auth mode selector */}
           <div className="flex items-center gap-1 text-xs">
             <span className="text-[var(--text-secondary)] mr-1">Auth:</span>
-            <button
-              onClick={(e) => { e.stopPropagation(); handleAuthModeChange("anthropic"); }}
+            <select
+              value={project.auth_mode}
+              onChange={(e) => { e.stopPropagation(); handleAuthModeChange(e.target.value as AuthMode); }}
+              onClick={(e) => e.stopPropagation()}
               disabled={!isStopped}
-              className={`px-2 py-0.5 rounded transition-colors ${
-                project.auth_mode === "anthropic"
-                  ? "bg-[var(--accent)] text-white"
-                  : "text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-primary)]"
-              } disabled:opacity-50`}
+              className="px-2 py-0.5 rounded bg-[var(--bg-primary)] border border-[var(--border-color)] text-xs text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)] disabled:opacity-50"
             >
-              Anthropic
-            </button>
-            <button
-              onClick={(e) => { e.stopPropagation(); handleAuthModeChange("bedrock"); }}
-              disabled={!isStopped}
-              className={`px-2 py-0.5 rounded transition-colors ${
-                project.auth_mode === "bedrock"
-                  ? "bg-[var(--accent)] text-white"
-                  : "text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-primary)]"
-              } disabled:opacity-50`}
-            >
-              Bedrock
-            </button>
-            <button
-              onClick={(e) => { e.stopPropagation(); handleAuthModeChange("ollama"); }}
-              disabled={!isStopped}
-              className={`px-2 py-0.5 rounded transition-colors ${
-                project.auth_mode === "ollama"
-                  ? "bg-[var(--accent)] text-white"
-                  : "text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-primary)]"
-              } disabled:opacity-50`}
-            >
-              Ollama
-            </button>
-            <button
-              onClick={(e) => { e.stopPropagation(); handleAuthModeChange("lit_llm"); }}
-              disabled={!isStopped}
-              className={`px-2 py-0.5 rounded transition-colors ${
-                project.auth_mode === "lit_llm"
-                  ? "bg-[var(--accent)] text-white"
-                  : "text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-primary)]"
-              } disabled:opacity-50`}
-            >
-              LiteLLM
-            </button>
+              <option value="anthropic">Anthropic</option>
+              <option value="bedrock">Bedrock</option>
+              <option value="ollama">Ollama</option>
+              <option value="lit_llm">LiteLLM</option>
+            </select>
           </div>
 
           {/* Action buttons */}
@@ -836,20 +804,17 @@ export default function ProjectCard({ project }: Props) {
                     {/* Sub-method selector */}
                     <div className="flex items-center gap-1 text-xs">
                       <span className="text-[var(--text-secondary)] mr-1">Method:</span>
-                      {(["static_credentials", "profile", "bearer_token"] as BedrockAuthMethod[]).map((m) => (
-                        <button
-                          key={m}
-                          onClick={() => updateBedrockConfig({ auth_method: m })}
-                          disabled={!isStopped}
-                          className={`px-2 py-0.5 rounded transition-colors ${
-                            bc.auth_method === m
-                              ? "bg-[var(--accent)] text-white"
-                              : "text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-primary)]"
-                          } disabled:opacity-50`}
-                        >
-                          {m === "static_credentials" ? "Keys" : m === "profile" ? "Profile" : "Token"}
-                        </button>
-                      ))}
+                      <select
+                        value={bc.auth_method}
+                        onChange={(e) => updateBedrockConfig({ auth_method: e.target.value as BedrockAuthMethod })}
+                        onClick={(e) => e.stopPropagation()}
+                        disabled={!isStopped}
+                        className="px-2 py-0.5 rounded bg-[var(--bg-primary)] border border-[var(--border-color)] text-xs text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)] disabled:opacity-50"
+                      >
+                        <option value="static_credentials">Keys</option>
+                        <option value="profile">Profile</option>
+                        <option value="bearer_token">Token</option>
+                      </select>
                     </div>
 
                     {/* AWS Region (always shown) */}
