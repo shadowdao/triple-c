@@ -2,8 +2,8 @@ import { useShallow } from "zustand/react/shallow";
 import { useAppState } from "../../store/appState";
 
 export default function StatusBar() {
-  const { projects, sessions } = useAppState(
-    useShallow(s => ({ projects: s.projects, sessions: s.sessions }))
+  const { projects, sessions, terminalHasSelection } = useAppState(
+    useShallow(s => ({ projects: s.projects, sessions: s.sessions, terminalHasSelection: s.terminalHasSelection }))
   );
   const running = projects.filter((p) => p.status === "running").length;
 
@@ -20,6 +20,12 @@ export default function StatusBar() {
       <span>
         {sessions.length} terminal{sessions.length !== 1 ? "s" : ""}
       </span>
+      {terminalHasSelection && (
+        <>
+          <span className="mx-2">|</span>
+          <span className="text-[var(--accent)]">Ctrl+Shift+C to copy</span>
+        </>
+      )}
     </div>
   );
 }

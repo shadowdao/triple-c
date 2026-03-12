@@ -24,6 +24,8 @@ interface AppState {
   removeMcpServerFromList: (id: string) => void;
 
   // UI state
+  terminalHasSelection: boolean;
+  setTerminalHasSelection: (has: boolean) => void;
   sidebarView: "projects" | "mcp" | "settings";
   setSidebarView: (view: "projects" | "mcp" | "settings") => void;
   dockerAvailable: boolean | null;
@@ -100,6 +102,8 @@ export const useAppState = create<AppState>((set) => ({
     })),
 
   // UI state
+  terminalHasSelection: false,
+  setTerminalHasSelection: (has) => set({ terminalHasSelection: has }),
   sidebarView: "projects",
   setSidebarView: (view) => set({ sidebarView: view }),
   dockerAvailable: null,

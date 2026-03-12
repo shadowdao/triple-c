@@ -7,6 +7,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import "@xterm/xterm/css/xterm.css";
 import { useTerminal } from "../../hooks/useTerminal";
 import { useAppState } from "../../store/appState";
+import { useShallow } from "zustand/react/shallow";
 import { awsSsoRefresh } from "../../lib/tauri-commands";
 import { UrlDetector } from "../../lib/urlDetector";
 import UrlToast from "./UrlToast";
@@ -24,6 +25,7 @@ export default function TerminalView({ sessionId, active }: Props) {
   const webglRef = useRef<WebglAddon | null>(null);
   const detectorRef = useRef<UrlDetector | null>(null);
   const { sendInput, pasteImage, resize, onOutput, onExit } = useTerminal();
+  const setTerminalHasSelection = useAppState(s => s.setTerminalHasSelection);
 
   const ssoBufferRef = useRef("");
   const ssoTriggeredRef = useRef(false);
@@ -136,6 +138,11 @@ export default function TerminalView({ sessionId, active }: Props) {
       setIsAtBottom(buf.viewportY >= buf.baseY);
     });
 
+    // Track text selection to show copy hint in status bar
+    const selectionDisposable = term.onSelectionChange(() => {
+      setTerminalHasSelection(term.hasSelection());
+    });
+
     // Handle image paste: intercept paste events with image data,
     // upload to the container, and inject the file path into terminal input.
     const handlePaste = (e: ClipboardEvent) => {
@@ -238,6 +245,8 @@ export default function TerminalView({ sessionId, active }: Props) {
       osc52Disposable.dispose();
       inputDisposable.dispose();
       scrollDisposable.dispose();
+      selectionDisposable.dispose();
+      setTerminalHasSelection(false);
       containerRef.current?.removeEventListener("paste", handlePaste, { capture: true });
       outputPromise.then((fn) => fn?.());
       exitPromise.then((fn) => fn?.());
