@@ -34,30 +34,37 @@ pub async fn check_for_updates() -> Result<Option<UpdateInfo>, String> {
         .map_err(|e| format!("Failed to parse releases: {}", e))?;
 
     let current_version = env!("CARGO_PKG_VERSION");
-    let is_windows = cfg!(target_os = "windows");
+    let current_semver = parse_semver(current_version).unwrap_or((0, 0, 0));
+
+    // Determine platform suffix for tag filtering
+    let platform_suffix: &str = if cfg!(target_os = "windows") {
+        "-win"
+    } else if cfg!(target_os = "macos") {
+        "-mac"
+    } else {
+        "" // Linux uses bare tags (no suffix)
+    };
 
     // Filter releases by platform tag suffix
     let platform_releases: Vec<&GiteaRelease> = releases
         .iter()
         .filter(|r| {
-            if is_windows {
-                r.tag_name.ends_with("-win")
+            if platform_suffix.is_empty() {
+                // Linux: bare tag only (no -win, no -mac)
+                !r.tag_name.ends_with("-win") && !r.tag_name.ends_with("-mac")
             } else {
-                !r.tag_name.ends_with("-win")
+                r.tag_name.ends_with(platform_suffix)
             }
         })
         .collect();
 
-    // Find the latest release with a higher patch version
-    // Version format: 0.1.X or v0.1.X (tag may have prefix/suffix)
-    let current_patch = parse_patch_version(current_version).unwrap_or(0);
-
-    let mut best: Option<(&GiteaRelease, u32)> = None;
+    // Find the latest release with a higher semver version
+    let mut best: Option<(&GiteaRelease, (u32, u32, u32))> = None;
     for release in &platform_releases {
-        if let Some(patch) = parse_patch_from_tag(&release.tag_name) {
-            if patch > current_patch {
-                if best.is_none() || patch > best.unwrap().1 {
-                    best = Some((release, patch));
+        if let Some(ver) = parse_semver_from_tag(&release.tag_name) {
+            if ver > current_semver {
+                if best.is_none() || ver > best.unwrap().1 {
+                    best = Some((release, ver));
                 }
             }
         }
@@ -92,36 +99,34 @@ pub async fn check_for_updates() -> Result<Option<UpdateInfo>, String> {
     }
 }
 
-/// Parse patch version from a semver string like "0.1.5" -> 5
-fn parse_patch_version(version: &str) -> Option<u32> {
+/// Parse a semver string like "0.2.5" -> (0, 2, 5)
+fn parse_semver(version: &str) -> Option<(u32, u32, u32)> {
     let clean = version.trim_start_matches('v');
     let parts: Vec<&str> = clean.split('.').collect();
     if parts.len() >= 3 {
-        parts[2].parse().ok()
+        let major = parts[0].parse().ok()?;
+        let minor = parts[1].parse().ok()?;
+        let patch = parts[2].parse().ok()?;
+        Some((major, minor, patch))
     } else {
         None
     }
 }
 
-/// Parse patch version from a tag like "v0.1.5", "v0.1.5-win", "0.1.5" -> 5
-fn parse_patch_from_tag(tag: &str) -> Option<u32> {
+/// Parse semver from a tag like "v0.2.5", "v0.2.5-win", "v0.2.5-mac" -> (0, 2, 5)
+fn parse_semver_from_tag(tag: &str) -> Option<(u32, u32, u32)> {
     let clean = tag.trim_start_matches('v');
     // Remove platform suffix
-    let clean = clean.strip_suffix("-win").unwrap_or(clean);
-    parse_patch_version(clean)
+    let clean = clean.strip_suffix("-win")
+        .or_else(|| clean.strip_suffix("-mac"))
+        .unwrap_or(clean);
+    parse_semver(clean)
 }
 
-/// Extract a clean version string from a tag like "v0.1.5-win" -> "0.1.5"
+/// Extract a clean version string from a tag like "v0.2.5-win" -> "0.2.5"
 fn extract_version_from_tag(tag: &str) -> Option<String> {
-    let clean = tag.trim_start_matches('v');
-    let clean = clean.strip_suffix("-win").unwrap_or(clean);
-    // Validate it looks like a version
-    let parts: Vec<&str> = clean.split('.').collect();
-    if parts.len() >= 3 && parts.iter().all(|p| p.parse::<u32>().is_ok()) {
-        Some(clean.to_string())
-    } else {
-        None
-    }
+    let (major, minor, patch) = parse_semver_from_tag(tag)?;
+    Some(format!("{}.{}.{}", major, minor, patch))
 }
 
 /// Check whether a newer container image is available in the registry.
