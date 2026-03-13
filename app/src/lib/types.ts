@@ -23,7 +23,7 @@ export interface Project {
   backend: Backend;
   bedrock_config: BedrockConfig | null;
   ollama_config: OllamaConfig | null;
-  litellm_config: LiteLlmConfig | null;
+  openai_compatible_config: OpenAiCompatibleConfig | null;
   allow_docker_access: boolean;
   mission_control_enabled: boolean;
   ssh_key_path: string | null;
@@ -45,7 +45,7 @@ export type ProjectStatus =
   | "stopping"
   | "error";
 
-export type Backend = "anthropic" | "bedrock" | "ollama" | "lite_llm";
+export type Backend = "anthropic" | "bedrock" | "ollama" | "open_ai_compatible";
 
 export type BedrockAuthMethod = "static_credentials" | "profile" | "bearer_token";
 
@@ -66,7 +66,7 @@ export interface OllamaConfig {
   model_id: string | null;
 }
 
-export interface LiteLlmConfig {
+export interface OpenAiCompatibleConfig {
   base_url: string;
   api_key: string | null;
   model_id: string | null;

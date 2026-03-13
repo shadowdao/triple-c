@@ -35,7 +35,8 @@ pub struct Project {
     pub backend: Backend,
     pub bedrock_config: Option<BedrockConfig>,
     pub ollama_config: Option<OllamaConfig>,
-    pub litellm_config: Option<LiteLlmConfig>,
+    #[serde(alias = "litellm_config")]
+    pub openai_compatible_config: Option<OpenAiCompatibleConfig>,
     pub allow_docker_access: bool,
     #[serde(default)]
     pub mission_control_enabled: bool,
@@ -70,7 +71,7 @@ pub enum ProjectStatus {
 /// - `Anthropic`: Direct Anthropic API (user runs `claude login` inside the container)
 /// - `Bedrock`: AWS Bedrock with per-project AWS credentials
 /// - `Ollama`: Local or remote Ollama server
-/// - `LiteLlm`: LiteLLM proxy gateway for 100+ model providers
+/// - `OpenAiCompatible`: Any OpenAI API-compatible endpoint (e.g., LiteLLM, vLLM, etc.)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum Backend {
@@ -79,8 +80,8 @@ pub enum Backend {
     Anthropic,
     Bedrock,
     Ollama,
-    #[serde(alias = "litellm")]
-    LiteLlm,
+    #[serde(alias = "lite_llm", alias = "litellm")]
+    OpenAiCompatible,
 }
 
 impl Default for Backend {
@@ -132,13 +133,14 @@ pub struct OllamaConfig {
     pub model_id: Option<String>,
 }
 
-/// LiteLLM gateway configuration for a project.
-/// LiteLLM translates Anthropic API calls to 100+ model providers.
+/// OpenAI Compatible endpoint configuration for a project.
+/// Routes Anthropic API calls through any OpenAI API-compatible endpoint
+/// (e.g., LiteLLM, vLLM, or other compatible gateways).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LiteLlmConfig {
-    /// The base URL of the LiteLLM proxy (e.g., "http://host.docker.internal:4000" or "https://litellm.example.com")
+pub struct OpenAiCompatibleConfig {
+    /// The base URL of the OpenAI-compatible endpoint (e.g., "http://host.docker.internal:4000" or "https://api.example.com")
     pub base_url: String,
-    /// API key for the LiteLLM proxy
+    /// API key for the OpenAI-compatible endpoint
     #[serde(skip_serializing, default)]
     pub api_key: Option<String>,
     /// Optional model override
@@ -157,7 +159,7 @@ impl Project {
             backend: Backend::default(),
             bedrock_config: None,
             ollama_config: None,
-            litellm_config: None,
+            openai_compatible_config: None,
             allow_docker_access: false,
             mission_control_enabled: false,
             ssh_key_path: None,

@@ -14,7 +14,7 @@ Triple-C (Claude-Code-Container) is a desktop application that runs Claude Code 
 - [MCP Servers (Beta)](#mcp-servers-beta)
 - [AWS Bedrock Configuration](#aws-bedrock-configuration)
 - [Ollama Configuration](#ollama-configuration)
-- [LiteLLM Configuration](#litellm-configuration)
+- [OpenAI Compatible Configuration](#openai-compatible-configuration)
 - [Settings](#settings)
 - [Terminal Features](#terminal-features)
 - [Scheduled Tasks (Inside the Container)](#scheduled-tasks-inside-the-container)
@@ -53,7 +53,7 @@ You need access to Claude Code through one of:
 - **Anthropic account** — Sign up at https://claude.ai and use `claude login` (OAuth) inside the terminal
 - **AWS Bedrock** — An AWS account with Bedrock access and Claude models enabled
 - **Ollama** — A local or remote Ollama server running an Anthropic-compatible model (best-effort support)
-- **LiteLLM** — A LiteLLM proxy gateway providing access to 100+ model providers (best-effort support)
+- **OpenAI Compatible** — Any OpenAI API-compatible endpoint (LiteLLM, OpenRouter, vLLM, text-generation-inference, LocalAI, etc.) (best-effort support)
 
 ---
 
@@ -117,11 +117,11 @@ Claude Code launches automatically with `--dangerously-skip-permissions` inside 
 4. Make sure the model has been pulled in Ollama (e.g., `ollama pull qwen3.5:27b`) or used via Ollama cloud before starting.
 5. Start the container again.
 
-**LiteLLM:**
+**OpenAI Compatible:**
 
 1. Stop the container first (settings can only be changed while stopped).
-2. In the project card, switch the backend to **LiteLLM**.
-3. Expand the **Config** panel and set the base URL of your LiteLLM proxy (defaults to `http://host.docker.internal:4000`). Optionally set an API key and model ID.
+2. In the project card, switch the backend to **OpenAI Compatible**.
+3. Expand the **Config** panel and set the base URL of your OpenAI-compatible endpoint (defaults to `http://host.docker.internal:4000` as an example). Optionally set an API key and model ID.
 4. Start the container again.
 
 ---
@@ -427,21 +427,21 @@ Triple-C sets `ANTHROPIC_BASE_URL` to point Claude Code at your Ollama server in
 
 ---
 
-## LiteLLM Configuration
+## OpenAI Compatible Configuration
 
-To use Claude Code through a [LiteLLM](https://docs.litellm.ai/) proxy gateway, switch the backend to **LiteLLM** on the project card. LiteLLM supports 100+ model providers (OpenAI, Gemini, Anthropic, and more) through a single proxy.
+To use Claude Code through any OpenAI API-compatible endpoint, switch the backend to **OpenAI Compatible** on the project card. This works with any server that exposes an OpenAI-compatible API, including LiteLLM, OpenRouter, vLLM, text-generation-inference, LocalAI, and others.
 
 ### Settings
 
-- **Base URL** — The URL of your LiteLLM proxy. Defaults to `http://host.docker.internal:4000` for a locally running proxy.
-- **API Key** — Optional. The API key for your LiteLLM proxy, if authentication is required. Stored securely in your OS keychain.
+- **Base URL** — The URL of your OpenAI-compatible endpoint. Defaults to `http://host.docker.internal:4000` as an example (adjust to match your server's address and port).
+- **API Key** — Optional. The API key for your endpoint, if authentication is required. Stored securely in your OS keychain.
 - **Model ID** — Optional. Override the model to use.
 
 ### How It Works
 
-Triple-C sets `ANTHROPIC_BASE_URL` to point Claude Code at your LiteLLM proxy. If an API key is provided, it is set as `ANTHROPIC_AUTH_TOKEN`.
+Triple-C sets `ANTHROPIC_BASE_URL` to point Claude Code at your OpenAI-compatible endpoint. If an API key is provided, it is set as `ANTHROPIC_AUTH_TOKEN`.
 
-> **Note:** LiteLLM support is best-effort. Claude Code is designed for Anthropic models, so some features (tool use, extended thinking, prompt caching, etc.) may not work as expected when routing to non-Anthropic models through the proxy.
+> **Note:** OpenAI Compatible support is best-effort. Claude Code is designed for Anthropic models, so some features (tool use, extended thinking, prompt caching, etc.) may not work as expected when routing to non-Anthropic models through the endpoint.
 
 ---
 

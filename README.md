@@ -50,9 +50,9 @@ Each project can independently use one of:
 - **Anthropic** (OAuth): User runs `claude login` inside the terminal on first use. Token persisted in the config volume across restarts and resets.
 - **AWS Bedrock**: Per-project AWS credentials (static keys, profile, or bearer token). SSO sessions are validated before launching Claude for Profile auth.
 - **Ollama**: Connect to a local or remote Ollama server via `ANTHROPIC_BASE_URL` (e.g., `http://host.docker.internal:11434`). Requires a model ID, and the model must be pulled (or used via Ollama cloud) before starting the container.
-- **LiteLLM**: Connect through a LiteLLM proxy gateway via `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` to access 100+ model providers. API key stored securely in OS keychain.
+- **OpenAI Compatible**: Connect through any OpenAI API-compatible endpoint (LiteLLM, OpenRouter, vLLM, text-generation-inference, LocalAI, etc.) via `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`. API key stored securely in OS keychain.
 
-> **Note:** Ollama and LiteLLM support is best-effort. Claude Code is designed for Anthropic models, so some features (tool use, extended thinking, prompt caching, etc.) may not work as expected with non-Anthropic models behind these backends.
+> **Note:** Ollama and OpenAI Compatible support is best-effort. Claude Code is designed for Anthropic models, so some features (tool use, extended thinking, prompt caching, etc.) may not work as expected with non-Anthropic models behind these backends.
 
 ### Container Spawning (Sibling Containers)
 

@@ -244,13 +244,13 @@ fn compute_ollama_fingerprint(project: &Project) -> String {
     }
 }
 
-/// Compute a fingerprint for the LiteLLM configuration so we can detect changes.
-fn compute_litellm_fingerprint(project: &Project) -> String {
-    if let Some(ref litellm) = project.litellm_config {
+/// Compute a fingerprint for the OpenAI Compatible configuration so we can detect changes.
+fn compute_openai_compatible_fingerprint(project: &Project) -> String {
+    if let Some(ref config) = project.openai_compatible_config {
         let parts = vec![
-            litellm.base_url.clone(),
-            litellm.api_key.as_deref().unwrap_or("").to_string(),
-            litellm.model_id.as_deref().unwrap_or("").to_string(),
+            config.base_url.clone(),
+            config.api_key.as_deref().unwrap_or("").to_string(),
+            config.model_id.as_deref().unwrap_or("").to_string(),
         ];
         sha256_hex(&parts.join("|"))
     } else {
@@ -516,14 +516,14 @@ pub async fn create_container(
         }
     }
 
-    // LiteLLM configuration
-    if project.backend == Backend::LiteLlm {
-        if let Some(ref litellm) = project.litellm_config {
-            env_vars.push(format!("ANTHROPIC_BASE_URL={}", litellm.base_url));
-            if let Some(ref key) = litellm.api_key {
+    // OpenAI Compatible configuration
+    if project.backend == Backend::OpenAiCompatible {
+        if let Some(ref config) = project.openai_compatible_config {
+            env_vars.push(format!("ANTHROPIC_BASE_URL={}", config.base_url));
+            if let Some(ref key) = config.api_key {
                 env_vars.push(format!("ANTHROPIC_AUTH_TOKEN={}", key));
             }
-            if let Some(ref model) = litellm.model_id {
+            if let Some(ref model) = config.model_id {
                 env_vars.push(format!("ANTHROPIC_MODEL={}", model));
             }
         }
@@ -698,7 +698,7 @@ pub async fn create_container(
     labels.insert("triple-c.paths-fingerprint".to_string(), compute_paths_fingerprint(&project.paths));
     labels.insert("triple-c.bedrock-fingerprint".to_string(), compute_bedrock_fingerprint(project));
     labels.insert("triple-c.ollama-fingerprint".to_string(), compute_ollama_fingerprint(project));
-    labels.insert("triple-c.litellm-fingerprint".to_string(), compute_litellm_fingerprint(project));
+    labels.insert("triple-c.openai-compatible-fingerprint".to_string(), compute_openai_compatible_fingerprint(project));
     labels.insert("triple-c.ports-fingerprint".to_string(), compute_ports_fingerprint(&project.port_mappings));
     labels.insert("triple-c.image".to_string(), image_name.to_string());
     labels.insert("triple-c.timezone".to_string(), timezone.unwrap_or("").to_string());
@@ -948,11 +948,11 @@ pub async fn container_needs_recreation(
         return Ok(true);
     }
 
-    // ── LiteLLM config fingerprint ───────────────────────────────────────
-    let expected_litellm_fp = compute_litellm_fingerprint(project);
-    let container_litellm_fp = get_label("triple-c.litellm-fingerprint").unwrap_or_default();
-    if container_litellm_fp != expected_litellm_fp {
-        log::info!("LiteLLM config mismatch");
+    // ── OpenAI Compatible config fingerprint ────────────────────────────
+    let expected_oai_fp = compute_openai_compatible_fingerprint(project);
+    let container_oai_fp = get_label("triple-c.openai-compatible-fingerprint").unwrap_or_default();
+    if container_oai_fp != expected_oai_fp {
+        log::info!("OpenAI Compatible config mismatch");
         return Ok(true);
     }
 

@@ -34,9 +34,9 @@ fn store_secrets_for_project(project: &Project) -> Result<(), String> {
             secure::store_project_secret(&project.id, "aws-bearer-token", v)?;
         }
     }
-    if let Some(ref litellm) = project.litellm_config {
-        if let Some(ref v) = litellm.api_key {
-            secure::store_project_secret(&project.id, "litellm-api-key", v)?;
+    if let Some(ref oai_config) = project.openai_compatible_config {
+        if let Some(ref v) = oai_config.api_key {
+            secure::store_project_secret(&project.id, "openai-compatible-api-key", v)?;
         }
     }
     Ok(())
@@ -56,8 +56,8 @@ fn load_secrets_for_project(project: &mut Project) {
         bedrock.aws_bearer_token = secure::get_project_secret(&project.id, "aws-bearer-token")
             .unwrap_or(None);
     }
-    if let Some(ref mut litellm) = project.litellm_config {
-        litellm.api_key = secure::get_project_secret(&project.id, "litellm-api-key")
+    if let Some(ref mut oai_config) = project.openai_compatible_config {
+        oai_config.api_key = secure::get_project_secret(&project.id, "openai-compatible-api-key")
             .unwrap_or(None);
     }
 }
@@ -197,11 +197,11 @@ pub async fn start_project_container(
         }
     }
 
-    if project.backend == Backend::LiteLlm {
-        let litellm = project.litellm_config.as_ref()
-            .ok_or_else(|| "LiteLLM backend selected but no LiteLLM configuration found.".to_string())?;
-        if litellm.base_url.is_empty() {
-            return Err("LiteLLM base URL is required.".to_string());
+    if project.backend == Backend::OpenAiCompatible {
+        let oai_config = project.openai_compatible_config.as_ref()
+            .ok_or_else(|| "OpenAI Compatible backend selected but no configuration found.".to_string())?;
+        if oai_config.base_url.is_empty() {
+            return Err("OpenAI Compatible base URL is required.".to_string());
         }
     }
 

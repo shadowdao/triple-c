@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
-import type { Project, ProjectPath, Backend, BedrockConfig, BedrockAuthMethod, OllamaConfig, LiteLlmConfig } from "../../lib/types";
+import type { Project, ProjectPath, Backend, BedrockConfig, BedrockAuthMethod, OllamaConfig, OpenAiCompatibleConfig } from "../../lib/types";
 import { useProjects } from "../../hooks/useProjects";
 import { useMcpServers } from "../../hooks/useMcpServers";
 import { useTerminal } from "../../hooks/useTerminal";
@@ -63,10 +63,10 @@ export default function ProjectCard({ project }: Props) {
   const [ollamaBaseUrl, setOllamaBaseUrl] = useState(project.ollama_config?.base_url ?? "http://host.docker.internal:11434");
   const [ollamaModelId, setOllamaModelId] = useState(project.ollama_config?.model_id ?? "");
 
-  // LiteLLM local state
-  const [litellmBaseUrl, setLitellmBaseUrl] = useState(project.litellm_config?.base_url ?? "http://host.docker.internal:4000");
-  const [litellmApiKey, setLitellmApiKey] = useState(project.litellm_config?.api_key ?? "");
-  const [litellmModelId, setLitellmModelId] = useState(project.litellm_config?.model_id ?? "");
+  // OpenAI Compatible local state
+  const [openaiCompatibleBaseUrl, setOpenaiCompatibleBaseUrl] = useState(project.openai_compatible_config?.base_url ?? "http://host.docker.internal:4000");
+  const [openaiCompatibleApiKey, setOpenaiCompatibleApiKey] = useState(project.openai_compatible_config?.api_key ?? "");
+  const [openaiCompatibleModelId, setOpenaiCompatibleModelId] = useState(project.openai_compatible_config?.model_id ?? "");
 
   // Sync local state when project prop changes (e.g., after save or external update)
   useEffect(() => {
@@ -88,9 +88,9 @@ export default function ProjectCard({ project }: Props) {
     setBedrockModelId(project.bedrock_config?.model_id ?? "");
     setOllamaBaseUrl(project.ollama_config?.base_url ?? "http://host.docker.internal:11434");
     setOllamaModelId(project.ollama_config?.model_id ?? "");
-    setLitellmBaseUrl(project.litellm_config?.base_url ?? "http://host.docker.internal:4000");
-    setLitellmApiKey(project.litellm_config?.api_key ?? "");
-    setLitellmModelId(project.litellm_config?.model_id ?? "");
+    setOpenaiCompatibleBaseUrl(project.openai_compatible_config?.base_url ?? "http://host.docker.internal:4000");
+    setOpenaiCompatibleApiKey(project.openai_compatible_config?.api_key ?? "");
+    setOpenaiCompatibleModelId(project.openai_compatible_config?.model_id ?? "");
   }, [project]);
 
   // Listen for container progress events
@@ -197,7 +197,7 @@ export default function ProjectCard({ project }: Props) {
     model_id: null,
   };
 
-  const defaultLiteLlmConfig: LiteLlmConfig = {
+  const defaultOpenAiCompatibleConfig: OpenAiCompatibleConfig = {
     base_url: "http://host.docker.internal:4000",
     api_key: null,
     model_id: null,
@@ -212,8 +212,8 @@ export default function ProjectCard({ project }: Props) {
       if (mode === "ollama" && !project.ollama_config) {
         updates.ollama_config = defaultOllamaConfig;
       }
-      if (mode === "lite_llm" && !project.litellm_config) {
-        updates.litellm_config = defaultLiteLlmConfig;
+      if (mode === "open_ai_compatible" && !project.openai_compatible_config) {
+        updates.openai_compatible_config = defaultOpenAiCompatibleConfig;
       }
       await update({ ...project, ...updates });
     } catch (e) {
@@ -355,30 +355,30 @@ export default function ProjectCard({ project }: Props) {
     }
   };
 
-  const handleLitellmBaseUrlBlur = async () => {
+  const handleOpenaiCompatibleBaseUrlBlur = async () => {
     try {
-      const current = project.litellm_config ?? defaultLiteLlmConfig;
-      await update({ ...project, litellm_config: { ...current, base_url: litellmBaseUrl } });
+      const current = project.openai_compatible_config ?? defaultOpenAiCompatibleConfig;
+      await update({ ...project, openai_compatible_config: { ...current, base_url: openaiCompatibleBaseUrl } });
     } catch (err) {
-      console.error("Failed to update LiteLLM base URL:", err);
+      console.error("Failed to update OpenAI Compatible base URL:", err);
     }
   };
 
-  const handleLitellmApiKeyBlur = async () => {
+  const handleOpenaiCompatibleApiKeyBlur = async () => {
     try {
-      const current = project.litellm_config ?? defaultLiteLlmConfig;
-      await update({ ...project, litellm_config: { ...current, api_key: litellmApiKey || null } });
+      const current = project.openai_compatible_config ?? defaultOpenAiCompatibleConfig;
+      await update({ ...project, openai_compatible_config: { ...current, api_key: openaiCompatibleApiKey || null } });
     } catch (err) {
-      console.error("Failed to update LiteLLM API key:", err);
+      console.error("Failed to update OpenAI Compatible API key:", err);
     }
   };
 
-  const handleLitellmModelIdBlur = async () => {
+  const handleOpenaiCompatibleModelIdBlur = async () => {
     try {
-      const current = project.litellm_config ?? defaultLiteLlmConfig;
-      await update({ ...project, litellm_config: { ...current, model_id: litellmModelId || null } });
+      const current = project.openai_compatible_config ?? defaultOpenAiCompatibleConfig;
+      await update({ ...project, openai_compatible_config: { ...current, model_id: openaiCompatibleModelId || null } });
     } catch (err) {
-      console.error("Failed to update LiteLLM model ID:", err);
+      console.error("Failed to update OpenAI Compatible model ID:", err);
     }
   };
 
@@ -449,7 +449,7 @@ export default function ProjectCard({ project }: Props) {
         <div className="mt-2 ml-4 space-y-2 min-w-0 overflow-hidden">
           {/* Backend selector */}
           <div className="flex items-center gap-1 text-xs">
-            <span className="text-[var(--text-secondary)] mr-1">Backend:<Tooltip text="Choose the AI model provider for this project. Anthropic: Connect directly to Claude via OAuth login (run 'claude login' in terminal). Bedrock: Route through AWS Bedrock using your AWS credentials. Ollama: Use locally-hosted open-source models (Llama, Mistral, etc.) via an Ollama server. LiteLLM: Connect through a LiteLLM proxy gateway to access 100+ model providers (OpenAI, Azure, Gemini, etc.)." /></span>
+            <span className="text-[var(--text-secondary)] mr-1">Backend:<Tooltip text="Choose the AI model provider for this project. Anthropic: Connect directly to Claude via OAuth login (run 'claude login' in terminal). Bedrock: Route through AWS Bedrock using your AWS credentials. Ollama: Use locally-hosted open-source models (Llama, Mistral, etc.) via an Ollama server. OpenAI Compatible: Connect through any OpenAI API-compatible endpoint (LiteLLM, OpenRouter, vLLM, etc.) to access 100+ model providers." /></span>
             <select
               value={project.backend}
               onChange={(e) => { e.stopPropagation(); handleBackendChange(e.target.value as Backend); }}
@@ -460,7 +460,7 @@ export default function ProjectCard({ project }: Props) {
               <option value="anthropic">Anthropic</option>
               <option value="bedrock">Bedrock</option>
               <option value="ollama">Ollama</option>
-              <option value="lite_llm">LiteLLM</option>
+              <option value="open_ai_compatible">OpenAI Compatible</option>
             </select>
           </div>
 
@@ -956,38 +956,38 @@ export default function ProjectCard({ project }: Props) {
                 );
               })()}
 
-              {/* LiteLLM config */}
-              {project.backend === "lite_llm" && (() => {
+              {/* OpenAI Compatible config */}
+              {project.backend === "open_ai_compatible" && (() => {
                 const inputCls = "w-full px-2 py-1 bg-[var(--bg-primary)] border border-[var(--border-color)] rounded text-xs text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)] disabled:opacity-50";
                 return (
                   <div className="space-y-2 pt-1 border-t border-[var(--border-color)]">
-                    <label className="block text-xs font-medium text-[var(--text-primary)]">LiteLLM Gateway</label>
+                    <label className="block text-xs font-medium text-[var(--text-primary)]">OpenAI Compatible Endpoint</label>
                     <p className="text-xs text-[var(--text-secondary)]">
-                      Connect through a LiteLLM proxy to use 100+ model providers.
+                      Connect through any OpenAI API-compatible endpoint (LiteLLM, OpenRouter, vLLM, etc.).
                     </p>
 
                     <div>
-                      <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Base URL<Tooltip text="URL of your LiteLLM proxy server. Use host.docker.internal for a locally running proxy." /></label>
+                      <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Base URL<Tooltip text="URL of your OpenAI API-compatible server. Use host.docker.internal for a locally running service." /></label>
                       <input
-                        value={litellmBaseUrl}
-                        onChange={(e) => setLitellmBaseUrl(e.target.value)}
-                        onBlur={handleLitellmBaseUrlBlur}
+                        value={openaiCompatibleBaseUrl}
+                        onChange={(e) => setOpenaiCompatibleBaseUrl(e.target.value)}
+                        onBlur={handleOpenaiCompatibleBaseUrlBlur}
                         placeholder="http://host.docker.internal:4000"
                         disabled={!isStopped}
                         className={inputCls}
                       />
                       <p className="text-xs text-[var(--text-secondary)] mt-0.5 opacity-70">
-                        Use host.docker.internal for local, or a URL for remote/containerized LiteLLM.
+                        Use host.docker.internal for local, or a URL for a remote OpenAI-compatible service.
                       </p>
                     </div>
 
                     <div>
-                      <label className="block text-xs text-[var(--text-secondary)] mb-0.5">API Key<Tooltip text="Authentication key for your LiteLLM proxy, if required." /></label>
+                      <label className="block text-xs text-[var(--text-secondary)] mb-0.5">API Key<Tooltip text="Authentication key for your OpenAI-compatible endpoint, if required." /></label>
                       <input
                         type="password"
-                        value={litellmApiKey}
-                        onChange={(e) => setLitellmApiKey(e.target.value)}
-                        onBlur={handleLitellmApiKeyBlur}
+                        value={openaiCompatibleApiKey}
+                        onChange={(e) => setOpenaiCompatibleApiKey(e.target.value)}
+                        onBlur={handleOpenaiCompatibleApiKeyBlur}
                         placeholder="sk-..."
                         disabled={!isStopped}
                         className={inputCls}
@@ -995,11 +995,11 @@ export default function ProjectCard({ project }: Props) {
                     </div>
 
                     <div>
-                      <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Model (optional)<Tooltip text="Model identifier as configured in your LiteLLM proxy (e.g. gpt-4o, gemini-pro)." /></label>
+                      <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Model (optional)<Tooltip text="Model identifier as configured in your provider (e.g. gpt-4o, gemini-pro)." /></label>
                       <input
-                        value={litellmModelId}
-                        onChange={(e) => setLitellmModelId(e.target.value)}
-                        onBlur={handleLitellmModelIdBlur}
+                        value={openaiCompatibleModelId}
+                        onChange={(e) => setOpenaiCompatibleModelId(e.target.value)}
+                        onBlur={handleOpenaiCompatibleModelIdBlur}
                         placeholder="gpt-4o / gemini-pro / etc."
                         disabled={!isStopped}
                         className={inputCls}
