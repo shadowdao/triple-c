@@ -2,7 +2,7 @@ use std::sync::OnceLock;
 use tokio::sync::Mutex;
 
 const HELP_URL: &str =
-    "https://repo.anhonesthost.net/cybercovellc/triple-c/raw/branch/main/HOW-TO-USE.md";
+    "https://raw.githubusercontent.com/shadowdao/triple-c/main/HOW-TO-USE.md";
 
 const EMBEDDED_HELP: &str = include_str!("../../../../HOW-TO-USE.md");
 

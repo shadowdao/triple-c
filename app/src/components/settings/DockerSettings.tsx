@@ -4,7 +4,7 @@ import { useSettings } from "../../hooks/useSettings";
 import type { ImageSource } from "../../lib/types";
 import Tooltip from "../ui/Tooltip";
 
-const REGISTRY_IMAGE = "repo.anhonesthost.net/cybercovellc/triple-c/triple-c-sandbox:latest";
+const REGISTRY_IMAGE = "ghcr.io/shadowdao/triple-c-sandbox:latest";
 
 const IMAGE_SOURCE_OPTIONS: { value: ImageSource; label: string; description: string }[] = [
   { value: "registry", label: "Registry", description: "Pull from container registry" },

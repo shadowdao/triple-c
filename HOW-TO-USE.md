@@ -70,7 +70,7 @@ Choose an **Image Source**:
 
 | Source | Description | When to Use |
 |--------|-------------|-------------|
-| **Registry** | Pulls the pre-built image from `repo.anhonesthost.net` | Fastest setup — recommended for most users |
+| **Registry** | Pulls the pre-built image from `ghcr.io` | Fastest setup — recommended for most users |
 | **Local Build** | Builds the image locally from the embedded Dockerfile | If you can't reach the registry, or want a custom build |
 | **Custom** | Use any Docker image you specify | Advanced — bring your own sandbox image |
 
