@@ -35,6 +35,7 @@ export default function TerminalView({ sessionId, active }: Props) {
   const [detectedUrl, setDetectedUrl] = useState<string | null>(null);
   const [imagePasteMsg, setImagePasteMsg] = useState<string | null>(null);
   const [isAtBottom, setIsAtBottom] = useState(true);
+  const isAtBottomRef = useRef(true);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -131,10 +132,19 @@ export default function TerminalView({ sessionId, active }: Props) {
       sendInput(sessionId, data);
     });
 
-    // Track scroll position to show "Jump to Current" button
+    // Track scroll position to show "Jump to Current" button.
+    // Debounce state updates via rAF to avoid excessive re-renders during rapid output.
+    let scrollStateRafId: number | null = null;
     const scrollDisposable = term.onScroll(() => {
       const buf = term.buffer.active;
-      setIsAtBottom(buf.viewportY >= buf.baseY);
+      const atBottom = buf.viewportY >= buf.baseY;
+      isAtBottomRef.current = atBottom;
+      if (scrollStateRafId === null) {
+        scrollStateRafId = requestAnimationFrame(() => {
+          scrollStateRafId = null;
+          setIsAtBottom(isAtBottomRef.current);
+        });
+      }
     });
 
     // Track text selection to show copy hint in status bar
@@ -187,7 +197,15 @@ export default function TerminalView({ sessionId, active }: Props) {
 
     const outputPromise = onOutput(sessionId, (data) => {
       if (aborted) return;
-      term.write(data);
+      const shouldFollow = isAtBottomRef.current;
+      term.write(data, () => {
+        // Keep viewport pinned to bottom when user hasn't scrolled up
+        if (shouldFollow) {
+          term.scrollToBottom();
+          isAtBottomRef.current = true;
+          setIsAtBottom(true);
+        }
+      });
       detector.feed(data);
 
       // Scan for SSO refresh marker in terminal output
@@ -229,8 +247,13 @@ export default function TerminalView({ sessionId, active }: Props) {
       resizeRafId = requestAnimationFrame(() => {
         resizeRafId = null;
         if (!containerRef.current || containerRef.current.offsetWidth === 0) return;
+        const wasAtBottom = isAtBottomRef.current;
         fitAddon.fit();
         resize(sessionId, term.cols, term.rows);
+        // Maintain scroll position after resize reflow
+        if (wasAtBottom) {
+          term.scrollToBottom();
+        }
       });
     });
     resizeObserver.observe(containerRef.current);
@@ -249,6 +272,7 @@ export default function TerminalView({ sessionId, active }: Props) {
       containerRef.current?.removeEventListener("paste", handlePaste, { capture: true });
       outputPromise.then((fn) => fn?.());
       exitPromise.then((fn) => fn?.());
+      if (scrollStateRafId !== null) cancelAnimationFrame(scrollStateRafId);
       if (resizeRafId !== null) cancelAnimationFrame(resizeRafId);
       resizeObserver.disconnect();
       try { webglRef.current?.dispose(); } catch { /* may already be disposed */ }
@@ -314,8 +338,14 @@ export default function TerminalView({ sessionId, active }: Props) {
   }, [detectedUrl]);
 
   const handleScrollToBottom = useCallback(() => {
-    termRef.current?.scrollToBottom();
-    setIsAtBottom(true);
+    const term = termRef.current;
+    if (term) {
+      // Re-fit first to fix viewport desync (same thing a resize does)
+      fitRef.current?.fit();
+      term.scrollToBottom();
+      isAtBottomRef.current = true;
+      setIsAtBottom(true);
+    }
   }, []);
 
   return (
