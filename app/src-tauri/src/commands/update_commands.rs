@@ -1,15 +1,20 @@
+use serde::Deserialize;
 use tauri::State;
 
 use crate::docker;
-use crate::models::{container_config, GiteaRelease, ImageUpdateInfo, ReleaseAsset, UpdateInfo};
+use crate::models::{container_config, GitHubRelease, ImageUpdateInfo, ReleaseAsset, UpdateInfo};
 use crate::AppState;
 
 const RELEASES_URL: &str =
-    "https://repo.anhonesthost.net/api/v1/repos/cybercovellc/triple-c/releases";
+    "https://api.github.com/repos/shadowdao/triple-c/releases";
 
-/// Gitea container-registry tag object (v2 manifest).
+/// GHCR container-registry API base (OCI distribution spec).
 const REGISTRY_API_BASE: &str =
-    "https://repo.anhonesthost.net/v2/cybercovellc/triple-c/triple-c-sandbox";
+    "https://ghcr.io/v2/shadowdao/triple-c-sandbox";
+
+/// GHCR token endpoint for anonymous pull access.
+const GHCR_TOKEN_URL: &str =
+    "https://ghcr.io/token?scope=repository:shadowdao/triple-c-sandbox:pull";
 
 #[tauri::command]
 pub fn get_app_version() -> String {
@@ -23,9 +28,10 @@ pub async fn check_for_updates() -> Result<Option<UpdateInfo>, String> {
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
-    let releases: Vec<GiteaRelease> = client
+    let releases: Vec<GitHubRelease> = client
         .get(RELEASES_URL)
         .header("Accept", "application/json")
+        .header("User-Agent", "triple-c-updater")
         .send()
         .await
         .map_err(|e| format!("Failed to fetch releases: {}", e))?
@@ -36,30 +42,27 @@ pub async fn check_for_updates() -> Result<Option<UpdateInfo>, String> {
     let current_version = env!("CARGO_PKG_VERSION");
     let current_semver = parse_semver(current_version).unwrap_or((0, 0, 0));
 
-    // Determine platform suffix for tag filtering
-    let platform_suffix: &str = if cfg!(target_os = "windows") {
-        "-win"
+    // Determine platform-specific asset extensions
+    let platform_extensions: &[&str] = if cfg!(target_os = "windows") {
+        &[".msi", ".exe"]
     } else if cfg!(target_os = "macos") {
-        "-mac"
+        &[".dmg", ".app.tar.gz"]
     } else {
-        "" // Linux uses bare tags (no suffix)
+        &[".AppImage", ".deb", ".rpm"]
     };
 
-    // Filter releases by platform tag suffix
-    let platform_releases: Vec<&GiteaRelease> = releases
+    // Filter releases that have at least one asset matching the current platform
+    let platform_releases: Vec<&GitHubRelease> = releases
         .iter()
         .filter(|r| {
-            if platform_suffix.is_empty() {
-                // Linux: bare tag only (no -win, no -mac)
-                !r.tag_name.ends_with("-win") && !r.tag_name.ends_with("-mac")
-            } else {
-                r.tag_name.ends_with(platform_suffix)
-            }
+            r.assets.iter().any(|a| {
+                platform_extensions.iter().any(|ext| a.name.ends_with(ext))
+            })
         })
         .collect();
 
     // Find the latest release with a higher semver version
-    let mut best: Option<(&GiteaRelease, (u32, u32, u32))> = None;
+    let mut best: Option<(&GitHubRelease, (u32, u32, u32))> = None;
     for release in &platform_releases {
         if let Some(ver) = parse_semver_from_tag(&release.tag_name) {
             if ver > current_semver {
@@ -72,9 +75,13 @@ pub async fn check_for_updates() -> Result<Option<UpdateInfo>, String> {
 
     match best {
         Some((release, _)) => {
+            // Only include assets matching the current platform
             let assets = release
                 .assets
                 .iter()
+                .filter(|a| {
+                    platform_extensions.iter().any(|ext| a.name.ends_with(ext))
+                })
                 .map(|a| ReleaseAsset {
                     name: a.name.clone(),
                     browser_download_url: a.browser_download_url.clone(),
@@ -82,7 +89,6 @@ pub async fn check_for_updates() -> Result<Option<UpdateInfo>, String> {
                 })
                 .collect();
 
-            // Reconstruct version string from tag
             let version = extract_version_from_tag(&release.tag_name)
                 .unwrap_or_else(|| release.tag_name.clone());
 
@@ -113,17 +119,13 @@ fn parse_semver(version: &str) -> Option<(u32, u32, u32)> {
     }
 }
 
-/// Parse semver from a tag like "v0.2.5", "v0.2.5-win", "v0.2.5-mac" -> (0, 2, 5)
+/// Parse semver from a tag like "v0.2.5" -> (0, 2, 5)
 fn parse_semver_from_tag(tag: &str) -> Option<(u32, u32, u32)> {
     let clean = tag.trim_start_matches('v');
-    // Remove platform suffix
-    let clean = clean.strip_suffix("-win")
-        .or_else(|| clean.strip_suffix("-mac"))
-        .unwrap_or(clean);
     parse_semver(clean)
 }
 
-/// Extract a clean version string from a tag like "v0.2.5-win" -> "0.2.5"
+/// Extract a clean version string from a tag like "v0.2.5" -> "0.2.5"
 fn extract_version_from_tag(tag: &str) -> Option<String> {
     let (major, minor, patch) = parse_semver_from_tag(tag)?;
     Some(format!("{}.{}.{}", major, minor, patch))
@@ -152,7 +154,7 @@ pub async fn check_image_update(
     // 1. Get local image digest via Docker
     let local_digest = docker::get_local_image_digest(&image_name).await.ok().flatten();
 
-    // 2. Get remote digest from the Gitea container registry (OCI distribution spec)
+    // 2. Get remote digest from the GHCR container registry (OCI distribution spec)
     let remote_digest = fetch_remote_digest("latest").await?;
 
     // No remote digest available — nothing to compare
@@ -176,18 +178,28 @@ pub async fn check_image_update(
     }))
 }
 
-/// Fetch the digest of a tag from the Gitea container registry using the
-/// OCI / Docker Registry HTTP API v2.
+/// Fetch the digest of a tag from GHCR using the OCI / Docker Registry HTTP API v2.
 ///
-/// We issue a HEAD request to /v2/<repo>/manifests/<tag> and read the
-/// `Docker-Content-Digest` header that the registry returns.
+/// GHCR requires authentication even for public images, so we first obtain an
+/// anonymous token, then issue a HEAD request to /v2/<repo>/manifests/<tag>
+/// and read the `Docker-Content-Digest` header.
 async fn fetch_remote_digest(tag: &str) -> Result<Option<String>, String> {
-    let url = format!("{}/manifests/{}", REGISTRY_API_BASE, tag);
-
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+
+    // 1. Obtain anonymous bearer token from GHCR
+    let token = match fetch_ghcr_token(&client).await {
+        Ok(t) => t,
+        Err(e) => {
+            log::warn!("Failed to obtain GHCR token: {}", e);
+            return Ok(None);
+        }
+    };
+
+    // 2. HEAD the manifest with the token
+    let url = format!("{}/manifests/{}", REGISTRY_API_BASE, tag);
 
     let response = client
         .head(&url)
@@ -195,6 +207,7 @@ async fn fetch_remote_digest(tag: &str) -> Result<Option<String>, String> {
             "Accept",
             "application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.index.v1+json",
         )
+        .header("Authorization", format!("Bearer {}", token))
         .send()
         .await;
 
@@ -220,4 +233,24 @@ async fn fetch_remote_digest(tag: &str) -> Result<Option<String>, String> {
             Ok(None)
         }
     }
+}
+
+/// Fetch an anonymous bearer token from GHCR for pulling public images.
+async fn fetch_ghcr_token(client: &reqwest::Client) -> Result<String, String> {
+    #[derive(Deserialize)]
+    struct TokenResponse {
+        token: String,
+    }
+
+    let resp: TokenResponse = client
+        .get(GHCR_TOKEN_URL)
+        .header("User-Agent", "triple-c-updater")
+        .send()
+        .await
+        .map_err(|e| format!("GHCR token request failed: {}", e))?
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse GHCR token response: {}", e))?;
+
+    Ok(resp.token)
 }

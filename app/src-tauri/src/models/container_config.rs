@@ -12,7 +12,7 @@ pub struct ContainerInfo {
 
 pub const LOCAL_IMAGE_NAME: &str = "triple-c";
 pub const IMAGE_TAG: &str = "latest";
-pub const REGISTRY_IMAGE: &str = "repo.anhonesthost.net/cybercovellc/triple-c/triple-c-sandbox:latest";
+pub const REGISTRY_IMAGE: &str = "ghcr.io/shadowdao/triple-c-sandbox:latest";
 
 pub fn local_build_image_name() -> String {
     format!("{LOCAL_IMAGE_NAME}:{IMAGE_TAG}")

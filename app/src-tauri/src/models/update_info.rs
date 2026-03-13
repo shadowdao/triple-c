@@ -18,19 +18,19 @@ pub struct ReleaseAsset {
     pub size: u64,
 }
 
-/// Gitea API release response (internal).
+/// GitHub API release response (internal).
 #[derive(Debug, Clone, Deserialize)]
-pub struct GiteaRelease {
+pub struct GitHubRelease {
     pub tag_name: String,
     pub html_url: String,
     pub body: String,
-    pub assets: Vec<GiteaAsset>,
+    pub assets: Vec<GitHubAsset>,
     pub published_at: String,
 }
 
-/// Gitea API asset response (internal).
+/// GitHub API asset response (internal).
 #[derive(Debug, Clone, Deserialize)]
-pub struct GiteaAsset {
+pub struct GitHubAsset {
     pub name: String,
     pub browser_download_url: String,
     pub size: u64,
