@@ -1,6 +1,6 @@
 # Triple-C (Claude-Code-Container)
 
-Triple-C is a cross-platform desktop application that sandboxes Claude Code inside Docker containers. When running with `--dangerously-skip-permissions`, Claude only has access to the files and projects you explicitly provide to it.
+Triple-C is a cross-platform desktop application that sandboxes Claude Code inside Docker containers. Each project can optionally enable full permissions mode (`--dangerously-skip-permissions`), giving Claude unrestricted access within the sandbox.
 
 ## Architecture
 

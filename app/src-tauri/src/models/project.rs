@@ -24,6 +24,10 @@ fn default_protocol() -> String {
     "tcp".to_string()
 }
 
+fn default_full_permissions() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub id: String,
@@ -40,6 +44,8 @@ pub struct Project {
     pub allow_docker_access: bool,
     #[serde(default)]
     pub mission_control_enabled: bool,
+    #[serde(default = "default_full_permissions")]
+    pub full_permissions: bool,
     pub ssh_key_path: Option<String>,
     #[serde(skip_serializing, default)]
     pub git_token: Option<String>,
@@ -162,6 +168,7 @@ impl Project {
             openai_compatible_config: None,
             allow_docker_access: false,
             mission_control_enabled: false,
+            full_permissions: false,
             ssh_key_path: None,
             git_token: None,
             git_user_name: None,

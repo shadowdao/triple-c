@@ -26,6 +26,7 @@ export interface Project {
   openai_compatible_config: OpenAiCompatibleConfig | null;
   allow_docker_access: boolean;
   mission_control_enabled: boolean;
+  full_permissions: boolean;
   ssh_key_path: string | null;
   git_token: string | null;
   git_user_name: string | null;

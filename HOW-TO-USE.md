@@ -92,7 +92,7 @@ Select your project in the sidebar and click **Start**. A progress modal appears
 
 Click the **Terminal** button to open an interactive terminal session. A new tab appears in the top bar and an xterm.js terminal loads in the main area.
 
-Claude Code launches automatically with `--dangerously-skip-permissions` inside the sandboxed container.
+Claude Code launches automatically. By default, it runs in standard permission mode and will ask for your approval before executing commands or editing files. To enable auto-approval of all actions within the sandbox, enable **Full Permissions** in the project configuration.
 
 ### 5. Authenticate
 
@@ -235,6 +235,18 @@ Toggle **Mission Control** to integrate [Flight Control](https://github.com/msie
 Available skills include `/mission`, `/flight`, `/leg`, `/agentic-workflow`, `/flight-debrief`, `/mission-debrief`, `/daily-briefing`, and `/init-project`.
 
 > This setting can only be changed when the container is stopped. Toggling it triggers a container recreation on the next start.
+
+### Full Permissions
+
+Toggle **Full Permissions** to allow Claude Code to run with `--dangerously-skip-permissions` inside the container. This is **off by default**.
+
+When **enabled**, Claude auto-approves all tool calls (file edits, shell commands, etc.) without prompting you. This is the fastest workflow since you won't be interrupted for approvals, and the Docker container provides isolation.
+
+When **disabled** (default), Claude prompts you for approval before executing each action, giving you fine-grained control over what it does.
+
+> **CAUTION:** Enabling full permissions means Claude can execute any command inside the container without asking. While the container sandbox limits the blast radius, make sure you understand the implications — especially if the container has Docker socket access or network connectivity.
+
+> This setting can only be changed when the container is stopped. It takes effect the next time you open a terminal session.
 
 ### Environment Variables
 

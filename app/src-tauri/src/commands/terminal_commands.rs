@@ -17,10 +17,11 @@ fn build_terminal_cmd(project: &Project, state: &AppState) -> Vec<String> {
             .unwrap_or(false);
 
     if !is_bedrock_profile {
-        return vec![
-            "claude".to_string(),
-            "--dangerously-skip-permissions".to_string(),
-        ];
+        let mut cmd = vec!["claude".to_string()];
+        if project.full_permissions {
+            cmd.push("--dangerously-skip-permissions".to_string());
+        }
+        return cmd;
     }
 
     // Resolve AWS profile: project-level → global settings → "default"
@@ -33,6 +34,12 @@ fn build_terminal_cmd(project: &Project, state: &AppState) -> Vec<String> {
 
     // Build a bash wrapper that validates credentials, re-auths if needed,
     // then exec's into claude.
+    let claude_cmd = if project.full_permissions {
+        "exec claude --dangerously-skip-permissions"
+    } else {
+        "exec claude"
+    };
+
     let script = format!(
         r#"
 echo "Validating AWS session for profile '{profile}'..."
@@ -58,9 +65,10 @@ else
         echo ""
     fi
 fi
-exec claude --dangerously-skip-permissions
+{claude_cmd}
 "#,
-        profile = profile
+        profile = profile,
+        claude_cmd = claude_cmd
     );
 
     vec![

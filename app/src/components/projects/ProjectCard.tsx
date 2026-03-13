@@ -712,6 +712,32 @@ export default function ProjectCard({ project }: Props) {
                 </button>
               </div>
 
+              {/* Full Permissions toggle */}
+              <div className="flex items-center gap-2">
+                <label className="text-xs text-[var(--text-secondary)]">
+                  Full Permissions
+                  <span className="text-[var(--error)] font-semibold ml-1">(CAUTION)</span>
+                  <Tooltip text="When enabled, Claude runs with --dangerously-skip-permissions and auto-approves all tool calls without prompting. Only enable this if you trust the sandboxed environment to contain all actions. When disabled, Claude will ask for your approval before running commands, editing files, etc." />
+                </label>
+                <button
+                  onClick={async () => {
+                    try {
+                      await update({ ...project, full_permissions: !project.full_permissions });
+                    } catch (err) {
+                      console.error("Failed to update full permissions setting:", err);
+                    }
+                  }}
+                  disabled={!isStopped}
+                  className={`px-2 py-0.5 text-xs rounded transition-colors disabled:opacity-50 ${
+                    project.full_permissions
+                      ? "bg-[var(--error)] text-white"
+                      : "bg-[var(--bg-primary)] border border-[var(--border-color)] text-[var(--text-secondary)]"
+                  }`}
+                >
+                  {project.full_permissions ? "ON" : "OFF"}
+                </button>
+              </div>
+
               {/* Environment Variables */}
               <div className="flex items-center justify-between">
                 <label className="text-xs text-[var(--text-secondary)]">
