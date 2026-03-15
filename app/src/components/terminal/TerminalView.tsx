@@ -35,10 +35,12 @@ export default function TerminalView({ sessionId, active }: Props) {
   const [detectedUrl, setDetectedUrl] = useState<string | null>(null);
   const [imagePasteMsg, setImagePasteMsg] = useState<string | null>(null);
   const [isAtBottom, setIsAtBottom] = useState(true);
+  const [isAutoFollow, setIsAutoFollow] = useState(true);
   const isAtBottomRef = useRef(true);
   // Tracks user intent to follow output — only set to false by explicit user
   // actions (mouse wheel up), not by xterm scroll events during writes.
   const autoFollowRef = useRef(true);
+  const lastUserScrollTimeRef = useRef(0);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -138,8 +140,10 @@ export default function TerminalView({ sessionId, active }: Props) {
     // Detect user-initiated scroll-up (mouse wheel) to pause auto-follow.
     // Captured during capture phase so it fires before xterm's own handler.
     const handleWheel = (e: WheelEvent) => {
+      lastUserScrollTimeRef.current = Date.now();
       if (e.deltaY < 0) {
         autoFollowRef.current = false;
+        setIsAutoFollow(false);
       }
     };
     containerRef.current.addEventListener("wheel", handleWheel, { capture: true, passive: true });
@@ -150,16 +154,24 @@ export default function TerminalView({ sessionId, active }: Props) {
     const scrollDisposable = term.onScroll(() => {
       const buf = term.buffer.active;
       const atBottom = buf.viewportY >= buf.baseY;
+      const prevAtBottom = isAtBottomRef.current;
       isAtBottomRef.current = atBottom;
-      // Re-enable auto-follow when viewport reaches the bottom
-      if (atBottom) {
+
+      // Re-enable auto-follow only when USER scrolls to bottom (not write-triggered)
+      const isUserScroll = (Date.now() - lastUserScrollTimeRef.current) < 300;
+      if (atBottom && isUserScroll && !autoFollowRef.current) {
         autoFollowRef.current = true;
+        setIsAutoFollow(true);
       }
-      if (scrollStateRafId === null) {
-        scrollStateRafId = requestAnimationFrame(() => {
-          scrollStateRafId = null;
-          setIsAtBottom(isAtBottomRef.current);
-        });
+
+      // Only update React state when value changes
+      if (atBottom !== prevAtBottom) {
+        if (scrollStateRafId === null) {
+          scrollStateRafId = requestAnimationFrame(() => {
+            scrollStateRafId = null;
+            setIsAtBottom(isAtBottomRef.current);
+          });
+        }
       }
     });
 
@@ -214,14 +226,12 @@ export default function TerminalView({ sessionId, active }: Props) {
     const outputPromise = onOutput(sessionId, (data) => {
       if (aborted) return;
       term.write(data, () => {
-        // Keep viewport pinned to bottom when user hasn't scrolled up.
-        // Uses autoFollowRef (user intent) rather than isAtBottomRef (viewport
-        // position) so that xterm desync during writes doesn't kill auto-follow,
-        // but an explicit user scroll-up does pause it.
         if (autoFollowRef.current) {
           term.scrollToBottom();
-          isAtBottomRef.current = true;
-          setIsAtBottom(true);
+          if (!isAtBottomRef.current) {
+            isAtBottomRef.current = true;
+            setIsAtBottom(true);
+          }
         }
       });
       detector.feed(data);
@@ -265,11 +275,9 @@ export default function TerminalView({ sessionId, active }: Props) {
       resizeRafId = requestAnimationFrame(() => {
         resizeRafId = null;
         if (!containerRef.current || containerRef.current.offsetWidth === 0) return;
-        const wasAtBottom = isAtBottomRef.current;
         fitAddon.fit();
         resize(sessionId, term.cols, term.rows);
-        // Maintain scroll position after resize reflow
-        if (wasAtBottom) {
+        if (autoFollowRef.current) {
           term.scrollToBottom();
         }
       });
@@ -323,6 +331,9 @@ export default function TerminalView({ sessionId, active }: Props) {
         }
       }
       fitRef.current?.fit();
+      if (autoFollowRef.current) {
+        term.scrollToBottom();
+      }
       term.focus();
     } else {
       // Release WebGL context for inactive terminals
@@ -360,11 +371,26 @@ export default function TerminalView({ sessionId, active }: Props) {
     const term = termRef.current;
     if (term) {
       autoFollowRef.current = true;
-      // Re-fit first to fix viewport desync (same thing a resize does)
+      setIsAutoFollow(true);
       fitRef.current?.fit();
       term.scrollToBottom();
       isAtBottomRef.current = true;
       setIsAtBottom(true);
+    }
+  }, []);
+
+  const handleToggleAutoFollow = useCallback(() => {
+    const next = !autoFollowRef.current;
+    autoFollowRef.current = next;
+    setIsAutoFollow(next);
+    if (next) {
+      const term = termRef.current;
+      if (term) {
+        fitRef.current?.fit();
+        term.scrollToBottom();
+        isAtBottomRef.current = true;
+        setIsAtBottom(true);
+      }
     }
   }, []);
 
@@ -388,6 +414,19 @@ export default function TerminalView({ sessionId, active }: Props) {
           {imagePasteMsg}
         </div>
       )}
+      {/* Auto-follow toggle - top right */}
+      <button
+        onClick={handleToggleAutoFollow}
+        className={`absolute top-2 right-4 z-50 px-2 py-1 rounded text-[10px] font-medium border shadow-sm transition-colors cursor-pointer ${
+          isAutoFollow
+            ? "bg-[#1a2332] text-[#3fb950] border-[#238636] hover:bg-[#1f2d3d]"
+            : "bg-[#1f2937] text-[#8b949e] border-[#30363d] hover:bg-[#2d3748]"
+        }`}
+        title={isAutoFollow ? "Auto-scrolling to latest output (click to pause)" : "Auto-scroll paused (click to resume)"}
+      >
+        {isAutoFollow ? "▼ Following" : "▽ Paused"}
+      </button>
+      {/* Jump to Current - bottom right, when scrolled up */}
       {!isAtBottom && (
         <button
           onClick={handleScrollToBottom}
