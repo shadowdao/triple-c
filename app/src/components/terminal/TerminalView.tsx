@@ -197,13 +197,12 @@ export default function TerminalView({ sessionId, active }: Props) {
 
     const outputPromise = onOutput(sessionId, (data) => {
       if (aborted) return;
-      const shouldFollow = isAtBottomRef.current;
       term.write(data, () => {
-        // Keep viewport pinned to bottom when user hasn't scrolled up
-        if (shouldFollow) {
+        // Keep viewport pinned to bottom when user hasn't scrolled up.
+        // Check ref at callback time (not capture time) so that a user
+        // scroll-up between the write() call and callback is respected.
+        if (isAtBottomRef.current) {
           term.scrollToBottom();
-          isAtBottomRef.current = true;
-          setIsAtBottom(true);
         }
       });
       detector.feed(data);
