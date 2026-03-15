@@ -36,6 +36,9 @@ export default function TerminalView({ sessionId, active }: Props) {
   const [imagePasteMsg, setImagePasteMsg] = useState<string | null>(null);
   const [isAtBottom, setIsAtBottom] = useState(true);
   const isAtBottomRef = useRef(true);
+  // Tracks user intent to follow output — only set to false by explicit user
+  // actions (mouse wheel up), not by xterm scroll events during writes.
+  const autoFollowRef = useRef(true);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -132,6 +135,15 @@ export default function TerminalView({ sessionId, active }: Props) {
       sendInput(sessionId, data);
     });
 
+    // Detect user-initiated scroll-up (mouse wheel) to pause auto-follow.
+    // Captured during capture phase so it fires before xterm's own handler.
+    const handleWheel = (e: WheelEvent) => {
+      if (e.deltaY < 0) {
+        autoFollowRef.current = false;
+      }
+    };
+    containerRef.current.addEventListener("wheel", handleWheel, { capture: true, passive: true });
+
     // Track scroll position to show "Jump to Current" button.
     // Debounce state updates via rAF to avoid excessive re-renders during rapid output.
     let scrollStateRafId: number | null = null;
@@ -139,6 +151,10 @@ export default function TerminalView({ sessionId, active }: Props) {
       const buf = term.buffer.active;
       const atBottom = buf.viewportY >= buf.baseY;
       isAtBottomRef.current = atBottom;
+      // Re-enable auto-follow when viewport reaches the bottom
+      if (atBottom) {
+        autoFollowRef.current = true;
+      }
       if (scrollStateRafId === null) {
         scrollStateRafId = requestAnimationFrame(() => {
           scrollStateRafId = null;
@@ -199,10 +215,13 @@ export default function TerminalView({ sessionId, active }: Props) {
       if (aborted) return;
       term.write(data, () => {
         // Keep viewport pinned to bottom when user hasn't scrolled up.
-        // Check ref at callback time (not capture time) so that a user
-        // scroll-up between the write() call and callback is respected.
-        if (isAtBottomRef.current) {
+        // Uses autoFollowRef (user intent) rather than isAtBottomRef (viewport
+        // position) so that xterm desync during writes doesn't kill auto-follow,
+        // but an explicit user scroll-up does pause it.
+        if (autoFollowRef.current) {
           term.scrollToBottom();
+          isAtBottomRef.current = true;
+          setIsAtBottom(true);
         }
       });
       detector.feed(data);
@@ -268,6 +287,7 @@ export default function TerminalView({ sessionId, active }: Props) {
       scrollDisposable.dispose();
       selectionDisposable.dispose();
       setTerminalHasSelection(false);
+      containerRef.current?.removeEventListener("wheel", handleWheel, { capture: true });
       containerRef.current?.removeEventListener("paste", handlePaste, { capture: true });
       outputPromise.then((fn) => fn?.());
       exitPromise.then((fn) => fn?.());
@@ -339,6 +359,7 @@ export default function TerminalView({ sessionId, active }: Props) {
   const handleScrollToBottom = useCallback(() => {
     const term = termRef.current;
     if (term) {
+      autoFollowRef.current = true;
       // Re-fit first to fix viewport desync (same thing a resize does)
       fitRef.current?.fit();
       term.scrollToBottom();
