@@ -144,6 +144,8 @@ export default function TerminalView({ sessionId, active }: Props) {
       if (e.deltaY < 0) {
         autoFollowRef.current = false;
         setIsAutoFollow(false);
+        isAtBottomRef.current = false;
+        setIsAtBottom(false);
       }
     };
     containerRef.current.addEventListener("wheel", handleWheel, { capture: true, passive: true });
@@ -154,7 +156,6 @@ export default function TerminalView({ sessionId, active }: Props) {
     const scrollDisposable = term.onScroll(() => {
       const buf = term.buffer.active;
       const atBottom = buf.viewportY >= buf.baseY;
-      const prevAtBottom = isAtBottomRef.current;
       isAtBottomRef.current = atBottom;
 
       // Re-enable auto-follow only when USER scrolls to bottom (not write-triggered)
@@ -164,14 +165,11 @@ export default function TerminalView({ sessionId, active }: Props) {
         setIsAutoFollow(true);
       }
 
-      // Only update React state when value changes
-      if (atBottom !== prevAtBottom) {
-        if (scrollStateRafId === null) {
-          scrollStateRafId = requestAnimationFrame(() => {
-            scrollStateRafId = null;
-            setIsAtBottom(isAtBottomRef.current);
-          });
-        }
+      if (scrollStateRafId === null) {
+        scrollStateRafId = requestAnimationFrame(() => {
+          scrollStateRafId = null;
+          setIsAtBottom(isAtBottomRef.current);
+        });
       }
     });
 
