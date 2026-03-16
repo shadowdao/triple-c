@@ -704,6 +704,13 @@ pub async fn create_container(
     labels.insert("triple-c.timezone".to_string(), timezone.unwrap_or("").to_string());
     labels.insert("triple-c.mcp-fingerprint".to_string(), compute_mcp_fingerprint(mcp_servers));
     labels.insert("triple-c.mission-control".to_string(), project.mission_control_enabled.to_string());
+    labels.insert("triple-c.custom-env-fingerprint".to_string(), custom_env_fingerprint.clone());
+    labels.insert("triple-c.instructions-fingerprint".to_string(),
+        combined_instructions.as_ref().map(|s| sha256_hex(s)).unwrap_or_default());
+    labels.insert("triple-c.git-user-name".to_string(), project.git_user_name.clone().unwrap_or_default());
+    labels.insert("triple-c.git-user-email".to_string(), project.git_user_email.clone().unwrap_or_default());
+    labels.insert("triple-c.git-token-hash".to_string(),
+        project.git_token.as_ref().map(|t| sha256_hex(t)).unwrap_or_default());
 
     let host_config = HostConfig {
         mounts: Some(mounts),
@@ -1000,41 +1007,32 @@ pub async fn container_needs_recreation(
         return Ok(true);
     }
 
-    // ── Git environment variables ────────────────────────────────────────
-    let env_vars = info
-        .config
-        .as_ref()
-        .and_then(|c| c.env.as_ref());
-
-    let get_env = |name: &str| -> Option<String> {
-        env_vars.and_then(|vars| {
-            vars.iter()
-                .find(|v| v.starts_with(&format!("{}=", name)))
-                .map(|v| v[name.len() + 1..].to_string())
-        })
-    };
-
-    let container_git_name = get_env("GIT_USER_NAME");
-    let container_git_email = get_env("GIT_USER_EMAIL");
-    let container_git_token = get_env("GIT_TOKEN");
-
-    if container_git_name.as_deref() != project.git_user_name.as_deref() {
-        log::info!("GIT_USER_NAME mismatch (container={:?}, project={:?})", container_git_name, project.git_user_name);
+    // ── Git settings (label-based to avoid stale snapshot env vars) ─────
+    let expected_git_name = project.git_user_name.clone().unwrap_or_default();
+    let container_git_name = get_label("triple-c.git-user-name").unwrap_or_default();
+    if container_git_name != expected_git_name {
+        log::info!("GIT_USER_NAME mismatch (container={:?}, project={:?})", container_git_name, expected_git_name);
         return Ok(true);
     }
-    if container_git_email.as_deref() != project.git_user_email.as_deref() {
-        log::info!("GIT_USER_EMAIL mismatch (container={:?}, project={:?})", container_git_email, project.git_user_email);
+
+    let expected_git_email = project.git_user_email.clone().unwrap_or_default();
+    let container_git_email = get_label("triple-c.git-user-email").unwrap_or_default();
+    if container_git_email != expected_git_email {
+        log::info!("GIT_USER_EMAIL mismatch (container={:?}, project={:?})", container_git_email, expected_git_email);
         return Ok(true);
     }
-    if container_git_token.as_deref() != project.git_token.as_deref() {
+
+    let expected_git_token_hash = project.git_token.as_ref().map(|t| sha256_hex(t)).unwrap_or_default();
+    let container_git_token_hash = get_label("triple-c.git-token-hash").unwrap_or_default();
+    if container_git_token_hash != expected_git_token_hash {
         log::info!("GIT_TOKEN mismatch");
         return Ok(true);
     }
 
-    // ── Custom environment variables ──────────────────────────────────────
+    // ── Custom environment variables (label-based fingerprint) ──────────
     let merged_env = merge_custom_env_vars(global_custom_env_vars, &project.custom_env_vars);
     let expected_fingerprint = compute_env_fingerprint(&merged_env);
-    let container_fingerprint = get_env("TRIPLE_C_CUSTOM_ENV").unwrap_or_default();
+    let container_fingerprint = get_label("triple-c.custom-env-fingerprint").unwrap_or_default();
     if container_fingerprint != expected_fingerprint {
         log::info!("Custom env vars mismatch (container={:?}, expected={:?})", container_fingerprint, expected_fingerprint);
         return Ok(true);
@@ -1048,15 +1046,16 @@ pub async fn container_needs_recreation(
         return Ok(true);
     }
 
-    // ── Claude instructions ───────────────────────────────────────────────
+    // ── Claude instructions (label-based fingerprint) ─────────────────────
     let expected_instructions = build_claude_instructions(
         global_claude_instructions,
         project.claude_instructions.as_deref(),
         &project.port_mappings,
         project.mission_control_enabled,
     );
-    let container_instructions = get_env("CLAUDE_INSTRUCTIONS");
-    if container_instructions.as_deref() != expected_instructions.as_deref() {
+    let expected_instructions_fp = expected_instructions.as_ref().map(|s| sha256_hex(s)).unwrap_or_default();
+    let container_instructions_fp = get_label("triple-c.instructions-fingerprint").unwrap_or_default();
+    if container_instructions_fp != expected_instructions_fp {
         log::info!("CLAUDE_INSTRUCTIONS mismatch");
         return Ok(true);
     }
