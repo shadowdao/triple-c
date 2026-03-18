@@ -100,9 +100,13 @@ Tauri uses a Rust backend paired with a web-based frontend rendered by the OS-na
 │  │  Project Management   │◄─┤  ProjectsStore           │ │
 │  │  Settings UI          │  │  bollard Docker Client   │ │
 │  │                       │  │  keyring Credential Mgr  │ │
-│  └───────────┬───────────┘  └────────────┬─────────────┘ │
+│  └───────────┬───────────┘  │  Web Terminal Server     │ │
+│              │              └────────────┬─────────────┘ │
 │              │  Tauri IPC (invoke/emit)   │               │
 │              └───────────┬───────────────┘               │
+│                                    ▲                      │
+│                        axum HTTP+WS│(port 7681)           │
+│                                    │                      │
 └──────────────────────────┼───────────────────────────────┘
                            │ Docker Socket
                            ▼
@@ -128,6 +132,8 @@ Tauri uses a Rust backend paired with a web-based frontend rendered by the OS-na
 The application uses two IPC mechanisms between the React frontend and Rust backend:
 
 **Request/Response** (`invoke()`): Used for discrete operations — starting containers, saving settings, listing projects. The frontend calls `invoke("command_name", { args })` and awaits a typed result.
+
+**WebSocket Streaming** (Web Terminal): Used for remote terminal access from browsers on the local network. An axum HTTP+WebSocket server runs inside the Tauri process, sharing the same `ExecSessionManager` via `Arc`-wrapped stores. The WebSocket uses a JSON protocol with base64-encoded terminal data. Each browser connection can open multiple terminal sessions; all sessions are cleaned up when the WebSocket disconnects.
 
 **Event Streaming** (`emit()`/`listen()`): Used for continuous data — terminal I/O. When a terminal session is opened, the Rust backend spawns two tokio tasks:
 1. **Output reader** — Reads from the Docker exec stdout stream and emits `terminal-output-{sessionId}` events to the frontend.
@@ -263,7 +269,7 @@ triple-c/
     │       ├── projects/          # ProjectCard, ProjectList, AddProjectDialog,
     │       │                      # FileManagerModal, ContainerProgressModal, modals
     │       ├── settings/          # SettingsPanel, DockerSettings, AwsSettings,
-    │       │                      # UpdateDialog
+    │       │                      # WebTerminalSettings, UpdateDialog
     │       └── terminal/          # TerminalView (xterm.js), TerminalTabs, UrlToast
     │
     └── src-tauri/                 # Rust backend
@@ -282,7 +288,13 @@ triple-c/
             │   ├── project_commands.rs  # Start/stop/rebuild containers
             │   ├── settings_commands.rs # Settings CRUD
             │   ├── terminal_commands.rs # Terminal I/O, resize
-            │   └── update_commands.rs   # App update checking
+            │   ├── update_commands.rs   # App update checking
+            │   └── web_terminal_commands.rs # Web terminal start/stop/status
+            ├── web_terminal/       # Remote terminal access
+            │   ├── mod.rs         # Module root
+            │   ├── server.rs      # Axum HTTP+WS server lifecycle
+            │   ├── ws_handler.rs  # WebSocket connection handler
+            │   └── terminal.html  # Embedded xterm.js web UI
             ├── docker/            # Docker API layer
             │   ├── client.rs      # bollard singleton connection
             │   ├── container.rs   # Create, start, stop, remove, fingerprinting
@@ -323,6 +335,11 @@ triple-c/
 | `tar` | 0.4 | In-memory tar archives for Docker build context |
 | `dirs` | 6.x | Cross-platform app data directory paths |
 | `serde` / `serde_json` | 1.x | Serialization for IPC and persistence |
+| `axum` | 0.8 | HTTP+WebSocket server for web terminal |
+| `tower-http` | 0.6 | CORS middleware for web terminal |
+| `base64` | 0.22 | Terminal data encoding over WebSocket |
+| `rand` | 0.9 | Access token generation |
+| `local-ip-address` | 0.6 | LAN IP detection for web terminal URL |
 
 ### JavaScript (Frontend)
 

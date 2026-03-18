@@ -62,7 +62,7 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
 - **`components/terminal/TerminalView.tsx`** — xterm.js integration with WebGL rendering, URL detection for OAuth flow
 - **`components/layout/`** — TopBar (tabs + status), Sidebar (project list), StatusBar
 - **`components/projects/`** — ProjectCard, ProjectList, AddProjectDialog
-- **`components/settings/`** — Settings panels for API keys, Docker, AWS
+- **`components/settings/`** — Settings panels for API keys, Docker, AWS, Web Terminal
 
 ### Backend Structure (`app/src-tauri/src/`)
 
@@ -72,7 +72,11 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   - `container.rs` — Container lifecycle (create, start, stop, remove, inspect)
   - `exec.rs` — PTY exec sessions with bidirectional stdin/stdout streaming
   - `image.rs` — Image build/pull with progress streaming
-- **`models/`** — Serde structs (`Project`, `Backend`, `BedrockConfig`, `OllamaConfig`, `OpenAiCompatibleConfig`, `ContainerInfo`, `AppSettings`). These define the IPC contract with the frontend.
+- **`web_terminal/`** — Remote terminal access via axum HTTP+WebSocket server:
+  - `server.rs` — Axum server lifecycle (start/stop), serves embedded HTML and handles WS upgrades
+  - `ws_handler.rs` — Per-connection WebSocket handler with JSON protocol, session management, cleanup on disconnect
+  - `terminal.html` — Self-contained xterm.js web UI embedded via `include_str!()`
+- **`models/`** — Serde structs (`Project`, `Backend`, `BedrockConfig`, `OllamaConfig`, `OpenAiCompatibleConfig`, `ContainerInfo`, `AppSettings`, `WebTerminalSettings`). These define the IPC contract with the frontend.
 - **`storage/`** — Persistence: `projects_store.rs` (JSON file with atomic writes), `secure.rs` (OS keychain via `keyring` crate), `settings_store.rs`
 
 ### Container (`container/`)

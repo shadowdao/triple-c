@@ -16,6 +16,7 @@ Triple-C (Claude-Code-Container) is a desktop application that runs Claude Code 
 - [Ollama Configuration](#ollama-configuration)
 - [OpenAI Compatible Configuration](#openai-compatible-configuration)
 - [Settings](#settings)
+- [Web Terminal (Remote Access)](#web-terminal-remote-access)
 - [Terminal Features](#terminal-features)
 - [Scheduled Tasks (Inside the Container)](#scheduled-tasks-inside-the-container)
 - [What's Inside the Container](#whats-inside-the-container)
@@ -480,6 +481,17 @@ Instructions applied to **all** projects. Written to `~/.claude/CLAUDE.md` in ev
 
 Environment variables applied to **all** project containers. Per-project variables with the same key take precedence.
 
+### Web Terminal
+
+Enable remote access to your project terminals from any device on the local network (tablets, phones, other computers).
+
+- **Toggle** — Click ON/OFF to start or stop the web terminal server.
+- **URL** — When running, shows the full URL including the access token. Click **Copy URL** to copy it to your clipboard, then open it in a browser on your tablet or phone.
+- **Token** — An access token is auto-generated on first enable. Click **Copy** to copy the token, or **Regenerate** to create a new one (this disconnects existing web sessions).
+- **Port** — Defaults to 7681. Configurable in `settings.json` if needed.
+
+The web terminal server auto-starts on app launch if it was previously enabled, and stops when the app closes.
+
 ### Updates
 
 - **Current Version** — The installed version of Triple-C.
@@ -487,6 +499,43 @@ Environment variables applied to **all** project containers. Per-project variabl
 - **Check now** — Manually check for updates.
 
 When an update is available, a pulsing **Update** button appears in the top bar. Click it to see release notes and download links.
+
+---
+
+## Web Terminal (Remote Access)
+
+The web terminal lets you access your running project terminals from a tablet, phone, or any other device on the local network — no app installation required, just a web browser.
+
+### Setup
+
+1. Go to **Settings** in the sidebar.
+2. Find the **Web Terminal** section and click the toggle to **ON**.
+3. A URL appears (e.g., `http://192.168.1.100:7681?token=...`). Click **Copy URL**.
+4. Open the URL in a browser on your tablet or other device.
+
+### Using the Web Terminal
+
+The web terminal UI mirrors the desktop app's terminal experience:
+
+- **Project picker** — Select a running project from the dropdown at the top.
+- **Claude / Bash buttons** — Open a new Claude Code or bash session for the selected project.
+- **Tab bar** — Switch between multiple open sessions. Click the **x** on a tab to close it.
+- **Input bar** — A text input at the bottom optimized for mobile/tablet keyboards. Characters are sent immediately without waiting for autocomplete. Helper buttons for **Enter**, **Tab**, and **^C** (Ctrl+C) are provided for keys that are awkward on virtual keyboards.
+- **Scroll to bottom** — A floating arrow button appears when you scroll up, letting you jump back to the latest output.
+
+### Security
+
+- Access requires a token in the URL query string. Without the correct token, connections are rejected.
+- The token is auto-generated (32 bytes, base64url-encoded) and can be regenerated at any time from Settings.
+- The server only listens on port 7681 (configurable) — make sure this port is not exposed to the public internet.
+- All sessions opened from a browser tab are automatically cleaned up when the tab is closed or the WebSocket disconnects.
+
+### Tips
+
+- **Bookmark the URL** on your tablet for quick access.
+- The web terminal works best in landscape orientation on tablets.
+- If the connection drops (e.g., Wi-Fi interruption), the web terminal auto-reconnects after 2 seconds.
+- Regenerating the token invalidates all existing browser sessions — you'll need to update bookmarks with the new URL.
 
 ---
 

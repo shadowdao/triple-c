@@ -85,6 +85,18 @@ Triple-C supports [Model Context Protocol (MCP)](https://modelcontextprotocol.io
 
 Optional per-project integration with [Flight Control](https://github.com/msieurthenardier/mission-control) — an AI-first development methodology. When enabled, the repo is cloned into the container, skills are installed, and workflow instructions are injected into CLAUDE.md.
 
+### Web Terminal (Remote Access)
+
+Triple-C includes an optional web terminal server for accessing project terminals from tablets, phones, or other devices on the local network. When enabled in Settings, an axum HTTP+WebSocket server starts inside the Tauri process, serving a standalone xterm.js-based terminal UI.
+
+- **URL**: `http://<LAN_IP>:7681?token=...` (port configurable)
+- **Authentication**: Token-based (auto-generated, copyable from Settings)
+- **Protocol**: JSON over WebSocket with base64-encoded terminal data
+- **Features**: Project picker, multiple tabs (Claude + bash sessions), mobile-optimized input bar, scroll-to-bottom button
+- **Session cleanup**: All terminal sessions are closed when the browser disconnects
+
+The web terminal shares the existing `ExecSessionManager` via `Arc`-wrapped stores — same Docker exec sessions, different transport (WebSocket instead of Tauri IPC events).
+
 ### Docker Socket Path
 
 The socket path is OS-aware:
@@ -108,7 +120,8 @@ Users can override this in Settings via the global `docker_socket_path` option.
 | `app/src/components/projects/ContainerProgressModal.tsx` | Real-time container operation progress |
 | `app/src/components/mcp/McpPanel.tsx` | MCP server library (global configuration) |
 | `app/src/components/mcp/McpServerCard.tsx` | Individual MCP server configuration card |
-| `app/src/components/settings/SettingsPanel.tsx` | Docker, AWS, timezone, and global settings |
+| `app/src/components/settings/SettingsPanel.tsx` | Docker, AWS, timezone, web terminal, and global settings |
+| `app/src/components/settings/WebTerminalSettings.tsx` | Web terminal toggle, URL, token management |
 | `app/src/components/terminal/TerminalView.tsx` | xterm.js terminal with WebGL, URL detection, OSC 52 clipboard, image paste |
 | `app/src/components/terminal/TerminalTabs.tsx` | Tab bar for multiple terminal sessions (claude + bash) |
 | `app/src/hooks/useTerminal.ts` | Terminal session management (claude and bash modes) |
@@ -124,7 +137,11 @@ Users can override this in Settings via the global `docker_socket_path` option.
 | `app/src-tauri/src/commands/mcp_commands.rs` | MCP server CRUD Tauri commands |
 | `app/src-tauri/src/models/project.rs` | Project struct (backend, Docker access, MCP servers, Mission Control) |
 | `app/src-tauri/src/models/mcp_server.rs` | MCP server struct (transport, Docker image, env vars) |
-| `app/src-tauri/src/models/app_settings.rs` | Global settings (image source, Docker socket, AWS, microphone) |
+| `app/src-tauri/src/models/app_settings.rs` | Global settings (image source, Docker socket, AWS, web terminal) |
+| `app/src-tauri/src/web_terminal/server.rs` | Axum HTTP+WS server for remote terminal access |
+| `app/src-tauri/src/web_terminal/ws_handler.rs` | WebSocket connection handler and session management |
+| `app/src-tauri/src/web_terminal/terminal.html` | Embedded web UI (xterm.js, project picker, tabs) |
+| `app/src-tauri/src/commands/web_terminal_commands.rs` | Web terminal start/stop/status Tauri commands |
 | `app/src-tauri/src/storage/mcp_store.rs` | MCP server persistence (JSON with atomic writes) |
 | `container/Dockerfile` | Ubuntu 24.04 sandbox image with Claude Code + dev tools + clipboard/audio shims |
 | `container/entrypoint.sh` | UID/GID remap, SSH setup, Docker group config, MCP injection, Mission Control setup |
