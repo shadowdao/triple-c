@@ -31,6 +31,11 @@ tar = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 iana-time-zone = "0.1"
 sha2 = "0.10"
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["cors"] }
+base64 = "0.22"
+rand = "0.9"
+local-ip-address = "0.6"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

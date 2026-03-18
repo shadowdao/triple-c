@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, ImageUpdateInfo, McpServer, FileEntry } from "./types";
+import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, ImageUpdateInfo, McpServer, FileEntry, WebTerminalInfo } from "./types";
 
 // Docker
 export const checkDocker = () => invoke<boolean>("check_docker");
@@ -88,3 +88,13 @@ export const checkImageUpdate = () =>
 
 // Help
 export const getHelpContent = () => invoke<string>("get_help_content");
+
+// Web Terminal
+export const startWebTerminal = () =>
+  invoke<WebTerminalInfo>("start_web_terminal");
+export const stopWebTerminal = () =>
+  invoke<void>("stop_web_terminal");
+export const getWebTerminalStatus = () =>
+  invoke<WebTerminalInfo>("get_web_terminal_status");
+export const regenerateWebTerminalToken = () =>
+  invoke<WebTerminalInfo>("regenerate_web_terminal_token");

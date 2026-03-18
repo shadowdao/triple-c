@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Triple-C Web Terminal</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0.11.0/lib/addon-web-links.min.js"></script>
+<style>
+  :root {
+    --bg-primary: #1a1b26;
+    --bg-secondary: #24283b;
+    --bg-tertiary: #2f3347;
+    --text-primary: #c0caf5;
+    --text-secondary: #565f89;
+    --accent: #7aa2f7;
+    --accent-hover: #89b4fa;
+    --border: #3b3f57;
+    --success: #9ece6a;
+    --warning: #e0af68;
+    --error: #f7768e;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  /* ── Top Bar ─────────────────────────────── */
+  .topbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+    min-height: 42px;
+  }
+
+  .topbar-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--accent);
+    white-space: nowrap;
+    margin-right: 8px;
+  }
+
+  .status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--error);
+    flex-shrink: 0;
+  }
+  .status-dot.connected { background: var(--success); }
+  .status-dot.reconnecting { background: var(--warning); animation: pulse 1s infinite; }
+
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+  select, button {
+    font-size: 12px;
+    padding: 4px 8px;
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    cursor: pointer;
+    touch-action: manipulation;
+  }
+
+  select:focus, button:focus { outline: none; border-color: var(--accent); }
+  button:hover { background: var(--border); }
+  button:active { background: var(--accent); color: var(--bg-primary); }
+
+  .btn-new {
+    font-weight: 600;
+    min-width: 44px;
+    min-height: 32px;
+  }
+
+  /* ── Tab Bar ─────────────────────────────── */
+  .tabbar {
+    display: flex;
+    align-items: center;
+    gap: 1px;
+    padding: 0 8px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    min-height: 32px;
+  }
+
+  .tab {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 12px;
+    font-size: 11px;
+    color: var(--text-secondary);
+    cursor: pointer;
+    white-space: nowrap;
+    border-bottom: 2px solid transparent;
+    transition: all 0.15s;
+    min-height: 32px;
+  }
+
+  .tab:hover { color: var(--text-primary); }
+  .tab.active {
+    color: var(--text-primary);
+    border-bottom-color: var(--accent);
+  }
+
+  .tab-close {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    border-radius: 3px;
+    font-size: 12px;
+    line-height: 1;
+    color: var(--text-secondary);
+    background: none;
+    border: none;
+    padding: 0;
+    min-width: unset;
+    min-height: unset;
+  }
+  .tab-close:hover { background: var(--error); color: white; }
+
+  /* ── Terminal Area ───────────────────────── */
+  .terminal-area {
+    flex: 1;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .terminal-container {
+    position: absolute;
+    inset: 0;
+    display: none;
+    padding: 4px;
+  }
+  .terminal-container.active { display: block; }
+
+  /* ── Empty State ─────────────────────────── */
+  .empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    color: var(--text-secondary);
+    font-size: 14px;
+    gap: 12px;
+  }
+
+  .empty-state .hint {
+    font-size: 12px;
+    opacity: 0.7;
+  }
+
+  /* ── Scrollbar ───────────────────────────── */
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<!-- Top Bar -->
+<div class="topbar">
+  <span class="topbar-title">Triple-C</span>
+  <span class="status-dot" id="statusDot"></span>
+  <select id="projectSelect" style="flex:1; max-width:240px;">
+    <option value="">Select project...</option>
+  </select>
+  <button class="btn-new" id="btnClaude" title="New Claude session">Claude</button>
+  <button class="btn-new" id="btnBash" title="New Bash session">Bash</button>
+</div>
+
+<!-- Tab Bar -->
+<div class="tabbar" id="tabbar"></div>
+
+<!-- Terminal Area -->
+<div class="terminal-area" id="terminalArea">
+  <div class="empty-state" id="emptyState">
+    <div>Select a project and open a terminal session</div>
+    <div class="hint">Use the buttons above to start a Claude or Bash session</div>
+  </div>
+</div>
+
+<script>
+(function() {
+  'use strict';
+
+  // ── State ──────────────────────────────────
+  const params = new URLSearchParams(window.location.search);
+  const TOKEN = params.get('token') || '';
+  let ws = null;
+  let reconnectTimer = null;
+  let sessions = {};       // { sessionId: { term, fitAddon, projectName, type, containerId } }
+  let activeSessionId = null;
+
+  // ── DOM refs ───────────────────────────────
+  const statusDot = document.getElementById('statusDot');
+  const projectSelect = document.getElementById('projectSelect');
+  const btnClaude = document.getElementById('btnClaude');
+  const btnBash = document.getElementById('btnBash');
+  const tabbar = document.getElementById('tabbar');
+  const terminalArea = document.getElementById('terminalArea');
+  const emptyState = document.getElementById('emptyState');
+
+  // ── WebSocket ──────────────────────────────
+  function connect() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const url = `${proto}//${location.host}/ws?token=${encodeURIComponent(TOKEN)}`;
+    ws = new WebSocket(url);
+
+    ws.onopen = () => {
+      statusDot.className = 'status-dot connected';
+      clearTimeout(reconnectTimer);
+      send({ type: 'list_projects' });
+      // Start keepalive
+      ws._pingInterval = setInterval(() => send({ type: 'ping' }), 30000);
+    };
+
+    ws.onmessage = (evt) => {
+      try {
+        const msg = JSON.parse(evt.data);
+        handleMessage(msg);
+      } catch (e) {
+        console.error('Parse error:', e);
+      }
+    };
+
+    ws.onclose = () => {
+      statusDot.className = 'status-dot reconnecting';
+      if (ws && ws._pingInterval) clearInterval(ws._pingInterval);
+      reconnectTimer = setTimeout(connect, 2000);
+    };
+
+    ws.onerror = () => {
+      ws.close();
+    };
+  }
+
+  function send(msg) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(msg));
+    }
+  }
+
+  // ── Message handling ───────────────────────
+  function handleMessage(msg) {
+    switch (msg.type) {
+      case 'projects':
+        updateProjectList(msg.projects);
+        break;
+      case 'opened':
+        onSessionOpened(msg.session_id, msg.project_name);
+        break;
+      case 'output':
+        onSessionOutput(msg.session_id, msg.data);
+        break;
+      case 'exit':
+        onSessionExit(msg.session_id);
+        break;
+      case 'error':
+        console.error('Server error:', msg.message);
+        // Show in active terminal if available
+        if (activeSessionId && sessions[activeSessionId]) {
+          sessions[activeSessionId].term.writeln(`\r\n\x1b[31mError: ${msg.message}\x1b[0m`);
+        }
+        break;
+      case 'pong':
+        break;
+    }
+  }
+
+  function updateProjectList(projects) {
+    const current = projectSelect.value;
+    projectSelect.innerHTML = '<option value="">Select project...</option>';
+    projects.forEach(p => {
+      const opt = document.createElement('option');
+      opt.value = p.id;
+      opt.textContent = `${p.name} (${p.status})`;
+      opt.disabled = p.status !== 'running';
+      projectSelect.appendChild(opt);
+    });
+    // Restore selection if still valid
+    if (current) projectSelect.value = current;
+  }
+
+  // ── Session management ─────────────────────
+  let pendingSessionType = null;
+
+  function openSession(type) {
+    const projectId = projectSelect.value;
+    if (!projectId) {
+      alert('Please select a running project first.');
+      return;
+    }
+    pendingSessionType = type;
+    send({
+      type: 'open',
+      project_id: projectId,
+      session_type: type,
+    });
+  }
+
+  function onSessionOpened(sessionId, projectName) {
+    const sessionType = pendingSessionType || 'claude';
+    pendingSessionType = null;
+
+    // Create terminal
+    const term = new Terminal({
+      theme: {
+        background: '#1a1b26',
+        foreground: '#c0caf5',
+        cursor: '#c0caf5',
+        selectionBackground: '#33467c',
+        black: '#15161e',
+        red: '#f7768e',
+        green: '#9ece6a',
+        yellow: '#e0af68',
+        blue: '#7aa2f7',
+        magenta: '#bb9af7',
+        cyan: '#7dcfff',
+        white: '#a9b1d6',
+        brightBlack: '#414868',
+        brightRed: '#f7768e',
+        brightGreen: '#9ece6a',
+        brightYellow: '#e0af68',
+        brightBlue: '#7aa2f7',
+        brightMagenta: '#bb9af7',
+        brightCyan: '#7dcfff',
+        brightWhite: '#c0caf5',
+      },
+      fontSize: 14,
+      fontFamily: "'Cascadia Code', 'Fira Code', 'JetBrains Mono', 'Menlo', monospace",
+      cursorBlink: true,
+      allowProposedApi: true,
+    });
+
+    const fitAddon = new FitAddon.FitAddon();
+    term.loadAddon(fitAddon);
+
+    const webLinksAddon = new WebLinksAddon.WebLinksAddon();
+    term.loadAddon(webLinksAddon);
+
+    // Create container div
+    const container = document.createElement('div');
+    container.className = 'terminal-container';
+    container.id = `term-${sessionId}`;
+    terminalArea.appendChild(container);
+
+    term.open(container);
+    fitAddon.fit();
+
+    // Send initial resize
+    send({
+      type: 'resize',
+      session_id: sessionId,
+      cols: term.cols,
+      rows: term.rows,
+    });
+
+    // Handle user input
+    term.onData(data => {
+      const bytes = new TextEncoder().encode(data);
+      const b64 = btoa(String.fromCharCode(...bytes));
+      send({
+        type: 'input',
+        session_id: sessionId,
+        data: b64,
+      });
+    });
+
+    // Store session
+    sessions[sessionId] = { term, fitAddon, projectName, type: sessionType, container };
+
+    // Add tab and switch to it
+    addTab(sessionId, projectName, sessionType);
+    switchToSession(sessionId);
+
+    emptyState.style.display = 'none';
+  }
+
+  function onSessionOutput(sessionId, b64data) {
+    const session = sessions[sessionId];
+    if (!session) return;
+    const bytes = Uint8Array.from(atob(b64data), c => c.charCodeAt(0));
+    session.term.write(bytes);
+  }
+
+  function onSessionExit(sessionId) {
+    const session = sessions[sessionId];
+    if (!session) return;
+    session.term.writeln('\r\n\x1b[90m[Session ended]\x1b[0m');
+  }
+
+  function closeSession(sessionId) {
+    send({ type: 'close', session_id: sessionId });
+    removeSession(sessionId);
+  }
+
+  function removeSession(sessionId) {
+    const session = sessions[sessionId];
+    if (!session) return;
+
+    session.term.dispose();
+    session.container.remove();
+    delete sessions[sessionId];
+
+    // Remove tab
+    const tab = document.getElementById(`tab-${sessionId}`);
+    if (tab) tab.remove();
+
+    // Switch to another session or show empty state
+    const remaining = Object.keys(sessions);
+    if (remaining.length > 0) {
+      switchToSession(remaining[remaining.length - 1]);
+    } else {
+      activeSessionId = null;
+      emptyState.style.display = '';
+    }
+  }
+
+  // ── Tab bar ────────────────────────────────
+  function addTab(sessionId, projectName, sessionType) {
+    const tab = document.createElement('div');
+    tab.className = 'tab';
+    tab.id = `tab-${sessionId}`;
+
+    const label = document.createElement('span');
+    label.textContent = `${projectName} (${sessionType})`;
+    tab.appendChild(label);
+
+    const close = document.createElement('button');
+    close.className = 'tab-close';
+    close.textContent = '\u00d7';
+    close.onclick = (e) => { e.stopPropagation(); closeSession(sessionId); };
+    tab.appendChild(close);
+
+    tab.onclick = () => switchToSession(sessionId);
+    tabbar.appendChild(tab);
+  }
+
+  function switchToSession(sessionId) {
+    activeSessionId = sessionId;
+
+    // Update tab styles
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    const tab = document.getElementById(`tab-${sessionId}`);
+    if (tab) tab.classList.add('active');
+
+    // Show/hide terminal containers
+    document.querySelectorAll('.terminal-container').forEach(c => c.classList.remove('active'));
+    const container = document.getElementById(`term-${sessionId}`);
+    if (container) {
+      container.classList.add('active');
+      const session = sessions[sessionId];
+      if (session) {
+        // Fit after making visible
+        requestAnimationFrame(() => {
+          session.fitAddon.fit();
+          session.term.focus();
+        });
+      }
+    }
+  }
+
+  // ── Resize handling ────────────────────────
+  function handleResize() {
+    if (activeSessionId && sessions[activeSessionId]) {
+      const session = sessions[activeSessionId];
+      session.fitAddon.fit();
+      send({
+        type: 'resize',
+        session_id: activeSessionId,
+        cols: session.term.cols,
+        rows: session.term.rows,
+      });
+    }
+  }
+
+  let resizeTimeout;
+  window.addEventListener('resize', () => {
+    clearTimeout(resizeTimeout);
+    resizeTimeout = setTimeout(handleResize, 100);
+  });
+
+  // ── Event listeners ────────────────────────
+  btnClaude.onclick = () => openSession('claude');
+  btnBash.onclick = () => openSession('bash');
+
+  // ── Init ───────────────────────────────────
+  connect();
+})();
+</script>
+</body>
+</html>

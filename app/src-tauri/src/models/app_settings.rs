@@ -74,6 +74,32 @@ pub struct AppSettings {
     pub default_microphone: Option<String>,
     #[serde(default)]
     pub dismissed_image_digest: Option<String>,
+    #[serde(default)]
+    pub web_terminal: WebTerminalSettings,
+}
+
+fn default_web_terminal_port() -> u16 {
+    7681
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebTerminalSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_web_terminal_port")]
+    pub port: u16,
+    #[serde(default)]
+    pub access_token: Option<String>,
+}
+
+impl Default for WebTerminalSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: 7681,
+            access_token: None,
+        }
+    }
 }
 
 impl Default for AppSettings {
@@ -93,6 +119,7 @@ impl Default for AppSettings {
             timezone: None,
             default_microphone: None,
             dismissed_image_digest: None,
+            web_terminal: WebTerminalSettings::default(),
         }
     }
 }

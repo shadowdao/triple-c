@@ -8,6 +8,7 @@ import EnvVarsModal from "../projects/EnvVarsModal";
 import { detectHostTimezone } from "../../lib/tauri-commands";
 import type { EnvVar } from "../../lib/types";
 import Tooltip from "../ui/Tooltip";
+import WebTerminalSettings from "./WebTerminalSettings";
 
 export default function SettingsPanel() {
   const { appSettings, saveSettings } = useSettings();
@@ -115,6 +116,9 @@ export default function SettingsPanel() {
           </button>
         </div>
       </div>
+
+      {/* Web Terminal */}
+      <WebTerminalSettings />
 
       {/* Updates section */}
       <div>

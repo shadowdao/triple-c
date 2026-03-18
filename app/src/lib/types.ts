@@ -118,6 +118,21 @@ export interface AppSettings {
   timezone: string | null;
   default_microphone: string | null;
   dismissed_image_digest: string | null;
+  web_terminal: WebTerminalSettings;
+}
+
+export interface WebTerminalSettings {
+  enabled: boolean;
+  port: number;
+  access_token: string | null;
+}
+
+export interface WebTerminalInfo {
+  running: boolean;
+  port: number;
+  access_token: string;
+  local_ip: string | null;
+  url: string | null;
 }
 
 export interface UpdateInfo {

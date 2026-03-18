@@ -3,44 +3,55 @@ mod docker;
 mod logging;
 mod models;
 mod storage;
+pub mod web_terminal;
+
+use std::sync::Arc;
 
 use docker::exec::ExecSessionManager;
 use storage::projects_store::ProjectsStore;
 use storage::settings_store::SettingsStore;
 use storage::mcp_store::McpStore;
 use tauri::Manager;
+use web_terminal::WebTerminalServer;
 
 pub struct AppState {
-    pub projects_store: ProjectsStore,
-    pub settings_store: SettingsStore,
-    pub mcp_store: McpStore,
-    pub exec_manager: ExecSessionManager,
+    pub projects_store: Arc<ProjectsStore>,
+    pub settings_store: Arc<SettingsStore>,
+    pub mcp_store: Arc<McpStore>,
+    pub exec_manager: Arc<ExecSessionManager>,
+    pub web_terminal_server: Arc<tokio::sync::Mutex<Option<WebTerminalServer>>>,
 }
 
 pub fn run() {
     logging::init();
 
-    let projects_store = match ProjectsStore::new() {
+    let projects_store = Arc::new(match ProjectsStore::new() {
         Ok(s) => s,
         Err(e) => {
             log::error!("Failed to initialize projects store: {}", e);
             panic!("Failed to initialize projects store: {}", e);
         }
-    };
-    let settings_store = match SettingsStore::new() {
+    });
+    let settings_store = Arc::new(match SettingsStore::new() {
         Ok(s) => s,
         Err(e) => {
             log::error!("Failed to initialize settings store: {}", e);
             panic!("Failed to initialize settings store: {}", e);
         }
-    };
-    let mcp_store = match McpStore::new() {
+    });
+    let mcp_store = Arc::new(match McpStore::new() {
         Ok(s) => s,
         Err(e) => {
             log::error!("Failed to initialize MCP store: {}", e);
             panic!("Failed to initialize MCP store: {}", e);
         }
-    };
+    });
+    let exec_manager = Arc::new(ExecSessionManager::new());
+
+    // Clone Arcs for the setup closure (web terminal auto-start)
+    let projects_store_setup = projects_store.clone();
+    let settings_store_setup = settings_store.clone();
+    let exec_manager_setup = exec_manager.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_store::Builder::default().build())
@@ -50,9 +61,10 @@ pub fn run() {
             projects_store,
             settings_store,
             mcp_store,
-            exec_manager: ExecSessionManager::new(),
+            exec_manager,
+            web_terminal_server: Arc::new(tokio::sync::Mutex::new(None)),
         })
-        .setup(|app| {
+        .setup(move |app| {
             match tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png")) {
                 Ok(icon) => {
                     if let Some(window) = app.get_webview_window("main") {
@@ -63,12 +75,54 @@ pub fn run() {
                     log::error!("Failed to load window icon: {}", e);
                 }
             }
+
+            // Auto-start web terminal server if enabled in settings
+            let settings = settings_store_setup.get();
+            if settings.web_terminal.enabled {
+                if let Some(token) = &settings.web_terminal.access_token {
+                    let token = token.clone();
+                    let port = settings.web_terminal.port;
+                    let exec_mgr = exec_manager_setup.clone();
+                    let proj_store = projects_store_setup.clone();
+                    let set_store = settings_store_setup.clone();
+                    let state = app.state::<AppState>();
+                    let web_server_mutex = state.web_terminal_server.clone();
+
+                    tauri::async_runtime::spawn(async move {
+                        match WebTerminalServer::start(
+                            port,
+                            token,
+                            exec_mgr,
+                            proj_store,
+                            set_store,
+                        )
+                        .await
+                        {
+                            Ok(server) => {
+                                let mut guard = web_server_mutex.lock().await;
+                                *guard = Some(server);
+                                log::info!("Web terminal auto-started on port {}", port);
+                            }
+                            Err(e) => {
+                                log::error!("Failed to auto-start web terminal: {}", e);
+                            }
+                        }
+                    });
+                }
+            }
+
             Ok(())
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
                 let state = window.state::<AppState>();
                 tauri::async_runtime::block_on(async {
+                    // Stop web terminal server
+                    let mut server_guard = state.web_terminal_server.lock().await;
+                    if let Some(server) = server_guard.take() {
+                        server.stop();
+                    }
+                    // Close all exec sessions
                     state.exec_manager.close_all_sessions().await;
                 });
             }
@@ -122,6 +176,11 @@ pub fn run() {
             commands::update_commands::check_image_update,
             // Help
             commands::help_commands::get_help_content,
+            // Web Terminal
+            commands::web_terminal_commands::start_web_terminal,
+            commands::web_terminal_commands::stop_web_terminal,
+            commands::web_terminal_commands::get_web_terminal_status,
+            commands::web_terminal_commands::regenerate_web_terminal_token,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
