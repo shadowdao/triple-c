@@ -30,6 +30,7 @@
     color: var(--text-primary);
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
     height: 100vh;
+    height: 100dvh; /* dynamic viewport height — shrinks when mobile keyboard opens */
     display: flex;
     flex-direction: column;
     overflow: hidden;
@@ -46,6 +47,9 @@
     border-bottom: 1px solid var(--border);
     flex-shrink: 0;
     min-height: 42px;
+    position: sticky;
+    top: 0;
+    z-index: 20;
   }
 
   .topbar-title {
@@ -101,6 +105,9 @@
     overflow-x: auto;
     -webkit-overflow-scrolling: touch;
     min-height: 32px;
+    position: sticky;
+    top: 42px; /* below .topbar min-height */
+    z-index: 20;
   }
 
   .tab {
