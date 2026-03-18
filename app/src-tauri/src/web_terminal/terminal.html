@@ -156,6 +156,69 @@
   }
   .terminal-container.active { display: block; }
 
+  /* ── Input Bar (mobile/tablet) ──────────── */
+  .input-bar {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 6px 8px;
+    background: var(--bg-secondary);
+    border-top: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+
+  .input-bar input {
+    flex: 1;
+    min-width: 0;
+    padding: 8px 10px;
+    font-size: 16px; /* prevents iOS zoom on focus */
+    font-family: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', 'Menlo', monospace;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    outline: none;
+    -webkit-appearance: none;
+  }
+  .input-bar input:focus { border-color: var(--accent); }
+
+  .input-bar .key-btn {
+    padding: 8px 10px;
+    font-size: 11px;
+    font-weight: 600;
+    min-width: 40px;
+    min-height: 36px;
+    border-radius: 6px;
+    white-space: nowrap;
+  }
+
+  /* ── Scroll-to-bottom FAB ──────────────── */
+  .scroll-bottom-btn {
+    position: absolute;
+    bottom: 12px;
+    right: 16px;
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    background: var(--accent);
+    color: var(--bg-primary);
+    border: none;
+    font-size: 18px;
+    font-weight: bold;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+    z-index: 10;
+    padding: 0;
+    min-width: unset;
+    min-height: unset;
+    line-height: 1;
+  }
+  .scroll-bottom-btn:hover { background: var(--accent-hover); }
+  .scroll-bottom-btn.visible { display: flex; }
+
   /* ── Empty State ─────────────────────────── */
   .empty-state {
     display: flex;
@@ -201,6 +264,17 @@
     <div>Select a project and open a terminal session</div>
     <div class="hint">Use the buttons above to start a Claude or Bash session</div>
   </div>
+  <button class="scroll-bottom-btn" id="scrollBottomBtn" title="Scroll to bottom">&#8595;</button>
+</div>
+
+<!-- Input Bar for mobile/tablet -->
+<div class="input-bar" id="inputBar">
+  <input type="text" id="mobileInput" placeholder="Type here..."
+    autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+    enterkeyhint="send" inputmode="text">
+  <button class="key-btn" id="btnEnter">Enter</button>
+  <button class="key-btn" id="btnTab">Tab</button>
+  <button class="key-btn" id="btnCtrlC">^C</button>
 </div>
 
 <script>
@@ -223,6 +297,11 @@
   const tabbar = document.getElementById('tabbar');
   const terminalArea = document.getElementById('terminalArea');
   const emptyState = document.getElementById('emptyState');
+  const mobileInput = document.getElementById('mobileInput');
+  const btnEnter = document.getElementById('btnEnter');
+  const btnTab = document.getElementById('btnTab');
+  const btnCtrlC = document.getElementById('btnCtrlC');
+  const scrollBottomBtn = document.getElementById('scrollBottomBtn');
 
   // ── WebSocket ──────────────────────────────
   function connect() {
@@ -390,6 +469,9 @@
       });
     });
 
+    // Track scroll position for scroll-to-bottom button
+    term.onScroll(() => updateScrollButton());
+
     // Store session
     sessions[sessionId] = { term, fitAddon, projectName, type: sessionType, container };
 
@@ -405,6 +487,8 @@
     if (!session) return;
     const bytes = Uint8Array.from(atob(b64data), c => c.charCodeAt(0));
     session.term.write(bytes);
+    // Update scroll button if this is the active session
+    if (sessionId === activeSessionId) updateScrollButton();
   }
 
   function onSessionExit(sessionId) {
@@ -479,6 +563,7 @@
         requestAnimationFrame(() => {
           session.fitAddon.fit();
           session.term.focus();
+          updateScrollButton();
         });
       }
     }
@@ -503,6 +588,67 @@
     clearTimeout(resizeTimeout);
     resizeTimeout = setTimeout(handleResize, 100);
   });
+
+  // ── Send helper ─────────────────────────────
+  function sendTerminalInput(str) {
+    if (!activeSessionId) return;
+    const bytes = new TextEncoder().encode(str);
+    const b64 = btoa(String.fromCharCode(...bytes));
+    send({
+      type: 'input',
+      session_id: activeSessionId,
+      data: b64,
+    });
+  }
+
+  // ── Input bar (mobile/tablet) ──────────────
+  // Send characters immediately, bypassing IME composition buffering.
+  // Clearing value on each input event cancels any active composition.
+  mobileInput.addEventListener('input', () => {
+    const val = mobileInput.value;
+    if (val) {
+      sendTerminalInput(val);
+      mobileInput.value = '';
+    }
+  });
+
+  // Catch Enter in the input field itself
+  mobileInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      const val = mobileInput.value;
+      if (val) {
+        sendTerminalInput(val);
+        mobileInput.value = '';
+      }
+      sendTerminalInput('\r');
+    } else if (e.key === 'Tab') {
+      e.preventDefault();
+      sendTerminalInput('\t');
+    }
+  });
+
+  btnEnter.onclick = () => { sendTerminalInput('\r'); mobileInput.focus(); };
+  btnTab.onclick = () => { sendTerminalInput('\t'); mobileInput.focus(); };
+  btnCtrlC.onclick = () => { sendTerminalInput('\x03'); mobileInput.focus(); };
+
+  // ── Scroll to bottom ──────────────────────
+  function updateScrollButton() {
+    if (!activeSessionId || !sessions[activeSessionId]) {
+      scrollBottomBtn.classList.remove('visible');
+      return;
+    }
+    const term = sessions[activeSessionId].term;
+    const isAtBottom = term.buffer.active.viewportY >= term.buffer.active.baseY;
+    scrollBottomBtn.classList.toggle('visible', !isAtBottom);
+  }
+
+  scrollBottomBtn.onclick = () => {
+    if (activeSessionId && sessions[activeSessionId]) {
+      sessions[activeSessionId].term.scrollToBottom();
+      scrollBottomBtn.classList.remove('visible');
+    }
+  };
 
   // ── Event listeners ────────────────────────
   btnClaude.onclick = () => openSession('claude');
