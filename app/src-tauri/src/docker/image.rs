@@ -1,6 +1,7 @@
 use bollard::image::{BuildImageOptions, CreateImageOptions, ListImagesOptions};
 use bollard::models::ImageSummary;
 use futures_util::StreamExt;
+use include_dir::{include_dir, Dir};
 use std::collections::HashMap;
 use std::io::Write;
 
@@ -11,6 +12,11 @@ const DOCKERFILE: &str = include_str!("../../../../container/Dockerfile");
 const ENTRYPOINT: &str = include_str!("../../../../container/entrypoint.sh");
 const SCHEDULER: &str = include_str!("../../../../container/triple-c-scheduler");
 const TASK_RUNNER: &str = include_str!("../../../../container/triple-c-task-runner");
+const OSC52_CLIPBOARD: &str = include_str!("../../../../container/osc52-clipboard");
+const AUDIO_SHIM: &str = include_str!("../../../../container/audio-shim");
+const SSO_REFRESH: &str = include_str!("../../../../container/triple-c-sso-refresh");
+
+static MISSION_CONTROL_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/../../container/mission-control");
 
 pub async fn image_exists(image_name: &str) -> Result<bool, String> {
     let docker = get_docker()?;
@@ -150,38 +156,48 @@ where
     Ok(())
 }
 
+fn append_file_to_archive(
+    archive: &mut tar::Builder<&mut Vec<u8>>,
+    path: &str,
+    content: &[u8],
+    mode: u32,
+) -> Result<(), std::io::Error> {
+    let mut header = tar::Header::new_gnu();
+    header.set_size(content.len() as u64);
+    header.set_mode(mode);
+    header.set_cksum();
+    archive.append_data(&mut header, path, content)
+}
+
+fn append_embedded_dir(
+    archive: &mut tar::Builder<&mut Vec<u8>>,
+    dir: &Dir,
+    prefix: &str,
+) -> Result<(), std::io::Error> {
+    for file in dir.files() {
+        let path = format!("{}/{}", prefix, file.path().display());
+        append_file_to_archive(archive, &path, file.contents(), 0o644)?;
+    }
+    for subdir in dir.dirs() {
+        append_embedded_dir(archive, subdir, prefix)?;
+    }
+    Ok(())
+}
+
 fn create_build_context() -> Result<Vec<u8>, std::io::Error> {
     let mut buf = Vec::new();
     {
         let mut archive = tar::Builder::new(&mut buf);
 
-        let dockerfile_bytes = DOCKERFILE.as_bytes();
-        let mut header = tar::Header::new_gnu();
-        header.set_size(dockerfile_bytes.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        archive.append_data(&mut header, "Dockerfile", dockerfile_bytes)?;
+        append_file_to_archive(&mut archive, "Dockerfile", DOCKERFILE.as_bytes(), 0o644)?;
+        append_file_to_archive(&mut archive, "entrypoint.sh", ENTRYPOINT.as_bytes(), 0o755)?;
+        append_file_to_archive(&mut archive, "triple-c-scheduler", SCHEDULER.as_bytes(), 0o755)?;
+        append_file_to_archive(&mut archive, "triple-c-task-runner", TASK_RUNNER.as_bytes(), 0o755)?;
+        append_file_to_archive(&mut archive, "osc52-clipboard", OSC52_CLIPBOARD.as_bytes(), 0o755)?;
+        append_file_to_archive(&mut archive, "audio-shim", AUDIO_SHIM.as_bytes(), 0o755)?;
+        append_file_to_archive(&mut archive, "triple-c-sso-refresh", SSO_REFRESH.as_bytes(), 0o755)?;
 
-        let entrypoint_bytes = ENTRYPOINT.as_bytes();
-        let mut header = tar::Header::new_gnu();
-        header.set_size(entrypoint_bytes.len() as u64);
-        header.set_mode(0o755);
-        header.set_cksum();
-        archive.append_data(&mut header, "entrypoint.sh", entrypoint_bytes)?;
-
-        let scheduler_bytes = SCHEDULER.as_bytes();
-        let mut header = tar::Header::new_gnu();
-        header.set_size(scheduler_bytes.len() as u64);
-        header.set_mode(0o755);
-        header.set_cksum();
-        archive.append_data(&mut header, "triple-c-scheduler", scheduler_bytes)?;
-
-        let task_runner_bytes = TASK_RUNNER.as_bytes();
-        let mut header = tar::Header::new_gnu();
-        header.set_size(task_runner_bytes.len() as u64);
-        header.set_mode(0o755);
-        header.set_cksum();
-        archive.append_data(&mut header, "triple-c-task-runner", task_runner_bytes)?;
+        append_embedded_dir(&mut archive, &MISSION_CONTROL_DIR, "mission-control")?;
 
         archive.finish()?;
     }

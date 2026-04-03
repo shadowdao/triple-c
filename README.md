@@ -83,7 +83,7 @@ Triple-C supports [Model Context Protocol (MCP)](https://modelcontextprotocol.io
 
 ### Mission Control Integration
 
-Optional per-project integration with [Flight Control](https://github.com/msieurthenardier/mission-control) — an AI-first development methodology. When enabled, the repo is cloned into the container, skills are installed, and workflow instructions are injected into CLAUDE.md.
+Optional per-project integration with Flight Control — an AI-first development methodology bundled with Triple-C. When enabled, the bundled files are installed into the container, skills are installed, and workflow instructions are injected into CLAUDE.md.
 
 ### Web Terminal (Remote Access)
 

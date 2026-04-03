@@ -145,13 +145,12 @@ fi
 if [ "$MISSION_CONTROL_ENABLED" = "1" ]; then
     MC_HOME="/home/claude/mission-control"
     MC_LINK="/workspace/mission-control"
-    if [ ! -d "$MC_HOME/.git" ]; then
-        echo "entrypoint: cloning mission-control..."
-        su -s /bin/bash claude -c \
-            'git clone https://github.com/msieurthenardier/mission-control.git /home/claude/mission-control' \
-            || echo "entrypoint: warning — failed to clone mission-control"
+    if [ ! -d "$MC_HOME" ]; then
+        echo "entrypoint: installing mission-control..."
+        cp -r /opt/mission-control "$MC_HOME"
+        chown -R claude:claude "$MC_HOME"
     else
-        echo "entrypoint: mission-control already present, skipping clone"
+        echo "entrypoint: mission-control already present, skipping install"
     fi
     # Symlink into workspace so Claude sees it at /workspace/mission-control
     ln -sfn "$MC_HOME" "$MC_LINK"

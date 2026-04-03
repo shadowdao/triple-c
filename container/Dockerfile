@@ -122,6 +122,8 @@ RUN chmod +x /usr/local/bin/audio-shim \
 COPY triple-c-sso-refresh /usr/local/bin/triple-c-sso-refresh
 RUN chmod +x /usr/local/bin/triple-c-sso-refresh
 
+COPY mission-control /opt/mission-control
+
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 COPY triple-c-scheduler /usr/local/bin/triple-c-scheduler

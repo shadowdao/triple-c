@@ -1,0 +1,29 @@
+# Projects Registry
+
+This file catalogs all active projects to provide context for mission, flight, and leg planning.
+
+Copy this file to `projects.md` and fill in your project details.
+
+---
+
+## example-project
+
+**Description**: Brief description of what this project does.
+
+| Property | Value |
+|----------|-------|
+| Path | `/path/to/project` |
+| Remote | `git@github.com:username/repo.git` |
+| Stack | (optional) Key technologies used |
+| Status | (optional) Current state of the project |
+
+---
+
+## another-project
+
+**Description**: Another project description.
+
+| Property | Value |
+|----------|-------|
+| Path | `/path/to/another-project` |
+| Remote | `git@github.com:username/another-repo.git` |

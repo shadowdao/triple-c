@@ -80,7 +80,7 @@ When working on any project that has a `.flightops/` directory, follow the Fligh
 
 const MISSION_CONTROL_PROJECT_INSTRUCTIONS: &str = r#"## Flight Operations
 
-This project uses [Flight Control](https://github.com/msieurthenardier/mission-control) for structured development.
+This project uses **Flight Control** (bundled with Triple-C) for structured development.
 
 **Before any mission/flight/leg work, read these files in order:**
 1. `.flightops/README.md` — What the flightops directory contains

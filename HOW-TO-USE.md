@@ -226,12 +226,12 @@ When enabled, the host Docker socket is mounted into the container so Claude Cod
 
 ### Mission Control
 
-Toggle **Mission Control** to integrate [Flight Control](https://github.com/msieurthenardier/mission-control) — an AI-first development methodology — into the project. When enabled:
+Toggle **Mission Control** to integrate Flight Control — an AI-first development methodology bundled with Triple-C — into the project. When enabled:
 
-- The Flight Control repository is automatically cloned into the container
+- The bundled Flight Control files are installed into the container
 - Flight Control skills are installed to Claude Code's skill directory (`~/.claude/skills/`)
 - Project instructions are appended with Flight Control workflow guidance
-- The repository is symlinked at `/workspace/mission-control`
+- The files are symlinked at `/workspace/mission-control`
 
 Available skills include `/mission`, `/flight`, `/leg`, `/agentic-workflow`, `/flight-debrief`, `/mission-debrief`, `/daily-briefing`, and `/init-project`.
 
