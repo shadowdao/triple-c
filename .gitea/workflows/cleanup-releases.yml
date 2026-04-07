@@ -1,0 +1,193 @@
+name: Cleanup Old Releases
+
+on:
+  workflow_dispatch:
+    inputs:
+      keep_versions:
+        description: "Number of recent versions to keep (each version has 3 releases: Linux, macOS, Windows)"
+        required: true
+        default: "5"
+      dry_run:
+        description: "Dry run - list what would be deleted without actually deleting"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+env:
+  GITEA_URL: ${{ gitea.server_url }}
+  REPO: ${{ gitea.repository }}
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cleanup old releases
+        env:
+          TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GITHUB_REPO: shadowdao/triple-c
+          KEEP_VERSIONS: ${{ gitea.event.inputs.keep_versions }}
+          DRY_RUN: ${{ gitea.event.inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          echo "==> Configuration"
+          echo "    Keep versions: ${KEEP_VERSIONS}"
+          echo "    Dry run: ${DRY_RUN}"
+          echo ""
+
+          # ── Fetch all Gitea releases (paginated) ──
+          ALL_RELEASES="[]"
+          PAGE=1
+          while true; do
+            BATCH=$(curl -sf \
+              -H "Authorization: token ${TOKEN}" \
+              "${GITEA_URL}/api/v1/repos/${REPO}/releases?limit=50&page=${PAGE}")
+            COUNT=$(echo "$BATCH" | jq 'length')
+            [ "$COUNT" -eq 0 ] && break
+            ALL_RELEASES=$(echo "$ALL_RELEASES" "$BATCH" | jq -s '.[0] + .[1]')
+            PAGE=$((PAGE + 1))
+          done
+
+          TOTAL=$(echo "$ALL_RELEASES" | jq 'length')
+          echo "==> Found ${TOTAL} total Gitea releases"
+
+          # ── Extract unique version numbers and sort them ──
+          # Tags are like: v0.2.26, v0.2.26-mac, v0.2.26-win, build-xxx
+          # Extract the base version (strip -mac, -win suffixes)
+          VERSIONS=$(echo "$ALL_RELEASES" | jq -r '.[].tag_name' \
+            | sed 's/-mac$//' | sed 's/-win$//' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -t. -k1,1V -k2,2n -k3,3n \
+            | uniq)
+
+          VERSION_COUNT=$(echo "$VERSIONS" | wc -l)
+          echo "==> Found ${VERSION_COUNT} unique versions"
+          echo ""
+
+          # ── Determine which versions to keep and which to delete ──
+          KEEP=$(echo "$VERSIONS" | tail -n "${KEEP_VERSIONS}")
+          DELETE=$(echo "$VERSIONS" | head -n -"${KEEP_VERSIONS}")
+
+          DELETE_COUNT=$(echo "$DELETE" | grep -c . || true)
+          if [ "$DELETE_COUNT" -eq 0 ]; then
+            echo "==> Nothing to clean up. Only ${VERSION_COUNT} versions exist, keeping ${KEEP_VERSIONS}."
+            exit 0
+          fi
+
+          echo "==> Keeping ${KEEP_VERSIONS} most recent versions:"
+          echo "$KEEP" | sed 's/^/    /'
+          echo ""
+          echo "==> Will delete ${DELETE_COUNT} older versions ($(echo "$DELETE" | head -1) through $(echo "$DELETE" | tail -1)):"
+          echo "$DELETE" | sed 's/^/    /'
+          echo ""
+
+          # ── Delete releases ──
+          DELETED_GITEA=0
+          DELETED_GITHUB=0
+          DELETED_TAGS=0
+
+          for VERSION in $DELETE; do
+            # Each version can have up to 3 releases: base, -mac, -win
+            for SUFFIX in "" "-mac" "-win"; do
+              TAG="${VERSION}${SUFFIX}"
+
+              # Find the Gitea release ID for this tag
+              RELEASE_ID=$(echo "$ALL_RELEASES" | jq -r --arg tag "$TAG" '.[] | select(.tag_name == $tag) | .id // empty')
+
+              if [ -n "$RELEASE_ID" ]; then
+                if [ "$DRY_RUN" = "true" ]; then
+                  echo "    [DRY RUN] Would delete Gitea release: ${TAG} (id: ${RELEASE_ID})"
+                else
+                  echo "    Deleting Gitea release: ${TAG} (id: ${RELEASE_ID})..."
+                  curl -sf -X DELETE \
+                    -H "Authorization: token ${TOKEN}" \
+                    "${GITEA_URL}/api/v1/repos/${REPO}/releases/${RELEASE_ID}" || echo "    Warning: failed to delete Gitea release ${TAG}"
+                  DELETED_GITEA=$((DELETED_GITEA + 1))
+                fi
+              fi
+
+              # Delete the Gitea tag
+              if [ "$DRY_RUN" = "true" ]; then
+                echo "    [DRY RUN] Would delete Gitea tag: ${TAG}"
+              else
+                curl -sf -X DELETE \
+                  -H "Authorization: token ${TOKEN}" \
+                  "${GITEA_URL}/api/v1/repos/${REPO}/tags/${TAG}" 2>/dev/null && DELETED_TAGS=$((DELETED_TAGS + 1)) || true
+              fi
+            done
+
+            # Delete the unified GitHub release (single tag per version, no suffix)
+            if [ -n "$GH_PAT" ]; then
+              GH_RELEASE=$(curl -sf \
+                -H "Authorization: Bearer ${GH_PAT}" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${GITHUB_REPO}/releases/tags/${VERSION}" 2>/dev/null || echo "{}")
+              GH_RELEASE_ID=$(echo "$GH_RELEASE" | jq -r '.id // empty')
+
+              if [ -n "$GH_RELEASE_ID" ]; then
+                if [ "$DRY_RUN" = "true" ]; then
+                  echo "    [DRY RUN] Would delete GitHub release: ${VERSION} (id: ${GH_RELEASE_ID})"
+                else
+                  echo "    Deleting GitHub release: ${VERSION} (id: ${GH_RELEASE_ID})..."
+                  curl -sf -X DELETE \
+                    -H "Authorization: Bearer ${GH_PAT}" \
+                    -H "Accept: application/vnd.github+json" \
+                    "https://api.github.com/repos/${GITHUB_REPO}/releases/${GH_RELEASE_ID}" || echo "    Warning: failed to delete GitHub release ${VERSION}"
+                  DELETED_GITHUB=$((DELETED_GITHUB + 1))
+                fi
+              fi
+
+              # Delete the GitHub tag
+              if [ "$DRY_RUN" = "true" ]; then
+                echo "    [DRY RUN] Would delete GitHub tag: ${VERSION}"
+              else
+                curl -sf -X DELETE \
+                  -H "Authorization: Bearer ${GH_PAT}" \
+                  -H "Accept: application/vnd.github+json" \
+                  "https://api.github.com/repos/${GITHUB_REPO}/git/refs/tags/${VERSION}" 2>/dev/null || true
+              fi
+            fi
+
+            echo ""
+          done
+
+          # ── Also clean up any legacy non-semver releases (e.g., build-xxx) ──
+          LEGACY_RELEASES=$(echo "$ALL_RELEASES" | jq -r '.[] | select(.tag_name | test("^v[0-9]") | not) | "\(.id) \(.tag_name)"')
+          LEGACY_COUNT=$(echo "$LEGACY_RELEASES" | grep -c . || true)
+
+          if [ "$LEGACY_COUNT" -gt 0 ]; then
+            echo "==> Found ${LEGACY_COUNT} legacy (non-versioned) releases to clean up:"
+            echo "$LEGACY_RELEASES" | while read -r ID TAG; do
+              [ -z "$ID" ] && continue
+              if [ "$DRY_RUN" = "true" ]; then
+                echo "    [DRY RUN] Would delete legacy release: ${TAG} (id: ${ID})"
+              else
+                echo "    Deleting legacy release: ${TAG} (id: ${ID})..."
+                curl -sf -X DELETE \
+                  -H "Authorization: token ${TOKEN}" \
+                  "${GITEA_URL}/api/v1/repos/${REPO}/releases/${ID}" || echo "    Warning: failed to delete ${TAG}"
+                # Delete the tag too
+                curl -sf -X DELETE \
+                  -H "Authorization: token ${TOKEN}" \
+                  "${GITEA_URL}/api/v1/repos/${REPO}/tags/${TAG}" 2>/dev/null || true
+                DELETED_GITEA=$((DELETED_GITEA + 1))
+              fi
+            done
+            echo ""
+          fi
+
+          # ── Summary ──
+          echo "==> Cleanup complete"
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "    Mode: DRY RUN (no changes made)"
+            echo "    Would delete: ${DELETE_COUNT} versions (up to $((DELETE_COUNT * 3)) Gitea releases + GitHub releases)"
+            [ "$LEGACY_COUNT" -gt 0 ] && echo "    Would also delete: ${LEGACY_COUNT} legacy releases"
+          else
+            echo "    Gitea releases deleted: ${DELETED_GITEA}"
+            echo "    GitHub releases deleted: ${DELETED_GITHUB}"
+            echo "    Tags deleted: ${DELETED_TAGS}"
+          fi
