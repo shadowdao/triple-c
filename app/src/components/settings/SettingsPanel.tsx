@@ -9,6 +9,7 @@ import { detectHostTimezone } from "../../lib/tauri-commands";
 import type { EnvVar } from "../../lib/types";
 import Tooltip from "../ui/Tooltip";
 import WebTerminalSettings from "./WebTerminalSettings";
+import SttSettings from "./SttSettings";
 
 export default function SettingsPanel() {
   const { appSettings, saveSettings } = useSettings();
@@ -119,6 +120,9 @@ export default function SettingsPanel() {
 
       {/* Web Terminal */}
       <WebTerminalSettings />
+
+      {/* Speech to Text */}
+      <SttSettings />
 
       {/* Updates section */}
       <div>

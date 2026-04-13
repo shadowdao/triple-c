@@ -122,6 +122,8 @@ pub fn run() {
                     if let Some(server) = server_guard.take() {
                         server.stop();
                     }
+                    // Stop STT container
+                    let _ = docker::stt::stop_stt_container().await;
                     // Close all exec sessions
                     state.exec_manager.close_all_sessions().await;
                 });
@@ -181,6 +183,13 @@ pub fn run() {
             commands::web_terminal_commands::stop_web_terminal,
             commands::web_terminal_commands::get_web_terminal_status,
             commands::web_terminal_commands::regenerate_web_terminal_token,
+            // STT
+            commands::stt_commands::get_stt_status,
+            commands::stt_commands::start_stt,
+            commands::stt_commands::stop_stt,
+            commands::stt_commands::build_stt_image,
+            commands::stt_commands::pull_stt_image,
+            commands::stt_commands::transcribe_audio,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
