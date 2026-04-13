@@ -61,7 +61,7 @@ export default function SttButton({ state, error, onToggle, onCancel }: Props) {
   };
 
   return (
-    <div className="absolute bottom-4 left-4 z-50 flex items-center gap-2">
+    <div className="absolute bottom-1 left-1 z-50 flex items-center gap-2">
       <button
         onClick={handleClick}
         onContextMenu={handleContextMenu}
