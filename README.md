@@ -97,6 +97,19 @@ Triple-C includes an optional web terminal server for accessing project terminal
 
 The web terminal shares the existing `ExecSessionManager` via `Arc`-wrapped stores — same Docker exec sessions, different transport (WebSocket instead of Tauri IPC events).
 
+### Speech-to-Text (Voice Mode)
+
+Triple-C includes optional speech-to-text powered by [Faster Whisper](https://github.com/SYSTRAN/faster-whisper) running in a separate Docker container. When enabled, a microphone button appears in the bottom-left corner of each terminal view.
+
+- **Hotkey**: `Ctrl+Shift+M` to toggle recording
+- **Models**: `tiny`, `small`, or `medium` (configurable in Settings)
+- **Port**: Default `9876` (configurable)
+- **Language**: Optional language hint for transcription
+- **Auto-start**: When STT is enabled in Settings, the container starts automatically with the app — no need to manually start it after each restart
+- **On-demand fallback**: If not auto-started, the container starts automatically when you first click the mic button
+
+**How it works**: Audio is captured in the browser via the Web Audio API, encoded as WAV, and sent to the Faster Whisper container's `/transcribe` endpoint. The transcribed text is inserted directly into the active terminal. The STT container uses a named Docker volume (`triple-c-stt-model-cache`) to cache Whisper models across restarts.
+
 ### Docker Socket Path
 
 The socket path is OS-aware:
@@ -122,12 +135,14 @@ Users can override this in Settings via the global `docker_socket_path` option.
 | `app/src/components/mcp/McpServerCard.tsx` | Individual MCP server configuration card |
 | `app/src/components/settings/SettingsPanel.tsx` | Docker, AWS, timezone, web terminal, and global settings |
 | `app/src/components/settings/WebTerminalSettings.tsx` | Web terminal toggle, URL, token management |
+| `app/src/components/settings/SttSettings.tsx` | STT settings panel (model, port, language, container controls) |
 | `app/src/components/terminal/TerminalView.tsx` | xterm.js terminal with WebGL, URL detection, OSC 52 clipboard, image paste |
+| `app/src/components/terminal/SttButton.tsx` | Mic button overlay with on-demand container start |
 | `app/src/components/terminal/TerminalTabs.tsx` | Tab bar for multiple terminal sessions (claude + bash) |
 | `app/src/hooks/useTerminal.ts` | Terminal session management (claude and bash modes) |
 | `app/src/hooks/useFileManager.ts` | File manager operations (list, download, upload) |
 | `app/src/hooks/useMcpServers.ts` | MCP server CRUD operations |
-| `app/src/hooks/useVoice.ts` | Voice mode audio capture (currently hidden) |
+| `app/src/hooks/useSTT.ts` | Speech-to-text recording, transcription, and container management |
 | `app/src-tauri/src/docker/container.rs` | Container creation, mounts, env vars, MCP injection, fingerprinting |
 | `app/src-tauri/src/docker/exec.rs` | PTY exec sessions, file upload/download via tar |
 | `app/src-tauri/src/docker/image.rs` | Image building/pulling |
@@ -137,12 +152,17 @@ Users can override this in Settings via the global `docker_socket_path` option.
 | `app/src-tauri/src/commands/mcp_commands.rs` | MCP server CRUD Tauri commands |
 | `app/src-tauri/src/models/project.rs` | Project struct (backend, Docker access, MCP servers, Mission Control) |
 | `app/src-tauri/src/models/mcp_server.rs` | MCP server struct (transport, Docker image, env vars) |
-| `app/src-tauri/src/models/app_settings.rs` | Global settings (image source, Docker socket, AWS, web terminal) |
+| `app/src-tauri/src/models/app_settings.rs` | Global settings (image source, Docker socket, AWS, web terminal, STT) |
 | `app/src-tauri/src/web_terminal/server.rs` | Axum HTTP+WS server for remote terminal access |
 | `app/src-tauri/src/web_terminal/ws_handler.rs` | WebSocket connection handler and session management |
 | `app/src-tauri/src/web_terminal/terminal.html` | Embedded web UI (xterm.js, project picker, tabs) |
+| `app/src-tauri/src/commands/stt_commands.rs` | STT start/stop/transcribe Tauri commands |
 | `app/src-tauri/src/commands/web_terminal_commands.rs` | Web terminal start/stop/status Tauri commands |
 | `app/src-tauri/src/storage/mcp_store.rs` | MCP server persistence (JSON with atomic writes) |
+| `app/src-tauri/src/docker/stt.rs` | STT Docker container lifecycle (create, start, stop, build, pull) |
+| `app/src/lib/wav.ts` | WAV audio encoding for STT transcription |
+| `stt-container/Dockerfile` | Faster Whisper STT container image (Python 3.11 + FastAPI) |
+| `stt-container/server.py` | STT HTTP server (POST /transcribe endpoint) |
 | `container/Dockerfile` | Ubuntu 24.04 sandbox image with Claude Code + dev tools + clipboard/audio shims |
 | `container/entrypoint.sh` | UID/GID remap, SSH setup, Docker group config, MCP injection, Mission Control setup |
 | `container/osc52-clipboard` | Clipboard shim (xclip/xsel/pbcopy via OSC 52) |
