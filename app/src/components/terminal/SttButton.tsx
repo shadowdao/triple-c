@@ -1,14 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useSTT } from "../../hooks/useSTT";
+import type { SttState } from "../../hooks/useSTT";
 import * as commands from "../../lib/tauri-commands";
 
 interface Props {
-  sessionId: string;
-  sendInput: (sessionId: string, data: string) => Promise<void>;
+  state: SttState;
+  error: string | null;
+  onToggle: () => Promise<void>;
+  onCancel: () => Promise<void>;
 }
 
-export default function SttButton({ sessionId, sendInput }: Props) {
-  const { state, error, toggle, cancelRecording } = useSTT(sessionId, sendInput);
+export default function SttButton({ state, error, onToggle, onCancel }: Props) {
   const [elapsed, setElapsed] = useState(0);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -40,17 +41,17 @@ export default function SttButton({ sessionId, sendInput }: Props) {
         // Container start failed, toggle will still attempt transcription
       }
     }
-    await toggle();
-  }, [state, toggle]);
+    await onToggle();
+  }, [state, onToggle]);
 
   const handleContextMenu = useCallback(
     (e: React.MouseEvent) => {
       e.preventDefault();
       if (state === "recording") {
-        cancelRecording();
+        onCancel();
       }
     },
-    [state, cancelRecording],
+    [state, onCancel],
   );
 
   const formatTime = (seconds: number) => {
@@ -64,6 +65,7 @@ export default function SttButton({ sessionId, sendInput }: Props) {
       <button
         onClick={handleClick}
         onContextMenu={handleContextMenu}
+        onMouseDown={(e) => e.preventDefault()} // prevent stealing focus from terminal
         disabled={state === "transcribing"}
         className={`w-8 h-8 rounded-full flex items-center justify-center transition-all cursor-pointer ${
           state === "recording"
@@ -74,10 +76,10 @@ export default function SttButton({ sessionId, sendInput }: Props) {
         }`}
         title={
           state === "recording"
-            ? "Click to stop and transcribe (right-click to cancel)"
+            ? "Click or Ctrl+Shift+M to stop and transcribe"
             : state === "transcribing"
               ? "Transcribing..."
-              : "Speech to text"
+              : "Speech to text (Ctrl+Shift+M)"
         }
       >
         {state === "transcribing" ? (
