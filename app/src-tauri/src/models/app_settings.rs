@@ -76,6 +76,48 @@ pub struct AppSettings {
     pub dismissed_image_digest: Option<String>,
     #[serde(default)]
     pub web_terminal: WebTerminalSettings,
+    #[serde(default)]
+    pub stt: SttSettings,
+}
+
+fn default_stt_model() -> String {
+    "tiny".to_string()
+}
+
+fn default_stt_port() -> u16 {
+    9876
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SttSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_stt_model")]
+    pub model: String,
+    #[serde(default = "default_stt_port")]
+    pub port: u16,
+    #[serde(default)]
+    pub language: Option<String>,
+}
+
+impl Default for SttSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: default_stt_model(),
+            port: 9876,
+            language: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SttStatus {
+    pub container_exists: bool,
+    pub running: bool,
+    pub port: u16,
+    pub model: String,
+    pub image_exists: bool,
 }
 
 fn default_web_terminal_port() -> u16 {
@@ -120,6 +162,7 @@ impl Default for AppSettings {
             default_microphone: None,
             dismissed_image_digest: None,
             web_terminal: WebTerminalSettings::default(),
+            stt: SttSettings::default(),
         }
     }
 }

@@ -119,6 +119,22 @@ export interface AppSettings {
   default_microphone: string | null;
   dismissed_image_digest: string | null;
   web_terminal: WebTerminalSettings;
+  stt: SttSettings;
+}
+
+export interface SttSettings {
+  enabled: boolean;
+  model: string;
+  port: number;
+  language: string | null;
+}
+
+export interface SttStatus {
+  container_exists: boolean;
+  running: boolean;
+  port: number;
+  model: string;
+  image_exists: boolean;
 }
 
 export interface WebTerminalSettings {

@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, ImageUpdateInfo, McpServer, FileEntry, WebTerminalInfo } from "./types";
+import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, ImageUpdateInfo, McpServer, FileEntry, WebTerminalInfo, SttStatus } from "./types";
 
 // Docker
 export const checkDocker = () => invoke<boolean>("check_docker");
@@ -98,3 +98,12 @@ export const getWebTerminalStatus = () =>
   invoke<WebTerminalInfo>("get_web_terminal_status");
 export const regenerateWebTerminalToken = () =>
   invoke<WebTerminalInfo>("regenerate_web_terminal_token");
+
+// STT
+export const getSttStatus = () => invoke<SttStatus>("get_stt_status");
+export const startStt = () => invoke<SttStatus>("start_stt");
+export const stopStt = () => invoke<void>("stop_stt");
+export const buildSttImage = () => invoke<void>("build_stt_image");
+export const pullSttImage = () => invoke<void>("pull_stt_image");
+export const transcribeAudio = (audioData: number[]) =>
+  invoke<string>("transcribe_audio", { audioData });

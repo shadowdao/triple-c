@@ -5,6 +5,7 @@ pub mod help_commands;
 pub mod mcp_commands;
 pub mod project_commands;
 pub mod settings_commands;
+pub mod stt_commands;
 pub mod terminal_commands;
 pub mod update_commands;
 pub mod web_terminal_commands;
