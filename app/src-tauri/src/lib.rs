@@ -111,6 +111,25 @@ pub fn run() {
                 }
             }
 
+            // Auto-start STT container if enabled in settings
+            if settings.stt.enabled {
+                let stt_settings = settings.stt.clone();
+                tauri::async_runtime::spawn(async move {
+                    match docker::stt::ensure_stt_running(&stt_settings).await {
+                        Ok(status) => {
+                            if status.running {
+                                log::info!("STT container auto-started on port {}", stt_settings.port);
+                            } else {
+                                log::warn!("STT auto-start: container not running after ensure_stt_running");
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("Failed to auto-start STT container: {}", e);
+                        }
+                    }
+                });
+            }
+
             Ok(())
         })
         .on_window_event(|window, event| {
