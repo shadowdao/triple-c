@@ -7,6 +7,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import "@xterm/xterm/css/xterm.css";
 import { useTerminal } from "../../hooks/useTerminal";
 import { useAppState } from "../../store/appState";
+import { useSTT } from "../../hooks/useSTT";
 import SttButton from "./SttButton";
 import { awsSsoRefresh } from "../../lib/tauri-commands";
 import { UrlDetector } from "../../lib/urlDetector";
@@ -27,6 +28,9 @@ export default function TerminalView({ sessionId, active }: Props) {
   const { sendInput, pasteImage, resize, onOutput, onExit } = useTerminal();
   const setTerminalHasSelection = useAppState(s => s.setTerminalHasSelection);
   const sttEnabled = useAppState(s => s.appSettings?.stt?.enabled);
+  const stt = useSTT(sessionId, sendInput);
+  const sttToggleRef = useRef(stt.toggle);
+  sttToggleRef.current = stt.toggle;
 
   const ssoBufferRef = useRef("");
   const ssoTriggeredRef = useRef(false);
@@ -101,6 +105,11 @@ export default function TerminalView({ sessionId, active }: Props) {
           );
         }
         return false; // prevent xterm from processing this key
+      }
+      // Ctrl+Shift+M toggles speech-to-text recording
+      if (event.type === "keydown" && event.ctrlKey && event.shiftKey && event.key === "M") {
+        sttToggleRef.current();
+        return false;
       }
       return true;
     });
@@ -427,7 +436,7 @@ export default function TerminalView({ sessionId, active }: Props) {
         {isAutoFollow ? "▼ Following" : "▽ Paused"}
       </button>
       {/* STT mic button - bottom left */}
-      {sttEnabled && <SttButton sessionId={sessionId} sendInput={sendInput} />}
+      {sttEnabled && <SttButton state={stt.state} error={stt.error} onToggle={stt.toggle} onCancel={stt.cancelRecording} />}
       {/* Jump to Current - bottom right, when scrolled up */}
       {!isAtBottom && (
         <button
