@@ -1,5 +1,6 @@
 use tauri::{AppHandle, Emitter, State};
 
+use crate::commands::aws_commands;
 use crate::models::{Backend, BedrockAuthMethod, Project};
 use crate::AppState;
 
@@ -24,13 +25,10 @@ fn build_terminal_cmd(project: &Project, state: &AppState) -> Vec<String> {
         return cmd;
     }
 
-    // Resolve AWS profile: project-level → global settings → "default"
-    let profile = project
-        .bedrock_config
-        .as_ref()
-        .and_then(|b| b.aws_profile.clone())
-        .or_else(|| state.settings_store.get().global_aws.aws_profile.clone())
-        .unwrap_or_else(|| "default".to_string());
+    let profile = aws_commands::resolve_profile_for_project(
+        project,
+        state.settings_store.get().global_aws.aws_profile.as_deref(),
+    );
 
     // Build a bash wrapper that validates credentials, re-auths if needed,
     // then exec's into claude.

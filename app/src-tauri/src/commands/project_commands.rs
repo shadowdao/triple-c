@@ -1,7 +1,8 @@
 use tauri::{Emitter, State};
 
+use crate::commands::aws_commands;
 use crate::docker;
-use crate::models::{container_config, Backend, McpServer, Project, ProjectPath, ProjectStatus};
+use crate::models::{container_config, Backend, BedrockAuthMethod, McpServer, Project, ProjectPath, ProjectStatus};
 use crate::storage::secure;
 use crate::AppState;
 
@@ -207,6 +208,76 @@ pub async fn start_project_container(
 
     // Update status to starting
     state.projects_store.update_status(&project_id, ProjectStatus::Starting)?;
+
+    // Pre-validate AWS SSO session on the host for Bedrock Profile projects.
+    // If the session is expired, trigger `aws sso login` before starting the container
+    // so the entrypoint copies already-fresh credentials from the host mount.
+    if project.backend == Backend::Bedrock {
+        if let Some(ref bedrock) = project.bedrock_config {
+            if bedrock.auth_method == BedrockAuthMethod::Profile {
+                let profile = aws_commands::resolve_profile_for_project(
+                    &project,
+                    settings.global_aws.aws_profile.as_deref(),
+                );
+
+                emit_progress(&app_handle, &project_id, "Validating AWS session...");
+
+                let session_valid = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    aws_commands::check_sso_session(&profile),
+                )
+                .await;
+
+                match session_valid {
+                    Ok(Ok(true)) => {
+                        emit_progress(&app_handle, &project_id, "AWS session valid.");
+                    }
+                    Ok(Ok(false)) => {
+                        // Session expired — check if this is an SSO profile
+                        if aws_commands::is_sso_profile(&profile).await.unwrap_or(false) {
+                            emit_progress(
+                                &app_handle,
+                                &project_id,
+                                "AWS session expired. Starting SSO login (check your browser)...",
+                            );
+                            match aws_commands::run_sso_login(&profile).await {
+                                Ok(()) => {
+                                    emit_progress(
+                                        &app_handle,
+                                        &project_id,
+                                        "SSO login successful.",
+                                    );
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "SSO login failed for profile '{}': {} — continuing anyway",
+                                        profile,
+                                        e
+                                    );
+                                    emit_progress(
+                                        &app_handle,
+                                        &project_id,
+                                        "SSO login failed or cancelled. Continuing...",
+                                    );
+                                }
+                            }
+                        } else {
+                            log::warn!(
+                                "AWS session invalid for profile '{}' (not SSO). Continuing...",
+                                profile
+                            );
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        log::warn!("Failed to check AWS session: {} — continuing anyway", e);
+                    }
+                    Err(_) => {
+                        log::warn!("AWS session check timed out — continuing anyway");
+                    }
+                }
+            }
+        }
+    }
 
     // Wrap container operations so that any failure resets status to Stopped.
     let result: Result<String, String> = async {

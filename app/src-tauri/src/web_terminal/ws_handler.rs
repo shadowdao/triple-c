@@ -7,6 +7,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
+use crate::commands::aws_commands;
 use crate::models::{Backend, BedrockAuthMethod, Project, ProjectStatus};
 
 use super::server::WebTerminalState;
@@ -212,12 +213,10 @@ fn build_terminal_cmd(project: &Project, settings_store: &crate::storage::settin
         return cmd;
     }
 
-    let profile = project
-        .bedrock_config
-        .as_ref()
-        .and_then(|b| b.aws_profile.clone())
-        .or_else(|| settings_store.get().global_aws.aws_profile.clone())
-        .unwrap_or_else(|| "default".to_string());
+    let profile = aws_commands::resolve_profile_for_project(
+        project,
+        settings_store.get().global_aws.aws_profile.as_deref(),
+    );
 
     let claude_cmd = if project.full_permissions {
         "exec claude --dangerously-skip-permissions"
