@@ -9,7 +9,7 @@ use crate::AppState;
 /// For Bedrock Profile projects, wraps `claude` in a bash script that validates
 /// the AWS session first. If the SSO session is expired, runs `aws sso login`
 /// so the user can re-authenticate (the URL is clickable via xterm.js WebLinksAddon).
-fn build_terminal_cmd(project: &Project, state: &AppState) -> Vec<String> {
+fn build_terminal_cmd(project: &Project, state: &AppState, session_name: Option<&str>) -> Vec<String> {
     let is_bedrock_profile = project.backend == Backend::Bedrock
         && project
             .bedrock_config
@@ -22,6 +22,12 @@ fn build_terminal_cmd(project: &Project, state: &AppState) -> Vec<String> {
         if project.full_permissions {
             cmd.push("--dangerously-skip-permissions".to_string());
         }
+        if let Some(name) = session_name {
+            if !name.is_empty() {
+                cmd.push("-n".to_string());
+                cmd.push(name.to_string());
+            }
+        }
         return cmd;
     }
 
@@ -32,10 +38,14 @@ fn build_terminal_cmd(project: &Project, state: &AppState) -> Vec<String> {
 
     // Build a bash wrapper that validates credentials, re-auths if needed,
     // then exec's into claude.
+    let name_flag = session_name
+        .filter(|n| !n.is_empty())
+        .map(|n| format!(" -n '{}'", n.replace('\'', "'\\''")))
+        .unwrap_or_default();
     let claude_cmd = if project.full_permissions {
-        "exec claude --dangerously-skip-permissions"
+        format!("exec claude --dangerously-skip-permissions{}", name_flag)
     } else {
-        "exec claude"
+        format!("exec claude{}", name_flag)
     };
 
     let script = format!(
@@ -81,6 +91,7 @@ pub async fn open_terminal_session(
     project_id: String,
     session_id: String,
     session_type: Option<String>,
+    session_name: Option<String>,
     app_handle: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
@@ -96,7 +107,7 @@ pub async fn open_terminal_session(
 
     let cmd = match session_type.as_deref() {
         Some("bash") => vec!["bash".to_string(), "-l".to_string()],
-        _ => build_terminal_cmd(&project, &state),
+        _ => build_terminal_cmd(&project, &state, session_name.as_deref()),
     };
 
     let output_event = format!("terminal-output-{}", session_id);

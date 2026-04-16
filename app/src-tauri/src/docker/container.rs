@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use sha2::{Sha256, Digest};
 
 use super::client::get_docker;
-use crate::models::{Backend, BedrockAuthMethod, ContainerInfo, EnvVar, GlobalAwsSettings, McpServer, McpTransportType, PortMapping, Project, ProjectPath};
+use crate::models::{Backend, BedrockAuthMethod, ClaudeCodeSettings, ContainerInfo, EnvVar, GlobalAwsSettings, McpServer, McpTransportType, PortMapping, Project, ProjectPath};
 
 const SCHEDULER_INSTRUCTIONS: &str = r#"## Scheduled Tasks
 
@@ -132,14 +132,17 @@ fn build_claude_instructions(
 /// Compute a fingerprint string for the custom environment variables.
 /// Sorted alphabetically so order changes do not cause spurious recreation.
 fn compute_env_fingerprint(custom_env_vars: &[EnvVar]) -> String {
-    let reserved_prefixes = ["ANTHROPIC_", "AWS_", "GIT_", "HOST_", "CLAUDE_", "TRIPLE_C_"];
+    let reserved_prefixes = ["ANTHROPIC_", "AWS_", "GIT_", "HOST_", "TRIPLE_C_"];
+    let reserved_exact = ["CLAUDE_INSTRUCTIONS", "MCP_SERVERS_JSON", "CLAUDE_CODE_SETTINGS_JSON", "MISSION_CONTROL_ENABLED"];
     let mut parts: Vec<String> = Vec::new();
     for env_var in custom_env_vars {
         let key = env_var.key.trim();
         if key.is_empty() {
             continue;
         }
-        let is_reserved = reserved_prefixes.iter().any(|p| key.to_uppercase().starts_with(p));
+        let upper = key.to_uppercase();
+        let is_reserved = reserved_prefixes.iter().any(|p| upper.starts_with(p))
+            || reserved_exact.iter().any(|e| upper == *e);
         if is_reserved {
             continue;
         }
@@ -282,6 +285,80 @@ fn compute_ports_fingerprint(port_mappings: &[PortMapping]) -> String {
     sha256_hex(&joined)
 }
 
+/// Merge global and per-project ClaudeCodeSettings.
+/// Per-project fields override global fields when set (non-default).
+fn merge_claude_code_settings(
+    global: Option<&ClaudeCodeSettings>,
+    project: Option<&ClaudeCodeSettings>,
+) -> Option<ClaudeCodeSettings> {
+    match (global, project) {
+        (None, None) => None,
+        (Some(g), None) => Some(g.clone()),
+        (None, Some(p)) => Some(p.clone()),
+        (Some(g), Some(p)) => {
+            // Project overrides global for each field when the project value is non-default
+            Some(ClaudeCodeSettings {
+                tui_mode: p.tui_mode.clone().or_else(|| g.tui_mode.clone()),
+                effort: p.effort.clone().or_else(|| g.effort.clone()),
+                auto_scroll_disabled: if p.auto_scroll_disabled { true } else { g.auto_scroll_disabled },
+                focus_mode: if p.focus_mode { true } else { g.focus_mode },
+                show_thinking_summaries: if p.show_thinking_summaries { true } else { g.show_thinking_summaries },
+                enable_session_recap: if p.enable_session_recap { true } else { g.enable_session_recap },
+                env_scrub: if p.env_scrub { true } else { g.env_scrub },
+                prompt_caching_1h: if p.prompt_caching_1h { true } else { g.prompt_caching_1h },
+            })
+        }
+    }
+}
+
+/// Compute a fingerprint for the Claude Code settings so we can detect changes.
+fn compute_claude_code_settings_fingerprint(settings: Option<&ClaudeCodeSettings>) -> String {
+    match settings {
+        None => String::new(),
+        Some(s) => {
+            let parts = vec![
+                s.tui_mode.as_deref().unwrap_or("").to_string(),
+                s.effort.as_deref().unwrap_or("").to_string(),
+                format!("{}", s.auto_scroll_disabled),
+                format!("{}", s.focus_mode),
+                format!("{}", s.show_thinking_summaries),
+                format!("{}", s.enable_session_recap),
+                format!("{}", s.env_scrub),
+                format!("{}", s.prompt_caching_1h),
+            ];
+            sha256_hex(&parts.join("|"))
+        }
+    }
+}
+
+/// Build the settings.json content for Claude Code from ClaudeCodeSettings.
+/// Returns a JSON string of the settings to be written to ~/.claude/settings.json.
+fn build_claude_code_settings_json(settings: &ClaudeCodeSettings) -> Option<String> {
+    let mut map = serde_json::Map::new();
+
+    if let Some(ref tui) = settings.tui_mode {
+        map.insert("tui".to_string(), serde_json::json!(tui));
+    }
+    if let Some(ref effort) = settings.effort {
+        map.insert("effort".to_string(), serde_json::json!(effort));
+    }
+    if settings.auto_scroll_disabled {
+        map.insert("autoScrollEnabled".to_string(), serde_json::json!(false));
+    }
+    if settings.focus_mode {
+        map.insert("focusMode".to_string(), serde_json::json!(true));
+    }
+    if settings.show_thinking_summaries {
+        map.insert("showThinkingSummaries".to_string(), serde_json::json!(true));
+    }
+
+    if map.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(map).to_string())
+    }
+}
+
 /// Build the JSON value for MCP servers config to be injected into ~/.claude.json.
 /// Produces `{"mcpServers": {"name": {"type": "stdio", ...}, ...}}`.
 ///
@@ -400,6 +477,10 @@ pub async fn create_container(
     timezone: Option<&str>,
     mcp_servers: &[McpServer],
     network_name: Option<&str>,
+    global_claude_code_settings: Option<&ClaudeCodeSettings>,
+    default_ssh_key_path: Option<&str>,
+    default_git_user_name: Option<&str>,
+    default_git_user_email: Option<&str>,
 ) -> Result<String, String> {
     let docker = get_docker()?;
     let container_name = project.container_name();
@@ -445,10 +526,13 @@ pub async fn create_container(
     if let Some(ref token) = project.git_token {
         env_vars.push(format!("GIT_TOKEN={}", token));
     }
-    if let Some(ref name) = project.git_user_name {
+    // Per-project git user overrides global defaults
+    let effective_git_name = project.git_user_name.as_deref().or(default_git_user_name);
+    let effective_git_email = project.git_user_email.as_deref().or(default_git_user_email);
+    if let Some(name) = effective_git_name {
         env_vars.push(format!("GIT_USER_NAME={}", name));
     }
-    if let Some(ref email) = project.git_user_email {
+    if let Some(email) = effective_git_email {
         env_vars.push(format!("GIT_USER_EMAIL={}", email));
     }
 
@@ -531,13 +615,16 @@ pub async fn create_container(
 
     // Custom environment variables (global + per-project, project overrides global for same key)
     let merged_env = merge_custom_env_vars(global_custom_env_vars, &project.custom_env_vars);
-    let reserved_prefixes = ["ANTHROPIC_", "AWS_", "GIT_", "HOST_", "CLAUDE_", "TRIPLE_C_"];
+    let reserved_prefixes = ["ANTHROPIC_", "AWS_", "GIT_", "HOST_", "TRIPLE_C_"];
+    let reserved_exact = ["CLAUDE_INSTRUCTIONS", "MCP_SERVERS_JSON", "CLAUDE_CODE_SETTINGS_JSON", "MISSION_CONTROL_ENABLED"];
     for env_var in &merged_env {
         let key = env_var.key.trim();
         if key.is_empty() {
             continue;
         }
-        let is_reserved = reserved_prefixes.iter().any(|p| key.to_uppercase().starts_with(p));
+        let upper = key.to_uppercase();
+        let is_reserved = reserved_prefixes.iter().any(|p| upper.starts_with(p))
+            || reserved_exact.iter().any(|e| upper == *e);
         if is_reserved {
             log::warn!("Skipping reserved env var: {}", key);
             continue;
@@ -577,6 +664,32 @@ pub async fn create_container(
         env_vars.push(format!("MCP_SERVERS_JSON={}", mcp_json));
     }
 
+    // Claude Code settings (global + per-project merged)
+    let merged_cc_settings = merge_claude_code_settings(
+        global_claude_code_settings,
+        project.claude_code_settings.as_ref(),
+    );
+    if let Some(ref cc) = merged_cc_settings {
+        // Env-var-based settings (these are read directly by Claude Code)
+        if cc.tui_mode.as_deref() == Some("fullscreen") {
+            env_vars.push("CLAUDE_CODE_NO_FLICKER=1".to_string());
+        }
+        if cc.enable_session_recap {
+            env_vars.push("CLAUDE_CODE_ENABLE_AWAY_SUMMARY=1".to_string());
+        }
+        if cc.env_scrub {
+            env_vars.push("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1".to_string());
+        }
+        if cc.prompt_caching_1h {
+            env_vars.push("ENABLE_PROMPT_CACHING_1H=1".to_string());
+        }
+
+        // settings.json-based settings (written by the entrypoint)
+        if let Some(settings_json) = build_claude_code_settings_json(cc) {
+            env_vars.push(format!("CLAUDE_CODE_SETTINGS_JSON={}", settings_json));
+        }
+    }
+
     let mut mounts: Vec<Mount> = Vec::new();
 
     // Project directories -> /workspace/{mount_name}
@@ -612,10 +725,12 @@ pub async fn create_container(
     });
 
     // SSH keys mount (read-only staging; entrypoint copies to ~/.ssh with correct perms)
-    if let Some(ref ssh_path) = project.ssh_key_path {
+    // Per-project ssh_key_path overrides global default_ssh_key_path
+    let effective_ssh_path = project.ssh_key_path.as_deref().or(default_ssh_key_path);
+    if let Some(ssh_path) = effective_ssh_path {
         mounts.push(Mount {
             target: Some("/tmp/.host-ssh".to_string()),
-            source: Some(ssh_path.clone()),
+            source: Some(ssh_path.to_string()),
             typ: Some(MountTypeEnum::BIND),
             read_only: Some(true),
             ..Default::default()
@@ -705,10 +820,12 @@ pub async fn create_container(
     labels.insert("triple-c.mcp-fingerprint".to_string(), compute_mcp_fingerprint(mcp_servers));
     labels.insert("triple-c.mission-control".to_string(), project.mission_control_enabled.to_string());
     labels.insert("triple-c.custom-env-fingerprint".to_string(), custom_env_fingerprint.clone());
+    labels.insert("triple-c.claude-code-settings-fingerprint".to_string(),
+        compute_claude_code_settings_fingerprint(merged_cc_settings.as_ref()));
     labels.insert("triple-c.instructions-fingerprint".to_string(),
         combined_instructions.as_ref().map(|s| sha256_hex(s)).unwrap_or_default());
-    labels.insert("triple-c.git-user-name".to_string(), project.git_user_name.clone().unwrap_or_default());
-    labels.insert("triple-c.git-user-email".to_string(), project.git_user_email.clone().unwrap_or_default());
+    labels.insert("triple-c.git-user-name".to_string(), effective_git_name.unwrap_or_default().to_string());
+    labels.insert("triple-c.git-user-email".to_string(), effective_git_email.unwrap_or_default().to_string());
     labels.insert("triple-c.git-token-hash".to_string(),
         project.git_token.as_ref().map(|t| sha256_hex(t)).unwrap_or_default());
 
@@ -877,6 +994,10 @@ pub async fn container_needs_recreation(
     global_custom_env_vars: &[EnvVar],
     timezone: Option<&str>,
     mcp_servers: &[McpServer],
+    global_claude_code_settings: Option<&ClaudeCodeSettings>,
+    default_ssh_key_path: Option<&str>,
+    default_git_user_name: Option<&str>,
+    default_git_user_email: Option<&str>,
 ) -> Result<bool, String> {
     let docker = get_docker()?;
     let info = docker
@@ -997,28 +1118,34 @@ pub async fn container_needs_recreation(
                 .find(|mount| mount.target.as_deref() == Some("/tmp/.host-ssh"))
         })
         .and_then(|mount| mount.source.as_deref());
-    let project_ssh = project.ssh_key_path.as_deref();
-    if ssh_mount_source != project_ssh {
+    let effective_ssh = project.ssh_key_path.as_deref().or(default_ssh_key_path);
+    if ssh_mount_source != effective_ssh {
         log::info!(
-            "SSH key path mismatch (container={:?}, project={:?})",
+            "SSH key path mismatch (container={:?}, expected={:?})",
             ssh_mount_source,
-            project_ssh
+            effective_ssh
         );
         return Ok(true);
     }
 
     // ── Git settings (label-based to avoid stale snapshot env vars) ─────
-    let expected_git_name = project.git_user_name.clone().unwrap_or_default();
+    let expected_git_name = project.git_user_name.as_deref()
+        .or(default_git_user_name)
+        .unwrap_or_default()
+        .to_string();
     let container_git_name = get_label("triple-c.git-user-name").unwrap_or_default();
     if container_git_name != expected_git_name {
-        log::info!("GIT_USER_NAME mismatch (container={:?}, project={:?})", container_git_name, expected_git_name);
+        log::info!("GIT_USER_NAME mismatch (container={:?}, expected={:?})", container_git_name, expected_git_name);
         return Ok(true);
     }
 
-    let expected_git_email = project.git_user_email.clone().unwrap_or_default();
+    let expected_git_email = project.git_user_email.as_deref()
+        .or(default_git_user_email)
+        .unwrap_or_default()
+        .to_string();
     let container_git_email = get_label("triple-c.git-user-email").unwrap_or_default();
     if container_git_email != expected_git_email {
-        log::info!("GIT_USER_EMAIL mismatch (container={:?}, project={:?})", container_git_email, expected_git_email);
+        log::info!("GIT_USER_EMAIL mismatch (container={:?}, expected={:?})", container_git_email, expected_git_email);
         return Ok(true);
     }
 
@@ -1057,6 +1184,18 @@ pub async fn container_needs_recreation(
     let container_instructions_fp = get_label("triple-c.instructions-fingerprint").unwrap_or_default();
     if container_instructions_fp != expected_instructions_fp {
         log::info!("CLAUDE_INSTRUCTIONS mismatch");
+        return Ok(true);
+    }
+
+    // ── Claude Code settings fingerprint ───────────────────────────────
+    let merged_cc = merge_claude_code_settings(
+        global_claude_code_settings,
+        project.claude_code_settings.as_ref(),
+    );
+    let expected_cc_fp = compute_claude_code_settings_fingerprint(merged_cc.as_ref());
+    let container_cc_fp = get_label("triple-c.claude-code-settings-fingerprint").unwrap_or_default();
+    if container_cc_fp != expected_cc_fp {
+        log::info!("Claude Code settings mismatch (container={:?}, expected={:?})", container_cc_fp, expected_cc_fp);
         return Ok(true);
     }
 

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::project::EnvVar;
+use super::project::{ClaudeCodeSettings, EnvVar};
 
 fn default_true() -> bool {
     true
@@ -78,6 +78,8 @@ pub struct AppSettings {
     pub web_terminal: WebTerminalSettings,
     #[serde(default)]
     pub stt: SttSettings,
+    #[serde(default)]
+    pub global_claude_code_settings: Option<ClaudeCodeSettings>,
 }
 
 fn default_stt_model() -> String {
@@ -163,6 +165,7 @@ impl Default for AppSettings {
             dismissed_image_digest: None,
             web_terminal: WebTerminalSettings::default(),
             stt: SttSettings::default(),
+            global_claude_code_settings: None,
         }
     }
 }

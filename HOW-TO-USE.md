@@ -253,7 +253,7 @@ When **disabled** (default), Claude prompts you for approval before executing ea
 
 Click **Edit** to open the environment variables modal. Add key-value pairs that will be injected into the container. Per-project variables override global variables with the same key.
 
-> Reserved prefixes (`ANTHROPIC_`, `AWS_`, `GIT_`, `HOST_`, `CLAUDE_`, `TRIPLE_C_`) are filtered out to prevent conflicts with internal variables.
+> Reserved prefixes (`ANTHROPIC_`, `AWS_`, `GIT_`, `HOST_`, `TRIPLE_C_`) and specific internal variables (`CLAUDE_INSTRUCTIONS`, `MCP_SERVERS_JSON`, etc.) are filtered out to prevent conflicts. `CLAUDE_CODE_*` variables are now allowed, so you can set Claude Code feature flags directly (e.g., `CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1`).
 
 ### Port Mappings
 
@@ -267,6 +267,25 @@ Each mapping specifies:
 ### Claude Instructions
 
 Click **Edit** to write per-project instructions for Claude Code. These are written to `~/.claude/CLAUDE.md` inside the container and provide project-specific context. If you also have global instructions (in Settings), the global instructions come first, followed by the per-project instructions.
+
+### Claude Code Settings
+
+Click **Edit** next to "Claude Code Settings" to configure Claude Code CLI behavior for this project. These settings control how Claude Code operates inside the container:
+
+| Setting | What It Does |
+|---------|-------------|
+| **TUI Mode** | Set to **Fullscreen** for flicker-free alt-screen rendering (uses `CLAUDE_CODE_NO_FLICKER=1`) |
+| **Effort Level** | Controls reasoning depth: **Low** (fast, less thorough), **Medium**, **High** (deep reasoning) |
+| **Focus Mode** | Collapses tool output to one-line summaries, showing only the prompt and final response |
+| **Thinking Summaries** | Shows Claude's thinking process as summaries during responses |
+| **Session Recap** | Provides context when returning to a session after being away |
+| **Auto-Scroll Disabled** | Disables auto-scroll when in fullscreen TUI mode |
+| **Env Scrub** | Strips credentials from subprocess environments for security |
+| **Prompt Caching (1h)** | Enables 1-hour prompt cache TTL instead of the default 5 minutes |
+
+Per-project settings override global defaults set in Settings. If all settings are at their defaults, no configuration is injected.
+
+> These settings map to Claude Code environment variables and `~/.claude/settings.json` entries. Changes require stopping and restarting the container to take effect.
 
 ---
 
@@ -481,6 +500,18 @@ Instructions applied to **all** projects. Written to `~/.claude/CLAUDE.md` in ev
 
 Environment variables applied to **all** project containers. Per-project variables with the same key take precedence.
 
+### Default SSH Key Directory
+
+Path to your SSH key directory (typically `~/.ssh`). This is mounted into **all** containers that don't have a per-project SSH path set. Per-project SSH paths take precedence.
+
+### Default Git Name / Email
+
+Sets `git user.name` and `git user.email` inside all containers. Per-project Git Name / Email settings take precedence. This is useful so you don't have to set the same name and email on every project.
+
+### Claude Code Settings (Global Defaults)
+
+Default Claude Code CLI settings applied to all projects. See [Claude Code Settings](#claude-code-settings) in the Project Configuration section for a description of each setting. Per-project settings override these global defaults.
+
 ### Web Terminal
 
 Enable remote access to your project terminals from any device on the local network (tablets, phones, other computers).
@@ -543,7 +574,7 @@ The web terminal UI mirrors the desktop app's terminal experience:
 
 ### Multiple Sessions
 
-You can open multiple terminal sessions (even for the same project). Each session gets its own tab in the top bar. Click a tab to switch, or click the **x** on a tab to close it. Tabs show the project name, with a "(bash)" suffix for shell sessions.
+You can open multiple terminal sessions (even for the same project). Each session gets its own tab in the top bar. Click a tab to switch, or click the **x** on a tab to close it. Tabs show the project name (or custom session name if provided), with a "(bash)" suffix for shell sessions.
 
 ### Bash Shell Sessions
 
@@ -665,6 +696,24 @@ The sandbox container (Ubuntu 24.04) comes pre-installed with:
 The container also includes **clipboard shims** (`xclip`, `xsel`, `pbcopy`) that forward copy operations to the host via OSC 52, and an **audio shim** (`rec`, `arecord`) for future voice mode support.
 
 You can install additional tools at runtime with `sudo apt install`, `pip install`, `npm install -g`, etc. Installed packages persist across container stops (but not across resets).
+
+---
+
+## Claude Code Tips
+
+These features are built into Claude Code and work inside Triple-C containers with no extra configuration:
+
+| Feature | How to Use |
+|---------|-----------|
+| **Focus Mode** | Run `/focus` or press `Ctrl+O` in the terminal to toggle collapsed tool output |
+| **Session Recap** | Run `/recap` to get a summary of what happened in the current session |
+| **Session Color** | Run `/color red` (or any color) to color-code your terminal prompt bar |
+| **Recurring Tasks** | Run `/loop 5m check the deploy` to repeat a prompt every 5 minutes |
+| **Interactive Lessons** | Run `/powerup` to learn Claude Code features with animated demos |
+| **Team Onboarding** | Run `/team-onboarding` to generate a teammate ramp-up guide |
+| **Bedrock Setup** | Select "3rd-party platform" on the login screen for an interactive Bedrock setup wizard |
+| **Vertex AI Setup** | Select "3rd-party platform" on the login screen for an interactive Vertex AI setup wizard |
+| **MCP Elicitation** | MCP servers can now request structured user input mid-task — works automatically |
 
 ---
 

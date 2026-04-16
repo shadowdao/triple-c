@@ -17,10 +17,10 @@ export function useTerminal() {
     );
 
   const open = useCallback(
-    async (projectId: string, projectName: string, sessionType: "claude" | "bash" = "claude") => {
+    async (projectId: string, projectName: string, sessionType: "claude" | "bash" = "claude", sessionName?: string) => {
       const sessionId = crypto.randomUUID();
-      await commands.openTerminalSession(projectId, sessionId, sessionType);
-      addSession({ id: sessionId, projectId, projectName, sessionType });
+      await commands.openTerminalSession(projectId, sessionId, sessionType, sessionName);
+      addSession({ id: sessionId, projectId, projectName, sessionType, sessionName: sessionName ?? null });
       return sessionId;
     },
     [addSession],

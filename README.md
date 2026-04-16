@@ -27,7 +27,7 @@ Triple-C is a cross-platform desktop application that sandboxes Claude Code insi
 ### Container Lifecycle
 
 1. **Create**: New container created with bind mounts, env vars, and labels
-2. **Start**: Container started, entrypoint remaps UID/GID, sets up SSH, configures Docker group, sets up MCP servers
+2. **Start**: Container started, entrypoint remaps UID/GID, sets up SSH, configures Docker group, sets up MCP servers, injects Claude Code settings
 3. **Terminal**: `docker exec` launches Claude Code (or bash shell) with a PTY
 4. **Stop**: Container halted (filesystem persists in named volume); MCP containers stopped
 5. **Restart**: Existing container restarted; recreated if settings changed (detected via SHA-256 fingerprint)
@@ -128,6 +128,7 @@ Users can override this in Settings via the global `docker_socket_path` option.
 | `app/src/components/layout/Sidebar.tsx` | Responsive sidebar (25% width, min 224px, max 320px) |
 | `app/src/components/layout/StatusBar.tsx` | Running project/terminal counts |
 | `app/src/components/projects/ProjectCard.tsx` | Project config, backend selector, action buttons |
+| `app/src/components/projects/ClaudeCodeSettingsModal.tsx` | Claude Code CLI settings modal (TUI mode, effort, focus, caching) |
 | `app/src/components/projects/ProjectList.tsx` | Project list in sidebar |
 | `app/src/components/projects/FileManagerModal.tsx` | File browser modal (browse, download, upload) |
 | `app/src/components/projects/ContainerProgressModal.tsx` | Real-time container operation progress |
@@ -150,9 +151,9 @@ Users can override this in Settings via the global `docker_socket_path` option.
 | `app/src-tauri/src/commands/project_commands.rs` | Start/stop/rebuild Tauri command handlers |
 | `app/src-tauri/src/commands/file_commands.rs` | File manager Tauri commands (list, download, upload) |
 | `app/src-tauri/src/commands/mcp_commands.rs` | MCP server CRUD Tauri commands |
-| `app/src-tauri/src/models/project.rs` | Project struct (backend, Docker access, MCP servers, Mission Control) |
+| `app/src-tauri/src/models/project.rs` | Project struct (backend, Docker access, Claude Code settings, MCP servers, Mission Control) |
 | `app/src-tauri/src/models/mcp_server.rs` | MCP server struct (transport, Docker image, env vars) |
-| `app/src-tauri/src/models/app_settings.rs` | Global settings (image source, Docker socket, AWS, web terminal, STT) |
+| `app/src-tauri/src/models/app_settings.rs` | Global settings (image source, Docker socket, AWS, Claude Code settings, web terminal, STT) |
 | `app/src-tauri/src/web_terminal/server.rs` | Axum HTTP+WS server for remote terminal access |
 | `app/src-tauri/src/web_terminal/ws_handler.rs` | WebSocket connection handler and session management |
 | `app/src-tauri/src/web_terminal/terminal.html` | Embedded web UI (xterm.js, project picker, tabs) |
@@ -164,7 +165,7 @@ Users can override this in Settings via the global `docker_socket_path` option.
 | `stt-container/Dockerfile` | Faster Whisper STT container image (Python 3.11 + FastAPI) |
 | `stt-container/server.py` | STT HTTP server (POST /transcribe endpoint) |
 | `container/Dockerfile` | Ubuntu 24.04 sandbox image with Claude Code + dev tools + clipboard/audio shims |
-| `container/entrypoint.sh` | UID/GID remap, SSH setup, Docker group config, MCP injection, Mission Control setup |
+| `container/entrypoint.sh` | UID/GID remap, SSH setup, Docker group config, MCP injection, Claude Code settings injection, Mission Control setup |
 | `container/osc52-clipboard` | Clipboard shim (xclip/xsel/pbcopy via OSC 52) |
 | `container/audio-shim` | Audio capture shim (rec/arecord via FIFO) for voice mode |
 

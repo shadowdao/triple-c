@@ -35,6 +35,7 @@ export interface Project {
   port_mappings: PortMapping[];
   claude_instructions: string | null;
   enabled_mcp_servers: string[];
+  claude_code_settings: ClaudeCodeSettings | null;
   created_at: string;
   updated_at: string;
 }
@@ -73,6 +74,17 @@ export interface OpenAiCompatibleConfig {
   model_id: string | null;
 }
 
+export interface ClaudeCodeSettings {
+  tui_mode: string | null;
+  effort: string | null;
+  auto_scroll_disabled: boolean;
+  focus_mode: boolean;
+  show_thinking_summaries: boolean;
+  enable_session_recap: boolean;
+  env_scrub: boolean;
+  prompt_caching_1h: boolean;
+}
+
 export interface ContainerInfo {
   container_id: string;
   project_id: string;
@@ -93,6 +105,7 @@ export interface TerminalSession {
   projectId: string;
   projectName: string;
   sessionType: "claude" | "bash";
+  sessionName: string | null;
 }
 
 export type ImageSource = "registry" | "local_build" | "custom";
@@ -120,6 +133,7 @@ export interface AppSettings {
   dismissed_image_digest: string | null;
   web_terminal: WebTerminalSettings;
   stt: SttSettings;
+  global_claude_code_settings: ClaudeCodeSettings | null;
 }
 
 export interface SttSettings {

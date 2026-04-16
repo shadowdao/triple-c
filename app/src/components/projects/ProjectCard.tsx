@@ -9,6 +9,7 @@ import { useAppState } from "../../store/appState";
 import EnvVarsModal from "./EnvVarsModal";
 import PortMappingsModal from "./PortMappingsModal";
 import ClaudeInstructionsModal from "./ClaudeInstructionsModal";
+import ClaudeCodeSettingsModal from "./ClaudeCodeSettingsModal";
 import ContainerProgressModal from "./ContainerProgressModal";
 import FileManagerModal from "./FileManagerModal";
 import ConfirmRemoveModal from "./ConfirmRemoveModal";
@@ -30,6 +31,7 @@ export default function ProjectCard({ project }: Props) {
   const [showEnvVarsModal, setShowEnvVarsModal] = useState(false);
   const [showPortMappingsModal, setShowPortMappingsModal] = useState(false);
   const [showClaudeInstructionsModal, setShowClaudeInstructionsModal] = useState(false);
+  const [showClaudeCodeSettingsModal, setShowClaudeCodeSettingsModal] = useState(false);
   const [showFileManager, setShowFileManager] = useState(false);
   const [progressMsg, setProgressMsg] = useState<string | null>(null);
   const [activeOperation, setActiveOperation] = useState<"starting" | "stopping" | "resetting" | null>(null);
@@ -777,6 +779,19 @@ export default function ProjectCard({ project }: Props) {
                 </button>
               </div>
 
+              {/* Claude Code Settings */}
+              <div className="flex items-center justify-between">
+                <label className="text-xs text-[var(--text-secondary)]">
+                  Claude Code Settings{project.claude_code_settings ? " (set)" : ""}<Tooltip text="Configure Claude Code CLI behavior: TUI mode, effort level, focus mode, prompt caching, and more. These override global defaults for this project." />
+                </label>
+                <button
+                  onClick={() => setShowClaudeCodeSettingsModal(true)}
+                  className="text-xs px-2 py-0.5 text-[var(--accent)] hover:text-[var(--accent-hover)] hover:bg-[var(--bg-primary)] rounded transition-colors"
+                >
+                  Edit
+                </button>
+              </div>
+
               {/* MCP Servers */}
               {mcpServers.length > 0 && (
                 <div>
@@ -1076,6 +1091,17 @@ export default function ProjectCard({ project }: Props) {
             await update({ ...project, claude_instructions: instructions || null });
           }}
           onClose={() => setShowClaudeInstructionsModal(false)}
+        />
+      )}
+
+      {showClaudeCodeSettingsModal && (
+        <ClaudeCodeSettingsModal
+          settings={project.claude_code_settings}
+          disabled={!isStopped}
+          onSave={async (ccSettings) => {
+            await update({ ...project, claude_code_settings: ccSettings });
+          }}
+          onClose={() => setShowClaudeCodeSettingsModal(false)}
         />
       )}
 

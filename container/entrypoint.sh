@@ -188,6 +188,29 @@ if [ -n "$MCP_SERVERS_JSON" ]; then
     unset MCP_SERVERS_JSON
 fi
 
+# ── Claude Code settings ────────────────────────────────────────────────────
+# Merge Claude Code settings into ~/.claude/settings.json (preserves existing
+# keys). Creates the file if it doesn't exist. These control TUI mode, effort
+# level, focus mode, thinking summaries, and other CLI behavior.
+if [ -n "$CLAUDE_CODE_SETTINGS_JSON" ]; then
+    SETTINGS_FILE="/home/claude/.claude/settings.json"
+    mkdir -p /home/claude/.claude
+    if [ -f "$SETTINGS_FILE" ]; then
+        # Merge: existing settings + new settings (new keys override on conflict)
+        MERGED=$(jq -s '.[0] * .[1]' "$SETTINGS_FILE" <(printf '%s' "$CLAUDE_CODE_SETTINGS_JSON") 2>/dev/null)
+        if [ -n "$MERGED" ]; then
+            printf '%s\n' "$MERGED" > "$SETTINGS_FILE"
+        else
+            echo "entrypoint: warning — failed to merge Claude Code settings into $SETTINGS_FILE"
+        fi
+    else
+        printf '%s\n' "$CLAUDE_CODE_SETTINGS_JSON" > "$SETTINGS_FILE"
+    fi
+    chown claude:claude "$SETTINGS_FILE"
+    chmod 600 "$SETTINGS_FILE"
+    unset CLAUDE_CODE_SETTINGS_JSON
+fi
+
 # ── AWS SSO auth refresh command ──────────────────────────────────────────────
 # When set, inject awsAuthRefresh into ~/.claude.json so Claude Code calls
 # triple-c-sso-refresh when AWS credentials expire mid-session.

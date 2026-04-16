@@ -28,6 +28,36 @@ fn default_full_permissions() -> bool {
     true
 }
 
+/// Settings for Claude Code CLI behavior inside the container.
+/// These map to Claude Code env vars and ~/.claude/settings.json entries.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ClaudeCodeSettings {
+    /// TUI rendering mode: None = default, Some("fullscreen") = flicker-free alt-screen
+    #[serde(default)]
+    pub tui_mode: Option<String>,
+    /// Effort level: None = default, Some("low"|"medium"|"high")
+    #[serde(default)]
+    pub effort: Option<String>,
+    /// Disable auto-scroll in fullscreen TUI mode
+    #[serde(default)]
+    pub auto_scroll_disabled: bool,
+    /// Enable focus mode (collapsed tool output)
+    #[serde(default)]
+    pub focus_mode: bool,
+    /// Show thinking summaries in responses
+    #[serde(default)]
+    pub show_thinking_summaries: bool,
+    /// Enable session recap when returning to a session
+    #[serde(default)]
+    pub enable_session_recap: bool,
+    /// Strip credentials from subprocess environments
+    #[serde(default)]
+    pub env_scrub: bool,
+    /// Enable 1-hour prompt cache TTL (vs default 5-minute)
+    #[serde(default)]
+    pub prompt_caching_1h: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub id: String,
@@ -59,6 +89,8 @@ pub struct Project {
     pub claude_instructions: Option<String>,
     #[serde(default)]
     pub enabled_mcp_servers: Vec<String>,
+    #[serde(default)]
+    pub claude_code_settings: Option<ClaudeCodeSettings>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -177,6 +209,7 @@ impl Project {
             port_mappings: Vec::new(),
             claude_instructions: None,
             enabled_mcp_servers: Vec::new(),
+            claude_code_settings: None,
             created_at: now.clone(),
             updated_at: now,
         }

@@ -4,6 +4,7 @@ import AwsSettings from "./AwsSettings";
 import { useSettings } from "../../hooks/useSettings";
 import { useUpdates } from "../../hooks/useUpdates";
 import ClaudeInstructionsModal from "../projects/ClaudeInstructionsModal";
+import ClaudeCodeSettingsModal from "../projects/ClaudeCodeSettingsModal";
 import EnvVarsModal from "../projects/EnvVarsModal";
 import { detectHostTimezone } from "../../lib/tauri-commands";
 import type { EnvVar } from "../../lib/types";
@@ -18,15 +19,22 @@ export default function SettingsPanel() {
   const [globalEnvVars, setGlobalEnvVars] = useState<EnvVar[]>(appSettings?.global_custom_env_vars ?? []);
   const [checkingUpdates, setCheckingUpdates] = useState(false);
   const [timezone, setTimezone] = useState(appSettings?.timezone ?? "");
+  const [sshKeyPath, setSshKeyPath] = useState(appSettings?.default_ssh_key_path ?? "");
+  const [gitName, setGitName] = useState(appSettings?.default_git_user_name ?? "");
+  const [gitEmail, setGitEmail] = useState(appSettings?.default_git_user_email ?? "");
   const [showInstructionsModal, setShowInstructionsModal] = useState(false);
   const [showEnvVarsModal, setShowEnvVarsModal] = useState(false);
+  const [showClaudeCodeSettingsModal, setShowClaudeCodeSettingsModal] = useState(false);
 
   // Sync local state when appSettings change
   useEffect(() => {
     setGlobalInstructions(appSettings?.global_claude_instructions ?? "");
     setGlobalEnvVars(appSettings?.global_custom_env_vars ?? []);
     setTimezone(appSettings?.timezone ?? "");
-  }, [appSettings?.global_claude_instructions, appSettings?.global_custom_env_vars, appSettings?.timezone]);
+    setSshKeyPath(appSettings?.default_ssh_key_path ?? "");
+    setGitName(appSettings?.default_git_user_name ?? "");
+    setGitEmail(appSettings?.default_git_user_email ?? "");
+  }, [appSettings?.global_claude_instructions, appSettings?.global_custom_env_vars, appSettings?.timezone, appSettings?.default_ssh_key_path, appSettings?.default_git_user_name, appSettings?.default_git_user_email]);
 
   // Auto-detect timezone on first load if not yet set
   useEffect(() => {
@@ -59,6 +67,60 @@ export default function SettingsPanel() {
       </h2>
       <DockerSettings />
       <AwsSettings />
+
+      {/* Default SSH Key Directory */}
+      <div>
+        <label className="block text-sm font-medium mb-1">Default SSH Key Directory<Tooltip text="Global default SSH key directory. Mounted into containers that don't have a per-project SSH path set." /></label>
+        <p className="text-xs text-[var(--text-secondary)] mb-1.5">
+          Mounted into all containers unless overridden by a per-project setting.
+        </p>
+        <input
+          type="text"
+          value={sshKeyPath}
+          onChange={(e) => setSshKeyPath(e.target.value)}
+          onBlur={async () => {
+            if (appSettings) {
+              await saveSettings({ ...appSettings, default_ssh_key_path: sshKeyPath || null });
+            }
+          }}
+          placeholder="~/.ssh"
+          className="w-full px-2 py-1 text-sm bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:outline-none focus:border-[var(--accent)]"
+        />
+      </div>
+
+      {/* Default Git Name */}
+      <div>
+        <label className="block text-sm font-medium mb-1">Default Git Name<Tooltip text="Sets git user.name inside containers. Per-project Git Name takes precedence." /></label>
+        <input
+          type="text"
+          value={gitName}
+          onChange={(e) => setGitName(e.target.value)}
+          onBlur={async () => {
+            if (appSettings) {
+              await saveSettings({ ...appSettings, default_git_user_name: gitName || null });
+            }
+          }}
+          placeholder="Your Name"
+          className="w-full px-2 py-1 text-sm bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:outline-none focus:border-[var(--accent)]"
+        />
+      </div>
+
+      {/* Default Git Email */}
+      <div>
+        <label className="block text-sm font-medium mb-1">Default Git Email<Tooltip text="Sets git user.email inside containers. Per-project Git Email takes precedence." /></label>
+        <input
+          type="text"
+          value={gitEmail}
+          onChange={(e) => setGitEmail(e.target.value)}
+          onBlur={async () => {
+            if (appSettings) {
+              await saveSettings({ ...appSettings, default_git_user_email: gitEmail || null });
+            }
+          }}
+          placeholder="you@example.com"
+          className="w-full px-2 py-1 text-sm bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:outline-none focus:border-[var(--accent)]"
+        />
+      </div>
 
       {/* Container Timezone */}
       <div>
@@ -111,6 +173,25 @@ export default function SettingsPanel() {
           </span>
           <button
             onClick={() => setShowEnvVarsModal(true)}
+            className="text-xs px-2 py-0.5 text-[var(--accent)] hover:text-[var(--accent-hover)] hover:bg-[var(--bg-primary)] rounded transition-colors"
+          >
+            Edit
+          </button>
+        </div>
+      </div>
+
+      {/* Global Claude Code Settings */}
+      <div>
+        <label className="block text-sm font-medium mb-1">Claude Code Settings<Tooltip text="Global defaults for Claude Code CLI behavior (TUI mode, effort, focus mode, caching, etc.). Per-project settings override these." /></label>
+        <p className="text-xs text-[var(--text-secondary)] mb-1.5">
+          Default Claude Code CLI settings applied to all projects. Per-project settings take precedence.
+        </p>
+        <div className="flex items-center justify-between">
+          <span className="text-xs text-[var(--text-secondary)]">
+            {appSettings?.global_claude_code_settings ? "Configured" : "Using defaults"}
+          </span>
+          <button
+            onClick={() => setShowClaudeCodeSettingsModal(true)}
             className="text-xs px-2 py-0.5 text-[var(--accent)] hover:text-[var(--accent-hover)] hover:bg-[var(--bg-primary)] rounded transition-colors"
           >
             Edit
@@ -187,6 +268,19 @@ export default function SettingsPanel() {
             }
           }}
           onClose={() => setShowEnvVarsModal(false)}
+        />
+      )}
+
+      {showClaudeCodeSettingsModal && (
+        <ClaudeCodeSettingsModal
+          settings={appSettings?.global_claude_code_settings ?? null}
+          disabled={false}
+          onSave={async (ccSettings) => {
+            if (appSettings) {
+              await saveSettings({ ...appSettings, global_claude_code_settings: ccSettings });
+            }
+          }}
+          onClose={() => setShowClaudeCodeSettingsModal(false)}
         />
       )}
     </div>

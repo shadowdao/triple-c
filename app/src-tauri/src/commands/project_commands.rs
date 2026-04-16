@@ -338,6 +338,10 @@ pub async fn start_project_container(
                 &settings.global_custom_env_vars,
                 settings.timezone.as_deref(),
                 &enabled_mcp,
+                settings.global_claude_code_settings.as_ref(),
+                settings.default_ssh_key_path.as_deref(),
+                settings.default_git_user_name.as_deref(),
+                settings.default_git_user_email.as_deref(),
             ).await.unwrap_or(false);
 
             if needs_recreate {
@@ -370,6 +374,10 @@ pub async fn start_project_container(
                     settings.timezone.as_deref(),
                     &enabled_mcp,
                     network_name.as_deref(),
+                    settings.global_claude_code_settings.as_ref(),
+                    settings.default_ssh_key_path.as_deref(),
+                    settings.default_git_user_name.as_deref(),
+                    settings.default_git_user_email.as_deref(),
                 ).await?;
                 emit_progress(&app_handle, &project_id, "Starting container...");
                 docker::start_container(&new_id).await?;
@@ -403,6 +411,10 @@ pub async fn start_project_container(
                 settings.timezone.as_deref(),
                 &enabled_mcp,
                 network_name.as_deref(),
+                settings.global_claude_code_settings.as_ref(),
+                settings.default_ssh_key_path.as_deref(),
+                settings.default_git_user_name.as_deref(),
+                settings.default_git_user_email.as_deref(),
             ).await?;
             emit_progress(&app_handle, &project_id, "Starting container...");
             docker::start_container(&new_id).await?;

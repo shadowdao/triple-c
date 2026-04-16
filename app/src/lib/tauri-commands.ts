@@ -45,8 +45,8 @@ export const awsSsoRefresh = (projectId: string) =>
   invoke<void>("aws_sso_refresh", { projectId });
 
 // Terminal
-export const openTerminalSession = (projectId: string, sessionId: string, sessionType?: string) =>
-  invoke<void>("open_terminal_session", { projectId, sessionId, sessionType });
+export const openTerminalSession = (projectId: string, sessionId: string, sessionType?: string, sessionName?: string) =>
+  invoke<void>("open_terminal_session", { projectId, sessionId, sessionType, sessionName });
 export const terminalInput = (sessionId: string, data: number[]) =>
   invoke<void>("terminal_input", { sessionId, data });
 export const terminalResize = (sessionId: string, cols: number, rows: number) =>

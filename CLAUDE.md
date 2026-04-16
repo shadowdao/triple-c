@@ -76,13 +76,13 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   - `server.rs` — Axum server lifecycle (start/stop), serves embedded HTML and handles WS upgrades
   - `ws_handler.rs` — Per-connection WebSocket handler with JSON protocol, session management, cleanup on disconnect
   - `terminal.html` — Self-contained xterm.js web UI embedded via `include_str!()`
-- **`models/`** — Serde structs (`Project`, `Backend`, `BedrockConfig`, `OllamaConfig`, `OpenAiCompatibleConfig`, `ContainerInfo`, `AppSettings`, `WebTerminalSettings`). These define the IPC contract with the frontend.
+- **`models/`** — Serde structs (`Project`, `Backend`, `BedrockConfig`, `OllamaConfig`, `OpenAiCompatibleConfig`, `ClaudeCodeSettings`, `ContainerInfo`, `AppSettings`, `WebTerminalSettings`). These define the IPC contract with the frontend.
 - **`storage/`** — Persistence: `projects_store.rs` (JSON file with atomic writes), `secure.rs` (OS keychain via `keyring` crate), `settings_store.rs`
 
 ### Container (`container/`)
 
 - **`Dockerfile`** — Ubuntu 24.04 base with Claude Code, Node.js 22, Python 3.12, Rust, Docker CLI, git, gh, AWS CLI v2, ripgrep, pnpm, uv, ruff pre-installed
-- **`entrypoint.sh`** — UID/GID remapping to match host user, SSH key setup, git config, docker socket permissions, then `sleep infinity`
+- **`entrypoint.sh`** — UID/GID remapping to match host user, SSH key setup, git config, docker socket permissions, Claude Code settings.json injection, then `sleep infinity`
 - **`triple-c-scheduler`** — Bash-based scheduled task system for recurring Claude Code invocations
 
 ### Container Lifecycle
