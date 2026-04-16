@@ -58,13 +58,32 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Node.js LTS (22.x) + pnpm ───────────────────────────────────────────────
-RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+# Configure NodeSource repo manually (not via their setup_22.x script, which
+# runs an internal apt-get update without retries and silently falls through
+# to Ubuntu's default nodejs 18 — missing npm — on mirror-sync failures).
+RUN curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+    | gpg --dearmor -o /usr/share/keyrings/nodesource.gpg \
+    && chmod a+r /usr/share/keyrings/nodesource.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" \
+    > /etc/apt/sources.list.d/nodesource.list \
+    && for i in 1 2 3 4 5; do \
+        apt-get -o Acquire::Retries=3 update && break; \
+        echo "apt-get update failed (attempt $i), retrying in 10s..."; \
+        rm -rf /var/lib/apt/lists/*; \
+        sleep 10; \
+    done \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/* \
     && npm install -g pnpm
 
 # ── Python 3 + pip + uv + ruff ──────────────────────────────────────────────
-RUN apt-get -o Acquire::Retries=3 update && apt-get install -y --no-install-recommends \
+RUN for i in 1 2 3 4 5; do \
+        apt-get -o Acquire::Retries=3 update && break; \
+        echo "apt-get update failed (attempt $i), retrying in 10s..."; \
+        rm -rf /var/lib/apt/lists/*; \
+        sleep 10; \
+    done \
+    && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
     python3-venv \
@@ -77,7 +96,13 @@ RUN install -m 0755 -d /etc/apt/keyrings \
     && chmod a+r /etc/apt/keyrings/docker.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
     > /etc/apt/sources.list.d/docker.list \
-    && apt-get -o Acquire::Retries=3 update && apt-get install -y docker-ce-cli \
+    && for i in 1 2 3 4 5; do \
+        apt-get -o Acquire::Retries=3 update && break; \
+        echo "apt-get update failed (attempt $i), retrying in 10s..."; \
+        rm -rf /var/lib/apt/lists/*; \
+        sleep 10; \
+    done \
+    && apt-get install -y docker-ce-cli \
     && rm -rf /var/lib/apt/lists/*
 
 # ── AWS CLI v2 ───────────────────────────────────────────────────────────────
