@@ -40,7 +40,8 @@ jobs:
           echo "Major.Minor: ${MAJOR_MINOR}"
 
           # Find the latest tag matching v{MAJOR_MINOR}.N (exclude -mac, -win suffixes)
-          LATEST_TAG=$(git tag -l "v${MAJOR_MINOR}.*" --sort=-v:refname | grep -E "^v${MAJOR_MINOR}\.[0-9]+$" | head -1)
+          # `|| true` so an empty grep result doesn't fail the step under pipefail.
+          LATEST_TAG=$(git tag -l "v${MAJOR_MINOR}.*" --sort=-v:refname | grep -E "^v${MAJOR_MINOR}\.[0-9]+$" | head -1 || true)
 
           if [ -n "$LATEST_TAG" ]; then
             echo "Latest matching tag: ${LATEST_TAG}"
