@@ -62,7 +62,7 @@ export default function SttButton({ state, error, onToggle, onCancel }: Props) {
   };
 
   return (
-    <div className="absolute bottom-1 left-1 z-50 flex items-center gap-2">
+    <div className="absolute bottom-2 left-2 z-50 flex items-center gap-2">
       <div className="relative">
         <button
           onClick={handleClick}
