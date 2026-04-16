@@ -449,7 +449,7 @@ export default function TerminalView({ sessionId, active }: Props) {
       <div
         ref={containerRef}
         className="w-full h-full"
-        style={{ padding: "8px" }}
+        style={{ padding: "8px 8px 20px 8px" }}
       />
     </div>
   );
