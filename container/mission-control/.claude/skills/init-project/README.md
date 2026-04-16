@@ -1,6 +1,6 @@
 # Flight Operations
 
-This directory contains reference materials for the [Flight Control](https://github.com/anthropics/flight-control) development methodology.
+This directory contains reference materials for the [Flight Control](https://github.com/msieurthenardier/mission-control) development methodology.
 
 ## Contents
 
