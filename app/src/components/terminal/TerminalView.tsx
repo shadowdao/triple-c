@@ -12,6 +12,8 @@ import SttButton from "./SttButton";
 import { awsSsoRefresh } from "../../lib/tauri-commands";
 import { UrlDetector } from "../../lib/urlDetector";
 import UrlToast from "./UrlToast";
+import { trimSelection } from "./trimSelection";
+import TerminalContextMenu from "./TerminalContextMenu";
 
 interface Props {
   sessionId: string;
@@ -42,6 +44,7 @@ export default function TerminalView({ sessionId, active }: Props) {
   const [imagePasteMsg, setImagePasteMsg] = useState<string | null>(null);
   const [isAtBottom, setIsAtBottom] = useState(true);
   const [isAutoFollow, setIsAutoFollow] = useState(true);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
   const isAtBottomRef = useRef(true);
   // Tracks user intent to follow output — only set to false by explicit user
   // actions (mouse wheel up), not by xterm scroll events during writes.
@@ -93,14 +96,16 @@ export default function TerminalView({ sessionId, active }: Props) {
 
     term.open(containerRef.current);
 
-    // Ctrl+Shift+C copies selected terminal text to clipboard.
-    // This prevents the keystroke from reaching the container (where
-    // Ctrl+C would send SIGINT and cancel running work).
+    // Ctrl+Shift+C copies the selection with whitespace trimmed (UI padding
+    // stripped, internal indentation preserved). Ctrl+Shift+Alt+C copies raw.
+    // Both prevent the keystroke from reaching the container (where Ctrl+C
+    // would send SIGINT and cancel running work).
     term.attachCustomKeyEventHandler((event) => {
       if (event.type === "keydown" && event.ctrlKey && event.shiftKey && event.key === "C") {
         const sel = term.getSelection();
         if (sel) {
-          navigator.clipboard.writeText(sel).catch((e) =>
+          const out = event.altKey ? sel : trimSelection(sel);
+          navigator.clipboard.writeText(out).catch((e) =>
             console.error("Ctrl+Shift+C clipboard write failed:", e),
           );
         }
@@ -388,6 +393,23 @@ export default function TerminalView({ sessionId, active }: Props) {
     }
   }, []);
 
+  const writeSelection = useCallback((mode: "trimmed" | "raw") => {
+    const term = termRef.current;
+    if (!term) return;
+    const sel = term.getSelection();
+    if (!sel) return;
+    const out = mode === "raw" ? sel : trimSelection(sel);
+    navigator.clipboard.writeText(out).catch((e) =>
+      console.error("Context menu clipboard write failed:", e),
+    );
+  }, []);
+
+  const handleContextMenu = useCallback((e: React.MouseEvent) => {
+    if (!termRef.current?.hasSelection()) return; // let default menu happen
+    e.preventDefault();
+    setContextMenu({ x: e.clientX, y: e.clientY });
+  }, []);
+
   const handleToggleAutoFollow = useCallback(() => {
     const next = !autoFollowRef.current;
     autoFollowRef.current = next;
@@ -450,7 +472,23 @@ export default function TerminalView({ sessionId, active }: Props) {
         ref={containerRef}
         className="w-full h-full"
         style={{ padding: "8px 12px 48px 16px" }}
+        onContextMenu={handleContextMenu}
       />
+      {contextMenu && (
+        <TerminalContextMenu
+          x={contextMenu.x}
+          y={contextMenu.y}
+          onCopyTrimmed={() => {
+            writeSelection("trimmed");
+            setContextMenu(null);
+          }}
+          onCopyRaw={() => {
+            writeSelection("raw");
+            setContextMenu(null);
+          }}
+          onDismiss={() => setContextMenu(null)}
+        />
+      )}
     </div>
   );
 }

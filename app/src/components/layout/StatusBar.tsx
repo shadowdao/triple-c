@@ -23,7 +23,9 @@ export default function StatusBar() {
       {terminalHasSelection && (
         <>
           <span className="mx-2">|</span>
-          <span className="text-[var(--accent)]">Ctrl+Shift+C to copy</span>
+          <span className="text-[var(--accent)]">
+            Ctrl+Shift+C: copy trimmed &middot; Ctrl+Shift+Alt+C: copy raw
+          </span>
         </>
       )}
     </div>
