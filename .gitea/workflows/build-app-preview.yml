@@ -5,12 +5,6 @@ name: Build App (Preview)
 # smoke-testing of feature branches before they merge.
 
 on:
-  push:
-    branches-ignore: [main]
-    paths:
-      - "app/**"
-      - "VERSION"
-      - ".gitea/workflows/build-app-preview.yml"
   workflow_dispatch:
 
 jobs:
