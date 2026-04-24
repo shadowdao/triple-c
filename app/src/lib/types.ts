@@ -211,3 +211,14 @@ export interface FileEntry {
   modified: string;
   permissions: string;
 }
+
+export interface InstallOptions {
+  os: "linux" | "macos" | "windows" | "unknown";
+  product_name: string;
+  can_auto_install: boolean;
+  auto_install_method: string | null;
+  auto_install_blocker: string | null;
+  docs_url: string;
+  manual_steps: string[];
+  post_install_notes: string[];
+}

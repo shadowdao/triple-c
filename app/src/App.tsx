@@ -1,9 +1,10 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import Sidebar from "./components/layout/Sidebar";
 import TopBar from "./components/layout/TopBar";
 import StatusBar from "./components/layout/StatusBar";
 import TerminalView from "./components/terminal/TerminalView";
+import DockerInstallDialog from "./components/DockerInstallDialog";
 import { useDocker } from "./hooks/useDocker";
 import { useSettings } from "./hooks/useSettings";
 import { useProjects } from "./hooks/useProjects";
@@ -21,6 +22,7 @@ export default function App() {
   const { sessions, activeSessionId, setProjects } = useAppState(
     useShallow(s => ({ sessions: s.sessions, activeSessionId: s.activeSessionId, setProjects: s.setProjects }))
   );
+  const [showInstallDialog, setShowInstallDialog] = useState(false);
 
   // Initialize on mount
   useEffect(() => {
@@ -38,6 +40,7 @@ export default function App() {
           refresh();
         });
       } else {
+        setShowInstallDialog(true);
         stopPolling = startDockerPolling();
       }
     });
@@ -80,6 +83,9 @@ export default function App() {
         </main>
       </div>
       <StatusBar />
+      {showInstallDialog && (
+        <DockerInstallDialog onClose={() => setShowInstallDialog(false)} />
+      )}
     </div>
   );
 }
