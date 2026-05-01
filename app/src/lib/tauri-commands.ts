@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, ImageUpdateInfo, McpServer, FileEntry, WebTerminalInfo, SttStatus } from "./types";
+import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, ImageUpdateInfo, McpServer, FileEntry, WebTerminalInfo, SttStatus, InstallOptions } from "./types";
 
 // Docker
 export const checkDocker = () => invoke<boolean>("check_docker");
@@ -107,3 +107,8 @@ export const buildSttImage = () => invoke<void>("build_stt_image");
 export const pullSttImage = () => invoke<void>("pull_stt_image");
 export const transcribeAudio = (audioData: number[]) =>
   invoke<string>("transcribe_audio", { audioData });
+
+// Docker install helper
+export const detectInstallOptions = () =>
+  invoke<InstallOptions>("detect_install_options");
+export const runDockerInstall = () => invoke<void>("run_docker_install");

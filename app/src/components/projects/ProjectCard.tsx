@@ -60,6 +60,7 @@ export default function ProjectCard({ project }: Props) {
   const [bedrockProfile, setBedrockProfile] = useState(project.bedrock_config?.aws_profile ?? "");
   const [bedrockBearerToken, setBedrockBearerToken] = useState(project.bedrock_config?.aws_bearer_token ?? "");
   const [bedrockModelId, setBedrockModelId] = useState(project.bedrock_config?.model_id ?? "");
+  const [bedrockServiceTier, setBedrockServiceTier] = useState(project.bedrock_config?.service_tier ?? "");
 
   // Ollama local state
   const [ollamaBaseUrl, setOllamaBaseUrl] = useState(project.ollama_config?.base_url ?? "http://host.docker.internal:11434");
@@ -88,6 +89,7 @@ export default function ProjectCard({ project }: Props) {
     setBedrockProfile(project.bedrock_config?.aws_profile ?? "");
     setBedrockBearerToken(project.bedrock_config?.aws_bearer_token ?? "");
     setBedrockModelId(project.bedrock_config?.model_id ?? "");
+    setBedrockServiceTier(project.bedrock_config?.service_tier ?? "");
     setOllamaBaseUrl(project.ollama_config?.base_url ?? "http://host.docker.internal:11434");
     setOllamaModelId(project.ollama_config?.model_id ?? "");
     setOpenaiCompatibleBaseUrl(project.openai_compatible_config?.base_url ?? "http://host.docker.internal:4000");
@@ -192,6 +194,7 @@ export default function ProjectCard({ project }: Props) {
     aws_bearer_token: null,
     model_id: null,
     disable_prompt_caching: false,
+    service_tier: null,
   };
 
   const defaultOllamaConfig: OllamaConfig = {
@@ -336,6 +339,16 @@ export default function ProjectCard({ project }: Props) {
       await update({ ...project, bedrock_config: { ...current, model_id: bedrockModelId || null } });
     } catch (err) {
       console.error("Failed to update Bedrock model ID:", err);
+    }
+  };
+
+  const handleBedrockServiceTierBlur = async () => {
+    try {
+      const current = project.bedrock_config ?? defaultBedrockConfig;
+      const trimmed = bedrockServiceTier.trim();
+      await update({ ...project, bedrock_config: { ...current, service_tier: trimmed || null } });
+    } catch (err) {
+      console.error("Failed to update Bedrock service tier:", err);
     }
   };
 
@@ -692,6 +705,28 @@ export default function ProjectCard({ project }: Props) {
                 </button>
               </div>
 
+              {/* Sandbox mode toggle */}
+              <div className="flex items-center gap-2">
+                <label className="text-xs text-[var(--text-secondary)]">Sandbox mode<Tooltip text="Enables Claude Code's bash sandbox (bubblewrap-based filesystem and network isolation). Triple-C is the source of truth for the on/off state — toggling this overrides any manual /sandbox configuration in the container's settings.json on next start. Uses enableWeakerNestedSandbox since the container runs without privileged user namespaces." /></label>
+                <button
+                  onClick={async () => {
+                    try {
+                      await update({ ...project, sandbox_mode_enabled: !project.sandbox_mode_enabled });
+                    } catch (err) {
+                      console.error("Failed to update sandbox mode setting:", err);
+                    }
+                  }}
+                  disabled={!isStopped}
+                  className={`px-2 py-0.5 text-xs rounded transition-colors disabled:opacity-50 ${
+                    project.sandbox_mode_enabled
+                      ? "bg-[var(--success)] text-white"
+                      : "bg-[var(--bg-primary)] border border-[var(--border-color)] text-[var(--text-secondary)]"
+                  }`}
+                >
+                  {project.sandbox_mode_enabled ? "ON" : "OFF"}
+                </button>
+              </div>
+
               {/* Mission Control toggle */}
               <div className="flex items-center gap-2">
                 <label className="text-xs text-[var(--text-secondary)]">Mission Control<Tooltip text="Enables a web dashboard for monitoring and managing Claude sessions remotely." /></label>
@@ -949,6 +984,19 @@ export default function ProjectCard({ project }: Props) {
                         onChange={(e) => setBedrockModelId(e.target.value)}
                         onBlur={handleBedrockModelIdBlur}
                         placeholder="anthropic.claude-sonnet-4-20250514-v1:0"
+                        disabled={!isStopped}
+                        className={inputCls}
+                      />
+                    </div>
+
+                    {/* Service tier */}
+                    <div>
+                      <label className="block text-xs text-[var(--text-secondary)] mb-0.5">Service Tier (optional)<Tooltip text="Sets ANTHROPIC_BEDROCK_SERVICE_TIER. Valid values are determined by AWS Bedrock (e.g. 'priority'). Leave blank for the account default." /></label>
+                      <input
+                        value={bedrockServiceTier}
+                        onChange={(e) => setBedrockServiceTier(e.target.value)}
+                        onBlur={handleBedrockServiceTierBlur}
+                        placeholder="(default)"
                         disabled={!isStopped}
                         className={inputCls}
                       />

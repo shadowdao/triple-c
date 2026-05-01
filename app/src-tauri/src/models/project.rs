@@ -73,6 +73,8 @@ pub struct Project {
     pub openai_compatible_config: Option<OpenAiCompatibleConfig>,
     pub allow_docker_access: bool,
     #[serde(default)]
+    pub sandbox_mode_enabled: bool,
+    #[serde(default)]
     pub mission_control_enabled: bool,
     #[serde(default = "default_full_permissions")]
     pub full_permissions: bool,
@@ -159,6 +161,10 @@ pub struct BedrockConfig {
     pub aws_bearer_token: Option<String>,
     pub model_id: Option<String>,
     pub disable_prompt_caching: bool,
+    /// Optional value for the `ANTHROPIC_BEDROCK_SERVICE_TIER` env var
+    /// (e.g. "priority"). Empty/None means leave unset.
+    #[serde(default)]
+    pub service_tier: Option<String>,
 }
 
 /// Ollama configuration for a project.
@@ -199,6 +205,7 @@ impl Project {
             ollama_config: None,
             openai_compatible_config: None,
             allow_docker_access: false,
+            sandbox_mode_enabled: false,
             mission_control_enabled: false,
             full_permissions: false,
             ssh_key_path: None,

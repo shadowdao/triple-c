@@ -1,5 +1,6 @@
 mod commands;
 mod docker;
+mod install_helper;
 mod logging;
 mod models;
 mod storage;
@@ -197,6 +198,9 @@ pub fn run() {
             commands::update_commands::check_image_update,
             // Help
             commands::help_commands::get_help_content,
+            // Install helper
+            commands::install_helper_commands::detect_install_options,
+            commands::install_helper_commands::run_docker_install,
             // Web Terminal
             commands::web_terminal_commands::start_web_terminal,
             commands::web_terminal_commands::stop_web_terminal,

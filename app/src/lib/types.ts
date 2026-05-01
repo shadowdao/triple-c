@@ -25,6 +25,7 @@ export interface Project {
   ollama_config: OllamaConfig | null;
   openai_compatible_config: OpenAiCompatibleConfig | null;
   allow_docker_access: boolean;
+  sandbox_mode_enabled: boolean;
   mission_control_enabled: boolean;
   full_permissions: boolean;
   ssh_key_path: string | null;
@@ -61,6 +62,7 @@ export interface BedrockConfig {
   aws_bearer_token: string | null;
   model_id: string | null;
   disable_prompt_caching: boolean;
+  service_tier: string | null;
 }
 
 export interface OllamaConfig {
@@ -210,4 +212,15 @@ export interface FileEntry {
   size: number;
   modified: string;
   permissions: string;
+}
+
+export interface InstallOptions {
+  os: "linux" | "macos" | "windows" | "unknown";
+  product_name: string;
+  can_auto_install: boolean;
+  auto_install_method: string | null;
+  auto_install_blocker: string | null;
+  docs_url: string;
+  manual_steps: string[];
+  post_install_notes: string[];
 }
