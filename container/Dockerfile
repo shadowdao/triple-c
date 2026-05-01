@@ -31,6 +31,8 @@ RUN for i in 1 2 3 4 5; do \
     pkg-config \
     libssl-dev \
     cron \
+    bubblewrap \
+    socat \
     && rm -rf /var/lib/apt/lists/*
 
 # Remove default ubuntu user to free UID 1000 for host-user remapping

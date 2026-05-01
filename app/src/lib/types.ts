@@ -25,6 +25,7 @@ export interface Project {
   ollama_config: OllamaConfig | null;
   openai_compatible_config: OpenAiCompatibleConfig | null;
   allow_docker_access: boolean;
+  sandbox_mode_enabled: boolean;
   mission_control_enabled: boolean;
   full_permissions: boolean;
   ssh_key_path: string | null;
@@ -61,6 +62,7 @@ export interface BedrockConfig {
   aws_bearer_token: string | null;
   model_id: string | null;
   disable_prompt_caching: boolean;
+  service_tier: string | null;
 }
 
 export interface OllamaConfig {

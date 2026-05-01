@@ -88,6 +88,40 @@ This project uses **Flight Control** (bundled with Triple-C) for structured deve
 3. `.flightops/ARTIFACTS.md` — Where all artifacts are stored
 4. `.flightops/agent-crews/` — Project crew definitions for each phase (read the relevant crew file)"#;
 
+const SANDBOX_INSTRUCTIONS: &str = r#"## Sandbox Mode
+
+This container has Claude Code's bash sandbox enabled, managed by Triple-C
+(toggle it from the project's "Sandbox mode" switch in the Triple-C UI).
+Bash commands run inside `bubblewrap` with filesystem and network isolation
+(`enableWeakerNestedSandbox` is on because we are inside Docker).
+
+### When a command fails because of sandbox restrictions
+
+Triple-C disables the `dangerouslyDisableSandbox` escape hatch
+(`allowUnsandboxedCommands: false`), so failing commands cannot bypass the
+sandbox at runtime. To make a blocked command work, edit
+`~/.claude/settings.json` and restart Claude Code:
+
+| Need | Setting |
+|---|---|
+| Write to a path outside the project (e.g. `~/.kube`) | Add to `sandbox.filesystem.allowWrite` |
+| Reach a new domain | Will prompt; or add permanently to `sandbox.allowedDomains` |
+| Run a specific tool entirely outside the sandbox | Add a glob (e.g. `"docker *"`) to `sandbox.excludedCommands` |
+
+### Docker commands
+
+The `docker` CLI does not work inside the sandbox. If this project has
+"Allow container spawning" enabled in Triple-C and you need to run
+`docker` commands, add `"docker *"` to `sandbox.excludedCommands` in
+`~/.claude/settings.json`. Other tools known to be sandbox-incompatible
+include `watchman` — pass `--no-watchman` to `jest`.
+
+### Disabling sandbox mode
+
+Do not change `sandbox.enabled` in `settings.json` — Triple-C overwrites it
+on every container start. To turn sandbox off, stop the container in
+Triple-C, flip the "Sandbox mode" switch off, then start the container."#;
+
 /// Build the full CLAUDE_INSTRUCTIONS value by merging global + project
 /// instructions, appending port mapping docs, and appending scheduler docs.
 /// Used by both create_container() and container_needs_recreation() to ensure
@@ -97,6 +131,7 @@ fn build_claude_instructions(
     project_instructions: Option<&str>,
     port_mappings: &[PortMapping],
     mission_control_enabled: bool,
+    sandbox_enabled: bool,
 ) -> Option<String> {
     let mut combined = merge_claude_instructions(
         global_instructions,
@@ -125,6 +160,13 @@ fn build_claude_instructions(
         Some(existing) => format!("{}\n\n{}", existing, SCHEDULER_INSTRUCTIONS),
         None => SCHEDULER_INSTRUCTIONS.to_string(),
     });
+
+    if sandbox_enabled {
+        combined = Some(match combined {
+            Some(existing) => format!("{}\n\n{}", existing, SANDBOX_INSTRUCTIONS),
+            None => SANDBOX_INSTRUCTIONS.to_string(),
+        });
+    }
 
     combined
 }
@@ -227,6 +269,7 @@ fn compute_bedrock_fingerprint(project: &Project) -> String {
             bedrock.aws_bearer_token.as_deref().unwrap_or("").to_string(),
             bedrock.model_id.as_deref().unwrap_or("").to_string(),
             format!("{}", bedrock.disable_prompt_caching),
+            bedrock.service_tier.as_deref().unwrap_or("").to_string(),
         ];
         sha256_hex(&parts.join("|"))
     } else {
@@ -312,8 +355,16 @@ fn merge_claude_code_settings(
 }
 
 /// Compute a fingerprint for the Claude Code settings so we can detect changes.
-fn compute_claude_code_settings_fingerprint(settings: Option<&ClaudeCodeSettings>) -> String {
-    match settings {
+/// The `sandbox_enabled` flag is included so that toggling sandbox mode forces
+/// a container recreation (re-injecting the merged settings.json). When
+/// sandbox is off the historical fingerprint is preserved unchanged so that
+/// upgrading triple-c does not spuriously flag every existing container for
+/// recreation.
+fn compute_claude_code_settings_fingerprint(
+    settings: Option<&ClaudeCodeSettings>,
+    sandbox_enabled: bool,
+) -> String {
+    let base_fp = match settings {
         None => String::new(),
         Some(s) => {
             let parts = vec![
@@ -328,29 +379,58 @@ fn compute_claude_code_settings_fingerprint(settings: Option<&ClaudeCodeSettings
             ];
             sha256_hex(&parts.join("|"))
         }
+    };
+    if sandbox_enabled {
+        sha256_hex(&format!("{}|sandbox=true", base_fp))
+    } else {
+        base_fp
     }
 }
 
-/// Build the settings.json content for Claude Code from ClaudeCodeSettings.
+/// Build the settings.json content for Claude Code.
 /// Returns a JSON string of the settings to be written to ~/.claude/settings.json.
-fn build_claude_code_settings_json(settings: &ClaudeCodeSettings) -> Option<String> {
+/// Always emits a `sandbox.enabled` key reflecting the current per-project
+/// toggle so that flipping it off in triple-c overrides any prior on-state
+/// stored in the persisted settings.json (which lives in a named volume).
+fn build_claude_code_settings_json(
+    settings: Option<&ClaudeCodeSettings>,
+    sandbox_enabled: bool,
+) -> Option<String> {
     let mut map = serde_json::Map::new();
 
-    if let Some(ref tui) = settings.tui_mode {
-        map.insert("tui".to_string(), serde_json::json!(tui));
+    if let Some(s) = settings {
+        if let Some(ref tui) = s.tui_mode {
+            map.insert("tui".to_string(), serde_json::json!(tui));
+        }
+        if let Some(ref effort) = s.effort {
+            map.insert("effort".to_string(), serde_json::json!(effort));
+        }
+        if s.auto_scroll_disabled {
+            map.insert("autoScrollEnabled".to_string(), serde_json::json!(false));
+        }
+        if s.focus_mode {
+            map.insert("focusMode".to_string(), serde_json::json!(true));
+        }
+        if s.show_thinking_summaries {
+            map.insert("showThinkingSummaries".to_string(), serde_json::json!(true));
+        }
     }
-    if let Some(ref effort) = settings.effort {
-        map.insert("effort".to_string(), serde_json::json!(effort));
-    }
-    if settings.auto_scroll_disabled {
-        map.insert("autoScrollEnabled".to_string(), serde_json::json!(false));
-    }
-    if settings.focus_mode {
-        map.insert("focusMode".to_string(), serde_json::json!(true));
-    }
-    if settings.show_thinking_summaries {
-        map.insert("showThinkingSummaries".to_string(), serde_json::json!(true));
-    }
+
+    // Always emit `sandbox.enabled` so that toggling the per-project sandbox
+    // off in triple-c clears any prior on-state in the persisted
+    // settings.json (which lives in a named volume that survives recreation).
+    // Inside a Docker container we can't rely on privileged user namespaces,
+    // so `enableWeakerNestedSandbox` is required when sandbox is on.
+    let sandbox_obj = if sandbox_enabled {
+        serde_json::json!({
+            "enabled": true,
+            "enableWeakerNestedSandbox": true,
+            "allowUnsandboxedCommands": false,
+        })
+    } else {
+        serde_json::json!({ "enabled": false })
+    };
+    map.insert("sandbox".to_string(), sandbox_obj);
 
     if map.is_empty() {
         None
@@ -586,6 +666,13 @@ pub async fn create_container(
             if bedrock.disable_prompt_caching {
                 env_vars.push("DISABLE_PROMPT_CACHING=1".to_string());
             }
+
+            if let Some(ref tier) = bedrock.service_tier {
+                let trimmed = tier.trim();
+                if !trimmed.is_empty() {
+                    env_vars.push(format!("ANTHROPIC_BEDROCK_SERVICE_TIER={}", trimmed));
+                }
+            }
         }
     }
 
@@ -652,6 +739,7 @@ pub async fn create_container(
         project.claude_instructions.as_deref(),
         &project.port_mappings,
         project.mission_control_enabled,
+        project.sandbox_mode_enabled,
     );
 
     if let Some(ref instructions) = combined_instructions {
@@ -683,11 +771,16 @@ pub async fn create_container(
         if cc.prompt_caching_1h {
             env_vars.push("ENABLE_PROMPT_CACHING_1H=1".to_string());
         }
+    }
 
-        // settings.json-based settings (written by the entrypoint)
-        if let Some(settings_json) = build_claude_code_settings_json(cc) {
-            env_vars.push(format!("CLAUDE_CODE_SETTINGS_JSON={}", settings_json));
-        }
+    // settings.json-based settings (written by the entrypoint).
+    // Always invoked so per-project sandbox state is injected even when no
+    // ClaudeCodeSettings struct is present.
+    if let Some(settings_json) = build_claude_code_settings_json(
+        merged_cc_settings.as_ref(),
+        project.sandbox_mode_enabled,
+    ) {
+        env_vars.push(format!("CLAUDE_CODE_SETTINGS_JSON={}", settings_json));
     }
 
     let mut mounts: Vec<Mount> = Vec::new();
@@ -821,7 +914,7 @@ pub async fn create_container(
     labels.insert("triple-c.mission-control".to_string(), project.mission_control_enabled.to_string());
     labels.insert("triple-c.custom-env-fingerprint".to_string(), custom_env_fingerprint.clone());
     labels.insert("triple-c.claude-code-settings-fingerprint".to_string(),
-        compute_claude_code_settings_fingerprint(merged_cc_settings.as_ref()));
+        compute_claude_code_settings_fingerprint(merged_cc_settings.as_ref(), project.sandbox_mode_enabled));
     labels.insert("triple-c.instructions-fingerprint".to_string(),
         combined_instructions.as_ref().map(|s| sha256_hex(s)).unwrap_or_default());
     labels.insert("triple-c.git-user-name".to_string(), effective_git_name.unwrap_or_default().to_string());
@@ -1179,6 +1272,7 @@ pub async fn container_needs_recreation(
         project.claude_instructions.as_deref(),
         &project.port_mappings,
         project.mission_control_enabled,
+        project.sandbox_mode_enabled,
     );
     let expected_instructions_fp = expected_instructions.as_ref().map(|s| sha256_hex(s)).unwrap_or_default();
     let container_instructions_fp = get_label("triple-c.instructions-fingerprint").unwrap_or_default();
@@ -1192,7 +1286,7 @@ pub async fn container_needs_recreation(
         global_claude_code_settings,
         project.claude_code_settings.as_ref(),
     );
-    let expected_cc_fp = compute_claude_code_settings_fingerprint(merged_cc.as_ref());
+    let expected_cc_fp = compute_claude_code_settings_fingerprint(merged_cc.as_ref(), project.sandbox_mode_enabled);
     let container_cc_fp = get_label("triple-c.claude-code-settings-fingerprint").unwrap_or_default();
     if container_cc_fp != expected_cc_fp {
         log::info!("Claude Code settings mismatch (container={:?}, expected={:?})", container_cc_fp, expected_cc_fp);
