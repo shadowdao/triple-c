@@ -273,12 +273,21 @@ jobs:
             "${GITEA_URL}/api/v1/repos/${REPO}/releases" > release.json
           RELEASE_ID=$(cat release.json | grep -o '"id":[0-9]*' | head -1 | grep -o '[0-9]*')
           echo "Release ID: ${RELEASE_ID}"
-          # Upload each artifact
+          # Upload each artifact.
+          # Note: the macOS runner has historically dropped this upload mid-stream
+          # (curl exit 92 — HTTP/2 stream not closed cleanly), leaving the release
+          # with empty assets. The flags below force HTTP/1.1, fail loudly on HTTP
+          # errors, and retry transient failures. Linux and Windows uploads remain
+          # on the original simpler form because they have not exhibited this
+          # flake. If they ever do, mirror this block over.
           for file in artifacts/*; do
             [ -f "$file" ] || continue
             filename=$(basename "$file")
             echo "Uploading ${filename}..."
-            curl -s -X POST \
+            curl -fsS --http1.1 \
+              --retry 5 --retry-all-errors --retry-delay 5 \
+              --max-time 600 \
+              -X POST \
               -H "Authorization: token ${TOKEN}" \
               -H "Content-Type: application/octet-stream" \
               --data-binary "@${file}" \
