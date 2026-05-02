@@ -264,25 +264,67 @@ jobs:
         env:
           TOKEN: ${{ secrets.REGISTRY_TOKEN }}
         run: |
+          set -euo pipefail
           TAG="v${{ needs.compute-version.outputs.version }}-mac"
-          # Create release
-          curl -s -X POST \
+
+          # Idempotent get-or-create. macOS upload has historically failed
+          # mid-stream (curl exit 92, exit 28), leaving the release record
+          # with empty assets. A naive POST /releases on the next run hits
+          # 409 from Gitea for the duplicate tag, the JSON parse below
+          # then yields an empty RELEASE_ID, and pipefail aborts with an
+          # opaque exit 1. Look the release up by tag first; create only
+          # if it doesn't exist; reuse the existing id otherwise.
+          HTTP_CODE=$(curl -sS -o release.json -w '%{http_code}' \
             -H "Authorization: token ${TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d "{\"tag_name\": \"${TAG}\", \"name\": \"Triple-C v${{ needs.compute-version.outputs.version }} (macOS)\", \"body\": \"Automated build from commit ${{ gitea.sha }}\"}" \
-            "${GITEA_URL}/api/v1/repos/${REPO}/releases" > release.json
-          RELEASE_ID=$(cat release.json | grep -o '"id":[0-9]*' | head -1 | grep -o '[0-9]*')
+            "${GITEA_URL}/api/v1/repos/${REPO}/releases/tags/${TAG}")
+          case "${HTTP_CODE}" in
+            200)
+              echo "Release ${TAG} already exists, reusing"
+              ;;
+            404)
+              echo "Release ${TAG} not found, creating"
+              curl -fsS -X POST \
+                -H "Authorization: token ${TOKEN}" \
+                -H "Content-Type: application/json" \
+                -d "{\"tag_name\": \"${TAG}\", \"name\": \"Triple-C v${{ needs.compute-version.outputs.version }} (macOS)\", \"body\": \"Automated build from commit ${{ gitea.sha }}\"}" \
+                "${GITEA_URL}/api/v1/repos/${REPO}/releases" > release.json
+              ;;
+            *)
+              echo "Unexpected HTTP ${HTTP_CODE} from get-release-by-tag" >&2
+              cat release.json >&2 || true
+              exit 1
+              ;;
+          esac
+
+          RELEASE_ID=$(grep -o '"id":[0-9]*' release.json | head -1 | grep -o '[0-9]*' || true)
+          if [ -z "${RELEASE_ID}" ]; then
+            echo "Failed to parse release id; response was:" >&2
+            cat release.json >&2
+            exit 1
+          fi
           echo "Release ID: ${RELEASE_ID}"
-          # Upload each artifact.
-          # Note: the macOS runner has historically dropped this upload mid-stream
-          # (curl exit 92 — HTTP/2 stream not closed cleanly), leaving the release
-          # with empty assets. The flags below force HTTP/1.1, fail loudly on HTTP
-          # errors, and retry transient failures. Linux and Windows uploads remain
-          # on the original simpler form because they have not exhibited this
-          # flake. If they ever do, mirror this block over.
+
+          # Upload each artifact. If an asset with the same name already
+          # exists on the release (left over from a partial prior run),
+          # delete it first so the upload is replace-not-conflict.
+          # Network hardening: HTTP/1.1 to dodge HTTP/2 stream flakes
+          # the macOS runner has hit, retries with backoff for transient
+          # drops, and -f so HTTP errors stop being silently swallowed.
           for file in artifacts/*; do
             [ -f "$file" ] || continue
             filename=$(basename "$file")
+
+            EXISTING_ID=$(curl -sS \
+              -H "Authorization: token ${TOKEN}" \
+              "${GITEA_URL}/api/v1/repos/${REPO}/releases/${RELEASE_ID}/assets" \
+              | python3 -c "import json,sys; t=sys.argv[1]; print(next((a['id'] for a in json.load(sys.stdin) if a.get('name')==t), ''))" "${filename}" || true)
+            if [ -n "${EXISTING_ID}" ]; then
+              echo "Deleting existing asset ${filename} (id ${EXISTING_ID})"
+              curl -fsS -X DELETE \
+                -H "Authorization: token ${TOKEN}" \
+                "${GITEA_URL}/api/v1/repos/${REPO}/releases/${RELEASE_ID}/assets/${EXISTING_ID}"
+            fi
+
             echo "Uploading ${filename}..."
             curl -fsS --http1.1 \
               --retry 5 --retry-all-errors --retry-delay 5 \
