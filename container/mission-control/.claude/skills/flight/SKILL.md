@@ -37,6 +37,49 @@ Create a technical flight spec from a mission.
    - What's been completed vs. in progress?
    - Are there dependencies on other flights?
 
+6. **Review recent flight debriefs for relevant observations**
+   - Read recent flight debriefs in the project (within and adjacent to this mission)
+   - Look for test metrics observations: known slow suites, recurring flakes, persistent failures, growing skip lists — anything narrated by prior debriefs
+   - Look for unresolved technical concerns or recommendations that touch this flight's likely scope
+   - Carry forward into the technical approach and risk picture: e.g. "this area has slow integration tests, account for that in time estimates"; "known flake in suite X, plan to fix or quarantine if touching that area"; "prior debrief flagged Y — verify whether still relevant"
+
+### Phase 1b: Upstream Reconnaissance
+
+**Applies when**: The flight sources work items from a prior artifact that cites specific code locations — a maintenance report, a flight or mission debrief that enumerates outstanding follow-ups, an issue tracker, or a security audit. Skip this phase for greenfield flights where no source artifact pre-enumerates findings.
+
+Source artifacts go stale. Items cited weeks or even days ago may have been incidentally fixed by intervening flights, partially addressed, or the cited file/line may have moved. Without a recon pass, stale items get drafted into legs and only get caught at design review or implementation — wasted artifact churn and rework.
+
+**Goal**: Before designing legs, walk every cited item against current code and classify it.
+
+1. **Enumerate source items**
+   - Read the source artifact in full and identify every item it treats as outstanding, actionable work — regardless of how the artifact organizes them. Different projects use different headings, severity labels, and status conventions; identify items by intent, not by literal section name.
+   - Capture each item's cited file paths, line numbers, and the change it describes
+
+2. **Verify each item against current code**
+   - Read the cited locations (or grep for the cited symbols if line numbers have drifted)
+   - Determine whether the described gap still exists
+
+3. **Classify each item** into one of:
+   - **`confirmed-live`** — gap still exists, item is real work
+   - **`already-satisfied`** — code now reflects what the item asked for; recommend retiring
+   - **`partially-satisfied`** — some sub-points done, others not; scope down
+   - **`needs-human-recheck`** — cannot be verified mechanically (runtime state, external system, credentials, infrastructure that isn't in the repo)
+   - **`drifted`** — cited location moved or symbol renamed; needs re-locating before classification
+
+4. **Produce a Reconnaissance Report**
+   - Append the report to the flight log under a clearly-titled section (something like `## Reconnaissance Report` if the project's flight-log conventions don't dictate otherwise)
+   - One row per source item: `{item-id} | {classification} | {evidence: file:line or "cannot verify from repo"} | {recommendation}`
+   - For `already-satisfied`: cite the specific code that satisfies the item, so the user can audit your call
+
+5. **Default to flag-for-human, not auto-retire**
+   - Do NOT silently drop items classified as `already-satisfied` or `partially-satisfied`
+   - Present the recon report to the user before proceeding to Phase 2 and ask: "Confirm retirements / accept partial scope / override any classifications?"
+   - The user has authority to keep an item live even if you think it's satisfied (e.g., the satisfying code is incomplete in ways you can't see)
+
+6. **Carry retired items into the flight artifact**
+   - In the section of the flight artifact the project uses to enumerate scope items contributing to mission criteria, retired items appear as completed `[x]` entries with the satisfying evidence inline — they are NOT silently dropped from the spec
+   - This preserves traceability: a future reader can see all source items were considered, and which ones were judged already-satisfied during reconnaissance
+
 ### Phase 2: Code Interrogation
 
 Explore the target project's codebase to inform the technical approach:
@@ -158,9 +201,11 @@ Break flights into legs based on technical boundaries:
 
 **For documentation**: Consider whether README, CLAUDE.md, or other docs need updates as part of this flight — especially for flights adding new CLI commands, API endpoints, or configuration options
 
+**For carry-forward debt from prior debriefs**: when multiple small items touch the same files or directories, bundle them into a single shared-surface leg rather than scheduling separate flights or letting them decay. Items that don't share a surface stay separate — bundling unrelated work just to "pull forward" is how scope creep enters maintenance work.
+
 **For schema changes**: Include explicit migration legs and verify against the live database, not just mocks
 
-**For UAT and alignment**: During the crew interview, ask the user whether they'd like to include a UAT and alignment leg. Explain that this optional leg is a guided UAT session — the agent walks the user through a series of tests and verification steps, fixing issues along the way until the user is satisfied with the results. If the user opts in, include it in the breakdown, marked as optional.
+**For HAT and alignment**: During the crew interview, ask the user whether they'd like to include an interactive HAT (human acceptance test) and alignment leg. Explain that this optional leg is a guided HAT session — the agent walks the user through a series of tests and verification steps, fixing issues along the way until the user is satisfied with the results. If the user opts in, include it in the breakdown, marked as optional.
 
 ### Pre-Flight Rigor
 

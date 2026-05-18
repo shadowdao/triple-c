@@ -33,7 +33,7 @@ Check for legacy directory layouts and offer to migrate them.
 2. **Run detection checks** for each migration in order (001, 002, ...)
 3. **If no migrations are needed**, proceed silently to the next step
 4. **If any migrations are needed**, present a summary to the user:
-   > "Detected legacy directory layout in {project}. The following migrations are available:"
+   > "Detected legacy directory layout in {target-project}. The following migrations are available:"
    >
    > - _Each applicable migration's user message_
    >
@@ -61,13 +61,13 @@ The script outputs one of:
 Based on the status:
 
 **If `missing`**:
-> "Flight operations directory not found. Create `{project}/.flightops/` with methodology references?"
+> "Flight operations directory not found. Create `{target-project}/.flightops/` with methodology references?"
 
 **If `outdated`**:
-> "Flight operations references in {project} are outdated. Update?"
+> "Flight operations references in {target-project} are outdated. Update?"
 
 **If `current`**:
-> "Flight operations references are up-to-date in {project}."
+> "Flight operations references are up-to-date in {target-project}."
 
 If the user confirms, create/update the directory:
 
@@ -79,33 +79,12 @@ cp "${SKILL_DIR}/README.md" "{target-project}/.flightops/"
 
 ### 5. Configure Artifact System (New Projects Only)
 
-**Only if ARTIFACTS.md doesn't exist**, ask the user to select an artifact system:
-
-> "How should mission, flight, and leg artifacts be stored?"
-
-Available templates:
-- **files** — Markdown files in the repository (`templates/ARTIFACTS-files.md`)
-- **jira** — Jira issues: Epics, Stories, Sub-tasks (`templates/ARTIFACTS-jira.md`)
-
-#### 5a. Check for Setup Questions
-
-After the user selects a template, read the template file and check if it contains a `## Setup Questions` section with a table of questions.
-
-If setup questions exist:
-1. Parse the questions from the table (first column contains the questions)
-2. Ask the user each question interactively
-3. Replace the placeholder answers in the table with the user's responses
-
-#### 5b. Copy and Populate Template
-
-Copy the selected template, with answers populated if setup questions were asked:
+**Only if ARTIFACTS.md doesn't exist**, copy the template:
 
 ```bash
-cp "${SKILL_DIR}/templates/ARTIFACTS-{selection}.md" \
+cp "${SKILL_DIR}/templates/ARTIFACTS-files.md" \
    "{target-project}/.flightops/ARTIFACTS.md"
 ```
-
-If setup questions were answered, update the ARTIFACTS.md file to replace the placeholder answers with the user's responses.
 
 **If ARTIFACTS.md already exists**, do not modify it — it's project-specific and may have been customized.
 
@@ -166,7 +145,7 @@ This project uses [Flight Control](https://github.com/msieurthenardier/mission-c
 
 After creating or updating the directory, inform the user:
 
-> "If you have Claude Code running in {project}, restart it to pick up the new flight operations references."
+> "If you have Claude Code running in {target-project}, restart it to pick up the new flight operations references."
 
 This ensures Claude Code loads the new files into its context when working in the target project.
 
@@ -175,7 +154,7 @@ This ensures Claude Code loads the new files into its context when working in th
 This skill creates/updates the following at project root:
 
 ```
-{project}/
+{target-project}/
 ├── CLAUDE.md                  # Updated with Flight Operations section
 └── .flightops/               # Hidden directory for Flight Control
     ├── README.md              # Explains the directory purpose

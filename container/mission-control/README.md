@@ -32,7 +32,7 @@ Aviation succeeds through layered planning and clear handoffs. Pilots follow fli
 
 ## Agentic Workflow
 
-**LLM orchestrators**: Run `/agentic-workflow` to drive multi-agent flight execution with Claude Code. The skill orchestrates the full leg cycle — design, implement, review, commit — using three separate Claude instances.
+**LLM orchestrators**: Run `/agentic-workflow` to drive multi-agent flight execution with Claude Code. The skill designs and implements each leg in turn, then runs a single code review and commit across the whole flight, using separate Claude instances for the Flight Director, Developer, and Reviewer roles.
 
 ## Getting Started
 
@@ -49,13 +49,13 @@ Aviation succeeds through layered planning and clear handoffs. Pilots follow fli
 
 3. **Initialize your project** — Run `/init-project` and select your project. This creates `.flightops/` in your target project with artifact configuration, methodology reference, and crew definitions.
 
-4. **Review agent crew files** — Check the files in `{project}/.flightops/agent-crews/`. These define the crew composition (roles, models, prompts) for each phase. Customize them to your needs.
+4. **Review agent crew files** — Check the files in `{target-project}/.flightops/agent-crews/`. These define the crew composition (roles, models, prompts) for each phase. Customize them to your needs.
 
 5. **Create a mission** — Run `/mission`. This interviews you about desired outcomes and creates a mission artifact in your target project.
 
 6. **Design a flight** — Run `/flight` to break the mission into a technical specification with pre/in/post-flight checklists.
 
-7. **Execute** — Run `/agentic-workflow` to drive multi-agent implementation. This orchestrates design, implement, review, and commit cycles across legs.
+7. **Execute** — Run `/agentic-workflow` to drive multi-agent implementation. This designs and implements each leg in turn, then reviews and commits the whole flight in one pass at the end.
 
 8. **Debrief** — Run `/flight-debrief` and `/mission-debrief` after completion to capture lessons learned.
 
@@ -106,13 +106,7 @@ Mission
     └── Leg
 ```
 
-How you store these artifacts depends on your project's needs. Flight Control supports multiple artifact systems:
-
-- **Markdown files** — Version-controlled documentation in your repository
-- **Issue trackers** — Jira, Linear, GitHub Issues with linked relationships
-- **Hybrid** — Missions in markdown, flights/legs as tickets
-
-Each project configures its artifact system during initialization. The methodology and Claude Code skills adapt to your choice.
+By default, artifacts are stored as version-controlled markdown files in your project's repository. Each project's `.flightops/ARTIFACTS.md` describes where and how artifacts live — skills read this file to determine locations and formats. You can adapt it to other backends (Jira, Linear, GitHub Issues, hybrid setups) by editing this file directly; only the markdown-files template ships out of the box.
 
 ## Claude Code Skills
 

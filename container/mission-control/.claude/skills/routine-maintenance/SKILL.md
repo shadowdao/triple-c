@@ -1,11 +1,11 @@
 ---
 name: routine-maintenance
-description: Codebase health assessment and maintenance recommendation. Use after a mission or ad-hoc to verify codebase is flight-ready or scaffold a maintenance mission.
+description: Post-mission codebase health assessment. Run after `/mission-debrief` to verify the codebase is flight-ready or scaffold a maintenance mission. Per-flight findings instead roll into the next flight or accumulate into an end-of-mission maintenance flight — not into this skill.
 ---
 
 # Routine Maintenance
 
-Perform an exhaustive, aviation-style codebase inspection. Can be triggered after a mission completes or run ad-hoc at any time. Produces a findings report and optionally scaffolds a maintenance mission for significant issues.
+Perform an exhaustive, aviation-style codebase inspection after a mission completes. Produces a findings report and optionally scaffolds a maintenance mission for significant issues.
 
 ## Prerequisites
 
@@ -31,12 +31,11 @@ Perform an exhaustive, aviation-style codebase inspection. Can be triggered afte
    - Deferred findings are those documented in prior reports but not addressed by a maintenance mission
    - This ensures recurring issues are tracked across cycles rather than re-discovered as "new"
 
-5. **Load mission and debrief documentation (if available)**
-   - If a recent mission exists, read it for outcome, success criteria, and known issues
-   - If a mission debrief exists, read it for lessons learned and action items
-   - If flight debriefs exist, read them for per-flight technical debt and recommendations
+5. **Load mission and debrief documentation**
+   - Read the most recently completed mission for outcome, success criteria, and known issues
+   - Read its mission debrief for lessons learned and action items
+   - Read its flight debriefs for per-flight technical debt and recommendations
    - This provides known-debt context so the inspection can distinguish new issues from acknowledged ones
-   - If no mission context is available (ad-hoc run), proceed without known-debt context
 
 6. **Identify project stack**
    - Read `README.md`, `CLAUDE.md`, and package files (`package.json`, `Cargo.toml`, `go.mod`, etc.)
@@ -178,6 +177,7 @@ Each agent receives:
    - Provide the "Inspect Codebase" prompt from the crew file's Prompts section
    - Include: applicable category list, project stack info, known debt from debriefs, user's areas of concern, and **scope assignment from the delegation plan**
    - For partitioned inspections: each Inspector agent receives its module/area scope and only the categories relevant to its assignment
+   - In addition to the crew prompt, the Flight Director directly instructs the Inspector to: scan recent flight debriefs for any test metrics observations (timing, failures, skipped tests, flakes) and look for trends across them — rising suite times, recurring flakes, growing skip lists, persistent failures. Surface concrete optimization recommendations as Category 2 findings (e.g. parallelization, mocking, fixture hoisting, slow-test extraction, runner config), each tied to evidence from the trend.
    - The Inspector performs broad automated checks and returns structured findings per category
 
 #### Security Reviewer

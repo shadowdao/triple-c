@@ -49,7 +49,7 @@ Eleven skills automate the planning, execution, debrief, and oversight workflow:
 | `/mission` | Create outcome-driven missions through research and interview |
 | `/flight` | Create technical flight specs from missions |
 | `/leg` | Generate implementation guidance for LLM execution |
-| `/agentic-workflow` | Drive multi-agent flight execution (design, implement, review, commit) |
+| `/agentic-workflow` | Drive multi-agent flight execution (design per leg, batch implement, single review and commit) |
 | `/flight-debrief` | Post-flight analysis for continuous improvement |
 | `/mission-debrief` | Post-mission retrospective for outcomes assessment |
 | `/routine-maintenance` | Post-mission codebase health assessment and maintenance recommendation |
@@ -89,6 +89,27 @@ The registry provides:
 - **Missions**: `planning` → `active` → `completed` (or `aborted`)
 - **Flights**: `planning` → `ready` → `in-flight` → `landed` → `completed` (or `aborted`)
 - **Legs**: `planning` → `ready` → `in-flight` → `landed` → `completed` (or `aborted`)
+
+## Skill–Project Boundary
+
+Mission Control skills run in projects whose owners can customize `.flightops/ARTIFACTS.md` and `.flightops/agent-crews/*.md` freely. Skills must not couple to project-owned shape:
+
+- **Do not read project-owned artifacts by section heading.** When a skill needs to extract information from a prior debrief, maintenance report, or other project-owned artifact, frame the instruction by intent — what the agent is looking for — and let the agent locate it within whatever structure the project uses. Reading by literal heading name (e.g. `## Action Items`, `## Test Suite Timing`) breaks silently the moment a project owner renames or removes that section.
+- **Do not write into project-owned artifacts at named anchors.** When a skill inserts content into a project artifact, describe the destination semantically ("in the section the project uses for X") rather than by literal heading. If the skill is appending a new section, suggest a heading without prescribing it as a contract.
+- **Do not rely on crew prompt files to carry skill-required instructions.** The Flight Director must issue per-spawn instructions directly from the SKILL.md, even when the crew file also contains an overlapping prompt. Crew files are project-modifiable scaffolding; SKILL.md is the protocol.
+
+See `docs/artifacts-md-ambiguities.md` for the full review of how the current ARTIFACTS.md template muddles this boundary.
+
+## Project Information Stays in Project Artifacts
+
+**Never store project-specific information in Claude Code memories** — not in mission-control's memory directory, not in any project's memory directory. Project-specific issues, bugs, technical debt, design gaps, known issues, and lessons learned belong exclusively in the project's own Flight Control artifacts:
+
+- **Flight logs** — runtime decisions, deviations, anomalies
+- **Flight debriefs** — post-flight analysis, recommendations, action items
+- **Mission known issues** — cross-flight concerns discovered during execution
+- **Design decision sections** — in flight and mission artifacts
+
+Mission-control is a neutral methodology tool. Its memory (if used at all) is reserved for methodology preferences, user collaboration preferences, and cross-cutting tooling notes — never for project-specific content.
 
 ## Public Repository
 

@@ -52,6 +52,7 @@ Read `{target-project}/.flightops/agent-crews/flight-debrief.md` for crew defini
 1. **Spawn a Developer agent** in the target project context (Task tool, `subagent_type: "general-purpose"`)
    - Provide the "Debrief Interview" prompt from the flight-debrief phase file's Prompts section
    - The Developer examines code changes, test coverage, patterns, and technical debt
+   - In addition to the crew prompt, the Flight Director directly instructs the Developer to: run the full test suite once, capture per-suite wall-clock timing, pass/fail counts (with names of any failing tests), skipped/ignored counts, and any flakes observed on the run; then read prior flight debriefs in the project and compare current metrics against any earlier numbers they find. Report findings as narrative — naming suites, quoting deltas, and proposing likely causes when visible from this flight's changes.
    - The Developer provides structured debrief input
 
 #### Architect Interview
@@ -92,6 +93,12 @@ Synthesize Developer input, Architect input, human input, and document analysis 
 - Were there architectural surprises?
 - What technical debt was introduced?
 - Does implementation align with project conventions?
+
+#### Test Metrics Capture
+- Run the full test suite as part of the debrief and record metrics: per-suite wall-clock timing, pass/fail counts, skipped/ignored tests, and any flakes observed on this run.
+- Read prior flight debriefs in this project for earlier metrics observations. Compare current numbers against whatever priors exist.
+- Surface meaningful changes — significant slowdowns, new failures, growing skip lists, recurring flakes — as narrative observations in whichever existing section best fits (Technical, Key Learnings, or What Could Be Improved).
+- If this is the first flight to capture metrics, the numbers seed comparisons for future flights.
 
 #### Deviation Analysis
 - What deviations occurred and why?

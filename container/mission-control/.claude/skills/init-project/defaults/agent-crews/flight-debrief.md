@@ -6,7 +6,7 @@ human and project-side agents to capture both execution and design perspectives.
 ## Crew
 
 ### Developer
-- **Context**: {project}/
+- **Context**: {target-project}/
 - **Model**: Sonnet
 - **Role**: Provides developer perspective on flight execution. Reviews what was
   built, identifies technical debt introduced, evaluates implementation quality,
@@ -14,7 +14,7 @@ human and project-side agents to capture both execution and design perspectives.
 - **Actions**: debrief-interview
 
 ### Architect
-- **Context**: {project}/
+- **Context**: {target-project}/
 - **Model**: Sonnet
 - **Role**: Closes the design feedback loop. Evaluates whether the design decisions
   made during flight planning held up in practice. Reviews architectural impact of

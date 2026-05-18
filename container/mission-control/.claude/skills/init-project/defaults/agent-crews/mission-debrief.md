@@ -6,7 +6,7 @@ both the human and a project-side Architect to capture strategic technical persp
 ## Crew
 
 ### Architect
-- **Context**: {project}/
+- **Context**: {target-project}/
 - **Model**: Sonnet
 - **Role**: Provides architectural perspective on mission outcomes. Evaluates
   whether the system evolved well across flights, identifies structural issues,

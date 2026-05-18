@@ -6,7 +6,7 @@ and uses project-side agents to validate technical viability.
 ## Crew
 
 ### Architect
-- **Context**: {project}/
+- **Context**: {target-project}/
 - **Model**: Sonnet
 - **Role**: Validates technical viability of proposed outcomes. Ensures business
   goals align with what's actually possible given the codebase, stack, and
