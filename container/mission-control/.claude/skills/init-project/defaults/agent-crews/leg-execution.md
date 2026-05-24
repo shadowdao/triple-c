@@ -7,21 +7,21 @@ The Flight Director (Mission Control) orchestrates this phase using the
 ## Crew
 
 ### Developer
-- **Context**: {working-directory}/
+- **Context**: {target-project}/
 - **Model**: Sonnet
 - **Role**: Implements code changes. Also performs design reviews against real
   codebase to validate leg specs before implementation.
 - **Actions**: implement, fix-review-issues, commit, review-leg-design
 
 ### Reviewer
-- **Context**: {working-directory}/
+- **Context**: {target-project}/
 - **Model**: Sonnet (NEVER Opus)
 - **Role**: Reviews code changes for quality, correctness, and criteria compliance.
   Has NO knowledge of Developer's reasoning — only sees resulting changes.
 - **Actions**: review
 
 ### Accessibility Reviewer (optional)
-- **Context**: {working-directory}/
+- **Context**: {target-project}/
 - **Model**: Sonnet
 - **Enabled**: false
 - **Role**: Reviews UI changes for accessibility compliance. Evaluates against
@@ -72,7 +72,6 @@ The Flight Director substitutes these variables in prompts at runtime:
 | `{flight-number}` | Current flight number | All prompts |
 | `{leg-number}` | Current leg number | Leg-scoped prompts |
 | `{leg-artifact-path}` | Path to the leg artifact file | review-leg-design |
-| `{working-directory}` | Resolved working directory for the agent (project root for branch strategy, worktree path for worktree strategy) | All prompts |
 | `{reviewer-issues}` | Full text of reviewer feedback (dynamic) | fix-review-issues |
 
 ## Prompts

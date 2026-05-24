@@ -28,8 +28,25 @@ export function useTerminal() {
 
   const close = useCallback(
     async (sessionId: string) => {
+      // Capture session/project info before we drop it from local state.
+      const { sessions: currentSessions, projects } = useAppState.getState();
+      const session = currentSessions.find((s) => s.id === sessionId);
+      const project = session ? projects.find((p) => p.id === session.projectId) : undefined;
+
       await commands.closeTerminalSession(sessionId);
       removeSession(sessionId);
+
+      // Drop any persisted custom name for this session.
+      if (project && project.renamed_session_names && sessionId in project.renamed_session_names) {
+        const map = { ...project.renamed_session_names };
+        delete map[sessionId];
+        try {
+          const updated = await commands.updateProject({ ...project, renamed_session_names: map });
+          useAppState.getState().updateProjectInList(updated);
+        } catch (err) {
+          console.error("Failed to clear renamed tab name on close:", err);
+        }
+      }
     },
     [removeSession],
   );

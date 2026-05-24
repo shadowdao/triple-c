@@ -5,7 +5,7 @@ This project stores Flight Control artifacts as markdown files in the repository
 ## Directory Structure
 
 ```
-{project}/
+{target-project}/
 ├── missions/
 │   └── {NN}-{mission-slug}/
 │       ├── mission.md
@@ -159,7 +159,7 @@ How the objective will be achieved.
 
 - [ ] `{leg-slug}` - {Brief description}
 - [ ] `{leg-slug}` - {Brief description}
-- [ ] `uat-and-alignment` *(optional)* - Guided UAT session with iterative fixes
+- [ ] `hat-and-alignment` *(optional)* - Guided HAT (human acceptance test) session with iterative fixes
 
 ---
 
@@ -560,16 +560,3 @@ States are tracked in the frontmatter or status field of each artifact:
 - **Flight briefings**: Created before execution, not modified after
 - **Debriefs**: Created after completion, may be updated with follow-up notes
 - **Mission as briefing**: The mission.md document serves as both definition and briefing (no separate mission-briefing.md)
-
-## Git Workflow
-
-| Property | Value |
-|----------|-------|
-| Strategy | `branch` |
-
-**Options:**
-
-- **`branch`** (default) — Single-checkout workflow. The orchestrator creates a feature branch and all agents work in the project root. One flight at a time per working copy.
-- **`worktree`** — Worktree isolation. The orchestrator creates a git worktree under `.worktrees/` for each flight. Agents work in the worktree path. Parallel flights are possible on a single repo clone.
-
-When using the `worktree` strategy, add `.worktrees/` to `.gitignore`.

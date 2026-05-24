@@ -6,7 +6,7 @@ technical spec and uses project-side agents to validate against the real codebas
 ## Crew
 
 ### Architect
-- **Context**: {project}/
+- **Context**: {target-project}/
 - **Model**: Sonnet
 - **Role**: Reviews flight specs for technical soundness. Validates design
   decisions, prerequisites, technical approach, and leg breakdown against
@@ -56,6 +56,20 @@ Evaluate:
 5. Codebase state — does the spec account for current working tree, existing tooling,
    and conventions that might affect implementation?
 6. Architecture — does the approach maintain or improve system structure?
+7. State-machine reachability — for every state, status, or lifecycle value the flight
+   introduces or relies on (e.g. "agent_deleted", "draft", "queued"), audit which
+   infrastructure layers could foreclose it: DB constraints (FK ON DELETE behaviors,
+   NOT NULL, CHECK), application caches and their invalidation rules, API/protocol
+   versions, fallback handlers that mask the state, and existing tests that pin
+   contradictory behavior. A state that the schema or a cache can silently prevent
+   is a design hole, not an implementation detail.
+8. Cache freshness contracts — for every cache (in-memory dict, query result cache,
+   derived state, frontend session storage) the flight reads from or populates,
+   the design must declare source of truth, rebuild trigger (per-call / TTL /
+   invalidation event / accepted permanent staleness), maximum staleness, and which
+   user actions should invalidate it. Vague answers ("eventually", "on next cycle")
+   without a concrete trigger are a flag. Conflating "cached object works" with
+   "cached object reflects current source" is a common category error worth catching.
 
 Provide structured output:
 

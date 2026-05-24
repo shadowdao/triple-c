@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use sha2::{Sha256, Digest};
 
 use super::client::get_docker;
-use crate::models::{Backend, BedrockAuthMethod, ClaudeCodeSettings, ContainerInfo, EnvVar, GlobalAwsSettings, McpServer, McpTransportType, PortMapping, Project, ProjectPath};
+use crate::models::{Backend, BedrockAuthMethod, ClaudeCodeSettings, ContainerInfo, EnvVar, GlobalAwsSettings, GlobalOllamaSettings, GlobalOpenAiCompatibleSettings, McpServer, McpTransportType, PortMapping, Project, ProjectPath};
 
 const SCHEDULER_INSTRUCTIONS: &str = r#"## Scheduled Tasks
 
@@ -256,9 +256,25 @@ fn sha256_hex(input: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Resolve a per-project string value with a global fallback. Returns `None`
+/// when both are blank, otherwise the per-project value if set, else the global.
+fn resolve_with_global<'a>(per_project: Option<&'a str>, global: Option<&'a str>) -> Option<&'a str> {
+    let project_val = per_project.map(str::trim).filter(|s| !s.is_empty());
+    if project_val.is_some() {
+        return project_val;
+    }
+    global.map(str::trim).filter(|s| !s.is_empty())
+}
+
 /// Compute a fingerprint for the Bedrock configuration so we can detect changes.
-fn compute_bedrock_fingerprint(project: &Project) -> String {
+/// Includes the resolved model_id (per-project blank → global default) so that
+/// changing the global default forces a container recreation.
+fn compute_bedrock_fingerprint(project: &Project, global_aws: &GlobalAwsSettings) -> String {
     if let Some(ref bedrock) = project.bedrock_config {
+        let effective_model = resolve_with_global(
+            bedrock.model_id.as_deref(),
+            global_aws.default_model_id.as_deref(),
+        ).unwrap_or("").to_string();
         let parts = vec![
             format!("{:?}", bedrock.auth_method),
             bedrock.aws_region.clone(),
@@ -267,7 +283,7 @@ fn compute_bedrock_fingerprint(project: &Project) -> String {
             bedrock.aws_session_token.as_deref().unwrap_or("").to_string(),
             bedrock.aws_profile.as_deref().unwrap_or("").to_string(),
             bedrock.aws_bearer_token.as_deref().unwrap_or("").to_string(),
-            bedrock.model_id.as_deref().unwrap_or("").to_string(),
+            effective_model,
             format!("{}", bedrock.disable_prompt_caching),
             bedrock.service_tier.as_deref().unwrap_or("").to_string(),
         ];
@@ -278,12 +294,18 @@ fn compute_bedrock_fingerprint(project: &Project) -> String {
 }
 
 /// Compute a fingerprint for the Ollama configuration so we can detect changes.
-fn compute_ollama_fingerprint(project: &Project) -> String {
+/// Includes the resolved base_url and model_id (per-project blank → global default).
+fn compute_ollama_fingerprint(project: &Project, global_ollama: &GlobalOllamaSettings) -> String {
     if let Some(ref ollama) = project.ollama_config {
-        let parts = vec![
-            ollama.base_url.clone(),
-            ollama.model_id.as_deref().unwrap_or("").to_string(),
-        ];
+        let effective_url = resolve_with_global(
+            Some(&ollama.base_url),
+            global_ollama.base_url.as_deref(),
+        ).unwrap_or("").to_string();
+        let effective_model = resolve_with_global(
+            ollama.model_id.as_deref(),
+            global_ollama.default_model_id.as_deref(),
+        ).unwrap_or("").to_string();
+        let parts = vec![effective_url, effective_model];
         sha256_hex(&parts.join("|"))
     } else {
         String::new()
@@ -291,12 +313,24 @@ fn compute_ollama_fingerprint(project: &Project) -> String {
 }
 
 /// Compute a fingerprint for the OpenAI Compatible configuration so we can detect changes.
-fn compute_openai_compatible_fingerprint(project: &Project) -> String {
+/// Includes the resolved base_url and model_id (per-project blank → global default).
+fn compute_openai_compatible_fingerprint(
+    project: &Project,
+    global_openai_compatible: &GlobalOpenAiCompatibleSettings,
+) -> String {
     if let Some(ref config) = project.openai_compatible_config {
+        let effective_url = resolve_with_global(
+            Some(&config.base_url),
+            global_openai_compatible.base_url.as_deref(),
+        ).unwrap_or("").to_string();
+        let effective_model = resolve_with_global(
+            config.model_id.as_deref(),
+            global_openai_compatible.default_model_id.as_deref(),
+        ).unwrap_or("").to_string();
         let parts = vec![
-            config.base_url.clone(),
+            effective_url,
             config.api_key.as_deref().unwrap_or("").to_string(),
-            config.model_id.as_deref().unwrap_or("").to_string(),
+            effective_model,
         ];
         sha256_hex(&parts.join("|"))
     } else {
@@ -552,6 +586,8 @@ pub async fn create_container(
     image_name: &str,
     aws_config_path: Option<&str>,
     global_aws: &GlobalAwsSettings,
+    global_ollama: &GlobalOllamaSettings,
+    global_openai_compatible: &GlobalOpenAiCompatibleSettings,
     global_claude_instructions: Option<&str>,
     global_custom_env_vars: &[EnvVar],
     timezone: Option<&str>,
@@ -659,7 +695,10 @@ pub async fn create_container(
                 }
             }
 
-            if let Some(ref model) = bedrock.model_id {
+            if let Some(model) = resolve_with_global(
+                bedrock.model_id.as_deref(),
+                global_aws.default_model_id.as_deref(),
+            ) {
                 env_vars.push(format!("ANTHROPIC_MODEL={}", model));
             }
 
@@ -679,9 +718,17 @@ pub async fn create_container(
     // Ollama configuration
     if project.backend == Backend::Ollama {
         if let Some(ref ollama) = project.ollama_config {
-            env_vars.push(format!("ANTHROPIC_BASE_URL={}", ollama.base_url));
+            if let Some(url) = resolve_with_global(
+                Some(&ollama.base_url),
+                global_ollama.base_url.as_deref(),
+            ) {
+                env_vars.push(format!("ANTHROPIC_BASE_URL={}", url));
+            }
             env_vars.push("ANTHROPIC_AUTH_TOKEN=ollama".to_string());
-            if let Some(ref model) = ollama.model_id {
+            if let Some(model) = resolve_with_global(
+                ollama.model_id.as_deref(),
+                global_ollama.default_model_id.as_deref(),
+            ) {
                 env_vars.push(format!("ANTHROPIC_MODEL={}", model));
             }
         }
@@ -690,11 +737,19 @@ pub async fn create_container(
     // OpenAI Compatible configuration
     if project.backend == Backend::OpenAiCompatible {
         if let Some(ref config) = project.openai_compatible_config {
-            env_vars.push(format!("ANTHROPIC_BASE_URL={}", config.base_url));
+            if let Some(url) = resolve_with_global(
+                Some(&config.base_url),
+                global_openai_compatible.base_url.as_deref(),
+            ) {
+                env_vars.push(format!("ANTHROPIC_BASE_URL={}", url));
+            }
             if let Some(ref key) = config.api_key {
                 env_vars.push(format!("ANTHROPIC_AUTH_TOKEN={}", key));
             }
-            if let Some(ref model) = config.model_id {
+            if let Some(model) = resolve_with_global(
+                config.model_id.as_deref(),
+                global_openai_compatible.default_model_id.as_deref(),
+            ) {
                 env_vars.push(format!("ANTHROPIC_MODEL={}", model));
             }
         }
@@ -904,9 +959,9 @@ pub async fn create_container(
     labels.insert("triple-c.project-name".to_string(), project.name.clone());
     labels.insert("triple-c.backend".to_string(), format!("{:?}", project.backend));
     labels.insert("triple-c.paths-fingerprint".to_string(), compute_paths_fingerprint(&project.paths));
-    labels.insert("triple-c.bedrock-fingerprint".to_string(), compute_bedrock_fingerprint(project));
-    labels.insert("triple-c.ollama-fingerprint".to_string(), compute_ollama_fingerprint(project));
-    labels.insert("triple-c.openai-compatible-fingerprint".to_string(), compute_openai_compatible_fingerprint(project));
+    labels.insert("triple-c.bedrock-fingerprint".to_string(), compute_bedrock_fingerprint(project, global_aws));
+    labels.insert("triple-c.ollama-fingerprint".to_string(), compute_ollama_fingerprint(project, global_ollama));
+    labels.insert("triple-c.openai-compatible-fingerprint".to_string(), compute_openai_compatible_fingerprint(project, global_openai_compatible));
     labels.insert("triple-c.ports-fingerprint".to_string(), compute_ports_fingerprint(&project.port_mappings));
     labels.insert("triple-c.image".to_string(), image_name.to_string());
     labels.insert("triple-c.timezone".to_string(), timezone.unwrap_or("").to_string());
@@ -1083,6 +1138,9 @@ pub async fn remove_project_volumes(project: &Project) -> Result<(), String> {
 pub async fn container_needs_recreation(
     container_id: &str,
     project: &Project,
+    global_aws: &GlobalAwsSettings,
+    global_ollama: &GlobalOllamaSettings,
+    global_openai_compatible: &GlobalOpenAiCompatibleSettings,
     global_claude_instructions: Option<&str>,
     global_custom_env_vars: &[EnvVar],
     timezone: Option<&str>,
@@ -1154,7 +1212,7 @@ pub async fn container_needs_recreation(
     }
 
     // ── Bedrock config fingerprint ───────────────────────────────────────
-    let expected_bedrock_fp = compute_bedrock_fingerprint(project);
+    let expected_bedrock_fp = compute_bedrock_fingerprint(project, global_aws);
     let container_bedrock_fp = get_label("triple-c.bedrock-fingerprint").unwrap_or_default();
     if container_bedrock_fp != expected_bedrock_fp {
         log::info!("Bedrock config mismatch");
@@ -1162,7 +1220,7 @@ pub async fn container_needs_recreation(
     }
 
     // ── Ollama config fingerprint ────────────────────────────────────────
-    let expected_ollama_fp = compute_ollama_fingerprint(project);
+    let expected_ollama_fp = compute_ollama_fingerprint(project, global_ollama);
     let container_ollama_fp = get_label("triple-c.ollama-fingerprint").unwrap_or_default();
     if container_ollama_fp != expected_ollama_fp {
         log::info!("Ollama config mismatch");
@@ -1170,7 +1228,7 @@ pub async fn container_needs_recreation(
     }
 
     // ── OpenAI Compatible config fingerprint ────────────────────────────
-    let expected_oai_fp = compute_openai_compatible_fingerprint(project);
+    let expected_oai_fp = compute_openai_compatible_fingerprint(project, global_openai_compatible);
     let container_oai_fp = get_label("triple-c.openai-compatible-fingerprint").unwrap_or_default();
     if container_oai_fp != expected_oai_fp {
         log::info!("OpenAI Compatible config mismatch");

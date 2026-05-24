@@ -193,16 +193,20 @@ pub async fn start_project_container(
     if project.backend == Backend::Ollama {
         let ollama = project.ollama_config.as_ref()
             .ok_or_else(|| "Ollama backend selected but no Ollama configuration found.".to_string())?;
-        if ollama.base_url.is_empty() {
-            return Err("Ollama base URL is required.".to_string());
+        if ollama.base_url.is_empty()
+            && settings.global_ollama.base_url.as_deref().map(str::trim).unwrap_or("").is_empty()
+        {
+            return Err("Ollama base URL is required. Set it per-project or in global Ollama settings.".to_string());
         }
     }
 
     if project.backend == Backend::OpenAiCompatible {
         let oai_config = project.openai_compatible_config.as_ref()
             .ok_or_else(|| "OpenAI Compatible backend selected but no configuration found.".to_string())?;
-        if oai_config.base_url.is_empty() {
-            return Err("OpenAI Compatible base URL is required.".to_string());
+        if oai_config.base_url.is_empty()
+            && settings.global_openai_compatible.base_url.as_deref().map(str::trim).unwrap_or("").is_empty()
+        {
+            return Err("OpenAI Compatible base URL is required. Set it per-project or in global settings.".to_string());
         }
     }
 
@@ -334,6 +338,9 @@ pub async fn start_project_container(
             let needs_recreate = docker::container_needs_recreation(
                 &existing_id,
                 &project,
+                &settings.global_aws,
+                &settings.global_ollama,
+                &settings.global_openai_compatible,
                 settings.global_claude_instructions.as_deref(),
                 &settings.global_custom_env_vars,
                 settings.timezone.as_deref(),
@@ -369,6 +376,8 @@ pub async fn start_project_container(
                     &create_image,
                     aws_config_path.as_deref(),
                     &settings.global_aws,
+                    &settings.global_ollama,
+                    &settings.global_openai_compatible,
                     settings.global_claude_instructions.as_deref(),
                     &settings.global_custom_env_vars,
                     settings.timezone.as_deref(),
@@ -406,6 +415,8 @@ pub async fn start_project_container(
                 &create_image,
                 aws_config_path.as_deref(),
                 &settings.global_aws,
+                &settings.global_ollama,
+                &settings.global_openai_compatible,
                 settings.global_claude_instructions.as_deref(),
                 &settings.global_custom_env_vars,
                 settings.timezone.as_deref(),

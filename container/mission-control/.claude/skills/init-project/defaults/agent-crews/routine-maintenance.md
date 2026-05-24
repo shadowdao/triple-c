@@ -7,7 +7,7 @@ for severity assessment and roundtable moderation.
 ## Crew
 
 ### Inspector
-- **Context**: {project}/
+- **Context**: {target-project}/
 - **Model**: Sonnet
 - **Role**: Performs broad read-only codebase inspection across all applicable
   categories. Runs test suites, linters, type checkers, audit commands, and
@@ -15,7 +15,7 @@ for severity assessment and roundtable moderation.
 - **Actions**: inspect-codebase
 
 ### Security Reviewer
-- **Context**: {project}/
+- **Context**: {target-project}/
 - **Model**: Sonnet
 - **Role**: Performs focused manual security review of authentication flows,
   injection surfaces, secrets handling, CORS/CSP configuration, and data
@@ -24,7 +24,7 @@ for severity assessment and roundtable moderation.
 - **Actions**: review-security
 
 ### CI/CD Reviewer (optional)
-- **Context**: {project}/
+- **Context**: {target-project}/
 - **Model**: Sonnet
 - **Enabled**: false (enable when project has CI/CD pipelines)
 - **Role**: Reviews CI/CD pipeline configuration, build security, deployment
@@ -33,7 +33,7 @@ for severity assessment and roundtable moderation.
 - **Actions**: review-cicd
 
 ### Accessibility Reviewer (optional)
-- **Context**: {project}/
+- **Context**: {target-project}/
 - **Model**: Sonnet
 - **Enabled**: false (enable when project has user-facing UI)
 - **Role**: Reviews codebase for accessibility compliance against WCAG 2.1 AA
@@ -42,7 +42,7 @@ for severity assessment and roundtable moderation.
 - **Actions**: review-accessibility
 
 ### Architect
-- **Context**: {project}/
+- **Context**: {target-project}/
 - **Model**: Opus
 - **Role**: Reviews all reviewer findings alongside debrief context. Assigns
   severity per finding, challenges questionable assessments, moderates
@@ -463,6 +463,7 @@ For each finding, assign one of:
 - Does this finding represent a real risk, or is it noise?
 - Is the severity proportional to the actual impact?
 - Would this compound if left for another cycle?
+- Is the infrastructure or framing this finding pertains to still serving its original purpose, or has it drifted into "maybe-someday" territory?
 - Is this a new discovery or previously acknowledged debt?
 - Do multiple reviewers corroborate the same issue?
 - Are any reviewer assessments questionable — too alarmist or too dismissive?

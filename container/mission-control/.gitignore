@@ -2,6 +2,7 @@
 projects.md
 daily-briefings/
 .claude/settings.local.json
+.mcp.json
 
 # OS files
 .DS_Store
