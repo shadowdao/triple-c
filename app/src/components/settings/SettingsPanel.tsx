@@ -9,6 +9,7 @@ import EnvVarsModal from "../projects/EnvVarsModal";
 import { detectHostTimezone } from "../../lib/tauri-commands";
 import type { EnvVar } from "../../lib/types";
 import Tooltip from "../ui/Tooltip";
+import AccordionSection from "../ui/AccordionSection";
 import WebTerminalSettings from "./WebTerminalSettings";
 import SttSettings from "./SttSettings";
 
@@ -61,153 +62,160 @@ export default function SettingsPanel() {
   };
 
   return (
-    <div className="p-4 space-y-6">
+    <div className="p-4 space-y-3">
       <h2 className="text-xs font-semibold uppercase text-[var(--text-secondary)]">
         Settings
       </h2>
-      <DockerSettings />
-      <AwsSettings />
 
-      {/* Default SSH Key Directory */}
-      <div>
-        <label className="block text-sm font-medium mb-1">Default SSH Key Directory<Tooltip text="Global default SSH key directory. Mounted into containers that don't have a per-project SSH path set." /></label>
-        <p className="text-xs text-[var(--text-secondary)] mb-1.5">
-          Mounted into all containers unless overridden by a per-project setting.
-        </p>
-        <input
-          type="text"
-          value={sshKeyPath}
-          onChange={(e) => setSshKeyPath(e.target.value)}
-          onBlur={async () => {
-            if (appSettings) {
-              await saveSettings({ ...appSettings, default_ssh_key_path: sshKeyPath || null });
-            }
-          }}
-          placeholder="~/.ssh"
-          className="w-full px-2 py-1 text-sm bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:outline-none focus:border-[var(--accent)]"
-        />
-      </div>
-
-      {/* Default Git Name */}
-      <div>
-        <label className="block text-sm font-medium mb-1">Default Git Name<Tooltip text="Sets git user.name inside containers. Per-project Git Name takes precedence." /></label>
-        <input
-          type="text"
-          value={gitName}
-          onChange={(e) => setGitName(e.target.value)}
-          onBlur={async () => {
-            if (appSettings) {
-              await saveSettings({ ...appSettings, default_git_user_name: gitName || null });
-            }
-          }}
-          placeholder="Your Name"
-          className="w-full px-2 py-1 text-sm bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:outline-none focus:border-[var(--accent)]"
-        />
-      </div>
-
-      {/* Default Git Email */}
-      <div>
-        <label className="block text-sm font-medium mb-1">Default Git Email<Tooltip text="Sets git user.email inside containers. Per-project Git Email takes precedence." /></label>
-        <input
-          type="text"
-          value={gitEmail}
-          onChange={(e) => setGitEmail(e.target.value)}
-          onBlur={async () => {
-            if (appSettings) {
-              await saveSettings({ ...appSettings, default_git_user_email: gitEmail || null });
-            }
-          }}
-          placeholder="you@example.com"
-          className="w-full px-2 py-1 text-sm bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:outline-none focus:border-[var(--accent)]"
-        />
-      </div>
-
-      {/* Container Timezone */}
-      <div>
-        <label className="block text-sm font-medium mb-1">Container Timezone<Tooltip text="Sets the timezone inside containers. Affects scheduled task timing and log timestamps." /></label>
-        <p className="text-xs text-[var(--text-secondary)] mb-1.5">
-          Timezone for containers — affects scheduled task timing (IANA format, e.g. America/New_York)
-        </p>
-        <input
-          type="text"
-          value={timezone}
-          onChange={(e) => setTimezone(e.target.value)}
-          onBlur={async () => {
-            if (appSettings) {
-              await saveSettings({ ...appSettings, timezone: timezone || null });
-            }
-          }}
-          placeholder="UTC"
-          className="w-full px-2 py-1 text-sm bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:outline-none focus:border-[var(--accent)]"
-        />
-      </div>
-
-      {/* Global Claude Instructions */}
-      <div>
-        <label className="block text-sm font-medium mb-1">Claude Instructions<Tooltip text="Global instructions applied to all projects. Written to ~/.claude/CLAUDE.md in every container." /></label>
-        <p className="text-xs text-[var(--text-secondary)] mb-1.5">
-          Global instructions applied to all projects (written to ~/.claude/CLAUDE.md in containers)
-        </p>
-        <div className="flex items-center justify-between">
-          <span className="text-xs text-[var(--text-secondary)]">
-            {globalInstructions ? "Configured" : "Not set"}
-          </span>
-          <button
-            onClick={() => setShowInstructionsModal(true)}
-            className="text-xs px-2 py-0.5 text-[var(--accent)] hover:text-[var(--accent-hover)] hover:bg-[var(--bg-primary)] rounded transition-colors"
-          >
-            Edit
-          </button>
+      <AccordionSection id="general" title="General">
+        {/* Container Timezone */}
+        <div>
+          <label className="block text-sm font-medium mb-1">Container Timezone<Tooltip text="Sets the timezone inside containers. Affects scheduled task timing and log timestamps." /></label>
+          <p className="text-xs text-[var(--text-secondary)] mb-1.5">
+            Timezone for containers — affects scheduled task timing (IANA format, e.g. America/New_York)
+          </p>
+          <input
+            type="text"
+            value={timezone}
+            onChange={(e) => setTimezone(e.target.value)}
+            onBlur={async () => {
+              if (appSettings) {
+                await saveSettings({ ...appSettings, timezone: timezone || null });
+              }
+            }}
+            placeholder="UTC"
+            className="w-full px-2 py-1 text-sm bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:outline-none focus:border-[var(--accent)]"
+          />
         </div>
-      </div>
 
-      {/* Global Environment Variables */}
-      <div>
-        <label className="block text-sm font-medium mb-1">Global Environment Variables<Tooltip text="Env vars injected into all containers. Per-project vars with the same key take precedence." /></label>
-        <p className="text-xs text-[var(--text-secondary)] mb-1.5">
-          Applied to all project containers. Per-project variables override global ones with the same key.
-        </p>
-        <div className="flex items-center justify-between">
-          <span className="text-xs text-[var(--text-secondary)]">
-            {globalEnvVars.length > 0 ? `${globalEnvVars.length} variable${globalEnvVars.length === 1 ? "" : "s"}` : "None"}
-          </span>
-          <button
-            onClick={() => setShowEnvVarsModal(true)}
-            className="text-xs px-2 py-0.5 text-[var(--accent)] hover:text-[var(--accent-hover)] hover:bg-[var(--bg-primary)] rounded transition-colors"
-          >
-            Edit
-          </button>
+        {/* Global Claude Instructions */}
+        <div>
+          <label className="block text-sm font-medium mb-1">Claude Instructions<Tooltip text="Global instructions applied to all projects. Written to ~/.claude/CLAUDE.md in every container." /></label>
+          <p className="text-xs text-[var(--text-secondary)] mb-1.5">
+            Global instructions applied to all projects (written to ~/.claude/CLAUDE.md in containers)
+          </p>
+          <div className="flex items-center justify-between">
+            <span className="text-xs text-[var(--text-secondary)]">
+              {globalInstructions ? "Configured" : "Not set"}
+            </span>
+            <button
+              onClick={() => setShowInstructionsModal(true)}
+              className="text-xs px-2 py-0.5 text-[var(--accent)] hover:text-[var(--accent-hover)] hover:bg-[var(--bg-primary)] rounded transition-colors"
+            >
+              Edit
+            </button>
+          </div>
         </div>
-      </div>
 
-      {/* Global Claude Code Settings */}
-      <div>
-        <label className="block text-sm font-medium mb-1">Claude Code Settings<Tooltip text="Global defaults for Claude Code CLI behavior (TUI mode, effort, focus mode, caching, etc.). Per-project settings override these." /></label>
-        <p className="text-xs text-[var(--text-secondary)] mb-1.5">
-          Default Claude Code CLI settings applied to all projects. Per-project settings take precedence.
-        </p>
-        <div className="flex items-center justify-between">
-          <span className="text-xs text-[var(--text-secondary)]">
-            {appSettings?.global_claude_code_settings ? "Configured" : "Using defaults"}
-          </span>
-          <button
-            onClick={() => setShowClaudeCodeSettingsModal(true)}
-            className="text-xs px-2 py-0.5 text-[var(--accent)] hover:text-[var(--accent-hover)] hover:bg-[var(--bg-primary)] rounded transition-colors"
-          >
-            Edit
-          </button>
+        {/* Global Environment Variables */}
+        <div>
+          <label className="block text-sm font-medium mb-1">Global Environment Variables<Tooltip text="Env vars injected into all containers. Per-project vars with the same key take precedence." /></label>
+          <p className="text-xs text-[var(--text-secondary)] mb-1.5">
+            Applied to all project containers. Per-project variables override global ones with the same key.
+          </p>
+          <div className="flex items-center justify-between">
+            <span className="text-xs text-[var(--text-secondary)]">
+              {globalEnvVars.length > 0 ? `${globalEnvVars.length} variable${globalEnvVars.length === 1 ? "" : "s"}` : "None"}
+            </span>
+            <button
+              onClick={() => setShowEnvVarsModal(true)}
+              className="text-xs px-2 py-0.5 text-[var(--accent)] hover:text-[var(--accent-hover)] hover:bg-[var(--bg-primary)] rounded transition-colors"
+            >
+              Edit
+            </button>
+          </div>
         </div>
-      </div>
 
-      {/* Web Terminal */}
-      <WebTerminalSettings />
+        {/* Global Claude Code Settings */}
+        <div>
+          <label className="block text-sm font-medium mb-1">Claude Code Settings<Tooltip text="Global defaults for Claude Code CLI behavior (TUI mode, effort, focus mode, caching, etc.). Per-project settings override these." /></label>
+          <p className="text-xs text-[var(--text-secondary)] mb-1.5">
+            Default Claude Code CLI settings applied to all projects. Per-project settings take precedence.
+          </p>
+          <div className="flex items-center justify-between">
+            <span className="text-xs text-[var(--text-secondary)]">
+              {appSettings?.global_claude_code_settings ? "Configured" : "Using defaults"}
+            </span>
+            <button
+              onClick={() => setShowClaudeCodeSettingsModal(true)}
+              className="text-xs px-2 py-0.5 text-[var(--accent)] hover:text-[var(--accent-hover)] hover:bg-[var(--bg-primary)] rounded transition-colors"
+            >
+              Edit
+            </button>
+          </div>
+        </div>
+      </AccordionSection>
 
-      {/* Speech to Text */}
-      <SttSettings />
+      <AccordionSection id="backends" title="Backends" defaultOpen={false}>
+        <AwsSettings />
+      </AccordionSection>
 
-      {/* Updates section */}
-      <div>
-        <label className="block text-sm font-medium mb-2">Updates<Tooltip text="Check for new versions of the Triple-C app and container image." /></label>
+      <AccordionSection id="container" title="Container" defaultOpen={false}>
+        <DockerSettings />
+      </AccordionSection>
+
+      <AccordionSection id="git-ssh" title="Git / SSH" defaultOpen={false}>
+        {/* Default SSH Key Directory */}
+        <div>
+          <label className="block text-sm font-medium mb-1">Default SSH Key Directory<Tooltip text="Global default SSH key directory. Mounted into containers that don't have a per-project SSH path set." /></label>
+          <p className="text-xs text-[var(--text-secondary)] mb-1.5">
+            Mounted into all containers unless overridden by a per-project setting.
+          </p>
+          <input
+            type="text"
+            value={sshKeyPath}
+            onChange={(e) => setSshKeyPath(e.target.value)}
+            onBlur={async () => {
+              if (appSettings) {
+                await saveSettings({ ...appSettings, default_ssh_key_path: sshKeyPath || null });
+              }
+            }}
+            placeholder="~/.ssh"
+            className="w-full px-2 py-1 text-sm bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:outline-none focus:border-[var(--accent)]"
+          />
+        </div>
+
+        {/* Default Git Name */}
+        <div>
+          <label className="block text-sm font-medium mb-1">Default Git Name<Tooltip text="Sets git user.name inside containers. Per-project Git Name takes precedence." /></label>
+          <input
+            type="text"
+            value={gitName}
+            onChange={(e) => setGitName(e.target.value)}
+            onBlur={async () => {
+              if (appSettings) {
+                await saveSettings({ ...appSettings, default_git_user_name: gitName || null });
+              }
+            }}
+            placeholder="Your Name"
+            className="w-full px-2 py-1 text-sm bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:outline-none focus:border-[var(--accent)]"
+          />
+        </div>
+
+        {/* Default Git Email */}
+        <div>
+          <label className="block text-sm font-medium mb-1">Default Git Email<Tooltip text="Sets git user.email inside containers. Per-project Git Email takes precedence." /></label>
+          <input
+            type="text"
+            value={gitEmail}
+            onChange={(e) => setGitEmail(e.target.value)}
+            onBlur={async () => {
+              if (appSettings) {
+                await saveSettings({ ...appSettings, default_git_user_email: gitEmail || null });
+              }
+            }}
+            placeholder="you@example.com"
+            className="w-full px-2 py-1 text-sm bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:outline-none focus:border-[var(--accent)]"
+          />
+        </div>
+      </AccordionSection>
+
+      <AccordionSection id="tools" title="Tools" defaultOpen={false}>
+        <WebTerminalSettings />
+        <SttSettings />
+      </AccordionSection>
+
+      <AccordionSection id="updates" title="Updates" defaultOpen={false}>
         <div className="space-y-2">
           {appVersion && (
             <p className="text-xs text-[var(--text-secondary)]">
@@ -237,11 +245,11 @@ export default function SettingsPanel() {
           {imageUpdateInfo && (
             <div className="flex items-center gap-2 px-3 py-2 text-xs bg-[var(--bg-primary)] border border-[var(--warning,#f59e0b)] rounded">
               <span className="inline-block w-2 h-2 rounded-full bg-[var(--warning,#f59e0b)]" />
-              <span>A newer container image is available. Re-pull the image in Docker settings above to update.</span>
+              <span>A newer container image is available. Re-pull the image in Container settings above to update.</span>
             </div>
           )}
         </div>
-      </div>
+      </AccordionSection>
 
       {showInstructionsModal && (
         <ClaudeInstructionsModal
