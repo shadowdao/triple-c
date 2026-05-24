@@ -1,6 +1,24 @@
 import { create } from "zustand";
 import type { Project, TerminalSession, AppSettings, UpdateInfo, ImageUpdateInfo, McpServer } from "../lib/types";
 
+const SIDEBAR_COLLAPSED_KEY = "triple-c.sidebar.collapsed";
+
+function loadSidebarCollapsed(): boolean {
+  try {
+    return localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function persistSidebarCollapsed(value: boolean) {
+  try {
+    localStorage.setItem(SIDEBAR_COLLAPSED_KEY, value ? "1" : "0");
+  } catch {
+    // ignore — storage may be unavailable
+  }
+}
+
 interface AppState {
   // Projects
   projects: Project[];
@@ -28,6 +46,9 @@ interface AppState {
   setTerminalHasSelection: (has: boolean) => void;
   sidebarView: "projects" | "mcp" | "settings";
   setSidebarView: (view: "projects" | "mcp" | "settings") => void;
+  sidebarCollapsed: boolean;
+  setSidebarCollapsed: (collapsed: boolean) => void;
+  toggleSidebarCollapsed: () => void;
   dockerAvailable: boolean | null;
   setDockerAvailable: (available: boolean | null) => void;
   imageExists: boolean | null;
@@ -106,6 +127,17 @@ export const useAppState = create<AppState>((set) => ({
   setTerminalHasSelection: (has) => set({ terminalHasSelection: has }),
   sidebarView: "projects",
   setSidebarView: (view) => set({ sidebarView: view }),
+  sidebarCollapsed: loadSidebarCollapsed(),
+  setSidebarCollapsed: (collapsed) => {
+    persistSidebarCollapsed(collapsed);
+    set({ sidebarCollapsed: collapsed });
+  },
+  toggleSidebarCollapsed: () =>
+    set((state) => {
+      const next = !state.sidebarCollapsed;
+      persistSidebarCollapsed(next);
+      return { sidebarCollapsed: next };
+    }),
   dockerAvailable: null,
   setDockerAvailable: (available) => set({ dockerAvailable: available }),
   imageExists: null,

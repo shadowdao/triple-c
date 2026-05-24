@@ -8,6 +8,9 @@ vi.mock("../../store/appState", () => ({
     selector({
       sidebarView: "projects",
       setSidebarView: vi.fn(),
+      sidebarCollapsed: false,
+      setSidebarCollapsed: vi.fn(),
+      toggleSidebarCollapsed: vi.fn(),
     })
   ),
 }));
