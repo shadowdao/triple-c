@@ -37,6 +37,7 @@ export interface Project {
   claude_instructions: string | null;
   enabled_mcp_servers: string[];
   claude_code_settings: ClaudeCodeSettings | null;
+  renamed_session_names: Record<string, string>;
   created_at: string;
   updated_at: string;
 }

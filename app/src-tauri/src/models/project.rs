@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -93,6 +95,9 @@ pub struct Project {
     pub enabled_mcp_servers: Vec<String>,
     #[serde(default)]
     pub claude_code_settings: Option<ClaudeCodeSettings>,
+    /// User-defined display names for terminal tabs, keyed by session id.
+    #[serde(default)]
+    pub renamed_session_names: HashMap<String, String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -217,6 +222,7 @@ impl Project {
             claude_instructions: None,
             enabled_mcp_servers: Vec::new(),
             claude_code_settings: None,
+            renamed_session_names: HashMap::new(),
             created_at: now.clone(),
             updated_at: now,
         }
