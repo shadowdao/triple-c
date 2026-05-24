@@ -116,6 +116,17 @@ export interface GlobalAwsSettings {
   aws_config_path: string | null;
   aws_profile: string | null;
   aws_region: string | null;
+  default_model_id: string | null;
+}
+
+export interface GlobalOllamaSettings {
+  base_url: string | null;
+  default_model_id: string | null;
+}
+
+export interface GlobalOpenAiCompatibleSettings {
+  base_url: string | null;
+  default_model_id: string | null;
 }
 
 export interface AppSettings {
@@ -126,6 +137,8 @@ export interface AppSettings {
   image_source: ImageSource;
   custom_image_name: string | null;
   global_aws: GlobalAwsSettings;
+  global_ollama: GlobalOllamaSettings;
+  global_openai_compatible: GlobalOpenAiCompatibleSettings;
   global_claude_instructions: string | null;
   global_custom_env_vars: EnvVar[];
   auto_check_updates: boolean;

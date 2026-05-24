@@ -32,6 +32,8 @@ pub struct GlobalAwsSettings {
     pub aws_profile: Option<String>,
     #[serde(default)]
     pub aws_region: Option<String>,
+    #[serde(default)]
+    pub default_model_id: Option<String>,
 }
 
 impl Default for GlobalAwsSettings {
@@ -40,8 +42,25 @@ impl Default for GlobalAwsSettings {
             aws_config_path: None,
             aws_profile: None,
             aws_region: None,
+            default_model_id: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GlobalOllamaSettings {
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub default_model_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GlobalOpenAiCompatibleSettings {
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub default_model_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +79,10 @@ pub struct AppSettings {
     pub custom_image_name: Option<String>,
     #[serde(default)]
     pub global_aws: GlobalAwsSettings,
+    #[serde(default)]
+    pub global_ollama: GlobalOllamaSettings,
+    #[serde(default)]
+    pub global_openai_compatible: GlobalOpenAiCompatibleSettings,
     #[serde(default = "default_global_instructions")]
     pub global_claude_instructions: Option<String>,
     #[serde(default)]
@@ -156,6 +179,8 @@ impl Default for AppSettings {
             image_source: ImageSource::default(),
             custom_image_name: None,
             global_aws: GlobalAwsSettings::default(),
+            global_ollama: GlobalOllamaSettings::default(),
+            global_openai_compatible: GlobalOpenAiCompatibleSettings::default(),
             global_claude_instructions: default_global_instructions(),
             global_custom_env_vars: Vec::new(),
             auto_check_updates: true,

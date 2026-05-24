@@ -12,6 +12,7 @@ export default function AwsSettings() {
     aws_config_path: null,
     aws_profile: null,
     aws_region: null,
+    default_model_id: null,
   };
 
   // Load profiles when component mounts or aws_config_path changes
@@ -102,6 +103,18 @@ export default function AwsSettings() {
             value={globalAws.aws_region ?? ""}
             onChange={(e) => handleChange("aws_region", e.target.value)}
             placeholder="e.g., us-east-1"
+            className="w-full px-2 py-1.5 text-xs bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:outline-none focus:border-[var(--accent)]"
+          />
+        </div>
+
+        {/* Default Model ID */}
+        <div>
+          <span className="text-[var(--text-secondary)] text-xs block mb-1">Default Model ID<Tooltip text="Default Bedrock model ID. Used when a Bedrock project doesn't set its own Model ID." /></span>
+          <input
+            type="text"
+            value={globalAws.default_model_id ?? ""}
+            onChange={(e) => handleChange("default_model_id", e.target.value)}
+            placeholder="anthropic.claude-sonnet-4-20250514-v1:0"
             className="w-full px-2 py-1.5 text-xs bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:outline-none focus:border-[var(--accent)]"
           />
         </div>

@@ -1,6 +1,8 @@
 import { useState, useEffect } from "react";
 import DockerSettings from "./DockerSettings";
 import AwsSettings from "./AwsSettings";
+import OllamaSettings from "./OllamaSettings";
+import OpenAiCompatibleSettings from "./OpenAiCompatibleSettings";
 import { useSettings } from "../../hooks/useSettings";
 import { useUpdates } from "../../hooks/useUpdates";
 import ClaudeInstructionsModal from "../projects/ClaudeInstructionsModal";
@@ -148,6 +150,10 @@ export default function SettingsPanel() {
 
       <AccordionSection id="backends" title="Backends" defaultOpen={false}>
         <AwsSettings />
+        <div className="pt-3 border-t border-[var(--border-color)]" />
+        <OllamaSettings />
+        <div className="pt-3 border-t border-[var(--border-color)]" />
+        <OpenAiCompatibleSettings />
       </AccordionSection>
 
       <AccordionSection id="container" title="Container" defaultOpen={false}>
