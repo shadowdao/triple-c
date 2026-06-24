@@ -292,6 +292,16 @@ if ls "$SCHEDULER_DIR/tasks/"*.json >/dev/null 2>&1; then
     echo "entrypoint: restored crontab from persisted tasks"
 fi
 
+# ── Claude Code self-update ──────────────────────────────────────────────────
+# Update the Claude Code CLI to the latest version on container start, before
+# any terminal session launches `claude`. Runs as the claude user (the CLI is
+# installed under /home/claude/.claude/bin). Non-fatal and time-bounded so a
+# slow or offline network never blocks container readiness.
+echo "entrypoint: checking for Claude Code updates..."
+timeout 120 su -s /bin/bash claude -c 'export PATH="/home/claude/.claude/bin:/home/claude/.local/bin:$PATH"; claude update' \
+    && echo "entrypoint: Claude Code is up to date" \
+    || echo "entrypoint: warning — Claude Code update skipped or failed (continuing)"
+
 # ── Stay alive as claude ─────────────────────────────────────────────────────
 echo "Triple-C container ready."
 exec su -s /bin/bash claude -c "exec sleep infinity"

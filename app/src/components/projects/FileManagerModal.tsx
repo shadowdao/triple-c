@@ -70,7 +70,7 @@ export default function FileManagerModal({ projectId, projectName, onClose }: Pr
     >
       <div className="bg-[var(--bg-secondary)] border border-[var(--border-color)] rounded-lg shadow-xl w-[36rem] max-h-[80vh] flex flex-col">
         {/* Header */}
-        <div className="flex items-center justify-between px-4 py-3 border-b border-[var(--border-color)]">
+        <div className="flex items-center justify-between px-4 py-3 border-b border-[var(--border-color)] flex-shrink-0">
           <h2 className="text-sm font-semibold">Files — {projectName}</h2>
           <button
             onClick={onClose}
@@ -177,7 +177,7 @@ export default function FileManagerModal({ projectId, projectName, onClose }: Pr
         </div>
 
         {/* Footer */}
-        <div className="flex items-center justify-between px-4 py-3 border-t border-[var(--border-color)]">
+        <div className="flex items-center justify-between px-4 py-3 border-t border-[var(--border-color)] flex-shrink-0">
           <button
             onClick={uploadFile}
             className="text-xs text-[var(--accent)] hover:text-[var(--accent-hover)] transition-colors"
