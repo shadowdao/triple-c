@@ -428,20 +428,62 @@ jobs:
 
       - name: Upload to Gitea release
         if: gitea.event_name == 'push'
+        shell: powershell
         env:
           TOKEN: ${{ secrets.REGISTRY_TOKEN }}
           COMMIT_SHA: ${{ gitea.sha }}
+          VERSION: ${{ needs.compute-version.outputs.version }}
         run: |
-          set "TAG=v${{ needs.compute-version.outputs.version }}-win"
-          echo Creating release %TAG%...
-          curl -s -X POST -H "Authorization: token %TOKEN%" -H "Content-Type: application/json" -d "{\"tag_name\": \"%TAG%\", \"name\": \"Triple-C v${{ needs.compute-version.outputs.version }} (Windows)\", \"body\": \"Automated build from commit %COMMIT_SHA%\"}" "%GITEA_URL%/api/v1/repos/%REPO%/releases" > release.json
-          for /f "tokens=2 delims=:," %%a in ('findstr /c:"\"id\"" release.json') do set "RELEASE_ID=%%a" & goto :found
-          :found
-          echo Release ID: %RELEASE_ID%
-          for %%f in (artifacts\*) do (
-            echo Uploading %%~nxf...
-            curl -s -X POST -H "Authorization: token %TOKEN%" -H "Content-Type: application/octet-stream" --data-binary "@%%f" "%GITEA_URL%/api/v1/repos/%REPO%/releases/%RELEASE_ID%/assets?name=%%~nxf"
-          )
+          $ErrorActionPreference = "Stop"
+          $tag = "v$env:VERSION-win"
+          $headers = @{ Authorization = "token $env:TOKEN" }
+          $api = "$env:GITEA_URL/api/v1/repos/$env:REPO"
+
+          # Idempotent get-or-create. The old cmd-batch version swallowed
+          # curl errors and parsed the release id with findstr, so a 409 on
+          # a pre-existing tag yielded an empty RELEASE_ID and uploads went to
+          # a malformed .../releases//assets URL while the step still reported
+          # success. Look the release up by tag first; create only on 404.
+          try {
+            $release = Invoke-RestMethod -Method Get -Headers $headers -Uri "$api/releases/tags/$tag"
+            Write-Host "Release $tag already exists, reusing"
+          } catch {
+            if ($_.Exception.Response.StatusCode.value__ -eq 404) {
+              Write-Host "Release $tag not found, creating"
+              $body = @{
+                tag_name = $tag
+                name     = "Triple-C v$env:VERSION (Windows)"
+                body     = "Automated build from commit $env:COMMIT_SHA"
+              } | ConvertTo-Json
+              $release = Invoke-RestMethod -Method Post -Headers $headers `
+                -ContentType "application/json" -Body $body -Uri "$api/releases"
+            } else {
+              throw
+            }
+          }
+
+          $releaseId = $release.id
+          if (-not $releaseId) { throw "Failed to resolve release id for $tag" }
+          Write-Host "Release ID: $releaseId"
+
+          # Upload each artifact. Delete any same-named asset left over from a
+          # partial prior run first, so the upload replaces rather than 409s.
+          $existing = Invoke-RestMethod -Method Get -Headers $headers -Uri "$api/releases/$releaseId/assets"
+          foreach ($file in Get-ChildItem -File -Path artifacts\*) {
+            $name = $file.Name
+            $dupe = $existing | Where-Object { $_.name -eq $name }
+            if ($dupe) {
+              Write-Host "Deleting existing asset $name (id $($dupe.id))"
+              Invoke-RestMethod -Method Delete -Headers $headers -Uri "$api/releases/$releaseId/assets/$($dupe.id)" | Out-Null
+            }
+            Write-Host "Uploading $name..."
+            $uploadUri = "$api/releases/$releaseId/assets?name=$([uri]::EscapeDataString($name))"
+            curl.exe -fsS --retry 5 --retry-all-errors --retry-delay 5 --max-time 600 `
+              -X POST -H "Authorization: token $env:TOKEN" `
+              -H "Content-Type: application/octet-stream" `
+              --data-binary "@$($file.FullName)" $uploadUri
+            if ($LASTEXITCODE -ne 0) { throw "Upload of $name failed (curl exit $LASTEXITCODE)" }
+          }
 
   create-tag:
     runs-on: ubuntu-latest
