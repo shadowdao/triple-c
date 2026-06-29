@@ -7,8 +7,6 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import "@xterm/xterm/css/xterm.css";
 import { useTerminal } from "../../hooks/useTerminal";
 import { useAppState } from "../../store/appState";
-import { useSTT } from "../../hooks/useSTT";
-import SttButton from "./SttButton";
 import { awsSsoRefresh } from "../../lib/tauri-commands";
 import { UrlDetector } from "../../lib/urlDetector";
 import UrlToast from "./UrlToast";
@@ -29,10 +27,8 @@ export default function TerminalView({ sessionId, active }: Props) {
   const detectorRef = useRef<UrlDetector | null>(null);
   const { sendInput, pasteImage, resize, onOutput, onExit } = useTerminal();
   const setTerminalHasSelection = useAppState(s => s.setTerminalHasSelection);
-  const sttEnabled = useAppState(s => s.appSettings?.stt?.enabled);
-  const stt = useSTT(sessionId, sendInput);
-  const sttToggleRef = useRef(stt.toggle);
-  sttToggleRef.current = stt.toggle;
+  const setTerminalAtBottom = useAppState(s => s.setTerminalAtBottom);
+  const setScrollActiveToBottom = useAppState(s => s.setScrollActiveToBottom);
 
   const ssoBufferRef = useRef("");
   const ssoTriggeredRef = useRef(false);
@@ -111,9 +107,10 @@ export default function TerminalView({ sessionId, active }: Props) {
         }
         return false; // prevent xterm from processing this key
       }
-      // Ctrl+Shift+M toggles speech-to-text recording
+      // Ctrl+Shift+M toggles speech-to-text recording (mic lives in the status
+      // bar, bound to the active session; trigger it via the store).
       if (event.type === "keydown" && event.ctrlKey && event.shiftKey && event.key === "M") {
-        sttToggleRef.current();
+        useAppState.getState().sttToggle();
         return false;
       }
       return true;
@@ -319,6 +316,7 @@ export default function TerminalView({ sessionId, active }: Props) {
       try { webglRef.current?.dispose(); } catch { /* may already be disposed */ }
       webglRef.current = null;
       term.dispose();
+      termRef.current = null;
     };
   }, [sessionId]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -393,6 +391,29 @@ export default function TerminalView({ sessionId, active }: Props) {
     }
   }, []);
 
+  // Surface this terminal's scroll state to the status bar's "Jump to Current"
+  // control, but only while it's the active (visible) terminal.
+  useEffect(() => {
+    if (!active) return;
+    setTerminalAtBottom(isAtBottom);
+    setScrollActiveToBottom(handleScrollToBottom);
+  }, [active, isAtBottom, handleScrollToBottom, setTerminalAtBottom, setScrollActiveToBottom]);
+
+  // On unmount, if this was the active terminal, clear the status-bar scroll
+  // state so it doesn't point at a disposed terminal. (Tab switches don't
+  // unmount — the deactivating terminal stays mounted but hidden — so this
+  // only fires when the active session is actually closed.)
+  const activeRef = useRef(active);
+  activeRef.current = active;
+  useEffect(() => {
+    return () => {
+      if (activeRef.current) {
+        setTerminalAtBottom(true);
+        setScrollActiveToBottom(() => {});
+      }
+    };
+  }, [setTerminalAtBottom, setScrollActiveToBottom]);
+
   const writeSelection = useCallback((mode: "trimmed" | "raw") => {
     const term = termRef.current;
     if (!term) return;
@@ -457,23 +478,19 @@ export default function TerminalView({ sessionId, active }: Props) {
       >
         {isAutoFollow ? "▼ Following" : "▽ Paused"}
       </button>
-      {/* STT mic button - bottom left */}
-      {sttEnabled && <SttButton state={stt.state} error={stt.error} onToggle={stt.toggle} onCancel={stt.cancelRecording} />}
-      {/* Jump to Current - bottom right, when scrolled up */}
-      {!isAtBottom && (
-        <button
-          onClick={handleScrollToBottom}
-          className="absolute bottom-4 right-4 z-50 px-3 py-1.5 rounded-md text-xs font-medium bg-[#1f2937] text-[#58a6ff] border border-[#30363d] shadow-lg hover:bg-[#2d3748] transition-colors cursor-pointer"
-        >
-          Jump to Current ↓
-        </button>
-      )}
-      <div
-        ref={containerRef}
-        className="w-full h-full"
-        style={{ padding: "8px 12px 48px 16px" }}
-        onContextMenu={handleContextMenu}
-      />
+      {/* Padding lives on this wrapper, NOT on the xterm host element. xterm's
+          FitAddon measures the host element it's mounted into; padding there
+          causes the grid to overhang and clip the rightmost column / bottom
+          row. The host below fills this wrapper's content box with no padding.
+          Kept to a tight, even gutter so the terminal claims as much area as
+          possible while leaving a little breathing room beside the scrollbar. */}
+      <div className="w-full h-full" style={{ padding: "4px 8px 4px 8px" }}>
+        <div
+          ref={containerRef}
+          className="w-full h-full"
+          onContextMenu={handleContextMenu}
+        />
+      </div>
       {contextMenu && (
         <TerminalContextMenu
           x={contextMenu.x}

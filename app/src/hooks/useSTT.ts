@@ -13,6 +13,11 @@ export function useSTT(sessionId: string, sendInput: (sessionId: string, data: s
   const streamRef = useRef<MediaStream | null>(null);
   const workletRef = useRef<AudioWorkletNode | null>(null);
   const chunksRef = useRef<Int16Array[]>([]);
+  // Pin the transcript to the terminal that was active when recording STARTED.
+  // The hook is bound to the live active session, which can change mid-recording
+  // (the user switches tabs); without this the transcript would land in whatever
+  // tab is active at stop time.
+  const recordingSessionIdRef = useRef(sessionId);
 
   const appSettings = useAppState((s) => s.appSettings);
   const deviceId = appSettings?.default_microphone;
@@ -22,6 +27,7 @@ export function useSTT(sessionId: string, sendInput: (sessionId: string, data: s
     setState("recording");
     setError(null);
     chunksRef.current = [];
+    recordingSessionIdRef.current = sessionId;
 
     try {
       const audioConstraints: MediaTrackConstraints = {
@@ -57,7 +63,7 @@ export function useSTT(sessionId: string, sendInput: (sessionId: string, data: s
       setError(msg);
       setState("error");
     }
-  }, [state, deviceId]);
+  }, [state, deviceId, sessionId]);
 
   const stopRecording = useCallback(async () => {
     if (state !== "recording") return;
@@ -102,7 +108,7 @@ export function useSTT(sessionId: string, sendInput: (sessionId: string, data: s
 
       const text = await commands.transcribeAudio(audioData);
       if (text) {
-        await sendInput(sessionId, text);
+        await sendInput(recordingSessionIdRef.current, text);
       }
       setState("idle");
     } catch (e) {
@@ -112,7 +118,7 @@ export function useSTT(sessionId: string, sendInput: (sessionId: string, data: s
       // Reset to idle after a brief delay so the UI shows the error
       setTimeout(() => setState("idle"), 3000);
     }
-  }, [state, sessionId, sendInput]);
+  }, [state, sendInput]);
 
   const cancelRecording = useCallback(async () => {
     workletRef.current?.disconnect();

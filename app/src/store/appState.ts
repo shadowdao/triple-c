@@ -44,6 +44,16 @@ interface AppState {
   // UI state
   terminalHasSelection: boolean;
   setTerminalHasSelection: (has: boolean) => void;
+  // STT toggle for the active session, registered by App so the terminal's
+  // Ctrl+Shift+M shortcut can trigger the single status-bar mic instance.
+  sttToggle: () => void;
+  setSttToggle: (fn: () => void) => void;
+  // Active terminal scroll state, surfaced so the status bar can host the
+  // "Jump to Current" control. Only the active TerminalView writes these.
+  terminalAtBottom: boolean;
+  setTerminalAtBottom: (v: boolean) => void;
+  scrollActiveToBottom: () => void;
+  setScrollActiveToBottom: (fn: () => void) => void;
   sidebarView: "projects" | "mcp" | "settings";
   setSidebarView: (view: "projects" | "mcp" | "settings") => void;
   sidebarCollapsed: boolean;
@@ -125,6 +135,12 @@ export const useAppState = create<AppState>((set) => ({
   // UI state
   terminalHasSelection: false,
   setTerminalHasSelection: (has) => set({ terminalHasSelection: has }),
+  sttToggle: () => {},
+  setSttToggle: (fn) => set({ sttToggle: fn }),
+  terminalAtBottom: true,
+  setTerminalAtBottom: (v) => set({ terminalAtBottom: v }),
+  scrollActiveToBottom: () => {},
+  setScrollActiveToBottom: (fn) => set({ scrollActiveToBottom: fn }),
   sidebarView: "projects",
   setSidebarView: (view) => set({ sidebarView: view }),
   sidebarCollapsed: loadSidebarCollapsed(),

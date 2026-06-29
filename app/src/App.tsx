@@ -10,6 +10,8 @@ import { useSettings } from "./hooks/useSettings";
 import { useProjects } from "./hooks/useProjects";
 import { useMcpServers } from "./hooks/useMcpServers";
 import { useUpdates } from "./hooks/useUpdates";
+import { useTerminal } from "./hooks/useTerminal";
+import { useSTT } from "./hooks/useSTT";
 import { useAppState } from "./store/appState";
 import { reconcileProjectStatuses } from "./lib/tauri-commands";
 
@@ -19,10 +21,19 @@ export default function App() {
   const { refresh } = useProjects();
   const { refresh: refreshMcp } = useMcpServers();
   const { loadVersion, checkForUpdates, checkImageUpdate, startPeriodicCheck } = useUpdates();
-  const { sessions, activeSessionId, setProjects } = useAppState(
-    useShallow(s => ({ sessions: s.sessions, activeSessionId: s.activeSessionId, setProjects: s.setProjects }))
+  const { sessions, activeSessionId, setProjects, setSttToggle } = useAppState(
+    useShallow(s => ({ sessions: s.sessions, activeSessionId: s.activeSessionId, setProjects: s.setProjects, setSttToggle: s.setSttToggle }))
   );
   const [showInstallDialog, setShowInstallDialog] = useState(false);
+
+  // Single STT instance bound to the active session. The mic lives in the
+  // StatusBar; the terminal's Ctrl+Shift+M shortcut calls stt.toggle via the
+  // store (registered below).
+  const { sendInput } = useTerminal();
+  const stt = useSTT(activeSessionId ?? "", sendInput);
+  useEffect(() => {
+    setSttToggle(stt.toggle);
+  }, [stt.toggle, setSttToggle]);
 
   // Initialize on mount
   useEffect(() => {
@@ -82,7 +93,7 @@ export default function App() {
           )}
         </main>
       </div>
-      <StatusBar />
+      <StatusBar stt={stt} />
       {showInstallDialog && (
         <DockerInstallDialog onClose={() => setShowInstallDialog(false)} />
       )}

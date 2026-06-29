@@ -62,7 +62,15 @@ export default function SttButton({ state, error, onToggle, onCancel }: Props) {
   };
 
   return (
-    <div className="absolute bottom-2 left-2 z-50 flex items-center gap-2">
+    <div className="flex items-center gap-1.5">
+      {state === "recording" && (
+        <span className="text-[#f85149] font-mono">{formatTime(elapsed)}</span>
+      )}
+      {state === "error" && error && (
+        <span className="text-[#f85149] max-w-[180px] truncate" title={error}>
+          {error}
+        </span>
+      )}
       <div className="relative">
         <button
           onClick={handleClick}
@@ -71,44 +79,34 @@ export default function SttButton({ state, error, onToggle, onCancel }: Props) {
           onMouseEnter={() => setHovered(true)}
           onMouseLeave={() => setHovered(false)}
           disabled={state === "transcribing"}
-          className={`w-8 h-8 rounded-full flex items-center justify-center transition-all cursor-pointer ${
+          className={`w-5 h-5 rounded-full flex items-center justify-center transition-all cursor-pointer ${
           state === "recording"
-            ? "bg-[#f85149] text-white shadow-lg animate-pulse"
+            ? "bg-[#f85149] text-white animate-pulse"
             : state === "transcribing"
-              ? "bg-[#1f2937] text-[#58a6ff] border border-[#30363d] opacity-80"
-              : "bg-[#1f2937]/80 text-[#8b949e] border border-[#30363d] hover:text-[#e6edf3] hover:bg-[#2d3748]"
+              ? "text-[#58a6ff] opacity-80"
+              : "text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-secondary)]"
         }`}
         >
           {state === "transcribing" ? (
-            <svg className="w-4 h-4 animate-spin" viewBox="0 0 24 24" fill="none">
+            <svg className="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none">
               <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="2" opacity="0.25" />
               <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
             </svg>
           ) : (
-            <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
+            <svg className="w-3 h-3" viewBox="0 0 24 24" fill="currentColor">
               <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z" />
               <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z" />
             </svg>
           )}
         </button>
         {hovered && state !== "recording" && (
-          <div className="absolute bottom-full left-0 mb-1.5 px-2 py-1 text-[11px] leading-snug text-[#e6edf3] bg-[#21262d] border border-[#30363d] rounded shadow-lg whitespace-nowrap pointer-events-none">
+          <div className="absolute bottom-full right-0 mb-1.5 px-2 py-1 text-[11px] leading-snug text-[#e6edf3] bg-[#21262d] border border-[#30363d] rounded shadow-lg whitespace-nowrap pointer-events-none z-50">
             {state === "transcribing" ? "Transcribing..." : (
               <>Speech to text <kbd className="ml-1 px-1 py-0.5 text-[10px] bg-[#0d1117] border border-[#30363d] rounded font-mono">Ctrl+Shift+M</kbd></>
             )}
           </div>
         )}
       </div>
-      {state === "recording" && (
-        <span className="text-xs text-[#f85149] font-mono bg-[#1f2937] px-2 py-0.5 rounded border border-[#30363d]">
-          {formatTime(elapsed)}
-        </span>
-      )}
-      {state === "error" && error && (
-        <span className="text-xs text-[#f85149] bg-[#1f2937] px-2 py-0.5 rounded border border-[#30363d] max-w-[200px] truncate">
-          {error}
-        </span>
-      )}
     </div>
   );
 }
