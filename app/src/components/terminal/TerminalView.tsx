@@ -316,6 +316,7 @@ export default function TerminalView({ sessionId, active }: Props) {
       try { webglRef.current?.dispose(); } catch { /* may already be disposed */ }
       webglRef.current = null;
       term.dispose();
+      termRef.current = null;
     };
   }, [sessionId]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -398,6 +399,21 @@ export default function TerminalView({ sessionId, active }: Props) {
     setScrollActiveToBottom(handleScrollToBottom);
   }, [active, isAtBottom, handleScrollToBottom, setTerminalAtBottom, setScrollActiveToBottom]);
 
+  // On unmount, if this was the active terminal, clear the status-bar scroll
+  // state so it doesn't point at a disposed terminal. (Tab switches don't
+  // unmount — the deactivating terminal stays mounted but hidden — so this
+  // only fires when the active session is actually closed.)
+  const activeRef = useRef(active);
+  activeRef.current = active;
+  useEffect(() => {
+    return () => {
+      if (activeRef.current) {
+        setTerminalAtBottom(true);
+        setScrollActiveToBottom(() => {});
+      }
+    };
+  }, [setTerminalAtBottom, setScrollActiveToBottom]);
+
   const writeSelection = useCallback((mode: "trimmed" | "raw") => {
     const term = termRef.current;
     if (!term) return;
@@ -466,8 +482,8 @@ export default function TerminalView({ sessionId, active }: Props) {
           FitAddon measures the host element it's mounted into; padding there
           causes the grid to overhang and clip the rightmost column / bottom
           row. The host below fills this wrapper's content box with no padding.
-          Kept tight so the terminal claims as much area as possible; right side
-          leaves a little room beside the scrollbar. */}
+          Kept to a tight, even gutter so the terminal claims as much area as
+          possible while leaving a little breathing room beside the scrollbar. */}
       <div className="w-full h-full" style={{ padding: "4px 8px 4px 8px" }}>
         <div
           ref={containerRef}
