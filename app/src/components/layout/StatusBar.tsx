@@ -1,9 +1,26 @@
 import { useShallow } from "zustand/react/shallow";
 import { useAppState } from "../../store/appState";
+import SttButton from "../terminal/SttButton";
+import type { useSTT } from "../../hooks/useSTT";
 
-export default function StatusBar() {
-  const { projects, sessions, terminalHasSelection } = useAppState(
-    useShallow(s => ({ projects: s.projects, sessions: s.sessions, terminalHasSelection: s.terminalHasSelection }))
+interface Props {
+  stt: ReturnType<typeof useSTT>;
+}
+
+export default function StatusBar({ stt }: Props) {
+  const {
+    projects, sessions, terminalHasSelection, activeSessionId, sttEnabled,
+    terminalAtBottom, scrollActiveToBottom,
+  } = useAppState(
+    useShallow(s => ({
+      projects: s.projects,
+      sessions: s.sessions,
+      terminalHasSelection: s.terminalHasSelection,
+      activeSessionId: s.activeSessionId,
+      sttEnabled: s.appSettings?.stt?.enabled,
+      terminalAtBottom: s.terminalAtBottom,
+      scrollActiveToBottom: s.scrollActiveToBottom,
+    }))
   );
   const running = projects.filter((p) => p.status === "running").length;
 
@@ -28,6 +45,26 @@ export default function StatusBar() {
           </span>
         </>
       )}
+      {/* Right-aligned controls: Jump to Current + STT mic */}
+      <div className="ml-auto flex items-center gap-3 pl-2">
+        {activeSessionId && !terminalAtBottom && (
+          <button
+            onClick={() => scrollActiveToBottom()}
+            className="text-[var(--accent)] hover:text-[var(--accent-hover)] cursor-pointer"
+            title="Scroll the terminal to the latest output"
+          >
+            Jump to Current ↓
+          </button>
+        )}
+        {sttEnabled && activeSessionId && (
+          <SttButton
+            state={stt.state}
+            error={stt.error}
+            onToggle={stt.toggle}
+            onCancel={stt.cancelRecording}
+          />
+        )}
+      </div>
     </div>
   );
 }
