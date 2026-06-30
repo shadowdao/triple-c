@@ -202,6 +202,17 @@ pub async fn upload_host_file_to_terminal(
         return Err(format!("{} is a directory — drop individual files", host_path));
     }
 
+    // Guard against ballooning host RAM: the file is read fully into memory and
+    // then re-packed into an in-memory tar, so cap the size of a dropped file.
+    const MAX_DROP_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
+    if meta.len() > MAX_DROP_BYTES {
+        return Err(format!(
+            "File too large to drop into the terminal ({:.0} MB; limit {} MB). Mount it into the project or use the Files panel instead.",
+            meta.len() as f64 / (1024.0 * 1024.0),
+            MAX_DROP_BYTES / (1024 * 1024)
+        ));
+    }
+
     let data =
         std::fs::read(&host_path).map_err(|e| format!("Failed to read {}: {}", host_path, e))?;
 

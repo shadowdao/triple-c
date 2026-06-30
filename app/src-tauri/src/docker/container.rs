@@ -1163,10 +1163,17 @@ fi
 chmod 600 "$HOME/.aws/credentials""#;
 
     let cmd = vec!["sh".to_string(), "-c".to_string(), script.to_string()];
-    crate::docker::exec::exec_oneshot_env(container_id, cmd, env)
-        .await
-        .map(|_| ())
-        .map_err(|e| format!("Failed to write AWS credentials into container: {}", e))?;
+    let (output, exit_code) =
+        crate::docker::exec::exec_oneshot_env_status(container_id, cmd, env)
+            .await
+            .map_err(|e| format!("Failed to write AWS credentials into container: {}", e))?;
+    if exit_code != 0 {
+        return Err(format!(
+            "Writing AWS credentials into container failed (exit {}): {}",
+            exit_code,
+            output.trim()
+        ));
+    }
 
     log::info!("Wrote Bedrock static credentials into container {}", container_id);
     Ok(())

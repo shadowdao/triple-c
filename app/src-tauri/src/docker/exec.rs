@@ -288,11 +288,27 @@ pub async fn exec_oneshot(container_id: &str, cmd: Vec<String>) -> Result<String
 /// process. Secrets passed this way live only in `/proc/<pid>/environ` (readable
 /// by the same user / root) rather than in the process argv, so they are not
 /// exposed via `ps`.
+///
+/// NOTE: the command's exit code is NOT checked — callers that need to know
+/// whether the command succeeded should use `exec_oneshot_env_status`.
 pub async fn exec_oneshot_env(
     container_id: &str,
     cmd: Vec<String>,
     env: Vec<String>,
 ) -> Result<String, String> {
+    exec_oneshot_env_status(container_id, cmd, env)
+        .await
+        .map(|(output, _exit_code)| output)
+}
+
+/// Like `exec_oneshot_env`, but also returns the command's exit code (0 on
+/// success). The returned string contains both stdout and stderr, interleaved
+/// in arrival order, which is useful for surfacing failure detail.
+pub async fn exec_oneshot_env_status(
+    container_id: &str,
+    cmd: Vec<String>,
+    env: Vec<String>,
+) -> Result<(String, i64), String> {
     let docker = get_docker()?;
 
     let exec = docker
@@ -315,17 +331,27 @@ pub async fn exec_oneshot_env(
         .await
         .map_err(|e| format!("Failed to start exec: {}", e))?;
 
+    let mut combined = String::new();
     match result {
         StartExecResults::Attached { mut output, .. } => {
-            let mut stdout = String::new();
             while let Some(msg) = output.next().await {
                 match msg {
-                    Ok(data) => stdout.push_str(&String::from_utf8_lossy(&data.into_bytes())),
+                    Ok(data) => combined.push_str(&String::from_utf8_lossy(&data.into_bytes())),
                     Err(e) => return Err(format!("Exec output error: {}", e)),
                 }
             }
-            Ok(stdout)
         }
-        StartExecResults::Detached => Err("Exec started in detached mode".to_string()),
+        StartExecResults::Detached => return Err("Exec started in detached mode".to_string()),
     }
+
+    // Exit code is only available after the process has finished (the stream above
+    // has drained), so inspect now.
+    let exit_code = docker
+        .inspect_exec(&exec.id)
+        .await
+        .map_err(|e| format!("Failed to inspect exec: {}", e))?
+        .exit_code
+        .unwrap_or(0);
+
+    Ok((combined, exit_code))
 }

@@ -72,7 +72,10 @@ export default function TerminalView({ sessionId, active }: Props) {
       return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
     };
 
-    const quote = (p: string) => (/\s/.test(p) ? `'${p.replace(/'/g, "'\\''")}'` : p);
+    // Always single-quote: a dropped filename can contain shell metacharacters
+    // ($(), &&, ', spaces) even with no whitespace, and this path is typed into
+    // a live shell. Single-quoting with '\'' escaping neutralizes all of them.
+    const quote = (p: string) => `'${p.replace(/'/g, "'\\''")}'`;
 
     (async () => {
       const un = await getCurrentWebview().onDragDropEvent(async (event) => {

@@ -512,11 +512,6 @@ export default function ProjectCard({ project }: Props) {
               <>
                 <ActionButton onClick={handleStart} disabled={loading} label="Start" />
                 <ActionButton
-                  onClick={handleBackup}
-                  disabled={loading || backingUp || !project.container_id}
-                  label={backingUp ? "Backing up…" : "Backup"}
-                />
-                <ActionButton
                   onClick={async () => {
                     setLoading(true);
                     setError(null);

@@ -155,14 +155,15 @@ pub async fn download_container_file(
 /// Create a `.tar.gz` backup of the container and stream it to a host file.
 /// The archive contains:
 ///   - the workspace (default /workspace), minus regenerable build artifacts
-///     (node_modules, target, .git/objects), at the archive root, and
+///     (node_modules, target), at the archive root, and
 ///   - a sanitized copy of the home config under `home-claude/`: ~/.claude.json
 ///     with secret-bearing keys removed (mcpServers/settings kept) and ~/.claude/
 ///     minus the OAuth `.credentials.json`, so MCP servers, settings and skills
 ///     set up via Claude Code survive a Reset.
-/// Build + gzip happen inside the container so a large workspace isn't streamed
-/// in full. Requires the container to exist (running or stopped). Returns the
-/// number of bytes written.
+/// `.git` is kept in full so the backup faithfully preserves git history,
+/// including unpushed commits. Build + gzip happen inside the container so a
+/// large workspace isn't streamed in full. The container must be RUNNING (the
+/// backup runs via `docker exec`). Returns the number of bytes written.
 #[tauri::command]
 pub async fn download_container_backup(
     project_id: String,
@@ -181,26 +182,44 @@ pub async fn download_container_backup(
         .ok_or_else(|| "No container exists for this project yet — start it first".to_string())?;
 
     let docker = get_docker()?;
+
+    // The backup runs inside the container via `docker exec`, which requires it
+    // to be running. Fail with a clear message rather than a raw Docker error.
+    let running = docker
+        .inspect_container(container_id, None)
+        .await
+        .ok()
+        .and_then(|info| info.state)
+        .and_then(|s| s.running)
+        .unwrap_or(false);
+    if !running {
+        return Err("Start the project before backing up — the backup runs inside the running container.".to_string());
+    }
+
     let path = container_path.unwrap_or_else(|| "/workspace".to_string());
 
     // Stage a sanitized home config, then tar+gzip workspace + staged config to
     // stdout. mktemp/jq output go nowhere near stdout, so the only thing the
     // exec emits on stdout is the archive itself. --ignore-failed-read keeps a
-    // transient unreadable file from aborting the whole backup.
+    // transient unreadable file from aborting the whole backup. If jq can't
+    // parse ~/.claude.json we substitute an empty object — never the raw file —
+    // so secrets can't leak through the sanitization fallback.
     let script = r#"set -e
 STAGE=$(mktemp -d)
 mkdir -p "$STAGE/home-claude"
 if [ -f "$HOME/.claude.json" ]; then
-  jq 'del(.primaryApiKey, .oauthAccount, .customApiKeyResponses)' "$HOME/.claude.json" \
-    > "$STAGE/home-claude/.claude.json" 2>/dev/null \
-    || cp "$HOME/.claude.json" "$STAGE/home-claude/.claude.json"
+  if ! jq 'del(.primaryApiKey, .oauthAccount, .customApiKeyResponses)' "$HOME/.claude.json" \
+       > "$STAGE/home-claude/.claude.json" 2>/dev/null; then
+    echo "warning: could not sanitize .claude.json; omitting it from backup" >&2
+    printf '{}' > "$STAGE/home-claude/.claude.json"
+  fi
 fi
 if [ -d "$HOME/.claude" ]; then
   cp -a "$HOME/.claude" "$STAGE/home-claude/.claude" 2>/dev/null || true
   rm -f "$STAGE/home-claude/.claude/.credentials.json"
 fi
 tar czf - --ignore-failed-read \
-  --exclude='*/node_modules' --exclude='*/target' --exclude='*/.git/objects' \
+  --exclude='*/node_modules' --exclude='*/target' \
   -C "$TC_BACKUP_SRC" . \
   -C "$STAGE" home-claude
 rm -rf "$STAGE""#;
@@ -241,28 +260,56 @@ rm -rf "$STAGE""#;
     let mut writer = std::io::BufWriter::new(file);
     let mut total: u64 = 0;
     let mut stderr_text = String::new();
+    let mut stream_err: Option<String> = None;
 
     while let Some(msg) = output.next().await {
-        match msg.map_err(|e| format!("Backup stream error: {}", e))? {
-            LogOutput::StdOut { message } => {
-                writer
-                    .write_all(&message)
-                    .map_err(|e| format!("Failed to write backup file: {}", e))?;
+        match msg {
+            Ok(LogOutput::StdOut { message }) => {
+                if let Err(e) = writer.write_all(&message) {
+                    stream_err = Some(format!("Failed to write backup file: {}", e));
+                    break;
+                }
                 total += message.len() as u64;
             }
-            LogOutput::StdErr { message } => {
+            Ok(LogOutput::StdErr { message }) => {
                 stderr_text.push_str(&String::from_utf8_lossy(&message));
             }
-            _ => {}
+            Ok(_) => {}
+            Err(e) => {
+                stream_err = Some(format!("Backup stream error: {}", e));
+                break;
+            }
         }
     }
-    writer
-        .flush()
-        .map_err(|e| format!("Failed to finalize backup file: {}", e))?;
+    if stream_err.is_none() {
+        if let Err(e) = writer.flush() {
+            stream_err = Some(format!("Failed to finalize backup file: {}", e));
+        }
+    }
+    drop(writer);
 
-    if total == 0 {
-        let _ = std::fs::remove_file(&host_path);
-        return Err(format!(
+    // The tar pipeline can abort mid-stream (producing a truncated archive) and
+    // still have sent bytes, so a non-zero exit must be treated as failure even
+    // when `total > 0`.
+    let exit_code = docker
+        .inspect_exec(&exec.id)
+        .await
+        .map(|i| i.exit_code.unwrap_or(0))
+        .unwrap_or(0);
+
+    if stream_err.is_none() && exit_code != 0 {
+        stream_err = Some(format!(
+            "Backup command failed (exit {}){}",
+            exit_code,
+            if stderr_text.trim().is_empty() {
+                String::new()
+            } else {
+                format!(": {}", stderr_text.trim())
+            }
+        ));
+    }
+    if stream_err.is_none() && total == 0 {
+        stream_err = Some(format!(
             "Backup produced no data{}",
             if stderr_text.trim().is_empty() {
                 String::new()
@@ -270,6 +317,12 @@ rm -rf "$STAGE""#;
                 format!(": {}", stderr_text.trim())
             }
         ));
+    }
+
+    if let Some(err) = stream_err {
+        // Don't leave a partial/corrupt archive behind.
+        let _ = std::fs::remove_file(&host_path);
+        return Err(err);
     }
 
     log::info!(
