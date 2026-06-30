@@ -344,14 +344,30 @@ pub async fn exec_oneshot_env_status(
         StartExecResults::Detached => return Err("Exec started in detached mode".to_string()),
     }
 
-    // Exit code is only available after the process has finished (the stream above
-    // has drained), so inspect now.
-    let exit_code = docker
-        .inspect_exec(&exec.id)
-        .await
-        .map_err(|e| format!("Failed to inspect exec: {}", e))?
-        .exit_code
-        .unwrap_or(0);
+    // The output stream draining doesn't strictly guarantee inspect_exec has the
+    // final exit_code populated yet, so poll until the exec reports finished.
+    let exit_code = wait_for_exec_exit(&exec.id).await.unwrap_or(0);
 
     Ok((combined, exit_code))
+}
+
+/// Poll `inspect_exec` until the exec reports finished and return its exit code.
+/// Returns `None` if the code can't be determined (inspect error, or the exec
+/// doesn't report finished within ~1s — which shouldn't happen once its output
+/// stream has drained).
+pub async fn wait_for_exec_exit(exec_id: &str) -> Option<i64> {
+    let docker = get_docker().ok()?;
+    for _ in 0..40 {
+        match docker.inspect_exec(exec_id).await {
+            Ok(info) => {
+                if info.running != Some(true) {
+                    // Finished: use the reported code (default 0 if somehow absent).
+                    return Some(info.exit_code.unwrap_or(0));
+                }
+            }
+            Err(_) => return None,
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    None
 }

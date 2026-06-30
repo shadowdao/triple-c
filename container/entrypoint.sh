@@ -231,7 +231,9 @@ if [ -n "$AWS_SSO_AUTH_REFRESH_CMD" ]; then
     chown claude:claude "$CLAUDE_JSON"
     chmod 600 "$CLAUDE_JSON"
     unset AWS_SSO_AUTH_REFRESH_CMD
-elif [ -f "$CLAUDE_JSON" ]; then
+elif [ -f "$CLAUDE_JSON" ] && grep -q '"awsAuthRefresh"' "$CLAUDE_JSON" 2>/dev/null; then
+    # Only rewrite when the key is actually present, to avoid a needless jq
+    # reformat of ~/.claude.json on every start of a non-SSO backend.
     MERGED=$(jq 'del(.awsAuthRefresh)' "$CLAUDE_JSON" 2>/dev/null)
     if [ -n "$MERGED" ]; then
         printf '%s\n' "$MERGED" > "$CLAUDE_JSON"

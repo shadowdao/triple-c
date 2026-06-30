@@ -206,6 +206,7 @@ pub async fn download_container_backup(
     // so secrets can't leak through the sanitization fallback.
     let script = r#"set -e
 STAGE=$(mktemp -d)
+trap 'rm -rf "$STAGE"' EXIT
 mkdir -p "$STAGE/home-claude"
 if [ -f "$HOME/.claude.json" ]; then
   if ! jq 'del(.primaryApiKey, .oauthAccount, .customApiKeyResponses)' "$HOME/.claude.json" \
@@ -221,8 +222,7 @@ fi
 tar czf - --ignore-failed-read \
   --exclude='*/node_modules' --exclude='*/target' \
   -C "$TC_BACKUP_SRC" . \
-  -C "$STAGE" home-claude
-rm -rf "$STAGE""#;
+  -C "$STAGE" home-claude"#;
 
     let cmd = vec!["sh".to_string(), "-c".to_string(), script.to_string()];
 
@@ -291,17 +291,15 @@ rm -rf "$STAGE""#;
 
     // The tar pipeline can abort mid-stream (producing a truncated archive) and
     // still have sent bytes, so a non-zero exit must be treated as failure even
-    // when `total > 0`.
-    let exit_code = docker
-        .inspect_exec(&exec.id)
-        .await
-        .map(|i| i.exit_code.unwrap_or(0))
-        .unwrap_or(0);
+    // when `total > 0`. Poll until the exec actually reports finished so the
+    // exit code is reliably populated; if it can't be determined we fall back to
+    // the `total == 0` check below.
+    let exit_code = crate::docker::exec::wait_for_exec_exit(&exec.id).await;
 
-    if stream_err.is_none() && exit_code != 0 {
+    if stream_err.is_none() && exit_code.is_some_and(|c| c != 0) {
         stream_err = Some(format!(
             "Backup command failed (exit {}){}",
-            exit_code,
+            exit_code.unwrap_or(-1),
             if stderr_text.trim().is_empty() {
                 String::new()
             } else {

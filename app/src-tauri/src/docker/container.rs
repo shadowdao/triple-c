@@ -278,7 +278,7 @@ fn compute_bedrock_fingerprint(project: &Project, global_aws: &GlobalAwsSettings
         // NOTE: the static credential fields (access key / secret / session
         // token) are intentionally NOT part of the fingerprint. They are
         // written to ~/.aws/credentials on every start by
-        // write_bedrock_static_credentials(), so a key rotation should refresh
+        // sync_bedrock_credentials(), so a key rotation should refresh
         // in place rather than force a full container recreation. Region,
         // profile, and bearer token remain env-based and so stay here.
         let parts = vec![
@@ -674,7 +674,7 @@ pub async fn create_container(
                 BedrockAuthMethod::StaticCredentials => {
                     // Static/session credentials are NOT injected as env vars.
                     // They are written to ~/.aws/credentials by
-                    // write_bedrock_static_credentials() on every container
+                    // sync_bedrock_credentials() on every container
                     // start, so rotated/updated keys are picked up without a
                     // full container recreation (and never get baked into the
                     // snapshot image). The empty values set by the
@@ -934,7 +934,19 @@ pub async fn create_container(
         false
     };
 
-    if should_mount_aws || aws_config_path.is_some() {
+    // For static-credential Bedrock, sync_bedrock_credentials() is the sole
+    // owner of ~/.aws/credentials (it rewrites it on every start). Mounting the
+    // host AWS dir would make the entrypoint's `rm -rf ~/.aws; cp -a` race that
+    // write at startup, so we never mount it in that case — the static keys
+    // (+ AWS_REGION env) are self-sufficient and don't need the host config.
+    let is_bedrock_static = project.backend == Backend::Bedrock
+        && project
+            .bedrock_config
+            .as_ref()
+            .map(|b| b.auth_method == BedrockAuthMethod::StaticCredentials)
+            .unwrap_or(false);
+
+    if (should_mount_aws || aws_config_path.is_some()) && !is_bedrock_static {
         let aws_dir = aws_config_path
             .map(|p| std::path::PathBuf::from(p))
             .or_else(|| dirs::home_dir().map(|h| h.join(".aws")));
