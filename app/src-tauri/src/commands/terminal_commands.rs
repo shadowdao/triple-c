@@ -196,7 +196,8 @@ pub async fn upload_host_file_to_terminal(
 ) -> Result<String, String> {
     let container_id = state.exec_manager.get_container_id(&session_id).await?;
 
-    let meta = std::fs::metadata(&host_path)
+    let meta = tokio::fs::metadata(&host_path)
+        .await
         .map_err(|e| format!("Cannot access {}: {}", host_path, e))?;
     if meta.is_dir() {
         return Err(format!("{} is a directory — drop individual files", host_path));
@@ -213,14 +214,23 @@ pub async fn upload_host_file_to_terminal(
         ));
     }
 
-    let data =
-        std::fs::read(&host_path).map_err(|e| format!("Failed to read {}: {}", host_path, e))?;
+    let data = tokio::fs::read(&host_path)
+        .await
+        .map_err(|e| format!("Failed to read {}: {}", host_path, e))?;
 
     let base = std::path::Path::new(&host_path)
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "dropped-file".to_string());
+
+    // Ensure the destination directory exists rather than relying on Docker's
+    // archive extractor to create the parent for the uploaded tar entry.
+    crate::docker::exec::exec_oneshot(
+        &container_id,
+        vec!["mkdir".to_string(), "-p".to_string(), "/tmp/triple-c-drops".to_string()],
+    )
+    .await?;
 
     let file_name = format!("triple-c-drops/{}", base);
     state

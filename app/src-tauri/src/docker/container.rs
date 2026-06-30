@@ -1097,36 +1097,61 @@ pub fn get_snapshot_image_name(project: &Project) -> String {
     format!("triple-c-snapshot-{}:latest", project.id)
 }
 
-/// Write Bedrock static/session credentials into the running container's
-/// ~/.aws/credentials file. Called on every container start (not just creation)
-/// so rotated keys or refreshed session tokens are picked up without recreating
-/// the container. Credentials are passed via the exec environment (not argv) and
-/// the file is written with 0600 permissions. No-op unless the project uses
-/// Bedrock with static-credential auth.
-pub async fn write_bedrock_static_credentials(
+/// Keep the container's `~/.aws/credentials` in sync with the project's Bedrock
+/// auth on every container start:
+///   - **Bedrock + static credentials**: (re)write `~/.aws/credentials` from the
+///     latest keychain values and drop a stale `~/.aws/config` left by a prior
+///     profile/SSO session, so rotated keys are picked up without recreating the
+///     container.
+///   - **Any other backend / auth method**: remove a stale `~/.aws/credentials`
+///     written by a previous static-credential session, so the secrets don't
+///     linger unused in the persistent home volume after switching away.
+///
+/// Both cleanups are skipped when `/tmp/.host-aws` is mounted (a global
+/// `aws_config_path` is configured), since the entrypoint already refreshes
+/// `~/.aws` from the host on every start in that case.
+pub async fn sync_bedrock_credentials(
     container_id: &str,
     project: &Project,
 ) -> Result<(), String> {
-    if project.backend != Backend::Bedrock {
-        return Ok(());
-    }
-    let bedrock = match project.bedrock_config {
-        Some(ref b) if b.auth_method == BedrockAuthMethod::StaticCredentials => b,
-        _ => return Ok(()),
+    let static_bedrock = if project.backend == Backend::Bedrock {
+        project
+            .bedrock_config
+            .as_ref()
+            .filter(|b| b.auth_method == BedrockAuthMethod::StaticCredentials)
+    } else {
+        None
     };
 
-    let key_id = match bedrock.aws_access_key_id.as_deref() {
-        Some(k) if !k.is_empty() => k,
+    let bedrock = match static_bedrock {
+        Some(b) if b.aws_access_key_id.as_deref().is_some_and(|k| !k.is_empty()) => b,
         _ => {
-            log::warn!("Bedrock static auth selected but no AWS access key id is set");
+            // Not static-credential Bedrock (or static selected but no key set):
+            // remove a stale credentials file from a previous static session.
+            if matches!(static_bedrock, Some(_)) {
+                log::warn!("Bedrock static auth selected but no AWS access key id is set");
+            }
+            let script = r#"if [ ! -d /tmp/.host-aws ]; then rm -f "$HOME/.aws/credentials"; fi"#;
+            let cmd = vec!["sh".to_string(), "-c".to_string(), script.to_string()];
+            let env = vec!["HOME=/home/claude".to_string()];
+            if let Err(e) = crate::docker::exec::exec_oneshot_env(container_id, cmd, env).await {
+                log::warn!(
+                    "Failed to clear stale AWS credentials in container {}: {}",
+                    container_id,
+                    e
+                );
+            }
             return Ok(());
         }
     };
+
+    let key_id = bedrock.aws_access_key_id.as_deref().unwrap_or("");
     let secret = bedrock.aws_secret_access_key.as_deref().unwrap_or("");
 
     // Pass secrets via the exec environment, then have the shell write them to
     // the file. This keeps them out of the process argv (visible via `ps`).
     let mut env = vec![
+        "HOME=/home/claude".to_string(),
         format!("TC_AWS_KEY_ID={}", key_id),
         format!("TC_AWS_SECRET={}", secret),
     ];

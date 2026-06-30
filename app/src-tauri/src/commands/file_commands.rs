@@ -254,10 +254,11 @@ rm -rf "$STAGE""#;
         StartExecResults::Detached => return Err("Backup exec started detached".to_string()),
     };
 
-    use std::io::Write;
-    let file =
-        std::fs::File::create(&host_path).map_err(|e| format!("Failed to create backup file: {}", e))?;
-    let mut writer = std::io::BufWriter::new(file);
+    use tokio::io::AsyncWriteExt;
+    let file = tokio::fs::File::create(&host_path)
+        .await
+        .map_err(|e| format!("Failed to create backup file: {}", e))?;
+    let mut writer = tokio::io::BufWriter::new(file);
     let mut total: u64 = 0;
     let mut stderr_text = String::new();
     let mut stream_err: Option<String> = None;
@@ -265,7 +266,7 @@ rm -rf "$STAGE""#;
     while let Some(msg) = output.next().await {
         match msg {
             Ok(LogOutput::StdOut { message }) => {
-                if let Err(e) = writer.write_all(&message) {
+                if let Err(e) = writer.write_all(&message).await {
                     stream_err = Some(format!("Failed to write backup file: {}", e));
                     break;
                 }
@@ -282,7 +283,7 @@ rm -rf "$STAGE""#;
         }
     }
     if stream_err.is_none() {
-        if let Err(e) = writer.flush() {
+        if let Err(e) = writer.flush().await {
             stream_err = Some(format!("Failed to finalize backup file: {}", e));
         }
     }
@@ -321,7 +322,7 @@ rm -rf "$STAGE""#;
 
     if let Some(err) = stream_err {
         // Don't leave a partial/corrupt archive behind.
-        let _ = std::fs::remove_file(&host_path);
+        let _ = tokio::fs::remove_file(&host_path).await;
         return Err(err);
     }
 

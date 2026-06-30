@@ -196,7 +196,7 @@ export default function ProjectCard({ project }: Props) {
       setError(null);
       const bytes = await commands.downloadContainerBackup(project.id, hostPath);
       const mb = (bytes / (1024 * 1024)).toFixed(1);
-      setProgressMsg(`Backup saved (${mb} MB)`);
+      setProgressMsg(`Backup saved (${mb} MB). Note: includes MCP/config — may contain MCP API keys. Keep it private.`);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -531,7 +531,12 @@ export default function ProjectCard({ project }: Props) {
                 <ActionButton onClick={handleOpenTerminal} disabled={loading} label="Terminal" accent />
                 <ActionButton onClick={handleOpenBashShell} disabled={loading} label="Shell" />
                 <ActionButton onClick={() => setShowFileManager(true)} disabled={loading} label="Files" />
-                <ActionButton onClick={handleBackup} disabled={loading || backingUp} label={backingUp ? "Backing up…" : "Backup"} />
+                <ActionButton
+                  onClick={handleBackup}
+                  disabled={loading || backingUp}
+                  label={backingUp ? "Backing up…" : "Backup"}
+                  title="Downloads /workspace plus a sanitized home config (MCP servers, settings, skills). OAuth tokens are excluded, but MCP server configs may embed their own API keys/tokens — keep the archive private."
+                />
               </>
             ) : (
               <>
@@ -1221,12 +1226,14 @@ function ActionButton({
   label,
   accent,
   danger,
+  title,
 }: {
   onClick: (e?: React.MouseEvent) => void;
   disabled: boolean;
   label: string;
   accent?: boolean;
   danger?: boolean;
+  title?: string;
 }) {
   let color = "text-[var(--text-secondary)] hover:text-[var(--text-primary)]";
   if (accent) color = "text-[var(--accent)] hover:text-[var(--accent-hover)]";
@@ -1236,6 +1243,7 @@ function ActionButton({
     <button
       onClick={(e) => { e.stopPropagation(); onClick(e); }}
       disabled={disabled}
+      title={title}
       className={`text-xs px-2 py-0.5 rounded transition-colors disabled:opacity-50 ${color} hover:bg-[var(--bg-primary)]`}
     >
       {label}

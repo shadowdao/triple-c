@@ -432,11 +432,11 @@ pub async fn start_project_container(
             new_id
         };
 
-        // Refresh Bedrock static/session credentials on every start so rotated
-        // keys are picked up without a full container recreation. No-op for
-        // other backends / auth methods.
-        if let Err(e) = docker::write_bedrock_static_credentials(&container_id, &project).await {
-            log::warn!("Failed to refresh AWS credentials for project {}: {}", project.id, e);
+        // Sync Bedrock credentials on every start: refresh static/session creds
+        // so rotated keys are picked up without a full container recreation, and
+        // clear stale creds when the project no longer uses static-cred Bedrock.
+        if let Err(e) = docker::sync_bedrock_credentials(&container_id, &project).await {
+            log::warn!("Failed to sync AWS credentials for project {}: {}", project.id, e);
         }
 
         Ok(container_id)
