@@ -203,8 +203,8 @@ pub async fn upload_host_file_to_terminal(
         return Err(format!("{} is a directory — drop individual files", host_path));
     }
 
-    // Guard against ballooning host RAM: the file is read fully into memory and
-    // then re-packed into an in-memory tar, so cap the size of a dropped file.
+    // Guard against ballooning host RAM: the file is packed into an in-memory
+    // tar before upload, so cap the size of a dropped file.
     const MAX_DROP_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
     if meta.len() > MAX_DROP_BYTES {
         return Err(format!(
@@ -213,10 +213,6 @@ pub async fn upload_host_file_to_terminal(
             MAX_DROP_BYTES / (1024 * 1024)
         ));
     }
-
-    let data = tokio::fs::read(&host_path)
-        .await
-        .map_err(|e| format!("Failed to read {}: {}", host_path, e))?;
 
     let base = std::path::Path::new(&host_path)
         .file_name()
@@ -233,10 +229,7 @@ pub async fn upload_host_file_to_terminal(
     .await?;
 
     let file_name = format!("triple-c-drops/{}", base);
-    state
-        .exec_manager
-        .write_file_to_container(&container_id, &file_name, &data)
-        .await
+    crate::docker::exec::upload_host_file_to_container(&container_id, &host_path, &file_name).await
 }
 
 #[tauri::command]

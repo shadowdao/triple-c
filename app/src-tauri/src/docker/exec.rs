@@ -279,6 +279,63 @@ impl ExecSessionManager {
     }
 }
 
+/// Upload a host file into the container's `/tmp` under `dest_name`, building the
+/// tar archive by streaming from the file inside a blocking task. Unlike reading
+/// the whole file into a `Vec` and then handing it to `write_file_to_container`
+/// (which holds two full-size copies — the data and the tar), this keeps only
+/// the single tar buffer, and the synchronous file IO runs off the async worker.
+/// Returns the in-container path (`/tmp/<dest_name>`).
+pub async fn upload_host_file_to_container(
+    container_id: &str,
+    host_path: &str,
+    dest_name: &str,
+) -> Result<String, String> {
+    let host_path = host_path.to_string();
+    let dest_name = dest_name.to_string();
+    let dest_for_blk = dest_name.clone();
+
+    let tar_buf = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+        let mut file = std::fs::File::open(&host_path)
+            .map_err(|e| format!("Failed to read {}: {}", host_path, e))?;
+        let size = file
+            .metadata()
+            .map_err(|e| format!("Failed to stat {}: {}", host_path, e))?
+            .len();
+        let mut tar_buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_buf);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(size);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, &dest_for_blk, &mut file)
+                .map_err(|e| format!("Failed to create tar entry: {}", e))?;
+            builder
+                .finish()
+                .map_err(|e| format!("Failed to finalize tar: {}", e))?;
+        }
+        Ok(tar_buf)
+    })
+    .await
+    .map_err(|e| format!("Upload task panicked: {}", e))??;
+
+    let docker = get_docker()?;
+    docker
+        .upload_to_container(
+            container_id,
+            Some(UploadToContainerOptions {
+                path: "/tmp".to_string(),
+                ..Default::default()
+            }),
+            tar_buf.into(),
+        )
+        .await
+        .map_err(|e| format!("Failed to upload file to container: {}", e))?;
+
+    Ok(format!("/tmp/{}", dest_name))
+}
+
 /// Run a one-shot (non-interactive) exec command in a container and collect stdout.
 pub async fn exec_oneshot(container_id: &str, cmd: Vec<String>) -> Result<String, String> {
     exec_oneshot_env(container_id, cmd, Vec::new()).await

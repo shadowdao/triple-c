@@ -57,15 +57,18 @@ export default function TerminalView({ sessionId, active }: Props) {
   // in-container paths typed into the prompt so Claude Code can read them.
   // Tauri intercepts OS file drops at the webview level, so we use
   // onDragDropEvent (HTML5 ondrop on the element wouldn't expose file paths).
-  // The listener is window-wide, so we guard on `active` + a hit-test against
-  // this terminal's bounds to ignore drops meant for another pane.
+  // The listener is window-wide, so we route purely by a hit-test against this
+  // terminal's bounds: the pane the drop lands on handles it. Inactive panes are
+  // `display:none` (zero-size rect) so they never match — this works for the
+  // current tabbed layout and would also do the right thing with split panes.
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     let cancelled = false;
 
     const insideThisTerminal = (pos: { x: number; y: number }): boolean => {
       const rect = containerRef.current?.getBoundingClientRect();
-      if (!rect) return false;
+      // A hidden (display:none) pane has a zero-size rect — never a drop target.
+      if (!rect || rect.width === 0 || rect.height === 0) return false;
       const dpr = window.devicePixelRatio || 1;
       const x = pos.x / dpr;
       const y = pos.y / dpr;
@@ -80,7 +83,6 @@ export default function TerminalView({ sessionId, active }: Props) {
     (async () => {
       const un = await getCurrentWebview().onDragDropEvent(async (event) => {
         if (event.payload.type !== "drop") return;
-        if (!activeRef.current) return;
         if (!insideThisTerminal(event.payload.position)) return;
 
         const paths = event.payload.paths ?? [];
