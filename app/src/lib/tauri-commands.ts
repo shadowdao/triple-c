@@ -55,6 +55,8 @@ export const closeTerminalSession = (sessionId: string) =>
   invoke<void>("close_terminal_session", { sessionId });
 export const pasteImageToTerminal = (sessionId: string, imageData: number[]) =>
   invoke<string>("paste_image_to_terminal", { sessionId, imageData });
+export const uploadHostFileToTerminal = (sessionId: string, hostPath: string) =>
+  invoke<string>("upload_host_file_to_terminal", { sessionId, hostPath });
 export const startAudioBridge = (sessionId: string) =>
   invoke<void>("start_audio_bridge", { sessionId });
 export const sendAudioData = (sessionId: string, data: number[]) =>

@@ -183,6 +183,41 @@ pub async fn paste_image_to_terminal(
         .await
 }
 
+/// Copy a host file (e.g. dragged onto the terminal) into the container so
+/// Claude Code can read it, and return the in-container path. Mirrors the
+/// image-paste flow: the file is placed under /tmp/triple-c-drops/ keeping its
+/// original name. Returns an error for paths that aren't readable regular files
+/// (e.g. a dropped directory).
+#[tauri::command]
+pub async fn upload_host_file_to_terminal(
+    session_id: String,
+    host_path: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let container_id = state.exec_manager.get_container_id(&session_id).await?;
+
+    let meta = std::fs::metadata(&host_path)
+        .map_err(|e| format!("Cannot access {}: {}", host_path, e))?;
+    if meta.is_dir() {
+        return Err(format!("{} is a directory — drop individual files", host_path));
+    }
+
+    let data =
+        std::fs::read(&host_path).map_err(|e| format!("Failed to read {}: {}", host_path, e))?;
+
+    let base = std::path::Path::new(&host_path)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "dropped-file".to_string());
+
+    let file_name = format!("triple-c-drops/{}", base);
+    state
+        .exec_manager
+        .write_file_to_container(&container_id, &file_name, &data)
+        .await
+}
+
 #[tauri::command]
 pub async fn start_audio_bridge(
     session_id: String,
