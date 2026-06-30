@@ -152,10 +152,17 @@ pub async fn download_container_file(
     Ok(())
 }
 
-/// Create a `.tar.gz` backup of the container's /workspace and stream it to a
-/// host file. Regenerable build artifacts (node_modules, target, .git/objects)
-/// are excluded so the archive stays restore-sized. Requires the container to
-/// exist (it can be stopped or running). Returns the number of bytes written.
+/// Create a `.tar.gz` backup of the container and stream it to a host file.
+/// The archive contains:
+///   - the workspace (default /workspace), minus regenerable build artifacts
+///     (node_modules, target, .git/objects), at the archive root, and
+///   - a sanitized copy of the home config under `home-claude/`: ~/.claude.json
+///     with secret-bearing keys removed (mcpServers/settings kept) and ~/.claude/
+///     minus the OAuth `.credentials.json`, so MCP servers, settings and skills
+///     set up via Claude Code survive a Reset.
+/// Build + gzip happen inside the container so a large workspace isn't streamed
+/// in full. Requires the container to exist (running or stopped). Returns the
+/// number of bytes written.
 #[tauri::command]
 pub async fn download_container_backup(
     project_id: String,
@@ -176,22 +183,29 @@ pub async fn download_container_backup(
     let docker = get_docker()?;
     let path = container_path.unwrap_or_else(|| "/workspace".to_string());
 
-    // Build + gzip the archive inside the container (excludes happen there, so a
-    // 16 GB workspace doesn't get streamed in full), then pipe stdout to the
-    // chosen host file. --ignore-failed-read keeps a transient unreadable file
-    // from aborting the whole backup.
-    let cmd = vec![
-        "tar".to_string(),
-        "czf".to_string(),
-        "-".to_string(),
-        "--ignore-failed-read".to_string(),
-        "--exclude=*/node_modules".to_string(),
-        "--exclude=*/target".to_string(),
-        "--exclude=*/.git/objects".to_string(),
-        "-C".to_string(),
-        path,
-        ".".to_string(),
-    ];
+    // Stage a sanitized home config, then tar+gzip workspace + staged config to
+    // stdout. mktemp/jq output go nowhere near stdout, so the only thing the
+    // exec emits on stdout is the archive itself. --ignore-failed-read keeps a
+    // transient unreadable file from aborting the whole backup.
+    let script = r#"set -e
+STAGE=$(mktemp -d)
+mkdir -p "$STAGE/home-claude"
+if [ -f "$HOME/.claude.json" ]; then
+  jq 'del(.primaryApiKey, .oauthAccount, .customApiKeyResponses)' "$HOME/.claude.json" \
+    > "$STAGE/home-claude/.claude.json" 2>/dev/null \
+    || cp "$HOME/.claude.json" "$STAGE/home-claude/.claude.json"
+fi
+if [ -d "$HOME/.claude" ]; then
+  cp -a "$HOME/.claude" "$STAGE/home-claude/.claude" 2>/dev/null || true
+  rm -f "$STAGE/home-claude/.claude/.credentials.json"
+fi
+tar czf - --ignore-failed-read \
+  --exclude='*/node_modules' --exclude='*/target' --exclude='*/.git/objects' \
+  -C "$TC_BACKUP_SRC" . \
+  -C "$STAGE" home-claude
+rm -rf "$STAGE""#;
+
+    let cmd = vec!["sh".to_string(), "-c".to_string(), script.to_string()];
 
     let exec = docker
         .create_exec(
@@ -200,6 +214,10 @@ pub async fn download_container_backup(
                 attach_stdout: Some(true),
                 attach_stderr: Some(true),
                 cmd: Some(cmd),
+                env: Some(vec![
+                    "HOME=/home/claude".to_string(),
+                    format!("TC_BACKUP_SRC={}", path),
+                ]),
                 user: Some("claude".to_string()),
                 ..Default::default()
             },
