@@ -196,7 +196,11 @@ export default function ProjectCard({ project }: Props) {
       setError(null);
       const bytes = await commands.downloadContainerBackup(project.id, hostPath);
       const mb = (bytes / (1024 * 1024)).toFixed(1);
-      setProgressMsg(`Backup saved (${mb} MB). Note: includes MCP/config — may contain MCP API keys. Keep it private.`);
+      const msg = `Backup saved (${mb} MB). Note: includes MCP/config — may contain MCP API keys. Keep it private.`;
+      setProgressMsg(msg);
+      // Auto-clear so the transient confirmation doesn't linger in the card
+      // status; guard against clobbering a newer message (e.g. a later op).
+      setTimeout(() => setProgressMsg((prev) => (prev === msg ? null : prev)), 8000);
     } catch (e) {
       setError(String(e));
     } finally {

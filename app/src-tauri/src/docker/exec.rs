@@ -279,11 +279,11 @@ impl ExecSessionManager {
     }
 }
 
-/// Upload a host file into the container's `/tmp` under `dest_name`, building the
-/// tar archive by streaming from the file inside a blocking task. Unlike reading
-/// the whole file into a `Vec` and then handing it to `write_file_to_container`
-/// (which holds two full-size copies — the data and the tar), this keeps only
-/// the single tar buffer, and the synchronous file IO runs off the async worker.
+/// Upload a host file into the container's `/tmp` under `dest_name`. The file is
+/// read and packed into the tar inside a blocking task, so the synchronous IO
+/// runs off the async worker. The tar's declared entry size is taken from the
+/// bytes actually read (not a separate `stat`), so a file changing size between
+/// a size check and the read can't desync the header and corrupt the archive.
 /// Returns the in-container path (`/tmp/<dest_name>`).
 pub async fn upload_host_file_to_container(
     container_id: &str,
@@ -295,21 +295,18 @@ pub async fn upload_host_file_to_container(
     let dest_for_blk = dest_name.clone();
 
     let tar_buf = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
-        let mut file = std::fs::File::open(&host_path)
+        let data = std::fs::read(&host_path)
             .map_err(|e| format!("Failed to read {}: {}", host_path, e))?;
-        let size = file
-            .metadata()
-            .map_err(|e| format!("Failed to stat {}: {}", host_path, e))?
-            .len();
-        let mut tar_buf = Vec::new();
+        let mut tar_buf = Vec::with_capacity(data.len() + 1024);
         {
             let mut builder = tar::Builder::new(&mut tar_buf);
             let mut header = tar::Header::new_gnu();
-            header.set_size(size);
+            // Size comes from the bytes in hand, so header and payload can't disagree.
+            header.set_size(data.len() as u64);
             header.set_mode(0o644);
             header.set_cksum();
             builder
-                .append_data(&mut header, &dest_for_blk, &mut file)
+                .append_data(&mut header, &dest_for_blk, &data[..])
                 .map_err(|e| format!("Failed to create tar entry: {}", e))?;
             builder
                 .finish()
