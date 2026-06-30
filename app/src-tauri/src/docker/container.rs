@@ -275,12 +275,15 @@ fn compute_bedrock_fingerprint(project: &Project, global_aws: &GlobalAwsSettings
             bedrock.model_id.as_deref(),
             global_aws.default_model_id.as_deref(),
         ).unwrap_or("").to_string();
+        // NOTE: the static credential fields (access key / secret / session
+        // token) are intentionally NOT part of the fingerprint. They are
+        // written to ~/.aws/credentials on every start by
+        // write_bedrock_static_credentials(), so a key rotation should refresh
+        // in place rather than force a full container recreation. Region,
+        // profile, and bearer token remain env-based and so stay here.
         let parts = vec![
             format!("{:?}", bedrock.auth_method),
             bedrock.aws_region.clone(),
-            bedrock.aws_access_key_id.as_deref().unwrap_or("").to_string(),
-            bedrock.aws_secret_access_key.as_deref().unwrap_or("").to_string(),
-            bedrock.aws_session_token.as_deref().unwrap_or("").to_string(),
             bedrock.aws_profile.as_deref().unwrap_or("").to_string(),
             bedrock.aws_bearer_token.as_deref().unwrap_or("").to_string(),
             effective_model,
@@ -669,15 +672,14 @@ pub async fn create_container(
 
             match bedrock.auth_method {
                 BedrockAuthMethod::StaticCredentials => {
-                    if let Some(ref key_id) = bedrock.aws_access_key_id {
-                        env_vars.push(format!("AWS_ACCESS_KEY_ID={}", key_id));
-                    }
-                    if let Some(ref secret) = bedrock.aws_secret_access_key {
-                        env_vars.push(format!("AWS_SECRET_ACCESS_KEY={}", secret));
-                    }
-                    if let Some(ref token) = bedrock.aws_session_token {
-                        env_vars.push(format!("AWS_SESSION_TOKEN={}", token));
-                    }
+                    // Static/session credentials are NOT injected as env vars.
+                    // They are written to ~/.aws/credentials by
+                    // write_bedrock_static_credentials() on every container
+                    // start, so rotated/updated keys are picked up without a
+                    // full container recreation (and never get baked into the
+                    // snapshot image). The empty values set by the
+                    // MANAGED_AUTH_KEYS neutralization pass below are ignored by
+                    // the AWS SDK, which falls through to the credentials file.
                 }
                 BedrockAuthMethod::Profile => {
                     // Per-project profile overrides global
@@ -752,6 +754,41 @@ pub async fn create_container(
             ) {
                 env_vars.push(format!("ANTHROPIC_MODEL={}", model));
             }
+        }
+    }
+
+    // ── Neutralize stale backend auth env vars ──────────────────────────────
+    // When a project switches backends (e.g. Bedrock → Anthropic) the container
+    // is recreated *from a snapshot image* committed off the previous container.
+    // `docker commit` always bakes the previous container's full ENV into that
+    // image, and the commit API cannot strip it. So any auth var set under the
+    // old backend (e.g. CLAUDE_CODE_USE_BEDROCK=1, AWS_*) survives in the image
+    // ENV and stays active unless we explicitly override it at create time.
+    // Create-time env takes precedence over image ENV, so we set every managed
+    // auth key the *current* backend did NOT set to an empty value, clearing the
+    // stale baked-in one.
+    const MANAGED_AUTH_KEYS: &[&str] = &[
+        "CLAUDE_CODE_USE_BEDROCK",
+        "AWS_REGION",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_PROFILE",
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "AWS_SSO_AUTH_REFRESH_CMD",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_MODEL",
+        "DISABLE_PROMPT_CACHING",
+        "ANTHROPIC_BEDROCK_SERVICE_TIER",
+    ];
+    let already_set: std::collections::HashSet<String> = env_vars
+        .iter()
+        .filter_map(|e| e.split('=').next().map(|k| k.to_string()))
+        .collect();
+    for key in MANAGED_AUTH_KEYS {
+        if !already_set.contains(*key) {
+            env_vars.push(format!("{}=", key));
         }
     }
 
@@ -1060,10 +1097,92 @@ pub fn get_snapshot_image_name(project: &Project) -> String {
     format!("triple-c-snapshot-{}:latest", project.id)
 }
 
+/// Write Bedrock static/session credentials into the running container's
+/// ~/.aws/credentials file. Called on every container start (not just creation)
+/// so rotated keys or refreshed session tokens are picked up without recreating
+/// the container. Credentials are passed via the exec environment (not argv) and
+/// the file is written with 0600 permissions. No-op unless the project uses
+/// Bedrock with static-credential auth.
+pub async fn write_bedrock_static_credentials(
+    container_id: &str,
+    project: &Project,
+) -> Result<(), String> {
+    if project.backend != Backend::Bedrock {
+        return Ok(());
+    }
+    let bedrock = match project.bedrock_config {
+        Some(ref b) if b.auth_method == BedrockAuthMethod::StaticCredentials => b,
+        _ => return Ok(()),
+    };
+
+    let key_id = match bedrock.aws_access_key_id.as_deref() {
+        Some(k) if !k.is_empty() => k,
+        _ => {
+            log::warn!("Bedrock static auth selected but no AWS access key id is set");
+            return Ok(());
+        }
+    };
+    let secret = bedrock.aws_secret_access_key.as_deref().unwrap_or("");
+
+    // Pass secrets via the exec environment, then have the shell write them to
+    // the file. This keeps them out of the process argv (visible via `ps`).
+    let mut env = vec![
+        format!("TC_AWS_KEY_ID={}", key_id),
+        format!("TC_AWS_SECRET={}", secret),
+    ];
+    if let Some(token) = bedrock.aws_session_token.as_deref() {
+        if !token.is_empty() {
+            env.push(format!("TC_AWS_TOKEN={}", token));
+        }
+    }
+
+    // umask 077 + explicit chmod guarantees 0600. The session-token line is only
+    // emitted when the variable is non-empty.
+    //
+    // We also remove a stale ~/.aws/config left over from a previous
+    // profile/SSO session on this project (the home volume persists across
+    // backend switches), so its sso_session/profile settings don't shadow the
+    // static [default] credentials. This is skipped when /tmp/.host-aws is
+    // mounted (a global aws_config_path is configured) — in that case the
+    // entrypoint already refreshes ~/.aws from the host on every start and the
+    // config is intentional.
+    let script = r#"set -e
+umask 077
+mkdir -p "$HOME/.aws"
+if [ ! -d /tmp/.host-aws ] && [ -f "$HOME/.aws/config" ]; then
+  rm -f "$HOME/.aws/config"
+fi
+{
+  printf '[default]\n'
+  printf 'aws_access_key_id=%s\n' "$TC_AWS_KEY_ID"
+  printf 'aws_secret_access_key=%s\n' "$TC_AWS_SECRET"
+  if [ -n "${TC_AWS_TOKEN:-}" ]; then
+    printf 'aws_session_token=%s\n' "$TC_AWS_TOKEN"
+  fi
+} > "$HOME/.aws/credentials"
+chmod 600 "$HOME/.aws/credentials""#;
+
+    let cmd = vec!["sh".to_string(), "-c".to_string(), script.to_string()];
+    crate::docker::exec::exec_oneshot_env(container_id, cmd, env)
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("Failed to write AWS credentials into container: {}", e))?;
+
+    log::info!("Wrote Bedrock static credentials into container {}", container_id);
+    Ok(())
+}
+
 /// Commit the container's filesystem to a snapshot image so that system-level
 /// changes (apt/pip/npm installs, ~/.claude.json, etc.) survive container
-/// removal. The Config is left empty so that secrets injected as env vars are
-/// NOT baked into the image.
+/// removal.
+///
+/// NOTE: `docker commit` always bakes the *running container's* full ENV into
+/// the resulting image — passing an empty Config here does NOT strip it, and
+/// the commit API gives no way to remove env vars. As a result auth vars (e.g.
+/// CLAUDE_CODE_USE_BEDROCK, AWS_*) are present in this snapshot image's ENV.
+/// `create_container` defends against that by explicitly overriding every
+/// managed auth key for the active backend (see MANAGED_AUTH_KEYS), so a
+/// backend switch does not inherit the previous backend's stale credentials.
 pub async fn commit_container_snapshot(container_id: &str, project: &Project) -> Result<(), String> {
     let docker = get_docker()?;
     let image_name = get_snapshot_image_name(project);

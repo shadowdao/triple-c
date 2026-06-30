@@ -281,6 +281,18 @@ impl ExecSessionManager {
 
 /// Run a one-shot (non-interactive) exec command in a container and collect stdout.
 pub async fn exec_oneshot(container_id: &str, cmd: Vec<String>) -> Result<String, String> {
+    exec_oneshot_env(container_id, cmd, Vec::new()).await
+}
+
+/// Like `exec_oneshot`, but passes additional environment variables to the exec
+/// process. Secrets passed this way live only in `/proc/<pid>/environ` (readable
+/// by the same user / root) rather than in the process argv, so they are not
+/// exposed via `ps`.
+pub async fn exec_oneshot_env(
+    container_id: &str,
+    cmd: Vec<String>,
+    env: Vec<String>,
+) -> Result<String, String> {
     let docker = get_docker()?;
 
     let exec = docker
@@ -290,6 +302,7 @@ pub async fn exec_oneshot(container_id: &str, cmd: Vec<String>) -> Result<String
                 attach_stdout: Some(true),
                 attach_stderr: Some(true),
                 cmd: Some(cmd),
+                env: if env.is_empty() { None } else { Some(env) },
                 user: Some("claude".to_string()),
                 ..Default::default()
             },
