@@ -7,7 +7,8 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import "@xterm/xterm/css/xterm.css";
 import { useTerminal } from "../../hooks/useTerminal";
 import { useAppState } from "../../store/appState";
-import { awsSsoRefresh } from "../../lib/tauri-commands";
+import { awsSsoRefresh, uploadHostFileToTerminal } from "../../lib/tauri-commands";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { UrlDetector } from "../../lib/urlDetector";
 import UrlToast from "./UrlToast";
 import { trimSelection } from "./trimSelection";
@@ -46,6 +47,72 @@ export default function TerminalView({ sessionId, active }: Props) {
   // actions (mouse wheel up), not by xterm scroll events during writes.
   const autoFollowRef = useRef(true);
   const lastUserScrollTimeRef = useRef(0);
+
+  // Keep latest `active` readable inside long-lived listeners (drag-drop below,
+  // and the unmount-cleanup effect further down).
+  const activeRef = useRef(active);
+  activeRef.current = active;
+
+  // File drag-and-drop: dropped files are copied into the container and their
+  // in-container paths typed into the prompt so Claude Code can read them.
+  // Tauri intercepts OS file drops at the webview level, so we use
+  // onDragDropEvent (HTML5 ondrop on the element wouldn't expose file paths).
+  // The listener is window-wide, so we route purely by a hit-test against this
+  // terminal's bounds: the pane the drop lands on handles it. Inactive panes are
+  // `display:none` (zero-size rect) so they never match — this works for the
+  // current tabbed layout and would also do the right thing with split panes.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+
+    const insideThisTerminal = (pos: { x: number; y: number }): boolean => {
+      const rect = containerRef.current?.getBoundingClientRect();
+      // A hidden (display:none) pane has a zero-size rect — never a drop target.
+      if (!rect || rect.width === 0 || rect.height === 0) return false;
+      const dpr = window.devicePixelRatio || 1;
+      const x = pos.x / dpr;
+      const y = pos.y / dpr;
+      return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+    };
+
+    // Always single-quote: a dropped filename can contain shell metacharacters
+    // ($(), &&, ', spaces) even with no whitespace, and this path is typed into
+    // a live shell. Single-quoting with '\'' escaping neutralizes all of them.
+    const quote = (p: string) => `'${p.replace(/'/g, "'\\''")}'`;
+
+    (async () => {
+      const un = await getCurrentWebview().onDragDropEvent(async (event) => {
+        if (event.payload.type !== "drop") return;
+        if (!insideThisTerminal(event.payload.position)) return;
+
+        const paths = event.payload.paths ?? [];
+        if (paths.length === 0) return;
+
+        setImagePasteMsg(`Adding ${paths.length} file${paths.length > 1 ? "s" : ""}…`);
+        const containerPaths: string[] = [];
+        for (const p of paths) {
+          try {
+            containerPaths.push(await uploadHostFileToTerminal(sessionId, p));
+          } catch (err) {
+            console.error("File drop upload failed for", p, err);
+          }
+        }
+        if (containerPaths.length === 0) {
+          setImagePasteMsg("File drop failed");
+          return;
+        }
+        sendInput(sessionId, containerPaths.map(quote).join(" ") + " ");
+        setImagePasteMsg(`Added ${containerPaths.length} file path${containerPaths.length > 1 ? "s" : ""}`);
+      });
+      if (cancelled) un();
+      else unlisten = un;
+    })();
+
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [sessionId, sendInput]);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -403,8 +470,6 @@ export default function TerminalView({ sessionId, active }: Props) {
   // state so it doesn't point at a disposed terminal. (Tab switches don't
   // unmount — the deactivating terminal stays mounted but hidden — so this
   // only fires when the active session is actually closed.)
-  const activeRef = useRef(active);
-  activeRef.current = active;
   useEffect(() => {
     return () => {
       if (activeRef.current) {

@@ -183,6 +183,55 @@ pub async fn paste_image_to_terminal(
         .await
 }
 
+/// Copy a host file (e.g. dragged onto the terminal) into the container so
+/// Claude Code can read it, and return the in-container path. Mirrors the
+/// image-paste flow: the file is placed under /tmp/triple-c-drops/ keeping its
+/// original name. Returns an error for paths that aren't readable regular files
+/// (e.g. a dropped directory).
+#[tauri::command]
+pub async fn upload_host_file_to_terminal(
+    session_id: String,
+    host_path: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let container_id = state.exec_manager.get_container_id(&session_id).await?;
+
+    let meta = tokio::fs::metadata(&host_path)
+        .await
+        .map_err(|e| format!("Cannot access {}: {}", host_path, e))?;
+    if meta.is_dir() {
+        return Err(format!("{} is a directory — drop individual files", host_path));
+    }
+
+    // Guard against ballooning host RAM: the file is packed into an in-memory
+    // tar before upload, so cap the size of a dropped file.
+    const MAX_DROP_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
+    if meta.len() > MAX_DROP_BYTES {
+        return Err(format!(
+            "File too large to drop into the terminal ({:.0} MB; limit {} MB). Mount it into the project or use the Files panel instead.",
+            meta.len() as f64 / (1024.0 * 1024.0),
+            MAX_DROP_BYTES / (1024 * 1024)
+        ));
+    }
+
+    let base = std::path::Path::new(&host_path)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "dropped-file".to_string());
+
+    // Ensure the destination directory exists rather than relying on Docker's
+    // archive extractor to create the parent for the uploaded tar entry.
+    crate::docker::exec::exec_oneshot(
+        &container_id,
+        vec!["mkdir".to_string(), "-p".to_string(), "/tmp/triple-c-drops".to_string()],
+    )
+    .await?;
+
+    let file_name = format!("triple-c-drops/{}", base);
+    crate::docker::exec::upload_host_file_to_container(&container_id, &host_path, &file_name).await
+}
+
 #[tauri::command]
 pub async fn start_audio_bridge(
     session_id: String,

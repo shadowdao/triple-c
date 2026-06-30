@@ -1,4 +1,5 @@
-use bollard::container::{DownloadFromContainerOptions, UploadToContainerOptions};
+use bollard::container::{DownloadFromContainerOptions, LogOutput, UploadToContainerOptions};
+use bollard::exec::{CreateExecOptions, StartExecResults};
 use futures_util::StreamExt;
 use serde::Serialize;
 use tauri::State;
@@ -149,6 +150,187 @@ pub async fn download_container_file(
     }
 
     Ok(())
+}
+
+/// Create a `.tar.gz` backup of the container and stream it to a host file.
+/// The archive contains:
+///   - the workspace (default /workspace), minus regenerable build artifacts
+///     (node_modules, target), at the archive root, and
+///   - a sanitized copy of the home config under `home-claude/`: ~/.claude.json
+///     with secret-bearing keys removed (mcpServers/settings kept) and ~/.claude/
+///     minus the OAuth `.credentials.json`, so MCP servers, settings and skills
+///     set up via Claude Code survive a Reset.
+/// `.git` is kept in full so the backup faithfully preserves git history,
+/// including unpushed commits. Build + gzip happen inside the container so a
+/// large workspace isn't streamed in full. The container must be RUNNING (the
+/// backup runs via `docker exec`). Returns the number of bytes written.
+#[tauri::command]
+pub async fn download_container_backup(
+    project_id: String,
+    host_path: String,
+    container_path: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<u64, String> {
+    let project = state
+        .projects_store
+        .get(&project_id)
+        .ok_or_else(|| format!("Project {} not found", project_id))?;
+
+    let container_id = project
+        .container_id
+        .as_ref()
+        .ok_or_else(|| "No container exists for this project yet — start it first".to_string())?;
+
+    let docker = get_docker()?;
+
+    // The backup runs inside the container via `docker exec`, which requires it
+    // to be running. Fail with a clear message rather than a raw Docker error.
+    let running = docker
+        .inspect_container(container_id, None)
+        .await
+        .ok()
+        .and_then(|info| info.state)
+        .and_then(|s| s.running)
+        .unwrap_or(false);
+    if !running {
+        return Err("Start the project before backing up — the backup runs inside the running container.".to_string());
+    }
+
+    let path = container_path.unwrap_or_else(|| "/workspace".to_string());
+
+    // Stage a sanitized home config, then tar+gzip workspace + staged config to
+    // stdout. mktemp/jq output go nowhere near stdout, so the only thing the
+    // exec emits on stdout is the archive itself. --ignore-failed-read keeps a
+    // transient unreadable file from aborting the whole backup. If jq can't
+    // parse ~/.claude.json we substitute an empty object — never the raw file —
+    // so secrets can't leak through the sanitization fallback.
+    let script = r#"set -e
+STAGE=$(mktemp -d)
+trap 'rm -rf "$STAGE"' EXIT
+mkdir -p "$STAGE/home-claude"
+if [ -f "$HOME/.claude.json" ]; then
+  if ! jq 'del(.primaryApiKey, .oauthAccount, .customApiKeyResponses)' "$HOME/.claude.json" \
+       > "$STAGE/home-claude/.claude.json" 2>/dev/null; then
+    echo "warning: could not sanitize .claude.json; omitting it from backup" >&2
+    printf '{}' > "$STAGE/home-claude/.claude.json"
+  fi
+fi
+if [ -d "$HOME/.claude" ]; then
+  cp -a "$HOME/.claude" "$STAGE/home-claude/.claude" 2>/dev/null || true
+  rm -f "$STAGE/home-claude/.claude/.credentials.json"
+fi
+tar czf - --ignore-failed-read \
+  --exclude='*/node_modules' --exclude='*/target' \
+  -C "$TC_BACKUP_SRC" . \
+  -C "$STAGE" home-claude"#;
+
+    let cmd = vec!["sh".to_string(), "-c".to_string(), script.to_string()];
+
+    let exec = docker
+        .create_exec(
+            container_id,
+            CreateExecOptions {
+                attach_stdout: Some(true),
+                attach_stderr: Some(true),
+                cmd: Some(cmd),
+                env: Some(vec![
+                    "HOME=/home/claude".to_string(),
+                    format!("TC_BACKUP_SRC={}", path),
+                ]),
+                user: Some("claude".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|e| format!("Failed to create backup exec: {}", e))?;
+
+    let result = docker
+        .start_exec(&exec.id, None)
+        .await
+        .map_err(|e| format!("Failed to start backup exec: {}", e))?;
+
+    let mut output = match result {
+        StartExecResults::Attached { output, .. } => output,
+        StartExecResults::Detached => return Err("Backup exec started detached".to_string()),
+    };
+
+    use tokio::io::AsyncWriteExt;
+    let file = tokio::fs::File::create(&host_path)
+        .await
+        .map_err(|e| format!("Failed to create backup file: {}", e))?;
+    let mut writer = tokio::io::BufWriter::new(file);
+    let mut total: u64 = 0;
+    let mut stderr_text = String::new();
+    let mut stream_err: Option<String> = None;
+
+    while let Some(msg) = output.next().await {
+        match msg {
+            Ok(LogOutput::StdOut { message }) => {
+                if let Err(e) = writer.write_all(&message).await {
+                    stream_err = Some(format!("Failed to write backup file: {}", e));
+                    break;
+                }
+                total += message.len() as u64;
+            }
+            Ok(LogOutput::StdErr { message }) => {
+                stderr_text.push_str(&String::from_utf8_lossy(&message));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                stream_err = Some(format!("Backup stream error: {}", e));
+                break;
+            }
+        }
+    }
+    if stream_err.is_none() {
+        if let Err(e) = writer.flush().await {
+            stream_err = Some(format!("Failed to finalize backup file: {}", e));
+        }
+    }
+    drop(writer);
+
+    // The tar pipeline can abort mid-stream (producing a truncated archive) and
+    // still have sent bytes, so a non-zero exit must be treated as failure even
+    // when `total > 0`. Poll until the exec actually reports finished so the
+    // exit code is reliably populated; if it can't be determined we fall back to
+    // the `total == 0` check below.
+    let exit_code = crate::docker::exec::wait_for_exec_exit(&exec.id).await;
+
+    if stream_err.is_none() && exit_code.is_some_and(|c| c != 0) {
+        stream_err = Some(format!(
+            "Backup command failed (exit {}){}",
+            exit_code.unwrap_or(-1),
+            if stderr_text.trim().is_empty() {
+                String::new()
+            } else {
+                format!(": {}", stderr_text.trim())
+            }
+        ));
+    }
+    if stream_err.is_none() && total == 0 {
+        stream_err = Some(format!(
+            "Backup produced no data{}",
+            if stderr_text.trim().is_empty() {
+                String::new()
+            } else {
+                format!(": {}", stderr_text.trim())
+            }
+        ));
+    }
+
+    if let Some(err) = stream_err {
+        // Don't leave a partial/corrupt archive behind.
+        let _ = tokio::fs::remove_file(&host_path).await;
+        return Err(err);
+    }
+
+    log::info!(
+        "Wrote {} byte backup for project {} to {}",
+        total,
+        project_id,
+        host_path
+    );
+    Ok(total)
 }
 
 #[tauri::command]

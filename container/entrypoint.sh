@@ -212,10 +212,14 @@ if [ -n "$CLAUDE_CODE_SETTINGS_JSON" ]; then
 fi
 
 # ── AWS SSO auth refresh command ──────────────────────────────────────────────
-# When set, inject awsAuthRefresh into ~/.claude.json so Claude Code calls
-# triple-c-sso-refresh when AWS credentials expire mid-session.
+# When set (Bedrock + profile/SSO auth), inject awsAuthRefresh into
+# ~/.claude.json so Claude Code calls triple-c-sso-refresh when AWS credentials
+# expire mid-session. When NOT set, strip any awsAuthRefresh left behind by a
+# previous Bedrock-profile session — ~/.claude.json lives in the persisted home
+# volume, so without this the container keeps trying to run the SSO refresh even
+# after switching to a non-SSO backend (Anthropic/Ollama) or to static creds.
+CLAUDE_JSON="/home/claude/.claude.json"
 if [ -n "$AWS_SSO_AUTH_REFRESH_CMD" ]; then
-    CLAUDE_JSON="/home/claude/.claude.json"
     if [ -f "$CLAUDE_JSON" ]; then
         MERGED=$(jq --arg cmd "$AWS_SSO_AUTH_REFRESH_CMD" '.awsAuthRefresh = $cmd' "$CLAUDE_JSON" 2>/dev/null)
         if [ -n "$MERGED" ]; then
@@ -227,6 +231,15 @@ if [ -n "$AWS_SSO_AUTH_REFRESH_CMD" ]; then
     chown claude:claude "$CLAUDE_JSON"
     chmod 600 "$CLAUDE_JSON"
     unset AWS_SSO_AUTH_REFRESH_CMD
+elif [ -f "$CLAUDE_JSON" ] && grep -q '"awsAuthRefresh"' "$CLAUDE_JSON" 2>/dev/null; then
+    # Only rewrite when the key is actually present, to avoid a needless jq
+    # reformat of ~/.claude.json on every start of a non-SSO backend.
+    MERGED=$(jq 'del(.awsAuthRefresh)' "$CLAUDE_JSON" 2>/dev/null)
+    if [ -n "$MERGED" ]; then
+        printf '%s\n' "$MERGED" > "$CLAUDE_JSON"
+        chown claude:claude "$CLAUDE_JSON"
+        chmod 600 "$CLAUDE_JSON"
+    fi
 fi
 
 # ── Docker socket permissions ────────────────────────────────────────────────

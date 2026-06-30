@@ -279,8 +279,90 @@ impl ExecSessionManager {
     }
 }
 
+/// Upload a host file into the container's `/tmp` under `dest_name`. The file is
+/// read and packed into the tar inside a blocking task, so the synchronous IO
+/// runs off the async worker. The tar's declared entry size is taken from the
+/// bytes actually read (not a separate `stat`), so a file changing size between
+/// a size check and the read can't desync the header and corrupt the archive.
+/// Returns the in-container path (`/tmp/<dest_name>`).
+pub async fn upload_host_file_to_container(
+    container_id: &str,
+    host_path: &str,
+    dest_name: &str,
+) -> Result<String, String> {
+    let host_path = host_path.to_string();
+    let dest_name = dest_name.to_string();
+    let dest_for_blk = dest_name.clone();
+
+    let tar_buf = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+        let data = std::fs::read(&host_path)
+            .map_err(|e| format!("Failed to read {}: {}", host_path, e))?;
+        let mut tar_buf = Vec::with_capacity(data.len() + 1024);
+        {
+            let mut builder = tar::Builder::new(&mut tar_buf);
+            let mut header = tar::Header::new_gnu();
+            // Size comes from the bytes in hand, so header and payload can't disagree.
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, &dest_for_blk, &data[..])
+                .map_err(|e| format!("Failed to create tar entry: {}", e))?;
+            builder
+                .finish()
+                .map_err(|e| format!("Failed to finalize tar: {}", e))?;
+        }
+        Ok(tar_buf)
+    })
+    .await
+    .map_err(|e| format!("Upload task panicked: {}", e))??;
+
+    let docker = get_docker()?;
+    docker
+        .upload_to_container(
+            container_id,
+            Some(UploadToContainerOptions {
+                path: "/tmp".to_string(),
+                ..Default::default()
+            }),
+            tar_buf.into(),
+        )
+        .await
+        .map_err(|e| format!("Failed to upload file to container: {}", e))?;
+
+    Ok(format!("/tmp/{}", dest_name))
+}
+
 /// Run a one-shot (non-interactive) exec command in a container and collect stdout.
 pub async fn exec_oneshot(container_id: &str, cmd: Vec<String>) -> Result<String, String> {
+    exec_oneshot_env(container_id, cmd, Vec::new()).await
+}
+
+/// Like `exec_oneshot`, but passes additional environment variables to the exec
+/// process. Secrets passed this way live only in `/proc/<pid>/environ` (readable
+/// by the same user / root) rather than in the process argv, so they are not
+/// exposed via `ps`.
+///
+/// NOTE: the command's exit code is NOT checked — callers that need to know
+/// whether the command succeeded should use `exec_oneshot_env_status`.
+pub async fn exec_oneshot_env(
+    container_id: &str,
+    cmd: Vec<String>,
+    env: Vec<String>,
+) -> Result<String, String> {
+    exec_oneshot_env_status(container_id, cmd, env)
+        .await
+        .map(|(output, _exit_code)| output)
+}
+
+/// Like `exec_oneshot_env`, but also returns the command's exit code (0 on
+/// success). The returned string contains both stdout and stderr, interleaved
+/// in arrival order, which is useful for surfacing failure detail.
+pub async fn exec_oneshot_env_status(
+    container_id: &str,
+    cmd: Vec<String>,
+    env: Vec<String>,
+) -> Result<(String, i64), String> {
     let docker = get_docker()?;
 
     let exec = docker
@@ -290,6 +372,7 @@ pub async fn exec_oneshot(container_id: &str, cmd: Vec<String>) -> Result<String
                 attach_stdout: Some(true),
                 attach_stderr: Some(true),
                 cmd: Some(cmd),
+                env: if env.is_empty() { None } else { Some(env) },
                 user: Some("claude".to_string()),
                 ..Default::default()
             },
@@ -302,17 +385,43 @@ pub async fn exec_oneshot(container_id: &str, cmd: Vec<String>) -> Result<String
         .await
         .map_err(|e| format!("Failed to start exec: {}", e))?;
 
+    let mut combined = String::new();
     match result {
         StartExecResults::Attached { mut output, .. } => {
-            let mut stdout = String::new();
             while let Some(msg) = output.next().await {
                 match msg {
-                    Ok(data) => stdout.push_str(&String::from_utf8_lossy(&data.into_bytes())),
+                    Ok(data) => combined.push_str(&String::from_utf8_lossy(&data.into_bytes())),
                     Err(e) => return Err(format!("Exec output error: {}", e)),
                 }
             }
-            Ok(stdout)
         }
-        StartExecResults::Detached => Err("Exec started in detached mode".to_string()),
+        StartExecResults::Detached => return Err("Exec started in detached mode".to_string()),
     }
+
+    // The output stream draining doesn't strictly guarantee inspect_exec has the
+    // final exit_code populated yet, so poll until the exec reports finished.
+    let exit_code = wait_for_exec_exit(&exec.id).await.unwrap_or(0);
+
+    Ok((combined, exit_code))
+}
+
+/// Poll `inspect_exec` until the exec reports finished and return its exit code.
+/// Returns `None` if the code can't be determined (inspect error, or the exec
+/// doesn't report finished within ~1s — which shouldn't happen once its output
+/// stream has drained).
+pub async fn wait_for_exec_exit(exec_id: &str) -> Option<i64> {
+    let docker = get_docker().ok()?;
+    for _ in 0..40 {
+        match docker.inspect_exec(exec_id).await {
+            Ok(info) => {
+                if info.running != Some(true) {
+                    // Finished: use the reported code (default 0 if somehow absent).
+                    return Some(info.exit_code.unwrap_or(0));
+                }
+            }
+            Err(_) => return None,
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    None
 }

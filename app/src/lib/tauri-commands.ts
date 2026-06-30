@@ -55,6 +55,8 @@ export const closeTerminalSession = (sessionId: string) =>
   invoke<void>("close_terminal_session", { sessionId });
 export const pasteImageToTerminal = (sessionId: string, imageData: number[]) =>
   invoke<string>("paste_image_to_terminal", { sessionId, imageData });
+export const uploadHostFileToTerminal = (sessionId: string, hostPath: string) =>
+  invoke<string>("upload_host_file_to_terminal", { sessionId, hostPath });
 export const startAudioBridge = (sessionId: string) =>
   invoke<void>("start_audio_bridge", { sessionId });
 export const sendAudioData = (sessionId: string, data: number[]) =>
@@ -76,6 +78,8 @@ export const listContainerFiles = (projectId: string, path: string) =>
   invoke<FileEntry[]>("list_container_files", { projectId, path });
 export const downloadContainerFile = (projectId: string, containerPath: string, hostPath: string) =>
   invoke<void>("download_container_file", { projectId, containerPath, hostPath });
+export const downloadContainerBackup = (projectId: string, hostPath: string, containerPath?: string) =>
+  invoke<number>("download_container_backup", { projectId, hostPath, containerPath });
 export const uploadFileToContainer = (projectId: string, hostPath: string, containerDir: string) =>
   invoke<void>("upload_file_to_container", { projectId, hostPath, containerDir });
 

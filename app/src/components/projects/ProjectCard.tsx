@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
+import * as commands from "../../lib/tauri-commands";
 import { listen } from "@tauri-apps/api/event";
 import type { Project, ProjectPath, Backend, BedrockConfig, BedrockAuthMethod, OllamaConfig, OpenAiCompatibleConfig } from "../../lib/types";
 import { useProjects } from "../../hooks/useProjects";
@@ -37,6 +38,7 @@ export default function ProjectCard({ project }: Props) {
   const [activeOperation, setActiveOperation] = useState<"starting" | "stopping" | "resetting" | null>(null);
   const [operationCompleted, setOperationCompleted] = useState(false);
   const [showRemoveModal, setShowRemoveModal] = useState(false);
+  const [backingUp, setBackingUp] = useState(false);
   const [isEditingName, setIsEditingName] = useState(false);
   const [editName, setEditName] = useState(project.name);
   const isSelected = selectedProjectId === project.id;
@@ -174,6 +176,35 @@ export default function ProjectCard({ project }: Props) {
       await stop(project.id);
     } catch (e) {
       setError(String(e));
+    }
+  };
+
+  const handleBackup = async () => {
+    if (!project.container_id) {
+      setError("Start the project at least once before backing up.");
+      return;
+    }
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+    const safeName = project.name.replace(/[^a-zA-Z0-9_-]+/g, "_");
+    try {
+      const hostPath = await save({
+        defaultPath: `${safeName}-backup-${stamp}.tar.gz`,
+        filters: [{ name: "Gzipped tarball", extensions: ["tar.gz"] }],
+      });
+      if (!hostPath) return;
+      setBackingUp(true);
+      setError(null);
+      const bytes = await commands.downloadContainerBackup(project.id, hostPath);
+      const mb = (bytes / (1024 * 1024)).toFixed(1);
+      const msg = `Backup saved (${mb} MB). Note: includes MCP/config — may contain MCP API keys. Keep it private.`;
+      setProgressMsg(msg);
+      // Auto-clear so the transient confirmation doesn't linger in the card
+      // status; guard against clobbering a newer message (e.g. a later op).
+      setTimeout(() => setProgressMsg((prev) => (prev === msg ? null : prev)), 8000);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBackingUp(false);
     }
   };
 
@@ -504,6 +535,12 @@ export default function ProjectCard({ project }: Props) {
                 <ActionButton onClick={handleOpenTerminal} disabled={loading} label="Terminal" accent />
                 <ActionButton onClick={handleOpenBashShell} disabled={loading} label="Shell" />
                 <ActionButton onClick={() => setShowFileManager(true)} disabled={loading} label="Files" />
+                <ActionButton
+                  onClick={handleBackup}
+                  disabled={loading || backingUp}
+                  label={backingUp ? "Backing up…" : "Backup"}
+                  title="Downloads /workspace plus a sanitized home config (MCP servers, settings, skills). OAuth tokens are excluded, but MCP server configs may embed their own API keys/tokens — keep the archive private."
+                />
               </>
             ) : (
               <>
@@ -1193,12 +1230,14 @@ function ActionButton({
   label,
   accent,
   danger,
+  title,
 }: {
   onClick: (e?: React.MouseEvent) => void;
   disabled: boolean;
   label: string;
   accent?: boolean;
   danger?: boolean;
+  title?: string;
 }) {
   let color = "text-[var(--text-secondary)] hover:text-[var(--text-primary)]";
   if (accent) color = "text-[var(--accent)] hover:text-[var(--accent-hover)]";
@@ -1208,6 +1247,7 @@ function ActionButton({
     <button
       onClick={(e) => { e.stopPropagation(); onClick(e); }}
       disabled={disabled}
+      title={title}
       className={`text-xs px-2 py-0.5 rounded transition-colors disabled:opacity-50 ${color} hover:bg-[var(--bg-primary)]`}
     >
       {label}
