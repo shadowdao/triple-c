@@ -76,6 +76,8 @@ export const listContainerFiles = (projectId: string, path: string) =>
   invoke<FileEntry[]>("list_container_files", { projectId, path });
 export const downloadContainerFile = (projectId: string, containerPath: string, hostPath: string) =>
   invoke<void>("download_container_file", { projectId, containerPath, hostPath });
+export const downloadContainerBackup = (projectId: string, hostPath: string, containerPath?: string) =>
+  invoke<number>("download_container_backup", { projectId, hostPath, containerPath });
 export const uploadFileToContainer = (projectId: string, hostPath: string, containerDir: string) =>
   invoke<void>("upload_file_to_container", { projectId, hostPath, containerDir });
 

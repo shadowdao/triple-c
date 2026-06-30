@@ -1,4 +1,5 @@
-use bollard::container::{DownloadFromContainerOptions, UploadToContainerOptions};
+use bollard::container::{DownloadFromContainerOptions, LogOutput, UploadToContainerOptions};
+use bollard::exec::{CreateExecOptions, StartExecResults};
 use futures_util::StreamExt;
 use serde::Serialize;
 use tauri::State;
@@ -149,6 +150,117 @@ pub async fn download_container_file(
     }
 
     Ok(())
+}
+
+/// Create a `.tar.gz` backup of the container's /workspace and stream it to a
+/// host file. Regenerable build artifacts (node_modules, target, .git/objects)
+/// are excluded so the archive stays restore-sized. Requires the container to
+/// exist (it can be stopped or running). Returns the number of bytes written.
+#[tauri::command]
+pub async fn download_container_backup(
+    project_id: String,
+    host_path: String,
+    container_path: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<u64, String> {
+    let project = state
+        .projects_store
+        .get(&project_id)
+        .ok_or_else(|| format!("Project {} not found", project_id))?;
+
+    let container_id = project
+        .container_id
+        .as_ref()
+        .ok_or_else(|| "No container exists for this project yet — start it first".to_string())?;
+
+    let docker = get_docker()?;
+    let path = container_path.unwrap_or_else(|| "/workspace".to_string());
+
+    // Build + gzip the archive inside the container (excludes happen there, so a
+    // 16 GB workspace doesn't get streamed in full), then pipe stdout to the
+    // chosen host file. --ignore-failed-read keeps a transient unreadable file
+    // from aborting the whole backup.
+    let cmd = vec![
+        "tar".to_string(),
+        "czf".to_string(),
+        "-".to_string(),
+        "--ignore-failed-read".to_string(),
+        "--exclude=*/node_modules".to_string(),
+        "--exclude=*/target".to_string(),
+        "--exclude=*/.git/objects".to_string(),
+        "-C".to_string(),
+        path,
+        ".".to_string(),
+    ];
+
+    let exec = docker
+        .create_exec(
+            container_id,
+            CreateExecOptions {
+                attach_stdout: Some(true),
+                attach_stderr: Some(true),
+                cmd: Some(cmd),
+                user: Some("claude".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|e| format!("Failed to create backup exec: {}", e))?;
+
+    let result = docker
+        .start_exec(&exec.id, None)
+        .await
+        .map_err(|e| format!("Failed to start backup exec: {}", e))?;
+
+    let mut output = match result {
+        StartExecResults::Attached { output, .. } => output,
+        StartExecResults::Detached => return Err("Backup exec started detached".to_string()),
+    };
+
+    use std::io::Write;
+    let file =
+        std::fs::File::create(&host_path).map_err(|e| format!("Failed to create backup file: {}", e))?;
+    let mut writer = std::io::BufWriter::new(file);
+    let mut total: u64 = 0;
+    let mut stderr_text = String::new();
+
+    while let Some(msg) = output.next().await {
+        match msg.map_err(|e| format!("Backup stream error: {}", e))? {
+            LogOutput::StdOut { message } => {
+                writer
+                    .write_all(&message)
+                    .map_err(|e| format!("Failed to write backup file: {}", e))?;
+                total += message.len() as u64;
+            }
+            LogOutput::StdErr { message } => {
+                stderr_text.push_str(&String::from_utf8_lossy(&message));
+            }
+            _ => {}
+        }
+    }
+    writer
+        .flush()
+        .map_err(|e| format!("Failed to finalize backup file: {}", e))?;
+
+    if total == 0 {
+        let _ = std::fs::remove_file(&host_path);
+        return Err(format!(
+            "Backup produced no data{}",
+            if stderr_text.trim().is_empty() {
+                String::new()
+            } else {
+                format!(": {}", stderr_text.trim())
+            }
+        ));
+    }
+
+    log::info!(
+        "Wrote {} byte backup for project {} to {}",
+        total,
+        project_id,
+        host_path
+    );
+    Ok(total)
 }
 
 #[tauri::command]

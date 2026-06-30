@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
+import * as commands from "../../lib/tauri-commands";
 import { listen } from "@tauri-apps/api/event";
 import type { Project, ProjectPath, Backend, BedrockConfig, BedrockAuthMethod, OllamaConfig, OpenAiCompatibleConfig } from "../../lib/types";
 import { useProjects } from "../../hooks/useProjects";
@@ -37,6 +38,7 @@ export default function ProjectCard({ project }: Props) {
   const [activeOperation, setActiveOperation] = useState<"starting" | "stopping" | "resetting" | null>(null);
   const [operationCompleted, setOperationCompleted] = useState(false);
   const [showRemoveModal, setShowRemoveModal] = useState(false);
+  const [backingUp, setBackingUp] = useState(false);
   const [isEditingName, setIsEditingName] = useState(false);
   const [editName, setEditName] = useState(project.name);
   const isSelected = selectedProjectId === project.id;
@@ -174,6 +176,31 @@ export default function ProjectCard({ project }: Props) {
       await stop(project.id);
     } catch (e) {
       setError(String(e));
+    }
+  };
+
+  const handleBackup = async () => {
+    if (!project.container_id) {
+      setError("Start the project at least once before backing up.");
+      return;
+    }
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+    const safeName = project.name.replace(/[^a-zA-Z0-9_-]+/g, "_");
+    try {
+      const hostPath = await save({
+        defaultPath: `${safeName}-backup-${stamp}.tar.gz`,
+        filters: [{ name: "Gzipped tarball", extensions: ["tar.gz"] }],
+      });
+      if (!hostPath) return;
+      setBackingUp(true);
+      setError(null);
+      const bytes = await commands.downloadContainerBackup(project.id, hostPath);
+      const mb = (bytes / (1024 * 1024)).toFixed(1);
+      setProgressMsg(`Backup saved (${mb} MB)`);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBackingUp(false);
     }
   };
 
@@ -485,6 +512,11 @@ export default function ProjectCard({ project }: Props) {
               <>
                 <ActionButton onClick={handleStart} disabled={loading} label="Start" />
                 <ActionButton
+                  onClick={handleBackup}
+                  disabled={loading || backingUp || !project.container_id}
+                  label={backingUp ? "Backing up…" : "Backup"}
+                />
+                <ActionButton
                   onClick={async () => {
                     setLoading(true);
                     setError(null);
@@ -504,6 +536,7 @@ export default function ProjectCard({ project }: Props) {
                 <ActionButton onClick={handleOpenTerminal} disabled={loading} label="Terminal" accent />
                 <ActionButton onClick={handleOpenBashShell} disabled={loading} label="Shell" />
                 <ActionButton onClick={() => setShowFileManager(true)} disabled={loading} label="Files" />
+                <ActionButton onClick={handleBackup} disabled={loading || backingUp} label={backingUp ? "Backing up…" : "Backup"} />
               </>
             ) : (
               <>
