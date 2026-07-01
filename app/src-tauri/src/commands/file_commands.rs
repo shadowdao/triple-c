@@ -206,10 +206,14 @@ pub async fn download_container_backup(
     // so secrets can't leak through the sanitization fallback.
     // The `--transform` nests the workspace under `workspace/` (parallel to
     // `home-claude/`) so an extracted archive has both clearly labeled instead
-    // of scattering the workspace files into the extraction dir. `flags=rh`
-    // rewrites regular member names AND hardlink target names (so an intra-
-    // workspace hardlink pair still resolves on extract) while leaving symlink
-    // targets untouched (rewriting those would corrupt relative/absolute links).
+    // of scattering the workspace files into the extraction dir. Rewriting the
+    // leading `.` (rather than `./`) also renames tar's root member from `./` to
+    // `workspace`, so the archive carries a proper `workspace/` dir entry rather
+    // than a bare `./` that would stamp the source root's mode/mtime onto the
+    // extraction directory. `flags=rh` rewrites regular member names AND
+    // hardlink target names (so an intra-workspace hardlink pair still resolves
+    // on extract) while leaving symlink targets untouched (rewriting those would
+    // corrupt relative/absolute links).
     let script = r#"set -e
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
@@ -227,7 +231,7 @@ if [ -d "$HOME/.claude" ]; then
 fi
 tar czf - --ignore-failed-read \
   --exclude='*/node_modules' --exclude='*/target' \
-  --transform='flags=rh;s,^\./,workspace/,' \
+  --transform='flags=rh;s,^\.,workspace,' \
   -C "$TC_BACKUP_SRC" . \
   -C "$STAGE" home-claude"#;
 
