@@ -155,7 +155,7 @@ pub async fn download_container_file(
 /// Create a `.tar.gz` backup of the container and stream it to a host file.
 /// The archive contains:
 ///   - the workspace (default /workspace), minus regenerable build artifacts
-///     (node_modules, target), at the archive root, and
+///     (node_modules, target), under `workspace/`, and
 ///   - a sanitized copy of the home config under `home-claude/`: ~/.claude.json
 ///     with secret-bearing keys removed (mcpServers/settings kept) and ~/.claude/
 ///     minus the OAuth `.credentials.json`, so MCP servers, settings and skills
@@ -204,6 +204,10 @@ pub async fn download_container_backup(
     // transient unreadable file from aborting the whole backup. If jq can't
     // parse ~/.claude.json we substitute an empty object — never the raw file —
     // so secrets can't leak through the sanitization fallback.
+    // The `--transform` nests the workspace under `workspace/` (parallel to
+    // `home-claude/`) so an extracted archive has both clearly labeled instead
+    // of scattering the workspace files into the extraction dir. `flags=r`
+    // scopes the rewrite to member names only, leaving symlink targets intact.
     let script = r#"set -e
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
@@ -221,6 +225,7 @@ if [ -d "$HOME/.claude" ]; then
 fi
 tar czf - --ignore-failed-read \
   --exclude='*/node_modules' --exclude='*/target' \
+  --transform='flags=r;s,^\./,workspace/,' \
   -C "$TC_BACKUP_SRC" . \
   -C "$STAGE" home-claude"#;
 
