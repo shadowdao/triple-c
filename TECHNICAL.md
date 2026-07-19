@@ -57,6 +57,16 @@ Tauri uses a Rust backend paired with a web-based frontend rendered by the OS-na
 - **Web links addon** — `@xterm/addon-web-links` makes URLs in terminal output clickable. Combined with `tauri-plugin-opener`, clicked URLs open in the host browser — essential for the `claude login` OAuth flow where Claude prints an authentication URL that must be opened on the host.
 - **Bidirectional data flow** — xterm.js exposes `term.onData()` for user keystrokes and `term.write()` for incoming data. This maps directly to our Tauri event-based streaming architecture.
 
+#### Terminal Layout & StatusBar Controls
+
+Implementation gotchas for the terminal view and its global controls (merged in PR #7, `terminal-layout-statusbar`):
+
+- **xterm padding lives on a wrapper, never the host.** FitAddon measures the same element that `term.open()` mounts into, so any padding on that host element makes the grid overhang and clip its rightmost column / bottom row. Padding must live on a **wrapper `div`**; the xterm host fills it with no padding of its own. Do not reintroduce padding on the host element in `TerminalView.tsx`.
+- **STT mic and "Jump to Current" live in the global `StatusBar`, not per-terminal overlays.** There is a single `useSTT` instance in `App.tsx` bound to the active session. `Ctrl+Shift+M` routes through the Zustand store (`sttToggle`).
+- **Recording is pinned to where it started.** The STT transcript targets `recordingSessionIdRef` (the session recording began in), **not** the live active session — switching tabs mid-recording must not misroute the transcript.
+- **"Jump to Current" state is written only by the active terminal.** The active `TerminalView` surfaces `terminalAtBottom` and `scrollActiveToBottom` through the store; only the active terminal writes them, and they are cleared on its unmount.
+- **Set store function values via object-merge, not the updater form** — `set({ fn: value })`, not `set(state => ...)` — when publishing action callbacks (like `scrollActiveToBottom`) into the Zustand store.
+
 ### bollard (Docker API)
 
 **Chosen over:** Shelling out to the `docker` CLI, dockerode (Node.js), docker-api (Python)
