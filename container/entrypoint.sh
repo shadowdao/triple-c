@@ -120,16 +120,16 @@ if [ -n "$GIT_TOKEN" ]; then
     echo "https://oauth2:${GIT_TOKEN}@github.com" >> "$CRED_FILE"
     echo "https://oauth2:${GIT_TOKEN}@gitlab.com" >> "$CRED_FILE"
     echo "https://oauth2:${GIT_TOKEN}@bitbucket.org" >> "$CRED_FILE"
-    git config --global --file /home/claude/.gitconfig credential.helper "store --file=$CRED_FILE"
+    git config --file /home/claude/.gitconfig credential.helper "store --file=$CRED_FILE"
     unset GIT_TOKEN
 fi
 
 # ── Git user config ──────────────────────────────────────────────────────────
 if [ -n "$GIT_USER_NAME" ]; then
-    git config --global --file /home/claude/.gitconfig user.name "$GIT_USER_NAME"
+    git config --file /home/claude/.gitconfig user.name "$GIT_USER_NAME"
 fi
 if [ -n "$GIT_USER_EMAIL" ]; then
-    git config --global --file /home/claude/.gitconfig user.email "$GIT_USER_EMAIL"
+    git config --file /home/claude/.gitconfig user.email "$GIT_USER_EMAIL"
 fi
 chown claude:claude /home/claude/.gitconfig 2>/dev/null || true
 
