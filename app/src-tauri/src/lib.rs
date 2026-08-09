@@ -168,6 +168,7 @@ pub fn run() {
             // Shared Claude Code auth token
             commands::auth_token_commands::acquire_claude_token,
             commands::auth_token_commands::submit_claude_token_code,
+            commands::auth_token_commands::cancel_claude_token,
             commands::auth_token_commands::has_claude_token,
             commands::auth_token_commands::clear_claude_token,
             // Settings

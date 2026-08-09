@@ -7,7 +7,13 @@ import type {
   OpenAiCompatibleConfig,
   Project,
 } from "../../../../lib/types";
-import Field, { ConfigGroup, monoInputClass, selectClass } from "../../../ui/Field";
+import Field, {
+  ConfigGroup,
+  SwitchRow,
+  monoInputClass,
+  selectClass,
+} from "../../../ui/Field";
+import Toggle from "../../../ui/Toggle";
 
 export const DEFAULT_BEDROCK_CONFIG: BedrockConfig = {
   auth_method: "static_credentials",
@@ -106,6 +112,10 @@ export default function ModelSection({ project, save, disabled }: Props) {
       },
     });
 
+  // Defaults to on: projects created before the field existed, and any data
+  // that predates it, should still pick the shared token up.
+  const useSharedToken = project.use_shared_auth_token !== false;
+
   const handleBackendChange = (mode: Backend) => {
     const patch: Partial<Project> = { backend: mode };
     if (mode === "bedrock" && !project.bedrock_config)
@@ -138,6 +148,29 @@ export default function ModelSection({ project, save, disabled }: Props) {
           </select>
         )}
       </Field>
+
+      {/* Only Anthropic reads CLAUDE_CODE_OAUTH_TOKEN; the other backends
+          authenticate through their own credentials entirely. */}
+      {project.backend === "anthropic" && (
+        <div className="pt-2 border-t border-[var(--border-color)]">
+          <SwitchRow
+            label="Use the shared Claude token"
+            hint={
+              useSharedToken
+                ? "Signs in with the shared token from Settings → Claude Authentication, so this container needs no `claude login` of its own."
+                : "This project is opted out: it ignores the shared token and needs its own `claude login` inside the container."
+            }
+            control={
+              <Toggle
+                label="Use the shared Claude token"
+                checked={useSharedToken}
+                onChange={(value) => save({ use_shared_auth_token: value })}
+                disabled={disabled}
+              />
+            }
+          />
+        </div>
+      )}
 
       {project.backend === "bedrock" && (
         <div className="space-y-4 pt-2 border-t border-[var(--border-color)]">

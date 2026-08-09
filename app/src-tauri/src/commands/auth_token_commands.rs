@@ -43,7 +43,7 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use tauri::{AppHandle, Emitter, State};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::docker::container::is_container_running;
 use crate::docker::exec::{create_attached_exec, wait_for_exec_exit, AttachedExec};
@@ -394,6 +394,18 @@ fn pending_input() -> &'static Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>> {
     PENDING_INPUT.get_or_init(|| Mutex::new(None))
 }
 
+/// Abort channel for the in-flight flow, claimed and released in lockstep with
+/// [`PENDING_INPUT`].
+///
+/// Without this the only exits are "finished" and "timed out", so a user who
+/// closes the dialog would be locked out by the single-flight guard until
+/// `SETUP_TIMEOUT` elapsed.
+static CANCEL_TX: OnceLock<Mutex<Option<oneshot::Sender<()>>>> = OnceLock::new();
+
+fn cancel_slot() -> &'static Mutex<Option<oneshot::Sender<()>>> {
+    CANCEL_TX.get_or_init(|| Mutex::new(None))
+}
+
 fn emit_progress(app: &AppHandle, project_id: &str, message: &str) {
     let _ = app.emit(
         PROGRESS_EVENT,
@@ -431,6 +443,7 @@ async fn run_setup_token(
     project_id: &str,
     container_id: &str,
     mut input_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut cancel_rx: oneshot::Receiver<()>,
 ) -> Result<String, String> {
     // A pty (`tty = true`) because `setup-token` renders an interactive TUI and
     // reads the pasted code in raw mode, which a plain pipe cannot provide.
@@ -460,6 +473,14 @@ async fn run_setup_token(
         // alive for the whole session anyway — dropping it early would tear the
         // output stream down with it.
         let next = tokio::select! {
+            // Cancellation wins the race so a user who gives up isn't held by
+            // the single-flight guard until the timeout. Dropping `input` and
+            // `output` on return tears the exec down with them.
+            _ = &mut cancel_rx => {
+                return Err(
+                    "Authentication cancelled. No token was stored.".to_string()
+                );
+            }
             Some(data) = input_rx.recv() => {
                 if let Err(e) = input.write_all(&data).await {
                     return Err(format!(
@@ -569,7 +590,11 @@ pub async fn acquire_claude_token(
     // Claim the flow before touching anything else, so a second caller bounces
     // off the guard rather than half-configuring the same project.
     let (input_tx, input_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
     {
+        // Both slots are claimed under the input lock held first, and released
+        // in the same order below, so the guard and its abort channel can never
+        // disagree about whether a flow is live.
         let mut slot = pending_input().lock().await;
         if slot.is_some() {
             return Err(
@@ -578,6 +603,7 @@ pub async fn acquire_claude_token(
             );
         }
         *slot = Some(input_tx);
+        *cancel_slot().lock().await = Some(cancel_tx);
     }
 
     let bridge_was_enabled = project.auth_bridge_enabled;
@@ -616,13 +642,14 @@ pub async fn acquire_claude_token(
             "Running `claude setup-token` — sign in at the URL below, then submit the code it gives you.",
         );
 
-        run_setup_token(&app_handle, &project_id, &container_id, input_rx).await
+        run_setup_token(&app_handle, &project_id, &container_id, input_rx, cancel_rx).await
     }
     .await;
 
     // Release the flow, then restore the bridge — both unconditionally, so a
     // failed or cancelled login leaves nothing latched on.
     *pending_input().lock().await = None;
+    *cancel_slot().lock().await = None;
     if !bridge_was_enabled {
         // Stop the poller first: it awaits teardown, so host ports are provably
         // released before the flag goes back.
@@ -684,6 +711,22 @@ pub async fn submit_claude_token_code(code: String) -> Result<(), String> {
     sender
         .send(keystrokes)
         .map_err(|_| "The authentication flow has already ended.".to_string())
+}
+
+/// Abort an in-flight [`acquire_claude_token`].
+///
+/// Tears the `setup-token` exec down and releases the single-flight guard, so
+/// the user can immediately try again rather than waiting out `SETUP_TIMEOUT`.
+/// A no-op when nothing is running, so closing the dialog twice is harmless.
+#[tauri::command]
+pub async fn cancel_claude_token() -> Result<(), String> {
+    let Some(sender) = cancel_slot().lock().await.take() else {
+        return Ok(());
+    };
+    // `Err` only means the flow finished between the take and the send, which
+    // is exactly the outcome cancelling wanted.
+    let _ = sender.send(());
+    Ok(())
 }
 
 /// Whether a shared Claude token exists. Deliberately a boolean — no command

@@ -158,5 +158,7 @@ export const acquireClaudeToken = (projectId: string) =>
   invoke<void>("acquire_claude_token", { projectId });
 export const submitClaudeTokenCode = (code: string) =>
   invoke<void>("submit_claude_token_code", { code });
+/** Abort an in-flight acquisition and release the single-flight guard. No-op if nothing is running. */
+export const cancelClaudeToken = () => invoke<void>("cancel_claude_token");
 export const hasClaudeToken = () => invoke<boolean>("has_claude_token");
 export const clearClaudeToken = () => invoke<void>("clear_claude_token");

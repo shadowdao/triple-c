@@ -15,6 +15,7 @@ import AccordionSection from "../ui/AccordionSection";
 import Toggle from "../ui/Toggle";
 import WebTerminalSettings from "./WebTerminalSettings";
 import SttSettings from "./SttSettings";
+import SharedAuthSettings from "./SharedAuthSettings";
 
 export default function SettingsPanel() {
   const { appSettings, saveSettings } = useSettings();
@@ -147,6 +148,10 @@ export default function SettingsPanel() {
             </button>
           </div>
         </div>
+      </AccordionSection>
+
+      <AccordionSection id="claude-auth" title="Claude Authentication" defaultOpen={false}>
+        <SharedAuthSettings />
       </AccordionSection>
 
       <AccordionSection id="backends" title="Backends" defaultOpen={false}>

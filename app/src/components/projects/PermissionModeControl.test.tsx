@@ -19,6 +19,8 @@ const baseProject: Project = {
   allow_docker_access: false,
   sandbox_mode_enabled: true,
   mission_control_enabled: false,
+  auth_bridge_enabled: false,
+  use_shared_auth_token: true,
   full_permissions: false,
   permission_mode: null,
   ssh_key_path: null,

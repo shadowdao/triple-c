@@ -56,22 +56,56 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
 
 ### Frontend Structure (`app/src/`)
 
-- **`store/appState.ts`** — Single Zustand store for all app state (projects, sessions, UI)
+- **`store/appState.ts`** — Single Zustand store for all app state (projects, sessions, UI). The
+  main area is a single ordered tab strip holding two tab kinds, keyed `term:<id>` and
+  `home:<id>`; `activeSessionId` is *derived* from `activeTabKey` so exactly one thing is current.
 - **`hooks/`** — All Tauri IPC calls are encapsulated in hooks (`useTerminal`, `useProjects`, `useDocker`, `useSettings`)
 - **`lib/tauri-commands.ts`** — Typed `invoke()` wrappers; TypeScript types in `lib/types.ts` must match Rust models
 - **`components/terminal/TerminalView.tsx`** — xterm.js integration with WebGL rendering, URL detection for OAuth flow
-- **`components/layout/`** — TopBar (tabs + status), Sidebar (project list), StatusBar
-- **`components/projects/`** — ProjectCard, ProjectList, AddProjectDialog
-- **`components/settings/`** — Settings panels for API keys, Docker, AWS, Web Terminal
+- **`components/layout/`** — TopBar, MainTabs (the unified tab strip), Sidebar, StatusBar
+- **`components/projects/`** — `ProjectRow` (select-only list row), `ProjectList`, `AddProjectDialog`,
+  and the editors reused by Project Home
+- **`components/projects/home/`** — **Project Home**, the main-area view for a project:
+  Overview / Sessions / Automation / Config / Files. Per-project configuration lives here, not in
+  modals — see "UI conventions" below.
+- **`components/settings/`** — Host-level settings: Docker, AWS, Web Terminal, STT, shared auth
+- **`components/ui/`** — Shared primitives. **Use these; do not hand-roll replacements.**
+  `Modal` (the only correct way to build a dialog — it supplies `role="dialog"`, `aria-modal`,
+  focus trap and restore), `Button`, `Toggle`, `Field`, `SegmentedControl`, `StatusIndicator`,
+  `SaveIndicator`, `OverflowMenu`, `ToastHost`, `Tooltip`
+
+### UI conventions
+
+- **Project config belongs in Project Home's Config tab, not a modal.** Modals are reserved for
+  short, genuinely modal tasks (add project, confirm removal, token acquisition). The app
+  previously had ~12 hand-rolled modals; they were consolidated deliberately.
+- **Never bypass the design tokens.** All colour comes from CSS custom properties in `index.css`.
+  Filled buttons use `--accent-emphasis` (not `--accent`, which fails WCAG AA against white).
+  Use `--text-disabled` rather than `disabled:opacity-50`.
+- **Never write `focus:outline-none`.** A global `:focus-visible` ring is defined in `index.css`.
+- **Status must not be encoded in colour alone** — `StatusIndicator` pairs a glyph with a word.
+- Keyboard: `Ctrl+T` new terminal, `Ctrl+Shift+W` close tab, `Ctrl+Tab` cycle, `Ctrl+1..9` jump.
+  `Ctrl+W` is intentionally left alone — it is readline's `kill-word` inside the terminal.
 
 ### Backend Structure (`app/src-tauri/src/`)
 
-- **`commands/`** — Tauri command handlers (docker, project, settings, terminal). These are the IPC entry points called by `invoke()`.
+- **`commands/`** — Tauri command handlers. These are the IPC entry points called by `invoke()`.
+  Beyond docker/project/settings/terminal: `inspect_commands.rs` (read-only views into a
+  container — Claude sessions, installed capabilities, scheduler tasks), `auth_bridge_commands.rs`,
+  `auth_token_commands.rs`.
+- **`auth_bridge/`** — Host-side loopback bridge so browser logins run *inside* a container can
+  complete against the host browser. Discovers listeners by parsing `/proc/net/tcp{,6}` (the image
+  has no `ss`/`netstat`/`lsof`), binds host `127.0.0.1` **only**, and tunnels in over the Docker
+  API via `socat`. Opt-in per project.
 - **`docker/`** — Docker API layer using bollard:
   - `client.rs` — Singleton Docker connection via `OnceLock`
   - `container.rs` — Container lifecycle (create, start, stop, remove, inspect)
-  - `exec.rs` — PTY exec sessions with bidirectional stdin/stdout streaming
+  - `exec.rs` — Attached exec streaming. `create_attached_exec()` is the **single** place an
+    attached exec is opened; terminal sessions and the auth bridge both go through it.
   - `image.rs` — Image build/pull with progress streaming
+  - `legacy_cleanup.rs` — One-release migration shim removing leftovers from the deleted MCP
+    feature (containers labelled `triple-c.mcp-server`, `triple-c-net-*` networks). Deletable once
+    users have migrated.
 - **`web_terminal/`** — Remote terminal access via axum HTTP+WebSocket server:
   - `server.rs` — Axum server lifecycle (start/stop), serves embedded HTML and handles WS upgrades
   - `ws_handler.rs` — Per-connection WebSocket handler with JSON protocol, session management, cleanup on disconnect
@@ -87,7 +121,13 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
 
 ### Container Lifecycle
 
-Containers use a **stop/start** model (not create/destroy). Installed packages persist across stops. The `.claude` config dir uses a named Docker volume (`triple-c-claude-config-{projectId}`) so OAuth tokens survive even container resets.
+Containers use a **stop/start** model (not create/destroy). Installed packages persist across stops. The `.claude` config dir uses a named Docker volume (`triple-c-claude-config-{projectId}`), nested inside the home volume (`triple-c-home-{projectId}`), so OAuth tokens and Claude Code config survive container stop/start *and* container recreation.
+
+**Reset is the exception and it is destructive.** `rebuild_project_container` calls
+`remove_project_volumes`, which deletes *both* volumes — so a Reset wipes `~/.claude`,
+`~/.claude.json`, the OAuth credential, installed skills, and session transcripts. That is
+intentional (Reset exists to get back to a clean base image), but do not describe Reset as
+preserving credentials.
 
 ### Authentication
 
@@ -108,8 +148,18 @@ Per-project, independently configured:
 
 - Frontend types in `lib/types.ts` must stay in sync with Rust structs in `models/`
 - Tauri commands are registered in `lib.rs` via `.invoke_handler(tauri::generate_handler![...])`
-- Tauri v2 permissions are declared in `capabilities/default.json` — new IPC commands need permission grants there
+- `capabilities/default.json` grants permissions for **plugin** commands only (`core:`, `dialog:`,
+  `store:`, `opener:`). Application commands registered through `generate_handler!` do **not**
+  need an entry there — adding one is not required and none exists for any app command.
 - The `projects.json` file uses atomic writes (write to `.tmp`, then `rename()`). Corrupted files are backed up to `.bak`.
+- **Adding project state that changes the container?** `container_needs_recreation()` is entirely
+  **label-based** — it does not diff the container's env. If a new setting affects the container's
+  environment or configuration, you must also write a corresponding `triple-c.*` label at creation
+  and compare it there, or the change will silently not take effect until some unrelated setting
+  forces a rebuild. Never put a secret in a label; labels are readable via `docker inspect`.
+- **New model fields need an explicit serde default when the correct default isn't the zero value.**
+  `#[serde(default)]` on a `bool` yields `false`; follow the `default_full_permissions` pattern in
+  `models/project.rs` for anything that should default to true.
 - Cross-platform paths: Docker socket is `/var/run/docker.sock` on Linux/macOS, `//./pipe/docker_engine` on Windows
 
 ## Testing
