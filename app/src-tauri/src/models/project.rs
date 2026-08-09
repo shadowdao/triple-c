@@ -30,6 +30,14 @@ fn default_full_permissions() -> bool {
     true
 }
 
+/// `use_shared_auth_token` defaults to **on**: once the user has run
+/// `claude setup-token` once, every existing Anthropic-backend project should
+/// pick the token up without being edited one by one. Projects deliberately
+/// pinned to their own `claude login` identity opt out.
+fn default_use_shared_auth_token() -> bool {
+    true
+}
+
 /// How much autonomy Claude Code is granted inside the container.
 ///
 /// Maps onto Claude Code CLI flags — see [`PermissionMode::cli_args`], which is
@@ -122,6 +130,23 @@ pub struct Project {
     pub sandbox_mode_enabled: bool,
     #[serde(default)]
     pub mission_control_enabled: bool,
+    /// Opt in to the auth bridge: while the container runs, its loopback
+    /// listeners are mirrored onto the host's loopback so browser OAuth
+    /// callbacks (`claude login`, `fly login`, `aws sso login`) can reach them.
+    /// Purely host-side — it deliberately has no container-recreation label,
+    /// because toggling it changes nothing about the container itself.
+    #[serde(default)]
+    pub auth_bridge_enabled: bool,
+    /// Use the shared, long-lived Claude Code OAuth token (from
+    /// `claude setup-token`, held in the OS keychain) for this project instead
+    /// of requiring its own `claude login`. Only consulted when `backend` is
+    /// [`Backend::Anthropic`] and a token has actually been stored.
+    ///
+    /// Defaults to **true** so a single `setup-token` run covers every project;
+    /// turn it off to pin a project to the identity it logged in with inside
+    /// its own container.
+    #[serde(default = "default_use_shared_auth_token")]
+    pub use_shared_auth_token: bool,
     /// Legacy binary permission flag. Superseded by `permission_mode`, but kept
     /// because it is the value already stored in users' `projects.json`; it is
     /// the fallback in `effective_permission_mode()` so old projects keep
@@ -262,6 +287,8 @@ impl Project {
             allow_docker_access: false,
             sandbox_mode_enabled: false,
             mission_control_enabled: false,
+            auth_bridge_enabled: false,
+            use_shared_auth_token: default_use_shared_auth_token(),
             full_permissions: false,
             permission_mode: None,
             ssh_key_path: None,

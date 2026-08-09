@@ -4,6 +4,7 @@ import { getSttStatus, startStt, stopStt, pullSttImage, buildSttImage } from "..
 import { listen } from "@tauri-apps/api/event";
 import type { SttStatus } from "../../lib/types";
 import Tooltip from "../ui/Tooltip";
+import Toggle from "../ui/Toggle";
 
 export default function SttSettings() {
   const { appSettings, saveSettings } = useSettings();
@@ -130,16 +131,11 @@ export default function SttSettings() {
       <div className="space-y-2">
         {/* Enable toggle */}
         <div className="flex items-center gap-2">
-          <button
-            onClick={handleToggleEnabled}
-            className={`px-2 py-0.5 text-xs rounded transition-colors ${
-              appSettings?.stt?.enabled
-                ? "bg-[var(--success)] text-white"
-                : "bg-[var(--bg-primary)] border border-[var(--border-color)] text-[var(--text-secondary)]"
-            }`}
-          >
-            {appSettings?.stt?.enabled ? "ON" : "OFF"}
-          </button>
+          <Toggle
+            label="Speech to text"
+            checked={!!appSettings?.stt?.enabled}
+            onChange={handleToggleEnabled}
+          />
           <span className="text-xs text-[var(--text-secondary)]">
             {appSettings?.stt?.enabled ? "Enabled" : "Disabled"}
           </span>
@@ -154,7 +150,7 @@ export default function SttSettings() {
                 value={model}
                 onChange={(e) => setModel(e.target.value)}
                 onBlur={handleSaveModel}
-                className="w-full px-2 py-1 text-sm bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:outline-none focus:border-[var(--accent)]"
+                className="w-full px-2 py-1 text-sm bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:border-[var(--accent)]"
               >
                 <option value="tiny">Tiny (fastest, ~75MB)</option>
                 <option value="small">Small (balanced, ~500MB)</option>
@@ -172,7 +168,7 @@ export default function SttSettings() {
                 onBlur={handleSavePort}
                 min={1}
                 max={65535}
-                className="w-full px-2 py-1 text-sm bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:outline-none focus:border-[var(--accent)]"
+                className="w-full px-2 py-1 text-sm bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:border-[var(--accent)]"
               />
             </div>
 
@@ -185,7 +181,7 @@ export default function SttSettings() {
                 onChange={(e) => setLanguage(e.target.value)}
                 onBlur={handleSaveLanguage}
                 placeholder="Auto-detect"
-                className="w-full px-2 py-1 text-sm bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:outline-none focus:border-[var(--accent)]"
+                className="w-full px-2 py-1 text-sm bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:border-[var(--accent)]"
               />
             </div>
 
@@ -222,14 +218,14 @@ export default function SttSettings() {
                 <button
                   onClick={handlePull}
                   disabled={pulling || building}
-                  className="px-3 py-1 text-xs bg-[var(--bg-primary)] border border-[var(--border-color)] rounded hover:bg-[var(--border-color)] disabled:opacity-50 transition-colors"
+                  className="px-3 py-1 text-xs bg-[var(--bg-primary)] border border-[var(--border-color)] rounded hover:bg-[var(--border-color)] disabled:text-[var(--text-disabled)] transition-colors"
                 >
                   {pulling ? "Pulling..." : "Pull Image"}
                 </button>
                 <button
                   onClick={handleBuild}
                   disabled={pulling || building}
-                  className="px-3 py-1 text-xs bg-[var(--bg-primary)] border border-[var(--border-color)] rounded hover:bg-[var(--border-color)] disabled:opacity-50 transition-colors"
+                  className="px-3 py-1 text-xs bg-[var(--bg-primary)] border border-[var(--border-color)] rounded hover:bg-[var(--border-color)] disabled:text-[var(--text-disabled)] transition-colors"
                 >
                   {building ? "Building..." : "Build Locally"}
                 </button>

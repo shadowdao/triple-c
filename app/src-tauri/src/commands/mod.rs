@@ -1,3 +1,5 @@
+pub mod auth_bridge_commands;
+pub mod auth_token_commands;
 pub mod aws_commands;
 pub mod docker_commands;
 pub mod file_commands;

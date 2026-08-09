@@ -33,7 +33,7 @@ export default function OpenAiCompatibleSettings() {
             value={globalOai.base_url ?? ""}
             onChange={(e) => handleChange("base_url", e.target.value)}
             placeholder="http://host.docker.internal:4000"
-            className="w-full px-2 py-1.5 text-xs bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:outline-none focus:border-[var(--accent)]"
+            className="w-full px-2 py-1.5 text-xs bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:border-[var(--accent)]"
           />
         </div>
 
@@ -44,7 +44,7 @@ export default function OpenAiCompatibleSettings() {
             value={globalOai.default_model_id ?? ""}
             onChange={(e) => handleChange("default_model_id", e.target.value)}
             placeholder="gpt-4o / gemini-pro / etc."
-            className="w-full px-2 py-1.5 text-xs bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:outline-none focus:border-[var(--accent)]"
+            className="w-full px-2 py-1.5 text-xs bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:border-[var(--accent)]"
           />
         </div>
       </div>

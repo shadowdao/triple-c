@@ -77,7 +77,7 @@ export default function MicrophoneSettings() {
             value={selected}
             onChange={(e) => handleChange(e.target.value)}
             disabled={loading}
-            className="flex-1 px-2 py-1 text-sm bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:outline-none focus:border-[var(--accent)]"
+            className="flex-1 px-2 py-1 text-sm bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:border-[var(--accent)]"
           >
             <option value="">System Default</option>
             {devices.map((d) => (
@@ -90,7 +90,7 @@ export default function MicrophoneSettings() {
             onClick={enumerateDevices}
             disabled={loading}
             title="Refresh microphone list"
-            className="text-xs px-2 py-1 text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-primary)] rounded transition-colors disabled:opacity-50"
+            className="text-xs px-2 py-1 text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-primary)] rounded transition-colors disabled:text-[var(--text-disabled)]"
           >
             {loading ? "..." : "Refresh"}
           </button>

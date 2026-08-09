@@ -34,6 +34,12 @@ describe("Sidebar", () => {
     expect(screen.getByText("Settings")).toBeInTheDocument();
   });
 
+  it("renders the project list, not a settings form, in the projects view", () => {
+    render(<Sidebar />);
+    expect(screen.getByTestId("project-list")).toBeInTheDocument();
+    expect(screen.queryByTestId("settings-panel")).not.toBeInTheDocument();
+  });
+
   it("content area has min-w-0 to prevent flex overflow", () => {
     const { container } = render(<Sidebar />);
     const contentArea = container.querySelector(".overflow-y-auto");

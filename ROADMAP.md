@@ -101,15 +101,28 @@ Two viable options:
 ### Option A — long-lived token injection (simple)
 
 `claude setup-token` (verified present on 2.1.226: *"Set up a long-lived authentication
-token (requires Claude subscription)"*) returns a ~1-year OAuth token. Triple-C runs it
-once on the host, stores the token in the OS keychain via the existing `secure.rs`, and
-injects `CLAUDE_CODE_OAUTH_TOKEN` into every container that uses the Anthropic backend.
+token (requires Claude subscription)"*) returns a ~1-year OAuth token. Triple-C runs it in
+a running container, stores the token in the OS keychain via the existing `secure.rs`, and
+injects `CLAUDE_CODE_OAUTH_TOKEN` into every container on the Anthropic backend.
+
+**Correction to an earlier assumption in this document.** `setup-token` does *not* start a
+loopback callback listener, so it does not need the Auth Bridge. Verified by running it
+under a pty: its `redirect_uri` is Anthropic-hosted
+(`https://platform.claude.com/oauth/code/callback`), the user copies a code off that page,
+and the CLI blocks at a `Paste code here if prompted >` prompt on **stdin**. A stdin path
+is therefore mandatory — the flow cannot complete without one.
 
 - No routing, no ports, no proxy.
 - One auth event covers every project.
 - Cost: small. Reuses existing keychain and env-injection plumbing.
 - Limits: token is subscription-scoped and expires annually; per the docs a `setup-token`
   token cannot drive Remote Control sessions or claude.ai connector fetches.
+
+Change detection uses a **random rotation id** in the `triple-c.claude-token-version`
+label, not a hash of the token. Labels are readable by anything that can run
+`docker inspect`, so a hash would be an offline verification oracle — given a candidate
+token you could confirm it. A presence boolean would instead miss rotations and silently
+leave containers on a stale token.
 
 ### Option B — the Auth Bridge (general loopback-callback bridge)
 
@@ -187,4 +200,28 @@ the config volume by the entrypoint. Generalizes the pattern the MCP tab was rea
 3. **Stale model placeholders** — see "Not yet scheduled" above.
 
 4. **Silent save failures.** Project config saves on blur; failures go only to
-   `console.error`. No user-visible indication. Addressed in Phase 3.
+   `console.error`. No user-visible indication. Fixed in Phase 3 — `useProjectSave`
+   now renders a Saved / Saving / Save failed indicator and raises a toast.
+
+---
+
+## Known gaps left by Phase 2–3
+
+- **`open_terminal_session` takes no command argument.** "Resume session" and
+  "Manage in terminal" therefore open a bash tab and *type* the command after a
+  fixed prompt delay. It works, but it is timing-dependent and will misfire on a
+  slow container start. The fix is a `command: Option<String>` parameter on the
+  Tauri command so the exec launches the process directly.
+- **Uptime is observed, not reported.** `get_container_info` returns a status enum
+  with no start time, so Project Home records "running since" when the app *sees*
+  the transition. A container already running when the app launches shows
+  `● Running` with no elapsed time. Surfacing Docker's `State.StartedAt` would fix it.
+- **`lucide-react` was not adopted** (DESIGN-REVIEW Tier-1 #9) — no package-registry
+  access in the build environment used for this cycle. The existing inline SVGs and
+  text glyphs remain.
+- **The tab strip stayed in the TopBar** rather than moving onto the terminal panel's
+  top edge. DESIGN-REVIEW §A6 asks for the move but its own §B2 layout diagram puts
+  the tabs in the TopBar; the diagram won. Worth revisiting.
+- **`Ctrl+Shift+W`, not `Ctrl+W`, closes a tab.** Plain `Ctrl+W` is readline's
+  `kill-word`, used constantly inside the terminal this app is built around;
+  intercepting it globally would break word-erase in every shell.

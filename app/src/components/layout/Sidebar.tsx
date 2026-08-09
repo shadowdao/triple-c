@@ -63,7 +63,7 @@ export default function Sidebar() {
     };
 
     return (
-      <div className="flex flex-col h-full w-12 bg-[var(--bg-secondary)] border border-[var(--border-color)] rounded-lg overflow-hidden">
+      <div className="flex flex-col h-full w-12 bg-[var(--bg-secondary)] border border-[var(--border-color)] rounded-[var(--radius-panel)] overflow-hidden">
         <button
           onClick={toggleSidebarCollapsed}
           title="Expand sidebar"
@@ -89,7 +89,7 @@ export default function Sidebar() {
     }`;
 
   return (
-    <div className="flex flex-col h-full w-[25%] min-w-56 max-w-80 bg-[var(--bg-secondary)] border border-[var(--border-color)] rounded-lg overflow-hidden">
+    <div className="flex flex-col h-full w-[25%] min-w-56 max-w-80 bg-[var(--bg-secondary)] border border-[var(--border-color)] rounded-[var(--radius-panel)] overflow-hidden">
       {/* Nav tabs */}
       <div className="flex border-b border-[var(--border-color)]">
         <button onClick={() => setSidebarView("projects")} className={tabCls("projects")}>

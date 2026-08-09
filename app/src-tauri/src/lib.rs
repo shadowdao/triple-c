@@ -1,3 +1,4 @@
+mod auth_bridge;
 mod commands;
 mod docker;
 mod install_helper;
@@ -8,6 +9,7 @@ pub mod web_terminal;
 
 use std::sync::Arc;
 
+use auth_bridge::AuthBridgeManager;
 use docker::exec::ExecSessionManager;
 use storage::projects_store::ProjectsStore;
 use storage::settings_store::SettingsStore;
@@ -18,6 +20,7 @@ pub struct AppState {
     pub projects_store: Arc<ProjectsStore>,
     pub settings_store: Arc<SettingsStore>,
     pub exec_manager: Arc<ExecSessionManager>,
+    pub auth_bridge: Arc<AuthBridgeManager>,
     pub web_terminal_server: Arc<tokio::sync::Mutex<Option<WebTerminalServer>>>,
 }
 
@@ -39,6 +42,7 @@ pub fn run() {
         }
     });
     let exec_manager = Arc::new(ExecSessionManager::new());
+    let auth_bridge = Arc::new(AuthBridgeManager::new());
 
     // Clone Arcs for the setup closure (web terminal auto-start)
     let projects_store_setup = projects_store.clone();
@@ -53,6 +57,7 @@ pub fn run() {
             projects_store,
             settings_store,
             exec_manager,
+            auth_bridge,
             web_terminal_server: Arc::new(tokio::sync::Mutex::new(None)),
         })
         .setup(move |app| {
@@ -136,6 +141,8 @@ pub fn run() {
                     let _ = docker::stt::stop_stt_container().await;
                     // Close all exec sessions
                     state.exec_manager.close_all_sessions().await;
+                    // Release every host loopback port held by the auth bridge
+                    state.auth_bridge.stop_all().await;
                 });
             }
         })
@@ -155,6 +162,14 @@ pub fn run() {
             commands::project_commands::stop_project_container,
             commands::project_commands::rebuild_project_container,
             commands::project_commands::reconcile_project_statuses,
+            // Auth bridge
+            commands::auth_bridge_commands::set_auth_bridge_enabled,
+            commands::auth_bridge_commands::get_auth_bridge_status,
+            // Shared Claude Code auth token
+            commands::auth_token_commands::acquire_claude_token,
+            commands::auth_token_commands::submit_claude_token_code,
+            commands::auth_token_commands::has_claude_token,
+            commands::auth_token_commands::clear_claude_token,
             // Settings
             commands::settings_commands::get_settings,
             commands::settings_commands::update_settings,

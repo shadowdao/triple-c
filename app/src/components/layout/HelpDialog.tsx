@@ -1,5 +1,7 @@
 import { useEffect, useRef, useCallback, useState } from "react";
 import { getHelpContent } from "../../lib/tauri-commands";
+import Modal from "../ui/Modal";
+import Button from "../ui/Button";
 
 interface Props {
   onClose: () => void;
@@ -140,31 +142,15 @@ function renderMarkdown(md: string): string {
 }
 
 export default function HelpDialog({ onClose }: Props) {
-  const overlayRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const [markdown, setMarkdown] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    document.addEventListener("keydown", handleKeyDown);
-    return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [onClose]);
 
   useEffect(() => {
     getHelpContent()
       .then(setMarkdown)
       .catch((e) => setError(String(e)));
   }, []);
-
-  const handleOverlayClick = useCallback(
-    (e: React.MouseEvent<HTMLDivElement>) => {
-      if (e.target === overlayRef.current) onClose();
-    },
-    [onClose],
-  );
 
   // Handle anchor link clicks to scroll within the dialog
   const handleContentClick = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
@@ -179,40 +165,25 @@ export default function HelpDialog({ onClose }: Props) {
   }, []);
 
   return (
-    <div
-      ref={overlayRef}
-      onClick={handleOverlayClick}
-      className="fixed inset-0 bg-black/50 flex items-center justify-center z-50"
+    <Modal
+      title="How to Use Triple-C"
+      onClose={onClose}
+      widthClassName="w-[48rem]"
+      footer={<Button onClick={onClose}>Close</Button>}
     >
-      <div className="bg-[var(--bg-secondary)] border border-[var(--border-color)] rounded-lg shadow-xl w-[48rem] max-w-[90vw] max-h-[85vh] flex flex-col">
-        {/* Header */}
-        <div className="flex items-center justify-between px-6 py-4 border-b border-[var(--border-color)] flex-shrink-0">
-          <h2 className="text-lg font-semibold">How to Use Triple-C</h2>
-          <button
-            onClick={onClose}
-            className="px-3 py-1.5 text-xs bg-[var(--bg-tertiary)] border border-[var(--border-color)] rounded hover:bg-[var(--border-color)] transition-colors"
-          >
-            Close
-          </button>
-        </div>
-
-        {/* Scrollable content */}
-        <div
-          ref={contentRef}
-          onClick={handleContentClick}
-          className="flex-1 overflow-y-auto px-6 py-4 help-content"
-        >
-          {error && (
-            <p className="text-[var(--error)] text-sm">Failed to load help content: {error}</p>
-          )}
-          {!markdown && !error && (
-            <p className="text-[var(--text-secondary)] text-sm">Loading...</p>
-          )}
-          {markdown && (
-            <div dangerouslySetInnerHTML={{ __html: renderMarkdown(markdown) }} />
-          )}
-        </div>
+      <div ref={contentRef} onClick={handleContentClick} className="help-content">
+        {error && (
+          <p className="text-[var(--error)] text-sm">
+            Failed to load help content: {error}
+          </p>
+        )}
+        {!markdown && !error && (
+          <p className="text-[var(--text-secondary)] text-sm">Loading…</p>
+        )}
+        {markdown && (
+          <div dangerouslySetInnerHTML={{ __html: renderMarkdown(markdown) }} />
+        )}
       </div>
-    </div>
+    </Modal>
   );
 }

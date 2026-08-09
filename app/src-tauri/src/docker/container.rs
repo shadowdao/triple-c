@@ -171,29 +171,90 @@ fn build_claude_instructions(
     combined
 }
 
+/// The env var Claude Code reads a long-lived `claude setup-token` credential
+/// from. Named once so injection, the reserved-name blocklist, and the
+/// stale-value neutralization pass can never disagree about the spelling.
+pub const CLAUDE_OAUTH_TOKEN_ENV: &str = "CLAUDE_CODE_OAUTH_TOKEN";
+
+/// Env var name prefixes Triple-C manages itself; users cannot set these by hand.
+const RESERVED_ENV_PREFIXES: &[&str] = &["ANTHROPIC_", "AWS_", "GIT_", "HOST_", "TRIPLE_C_"];
+
+/// Exact env var names Triple-C manages itself. Not covered by
+/// [`RESERVED_ENV_PREFIXES`] because they don't share those prefixes.
+///
+/// `MCP_SERVERS_JSON` is reserved for legacy reasons: the built-in MCP feature
+/// was removed, but the name stays blocked so users cannot hand-set it.
+/// `CLAUDE_CODE_OAUTH_TOKEN` is reserved because Triple-C owns it — a hand-set
+/// value would silently outrank the keychain-held shared token and be invisible
+/// to the auth UI.
+const RESERVED_ENV_EXACT: &[&str] = &[
+    "CLAUDE_INSTRUCTIONS",
+    "MCP_SERVERS_JSON",
+    "CLAUDE_CODE_SETTINGS_JSON",
+    "MISSION_CONTROL_ENABLED",
+    "TRIPLE_C_PERMISSION_MODE",
+    CLAUDE_OAUTH_TOKEN_ENV,
+];
+
+/// Whether `key` is an env var name Triple-C reserves for itself.
+fn is_reserved_env_key(key: &str) -> bool {
+    let upper = key.to_uppercase();
+    RESERVED_ENV_PREFIXES.iter().any(|p| upper.starts_with(p))
+        || RESERVED_ENV_EXACT.iter().any(|e| upper == *e)
+}
+
 /// Compute a fingerprint string for the custom environment variables.
 /// Sorted alphabetically so order changes do not cause spurious recreation.
 fn compute_env_fingerprint(custom_env_vars: &[EnvVar]) -> String {
-    let reserved_prefixes = ["ANTHROPIC_", "AWS_", "GIT_", "HOST_", "TRIPLE_C_"];
-    // MCP_SERVERS_JSON is reserved for legacy reasons: the built-in MCP feature was
-    // removed, but the name stays blocked so users cannot hand-set it.
-    let reserved_exact = ["CLAUDE_INSTRUCTIONS", "MCP_SERVERS_JSON", "CLAUDE_CODE_SETTINGS_JSON", "MISSION_CONTROL_ENABLED", "TRIPLE_C_PERMISSION_MODE"];
     let mut parts: Vec<String> = Vec::new();
     for env_var in custom_env_vars {
         let key = env_var.key.trim();
-        if key.is_empty() {
-            continue;
-        }
-        let upper = key.to_uppercase();
-        let is_reserved = reserved_prefixes.iter().any(|p| upper.starts_with(p))
-            || reserved_exact.iter().any(|e| upper == *e);
-        if is_reserved {
+        if key.is_empty() || is_reserved_env_key(key) {
             continue;
         }
         parts.push(format!("{}={}", key, env_var.value));
     }
     parts.sort();
     parts.join(",")
+}
+
+/// The shared Claude Code OAuth token to inject for this project, paired with
+/// its rotation id.
+///
+/// `None` unless *all* of: the backend is Anthropic (the token is meaningless
+/// to Bedrock/Ollama/OpenAI-compatible), the project has not opted out, and a
+/// non-blank token is actually in the keychain. Read here rather than passed in
+/// because the token is global, not part of the per-project record.
+///
+/// The returned token is never logged and never leaves this module except as
+/// the env var value handed to Docker.
+fn shared_claude_auth(project: &Project) -> Option<(String, String)> {
+    if project.backend != Backend::Anthropic || !project.use_shared_auth_token {
+        return None;
+    }
+    let token = crate::storage::secure::get_claude_oauth_token()
+        .unwrap_or_else(|e| {
+            log::warn!("Could not read the shared Claude token from the keychain: {}", e);
+            None
+        })
+        .filter(|t| !t.trim().is_empty())?;
+    // A token with no rotation id predates versioning (or the id write failed).
+    // A constant stand-in still differs from the empty "no token" label, so
+    // presence changes are caught; only rotations could be missed.
+    let version = crate::storage::secure::get_claude_oauth_token_version()
+        .unwrap_or(None)
+        .unwrap_or_else(|| "unversioned".to_string());
+    Some((token, version))
+}
+
+/// Label value tracking which shared Claude token (if any) a container was
+/// created with. Empty means "none injected". See
+/// [`crate::storage::secure`] for why this is a random rotation id rather than
+/// a hash of the token.
+fn claude_token_label(project: &Project) -> String {
+    shared_claude_auth(project)
+        .map(|(_, version)| version)
+        .unwrap_or_default()
 }
 
 /// Merge global and per-project custom environment variables.
@@ -680,6 +741,19 @@ pub async fn create_container(
         }
     }
 
+    // Shared Claude Code OAuth token (Anthropic backend only, opt-out per
+    // project). Injected *before* the neutralization pass below so that pass
+    // sees it as already-set; when it is absent the pass actively blanks the
+    // variable instead of leaving a stale one baked into the snapshot image.
+    let shared_claude = shared_claude_auth(project);
+    if let Some((ref token, _)) = shared_claude {
+        env_vars.push(format!("{}={}", CLAUDE_OAUTH_TOKEN_ENV, token));
+        log::info!(
+            "Injecting the shared Claude authentication token into the container for project {}",
+            project.id
+        );
+    }
+
     // ── Neutralize stale backend auth env vars ──────────────────────────────
     // When a project switches backends (e.g. Bedrock → Anthropic) the container
     // is recreated *from a snapshot image* committed off the previous container.
@@ -704,6 +778,11 @@ pub async fn create_container(
         "ANTHROPIC_MODEL",
         "DISABLE_PROMPT_CACHING",
         "ANTHROPIC_BEDROCK_SERVICE_TIER",
+        // Revoking the shared token, opting a project out, or switching away
+        // from the Anthropic backend must *clear* this, not merely stop setting
+        // it — otherwise the value committed into the snapshot image keeps
+        // authenticating the container with a credential the user removed.
+        CLAUDE_OAUTH_TOKEN_ENV,
     ];
     let already_set: std::collections::HashSet<String> = env_vars
         .iter()
@@ -717,19 +796,12 @@ pub async fn create_container(
 
     // Custom environment variables (global + per-project, project overrides global for same key)
     let merged_env = merge_custom_env_vars(global_custom_env_vars, &project.custom_env_vars);
-    let reserved_prefixes = ["ANTHROPIC_", "AWS_", "GIT_", "HOST_", "TRIPLE_C_"];
-    // MCP_SERVERS_JSON is reserved for legacy reasons: the built-in MCP feature was
-    // removed, but the name stays blocked so users cannot hand-set it.
-    let reserved_exact = ["CLAUDE_INSTRUCTIONS", "MCP_SERVERS_JSON", "CLAUDE_CODE_SETTINGS_JSON", "MISSION_CONTROL_ENABLED", "TRIPLE_C_PERMISSION_MODE"];
     for env_var in &merged_env {
         let key = env_var.key.trim();
         if key.is_empty() {
             continue;
         }
-        let upper = key.to_uppercase();
-        let is_reserved = reserved_prefixes.iter().any(|p| upper.starts_with(p))
-            || reserved_exact.iter().any(|e| upper == *e);
-        if is_reserved {
+        if is_reserved_env_key(key) {
             log::warn!("Skipping reserved env var: {}", key);
             continue;
         }
@@ -948,6 +1020,10 @@ pub async fn create_container(
     labels.insert("triple-c.git-user-email".to_string(), effective_git_email.unwrap_or_default().to_string());
     labels.insert("triple-c.git-token-hash".to_string(),
         project.git_token.as_ref().map(|t| sha256_hex(t)).unwrap_or_default());
+    // Rotation id, NOT the token and NOT a hash of it — labels are readable by
+    // anything on the host via `docker inspect`.
+    labels.insert("triple-c.claude-token-version".to_string(),
+        shared_claude.as_ref().map(|(_, v)| v.clone()).unwrap_or_default());
 
     let host_config = HostConfig {
         mounts: Some(mounts),
@@ -1144,7 +1220,8 @@ chmod 600 "$HOME/.aws/credentials""#;
 /// NOTE: `docker commit` always bakes the *running container's* full ENV into
 /// the resulting image — passing an empty Config here does NOT strip it, and
 /// the commit API gives no way to remove env vars. As a result auth vars (e.g.
-/// CLAUDE_CODE_USE_BEDROCK, AWS_*) are present in this snapshot image's ENV.
+/// CLAUDE_CODE_USE_BEDROCK, AWS_*, CLAUDE_CODE_OAUTH_TOKEN) are present in this
+/// snapshot image's ENV — this image is local and per-project, never pushed.
 /// `create_container` defends against that by explicitly overriding every
 /// managed auth key for the active backend (see MANAGED_AUTH_KEYS), so a
 /// backend switch does not inherit the previous backend's stale credentials.
@@ -1387,6 +1464,20 @@ pub async fn container_needs_recreation(
     let container_git_token_hash = get_label("triple-c.git-token-hash").unwrap_or_default();
     if container_git_token_hash != expected_git_token_hash {
         log::info!("GIT_TOKEN mismatch");
+        return Ok(true);
+    }
+
+    // ── Shared Claude Code OAuth token ───────────────────────────────────
+    // Compares rotation ids, so this fires when the token is first acquired,
+    // re-acquired (rotated), revoked, or opted out of. Both "" means no token
+    // is in play, which is also what a container predating this feature reports
+    // — so existing installs are not recreated until a token actually exists.
+    // Recreation is the only way to change container env, and it is also what
+    // makes MANAGED_AUTH_KEYS blank a revoked token out of the snapshot image.
+    let expected_claude_token = claude_token_label(project);
+    let container_claude_token = get_label("triple-c.claude-token-version").unwrap_or_default();
+    if container_claude_token != expected_claude_token {
+        log::info!("Shared Claude authentication token mismatch — recreating container");
         return Ok(true);
     }
 

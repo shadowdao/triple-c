@@ -100,6 +100,10 @@ pub async fn remove_project(
     project_id: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    // Release any host loopback ports the auth bridge holds for this project
+    // before the container (and the project record) go away.
+    state.auth_bridge.stop(&project_id).await;
+
     // Stop and remove container if it exists
     if let Some(ref project) = state.projects_store.get(&project_id) {
         if let Some(ref container_id) = project.container_id {
@@ -133,10 +137,35 @@ pub async fn remove_project(
 #[tauri::command]
 pub async fn update_project(
     project: Project,
+    app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Project, String> {
     store_secrets_for_project(&project)?;
-    state.projects_store.update(project)
+    let updated = state.projects_store.update(project)?;
+
+    // `auth_bridge_enabled` can arrive through this generic save as well as
+    // through `set_auth_bridge_enabled`, so reconcile the running bridge with
+    // whatever was just persisted. `start` is idempotent and `stop` is a no-op
+    // when nothing is running, so this is safe on every project save.
+    if updated.auth_bridge_enabled {
+        if let Some(ref container_id) = updated.container_id {
+            if docker::is_container_running(container_id).await.unwrap_or(false) {
+                state
+                    .auth_bridge
+                    .start(
+                        updated.id.clone(),
+                        container_id.clone(),
+                        app_handle,
+                        state.projects_store.clone(),
+                    )
+                    .await;
+            }
+        }
+    } else {
+        state.auth_bridge.stop(&updated.id).await;
+    }
+
+    Ok(updated)
 }
 
 #[tauri::command]
@@ -400,6 +429,20 @@ pub async fn start_project_container(
     state.projects_store.set_container_id(&project_id, Some(container_id.clone()))?;
     state.projects_store.update_status(&project_id, ProjectStatus::Running)?;
 
+    // Arm the auth bridge if this project opted in. Purely host-side, so it
+    // happens after the container is up and never affects the start itself.
+    if project.auth_bridge_enabled {
+        state
+            .auth_bridge
+            .start(
+                project_id.clone(),
+                container_id.clone(),
+                app_handle.clone(),
+                state.projects_store.clone(),
+            )
+            .await;
+    }
+
     project.container_id = Some(container_id);
     project.status = ProjectStatus::Running;
     Ok(project)
@@ -417,6 +460,9 @@ pub async fn stop_project_container(
         .ok_or_else(|| format!("Project {} not found", project_id))?;
 
     state.projects_store.update_status(&project_id, ProjectStatus::Stopping)?;
+
+    // Drop host listeners first: they only make sense while the container runs.
+    state.auth_bridge.stop(&project_id).await;
 
     if let Some(ref container_id) = project.container_id {
         // Close exec sessions for this project
@@ -442,6 +488,10 @@ pub async fn rebuild_project_container(
         .projects_store
         .get(&project_id)
         .ok_or_else(|| format!("Project {} not found", project_id))?;
+
+    // The bridge is bound to the container that is about to be destroyed;
+    // `start_project_container` below re-arms it against the new one.
+    state.auth_bridge.stop(&project_id).await;
 
     // Remove existing container
     if let Some(ref container_id) = project.container_id {
@@ -469,6 +519,7 @@ pub async fn rebuild_project_container(
 /// to Stopped.
 #[tauri::command]
 pub async fn reconcile_project_statuses(
+    app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Vec<Project>, String> {
     let projects = state.projects_store.list();
@@ -490,6 +541,22 @@ pub async fn reconcile_project_statuses(
                 project.name,
                 project.id
             );
+            // The app may have restarted while the container kept running; the
+            // bridge lives in this process, so re-arm it here. `start` is
+            // idempotent, so a bridge that is already polling is untouched.
+            if project.auth_bridge_enabled {
+                if let Some(ref container_id) = project.container_id {
+                    state
+                        .auth_bridge
+                        .start(
+                            project.id.clone(),
+                            container_id.clone(),
+                            app_handle.clone(),
+                            state.projects_store.clone(),
+                        )
+                        .await;
+                }
+            }
         } else {
             log::info!(
                 "Project '{}' ({}) container is not running — setting to Stopped",

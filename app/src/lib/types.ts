@@ -27,6 +27,14 @@ export interface Project {
   allow_docker_access: boolean;
   sandbox_mode_enabled: boolean;
   mission_control_enabled: boolean;
+  /** Mirror container loopback listeners onto host loopback so in-container
+   *  browser OAuth logins can complete. Host-side only — no container recreate. */
+  auth_bridge_enabled: boolean;
+  /** Use the shared long-lived Claude Code token (from `claude setup-token`,
+   *  held in the OS keychain) instead of this project's own `claude login`.
+   *  Defaults to true; only applies when `backend` is "anthropic" and a token
+   *  has actually been stored. */
+  use_shared_auth_token: boolean;
   /** Legacy binary permission flag; superseded by `permission_mode`, kept for
    *  existing projects.json data. */
   full_permissions: boolean;
@@ -292,4 +300,52 @@ export interface SchedulerNotification {
   summary: string | null;
   body: string;
   created_at: string;
+}
+
+// ── Auth bridge ──────────────────────────────────────────────────────────────
+
+/** Which loopback family the container-side listener was found on.
+ *  Mirrors Rust `PortFamily` (serde lowercase). */
+export type AuthBridgePortFamily = "v4" | "v6" | "dual";
+
+/** A container loopback port currently mirrored onto the host's loopback. */
+export interface BridgedPort {
+  port: number;
+  family: AuthBridgePortFamily;
+  /** RFC 3339 timestamp of when the host listener was bound. */
+  bridged_at: string;
+}
+
+/** A discovered loopback listener that could not be bridged (host port taken). */
+export interface PortConflict {
+  port: number;
+  reason: string;
+}
+
+export interface AuthBridgeStatus {
+  enabled: boolean;
+  active_ports: BridgedPort[];
+  conflicts: PortConflict[];
+}
+
+/** Payload of the `auth-bridge-changed` event, emitted whenever the bridged
+ *  port set or the conflict set changes for a project. */
+export interface AuthBridgeChangedEvent {
+  project_id: string;
+  status: AuthBridgeStatus;
+}
+
+/** Payload of the `claude-token-progress` event: milestones during
+ *  `acquire_claude_token`. Never contains the token. */
+export interface ClaudeTokenProgressEvent {
+  project_id: string;
+  message: string;
+}
+
+/** Payload of the `claude-token-output` event: output from
+ *  `claude setup-token`, so the UI can show the URL the user must visit.
+ *  Credentials are redacted backend-side before the event is emitted. */
+export interface ClaudeTokenOutputEvent {
+  project_id: string;
+  chunk: string;
 }

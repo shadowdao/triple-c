@@ -1,7 +1,10 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useId, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useProjects } from "../../hooks/useProjects";
 import type { ProjectPath } from "../../lib/types";
+import Modal from "../ui/Modal";
+import Button from "../ui/Button";
+import { inputClass, monoInputClass } from "../ui/Field";
 
 interface Props {
   onClose: () => void;
@@ -25,26 +28,7 @@ export default function AddProjectDialog({ onClose }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const nameInputRef = useRef<HTMLInputElement>(null);
-  const overlayRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    nameInputRef.current?.focus();
-  }, []);
-
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    document.addEventListener("keydown", handleKeyDown);
-    return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [onClose]);
-
-  const handleOverlayClick = useCallback(
-    (e: React.MouseEvent<HTMLDivElement>) => {
-      if (e.target === overlayRef.current) onClose();
-    },
-    [onClose],
-  );
+  const formId = useId();
 
   const handleBrowse = async (index: number) => {
     const selected = await open({ directory: true, multiple: false });
@@ -63,22 +47,10 @@ export default function AddProjectDialog({ onClose }: Props) {
     }
   };
 
-  const updateEntry = (
-    index: number,
-    field: keyof PathEntry,
-    value: string,
-  ) => {
+  const updateEntry = (index: number, field: keyof PathEntry, value: string) => {
     const entries = [...pathEntries];
     entries[index] = { ...entries[index], [field]: value };
     setPathEntries(entries);
-  };
-
-  const removeEntry = (index: number) => {
-    setPathEntries(pathEntries.filter((_, i) => i !== index));
-  };
-
-  const addEntry = () => {
-    setPathEntries([...pathEntries, { host_path: "", mount_name: "" }]);
   };
 
   const handleSubmit = async (e?: React.FormEvent) => {
@@ -115,98 +87,106 @@ export default function AddProjectDialog({ onClose }: Props) {
   };
 
   return (
-    <div
-      ref={overlayRef}
-      onClick={handleOverlayClick}
-      className="fixed inset-0 bg-black/50 flex items-center justify-center z-50"
+    <Modal
+      title="Add Project"
+      onClose={onClose}
+      widthClassName="w-[30rem]"
+      initialFocusRef={nameInputRef}
+      footer={
+        <>
+          <Button size="md" variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button size="md" variant="primary" type="submit" form={formId} disabled={loading}>
+            {loading ? "Adding…" : "Add Project"}
+          </Button>
+        </>
+      }
     >
-      <div className="bg-[var(--bg-secondary)] border border-[var(--border-color)] rounded-lg p-6 w-[28rem] shadow-xl max-h-[80vh] overflow-y-auto">
-        <h2 className="text-lg font-semibold mb-4">Add Project</h2>
-
-        <form onSubmit={handleSubmit}>
-          <label className="block text-sm text-[var(--text-secondary)] mb-1">
-            Project Name
+      <form id={formId} onSubmit={handleSubmit} className="space-y-4">
+        <div>
+          <label
+            htmlFor={`${formId}-name`}
+            className="block text-[13px] font-medium mb-1"
+          >
+            Project name
           </label>
           <input
+            id={`${formId}-name`}
             ref={nameInputRef}
             value={name}
             onChange={(e) => setName(e.target.value)}
             placeholder="my-project"
-            className="w-full px-3 py-2 mb-3 bg-[var(--bg-primary)] border border-[var(--border-color)] rounded text-sm text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
+            className={inputClass}
           />
+        </div>
 
-          <label className="block text-sm text-[var(--text-secondary)] mb-1">
-            Folders
-          </label>
-          <div className="space-y-2 mb-3">
+        <div>
+          <span className="block text-[13px] font-medium mb-1">Folders</span>
+          <div className="space-y-2">
             {pathEntries.map((entry, i) => (
-              <div key={i} className="space-y-1 p-2 bg-[var(--bg-primary)] rounded border border-[var(--border-color)]">
-                <div className="flex gap-1">
+              <div
+                key={i}
+                className="space-y-1.5 p-2 bg-[var(--bg-primary)] rounded-[var(--radius-control)] border border-[var(--border-color)]"
+              >
+                <div className="flex gap-1.5">
                   <input
                     value={entry.host_path}
                     onChange={(e) => updateEntry(i, "host_path", e.target.value)}
                     placeholder="/path/to/folder"
-                    className="flex-1 px-2 py-1.5 bg-[var(--bg-secondary)] border border-[var(--border-color)] rounded text-xs text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
+                    aria-label={`Folder ${i + 1} host path`}
+                    className={inputClass}
                   />
-                  <button
-                    type="button"
-                    onClick={() => handleBrowse(i)}
-                    className="px-2 py-1.5 text-xs bg-[var(--bg-tertiary)] border border-[var(--border-color)] rounded hover:bg-[var(--border-color)] transition-colors"
-                  >
+                  <Button size="md" onClick={() => handleBrowse(i)}>
                     Browse
-                  </button>
+                  </Button>
                   {pathEntries.length > 1 && (
-                    <button
-                      type="button"
-                      onClick={() => removeEntry(i)}
-                      className="px-1.5 py-1.5 text-xs text-[var(--error)] hover:bg-[var(--bg-secondary)] rounded transition-colors"
+                    <Button
+                      size="md"
+                      variant="danger"
+                      aria-label={`Remove folder ${i + 1}`}
+                      onClick={() =>
+                        setPathEntries(pathEntries.filter((_, j) => j !== i))
+                      }
                     >
-                      x
-                    </button>
+                      Remove
+                    </Button>
                   )}
                 </div>
-                <div className="flex items-center gap-1">
-                  <span className="text-xs text-[var(--text-secondary)] flex-shrink-0">/workspace/</span>
+                <div className="flex items-center gap-1.5">
+                  <span className="text-xs text-[var(--text-secondary)] flex-shrink-0 font-mono">
+                    /workspace/
+                  </span>
                   <input
                     value={entry.mount_name}
                     onChange={(e) => updateEntry(i, "mount_name", e.target.value)}
                     placeholder="mount-name"
-                    className="flex-1 px-2 py-1 bg-[var(--bg-secondary)] border border-[var(--border-color)] rounded text-xs text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)] font-mono"
+                    aria-label={`Folder ${i + 1} mount name`}
+                    className={monoInputClass}
                   />
                 </div>
               </div>
             ))}
           </div>
-          <button
-            type="button"
-            onClick={addEntry}
-            className="text-xs text-[var(--accent)] hover:text-[var(--accent-hover)] mb-4 transition-colors"
+          <Button
+            className="mt-2"
+            onClick={() =>
+              setPathEntries([...pathEntries, { host_path: "", mount_name: "" }])
+            }
           >
             + Add folder
-          </button>
+          </Button>
+        </div>
 
-          {error && (
-            <div className="text-xs text-[var(--error)] mb-3">{error}</div>
-          )}
-
-          <div className="flex justify-end gap-2">
-            <button
-              type="button"
-              onClick={onClose}
-              className="px-4 py-2 text-sm text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors"
-            >
-              Cancel
-            </button>
-            <button
-              type="submit"
-              disabled={loading}
-              className="px-4 py-2 text-sm bg-[var(--accent)] text-white rounded hover:bg-[var(--accent-hover)] disabled:opacity-50 transition-colors"
-            >
-              {loading ? "Adding..." : "Add Project"}
-            </button>
+        {error && (
+          <div
+            role="alert"
+            className="px-2 py-1.5 text-xs text-[var(--error)] bg-[var(--error-muted)] border border-[var(--error)]/30 rounded-[var(--radius-control)]"
+          >
+            {error}
           </div>
-        </form>
-      </div>
-    </div>
+        )}
+      </form>
+    </Modal>
   );
 }

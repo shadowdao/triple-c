@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, ImageUpdateInfo, FileEntry, WebTerminalInfo, SttStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, SchedulerNotification } from "./types";
+import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, ImageUpdateInfo, FileEntry, WebTerminalInfo, SttStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, SchedulerNotification, AuthBridgeStatus } from "./types";
 
 // Docker
 export const checkDocker = () => invoke<boolean>("check_docker");
@@ -133,3 +133,30 @@ export const getSchedulerNotifications = (projectId: string) =>
   invoke<SchedulerNotification[]>("get_scheduler_notifications", { projectId });
 export const clearSchedulerNotifications = (projectId: string) =>
   invoke<void>("clear_scheduler_notifications", { projectId });
+
+// Auth bridge — mirrors container loopback listeners onto host loopback so
+// browser OAuth logins started inside the container can complete.
+export const setAuthBridgeEnabled = (projectId: string, enabled: boolean) =>
+  invoke<AuthBridgeStatus>("set_auth_bridge_enabled", { projectId, enabled });
+export const getAuthBridgeStatus = (projectId: string) =>
+  invoke<AuthBridgeStatus>("get_auth_bridge_status", { projectId });
+
+// Shared Claude Code auth token — one `claude setup-token` run authenticates
+// every Anthropic-backend project. The token itself is never exposed here: it
+// lives in the OS keychain and is injected as a container env var.
+//
+// `acquireClaudeToken` borrows the given project's running container to run the
+// login (temporarily enabling its auth bridge), and streams progress on the
+// `claude-token-progress` and `claude-token-output` events. It resolves only
+// once the whole flow finishes, so call it without awaiting the UI on it.
+//
+// Partway through, `claude setup-token` prints a sign-in URL and then waits at
+// a "Paste code here" prompt: the user signs in, copies the code shown by
+// Anthropic, and it is delivered with `submitClaudeTokenCode`. One flow at a
+// time — a second `acquireClaudeToken` call rejects while one is in progress.
+export const acquireClaudeToken = (projectId: string) =>
+  invoke<void>("acquire_claude_token", { projectId });
+export const submitClaudeTokenCode = (code: string) =>
+  invoke<void>("submit_claude_token_code", { code });
+export const hasClaudeToken = () => invoke<boolean>("has_claude_token");
+export const clearClaudeToken = () => invoke<void>("clear_claude_token");

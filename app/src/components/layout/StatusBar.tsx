@@ -25,7 +25,7 @@ export default function StatusBar({ stt }: Props) {
   const running = projects.filter((p) => p.status === "running").length;
 
   return (
-    <div className="flex items-center h-6 px-4 bg-[var(--bg-tertiary)] border border-[var(--border-color)] rounded-lg text-xs text-[var(--text-secondary)]">
+    <div className="flex items-center h-6 px-4 bg-[var(--bg-tertiary)] border border-[var(--border-color)] rounded-[var(--radius-panel)] text-xs text-[var(--text-secondary)]">
       <span>
         {projects.length} project{projects.length !== 1 ? "s" : ""}
       </span>
