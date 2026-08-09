@@ -221,6 +221,8 @@ pub fn run() {
             commands::inspect_commands::resume_session_command,
             commands::inspect_commands::list_container_capabilities,
             commands::inspect_commands::list_scheduled_tasks,
+            commands::inspect_commands::add_scheduled_task,
+            commands::inspect_commands::update_scheduled_task,
             commands::inspect_commands::get_scheduled_task_log,
             commands::inspect_commands::set_scheduled_task_enabled,
             commands::inspect_commands::run_scheduled_task_now,

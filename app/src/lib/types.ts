@@ -291,6 +291,22 @@ export interface ScheduledTask {
   next_run: string | null;
 }
 
+/** Mirrors Rust `ScheduleKind` — which of the scheduler's two `add` flags to
+ *  use: `--schedule "<cron>"` or `--at "YYYY-MM-DD HH:MM"`. */
+export type ScheduleKind = "recurring" | "once";
+
+/** The editable fields of a scheduled task, as `add`/`update` take them. */
+export interface ScheduledTaskInput {
+  name: string;
+  prompt: string;
+  scheduleKind: ScheduleKind;
+  /** A cron expression when `scheduleKind` is `recurring`, otherwise the
+   *  `YYYY-MM-DD HH:MM` one-shot time. */
+  schedule: string;
+  /** Absolute path inside the container; blank means `/workspace`. */
+  workingDir: string;
+}
+
 export interface SchedulerNotification {
   task_id: string;
   task_name: string | null;

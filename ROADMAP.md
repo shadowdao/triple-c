@@ -197,16 +197,39 @@ the config volume by the entrypoint. Generalizes the pattern the MCP tab was rea
    (holding `~/.claude`). README.md, HOW-TO-USE.md, and CLAUDE.md all still state that
    OAuth tokens survive a Reset. Pre-existing; not yet corrected.
 
-3. **Stale model placeholders** — see "Not yet scheduled" above.
+3. **An invalid cron expression silently unscheduled every task.** Found while adding
+   task creation to the Automation tab, and the most serious bug in this review.
+   `triple-c-scheduler` never validated `--schedule`, and `rebuild_crontab` regenerates the
+   *entire* crontab and pipes it to `crontab`, which rejects the whole file if any single
+   line is malformed — with the error discarded by `2>/dev/null || true`. So one bad
+   schedule silently unscheduled every other task in the container, reporting success.
+   Reproduced directly. This mattered because the global CLAUDE.md instructs Claude to use
+   this CLI, so Claude itself could trigger it. Fixed at the root: `add` now validates the
+   expression and exits non-zero, and `rebuild_crontab` reports a rejected crontab instead
+   of swallowing it. The Rust `add_scheduled_task` command validates independently.
 
-4. **Silent save failures.** Project config saves on blur; failures go only to
-   `console.error`. No user-visible indication. Fixed in Phase 3 — `useProjectSave`
-   now renders a Saved / Saving / Save failed indicator and raises a toast.
+4. **Reset was destructive with no confirmation.** It deletes both volumes — the login,
+   installed skills, all session transcripts — from a single unconfirmed click, while the
+   comparably destructive Remove already confirmed. Now gated by a dialog that names each
+   loss. Fixed.
+
+5. **Cancelling authentication did not cancel.** Fixed — see the handoff section above.
+
+6. **Stale model placeholders** — see "Not yet scheduled" above.
+
+7. **Silent save failures.** Project config saves on blur; failures went only to
+   `console.error`. Fixed in Phase 3 — `useProjectSave` now renders a
+   Saved / Saving / Save failed indicator and raises a toast.
 
 ---
 
 ## Known gaps left by Phase 2–3
 
+- **Editing a scheduled task changes its id.** `triple-c-scheduler` has no `edit`
+  subcommand, and hand-editing its JSON behind its back would desync the crontab, so edit is
+  implemented as add-then-remove. The add runs first, so a rejected edit leaves the original
+  intact. The task gets a new id and its older logs stay under the old one; the editor says
+  so before saving.
 - **`open_terminal_session` takes no command argument.** "Resume session" and
   "Manage in terminal" therefore open a bash tab and *type* the command after a
   fixed prompt delay. It works, but it is timing-dependent and will misfire on a

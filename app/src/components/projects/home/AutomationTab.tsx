@@ -14,6 +14,7 @@ import Button from "../../ui/Button";
 import Toggle from "../../ui/Toggle";
 import Modal from "../../ui/Modal";
 import StatusIndicator from "../../ui/StatusIndicator";
+import TaskEditorModal from "./TaskEditorModal";
 import { formatAge } from "./format";
 
 interface Props {
@@ -31,6 +32,8 @@ export default function AutomationTab({ project }: Props) {
   const [busyTaskId, setBusyTaskId] = useState<string | null>(null);
   const [log, setLog] = useState<{ task: ScheduledTask; text: string } | null>(null);
   const [confirmRemoveId, setConfirmRemoveId] = useState<string | null>(null);
+  /** `undefined` = closed, `null` = creating, a task = editing it. */
+  const [editing, setEditing] = useState<ScheduledTask | null | undefined>(undefined);
   const pushToast = useAppState((s) => s.pushToast);
   const running = project.status === "running";
 
@@ -148,9 +151,14 @@ export default function AutomationTab({ project }: Props) {
             </code>{" "}
             inside the container.
           </p>
-          <Button onClick={load} disabled={!running || loading}>
-            {loading ? "Refreshing…" : "Refresh"}
-          </Button>
+          <div className="flex items-center gap-2">
+            <Button onClick={load} disabled={!running || loading}>
+              {loading ? "Refreshing…" : "Refresh"}
+            </Button>
+            <Button variant="primary" disabled={!running} onClick={() => setEditing(null)}>
+              New task
+            </Button>
+          </div>
         </div>
 
         {!running ? (
@@ -159,7 +167,7 @@ export default function AutomationTab({ project }: Props) {
           </p>
         ) : tasks.length === 0 && !loading ? (
           <p className="text-[13px] text-[var(--text-secondary)]">
-            No scheduled tasks. Ask Claude to add one with{" "}
+            No scheduled tasks yet. Use <strong>New task</strong>, or ask Claude to add one with{" "}
             <code className="font-mono">triple-c-scheduler add</code>.
           </p>
         ) : (
@@ -203,6 +211,9 @@ export default function AutomationTab({ project }: Props) {
                 >
                   Run now
                 </Button>
+                <Button disabled={busyTaskId === task.id} onClick={() => setEditing(task)}>
+                  Edit
+                </Button>
                 <Button disabled={busyTaskId === task.id} onClick={() => openLog(task)}>
                   Log
                 </Button>
@@ -218,6 +229,15 @@ export default function AutomationTab({ project }: Props) {
           </ul>
         )}
       </section>
+
+      {editing !== undefined && (
+        <TaskEditorModal
+          project={project}
+          task={editing}
+          onClose={() => setEditing(undefined)}
+          onSaved={load}
+        />
+      )}
 
       {log && (
         <Modal

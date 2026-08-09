@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, ImageUpdateInfo, FileEntry, WebTerminalInfo, SttStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, SchedulerNotification, AuthBridgeStatus } from "./types";
+import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, ImageUpdateInfo, FileEntry, WebTerminalInfo, SttStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus } from "./types";
 
 // Docker
 export const checkDocker = () => invoke<boolean>("check_docker");
@@ -121,6 +121,16 @@ export const listContainerCapabilities = (projectId: string) =>
 // Container introspection — scheduler
 export const listScheduledTasks = (projectId: string) =>
   invoke<ScheduledTask[]>("list_scheduled_tasks", { projectId });
+/** Returns the new task's id. */
+export const addScheduledTask = (projectId: string, input: ScheduledTaskInput) =>
+  invoke<string>("add_scheduled_task", { projectId, ...input });
+/** Edit = add + remove, so this returns a *new* task id (see the Rust doc). */
+export const updateScheduledTask = (
+  projectId: string,
+  taskId: string,
+  input: ScheduledTaskInput,
+  enabled: boolean,
+) => invoke<string>("update_scheduled_task", { projectId, taskId, enabled, ...input });
 export const getScheduledTaskLog = (projectId: string, taskId: string, tailLines?: number) =>
   invoke<string>("get_scheduled_task_log", { projectId, taskId, tailLines });
 export const setScheduledTaskEnabled = (projectId: string, taskId: string, enabled: boolean) =>
