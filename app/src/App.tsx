@@ -8,7 +8,6 @@ import DockerInstallDialog from "./components/DockerInstallDialog";
 import { useDocker } from "./hooks/useDocker";
 import { useSettings } from "./hooks/useSettings";
 import { useProjects } from "./hooks/useProjects";
-import { useMcpServers } from "./hooks/useMcpServers";
 import { useUpdates } from "./hooks/useUpdates";
 import { useTerminal } from "./hooks/useTerminal";
 import { useSTT } from "./hooks/useSTT";
@@ -19,7 +18,6 @@ export default function App() {
   const { checkDocker, checkImage, startDockerPolling } = useDocker();
   const { loadSettings } = useSettings();
   const { refresh } = useProjects();
-  const { refresh: refreshMcp } = useMcpServers();
   const { loadVersion, checkForUpdates, checkImageUpdate, startPeriodicCheck } = useUpdates();
   const { sessions, activeSessionId, setProjects, setSttToggle } = useAppState(
     useShallow(s => ({ sessions: s.sessions, activeSessionId: s.activeSessionId, setProjects: s.setProjects, setSttToggle: s.setSttToggle }))
@@ -56,7 +54,6 @@ export default function App() {
       }
     });
     refresh();
-    refreshMcp();
 
     // Update detection
     loadVersion();

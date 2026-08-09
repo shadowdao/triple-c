@@ -4,7 +4,6 @@ import * as commands from "../../lib/tauri-commands";
 import { listen } from "@tauri-apps/api/event";
 import type { Project, ProjectPath, Backend, BedrockConfig, BedrockAuthMethod, OllamaConfig, OpenAiCompatibleConfig } from "../../lib/types";
 import { useProjects } from "../../hooks/useProjects";
-import { useMcpServers } from "../../hooks/useMcpServers";
 import { useTerminal } from "../../hooks/useTerminal";
 import { useAppState } from "../../store/appState";
 import EnvVarsModal from "./EnvVarsModal";
@@ -24,7 +23,6 @@ export default function ProjectCard({ project }: Props) {
   const selectedProjectId = useAppState(s => s.selectedProjectId);
   const setSelectedProject = useAppState(s => s.setSelectedProject);
   const { start, stop, rebuild, remove, update } = useProjects();
-  const { mcpServers } = useMcpServers();
   const { open: openTerminal } = useTerminal();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -196,7 +194,7 @@ export default function ProjectCard({ project }: Props) {
       setError(null);
       const bytes = await commands.downloadContainerBackup(project.id, hostPath);
       const mb = (bytes / (1024 * 1024)).toFixed(1);
-      const msg = `Backup saved (${mb} MB). Note: includes MCP/config — may contain MCP API keys. Keep it private.`;
+      const msg = `Backup saved (${mb} MB). Note: includes Claude config — may contain API keys. Keep it private.`;
       setProgressMsg(msg);
       // Auto-clear so the transient confirmation doesn't linger in the card
       // status; guard against clobbering a newer message (e.g. a later op).
@@ -539,7 +537,7 @@ export default function ProjectCard({ project }: Props) {
                   onClick={handleBackup}
                   disabled={loading || backingUp}
                   label={backingUp ? "Backing up…" : "Backup"}
-                  title="Downloads /workspace plus a sanitized home config (MCP servers, settings, skills). OAuth tokens are excluded, but MCP server configs may embed their own API keys/tokens — keep the archive private."
+                  title="Downloads /workspace plus a sanitized home config (Claude settings, skills, MCP config). OAuth tokens are excluded, but other config may embed its own API keys/tokens — keep the archive private."
                 />
               </>
             ) : (
@@ -863,49 +861,6 @@ export default function ProjectCard({ project }: Props) {
                   Edit
                 </button>
               </div>
-
-              {/* MCP Servers */}
-              {mcpServers.length > 0 && (
-                <div>
-                  <label className="block text-xs text-[var(--text-secondary)] mb-1">MCP Servers<Tooltip text="Model Context Protocol servers give Claude access to external tools and data sources." /></label>
-                  <div className="space-y-1">
-                    {mcpServers.map((server) => {
-                      const enabled = project.enabled_mcp_servers.includes(server.id);
-                      const isDocker = !!server.docker_image;
-                      return (
-                        <label key={server.id} className="flex items-center gap-2 cursor-pointer">
-                          <input
-                            type="checkbox"
-                            checked={enabled}
-                            disabled={!isStopped}
-                            onChange={async () => {
-                              const updated = enabled
-                                ? project.enabled_mcp_servers.filter((id) => id !== server.id)
-                                : [...project.enabled_mcp_servers, server.id];
-                              try {
-                                await update({ ...project, enabled_mcp_servers: updated });
-                              } catch (err) {
-                                console.error("Failed to update MCP servers:", err);
-                              }
-                            }}
-                            className="rounded border-[var(--border-color)] disabled:opacity-50"
-                          />
-                          <span className="text-xs text-[var(--text-primary)]">{server.name}</span>
-                          <span className="text-xs text-[var(--text-secondary)]">({server.transport_type})</span>
-                          <span className={`text-xs px-1 py-0.5 rounded ${isDocker ? "bg-blue-500/20 text-blue-400" : "bg-[var(--bg-secondary)] text-[var(--text-secondary)]"}`}>
-                            {isDocker ? "Docker" : "Manual"}
-                          </span>
-                        </label>
-                      );
-                    })}
-                  </div>
-                  {mcpServers.some((s) => s.docker_image && s.transport_type === "stdio" && project.enabled_mcp_servers.includes(s.id)) && (
-                    <p className="text-xs text-[var(--text-secondary)] mt-1 opacity-70">
-                      Docker access will be auto-enabled for stdio+Docker MCP servers.
-                    </p>
-                  )}
-                </div>
-              )}
 
               {/* Bedrock config */}
               {project.backend === "bedrock" && (() => {

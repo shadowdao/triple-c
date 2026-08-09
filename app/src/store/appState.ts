@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import type { Project, TerminalSession, AppSettings, UpdateInfo, ImageUpdateInfo, McpServer } from "../lib/types";
+import type { Project, TerminalSession, AppSettings, UpdateInfo, ImageUpdateInfo } from "../lib/types";
 
 const SIDEBAR_COLLAPSED_KEY = "triple-c.sidebar.collapsed";
 
@@ -35,12 +35,6 @@ interface AppState {
   removeSession: (id: string) => void;
   setActiveSession: (id: string | null) => void;
 
-  // MCP servers
-  mcpServers: McpServer[];
-  setMcpServers: (servers: McpServer[]) => void;
-  updateMcpServerInList: (server: McpServer) => void;
-  removeMcpServerFromList: (id: string) => void;
-
   // UI state
   terminalHasSelection: boolean;
   setTerminalHasSelection: (has: boolean) => void;
@@ -54,8 +48,8 @@ interface AppState {
   setTerminalAtBottom: (v: boolean) => void;
   scrollActiveToBottom: () => void;
   setScrollActiveToBottom: (fn: () => void) => void;
-  sidebarView: "projects" | "mcp" | "settings";
-  setSidebarView: (view: "projects" | "mcp" | "settings") => void;
+  sidebarView: "projects" | "settings";
+  setSidebarView: (view: "projects" | "settings") => void;
   sidebarCollapsed: boolean;
   setSidebarCollapsed: (collapsed: boolean) => void;
   toggleSidebarCollapsed: () => void;
@@ -117,20 +111,6 @@ export const useAppState = create<AppState>((set) => ({
       };
     }),
   setActiveSession: (id) => set({ activeSessionId: id }),
-
-  // MCP servers
-  mcpServers: [],
-  setMcpServers: (servers) => set({ mcpServers: servers }),
-  updateMcpServerInList: (server) =>
-    set((state) => ({
-      mcpServers: state.mcpServers.map((s) =>
-        s.id === server.id ? server : s,
-      ),
-    })),
-  removeMcpServerFromList: (id) =>
-    set((state) => ({
-      mcpServers: state.mcpServers.filter((s) => s.id !== id),
-    })),
 
   // UI state
   terminalHasSelection: false,

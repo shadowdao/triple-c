@@ -35,7 +35,6 @@ export interface Project {
   custom_env_vars: EnvVar[];
   port_mappings: PortMapping[];
   claude_instructions: string | null;
-  enabled_mcp_servers: string[];
   claude_code_settings: ClaudeCodeSettings | null;
   renamed_session_names: Record<string, string>;
   created_at: string;
@@ -200,23 +199,6 @@ export interface ImageUpdateInfo {
   remote_digest: string;
   local_digest: string | null;
   remote_updated_at: string | null;
-}
-
-export type McpTransportType = "stdio" | "http";
-
-export interface McpServer {
-  id: string;
-  name: string;
-  transport_type: McpTransportType;
-  command: string | null;
-  args: string[];
-  env: Record<string, string>;
-  url: string | null;
-  headers: Record<string, string>;
-  docker_image: string | null;
-  container_port: number | null;
-  created_at: string;
-  updated_at: string;
 }
 
 export interface FileEntry {

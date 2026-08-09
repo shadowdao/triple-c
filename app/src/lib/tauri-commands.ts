@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, ImageUpdateInfo, McpServer, FileEntry, WebTerminalInfo, SttStatus, InstallOptions } from "./types";
+import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, ImageUpdateInfo, FileEntry, WebTerminalInfo, SttStatus, InstallOptions } from "./types";
 
 // Docker
 export const checkDocker = () => invoke<boolean>("check_docker");
@@ -63,15 +63,6 @@ export const sendAudioData = (sessionId: string, data: number[]) =>
   invoke<void>("send_audio_data", { sessionId, data });
 export const stopAudioBridge = (sessionId: string) =>
   invoke<void>("stop_audio_bridge", { sessionId });
-
-// MCP Servers
-export const listMcpServers = () => invoke<McpServer[]>("list_mcp_servers");
-export const addMcpServer = (name: string) =>
-  invoke<McpServer>("add_mcp_server", { name });
-export const updateMcpServer = (server: McpServer) =>
-  invoke<McpServer>("update_mcp_server", { server });
-export const removeMcpServer = (serverId: string) =>
-  invoke<void>("remove_mcp_server", { serverId });
 
 // Files
 export const listContainerFiles = (projectId: string, path: string) =>
