@@ -92,8 +92,6 @@ pub struct Project {
     #[serde(default)]
     pub claude_instructions: Option<String>,
     #[serde(default)]
-    pub enabled_mcp_servers: Vec<String>,
-    #[serde(default)]
     pub claude_code_settings: Option<ClaudeCodeSettings>,
     /// User-defined display names for terminal tabs, keyed by session id.
     #[serde(default)]
@@ -220,7 +218,6 @@ impl Project {
             custom_env_vars: Vec::new(),
             port_mappings: Vec::new(),
             claude_instructions: None,
-            enabled_mcp_servers: Vec::new(),
             claude_code_settings: None,
             renamed_session_names: HashMap::new(),
             created_at: now.clone(),

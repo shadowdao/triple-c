@@ -11,7 +11,6 @@ Triple-C (Claude-Code-Container) is a desktop application that runs Claude Code 
 - [The Interface](#the-interface)
 - [Project Management](#project-management)
 - [Project Configuration](#project-configuration)
-- [MCP Servers (Beta)](#mcp-servers-beta)
 - [AWS Bedrock Configuration](#aws-bedrock-configuration)
 - [Ollama Configuration](#ollama-configuration)
 - [OpenAI Compatible Configuration](#openai-compatible-configuration)
@@ -136,7 +135,6 @@ Claude Code launches automatically. By default, it runs in standard permission m
 │  Sidebar   │                                        │
 │            │          Terminal View                  │
 │  Projects  │         (xterm.js)                     │
-│  MCP       │                                        │
 │  Settings  │                                        │
 ├────────────┴────────────────────────────────────────┤
 │  StatusBar   X projects · X running · X terminals   │
@@ -144,7 +142,7 @@ Claude Code launches automatically. By default, it runs in standard permission m
 ```
 
 - **TopBar** — Terminal tabs for switching between sessions. Bash shell tabs show a "(bash)" suffix. Status dots on the right show Docker connection (green = connected) and image availability (green = ready).
-- **Sidebar** — Toggle between the **Projects** list, **MCP** server configuration, and **Settings** panel.
+- **Sidebar** — Toggle between the **Projects** list and the **Settings** panel.
 - **Terminal View** — Interactive terminal powered by xterm.js with WebGL rendering. Includes a **Jump to Current** button that appears when you scroll up, so you can quickly return to the latest output.
 - **StatusBar** — Counts of total projects, running containers, and open terminal sessions.
 
@@ -192,7 +190,7 @@ Only **Remove** deletes everything, including the config volume and any stored c
 
 ### Container Progress Feedback
 
-When starting, stopping, or resetting a container, a progress modal shows real-time status messages (e.g., "Setting up MCP network...", "Starting MCP containers...", "Creating container..."). If an error occurs, the modal displays the error with a **Close** button. A **Force Stop** option is available if the operation stalls. The modal auto-closes on success.
+When starting, stopping, or resetting a container, a progress modal shows real-time status messages (e.g., "Creating container...", "Starting container..."). If an error occurs, the modal displays the error with a **Close** button. A **Force Stop** option is available if the operation stalls. The modal auto-closes on success.
 
 ---
 
@@ -253,7 +251,7 @@ When **disabled** (default), Claude prompts you for approval before executing ea
 
 Click **Edit** to open the environment variables modal. Add key-value pairs that will be injected into the container. Per-project variables override global variables with the same key.
 
-> Reserved prefixes (`ANTHROPIC_`, `AWS_`, `GIT_`, `HOST_`, `TRIPLE_C_`) and specific internal variables (`CLAUDE_INSTRUCTIONS`, `MCP_SERVERS_JSON`, etc.) are filtered out to prevent conflicts. `CLAUDE_CODE_*` variables are now allowed, so you can set Claude Code feature flags directly (e.g., `CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1`).
+> Reserved prefixes (`ANTHROPIC_`, `AWS_`, `GIT_`, `HOST_`, `TRIPLE_C_`) and specific internal variables (`CLAUDE_INSTRUCTIONS`, `CLAUDE_CODE_SETTINGS_JSON`, etc.) are filtered out to prevent conflicts. `CLAUDE_CODE_*` variables are now allowed, so you can set Claude Code feature flags directly (e.g., `CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1`).
 
 ### Port Mappings
 
@@ -287,127 +285,17 @@ Per-project settings override global defaults set in Settings. If all settings a
 
 > These settings map to Claude Code environment variables and `~/.claude/settings.json` entries. Changes require stopping and restarting the container to take effect.
 
----
+### MCP Servers
 
-## MCP Servers (Beta)
+Triple-C no longer manages [MCP](https://modelcontextprotocol.io/) servers itself. Configure them with Claude Code's own tooling from a terminal inside the container:
 
-Triple-C supports [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) servers, which extend Claude Code with access to external tools and data sources. MCP servers are configured in a **global library** and **enabled per-project**.
+- `claude mcp add` — register a server
+- `claude mcp list` — show configured servers
+- `claude mcp remove` — delete a server
+- `/mcp` — slash command inside a Claude Code session for MCP status and authentication
+- A project-level `.mcp.json` in `/workspace` — checked into your repo and shared with anyone who opens the project
 
-### How It Works
-
-There are two dimensions to MCP server configuration:
-
-| | **Manual** (no Docker image) | **Docker** (Docker image specified) |
-|---|---|---|
-| **Stdio** | Command runs inside the project container | Command runs in a separate MCP container via `docker exec` |
-| **HTTP** | Connects to a URL you provide | Runs in a separate container, reached by hostname on a shared Docker network |
-
-**Docker images are pulled automatically** if not already present when the project starts.
-
-### Accessing MCP Configuration
-
-Click the **MCP** tab in the sidebar to open the MCP server library. This is where you define all available MCP servers.
-
-### Adding an MCP Server
-
-1. Type a name in the input field and click **Add**.
-2. Expand the server card and configure it.
-
-The key decision is whether to set a **Docker Image**:
-- **With Docker image** — The MCP server runs in its own isolated container. Best for servers that need specific dependencies or system-level packages.
-- **Without Docker image** (manual) — The command runs directly inside your project container. Best for lightweight npx-based servers that just need Node.js.
-
-Then choose the **Transport Type**:
-- **Stdio** — The MCP server communicates over stdin/stdout. This is the most common type.
-- **HTTP** — The MCP server exposes an HTTP endpoint (streamable HTTP transport).
-
-### Configuration Examples
-
-#### Example 1: Filesystem Server (Stdio, Manual)
-
-A simple npx-based server that runs inside the project container. No Docker image needed since Node.js is already installed.
-
-| Field | Value |
-|-------|-------|
-| **Docker Image** | *(empty)* |
-| **Transport** | Stdio |
-| **Command** | `npx` |
-| **Arguments** | `-y @modelcontextprotocol/server-filesystem /workspace` |
-
-This gives Claude Code access to browse and read files via MCP. The command runs directly inside the project container using the pre-installed Node.js.
-
-#### Example 2: GitHub Server (Stdio, Manual)
-
-Another npx-based server, with an environment variable for authentication.
-
-| Field | Value |
-|-------|-------|
-| **Docker Image** | *(empty)* |
-| **Transport** | Stdio |
-| **Command** | `npx` |
-| **Arguments** | `-y @modelcontextprotocol/server-github` |
-| **Environment Variables** | `GITHUB_PERSONAL_ACCESS_TOKEN` = `ghp_your_token` |
-
-#### Example 3: Custom MCP Server (HTTP, Docker)
-
-An MCP server packaged as a Docker image that exposes an HTTP endpoint.
-
-| Field | Value |
-|-------|-------|
-| **Docker Image** | `myregistry/my-mcp-server:latest` |
-| **Transport** | HTTP |
-| **Container Port** | `8080` |
-| **Environment Variables** | `API_KEY` = `your_key` |
-
-Triple-C will:
-1. Pull the image automatically if not present
-2. Start the container on the project's bridge network
-3. Configure Claude Code to reach it at `http://triple-c-mcp-{id}:8080/mcp`
-
-The hostname is the MCP container's name on the Docker network — **not** `localhost`.
-
-#### Example 4: Database Server (Stdio, Docker)
-
-An MCP server that needs its own runtime environment, communicating over stdio.
-
-| Field | Value |
-|-------|-------|
-| **Docker Image** | `mcp/postgres-server:latest` |
-| **Transport** | Stdio |
-| **Command** | `node` |
-| **Arguments** | `dist/index.js` |
-| **Environment Variables** | `DATABASE_URL` = `postgresql://user:pass@host:5432/db` |
-
-Triple-C will:
-1. Pull the image and start it on the project network
-2. Configure Claude Code to communicate via `docker exec -i triple-c-mcp-{id} node dist/index.js`
-3. Automatically enable Docker socket access on the project container (required for `docker exec`)
-
-### Enabling MCP Servers Per-Project
-
-In a project's configuration panel (click **Config**), the **MCP Servers** section shows checkboxes for all globally defined servers. Toggle each server on or off for that project. Changes take effect on the next container start.
-
-### How Docker-Based MCP Works
-
-When a project with Docker-based MCP servers starts:
-
-1. Missing Docker images are **automatically pulled** (progress shown in the progress modal)
-2. A dedicated **bridge network** is created for the project (`triple-c-net-{projectId}`)
-3. Each enabled Docker MCP server gets its own container on that network
-4. The main project container is connected to the same network
-5. MCP server configuration is written to `~/.claude.json` inside the container
-
-**Networking**: Docker-based MCP containers are reached by their container name as a hostname (e.g., `triple-c-mcp-{serverId}`), not by `localhost`. Docker DNS resolves these names automatically on the shared bridge network.
-
-**Stdio + Docker**: The project container uses `docker exec` to communicate with the MCP container over stdin/stdout. This automatically enables Docker socket access on the project container.
-
-**HTTP + Docker**: The project container connects to the MCP container's HTTP endpoint using the container hostname and port (e.g., `http://triple-c-mcp-{serverId}:3000/mcp`).
-
-**Manual (no Docker image)**: Stdio commands run directly inside the project container. HTTP URLs connect to wherever you point them (could be an external service or something running on the host).
-
-### Configuration Change Detection
-
-MCP server configuration is tracked via SHA-256 fingerprints stored as Docker labels. If you add, remove, or modify MCP servers for a project, the container is automatically recreated on the next start to apply the new configuration. The container filesystem is snapshotted first, so installed packages are preserved.
+Your MCP configuration persists across container stop/start because `~/.claude.json` and `~/.claude` live on named Docker volumes. A **Reset** wipes them, so you would need to re-add your servers afterwards.
 
 ---
 
@@ -752,12 +640,6 @@ These features are built into Claude Code and work inside Triple-C containers wi
 
 - Most project settings can only be changed when the container is **stopped**. Stop the container first, make your changes, then start it again.
 - Some changes (like toggling Docker access, Mission Control, or changing mounted folders) trigger an automatic container recreation on the next start.
-
-### MCP Containers Not Starting
-
-- Ensure the Docker image for the MCP server exists (pull it first if needed).
-- Check that Docker socket access is available (stdio + Docker MCP servers auto-enable this).
-- Try resetting the project container to force a clean recreation.
 
 ### "Failed to install Anthropic marketplace" Error
 

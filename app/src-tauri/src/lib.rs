@@ -11,14 +11,12 @@ use std::sync::Arc;
 use docker::exec::ExecSessionManager;
 use storage::projects_store::ProjectsStore;
 use storage::settings_store::SettingsStore;
-use storage::mcp_store::McpStore;
 use tauri::Manager;
 use web_terminal::WebTerminalServer;
 
 pub struct AppState {
     pub projects_store: Arc<ProjectsStore>,
     pub settings_store: Arc<SettingsStore>,
-    pub mcp_store: Arc<McpStore>,
     pub exec_manager: Arc<ExecSessionManager>,
     pub web_terminal_server: Arc<tokio::sync::Mutex<Option<WebTerminalServer>>>,
 }
@@ -40,13 +38,6 @@ pub fn run() {
             panic!("Failed to initialize settings store: {}", e);
         }
     });
-    let mcp_store = Arc::new(match McpStore::new() {
-        Ok(s) => s,
-        Err(e) => {
-            log::error!("Failed to initialize MCP store: {}", e);
-            panic!("Failed to initialize MCP store: {}", e);
-        }
-    });
     let exec_manager = Arc::new(ExecSessionManager::new());
 
     // Clone Arcs for the setup closure (web terminal auto-start)
@@ -61,7 +52,6 @@ pub fn run() {
         .manage(AppState {
             projects_store,
             settings_store,
-            mcp_store,
             exec_manager,
             web_terminal_server: Arc::new(tokio::sync::Mutex::new(None)),
         })
@@ -187,11 +177,6 @@ pub fn run() {
             commands::file_commands::download_container_file,
             commands::file_commands::download_container_backup,
             commands::file_commands::upload_file_to_container,
-            // MCP
-            commands::mcp_commands::list_mcp_servers,
-            commands::mcp_commands::add_mcp_server,
-            commands::mcp_commands::update_mcp_server,
-            commands::mcp_commands::remove_mcp_server,
             // AWS
             commands::aws_commands::aws_sso_refresh,
             // Updates

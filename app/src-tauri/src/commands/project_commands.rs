@@ -2,7 +2,7 @@ use tauri::{Emitter, State};
 
 use crate::commands::aws_commands;
 use crate::docker;
-use crate::models::{container_config, Backend, BedrockAuthMethod, McpServer, Project, ProjectPath, ProjectStatus};
+use crate::models::{container_config, Backend, BedrockAuthMethod, Project, ProjectPath, ProjectStatus};
 use crate::storage::secure;
 use crate::AppState;
 
@@ -63,19 +63,6 @@ fn load_secrets_for_project(project: &mut Project) {
     }
 }
 
-/// Resolve enabled MCP servers and filter to Docker-only ones.
-fn resolve_mcp_servers(project: &Project, state: &AppState) -> (Vec<McpServer>, Vec<McpServer>) {
-    let all_mcp_servers = state.mcp_store.list();
-    let enabled_mcp: Vec<McpServer> = project.enabled_mcp_servers.iter()
-        .filter_map(|id| all_mcp_servers.iter().find(|s| &s.id == id).cloned())
-        .collect();
-    let docker_mcp: Vec<McpServer> = enabled_mcp.iter()
-        .filter(|s| s.is_docker())
-        .cloned()
-        .collect();
-    (enabled_mcp, docker_mcp)
-}
-
 #[tauri::command]
 pub async fn list_projects(state: State<'_, AppState>) -> Result<Vec<Project>, String> {
     Ok(state.projects_store.list())
@@ -121,16 +108,10 @@ pub async fn remove_project(
             let _ = docker::remove_container(container_id).await;
         }
 
-        // Remove MCP containers and network
-        let (_enabled_mcp, docker_mcp) = resolve_mcp_servers(project, &state);
-        if !docker_mcp.is_empty() {
-            if let Err(e) = docker::remove_mcp_containers(&docker_mcp).await {
-                log::warn!("Failed to remove MCP containers for project {}: {}", project_id, e);
-            }
-        }
-        if let Err(e) = docker::remove_project_network(&project.id).await {
-            log::warn!("Failed to remove project network for project {}: {}", project_id, e);
-        }
+        // Legacy MCP cleanup (pre-MCP-removal installs): drop any leftover MCP
+        // containers first, then the per-project network they were attached to.
+        docker::remove_legacy_mcp_containers(&project.id).await;
+        docker::remove_legacy_project_network(&project.id).await;
 
         // Clean up the snapshot image + volumes
         if let Err(e) = docker::remove_snapshot_image(project).await {
@@ -176,9 +157,6 @@ pub async fn start_project_container(
     // Load settings for image resolution and global AWS
     let settings = state.settings_store.get();
     let image_name = container_config::resolve_image_name(&settings.image_source, &settings.custom_image_name);
-
-    // Resolve enabled MCP servers for this project
-    let (enabled_mcp, docker_mcp) = resolve_mcp_servers(&project, &state);
 
     // Validate backend requirements
     if project.backend == Backend::Bedrock {
@@ -300,39 +278,6 @@ pub async fn start_project_container(
         // AWS config path from global settings
         let aws_config_path = settings.global_aws.aws_config_path.clone();
 
-        // Set up Docker network and MCP containers if needed
-        let network_name = if !docker_mcp.is_empty() {
-            // Pull any missing MCP Docker images before starting containers
-            for server in &docker_mcp {
-                if let Some(ref image) = server.docker_image {
-                    if !docker::image_exists(image).await.unwrap_or(false) {
-                        emit_progress(
-                            &app_handle,
-                            &project_id,
-                            &format!("Pulling MCP image for '{}'...", server.name),
-                        );
-                        let image_clone = image.clone();
-                        let app_clone = app_handle.clone();
-                        let pid_clone = project_id.clone();
-                        let sname = server.name.clone();
-                        docker::pull_image(&image_clone, move |msg| {
-                            emit_progress(&app_clone, &pid_clone, &format!("[{}] {}", sname, msg));
-                        }).await.map_err(|e| {
-                            format!("Failed to pull MCP image '{}' for '{}': {}", image, server.name, e)
-                        })?;
-                    }
-                }
-            }
-
-            emit_progress(&app_handle, &project_id, "Setting up MCP network...");
-            let net = docker::ensure_project_network(&project.id).await?;
-            emit_progress(&app_handle, &project_id, "Starting MCP containers...");
-            docker::start_mcp_containers(&docker_mcp, &net).await?;
-            Some(net)
-        } else {
-            None
-        };
-
         let container_id = if let Some(existing_id) = docker::find_existing_container(&project).await? {
             // Check if config changed — if so, snapshot + recreate
             let needs_recreate = docker::container_needs_recreation(
@@ -344,7 +289,6 @@ pub async fn start_project_container(
                 settings.global_claude_instructions.as_deref(),
                 &settings.global_custom_env_vars,
                 settings.timezone.as_deref(),
-                &enabled_mcp,
                 settings.global_claude_code_settings.as_ref(),
                 settings.default_ssh_key_path.as_deref(),
                 settings.default_git_user_name.as_deref(),
@@ -361,6 +305,12 @@ pub async fn start_project_container(
                 emit_progress(&app_handle, &project_id, "Recreating container...");
                 let _ = docker::stop_container(&existing_id).await;
                 docker::remove_container(&existing_id).await?;
+
+                // Legacy MCP cleanup: the old container may have been attached to
+                // `triple-c-net-<projectId>`. Tear down leftover MCP containers and
+                // that network now, before the replacement is created without it.
+                docker::remove_legacy_mcp_containers(&project.id).await;
+                docker::remove_legacy_project_network(&project.id).await;
 
                 // Create from snapshot image (preserves system-level changes)
                 let snapshot_image = docker::get_snapshot_image_name(&project);
@@ -381,8 +331,6 @@ pub async fn start_project_container(
                     settings.global_claude_instructions.as_deref(),
                     &settings.global_custom_env_vars,
                     settings.timezone.as_deref(),
-                    &enabled_mcp,
-                    network_name.as_deref(),
                     settings.global_claude_code_settings.as_ref(),
                     settings.default_ssh_key_path.as_deref(),
                     settings.default_git_user_name.as_deref(),
@@ -420,8 +368,6 @@ pub async fn start_project_container(
                 settings.global_claude_instructions.as_deref(),
                 &settings.global_custom_env_vars,
                 settings.timezone.as_deref(),
-                &enabled_mcp,
-                network_name.as_deref(),
                 settings.global_claude_code_settings.as_ref(),
                 settings.default_ssh_key_path.as_deref(),
                 settings.default_git_user_name.as_deref(),
@@ -482,15 +428,6 @@ pub async fn stop_project_container(
         }
     }
 
-    // Stop MCP containers (best-effort)
-    let (_enabled_mcp, docker_mcp) = resolve_mcp_servers(&project, &state);
-    if !docker_mcp.is_empty() {
-        emit_progress(&app_handle, &project_id, "Stopping MCP containers...");
-        if let Err(e) = docker::stop_mcp_containers(&docker_mcp).await {
-            log::warn!("Failed to stop MCP containers for project {}: {}", project_id, e);
-        }
-    }
-
     state.projects_store.update_status(&project_id, ProjectStatus::Stopped)?;
     Ok(())
 }
@@ -512,14 +449,6 @@ pub async fn rebuild_project_container(
         let _ = docker::stop_container(container_id).await;
         docker::remove_container(container_id).await?;
         state.projects_store.set_container_id(&project_id, None)?;
-    }
-
-    // Remove MCP containers before rebuild
-    let (_enabled_mcp, docker_mcp) = resolve_mcp_servers(&project, &state);
-    if !docker_mcp.is_empty() {
-        if let Err(e) = docker::remove_mcp_containers(&docker_mcp).await {
-            log::warn!("Failed to remove MCP containers for project {}: {}", project_id, e);
-        }
     }
 
     // Remove snapshot image + volumes so Reset creates from the clean base image

@@ -236,7 +236,7 @@ triple-c/
 │
 ├── container/
 │   ├── Dockerfile                 # Ubuntu 24.04 + all dev tools + Claude Code
-│   ├── entrypoint.sh              # UID/GID remap, SSH setup, git config, MCP injection
+│   ├── entrypoint.sh              # UID/GID remap, SSH setup, git config, settings injection
 │   ├── osc52-clipboard            # Clipboard shim (xclip/xsel/pbcopy via OSC 52)
 │   ├── audio-shim                 # Audio capture shim (rec/arecord via FIFO)
 │   ├── triple-c-scheduler         # Bash-based cron task system
@@ -259,11 +259,10 @@ triple-c/
     │   ├── App.tsx                # Top-level layout
     │   ├── index.css              # CSS variables, dark theme, scrollbars
     │   ├── store/
-    │   │   └── appState.ts        # Zustand store (projects, sessions, MCP, UI)
+    │   │   └── appState.ts        # Zustand store (projects, sessions, UI)
     │   ├── hooks/
     │   │   ├── useDocker.ts       # Docker status, image build/pull
     │   │   ├── useFileManager.ts  # File manager operations
-    │   │   ├── useMcpServers.ts   # MCP server CRUD
     │   │   ├── useProjects.ts     # Project CRUD operations
     │   │   ├── useSettings.ts     # App settings
     │   │   ├── useTerminal.ts     # Terminal I/O, resize, session events
@@ -275,7 +274,6 @@ triple-c/
     │   │   └── constants.ts       # App-wide constants
     │   └── components/
     │       ├── layout/            # Sidebar, TopBar, StatusBar
-    │       ├── mcp/               # McpPanel, McpServerCard
     │       ├── projects/          # ProjectCard, ProjectList, AddProjectDialog,
     │       │                      # FileManagerModal, ContainerProgressModal, modals
     │       ├── settings/          # SettingsPanel, DockerSettings, AwsSettings,
@@ -294,7 +292,6 @@ triple-c/
             ├── commands/          # Tauri command handlers
             │   ├── docker_commands.rs   # Docker status, image ops
             │   ├── file_commands.rs     # File manager (list/download/upload)
-            │   ├── mcp_commands.rs      # MCP server CRUD
             │   ├── project_commands.rs  # Start/stop/rebuild containers
             │   ├── settings_commands.rs # Settings CRUD
             │   ├── terminal_commands.rs # Terminal I/O, resize
@@ -309,17 +306,14 @@ triple-c/
             │   ├── client.rs      # bollard singleton connection
             │   ├── container.rs   # Create, start, stop, remove, fingerprinting
             │   ├── exec.rs        # PTY exec sessions with bidirectional streaming
-            │   ├── image.rs       # Build from Dockerfile, pull from registry
-            │   └── network.rs     # Per-project bridge networks for MCP
+            │   └── image.rs       # Build from Dockerfile, pull from registry
             ├── models/            # Data structures
             │   ├── project.rs     # Project, Backend, BedrockConfig
-            │   ├── mcp_server.rs  # MCP server configuration
             │   ├── app_settings.rs # Global settings (image source, AWS, etc.)
             │   ├── container_config.rs # Image name resolution
             │   └── update_info.rs # Update metadata
             └── storage/           # Persistence
                 ├── projects_store.rs  # JSON file with atomic writes
-                ├── mcp_store.rs       # MCP server persistence
                 ├── settings_store.rs  # App settings (Tauri plugin-store)
                 └── secure.rs          # OS keychain via keyring
 ```

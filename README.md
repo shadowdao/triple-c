@@ -27,9 +27,9 @@ Triple-C is a cross-platform desktop application that sandboxes Claude Code insi
 ### Container Lifecycle
 
 1. **Create**: New container created with bind mounts, env vars, and labels
-2. **Start**: Container started, entrypoint remaps UID/GID, sets up SSH, configures Docker group, sets up MCP servers, injects Claude Code settings
+2. **Start**: Container started, entrypoint remaps UID/GID, sets up SSH, configures Docker group, injects Claude Code settings
 3. **Terminal**: `docker exec` launches Claude Code (or bash shell) with a PTY
-4. **Stop**: Container halted (filesystem persists in named volume); MCP containers stopped
+4. **Stop**: Container halted (filesystem persists in named volume)
 5. **Restart**: Existing container restarted; recreated if settings changed (detected via SHA-256 fingerprint)
 6. **Reset**: Container removed and recreated from scratch (named volume preserved)
 
@@ -41,7 +41,7 @@ Triple-C is a cross-platform desktop application that sandboxes Claude Code insi
 | `/home/claude/.claude` | `triple-c-claude-config-{projectId}` | Named Volume | Persists across container recreation |
 | `/tmp/.host-ssh` | SSH key directory | Bind | Read-only; entrypoint copies to `~/.ssh` |
 | `/home/claude/.aws` | AWS config directory | Bind | Read-only; for Bedrock auth |
-| `/var/run/docker.sock` | Host Docker socket | Bind | If "Allow container spawning" is ON, or auto-enabled by stdio+Docker MCP servers |
+| `/var/run/docker.sock` | Host Docker socket | Bind | If "Allow container spawning" is ON |
 
 ### Authentication Modes
 
@@ -59,27 +59,6 @@ Each project can independently use one of:
 When "Allow container spawning" is enabled per-project, the host Docker socket is bind-mounted into the container. This allows Claude Code to create **sibling containers** (not nested Docker-in-Docker) that are visible to the host. The entrypoint detects the socket's GID and adds the `claude` user to the matching group.
 
 If the Docker access setting is toggled after a container already exists, the container is automatically recreated on next start to apply the mount change. The named config volume (keyed by project ID) is preserved across recreation.
-
-### MCP Server Architecture
-
-Triple-C supports [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) servers as a Beta feature. MCP servers extend Claude Code with external tools and data sources.
-
-**Modes**: Each MCP server operates in one of four modes based on transport type and whether a Docker image is specified:
-
-| Mode | Where It Runs | How It Communicates |
-|------|--------------|---------------------|
-| Stdio + Manual | Inside the project container | Direct stdin/stdout (e.g., `npx -y @mcp/server`) |
-| Stdio + Docker | Separate MCP container | `docker exec -i <mcp-container> <command>` from the project container |
-| HTTP + Manual | External / user-provided | Connects to the URL you specify |
-| HTTP + Docker | Separate MCP container | `http://<mcp-container>:<port>/mcp` via Docker DNS on a shared bridge network |
-
-**Key behaviors**:
-- **Global library**: MCP servers are defined globally in the MCP sidebar tab and stored in `mcp_servers.json`
-- **Per-project toggles**: Each project enables/disables individual servers via checkboxes
-- **Auto-pull**: Docker images for MCP servers are pulled automatically if not present when the project starts
-- **Docker networking**: Docker-based MCP containers run on a per-project bridge network (`triple-c-net-{projectId}`), reachable by container name — not localhost
-- **Auto-detection**: Config changes are detected via SHA-256 fingerprints and trigger automatic container recreation
-- **Config injection**: MCP server configuration is written to `~/.claude.json` inside the container via the `MCP_SERVERS_JSON` environment variable, merged by the entrypoint using `jq`
 
 ### Mission Control Integration
 
@@ -132,8 +111,6 @@ Users can override this in Settings via the global `docker_socket_path` option.
 | `app/src/components/projects/ProjectList.tsx` | Project list in sidebar |
 | `app/src/components/projects/FileManagerModal.tsx` | File browser modal (browse, download, upload) |
 | `app/src/components/projects/ContainerProgressModal.tsx` | Real-time container operation progress |
-| `app/src/components/mcp/McpPanel.tsx` | MCP server library (global configuration) |
-| `app/src/components/mcp/McpServerCard.tsx` | Individual MCP server configuration card |
 | `app/src/components/settings/SettingsPanel.tsx` | Docker, AWS, timezone, web terminal, and global settings |
 | `app/src/components/settings/WebTerminalSettings.tsx` | Web terminal toggle, URL, token management |
 | `app/src/components/settings/SttSettings.tsx` | STT settings panel (model, port, language, container controls) |
@@ -142,30 +119,25 @@ Users can override this in Settings via the global `docker_socket_path` option.
 | `app/src/components/terminal/TerminalTabs.tsx` | Tab bar for multiple terminal sessions (claude + bash) |
 | `app/src/hooks/useTerminal.ts` | Terminal session management (claude and bash modes) |
 | `app/src/hooks/useFileManager.ts` | File manager operations (list, download, upload) |
-| `app/src/hooks/useMcpServers.ts` | MCP server CRUD operations |
 | `app/src/hooks/useSTT.ts` | Speech-to-text recording, transcription, and container management |
-| `app/src-tauri/src/docker/container.rs` | Container creation, mounts, env vars, MCP injection, fingerprinting |
+| `app/src-tauri/src/docker/container.rs` | Container creation, mounts, env vars, fingerprinting |
 | `app/src-tauri/src/docker/exec.rs` | PTY exec sessions, file upload/download via tar |
 | `app/src-tauri/src/docker/image.rs` | Image building/pulling |
-| `app/src-tauri/src/docker/network.rs` | Per-project bridge networks for MCP containers |
 | `app/src-tauri/src/commands/project_commands.rs` | Start/stop/rebuild Tauri command handlers |
 | `app/src-tauri/src/commands/file_commands.rs` | File manager Tauri commands (list, download, upload) |
-| `app/src-tauri/src/commands/mcp_commands.rs` | MCP server CRUD Tauri commands |
-| `app/src-tauri/src/models/project.rs` | Project struct (backend, Docker access, Claude Code settings, MCP servers, Mission Control) |
-| `app/src-tauri/src/models/mcp_server.rs` | MCP server struct (transport, Docker image, env vars) |
+| `app/src-tauri/src/models/project.rs` | Project struct (backend, Docker access, Claude Code settings, Mission Control) |
 | `app/src-tauri/src/models/app_settings.rs` | Global settings (image source, Docker socket, AWS, Claude Code settings, web terminal, STT) |
 | `app/src-tauri/src/web_terminal/server.rs` | Axum HTTP+WS server for remote terminal access |
 | `app/src-tauri/src/web_terminal/ws_handler.rs` | WebSocket connection handler and session management |
 | `app/src-tauri/src/web_terminal/terminal.html` | Embedded web UI (xterm.js, project picker, tabs) |
 | `app/src-tauri/src/commands/stt_commands.rs` | STT start/stop/transcribe Tauri commands |
 | `app/src-tauri/src/commands/web_terminal_commands.rs` | Web terminal start/stop/status Tauri commands |
-| `app/src-tauri/src/storage/mcp_store.rs` | MCP server persistence (JSON with atomic writes) |
 | `app/src-tauri/src/docker/stt.rs` | STT Docker container lifecycle (create, start, stop, build, pull) |
 | `app/src/lib/wav.ts` | WAV audio encoding for STT transcription |
 | `stt-container/Dockerfile` | Faster Whisper STT container image (Python 3.11 + FastAPI) |
 | `stt-container/server.py` | STT HTTP server (POST /transcribe endpoint) |
 | `container/Dockerfile` | Ubuntu 24.04 sandbox image with Claude Code + dev tools + clipboard/audio shims |
-| `container/entrypoint.sh` | UID/GID remap, SSH setup, Docker group config, MCP injection, Claude Code settings injection, Mission Control setup |
+| `container/entrypoint.sh` | UID/GID remap, SSH setup, Docker group config, Claude Code settings injection, Mission Control setup |
 | `container/osc52-clipboard` | Clipboard shim (xclip/xsel/pbcopy via OSC 52) |
 | `container/audio-shim` | Audio capture shim (rec/arecord via FIFO) for voice mode |
 
