@@ -200,6 +200,17 @@ pub fn run() {
             commands::stt_commands::build_stt_image,
             commands::stt_commands::pull_stt_image,
             commands::stt_commands::transcribe_audio,
+            // Container introspection (sessions / capabilities / scheduler)
+            commands::inspect_commands::list_claude_sessions,
+            commands::inspect_commands::resume_session_command,
+            commands::inspect_commands::list_container_capabilities,
+            commands::inspect_commands::list_scheduled_tasks,
+            commands::inspect_commands::get_scheduled_task_log,
+            commands::inspect_commands::set_scheduled_task_enabled,
+            commands::inspect_commands::run_scheduled_task_now,
+            commands::inspect_commands::remove_scheduled_task,
+            commands::inspect_commands::get_scheduler_notifications,
+            commands::inspect_commands::clear_scheduler_notifications,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

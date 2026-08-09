@@ -255,7 +255,7 @@ ENV_FILE="$SCHEDULER_DIR/.env"
 : > "$ENV_FILE"
 env | while IFS='=' read -r key value; do
     case "$key" in
-        ANTHROPIC_*|AWS_*|CLAUDE_CODE_*|PATH|HOME|LANG|TZ|COLORTERM)
+        ANTHROPIC_*|AWS_*|CLAUDE_CODE_*|TRIPLE_C_PERMISSION_MODE|PATH|HOME|LANG|TZ|COLORTERM)
             # Escape single quotes in value and write as KEY='VALUE'
             escaped_value=$(printf '%s' "$value" | sed "s/'/'\\\\''/g")
             printf "%s='%s'\n" "$key" "$escaped_value" >> "$ENV_FILE"

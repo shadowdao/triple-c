@@ -30,6 +30,50 @@ fn default_full_permissions() -> bool {
     true
 }
 
+/// How much autonomy Claude Code is granted inside the container.
+///
+/// Maps onto Claude Code CLI flags — see [`PermissionMode::cli_args`], which is
+/// the single definition of that mapping and must be used by every call site.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum PermissionMode {
+    /// Read-only planning mode.
+    Plan,
+    /// Claude Code's own default behavior (prompts for permission).
+    #[default]
+    Default,
+    /// Auto-accept file edits, prompt for everything else.
+    AcceptEdits,
+    /// Skip all permission prompts.
+    Bypass,
+}
+
+impl PermissionMode {
+    /// The CLI flags this mode adds to a `claude` invocation.
+    /// Defined once here so every call site stays in sync.
+    pub fn cli_args(&self) -> Vec<String> {
+        match self {
+            PermissionMode::Plan => vec!["--permission-mode".to_string(), "plan".to_string()],
+            PermissionMode::Default => Vec::new(),
+            PermissionMode::AcceptEdits => {
+                vec!["--permission-mode".to_string(), "acceptEdits".to_string()]
+            }
+            PermissionMode::Bypass => vec!["--dangerously-skip-permissions".to_string()],
+        }
+    }
+
+    /// The wire value used for the `TRIPLE_C_PERMISSION_MODE` container env var.
+    /// Matches the serde `camelCase` representation.
+    pub fn as_env_value(&self) -> &'static str {
+        match self {
+            PermissionMode::Plan => "plan",
+            PermissionMode::Default => "default",
+            PermissionMode::AcceptEdits => "acceptEdits",
+            PermissionMode::Bypass => "bypass",
+        }
+    }
+}
+
 /// Settings for Claude Code CLI behavior inside the container.
 /// These map to Claude Code env vars and ~/.claude/settings.json entries.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -78,8 +122,16 @@ pub struct Project {
     pub sandbox_mode_enabled: bool,
     #[serde(default)]
     pub mission_control_enabled: bool,
+    /// Legacy binary permission flag. Superseded by `permission_mode`, but kept
+    /// because it is the value already stored in users' `projects.json`; it is
+    /// the fallback in `effective_permission_mode()` so old projects keep
+    /// behaving identically without a data migration.
     #[serde(default = "default_full_permissions")]
     pub full_permissions: bool,
+    /// Per-project permission mode. `None` means "not set yet" → fall back to
+    /// the legacy `full_permissions` flag.
+    #[serde(default)]
+    pub permission_mode: Option<PermissionMode>,
     pub ssh_key_path: Option<String>,
     #[serde(skip_serializing, default)]
     pub git_token: Option<String>,
@@ -211,6 +263,7 @@ impl Project {
             sandbox_mode_enabled: false,
             mission_control_enabled: false,
             full_permissions: false,
+            permission_mode: None,
             ssh_key_path: None,
             git_token: None,
             git_user_name: None,
@@ -223,6 +276,17 @@ impl Project {
             created_at: now.clone(),
             updated_at: now,
         }
+    }
+
+    /// The permission mode to actually use for this project.
+    /// Falls back to the legacy `full_permissions` boolean when the newer
+    /// `permission_mode` field has never been set.
+    pub fn effective_permission_mode(&self) -> PermissionMode {
+        self.permission_mode.unwrap_or(if self.full_permissions {
+            PermissionMode::Bypass
+        } else {
+            PermissionMode::Default
+        })
     }
 
     pub fn container_name(&self) -> String {

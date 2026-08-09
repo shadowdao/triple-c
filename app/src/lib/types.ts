@@ -27,7 +27,11 @@ export interface Project {
   allow_docker_access: boolean;
   sandbox_mode_enabled: boolean;
   mission_control_enabled: boolean;
+  /** Legacy binary permission flag; superseded by `permission_mode`, kept for
+   *  existing projects.json data. */
   full_permissions: boolean;
+  /** null = not set → falls back to `full_permissions` (true → "bypass"). */
+  permission_mode: PermissionMode | null;
   ssh_key_path: string | null;
   git_token: string | null;
   git_user_name: string | null;
@@ -49,6 +53,9 @@ export type ProjectStatus =
   | "error";
 
 export type Backend = "anthropic" | "bedrock" | "ollama" | "open_ai_compatible";
+
+/** Mirrors Rust `PermissionMode` (serde camelCase). */
+export type PermissionMode = "plan" | "default" | "acceptEdits" | "bypass";
 
 export type BedrockAuthMethod = "static_credentials" | "profile" | "bearer_token";
 
@@ -219,4 +226,70 @@ export interface InstallOptions {
   docs_url: string;
   manual_steps: string[];
   post_install_notes: string[];
+}
+
+// Container introspection (read-only) — see src-tauri/src/commands/inspect_commands.rs
+
+/** A Claude Code session transcript stored on the container's config volume. */
+export interface ClaudeSession {
+  id: string;
+  /** User-set display name (`claude -n <name>`), if any. */
+  name: string | null;
+  /** Claude's auto-generated title, else the session's last prompt. */
+  summary: string | null;
+  last_modified: string;
+  size_bytes: number;
+  message_count: number;
+  cwd: string | null;
+}
+
+export type CapabilityScope = "user" | "project";
+
+export interface CapabilityItem {
+  name: string;
+  description: string | null;
+  scope: CapabilityScope;
+}
+
+export interface CapabilityGroup {
+  count: number;
+  items: CapabilityItem[];
+}
+
+export interface ContainerCapabilities {
+  skills: CapabilityGroup;
+  agents: CapabilityGroup;
+  commands: CapabilityGroup;
+  /** One item per hook event; `count` totals the individual handlers. */
+  hooks: CapabilityGroup;
+  plugins: CapabilityGroup;
+  mcp_servers: CapabilityGroup;
+}
+
+export interface ScheduledTask {
+  id: string;
+  name: string;
+  prompt: string;
+  /** Cron expression (one-shot tasks are stored as cron too — see `at`). */
+  schedule: string;
+  task_type: "recurring" | "once";
+  /** Original `--at` value (`"YYYY-MM-DD HH:MM"`) for one-shot tasks. */
+  at: string | null;
+  enabled: boolean;
+  working_dir: string;
+  created_at: string | null;
+  last_run: string | null;
+  /** Known only for enabled one-shot tasks; cron is not evaluated. */
+  next_run: string | null;
+}
+
+export interface SchedulerNotification {
+  task_id: string;
+  task_name: string | null;
+  status: string | null;
+  time: string | null;
+  task_type: string | null;
+  summary: string | null;
+  body: string;
+  created_at: string;
 }

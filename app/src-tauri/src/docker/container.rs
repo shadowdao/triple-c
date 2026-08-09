@@ -177,7 +177,7 @@ fn compute_env_fingerprint(custom_env_vars: &[EnvVar]) -> String {
     let reserved_prefixes = ["ANTHROPIC_", "AWS_", "GIT_", "HOST_", "TRIPLE_C_"];
     // MCP_SERVERS_JSON is reserved for legacy reasons: the built-in MCP feature was
     // removed, but the name stays blocked so users cannot hand-set it.
-    let reserved_exact = ["CLAUDE_INSTRUCTIONS", "MCP_SERVERS_JSON", "CLAUDE_CODE_SETTINGS_JSON", "MISSION_CONTROL_ENABLED"];
+    let reserved_exact = ["CLAUDE_INSTRUCTIONS", "MCP_SERVERS_JSON", "CLAUDE_CODE_SETTINGS_JSON", "MISSION_CONTROL_ENABLED", "TRIPLE_C_PERMISSION_MODE"];
     let mut parts: Vec<String> = Vec::new();
     for env_var in custom_env_vars {
         let key = env_var.key.trim();
@@ -720,7 +720,7 @@ pub async fn create_container(
     let reserved_prefixes = ["ANTHROPIC_", "AWS_", "GIT_", "HOST_", "TRIPLE_C_"];
     // MCP_SERVERS_JSON is reserved for legacy reasons: the built-in MCP feature was
     // removed, but the name stays blocked so users cannot hand-set it.
-    let reserved_exact = ["CLAUDE_INSTRUCTIONS", "MCP_SERVERS_JSON", "CLAUDE_CODE_SETTINGS_JSON", "MISSION_CONTROL_ENABLED"];
+    let reserved_exact = ["CLAUDE_INSTRUCTIONS", "MCP_SERVERS_JSON", "CLAUDE_CODE_SETTINGS_JSON", "MISSION_CONTROL_ENABLED", "TRIPLE_C_PERMISSION_MODE"];
     for env_var in &merged_env {
         let key = env_var.key.trim();
         if key.is_empty() {
@@ -749,6 +749,13 @@ pub async fn create_container(
     if project.mission_control_enabled {
         env_vars.push("MISSION_CONTROL_ENABLED=1".to_string());
     }
+
+    // Permission mode — read by triple-c-task-runner for scheduled (headless)
+    // Claude Code runs. Interactive terminals get the flags directly instead.
+    env_vars.push(format!(
+        "TRIPLE_C_PERMISSION_MODE={}",
+        project.effective_permission_mode().as_env_value()
+    ));
 
     // Claude instructions (global + per-project, plus port mapping info + scheduler docs)
     let combined_instructions = build_claude_instructions(
@@ -930,6 +937,8 @@ pub async fn create_container(
     labels.insert("triple-c.image".to_string(), image_name.to_string());
     labels.insert("triple-c.timezone".to_string(), timezone.unwrap_or("").to_string());
     labels.insert("triple-c.mission-control".to_string(), project.mission_control_enabled.to_string());
+    labels.insert("triple-c.permission-mode".to_string(),
+        project.effective_permission_mode().as_env_value().to_string());
     labels.insert("triple-c.custom-env-fingerprint".to_string(), custom_env_fingerprint.clone());
     labels.insert("triple-c.claude-code-settings-fingerprint".to_string(),
         compute_claude_code_settings_fingerprint(merged_cc_settings.as_ref(), project.sandbox_mode_enabled));
@@ -1395,6 +1404,22 @@ pub async fn container_needs_recreation(
     let container_mc = get_label("triple-c.mission-control").unwrap_or_else(|| "false".to_string());
     if container_mc != expected_mc {
         log::info!("Mission Control mismatch (container={:?}, expected={:?})", container_mc, expected_mc);
+        return Ok(true);
+    }
+
+    // ── Permission mode ────────────────────────────────────────────────────
+    // The mode is injected as the TRIPLE_C_PERMISSION_MODE env var, and
+    // container env can only change by recreating the container. A missing
+    // label means the container predates this feature and therefore has no
+    // such env var, so it must be recreated too (empty != any valid mode).
+    let expected_permission_mode = project.effective_permission_mode().as_env_value();
+    let container_permission_mode = get_label("triple-c.permission-mode").unwrap_or_default();
+    if container_permission_mode != expected_permission_mode {
+        log::info!(
+            "Permission mode mismatch (container={:?}, expected={:?})",
+            container_permission_mode,
+            expected_permission_mode
+        );
         return Ok(true);
     }
 

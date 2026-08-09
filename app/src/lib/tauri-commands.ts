@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, ImageUpdateInfo, FileEntry, WebTerminalInfo, SttStatus, InstallOptions } from "./types";
+import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, ImageUpdateInfo, FileEntry, WebTerminalInfo, SttStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, SchedulerNotification } from "./types";
 
 // Docker
 export const checkDocker = () => invoke<boolean>("check_docker");
@@ -107,3 +107,29 @@ export const transcribeAudio = (audioData: number[]) =>
 export const detectInstallOptions = () =>
   invoke<InstallOptions>("detect_install_options");
 export const runDockerInstall = () => invoke<void>("run_docker_install");
+
+// Container introspection — sessions
+export const listClaudeSessions = (projectId: string) =>
+  invoke<ClaudeSession[]>("list_claude_sessions", { projectId });
+export const resumeSessionCommand = (projectId: string, sessionId: string) =>
+  invoke<string>("resume_session_command", { projectId, sessionId });
+
+// Container introspection — capabilities
+export const listContainerCapabilities = (projectId: string) =>
+  invoke<ContainerCapabilities>("list_container_capabilities", { projectId });
+
+// Container introspection — scheduler
+export const listScheduledTasks = (projectId: string) =>
+  invoke<ScheduledTask[]>("list_scheduled_tasks", { projectId });
+export const getScheduledTaskLog = (projectId: string, taskId: string, tailLines?: number) =>
+  invoke<string>("get_scheduled_task_log", { projectId, taskId, tailLines });
+export const setScheduledTaskEnabled = (projectId: string, taskId: string, enabled: boolean) =>
+  invoke<string>("set_scheduled_task_enabled", { projectId, taskId, enabled });
+export const runScheduledTaskNow = (projectId: string, taskId: string) =>
+  invoke<string>("run_scheduled_task_now", { projectId, taskId });
+export const removeScheduledTask = (projectId: string, taskId: string) =>
+  invoke<string>("remove_scheduled_task", { projectId, taskId });
+export const getSchedulerNotifications = (projectId: string) =>
+  invoke<SchedulerNotification[]>("get_scheduler_notifications", { projectId });
+export const clearSchedulerNotifications = (projectId: string) =>
+  invoke<void>("clear_scheduler_notifications", { projectId });
