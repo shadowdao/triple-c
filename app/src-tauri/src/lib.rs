@@ -1,4 +1,5 @@
 mod auth_bridge;
+mod browser_view;
 mod commands;
 mod docker;
 mod install_helper;
@@ -126,6 +127,25 @@ pub fn run() {
                 });
             }
 
+            // Auto-start model gateway container if enabled in settings
+            if settings.gateway.enabled {
+                let gateway_settings = settings.gateway.clone();
+                tauri::async_runtime::spawn(async move {
+                    match docker::gateway::ensure_gateway_running(&gateway_settings).await {
+                        Ok(status) => {
+                            if status.running {
+                                log::info!("Model gateway auto-started on port {}", gateway_settings.port);
+                            } else {
+                                log::warn!("Model gateway auto-start: container not running after ensure_gateway_running");
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("Failed to auto-start model gateway container: {}", e);
+                        }
+                    }
+                });
+            }
+
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -139,10 +159,14 @@ pub fn run() {
                     }
                     // Stop STT container
                     let _ = docker::stt::stop_stt_container().await;
+                    // Stop model gateway container
+                    let _ = docker::gateway::stop_gateway_container().await;
                     // Close all exec sessions
                     state.exec_manager.close_all_sessions().await;
                     // Release every host loopback port held by the auth bridge
                     state.auth_bridge.stop_all().await;
+                    // Stop any browser-view proxies and in-container dashboards
+                    browser_view::manager().stop_all().await;
                 });
             }
         })
@@ -165,6 +189,10 @@ pub fn run() {
             // Auth bridge
             commands::auth_bridge_commands::set_auth_bridge_enabled,
             commands::auth_bridge_commands::get_auth_bridge_status,
+            // Browser view (Playwright dashboard pane)
+            browser_view::commands::set_browser_view_enabled,
+            browser_view::commands::get_browser_view_status,
+            browser_view::commands::check_browser_view_support,
             // Shared Claude Code auth token
             commands::auth_token_commands::acquire_claude_token,
             commands::auth_token_commands::submit_claude_token_code,
@@ -216,6 +244,17 @@ pub fn run() {
             commands::stt_commands::build_stt_image,
             commands::stt_commands::pull_stt_image,
             commands::stt_commands::transcribe_audio,
+            // Model gateway (LiteLLM)
+            commands::gateway_commands::get_gateway_status,
+            commands::gateway_commands::start_gateway,
+            commands::gateway_commands::stop_gateway,
+            commands::gateway_commands::check_gateway_health,
+            commands::gateway_commands::build_gateway_image,
+            commands::gateway_commands::pull_gateway_image,
+            commands::gateway_commands::set_gateway_api_key,
+            commands::gateway_commands::clear_gateway_api_key,
+            commands::gateway_commands::get_gateway_auth_token,
+            commands::gateway_commands::regenerate_gateway_auth_token,
             // Container introspection (sessions / capabilities / scheduler)
             commands::inspect_commands::list_claude_sessions,
             commands::inspect_commands::resume_session_command,

@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, ImageUpdateInfo, FileEntry, WebTerminalInfo, SttStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus } from "./types";
+import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, ImageUpdateInfo, FileEntry, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, PlaywrightDetection } from "./types";
 
 // Docker
 export const checkDocker = () => invoke<boolean>("check_docker");
@@ -103,6 +103,21 @@ export const pullSttImage = () => invoke<void>("pull_stt_image");
 export const transcribeAudio = (audioData: number[]) =>
   invoke<string>("transcribe_audio", { audioData });
 
+// Model gateway (LiteLLM)
+export const getGatewayStatus = () => invoke<GatewayStatus>("get_gateway_status");
+export const startGateway = () => invoke<GatewayStatus>("start_gateway");
+export const stopGateway = () => invoke<void>("stop_gateway");
+export const checkGatewayHealth = () => invoke<boolean>("check_gateway_health");
+export const buildGatewayImage = () => invoke<void>("build_gateway_image");
+export const pullGatewayImage = () => invoke<void>("pull_gateway_image");
+/** Write-only: the provider API key is never read back out of the keychain. */
+export const setGatewayApiKey = (apiKey: string) =>
+  invoke<void>("set_gateway_api_key", { apiKey });
+export const clearGatewayApiKey = () => invoke<void>("clear_gateway_api_key");
+export const getGatewayAuthToken = () => invoke<string>("get_gateway_auth_token");
+export const regenerateGatewayAuthToken = () =>
+  invoke<string>("regenerate_gateway_auth_token");
+
 // Docker install helper
 export const detectInstallOptions = () =>
   invoke<InstallOptions>("detect_install_options");
@@ -150,6 +165,19 @@ export const setAuthBridgeEnabled = (projectId: string, enabled: boolean) =>
   invoke<AuthBridgeStatus>("set_auth_bridge_enabled", { projectId, enabled });
 export const getAuthBridgeStatus = (projectId: string) =>
   invoke<AuthBridgeStatus>("get_auth_bridge_status", { projectId });
+
+// Browser view — watch and take over the browser Claude drives with Playwright
+// inside the container. Off by default, per project. Enabling probes the
+// container, starts the Playwright dashboard in it, and puts a token-gated
+// listener on the host's loopback in front of it; the returned `url` is the
+// only way in, and it is never reachable off the machine.
+export const setBrowserViewEnabled = (projectId: string, enabled: boolean) =>
+  invoke<BrowserViewStatus>("set_browser_view_enabled", { projectId, enabled });
+export const getBrowserViewStatus = (projectId: string) =>
+  invoke<BrowserViewStatus>("get_browser_view_status", { projectId });
+/** Probe for Playwright without starting anything — used to re-check after installing it. */
+export const checkBrowserViewSupport = (projectId: string) =>
+  invoke<PlaywrightDetection>("check_browser_view_support", { projectId });
 
 // Shared Claude Code auth token — one `claude setup-token` run authenticates
 // every Anthropic-backend project. The token itself is never exposed here: it

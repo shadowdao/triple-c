@@ -7,9 +7,13 @@ export default function OllamaSettings() {
   const globalOllama = appSettings?.global_ollama ?? {
     base_url: null,
     default_model_id: null,
+    default_haiku_model_id: null,
   };
 
-  const handleChange = async (field: "base_url" | "default_model_id", value: string) => {
+  const handleChange = async (
+    field: "base_url" | "default_model_id" | "default_haiku_model_id",
+    value: string,
+  ) => {
     if (!appSettings) return;
     await saveSettings({
       ...appSettings,
@@ -44,6 +48,17 @@ export default function OllamaSettings() {
             value={globalOllama.default_model_id ?? ""}
             onChange={(e) => handleChange("default_model_id", e.target.value)}
             placeholder="qwen3.5:27b"
+            className="w-full px-2 py-1.5 text-xs bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:border-[var(--accent)]"
+          />
+        </div>
+
+        <div>
+          <span className="text-[var(--text-secondary)] text-xs block mb-1">Default Background Model<span className="text-[var(--text-disabled)]"> (optional)</span><Tooltip text="What the `haiku` alias resolves to, which is also what Claude Code uses for background work such as titles and summaries. Leave blank to reuse the model above — only set this if you have pulled a second, smaller model." /></span>
+          <input
+            type="text"
+            value={globalOllama.default_haiku_model_id ?? ""}
+            onChange={(e) => handleChange("default_haiku_model_id", e.target.value)}
+            placeholder="(same as the model above)"
             className="w-full px-2 py-1.5 text-xs bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:border-[var(--accent)]"
           />
         </div>

@@ -362,13 +362,42 @@ async fn poll_loop(
 /// Ports Docker already handles for this project. A container port that is
 /// explicitly published has a host-side path already, and the mapping's host
 /// port is a binding we must not fight over.
+///
+/// [`RESERVED_CONTAINER_PORTS`] is folded in as well: those are container
+/// loopback listeners another feature owns and exposes on its own,
+/// authenticated terms.
 fn skipped_ports(project: &crate::models::Project) -> HashSet<u16> {
-    project
+    let mut skip: HashSet<u16> = project
         .port_mappings
         .iter()
         .flat_map(|m| [m.container_port, m.host_port])
-        .collect()
+        .collect();
+    skip.extend(RESERVED_CONTAINER_PORTS.clone());
+    skip
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Reservations
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Container loopback ports another feature owns, which the bridge must leave
+/// alone.
+///
+/// The bridge's contract is "mirror every container loopback listener onto the
+/// same host port, **unauthenticated**" — correct for the throwaway OAuth
+/// callback listeners it exists for, wrong for anything sensitive. The
+/// browser-view pane runs Playwright's dashboard on a container loopback port
+/// in this range and puts a token-gated listener in front of it; mirroring that
+/// port here would quietly publish an ungated second door to full control of a
+/// browser inside the container.
+///
+/// This is a constant rather than a registry the pane populates at runtime, and
+/// that is the point: Playwright's dashboard is a detached daemon that outlives
+/// the app, so after a crash an orphaned viewer can still be listening with
+/// nothing in this process left to remember it. A static range is the only form
+/// of the rule that survives a restart. It must stay in step with
+/// `browser_view::VIEWER_PORTS`, which asserts on it.
+pub const RESERVED_CONTAINER_PORTS: std::ops::RangeInclusive<u16> = 39321..=39328;
 
 /// Bring the set of host listeners in line with what the container is currently
 /// listening on. Returns whether anything the UI cares about changed.
@@ -519,7 +548,25 @@ mod tests {
     }
 
     #[test]
-    fn no_mappings_means_nothing_is_skipped() {
-        assert!(skipped_ports(&project_with_mappings(vec![])).is_empty());
+    fn no_mappings_means_nothing_but_the_reserved_range_is_skipped() {
+        let skip = skipped_ports(&project_with_mappings(vec![]));
+        assert_eq!(skip.len(), RESERVED_CONTAINER_PORTS.clone().count());
+    }
+
+    #[test]
+    fn the_browser_views_ports_are_never_mirrored() {
+        // Mirroring these would publish an ungated second door to the
+        // Playwright dashboard, which the pane deliberately keeps behind a
+        // token-checking listener.
+        let skip = skipped_ports(&project_with_mappings(vec![]));
+        for port in RESERVED_CONTAINER_PORTS {
+            assert!(skip.contains(&port), "port {} should be reserved", port);
+        }
+        assert!(!skip.contains(&(RESERVED_CONTAINER_PORTS.end() + 1)));
+
+        // Reservations coexist with Docker's own published ports.
+        let skip = skipped_ports(&project_with_mappings(vec![(3000, 3000)]));
+        assert!(skip.contains(RESERVED_CONTAINER_PORTS.start()));
+        assert!(skip.contains(&3000));
     }
 }

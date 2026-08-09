@@ -23,6 +23,7 @@ export interface Project {
   backend: Backend;
   bedrock_config: BedrockConfig | null;
   ollama_config: OllamaConfig | null;
+  llamacpp_config: LlamaCppConfig | null;
   openai_compatible_config: OpenAiCompatibleConfig | null;
   allow_docker_access: boolean;
   sandbox_mode_enabled: boolean;
@@ -30,6 +31,8 @@ export interface Project {
   /** Mirror container loopback listeners onto host loopback so in-container
    *  browser OAuth logins can complete. Host-side only — no container recreate. */
   auth_bridge_enabled: boolean;
+  /** Opt in to the browser-view pane. Host-side only, like `auth_bridge_enabled`. */
+  browser_view_enabled: boolean;
   /** Use the shared long-lived Claude Code token (from `claude setup-token`,
    *  held in the OS keychain) instead of this project's own `claude login`.
    *  Defaults to true; only applies when `backend` is "anthropic" and a token
@@ -60,7 +63,22 @@ export type ProjectStatus =
   | "stopping"
   | "error";
 
-export type Backend = "anthropic" | "bedrock" | "ollama" | "open_ai_compatible";
+export type Backend =
+  | "anthropic"
+  | "bedrock"
+  | "ollama"
+  | "llama_cpp"
+  | "open_ai_compatible";
+
+/** Backends that point Claude Code at a non-Anthropic endpoint via
+ *  `ANTHROPIC_BASE_URL`. These get the `ANTHROPIC_DEFAULT_*_MODEL` aliases
+ *  pinned to their configured model; Anthropic and Bedrock do not. Mirrors
+ *  Rust `Backend::uses_custom_endpoint`. */
+export const CUSTOM_ENDPOINT_BACKENDS: readonly Backend[] = [
+  "ollama",
+  "llama_cpp",
+  "open_ai_compatible",
+];
 
 /** Mirrors Rust `PermissionMode` (serde camelCase). */
 export type PermissionMode = "plan" | "default" | "acceptEdits" | "bypass";
@@ -83,12 +101,28 @@ export interface BedrockConfig {
 export interface OllamaConfig {
   base_url: string;
   model_id: string | null;
+  /** Optional override for the model the `haiku` alias resolves to (the alias
+   *  Claude Code uses for background work). Blank falls back to `model_id`. */
+  haiku_model_id: string | null;
 }
 
+/** llama.cpp (`llama-server`) — it natively implements the Anthropic Messages
+ *  API at `POST /v1/messages`, so Claude Code talks to it directly. */
+export interface LlamaCppConfig {
+  base_url: string;
+  model_id: string | null;
+  /** See `OllamaConfig.haiku_model_id`. */
+  haiku_model_id: string | null;
+}
+
+/** Despite the name (kept for existing project data), the endpoint must
+ *  implement the **Anthropic** Messages API — e.g. LiteLLM. */
 export interface OpenAiCompatibleConfig {
   base_url: string;
   api_key: string | null;
   model_id: string | null;
+  /** See `OllamaConfig.haiku_model_id`. */
+  haiku_model_id: string | null;
 }
 
 export interface ClaudeCodeSettings {
@@ -137,11 +171,21 @@ export interface GlobalAwsSettings {
 export interface GlobalOllamaSettings {
   base_url: string | null;
   default_model_id: string | null;
+  /** Global fallback for the `haiku` alias override; blank means "use the
+   *  resolved model id". */
+  default_haiku_model_id: string | null;
+}
+
+export interface GlobalLlamaCppSettings {
+  base_url: string | null;
+  default_model_id: string | null;
+  default_haiku_model_id: string | null;
 }
 
 export interface GlobalOpenAiCompatibleSettings {
   base_url: string | null;
   default_model_id: string | null;
+  default_haiku_model_id: string | null;
 }
 
 export interface AppSettings {
@@ -153,6 +197,7 @@ export interface AppSettings {
   custom_image_name: string | null;
   global_aws: GlobalAwsSettings;
   global_ollama: GlobalOllamaSettings;
+  global_llamacpp: GlobalLlamaCppSettings;
   global_openai_compatible: GlobalOpenAiCompatibleSettings;
   global_claude_instructions: string | null;
   global_custom_env_vars: EnvVar[];
@@ -163,6 +208,7 @@ export interface AppSettings {
   dismissed_image_digest: string | null;
   web_terminal: WebTerminalSettings;
   stt: SttSettings;
+  gateway: GatewaySettings;
   global_claude_code_settings: ClaudeCodeSettings | null;
 }
 
@@ -179,6 +225,35 @@ export interface SttStatus {
   port: number;
   model: string;
   image_exists: boolean;
+}
+
+/** One entry of the gateway's LiteLLM `model_list`. */
+export interface GatewayModel {
+  /** Friendly name a project puts in its model field. */
+  name: string;
+  /** Provider-side model id, e.g. `gpt-5.1`. */
+  model_id: string;
+}
+
+export interface GatewaySettings {
+  enabled: boolean;
+  port: number;
+  /** LiteLLM provider prefix — `openai`, `azure`, `gemini`, … */
+  provider: string;
+  api_base: string | null;
+  models: GatewayModel[];
+}
+
+export interface GatewayStatus {
+  container_exists: boolean;
+  running: boolean;
+  port: number;
+  image_exists: boolean;
+  model_count: number;
+  /** Presence only — the provider API key never leaves the keychain. */
+  has_api_key: boolean;
+  /** The value a project should use as its base URL. */
+  base_url: string;
 }
 
 export interface WebTerminalSettings {
@@ -349,6 +424,44 @@ export interface AuthBridgeStatus {
 export interface AuthBridgeChangedEvent {
   project_id: string;
   status: AuthBridgeStatus;
+}
+
+// ── Browser view ─────────────────────────────────────────────────────────────
+
+/** What the container has, as reported by the in-container Playwright probe.
+ *  Mirrors Rust `PlaywrightDetection`. */
+export interface PlaywrightDetection {
+  node_version: string | null;
+  playwright_version: string | null;
+  playwright_path: string | null;
+  /** Whether the resolved Playwright declares the `browser.bind()` live-dashboard API. */
+  has_bind: boolean;
+  cli_version: string | null;
+  cli_entry: string | null;
+  /** Module roots the probe searched, echoed back for the "not found" message. */
+  searched: string[];
+}
+
+/** Mirrors Rust `BrowserViewState` (serde snake_case). */
+export type BrowserViewState = "off" | "running" | "unavailable";
+
+export interface BrowserViewStatus {
+  enabled: boolean;
+  state: BrowserViewState;
+  /** Token-bearing loopback URL for the pane's iframe. Never leaves the host. */
+  url: string | null;
+  host_port: number | null;
+  container_port: number | null;
+  started_at: string | null;
+  detection: PlaywrightDetection | null;
+  /** Why the view isn't running, and what to do about it. */
+  message: string | null;
+}
+
+/** Payload of the `browser-view-changed` event. */
+export interface BrowserViewChangedEvent {
+  project_id: string;
+  status: BrowserViewStatus;
 }
 
 /** Payload of the `claude-token-progress` event: milestones during

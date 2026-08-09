@@ -1,0 +1,27 @@
+# Placeholder LiteLLM config baked into the Triple-C gateway image.
+#
+# This file exists only so the image starts on its own. Triple-C generates the
+# real config from Settings → Model Gateway and uploads it over this path
+# (/etc/litellm/config.yaml) before the container's first start, because the
+# generated file contains the provider API key and must not live in an image
+# layer.
+#
+# The generated file has the same shape:
+#
+#   model_list:
+#     - model_name: <friendly name a project puts in ANTHROPIC_MODEL>
+#       litellm_params:
+#         model: <provider>/<provider-side model id>
+#         api_key: <key read from the OS keychain>
+#         api_base: <optional provider base URL override>
+#   general_settings:
+#     master_key: <generated; projects send it as ANTHROPIC_AUTH_TOKEN>
+#   litellm_settings:
+#     drop_params: true
+
+model_list: []
+
+litellm_settings:
+  # Anthropic-format requests carry fields some providers reject outright.
+  # Dropping unsupported params is what makes the translation survive.
+  drop_params: true

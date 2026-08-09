@@ -218,8 +218,21 @@ Each project independently chooses one backend:
 |------|-------------|-------------|
 | **Anthropic** | Either the shared `CLAUDE_CODE_OAUTH_TOKEN` injected from the OS keychain, or a per-container `claude login` whose credential persists in the `.claude` config volume. The OAuth URL opens in the host browser via URL detection. | Default — personal and team use |
 | **AWS Bedrock** | Per-project AWS credentials (static keys, named profile, or bearer token) injected as env vars. `~/.aws` config optionally bind-mounted read-only; SSO sessions are validated before launching Claude for profile auth. | Enterprise environments using Bedrock |
-| **Ollama** | `ANTHROPIC_BASE_URL` points at an Ollama server; `ANTHROPIC_AUTH_TOKEN` is set to a placeholder. | Local models (best-effort) |
-| **OpenAI Compatible** | `ANTHROPIC_BASE_URL` plus `ANTHROPIC_AUTH_TOKEN` point at any OpenAI-compatible endpoint (LiteLLM, OpenRouter, vLLM, …). | Gateways and proxies (best-effort) |
+| **Ollama** | `ANTHROPIC_BASE_URL` points at an Ollama server; `ANTHROPIC_AUTH_TOKEN` is set to the placeholder `ollama`. Ollama implements `POST /v1/messages` natively. | Local models (best-effort) |
+| **llama.cpp** | `ANTHROPIC_BASE_URL` points at a `llama-server` (default port 8080); `ANTHROPIC_AUTH_TOKEN` is set to the placeholder `llama.cpp`, which `llama-server` ignores unless started with `--api-key`. `llama-server` implements `POST /v1/messages` and `/v1/messages/count_tokens` natively. | Local models (best-effort) |
+| **OpenAI Compatible** | `ANTHROPIC_BASE_URL` plus `ANTHROPIC_AUTH_TOKEN` point at a gateway. **Despite the name, the endpoint must implement the Anthropic Messages API** — Claude Code only ever sends `POST /v1/messages?beta=true`, never `/v1/chat/completions`. LiteLLM works; a bare OpenAI-only server does not. | Anthropic-shaped gateways (best-effort) |
+
+#### Model aliases on custom endpoints
+
+`Backend::uses_custom_endpoint()` (Ollama, llama.cpp, OpenAI Compatible) gates the emission of
+`ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU,FABLE}_MODEL`, computed by
+`docker::container::compute_model_aliases`. All four default to the backend's resolved model id;
+each backend carries an optional `haiku_model_id` override, because the Haiku alias is what Claude
+Code uses for background work. Anthropic and Bedrock emit none of them and keep Claude Code's
+defaults; the four names are in `MANAGED_AUTH_KEYS`, so switching away from a custom endpoint
+blanks the values baked into the snapshot image. The resolved alias set is folded into each
+backend's `triple-c.*-fingerprint` label, since `container_needs_recreation` is label-based and
+never diffs env. `ANTHROPIC_SMALL_FAST_MODEL` is deprecated and unused.
 
 ### Shared Claude Authentication Token
 
@@ -443,7 +456,8 @@ triple-c/
     │       │                                 # ClaudeInstructions, ClaudeCodeSettings —
     │       │                                 # editors reused by Project Home
     │       ├── settings/          # SettingsPanel, DockerSettings, AwsSettings,
-    │       │                      # OllamaSettings, OpenAiCompatibleSettings,
+    │       │                      # OllamaSettings, LlamaCppSettings,
+    │       │                      # OpenAiCompatibleSettings,
     │       │                      # SharedAuthSettings, ClaudeAuthModal,
     │       │                      # WebTerminalSettings, SttSettings,
     │       │                      # MicrophoneSettings, UpdateDialog, ImageUpdateDialog

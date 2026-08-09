@@ -97,6 +97,60 @@ plugins and MCP servers**, at user scope (`/home/claude/.claude`) and project sc
 Triple-C does not create or edit any of them — Claude Code owns that configuration, and the tiles
 link out to a terminal where `/agents`, `/hooks`, `/plugins` and `/mcp` do the real work.
 
+### URL Relay (host browser)
+
+There is no browser and no display inside the container, so any CLI that wants to open a web page
+— `gh auth login`, `aws sso login`, `gcloud auth login`, `az login`, vendor CLIs, `xdg-open`,
+Python's `webbrowser` — simply fails. The URL relay forwards the *request* to the host, where the
+user's real browser is. Nothing is rendered or forwarded from the container; only the URL travels.
+It complements the Auth Bridge below: the relay gets the login page open, the bridge lets the
+callback land.
+
+**Transport — an OSC escape sequence, following `osc52-clipboard`.** `container/triple-c-open`
+writes
+
+```
+ESC ] 7777 ; open ; <base64(url)> BEL
+```
+
+to **`/dev/tty`**, and `TerminalView.tsx` picks it up with `term.parser.registerOscHandler(7777, …)`.
+`/dev/tty` rather than stdout is the whole point: the shim usually runs as a grandchild of
+something that captures its children's output (Claude Code invoking `gh auth login` as a tool
+call), so a printed sentinel line — the `###TRIPLE_C_SSO_REFRESH###` approach — would be swallowed
+by the intermediate process and never reach the terminal. A control sequence on the controlling
+terminal always arrives, and is invisible to terminals that don't know it. Base64 keeps a `;`,
+`BEL` or `ESC` inside the URL from breaking out of the sequence.
+
+**Container side** — `container/triple-c-open`, installed as `xdg-open`, `sensible-browser`,
+`www-browser`, `x-www-browser`, `gnome-open`, `gvfs-open`, `kde-open`, `open`, and exported as
+`$BROWSER`. Ubuntu 24.04 ships a real `/usr/bin/sensible-browser` (from `sensible-utils`), so that
+one is `dpkg-divert`ed rather than merely shadowed by a `/usr/local/bin` symlink; `www-browser` and
+`x-www-browser` are registered through `update-alternatives` and pinned with `--set`, because
+`sensible-browser` probes them by absolute path and because a later `apt install firefox` must not
+be able to steal them. `xdg-open` is diverted pre-emptively so installing `xdg-utils` inside the
+container cannot displace the relay. `BROWSER` is an image-level `ENV` — terminal sessions are
+separate `docker exec`s and never see what the entrypoint exported — and the entrypoint also
+forwards it into the scheduler's cron environment file.
+
+**No terminal attached** (cron-driven scheduled tasks, or a plain `docker exec` from outside
+Triple-C): there is no handshake and nothing to wait for, so the shim never blocks. The write to
+`/dev/tty` fails, and it prints the URL in plain text on its own line and exits 0 — which lands in
+the scheduler task log where a human can still act on it.
+
+**Security posture — the container is the untrusted side.** `app/src/lib/urlRelay.ts` validates
+before anything reaches `openUrl`: `http:`/`https:` only (`file:`, `javascript:`, `data:` and every
+registered protocol handler rejected), no embedded credentials, no control characters or
+whitespace, length-capped, and returned WHATWG-normalized so the prompt shows exactly what will
+open. Nothing opens automatically — the user confirms in the existing `UrlToast`, and prompts are
+rate-limited (5 per 10 s, repeats of the same URL collapsed) so a loop in the container cannot bury
+the UI.
+
+**Web terminal** — deliberately *not* a copy of the desktop behaviour. The browser there belongs to
+a remote viewer, possibly on a phone across a tunnel, so `terminal.html` renders the relayed URL as
+a tap-to-open link banner with the same scheme allowlist and rate limit, and opens nothing by
+itself. The OSC handler is registered regardless so the sequence is consumed rather than painted as
+garbage.
+
 ### Auth Bridge
 
 Browser-based logins run *inside* a container (`claude login`, `aws sso login`, Concourse
@@ -169,9 +223,42 @@ Each project can independently use one of:
 - **Anthropic** (OAuth or shared token): either the shared `claude setup-token` token injected as `CLAUDE_CODE_OAUTH_TOKEN` (see below), or a per-container `claude login`. An interactive login's token lives in the config volume and survives container stop/start and recreation — but **not** a Reset, which deletes the volumes.
 - **AWS Bedrock**: Per-project AWS credentials (static keys, profile, or bearer token). SSO sessions are validated before launching Claude for Profile auth.
 - **Ollama**: Connect to a local or remote Ollama server via `ANTHROPIC_BASE_URL` (e.g., `http://host.docker.internal:11434`). Requires a model ID, and the model must be pulled (or used via Ollama cloud) before starting the container.
-- **OpenAI Compatible**: Connect through any OpenAI API-compatible endpoint (LiteLLM, OpenRouter, vLLM, text-generation-inference, LocalAI, etc.) via `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`. API key stored securely in OS keychain.
+- **llama.cpp**: Connect to a local or remote `llama-server` via `ANTHROPIC_BASE_URL` (e.g., `http://host.docker.internal:8080` — 8080 is `llama-server`'s default port). `ANTHROPIC_AUTH_TOKEN` is set to a placeholder; `llama-server` ignores it unless it was started with `--api-key`.
+- **OpenAI Compatible**: Connect through a gateway that implements the **Anthropic Messages API**, via `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`. API key stored securely in OS keychain.
 
-> **Note:** Ollama and OpenAI Compatible support is best-effort. Claude Code is designed for Anthropic models, so some features (tool use, extended thinking, prompt caching, etc.) may not work as expected with non-Anthropic models behind these backends.
+> **The endpoint must speak the Anthropic Messages API.** Claude Code only ever sends
+> `POST /v1/messages?beta=true` in Anthropic Messages format to `ANTHROPIC_BASE_URL` — it never
+> speaks OpenAI's `/v1/chat/completions`. So a server that exposes *only* an OpenAI-compatible API
+> (plain vLLM, text-generation-inference, LocalAI, OpenRouter, …) will **not** work behind any of
+> these backends. What does work: **LiteLLM**, which exposes an Anthropic-shaped route, and
+> **Ollama** and **llama.cpp**, both of which implement `POST /v1/messages` natively — which is why
+> they get first-class backends of their own rather than going through a translation layer.
+
+#### Model alias variables
+
+The `opus` / `sonnet` / `haiku` / `fable` aliases in Claude Code resolve to Anthropic model IDs by
+default. Against a local server those IDs do not exist, so anything that uses an alias fails —
+most visibly the **background** calls (conversation titles, summaries), which use `haiku`.
+
+For every backend that points at a custom endpoint (Ollama, llama.cpp, OpenAI Compatible),
+Triple-C therefore sets all four:
+
+| Variable | Value |
+|---|---|
+| `ANTHROPIC_DEFAULT_OPUS_MODEL` | the backend's configured model ID |
+| `ANTHROPIC_DEFAULT_SONNET_MODEL` | the backend's configured model ID |
+| `ANTHROPIC_DEFAULT_HAIKU_MODEL` | the **Background model** override, else the configured model ID |
+| `ANTHROPIC_DEFAULT_FABLE_MODEL` | the backend's configured model ID |
+
+A local server usually serves exactly one model, so pointing every alias at it is the right
+default. If you run a second, smaller model for cheap background work, set **Background model**
+(Config → Model, and in global Backend settings) and only the Haiku alias moves.
+
+These are *not* set for the Anthropic or Bedrock backends, which reach servers that really do host
+the Anthropic model IDs. Triple-C manages all four names, so they cannot be set as custom
+environment variables. (`ANTHROPIC_SMALL_FAST_MODEL` is deprecated and is not used.)
+
+> **Note:** Ollama, llama.cpp and OpenAI Compatible support is best-effort. Claude Code is designed for Anthropic models, so some features (tool use, extended thinking, prompt caching, etc.) may not work as expected with non-Anthropic models behind these backends.
 
 ### Container Spawning (Sibling Containers)
 
@@ -244,7 +331,7 @@ Users can override this in Settings via the global `docker_socket_path` option.
 | `app/src/components/settings/SharedAuthSettings.tsx` | Acquire / revoke the shared Claude authentication token |
 | `app/src/components/settings/WebTerminalSettings.tsx` | Web terminal toggle, URL, token management |
 | `app/src/components/settings/SttSettings.tsx` | STT settings panel (model, port, language, container controls) |
-| `app/src/components/terminal/TerminalView.tsx` | xterm.js terminal with WebGL, URL detection, OSC 52 clipboard, image paste |
+| `app/src/components/terminal/TerminalView.tsx` | xterm.js terminal with WebGL, URL detection, OSC 52 clipboard, OSC 7777 URL relay, image paste |
 | `app/src/components/terminal/SttButton.tsx` | Mic button with on-demand STT container start |
 | `app/src/hooks/useTerminal.ts` | Terminal session management (claude and bash modes) |
 | `app/src/hooks/useProjectActions.ts` | Start/stop/reset/backup and terminal-opening helpers |
@@ -276,6 +363,8 @@ Users can override this in Settings via the global `docker_socket_path` option.
 | `container/Dockerfile` | Ubuntu 24.04 sandbox image with Claude Code + dev tools + clipboard/audio shims |
 | `container/entrypoint.sh` | UID/GID remap, SSH setup, Docker group config, Claude Code settings injection, Mission Control setup |
 | `container/osc52-clipboard` | Clipboard shim (xclip/xsel/pbcopy via OSC 52) |
+| `container/triple-c-open` | URL relay shim (xdg-open/`$BROWSER`/sensible-browser via OSC 7777); prints the URL when no terminal is attached |
+| `app/src/lib/urlRelay.ts` | Host-side relay validation: OSC 7777 parsing, http/https allowlist, rate limiting |
 | `container/audio-shim` | Audio capture shim (rec/arecord via FIFO) for voice mode |
 | `container/triple-c-scheduler` | Bash CLI managing scheduled task JSON and the crontab |
 | `container/triple-c-task-runner` | Cron entry point; maps `TRIPLE_C_PERMISSION_MODE` to flags and runs `claude -p` |
@@ -295,6 +384,6 @@ Users can override this in Settings via the global `docker_socket_path` option.
 
 **Pre-installed tools**: Claude Code, Node.js 22 LTS + pnpm, Python 3.12 + uv + ruff, Rust (stable), Docker CLI, git + gh, AWS CLI v2, ripgrep, openssh-client, build-essential
 
-**Shims**: `xclip`/`xsel`/`pbcopy` (OSC 52 clipboard forwarding), `rec`/`arecord` (audio FIFO for voice mode)
+**Shims**: `xclip`/`xsel`/`pbcopy` (OSC 52 clipboard forwarding), `xdg-open`/`sensible-browser`/`www-browser`/`x-www-browser`/`$BROWSER` (OSC 7777 URL relay to the host browser), `rec`/`arecord` (audio FIFO for voice mode)
 
 **Default user**: `claude` (UID/GID 1000, remapped by entrypoint to match host)

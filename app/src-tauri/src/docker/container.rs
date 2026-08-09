@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use sha2::{Sha256, Digest};
 
 use super::client::get_docker;
-use crate::models::{Backend, BedrockAuthMethod, ClaudeCodeSettings, ContainerInfo, EnvVar, GlobalAwsSettings, GlobalOllamaSettings, GlobalOpenAiCompatibleSettings, PortMapping, Project, ProjectPath};
+use crate::models::{Backend, BedrockAuthMethod, ClaudeCodeSettings, ContainerInfo, EnvVar, GlobalAwsSettings, GlobalLlamaCppSettings, GlobalOllamaSettings, GlobalOpenAiCompatibleSettings, PortMapping, Project, ProjectPath};
 
 const SCHEDULER_INSTRUCTIONS: &str = r#"## Scheduled Tasks
 
@@ -194,7 +194,88 @@ const RESERVED_ENV_EXACT: &[&str] = &[
     "MISSION_CONTROL_ENABLED",
     "TRIPLE_C_PERMISSION_MODE",
     CLAUDE_OAUTH_TOKEN_ENV,
+    // The model-alias vars are already covered by the `ANTHROPIC_` prefix
+    // above; they are listed explicitly so that a future narrowing of the
+    // prefix list cannot silently unreserve them, and so `is_reserved_env_key`
+    // reads as the single, complete statement of what Triple-C owns.
+    ANTHROPIC_DEFAULT_OPUS_MODEL,
+    ANTHROPIC_DEFAULT_SONNET_MODEL,
+    ANTHROPIC_DEFAULT_HAIKU_MODEL,
+    ANTHROPIC_DEFAULT_FABLE_MODEL,
 ];
+
+/// Claude Code's model-alias env vars. Each names the concrete model id that
+/// one of the `opus` / `sonnet` / `haiku` / `fable` aliases resolves to.
+///
+/// `ANTHROPIC_DEFAULT_HAIKU_MODEL` is the important one: it is documented as
+/// *"Model ID that the `haiku` alias resolves to, also used for background
+/// functionality"* — conversation titles, summarisation, and other out-of-band
+/// calls. Left unset against a local server, Claude Code sends
+/// Anthropic's own Haiku model id to a server that has never heard of it and
+/// every background call fails, usually silently.
+///
+/// (`ANTHROPIC_SMALL_FAST_MODEL` is the deprecated predecessor of the Haiku
+/// var and is deliberately *not* used.)
+pub const ANTHROPIC_DEFAULT_OPUS_MODEL: &str = "ANTHROPIC_DEFAULT_OPUS_MODEL";
+pub const ANTHROPIC_DEFAULT_SONNET_MODEL: &str = "ANTHROPIC_DEFAULT_SONNET_MODEL";
+pub const ANTHROPIC_DEFAULT_HAIKU_MODEL: &str = "ANTHROPIC_DEFAULT_HAIKU_MODEL";
+pub const ANTHROPIC_DEFAULT_FABLE_MODEL: &str = "ANTHROPIC_DEFAULT_FABLE_MODEL";
+
+/// Resolve the four `ANTHROPIC_DEFAULT_*_MODEL` values for a backend that
+/// points Claude Code at a custom endpoint.
+///
+/// All four aliases fall back to `effective_model` — the backend's configured
+/// model id, already resolved per-project → global. That is the right default:
+/// a local server almost always serves exactly one model, so every alias must
+/// name it or the calls that use an alias (notably the background ones, which
+/// use `haiku`) go to a model the server does not have.
+///
+/// `haiku_override` exists because that is the one alias someone might
+/// legitimately want to point elsewhere — at a second, smaller server-side
+/// model kept for cheap background work. A blank override falls back to
+/// `effective_model` like the others.
+///
+/// Returns pairs in `(name, value)` form; a blank resolved value emits nothing
+/// at all rather than an empty var, so an unconfigured backend is left exactly
+/// as Claude Code found it.
+pub fn compute_model_aliases(
+    effective_model: Option<&str>,
+    haiku_override: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let base = effective_model.map(str::trim).filter(|s| !s.is_empty());
+    let haiku = haiku_override
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or(base);
+
+    let mut out: Vec<(&'static str, String)> = Vec::new();
+    if let Some(m) = base {
+        out.push((ANTHROPIC_DEFAULT_OPUS_MODEL, m.to_string()));
+        out.push((ANTHROPIC_DEFAULT_SONNET_MODEL, m.to_string()));
+    }
+    if let Some(h) = haiku {
+        out.push((ANTHROPIC_DEFAULT_HAIKU_MODEL, h.to_string()));
+    }
+    if let Some(m) = base {
+        out.push((ANTHROPIC_DEFAULT_FABLE_MODEL, m.to_string()));
+    }
+    out
+}
+
+/// The fingerprint contribution of the model aliases, so that changing an
+/// alias (or the model it falls back to) forces a container recreation.
+/// `container_needs_recreation` is label-based and never diffs env, so an
+/// env-only change is invisible without this.
+fn model_alias_fingerprint_part(
+    effective_model: Option<&str>,
+    haiku_override: Option<&str>,
+) -> String {
+    compute_model_aliases(effective_model, haiku_override)
+        .into_iter()
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect::<Vec<_>>()
+        .join(",")
+}
 
 /// Whether `key` is an env var name Triple-C reserves for itself.
 fn is_reserved_env_key(key: &str) -> bool {
@@ -360,7 +441,13 @@ fn compute_bedrock_fingerprint(project: &Project, global_aws: &GlobalAwsSettings
 }
 
 /// Compute a fingerprint for the Ollama configuration so we can detect changes.
-/// Includes the resolved base_url and model_id (per-project blank → global default).
+/// Includes the resolved base_url and model_id (per-project blank → global
+/// default) and the resolved model aliases.
+///
+/// NOTE: adding the alias part changes this hash for every existing Ollama
+/// container, so each will be recreated once on the next start. That is exactly
+/// what is wanted — recreation is the only way to get the new
+/// `ANTHROPIC_DEFAULT_*_MODEL` vars into the container's env.
 fn compute_ollama_fingerprint(project: &Project, global_ollama: &GlobalOllamaSettings) -> String {
     if let Some(ref ollama) = project.ollama_config {
         let effective_url = resolve_with_global(
@@ -371,7 +458,43 @@ fn compute_ollama_fingerprint(project: &Project, global_ollama: &GlobalOllamaSet
             ollama.model_id.as_deref(),
             global_ollama.default_model_id.as_deref(),
         ).unwrap_or("").to_string();
-        let parts = vec![effective_url, effective_model];
+        let aliases = model_alias_fingerprint_part(
+            Some(&effective_model),
+            resolve_with_global(
+                ollama.haiku_model_id.as_deref(),
+                global_ollama.default_haiku_model_id.as_deref(),
+            ),
+        );
+        let parts = vec![effective_url, effective_model, aliases];
+        sha256_hex(&parts.join("|"))
+    } else {
+        String::new()
+    }
+}
+
+/// Compute a fingerprint for the llama.cpp configuration so we can detect
+/// changes. Mirrors [`compute_ollama_fingerprint`].
+fn compute_llamacpp_fingerprint(
+    project: &Project,
+    global_llamacpp: &GlobalLlamaCppSettings,
+) -> String {
+    if let Some(ref cfg) = project.llamacpp_config {
+        let effective_url = resolve_with_global(
+            Some(&cfg.base_url),
+            global_llamacpp.base_url.as_deref(),
+        ).unwrap_or("").to_string();
+        let effective_model = resolve_with_global(
+            cfg.model_id.as_deref(),
+            global_llamacpp.default_model_id.as_deref(),
+        ).unwrap_or("").to_string();
+        let aliases = model_alias_fingerprint_part(
+            Some(&effective_model),
+            resolve_with_global(
+                cfg.haiku_model_id.as_deref(),
+                global_llamacpp.default_haiku_model_id.as_deref(),
+            ),
+        );
+        let parts = vec![effective_url, effective_model, aliases];
         sha256_hex(&parts.join("|"))
     } else {
         String::new()
@@ -393,10 +516,18 @@ fn compute_openai_compatible_fingerprint(
             config.model_id.as_deref(),
             global_openai_compatible.default_model_id.as_deref(),
         ).unwrap_or("").to_string();
+        let aliases = model_alias_fingerprint_part(
+            Some(&effective_model),
+            resolve_with_global(
+                config.haiku_model_id.as_deref(),
+                global_openai_compatible.default_haiku_model_id.as_deref(),
+            ),
+        );
         let parts = vec![
             effective_url,
             config.api_key.as_deref().unwrap_or("").to_string(),
             effective_model,
+            aliases,
         ];
         sha256_hex(&parts.join("|"))
     } else {
@@ -576,6 +707,7 @@ pub async fn create_container(
     aws_config_path: Option<&str>,
     global_aws: &GlobalAwsSettings,
     global_ollama: &GlobalOllamaSettings,
+    global_llamacpp: &GlobalLlamaCppSettings,
     global_openai_compatible: &GlobalOpenAiCompatibleSettings,
     global_claude_instructions: Option<&str>,
     global_custom_env_vars: &[EnvVar],
@@ -701,6 +833,14 @@ pub async fn create_container(
         }
     }
 
+    // ── Custom-endpoint backends ─────────────────────────────────────────────
+    // Ollama, llama.cpp and the OpenAI-Compatible gateway all point Claude Code
+    // at a non-Anthropic server via ANTHROPIC_BASE_URL. Each resolves its model
+    // id here; the model-alias vars are emitted once below, from
+    // `alias_model` / `alias_haiku`, so the three backends cannot drift apart.
+    let mut alias_model: Option<String> = None;
+    let mut alias_haiku: Option<String> = None;
+
     // Ollama configuration
     if project.backend == Backend::Ollama {
         if let Some(ref ollama) = project.ollama_config {
@@ -716,7 +856,44 @@ pub async fn create_container(
                 global_ollama.default_model_id.as_deref(),
             ) {
                 env_vars.push(format!("ANTHROPIC_MODEL={}", model));
+                alias_model = Some(model.to_string());
             }
+            alias_haiku = resolve_with_global(
+                ollama.haiku_model_id.as_deref(),
+                global_ollama.default_haiku_model_id.as_deref(),
+            )
+            .map(str::to_string);
+        }
+    }
+
+    // llama.cpp (llama-server) configuration
+    if project.backend == Backend::LlamaCpp {
+        if let Some(ref cfg) = project.llamacpp_config {
+            if let Some(url) = resolve_with_global(
+                Some(&cfg.base_url),
+                global_llamacpp.base_url.as_deref(),
+            ) {
+                env_vars.push(format!("ANTHROPIC_BASE_URL={}", url));
+            }
+            // llama-server only enforces an Authorization header when it was
+            // started with `--api-key` (default: none), so the value here is
+            // ignored in the common case. Claude Code still refuses to run
+            // against a custom base URL with no credential at all, so a
+            // placeholder is always sent — same trick as the Ollama branch
+            // above, which sends the literal "ollama".
+            env_vars.push("ANTHROPIC_AUTH_TOKEN=llama.cpp".to_string());
+            if let Some(model) = resolve_with_global(
+                cfg.model_id.as_deref(),
+                global_llamacpp.default_model_id.as_deref(),
+            ) {
+                env_vars.push(format!("ANTHROPIC_MODEL={}", model));
+                alias_model = Some(model.to_string());
+            }
+            alias_haiku = resolve_with_global(
+                cfg.haiku_model_id.as_deref(),
+                global_llamacpp.default_haiku_model_id.as_deref(),
+            )
+            .map(str::to_string);
         }
     }
 
@@ -737,7 +914,27 @@ pub async fn create_container(
                 global_openai_compatible.default_model_id.as_deref(),
             ) {
                 env_vars.push(format!("ANTHROPIC_MODEL={}", model));
+                alias_model = Some(model.to_string());
             }
+            alias_haiku = resolve_with_global(
+                config.haiku_model_id.as_deref(),
+                global_openai_compatible.default_haiku_model_id.as_deref(),
+            )
+            .map(str::to_string);
+        }
+    }
+
+    // Model aliases — the fix for background Claude Code calls against a local
+    // server. Only for backends that talk to a custom endpoint: Anthropic and
+    // Bedrock reach servers that really do host the Anthropic model ids, so
+    // they keep Claude Code's own defaults. Anything not emitted here is
+    // blanked by the MANAGED_AUTH_KEYS pass below, so switching *away* from a
+    // custom endpoint clears the aliases out of the snapshot image too.
+    if project.backend.uses_custom_endpoint() {
+        for (key, value) in
+            compute_model_aliases(alias_model.as_deref(), alias_haiku.as_deref())
+        {
+            env_vars.push(format!("{}={}", key, value));
         }
     }
 
@@ -778,6 +975,15 @@ pub async fn create_container(
         "ANTHROPIC_MODEL",
         "DISABLE_PROMPT_CACHING",
         "ANTHROPIC_BEDROCK_SERVICE_TIER",
+        // Switching from a custom-endpoint backend to Anthropic or Bedrock must
+        // *clear* the aliases, not merely stop setting them: a stale
+        // ANTHROPIC_DEFAULT_HAIKU_MODEL baked into the snapshot image would
+        // keep pointing background calls at a model id the new backend has
+        // never heard of.
+        ANTHROPIC_DEFAULT_OPUS_MODEL,
+        ANTHROPIC_DEFAULT_SONNET_MODEL,
+        ANTHROPIC_DEFAULT_HAIKU_MODEL,
+        ANTHROPIC_DEFAULT_FABLE_MODEL,
         // Revoking the shared token, opting a project out, or switching away
         // from the Anthropic backend must *clear* this, not merely stop setting
         // it — otherwise the value committed into the snapshot image keeps
@@ -1004,6 +1210,7 @@ pub async fn create_container(
     labels.insert("triple-c.paths-fingerprint".to_string(), compute_paths_fingerprint(&project.paths));
     labels.insert("triple-c.bedrock-fingerprint".to_string(), compute_bedrock_fingerprint(project, global_aws));
     labels.insert("triple-c.ollama-fingerprint".to_string(), compute_ollama_fingerprint(project, global_ollama));
+    labels.insert("triple-c.llamacpp-fingerprint".to_string(), compute_llamacpp_fingerprint(project, global_llamacpp));
     labels.insert("triple-c.openai-compatible-fingerprint".to_string(), compute_openai_compatible_fingerprint(project, global_openai_compatible));
     labels.insert("triple-c.ports-fingerprint".to_string(), compute_ports_fingerprint(&project.port_mappings));
     labels.insert("triple-c.image".to_string(), image_name.to_string());
@@ -1301,6 +1508,7 @@ pub async fn container_needs_recreation(
     project: &Project,
     global_aws: &GlobalAwsSettings,
     global_ollama: &GlobalOllamaSettings,
+    global_llamacpp: &GlobalLlamaCppSettings,
     global_openai_compatible: &GlobalOpenAiCompatibleSettings,
     global_claude_instructions: Option<&str>,
     global_custom_env_vars: &[EnvVar],
@@ -1384,6 +1592,17 @@ pub async fn container_needs_recreation(
     let container_ollama_fp = get_label("triple-c.ollama-fingerprint").unwrap_or_default();
     if container_ollama_fp != expected_ollama_fp {
         log::info!("Ollama config mismatch");
+        return Ok(true);
+    }
+
+    // ── llama.cpp config fingerprint ─────────────────────────────────────
+    // A missing label means the container predates the llama.cpp backend, in
+    // which case the expected fingerprint is also "" (no llamacpp_config) and
+    // nothing is recreated needlessly.
+    let expected_llamacpp_fp = compute_llamacpp_fingerprint(project, global_llamacpp);
+    let container_llamacpp_fp = get_label("triple-c.llamacpp-fingerprint").unwrap_or_default();
+    if container_llamacpp_fp != expected_llamacpp_fp {
+        log::info!("llama.cpp config mismatch");
         return Ok(true);
     }
 
@@ -1634,4 +1853,231 @@ pub async fn list_sibling_containers() -> Result<Vec<ContainerSummary>, String> 
         .collect();
 
     Ok(siblings)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const OPUS: &str = ANTHROPIC_DEFAULT_OPUS_MODEL;
+    const SONNET: &str = ANTHROPIC_DEFAULT_SONNET_MODEL;
+    const HAIKU: &str = ANTHROPIC_DEFAULT_HAIKU_MODEL;
+    const FABLE: &str = ANTHROPIC_DEFAULT_FABLE_MODEL;
+
+    fn aliases(model: Option<&str>, haiku: Option<&str>) -> Vec<(&'static str, String)> {
+        compute_model_aliases(model, haiku)
+    }
+
+    #[test]
+    fn all_four_aliases_fall_back_to_the_configured_model() {
+        assert_eq!(
+            aliases(Some("qwen3.5:27b"), None),
+            vec![
+                (OPUS, "qwen3.5:27b".to_string()),
+                (SONNET, "qwen3.5:27b".to_string()),
+                (HAIKU, "qwen3.5:27b".to_string()),
+                (FABLE, "qwen3.5:27b".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_haiku_override_replaces_only_the_haiku_alias() {
+        let got = aliases(Some("big-model"), Some("small-model"));
+        assert_eq!(
+            got,
+            vec![
+                (OPUS, "big-model".to_string()),
+                (SONNET, "big-model".to_string()),
+                (HAIKU, "small-model".to_string()),
+                (FABLE, "big-model".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_blank_or_whitespace_haiku_override_falls_back_to_the_model() {
+        for override_value in [Some(""), Some("   "), None] {
+            let got = aliases(Some("m"), override_value);
+            assert_eq!(
+                got.iter().find(|(k, _)| *k == HAIKU).map(|(_, v)| v.as_str()),
+                Some("m"),
+                "override {:?} should fall back to the model id",
+                override_value
+            );
+        }
+    }
+
+    #[test]
+    fn values_are_trimmed() {
+        assert_eq!(
+            aliases(Some("  m  "), Some("  h  ")),
+            vec![
+                (OPUS, "m".to_string()),
+                (SONNET, "m".to_string()),
+                (HAIKU, "h".to_string()),
+                (FABLE, "m".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn no_model_and_no_override_emits_nothing() {
+        // Nothing to point the aliases at — leave Claude Code's defaults alone
+        // rather than injecting empty vars.
+        assert!(aliases(None, None).is_empty());
+        assert!(aliases(Some(""), Some("  ")).is_empty());
+    }
+
+    #[test]
+    fn a_haiku_override_alone_still_fixes_background_calls() {
+        // No model id configured, but the user pointed haiku somewhere: emit
+        // just that one, because it is the alias background work uses.
+        assert_eq!(
+            aliases(None, Some("small-model")),
+            vec![(HAIKU, "small-model".to_string())]
+        );
+    }
+
+    #[test]
+    fn only_custom_endpoint_backends_get_aliases() {
+        assert!(!Backend::Anthropic.uses_custom_endpoint());
+        assert!(!Backend::Bedrock.uses_custom_endpoint());
+        assert!(Backend::Ollama.uses_custom_endpoint());
+        assert!(Backend::LlamaCpp.uses_custom_endpoint());
+        assert!(Backend::OpenAiCompatible.uses_custom_endpoint());
+    }
+
+    #[test]
+    fn every_alias_var_is_reserved_and_managed() {
+        for key in [OPUS, SONNET, HAIKU, FABLE] {
+            assert!(is_reserved_env_key(key), "{} must be reserved", key);
+            assert!(
+                is_reserved_env_key(&key.to_lowercase()),
+                "{} must be reserved case-insensitively",
+                key
+            );
+        }
+        // A user-set alias must never survive into the container env.
+        let fp = compute_env_fingerprint(&[EnvVar {
+            key: HAIKU.to_string(),
+            value: "sneaky".to_string(),
+        }]);
+        assert_eq!(fp, "");
+    }
+
+    #[test]
+    fn the_deprecated_small_fast_model_var_is_never_emitted() {
+        let rendered: Vec<String> = aliases(Some("m"), Some("h"))
+            .into_iter()
+            .map(|(k, _)| k.to_string())
+            .collect();
+        assert!(!rendered.iter().any(|k| k == "ANTHROPIC_SMALL_FAST_MODEL"));
+    }
+
+    #[test]
+    fn the_alias_fingerprint_tracks_both_the_model_and_the_override() {
+        let base = model_alias_fingerprint_part(Some("m"), None);
+        assert_eq!(base, model_alias_fingerprint_part(Some("m"), Some("")));
+        assert_ne!(base, model_alias_fingerprint_part(Some("m2"), None));
+        assert_ne!(base, model_alias_fingerprint_part(Some("m"), Some("h")));
+        assert_eq!(model_alias_fingerprint_part(None, None), "");
+    }
+
+    fn project_with_llamacpp(model: Option<&str>, haiku: Option<&str>) -> Project {
+        let mut p = Project::new("t".to_string(), Vec::new());
+        p.backend = Backend::LlamaCpp;
+        p.llamacpp_config = Some(crate::models::LlamaCppConfig {
+            base_url: "http://host.docker.internal:8080".to_string(),
+            model_id: model.map(str::to_string),
+            haiku_model_id: haiku.map(str::to_string),
+        });
+        p
+    }
+
+    #[test]
+    fn llamacpp_fingerprint_changes_when_the_haiku_override_changes() {
+        let g = GlobalLlamaCppSettings::default();
+        let a = compute_llamacpp_fingerprint(&project_with_llamacpp(Some("m"), None), &g);
+        let b = compute_llamacpp_fingerprint(&project_with_llamacpp(Some("m"), Some("h")), &g);
+        assert_ne!(a, b, "the haiku override must force a container recreation");
+
+        // No config at all -> empty, so projects on other backends are not
+        // flagged for recreation by this fingerprint.
+        let plain = Project::new("t".to_string(), Vec::new());
+        assert_eq!(compute_llamacpp_fingerprint(&plain, &g), "");
+    }
+
+    #[test]
+    fn llamacpp_global_defaults_fill_in_for_blank_per_project_fields() {
+        let g = GlobalLlamaCppSettings {
+            base_url: Some("http://elsewhere:8080".to_string()),
+            default_model_id: Some("global-model".to_string()),
+            default_haiku_model_id: Some("global-haiku".to_string()),
+        };
+        // The per-project base URL is set in the fixture, so only the model and
+        // haiku fields fall through to the globals. Filling them in from the
+        // globals must be indistinguishable from setting them per-project.
+        let with_global = compute_llamacpp_fingerprint(&project_with_llamacpp(None, None), &g);
+        let explicit = compute_llamacpp_fingerprint(
+            &project_with_llamacpp(Some("global-model"), Some("global-haiku")),
+            &GlobalLlamaCppSettings::default(),
+        );
+        assert_eq!(with_global, explicit);
+        // …and changing a global must change the fingerprint, so a global-only
+        // edit still forces a recreation.
+        assert_ne!(
+            with_global,
+            compute_llamacpp_fingerprint(
+                &project_with_llamacpp(None, None),
+                &GlobalLlamaCppSettings {
+                    default_haiku_model_id: Some("other-haiku".to_string()),
+                    ..g.clone()
+                },
+            )
+        );
+        assert_eq!(
+            resolve_with_global(None, g.default_haiku_model_id.as_deref()),
+            Some("global-haiku")
+        );
+        assert_eq!(
+            resolve_with_global(Some("  "), g.default_model_id.as_deref()),
+            Some("global-model")
+        );
+    }
+
+    #[test]
+    fn backend_serde_round_trips_llamacpp_and_accepts_legacy_spellings() {
+        assert_eq!(
+            serde_json::to_string(&Backend::LlamaCpp).unwrap(),
+            "\"llama_cpp\""
+        );
+        for spelling in ["\"llama_cpp\"", "\"llamacpp\"", "\"llama-cpp\"", "\"llama.cpp\""] {
+            let parsed: Backend = serde_json::from_str(spelling).unwrap();
+            assert_eq!(parsed, Backend::LlamaCpp, "failed for {}", spelling);
+        }
+    }
+
+    #[test]
+    fn a_project_json_without_llamacpp_config_still_deserialises() {
+        // `projects.json` written by an older build has no llamacpp_config key.
+        let json = serde_json::json!({
+            "id": "p1",
+            "name": "old",
+            "paths": [],
+            "container_id": null,
+            "status": "stopped",
+            "backend": "ollama",
+            "bedrock_config": null,
+            "ollama_config": { "base_url": "http://x:11434", "model_id": "m" },
+            "openai_compatible_config": null,
+            "allow_docker_access": false,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        });
+        let p: Project = serde_json::from_value(json).unwrap();
+        assert!(p.llamacpp_config.is_none());
+        // The new per-backend haiku override also defaults cleanly.
+        assert!(p.ollama_config.unwrap().haiku_model_id.is_none());
+    }
 }

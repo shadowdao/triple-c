@@ -1,10 +1,17 @@
 interface Props {
   url: string;
+  /** Heading above the URL. Says why the toast appeared. */
+  label?: string;
   onOpen: () => void;
   onDismiss: () => void;
 }
 
-export default function UrlToast({ url, onOpen, onDismiss }: Props) {
+export default function UrlToast({
+  url,
+  label = "Long URL detected",
+  onOpen,
+  onDismiss,
+}: Props) {
   return (
     <div
       className="animate-slide-down"
@@ -33,7 +40,7 @@ export default function UrlToast({ url, onOpen, onDismiss }: Props) {
             marginBottom: 2,
           }}
         >
-          Long URL detected
+          {label}
         </div>
         <div
           style={{

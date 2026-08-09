@@ -226,6 +226,51 @@
   .scroll-bottom-btn:hover { background: var(--accent-hover); }
   .scroll-bottom-btn.visible { display: flex; }
 
+  /* ── URL relay banner ───────────────────── */
+  .relay-banner {
+    position: absolute;
+    top: 8px;
+    left: 50%;
+    transform: translateX(-50%);
+    max-width: min(94%, 620px);
+    display: none;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 10px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.45);
+    z-index: 30;
+  }
+  .relay-banner.visible { display: flex; }
+  .relay-banner-text { flex: 1; min-width: 0; }
+  .relay-banner-label {
+    font-size: 11px;
+    color: var(--text-secondary);
+    margin-bottom: 2px;
+  }
+  .relay-banner-url {
+    display: block;
+    font-size: 12px;
+    font-family: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', 'Menlo', monospace;
+    color: var(--accent);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .relay-banner-dismiss {
+    flex-shrink: 0;
+    background: transparent;
+    border: none;
+    color: var(--text-secondary);
+    font-size: 14px;
+    line-height: 1;
+    padding: 4px 6px;
+    cursor: pointer;
+  }
+  .relay-banner-dismiss:hover { color: var(--text-primary); }
+
   /* ── Empty State ─────────────────────────── */
   .empty-state {
     display: flex;
@@ -272,6 +317,15 @@
     <div class="hint">Use the buttons above to start a Claude or Bash session</div>
   </div>
   <button class="scroll-bottom-btn" id="scrollBottomBtn" title="Scroll to bottom">&#8595;</button>
+  <!-- URL relay: a CLI in the container asked for a browser. Tap-to-open only,
+       never automatic — see the OSC 7777 handler below. -->
+  <div class="relay-banner" id="relayBanner">
+    <div class="relay-banner-text">
+      <div class="relay-banner-label">Container asked to open a URL &mdash; tap to open here</div>
+      <a class="relay-banner-url" id="relayBannerLink" target="_blank" rel="noopener noreferrer"></a>
+    </div>
+    <button class="relay-banner-dismiss" id="relayBannerDismiss" aria-label="Dismiss">&#10005;</button>
+  </div>
 </div>
 
 <!-- Input Bar for mobile/tablet -->
@@ -309,6 +363,96 @@
   const btnTab = document.getElementById('btnTab');
   const btnCtrlC = document.getElementById('btnCtrlC');
   const scrollBottomBtn = document.getElementById('scrollBottomBtn');
+  const relayBanner = document.getElementById('relayBanner');
+  const relayBannerLink = document.getElementById('relayBannerLink');
+  const relayBannerDismiss = document.getElementById('relayBannerDismiss');
+
+  // ── URL relay (OSC 7777) ───────────────────
+  // `container/triple-c-open` — installed in the container as xdg-open,
+  // $BROWSER, sensible-browser, ... — emits ESC]7777;open;<base64(url)>BEL
+  // when a CLI wants a browser. The desktop app turns that into a host-browser
+  // open; here the only browser available is the *remote viewer's*.
+  //
+  // That is a different trust situation, so this deliberately does NOT mirror
+  // the desktop behaviour: nothing opens by itself. The web terminal may be
+  // reached from a phone on the LAN or through a tunnel, and the viewer's
+  // browser carries their own logged-in sessions and can reach their own
+  // network. We surface the request as a tap-to-open link and let the human
+  // decide. (A popup would be blocked without a user gesture anyway.)
+  // The same http/https allowlist as the desktop side applies — this file is
+  // standalone (embedded via include_str!) so it cannot import lib/urlRelay.ts;
+  // the logic is kept deliberately short and identical in behaviour.
+  const RELAY_OSC = 7777;
+  const RELAY_MAX_URL = 8192;
+  let relayTimes = [];
+  let relayLastUrl = null;
+  let relayLastAt = 0;
+  let relayHideTimer = null;
+
+  function sanitizeRelayUrl(raw) {
+    if (typeof raw !== 'string') return null;
+    const s = raw.trim();
+    if (!s || s.length > RELAY_MAX_URL) return null;
+    // Control characters and whitespace first: new URL() strips tabs/newlines,
+    // so "java\nscript:" would otherwise slip through as javascript:.
+    if (/[\s\u0000-\u0020\u007f]/.test(s)) return null;
+    let u;
+    try { u = new URL(s); } catch (e) { return null; }
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+    if (!u.hostname) return null;
+    if (u.username || u.password) return null;  // origin spoofing
+    return u.toString();
+  }
+
+  function parseRelayOsc(data) {
+    if (typeof data !== 'string') return null;
+    const sep = data.indexOf(';');
+    if (sep === -1) return null;
+    if (data.slice(0, sep) !== 'open') return null;
+    const body = data.slice(sep + 1);
+    if (!body || body.length > RELAY_MAX_URL * 2) return null;
+    if (!/^[A-Za-z0-9+/]+=*$/.test(body)) return null;
+    let text;
+    try {
+      const bin = atob(body);
+      const bytes = Uint8Array.from(bin, c => c.charCodeAt(0));
+      text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    } catch (e) { return null; }
+    return sanitizeRelayUrl(text);
+  }
+
+  // Cap the prompt rate so a runaway loop in the container can't bury the UI.
+  function relayAllowed(url) {
+    const now = Date.now();
+    if (url === relayLastUrl && now - relayLastAt < 5000) {
+      relayLastAt = now;
+      return false;
+    }
+    relayTimes = relayTimes.filter(t => now - t < 10000);
+    if (relayTimes.length >= 5) return false;
+    relayTimes.push(now);
+    relayLastUrl = url;
+    relayLastAt = now;
+    return true;
+  }
+
+  function hideRelayBanner() {
+    relayBanner.classList.remove('visible');
+    relayBannerLink.removeAttribute('href');
+    relayBannerLink.textContent = '';
+    clearTimeout(relayHideTimer);
+  }
+
+  function showRelayBanner(url) {
+    relayBannerLink.href = url;
+    relayBannerLink.textContent = url;
+    relayBanner.classList.add('visible');
+    clearTimeout(relayHideTimer);
+    relayHideTimer = setTimeout(hideRelayBanner, 60000);
+  }
+
+  relayBannerDismiss.addEventListener('click', hideRelayBanner);
+  relayBannerLink.addEventListener('click', () => hideRelayBanner());
 
   // ── WebSocket ──────────────────────────────
   function connect() {
@@ -447,6 +591,15 @@
 
     const webLinksAddon = new WebLinksAddon.WebLinksAddon();
     term.loadAddon(webLinksAddon);
+
+    // URL relay from the container (see the OSC 7777 notes above). Always
+    // returns true so the sequence is consumed and never painted as garbage,
+    // whether or not we act on it.
+    term.parser.registerOscHandler(RELAY_OSC, data => {
+      const url = parseRelayOsc(data);
+      if (url && relayAllowed(url)) showRelayBanner(url);
+      return true;
+    });
 
     // Create container div
     const container = document.createElement('div');

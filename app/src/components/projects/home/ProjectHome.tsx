@@ -14,6 +14,7 @@ import SessionsTab from "./SessionsTab";
 import AutomationTab from "./AutomationTab";
 import ConfigTab from "./ConfigTab";
 import FilesTab from "./FilesTab";
+import BrowserTab from "./BrowserTab";
 import { formatUptime } from "./format";
 
 const TABS = [
@@ -22,6 +23,7 @@ const TABS = [
   { id: "automation", label: "Automation" },
   { id: "config", label: "Config" },
   { id: "files", label: "Files" },
+  { id: "browser", label: "Browser" },
 ] as const;
 
 export type ProjectHomeTabId = (typeof TABS)[number]["id"];
@@ -206,6 +208,9 @@ export default function ProjectHome({ projectId, active }: Props) {
           <ConfigTab project={project} save={save} saveState={saveState} />
         )}
         {tab === "files" && <FilesTab project={project} />}
+        {tab === "browser" && (
+          <BrowserTab project={project} active={active && tab === "browser"} />
+        )}
       </div>
 
       {confirmReset && (

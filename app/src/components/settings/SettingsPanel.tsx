@@ -2,7 +2,9 @@ import { useState, useEffect } from "react";
 import DockerSettings from "./DockerSettings";
 import AwsSettings from "./AwsSettings";
 import OllamaSettings from "./OllamaSettings";
+import LlamaCppSettings from "./LlamaCppSettings";
 import OpenAiCompatibleSettings from "./OpenAiCompatibleSettings";
+import GatewaySettings from "./GatewaySettings";
 import { useSettings } from "../../hooks/useSettings";
 import { useUpdates } from "../../hooks/useUpdates";
 import ClaudeInstructionsModal from "../projects/ClaudeInstructionsModal";
@@ -159,7 +161,11 @@ export default function SettingsPanel() {
         <div className="pt-3 border-t border-[var(--border-color)]" />
         <OllamaSettings />
         <div className="pt-3 border-t border-[var(--border-color)]" />
+        <LlamaCppSettings />
+        <div className="pt-3 border-t border-[var(--border-color)]" />
         <OpenAiCompatibleSettings />
+        <div className="pt-3 border-t border-[var(--border-color)]" />
+        <GatewaySettings />
       </AccordionSection>
 
       <AccordionSection id="container" title="Container" defaultOpen={false}>

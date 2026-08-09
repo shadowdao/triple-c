@@ -172,6 +172,24 @@ async fn accept_optional(
 
 /// Carry one accepted host connection into the container over `socat`.
 async fn tunnel_connection(container_id: String, target: String, stream: TcpStream, port: u16) {
+    tunnel_connection_with_prelude(container_id, target, stream, port, Vec::new()).await
+}
+
+/// As [`tunnel_connection`], but `prelude` is written into the container first,
+/// ahead of anything further read from `stream`.
+///
+/// This exists for callers that must *inspect* the beginning of a connection
+/// before deciding to forward it — the browser-view proxy reads the HTTP request
+/// head off the socket to check a token, and then has to put those same bytes
+/// back on the wire. Passing them here keeps the byte stream exact, rather than
+/// re-serialising a parsed request.
+pub async fn tunnel_connection_with_prelude(
+    container_id: String,
+    target: String,
+    stream: TcpStream,
+    port: u16,
+    prelude: Vec<u8>,
+) {
     let cmd = vec!["socat".to_string(), "-".to_string(), target.clone()];
 
     let AttachedExec {
@@ -198,6 +216,13 @@ async fn tunnel_connection(container_id: String, target: String, stream: TcpStre
     // direction drops `input`, which closes the exec's stdin and lets socat see
     // a clean EOF (a half-close, not a teardown of the whole connection).
     let upstream = AbortOnDrop(tokio::spawn(async move {
+        // Bytes the caller already consumed from the socket go first, so the
+        // container sees the connection exactly as the client sent it.
+        if !prelude.is_empty()
+            && (input.write_all(&prelude).await.is_err() || input.flush().await.is_err())
+        {
+            return;
+        }
         let mut buf = vec![0u8; PUMP_BUF];
         loop {
             match host_rx.read(&mut buf).await {

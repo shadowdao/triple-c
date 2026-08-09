@@ -207,6 +207,16 @@ pub async fn start_project_container(
         }
     }
 
+    if project.backend == Backend::LlamaCpp {
+        let cfg = project.llamacpp_config.as_ref()
+            .ok_or_else(|| "llama.cpp backend selected but no llama.cpp configuration found.".to_string())?;
+        if cfg.base_url.trim().is_empty()
+            && settings.global_llamacpp.base_url.as_deref().map(str::trim).unwrap_or("").is_empty()
+        {
+            return Err("llama.cpp base URL is required. Set it per-project or in global llama.cpp settings.".to_string());
+        }
+    }
+
     if project.backend == Backend::OpenAiCompatible {
         let oai_config = project.openai_compatible_config.as_ref()
             .ok_or_else(|| "OpenAI Compatible backend selected but no configuration found.".to_string())?;
@@ -314,6 +324,7 @@ pub async fn start_project_container(
                 &project,
                 &settings.global_aws,
                 &settings.global_ollama,
+                &settings.global_llamacpp,
                 &settings.global_openai_compatible,
                 settings.global_claude_instructions.as_deref(),
                 &settings.global_custom_env_vars,
@@ -356,6 +367,7 @@ pub async fn start_project_container(
                     aws_config_path.as_deref(),
                     &settings.global_aws,
                     &settings.global_ollama,
+                    &settings.global_llamacpp,
                     &settings.global_openai_compatible,
                     settings.global_claude_instructions.as_deref(),
                     &settings.global_custom_env_vars,
@@ -393,6 +405,7 @@ pub async fn start_project_container(
                 aws_config_path.as_deref(),
                 &settings.global_aws,
                 &settings.global_ollama,
+                &settings.global_llamacpp,
                 &settings.global_openai_compatible,
                 settings.global_claude_instructions.as_deref(),
                 &settings.global_custom_env_vars,

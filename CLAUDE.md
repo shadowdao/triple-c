@@ -97,12 +97,24 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   complete against the host browser. Discovers listeners by parsing `/proc/net/tcp{,6}` (the image
   has no `ss`/`netstat`/`lsof`), binds host `127.0.0.1` **only**, and tunnels in over the Docker
   API via `socat`. Opt-in per project.
+- **`browser_view/`** — Watch and take over the browser Claude drives with Playwright inside the
+  container. Runs Playwright's own dashboard (`browser.bind()` + `playwright-cli show`) in the
+  container and fronts it with a **token-gated** loopback proxy. Deliberately does **not** reuse
+  the auth bridge's `PortForward`, which binds an unauthenticated port — fine for a throwaway
+  OAuth listener, wrong for remote control of a browser. Host ports are confined to
+  `47820..=47827` because CSP `frame-src` cannot express a port range and must enumerate them;
+  a unit test asserts the Rust range matches `tauri.conf.json`. Opt-in per project.
 - **`docker/`** — Docker API layer using bollard:
   - `client.rs` — Singleton Docker connection via `OnceLock`
   - `container.rs` — Container lifecycle (create, start, stop, remove, inspect)
   - `exec.rs` — Attached exec streaming. `create_attached_exec()` is the **single** place an
     attached exec is opened; terminal sessions and the auth bridge both go through it.
   - `image.rs` — Image build/pull with progress streaming
+  - `gateway.rs` — Optional LiteLLM sibling container giving Claude Code an Anthropic-format
+    front end for providers that only speak OpenAI (see `gateway-container/`). Mirrors `stt.rs`.
+    Binds `0.0.0.0` — unlike STT — because *project containers*, not the host process, consume
+    it; it therefore **always** sets a LiteLLM `master_key`, since LiteLLM without one accepts
+    any key.
   - `legacy_cleanup.rs` — One-release migration shim removing leftovers from the deleted MCP
     feature (containers labelled `triple-c.mcp-server`, `triple-c-net-*` networks). Deletable once
     users have migrated.
@@ -110,7 +122,7 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   - `server.rs` — Axum server lifecycle (start/stop), serves embedded HTML and handles WS upgrades
   - `ws_handler.rs` — Per-connection WebSocket handler with JSON protocol, session management, cleanup on disconnect
   - `terminal.html` — Self-contained xterm.js web UI embedded via `include_str!()`
-- **`models/`** — Serde structs (`Project`, `Backend`, `BedrockConfig`, `OllamaConfig`, `OpenAiCompatibleConfig`, `ClaudeCodeSettings`, `ContainerInfo`, `AppSettings`, `WebTerminalSettings`). These define the IPC contract with the frontend.
+- **`models/`** — Serde structs (`Project`, `Backend`, `BedrockConfig`, `OllamaConfig`, `LlamaCppConfig`, `OpenAiCompatibleConfig`, `ClaudeCodeSettings`, `ContainerInfo`, `AppSettings`, `WebTerminalSettings`). These define the IPC contract with the frontend.
 - **`storage/`** — Persistence: `projects_store.rs` (JSON file with atomic writes), `secure.rs` (OS keychain via `keyring` crate), `settings_store.rs`
 
 ### Container (`container/`)
@@ -135,7 +147,20 @@ Per-project, independently configured:
 - **Anthropic (OAuth)** — `claude login` in terminal, token persists in config volume
 - **AWS Bedrock** — Static keys, profile, or bearer token injected as env vars
 - **Ollama** — Connect to a local or remote Ollama server via `ANTHROPIC_BASE_URL` (e.g., `http://host.docker.internal:11434`)
-- **OpenAI Compatible** — Connect through any OpenAI API-compatible endpoint (LiteLLM, OpenRouter, vLLM, etc.) via `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`
+- **llama.cpp** — Connect to a local or remote `llama-server` via `ANTHROPIC_BASE_URL` (e.g., `http://host.docker.internal:8080`, its default port)
+- **OpenAI Compatible** — Connect through a gateway implementing the **Anthropic Messages API** (LiteLLM) via `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`
+
+**Claude Code only ever speaks the Anthropic Messages API** (`POST /v1/messages?beta=true`) to
+`ANTHROPIC_BASE_URL` — never OpenAI's `/v1/chat/completions`. Ollama and llama.cpp implement
+`/v1/messages` natively, which is why each gets a plain base-URL backend with no translation shim.
+A server that only exposes an OpenAI-shaped API does not work behind any backend.
+
+For every backend pointing at a custom endpoint (`Backend::uses_custom_endpoint`), all four
+`ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU,FABLE}_MODEL` vars are pinned to the backend's configured
+model id, with an optional per-backend Haiku override. Without this, Claude Code's background
+calls resolve `haiku` to an Anthropic model id the local server does not have and fail silently.
+Anthropic and Bedrock deliberately keep Claude Code's own defaults.
+`ANTHROPIC_SMALL_FAST_MODEL` is deprecated and must not be used.
 
 ## Styling
 

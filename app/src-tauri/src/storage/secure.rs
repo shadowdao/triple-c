@@ -156,3 +156,116 @@ pub fn delete_claude_oauth_token() -> Result<(), String> {
     );
     token_result.and(version_result)
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Model gateway secrets (global, not per project)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Keychain service for the upstream provider API key (OpenAI etc.) the
+/// LiteLLM gateway authenticates to the model provider with. This value is
+/// written into the gateway's generated `config.yaml`, which is uploaded
+/// straight into the container over the Docker API — it is never an env var,
+/// never a Docker label, and is never returned to the frontend.
+const GATEWAY_API_KEY_SERVICE: &str = "triple-c-gateway-provider-api-key";
+
+/// Keychain service for the gateway's **master key** — the credential a
+/// *project* presents to the gateway as `ANTHROPIC_AUTH_TOKEN`. Unlike the
+/// provider key this one is minted by Triple-C and must be readable by the
+/// user, since they have to paste it into a project's model config.
+const GATEWAY_MASTER_KEY_SERVICE: &str = "triple-c-gateway-master-key";
+
+/// Rotation id covering *both* gateway secrets, on the same reasoning as
+/// `CLAUDE_TOKEN_VERSION_SERVICE`: container recreation is driven off Docker
+/// labels, labels are world-readable via `docker inspect`, and a hash of a
+/// secret is a verification oracle. This is unrelated random data that merely
+/// changes whenever either secret does.
+const GATEWAY_SECRET_VERSION_SERVICE: &str = "triple-c-gateway-secret-version";
+
+/// Mint a fresh gateway rotation id. Called after either gateway secret moves.
+fn bump_gateway_secret_version() -> Result<(), String> {
+    let version = uuid::Uuid::new_v4().to_string();
+    let entry = keyring::Entry::new(GATEWAY_SECRET_VERSION_SERVICE, KEYCHAIN_ACCOUNT)
+        .map_err(|e| format!("Keyring error: {}", e))?;
+    entry
+        .set_password(&version)
+        .map_err(|e| format!("Failed to store the gateway secret rotation id: {}", e))
+}
+
+/// The rotation id of the currently stored gateway secrets. Opaque random
+/// data — safe to put in a Docker label, unlike either secret.
+pub fn get_gateway_secret_version() -> Result<Option<String>, String> {
+    read_entry(
+        GATEWAY_SECRET_VERSION_SERVICE,
+        "the gateway secret rotation id",
+    )
+}
+
+/// Store the provider API key, replacing any previous one. Blank input is
+/// rejected rather than silently stored.
+pub fn store_gateway_api_key(key: &str) -> Result<(), String> {
+    if key.trim().is_empty() {
+        return Err("Refusing to store an empty gateway provider API key.".to_string());
+    }
+
+    let entry = keyring::Entry::new(GATEWAY_API_KEY_SERVICE, KEYCHAIN_ACCOUNT)
+        .map_err(|e| format!("Keyring error: {}", e))?;
+    entry
+        .set_password(key.trim())
+        .map_err(|e| format!("Failed to store the gateway provider API key: {}", e))?;
+
+    // Rotation id second: if this fails the key is still usable, and the stale
+    // id only costs one extra container recreation later.
+    bump_gateway_secret_version()
+}
+
+/// Retrieve the provider API key. **Host-side only** — this is consumed when
+/// rendering the gateway config and must not be handed to the frontend.
+pub fn get_gateway_api_key() -> Result<Option<String>, String> {
+    read_entry(GATEWAY_API_KEY_SERVICE, "the gateway provider API key")
+}
+
+/// Whether a provider API key is stored. A keychain failure is reported as
+/// "no key" so the UI degrades to the unconfigured state instead of breaking.
+pub fn has_gateway_api_key() -> bool {
+    matches!(get_gateway_api_key(), Ok(Some(k)) if !k.trim().is_empty())
+}
+
+/// Delete the provider API key and rotate the id so a running gateway holding
+/// the old key is flagged for recreation.
+pub fn delete_gateway_api_key() -> Result<(), String> {
+    let delete_result = delete_entry(GATEWAY_API_KEY_SERVICE, "the gateway provider API key");
+    let version_result = bump_gateway_secret_version();
+    delete_result.and(version_result)
+}
+
+/// The gateway master key, minting one on first use.
+///
+/// The gateway is published on a host port so project containers can reach it,
+/// which means an unauthenticated gateway would be an open proxy onto the
+/// user's provider account for anything that can route to the host. LiteLLM
+/// only enforces auth when a master key is configured, so Triple-C always
+/// configures one.
+pub fn get_or_create_gateway_master_key() -> Result<String, String> {
+    if let Some(existing) = read_entry(GATEWAY_MASTER_KEY_SERVICE, "the gateway master key")? {
+        if !existing.trim().is_empty() {
+            return Ok(existing);
+        }
+    }
+    regenerate_gateway_master_key()
+}
+
+/// Mint a new gateway master key, invalidating the old one. Projects using the
+/// previous value must be updated.
+pub fn regenerate_gateway_master_key() -> Result<String, String> {
+    // LiteLLM requires the master key to start with `sk-`.
+    let key = format!("sk-triple-c-{}", uuid::Uuid::new_v4().simple());
+
+    let entry = keyring::Entry::new(GATEWAY_MASTER_KEY_SERVICE, KEYCHAIN_ACCOUNT)
+        .map_err(|e| format!("Keyring error: {}", e))?;
+    entry
+        .set_password(&key)
+        .map_err(|e| format!("Failed to store the gateway master key: {}", e))?;
+
+    bump_gateway_secret_version()?;
+    Ok(key)
+}

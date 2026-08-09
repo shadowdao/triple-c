@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use super::gateway_settings::GatewaySettings;
 use super::project::{ClaudeCodeSettings, EnvVar};
 
 fn default_true() -> bool {
@@ -53,6 +54,23 @@ pub struct GlobalOllamaSettings {
     pub base_url: Option<String>,
     #[serde(default)]
     pub default_model_id: Option<String>,
+    /// Global fallback for the `haiku` alias override. Blank means "use the
+    /// resolved model id", which is what makes background Claude Code calls
+    /// work against a server that only serves one model.
+    #[serde(default)]
+    pub default_haiku_model_id: Option<String>,
+}
+
+/// Global defaults for the llama.cpp (`llama-server`) backend.
+/// Mirrors [`GlobalOllamaSettings`]; used when the per-project field is blank.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GlobalLlamaCppSettings {
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub default_model_id: Option<String>,
+    #[serde(default)]
+    pub default_haiku_model_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -61,6 +79,8 @@ pub struct GlobalOpenAiCompatibleSettings {
     pub base_url: Option<String>,
     #[serde(default)]
     pub default_model_id: Option<String>,
+    #[serde(default)]
+    pub default_haiku_model_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +102,8 @@ pub struct AppSettings {
     #[serde(default)]
     pub global_ollama: GlobalOllamaSettings,
     #[serde(default)]
+    pub global_llamacpp: GlobalLlamaCppSettings,
+    #[serde(default)]
     pub global_openai_compatible: GlobalOpenAiCompatibleSettings,
     #[serde(default = "default_global_instructions")]
     pub global_claude_instructions: Option<String>,
@@ -101,6 +123,8 @@ pub struct AppSettings {
     pub web_terminal: WebTerminalSettings,
     #[serde(default)]
     pub stt: SttSettings,
+    #[serde(default)]
+    pub gateway: GatewaySettings,
     #[serde(default)]
     pub global_claude_code_settings: Option<ClaudeCodeSettings>,
 }
@@ -180,6 +204,7 @@ impl Default for AppSettings {
             custom_image_name: None,
             global_aws: GlobalAwsSettings::default(),
             global_ollama: GlobalOllamaSettings::default(),
+            global_llamacpp: GlobalLlamaCppSettings::default(),
             global_openai_compatible: GlobalOpenAiCompatibleSettings::default(),
             global_claude_instructions: default_global_instructions(),
             global_custom_env_vars: Vec::new(),
@@ -190,6 +215,7 @@ impl Default for AppSettings {
             dismissed_image_digest: None,
             web_terminal: WebTerminalSettings::default(),
             stt: SttSettings::default(),
+            gateway: GatewaySettings::default(),
             global_claude_code_settings: None,
         }
     }

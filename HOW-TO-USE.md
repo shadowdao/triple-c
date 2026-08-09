@@ -14,10 +14,13 @@ Triple-C (Claude-Code-Container) is a desktop application that runs Claude Code 
 - [Permission Modes](#permission-modes)
 - [Project Configuration](#project-configuration)
 - [Shared Claude Authentication](#shared-claude-authentication)
+- [Opening URLs in Your Browser (URL Relay)](#opening-urls-in-your-browser-url-relay)
 - [Browser Logins Inside the Container (Auth Bridge)](#browser-logins-inside-the-container-auth-bridge)
 - [AWS Bedrock Configuration](#aws-bedrock-configuration)
 - [Ollama Configuration](#ollama-configuration)
+- [llama.cpp Configuration](#llamacpp-configuration)
 - [OpenAI Compatible Configuration](#openai-compatible-configuration)
+- [Model Aliases and Background Calls](#model-aliases-and-background-calls)
 - [Settings](#settings)
 - [Web Terminal (Remote Access)](#web-terminal-remote-access)
 - [Terminal Features](#terminal-features)
@@ -58,8 +61,9 @@ You need access to Claude Code through one of:
 
 - **Anthropic account** — Sign up at https://claude.ai and use `claude login` (OAuth) inside the terminal
 - **AWS Bedrock** — An AWS account with Bedrock access and Claude models enabled
-- **Ollama** — A local or remote Ollama server running an Anthropic-compatible model (best-effort support)
-- **OpenAI Compatible** — Any OpenAI API-compatible endpoint (LiteLLM, OpenRouter, vLLM, text-generation-inference, LocalAI, etc.) (best-effort support)
+- **Ollama** — A local or remote Ollama server (best-effort support)
+- **llama.cpp** — A local or remote `llama-server` (best-effort support)
+- **OpenAI Compatible** — A gateway that implements the **Anthropic Messages API**, such as LiteLLM (best-effort support). A server that only speaks OpenAI's `/v1/chat/completions` will not work — see [OpenAI Compatible Configuration](#openai-compatible-configuration).
 
 ---
 
@@ -142,11 +146,18 @@ Anthropic-backend project uses that token without its own login. See
 4. Make sure the model has been pulled in Ollama (e.g., `ollama pull qwen3.5:27b`) or used via Ollama cloud before starting.
 5. Start the container again.
 
+**llama.cpp:**
+
+1. Stop the container first (most settings can only be changed while stopped).
+2. Open the project's **Config** tab and, under **Model**, set **Backend** to **llama.cpp**.
+3. Set the base URL of your `llama-server` (defaults to `http://host.docker.internal:8080`, `llama-server`'s default port). Set the **Model** to the model it is serving.
+4. Start the container again.
+
 **OpenAI Compatible:**
 
 1. Stop the container first (most settings can only be changed while stopped).
 2. Open the project's **Config** tab and, under **Model**, set **Backend** to **OpenAI Compatible**.
-3. Set the base URL of your OpenAI-compatible endpoint (defaults to `http://host.docker.internal:4000` as an example). Optionally set an API key and model.
+3. Set the base URL of your gateway (defaults to `http://host.docker.internal:4000`, LiteLLM's default port). Optionally set an API key and model.
 4. Start the container again.
 
 ---
@@ -505,7 +516,7 @@ and nothing is stored.
 ### How the token is used
 
 - It is injected only into projects whose backend is **Anthropic** — it means nothing to Bedrock,
-  Ollama or an OpenAI-compatible endpoint.
+  Ollama, llama.cpp or an OpenAI-compatible gateway.
 - Each project can opt out under **Config → Model** ("Use the shared Claude token"). Projects are
   opted **in** by default, so a single sign-in covers your whole fleet; opt a project out if you
   want it pinned to its own `claude login` identity.
@@ -524,6 +535,95 @@ is next started, at which point the same recreation clears the variable.
 > While `setup-token` is running, its output is filtered so anything resembling an `sk-ant-`
 > secret is masked before it reaches the screen — including a secret split across two chunks of
 > output.
+
+---
+
+## Opening URLs in Your Browser (URL Relay)
+
+There is no browser inside the container and no screen to put one on. Any tool that tries to open
+a web page therefore fails, usually with something unhelpful like *"Couldn't find a suitable web
+browser!"*. The **URL relay** fixes that: when a command inside the container asks for a browser,
+the URL is handed to **your** browser on the host.
+
+Nothing is displayed or forwarded from the container — only the URL travels.
+
+It is always on and needs no configuration.
+
+### What you see
+
+A small bar appears at the top of the terminal reading **"Container asked to open a URL"**, with
+the URL and an **Open** button. Click **Open** and the page loads in your normal browser, signed
+in as you. The prompt disappears on its own after 30 seconds if you ignore it.
+
+Triple-C asks rather than opening pages by itself. The container is sandboxed code — some of it
+written by Claude a minute ago — and silently making your logged-in browser visit a URL it chose
+is not something to hand over automatically. One click keeps that decision yours.
+
+### Which commands benefit
+
+Anything that opens a browser to authenticate or to show you a page:
+
+| Command | What it wanted a browser for |
+|---|---|
+| `gh auth login` | GitHub device / OAuth login |
+| `aws sso login` | AWS IAM Identity Center login |
+| `gcloud auth login` | Google Cloud login |
+| `az login` | Azure login |
+| `vercel login`, `netlify login`, `fly auth login`, `heroku login`, `wrangler login` | Vendor CLI logins |
+| `npm login`, `supabase login`, `doctl auth init` | Token / device flows |
+| `xdg-open <url>` in any script | Opening a page directly |
+| `python3 -m webbrowser <url>` | Anything using Python's `webbrowser` module |
+
+Under the hood the container provides a stand-in browser at `/usr/local/bin/triple-c-open`,
+installed under all the names tools look for — `xdg-open`, `sensible-browser`, `www-browser`,
+`x-www-browser`, `gnome-open`, `gvfs-open`, `kde-open`, `open` — and as the `$BROWSER`
+environment variable, which most of the CLIs above consult first. You can also call
+`triple-c-open <url>` yourself.
+
+It works even when the command is run *by* Claude Code rather than typed by you: the relay talks
+to the terminal directly, not through the command's output, so being nested inside a tool call
+does not break it.
+
+### When no terminal is attached
+
+The relay rides on the terminal session. If nothing is attached to the container, there is nothing
+to relay through:
+
+- **Scheduled tasks** (Automation tab) run from cron with no terminal at all.
+- A shell you opened with your own `docker exec`, outside Triple-C.
+
+In those cases the relay does **not** hang or wait. It prints the URL in plain text and returns
+immediately:
+
+```
+triple-c-open: no Triple-C terminal attached — cannot reach the host browser.
+triple-c-open: open this URL manually:
+https://github.com/login/device?user_code=WXYZ-1234
+```
+
+For a scheduled task that text lands in the task log (**Project Home → Automation → Logs**), so
+you can still finish the login yourself afterwards. Practically speaking: don't expect an
+unattended scheduled task to complete an interactive browser login. Authenticate once from a
+terminal session — the credentials persist in the project's config volume — and let the scheduled
+runs use them.
+
+### Security
+
+Requests coming out of the container are treated as untrusted input, because that is what they
+are:
+
+- **Only `http://` and `https://` are ever opened.** `file://`, `javascript:`, `data:` and every
+  custom protocol handler your OS has registered are rejected outright. A container that could
+  make the host open arbitrary URI schemes would have a way out of the sandbox.
+- URLs with embedded credentials (`https://github.com@evil.example/`) are rejected — they
+  misrepresent which site you are about to visit.
+- Control characters, whitespace and oversized payloads are rejected before parsing, so the relay
+  cannot be used to smuggle terminal escape sequences into the UI.
+- The URL is shown to you in its normalized form: what the prompt displays is exactly what opens.
+- Prompts are rate-limited (a handful per ten seconds, with repeats of the same URL collapsed), so
+  a runaway loop in the container cannot bury the interface.
+
+The relay only *asks*. Nothing opens without your click.
 
 ---
 
@@ -607,10 +707,13 @@ To use Claude Code with a local or remote Ollama server, set **Backend** to **Ol
 
 - **Base URL** — The URL of your Ollama server. Defaults to `http://host.docker.internal:11434`, which reaches a locally running Ollama instance from inside the container. For a remote server, use its IP or hostname (e.g., `http://192.168.1.100:11434`).
 - **Model ID** — **Required.** The model to use (e.g., `qwen3.5:27b`). The model must be pulled in Ollama before use — run `ollama pull <model>` or use it via Ollama cloud so it is available when the container starts.
+- **Background model** — Optional. See [Model Aliases and Background Calls](#model-aliases-and-background-calls). Leave blank to reuse the Model ID above.
+
+Global defaults for all three live under **Settings → Backends → Ollama Configuration** and are used whenever the matching per-project field is blank.
 
 ### How It Works
 
-Triple-C sets `ANTHROPIC_BASE_URL` to point Claude Code at your Ollama server instead of Anthropic's API. The `ANTHROPIC_AUTH_TOKEN` is set to `ollama` (required by Claude Code but not used for actual authentication).
+Ollama natively implements the Anthropic Messages API at `POST /v1/messages`, which is the only thing Claude Code ever sends. Triple-C sets `ANTHROPIC_BASE_URL` to point Claude Code at your Ollama server instead of Anthropic's API. The `ANTHROPIC_AUTH_TOKEN` is set to `ollama` (required by Claude Code but not used for actual authentication). The `ANTHROPIC_DEFAULT_*_MODEL` aliases are pinned to your model — see [Model Aliases and Background Calls](#model-aliases-and-background-calls).
 
 > **Note:** Ollama support is best-effort. Claude Code is designed for Anthropic models, so some features (tool use, extended thinking, prompt caching, etc.) may not work as expected with non-Anthropic models.
 
@@ -618,21 +721,103 @@ Triple-C sets `ANTHROPIC_BASE_URL` to point Claude Code at your Ollama server in
 
 ---
 
-## OpenAI Compatible Configuration
+## llama.cpp Configuration
 
-To use Claude Code through any OpenAI API-compatible endpoint, set **Backend** to **OpenAI Compatible** under **Config → Model**. This works with any server that exposes an OpenAI-compatible API, including LiteLLM, OpenRouter, vLLM, text-generation-inference, LocalAI, and others.
+To use Claude Code with a local or remote `llama-server` (from [llama.cpp](https://github.com/ggml-org/llama.cpp)), set **Backend** to **llama.cpp** under **Config → Model**.
+
+`llama-server` implements the Anthropic Messages API natively — `POST /v1/messages` and `POST /v1/messages/count_tokens` — so Claude Code talks to it directly, with no translation layer in between.
 
 ### Settings
 
-- **Base URL** — The URL of your OpenAI-compatible endpoint. Defaults to `http://host.docker.internal:4000` as an example (adjust to match your server's address and port).
-- **API Key** — Optional. The API key for your endpoint, if authentication is required. Stored securely in your OS keychain.
-- **Model ID** — Optional. Override the model to use.
+- **Base URL** — The URL of your `llama-server`. Defaults to `http://host.docker.internal:8080`; **8080** is `llama-server`'s own default port (`--port PORT | port to listen (default: 8080)`). For a remote server, use its IP or hostname.
+- **Model ID** — The model `llama-server` is serving. A `llama-server` process serves one model, so this is mostly the id Claude Code reports — but it is also what the model aliases are pinned to, so setting it matters.
+- **Background model** — Optional. See [Model Aliases and Background Calls](#model-aliases-and-background-calls). Leave blank to reuse the Model ID above.
+
+Global defaults for all three live under **Settings → Backends → llama.cpp Configuration** and are used whenever the matching per-project field is blank.
+
+### Starting llama-server
+
+```bash
+llama-server -m /path/to/model.gguf --port 8080 --host 0.0.0.0
+```
+
+`--host 0.0.0.0` matters: `llama-server` binds `127.0.0.1` by default, which the container cannot reach through `host.docker.internal`.
 
 ### How It Works
 
-Triple-C sets `ANTHROPIC_BASE_URL` to point Claude Code at your OpenAI-compatible endpoint. If an API key is provided, it is set as `ANTHROPIC_AUTH_TOKEN`.
+Triple-C sets `ANTHROPIC_BASE_URL` to your `llama-server`, and `ANTHROPIC_AUTH_TOKEN` to the placeholder `llama.cpp`. `llama-server` only checks the `Authorization` header when it was started with `--api-key` (default: none), so the value is ignored in the usual case — but Claude Code requires *some* credential to be present, so one is always sent.
+
+> **Note:** llama.cpp support is best-effort. Claude Code is designed for Anthropic models, so some features (tool use, extended thinking, prompt caching, etc.) may not work as expected with non-Anthropic models.
+
+---
+
+## OpenAI Compatible Configuration
+
+To route Claude Code through a gateway, set **Backend** to **OpenAI Compatible** under **Config → Model**.
+
+> **The name is misleading, and the distinction matters.** Claude Code only ever sends
+> `POST /v1/messages?beta=true` in **Anthropic Messages** format to `ANTHROPIC_BASE_URL`. It never
+> calls OpenAI's `/v1/chat/completions`. So this backend requires an endpoint that implements the
+> **Anthropic Messages API** — **LiteLLM** does, and works. A server that exposes only an
+> OpenAI-compatible API (plain vLLM, text-generation-inference, LocalAI, OpenRouter, …) will
+> **not** work here; put an Anthropic-shaped gateway such as LiteLLM in front of it.
+> For Ollama and llama.cpp, use their own backends — both implement `/v1/messages` natively.
+>
+> (The backend name is kept as-is so existing projects keep working.)
+
+### Settings
+
+- **Base URL** — The URL of your gateway. Defaults to `http://host.docker.internal:4000`, LiteLLM's default port (adjust to match your server's address and port).
+- **API Key** — Optional. The API key for your endpoint, if authentication is required. Stored securely in your OS keychain.
+- **Model ID** — Optional. Override the model to use.
+- **Background model** — Optional. See [Model Aliases and Background Calls](#model-aliases-and-background-calls). Leave blank to reuse the Model ID above.
+
+Global defaults for the base URL, model and background model live under **Settings → Backends → OpenAI Compatible Configuration**.
+
+### How It Works
+
+Triple-C sets `ANTHROPIC_BASE_URL` to point Claude Code at your gateway. If an API key is provided, it is set as `ANTHROPIC_AUTH_TOKEN`.
 
 > **Note:** OpenAI Compatible support is best-effort. Claude Code is designed for Anthropic models, so some features (tool use, extended thinking, prompt caching, etc.) may not work as expected when routing to non-Anthropic models through the endpoint.
+
+---
+
+## Model Aliases and Background Calls
+
+Claude Code has four model aliases — `opus`, `sonnet`, `haiku` and `fable`. Left alone they resolve
+to **Anthropic's** model IDs. A local server has never heard of those IDs, so every call that goes
+through an alias fails, usually with no visible error.
+
+The one that bites hardest is `haiku`: `ANTHROPIC_DEFAULT_HAIKU_MODEL` is documented as *"Model ID
+that the `haiku` alias resolves to, also used for background functionality"* — conversation titles,
+summaries, and other out-of-band work. If it is wrong, those quietly stop happening.
+
+So for every backend that points at a custom endpoint — **Ollama**, **llama.cpp** and **OpenAI
+Compatible** — Triple-C sets all four:
+
+| Variable | Value |
+|---|---|
+| `ANTHROPIC_DEFAULT_OPUS_MODEL` | your configured **Model ID** |
+| `ANTHROPIC_DEFAULT_SONNET_MODEL` | your configured **Model ID** |
+| `ANTHROPIC_DEFAULT_HAIKU_MODEL` | your **Background model**, or the **Model ID** if that is blank |
+| `ANTHROPIC_DEFAULT_FABLE_MODEL` | your configured **Model ID** |
+
+**Leaving Background model blank is the right default.** A local server almost always serves one
+model, and pointing every alias at it is what makes background work succeed.
+
+Set **Background model** only if you serve a second, smaller model you would rather spend on titles
+and summaries. It moves the Haiku alias alone; the other three still follow **Model ID**. It is
+available per-project (Config → Model) and globally (Settings → Backends), with the usual
+per-project-overrides-global rule.
+
+Notes:
+
+- These variables are **not** set for the **Anthropic** or **Bedrock** backends. Those reach
+  servers that genuinely host the Anthropic model IDs, so Claude Code's own defaults are correct.
+- All four names are reserved — you cannot set them yourself as custom environment variables.
+- Changing a model or a Background model **recreates the container on the next start**, because
+  environment variables can only change at creation time.
+- `ANTHROPIC_SMALL_FAST_MODEL`, the deprecated predecessor of the Haiku variable, is not used.
 
 ---
 
@@ -940,7 +1125,7 @@ The sandbox container (Ubuntu 24.04) comes pre-installed with:
 | build-essential | — | C/C++ compiler toolchain |
 | openssh-client | — | SSH for git and remote access |
 
-The container also includes **clipboard shims** (`xclip`, `xsel`, `pbcopy`) that forward copy operations to the host via OSC 52, and an **audio shim** (`rec`, `arecord`) for future voice mode support.
+The container also includes **clipboard shims** (`xclip`, `xsel`, `pbcopy`) that forward copy operations to the host via OSC 52, a **browser shim** (`triple-c-open`, installed as `xdg-open`, `sensible-browser`, `www-browser`, `x-www-browser` and `$BROWSER`) that relays URLs to your host browser — see [Opening URLs in Your Browser](#opening-urls-in-your-browser-url-relay) — and an **audio shim** (`rec`, `arecord`) for future voice mode support.
 
 You can install additional tools at runtime with `sudo apt install`, `pip install`, `npm install -g`, etc. Installed packages persist across container stops (but not across resets).
 
@@ -989,6 +1174,28 @@ These features are built into Claude Code and work inside Triple-C containers wi
 - Triple-C detects long URLs printed by `claude login` and shows a toast with an **Open** button.
 - If the toast doesn't appear, try scrolling up in the terminal — the URL may have already been printed.
 - You can also manually copy the URL from the terminal output and paste it into your browser.
+
+### "Couldn't find a suitable web browser" / a Command Won't Open a Page
+
+The [URL relay](#opening-urls-in-your-browser-url-relay) should catch this. If a command still
+complains, check from a terminal session in that project:
+
+```bash
+echo "$BROWSER"                       # /usr/local/bin/triple-c-open
+triple-c-open https://example.com/    # should raise the prompt in the terminal
+```
+
+If `$BROWSER` is empty or `triple-c-open` is missing, the container is running an **older image**.
+Rebuild it (Project Home → **Reset**, or pull/build the image again from Settings) — the relay is
+part of the container image, not something the app can inject into a running container.
+
+If you see *"no Triple-C terminal attached"*, the command is running somewhere with no terminal —
+a scheduled task, or a shell you opened with your own `docker exec`. The URL is printed instead;
+copy it into your browser. See
+[When no terminal is attached](#when-no-terminal-is-attached).
+
+If the prompt says the URL was refused, the command asked for a scheme the relay will not open on
+your machine (anything that isn't `http`/`https`).
 
 ### A Browser Login Never Completes
 

@@ -21,6 +21,7 @@ const BACKEND_LABEL: Record<Project["backend"], string> = {
   anthropic: "Anthropic",
   bedrock: "AWS Bedrock",
   ollama: "Ollama",
+  llama_cpp: "llama.cpp",
   open_ai_compatible: "OpenAI Compatible",
 };
 
