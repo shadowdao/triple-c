@@ -8,6 +8,7 @@ import { ProjectStatusIndicator } from "../../ui/StatusIndicator";
 import Button from "../../ui/Button";
 import OverflowMenu from "../../ui/OverflowMenu";
 import ConfirmRemoveModal from "../ConfirmRemoveModal";
+import ConfirmResetModal from "../ConfirmResetModal";
 import OverviewTab from "./OverviewTab";
 import SessionsTab from "./SessionsTab";
 import AutomationTab from "./AutomationTab";
@@ -39,6 +40,7 @@ export default function ProjectHome({ projectId, active }: Props) {
   const project = projects.find((p) => p.id === projectId);
   const [tab, setTab] = useState<ProjectHomeTabId>("overview");
   const [confirmRemove, setConfirmRemove] = useState(false);
+  const [confirmReset, setConfirmReset] = useState(false);
   const { runningSince, progress } = useAppState(
     useShallow((s) => ({
       runningSince: s.runningSince[projectId],
@@ -144,9 +146,10 @@ export default function ProjectHome({ projectId, active }: Props) {
                   disabled: actions.backingUp || !project.container_id,
                 },
                 {
-                  label: "Reset container",
-                  onSelect: actions.handleReset,
+                  label: "Reset container…",
+                  onSelect: () => setConfirmReset(true),
                   disabled: !isStopped || actions.busy,
+                  danger: true,
                 },
                 {
                   label: "Remove project…",
@@ -205,6 +208,16 @@ export default function ProjectHome({ projectId, active }: Props) {
         {tab === "files" && <FilesTab project={project} />}
       </div>
 
+      {confirmReset && (
+        <ConfirmResetModal
+          projectName={project.name}
+          onCancel={() => setConfirmReset(false)}
+          onConfirm={() => {
+            setConfirmReset(false);
+            actions.handleReset();
+          }}
+        />
+      )}
       {confirmRemove && (
         <ConfirmRemoveModal
           projectName={project.name}
