@@ -502,6 +502,26 @@ export interface ClaudeTokenOutputEvent {
   chunk: string;
 }
 
+/** Payload of the `claude-token-link`: a sign-in URL taken from an OSC 8
+ *  hyperlink parameter, which is the only place the CLI emits it whole — the
+ *  visible text is sliced to the terminal width. **Untrusted**: it is container
+ *  output, so it goes through `sanitizeRelayUrl` with the
+ *  `ANTHROPIC_SIGN_IN_HOSTS` allowlist before it is shown or opened. */
+export interface ClaudeTokenLinkEvent {
+  project_id: string;
+  url: string;
+}
+
+/** Payload of `claude-token-code-rejected`: `claude setup-token` refused the
+ *  submitted code and is parked waiting for another one. The flow is still
+ *  alive, so this is recoverable — `attempts_remaining` is how many more codes
+ *  the backend will pass on before giving up. */
+export interface ClaudeTokenCodeRejectedEvent {
+  project_id: string;
+  message: string;
+  attempts_remaining: number;
+}
+
 // ── Container base-image migration ───────────────────────────────────────────
 //
 // A project's container is created from its own `triple-c-snapshot-<id>:latest`

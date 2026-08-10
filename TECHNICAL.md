@@ -245,9 +245,31 @@ minutes.
 
 - **Storage** — the OS keychain, under a dedicated service name; the token is never returned to the
   frontend, never written to a log, and no command accepts or returns it.
+- **The sign-in URL comes from the OSC 8 parameter, not the screen.** The CLI emits the URL as a
+  hyperlink and slices the *visible* text of it to the terminal width — measured against 2.1.226, a
+  346-character URL arrives at 80 columns as five separate hyperlink emissions, each carrying the
+  whole URL in its parameter and 80 characters of it on screen. Scraping the visible text yields a
+  URL that parses, points at `claude.com`, and cannot authorise anything, so the ANSI stripper
+  surfaces the hyperlink target and `claude-token-link` carries it to the UI. The frontend applies
+  the `ANTHROPIC_SIGN_IN_HOSTS` allowlist to it before display and again before `openUrl` — an OSC 8
+  parameter is container output that is never rendered, which makes it the *easier* place to hide a
+  hostile host, not a trusted one. `stty cols 400` (up from 200, which the URL still overflowed)
+  removes wrapping as a variable elsewhere, but it is not the fix: that line fails silently.
+- **A rejected code is recoverable, not a hang.** On a bad paste the CLI prints
+  `OAuth error: Invalid code…` / `Press Enter to retry.` and blocks on stdin rather than exiting.
+  The streamed output is scanned for that, `claude-token-code-rejected` reopens the input with an
+  explanation, and the Enter is sent so the next code has a prompt to land in — bounded by
+  `MAX_CODE_ATTEMPTS`, after which the flow reports a failure. Without this the exec sat until the
+  15-minute timeout with the UI still saying "Finishing sign-in".
 - **Redaction** — streamed output is stripped of ANSI sequences and passed through a stateful
   redactor that masks anything matching `sk-ant-` with a plausible body, withholding any tail that
-  could still grow into a secret across a chunk boundary.
+  could still grow into a secret across a chunk boundary. A credential split across a hard line
+  wrap is reassembled by both the parser and the redactor from the same `scan_credential_body`, so
+  the two cannot disagree about where a credential ends — previously a wrapped token was rejected
+  as too short *and* its second line, which carries no `sk-ant-` marker, was printed to the UI in
+  clear. A run is only joined across a break that sits at a plausible terminal margin and is not
+  already long enough to be a whole credential; otherwise a repainting TUI would weld one frame's
+  token onto the next frame's first word.
 - **Injection** — `CLAUDE_CODE_OAUTH_TOKEN` is set only when the backend is Anthropic, the project
   has not opted out (`use_shared_auth_token`, default `true`), and a non-blank token is stored. When
   those conditions do not hold, the variable is explicitly set to empty rather than omitted, so a

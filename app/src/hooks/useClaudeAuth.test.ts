@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { authErrorMessage, extractSignInUrl } from "./useClaudeAuth";
+import {
+  authErrorMessage,
+  extractSignInUrl,
+  pickSignInUrl,
+} from "./useClaudeAuth";
 
 describe("extractSignInUrl", () => {
   it("finds the authorize URL in realistic setup-token output", () => {
@@ -78,6 +82,64 @@ describe("extractSignInUrl", () => {
     const first = "https://claude.ai/oauth/authorize?code=true";
     const second = "https://platform.claude.com/oauth/authorize?code=true&more=1";
     expect(extractSignInUrl(`${first}\n${second}\n`)).toBe(first);
+  });
+
+  // ── Why the scraper is only the fallback ─────────────────────────────────
+  // `claude setup-token` emits the URL as an OSC 8 hyperlink and slices the
+  // *visible* text of it to the terminal width, so the transcript holds five
+  // 80-character pieces of a 346-character URL. Each piece is a valid,
+  // Anthropic-hosted, oauth-looking URL — and none of them authorises
+  // anything.
+
+  it("cannot recover a URL the CLI sliced across lines, which is why the hyperlink wins", () => {
+    const slices = [
+      FULL_URL.slice(0, 80),
+      FULL_URL.slice(80, 160),
+      FULL_URL.slice(160, 240),
+      FULL_URL.slice(240, 320),
+      FULL_URL.slice(320),
+    ];
+    const scraped = extractSignInUrl(slices.join("\n"));
+
+    // Documenting the limit, not endorsing it: the pieces share no prefix, so
+    // the "extends the current pick" rule cannot join them, and guessing at
+    // line joins on an untrusted stream is not on the table.
+    expect(scraped).toBe(slices[0]);
+    expect(scraped).not.toBe(FULL_URL);
+
+    // The hyperlink parameter carries the whole thing, and that is what the
+    // hook prefers.
+    expect(pickSignInUrl([FULL_URL])).toBe(FULL_URL);
+  });
+});
+
+/** The real sign-in URL, at its measured length (346 characters, Claude Code
+ *  2.1.226). */
+const FULL_URL =
+  "https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&scope=user%3Ainference&code_challenge=RUX5MlWvwld1dmpvF_aPIJQWMBmffuJt4dOdL13zWAg&code_challenge_method=S256&state=su-x9PgZzvkBd3-um6G1llLNDgxptyO6HERvvCSrTbg";
+
+describe("pickSignInUrl", () => {
+  it("keeps a 346-character authorize URL intact", () => {
+    expect(FULL_URL).toHaveLength(346);
+    expect(pickSignInUrl([FULL_URL])).toBe(FULL_URL);
+  });
+
+  it("applies the same host allowlist to a hyperlink target", () => {
+    // An OSC 8 parameter is container output like anything else, and it is
+    // never displayed — so it is the *easier* place to hide a hostile host.
+    expect(pickSignInUrl(["https://evil.tld/cai/oauth/authorize"])).toBeNull();
+    expect(
+      pickSignInUrl(["https://claude.ai@evil.tld/oauth/authorize"]),
+    ).toBeNull();
+    expect(pickSignInUrl(["javascript:alert(1)"])).toBeNull();
+    expect(pickSignInUrl([])).toBeNull();
+  });
+
+  it("does not let a later hyperlink displace the one already shown", () => {
+    const real = `${FULL_URL}`;
+    const spoof = "https://claude.com.evil.tld/cai/oauth/authorize?code=true";
+    expect(pickSignInUrl([real, spoof])).toBe(real);
+    expect(pickSignInUrl([spoof, real])).toBe(real);
   });
 });
 
