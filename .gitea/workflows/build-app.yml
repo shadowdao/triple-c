@@ -454,23 +454,25 @@ jobs:
           TAURI_CONFIG: "{\"build\":{\"beforeBuildCommand\":\"\"}}"
         run: |
           set "PATH=%USERPROFILE%\.cargo\bin;C:\Program Files\nodejs;%PATH%"
-          rem NSIS only: the MSI target needs WiX, whose candle.exe/light.exe are
-          rem 32-bit. On a runner running as SYSTEM, Tauri caches WiX under
-          rem %LOCALAPPDATA% = C:\Windows\system32\config\systemprofile\..., and
-          rem WOW64 redirection points 32-bit processes at SysWOW64, where that
-          rem directory does not exist - so candle cannot see its own folder and
-          rem dies with 0x80131700. Tauri aborts the whole bundle when one target
-          rem fails, so the MSI was also costing us the NSIS installer.
+          rem Every Tauri bundler it downloads - candle.exe, light.exe and
+          rem makensis.exe - is 32-bit. A runner running as SYSTEM has
+          rem %LOCALAPPDATA% under C:\Windows\system32\config\systemprofile, and
+          rem WOW64 redirection sends 32-bit processes reading System32 to
+          rem SysWOW64, so they cannot see their own directory: candle exits
+          rem 0x80131700 and makensis reports "Unable to start child process,
+          rem error 0x2".
           rem
-          rem NSIS is what the project ships for Windows upgrades anyway. To bring
-          rem the MSI back, run the runner as a normal user (whose LOCALAPPDATA is
-          rem outside System32) and restore --bundles msi,nsis.
-          cargo tauri build --bundles nsis
+          rem The build VM carries junctions from the SysWOW64 view of
+          rem systemprofile\AppData\Local\tauri and systemprofile\.cache to the
+          rem System32 originals, which makes the redirected view resolve. A
+          rem runner running as a normal user needs no such patch.
+          cargo tauri build --bundles msi,nsis
 
       - name: Collect artifacts
         run: |
           set "PATH=%USERPROFILE%\.cargo\bin;C:\Program Files\nodejs;%PATH%"
           mkdir artifacts
+          copy app\src-tauri\target\release\bundle\msi\*.msi artifacts\ || exit /b 1
           copy app\src-tauri\target\release\bundle\nsis\*.exe artifacts\ || exit /b 1
           dir artifacts\
 
