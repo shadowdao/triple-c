@@ -176,6 +176,39 @@ fn build_claude_instructions(
 /// stale-value neutralization pass can never disagree about the spelling.
 pub const CLAUDE_OAUTH_TOKEN_ENV: &str = "CLAUDE_CODE_OAUTH_TOKEN";
 
+/// Every managed env var whose *value* is a credential.
+///
+/// These are the names that must never survive into a snapshot image. A
+/// container's env is visible to `docker inspect`, which is bad but bounded —
+/// the container is recreated whenever the credential rotates, and removed
+/// with the project. An **image**'s env is neither: `docker commit` copies the
+/// container's full environment into `triple-c-snapshot-{id}:latest`, that tag
+/// outlives every container built from it, and nothing about deleting a
+/// keychain entry touches it. A ~1-year OAuth token baked in that way is
+/// readable by `docker image inspect` for as long as the image exists, long
+/// after the user has clicked Revoke.
+///
+/// [`commit_container_snapshot`] therefore blanks all of them at commit time,
+/// and [`scrub_secrets_from_snapshots`] rewrites images committed before that
+/// was true.
+///
+/// Blanked rather than omitted, because Docker's commit endpoint *merges* the
+/// supplied config over the container's rather than replacing it: a key left
+/// out of the list is inherited with its original value, so `KEY=` is the only
+/// way to clear one. That matches how `MANAGED_AUTH_KEYS` already works at
+/// create time, and Claude Code, the AWS SDK and git all treat an empty value
+/// as unset.
+pub const SECRET_ENV_KEYS: &[&str] = &[
+    CLAUDE_OAUTH_TOKEN_ENV,
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "GIT_TOKEN",
+];
+
 /// Env var name prefixes Triple-C manages itself; users cannot set these by hand.
 const RESERVED_ENV_PREFIXES: &[&str] = &["ANTHROPIC_", "AWS_", "GIT_", "HOST_", "TRIPLE_C_"];
 
@@ -998,11 +1031,16 @@ pub async fn create_container(
 
     // ── Neutralize stale backend auth env vars ──────────────────────────────
     // When a project switches backends (e.g. Bedrock → Anthropic) the container
-    // is recreated *from a snapshot image* committed off the previous container.
-    // `docker commit` always bakes the previous container's full ENV into that
-    // image, and the commit API cannot strip it. So any auth var set under the
-    // old backend (e.g. CLAUDE_CODE_USE_BEDROCK=1, AWS_*) survives in the image
-    // ENV and stays active unless we explicitly override it at create time.
+    // is recreated *from a snapshot image* committed off the previous container,
+    // and `docker commit` copies that container's full ENV into the image. So
+    // any auth var set under the old backend (e.g. CLAUDE_CODE_USE_BEDROCK=1,
+    // AWS_PROFILE, a model alias) survives in the image ENV and stays active
+    // unless we explicitly override it at create time.
+    //
+    // This pass is about *staleness*, not secrecy. It fixes the container it is
+    // building and does nothing to the image, so it is not — and never was —
+    // a defence against a credential baked into a snapshot. That is
+    // `commit_container_snapshot`'s job, via SECRET_ENV_KEYS.
     // Create-time env takes precedence over image ENV, so we set every managed
     // auth key the *current* backend did NOT set to an empty value, clearing the
     // stale baked-in one.
@@ -1514,14 +1552,29 @@ chmod 600 "$HOME/.aws/credentials""#;
 /// changes (apt/pip/npm installs, ~/.claude.json, etc.) survive container
 /// removal.
 ///
-/// NOTE: `docker commit` always bakes the *running container's* full ENV into
-/// the resulting image — passing an empty Config here does NOT strip it, and
-/// the commit API gives no way to remove env vars. As a result auth vars (e.g.
-/// CLAUDE_CODE_USE_BEDROCK, AWS_*, CLAUDE_CODE_OAUTH_TOKEN) are present in this
-/// snapshot image's ENV — this image is local and per-project, never pushed.
-/// `create_container` defends against that by explicitly overriding every
-/// managed auth key for the active backend (see MANAGED_AUTH_KEYS), so a
-/// backend switch does not inherit the previous backend's stale credentials.
+/// ## Why this passes a Config instead of `Default::default()`
+///
+/// `docker commit` bakes the *running container's* full ENV into the resulting
+/// image. An earlier version of this function passed an empty `Config` and a
+/// comment asserting that the API "gives no way to remove env vars", with
+/// `MANAGED_AUTH_KEYS` cited as the defence. That was wrong on both counts.
+///
+/// `MANAGED_AUTH_KEYS` defends the *next container* — it overrides the image's
+/// stale value at create time — and does nothing whatsoever about the value
+/// sitting in the image. So `docker image inspect triple-c-snapshot-<id>:latest
+/// --format '{{json .Config.Env}}'` returned the shared ~1-year OAuth token,
+/// and kept returning it after the user revoked the token, because
+/// `clear_claude_token` only deletes a keychain entry.
+///
+/// And the API does allow it. Verified against Engine 29.6: the config in the
+/// commit body is **merged over** the container's config, key by key for `Env`,
+/// with unmentioned fields (`Cmd`, `WorkingDir`, `Labels`, …) inherited
+/// untouched. A key cannot be *dropped*, but it can be set — so every name in
+/// [`SECRET_ENV_KEYS`] is committed as `KEY=`, which is exactly the "empty
+/// means unset" convention the rest of the auth plumbing already uses.
+///
+/// Non-secret env (PATH, TZ, model aliases, instructions) is inherited as
+/// before, so nothing about the snapshot's behaviour changes.
 pub async fn commit_container_snapshot(container_id: &str, project: &Project) -> Result<(), String> {
     let docker = get_docker()?;
     let image_name = get_snapshot_image_name(project);
@@ -1540,8 +1593,8 @@ pub async fn commit_container_snapshot(container_id: &str, project: &Project) ->
         ..Default::default()
     };
 
-    // Empty config — no env vars / cmd baked in
     let config = Config::<String> {
+        env: Some(blanked_secret_env()),
         ..Default::default()
     };
 
@@ -1552,6 +1605,258 @@ pub async fn commit_container_snapshot(container_id: &str, project: &Project) ->
 
     log::info!("Committed container {} as snapshot {}:{}", container_id, repo, tag);
     Ok(())
+}
+
+/// `KEY=` for every name in [`SECRET_ENV_KEYS`] — the env override handed to
+/// `docker commit` so no credential value reaches an image.
+fn blanked_secret_env() -> Vec<String> {
+    SECRET_ENV_KEYS
+        .iter()
+        .map(|key| format!("{}=", key))
+        .collect()
+}
+
+/// Whether `env` (an image's `Config.Env`) holds a non-empty value for any
+/// name in [`SECRET_ENV_KEYS`].
+fn env_holds_a_secret(env: &[String]) -> bool {
+    env.iter().any(|entry| {
+        let Some((key, value)) = entry.split_once('=') else {
+            return false;
+        };
+        !value.is_empty() && SECRET_ENV_KEYS.contains(&key)
+    })
+}
+
+/// Outcome of [`scrub_secrets_from_snapshots`], so callers can tell the user
+/// what actually happened rather than guessing.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct SnapshotScrubReport {
+    /// Snapshot images that were found to hold a credential and were rewritten.
+    pub scrubbed: Vec<String>,
+    /// Snapshot images that hold a credential and could **not** be rewritten,
+    /// each with the reason. A non-empty list means the tag every future
+    /// container is built from still carries the credential.
+    pub failed: Vec<(String, String)>,
+    /// Tags that *were* rewritten, but whose superseded image object could not
+    /// be deleted — almost always because a container is still running off it.
+    ///
+    /// Much weaker than `failed`, and normal rather than exceptional. The tag
+    /// is clean, so nothing new is built with the credential; what remains is
+    /// an untagged image whose config is still readable by id, for exactly as
+    /// long as the container using it survives — and that container already
+    /// holds the same value in its own env, so it is not a new exposure. The
+    /// rotation-id label mismatch recreates it on the next start, after which
+    /// an image prune collects the leftover.
+    pub superseded_retained: Vec<String>,
+    /// Set when the image list itself could not be read (Docker not running,
+    /// no permission). Nothing was scrubbed and nothing is known.
+    pub unavailable: Option<String>,
+}
+
+impl SnapshotScrubReport {
+    /// True when a credential is known to still be reachable through something
+    /// that will keep being used — a tag, or an unknown state.
+    pub fn left_something_behind(&self) -> bool {
+        !self.failed.is_empty() || self.unavailable.is_some()
+    }
+}
+
+/// Rewrite every `triple-c-snapshot-*` image whose ENV still carries a
+/// credential, blanking the values in place.
+///
+/// Revoking a shared token has to mean something. Deleting the keychain entry
+/// stops *new* containers getting it, but images committed before
+/// [`commit_container_snapshot`] learned to strip secrets still have the token
+/// in their config, and those images are the ones every future container of
+/// that project is built from. This is the cleanup for them.
+///
+/// Mechanics: create (do not start) a throwaway container from the image, then
+/// commit it straight back over the same tag with the secret keys blanked. The
+/// new image shares every layer with the old one, so this costs no meaningful
+/// disk and preserves the project's installed packages exactly. The superseded
+/// image is then removed by id; if Docker refuses (some storage drivers will
+/// not delete an image that is a parent of another), the report says so rather
+/// than pretending the secret is gone.
+///
+/// Never fails the caller: an unreachable Docker engine is reported in the
+/// return value, because the keychain deletion that precedes it must still
+/// stand.
+pub async fn scrub_secrets_from_snapshots() -> SnapshotScrubReport {
+    use bollard::image::ListImagesOptions;
+
+    let mut report = SnapshotScrubReport::default();
+
+    let docker = match get_docker() {
+        Ok(d) => d,
+        Err(e) => {
+            report.unavailable = Some(e);
+            return report;
+        }
+    };
+
+    let filters: HashMap<String, Vec<String>> = HashMap::from([(
+        "reference".to_string(),
+        vec!["triple-c-snapshot-*".to_string()],
+    )]);
+    let images = match docker
+        .list_images(Some(ListImagesOptions {
+            filters,
+            ..Default::default()
+        }))
+        .await
+    {
+        Ok(images) => images,
+        Err(e) => {
+            report.unavailable = Some(format!("Could not list snapshot images: {}", e));
+            return report;
+        }
+    };
+
+    for summary in images {
+        // `list_images` does not return Config, so inspect each candidate.
+        let details = match docker.inspect_image(&summary.id).await {
+            Ok(d) => d,
+            Err(e) => {
+                report
+                    .failed
+                    .push((summary.id.clone(), format!("could not inspect: {}", e)));
+                continue;
+            }
+        };
+        let env = details
+            .config
+            .as_ref()
+            .and_then(|c| c.env.clone())
+            .unwrap_or_default();
+        if !env_holds_a_secret(&env) {
+            continue;
+        }
+
+        if summary.repo_tags.is_empty() {
+            // The reference filter should make this impossible; if it happens,
+            // say so rather than silently leaving a credential in place.
+            report.failed.push((
+                summary.id.clone(),
+                "an untagged snapshot image holds a credential and cannot be rewritten"
+                    .to_string(),
+            ));
+            continue;
+        }
+
+        // Rewrite every tag this image answers to, so an old tag cannot keep
+        // serving the un-scrubbed config.
+        let mut all_tags_rewritten = true;
+        for tag in summary.repo_tags.iter() {
+            let (repo, tag_part) = match tag.rsplit_once(':') {
+                Some((r, t)) => (r.to_string(), t.to_string()),
+                None => (tag.clone(), "latest".to_string()),
+            };
+            if let Err(e) = rewrite_image_without_secrets(&docker, tag, &repo, &tag_part).await {
+                all_tags_rewritten = false;
+                report.failed.push((tag.clone(), e));
+            } else {
+                report.scrubbed.push(tag.clone());
+            }
+        }
+
+        // Drop the superseded image so its config stops being inspectable.
+        // Best effort by design — see the doc comment.
+        if all_tags_rewritten {
+            if let Err(e) = docker
+                .remove_image(
+                    &summary.id,
+                    Some(RemoveImageOptions {
+                        force: false,
+                        noprune: false,
+                    }),
+                    None,
+                )
+                .await
+            {
+                // Expected whenever the project's container is still around:
+                // Docker will not delete an image a container was created
+                // from. Not a failure of the scrub — see `superseded_retained`.
+                log::info!(
+                    "Scrubbed snapshot {} but kept the superseded image {}: {}",
+                    summary.repo_tags.join(", "),
+                    summary.id,
+                    e
+                );
+                report
+                    .superseded_retained
+                    .push(summary.repo_tags.join(", "));
+            }
+        }
+    }
+
+    report
+}
+
+/// Commit `source_image` back over `repo:tag` with [`SECRET_ENV_KEYS`] blanked.
+async fn rewrite_image_without_secrets(
+    docker: &bollard::Docker,
+    source_image: &str,
+    repo: &str,
+    tag: &str,
+) -> Result<(), String> {
+    let scratch_name = format!("triple-c-scrub-{}", uuid::Uuid::new_v4().simple());
+
+    let created = docker
+        .create_container(
+            Some(CreateContainerOptions {
+                name: scratch_name.clone(),
+                ..Default::default()
+            }),
+            Config::<String> {
+                image: Some(source_image.to_string()),
+                // Deliberately nothing else. The container is never started;
+                // its only job is to be a config to commit from, and every
+                // field left unset here is inherited from the image and
+                // inherited back out by the commit. Setting `cmd` to a
+                // placeholder — the obvious way to satisfy an image with no
+                // CMD — would write that placeholder into the rewritten
+                // snapshot. The base image has an ENTRYPOINT, so `create`
+                // needs no command; an image with neither fails here and is
+                // reported rather than silently mangled.
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|e| format!("could not create a scratch container: {}", e))?;
+
+    let commit = docker
+        .commit_container(
+            CommitContainerOptions {
+                container: created.id.clone(),
+                repo: repo.to_string(),
+                tag: tag.to_string(),
+                // Nothing is running; pausing a created container is an error.
+                pause: false,
+                ..Default::default()
+            },
+            Config::<String> {
+                env: Some(blanked_secret_env()),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|e| format!("could not re-commit without the credential: {}", e));
+
+    // Remove the scratch container whatever happened to the commit.
+    if let Err(e) = docker
+        .remove_container(
+            &created.id,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await
+    {
+        log::warn!("Could not remove scratch container {}: {}", scratch_name, e);
+    }
+
+    commit.map(|_| ())
 }
 
 /// Remove the snapshot image for a project (used on Reset / project removal).
@@ -1806,8 +2111,10 @@ pub async fn container_needs_recreation(
     // re-acquired (rotated), revoked, or opted out of. Both "" means no token
     // is in play, which is also what a container predating this feature reports
     // — so existing installs are not recreated until a token actually exists.
-    // Recreation is the only way to change container env, and it is also what
-    // makes MANAGED_AUTH_KEYS blank a revoked token out of the snapshot image.
+    // Recreation is the only way to change a container's env, so it is the only
+    // way a revoked token stops being live in one. It does *not* clean the
+    // snapshot image — `clear_claude_token` calls
+    // `scrub_secrets_from_snapshots` for that.
     let expected_claude_token = claude_token_label(project);
     let container_claude_token = get_label("triple-c.claude-token-version").unwrap_or_default();
     if container_claude_token != expected_claude_token {
@@ -2194,5 +2501,85 @@ mod tests {
         assert!(p.llamacpp_config.is_none());
         // The new per-backend haiku override also defaults cleanly.
         assert!(p.ollama_config.unwrap().haiku_model_id.is_none());
+    }
+    // ── Snapshot secret stripping ────────────────────────────────────────
+    // The bug these cover: `docker commit` copies the container's whole
+    // environment into `triple-c-snapshot-{id}:latest`, that image outlives
+    // every container built from it, and revoking the shared token used to
+    // touch only the keychain — so `docker image inspect` kept returning a
+    // live ~1-year OAuth credential indefinitely.
+
+    #[test]
+    fn the_commit_override_blanks_every_credential_bearing_key() {
+        let blanked = blanked_secret_env();
+        assert_eq!(blanked.len(), SECRET_ENV_KEYS.len());
+        for key in SECRET_ENV_KEYS {
+            assert!(
+                blanked.contains(&format!("{}=", key)),
+                "{} is not blanked at commit time",
+                key
+            );
+        }
+        // Blanked, never omitted: the commit endpoint merges this over the
+        // container's env key by key, so a name left out is inherited with its
+        // original value.
+        assert!(blanked.iter().all(|e| e.ends_with('=')));
+    }
+
+    #[test]
+    fn the_shared_claude_token_is_one_of_the_stripped_keys() {
+        assert!(SECRET_ENV_KEYS.contains(&CLAUDE_OAUTH_TOKEN_ENV));
+    }
+
+    #[test]
+    fn an_image_holding_a_credential_is_detected() {
+        let env = vec![
+            "PATH=/usr/bin".to_string(),
+            format!("{}=sk-ant-oat01-{}", CLAUDE_OAUTH_TOKEN_ENV, "x".repeat(90)),
+        ];
+        assert!(env_holds_a_secret(&env));
+    }
+
+    #[test]
+    fn a_blanked_or_secret_free_image_is_left_alone() {
+        // Already scrubbed.
+        assert!(!env_holds_a_secret(&blanked_secret_env()));
+        // Never had one.
+        assert!(!env_holds_a_secret(&[
+            "PATH=/usr/bin".to_string(),
+            "TZ=UTC".to_string(),
+            format!("{}=claude-sonnet-4-5", ANTHROPIC_DEFAULT_SONNET_MODEL),
+        ]));
+        // A non-secret var whose *name* merely contains a secret name.
+        assert!(!env_holds_a_secret(&[
+            format!("MY_{}=not-a-secret", CLAUDE_OAUTH_TOKEN_ENV)
+        ]));
+    }
+
+    #[test]
+    fn a_value_containing_an_equals_sign_is_still_recognised() {
+        let env = vec!["ANTHROPIC_AUTH_TOKEN=abc=def==".to_string()];
+        assert!(env_holds_a_secret(&env));
+    }
+
+    #[test]
+    fn the_scrub_report_only_claims_success_when_nothing_is_left() {
+        let clean = SnapshotScrubReport {
+            scrubbed: vec!["triple-c-snapshot-a:latest".to_string()],
+            ..Default::default()
+        };
+        assert!(!clean.left_something_behind());
+
+        let partial = SnapshotScrubReport {
+            failed: vec![("triple-c-snapshot-b:latest".to_string(), "nope".to_string())],
+            ..Default::default()
+        };
+        assert!(partial.left_something_behind());
+
+        let blind = SnapshotScrubReport {
+            unavailable: Some("Docker is not running".to_string()),
+            ..Default::default()
+        };
+        assert!(blind.left_something_behind());
     }
 }

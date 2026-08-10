@@ -466,6 +466,29 @@ export interface BrowserViewChangedEvent {
 
 /** Payload of the `claude-token-progress` event: milestones during
  *  `acquire_claude_token`. Never contains the token. */
+/**
+ * Result of `clear_claude_token`.
+ *
+ * Revoking is not one action but three: delete the keychain entry (always
+ * succeeds or throws), let container recreation clear the env var, and rewrite
+ * any snapshot image that still has the token baked into its `Config.Env`.
+ * Only the last one can partly fail, and when it does the user has to be told
+ * — a token sitting in an image is readable by `docker image inspect` for as
+ * long as the image exists.
+ */
+export interface ClearTokenOutcome {
+  /** Snapshot images that were holding the token and have been rewritten. */
+  snapshots_scrubbed: string[];
+  /** Images still holding it, each with the reason. Non-empty = incomplete. */
+  snapshots_failed: string[];
+  /** Rewritten, but the pre-rewrite image object could not be deleted because a
+   *  container still runs off it. Clears itself when that container is
+   *  recreated — worth mentioning, not worth alarming about. */
+  snapshots_superseded: string[];
+  /** Set when Docker could not be reached, so nothing is known. */
+  docker_unavailable: string | null;
+}
+
 export interface ClaudeTokenProgressEvent {
   project_id: string;
   message: string;
@@ -507,6 +530,23 @@ export interface PackageFailure {
   reason: string;
 }
 
+/** A data-bearing directory a migration destroys and cannot put back.
+ *
+ *  Service state lives under /var — a database's files in /var/lib/<service>,
+ *  a site in /var/www — and none of it is carried across: replaying the apt
+ *  delta reinstalls the *package* onto the new base and hands back an empty
+ *  data directory. The ordinary recreate path does not have this problem
+ *  because it creates from the project's own snapshot, so migration has to say
+ *  so out loud before anything is touched. */
+export interface UnpreservedData {
+  /** Absolute path, e.g. `/var/lib/postgresql`. */
+  path: string;
+  /** Total size of the non-package files beneath it. */
+  bytes: number;
+  /** How many non-package files it holds. */
+  file_count: number;
+}
+
 /** Why a project is worth migrating, and what migrating would carry across.
  *
  *  An empty array always means "nothing found", never "not checked" —
@@ -535,6 +575,9 @@ export interface ContainerStaleness {
    *  be carried across. Empty when nothing user-authored was found — which is
    *  the common case. */
   verbatim_paths: string[];
+  /** Data under /var that the migration destroys and cannot restore. Empty on
+   *  an ordinary container; when it is not, the pre-flight has to lead with it. */
+  unpreserved_data: UnpreservedData[];
   /** dpkg packages the base carries at a different version. A drift measure,
    *  not a promise that every one is newer. */
   outdated_package_count: number;
@@ -599,6 +642,9 @@ export interface MigrationPlan {
   npm_packages: string[];
   verbatim_paths: string[];
   missing_paths: string[];
+  /** What the pre-flight found under /var that the migration would destroy,
+   *  frozen so the finished report can still name it. */
+  unpreserved_data: UnpreservedData[];
 }
 
 /** Persisted host-side migration record. Present only while a migration is in

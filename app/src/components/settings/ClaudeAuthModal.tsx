@@ -9,6 +9,11 @@ import {
   authErrorMessage,
   useClaudeTokenAcquisition,
 } from "../../hooks/useClaudeAuth";
+import {
+  ANTHROPIC_SIGN_IN_HOSTS,
+  sanitizeRelayUrl,
+  urlOrigin,
+} from "../../lib/urlRelay";
 
 interface Props {
   /** Project whose running container is borrowed to run the CLI. */
@@ -85,11 +90,30 @@ export default function ClaudeAuthModal({
           ? PHASE_STATUS.finishing
           : PHASE_STATUS.waiting;
 
+  // Split for display only. `flow.signInUrl` has already passed the host
+  // allowlist; this decides which half of it an ellipsis is allowed to eat.
+  const signInOrigin = flow.signInUrl ? (urlOrigin(flow.signInUrl) ?? "") : "";
+  const signInPath = flow.signInUrl
+    ? flow.signInUrl.slice(signInOrigin.length)
+    : "";
+
   const handleOpen = async () => {
     if (!flow.signInUrl) return;
     setLinkError(null);
+    // Re-validated at the sink. `extractSignInUrl` already applies the host
+    // allowlist, so a failure here means that invariant broke — which is the
+    // one moment it matters that the last step before the OS opener checks.
+    const target = sanitizeRelayUrl(flow.signInUrl, {
+      allowHosts: ANTHROPIC_SIGN_IN_HOSTS,
+    });
+    if (!target) {
+      setLinkError(
+        "That link is not an Anthropic sign-in address and was not opened. Start authentication again.",
+      );
+      return;
+    }
     try {
-      await openUrl(flow.signInUrl);
+      await openUrl(target);
     } catch (e) {
       setLinkError(
         authErrorMessage(
@@ -103,8 +127,19 @@ export default function ClaudeAuthModal({
   const handleCopy = async () => {
     if (!flow.signInUrl) return;
     setLinkError(null);
+    // Copying is the manual route to the same browser, so it gets the same
+    // check — a link too dangerous to open is too dangerous to hand over.
+    const target = sanitizeRelayUrl(flow.signInUrl, {
+      allowHosts: ANTHROPIC_SIGN_IN_HOSTS,
+    });
+    if (!target) {
+      setLinkError(
+        "That link is not an Anthropic sign-in address and was not copied. Start authentication again.",
+      );
+      return;
+    }
     try {
-      await navigator.clipboard.writeText(flow.signInUrl);
+      await navigator.clipboard.writeText(target);
       setCopied(true);
     } catch (e) {
       setLinkError(
@@ -185,16 +220,32 @@ export default function ClaudeAuthModal({
           {flow.signInUrl ? (
             <div className="mt-1 space-y-1.5">
               <div className="flex items-center gap-1.5">
+                {/* The origin is rendered at full length and the path is the
+                    only part allowed to truncate. A single `truncate` element
+                    showing the whole URL is a spoofing primitive: pad the
+                    front and the ellipsis eats the half that decides where the
+                    user's Anthropic password goes. */}
                 <a
                   href={flow.signInUrl}
                   onClick={(e) => {
                     e.preventDefault();
                     void handleOpen();
                   }}
-                  className="min-w-0 flex-1 truncate px-2.5 py-1.5 font-mono text-xs text-[var(--accent)] hover:text-[var(--accent-hover)] bg-[var(--bg-primary)] border border-[var(--border-color)] rounded-[var(--radius-control)] transition-colors"
+                  className="flex min-w-0 flex-1 items-baseline px-2.5 py-1.5 font-mono text-xs text-[var(--accent)] hover:text-[var(--accent-hover)] bg-[var(--bg-primary)] border border-[var(--border-color)] rounded-[var(--radius-control)] transition-colors"
                   title={flow.signInUrl}
                 >
-                  {flow.signInUrl}
+                  <span
+                    data-testid="claude-auth-url-origin"
+                    className="shrink-0 font-semibold [overflow-wrap:anywhere]"
+                  >
+                    {signInOrigin}
+                  </span>
+                  <span
+                    data-testid="claude-auth-url-path"
+                    className="min-w-0 truncate text-[var(--text-secondary)]"
+                  >
+                    {signInPath}
+                  </span>
                 </a>
                 <Button size="md" onClick={() => void handleOpen()}>
                   Open

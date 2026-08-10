@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import * as commands from "../lib/tauri-commands";
+import { ANTHROPIC_SIGN_IN_HOSTS, sanitizeRelayUrl } from "../lib/urlRelay";
 import type {
   ClaudeTokenOutputEvent,
   ClaudeTokenProgressEvent,
@@ -39,25 +40,43 @@ export function authErrorMessage(e: unknown, fallback: string): string {
 /**
  * Pick the sign-in URL out of `claude setup-token`'s transcript.
  *
- * Prefers an OAuth-looking URL, and among candidates prefers the longest: a
- * TUI repaints, and a repaint can land a truncated copy of the same URL in the
- * transcript. Longest-wins means a partial frame never replaces the full link.
+ * **The transcript is container output, so every candidate here is
+ * attacker-controlled if the sandboxed agent misbehaves.** It is then rendered
+ * under a heading that says "Sign in with Anthropic" and handed to the host
+ * browser, which makes this the highest-value URL in the app to spoof: a user
+ * who follows it types their real Anthropic credentials into whatever it
+ * resolves to. Three rules follow, and none of them are optional:
+ *
+ *  - Every candidate goes through the shared {@link sanitizeRelayUrl}, with a
+ *    host allowlist. Only Anthropic's own domains can be a sign-in link;
+ *    userinfo (`https://claude.ai@evil.tld/...`) and control characters are
+ *    rejected there.
+ *  - The **first** surviving candidate wins. The previous rule was
+ *    longest-wins, which handed the choice to the attacker: pad a hostile URL
+ *    and it displaces the real one that came before it.
+ *  - The one exception is a candidate that *extends* the current pick, i.e.
+ *    starts with it. That is the case longest-wins existed for — a repainting
+ *    TUI can land a truncated copy of the same link in the transcript before
+ *    the complete one — and it cannot swap the origin, because a longer string
+ *    with the same prefix has the same host.
  */
 export function extractSignInUrl(text: string): string | null {
-  const matches = text.match(/https?:\/\/[^\s"'<>`]+/g);
+  // eslint-disable-next-line no-control-regex
+  const matches = text.match(/https?:\/\/[^\s"'`<>\x00-\x20\x7f]+/g);
   if (!matches) return null;
 
   const cleaned = matches
     // Trailing punctuation belongs to the prose, not the URL.
     .map((url) => url.replace(/[.,;:!?)\]}>'"]+$/, ""))
-    .filter((url) => url.length > "https://".length);
+    .map((url) => sanitizeRelayUrl(url, { allowHosts: ANTHROPIC_SIGN_IN_HOSTS }))
+    .filter((url): url is string => url !== null);
 
   const oauth = cleaned.filter((url) => /oauth|authorize|login/i.test(url));
   const pool = oauth.length > 0 ? oauth : cleaned;
 
   let best: string | null = null;
   for (const url of pool) {
-    if (best === null || url.length >= best.length) best = url;
+    if (best === null || url.startsWith(best)) best = url;
   }
   return best;
 }

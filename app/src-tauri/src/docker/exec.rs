@@ -432,9 +432,49 @@ pub async fn upload_bytes_to_container(
     Ok(format!("{}/{}", dest_dir.trim_end_matches('/'), file_name))
 }
 
+/// Ceiling on how much container output a one-shot exec will buffer into the
+/// host process.
+///
+/// Every `exec_oneshot*` call reads the whole stream into a `String` before any
+/// caller sees a byte, and what it is reading is *container-controlled* — the
+/// scheduler notifications reader `cat`s up to 50 files with no size cap, and
+/// the auth bridge reads `/proc/net/tcp` every two seconds. Neither has an
+/// upstream bound, so this is where the bound goes. Generous enough that no
+/// legitimate reader (the largest is a package manifest of a full image) comes
+/// close.
+pub const MAX_ONESHOT_OUTPUT: usize = 8 * 1024 * 1024;
+
+/// The auth bridge's per-tick budget. It reads two procfs files whose rows are
+/// ~150 bytes; a real container has tens of listeners, and the parser only ever
+/// yields at most one entry per port number. 1 MiB is thousands of rows — far
+/// past anything genuine, far short of a problem.
+pub const PROC_NET_OUTPUT_LIMIT: usize = 1024 * 1024;
+
+/// Append to `buf` while it stays inside `limit`. Returns `false` once the
+/// limit is exceeded, at which point the caller must stop reading.
+fn push_capped(buf: &mut String, chunk: &str, limit: usize) -> bool {
+    if buf.len() + chunk.len() > limit {
+        return false;
+    }
+    buf.push_str(chunk);
+    true
+}
+
 /// Run a one-shot (non-interactive) exec command in a container and collect stdout.
 pub async fn exec_oneshot(container_id: &str, cmd: Vec<String>) -> Result<String, String> {
     exec_oneshot_env(container_id, cmd, Vec::new()).await
+}
+
+/// [`exec_oneshot`] with a caller-chosen output ceiling, for readers whose
+/// input is fully container-controlled and whose legitimate output is small.
+pub async fn exec_oneshot_limited(
+    container_id: &str,
+    cmd: Vec<String>,
+    limit: usize,
+) -> Result<String, String> {
+    exec_oneshot_inner(container_id, "claude", cmd, Vec::new(), limit)
+        .await
+        .map(|(output, _)| output)
 }
 
 /// Like `exec_oneshot`, but passes additional environment variables to the exec
@@ -478,6 +518,16 @@ pub async fn exec_oneshot_as(
     cmd: Vec<String>,
     env: Vec<String>,
 ) -> Result<(String, i64), String> {
+    exec_oneshot_inner(container_id, user, cmd, env, MAX_ONESHOT_OUTPUT).await
+}
+
+async fn exec_oneshot_inner(
+    container_id: &str,
+    user: &str,
+    cmd: Vec<String>,
+    env: Vec<String>,
+    limit: usize,
+) -> Result<(String, i64), String> {
     let docker = get_docker()?;
 
     let exec = docker
@@ -505,7 +555,19 @@ pub async fn exec_oneshot_as(
         StartExecResults::Attached { mut output, .. } => {
             while let Some(msg) = output.next().await {
                 match msg {
-                    Ok(data) => combined.push_str(&String::from_utf8_lossy(&data.into_bytes())),
+                    Ok(data) => {
+                        let chunk = String::from_utf8_lossy(&data.into_bytes()).into_owned();
+                        if !push_capped(&mut combined, &chunk, limit) {
+                            // Stop reading rather than truncate silently: every
+                            // caller parses this output, and a half-read
+                            // manifest or JSON array is worse than an error.
+                            // Dropping `output` kills the exec's stream.
+                            return Err(format!(
+                                "Command output exceeded {} bytes and was abandoned",
+                                limit
+                            ));
+                        }
+                    }
                     Err(e) => return Err(format!("Exec output error: {}", e)),
                 }
             }
@@ -539,4 +601,43 @@ pub async fn wait_for_exec_exit(exec_id: &str) -> Option<i64> {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_under_the_limit_is_buffered_whole() {
+        let mut buf = String::new();
+        assert!(push_capped(&mut buf, "hello ", 16));
+        assert!(push_capped(&mut buf, "world", 16));
+        assert_eq!(buf, "hello world");
+    }
+
+    #[test]
+    fn output_over_the_limit_is_refused_rather_than_truncated() {
+        // The abandoned chunk must not land in the buffer either: a caller that
+        // ignored the error would otherwise parse a half-read document.
+        let mut buf = String::new();
+        assert!(push_capped(&mut buf, "0123456789", 12));
+        assert!(!push_capped(&mut buf, "0123456789", 12));
+        assert_eq!(buf, "0123456789");
+    }
+
+    #[test]
+    fn a_single_oversized_chunk_is_refused() {
+        let mut buf = String::new();
+        assert!(!push_capped(&mut buf, "0123456789", 4));
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn the_bridge_budget_is_far_smaller_than_the_general_one() {
+        // The auth bridge re-reads container-controlled procfs every 2s, so it
+        // gets a tighter ceiling than one-shot readers that run on demand.
+        assert!(PROC_NET_OUTPUT_LIMIT < MAX_ONESHOT_OUTPUT);
+        // …but still comfortably above a genuine /proc/net/tcp{,6} pair.
+        assert!(PROC_NET_OUTPUT_LIMIT > 100 * 150);
+    }
 }

@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, ImageUpdateInfo, FileEntry, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, PlaywrightDetection, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState } from "./types";
+import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, ImageUpdateInfo, FileEntry, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, PlaywrightDetection, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome } from "./types";
 
 // Docker
 export const checkDocker = () => invoke<boolean>("check_docker");
@@ -199,7 +199,10 @@ export const submitClaudeTokenCode = (code: string) =>
 /** Abort an in-flight acquisition and release the single-flight guard. No-op if nothing is running. */
 export const cancelClaudeToken = () => invoke<void>("cancel_claude_token");
 export const hasClaudeToken = () => invoke<boolean>("has_claude_token");
-export const clearClaudeToken = () => invoke<void>("clear_claude_token");
+/** Revoke the shared token. Also rewrites any snapshot image that still has it
+ *  baked into its env — see `ClearTokenOutcome` for what may be left behind. */
+export const clearClaudeToken = () =>
+  invoke<ClearTokenOutcome>("clear_claude_token");
 
 // Container base-image migration — move a project onto the current base image
 // without deleting its volumes. Reset is the destructive alternative: it wipes

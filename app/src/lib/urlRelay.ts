@@ -1,5 +1,6 @@
 /**
- * URL relay — host side of `container/triple-c-open`.
+ * URL relay — host side of `container/triple-c-open` — and the single URL
+ * validator every `openUrl` call site in the app is required to go through.
  *
  * A CLI inside the container has no browser. When it wants to open a URL
  * (`gh auth login`, `aws sso login`, `gcloud auth login`, anything honouring
@@ -29,6 +30,19 @@
  *
  * Opening is never automatic — see `RelayRateLimiter` and the confirmation
  * toast in TerminalView.
+ *
+ * The relay is not the only route from the container to the host's browser.
+ * The heuristic long-URL detector (`urlDetector.ts`) and the `claude
+ * setup-token` sign-in link (`useClaudeAuth.ts`) both scrape the same
+ * untrusted PTY byte stream, so they use this validator too — with an added
+ * host allowlist in the sign-in case, where exactly one origin is legitimate.
+ * Keep this the only implementation: a second copy is a second place for a
+ * rule to go missing.
+ *
+ * `web_terminal/terminal.html` is the one unavoidable duplicate — it is
+ * embedded standalone via `include_str!()` and cannot import this module.
+ * `urlRelay.embedded.test.ts` extracts that copy and runs it against the same
+ * table of cases, so the two cannot drift silently.
  */
 
 /** Private OSC identifier used by the relay. Chosen to avoid the numbers in
@@ -39,22 +53,79 @@ export const URL_RELAY_OSC = 7777;
 export const MAX_RELAY_URL_LENGTH = 8192;
 
 /**
- * Validate a URL the container asked the host to open.
+ * Whether `candidate` contains a character that disqualifies it before it is
+ * ever parsed.
+ *
+ * Whitespace and C0/DEL matter most: `new URL()` silently *strips* tab, LF and
+ * CR, so `"java\nscript:alert(1)"` would otherwise parse as a `javascript:`
+ * URL. Quote characters are rejected on top of that: `"`, `'` and a backtick
+ * are all illegal in a URL per RFC 3986, and this string ends up as an
+ * argument to an OS-level opener — a path that on Windows has historically
+ * run through a command interpreter, where a quote ends the argument and
+ * whatever follows is the next command. Nothing legitimate loses out; a URL
+ * that really needs one carries it percent-encoded.
+ *
+ * Written as a scan rather than a regex literal so the C0 range is expressed
+ * as code points and cannot be quietly mangled by an editing tool.
+ */
+function hasForbiddenChar(candidate: string): boolean {
+  for (const ch of candidate) {
+    const code = ch.codePointAt(0) ?? 0;
+    // C0 controls, space, and DEL.
+    if (code <= 0x20 || code === 0x7f) return true;
+    // C1 controls — not stripped by `new URL()`, invisible in the toast.
+    if (code >= 0x80 && code <= 0x9f) return true;
+    if (ch === '"' || ch === "'" || ch === "`") return true;
+    // Any other Unicode whitespace (NBSP, ideographic space, ...).
+    if (ch.trim() === "") return true;
+  }
+  return false;
+}
+
+/**
+ * Registrable domains the Anthropic sign-in flow may send the user to.
+ *
+ * `claude setup-token` prints a `claude.ai` authorize URL and redirects to
+ * `platform.claude.com`; `anthropic.com` covers the console. Anything else in
+ * the transcript is not a sign-in link, whatever it claims.
+ */
+export const ANTHROPIC_SIGN_IN_HOSTS = [
+  "claude.ai",
+  "claude.com",
+  "anthropic.com",
+] as const;
+
+export interface SanitizeUrlOptions {
+  /**
+   * Registrable domains the URL's host must match — either exactly, or as a
+   * subdomain (`platform.claude.com` matches `claude.com`). Omit to allow any
+   * host: the relay deliberately does, because opening a third-party OAuth
+   * page is the entire point of it.
+   */
+  allowHosts?: readonly string[];
+}
+
+/** True when `host` is `domain` itself or a subdomain of it. */
+function hostMatches(host: string, domain: string): boolean {
+  return host === domain || host.endsWith(`.${domain}`);
+}
+
+/**
+ * Validate a URL that something untrusted asked the host to open.
  *
  * @returns the normalized URL, or `null` if it must not be opened.
  */
-export function sanitizeRelayUrl(raw: unknown): string | null {
+export function sanitizeRelayUrl(
+  raw: unknown,
+  options: SanitizeUrlOptions = {},
+): string | null {
   if (typeof raw !== "string") return null;
 
   const candidate = raw.trim();
   if (candidate.length === 0) return null;
   if (candidate.length > MAX_RELAY_URL_LENGTH) return null;
 
-  // No whitespace or control characters anywhere. Rejecting these before
-  // parsing matters: `new URL()` silently strips tabs/newlines, so
-  // "java\nscript:alert(1)" would otherwise parse as a javascript: URL.
-  // eslint-disable-next-line no-control-regex
-  if (/[\s\u0000-\u0020\u007f]/.test(candidate)) return null;
+  if (hasForbiddenChar(candidate)) return null;
 
   let parsed: URL;
   try {
@@ -70,13 +141,41 @@ export function sanitizeRelayUrl(raw: unknown): string | null {
   // resolves in surprising ways.
   if (parsed.hostname === "") return null;
 
-  // Embedded credentials spoof the displayed origin.
+  // Embedded credentials spoof the displayed origin: `https://claude.ai@evil.tld/x`
+  // reads as claude.ai in anything that truncates, and navigates to evil.tld.
   if (parsed.username !== "" || parsed.password !== "") return null;
+
+  if (options.allowHosts) {
+    const host = parsed.hostname.toLowerCase();
+    if (!options.allowHosts.some((domain) => hostMatches(host, domain))) {
+      return null;
+    }
+  }
 
   const normalized = parsed.toString();
   if (normalized.length > MAX_RELAY_URL_LENGTH) return null;
 
   return normalized;
+}
+
+/**
+ * The origin of an already-sanitized URL, for display.
+ *
+ * The origin is the only part of a URL that decides where the user's
+ * credentials end up, so it is the one part an ellipsis must never eat. Every
+ * place that shows a URL the user is about to open shows this separately, at
+ * full length, next to the truncatable remainder.
+ *
+ * Returns `null` for input that does not parse — callers pass
+ * {@link sanitizeRelayUrl} output, so that would be a bug rather than an
+ * attack.
+ */
+export function urlOrigin(url: string): string | null {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return null;
+  }
 }
 
 /**

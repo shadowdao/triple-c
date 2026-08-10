@@ -2,7 +2,8 @@ import type { ContainerMigration } from "../../../hooks/useContainerMigration";
 import Button from "../../ui/Button";
 import StatusIndicator from "../../ui/StatusIndicator";
 import MigrationReportCard from "../MigrationReportCard";
-import { ROLLBACK_SCOPE, formatSnapshotDate, joinFeatures } from "../migrationCopy";
+import MigrationInterruptedCard from "../MigrationInterruptedCard";
+import { formatSnapshotDate, joinFeatures } from "../migrationCopy";
 
 interface Props {
   migration: ContainerMigration;
@@ -31,8 +32,38 @@ export default function ContainerMigrationBanner({
   canMigrate,
   onOpen,
 }: Props) {
-  const { staleness, running, recovered, interrupted, report, phaseMessage, busy } =
-    migration;
+  const {
+    staleness,
+    probing,
+    probeSettled,
+    running,
+    recovered,
+    interrupted,
+    report,
+    phaseMessage,
+    busy,
+  } = migration;
+
+  // An unfinished migration outranks its own report. The report's action row
+  // offers Keep, and Keep on a mid-swap container drops the rollback image
+  // while `:latest` still points at the old lineage — the backend's message on
+  // the very same record says to resume. Resume is the only honest primary
+  // action here, so the report card is not rendered at all.
+  if (interrupted) {
+    return (
+      <section
+        className={`${SHELL} border-[var(--error)]/40 bg-[var(--error-muted)]`}
+        aria-label="Container base update was interrupted"
+      >
+        <MigrationInterruptedCard
+          record={interrupted}
+          busy={busy || running}
+          onResume={() => void migration.resume()}
+          onRollback={() => void migration.rollback()}
+        />
+      </section>
+    );
+  }
 
   // The report outranks staleness: after a run, the outcome is the news.
   if (report) {
@@ -50,7 +81,7 @@ export default function ContainerMigrationBanner({
           busy={busy}
           onKeep={() => void migration.keep()}
           onRollback={() => void migration.rollback()}
-          onDismiss={migration.dismiss}
+          onDismiss={() => void migration.dismiss()}
         />
       </section>
     );
@@ -85,53 +116,6 @@ export default function ContainerMigrationBanner({
           <Button size="md" onClick={onOpen}>
             Show progress
           </Button>
-        </div>
-      </section>
-    );
-  }
-
-  // Nothing is driving this one. It outranks staleness because the container is
-  // sitting mid-swap, and the one thing it must never do is look like a normal
-  // out-of-date container that the user can take or leave.
-  if (interrupted) {
-    return (
-      <section
-        className={`${SHELL} border-[var(--error)]/40 bg-[var(--error-muted)]`}
-        aria-label="Container base update was interrupted"
-      >
-        <StatusIndicator
-          tone="error"
-          label="A container base update was interrupted"
-          className="text-[13px] font-semibold"
-        />
-        <p className="text-xs text-[var(--text-secondary)] leading-snug">
-          It started{" "}
-          {formatSnapshotDate(interrupted.started_at) ?? "earlier"} and the app
-          closed before it finished, so this container is part-way onto the new
-          base. Resuming replays the same plan it was given.
-        </p>
-        <p className="text-xs text-[var(--text-secondary)] leading-snug">
-          {ROLLBACK_SCOPE}
-        </p>
-        <div className="flex flex-wrap gap-1.5">
-          <Button
-            size="md"
-            variant="primary"
-            disabled={busy}
-            onClick={() => void migration.resume()}
-          >
-            Resume update
-          </Button>
-          {interrupted.rollback_image && (
-            <Button
-              size="md"
-              variant="danger"
-              disabled={busy}
-              onClick={() => void migration.rollback()}
-            >
-              Roll back
-            </Button>
-          )}
         </div>
       </section>
     );
@@ -210,9 +194,32 @@ export default function ContainerMigrationBanner({
             </p>
           )}
 
+          {/* An out-of-date container that also has data under /var is the one
+              case where updating can cost something, so it is said here and not
+              only behind the button. */}
+          {staleness.unpreserved_data.length > 0 && (
+            <p className="text-xs text-[var(--text-primary)] leading-snug">
+              Not carried across:{" "}
+              <span className="font-mono text-[var(--text-secondary)]">
+                {staleness.unpreserved_data.map((d) => d.path).join(", ")}
+              </span>
+              <span className="text-[var(--text-secondary)]">
+                {" "}
+                — back this up before updating.
+              </span>
+            </p>
+          )}
+
           {!canMigrate && (
             <p className="text-xs text-[var(--text-secondary)] leading-snug">
-              Stop the container to update its base.
+              {/* Distinguishing these matters: "stop the container" on a
+                  container that is already stopped, because the probe has not
+                  landed, reads as a bug. */}
+              {!probeSettled
+                ? probing
+                  ? "Checking what this container has that the current base does not…"
+                  : "That check did not complete, so what would be carried across is not known. Updating stays disabled until it does — try again once the container can be inspected."
+                : "Stop the container to update its base."}
             </p>
           )}
         </div>

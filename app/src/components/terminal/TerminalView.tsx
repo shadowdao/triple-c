@@ -14,6 +14,7 @@ import {
   RelayRateLimiter,
   URL_RELAY_OSC,
   parseUrlRelayOsc,
+  sanitizeRelayUrl,
 } from "../../lib/urlRelay";
 import UrlToast from "./UrlToast";
 import { trimSelection } from "./trimSelection";
@@ -45,10 +46,38 @@ export default function TerminalView({ sessionId, active }: Props) {
   // One toast slot, two producers: the heuristic long-URL detector and the
   // container's explicit "open this in the host browser" relay (OSC 7777).
   // Sharing the slot keeps them from stacking on top of each other.
-  const [urlPrompt, setUrlPrompt] = useState<{ url: string; label: string } | null>(
-    null,
-  );
+  //
+  // Both producers read the container's PTY output, so both are untrusted, and
+  // both must go through `sanitizeRelayUrl` before anything is stored here —
+  // see `promptUrl` below, which is the only writer.
+  //
+  // `seq` exists because the slot is shared and long-lived: a second prompt
+  // replacing a first would otherwise mutate the toast in place, swapping the
+  // text under a user who is mid-read and mid-click. Keying the toast on it
+  // remounts the component, so a new URL is unmistakably a new prompt.
+  const [urlPrompt, setUrlPrompt] = useState<{
+    url: string;
+    label: string;
+    seq: number;
+  } | null>(null);
+  const promptSeqRef = useRef(0);
   const relayLimiterRef = useRef(new RelayRateLimiter());
+
+  /**
+   * The only writer of the prompt slot. Re-validates whatever the caller
+   * found: the OSC relay branch has already been through `parseUrlRelayOsc`,
+   * but the heuristic detector branch has been through nothing at all, and a
+   * raw regex match is exactly the input `sanitizeRelayUrl` exists to refuse.
+   */
+  const promptUrl = useCallback((raw: string, label: string) => {
+    const url = sanitizeRelayUrl(raw);
+    if (!url) {
+      console.warn("Refusing to prompt for a URL that failed validation");
+      return;
+    }
+    promptSeqRef.current += 1;
+    setUrlPrompt({ url, label, seq: promptSeqRef.current });
+  }, []);
   const [imagePasteMsg, setImagePasteMsg] = useState<string | null>(null);
   const [isAtBottom, setIsAtBottom] = useState(true);
   const [isAutoFollow, setIsAutoFollow] = useState(true);
@@ -162,9 +191,19 @@ export default function TerminalView({ sessionId, active }: Props) {
     // Web links addon — opens URLs in host browser via Tauri, with a permissive regex
     // that matches URLs even if they lack trailing path segments (the default regex
     // misses OAuth URLs that end mid-line).
-    const urlRegex = /https?:\/\/[^\s'"\x07]+/;
+    // eslint-disable-next-line no-control-regex
+    const urlRegex = /https?:\/\/[^\s'"`<>\x00-\x20\x7f]+/;
     const webLinksAddon = new WebLinksAddon((_event, uri) => {
-      openUrl(uri).catch((e) => console.error("Failed to open URL:", e));
+      // Same sink, same rule: what xterm matched came off the container's
+      // output, so it is validated before it reaches the OS opener. A click
+      // here is a deliberate act on visible text, but "visible" is exactly
+      // what a userinfo-spoofed URL subverts.
+      const safe = sanitizeRelayUrl(uri);
+      if (!safe) {
+        console.warn("Refusing to open a link that failed validation");
+        return;
+      }
+      openUrl(safe).catch((e) => console.error("Failed to open URL:", e));
     }, { urlRegex });
     term.loadAddon(webLinksAddon);
 
@@ -244,7 +283,7 @@ export default function TerminalView({ sessionId, active }: Props) {
         console.warn("URL relay: rate-limited", url);
         return true;
       }
-      setUrlPrompt({ url, label: "Container asked to open a URL" });
+      promptUrl(url, "Container asked to open a URL");
       return true;
     });
 
@@ -332,7 +371,7 @@ export default function TerminalView({ sessionId, active }: Props) {
     let aborted = false;
 
     const detector = new UrlDetector((url) =>
-      setUrlPrompt({ url, label: "Long URL detected" }),
+      promptUrl(url, "Long URL detected"),
     );
     detectorRef.current = detector;
 
@@ -477,12 +516,17 @@ export default function TerminalView({ sessionId, active }: Props) {
   }, [imagePasteMsg]);
 
   const handleOpenUrl = useCallback(() => {
-    if (urlPrompt) {
-      openUrl(urlPrompt.url).catch((e) =>
-        console.error("Failed to open URL:", e),
-      );
-      setUrlPrompt(null);
+    if (!urlPrompt) return;
+    // Validated again at the sink. `promptUrl` is the only writer and already
+    // sanitizes, so this can only fail if that invariant is broken — which is
+    // precisely when it matters that the last thing before `openUrl` checks.
+    const safe = sanitizeRelayUrl(urlPrompt.url);
+    setUrlPrompt(null);
+    if (!safe) {
+      console.warn("Refusing to open a URL that failed validation");
+      return;
     }
+    openUrl(safe).catch((e) => console.error("Failed to open URL:", e));
   }, [urlPrompt]);
 
   const handleScrollToBottom = useCallback(() => {
@@ -557,6 +601,8 @@ export default function TerminalView({ sessionId, active }: Props) {
     >
       {urlPrompt && (
         <UrlToast
+          // A different URL is a different prompt, not an edit of this one.
+          key={urlPrompt.seq}
           url={urlPrompt.url}
           label={urlPrompt.label}
           onOpen={handleOpenUrl}

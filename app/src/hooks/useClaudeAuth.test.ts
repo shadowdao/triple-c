@@ -35,6 +35,50 @@ describe("extractSignInUrl", () => {
     const text = `https://claude.ai/oauth/authorize?code=tr\n${full}\n`;
     expect(extractSignInUrl(text)).toBe(full);
   });
+
+  // ── The spoof this function exists to refuse ──────────────────────────────
+  // The transcript is container output. Everything below is a URL a misbehaving
+  // sandboxed agent can print at will, and the modal renders whatever comes
+  // back under a heading that says "Sign in with Anthropic".
+
+  it("rejects userinfo that makes an attacker's host read as Anthropic's", () => {
+    // Displays as `https://claude.ai...` in anything that truncates; navigates
+    // to evil.tld and harvests the real credential.
+    const spoof =
+      "https://claude.ai@evil.tld/oauth/authorize?" + "padding=".repeat(40);
+    expect(extractSignInUrl(`Use this url to sign in:\n${spoof}\n`)).toBeNull();
+  });
+
+  it("does not let a longer hostile URL displace the real one", () => {
+    const real = "https://claude.ai/oauth/authorize?code=true&client_id=abc";
+    const longer =
+      "https://evil.tld/oauth/authorize?" + "x".repeat(real.length * 2);
+    expect(extractSignInUrl(`${real}\n${longer}\n`)).toBe(real);
+    // ...and the same when the hostile one is printed first.
+    expect(extractSignInUrl(`${longer}\n${real}\n`)).toBe(real);
+  });
+
+  it("rejects a host that merely contains an Anthropic domain", () => {
+    expect(
+      extractSignInUrl("Sign in: https://claude.ai.evil.tld/oauth/authorize\n"),
+    ).toBeNull();
+    expect(
+      extractSignInUrl("Sign in: https://evil.tld/claude.ai/oauth/authorize\n"),
+    ).toBeNull();
+  });
+
+  it("rejects non-http schemes and control characters smuggled into the link", () => {
+    expect(extractSignInUrl("Open javascript:alert(1) to continue\n")).toBeNull();
+    expect(
+      extractSignInUrl("https://claude.ai/oauth\u0000/authorize\n"),
+    ).toBe("https://claude.ai/oauth");
+  });
+
+  it("takes the first legitimate link, not the longest", () => {
+    const first = "https://claude.ai/oauth/authorize?code=true";
+    const second = "https://platform.claude.com/oauth/authorize?code=true&more=1";
+    expect(extractSignInUrl(`${first}\n${second}\n`)).toBe(first);
+  });
 });
 
 describe("authErrorMessage", () => {

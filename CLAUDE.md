@@ -112,9 +112,13 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   - `image.rs` — Image build/pull with progress streaming
   - `gateway.rs` — Optional LiteLLM sibling container giving Claude Code an Anthropic-format
     front end for providers that only speak OpenAI (see `gateway-container/`). Mirrors `stt.rs`.
-    Binds `0.0.0.0` — unlike STT — because *project containers*, not the host process, consume
-    it; it therefore **always** sets a LiteLLM `master_key`, since LiteLLM without one accepts
-    any key.
+    Its bind address is **detected, never `0.0.0.0`** — unlike STT, *project containers* consume
+    it, so loopback alone is not always enough: Docker Desktop gets `127.0.0.1` (containers reach
+    it via `host.docker.internal`), native Linux gets the default bridge gateway (`172.17.0.1`).
+    `GatewayBinding` derives the bind address and the advertised `base_url` together so they
+    cannot drift. A wildcard bind would be LAN-reachable — Docker's rules precede host firewalls —
+    in front of a container config holding a billed provider key. It also **always** sets a
+    LiteLLM `master_key`, since LiteLLM without one accepts any key.
   - `migration.rs` — Base-image migration: manifest capture via throwaway containers, the pure
     delta computation (dpkg-ownership filter, bind-mount exclusion, verbatim-copy set), and the
     crash-recovery state machine. See "Base-image migration" below.
@@ -180,6 +184,25 @@ security update. Migration is the non-destructive way out; Reset is the destruct
   label plus the persisted state file let `reconcile_project_statuses` offer resume or rollback.
 - **Rollback restores the system layer only.** The volumes are never touched at any point, so work
   done in `$HOME` during a migrated session survives a rollback. Say so in any UI copy.
+- **`/var` is never copied either, and that is the one way migration is *more* destructive than
+  the ordinary recreate.** A recreate builds from the project's snapshot, so `/var/lib/postgresql`
+  rides along; a migration builds from the base and the apt replay hands back an empty cluster.
+  Copying a live database's files onto a different base's version of the same package is a
+  corruption risk, not a fix — so the answer is disclosure. `unpreserved_data()` reports
+  first-level directories under `/var/lib` and `/var/www` that the base does not ship *and* that
+  hold non-dpkg-owned files (which is what keeps `/var/lib/apt` and `/var/lib/dpkg` out of it),
+  and the pre-flight, the banner and the finished report all name them. Do not make this silent.
+- **The rollback pin is not best-effort.** After `commit_container_snapshot` the commit is the only
+  copy of the old system layer, so a `docker tag` that fails — or succeeds without the reference
+  resolving — aborts the migration before `remove_container`. Same rule in reverse for
+  `rollback_migration`: the image is confirmed to exist before the container is destroyed.
+- **`resume` must check the container's `triple-c.migration-state` label**, exactly as
+  `reconcile_migration` does. Without it a record left behind by a failed commit "resumes" into
+  the *old, unmigrated* container and commits it as migrated.
+- **Anything that stops, removes or recreates a project's container consults
+  `migration_commands::is_migrating`.** The window between `remove_container` and the create that
+  follows looks exactly like "no container" to Start, and Reset would delete the volumes out from
+  under a live run.
 - **`/etc` is never copied**, only reported: the snapshot lineage has
   `/etc/apt/sources.list.d/nodesource.sources` where the current base has `nodesource.list`, and
   having both breaks every `apt-get update` on a duplicate source. Verified, not theoretical.

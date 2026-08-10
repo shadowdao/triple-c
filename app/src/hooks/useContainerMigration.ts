@@ -29,6 +29,17 @@ export interface ContainerMigration {
   /** Null until the first probe returns, or when the container has never been created. */
   staleness: ContainerStaleness | null;
   probing: boolean;
+  /**
+   * The probe has landed with a complete answer.
+   *
+   * Until it does, `apt_delta`, `verbatim_paths` and `unpreserved_data` are all
+   * "not known", which is indistinguishable from "empty" at every call site
+   * that reads them. Starting a migration in that state means the modal telling
+   * the user there was nothing to copy while the backend quietly skips copying
+   * — so the action is gated on this, not on the probe merely having been
+   * kicked off.
+   */
+  probeSettled: boolean;
   /** True while a migration is running — whether we started it or found it. */
   running: boolean;
   /** True when the run in progress was recovered from disk, not started here. */
@@ -51,8 +62,15 @@ export interface ContainerMigration {
   start: (options: MigrationOptions) => Promise<void>;
   keep: () => Promise<void>;
   rollback: () => Promise<void>;
-  /** Clear a report we cannot act on (failed / rolled back). Local only. */
-  dismiss: () => void;
+  /**
+   * Acknowledge a report there is nothing to keep or roll back.
+   *
+   * It has to reach the backend, not just clear local state: an
+   * `awaiting-confirmation` record that is never resolved comes back on the
+   * next mount *and* makes every future migration refuse with "already has a
+   * finished migration waiting for a decision".
+   */
+  dismiss: () => Promise<void>;
   refresh: () => Promise<void>;
 }
 
@@ -186,6 +204,25 @@ export function useContainerMigration(project: Project): ContainerMigration {
     );
   }, [progress, running]);
 
+  /**
+   * Re-read the persisted record after a run settles.
+   *
+   * A migration that got past the container swap and then failed leaves the
+   * record at `interrupted` — the container is mid-swap and the only correct
+   * next actions are Resume and Roll back. Without this the hook would show the
+   * failure report's Keep button over a half-migrated container, and a *failed
+   * resume* would clear `interrupted` and never look again, hiding the mid-swap
+   * container for the rest of the session.
+   */
+  const adoptRecordAfterRun = useCallback(async () => {
+    try {
+      const state = await commands.getMigrationState(projectId);
+      setInterrupted(state?.phase === INTERRUPTED ? state : null);
+    } catch {
+      /* Leave whatever we had; a transient IPC failure is not an outcome. */
+    }
+  }, [projectId]);
+
   const start = useCallback(
     async (options: MigrationOptions) => {
       setLog([]);
@@ -213,10 +250,11 @@ export function useContainerMigration(project: Project): ContainerMigration {
       } finally {
         setRunning(false);
         useAppState.getState().setContainerProgress(projectId, null);
+        await adoptRecordAfterRun();
         void refresh();
       }
     },
-    [projectId, refresh],
+    [projectId, refresh, adoptRecordAfterRun],
   );
 
   /**
@@ -271,11 +309,35 @@ export function useContainerMigration(project: Project): ContainerMigration {
     }
   }, [projectId, project.name, refresh, pushToast]);
 
-  const dismiss = useCallback(() => setReport(null), []);
+  /**
+   * Dismiss resolves the record; it is not a local hide.
+   *
+   * `confirm_migration` is the backend's "this decision is made": it drops the
+   * rollback tag (there is none in this case), deletes the staged payload and
+   * removes the state file. Skipping it left an `awaiting-confirmation` record
+   * on disk that reappeared on every mount and made `migrate_project_to_base`
+   * refuse forever — recoverable only by deleting JSON by hand.
+   */
+  const dismiss = useCallback(async () => {
+    setBusy(true);
+    try {
+      await commands.confirmMigration(projectId);
+      setReport(null);
+    } catch (e) {
+      pushToast({
+        kind: "error",
+        message: `Could not clear the update record for “${project.name}”`,
+        detail: String(e),
+      });
+    } finally {
+      setBusy(false);
+    }
+  }, [projectId, project.name, pushToast]);
 
   return {
     staleness,
     probing,
+    probeSettled: !probing && staleness !== null && !staleness.probe_error,
     running,
     recovered,
     interrupted,

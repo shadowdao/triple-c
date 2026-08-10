@@ -389,13 +389,30 @@
   let relayLastAt = 0;
   let relayHideTimer = null;
 
+  // ─── shared-url-sanitizer ─────────────────────────────────────
+  // THIS IS A COPY OF `sanitizeRelayUrl` IN app/src/lib/urlRelay.ts.
+  // It exists only because this file is embedded standalone via include_str!()
+  // and cannot import a module. Change one, change the other — and note that
+  // app/src/lib/urlRelay.embedded.test.ts reads this file, extracts the block
+  // between these two markers and runs it against the same table of cases as
+  // the TypeScript original, so a divergence fails the suite instead of
+  // silently shipping. Keep the markers, the function name and the arity
+  // intact: that test finds the code by them.
   function sanitizeRelayUrl(raw) {
     if (typeof raw !== 'string') return null;
     const s = raw.trim();
     if (!s || s.length > RELAY_MAX_URL) return null;
     // Control characters and whitespace first: new URL() strips tabs/newlines,
-    // so "java\nscript:" would otherwise slip through as javascript:.
-    if (/[\s\u0000-\u0020\u007f]/.test(s)) return null;
+    // so "java\nscript:" would otherwise slip through as javascript:. Quotes
+    // and backticks go with them — all three are illegal in a URL, and this
+    // string ends up as an argument to something that may treat them as syntax.
+    for (const ch of s) {
+      const code = ch.codePointAt(0);
+      if (code <= 0x20 || code === 0x7f) return null;
+      if (code >= 0x80 && code <= 0x9f) return null;
+      if (ch === '"' || ch === "'" || ch === '`') return null;
+      if (ch.trim() === '') return null;
+    }
     let u;
     try { u = new URL(s); } catch (e) { return null; }
     if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
@@ -403,6 +420,7 @@
     if (u.username || u.password) return null;  // origin spoofing
     return u.toString();
   }
+  // ─── end shared-url-sanitizer ────────────────────────────────
 
   function parseRelayOsc(data) {
     if (typeof data !== 'string') return null;

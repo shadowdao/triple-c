@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import SharedAuthSettings from "./SharedAuthSettings";
-import type { Project } from "../../lib/types";
+import { useAppState } from "../../store/appState";
+import type { ClearTokenOutcome, Project } from "../../lib/types";
 
 const hasClaudeToken = vi.fn();
 const clearClaudeToken = vi.fn();
@@ -63,7 +64,28 @@ describe("SharedAuthSettings", () => {
     vi.clearAllMocks();
     projects = [];
     hasClaudeToken.mockResolvedValue(false);
+    useAppState.setState({ toasts: [] });
   });
+
+  /** Open the confirmation and go through with it. */
+  async function revoke(outcome: Partial<ClearTokenOutcome>) {
+    projects = [running()];
+    hasClaudeToken.mockResolvedValue(true);
+    clearClaudeToken.mockResolvedValue({
+      snapshots_scrubbed: [],
+      snapshots_failed: [],
+      snapshots_superseded: [],
+      docker_unavailable: null,
+      ...outcome,
+    });
+    render(<SharedAuthSettings />);
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke token" }));
+    await waitFor(() =>
+      expect(useAppState.getState().toasts.length).toBeGreaterThan(0),
+    );
+    return useAppState.getState().toasts[0];
+  }
 
   it("disables Authenticate and says why when nothing is running", async () => {
     projects = [baseProject];
@@ -122,5 +144,49 @@ describe("SharedAuthSettings", () => {
 
     await screen.findByText("keyring backend unavailable");
     expect(screen.queryByRole("button", { name: "Revoke" })).not.toBeInTheDocument();
+  });
+
+  // ── Revoking has to tell the truth ──────────────────────────────────────
+  // Deleting the keychain entry is only part of it. `docker commit` copies the
+  // token into each project's snapshot image, and an image outlives every
+  // container built from it — so a "removed" message while a snapshot still
+  // holds a live ~1-year credential is the wrong thing to say.
+
+  it("says so plainly when snapshot images were cleared too", async () => {
+    const toast = await revoke({
+      snapshots_scrubbed: ["triple-c-snapshot-p1:latest"],
+    });
+    expect(toast.kind).toBe("success");
+    expect(toast.message).toMatch(/1 snapshot image/);
+  });
+
+  it("reports an error, not success, when an image still holds the token", async () => {
+    const toast = await revoke({
+      snapshots_failed: ["triple-c-snapshot-p1:latest: image has child images"],
+    });
+    expect(toast.kind).toBe("error");
+    expect(toast.message).toMatch(/still in some images/i);
+    expect(toast.detail).toMatch(/triple-c-snapshot-p1/);
+  });
+
+  it("does not claim the images are clean when Docker could not be reached", async () => {
+    const toast = await revoke({ docker_unavailable: "Docker is not running" });
+    expect(toast.kind).toBe("error");
+    expect(toast.detail).toMatch(/Docker could not be reached/);
+  });
+
+  it("mentions a retained image layer without calling the revoke a failure", async () => {
+    const toast = await revoke({
+      snapshots_scrubbed: ["triple-c-snapshot-p1:latest"],
+      snapshots_superseded: ["triple-c-snapshot-p1:latest"],
+    });
+    expect(toast.kind).toBe("success");
+    expect(toast.detail).toMatch(/still on disk because a container is running/);
+  });
+
+  it("still succeeds plainly when there was nothing to scrub", async () => {
+    const toast = await revoke({});
+    expect(toast.kind).toBe("success");
+    expect(toast.message).toBe("Shared Claude token removed from the keychain.");
   });
 });

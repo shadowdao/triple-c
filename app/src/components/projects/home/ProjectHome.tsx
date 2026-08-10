@@ -93,11 +93,17 @@ export default function ProjectHome({ projectId, active }: Props) {
   // Reset does — with the extra condition that there is a container to migrate.
   // An interrupted migration is excluded too: its action is Resume, on the
   // Overview banner, not a fresh pre-flight.
+  //
+  // `probeSettled` is the fourth condition and it is not cosmetic. The probe
+  // takes ~6 s, and until it lands every delta the pre-flight renders reads as
+  // empty — so the dialog would tell the user there was nothing to copy while
+  // the backend was told not to copy anything.
   const canMigrate =
     isStopped &&
     !actions.busy &&
     !migration.running &&
     !migration.interrupted &&
+    migration.probeSettled &&
     !!project.container_id;
 
   return (

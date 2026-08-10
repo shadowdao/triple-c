@@ -145,6 +145,11 @@ pub async fn remove_project(
     // before the container (and the project record) go away.
     state.auth_bridge.stop(&project_id).await;
 
+    // A migration record outliving its project leaks a state file, a staged
+    // payload tar that can run to several GB, and a `:pre-migration-<ts>` tag
+    // holding an entire snapshot image that nothing will ever reference again.
+    crate::commands::migration_commands::purge_migration_artifacts(&project_id).await;
+
     // Stop and remove container if it exists
     if let Some(ref project) = state.projects_store.get(&project_id) {
         if let Some(ref container_id) = project.container_id {
@@ -215,6 +220,20 @@ pub async fn start_project_container(
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Project, String> {
+    // A migration removes the container and creates its replacement moments
+    // later. Starting in that window finds no container, creates a second one
+    // under the same name, and the migration's own create then fails on the
+    // name conflict — which sends it into an auto-rollback that also cannot
+    // create. The UI already refuses (`canMigrate` gates on the container being
+    // stopped and no run being in flight); this is the same gate on the side
+    // that actually owns the invariant.
+    if crate::commands::migration_commands::is_migrating(&project_id) {
+        return Err(
+            "A container base update is running for this project. Wait for it to finish, then start the project."
+                .to_string(),
+        );
+    }
+
     let mut project = state
         .projects_store
         .get(&project_id)
@@ -536,10 +555,27 @@ pub async fn rebuild_project_container(
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Project, String> {
+    // Reset deletes both volumes and the snapshot image. Doing that while a
+    // migration is mid-flight pulls the ground out from under it and leaves an
+    // orphan migration record pointing at images that no longer exist.
+    if crate::commands::migration_commands::is_migrating(&project_id) {
+        return Err(
+            "A container base update is running for this project. Wait for it to finish before resetting."
+                .to_string(),
+        );
+    }
+
     let project = state
         .projects_store
         .get(&project_id)
         .ok_or_else(|| format!("Project {} not found", project_id))?;
+
+    // Reset supersedes any migration decision that was still pending: the
+    // snapshot image and both volumes are about to go, so a surviving record
+    // could only describe things that no longer exist — while its
+    // `:pre-migration-<ts>` tag held a whole snapshot image (multiple GB) alive
+    // with nothing left that could ever use it.
+    crate::commands::migration_commands::purge_migration_artifacts(&project_id).await;
 
     // The bridge is bound to the container that is about to be destroyed;
     // `start_project_container` below re-arms it against the new one.
@@ -588,7 +624,27 @@ pub async fn reconcile_project_statuses(
     }
 
     for project in &projects {
-        if project.status != ProjectStatus::Running && project.status != ProjectStatus::Error {
+        // `Starting` and `Stopping` are in here as a backstop, not because
+        // anything is expected to leave a project in one. They are transitional
+        // states owned by an in-flight command, so a project still wearing one
+        // is a project whose command died — a crash mid-start, or a migration
+        // that bailed out between the stop and the swap. Skipping them, as this
+        // loop used to, meant nothing in the app ever put such a project right:
+        // it sat at "Stopping" with the Start button disabled, permanently.
+        // Docker is the authority either way, so the check below is correct for
+        // all four.
+        if !matches!(
+            project.status,
+            ProjectStatus::Running
+                | ProjectStatus::Error
+                | ProjectStatus::Starting
+                | ProjectStatus::Stopping
+        ) {
+            continue;
+        }
+        // ...but never for a project this process is actively migrating: the
+        // container is legitimately absent for part of that run.
+        if crate::commands::migration_commands::is_migrating(&project.id) {
             continue;
         }
 

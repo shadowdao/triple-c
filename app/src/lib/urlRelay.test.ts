@@ -1,10 +1,12 @@
 import { describe, it, expect } from "vitest";
 import {
+  ANTHROPIC_SIGN_IN_HOSTS,
   MAX_RELAY_URL_LENGTH,
   RelayRateLimiter,
   URL_RELAY_OSC,
   parseUrlRelayOsc,
   sanitizeRelayUrl,
+  urlOrigin,
 } from "./urlRelay";
 
 /** Build the OSC 7777 payload the container shim emits for `url`. */
@@ -150,6 +152,86 @@ describe("sanitizeRelayUrl — rejects malformed and hostile input", () => {
     const huge = "https://example.com/" + "a".repeat(MAX_RELAY_URL_LENGTH);
     expect(huge.length).toBeGreaterThan(MAX_RELAY_URL_LENGTH);
     expect(sanitizeRelayUrl(huge)).toBeNull();
+  });
+});
+
+describe("sanitizeRelayUrl — quote characters", () => {
+  // Latent today, because the only path that would exploit it is behind a
+  // feature flag. Latent is not the same as absent: the character class is the
+  // thing standing between a container-supplied string and an OS opener that
+  // on Windows has historically been reached through a command interpreter.
+  it("rejects a double quote", () => {
+    expect(sanitizeRelayUrl('https://example.com/a"b')).toBeNull();
+    expect(sanitizeRelayUrl('https://example.com/?q="&x=1')).toBeNull();
+  });
+
+  it("rejects a single quote and a backtick", () => {
+    expect(sanitizeRelayUrl("https://example.com/a'b")).toBeNull();
+    expect(sanitizeRelayUrl("https://example.com/a`b")).toBeNull();
+  });
+
+  it("still accepts the percent-encoded forms", () => {
+    expect(sanitizeRelayUrl("https://example.com/a%22b")).toBe(
+      "https://example.com/a%22b",
+    );
+  });
+
+  it("rejects C1 controls and exotic whitespace new URL() would keep", () => {
+    expect(sanitizeRelayUrl("https://example.com/a\u0085b")).toBeNull();
+    expect(sanitizeRelayUrl("https://example.com/a\u00a0b")).toBeNull();
+    expect(sanitizeRelayUrl("https://example.com/a\u3000b")).toBeNull();
+  });
+});
+
+describe("sanitizeRelayUrl — host allowlist", () => {
+  const opts = { allowHosts: ANTHROPIC_SIGN_IN_HOSTS };
+
+  it("accepts the domain itself and its subdomains", () => {
+    expect(sanitizeRelayUrl("https://claude.ai/oauth/authorize", opts)).toBe(
+      "https://claude.ai/oauth/authorize",
+    );
+    expect(
+      sanitizeRelayUrl("https://platform.claude.com/oauth/code/callback", opts),
+    ).toBe("https://platform.claude.com/oauth/code/callback");
+  });
+
+  it("rejects a lookalike that merely contains the domain", () => {
+    expect(sanitizeRelayUrl("https://claude.ai.evil.tld/oauth", opts)).toBeNull();
+    expect(sanitizeRelayUrl("https://notclaude.ai/oauth", opts)).toBeNull();
+    expect(sanitizeRelayUrl("https://evil.tld/claude.ai/oauth", opts)).toBeNull();
+  });
+
+  it("rejects the userinfo spoof even though it reads as an allowed host", () => {
+    expect(
+      sanitizeRelayUrl("https://claude.ai@evil.tld/oauth/authorize", opts),
+    ).toBeNull();
+  });
+
+  it("is case-insensitive about the host", () => {
+    expect(sanitizeRelayUrl("https://CLAUDE.AI/oauth", opts)).toBe(
+      "https://claude.ai/oauth",
+    );
+  });
+
+  it("allows any host when no allowlist is given — the relay's whole point", () => {
+    expect(sanitizeRelayUrl("https://github.com/login/device")).toBe(
+      "https://github.com/login/device",
+    );
+  });
+});
+
+describe("urlOrigin", () => {
+  it("returns the part that decides where credentials go", () => {
+    expect(urlOrigin("https://claude.ai/oauth/authorize?code=true")).toBe(
+      "https://claude.ai",
+    );
+    expect(urlOrigin("http://127.0.0.1:41703/callback")).toBe(
+      "http://127.0.0.1:41703",
+    );
+  });
+
+  it("returns null rather than guessing at unparseable input", () => {
+    expect(urlOrigin("not a url")).toBeNull();
   });
 });
 

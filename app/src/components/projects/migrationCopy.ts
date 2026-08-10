@@ -24,8 +24,23 @@ export const KEPT_AUTOMATICALLY = [
 export const KEPT_WHY =
   "/home/claude and ~/.claude are Docker volumes. They detach from the old container and re-attach to the new one unchanged.";
 
+/**
+ * The honest list of what the writable layer holds, because the modal's own
+ * sections name more than one thing and copy that says "the only thing" while
+ * the section below it offers to copy files is copy the user cannot trust.
+ */
 export const LOST_WITHOUT_REPLAY =
-  "What a new base does not carry over is the root-level system packages you installed with apt. Those are the only thing this update has to put back.";
+  "What a new base does not carry over is what lives in the container itself: system packages you installed with apt, global npm packages, and files under /usr/local, /opt, /srv or loose in /workspace. This update puts those back.";
+
+/**
+ * The exception, and it is not a small one — so it gets its own line wherever
+ * the update is offered. Reinstalling `postgresql` gets the package back and an
+ * empty cluster with it; the ordinary Reset-free recreate keeps /var because it
+ * builds from the project's own saved image, so this is the one way in which
+ * updating the base is more destructive than leaving it alone.
+ */
+export const DATA_NOT_CARRIED =
+  "Data written under /var is not carried across and reinstalling the package does not bring it back — a database in /var/lib, a site in /var/www. Back it up from inside the container before you update.";
 
 /**
  * Said plainly everywhere rollback is offered. Rollback is not a time machine:
@@ -44,6 +59,18 @@ export const MID_RUN_SAFETY =
 
 export const REPLAY_COST =
   "Needs network access and usually takes 1–2 minutes.";
+
+/** `41.0 MB`. Sizes here are informational, so the friendlier decimal unit. */
+export function formatDataSize(bytes: number): string {
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1000 && unit < units.length - 1) {
+    value /= 1000;
+    unit += 1;
+  }
+  return unit === 0 ? `${bytes} B` : `${value.toFixed(1)} ${units[unit]}`;
+}
 
 /** `1 Mar` — short enough to sit inline in the banner sentence. */
 export function formatSnapshotDate(iso: string | null): string | null {

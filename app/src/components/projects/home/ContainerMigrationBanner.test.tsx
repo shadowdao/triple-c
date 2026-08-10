@@ -18,6 +18,7 @@ const FRESH: ContainerStaleness = {
   apt_delta: [],
   npm_global_delta: [],
   verbatim_paths: [],
+  unpreserved_data: [],
   outdated_package_count: 0,
   probe_error: null,
 };
@@ -40,6 +41,7 @@ function migration(overrides: Partial<ContainerMigration> = {}): ContainerMigrat
   return {
     staleness: null,
     probing: false,
+    probeSettled: true,
     running: false,
     recovered: false,
     interrupted: null,
@@ -51,7 +53,7 @@ function migration(overrides: Partial<ContainerMigration> = {}): ContainerMigrat
     resume: vi.fn(async () => {}),
     keep: vi.fn(async () => {}),
     rollback: vi.fn(async () => {}),
-    dismiss: vi.fn(),
+    dismiss: vi.fn(async () => {}),
     refresh: vi.fn(async () => {}),
     ...overrides,
   };
@@ -173,7 +175,7 @@ describe("ContainerMigrationBanner", () => {
     });
     renderBanner(m);
     expect(
-      screen.getByText(/A container base update was interrupted/i),
+      screen.getByText(/The container base update did not finish/i),
     ).toBeInTheDocument();
     expect(screen.getByText(/part-way onto the new base/i)).toBeInTheDocument();
     // The plain "Update container base…" call to action must not be what is
@@ -205,6 +207,36 @@ describe("ContainerMigrationBanner", () => {
     );
     expect(screen.queryByRole("button", { name: "Roll back" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Resume update" })).toBeInTheDocument();
+  });
+
+  it("distinguishes an unsettled probe from a running container", () => {
+    // "Stop the container to update its base" on a container that is already
+    // stopped — because the probe has not landed — reads as a bug.
+    renderBanner(
+      migration({ staleness: STALE, probing: true, probeSettled: false }),
+      false,
+    );
+    expect(
+      screen.getByText(/Checking what this container has/i),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(/Stop the container to update its base/i),
+    ).not.toBeInTheDocument();
+  });
+
+  it("names the /var data that updating would destroy", () => {
+    renderBanner(
+      migration({
+        staleness: {
+          ...STALE,
+          unpreserved_data: [
+            { path: "/var/lib/postgresql", bytes: 41_000_000, file_count: 912 },
+          ],
+        },
+      }),
+    );
+    expect(screen.getByText("/var/lib/postgresql")).toBeInTheDocument();
+    expect(screen.getByText(/back this up before updating/i)).toBeInTheDocument();
   });
 
   describe("the report", () => {
@@ -293,6 +325,39 @@ describe("ContainerMigrationBanner", () => {
       expect(screen.getByText(/Update failed at replay/i)).toBeInTheDocument();
       expect(screen.queryByRole("button", { name: "Roll back" })).not.toBeInTheDocument();
       expect(screen.getByRole("button", { name: "Dismiss" })).toBeInTheDocument();
+    });
+
+    it("never offers Keep over a container that is still mid-swap", () => {
+      // The failing-commit path returns a report *and* leaves the record
+      // interrupted. Keep would untag the rollback image and delete the record
+      // while `triple-c-snapshot-<id>:latest` still points at the old lineage —
+      // and the backend's own message on that record says to resume.
+      const m = migration({
+        staleness: STALE,
+        interrupted: {
+          phase: "interrupted",
+          from_image_id: "sha256:aaa",
+          to_base_id: "sha256:bbb",
+          started_at: "2026-08-09T10:00:00Z",
+          report: null,
+          rollback_image: "triple-c-snapshot-p1:pre-migration-20260809-100000",
+          staging_path: null,
+          options: { replay_packages: true, copy_paths: true, keep_rollback: true },
+          plan: null,
+        },
+        report: {
+          ...CLEAN,
+          phase: "failed",
+          message: "saving it failed. Resume it, or roll back.",
+        },
+      });
+      renderBanner(m);
+      expect(screen.queryByRole("button", { name: "Keep" })).not.toBeInTheDocument();
+      expect(
+        screen.getByRole("button", { name: "Resume update" }),
+      ).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Roll back" }));
+      expect(m.rollback).toHaveBeenCalledTimes(1);
     });
 
     it("does not describe rollback as a time machine", () => {

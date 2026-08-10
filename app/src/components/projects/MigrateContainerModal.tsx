@@ -5,8 +5,10 @@ import Button from "../ui/Button";
 import Toggle from "../ui/Toggle";
 import { SwitchRow } from "../ui/Field";
 import MigrationReportCard from "./MigrationReportCard";
+import MigrationInterruptedCard from "./MigrationInterruptedCard";
 import type { ContainerMigration } from "../../hooks/useContainerMigration";
 import {
+  DATA_NOT_CARRIED,
   KEPT_AUTOMATICALLY,
   KEPT_WHY,
   LOST_WITHOUT_REPLAY,
@@ -14,6 +16,7 @@ import {
   REPLAY_COST,
   ROLLBACK_DISK_COST,
   ROLLBACK_SCOPE,
+  formatDataSize,
   formatSnapshotDate,
 } from "./migrationCopy";
 
@@ -85,10 +88,12 @@ export default function MigrateContainerModal({
   const [keepRollback, setKeepRollback] = useState(true);
   const logRef = useRef<HTMLDivElement>(null);
 
-  const { running, report, log, phaseMessage, busy } = migration;
+  const { running, report, interrupted, log, phaseMessage, busy, probeSettled } =
+    migration;
   const aptDelta = staleness?.apt_delta ?? [];
   const npmDelta = staleness?.npm_global_delta ?? [];
   const verbatim = staleness?.verbatim_paths ?? [];
+  const atRisk = staleness?.unpreserved_data ?? [];
   const gains = staleness?.missing_features ?? [];
   const snapshot = formatSnapshotDate(staleness?.snapshot_created_at ?? null);
 
@@ -100,12 +105,43 @@ export default function MigrateContainerModal({
 
   const start = () => {
     const options: MigrationOptions = {
+      // Deliberately *not* `&& verbatim.length > 0`. That looked like a
+      // harmless optimisation but read the toggle's meaning off a probe that
+      // may not have landed, so a null `staleness` sent `copy_paths: false`
+      // and the backend — which recomputes the real set but honours the flag —
+      // skipped files that did exist. The backend already skips the step when
+      // its own set comes out empty; that is the only place that knows.
       replay_packages: replayPackages,
-      copy_paths: copyPaths && verbatim.length > 0,
+      copy_paths: copyPaths,
       keep_rollback: keepRollback,
     };
     void migration.start(options);
   };
+
+  // ---- Unfinished ---------------------------------------------------------
+  // Ahead of the report, for the reason spelled out in MigrationInterruptedCard:
+  // Keep is not a legitimate action on a container that is mid-swap.
+  if (interrupted) {
+    return (
+      <Modal
+        title={`Update container base — ${projectName}`}
+        onClose={onClose}
+        widthClassName="w-[34rem]"
+        footer={
+          <Button size="md" variant="ghost" onClick={onClose}>
+            Close
+          </Button>
+        }
+      >
+        <MigrationInterruptedCard
+          record={interrupted}
+          busy={busy || running}
+          onResume={() => void migration.resume()}
+          onRollback={() => void migration.rollback().then(onClose)}
+        />
+      </Modal>
+    );
+  }
 
   // ---- Outcome ------------------------------------------------------------
   if (report) {
@@ -125,10 +161,7 @@ export default function MigrateContainerModal({
           busy={busy}
           onKeep={() => void migration.keep().then(onClose)}
           onRollback={() => void migration.rollback().then(onClose)}
-          onDismiss={() => {
-            migration.dismiss();
-            onClose();
-          }}
+          onDismiss={() => void migration.dismiss().then(onClose)}
         />
       </Modal>
     );
@@ -187,13 +220,35 @@ export default function MigrateContainerModal({
           <Button size="md" variant="ghost" onClick={onClose}>
             Cancel
           </Button>
-          <Button size="md" variant="primary" onClick={start}>
+          <Button
+            size="md"
+            variant="primary"
+            disabled={!probeSettled}
+            onClick={start}
+          >
             Update container base
           </Button>
         </>
       }
     >
       <div className="space-y-3">
+        {/* 0. Until the probe lands, every list below is "not known" wearing
+            "empty"'s clothes. Say which one it is, and do not let the run
+            start on an unread delta. */}
+        {!probeSettled && (
+          <section
+            className="border border-[var(--warning)]/40 bg-[var(--warning-muted)] rounded-[var(--radius-panel)] px-3.5 py-3"
+            role="status"
+            aria-live="polite"
+          >
+            <p className="text-xs text-[var(--text-primary)] leading-snug">
+              Still working out what this container has that the current base
+              does not. The lists below are not complete until it finishes, so
+              the update cannot start yet.
+            </p>
+          </section>
+        )}
+
         {/* 1. Reassurance first. Not a choice — a statement of fact. */}
         <Section title="Kept automatically">
           <BulletList items={KEPT_AUTOMATICALLY} />
@@ -202,6 +257,51 @@ export default function MigrateContainerModal({
             {LOST_WITHOUT_REPLAY}
           </p>
         </Section>
+
+        {/* 1b. The one thing that is genuinely destroyed. Directly under the
+            reassurance, because a user who reads only the top of this dialog
+            must not come away thinking nothing is at stake. */}
+        <section
+          className="border border-[var(--error)]/40 bg-[var(--error-muted)] rounded-[var(--radius-panel)] px-3.5 py-3 space-y-2"
+          data-testid="migration-unpreserved"
+        >
+          <h3 className="text-[13px] font-medium text-[var(--text-primary)]">
+            {atRisk.length > 0
+              ? `Destroyed, and not restored by this update (${atRisk.length})`
+              : "Not carried across"}
+          </h3>
+          <p className="text-xs text-[var(--text-secondary)] leading-snug">
+            {DATA_NOT_CARRIED}
+          </p>
+          {probeSettled ? (
+            atRisk.length > 0 ? (
+              <ul className="space-y-1 pl-4 list-disc marker:text-[var(--text-disabled)]">
+                {atRisk.map((d) => (
+                  <li
+                    key={d.path}
+                    className="text-xs leading-snug text-[var(--text-primary)]"
+                  >
+                    <span className="font-mono break-all">{d.path}</span>
+                    <span className="text-[var(--text-secondary)]">
+                      {" "}
+                      — {formatDataSize(d.bytes)} in {d.file_count} file
+                      {d.file_count === 1 ? "" : "s"}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="text-xs text-[var(--text-secondary)]">
+                Nothing was found under <code className="font-mono">/var</code>{" "}
+                on this container, so there is nothing here to lose.
+              </p>
+            )
+          ) : (
+            <p className="text-xs text-[var(--text-secondary)]">
+              Not checked yet.
+            </p>
+          )}
+        </section>
 
         {/* 2. The apt replay. */}
         <Section
@@ -216,7 +316,12 @@ export default function MigrateContainerModal({
         >
           {aptDelta.length === 0 ? (
             <p className="text-xs text-[var(--text-secondary)]">
-              No extra apt packages were found on this container.
+              {/* "None found" and "not looked yet" are different sentences.
+                  Printing the first while the probe is still running is how a
+                  user ends up believing a delta was empty when it was unread. */}
+              {probeSettled
+                ? "No extra apt packages were found on this container."
+                : "Still checking which apt packages this container added."}
             </p>
           ) : (
             <BulletList items={aptDelta} mono />
@@ -232,10 +337,16 @@ export default function MigrateContainerModal({
           <p className="text-xs text-[var(--text-secondary)]">{REPLAY_COST}</p>
         </Section>
 
-        {/* 3. Verbatim copies — usually nothing, so usually not shown at all. */}
-        {verbatim.length > 0 && (
+        {/* 3. Verbatim copies — usually nothing once the probe has settled, so
+            usually not shown at all. Shown while it has not, because a hidden
+            section reads as "there is nothing here". */}
+        {(verbatim.length > 0 || !probeSettled) && (
           <Section
-            title={`Copied across as-is (${verbatim.length})`}
+            title={
+              probeSettled
+                ? `Copied across as-is (${verbatim.length})`
+                : "Copied across as-is"
+            }
             control={
               <Toggle
                 label="Copy user-authored files across as-is"
@@ -251,7 +362,13 @@ export default function MigrateContainerModal({
               <code className="font-mono">/workspace</code> that belongs to no
               package, so it cannot be reinstalled from a repository.
             </p>
-            <BulletList items={verbatim} mono />
+            {probeSettled ? (
+              <BulletList items={verbatim} mono />
+            ) : (
+              <p className="text-xs text-[var(--text-secondary)]">
+                Still checking what is there.
+              </p>
+            )}
           </Section>
         )}
 

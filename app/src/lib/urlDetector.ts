@@ -70,8 +70,16 @@ export class UrlDetector {
 
     if (!flat) return;
 
-    // 3. Match URLs on the flattened string — spans across wrapped lines naturally
-    const urlRe = /https?:\/\/[^\s'"<>\x07]+/g;
+    // 3. Match URLs on the flattened string — spans across wrapped lines naturally.
+    //    The negated class stops at anything illegal in a URL, which must
+    //    include the *whole* C0 range and DEL, not just BEL: an escape or a NUL
+    //    swallowed into the middle of a match becomes a URL that renders as one
+    //    thing in the toast and resolves as another. Everything emitted here is
+    //    still re-validated by `sanitizeRelayUrl` before it can reach `openUrl`;
+    //    stopping the match early only means the legitimate prefix survives
+    //    instead of the whole candidate being thrown away.
+    // eslint-disable-next-line no-control-regex
+    const urlRe = /https?:\/\/[^\s'"`<>\x00-\x20\x7f]+/g;
     let m: RegExpExecArray | null;
 
     while ((m = urlRe.exec(flat)) !== null) {

@@ -22,6 +22,7 @@ const STALE: ContainerStaleness = {
   apt_delta: ["socat", "bubblewrap"],
   npm_global_delta: [],
   verbatim_paths: [],
+  unpreserved_data: [],
   outdated_package_count: 61,
   probe_error: null,
 };
@@ -30,6 +31,7 @@ function migration(overrides: Partial<ContainerMigration> = {}): ContainerMigrat
   return {
     staleness: STALE,
     probing: false,
+    probeSettled: true,
     running: false,
     recovered: false,
     interrupted: null,
@@ -41,7 +43,7 @@ function migration(overrides: Partial<ContainerMigration> = {}): ContainerMigrat
     resume: vi.fn(async () => {}),
     keep: vi.fn(async () => {}),
     rollback: vi.fn(async () => {}),
-    dismiss: vi.fn(),
+    dismiss: vi.fn(async () => {}),
     refresh: vi.fn(async () => {}),
     ...overrides,
   };
@@ -153,16 +155,93 @@ describe("MigrateContainerModal", () => {
       });
     });
 
-    it("does not ask to copy paths when there are none to copy", async () => {
+    it("never derives copy_paths from a delta the probe may not have read", async () => {
+      // The regression: `copy_paths: copyPaths && verbatim.length > 0` read the
+      // toggle's meaning off `staleness`, which is null while the ~6 s probe
+      // runs. That sent `copy_paths: false` to a backend that recomputes the
+      // real set but honours the flag — files silently not copied, while this
+      // dialog said there was nothing to copy. The toggle's own value is the
+      // only thing that may be sent; the backend skips the step when *its* set
+      // comes out empty, which is the only place that knows.
       const { m } = await renderModal({ ...STALE, verbatim_paths: [] });
       fireEvent.click(
         screen.getByRole("button", { name: "Update container base" }),
       );
       expect(m.start).toHaveBeenCalledWith({
         replay_packages: true,
-        copy_paths: false,
+        copy_paths: true,
         keep_rollback: true,
       });
+    });
+
+    it("cannot be started until the probe has settled, and says so", async () => {
+      await renderModal(null, { probeSettled: false, probing: true });
+      expect(
+        screen.getByRole("button", { name: "Update container base" }),
+      ).toBeDisabled();
+      expect(
+        screen.getByText(/lists below are not complete until it finishes/i),
+      ).toBeInTheDocument();
+      // "None found" and "not checked yet" must not be the same sentence.
+      expect(
+        screen.getByText(/Still checking which apt packages/i),
+      ).toBeInTheDocument();
+      expect(screen.getByText("Not checked yet.")).toBeInTheDocument();
+      expect(
+        screen.queryByText(/No extra apt packages were found/i),
+      ).not.toBeInTheDocument();
+    });
+
+    it("names the data under /var that the update destroys and cannot restore", async () => {
+      await renderModal({
+        ...STALE,
+        unpreserved_data: [
+          { path: "/var/lib/postgresql", bytes: 41_000_000, file_count: 912 },
+        ],
+      });
+      const panel = screen.getByTestId("migration-unpreserved");
+      expect(panel.textContent).toMatch(/\/var\/lib\/postgresql/);
+      expect(panel.textContent).toMatch(/41\.0 MB in 912 files/);
+      expect(panel.textContent).toMatch(/reinstalling the package does not bring it back/i);
+    });
+
+    it("says plainly that /var is not carried across even when nothing is at risk", async () => {
+      await renderModal();
+      const panel = screen.getByTestId("migration-unpreserved");
+      expect(panel.textContent).toMatch(/nothing here to lose/i);
+      expect(panel.textContent).toMatch(/Data written under \/var is not carried across/i);
+    });
+
+    it("offers Resume rather than Keep on a container that is mid-swap", async () => {
+      // Keep drops the rollback image, and on an unfinished migration
+      // `:latest` still points at the old lineage — so Keep here deletes the
+      // only way back from a container the app can no longer reason about.
+      const { m } = await renderModal(STALE, {
+        interrupted: {
+          phase: "interrupted",
+          from_image_id: "sha256:aaa",
+          to_base_id: "sha256:bbb",
+          started_at: "2026-08-09T10:00:00Z",
+          report: null,
+          rollback_image: "triple-c-snapshot-p1:pre-migration-20260809-100000",
+          staging_path: null,
+          options: { replay_packages: true, copy_paths: true, keep_rollback: true },
+          plan: null,
+        },
+        report: {
+          phase: "failed",
+          packages_requested: [],
+          packages_installed: [],
+          packages_failed: [],
+          paths_copied: [],
+          features_restored: [],
+          rollback_available: true,
+          message: "saving it failed",
+        },
+      });
+      expect(screen.queryByRole("button", { name: "Keep" })).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Resume update" }));
+      expect(m.resume).toHaveBeenCalledTimes(1);
     });
 
     it("does not start anything on cancel", async () => {

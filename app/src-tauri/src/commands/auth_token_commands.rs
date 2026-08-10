@@ -23,11 +23,20 @@
 //! * The flow needs a way to deliver the pasted code, hence
 //!   [`submit_claude_token_code`] and the stdin channel below. Without it the
 //!   command would simply sit at the prompt until it timed out.
-//! * [`crate::auth_bridge`] is *not* required for this particular command,
-//!   since there is no container-local callback to reach. It is still enabled
-//!   for the duration (and restored afterwards) as designed: it costs nothing
-//!   here and keeps the flow working if a future CLI version, or the plain
-//!   `claude login` path, goes back to a loopback redirect.
+//! * [`crate::auth_bridge`] is **not involved**. There is no container-local
+//!   listener to reach, so there is nothing for it to bridge.
+//!
+//!   An earlier version turned the bridge on for the duration "in case a
+//!   future CLI version goes back to a loopback redirect", and turned it off
+//!   again afterwards. That was wrong twice over. The bridge flag is
+//!   *persisted* to `projects.json`, and the restore only ran if the future
+//!   completed — so a force-quit, kill or panic inside the 15-minute
+//!   [`SETUP_TIMEOUT`] left it latched on, and the app re-armed an
+//!   unauthenticated loopback port mirror on every subsequent launch, for a
+//!   project whose owner had never opted in. And it bought nothing: the
+//!   speculative future it defended against would need code changes here
+//!   anyway. The bridge remains available as the per-project setting it always
+//!   was; this command does not touch it.
 //!
 //! ## Handling of the token itself
 //!
@@ -66,10 +75,27 @@ const SETUP_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const TOKEN_PREFIX: &str = "sk-ant-oat01-";
 
 /// Minimum number of body characters after [`TOKEN_PREFIX`] for a match to be
-/// believed. Real tokens run to ~90 characters; this is set well below that but
-/// far above anything prose would produce, so documentation-style decoys like
-/// `sk-ant-oat01-...` or `sk-ant-oat01-<your-token>` are rejected.
-const MIN_TOKEN_BODY: usize = 32;
+/// believed. Real `setup-token` credentials run to ~90 body characters.
+///
+/// This must be close to that real length, not merely "longer than prose".
+/// The earlier value of 32 accepted a *fragment* of a token — which is what a
+/// line wrap produces if `stty cols 200` fails and the pty falls back to 80
+/// columns, splitting the value across two lines. Two bad things follow from
+/// accepting one:
+///
+///  * the fragment gets stored as if it were the credential, so every
+///    container authenticates with a token that cannot work, and the failure
+///    surfaces far from its cause;
+///  * [`SecretRedactor`] masks the leading fragment because it carries the
+///    `sk-ant-` marker, but the *tail* on the next line carries no marker and
+///    is emitted to the UI in clear.
+///
+/// Set below the real length by enough margin to survive a modest change in
+/// token format, and far above any fragment an 80-column wrap can produce (the
+/// prefix alone eats 13 columns, so the longest possible first line fragment is
+/// ~67). Rejecting a real-but-shorter token is a loud, recoverable failure —
+/// "printed no recognisable token" — whereas accepting a fragment is silent.
+const MIN_TOKEN_BODY: usize = 80;
 
 /// Redaction is deliberately broader than extraction: anything shaped like an
 /// Anthropic credential is masked on its way to the UI, not just `oat01` ones.
@@ -361,6 +387,20 @@ fn strip_ansi_prefix(bytes: &[u8]) -> (String, usize) {
     (out, i)
 }
 
+/// Cap on the bytes [`AnsiStripper`] will hold waiting for a control sequence
+/// to terminate.
+///
+/// [`strip_ansi_prefix`] stops at the first *incomplete* sequence and the
+/// remainder is carried to the next chunk — which is correct while the
+/// sequence really is going to end, and unbounded when it never does. A single
+/// `ESC ]` with no BEL and no ST swallows everything the container prints for
+/// the rest of the 15-minute [`SETUP_TIMEOUT`], and the buffer grows with it;
+/// `transcript` and [`SecretRedactor::pending`] are both already capped, so
+/// this was the one remaining way to make the flow eat memory. Generous enough
+/// that no legitimate sequence comes close (OSC 8 hyperlinks are the longest
+/// thing Claude Code emits, in the low hundreds of bytes).
+const MAX_ANSI_CARRY: usize = 64 * 1024;
+
 /// Stateful wrapper around [`strip_ansi_prefix`] that carries an incomplete
 /// trailing sequence over to the next chunk.
 #[derive(Default)]
@@ -371,8 +411,29 @@ struct AnsiStripper {
 impl AnsiStripper {
     fn push(&mut self, chunk: &[u8]) -> String {
         self.carry.extend_from_slice(chunk);
-        let (out, consumed) = strip_ansi_prefix(&self.carry);
+        let (mut out, consumed) = strip_ansi_prefix(&self.carry);
         self.carry.drain(..consumed);
+
+        // Past the cap the leading sequence is not going to terminate. Drop
+        // its introducer and re-strip: the bytes behind it are then treated as
+        // ordinary text rather than discarded, so a token hiding inside a
+        // runaway OSC still reaches the parser. Dropping one byte per
+        // overflowing chunk is enough — the cap can only be re-crossed by a
+        // fresh chunk, which re-enters here.
+        if self.carry.len() > MAX_ANSI_CARRY {
+            log::warn!(
+                "`claude setup-token` emitted an unterminated control sequence \
+                 longer than {} bytes — treating it as text",
+                MAX_ANSI_CARRY
+            );
+        }
+        while self.carry.len() > MAX_ANSI_CARRY {
+            self.carry.drain(..1);
+            let (more, consumed) = strip_ansi_prefix(&self.carry);
+            self.carry.drain(..consumed);
+            out.push_str(&more);
+        }
+
         out
     }
 }
@@ -606,65 +667,23 @@ pub async fn acquire_claude_token(
         *cancel_slot().lock().await = Some(cancel_tx);
     }
 
-    let bridge_was_enabled = project.auth_bridge_enabled;
+    // No auth-bridge elevation here — see the module docs. `setup-token` has no
+    // container-local callback to bridge, and the flag that would enable one is
+    // *persisted*, so a crash anywhere inside the 15-minute timeout used to
+    // leave an unauthenticated port mirror armed for good.
+    emit_progress(
+        &app_handle,
+        &project_id,
+        "Running `claude setup-token` — sign in at the URL below, then submit the code it gives you.",
+    );
 
-    let result = async {
-        // See the module docs: 2.1.226's `setup-token` redirects to an
-        // Anthropic-hosted callback, so no container-local listener needs
-        // bridging. Enabled anyway, per design, to cover CLI versions and login
-        // paths that do use a loopback redirect. Temporary elevation — the
-        // prior setting is restored below whatever happens.
-        if !bridge_was_enabled {
-            state
-                .projects_store
-                .set_auth_bridge_enabled(&project_id, true)?;
-            emit_progress(
-                &app_handle,
-                &project_id,
-                "Auth bridge enabled for the duration of login.",
-            );
-        }
-        // Called unconditionally, and idempotent: the flag may already have
-        // been on while the poller was not running (e.g. enabled before start).
-        state
-            .auth_bridge
-            .start(
-                project_id.clone(),
-                container_id.clone(),
-                app_handle.clone(),
-                state.projects_store.clone(),
-            )
-            .await;
+    let result =
+        run_setup_token(&app_handle, &project_id, &container_id, input_rx, cancel_rx).await;
 
-        emit_progress(
-            &app_handle,
-            &project_id,
-            "Running `claude setup-token` — sign in at the URL below, then submit the code it gives you.",
-        );
-
-        run_setup_token(&app_handle, &project_id, &container_id, input_rx, cancel_rx).await
-    }
-    .await;
-
-    // Release the flow, then restore the bridge — both unconditionally, so a
-    // failed or cancelled login leaves nothing latched on.
+    // Release the flow. Nothing else needs unwinding: this command changes no
+    // persisted state until the token itself is stored, which is the point.
     *pending_input().lock().await = None;
     *cancel_slot().lock().await = None;
-    if !bridge_was_enabled {
-        // Stop the poller first: it awaits teardown, so host ports are provably
-        // released before the flag goes back.
-        state.auth_bridge.stop(&project_id).await;
-        if let Err(e) = state
-            .projects_store
-            .set_auth_bridge_enabled(&project_id, false)
-        {
-            log::warn!(
-                "Failed to restore the auth bridge setting for project {}: {}",
-                project_id,
-                e
-            );
-        }
-    }
 
     let token = result?;
     secure::store_claude_oauth_token(&token)?;
@@ -736,14 +755,69 @@ pub async fn has_claude_token() -> Result<bool, String> {
     Ok(secure::has_claude_oauth_token())
 }
 
-/// Forget the shared Claude token. Containers keep the injected value until
-/// each is next started, at which point the rotation-id label mismatch forces a
-/// recreation that blanks the env var.
+/// What [`clear_claude_token`] managed to reach. The keychain entry is always
+/// gone by the time this is returned — the rest is about copies of the token
+/// that live outside it.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct ClearTokenOutcome {
+    /// Snapshot images that were holding the token and have been rewritten.
+    pub snapshots_scrubbed: Vec<String>,
+    /// Images still holding it, with the reason each could not be rewritten.
+    /// Non-empty means the revocation is **incomplete** and the UI must say so.
+    pub snapshots_failed: Vec<String>,
+    /// Rewritten, but the pre-rewrite image object could not be deleted because
+    /// a container is still running off it. Worth mentioning, not worth
+    /// alarming about — see `SnapshotScrubReport::superseded_retained`.
+    pub snapshots_superseded: Vec<String>,
+    /// Set when Docker could not be reached at all, so nothing is known about
+    /// what is still on disk.
+    pub docker_unavailable: Option<String>,
+}
+
+/// Forget the shared Claude token.
+///
+/// Deleting the keychain entry is the easy half. The token also exists in two
+/// other places, and a "Revoke" button that leaves either of them behind is
+/// telling the user something untrue:
+///
+///  * **Running containers** hold it in their environment. That resolves
+///    itself: the rotation id in `triple-c.claude-token-version` no longer
+///    matches, so the next start recreates the container and
+///    `MANAGED_AUTH_KEYS` blanks the variable.
+///  * **Snapshot images** hold it in `Config.Env`, and nothing resolves that on
+///    its own — the image outlives every container built from it, and
+///    `docker image inspect` will keep printing a live ~1-year credential for
+///    as long as the image exists. New commits no longer bake it in (see
+///    [`crate::docker::container::commit_container_snapshot`]), but images
+///    committed by earlier builds have to be rewritten, which is what
+///    [`scrub_secrets_from_snapshots`] does here.
+///
+/// The keychain deletion is never rolled back if the scrub fails; a partially
+/// completed revocation is still better than none, and the outcome is reported
+/// so the UI can be explicit about what is left.
 #[tauri::command]
-pub async fn clear_claude_token() -> Result<(), String> {
+pub async fn clear_claude_token() -> Result<ClearTokenOutcome, String> {
     secure::delete_claude_oauth_token()?;
     log::info!("Cleared the shared Claude authentication token");
-    Ok(())
+
+    let report = crate::docker::container::scrub_secrets_from_snapshots().await;
+    if report.left_something_behind() {
+        log::warn!(
+            "Revoked the shared Claude token but {} snapshot image(s) may still contain it",
+            report.failed.len()
+        );
+    }
+
+    Ok(ClearTokenOutcome {
+        snapshots_scrubbed: report.scrubbed,
+        snapshots_failed: report
+            .failed
+            .into_iter()
+            .map(|(image, reason)| format!("{}: {}", image, reason))
+            .collect(),
+        snapshots_superseded: report.superseded_retained,
+        docker_unavailable: report.unavailable,
+    })
 }
 
 #[cfg(test)]
@@ -938,5 +1012,72 @@ mod tests {
         visible.push_str(&s.push(b"1mb"));
         assert_eq!(visible, "ab");
     }
-}
+    // ── Truncated credentials ────────────────────────────────────────────
+    // `stty cols 200` runs before Claude Code starts precisely so the ~103
+    // character token never wraps. If that fails, the pty falls back to 80
+    // columns and the token arrives split across two lines. The old floor of
+    // 32 body characters believed the first half.
 
+    #[test]
+    fn a_token_shorter_than_a_real_one_is_rejected() {
+        let fragment = format!("{}{}", TOKEN_PREFIX, "M".repeat(MIN_TOKEN_BODY - 1));
+        assert_eq!(
+            parse_setup_token(&format!("Your token: {}\n", fragment)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_line_wrapped_token_yields_nothing_rather_than_half_a_credential() {
+        let tok = token('N');
+        // Column 12 is where `Your token: ` ends, so an 80-column pty breaks
+        // the value 68 characters in.
+        let wrapped = format!("Your token: {}\n{}\n", &tok[..68], &tok[68..]);
+        assert_eq!(
+            parse_setup_token(&wrapped),
+            None,
+            "a wrapped token must fail loudly, not be stored truncated"
+        );
+    }
+
+    #[test]
+    fn a_real_length_token_is_still_accepted() {
+        // Guards the floor from being raised past what Anthropic actually mints.
+        let tok = token('O');
+        assert_eq!(tok.len() - TOKEN_PREFIX.len(), 90);
+        assert!(90 > MIN_TOKEN_BODY);
+        assert_eq!(parse_setup_token(&format!("{}\n", tok)), Some(tok));
+    }
+
+    // ── Bounded buffering ────────────────────────────────────────────────
+
+    #[test]
+    fn an_unterminated_control_sequence_cannot_grow_the_carry_without_bound() {
+        let mut s = AnsiStripper::default();
+        // An OSC introducer with no BEL and no ST. `strip_ansi_prefix` cannot
+        // know it has ended, so every byte after it is carried — for the whole
+        // 15-minute timeout, if nothing caps it.
+        let mut seen = s.push(b"\x1b]8;id=1;");
+        for _ in 0..40 {
+            seen.push_str(&s.push(&vec![b'A'; 4096]));
+        }
+        assert!(
+            s.carry.len() <= MAX_ANSI_CARRY,
+            "carry grew to {} bytes",
+            s.carry.len()
+        );
+        assert!(!seen.is_empty(), "the withheld text must be released, not dropped");
+    }
+
+    #[test]
+    fn a_token_printed_after_a_runaway_sequence_is_still_found() {
+        let tok = token('Q');
+        let mut s = AnsiStripper::default();
+        let mut seen = s.push(b"\x1b]8;id=1;");
+        for _ in 0..40 {
+            seen.push_str(&s.push(&vec![b'A'; 4096]));
+        }
+        seen.push_str(&s.push(format!("\nYour token: {}\n", tok).as_bytes()));
+        assert_eq!(parse_setup_token(&seen), Some(tok));
+    }
+}

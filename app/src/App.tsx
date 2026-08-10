@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
+import { listen } from "@tauri-apps/api/event";
 import Sidebar from "./components/layout/Sidebar";
 import TopBar from "./components/layout/TopBar";
 import StatusBar from "./components/layout/StatusBar";
@@ -38,6 +39,25 @@ export default function App() {
       }))
     );
   const [showInstallDialog, setShowInstallDialog] = useState(false);
+  const [shuttingDown, setShuttingDown] = useState(false);
+
+  /**
+   * Everything that can only be done once Docker answers. Called from the
+   * startup check *and* from the poller when the daemon shows up later — a
+   * session that launched before Docker was ready otherwise never reconciles
+   * container state or recovers an interrupted migration.
+   */
+  const onDockerReady = useCallback(async () => {
+    checkImage();
+    // Reconcile project statuses against actual Docker container state,
+    // then refresh the project list so the UI reflects reality.
+    try {
+      setProjects(await reconcileProjectStatuses());
+    } catch {
+      // If reconciliation fails (e.g. Docker hiccup), just load from store
+      refresh();
+    }
+  }, [checkImage, setProjects, refresh]);
 
   // Single STT instance bound to the active session. The mic lives in the
   // StatusBar; the terminal's Ctrl+Shift+M shortcut calls stt.toggle via the
@@ -57,18 +77,10 @@ export default function App() {
     let stopPolling: (() => void) | undefined;
     checkDocker().then((available) => {
       if (available) {
-        checkImage();
-        // Reconcile project statuses against actual Docker container state,
-        // then refresh the project list so the UI reflects reality.
-        reconcileProjectStatuses().then((projects) => {
-          setProjects(projects);
-        }).catch(() => {
-          // If reconciliation fails (e.g. Docker hiccup), just load from store
-          refresh();
-        });
+        onDockerReady();
       } else {
         setShowInstallDialog(true);
-        stopPolling = startDockerPolling();
+        stopPolling = startDockerPolling(onDockerReady);
       }
     });
     refresh();
@@ -86,6 +98,23 @@ export default function App() {
       stopPolling?.();
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // The backend prevents the window closing so it can stop containers first,
+  // which freezes the UI for several seconds. This says why.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    listen("app-shutting-down", () => setShuttingDown(true))
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch((e) => console.error("Failed to listen for shutdown:", e));
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
 
   const homeProjectIds = tabOrder.filter(isHomeTab).map(tabKeyId);
 
@@ -121,6 +150,21 @@ export default function App() {
       <ToastHost />
       {showInstallDialog && (
         <DockerInstallDialog onClose={() => setShowInstallDialog(false)} />
+      )}
+      {shuttingDown && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-[var(--bg-primary)]/95 backdrop-blur-sm"
+          role="status"
+          aria-live="polite"
+          data-testid="shutdown-overlay"
+        >
+          <div className="flex flex-col items-center gap-2 px-6 text-center">
+            <StatusIndicator tone="busy" label="Shutting down" className="text-sm" />
+            <p className="text-[13px] text-[var(--text-secondary)]">
+              Stopping containers before quitting. This window will close on its own.
+            </p>
+          </div>
+        </div>
       )}
     </div>
   );

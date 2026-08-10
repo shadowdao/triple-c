@@ -64,13 +64,52 @@ export default function SharedAuthSettings() {
   const handleRevoke = async () => {
     setRevoking(true);
     try {
-      await clearClaudeToken();
+      const outcome = await clearClaudeToken();
       setConfirmRevoke(false);
       await refresh();
-      pushToast({
-        kind: "success",
-        message: "Shared Claude token removed from the keychain.",
-      });
+
+      // The keychain entry is gone either way. What matters here is the copy of
+      // the token that `docker commit` baked into each project's snapshot
+      // image: that one outlives every container, and `docker image inspect`
+      // will keep printing it until the image is rewritten. If that could not
+      // be done, the revocation is incomplete and saying "removed" would be a
+      // lie.
+      if (outcome.docker_unavailable) {
+        pushToast({
+          kind: "error",
+          message: "Token removed from the keychain, but snapshots were not checked.",
+          detail:
+            `Docker could not be reached (${outcome.docker_unavailable}), so any snapshot image ` +
+            "built before this version may still contain the token in its environment. " +
+            "Start Docker and revoke again to clear them.",
+        });
+      } else if (outcome.snapshots_failed.length > 0) {
+        pushToast({
+          kind: "error",
+          message: "Token removed from the keychain, but it is still in some images.",
+          detail:
+            `${outcome.snapshots_failed.length} snapshot image(s) could not be rewritten and ` +
+            "still contain the token, readable via `docker image inspect`. Reset those " +
+            `projects to remove the images. Details: ${outcome.snapshots_failed.join("; ")}`,
+        });
+      } else if (outcome.snapshots_scrubbed.length > 0) {
+        pushToast({
+          kind: "success",
+          message: `Shared Claude token removed, and cleared from ${outcome.snapshots_scrubbed.length} snapshot image(s).`,
+          detail:
+            outcome.snapshots_superseded.length > 0
+              ? "The pre-rewrite image layer for " +
+                `${outcome.snapshots_superseded.join(", ")} is still on disk because a ` +
+                "container is running from it. It goes away once that project is restarted " +
+                "(which recreates the container) and Docker prunes the leftover."
+              : undefined,
+        });
+      } else {
+        pushToast({
+          kind: "success",
+          message: "Shared Claude token removed from the keychain.",
+        });
+      }
     } catch (e) {
       pushToast({
         kind: "error",
@@ -219,6 +258,13 @@ export default function SharedAuthSettings() {
             <code className="font-mono">claude login</code> the next time their
             container starts. Existing running containers keep working until they are
             restarted.
+          </p>
+          <p className="mt-2 text-[13px] text-[var(--text-secondary)] leading-snug">
+            Each project&rsquo;s snapshot image is also rewritten, because{" "}
+            <code className="font-mono">docker commit</code> copies the token into it
+            and an image outlives every container built from it. If any image
+            cannot be rewritten you will be told which, and the token stays readable
+            in it until that project is Reset.
           </p>
         </Modal>
       )}

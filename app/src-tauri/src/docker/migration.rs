@@ -45,7 +45,7 @@ use bollard::models::HostConfig;
 use futures_util::StreamExt;
 
 use super::client::get_docker;
-use crate::models::ProjectPath;
+use crate::models::{ProjectPath, UnpreservedData};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Policy constants
@@ -81,7 +81,35 @@ pub const COPY_EXCLUSIONS: &[&str] = &["/usr/local/aws-cli", "/opt/mission-contr
 /// Roots the filesystem manifest walks. Wider than [`COPY_ROOTS`] so the
 /// manifest stays useful for debugging; [`compute_verbatim_paths`] applies the
 /// narrower policy.
-pub const MANIFEST_ROOTS: &[&str] = &["/usr/local", "/opt", "/srv", "/workspace"];
+///
+/// [`DATA_ROOTS`] are in here for a different reason: they are never copied,
+/// but they *are* destroyed by the container swap, so the walk has to see them
+/// in order to warn about them.
+pub const MANIFEST_ROOTS: &[&str] = &[
+    "/usr/local",
+    "/opt",
+    "/srv",
+    "/workspace",
+    "/var/lib",
+    "/var/www",
+];
+
+/// Roots holding **state a base-image swap destroys and no replay can put
+/// back**. Reported by [`unpreserved_data`], never copied.
+///
+/// A container running Postgres, MySQL, Redis or nginx keeps its actual data in
+/// `/var/lib/<service>` or `/var/www`. Replaying the apt delta reinstalls the
+/// *package* onto the new base and gets an empty data directory back — the
+/// database is gone. That is worse than the ordinary recreate path, which
+/// creates from the project's snapshot and therefore keeps `/var` intact.
+///
+/// These are deliberately **not** in [`COPY_ROOTS`]. A live database's on-disk
+/// files cannot be tarred out from under a running server and restored into a
+/// different base's version of the same package with any confidence — a copy
+/// that half-works is worse than a warning that lets the user take a proper
+/// dump first. So migration's answer is disclosure, loudly, before anything is
+/// touched.
+pub const DATA_ROOTS: &[&str] = &["/var/lib", "/var/www"];
 
 /// Base-image capabilities worth telling the user they are missing, as
 /// `(path, human label)`.
@@ -125,6 +153,16 @@ pub const LABEL_CREATE_IMAGE: &str = "triple-c.create-image";
 pub const LABEL_MIGRATION_STATE: &str = "triple-c.migration-state";
 /// Value of [`LABEL_MIGRATION_STATE`] while a migration is unfinished.
 pub const MIGRATION_LABEL_IN_PROGRESS: &str = "in-progress";
+/// Label stamped on the short-lived probe containers [`run_throwaway`] creates.
+///
+/// They are removed on every path including failure, but a hard crash of the
+/// app (or of Docker) between create and remove would otherwise leave a
+/// container that carries no `triple-c.*` marking at all — invisible to every
+/// cleanup this app has, and unattributable by hand. The label makes
+/// `docker ps -a --filter label=triple-c.probe=migration` find them.
+pub const LABEL_PROBE: &str = "triple-c.probe";
+/// Value of [`LABEL_PROBE`] on a migration manifest/pre-flight probe container.
+pub const PROBE_LABEL_MIGRATION: &str = "migration";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Manifests
@@ -437,6 +475,72 @@ pub fn verbatim_payload_bytes(from: &Manifest, verbatim: &[String]) -> u64 {
         .sum()
 }
 
+/// The reporting unit under a [`DATA_ROOTS`] entry: the first path component
+/// below the root, e.g. `/var/lib/postgresql`. Directory-level, because that is
+/// the granularity a user can actually act on ("dump this database"), and
+/// because a per-file list of a Postgres cluster would be thousands of lines.
+fn data_unit(path: &str) -> Option<String> {
+    for root in DATA_ROOTS {
+        let prefix = format!("{}/", root);
+        if let Some(rest) = path.strip_prefix(&prefix) {
+            let first = rest.split('/').next()?;
+            if first.is_empty() {
+                return None;
+            }
+            return Some(format!("{}/{}", root, first));
+        }
+    }
+    None
+}
+
+/// Data-bearing subtrees under [`DATA_ROOTS`] that the migration will destroy
+/// and cannot restore, with the size and file count of what is at risk.
+///
+/// A subtree qualifies when **all** of:
+/// * it is a first-level directory under a [`DATA_ROOTS`] entry,
+/// * the current base image does not have that directory **at all** — if the
+///   base ships it, it is the base's own machinery (`/var/lib/apt`,
+///   `/var/lib/dpkg`, `/var/lib/systemd`, …) and the base's copy is the right
+///   one, exactly as for `/etc`,
+/// * it contains at least one regular file that neither image's dpkg database
+///   owns — a package's own scaffolding is recreated by the apt replay, the
+///   data written into it is not.
+///
+/// That pair of filters is what keeps this quiet on an ordinary container and
+/// loud on one running a database: `/var/lib/postgresql` is absent from the
+/// base and full of unowned files, while `/var/lib/apt/lists` is present in the
+/// base and never reported.
+pub fn unpreserved_data(from: &Manifest, base: &Manifest) -> Vec<UnpreservedData> {
+    let base_paths = base.path_set();
+    let mut acc: BTreeMap<String, (u64, u32)> = BTreeMap::new();
+
+    for entry in &from.paths {
+        let Some(unit) = data_unit(&entry.path) else {
+            continue;
+        };
+        if base_paths.contains(unit.as_str()) {
+            continue;
+        }
+        if entry.is_dir() {
+            continue;
+        }
+        if from.dpkg_owned.contains(&entry.path) || base.dpkg_owned.contains(&entry.path) {
+            continue;
+        }
+        let slot = acc.entry(unit).or_insert((0, 0));
+        slot.0 = slot.0.saturating_add(entry.size);
+        slot.1 += 1;
+    }
+
+    acc.into_iter()
+        .map(|(path, (bytes, file_count))| UnpreservedData {
+            path,
+            bytes,
+            file_count,
+        })
+        .collect()
+}
+
 /// Base-image capabilities the container does not have, as
 /// `(concrete paths, human labels)`.
 ///
@@ -582,6 +686,13 @@ pub async fn run_throwaway(image: &str, script: &str) -> Result<ThrowawayResult,
         user: Some("root".to_string()),
         working_dir: Some("/".to_string()),
         tty: Some(false),
+        // Written explicitly rather than inherited: a probe container that
+        // outlives a crash has to be findable, and nothing else in the app
+        // labels these.
+        labels: Some(HashMap::from([(
+            LABEL_PROBE.to_string(),
+            PROBE_LABEL_MIGRATION.to_string(),
+        )])),
         host_config: Some(HostConfig {
             // No mounts on purpose: this must observe the *image*, not the
             // project's volumes, which are exactly the state migration does
@@ -1178,6 +1289,99 @@ mod tests {
         // Directories contribute their inode size on disk, not their contents;
         // counting them would double-count. Excluded subtrees contribute zero.
         assert_eq!(verbatim_payload_bytes(&from, &verbatim), 300);
+    }
+
+    // ── Data that migration destroys and cannot restore ─────────────────────
+
+    #[test]
+    fn a_database_under_var_lib_is_reported_because_nothing_replays_it() {
+        // The regression this exists for: replaying `postgresql` onto the new
+        // base reinstalls the package and gets an empty cluster. The ordinary
+        // recreate path keeps /var because it creates from the snapshot, so a
+        // silent migration would be *more* destructive than the thing it
+        // replaces.
+        let from = manifest(
+            &[
+                ('d', 4096, "/var/lib/postgresql"),
+                ('d', 4096, "/var/lib/postgresql/16/main"),
+                ('f', 8192, "/var/lib/postgresql/16/main/PG_VERSION"),
+                ('f', 1024, "/var/lib/postgresql/16/main/base/1/2"),
+                ('d', 4096, "/var/www"),
+                ('d', 4096, "/var/www/site"),
+                ('f', 500, "/var/www/site/index.html"),
+            ],
+            &[],
+            &[],
+        );
+        let got = unpreserved_data(&from, &Manifest::default());
+        assert_eq!(
+            got.iter().map(|d| d.path.as_str()).collect::<Vec<_>>(),
+            vec!["/var/lib/postgresql", "/var/www/site"]
+        );
+        assert_eq!(got[0].bytes, 9216);
+        assert_eq!(got[0].file_count, 2);
+        // And it is emphatically not in the copy set — reporting is the whole
+        // answer here, not a half-working copy of a live database.
+        assert!(!COPY_ROOTS.iter().any(|r| is_under("/var/lib/postgresql", r)));
+    }
+
+    #[test]
+    fn package_machinery_under_var_is_never_reported_as_data_at_risk() {
+        // /var/lib/apt exists in the base too, so it is the base's to own —
+        // the same rule /etc gets. Reporting apt's lists would bury the one
+        // line that matters under noise on every single migration.
+        let from = manifest(
+            &[
+                ('d', 4096, "/var/lib/apt"),
+                ('f', 900_000, "/var/lib/apt/lists/some.mirror_InRelease"),
+                ('d', 4096, "/var/lib/dpkg"),
+                ('f', 4096, "/var/lib/dpkg/status"),
+            ],
+            &[],
+            &[],
+        );
+        let base = manifest(
+            &[
+                ('d', 4096, "/var/lib/apt"),
+                ('d', 4096, "/var/lib/dpkg"),
+                ('f', 4096, "/var/lib/dpkg/status"),
+            ],
+            &[],
+            &[],
+        );
+        assert!(unpreserved_data(&from, &base).is_empty());
+    }
+
+    #[test]
+    fn a_packages_own_scaffolding_under_var_is_not_data() {
+        // nginx-common ships /var/www/html/index.nginx-debian.html. The apt
+        // replay puts that back; only what the user wrote is at risk.
+        let from = manifest(
+            &[
+                ('d', 4096, "/var/www/html"),
+                ('f', 612, "/var/www/html/index.nginx-debian.html"),
+            ],
+            &["/var/www/html/index.nginx-debian.html"],
+            &[],
+        );
+        assert!(unpreserved_data(&from, &Manifest::default()).is_empty());
+    }
+
+    #[test]
+    fn data_is_reported_per_directory_not_per_file() {
+        assert_eq!(
+            data_unit("/var/lib/mysql/ibdata1").as_deref(),
+            Some("/var/lib/mysql")
+        );
+        // A first-level directory is its own unit.
+        assert_eq!(
+            data_unit("/var/lib/mysql").as_deref(),
+            Some("/var/lib/mysql")
+        );
+        // The root itself is not: it exists in every image.
+        assert_eq!(data_unit("/var/lib").as_deref(), None);
+        assert_eq!(data_unit("/var/www").as_deref(), None);
+        assert_eq!(data_unit("/usr/local/bin/tool"), None);
     }
 
     // ── Bind-mount exclusion ────────────────────────────────────────────────

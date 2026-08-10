@@ -8,13 +8,17 @@ mod models;
 mod storage;
 pub mod web_terminal;
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use auth_bridge::AuthBridgeManager;
 use docker::exec::ExecSessionManager;
 use storage::projects_store::ProjectsStore;
 use storage::settings_store::SettingsStore;
-use tauri::Manager;
+use tauri::async_runtime::JoinHandle;
+use tauri::{Emitter, Manager};
+use tokio::sync::watch;
 use web_terminal::WebTerminalServer;
 
 pub struct AppState {
@@ -23,6 +27,161 @@ pub struct AppState {
     pub exec_manager: Arc<ExecSessionManager>,
     pub auth_bridge: Arc<AuthBridgeManager>,
     pub web_terminal_server: Arc<tokio::sync::Mutex<Option<WebTerminalServer>>>,
+    pub lifecycle: Arc<Lifecycle>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Startup / shutdown coordination
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Total wall-clock budget for teardown before the process exits regardless.
+///
+/// Six teardown steps used to run *serially* inside a `block_on` on the
+/// window-event thread with no timeout: two container stops at Docker's default
+/// 10s grace, a `docker exec` per browser-view project, and every bollard call
+/// inheriting a 120s client timeout. Quitting after Docker Desktop had already
+/// gone away froze the window for minutes. Nothing here is worth more than a
+/// few seconds of a user's exit.
+const SHUTDOWN_BUDGET: Duration = Duration::from_secs(8);
+
+/// How long the in-flight auto-start tasks get to notice cancellation before
+/// they are aborted. They only have to reach their next await point.
+const STARTUP_CANCEL_BUDGET: Duration = Duration::from_secs(3);
+
+/// Backoff (seconds) between auto-start attempts. Docker Desktop routinely
+/// takes 30-60s to accept API calls after login, which is exactly the window in
+/// which Triple-C used to be launched, fail once, and stay broken for the whole
+/// session.
+const AUTOSTART_DELAYS: [u64; 8] = [0, 2, 4, 8, 15, 15, 30, 30];
+
+/// Owns the "is the app going away?" signal and the handles of the background
+/// tasks started during `setup`.
+///
+/// Both auto-starts are fire-and-forget, and quitting quickly used to race
+/// them: `CloseRequested` stopped a gateway container that did not exist yet,
+/// and the detached task then created and started it *after* the app was gone —
+/// leaving an orphan proxy holding a provider key. The same shape orphaned the
+/// web terminal, whose task wrote its server into the state slot that
+/// `CloseRequested` had already `take()`-n. Shutdown therefore cancels and
+/// waits for these tasks *before* running teardown, so teardown always sees the
+/// final state of the world.
+pub struct Lifecycle {
+    cancel: watch::Sender<bool>,
+    tasks: Mutex<Vec<JoinHandle<()>>>,
+    shutting_down: AtomicBool,
+}
+
+impl Lifecycle {
+    fn new() -> Self {
+        let (cancel, _) = watch::channel(false);
+        Self {
+            cancel,
+            tasks: Mutex::new(Vec::new()),
+            shutting_down: AtomicBool::new(false),
+        }
+    }
+
+    /// A receiver that flips to `true` when the app starts shutting down.
+    pub fn cancellation(&self) -> watch::Receiver<bool> {
+        self.cancel.subscribe()
+    }
+
+    pub fn is_shutting_down(&self) -> bool {
+        *self.cancel.borrow()
+    }
+
+    /// Register a startup task so shutdown can wait for it.
+    fn track(&self, handle: JoinHandle<()>) {
+        self.tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(handle);
+    }
+
+    /// `true` the first time only — the window can emit `CloseRequested` again
+    /// once we ask the app to exit, and teardown must not restart.
+    fn begin_shutdown(&self) -> bool {
+        if self.shutting_down.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        // `send_replace`, not `send`: `send` reports an error *and leaves the
+        // value untouched* when nothing is subscribed, which is exactly the
+        // case when neither auto-start is enabled — and `is_shutting_down` (the
+        // web terminal's check) reads that stored value.
+        self.cancel.send_replace(true);
+        true
+    }
+
+    /// Let the tracked startup tasks unwind, then abort whatever is left.
+    async fn settle_startup_tasks(&self) {
+        let mut handles: Vec<JoinHandle<()>> = std::mem::take(
+            &mut *self.tasks.lock().unwrap_or_else(|e| e.into_inner()),
+        );
+        if handles.is_empty() {
+            return;
+        }
+        let settle = async {
+            for handle in &mut handles {
+                let _ = handle.await;
+            }
+        };
+        if tokio::time::timeout(STARTUP_CANCEL_BUDGET, settle).await.is_err() {
+            log::warn!("Startup tasks did not settle in time — aborting them");
+            for handle in &handles {
+                handle.abort();
+            }
+        }
+    }
+}
+
+/// Run an auto-start until it succeeds, the app quits, or the retries run out.
+///
+/// Without this a launch that beats the Docker daemon (or Docker Desktop) to
+/// readiness left the gateway and STT down for the entire session, with no
+/// path back: nothing re-attempts them.
+async fn autostart_with_retry<F, Fut>(label: &str, mut cancel: watch::Receiver<bool>, mut attempt: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    for (index, delay) in AUTOSTART_DELAYS.iter().enumerate() {
+        if *delay > 0 {
+            tokio::select! {
+                _ = cancel.changed() => return,
+                _ = tokio::time::sleep(Duration::from_secs(*delay)) => {}
+            }
+        }
+        if *cancel.borrow() {
+            return;
+        }
+
+        // Cancellation races the attempt itself, not just the backoff, so a
+        // quick quit isn't held up by an in-flight Docker call — and, more
+        // importantly, so the attempt cannot complete after teardown has run.
+        let result = tokio::select! {
+            _ = cancel.changed() => return,
+            r = attempt() => r,
+        };
+
+        match result {
+            Ok(()) => {
+                if index > 0 {
+                    log::info!("{} auto-start succeeded on attempt {}", label, index + 1);
+                }
+                return;
+            }
+            Err(e) => {
+                let last = index + 1 == AUTOSTART_DELAYS.len();
+                if index == 0 {
+                    log::warn!("{} auto-start failed ({}) — will retry", label, e);
+                } else if last {
+                    log::error!("{} auto-start gave up after {} attempts: {}", label, index + 1, e);
+                } else {
+                    log::debug!("{} auto-start attempt {} failed: {}", label, index + 1, e);
+                }
+            }
+        }
+    }
 }
 
 pub fn run() {
@@ -44,11 +203,13 @@ pub fn run() {
     });
     let exec_manager = Arc::new(ExecSessionManager::new());
     let auth_bridge = Arc::new(AuthBridgeManager::new());
+    let lifecycle = Arc::new(Lifecycle::new());
 
     // Clone Arcs for the setup closure (web terminal auto-start)
     let projects_store_setup = projects_store.clone();
     let settings_store_setup = settings_store.clone();
     let exec_manager_setup = exec_manager.clone();
+    let lifecycle_setup = lifecycle.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_store::Builder::default().build())
@@ -60,6 +221,7 @@ pub fn run() {
             exec_manager,
             auth_bridge,
             web_terminal_server: Arc::new(tokio::sync::Mutex::new(None)),
+            lifecycle,
         })
         .setup(move |app| {
             match tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png")) {
@@ -84,8 +246,9 @@ pub fn run() {
                     let set_store = settings_store_setup.clone();
                     let state = app.state::<AppState>();
                     let web_server_mutex = state.web_terminal_server.clone();
+                    let lifecycle = lifecycle_setup.clone();
 
-                    tauri::async_runtime::spawn(async move {
+                    let handle = tauri::async_runtime::spawn(async move {
                         match WebTerminalServer::start(
                             port,
                             token,
@@ -96,6 +259,16 @@ pub fn run() {
                         .await
                         {
                             Ok(server) => {
+                                // The app may have been asked to quit while the
+                                // server was coming up, in which case teardown
+                                // has already emptied this slot and would never
+                                // look at it again. Stop it here instead of
+                                // storing an orphan.
+                                if lifecycle.is_shutting_down() {
+                                    server.stop();
+                                    log::info!("Web terminal stopped immediately: app is exiting");
+                                    return;
+                                }
                                 let mut guard = web_server_mutex.lock().await;
                                 *guard = Some(server);
                                 log::info!("Web terminal auto-started on port {}", port);
@@ -105,68 +278,122 @@ pub fn run() {
                             }
                         }
                     });
+                    lifecycle_setup.track(handle);
                 }
             }
 
             // Auto-start STT container if enabled in settings
             if settings.stt.enabled {
                 let stt_settings = settings.stt.clone();
-                tauri::async_runtime::spawn(async move {
-                    match docker::stt::ensure_stt_running(&stt_settings).await {
-                        Ok(status) => {
-                            if status.running {
-                                log::info!("STT container auto-started on port {}", stt_settings.port);
-                            } else {
-                                log::warn!("STT auto-start: container not running after ensure_stt_running");
-                            }
+                let cancel = lifecycle_setup.cancellation();
+                let handle = tauri::async_runtime::spawn(async move {
+                    autostart_with_retry("STT container", cancel, || async {
+                        let status = docker::stt::ensure_stt_running(&stt_settings).await?;
+                        if status.running {
+                            log::info!("STT container auto-started on port {}", stt_settings.port);
+                            Ok(())
+                        } else {
+                            Err("container not running after ensure_stt_running".to_string())
                         }
-                        Err(e) => {
-                            log::error!("Failed to auto-start STT container: {}", e);
-                        }
-                    }
+                    })
+                    .await;
                 });
+                lifecycle_setup.track(handle);
             }
 
             // Auto-start model gateway container if enabled in settings
             if settings.gateway.enabled {
                 let gateway_settings = settings.gateway.clone();
-                tauri::async_runtime::spawn(async move {
-                    match docker::gateway::ensure_gateway_running(&gateway_settings).await {
-                        Ok(status) => {
-                            if status.running {
-                                log::info!("Model gateway auto-started on port {}", gateway_settings.port);
-                            } else {
-                                log::warn!("Model gateway auto-start: container not running after ensure_gateway_running");
-                            }
+                let cancel = lifecycle_setup.cancellation();
+                let handle = tauri::async_runtime::spawn(async move {
+                    autostart_with_retry("Model gateway", cancel, || async {
+                        let status =
+                            docker::gateway::ensure_gateway_running(&gateway_settings).await?;
+                        if status.running {
+                            log::info!(
+                                "Model gateway auto-started on port {}",
+                                gateway_settings.port
+                            );
+                            Ok(())
+                        } else {
+                            Err("container not running after ensure_gateway_running".to_string())
                         }
-                        Err(e) => {
-                            log::error!("Failed to auto-start model gateway container: {}", e);
-                        }
-                    }
+                    })
+                    .await;
                 });
+                lifecycle_setup.track(handle);
             }
 
             Ok(())
         })
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { .. } = event {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let state = window.state::<AppState>();
-                tauri::async_runtime::block_on(async {
-                    // Stop web terminal server
-                    let mut server_guard = state.web_terminal_server.lock().await;
-                    if let Some(server) = server_guard.take() {
-                        server.stop();
+                let lifecycle = state.lifecycle.clone();
+
+                // Already shutting down: let the window close. That covers our
+                // own `exit` unwinding it, and it deliberately leaves a second
+                // click on the X as a force-quit — teardown is a courtesy, not
+                // a hostage situation.
+                if !lifecycle.begin_shutdown() {
+                    return;
+                }
+
+                let exec_manager = state.exec_manager.clone();
+                let auth_bridge = state.auth_bridge.clone();
+                let web_terminal_server = state.web_terminal_server.clone();
+                drop(state);
+
+                // Teardown talks to Docker, so it cannot be instant. Keep the
+                // window alive and tell the UI what is happening rather than
+                // blocking the event thread on it and looking hung.
+                api.prevent_close();
+                let _ = window.emit("app-shutting-down", ());
+
+                let app_handle = window.app_handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let teardown = async {
+                        // First: let the auto-starts unwind. Anything they are
+                        // midway through creating has to exist before the stops
+                        // below run, or it outlives the app.
+                        lifecycle.settle_startup_tasks().await;
+
+                        // Then everything else, concurrently — these touch
+                        // different subsystems and nothing here depends on
+                        // another's result. Serially, the two container stops
+                        // alone were 20s of Docker's default grace period.
+                        let web_terminal = async {
+                            if let Some(server) = web_terminal_server.lock().await.take() {
+                                server.stop();
+                            }
+                        };
+                        let stop_stt = async {
+                            if let Err(e) = docker::stt::stop_stt_container().await {
+                                log::warn!("Failed to stop the STT container on exit: {}", e);
+                            }
+                        };
+                        let stop_gateway = async {
+                            if let Err(e) = docker::gateway::stop_gateway_container().await {
+                                log::warn!("Failed to stop the model gateway on exit: {}", e);
+                            }
+                        };
+                        tokio::join!(
+                            web_terminal,
+                            stop_stt,
+                            stop_gateway,
+                            exec_manager.close_all_sessions(),
+                            auth_bridge.stop_all(),
+                            browser_view::manager().stop_all(),
+                        );
+                    };
+
+                    if tokio::time::timeout(SHUTDOWN_BUDGET, teardown).await.is_err() {
+                        log::warn!(
+                            "Shutdown exceeded {}s — exiting with teardown incomplete",
+                            SHUTDOWN_BUDGET.as_secs()
+                        );
                     }
-                    // Stop STT container
-                    let _ = docker::stt::stop_stt_container().await;
-                    // Stop model gateway container
-                    let _ = docker::gateway::stop_gateway_container().await;
-                    // Close all exec sessions
-                    state.exec_manager.close_all_sessions().await;
-                    // Release every host loopback port held by the auth bridge
-                    state.auth_bridge.stop_all().await;
-                    // Stop any browser-view proxies and in-container dashboards
-                    browser_view::manager().stop_all().await;
+                    app_handle.exit(0);
                 });
             }
         })
@@ -277,4 +504,131 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// Drives the retry loop under a paused clock, so the real backoff schedule
+    /// is exercised without waiting for it.
+    async fn run_autostart(
+        cancel: watch::Receiver<bool>,
+        outcomes: Vec<Result<(), String>>,
+    ) -> usize {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let outcomes = Arc::new(Mutex::new(outcomes.into_iter()));
+        autostart_with_retry("test", cancel, move || {
+            let counter = counter.clone();
+            let outcomes = outcomes.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                outcomes
+                    .lock()
+                    .unwrap()
+                    .next()
+                    .unwrap_or(Err("still down".to_string()))
+            }
+        })
+        .await;
+        calls.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_working_autostart_runs_exactly_once() {
+        let (_tx, rx) = watch::channel(false);
+        assert_eq!(run_autostart(rx, vec![Ok(())]).await, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_autostart_that_beat_docker_to_readiness_recovers() {
+        // The regression: Docker not being up yet used to cost the whole
+        // session — gateway down, STT down, and nothing ever retried.
+        let (_tx, rx) = watch::channel(false);
+        let calls = run_autostart(
+            rx,
+            vec![
+                Err("daemon not running".to_string()),
+                Err("daemon not running".to_string()),
+                Ok(()),
+            ],
+        )
+        .await;
+        assert_eq!(calls, 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_permanently_failing_autostart_gives_up_rather_than_looping_forever() {
+        let (_tx, rx) = watch::channel(false);
+        assert_eq!(
+            run_autostart(rx, vec![]).await,
+            AUTOSTART_DELAYS.len(),
+            "should attempt once per backoff step and then stop"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_quick_quit_stops_the_retries_before_they_start() {
+        // Quitting before the first attempt must not leave a task that creates
+        // and starts a container after teardown has already run.
+        let (tx, rx) = watch::channel(false);
+        tx.send(true).unwrap();
+        assert_eq!(run_autostart(rx, vec![Ok(())]).await, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_between_attempts_stops_the_retries() {
+        let (tx, rx) = watch::channel(false);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        autostart_with_retry("test", rx, move || {
+            let counter = counter.clone();
+            let tx = tx.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                // The app starts quitting while this attempt is in flight.
+                let _ = tx.send(true);
+                Err("daemon not running".to_string())
+            }
+        })
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn shutdown_begins_exactly_once() {
+        // `CloseRequested` fires again when our own `exit(0)` unwinds the
+        // window; teardown must not start a second time.
+        let lifecycle = Lifecycle::new();
+        assert!(!lifecycle.is_shutting_down());
+        assert!(lifecycle.begin_shutdown());
+        assert!(lifecycle.is_shutting_down());
+        assert!(!lifecycle.begin_shutdown());
+    }
+
+    #[tokio::test]
+    async fn beginning_shutdown_notifies_already_running_startup_tasks() {
+        let lifecycle = Lifecycle::new();
+        let mut cancel = lifecycle.cancellation();
+        assert!(!*cancel.borrow());
+        lifecycle.begin_shutdown();
+        assert!(cancel.changed().await.is_ok());
+        assert!(*cancel.borrow());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_startup_task_that_ignores_cancellation_is_abandoned_not_awaited() {
+        // The budget is what keeps a wedged auto-start from turning quit into a
+        // multi-minute freeze.
+        let lifecycle = Lifecycle::new();
+        lifecycle.track(tauri::async_runtime::spawn(async {
+            tokio::time::sleep(Duration::from_secs(600)).await;
+        }));
+        lifecycle.begin_shutdown();
+        let started = tokio::time::Instant::now();
+        lifecycle.settle_startup_tasks().await;
+        assert!(started.elapsed() <= STARTUP_CANCEL_BUDGET + Duration::from_secs(1));
+    }
 }

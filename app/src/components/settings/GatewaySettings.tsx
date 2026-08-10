@@ -79,9 +79,17 @@ export default function GatewaySettings() {
     refreshStatus();
   }, [refreshStatus]);
 
+  /**
+   * Persist a gateway settings change, then re-read the container status.
+   *
+   * `update_settings` reconciles the container itself — it stops the gateway
+   * when `enabled` goes false and recreates it on a port change — so the status
+   * we are holding is stale the moment the save returns.
+   */
   const patch = async (changes: Partial<GatewaySettingsType>) => {
     if (!appSettings) return;
     await saveSettings({ ...appSettings, gateway: { ...gateway, ...changes } });
+    await refreshStatus();
   };
 
   const savePort = async () => {
@@ -190,6 +198,13 @@ export default function GatewaySettings() {
         ? "Stopped"
         : "Image ready";
 
+  // Rendered in whichever branch is live — only one of them ever mounts.
+  const errorLine = error ? (
+    <p className="text-xs text-[var(--error)]" role="alert">
+      {error}
+    </p>
+  ) : null;
+
   return (
     <div>
       <label className="block text-sm font-medium mb-1">Model Gateway</label>
@@ -212,6 +227,27 @@ export default function GatewaySettings() {
             />
           }
         />
+
+        {/*
+          Turning the gateway off hides its configuration, but a container that
+          already exists must stay reachable — otherwise a leftover container
+          keeps its port bound with no UI left to stop it.
+        */}
+        {!gateway.enabled && status?.container_exists && (
+          <div className="space-y-2" data-testid="gateway-leftover-container">
+            <div className="flex items-center gap-3 flex-wrap">
+              <StatusIndicator tone={tone} label={statusLabel} className="text-xs" />
+              <Button variant="danger" disabled={loading} onClick={() => run(stopGateway)}>
+                {loading ? "Working…" : "Stop"}
+              </Button>
+            </div>
+            <p className="text-xs text-[var(--text-secondary)] leading-snug">
+              The gateway container is still present. Stop it here if it is still running; it
+              will not be started again while the gateway is off.
+            </p>
+            {errorLine}
+          </div>
+        )}
 
         {gateway.enabled && (
           <>
@@ -247,11 +283,7 @@ export default function GatewaySettings() {
               </pre>
             )}
 
-            {error && (
-              <p className="text-xs text-[var(--error)]" role="alert">
-                {error}
-              </p>
-            )}
+            {errorLine}
 
             {/* ── Provider ──────────────────────────────────────────────── */}
             <Field
@@ -395,10 +427,10 @@ export default function GatewaySettings() {
                 </div>
                 <p className="mt-0.5 text-xs text-[var(--text-secondary)] leading-snug">
                   Set a project's backend to <strong>OpenAI Compatible</strong> and use these
-                  values. On native Linux Docker, where{" "}
-                  <code className="font-mono">host.docker.internal</code> is not injected into
-                  containers, use <code className="font-mono">http://172.17.0.1:{gateway.port}</code>{" "}
-                  instead.
+                  values. The base URL below is the one your Docker engine actually needs —{" "}
+                  <code className="font-mono">host.docker.internal</code> on Docker Desktop, the
+                  bridge gateway address on native Linux, where that name is not injected into
+                  containers.
                 </p>
               </div>
 

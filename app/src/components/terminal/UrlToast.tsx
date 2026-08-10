@@ -1,4 +1,7 @@
+import { urlOrigin } from "../../lib/urlRelay";
+
 interface Props {
+  /** Already validated by `sanitizeRelayUrl` — this component never opens it. */
   url: string;
   /** Heading above the URL. Says why the toast appeared. */
   label?: string;
@@ -6,15 +9,36 @@ interface Props {
   onDismiss: () => void;
 }
 
+/**
+ * Confirmation prompt for a URL something inside the container wants opened in
+ * the host browser.
+ *
+ * The origin is rendered separately from the rest of the URL and is never
+ * truncated. A single `nowrap`/`ellipsis` line looks tidy but is a spoofing
+ * primitive: `https://accounts.example.com/....(600 chars)....@evil.tld/` shows
+ * the reassuring half and hides the half that decides where the request goes.
+ * `sanitizeRelayUrl` already rejects the userinfo form; showing the origin in
+ * full is the belt to that braces, and it also covers the plainer case of a
+ * long path pushing the host out of view.
+ *
+ * Render this with a `key` that changes whenever the URL does. The prompt slot
+ * is shared and long-lived, so without one React mutates the node in place: the
+ * text swaps with no animation, and a user reading URL A can click Open on URL
+ * B that arrived a second later.
+ */
 export default function UrlToast({
   url,
   label = "Long URL detected",
   onOpen,
   onDismiss,
 }: Props) {
+  const origin = urlOrigin(url);
+  const rest = origin && url.startsWith(origin) ? url.slice(origin.length) : url;
+
   return (
     <div
       className="animate-slide-down"
+      role="status"
       style={{
         position: "absolute",
         top: 12,
@@ -43,16 +67,43 @@ export default function UrlToast({
           {label}
         </div>
         <div
+          data-testid="url-toast-url"
+          title={url}
           style={{
             fontSize: 12,
             fontFamily: "monospace",
             color: "var(--text-primary)",
-            overflow: "hidden",
-            textOverflow: "ellipsis",
-            whiteSpace: "nowrap",
+            display: "flex",
+            alignItems: "baseline",
+            minWidth: 0,
           }}
         >
-          {url}
+          {origin && (
+            <span
+              data-testid="url-toast-origin"
+              style={{
+                fontWeight: 700,
+                // The part that decides where the credentials go. It wraps
+                // rather than truncates, whatever else has to give.
+                flexShrink: 0,
+                overflowWrap: "anywhere",
+              }}
+            >
+              {origin}
+            </span>
+          )}
+          <span
+            data-testid="url-toast-rest"
+            style={{
+              color: "var(--text-secondary)",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+              minWidth: 0,
+            }}
+          >
+            {rest}
+          </span>
         </div>
       </div>
 

@@ -28,9 +28,26 @@
 //!
 //! What is genuinely lost is confined to the container's writable layer:
 //! root-level `apt` installs, `npm -g` packages (npm's prefix is `/usr`),
-//! `/usr/local`, `/opt`, `/srv`, and anything under `/workspace` that is not on
-//! a bind mount. Those four categories are exactly what
-//! [`MigrationOptions`] can replay.
+//! `/usr/local`, `/opt`, `/srv`, anything under `/workspace` that is not on a
+//! bind mount — and **`/var`**. The first four are what [`MigrationOptions`]
+//! can replay. `/var` is not, and that gap is deliberate rather than an
+//! oversight, so it is stated here rather than glossed over:
+//!
+//! Service state lives in `/var/lib/<service>` and `/var/www`. Replaying the
+//! apt delta reinstalls `postgresql` onto the new base and hands back an
+//! **empty** cluster; the old one is gone with the writable layer. The
+//! ordinary recreate path does not have this problem, because it creates from
+//! the project's own snapshot and `/var` rides along — so a silent migration
+//! would be *more* destructive than the thing it is sold as a safer
+//! alternative to.
+//!
+//! Copying a live database's files out with `tar` and unpacking them onto a
+//! different base's version of the same package is not a fix; it is a
+//! corruption risk wearing a fix's clothes. So the answer is disclosure:
+//! [`crate::docker::migration::unpreserved_data`] finds the data-bearing
+//! subtrees under `/var` that the base does not ship, and
+//! [`ContainerStaleness::unpreserved_data`] carries them into the pre-flight,
+//! where the user is told to back them up before anything is touched.
 //!
 //! ## Serde
 //!
@@ -65,6 +82,20 @@ pub struct PackageFailure {
     pub name: String,
     /// Trimmed tail of the package manager's own error output.
     pub reason: String,
+}
+
+/// A data-bearing subtree the migration will destroy and cannot put back.
+///
+/// See [`crate::docker::migration::unpreserved_data`]. Surfaced in the
+/// pre-flight so the user can take a backup first; never copied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnpreservedData {
+    /// Absolute path of the directory, e.g. `/var/lib/postgresql`.
+    pub path: String,
+    /// Total size of the non-package files beneath it.
+    pub bytes: u64,
+    /// How many non-package files it holds.
+    pub file_count: u32,
 }
 
 /// Everything the UI needs to decide whether a project is worth migrating, and
@@ -102,6 +133,12 @@ pub struct ContainerStaleness {
     /// Non-dpkg-owned paths under the verbatim-copy roots that would be carried
     /// across. Empty when nothing user-authored was found.
     pub verbatim_paths: Vec<String>,
+    /// Data-bearing subtrees under `/var` that a migration **destroys and
+    /// cannot restore** — a database's files, a served site. Empty on an
+    /// ordinary container; when it is not, the pre-flight has to say so before
+    /// anything is touched. See [`UnpreservedData`].
+    #[serde(default)]
+    pub unpreserved_data: Vec<UnpreservedData>,
     /// dpkg packages the current base carries at a different version than this
     /// container does. A rough "how much security drift" number, not a promise
     /// that every one of them is newer.
@@ -178,6 +215,11 @@ pub struct MigrationPlan {
     /// Base-image paths the old container lacked, so the finished migration can
     /// report which of them it actually gained.
     pub missing_paths: Vec<String>,
+    /// What the pre-flight found under `/var` that the migration would destroy.
+    /// Frozen here so the finished report can name it even though the container
+    /// it was measured on no longer exists.
+    #[serde(default)]
+    pub unpreserved_data: Vec<UnpreservedData>,
 }
 
 /// Persisted, host-side migration state. Written **before** anything
