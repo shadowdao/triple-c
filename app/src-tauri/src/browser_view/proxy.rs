@@ -221,7 +221,7 @@ async fn serve_connection(
     origins: Vec<String>,
     authorities: Vec<String>,
 ) {
-    let head = match tokio::time::timeout(HEAD_TIMEOUT, read_head(&mut stream)).await {
+    let (head, head_len) = match tokio::time::timeout(HEAD_TIMEOUT, read_head(&mut stream)).await {
         Ok(Ok(head)) => head,
         Ok(Err(e)) => {
             log::debug!("Browser view: dropping connection: {}", e);
@@ -234,7 +234,8 @@ async fn serve_connection(
         }
     };
 
-    let head_text = String::from_utf8_lossy(&head).into_owned();
+    // Authorize against the head slice only — never the trailing body bytes.
+    let head_text = String::from_utf8_lossy(&head[..head_len]).into_owned();
     let verdict = authorize(&head_text, &token, &origins, &authorities);
     if verdict != Verdict::Allow {
         log::warn!(
@@ -252,7 +253,16 @@ async fn serve_connection(
 }
 
 /// Read bytes until the end of the HTTP request head (`\r\n\r\n`), or fail.
-async fn read_head(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
+/// Returns the bytes read so far and the index one past the head terminator.
+///
+/// Both halves matter. The caller must replay the **whole** buffer into the
+/// tunnel — a client may pipeline body bytes into the same packet as the head —
+/// but it must authorize against the **head only**. Returning just the buffer
+/// is how a request body gets parsed as headers, which defeats the token gate
+/// and the anti-rebinding check outright: a cross-site `fetch` with a
+/// `text/plain` body of `a=x\r\nSec-Fetch-Site: same-origin\r\n` is not
+/// preflighted, and the forged line wins the last-occurrence match below.
+async fn read_head(stream: &mut TcpStream) -> Result<(Vec<u8>, usize), String> {
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
     loop {
@@ -264,8 +274,8 @@ async fn read_head(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
             return Err("connection closed before a request head arrived".to_string());
         }
         buf.extend_from_slice(&chunk[..n]);
-        if find_head_end(&buf).is_some() {
-            return Ok(buf);
+        if let Some(head_end) = find_head_end(&buf) {
+            return Ok((buf, head_end));
         }
         if buf.len() > MAX_HEAD {
             return Err(format!("request head exceeded {} bytes", MAX_HEAD));
@@ -349,7 +359,13 @@ pub(crate) fn authorize(
             continue;
         };
         let value = value.trim();
+        // Duplicates of a security-relevant header are refused rather than
+        // resolved. Last-occurrence-wins is what turns any header-smuggling
+        // primitive into a full bypass, and no legitimate client sends two.
         match name.trim().to_ascii_lowercase().as_str() {
+            "host" if host.is_some() => return Verdict::Malformed,
+            "origin" if origin.is_some() => return Verdict::Malformed,
+            "sec-fetch-site" if fetch_site.is_some() => return Verdict::Malformed,
             "host" => host = Some(value),
             "origin" => origin = Some(value),
             "referer" => referer = Some(value),
@@ -455,6 +471,84 @@ fn tokens_match(candidate: &str, expected: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// The body of a cross-site POST must never be parsed as headers.
+    ///
+    /// `text/plain` is CORS-safelisted, so `fetch(..., {mode:'no-cors'})` sends
+    /// this with no preflight. Before the head was truncated at its terminator,
+    /// the forged trailing line won the last-occurrence match and the gate
+    /// returned Allow — an unauthenticated takeover of the container's browser
+    /// from any page the user happened to visit.
+    #[test]
+    fn body_bytes_are_not_parsed_as_headers() {
+        // Deliberately no Sec-Fetch-Site in the head, so the duplicate-header
+        // guard is not what saves us — this isolates truncation on its own.
+        let raw = concat!(
+            "POST / HTTP/1.1\r\n",
+            "Host: 127.0.0.1:47820\r\n",
+            "Content-Type: text/plain\r\n",
+            "\r\n",
+            "a=x\r\nSec-Fetch-Site: same-origin\r\n",
+        );
+        let head_end = find_head_end(raw.as_bytes()).expect("terminator present");
+        let head = &raw[..head_end];
+        let verdict = authorize(
+            head,
+            "tok",
+            &["http://127.0.0.1:47820".to_string()],
+            &["127.0.0.1:47820".to_string()],
+        );
+        assert_ne!(verdict, Verdict::Allow, "body line must not authorize");
+
+        // And the whole buffer — the pre-fix input — would have been allowed,
+        // which is what makes the truncation load-bearing rather than cosmetic.
+        assert_eq!(
+            authorize(
+                raw,
+                "tok",
+                &["http://127.0.0.1:47820".to_string()],
+                &["127.0.0.1:47820".to_string()]
+            ),
+            Verdict::Allow,
+            "guard test: the untruncated buffer is exactly the bypass"
+        );
+    }
+
+    /// A smuggled duplicate must be refused, not resolved last-wins.
+    #[test]
+    fn duplicate_security_headers_are_refused() {
+        for dup in [
+            "Host: 127.0.0.1:47820",
+            "Origin: http://127.0.0.1:47820",
+            "Sec-Fetch-Site: same-origin",
+        ] {
+            let raw = format!(
+                "GET / HTTP/1.1\r\nHost: evil.example:47820\r\nOrigin: http://evil.example\r\nSec-Fetch-Site: cross-site\r\n{}\r\n\r\n",
+                dup
+            );
+            assert_eq!(
+                authorize(
+                    &raw,
+                    "tok",
+                    &["http://127.0.0.1:47820".to_string()],
+                    &["127.0.0.1:47820".to_string()]
+                ),
+                Verdict::Malformed,
+                "duplicate {} must be refused",
+                dup
+            );
+        }
+    }
+
+    /// find_head_end must report the index, and it must exclude the body.
+    #[test]
+    fn head_end_excludes_the_body() {
+        let raw = b"GET / HTTP/1.1\r\nHost: a\r\n\r\nBODYBYTES";
+        let end = find_head_end(raw).expect("terminator");
+        assert_eq!(&raw[..end], b"GET / HTTP/1.1\r\nHost: a\r\n\r\n");
+        assert!(!raw[..end].ends_with(b"BODYBYTES"));
+    }
+
     use super::*;
 
     const TOKEN: &str = "s3cr3t-token-value";
