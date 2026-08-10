@@ -104,6 +104,32 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   OAuth listener, wrong for remote control of a browser. Host ports are confined to
   `47820..=47827` because CSP `frame-src` cannot express a port range and must enumerate them;
   a unit test asserts the Rust range matches `tauri.conf.json`. Opt-in per project.
+  - **Detection has to look past `node_modules`.** `claude mcp add … npx @playwright/mcp@latest`
+    installs into `~/.npm/_npx/<hash>/node_modules`, not any `node_modules`, so `detect.rs`
+    globs that cache as well as `/workspace`, `$HOME/node_modules` and `npm root -g`. It also
+    hops from a wrapper `playwright` to its **nested** `playwright-core`: verified that npm does
+    not hoist for global installs, and the wrapper ships no `types/types.d.ts`, so reading the
+    wrapper alone reports a current build as "predates `browser.bind()`".
+  - **`@playwright/mcp` can never satisfy this pane.** It bundles a `playwright-core` that binds,
+    but never `@playwright/cli`, which is the viewer. Never offer it as a setup route — only as
+    what binds sessions automatically once Playwright is present.
+  - **`install.rs` installs into `/workspace`, as `claude`, with `--no-save`.** `/workspace` is
+    *not* a bind mount — project directories are mounted at `/workspace/{mount_name}` — so this
+    touches nothing of the user's, needs no sudo (npm's prefix is `/usr`, which is root-owned),
+    and is on the module resolution path for scripts in the project. Browsers go to
+    `~/.cache/ms-playwright` as `claude`, i.e. the home volume.
+  - **Current base images ship Chromium's shared libraries; older ones do not** — and a project
+    keeps the base image it was first built from until it is migrated, so "older" is the normal
+    case. Without them `playwright install chromium` downloads a browser that cannot launch, which
+    is why installing Chrome via apt looks like a fix. `install.rs` asks
+    `install-deps --dry-run` first and skips the apt step when the answer is "all present",
+    *saying so* in the progress stream. Do not decide this by probing for library names: the
+    dry-run simulates the same `apt-get install` the fix would run, so check and fix cannot
+    disagree about what the dependency set is. Note that `--dry-run` exits **0** both when
+    everything is installed and when Playwright has no list for the platform — match on its
+    output, not its exit code. Either way the action ends by *actually launching* the browser to
+    verify. `@playwright/mcp` wants the `chrome` **channel** specifically, so both browsers are
+    offered.
 - **`docker/`** — Docker API layer using bollard:
   - `client.rs` — Singleton Docker connection via `OnceLock`
   - `container.rs` — Container lifecycle (create, start, stop, remove, inspect)
@@ -134,7 +160,27 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
 
 ### Container (`container/`)
 
-- **`Dockerfile`** — Ubuntu 24.04 base with Claude Code, Node.js 22, Python 3.12, Rust, Docker CLI, git, gh, AWS CLI v2, ripgrep, pnpm, uv, ruff pre-installed
+- **`Dockerfile`** — Ubuntu 24.04 base with Claude Code, Node.js 22, Python 3.12, Rust, Docker CLI, git, gh, AWS CLI v2, ripgrep, pnpm, uv, ruff pre-installed, plus the shared
+  libraries a browser links against (see below)
+- **Browser runtime libraries are baked in; browser *binaries* are not.** A layer runs
+  `npx --yes playwright@latest install-deps chromium` as root, so Playwright names its own
+  dependencies and the list cannot rot against Ubuntu 24.04's `t64` renames or a new Chromium
+  dependency. Measured: +99 packages, +334 MiB unpacked / +119 MiB compressed, on both arches. Do
+  not replace it with a hand-written apt list without pinning the Playwright version you derived
+  it from — a `chromium`-only list saves ~94 MiB (Playwright's `tools` group: xvfb and the CJK
+  fonts) and nothing more, because `libgbm1` → `mesa-libgallium` → `libllvm20` is ~213 MiB that
+  no trimming removes.
+  - The `install-deps --dry-run` call after it is a **build-time assertion, not decoration**: on a
+    platform Playwright's table does not cover, `install-deps` prints a warning and returns having
+    installed nothing **with exit status 0**. Without the assertion that ships a broken image
+    behind a clean build log.
+  - Baking the libraries but not the browsers is the whole point of the split. Browsers live in
+    `~/.cache/ms-playwright` (home volume) and already survive recreation *and* migration; a
+    runtime `apt-get install` of the libraries lands in the writable layer, is re-paid after every
+    Reset, and is **lost on base-image migration**, which replays apt from a manifest. The runtime
+    approach converges on the worst state: a 400 MB browser present with its libraries gone.
+  - The layer sits immediately after Node (npx is its only prerequisite) and well above the shim
+    `COPY`s, so editing a shim does not re-run a multi-hundred-megabyte apt install.
 - **`entrypoint.sh`** — UID/GID remapping to match host user, SSH key setup, git config, docker socket permissions, Claude Code settings.json injection, then `sleep infinity`
 - **`triple-c-scheduler`** — Bash-based scheduled task system for recurring Claude Code invocations
 

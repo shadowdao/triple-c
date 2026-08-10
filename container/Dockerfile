@@ -78,6 +78,95 @@ RUN curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
     && rm -rf /var/lib/apt/lists/* \
     && npm install -g pnpm
 
+# ── Browser runtime libraries (Chromium / Google Chrome) ────────────────────
+# Chromium links against a set of shared libraries Ubuntu's base image does not
+# ship — libnss3, libgbm1, libatk*, libasound2t64, libcups2t64, libpango,
+# libdrm2 and friends. Without them `playwright install chromium` downloads a
+# browser that then dies at launch with "Host system is missing dependencies:
+# libnss3.so", which reads like a Playwright bug and is not one. Installing
+# google-chrome-stable used to look like the fix only because apt pulled these
+# in as *its* dependencies.
+#
+# ## Why baked, and why only the libraries
+#
+# A runtime `apt-get install` lands in the container's writable layer: it is
+# re-paid after every project Reset, and it is *lost* on base-image migration,
+# which replays apt from a manifest against the new base. The browsers
+# themselves live in ~/.cache/ms-playwright, inside the home volume, and survive
+# both — so the runtime approach converges on the worst state, a 400 MB browser
+# present with its libraries gone. Baking the libraries and leaving the browsers
+# out puts each half where it already persists.
+#
+# Browser binaries are deliberately NOT baked: they are large, they are
+# version-coupled to whatever Playwright the user installs, and the home volume
+# already keeps them.
+#
+# ## Why `install-deps` rather than a hand-written apt list
+#
+# Playwright names its own dependencies, so the list cannot silently rot. That
+# matters more than usual on Ubuntu 24.04, whose 64-bit-time_t transition
+# renamed a swathe of these packages (libasound2 → libasound2t64, libatk1.0-0 →
+# libatk1.0-0t64, libglib2.0-0 → libglib2.0-0t64, …); a hardcoded list drifts
+# into "E: Unable to locate package" build failures, and a list that predates a
+# new Chromium dependency drifts into exactly the launch failure this layer
+# exists to prevent.
+#
+# Verified on a real `--platform linux/arm64` build of this file, not assumed:
+# it resolves and installs there too (99 packages on both arches), and the
+# --dry-run assertion below passes. Worth checking rather than assuming:
+# Playwright looks its dependency list up under `<distro><version>-<arch>`, so
+# arm64 is a separate lookup that could have missed.
+#
+# ## What it costs
+#
+# Measured with this layer applied on top of an otherwise identical image
+# (linux/amd64, playwright 1.62.1): **+99 packages, +334 MiB unpacked, +119 MiB
+# compressed** — the image goes 2950 → 3284 MiB unpacked, 759 → 878 MiB
+# compressed. (`docker history` calls the layer 361 MB, i.e. 344 MiB; the
+# difference is tar metadata `du` doesn't count.)
+#
+# Where it goes, by dpkg Installed-Size:
+#   ~213 MiB  libllvm20 + mesa-libgallium + libicu74. Not optional and not
+#             avoidable by trimming the list: libgbm1, which Chromium genuinely
+#             needs, Depends on mesa-libgallium, which Depends on libllvm20.
+#   ~94 MiB   Playwright's `tools` group — xvfb and the CJK/emoji fonts. Kept:
+#             the base image ships no fonts at all, so without them every page
+#             this feature exists to display renders as tofu, and xvfb is what
+#             lets a *headed* browser run in here.
+#   the rest  Chromium's own library closure.
+#
+# An explicit apt list of just `chromium`'s dependencies measures 247 MiB
+# installed against install-deps' 341 MiB, so hand-maintaining one would save
+# ~94 MiB. Not worth owning the drift; if you disagree, derive the list from
+# `install-deps --dry-run chromium` and pin the Playwright version you took it
+# from in a comment here.
+#
+# The retry loop is for the same transient mirror-sync failures the other apt
+# layers guard against; install-deps runs its own un-retried `apt-get update`
+# internally. `npx --yes` is what makes it non-interactive, and the version it
+# resolved is printed so a build log says which Playwright named this set.
+#
+# Placed immediately after Node (npx is its only prerequisite) and well above
+# the shim COPYs, so editing a shim at the bottom of this file does not re-run a
+# multi-hundred-megabyte apt install.
+#
+# `--dry-run` afterwards is the build-time assertion, and it is not decoration:
+# on a platform Playwright's table does not cover, `install-deps` prints a
+# warning and returns having installed **nothing, with exit status 0**. Without
+# this check that failure mode would ship an image whose build log looked clean.
+# `--dry-run` exits non-zero if any required package is still missing.
+RUN npx --yes playwright@latest --version \
+    && ok=0 \
+    && for i in 1 2 3 4 5; do \
+        if npx --yes playwright@latest install-deps chromium; then ok=1; break; fi; \
+        echo "install-deps failed (attempt $i), retrying in 10s..."; \
+        rm -rf /var/lib/apt/lists/*; \
+        sleep 10; \
+    done \
+    && [ "$ok" = 1 ] \
+    && npx --yes playwright@latest install-deps --dry-run chromium \
+    && rm -rf /var/lib/apt/lists/* /root/.npm
+
 # ── Python 3 + pip + uv + ruff ──────────────────────────────────────────────
 RUN for i in 1 2 3 4 5; do \
         apt-get -o Acquire::Retries=3 update && break; \

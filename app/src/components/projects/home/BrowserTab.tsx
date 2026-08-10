@@ -1,15 +1,22 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import type {
+  BrowserInstallTarget,
+  BrowserSetupOutcome,
   BrowserViewChangedEvent,
   BrowserViewStatus,
+  PlaywrightDetection,
   Project,
 } from "../../../lib/types";
 import {
+  checkBrowserViewSupport,
   getBrowserViewStatus,
+  installBrowserViewBrowser,
+  installBrowserViewSupport,
   setBrowserViewEnabled,
 } from "../../../lib/tauri-commands";
 import { useAppState } from "../../../store/appState";
+import AccordionSection from "../../ui/AccordionSection";
 import Button from "../../ui/Button";
 import StatusIndicator from "../../ui/StatusIndicator";
 
@@ -29,6 +36,9 @@ const OFF: BrowserViewStatus = {
   message: null,
 };
 
+/** Which install is in flight. `null` means none — nothing installs itself. */
+type SetupJob = null | "packages" | BrowserInstallTarget;
+
 /**
  * Watch — and take over — the browser Claude is driving with Playwright inside
  * the container.
@@ -38,6 +48,12 @@ const OFF: BrowserViewStatus = {
  * loopback. Nothing starts until the user asks: this is remote control of a
  * browser in a privileged sandbox, so it is off by default and opted into per
  * project, exactly like the auth bridge.
+ *
+ * The same rule, harder, applies to setup. Opening this tab *probes* the
+ * container (one `node -e`, read-only) so the pane can say what is missing
+ * before the user asks for a view — but it never installs anything. Installing
+ * packages and downloading a browser are container mutations measured in
+ * hundreds of megabytes; both are separate, labelled, user-pressed buttons.
  */
 export default function BrowserTab({ project, active }: Props) {
   const [status, setStatus] = useState<BrowserViewStatus>(OFF);
@@ -45,7 +61,14 @@ export default function BrowserTab({ project, active }: Props) {
   const [error, setError] = useState<string | null>(null);
   /** Bumped to force the iframe to reload without changing its src. */
   const [reloadKey, setReloadKey] = useState(0);
+  /** Last read-only probe of the container, for the setup panel. */
+  const [detection, setDetection] = useState<PlaywrightDetection | null>(null);
+  const [job, setJob] = useState<SetupJob>(null);
+  const [outcome, setOutcome] = useState<BrowserSetupOutcome | null>(null);
+  const [setupError, setSetupError] = useState<string | null>(null);
   const pushToast = useAppState((s) => s.pushToast);
+  const setContainerProgress = useAppState((s) => s.setContainerProgress);
+  const progress = useAppState((s) => s.containerProgress[project.id]);
   const running = project.status === "running";
 
   // The backend is the source of truth: it emits whenever a view starts or is
@@ -77,6 +100,11 @@ export default function BrowserTab({ project, active }: Props) {
     getBrowserViewStatus(projectId)
       .then((s) => mounted.current && setStatus(s))
       .catch(() => {});
+    // Read-only. This is what lets the pane offer setup before the user hits a
+    // wall, and it is why a "not installed" answer is never stale.
+    checkBrowserViewSupport(projectId)
+      .then((d) => mounted.current && setDetection(d))
+      .catch(() => {});
   }, [active, projectId, running]);
 
   const toggle = useCallback(
@@ -101,8 +129,52 @@ export default function BrowserTab({ project, active }: Props) {
     [projectId, pushToast],
   );
 
-  // A stopped container can't be hosting a browser, so say that plainly rather
-  // than offering a control that would only fail.
+  /** Run one install. Every path clears the progress line it started. */
+  const install = useCallback(
+    async (which: Exclude<SetupJob, null>) => {
+      setJob(which);
+      setSetupError(null);
+      setOutcome(null);
+      try {
+        const result =
+          which === "packages"
+            ? await installBrowserViewSupport(projectId)
+            : await installBrowserViewBrowser(projectId, which);
+        if (!mounted.current) return;
+        // The command re-probes, so the pane updates itself — no reopening the
+        // tab, no second button to press.
+        setDetection(result.detection);
+        setOutcome(result);
+        if (result.warning) {
+          // Not an error — the step did what it said — but the caveat is the
+          // part that decides whether the browser will actually work.
+          pushToast({
+            kind: "info",
+            message: "Setup finished, with something to know",
+            detail: result.warning,
+          });
+        } else {
+          pushToast({
+            kind: "success",
+            message:
+              which === "packages" ? "Playwright installed" : `${which} installed and verified`,
+          });
+        }
+      } catch (e) {
+        const detail = String(e);
+        if (mounted.current) setSetupError(detail);
+        pushToast({ kind: "error", message: "Setup failed", detail });
+      } finally {
+        setContainerProgress(projectId, null);
+        if (mounted.current) setJob(null);
+      }
+    },
+    [projectId, pushToast, setContainerProgress],
+  );
+
+  // A stopped container can't be hosting a browser — and can't be installed
+  // into either, so say that plainly rather than offering controls that would
+  // only fail.
   if (!running) {
     return (
       <Explainer title="The container isn’t running.">
@@ -113,6 +185,16 @@ export default function BrowserTab({ project, active }: Props) {
   }
 
   const live = status.state === "running" && status.url;
+  // Prefer the probe: it is the fresher of the two, and it is the one that
+  // reflects an install that just finished.
+  const probed = detection ?? status.detection;
+  const ready = isUsable(probed);
+  // Mirrors Rust `PlaywrightDetection::needs_browser`: the Chrome channel is an
+  // apt package, so it never shows up in `browsers`, and a container that has
+  // it is not missing a browser.
+  const needsBrowser =
+    probed !== null && probed.browsers.length === 0 && probed.chrome_channel === null;
+  const needsSetup = probed !== null && (!ready || needsBrowser);
 
   return (
     <div className="flex flex-col h-full min-h-0">
@@ -151,7 +233,7 @@ export default function BrowserTab({ project, active }: Props) {
         <Button
           size="md"
           variant={live ? "secondary" : "primary"}
-          disabled={busy}
+          disabled={busy || job !== null}
           onClick={() => toggle(!status.enabled || status.state !== "running")}
         >
           {busy ? "Working…" : live ? "Stop" : "Start browser view"}
@@ -169,8 +251,23 @@ export default function BrowserTab({ project, active }: Props) {
         />
       ) : (
         <div className="flex-1 min-h-0 overflow-y-auto">
-          {status.state === "unavailable" ? (
-            <Unavailable status={status} />
+          {/* Setup stays on screen while an install is running and after it
+              finishes, so its output and caveats don't vanish at the moment
+              they become readable. */}
+          {needsSetup ||
+          status.state === "unavailable" ||
+          job !== null ||
+          outcome !== null ||
+          setupError !== null ? (
+            <Setup
+              detection={probed}
+              message={status.state === "unavailable" ? status.message : null}
+              job={job}
+              progress={job ? progress : undefined}
+              outcome={outcome}
+              error={setupError}
+              onInstall={install}
+            />
           ) : error ? (
             <Explainer title="The browser view didn’t start." tone="error">
               <span className="font-mono text-xs break-words">{error}</span>
@@ -190,28 +287,255 @@ export default function BrowserTab({ project, active }: Props) {
   );
 }
 
-/** The container can't serve a view — say exactly what is missing. */
-function Unavailable({ status }: { status: BrowserViewStatus }) {
-  const d = status.detection;
+/** Mirrors Rust `PlaywrightDetection::is_usable`. */
+function isUsable(d: PlaywrightDetection | null): boolean {
+  return d !== null && d.playwright_version !== null && d.has_bind && d.cli_entry !== null;
+}
+
+/** What the container is short of, as a list rather than as prose. */
+function missingParts(d: PlaywrightDetection | null): string[] {
+  if (!d) return [];
+  const out: string[] = [];
+  if (!d.node_version) out.push("Node.js");
+  if (!d.playwright_version) out.push("playwright");
+  else if (!d.has_bind) out.push("a newer playwright — this build has no browser.bind()");
+  if (!d.cli_entry) out.push("@playwright/cli");
+  return out;
+}
+
+/**
+ * Setup, as one action per line, each saying what it costs before it is
+ * pressed.
+ *
+ * The old pane printed npm commands here and left the rest to the user. The
+ * result, verified with a real one: an `@playwright/mcp` install that could
+ * never satisfy this pane, a global install that hit EACCES, a Chromium that
+ * downloaded and then would not start because the image shipped none of its
+ * shared libraries, and a long tail of commands after that. Current base images
+ * bake those libraries in, so that last one is fixed at the source — but a
+ * project keeps its original base image until it is migrated, so the install
+ * action still handles a container that lacks them.
+ */
+function Setup({
+  detection,
+  message,
+  job,
+  progress,
+  outcome,
+  error,
+  onInstall,
+}: {
+  detection: PlaywrightDetection | null;
+  message: string | null;
+  job: SetupJob;
+  progress?: string;
+  outcome: BrowserSetupOutcome | null;
+  error: string | null;
+  onInstall: (which: Exclude<SetupJob, null>) => void;
+}) {
+  const busy = job !== null;
+  const havePackages = isUsable(detection);
+  const missing = missingParts(detection);
+  const browsers = detection?.browsers ?? [];
+  const chrome = detection?.chrome_channel ?? null;
+  const noBrowser = browsers.length === 0 && chrome === null;
+
   return (
-    <div className="p-4 max-w-[46rem] space-y-3">
-      <h2 className="text-[13px] font-semibold text-[var(--text-primary)]">
-        This container can’t serve a browser view yet
-      </h2>
-      <p className="text-[13px] text-[var(--text-secondary)] leading-relaxed">
-        {status.message}
-      </p>
-      {d && (
-        <dl className="text-xs grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 pt-2 border-t border-[var(--border-color)]">
-          <Detail label="Node.js" value={d.node_version} />
-          <Detail label="Playwright" value={d.playwright_version} />
-          <Detail label="browser.bind()" value={d.has_bind ? "available" : "not in this build"} />
-          <Detail label="@playwright/cli" value={d.cli_version} />
-          {d.searched.length > 0 && (
-            <Detail label="Searched" value={d.searched.join(", ")} />
+    <div className="p-4 max-w-[46rem] space-y-4">
+      <div>
+        <h2 className="text-[13px] font-semibold text-[var(--text-primary)]">
+          {!havePackages
+            ? "This container can’t serve a browser view yet"
+            : noBrowser
+              ? "Playwright is ready — but there’s no browser to drive yet"
+              : "This container is set up"}
+        </h2>
+        <p className="mt-1 text-[13px] text-[var(--text-secondary)] leading-relaxed">
+          {message ??
+            (missing.length > 0
+              ? `Missing: ${missing.join(", ")}.`
+              : noBrowser
+                ? "Playwright and the viewer are installed. Install a browser below so there is something to watch."
+                : "Start the view from the button above once Claude has a browser open.")}
+        </p>
+      </div>
+
+      <Step
+        title="1. Playwright and the viewer UI"
+        detail={
+          <>
+            Installs <Code>playwright</Code> and <Code>@playwright/cli</Code> into{" "}
+            <Code>/workspace/node_modules</Code> inside the container. That directory is
+            container storage — your project folders are mounted one level down, so
+            nothing of yours is touched — and no <Code>sudo</Code> is involved. Small
+            download; browsers come next.
+          </>
+        }
+        done={havePackages}
+        doneLabel={`Installed — playwright ${detection?.playwright_version ?? ""}, @playwright/cli ${detection?.cli_version ?? ""}`}
+        action={
+          <Button
+            size="md"
+            variant={havePackages ? "secondary" : "primary"}
+            disabled={busy}
+            onClick={() => onInstall("packages")}
+          >
+            {job === "packages" ? "Installing…" : havePackages ? "Reinstall" : "Set up Playwright"}
+          </Button>
+        }
+      />
+
+      <Step
+        title="2. A browser to drive"
+        detail={
+          <>
+            Both check the system libraries a browser links against first. Current base
+            images ship them, so that step is normally skipped; a container built from an
+            older image gets them installed with apt, which is the difference between a
+            browser that downloads successfully and one that also starts. Both end by
+            actually launching the browser to prove it works. Browsers land in{" "}
+            <Code>~/.cache/ms-playwright</Code>, which is on the home volume, so they
+            survive container recreation and are only lost on a project Reset.
+          </>
+        }
+        done={browsers.length > 0 || chrome !== null}
+        doneLabel={[
+          browsers.length > 0 ? browsers.join(", ") : null,
+          chrome ? `Chrome channel (${chrome})` : null,
+        ]
+          .filter(Boolean)
+          .join(" · ")}
+        action={
+          <div className="flex flex-col gap-2 items-end">
+            <Button
+              size="md"
+              variant={browsers.length > 0 || !havePackages ? "secondary" : "primary"}
+              disabled={busy || !havePackages}
+              onClick={() => onInstall("chromium")}
+            >
+              {job === "chromium" ? "Installing…" : "Install Chromium"}
+            </Button>
+            <Button
+              size="md"
+              disabled={busy || !havePackages}
+              onClick={() => onInstall("chrome")}
+            >
+              {job === "chrome" ? "Installing…" : "Install Chrome channel"}
+            </Button>
+          </div>
+        }
+      >
+        <ul className="mt-2 space-y-1 text-xs text-[var(--text-secondary)] leading-relaxed">
+          <li>
+            <strong className="text-[var(--text-primary)]">Chromium</strong> — Playwright’s
+            own build, used by <Code>chromium.launch()</Code> with no channel. Several
+            hundred MB.
+          </li>
+          <li>
+            <strong className="text-[var(--text-primary)]">Chrome channel</strong> — Google
+            Chrome from apt, which is what <Code>@playwright/mcp</Code> asks for. Install
+            this one if Claude drives the browser through the MCP plugin. Roughly 150 MB.
+          </li>
+        </ul>
+      </Step>
+
+      {busy && (
+        <p
+          className="text-xs font-mono text-[var(--text-secondary)] break-all"
+          aria-live="polite"
+        >
+          {progress ?? "Working…"}
+        </p>
+      )}
+
+      {error && (
+        <div className="text-xs text-[var(--error)]">
+          <p className="font-semibold">That didn’t work.</p>
+          <pre className="mt-1 whitespace-pre-wrap font-mono break-words text-[var(--text-secondary)]">
+            {error}
+          </pre>
+        </div>
+      )}
+
+      {outcome?.warning && (
+        <div className="text-xs text-[var(--text-primary)] border border-[var(--border-color)] rounded-[var(--radius-control)] p-3">
+          <p className="font-semibold">Worth knowing</p>
+          <p className="mt-1 whitespace-pre-wrap text-[var(--text-secondary)] leading-relaxed">
+            {outcome.warning}
+          </p>
+        </div>
+      )}
+
+      {outcome?.log && (
+        <AccordionSection
+          id="browser-view-install-log"
+          title="Install output"
+          defaultOpen={false}
+        >
+          <pre className="p-3 text-xs font-mono whitespace-pre-wrap break-words text-[var(--text-secondary)] max-h-64 overflow-y-auto">
+            {outcome.log}
+          </pre>
+        </AccordionSection>
+      )}
+
+      {detection && (
+        <dl className="text-xs grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 pt-3 border-t border-[var(--border-color)]">
+          <Detail label="Node.js" value={detection.node_version} />
+          <Detail label="Playwright" value={detection.playwright_version} />
+          <Detail label="Resolved from" value={detection.playwright_path} />
+          <Detail
+            label="browser.bind()"
+            value={detection.has_bind ? "available" : "not in this build"}
+          />
+          <Detail label="@playwright/cli" value={detection.cli_version} />
+          <Detail
+            label="Browsers"
+            value={browsers.length > 0 ? browsers.join(", ") : null}
+          />
+          <Detail label="Chrome channel" value={chrome} />
+          {detection.searched.length > 0 && (
+            <Detail label="Searched" value={detection.searched.join(", ")} />
           )}
         </dl>
       )}
+    </div>
+  );
+}
+
+/** One numbered setup step: what it does, whether it is done, and its button. */
+function Step({
+  title,
+  detail,
+  done,
+  doneLabel,
+  action,
+  children,
+}: {
+  title: string;
+  detail: React.ReactNode;
+  done: boolean;
+  doneLabel?: string;
+  action: React.ReactNode;
+  children?: React.ReactNode;
+}) {
+  return (
+    <div className="border border-[var(--border-color)] rounded-[var(--radius-control)] p-3">
+      <div className="flex items-start gap-3">
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 flex-wrap">
+            <h3 className="text-[13px] font-semibold text-[var(--text-primary)]">{title}</h3>
+            <StatusIndicator tone={done ? "ok" : "off"} label={done ? "Installed" : "Not installed"} />
+          </div>
+          <p className="mt-1 text-xs text-[var(--text-secondary)] leading-relaxed">{detail}</p>
+          {done && doneLabel && (
+            <p className="mt-1 text-xs font-mono text-[var(--text-secondary)] break-all">
+              {doneLabel}
+            </p>
+          )}
+          {children}
+        </div>
+        <div className="flex-shrink-0">{action}</div>
+      </div>
     </div>
   );
 }
