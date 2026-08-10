@@ -2,11 +2,11 @@ use tauri::{Emitter, State};
 
 use crate::commands::aws_commands;
 use crate::docker;
-use crate::models::{container_config, Backend, BedrockAuthMethod, Project, ProjectPath, ProjectStatus};
+use crate::models::{container_config, AppSettings, Backend, BedrockAuthMethod, Project, ProjectPath, ProjectStatus};
 use crate::storage::secure;
 use crate::AppState;
 
-fn emit_progress(app_handle: &tauri::AppHandle, project_id: &str, message: &str) {
+pub(crate) fn emit_progress(app_handle: &tauri::AppHandle, project_id: &str, message: &str) {
     let _ = app_handle.emit(
         "container-progress",
         serde_json::json!({
@@ -43,8 +43,49 @@ fn store_secrets_for_project(project: &Project) -> Result<(), String> {
     Ok(())
 }
 
+/// Create the project's container, threading every global setting through.
+///
+/// Exists so that the two ordinary create paths below and base-image migration
+/// cannot drift apart — a container created by a migration must be
+/// indistinguishable from one created by a normal start, or the next
+/// `container_needs_recreation` would immediately throw it away.
+///
+/// `create_image` is what to create *from* (the snapshot or the base);
+/// `base_image_name` is the configured base, which `create_container` needs in
+/// order to tell those two apart when it stamps the lineage labels.
+pub(crate) async fn create_container_for_project(
+    project: &Project,
+    settings: &AppSettings,
+    docker_socket: &str,
+    aws_config_path: Option<&str>,
+    create_image: &str,
+    base_image_name: &str,
+    extras: docker::CreateExtras<'_>,
+) -> Result<String, String> {
+    docker::create_container(
+        project,
+        docker_socket,
+        create_image,
+        base_image_name,
+        extras,
+        aws_config_path,
+        &settings.global_aws,
+        &settings.global_ollama,
+        &settings.global_llamacpp,
+        &settings.global_openai_compatible,
+        settings.global_claude_instructions.as_deref(),
+        &settings.global_custom_env_vars,
+        settings.timezone.as_deref(),
+        settings.global_claude_code_settings.as_ref(),
+        settings.default_ssh_key_path.as_deref(),
+        settings.default_git_user_name.as_deref(),
+        settings.default_git_user_email.as_deref(),
+    )
+    .await
+}
+
 /// Populate secret fields on a project struct from the OS keychain.
-fn load_secrets_for_project(project: &mut Project) {
+pub(crate) fn load_secrets_for_project(project: &mut Project) {
     project.git_token = secure::get_project_secret(&project.id, "git-token")
         .unwrap_or(None);
     if let Some(ref mut bedrock) = project.bedrock_config {
@@ -317,11 +358,26 @@ pub async fn start_project_container(
         // AWS config path from global settings
         let aws_config_path = settings.global_aws.aws_config_path.clone();
 
+        // What we would create this container from *right now*: the project's
+        // snapshot when one exists, else the configured base. This is the value
+        // `container_needs_recreation` compares against the container's
+        // `triple-c.create-image` label — the check that replaced the old
+        // tautological one. It is resolved *before* the commit below, so it
+        // describes the pre-commit world the existing container was born into.
+        let snapshot_image = docker::get_snapshot_image_name(&project);
+        let expected_create_image =
+            if docker::image_exists(&snapshot_image).await.unwrap_or(false) {
+                snapshot_image.clone()
+            } else {
+                image_name.clone()
+            };
+
         let container_id = if let Some(existing_id) = docker::find_existing_container(&project).await? {
             // Check if config changed — if so, snapshot + recreate
             let needs_recreate = docker::container_needs_recreation(
                 &existing_id,
                 &project,
+                &expected_create_image,
                 &settings.global_aws,
                 &settings.global_ollama,
                 &settings.global_llamacpp,
@@ -352,30 +408,24 @@ pub async fn start_project_container(
                 docker::remove_legacy_mcp_containers(&project.id).await;
                 docker::remove_legacy_project_network(&project.id).await;
 
-                // Create from snapshot image (preserves system-level changes)
-                let snapshot_image = docker::get_snapshot_image_name(&project);
+                // Create from snapshot image (preserves system-level changes).
+                // Re-resolved after the commit above: when no snapshot existed
+                // before, one does now, and creating from the base instead
+                // would throw away the state that was just saved.
                 let create_image = if docker::image_exists(&snapshot_image).await.unwrap_or(false) {
-                    snapshot_image
+                    snapshot_image.clone()
                 } else {
                     image_name.clone()
                 };
 
-                let new_id = docker::create_container(
+                let new_id = create_container_for_project(
                     &project,
+                    &settings,
                     &docker_socket,
-                    &create_image,
                     aws_config_path.as_deref(),
-                    &settings.global_aws,
-                    &settings.global_ollama,
-                    &settings.global_llamacpp,
-                    &settings.global_openai_compatible,
-                    settings.global_claude_instructions.as_deref(),
-                    &settings.global_custom_env_vars,
-                    settings.timezone.as_deref(),
-                    settings.global_claude_code_settings.as_ref(),
-                    settings.default_ssh_key_path.as_deref(),
-                    settings.default_git_user_name.as_deref(),
-                    settings.default_git_user_email.as_deref(),
+                    &create_image,
+                    &image_name,
+                    docker::CreateExtras::default(),
                 ).await?;
                 emit_progress(&app_handle, &project_id, "Starting container...");
                 docker::start_container(&new_id).await?;
@@ -389,31 +439,20 @@ pub async fn start_project_container(
             // Container doesn't exist (first start, or Docker pruned it).
             // Check for a snapshot image first — it preserves system-level
             // changes (apt/pip/npm installs) from the previous session.
-            let snapshot_image = docker::get_snapshot_image_name(&project);
-            let create_image = if docker::image_exists(&snapshot_image).await.unwrap_or(false) {
+            if expected_create_image == snapshot_image {
                 log::info!("Creating container from snapshot image for project {}", project.id);
-                snapshot_image
-            } else {
-                image_name.clone()
-            };
+            }
+            let create_image = expected_create_image.clone();
 
             emit_progress(&app_handle, &project_id, "Creating container...");
-            let new_id = docker::create_container(
+            let new_id = create_container_for_project(
                 &project,
+                &settings,
                 &docker_socket,
-                &create_image,
                 aws_config_path.as_deref(),
-                &settings.global_aws,
-                &settings.global_ollama,
-                &settings.global_llamacpp,
-                &settings.global_openai_compatible,
-                settings.global_claude_instructions.as_deref(),
-                &settings.global_custom_env_vars,
-                settings.timezone.as_deref(),
-                settings.global_claude_code_settings.as_ref(),
-                settings.default_ssh_key_path.as_deref(),
-                settings.default_git_user_name.as_deref(),
-                settings.default_git_user_email.as_deref(),
+                &create_image,
+                &image_name,
+                docker::CreateExtras::default(),
             ).await?;
             emit_progress(&app_handle, &project_id, "Starting container...");
             docker::start_container(&new_id).await?;
@@ -530,12 +569,23 @@ pub async fn rebuild_project_container(
 /// Called by the frontend after Docker is confirmed available. Projects
 /// marked as Running whose containers are no longer running get reset
 /// to Stopped.
+///
+/// This is also where an interrupted **base-image migration** is picked up.
+/// It runs at startup, which is exactly when a migration that died with the app
+/// needs to be noticed — see
+/// [`crate::commands::migration_commands::reconcile_migration`]. The migration
+/// pass runs over *every* project, not just the Running ones, because a project
+/// whose container was removed mid-migration reports Stopped.
 #[tauri::command]
 pub async fn reconcile_project_statuses(
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Vec<Project>, String> {
     let projects = state.projects_store.list();
+
+    for project in &projects {
+        crate::commands::migration_commands::reconcile_migration(project, &app_handle).await;
+    }
 
     for project in &projects {
         if project.status != ProjectStatus::Running && project.status != ProjectStatus::Error {

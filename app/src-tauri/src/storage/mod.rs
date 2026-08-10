@@ -1,3 +1,4 @@
+pub mod migration_store;
 pub mod projects_store;
 pub mod secure;
 pub mod settings_store;

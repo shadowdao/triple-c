@@ -38,6 +38,22 @@ pub async fn create_attached_exec(
     cmd: Vec<String>,
     tty: bool,
 ) -> Result<AttachedExec, String> {
+    create_attached_exec_as(container_id, cmd, tty, "claude", "/workspace").await
+}
+
+/// [`create_attached_exec`] with the user and working directory spelled out.
+///
+/// Only base-image migration needs this: replaying `apt` and unpacking a
+/// payload tar at `/` have to run as **root**, and every other caller wants the
+/// `claude` / `/workspace` defaults that [`create_attached_exec`] supplies. It
+/// stays the single place an attached exec is opened.
+pub async fn create_attached_exec_as(
+    container_id: &str,
+    cmd: Vec<String>,
+    tty: bool,
+    user: &str,
+    working_dir: &str,
+) -> Result<AttachedExec, String> {
     let docker = get_docker()?;
 
     let exec = docker
@@ -49,8 +65,8 @@ pub async fn create_attached_exec(
                 attach_stderr: Some(true),
                 tty: Some(tty),
                 cmd: Some(cmd),
-                user: Some("claude".to_string()),
-                working_dir: Some("/workspace".to_string()),
+                user: Some(user.to_string()),
+                working_dir: Some(working_dir.to_string()),
                 ..Default::default()
             },
         )
@@ -371,6 +387,51 @@ pub async fn upload_host_file_to_container(
     Ok(format!("/tmp/{}", dest_name))
 }
 
+/// Write `data` into the container at `<dest_dir>/<file_name>` with `mode`.
+///
+/// For small, generated files — migration uses it for the `tar -T` include
+/// list, which can be too long to pass as argv. Anything large should be
+/// streamed through an attached exec's stdin instead, since this buffers the
+/// whole payload in memory twice (once raw, once tarred).
+pub async fn upload_bytes_to_container(
+    container_id: &str,
+    dest_dir: &str,
+    file_name: &str,
+    data: &[u8],
+    mode: u32,
+) -> Result<String, String> {
+    let docker = get_docker()?;
+
+    let mut tar_buf = Vec::with_capacity(data.len() + 1024);
+    {
+        let mut builder = tar::Builder::new(&mut tar_buf);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(mode);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, file_name, data)
+            .map_err(|e| format!("Failed to create tar entry: {}", e))?;
+        builder
+            .finish()
+            .map_err(|e| format!("Failed to finalize tar: {}", e))?;
+    }
+
+    docker
+        .upload_to_container(
+            container_id,
+            Some(UploadToContainerOptions {
+                path: dest_dir.to_string(),
+                ..Default::default()
+            }),
+            tar_buf.into(),
+        )
+        .await
+        .map_err(|e| format!("Failed to upload file to container: {}", e))?;
+
+    Ok(format!("{}/{}", dest_dir.trim_end_matches('/'), file_name))
+}
+
 /// Run a one-shot (non-interactive) exec command in a container and collect stdout.
 pub async fn exec_oneshot(container_id: &str, cmd: Vec<String>) -> Result<String, String> {
     exec_oneshot_env(container_id, cmd, Vec::new()).await
@@ -401,6 +462,22 @@ pub async fn exec_oneshot_env_status(
     cmd: Vec<String>,
     env: Vec<String>,
 ) -> Result<(String, i64), String> {
+    exec_oneshot_as(container_id, "claude", cmd, env).await
+}
+
+/// [`exec_oneshot_env_status`] with the user spelled out.
+///
+/// Base-image migration is the only caller that needs anything but `claude`:
+/// `apt-get`, `npm -g` and the payload unpack all run as **root**. Note that
+/// the container does grant `claude` passwordless sudo, but going through
+/// `sudo` would put the whole command in `ps` output and add a second failure
+/// mode to interpret, so the exec is simply created as root.
+pub async fn exec_oneshot_as(
+    container_id: &str,
+    user: &str,
+    cmd: Vec<String>,
+    env: Vec<String>,
+) -> Result<(String, i64), String> {
     let docker = get_docker()?;
 
     let exec = docker
@@ -411,7 +488,7 @@ pub async fn exec_oneshot_env_status(
                 attach_stderr: Some(true),
                 cmd: Some(cmd),
                 env: if env.is_empty() { None } else { Some(env) },
-                user: Some("claude".to_string()),
+                user: Some(user.to_string()),
                 ..Default::default()
             },
         )

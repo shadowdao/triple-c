@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, ImageUpdateInfo, FileEntry, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, PlaywrightDetection } from "./types";
+import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, ImageUpdateInfo, FileEntry, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, PlaywrightDetection, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState } from "./types";
 
 // Docker
 export const checkDocker = () => invoke<boolean>("check_docker");
@@ -200,3 +200,44 @@ export const submitClaudeTokenCode = (code: string) =>
 export const cancelClaudeToken = () => invoke<void>("cancel_claude_token");
 export const hasClaudeToken = () => invoke<boolean>("has_claude_token");
 export const clearClaudeToken = () => invoke<void>("clear_claude_token");
+
+// Container base-image migration — move a project onto the current base image
+// without deleting its volumes. Reset is the destructive alternative: it wipes
+// ~/.claude, the OAuth credential, installed skills and every transcript.
+//
+// Flow: getContainerStaleness (read-only, ~6s — two filesystem probes, so call
+// it on demand rather than polling) → migrateProjectToBase → the project sits
+// in "awaiting-confirmation" while the user tries it → confirmMigration or
+// rollbackMigration.
+//
+// Rollback restores the **system layer only**. Both named volumes are untouched
+// throughout, so anything written to $HOME during the migrated session — a new
+// login, new skills, new transcripts — survives a rollback.
+//
+// Progress arrives on the existing `container-progress` event.
+
+/** Read-only. Runs two container/image filesystem probes; not for polling. */
+export const getContainerStaleness = (projectId: string) =>
+  invoke<ContainerStaleness>("get_container_staleness", { projectId });
+
+/** Runs the whole migration and resolves with its report. Long-running — the
+ *  apt replay alone was measured at ~70s for 8 packages. Calling it again while
+ *  a migration is `interrupted` resumes that one instead of starting a new one. */
+export const migrateProjectToBase = (projectId: string, options: MigrationOptions) =>
+  invoke<MigrationReport>("migrate_project_to_base", { projectId, options });
+
+/** Accept the migration: drops the rollback tag and the staged payload, and
+ *  clears the record. Idempotent. */
+export const confirmMigration = (projectId: string) =>
+  invoke<void>("confirm_migration", { projectId });
+
+/** Undo the migration: recreates the container from its pre-migration image.
+ *  Fails if the migration kept no rollback image (`keep_rollback: false`). */
+export const rollbackMigration = (projectId: string) =>
+  invoke<void>("rollback_migration", { projectId });
+
+/** The persisted record, or null when no migration is in flight. Worth calling
+ *  after `reconcileProjectStatuses` at startup: a migration interrupted by an
+ *  app crash shows up here as phase "interrupted". */
+export const getMigrationState = (projectId: string) =>
+  invoke<MigrationState | null>("get_migration_state", { projectId });

@@ -4,6 +4,7 @@ pub mod image;
 pub mod exec;
 pub mod gateway;
 pub mod legacy_cleanup;
+pub mod migration;
 pub mod stt;
 
 #[allow(unused_imports)]
@@ -20,3 +21,5 @@ pub use image::*;
 pub use exec::*;
 #[allow(unused_imports)]
 pub use legacy_cleanup::*;
+#[allow(unused_imports)]
+pub use migration::*;

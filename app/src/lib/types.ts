@@ -478,3 +478,144 @@ export interface ClaudeTokenOutputEvent {
   project_id: string;
   chunk: string;
 }
+
+// ── Container base-image migration ───────────────────────────────────────────
+//
+// A project's container is created from its own `triple-c-snapshot-<id>:latest`
+// image and re-committed on every recreation, so it stays on the base image it
+// was first built from forever. Migration moves it onto the *current* base
+// **without touching either named volume** — unlike Reset, which deletes them
+// and takes the login, skills and transcripts with it.
+//
+// Because `/home/claude` is a volume and the image's copy of it is masked after
+// the first mount, almost nothing needs replaying: Claude Code itself, cargo,
+// uv, ruff, `~/.claude.json`, the OAuth credential, skills, transcripts,
+// scheduled tasks and SSH keys all re-attach for free. What is genuinely lost
+// on an image swap is confined to the writable layer: root-level apt installs,
+// `npm -g` packages, `/usr/local`, `/opt`, `/srv`, and non-bind-mounted
+// `/workspace` content. Those are exactly what `MigrationOptions` replays.
+//
+// Mirrors Rust `models/migration.rs` (serde snake_case).
+
+/** How a finished migration attempt ended. Mirrors Rust `MigrationPhase`. */
+export type MigrationPhase = "succeeded" | "partial" | "failed" | "rolled_back";
+
+/** One package that could not be replayed onto the new base. */
+export interface PackageFailure {
+  name: string;
+  /** Tail of the package manager's own error output. */
+  reason: string;
+}
+
+/** Why a project is worth migrating, and what migrating would carry across.
+ *
+ *  An empty array always means "nothing found", never "not checked" —
+ *  `probe_error` is the single place a failed inspection is reported. */
+export interface ContainerStaleness {
+  /** The container's lineage is not the current base. Always false when
+   *  `known` is false: an unknown lineage is not a claim of staleness. */
+  stale: boolean;
+  /** Whether the lineage could be established at all. False means the
+   *  container predates the `triple-c.base-image-id` label — "unknown, probe
+   *  instead", not "stale". */
+  known: boolean;
+  base_image_id: string | null;
+  current_base_image_id: string | null;
+  /** `Created` of the project's snapshot image, RFC 3339. */
+  snapshot_created_at: string | null;
+  /** Concrete paths the base ships and this container lacks, e.g. `/usr/bin/socat`. */
+  missing_paths: string[];
+  /** Human labels for the same, e.g. "Auth bridge tunnel (socat)". */
+  missing_features: string[];
+  /** apt packages the project added on top of the base; migration replays these. */
+  apt_delta: string[];
+  /** Global npm packages the base does not ship. */
+  npm_global_delta: string[];
+  /** Non-package paths under /usr/local, /opt, /srv and /workspace that would
+   *  be carried across. Empty when nothing user-authored was found — which is
+   *  the common case. */
+  verbatim_paths: string[];
+  /** dpkg packages the base carries at a different version. A drift measure,
+   *  not a promise that every one is newer. */
+  outdated_package_count: number;
+  /** Set when the container/image could not be inspected; everything else is
+   *  then at its default. */
+  probe_error: string | null;
+}
+
+/** What a migration should replay. All default to false. */
+export interface MigrationOptions {
+  /** Replay the apt and `npm -g` deltas onto the new base. */
+  replay_packages: boolean;
+  /** Copy the verbatim payload (/usr/local, /opt, /srv, non-bind-mounted /workspace). */
+  copy_paths: boolean;
+  /** Keep the `:pre-migration-<ts>` rollback tag after the migration reports
+   *  success, so it can still be undone. Costs roughly a whole snapshot on disk
+   *  (3.8–12.3 GB on real projects) because snapshots share almost no layers
+   *  with the current base. When false the tag is dropped as soon as the
+   *  migration is known to have worked, and `rollback_available` is false. */
+  keep_rollback: boolean;
+}
+
+/** The outcome of one migration attempt. */
+export interface MigrationReport {
+  phase: MigrationPhase;
+  packages_requested: string[];
+  packages_installed: string[];
+  packages_failed: PackageFailure[];
+  paths_copied: string[];
+  /** Human labels for base features the container gained. */
+  features_restored: string[];
+  /** A `:pre-migration-<ts>` image still exists, so `rollbackMigration` works. */
+  rollback_available: boolean;
+  /** One paragraph fit to show the user verbatim. */
+  message: string;
+}
+
+/** In-flight phases of `MigrationState.phase`. Distinct from `MigrationPhase`,
+ *  which describes *outcomes*.
+ *
+ *  These are **hyphenated**, matching the `triple-c.migration-state=in-progress`
+ *  container label so there is exactly one spelling in the system. Compare
+ *  against the constants below rather than writing the literals — that is what
+ *  they are for. */
+export type MigrationStatePhase =
+  | "in-progress"
+  | "interrupted"
+  | "awaiting-confirmation";
+
+/** A migration is running right now. Poll `getMigrationState` until it changes. */
+export const MIGRATION_PHASE_IN_PROGRESS = "in-progress";
+/** The app died after the container was swapped. Offer resume (call
+ *  `migrateProjectToBase` again — it picks the interrupted run up) or rollback. */
+export const MIGRATION_PHASE_INTERRUPTED = "interrupted";
+/** Finished; `report` is populated. Offer confirm or rollback. */
+export const MIGRATION_PHASE_AWAITING_CONFIRMATION = "awaiting-confirmation";
+
+/** What a migration decided to do, frozen at pre-flight time so a resume
+ *  replays the same thing (the deltas cannot be recomputed after the swap). */
+export interface MigrationPlan {
+  apt_packages: string[];
+  npm_packages: string[];
+  verbatim_paths: string[];
+  missing_paths: string[];
+}
+
+/** Persisted host-side migration record. Present only while a migration is in
+ *  flight or waiting for a decision; `confirmMigration` and `rollbackMigration`
+ *  both clear it. */
+export interface MigrationState {
+  /** One of `MigrationStatePhase`; typed loosely because an unrecognised value
+   *  from a future build must not crash the UI. */
+  phase: string;
+  from_image_id: string | null;
+  to_base_id: string | null;
+  started_at: string;
+  report: MigrationReport | null;
+  /** The `:pre-migration-<ts>` tag holding the old system layer, if kept. */
+  rollback_image: string | null;
+  /** Host path of the staged payload tar, while one exists. */
+  staging_path: string | null;
+  options: MigrationOptions;
+  plan: MigrationPlan | null;
+}

@@ -186,6 +186,12 @@ pub fn run() {
             commands::project_commands::stop_project_container,
             commands::project_commands::rebuild_project_container,
             commands::project_commands::reconcile_project_statuses,
+            // Container base-image migration
+            commands::migration_commands::get_container_staleness,
+            commands::migration_commands::migrate_project_to_base,
+            commands::migration_commands::confirm_migration,
+            commands::migration_commands::rollback_migration,
+            commands::migration_commands::get_migration_state,
             // Auth bridge
             commands::auth_bridge_commands::set_auth_bridge_enabled,
             commands::auth_bridge_commands::get_auth_bridge_status,

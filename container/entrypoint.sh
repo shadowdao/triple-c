@@ -2,6 +2,16 @@
 # NOTE: set -e is intentionally omitted. A failing usermod/groupmod must not
 # kill the entire entrypoint — SSH setup, git config, and the final exec
 # must still run so the container is usable even if remapping fails.
+#
+# NOTE: /home/claude is the mount point of the named volume
+# triple-c-home-{projectId}, so the *image's* copy of that directory is
+# seed-only: after a project's first start it is masked permanently. Anything
+# this script writes under /home/claude on **every** start does reach existing
+# projects (that is why the CLAUDE.md, git config and Mission Control skill
+# copies are written here rather than baked into the image). Anything added to
+# /home/claude in the Dockerfile reaches new projects only, forever. Put
+# upgradable content in /usr/local/bin or /opt, or seed it from here.
+# See "Container Lifecycle" in the repo's CLAUDE.md.
 
 # ── UID/GID remapping ──────────────────────────────────────────────────────
 # Match the container's claude user to the host user's UID/GID so that

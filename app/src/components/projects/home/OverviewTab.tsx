@@ -12,6 +12,8 @@ import PermissionModeControl, {
   permissionModePatch,
 } from "../PermissionModeControl";
 import CapabilityTiles from "./CapabilityTiles";
+import ContainerMigrationBanner from "./ContainerMigrationBanner";
+import type { ContainerMigration } from "../../../hooks/useContainerMigration";
 import SaveIndicator from "../../ui/SaveIndicator";
 import Button from "../../ui/Button";
 import { formatAge } from "./format";
@@ -31,6 +33,11 @@ interface Props {
   saveState: SaveState;
   actions: ReturnType<typeof useProjectActions>;
   onOpenTab: (tab: ProjectHomeTabId) => void;
+  /** Base-image staleness, run state and report. Owned by `ProjectHome`. */
+  migration: ContainerMigration;
+  /** Migration mirrors Reset's gate: only offered on a stopped container. */
+  canMigrate: boolean;
+  onOpenMigration: () => void;
 }
 
 export default function OverviewTab({
@@ -39,6 +46,9 @@ export default function OverviewTab({
   saveState,
   actions,
   onOpenTab,
+  migration,
+  canMigrate,
+  onOpenMigration,
 }: Props) {
   const [sessions, setSessions] = useState<ClaudeSession[]>([]);
   const [tasks, setTasks] = useState<ScheduledTask[]>([]);
@@ -119,6 +129,14 @@ export default function OverviewTab({
           </button>
         </div>
       </section>
+
+      {/* A container missing socat and bwrap is a capability statement, so the
+          out-of-date warning sits directly above the capability inventory. */}
+      <ContainerMigrationBanner
+        migration={migration}
+        canMigrate={canMigrate}
+        onOpen={onOpenMigration}
+      />
 
       <CapabilityTiles
         project={project}

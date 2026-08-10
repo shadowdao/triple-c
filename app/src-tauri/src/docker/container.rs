@@ -700,10 +700,55 @@ pub async fn find_existing_container(project: &Project) -> Result<Option<String>
     Ok(None)
 }
 
+/// Extra creation inputs that only base-image migration cares about, kept in
+/// one struct so `create_container`'s already-long parameter list does not grow
+/// two more positional arguments that every ordinary call site would have to
+/// pass as `None`-ish placeholders.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CreateExtras<'a> {
+    /// Extra labels merged in last, overriding anything computed here.
+    /// Migration uses this to stamp `triple-c.migration-state=in-progress`.
+    pub extra_labels: &'a [(&'a str, &'a str)],
+}
+
+/// Resolve the value for the `triple-c.base-image-id` label.
+///
+/// This is the **image ID**, not a `RepoDigests` entry: a locally built image
+/// (`triple-c:latest`) and any custom image have no repo digest at all, so a
+/// digest-based lineage would be blank for exactly the users most likely to
+/// change their base.
+///
+/// Two cases:
+/// * creating **from the base** — the base's own current `.Id`;
+/// * creating **from the project's snapshot** — carry forward whatever lineage
+///   the snapshot image already records, because a snapshot is a commit of a
+///   container that itself descended from some base. Committing propagates
+///   container labels onto the image (verified), which is what makes the
+///   carry-forward chain hold across every recreation.
+///
+/// An empty string means "unknown" — a snapshot that predates this label. It is
+/// deliberately *not* the same as "stale"; see [`crate::models::ContainerStaleness::known`].
+async fn resolve_base_image_id(image_name: &str, base_image_name: &str) -> String {
+    if image_name == base_image_name {
+        return super::migration::image_id(base_image_name)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+    }
+    super::migration::image_labels(image_name)
+        .await
+        .get(super::migration::LABEL_BASE_IMAGE_ID)
+        .cloned()
+        .unwrap_or_default()
+}
+
 pub async fn create_container(
     project: &Project,
     docker_socket_path: &str,
     image_name: &str,
+    base_image_name: &str,
+    extras: CreateExtras<'_>,
     aws_config_path: Option<&str>,
     global_aws: &GlobalAwsSettings,
     global_ollama: &GlobalOllamaSettings,
@@ -1232,6 +1277,51 @@ pub async fn create_container(
     labels.insert("triple-c.claude-token-version".to_string(),
         shared_claude.as_ref().map(|(_, v)| v.clone()).unwrap_or_default());
 
+    // ── Base-image lineage ───────────────────────────────────────────────────
+    // `triple-c.create-image` is what this container was actually created
+    // from — the snapshot when one exists, otherwise the configured base. It is
+    // what `container_needs_recreation` compares against; the older
+    // `triple-c.image` label recorded the same thing but was compared against
+    // the container's *own* image, which is where it came from, so that check
+    // was a tautology and never fired. `triple-c.image` is still written for
+    // continuity with existing containers but is no longer compared.
+    //
+    // `triple-c.base-image-id` records the lineage — see `resolve_base_image_id`.
+    //
+    // All three (plus the migration marker) are written **unconditionally**,
+    // even when empty. Docker merges an image's labels into a container's at
+    // creation, and `docker commit` copies container labels onto the snapshot
+    // image, so a value stamped once would otherwise ride the snapshot into
+    // every future container forever. Writing the key explicitly overrides the
+    // inherited one — the same defence MANAGED_AUTH_KEYS applies to env.
+    labels.insert(
+        super::migration::LABEL_CREATE_IMAGE.to_string(),
+        image_name.to_string(),
+    );
+    labels.insert(
+        super::migration::LABEL_BASE_IMAGE_ID.to_string(),
+        resolve_base_image_id(image_name, base_image_name).await,
+    );
+    labels.insert(
+        super::migration::LABEL_MIGRATION_STATE.to_string(),
+        String::new(),
+    );
+    // Same defence, applied to the legacy MCP shim — and here it fixes a real,
+    // observed bug rather than pre-empting one. `container_needs_recreation`
+    // recreates any container carrying a non-empty `triple-c.mcp-fingerprint`,
+    // but nothing has written that label since the MCP feature was removed. It
+    // survives only by *inheritance* from a snapshot image committed by an
+    // older build (one such image was found on this host with a non-empty
+    // value), and every recreation re-commits it — so the shim can never
+    // terminate and the project is recreated on every single start. Writing it
+    // explicitly empty makes the shim fire exactly once, which is what it was
+    // always meant to do.
+    labels.insert("triple-c.mcp-fingerprint".to_string(), String::new());
+
+    for (key, value) in extras.extra_labels {
+        labels.insert((*key).to_string(), (*value).to_string());
+    }
+
     let host_config = HostConfig {
         mounts: Some(mounts),
         port_bindings: if port_bindings.is_empty() { None } else { Some(port_bindings) },
@@ -1506,6 +1596,7 @@ pub async fn remove_project_volumes(project: &Project) -> Result<(), String> {
 pub async fn container_needs_recreation(
     container_id: &str,
     project: &Project,
+    expected_create_image: &str,
     global_aws: &GlobalAwsSettings,
     global_ollama: &GlobalOllamaSettings,
     global_llamacpp: &GlobalLlamaCppSettings,
@@ -1614,24 +1705,48 @@ pub async fn container_needs_recreation(
         return Ok(true);
     }
 
-    // ── Image ────────────────────────────────────────────────────────────
-    // The image label is set at creation time; if the user changed the
-    // configured image we need to recreate.  We only compare when the
-    // label exists (containers created before this change won't have it).
-    if let Some(container_image) = get_label("triple-c.image") {
-        // The caller doesn't pass the image name, but we can read the
-        // container's actual image from Docker inspect.
-        let actual_image = info
-            .config
-            .as_ref()
-            .and_then(|c| c.image.as_ref());
-        if let Some(actual) = actual_image {
-            if *actual != container_image {
-                log::info!("Image mismatch (actual={:?}, label={:?})", actual, container_image);
-                return Ok(true);
-            }
+    // ── Create image ─────────────────────────────────────────────────────
+    // What this container was created from, against what we would create it
+    // from *now* — the caller resolves that (snapshot-if-it-exists, else the
+    // configured base) and passes it in as `expected_create_image`, preserving
+    // exactly today's semantics.
+    //
+    // This replaces a check that compared the container's actual image against
+    // the `triple-c.image` label. `create_container` wrote that label from the
+    // very image it created from, so the two could never differ: it was a
+    // tautology that never once fired, and it is the reason a project stayed
+    // pinned to its own snapshot lineage forever.
+    //
+    // A missing `triple-c.create-image` label means the container predates this
+    // fix — unknown, so leave it alone rather than churn every existing
+    // container on first launch after an update.
+    if let Some(container_create_image) = get_label(crate::docker::migration::LABEL_CREATE_IMAGE) {
+        if container_create_image != expected_create_image {
+            log::info!(
+                "Create-image mismatch (container={:?}, expected={:?})",
+                container_create_image,
+                expected_create_image
+            );
+            return Ok(true);
         }
     }
+
+    // ── Base image id: deliberately NOT compared here ────────────────────
+    // This departs from the CLAUDE.md rule that new container state gets a
+    // label and a comparison, and the departure is the point.
+    //
+    // `triple-c.base-image-id` records which base a container's lineage
+    // descends from. Comparing it here would mean that publishing a new base
+    // image silently recreates every project on next start — and, because
+    // `expected_create_image` is the snapshot whenever one exists, it would
+    // recreate them *from their own snapshot*: pure churn, on the old base,
+    // with no benefit. Worse, it would consume the very signal ("this project
+    // is behind the base") that is supposed to prompt the user, without
+    // actually migrating anything.
+    //
+    // Staleness is therefore a *surfaced* signal gating an explicit user
+    // action — `get_container_staleness` / `migrate_project_to_base` — not an
+    // automatic recreation trigger.
 
     // ── Timezone ─────────────────────────────────────────────────────────
     let expected_tz = timezone.unwrap_or("");
