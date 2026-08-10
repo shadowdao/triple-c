@@ -25,6 +25,7 @@ RUN for i in 1 2 3 4 5; do \
     jq \
     sudo \
     ca-certificates \
+    libnss3-tools \
     gnupg \
     locales \
     unzip \
@@ -34,6 +35,12 @@ RUN for i in 1 2 3 4 5; do \
     bubblewrap \
     socat \
     && rm -rf /var/lib/apt/lists/*
+
+# `libnss3-tools` above provides `certutil`. Chrome/Chromium read neither
+# /etc/ssl/certs nor $SSL_CERT_FILE — they have their own NSS database at
+# ~/.pki/nssdb — so without it the browser-view pane cannot be made to trust a
+# corporate CA, no matter what the system trust store says. entrypoint.sh
+# degrades to a warning if it is ever missing.
 
 # Remove default ubuntu user to free UID 1000 for host-user remapping
 RUN if id ubuntu >/dev/null 2>&1; then userdel -r ubuntu 2>/dev/null || userdel ubuntu; fi \

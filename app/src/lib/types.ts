@@ -44,6 +44,10 @@ export interface Project {
   /** null = not set → falls back to `full_permissions` (true → "bypass"). */
   permission_mode: PermissionMode | null;
   ssh_key_path: string | null;
+  /** Per-project override for the corporate CA certificate path (a single
+   *  certificate file or a directory of them). null falls back to
+   *  `AppSettings.ca_cert_path`. Changing it recreates the container. */
+  ca_cert_path: string | null;
   git_token: string | null;
   git_user_name: string | null;
   git_user_email: string | null;
@@ -190,6 +194,12 @@ export interface GlobalOpenAiCompatibleSettings {
 
 export interface AppSettings {
   default_ssh_key_path: string | null;
+  /** Corporate root CA — a single certificate file or a directory of them —
+   *  mounted read-only into every container and installed into the system
+   *  trust store, Node's `NODE_EXTRA_CA_CERTS`, Python's
+   *  `REQUESTS_CA_BUNDLE`/`SSL_CERT_FILE` and Chrome's NSS database.
+   *  Needed when the host is behind a TLS-terminating corporate proxy. */
+  ca_cert_path: string | null;
   default_git_user_name: string | null;
   default_git_user_email: string | null;
   docker_socket_path: string | null;
@@ -210,6 +220,20 @@ export interface AppSettings {
   stt: SttSettings;
   gateway: GatewaySettings;
   global_claude_code_settings: ClaudeCodeSettings | null;
+}
+
+/** What `inspect_ca_cert_path` reports about a corporate CA path. Errors ride
+ *  in the payload rather than rejecting, so the field can render them inline
+ *  while the user is still typing. */
+export interface CaCertInfo {
+  exists: boolean;
+  is_directory: boolean;
+  cert_count: number;
+  /** The `.crt` names the certificates are installed as inside the container —
+   *  surfacing the silent `.pem` → `.crt` rename that
+   *  `update-ca-certificates` requires. */
+  installed_names: string[];
+  error: string | null;
 }
 
 export interface SttSettings {

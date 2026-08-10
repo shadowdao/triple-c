@@ -78,6 +78,7 @@ pub(crate) async fn create_container_for_project(
         settings.timezone.as_deref(),
         settings.global_claude_code_settings.as_ref(),
         settings.default_ssh_key_path.as_deref(),
+        settings.ca_cert_path.as_deref(),
         settings.default_git_user_name.as_deref(),
         settings.default_git_user_email.as_deref(),
     )
@@ -406,6 +407,7 @@ pub async fn start_project_container(
                 settings.timezone.as_deref(),
                 settings.global_claude_code_settings.as_ref(),
                 settings.default_ssh_key_path.as_deref(),
+                settings.ca_cert_path.as_deref(),
                 settings.default_git_user_name.as_deref(),
                 settings.default_git_user_email.as_deref(),
             ).await.unwrap_or(false);

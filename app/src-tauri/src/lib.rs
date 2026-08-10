@@ -437,6 +437,7 @@ pub fn run() {
             commands::settings_commands::update_settings,
             commands::settings_commands::pull_image,
             commands::settings_commands::detect_aws_config,
+            commands::settings_commands::inspect_ca_cert_path,
             commands::settings_commands::list_aws_profiles,
             commands::settings_commands::detect_host_timezone,
             // Terminal

@@ -58,6 +58,167 @@ remap_uid_gid
 # Fix ownership of home directory after UID/GID change
 chown -R claude:claude /home/claude
 
+# ── Corporate CA certificates ───────────────────────────────────────────────
+# The host's CA material is bind-mounted read-only at /tmp/.host-ca. Triple-C
+# mounts a *directory* as-is and a *single file* as /tmp/.host-ca/<name>.crt,
+# so this only ever has to deal with a directory (the file branch below is
+# defensive).
+#
+# Runs before everything that touches the network — the git credential helper,
+# ssh-keyscan, and especially the `claude update` at the bottom of this file,
+# which is itself an HTTPS call that fails behind a TLS-terminating proxy
+# without this.
+#
+# Two things are easy to get wrong here:
+#   1. `update-ca-certificates` globs /usr/local/share/ca-certificates/*.crt
+#      case-sensitively. A `.pem` that is merely copied in is ignored in total
+#      silence, so certificates are *renamed*, not copied.
+#   2. Chrome/Chromium read neither /etc/ssl nor $SSL_CERT_FILE; they have
+#      their own NSS database at ~/.pki/nssdb, seeded below with certutil.
+#
+# NODE_EXTRA_CA_CERTS / REQUESTS_CA_BUNDLE / SSL_CERT_FILE are deliberately NOT
+# exported here. Every terminal is a separate `docker exec`, which inherits the
+# container's configured env and sees nothing this script exported — the same
+# reason $BROWSER had to become an image-level ENV. Triple-C sets them on the
+# container at creation time instead. (They are forwarded into the cron
+# environment file further down, because cron jobs start from a bare env.)
+CA_SRC="/tmp/.host-ca"
+CA_STORE="/usr/local/share/ca-certificates"
+CA_PREFIX="triple-c-"
+CA_BUNDLE="/etc/ssl/certs/ca-certificates.crt"
+CA_STAMP="/var/lib/triple-c/ca.stamp"
+CA_NSSDB="/home/claude/.pki/nssdb"
+
+# Mirror of `container_cert_name()` in app/src-tauri/src/docker/ca_certs.rs.
+# The two must agree; the Rust side has the unit tests.
+ca_normalise_name() {
+    local name stem
+    name=$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_')
+    while [ "${name#.}" != "$name" ]; do name="${name#.}"; done
+    stem="${name%.*}"
+    [ -z "$stem" ] && stem="corporate-ca"
+    printf '%s.crt' "$stem"
+}
+
+ca_source_files() {
+    if [ -d "$CA_SRC" ]; then
+        find "$CA_SRC" -maxdepth 1 -type f \
+            \( -iname '*.crt' -o -iname '*.pem' -o -iname '*.cer' \
+               -o -iname '*.cert' -o -iname '*.ca-bundle' \) 2>/dev/null | sort
+    elif [ -f "$CA_SRC" ]; then
+        printf '%s\n' "$CA_SRC"
+    fi
+}
+
+# Seed Chrome/Chromium's NSS database. Tolerant by design: a missing certutil
+# or a broken profile must warn, never fail the container start.
+# ~/.pki lives in the home volume, so this persists once done; the system store
+# lives in the writable layer and is re-applied on every start.
+ca_seed_nssdb() {
+    if ! command -v certutil >/dev/null 2>&1; then
+        echo "entrypoint: warning — certutil not found (install libnss3-tools); Chrome/Chromium in this container will not trust the corporate CA"
+        return 0
+    fi
+    su -s /bin/bash claude -c '
+        db="$HOME/.pki/nssdb"
+        mkdir -p "$db" || exit 1
+        if [ ! -f "$db/cert9.db" ]; then
+            certutil -d "sql:$db" -N --empty-password >/dev/null 2>&1 || exit 1
+        fi
+        for f in /usr/local/share/ca-certificates/triple-c-*.crt; do
+            [ -f "$f" ] || continue
+            nick="triple-c:$(basename "$f" .crt)"
+            # Delete first so re-running replaces rather than duplicates.
+            certutil -d "sql:$db" -D -n "$nick" >/dev/null 2>&1
+            certutil -d "sql:$db" -A -t "C,," -n "$nick" -i "$f" >/dev/null 2>&1 \
+                || echo "entrypoint: warning — certutil could not add $nick"
+        done
+    ' && echo "entrypoint: seeded Chrome/Chromium NSS database with the corporate CA" \
+      || echo "entrypoint: warning — NSS database seeding failed (continuing)"
+}
+
+install_corporate_ca() {
+    local files fp stamp f base name count installed
+
+    files=$(ca_source_files)
+
+    if [ -z "$files" ]; then
+        # Nothing configured — but /usr/local/share is in the writable layer and
+        # `docker commit` bakes it into the project's snapshot image, so a cert
+        # installed by a previous configuration would ride that snapshot into
+        # every future container. Turning the setting off has to actively undo.
+        if ls "$CA_STORE/$CA_PREFIX"*.crt >/dev/null 2>&1; then
+            echo "entrypoint: removing previously installed corporate CA certificates"
+            rm -f "$CA_STORE/$CA_PREFIX"*.crt
+            update-ca-certificates --fresh >/dev/null 2>&1 \
+                || echo "entrypoint: warning — update-ca-certificates failed while removing certificates"
+            rm -f "$CA_STAMP"
+        fi
+        if [ -e "$CA_SRC" ]; then
+            echo "entrypoint: warning — $CA_SRC holds no certificate files"
+        fi
+        return 0
+    fi
+
+    # Idempotent and cheap: the certs are already installed on a plain restart
+    # (the writable layer survives stop/start), so hash the sources and skip the
+    # work when nothing has moved. The NSS database is checked separately
+    # because it lives in the home volume and can be wiped independently.
+    fp=$(printf '%s\n' "$files" | xargs -d '\n' -r sha256sum 2>/dev/null | sha256sum | cut -d' ' -f1)
+    stamp=$(cat "$CA_STAMP" 2>/dev/null)
+    if [ -n "$fp" ] && [ "$fp" = "$stamp" ] && [ -s "$CA_BUNDLE" ]; then
+        if [ -f "$CA_NSSDB/cert9.db" ]; then
+            echo "entrypoint: corporate CA certificates already installed"
+            return 0
+        fi
+        ca_seed_nssdb
+        return 0
+    fi
+
+    mkdir -p "$CA_STORE" "$(dirname "$CA_STAMP")"
+    rm -f "$CA_STORE/$CA_PREFIX"*.crt
+    installed=0
+
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        base=$(basename "$f")
+        name="$CA_PREFIX$(ca_normalise_name "$base")"
+        count=$(grep -c -- '-----BEGIN CERTIFICATE-----' "$f" 2>/dev/null || true)
+        [ -n "$count" ] || count=0
+        if [ "$count" -gt 1 ]; then
+            # A corporate trust chain is usually delivered as one PEM holding
+            # root + intermediates. update-ca-certificates handles exactly one
+            # certificate per file, so split it.
+            awk -v out="$CA_STORE/${name%.crt}" '
+                /-----BEGIN CERTIFICATE-----/ { n++; f = out "-" n ".crt" }
+                n > 0 { print > f }
+            ' "$f" && installed=$((installed + count))
+        elif [ "$count" -eq 1 ]; then
+            cp -f "$f" "$CA_STORE/$name" && installed=$((installed + 1))
+        else
+            echo "entrypoint: warning — $f holds no PEM certificate (DER is not supported), skipping"
+        fi
+    done <<< "$files"
+
+    chmod 644 "$CA_STORE/$CA_PREFIX"*.crt 2>/dev/null
+
+    if [ "$installed" -eq 0 ]; then
+        echo "entrypoint: warning — no usable certificates found under $CA_SRC"
+        return 0
+    fi
+
+    if update-ca-certificates >/dev/null 2>&1; then
+        echo "entrypoint: installed $installed corporate CA certificate(s) into the system trust store"
+        printf '%s' "$fp" > "$CA_STAMP"
+    else
+        echo "entrypoint: warning — update-ca-certificates failed; corporate certificates may not be trusted"
+    fi
+
+    ca_seed_nssdb
+}
+
+install_corporate_ca
+
 # ── SSH key setup ──────────────────────────────────────────────────────────
 # Host SSH dir is mounted read-only at /tmp/.host-ssh.
 # Copy to /home/claude/.ssh so we can fix permissions.
@@ -277,7 +438,7 @@ ENV_FILE="$SCHEDULER_DIR/.env"
 : > "$ENV_FILE"
 env | while IFS='=' read -r key value; do
     case "$key" in
-        ANTHROPIC_*|AWS_*|CLAUDE_CODE_*|TRIPLE_C_PERMISSION_MODE|PATH|HOME|LANG|TZ|COLORTERM|BROWSER)
+        ANTHROPIC_*|AWS_*|CLAUDE_CODE_*|TRIPLE_C_PERMISSION_MODE|PATH|HOME|LANG|TZ|COLORTERM|BROWSER|NODE_EXTRA_CA_CERTS|REQUESTS_CA_BUNDLE|SSL_CERT_FILE)
             # Escape single quotes in value and write as KEY='VALUE'
             escaped_value=$(printf '%s' "$value" | sed "s/'/'\\\\''/g")
             printf "%s='%s'\n" "$key" "$escaped_value" >> "$ENV_FILE"

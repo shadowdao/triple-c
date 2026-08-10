@@ -1,3 +1,4 @@
+pub mod ca_certs;
 pub mod client;
 pub mod container;
 pub mod image;
@@ -23,3 +24,6 @@ pub use exec::*;
 pub use legacy_cleanup::*;
 #[allow(unused_imports)]
 pub use migration::*;
+// Deliberately *not* re-exported flat: `ca_certs::resolve` and
+// `ca_certs::CA_MOUNT_DIR` are far clearer than bare `resolve` in a module that
+// already re-exports five other namespaces.

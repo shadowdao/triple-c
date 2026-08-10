@@ -155,6 +155,36 @@ ruff, the OAuth login, `~/.claude.json`, skills, transcripts, scheduler tasks an
 re-attach for free when a container is recreated from a *different* image — which is what makes
 base-image migration cheap.
 
+### Corporate CA certificates (`docker/ca_certs.rs`, `entrypoint.sh`)
+
+A global `AppSettings::ca_cert_path` with a per-project `Project::ca_cert_path` override, accepting
+a single certificate file **or** a directory. Follows the SSH/AWS host-mount pattern: read-only
+bind mount at `/tmp/.host-ca`, applied by the entrypoint on every start, so it survives recreation,
+migration and Reset. Four things here are not obvious:
+
+- **`update-ca-certificates` globs `*.crt`, case-sensitively.** A `.pem` that is merely copied into
+  `/usr/local/share/ca-certificates/` is ignored in total silence. Certificates are *renamed* —
+  `container_cert_name()` in Rust, mirrored in a few lines of shell in `entrypoint.sh` (the Rust
+  side carries the unit tests). A single-file mount lands at `/tmp/.host-ca/<name>.crt` so the
+  entrypoint only ever sees a directory and the file keeps a recognisable name.
+- **The system store is not enough.** Only curl/git/apt read it. Node — and therefore Claude Code
+  itself — needs `NODE_EXTRA_CA_CERTS`; Python/requests need `REQUESTS_CA_BUNDLE`/`SSL_CERT_FILE`;
+  Chrome/Chromium read neither and want their own NSS database at `~/.pki/nssdb`, seeded with
+  `certutil` (`libnss3-tools`, added to the image for this). The NSS step warns and continues if
+  `certutil` is missing rather than failing the start.
+- **Those env vars are set from Rust at creation, never exported by the entrypoint.** A terminal
+  session is a `docker exec`, which inherits the container's configured env and sees nothing the
+  entrypoint exported — the same lesson that made `$BROWSER` an image-level `ENV`. The bundle path
+  is deterministic (`/etc/ssl/certs/ca-certificates.crt`), so Rust can set them up front. They are
+  emitted **empty** when no CA is configured, for the `MANAGED_AUTH_KEYS` reason: `docker commit`
+  bakes env into the snapshot image. Empty is safe — verified on Ubuntu 24.04 that curl, `openssl
+  s_client` and Python's `ssl` behave exactly as with the vars unset.
+- **`triple-c.ca-fingerprint` covers the certificate *bytes*, not just the path.** Replacing a
+  rotated CA at the same location must recreate the container; the copy inside is made once, at
+  start, so nothing else would notice. The entrypoint is stamped/idempotent on restart, and
+  actively **removes** `triple-c-*.crt` when the setting is cleared — `/usr/local/share` rides the
+  project's snapshot image, so turning the feature off has to undo, not merely stop.
+
 ### Container Lifecycle
 
 Containers use a **stop/start** model (not create/destroy). Installed packages persist across stops. The `.claude` config dir uses a named Docker volume (`triple-c-claude-config-{projectId}`), nested inside the home volume (`triple-c-home-{projectId}`), so OAuth tokens and Claude Code config survive container stop/start *and* container recreation.

@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, ImageUpdateInfo, FileEntry, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, PlaywrightDetection, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome } from "./types";
+import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, ImageUpdateInfo, FileEntry, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, PlaywrightDetection, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo } from "./types";
 
 // Docker
 export const checkDocker = () => invoke<boolean>("check_docker");
@@ -37,6 +37,10 @@ export const detectAwsConfig = () =>
   invoke<string | null>("detect_aws_config");
 export const listAwsProfiles = () =>
   invoke<string[]>("list_aws_profiles");
+/** Check a corporate CA path and report what would be installed. Never
+ *  rejects for a bad path — the reason comes back in `error`. */
+export const inspectCaCertPath = (path: string) =>
+  invoke<CaCertInfo>("inspect_ca_cert_path", { path });
 export const detectHostTimezone = () =>
   invoke<string>("detect_host_timezone");
 

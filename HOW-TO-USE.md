@@ -824,8 +824,8 @@ Notes:
 ## Settings
 
 Access global settings via the **Settings** tab in the sidebar. The panel is a set of collapsible
-sections: **General**, **Claude Authentication**, **Backends**, **Container**, **Git / SSH**,
-**Tools** and **Updates**.
+sections: **General**, **Claude Authentication**, **Backends**, **Container**, **Certificates**,
+**Git / SSH**, **Tools** and **Updates**.
 
 ### Claude Authentication
 
@@ -854,6 +854,36 @@ Environment variables applied to **all** project containers. Per-project variabl
 ### Default SSH Key Directory
 
 Path to your SSH key directory (typically `~/.ssh`). This is mounted into **all** containers that don't have a per-project SSH path set. Per-project SSH paths take precedence.
+
+### Corporate CA Certificate
+
+If your organisation's network inspects TLS (a corporate proxy, a VPN that terminates HTTPS at the
+edge), containers need your organisation's root certificate or **every** HTTPS call inside them
+fails — `npm install`, `pip`, `git clone` over HTTPS, `curl`, the browser-view pane, and Claude
+Code's own calls to the API.
+
+Point this at either a **single certificate file** or a **folder** of them. It is mounted read-only
+into every container and applied on every start, so it survives container recreation, base-image
+migration and Reset — unlike a certificate you install by hand inside a running container, which is
+lost the first time any of those happens.
+
+The status line under the field tells you how many certificates were found and the names they will
+be installed as inside the container. That rename matters: the container's trust store only reads
+files ending in `.crt`, so a `.pem` is renamed rather than merely copied, which is the step that is
+easiest to get wrong by hand.
+
+Inside the container the certificate is trusted by:
+
+| Consumer | How |
+|---|---|
+| curl, git, apt, wget | the system trust store (`update-ca-certificates`) |
+| Node, npm, **Claude Code itself** | `NODE_EXTRA_CA_CERTS` |
+| Python, pip, requests | `REQUESTS_CA_BUNDLE` and `SSL_CERT_FILE` |
+| Chrome / Chromium (browser view) | its own NSS database at `~/.pki/nssdb` |
+
+A per-project override lives in **Project Home → Config → Access**; leave it blank to use this
+global setting. Changing either recreates the project's container on its next start — replacing the
+certificate file in place counts as a change, so a rotated CA is picked up too.
 
 ### Default Git Name / Email
 

@@ -87,6 +87,14 @@ pub struct GlobalOpenAiCompatibleSettings {
 pub struct AppSettings {
     #[serde(default)]
     pub default_ssh_key_path: Option<String>,
+    /// Path to the organisation's root CA — a single certificate file or a
+    /// directory of them. Mounted read-only into every container, which then
+    /// installs it into the system trust store, Node's `NODE_EXTRA_CA_CERTS`,
+    /// Python's `REQUESTS_CA_BUNDLE`/`SSL_CERT_FILE` and Chrome's NSS database.
+    /// Required when the host sits behind a TLS-terminating corporate proxy.
+    /// Overridden per project by `Project::ca_cert_path`.
+    #[serde(default)]
+    pub ca_cert_path: Option<String>,
     #[serde(default)]
     pub default_git_user_name: Option<String>,
     #[serde(default)]
@@ -197,6 +205,7 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             default_ssh_key_path: None,
+            ca_cert_path: None,
             default_git_user_name: None,
             default_git_user_email: None,
             docker_socket_path: None,
