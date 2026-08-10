@@ -61,7 +61,15 @@ export function useDocker() {
 
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  const startDockerPolling = useCallback(() => {
+  /**
+   * Poll until Docker appears, then stop.
+   *
+   * `onAvailable` runs exactly once, after `dockerAvailable` is set and the
+   * image has been re-checked. It exists because a session that started before
+   * the daemon was up otherwise never does the "Docker is up" work — status
+   * reconciliation, interrupted-migration recovery, loading the project list.
+   */
+  const startDockerPolling = useCallback((onAvailable?: () => void | Promise<void>) => {
     // Don't start if already polling
     if (pollingRef.current) return () => {};
 
@@ -78,6 +86,11 @@ export function useDocker() {
             setImageExists(exists);
           } catch {
             setImageExists(false);
+          }
+          try {
+            await onAvailable?.();
+          } catch (e) {
+            console.error("Docker-available callback failed:", e);
           }
         }
       } catch {

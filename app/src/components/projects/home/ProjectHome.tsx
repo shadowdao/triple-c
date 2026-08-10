@@ -4,16 +4,19 @@ import { useAppState } from "../../../store/appState";
 import { useProjectActions } from "../../../hooks/useProjectActions";
 import { useProjects } from "../../../hooks/useProjects";
 import { useProjectSave } from "../../../hooks/useSaveState";
+import { useContainerMigration } from "../../../hooks/useContainerMigration";
 import { ProjectStatusIndicator } from "../../ui/StatusIndicator";
 import Button from "../../ui/Button";
 import OverflowMenu from "../../ui/OverflowMenu";
 import ConfirmRemoveModal from "../ConfirmRemoveModal";
 import ConfirmResetModal from "../ConfirmResetModal";
+import MigrateContainerModal from "../MigrateContainerModal";
 import OverviewTab from "./OverviewTab";
 import SessionsTab from "./SessionsTab";
 import AutomationTab from "./AutomationTab";
 import ConfigTab from "./ConfigTab";
 import FilesTab from "./FilesTab";
+import BrowserTab from "./BrowserTab";
 import { formatUptime } from "./format";
 
 const TABS = [
@@ -22,6 +25,7 @@ const TABS = [
   { id: "automation", label: "Automation" },
   { id: "config", label: "Config" },
   { id: "files", label: "Files" },
+  { id: "browser", label: "Browser" },
 ] as const;
 
 export type ProjectHomeTabId = (typeof TABS)[number]["id"];
@@ -41,6 +45,7 @@ export default function ProjectHome({ projectId, active }: Props) {
   const [tab, setTab] = useState<ProjectHomeTabId>("overview");
   const [confirmRemove, setConfirmRemove] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
+  const [showMigration, setShowMigration] = useState(false);
   const { runningSince, progress } = useAppState(
     useShallow((s) => ({
       runningSince: s.runningSince[projectId],
@@ -62,6 +67,11 @@ export default function ProjectHome({ projectId, active }: Props) {
   const { save, saveState } = useProjectSave(
     project ?? ({ id: projectId, name: "" } as never),
   );
+  // Owned here, not in the modal: the run outlives the dialog, and the Overview
+  // banner has to keep showing progress and the report after it is dismissed.
+  const migration = useContainerMigration(
+    project ?? ({ id: projectId, name: "", container_id: null } as never),
+  );
 
   const uptime = useMemo(() => formatUptime(runningSince), [runningSince]);
 
@@ -79,6 +89,22 @@ export default function ProjectHome({ projectId, active }: Props) {
   const isTransitioning =
     project.status === "starting" || project.status === "stopping";
   const isStopped = project.status === "stopped" || project.status === "error";
+  // Rebuilding on a new base swaps the container out, so it gates exactly like
+  // Reset does — with the extra condition that there is a container to migrate.
+  // An interrupted migration is excluded too: its action is Resume, on the
+  // Overview banner, not a fresh pre-flight.
+  //
+  // `probeSettled` is the fourth condition and it is not cosmetic. The probe
+  // takes ~6 s, and until it lands every delta the pre-flight renders reads as
+  // empty — so the dialog would tell the user there was nothing to copy while
+  // the backend was told not to copy anything.
+  const canMigrate =
+    isStopped &&
+    !actions.busy &&
+    !migration.running &&
+    !migration.interrupted &&
+    migration.probeSettled &&
+    !!project.container_id;
 
   return (
     <div className={`flex flex-col h-full min-h-0 ${active ? "" : "hidden"}`}>
@@ -146,6 +172,11 @@ export default function ProjectHome({ projectId, active }: Props) {
                   disabled: actions.backingUp || !project.container_id,
                 },
                 {
+                  label: "Update container base…",
+                  onSelect: () => setShowMigration(true),
+                  disabled: !canMigrate,
+                },
+                {
                   label: "Reset container…",
                   onSelect: () => setConfirmReset(true),
                   disabled: !isStopped || actions.busy,
@@ -198,6 +229,9 @@ export default function ProjectHome({ projectId, active }: Props) {
             saveState={saveState}
             actions={actions}
             onOpenTab={setTab}
+            migration={migration}
+            canMigrate={canMigrate}
+            onOpenMigration={() => setShowMigration(true)}
           />
         )}
         {tab === "sessions" && <SessionsTab project={project} actions={actions} />}
@@ -206,8 +240,21 @@ export default function ProjectHome({ projectId, active }: Props) {
           <ConfigTab project={project} save={save} saveState={saveState} />
         )}
         {tab === "files" && <FilesTab project={project} />}
+        {tab === "browser" && (
+          <BrowserTab project={project} active={active && tab === "browser"} />
+        )}
       </div>
 
+      {showMigration && (
+        <MigrateContainerModal
+          projectName={project.name}
+          staleness={migration.staleness}
+          migration={migration}
+          // Closing is not cancelling — the run keeps going and the Overview
+          // banner keeps reporting it.
+          onClose={() => setShowMigration(false)}
+        />
+      )}
       {confirmReset && (
         <ConfirmResetModal
           projectName={project.name}

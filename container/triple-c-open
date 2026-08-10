@@ -1,0 +1,136 @@
+#!/bin/bash
+# triple-c-open — URL relay shim.
+#
+# Programs inside the container have no browser and no display. When one wants
+# to open a URL (`gh auth login`, `aws sso login`, `gcloud auth login`, any
+# tool that shells out to xdg-open or honours $BROWSER), this shim relays the
+# URL to the *Triple-C host*, where the user's real browser lives. Nothing is
+# rendered in the container — this is a message, not display forwarding.
+#
+# Transport: an OSC escape sequence written to the controlling terminal, the
+# same trick /usr/local/bin/osc52-clipboard uses for the clipboard.
+#
+#     ESC ] 7777 ; open ; <base64(url)> BEL
+#
+# It goes to /dev/tty, not stdout, so it still reaches the terminal when this
+# shim is a grandchild of something that captures its children's output (e.g.
+# Claude Code running `gh auth login` as a tool call). Triple-C's terminal
+# front-end registers an OSC 7777 handler, validates the URL and offers to open
+# it on the host. Terminals that don't know OSC 7777 silently discard it.
+#
+# Installed as: xdg-open, sensible-browser, www-browser, x-www-browser,
+# gnome-open, gvfs-open, kde-open, open — and as $BROWSER.
+#
+# NO-TERMINAL FALLBACK: cron-driven scheduled tasks (triple-c-task-runner) run
+# with no controlling terminal at all, and a container can be exec'd into from
+# a plain `docker exec` with no Triple-C front-end listening. There is no
+# handshake and nothing to wait for, so this shim never blocks: it prints the
+# URL in plain text on its own line and exits. A human reading the scheduler
+# log, or the operator at a foreign terminal, can still act on it.
+
+set -u
+
+PROGRAM_NAME="triple-c-open"
+MAX_URL_LENGTH=8192   # refuse absurd payloads rather than base64 them
+MAX_TARGETS=8         # refuse to fan out into a burst of relays
+
+usage() {
+    cat <<EOF
+Usage: $PROGRAM_NAME <url> [url ...]
+
+Relays http/https URLs to the Triple-C host's browser via the terminal.
+With no Triple-C terminal attached, prints the URL instead of opening it.
+
+Options:
+  -h, --help     Show this help
+  -v, --version  Show version
+EOF
+}
+
+# stderr, so we never pollute a caller that parses our stdout.
+note() {
+    printf '%s\n' "$*" >&2
+}
+
+# Scheme allow-list. The host validates independently — this is defence in
+# depth and, more usefully, an immediate error message for the caller.
+# Rejects file:, javascript:, data:, and every custom handler.
+is_relayable_url() {
+    local url="$1"
+    case "$url" in
+        http://*|https://*|HTTP://*|HTTPS://*|Http://*|Https://*) ;;
+        *) return 1 ;;
+    esac
+    # Reject control characters and whitespace: a bare CR/LF or ESC in the URL
+    # would let the container inject its own escape sequences into the relay.
+    case "$url" in
+        *[[:space:][:cntrl:]]*) return 1 ;;
+    esac
+    [ "${#url}" -le "$MAX_URL_LENGTH" ]
+}
+
+# Write the OSC sequence to the controlling terminal. Returns non-zero when
+# there is no controlling terminal (cron, detached exec) — bash fails the
+# redirection itself, which is exactly the signal we want.
+emit_osc() {
+    local encoded
+    encoded=$(printf '%s' "$1" | base64 | tr -d '\n') || return 1
+    # The braces matter: with no controlling terminal bash reports the failed
+    # redirection on stderr, and only a group-level 2>/dev/null (applied before
+    # the inner > /dev/tty) suppresses that noise. Trailing `2>/dev/null` on
+    # the printf itself would be applied *after* the failing redirection.
+    { printf '\033]7777;open;%s\a' "$encoded" > /dev/tty; } 2>/dev/null
+}
+
+relay() {
+    local url="$1"
+
+    if ! is_relayable_url "$url"; then
+        note "$PROGRAM_NAME: refusing to relay non-http(s) target: $url"
+        note "$PROGRAM_NAME: only http:// and https:// URLs can be opened on the host."
+        # xdg-open convention: 4 = the action failed.
+        return 4
+    fi
+
+    if emit_osc "$url"; then
+        note "$PROGRAM_NAME: sent to the Triple-C host browser:"
+        note "$url"
+        return 0
+    fi
+
+    # No controlling terminal. Do not wait for a host that isn't listening.
+    note "$PROGRAM_NAME: no Triple-C terminal attached — cannot reach the host browser."
+    note "$PROGRAM_NAME: open this URL manually:"
+    note "$url"
+    return 0
+}
+
+targets=()
+for arg in "$@"; do
+    case "$arg" in
+        -h|--help)    usage; exit 0 ;;
+        -v|--version) printf 'triple-c-open 1.0\n'; exit 0 ;;
+        --)           continue ;;
+        # Swallow unknown flags (xdg-open accepts --manual etc.) rather than
+        # mistaking them for targets.
+        -*)           continue ;;
+        *)            targets+=("$arg") ;;
+    esac
+done
+
+if [ "${#targets[@]}" -eq 0 ]; then
+    note "$PROGRAM_NAME: no URL given"
+    usage
+    exit 1   # xdg-open convention: 1 = error in command line syntax
+fi
+
+if [ "${#targets[@]}" -gt "$MAX_TARGETS" ]; then
+    note "$PROGRAM_NAME: refusing to relay ${#targets[@]} URLs at once (max $MAX_TARGETS)"
+    exit 4
+fi
+
+status=0
+for target in "${targets[@]}"; do
+    relay "$target" || status=$?
+done
+exit "$status"

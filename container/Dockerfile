@@ -162,6 +162,57 @@ RUN chmod +x /usr/local/bin/audio-shim \
     && ln -sf /usr/local/bin/audio-shim /usr/local/bin/rec \
     && ln -sf /usr/local/bin/audio-shim /usr/local/bin/arecord
 
+# ── URL relay shim (host browser) ───────────────────────────────────────────
+# Container-side stand-in for a browser. Emits an OSC 7777 escape sequence that
+# Triple-C's terminal front-end intercepts and turns into a host-browser open.
+# Installed under every name a CLI conventionally consults, plus $BROWSER.
+#
+# What Ubuntu 24.04's base actually ships (verified, not assumed):
+#   sensible-browser  PRESENT  (/usr/bin/sensible-browser, from sensible-utils)
+#   xdg-open          absent   (xdg-utils is not installed)
+#   www-browser       absent   (no update-alternatives entry)
+#   x-www-browser     absent   (no update-alternatives entry)
+#   gnome-open / gvfs-open / kde-open / open   absent
+#
+# So the three names that need real handling, not just a symlink:
+#   * sensible-browser is a dpkg-owned file. A /usr/local/bin symlink would
+#     only shadow it for PATH lookups, leaving absolute-path callers on the
+#     stock script — so it is dpkg-diverted and replaced. (The stock script
+#     does defer to $BROWSER, but only when $BROWSER is set; diverting makes
+#     the behaviour unconditional and survives package upgrades.)
+#   * www-browser / x-www-browser are update-alternatives names, so they are
+#     registered as alternatives rather than hand-symlinked. This matters:
+#     sensible-browser probes /usr/bin/x-www-browser by absolute path, which
+#     only exists if something registered the alternative. `--set` pins them
+#     to manual mode so a later `apt install firefox` cannot steal them and
+#     point the container at a browser it has no display to run.
+#   * xdg-open is diverted pre-emptively so that if someone later installs
+#     xdg-utils inside the container, dpkg unpacks to xdg-open.distrib and
+#     our relay keeps /usr/bin/xdg-open.
+COPY triple-c-open /usr/local/bin/triple-c-open
+RUN chmod +x /usr/local/bin/triple-c-open \
+    && for name in xdg-open sensible-browser gnome-open gvfs-open kde-open open; do \
+           ln -sf /usr/local/bin/triple-c-open "/usr/local/bin/$name"; \
+       done \
+    && dpkg-divert --local --rename --divert /usr/bin/sensible-browser.distrib \
+           --add /usr/bin/sensible-browser \
+    && ln -sf /usr/local/bin/triple-c-open /usr/bin/sensible-browser \
+    && dpkg-divert --local --rename --divert /usr/bin/xdg-open.distrib \
+           --add /usr/bin/xdg-open \
+    && ln -sf /usr/local/bin/triple-c-open /usr/bin/xdg-open \
+    && update-alternatives --install /usr/bin/x-www-browser x-www-browser \
+           /usr/local/bin/triple-c-open 200 \
+    && update-alternatives --set x-www-browser /usr/local/bin/triple-c-open \
+    && update-alternatives --install /usr/bin/www-browser www-browser \
+           /usr/local/bin/triple-c-open 200 \
+    && update-alternatives --set www-browser /usr/local/bin/triple-c-open
+
+# $BROWSER must be an image-level ENV, not just an entrypoint export: terminal
+# sessions are separate `docker exec`s, which inherit the container's config
+# env and see nothing the entrypoint exported into its own process. The
+# entrypoint additionally forwards it into the cron environment file.
+ENV BROWSER=/usr/local/bin/triple-c-open
+
 COPY triple-c-sso-refresh /usr/local/bin/triple-c-sso-refresh
 RUN chmod +x /usr/local/bin/triple-c-sso-refresh
 

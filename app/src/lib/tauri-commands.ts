@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, ImageUpdateInfo, FileEntry, WebTerminalInfo, SttStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus } from "./types";
+import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, ImageUpdateInfo, FileEntry, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, PlaywrightDetection, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome } from "./types";
 
 // Docker
 export const checkDocker = () => invoke<boolean>("check_docker");
@@ -103,6 +103,21 @@ export const pullSttImage = () => invoke<void>("pull_stt_image");
 export const transcribeAudio = (audioData: number[]) =>
   invoke<string>("transcribe_audio", { audioData });
 
+// Model gateway (LiteLLM)
+export const getGatewayStatus = () => invoke<GatewayStatus>("get_gateway_status");
+export const startGateway = () => invoke<GatewayStatus>("start_gateway");
+export const stopGateway = () => invoke<void>("stop_gateway");
+export const checkGatewayHealth = () => invoke<boolean>("check_gateway_health");
+export const buildGatewayImage = () => invoke<void>("build_gateway_image");
+export const pullGatewayImage = () => invoke<void>("pull_gateway_image");
+/** Write-only: the provider API key is never read back out of the keychain. */
+export const setGatewayApiKey = (apiKey: string) =>
+  invoke<void>("set_gateway_api_key", { apiKey });
+export const clearGatewayApiKey = () => invoke<void>("clear_gateway_api_key");
+export const getGatewayAuthToken = () => invoke<string>("get_gateway_auth_token");
+export const regenerateGatewayAuthToken = () =>
+  invoke<string>("regenerate_gateway_auth_token");
+
 // Docker install helper
 export const detectInstallOptions = () =>
   invoke<InstallOptions>("detect_install_options");
@@ -151,6 +166,19 @@ export const setAuthBridgeEnabled = (projectId: string, enabled: boolean) =>
 export const getAuthBridgeStatus = (projectId: string) =>
   invoke<AuthBridgeStatus>("get_auth_bridge_status", { projectId });
 
+// Browser view — watch and take over the browser Claude drives with Playwright
+// inside the container. Off by default, per project. Enabling probes the
+// container, starts the Playwright dashboard in it, and puts a token-gated
+// listener on the host's loopback in front of it; the returned `url` is the
+// only way in, and it is never reachable off the machine.
+export const setBrowserViewEnabled = (projectId: string, enabled: boolean) =>
+  invoke<BrowserViewStatus>("set_browser_view_enabled", { projectId, enabled });
+export const getBrowserViewStatus = (projectId: string) =>
+  invoke<BrowserViewStatus>("get_browser_view_status", { projectId });
+/** Probe for Playwright without starting anything — used to re-check after installing it. */
+export const checkBrowserViewSupport = (projectId: string) =>
+  invoke<PlaywrightDetection>("check_browser_view_support", { projectId });
+
 // Shared Claude Code auth token — one `claude setup-token` run authenticates
 // every Anthropic-backend project. The token itself is never exposed here: it
 // lives in the OS keychain and is injected as a container env var.
@@ -171,4 +199,48 @@ export const submitClaudeTokenCode = (code: string) =>
 /** Abort an in-flight acquisition and release the single-flight guard. No-op if nothing is running. */
 export const cancelClaudeToken = () => invoke<void>("cancel_claude_token");
 export const hasClaudeToken = () => invoke<boolean>("has_claude_token");
-export const clearClaudeToken = () => invoke<void>("clear_claude_token");
+/** Revoke the shared token. Also rewrites any snapshot image that still has it
+ *  baked into its env — see `ClearTokenOutcome` for what may be left behind. */
+export const clearClaudeToken = () =>
+  invoke<ClearTokenOutcome>("clear_claude_token");
+
+// Container base-image migration — move a project onto the current base image
+// without deleting its volumes. Reset is the destructive alternative: it wipes
+// ~/.claude, the OAuth credential, installed skills and every transcript.
+//
+// Flow: getContainerStaleness (read-only, ~6s — two filesystem probes, so call
+// it on demand rather than polling) → migrateProjectToBase → the project sits
+// in "awaiting-confirmation" while the user tries it → confirmMigration or
+// rollbackMigration.
+//
+// Rollback restores the **system layer only**. Both named volumes are untouched
+// throughout, so anything written to $HOME during the migrated session — a new
+// login, new skills, new transcripts — survives a rollback.
+//
+// Progress arrives on the existing `container-progress` event.
+
+/** Read-only. Runs two container/image filesystem probes; not for polling. */
+export const getContainerStaleness = (projectId: string) =>
+  invoke<ContainerStaleness>("get_container_staleness", { projectId });
+
+/** Runs the whole migration and resolves with its report. Long-running — the
+ *  apt replay alone was measured at ~70s for 8 packages. Calling it again while
+ *  a migration is `interrupted` resumes that one instead of starting a new one. */
+export const migrateProjectToBase = (projectId: string, options: MigrationOptions) =>
+  invoke<MigrationReport>("migrate_project_to_base", { projectId, options });
+
+/** Accept the migration: drops the rollback tag and the staged payload, and
+ *  clears the record. Idempotent. */
+export const confirmMigration = (projectId: string) =>
+  invoke<void>("confirm_migration", { projectId });
+
+/** Undo the migration: recreates the container from its pre-migration image.
+ *  Fails if the migration kept no rollback image (`keep_rollback: false`). */
+export const rollbackMigration = (projectId: string) =>
+  invoke<void>("rollback_migration", { projectId });
+
+/** The persisted record, or null when no migration is in flight. Worth calling
+ *  after `reconcileProjectStatuses` at startup: a migration interrupted by an
+ *  app crash shows up here as phase "interrupted". */
+export const getMigrationState = (projectId: string) =>
+  invoke<MigrationState | null>("get_migration_state", { projectId });

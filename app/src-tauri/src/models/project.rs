@@ -123,6 +123,8 @@ pub struct Project {
     pub backend: Backend,
     pub bedrock_config: Option<BedrockConfig>,
     pub ollama_config: Option<OllamaConfig>,
+    #[serde(default, alias = "llama_cpp_config")]
+    pub llamacpp_config: Option<LlamaCppConfig>,
     #[serde(alias = "litellm_config")]
     pub openai_compatible_config: Option<OpenAiCompatibleConfig>,
     pub allow_docker_access: bool,
@@ -137,6 +139,12 @@ pub struct Project {
     /// because toggling it changes nothing about the container itself.
     #[serde(default)]
     pub auth_bridge_enabled: bool,
+    /// Opt in to the browser-view pane, which watches and takes over the
+    /// browser Claude drives with Playwright inside the container. Purely
+    /// host-side like `auth_bridge_enabled`, so it likewise has no
+    /// container-recreation label.
+    #[serde(default)]
+    pub browser_view_enabled: bool,
     /// Use the shared, long-lived Claude Code OAuth token (from
     /// `claude setup-token`, held in the OS keychain) for this project instead
     /// of requiring its own `claude login`. Only consulted when `backend` is
@@ -191,8 +199,10 @@ pub enum ProjectStatus {
 /// - `Anthropic`: Direct Anthropic API (user runs `claude login` inside the container)
 /// - `Bedrock`: AWS Bedrock with per-project AWS credentials
 /// - `Ollama`: Local or remote Ollama server
-/// - `OpenAiCompatible`: Any OpenAI API-compatible endpoint (e.g., LiteLLM, vLLM, etc.)
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// - `LlamaCpp`: A local or remote `llama-server` (llama.cpp)
+/// - `OpenAiCompatible`: Any endpoint that speaks the Anthropic Messages API
+///   (e.g. LiteLLM). See [`Backend::uses_custom_endpoint`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Backend {
     /// Backward compat: old projects stored as "login" or "api_key" map to Anthropic.
@@ -200,6 +210,10 @@ pub enum Backend {
     Anthropic,
     Bedrock,
     Ollama,
+    /// Serialises as `llama_cpp`; the aliases accept the spellings a
+    /// hand-edited `projects.json` is likely to contain.
+    #[serde(alias = "llamacpp", alias = "llama-cpp", alias = "llama.cpp")]
+    LlamaCpp,
     #[serde(alias = "lite_llm", alias = "litellm")]
     OpenAiCompatible,
 }
@@ -207,6 +221,28 @@ pub enum Backend {
 impl Default for Backend {
     fn default() -> Self {
         Self::Anthropic
+    }
+}
+
+impl Backend {
+    /// Whether this backend points Claude Code at a non-Anthropic HTTP endpoint
+    /// via `ANTHROPIC_BASE_URL`.
+    ///
+    /// Those endpoints serve whatever model *they* were started with, so
+    /// Claude Code's built-in `opus`/`sonnet`/`haiku`/`fable` aliases resolve to
+    /// Anthropic model ids the server has never heard of. Every backend for
+    /// which this returns `true` therefore gets the
+    /// `ANTHROPIC_DEFAULT_*_MODEL` alias vars pinned to the configured model —
+    /// see `docker::container::compute_model_aliases`.
+    ///
+    /// Bedrock is deliberately excluded: it talks to AWS, which does host the
+    /// real Anthropic model ids, so Claude Code's own defaults are correct
+    /// there. Anthropic is excluded for the same reason.
+    pub fn uses_custom_endpoint(&self) -> bool {
+        matches!(
+            self,
+            Backend::Ollama | Backend::LlamaCpp | Backend::OpenAiCompatible
+        )
     }
 }
 
@@ -248,27 +284,60 @@ pub struct BedrockConfig {
 }
 
 /// Ollama configuration for a project.
-/// Ollama exposes an Anthropic-compatible API endpoint.
+/// Ollama natively implements the Anthropic Messages API at `/v1/messages`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OllamaConfig {
     /// The base URL of the Ollama server (e.g., "http://host.docker.internal:11434" or "http://192.168.1.100:11434")
     pub base_url: String,
     /// Optional model override (e.g., "qwen3.5:27b")
     pub model_id: Option<String>,
+    /// Optional override for the model the `haiku` alias resolves to.
+    /// Blank falls back to `model_id`. See [`Backend::uses_custom_endpoint`].
+    #[serde(default)]
+    pub haiku_model_id: Option<String>,
+}
+
+/// llama.cpp (`llama-server`) configuration for a project.
+///
+/// `llama-server` natively implements the Anthropic Messages API at
+/// `POST /v1/messages` (plus `/v1/messages/count_tokens`), so Claude Code can
+/// talk to it directly through `ANTHROPIC_BASE_URL` — exactly like Ollama, with
+/// no translation shim.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlamaCppConfig {
+    /// The base URL of the llama-server instance. `llama-server`'s default
+    /// listen port is 8080 (`--port PORT | port to listen (default: 8080)`).
+    pub base_url: String,
+    /// Optional model override. `llama-server` serves whatever model it was
+    /// started with, so this is mostly the id Claude Code should *say* it is
+    /// using — but it is also what the model aliases are pinned to.
+    pub model_id: Option<String>,
+    /// Optional override for the model the `haiku` alias resolves to.
+    /// Blank falls back to `model_id`.
+    #[serde(default)]
+    pub haiku_model_id: Option<String>,
 }
 
 /// OpenAI Compatible endpoint configuration for a project.
-/// Routes Anthropic API calls through any OpenAI API-compatible endpoint
-/// (e.g., LiteLLM, vLLM, or other compatible gateways).
+///
+/// Despite the name (kept for backward compatibility with existing
+/// `projects.json` data), the endpoint must implement the **Anthropic Messages
+/// API** — Claude Code only ever speaks `POST /v1/messages`. Gateways such as
+/// LiteLLM expose an Anthropic-shaped route and work; a bare
+/// `/v1/chat/completions` server does not.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAiCompatibleConfig {
-    /// The base URL of the OpenAI-compatible endpoint (e.g., "http://host.docker.internal:4000" or "https://api.example.com")
+    /// The base URL of the endpoint (e.g., "http://host.docker.internal:4000" or "https://api.example.com")
     pub base_url: String,
-    /// API key for the OpenAI-compatible endpoint
+    /// API key for the endpoint
     #[serde(skip_serializing, default)]
     pub api_key: Option<String>,
     /// Optional model override
     pub model_id: Option<String>,
+    /// Optional override for the model the `haiku` alias resolves to.
+    /// Blank falls back to `model_id`.
+    #[serde(default)]
+    pub haiku_model_id: Option<String>,
 }
 
 impl Project {
@@ -283,11 +352,13 @@ impl Project {
             backend: Backend::default(),
             bedrock_config: None,
             ollama_config: None,
+            llamacpp_config: None,
             openai_compatible_config: None,
             allow_docker_access: false,
             sandbox_mode_enabled: false,
             mission_control_enabled: false,
             auth_bridge_enabled: false,
+            browser_view_enabled: false,
             use_shared_auth_token: default_use_shared_auth_token(),
             full_permissions: false,
             permission_mode: None,

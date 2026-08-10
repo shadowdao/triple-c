@@ -2,11 +2,11 @@ use tauri::{Emitter, State};
 
 use crate::commands::aws_commands;
 use crate::docker;
-use crate::models::{container_config, Backend, BedrockAuthMethod, Project, ProjectPath, ProjectStatus};
+use crate::models::{container_config, AppSettings, Backend, BedrockAuthMethod, Project, ProjectPath, ProjectStatus};
 use crate::storage::secure;
 use crate::AppState;
 
-fn emit_progress(app_handle: &tauri::AppHandle, project_id: &str, message: &str) {
+pub(crate) fn emit_progress(app_handle: &tauri::AppHandle, project_id: &str, message: &str) {
     let _ = app_handle.emit(
         "container-progress",
         serde_json::json!({
@@ -43,8 +43,49 @@ fn store_secrets_for_project(project: &Project) -> Result<(), String> {
     Ok(())
 }
 
+/// Create the project's container, threading every global setting through.
+///
+/// Exists so that the two ordinary create paths below and base-image migration
+/// cannot drift apart — a container created by a migration must be
+/// indistinguishable from one created by a normal start, or the next
+/// `container_needs_recreation` would immediately throw it away.
+///
+/// `create_image` is what to create *from* (the snapshot or the base);
+/// `base_image_name` is the configured base, which `create_container` needs in
+/// order to tell those two apart when it stamps the lineage labels.
+pub(crate) async fn create_container_for_project(
+    project: &Project,
+    settings: &AppSettings,
+    docker_socket: &str,
+    aws_config_path: Option<&str>,
+    create_image: &str,
+    base_image_name: &str,
+    extras: docker::CreateExtras<'_>,
+) -> Result<String, String> {
+    docker::create_container(
+        project,
+        docker_socket,
+        create_image,
+        base_image_name,
+        extras,
+        aws_config_path,
+        &settings.global_aws,
+        &settings.global_ollama,
+        &settings.global_llamacpp,
+        &settings.global_openai_compatible,
+        settings.global_claude_instructions.as_deref(),
+        &settings.global_custom_env_vars,
+        settings.timezone.as_deref(),
+        settings.global_claude_code_settings.as_ref(),
+        settings.default_ssh_key_path.as_deref(),
+        settings.default_git_user_name.as_deref(),
+        settings.default_git_user_email.as_deref(),
+    )
+    .await
+}
+
 /// Populate secret fields on a project struct from the OS keychain.
-fn load_secrets_for_project(project: &mut Project) {
+pub(crate) fn load_secrets_for_project(project: &mut Project) {
     project.git_token = secure::get_project_secret(&project.id, "git-token")
         .unwrap_or(None);
     if let Some(ref mut bedrock) = project.bedrock_config {
@@ -103,6 +144,11 @@ pub async fn remove_project(
     // Release any host loopback ports the auth bridge holds for this project
     // before the container (and the project record) go away.
     state.auth_bridge.stop(&project_id).await;
+
+    // A migration record outliving its project leaks a state file, a staged
+    // payload tar that can run to several GB, and a `:pre-migration-<ts>` tag
+    // holding an entire snapshot image that nothing will ever reference again.
+    crate::commands::migration_commands::purge_migration_artifacts(&project_id).await;
 
     // Stop and remove container if it exists
     if let Some(ref project) = state.projects_store.get(&project_id) {
@@ -174,6 +220,20 @@ pub async fn start_project_container(
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Project, String> {
+    // A migration removes the container and creates its replacement moments
+    // later. Starting in that window finds no container, creates a second one
+    // under the same name, and the migration's own create then fails on the
+    // name conflict — which sends it into an auto-rollback that also cannot
+    // create. The UI already refuses (`canMigrate` gates on the container being
+    // stopped and no run being in flight); this is the same gate on the side
+    // that actually owns the invariant.
+    if crate::commands::migration_commands::is_migrating(&project_id) {
+        return Err(
+            "A container base update is running for this project. Wait for it to finish, then start the project."
+                .to_string(),
+        );
+    }
+
     let mut project = state
         .projects_store
         .get(&project_id)
@@ -204,6 +264,16 @@ pub async fn start_project_container(
             && settings.global_ollama.base_url.as_deref().map(str::trim).unwrap_or("").is_empty()
         {
             return Err("Ollama base URL is required. Set it per-project or in global Ollama settings.".to_string());
+        }
+    }
+
+    if project.backend == Backend::LlamaCpp {
+        let cfg = project.llamacpp_config.as_ref()
+            .ok_or_else(|| "llama.cpp backend selected but no llama.cpp configuration found.".to_string())?;
+        if cfg.base_url.trim().is_empty()
+            && settings.global_llamacpp.base_url.as_deref().map(str::trim).unwrap_or("").is_empty()
+        {
+            return Err("llama.cpp base URL is required. Set it per-project or in global llama.cpp settings.".to_string());
         }
     }
 
@@ -307,13 +377,29 @@ pub async fn start_project_container(
         // AWS config path from global settings
         let aws_config_path = settings.global_aws.aws_config_path.clone();
 
+        // What we would create this container from *right now*: the project's
+        // snapshot when one exists, else the configured base. This is the value
+        // `container_needs_recreation` compares against the container's
+        // `triple-c.create-image` label — the check that replaced the old
+        // tautological one. It is resolved *before* the commit below, so it
+        // describes the pre-commit world the existing container was born into.
+        let snapshot_image = docker::get_snapshot_image_name(&project);
+        let expected_create_image =
+            if docker::image_exists(&snapshot_image).await.unwrap_or(false) {
+                snapshot_image.clone()
+            } else {
+                image_name.clone()
+            };
+
         let container_id = if let Some(existing_id) = docker::find_existing_container(&project).await? {
             // Check if config changed — if so, snapshot + recreate
             let needs_recreate = docker::container_needs_recreation(
                 &existing_id,
                 &project,
+                &expected_create_image,
                 &settings.global_aws,
                 &settings.global_ollama,
+                &settings.global_llamacpp,
                 &settings.global_openai_compatible,
                 settings.global_claude_instructions.as_deref(),
                 &settings.global_custom_env_vars,
@@ -341,29 +427,24 @@ pub async fn start_project_container(
                 docker::remove_legacy_mcp_containers(&project.id).await;
                 docker::remove_legacy_project_network(&project.id).await;
 
-                // Create from snapshot image (preserves system-level changes)
-                let snapshot_image = docker::get_snapshot_image_name(&project);
+                // Create from snapshot image (preserves system-level changes).
+                // Re-resolved after the commit above: when no snapshot existed
+                // before, one does now, and creating from the base instead
+                // would throw away the state that was just saved.
                 let create_image = if docker::image_exists(&snapshot_image).await.unwrap_or(false) {
-                    snapshot_image
+                    snapshot_image.clone()
                 } else {
                     image_name.clone()
                 };
 
-                let new_id = docker::create_container(
+                let new_id = create_container_for_project(
                     &project,
+                    &settings,
                     &docker_socket,
-                    &create_image,
                     aws_config_path.as_deref(),
-                    &settings.global_aws,
-                    &settings.global_ollama,
-                    &settings.global_openai_compatible,
-                    settings.global_claude_instructions.as_deref(),
-                    &settings.global_custom_env_vars,
-                    settings.timezone.as_deref(),
-                    settings.global_claude_code_settings.as_ref(),
-                    settings.default_ssh_key_path.as_deref(),
-                    settings.default_git_user_name.as_deref(),
-                    settings.default_git_user_email.as_deref(),
+                    &create_image,
+                    &image_name,
+                    docker::CreateExtras::default(),
                 ).await?;
                 emit_progress(&app_handle, &project_id, "Starting container...");
                 docker::start_container(&new_id).await?;
@@ -377,30 +458,20 @@ pub async fn start_project_container(
             // Container doesn't exist (first start, or Docker pruned it).
             // Check for a snapshot image first — it preserves system-level
             // changes (apt/pip/npm installs) from the previous session.
-            let snapshot_image = docker::get_snapshot_image_name(&project);
-            let create_image = if docker::image_exists(&snapshot_image).await.unwrap_or(false) {
+            if expected_create_image == snapshot_image {
                 log::info!("Creating container from snapshot image for project {}", project.id);
-                snapshot_image
-            } else {
-                image_name.clone()
-            };
+            }
+            let create_image = expected_create_image.clone();
 
             emit_progress(&app_handle, &project_id, "Creating container...");
-            let new_id = docker::create_container(
+            let new_id = create_container_for_project(
                 &project,
+                &settings,
                 &docker_socket,
-                &create_image,
                 aws_config_path.as_deref(),
-                &settings.global_aws,
-                &settings.global_ollama,
-                &settings.global_openai_compatible,
-                settings.global_claude_instructions.as_deref(),
-                &settings.global_custom_env_vars,
-                settings.timezone.as_deref(),
-                settings.global_claude_code_settings.as_ref(),
-                settings.default_ssh_key_path.as_deref(),
-                settings.default_git_user_name.as_deref(),
-                settings.default_git_user_email.as_deref(),
+                &create_image,
+                &image_name,
+                docker::CreateExtras::default(),
             ).await?;
             emit_progress(&app_handle, &project_id, "Starting container...");
             docker::start_container(&new_id).await?;
@@ -484,10 +555,27 @@ pub async fn rebuild_project_container(
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Project, String> {
+    // Reset deletes both volumes and the snapshot image. Doing that while a
+    // migration is mid-flight pulls the ground out from under it and leaves an
+    // orphan migration record pointing at images that no longer exist.
+    if crate::commands::migration_commands::is_migrating(&project_id) {
+        return Err(
+            "A container base update is running for this project. Wait for it to finish before resetting."
+                .to_string(),
+        );
+    }
+
     let project = state
         .projects_store
         .get(&project_id)
         .ok_or_else(|| format!("Project {} not found", project_id))?;
+
+    // Reset supersedes any migration decision that was still pending: the
+    // snapshot image and both volumes are about to go, so a surviving record
+    // could only describe things that no longer exist — while its
+    // `:pre-migration-<ts>` tag held a whole snapshot image (multiple GB) alive
+    // with nothing left that could ever use it.
+    crate::commands::migration_commands::purge_migration_artifacts(&project_id).await;
 
     // The bridge is bound to the container that is about to be destroyed;
     // `start_project_container` below re-arms it against the new one.
@@ -517,6 +605,13 @@ pub async fn rebuild_project_container(
 /// Called by the frontend after Docker is confirmed available. Projects
 /// marked as Running whose containers are no longer running get reset
 /// to Stopped.
+///
+/// This is also where an interrupted **base-image migration** is picked up.
+/// It runs at startup, which is exactly when a migration that died with the app
+/// needs to be noticed — see
+/// [`crate::commands::migration_commands::reconcile_migration`]. The migration
+/// pass runs over *every* project, not just the Running ones, because a project
+/// whose container was removed mid-migration reports Stopped.
 #[tauri::command]
 pub async fn reconcile_project_statuses(
     app_handle: tauri::AppHandle,
@@ -525,7 +620,31 @@ pub async fn reconcile_project_statuses(
     let projects = state.projects_store.list();
 
     for project in &projects {
-        if project.status != ProjectStatus::Running && project.status != ProjectStatus::Error {
+        crate::commands::migration_commands::reconcile_migration(project, &app_handle).await;
+    }
+
+    for project in &projects {
+        // `Starting` and `Stopping` are in here as a backstop, not because
+        // anything is expected to leave a project in one. They are transitional
+        // states owned by an in-flight command, so a project still wearing one
+        // is a project whose command died — a crash mid-start, or a migration
+        // that bailed out between the stop and the swap. Skipping them, as this
+        // loop used to, meant nothing in the app ever put such a project right:
+        // it sat at "Stopping" with the Start button disabled, permanently.
+        // Docker is the authority either way, so the check below is correct for
+        // all four.
+        if !matches!(
+            project.status,
+            ProjectStatus::Running
+                | ProjectStatus::Error
+                | ProjectStatus::Starting
+                | ProjectStatus::Stopping
+        ) {
+            continue;
+        }
+        // ...but never for a project this process is actively migrating: the
+        // container is legitimately absent for part of that run.
+        if crate::commands::migration_commands::is_migrating(&project.id) {
             continue;
         }
 

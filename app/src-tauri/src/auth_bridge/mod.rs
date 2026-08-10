@@ -56,7 +56,7 @@ use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
 
 use crate::docker::container::is_container_running;
-use crate::docker::exec::exec_oneshot;
+use crate::docker::exec::{exec_oneshot_limited, PROC_NET_OUTPUT_LIMIT};
 use crate::storage::projects_store::ProjectsStore;
 
 use proc_net::PortFamily;
@@ -248,9 +248,14 @@ impl AuthBridgeManager {
     /// project whose bridge is on but whose container is stopped still reports
     /// `enabled: true` with no active ports.
     pub async fn status(&self, project_id: &str, enabled: bool) -> AuthBridgeStatus {
-        let map = self.bridges.lock().await;
-        match map.get(project_id) {
-            Some(bridge) => bridge.state.lock().await.snapshot(enabled),
+        // Clone the per-project handle out and drop the map lock before taking
+        // the state lock. Holding both across the nested await is not a
+        // deadlock — the order is consistently bridges→state — but it puts a
+        // cheap UI status call behind whatever the poller is doing under
+        // `state`, and behind every other project's status call too.
+        let state = self.bridges.lock().await.get(project_id).map(|b| b.state.clone());
+        match state {
+            Some(state) => state.lock().await.snapshot(enabled),
             None => AuthBridgeStatus {
                 enabled,
                 ..AuthBridgeStatus::disabled()
@@ -300,8 +305,16 @@ async fn poll_loop(
         }
 
         // One exec per tick reads both procfs files.
+        //
+        // Absolute path, deliberately: the image's `ENV PATH` puts a
+        // container-writable directory first, so a bare `cat` is a name the
+        // container can rebind to a shim that prints whatever it likes. It
+        // still could not make us bind a *non-loopback* port, but it decides
+        // how much output this loop ingests and how many host ports it is asked
+        // for, which is why the call is also length-capped and the result
+        // count is capped in `reconcile`.
         let cmd = vec![
-            "cat".to_string(),
+            "/usr/bin/cat".to_string(),
             "/proc/net/tcp".to_string(),
             "/proc/net/tcp6".to_string(),
         ];
@@ -309,7 +322,7 @@ async fn poll_loop(
         // bridge or stopping the container doesn't wait out an in-flight poll.
         let discovery = tokio::select! {
             _ = cancel.changed() => break,
-            res = exec_oneshot(&container_id, cmd) => res,
+            res = exec_oneshot_limited(&container_id, cmd, PROC_NET_OUTPUT_LIMIT) => res,
         };
 
         match discovery {
@@ -362,13 +375,70 @@ async fn poll_loop(
 /// Ports Docker already handles for this project. A container port that is
 /// explicitly published has a host-side path already, and the mapping's host
 /// port is a binding we must not fight over.
+///
+/// [`RESERVED_CONTAINER_PORTS`] is folded in as well: those are container
+/// loopback listeners another feature owns and exposes on its own,
+/// authenticated terms.
 fn skipped_ports(project: &crate::models::Project) -> HashSet<u16> {
-    project
+    let mut skip: HashSet<u16> = project
         .port_mappings
         .iter()
         .flat_map(|m| [m.container_port, m.host_port])
-        .collect()
+        .collect();
+    skip.extend(RESERVED_CONTAINER_PORTS.clone());
+    skip.extend(RESERVED_HOST_PORTS.clone());
+    skip
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Reservations
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Container loopback ports another feature owns, which the bridge must leave
+/// alone.
+///
+/// The bridge's contract is "mirror every container loopback listener onto the
+/// same host port, **unauthenticated**" — correct for the throwaway OAuth
+/// callback listeners it exists for, wrong for anything sensitive. The
+/// browser-view pane runs Playwright's dashboard on a container loopback port
+/// in this range and puts a token-gated listener in front of it; mirroring that
+/// port here would quietly publish an ungated second door to full control of a
+/// browser inside the container.
+///
+/// This is a constant rather than a registry the pane populates at runtime, and
+/// that is the point: Playwright's dashboard is a detached daemon that outlives
+/// the app, so after a crash an orphaned viewer can still be listening with
+/// nothing in this process left to remember it. A static range is the only form
+/// of the rule that survives a restart. It must stay in step with
+/// `browser_view::VIEWER_PORTS`, which asserts on it.
+pub const RESERVED_CONTAINER_PORTS: std::ops::RangeInclusive<u16> = 39321..=39328;
+
+/// Host ports another feature binds on demand, which the bridge must not take
+/// first.
+///
+/// These are the browser-view proxy's host ports. The bridge binds *host* ports
+/// named by the container, so a container listening on 47820 would have the
+/// bridge take the host side of that number — and then the browser-view pane,
+/// which only binds when the user opens it, finds its port gone. The two ranges
+/// are separate constants because they guard opposite ends of the same
+/// mechanism: [`RESERVED_CONTAINER_PORTS`] is about not *publishing* something,
+/// this one is about not *stealing* something.
+pub const RESERVED_HOST_PORTS: std::ops::RangeInclusive<u16> =
+    crate::browser_view::proxy::PROXY_PORTS;
+
+/// Most host ports the bridge will hold for one project at a time.
+///
+/// The discovery input is entirely container-controlled, and each
+/// [`PortForward`] costs two listeners plus a task, so without a cap a
+/// container that reports tens of thousands of fake listeners exhausts the
+/// app's file descriptors and the host's ephemeral ports in a single tick. A
+/// real login flow uses one or two ports at a time; anything past a couple of
+/// dozen is not a login.
+const MAX_FORWARDS: usize = 24;
+
+/// Most conflicts recorded at once, so a flood of unbindable ports can't grow
+/// the status payload (and the UI list) without bound either.
+const MAX_CONFLICTS: usize = 32;
 
 /// Bring the set of host listeners in line with what the container is currently
 /// listening on. Returns whether anything the UI cares about changed.
@@ -412,6 +482,20 @@ async fn reconcile(
         if skip.contains(&port) || st.forwards.contains_key(&port) {
             continue;
         }
+        if st.forwards.len() >= MAX_FORWARDS {
+            // Don't even attempt the bind: the point of the cap is to stop the
+            // container dictating how many host resources we take.
+            changed |= note_conflict(
+                &mut st,
+                port,
+                format!(
+                    "The auth bridge is already holding {} ports for this project; \
+                     {} was not bridged.",
+                    MAX_FORWARDS, port
+                ),
+            );
+            continue;
+        }
         match PortForward::bind(container_id.to_string(), port, family).await {
             Ok(forward) => {
                 if st.conflicts.remove(&port).is_some() {
@@ -438,14 +522,30 @@ async fn reconcile(
                 );
                 if st.conflicts.get(&port) != Some(&reason) {
                     log::warn!("Auth bridge: {}", reason);
-                    st.conflicts.insert(port, reason);
-                    changed = true;
                 }
+                changed |= note_conflict(&mut st, port, reason);
             }
         }
     }
 
     changed
+}
+
+/// Record why a port wasn't bridged, up to [`MAX_CONFLICTS`]. Returns whether
+/// the recorded set changed.
+fn note_conflict(state: &mut BridgeState, port: u16, reason: String) -> bool {
+    match state.conflicts.get(&port) {
+        Some(existing) if *existing == reason => false,
+        Some(_) => {
+            state.conflicts.insert(port, reason);
+            true
+        }
+        None if state.conflicts.len() < MAX_CONFLICTS => {
+            state.conflicts.insert(port, reason);
+            true
+        }
+        None => false,
+    }
 }
 
 /// Release every host port held for this project. Awaits each shutdown, so on
@@ -519,7 +619,84 @@ mod tests {
     }
 
     #[test]
-    fn no_mappings_means_nothing_is_skipped() {
-        assert!(skipped_ports(&project_with_mappings(vec![])).is_empty());
+    fn no_mappings_means_nothing_but_the_reserved_ranges_are_skipped() {
+        let skip = skipped_ports(&project_with_mappings(vec![]));
+        assert_eq!(
+            skip.len(),
+            RESERVED_CONTAINER_PORTS.clone().count() + RESERVED_HOST_PORTS.clone().count()
+        );
+    }
+
+    #[test]
+    fn the_browser_views_host_ports_are_never_taken() {
+        // The bridge binds *host* ports chosen by the container, so without
+        // this it can take the port the browser-view proxy will want later —
+        // that pane binds on demand, so first-come would win.
+        let skip = skipped_ports(&project_with_mappings(vec![]));
+        for port in RESERVED_HOST_PORTS {
+            assert!(skip.contains(&port), "host port {} should be reserved", port);
+        }
+        assert!(!skip.contains(&(RESERVED_HOST_PORTS.end() + 1)));
+    }
+
+    #[test]
+    fn conflicts_stop_being_recorded_past_the_cap() {
+        let mut st = BridgeState::default();
+        for port in 1000u16..1000 + MAX_CONFLICTS as u16 {
+            assert!(note_conflict(&mut st, port, "busy".to_string()));
+        }
+        // Past the cap: new ports are dropped rather than growing the status
+        // payload the UI renders.
+        assert!(!note_conflict(&mut st, 9999, "busy".to_string()));
+        assert_eq!(st.conflicts.len(), MAX_CONFLICTS);
+        // A changed reason for a port already tracked still updates.
+        assert!(!note_conflict(&mut st, 1000, "busy".to_string()));
+        assert!(note_conflict(&mut st, 1000, "different".to_string()));
+        assert_eq!(st.conflicts.len(), MAX_CONFLICTS);
+    }
+
+    #[tokio::test]
+    async fn the_host_ports_one_container_can_demand_are_capped() {
+        // The container fully controls the discovery input (it can shim the
+        // probe command), and each forward costs two listeners plus a task —
+        // uncapped, one tick could exhaust the app's fds and the host's
+        // ephemeral ports.
+        let discovered: BTreeMap<u16, PortFamily> =
+            (45000u16..45200).map(|p| (p, PortFamily::V4)).collect();
+        let state = Arc::new(Mutex::new(BridgeState::default()));
+
+        reconcile("no-such-container", &discovered, &HashSet::new(), &state).await;
+
+        let mut st = state.lock().await;
+        assert!(
+            st.forwards.len() <= MAX_FORWARDS,
+            "bridged {} ports, cap is {}",
+            st.forwards.len(),
+            MAX_FORWARDS
+        );
+        assert!(st.conflicts.len() <= MAX_CONFLICTS);
+        // Nowhere near the 200 the "container" asked for.
+        assert!(st.forwards.len() + st.conflicts.len() < discovered.len());
+
+        for (_, mut forward) in std::mem::take(&mut st.forwards) {
+            forward.shutdown().await;
+        }
+    }
+
+    #[test]
+    fn the_browser_views_ports_are_never_mirrored() {
+        // Mirroring these would publish an ungated second door to the
+        // Playwright dashboard, which the pane deliberately keeps behind a
+        // token-checking listener.
+        let skip = skipped_ports(&project_with_mappings(vec![]));
+        for port in RESERVED_CONTAINER_PORTS {
+            assert!(skip.contains(&port), "port {} should be reserved", port);
+        }
+        assert!(!skip.contains(&(RESERVED_CONTAINER_PORTS.end() + 1)));
+
+        // Reservations coexist with Docker's own published ports.
+        let skip = skipped_ports(&project_with_mappings(vec![(3000, 3000)]));
+        assert!(skip.contains(RESERVED_CONTAINER_PORTS.start()));
+        assert!(skip.contains(&3000));
     }
 }

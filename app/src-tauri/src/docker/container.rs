@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use sha2::{Sha256, Digest};
 
 use super::client::get_docker;
-use crate::models::{Backend, BedrockAuthMethod, ClaudeCodeSettings, ContainerInfo, EnvVar, GlobalAwsSettings, GlobalOllamaSettings, GlobalOpenAiCompatibleSettings, PortMapping, Project, ProjectPath};
+use crate::models::{Backend, BedrockAuthMethod, ClaudeCodeSettings, ContainerInfo, EnvVar, GlobalAwsSettings, GlobalLlamaCppSettings, GlobalOllamaSettings, GlobalOpenAiCompatibleSettings, PortMapping, Project, ProjectPath};
 
 const SCHEDULER_INSTRUCTIONS: &str = r#"## Scheduled Tasks
 
@@ -176,6 +176,39 @@ fn build_claude_instructions(
 /// stale-value neutralization pass can never disagree about the spelling.
 pub const CLAUDE_OAUTH_TOKEN_ENV: &str = "CLAUDE_CODE_OAUTH_TOKEN";
 
+/// Every managed env var whose *value* is a credential.
+///
+/// These are the names that must never survive into a snapshot image. A
+/// container's env is visible to `docker inspect`, which is bad but bounded —
+/// the container is recreated whenever the credential rotates, and removed
+/// with the project. An **image**'s env is neither: `docker commit` copies the
+/// container's full environment into `triple-c-snapshot-{id}:latest`, that tag
+/// outlives every container built from it, and nothing about deleting a
+/// keychain entry touches it. A ~1-year OAuth token baked in that way is
+/// readable by `docker image inspect` for as long as the image exists, long
+/// after the user has clicked Revoke.
+///
+/// [`commit_container_snapshot`] therefore blanks all of them at commit time,
+/// and [`scrub_secrets_from_snapshots`] rewrites images committed before that
+/// was true.
+///
+/// Blanked rather than omitted, because Docker's commit endpoint *merges* the
+/// supplied config over the container's rather than replacing it: a key left
+/// out of the list is inherited with its original value, so `KEY=` is the only
+/// way to clear one. That matches how `MANAGED_AUTH_KEYS` already works at
+/// create time, and Claude Code, the AWS SDK and git all treat an empty value
+/// as unset.
+pub const SECRET_ENV_KEYS: &[&str] = &[
+    CLAUDE_OAUTH_TOKEN_ENV,
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "GIT_TOKEN",
+];
+
 /// Env var name prefixes Triple-C manages itself; users cannot set these by hand.
 const RESERVED_ENV_PREFIXES: &[&str] = &["ANTHROPIC_", "AWS_", "GIT_", "HOST_", "TRIPLE_C_"];
 
@@ -194,7 +227,88 @@ const RESERVED_ENV_EXACT: &[&str] = &[
     "MISSION_CONTROL_ENABLED",
     "TRIPLE_C_PERMISSION_MODE",
     CLAUDE_OAUTH_TOKEN_ENV,
+    // The model-alias vars are already covered by the `ANTHROPIC_` prefix
+    // above; they are listed explicitly so that a future narrowing of the
+    // prefix list cannot silently unreserve them, and so `is_reserved_env_key`
+    // reads as the single, complete statement of what Triple-C owns.
+    ANTHROPIC_DEFAULT_OPUS_MODEL,
+    ANTHROPIC_DEFAULT_SONNET_MODEL,
+    ANTHROPIC_DEFAULT_HAIKU_MODEL,
+    ANTHROPIC_DEFAULT_FABLE_MODEL,
 ];
+
+/// Claude Code's model-alias env vars. Each names the concrete model id that
+/// one of the `opus` / `sonnet` / `haiku` / `fable` aliases resolves to.
+///
+/// `ANTHROPIC_DEFAULT_HAIKU_MODEL` is the important one: it is documented as
+/// *"Model ID that the `haiku` alias resolves to, also used for background
+/// functionality"* — conversation titles, summarisation, and other out-of-band
+/// calls. Left unset against a local server, Claude Code sends
+/// Anthropic's own Haiku model id to a server that has never heard of it and
+/// every background call fails, usually silently.
+///
+/// (`ANTHROPIC_SMALL_FAST_MODEL` is the deprecated predecessor of the Haiku
+/// var and is deliberately *not* used.)
+pub const ANTHROPIC_DEFAULT_OPUS_MODEL: &str = "ANTHROPIC_DEFAULT_OPUS_MODEL";
+pub const ANTHROPIC_DEFAULT_SONNET_MODEL: &str = "ANTHROPIC_DEFAULT_SONNET_MODEL";
+pub const ANTHROPIC_DEFAULT_HAIKU_MODEL: &str = "ANTHROPIC_DEFAULT_HAIKU_MODEL";
+pub const ANTHROPIC_DEFAULT_FABLE_MODEL: &str = "ANTHROPIC_DEFAULT_FABLE_MODEL";
+
+/// Resolve the four `ANTHROPIC_DEFAULT_*_MODEL` values for a backend that
+/// points Claude Code at a custom endpoint.
+///
+/// All four aliases fall back to `effective_model` — the backend's configured
+/// model id, already resolved per-project → global. That is the right default:
+/// a local server almost always serves exactly one model, so every alias must
+/// name it or the calls that use an alias (notably the background ones, which
+/// use `haiku`) go to a model the server does not have.
+///
+/// `haiku_override` exists because that is the one alias someone might
+/// legitimately want to point elsewhere — at a second, smaller server-side
+/// model kept for cheap background work. A blank override falls back to
+/// `effective_model` like the others.
+///
+/// Returns pairs in `(name, value)` form; a blank resolved value emits nothing
+/// at all rather than an empty var, so an unconfigured backend is left exactly
+/// as Claude Code found it.
+pub fn compute_model_aliases(
+    effective_model: Option<&str>,
+    haiku_override: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let base = effective_model.map(str::trim).filter(|s| !s.is_empty());
+    let haiku = haiku_override
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or(base);
+
+    let mut out: Vec<(&'static str, String)> = Vec::new();
+    if let Some(m) = base {
+        out.push((ANTHROPIC_DEFAULT_OPUS_MODEL, m.to_string()));
+        out.push((ANTHROPIC_DEFAULT_SONNET_MODEL, m.to_string()));
+    }
+    if let Some(h) = haiku {
+        out.push((ANTHROPIC_DEFAULT_HAIKU_MODEL, h.to_string()));
+    }
+    if let Some(m) = base {
+        out.push((ANTHROPIC_DEFAULT_FABLE_MODEL, m.to_string()));
+    }
+    out
+}
+
+/// The fingerprint contribution of the model aliases, so that changing an
+/// alias (or the model it falls back to) forces a container recreation.
+/// `container_needs_recreation` is label-based and never diffs env, so an
+/// env-only change is invisible without this.
+fn model_alias_fingerprint_part(
+    effective_model: Option<&str>,
+    haiku_override: Option<&str>,
+) -> String {
+    compute_model_aliases(effective_model, haiku_override)
+        .into_iter()
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect::<Vec<_>>()
+        .join(",")
+}
 
 /// Whether `key` is an env var name Triple-C reserves for itself.
 fn is_reserved_env_key(key: &str) -> bool {
@@ -360,7 +474,13 @@ fn compute_bedrock_fingerprint(project: &Project, global_aws: &GlobalAwsSettings
 }
 
 /// Compute a fingerprint for the Ollama configuration so we can detect changes.
-/// Includes the resolved base_url and model_id (per-project blank → global default).
+/// Includes the resolved base_url and model_id (per-project blank → global
+/// default) and the resolved model aliases.
+///
+/// NOTE: adding the alias part changes this hash for every existing Ollama
+/// container, so each will be recreated once on the next start. That is exactly
+/// what is wanted — recreation is the only way to get the new
+/// `ANTHROPIC_DEFAULT_*_MODEL` vars into the container's env.
 fn compute_ollama_fingerprint(project: &Project, global_ollama: &GlobalOllamaSettings) -> String {
     if let Some(ref ollama) = project.ollama_config {
         let effective_url = resolve_with_global(
@@ -371,7 +491,43 @@ fn compute_ollama_fingerprint(project: &Project, global_ollama: &GlobalOllamaSet
             ollama.model_id.as_deref(),
             global_ollama.default_model_id.as_deref(),
         ).unwrap_or("").to_string();
-        let parts = vec![effective_url, effective_model];
+        let aliases = model_alias_fingerprint_part(
+            Some(&effective_model),
+            resolve_with_global(
+                ollama.haiku_model_id.as_deref(),
+                global_ollama.default_haiku_model_id.as_deref(),
+            ),
+        );
+        let parts = vec![effective_url, effective_model, aliases];
+        sha256_hex(&parts.join("|"))
+    } else {
+        String::new()
+    }
+}
+
+/// Compute a fingerprint for the llama.cpp configuration so we can detect
+/// changes. Mirrors [`compute_ollama_fingerprint`].
+fn compute_llamacpp_fingerprint(
+    project: &Project,
+    global_llamacpp: &GlobalLlamaCppSettings,
+) -> String {
+    if let Some(ref cfg) = project.llamacpp_config {
+        let effective_url = resolve_with_global(
+            Some(&cfg.base_url),
+            global_llamacpp.base_url.as_deref(),
+        ).unwrap_or("").to_string();
+        let effective_model = resolve_with_global(
+            cfg.model_id.as_deref(),
+            global_llamacpp.default_model_id.as_deref(),
+        ).unwrap_or("").to_string();
+        let aliases = model_alias_fingerprint_part(
+            Some(&effective_model),
+            resolve_with_global(
+                cfg.haiku_model_id.as_deref(),
+                global_llamacpp.default_haiku_model_id.as_deref(),
+            ),
+        );
+        let parts = vec![effective_url, effective_model, aliases];
         sha256_hex(&parts.join("|"))
     } else {
         String::new()
@@ -393,10 +549,18 @@ fn compute_openai_compatible_fingerprint(
             config.model_id.as_deref(),
             global_openai_compatible.default_model_id.as_deref(),
         ).unwrap_or("").to_string();
+        let aliases = model_alias_fingerprint_part(
+            Some(&effective_model),
+            resolve_with_global(
+                config.haiku_model_id.as_deref(),
+                global_openai_compatible.default_haiku_model_id.as_deref(),
+            ),
+        );
         let parts = vec![
             effective_url,
             config.api_key.as_deref().unwrap_or("").to_string(),
             effective_model,
+            aliases,
         ];
         sha256_hex(&parts.join("|"))
     } else {
@@ -569,13 +733,59 @@ pub async fn find_existing_container(project: &Project) -> Result<Option<String>
     Ok(None)
 }
 
+/// Extra creation inputs that only base-image migration cares about, kept in
+/// one struct so `create_container`'s already-long parameter list does not grow
+/// two more positional arguments that every ordinary call site would have to
+/// pass as `None`-ish placeholders.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CreateExtras<'a> {
+    /// Extra labels merged in last, overriding anything computed here.
+    /// Migration uses this to stamp `triple-c.migration-state=in-progress`.
+    pub extra_labels: &'a [(&'a str, &'a str)],
+}
+
+/// Resolve the value for the `triple-c.base-image-id` label.
+///
+/// This is the **image ID**, not a `RepoDigests` entry: a locally built image
+/// (`triple-c:latest`) and any custom image have no repo digest at all, so a
+/// digest-based lineage would be blank for exactly the users most likely to
+/// change their base.
+///
+/// Two cases:
+/// * creating **from the base** — the base's own current `.Id`;
+/// * creating **from the project's snapshot** — carry forward whatever lineage
+///   the snapshot image already records, because a snapshot is a commit of a
+///   container that itself descended from some base. Committing propagates
+///   container labels onto the image (verified), which is what makes the
+///   carry-forward chain hold across every recreation.
+///
+/// An empty string means "unknown" — a snapshot that predates this label. It is
+/// deliberately *not* the same as "stale"; see [`crate::models::ContainerStaleness::known`].
+async fn resolve_base_image_id(image_name: &str, base_image_name: &str) -> String {
+    if image_name == base_image_name {
+        return super::migration::image_id(base_image_name)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+    }
+    super::migration::image_labels(image_name)
+        .await
+        .get(super::migration::LABEL_BASE_IMAGE_ID)
+        .cloned()
+        .unwrap_or_default()
+}
+
 pub async fn create_container(
     project: &Project,
     docker_socket_path: &str,
     image_name: &str,
+    base_image_name: &str,
+    extras: CreateExtras<'_>,
     aws_config_path: Option<&str>,
     global_aws: &GlobalAwsSettings,
     global_ollama: &GlobalOllamaSettings,
+    global_llamacpp: &GlobalLlamaCppSettings,
     global_openai_compatible: &GlobalOpenAiCompatibleSettings,
     global_claude_instructions: Option<&str>,
     global_custom_env_vars: &[EnvVar],
@@ -701,6 +911,14 @@ pub async fn create_container(
         }
     }
 
+    // ── Custom-endpoint backends ─────────────────────────────────────────────
+    // Ollama, llama.cpp and the OpenAI-Compatible gateway all point Claude Code
+    // at a non-Anthropic server via ANTHROPIC_BASE_URL. Each resolves its model
+    // id here; the model-alias vars are emitted once below, from
+    // `alias_model` / `alias_haiku`, so the three backends cannot drift apart.
+    let mut alias_model: Option<String> = None;
+    let mut alias_haiku: Option<String> = None;
+
     // Ollama configuration
     if project.backend == Backend::Ollama {
         if let Some(ref ollama) = project.ollama_config {
@@ -716,7 +934,44 @@ pub async fn create_container(
                 global_ollama.default_model_id.as_deref(),
             ) {
                 env_vars.push(format!("ANTHROPIC_MODEL={}", model));
+                alias_model = Some(model.to_string());
             }
+            alias_haiku = resolve_with_global(
+                ollama.haiku_model_id.as_deref(),
+                global_ollama.default_haiku_model_id.as_deref(),
+            )
+            .map(str::to_string);
+        }
+    }
+
+    // llama.cpp (llama-server) configuration
+    if project.backend == Backend::LlamaCpp {
+        if let Some(ref cfg) = project.llamacpp_config {
+            if let Some(url) = resolve_with_global(
+                Some(&cfg.base_url),
+                global_llamacpp.base_url.as_deref(),
+            ) {
+                env_vars.push(format!("ANTHROPIC_BASE_URL={}", url));
+            }
+            // llama-server only enforces an Authorization header when it was
+            // started with `--api-key` (default: none), so the value here is
+            // ignored in the common case. Claude Code still refuses to run
+            // against a custom base URL with no credential at all, so a
+            // placeholder is always sent — same trick as the Ollama branch
+            // above, which sends the literal "ollama".
+            env_vars.push("ANTHROPIC_AUTH_TOKEN=llama.cpp".to_string());
+            if let Some(model) = resolve_with_global(
+                cfg.model_id.as_deref(),
+                global_llamacpp.default_model_id.as_deref(),
+            ) {
+                env_vars.push(format!("ANTHROPIC_MODEL={}", model));
+                alias_model = Some(model.to_string());
+            }
+            alias_haiku = resolve_with_global(
+                cfg.haiku_model_id.as_deref(),
+                global_llamacpp.default_haiku_model_id.as_deref(),
+            )
+            .map(str::to_string);
         }
     }
 
@@ -737,7 +992,27 @@ pub async fn create_container(
                 global_openai_compatible.default_model_id.as_deref(),
             ) {
                 env_vars.push(format!("ANTHROPIC_MODEL={}", model));
+                alias_model = Some(model.to_string());
             }
+            alias_haiku = resolve_with_global(
+                config.haiku_model_id.as_deref(),
+                global_openai_compatible.default_haiku_model_id.as_deref(),
+            )
+            .map(str::to_string);
+        }
+    }
+
+    // Model aliases — the fix for background Claude Code calls against a local
+    // server. Only for backends that talk to a custom endpoint: Anthropic and
+    // Bedrock reach servers that really do host the Anthropic model ids, so
+    // they keep Claude Code's own defaults. Anything not emitted here is
+    // blanked by the MANAGED_AUTH_KEYS pass below, so switching *away* from a
+    // custom endpoint clears the aliases out of the snapshot image too.
+    if project.backend.uses_custom_endpoint() {
+        for (key, value) in
+            compute_model_aliases(alias_model.as_deref(), alias_haiku.as_deref())
+        {
+            env_vars.push(format!("{}={}", key, value));
         }
     }
 
@@ -756,11 +1031,16 @@ pub async fn create_container(
 
     // ── Neutralize stale backend auth env vars ──────────────────────────────
     // When a project switches backends (e.g. Bedrock → Anthropic) the container
-    // is recreated *from a snapshot image* committed off the previous container.
-    // `docker commit` always bakes the previous container's full ENV into that
-    // image, and the commit API cannot strip it. So any auth var set under the
-    // old backend (e.g. CLAUDE_CODE_USE_BEDROCK=1, AWS_*) survives in the image
-    // ENV and stays active unless we explicitly override it at create time.
+    // is recreated *from a snapshot image* committed off the previous container,
+    // and `docker commit` copies that container's full ENV into the image. So
+    // any auth var set under the old backend (e.g. CLAUDE_CODE_USE_BEDROCK=1,
+    // AWS_PROFILE, a model alias) survives in the image ENV and stays active
+    // unless we explicitly override it at create time.
+    //
+    // This pass is about *staleness*, not secrecy. It fixes the container it is
+    // building and does nothing to the image, so it is not — and never was —
+    // a defence against a credential baked into a snapshot. That is
+    // `commit_container_snapshot`'s job, via SECRET_ENV_KEYS.
     // Create-time env takes precedence over image ENV, so we set every managed
     // auth key the *current* backend did NOT set to an empty value, clearing the
     // stale baked-in one.
@@ -778,6 +1058,15 @@ pub async fn create_container(
         "ANTHROPIC_MODEL",
         "DISABLE_PROMPT_CACHING",
         "ANTHROPIC_BEDROCK_SERVICE_TIER",
+        // Switching from a custom-endpoint backend to Anthropic or Bedrock must
+        // *clear* the aliases, not merely stop setting them: a stale
+        // ANTHROPIC_DEFAULT_HAIKU_MODEL baked into the snapshot image would
+        // keep pointing background calls at a model id the new backend has
+        // never heard of.
+        ANTHROPIC_DEFAULT_OPUS_MODEL,
+        ANTHROPIC_DEFAULT_SONNET_MODEL,
+        ANTHROPIC_DEFAULT_HAIKU_MODEL,
+        ANTHROPIC_DEFAULT_FABLE_MODEL,
         // Revoking the shared token, opting a project out, or switching away
         // from the Anthropic backend must *clear* this, not merely stop setting
         // it — otherwise the value committed into the snapshot image keeps
@@ -1004,6 +1293,7 @@ pub async fn create_container(
     labels.insert("triple-c.paths-fingerprint".to_string(), compute_paths_fingerprint(&project.paths));
     labels.insert("triple-c.bedrock-fingerprint".to_string(), compute_bedrock_fingerprint(project, global_aws));
     labels.insert("triple-c.ollama-fingerprint".to_string(), compute_ollama_fingerprint(project, global_ollama));
+    labels.insert("triple-c.llamacpp-fingerprint".to_string(), compute_llamacpp_fingerprint(project, global_llamacpp));
     labels.insert("triple-c.openai-compatible-fingerprint".to_string(), compute_openai_compatible_fingerprint(project, global_openai_compatible));
     labels.insert("triple-c.ports-fingerprint".to_string(), compute_ports_fingerprint(&project.port_mappings));
     labels.insert("triple-c.image".to_string(), image_name.to_string());
@@ -1024,6 +1314,51 @@ pub async fn create_container(
     // anything on the host via `docker inspect`.
     labels.insert("triple-c.claude-token-version".to_string(),
         shared_claude.as_ref().map(|(_, v)| v.clone()).unwrap_or_default());
+
+    // ── Base-image lineage ───────────────────────────────────────────────────
+    // `triple-c.create-image` is what this container was actually created
+    // from — the snapshot when one exists, otherwise the configured base. It is
+    // what `container_needs_recreation` compares against; the older
+    // `triple-c.image` label recorded the same thing but was compared against
+    // the container's *own* image, which is where it came from, so that check
+    // was a tautology and never fired. `triple-c.image` is still written for
+    // continuity with existing containers but is no longer compared.
+    //
+    // `triple-c.base-image-id` records the lineage — see `resolve_base_image_id`.
+    //
+    // All three (plus the migration marker) are written **unconditionally**,
+    // even when empty. Docker merges an image's labels into a container's at
+    // creation, and `docker commit` copies container labels onto the snapshot
+    // image, so a value stamped once would otherwise ride the snapshot into
+    // every future container forever. Writing the key explicitly overrides the
+    // inherited one — the same defence MANAGED_AUTH_KEYS applies to env.
+    labels.insert(
+        super::migration::LABEL_CREATE_IMAGE.to_string(),
+        image_name.to_string(),
+    );
+    labels.insert(
+        super::migration::LABEL_BASE_IMAGE_ID.to_string(),
+        resolve_base_image_id(image_name, base_image_name).await,
+    );
+    labels.insert(
+        super::migration::LABEL_MIGRATION_STATE.to_string(),
+        String::new(),
+    );
+    // Same defence, applied to the legacy MCP shim — and here it fixes a real,
+    // observed bug rather than pre-empting one. `container_needs_recreation`
+    // recreates any container carrying a non-empty `triple-c.mcp-fingerprint`,
+    // but nothing has written that label since the MCP feature was removed. It
+    // survives only by *inheritance* from a snapshot image committed by an
+    // older build (one such image was found on this host with a non-empty
+    // value), and every recreation re-commits it — so the shim can never
+    // terminate and the project is recreated on every single start. Writing it
+    // explicitly empty makes the shim fire exactly once, which is what it was
+    // always meant to do.
+    labels.insert("triple-c.mcp-fingerprint".to_string(), String::new());
+
+    for (key, value) in extras.extra_labels {
+        labels.insert((*key).to_string(), (*value).to_string());
+    }
 
     let host_config = HostConfig {
         mounts: Some(mounts),
@@ -1217,14 +1552,29 @@ chmod 600 "$HOME/.aws/credentials""#;
 /// changes (apt/pip/npm installs, ~/.claude.json, etc.) survive container
 /// removal.
 ///
-/// NOTE: `docker commit` always bakes the *running container's* full ENV into
-/// the resulting image — passing an empty Config here does NOT strip it, and
-/// the commit API gives no way to remove env vars. As a result auth vars (e.g.
-/// CLAUDE_CODE_USE_BEDROCK, AWS_*, CLAUDE_CODE_OAUTH_TOKEN) are present in this
-/// snapshot image's ENV — this image is local and per-project, never pushed.
-/// `create_container` defends against that by explicitly overriding every
-/// managed auth key for the active backend (see MANAGED_AUTH_KEYS), so a
-/// backend switch does not inherit the previous backend's stale credentials.
+/// ## Why this passes a Config instead of `Default::default()`
+///
+/// `docker commit` bakes the *running container's* full ENV into the resulting
+/// image. An earlier version of this function passed an empty `Config` and a
+/// comment asserting that the API "gives no way to remove env vars", with
+/// `MANAGED_AUTH_KEYS` cited as the defence. That was wrong on both counts.
+///
+/// `MANAGED_AUTH_KEYS` defends the *next container* — it overrides the image's
+/// stale value at create time — and does nothing whatsoever about the value
+/// sitting in the image. So `docker image inspect triple-c-snapshot-<id>:latest
+/// --format '{{json .Config.Env}}'` returned the shared ~1-year OAuth token,
+/// and kept returning it after the user revoked the token, because
+/// `clear_claude_token` only deletes a keychain entry.
+///
+/// And the API does allow it. Verified against Engine 29.6: the config in the
+/// commit body is **merged over** the container's config, key by key for `Env`,
+/// with unmentioned fields (`Cmd`, `WorkingDir`, `Labels`, …) inherited
+/// untouched. A key cannot be *dropped*, but it can be set — so every name in
+/// [`SECRET_ENV_KEYS`] is committed as `KEY=`, which is exactly the "empty
+/// means unset" convention the rest of the auth plumbing already uses.
+///
+/// Non-secret env (PATH, TZ, model aliases, instructions) is inherited as
+/// before, so nothing about the snapshot's behaviour changes.
 pub async fn commit_container_snapshot(container_id: &str, project: &Project) -> Result<(), String> {
     let docker = get_docker()?;
     let image_name = get_snapshot_image_name(project);
@@ -1243,8 +1593,8 @@ pub async fn commit_container_snapshot(container_id: &str, project: &Project) ->
         ..Default::default()
     };
 
-    // Empty config — no env vars / cmd baked in
     let config = Config::<String> {
+        env: Some(blanked_secret_env()),
         ..Default::default()
     };
 
@@ -1255,6 +1605,258 @@ pub async fn commit_container_snapshot(container_id: &str, project: &Project) ->
 
     log::info!("Committed container {} as snapshot {}:{}", container_id, repo, tag);
     Ok(())
+}
+
+/// `KEY=` for every name in [`SECRET_ENV_KEYS`] — the env override handed to
+/// `docker commit` so no credential value reaches an image.
+fn blanked_secret_env() -> Vec<String> {
+    SECRET_ENV_KEYS
+        .iter()
+        .map(|key| format!("{}=", key))
+        .collect()
+}
+
+/// Whether `env` (an image's `Config.Env`) holds a non-empty value for any
+/// name in [`SECRET_ENV_KEYS`].
+fn env_holds_a_secret(env: &[String]) -> bool {
+    env.iter().any(|entry| {
+        let Some((key, value)) = entry.split_once('=') else {
+            return false;
+        };
+        !value.is_empty() && SECRET_ENV_KEYS.contains(&key)
+    })
+}
+
+/// Outcome of [`scrub_secrets_from_snapshots`], so callers can tell the user
+/// what actually happened rather than guessing.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct SnapshotScrubReport {
+    /// Snapshot images that were found to hold a credential and were rewritten.
+    pub scrubbed: Vec<String>,
+    /// Snapshot images that hold a credential and could **not** be rewritten,
+    /// each with the reason. A non-empty list means the tag every future
+    /// container is built from still carries the credential.
+    pub failed: Vec<(String, String)>,
+    /// Tags that *were* rewritten, but whose superseded image object could not
+    /// be deleted — almost always because a container is still running off it.
+    ///
+    /// Much weaker than `failed`, and normal rather than exceptional. The tag
+    /// is clean, so nothing new is built with the credential; what remains is
+    /// an untagged image whose config is still readable by id, for exactly as
+    /// long as the container using it survives — and that container already
+    /// holds the same value in its own env, so it is not a new exposure. The
+    /// rotation-id label mismatch recreates it on the next start, after which
+    /// an image prune collects the leftover.
+    pub superseded_retained: Vec<String>,
+    /// Set when the image list itself could not be read (Docker not running,
+    /// no permission). Nothing was scrubbed and nothing is known.
+    pub unavailable: Option<String>,
+}
+
+impl SnapshotScrubReport {
+    /// True when a credential is known to still be reachable through something
+    /// that will keep being used — a tag, or an unknown state.
+    pub fn left_something_behind(&self) -> bool {
+        !self.failed.is_empty() || self.unavailable.is_some()
+    }
+}
+
+/// Rewrite every `triple-c-snapshot-*` image whose ENV still carries a
+/// credential, blanking the values in place.
+///
+/// Revoking a shared token has to mean something. Deleting the keychain entry
+/// stops *new* containers getting it, but images committed before
+/// [`commit_container_snapshot`] learned to strip secrets still have the token
+/// in their config, and those images are the ones every future container of
+/// that project is built from. This is the cleanup for them.
+///
+/// Mechanics: create (do not start) a throwaway container from the image, then
+/// commit it straight back over the same tag with the secret keys blanked. The
+/// new image shares every layer with the old one, so this costs no meaningful
+/// disk and preserves the project's installed packages exactly. The superseded
+/// image is then removed by id; if Docker refuses (some storage drivers will
+/// not delete an image that is a parent of another), the report says so rather
+/// than pretending the secret is gone.
+///
+/// Never fails the caller: an unreachable Docker engine is reported in the
+/// return value, because the keychain deletion that precedes it must still
+/// stand.
+pub async fn scrub_secrets_from_snapshots() -> SnapshotScrubReport {
+    use bollard::image::ListImagesOptions;
+
+    let mut report = SnapshotScrubReport::default();
+
+    let docker = match get_docker() {
+        Ok(d) => d,
+        Err(e) => {
+            report.unavailable = Some(e);
+            return report;
+        }
+    };
+
+    let filters: HashMap<String, Vec<String>> = HashMap::from([(
+        "reference".to_string(),
+        vec!["triple-c-snapshot-*".to_string()],
+    )]);
+    let images = match docker
+        .list_images(Some(ListImagesOptions {
+            filters,
+            ..Default::default()
+        }))
+        .await
+    {
+        Ok(images) => images,
+        Err(e) => {
+            report.unavailable = Some(format!("Could not list snapshot images: {}", e));
+            return report;
+        }
+    };
+
+    for summary in images {
+        // `list_images` does not return Config, so inspect each candidate.
+        let details = match docker.inspect_image(&summary.id).await {
+            Ok(d) => d,
+            Err(e) => {
+                report
+                    .failed
+                    .push((summary.id.clone(), format!("could not inspect: {}", e)));
+                continue;
+            }
+        };
+        let env = details
+            .config
+            .as_ref()
+            .and_then(|c| c.env.clone())
+            .unwrap_or_default();
+        if !env_holds_a_secret(&env) {
+            continue;
+        }
+
+        if summary.repo_tags.is_empty() {
+            // The reference filter should make this impossible; if it happens,
+            // say so rather than silently leaving a credential in place.
+            report.failed.push((
+                summary.id.clone(),
+                "an untagged snapshot image holds a credential and cannot be rewritten"
+                    .to_string(),
+            ));
+            continue;
+        }
+
+        // Rewrite every tag this image answers to, so an old tag cannot keep
+        // serving the un-scrubbed config.
+        let mut all_tags_rewritten = true;
+        for tag in summary.repo_tags.iter() {
+            let (repo, tag_part) = match tag.rsplit_once(':') {
+                Some((r, t)) => (r.to_string(), t.to_string()),
+                None => (tag.clone(), "latest".to_string()),
+            };
+            if let Err(e) = rewrite_image_without_secrets(&docker, tag, &repo, &tag_part).await {
+                all_tags_rewritten = false;
+                report.failed.push((tag.clone(), e));
+            } else {
+                report.scrubbed.push(tag.clone());
+            }
+        }
+
+        // Drop the superseded image so its config stops being inspectable.
+        // Best effort by design — see the doc comment.
+        if all_tags_rewritten {
+            if let Err(e) = docker
+                .remove_image(
+                    &summary.id,
+                    Some(RemoveImageOptions {
+                        force: false,
+                        noprune: false,
+                    }),
+                    None,
+                )
+                .await
+            {
+                // Expected whenever the project's container is still around:
+                // Docker will not delete an image a container was created
+                // from. Not a failure of the scrub — see `superseded_retained`.
+                log::info!(
+                    "Scrubbed snapshot {} but kept the superseded image {}: {}",
+                    summary.repo_tags.join(", "),
+                    summary.id,
+                    e
+                );
+                report
+                    .superseded_retained
+                    .push(summary.repo_tags.join(", "));
+            }
+        }
+    }
+
+    report
+}
+
+/// Commit `source_image` back over `repo:tag` with [`SECRET_ENV_KEYS`] blanked.
+async fn rewrite_image_without_secrets(
+    docker: &bollard::Docker,
+    source_image: &str,
+    repo: &str,
+    tag: &str,
+) -> Result<(), String> {
+    let scratch_name = format!("triple-c-scrub-{}", uuid::Uuid::new_v4().simple());
+
+    let created = docker
+        .create_container(
+            Some(CreateContainerOptions {
+                name: scratch_name.clone(),
+                ..Default::default()
+            }),
+            Config::<String> {
+                image: Some(source_image.to_string()),
+                // Deliberately nothing else. The container is never started;
+                // its only job is to be a config to commit from, and every
+                // field left unset here is inherited from the image and
+                // inherited back out by the commit. Setting `cmd` to a
+                // placeholder — the obvious way to satisfy an image with no
+                // CMD — would write that placeholder into the rewritten
+                // snapshot. The base image has an ENTRYPOINT, so `create`
+                // needs no command; an image with neither fails here and is
+                // reported rather than silently mangled.
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|e| format!("could not create a scratch container: {}", e))?;
+
+    let commit = docker
+        .commit_container(
+            CommitContainerOptions {
+                container: created.id.clone(),
+                repo: repo.to_string(),
+                tag: tag.to_string(),
+                // Nothing is running; pausing a created container is an error.
+                pause: false,
+                ..Default::default()
+            },
+            Config::<String> {
+                env: Some(blanked_secret_env()),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|e| format!("could not re-commit without the credential: {}", e));
+
+    // Remove the scratch container whatever happened to the commit.
+    if let Err(e) = docker
+        .remove_container(
+            &created.id,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await
+    {
+        log::warn!("Could not remove scratch container {}: {}", scratch_name, e);
+    }
+
+    commit.map(|_| ())
 }
 
 /// Remove the snapshot image for a project (used on Reset / project removal).
@@ -1299,8 +1901,10 @@ pub async fn remove_project_volumes(project: &Project) -> Result<(), String> {
 pub async fn container_needs_recreation(
     container_id: &str,
     project: &Project,
+    expected_create_image: &str,
     global_aws: &GlobalAwsSettings,
     global_ollama: &GlobalOllamaSettings,
+    global_llamacpp: &GlobalLlamaCppSettings,
     global_openai_compatible: &GlobalOpenAiCompatibleSettings,
     global_claude_instructions: Option<&str>,
     global_custom_env_vars: &[EnvVar],
@@ -1387,6 +1991,17 @@ pub async fn container_needs_recreation(
         return Ok(true);
     }
 
+    // ── llama.cpp config fingerprint ─────────────────────────────────────
+    // A missing label means the container predates the llama.cpp backend, in
+    // which case the expected fingerprint is also "" (no llamacpp_config) and
+    // nothing is recreated needlessly.
+    let expected_llamacpp_fp = compute_llamacpp_fingerprint(project, global_llamacpp);
+    let container_llamacpp_fp = get_label("triple-c.llamacpp-fingerprint").unwrap_or_default();
+    if container_llamacpp_fp != expected_llamacpp_fp {
+        log::info!("llama.cpp config mismatch");
+        return Ok(true);
+    }
+
     // ── OpenAI Compatible config fingerprint ────────────────────────────
     let expected_oai_fp = compute_openai_compatible_fingerprint(project, global_openai_compatible);
     let container_oai_fp = get_label("triple-c.openai-compatible-fingerprint").unwrap_or_default();
@@ -1395,24 +2010,48 @@ pub async fn container_needs_recreation(
         return Ok(true);
     }
 
-    // ── Image ────────────────────────────────────────────────────────────
-    // The image label is set at creation time; if the user changed the
-    // configured image we need to recreate.  We only compare when the
-    // label exists (containers created before this change won't have it).
-    if let Some(container_image) = get_label("triple-c.image") {
-        // The caller doesn't pass the image name, but we can read the
-        // container's actual image from Docker inspect.
-        let actual_image = info
-            .config
-            .as_ref()
-            .and_then(|c| c.image.as_ref());
-        if let Some(actual) = actual_image {
-            if *actual != container_image {
-                log::info!("Image mismatch (actual={:?}, label={:?})", actual, container_image);
-                return Ok(true);
-            }
+    // ── Create image ─────────────────────────────────────────────────────
+    // What this container was created from, against what we would create it
+    // from *now* — the caller resolves that (snapshot-if-it-exists, else the
+    // configured base) and passes it in as `expected_create_image`, preserving
+    // exactly today's semantics.
+    //
+    // This replaces a check that compared the container's actual image against
+    // the `triple-c.image` label. `create_container` wrote that label from the
+    // very image it created from, so the two could never differ: it was a
+    // tautology that never once fired, and it is the reason a project stayed
+    // pinned to its own snapshot lineage forever.
+    //
+    // A missing `triple-c.create-image` label means the container predates this
+    // fix — unknown, so leave it alone rather than churn every existing
+    // container on first launch after an update.
+    if let Some(container_create_image) = get_label(crate::docker::migration::LABEL_CREATE_IMAGE) {
+        if container_create_image != expected_create_image {
+            log::info!(
+                "Create-image mismatch (container={:?}, expected={:?})",
+                container_create_image,
+                expected_create_image
+            );
+            return Ok(true);
         }
     }
+
+    // ── Base image id: deliberately NOT compared here ────────────────────
+    // This departs from the CLAUDE.md rule that new container state gets a
+    // label and a comparison, and the departure is the point.
+    //
+    // `triple-c.base-image-id` records which base a container's lineage
+    // descends from. Comparing it here would mean that publishing a new base
+    // image silently recreates every project on next start — and, because
+    // `expected_create_image` is the snapshot whenever one exists, it would
+    // recreate them *from their own snapshot*: pure churn, on the old base,
+    // with no benefit. Worse, it would consume the very signal ("this project
+    // is behind the base") that is supposed to prompt the user, without
+    // actually migrating anything.
+    //
+    // Staleness is therefore a *surfaced* signal gating an explicit user
+    // action — `get_container_staleness` / `migrate_project_to_base` — not an
+    // automatic recreation trigger.
 
     // ── Timezone ─────────────────────────────────────────────────────────
     let expected_tz = timezone.unwrap_or("");
@@ -1472,8 +2111,10 @@ pub async fn container_needs_recreation(
     // re-acquired (rotated), revoked, or opted out of. Both "" means no token
     // is in play, which is also what a container predating this feature reports
     // — so existing installs are not recreated until a token actually exists.
-    // Recreation is the only way to change container env, and it is also what
-    // makes MANAGED_AUTH_KEYS blank a revoked token out of the snapshot image.
+    // Recreation is the only way to change a container's env, so it is the only
+    // way a revoked token stops being live in one. It does *not* clean the
+    // snapshot image — `clear_claude_token` calls
+    // `scrub_secrets_from_snapshots` for that.
     let expected_claude_token = claude_token_label(project);
     let container_claude_token = get_label("triple-c.claude-token-version").unwrap_or_default();
     if container_claude_token != expected_claude_token {
@@ -1634,4 +2275,311 @@ pub async fn list_sibling_containers() -> Result<Vec<ContainerSummary>, String> 
         .collect();
 
     Ok(siblings)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const OPUS: &str = ANTHROPIC_DEFAULT_OPUS_MODEL;
+    const SONNET: &str = ANTHROPIC_DEFAULT_SONNET_MODEL;
+    const HAIKU: &str = ANTHROPIC_DEFAULT_HAIKU_MODEL;
+    const FABLE: &str = ANTHROPIC_DEFAULT_FABLE_MODEL;
+
+    fn aliases(model: Option<&str>, haiku: Option<&str>) -> Vec<(&'static str, String)> {
+        compute_model_aliases(model, haiku)
+    }
+
+    #[test]
+    fn all_four_aliases_fall_back_to_the_configured_model() {
+        assert_eq!(
+            aliases(Some("qwen3.5:27b"), None),
+            vec![
+                (OPUS, "qwen3.5:27b".to_string()),
+                (SONNET, "qwen3.5:27b".to_string()),
+                (HAIKU, "qwen3.5:27b".to_string()),
+                (FABLE, "qwen3.5:27b".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_haiku_override_replaces_only_the_haiku_alias() {
+        let got = aliases(Some("big-model"), Some("small-model"));
+        assert_eq!(
+            got,
+            vec![
+                (OPUS, "big-model".to_string()),
+                (SONNET, "big-model".to_string()),
+                (HAIKU, "small-model".to_string()),
+                (FABLE, "big-model".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_blank_or_whitespace_haiku_override_falls_back_to_the_model() {
+        for override_value in [Some(""), Some("   "), None] {
+            let got = aliases(Some("m"), override_value);
+            assert_eq!(
+                got.iter().find(|(k, _)| *k == HAIKU).map(|(_, v)| v.as_str()),
+                Some("m"),
+                "override {:?} should fall back to the model id",
+                override_value
+            );
+        }
+    }
+
+    #[test]
+    fn values_are_trimmed() {
+        assert_eq!(
+            aliases(Some("  m  "), Some("  h  ")),
+            vec![
+                (OPUS, "m".to_string()),
+                (SONNET, "m".to_string()),
+                (HAIKU, "h".to_string()),
+                (FABLE, "m".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn no_model_and_no_override_emits_nothing() {
+        // Nothing to point the aliases at — leave Claude Code's defaults alone
+        // rather than injecting empty vars.
+        assert!(aliases(None, None).is_empty());
+        assert!(aliases(Some(""), Some("  ")).is_empty());
+    }
+
+    #[test]
+    fn a_haiku_override_alone_still_fixes_background_calls() {
+        // No model id configured, but the user pointed haiku somewhere: emit
+        // just that one, because it is the alias background work uses.
+        assert_eq!(
+            aliases(None, Some("small-model")),
+            vec![(HAIKU, "small-model".to_string())]
+        );
+    }
+
+    #[test]
+    fn only_custom_endpoint_backends_get_aliases() {
+        assert!(!Backend::Anthropic.uses_custom_endpoint());
+        assert!(!Backend::Bedrock.uses_custom_endpoint());
+        assert!(Backend::Ollama.uses_custom_endpoint());
+        assert!(Backend::LlamaCpp.uses_custom_endpoint());
+        assert!(Backend::OpenAiCompatible.uses_custom_endpoint());
+    }
+
+    #[test]
+    fn every_alias_var_is_reserved_and_managed() {
+        for key in [OPUS, SONNET, HAIKU, FABLE] {
+            assert!(is_reserved_env_key(key), "{} must be reserved", key);
+            assert!(
+                is_reserved_env_key(&key.to_lowercase()),
+                "{} must be reserved case-insensitively",
+                key
+            );
+        }
+        // A user-set alias must never survive into the container env.
+        let fp = compute_env_fingerprint(&[EnvVar {
+            key: HAIKU.to_string(),
+            value: "sneaky".to_string(),
+        }]);
+        assert_eq!(fp, "");
+    }
+
+    #[test]
+    fn the_deprecated_small_fast_model_var_is_never_emitted() {
+        let rendered: Vec<String> = aliases(Some("m"), Some("h"))
+            .into_iter()
+            .map(|(k, _)| k.to_string())
+            .collect();
+        assert!(!rendered.iter().any(|k| k == "ANTHROPIC_SMALL_FAST_MODEL"));
+    }
+
+    #[test]
+    fn the_alias_fingerprint_tracks_both_the_model_and_the_override() {
+        let base = model_alias_fingerprint_part(Some("m"), None);
+        assert_eq!(base, model_alias_fingerprint_part(Some("m"), Some("")));
+        assert_ne!(base, model_alias_fingerprint_part(Some("m2"), None));
+        assert_ne!(base, model_alias_fingerprint_part(Some("m"), Some("h")));
+        assert_eq!(model_alias_fingerprint_part(None, None), "");
+    }
+
+    fn project_with_llamacpp(model: Option<&str>, haiku: Option<&str>) -> Project {
+        let mut p = Project::new("t".to_string(), Vec::new());
+        p.backend = Backend::LlamaCpp;
+        p.llamacpp_config = Some(crate::models::LlamaCppConfig {
+            base_url: "http://host.docker.internal:8080".to_string(),
+            model_id: model.map(str::to_string),
+            haiku_model_id: haiku.map(str::to_string),
+        });
+        p
+    }
+
+    #[test]
+    fn llamacpp_fingerprint_changes_when_the_haiku_override_changes() {
+        let g = GlobalLlamaCppSettings::default();
+        let a = compute_llamacpp_fingerprint(&project_with_llamacpp(Some("m"), None), &g);
+        let b = compute_llamacpp_fingerprint(&project_with_llamacpp(Some("m"), Some("h")), &g);
+        assert_ne!(a, b, "the haiku override must force a container recreation");
+
+        // No config at all -> empty, so projects on other backends are not
+        // flagged for recreation by this fingerprint.
+        let plain = Project::new("t".to_string(), Vec::new());
+        assert_eq!(compute_llamacpp_fingerprint(&plain, &g), "");
+    }
+
+    #[test]
+    fn llamacpp_global_defaults_fill_in_for_blank_per_project_fields() {
+        let g = GlobalLlamaCppSettings {
+            base_url: Some("http://elsewhere:8080".to_string()),
+            default_model_id: Some("global-model".to_string()),
+            default_haiku_model_id: Some("global-haiku".to_string()),
+        };
+        // The per-project base URL is set in the fixture, so only the model and
+        // haiku fields fall through to the globals. Filling them in from the
+        // globals must be indistinguishable from setting them per-project.
+        let with_global = compute_llamacpp_fingerprint(&project_with_llamacpp(None, None), &g);
+        let explicit = compute_llamacpp_fingerprint(
+            &project_with_llamacpp(Some("global-model"), Some("global-haiku")),
+            &GlobalLlamaCppSettings::default(),
+        );
+        assert_eq!(with_global, explicit);
+        // …and changing a global must change the fingerprint, so a global-only
+        // edit still forces a recreation.
+        assert_ne!(
+            with_global,
+            compute_llamacpp_fingerprint(
+                &project_with_llamacpp(None, None),
+                &GlobalLlamaCppSettings {
+                    default_haiku_model_id: Some("other-haiku".to_string()),
+                    ..g.clone()
+                },
+            )
+        );
+        assert_eq!(
+            resolve_with_global(None, g.default_haiku_model_id.as_deref()),
+            Some("global-haiku")
+        );
+        assert_eq!(
+            resolve_with_global(Some("  "), g.default_model_id.as_deref()),
+            Some("global-model")
+        );
+    }
+
+    #[test]
+    fn backend_serde_round_trips_llamacpp_and_accepts_legacy_spellings() {
+        assert_eq!(
+            serde_json::to_string(&Backend::LlamaCpp).unwrap(),
+            "\"llama_cpp\""
+        );
+        for spelling in ["\"llama_cpp\"", "\"llamacpp\"", "\"llama-cpp\"", "\"llama.cpp\""] {
+            let parsed: Backend = serde_json::from_str(spelling).unwrap();
+            assert_eq!(parsed, Backend::LlamaCpp, "failed for {}", spelling);
+        }
+    }
+
+    #[test]
+    fn a_project_json_without_llamacpp_config_still_deserialises() {
+        // `projects.json` written by an older build has no llamacpp_config key.
+        let json = serde_json::json!({
+            "id": "p1",
+            "name": "old",
+            "paths": [],
+            "container_id": null,
+            "status": "stopped",
+            "backend": "ollama",
+            "bedrock_config": null,
+            "ollama_config": { "base_url": "http://x:11434", "model_id": "m" },
+            "openai_compatible_config": null,
+            "allow_docker_access": false,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        });
+        let p: Project = serde_json::from_value(json).unwrap();
+        assert!(p.llamacpp_config.is_none());
+        // The new per-backend haiku override also defaults cleanly.
+        assert!(p.ollama_config.unwrap().haiku_model_id.is_none());
+    }
+    // ── Snapshot secret stripping ────────────────────────────────────────
+    // The bug these cover: `docker commit` copies the container's whole
+    // environment into `triple-c-snapshot-{id}:latest`, that image outlives
+    // every container built from it, and revoking the shared token used to
+    // touch only the keychain — so `docker image inspect` kept returning a
+    // live ~1-year OAuth credential indefinitely.
+
+    #[test]
+    fn the_commit_override_blanks_every_credential_bearing_key() {
+        let blanked = blanked_secret_env();
+        assert_eq!(blanked.len(), SECRET_ENV_KEYS.len());
+        for key in SECRET_ENV_KEYS {
+            assert!(
+                blanked.contains(&format!("{}=", key)),
+                "{} is not blanked at commit time",
+                key
+            );
+        }
+        // Blanked, never omitted: the commit endpoint merges this over the
+        // container's env key by key, so a name left out is inherited with its
+        // original value.
+        assert!(blanked.iter().all(|e| e.ends_with('=')));
+    }
+
+    #[test]
+    fn the_shared_claude_token_is_one_of_the_stripped_keys() {
+        assert!(SECRET_ENV_KEYS.contains(&CLAUDE_OAUTH_TOKEN_ENV));
+    }
+
+    #[test]
+    fn an_image_holding_a_credential_is_detected() {
+        let env = vec![
+            "PATH=/usr/bin".to_string(),
+            format!("{}=sk-ant-oat01-{}", CLAUDE_OAUTH_TOKEN_ENV, "x".repeat(90)),
+        ];
+        assert!(env_holds_a_secret(&env));
+    }
+
+    #[test]
+    fn a_blanked_or_secret_free_image_is_left_alone() {
+        // Already scrubbed.
+        assert!(!env_holds_a_secret(&blanked_secret_env()));
+        // Never had one.
+        assert!(!env_holds_a_secret(&[
+            "PATH=/usr/bin".to_string(),
+            "TZ=UTC".to_string(),
+            format!("{}=claude-sonnet-4-5", ANTHROPIC_DEFAULT_SONNET_MODEL),
+        ]));
+        // A non-secret var whose *name* merely contains a secret name.
+        assert!(!env_holds_a_secret(&[
+            format!("MY_{}=not-a-secret", CLAUDE_OAUTH_TOKEN_ENV)
+        ]));
+    }
+
+    #[test]
+    fn a_value_containing_an_equals_sign_is_still_recognised() {
+        let env = vec!["ANTHROPIC_AUTH_TOKEN=abc=def==".to_string()];
+        assert!(env_holds_a_secret(&env));
+    }
+
+    #[test]
+    fn the_scrub_report_only_claims_success_when_nothing_is_left() {
+        let clean = SnapshotScrubReport {
+            scrubbed: vec!["triple-c-snapshot-a:latest".to_string()],
+            ..Default::default()
+        };
+        assert!(!clean.left_something_behind());
+
+        let partial = SnapshotScrubReport {
+            failed: vec![("triple-c-snapshot-b:latest".to_string(), "nope".to_string())],
+            ..Default::default()
+        };
+        assert!(partial.left_something_behind());
+
+        let blind = SnapshotScrubReport {
+            unavailable: Some("Docker is not running".to_string()),
+            ..Default::default()
+        };
+        assert!(blind.left_something_behind());
+    }
 }

@@ -23,6 +23,7 @@ export interface Project {
   backend: Backend;
   bedrock_config: BedrockConfig | null;
   ollama_config: OllamaConfig | null;
+  llamacpp_config: LlamaCppConfig | null;
   openai_compatible_config: OpenAiCompatibleConfig | null;
   allow_docker_access: boolean;
   sandbox_mode_enabled: boolean;
@@ -30,6 +31,8 @@ export interface Project {
   /** Mirror container loopback listeners onto host loopback so in-container
    *  browser OAuth logins can complete. Host-side only — no container recreate. */
   auth_bridge_enabled: boolean;
+  /** Opt in to the browser-view pane. Host-side only, like `auth_bridge_enabled`. */
+  browser_view_enabled: boolean;
   /** Use the shared long-lived Claude Code token (from `claude setup-token`,
    *  held in the OS keychain) instead of this project's own `claude login`.
    *  Defaults to true; only applies when `backend` is "anthropic" and a token
@@ -60,7 +63,22 @@ export type ProjectStatus =
   | "stopping"
   | "error";
 
-export type Backend = "anthropic" | "bedrock" | "ollama" | "open_ai_compatible";
+export type Backend =
+  | "anthropic"
+  | "bedrock"
+  | "ollama"
+  | "llama_cpp"
+  | "open_ai_compatible";
+
+/** Backends that point Claude Code at a non-Anthropic endpoint via
+ *  `ANTHROPIC_BASE_URL`. These get the `ANTHROPIC_DEFAULT_*_MODEL` aliases
+ *  pinned to their configured model; Anthropic and Bedrock do not. Mirrors
+ *  Rust `Backend::uses_custom_endpoint`. */
+export const CUSTOM_ENDPOINT_BACKENDS: readonly Backend[] = [
+  "ollama",
+  "llama_cpp",
+  "open_ai_compatible",
+];
 
 /** Mirrors Rust `PermissionMode` (serde camelCase). */
 export type PermissionMode = "plan" | "default" | "acceptEdits" | "bypass";
@@ -83,12 +101,28 @@ export interface BedrockConfig {
 export interface OllamaConfig {
   base_url: string;
   model_id: string | null;
+  /** Optional override for the model the `haiku` alias resolves to (the alias
+   *  Claude Code uses for background work). Blank falls back to `model_id`. */
+  haiku_model_id: string | null;
 }
 
+/** llama.cpp (`llama-server`) — it natively implements the Anthropic Messages
+ *  API at `POST /v1/messages`, so Claude Code talks to it directly. */
+export interface LlamaCppConfig {
+  base_url: string;
+  model_id: string | null;
+  /** See `OllamaConfig.haiku_model_id`. */
+  haiku_model_id: string | null;
+}
+
+/** Despite the name (kept for existing project data), the endpoint must
+ *  implement the **Anthropic** Messages API — e.g. LiteLLM. */
 export interface OpenAiCompatibleConfig {
   base_url: string;
   api_key: string | null;
   model_id: string | null;
+  /** See `OllamaConfig.haiku_model_id`. */
+  haiku_model_id: string | null;
 }
 
 export interface ClaudeCodeSettings {
@@ -137,11 +171,21 @@ export interface GlobalAwsSettings {
 export interface GlobalOllamaSettings {
   base_url: string | null;
   default_model_id: string | null;
+  /** Global fallback for the `haiku` alias override; blank means "use the
+   *  resolved model id". */
+  default_haiku_model_id: string | null;
+}
+
+export interface GlobalLlamaCppSettings {
+  base_url: string | null;
+  default_model_id: string | null;
+  default_haiku_model_id: string | null;
 }
 
 export interface GlobalOpenAiCompatibleSettings {
   base_url: string | null;
   default_model_id: string | null;
+  default_haiku_model_id: string | null;
 }
 
 export interface AppSettings {
@@ -153,6 +197,7 @@ export interface AppSettings {
   custom_image_name: string | null;
   global_aws: GlobalAwsSettings;
   global_ollama: GlobalOllamaSettings;
+  global_llamacpp: GlobalLlamaCppSettings;
   global_openai_compatible: GlobalOpenAiCompatibleSettings;
   global_claude_instructions: string | null;
   global_custom_env_vars: EnvVar[];
@@ -163,6 +208,7 @@ export interface AppSettings {
   dismissed_image_digest: string | null;
   web_terminal: WebTerminalSettings;
   stt: SttSettings;
+  gateway: GatewaySettings;
   global_claude_code_settings: ClaudeCodeSettings | null;
 }
 
@@ -179,6 +225,35 @@ export interface SttStatus {
   port: number;
   model: string;
   image_exists: boolean;
+}
+
+/** One entry of the gateway's LiteLLM `model_list`. */
+export interface GatewayModel {
+  /** Friendly name a project puts in its model field. */
+  name: string;
+  /** Provider-side model id, e.g. `gpt-5.1`. */
+  model_id: string;
+}
+
+export interface GatewaySettings {
+  enabled: boolean;
+  port: number;
+  /** LiteLLM provider prefix — `openai`, `azure`, `gemini`, … */
+  provider: string;
+  api_base: string | null;
+  models: GatewayModel[];
+}
+
+export interface GatewayStatus {
+  container_exists: boolean;
+  running: boolean;
+  port: number;
+  image_exists: boolean;
+  model_count: number;
+  /** Presence only — the provider API key never leaves the keychain. */
+  has_api_key: boolean;
+  /** The value a project should use as its base URL. */
+  base_url: string;
 }
 
 export interface WebTerminalSettings {
@@ -351,8 +426,69 @@ export interface AuthBridgeChangedEvent {
   status: AuthBridgeStatus;
 }
 
+// ── Browser view ─────────────────────────────────────────────────────────────
+
+/** What the container has, as reported by the in-container Playwright probe.
+ *  Mirrors Rust `PlaywrightDetection`. */
+export interface PlaywrightDetection {
+  node_version: string | null;
+  playwright_version: string | null;
+  playwright_path: string | null;
+  /** Whether the resolved Playwright declares the `browser.bind()` live-dashboard API. */
+  has_bind: boolean;
+  cli_version: string | null;
+  cli_entry: string | null;
+  /** Module roots the probe searched, echoed back for the "not found" message. */
+  searched: string[];
+}
+
+/** Mirrors Rust `BrowserViewState` (serde snake_case). */
+export type BrowserViewState = "off" | "running" | "unavailable";
+
+export interface BrowserViewStatus {
+  enabled: boolean;
+  state: BrowserViewState;
+  /** Token-bearing loopback URL for the pane's iframe. Never leaves the host. */
+  url: string | null;
+  host_port: number | null;
+  container_port: number | null;
+  started_at: string | null;
+  detection: PlaywrightDetection | null;
+  /** Why the view isn't running, and what to do about it. */
+  message: string | null;
+}
+
+/** Payload of the `browser-view-changed` event. */
+export interface BrowserViewChangedEvent {
+  project_id: string;
+  status: BrowserViewStatus;
+}
+
 /** Payload of the `claude-token-progress` event: milestones during
  *  `acquire_claude_token`. Never contains the token. */
+/**
+ * Result of `clear_claude_token`.
+ *
+ * Revoking is not one action but three: delete the keychain entry (always
+ * succeeds or throws), let container recreation clear the env var, and rewrite
+ * any snapshot image that still has the token baked into its `Config.Env`.
+ * Only the last one can partly fail, and when it does the user has to be told
+ * — a token sitting in an image is readable by `docker image inspect` for as
+ * long as the image exists.
+ */
+export interface ClearTokenOutcome {
+  /** Snapshot images that were holding the token and have been rewritten. */
+  snapshots_scrubbed: string[];
+  /** Images still holding it, each with the reason. Non-empty = incomplete. */
+  snapshots_failed: string[];
+  /** Rewritten, but the pre-rewrite image object could not be deleted because a
+   *  container still runs off it. Clears itself when that container is
+   *  recreated — worth mentioning, not worth alarming about. */
+  snapshots_superseded: string[];
+  /** Set when Docker could not be reached, so nothing is known. */
+  docker_unavailable: string | null;
+}
+
 export interface ClaudeTokenProgressEvent {
   project_id: string;
   message: string;
@@ -364,4 +500,168 @@ export interface ClaudeTokenProgressEvent {
 export interface ClaudeTokenOutputEvent {
   project_id: string;
   chunk: string;
+}
+
+// ── Container base-image migration ───────────────────────────────────────────
+//
+// A project's container is created from its own `triple-c-snapshot-<id>:latest`
+// image and re-committed on every recreation, so it stays on the base image it
+// was first built from forever. Migration moves it onto the *current* base
+// **without touching either named volume** — unlike Reset, which deletes them
+// and takes the login, skills and transcripts with it.
+//
+// Because `/home/claude` is a volume and the image's copy of it is masked after
+// the first mount, almost nothing needs replaying: Claude Code itself, cargo,
+// uv, ruff, `~/.claude.json`, the OAuth credential, skills, transcripts,
+// scheduled tasks and SSH keys all re-attach for free. What is genuinely lost
+// on an image swap is confined to the writable layer: root-level apt installs,
+// `npm -g` packages, `/usr/local`, `/opt`, `/srv`, and non-bind-mounted
+// `/workspace` content. Those are exactly what `MigrationOptions` replays.
+//
+// Mirrors Rust `models/migration.rs` (serde snake_case).
+
+/** How a finished migration attempt ended. Mirrors Rust `MigrationPhase`. */
+export type MigrationPhase = "succeeded" | "partial" | "failed" | "rolled_back";
+
+/** One package that could not be replayed onto the new base. */
+export interface PackageFailure {
+  name: string;
+  /** Tail of the package manager's own error output. */
+  reason: string;
+}
+
+/** A data-bearing directory a migration destroys and cannot put back.
+ *
+ *  Service state lives under /var — a database's files in /var/lib/<service>,
+ *  a site in /var/www — and none of it is carried across: replaying the apt
+ *  delta reinstalls the *package* onto the new base and hands back an empty
+ *  data directory. The ordinary recreate path does not have this problem
+ *  because it creates from the project's own snapshot, so migration has to say
+ *  so out loud before anything is touched. */
+export interface UnpreservedData {
+  /** Absolute path, e.g. `/var/lib/postgresql`. */
+  path: string;
+  /** Total size of the non-package files beneath it. */
+  bytes: number;
+  /** How many non-package files it holds. */
+  file_count: number;
+}
+
+/** Why a project is worth migrating, and what migrating would carry across.
+ *
+ *  An empty array always means "nothing found", never "not checked" —
+ *  `probe_error` is the single place a failed inspection is reported. */
+export interface ContainerStaleness {
+  /** The container's lineage is not the current base. Always false when
+   *  `known` is false: an unknown lineage is not a claim of staleness. */
+  stale: boolean;
+  /** Whether the lineage could be established at all. False means the
+   *  container predates the `triple-c.base-image-id` label — "unknown, probe
+   *  instead", not "stale". */
+  known: boolean;
+  base_image_id: string | null;
+  current_base_image_id: string | null;
+  /** `Created` of the project's snapshot image, RFC 3339. */
+  snapshot_created_at: string | null;
+  /** Concrete paths the base ships and this container lacks, e.g. `/usr/bin/socat`. */
+  missing_paths: string[];
+  /** Human labels for the same, e.g. "Auth bridge tunnel (socat)". */
+  missing_features: string[];
+  /** apt packages the project added on top of the base; migration replays these. */
+  apt_delta: string[];
+  /** Global npm packages the base does not ship. */
+  npm_global_delta: string[];
+  /** Non-package paths under /usr/local, /opt, /srv and /workspace that would
+   *  be carried across. Empty when nothing user-authored was found — which is
+   *  the common case. */
+  verbatim_paths: string[];
+  /** Data under /var that the migration destroys and cannot restore. Empty on
+   *  an ordinary container; when it is not, the pre-flight has to lead with it. */
+  unpreserved_data: UnpreservedData[];
+  /** dpkg packages the base carries at a different version. A drift measure,
+   *  not a promise that every one is newer. */
+  outdated_package_count: number;
+  /** Set when the container/image could not be inspected; everything else is
+   *  then at its default. */
+  probe_error: string | null;
+}
+
+/** What a migration should replay. All default to false. */
+export interface MigrationOptions {
+  /** Replay the apt and `npm -g` deltas onto the new base. */
+  replay_packages: boolean;
+  /** Copy the verbatim payload (/usr/local, /opt, /srv, non-bind-mounted /workspace). */
+  copy_paths: boolean;
+  /** Keep the `:pre-migration-<ts>` rollback tag after the migration reports
+   *  success, so it can still be undone. Costs roughly a whole snapshot on disk
+   *  (3.8–12.3 GB on real projects) because snapshots share almost no layers
+   *  with the current base. When false the tag is dropped as soon as the
+   *  migration is known to have worked, and `rollback_available` is false. */
+  keep_rollback: boolean;
+}
+
+/** The outcome of one migration attempt. */
+export interface MigrationReport {
+  phase: MigrationPhase;
+  packages_requested: string[];
+  packages_installed: string[];
+  packages_failed: PackageFailure[];
+  paths_copied: string[];
+  /** Human labels for base features the container gained. */
+  features_restored: string[];
+  /** A `:pre-migration-<ts>` image still exists, so `rollbackMigration` works. */
+  rollback_available: boolean;
+  /** One paragraph fit to show the user verbatim. */
+  message: string;
+}
+
+/** In-flight phases of `MigrationState.phase`. Distinct from `MigrationPhase`,
+ *  which describes *outcomes*.
+ *
+ *  These are **hyphenated**, matching the `triple-c.migration-state=in-progress`
+ *  container label so there is exactly one spelling in the system. Compare
+ *  against the constants below rather than writing the literals — that is what
+ *  they are for. */
+export type MigrationStatePhase =
+  | "in-progress"
+  | "interrupted"
+  | "awaiting-confirmation";
+
+/** A migration is running right now. Poll `getMigrationState` until it changes. */
+export const MIGRATION_PHASE_IN_PROGRESS = "in-progress";
+/** The app died after the container was swapped. Offer resume (call
+ *  `migrateProjectToBase` again — it picks the interrupted run up) or rollback. */
+export const MIGRATION_PHASE_INTERRUPTED = "interrupted";
+/** Finished; `report` is populated. Offer confirm or rollback. */
+export const MIGRATION_PHASE_AWAITING_CONFIRMATION = "awaiting-confirmation";
+
+/** What a migration decided to do, frozen at pre-flight time so a resume
+ *  replays the same thing (the deltas cannot be recomputed after the swap). */
+export interface MigrationPlan {
+  apt_packages: string[];
+  npm_packages: string[];
+  verbatim_paths: string[];
+  missing_paths: string[];
+  /** What the pre-flight found under /var that the migration would destroy,
+   *  frozen so the finished report can still name it. */
+  unpreserved_data: UnpreservedData[];
+}
+
+/** Persisted host-side migration record. Present only while a migration is in
+ *  flight or waiting for a decision; `confirmMigration` and `rollbackMigration`
+ *  both clear it. */
+export interface MigrationState {
+  /** One of `MigrationStatePhase`; typed loosely because an unrecognised value
+   *  from a future build must not crash the UI. */
+  phase: string;
+  from_image_id: string | null;
+  to_base_id: string | null;
+  started_at: string;
+  report: MigrationReport | null;
+  /** The `:pre-migration-<ts>` tag holding the old system layer, if kept. */
+  rollback_image: string | null;
+  /** Host path of the staged payload tar, while one exists. */
+  staging_path: string | null;
+  options: MigrationOptions;
+  plan: MigrationPlan | null;
 }

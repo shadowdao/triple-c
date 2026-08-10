@@ -1,9 +1,13 @@
 pub mod project;
 pub mod container_config;
 pub mod app_settings;
+pub mod gateway_settings;
+pub mod migration;
 pub mod update_info;
 
 pub use project::*;
 pub use container_config::*;
 pub use app_settings::*;
+pub use gateway_settings::*;
+pub use migration::*;
 pub use update_info::*;

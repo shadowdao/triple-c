@@ -3,6 +3,7 @@ import type {
   Backend,
   BedrockAuthMethod,
   BedrockConfig,
+  LlamaCppConfig,
   OllamaConfig,
   OpenAiCompatibleConfig,
   Project,
@@ -31,13 +32,27 @@ export const DEFAULT_BEDROCK_CONFIG: BedrockConfig = {
 export const DEFAULT_OLLAMA_CONFIG: OllamaConfig = {
   base_url: "http://host.docker.internal:11434",
   model_id: null,
+  haiku_model_id: null,
+};
+
+/** `llama-server` listens on port 8080 unless `--port` says otherwise. */
+export const DEFAULT_LLAMACPP_CONFIG: LlamaCppConfig = {
+  base_url: "http://host.docker.internal:8080",
+  model_id: null,
+  haiku_model_id: null,
 };
 
 export const DEFAULT_OPENAI_COMPATIBLE_CONFIG: OpenAiCompatibleConfig = {
   base_url: "http://host.docker.internal:4000",
   api_key: null,
   model_id: null,
+  haiku_model_id: null,
 };
+
+/** Shown under the optional per-backend Haiku override. Kept in one place so
+ *  all three custom-endpoint backends explain it identically. */
+const HAIKU_HINT =
+  "Optional. Claude Code resolves the `haiku` alias to this, and uses it for background work such as conversation titles. Leave blank to reuse the model above — that is what stops background calls failing against a server that only serves one model.";
 
 interface Props {
   project: Project;
@@ -64,6 +79,19 @@ export default function ModelSection({ project, save, disabled }: Props) {
   const [ollamaModelId, setOllamaModelId] = useState(
     project.ollama_config?.model_id ?? "",
   );
+  const [ollamaHaikuModelId, setOllamaHaikuModelId] = useState(
+    project.ollama_config?.haiku_model_id ?? "",
+  );
+
+  const [llamaCppBaseUrl, setLlamaCppBaseUrl] = useState(
+    project.llamacpp_config?.base_url ?? DEFAULT_LLAMACPP_CONFIG.base_url,
+  );
+  const [llamaCppModelId, setLlamaCppModelId] = useState(
+    project.llamacpp_config?.model_id ?? "",
+  );
+  const [llamaCppHaikuModelId, setLlamaCppHaikuModelId] = useState(
+    project.llamacpp_config?.haiku_model_id ?? "",
+  );
 
   const [oaiBaseUrl, setOaiBaseUrl] = useState(
     project.openai_compatible_config?.base_url ??
@@ -74,6 +102,9 @@ export default function ModelSection({ project, save, disabled }: Props) {
   );
   const [oaiModelId, setOaiModelId] = useState(
     project.openai_compatible_config?.model_id ?? "",
+  );
+  const [oaiHaikuModelId, setOaiHaikuModelId] = useState(
+    project.openai_compatible_config?.haiku_model_id ?? "",
   );
 
   useEffect(() => {
@@ -88,12 +119,19 @@ export default function ModelSection({ project, save, disabled }: Props) {
     setServiceTier(bc.service_tier ?? "");
     setOllamaBaseUrl(project.ollama_config?.base_url ?? DEFAULT_OLLAMA_CONFIG.base_url);
     setOllamaModelId(project.ollama_config?.model_id ?? "");
+    setOllamaHaikuModelId(project.ollama_config?.haiku_model_id ?? "");
+    setLlamaCppBaseUrl(
+      project.llamacpp_config?.base_url ?? DEFAULT_LLAMACPP_CONFIG.base_url,
+    );
+    setLlamaCppModelId(project.llamacpp_config?.model_id ?? "");
+    setLlamaCppHaikuModelId(project.llamacpp_config?.haiku_model_id ?? "");
     setOaiBaseUrl(
       project.openai_compatible_config?.base_url ??
         DEFAULT_OPENAI_COMPATIBLE_CONFIG.base_url,
     );
     setOaiApiKey(project.openai_compatible_config?.api_key ?? "");
     setOaiModelId(project.openai_compatible_config?.model_id ?? "");
+    setOaiHaikuModelId(project.openai_compatible_config?.haiku_model_id ?? "");
   }, [project]);
 
   const saveBedrock = (patch: Partial<BedrockConfig>) =>
@@ -102,6 +140,14 @@ export default function ModelSection({ project, save, disabled }: Props) {
   const saveOllama = (patch: Partial<OllamaConfig>) =>
     save({
       ollama_config: { ...(project.ollama_config ?? DEFAULT_OLLAMA_CONFIG), ...patch },
+    });
+
+  const saveLlamaCpp = (patch: Partial<LlamaCppConfig>) =>
+    save({
+      llamacpp_config: {
+        ...(project.llamacpp_config ?? DEFAULT_LLAMACPP_CONFIG),
+        ...patch,
+      },
     });
 
   const saveOpenAi = (patch: Partial<OpenAiCompatibleConfig>) =>
@@ -122,6 +168,8 @@ export default function ModelSection({ project, save, disabled }: Props) {
       patch.bedrock_config = DEFAULT_BEDROCK_CONFIG;
     if (mode === "ollama" && !project.ollama_config)
       patch.ollama_config = DEFAULT_OLLAMA_CONFIG;
+    if (mode === "llama_cpp" && !project.llamacpp_config)
+      patch.llamacpp_config = DEFAULT_LLAMACPP_CONFIG;
     if (mode === "open_ai_compatible" && !project.openai_compatible_config)
       patch.openai_compatible_config = DEFAULT_OPENAI_COMPATIBLE_CONFIG;
     save(patch);
@@ -131,7 +179,7 @@ export default function ModelSection({ project, save, disabled }: Props) {
     <ConfigGroup title="Model" description="Which provider serves this project's Claude.">
       <Field
         label="Backend"
-        hint="Anthropic connects directly via OAuth (run `claude login` in a terminal). Bedrock routes through AWS. Ollama and OpenAI Compatible point at any compatible endpoint."
+        hint="Anthropic connects directly via OAuth (run `claude login` in a terminal). Bedrock routes through AWS. Ollama, llama.cpp and OpenAI Compatible point at any endpoint that implements the Anthropic Messages API."
       >
         {(id) => (
           <select
@@ -144,6 +192,7 @@ export default function ModelSection({ project, save, disabled }: Props) {
             <option value="anthropic">Anthropic</option>
             <option value="bedrock">Bedrock</option>
             <option value="ollama">Ollama</option>
+            <option value="llama_cpp">llama.cpp</option>
             <option value="open_ai_compatible">OpenAI Compatible</option>
           </select>
         )}
@@ -365,6 +414,73 @@ export default function ModelSection({ project, save, disabled }: Props) {
               />
             )}
           </Field>
+          <Field label="Background model" hint={HAIKU_HINT}>
+            {(id) => (
+              <input
+                id={id}
+                value={ollamaHaikuModelId}
+                onChange={(e) => setOllamaHaikuModelId(e.target.value)}
+                onBlur={() =>
+                  saveOllama({ haiku_model_id: ollamaHaikuModelId.trim() || null })
+                }
+                placeholder="(same as the model above)"
+                disabled={disabled}
+                className={monoInputClass}
+              />
+            )}
+          </Field>
+        </div>
+      )}
+
+      {project.backend === "llama_cpp" && (
+        <div className="space-y-4 pt-2 border-t border-[var(--border-color)]">
+          <Field
+            label="Base URL"
+            hint="Your llama-server. It listens on port 8080 by default; use host.docker.internal to reach the host machine."
+          >
+            {(id) => (
+              <input
+                id={id}
+                value={llamaCppBaseUrl}
+                onChange={(e) => setLlamaCppBaseUrl(e.target.value)}
+                onBlur={() => saveLlamaCpp({ base_url: llamaCppBaseUrl })}
+                placeholder="http://host.docker.internal:8080"
+                disabled={disabled}
+                className={monoInputClass}
+              />
+            )}
+          </Field>
+          <Field
+            label="Model"
+            hint="The model llama-server was started with. llama-server serves one model, so this is mainly what Claude Code reports — but it is also what the model aliases are pinned to."
+          >
+            {(id) => (
+              <input
+                id={id}
+                value={llamaCppModelId}
+                onChange={(e) => setLlamaCppModelId(e.target.value)}
+                onBlur={() => saveLlamaCpp({ model_id: llamaCppModelId || null })}
+                placeholder="qwen3.5-coder-30b"
+                disabled={disabled}
+                className={monoInputClass}
+              />
+            )}
+          </Field>
+          <Field label="Background model" hint={HAIKU_HINT}>
+            {(id) => (
+              <input
+                id={id}
+                value={llamaCppHaikuModelId}
+                onChange={(e) => setLlamaCppHaikuModelId(e.target.value)}
+                onBlur={() =>
+                  saveLlamaCpp({ haiku_model_id: llamaCppHaikuModelId.trim() || null })
+                }
+                placeholder="(same as the model above)"
+                disabled={disabled}
+                className={monoInputClass}
+              />
+            )}
+          </Field>
         </div>
       )}
 
@@ -372,7 +488,7 @@ export default function ModelSection({ project, save, disabled }: Props) {
         <div className="space-y-4 pt-2 border-t border-[var(--border-color)]">
           <Field
             label="Base URL"
-            hint="Any OpenAI API-compatible endpoint — LiteLLM, OpenRouter, vLLM, and so on."
+            hint="A gateway that implements the Anthropic Messages API (POST /v1/messages) — LiteLLM, for example. An endpoint that only speaks OpenAI /v1/chat/completions will not work."
           >
             {(id) => (
               <input
@@ -408,6 +524,21 @@ export default function ModelSection({ project, save, disabled }: Props) {
                 onChange={(e) => setOaiModelId(e.target.value)}
                 onBlur={() => saveOpenAi({ model_id: oaiModelId || null })}
                 placeholder="gpt-4o / gemini-pro / …"
+                disabled={disabled}
+                className={monoInputClass}
+              />
+            )}
+          </Field>
+          <Field label="Background model" hint={HAIKU_HINT}>
+            {(id) => (
+              <input
+                id={id}
+                value={oaiHaikuModelId}
+                onChange={(e) => setOaiHaikuModelId(e.target.value)}
+                onBlur={() =>
+                  saveOpenAi({ haiku_model_id: oaiHaikuModelId.trim() || null })
+                }
+                placeholder="(same as the model above)"
                 disabled={disabled}
                 className={monoInputClass}
               />

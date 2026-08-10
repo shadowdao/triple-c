@@ -10,6 +10,12 @@ import { useAppState } from "../../store/appState";
 import { awsSsoRefresh, uploadHostFileToTerminal } from "../../lib/tauri-commands";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { UrlDetector } from "../../lib/urlDetector";
+import {
+  RelayRateLimiter,
+  URL_RELAY_OSC,
+  parseUrlRelayOsc,
+  sanitizeRelayUrl,
+} from "../../lib/urlRelay";
 import UrlToast from "./UrlToast";
 import { trimSelection } from "./trimSelection";
 import TerminalContextMenu from "./TerminalContextMenu";
@@ -37,7 +43,41 @@ export default function TerminalView({ sessionId, active }: Props) {
     (s) => s.sessions.find((sess) => sess.id === sessionId)?.projectId
   );
 
-  const [detectedUrl, setDetectedUrl] = useState<string | null>(null);
+  // One toast slot, two producers: the heuristic long-URL detector and the
+  // container's explicit "open this in the host browser" relay (OSC 7777).
+  // Sharing the slot keeps them from stacking on top of each other.
+  //
+  // Both producers read the container's PTY output, so both are untrusted, and
+  // both must go through `sanitizeRelayUrl` before anything is stored here —
+  // see `promptUrl` below, which is the only writer.
+  //
+  // `seq` exists because the slot is shared and long-lived: a second prompt
+  // replacing a first would otherwise mutate the toast in place, swapping the
+  // text under a user who is mid-read and mid-click. Keying the toast on it
+  // remounts the component, so a new URL is unmistakably a new prompt.
+  const [urlPrompt, setUrlPrompt] = useState<{
+    url: string;
+    label: string;
+    seq: number;
+  } | null>(null);
+  const promptSeqRef = useRef(0);
+  const relayLimiterRef = useRef(new RelayRateLimiter());
+
+  /**
+   * The only writer of the prompt slot. Re-validates whatever the caller
+   * found: the OSC relay branch has already been through `parseUrlRelayOsc`,
+   * but the heuristic detector branch has been through nothing at all, and a
+   * raw regex match is exactly the input `sanitizeRelayUrl` exists to refuse.
+   */
+  const promptUrl = useCallback((raw: string, label: string) => {
+    const url = sanitizeRelayUrl(raw);
+    if (!url) {
+      console.warn("Refusing to prompt for a URL that failed validation");
+      return;
+    }
+    promptSeqRef.current += 1;
+    setUrlPrompt({ url, label, seq: promptSeqRef.current });
+  }, []);
   const [imagePasteMsg, setImagePasteMsg] = useState<string | null>(null);
   const [isAtBottom, setIsAtBottom] = useState(true);
   const [isAutoFollow, setIsAutoFollow] = useState(true);
@@ -151,9 +191,19 @@ export default function TerminalView({ sessionId, active }: Props) {
     // Web links addon — opens URLs in host browser via Tauri, with a permissive regex
     // that matches URLs even if they lack trailing path segments (the default regex
     // misses OAuth URLs that end mid-line).
-    const urlRegex = /https?:\/\/[^\s'"\x07]+/;
+    // eslint-disable-next-line no-control-regex
+    const urlRegex = /https?:\/\/[^\s'"`<>\x00-\x20\x7f]+/;
     const webLinksAddon = new WebLinksAddon((_event, uri) => {
-      openUrl(uri).catch((e) => console.error("Failed to open URL:", e));
+      // Same sink, same rule: what xterm matched came off the container's
+      // output, so it is validated before it reaches the OS opener. A click
+      // here is a deliberate act on visible text, but "visible" is exactly
+      // what a userinfo-spoofed URL subverts.
+      const safe = sanitizeRelayUrl(uri);
+      if (!safe) {
+        console.warn("Refusing to open a link that failed validation");
+        return;
+      }
+      openUrl(safe).catch((e) => console.error("Failed to open URL:", e));
     }, { urlRegex });
     term.loadAddon(webLinksAddon);
 
@@ -209,6 +259,31 @@ export default function TerminalView({ sessionId, active }: Props) {
       } catch (e) {
         console.error("OSC 52 decode failed:", e);
       }
+      return true;
+    });
+
+    // URL relay (OSC 7777) — a CLI inside the container asked for a URL to be
+    // opened in a browser. The container has none; `triple-c-open` (installed
+    // as xdg-open / $BROWSER / sensible-browser / ...) forwards the request
+    // here instead.
+    //
+    // The container is untrusted, so this never opens anything by itself:
+    // parseUrlRelayOsc enforces the http/https allowlist and the payload is
+    // rate-limited, then the user gets the same confirmation toast the
+    // long-URL detector uses. One click is a small price for not handing a
+    // sandboxed agent a "make the host's logged-in browser fetch this"
+    // primitive.
+    const relayDisposable = term.parser.registerOscHandler(URL_RELAY_OSC, (data) => {
+      const url = parseUrlRelayOsc(data);
+      if (!url) {
+        console.warn("URL relay: rejected request from container");
+        return true; // consumed either way — never let it reach the screen
+      }
+      if (!relayLimiterRef.current.allow(url)) {
+        console.warn("URL relay: rate-limited", url);
+        return true;
+      }
+      promptUrl(url, "Container asked to open a URL");
       return true;
     });
 
@@ -295,7 +370,9 @@ export default function TerminalView({ sessionId, active }: Props) {
     // Handle backend output -> terminal
     let aborted = false;
 
-    const detector = new UrlDetector((url) => setDetectedUrl(url));
+    const detector = new UrlDetector((url) =>
+      promptUrl(url, "Long URL detected"),
+    );
     detectorRef.current = detector;
 
     const SSO_MARKER = "###TRIPLE_C_SSO_REFRESH###";
@@ -369,6 +446,7 @@ export default function TerminalView({ sessionId, active }: Props) {
       ssoTriggeredRef.current = false;
       ssoBufferRef.current = "";
       osc52Disposable.dispose();
+      relayDisposable.dispose();
       inputDisposable.dispose();
       scrollDisposable.dispose();
       selectionDisposable.dispose();
@@ -425,10 +503,10 @@ export default function TerminalView({ sessionId, active }: Props) {
 
   // Auto-dismiss toast after 30 seconds
   useEffect(() => {
-    if (!detectedUrl) return;
-    const timer = setTimeout(() => setDetectedUrl(null), 30_000);
+    if (!urlPrompt) return;
+    const timer = setTimeout(() => setUrlPrompt(null), 30_000);
     return () => clearTimeout(timer);
-  }, [detectedUrl]);
+  }, [urlPrompt]);
 
   // Auto-dismiss image paste message after 3 seconds
   useEffect(() => {
@@ -438,13 +516,18 @@ export default function TerminalView({ sessionId, active }: Props) {
   }, [imagePasteMsg]);
 
   const handleOpenUrl = useCallback(() => {
-    if (detectedUrl) {
-      openUrl(detectedUrl).catch((e) =>
-        console.error("Failed to open URL:", e),
-      );
-      setDetectedUrl(null);
+    if (!urlPrompt) return;
+    // Validated again at the sink. `promptUrl` is the only writer and already
+    // sanitizes, so this can only fail if that invariant is broken — which is
+    // precisely when it matters that the last thing before `openUrl` checks.
+    const safe = sanitizeRelayUrl(urlPrompt.url);
+    setUrlPrompt(null);
+    if (!safe) {
+      console.warn("Refusing to open a URL that failed validation");
+      return;
     }
-  }, [detectedUrl]);
+    openUrl(safe).catch((e) => console.error("Failed to open URL:", e));
+  }, [urlPrompt]);
 
   const handleScrollToBottom = useCallback(() => {
     const term = termRef.current;
@@ -516,11 +599,14 @@ export default function TerminalView({ sessionId, active }: Props) {
       ref={terminalContainerRef}
       className={`w-full h-full relative ${active ? "" : "hidden"}`}
     >
-      {detectedUrl && (
+      {urlPrompt && (
         <UrlToast
-          url={detectedUrl}
+          // A different URL is a different prompt, not an edit of this one.
+          key={urlPrompt.seq}
+          url={urlPrompt.url}
+          label={urlPrompt.label}
           onOpen={handleOpenUrl}
-          onDismiss={() => setDetectedUrl(null)}
+          onDismiss={() => setUrlPrompt(null)}
         />
       )}
       {imagePasteMsg && (

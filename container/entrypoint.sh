@@ -2,6 +2,16 @@
 # NOTE: set -e is intentionally omitted. A failing usermod/groupmod must not
 # kill the entire entrypoint — SSH setup, git config, and the final exec
 # must still run so the container is usable even if remapping fails.
+#
+# NOTE: /home/claude is the mount point of the named volume
+# triple-c-home-{projectId}, so the *image's* copy of that directory is
+# seed-only: after a project's first start it is masked permanently. Anything
+# this script writes under /home/claude on **every** start does reach existing
+# projects (that is why the CLAUDE.md, git config and Mission Control skill
+# copies are written here rather than baked into the image). Anything added to
+# /home/claude in the Dockerfile reaches new projects only, forever. Put
+# upgradable content in /usr/local/bin or /opt, or seed it from here.
+# See "Container Lifecycle" in the repo's CLAUDE.md.
 
 # ── UID/GID remapping ──────────────────────────────────────────────────────
 # Match the container's claude user to the host user's UID/GID so that
@@ -242,6 +252,18 @@ if [ -n "${TZ:-}" ]; then
     fi
 fi
 
+# ── Browser / URL relay ──────────────────────────────────────────────────────
+# Tools that open a browser (gh, aws sso login, gcloud, python webbrowser, ...)
+# consult $BROWSER first. Point it at the relay shim, which forwards the URL to
+# the host's browser over the terminal. The image already sets this as an ENV —
+# that is what `docker exec` terminal sessions inherit — but exporting it here
+# means the entrypoint's own children see it too, and (below) that it is
+# captured into the cron environment file for scheduled tasks. Under cron there
+# is no terminal, so the shim degrades to printing the URL into the task log.
+if [ -x /usr/local/bin/triple-c-open ]; then
+    export BROWSER=/usr/local/bin/triple-c-open
+fi
+
 # ── Scheduler setup ─────────────────────────────────────────────────────────
 SCHEDULER_DIR="/home/claude/.claude/scheduler"
 mkdir -p "$SCHEDULER_DIR/tasks" "$SCHEDULER_DIR/logs" "$SCHEDULER_DIR/notifications"
@@ -255,7 +277,7 @@ ENV_FILE="$SCHEDULER_DIR/.env"
 : > "$ENV_FILE"
 env | while IFS='=' read -r key value; do
     case "$key" in
-        ANTHROPIC_*|AWS_*|CLAUDE_CODE_*|TRIPLE_C_PERMISSION_MODE|PATH|HOME|LANG|TZ|COLORTERM)
+        ANTHROPIC_*|AWS_*|CLAUDE_CODE_*|TRIPLE_C_PERMISSION_MODE|PATH|HOME|LANG|TZ|COLORTERM|BROWSER)
             # Escape single quotes in value and write as KEY='VALUE'
             escaped_value=$(printf '%s' "$value" | sed "s/'/'\\\\''/g")
             printf "%s='%s'\n" "$key" "$escaped_value" >> "$ENV_FILE"
