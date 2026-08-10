@@ -104,6 +104,25 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   OAuth listener, wrong for remote control of a browser. Host ports are confined to
   `47820..=47827` because CSP `frame-src` cannot express a port range and must enumerate them;
   a unit test asserts the Rust range matches `tauri.conf.json`. Opt-in per project.
+  - **Detection has to look past `node_modules`.** `claude mcp add … npx @playwright/mcp@latest`
+    installs into `~/.npm/_npx/<hash>/node_modules`, not any `node_modules`, so `detect.rs`
+    globs that cache as well as `/workspace`, `$HOME/node_modules` and `npm root -g`. It also
+    hops from a wrapper `playwright` to its **nested** `playwright-core`: verified that npm does
+    not hoist for global installs, and the wrapper ships no `types/types.d.ts`, so reading the
+    wrapper alone reports a current build as "predates `browser.bind()`".
+  - **`@playwright/mcp` can never satisfy this pane.** It bundles a `playwright-core` that binds,
+    but never `@playwright/cli`, which is the viewer. Never offer it as a setup route — only as
+    what binds sessions automatically once Playwright is present.
+  - **`install.rs` installs into `/workspace`, as `claude`, with `--no-save`.** `/workspace` is
+    *not* a bind mount — project directories are mounted at `/workspace/{mount_name}` — so this
+    touches nothing of the user's, needs no sudo (npm's prefix is `/usr`, which is root-owned),
+    and is on the module resolution path for scripts in the project. Browsers go to
+    `~/.cache/ms-playwright` as `claude`, i.e. the home volume.
+  - **The base image ships none of Chromium's shared libraries.** `playwright install chromium`
+    therefore downloads a browser that cannot launch, which is why installing Chrome via apt
+    looks like a fix. The install action runs `install-deps` as root first and then *actually
+    launches* the browser to verify. `@playwright/mcp` wants the `chrome` **channel**
+    specifically, so both browsers are offered.
 - **`docker/`** — Docker API layer using bollard:
   - `client.rs` — Singleton Docker connection via `OnceLock`
   - `container.rs` — Container lifecycle (create, start, stop, remove, inspect)
