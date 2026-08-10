@@ -362,32 +362,61 @@ jobs:
         run: |
           rem Tauri links with MSVC, so rustc needs link.exe and the Windows SDK.
           rem This job previously assumed a hand-provisioned runner; a runner
-          rem without them registers fine, accepts windows-latest jobs, and then
-          rem fails at link time with "linker `link.exe` not found" after having
-          rem already downloaded the whole crate graph.
+          rem without them registers fine, advertises windows-latest, accepts the
+          rem job, downloads the whole crate graph and only then fails at link
+          rem time with "linker `link.exe` not found".
           rem
-          rem rustc locates MSVC through vswhere/the registry rather than PATH,
-          rem so installing is sufficient — no dev-shell activation needed here.
+          rem rustc finds MSVC via vswhere and the registry rather than PATH, so
+          rem installing is enough - no dev-shell activation needed here.
+          rem
+          rem Delayed expansion is required: %VAR% inside a parenthesised block
+          rem is substituted when the block is PARSED, not when it runs, so both
+          rem %ERRORLEVEL% and %VSEXIT% would read as their pre-block values.
+          setlocal enabledelayedexpansion
+          set "VCPATH="
           set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
           if exist "%VSWHERE%" (
-            "%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath > "%TEMP%\vcpath.txt" 2>nul
-            for /f "usebackq delims=" %%i in ("%TEMP%\vcpath.txt") do set "VCPATH=%%i"
+            for /f "usebackq delims=" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VCPATH=%%i"
           )
           if defined VCPATH (
-            echo MSVC build tools already present at %VCPATH%
+            echo MSVC build tools already present at !VCPATH!
           ) else (
             echo MSVC build tools not found - installing Visual Studio Build Tools
             curl -fSL -o "%TEMP%\vs_BuildTools.exe" https://aka.ms/vs/17/release/vs_BuildTools.exe || exit /b 1
-            rem 3010 means "installed, reboot pending" and is a success for our purposes.
-            "%TEMP%\vs_BuildTools.exe" --quiet --wait --norestart --nocache ^
-              --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended
-            set "VSEXIT=%ERRORLEVEL%"
+            "%TEMP%\vs_BuildTools.exe" --quiet --wait --norestart --nocache --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended
+            set "VSEXIT=!ERRORLEVEL!"
             del "%TEMP%\vs_BuildTools.exe" 2>nul
-            if not "%VSEXIT%"=="0" if not "%VSEXIT%"=="3010" (
-              echo Visual Studio Build Tools installer failed with %VSEXIT%
-              exit /b %VSEXIT%
+            rem 3010 means installed, reboot pending - a success for our purposes.
+            if not "!VSEXIT!"=="0" if not "!VSEXIT!"=="3010" (
+              echo Visual Studio Build Tools installer failed with exit code !VSEXIT!
+              exit /b 1
             )
             echo Visual Studio Build Tools installed
+          )
+          endlocal
+
+      - name: Verify .NET 3.5 for the MSI bundler
+        shell: cmd
+        run: |
+          rem WiX 3.x candle.exe is a .NET 2.0/3.5 application, and Tauri aborts
+          rem the whole bundle when the MSI target fails - taking the NSIS
+          rem installer with it. Windows 11 ships NetFx3 as
+          rem DisabledWithPayloadRemoved, and enabling it needs a payload that
+          rem Windows Update cannot always supply, so this checks rather than
+          rem guesses and tells you exactly how to fix it on the runner.
+          if exist "%WINDIR%\Microsoft.NET\Framework64\v2.0.50727" (
+            echo .NET 3.5 runtime present - WiX can run
+          ) else (
+            echo ERROR: .NET 3.5 is missing, so WiX candle.exe cannot run and the
+            echo        MSI bundle will fail, which also suppresses the NSIS build.
+            echo.
+            echo   Fix on this runner, with a Windows ISO mounted ^(e.g. D:^):
+            echo     dism /Online /Enable-Feature /FeatureName:NetFx3 /All ^
+            echo          /Source:D:\sources\sxs /LimitAccess
+            echo.
+            echo   Windows Update alone is not sufficient when the feature reports
+            echo   DisabledWithPayloadRemoved.
+            exit /b 1
           )
       - name: Install Rust stable
         run: |
