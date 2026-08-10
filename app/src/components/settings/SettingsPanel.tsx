@@ -18,6 +18,7 @@ import Toggle from "../ui/Toggle";
 import WebTerminalSettings from "./WebTerminalSettings";
 import SttSettings from "./SttSettings";
 import SharedAuthSettings from "./SharedAuthSettings";
+import CertificateSettings from "./CertificateSettings";
 
 export default function SettingsPanel() {
   const { appSettings, saveSettings } = useSettings();
@@ -170,6 +171,10 @@ export default function SettingsPanel() {
 
       <AccordionSection id="container" title="Container" defaultOpen={false}>
         <DockerSettings />
+      </AccordionSection>
+
+      <AccordionSection id="certificates" title="Certificates" defaultOpen={false}>
+        <CertificateSettings />
       </AccordionSection>
 
       <AccordionSection id="git-ssh" title="Git / SSH" defaultOpen={false}>

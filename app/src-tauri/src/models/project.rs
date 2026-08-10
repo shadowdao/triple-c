@@ -166,6 +166,13 @@ pub struct Project {
     #[serde(default)]
     pub permission_mode: Option<PermissionMode>,
     pub ssh_key_path: Option<String>,
+    /// Per-project override for the corporate CA certificate path (file or
+    /// directory). Blank falls back to `AppSettings::ca_cert_path`.
+    ///
+    /// `#[serde(default)]` rather than a required field: every project stored
+    /// before this existed must keep loading.
+    #[serde(default)]
+    pub ca_cert_path: Option<String>,
     #[serde(skip_serializing, default)]
     pub git_token: Option<String>,
     pub git_user_name: Option<String>,
@@ -363,6 +370,7 @@ impl Project {
             full_permissions: false,
             permission_mode: None,
             ssh_key_path: None,
+            ca_cert_path: None,
             git_token: None,
             git_user_name: None,
             git_user_email: None,

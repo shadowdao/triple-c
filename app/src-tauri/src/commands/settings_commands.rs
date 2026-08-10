@@ -155,6 +155,78 @@ pub async fn detect_aws_config() -> Result<Option<String>, String> {
     Ok(None)
 }
 
+/// What the UI shows next to a corporate CA certificate path.
+///
+/// Errors are returned *inside* the payload rather than as `Err` so the field
+/// can render its own inline message while the user is still typing — a toast
+/// per keystroke would be unusable. The same check runs again, as a hard error,
+/// when the container is created.
+#[derive(Debug, serde::Serialize)]
+pub struct CaCertInfo {
+    pub exists: bool,
+    pub is_directory: bool,
+    /// How many certificate files were found.
+    pub cert_count: usize,
+    /// The names they will be installed as inside the container. Surfacing
+    /// these makes the silent `.pem` → `.crt` rename visible, which is the one
+    /// step users most often do by hand and get wrong.
+    pub installed_names: Vec<String>,
+    /// Why the path is unusable, if it is.
+    pub error: Option<String>,
+}
+
+#[tauri::command]
+pub async fn inspect_ca_cert_path(path: String) -> Result<CaCertInfo, String> {
+    use crate::docker::ca_certs;
+
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Ok(CaCertInfo {
+            exists: false,
+            is_directory: false,
+            cert_count: 0,
+            installed_names: Vec::new(),
+            error: None,
+        });
+    }
+
+    let p = std::path::Path::new(trimmed);
+    let exists = p.exists();
+    let is_directory = p.is_dir();
+
+    match ca_certs::resolve(Some(trimmed)) {
+        Ok(Some(resolved)) => Ok(CaCertInfo {
+            exists,
+            is_directory,
+            cert_count: resolved.cert_files.len(),
+            installed_names: resolved
+                .cert_files
+                .iter()
+                .map(|f| {
+                    ca_certs::container_cert_name(
+                        &f.file_name().unwrap_or_default().to_string_lossy(),
+                    )
+                })
+                .collect(),
+            error: None,
+        }),
+        Ok(None) => Ok(CaCertInfo {
+            exists,
+            is_directory,
+            cert_count: 0,
+            installed_names: Vec::new(),
+            error: None,
+        }),
+        Err(e) => Ok(CaCertInfo {
+            exists,
+            is_directory,
+            cert_count: 0,
+            installed_names: Vec::new(),
+            error: Some(e),
+        }),
+    }
+}
+
 #[tauri::command]
 pub async fn list_aws_profiles() -> Result<Vec<String>, String> {
     let mut profiles = Vec::new();

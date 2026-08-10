@@ -3,6 +3,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import type { Project } from "../../../../lib/types";
 import Button from "../../../ui/Button";
 import Field, { ConfigGroup, inputClass } from "../../../ui/Field";
+import CaCertPathInput from "../../../settings/CaCertPathInput";
 import EnvVarsEditor from "../../EnvVarsEditor";
 import PortMappingsEditor from "../../PortMappingsEditor";
 
@@ -20,12 +21,14 @@ export default function AccessSection({
   disabledReason,
 }: Props) {
   const [sshKeyPath, setSshKeyPath] = useState(project.ssh_key_path ?? "");
+  const [caCertPath, setCaCertPath] = useState(project.ca_cert_path ?? "");
   const [gitName, setGitName] = useState(project.git_user_name ?? "");
   const [gitEmail, setGitEmail] = useState(project.git_user_email ?? "");
   const [gitToken, setGitToken] = useState(project.git_token ?? "");
 
   useEffect(() => {
     setSshKeyPath(project.ssh_key_path ?? "");
+    setCaCertPath(project.ca_cert_path ?? "");
     setGitName(project.git_user_name ?? "");
     setGitEmail(project.git_user_email ?? "");
     setGitToken(project.git_token ?? "");
@@ -110,6 +113,24 @@ export default function AccessSection({
             placeholder="ghp_…"
             disabled={disabled}
             className={inputClass}
+          />
+        )}
+      </Field>
+
+      <Field
+        label="Corporate CA certificate"
+        hint="Overrides the global certificate for this project only. A certificate file, or a folder of them, trusted inside the container by curl, git, npm, pip, Chromium and Claude Code."
+      >
+        {(id) => (
+          <CaCertPathInput
+            id={id}
+            value={caCertPath}
+            onChange={setCaCertPath}
+            onCommit={(value) => save({ ca_cert_path: value.trim() || null })}
+            disabled={disabled}
+            placeholder="/etc/ssl/certs/corp-root.pem"
+            emptyHint="Using the global certificate from Settings → Certificates."
+            inputClassName={`${inputClass} min-w-0`}
           />
         )}
       </Field>

@@ -7,6 +7,7 @@ use bollard::models::{ContainerSummary, HostConfig, Mount, MountTypeEnum, PortBi
 use std::collections::HashMap;
 use sha2::{Sha256, Digest};
 
+use super::ca_certs;
 use super::client::get_docker;
 use crate::models::{Backend, BedrockAuthMethod, ClaudeCodeSettings, ContainerInfo, EnvVar, GlobalAwsSettings, GlobalLlamaCppSettings, GlobalOllamaSettings, GlobalOpenAiCompatibleSettings, PortMapping, Project, ProjectPath};
 
@@ -792,6 +793,7 @@ pub async fn create_container(
     timezone: Option<&str>,
     global_claude_code_settings: Option<&ClaudeCodeSettings>,
     default_ssh_key_path: Option<&str>,
+    default_ca_cert_path: Option<&str>,
     default_git_user_name: Option<&str>,
     default_git_user_email: Option<&str>,
 ) -> Result<String, String> {
@@ -1029,6 +1031,34 @@ pub async fn create_container(
         );
     }
 
+    // ── Corporate CA certificates ───────────────────────────────────────────
+    // Resolved here (rather than down with the mounts) so the env vars land
+    // *before* the neutralization pass below and are seen as already-set.
+    //
+    // A bad path is a hard error, not a warning: behind a TLS-terminating
+    // proxy a container without the CA fails every HTTPS call — npm, pip, git,
+    // and Claude Code's own API requests — each in its own confusing way. One
+    // message naming the path is far kinder.
+    //
+    // The values are set here rather than exported by the entrypoint because a
+    // terminal session is a `docker exec`, which sees the container's
+    // configured env and nothing the entrypoint exported. Same lesson as
+    // `$BROWSER` and the URL relay shim.
+    let effective_ca_path =
+        resolve_with_global(project.ca_cert_path.as_deref(), default_ca_cert_path);
+    let resolved_ca = ca_certs::resolve(effective_ca_path)?;
+    if let Some(ref ca) = resolved_ca {
+        log::info!(
+            "Mounting {} corporate CA certificate(s) from {} into project {}",
+            ca.cert_files.len(),
+            ca.host_path,
+            project.id
+        );
+    }
+    for (key, value) in ca_certs::ca_env_vars(resolved_ca.as_ref()) {
+        env_vars.push(format!("{}={}", key, value));
+    }
+
     // ── Neutralize stale backend auth env vars ──────────────────────────────
     // When a project switches backends (e.g. Bedrock → Anthropic) the container
     // is recreated *from a snapshot image* committed off the previous container,
@@ -1073,11 +1103,19 @@ pub async fn create_container(
         // authenticating the container with a credential the user removed.
         CLAUDE_OAUTH_TOKEN_ENV,
     ];
+    // Same reasoning for the CA vars — `ca_env_vars` already emits them empty
+    // when no CA is configured, so this list is belt-and-braces for a snapshot
+    // committed by a build that predates the feature.
+    let managed_keys: Vec<&str> = MANAGED_AUTH_KEYS
+        .iter()
+        .copied()
+        .chain(ca_certs::CA_ENV_KEYS.iter().copied())
+        .collect();
     let already_set: std::collections::HashSet<String> = env_vars
         .iter()
         .filter_map(|e| e.split('=').next().map(|k| k.to_string()))
         .collect();
-    for key in MANAGED_AUTH_KEYS {
+    for key in &managed_keys {
         if !already_set.contains(*key) {
             env_vars.push(format!("{}=", key));
         }
@@ -1209,6 +1247,23 @@ pub async fn create_container(
         });
     }
 
+    // Corporate CA certificates mount (read-only staging; the entrypoint copies
+    // them into /usr/local/share/ca-certificates with a `.crt` name and runs
+    // update-ca-certificates). Mirrors /tmp/.host-ssh and /tmp/.host-aws.
+    //
+    // A directory mounts at /tmp/.host-ca; a single file mounts at
+    // /tmp/.host-ca/<name>.crt so the entrypoint always sees a directory and
+    // the certificate keeps a recognisable name. Docker creates the parent.
+    if let Some(ref ca) = resolved_ca {
+        mounts.push(Mount {
+            target: Some(ca.mount_target.clone()),
+            source: Some(ca.host_path.clone()),
+            typ: Some(MountTypeEnum::BIND),
+            read_only: Some(true),
+            ..Default::default()
+        });
+    }
+
     // AWS config mount (read-only)
     // Mount if: Bedrock profile auth needs it, OR a global aws_config_path is set
     let should_mount_aws = if project.backend == Backend::Bedrock {
@@ -1306,6 +1361,13 @@ pub async fn create_container(
         compute_claude_code_settings_fingerprint(merged_cc_settings.as_ref(), project.sandbox_mode_enabled));
     labels.insert("triple-c.instructions-fingerprint".to_string(),
         combined_instructions.as_ref().map(|s| sha256_hex(s)).unwrap_or_default());
+    // Written unconditionally, even when empty — `container_needs_recreation`
+    // is label-based and never diffs env or mounts, so without this a changed
+    // CA path would silently do nothing until some unrelated setting forced a
+    // rebuild. The fingerprint covers the certificate *bytes* as well as the
+    // path, so swapping a rotated CA in at the same location is caught too.
+    labels.insert("triple-c.ca-fingerprint".to_string(),
+        ca_certs::compute_ca_fingerprint(effective_ca_path));
     labels.insert("triple-c.git-user-name".to_string(), effective_git_name.unwrap_or_default().to_string());
     labels.insert("triple-c.git-user-email".to_string(), effective_git_email.unwrap_or_default().to_string());
     labels.insert("triple-c.git-token-hash".to_string(),
@@ -1911,6 +1973,7 @@ pub async fn container_needs_recreation(
     timezone: Option<&str>,
     global_claude_code_settings: Option<&ClaudeCodeSettings>,
     default_ssh_key_path: Option<&str>,
+    default_ca_cert_path: Option<&str>,
     default_git_user_name: Option<&str>,
     default_git_user_email: Option<&str>,
 ) -> Result<bool, String> {
@@ -2074,6 +2137,28 @@ pub async fn container_needs_recreation(
             "SSH key path mismatch (container={:?}, expected={:?})",
             ssh_mount_source,
             effective_ssh
+        );
+        return Ok(true);
+    }
+
+    // ── Corporate CA certificates ────────────────────────────────────────
+    // Both the resolved path and the certificate contents, so replacing a
+    // rotated CA at the same path recreates the container — the copy inside
+    // the container is made once, at start, and nothing else would notice.
+    //
+    // A container predating this feature has no label, i.e. "", which is also
+    // what an unconfigured CA fingerprints as — so existing installs are not
+    // churned until a CA is actually set.
+    let expected_ca_fp = ca_certs::compute_ca_fingerprint(resolve_with_global(
+        project.ca_cert_path.as_deref(),
+        default_ca_cert_path,
+    ));
+    let container_ca_fp = get_label("triple-c.ca-fingerprint").unwrap_or_default();
+    if container_ca_fp != expected_ca_fp {
+        log::info!(
+            "Corporate CA certificate mismatch (container={:?}, expected={:?})",
+            container_ca_fp,
+            expected_ca_fp
         );
         return Ok(true);
     }
