@@ -509,6 +509,10 @@ This lives in the sidebar under **Settings → Claude Authentication**.
    code to copy — this flow finishes on an Anthropic-hosted page, not a local callback.
 4. Paste the code back into Triple-C. The token is captured and written straight to the keychain.
 
+The code is long and easy to truncate. If Anthropic refuses it, the dialog says so and lets you
+paste another one without restarting the sign-in — the CLI is still waiting. After a few refusals
+the flow gives up and reports it rather than sitting there.
+
 Only one sign-in can run at a time, and the whole flow times out after 15 minutes. A long-lived
 token requires a Claude subscription; without one, `setup-token` finishes without printing a token
 and nothing is stored.
@@ -1156,6 +1160,12 @@ The sandbox container (Ubuntu 24.04) comes pre-installed with:
 | openssh-client | — | SSH for git and remote access |
 
 The container also includes **clipboard shims** (`xclip`, `xsel`, `pbcopy`) that forward copy operations to the host via OSC 52, a **browser shim** (`triple-c-open`, installed as `xdg-open`, `sensible-browser`, `www-browser`, `x-www-browser` and `$BROWSER`) that relays URLs to your host browser — see [Opening URLs in Your Browser](#opening-urls-in-your-browser-url-relay) — and an **audio shim** (`rec`, `arecord`) for future voice mode support.
+
+It also ships the **system libraries a browser needs to run** (`libnss3`, `libgbm1`, `libatk*`, `libasound2t64`, `libcups2t64`, `libpango`, `libdrm2`, fonts, and the rest of the set Playwright asks for). So `npx playwright install chromium` gives you a browser that actually starts. Before these were baked in, that download succeeded and the browser then died with *"Host system is missing dependencies: libnss3.so"*, which is why `sudo apt install google-chrome-stable` looked like the cure — apt was quietly installing the same libraries as Chrome's own dependencies.
+
+The **browsers themselves are not pre-installed** — they are hundreds of megabytes and tied to the Playwright version you use. Install one with the Browser tab's setup buttons, or `npx playwright install chromium` in a terminal. They land in `~/.cache/ms-playwright`, which is on the home volume, so a browser survives container recreation and base-image migration and is only lost on a project **Reset**.
+
+If your project's container was created from an older base image, it won't have the libraries — the Browser tab's install action detects that and installs them for you first, and says so while it does. That install lives in the container's writable layer, so it is undone by a **Reset** and by a base-image migration; migrating the project onto the current base image is what picks the libraries up for good.
 
 You can install additional tools at runtime with `sudo apt install`, `pip install`, `npm install -g`, etc. Installed packages persist across container stops (but not across resets).
 

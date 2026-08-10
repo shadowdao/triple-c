@@ -386,4 +386,24 @@ Users can override this in Settings via the global `docker_socket_path` option.
 
 **Shims**: `xclip`/`xsel`/`pbcopy` (OSC 52 clipboard forwarding), `xdg-open`/`sensible-browser`/`www-browser`/`x-www-browser`/`$BROWSER` (OSC 7777 URL relay to the host browser), `rec`/`arecord` (audio FIFO for voice mode)
 
+**Browser runtime libraries**: the shared libraries Chromium links against (`libnss3`, `libgbm1`,
+`libatk*`, `libasound2t64`, `libcups2t64`, `libpango`, `libdrm2`, … plus fonts) are baked in, via
+`npx playwright install-deps chromium` at build time. Without them `playwright install chromium`
+downloads a browser that then dies at launch with *"Host system is missing dependencies:
+libnss3.so"* — which is why installing `google-chrome-stable` used to look like the fix (apt was
+pulling the libraries in as *its* dependencies). Measured cost of the layer: +99 packages,
+**+334 MiB unpacked / +119 MiB compressed** (2950 → 3284 MiB unpacked, 759 → 878 MiB compressed).
+Two thirds of that is not avoidable by trimming — `libgbm1`, which Chromium needs, depends on
+`mesa-libgallium`, which depends on `libllvm20`. The list is taken from Playwright rather than
+hand-written so it cannot rot against Ubuntu 24.04's `t64` renames or a future Chromium dependency,
+and the `install-deps --dry-run` that follows it is a build-time assertion: on a platform
+Playwright has no list for, `install-deps` installs nothing and still exits 0.
+
+**Browser binaries are deliberately not baked.** They are large, they are version-coupled to
+whatever Playwright the user installs, and they already persist: `~/.cache/ms-playwright` is inside
+the home volume, so a downloaded browser survives container recreation *and* base-image migration.
+The libraries are the opposite — a runtime `apt-get install` lands in the container's writable
+layer, is re-paid after every Reset, and is lost on migration (which replays apt from a manifest
+against the new base). Baking one and not the other puts each half where it already persists.
+
 **Default user**: `claude` (UID/GID 1000, remapped by entrypoint to match host)

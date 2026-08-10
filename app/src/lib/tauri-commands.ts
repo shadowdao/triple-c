@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, ImageUpdateInfo, FileEntry, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, PlaywrightDetection, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo } from "./types";
+import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, ImageUpdateInfo, FileEntry, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo } from "./types";
 
 // Docker
 export const checkDocker = () => invoke<boolean>("check_docker");
@@ -182,6 +182,24 @@ export const getBrowserViewStatus = (projectId: string) =>
 /** Probe for Playwright without starting anything — used to re-check after installing it. */
 export const checkBrowserViewSupport = (projectId: string) =>
   invoke<PlaywrightDetection>("check_browser_view_support", { projectId });
+/**
+ * Install `playwright` + `@playwright/cli` into the container's `/workspace`.
+ *
+ * A container mutation, so it only ever runs from an explicit click. Progress
+ * streams on the existing `container-progress` event; the result carries a
+ * fresh probe. Browsers are a separate action — see below.
+ */
+export const installBrowserViewSupport = (projectId: string) =>
+  invoke<BrowserSetupOutcome>("install_browser_view_support", { projectId });
+/**
+ * Install a browser and the apt libraries it needs, then verify it launches.
+ * `chromium` is Playwright's own build; `chrome` is the channel
+ * `@playwright/mcp` asks for. Hundreds of MB — never call this implicitly.
+ */
+export const installBrowserViewBrowser = (
+  projectId: string,
+  browser: BrowserInstallTarget,
+) => invoke<BrowserSetupOutcome>("install_browser_view_browser", { projectId, browser });
 
 // Shared Claude Code auth token — one `claude setup-token` run authenticates
 // every Anthropic-backend project. The token itself is never exposed here: it

@@ -458,13 +458,39 @@ export interface PlaywrightDetection {
   node_version: string | null;
   playwright_version: string | null;
   playwright_path: string | null;
+  /** Playwright's own `cli.js`, which installs browsers and their apt libraries. */
+  playwright_cli: string | null;
   /** Whether the resolved Playwright declares the `browser.bind()` live-dashboard API. */
   has_bind: boolean;
   cli_version: string | null;
   cli_entry: string | null;
-  /** Module roots the probe searched, echoed back for the "not found" message. */
+  /** Browser bundles in `~/.cache/ms-playwright`, e.g. `chromium-1200`. Never `ffmpeg-*`. */
+  browsers: string[];
+  /** Path to Google Chrome when the `chrome` channel — what `@playwright/mcp`
+   *  asks for — is installed. It is an apt package, so it is never in `browsers`. */
+  chrome_channel: string | null;
+  /** Module roots the probe searched, echoed back for the "not found" message.
+   *  Includes the npx cache (`~/.npm/_npx/*​/node_modules`), which is where a
+   *  Playwright installed through Claude Code's MCP setup actually lives. */
   searched: string[];
 }
+
+/** Result of an install action. Mirrors Rust `BrowserSetupOutcome`. */
+export interface BrowserSetupOutcome {
+  /** Fresh probe taken after the install, so the pane can update itself. */
+  detection: PlaywrightDetection;
+  /** Tail of the real npm/apt/Playwright output — shown instead of a generic message. */
+  log: string;
+  /** Whether a browser was actually started and closed. `null` when the step
+   *  didn't try (the package step doesn't). */
+  browser_launched: boolean | null;
+  /** Something that didn't fail the action but the user still needs to know. */
+  warning: string | null;
+}
+
+/** Browsers the pane can install. `chromium` is Playwright's own build;
+ *  `chrome` is the Google Chrome channel `@playwright/mcp` asks for. */
+export type BrowserInstallTarget = "chromium" | "chrome";
 
 /** Mirrors Rust `BrowserViewState` (serde snake_case). */
 export type BrowserViewState = "off" | "running" | "unavailable";
@@ -524,6 +550,26 @@ export interface ClaudeTokenProgressEvent {
 export interface ClaudeTokenOutputEvent {
   project_id: string;
   chunk: string;
+}
+
+/** Payload of the `claude-token-link`: a sign-in URL taken from an OSC 8
+ *  hyperlink parameter, which is the only place the CLI emits it whole — the
+ *  visible text is sliced to the terminal width. **Untrusted**: it is container
+ *  output, so it goes through `sanitizeRelayUrl` with the
+ *  `ANTHROPIC_SIGN_IN_HOSTS` allowlist before it is shown or opened. */
+export interface ClaudeTokenLinkEvent {
+  project_id: string;
+  url: string;
+}
+
+/** Payload of `claude-token-code-rejected`: `claude setup-token` refused the
+ *  submitted code and is parked waiting for another one. The flow is still
+ *  alive, so this is recoverable — `attempts_remaining` is how many more codes
+ *  the backend will pass on before giving up. */
+export interface ClaudeTokenCodeRejectedEvent {
+  project_id: string;
+  message: string;
+  attempts_remaining: number;
 }
 
 // ── Container base-image migration ───────────────────────────────────────────

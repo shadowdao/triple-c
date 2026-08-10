@@ -426,6 +426,8 @@ pub fn run() {
             browser_view::commands::set_browser_view_enabled,
             browser_view::commands::get_browser_view_status,
             browser_view::commands::check_browser_view_support,
+            browser_view::commands::install_browser_view_support,
+            browser_view::commands::install_browser_view_browser,
             // Shared Claude Code auth token
             commands::auth_token_commands::acquire_claude_token,
             commands::auth_token_commands::submit_claude_token_code,

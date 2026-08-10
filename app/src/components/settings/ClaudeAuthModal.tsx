@@ -27,6 +27,9 @@ interface Props {
 const PHASE_STATUS: Record<string, { tone: StatusTone; label: string }> = {
   waiting: { tone: "busy", label: "Waiting for sign-in" },
   finishing: { tone: "busy", label: "Finishing sign-in" },
+  // The CLI refused a code and is back at its prompt. Distinct from "failed":
+  // the flow is still live and another code will be accepted.
+  rejected: { tone: "error", label: "Code rejected — try again" },
   succeeded: { tone: "ok", label: "Token stored" },
   failed: { tone: "error", label: "Authentication failed" },
 };
@@ -88,7 +91,9 @@ export default function ClaudeAuthModal({
         ? PHASE_STATUS.failed
         : flow.codeSubmitted
           ? PHASE_STATUS.finishing
-          : PHASE_STATUS.waiting;
+          : flow.codeRejections > 0
+            ? PHASE_STATUS.rejected
+            : PHASE_STATUS.waiting;
 
   // Split for display only. `flow.signInUrl` has already passed the host
   // allowlist; this decides which half of it an ellipsis is allowed to eat.

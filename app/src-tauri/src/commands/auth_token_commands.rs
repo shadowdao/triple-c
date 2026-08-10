@@ -23,6 +23,28 @@
 //! * The flow needs a way to deliver the pasted code, hence
 //!   [`submit_claude_token_code`] and the stdin channel below. Without it the
 //!   command would simply sit at the prompt until it timed out.
+//!
+//!   And the code can be *refused*. On a bad paste the CLI prints
+//!   `OAuth error: Invalid code…` / `Press Enter to retry.` and then blocks on
+//!   stdin waiting for that Enter — it does **not** exit. Nothing recognised
+//!   that, so a rejected code used to wedge the flow until [`SETUP_TIMEOUT`]
+//!   with the UI still claiming it was finishing. [`detect_code_rejection`]
+//!   spots it, [`CODE_REJECTED_EVENT`] tells the user, and the Enter is sent
+//!   for them so their next code has a prompt to land in — bounded by
+//!   [`MAX_CODE_ATTEMPTS`], because a retry loop nobody can win is just the
+//!   same hang with more steps.
+//!
+//! * The URL is emitted as an **OSC 8 hyperlink**, and the visible text of
+//!   that hyperlink is sliced by the CLI into terminal-width pieces on
+//!   separate lines. Measured against 2.1.226: the URL is 346 characters, and
+//!   at 80 columns it arrives as five separate hyperlink emissions, each
+//!   carrying the *complete* URL in its OSC 8 parameter and 80 characters of
+//!   it as visible text. Scraping the visible text therefore yields a
+//!   truncated URL that still parses, still points at claude.com, and still
+//!   fails to authorise — the worst possible shape of wrong. The parameter is
+//!   contiguous and authoritative, so [`AnsiStripper`] surfaces it and
+//!   [`LINK_EVENT`] carries it to the UI, which allowlists it before it is
+//!   shown or opened.
 //! * [`crate::auth_bridge`] is **not involved**. There is no container-local
 //!   listener to reach, so there is nothing for it to bridge.
 //!
@@ -66,6 +88,19 @@ const PROGRESS_EVENT: &str = "claude-token-progress";
 /// Redacted output from `claude setup-token`, so the UI can show the user the
 /// URL to visit. Payload `{ project_id, chunk }`.
 const OUTPUT_EVENT: &str = "claude-token-output";
+
+/// A sign-in URL lifted from an OSC 8 hyperlink parameter, which is the only
+/// place the *whole* URL appears — see the module docs. Payload
+/// `{ project_id, url }`.
+///
+/// This is a candidate, not a verdict: the payload is container output, so the
+/// frontend re-parses it and applies the `ANTHROPIC_SIGN_IN_HOSTS` allowlist
+/// before showing it and again before handing it to the OS opener.
+const LINK_EVENT: &str = "claude-token-link";
+
+/// The CLI refused the submitted code and is waiting to be handed another.
+/// Payload `{ project_id, message, attempts_remaining }`.
+const CODE_REJECTED_EVENT: &str = "claude-token-code-rejected";
 
 /// How long to wait for the whole flow. Generous: the user has to switch to a
 /// browser, sign in, and approve. Bounded so a wedged exec can't leak a task.
@@ -118,6 +153,114 @@ fn is_token_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'-' || b == b'_'
 }
 
+/// How far into a line a break has to sit before it can be believed to be the
+/// terminal's right margin rather than the end of a line of prose.
+///
+/// This is what makes reassembling a wrapped credential safe. Without it,
+/// "join a credential-shaped run to whatever starts the next line" would happily
+/// weld `sk-ant-oat01-…` in a usage example onto the first word below it and
+/// manufacture a token-length string out of two unrelated things — silently
+/// storing a credential that cannot work, which is the exact failure
+/// [`MIN_TOKEN_BODY`] exists to prevent. A hard wrap, by contrast, always breaks
+/// at the pty's width, and no pty this code can be handed is narrower than 40
+/// columns (Docker's default is 80; [`SETUP_TOKEN_SCRIPT`] asks for 400).
+const MIN_WRAP_COLUMN: usize = 40;
+
+/// How many hard wraps one credential may be reassembled across. A ~103
+/// character token needs one at 80 columns and two at 40; three is slack, and a
+/// bound at all stops a pathological input walking the whole transcript.
+const MAX_CREDENTIAL_WRAPS: usize = 3;
+
+/// A credential-shaped run of characters, possibly spanning hard wraps.
+struct CredentialRun {
+    /// One past the last byte of the run, embedded line breaks included.
+    end: usize,
+    /// How many credential characters it holds, line breaks excluded.
+    body_len: usize,
+    /// The run ran into the end of the buffer, so more input could extend it.
+    open: bool,
+}
+
+/// Walk a credential body forwards from `body_start`, stepping over the hard
+/// line breaks a pty inserts when the value is wider than the terminal.
+///
+/// Wrapping is not hypothetical and it is not harmless. `stty cols` in
+/// [`SETUP_TOKEN_SCRIPT`] fails *silently* (`2>/dev/null || true`), and an
+/// 80-column fallback splits the ~103 character token across two lines. Before
+/// this, that produced two bad outcomes at once: the parser saw only a
+/// too-short fragment and the whole sign-in failed for no visible reason, while
+/// [`redact_complete`] masked the first line — which carries the `sk-ant-`
+/// marker — and printed the *second* line, the tail of a live credential,
+/// straight to the UI. Both halves are handled here so the two can never
+/// disagree about where a credential ends.
+///
+/// The column test is measured from the last line break *in the buffer given*.
+/// For [`SecretRedactor`], text earlier on the same line may already have been
+/// emitted and drained, so the measured column can be shorter than the true one
+/// — which can only make the scan *refuse* a join it would otherwise make,
+/// never invent one. In practice it does not bite: the redactor withholds from
+/// the marker onwards, so the whole credential and any wrap inside it are
+/// together in the buffer by the time this runs.
+fn scan_credential_body(bytes: &[u8], body_start: usize) -> CredentialRun {
+    let mut end = body_start;
+    let mut body_len = 0usize;
+    let mut wraps = 0usize;
+
+    loop {
+        while end < bytes.len() && is_token_byte(bytes[end]) {
+            end += 1;
+            body_len += 1;
+        }
+
+        // Ran out of input mid-run: the rest may be in the next chunk.
+        if end >= bytes.len() {
+            return CredentialRun { end, body_len, open: true };
+        }
+        if bytes[end] != b'\n' || wraps >= MAX_CREDENTIAL_WRAPS {
+            return CredentialRun { end, body_len, open: false };
+        }
+
+        // A run already long enough to *be* a credential does not need
+        // continuing, and continuing it is how the reassembly turns into a
+        // fabrication machine: a repainting TUI prints `Your token: <token>\n`
+        // over and over, so the character after the break is very often another
+        // token character belonging to the next frame entirely. Stopping here
+        // means the only runs ever joined are the ones too short to stand alone
+        // — which is exactly what a wrap produces.
+        //
+        // The cost is a token wrapped at a width between ~93 and ~102 columns,
+        // where the first line would already clear this bar. No pty in this flow
+        // is that size (Docker gives 80, [`SETUP_TOKEN_SCRIPT`] asks for 400),
+        // and the outcome there is the pre-existing loud failure, not a wrong
+        // credential.
+        if body_len >= MIN_TOKEN_BODY {
+            return CredentialRun { end, body_len, open: false };
+        }
+
+        let line_start = bytes[..end]
+            .iter()
+            .rposition(|b| *b == b'\n')
+            .map_or(0, |i| i + 1);
+        if end - line_start < MIN_WRAP_COLUMN {
+            return CredentialRun { end, body_len, open: false };
+        }
+
+        // The break is at a plausible margin, so whether this is a wrap turns on
+        // what follows it. A continuation resumes in column 0 with more
+        // credential characters; anything else — a blank line, an indent, prose
+        // — ends the run.
+        if end + 1 >= bytes.len() {
+            return CredentialRun { end, body_len, open: true };
+        }
+        if !is_token_byte(bytes[end + 1]) {
+            return CredentialRun { end, body_len, open: false };
+        }
+
+        wraps += 1;
+        end += 1;
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Token extraction
 // ─────────────────────────────────────────────────────────────────────────────
@@ -129,6 +272,12 @@ fn is_token_byte(b: u8) -> bool {
 ///   * the value must carry the documented `sk-ant-oat01-` prefix;
 ///   * the prefix must not be glued to the tail of a longer word;
 ///   * at least [`MIN_TOKEN_BODY`] token characters must follow it.
+///
+/// Those characters may be split across hard line breaks — see
+/// [`scan_credential_body`] — and the breaks are removed from the value. The
+/// length floor is applied to the *reassembled* body, so a fragment is still
+/// never accepted on its own; reassembly only ever turns a failure into the
+/// whole credential, never a fragment into a plausible one.
 ///
 /// The **last** match wins. The command narrates before it succeeds, and a TUI
 /// may repaint the same frame repeatedly, so earlier matches are either prose
@@ -147,16 +296,15 @@ pub fn parse_setup_token(output: &str) -> Option<String> {
             continue;
         }
 
-        let body_start = start + TOKEN_PREFIX.len();
-        let mut end = body_start;
-        while end < bytes.len() && is_token_byte(bytes[end]) {
-            end += 1;
-        }
-        if end - body_start < MIN_TOKEN_BODY {
+        let run = scan_credential_body(bytes, start + TOKEN_PREFIX.len());
+        if run.body_len < MIN_TOKEN_BODY {
             continue;
         }
 
-        found = Some(output[start..end].to_string());
+        // `run.end` lands on a non-token byte or the end of the buffer, and
+        // every non-token byte is either ASCII or a UTF-8 lead byte, so both
+        // ends are char boundaries.
+        found = Some(output[start..run.end].replace('\n', ""));
     }
 
     found
@@ -167,6 +315,12 @@ pub fn parse_setup_token(output: &str) -> Option<String> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Mask every *complete* credential in `text`.
+///
+/// A credential wrapped across lines is masked as one span, line breaks
+/// included, so the placeholder replaces the whole thing rather than leaving the
+/// tail visible on the next line. That welds the two display lines together;
+/// losing a line break in the transcript is a fair price for not printing half a
+/// live credential to the UI.
 fn redact_complete(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
@@ -180,19 +334,15 @@ fn redact_complete(text: &str) -> String {
         if start > 0 && is_token_byte(bytes[start - 1]) {
             continue;
         }
-        let body_start = start + SECRET_MARKER.len();
-        let mut end = body_start;
-        while end < bytes.len() && is_token_byte(bytes[end]) {
-            end += 1;
-        }
-        if end - body_start < MIN_SECRET_BODY {
+        let run = scan_credential_body(bytes, start + SECRET_MARKER.len());
+        if run.body_len < MIN_SECRET_BODY {
             continue;
         }
 
         out.push_str(&text[copied..start]);
         out.push_str(SECRET_PLACEHOLDER);
-        copied = end;
-        cursor = end;
+        copied = run.end;
+        cursor = run.end;
     }
 
     out.push_str(&text[copied..]);
@@ -205,15 +355,14 @@ fn redact_complete(text: &str) -> String {
 fn holdback_index(text: &str) -> usize {
     let bytes = text.as_bytes();
 
-    // A credential already under way: the last marker with nothing but token
-    // characters after it. If the *last* marker fails that test, no earlier one
-    // can pass it either — the disqualifying character lies after them all.
+    // A credential already under way: the last marker whose body runs to the end
+    // of what we have, so the next chunk could extend it. If the *last* marker
+    // fails that test, no earlier one can pass it either — the disqualifying
+    // character lies after them all. A body that stops at a hard wrap counts as
+    // still open, because the continuation is what the next chunk will bring.
     if let Some(start) = text.rfind(SECRET_MARKER) {
         let clean_start = start == 0 || !is_token_byte(bytes[start - 1]);
-        let body_all_token = bytes[start + SECRET_MARKER.len()..]
-            .iter()
-            .all(|b| is_token_byte(*b));
-        if clean_start && body_all_token {
+        if clean_start && scan_credential_body(bytes, start + SECRET_MARKER.len()).open {
             return start;
         }
     }
@@ -288,18 +437,59 @@ fn utf8_len(b: u8) -> usize {
 /// a separator can never fabricate or destroy a match.
 const CURSOR_MOVE_FINALS: &[u8] = b"ABCDEFGHd";
 
+/// Escape intermediates that introduce a **three**-byte sequence: `ESC`, the
+/// intermediate, then one final byte.
+///
+/// Claude Code prefixes every repaint frame with `ESC ( B` (designate ASCII as
+/// G0). Treating that as a two-byte escape — which is what "anything else is two
+/// bytes" did — consumed `ESC (` and emitted the `B` as ordinary text. Mostly
+/// that was a stray letter in the transcript; landing immediately before a
+/// token it would have glued `B` onto `sk-ant-oat01-…` and made
+/// [`parse_setup_token`] reject a perfectly good credential.
+const ESCAPE_INTERMEDIATES: &[u8] = b"()*+-./#%";
+
+/// Largest OSC 8 target this will carry. Real authorize URLs are ~350
+/// characters (measured: 346 against 2.1.226); anything past a few kilobytes is
+/// not a link, and the frontend's own relay cap is 8192.
+const MAX_LINK_LENGTH: usize = 8192;
+
+/// Cap on undrained OSC 8 targets, so a container printing hyperlinks in a loop
+/// cannot grow [`AnsiStripper`] without bound. The caller drains after every
+/// chunk, so reaching this means something pathological is happening.
+const MAX_PENDING_LINKS: usize = 32;
+
+/// Pull the link target out of an OSC 8 payload — everything between `ESC ]`
+/// and the terminator.
+///
+/// Shape: `8;<params>;<uri>`, e.g. `8;id=1umaq0e;https://claude.com/…`. The
+/// closing half of a hyperlink is `8;;` and so yields `None`, as does any other
+/// OSC (window title, the URL relay's own OSC 7777, …).
+fn osc8_target(payload: &[u8]) -> Option<String> {
+    let payload = std::str::from_utf8(payload).ok()?;
+    let rest = payload.strip_prefix("8;")?;
+    let uri = &rest[rest.find(';')? + 1..];
+    if uri.is_empty() || uri.len() > MAX_LINK_LENGTH {
+        return None;
+    }
+    Some(uri.to_string())
+}
+
 /// Strip terminal control sequences from the front of `bytes`, stopping at the
-/// first incomplete sequence or truncated character. Returns the clean text and
-/// how many bytes were consumed.
-fn strip_ansi_prefix(bytes: &[u8]) -> (String, usize) {
+/// first incomplete sequence or truncated character. Returns the clean text, any
+/// OSC 8 link targets found, and how many bytes were consumed.
+fn strip_ansi_prefix(bytes: &[u8]) -> (String, Vec<String>, usize) {
     let mut out = String::with_capacity(bytes.len());
+    let mut links: Vec<String> = Vec::new();
     let mut i = 0usize;
 
-    while i < bytes.len() {
+    let consumed = 'scan: loop {
+        if i >= bytes.len() {
+            break 'scan i;
+        }
         match bytes[i] {
             0x1b => {
                 if i + 1 >= bytes.len() {
-                    return (out, i);
+                    break 'scan i;
                 }
                 match bytes[i + 1] {
                     // CSI: parameter/intermediate bytes, then a final 0x40..=0x7e.
@@ -309,7 +499,7 @@ fn strip_ansi_prefix(bytes: &[u8]) -> (String, usize) {
                             j += 1;
                         }
                         if j >= bytes.len() {
-                            return (out, i);
+                            break 'scan i;
                         }
                         if CURSOR_MOVE_FINALS.contains(&bytes[j]) {
                             out.push(' ');
@@ -318,29 +508,46 @@ fn strip_ansi_prefix(bytes: &[u8]) -> (String, usize) {
                     }
                     // OSC: runs until BEL or ST (ESC \).
                     b']' => {
-                        let mut j = i + 2;
+                        let payload_start = i + 2;
+                        let mut j = payload_start;
+                        let payload_end;
                         loop {
                             if j >= bytes.len() {
-                                return (out, i);
+                                break 'scan i;
                             }
                             if bytes[j] == 0x07 {
+                                payload_end = j;
                                 j += 1;
                                 break;
                             }
                             if bytes[j] == 0x1b {
                                 if j + 1 >= bytes.len() {
-                                    return (out, i);
+                                    break 'scan i;
                                 }
                                 if bytes[j + 1] == b'\\' {
+                                    payload_end = j;
                                     j += 2;
                                     break;
                                 }
                             }
                             j += 1;
                         }
+                        // The one part of an OSC worth keeping: the hyperlink
+                        // target, which is the only contiguous copy of the
+                        // sign-in URL the CLI emits.
+                        if let Some(uri) = osc8_target(&bytes[payload_start..payload_end]) {
+                            links.push(uri);
+                        }
                         i = j;
                     }
-                    // Two-byte escapes (charset selection, keypad mode, …).
+                    // Three-byte escapes: charset designation and friends.
+                    b if ESCAPE_INTERMEDIATES.contains(&b) => {
+                        if i + 2 >= bytes.len() {
+                            break 'scan i;
+                        }
+                        i += 3;
+                    }
+                    // Two-byte escapes (keypad mode, index, …).
                     _ => i += 2,
                 }
             }
@@ -355,7 +562,7 @@ fn strip_ansi_prefix(bytes: &[u8]) -> (String, usize) {
                     j += 1;
                 }
                 if j >= bytes.len() {
-                    return (out, i);
+                    break 'scan i;
                 }
                 if bytes[j] != b'\n' {
                     out.push('\n');
@@ -374,7 +581,7 @@ fn strip_ansi_prefix(bytes: &[u8]) -> (String, usize) {
             b => {
                 let len = utf8_len(b);
                 if i + len > bytes.len() {
-                    return (out, i);
+                    break 'scan i;
                 }
                 if let Ok(s) = std::str::from_utf8(&bytes[i..i + len]) {
                     out.push_str(s);
@@ -382,9 +589,9 @@ fn strip_ansi_prefix(bytes: &[u8]) -> (String, usize) {
                 i += len;
             }
         }
-    }
+    };
 
-    (out, i)
+    (out, links, consumed)
 }
 
 /// Cap on the bytes [`AnsiStripper`] will hold waiting for a control sequence
@@ -406,12 +613,17 @@ const MAX_ANSI_CARRY: usize = 64 * 1024;
 #[derive(Default)]
 struct AnsiStripper {
     carry: Vec<u8>,
+    /// OSC 8 link targets seen since the last [`AnsiStripper::take_links`].
+    /// Kept out of the return value so every existing caller and test of
+    /// `push` keeps reading as "bytes in, visible text out".
+    links: Vec<String>,
 }
 
 impl AnsiStripper {
     fn push(&mut self, chunk: &[u8]) -> String {
         self.carry.extend_from_slice(chunk);
-        let (mut out, consumed) = strip_ansi_prefix(&self.carry);
+        let (mut out, links, consumed) = strip_ansi_prefix(&self.carry);
+        self.record_links(links);
         self.carry.drain(..consumed);
 
         // Past the cap the leading sequence is not going to terminate. Drop
@@ -429,13 +641,116 @@ impl AnsiStripper {
         }
         while self.carry.len() > MAX_ANSI_CARRY {
             self.carry.drain(..1);
-            let (more, consumed) = strip_ansi_prefix(&self.carry);
+            let (more, links, consumed) = strip_ansi_prefix(&self.carry);
+            self.record_links(links);
             self.carry.drain(..consumed);
             out.push_str(&more);
         }
 
         out
     }
+
+    fn record_links(&mut self, links: Vec<String>) {
+        for link in links {
+            if self.links.len() >= MAX_PENDING_LINKS {
+                break;
+            }
+            self.links.push(link);
+        }
+    }
+
+    /// Hand over the hyperlink targets seen so far and forget them.
+    fn take_links(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.links)
+    }
+}
+
+/// Whether an OSC 8 target is worth forwarding to the UI as a sign-in candidate.
+///
+/// Deliberately shallow. The frontend re-parses it, applies the
+/// `ANTHROPIC_SIGN_IN_HOSTS` allowlist before it is displayed, and applies it
+/// again at the sink before `openUrl` — that is where the security decision
+/// lives, and duplicating a host allowlist here would be a second place for it
+/// to go stale. All this does is keep obvious junk off the wire.
+fn usable_sign_in_link(uri: &str) -> bool {
+    if !uri.starts_with("https://") && !uri.starts_with("http://") {
+        return false;
+    }
+    if uri.len() > MAX_LINK_LENGTH {
+        return false;
+    }
+    // Printable ASCII only. Control characters and whitespace are exactly how a
+    // URL is smuggled past a display, and `new URL()` on the other side strips
+    // some of them silently; a real authorize URL is percent-encoded anyway.
+    if !uri.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+        return false;
+    }
+    // This path bypasses [`SecretRedactor`] entirely, so nothing
+    // credential-shaped is allowed to ride it.
+    if uri.contains(SECRET_MARKER) {
+        return false;
+    }
+    true
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Rejected codes
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// How many codes may be refused before the flow gives up.
+///
+/// The CLI will retry forever, which is the wrong bound for a dialog: the same
+/// truncated clipboard pasted a fourth time will fail a fourth time, and a flow
+/// that never resolves is indistinguishable from the hang this replaced.
+const MAX_CODE_ATTEMPTS: usize = 3;
+
+/// How much recent output to keep for [`detect_code_rejection`]. The message
+/// lands within a few hundred characters of the paste; anything older belongs to
+/// a previous attempt.
+const REJECTION_SCAN_WINDOW: usize = 4096;
+
+/// Phrases `claude setup-token` prints when it refuses a pasted code.
+///
+/// Measured against 2.1.226 under a pty. The CLI writes
+///
+/// ```text
+/// OAuth error: Invalid code. Please make sure the full code was copied
+/// Press Enter to retry.
+/// ```
+///
+/// on two lines placed with cursor motion rather than newlines, then blocks on
+/// stdin. Either phrase is enough — matching both would make a change to one of
+/// them silently restore the hang.
+const CODE_REJECTED_MARKERS: &[&str] = &["invalid code", "press enter to retry"];
+
+/// Append `chunk` to `buf`, keeping no more than `cap` bytes of the tail.
+fn push_capped_tail(buf: &mut String, chunk: &str, cap: usize) {
+    buf.push_str(chunk);
+    if buf.len() <= cap {
+        return;
+    }
+    let cut = buf.len() - cap;
+    let cut = (cut..buf.len())
+        .find(|i| buf.is_char_boundary(*i))
+        .unwrap_or(buf.len());
+    buf.drain(..cut);
+}
+
+/// Whether `text` shows the CLI has refused a code and parked on stdin.
+///
+/// Whitespace is collapsed before matching because [`strip_ansi_prefix`] turns
+/// the cursor moves that lay this message out into spaces and line breaks, so
+/// the phrase arrives with runs of blanks inside it that are not in the source
+/// string.
+fn detect_code_rejection(text: &str) -> bool {
+    let normalized: String = text
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    CODE_REJECTED_MARKERS
+        .iter()
+        .any(|marker| normalized.contains(marker))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -481,17 +796,43 @@ fn emit_output(app: &AppHandle, project_id: &str, chunk: &str) {
     );
 }
 
+fn emit_link(app: &AppHandle, project_id: &str, url: &str) {
+    let _ = app.emit(
+        LINK_EVENT,
+        serde_json::json!({ "project_id": project_id, "url": url }),
+    );
+}
+
+fn emit_code_rejected(app: &AppHandle, project_id: &str, message: &str, remaining: usize) {
+    let _ = app.emit(
+        CODE_REJECTED_EVENT,
+        serde_json::json!({
+            "project_id": project_id,
+            "message": message,
+            "attempts_remaining": remaining,
+        }),
+    );
+}
+
 /// Shell run inside the container.
 ///
 /// * `stty` widens the pty before Claude Code starts, so its layout engine does
 ///   not wrap the token or the sign-in URL across lines. Docker's default exec
 ///   pty is 80 columns; both are longer than that. Setting it here rather than
 ///   via a post-start resize avoids racing the process's startup.
+///
+///   400 columns, not 200: the sign-in URL is 346 characters (measured against
+///   2.1.226), so at 200 it wrapped anyway. Widening is *not* the fix for that
+///   — this line is `|| true` and fails silently, which is precisely how the
+///   truncated-URL bug survived — but it removes wrapping as a variable
+///   everywhere else in the flow. The two things that must survive a wrap
+///   regardless are handled directly: the URL comes from the OSC 8 parameter,
+///   and [`scan_credential_body`] reassembles a split token.
 /// * The `unset` line strips inherited auth so `setup-token` runs against a
 ///   clean claude.ai login instead of warning about, or deferring to, whatever
 ///   credential the container is already configured with — including a shared
 ///   token from a previous run, which is likely the very thing being replaced.
-const SETUP_TOKEN_SCRIPT: &str = r#"stty cols 200 rows 50 2>/dev/null || true
+const SETUP_TOKEN_SCRIPT: &str = r#"stty cols 400 rows 50 2>/dev/null || true
 unset CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL \
       ANTHROPIC_MODEL CLAUDE_CODE_USE_BEDROCK AWS_BEARER_TOKEN_BEDROCK
 exec claude setup-token"#;
@@ -528,6 +869,17 @@ async fn run_setup_token(
     let mut transcript = String::new();
     let deadline = tokio::time::Instant::now() + SETUP_TIMEOUT;
 
+    // The last hyperlink forwarded, so the five consecutive emissions the CLI
+    // makes for one wrapped URL become one event. Only the immediately previous
+    // one is remembered — the CLI reprints the same URL after a retry, and a
+    // genuinely different one would be news.
+    let mut last_link: Option<String> = None;
+    // Recent visible output, scanned for a rejection message. Only filled while
+    // a code is outstanding, so a repaint of an old message cannot re-fire.
+    let mut recent = String::new();
+    let mut awaiting_code_result = false;
+    let mut rejected_codes = 0usize;
+
     loop {
         // Writing stdin and reading stdout are driven from the same loop: with
         // a hijacked exec both halves ride one socket, and `input` must stay
@@ -550,6 +902,10 @@ async fn run_setup_token(
                     ));
                 }
                 let _ = input.flush().await;
+                // Arm the rejection detector. Anything the CLI says from here
+                // on is a verdict on *this* code.
+                awaiting_code_result = true;
+                recent.clear();
                 continue;
             }
             next = tokio::time::timeout_at(deadline, output.next()) => match next {
@@ -576,8 +932,65 @@ async fn run_setup_token(
         };
 
         let visible = stripper.push(&frame.into_bytes());
+
+        // Before the emptiness check: a chunk can be nothing but hyperlink
+        // wrappers, which is exactly the chunk carrying the sign-in URL.
+        for link in stripper.take_links() {
+            if !usable_sign_in_link(&link) || last_link.as_deref() == Some(link.as_str()) {
+                continue;
+            }
+            emit_link(app, project_id, &link);
+            last_link = Some(link);
+        }
+
         if visible.is_empty() {
             continue;
+        }
+
+        // A refused code parks the CLI on stdin instead of ending it, so this is
+        // the only thing between the user and a 15-minute wait.
+        if awaiting_code_result {
+            push_capped_tail(&mut recent, &visible, REJECTION_SCAN_WINDOW);
+            if detect_code_rejection(&recent) {
+                awaiting_code_result = false;
+                recent.clear();
+                rejected_codes += 1;
+
+                if rejected_codes >= MAX_CODE_ATTEMPTS {
+                    return Err(format!(
+                        "`claude setup-token` rejected the code {} times, so the sign-in was \
+                         abandoned. No token was stored. The code is long and easy to \
+                         truncate — copy all of it from the Anthropic page, then start \
+                         authentication again.",
+                        rejected_codes
+                    ));
+                }
+
+                // The CLI is parked on "Press Enter to retry" and will not draw
+                // its paste prompt again until it gets that Enter. Send it, so
+                // the user's next code has somewhere to land. Bounded above, and
+                // announced below — this is a retry the user is told about, not
+                // a loop hidden from them.
+                if let Err(e) = input.write_all(b"\r").await {
+                    return Err(format!(
+                        "`claude setup-token` rejected the code and could not be asked to \
+                         retry: {}. No token was stored.",
+                        e
+                    ));
+                }
+                let _ = input.flush().await;
+
+                let remaining = MAX_CODE_ATTEMPTS - rejected_codes;
+                let message = format!(
+                    "That code was rejected — `claude setup-token` reports the full code was \
+                     not copied. Copy it again from the Anthropic page and submit it; {} \
+                     attempt{} left.",
+                    remaining,
+                    if remaining == 1 { "" } else { "s" }
+                );
+                emit_code_rejected(app, project_id, &message, remaining);
+                emit_progress(app, project_id, &message);
+            }
         }
 
         transcript.push_str(&visible);
@@ -601,20 +1014,40 @@ async fn run_setup_token(
         emit_output(app, project_id, &tail);
     }
 
-    let exit_code = wait_for_exec_exit(&exec_id).await.unwrap_or(0);
-    if exit_code != 0 {
-        return Err(format!(
-            "`claude setup-token` exited with status {}. No token was stored — \
-             see the command output above for what went wrong.",
-            exit_code
-        ));
+    // `None` means the exit code could not be determined, not that it was zero.
+    // Falling through to the token parse is right either way — a run that
+    // printed a token succeeded whatever Docker says about it — but it is worth
+    // saying so rather than silently calling it a clean exit.
+    match wait_for_exec_exit(&exec_id).await {
+        Some(0) => {}
+        Some(code) => {
+            return Err(format!(
+                "`claude setup-token` exited with status {}. No token was stored — \
+                 see the command output above for what went wrong.",
+                code
+            ))
+        }
+        None => log::warn!(
+            "Could not read the exit status of `claude setup-token`; judging the run \
+             by whether it printed a token"
+        ),
     }
 
     parse_setup_token(&transcript).ok_or_else(|| {
-        "`claude setup-token` finished but printed no recognisable token. \
-         Nothing was stored. This usually means the login was cancelled, or the \
-         account has no Claude subscription (long-lived tokens require one)."
-            .to_string()
+        if rejected_codes > 0 {
+            format!(
+                "`claude setup-token` ended without a token after rejecting {} code{}. \
+                 Nothing was stored. Copy the whole code from the Anthropic page — it is \
+                 long and easy to truncate — then start authentication again.",
+                rejected_codes,
+                if rejected_codes == 1 { "" } else { "s" }
+            )
+        } else {
+            "`claude setup-token` finished but printed no recognisable token. \
+             Nothing was stored. This usually means the login was cancelled, or the \
+             account has no Claude subscription (long-lived tokens require one)."
+                .to_string()
+        }
     })
 }
 
@@ -1012,11 +1445,11 @@ mod tests {
         visible.push_str(&s.push(b"1mb"));
         assert_eq!(visible, "ab");
     }
-    // ── Truncated credentials ────────────────────────────────────────────
-    // `stty cols 200` runs before Claude Code starts precisely so the ~103
-    // character token never wraps. If that fails, the pty falls back to 80
-    // columns and the token arrives split across two lines. The old floor of
-    // 32 body characters believed the first half.
+    // ── Truncated and wrapped credentials ────────────────────────────────
+    // `stty cols 400` runs before Claude Code starts precisely so the ~103
+    // character token never wraps. But that line is `|| true` and fails
+    // silently, and an 80-column fallback splits the value across two lines.
+    // A fragment must never be accepted; the whole value, reassembled, must be.
 
     #[test]
     fn a_token_shorter_than_a_real_one_is_rejected() {
@@ -1028,16 +1461,105 @@ mod tests {
     }
 
     #[test]
-    fn a_line_wrapped_token_yields_nothing_rather_than_half_a_credential() {
+    fn a_truncated_token_with_no_continuation_is_still_rejected() {
+        let tok = token('N');
+        // The first half of an 80-column wrap, and nothing after it.
+        let half = format!("Your token: {}\n", &tok[..68]);
+        assert_eq!(
+            parse_setup_token(&half),
+            None,
+            "half a credential must fail loudly, not be stored truncated"
+        );
+    }
+
+    #[test]
+    fn a_line_wrapped_token_is_reassembled_whole() {
         let tok = token('N');
         // Column 12 is where `Your token: ` ends, so an 80-column pty breaks
         // the value 68 characters in.
         let wrapped = format!("Your token: {}\n{}\n", &tok[..68], &tok[68..]);
         assert_eq!(
             parse_setup_token(&wrapped),
-            None,
-            "a wrapped token must fail loudly, not be stored truncated"
+            Some(tok),
+            "the halves of a wrapped token belong to one credential"
         );
+    }
+
+    #[test]
+    fn a_token_wrapped_twice_is_reassembled_whole() {
+        let tok = token('N');
+        // A 40-column pty needs two breaks for a 103-character value.
+        let wrapped = format!("{}\n{}\n{}\n", &tok[..40], &tok[40..80], &tok[80..]);
+        assert_eq!(parse_setup_token(&wrapped), Some(tok));
+    }
+
+    /// The guard that keeps reassembly from becoming a fabrication machine: a
+    /// break early in a line is prose, not the terminal's right margin, so the
+    /// two sides are two different things and must not be welded together.
+    #[test]
+    fn a_break_before_the_margin_does_not_join_two_lines() {
+        let tail = "N".repeat(70);
+        let text = format!("{}ABC\n{}\n", TOKEN_PREFIX, tail);
+        assert_eq!(
+            parse_setup_token(&text),
+            None,
+            "a short first line is prose; joining it would invent a credential"
+        );
+    }
+
+    /// A repainting TUI prints the same line again and again, so the character
+    /// after a line break is very often the start of the next frame. Joining
+    /// there would hand back `<token>Your` instead of `<token>`.
+    #[test]
+    fn a_repaint_after_a_complete_token_is_not_joined_onto_it() {
+        let tok = token('P');
+        let output = format!("Your token: {}\n", tok).repeat(3);
+        assert_eq!(parse_setup_token(&output), Some(tok));
+    }
+
+    /// The wrap has to produce a *whole* credential to be believed. Two short
+    /// pieces that still fall short of the floor are not one.
+    #[test]
+    fn joining_a_wrap_does_not_lower_the_length_floor() {
+        let body_a = "N".repeat(45);
+        let body_b = "N".repeat(20);
+        let text = format!("{}{}\n{}\n", TOKEN_PREFIX, body_a, body_b);
+        assert_eq!(parse_setup_token(&text), None);
+    }
+
+    /// The security half of the same bug. Before the parser could reassemble a
+    /// wrapped token, the redactor could not either: it masked the first line,
+    /// which carries the `sk-ant-` marker, and printed the second — the tail of
+    /// a live credential — to the UI in clear.
+    #[test]
+    fn redaction_masks_both_halves_of_a_wrapped_token() {
+        let tok = token('R');
+        let mut r = SecretRedactor::default();
+        let mut seen = r.push(&format!("Your token: {}\n{}\n", &tok[..68], &tok[68..]));
+        seen.push_str(&r.flush());
+        assert!(!seen.contains(TOKEN_PREFIX), "leaked: {}", seen);
+        assert!(
+            !seen.contains(&tok[68..]),
+            "the tail of the credential reached the UI: {}",
+            seen
+        );
+        assert!(seen.contains(SECRET_PLACEHOLDER));
+    }
+
+    /// …and the same when the wrap lands on a chunk boundary, which is the way
+    /// it actually arrives off the socket.
+    #[test]
+    fn redaction_masks_a_wrapped_token_split_across_chunks() {
+        let tok = token('S');
+        let mut r = SecretRedactor::default();
+        let mut seen = r.push(&format!("Your token: {}", &tok[..68]));
+        seen.push_str(&r.push("\n"));
+        seen.push_str(&r.push(&tok[68..]));
+        seen.push_str(&r.push("\ndone\n"));
+        seen.push_str(&r.flush());
+        assert!(!seen.contains(TOKEN_PREFIX), "leaked: {}", seen);
+        assert!(!seen.contains(&tok[68..]), "leaked tail: {}", seen);
+        assert!(seen.ends_with("\ndone\n"));
     }
 
     #[test]
@@ -1047,6 +1569,165 @@ mod tests {
         assert_eq!(tok.len() - TOKEN_PREFIX.len(), 90);
         assert!(90 > MIN_TOKEN_BODY);
         assert_eq!(parse_setup_token(&format!("{}\n", tok)), Some(tok));
+    }
+
+    // ── OSC 8 sign-in link ───────────────────────────────────────────────
+    // The URL only exists in one piece inside the hyperlink parameter. Its
+    // visible text is chopped into terminal-width slices, each of them a
+    // separate, complete hyperlink emission — measured against 2.1.226 at 80
+    // columns, where a 346-character URL arrives as five of them.
+
+    /// The real sign-in URL's shape and length, from the pty capture.
+    fn sign_in_url() -> String {
+        let url = format!(
+            "https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-\
+             5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2F\
+             oauth%2Fcode%2Fcallback&scope=user%3Ainference&code_challenge={}&\
+             code_challenge_method=S256&state=su-{}",
+            "R".repeat(43),
+            "x".repeat(40)
+        );
+        assert!(url.len() > 300, "the point of this fixture is its length");
+        url
+    }
+
+    /// One hyperlink emission: the whole URL in the parameter, `visible` on
+    /// screen, then the empty `8;;` that closes it.
+    fn osc8(url: &str, visible: &str) -> String {
+        format!(
+            "\x1b]8;id=1umaq0e;{}\x07\x1b[38;2;153;153;153m{}\x1b[39m\x1b]8;;\x07",
+            url, visible
+        )
+    }
+
+    #[test]
+    fn the_full_url_survives_a_display_text_wrapped_mid_url() {
+        let url = sign_in_url();
+        let mut frame = String::new();
+        for slice in url.as_bytes().chunks(80) {
+            frame.push_str(&osc8(&url, std::str::from_utf8(slice).unwrap()));
+            frame.push_str("\r\r\n");
+        }
+
+        let mut s = AnsiStripper::default();
+        let visible = s.push(frame.as_bytes());
+        let links = s.take_links();
+
+        // The visible text is exactly the broken form the old scraper saw.
+        assert!(visible.contains(&format!("{}\n", &url[..80])));
+        assert!(!visible.contains(&url));
+
+        assert!(links.iter().all(|l| *l == url), "links: {:?}", links);
+        assert_eq!(links.len(), 5, "one emission per display slice");
+        assert!(usable_sign_in_link(&links[0]));
+    }
+
+    #[test]
+    fn the_closing_half_of_a_hyperlink_is_not_a_link() {
+        let mut s = AnsiStripper::default();
+        s.push(b"\x1b]8;;\x07");
+        assert!(s.take_links().is_empty());
+    }
+
+    #[test]
+    fn a_non_hyperlink_osc_is_not_a_link() {
+        let mut s = AnsiStripper::default();
+        // Window title, and the app's own URL relay sequence.
+        s.push(b"\x1b]0;a title\x07\x1b]7777;open;aHR0cHM6Ly9ldmlsLnRsZA==\x07");
+        assert!(s.take_links().is_empty());
+    }
+
+    #[test]
+    fn a_hyperlink_split_across_chunks_still_yields_its_target() {
+        let url = sign_in_url();
+        let frame = osc8(&url, &url[..80]);
+        let (head, tail) = frame.as_bytes().split_at(60);
+
+        let mut s = AnsiStripper::default();
+        s.push(head);
+        assert!(s.take_links().is_empty(), "incomplete: nothing to report yet");
+        s.push(tail);
+        assert_eq!(s.take_links().first().map(String::as_str), Some(url.as_str()));
+    }
+
+    #[test]
+    fn only_plausible_http_targets_reach_the_frontend() {
+        assert!(usable_sign_in_link("https://claude.ai/oauth/authorize?code=true"));
+        assert!(usable_sign_in_link("http://127.0.0.1:8123/callback"));
+        // The host allowlist lives on the frontend; these are the shallow
+        // checks that keep junk off the wire.
+        assert!(!usable_sign_in_link("file:///etc/passwd"));
+        assert!(!usable_sign_in_link("javascript:alert(1)"));
+        assert!(!usable_sign_in_link("https://claude.ai/a b"));
+        assert!(!usable_sign_in_link("https://claude.ai/\u{7f}"));
+        assert!(!usable_sign_in_link(&format!(
+            "https://claude.ai/?t={}",
+            "A".repeat(MAX_LINK_LENGTH)
+        )));
+        // Nothing credential-shaped may ride the one path that skips redaction.
+        assert!(!usable_sign_in_link(&format!(
+            "https://claude.ai/?t={}",
+            token('T')
+        )));
+    }
+
+    /// Claude Code prefixes every repaint frame with `ESC ( B`. Treating that
+    /// as a two-byte escape emitted the `B` as text — and a stray `B` glued to
+    /// the front of a token makes [`parse_setup_token`] refuse it.
+    #[test]
+    fn a_charset_designation_does_not_leave_a_letter_behind() {
+        let tok = token('U');
+        let mut s = AnsiStripper::default();
+        let visible = s.push(format!("\x1b(B\x0f{}\r\n", tok).as_bytes());
+        assert_eq!(visible, format!("{}\n", tok));
+        assert_eq!(parse_setup_token(&visible), Some(tok));
+    }
+
+    // ── Rejected codes ───────────────────────────────────────────────────
+
+    /// The exact bytes 2.1.226 emits after a bad paste, from the pty capture.
+    const REJECTION_FRAME: &[u8] =
+        b"\x1b(B\x0f\x1b[2K\x1b[1A\x1b[2K\x1b[G\x1b[1A\r\x1b[1C\x1b[4A\x1b[38;2;255;107;128m\
+          OAuth error: Invalid code. Please make sure the full code was copied\
+          \r\x1b[2B\x1b[39m\x1b[K\r\x1b[1B \x1b[38;2;177;185;249mPress \x1b[1mEnter\x1b[22m \
+          to retry.\x1b[39m\x1b[K\r\x1b[5A";
+
+    #[test]
+    fn the_real_rejection_frame_is_recognised_after_ansi_stripping() {
+        let mut s = AnsiStripper::default();
+        let visible = s.push(REJECTION_FRAME);
+        assert!(
+            detect_code_rejection(&visible),
+            "a rejected code must be seen, not waited out: {:?}",
+            visible
+        );
+    }
+
+    #[test]
+    fn cursor_motion_inside_the_message_does_not_hide_it() {
+        // The layout engine can place these words with column jumps, which
+        // become runs of spaces. Matching must survive that.
+        let mut s = AnsiStripper::default();
+        let visible = s.push(b"\x1b[2GPress\x1b[9GEnter\x1b[16Gto\x1b[20Gretry.");
+        assert!(detect_code_rejection(&visible));
+    }
+
+    #[test]
+    fn ordinary_progress_output_is_not_mistaken_for_a_rejection() {
+        assert!(!detect_code_rejection(
+            "Browser didn't open? Use the url below to sign in (c to copy)"
+        ));
+        assert!(!detect_code_rejection("Paste code here if prompted >"));
+        assert!(!detect_code_rejection("Login successful! Your token:"));
+        assert!(!detect_code_rejection(""));
+    }
+
+    /// The retry budget has to be finite: the CLI itself will loop forever, and
+    /// a flow that never resolves is the hang this replaced wearing a hat.
+    #[test]
+    fn the_retry_budget_is_bounded_and_leaves_room_for_a_retry() {
+        assert!(MAX_CODE_ATTEMPTS >= 2, "one attempt is not a retry");
+        assert!(MAX_CODE_ATTEMPTS <= 5, "the budget must actually run out");
     }
 
     // ── Bounded buffering ────────────────────────────────────────────────
@@ -1081,3 +1762,4 @@ mod tests {
         assert_eq!(parse_setup_token(&seen), Some(tok));
     }
 }
+
