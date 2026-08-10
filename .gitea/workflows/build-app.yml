@@ -395,6 +395,39 @@ jobs:
           )
           endlocal
 
+      - name: Work around WOW64 redirection for 32-bit bundlers
+        shell: cmd
+        run: |
+          rem Tauri downloads its bundlers - candle.exe, light.exe and
+          rem makensis.exe - and every one of them is 32-bit. When the runner
+          rem runs as SYSTEM its %LOCALAPPDATA% is under
+          rem C:\Windows\System32\config\systemprofile, and WOW64 redirection
+          rem serves any 32-bit process reading System32 from SysWOW64 instead -
+          rem where those directories do not exist. The bundlers then cannot see
+          rem their own folder: candle exits 0x80131700 and makensis reports
+          rem "Unable to start child process, error 0x2". Tauri surfaces neither,
+          rem only "failed to run candle.exe", which is why this is worth a
+          rem comment this long.
+          rem
+          rem Junctioning the SysWOW64 view onto the System32 originals makes the
+          rem redirected path resolve to the same files. A runner running as a
+          rem normal user has a profile outside System32 and skips all of this.
+          echo.%LOCALAPPDATA%| find /I "\system32\" >nul
+          if errorlevel 1 goto skipwow
+
+          if not exist "%WINDIR%\System32\config\systemprofile\AppData\Local\tauri" mkdir "%WINDIR%\System32\config\systemprofile\AppData\Local\tauri"
+          if not exist "%WINDIR%\SysWOW64\config\systemprofile\AppData\Local" mkdir "%WINDIR%\SysWOW64\config\systemprofile\AppData\Local"
+          if not exist "%WINDIR%\SysWOW64\config\systemprofile\AppData\Local\tauri" mklink /J "%WINDIR%\SysWOW64\config\systemprofile\AppData\Local\tauri" "%WINDIR%\System32\config\systemprofile\AppData\Local\tauri"
+
+          if not exist "%WINDIR%\System32\config\systemprofile\.cache" mkdir "%WINDIR%\System32\config\systemprofile\.cache"
+          if not exist "%WINDIR%\SysWOW64\config\systemprofile\.cache" mklink /J "%WINDIR%\SysWOW64\config\systemprofile\.cache" "%WINDIR%\System32\config\systemprofile\.cache"
+
+          echo WOW64 junctions in place for the SYSTEM profile
+          goto :eof
+
+          :skipwow
+          echo Runner profile is outside System32 - WOW64 junctions not needed
+
       - name: Install Rust stable
         run: |
           where rustup >nul 2>&1 && (
