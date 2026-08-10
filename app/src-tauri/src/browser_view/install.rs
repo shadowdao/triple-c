@@ -11,10 +11,14 @@
 //!    image leaves npm's prefix at `/usr`, so the unprivileged form fails with
 //!    `EACCES` first.
 //!  * `playwright install chromium` downloads a browser that then cannot start,
-//!    because the base image ships **none** of Chromium's shared libraries
+//!    because the image shipped **none** of Chromium's shared libraries
 //!    (`libnss3`, `libgbm1`, `libatk*`, `libasound2`, `libcups2`, …). The
 //!    download succeeds, the launch fails, and the error reads like a Playwright
-//!    bug.
+//!    bug. Current base images bake those libraries in (see `container/
+//!    Dockerfile`), so this step is now usually a no-op — but a project stays on
+//!    the base image it was first built from until someone migrates it, so the
+//!    old case is the *normal* case and has to keep working. Hence: check, then
+//!    install only if needed, and say which happened.
 //!  * Getting from there to a working pane took a long tail of further commands.
 //!
 //! ## Where the packages go, and why it is `/workspace`
@@ -86,6 +90,10 @@ pub const INSTALL_DIR: &str = "/workspace";
 const NPM_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// `apt-get update` plus a dozen library packages, or Google's apt repository.
 const DEPS_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+/// `apt-get install -s` over ~100 already-installed packages. Local work; a
+/// container that cannot answer this in two minutes gets the libraries
+/// installed rather than a hang.
+const DEPS_CHECK_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 /// The browser download itself, on a bad connection.
 const BROWSER_TIMEOUT: Duration = Duration::from_secs(45 * 60);
 /// Starting a headless browser, and one page load.
@@ -148,8 +156,9 @@ impl BrowserTarget {
     pub fn download_note(self) -> &'static str {
         match self {
             Self::Chromium => {
-                "Playwright's Chromium build plus the system libraries it needs — several \
-                 hundred MB in total, a few minutes on a normal connection"
+                "Playwright's Chromium build — a few hundred MB, a few minutes on a normal \
+                 connection. The system libraries it needs are already in current base images; \
+                 on an older container they are installed first"
             }
             Self::Chrome => {
                 "Google Chrome from Google's apt repository, with its dependencies — roughly \
@@ -302,47 +311,83 @@ pub async fn install_browser(
     // cause of the "Chromium downloads and then dies" reports, so it gets its
     // own progress line rather than being folded into the download.
     //
-    // This is what `playwright install --with-deps` does internally. Running
-    // `install-deps` directly *as root* is the same apt work without depending
-    // on Playwright's own privilege escalation: read from the shipped source, it
-    // shells out to `sudo -- sh -c "apt-get update && apt-get install …"` when
-    // it is not root, which would work here (`claude` has passwordless sudo) but
-    // puts an extra failure mode between the user and the answer.
+    // Current base images bake these in, so on an up-to-date container there is
+    // nothing to do here. That is *not* a reason to drop the step: a project
+    // keeps the base image it was first built from until it is migrated, so
+    // containers without the libraries are the common case for a long while
+    // yet. So: ask first, skip loudly, install only when the answer is no.
+    //
+    // The question is put to Playwright rather than answered by probing for
+    // library names ourselves. `install-deps --dry-run` simulates the very
+    // `apt-get install` that `install-deps` would run and exits non-zero if
+    // anything is missing, which means the check and the fix can never disagree
+    // about what "the libraries" means — including after a Playwright release
+    // adds one.
+    //
+    // Installing runs `install-deps` directly *as root*: that is what `playwright
+    // install --with-deps` does internally, minus Playwright's own privilege
+    // escalation (read from the shipped source, it shells out to
+    // `sudo -- sh -c "apt-get update && apt-get install …"` when it is not root,
+    // which would work here — `claude` has passwordless sudo — but puts an extra
+    // failure mode between the user and the answer).
     //
     // For the Chrome channel apt installs `google-chrome-stable`, whose own
-    // dependencies cover the same libraries — but running `install-deps` first
-    // costs little and makes the two paths behave identically.
+    // dependencies cover the same libraries — but going through the same check
+    // first makes the two paths behave identically.
     emit_progress(
         app,
         project_id,
-        "Step 1/3 — installing browser system libraries with apt (needs root; a minute or two)…",
+        "Step 1/3 — checking whether this container already has the browser system libraries…",
     );
-    let deps = run_step(
-        app,
-        project_id,
-        container_id,
-        "root",
-        "/tmp",
-        vec![
-            "node".to_string(),
-            cli.clone(),
-            "install-deps".to_string(),
-            target.cli_name().to_string(),
-        ],
-        DEPS_TIMEOUT,
-    )
-    .await?;
-    log.push_str(&deps.log);
-    if deps.exit_code != 0 {
-        // Not fatal on its own — the libraries may already be present — but it
-        // must never pass silently, because the failure it causes surfaces much
-        // later and looks like something else.
-        warning = Some(format!(
-            "Installing the browser's system libraries failed (exit {}). The browser may install \
-             and then refuse to start. apt said:\n{}",
-            deps.exit_code,
-            deps.log_or("nothing")
-        ));
+    let state = check_libraries(container_id, &cli, target).await;
+    match &state {
+        LibraryState::Present => {
+            emit_progress(
+                app,
+                project_id,
+                "Step 1/3 — already there: this image ships the browser system libraries. \
+                 Skipping the apt install.",
+            );
+            push_section(&mut log, "Browser system libraries: already installed, apt skipped.");
+        }
+        LibraryState::Missing(_) | LibraryState::Unknown(_) => {
+            emit_progress(
+                app,
+                project_id,
+                &format!(
+                    "Step 1/3 — {} Installing browser system libraries with apt (needs root; a \
+                     minute or two)…",
+                    state.detail()
+                ),
+            );
+            let deps = run_step(
+                app,
+                project_id,
+                container_id,
+                "root",
+                "/tmp",
+                vec![
+                    "node".to_string(),
+                    cli.clone(),
+                    "install-deps".to_string(),
+                    target.cli_name().to_string(),
+                ],
+                DEPS_TIMEOUT,
+            )
+            .await?;
+            push_section(&mut log, &deps.log);
+            if deps.exit_code != 0 {
+                // Not fatal on its own — some of the libraries may already be
+                // present — but it must never pass silently, because the failure
+                // it causes surfaces much later and looks like something else.
+                warning = Some(format!(
+                    "Installing the browser's system libraries failed (exit {}). The browser may \
+                     install and then refuse to start. apt said:\n{}",
+                    deps.exit_code,
+                    deps.log_or("nothing")
+                ));
+            }
+        }
     }
 
     // Step 2 — the download the user was warned about. Chromium is fetched as
@@ -434,6 +479,102 @@ pub async fn install_browser(
         browser_launched: Some(verdict.ok),
         warning,
     })
+}
+
+/// Phrases `install-deps --dry-run` prints. Matching on Playwright's own words
+/// is load-bearing: the exit code alone cannot tell "everything is installed"
+/// (0) apart from "this platform isn't in my table, so I did nothing" (also 0).
+const DEPS_OK_MARKER: &str = "All system dependencies are installed";
+const DEPS_MISSING_MARKER: &str = "Missing system dependencies";
+const DEPS_UNKNOWN_PLATFORM_MARKER: &str = "Cannot install dependencies for";
+
+/// Whether this container already has the libraries a browser links against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LibraryState {
+    /// Playwright confirms every package it would install is present. Current
+    /// base images bake them, so this is the answer on an up-to-date container.
+    Present,
+    /// Playwright named packages that are absent.
+    Missing(String),
+    /// The check could not answer. Always installs — an unnecessary apt run
+    /// costs a minute, a skipped one costs a browser that will not start.
+    Unknown(String),
+}
+
+impl LibraryState {
+    /// What the user sees on the progress line, and why.
+    fn detail(&self) -> &str {
+        match self {
+            Self::Present => "",
+            Self::Missing(d) | Self::Unknown(d) => d,
+        }
+    }
+}
+
+/// Ask Playwright whether the libraries are already installed.
+///
+/// `--dry-run` simulates the same `apt-get install` that `install-deps` would
+/// perform and exits non-zero if any package is missing, so the check can never
+/// disagree with the fix about what the dependency set is — including after a
+/// Playwright release changes it.
+///
+/// Note that the simulation works on an image whose `/var/lib/apt/lists` has
+/// been cleaned (every base image's has): apt knows installed packages from
+/// dpkg's status file. A *missing* package on such an image is simply not in
+/// any index, so apt fails, Playwright reports the failure, and this returns
+/// [`LibraryState::Unknown`] — which installs, which is the right answer.
+async fn check_libraries(container_id: &str, cli: &str, target: BrowserTarget) -> LibraryState {
+    let run = exec_oneshot_as(
+        container_id,
+        "root",
+        vec![
+            "node".to_string(),
+            cli.to_string(),
+            "install-deps".to_string(),
+            "--dry-run".to_string(),
+            target.cli_name().to_string(),
+        ],
+        vec![],
+    );
+    match tokio::time::timeout(DEPS_CHECK_TIMEOUT, run).await {
+        Ok(Ok((output, code))) => classify_library_check(&output, code),
+        Ok(Err(e)) => LibraryState::Unknown(format!(
+            "Couldn't ask Playwright whether they're already there ({}), so installing them to be \
+             sure.",
+            e
+        )),
+        Err(_) => LibraryState::Unknown(
+            "The check for them didn't finish in time, so installing them to be sure.".to_string(),
+        ),
+    }
+}
+
+/// Read the verdict out of `install-deps --dry-run`'s output.
+fn classify_library_check(output: &str, exit_code: i64) -> LibraryState {
+    // Checked before the success marker, not after: this branch also exits 0.
+    if output.contains(DEPS_UNKNOWN_PLATFORM_MARKER) {
+        return LibraryState::Unknown(
+            "Playwright doesn't have a dependency list for this container's platform, so it \
+             can't say — installing them to be sure."
+                .to_string(),
+        );
+    }
+    if exit_code == 0 && output.contains(DEPS_OK_MARKER) {
+        return LibraryState::Present;
+    }
+    if let Some(idx) = output.find(DEPS_MISSING_MARKER) {
+        let summary = output[idx..]
+            .lines()
+            .next()
+            .unwrap_or(DEPS_MISSING_MARKER)
+            .trim();
+        return LibraryState::Missing(format!("Playwright reports {}", summary.to_lowercase()));
+    }
+    LibraryState::Unknown(format!(
+        "Couldn't tell whether they're already there (the check exited {}), so installing them to \
+         be sure.",
+        exit_code
+    ))
 }
 
 /// The result of actually starting a browser.
@@ -757,6 +898,55 @@ mod tests {
         let err = BrowserTarget::parse("firefox").unwrap_err();
         assert!(err.contains("chromium"), "{}", err);
         assert!(err.contains("chrome"), "{}", err);
+    }
+
+    #[test]
+    fn baked_in_libraries_are_detected_and_the_apt_step_is_skipped() {
+        // What a container built from a current base image says. The whole
+        // point of baking them: this must not re-run apt.
+        assert_eq!(
+            classify_library_check("All system dependencies are installed.\n", 0),
+            LibraryState::Present
+        );
+    }
+
+    #[test]
+    fn an_older_image_without_them_is_detected_and_named() {
+        let v = classify_library_check(
+            "Missing system dependencies (12):\n  libnss3\n  libgbm1\n",
+            1,
+        );
+        match v {
+            LibraryState::Missing(d) => assert!(d.contains("(12)"), "{}", d),
+            other => panic!("expected Missing, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn an_unrecognised_platform_installs_rather_than_reporting_success() {
+        // Playwright prints this and exits **0** having installed nothing, so a
+        // check that trusted the exit code would skip the apt step on exactly
+        // the container that needs it.
+        let v = classify_library_check(
+            "Cannot install dependencies for ubuntu24.04-riscv64 with Playwright 1.62.1!\n",
+            0,
+        );
+        assert!(matches!(v, LibraryState::Unknown(_)), "{:?}", v);
+    }
+
+    #[test]
+    fn a_check_that_could_not_run_installs_rather_than_guessing() {
+        // e.g. apt cannot resolve a package because the image's package index
+        // was cleaned and the package is genuinely absent.
+        let v = classify_library_check("E: Unable to locate package libgbm1\n", 100);
+        match v {
+            LibraryState::Unknown(d) => assert!(d.contains("100"), "{}", d),
+            other => panic!("expected Unknown, got {:?}", other),
+        }
+        // Present contributes nothing to the progress line; the other two must
+        // explain themselves, because the reason is shown to the user.
+        assert_eq!(LibraryState::Present.detail(), "");
+        assert!(!LibraryState::Unknown("why".into()).detail().is_empty());
     }
 
     #[test]

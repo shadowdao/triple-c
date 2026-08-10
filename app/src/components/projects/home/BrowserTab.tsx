@@ -310,8 +310,11 @@ function missingParts(d: PlaywrightDetection | null): string[] {
  * The old pane printed npm commands here and left the rest to the user. The
  * result, verified with a real one: an `@playwright/mcp` install that could
  * never satisfy this pane, a global install that hit EACCES, a Chromium that
- * downloaded and then would not start because the image ships none of its
- * shared libraries, and a long tail of commands after that.
+ * downloaded and then would not start because the image shipped none of its
+ * shared libraries, and a long tail of commands after that. Current base images
+ * bake those libraries in, so that last one is fixed at the source — but a
+ * project keeps its original base image until it is migrated, so the install
+ * action still handles a container that lacks them.
  */
 function Setup({
   detection,
@@ -386,11 +389,13 @@ function Setup({
         title="2. A browser to drive"
         detail={
           <>
-            Both install the system libraries first — the base image ships none of them,
-            which is why a browser can download successfully and then refuse to start —
-            and both end by actually launching the browser to prove it works. Browsers
-            land in <Code>~/.cache/ms-playwright</Code>, which is on the home volume, so
-            they survive container recreation and are only lost on a project Reset.
+            Both check the system libraries a browser links against first. Current base
+            images ship them, so that step is normally skipped; a container built from an
+            older image gets them installed with apt, which is the difference between a
+            browser that downloads successfully and one that also starts. Both end by
+            actually launching the browser to prove it works. Browsers land in{" "}
+            <Code>~/.cache/ms-playwright</Code>, which is on the home volume, so they
+            survive container recreation and are only lost on a project Reset.
           </>
         }
         done={browsers.length > 0 || chrome !== null}
