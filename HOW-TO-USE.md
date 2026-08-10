@@ -509,6 +509,10 @@ This lives in the sidebar under **Settings → Claude Authentication**.
    code to copy — this flow finishes on an Anthropic-hosted page, not a local callback.
 4. Paste the code back into Triple-C. The token is captured and written straight to the keychain.
 
+The code is long and easy to truncate. If Anthropic refuses it, the dialog says so and lets you
+paste another one without restarting the sign-in — the CLI is still waiting. After a few refusals
+the flow gives up and reports it rather than sitting there.
+
 Only one sign-in can run at a time, and the whole flow times out after 15 minutes. A long-lived
 token requires a Claude subscription; without one, `setup-token` finishes without printing a token
 and nothing is stored.
