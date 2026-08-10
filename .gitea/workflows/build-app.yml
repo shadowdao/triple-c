@@ -395,29 +395,6 @@ jobs:
           )
           endlocal
 
-      - name: Verify .NET 3.5 for the MSI bundler
-        shell: cmd
-        run: |
-          rem WiX 3.x candle.exe is a .NET 2.0/3.5 application, and Tauri aborts
-          rem the whole bundle when the MSI target fails - taking the NSIS
-          rem installer with it. Windows 11 ships NetFx3 as
-          rem DisabledWithPayloadRemoved, and enabling it needs a payload that
-          rem Windows Update cannot always supply, so this checks rather than
-          rem guesses and tells you exactly how to fix it on the runner.
-          if exist "%WINDIR%\Microsoft.NET\Framework64\v2.0.50727" (
-            echo .NET 3.5 runtime present - WiX can run
-          ) else (
-            echo ERROR: .NET 3.5 is missing, so WiX candle.exe cannot run and the
-            echo        MSI bundle will fail, which also suppresses the NSIS build.
-            echo.
-            echo   Fix on this runner, with a Windows ISO mounted ^(e.g. D:^):
-            echo     dism /Online /Enable-Feature /FeatureName:NetFx3 /All ^
-            echo          /Source:D:\sources\sxs /LimitAccess
-            echo.
-            echo   Windows Update alone is not sufficient when the feature reports
-            echo   DisabledWithPayloadRemoved.
-            exit /b 1
-          )
       - name: Install Rust stable
         run: |
           where rustup >nul 2>&1 && (
@@ -477,14 +454,24 @@ jobs:
           TAURI_CONFIG: "{\"build\":{\"beforeBuildCommand\":\"\"}}"
         run: |
           set "PATH=%USERPROFILE%\.cargo\bin;C:\Program Files\nodejs;%PATH%"
-          cargo tauri build
+          rem NSIS only: the MSI target needs WiX, whose candle.exe/light.exe are
+          rem 32-bit. On a runner running as SYSTEM, Tauri caches WiX under
+          rem %LOCALAPPDATA% = C:\Windows\system32\config\systemprofile\..., and
+          rem WOW64 redirection points 32-bit processes at SysWOW64, where that
+          rem directory does not exist - so candle cannot see its own folder and
+          rem dies with 0x80131700. Tauri aborts the whole bundle when one target
+          rem fails, so the MSI was also costing us the NSIS installer.
+          rem
+          rem NSIS is what the project ships for Windows upgrades anyway. To bring
+          rem the MSI back, run the runner as a normal user (whose LOCALAPPDATA is
+          rem outside System32) and restore --bundles msi,nsis.
+          cargo tauri build --bundles nsis
 
       - name: Collect artifacts
         run: |
           set "PATH=%USERPROFILE%\.cargo\bin;C:\Program Files\nodejs;%PATH%"
           mkdir artifacts
-          copy app\src-tauri\target\release\bundle\msi\*.msi artifacts\ 2>nul
-          copy app\src-tauri\target\release\bundle\nsis\*.exe artifacts\ 2>nul
+          copy app\src-tauri\target\release\bundle\nsis\*.exe artifacts\ || exit /b 1
           dir artifacts\
 
       - name: Upload to Gitea release
