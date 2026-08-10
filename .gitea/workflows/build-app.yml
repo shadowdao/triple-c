@@ -357,6 +357,38 @@ jobs:
           (Get-Content app/src-tauri/Cargo.toml) -replace '^version = ".*?"', "version = `"$version`"" | Set-Content app/src-tauri/Cargo.toml
           Write-Host "Patched version to $version"
 
+      - name: Install MSVC C++ build tools
+        shell: cmd
+        run: |
+          rem Tauri links with MSVC, so rustc needs link.exe and the Windows SDK.
+          rem This job previously assumed a hand-provisioned runner; a runner
+          rem without them registers fine, accepts windows-latest jobs, and then
+          rem fails at link time with "linker `link.exe` not found" after having
+          rem already downloaded the whole crate graph.
+          rem
+          rem rustc locates MSVC through vswhere/the registry rather than PATH,
+          rem so installing is sufficient — no dev-shell activation needed here.
+          set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+          if exist "%VSWHERE%" (
+            "%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath > "%TEMP%\vcpath.txt" 2>nul
+            for /f "usebackq delims=" %%i in ("%TEMP%\vcpath.txt") do set "VCPATH=%%i"
+          )
+          if defined VCPATH (
+            echo MSVC build tools already present at %VCPATH%
+          ) else (
+            echo MSVC build tools not found - installing Visual Studio Build Tools
+            curl -fSL -o "%TEMP%\vs_BuildTools.exe" https://aka.ms/vs/17/release/vs_BuildTools.exe || exit /b 1
+            rem 3010 means "installed, reboot pending" and is a success for our purposes.
+            "%TEMP%\vs_BuildTools.exe" --quiet --wait --norestart --nocache ^
+              --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended
+            set "VSEXIT=%ERRORLEVEL%"
+            del "%TEMP%\vs_BuildTools.exe" 2>nul
+            if not "%VSEXIT%"=="0" if not "%VSEXIT%"=="3010" (
+              echo Visual Studio Build Tools installer failed with %VSEXIT%
+              exit /b %VSEXIT%
+            )
+            echo Visual Studio Build Tools installed
+          )
       - name: Install Rust stable
         run: |
           where rustup >nul 2>&1 && (
