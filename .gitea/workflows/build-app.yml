@@ -339,6 +339,22 @@ jobs:
   build-windows:
     runs-on: windows-latest
     needs: [compute-version]
+    env:
+      # WiX 3.x candle.exe/light.exe are 32-bit. A runner running as SYSTEM has
+      # %LOCALAPPDATA% = C:\Windows\system32\config\systemprofile\AppData\Local,
+      # and Tauri caches the WiX toolset there. WOW64 redirection then sends a
+      # 32-bit process reading C:\Windows\System32 to C:\Windows\SysWOW64, where
+      # that directory does not exist - so candle.exe cannot see its own folder,
+      # the CLR fails to start, and Tauri reports only "failed to run
+      # candle.exe". The real error is 0x80131700, visible in the Application
+      # event log as ".NET Runtime ... could not be started".
+      #
+      # Verified on our runner: candle.exe -? exits 0 from C:\wixtest and
+      # 0x80131700 from the systemprofile path - same identity, same binary.
+      #
+      # Pointing LOCALAPPDATA outside System32 sidesteps redirection entirely,
+      # and is harmless on a runner that already runs as a normal user.
+      LOCALAPPDATA: C:\actions-runner-cache
     defaults:
       run:
         shell: cmd
