@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { startWebTerminal, stopWebTerminal, getWebTerminalStatus, regenerateWebTerminalToken } from "../../lib/tauri-commands";
 import type { WebTerminalInfo } from "../../lib/types";
 import Tooltip from "../ui/Tooltip";
+import Toggle from "../ui/Toggle";
 
 export default function WebTerminalSettings() {
   const [info, setInfo] = useState<WebTerminalInfo | null>(null);
@@ -68,17 +69,12 @@ export default function WebTerminalSettings() {
       <div className="space-y-2">
         {/* Toggle */}
         <div className="flex items-center gap-2">
-          <button
-            onClick={handleToggle}
+          <Toggle
+            label="Web terminal"
+            checked={!!info?.running}
             disabled={loading}
-            className={`px-2 py-0.5 text-xs rounded transition-colors ${
-              info?.running
-                ? "bg-[var(--success)] text-white"
-                : "bg-[var(--bg-primary)] border border-[var(--border-color)] text-[var(--text-secondary)]"
-            }`}
-          >
-            {loading ? "..." : info?.running ? "ON" : "OFF"}
-          </button>
+            onChange={handleToggle}
+          />
           <span className="text-xs text-[var(--text-secondary)]">
             {info?.running
               ? `Running on port ${info.port}`
@@ -116,7 +112,7 @@ export default function WebTerminalSettings() {
             </button>
             <button
               onClick={handleRegenerate}
-              className="text-xs px-2 py-0.5 text-[var(--warning,#f59e0b)] hover:bg-[var(--bg-primary)] rounded transition-colors"
+              className="text-xs px-2 py-0.5 text-[var(--warning)] hover:bg-[var(--bg-primary)] rounded transition-colors"
             >
               Regenerate
             </button>

@@ -47,6 +47,21 @@ WORKING_DIR=$(jq -r '.working_dir // "/workspace"' "$TASK_FILE")
 TASK_NAME=$(jq -r '.name' "$TASK_FILE")
 TASK_TYPE=$(jq -r '.type' "$TASK_FILE")
 
+# ── Resolve permission mode ─────────────────────────────────────────────────
+# TRIPLE_C_PERMISSION_MODE is injected into the container by Triple-C from the
+# project's permission setting. Keep this mapping in sync with
+# PermissionMode::cli_args() in app/src-tauri/src/models/project.rs.
+# NOTE: headless `claude -p` runs cannot answer a permission prompt, so any
+# mode other than "bypass" means the task may stop early when Claude Code asks
+# for permission. Unset or unrecognized values pass no flag (Claude's default).
+PERMISSION_ARGS=()
+case "${TRIPLE_C_PERMISSION_MODE:-}" in
+    plan)        PERMISSION_ARGS=(--permission-mode plan) ;;
+    acceptEdits) PERMISSION_ARGS=(--permission-mode acceptEdits) ;;
+    bypass)      PERMISSION_ARGS=(--dangerously-skip-permissions) ;;
+    *)           PERMISSION_ARGS=() ;;
+esac
+
 # ── Prepare log directory ───────────────────────────────────────────────────
 TASK_LOG_DIR="${LOGS_DIR}/${TASK_ID}"
 mkdir -p "$TASK_LOG_DIR"
@@ -60,13 +75,15 @@ LOG_FILE="${TASK_LOG_DIR}/${TIMESTAMP}.log"
     echo "=== Started: $(date) ==="
     echo "=== Working dir: $WORKING_DIR ==="
     echo "=== Prompt: $PROMPT ==="
+    echo "=== Permission mode: ${TRIPLE_C_PERMISSION_MODE:-default} ==="
     echo ""
 } > "$LOG_FILE"
 
 EXIT_CODE=0
 if [ -d "$WORKING_DIR" ]; then
     cd "$WORKING_DIR"
-    claude -p "$PROMPT" --dangerously-skip-permissions >> "$LOG_FILE" 2>&1 || EXIT_CODE=$?
+    # ${arr[@]+"${arr[@]}"} keeps an empty array safe under `set -u`
+    claude -p "$PROMPT" ${PERMISSION_ARGS[@]+"${PERMISSION_ARGS[@]}"} >> "$LOG_FILE" 2>&1 || EXIT_CODE=$?
 else
     echo "Error: working directory '$WORKING_DIR' does not exist" >> "$LOG_FILE"
     EXIT_CODE=1

@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use sha2::{Sha256, Digest};
 
 use super::client::get_docker;
-use crate::models::{Backend, BedrockAuthMethod, ClaudeCodeSettings, ContainerInfo, EnvVar, GlobalAwsSettings, GlobalOllamaSettings, GlobalOpenAiCompatibleSettings, McpServer, McpTransportType, PortMapping, Project, ProjectPath};
+use crate::models::{Backend, BedrockAuthMethod, ClaudeCodeSettings, ContainerInfo, EnvVar, GlobalAwsSettings, GlobalOllamaSettings, GlobalOpenAiCompatibleSettings, PortMapping, Project, ProjectPath};
 
 const SCHEDULER_INSTRUCTIONS: &str = r#"## Scheduled Tasks
 
@@ -171,27 +171,90 @@ fn build_claude_instructions(
     combined
 }
 
+/// The env var Claude Code reads a long-lived `claude setup-token` credential
+/// from. Named once so injection, the reserved-name blocklist, and the
+/// stale-value neutralization pass can never disagree about the spelling.
+pub const CLAUDE_OAUTH_TOKEN_ENV: &str = "CLAUDE_CODE_OAUTH_TOKEN";
+
+/// Env var name prefixes Triple-C manages itself; users cannot set these by hand.
+const RESERVED_ENV_PREFIXES: &[&str] = &["ANTHROPIC_", "AWS_", "GIT_", "HOST_", "TRIPLE_C_"];
+
+/// Exact env var names Triple-C manages itself. Not covered by
+/// [`RESERVED_ENV_PREFIXES`] because they don't share those prefixes.
+///
+/// `MCP_SERVERS_JSON` is reserved for legacy reasons: the built-in MCP feature
+/// was removed, but the name stays blocked so users cannot hand-set it.
+/// `CLAUDE_CODE_OAUTH_TOKEN` is reserved because Triple-C owns it — a hand-set
+/// value would silently outrank the keychain-held shared token and be invisible
+/// to the auth UI.
+const RESERVED_ENV_EXACT: &[&str] = &[
+    "CLAUDE_INSTRUCTIONS",
+    "MCP_SERVERS_JSON",
+    "CLAUDE_CODE_SETTINGS_JSON",
+    "MISSION_CONTROL_ENABLED",
+    "TRIPLE_C_PERMISSION_MODE",
+    CLAUDE_OAUTH_TOKEN_ENV,
+];
+
+/// Whether `key` is an env var name Triple-C reserves for itself.
+fn is_reserved_env_key(key: &str) -> bool {
+    let upper = key.to_uppercase();
+    RESERVED_ENV_PREFIXES.iter().any(|p| upper.starts_with(p))
+        || RESERVED_ENV_EXACT.iter().any(|e| upper == *e)
+}
+
 /// Compute a fingerprint string for the custom environment variables.
 /// Sorted alphabetically so order changes do not cause spurious recreation.
 fn compute_env_fingerprint(custom_env_vars: &[EnvVar]) -> String {
-    let reserved_prefixes = ["ANTHROPIC_", "AWS_", "GIT_", "HOST_", "TRIPLE_C_"];
-    let reserved_exact = ["CLAUDE_INSTRUCTIONS", "MCP_SERVERS_JSON", "CLAUDE_CODE_SETTINGS_JSON", "MISSION_CONTROL_ENABLED"];
     let mut parts: Vec<String> = Vec::new();
     for env_var in custom_env_vars {
         let key = env_var.key.trim();
-        if key.is_empty() {
-            continue;
-        }
-        let upper = key.to_uppercase();
-        let is_reserved = reserved_prefixes.iter().any(|p| upper.starts_with(p))
-            || reserved_exact.iter().any(|e| upper == *e);
-        if is_reserved {
+        if key.is_empty() || is_reserved_env_key(key) {
             continue;
         }
         parts.push(format!("{}={}", key, env_var.value));
     }
     parts.sort();
     parts.join(",")
+}
+
+/// The shared Claude Code OAuth token to inject for this project, paired with
+/// its rotation id.
+///
+/// `None` unless *all* of: the backend is Anthropic (the token is meaningless
+/// to Bedrock/Ollama/OpenAI-compatible), the project has not opted out, and a
+/// non-blank token is actually in the keychain. Read here rather than passed in
+/// because the token is global, not part of the per-project record.
+///
+/// The returned token is never logged and never leaves this module except as
+/// the env var value handed to Docker.
+fn shared_claude_auth(project: &Project) -> Option<(String, String)> {
+    if project.backend != Backend::Anthropic || !project.use_shared_auth_token {
+        return None;
+    }
+    let token = crate::storage::secure::get_claude_oauth_token()
+        .unwrap_or_else(|e| {
+            log::warn!("Could not read the shared Claude token from the keychain: {}", e);
+            None
+        })
+        .filter(|t| !t.trim().is_empty())?;
+    // A token with no rotation id predates versioning (or the id write failed).
+    // A constant stand-in still differs from the empty "no token" label, so
+    // presence changes are caught; only rotations could be missed.
+    let version = crate::storage::secure::get_claude_oauth_token_version()
+        .unwrap_or(None)
+        .unwrap_or_else(|| "unversioned".to_string());
+    Some((token, version))
+}
+
+/// Label value tracking which shared Claude token (if any) a container was
+/// created with. Empty means "none injected". See
+/// [`crate::storage::secure`] for why this is a random rotation id rather than
+/// a hash of the token.
+fn claude_token_label(project: &Project) -> String {
+    shared_claude_auth(project)
+        .map(|(_, version)| version)
+        .unwrap_or_default()
 }
 
 /// Merge global and per-project custom environment variables.
@@ -476,83 +539,6 @@ fn build_claude_code_settings_json(
     }
 }
 
-/// Build the JSON value for MCP servers config to be injected into ~/.claude.json.
-/// Produces `{"mcpServers": {"name": {"type": "stdio", ...}, ...}}`.
-///
-/// Handles 4 modes:
-/// - Stdio+Docker: `docker exec -i <mcp-container-name> <command> ...args`
-/// - Stdio+Manual: `<command> ...args` (existing behavior)
-/// - HTTP+Docker: `streamableHttp` URL pointing to `http://<mcp-container-name>:<port>/mcp`
-/// - HTTP+Manual: `streamableHttp` with user-provided URL + headers
-fn build_mcp_servers_json(servers: &[McpServer]) -> String {
-    let mut mcp_map = serde_json::Map::new();
-    for server in servers {
-        let mut entry = serde_json::Map::new();
-        match server.transport_type {
-            McpTransportType::Stdio => {
-                entry.insert("type".to_string(), serde_json::json!("stdio"));
-                if server.is_docker() {
-                    // Stdio+Docker: use `docker exec` to communicate with MCP container
-                    entry.insert("command".to_string(), serde_json::json!("docker"));
-                    let mut args = vec![
-                        "exec".to_string(),
-                        "-i".to_string(),
-                        server.mcp_container_name(),
-                    ];
-                    if let Some(ref cmd) = server.command {
-                        args.push(cmd.clone());
-                    }
-                    args.extend(server.args.iter().cloned());
-                    entry.insert("args".to_string(), serde_json::json!(args));
-                } else {
-                    // Stdio+Manual: existing behavior
-                    if let Some(ref cmd) = server.command {
-                        entry.insert("command".to_string(), serde_json::json!(cmd));
-                    }
-                    if !server.args.is_empty() {
-                        entry.insert("args".to_string(), serde_json::json!(server.args));
-                    }
-                }
-                if !server.env.is_empty() {
-                    entry.insert("env".to_string(), serde_json::json!(server.env));
-                }
-            }
-            McpTransportType::Http => {
-                entry.insert("type".to_string(), serde_json::json!("streamableHttp"));
-                if server.is_docker() {
-                    // HTTP+Docker: point to MCP container by name on the shared network
-                    let url = format!(
-                        "http://{}:{}/mcp",
-                        server.mcp_container_name(),
-                        server.effective_container_port()
-                    );
-                    entry.insert("url".to_string(), serde_json::json!(url));
-                } else {
-                    // HTTP+Manual: user-provided URL + headers
-                    if let Some(ref url) = server.url {
-                        entry.insert("url".to_string(), serde_json::json!(url));
-                    }
-                    if !server.headers.is_empty() {
-                        entry.insert("headers".to_string(), serde_json::json!(server.headers));
-                    }
-                }
-            }
-        }
-        mcp_map.insert(server.name.clone(), serde_json::Value::Object(entry));
-    }
-    let wrapper = serde_json::json!({ "mcpServers": mcp_map });
-    serde_json::to_string(&wrapper).unwrap_or_default()
-}
-
-/// Compute a fingerprint for MCP server configuration so we can detect changes.
-fn compute_mcp_fingerprint(servers: &[McpServer]) -> String {
-    if servers.is_empty() {
-        return String::new();
-    }
-    let json = build_mcp_servers_json(servers);
-    sha256_hex(&json)
-}
-
 pub async fn find_existing_container(project: &Project) -> Result<Option<String>, String> {
     let docker = get_docker()?;
     let container_name = project.container_name();
@@ -594,8 +580,6 @@ pub async fn create_container(
     global_claude_instructions: Option<&str>,
     global_custom_env_vars: &[EnvVar],
     timezone: Option<&str>,
-    mcp_servers: &[McpServer],
-    network_name: Option<&str>,
     global_claude_code_settings: Option<&ClaudeCodeSettings>,
     default_ssh_key_path: Option<&str>,
     default_git_user_name: Option<&str>,
@@ -757,6 +741,19 @@ pub async fn create_container(
         }
     }
 
+    // Shared Claude Code OAuth token (Anthropic backend only, opt-out per
+    // project). Injected *before* the neutralization pass below so that pass
+    // sees it as already-set; when it is absent the pass actively blanks the
+    // variable instead of leaving a stale one baked into the snapshot image.
+    let shared_claude = shared_claude_auth(project);
+    if let Some((ref token, _)) = shared_claude {
+        env_vars.push(format!("{}={}", CLAUDE_OAUTH_TOKEN_ENV, token));
+        log::info!(
+            "Injecting the shared Claude authentication token into the container for project {}",
+            project.id
+        );
+    }
+
     // ── Neutralize stale backend auth env vars ──────────────────────────────
     // When a project switches backends (e.g. Bedrock → Anthropic) the container
     // is recreated *from a snapshot image* committed off the previous container.
@@ -781,6 +778,11 @@ pub async fn create_container(
         "ANTHROPIC_MODEL",
         "DISABLE_PROMPT_CACHING",
         "ANTHROPIC_BEDROCK_SERVICE_TIER",
+        // Revoking the shared token, opting a project out, or switching away
+        // from the Anthropic backend must *clear* this, not merely stop setting
+        // it — otherwise the value committed into the snapshot image keeps
+        // authenticating the container with a credential the user removed.
+        CLAUDE_OAUTH_TOKEN_ENV,
     ];
     let already_set: std::collections::HashSet<String> = env_vars
         .iter()
@@ -794,17 +796,12 @@ pub async fn create_container(
 
     // Custom environment variables (global + per-project, project overrides global for same key)
     let merged_env = merge_custom_env_vars(global_custom_env_vars, &project.custom_env_vars);
-    let reserved_prefixes = ["ANTHROPIC_", "AWS_", "GIT_", "HOST_", "TRIPLE_C_"];
-    let reserved_exact = ["CLAUDE_INSTRUCTIONS", "MCP_SERVERS_JSON", "CLAUDE_CODE_SETTINGS_JSON", "MISSION_CONTROL_ENABLED"];
     for env_var in &merged_env {
         let key = env_var.key.trim();
         if key.is_empty() {
             continue;
         }
-        let upper = key.to_uppercase();
-        let is_reserved = reserved_prefixes.iter().any(|p| upper.starts_with(p))
-            || reserved_exact.iter().any(|e| upper == *e);
-        if is_reserved {
+        if is_reserved_env_key(key) {
             log::warn!("Skipping reserved env var: {}", key);
             continue;
         }
@@ -825,6 +822,13 @@ pub async fn create_container(
         env_vars.push("MISSION_CONTROL_ENABLED=1".to_string());
     }
 
+    // Permission mode — read by triple-c-task-runner for scheduled (headless)
+    // Claude Code runs. Interactive terminals get the flags directly instead.
+    env_vars.push(format!(
+        "TRIPLE_C_PERMISSION_MODE={}",
+        project.effective_permission_mode().as_env_value()
+    ));
+
     // Claude instructions (global + per-project, plus port mapping info + scheduler docs)
     let combined_instructions = build_claude_instructions(
         global_claude_instructions,
@@ -836,12 +840,6 @@ pub async fn create_container(
 
     if let Some(ref instructions) = combined_instructions {
         env_vars.push(format!("CLAUDE_INSTRUCTIONS={}", instructions));
-    }
-
-    // MCP servers config
-    if !mcp_servers.is_empty() {
-        let mcp_json = build_mcp_servers_json(mcp_servers);
-        env_vars.push(format!("MCP_SERVERS_JSON={}", mcp_json));
     }
 
     // Claude Code settings (global + per-project merged)
@@ -964,12 +962,8 @@ pub async fn create_container(
         }
     }
 
-    // Docker socket (if allowed, or auto-enabled for stdio+Docker MCP servers)
-    let needs_docker_for_mcp = any_stdio_docker_mcp(mcp_servers);
-    if project.allow_docker_access || needs_docker_for_mcp {
-        if needs_docker_for_mcp && !project.allow_docker_access {
-            log::info!("Auto-enabling Docker socket access for stdio+Docker MCP servers");
-        }
+    // Docker socket (if allowed)
+    if project.allow_docker_access {
         // On Windows, the named pipe (//./pipe/docker_engine) cannot be
         // bind-mounted into a Linux container. Docker Desktop exposes the
         // daemon socket as /var/run/docker.sock for container mounts.
@@ -1014,8 +1008,9 @@ pub async fn create_container(
     labels.insert("triple-c.ports-fingerprint".to_string(), compute_ports_fingerprint(&project.port_mappings));
     labels.insert("triple-c.image".to_string(), image_name.to_string());
     labels.insert("triple-c.timezone".to_string(), timezone.unwrap_or("").to_string());
-    labels.insert("triple-c.mcp-fingerprint".to_string(), compute_mcp_fingerprint(mcp_servers));
     labels.insert("triple-c.mission-control".to_string(), project.mission_control_enabled.to_string());
+    labels.insert("triple-c.permission-mode".to_string(),
+        project.effective_permission_mode().as_env_value().to_string());
     labels.insert("triple-c.custom-env-fingerprint".to_string(), custom_env_fingerprint.clone());
     labels.insert("triple-c.claude-code-settings-fingerprint".to_string(),
         compute_claude_code_settings_fingerprint(merged_cc_settings.as_ref(), project.sandbox_mode_enabled));
@@ -1025,13 +1020,15 @@ pub async fn create_container(
     labels.insert("triple-c.git-user-email".to_string(), effective_git_email.unwrap_or_default().to_string());
     labels.insert("triple-c.git-token-hash".to_string(),
         project.git_token.as_ref().map(|t| sha256_hex(t)).unwrap_or_default());
+    // Rotation id, NOT the token and NOT a hash of it — labels are readable by
+    // anything on the host via `docker inspect`.
+    labels.insert("triple-c.claude-token-version".to_string(),
+        shared_claude.as_ref().map(|(_, v)| v.clone()).unwrap_or_default());
 
     let host_config = HostConfig {
         mounts: Some(mounts),
         port_bindings: if port_bindings.is_empty() { None } else { Some(port_bindings) },
         init: Some(true),
-        // Connect to project network if specified (for MCP container communication)
-        network_mode: network_name.map(|n| n.to_string()),
         ..Default::default()
     };
 
@@ -1223,7 +1220,8 @@ chmod 600 "$HOME/.aws/credentials""#;
 /// NOTE: `docker commit` always bakes the *running container's* full ENV into
 /// the resulting image — passing an empty Config here does NOT strip it, and
 /// the commit API gives no way to remove env vars. As a result auth vars (e.g.
-/// CLAUDE_CODE_USE_BEDROCK, AWS_*) are present in this snapshot image's ENV.
+/// CLAUDE_CODE_USE_BEDROCK, AWS_*, CLAUDE_CODE_OAUTH_TOKEN) are present in this
+/// snapshot image's ENV — this image is local and per-project, never pushed.
 /// `create_container` defends against that by explicitly overriding every
 /// managed auth key for the active backend (see MANAGED_AUTH_KEYS), so a
 /// backend switch does not inherit the previous backend's stale credentials.
@@ -1307,7 +1305,6 @@ pub async fn container_needs_recreation(
     global_claude_instructions: Option<&str>,
     global_custom_env_vars: &[EnvVar],
     timezone: Option<&str>,
-    mcp_servers: &[McpServer],
     global_claude_code_settings: Option<&ClaudeCodeSettings>,
     default_ssh_key_path: Option<&str>,
     default_git_user_name: Option<&str>,
@@ -1470,6 +1467,20 @@ pub async fn container_needs_recreation(
         return Ok(true);
     }
 
+    // ── Shared Claude Code OAuth token ───────────────────────────────────
+    // Compares rotation ids, so this fires when the token is first acquired,
+    // re-acquired (rotated), revoked, or opted out of. Both "" means no token
+    // is in play, which is also what a container predating this feature reports
+    // — so existing installs are not recreated until a token actually exists.
+    // Recreation is the only way to change container env, and it is also what
+    // makes MANAGED_AUTH_KEYS blank a revoked token out of the snapshot image.
+    let expected_claude_token = claude_token_label(project);
+    let container_claude_token = get_label("triple-c.claude-token-version").unwrap_or_default();
+    if container_claude_token != expected_claude_token {
+        log::info!("Shared Claude authentication token mismatch — recreating container");
+        return Ok(true);
+    }
+
     // ── Custom environment variables (label-based fingerprint) ──────────
     let merged_env = merge_custom_env_vars(global_custom_env_vars, &project.custom_env_vars);
     let expected_fingerprint = compute_env_fingerprint(&merged_env);
@@ -1484,6 +1495,22 @@ pub async fn container_needs_recreation(
     let container_mc = get_label("triple-c.mission-control").unwrap_or_else(|| "false".to_string());
     if container_mc != expected_mc {
         log::info!("Mission Control mismatch (container={:?}, expected={:?})", container_mc, expected_mc);
+        return Ok(true);
+    }
+
+    // ── Permission mode ────────────────────────────────────────────────────
+    // The mode is injected as the TRIPLE_C_PERMISSION_MODE env var, and
+    // container env can only change by recreating the container. A missing
+    // label means the container predates this feature and therefore has no
+    // such env var, so it must be recreated too (empty != any valid mode).
+    let expected_permission_mode = project.effective_permission_mode().as_env_value();
+    let container_permission_mode = get_label("triple-c.permission-mode").unwrap_or_default();
+    if container_permission_mode != expected_permission_mode {
+        log::info!(
+            "Permission mode mismatch (container={:?}, expected={:?})",
+            container_permission_mode,
+            expected_permission_mode
+        );
         return Ok(true);
     }
 
@@ -1514,11 +1541,29 @@ pub async fn container_needs_recreation(
         return Ok(true);
     }
 
-    // ── MCP servers fingerprint ─────────────────────────────────────────
-    let expected_mcp_fp = compute_mcp_fingerprint(mcp_servers);
-    let container_mcp_fp = get_label("triple-c.mcp-fingerprint").unwrap_or_default();
-    if container_mcp_fp != expected_mcp_fp {
-        log::info!("MCP servers fingerprint mismatch (container={:?}, expected={:?})", container_mcp_fp, expected_mcp_fp);
+    // ── Legacy MCP migration shim ───────────────────────────────────────
+    // One-release migration for containers created before the built-in MCP
+    // feature was removed. Such containers carry a `triple-c.mcp-fingerprint`
+    // label and/or are attached to the per-project `triple-c-net-<id>` network.
+    // That user-defined network is deleted during cleanup, and a container
+    // whose NetworkMode points at a missing network refuses to start — so force
+    // a recreation to move them onto the default bridge. Containers created by
+    // the current code never carry the label or the network, so this is a no-op
+    // for them and can be dropped a release later.
+    if let Some(fp) = get_label("triple-c.mcp-fingerprint") {
+        if !fp.is_empty() {
+            log::info!("Legacy container carries triple-c.mcp-fingerprint label — recreating without MCP");
+            return Ok(true);
+        }
+    }
+    let legacy_network = info
+        .host_config
+        .as_ref()
+        .and_then(|hc| hc.network_mode.as_deref())
+        .map(|nm| nm.starts_with("triple-c-net-"))
+        .unwrap_or(false);
+    if legacy_network {
+        log::info!("Legacy container attached to a triple-c-net-* network — recreating without MCP");
         return Ok(true);
     }
 
@@ -1589,174 +1634,4 @@ pub async fn list_sibling_containers() -> Result<Vec<ContainerSummary>, String> 
         .collect();
 
     Ok(siblings)
-}
-
-// ── MCP Container Lifecycle ─────────────────────────────────────────────
-
-/// Returns true if any MCP server uses stdio transport with Docker.
-pub fn any_stdio_docker_mcp(servers: &[McpServer]) -> bool {
-    servers.iter().any(|s| s.is_docker() && s.transport_type == McpTransportType::Stdio)
-}
-
-/// Find an existing MCP container by its expected name.
-pub async fn find_mcp_container(server: &McpServer) -> Result<Option<String>, String> {
-    let docker = get_docker()?;
-    let container_name = server.mcp_container_name();
-
-    let filters: HashMap<String, Vec<String>> = HashMap::from([
-        ("name".to_string(), vec![container_name.clone()]),
-    ]);
-
-    let containers: Vec<ContainerSummary> = docker
-        .list_containers(Some(ListContainersOptions {
-            all: true,
-            filters,
-            ..Default::default()
-        }))
-        .await
-        .map_err(|e| format!("Failed to list MCP containers: {}", e))?;
-
-    let expected = format!("/{}", container_name);
-    for c in &containers {
-        if let Some(names) = &c.names {
-            if names.iter().any(|n| n == &expected) {
-                return Ok(c.id.clone());
-            }
-        }
-    }
-
-    Ok(None)
-}
-
-/// Create a Docker container for an MCP server.
-pub async fn create_mcp_container(
-    server: &McpServer,
-    network_name: &str,
-) -> Result<String, String> {
-    let docker = get_docker()?;
-    let container_name = server.mcp_container_name();
-
-    let image = server
-        .docker_image
-        .as_ref()
-        .ok_or_else(|| format!("MCP server '{}' has no docker_image", server.name))?;
-
-    let mut env_vars: Vec<String> = Vec::new();
-    for (k, v) in &server.env {
-        env_vars.push(format!("{}={}", k, v));
-    }
-
-    // Build command + args as Cmd
-    let mut cmd: Vec<String> = Vec::new();
-    if let Some(ref command) = server.command {
-        cmd.push(command.clone());
-    }
-    cmd.extend(server.args.iter().cloned());
-
-    let mut labels = HashMap::new();
-    labels.insert("triple-c.managed".to_string(), "true".to_string());
-    labels.insert("triple-c.mcp-server".to_string(), server.id.clone());
-
-    let host_config = HostConfig {
-        network_mode: Some(network_name.to_string()),
-        ..Default::default()
-    };
-
-    let config = Config {
-        image: Some(image.clone()),
-        env: if env_vars.is_empty() { None } else { Some(env_vars) },
-        cmd: if cmd.is_empty() { None } else { Some(cmd) },
-        labels: Some(labels),
-        host_config: Some(host_config),
-        ..Default::default()
-    };
-
-    let options = CreateContainerOptions {
-        name: container_name.clone(),
-        ..Default::default()
-    };
-
-    let response = docker
-        .create_container(Some(options), config)
-        .await
-        .map_err(|e| format!("Failed to create MCP container '{}': {}", container_name, e))?;
-
-    log::info!(
-        "Created MCP container {} (image: {}) on network {}",
-        container_name,
-        image,
-        network_name
-    );
-    Ok(response.id)
-}
-
-/// Start all Docker-based MCP server containers. Finds or creates each one.
-pub async fn start_mcp_containers(
-    servers: &[McpServer],
-    network_name: &str,
-) -> Result<(), String> {
-    for server in servers {
-        if !server.is_docker() {
-            continue;
-        }
-
-        let container_id = if let Some(existing_id) = find_mcp_container(server).await? {
-            log::debug!("Found existing MCP container for '{}'", server.name);
-            existing_id
-        } else {
-            create_mcp_container(server, network_name).await?
-        };
-
-        // Start the container (ignore already-started errors)
-        if let Err(e) = start_container(&container_id).await {
-            let err_str = e.to_string();
-            if err_str.contains("already started") || err_str.contains("304") {
-                log::debug!("MCP container '{}' already running", server.name);
-            } else {
-                return Err(format!(
-                    "Failed to start MCP container '{}': {}",
-                    server.name, e
-                ));
-            }
-        }
-
-        log::info!("MCP container '{}' started", server.name);
-    }
-
-    Ok(())
-}
-
-/// Stop all Docker-based MCP server containers (best-effort).
-pub async fn stop_mcp_containers(servers: &[McpServer]) -> Result<(), String> {
-    for server in servers {
-        if !server.is_docker() {
-            continue;
-        }
-        if let Ok(Some(container_id)) = find_mcp_container(server).await {
-            if let Err(e) = stop_container(&container_id).await {
-                log::warn!("Failed to stop MCP container '{}': {}", server.name, e);
-            } else {
-                log::info!("Stopped MCP container '{}'", server.name);
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Stop and remove all Docker-based MCP server containers (best-effort).
-pub async fn remove_mcp_containers(servers: &[McpServer]) -> Result<(), String> {
-    for server in servers {
-        if !server.is_docker() {
-            continue;
-        }
-        if let Ok(Some(container_id)) = find_mcp_container(server).await {
-            let _ = stop_container(&container_id).await;
-            if let Err(e) = remove_container(&container_id).await {
-                log::warn!("Failed to remove MCP container '{}': {}", server.name, e);
-            } else {
-                log::info!("Removed MCP container '{}'", server.name);
-            }
-        }
-    }
-    Ok(())
 }

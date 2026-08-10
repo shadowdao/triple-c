@@ -2,10 +2,9 @@ import type { ReactNode } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { useAppState } from "../../store/appState";
 import ProjectList from "../projects/ProjectList";
-import McpPanel from "../mcp/McpPanel";
 import SettingsPanel from "../settings/SettingsPanel";
 
-type SidebarView = "projects" | "mcp" | "settings";
+type SidebarView = "projects" | "settings";
 
 const RAIL_ICONS: { view: SidebarView; label: string; icon: ReactNode }[] = [
   {
@@ -14,18 +13,6 @@ const RAIL_ICONS: { view: SidebarView; label: string; icon: ReactNode }[] = [
     icon: (
       <svg className="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
         <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z" />
-      </svg>
-    ),
-  },
-  {
-    view: "mcp",
-    label: "MCP",
-    icon: (
-      <svg className="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-        <path d="M9 2v6" />
-        <path d="M15 2v6" />
-        <path d="M7 8h10v4a5 5 0 0 1-10 0V8z" />
-        <path d="M12 17v5" />
       </svg>
     ),
   },
@@ -76,7 +63,7 @@ export default function Sidebar() {
     };
 
     return (
-      <div className="flex flex-col h-full w-12 bg-[var(--bg-secondary)] border border-[var(--border-color)] rounded-lg overflow-hidden">
+      <div className="flex flex-col h-full w-12 bg-[var(--bg-secondary)] border border-[var(--border-color)] rounded-[var(--radius-panel)] overflow-hidden">
         <button
           onClick={toggleSidebarCollapsed}
           title="Expand sidebar"
@@ -102,14 +89,11 @@ export default function Sidebar() {
     }`;
 
   return (
-    <div className="flex flex-col h-full w-[25%] min-w-56 max-w-80 bg-[var(--bg-secondary)] border border-[var(--border-color)] rounded-lg overflow-hidden">
+    <div className="flex flex-col h-full w-[25%] min-w-56 max-w-80 bg-[var(--bg-secondary)] border border-[var(--border-color)] rounded-[var(--radius-panel)] overflow-hidden">
       {/* Nav tabs */}
       <div className="flex border-b border-[var(--border-color)]">
         <button onClick={() => setSidebarView("projects")} className={tabCls("projects")}>
           Projects
-        </button>
-        <button onClick={() => setSidebarView("mcp")} className={tabCls("mcp")}>
-          MCP <span className="text-[0.6rem] px-1 py-0.5 rounded bg-yellow-500/20 text-yellow-400 ml-0.5">Beta</span>
         </button>
         <button onClick={() => setSidebarView("settings")} className={tabCls("settings")}>
           Settings
@@ -128,13 +112,7 @@ export default function Sidebar() {
 
       {/* Content */}
       <div className="flex-1 overflow-y-auto overflow-x-hidden p-1 min-w-0">
-        {sidebarView === "projects" ? (
-          <ProjectList />
-        ) : sidebarView === "mcp" ? (
-          <McpPanel />
-        ) : (
-          <SettingsPanel />
-        )}
+        {sidebarView === "projects" ? <ProjectList /> : <SettingsPanel />}
       </div>
     </div>
   );

@@ -1,35 +1,32 @@
 import { useState } from "react";
 import { useProjects } from "../../hooks/useProjects";
-import ProjectCard from "./ProjectCard";
+import ProjectRow from "./ProjectRow";
 import AddProjectDialog from "./AddProjectDialog";
+import Button from "../ui/Button";
 
 export default function ProjectList() {
   const { projects } = useProjects();
   const [showAdd, setShowAdd] = useState(false);
 
   return (
-    <div className="p-3">
-      <div className="flex items-center justify-between px-2 py-1 mb-2">
-        <span className="text-xs font-semibold uppercase text-[var(--text-secondary)]">
+    <div className="p-2">
+      <div className="flex items-center justify-between px-1 py-1 mb-1.5">
+        <span className="text-[11px] font-semibold uppercase tracking-wide text-[var(--text-secondary)]">
           Projects
         </span>
-        <button
-          onClick={() => setShowAdd(true)}
-          className="text-lg leading-none text-[var(--text-secondary)] hover:text-[var(--accent)] transition-colors"
-          title="Add project"
-        >
-          +
-        </button>
+        <Button onClick={() => setShowAdd(true)} aria-label="Add project">
+          + Add
+        </Button>
       </div>
 
       {projects.length === 0 ? (
-        <p className="px-2 text-sm text-[var(--text-secondary)]">
-          No projects yet. Click + to add one.
+        <p className="px-1 text-xs text-[var(--text-secondary)]">
+          No projects yet — use “+ Add” to create one.
         </p>
       ) : (
-        <div className="flex flex-col gap-1">
+        <div className="flex flex-col gap-0.5">
           {projects.map((project) => (
-            <ProjectCard key={project.id} project={project} />
+            <ProjectRow key={project.id} project={project} />
           ))}
         </div>
       )}

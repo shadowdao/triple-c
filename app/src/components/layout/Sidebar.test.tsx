@@ -22,9 +22,6 @@ vi.mock("../projects/ProjectList", () => ({
 vi.mock("../settings/SettingsPanel", () => ({
   default: () => <div data-testid="settings-panel">SettingsPanel</div>,
 }));
-vi.mock("../mcp/McpPanel", () => ({
-  default: () => <div data-testid="mcp-panel">McpPanel</div>,
-}));
 
 describe("Sidebar", () => {
   beforeEach(() => {
@@ -35,6 +32,12 @@ describe("Sidebar", () => {
     render(<Sidebar />);
     expect(screen.getByText("Projects")).toBeInTheDocument();
     expect(screen.getByText("Settings")).toBeInTheDocument();
+  });
+
+  it("renders the project list, not a settings form, in the projects view", () => {
+    render(<Sidebar />);
+    expect(screen.getByTestId("project-list")).toBeInTheDocument();
+    expect(screen.queryByTestId("settings-panel")).not.toBeInTheDocument();
   });
 
   it("content area has min-w-0 to prevent flex overflow", () => {

@@ -2,7 +2,7 @@ pub mod client;
 pub mod container;
 pub mod image;
 pub mod exec;
-pub mod network;
+pub mod legacy_cleanup;
 pub mod stt;
 
 #[allow(unused_imports)]
@@ -16,4 +16,4 @@ pub use image::*;
 #[allow(unused_imports)]
 pub use exec::*;
 #[allow(unused_imports)]
-pub use network::*;
+pub use legacy_cleanup::*;

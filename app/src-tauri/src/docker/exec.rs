@@ -1,12 +1,77 @@
-use bollard::container::UploadToContainerOptions;
+use bollard::container::{LogOutput, UploadToContainerOptions};
 use bollard::exec::{CreateExecOptions, ResizeExecOptions, StartExecResults};
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex};
 
 use super::client::get_docker;
+
+/// A `docker exec` that has been created and started with stdin/stdout/stderr
+/// attached — the raw duplex halves, before any policy about what to do with
+/// them.
+///
+/// This is the single place in the codebase that knows how to open an attached
+/// exec. Both consumers are built on it:
+///   * [`ExecSessionManager`] — interactive terminals and the audio bridge,
+///     which pump bytes through mpsc channels and a callback.
+///   * `auth_bridge` — per-connection `socat` tunnels, which pump bytes
+///     straight between a host TCP socket and these halves.
+///
+/// With `tty = false` the output stream is demultiplexed by Docker, so the
+/// consumer can tell [`LogOutput::StdOut`] from [`LogOutput::StdErr`]. That
+/// distinction matters for the auth bridge: `socat`'s diagnostics must not be
+/// spliced into the proxied byte stream.
+pub struct AttachedExec {
+    pub exec_id: String,
+    pub output: Pin<Box<dyn Stream<Item = Result<LogOutput, bollard::errors::Error>> + Send>>,
+    pub input: Pin<Box<dyn AsyncWrite + Send>>,
+}
+
+/// Create and start an exec with stdin + stdout + stderr attached, returning the
+/// raw duplex halves. Runs as `claude` in `/workspace`, like every other exec
+/// this app opens.
+pub async fn create_attached_exec(
+    container_id: &str,
+    cmd: Vec<String>,
+    tty: bool,
+) -> Result<AttachedExec, String> {
+    let docker = get_docker()?;
+
+    let exec = docker
+        .create_exec(
+            container_id,
+            CreateExecOptions {
+                attach_stdin: Some(true),
+                attach_stdout: Some(true),
+                attach_stderr: Some(true),
+                tty: Some(tty),
+                cmd: Some(cmd),
+                user: Some("claude".to_string()),
+                working_dir: Some("/workspace".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|e| format!("Failed to create exec: {}", e))?;
+
+    let exec_id = exec.id.clone();
+
+    match docker
+        .start_exec(&exec_id, None)
+        .await
+        .map_err(|e| format!("Failed to start exec: {}", e))?
+    {
+        StartExecResults::Attached { output, input } => Ok(AttachedExec {
+            exec_id,
+            output,
+            input,
+        }),
+        StartExecResults::Detached => Err("Exec started in detached mode".to_string()),
+    }
+}
 
 pub struct ExecSession {
     pub exec_id: String,
@@ -80,82 +145,55 @@ impl ExecSessionManager {
     where
         F: Fn(Vec<u8>) + Send + 'static,
     {
-        let docker = get_docker()?;
-
-        let exec = docker
-            .create_exec(
-                container_id,
-                CreateExecOptions {
-                    attach_stdin: Some(true),
-                    attach_stdout: Some(true),
-                    attach_stderr: Some(true),
-                    tty: Some(tty),
-                    cmd: Some(cmd),
-                    user: Some("claude".to_string()),
-                    working_dir: Some("/workspace".to_string()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|e| format!("Failed to create exec: {}", e))?;
-
-        let exec_id = exec.id.clone();
-
-        let result = docker
-            .start_exec(&exec_id, None)
-            .await
-            .map_err(|e| format!("Failed to start exec: {}", e))?;
+        let AttachedExec {
+            exec_id,
+            mut output,
+            mut input,
+        } = create_attached_exec(container_id, cmd, tty).await?;
 
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
 
-        match result {
-            StartExecResults::Attached { mut output, mut input } => {
-                // Output reader task
-                let session_id_clone = session_id.to_string();
-                let shutdown_tx_clone = shutdown_tx.clone();
-                tokio::spawn(async move {
-                    loop {
-                        tokio::select! {
-                            msg = output.next() => {
-                                match msg {
-                                    Some(Ok(output)) => {
-                                        on_output(output.into_bytes().to_vec());
-                                    }
-                                    Some(Err(e)) => {
-                                        log::error!("Exec output error for {}: {}", session_id_clone, e);
-                                        break;
-                                    }
-                                    None => {
-                                        log::info!("Exec output stream ended for {}", session_id_clone);
-                                        break;
-                                    }
-                                }
+        // Output reader task
+        let session_id_clone = session_id.to_string();
+        let shutdown_tx_clone = shutdown_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    msg = output.next() => {
+                        match msg {
+                            Some(Ok(output)) => {
+                                on_output(output.into_bytes().to_vec());
                             }
-                            _ = shutdown_rx.recv() => {
-                                log::info!("Exec session {} shutting down", session_id_clone);
+                            Some(Err(e)) => {
+                                log::error!("Exec output error for {}: {}", session_id_clone, e);
+                                break;
+                            }
+                            None => {
+                                log::info!("Exec output stream ended for {}", session_id_clone);
                                 break;
                             }
                         }
                     }
-                    on_exit();
-                    let _ = shutdown_tx_clone;
-                });
-
-                // Input writer task
-                tokio::spawn(async move {
-                    while let Some(data) = input_rx.recv().await {
-                        if let Err(e) = input.write_all(&data).await {
-                            log::error!("Failed to write to exec stdin: {}", e);
-                            break;
-                        }
+                    _ = shutdown_rx.recv() => {
+                        log::info!("Exec session {} shutting down", session_id_clone);
+                        break;
                     }
-                });
+                }
             }
-            StartExecResults::Detached => {
-                return Err("Exec started in detached mode".to_string());
+            on_exit();
+            let _ = shutdown_tx_clone;
+        });
+
+        // Input writer task
+        tokio::spawn(async move {
+            while let Some(data) = input_rx.recv().await {
+                if let Err(e) = input.write_all(&data).await {
+                    log::error!("Failed to write to exec stdin: {}", e);
+                    break;
+                }
             }
-        }
+        });
 
         let session = ExecSession {
             exec_id,

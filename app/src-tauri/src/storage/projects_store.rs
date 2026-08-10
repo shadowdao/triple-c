@@ -177,6 +177,20 @@ impl ProjectsStore {
         }
     }
 
+    /// Granular setter for the auth bridge opt-in, so toggling it can't clobber
+    /// concurrent edits to the rest of the project record.
+    pub fn set_auth_bridge_enabled(&self, project_id: &str, enabled: bool) -> Result<(), String> {
+        let mut projects = self.lock();
+        if let Some(p) = projects.iter_mut().find(|p| p.id == project_id) {
+            p.auth_bridge_enabled = enabled;
+            p.updated_at = chrono::Utc::now().to_rfc3339();
+            self.save(&projects)?;
+            Ok(())
+        } else {
+            Err(format!("Project {} not found", project_id))
+        }
+    }
+
     pub fn set_container_id(&self, project_id: &str, container_id: Option<String>) -> Result<(), String> {
         let mut projects = self.lock();
         if let Some(p) = projects.iter_mut().find(|p| p.id == project_id) {

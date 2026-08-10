@@ -2,7 +2,7 @@
 
 ## Overview
 
-Triple-C (Claude-Code-Container) sandboxes Claude Code inside Docker containers so that when running with `--dangerously-skip-permissions`, Claude only has access to files and projects you explicitly provide. The project consists of two components: a **Docker container image** pre-loaded with development tools, and a **cross-platform desktop application** for managing project containers, terminal sessions, and authentication.
+Triple-C (Claude-Code-Container) sandboxes Claude Code inside Docker containers so that even in its most permissive mode — `--dangerously-skip-permissions` — Claude only has access to files and projects you explicitly provide. The project consists of two components: a **Docker container image** pre-loaded with development tools, and a **cross-platform desktop application** for managing project containers, terminal sessions, and authentication.
 
 ---
 
@@ -123,7 +123,8 @@ Implementation gotchas for the terminal view and its global controls (merged in 
 ┌──────────────────────────────────────────────────────────┐
 │                 Docker Container (per project)            │
 │                                                          │
-│  /workspace ←── bind mount ──► Host project directory    │
+│  /workspace/<name> ←─ bind mount ─► Host project folder  │
+│  /home/claude ←── named volume (home dir)                │
 │  /home/claude/.claude ←── named volume (persists config) │
 │  /tmp/.host-ssh ←── read-only bind mount (SSH keys)      │
 │  /var/run/docker.sock ←── optional (sibling containers)  │
@@ -160,22 +161,143 @@ Terminal resize follows the same pattern: `ResizeObserver` detects container siz
 
 Containers follow a **stop/start** model, not create/destroy:
 
-1. **First start**: A new container is created with bind mounts, environment variables, and labels. The entrypoint remaps UID/GID, configures SSH and git, then runs `sleep infinity` to keep the container alive.
-2. **Terminal open**: `docker exec` launches `claude --dangerously-skip-permissions` with a PTY in the running container.
+1. **First start**: A new container is created with bind mounts, named volumes, environment variables, and labels. The entrypoint remaps UID/GID, configures SSH and git, rebuilds the scheduler crontab, then runs `sleep infinity` to keep the container alive.
+2. **Terminal open**: `docker exec` launches `claude` with a PTY in the running container, with the permission-mode flags from `PermissionMode::cli_args()` (or `bash -l` for a shell session).
 3. **Stop**: `docker stop` halts the container but preserves its filesystem. Any packages Claude installed via `apt`, `pip`, `cargo`, etc. survive.
-4. **Restart**: `docker start` resumes the existing container. All installed tools and configuration persist.
-5. **Reset**: The container is removed and recreated from the image. This is a clean slate — the nuclear option when the container state is corrupted.
+4. **Restart**: `docker start` resumes the existing container — unless `container_needs_recreation()` finds a `triple-c.*` label that no longer matches the project's settings, in which case the container is committed to a snapshot image (`triple-c-snapshot-{projectId}:latest`), removed, and recreated from that snapshot. Installed tools survive; the named volumes are untouched.
+5. **Reset**: `rebuild_project_container` closes live exec sessions, removes the container, removes the snapshot image, calls `remove_project_volumes` to delete **both** named volumes, then starts fresh from the clean base image.
 
-The `.claude` configuration directory uses a **named Docker volume** (`triple-c-claude-config-{projectId}`) so OAuth tokens from `claude login` persist even across container resets.
+Two named volumes exist per project and they are the only ones it owns:
+
+| Volume | Mount point | Purpose |
+|---|---|---|
+| `triple-c-home-{projectId}` | `/home/claude` | Home directory — `~/.claude.json`, `~/.local`, `~/.ssh`, `~/.aws` |
+| `triple-c-claude-config-{projectId}` | `/home/claude/.claude` | Claude Code config: OAuth credential, settings, skills/agents/commands, session transcripts, scheduler state. Nested inside the home volume; Docker gives the more specific mount precedence. |
+
+`remove_project_volumes` names those two volumes explicitly (no prefix sweep) and is called from
+exactly two places: `remove_project` and `rebuild_project_container`. Ordinary container removal
+passes `v: false`, so stop/start and recreation never touch the volumes — **only Reset and project
+removal delete them.** A Reset therefore destroys the `claude login` credential, installed skills,
+session transcripts and scheduled tasks; it does not touch host bind mounts, the project record, or
+host keychain secrets.
+
+### Permission Modes
+
+`PermissionMode` (`models/project.rs`) is a four-state enum replacing the earlier `full_permissions`
+boolean. It reaches Claude Code by two different routes:
+
+| Mode | `cli_args()` — interactive terminals | `as_env_value()` — scheduler |
+|---|---|---|
+| `Plan` | `--permission-mode plan` | `plan` |
+| `Default` | *(no flag)* | `default` |
+| `AcceptEdits` | `--permission-mode acceptEdits` | `acceptEdits` |
+| `Bypass` | `--dangerously-skip-permissions` | `bypass` |
+
+`Project.permission_mode` is `Option<PermissionMode>`, and `effective_permission_mode()` resolves
+`None` from the legacy `full_permissions` flag, so records written before the change keep behaving
+the same way.
+
+**Interactive path.** `build_terminal_cmd()` evaluates `cli_args()` when a session is created, so
+the flags are fixed for the life of that `claude` process. Changing the mode affects terminals
+opened afterwards, not running ones. The same applies to `resume_session_command`, which builds
+`claude <flags> --resume <id>` server-side.
+
+**Scheduler path.** Cron jobs run with a minimal environment, so the mode travels as
+`TRIPLE_C_PERMISSION_MODE` in the container's env; the entrypoint snapshots the allowlisted
+variables into `~/.claude/scheduler/.env`, and `triple-c-task-runner` sources that file and maps the
+value back to flags for its `claude -p` run. Container env can only change at create time, so
+`container_needs_recreation()` compares a `triple-c.permission-mode` label and forces a recreation
+on the next start. A mode change therefore reaches new terminals immediately but the scheduler only
+after a stop/start. `TRIPLE_C_PERMISSION_MODE` is a reserved env key so it cannot be hand-set.
 
 ### Authentication Modes
 
-Each project independently chooses one of two authentication methods:
+Each project independently chooses one backend:
 
-| Mode | How It Works | When to Use |
+| Backend | How It Works | When to Use |
 |------|-------------|-------------|
-| **Anthropic (OAuth)** | User runs `claude login` or `/login` inside the terminal. OAuth URL opens in host browser via URL detection. Token persists in the `.claude` config volume. | Default — personal and team use |
-| **AWS Bedrock** | Per-project AWS credentials (static keys, profile, or bearer token) injected as env vars. `~/.aws` config optionally bind-mounted read-only. | Enterprise environments using Bedrock |
+| **Anthropic** | Either the shared `CLAUDE_CODE_OAUTH_TOKEN` injected from the OS keychain, or a per-container `claude login` whose credential persists in the `.claude` config volume. The OAuth URL opens in the host browser via URL detection. | Default — personal and team use |
+| **AWS Bedrock** | Per-project AWS credentials (static keys, named profile, or bearer token) injected as env vars. `~/.aws` config optionally bind-mounted read-only; SSO sessions are validated before launching Claude for profile auth. | Enterprise environments using Bedrock |
+| **Ollama** | `ANTHROPIC_BASE_URL` points at an Ollama server; `ANTHROPIC_AUTH_TOKEN` is set to a placeholder. | Local models (best-effort) |
+| **OpenAI Compatible** | `ANTHROPIC_BASE_URL` plus `ANTHROPIC_AUTH_TOKEN` point at any OpenAI-compatible endpoint (LiteLLM, OpenRouter, vLLM, …). | Gateways and proxies (best-effort) |
+
+### Shared Claude Authentication Token
+
+`commands/auth_token_commands.rs` runs `claude setup-token` on a PTY inside a running container.
+Contrary to the loopback pattern most CLI logins use, `setup-token` redirects to an Anthropic-hosted
+page and then blocks on a stdin paste prompt, so the flow needs a way to feed the pasted code back
+in — hence `submit_claude_token_code`. The flow is single-flight (the token is global, so two
+concurrent logins would race to overwrite each other's keychain entry) and times out after 15
+minutes.
+
+- **Storage** — the OS keychain, under a dedicated service name; the token is never returned to the
+  frontend, never written to a log, and no command accepts or returns it.
+- **Redaction** — streamed output is stripped of ANSI sequences and passed through a stateful
+  redactor that masks anything matching `sk-ant-` with a plausible body, withholding any tail that
+  could still grow into a secret across a chunk boundary.
+- **Injection** — `CLAUDE_CODE_OAUTH_TOKEN` is set only when the backend is Anthropic, the project
+  has not opted out (`use_shared_auth_token`, default `true`), and a non-blank token is stored. When
+  those conditions do not hold, the variable is explicitly set to empty rather than omitted, so a
+  value baked into a snapshot image by `docker commit` is actively cleared.
+- **Rotation** — a random UUID minted on each store is mirrored into the
+  `triple-c.claude-token-version` label. It is deliberately *not* a hash of the token: labels are
+  readable by anything that can run `docker inspect`, and a hash would be an offline verification
+  oracle. A label mismatch forces container recreation on the next start, which is when a container
+  picks up or loses the token.
+
+### Auth Bridge
+
+CLIs that log in through a browser (`claude login`, `aws sso login`, `fly login`) start an ephemeral
+HTTP listener on an unpredictable loopback port and hand the provider a `http://localhost:<port>/…`
+redirect. Run inside a container, that listener is unreachable from the host browser and nothing can
+be pre-published at container-creation time. `auth_bridge/` bridges it at runtime:
+
+- **Discovery** (`proc_net.rs`) — a `docker exec` reads `/proc/net/tcp` and `/proc/net/tcp6` every
+  two seconds. The image ships no `ss`, `netstat` or `lsof`. Only rows in state `0A` (`TCP_LISTEN`)
+  bound to loopback are kept; wildcard binds are ignored on purpose, since publishing those is the
+  port-mappings feature's job.
+- **Family handling** — a `::1`-only listener genuinely cannot be reached over `127.0.0.1`, and Node
+  resolves `localhost` to IPv6 first on Linux, so `claude login` frequently binds `::1` alone. The
+  socat target follows the family actually observed; IPv4-mapped rows in `/proc/net/tcp6` are
+  treated as IPv4.
+- **Host bind** (`tunnel.rs`) — the same port number is bound on the host: `127.0.0.1` is required,
+  `[::1]` is best-effort. **The host side binds loopback only, never a wildcard address** —
+  everything behind it is an unauthenticated in-container service that bound loopback precisely
+  because it expected to be unreachable.
+- **Transport** — each accepted connection is proxied by an attached exec running
+  `socat - TCP:127.0.0.1:<port>`, because container IPs are not routable from the host under Docker
+  Desktop. It goes through the same `create_attached_exec()` helper as terminal sessions, with
+  `tty: false` so socat's stderr is demultiplexed away from the proxied byte stream.
+- **Policy** — ports appearing in the project's port mappings are skipped, and a host bind failure
+  is recorded as a conflict and retried later rather than fought over.
+- **Lifecycle** — opt-in per project (`auth_bridge_enabled`, default `false`). It is purely
+  host-side, so it deliberately has no container-recreation label. The poller stops itself when the
+  project is gone, the flag is cleared, or the container is no longer running, and `stop()` awaits
+  it so host ports are provably released.
+
+### Container Introspection
+
+`list_container_capabilities` (`commands/inspect_commands.rs`) executes a read-only shell script in
+a running container and returns counts and item lists for skills, agents, commands, hooks, plugins
+and MCP servers, across user scope (`/home/claude/.claude`) and project scope
+(`/workspace/*/.claude`, `/workspace/*/.mcp.json`). Everything is computed in-container with
+`find`/`awk`/`jq`; only the JSON summary crosses the wire, and a stopped container yields zeros
+rather than an error.
+
+The script writes nothing. Claude Code owns this configuration and has its own tooling for it
+(`/agents`, `/hooks`, `/plugins`, `/mcp`); Triple-C surfaces counts and opens a terminal rather than
+rebuilding those editors as forms. `list_claude_sessions` and the scheduler commands
+(`list_scheduled_tasks`, `get_scheduled_task_log`, `set_scheduled_task_enabled`,
+`run_scheduled_task_now`, `remove_scheduled_task`, `clear_scheduler_notifications`) live in the same
+module; the mutating ones shell out to `triple-c-scheduler` rather than editing its state files.
+
+### Main-Area Tab Model
+
+The frontend keeps a single ordered `tabOrder` array in the Zustand store holding two tab kinds,
+`home:<projectId>` and `term:<sessionId>`, rendered by `components/layout/MainTabs.tsx`.
+`activeSessionId` is *derived* from `activeTabKey`, so exactly one thing is current and a Project
+Home tab and a terminal cannot both claim focus. Project configuration is a main-area view
+(`components/projects/home/`), not a modal; the sidebar row is select-only.
 
 ### UID/GID Remapping
 
@@ -205,10 +327,12 @@ This avoids the common Docker problem where bind-mount permissions can't be chan
 | Data | Storage | Location |
 |------|---------|----------|
 | Project configurations | JSON file (atomic writes) | `~/.local/share/triple-c/projects.json` |
-| API keys | OS keychain | macOS Keychain / Windows Credential Manager / Linux Secret Service |
+| API keys and per-project secrets | OS keychain | macOS Keychain / Windows Credential Manager / Linux Secret Service |
+| Shared Claude token + rotation id | OS keychain | Separate service entries; never on disk, never in a label |
 | App settings | Tauri plugin-store | App data directory |
-| Claude config/tokens | Named Docker volume | `triple-c-claude-config-{projectId}` |
-| Container filesystem | Docker container layer | Preserved across stop/start, cleared on reset |
+| Claude config, sessions, scheduler state | Named Docker volume | `triple-c-claude-config-{projectId}` |
+| Container home directory | Named Docker volume | `triple-c-home-{projectId}` |
+| Container filesystem | Docker container layer, preserved into `triple-c-snapshot-{projectId}:latest` on recreation | Survives stop/start and recreation; destroyed by Reset |
 
 The projects store uses **atomic writes** (write to `.json.tmp`, then `rename()`) to prevent data corruption if the app crashes mid-write. Corrupted files are backed up to `.json.bak` before being replaced.
 
@@ -230,98 +354,159 @@ The `TerminalView` component works around this with a **URL accumulator**:
 triple-c/
 ├── README.md                      # Architecture overview
 ├── TECHNICAL.md                   # This document
-├── HOW-TO-USE.md                  # User guide
+├── HOW-TO-USE.md                  # User guide (also served by the in-app Help dialog)
 ├── BUILDING.md                    # Build instructions
 ├── CLAUDE.md                      # Claude Code instructions
+├── DESIGN-REVIEW.md               # UI/UX review notes
+├── ROADMAP.md                     # Planned work
 │
-├── container/
+├── container/                     # Sandbox image
 │   ├── Dockerfile                 # Ubuntu 24.04 + all dev tools + Claude Code
-│   ├── entrypoint.sh              # UID/GID remap, SSH setup, git config, MCP injection
+│   ├── entrypoint.sh              # UID/GID remap, SSH setup, git config, settings injection,
+│   │                              # scheduler env snapshot + crontab rebuild
 │   ├── osc52-clipboard            # Clipboard shim (xclip/xsel/pbcopy via OSC 52)
 │   ├── audio-shim                 # Audio capture shim (rec/arecord via FIFO)
 │   ├── triple-c-scheduler         # Bash-based cron task system
-│   └── triple-c-task-runner       # Task execution runner for scheduler
+│   ├── triple-c-task-runner       # Cron entry point; permission mode → flags → `claude -p`
+│   ├── triple-c-sso-refresh       # AWS SSO session refresh helper
+│   └── mission-control/           # Bundled Flight Control methodology (skills, docs, templates)
+│
+├── stt-container/                 # Speech-to-text image
+│   ├── Dockerfile                 # Faster Whisper (Python 3.11 + FastAPI)
+│   └── server.py                  # POST /transcribe endpoint
 │
 ├── .gitea/
 │   └── workflows/
 │       ├── build-app.yml          # Build Tauri app (Linux/macOS/Windows)
+│       ├── build-app-preview.yml  # Preview builds
 │       ├── build.yml              # Build container image (multi-arch)
+│       ├── build-stt.yml          # Build the STT image
 │       ├── sync-release.yml       # Mirror releases to GitHub
-│       └── backfill-releases.yml  # Bulk copy releases to GitHub
+│       ├── backfill-releases.yml  # Bulk copy releases to GitHub
+│       └── cleanup-releases.yml   # Prune old releases
 │
 └── app/                           # Tauri v2 desktop application
     ├── package.json               # React, xterm.js, zustand, tailwindcss
     ├── vite.config.ts             # Vite bundler config
+    ├── vitest.config.ts           # Vitest (jsdom) config
     ├── index.html                 # HTML entry point
     │
     ├── src/                       # React frontend
     │   ├── main.tsx               # React DOM root
-    │   ├── App.tsx                # Top-level layout
-    │   ├── index.css              # CSS variables, dark theme, scrollbars
+    │   ├── App.tsx                # Top-level layout + welcome screen
+    │   ├── index.css              # CSS variables, dark theme, focus ring, scrollbars
     │   ├── store/
-    │   │   └── appState.ts        # Zustand store (projects, sessions, MCP, UI)
+    │   │   └── appState.ts        # Zustand store (projects, sessions, tab strip, toasts)
     │   ├── hooks/
+    │   │   ├── useClaudeAuth.ts   # Shared token status + acquisition
+    │   │   ├── useContainerProgress.ts # container-progress events → inline progress
     │   │   ├── useDocker.ts       # Docker status, image build/pull
-    │   │   ├── useFileManager.ts  # File manager operations
-    │   │   ├── useMcpServers.ts   # MCP server CRUD
+    │   │   ├── useFileManager.ts  # File browser operations
+    │   │   ├── useInstallHelper.ts # Guided Docker installation
+    │   │   ├── useKeyboardShortcuts.ts # Ctrl+T / Ctrl+Shift+W / Ctrl+Tab / Ctrl+1..9
+    │   │   ├── useProjectActions.ts # Start/stop/reset/backup, open terminals
     │   │   ├── useProjects.ts     # Project CRUD operations
+    │   │   ├── useSaveState.ts    # Saved / Saving / Failed indicator state
     │   │   ├── useSettings.ts     # App settings
+    │   │   ├── useSTT.ts          # Speech-to-text recording and container control
     │   │   ├── useTerminal.ts     # Terminal I/O, resize, session events
     │   │   ├── useUpdates.ts      # App update checking
     │   │   └── useVoice.ts        # Voice mode audio capture
     │   ├── lib/
     │   │   ├── types.ts           # TypeScript interfaces matching Rust models
     │   │   ├── tauri-commands.ts  # Typed invoke() wrappers
+    │   │   ├── urlDetector.ts     # Long-URL reassembly for OAuth flows
+    │   │   ├── wav.ts             # WAV encoding for STT
     │   │   └── constants.ts       # App-wide constants
     │   └── components/
-    │       ├── layout/            # Sidebar, TopBar, StatusBar
-    │       ├── mcp/               # McpPanel, McpServerCard
-    │       ├── projects/          # ProjectCard, ProjectList, AddProjectDialog,
-    │       │                      # FileManagerModal, ContainerProgressModal, modals
+    │       ├── DockerInstallDialog.tsx # First-run Docker setup
+    │       ├── layout/            # TopBar, MainTabs (the unified tab strip),
+    │       │                      # Sidebar, StatusBar, HelpDialog
+    │       ├── projects/
+    │       │   ├── home/                 # Project Home — the main-area project view
+    │       │   │   ├── ProjectHome.tsx   # Header, actions, overflow menu, tab strip
+    │       │   │   ├── OverviewTab.tsx   # Permission mode, summary, recent activity
+    │       │   │   ├── SessionsTab.tsx   # Past Claude sessions + Resume
+    │       │   │   ├── AutomationTab.tsx # Scheduler tasks + notifications
+    │       │   │   ├── ConfigTab.tsx     # Config section host
+    │       │   │   ├── FilesTab.tsx      # In-container file browser
+    │       │   │   ├── CapabilityTiles.tsx # Read-only capability counts
+    │       │   │   ├── format.ts         # Age / size / uptime formatting
+    │       │   │   └── config/           # WorkspaceSection, ModelSection,
+    │       │   │                         # AccessSection, RuntimeSection
+    │       │   ├── ProjectRow.tsx        # Select-only sidebar row
+    │       │   ├── ProjectList.tsx       # Sidebar project list
+    │       │   ├── AddProjectDialog.tsx  # New-project dialog
+    │       │   ├── PermissionModeControl.tsx # Plan/Default/Accept Edits/Bypass
+    │       │   ├── ConfirmRemoveModal.tsx    # Project removal confirmation
+    │       │   └── *Editor.tsx / *Modal.tsx  # EnvVars, PortMappings,
+    │       │                                 # ClaudeInstructions, ClaudeCodeSettings —
+    │       │                                 # editors reused by Project Home
     │       ├── settings/          # SettingsPanel, DockerSettings, AwsSettings,
-    │       │                      # WebTerminalSettings, UpdateDialog
-    │       └── terminal/          # TerminalView (xterm.js), TerminalTabs, UrlToast
+    │       │                      # OllamaSettings, OpenAiCompatibleSettings,
+    │       │                      # SharedAuthSettings, ClaudeAuthModal,
+    │       │                      # WebTerminalSettings, SttSettings,
+    │       │                      # MicrophoneSettings, UpdateDialog, ImageUpdateDialog
+    │       ├── terminal/          # TerminalView (xterm.js), TerminalContextMenu,
+    │       │                      # SttButton, UrlToast, trimSelection
+    │       └── ui/                # Shared primitives: Modal, Button, Toggle, Field,
+    │                              # SegmentedControl, StatusIndicator, SaveIndicator,
+    │                              # OverflowMenu, ToastHost, Tooltip, AccordionSection
     │
     └── src-tauri/                 # Rust backend
         ├── Cargo.toml             # Rust dependencies
         ├── tauri.conf.json        # Tauri app configuration
+        ├── build.rs               # Tauri build script
         ├── capabilities/
-        │   └── default.json       # Tauri v2 permission grants
+        │   └── default.json       # Tauri v2 plugin permission grants
         └── src/
             ├── lib.rs             # App builder, plugin + command registration
             ├── main.rs            # Entry point
             ├── logging.rs         # Log configuration
             ├── commands/          # Tauri command handlers
-            │   ├── docker_commands.rs   # Docker status, image ops
-            │   ├── file_commands.rs     # File manager (list/download/upload)
-            │   ├── mcp_commands.rs      # MCP server CRUD
-            │   ├── project_commands.rs  # Start/stop/rebuild containers
-            │   ├── settings_commands.rs # Settings CRUD
-            │   ├── terminal_commands.rs # Terminal I/O, resize
-            │   ├── update_commands.rs   # App update checking
+            │   ├── auth_bridge_commands.rs  # Enable/status for the loopback bridge
+            │   ├── auth_token_commands.rs   # claude setup-token flow, redaction, keychain
+            │   ├── aws_commands.rs          # AWS profile/region discovery
+            │   ├── docker_commands.rs       # Docker status, image ops
+            │   ├── file_commands.rs         # File browser (list/download/upload)
+            │   ├── help_commands.rs         # Serves HOW-TO-USE.md to the Help dialog
+            │   ├── inspect_commands.rs      # Sessions, capabilities, scheduler tasks
+            │   ├── install_helper_commands.rs # Guided Docker installation
+            │   ├── project_commands.rs      # Start/stop/rebuild/backup containers
+            │   ├── settings_commands.rs     # Settings CRUD
+            │   ├── stt_commands.rs          # STT start/stop/transcribe
+            │   ├── terminal_commands.rs     # Terminal I/O, resize
+            │   ├── update_commands.rs       # App update checking
             │   └── web_terminal_commands.rs # Web terminal start/stop/status
-            ├── web_terminal/       # Remote terminal access
+            ├── auth_bridge/       # Host-side loopback callback bridge
+            │   ├── mod.rs         # Per-project poller, status, lifecycle
+            │   ├── proc_net.rs    # /proc/net/tcp{,6} parsing, loopback filtering
+            │   └── tunnel.rs      # Host loopback bind + socat tunnel over the Docker API
+            ├── web_terminal/      # Remote terminal access
             │   ├── mod.rs         # Module root
             │   ├── server.rs      # Axum HTTP+WS server lifecycle
             │   ├── ws_handler.rs  # WebSocket connection handler
             │   └── terminal.html  # Embedded xterm.js web UI
+            ├── install_helper/    # Docker installation assistance
+            │   ├── mod.rs         # Install orchestration
+            │   └── platform.rs    # Per-OS install strategies
             ├── docker/            # Docker API layer
             │   ├── client.rs      # bollard singleton connection
-            │   ├── container.rs   # Create, start, stop, remove, fingerprinting
-            │   ├── exec.rs        # PTY exec sessions with bidirectional streaming
+            │   ├── container.rs   # Create/start/stop/remove, labels, recreation checks,
+            │   │                  # remove_project_volumes, snapshot commit
+            │   ├── exec.rs        # create_attached_exec() — the single attached-exec path
             │   ├── image.rs       # Build from Dockerfile, pull from registry
-            │   └── network.rs     # Per-project bridge networks for MCP
+            │   ├── stt.rs         # Speech-to-text container lifecycle
+            │   └── legacy_cleanup.rs # Migration shim for the removed MCP feature
             ├── models/            # Data structures
-            │   ├── project.rs     # Project, Backend, BedrockConfig
-            │   ├── mcp_server.rs  # MCP server configuration
-            │   ├── app_settings.rs # Global settings (image source, AWS, etc.)
+            │   ├── project.rs     # Project, Backend, PermissionMode, BedrockConfig, …
+            │   ├── app_settings.rs # Global settings (image source, AWS, STT, web terminal)
             │   ├── container_config.rs # Image name resolution
             │   └── update_info.rs # Update metadata
             └── storage/           # Persistence
                 ├── projects_store.rs  # JSON file with atomic writes
-                ├── mcp_store.rs       # MCP server persistence
                 ├── settings_store.rs  # App settings (Tauri plugin-store)
-                └── secure.rs          # OS keychain via keyring
+                └── secure.rs          # OS keychain via keyring (secrets, shared token)
 ```
 
 ---
@@ -345,6 +530,11 @@ triple-c/
 | `tar` | 0.4 | In-memory tar archives for Docker build context |
 | `dirs` | 6.x | Cross-platform app data directory paths |
 | `serde` / `serde_json` | 1.x | Serialization for IPC and persistence |
+| `log` / `fern` | 0.4 / 0.7 | Date-based file logging |
+| `include_dir` | 0.7 | Embeds the container build context in the binary |
+| `reqwest` | 0.12 | HTTPS (rustls) for update checks, help content, STT uploads |
+| `iana-time-zone` | 0.1 | Host timezone detection for container `TZ` |
+| `sha2` | 0.10 | Settings fingerprints |
 | `axum` | 0.8 | HTTP+WebSocket server for web terminal |
 | `tower-http` | 0.6 | CORS middleware for web terminal |
 | `base64` | 0.22 | Terminal data encoding over WebSocket |
@@ -367,6 +557,8 @@ triple-c/
 | `zustand` | 5.x | Lightweight state management |
 | `tailwindcss` | 4.x | Utility-first CSS framework |
 | `vite` | 6.x | Frontend build tool and dev server |
+| `vitest` | 4.x | Test runner (jsdom environment) |
+| `@testing-library/react` | 16.x | Component tests |
 
 ### Container Image
 

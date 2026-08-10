@@ -1,9 +1,11 @@
+pub mod auth_bridge_commands;
+pub mod auth_token_commands;
 pub mod aws_commands;
 pub mod docker_commands;
 pub mod file_commands;
 pub mod help_commands;
+pub mod inspect_commands;
 pub mod install_helper_commands;
-pub mod mcp_commands;
 pub mod project_commands;
 pub mod settings_commands;
 pub mod stt_commands;

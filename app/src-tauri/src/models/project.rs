@@ -30,6 +30,58 @@ fn default_full_permissions() -> bool {
     true
 }
 
+/// `use_shared_auth_token` defaults to **on**: once the user has run
+/// `claude setup-token` once, every existing Anthropic-backend project should
+/// pick the token up without being edited one by one. Projects deliberately
+/// pinned to their own `claude login` identity opt out.
+fn default_use_shared_auth_token() -> bool {
+    true
+}
+
+/// How much autonomy Claude Code is granted inside the container.
+///
+/// Maps onto Claude Code CLI flags — see [`PermissionMode::cli_args`], which is
+/// the single definition of that mapping and must be used by every call site.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum PermissionMode {
+    /// Read-only planning mode.
+    Plan,
+    /// Claude Code's own default behavior (prompts for permission).
+    #[default]
+    Default,
+    /// Auto-accept file edits, prompt for everything else.
+    AcceptEdits,
+    /// Skip all permission prompts.
+    Bypass,
+}
+
+impl PermissionMode {
+    /// The CLI flags this mode adds to a `claude` invocation.
+    /// Defined once here so every call site stays in sync.
+    pub fn cli_args(&self) -> Vec<String> {
+        match self {
+            PermissionMode::Plan => vec!["--permission-mode".to_string(), "plan".to_string()],
+            PermissionMode::Default => Vec::new(),
+            PermissionMode::AcceptEdits => {
+                vec!["--permission-mode".to_string(), "acceptEdits".to_string()]
+            }
+            PermissionMode::Bypass => vec!["--dangerously-skip-permissions".to_string()],
+        }
+    }
+
+    /// The wire value used for the `TRIPLE_C_PERMISSION_MODE` container env var.
+    /// Matches the serde `camelCase` representation.
+    pub fn as_env_value(&self) -> &'static str {
+        match self {
+            PermissionMode::Plan => "plan",
+            PermissionMode::Default => "default",
+            PermissionMode::AcceptEdits => "acceptEdits",
+            PermissionMode::Bypass => "bypass",
+        }
+    }
+}
+
 /// Settings for Claude Code CLI behavior inside the container.
 /// These map to Claude Code env vars and ~/.claude/settings.json entries.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -78,8 +130,33 @@ pub struct Project {
     pub sandbox_mode_enabled: bool,
     #[serde(default)]
     pub mission_control_enabled: bool,
+    /// Opt in to the auth bridge: while the container runs, its loopback
+    /// listeners are mirrored onto the host's loopback so browser OAuth
+    /// callbacks (`claude login`, `fly login`, `aws sso login`) can reach them.
+    /// Purely host-side — it deliberately has no container-recreation label,
+    /// because toggling it changes nothing about the container itself.
+    #[serde(default)]
+    pub auth_bridge_enabled: bool,
+    /// Use the shared, long-lived Claude Code OAuth token (from
+    /// `claude setup-token`, held in the OS keychain) for this project instead
+    /// of requiring its own `claude login`. Only consulted when `backend` is
+    /// [`Backend::Anthropic`] and a token has actually been stored.
+    ///
+    /// Defaults to **true** so a single `setup-token` run covers every project;
+    /// turn it off to pin a project to the identity it logged in with inside
+    /// its own container.
+    #[serde(default = "default_use_shared_auth_token")]
+    pub use_shared_auth_token: bool,
+    /// Legacy binary permission flag. Superseded by `permission_mode`, but kept
+    /// because it is the value already stored in users' `projects.json`; it is
+    /// the fallback in `effective_permission_mode()` so old projects keep
+    /// behaving identically without a data migration.
     #[serde(default = "default_full_permissions")]
     pub full_permissions: bool,
+    /// Per-project permission mode. `None` means "not set yet" → fall back to
+    /// the legacy `full_permissions` flag.
+    #[serde(default)]
+    pub permission_mode: Option<PermissionMode>,
     pub ssh_key_path: Option<String>,
     #[serde(skip_serializing, default)]
     pub git_token: Option<String>,
@@ -91,8 +168,6 @@ pub struct Project {
     pub port_mappings: Vec<PortMapping>,
     #[serde(default)]
     pub claude_instructions: Option<String>,
-    #[serde(default)]
-    pub enabled_mcp_servers: Vec<String>,
     #[serde(default)]
     pub claude_code_settings: Option<ClaudeCodeSettings>,
     /// User-defined display names for terminal tabs, keyed by session id.
@@ -212,7 +287,10 @@ impl Project {
             allow_docker_access: false,
             sandbox_mode_enabled: false,
             mission_control_enabled: false,
+            auth_bridge_enabled: false,
+            use_shared_auth_token: default_use_shared_auth_token(),
             full_permissions: false,
+            permission_mode: None,
             ssh_key_path: None,
             git_token: None,
             git_user_name: None,
@@ -220,12 +298,22 @@ impl Project {
             custom_env_vars: Vec::new(),
             port_mappings: Vec::new(),
             claude_instructions: None,
-            enabled_mcp_servers: Vec::new(),
             claude_code_settings: None,
             renamed_session_names: HashMap::new(),
             created_at: now.clone(),
             updated_at: now,
         }
+    }
+
+    /// The permission mode to actually use for this project.
+    /// Falls back to the legacy `full_permissions` boolean when the newer
+    /// `permission_mode` field has never been set.
+    pub fn effective_permission_mode(&self) -> PermissionMode {
+        self.permission_mode.unwrap_or(if self.full_permissions {
+            PermissionMode::Bypass
+        } else {
+            PermissionMode::Default
+        })
     }
 
     pub fn container_name(&self) -> String {

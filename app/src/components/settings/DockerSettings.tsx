@@ -96,7 +96,7 @@ export default function DockerSettings() {
                 onClick={() => handleSourceChange(opt.value)}
                 className={`flex-1 px-2 py-1.5 text-xs rounded border transition-colors ${
                   imageSource === opt.value
-                    ? "bg-[var(--accent)] text-white border-[var(--accent)]"
+                    ? "bg-[var(--accent-emphasis)] text-white border-[var(--accent)]"
                     : "bg-[var(--bg-tertiary)] border-[var(--border-color)] hover:bg-[var(--border-color)]"
                 }`}
                 title={opt.description}
@@ -116,7 +116,7 @@ export default function DockerSettings() {
               value={customInput}
               onChange={(e) => handleCustomChange(e.target.value)}
               placeholder="e.g., myregistry.com/image:tag"
-              className="w-full px-2 py-1.5 text-xs bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:outline-none focus:border-[var(--accent)]"
+              className="w-full px-2 py-1.5 text-xs bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:border-[var(--accent)]"
             />
           </div>
         )}
@@ -149,7 +149,7 @@ export default function DockerSettings() {
             <button
               onClick={handleBuild}
               disabled={working || !dockerAvailable}
-              className="px-3 py-1.5 text-xs bg-[var(--accent)] text-white rounded hover:bg-[var(--accent-hover)] disabled:opacity-50 transition-colors"
+              className="px-3 py-1.5 text-xs bg-[var(--accent-emphasis)] text-white rounded hover:bg-[var(--accent-emphasis-hover)] disabled:text-[var(--text-disabled)] transition-colors"
             >
               {working ? "Building..." : imageExists ? "Rebuild Image" : "Build Image"}
             </button>
@@ -157,7 +157,7 @@ export default function DockerSettings() {
             <button
               onClick={handlePull}
               disabled={working || !dockerAvailable}
-              className="px-3 py-1.5 text-xs bg-[var(--accent)] text-white rounded hover:bg-[var(--accent-hover)] disabled:opacity-50 transition-colors"
+              className="px-3 py-1.5 text-xs bg-[var(--accent-emphasis)] text-white rounded hover:bg-[var(--accent-emphasis-hover)] disabled:text-[var(--text-disabled)] transition-colors"
             >
               {working ? "Pulling..." : imageExists ? "Re-pull Image" : "Pull Image"}
             </button>

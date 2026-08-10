@@ -12,8 +12,10 @@ import { detectHostTimezone } from "../../lib/tauri-commands";
 import type { EnvVar } from "../../lib/types";
 import Tooltip from "../ui/Tooltip";
 import AccordionSection from "../ui/AccordionSection";
+import Toggle from "../ui/Toggle";
 import WebTerminalSettings from "./WebTerminalSettings";
 import SttSettings from "./SttSettings";
+import SharedAuthSettings from "./SharedAuthSettings";
 
 export default function SettingsPanel() {
   const { appSettings, saveSettings } = useSettings();
@@ -86,7 +88,7 @@ export default function SettingsPanel() {
               }
             }}
             placeholder="UTC"
-            className="w-full px-2 py-1 text-sm bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:outline-none focus:border-[var(--accent)]"
+            className="w-full px-2 py-1 text-sm bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:border-[var(--accent)]"
           />
         </div>
 
@@ -148,6 +150,10 @@ export default function SettingsPanel() {
         </div>
       </AccordionSection>
 
+      <AccordionSection id="claude-auth" title="Claude Authentication" defaultOpen={false}>
+        <SharedAuthSettings />
+      </AccordionSection>
+
       <AccordionSection id="backends" title="Backends" defaultOpen={false}>
         <AwsSettings />
         <div className="pt-3 border-t border-[var(--border-color)]" />
@@ -177,7 +183,7 @@ export default function SettingsPanel() {
               }
             }}
             placeholder="~/.ssh"
-            className="w-full px-2 py-1 text-sm bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:outline-none focus:border-[var(--accent)]"
+            className="w-full px-2 py-1 text-sm bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:border-[var(--accent)]"
           />
         </div>
 
@@ -194,7 +200,7 @@ export default function SettingsPanel() {
               }
             }}
             placeholder="Your Name"
-            className="w-full px-2 py-1 text-sm bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:outline-none focus:border-[var(--accent)]"
+            className="w-full px-2 py-1 text-sm bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:border-[var(--accent)]"
           />
         </div>
 
@@ -211,7 +217,7 @@ export default function SettingsPanel() {
               }
             }}
             placeholder="you@example.com"
-            className="w-full px-2 py-1 text-sm bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:outline-none focus:border-[var(--accent)]"
+            className="w-full px-2 py-1 text-sm bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:border-[var(--accent)]"
           />
         </div>
       </AccordionSection>
@@ -230,27 +236,22 @@ export default function SettingsPanel() {
           )}
           <div className="flex items-center gap-2">
             <label className="text-xs text-[var(--text-secondary)]">Auto-check for updates</label>
-            <button
-              onClick={handleAutoCheckToggle}
-              className={`px-2 py-0.5 text-xs rounded transition-colors ${
-                appSettings?.auto_check_updates !== false
-                  ? "bg-[var(--success)] text-white"
-                  : "bg-[var(--bg-primary)] border border-[var(--border-color)] text-[var(--text-secondary)]"
-              }`}
-            >
-              {appSettings?.auto_check_updates !== false ? "ON" : "OFF"}
-            </button>
+            <Toggle
+              label="Auto-check for updates"
+              checked={appSettings?.auto_check_updates !== false}
+              onChange={handleAutoCheckToggle}
+            />
           </div>
           <button
             onClick={handleCheckNow}
             disabled={checkingUpdates}
-            className="px-3 py-1.5 text-xs bg-[var(--bg-primary)] border border-[var(--border-color)] rounded hover:bg-[var(--border-color)] disabled:opacity-50 transition-colors"
+            className="px-3 py-1.5 text-xs bg-[var(--bg-primary)] border border-[var(--border-color)] rounded hover:bg-[var(--border-color)] disabled:text-[var(--text-disabled)] transition-colors"
           >
             {checkingUpdates ? "Checking..." : "Check now"}
           </button>
           {imageUpdateInfo && (
-            <div className="flex items-center gap-2 px-3 py-2 text-xs bg-[var(--bg-primary)] border border-[var(--warning,#f59e0b)] rounded">
-              <span className="inline-block w-2 h-2 rounded-full bg-[var(--warning,#f59e0b)]" />
+            <div className="flex items-center gap-2 px-3 py-2 text-xs bg-[var(--bg-primary)] border border-[var(--warning)] rounded">
+              <span className="inline-block w-2 h-2 rounded-full bg-[var(--warning)]" />
               <span>A newer container image is available. Re-pull the image in Container settings above to update.</span>
             </div>
           )}

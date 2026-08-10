@@ -9,17 +9,22 @@ Triple-C (Claude-Code-Container) is a desktop application that runs Claude Code 
 - [Prerequisites](#prerequisites)
 - [First Launch](#first-launch)
 - [The Interface](#the-interface)
+- [Project Home](#project-home)
 - [Project Management](#project-management)
+- [Permission Modes](#permission-modes)
 - [Project Configuration](#project-configuration)
-- [MCP Servers (Beta)](#mcp-servers-beta)
+- [Shared Claude Authentication](#shared-claude-authentication)
+- [Browser Logins Inside the Container (Auth Bridge)](#browser-logins-inside-the-container-auth-bridge)
 - [AWS Bedrock Configuration](#aws-bedrock-configuration)
 - [Ollama Configuration](#ollama-configuration)
 - [OpenAI Compatible Configuration](#openai-compatible-configuration)
 - [Settings](#settings)
 - [Web Terminal (Remote Access)](#web-terminal-remote-access)
 - [Terminal Features](#terminal-features)
-- [Scheduled Tasks (Inside the Container)](#scheduled-tasks-inside-the-container)
+- [Automation & Scheduled Tasks](#automation--scheduled-tasks)
+- [Keyboard Shortcuts](#keyboard-shortcuts)
 - [What's Inside the Container](#whats-inside-the-container)
+- [Claude Code Tips](#claude-code-tips)
 - [Troubleshooting](#troubleshooting)
 
 ---
@@ -79,7 +84,7 @@ Click **Pull Image** (for Registry/Custom) or **Build Image** (for Local Build).
 
 ### 2. Create Your First Project
 
-Switch to the **Projects** tab in the sidebar and click the **+** button.
+Switch to the **Projects** tab in the sidebar and click **+ Add**.
 
 1. **Project Name** — Give it a meaningful name (e.g., "my-web-app").
 2. **Folders** — Click **Browse** to select a directory on your host machine. This directory will be mounted into the container at `/workspace/<folder-name>`. You can add multiple folders with the **+** button at the bottom of the folder list.
@@ -87,42 +92,61 @@ Switch to the **Projects** tab in the sidebar and click the **+** button.
 
 ### 3. Start the Container
 
-Select your project in the sidebar and click **Start**. A progress modal appears showing real-time status as the container starts. The status dot changes from gray (stopped) to orange (starting) to green (running). The modal auto-closes on success.
+Click the project in the sidebar. Its **Project Home** opens as a tab in the main area. Click
+**Start** in the Project Home header (or use the play control that appears when you hover the
+sidebar row).
+
+Progress is reported inline — the sidebar row and the Project Home header show messages like
+"Creating container…" and "Starting container…" while the status moves from Stopped (`○`) to
+Starting (`◐`) to Running (`●`). Nothing blocks the rest of the app; if something fails you get a
+toast with the full detail behind a **Details** disclosure.
 
 ### 4. Open a Terminal
 
-Click the **Terminal** button to open an interactive terminal session. A new tab appears in the top bar and an xterm.js terminal loads in the main area.
+Click **Open Claude Terminal** in the Project Home header, or press **Ctrl+T**. A new tab appears
+in the main tab strip and an xterm.js terminal loads.
 
-Claude Code launches automatically. By default, it runs in standard permission mode and will ask for your approval before executing commands or editing files. To enable auto-approval of all actions within the sandbox, enable **Full Permissions** in the project configuration.
+Claude Code launches automatically. The project's **permission mode** decides how much it asks
+before acting — the default is to prompt before each tool call. See
+[Permission Modes](#permission-modes).
 
 ### 5. Authenticate
 
-**Anthropic (OAuth) — default:**
+**Anthropic — shared token (recommended):**
+
+Run `claude setup-token` once from **Settings → Claude Authentication** in the sidebar, and every
+Anthropic-backend project uses that token without its own login. See
+[Shared Claude Authentication](#shared-claude-authentication).
+
+**Anthropic — per-container OAuth:**
 
 1. Type `claude login` or `/login` in the terminal.
 2. Claude prints an OAuth URL. Triple-C detects long URLs and shows a clickable toast at the top of the terminal — click **Open** to open it in your browser.
-3. Complete the login in your browser. The token is saved and persists across container stops and resets.
+3. Complete the login in your browser. The token is saved and persists across container stops, starts and recreations. A **Reset** deletes it — see below.
+
+> If the login hangs after the browser step, the callback could not reach the container. Enable the
+> [Auth Bridge](#browser-logins-inside-the-container-auth-bridge) for that project.
 
 **AWS Bedrock:**
 
-1. Stop the container first (settings can only be changed while stopped).
-2. In the project card, switch the backend to **Bedrock**.
-3. Expand the **Config** panel and fill in your AWS credentials (see [AWS Bedrock Configuration](#aws-bedrock-configuration) below).
+1. Stop the container first (most settings can only be changed while stopped).
+2. Open the project's **Config** tab and, under **Model**, set **Backend** to **Bedrock**.
+3. Fill in your AWS credentials in the same section (see [AWS Bedrock Configuration](#aws-bedrock-configuration) below).
 4. Start the container again.
 
 **Ollama:**
 
-1. Stop the container first (settings can only be changed while stopped).
-2. In the project card, switch the backend to **Ollama**.
-3. Expand the **Config** panel and set the base URL of your Ollama server (defaults to `http://host.docker.internal:11434` for a local instance). Set the **Model ID** to the model you want to use (required).
+1. Stop the container first (most settings can only be changed while stopped).
+2. Open the project's **Config** tab and, under **Model**, set **Backend** to **Ollama**.
+3. Set the base URL of your Ollama server (defaults to `http://host.docker.internal:11434` for a local instance). Set the **Model** to the model you want to use (required).
 4. Make sure the model has been pulled in Ollama (e.g., `ollama pull qwen3.5:27b`) or used via Ollama cloud before starting.
 5. Start the container again.
 
 **OpenAI Compatible:**
 
-1. Stop the container first (settings can only be changed while stopped).
-2. In the project card, switch the backend to **OpenAI Compatible**.
-3. Expand the **Config** panel and set the base URL of your OpenAI-compatible endpoint (defaults to `http://host.docker.internal:4000` as an example). Optionally set an API key and model ID.
+1. Stop the container first (most settings can only be changed while stopped).
+2. Open the project's **Config** tab and, under **Model**, set **Backend** to **OpenAI Compatible**.
+3. Set the base URL of your OpenAI-compatible endpoint (defaults to `http://host.docker.internal:4000` as an example). Optionally set an API key and model.
 4. Start the container again.
 
 ---
@@ -130,23 +154,97 @@ Claude Code launches automatically. By default, it runs in standard permission m
 ## The Interface
 
 ```
-┌─────────────────────────────────────────────────────┐
-│  TopBar  [ Terminal Tabs ]           Docker ● Image ●│
-├────────────┬────────────────────────────────────────┤
-│  Sidebar   │                                        │
-│            │          Terminal View                  │
-│  Projects  │         (xterm.js)                     │
-│  MCP       │                                        │
-│  Settings  │                                        │
-├────────────┴────────────────────────────────────────┤
-│  StatusBar   X projects · X running · X terminals   │
-└─────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│ [⌂ my-app] [▣ my-app ask] [▣ my-app (bash)]   Docker ● Image ● ?     │
+├─────────────┬────────────────────────────────────────────────────────┤
+│  Sidebar    │  ┌──────────────────────────────────────────────────┐  │
+│             │  │ my-app   ● Running · up 2h 5m                    │  │
+│  Projects   │  │  [Open Claude Terminal] [Shell] [Files]          │  │
+│  Settings   │  │  [Stop] [⋯]                                      │  │
+│             │  ├──────────────────────────────────────────────────┤  │
+│  ● my-app   │  │ Overview · Sessions · Automation · Config · Files│  │
+│  ○ other    │  ├──────────────────────────────────────────────────┤  │
+│             │  │                                                  │  │
+│             │  │        (Project Home, or a terminal view)        │  │
+│             │  │                                                  │  │
+│             │  └──────────────────────────────────────────────────┘  │
+├─────────────┴────────────────────────────────────────────────────────┤
+│  2 project(s) · 1 running · 2 terminal(s)          Jump to Current ↓ │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-- **TopBar** — Terminal tabs for switching between sessions. Bash shell tabs show a "(bash)" suffix. Status dots on the right show Docker connection (green = connected) and image availability (green = ready).
-- **Sidebar** — Toggle between the **Projects** list, **MCP** server configuration, and **Settings** panel.
-- **Terminal View** — Interactive terminal powered by xterm.js with WebGL rendering. Includes a **Jump to Current** button that appears when you scroll up, so you can quickly return to the latest output.
-- **StatusBar** — Counts of total projects, running containers, and open terminal sessions.
+- **Tab strip (top)** — One strip holds every open tab, in the order you opened them. There are two
+  kinds: **Project Home** tabs (`⌂` glyph, project name, status glyph) and **terminal** tabs (`▣`
+  glyph, plus a small badge showing the permission mode the terminal was launched with —
+  `plan`, `ask`, `edits` or `bypass`). Bash shell tabs show a "(bash)" suffix. Right-click a
+  terminal tab to rename it, jump to its project home, or close it; double-click to rename inline.
+  There is no separate terminal tab bar and no "+" button — tabs appear when you open a project or
+  a terminal.
+- **Status indicators (top right)** — Docker connection and container image availability. Each pairs
+  a coloured dot with a word, so status is never conveyed by colour alone. The **?** button opens
+  the built-in help.
+- **Sidebar** — Toggle between the **Projects** list and the **Settings** panel. It collapses to a
+  narrow icon rail with the chevron button, and remembers that choice.
+- **Main area** — Shows the active tab: a Project Home view or an xterm.js terminal. With no tabs
+  open you get a welcome screen with Docker/image/project readiness checks.
+- **StatusBar** — Counts of total projects, running containers and open terminal sessions; the
+  **Jump to Current ↓** button when a terminal is scrolled up; and the microphone button when
+  speech-to-text is enabled.
+
+---
+
+## Project Home
+
+Clicking a project in the sidebar opens **Project Home** in the main area. The sidebar row is only
+for selecting a project and for two quick controls that appear on hover — start/stop, and open a
+Claude terminal. Everything else about a project lives in Project Home.
+
+The header shows the project name, its status, how long the container has been up, and the action
+buttons. Below that are five tabs:
+
+| Tab | What it's for |
+|---|---|
+| **Overview** | The permission mode control, a summary of the backend and sandbox settings, capability tiles, recent sessions and scheduled tasks |
+| **Sessions** | Past Claude Code conversations stored on this project's config volume, each with a **Resume** button |
+| **Automation** | The scheduled tasks running inside this container — see [Automation & Scheduled Tasks](#automation--scheduled-tasks) |
+| **Config** | All per-project configuration — see [Project Configuration](#project-configuration) |
+| **Files** | Browse, download and upload files inside the container |
+
+### Sessions
+
+Claude Code records each conversation on the project's config volume. The **Sessions** tab lists
+them with a name or summary, the session id, its working directory, its age, size and message
+count. **Refresh** re-reads the list.
+
+**Resume** opens a new shell tab and runs `claude --resume <session-id>` for you, with the
+project's current permission-mode flags applied. The Overview tab shows the four most recent
+sessions with the same Resume action.
+
+Sessions can only be read while the container is running, and they are stored on the config volume
+— so a **Reset** deletes them.
+
+### Capability Tiles
+
+The Overview tab shows read-only counts of what Claude Code has available **inside this container**:
+
+| Tile | What is counted |
+|---|---|
+| **Skills** | Directories under `.claude/skills/` that contain a `SKILL.md` |
+| **Agents** | `.md` files under `.claude/agents/` |
+| **Commands** | `.md` files under `.claude/commands/` |
+| **Hooks** | Hook handlers configured in `.claude/settings.json` / `settings.local.json` |
+| **Plugins** | Installed and enabled Claude Code plugins |
+| **MCP servers** | Servers in `~/.claude.json` and in any `.mcp.json` under `/workspace` |
+
+Both user scope (`/home/claude/.claude`) and project scope (`/workspace/<folder>/.claude`) are
+included, and each tile opens a list of what it found.
+
+> **Triple-C does not edit any of this.** Claude Code owns skills, agents, commands, hooks, plugins
+> and MCP servers, and it has good built-in tooling for them. The tiles are a window, not an editor:
+> **Manage in terminal** opens a terminal in the container so you can use `/agents`, `/hooks`,
+> `/plugins`, `/mcp` and friends directly.
+
+The counts are only available while the container is running.
 
 ---
 
@@ -154,59 +252,135 @@ Claude Code launches automatically. By default, it runs in standard permission m
 
 ### Project Status
 
-Each project shows a colored status dot:
+Each project shows a status glyph paired with a word, so it is readable without relying on colour:
 
-| Color | Status | Meaning |
+| Glyph | Status | Meaning |
 |-------|--------|---------|
-| Gray | Stopped | Container is not running |
-| Orange | Starting / Stopping | Container is transitioning |
-| Green | Running | Container is active, ready for terminals |
-| Red | Error | Something went wrong (check error message) |
+| `○` | Stopped | Container is not running |
+| `◐` | Starting / Stopping | Container is transitioning (the glyph pulses) |
+| `●` | Running | Container is active, ready for terminals |
+| `▲` | Error | Something went wrong (check the toast for detail) |
+
+While a container is starting or stopping, the status line is replaced by the live progress message.
 
 ### Project Actions
 
-Select a project in the sidebar to see its action buttons:
+Most actions live in the **Project Home header**; two live behind the **⋯** overflow menu next to
+it. The sidebar row carries only the two hover controls.
 
-| Button | When Available | What It Does |
-|--------|---------------|--------------|
-| **Start** | Stopped | Creates (if needed) and starts the container |
-| **Stop** | Running | Stops the container but preserves its state |
-| **Terminal** | Running | Opens a new Claude Code terminal session |
-| **Shell** | Running | Opens a bash login shell in the container (no Claude Code) |
-| **Files** | Running | Opens the file manager to browse, download, and upload files |
-| **Reset** | Stopped | Destroys and recreates the container from scratch |
-| **Config** | Always | Toggles the configuration panel |
-| **Remove** | Stopped | Deletes the project and its container (with confirmation) |
+| Action | Where | When Available | What It Does |
+|--------|-------|---------------|--------------|
+| **Start** | Project Home header; sidebar hover control | Stopped | Creates (if needed) and starts the container |
+| **Stop** | Project Home header; sidebar hover control | Running | Stops the container but preserves its state |
+| **Force stop** | Project Home header | Starting / Stopping | Interrupts a transition that is stuck |
+| **Open Claude Terminal** | Project Home header; sidebar hover control; `Ctrl+T` | Running | Opens a new Claude Code terminal tab |
+| **Shell** | Project Home header | Running | Opens a bash login shell tab in the container (no Claude Code) |
+| **Files** | Project Home header, and the **Files** tab | Running | Switches to the Files tab to browse, download and upload files |
+| **Config** | The **Config** tab | Always | Per-project configuration (most fields need the container stopped) |
+| **Back up container** | **⋯** overflow menu | A container exists | Saves a `.tar.gz` archive of the container to a location you choose |
+| **Reset container…** | **⋯** overflow menu | Stopped or Error | Destroys the container, snapshot image and both volumes, then recreates from the base image (wipes `~/.claude`) — asks first |
+| **Remove project…** | **⋯** overflow menu | Always | Deletes the project, its container, its volumes and its stored credentials — asks first |
+
+> Both destructive actions confirm before acting, and the Reset dialog spells out what you
+> lose: your `claude login`, anything installed inside the container, and every saved
+> session transcript. Your mounted project folders live on the host and are not touched.
+
+> The backup archive includes the Claude config volume, which may contain API keys. Keep it private.
 
 ### Renaming a Project
 
-Double-click the project name in the sidebar to rename it inline. Press **Enter** to confirm or **Escape** to cancel.
+Rename a project in its **Config** tab, under **Workspace → Project name**. Press **Enter** to save
+and leave the field, or **Escape** to revert. (Double-clicking a *terminal tab* renames that tab —
+that is a different thing.)
 
 ### Container Lifecycle
 
 Containers use a **stop/start** model. When you stop a container, everything inside it is preserved — installed packages, modified files, downloaded tools. Starting it again resumes where you left off.
 
-**Reset** removes the container and creates a fresh one. However, your Claude Code configuration (including OAuth tokens from `claude login`) is stored in a separate Docker volume and survives resets.
+**Reset container** removes the container, its snapshot image **and both of its named volumes**
+(`triple-c-home-<project-id>` and `triple-c-claude-config-<project-id>`), then creates a fresh one
+from the clean base image. This is destructive: `~/.claude` and `~/.claude.json` go with the
+volumes, so your per-container OAuth login, any skills or agents you installed, your session
+transcripts and your scheduled tasks are all lost.
 
-Only **Remove** deletes everything, including the config volume and any stored credentials.
+What Reset keeps: your host folders (they are bind mounts and are never touched), the project's
+configuration in Triple-C, and anything stored in your OS keychain — including the shared Claude
+authentication token. If the project uses that shared token, it re-authenticates by itself after a
+Reset; if it relies on `claude login`, you will need to log in again.
+
+Apart from **Remove project…**, Reset is the only action that deletes the volumes. Stopping and
+starting preserves them, and so does the automatic container recreation that happens when you
+change a setting that affects the container — in both cases your Claude Code configuration
+survives.
+
+**Remove project…** deletes everything Reset does, plus the project record itself and its stored
+credentials.
 
 ### Container Progress Feedback
 
-When starting, stopping, or resetting a container, a progress modal shows real-time status messages (e.g., "Setting up MCP network...", "Starting MCP containers...", "Creating container..."). If an error occurs, the modal displays the error with a **Close** button. A **Force Stop** option is available if the operation stalls. The modal auto-closes on success.
+When starting, stopping, or resetting a container, progress is shown inline on the project row and in the Project Home header (e.g., "Creating container...", "Starting container..."), so the rest of the app stays usable. If an error occurs it is raised as a toast with the full detail behind a **Details** disclosure. There is no blocking progress modal.
+
+---
+
+## Permission Modes
+
+Every project has a **permission mode** that decides how much Claude Code does without asking. It
+is a segmented control on the **Overview** tab (and again under **Config → Runtime**), and it
+replaces the old Full Permissions on/off switch.
+
+| Mode | What Claude does | What Triple-C passes to `claude` |
+|------|------------------|----------------------------------|
+| **Plan** | Proposes a plan and makes no changes | `--permission-mode plan` |
+| **Default** | Asks before each tool call | *(nothing — Claude Code's own default)* |
+| **Accept Edits** | Auto-approves file edits; other tools still prompt | `--permission-mode acceptEdits` |
+| **Bypass** | Auto-approves every tool call | `--dangerously-skip-permissions` |
+
+New projects start in **Default**. Projects created before permission modes existed keep behaving
+the way they did: one that had Full Permissions on becomes **Bypass**, one that had it off becomes
+**Default**.
+
+> **CAUTION:** In **Bypass**, Claude can execute any command inside the container without asking.
+> The container sandbox limits the blast radius, but think carefully — especially if the container
+> has Docker socket access or reaches services on your network. The Overview tab tells you whether
+> the in-container sandbox is also on.
+
+### When a change takes effect
+
+- **Terminals** — the mode is applied when a terminal is opened, so it affects terminals you open
+  from then on. A Claude session that is already running keeps the permissions it started with;
+  close the tab and open a new terminal to change it. The badge on each terminal tab shows the mode
+  that terminal was launched with (`plan`, `ask`, `edits`, `bypass`).
+- **Resumed sessions** — a session resumed from the **Sessions** tab uses the project's current
+  mode.
+- **Scheduled tasks** — these now honour the permission mode too (they previously always ran with
+  `--dangerously-skip-permissions`). The mode reaches them through the container's environment,
+  which can only change when the container is recreated, so **stop and start the project** for a
+  mode change to reach the scheduler.
+
+> Scheduled tasks run headless (`claude -p`) and cannot answer a permission prompt. In any mode
+> other than **Bypass**, a task may simply stop early when Claude Code asks for approval. Its run
+> log records which mode it used.
 
 ---
 
 ## Project Configuration
 
-Click **Config** on a selected project to expand the configuration panel. Settings can only be changed when the container is **stopped** (an orange warning box appears if the container is running).
+Open a project's **Config** tab in Project Home. Configuration is grouped into four sections —
+**Workspace**, **Model**, **Access** and **Runtime** — plus **Claude instructions** and **Claude
+Code settings**.
+
+Changes save automatically when a field loses focus, and a Saved / Saving… / Failed indicator in
+the corner tells you what happened. Most settings can only be changed when the container is
+**stopped**; a warning chip appears at the top of the tab if it is running. (The project name and
+the permission mode can be changed at any time.)
 
 ### Mounted Folders
 
 Each project mounts one or more host directories into the container. The mount appears at `/workspace/<mount-name>` inside the container.
 
-- Click **Browse** ("...") to change the host path
+- Click **Browse** to change the host path
 - Edit the mount name to control where it appears inside `/workspace/`
-- Click **+** to add more folders, or **x** to remove one
+- Click **+ Add folder** to add more, or **Remove** to drop one (the last remaining folder cannot be removed)
 - Mount names must be unique and use only letters, numbers, dashes, underscores, and dots
 
 ### SSH Keys
@@ -237,27 +411,31 @@ Available skills include `/mission`, `/flight`, `/leg`, `/agentic-workflow`, `/f
 
 > This setting can only be changed when the container is stopped. Toggling it triggers a container recreation on the next start.
 
-### Full Permissions
+### Permission Mode
 
-Toggle **Full Permissions** to allow Claude Code to run with `--dangerously-skip-permissions` inside the container. This is **off by default**.
+The **Runtime** section repeats the permission mode control from the Overview tab — see
+[Permission Modes](#permission-modes) for what each mode does and when a change takes effect.
 
-When **enabled**, Claude auto-approves all tool calls (file edits, shell commands, etc.) without prompting you. This is the fastest workflow since you won't be interrupted for approvals, and the Docker container provides isolation.
+### Sandbox Mode
 
-When **disabled** (default), Claude prompts you for approval before executing each action, giving you fine-grained control over what it does.
-
-> **CAUTION:** Enabling full permissions means Claude can execute any command inside the container without asking. While the container sandbox limits the blast radius, make sure you understand the implications — especially if the container has Docker socket access or network connectivity.
-
-> This setting can only be changed when the container is stopped. It takes effect the next time you open a terminal session.
+Toggles Claude Code's in-container bubblewrap isolation. The Overview tab shows the current state
+next to the permission mode, because the two together decide how contained a Bypass-mode session
+really is.
 
 ### Environment Variables
 
-Click **Edit** to open the environment variables modal. Add key-value pairs that will be injected into the container. Per-project variables override global variables with the same key.
+Add key-value pairs under **Access → Environment variables**; they are injected into the container.
+Per-project variables override global variables with the same key.
 
-> Reserved prefixes (`ANTHROPIC_`, `AWS_`, `GIT_`, `HOST_`, `TRIPLE_C_`) and specific internal variables (`CLAUDE_INSTRUCTIONS`, `MCP_SERVERS_JSON`, etc.) are filtered out to prevent conflicts. `CLAUDE_CODE_*` variables are now allowed, so you can set Claude Code feature flags directly (e.g., `CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1`).
+> Reserved prefixes (`ANTHROPIC_`, `AWS_`, `GIT_`, `HOST_`, `TRIPLE_C_`) are filtered out to prevent
+> conflicts, along with the exact names Triple-C manages itself: `CLAUDE_INSTRUCTIONS`,
+> `CLAUDE_CODE_SETTINGS_JSON`, `CLAUDE_CODE_OAUTH_TOKEN`, `MISSION_CONTROL_ENABLED`,
+> `TRIPLE_C_PERMISSION_MODE` and `MCP_SERVERS_JSON`. Other `CLAUDE_CODE_*` variables are allowed, so
+> you can set Claude Code feature flags directly (e.g., `CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1`).
 
 ### Port Mappings
 
-Click **Edit** to map host ports to container ports. This is useful when Claude Code starts a web server or other service inside the container and you want to access it from your host browser.
+Under **Access → Port mappings**, map host ports to container ports. This is useful when Claude Code starts a web server or other service inside the container and you want to access it from your host browser.
 
 Each mapping specifies:
 - **Host Port** — The port on your machine (1-65535)
@@ -266,11 +444,11 @@ Each mapping specifies:
 
 ### Claude Instructions
 
-Click **Edit** to write per-project instructions for Claude Code. These are written to `~/.claude/CLAUDE.md` inside the container and provide project-specific context. If you also have global instructions (in Settings), the global instructions come first, followed by the per-project instructions.
+The **Claude instructions** editor at the bottom of the Config tab holds per-project instructions for Claude Code. These are written to `~/.claude/CLAUDE.md` inside the container and provide project-specific context. If you also have global instructions (in Settings), the global instructions come first, followed by the per-project instructions.
 
 ### Claude Code Settings
 
-Click **Edit** next to "Claude Code Settings" to configure Claude Code CLI behavior for this project. These settings control how Claude Code operates inside the container:
+The **Claude Code settings** editor, also at the bottom of the Config tab, configures Claude Code CLI behavior for this project. These settings control how Claude Code operates inside the container:
 
 | Setting | What It Does |
 |---------|-------------|
@@ -287,146 +465,127 @@ Per-project settings override global defaults set in Settings. If all settings a
 
 > These settings map to Claude Code environment variables and `~/.claude/settings.json` entries. Changes require stopping and restarting the container to take effect.
 
+### MCP Servers
+
+Triple-C no longer manages [MCP](https://modelcontextprotocol.io/) servers itself. Configure them with Claude Code's own tooling from a terminal inside the container:
+
+- `claude mcp add` — register a server
+- `claude mcp list` — show configured servers
+- `claude mcp remove` — delete a server
+- `/mcp` — slash command inside a Claude Code session for MCP status and authentication
+- A project-level `.mcp.json` in `/workspace` — checked into your repo and shared with anyone who opens the project
+
+Your MCP configuration persists across container stop/start because `~/.claude.json` and `~/.claude` live on named Docker volumes. A **Reset** wipes them, so you would need to re-add your servers afterwards.
+
 ---
 
-## MCP Servers (Beta)
+## Shared Claude Authentication
 
-Triple-C supports [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) servers, which extend Claude Code with access to external tools and data sources. MCP servers are configured in a **global library** and **enabled per-project**.
+Instead of running `claude login` separately in every container, you can authenticate once and
+share the result across projects. Claude Code's `claude setup-token` mints a long-lived token
+(roughly a year) that Triple-C stores in your **OS keychain** and injects into containers as
+`CLAUDE_CODE_OAUTH_TOKEN`.
 
-### How It Works
+This lives in the sidebar under **Settings → Claude Authentication**.
 
-There are two dimensions to MCP server configuration:
+### Signing in
 
-| | **Manual** (no Docker image) | **Docker** (Docker image specified) |
-|---|---|---|
-| **Stdio** | Command runs inside the project container | Command runs in a separate MCP container via `docker exec` |
-| **HTTP** | Connects to a URL you provide | Runs in a separate container, reached by hostname on a shared Docker network |
+1. Start at least one project whose container is running — the flow borrows that container as a
+   place to run the CLI. The token it produces is global, not tied to that project.
+2. Start the sign-in. Triple-C runs `claude setup-token` inside the container and streams its
+   output.
+3. Claude Code prints an authorization URL. Open it, sign in, and Anthropic's page gives you a
+   code to copy — this flow finishes on an Anthropic-hosted page, not a local callback.
+4. Paste the code back into Triple-C. The token is captured and written straight to the keychain.
 
-**Docker images are pulled automatically** if not already present when the project starts.
+Only one sign-in can run at a time, and the whole flow times out after 15 minutes. A long-lived
+token requires a Claude subscription; without one, `setup-token` finishes without printing a token
+and nothing is stored.
 
-### Accessing MCP Configuration
+### How the token is used
 
-Click the **MCP** tab in the sidebar to open the MCP server library. This is where you define all available MCP servers.
+- It is injected only into projects whose backend is **Anthropic** — it means nothing to Bedrock,
+  Ollama or an OpenAI-compatible endpoint.
+- Each project can opt out under **Config → Model** ("Use the shared Claude token"). Projects are
+  opted **in** by default, so a single sign-in covers your whole fleet; opt a project out if you
+  want it pinned to its own `claude login` identity.
+- `CLAUDE_CODE_OAUTH_TOKEN` is reserved — you cannot set it yourself as a custom environment
+  variable, because a hand-set value would silently outrank the stored token.
+- A container picks the token up when it is **next started**: acquiring, re-acquiring, revoking or
+  opting out changes an internal marker that triggers a container recreation on the next start.
+  Restart your Anthropic-backend containers after signing in.
 
-### Adding an MCP Server
+### Revoking
 
-1. Type a name in the input field and click **Add**.
-2. Expand the server card and configure it.
+Revoking deletes the token from your keychain. Containers keep the value they were given until each
+is next started, at which point the same recreation clears the variable.
 
-The key decision is whether to set a **Docker Image**:
-- **With Docker image** — The MCP server runs in its own isolated container. Best for servers that need specific dependencies or system-level packages.
-- **Without Docker image** (manual) — The command runs directly inside your project container. Best for lightweight npx-based servers that just need Node.js.
+> The token is never shown in the app, never written to a log, and never sent to the frontend.
+> While `setup-token` is running, its output is filtered so anything resembling an `sk-ant-`
+> secret is masked before it reaches the screen — including a secret split across two chunks of
+> output.
 
-Then choose the **Transport Type**:
-- **Stdio** — The MCP server communicates over stdin/stdout. This is the most common type.
-- **HTTP** — The MCP server exposes an HTTP endpoint (streamable HTTP transport).
+---
 
-### Configuration Examples
+## Browser Logins Inside the Container (Auth Bridge)
 
-#### Example 1: Filesystem Server (Stdio, Manual)
+Some CLIs log you in by opening a browser and waiting for the browser to call back to a temporary
+web server they started on `localhost`. `claude login`, `aws sso login` and Concourse's
+`fly login` all work this way. When the CLI runs inside a container, that `localhost` is the
+*container's* — the browser on your host calls back into nothing and the login hangs forever.
 
-A simple npx-based server that runs inside the project container. No Docker image needed since Node.js is already installed.
+The **Auth Bridge** fixes this. It is **opt-in per project** and **off by default**.
 
-| Field | Value |
-|-------|-------|
-| **Docker Image** | *(empty)* |
-| **Transport** | Stdio |
-| **Command** | `npx` |
-| **Arguments** | `-y @modelcontextprotocol/server-filesystem /workspace` |
+### What it does
 
-This gives Claude Code access to browse and read files via MCP. The command runs directly inside the project container using the pre-installed Node.js.
+- Every couple of seconds it looks inside the container for programs listening on the container's
+  loopback address, and binds **the same port number** on your host. That is the whole trick: the
+  redirect URL the login provider was handed resolves correctly on both sides.
+- Connections are carried into the container over the Docker API, which keeps working on Docker
+  Desktop where container IP addresses are not reachable from the host.
+- It follows whichever address family the container program actually used. This matters in
+  practice: Node resolves `localhost` to IPv6 first on Linux, so `claude login` frequently listens
+  on `::1` and nothing else.
+- Ports you have already configured as port mappings are left alone. If a host port is already
+  taken, the bridge reports a conflict and leaves it alone rather than fighting for it — it will
+  retry on a later pass.
+- The bridge is entirely host-side, so turning it on or off never recreates the container. It stops
+  by itself when the container stops.
 
-#### Example 2: GitHub Server (Stdio, Manual)
+### Security
 
-Another npx-based server, with an environment variable for authentication.
+The host side binds **loopback only** — `127.0.0.1` and `[::1]`, never a wildcard address. Nothing
+on your network can reach a bridged port. Within your own machine, though, a bridged port is
+reachable by any local process for as long as the in-container listener exists, and the services
+behind it are unauthenticated: they bound loopback precisely because they expected to be reachable
+from nowhere else. Only container programs that bound loopback are bridged; anything listening on
+all interfaces is deliberately ignored (publishing those is what port mappings are for).
 
-| Field | Value |
-|-------|-------|
-| **Docker Image** | *(empty)* |
-| **Transport** | Stdio |
-| **Command** | `npx` |
-| **Arguments** | `-y @modelcontextprotocol/server-github` |
-| **Environment Variables** | `GITHUB_PERSONAL_ACCESS_TOKEN` = `ghp_your_token` |
-
-#### Example 3: Custom MCP Server (HTTP, Docker)
-
-An MCP server packaged as a Docker image that exposes an HTTP endpoint.
-
-| Field | Value |
-|-------|-------|
-| **Docker Image** | `myregistry/my-mcp-server:latest` |
-| **Transport** | HTTP |
-| **Container Port** | `8080` |
-| **Environment Variables** | `API_KEY` = `your_key` |
-
-Triple-C will:
-1. Pull the image automatically if not present
-2. Start the container on the project's bridge network
-3. Configure Claude Code to reach it at `http://triple-c-mcp-{id}:8080/mcp`
-
-The hostname is the MCP container's name on the Docker network — **not** `localhost`.
-
-#### Example 4: Database Server (Stdio, Docker)
-
-An MCP server that needs its own runtime environment, communicating over stdio.
-
-| Field | Value |
-|-------|-------|
-| **Docker Image** | `mcp/postgres-server:latest` |
-| **Transport** | Stdio |
-| **Command** | `node` |
-| **Arguments** | `dist/index.js` |
-| **Environment Variables** | `DATABASE_URL` = `postgresql://user:pass@host:5432/db` |
-
-Triple-C will:
-1. Pull the image and start it on the project network
-2. Configure Claude Code to communicate via `docker exec -i triple-c-mcp-{id} node dist/index.js`
-3. Automatically enable Docker socket access on the project container (required for `docker exec`)
-
-### Enabling MCP Servers Per-Project
-
-In a project's configuration panel (click **Config**), the **MCP Servers** section shows checkboxes for all globally defined servers. Toggle each server on or off for that project. Changes take effect on the next container start.
-
-### How Docker-Based MCP Works
-
-When a project with Docker-based MCP servers starts:
-
-1. Missing Docker images are **automatically pulled** (progress shown in the progress modal)
-2. A dedicated **bridge network** is created for the project (`triple-c-net-{projectId}`)
-3. Each enabled Docker MCP server gets its own container on that network
-4. The main project container is connected to the same network
-5. MCP server configuration is written to `~/.claude.json` inside the container
-
-**Networking**: Docker-based MCP containers are reached by their container name as a hostname (e.g., `triple-c-mcp-{serverId}`), not by `localhost`. Docker DNS resolves these names automatically on the shared bridge network.
-
-**Stdio + Docker**: The project container uses `docker exec` to communicate with the MCP container over stdin/stdout. This automatically enables Docker socket access on the project container.
-
-**HTTP + Docker**: The project container connects to the MCP container's HTTP endpoint using the container hostname and port (e.g., `http://triple-c-mcp-{serverId}:3000/mcp`).
-
-**Manual (no Docker image)**: Stdio commands run directly inside the project container. HTTP URLs connect to wherever you point them (could be an external service or something running on the host).
-
-### Configuration Change Detection
-
-MCP server configuration is tracked via SHA-256 fingerprints stored as Docker labels. If you add, remove, or modify MCP servers for a project, the container is automatically recreated on the next start to apply the new configuration. The container filesystem is snapshotted first, so installed packages are preserved.
+Leave it off unless you need it, and it will not be running.
 
 ---
 
 ## AWS Bedrock Configuration
 
-To use Claude via AWS Bedrock instead of Anthropic's API, switch the backend to **Bedrock** on the project card.
+To use Claude via AWS Bedrock instead of Anthropic's API, set **Backend** to **Bedrock** under
+**Config → Model**.
 
 ### Authentication Methods
 
 | Method | Fields | Use Case |
 |--------|--------|----------|
-| **Keys** | Access Key ID, Secret Access Key, Session Token (optional) | Direct credentials — simplest setup |
-| **Profile** | AWS Profile name | Uses `~/.aws/config` and `~/.aws/credentials` on the host |
-| **Token** | Bearer Token | Temporary bearer token authentication |
+| **Static keys** | Access Key ID, Secret Access Key, Session Token (optional) | Direct credentials — simplest setup |
+| **Named profile** | AWS Profile name | Uses `~/.aws/config` and `~/.aws/credentials` on the host |
+| **Bearer token** | Bearer Token | Temporary bearer token authentication |
+
+With **Named profile**, the SSO session is validated before Claude Code launches, so an expired
+session is caught at the start of a terminal rather than mid-task.
 
 ### Additional Bedrock Settings
 
 - **AWS Region** — Required. The region where your Bedrock models are deployed (e.g., `us-east-1`).
 - **Model ID** — Optional. Override the default Claude model (e.g., `anthropic.claude-sonnet-4-20250514-v1:0`).
+- **Service tier** — Optional. Selects a Bedrock service tier.
 
 ### Global AWS Defaults
 
@@ -442,7 +601,7 @@ Per-project settings always override these global defaults.
 
 ## Ollama Configuration
 
-To use Claude Code with a local or remote Ollama server, switch the backend to **Ollama** on the project card.
+To use Claude Code with a local or remote Ollama server, set **Backend** to **Ollama** under **Config → Model**.
 
 ### Settings
 
@@ -461,7 +620,7 @@ Triple-C sets `ANTHROPIC_BASE_URL` to point Claude Code at your Ollama server in
 
 ## OpenAI Compatible Configuration
 
-To use Claude Code through any OpenAI API-compatible endpoint, switch the backend to **OpenAI Compatible** on the project card. This works with any server that exposes an OpenAI-compatible API, including LiteLLM, OpenRouter, vLLM, text-generation-inference, LocalAI, and others.
+To use Claude Code through any OpenAI API-compatible endpoint, set **Backend** to **OpenAI Compatible** under **Config → Model**. This works with any server that exposes an OpenAI-compatible API, including LiteLLM, OpenRouter, vLLM, text-generation-inference, LocalAI, and others.
 
 ### Settings
 
@@ -479,7 +638,14 @@ Triple-C sets `ANTHROPIC_BASE_URL` to point Claude Code at your OpenAI-compatibl
 
 ## Settings
 
-Access global settings via the **Settings** tab in the sidebar.
+Access global settings via the **Settings** tab in the sidebar. The panel is a set of collapsible
+sections: **General**, **Claude Authentication**, **Backends**, **Container**, **Git / SSH**,
+**Tools** and **Updates**.
+
+### Claude Authentication
+
+Acquire or revoke the shared Claude authentication token — see
+[Shared Claude Authentication](#shared-claude-authentication).
 
 ### Docker Settings
 
@@ -574,7 +740,14 @@ The web terminal UI mirrors the desktop app's terminal experience:
 
 ### Multiple Sessions
 
-You can open multiple terminal sessions (even for the same project). Each session gets its own tab in the top bar. Click a tab to switch, or click the **x** on a tab to close it. Tabs show the project name (or custom session name if provided), with a "(bash)" suffix for shell sessions.
+You can open multiple terminal sessions (even for the same project). Each session gets its own tab
+in the main tab strip, alongside any open Project Home tabs. Click a tab to switch, or click the
+**×** on a tab to close it. Tabs show the project name (or a custom session name if you set one),
+with a "(bash)" suffix for shell sessions and a badge for the permission mode the session was
+launched with.
+
+Right-click a terminal tab for **Rename tab**, **Reset name**, **Open project home** and
+**Close tab**; double-click it to rename inline.
 
 ### Bash Shell Sessions
 
@@ -602,16 +775,16 @@ You can paste images from your clipboard into the terminal (Ctrl+V / Cmd+V). The
 
 When you scroll up in the terminal to review previous output, a **Jump to Current** button appears in the bottom-right corner. Click it to scroll back to the latest output.
 
-### File Manager
+### Files
 
-Click the **Files** button on a running project to open the file manager modal. You can:
+The **Files** tab of Project Home browses inside a running container. You can:
 
-- **Browse** the container filesystem starting from `/workspace`, with breadcrumb navigation
-- **Download** any file to your host machine via the download button on each file entry
-- **Upload** files from your host into the current container directory
+- **Browse** the container filesystem, starting at `/workspace`, with breadcrumb navigation
+- **Download** any file to your host machine via the **Download** button on each file entry
+- **Upload file** from your host into the current container directory
 - **Refresh** the directory listing at any time
 
-The file manager shows file names, sizes, and modification dates.
+The listing shows file names, sizes, and modification dates.
 
 ### Terminal Rendering
 
@@ -619,9 +792,48 @@ The terminal uses WebGL for hardware-accelerated rendering of the active tab. In
 
 ---
 
-## Scheduled Tasks (Inside the Container)
+## Automation & Scheduled Tasks
 
-Once inside a running container terminal, you can set up recurring or one-time tasks using `triple-c-scheduler`. Tasks run as separate Claude Code sessions.
+Each container can run Claude Code on a schedule — recurring or one-time — through a small
+scheduler called `triple-c-scheduler` that lives inside the image. Tasks run as separate,
+headless Claude Code invocations (`claude -p "<your prompt>"`) driven by cron.
+
+The **Automation** tab in Project Home is the place to watch and control them; tasks are created
+from inside the container with the `triple-c-scheduler` CLI.
+
+### The Automation Tab
+
+With the container running, the Automation tab lists every task the scheduler knows about. For each
+one you get its name, whether it is recurring or one-time, its cron expression or scheduled time,
+and when it last ran. For each task you can:
+
+| Control | What it does |
+|---------|--------------|
+| **Toggle** | Enable or disable the task without deleting it |
+| **Run now** | Trigger the task immediately, outside its schedule |
+| **Log** | Show the tail of that task's run log (last 200 lines) |
+| **Remove** | Delete the task, after a confirmation |
+
+**Refresh** re-reads everything from the container.
+
+When tasks finish they leave **notifications**. If any are waiting, a panel appears at the top of
+the tab listing each one with its task name, whether it succeeded or failed, how long ago it ran
+and a summary. **Clear all** dismisses them. The Overview tab also shows a notification count and
+the next few scheduled tasks.
+
+### Permission mode
+
+Scheduled runs use the project's [permission mode](#permission-modes) — they no longer always run
+with `--dangerously-skip-permissions`. Because the mode travels into the container as an
+environment variable, **stop and start the project** after changing it for the scheduler to see the
+change. Remember that a headless run cannot answer a permission prompt, so in any mode other than
+**Bypass** a task may stop early when Claude Code asks for approval; the run log records the mode
+that was used.
+
+### Creating Tasks (In the Container)
+
+There is no "add task" form in the app. Create tasks from a terminal in the container — either type
+the commands yourself in a **Shell** session, or just ask Claude to do it.
 
 ### Create a Recurring Task
 
@@ -637,7 +849,9 @@ triple-c-scheduler add --name "migrate-db" --at "2026-03-05 14:00" --prompt "Run
 
 One-time tasks automatically remove themselves after execution.
 
-### Manage Tasks
+### Manage Tasks From the CLI
+
+The CLI still works, and does the same things the Automation tab does:
 
 ```bash
 triple-c-scheduler list                    # List all tasks
@@ -669,6 +883,39 @@ By default, tasks run in `/workspace`. Use `--working-dir` to specify a differen
 ```bash
 triple-c-scheduler add --name "test" --schedule "0 */6 * * *" --prompt "Run tests" --working-dir /workspace/my-project
 ```
+
+> Scheduled tasks live on the project's config volume, so a **Reset** deletes them along with
+> everything else on that volume.
+
+---
+
+## Keyboard Shortcuts
+
+### Application
+
+| Shortcut | Action |
+|----------|--------|
+| **Ctrl+T** | Open a new Claude terminal for the current project (nothing happens unless its container is running) |
+| **Ctrl+Shift+W** | Close the active tab |
+| **Ctrl+Tab** | Switch to the next tab |
+| **Ctrl+Shift+Tab** | Switch to the previous tab |
+| **Ctrl+1** … **Ctrl+9** | Jump to the first through ninth tab |
+
+> **Why Ctrl+Shift+W and not Ctrl+W?** `Ctrl+W` is readline's `kill-word` — it deletes the word
+> before the cursor, and it is used constantly in the terminal this app is built around. Binding it
+> to "close tab" would make the shell unusable, so Triple-C deliberately leaves `Ctrl+W` alone.
+
+### In the Terminal
+
+| Shortcut | Action |
+|----------|--------|
+| **Ctrl+Shift+C** | Copy the selection, with trailing whitespace trimmed |
+| **Ctrl+Shift+Alt+C** | Copy the selection exactly as-is |
+| **Ctrl+Shift+V** | Paste |
+| **Ctrl+V** | Paste an image from the clipboard into the container |
+| **Ctrl+Shift+M** | Toggle speech-to-text recording (when enabled) |
+
+Everything else goes straight through to the program running in the container.
 
 ---
 
@@ -735,7 +982,7 @@ These features are built into Claude Code and work inside Triple-C containers wi
 
 - Check that the Docker image is "Ready" in Settings.
 - Verify that the mounted folder paths exist on your host.
-- Look at the error message displayed in the progress modal.
+- Read the error toast — the full message is behind its **Details** disclosure.
 
 ### OAuth Login URL Not Opening
 
@@ -743,21 +990,38 @@ These features are built into Claude Code and work inside Triple-C containers wi
 - If the toast doesn't appear, try scrolling up in the terminal — the URL may have already been printed.
 - You can also manually copy the URL from the terminal output and paste it into your browser.
 
+### A Browser Login Never Completes
+
+You opened the URL, signed in successfully, and the CLI in the terminal is still waiting. The
+callback from your browser is landing on your host's `localhost` while the CLI is listening on the
+*container's*. Enable the
+[Auth Bridge](#browser-logins-inside-the-container-auth-bridge) for that project and try again.
+
+For Claude specifically, the simpler answer is usually
+[Shared Claude Authentication](#shared-claude-authentication), which finishes on an Anthropic-hosted
+page and needs no callback at all.
+
+### A Scheduled Task Stopped Part-Way Through
+
+Scheduled tasks run headless and cannot answer a permission prompt. If the project is not in
+**Bypass** mode, a task will stop when Claude Code asks for approval. Check the task's **Log** in
+the Automation tab — it records the permission mode the run used.
+
+### A Permission Mode Change Didn't Apply
+
+- **In a terminal:** the mode is set when the terminal opens. Close the tab and open a new one.
+- **For scheduled tasks:** the mode reaches the scheduler through the container's environment. Stop
+  the project and start it again.
+
 ### File Permission Issues
 
 - Triple-C automatically remaps the container user's UID/GID to match your host user, so files created inside the container should have the correct ownership on your host.
-- If you see permission errors, try resetting the container (stop, then click **Reset**).
+- If you see permission errors, try resetting the container: stop it, then choose **Reset container** from the **⋯** menu in the Project Home header. Note that this wipes `~/.claude`.
 
 ### Settings Won't Save
 
 - Most project settings can only be changed when the container is **stopped**. Stop the container first, make your changes, then start it again.
 - Some changes (like toggling Docker access, Mission Control, or changing mounted folders) trigger an automatic container recreation on the next start.
-
-### MCP Containers Not Starting
-
-- Ensure the Docker image for the MCP server exists (pull it first if needed).
-- Check that Docker socket access is available (stdio + Docker MCP servers auto-enable this).
-- Try resetting the project container to force a clean recreation.
 
 ### "Failed to install Anthropic marketplace" Error
 

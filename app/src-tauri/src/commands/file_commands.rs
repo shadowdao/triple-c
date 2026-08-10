@@ -157,9 +157,10 @@ pub async fn download_container_file(
 ///   - the workspace (default /workspace), minus regenerable build artifacts
 ///     (node_modules, target), under `workspace/`, and
 ///   - a sanitized copy of the home config under `home-claude/`: ~/.claude.json
-///     with secret-bearing keys removed (mcpServers/settings kept) and ~/.claude/
-///     minus the OAuth `.credentials.json`, so MCP servers, settings and skills
-///     set up via Claude Code survive a Reset.
+///     with secret-bearing keys removed (`mcpServers` — Claude Code's own native
+///     MCP config — and `settings` are kept) and ~/.claude/ minus the OAuth
+///     `.credentials.json`, so settings and skills set up via Claude Code
+///     survive a Reset.
 /// `.git` is kept in full so the backup faithfully preserves git history,
 /// including unpushed commits. Build + gzip happen inside the container so a
 /// large workspace isn't streamed in full. The container must be RUNNING (the

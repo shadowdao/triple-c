@@ -19,6 +19,28 @@ generate_id() {
     head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n'
 }
 
+# Reject a malformed cron expression at the point of entry.
+#
+# Without this an invalid schedule is written to a task file, and the next
+# rebuild hands crontab a file it refuses wholesale — taking every other task
+# down with it. Deliberately shape-only: five fields, each built from `*`,
+# numbers, ranges, lists and steps. Names (JAN, MON) and `@daily` are not
+# accepted here.
+validate_cron() {
+    local expr="$1"
+    # Exactly five whitespace-separated fields.
+    read -ra _cron_fields <<< "$expr"
+    [ "${#_cron_fields[@]}" -eq 5 ] || return 1
+    local field
+    for field in "${_cron_fields[@]}"; do
+        # A field is one or more comma-separated terms; a term is `*`, a number,
+        # or a range, each optionally followed by a `/step`. Vixie only allows a
+        # step after `*` or a range, which this mirrors.
+        [[ "$field" =~ ^(\*(/[0-9]+)?|[0-9]+(-[0-9]+(/[0-9]+)?)?)(,(\*(/[0-9]+)?|[0-9]+(-[0-9]+(/[0-9]+)?)?))*$ ]] || return 1
+    done
+    return 0
+}
+
 rebuild_crontab() {
     local tmp
     tmp=$(mktemp)
@@ -37,7 +59,19 @@ rebuild_crontab() {
         echo "$schedule /usr/local/bin/triple-c-task-runner $id" >> "$tmp"
     done
 
-    crontab "$tmp" 2>/dev/null || true
+    # `crontab` validates the WHOLE file and rejects all of it if any single
+    # line is malformed. Swallowing that error silently unschedules every task
+    # in the container, so report it loudly and leave the previous crontab
+    # (which `crontab` keeps on rejection) in place.
+    local crontab_err
+    if ! crontab_err=$(crontab "$tmp" 2>&1); then
+        echo "ERROR: crontab rejected the generated schedule; NO tasks are scheduled." >&2
+        echo "       ${crontab_err}" >&2
+        echo "       Offending file kept at ${tmp} for inspection." >&2
+        echo "       Fix or remove the task with the bad schedule, then re-run any" >&2
+        echo "       scheduler command to rebuild." >&2
+        return 1
+    fi
     rm -f "$tmp"
 }
 
@@ -139,6 +173,12 @@ cmd_add() {
     else
         task_type="recurring"
         cron_expr="$schedule"
+        if ! validate_cron "$cron_expr"; then
+            echo "Error: invalid cron expression: '$cron_expr'" >&2
+            echo "       Expected five fields: minute hour day-of-month month day-of-week" >&2
+            echo "       e.g. '*/30 * * * *' (every 30 min), '0 9 * * 1-5' (9am weekdays)" >&2
+            exit 1
+        fi
     fi
 
     local created_at

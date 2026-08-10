@@ -51,8 +51,11 @@ export default function Tooltip({ text, children }: TooltipProps) {
     >
       {children ?? (
         <span
-          className="inline-flex items-center justify-center w-3.5 h-3.5 rounded-full border border-[var(--text-secondary)] text-[var(--text-secondary)] text-[9px] leading-none cursor-help select-none hover:border-[var(--accent)] hover:text-[var(--accent)] transition-colors"
+          className="inline-flex items-center justify-center w-4 h-4 rounded-full border border-[var(--text-secondary)] text-[var(--text-secondary)] text-[10px] leading-none cursor-help select-none hover:border-[var(--accent)] hover:text-[var(--accent)] transition-colors"
           aria-label="Help"
+          tabIndex={0}
+          onFocus={() => setVisible(true)}
+          onBlur={() => setVisible(false)}
         >
           ?
         </span>

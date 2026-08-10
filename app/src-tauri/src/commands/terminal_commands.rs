@@ -17,11 +17,11 @@ fn build_terminal_cmd(project: &Project, state: &AppState, session_name: Option<
             .map(|b| b.auth_method == BedrockAuthMethod::Profile)
             .unwrap_or(false);
 
+    let permission_args = project.effective_permission_mode().cli_args();
+
     if !is_bedrock_profile {
         let mut cmd = vec!["claude".to_string()];
-        if project.full_permissions {
-            cmd.push("--dangerously-skip-permissions".to_string());
-        }
+        cmd.extend(permission_args);
         if let Some(name) = session_name {
             if !name.is_empty() {
                 cmd.push("-n".to_string());
@@ -42,11 +42,13 @@ fn build_terminal_cmd(project: &Project, state: &AppState, session_name: Option<
         .filter(|n| !n.is_empty())
         .map(|n| format!(" -n '{}'", n.replace('\'', "'\\''")))
         .unwrap_or_default();
-    let claude_cmd = if project.full_permissions {
-        format!("exec claude --dangerously-skip-permissions{}", name_flag)
-    } else {
-        format!("exec claude{}", name_flag)
-    };
+    // The args are interpolated into a shell script string, so single-quote
+    // each one (same escaping style as name_flag above).
+    let permission_flags: String = permission_args
+        .iter()
+        .map(|a| format!(" '{}'", a.replace('\'', "'\\''")))
+        .collect();
+    let claude_cmd = format!("exec claude{}{}", permission_flags, name_flag);
 
     let script = format!(
         r#"

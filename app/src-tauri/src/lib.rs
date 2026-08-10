@@ -1,3 +1,4 @@
+mod auth_bridge;
 mod commands;
 mod docker;
 mod install_helper;
@@ -8,18 +9,18 @@ pub mod web_terminal;
 
 use std::sync::Arc;
 
+use auth_bridge::AuthBridgeManager;
 use docker::exec::ExecSessionManager;
 use storage::projects_store::ProjectsStore;
 use storage::settings_store::SettingsStore;
-use storage::mcp_store::McpStore;
 use tauri::Manager;
 use web_terminal::WebTerminalServer;
 
 pub struct AppState {
     pub projects_store: Arc<ProjectsStore>,
     pub settings_store: Arc<SettingsStore>,
-    pub mcp_store: Arc<McpStore>,
     pub exec_manager: Arc<ExecSessionManager>,
+    pub auth_bridge: Arc<AuthBridgeManager>,
     pub web_terminal_server: Arc<tokio::sync::Mutex<Option<WebTerminalServer>>>,
 }
 
@@ -40,14 +41,8 @@ pub fn run() {
             panic!("Failed to initialize settings store: {}", e);
         }
     });
-    let mcp_store = Arc::new(match McpStore::new() {
-        Ok(s) => s,
-        Err(e) => {
-            log::error!("Failed to initialize MCP store: {}", e);
-            panic!("Failed to initialize MCP store: {}", e);
-        }
-    });
     let exec_manager = Arc::new(ExecSessionManager::new());
+    let auth_bridge = Arc::new(AuthBridgeManager::new());
 
     // Clone Arcs for the setup closure (web terminal auto-start)
     let projects_store_setup = projects_store.clone();
@@ -61,8 +56,8 @@ pub fn run() {
         .manage(AppState {
             projects_store,
             settings_store,
-            mcp_store,
             exec_manager,
+            auth_bridge,
             web_terminal_server: Arc::new(tokio::sync::Mutex::new(None)),
         })
         .setup(move |app| {
@@ -146,6 +141,8 @@ pub fn run() {
                     let _ = docker::stt::stop_stt_container().await;
                     // Close all exec sessions
                     state.exec_manager.close_all_sessions().await;
+                    // Release every host loopback port held by the auth bridge
+                    state.auth_bridge.stop_all().await;
                 });
             }
         })
@@ -165,6 +162,15 @@ pub fn run() {
             commands::project_commands::stop_project_container,
             commands::project_commands::rebuild_project_container,
             commands::project_commands::reconcile_project_statuses,
+            // Auth bridge
+            commands::auth_bridge_commands::set_auth_bridge_enabled,
+            commands::auth_bridge_commands::get_auth_bridge_status,
+            // Shared Claude Code auth token
+            commands::auth_token_commands::acquire_claude_token,
+            commands::auth_token_commands::submit_claude_token_code,
+            commands::auth_token_commands::cancel_claude_token,
+            commands::auth_token_commands::has_claude_token,
+            commands::auth_token_commands::clear_claude_token,
             // Settings
             commands::settings_commands::get_settings,
             commands::settings_commands::update_settings,
@@ -187,11 +193,6 @@ pub fn run() {
             commands::file_commands::download_container_file,
             commands::file_commands::download_container_backup,
             commands::file_commands::upload_file_to_container,
-            // MCP
-            commands::mcp_commands::list_mcp_servers,
-            commands::mcp_commands::add_mcp_server,
-            commands::mcp_commands::update_mcp_server,
-            commands::mcp_commands::remove_mcp_server,
             // AWS
             commands::aws_commands::aws_sso_refresh,
             // Updates
@@ -215,6 +216,19 @@ pub fn run() {
             commands::stt_commands::build_stt_image,
             commands::stt_commands::pull_stt_image,
             commands::stt_commands::transcribe_audio,
+            // Container introspection (sessions / capabilities / scheduler)
+            commands::inspect_commands::list_claude_sessions,
+            commands::inspect_commands::resume_session_command,
+            commands::inspect_commands::list_container_capabilities,
+            commands::inspect_commands::list_scheduled_tasks,
+            commands::inspect_commands::add_scheduled_task,
+            commands::inspect_commands::update_scheduled_task,
+            commands::inspect_commands::get_scheduled_task_log,
+            commands::inspect_commands::set_scheduled_task_enabled,
+            commands::inspect_commands::run_scheduled_task_now,
+            commands::inspect_commands::remove_scheduled_task,
+            commands::inspect_commands::get_scheduler_notifications,
+            commands::inspect_commands::clear_scheduler_notifications,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

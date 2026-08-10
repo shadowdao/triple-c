@@ -65,7 +65,7 @@ export default function AwsSettings() {
               value={globalAws.aws_config_path ?? ""}
               onChange={(e) => handleChange("aws_config_path", e.target.value)}
               placeholder="~/.aws"
-              className="flex-1 px-2 py-1.5 text-xs bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:outline-none focus:border-[var(--accent)]"
+              className="flex-1 px-2 py-1.5 text-xs bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:border-[var(--accent)]"
             />
             <button
               onClick={handleDetect}
@@ -86,7 +86,7 @@ export default function AwsSettings() {
           <select
             value={globalAws.aws_profile ?? ""}
             onChange={(e) => handleChange("aws_profile", e.target.value)}
-            className="w-full px-2 py-1.5 text-xs bg-[var(--bg-primary)] text-[var(--text-primary)] border border-[var(--border-color)] rounded focus:outline-none focus:border-[var(--accent)]"
+            className="w-full px-2 py-1.5 text-xs bg-[var(--bg-primary)] text-[var(--text-primary)] border border-[var(--border-color)] rounded focus:border-[var(--accent)]"
           >
             <option value="">None (use default)</option>
             {profiles.map((p) => (
@@ -103,7 +103,7 @@ export default function AwsSettings() {
             value={globalAws.aws_region ?? ""}
             onChange={(e) => handleChange("aws_region", e.target.value)}
             placeholder="e.g., us-east-1"
-            className="w-full px-2 py-1.5 text-xs bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:outline-none focus:border-[var(--accent)]"
+            className="w-full px-2 py-1.5 text-xs bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:border-[var(--accent)]"
           />
         </div>
 
@@ -115,7 +115,7 @@ export default function AwsSettings() {
             value={globalAws.default_model_id ?? ""}
             onChange={(e) => handleChange("default_model_id", e.target.value)}
             placeholder="anthropic.claude-sonnet-4-20250514-v1:0"
-            className="w-full px-2 py-1.5 text-xs bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:outline-none focus:border-[var(--accent)]"
+            className="w-full px-2 py-1.5 text-xs bg-[var(--bg-primary)] border border-[var(--border-color)] rounded focus:border-[var(--accent)]"
           />
         </div>
       </div>
