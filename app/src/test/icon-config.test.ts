@@ -33,4 +33,33 @@ describe("Window icon configuration", () => {
     expect(config.bundle.icon).toContain("icons/icon.ico");
     expect(config.bundle.icon).toContain("icons/icon.png");
   });
+
+  it("icon.ico carries the small sizes Windows draws in the taskbar", () => {
+    // A single-image .ico is the taskbar bug: Windows upscales 16x16 into every
+    // other slot. Regenerate with `python3 branding/build-icons.py`.
+    const ico = readFileSync(resolve(srcTauriDir, "icons/icon.ico"));
+    const count = ico.readUInt16LE(4);
+    expect(count).toBeGreaterThan(1);
+
+    // Directory entries start at byte 6; width/height of 0 means 256.
+    const widths = new Set<number>();
+    for (let i = 0; i < count; i++) {
+      const w = ico[6 + i * 16];
+      widths.add(w === 0 ? 256 : w);
+    }
+    for (const size of [16, 24, 32, 48, 256]) {
+      expect(widths).toContain(size);
+    }
+  });
+
+  it("icon.icns exists and is bundled for macOS", () => {
+    const icnsPath = resolve(srcTauriDir, "icons/icon.icns");
+    expect(existsSync(icnsPath)).toBe(true);
+    expect(readFileSync(icnsPath).subarray(0, 4).toString("ascii")).toBe("icns");
+
+    const config = JSON.parse(
+      readFileSync(resolve(srcTauriDir, "tauri.conf.json"), "utf-8")
+    );
+    expect(config.bundle.icon).toContain("icons/icon.icns");
+  });
 });

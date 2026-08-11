@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="Triple-C">
+  <title>Triple-C application icon, small-size variant</title>
+  <!-- Source for every raster ≤ 32 px: the small mark, drawn at 82% so the strokes
+       survive being resampled down to 16 px. See build-icons.py. -->
+  <rect width="128" height="128" rx="28.16" fill="#0D1117"/>
+  <g transform="translate(2.9236 2.9236) scale(0.95418)">
+    <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M112 50 L112 38 A22 22 0 0 0 90 16 L38 16 A22 22 0 0 0 16 38 L16 90 A22 22 0 0 0 38 112 L90 112 A22 22 0 0 0 112 90 L112 78"
+            stroke="#58A6FF" stroke-width="14"/>
+      <path d="M46 50 L62 66 L46 82" stroke="#F0821E" stroke-width="13"/>
+    </g>
+  </g>
+</svg>
