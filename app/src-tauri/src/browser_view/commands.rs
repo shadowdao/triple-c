@@ -180,6 +180,8 @@ pub async fn open_page_in_container_browser(
     url: String,
     width: u32,
     height: u32,
+    show_window: bool,
+    app_handle: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<page::PageState, String> {
     let trimmed = url.trim();
@@ -188,13 +190,45 @@ pub async fn open_page_in_container_browser(
     }
     let container_id = running_container(&state, &project_id, "opening a page").await?;
     let detection = crate::browser_view::detect::detect(&container_id).await?;
-    page::open(
+    let opened = page::open(
         &container_id,
         &detection,
         trimmed,
         page::Viewport::sane(width, height),
     )
-    .await
+    .await?;
+
+    // A page nobody can see is not an opened page. Opening one used to leave
+    // the user to go and press Start in the Browser tab themselves — and from
+    // the terminal's URL prompt, with no indication that was even needed.
+    // Asking for a page *is* asking to watch it, so the viewer comes up too.
+    let status = manager().status(&project_id).await;
+    if status.state != BrowserViewState::Running {
+        manager()
+            .start(
+                project_id.clone(),
+                container_id,
+                app_handle.clone(),
+                state.projects_store.clone(),
+            )
+            .await?;
+    }
+
+    // From the terminal there is no pane on screen to fill, so the page needs a
+    // window of its own or it lands somewhere the user isn't looking.
+    if show_window {
+        let status = manager().status(&project_id).await;
+        if let Some(url) = status.url.as_deref() {
+            let name = state
+                .projects_store
+                .get(&project_id)
+                .map(|p| p.name)
+                .unwrap_or_else(|| "Triple-C".to_string());
+            popout::open(&app_handle, &project_id, &name, url, false)?;
+        }
+    }
+
+    Ok(opened)
 }
 
 /// Resize the page this opened. The pop-out's "match window" mode calls this on

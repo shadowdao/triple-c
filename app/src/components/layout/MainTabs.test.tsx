@@ -127,6 +127,46 @@ describe("MainTabs reordering", () => {
     expect(useAppState.getState().activeTabKey).toBe(HOME);
   });
 
+  it("shows the tab itself under the cursor while dragging", () => {
+    // A dimmed source tab and a thin line do not read as "I am holding this
+    // tab" — the dragged copy is what makes the gesture legible.
+    render(<MainTabs />);
+    const tabs = laidOut();
+    expect(screen.queryByTestId("tab-drag-ghost")).toBeNull();
+
+    pointer(tabs[2], "pointerdown", 250);
+    pointer(tabs[2], "pointermove", 120);
+
+    const ghost = screen.getByTestId("tab-drag-ghost");
+    expect(ghost).toHaveTextContent("shell (bash)");
+    expect(ghost).toHaveTextContent("▣");
+
+    pointer(tabs[2], "pointerup", 120);
+    expect(screen.queryByTestId("tab-drag-ghost")).toBeNull();
+  });
+
+  it("carries the project name when a home tab is dragged", () => {
+    render(<MainTabs />);
+    const tabs = laidOut();
+
+    pointer(tabs[0], "pointerdown", 50);
+    pointer(tabs[0], "pointermove", 250);
+
+    expect(screen.getByTestId("tab-drag-ghost")).toHaveTextContent("api-server");
+    expect(screen.getByTestId("tab-drag-ghost")).toHaveTextContent("⌂");
+  });
+
+  it("drops the dragged copy when the drag is abandoned", () => {
+    render(<MainTabs />);
+    const tabs = laidOut();
+
+    pointer(tabs[2], "pointerdown", 250);
+    pointer(tabs[2], "pointermove", 10);
+    fireEvent.keyDown(window, { key: "Escape" });
+
+    expect(screen.queryByTestId("tab-drag-ghost")).toBeNull();
+  });
+
   it("shows the drop marker only while a drag is under way", () => {
     render(<MainTabs />);
     const tabs = laidOut();

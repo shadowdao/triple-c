@@ -374,8 +374,12 @@ export default function TerminalView({ sessionId, active }: Props) {
     // Handle backend output -> terminal
     let aborted = false;
 
-    const detector = new UrlDetector((url) =>
-      promptUrl(url, "Long URL detected"),
+    // The width is read per scan, not captured: only a break the terminal
+    // itself inserted may be deleted, and where that is moves with every
+    // resize.
+    const detector = new UrlDetector(
+      (url) => promptUrl(url, "Long URL detected"),
+      () => termRef.current?.cols ?? 0,
     );
     detectorRef.current = detector;
 
@@ -552,7 +556,9 @@ export default function TerminalView({ sessionId, active }: Props) {
     if (!projectId) return;
     // A sign-in page is the one case where the *window* size matters least and
     // the layout matters most, so it gets the ordinary desktop viewport.
-    openPageInContainerBrowser(projectId, safe, 1280, 720)
+    // `true`: from a terminal there is no Browser pane on screen, so the page
+    // needs a window of its own or it opens somewhere the user isn't looking.
+    openPageInContainerBrowser(projectId, safe, 1280, 720, true)
       .then((result) => {
         const push = useAppState.getState().pushToast;
         if (result.error) {
@@ -560,7 +566,7 @@ export default function TerminalView({ sessionId, active }: Props) {
         } else {
           push({
             kind: "success",
-            message: "Opened in the container’s browser — see the project’s Browser tab",
+            message: "Opened in the container’s browser",
           });
         }
       })

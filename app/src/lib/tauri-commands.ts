@@ -229,13 +229,26 @@ export const getBrowserViewPopoutState = (projectId: string) =>
  * container too, so the loop closes without the host — and a dev server on
  * container loopback, which is how you watch a UI Claude is building. Only
  * http/https; the backend rejects anything else.
+ *
+ * The viewer is started if it isn't already: asking for a page is asking to
+ * watch it, and leaving the user to go and press Start themselves — with no
+ * hint that they had to — is what the first version did.
  */
 export const openPageInContainerBrowser = (
   projectId: string,
   url: string,
   width: number,
   height: number,
-) => invoke<BrowserPageState>("open_page_in_container_browser", { projectId, url, width, height });
+  /** Also raise the pop-out window — for callers with no pane on screen. */
+  showWindow = false,
+) =>
+  invoke<BrowserPageState>("open_page_in_container_browser", {
+    projectId,
+    url,
+    width,
+    height,
+    showWindow,
+  });
 /** Resize that page. Real reflow, not a scaled screencast — see BrowserTab. */
 export const setContainerPageViewport = (projectId: string, width: number, height: number) =>
   invoke<void>("set_container_page_viewport", { projectId, width, height });

@@ -55,9 +55,21 @@ export default function MainTabs() {
   /** The tab being dragged, and the slot it would drop into. */
   const [dragKey, setDragKey] = useState<string | null>(null);
   const [dropIndex, setDropIndex] = useState<number | null>(null);
+  /** Where the dragged tab is drawn, and how it looked when the drag started. */
+  const [ghost, setGhost] = useState<{ x: number; y: number; label: string; icon: string } | null>(
+    null,
+  );
   const stripRef = useRef<HTMLDivElement>(null);
   /** A press that has not yet moved far enough to be a drag. */
-  const pending = useRef<{ key: string; startX: number; dragging: boolean } | null>(null);
+  const pending = useRef<{
+    key: string;
+    startX: number;
+    dragging: boolean;
+    offsetX: number;
+    width: number;
+    height: number;
+    top: number;
+  } | null>(null);
   const suppressClick = useRef(false);
 
   useEffect(() => {
@@ -87,6 +99,7 @@ export default function MainTabs() {
       pending.current = null;
       setDragKey(null);
       setDropIndex(null);
+      setGhost(null);
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
@@ -171,10 +184,29 @@ export default function MainTabs() {
         : "text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
     }${dragging ? " opacity-40" : ""}`;
 
+  /**
+   * What a tab reads as, for the dragged copy. Same sources the tab itself
+   * uses — a ghost showing a different name from the tab it came from would be
+   * worse than no ghost.
+   */
+  const tabLabel = (key: string): string => {
+    if (isHomeTab(key)) {
+      return projects.find((p) => p.id === tabKeyId(key))?.name ?? "";
+    }
+    const session = sessions.find((s) => s.id === tabKeyId(key));
+    if (!session) return "";
+    const custom = getCustomName(session.projectId, session.id);
+    return custom
+      ? `${session.projectName}: ${custom}`
+      : (session.sessionName ?? session.projectName) +
+          (session.sessionType === "bash" ? " (bash)" : "");
+  };
+
   const endDrag = () => {
     pending.current = null;
     setDragKey(null);
     setDropIndex(null);
+    setGhost(null);
   };
 
   /**
@@ -212,7 +244,19 @@ export default function MainTabs() {
       // rename input is up — that drag is a text selection.
       if (e.button !== 0 || renaming) return;
       if ((e.target as HTMLElement).closest("button, input")) return;
-      pending.current = { key, startX: e.clientX, dragging: false };
+      const rect = e.currentTarget.getBoundingClientRect();
+      pending.current = {
+        key,
+        startX: e.clientX,
+        dragging: false,
+        // Where inside the tab the pointer grabbed it, so the ghost sits under
+        // the cursor exactly where the real tab was — the thing that makes a
+        // drag feel like moving an object rather than nudging a setting.
+        offsetX: e.clientX - rect.left,
+        width: rect.width,
+        height: rect.height,
+        top: rect.top,
+      };
       e.currentTarget.setPointerCapture?.(e.pointerId);
     },
     onPointerMove: (e: React.PointerEvent<HTMLDivElement>) => {
@@ -223,6 +267,12 @@ export default function MainTabs() {
       drag.dragging = true;
       setDragKey(drag.key);
       setDropIndex(dropIndexAt(e.clientX));
+      setGhost({
+        x: e.clientX - drag.offsetX,
+        y: drag.top,
+        label: tabLabel(drag.key),
+        icon: isHomeTab(drag.key) ? "⌂" : "▣",
+      });
     },
     onPointerUp: (e: React.PointerEvent<HTMLDivElement>) => {
       const drag = pending.current;
@@ -407,6 +457,26 @@ export default function MainTabs() {
       {/* The empty run after the last tab is a drop target too — it is where
           the hand naturally goes to say "put it at the end". */}
       <div className="flex-1 self-stretch">{markerPending && dropMarker}</div>
+
+      {ghost && (
+        // A copy of the tab, following the pointer. Without it the only
+        // feedback is a dimmed source and a thin line, which reads as "some
+        // setting changed" rather than "I am holding this tab".
+        <div
+          aria-hidden="true"
+          data-testid="tab-drag-ghost"
+          className="fixed z-50 flex items-center gap-1.5 px-3 h-8 text-xs rounded-[var(--radius-control)] bg-[var(--bg-primary)] text-[var(--text-primary)] border border-[var(--accent)] pointer-events-none"
+          style={{
+            left: ghost.x,
+            top: ghost.y,
+            boxShadow: "var(--shadow-overlay)",
+            opacity: 0.9,
+          }}
+        >
+          <span className="text-[var(--text-secondary)]">{ghost.icon}</span>
+          <span className="truncate max-w-[180px]">{ghost.label}</span>
+        </div>
+      )}
 
       {menu && (() => {
         const session = sessions.find((s) => s.id === menu.sessionId);
