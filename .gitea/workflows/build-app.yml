@@ -7,13 +7,13 @@ on:
       - "app/**"
       - "VERSION"
       - ".gitea/workflows/build-app.yml"
-  pull_request:
-    branches: [main]
-    paths:
-      - "app/**"
-      - "VERSION"
-      - ".gitea/workflows/build-app.yml"
   workflow_dispatch:
+
+# Deliberately **not** on pull_request. Every publishing step here is gated on
+# `gitea.event_name == 'push'`, so a PR run compiled all three platforms and
+# produced nothing — and it ran alongside build-app-preview.yml, which compiles
+# the same three and publishes them. Six OS builds per push, one set of which
+# was unreachable. Previews now carry the PR check; this workflow is releases.
 
 env:
   GITEA_URL: ${{ gitea.server_url }}

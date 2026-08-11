@@ -2,7 +2,15 @@ name: Build App (Preview)
 
 # Builds the Tauri app for branches other than main and publishes the bundles as
 # a **prerelease**, so they are downloadable from the Releases page. No GitHub
-# sync — intended for smoke-testing a feature branch before it merges.
+# sync.
+#
+# This is also the **PR build check**: it compiles Linux, macOS and Windows, so
+# a push that breaks any of them fails here. build-app.yml used to do that job
+# in parallel and publish nothing, which meant six OS builds per push and one
+# unreachable set of bundles; it is now releases-only.
+#
+# The cost of the swap, stated plainly: one prerelease per PR commit that
+# touches `app/**`. They are pruned by Cleanup Old Releases (see Lifecycle).
 #
 # ## Why not workflow artifacts
 #
@@ -36,6 +44,15 @@ env:
   REPO: ${{ gitea.repository }}
 
 on:
+  # Every push to an open PR: this *is* the branch's build check — it compiles
+  # Linux, macOS and Windows — and publishing the result costs nothing extra
+  # once they are built. build-app.yml deliberately no longer runs on PRs.
+  pull_request:
+    branches: [main]
+    paths:
+      - "app/**"
+      - "VERSION"
+      - ".gitea/workflows/build-app-preview.yml"
   workflow_dispatch:
 
 jobs:
@@ -43,6 +60,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.VERSION }}
+      sha: ${{ steps.version.outputs.SHA }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -54,6 +72,10 @@ jobs:
         run: |
           MAJOR_MINOR=$(cat VERSION | tr -d '[:space:]')
           SHORT_SHA=$(git rev-parse --short HEAD)
+          # From the checkout, not from `gitea.sha`: on a pull_request event
+          # that variable can be the merge ref, which is not the commit anyone
+          # is testing and not something to hang a tag on.
+          echo "SHA=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
 
           # The patch number is computed exactly as build-app.yml does it, so a
           # preview is labelled with the version the release it previews would
@@ -89,6 +111,8 @@ jobs:
         env:
           TOKEN: ${{ secrets.REGISTRY_TOKEN }}
           VERSION: ${{ needs.compute-version.outputs.version }}
+          SHA: ${{ needs.compute-version.outputs.sha }}
+          BRANCH: ${{ gitea.head_ref || gitea.ref_name }}
         run: |
           set -euo pipefail
           TAG="preview-${VERSION##*.}"
@@ -108,7 +132,7 @@ jobs:
               curl -fsS -X POST \
                 -H "Authorization: token ${TOKEN}" \
                 -H "Content-Type: application/json" \
-                -d "{\"tag_name\": \"${TAG}\", \"target_commitish\": \"${{ gitea.sha }}\", \"name\": \"Preview ${VERSION}\", \"prerelease\": true, \"body\": \"Unreleased build of \`${{ gitea.ref_name }}\` at ${{ gitea.sha }}. Not a release — pruned by Cleanup Old Releases.\"}" \
+                -d "{\"tag_name\": \"${TAG}\", \"target_commitish\": \"${SHA}\", \"name\": \"Preview ${VERSION}\", \"prerelease\": true, \"body\": \"Unreleased build of \`${BRANCH}\` at ${SHA}. Not a release — pruned by Cleanup Old Releases.\"}" \
                 "${GITEA_URL}/api/v1/repos/${REPO}/releases" > release.json
               ;;
             *)
