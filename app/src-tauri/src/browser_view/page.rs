@@ -34,7 +34,9 @@
 //! larger. This is what makes the pop-out usable as a responsive-design ruler.
 
 use serde::{Deserialize, Serialize};
+use tauri::AppHandle;
 
+use crate::commands::project_commands::emit_progress;
 use crate::docker::exec::exec_oneshot_as;
 
 use super::detect::PlaywrightDetection;
@@ -87,6 +89,8 @@ pub struct PageState {
 /// Replaces any page this opened before: one helper per container, because the
 /// pane shows one browser and a second would just compete for the pane.
 pub async fn open(
+    app: &AppHandle,
+    project_id: &str,
     container_id: &str,
     detection: &PlaywrightDetection,
     url: &str,
@@ -112,6 +116,7 @@ pub async fn open(
     // browser's cookies and storage — which for the auth case means signing in
     // again to reach the second page, having just signed in on the first.
     if state(container_id).await.ready {
+        emit_progress(app, project_id, "Navigating the container's browser…");
         set_viewport(container_id, viewport).await?;
         navigate(container_id, url).await?;
         if let Some(state) = wait_for_url(container_id, url).await {
@@ -121,6 +126,10 @@ pub async fn open(
     }
 
     close(container_id).await;
+    // Cold start: a browser launch plus a page load, which is the several
+    // seconds the user would otherwise spend wondering whether the click
+    // registered.
+    emit_progress(app, project_id, "Launching a browser in the container…");
 
     let config = serde_json::json!({
         "core": core_dir,
@@ -150,6 +159,7 @@ pub async fn open(
     .await
     .map_err(|e| format!("Could not start the browser helper: {}", e))?;
 
+    emit_progress(app, project_id, "Waiting for the page to load…");
     wait_until_ready(container_id).await
 }
 

@@ -71,6 +71,18 @@ interface AppState {
   tabOrder: string[];
   activeTabKey: string | null;
   openProjectHome: (projectId: string) => void;
+  /**
+   * Open a project's home tab *on a particular sub-tab*.
+   *
+   * The sub-tab is local state inside `ProjectHome`, so this parks a request
+   * here for it to pick up: an action taken somewhere else entirely — opening a
+   * page in the container's browser from a terminal — has to be able to land
+   * the user on the pane that shows the result.
+   */
+  openProjectHomeTab: (projectId: string, tab: string) => void;
+  /** Consumed once by `ProjectHome`, then cleared. */
+  pendingHomeTab: { projectId: string; tab: string } | null;
+  clearPendingHomeTab: () => void;
   closeHomeTab: (projectId: string) => void;
   setActiveTabKey: (key: string) => void;
   cycleTab: (delta: number) => void;
@@ -235,6 +247,20 @@ export const useAppState = create<AppState>((set) => ({
         ...activation(key),
       };
     }),
+  openProjectHomeTab: (projectId, tab) =>
+    set((state) => {
+      const key = homeTabKey(projectId);
+      return {
+        selectedProjectId: projectId,
+        tabOrder: state.tabOrder.includes(key)
+          ? state.tabOrder
+          : [...state.tabOrder, key],
+        pendingHomeTab: { projectId, tab },
+        ...activation(key),
+      };
+    }),
+  pendingHomeTab: null,
+  clearPendingHomeTab: () => set({ pendingHomeTab: null }),
   closeHomeTab: (projectId) =>
     set((state) => {
       const key = homeTabKey(projectId);

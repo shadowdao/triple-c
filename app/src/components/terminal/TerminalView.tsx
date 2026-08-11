@@ -554,6 +554,9 @@ export default function TerminalView({ sessionId, active }: Props) {
       return;
     }
     if (!projectId) return;
+    // Land on the pane that will show it, before the work starts: opening takes
+    // several seconds, and the progress line lives there.
+    useAppState.getState().openProjectHomeTab(projectId, "browser");
     // A sign-in page is the one case where the *window* size matters least and
     // the layout matters most, so it gets the ordinary desktop viewport.
     // `true`: from a terminal there is no Browser pane on screen, so the page

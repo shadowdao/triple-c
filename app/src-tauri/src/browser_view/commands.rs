@@ -189,8 +189,15 @@ pub async fn open_page_in_container_browser(
         return Err("Only http:// and https:// URLs can be opened in the browser.".to_string());
     }
     let container_id = running_container(&state, &project_id, "opening a page").await?;
+    crate::commands::project_commands::emit_progress(
+        &app_handle,
+        &project_id,
+        "Checking the container for Playwright…",
+    );
     let detection = crate::browser_view::detect::detect(&container_id).await?;
     let opened = page::open(
+        &app_handle,
+        &project_id,
         &container_id,
         &detection,
         trimmed,
@@ -204,6 +211,11 @@ pub async fn open_page_in_container_browser(
     // Asking for a page *is* asking to watch it, so the viewer comes up too.
     let status = manager().status(&project_id).await;
     if status.state != BrowserViewState::Running {
+        crate::commands::project_commands::emit_progress(
+            &app_handle,
+            &project_id,
+            "Starting the viewer…",
+        );
         manager()
             .start(
                 project_id.clone(),
@@ -228,6 +240,7 @@ pub async fn open_page_in_container_browser(
         }
     }
 
+    crate::commands::project_commands::emit_progress(&app_handle, &project_id, "");
     Ok(opened)
 }
 

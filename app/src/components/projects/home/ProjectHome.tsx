@@ -43,6 +43,16 @@ export default function ProjectHome({ projectId, active }: Props) {
   const { projects, remove } = useProjects();
   const project = projects.find((p) => p.id === projectId);
   const [tab, setTab] = useState<ProjectHomeTabId>("overview");
+
+  // Somewhere else asked for this project on a particular sub-tab — currently
+  // "I opened a page in the container's browser, show me it". Consumed once, so
+  // it cannot fight the user's own clicking afterwards.
+  const pendingHomeTab = useAppState((s) => s.pendingHomeTab);
+  useEffect(() => {
+    if (pendingHomeTab?.projectId !== projectId) return;
+    setTab(pendingHomeTab.tab as ProjectHomeTabId);
+    useAppState.getState().clearPendingHomeTab();
+  }, [pendingHomeTab, projectId]);
   const [confirmRemove, setConfirmRemove] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
   const [showMigration, setShowMigration] = useState(false);

@@ -377,6 +377,15 @@ export default function BrowserTab({ project, active }: Props) {
           </span>
         )}
         <div className="flex-1" />
+        {progress && (
+          <span
+            className="flex items-center gap-1.5 text-xs text-[var(--text-secondary)] min-w-0"
+            aria-live="polite"
+          >
+            <StatusIndicator tone="busy" label="" />
+            <span className="truncate">{progress}</span>
+          </span>
+        )}
         {live && poppedOut === true && (
           <span className="flex items-center gap-1.5 text-xs text-[var(--text-secondary)]">
             Keep on top

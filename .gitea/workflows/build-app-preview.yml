@@ -10,7 +10,8 @@ name: Build App (Preview)
 # unreachable set of bundles; it is now releases-only.
 #
 # The cost of the swap, stated plainly: one prerelease per PR commit that
-# touches `app/**`. They are pruned by Cleanup Old Releases (see Lifecycle).
+# touches `app/**` — so the workflow prunes its own, keeping the newest
+# KEEP_PREVIEWS (see Lifecycle).
 #
 # ## Why not workflow artifacts
 #
@@ -34,14 +35,22 @@ name: Build App (Preview)
 #
 # The `preview-` tag prefix is deliberate. `cleanup-releases.yml` keeps the most
 # recent `v<major>.<minor>.<patch>` releases and separately deletes every release
-# whose tag does *not* start with `v[0-9]` — so previews are pruned by the
-# cleanup that is already run, and never crowd the real release list.
+# whose tag does *not* start with `v[0-9]` — so previews never crowd the real
+# release list, and a manual cleanup sweeps any this workflow missed.
+#
+# But that cleanup is a manual, dry-run-by-default action, and one prerelease per
+# pushed commit accumulates faster than anyone runs it. So the last job here
+# prunes previous previews itself, keeping the newest few. Bundles are ~130 MB a
+# release; the point of a preview is the build you are testing now.
 #
 # `sync-release.yml` is workflow_dispatch-only, so nothing here reaches GitHub.
 
 env:
   GITEA_URL: ${{ gitea.server_url }}
   REPO: ${{ gitea.repository }}
+  # How many preview releases survive a run, newest first — including the one
+  # just published.
+  KEEP_PREVIEWS: "2"
 
 on:
   # Every push to an open PR: this *is* the branch's build check — it compiles
@@ -522,3 +531,48 @@ jobs:
               --data-binary "@$($file.FullName)" $uploadUri
             if ($LASTEXITCODE -ne 0) { throw "Upload of $name failed (curl exit $LASTEXITCODE)" }
           }
+
+  # Keep the preview list short. Runs after the builds and only if all three
+  # succeeded: a half-published run must not be what evicts a good older build.
+  prune-previews:
+    runs-on: ubuntu-latest
+    needs: [create-release, build-linux, build-macos, build-windows]
+    steps:
+      - name: Delete all but the newest preview releases
+        env:
+          TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          KEEP_TAG: ${{ needs.create-release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          curl -fsS -H "Authorization: token ${TOKEN}" \
+            "${GITEA_URL}/api/v1/repos/${REPO}/releases?limit=50" > releases.json
+
+          # Newest first by creation time, `preview-` only, and never the one
+          # this run just published — a clock skew must not delete it.
+          DOOMED=$(python3 - "${KEEP_PREVIEWS}" "${KEEP_TAG}" <<'PY'
+          import json, sys
+          keep, keep_tag = int(sys.argv[1]), sys.argv[2]
+          previews = [r for r in json.load(open("releases.json"))
+                      if r["tag_name"].startswith("preview-")]
+          previews.sort(key=lambda r: r["created_at"], reverse=True)
+          for r in previews[keep:]:
+              if r["tag_name"] != keep_tag:
+                  print(r["id"], r["tag_name"])
+          PY
+          )
+
+          if [ -z "${DOOMED}" ]; then
+            echo "Nothing to prune (keeping ${KEEP_PREVIEWS})"
+            exit 0
+          fi
+
+          echo "${DOOMED}" | while read -r ID TAG; do
+            [ -z "${ID}" ] && continue
+            echo "Deleting ${TAG} (id ${ID})"
+            # Best effort: a preview someone deleted by hand mid-run is not a
+            # reason to fail a build that otherwise succeeded.
+            curl -sS -X DELETE -H "Authorization: token ${TOKEN}" \
+              "${GITEA_URL}/api/v1/repos/${REPO}/releases/${ID}" || true
+            curl -sS -X DELETE -H "Authorization: token ${TOKEN}" \
+              "${GITEA_URL}/api/v1/repos/${REPO}/tags/${TAG}" || true
+          done
