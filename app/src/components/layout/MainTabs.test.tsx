@@ -45,39 +45,35 @@ const S1 = terminalTabKey("s1");
 const S2 = terminalTabKey("s2");
 
 /**
- * A stand-in for the DataTransfer jsdom doesn't implement. It only has to
- * carry the tab key, which is what a drop falls back to reading.
+ * A pointer event carrying a real `clientX`.
+ *
+ * jsdom implements no `PointerEvent`, so Testing Library's synthesized one has
+ * no coordinates — and the coordinate is the whole point here, since it decides
+ * which slot the drop lands in. `MouseEvent` has one, and React dispatches on
+ * the event's type name either way.
  */
-function dataTransfer() {
-  const store: Record<string, string> = {};
-  return {
-    effectAllowed: "",
-    dropEffect: "",
-    setData: (format: string, value: string) => {
-      store[format] = value;
-    },
-    getData: (format: string) => store[format] ?? "",
-  };
+function pointer(el: Element, type: string, clientX: number) {
+  fireEvent(el, new MouseEvent(type, { bubbles: true, cancelable: true, clientX, button: 0 }));
 }
 
-/**
- * A dragover carrying a real `clientX`.
- *
- * jsdom has no `DragEvent`, so Testing Library's synthesized one is a plain
- * `Event` with no pointer coordinates — and the coordinate is the whole point
- * here, since it decides which side of a tab the drop lands on. A `MouseEvent`
- * has one, and React reads it the same way.
- */
-function dragOverAt(el: Element, clientX: number, dt: ReturnType<typeof dataTransfer>) {
-  const event = new MouseEvent("dragover", { bubbles: true, cancelable: true, clientX });
-  Object.defineProperty(event, "dataTransfer", { value: dt });
-  fireEvent(el, event);
+/** Press, move past the drag threshold, and release over `endX`. */
+function dragTab(el: Element, fromX: number, endX: number) {
+  pointer(el, "pointerdown", fromX);
+  pointer(el, "pointermove", endX);
+  pointer(el, "pointerup", endX);
 }
 
 /** Pin a tab's geometry so "past the midpoint" means something in jsdom. */
 function place(el: Element, left: number, width = 100) {
   el.getBoundingClientRect = () =>
     ({ left, width, right: left + width, top: 0, bottom: 30, height: 30, x: left, y: 0 }) as DOMRect;
+}
+
+/** Lay the strip out as three 100px tabs starting at x=0. */
+function laidOut() {
+  const tabs = screen.getAllByRole("tab");
+  tabs.forEach((tab, i) => place(tab, i * 100));
+  return tabs;
 }
 
 const order = () => useAppState.getState().tabOrder;
@@ -95,73 +91,124 @@ beforeEach(() => {
 describe("MainTabs reordering", () => {
   it("drags a tab to the front", () => {
     render(<MainTabs />);
-    const tabs = screen.getAllByRole("tab");
-    tabs.forEach((tab, i) => place(tab, i * 100));
+    const tabs = laidOut();
 
-    const dt = dataTransfer();
-    fireEvent.dragStart(tabs[2], { dataTransfer: dt });
-    // Left half of the first tab — the marker sits before it.
-    dragOverAt(tabs[0], 10, dt);
-    expect(screen.getByTestId("tab-drop-marker")).toBeInTheDocument();
-    fireEvent.drop(tabs[0], { dataTransfer: dt });
+    // Left half of the first tab — the tab lands before it.
+    dragTab(tabs[2], 250, 10);
 
     expect(order()).toEqual([S2, HOME, S1]);
   });
 
   it("drops after the tab when the pointer is past its midpoint", () => {
     render(<MainTabs />);
-    const tabs = screen.getAllByRole("tab");
-    tabs.forEach((tab, i) => place(tab, i * 100));
+    const tabs = laidOut();
 
-    const dt = dataTransfer();
-    fireEvent.dragStart(tabs[0], { dataTransfer: dt });
-    dragOverAt(tabs[1], 190, dt);
-    fireEvent.drop(tabs[1], { dataTransfer: dt });
+    dragTab(tabs[0], 50, 190);
 
     expect(order()).toEqual([S1, HOME, S2]);
   });
 
+  it("drops at the end when released past the last tab", () => {
+    render(<MainTabs />);
+    const tabs = laidOut();
+
+    dragTab(tabs[0], 50, 800);
+
+    expect(order()).toEqual([S1, S2, HOME]);
+  });
+
   it("dragging does not steal the selection", () => {
     render(<MainTabs />);
-    const tabs = screen.getAllByRole("tab");
-    tabs.forEach((tab, i) => place(tab, i * 100));
+    const tabs = laidOut();
 
-    const dt = dataTransfer();
-    fireEvent.dragStart(tabs[1], { dataTransfer: dt });
-    dragOverAt(tabs[2], 290, dt);
-    fireEvent.drop(tabs[2], { dataTransfer: dt });
+    dragTab(tabs[1], 150, 290);
 
     expect(order()).toEqual([HOME, S2, S1]);
     expect(useAppState.getState().activeTabKey).toBe(HOME);
   });
 
-  it("shows no drop marker until a drag is under way", () => {
+  it("shows the drop marker only while a drag is under way", () => {
     render(<MainTabs />);
+    const tabs = laidOut();
+    expect(screen.queryByTestId("tab-drop-marker")).toBeNull();
+
+    pointer(tabs[2], "pointerdown", 250);
+    pointer(tabs[2], "pointermove", 10);
+    expect(screen.getByTestId("tab-drop-marker")).toBeInTheDocument();
+
+    pointer(tabs[2], "pointerup", 10);
     expect(screen.queryByTestId("tab-drop-marker")).toBeNull();
   });
 
-  it("clears the marker when the drag ends without a drop", () => {
+  it("abandons the drag on Escape, leaving the order alone", () => {
     render(<MainTabs />);
-    const tabs = screen.getAllByRole("tab");
-    tabs.forEach((tab, i) => place(tab, i * 100));
+    const tabs = laidOut();
 
-    const dt = dataTransfer();
-    fireEvent.dragStart(tabs[2], { dataTransfer: dt });
-    dragOverAt(tabs[0], 10, dt);
-    fireEvent.dragEnd(tabs[2], { dataTransfer: dt });
+    pointer(tabs[2], "pointerdown", 250);
+    pointer(tabs[2], "pointermove", 10);
+    fireEvent.keyDown(window, { key: "Escape" });
+
+    expect(screen.queryByTestId("tab-drop-marker")).toBeNull();
+    pointer(tabs[2], "pointerup", 10);
+    expect(order()).toEqual([HOME, S1, S2]);
+  });
+
+  it("treats a press that barely moves as a click, not a drag", () => {
+    render(<MainTabs />);
+    const tabs = laidOut();
+
+    // Two pixels of tremble, under the threshold.
+    pointer(tabs[2], "pointerdown", 250);
+    pointer(tabs[2], "pointermove", 252);
+    pointer(tabs[2], "pointerup", 252);
+    fireEvent.click(tabs[2]);
+
+    expect(order()).toEqual([HOME, S1, S2]);
+    expect(useAppState.getState().activeTabKey).toBe(S2);
+  });
+
+  it("does not select the tab it just dropped", () => {
+    render(<MainTabs />);
+    const tabs = laidOut();
+
+    dragTab(tabs[2], 250, 10);
+    // The browser fires a click after the pointerup that ended the drag.
+    fireEvent.click(tabs[2]);
+
+    expect(order()).toEqual([S2, HOME, S1]);
+    expect(useAppState.getState().activeTabKey).toBe(HOME);
+  });
+
+  it("ignores a press that starts on the close button", () => {
+    render(<MainTabs />);
+    const tabs = laidOut();
+    const close = screen.getByRole("button", { name: "Close shell (bash)" });
+
+    fireEvent(close, new MouseEvent("pointerdown", { bubbles: true, clientX: 290, button: 0 }));
+    pointer(tabs[2], "pointermove", 10);
 
     expect(screen.queryByTestId("tab-drop-marker")).toBeNull();
     expect(order()).toEqual([HOME, S1, S2]);
   });
 
-  it("leaves a tab being renamed undraggable, so its text stays selectable", () => {
+  it("does not drag a tab that is being renamed — that drag selects text", () => {
     render(<MainTabs />);
-    const tabs = screen.getAllByRole("tab");
-    expect(tabs[1]).toHaveAttribute("draggable", "true");
-
+    const tabs = laidOut();
     fireEvent.doubleClick(tabs[1]);
-
     expect(screen.getByLabelText("Rename tab")).toBeInTheDocument();
-    expect(screen.getAllByRole("tab")[1]).toHaveAttribute("draggable", "false");
+
+    dragTab(screen.getAllByRole("tab")[1], 150, 10);
+
+    expect(order()).toEqual([HOME, S1, S2]);
+  });
+
+  it("carries no drag payload that another element could receive", () => {
+    // An HTML5 drag would put the tab key in a DataTransfer, and releasing over
+    // any text field in the app would type `term:…` into it. Pointer events
+    // have nothing to hand over, and the tabs are not draggable at all.
+    render(<MainTabs />);
+    for (const tab of screen.getAllByRole("tab")) {
+      expect(tab).not.toHaveAttribute("draggable", "true");
+    }
   });
 });

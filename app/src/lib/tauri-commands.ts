@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, ImageUpdateInfo, FileEntry, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo } from "./types";
+import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, ImageUpdateInfo, FileEntry, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo } from "./types";
 
 // Docker
 export const checkDocker = () => invoke<boolean>("check_docker");
@@ -213,9 +213,15 @@ export const openBrowserViewPopout = (projectId: string, alwaysOnTop: boolean) =
 /** Close the pop-out and put the view back in the tab. No-op if it isn't open. */
 export const closeBrowserViewPopout = (projectId: string) =>
   invoke<void>("close_browser_view_popout", { projectId });
-/** Asked on tab open: the window outlives the pane, so its state has to be read back. */
-export const isBrowserViewPopoutOpen = (projectId: string) =>
-  invoke<boolean>("is_browser_view_popout_open", { projectId });
+/**
+ * Whether the pop-out is open and whether it is pinned, read from the window.
+ *
+ * Asked on every mount: the pane is unmounted whenever another Project Home
+ * sub-tab is selected, while the window carries on — so neither fact can live
+ * in component state and survive.
+ */
+export const getBrowserViewPopoutState = (projectId: string) =>
+  invoke<BrowserViewPopoutState>("get_browser_view_popout_state", { projectId });
 /** Pin the pop-out above other windows — the point of popping it out at all. */
 export const setBrowserViewPopoutAlwaysOnTop = (projectId: string, onTop: boolean) =>
   invoke<void>("set_browser_view_popout_always_on_top", { projectId, onTop });

@@ -128,23 +128,29 @@ pub async fn open_browser_view_popout(
 }
 
 /// Close the pop-out, putting the view back in the tab. No-op if it is closed.
+///
+/// Propagates a failed close rather than reporting success: the pane restores
+/// its iframe on success, and doing that with the window still up puts two
+/// viewers on one browser.
 #[tauri::command]
 pub async fn close_browser_view_popout(
     project_id: String,
     app_handle: AppHandle,
 ) -> Result<(), String> {
-    popout::close(&app_handle, &project_id);
-    Ok(())
+    popout::close(&app_handle, &project_id)
 }
 
-/// Whether the pop-out is open — asked on tab open, since a window can outlive
-/// the pane that spawned it.
+/// Whether the pop-out is open, and whether it is pinned on top.
+///
+/// Read on every pane mount: the window outlives the pane — which is unmounted
+/// whenever another Project Home sub-tab is selected — so neither fact can be
+/// carried in component state.
 #[tauri::command]
-pub async fn is_browser_view_popout_open(
+pub async fn get_browser_view_popout_state(
     project_id: String,
     app_handle: AppHandle,
-) -> Result<bool, String> {
-    Ok(popout::is_open(&app_handle, &project_id))
+) -> Result<popout::PopoutState, String> {
+    Ok(popout::state(&app_handle, &project_id))
 }
 
 /// Pin the pop-out above other windows, so it can be watched while working in

@@ -515,15 +515,27 @@ export interface BrowserViewChangedEvent {
 }
 
 /**
- * Payload of the `browser-view-popout-changed` event.
+ * Mirrors Rust `PopoutState` — read from the window, never remembered.
+ *
+ * The pane is unmounted whenever another Project Home sub-tab is selected while
+ * the window carries on, so anything it holds in component state is stale by
+ * the time the user comes back.
+ */
+export interface BrowserViewPopoutState {
+  open: boolean;
+  always_on_top: boolean;
+}
+
+/**
+ * Payload of the `browser-view-popout-changed` event: a `BrowserViewPopoutState`
+ * plus the project it belongs to.
  *
  * The pop-out window can close without the pane asking — the user hits its X,
  * or the session tears down and takes it — so this is the only reliable way to
  * know whether it is on screen.
  */
-export interface BrowserViewPopoutChangedEvent {
+export interface BrowserViewPopoutChangedEvent extends BrowserViewPopoutState {
   project_id: string;
-  open: boolean;
 }
 
 /** Payload of the `claude-token-progress` event: milestones during

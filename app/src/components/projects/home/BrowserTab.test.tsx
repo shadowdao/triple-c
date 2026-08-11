@@ -15,7 +15,8 @@ const installBrowserViewSupport = vi.fn<() => Promise<BrowserSetupOutcome>>();
 const installBrowserViewBrowser = vi.fn<(id: string, b: string) => Promise<BrowserSetupOutcome>>();
 const openBrowserViewPopout = vi.fn<(id: string, onTop: boolean) => Promise<void>>();
 const closeBrowserViewPopout = vi.fn<(id: string) => Promise<void>>();
-const isBrowserViewPopoutOpen = vi.fn<() => Promise<boolean>>();
+const getBrowserViewPopoutState =
+  vi.fn<() => Promise<{ open: boolean; always_on_top: boolean }>>();
 const setBrowserViewPopoutAlwaysOnTop = vi.fn<(id: string, onTop: boolean) => Promise<void>>();
 const pushToast = vi.fn();
 const setContainerProgress = vi.fn();
@@ -28,7 +29,7 @@ vi.mock("../../../lib/tauri-commands", () => ({
   installBrowserViewBrowser: (id: string, b: string) => installBrowserViewBrowser(id, b),
   openBrowserViewPopout: (id: string, onTop: boolean) => openBrowserViewPopout(id, onTop),
   closeBrowserViewPopout: (id: string) => closeBrowserViewPopout(id),
-  isBrowserViewPopoutOpen: () => isBrowserViewPopoutOpen(),
+  getBrowserViewPopoutState: () => getBrowserViewPopoutState(),
   setBrowserViewPopoutAlwaysOnTop: (id: string, onTop: boolean) =>
     setBrowserViewPopoutAlwaysOnTop(id, onTop),
 }));
@@ -120,7 +121,7 @@ beforeEach(() => {
   storeState.containerProgress = {};
   getBrowserViewStatus.mockResolvedValue(OFF);
   checkBrowserViewSupport.mockResolvedValue(READY);
-  isBrowserViewPopoutOpen.mockResolvedValue(false);
+  getBrowserViewPopoutState.mockResolvedValue({ open: false, always_on_top: false });
   openBrowserViewPopout.mockResolvedValue(undefined);
   closeBrowserViewPopout.mockResolvedValue(undefined);
   setBrowserViewPopoutAlwaysOnTop.mockResolvedValue(undefined);
@@ -406,16 +407,17 @@ describe("BrowserTab", () => {
     });
 
     await act(async () => {
-      fireEvent.click(screen.getByRole("switch", { name: /above other windows/i }));
+      // The accessible name is the visible text, as with every other Toggle.
+      fireEvent.click(screen.getByRole("switch", { name: "Keep on top" }));
     });
 
     expect(setBrowserViewPopoutAlwaysOnTop).toHaveBeenCalledWith("p1", true);
   });
 
   it("keeps a pop-out that outlived the tab, rather than showing an empty pane", async () => {
-    // The window belongs to the backend, so reopening the tab has to read its
+    // The window belongs to the backend, so remounting the pane has to read its
     // state back — otherwise the pane would render an iframe alongside it.
-    isBrowserViewPopoutOpen.mockResolvedValue(true);
+    getBrowserViewPopoutState.mockResolvedValue({ open: true, always_on_top: true });
     checkBrowserViewSupport.mockResolvedValue({ ...READY, browsers: ["chromium-1200"] });
     getBrowserViewStatus.mockResolvedValue(LIVE);
 
@@ -423,6 +425,33 @@ describe("BrowserTab", () => {
 
     expect(await screen.findByText(/in its own window/i)).toBeInTheDocument();
     expect(screen.queryByTitle(/browser view for/i)).toBeNull();
+    // The pin is read from the window too — the pane is unmounted every time
+    // another sub-tab is selected, so remembering it would show Off over a
+    // window that is still floating on top.
+    expect(screen.getByRole("switch", { name: "Keep on top" })).toBeChecked();
+  });
+
+  it("never mounts the iframe before the window's state is known", async () => {
+    // The status and the pop-out state are two separate round trips. If the
+    // status wins the race, guessing "not popped out" would flash a second
+    // viewer onto a browser the window is already driving.
+    checkBrowserViewSupport.mockResolvedValue({ ...READY, browsers: ["chromium-1200"] });
+    getBrowserViewStatus.mockResolvedValue(LIVE);
+    let answer: (s: { open: boolean; always_on_top: boolean }) => void = () => {};
+    getBrowserViewPopoutState.mockReturnValue(
+      new Promise((resolve) => {
+        answer = resolve;
+      }),
+    );
+
+    render(<BrowserTab project={project} active />);
+    await waitFor(() => expect(screen.getByText("Live")).toBeInTheDocument());
+    expect(screen.queryByTitle(/browser view for/i)).toBeNull();
+
+    await act(async () => {
+      answer({ open: false, always_on_top: false });
+    });
+    expect(await screen.findByTitle("Playwright browser view for api-server")).toBeInTheDocument();
   });
 
   it("says why the window wouldn’t open instead of pretending it did", async () => {

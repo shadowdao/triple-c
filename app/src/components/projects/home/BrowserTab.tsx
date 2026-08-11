@@ -15,7 +15,7 @@ import {
   getBrowserViewStatus,
   installBrowserViewBrowser,
   installBrowserViewSupport,
-  isBrowserViewPopoutOpen,
+  getBrowserViewPopoutState,
   openBrowserViewPopout,
   setBrowserViewEnabled,
   setBrowserViewPopoutAlwaysOnTop,
@@ -72,8 +72,13 @@ export default function BrowserTab({ project, active }: Props) {
   const [job, setJob] = useState<SetupJob>(null);
   const [outcome, setOutcome] = useState<BrowserSetupOutcome | null>(null);
   const [setupError, setSetupError] = useState<string | null>(null);
-  /** Whether the view is currently in its own window instead of this pane. */
-  const [poppedOut, setPoppedOut] = useState(false);
+  /**
+   * Whether the view is in its own window instead of this pane, and whether
+   * that window is pinned. `null` means "not asked yet" — a distinct state from
+   * "not popped out", because rendering the iframe on a guess is what puts a
+   * second viewer on the browser.
+   */
+  const [poppedOut, setPoppedOut] = useState<boolean | null>(null);
   const [onTop, setOnTop] = useState(false);
   const pushToast = useAppState((s) => s.pushToast);
   const setContainerProgress = useAppState((s) => s.setContainerProgress);
@@ -112,7 +117,7 @@ export default function BrowserTab({ project, active }: Props) {
     listen<BrowserViewPopoutChangedEvent>("browser-view-popout-changed", (event) => {
       if (event.payload.project_id === projectId && mounted.current) {
         setPoppedOut(event.payload.open);
-        if (!event.payload.open) setOnTop(false);
+        setOnTop(event.payload.always_on_top);
       }
     }).then((un) => {
       if (mounted.current) dispose = un;
@@ -123,9 +128,15 @@ export default function BrowserTab({ project, active }: Props) {
 
   useEffect(() => {
     if (!active || !running) return;
-    isBrowserViewPopoutOpen(projectId)
-      .then((open) => mounted.current && setPoppedOut(open))
-      .catch(() => {});
+    getBrowserViewPopoutState(projectId)
+      .then((s) => {
+        if (!mounted.current) return;
+        setPoppedOut(s.open);
+        setOnTop(s.always_on_top);
+      })
+      // Unreachable in practice, but a pane stuck at "not asked yet" would
+      // never show the view at all — so fail towards the tab.
+      .catch(() => mounted.current && setPoppedOut(false));
     getBrowserViewStatus(projectId)
       .then((s) => mounted.current && setStatus(s))
       .catch(() => {});
@@ -304,22 +315,21 @@ export default function BrowserTab({ project, active }: Props) {
           </span>
         )}
         <div className="flex-1" />
-        {live && poppedOut && (
-          <label className="flex items-center gap-1.5 text-xs text-[var(--text-secondary)]">
+        {live && poppedOut === true && (
+          <span className="flex items-center gap-1.5 text-xs text-[var(--text-secondary)]">
             Keep on top
-            <Toggle
-              checked={onTop}
-              onChange={toggleOnTop}
-              label="Keep the browser window above other windows"
-            />
-          </label>
+            {/* The accessible name matches the visible text, as everywhere else
+                a Toggle is used — a `<label>` around it would be inert anyway,
+                since a Toggle renders a button. */}
+            <Toggle checked={onTop} onChange={toggleOnTop} label="Keep on top" />
+          </span>
         )}
-        {live && !poppedOut && (
+        {live && poppedOut === false && (
           <Button size="md" onClick={() => setReloadKey((k) => k + 1)}>
             Reload
           </Button>
         )}
-        {live && (
+        {live && poppedOut !== null && (
           <Button size="md" onClick={poppedOut ? popIn : popOut}>
             {poppedOut ? "Put back in tab" : "Open in own window"}
           </Button>
@@ -334,7 +344,7 @@ export default function BrowserTab({ project, active }: Props) {
         </Button>
       </div>
 
-      {live && poppedOut ? (
+      {live && poppedOut === true ? (
         // The iframe is unmounted while the window is up, on purpose. Two
         // viewers on one browser both work, but both also *drive* it — two
         // cursors taking over the same page is not a feature.
@@ -355,7 +365,7 @@ export default function BrowserTab({ project, active }: Props) {
             </div>
           </div>
         </div>
-      ) : live ? (
+      ) : live && poppedOut === false ? (
         <iframe
           key={reloadKey}
           // Loopback only, and the URL carries the one-time session token the
@@ -364,6 +374,11 @@ export default function BrowserTab({ project, active }: Props) {
           title={`Playwright browser view for ${project.name}`}
           className="flex-1 min-h-0 w-full border-0 bg-[var(--bg-primary)]"
         />
+      ) : live ? (
+        // Live, but the window's state hasn't come back yet. An instant, and
+        // deliberately empty: guessing "not popped out" here is what would
+        // flash a second viewer onto the browser.
+        <div className="flex-1 min-h-0" />
       ) : (
         <div className="flex-1 min-h-0 overflow-y-auto">
           {/* Setup stays on screen while an install is running and after it

@@ -192,10 +192,11 @@ Anthropic-backend project uses that token without its own login. See
   There is no separate terminal tab bar and no "+" button — tabs appear when you open a project or
   a terminal.
 
-  **Drag a tab to reorder it.** A line shows where it will land, and dropping it does not change
-  which tab you are looking at — so you can rearrange the strip without pulling focus away from a
-  terminal that is mid-run. `Ctrl+Shift+←` and `Ctrl+Shift+→` move the *active* tab the same way
-  without the mouse. The order is per-session: it is not saved when you quit.
+  **Drag a tab to reorder it.** A line shows where it will land; **Escape** abandons the drag.
+  Dropping does not change which tab you are looking at — so you can rearrange the strip without
+  pulling focus away from a terminal that is mid-run. `Ctrl+Shift+←` and `Ctrl+Shift+→` move the
+  *active* tab the same way without the mouse (they leave text fields alone, where that chord
+  still selects by word). The order is per-session: it is not saved when you quit.
 - **Status indicators (top right)** — Docker connection and container image availability. Each pairs
   a coloured dot with a word, so status is never conveyed by colour alone. The **?** button opens
   the built-in help.

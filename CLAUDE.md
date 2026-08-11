@@ -62,6 +62,14 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   `tabOrder` is user-reorderable (drag, or `Ctrl+Shift+←/→` via `moveActiveTab`) — so **never
   treat a tab's position as identity**: address tabs by key, and index only through `tabOrder`.
   `moveTab` deliberately does not activate what it moves.
+  - **The tab drag is pointer events, not HTML5 drag-and-drop, and must stay that way.** Tauri's
+    `dragDropEnabled` blocks HTML5 drag inside the webview on Windows, and it cannot simply be
+    turned off: `TerminalView` needs Tauri's native drag-drop event because it is the only one
+    that carries dropped *file paths*. An HTML5 drag also carries a `DataTransfer`, which the
+    default handler types into any text field the drag is released over.
+  - **A new app-level shortcut must not swallow a text-editing chord.** `useKeyboardShortcuts`
+    binds on `document` in the capture phase, so `inTextField()` guards the arrow bindings —
+    excluding xterm's helper textarea, which is an input-method shim rather than a field.
 - **`hooks/`** — All Tauri IPC calls are encapsulated in hooks (`useTerminal`, `useProjects`, `useDocker`, `useSettings`)
 - **`lib/tauri-commands.ts`** — Typed `invoke()` wrappers; TypeScript types in `lib/types.ts` must match Rust models
 - **`components/terminal/TerminalView.tsx`** — xterm.js integration with WebGL rendering, URL detection for OAuth flow

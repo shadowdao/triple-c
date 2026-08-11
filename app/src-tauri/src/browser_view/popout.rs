@@ -27,14 +27,35 @@
 //! dead viewer is worse than no window. The reverse is not true; closing the
 //! window leaves the view running, and the pane takes it back into the tab.
 
+use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
-/// Emitted when a pop-out opens or closes. Payload: `{ project_id, open }`.
+/// Emitted when a pop-out opens or closes. Payload: [`PopoutState`] plus the
+/// project id.
 ///
 /// The window can close without the app asking it to — the user hits its X, or
 /// a teardown takes it — so the pane learns about it the same way it learns
 /// about everything else here, by listening.
 const POPOUT_EVENT: &str = "browser-view-popout-changed";
+
+/// What the pane needs to render its pop-out controls.
+///
+/// Both fields are read from the window itself rather than remembered on either
+/// side: the pane is unmounted whenever another Project Home sub-tab is
+/// selected, so anything it merely *remembers* about the window is gone by the
+/// time the user comes back, while the window is still there.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct PopoutState {
+    pub open: bool,
+    pub always_on_top: bool,
+}
+
+impl PopoutState {
+    const CLOSED: Self = Self {
+        open: false,
+        always_on_top: false,
+    };
+}
 
 /// Tauri window labels admit `[a-zA-Z0-9-/:_]` only. Project ids are UUIDs, so
 /// this never fires in practice; it exists so a hand-edited `projects.json`
@@ -65,7 +86,7 @@ pub fn open(
         let _ = window.unminimize();
         let _ = window.set_focus();
         let _ = window.set_always_on_top(always_on_top);
-        emit(app, project_id, true);
+        emit(app, project_id, state(app, project_id));
         return Ok(());
     }
 
@@ -88,12 +109,12 @@ pub fn open(
     // to take the view back into the tab.
     window.on_window_event(move |event| {
         if matches!(event, WindowEvent::Destroyed) {
-            emit(&app_for_event, &project_id_owned, false);
+            emit(&app_for_event, &project_id_owned, PopoutState::CLOSED);
         }
     });
 
     log::info!("Browser view: popped out for project {}", project_id);
-    emit(app, project_id, true);
+    emit(app, project_id, state(app, project_id));
     Ok(())
 }
 
@@ -102,23 +123,39 @@ pub fn open(
 /// `destroy`, not `close`: `close` raises `CloseRequested`, and the app's
 /// window-event handler treats that as a request to quit for the main window.
 /// Nothing here should ever be able to be mistaken for that.
-pub fn close(app: &AppHandle, project_id: &str) {
+///
+/// A failure is **returned, not logged and forgotten**. The pane puts its
+/// iframe back the moment it believes the window is gone, so reporting a close
+/// that did not happen is how you end up with two viewers driving one browser —
+/// the exact state the iframe is dropped to prevent.
+pub fn close(app: &AppHandle, project_id: &str) -> Result<(), String> {
     if let Some(window) = app.get_webview_window(&window_label(project_id)) {
-        if let Err(e) = window.destroy() {
+        window.destroy().map_err(|e| {
             log::warn!(
                 "Browser view: could not close the pop-out for project {}: {}",
                 project_id,
                 e
             );
-        }
+            format!("Could not close the browser window: {}", e)
+        })?;
     }
-    // Unconditional: `Destroyed` covers the normal path, but a window that was
-    // already gone still owes the pane an answer.
-    emit(app, project_id, false);
+    // `Destroyed` covers the normal path; a window that was already gone still
+    // owes the pane an answer.
+    emit(app, project_id, PopoutState::CLOSED);
+    Ok(())
 }
 
-pub fn is_open(app: &AppHandle, project_id: &str) -> bool {
-    app.get_webview_window(&window_label(project_id)).is_some()
+/// Whether the window exists and how it is stacked, read from the window.
+pub fn state(app: &AppHandle, project_id: &str) -> PopoutState {
+    match app.get_webview_window(&window_label(project_id)) {
+        Some(window) => PopoutState {
+            open: true,
+            // A window that cannot answer is not a reason to fail the call; the
+            // pin is a preference, and "not pinned" is the safe reading.
+            always_on_top: window.is_always_on_top().unwrap_or(false),
+        },
+        None => PopoutState::CLOSED,
+    }
 }
 
 /// Pin the pop-out above other windows, or unpin it. No-op when it is closed.
@@ -128,13 +165,19 @@ pub fn set_always_on_top(app: &AppHandle, project_id: &str, on_top: bool) -> Res
     };
     window
         .set_always_on_top(on_top)
-        .map_err(|e| format!("Could not change the window's stacking: {}", e))
+        .map_err(|e| format!("Could not change the window's stacking: {}", e))?;
+    emit(app, project_id, state(app, project_id));
+    Ok(())
 }
 
-fn emit(app: &AppHandle, project_id: &str, open: bool) {
+fn emit(app: &AppHandle, project_id: &str, state: PopoutState) {
     let _ = app.emit(
         POPOUT_EVENT,
-        serde_json::json!({ "project_id": project_id, "open": open }),
+        serde_json::json!({
+            "project_id": project_id,
+            "open": state.open,
+            "always_on_top": state.always_on_top,
+        }),
     );
 }
 

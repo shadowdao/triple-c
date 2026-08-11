@@ -18,6 +18,9 @@ interface ContextMenuState {
   y: number;
 }
 
+/** Pixels of horizontal travel before a press becomes a drag rather than a click. */
+const DRAG_THRESHOLD = 4;
+
 const MODE_BADGE: Record<PermissionMode, { text: string; className: string }> = {
   plan: { text: "plan", className: "bg-[var(--bg-tertiary)] text-[var(--text-secondary)]" },
   default: { text: "ask", className: "bg-[var(--bg-tertiary)] text-[var(--text-secondary)]" },
@@ -29,9 +32,8 @@ const MODE_BADGE: Record<PermissionMode, { text: string; className: string }> = 
  * One strip for both main-area tab kinds: Project Home views (⌂) and
  * terminals (▣).
  *
- * Tabs are draggable. The drag is HTML5's, not a pointer-event
- * reimplementation, so the OS supplies the drag image and the Escape-to-cancel
- * behaviour for free; the only thing tracked here is where the drop would land.
+ * Tabs are draggable, on pointer events rather than HTML5 drag-and-drop — see
+ * `pointerProps` for why neither of the two obvious alternatives works.
  * `Ctrl+Shift+←/→` does the same thing without a mouse.
  */
 export default function MainTabs() {
@@ -53,6 +55,10 @@ export default function MainTabs() {
   /** The tab being dragged, and the slot it would drop into. */
   const [dragKey, setDragKey] = useState<string | null>(null);
   const [dropIndex, setDropIndex] = useState<number | null>(null);
+  const stripRef = useRef<HTMLDivElement>(null);
+  /** A press that has not yet moved far enough to be a drag. */
+  const pending = useRef<{ key: string; startX: number; dragging: boolean } | null>(null);
+  const suppressClick = useRef(false);
 
   useEffect(() => {
     if (!menu) return;
@@ -71,6 +77,20 @@ export default function MainTabs() {
       renameInputRef.current?.select();
     }
   }, [renamingId]);
+
+  // Escape abandons a drag — the one affordance a pointer-event drag has to
+  // supply for itself, since the OS is not running this one.
+  useEffect(() => {
+    if (!dragKey) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      pending.current = null;
+      setDragKey(null);
+      setDropIndex(null);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [dragKey]);
 
   if (tabOrder.length === 0) {
     return (
@@ -152,54 +172,91 @@ export default function MainTabs() {
     }${dragging ? " opacity-40" : ""}`;
 
   const endDrag = () => {
+    pending.current = null;
     setDragKey(null);
     setDropIndex(null);
   };
 
   /**
-   * Drag props shared by both tab kinds.
+   * Which slot the pointer is currently over, as an insertion index into
+   * `tabOrder`.
    *
-   * A tab in rename mode is not draggable: a `draggable` ancestor swallows the
-   * mouse-drag that selects text inside the input, which would make the rename
-   * field impossible to select in.
+   * Measured from the tabs actually on screen rather than from the event's
+   * target, so the answer is the same whatever the pointer happens to be over —
+   * including the drop marker itself, and including a `tabOrder` entry whose
+   * session has already gone and which therefore renders nothing.
    */
-  const dragProps = (key: string, index: number, renaming: boolean) => ({
-    draggable: !renaming,
-    onDragStart: (e: React.DragEvent<HTMLDivElement>) => {
-      e.dataTransfer.effectAllowed = "move";
-      // Some platforms refuse to start a drag with an empty payload.
-      e.dataTransfer.setData("text/plain", key);
-      setDragKey(key);
-      setDropIndex(index);
+  const dropIndexAt = (clientX: number): number => {
+    const strip = stripRef.current;
+    if (!strip) return tabOrder.length;
+    for (const el of strip.querySelectorAll<HTMLElement>("[data-tab-index]")) {
+      const rect = el.getBoundingClientRect();
+      if (clientX < rect.left + rect.width / 2) return Number(el.dataset.tabIndex);
+    }
+    return tabOrder.length;
+  };
+
+  /**
+   * Dragging is done with pointer events, not HTML5 drag-and-drop.
+   *
+   * Two reasons, both load-bearing. Tauri's `dragDropEnabled` — which the
+   * terminal needs left on, because only the native drag-drop event carries
+   * dropped *file paths* — blocks HTML5 drag inside the webview on Windows, so
+   * an HTML5 implementation is simply dead there. And an HTML5 drag carries a
+   * `DataTransfer`: released over any text field in the app, the default
+   * handler types the payload into it.
+   */
+  const pointerProps = (key: string, renaming: boolean) => ({
+    onPointerDown: (e: React.PointerEvent<HTMLDivElement>) => {
+      // Left button only, never from the close button, and never while the
+      // rename input is up — that drag is a text selection.
+      if (e.button !== 0 || renaming) return;
+      if ((e.target as HTMLElement).closest("button, input")) return;
+      pending.current = { key, startX: e.clientX, dragging: false };
+      e.currentTarget.setPointerCapture?.(e.pointerId);
     },
-    onDragOver: (e: React.DragEvent<HTMLDivElement>) => {
-      if (!dragKey) return; // not our drag — a file dropped on the strip isn't one
-      e.preventDefault();
-      e.dataTransfer.dropEffect = "move";
-      const rect = e.currentTarget.getBoundingClientRect();
-      const after = e.clientX > rect.left + rect.width / 2;
-      setDropIndex(index + (after ? 1 : 0));
+    onPointerMove: (e: React.PointerEvent<HTMLDivElement>) => {
+      const drag = pending.current;
+      if (!drag) return;
+      // A few pixels of slop, so a click that trembles stays a click.
+      if (!drag.dragging && Math.abs(e.clientX - drag.startX) < DRAG_THRESHOLD) return;
+      drag.dragging = true;
+      setDragKey(drag.key);
+      setDropIndex(dropIndexAt(e.clientX));
     },
-    onDragEnd: endDrag,
+    onPointerUp: (e: React.PointerEvent<HTMLDivElement>) => {
+      const drag = pending.current;
+      e.currentTarget.releasePointerCapture?.(e.pointerId);
+      if (!drag?.dragging) {
+        pending.current = null;
+        return; // a plain click: leave it to `onClick` to select the tab
+      }
+      const to = dropIndexAt(e.clientX);
+      const from = tabOrder.indexOf(drag.key);
+      // `to` is a slot in the strip as it looks *now*; `moveTab` places the tab
+      // after pulling it out, so every slot past its own shifts down one.
+      if (from !== -1) moveTab(drag.key, to > from ? to - 1 : to);
+      // The click that follows this pointerup is the drag's, not a selection.
+      suppressClick.current = true;
+      endDrag();
+    },
+    onPointerCancel: endDrag,
   });
 
-  /** Drop lands wherever the marker is showing, and only there. */
-  const onDrop = (e: React.DragEvent<HTMLDivElement>) => {
-    const key = dragKey ?? e.dataTransfer.getData("text/plain");
-    if (!key || dropIndex === null) return endDrag();
-    e.preventDefault();
-    const from = tabOrder.indexOf(key);
-    // `dropIndex` is a slot in the strip as it looks *now*; `moveTab` places the
-    // tab after pulling it out, so every slot past the tab's own shifts down one.
-    moveTab(key, dropIndex > from ? dropIndex - 1 : dropIndex);
-    endDrag();
+  /** A drag in progress swallows the click it ends with. */
+  const activateTab = (key: string) => {
+    if (suppressClick.current) {
+      suppressClick.current = false;
+      return;
+    }
+    setActiveTabKey(key);
   };
 
   const dropMarker = (
     <div
       aria-hidden="true"
       data-testid="tab-drop-marker"
-      className="w-0.5 -mx-px h-full bg-[var(--accent)] flex-shrink-0"
+      className="w-0.5 -mx-px h-full bg-[var(--accent)] flex-shrink-0 pointer-events-none"
     />
   );
 
@@ -215,14 +272,15 @@ export default function MainTabs() {
           role="tab"
           aria-selected={active}
           tabIndex={0}
-          onClick={() => setActiveTabKey(key)}
+          data-tab-index={index}
+          onClick={() => activateTab(key)}
           onKeyDown={(e) => {
             if (e.key === "Enter" || e.key === " ") {
               e.preventDefault();
               setActiveTabKey(key);
             }
           }}
-          {...dragProps(key, index, false)}
+          {...pointerProps(key, false)}
           className={tabClass(active, dragKey === key)}
         >
           <span aria-hidden="true" className="text-[var(--text-secondary)]">⌂</span>
@@ -265,7 +323,8 @@ export default function MainTabs() {
         role="tab"
         aria-selected={active}
         tabIndex={0}
-        onClick={() => setActiveTabKey(terminalTabKey(session.id))}
+        data-tab-index={index}
+        onClick={() => activateTab(terminalTabKey(session.id))}
         onKeyDown={(e) => {
           if (e.key === "Enter" || e.key === " ") {
             e.preventDefault();
@@ -277,7 +336,7 @@ export default function MainTabs() {
           setMenu({ sessionId: session.id, x: e.clientX, y: e.clientY });
         }}
         onDoubleClick={() => startRename(session.id)}
-        {...dragProps(key, index, isRenaming)}
+        {...pointerProps(key, isRenaming)}
         className={tabClass(active, dragKey === key)}
       >
         <span aria-hidden="true" className="text-[var(--text-secondary)]">▣</span>
@@ -324,26 +383,22 @@ export default function MainTabs() {
     );
   };
 
+  // The marker goes before the first tab that is *actually on screen* at or
+  // past the drop slot. Addressing it by raw index would lose it whenever a
+  // `tabOrder` entry renders nothing — the window between a session ending and
+  // the store dropping its key — leaving the drag with no visible target.
+  let markerPending = dragKey !== null && dropIndex !== null;
+
   return (
-    <div
-      className="flex items-center h-full"
-      role="tablist"
-      aria-label="Open tabs"
-      onDrop={onDrop}
-      onDragLeave={(e) => {
-        // Leaving the strip entirely (not crossing between tabs) parks the
-        // marker, so a drag aborted outside doesn't leave one behind.
-        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
-          setDropIndex(null);
-        }
-      }}
-    >
+    <div ref={stripRef} className="flex items-center h-full" role="tablist" aria-label="Open tabs">
       {tabOrder.map((key, index) => {
         const tab = renderTab(key, index);
         if (!tab) return null;
+        const marker = markerPending && index >= (dropIndex ?? 0);
+        if (marker) markerPending = false;
         return (
           <Fragment key={key}>
-            {dragKey !== null && dropIndex === index && dropMarker}
+            {marker && dropMarker}
             {tab}
           </Fragment>
         );
@@ -351,17 +406,7 @@ export default function MainTabs() {
 
       {/* The empty run after the last tab is a drop target too — it is where
           the hand naturally goes to say "put it at the end". */}
-      <div
-        className="flex-1 self-stretch"
-        onDragOver={(e) => {
-          if (!dragKey) return;
-          e.preventDefault();
-          e.dataTransfer.dropEffect = "move";
-          setDropIndex(tabOrder.length);
-        }}
-      >
-        {dragKey !== null && dropIndex === tabOrder.length && dropMarker}
-      </div>
+      <div className="flex-1 self-stretch">{markerPending && dropMarker}</div>
 
       {menu && (() => {
         const session = sessions.find((s) => s.id === menu.sessionId);

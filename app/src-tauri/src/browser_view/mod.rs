@@ -468,17 +468,33 @@ async fn supervise(
     let _ = kill_dashboard(&container_id, &cli_entry).await;
 
     // Deregister, unless a newer session has already taken this project's slot.
-    {
+    let superseded = {
         let mut map = sessions.lock().await;
-        if map.get(&project_id).is_some_and(|s| s.epoch == epoch) {
-            map.remove(&project_id);
+        match map.get(&project_id) {
+            Some(session) if session.epoch == epoch => {
+                map.remove(&project_id);
+                false
+            }
+            // Someone else owns this project now: `stop` removes the session
+            // from the map *before* awaiting this task, and teardown below is
+            // seconds of Docker work, so a restart in that window is ordinary.
+            Some(_) => true,
+            None => false,
         }
+    };
+
+    // Everything past here speaks for the project as a whole, so a superseded
+    // supervisor must say nothing: closing the pop-out would destroy the *new*
+    // session's window, and the off-status would report a running view as
+    // stopped.
+    if superseded {
+        return;
     }
 
     // A pop-out outlives the tab, so nothing else would take it down: the
     // window would sit there showing a frozen last frame of a viewer that no
     // longer exists. The session owns it, and this is where the session ends.
-    popout::close(&app, &project_id);
+    let _ = popout::close(&app, &project_id);
 
     let enabled = manager().is_enabled(&project_id).await;
     emit(&app, &project_id, &BrowserViewStatus::off(enabled));
