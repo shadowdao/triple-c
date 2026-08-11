@@ -178,7 +178,7 @@ export default function MainTabs() {
   };
 
   const tabClass = (active: boolean, dragging: boolean) =>
-    `flex items-center gap-1.5 pl-3 pr-1.5 h-full text-xs cursor-pointer border-r border-[var(--border-color)] transition-colors ${
+    `flex items-center gap-1.5 pl-3 pr-1.5 h-full text-xs cursor-pointer select-none border-r border-[var(--border-color)] transition-colors ${
       active
         ? "bg-[var(--bg-primary)] text-[var(--text-primary)]"
         : "text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
@@ -402,7 +402,7 @@ export default function MainTabs() {
               if (e.key === "Enter") (e.target as HTMLInputElement).blur();
               if (e.key === "Escape") setRenamingId(null);
             }}
-            className="max-w-[180px] px-1 py-0 bg-[var(--bg-primary)] border border-[var(--accent)] rounded-[var(--radius-control)] text-xs text-[var(--text-primary)]"
+            className="max-w-[180px] px-1 py-0 select-text bg-[var(--bg-primary)] border border-[var(--accent)] rounded-[var(--radius-control)] text-xs text-[var(--text-primary)]"
           />
         ) : (
           <span className="truncate max-w-[180px]" title={displayLabel}>
@@ -465,7 +465,7 @@ export default function MainTabs() {
         <div
           aria-hidden="true"
           data-testid="tab-drag-ghost"
-          className="fixed z-50 flex items-center gap-1.5 px-3 h-8 text-xs rounded-[var(--radius-control)] bg-[var(--bg-primary)] text-[var(--text-primary)] border border-[var(--accent)] pointer-events-none"
+          className="fixed z-50 flex items-center gap-1.5 px-3 h-8 text-xs rounded-[var(--radius-control)] bg-[var(--bg-primary)] text-[var(--text-primary)] border border-[var(--accent)] pointer-events-none select-none"
           style={{
             left: ghost.x,
             top: ghost.y,

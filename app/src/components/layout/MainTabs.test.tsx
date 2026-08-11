@@ -127,6 +127,19 @@ describe("MainTabs reordering", () => {
     expect(useAppState.getState().activeTabKey).toBe(HOME);
   });
 
+  it("does not let a drag select the tab's text", () => {
+    // A pointer-driven drag is still a mouse drag as far as the browser is
+    // concerned, so without this the label highlights blue while you move it.
+    // The rename field is exempt — selecting there is the whole point.
+    render(<MainTabs />);
+    for (const tab of screen.getAllByRole("tab")) {
+      expect(tab.className).toContain("select-none");
+    }
+
+    fireEvent.doubleClick(screen.getAllByRole("tab")[1]);
+    expect(screen.getByLabelText("Rename tab").className).toContain("select-text");
+  });
+
   it("shows the tab itself under the cursor while dragging", () => {
     // A dimmed source tab and a thin line do not read as "I am holding this
     // tab" — the dragged copy is what makes the gesture legible.
