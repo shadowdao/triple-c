@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, ImageUpdateInfo, FileEntry, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo } from "./types";
+import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, ImageUpdateInfo, FileEntry, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, BrowserPageState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo } from "./types";
 
 // Docker
 export const checkDocker = () => invoke<boolean>("check_docker");
@@ -200,6 +200,77 @@ export const installBrowserViewBrowser = (
   projectId: string,
   browser: BrowserInstallTarget,
 ) => invoke<BrowserSetupOutcome>("install_browser_view_browser", { projectId, browser });
+
+/**
+ * Detach the live view into its own OS window, or raise it if already open.
+ *
+ * Window-only: the viewer, the proxy and the container are untouched, so
+ * popping out and back costs nothing. The window loads the same token-bearing
+ * loopback URL as the pane, and has no IPC access.
+ */
+export const openBrowserViewPopout = (projectId: string, alwaysOnTop: boolean) =>
+  invoke<void>("open_browser_view_popout", { projectId, alwaysOnTop });
+/** Close the pop-out and put the view back in the tab. No-op if it isn't open. */
+export const closeBrowserViewPopout = (projectId: string) =>
+  invoke<void>("close_browser_view_popout", { projectId });
+/**
+ * Whether the pop-out is open and whether it is pinned, read from the window.
+ *
+ * Asked on every mount: the pane is unmounted whenever another Project Home
+ * sub-tab is selected, while the window carries on — so neither fact can live
+ * in component state and survive.
+ */
+export const getBrowserViewPopoutState = (projectId: string) =>
+  invoke<BrowserViewPopoutState>("get_browser_view_popout_state", { projectId });
+/**
+ * Open a URL in a browser *inside* the container, published so the pane shows it.
+ *
+ * The same action serves an auth URL — the OAuth callback listener is in the
+ * container too, so the loop closes without the host — and a dev server on
+ * container loopback, which is how you watch a UI Claude is building. Only
+ * http/https; the backend rejects anything else.
+ *
+ * The viewer is started if it isn't already: asking for a page is asking to
+ * watch it, and leaving the user to go and press Start themselves — with no
+ * hint that they had to — is what the first version did.
+ */
+export const openPageInContainerBrowser = (
+  projectId: string,
+  url: string,
+  width: number,
+  height: number,
+  /** Also raise the pop-out window — for callers with no pane on screen. */
+  showWindow = false,
+) =>
+  invoke<BrowserPageState>("open_page_in_container_browser", {
+    projectId,
+    url,
+    width,
+    height,
+    showWindow,
+  });
+/** Resize that page. Real reflow, not a scaled screencast — see BrowserTab. */
+export const setContainerPageViewport = (projectId: string, width: number, height: number) =>
+  invoke<void>("set_container_page_viewport", { projectId, width, height });
+export const getContainerPageState = (projectId: string) =>
+  invoke<BrowserPageState>("get_container_page_state", { projectId });
+export const closeContainerPage = (projectId: string) =>
+  invoke<void>("close_container_page", { projectId });
+
+/**
+ * Make the page track the pop-out window's size as it is dragged.
+ *
+ * Only affects a page this app opened: a bound browser admits no second client,
+ * so one `@playwright/mcp` launched keeps the viewport it was given.
+ */
+export const setBrowserViewMatchWindow = (projectId: string, enabled: boolean) =>
+  invoke<void>("set_browser_view_match_window", { projectId, enabled });
+export const getBrowserViewMatchWindow = (projectId: string) =>
+  invoke<boolean>("get_browser_view_match_window", { projectId });
+
+/** Pin the pop-out above other windows — the point of popping it out at all. */
+export const setBrowserViewPopoutAlwaysOnTop = (projectId: string, onTop: boolean) =>
+  invoke<void>("set_browser_view_popout_always_on_top", { projectId, onTop });
 
 // Shared Claude Code auth token — one `claude setup-token` run authenticates
 // every Anthropic-backend project. The token itself is never exposed here: it

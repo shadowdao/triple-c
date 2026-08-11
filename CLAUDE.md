@@ -59,6 +59,17 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
 - **`store/appState.ts`** — Single Zustand store for all app state (projects, sessions, UI). The
   main area is a single ordered tab strip holding two tab kinds, keyed `term:<id>` and
   `home:<id>`; `activeSessionId` is *derived* from `activeTabKey` so exactly one thing is current.
+  `tabOrder` is user-reorderable (drag, or `Ctrl+Shift+←/→` via `moveActiveTab`) — so **never
+  treat a tab's position as identity**: address tabs by key, and index only through `tabOrder`.
+  `moveTab` deliberately does not activate what it moves.
+  - **The tab drag is pointer events, not HTML5 drag-and-drop, and must stay that way.** Tauri's
+    `dragDropEnabled` blocks HTML5 drag inside the webview on Windows, and it cannot simply be
+    turned off: `TerminalView` needs Tauri's native drag-drop event because it is the only one
+    that carries dropped *file paths*. An HTML5 drag also carries a `DataTransfer`, which the
+    default handler types into any text field the drag is released over.
+  - **A new app-level shortcut must not swallow a text-editing chord.** `useKeyboardShortcuts`
+    binds on `document` in the capture phase, so `inTextField()` guards the arrow bindings —
+    excluding xterm's helper textarea, which is an input-method shim rather than a field.
 - **`hooks/`** — All Tauri IPC calls are encapsulated in hooks (`useTerminal`, `useProjects`, `useDocker`, `useSettings`)
 - **`lib/tauri-commands.ts`** — Typed `invoke()` wrappers; TypeScript types in `lib/types.ts` must match Rust models
 - **`components/terminal/TerminalView.tsx`** — xterm.js integration with WebGL rendering, URL detection for OAuth flow
@@ -84,8 +95,10 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   Use `--text-disabled` rather than `disabled:opacity-50`.
 - **Never write `focus:outline-none`.** A global `:focus-visible` ring is defined in `index.css`.
 - **Status must not be encoded in colour alone** — `StatusIndicator` pairs a glyph with a word.
-- Keyboard: `Ctrl+T` new terminal, `Ctrl+Shift+W` close tab, `Ctrl+Tab` cycle, `Ctrl+1..9` jump.
-  `Ctrl+W` is intentionally left alone — it is readline's `kill-word` inside the terminal.
+- Keyboard: `Ctrl+T` new terminal, `Ctrl+Shift+W` close tab, `Ctrl+Tab` cycle, `Ctrl+1..9` jump,
+  `Ctrl+Shift+←/→` move the active tab. `Ctrl+W` is intentionally left alone — it is readline's
+  `kill-word` inside the terminal, and plain `Ctrl+←/→` is its word-wise cursor motion, which is
+  why tab-moving takes Shift.
 
 ### Backend Structure (`app/src-tauri/src/`)
 
@@ -104,6 +117,35 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   OAuth listener, wrong for remote control of a browser. Host ports are confined to
   `47820..=47827` because CSP `frame-src` cannot express a port range and must enumerate them;
   a unit test asserts the Rust range matches `tauri.conf.json`. Opt-in per project.
+  - **`popout.rs` puts the same URL in a second OS window** (`WebviewUrl::External`), so the view
+    can be watched on another monitor or pinned on top while the main window is used for work.
+    Three things it rests on: no capability lists that window, so it has **no IPC surface** — do
+    not give it one; the app CSP does not apply, because it is a top-level document rather than a
+    frame, and the token gate is what protects the port in both cases; and the window is owned by
+    the *session*, so the supervisor's teardown closes it rather than leaving a window onto a
+    viewer that no longer exists. It closes with `destroy()`, never `close()`, to stay clear of
+    `CloseRequested`. The pane drops its iframe while popped out — two viewers can both *drive*
+    the browser.
+  - **`page.rs` opens a page, which is the one thing the pane could not do.** A URL plus a
+    viewport: launch a browser in the container, `browser.bind()` it so the pane shows it, and
+    keep the handle. Serves auth (the OAuth callback listener is *in* the container, so a
+    container-side browser closes the loop with no host round trip and no auth bridge) and dev
+    servers on container loopback. **Verified: a second client cannot join a bound browser** —
+    `chromium.connect()` against the published endpoint times out in every URL form, because that
+    socket speaks the dashboard's transport, not the public connect protocol. So whoever launches
+    is the only process that can drive, which is why the helper is resident and why live resize
+    applies to pages *we* opened and never to `@playwright/mcp`'s (those take `--viewport-size` /
+    `PLAYWRIGHT_MCP_VIEWPORT_SIZE` at launch). Control is a polled JSON file in `/tmp` — no port,
+    no second listener — and a re-open with a helper already up *navigates* rather than
+    relaunching, so a session signed in on one page survives to the next.
+  - **Resizing the window does not resize the page.** The viewer is a CDP screencast: a bigger
+    window is the same pixels drawn larger. `page.setViewportSize()` is what reflows (measured
+    against a `@media (max-width: 900px)` rule), and match-window mode pushes the pop-out's
+    settled `Resized` size into it — debounced by generation counter, since a drag emits
+    continuously and each one costs a container exec.
+  - **`lib.rs`'s `on_window_event` fires for every window and must stay guarded on
+    `label() == "main"`.** Without that guard, closing a pop-out runs the app's shutdown: every
+    container stopped, process exited.
   - **Detection has to look past `node_modules`.** `claude mcp add … npx @playwright/mcp@latest`
     installs into `~/.npm/_npx/<hash>/node_modules`, not any `node_modules`, so `detect.rs`
     globs that cache as well as `/workspace`, `$HOME/node_modules` and `npm root -g`. It also

@@ -469,6 +469,15 @@ export interface PlaywrightDetection {
   /** Path to Google Chrome when the `chrome` channel — what `@playwright/mcp`
    *  asks for — is installed. It is an apt package, so it is never in `browsers`. */
   chrome_channel: string | null;
+  /** The Chromium the *viewer's* Playwright would launch, and whether it exists. */
+  chromium_executable: string | null;
+  chromium_executable_exists: boolean;
+  /** What a script's `require("playwright")` resolves to — routinely a different
+   *  copy, pinning a different browser revision. If its Chromium is missing,
+   *  every script Claude writes fails while the pane still looks green. */
+  script_playwright_version: string | null;
+  script_chromium_executable: string | null;
+  script_chromium_executable_exists: boolean;
   /** Module roots the probe searched, echoed back for the "not found" message.
    *  Includes the npx cache (`~/.npm/_npx/*​/node_modules`), which is where a
    *  Playwright installed through Claude Code's MCP setup actually lives. */
@@ -512,6 +521,47 @@ export interface BrowserViewStatus {
 export interface BrowserViewChangedEvent {
   project_id: string;
   status: BrowserViewStatus;
+}
+
+/**
+ * Mirrors Rust `PopoutState` — read from the window, never remembered.
+ *
+ * The pane is unmounted whenever another Project Home sub-tab is selected while
+ * the window carries on, so anything it holds in component state is stale by
+ * the time the user comes back.
+ */
+export interface BrowserViewPopoutState {
+  open: boolean;
+  always_on_top: boolean;
+}
+
+/** Mirrors Rust `page::Viewport` — CSS pixels, clamped backend-side. */
+export interface BrowserPageViewport {
+  width: number;
+  height: number;
+}
+
+/**
+ * Mirrors Rust `page::PageState`: what the container-side helper reports about
+ * the page Triple-C opened. `ready: false` with no error means there is none.
+ */
+export interface BrowserPageState {
+  ready: boolean;
+  url: string | null;
+  viewport: BrowserPageViewport | null;
+  error: string | null;
+}
+
+/**
+ * Payload of the `browser-view-popout-changed` event: a `BrowserViewPopoutState`
+ * plus the project it belongs to.
+ *
+ * The pop-out window can close without the pane asking — the user hits its X,
+ * or the session tears down and takes it — so this is the only reliable way to
+ * know whether it is on screen.
+ */
+export interface BrowserViewPopoutChangedEvent extends BrowserViewPopoutState {
+  project_id: string;
 }
 
 /** Payload of the `claude-token-progress` event: milestones during

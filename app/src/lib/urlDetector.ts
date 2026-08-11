@@ -3,8 +3,23 @@
  *
  * The Linux PTY hard-wraps long lines with \r\n at the terminal column width,
  * which breaks xterm.js WebLinksAddon URL detection. This class flattens
- * the buffer (stripping PTY wraps, converting blank lines to spaces) and
- * matches URLs with a single regex, firing a callback for ones >= 100 chars.
+ * the buffer (rejoining hard wraps, treating every other break as a
+ * terminator) and matches URLs with a single regex, firing a callback for ones
+ * >= 100 chars.
+ *
+ * ## Which line breaks may be deleted
+ *
+ * Only the ones the *terminal* inserted. A hard wrap happens at exactly the
+ * column width, so a line that reached the width was cut mid-token and its
+ * break must be removed to put the token back together; a line that stopped
+ * short ended for its own reasons and its break is a real separator.
+ *
+ * Deleting every break instead — which this did — glues unrelated output onto
+ * the end of a URL. Observed for real: a wrapped paragraph following a link
+ * became `…/tag/preview-63f3c54Butitprovesyournitpick…`, because a terminal
+ * that wraps at a space emits the break *instead of* the space, so removing
+ * the break removes the separator too. That candidate is a different URL from
+ * the one on screen, and the user is the one who has to notice.
  *
  * When a URL match extends to the end of the flattened buffer, emission is
  * deferred (more chunks may still be arriving). A confirmation timer emits
@@ -21,6 +36,45 @@ const MIN_URL_LENGTH = 100;
 
 export type UrlCallback = (url: string) => void;
 
+/**
+ * How wide the terminal is right now.
+ *
+ * A getter, not a number: the width changes with every window resize, and a
+ * stale one silently turns joining back into guesswork.
+ */
+export type ColumnsGetter = () => number;
+
+/**
+ * Rejoin the line breaks the terminal inserted; turn the rest into spaces.
+ *
+ * A line of exactly `columns` visible characters was cut by the terminal, so
+ * its break is deleted and the two halves are put back together. Anything
+ * shorter ended on its own and becomes a space — a URL cannot contain one, so
+ * that is also what stops a match running into whatever followed.
+ *
+ * `columns` of 0 or less means "not known yet"; nothing is rejoined, which
+ * costs a wrapped URL rather than inventing one.
+ *
+ * One case stays ambiguous and cannot be resolved here: a token that happens to
+ * end exactly at the width is indistinguishable from one the terminal cut, so
+ * the following line is joined to it. The candidate is still shown in full and
+ * confirmed by the user before anything opens.
+ */
+export function flatten(clean: string, columns: number): string {
+  const lines = clean.split(/\r?\n/);
+  let out = "";
+  for (let i = 0; i < lines.length; i++) {
+    out += lines[i];
+    if (i === lines.length - 1) break;
+    // `===`, not `>=`. A line *longer* than the width was never cut by the
+    // terminal — the stream simply contained no break there, so the break that
+    // follows it is the application's own and separates two things.
+    const wrapped = columns > 0 && lines[i].length === columns;
+    if (!wrapped) out += " ";
+  }
+  return out;
+}
+
 export class UrlDetector {
   private decoder = new TextDecoder();
   private buffer = "";
@@ -29,9 +83,11 @@ export class UrlDetector {
   private lastEmitted = "";
   private pendingUrl: string | null = null;
   private callback: UrlCallback;
+  private columns: ColumnsGetter;
 
-  constructor(callback: UrlCallback) {
+  constructor(callback: UrlCallback, columns: ColumnsGetter) {
     this.callback = callback;
+    this.columns = columns;
   }
 
   /** Feed raw PTY output chunks. */
@@ -61,12 +117,8 @@ export class UrlDetector {
     // 1. Strip ANSI escape sequences
     const clean = this.buffer.replace(ANSI_RE, "");
 
-    // 2. Flatten the buffer:
-    //    - Blank lines (2+ consecutive line breaks) → space (real paragraph break / URL terminator)
-    //    - Remaining \r and \n → removed (PTY hard-wrap artifacts)
-    const flat = clean
-      .replace(/(\r?\n){2,}/g, " ")
-      .replace(/[\r\n]/g, "");
+    // 2. Flatten the buffer: rejoin hard wraps, terminate on everything else.
+    const flat = flatten(clean, this.columns());
 
     if (!flat) return;
 

@@ -13,6 +13,15 @@ const setBrowserViewEnabled = vi.fn<() => Promise<BrowserViewStatus>>();
 const checkBrowserViewSupport = vi.fn<() => Promise<PlaywrightDetection>>();
 const installBrowserViewSupport = vi.fn<() => Promise<BrowserSetupOutcome>>();
 const installBrowserViewBrowser = vi.fn<(id: string, b: string) => Promise<BrowserSetupOutcome>>();
+const openBrowserViewPopout = vi.fn<(id: string, onTop: boolean) => Promise<void>>();
+const closeBrowserViewPopout = vi.fn<(id: string) => Promise<void>>();
+const getBrowserViewPopoutState =
+  vi.fn<() => Promise<{ open: boolean; always_on_top: boolean }>>();
+const setBrowserViewPopoutAlwaysOnTop = vi.fn<(id: string, onTop: boolean) => Promise<void>>();
+const openPageInContainerBrowser =
+  vi.fn<(id: string, url: string, w: number, h: number) => Promise<{ error: string | null }>>();
+const setBrowserViewMatchWindow = vi.fn<(id: string, on: boolean) => Promise<void>>();
+const getBrowserViewMatchWindow = vi.fn<() => Promise<boolean>>();
 const pushToast = vi.fn();
 const setContainerProgress = vi.fn();
 
@@ -22,6 +31,15 @@ vi.mock("../../../lib/tauri-commands", () => ({
   checkBrowserViewSupport: () => checkBrowserViewSupport(),
   installBrowserViewSupport: () => installBrowserViewSupport(),
   installBrowserViewBrowser: (id: string, b: string) => installBrowserViewBrowser(id, b),
+  openBrowserViewPopout: (id: string, onTop: boolean) => openBrowserViewPopout(id, onTop),
+  closeBrowserViewPopout: (id: string) => closeBrowserViewPopout(id),
+  getBrowserViewPopoutState: () => getBrowserViewPopoutState(),
+  setBrowserViewPopoutAlwaysOnTop: (id: string, onTop: boolean) =>
+    setBrowserViewPopoutAlwaysOnTop(id, onTop),
+  openPageInContainerBrowser: (id: string, url: string, w: number, h: number) =>
+    openPageInContainerBrowser(id, url, w, h),
+  setBrowserViewMatchWindow: (id: string, on: boolean) => setBrowserViewMatchWindow(id, on),
+  getBrowserViewMatchWindow: () => getBrowserViewMatchWindow(),
 }));
 
 vi.mock("@tauri-apps/api/event", () => ({
@@ -59,6 +77,11 @@ const NOTHING: PlaywrightDetection = {
   cli_entry: null,
   browsers: [],
   chrome_channel: null,
+  chromium_executable: null,
+  chromium_executable_exists: false,
+  script_playwright_version: null,
+  script_chromium_executable: null,
+  script_chromium_executable_exists: false,
   searched: [
     "/workspace",
     "/usr/lib/node_modules",
@@ -111,7 +134,36 @@ beforeEach(() => {
   storeState.containerProgress = {};
   getBrowserViewStatus.mockResolvedValue(OFF);
   checkBrowserViewSupport.mockResolvedValue(READY);
+  getBrowserViewPopoutState.mockResolvedValue({ open: false, always_on_top: false });
+  openBrowserViewPopout.mockResolvedValue(undefined);
+  closeBrowserViewPopout.mockResolvedValue(undefined);
+  setBrowserViewPopoutAlwaysOnTop.mockResolvedValue(undefined);
+  setBrowserViewMatchWindow.mockResolvedValue(undefined);
+  getBrowserViewMatchWindow.mockResolvedValue(false);
+  openPageInContainerBrowser.mockResolvedValue({ error: null });
 });
+
+const LIVE: BrowserViewStatus = {
+  ...OFF,
+  enabled: true,
+  state: "running",
+  url: "http://127.0.0.1:47820/index.html?ws=abc&token=SEKRIT",
+  host_port: 47820,
+  container_port: 39321,
+  started_at: "2026-08-09T10:00:00Z",
+};
+
+/** Render with the view already live, which is the only state that pops out. */
+async function renderLive() {
+  checkBrowserViewSupport.mockResolvedValue({ ...READY, browsers: ["chromium-1200"] });
+  setBrowserViewEnabled.mockResolvedValue(LIVE);
+  render(<BrowserTab project={project} active />);
+  await waitFor(() => expect(getBrowserViewStatus).toHaveBeenCalled());
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: /start browser view/i }));
+  });
+  await screen.findByTitle("Playwright browser view for api-server");
+}
 
 describe("BrowserTab", () => {
   it("does not offer to start anything while the container is stopped", async () => {
@@ -324,5 +376,199 @@ describe("BrowserTab", () => {
     await waitFor(() => expect(setBrowserViewEnabled).toHaveBeenCalled());
     expect(await screen.findByText("Off")).toBeInTheDocument();
     expect(screen.queryByTitle(/browser view for/i)).toBeNull();
+  });
+
+  it("names both halves when the installed browser isn\u2019t the one Playwright launches", async () => {
+    // The cache is full and every script fails \u2014 "install a browser" alone
+    // would read as nonsense, so the copy has to say which copy wants what.
+    checkBrowserViewSupport.mockResolvedValue({
+      ...READY,
+      browsers: ["chromium-1237"],
+      chromium_executable: "/home/claude/.cache/ms-playwright/chromium-1237/chrome-linux64/chrome",
+      chromium_executable_exists: true,
+      script_playwright_version: "1.62.1",
+      script_chromium_executable:
+        "/home/claude/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome",
+      script_chromium_executable_exists: false,
+    });
+
+    render(<BrowserTab project={project} active />);
+
+    expect(await screen.findByText(/isn\u2019t the one Playwright launches/i)).toBeInTheDocument();
+    // Both revisions appear in the explanation: what is installed, and what
+    // the failing copy actually wants.
+    expect(screen.getAllByText(/chromium-1237/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/chromium-1234/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/Set up Playwright/).length).toBeGreaterThan(0);
+  });
+
+  it("does not call an unanswered probe a skew", async () => {
+    // A container older than these fields omits them; unknown is not broken.
+    checkBrowserViewSupport.mockResolvedValue({ ...READY, browsers: ["chromium-1200"] });
+    getBrowserViewStatus.mockResolvedValue(LIVE);
+
+    render(<BrowserTab project={project} active />);
+
+    expect(await screen.findByTitle("Playwright browser view for api-server")).toBeInTheDocument();
+    expect(screen.queryByText(/isn\u2019t the one Playwright launches/i)).toBeNull();
+  });
+
+  it("only offers a window of its own once there is something to watch", async () => {
+    checkBrowserViewSupport.mockResolvedValue({ ...READY, browsers: ["chromium-1200"] });
+    render(<BrowserTab project={project} active />);
+    await waitFor(() => expect(getBrowserViewStatus).toHaveBeenCalled());
+    expect(screen.queryByRole("button", { name: /own window/i })).toBeNull();
+  });
+
+  it("pops the live view out, and drops the iframe so only one viewer drives", async () => {
+    await renderLive();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /own window/i }));
+    });
+
+    expect(openBrowserViewPopout).toHaveBeenCalledWith("p1", false);
+    // The window is showing it now — a second copy here would be a second
+    // cursor on the same page.
+    expect(screen.queryByTitle(/browser view for/i)).toBeNull();
+    expect(await screen.findByText(/in its own window/i)).toBeInTheDocument();
+    // Still live, and still stoppable from the tab.
+    expect(screen.getByText("Live")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Stop" })).toBeInTheDocument();
+  });
+
+  it("puts the view back in the tab when the window is closed from here", async () => {
+    await renderLive();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /own window/i }));
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getAllByRole("button", { name: /put back in tab/i })[0]);
+    });
+
+    expect(closeBrowserViewPopout).toHaveBeenCalledWith("p1");
+    expect(await screen.findByTitle("Playwright browser view for api-server")).toBeInTheDocument();
+  });
+
+  it("pins the window on top on request", async () => {
+    await renderLive();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /own window/i }));
+    });
+
+    await act(async () => {
+      // The accessible name is the visible text, as with every other Toggle.
+      fireEvent.click(screen.getByRole("switch", { name: "Keep on top" }));
+    });
+
+    expect(setBrowserViewPopoutAlwaysOnTop).toHaveBeenCalledWith("p1", true);
+  });
+
+  it("keeps a pop-out that outlived the tab, rather than showing an empty pane", async () => {
+    // The window belongs to the backend, so remounting the pane has to read its
+    // state back — otherwise the pane would render an iframe alongside it.
+    getBrowserViewPopoutState.mockResolvedValue({ open: true, always_on_top: true });
+    checkBrowserViewSupport.mockResolvedValue({ ...READY, browsers: ["chromium-1200"] });
+    getBrowserViewStatus.mockResolvedValue(LIVE);
+
+    render(<BrowserTab project={project} active />);
+
+    expect(await screen.findByText(/in its own window/i)).toBeInTheDocument();
+    expect(screen.queryByTitle(/browser view for/i)).toBeNull();
+    // The pin is read from the window too — the pane is unmounted every time
+    // another sub-tab is selected, so remembering it would show Off over a
+    // window that is still floating on top.
+    expect(screen.getByRole("switch", { name: "Keep on top" })).toBeChecked();
+  });
+
+  it("never mounts the iframe before the window's state is known", async () => {
+    // The status and the pop-out state are two separate round trips. If the
+    // status wins the race, guessing "not popped out" would flash a second
+    // viewer onto a browser the window is already driving.
+    checkBrowserViewSupport.mockResolvedValue({ ...READY, browsers: ["chromium-1200"] });
+    getBrowserViewStatus.mockResolvedValue(LIVE);
+    let answer: (s: { open: boolean; always_on_top: boolean }) => void = () => {};
+    getBrowserViewPopoutState.mockReturnValue(
+      new Promise((resolve) => {
+        answer = resolve;
+      }),
+    );
+
+    render(<BrowserTab project={project} active />);
+    await waitFor(() => expect(screen.getByText("Live")).toBeInTheDocument());
+    expect(screen.queryByTitle(/browser view for/i)).toBeNull();
+
+    await act(async () => {
+      answer({ open: false, always_on_top: false });
+    });
+    expect(await screen.findByTitle("Playwright browser view for api-server")).toBeInTheDocument();
+  });
+
+  it("opens a page in the container’s browser at the chosen viewport", async () => {
+    await renderLive();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /open a page/i }));
+    });
+    fireEvent.change(screen.getByLabelText(/^URL$/i), {
+      target: { value: "http://localhost:5173" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "1920 × 1080" }));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /open page/i }));
+    });
+
+    expect(openPageInContainerBrowser).toHaveBeenCalledWith(
+      "p1",
+      "http://localhost:5173",
+      1920,
+      1080,
+    );
+  });
+
+  it("refuses a URL scheme the backend would reject, before the round trip", async () => {
+    await renderLive();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /open a page/i }));
+    });
+    fireEvent.change(screen.getByLabelText(/^URL$/i), {
+      target: { value: "file:///etc/passwd" },
+    });
+
+    expect(screen.getByRole("button", { name: /open page/i })).toBeDisabled();
+    expect(screen.getByText(/Only http:\/\/ and https:\/\//)).toBeInTheDocument();
+    expect(openPageInContainerBrowser).not.toHaveBeenCalled();
+  });
+
+  it("offers match-window only once the view is in its own window", async () => {
+    await renderLive();
+    expect(screen.queryByRole("switch", { name: "Match window" })).toBeNull();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /own window/i }));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("switch", { name: "Match window" }));
+    });
+
+    expect(setBrowserViewMatchWindow).toHaveBeenCalledWith("p1", true);
+  });
+
+  it("says why the window wouldn’t open instead of pretending it did", async () => {
+    await renderLive();
+    openBrowserViewPopout.mockRejectedValue("no display");
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /own window/i }));
+    });
+
+    expect(pushToast).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "error", detail: "no display" }),
+    );
+    // The view is still in the tab, where it was.
+    expect(screen.getByTitle("Playwright browser view for api-server")).toBeInTheDocument();
   });
 });

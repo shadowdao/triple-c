@@ -3,6 +3,22 @@ import { useAppState, isTerminalTab, tabKeyId } from "../store/appState";
 import { useTerminal } from "./useTerminal";
 
 /**
+ * Whether the focus is in something the user is editing text in.
+ *
+ * xterm's hidden textarea is deliberately excluded: it is an input-method
+ * shim, not a field anyone edits word-wise, and the terminal is exactly where
+ * the tab shortcuts need to keep working.
+ */
+function inTextField(el: Element | null): boolean {
+  if (!el || el.closest(".xterm")) return false;
+  return (
+    el.tagName === "INPUT" ||
+    el.tagName === "TEXTAREA" ||
+    (el as HTMLElement).isContentEditable === true
+  );
+}
+
+/**
  * App-level shortcuts. Registered on `document` in the *capture* phase so they
  * win over xterm.js, which would otherwise forward them to the shell inside
  * the container.
@@ -11,6 +27,7 @@ import { useTerminal } from "./useTerminal";
  *   Ctrl+Shift+W  close the active tab
  *   Ctrl+Tab      next tab (Ctrl+Shift+Tab for previous)
  *   Ctrl+1..9     jump to the nth tab
+ *   Ctrl+Shift+←/→  move the active tab along the strip
  */
 export function useKeyboardShortcuts() {
   const { open: openTerminal, close: closeTerminal } = useTerminal();
@@ -48,6 +65,22 @@ export function useKeyboardShortcuts() {
         } else {
           state.closeHomeTab(tabKeyId(key));
         }
+        return;
+      }
+
+      // Ctrl+Shift+←/→ — move the active tab, the keyboard route to what
+      // dragging a tab does. Shift is what keeps it clear of the terminal:
+      // Ctrl+←/→ is readline's word-wise cursor motion.
+      //
+      // In a text field this chord already means "extend the selection by a
+      // word", which is not ours to take: swallowing it would make word-wise
+      // selection impossible in every input in the app *and* silently reorder
+      // the strip each time someone tried it.
+      if (e.shiftKey && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
+        if (!state.activeTabKey || inTextField(document.activeElement)) return;
+        e.preventDefault();
+        e.stopPropagation();
+        state.moveActiveTab(e.key === "ArrowLeft" ? -1 : 1);
         return;
       }
 

@@ -73,14 +73,33 @@ use crate::docker::exec::{
 
 use super::detect::{self, PlaywrightDetection};
 
-/// The two packages the pane genuinely needs, pinned to `@latest` because
-/// `browser.bind()` is recent and the viewer tracks it.
+/// The viewer package — installed **first**, and it decides the version of
+/// `playwright` installed after it.
 ///
-/// This is the *minimum* set. A user who followed the old guidance ended up
-/// with a global install as well as these; only these are required. Note what
-/// is not here: `@playwright/mcp` is Claude's MCP configuration to make, not
-/// this pane's, and it contributes nothing to serving a viewer.
-pub const PACKAGES: [&str; 2] = ["playwright@latest", "@playwright/cli@latest"];
+/// `@playwright/mcp` is deliberately not part of the set: it is Claude's MCP
+/// configuration to make, and it contributes nothing to serving a viewer.
+///
+/// **Order matters here, and `playwright` is deliberately not `@latest`.**
+///
+/// Installing both at `@latest` produces a tree that looks right and is broken.
+/// Verified on a real container: `@playwright/cli@0.1.18` pins
+/// `playwright-core@1.63.0-alpha`, npm hoists that to the root, and
+/// `playwright@latest` (1.62.1) then nests its own `playwright-core@1.62.1`
+/// beside it. The two cores want *different browser revisions*. The browser
+/// step runs the resolved — hoisted — CLI, so it downloads 1237; every script
+/// Claude writes says `require("playwright")`, gets the nested 1.62.1, and dies
+/// with "Executable doesn't exist … chromium_headless_shell-1234". The pane
+/// meanwhile reports a browser installed, because one is.
+///
+/// So the viewer package goes first and its own pinned `playwright` version is
+/// what gets installed second — one core, one browser revision, both halves
+/// agreeing. See [`pinned_playwright_spec`].
+pub const VIEWER_PACKAGE: &str = "@playwright/cli@latest";
+
+/// Fallback when the viewer's manifest can't be read: better a possibly-skewed
+/// tree than no Playwright at all, and [`detect`](super::detect) reports the
+/// skew either way.
+pub const PLAYWRIGHT_FALLBACK: &str = "playwright@latest";
 
 /// Where the packages are installed. Container storage, not a bind mount — see
 /// the module docs.
@@ -213,48 +232,32 @@ pub async fn install_packages(
     emit_progress(
         app,
         project_id,
-        &format!(
-            "Installing playwright and @playwright/cli into {}/node_modules…",
-            INSTALL_DIR
-        ),
+        &format!("Installing @playwright/cli into {}/node_modules…", INSTALL_DIR),
     );
 
-    // `env VAR=… cmd` rather than an exec env: it keeps the one exec path in
-    // `docker/exec.rs` untouched, and `env` is a real binary so no shell is
-    // involved. The guard matters because these are `@latest`: current
-    // Playwright has no postinstall (verified — `playwright@1.62.1` declares no
-    // `scripts` at all), but if a future release brings the browser download
-    // back, this step must stay small and the download must stay the step the
-    // user explicitly asked for.
-    let mut cmd = vec![
-        "env".to_string(),
-        "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1".to_string(),
-        "npm".to_string(),
-        "install".to_string(),
-        // Leaves any package.json and lockfile at /workspace untouched.
-        "--no-save".to_string(),
-        "--no-fund".to_string(),
-        "--no-audit".to_string(),
-    ];
-    cmd.extend(PACKAGES.iter().map(|p| p.to_string()));
-
-    let step = run_step(
-        app,
-        project_id,
-        container_id,
-        "claude",
-        INSTALL_DIR,
-        cmd,
-        NPM_TIMEOUT,
-    )
-    .await?;
+    let mut step = npm_install(app, project_id, container_id, VIEWER_PACKAGE).await?;
     if step.exit_code != 0 {
         return Err(format!(
-            "npm couldn't install Playwright in this container (exit {}).\n\nnpm said:\n{}",
+            "npm couldn't install the viewer package in this container (exit {}).\n\nnpm said:\n{}",
             step.exit_code,
             step.log_or("it produced no output at all")
         ));
     }
+
+    // Second, `playwright` at the version the viewer package pins — see
+    // `VIEWER_PACKAGE`. Installing it as `@latest` is what splits the tree.
+    let spec = pinned_playwright_spec(container_id).await;
+    emit_progress(app, project_id, &format!("Installing {}…", spec));
+    let second = npm_install(app, project_id, container_id, &spec).await?;
+    if second.exit_code != 0 {
+        return Err(format!(
+            "npm couldn't install {} in this container (exit {}).\n\nnpm said:\n{}",
+            spec,
+            second.exit_code,
+            second.log_or("it produced no output at all")
+        ));
+    }
+    step.log = merge_logs(step.log, second.log);
 
     emit_progress(app, project_id, "Re-checking what the container has…");
     let detection = detect::detect(container_id).await?;
@@ -265,7 +268,12 @@ pub async fn install_packages(
     // saying so here is what stops someone walking away from a pane that will
     // never show them anything.
     let mut warning = detection.blocker();
-    if detection.needs_browser() {
+    // Skew outranks "no browser": a container in that state *has* browsers, and
+    // telling someone to install one they can see already installed is how a
+    // real user ends up doing it three times.
+    if let Some(skew) = detection.skew_message() {
+        warning = merge(warning, skew);
+    } else if detection.needs_browser() {
         warning = merge(
             warning,
             "Playwright is installed, but this container has no browser to drive yet. Install \
@@ -280,6 +288,87 @@ pub async fn install_packages(
         log: step.log,
         browser_launched: None,
     })
+}
+
+/// One `npm install` of one spec, into [`INSTALL_DIR`], as `claude`.
+///
+/// `env VAR=… cmd` rather than an exec env: it keeps the one exec path in
+/// `docker/exec.rs` untouched, and `env` is a real binary so no shell is
+/// involved. The guard matters because these are `@latest`: current Playwright
+/// has no postinstall (verified — `playwright@1.62.1` declares no `scripts` at
+/// all), but if a future release brings the browser download back, this step
+/// must stay small and the download must stay the step the user asked for.
+async fn npm_install(
+    app: &AppHandle,
+    project_id: &str,
+    container_id: &str,
+    spec: &str,
+) -> Result<StepResult, String> {
+    let cmd = vec![
+        "env".to_string(),
+        "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1".to_string(),
+        "npm".to_string(),
+        "install".to_string(),
+        // Leaves any package.json and lockfile at /workspace untouched.
+        "--no-save".to_string(),
+        "--no-fund".to_string(),
+        "--no-audit".to_string(),
+        spec.to_string(),
+    ];
+    run_step(
+        app,
+        project_id,
+        container_id,
+        "claude",
+        INSTALL_DIR,
+        cmd,
+        NPM_TIMEOUT,
+    )
+    .await
+}
+
+/// The `playwright` spec to install: the exact version `@playwright/cli`
+/// depends on, so both halves share one `playwright-core`.
+///
+/// Read from the manifest npm just wrote rather than guessed, and falling back
+/// to `@latest` when it can't be read — an unreadable manifest is a reason to
+/// install something, not nothing.
+async fn pinned_playwright_spec(container_id: &str) -> String {
+    let script = format!(
+        "try{{const d=require('{}/node_modules/@playwright/cli/package.json').dependencies||{{}};\
+         process.stdout.write(d.playwright||'');}}catch(e){{}}",
+        INSTALL_DIR
+    );
+    let (out, _code) = exec_oneshot_as(
+        container_id,
+        "claude",
+        vec!["node".to_string(), "-e".to_string(), script],
+        Vec::new(),
+    )
+    .await
+    .unwrap_or_default();
+
+    let version: &str = out.trim();
+    // A version, not a range or a URL: anything else goes to the fallback
+    // rather than into an npm command line.
+    if !version.is_empty()
+        && version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
+    {
+        format!("playwright@{}", version)
+    } else {
+        PLAYWRIGHT_FALLBACK.to_string()
+    }
+}
+
+/// Keep both npm runs' output, so a failure in either is diagnosable.
+fn merge_logs(first: String, second: String) -> String {
+    match (first.trim().is_empty(), second.trim().is_empty()) {
+        (true, _) => second,
+        (_, true) => first,
+        _ => format!("{}\n{}", first.trim_end(), second),
+    }
 }
 
 /// Install a browser: its system libraries first, then the browser, then prove
@@ -865,10 +954,20 @@ mod tests {
     fn the_package_set_is_the_minimum_that_satisfies_the_probe() {
         // The viewer package is not optional, and `@playwright/mcp` is not a
         // member: it can bind sessions, it can never serve the UI.
-        assert!(PACKAGES.iter().any(|p| p.starts_with("playwright@")));
-        assert!(PACKAGES.iter().any(|p| p.starts_with("@playwright/cli@")));
-        assert!(!PACKAGES.iter().any(|p| p.contains("@playwright/mcp")));
-        assert_eq!(PACKAGES.len(), 2);
+        assert!(VIEWER_PACKAGE.starts_with("@playwright/cli@"));
+        assert!(PLAYWRIGHT_FALLBACK.starts_with("playwright@"));
+        assert!(!VIEWER_PACKAGE.contains("@playwright/mcp"));
+    }
+
+    #[test]
+    fn playwright_is_not_installed_at_latest_alongside_the_viewer() {
+        // `@latest` for both is exactly what splits the tree into two
+        // `playwright-core`s wanting different browser revisions — the viewer
+        // green, every `require("playwright")` dead. The version comes from the
+        // viewer's own manifest instead; `@latest` is only the fallback for an
+        // unreadable one.
+        assert!(!VIEWER_PACKAGE.contains("playwright@latest"));
+        assert_eq!(PLAYWRIGHT_FALLBACK, "playwright@latest");
     }
 
     #[test]

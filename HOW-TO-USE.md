@@ -191,6 +191,12 @@ Anthropic-backend project uses that token without its own login. See
   terminal tab to rename it, jump to its project home, or close it; double-click to rename inline.
   There is no separate terminal tab bar and no "+" button — tabs appear when you open a project or
   a terminal.
+
+  **Drag a tab to reorder it.** A line shows where it will land; **Escape** abandons the drag.
+  Dropping does not change which tab you are looking at — so you can rearrange the strip without
+  pulling focus away from a terminal that is mid-run. `Ctrl+Shift+←` and `Ctrl+Shift+→` move the
+  *active* tab the same way without the mouse (they leave text fields alone, where that chord
+  still selects by word). The order is per-session: it is not saved when you quit.
 - **Status indicators (top right)** — Docker connection and container image availability. Each pairs
   a coloured dot with a word, so status is never conveyed by colour alone. The **?** button opens
   the built-in help.
@@ -211,7 +217,7 @@ for selecting a project and for two quick controls that appear on hover — star
 Claude terminal. Everything else about a project lives in Project Home.
 
 The header shows the project name, its status, how long the container has been up, and the action
-buttons. Below that are five tabs:
+buttons. Below that are six tabs:
 
 | Tab | What it's for |
 |---|---|
@@ -220,6 +226,7 @@ buttons. Below that are five tabs:
 | **Automation** | The scheduled tasks running inside this container — see [Automation & Scheduled Tasks](#automation--scheduled-tasks) |
 | **Config** | All per-project configuration — see [Project Configuration](#project-configuration) |
 | **Files** | Browse, download and upload files inside the container |
+| **Browser** | Watch — and take over — the browser Claude is driving with Playwright, see [The Browser Tab](#the-browser-tab) |
 
 ### Sessions
 
@@ -256,6 +263,61 @@ included, and each tile opens a list of what it found.
 > `/plugins`, `/mcp` and friends directly.
 
 The counts are only available while the container is running.
+
+### The Browser Tab
+
+When Claude drives a browser with Playwright inside the container, the **Browser** tab shows you
+that browser live — and lets you take it over with your own mouse and keyboard.
+
+It is **off by default and opted into per project**, and it never installs anything on its own.
+Opening the tab only *probes* the container, so it can tell you what is missing before you ask for
+a view; installing Playwright and downloading a browser are separate, labelled buttons that state
+what they cost before you press them. See
+[What's Inside the Container](#whats-inside-the-container) for why the browser itself is not
+pre-installed.
+
+Press **Start browser view** and the pane fills with Playwright's own dashboard, running inside the
+container and reached over a token-gated listener on your machine's loopback address. Nothing is
+exposed off the machine.
+
+#### Opening a page yourself
+
+**Open a page…** launches a browser inside the container at a URL and viewport you choose, and
+publishes it to this pane. Two uses:
+
+- **A sign-in page.** The callback the tool is waiting for is a listener *inside* the container, so
+  a container-side browser completes the login without anything crossing to your host browser.
+  When a long URL appears in a terminal, the prompt that offers to open it on your host now also
+  offers **In container**, which does the same thing in one click.
+- **A dev server.** `http://localhost:5173` inside the container is reachable with no port mapping
+  and nothing exposed to your network — which is how you watch a UI Claude is building, and click
+  around it yourself.
+
+The **viewport** is the page's own resolution, and it is not the same thing as the window size.
+The pane shows a video of the browser, so a bigger window draws the same pixels larger; changing
+the viewport is what makes the layout actually reflow. Pick a preset or type a size.
+
+Note the limit, because it is not obvious: a browser Claude opened through `@playwright/mcp` can
+be *watched* but not resized — a published browser admits only the client that launched it. Set
+its size with `PLAYWRIGHT_MCP_VIEWPORT_SIZE=1920x1080` in the project's environment variables
+instead.
+
+#### Watching it while you work
+
+Press **Open in own window** and the view moves out of the tab into a window of its own — put it on
+a second monitor, or turn on **Keep on top** and let it float above the app while you work in a
+terminal. **Match window** goes further: the page's viewport follows the window as you drag it, so
+the pop-out becomes a responsive-design ruler. It applies to pages opened with **Open a page…**,
+for the reason above. This is a window change only: the browser and the view keep running throughout, so
+popping out and back costs nothing and interrupts nothing.
+
+While the view is in its own window the tab shows a placeholder rather than a second copy of it —
+two viewers would both be able to *drive* the browser, and two cursors on one page is not useful.
+**Put back in tab**, or just closing the window, brings it back.
+
+The window belongs to the view, not to the tab: closing the project's home tab leaves it open, and
+stopping the view — by pressing **Stop**, stopping the container, or removing the project — closes
+it, because a window showing a viewer that no longer exists is worse than no window.
 
 ---
 
@@ -1119,6 +1181,7 @@ triple-c-scheduler add --name "test" --schedule "0 */6 * * *" --prompt "Run test
 | **Ctrl+Tab** | Switch to the next tab |
 | **Ctrl+Shift+Tab** | Switch to the previous tab |
 | **Ctrl+1** … **Ctrl+9** | Jump to the first through ninth tab |
+| **Ctrl+Shift+←** / **Ctrl+Shift+→** | Move the active tab one place along the strip (the mouse equivalent is dragging it) |
 
 > **Why Ctrl+Shift+W and not Ctrl+W?** `Ctrl+W` is readline's `kill-word` — it deletes the word
 > before the cursor, and it is used constantly in the terminal this app is built around. Binding it

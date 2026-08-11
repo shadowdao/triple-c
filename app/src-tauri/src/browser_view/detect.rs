@@ -93,6 +93,32 @@ pub struct PlaywrightDetection {
     /// user's own scripts and not for the MCP plugin.
     #[serde(default)]
     pub chrome_channel: Option<String>,
+    /// The Chromium binary the *resolved* Playwright would launch, asked of the
+    /// build itself rather than derived from the cache listing.
+    #[serde(default)]
+    pub chromium_executable: Option<String>,
+    /// Whether that binary is actually on disk.
+    ///
+    /// False with a non-empty [`Self::browsers`] is the revision-skew case: two
+    /// Playwright copies in one container pin different revisions, so the cache
+    /// can be full of browsers and every launch still fail.
+    #[serde(default)]
+    pub chromium_executable_exists: bool,
+    /// The version a *script's* `require("playwright")` resolves to.
+    ///
+    /// Tracked separately from [`Self::playwright_version`] because they are
+    /// routinely different in one directory: `@playwright/cli` pins its own
+    /// `playwright-core`, npm hoists that, and a separately-installed
+    /// `playwright` then nests a second core beside it. The viewer uses one,
+    /// Claude's scripts use the other.
+    #[serde(default)]
+    pub script_playwright_version: Option<String>,
+    /// The Chromium that copy would launch, and whether it is there. This is
+    /// the pair that decides whether a script Claude writes actually runs.
+    #[serde(default)]
+    pub script_chromium_executable: Option<String>,
+    #[serde(default)]
+    pub script_chromium_executable_exists: bool,
     /// Where the probe looked, echoed back for the "not found" message.
     #[serde(default)]
     pub searched: Vec<String>,
@@ -155,13 +181,82 @@ impl PlaywrightDetection {
         None
     }
 
+    /// The revision-skew sentence, for the pane's browser step.
+    ///
+    /// Separate from [`Self::blocker`] because it does not block the *viewer* —
+    /// the dashboard runs fine; it is the browser that cannot start. Names both
+    /// halves, because "install a browser" over a cache that visibly already
+    /// has one reads as nonsense without them.
+    pub fn skew_message(&self) -> Option<String> {
+        if !self.revision_skew() {
+            return None;
+        }
+        // Which half is broken changes what the user sees, so say the one that
+        // is. The scripts case is the one that looks like a lie: the pane is
+        // green, the viewer works, and every script Claude writes dies.
+        if self.scripts_cannot_launch() {
+            return Some(format!(
+                "This container has {}, and the viewer works — but `require(\"playwright\")` \
+                 resolves Playwright {}, which launches {}. That file isn't there, so every \
+                 script Claude writes fails with “Executable doesn't exist”. Two copies ended \
+                 up in one tree: `@playwright/cli` pins its own `playwright-core`, and a \
+                 separately-installed `playwright` nests a second one beside it. “Set up \
+                 Playwright” below reinstalls them as one consistent set.",
+                self.browsers.join(", "),
+                self.script_playwright_version.as_deref().unwrap_or("?"),
+                self.script_chromium_executable.as_deref().unwrap_or("?"),
+            ));
+        }
+        Some(format!(
+            "This container has {}, but Playwright {} launches {} — which isn't there, so \
+             every `chromium.launch()` fails with “Executable doesn't exist”. That happens \
+             when two Playwright copies share a container (typically an npx `@playwright/mcp` \
+             alongside this one); each pins its own browser revision. “Install Chromium” below \
+             fetches the revision this build needs — it runs that build's own installer, so it \
+             cannot pick the wrong one again.",
+            self.browsers.join(", "),
+            self.playwright_version.as_deref().unwrap_or("?"),
+            self.chromium_executable.as_deref().unwrap_or("?"),
+        ))
+    }
+
     /// Whether Playwright is present but has no browser at all to drive —
     /// neither a downloaded bundle nor the Chrome channel. Advisory: the viewer
     /// still runs, it just has nothing to show until a browser is bound.
     pub fn needs_browser(&self) -> bool {
         self.playwright_version.is_some()
-            && self.browsers.is_empty()
             && self.chrome_channel.is_none()
+            && (self.browsers.is_empty() || self.revision_skew())
+    }
+
+    /// Browsers are installed, but not the revision this Playwright launches.
+    ///
+    /// The container looks equipped and every `chromium.launch()` fails with
+    /// "Executable doesn't exist". It happens whenever two Playwright copies
+    /// share a container — the npx `@playwright/mcp` one and a `/workspace`
+    /// one — because each pins its own revision and installs into the same
+    /// cache. The install action fixes it: it runs the *resolved* build's own
+    /// CLI, so it fetches exactly the revision that was missing.
+    ///
+    /// Requires the probe to have answered: an older container image, or a
+    /// Playwright too broken to `require`, leaves `chromium_executable` unset,
+    /// and "didn't answer" must not read as "skewed".
+    pub fn revision_skew(&self) -> bool {
+        !self.browsers.is_empty() && (self.viewer_cannot_launch() || self.scripts_cannot_launch())
+    }
+
+    /// The copy serving the viewer would not find its browser.
+    fn viewer_cannot_launch(&self) -> bool {
+        self.chromium_executable.is_some() && !self.chromium_executable_exists
+    }
+
+    /// `require("playwright")` — what every script Claude writes uses — would
+    /// not find its browser. Independent of the above, and the more common of
+    /// the two: `@playwright/cli` pins a `playwright-core`, npm hoists it, and
+    /// a separately-installed `playwright` nests a second one that no browser
+    /// was ever downloaded for.
+    fn scripts_cannot_launch(&self) -> bool {
+        self.script_chromium_executable.is_some() && !self.script_chromium_executable_exists
     }
 
     /// The searched roots as prose, so a message never trails off into "Looked
@@ -277,6 +372,30 @@ const PROBE: &str = concat!(
     // the pane claim a browser is present when none is.
     r#"try{const bd=process.env.PLAYWRIGHT_BROWSERS_PATH||(home?path.join(home,".cache","ms-playwright"):null);"#,
     r#"if(bd)out.browsers=fs.readdirSync(bd).filter((n)=>/^(chromium|firefox|webkit)/.test(n)).sort();}catch(e){}"#,
+    // What this Playwright would *actually launch*, and whether it is there.
+    //
+    // A cache listing is not the same question. Two Playwright copies in one
+    // container — the npx `@playwright/mcp` one and a `/workspace` one — pin
+    // different browser revisions, and each installs its own. So the cache can
+    // hold `chromium-1237` while the resolved build wants `chromium-1234` and
+    // every `chromium.launch()` dies with "Executable doesn't exist", *while
+    // the pane reports a browser installed*. Asking the build itself sidesteps
+    // revision arithmetic entirely: this is the path a launch would use.
+    r#"const exe=(dir)=>{try{const bt=require(dir).chromium;"#,
+    r#"const ep=bt&&bt.executablePath?bt.executablePath():null;"#,
+    r#"return ep?[ep,fs.existsSync(ep)]:null;}catch(e){return null;}};"#,
+    r#"if(core){const r=exe(path.dirname(core));"#,
+    r#"if(r){out.chromium_executable=r[0];out.chromium_executable_exists=r[1];}}"#,
+    // And separately: what a *script* gets. `require("playwright")` is what
+    // every Playwright example writes, and it resolves the wrapper — which
+    // carries its own nested `playwright-core` whenever npm could not settle on
+    // one version. That copy can want a different browser revision than the one
+    // the viewer's copy installed, so it is asked its own question.
+    r#"try{const w=res("playwright/package.json");"#,
+    r#"if(w){const j=JSON.parse(fs.readFileSync(w,"utf8"));out.script_playwright_version=j.version;"#,
+    r#"const wc=at("playwright-core/package.json",path.dirname(w));"#,
+    r#"const r=exe(path.dirname(wc||w));"#,
+    r#"if(r){out.script_chromium_executable=r[0];out.script_chromium_executable_exists=r[1];}}}catch(e){}"#,
     // The Chrome *channel* is an apt package, not a Playwright download, so it
     // is looked for where apt puts it.
     r#"try{for(const p of ["/usr/bin/google-chrome-stable","/usr/bin/google-chrome","/opt/google/chrome/chrome"]){"#,
@@ -465,6 +584,66 @@ mod tests {
     fn the_probe_looks_for_the_chrome_channel_where_apt_puts_it() {
         assert!(PROBE.contains("google-chrome-stable"), "{}", PROBE);
         assert!(PROBE.contains("/opt/google/chrome/chrome"), "{}", PROBE);
+    }
+
+    #[test]
+    fn the_probe_asks_playwright_what_it_would_launch() {
+        // Not derived from the cache listing — asked of the build, because the
+        // cache can hold a browser this build will never launch.
+        assert!(PROBE.contains("executablePath"), "{}", PROBE);
+        assert!(PROBE.contains("out.chromium_executable_exists"), "{}", PROBE);
+    }
+
+    /// A container carrying browsers from a *different* Playwright copy.
+    fn skewed() -> PlaywrightDetection {
+        parse_probe_output(&payload(concat!(
+            r#"{"node_version":"22.11.0","playwright_version":"1.62.1","has_bind":true,"#,
+            r#""cli_version":"0.1.18","cli_entry":"/g/cli.js","browsers":["chromium-1237"],"#,
+            r#""chromium_executable":"/home/claude/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome","#,
+            r#""chromium_executable_exists":false}"#,
+        )))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_browser_cache_full_of_the_wrong_revision_counts_as_no_browser() {
+        let d = skewed();
+        // The viewer still serves — it is the browser that cannot start.
+        assert!(d.is_usable());
+        assert_eq!(d.blocker(), None);
+        assert!(d.revision_skew());
+        assert!(d.needs_browser(), "a browser that cannot launch is not a browser");
+    }
+
+    #[test]
+    fn the_skew_message_names_both_revisions_and_the_way_out() {
+        let msg = skewed().skew_message().unwrap();
+        assert!(msg.contains("chromium-1237"), "{}", msg); // what is there
+        assert!(msg.contains("chromium-1234"), "{}", msg); // what it wants
+        assert!(msg.contains("Install Chromium"), "{}", msg); // what fixes it
+    }
+
+    #[test]
+    fn the_chrome_channel_covers_a_skewed_cache() {
+        // The channel is an apt binary at a fixed path, so a revision mismatch
+        // cannot affect it: there is still something to drive.
+        let mut d = skewed();
+        d.chrome_channel = Some("/usr/bin/google-chrome-stable".to_string());
+        assert!(!d.needs_browser());
+    }
+
+    #[test]
+    fn a_probe_that_could_not_answer_is_not_reported_as_skew() {
+        // Older container, or a Playwright too broken to `require`: unset is
+        // "unknown", and unknown must never render as "your browsers are wrong".
+        let d = parse_probe_output(&payload(concat!(
+            r#"{"node_version":"22.11.0","playwright_version":"1.62.1","has_bind":true,"#,
+            r#""cli_version":"0.1.18","cli_entry":"/g/cli.js","browsers":["chromium-1237"]}"#,
+        )))
+        .unwrap();
+        assert!(!d.revision_skew());
+        assert!(!d.needs_browser());
+        assert_eq!(d.skew_message(), None);
     }
 
     #[test]
