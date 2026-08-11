@@ -3,6 +3,19 @@ name: Build App (Preview)
 # Builds the Tauri app for branches other than main and exposes the bundles as
 # workflow artifacts. No Gitea release, no GitHub sync — intended for local
 # smoke-testing of feature branches before they merge.
+#
+# The uploads pin actions/upload-artifact@v3 and must not be "upgraded". v4
+# bundles @actions/artifact v2, which refuses to run before making a single
+# request whenever GITHUB_SERVER_URL is not github.com:
+#
+#   isGhes() -> hostname !== 'GITHUB.COM' && !endsWith('.GHE.COM') && !endsWith('.LOCALHOST')
+#
+# act_runner sets GITHUB_SERVER_URL to this Gitea instance, so v4 fails on every
+# runner and every OS with "GHESNotSupportedError" — after the whole Tauri build
+# has been paid for. v3 uses the v1 artifact API, which Gitea implements. (Run
+# #265 was this workflow's first ever run and lost all three platforms this way.)
+# The other workflows here never hit it because they publish by curling the
+# Gitea releases API instead — see build-app.yml.
 
 on:
   workflow_dispatch:
@@ -128,8 +141,9 @@ jobs:
           cp app/src-tauri/target/release/bundle/rpm/*.rpm artifacts/ 2>/dev/null || true
           ls -la artifacts/
 
+      # v3, not v4, and it must stay v3 — see the note at the top of this file.
       - name: Upload Linux artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
           name: triple-c-${{ needs.compute-version.outputs.version }}-linux
           path: artifacts/
@@ -210,7 +224,7 @@ jobs:
           ls -la artifacts/
 
       - name: Upload macOS artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3 # v3 deliberately — see the top of this file
         with:
           name: triple-c-${{ needs.compute-version.outputs.version }}-macos
           path: artifacts/
@@ -309,7 +323,7 @@ jobs:
           dir artifacts\
 
       - name: Upload Windows artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3 # v3 deliberately — see the top of this file
         with:
           name: triple-c-${{ needs.compute-version.outputs.version }}-windows
           path: artifacts/
