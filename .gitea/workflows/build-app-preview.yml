@@ -1,21 +1,39 @@
 name: Build App (Preview)
 
-# Builds the Tauri app for branches other than main and exposes the bundles as
-# workflow artifacts. No Gitea release, no GitHub sync — intended for local
-# smoke-testing of feature branches before they merge.
+# Builds the Tauri app for branches other than main and publishes the bundles as
+# a **prerelease**, so they are downloadable from the Releases page. No GitHub
+# sync — intended for smoke-testing a feature branch before it merges.
 #
-# The uploads pin actions/upload-artifact@v3 and must not be "upgraded". v4
-# bundles @actions/artifact v2, which refuses to run before making a single
-# request whenever GITHUB_SERVER_URL is not github.com:
+# ## Why not workflow artifacts
 #
-#   isGhes() -> hostname !== 'GITHUB.COM' && !endsWith('.GHE.COM') && !endsWith('.LOCALHOST')
+# Two attempts failed before this one, and both failure modes are worth knowing:
 #
-# act_runner sets GITHUB_SERVER_URL to this Gitea instance, so v4 fails on every
-# runner and every OS with "GHESNotSupportedError" — after the whole Tauri build
-# has been paid for. v3 uses the v1 artifact API, which Gitea implements. (Run
-# #265 was this workflow's first ever run and lost all three platforms this way.)
-# The other workflows here never hit it because they publish by curling the
-# Gitea releases API instead — see build-app.yml.
+#  * `actions/upload-artifact@v4` cannot run here at all. It bundles
+#    `@actions/artifact` v2, whose `isGhes()` treats any GITHUB_SERVER_URL that
+#    is not github.com / *.ghe.com / *.localhost as GitHub Enterprise Server and
+#    throws before making a single request. act_runner sets that variable to this
+#    Gitea instance, so every platform died with "GHESNotSupportedError" — after
+#    the whole Tauri build had been paid for (run #265).
+#  * `@v3` uploads *succeed*, and the files are downloadable by direct URL — but
+#    Gitea does not **list** them: `/api/v1/…/runs/<id>/artifacts` reports
+#    `total_count: 0` and the run page shows nothing (verified on run #267).
+#    A build nobody can find is not a build.
+#
+# So previews publish the same way every other workflow here does: curl to the
+# Gitea releases API. One release per preview, tagged `preview-<sha>`.
+#
+# ## Lifecycle
+#
+# The `preview-` tag prefix is deliberate. `cleanup-releases.yml` keeps the most
+# recent `v<major>.<minor>.<patch>` releases and separately deletes every release
+# whose tag does *not* start with `v[0-9]` — so previews are pruned by the
+# cleanup that is already run, and never crowd the real release list.
+#
+# `sync-release.yml` is workflow_dispatch-only, so nothing here reaches GitHub.
+
+env:
+  GITEA_URL: ${{ gitea.server_url }}
+  REPO: ${{ gitea.repository }}
 
 on:
   workflow_dispatch:
@@ -40,9 +58,64 @@ jobs:
           echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
           echo "Computed preview version: ${VERSION}"
 
-  build-linux:
+  # One release, created once. The three build jobs run concurrently, so
+  # get-or-create in each of them would race on the same tag: whoever loses gets
+  # a 409 and (the way the old build-app.yml parsed it) an empty release id that
+  # still reported success. Creating it in a job they all depend on removes the
+  # race rather than handling it.
+  create-release:
     runs-on: ubuntu-latest
     needs: [compute-version]
+    outputs:
+      release_id: ${{ steps.release.outputs.RELEASE_ID }}
+      tag: ${{ steps.release.outputs.TAG }}
+    steps:
+      - name: Create the preview release
+        id: release
+        env:
+          TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          VERSION: ${{ needs.compute-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          TAG="preview-${VERSION##*.}"
+          echo "TAG=${TAG}" >> $GITHUB_OUTPUT
+
+          # Idempotent: re-dispatching the same commit must update the existing
+          # release rather than fail on the duplicate tag.
+          HTTP_CODE=$(curl -sS -o release.json -w '%{http_code}' \
+            -H "Authorization: token ${TOKEN}" \
+            "${GITEA_URL}/api/v1/repos/${REPO}/releases/tags/${TAG}")
+          case "${HTTP_CODE}" in
+            200) echo "Release ${TAG} already exists, reusing" ;;
+            404)
+              echo "Creating release ${TAG}"
+              # prerelease: true keeps it off "latest" — this is a branch build,
+              # not something anyone should install by accident.
+              curl -fsS -X POST \
+                -H "Authorization: token ${TOKEN}" \
+                -H "Content-Type: application/json" \
+                -d "{\"tag_name\": \"${TAG}\", \"target_commitish\": \"${{ gitea.sha }}\", \"name\": \"Preview ${VERSION}\", \"prerelease\": true, \"body\": \"Unreleased build of \`${{ gitea.ref_name }}\` at ${{ gitea.sha }}. Not a release — pruned by Cleanup Old Releases.\"}" \
+                "${GITEA_URL}/api/v1/repos/${REPO}/releases" > release.json
+              ;;
+            *)
+              echo "Unexpected HTTP ${HTTP_CODE} from get-release-by-tag" >&2
+              cat release.json >&2 || true
+              exit 1
+              ;;
+          esac
+
+          RELEASE_ID=$(grep -o '"id":[0-9]*' release.json | head -1 | grep -o '[0-9]*' || true)
+          if [ -z "${RELEASE_ID}" ]; then
+            echo "Failed to parse release id; response was:" >&2
+            cat release.json >&2
+            exit 1
+          fi
+          echo "RELEASE_ID=${RELEASE_ID}" >> $GITHUB_OUTPUT
+          echo "Release ${TAG} is id ${RELEASE_ID}"
+
+  build-linux:
+    runs-on: ubuntu-latest
+    needs: [compute-version, create-release]
     steps:
       - name: Install Node.js 22
         run: |
@@ -141,18 +214,47 @@ jobs:
           cp app/src-tauri/target/release/bundle/rpm/*.rpm artifacts/ 2>/dev/null || true
           ls -la artifacts/
 
-      # v3, not v4, and it must stay v3 — see the note at the top of this file.
-      - name: Upload Linux artifacts
-        uses: actions/upload-artifact@v3
-        with:
-          name: triple-c-${{ needs.compute-version.outputs.version }}-linux
-          path: artifacts/
-          if-no-files-found: error
-          retention-days: 14
+      # Assets, not workflow artifacts — see the note at the top of this file.
+      # Delete-then-upload so a re-dispatch replaces rather than 409s, and the
+      # retry/http1.1 hardening that build-app.yml learned from real macOS
+      # upload failures (curl exit 92 and exit 28 mid-stream).
+      - name: Upload Linux bundles to the preview release
+        shell: bash
+        env:
+          TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(artifacts/*)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No Linux bundles were produced" >&2
+            exit 1
+          fi
+          for file in "${files[@]}"; do
+            filename=$(basename "$file")
+            EXISTING_ID=$(curl -sS \
+              -H "Authorization: token ${TOKEN}" \
+              "${GITEA_URL}/api/v1/repos/${REPO}/releases/${RELEASE_ID}/assets" \
+              | python3 -c "import json,sys; t=sys.argv[1]; print(next((a['id'] for a in json.load(sys.stdin) if a.get('name')==t), ''))" "${filename}" || true)
+            if [ -n "${EXISTING_ID}" ]; then
+              echo "Replacing existing asset ${filename}"
+              curl -fsS -X DELETE \
+                -H "Authorization: token ${TOKEN}" \
+                "${GITEA_URL}/api/v1/repos/${REPO}/releases/${RELEASE_ID}/assets/${EXISTING_ID}"
+            fi
+            echo "Uploading ${filename}..."
+            curl -fsS --http1.1 --retry 5 --retry-all-errors --retry-delay 5 --max-time 600 \
+              -X POST \
+              -H "Authorization: token ${TOKEN}" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary "@${file}" \
+              "${GITEA_URL}/api/v1/repos/${REPO}/releases/${RELEASE_ID}/assets?name=${filename}"
+          done
 
   build-macos:
     runs-on: macos-latest
-    needs: [compute-version]
+    needs: [compute-version, create-release]
     steps:
       - name: Install Node.js 22
         run: |
@@ -223,17 +325,47 @@ jobs:
           cp app/src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz artifacts/ 2>/dev/null || true
           ls -la artifacts/
 
-      - name: Upload macOS artifacts
-        uses: actions/upload-artifact@v3 # v3 deliberately — see the top of this file
-        with:
-          name: triple-c-${{ needs.compute-version.outputs.version }}-macos
-          path: artifacts/
-          if-no-files-found: error
-          retention-days: 14
+      # Assets, not workflow artifacts — see the note at the top of this file.
+      # Delete-then-upload so a re-dispatch replaces rather than 409s, and the
+      # retry/http1.1 hardening that build-app.yml learned from real macOS
+      # upload failures (curl exit 92 and exit 28 mid-stream).
+      - name: Upload macOS bundles to the preview release
+        shell: bash
+        env:
+          TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(artifacts/*)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No macOS bundles were produced" >&2
+            exit 1
+          fi
+          for file in "${files[@]}"; do
+            filename=$(basename "$file")
+            EXISTING_ID=$(curl -sS \
+              -H "Authorization: token ${TOKEN}" \
+              "${GITEA_URL}/api/v1/repos/${REPO}/releases/${RELEASE_ID}/assets" \
+              | python3 -c "import json,sys; t=sys.argv[1]; print(next((a['id'] for a in json.load(sys.stdin) if a.get('name')==t), ''))" "${filename}" || true)
+            if [ -n "${EXISTING_ID}" ]; then
+              echo "Replacing existing asset ${filename}"
+              curl -fsS -X DELETE \
+                -H "Authorization: token ${TOKEN}" \
+                "${GITEA_URL}/api/v1/repos/${REPO}/releases/${RELEASE_ID}/assets/${EXISTING_ID}"
+            fi
+            echo "Uploading ${filename}..."
+            curl -fsS --http1.1 --retry 5 --retry-all-errors --retry-delay 5 --max-time 600 \
+              -X POST \
+              -H "Authorization: token ${TOKEN}" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary "@${file}" \
+              "${GITEA_URL}/api/v1/repos/${REPO}/releases/${RELEASE_ID}/assets?name=${filename}"
+          done
 
   build-windows:
     runs-on: windows-latest
-    needs: [compute-version]
+    needs: [compute-version, create-release]
     defaults:
       run:
         shell: cmd
@@ -322,10 +454,33 @@ jobs:
           copy app\src-tauri\target\release\bundle\nsis\*.exe artifacts\ 2>nul
           dir artifacts\
 
-      - name: Upload Windows artifacts
-        uses: actions/upload-artifact@v3 # v3 deliberately — see the top of this file
-        with:
-          name: triple-c-${{ needs.compute-version.outputs.version }}-windows
-          path: artifacts/
-          if-no-files-found: error
-          retention-days: 14
+      # PowerShell, because this job's default shell is cmd. Same
+      # delete-then-upload shape as the other two.
+      - name: Upload Windows bundles to the preview release
+        shell: powershell
+        env:
+          TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $headers = @{ Authorization = "token $env:TOKEN" }
+          $api = "$env:GITEA_URL/api/v1/repos/$env:REPO"
+          $files = @(Get-ChildItem -File -Path artifacts\*)
+          if ($files.Count -eq 0) { throw "No Windows bundles were produced" }
+
+          $existing = Invoke-RestMethod -Method Get -Headers $headers -Uri "$api/releases/$env:RELEASE_ID/assets"
+          foreach ($file in $files) {
+            $name = $file.Name
+            $dupe = $existing | Where-Object { $_.name -eq $name }
+            if ($dupe) {
+              Write-Host "Replacing existing asset $name"
+              Invoke-RestMethod -Method Delete -Headers $headers -Uri "$api/releases/$env:RELEASE_ID/assets/$($dupe.id)" | Out-Null
+            }
+            Write-Host "Uploading $name..."
+            $uploadUri = "$api/releases/$env:RELEASE_ID/assets?name=$([uri]::EscapeDataString($name))"
+            curl.exe -fsS --retry 5 --retry-all-errors --retry-delay 5 --max-time 600 `
+              -X POST -H "Authorization: token $env:TOKEN" `
+              -H "Content-Type: application/octet-stream" `
+              --data-binary "@$($file.FullName)" $uploadUri
+            if ($LASTEXITCODE -ne 0) { throw "Upload of $name failed (curl exit $LASTEXITCODE)" }
+          }
