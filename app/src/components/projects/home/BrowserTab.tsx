@@ -283,7 +283,9 @@ export default function BrowserTab({ project, active }: Props) {
   // apt package, so it never shows up in `browsers`, and a container that has
   // it is not missing a browser.
   const needsBrowser =
-    probed !== null && probed.browsers.length === 0 && probed.chrome_channel === null;
+    probed !== null &&
+    probed.chrome_channel === null &&
+    (probed.browsers.length === 0 || revisionSkew(probed));
   const needsSetup = probed !== null && (!ready || needsBrowser);
 
   return (
@@ -422,6 +424,47 @@ function isUsable(d: PlaywrightDetection | null): boolean {
   return d !== null && d.playwright_version !== null && d.has_bind && d.cli_entry !== null;
 }
 
+/**
+ * Mirrors Rust `PlaywrightDetection::revision_skew`.
+ *
+ * Browsers are installed, but not the revision one of the two Playwright copies
+ * would launch — so the cache looks full and launches fail. A probe that didn't
+ * answer leaves the executable null, and "unknown" must not read as "broken".
+ */
+function revisionSkew(d: PlaywrightDetection | null): boolean {
+  if (!d || d.browsers.length === 0) return false;
+  // `!= null`, not `!== null`: a probe from a container that predates these
+  // fields omits them entirely, and `undefined` is "didn't answer" — which must
+  // never render as "your browsers are wrong".
+  const viewerBroken = d.chromium_executable != null && !d.chromium_executable_exists;
+  const scriptsBroken =
+    d.script_chromium_executable != null && !d.script_chromium_executable_exists;
+  return viewerBroken || scriptsBroken;
+}
+
+/**
+ * The skew sentence, naming both halves.
+ *
+ * "Install a browser" over a cache that visibly already holds one reads as
+ * nonsense, so the copy has to say which copy of Playwright wants what.
+ */
+function skewText(d: PlaywrightDetection | null): string {
+  if (!d) return "";
+  const scriptsBroken =
+    d.script_chromium_executable !== null && !d.script_chromium_executable_exists;
+  const [version, wanted] = scriptsBroken
+    ? [d.script_playwright_version, d.script_chromium_executable]
+    : [d.playwright_version, d.chromium_executable];
+  return (
+    `This container has ${d.browsers.join(", ")}, but ` +
+    `${scriptsBroken ? 'the Playwright a script gets from require("playwright")' : "the Playwright serving the viewer"}` +
+    ` — ${version ?? "?"} — launches ${wanted ?? "?"}, which isn’t there. ` +
+    (scriptsBroken
+      ? "Two copies ended up in one tree, each pinning its own browser revision, so the viewer works and every script Claude writes fails. Re-run “Set up Playwright” to reinstall them as one consistent set."
+      : "Install Chromium below: it runs that build’s own installer, so it fetches exactly the revision that is missing.")
+  );
+}
+
 /** What the container is short of, as a list rather than as prose. */
 function missingParts(d: PlaywrightDetection | null): string[] {
   if (!d) return [];
@@ -469,6 +512,10 @@ function Setup({
   const browsers = detection?.browsers ?? [];
   const chrome = detection?.chrome_channel ?? null;
   const noBrowser = browsers.length === 0 && chrome === null;
+  // Installed browsers that cannot be launched. Handled apart from `noBrowser`
+  // because the fix is the same button but the sentence must not be "install a
+  // browser" over a cache that visibly has one.
+  const skew = revisionSkew(detection) && chrome === null;
 
   return (
     <div className="p-4 max-w-[46rem] space-y-4">
@@ -476,17 +523,21 @@ function Setup({
         <h2 className="text-[13px] font-semibold text-[var(--text-primary)]">
           {!havePackages
             ? "This container can’t serve a browser view yet"
-            : noBrowser
-              ? "Playwright is ready — but there’s no browser to drive yet"
-              : "This container is set up"}
+            : skew
+              ? "The installed browser isn’t the one Playwright launches"
+              : noBrowser
+                ? "Playwright is ready — but there’s no browser to drive yet"
+                : "This container is set up"}
         </h2>
         <p className="mt-1 text-[13px] text-[var(--text-secondary)] leading-relaxed">
           {message ??
             (missing.length > 0
               ? `Missing: ${missing.join(", ")}.`
-              : noBrowser
-                ? "Playwright and the viewer are installed. Install a browser below so there is something to watch."
-                : "Start the view from the button above once Claude has a browser open.")}
+              : skew
+                ? skewText(detection)
+                : noBrowser
+                  ? "Playwright and the viewer are installed. Install a browser below so there is something to watch."
+                  : "Start the view from the button above once Claude has a browser open.")}
         </p>
       </div>
 

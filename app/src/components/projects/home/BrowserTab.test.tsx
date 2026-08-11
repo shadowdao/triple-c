@@ -69,6 +69,11 @@ const NOTHING: PlaywrightDetection = {
   cli_entry: null,
   browsers: [],
   chrome_channel: null,
+  chromium_executable: null,
+  chromium_executable_exists: false,
+  script_playwright_version: null,
+  script_chromium_executable: null,
+  script_chromium_executable_exists: false,
   searched: [
     "/workspace",
     "/usr/lib/node_modules",
@@ -360,6 +365,41 @@ describe("BrowserTab", () => {
     await waitFor(() => expect(setBrowserViewEnabled).toHaveBeenCalled());
     expect(await screen.findByText("Off")).toBeInTheDocument();
     expect(screen.queryByTitle(/browser view for/i)).toBeNull();
+  });
+
+  it("names both halves when the installed browser isn\u2019t the one Playwright launches", async () => {
+    // The cache is full and every script fails \u2014 "install a browser" alone
+    // would read as nonsense, so the copy has to say which copy wants what.
+    checkBrowserViewSupport.mockResolvedValue({
+      ...READY,
+      browsers: ["chromium-1237"],
+      chromium_executable: "/home/claude/.cache/ms-playwright/chromium-1237/chrome-linux64/chrome",
+      chromium_executable_exists: true,
+      script_playwright_version: "1.62.1",
+      script_chromium_executable:
+        "/home/claude/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome",
+      script_chromium_executable_exists: false,
+    });
+
+    render(<BrowserTab project={project} active />);
+
+    expect(await screen.findByText(/isn\u2019t the one Playwright launches/i)).toBeInTheDocument();
+    // Both revisions appear in the explanation: what is installed, and what
+    // the failing copy actually wants.
+    expect(screen.getAllByText(/chromium-1237/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/chromium-1234/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/Set up Playwright/).length).toBeGreaterThan(0);
+  });
+
+  it("does not call an unanswered probe a skew", async () => {
+    // A container older than these fields omits them; unknown is not broken.
+    checkBrowserViewSupport.mockResolvedValue({ ...READY, browsers: ["chromium-1200"] });
+    getBrowserViewStatus.mockResolvedValue(LIVE);
+
+    render(<BrowserTab project={project} active />);
+
+    expect(await screen.findByTitle("Playwright browser view for api-server")).toBeInTheDocument();
+    expect(screen.queryByText(/isn\u2019t the one Playwright launches/i)).toBeNull();
   });
 
   it("only offers a window of its own once there is something to watch", async () => {

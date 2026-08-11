@@ -469,6 +469,15 @@ export interface PlaywrightDetection {
   /** Path to Google Chrome when the `chrome` channel — what `@playwright/mcp`
    *  asks for — is installed. It is an apt package, so it is never in `browsers`. */
   chrome_channel: string | null;
+  /** The Chromium the *viewer's* Playwright would launch, and whether it exists. */
+  chromium_executable: string | null;
+  chromium_executable_exists: boolean;
+  /** What a script's `require("playwright")` resolves to — routinely a different
+   *  copy, pinning a different browser revision. If its Chromium is missing,
+   *  every script Claude writes fails while the pane still looks green. */
+  script_playwright_version: string | null;
+  script_chromium_executable: string | null;
+  script_chromium_executable_exists: boolean;
   /** Module roots the probe searched, echoed back for the "not found" message.
    *  Includes the npx cache (`~/.npm/_npx/*​/node_modules`), which is where a
    *  Playwright installed through Claude Code's MCP setup actually lives. */
