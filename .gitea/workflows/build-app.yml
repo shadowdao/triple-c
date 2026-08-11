@@ -47,8 +47,12 @@ jobs:
             echo "Latest matching tag: ${LATEST_TAG}"
             PATCH=$(git rev-list --count "${LATEST_TAG}..HEAD")
           else
-            echo "No matching tag found for v${MAJOR_MINOR}.*, using total commit count"
-            PATCH=$(git rev-list --count HEAD)
+            # A minor line nobody has tagged yet is a *new* line, and a new line
+            # starts at .0 — that is what "we are moving to 0.4.x" means. The
+            # old fallback here counted every commit in the repository, which
+            # would have made the first 0.4 build 0.4.234.
+            echo "No v${MAJOR_MINOR}.* tag yet — starting this line at .0"
+            PATCH=0
           fi
 
           VERSION="${MAJOR_MINOR}.${PATCH}"

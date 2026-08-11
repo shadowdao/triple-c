@@ -54,7 +54,21 @@ jobs:
         run: |
           MAJOR_MINOR=$(cat VERSION | tr -d '[:space:]')
           SHORT_SHA=$(git rev-parse --short HEAD)
-          VERSION="${MAJOR_MINOR}.0-preview.${SHORT_SHA}"
+
+          # The patch number is computed exactly as build-app.yml does it, so a
+          # preview is labelled with the version the release it previews would
+          # carry. This used to be hard-coded `.0`, which made every preview
+          # installer claim to be x.y.0 no matter what it contained.
+          LATEST_TAG=$(git tag -l "v${MAJOR_MINOR}.*" --sort=-v:refname | grep -E "^v${MAJOR_MINOR}\.[0-9]+$" | head -1 || true)
+          if [ -n "$LATEST_TAG" ]; then
+            PATCH=$(git rev-list --count "${LATEST_TAG}..HEAD")
+            echo "Latest matching tag: ${LATEST_TAG} (+${PATCH} commits)"
+          else
+            echo "No v${MAJOR_MINOR}.* tag yet — starting this line at .0"
+            PATCH=0
+          fi
+
+          VERSION="${MAJOR_MINOR}.${PATCH}-preview.${SHORT_SHA}"
           echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
           echo "Computed preview version: ${VERSION}"
 
