@@ -318,8 +318,19 @@ fn is_reserved_env_key(key: &str) -> bool {
         || RESERVED_ENV_EXACT.iter().any(|e| upper == *e)
 }
 
-/// Compute a fingerprint string for the custom environment variables.
-/// Sorted alphabetically so order changes do not cause spurious recreation.
+/// Compute a fingerprint for the custom environment variables.
+///
+/// Sorted alphabetically so order changes do not cause spurious recreation, and
+/// **hashed**, because this value is written as the
+/// `triple-c.custom-env-fingerprint` label. Labels are readable by anything on
+/// the host through `docker inspect`, `docker commit` copies them onto the
+/// project's snapshot image, and `container_needs_recreation` logs both sides on
+/// a mismatch — so a plaintext `KEY=VALUE` join published every custom
+/// variable's *value*, API tokens included, to all three places. Same treatment
+/// as `triple-c.git-token-hash`.
+///
+/// Empty stays empty rather than becoming the hash of the empty string: an empty
+/// label is how every other `triple-c.*` key says "nothing configured".
 fn compute_env_fingerprint(custom_env_vars: &[EnvVar]) -> String {
     let mut parts: Vec<String> = Vec::new();
     for env_var in custom_env_vars {
@@ -330,7 +341,10 @@ fn compute_env_fingerprint(custom_env_vars: &[EnvVar]) -> String {
         parts.push(format!("{}={}", key, env_var.value));
     }
     parts.sort();
-    parts.join(",")
+    if parts.is_empty() {
+        return String::new();
+    }
+    sha256_hex(&parts.join(","))
 }
 
 /// The shared Claude Code OAuth token to inject for this project, paired with
@@ -2471,6 +2485,29 @@ mod tests {
             value: "sneaky".to_string(),
         }]);
         assert_eq!(fp, "");
+    }
+
+    #[test]
+    fn the_custom_env_fingerprint_never_carries_the_value() {
+        // It goes into `triple-c.custom-env-fingerprint`, which `docker inspect`
+        // hands to anything on the host, `docker commit` copies onto the
+        // project's snapshot image, and the recreation check logs on a mismatch.
+        let secret = "33da01c1b320644920c20d6b5e0a1c6b3c3451c2";
+        let fp = compute_env_fingerprint(&[EnvVar {
+            key: "TEA_TOKEN".to_string(),
+            value: secret.to_string(),
+        }]);
+        assert!(!fp.contains(secret), "fingerprint leaked the value: {}", fp);
+        assert!(!fp.contains("TEA_TOKEN"), "fingerprint leaked the key: {}", fp);
+        assert_eq!(fp.len(), 64, "expected a sha256 hex digest, got {:?}", fp);
+
+        // It still has to move when the value does, or a rotated token would
+        // never reach the container.
+        let rotated = compute_env_fingerprint(&[EnvVar {
+            key: "TEA_TOKEN".to_string(),
+            value: "rotated".to_string(),
+        }]);
+        assert_ne!(fp, rotated);
     }
 
     #[test]
