@@ -15,12 +15,16 @@ import {
   getBrowserViewStatus,
   installBrowserViewBrowser,
   installBrowserViewSupport,
+  getBrowserViewMatchWindow,
   getBrowserViewPopoutState,
   openBrowserViewPopout,
+  openPageInContainerBrowser,
   setBrowserViewEnabled,
+  setBrowserViewMatchWindow,
   setBrowserViewPopoutAlwaysOnTop,
 } from "../../../lib/tauri-commands";
 import { useAppState } from "../../../store/appState";
+import OpenPageDialog from "./OpenPageDialog";
 import AccordionSection from "../../ui/AccordionSection";
 import Button from "../../ui/Button";
 import StatusIndicator from "../../ui/StatusIndicator";
@@ -80,6 +84,10 @@ export default function BrowserTab({ project, active }: Props) {
    */
   const [poppedOut, setPoppedOut] = useState<boolean | null>(null);
   const [onTop, setOnTop] = useState(false);
+  /** The "open a page" dialog, and the request it is running. */
+  const [matchWindow, setMatchWindow] = useState(false);
+  const [askPage, setAskPage] = useState(false);
+  const [openingPage, setOpeningPage] = useState(false);
   const pushToast = useAppState((s) => s.pushToast);
   const setContainerProgress = useAppState((s) => s.setContainerProgress);
   const progress = useAppState((s) => s.containerProgress[project.id]);
@@ -137,6 +145,9 @@ export default function BrowserTab({ project, active }: Props) {
       // Unreachable in practice, but a pane stuck at "not asked yet" would
       // never show the view at all — so fail towards the tab.
       .catch(() => mounted.current && setPoppedOut(false));
+    getBrowserViewMatchWindow(projectId)
+      .then((on) => mounted.current && setMatchWindow(on))
+      .catch(() => {});
     getBrowserViewStatus(projectId)
       .then((s) => mounted.current && setStatus(s))
       .catch(() => {});
@@ -212,6 +223,55 @@ export default function BrowserTab({ project, active }: Props) {
         pushToast({
           kind: "error",
           message: "Could not change the window's stacking",
+          detail: String(e),
+        });
+      }
+    },
+    [projectId, pushToast],
+  );
+
+  /**
+   * Open a URL in a browser inside the container.
+   *
+   * The pane only ever *watched* browsers something else published; this is the
+   * one action that opens one. It also means the page can be resized later —
+   * whoever launches a bound browser is the only process that can drive it.
+   */
+  const openPage = useCallback(
+    async (url: string, width: number, height: number) => {
+      setOpeningPage(true);
+      try {
+        const result = await openPageInContainerBrowser(projectId, url, width, height);
+        if (!mounted.current) return;
+        setAskPage(false);
+        if (result.error) {
+          pushToast({ kind: "error", message: "The page didn’t open", detail: result.error });
+        } else {
+          pushToast({ kind: "success", message: `Opened ${url} at ${width}×${height}` });
+        }
+      } catch (e) {
+        pushToast({
+          kind: "error",
+          message: "Could not open the page in the container’s browser",
+          detail: String(e),
+        });
+      } finally {
+        if (mounted.current) setOpeningPage(false);
+      }
+    },
+    [projectId, pushToast],
+  );
+
+  const toggleMatchWindow = useCallback(
+    async (next: boolean) => {
+      setMatchWindow(next);
+      try {
+        await setBrowserViewMatchWindow(projectId, next);
+      } catch (e) {
+        if (mounted.current) setMatchWindow(!next);
+        pushToast({
+          kind: "error",
+          message: "Could not match the page to the window",
           detail: String(e),
         });
       }
@@ -326,9 +386,23 @@ export default function BrowserTab({ project, active }: Props) {
             <Toggle checked={onTop} onChange={toggleOnTop} label="Keep on top" />
           </span>
         )}
+        {live && poppedOut === true && (
+          <span
+            className="flex items-center gap-1.5 text-xs text-[var(--text-secondary)]"
+            title="Resize the page itself as the window is dragged, so the layout actually reflows. Applies to pages opened from here."
+          >
+            Match window
+            <Toggle checked={matchWindow} onChange={toggleMatchWindow} label="Match window" />
+          </span>
+        )}
         {live && poppedOut === false && (
           <Button size="md" onClick={() => setReloadKey((k) => k + 1)}>
             Reload
+          </Button>
+        )}
+        {live && (
+          <Button size="md" onClick={() => setAskPage(true)}>
+            Open a page…
           </Button>
         )}
         {live && poppedOut !== null && (
@@ -414,6 +488,14 @@ export default function BrowserTab({ project, active }: Props) {
             </Explainer>
           )}
         </div>
+      )}
+
+      {askPage && (
+        <OpenPageDialog
+          busy={openingPage}
+          onOpen={openPage}
+          onClose={() => setAskPage(false)}
+        />
       )}
     </div>
   );

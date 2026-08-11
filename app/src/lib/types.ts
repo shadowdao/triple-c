@@ -535,6 +535,23 @@ export interface BrowserViewPopoutState {
   always_on_top: boolean;
 }
 
+/** Mirrors Rust `page::Viewport` — CSS pixels, clamped backend-side. */
+export interface BrowserPageViewport {
+  width: number;
+  height: number;
+}
+
+/**
+ * Mirrors Rust `page::PageState`: what the container-side helper reports about
+ * the page Triple-C opened. `ready: false` with no error means there is none.
+ */
+export interface BrowserPageState {
+  ready: boolean;
+  url: string | null;
+  viewport: BrowserPageViewport | null;
+  error: string | null;
+}
+
 /**
  * Payload of the `browser-view-popout-changed` event: a `BrowserViewPopoutState`
  * plus the project it belongs to.

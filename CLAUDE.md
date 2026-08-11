@@ -126,6 +126,23 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
     viewer that no longer exists. It closes with `destroy()`, never `close()`, to stay clear of
     `CloseRequested`. The pane drops its iframe while popped out — two viewers can both *drive*
     the browser.
+  - **`page.rs` opens a page, which is the one thing the pane could not do.** A URL plus a
+    viewport: launch a browser in the container, `browser.bind()` it so the pane shows it, and
+    keep the handle. Serves auth (the OAuth callback listener is *in* the container, so a
+    container-side browser closes the loop with no host round trip and no auth bridge) and dev
+    servers on container loopback. **Verified: a second client cannot join a bound browser** —
+    `chromium.connect()` against the published endpoint times out in every URL form, because that
+    socket speaks the dashboard's transport, not the public connect protocol. So whoever launches
+    is the only process that can drive, which is why the helper is resident and why live resize
+    applies to pages *we* opened and never to `@playwright/mcp`'s (those take `--viewport-size` /
+    `PLAYWRIGHT_MCP_VIEWPORT_SIZE` at launch). Control is a polled JSON file in `/tmp` — no port,
+    no second listener — and a re-open with a helper already up *navigates* rather than
+    relaunching, so a session signed in on one page survives to the next.
+  - **Resizing the window does not resize the page.** The viewer is a CDP screencast: a bigger
+    window is the same pixels drawn larger. `page.setViewportSize()` is what reflows (measured
+    against a `@media (max-width: 900px)` rule), and match-window mode pushes the pop-out's
+    settled `Resized` size into it — debounced by generation counter, since a drag emits
+    continuously and each one costs a container exec.
   - **`lib.rs`'s `on_window_event` fires for every window and must stay guarded on
     `label() == "main"`.** Without that guard, closing a pop-out runs the app's shutdown: every
     container stopped, process exited.

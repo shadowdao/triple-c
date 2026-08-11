@@ -18,6 +18,10 @@ const closeBrowserViewPopout = vi.fn<(id: string) => Promise<void>>();
 const getBrowserViewPopoutState =
   vi.fn<() => Promise<{ open: boolean; always_on_top: boolean }>>();
 const setBrowserViewPopoutAlwaysOnTop = vi.fn<(id: string, onTop: boolean) => Promise<void>>();
+const openPageInContainerBrowser =
+  vi.fn<(id: string, url: string, w: number, h: number) => Promise<{ error: string | null }>>();
+const setBrowserViewMatchWindow = vi.fn<(id: string, on: boolean) => Promise<void>>();
+const getBrowserViewMatchWindow = vi.fn<() => Promise<boolean>>();
 const pushToast = vi.fn();
 const setContainerProgress = vi.fn();
 
@@ -32,6 +36,10 @@ vi.mock("../../../lib/tauri-commands", () => ({
   getBrowserViewPopoutState: () => getBrowserViewPopoutState(),
   setBrowserViewPopoutAlwaysOnTop: (id: string, onTop: boolean) =>
     setBrowserViewPopoutAlwaysOnTop(id, onTop),
+  openPageInContainerBrowser: (id: string, url: string, w: number, h: number) =>
+    openPageInContainerBrowser(id, url, w, h),
+  setBrowserViewMatchWindow: (id: string, on: boolean) => setBrowserViewMatchWindow(id, on),
+  getBrowserViewMatchWindow: () => getBrowserViewMatchWindow(),
 }));
 
 vi.mock("@tauri-apps/api/event", () => ({
@@ -130,6 +138,9 @@ beforeEach(() => {
   openBrowserViewPopout.mockResolvedValue(undefined);
   closeBrowserViewPopout.mockResolvedValue(undefined);
   setBrowserViewPopoutAlwaysOnTop.mockResolvedValue(undefined);
+  setBrowserViewMatchWindow.mockResolvedValue(undefined);
+  getBrowserViewMatchWindow.mockResolvedValue(false);
+  openPageInContainerBrowser.mockResolvedValue({ error: null });
 });
 
 const LIVE: BrowserViewStatus = {
@@ -492,6 +503,58 @@ describe("BrowserTab", () => {
       answer({ open: false, always_on_top: false });
     });
     expect(await screen.findByTitle("Playwright browser view for api-server")).toBeInTheDocument();
+  });
+
+  it("opens a page in the container’s browser at the chosen viewport", async () => {
+    await renderLive();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /open a page/i }));
+    });
+    fireEvent.change(screen.getByLabelText(/^URL$/i), {
+      target: { value: "http://localhost:5173" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "1920 × 1080" }));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /open page/i }));
+    });
+
+    expect(openPageInContainerBrowser).toHaveBeenCalledWith(
+      "p1",
+      "http://localhost:5173",
+      1920,
+      1080,
+    );
+  });
+
+  it("refuses a URL scheme the backend would reject, before the round trip", async () => {
+    await renderLive();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /open a page/i }));
+    });
+    fireEvent.change(screen.getByLabelText(/^URL$/i), {
+      target: { value: "file:///etc/passwd" },
+    });
+
+    expect(screen.getByRole("button", { name: /open page/i })).toBeDisabled();
+    expect(screen.getByText(/Only http:\/\/ and https:\/\//)).toBeInTheDocument();
+    expect(openPageInContainerBrowser).not.toHaveBeenCalled();
+  });
+
+  it("offers match-window only once the view is in its own window", async () => {
+    await renderLive();
+    expect(screen.queryByRole("switch", { name: "Match window" })).toBeNull();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /own window/i }));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("switch", { name: "Match window" }));
+    });
+
+    expect(setBrowserViewMatchWindow).toHaveBeenCalledWith("p1", true);
   });
 
   it("says why the window wouldn’t open instead of pretending it did", async () => {

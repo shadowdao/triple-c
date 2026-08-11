@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, ImageUpdateInfo, FileEntry, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo } from "./types";
+import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, ImageUpdateInfo, FileEntry, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, BrowserPageState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo } from "./types";
 
 // Docker
 export const checkDocker = () => invoke<boolean>("check_docker");
@@ -222,6 +222,39 @@ export const closeBrowserViewPopout = (projectId: string) =>
  */
 export const getBrowserViewPopoutState = (projectId: string) =>
   invoke<BrowserViewPopoutState>("get_browser_view_popout_state", { projectId });
+/**
+ * Open a URL in a browser *inside* the container, published so the pane shows it.
+ *
+ * The same action serves an auth URL — the OAuth callback listener is in the
+ * container too, so the loop closes without the host — and a dev server on
+ * container loopback, which is how you watch a UI Claude is building. Only
+ * http/https; the backend rejects anything else.
+ */
+export const openPageInContainerBrowser = (
+  projectId: string,
+  url: string,
+  width: number,
+  height: number,
+) => invoke<BrowserPageState>("open_page_in_container_browser", { projectId, url, width, height });
+/** Resize that page. Real reflow, not a scaled screencast — see BrowserTab. */
+export const setContainerPageViewport = (projectId: string, width: number, height: number) =>
+  invoke<void>("set_container_page_viewport", { projectId, width, height });
+export const getContainerPageState = (projectId: string) =>
+  invoke<BrowserPageState>("get_container_page_state", { projectId });
+export const closeContainerPage = (projectId: string) =>
+  invoke<void>("close_container_page", { projectId });
+
+/**
+ * Make the page track the pop-out window's size as it is dragged.
+ *
+ * Only affects a page this app opened: a bound browser admits no second client,
+ * so one `@playwright/mcp` launched keeps the viewport it was given.
+ */
+export const setBrowserViewMatchWindow = (projectId: string, enabled: boolean) =>
+  invoke<void>("set_browser_view_match_window", { projectId, enabled });
+export const getBrowserViewMatchWindow = (projectId: string) =>
+  invoke<boolean>("get_browser_view_match_window", { projectId });
+
 /** Pin the pop-out above other windows — the point of popping it out at all. */
 export const setBrowserViewPopoutAlwaysOnTop = (projectId: string, onTop: boolean) =>
   invoke<void>("set_browser_view_popout_always_on_top", { projectId, onTop });

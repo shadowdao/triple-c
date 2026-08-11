@@ -5,7 +5,7 @@
 use tauri::{AppHandle, State};
 
 use crate::browser_view::install::{self, BrowserSetupOutcome};
-use crate::browser_view::{manager, popout, BrowserViewState, BrowserViewStatus};
+use crate::browser_view::{manager, page, popout, BrowserViewState, BrowserViewStatus};
 use crate::AppState;
 
 /// Turn the pane on or off for a project.
@@ -162,6 +162,106 @@ pub async fn set_browser_view_popout_always_on_top(
     app_handle: AppHandle,
 ) -> Result<(), String> {
     popout::set_always_on_top(&app_handle, &project_id, on_top)
+}
+
+/// Open a URL in a browser *inside* the container, published so the pane shows
+/// it.
+///
+/// Two uses, one action: an auth URL — where the OAuth callback listener is in
+/// the container too, so the loop closes without the host being involved at all
+/// — and a dev server on container loopback, which is how you watch a UI Claude
+/// is building.
+///
+/// The scheme allow-list mirrors the URL relay's: `http`/`https` only, so this
+/// can never be talked into opening `file:` on the container's filesystem.
+#[tauri::command]
+pub async fn open_page_in_container_browser(
+    project_id: String,
+    url: String,
+    width: u32,
+    height: u32,
+    state: State<'_, AppState>,
+) -> Result<page::PageState, String> {
+    let trimmed = url.trim();
+    if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+        return Err("Only http:// and https:// URLs can be opened in the browser.".to_string());
+    }
+    let container_id = running_container(&state, &project_id, "opening a page").await?;
+    let detection = crate::browser_view::detect::detect(&container_id).await?;
+    page::open(
+        &container_id,
+        &detection,
+        trimmed,
+        page::Viewport::sane(width, height),
+    )
+    .await
+}
+
+/// Resize the page this opened. The pop-out's "match window" mode calls this on
+/// every settled resize, so it is deliberately cheap: one control-file write.
+#[tauri::command]
+pub async fn set_container_page_viewport(
+    project_id: String,
+    width: u32,
+    height: u32,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let container_id = running_container(&state, &project_id, "resizing the page").await?;
+    page::set_viewport(&container_id, page::Viewport::sane(width, height)).await
+}
+
+/// State of the page this opened, if any. Never fails: "no page" is an answer.
+#[tauri::command]
+pub async fn get_container_page_state(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<page::PageState, String> {
+    let Ok(container_id) = running_container(&state, &project_id, "reading the page").await else {
+        return Ok(page::PageState::default());
+    };
+    Ok(page::state(&container_id).await)
+}
+
+/// Close the page this opened, leaving the view itself running.
+#[tauri::command]
+pub async fn close_container_page(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let container_id = running_container(&state, &project_id, "closing the page").await?;
+    page::close(&container_id).await;
+    Ok(())
+}
+
+/// Make the page track the pop-out window's size as it is dragged.
+///
+/// Only affects a page **this app opened**: a bound browser admits no second
+/// client, so one `@playwright/mcp` launched keeps the viewport it was given.
+/// Turning it on applies the window's current size immediately, so the toggle
+/// has a visible effect without waiting for a drag.
+#[tauri::command]
+pub async fn set_browser_view_match_window(
+    project_id: String,
+    enabled: bool,
+    app_handle: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    popout::set_match_window(&project_id, enabled);
+    if !enabled {
+        return Ok(());
+    }
+    let Some((width, height)) = popout::inner_size(&app_handle, &project_id) else {
+        return Ok(());
+    };
+    let container_id = running_container(&state, &project_id, "matching the window").await?;
+    page::set_viewport(&container_id, page::Viewport::sane(width, height)).await
+}
+
+/// Whether match-window mode is on. Read on mount, like the rest of the
+/// pop-out's state — the pane is unmounted whenever another sub-tab is shown.
+#[tauri::command]
+pub async fn get_browser_view_match_window(project_id: String) -> Result<bool, String> {
+    Ok(popout::match_window(&project_id))
 }
 
 /// The project's container, or a sentence saying why there isn't one.

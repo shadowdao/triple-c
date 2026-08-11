@@ -280,11 +280,35 @@ Press **Start browser view** and the pane fills with Playwright's own dashboard,
 container and reached over a token-gated listener on your machine's loopback address. Nothing is
 exposed off the machine.
 
+#### Opening a page yourself
+
+**Open a page…** launches a browser inside the container at a URL and viewport you choose, and
+publishes it to this pane. Two uses:
+
+- **A sign-in page.** The callback the tool is waiting for is a listener *inside* the container, so
+  a container-side browser completes the login without anything crossing to your host browser.
+  When a long URL appears in a terminal, the prompt that offers to open it on your host now also
+  offers **In container**, which does the same thing in one click.
+- **A dev server.** `http://localhost:5173` inside the container is reachable with no port mapping
+  and nothing exposed to your network — which is how you watch a UI Claude is building, and click
+  around it yourself.
+
+The **viewport** is the page's own resolution, and it is not the same thing as the window size.
+The pane shows a video of the browser, so a bigger window draws the same pixels larger; changing
+the viewport is what makes the layout actually reflow. Pick a preset or type a size.
+
+Note the limit, because it is not obvious: a browser Claude opened through `@playwright/mcp` can
+be *watched* but not resized — a published browser admits only the client that launched it. Set
+its size with `PLAYWRIGHT_MCP_VIEWPORT_SIZE=1920x1080` in the project's environment variables
+instead.
+
 #### Watching it while you work
 
 Press **Open in own window** and the view moves out of the tab into a window of its own — put it on
 a second monitor, or turn on **Keep on top** and let it float above the app while you work in a
-terminal. This is a window change only: the browser and the view keep running throughout, so
+terminal. **Match window** goes further: the page's viewport follows the window as you drag it, so
+the pop-out becomes a responsive-design ruler. It applies to pages opened with **Open a page…**,
+for the reason above. This is a window change only: the browser and the view keep running throughout, so
 popping out and back costs nothing and interrupts nothing.
 
 While the view is in its own window the tab shows a placeholder rather than a second copy of it —

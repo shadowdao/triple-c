@@ -27,6 +27,10 @@
 //! dead viewer is worse than no window. The reverse is not true; closing the
 //! window leaves the view running, and the pane takes it back into the tab.
 
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
+
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
@@ -106,11 +110,17 @@ pub fn open(
         .map_err(|e| format!("Could not open the browser window: {}", e))?;
 
     // Closed from its own titlebar, this is the only thing that tells the pane
-    // to take the view back into the tab.
-    window.on_window_event(move |event| {
-        if matches!(event, WindowEvent::Destroyed) {
+    // to take the view back into the tab. `Resized` drives match-window mode —
+    // see `set_match_window`.
+    window.on_window_event(move |event| match event {
+        WindowEvent::Destroyed => {
+            set_match_window(&project_id_owned, false);
             emit(&app_for_event, &project_id_owned, PopoutState::CLOSED);
         }
+        WindowEvent::Resized(size) => {
+            on_resized(&app_for_event, &project_id_owned, size.width, size.height);
+        }
+        _ => {}
     });
 
     log::info!("Browser view: popped out for project {}", project_id);
@@ -170,6 +180,99 @@ pub fn set_always_on_top(app: &AppHandle, project_id: &str, on_top: bool) -> Res
     Ok(())
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Match-window mode
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Projects whose pop-out is driving the page's viewport, and the generation of
+/// the latest resize for each — the debounce is "did anything else arrive while
+/// I slept?", which needs no timer to cancel.
+static MATCH_WINDOW: OnceLock<Mutex<HashMap<String, (bool, u64)>>> = OnceLock::new();
+
+/// How long the window has to stop moving before the page is resized.
+///
+/// A drag emits `Resized` continuously; each one costs a container exec, and
+/// Chromium relayouts the page. Settling first turns a drag into one resize.
+const RESIZE_SETTLE: Duration = Duration::from_millis(300);
+
+fn match_window_map() -> &'static Mutex<HashMap<String, (bool, u64)>> {
+    MATCH_WINDOW.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Turn match-window mode on or off for a project.
+///
+/// Only ever affects a page **Triple-C opened** — a bound browser cannot be
+/// joined by a second client, so a page `@playwright/mcp` launched keeps
+/// whatever viewport it was given. See [`super::page`].
+pub fn set_match_window(project_id: &str, enabled: bool) {
+    let mut map = match_window_map().lock().unwrap_or_else(|e| e.into_inner());
+    let entry = map.entry(project_id.to_string()).or_insert((false, 0));
+    entry.0 = enabled;
+}
+
+pub fn match_window(project_id: &str) -> bool {
+    match_window_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(project_id)
+        .map(|(on, _)| *on)
+        .unwrap_or(false)
+}
+
+/// The pop-out's current inner size, for applying match-window immediately
+/// rather than only on the next drag.
+pub fn inner_size(app: &AppHandle, project_id: &str) -> Option<(u32, u32)> {
+    let window = app.get_webview_window(&window_label(project_id))?;
+    let size = window.inner_size().ok()?;
+    Some((size.width, size.height))
+}
+
+/// Debounce a resize, then push the settled size into the page's viewport.
+fn on_resized(app: &AppHandle, project_id: &str, width: u32, height: u32) {
+    let generation = {
+        let mut map = match_window_map().lock().unwrap_or_else(|e| e.into_inner());
+        let Some(entry) = map.get_mut(project_id) else {
+            return;
+        };
+        if !entry.0 {
+            return;
+        }
+        entry.1 += 1;
+        entry.1
+    };
+
+    let app = app.clone();
+    let project_id = project_id.to_string();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(RESIZE_SETTLE).await;
+        // Superseded by a later resize: that one will do the work.
+        {
+            let map = match_window_map().lock().unwrap_or_else(|e| e.into_inner());
+            match map.get(&project_id) {
+                Some((true, latest)) if *latest == generation => {}
+                _ => return,
+            }
+        }
+
+        let state = app.state::<crate::AppState>();
+        let Some(container_id) = state
+            .projects_store
+            .get(&project_id)
+            .and_then(|p| p.container_id)
+        else {
+            return;
+        };
+        if let Err(e) = super::page::set_viewport(
+            &container_id,
+            super::page::Viewport::sane(width, height),
+        )
+        .await
+        {
+            log::debug!("Browser view: could not match the page to the window: {}", e);
+        }
+    });
+}
+
 fn emit(app: &AppHandle, project_id: &str, state: PopoutState) {
     let _ = app.emit(
         POPOUT_EVENT,
@@ -197,5 +300,39 @@ mod tests {
     #[test]
     fn distinct_projects_get_distinct_windows() {
         assert_ne!(window_label("alpha"), window_label("beta"));
+    }
+
+    #[test]
+    fn match_window_is_off_until_asked_for_and_is_per_project() {
+        assert!(!match_window("mw-a"));
+        set_match_window("mw-a", true);
+        assert!(match_window("mw-a"));
+        // Another project's window must not start driving its page too.
+        assert!(!match_window("mw-b"));
+        set_match_window("mw-a", false);
+        assert!(!match_window("mw-a"));
+    }
+
+    #[test]
+    fn a_resize_supersedes_the_one_before_it() {
+        // The debounce is a generation counter, not a cancellable timer: only
+        // the newest resize of a drag survives to touch the container.
+        set_match_window("mw-gen", true);
+        let read = || {
+            match_window_map()
+                .lock()
+                .unwrap()
+                .get("mw-gen")
+                .map(|(_, g)| *g)
+                .unwrap()
+        };
+        let before = read();
+        {
+            let mut map = match_window_map().lock().unwrap();
+            let entry = map.get_mut("mw-gen").unwrap();
+            entry.1 += 1;
+        }
+        assert!(read() > before);
+        set_match_window("mw-gen", false);
     }
 }

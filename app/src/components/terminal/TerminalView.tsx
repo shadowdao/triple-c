@@ -7,7 +7,11 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import "@xterm/xterm/css/xterm.css";
 import { useTerminal } from "../../hooks/useTerminal";
 import { useAppState } from "../../store/appState";
-import { awsSsoRefresh, uploadHostFileToTerminal } from "../../lib/tauri-commands";
+import {
+  awsSsoRefresh,
+  openPageInContainerBrowser,
+  uploadHostFileToTerminal,
+} from "../../lib/tauri-commands";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { UrlDetector } from "../../lib/urlDetector";
 import {
@@ -529,6 +533,46 @@ export default function TerminalView({ sessionId, active }: Props) {
     openUrl(safe).catch((e) => console.error("Failed to open URL:", e));
   }, [urlPrompt]);
 
+  /**
+   * Open the prompted URL in the container's own browser instead of the host's.
+   *
+   * For a sign-in this is the shorter path: the callback listener the tool is
+   * waiting on is inside the container, so a container-side browser closes the
+   * loop with nothing crossing to the host. The page is published to the
+   * project's Browser tab, which is where the user completes it by hand.
+   */
+  const handleOpenUrlInContainer = useCallback(() => {
+    if (!urlPrompt) return;
+    const safe = sanitizeRelayUrl(urlPrompt.url);
+    setUrlPrompt(null);
+    if (!safe) {
+      console.warn("Refusing to open a URL that failed validation");
+      return;
+    }
+    if (!projectId) return;
+    // A sign-in page is the one case where the *window* size matters least and
+    // the layout matters most, so it gets the ordinary desktop viewport.
+    openPageInContainerBrowser(projectId, safe, 1280, 720)
+      .then((result) => {
+        const push = useAppState.getState().pushToast;
+        if (result.error) {
+          push({ kind: "error", message: "The page didn’t open", detail: result.error });
+        } else {
+          push({
+            kind: "success",
+            message: "Opened in the container’s browser — see the project’s Browser tab",
+          });
+        }
+      })
+      .catch((e) =>
+        useAppState.getState().pushToast({
+          kind: "error",
+          message: "Could not open it in the container’s browser",
+          detail: String(e),
+        }),
+      );
+  }, [urlPrompt, projectId]);
+
   const handleScrollToBottom = useCallback(() => {
     const term = termRef.current;
     if (term) {
@@ -606,6 +650,7 @@ export default function TerminalView({ sessionId, active }: Props) {
           url={urlPrompt.url}
           label={urlPrompt.label}
           onOpen={handleOpenUrl}
+          onOpenInContainer={handleOpenUrlInContainer}
           onDismiss={() => setUrlPrompt(null)}
         />
       )}

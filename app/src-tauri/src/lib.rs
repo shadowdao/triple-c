@@ -440,6 +440,12 @@ pub fn run() {
             browser_view::commands::close_browser_view_popout,
             browser_view::commands::get_browser_view_popout_state,
             browser_view::commands::set_browser_view_popout_always_on_top,
+            browser_view::commands::open_page_in_container_browser,
+            browser_view::commands::set_container_page_viewport,
+            browser_view::commands::get_container_page_state,
+            browser_view::commands::close_container_page,
+            browser_view::commands::set_browser_view_match_window,
+            browser_view::commands::get_browser_view_match_window,
             // Shared Claude Code auth token
             commands::auth_token_commands::acquire_claude_token,
             commands::auth_token_commands::submit_claude_token_code,

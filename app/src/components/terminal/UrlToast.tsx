@@ -6,6 +6,9 @@ interface Props {
   /** Heading above the URL. Says why the toast appeared. */
   label?: string;
   onOpen: () => void;
+  /** Open it in the container's own browser instead of the host's. Omitted when
+   *  the project has no browser to open it in. */
+  onOpenInContainer?: () => void;
   onDismiss: () => void;
 }
 
@@ -30,6 +33,7 @@ export default function UrlToast({
   url,
   label = "Long URL detected",
   onOpen,
+  onOpenInContainer,
   onDismiss,
 }: Props) {
   const origin = urlOrigin(url);
@@ -130,6 +134,30 @@ export default function UrlToast({
       >
         Open
       </button>
+
+      {onOpenInContainer && (
+        // A sign-in completed in the *container's* browser lands its callback
+        // on the container's own loopback, which is where the tool waiting for
+        // it is listening — no host round trip, no auth bridge.
+        <button
+          onClick={onOpenInContainer}
+          title="Open in a browser inside the container, and watch it in the Browser tab"
+          style={{
+            padding: "4px 10px",
+            fontSize: 12,
+            fontWeight: 600,
+            color: "var(--text-primary)",
+            background: "transparent",
+            border: "1px solid var(--border-color)",
+            borderRadius: 4,
+            cursor: "pointer",
+            whiteSpace: "nowrap",
+            flexShrink: 0,
+          }}
+        >
+          In container
+        </button>
+      )}
 
       <button
         onClick={onDismiss}

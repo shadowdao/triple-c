@@ -64,6 +64,7 @@
 pub mod commands;
 pub mod detect;
 pub mod install;
+pub mod page;
 pub mod popout;
 pub mod proxy;
 
