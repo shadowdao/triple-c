@@ -43,26 +43,36 @@ export default function EnvVarsEditor({
         </p>
       )}
 
+      {/* The row's widths live on wrapper divs, not on the inputs. `inputClass`
+          carries `w-full`, and a width utility on the input itself does not beat
+          it — class-attribute order is not what resolves the conflict, stylesheet
+          order is. Sizing the key input directly left it asking for the whole row
+          and collapsed the value input, whose `flex-1` basis of 0 gave it only the
+          leftover space, to an unusable sliver. */}
       {vars.map((ev, i) => (
         <div key={i} className="flex gap-2 items-center">
-          <input
-            value={ev.key}
-            onChange={(e) => updateVar(i, "key", e.target.value)}
-            onBlur={() => onSave(vars)}
-            placeholder="KEY"
-            aria-label={`Environment variable ${i + 1} name`}
-            disabled={disabled}
-            className={`w-2/5 ${monoInputClass}`}
-          />
-          <input
-            value={ev.value}
-            onChange={(e) => updateVar(i, "value", e.target.value)}
-            onBlur={() => onSave(vars)}
-            placeholder="value"
-            aria-label={`Environment variable ${i + 1} value`}
-            disabled={disabled}
-            className={`flex-1 ${monoInputClass}`}
-          />
+          <div className="w-2/5 shrink-0">
+            <input
+              value={ev.key}
+              onChange={(e) => updateVar(i, "key", e.target.value)}
+              onBlur={() => onSave(vars)}
+              placeholder="KEY"
+              aria-label={`Environment variable ${i + 1} name`}
+              disabled={disabled}
+              className={monoInputClass}
+            />
+          </div>
+          <div className="flex-1 min-w-0">
+            <input
+              value={ev.value}
+              onChange={(e) => updateVar(i, "value", e.target.value)}
+              onBlur={() => onSave(vars)}
+              placeholder="value"
+              aria-label={`Environment variable ${i + 1} value`}
+              disabled={disabled}
+              className={monoInputClass}
+            />
+          </div>
           <Button
             variant="danger"
             disabled={disabled}
