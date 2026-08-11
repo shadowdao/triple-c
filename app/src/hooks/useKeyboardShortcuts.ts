@@ -11,6 +11,7 @@ import { useTerminal } from "./useTerminal";
  *   Ctrl+Shift+W  close the active tab
  *   Ctrl+Tab      next tab (Ctrl+Shift+Tab for previous)
  *   Ctrl+1..9     jump to the nth tab
+ *   Ctrl+Shift+←/→  move the active tab along the strip
  */
 export function useKeyboardShortcuts() {
   const { open: openTerminal, close: closeTerminal } = useTerminal();
@@ -48,6 +49,17 @@ export function useKeyboardShortcuts() {
         } else {
           state.closeHomeTab(tabKeyId(key));
         }
+        return;
+      }
+
+      // Ctrl+Shift+←/→ — move the active tab, the keyboard route to what
+      // dragging a tab does. Shift is what keeps it clear of the terminal:
+      // Ctrl+←/→ is readline's word-wise cursor motion.
+      if (e.shiftKey && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
+        if (!state.activeTabKey) return;
+        e.preventDefault();
+        e.stopPropagation();
+        state.moveActiveTab(e.key === "ArrowLeft" ? -1 : 1);
         return;
       }
 

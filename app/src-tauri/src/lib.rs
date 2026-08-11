@@ -328,6 +328,14 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                // This handler fires for *every* window, and what follows stops
+                // containers and exits the process. Only the main window means
+                // that. Secondary windows — the browser view's pop-out — are
+                // closed and reopened freely and must just close.
+                if window.label() != "main" {
+                    return;
+                }
+
                 let state = window.state::<AppState>();
                 let lifecycle = state.lifecycle.clone();
 
@@ -428,6 +436,10 @@ pub fn run() {
             browser_view::commands::check_browser_view_support,
             browser_view::commands::install_browser_view_support,
             browser_view::commands::install_browser_view_browser,
+            browser_view::commands::open_browser_view_popout,
+            browser_view::commands::close_browser_view_popout,
+            browser_view::commands::is_browser_view_popout_open,
+            browser_view::commands::set_browser_view_popout_always_on_top,
             // Shared Claude Code auth token
             commands::auth_token_commands::acquire_claude_token,
             commands::auth_token_commands::submit_claude_token_code,

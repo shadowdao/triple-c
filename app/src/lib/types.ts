@@ -514,6 +514,18 @@ export interface BrowserViewChangedEvent {
   status: BrowserViewStatus;
 }
 
+/**
+ * Payload of the `browser-view-popout-changed` event.
+ *
+ * The pop-out window can close without the pane asking — the user hits its X,
+ * or the session tears down and takes it — so this is the only reliable way to
+ * know whether it is on screen.
+ */
+export interface BrowserViewPopoutChangedEvent {
+  project_id: string;
+  open: boolean;
+}
+
 /** Payload of the `claude-token-progress` event: milestones during
  *  `acquire_claude_token`. Never contains the token. */
 /**

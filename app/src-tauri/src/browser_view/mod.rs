@@ -64,6 +64,7 @@
 pub mod commands;
 pub mod detect;
 pub mod install;
+pub mod popout;
 pub mod proxy;
 
 use std::collections::HashMap;
@@ -473,6 +474,11 @@ async fn supervise(
             map.remove(&project_id);
         }
     }
+
+    // A pop-out outlives the tab, so nothing else would take it down: the
+    // window would sit there showing a frozen last frame of a viewer that no
+    // longer exists. The session owns it, and this is where the session ends.
+    popout::close(&app, &project_id);
 
     let enabled = manager().is_enabled(&project_id).await;
     emit(&app, &project_id, &BrowserViewStatus::off(enabled));

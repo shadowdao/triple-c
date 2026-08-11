@@ -201,6 +201,25 @@ export const installBrowserViewBrowser = (
   browser: BrowserInstallTarget,
 ) => invoke<BrowserSetupOutcome>("install_browser_view_browser", { projectId, browser });
 
+/**
+ * Detach the live view into its own OS window, or raise it if already open.
+ *
+ * Window-only: the viewer, the proxy and the container are untouched, so
+ * popping out and back costs nothing. The window loads the same token-bearing
+ * loopback URL as the pane, and has no IPC access.
+ */
+export const openBrowserViewPopout = (projectId: string, alwaysOnTop: boolean) =>
+  invoke<void>("open_browser_view_popout", { projectId, alwaysOnTop });
+/** Close the pop-out and put the view back in the tab. No-op if it isn't open. */
+export const closeBrowserViewPopout = (projectId: string) =>
+  invoke<void>("close_browser_view_popout", { projectId });
+/** Asked on tab open: the window outlives the pane, so its state has to be read back. */
+export const isBrowserViewPopoutOpen = (projectId: string) =>
+  invoke<boolean>("is_browser_view_popout_open", { projectId });
+/** Pin the pop-out above other windows — the point of popping it out at all. */
+export const setBrowserViewPopoutAlwaysOnTop = (projectId: string, onTop: boolean) =>
+  invoke<void>("set_browser_view_popout_always_on_top", { projectId, onTop });
+
 // Shared Claude Code auth token — one `claude setup-token` run authenticates
 // every Anthropic-backend project. The token itself is never exposed here: it
 // lives in the OS keychain and is injected as a container env var.

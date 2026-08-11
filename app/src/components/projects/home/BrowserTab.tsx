@@ -4,21 +4,27 @@ import type {
   BrowserInstallTarget,
   BrowserSetupOutcome,
   BrowserViewChangedEvent,
+  BrowserViewPopoutChangedEvent,
   BrowserViewStatus,
   PlaywrightDetection,
   Project,
 } from "../../../lib/types";
 import {
   checkBrowserViewSupport,
+  closeBrowserViewPopout,
   getBrowserViewStatus,
   installBrowserViewBrowser,
   installBrowserViewSupport,
+  isBrowserViewPopoutOpen,
+  openBrowserViewPopout,
   setBrowserViewEnabled,
+  setBrowserViewPopoutAlwaysOnTop,
 } from "../../../lib/tauri-commands";
 import { useAppState } from "../../../store/appState";
 import AccordionSection from "../../ui/AccordionSection";
 import Button from "../../ui/Button";
 import StatusIndicator from "../../ui/StatusIndicator";
+import Toggle from "../../ui/Toggle";
 
 interface Props {
   project: Project;
@@ -66,6 +72,9 @@ export default function BrowserTab({ project, active }: Props) {
   const [job, setJob] = useState<SetupJob>(null);
   const [outcome, setOutcome] = useState<BrowserSetupOutcome | null>(null);
   const [setupError, setSetupError] = useState<string | null>(null);
+  /** Whether the view is currently in its own window instead of this pane. */
+  const [poppedOut, setPoppedOut] = useState(false);
+  const [onTop, setOnTop] = useState(false);
   const pushToast = useAppState((s) => s.pushToast);
   const setContainerProgress = useAppState((s) => s.setContainerProgress);
   const progress = useAppState((s) => s.containerProgress[project.id]);
@@ -95,8 +104,28 @@ export default function BrowserTab({ project, active }: Props) {
     return () => dispose?.();
   }, [projectId]);
 
+  // The window is the backend's, not this component's: it survives the tab
+  // being closed, the pane being unmounted and the view being torn down from
+  // elsewhere. So its state is listened for, never assumed.
+  useEffect(() => {
+    let dispose: (() => void) | undefined;
+    listen<BrowserViewPopoutChangedEvent>("browser-view-popout-changed", (event) => {
+      if (event.payload.project_id === projectId && mounted.current) {
+        setPoppedOut(event.payload.open);
+        if (!event.payload.open) setOnTop(false);
+      }
+    }).then((un) => {
+      if (mounted.current) dispose = un;
+      else un();
+    });
+    return () => dispose?.();
+  }, [projectId]);
+
   useEffect(() => {
     if (!active || !running) return;
+    isBrowserViewPopoutOpen(projectId)
+      .then((open) => mounted.current && setPoppedOut(open))
+      .catch(() => {});
     getBrowserViewStatus(projectId)
       .then((s) => mounted.current && setStatus(s))
       .catch(() => {});
@@ -124,6 +153,56 @@ export default function BrowserTab({ project, active }: Props) {
         });
       } finally {
         if (mounted.current) setBusy(false);
+      }
+    },
+    [projectId, pushToast],
+  );
+
+  /**
+   * Pop the view out, or pull it back.
+   *
+   * Both are window operations only — the viewer keeps running either way — so
+   * this is cheap enough to toggle freely and never interrupts what the agent
+   * is doing in the browser.
+   */
+  const popOut = useCallback(async () => {
+    try {
+      await openBrowserViewPopout(projectId, onTop);
+      if (mounted.current) setPoppedOut(true);
+    } catch (e) {
+      pushToast({
+        kind: "error",
+        message: "Could not open the browser in its own window",
+        detail: String(e),
+      });
+    }
+  }, [projectId, onTop, pushToast]);
+
+  const popIn = useCallback(async () => {
+    try {
+      await closeBrowserViewPopout(projectId);
+      if (mounted.current) setPoppedOut(false);
+    } catch (e) {
+      pushToast({
+        kind: "error",
+        message: "Could not close the browser window",
+        detail: String(e),
+      });
+    }
+  }, [projectId, pushToast]);
+
+  const toggleOnTop = useCallback(
+    async (next: boolean) => {
+      setOnTop(next);
+      try {
+        await setBrowserViewPopoutAlwaysOnTop(projectId, next);
+      } catch (e) {
+        if (mounted.current) setOnTop(!next);
+        pushToast({
+          kind: "error",
+          message: "Could not change the window's stacking",
+          detail: String(e),
+        });
       }
     },
     [projectId, pushToast],
@@ -225,9 +304,24 @@ export default function BrowserTab({ project, active }: Props) {
           </span>
         )}
         <div className="flex-1" />
-        {live && (
+        {live && poppedOut && (
+          <label className="flex items-center gap-1.5 text-xs text-[var(--text-secondary)]">
+            Keep on top
+            <Toggle
+              checked={onTop}
+              onChange={toggleOnTop}
+              label="Keep the browser window above other windows"
+            />
+          </label>
+        )}
+        {live && !poppedOut && (
           <Button size="md" onClick={() => setReloadKey((k) => k + 1)}>
             Reload
+          </Button>
+        )}
+        {live && (
+          <Button size="md" onClick={poppedOut ? popIn : popOut}>
+            {poppedOut ? "Put back in tab" : "Open in own window"}
           </Button>
         )}
         <Button
@@ -240,7 +334,28 @@ export default function BrowserTab({ project, active }: Props) {
         </Button>
       </div>
 
-      {live ? (
+      {live && poppedOut ? (
+        // The iframe is unmounted while the window is up, on purpose. Two
+        // viewers on one browser both work, but both also *drive* it — two
+        // cursors taking over the same page is not a feature.
+        <div className="flex-1 min-h-0 flex items-center justify-center p-6">
+          <div className="max-w-[28rem] text-center">
+            <h2 className="text-[13px] font-semibold text-[var(--text-primary)]">
+              This view is in its own window.
+            </h2>
+            <p className="mt-1 text-[13px] text-[var(--text-secondary)] leading-relaxed">
+              Move it to another screen, or keep it on top, and watch the browser while
+              you work here. The view keeps running either way — closing the window
+              brings it back into this tab.
+            </p>
+            <div className="mt-3 flex items-center justify-center gap-2">
+              <Button size="md" variant="primary" onClick={popIn}>
+                Put back in tab
+              </Button>
+            </div>
+          </div>
+        </div>
+      ) : live ? (
         <iframe
           key={reloadKey}
           // Loopback only, and the URL carries the one-time session token the

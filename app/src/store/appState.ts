@@ -75,6 +75,10 @@ interface AppState {
   setActiveTabKey: (key: string) => void;
   cycleTab: (delta: number) => void;
   focusTabIndex: (index: number) => void;
+  /** Reorder: put `key` at `toIndex` in the strip. Never changes what's active. */
+  moveTab: (key: string, toIndex: number) => void;
+  /** Nudge the active tab left/right — the keyboard route to the same thing. */
+  moveActiveTab: (delta: number) => void;
 
   // Inline container progress, replacing the blocking progress modal.
   containerProgress: Record<string, string>;
@@ -273,6 +277,35 @@ export const useAppState = create<AppState>((set) => ({
       return isHomeTab(key)
         ? { ...patch, selectedProjectId: tabKeyId(key) }
         : patch;
+    }),
+  // Reordering is deliberately *only* a reordering: dragging a tab does not
+  // select it, so a drag can be aimed at a background tab without yanking the
+  // main area (and a running terminal's focus) away mid-gesture.
+  moveTab: (key, toIndex) =>
+    set((state) => {
+      const from = state.tabOrder.indexOf(key);
+      if (from === -1) return {};
+      const to = Math.max(0, Math.min(toIndex, state.tabOrder.length - 1));
+      if (from === to) return {};
+      const tabOrder = [...state.tabOrder];
+      tabOrder.splice(from, 1);
+      tabOrder.splice(to, 0, key);
+      return { tabOrder };
+    }),
+  moveActiveTab: (delta) =>
+    set((state) => {
+      const key = state.activeTabKey;
+      if (!key) return {};
+      const from = state.tabOrder.indexOf(key);
+      if (from === -1) return {};
+      // Clamped, not wrapped: a tab dragged off the end would otherwise
+      // reappear at the other end, which reads as a bug on a held-down key.
+      const to = Math.max(0, Math.min(from + delta, state.tabOrder.length - 1));
+      if (from === to) return {};
+      const tabOrder = [...state.tabOrder];
+      tabOrder.splice(from, 1);
+      tabOrder.splice(to, 0, key);
+      return { tabOrder };
     }),
 
   // Container progress
