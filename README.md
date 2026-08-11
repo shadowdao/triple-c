@@ -1,3 +1,8 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="branding/triple-c-lockup-dark.svg">
+  <img src="branding/triple-c-lockup-light.svg" alt="Triple-C — Coding Container" width="429" height="112">
+</picture>
+
 # Triple-C (Claude-Code-Container)
 
 Triple-C is a cross-platform desktop application that sandboxes Claude Code inside Docker containers. Each project chooses its own **permission mode** — from Plan (read-only) through to Bypass (`--dangerously-skip-permissions`), which gives Claude unrestricted access within the sandbox.
