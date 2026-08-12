@@ -34,11 +34,19 @@ if ! flock -n 200; then
 fi
 
 # ── Source saved environment ─────────────────────────────────────────────────
+# The env file is a snapshot taken by the entrypoint, which runs as root. A
+# snapshot written before the entrypoint stopped capturing HOME still carries
+# HOME=/root, and `set -a` would apply it to `claude` below — which then finds no
+# credential under /root/.claude and exits with "Not logged in". The env file
+# lives on the home volume, so those stale copies outlive an image update until
+# the container is restarted; keep our own HOME regardless of what it says.
 if [ -f "$ENV_FILE" ]; then
+    REAL_HOME="${HOME:-/home/claude}"
     set -a
     # shellcheck disable=SC1090
     source "$ENV_FILE"
     set +a
+    HOME="$REAL_HOME"
 fi
 
 # ── Read task definition ────────────────────────────────────────────────────
