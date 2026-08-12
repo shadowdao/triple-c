@@ -133,6 +133,14 @@ forces that).
 4. **Stop**: Container halted (its filesystem layer and both named volumes persist)
 5. **Restart**: Existing container restarted; if any `triple-c.*` label no longer matches the project's settings, the container is committed to a snapshot image, removed, and recreated from that snapshot — so installed packages survive
 6. **Migrate**: The project is moved onto a newer base image without losing its volumes — see below
+
+Each recreation moves the `triple-c-snapshot-{projectId}:latest` tag, leaving the image it pointed
+at before untagged but still on disk — multiple gigabytes per recreation. `sweep_orphaned_snapshots`
+clears those after a recreation and after a migration is accepted. It only ever removes images that
+are **both** untagged *and* labelled `triple-c.managed=true`, so a live snapshot tag and a
+migration's `pre-migration-*` rollback pin are structurally out of reach, and removal is unforced so
+Docker itself refuses while any container — including a stopped project's — is still built from the
+image.
 7. **Reset**: Container, snapshot image **and both named volumes** all removed, then recreated from the clean base image. `remove_project_volumes` deletes `triple-c-home-{projectId}` and `triple-c-claude-config-{projectId}`, so `~/.claude`, `~/.claude.json`, the OAuth login, installed skills, session transcripts and the scheduler's tasks are all lost.
 
 ### Base-Image Migration

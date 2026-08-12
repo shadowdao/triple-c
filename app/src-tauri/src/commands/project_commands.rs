@@ -450,6 +450,18 @@ pub async fn start_project_container(
                 ).await?;
                 emit_progress(&app_handle, &project_id, "Starting container...");
                 docker::start_container(&new_id).await?;
+
+                // The commit above moved `:latest` and orphaned the image it
+                // used to point at; the container holding that image open was
+                // removed a few lines up, so now is when Docker will actually
+                // let it go. Detached because this is housekeeping and the
+                // project is already running — and it sweeps every orphan, not
+                // just this one, so recreations that happened before the sweep
+                // existed are cleaned up too.
+                tauri::async_runtime::spawn(async {
+                    docker::sweep_orphaned_snapshots().await;
+                });
+
                 new_id
             } else {
                 emit_progress(&app_handle, &project_id, "Starting container...");
