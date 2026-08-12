@@ -26,6 +26,21 @@ export function formatElapsed(ms: number): string {
   return `${days}d ago`;
 }
 
+/** "for 42s" / "for 4m" / "for 1h 12m" — elapsed phrasing for a run in flight.
+ *  Seconds are kept below a minute because the first thing anyone wants from a
+ *  freshly triggered run is evidence that it started at all. */
+export function formatRunningFor(iso: string | null | undefined): string | null {
+  if (!iso) return null;
+  const started = Date.parse(iso);
+  if (Number.isNaN(started)) return null;
+  const seconds = Math.max(0, Math.floor((Date.now() - started) / 1000));
+  if (seconds < 60) return `for ${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `for ${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  return `for ${hours}h ${minutes % 60}m`;
+}
+
 /** Uptime phrasing for a known start timestamp. */
 export function formatUptime(startedAtMs: number | undefined): string | null {
   if (startedAtMs === undefined) return null;

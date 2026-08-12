@@ -18,11 +18,12 @@ This container supports scheduled tasks via `triple-c-scheduler`. You can set up
 ### Commands
 - `triple-c-scheduler add --name "NAME" --schedule "CRON" --prompt "TASK"` — Add a recurring task
 - `triple-c-scheduler add --name "NAME" --at "YYYY-MM-DD HH:MM" --prompt "TASK"` — Add a one-time task
-- `triple-c-scheduler list` — List all scheduled tasks
+- `triple-c-scheduler list` — List all scheduled tasks, with a running/idle status column
 - `triple-c-scheduler remove --id ID` — Remove a task
 - `triple-c-scheduler enable --id ID` / `triple-c-scheduler disable --id ID` — Toggle tasks
+- `triple-c-scheduler status [--id ID] [--watch]` — Show what is running right now, and for how long
 - `triple-c-scheduler logs [--id ID] [--tail N]` — View execution logs
-- `triple-c-scheduler run --id ID` — Manually trigger a task immediately
+- `triple-c-scheduler run --id ID` — Manually trigger a task immediately (streams its log)
 - `triple-c-scheduler notifications [--clear]` — View or clear completion notifications
 
 ### Cron format
@@ -36,7 +37,7 @@ Use `--at "YYYY-MM-DD HH:MM"` instead of `--schedule`. The task automatically re
 Use `--working-dir /workspace/project` to set where the task runs (default: /workspace).
 
 ### Checking results
-After tasks run, check notifications with `triple-c-scheduler notifications` and detailed output with `triple-c-scheduler logs`.
+While a task is running, `triple-c-scheduler status` reports it with elapsed time — a log that has stopped growing is normal, because `claude -p` writes its answer only at the end, so use `status` rather than log silence to tell a slow run from a dead one. After tasks run, check notifications with `triple-c-scheduler notifications` and detailed output with `triple-c-scheduler logs`.
 
 ### Timezone
 Scheduled times use the container's configured timezone (check with `date`). If no timezone is configured, UTC is used."#;

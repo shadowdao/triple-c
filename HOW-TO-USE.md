@@ -1139,12 +1139,22 @@ triple-c-scheduler list                    # List all tasks
 triple-c-scheduler enable --id abc123      # Enable a task
 triple-c-scheduler disable --id abc123     # Disable a task
 triple-c-scheduler remove --id abc123      # Delete a task
-triple-c-scheduler run --id abc123         # Trigger a task immediately
+triple-c-scheduler run --id abc123         # Trigger a task now, streaming its log
+triple-c-scheduler status                  # What is running right now, and for how long
+triple-c-scheduler status --id abc123 -w   # Watch one task until its run finishes
 triple-c-scheduler logs --id abc123        # View logs for a task
 triple-c-scheduler logs --tail 20          # View last 20 log entries (all tasks)
 triple-c-scheduler notifications           # View completion notifications
 triple-c-scheduler notifications --clear   # Clear notifications
 ```
+
+`list` carries a status column, and the Automation tab marks a task **Running** with
+its elapsed time, so a triggered run is visible rather than silent.
+
+Note that a log which has stopped growing is not evidence of a stall: `claude -p`
+writes its answer in one go when it finishes, so a healthy run shows nothing but its
+header for as long as it is thinking. `status` is what distinguishes a slow run from
+a dead one — it reports the run only while the runner's process is genuinely alive.
 
 ### Cron Schedule Format
 

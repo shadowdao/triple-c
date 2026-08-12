@@ -60,6 +60,8 @@ const existingTask: ScheduledTask = {
   created_at: null,
   last_run: null,
   next_run: null,
+  running: false,
+  running_since: null,
 };
 
 async function renderEditor(task: ScheduledTask | null = null, project = baseProject) {
