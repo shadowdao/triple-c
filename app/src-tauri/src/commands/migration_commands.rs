@@ -833,6 +833,16 @@ pub async fn confirm_migration(
     migration_store::clear_staging(&project_id)?;
     migration_store::clear(&project_id)?;
     log::info!("Migration confirmed for project {}", project_id);
+
+    // Dropping the pin above is what turns the pre-migration image into an
+    // orphan: it was the only tag holding a multi-gigabyte pre-migration
+    // snapshot. Accepting the update is therefore the moment to sweep, and
+    // waiting for the project's next recreation would leave it lying around
+    // indefinitely.
+    tauri::async_runtime::spawn(async {
+        crate::docker::sweep_orphaned_snapshots().await;
+    });
+
     Ok(())
 }
 

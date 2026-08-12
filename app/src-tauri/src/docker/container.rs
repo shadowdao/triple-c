@@ -211,6 +211,12 @@ pub const SECRET_ENV_KEYS: &[&str] = &[
 ];
 
 /// Env var name prefixes Triple-C manages itself; users cannot set these by hand.
+/// The label every container Triple-C creates carries — and, because
+/// `docker commit` copies a container's labels onto the image, every snapshot it
+/// commits. [`sweep_orphaned_snapshots`] treats it as the mark of provenance,
+/// which is what keeps the sweep away from the user's own images.
+const LABEL_MANAGED: &str = "triple-c.managed";
+
 const RESERVED_ENV_PREFIXES: &[&str] = &["ANTHROPIC_", "AWS_", "GIT_", "HOST_", "TRIPLE_C_"];
 
 /// Exact env var names Triple-C manages itself. Not covered by
@@ -1355,7 +1361,7 @@ pub async fn create_container(
     }
 
     let mut labels = HashMap::new();
-    labels.insert("triple-c.managed".to_string(), "true".to_string());
+    labels.insert(LABEL_MANAGED.to_string(), "true".to_string());
     labels.insert("triple-c.project-id".to_string(), project.id.clone());
     labels.insert("triple-c.project-name".to_string(), project.name.clone());
     labels.insert("triple-c.backend".to_string(), format!("{:?}", project.backend));
@@ -1701,6 +1707,128 @@ fn env_holds_a_secret(env: &[String]) -> bool {
         };
         !value.is_empty() && SECRET_ENV_KEYS.contains(&key)
     })
+}
+
+/// Outcome of [`sweep_orphaned_snapshots`].
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct SnapshotSweepReport {
+    /// Image ids that were removed.
+    pub removed: Vec<String>,
+    /// Bytes the removed images accounted for, as Docker reported them. A
+    /// shared-layer estimate, not a disk-usage measurement.
+    pub reclaimed_bytes: i64,
+    /// Orphans Docker refused to delete because a container is still built
+    /// from them. Normal, not a failure — the next sweep gets them.
+    pub in_use: usize,
+    /// Orphans that could not be removed for any other reason, with the error.
+    pub failed: Vec<(String, String)>,
+    /// Set when the engine could not be reached or listed at all.
+    pub unavailable: Option<String>,
+}
+
+/// The filter every sweep runs under. Extracted so a test can hold the two
+/// conditions in place: **dangling** and **labelled as ours**. Losing either
+/// one turns a snapshot sweep into a prune of the user's whole image store.
+fn orphan_sweep_filters() -> HashMap<String, Vec<String>> {
+    HashMap::from([
+        ("dangling".to_string(), vec!["true".to_string()]),
+        (
+            "label".to_string(),
+            vec![format!("{}=true", LABEL_MANAGED)],
+        ),
+    ])
+}
+
+/// Remove the untagged snapshot commits left behind by recreation.
+///
+/// Every recreation commits the container to `triple-c-snapshot-{id}:latest`
+/// and moves that tag; the image the tag pointed at before keeps its layers and
+/// loses its name. Nothing else deletes those, so a project that has been
+/// recreated a dozen times leaves a dozen multi-gigabyte orphans behind.
+///
+/// Two conditions, and the safety of this whole function rests on them:
+///
+/// * **Dangling** — untagged. Every image the app relies on carries a tag:
+///   `triple-c-snapshot-{id}:latest` is what a project is rebuilt from, and a
+///   migration's `pre-migration-*` pin is the only copy of a rollback target.
+///   Neither can ever match this filter, so neither can be swept.
+/// * **`triple-c.managed=true`** — only images Triple-C itself committed.
+///   `docker commit` copies the container's labels onto the image, which is what
+///   makes the label a reliable mark of provenance. The user's own dangling
+///   images are none of our business.
+///
+/// Removal is not forced, so Docker refuses (409) while any container is still
+/// built from the image — including the stopped containers of projects that are
+/// not running. That refusal is the third safety net and it is the daemon's,
+/// not ours; those orphans are simply counted and left for a later sweep.
+///
+/// Never fails the caller: this is housekeeping, and a full disk is a better
+/// outcome than a project that will not start.
+pub async fn sweep_orphaned_snapshots() -> SnapshotSweepReport {
+    use bollard::image::ListImagesOptions;
+
+    let mut report = SnapshotSweepReport::default();
+
+    let docker = match get_docker() {
+        Ok(d) => d,
+        Err(e) => {
+            report.unavailable = Some(e);
+            return report;
+        }
+    };
+
+    let images = match docker
+        .list_images(Some(ListImagesOptions {
+            all: false,
+            filters: orphan_sweep_filters(),
+            ..Default::default()
+        }))
+        .await
+    {
+        Ok(images) => images,
+        Err(e) => {
+            report.unavailable = Some(format!("Could not list orphaned snapshots: {}", e));
+            return report;
+        }
+    };
+
+    for summary in images {
+        match docker
+            .remove_image(
+                &summary.id,
+                Some(RemoveImageOptions {
+                    force: false,
+                    noprune: false,
+                }),
+                None,
+            )
+            .await
+        {
+            Ok(_) => {
+                report.reclaimed_bytes += summary.size;
+                report.removed.push(summary.id);
+            }
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 409, ..
+            }) => {
+                report.in_use += 1;
+            }
+            Err(e) => {
+                report.failed.push((summary.id, e.to_string()));
+            }
+        }
+    }
+
+    if !report.removed.is_empty() || report.in_use > 0 {
+        log::info!(
+            "Snapshot sweep: removed {} orphan(s) ({:.2} GB), {} still in use by a container",
+            report.removed.len(),
+            report.reclaimed_bytes as f64 / 1_073_741_824.0,
+            report.in_use
+        );
+    }
+
+    report
 }
 
 /// Outcome of [`scrub_secrets_from_snapshots`], so callers can tell the user
@@ -2366,7 +2494,7 @@ pub async fn list_sibling_containers() -> Result<Vec<ContainerSummary>, String> 
         .into_iter()
         .filter(|c| {
             if let Some(labels) = &c.labels {
-                !labels.contains_key("triple-c.managed")
+                !labels.contains_key(LABEL_MANAGED)
             } else {
                 true
             }
@@ -2485,6 +2613,22 @@ mod tests {
             value: "sneaky".to_string(),
         }]);
         assert_eq!(fp, "");
+    }
+
+    #[test]
+    fn the_orphan_sweep_only_ever_looks_at_our_own_untagged_images() {
+        // Both conditions are load-bearing. Without `dangling` the sweep would
+        // match `triple-c-snapshot-{id}:latest` — what every project is rebuilt
+        // from — and a migration's `pre-migration-*` pin, which is the only copy
+        // of a rollback target. Without the label it would match every dangling
+        // image on the user's machine.
+        let filters = orphan_sweep_filters();
+        assert_eq!(filters.get("dangling"), Some(&vec!["true".to_string()]));
+        assert_eq!(
+            filters.get("label"),
+            Some(&vec!["triple-c.managed=true".to_string()])
+        );
+        assert_eq!(filters.len(), 2, "an extra filter widens or narrows the sweep");
     }
 
     #[test]
