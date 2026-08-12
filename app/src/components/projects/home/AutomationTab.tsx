@@ -15,7 +15,7 @@ import Toggle from "../../ui/Toggle";
 import Modal from "../../ui/Modal";
 import StatusIndicator from "../../ui/StatusIndicator";
 import TaskEditorModal from "./TaskEditorModal";
-import { formatAge } from "./format";
+import { formatAge, formatRunningFor } from "./format";
 
 interface Props {
   project: Project;
@@ -58,6 +58,22 @@ export default function AutomationTab({ project }: Props) {
   }, [project.id, running]);
 
   useEffect(load, [load]);
+
+  // A task in flight is the one state this view cannot sit still for: runs are
+  // detached, so without polling "Run now" looks like it did nothing until the
+  // user reaches for Refresh. Polling stops as soon as nothing is running.
+  //
+  // `justTriggered` covers the gap between firing a run and the runner writing
+  // its state file — a second or two in which the task still reads as idle, and
+  // where giving up on polling would reproduce the exact silence this fixes.
+  const anyTaskRunning = tasks.some((t) => t.running);
+  const [justTriggered, setJustTriggered] = useState(0);
+  useEffect(() => {
+    if (!running) return;
+    if (!anyTaskRunning && Date.now() - justTriggered > 20_000) return;
+    const timer = setInterval(load, anyTaskRunning ? 5000 : 1500);
+    return () => clearInterval(timer);
+  }, [running, anyTaskRunning, justTriggered, load]);
 
   const withTask = async (taskId: string, label: string, fn: () => Promise<unknown>) => {
     setBusyTaskId(taskId);
@@ -185,6 +201,12 @@ export default function AutomationTab({ project }: Props) {
                     <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded-[var(--radius-control)] bg-[var(--bg-tertiary)] text-[var(--text-secondary)]">
                       {task.task_type}
                     </span>
+                    {task.running && (
+                      <StatusIndicator
+                        tone="busy"
+                        label={`Running ${formatRunningFor(task.running_since) ?? ""}`.trim()}
+                      />
+                    )}
                   </div>
                   <div className="text-xs text-[var(--text-secondary)] font-mono truncate">
                     {task.at ?? task.schedule}
@@ -202,14 +224,15 @@ export default function AutomationTab({ project }: Props) {
                   }
                 />
                 <Button
-                  disabled={busyTaskId === task.id}
+                  disabled={busyTaskId === task.id || task.running}
                   onClick={() =>
-                    withTask(task.id, "Run now", () =>
-                      runScheduledTaskNow(project.id, task.id),
-                    )
+                    withTask(task.id, "Run now", async () => {
+                      await runScheduledTaskNow(project.id, task.id);
+                      setJustTriggered(Date.now());
+                    })
                   }
                 >
-                  Run now
+                  {task.running ? "Running…" : "Run now"}
                 </Button>
                 <Button disabled={busyTaskId === task.id} onClick={() => setEditing(task)}>
                   Edit

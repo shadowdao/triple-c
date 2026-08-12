@@ -388,6 +388,10 @@ export interface ScheduledTask {
   last_run: string | null;
   /** Known only for enabled one-shot tasks; cron is not evaluated. */
   next_run: string | null;
+  /** A run is in flight right now (the runner's pid was verified live). */
+  running: boolean;
+  /** When that run started. Null unless `running`. */
+  running_since: string | null;
 }
 
 /** Mirrors Rust `ScheduleKind` — which of the scheduler's two `add` flags to

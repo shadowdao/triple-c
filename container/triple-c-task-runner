@@ -9,6 +9,7 @@ SCHEDULER_DIR="${HOME}/.claude/scheduler"
 TASKS_DIR="${SCHEDULER_DIR}/tasks"
 LOGS_DIR="${SCHEDULER_DIR}/logs"
 NOTIFICATIONS_DIR="${SCHEDULER_DIR}/notifications"
+RUNNING_DIR="${SCHEDULER_DIR}/running"
 ENV_FILE="${SCHEDULER_DIR}/.env"
 
 TASK_ID="${1:-}"
@@ -34,11 +35,19 @@ if ! flock -n 200; then
 fi
 
 # ── Source saved environment ─────────────────────────────────────────────────
+# The env file is a snapshot taken by the entrypoint, which runs as root. A
+# snapshot written before the entrypoint stopped capturing HOME still carries
+# HOME=/root, and `set -a` would apply it to `claude` below — which then finds no
+# credential under /root/.claude and exits with "Not logged in". The env file
+# lives on the home volume, so those stale copies outlive an image update until
+# the container is restarted; keep our own HOME regardless of what it says.
 if [ -f "$ENV_FILE" ]; then
+    REAL_HOME="${HOME:-/home/claude}"
     set -a
     # shellcheck disable=SC1090
     source "$ENV_FILE"
     set +a
+    HOME="$REAL_HOME"
 fi
 
 # ── Read task definition ────────────────────────────────────────────────────
@@ -68,6 +77,27 @@ mkdir -p "$TASK_LOG_DIR"
 
 TIMESTAMP=$(date +"%Y%m%d-%H%M%S")
 LOG_FILE="${TASK_LOG_DIR}/${TIMESTAMP}.log"
+
+# ── Publish run state ───────────────────────────────────────────────────────
+# A scheduled run is detached — cron has no terminal, and the app fires it as a
+# detached exec — so without this there is no way to tell a task that is still
+# thinking from one that died, and a long run reads as a stall. `list`, `status`
+# and the app's Automation tab all read this file.
+#
+# flock above is what actually prevents overlapping runs; this is purely an
+# observability record, which is why readers verify the pid rather than trust
+# the file. The EXIT trap covers the crash paths (OOM, container stop, SIGTERM)
+# that would otherwise leave a task looking like it had been running for days.
+mkdir -p "$RUNNING_DIR"
+RUN_STATE="${RUNNING_DIR}/${TASK_ID}.json"
+trap 'rm -f "$RUN_STATE"' EXIT
+jq -n \
+    --arg pid "$$" \
+    --arg started "$(date +%s)" \
+    --arg log "$LOG_FILE" \
+    --arg name "$TASK_NAME" \
+    '{pid: ($pid | tonumber), started_epoch: ($started | tonumber), log: $log, name: $name}' \
+    > "$RUN_STATE"
 
 # ── Execute Claude agent ────────────────────────────────────────────────────
 {

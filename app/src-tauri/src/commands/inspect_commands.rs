@@ -164,6 +164,11 @@ pub struct ScheduledTask {
     /// Only known for enabled one-shot tasks (their `at` time). Recurring cron
     /// expressions are not evaluated here.
     pub next_run: Option<String>,
+    /// Whether a run is in flight right now, from the runner's state file in
+    /// `~/.claude/scheduler/running/<id>.json` with its pid verified live.
+    pub running: bool,
+    /// When the in-flight run started, ISO 8601 (UTC). `None` unless `running`.
+    pub running_since: Option<String>,
 }
 
 /// A completion notice written by `triple-c-task-runner` after a task ran.
@@ -614,13 +619,25 @@ const SCHEDULER_LIST_SCRIPT: &str = r#"exec 2>/dev/null
 set -u
 TASKS="$HOME/.claude/scheduler/tasks"
 LOGS="$HOME/.claude/scheduler/logs"
+RUNNING="$HOME/.claude/scheduler/running"
 [ -d "$TASKS" ] || { echo '[]'; exit 0; }
 for f in "$TASKS"/*.json; do
   [ -f "$f" ] || continue
   id=$(jq -r '.id // ""' "$f") || continue
   [ -n "$id" ] || id=$(basename "$f" .json)
   last=$(find "$LOGS/$id" -name '*.log' -type f -printf '%T@\n' | sort -rn | head -1)
-  jq -c --arg fallback_id "$id" --arg lr "${last%%.*}" '{
+  # Live-run state. The pid is checked, not trusted: a container stopped
+  # mid-run cannot fire the runner's cleanup trap, and a task stuck on
+  # "running" forever is a worse lie than showing nothing.
+  started=""
+  state="$RUNNING/$id.json"
+  if [ -f "$state" ]; then
+    pid=$(jq -r '.pid // empty' "$state")
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      started=$(jq -r '.started_epoch // empty' "$state")
+    fi
+  fi
+  jq -c --arg fallback_id "$id" --arg lr "${last%%.*}" --arg started "$started" '{
       id: (if (.id // "") == "" then $fallback_id else .id end),
       name: (.name // ""),
       prompt: (.prompt // ""),
@@ -630,7 +647,8 @@ for f in "$TASKS"/*.json; do
       enabled: (.enabled == true),
       working_dir: (.working_dir // "/workspace"),
       created_at: (.created_at // null),
-      last_run_epoch: (if $lr == "" then null else ($lr | tonumber) end)
+      last_run_epoch: (if $lr == "" then null else ($lr | tonumber) end),
+      running_since_epoch: (if $started == "" then null else ($started | tonumber) end)
     }' "$f"
 done | jq -s 'sort_by(.name, .id)'
 "#;
@@ -673,6 +691,7 @@ struct RawScheduledTask {
     working_dir: String,
     created_at: Option<String>,
     last_run_epoch: Option<i64>,
+    running_since_epoch: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -723,6 +742,8 @@ pub async fn list_scheduled_tasks(
                 created_at: t.created_at,
                 last_run: t.last_run_epoch.map(epoch_to_iso),
                 next_run,
+                running: t.running_since_epoch.is_some(),
+                running_since: t.running_since_epoch.map(epoch_to_iso),
             }
         })
         .collect())

@@ -8,15 +8,57 @@ SCHEDULER_DIR="${HOME}/.claude/scheduler"
 TASKS_DIR="${SCHEDULER_DIR}/tasks"
 LOGS_DIR="${SCHEDULER_DIR}/logs"
 NOTIFICATIONS_DIR="${SCHEDULER_DIR}/notifications"
+RUNNING_DIR="${SCHEDULER_DIR}/running"
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 ensure_dirs() {
-    mkdir -p "$TASKS_DIR" "$LOGS_DIR" "$NOTIFICATIONS_DIR"
+    mkdir -p "$TASKS_DIR" "$LOGS_DIR" "$NOTIFICATIONS_DIR" "$RUNNING_DIR"
 }
 
 generate_id() {
     head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n'
+}
+
+# Live run state for a task: prints "pid<TAB>started_epoch<TAB>log" and returns
+# 0 when the task is genuinely running, returns 1 otherwise.
+#
+# triple-c-task-runner writes the file and removes it from an EXIT trap, but a
+# trap cannot fire for SIGKILL or a container stop mid-run. So the pid is
+# checked rather than believed, and a state file whose process is gone is
+# cleared here — otherwise one hard stop leaves a task reading as "running"
+# forever, which is worse than no indicator at all.
+run_state() {
+    local id="$1"
+    local state_file="${RUNNING_DIR}/${id}.json"
+    [ -f "$state_file" ] || return 1
+
+    local pid
+    pid=$(jq -r '.pid // empty' "$state_file" 2>/dev/null)
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+        rm -f "$state_file"
+        return 1
+    fi
+
+    printf '%s\t%s\t%s\n' \
+        "$pid" \
+        "$(jq -r '.started_epoch // 0' "$state_file")" \
+        "$(jq -r '.log // ""' "$state_file")"
+}
+
+# Compact elapsed time since an epoch, e.g. "8s", "4m12s", "1h07m".
+elapsed_since() {
+    local start="$1" now delta
+    now=$(date +%s)
+    delta=$(( now - start ))
+    [ "$delta" -lt 0 ] && delta=0
+    if [ "$delta" -ge 3600 ]; then
+        printf '%dh%02dm' $(( delta / 3600 )) $(( (delta % 3600) / 60 ))
+    elif [ "$delta" -ge 60 ]; then
+        printf '%dm%02ds' $(( delta / 60 )) $(( delta % 60 ))
+    else
+        printf '%ds' "$delta"
+    fi
 }
 
 # Reject a malformed cron expression at the point of entry.
@@ -85,8 +127,9 @@ Commands:
   enable       Enable a disabled task
   disable      Disable a task
   list         List all tasks
+  status       Show which tasks are running right now
   logs         Show execution logs
-  run          Manually trigger a task now
+  run          Manually trigger a task now (streams its log)
   notifications  Show or clear completion notifications
 
 Add options:
@@ -98,6 +141,10 @@ Add options:
 
 Remove/Enable/Disable/Run options:
   --id ID              Task ID (required)
+
+Status options:
+  --id ID              Show one task, including its last result when idle
+  --watch, -w          Refresh every 5s until the run finishes
 
 Logs options:
   --id ID              Show logs for a specific task (optional)
@@ -313,8 +360,8 @@ cmd_disable() {
 
 cmd_list() {
     local found=false
-    printf "%-10s %-20s %-10s %-9s %-20s %s\n" "ID" "NAME" "TYPE" "ENABLED" "SCHEDULE" "PROMPT"
-    printf "%-10s %-20s %-10s %-9s %-20s %s\n" "──────────" "────────────────────" "──────────" "─────────" "────────────────────" "──────────────────────────────"
+    printf "%-10s %-20s %-10s %-9s %-20s %-12s %s\n" "ID" "NAME" "TYPE" "ENABLED" "SCHEDULE" "STATUS" "PROMPT"
+    printf "%-10s %-20s %-10s %-9s %-20s %-12s %s\n" "──────────" "────────────────────" "──────────" "─────────" "────────────────────" "────────────" "──────────────────────────────"
 
     for task_file in "$TASKS_DIR"/*.json; do
         [ -f "$task_file" ] || continue
@@ -333,17 +380,98 @@ cmd_list() {
             display_schedule="at $at"
         fi
 
+        local status state started
+        if state=$(run_state "$id"); then
+            started=$(printf '%s' "$state" | cut -f2)
+            status="running $(elapsed_since "$started")"
+        else
+            status="idle"
+        fi
+
         # Truncate long fields for display
         [ ${#name} -gt 20 ] && name="${name:0:17}..."
         [ ${#display_schedule} -gt 20 ] && display_schedule="${display_schedule:0:17}..."
         [ ${#prompt} -gt 30 ] && prompt="${prompt:0:27}..."
 
-        printf "%-10s %-20s %-10s %-9s %-20s %s\n" "$id" "$name" "$type" "$enabled" "$display_schedule" "$prompt"
+        printf "%-10s %-20s %-10s %-9s %-20s %-12s %s\n" \
+            "$id" "$name" "$type" "$enabled" "$display_schedule" "$status" "$prompt"
     done
 
     if [ "$found" = "false" ]; then
         echo "No scheduled tasks."
     fi
+}
+
+# Is anything running, and how far along is it?
+#
+# This is the command for the question "did my `run` do anything, or has it
+# stalled?" — `logs` alone cannot answer it, because a log that stops growing
+# looks identical whether Claude is thinking or the run is dead.
+cmd_status() {
+    local id="" watch=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --id)    id="$2"; shift 2 ;;
+            --watch|-w) watch=true; shift ;;
+            *) echo "Unknown option: $1" >&2; return 1 ;;
+        esac
+    done
+
+    while true; do
+        local any=false
+        for task_file in "$TASKS_DIR"/*.json; do
+            [ -f "$task_file" ] || continue
+            local tid
+            tid=$(jq -r '.id' "$task_file")
+            [ -z "$id" ] || [ "$tid" = "$id" ] || continue
+
+            local name state
+            name=$(jq -r '.name' "$task_file")
+            if state=$(run_state "$tid"); then
+                any=true
+                local pid started log
+                pid=$(printf '%s' "$state" | cut -f1)
+                started=$(printf '%s' "$state" | cut -f2)
+                log=$(printf '%s' "$state" | cut -f3)
+                echo "● RUNNING  $name ($tid)"
+                echo "    elapsed: $(elapsed_since "$started")   pid: $pid"
+                echo "    log:     $log"
+                # `claude -p` writes its answer in one go at the end, so a log
+                # with only its header is the normal state of a healthy run —
+                # print the tail only when there is something to show, rather
+                # than an empty "last output:" that reads like a stall.
+                # `|| true` throughout: under `set -e` a grep matching nothing
+                # would otherwise abort the whole command.
+                local tail_out=""
+                if [ -f "$log" ]; then
+                    tail_out=$({ grep -v '^===' "$log" || true; } \
+                        | { grep -v '^$' || true; } | tail -n 3)
+                fi
+                if [ -n "$tail_out" ]; then
+                    echo "    last output:"
+                    printf '%s\n' "$tail_out" | sed 's/^/      /'
+                fi
+            elif [ -n "$id" ]; then
+                echo "○ idle     $name ($tid)"
+                local latest
+                latest=$(ls -t "$LOGS_DIR/$tid"/*.log 2>/dev/null | head -1) || true
+                if [ -n "$latest" ]; then
+                    echo "    last run: $(basename "$latest" .log)  $(grep -o 'Exit code: [0-9]*' "$latest" | tail -1)"
+                fi
+            fi
+        done
+
+        if [ "$any" = "false" ] && [ -z "$id" ]; then
+            echo "Nothing running."
+        fi
+
+        [ "$watch" = "true" ] || break
+        # Stop watching once the thing being watched has finished.
+        [ "$any" = "true" ] || break
+        sleep 5
+        echo ""
+    done
 }
 
 cmd_logs() {
@@ -413,8 +541,53 @@ cmd_run() {
 
     local name
     name=$(jq -r '.name' "$task_file")
+
+    if run_state "$id" >/dev/null; then
+        echo "Task '$name' ($id) is already running — see: triple-c-scheduler status --id $id"
+        return 0
+    fi
+
     echo "Manually triggering task '$name' ($id)..."
-    /usr/local/bin/triple-c-task-runner "$id"
+
+    # Run in the background and stream its log. A task can easily think for
+    # minutes, and the previous behaviour — block with no output until it is
+    # over — is indistinguishable from a hang.
+    /usr/local/bin/triple-c-task-runner "$id" &
+    local runner_pid=$!
+
+    local state="" waited=0
+    while [ "$waited" -lt 20 ]; do
+        if state=$(run_state "$id"); then
+            break
+        fi
+        kill -0 "$runner_pid" 2>/dev/null || break
+        sleep 0.5
+        waited=$(( waited + 1 ))
+    done
+
+    local log=""
+    [ -n "$state" ] && log=$(printf '%s' "$state" | cut -f3)
+
+    if [ -n "$log" ]; then
+        echo "  log:     $log"
+        echo "  elsewhere: triple-c-scheduler status --id $id --watch"
+        echo ""
+        # --pid stops the follow when the runner exits, so this returns on its own.
+        tail -n +1 -f --pid="$runner_pid" "$log" 2>/dev/null
+    fi
+
+    local rc=0
+    wait "$runner_pid" || rc=$?
+
+    # A run short enough that its state file was never observed still deserves
+    # its output shown rather than swallowed.
+    if [ -z "$log" ]; then
+        local latest
+        latest=$(ls -t "$LOGS_DIR/$id"/*.log 2>/dev/null | head -1) || true
+        [ -n "$latest" ] && tail -n 20 "$latest"
+    fi
+
+    return $rc
 }
 
 cmd_notifications() {
@@ -464,6 +637,7 @@ case "$command" in
     enable)        cmd_enable "$@" ;;
     disable)       cmd_disable "$@" ;;
     list)          cmd_list ;;
+    status)        cmd_status "$@" ;;
     logs)          cmd_logs "$@" ;;
     run)           cmd_run "$@" ;;
     notifications) cmd_notifications "$@" ;;

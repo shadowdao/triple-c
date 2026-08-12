@@ -434,17 +434,26 @@ chown -R claude:claude "$SCHEDULER_DIR"
 cron
 
 # Save environment variables for cron jobs (cron runs with a minimal env)
+#
+# HOME is deliberately NOT captured here. This entrypoint runs as root, so the
+# snapshot would record HOME=/root — and the task runner sources this file with
+# `set -a`, which would overwrite the HOME cron gives the job. Claude Code then
+# looks for its OAuth credential at /root/.claude/.credentials.json instead of
+# /home/claude/.claude/.credentials.json and every scheduled task dies with
+# "Not logged in · Please run /login". Cron still needs a HOME, so it is written
+# explicitly below with the value the `claude` user actually has.
 ENV_FILE="$SCHEDULER_DIR/.env"
 : > "$ENV_FILE"
 env | while IFS='=' read -r key value; do
     case "$key" in
-        ANTHROPIC_*|AWS_*|CLAUDE_CODE_*|TRIPLE_C_PERMISSION_MODE|PATH|HOME|LANG|TZ|COLORTERM|BROWSER|NODE_EXTRA_CA_CERTS|REQUESTS_CA_BUNDLE|SSL_CERT_FILE)
+        ANTHROPIC_*|AWS_*|CLAUDE_CODE_*|TRIPLE_C_PERMISSION_MODE|PATH|LANG|TZ|COLORTERM|BROWSER|NODE_EXTRA_CA_CERTS|REQUESTS_CA_BUNDLE|SSL_CERT_FILE)
             # Escape single quotes in value and write as KEY='VALUE'
             escaped_value=$(printf '%s' "$value" | sed "s/'/'\\\\''/g")
             printf "%s='%s'\n" "$key" "$escaped_value" >> "$ENV_FILE"
             ;;
     esac
 done
+printf "HOME='/home/claude'\n" >> "$ENV_FILE"
 chown claude:claude "$ENV_FILE"
 chmod 600 "$ENV_FILE"
 
