@@ -131,7 +131,15 @@ export default function ContainerMigrationBanner({
   const probeFoundGaps =
     !staleness.known &&
     (staleness.missing_features.length > 0 || staleness.missing_paths.length > 0);
-  if (!staleness.stale && !probeFoundGaps) return null;
+
+  // The probe is the *only* signal a container with no lineage label has, so
+  // when it fails there is nothing left to be quiet about. Staying silent here
+  // is indistinguishable from "everything is fine" — and it is the likeliest
+  // outcome for the oldest, largest projects, whose manifests are the ones apt
+  // to exceed the inspection limit. Say that the check did not run instead.
+  const probeUnavailable = !staleness.known && !!staleness.probe_error;
+
+  if (!staleness.stale && !probeFoundGaps && !probeUnavailable) return null;
 
   const snapshot = formatSnapshotDate(staleness.snapshot_created_at);
   const features = joinFeatures(staleness.missing_features);
@@ -139,16 +147,25 @@ export default function ContainerMigrationBanner({
   return (
     <section
       className={`${SHELL} border-[var(--warning)]/40 bg-[var(--warning-muted)]`}
-      aria-label="Container base is out of date"
+      aria-label={
+        probeUnavailable
+          ? "Container base could not be checked"
+          : "Container base is out of date"
+      }
     >
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0 space-y-1">
           <StatusIndicator
-            tone="error"
+            // A check that could not run is not a finding: it gets the
+            // "unresolved" tone rather than the one that says something is
+            // wrong with the container.
+            tone={probeUnavailable ? "unknown" : "error"}
             label={
               staleness.known
                 ? "Container base is out of date"
-                : "Container is missing things the current base ships"
+                : probeUnavailable
+                  ? "Container base could not be checked"
+                  : "Container is missing things the current base ships"
             }
             className="text-[13px] font-semibold"
           />
@@ -158,7 +175,9 @@ export default function ContainerMigrationBanner({
               ? snapshot
                 ? `Running on a saved image from ${snapshot}.`
                 : "Running on a saved image older than the current base."
-              : "This container predates base-image tracking, so it was probed directly."}
+              : probeUnavailable
+                ? "This container predates base-image tracking, so probing it is the only way to tell whether it is behind — and that did not complete."
+                : "This container predates base-image tracking, so it was probed directly."}
           </p>
 
           {staleness.missing_features.length > 0 && (
