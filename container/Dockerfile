@@ -318,6 +318,13 @@ COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 COPY triple-c-scheduler /usr/local/bin/triple-c-scheduler
 RUN chmod +x /usr/local/bin/triple-c-scheduler
+# Lives in /usr/local/bin rather than under /home/claude on purpose: the home
+# directory is the mount point of the project's home volume, so an image copy
+# of it is masked after the project's first start and can never be updated
+# again. /usr/local/bin rides the snapshot and is replaced on migration, which
+# is what lets a fix to this script reach an existing project at all.
+COPY triple-c-playwright-heal /usr/local/bin/triple-c-playwright-heal
+RUN chmod +x /usr/local/bin/triple-c-playwright-heal
 COPY triple-c-task-runner /usr/local/bin/triple-c-task-runner
 RUN chmod +x /usr/local/bin/triple-c-task-runner
 
