@@ -273,6 +273,30 @@ migration and Reset. Four things here are not obvious:
   actively **removes** `triple-c-*.crt` when the setting is cleared — `/usr/local/share` rides the
   project's snapshot image, so turning the feature off has to undo, not merely stop.
 
+### VPN support (`vpn_support_enabled`, `docker/container.rs`)
+
+An opt-in per-project switch granting the container what a VPN client needs to build a tunnel.
+`vpn_host_config()` is the single definition of what that means, and it is unit-tested because a
+container is created once by a very long function where a dropped capability is invisible.
+
+- **All three pieces or none.** `CAP_NET_ADMIN` (Docker's default set has `net_raw` but *not*
+  `net_admin`, so a client can ping but never connect), the `/dev/net/tun` device (absent
+  entirely from a default container — nothing to open even with the capability), and
+  `net.ipv4.conf.all.src_valid_mark=1` (WireGuard's `wg-quick` sets it and cannot from inside a
+  container, since `/proc/sys` is read-only, so handshake packets die to reverse-path filtering).
+  Any two without the third still presents as a connection that hangs to a timeout, which is why
+  the tests assert the whole set.
+- **The device is passed through from the host, never `mknod`-ed inside.** The kernel's `tun`
+  module has to back it. When the host has no such device the failure lands at *creation* — the
+  project simply won't start — so `explain_create_failure()` rewrites that one error to name the
+  switch and the Docker-Desktop-VM-vs-your-machine distinction. Do not let it degrade to a raw
+  bollard string.
+- **`triple-c.vpn-support` is written unconditionally, including `false`.** The usual
+  `docker commit` reason: a `true` stamped once would ride the snapshot image into every future
+  container and make the switch impossible to turn off.
+- Off is byte-identical to a container created before the feature existed, and a missing label
+  reads as `false`, so no existing project is churned.
+
 ### Container Lifecycle
 
 Containers use a **stop/start** model (not create/destroy). Installed packages persist across stops. The `.claude` config dir uses a named Docker volume (`triple-c-claude-config-{projectId}`), nested inside the home volume (`triple-c-home-{projectId}`), so OAuth tokens and Claude Code config survive container stop/start *and* container recreation.

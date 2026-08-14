@@ -33,6 +33,10 @@ export interface Project {
   auth_bridge_enabled: boolean;
   /** Opt in to the browser-view pane. Host-side only, like `auth_bridge_enabled`. */
   browser_view_enabled: boolean;
+  /** Grant NET_ADMIN, /dev/net/tun and the WireGuard `src_valid_mark` sysctl so
+   *  a VPN client inside the container can build a tunnel. Unlike the two flags
+   *  above this is container state — changing it recreates the container. */
+  vpn_support_enabled: boolean;
   /** Use the shared long-lived Claude Code token (from `claude setup-token`,
    *  held in the OS keychain) instead of this project's own `claude login`.
    *  Defaults to true; only applies when `backend` is "anthropic" and a token

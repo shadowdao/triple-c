@@ -120,6 +120,15 @@ export default function OverviewTab({
               {project.mission_control_enabled ? "ON" : "OFF"}
             </span>
           </span>
+          {/* Only when granted. It is off for nearly every project and an
+              always-present "VPN OFF" would be noise, but where it *is* on the
+              container holds NET_ADMIN, which is worth seeing at a glance. */}
+          {project.vpn_support_enabled && (
+            <span className="text-[var(--text-secondary)]">
+              VPN support{" "}
+              <span className="text-[var(--text-primary)] font-medium">ON</span>
+            </span>
+          )}
           <button
             type="button"
             onClick={() => onOpenTab("config")}

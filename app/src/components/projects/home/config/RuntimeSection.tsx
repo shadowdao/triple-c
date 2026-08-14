@@ -58,6 +58,19 @@ export default function RuntimeSection({
         />
 
         <SwitchRow
+          label="VPN support"
+          hint="Grants NET_ADMIN and the /dev/net/tun device so a VPN client (PIA, WireGuard, OpenVPN, Tailscale) can build a tunnel inside the container. Without it a client installs and runs but its connection hangs until it times out. Anything in the container can then reconfigure the container's own network stack; the host's is untouched."
+          control={
+            <Toggle
+              label="VPN support"
+              checked={project.vpn_support_enabled}
+              disabled={disabled}
+              onChange={(v) => save({ vpn_support_enabled: v })}
+            />
+          }
+        />
+
+        <SwitchRow
           label="Mission Control"
           hint="A web dashboard for monitoring and managing Claude sessions remotely."
           control={
