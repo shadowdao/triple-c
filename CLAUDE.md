@@ -273,6 +273,41 @@ migration and Reset. Four things here are not obvious:
   actively **removes** `triple-c-*.crt` when the setting is cleared — `/usr/local/share` rides the
   project's snapshot image, so turning the feature off has to undo, not merely stop.
 
+### VPN support (`vpn_support_enabled`, `docker/container.rs`)
+
+An opt-in per-project switch granting the container what a VPN client needs to build a tunnel.
+`vpn_host_config()` is the single definition of what that means, and it is unit-tested because a
+container is created once by a very long function where a dropped capability is invisible.
+
+- **All three pieces or none.** `CAP_NET_ADMIN` (Docker's default set has `net_raw` but *not*
+  `net_admin`, so a client can ping but never connect), the `/dev/net/tun` device (absent
+  entirely from a default container — nothing to open even with the capability), and
+  `net.ipv4.conf.all.src_valid_mark=1` (WireGuard's `wg-quick` sets it and cannot from inside a
+  container, since `/proc/sys` is read-only, so handshake packets die to reverse-path filtering).
+  Any two without the third still presents as a connection that hangs to a timeout, which is why
+  the tests assert the whole set.
+- **The device is passed through from the host, never `mknod`-ed inside.** The kernel's `tun`
+  module has to back it.
+- **A missing device fails at `start`, not `create` — verified against Docker 29.7.** `docker
+  create --device /dev/does-not-exist` succeeds and prints an id; runc resolves the device (and
+  validates sysctls) only when it builds the container. So the guard belongs on the start path:
+  `explain_container_failure()` covers both and is called from `start_container`, where it has a
+  container id and no project — which is why it keys off the error naming `/dev/net/tun` rather
+  than off `vpn_support_enabled`. Nothing else in Triple-C requests a device, so that is
+  unambiguous. A version of this check wired to `create` alone is dead code that looks correct.
+- **`NET_ADMIN` here is not user-namespaced.** Docker does not enable userns remapping by default,
+  so only the *network* namespace confines it: no reach onto host interfaces, but promiscuous
+  mode, arbitrary addresses/routes/NAT on the shared `docker0` segment (sibling containers, the
+  LiteLLM gateway among them, are ARP-spoofable), netlink-triggered host module auto-load, and
+  enough authority to flush in-container netfilter rules that sandbox mode may rely on. Keep the
+  code comments honest about this — an earlier draft claimed it "confers no authority" outside the
+  container, which is too strong.
+- **`triple-c.vpn-support` is written unconditionally, including `false`.** The usual
+  `docker commit` reason: a `true` stamped once would ride the snapshot image into every future
+  container and make the switch impossible to turn off.
+- Off is byte-identical to a container created before the feature existed, and a missing label
+  reads as `false`, so no existing project is churned.
+
 ### Container Lifecycle
 
 Containers use a **stop/start** model (not create/destroy). Installed packages persist across stops. The `.claude` config dir uses a named Docker volume (`triple-c-claude-config-{projectId}`), nested inside the home volume (`triple-c-home-{projectId}`), so OAuth tokens and Claude Code config survive container stop/start *and* container recreation.

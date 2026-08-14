@@ -145,6 +145,22 @@ pub struct Project {
     /// container-recreation label.
     #[serde(default)]
     pub browser_view_enabled: bool,
+    /// Grant the container what a VPN client needs to build a tunnel:
+    /// `CAP_NET_ADMIN`, the `/dev/net/tun` device, and the WireGuard
+    /// `src_valid_mark` sysctl. Without all three a client (PIA, WireGuard,
+    /// OpenVPN) installs and runs but its connection attempt hangs until it
+    /// times out, because it cannot create the tunnel interface or touch the
+    /// routing table.
+    ///
+    /// Off by default and deliberately opt-in: `NET_ADMIN` lets anything in the
+    /// container reconfigure its own network stack, which reaches further than
+    /// it sounds — see `vpn_host_config` for what it does and does not confer.
+    /// Unlike `auth_bridge_enabled` this *is*
+    /// container state, so it carries a `triple-c.vpn-support` label and is
+    /// compared in `container_needs_recreation` — capabilities and devices are
+    /// fixed at creation and can only change by recreating the container.
+    #[serde(default)]
+    pub vpn_support_enabled: bool,
     /// Use the shared, long-lived Claude Code OAuth token (from
     /// `claude setup-token`, held in the OS keychain) for this project instead
     /// of requiring its own `claude login`. Only consulted when `backend` is
@@ -366,6 +382,7 @@ impl Project {
             mission_control_enabled: false,
             auth_bridge_enabled: false,
             browser_view_enabled: false,
+            vpn_support_enabled: false,
             use_shared_auth_token: default_use_shared_auth_token(),
             full_permissions: false,
             permission_mode: None,

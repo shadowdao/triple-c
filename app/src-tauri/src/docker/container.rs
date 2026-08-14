@@ -798,6 +798,111 @@ async fn resolve_base_image_id(image_name: &str, base_image_name: &str) -> Strin
         .unwrap_or_default()
 }
 
+/// The `/dev/net/tun` character device, as it is named on both sides.
+const TUN_DEVICE: &str = "/dev/net/tun";
+
+/// The `HostConfig` fields "VPN support" contributes: `CapAdd`, `Devices`,
+/// `Sysctls` — in that order.
+type VpnHostConfigParts = (
+    Option<Vec<String>>,
+    Option<Vec<bollard::models::DeviceMapping>>,
+    Option<HashMap<String, String>>,
+);
+
+/// The three host-config pieces a VPN client needs, or all-`None` when the
+/// project has not opted in.
+///
+/// Returned as a triple rather than set inline so the exact shape is unit
+/// testable — a container is created once, by a very long async function, and a
+/// silently-dropped capability looks identical to a VPN server that is simply
+/// unreachable.
+///
+/// All three are required together and each fails differently on its own:
+/// * **`CAP_NET_ADMIN`** — without it the client cannot create an interface or
+///   write a route. Docker's default bounding set grants `net_raw` but not
+///   `net_admin`, which is why a client can ping but never connect.
+/// * **`/dev/net/tun`** — the device is absent from a default container, so
+///   there is nothing to open even with the capability. It is passed through
+///   from the host rather than `mknod`-ed inside, so the kernel's `tun` module
+///   backs it.
+/// * **`net.ipv4.conf.all.src_valid_mark`** — WireGuard's own `wg-quick` sets
+///   this, and cannot from inside a container (`/proc/sys` is read-only), so
+///   its handshake packets are dropped by reverse-path filtering. Harmless for
+///   OpenVPN-based clients, so it is set unconditionally with the rest.
+///
+/// What it costs, stated accurately: Docker does not enable user-namespace
+/// remapping by default, so this is a real `CAP_NET_ADMIN` in the *initial*
+/// user namespace and only the **network** namespace confines it. It cannot
+/// touch the host's interfaces, but within its own namespace it can set
+/// promiscuous mode and add arbitrary addresses, routes and NAT rules on the
+/// shared `docker0` L2 segment — which puts sibling containers (the LiteLLM
+/// gateway among them) within reach of ARP spoofing, and lets netlink trigger
+/// host-kernel module auto-loading. It is also enough to flush netfilter rules
+/// inside the container, so pair it with `sandbox_mode_enabled` advisedly.
+/// Hence opt-in, per project, rather than on for everyone.
+fn vpn_host_config(enabled: bool) -> VpnHostConfigParts {
+    if !enabled {
+        return (None, None, None);
+    }
+
+    let devices = vec![bollard::models::DeviceMapping {
+        path_on_host: Some(TUN_DEVICE.to_string()),
+        path_in_container: Some(TUN_DEVICE.to_string()),
+        cgroup_permissions: Some("rwm".to_string()),
+    }];
+
+    let sysctls = HashMap::from([(
+        "net.ipv4.conf.all.src_valid_mark".to_string(),
+        "1".to_string(),
+    )]);
+
+    (
+        Some(vec!["NET_ADMIN".to_string()]),
+        Some(devices),
+        Some(sysctls),
+    )
+}
+
+/// Turn the daemon's device-passthrough failure into an explanation.
+///
+/// **This fires on `start`, not `create`.** Verified against Docker 29.7:
+/// `docker create --device /dev/does-not-exist` succeeds and prints an id; the
+/// device is only resolved when runc builds the container, so the failure lands
+/// on the *next* call. Sysctls validate at the same point. Anything that
+/// inspects only the create path will never see it — which is why both paths
+/// route through here and the tests exercise the start-side string.
+///
+/// Unmapped, this reads as `Failed to start container: Docker responded with
+/// status code 500: error gathering device information while adding custom
+/// device "/dev/net/tun": no such file or directory` — a path the user will go
+/// looking for on the wrong machine, since with Docker Desktop the relevant
+/// host is the Linux VM rather than their own, and with nothing pointing back
+/// at the switch that caused it.
+///
+/// Deliberately not gated on `vpn_support_enabled`: nothing else in Triple-C
+/// ever asks for a device, so an error naming `/dev/net/tun` can only have come
+/// from a container created with the switch on. That keeps the check usable
+/// from [`start_container`], which has a container id and no project.
+fn explain_container_failure(action: &str, err: &str) -> String {
+    let device_missing = err.contains(TUN_DEVICE)
+        && (err.contains("no such file or directory")
+            || err.contains("No such file or directory")
+            || err.contains("error gathering device information"));
+
+    if device_missing {
+        return format!(
+            "Failed to {} container: the Docker host has no {} device, which \
+             \"VPN support\" requires. The host kernel needs the `tun` module \
+             loaded (on Docker Desktop that is the Linux VM, not your own \
+             machine). Turn VPN support off in Config → Runtime to start this \
+             project without it. Original error: {}",
+            action, TUN_DEVICE, err
+        );
+    }
+
+    format!("Failed to {} container: {}", action, err)
+}
+
 pub async fn create_container(
     project: &Project,
     docker_socket_path: &str,
@@ -1375,6 +1480,13 @@ pub async fn create_container(
     labels.insert("triple-c.image".to_string(), image_name.to_string());
     labels.insert("triple-c.timezone".to_string(), timezone.unwrap_or("").to_string());
     labels.insert("triple-c.mission-control".to_string(), project.mission_control_enabled.to_string());
+    // Capabilities, devices and sysctls are fixed at creation, so this is
+    // container state and gets the label-and-compare treatment. Written
+    // unconditionally (`false`, not omitted) because `docker commit` copies
+    // container labels onto the snapshot image: a `true` stamped once would
+    // otherwise ride that snapshot into every future container and make the
+    // switch impossible to turn back off.
+    labels.insert("triple-c.vpn-support".to_string(), project.vpn_support_enabled.to_string());
     labels.insert("triple-c.permission-mode".to_string(),
         project.effective_permission_mode().as_env_value().to_string());
     labels.insert("triple-c.custom-env-fingerprint".to_string(), custom_env_fingerprint.clone());
@@ -1443,10 +1555,15 @@ pub async fn create_container(
         labels.insert((*key).to_string(), (*value).to_string());
     }
 
+    let (cap_add, devices, sysctls) = vpn_host_config(project.vpn_support_enabled);
+
     let host_config = HostConfig {
         mounts: Some(mounts),
         port_bindings: if port_bindings.is_empty() { None } else { Some(port_bindings) },
         init: Some(true),
+        cap_add,
+        devices,
+        sysctls,
         ..Default::default()
     };
 
@@ -1476,7 +1593,7 @@ pub async fn create_container(
     let response = docker
         .create_container(Some(options), config)
         .await
-        .map_err(|e| format!("Failed to create container: {}", e))?;
+        .map_err(|e| explain_container_failure("create", &e.to_string()))?;
 
     Ok(response.id)
 }
@@ -1486,7 +1603,7 @@ pub async fn start_container(container_id: &str) -> Result<(), String> {
     docker
         .start_container(container_id, None::<StartContainerOptions<String>>)
         .await
-        .map_err(|e| format!("Failed to start container: {}", e))
+        .map_err(|e| explain_container_failure("start", &e.to_string()))
 }
 
 pub async fn stop_container(container_id: &str) -> Result<(), String> {
@@ -2367,6 +2484,19 @@ pub async fn container_needs_recreation(
         return Ok(true);
     }
 
+    // ── VPN support (NET_ADMIN + /dev/net/tun + sysctl) ───────────────────
+    // A container's capabilities, devices and sysctls are set at creation and
+    // cannot be changed on a running or stopped container, so recreation is the
+    // only way a toggle here takes effect. A missing label means the container
+    // predates the feature, which is the same thing as having it off — so
+    // existing projects are not churned until someone actually turns it on.
+    let expected_vpn = project.vpn_support_enabled.to_string();
+    let container_vpn = get_label("triple-c.vpn-support").unwrap_or_else(|| "false".to_string());
+    if container_vpn != expected_vpn {
+        log::info!("VPN support mismatch (container={:?}, expected={:?})", container_vpn, expected_vpn);
+        return Ok(true);
+    }
+
     // ── Permission mode ────────────────────────────────────────────────────
     // The mode is injected as the TRIPLE_C_PERMISSION_MODE env var, and
     // container env can only change by recreating the container. A missing
@@ -2614,6 +2744,98 @@ mod tests {
             value: "sneaky".to_string(),
         }]);
         assert_eq!(fp, "");
+    }
+
+    #[test]
+    fn vpn_support_off_touches_nothing_in_the_host_config() {
+        // The default must stay byte-identical to a container created before the
+        // feature existed, or every project recreates on the next start.
+        let (cap_add, devices, sysctls) = vpn_host_config(false);
+        assert_eq!(cap_add, None);
+        assert_eq!(devices, None);
+        assert_eq!(sysctls, None);
+    }
+
+    #[test]
+    fn vpn_support_on_grants_all_three_pieces() {
+        // Each is useless without the others — a client with the capability but
+        // no device, or the device but no capability, still times out — so this
+        // asserts the whole set rather than any one of them.
+        let (cap_add, devices, sysctls) = vpn_host_config(true);
+
+        assert_eq!(cap_add, Some(vec!["NET_ADMIN".to_string()]));
+
+        let devices = devices.expect("the tun device must be passed through");
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].path_on_host.as_deref(), Some(TUN_DEVICE));
+        assert_eq!(devices[0].path_in_container.as_deref(), Some(TUN_DEVICE));
+        assert_eq!(devices[0].cgroup_permissions.as_deref(), Some("rwm"));
+
+        assert_eq!(
+            sysctls
+                .expect("wireguard needs src_valid_mark")
+                .get("net.ipv4.conf.all.src_valid_mark")
+                .map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn vpn_support_never_grants_more_than_net_admin() {
+        // NET_ADMIN is already a step out of the sandbox. Anything else added
+        // here (SYS_ADMIN, or a blanket privileged flag) would be a much larger
+        // one, so pin the set.
+        let (cap_add, _, _) = vpn_host_config(true);
+        assert_eq!(cap_add.unwrap(), vec!["NET_ADMIN"]);
+    }
+
+    /// What bollard actually hands us when a tun-less host rejects the device.
+    ///
+    /// Captured verbatim from Docker 29.7: `docker create` with a missing
+    /// device **succeeds**, and this arrives from the subsequent `start`.
+    /// `DockerResponseServerError`'s Display is
+    /// `"Docker responded with status code {code}: {message}"` with the
+    /// daemon's message unaltered.
+    const REAL_TUN_ERROR: &str = "Docker responded with status code 500: error \
+        gathering device information while adding custom device \
+        \"/dev/net/tun\": no such file or directory";
+
+    #[test]
+    fn a_missing_tun_device_is_explained_on_the_path_that_actually_fails() {
+        // The start path is the one that matters: the daemon defers device
+        // resolution to runc, so create returns an id on a host with no tun
+        // module and only start fails. A version of this that checked create
+        // alone would be dead code.
+        let msg = explain_container_failure("start", REAL_TUN_ERROR);
+        assert!(msg.starts_with("Failed to start container:"), "{}", msg);
+        assert!(msg.contains("VPN support"), "should name the switch: {}", msg);
+        assert!(msg.contains("tun` module"), "should name the cause: {}", msg);
+        assert!(msg.contains("Config → Runtime"), "should say where to fix it: {}", msg);
+        assert!(msg.contains(REAL_TUN_ERROR), "should keep the original: {}", msg);
+    }
+
+    #[test]
+    fn the_same_explanation_covers_create_if_the_daemon_ever_checks_earlier() {
+        // Belt and braces — older and future daemons may validate at create.
+        let msg = explain_container_failure("create", REAL_TUN_ERROR);
+        assert!(msg.starts_with("Failed to create container:"), "{}", msg);
+        assert!(msg.contains("VPN support"), "{}", msg);
+    }
+
+    #[test]
+    fn unrelated_failures_are_left_alone() {
+        for (action, err) in [
+            ("create", "Conflict. The container name \"/triple-c-x\" is already in use"),
+            ("start", "Docker responded with status code 404: No such container"),
+            ("start", "error gathering device information while adding custom device \"/dev/dri/card0\""),
+        ] {
+            assert_eq!(
+                explain_container_failure(action, err),
+                format!("Failed to {} container: {}", action, err),
+                "{} should pass through untouched",
+                err
+            );
+        }
     }
 
     #[test]
