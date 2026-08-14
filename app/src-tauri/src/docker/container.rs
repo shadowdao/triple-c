@@ -830,8 +830,16 @@ type VpnHostConfigParts = (
 ///   its handshake packets are dropped by reverse-path filtering. Harmless for
 ///   OpenVPN-based clients, so it is set unconditionally with the rest.
 ///
-/// This is namespaced to the container's own network stack: `NET_ADMIN` confers
-/// no authority over the host's interfaces or over any other container.
+/// What it costs, stated accurately: Docker does not enable user-namespace
+/// remapping by default, so this is a real `CAP_NET_ADMIN` in the *initial*
+/// user namespace and only the **network** namespace confines it. It cannot
+/// touch the host's interfaces, but within its own namespace it can set
+/// promiscuous mode and add arbitrary addresses, routes and NAT rules on the
+/// shared `docker0` L2 segment — which puts sibling containers (the LiteLLM
+/// gateway among them) within reach of ARP spoofing, and lets netlink trigger
+/// host-kernel module auto-loading. It is also enough to flush netfilter rules
+/// inside the container, so pair it with `sandbox_mode_enabled` advisedly.
+/// Hence opt-in, per project, rather than on for everyone.
 fn vpn_host_config(enabled: bool) -> VpnHostConfigParts {
     if !enabled {
         return (None, None, None);
@@ -857,31 +865,42 @@ fn vpn_host_config(enabled: bool) -> VpnHostConfigParts {
 
 /// Turn the daemon's device-passthrough failure into an explanation.
 ///
-/// Requesting `/dev/net/tun` fails at *creation* when the host kernel has no
-/// `tun` module — and the raw bollard error names a path the user will look for
-/// on the wrong machine, since with Docker Desktop the relevant host is the
-/// Linux VM rather than their own. Left unmapped this surfaces as a project
-/// that simply refuses to start, with nothing pointing back at the switch that
-/// caused it.
-fn explain_create_failure(err: &str, vpn_enabled: bool) -> String {
-    let device_missing = vpn_enabled
-        && err.contains(TUN_DEVICE)
+/// **This fires on `start`, not `create`.** Verified against Docker 29.7:
+/// `docker create --device /dev/does-not-exist` succeeds and prints an id; the
+/// device is only resolved when runc builds the container, so the failure lands
+/// on the *next* call. Sysctls validate at the same point. Anything that
+/// inspects only the create path will never see it — which is why both paths
+/// route through here and the tests exercise the start-side string.
+///
+/// Unmapped, this reads as `Failed to start container: Docker responded with
+/// status code 500: error gathering device information while adding custom
+/// device "/dev/net/tun": no such file or directory` — a path the user will go
+/// looking for on the wrong machine, since with Docker Desktop the relevant
+/// host is the Linux VM rather than their own, and with nothing pointing back
+/// at the switch that caused it.
+///
+/// Deliberately not gated on `vpn_support_enabled`: nothing else in Triple-C
+/// ever asks for a device, so an error naming `/dev/net/tun` can only have come
+/// from a container created with the switch on. That keeps the check usable
+/// from [`start_container`], which has a container id and no project.
+fn explain_container_failure(action: &str, err: &str) -> String {
+    let device_missing = err.contains(TUN_DEVICE)
         && (err.contains("no such file or directory")
             || err.contains("No such file or directory")
             || err.contains("error gathering device information"));
 
     if device_missing {
         return format!(
-            "Failed to create container: the Docker host has no {} device, which \
+            "Failed to {} container: the Docker host has no {} device, which \
              \"VPN support\" requires. The host kernel needs the `tun` module \
              loaded (on Docker Desktop that is the Linux VM, not your own \
              machine). Turn VPN support off in Config → Runtime to start this \
              project without it. Original error: {}",
-            TUN_DEVICE, err
+            action, TUN_DEVICE, err
         );
     }
 
-    format!("Failed to create container: {}", err)
+    format!("Failed to {} container: {}", action, err)
 }
 
 pub async fn create_container(
@@ -1574,7 +1593,7 @@ pub async fn create_container(
     let response = docker
         .create_container(Some(options), config)
         .await
-        .map_err(|e| explain_create_failure(&e.to_string(), project.vpn_support_enabled))?;
+        .map_err(|e| explain_container_failure("create", &e.to_string()))?;
 
     Ok(response.id)
 }
@@ -1584,7 +1603,7 @@ pub async fn start_container(container_id: &str) -> Result<(), String> {
     docker
         .start_container(container_id, None::<StartContainerOptions<String>>)
         .await
-        .map_err(|e| format!("Failed to start container: {}", e))
+        .map_err(|e| explain_container_failure("start", &e.to_string()))
 }
 
 pub async fn stop_container(container_id: &str) -> Result<(), String> {
@@ -2770,31 +2789,53 @@ mod tests {
         assert_eq!(cap_add.unwrap(), vec!["NET_ADMIN"]);
     }
 
+    /// What bollard actually hands us when a tun-less host rejects the device.
+    ///
+    /// Captured verbatim from Docker 29.7: `docker create` with a missing
+    /// device **succeeds**, and this arrives from the subsequent `start`.
+    /// `DockerResponseServerError`'s Display is
+    /// `"Docker responded with status code {code}: {message}"` with the
+    /// daemon's message unaltered.
+    const REAL_TUN_ERROR: &str = "Docker responded with status code 500: error \
+        gathering device information while adding custom device \
+        \"/dev/net/tun\": no such file or directory";
+
     #[test]
-    fn a_missing_tun_device_is_explained_rather_than_echoed() {
-        let raw = "error gathering device information while adding custom device \
-                   \"/dev/net/tun\": no such file or directory";
-        let msg = explain_create_failure(raw, true);
+    fn a_missing_tun_device_is_explained_on_the_path_that_actually_fails() {
+        // The start path is the one that matters: the daemon defers device
+        // resolution to runc, so create returns an id on a host with no tun
+        // module and only start fails. A version of this that checked create
+        // alone would be dead code.
+        let msg = explain_container_failure("start", REAL_TUN_ERROR);
+        assert!(msg.starts_with("Failed to start container:"), "{}", msg);
         assert!(msg.contains("VPN support"), "should name the switch: {}", msg);
         assert!(msg.contains("tun` module"), "should name the cause: {}", msg);
-        assert!(msg.contains(raw), "should keep the original error: {}", msg);
+        assert!(msg.contains("Config → Runtime"), "should say where to fix it: {}", msg);
+        assert!(msg.contains(REAL_TUN_ERROR), "should keep the original: {}", msg);
+    }
+
+    #[test]
+    fn the_same_explanation_covers_create_if_the_daemon_ever_checks_earlier() {
+        // Belt and braces — older and future daemons may validate at create.
+        let msg = explain_container_failure("create", REAL_TUN_ERROR);
+        assert!(msg.starts_with("Failed to create container:"), "{}", msg);
+        assert!(msg.contains("VPN support"), "{}", msg);
     }
 
     #[test]
     fn unrelated_failures_are_left_alone() {
-        // Including a tun error on a project that never asked for VPN support —
-        // that came from somewhere else and must not be misattributed.
-        let name_clash = "Conflict. The container name \"/triple-c-x\" is already in use";
-        assert_eq!(
-            explain_create_failure(name_clash, true),
-            format!("Failed to create container: {}", name_clash)
-        );
-
-        let tun_err = "no such file or directory: /dev/net/tun";
-        assert_eq!(
-            explain_create_failure(tun_err, false),
-            format!("Failed to create container: {}", tun_err)
-        );
+        for (action, err) in [
+            ("create", "Conflict. The container name \"/triple-c-x\" is already in use"),
+            ("start", "Docker responded with status code 404: No such container"),
+            ("start", "error gathering device information while adding custom device \"/dev/dri/card0\""),
+        ] {
+            assert_eq!(
+                explain_container_failure(action, err),
+                format!("Failed to {} container: {}", action, err),
+                "{} should pass through untouched",
+                err
+            );
+        }
     }
 
     #[test]

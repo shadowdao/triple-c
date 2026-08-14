@@ -477,19 +477,24 @@ When enabled, the container is given the three things a VPN client needs to buil
 the `NET_ADMIN` capability, the `/dev/net/tun` device, and the `net.ipv4.conf.all.src_valid_mark`
 sysctl that WireGuard requires. This is **off by default**.
 
-Without it, a client such as PIA, WireGuard, OpenVPN or Tailscale installs and its daemon starts
-normally, but the connection attempt **hangs until it times out** — a default container has no tun
-device to open and no permission to add an interface or a route, and most clients report that as a
-generic timeout rather than a permissions error.
+Without it, a client such as PIA, WireGuard or OpenVPN installs and its daemon starts normally, but
+the connection attempt **hangs until it times out** — a default container has no tun device to open
+and no permission to add an interface or a route, and most clients report that as a generic timeout
+rather than a permissions error.
 
 Things worth knowing:
 
-- `NET_ADMIN` applies to the container's **own** network namespace. It confers no authority over
-  the host's interfaces or over any other container. It does mean anything running in the
-  container can reconfigure that namespace, which is why it is opt-in.
+- Tailscale is the exception: in its `--tun=userspace-networking` mode it needs neither the
+  capability nor the device, so leave this off if that is all you want.
+
+- `NET_ADMIN` applies to the container's **own** network namespace — it cannot touch the host's
+  interfaces. It is not nothing, though: within that namespace anything in the container can set
+  promiscuous mode and add arbitrary addresses, routes and firewall rules on the Docker bridge it
+  shares with your other containers, and it can flush firewall rules that sandbox mode relies on.
+  Grant it per project, to projects that need it.
 - The **Docker host's** kernel must have the `tun` module available. With Docker Desktop that is
-  the Linux VM, not your own machine. If it is missing, the container fails to create with an
-  error naming `/dev/net/tun` and pointing back at this setting.
+  the Linux VM, not your own machine. If it is missing, the container is created but fails to
+  **start**, with an error naming `/dev/net/tun` and pointing back at this setting.
 - A VPN client's kill switch applies to everything in the container, Claude Code included. If the
   tunnel drops, expect API calls to fail until it reconnects or the kill switch is turned off.
 

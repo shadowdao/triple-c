@@ -148,13 +148,14 @@ pub struct Project {
     /// Grant the container what a VPN client needs to build a tunnel:
     /// `CAP_NET_ADMIN`, the `/dev/net/tun` device, and the WireGuard
     /// `src_valid_mark` sysctl. Without all three a client (PIA, WireGuard,
-    /// OpenVPN, Tailscale) installs and runs but its connection attempt hangs
-    /// until it times out, because it cannot create the tunnel interface or
-    /// touch the routing table.
+    /// OpenVPN) installs and runs but its connection attempt hangs until it
+    /// times out, because it cannot create the tunnel interface or touch the
+    /// routing table.
     ///
     /// Off by default and deliberately opt-in: `NET_ADMIN` lets anything in the
-    /// container reconfigure its own network stack, which is a meaningful step
-    /// out of the default sandbox. Unlike `auth_bridge_enabled` this *is*
+    /// container reconfigure its own network stack, which reaches further than
+    /// it sounds — see `vpn_host_config` for what it does and does not confer.
+    /// Unlike `auth_bridge_enabled` this *is*
     /// container state, so it carries a `triple-c.vpn-support` label and is
     /// compared in `container_needs_recreation` — capabilities and devices are
     /// fixed at creation and can only change by recreating the container.

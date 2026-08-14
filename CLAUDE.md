@@ -287,10 +287,21 @@ container is created once by a very long function where a dropped capability is 
   Any two without the third still presents as a connection that hangs to a timeout, which is why
   the tests assert the whole set.
 - **The device is passed through from the host, never `mknod`-ed inside.** The kernel's `tun`
-  module has to back it. When the host has no such device the failure lands at *creation* — the
-  project simply won't start — so `explain_create_failure()` rewrites that one error to name the
-  switch and the Docker-Desktop-VM-vs-your-machine distinction. Do not let it degrade to a raw
-  bollard string.
+  module has to back it.
+- **A missing device fails at `start`, not `create` — verified against Docker 29.7.** `docker
+  create --device /dev/does-not-exist` succeeds and prints an id; runc resolves the device (and
+  validates sysctls) only when it builds the container. So the guard belongs on the start path:
+  `explain_container_failure()` covers both and is called from `start_container`, where it has a
+  container id and no project — which is why it keys off the error naming `/dev/net/tun` rather
+  than off `vpn_support_enabled`. Nothing else in Triple-C requests a device, so that is
+  unambiguous. A version of this check wired to `create` alone is dead code that looks correct.
+- **`NET_ADMIN` here is not user-namespaced.** Docker does not enable userns remapping by default,
+  so only the *network* namespace confines it: no reach onto host interfaces, but promiscuous
+  mode, arbitrary addresses/routes/NAT on the shared `docker0` segment (sibling containers, the
+  LiteLLM gateway among them, are ARP-spoofable), netlink-triggered host module auto-load, and
+  enough authority to flush in-container netfilter rules that sandbox mode may rely on. Keep the
+  code comments honest about this — an earlier draft claimed it "confers no authority" outside the
+  container, which is too strong.
 - **`triple-c.vpn-support` is written unconditionally, including `false`.** The usual
   `docker commit` reason: a `true` stamped once would ride the snapshot image into every future
   container and make the switch impossible to turn off.
