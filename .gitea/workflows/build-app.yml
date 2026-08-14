@@ -39,13 +39,48 @@ jobs:
           MAJOR_MINOR=$(cat VERSION | tr -d '[:space:]')
           echo "Major.Minor: ${MAJOR_MINOR}"
 
-          # Find the latest tag matching v{MAJOR_MINOR}.N (exclude -mac, -win suffixes)
-          # `|| true` so an empty grep result doesn't fail the step under pipefail.
-          LATEST_TAG=$(git tag -l "v${MAJOR_MINOR}.*" --sort=-v:refname | grep -E "^v${MAJOR_MINOR}\.[0-9]+$" | head -1 || true)
+          # The patch number is **one past the highest patch already used**, and
+          # never a distance.
+          #
+          # It used to be `git rev-list --count <highest tag>..HEAD`, which is
+          # not a counter at all: it measures how far HEAD has drifted from
+          # whichever tag sorts highest, and that resets to zero every time a
+          # tag is cut. The published history is the proof — each of these is
+          # exactly what the old formula returned at the time:
+          #
+          #   v0.4.0 -> 3 commits -> v0.4.3    looked fine
+          #   v0.4.3 -> 4 commits -> v0.4.4    fine by luck, 4 > 3
+          #   v0.4.4 -> 2 commits -> v0.4.2    went backwards
+          #   v0.4.4 -> 6 commits -> v0.4.6    jumped, skipping .5
+          #   v0.4.6 -> 3 commits -> v0.4.3    already taken; the upload failed
+          #
+          # Reusing a version is worse than failing to publish one: the macOS
+          # and Windows steps replace assets in place, so a duplicate silently
+          # rewrote a release that had been public for three days. Monotonic
+          # numbering is what stops that at the source.
+          #
+          # Suffixed tags count too. `create-tag` is skipped when any platform
+          # job fails, so a run can publish v0.4.7-mac and never create the
+          # plain v0.4.7 — reading only unsuffixed tags would then hand the
+          # same number out twice.
+          HIGHEST=$(git tag -l "v${MAJOR_MINOR}.*" \
+            | grep -E "^v${MAJOR_MINOR}\.[0-9]+(-mac|-win)?$" \
+            | sed -E "s/^v${MAJOR_MINOR}\.([0-9]+).*/\1/" \
+            | sort -n | tail -1 || true)
 
-          if [ -n "$LATEST_TAG" ]; then
-            echo "Latest matching tag: ${LATEST_TAG}"
-            PATCH=$(git rev-list --count "${LATEST_TAG}..HEAD")
+          # A re-run of a commit that already released must not mint a new
+          # version just because its own tag now exists.
+          EXISTING=$(git tag --points-at HEAD \
+            | grep -E "^v${MAJOR_MINOR}\.[0-9]+$" \
+            | sed -E "s/^v${MAJOR_MINOR}\.([0-9]+)$/\1/" \
+            | sort -n | tail -1 || true)
+
+          if [ -n "$EXISTING" ]; then
+            echo "HEAD is already tagged v${MAJOR_MINOR}.${EXISTING} — reusing it"
+            PATCH="${EXISTING}"
+          elif [ -n "$HIGHEST" ]; then
+            echo "Highest patch already used on this line: ${HIGHEST}"
+            PATCH=$((HIGHEST + 1))
           else
             # A minor line nobody has tagged yet is a *new* line, and a new line
             # starts at .0 — that is what "we are moving to 0.4.x" means. The
@@ -165,21 +200,70 @@ jobs:
         env:
           TOKEN: ${{ secrets.REGISTRY_TOKEN }}
         run: |
+          set -euo pipefail
           TAG="v${{ needs.compute-version.outputs.version }}"
-          # Create release
-          curl -s -X POST \
+
+          # Idempotent get-or-create, matching build-macos. This step used to
+          # POST /releases unconditionally: against a tag that already existed
+          # Gitea answered 409, the grep below found no id, and the run died
+          # with a bare "exitcode '1'" and not one line of output explaining
+          # it — `curl -s` with no `-f` swallows the HTTP error, so nothing
+          # ever said "409" or "duplicate tag". Hence -fsS throughout, and
+          # pipefail so a failure cannot be stepped over.
+          HTTP_CODE=$(curl -sS -o release.json -w '%{http_code}' \
             -H "Authorization: token ${TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d "{\"tag_name\": \"${TAG}\", \"name\": \"Triple-C ${TAG} (Linux)\", \"body\": \"Automated build from commit ${{ gitea.sha }}\"}" \
-            "${GITEA_URL}/api/v1/repos/${REPO}/releases" > release.json
-          RELEASE_ID=$(cat release.json | grep -o '"id":[0-9]*' | head -1 | grep -o '[0-9]*')
+            "${GITEA_URL}/api/v1/repos/${REPO}/releases/tags/${TAG}")
+          case "${HTTP_CODE}" in
+            200)
+              echo "Release ${TAG} already exists, reusing"
+              ;;
+            404)
+              echo "Creating release ${TAG}"
+              curl -fsS -X POST \
+                -H "Authorization: token ${TOKEN}" \
+                -H "Content-Type: application/json" \
+                -d "{\"tag_name\": \"${TAG}\", \"name\": \"Triple-C ${TAG} (Linux)\", \"body\": \"Automated build from commit ${{ gitea.sha }}\"}" \
+                "${GITEA_URL}/api/v1/repos/${REPO}/releases" > release.json
+              ;;
+            *)
+              echo "Unexpected ${HTTP_CODE} looking up release ${TAG}:" >&2
+              cat release.json >&2
+              exit 1
+              ;;
+          esac
+
+          RELEASE_ID=$(python3 -c "import json,sys; print(json.load(open('release.json')).get('id',''))")
+          if [ -z "${RELEASE_ID}" ]; then
+            echo "No release id for ${TAG}; refusing to upload into nothing:" >&2
+            cat release.json >&2
+            exit 1
+          fi
           echo "Release ID: ${RELEASE_ID}"
-          # Upload each artifact
+
+          # Replace-not-conflict, so a retry after a partial upload succeeds.
+          # Versions are monotonic now (see compute-version), so this can only
+          # ever be replacing an asset from a failed run of this same commit —
+          # never one belonging to an already-published version.
           for file in artifacts/*; do
             [ -f "$file" ] || continue
             filename=$(basename "$file")
+
+            EXISTING_ID=$(curl -sS \
+              -H "Authorization: token ${TOKEN}" \
+              "${GITEA_URL}/api/v1/repos/${REPO}/releases/${RELEASE_ID}/assets" \
+              | python3 -c "import json,sys; t=sys.argv[1]; print(next((a['id'] for a in json.load(sys.stdin) if a.get('name')==t), ''))" "${filename}" || true)
+            if [ -n "${EXISTING_ID}" ]; then
+              echo "Deleting existing asset ${filename} (id ${EXISTING_ID})"
+              curl -fsS -X DELETE \
+                -H "Authorization: token ${TOKEN}" \
+                "${GITEA_URL}/api/v1/repos/${REPO}/releases/${RELEASE_ID}/assets/${EXISTING_ID}"
+            fi
+
             echo "Uploading ${filename}..."
-            curl -s -X POST \
+            curl -fsS --http1.1 \
+              --retry 5 --retry-all-errors --retry-delay 5 \
+              --max-time 600 \
+              -X POST \
               -H "Authorization: token ${TOKEN}" \
               -H "Content-Type: application/octet-stream" \
               --data-binary "@${file}" \
