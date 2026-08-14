@@ -1,0 +1,272 @@
+#!/bin/bash
+# triple-c-playwright-heal — make Playwright usable in a Triple-C container.
+#
+# Idempotent: safe to run on every start and safe to re-run after a partial
+# failure. Each step checks for its own result first, so a healthy container is
+# a fast no-op that still prints why it is healthy. The last step is the only
+# one that means anything: it launches a browser for real.
+#
+# The things that go wrong, in the order they bite:
+#
+#   1. @playwright/cli missing — including the case where it was installed and
+#      then silently removed again. `npm install --no-save <pkg>` in /workspace,
+#      which has no package.json, prunes packages npm considers extraneous, so
+#      installing @playwright/cli and then installing playwright wipes the
+#      first one and leaves an empty node_modules/@playwright/. That directory
+#      reads as "installed" to a naive check, which is why this script tests
+#      the package *entry point*.
+#
+#   2. Bundled chromium missing or the wrong revision. Browsers live in the
+#      home volume and outlive any single @playwright/cli install, so a stale
+#      chromium-<old> is routinely present while the installed playwright-core
+#      wants a newer one. Must be installed AS claude: run as root it lands in
+#      /root/.cache/ms-playwright where the agent cannot see it.
+#
+#   3. No cli.config.json — the one that breaks an otherwise clean install.
+#      With no config, playwright-cli resolves to channel `chrome` (system
+#      Google Chrome) with the sandbox ON. These containers forbid unprivileged
+#      user namespaces, so Chrome aborts with "Failed to move to new namespace
+#      ... Operation not permitted". On newer base images Chrome is not present
+#      at all and it fails with "Chromium distribution 'chrome' is not found".
+#      Same root cause both ways: the default channel is wrong here.
+#
+#   4. The storage-state file the config points at is missing. Playwright
+#      treats an unreadable storageState as a hard error on every launch, not
+#      as "no saved state", so the file has to exist from the very first run.
+#
+#   5. xvfb or socat missing (older base images only). Headless Playwright
+#      needs neither; the `playwright-cli show` dashboard needs xvfb, and the
+#      browser-view pane needs socat — without it the pane reports
+#      "127.0.0.1 sent an invalid response" while the container side is fine.
+#
+# Usage: triple-c-playwright-heal [--seed-config-only] [--force-config] [--quiet]
+#   --seed-config-only  only ensure the config and its storage-state file
+#                       exist. No npm install, no browser download, no apt, no
+#                       verify launch. Cheap and offline — this is the mode
+#                       entrypoint.sh runs on every container start.
+#   --force-config      overwrite an existing config instead of keeping it
+#   --quiet             print only problems and repairs, not healthy no-ops
+
+set -u
+
+TARGET_USER=claude
+TARGET_HOME=/home/claude
+PW_DIR=/workspace
+CONFIG_DIR="$TARGET_HOME/.playwright"
+CONFIG_FILE="$CONFIG_DIR/cli.config.json"
+STATE_FILE="$CONFIG_DIR/storage-state.json"
+CLI_ENTRY="$PW_DIR/node_modules/@playwright/cli/playwright-cli.js"
+
+FORCE_CONFIG=0
+QUIET=0
+SEED_ONLY=0
+for arg in "$@"; do
+    case "$arg" in
+        --force-config)     FORCE_CONFIG=1 ;;
+        --quiet)            QUIET=1 ;;
+        --seed-config-only) SEED_ONLY=1 ;;
+        *) echo "playwright-heal: unknown option: $arg" >&2; exit 2 ;;
+    esac
+done
+
+changed=0
+failed=0
+
+say()  { [ "$QUIET" = 1 ] || echo "playwright-heal: $*"; }
+warn() { echo "playwright-heal: $*" >&2; }
+did()  { changed=1; echo "playwright-heal: $*"; }
+
+# Run as claude whether we were invoked as root (docker exec / entrypoint) or
+# as claude (terminal session). Nothing user-visible may end up root-owned.
+as_claude() {
+    if [ "$(id -u)" = 0 ]; then
+        su "$TARGET_USER" -s /bin/sh -c "$1"
+    else
+        sh -c "$1"
+    fi
+}
+
+# ── 1. @playwright/cli ───────────────────────────────────────────────────────
+if [ "$SEED_ONLY" = 1 ]; then
+    :
+elif [ -f "$CLI_ENTRY" ]; then
+    say "@playwright/cli present"
+else
+    # An empty leftover @playwright/ can make npm consider the tree settled.
+    if [ -d "$PW_DIR/node_modules/@playwright" ]; then
+        say "clearing partial @playwright install"
+        rm -rf "$PW_DIR/node_modules/@playwright"
+    fi
+    say "installing @playwright/cli..."
+    if as_claude "cd $PW_DIR && npm install --no-save --no-audit --no-fund @playwright/cli" >/tmp/pw-heal-npm.log 2>&1; then
+        did "installed @playwright/cli"
+    else
+        warn "npm install failed; see /tmp/pw-heal-npm.log"
+        failed=1
+    fi
+fi
+
+# ── 2. bundled chromium ──────────────────────────────────────────────────────
+# Ask Playwright where *this* version's chromium belongs rather than globbing
+# chromium-*, which would call a stale revision "present" and then fail at
+# launch with 'Browser "chrome-for-testing" is not installed'. --dry-run prints
+# the install location for the installed version and downloads nothing.
+if [ "$SEED_ONLY" = 1 ]; then
+    :
+else
+    chromium_dir=""
+    if [ -f "$PW_DIR/node_modules/playwright-core/cli.js" ]; then
+        chromium_dir=$(as_claude "cd $PW_DIR && node node_modules/playwright-core/cli.js install --dry-run chromium 2>/dev/null" \
+                       | awk '/Install location:/ { print $3; exit }')
+    fi
+
+    if [ -n "$chromium_dir" ] && [ -d "$chromium_dir" ]; then
+        say "chromium present ($(basename "$chromium_dir"))"
+    elif [ -f "$PW_DIR/node_modules/playwright-core/cli.js" ]; then
+        say "downloading chromium (~300 MB)..."
+        if as_claude "cd $PW_DIR && node node_modules/playwright-core/cli.js install chromium" >/tmp/pw-heal-browser.log 2>&1; then
+            did "installed chromium"
+        else
+            warn "chromium install failed; see /tmp/pw-heal-browser.log"
+            failed=1
+        fi
+    else
+        warn "playwright-core missing, cannot install chromium"
+        failed=1
+    fi
+fi
+
+# ── 3. cli.config.json ───────────────────────────────────────────────────────
+# The *global* config, not a project-level .playwright/, because the project
+# one resolves relative to the current working directory and silently stops
+# applying the moment you cd elsewhere.
+#
+# `chrome-for-testing` is the only recognised chromium alias — "chromium" is
+# not one and falls back to system Chrome. chromiumSandbox:false is what
+# actually appends --no-sandbox.
+write_config() {
+    mkdir -p "$CONFIG_DIR" || return 1
+    cat > "$CONFIG_FILE" <<EOF
+{
+  "browser": {
+    "browserName": "chromium",
+    "launchOptions": {
+      "channel": "chrome-for-testing",
+      "chromiumSandbox": false,
+      "args": ["--no-sandbox", "--disable-dev-shm-usage"]
+    },
+    "contextOptions": {
+      "storageState": "$STATE_FILE"
+    }
+  }
+}
+EOF
+    chown -R "$TARGET_USER:$TARGET_USER" "$CONFIG_DIR" 2>/dev/null || true
+}
+
+# storageState is a *load* path, and Playwright reads it at context creation.
+# A path that does not exist is not treated as "no saved state" — it is a hard
+# error, "Error reading storage state from …", on every single launch. So the
+# file has to exist before the config that names it can be used at all, and it
+# has to be recreated if anything deletes it. An empty state is valid and
+# behaves exactly like no state.
+#
+# The path is read back out of the config rather than assumed, so a
+# hand-edited config pointing somewhere else still gets its file created
+# instead of being silently broken by ours.
+ensure_state_file() {
+    [ -f "$CONFIG_FILE" ] || return 0
+    state_path=$(grep -o '"storageState"[[:space:]]*:[[:space:]]*"[^"]*"' "$CONFIG_FILE" 2>/dev/null \
+                 | sed 's/.*"\([^"]*\)"[[:space:]]*$/\1/')
+    [ -n "$state_path" ] || return 0
+    [ -f "$state_path" ] && return 0
+    mkdir -p "$(dirname "$state_path")" 2>/dev/null
+    printf '{\n  "cookies": [],\n  "origins": []\n}\n' > "$state_path" || return 1
+    chown "$TARGET_USER:$TARGET_USER" "$state_path" 2>/dev/null || true
+    did "created empty $state_path (storageState needs it to exist)"
+}
+
+if [ ! -f "$CONFIG_FILE" ]; then
+    if write_config; then did "wrote $CONFIG_FILE"; else warn "could not write $CONFIG_FILE"; failed=1; fi
+elif [ "$FORCE_CONFIG" = 1 ]; then
+    if write_config; then did "overwrote $CONFIG_FILE (--force-config)"; else warn "could not write $CONFIG_FILE"; failed=1; fi
+elif grep -q '"chromiumSandbox"[[:space:]]*:[[:space:]]*false' "$CONFIG_FILE" 2>/dev/null; then
+    say "config present and disables the sandbox"
+else
+    # Present but hand-edited into a state that will not launch. Do not clobber
+    # deliberate config silently; say what is wrong and how to replace it.
+    warn "config at $CONFIG_FILE does not set chromiumSandbox:false — the browser will likely fail to launch. Re-run with --force-config to replace it."
+fi
+
+# Unconditional: the config may name a storageState this run did not write —
+# one seeded by an older version of this script, or edited by hand — and a
+# missing file there breaks every launch.
+ensure_state_file || { warn "could not create the storage-state file"; failed=1; }
+
+if [ "$SEED_ONLY" = 1 ]; then
+    [ "$failed" = 1 ] && exit 1
+    exit 0
+fi
+
+# ── 4. xvfb (headed dashboard only) ──────────────────────────────────────────
+# Current base images get this from `playwright install-deps` (its `tools`
+# group); older ones predate that layer. Headless never needs it, so a missing
+# xvfb is a note, not a failure.
+if command -v Xvfb >/dev/null 2>&1; then
+    say "xvfb present"
+elif [ "$(id -u)" = 0 ]; then
+    say "installing xvfb (needed only for the headed dashboard)..."
+    if (apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq xvfb) >/tmp/pw-heal-xvfb.log 2>&1; then
+        did "installed xvfb"
+    else
+        warn "xvfb install failed (headless still works); see /tmp/pw-heal-xvfb.log"
+    fi
+else
+    say "xvfb missing and not running as root — skipping (headless still works)"
+fi
+
+# ── 4b. socat (the browser-view pane's tunnel) ───────────────────────────────
+# Not Playwright's, but the same class of failure and it presents as a
+# Playwright problem: the pane's host-side proxy reaches the dashboard by
+# running `socat` *inside* the container over a Docker exec. On a container old
+# enough to predate socat in the base image, that exec produces something that
+# is not an HTTP response, and the webview reports "127.0.0.1 sent an invalid
+# response" — with the container side working perfectly. A project keeps the
+# base image it was first built from until it is migrated, so this is the
+# normal case on an older project, not an exotic one.
+if command -v socat >/dev/null 2>&1; then
+    say "socat present"
+elif [ "$(id -u)" = 0 ]; then
+    say "installing socat (needed by the browser-view pane)..."
+    if (apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq socat) >/tmp/pw-heal-socat.log 2>&1; then
+        did "installed socat"
+    else
+        warn "socat install failed; the browser-view pane will report an invalid response. See /tmp/pw-heal-socat.log"
+        failed=1
+    fi
+else
+    warn "socat missing and not running as root — the browser-view pane will report an invalid response"
+fi
+
+# ── 5. verify by actually launching ──────────────────────────────────────────
+# Every step above can report success while the browser still refuses to
+# start — that is precisely how this broke. A dedicated session name keeps
+# this clear of whatever the agent already has open.
+if [ -f "$CLI_ENTRY" ]; then
+    verify_out=$(as_claude "cd /tmp && timeout 90 node $CLI_ENTRY -s=heal-verify open 'data:text/html,<h1>ok</h1>' 2>&1")
+    if printf '%s' "$verify_out" | grep -q 'opened with pid'; then
+        say "verified: browser launches"
+        as_claude "cd /tmp && timeout 30 node $CLI_ENTRY -s=heal-verify close" >/dev/null 2>&1
+    else
+        warn "browser still fails to launch:"
+        printf '%s\n' "$verify_out" | grep -m4 -E 'namespace|Check failed|is not installed|is not found|missing dependencies|Error' >&2
+        failed=1
+    fi
+else
+    warn "@playwright/cli not installed — nothing to verify"
+    failed=1
+fi
+
+[ "$failed" = 1 ] && exit 1
+[ "$changed" = 1 ] && say "done — repairs applied" || say "done — nothing to repair"
+exit 0

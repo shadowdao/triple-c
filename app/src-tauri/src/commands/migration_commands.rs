@@ -73,6 +73,25 @@ use crate::AppState;
 /// Report how far behind the current base image a project's container is, and
 /// what migrating it would actually carry across.
 ///
+/// Choose the recorded lineage from the two places it can be written, most
+/// authoritative first: the live container's label, then the snapshot image's.
+///
+/// **An empty label is absence, not an answer.** `create_container` always
+/// writes `triple-c.base-image-id`, even when the value is unknown — that is
+/// deliberate, because Docker merges an image's labels into a container's and
+/// an inherited value would otherwise ride a snapshot forever. The consequence
+/// is that `Some("")` is the *common* reading from a container whose lineage
+/// was never established, so treating it as an answer silently skips the
+/// snapshot, which may well have recorded a real one.
+fn pick_recorded_lineage(
+    from_container: Option<String>,
+    from_snapshot: Option<String>,
+) -> Option<String> {
+    from_container
+        .filter(|v| !v.is_empty())
+        .or_else(|| from_snapshot.filter(|v| !v.is_empty()))
+}
+
 /// Read-only. Runs two filesystem probes (~3 s each) and is therefore meant to
 /// be called on demand, not polled.
 #[tauri::command]
@@ -98,20 +117,24 @@ pub async fn get_container_staleness(
     // Lineage, most authoritative source first: the live container's label,
     // then the snapshot image's. Both are written by `create_container` and
     // propagated onto the snapshot by `docker commit`.
+    // Each source is filtered for emptiness *before* it is allowed to satisfy
+    // the lookup. `create_container` always writes this label, even when the
+    // value is unknown — deliberately, so an inherited image label cannot ride
+    // a snapshot forever — which means the container's copy is very often
+    // `Some("")`. Filtering only the final result let that empty string count
+    // as an answer and skip the snapshot entirely, so a snapshot that *did*
+    // record a lineage was never consulted and the project reported "unknown"
+    // with the information sitting one lookup away.
     let container_id = docker::find_existing_container(&project).await.unwrap_or(None);
-    let recorded = match &container_id {
+    let from_container = match &container_id {
         Some(id) => container_label(id, mig::LABEL_BASE_IMAGE_ID).await,
         None => None,
-    }
-    .or_else(|| None);
-    let recorded = match recorded {
-        Some(v) => Some(v),
-        None => mig::image_labels(&snapshot_image)
-            .await
-            .get(mig::LABEL_BASE_IMAGE_ID)
-            .cloned(),
-    }
-    .filter(|v| !v.is_empty());
+    };
+    let from_snapshot = mig::image_labels(&snapshot_image)
+        .await
+        .get(mig::LABEL_BASE_IMAGE_ID)
+        .cloned();
+    let recorded = pick_recorded_lineage(from_container, from_snapshot);
 
     out.base_image_id = recorded.clone();
     out.known = recorded.is_some();
@@ -1670,6 +1693,32 @@ fn summarize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_lineage_label_is_absence_and_falls_through_to_the_snapshot() {
+        let some = |s: &str| Some(s.to_string());
+
+        // The regression: the container always carries the label, so an
+        // unknown lineage reads as `Some("")`. Letting that satisfy the lookup
+        // skipped a snapshot that had recorded the real thing.
+        assert_eq!(
+            pick_recorded_lineage(some(""), some("sha256:base")),
+            some("sha256:base")
+        );
+
+        // Ordinary precedence still holds: the container wins when it has one.
+        assert_eq!(
+            pick_recorded_lineage(some("sha256:container"), some("sha256:snapshot")),
+            some("sha256:container")
+        );
+        assert_eq!(pick_recorded_lineage(None, some("sha256:snap")), some("sha256:snap"));
+
+        // Genuinely unknown stays unknown — "probe instead", never a lineage
+        // invented to make the comparison succeed.
+        assert_eq!(pick_recorded_lineage(None, None), None);
+        assert_eq!(pick_recorded_lineage(some(""), some("")), None);
+        assert_eq!(pick_recorded_lineage(some(""), None), None);
+    }
 
     #[test]
     fn byte_sizes_read_the_way_a_disk_warning_should() {

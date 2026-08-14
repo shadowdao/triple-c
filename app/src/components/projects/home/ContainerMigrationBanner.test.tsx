@@ -127,6 +127,46 @@ describe("ContainerMigrationBanner", () => {
     expect(container).toBeEmptyDOMElement();
   });
 
+  it("speaks up when an unlabelled container could not be probed at all", () => {
+    // The probe is the only signal a container with no lineage label has. If
+    // it fails and the banner stays silent, that is indistinguishable from
+    // "up to date" — the exact reading that let an out-of-date project go
+    // unnoticed indefinitely.
+    renderBanner(
+      migration({
+        staleness: {
+          ...FRESH,
+          known: false,
+          stale: false,
+          probe_error: "output exceeded the inspection limit",
+        },
+        probeSettled: false,
+      }),
+    );
+    expect(
+      screen.getByText(/Container base could not be checked/i),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/output exceeded the inspection limit/i),
+    ).toBeInTheDocument();
+    // And it must not pose as a finding about the container itself.
+    expect(
+      screen.queryByText(/Container is missing things/i),
+    ).not.toBeInTheDocument();
+  });
+
+  it("stays quiet when a labelled container's probe fails but its lineage is current", () => {
+    // `known` means the version comparison already answered the question, so
+    // a failed probe is not grounds to raise anything.
+    const { container } = renderBanner(
+      migration({
+        staleness: { ...FRESH, probe_error: "could not exec in the container" },
+        probeSettled: false,
+      }),
+    );
+    expect(container).toBeEmptyDOMElement();
+  });
+
   it("disables the action and explains why while the container is running", () => {
     renderBanner(migration({ staleness: STALE }), false);
     expect(

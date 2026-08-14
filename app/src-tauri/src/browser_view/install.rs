@@ -194,11 +194,24 @@ impl BrowserTarget {
         }
     }
 
-    /// The `channel` a launch check must pass. `None` means the bundled build.
-    fn channel(self) -> Option<&'static str> {
+    /// Every `channel` a launch check must pass, comma-separated, where
+    /// `default` means "no channel — the bundled build".
+    ///
+    /// Chromium is checked twice because the two consumers of this install do
+    /// not launch the same binary. A script calling `chromium.launch()` with
+    /// no channel gets `chromium-headless-shell`; the viewer reads
+    /// `~/.playwright/cli.config.json`, which pins channel
+    /// `chrome-for-testing`, and that resolves to the *full* `chromium-<rev>`
+    /// build — a separate download under the same `install chromium`.
+    ///
+    /// Checking only the first is how a container reaches "verified" and then
+    /// fails in the pane with `Browser "chrome-for-testing" is not installed`.
+    /// Observed on a real project, where a stale `chromium-1217` satisfied the
+    /// headless-shell launch while the viewer wanted `chromium-1237`.
+    fn channels(self) -> &'static str {
         match self {
-            Self::Chromium => None,
-            Self::Chrome => Some("chrome"),
+            Self::Chromium => "default,chrome-for-testing",
+            Self::Chrome => "chrome",
         }
     }
 }
@@ -235,7 +248,7 @@ pub async fn install_packages(
         &format!("Installing @playwright/cli into {}/node_modules…", INSTALL_DIR),
     );
 
-    let mut step = npm_install(app, project_id, container_id, VIEWER_PACKAGE).await?;
+    let mut step = npm_install(app, project_id, container_id, &[VIEWER_PACKAGE]).await?;
     if step.exit_code != 0 {
         return Err(format!(
             "npm couldn't install the viewer package in this container (exit {}).\n\nnpm said:\n{}",
@@ -246,9 +259,15 @@ pub async fn install_packages(
 
     // Second, `playwright` at the version the viewer package pins — see
     // `VIEWER_PACKAGE`. Installing it as `@latest` is what splits the tree.
+    //
+    // The viewer package is named *again* here. It is already installed, so
+    // this adds no work, but omitting it is what made npm prune it back out —
+    // see the note on `npm_install`. The pin can only be read after the first
+    // install has written the manifest, which is why this stays two commands
+    // rather than one.
     let spec = pinned_playwright_spec(container_id).await;
     emit_progress(app, project_id, &format!("Installing {}…", spec));
-    let second = npm_install(app, project_id, container_id, &spec).await?;
+    let second = npm_install(app, project_id, container_id, &[VIEWER_PACKAGE, &spec]).await?;
     if second.exit_code != 0 {
         return Err(format!(
             "npm couldn't install {} in this container (exit {}).\n\nnpm said:\n{}",
@@ -290,7 +309,7 @@ pub async fn install_packages(
     })
 }
 
-/// One `npm install` of one spec, into [`INSTALL_DIR`], as `claude`.
+/// One `npm install` of one or more specs, into [`INSTALL_DIR`], as `claude`.
 ///
 /// `env VAR=… cmd` rather than an exec env: it keeps the one exec path in
 /// `docker/exec.rs` untouched, and `env` is a real binary so no shell is
@@ -298,13 +317,24 @@ pub async fn install_packages(
 /// has no postinstall (verified — `playwright@1.62.1` declares no `scripts` at
 /// all), but if a future release brings the browser download back, this step
 /// must stay small and the download must stay the step the user asked for.
+///
+/// **Every package that must survive has to appear in `specs`.** `--no-save`
+/// in a directory with no `package.json` — which [`INSTALL_DIR`] is — leaves
+/// npm with the command line as its only statement of what the tree should
+/// contain, and npm ≥7 reconciles the tree against that on every run by
+/// removing whatever it now considers extraneous. Installing `@playwright/cli`
+/// and then installing `playwright` in a second command therefore *deletes the
+/// first one*: verified in a container, `removed 3 packages`, leaving an empty
+/// `node_modules/@playwright/` behind `playwright` and `playwright-core`. That
+/// empty directory is why a fresh setup could report success and still leave
+/// the pane saying `@playwright/cli` was not installed.
 async fn npm_install(
     app: &AppHandle,
     project_id: &str,
     container_id: &str,
-    spec: &str,
+    specs: &[&str],
 ) -> Result<StepResult, String> {
-    let cmd = vec![
+    let mut cmd = vec![
         "env".to_string(),
         "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1".to_string(),
         "npm".to_string(),
@@ -313,8 +343,8 @@ async fn npm_install(
         "--no-save".to_string(),
         "--no-fund".to_string(),
         "--no-audit".to_string(),
-        spec.to_string(),
     ];
+    cmd.extend(specs.iter().map(|s| s.to_string()));
     run_step(
         app,
         project_id,
@@ -704,7 +734,7 @@ async fn verify_launch(
         ],
         vec![
             format!("TRIPLE_C_PW_DIR={}", dir),
-            format!("TRIPLE_C_PW_CHANNEL={}", target.channel().unwrap_or("")),
+            format!("TRIPLE_C_PW_CHANNELS={}", target.channels()),
             format!("TRIPLE_C_PW_URL={}", REACHABILITY_URL),
         ],
     );
@@ -795,27 +825,43 @@ fn parse_launch_output(output: &str) -> LaunchVerdict {
 /// The launch check. One `argv` element, no newlines, same contract as the
 /// detection probe.
 ///
-/// Playwright leaves the Chromium sandbox disabled by default, which is what
-/// makes this work in a container at all. The timeout exists so a browser that
-/// hangs on a missing library still returns a verdict rather than sitting there
-/// until the exec is torn down. The navigation is best-effort and never decides
-/// `ok` — it exists to tell a TLS-intercepted network apart from a broken
-/// install.
+/// `chromiumSandbox` is set explicitly rather than left to Playwright's
+/// default, so this check states the same thing the seeded
+/// `cli.config.json` does instead of agreeing with it by coincidence. The
+/// containers forbid unprivileged user namespaces, so a sandboxed Chromium
+/// aborts on launch; nothing here should be able to drift back into testing a
+/// configuration the viewer will not use.
+///
+/// Each channel in `TRIPLE_C_PW_CHANNELS` is launched in turn — see
+/// [`BrowserTarget::channels`] for why Chromium needs two — and a failure
+/// names the channel that failed, because "is not installed" is meaningless
+/// without it. Only the last launch loads a page: the navigation is
+/// best-effort, never decides `ok`, and exists to tell a TLS-intercepted
+/// network apart from a broken install, so doing it once is enough.
+///
+/// The timeout exists so a browser that hangs on a missing library still
+/// returns a verdict rather than sitting there until the exec is torn down.
 const LAUNCH_PROBE: &str = concat!(
-    r#"const d=process.env.TRIPLE_C_PW_DIR,ch=process.env.TRIPLE_C_PW_CHANNEL||undefined,u=process.env.TRIPLE_C_PW_URL;"#,
+    r#"const d=process.env.TRIPLE_C_PW_DIR,chs=process.env.TRIPLE_C_PW_CHANNELS||"default",u=process.env.TRIPLE_C_PW_URL;"#,
     r#"let done=false;const say=(ok,detail,nav)=>{if(done)return;done=true;"#,
     r#"process.stdout.write("\n__TRIPLE_C_BROWSER_LAUNCH__"+JSON.stringify({ok,detail,nav:nav||null})+"\n");};"#,
     r#"const one=(e)=>String((e&&e.message)||e).split("\n").slice(0,8).join(" | ");"#,
     r#"const t=setTimeout(()=>{say(false,"the browser did not finish starting within 90s");process.exit(0);},90000);"#,
-    r#"(async()=>{let b=null;try{const {chromium}=require(d);b=await chromium.launch(ch?{channel:ch}:{});"#,
-    r#"let v="";try{v=b.version();}catch(e){}"#,
-    r#"let nav={ok:true,cert:false,detail:""};"#,
+    r#"(async()=>{let b=null,cur="";try{const {chromium}=require(d);"#,
+    r#"const list=chs.split(",").map(s=>s.trim()).filter(Boolean);"#,
+    r#"let v="",nav={ok:true,cert:false,detail:""};"#,
+    r#"for(let i=0;i<list.length;i++){cur=list[i];const c=cur==="default"?undefined:cur;"#,
+    r#"b=await chromium.launch(Object.assign({chromiumSandbox:false},c?{channel:c}:{}));"#,
+    r#"try{v=b.version();}catch(e){}"#,
+    r#"if(i===list.length-1){"#,
     r#"try{const p=await b.newPage();await p.goto(u,{timeout:20000});}"#,
     // A certificate failure is classified here, next to the message, because
     // Chromium's wording is the only place the distinction exists.
-    r#"catch(e){const m=one(e);nav={ok:false,cert:/ERR_CERT|CERT_AUTHORITY|ERR_SSL|SSL_ERROR|self.signed/i.test(m),detail:m};}"#,
-    r#"await b.close();clearTimeout(t);say(true,v,nav);}"#,
-    r#"catch(e){clearTimeout(t);try{if(b)await b.close();}catch(e2){}say(false,one(e));}"#,
+    r#"catch(e){const m=one(e);nav={ok:false,cert:/ERR_CERT|CERT_AUTHORITY|ERR_SSL|SSL_ERROR|self.signed/i.test(m),detail:m};}}"#,
+    r#"await b.close();b=null;}"#,
+    r#"clearTimeout(t);say(true,v,nav);}"#,
+    r#"catch(e){clearTimeout(t);try{if(b)await b.close();}catch(e2){}"#,
+    r#"say(false,(cur&&cur!=="default"?"channel "+cur+": ":"")+one(e));}"#,
     r#"process.exit(0);})();"#,
 );
 
@@ -984,8 +1030,10 @@ mod tests {
         // `@playwright/mcp` asks for the chrome channel specifically, so the UI
         // must be able to say so.
         assert!(BrowserTarget::Chrome.needed_for().contains("@playwright/mcp"));
-        assert_eq!(BrowserTarget::Chrome.channel(), Some("chrome"));
-        assert_eq!(BrowserTarget::Chromium.channel(), None);
+        assert_eq!(BrowserTarget::Chrome.channels(), "chrome");
+        // Both of Chromium's consumers, or the check passes for a browser the
+        // viewer cannot open — see `channels`.
+        assert_eq!(BrowserTarget::Chromium.channels(), "default,chrome-for-testing");
         // And a size, before the click, for both.
         for t in [BrowserTarget::Chromium, BrowserTarget::Chrome] {
             assert!(t.download_note().to_lowercase().contains("mb"), "{:?}", t);

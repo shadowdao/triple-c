@@ -425,6 +425,32 @@ if [ -x /usr/local/bin/triple-c-open ]; then
     export BROWSER=/usr/local/bin/triple-c-open
 fi
 
+# ── Playwright browser config ───────────────────────────────────────────────
+# Seed ~/.playwright/cli.config.json on every start.
+#
+# Without it `playwright-cli` resolves to channel `chrome` — system Google
+# Chrome — with the Chromium sandbox ON, and these containers do not permit
+# unprivileged user namespaces, so the browser aborts with "Failed to move to
+# new namespace ... Operation not permitted". On a base image that no longer
+# ships Google Chrome the same default fails the other way, with "Chromium
+# distribution 'chrome' is not found". One cause, two error messages, and
+# neither of them looks like a configuration problem.
+#
+# Seeded here rather than baked into the image because ~/.playwright is inside
+# the home volume: an image copy would reach new projects only, and every
+# existing project would stay broken forever. Written on every start from a
+# source outside the volume, the way CLAUDE_INSTRUCTIONS and the Mission
+# Control skills already are.
+#
+# --seed-config-only is the cheap path: no npm install, no browser download, no
+# apt, no verify launch, nothing over the network. It writes one small file if
+# it is absent and returns. Measured at ~2 ms. The heavier repairs stay
+# on-demand — run `triple-c-playwright-heal` with no arguments for those.
+if [ -x /usr/local/bin/triple-c-playwright-heal ]; then
+    /usr/local/bin/triple-c-playwright-heal --seed-config-only --quiet || \
+        echo "entrypoint: warning — playwright config seeding failed (browser view may not launch)"
+fi
+
 # ── Scheduler setup ─────────────────────────────────────────────────────────
 SCHEDULER_DIR="/home/claude/.claude/scheduler"
 mkdir -p "$SCHEDULER_DIR/tasks" "$SCHEDULER_DIR/logs" "$SCHEDULER_DIR/notifications"
