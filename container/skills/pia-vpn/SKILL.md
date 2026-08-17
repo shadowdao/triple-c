@@ -9,8 +9,10 @@ Bring this container's traffic out through Private Internet Access over
 WireGuard, using the API PIA documents for headless use.
 
 Run `sudo ~/.claude/skills/pia-vpn/pia-wg.sh` with `up`, `up --full`, `down` or
-`status`. Read the rest of this page before the first `up --full` — two of the
-behaviours below are actively misleading if you meet them without warning.
+`status`. Read the rest of this page before the first `up --full` — three of the
+behaviours below are actively misleading if you meet them without warning, and
+each one presents as "the VPN is fine" or "Claude is broken" rather than as
+what it is.
 
 ## Before anything else: what the toggle does not do
 
@@ -72,7 +74,27 @@ that way looks perfect and works for nothing.
 `status` resolves a real name for this reason. Trust its `DNS:` line, and if
 you check by hand, resolve a name rather than fetching an address.
 
-## Trap 3: no tunnel survives a restart, and it fails open
+## Trap 3: in test mode, the obvious probe is the one thing tunnelled
+
+`up` routes `1.1.1.1` and nothing else. So checking your address by fetching
+`https://1.1.1.1/cdn-cgi/trace` reports a **PIA** address — not because your
+traffic is going through PIA, but because that single probe is. Everything else
+still leaves directly.
+
+This reads exactly like a working full tunnel, and it is the likeliest reason
+someone concludes the VPN is on when it is not. `status` prints both exits in
+test mode for this reason:
+
+```
+mode: test route only (1.1.1.1 through the tunnel, nothing else)
+  through the tunnel: 64.113.5.73
+  everything else:    172.116.197.166   <- your real address
+```
+
+Two different addresses there is correct and expected in test mode. If you want
+the second line to change, you want `up --full`.
+
+## Trap 4: no tunnel survives a restart, and it fails open
 
 The network namespace is rebuilt every time the container starts, and nothing
 inside reconnects anything. After a stop/start, Reset or any config change that
@@ -115,18 +137,22 @@ curl -s https://serverlist.piaservers.net/vpninfo/servers/v6 \
 
 ## Verifying
 
-`status` prints three things — handshake, DNS, and the public address:
+`status` prints the handshake, DNS, and which address traffic actually leaves
+from — labelled by mode, so the answer cannot be misread:
 
 ```
   latest handshake: 2 seconds ago
   transfer: 92 B received, 180 B sent
 DNS: ok (via 10.0.0.243 10.0.0.242)
-public IP: 64.113.5.244
+mode: full tunnel
+  all traffic exits: 64.113.5.244
 ```
 
-All three matter. A handshake with `DNS: BROKEN` is trap 1. A handshake with an
-unchanged public address means routing did not take — you are probably in `up`
-rather than `up --full`.
+All of it matters. A handshake with `DNS: BROKEN` is trap 1. `mode: test route
+only` with two different addresses is trap 3, and is correct — it means the
+tunnel works and you have not asked for it to carry anything yet. Report the
+mode line when telling someone the VPN is on; "the public IP is a PIA one" is
+true in test mode too, and means much less than it sounds like.
 
 ## Tearing down
 

@@ -156,8 +156,17 @@ down() {
   echo "tunnel down"
 }
 
+# Both are Cloudflare and both answer /cdn-cgi/trace over their bare address, so
+# neither needs DNS. Only 1.1.1.1 is ever routed into the tunnel, which is what
+# lets status tell the two exits apart.
+TRACE_TUNNELLED=https://1.1.1.1/cdn-cgi/trace
+TRACE_DIRECT=https://1.0.0.1/cdn-cgi/trace
+
+exit_ip() { curl -s -m 20 "$1" | sed -n 's/^ip=//p'; }
+
 status() {
   wg show "$IFACE" 2>/dev/null | grep -E "latest handshake|transfer" || echo "no tunnel up"
+
   # Resolve a name, not an IP literal. A curl to 1.1.1.1 succeeds while DNS is
   # completely broken, which is exactly how a dead resolver goes unnoticed.
   printf 'DNS: '
@@ -166,8 +175,22 @@ status() {
   else
     echo "BROKEN - cannot resolve api.anthropic.com"
   fi
-  echo -n "public IP: "
-  curl -s -m 20 https://1.1.1.1/cdn-cgi/trace | sed -n 's/^ip=//p'
+
+  # Report the exit per mode. In test mode the probe address is itself the one
+  # thing inside the tunnel, so a single "public IP" line would print a PIA
+  # address while every other packet leaves directly -- the exact reading that
+  # makes a test tunnel look like a full one.
+  if ip route show 0.0.0.0/1 2>/dev/null | grep -q "$IFACE"; then
+    echo "mode: full tunnel"
+    echo "  all traffic exits: $(exit_ip "$TRACE_TUNNELLED")"
+  elif ip link show "$IFACE" >/dev/null 2>&1; then
+    echo "mode: test route only (1.1.1.1 through the tunnel, nothing else)"
+    echo "  through the tunnel: $(exit_ip "$TRACE_TUNNELLED")"
+    echo "  everything else:    $(exit_ip "$TRACE_DIRECT")   <- your real address"
+  else
+    echo "mode: no tunnel"
+    echo "  all traffic exits: $(exit_ip "$TRACE_DIRECT")"
+  fi
 }
 
 case "${1:-}" in
