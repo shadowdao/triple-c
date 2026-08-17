@@ -27,6 +27,9 @@
 set -euo pipefail
 
 # Not ~/pia-creds: under sudo, HOME is /root.
+# Read by up()'s EXIT trap, which runs after the function's locals are gone.
+SETUP_OK=0
+
 CREDS=${PIA_CREDS:-/home/claude/pia-creds}
 REGION=${PIA_REGION:-us_chicago}
 IFACE=pia0
@@ -88,7 +91,7 @@ preflight() {
 # tunnel captures everything while the exclusions that keep DNS and the Docker
 # host reachable are quietly missing -- and `status` still says "full tunnel".
 add_route() {
-  ip route add "$@" || die "could not add route '$*'. Run 'down' to undo the partial setup."
+  ip route add "$@" || die "could not add route '$*'"
   printf '%s\n' "$*" >> "$STATE/routes"
 }
 
@@ -99,11 +102,6 @@ up() {
            "Refusing rather than silently giving you a test route." ;;
   esac
   preflight
-
-  # Always start from a known state. Without this a second `up` overwrites the
-  # saved resolv.conf with PIA's own resolvers, so the later `down` "restores"
-  # those and leaves the container with no working DNS and no way back.
-  down >/dev/null 2>&1 || true
 
   mkdir -p "$STATE"; cd "$STATE"
 
@@ -135,6 +133,27 @@ up() {
   sip=$(echo "$srv" | jq -r .ip); scn=$(echo "$srv" | jq -r .cn)
   [ -n "$sip" ] && [ "$sip" != null ] || die "no WireGuard server for region '$REGION'"
 
+  # Only now tear down any previous tunnel. Doing it up front (as an earlier
+  # version did) meant a failed token fetch or an unreachable server list took
+  # a *working* tunnel down with it and silently reverted the container to its
+  # real address, while the error talked about credentials. Everything above
+  # this line can fail; nothing above it has touched the network stack.
+  #
+  # It also still does the job it was added for: clearing a stale resolv.conf
+  # backup so a second `up` cannot save PIA's own resolvers over the real ones.
+  down >/dev/null 2>&1 || true
+
+  # From here on the network stack is being modified, so any failure has to put
+  # it back rather than exit half-configured. `down` is idempotent and restores
+  # routes and resolv.conf exactly.
+  #
+  # EXIT rather than ERR, and a flag rather than the trap's own exit status: an
+  # ERR trap is not inherited by shell functions without `set -E`, so a failure
+  # inside add_route would not fire it, and `die` exits explicitly, which is not
+  # an error and would not fire it either. EXIT catches both.
+  SETUP_OK=0
+  trap '[ "$SETUP_OK" = 1 ] || { echo "pia-wg: setup failed - rolling back" >&2; down >/dev/null 2>&1; }' EXIT
+
   # umask, not a later chmod: the file is created under the inherited 0022
   # otherwise, so the key is world-readable for the moment in between.
   ( umask 077; priv=$(wg genkey); printf '%s' "$priv" > wg.priv )
@@ -159,6 +178,12 @@ up() {
     peer "$(echo "$resp" | jq -r .server_key)" \
     endpoint "$(echo "$resp" | jq -r .server_ip):$(echo "$resp" | jq -r .server_port)" \
     allowed-ips 0.0.0.0/0 persistent-keepalive 25
+  # The kernel holds the key from here, so the file has no reason to outlive
+  # this line -- and every reason not to: /run is in the writable layer, and a
+  # recreate or migrate runs `docker commit` over it without tearing the tunnel
+  # down first, baking the key into the project's snapshot image. `down` also
+  # removes it, for the case where `up` never got this far.
+  rm -f wg.priv
   ip addr add "$(echo "$resp" | jq -r .peer_ip)/32" dev "$IFACE"
   ip link set "$IFACE" up
 
@@ -201,7 +226,18 @@ up() {
     echo "test route only: 1.1.1.1 goes via PIA, everything else unchanged"
   fi
 
-  sleep 2
+  # A tunnel with no handshake still routes -- into a black hole. Without this
+  # `up --full` would exit 0 having pointed all traffic *and* resolv.conf at a
+  # peer that never answered, and `status` would print "mode: full tunnel".
+  local waited=0
+  until [ "$(wg show "$IFACE" latest-handshakes | awk '{print $2; exit}')" != 0 ]; do
+    waited=$((waited + 1))
+    [ "$waited" -lt 20 ] || die "no handshake from $REGION after 10s - rolled back"
+    sleep 0.5
+  done
+
+  SETUP_OK=1
+  trap - EXIT
   status
 }
 
@@ -242,6 +278,10 @@ TRACE_DIRECT=https://1.0.0.1/cdn-cgi/trace
 exit_ip() { curl -s -m 20 "$1" | sed -n 's/^ip=//p'; }
 
 status() {
+  # `wg show` needs root; `ip route`/`ip link` do not. Without this guard an
+  # unprivileged run prints "no tunnel up" and then "mode: full tunnel" in the
+  # same breath, and an agent reading the first line re-runs `up`.
+  [ "$(id -u)" = 0 ] || die "run with sudo"
   wg show "$IFACE" 2>/dev/null | grep -E "latest handshake|transfer" || echo "no tunnel up"
 
   # Resolve a name, not an IP literal. A curl to 1.1.1.1 succeeds while DNS is
@@ -274,5 +314,5 @@ case "${1:-}" in
   up) shift; up "${1:-}" ;;
   down) down ;;
   status) status ;;
-  *) sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

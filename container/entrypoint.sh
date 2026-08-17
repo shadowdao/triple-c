@@ -359,21 +359,31 @@ install_feature_skill() {
     local _src="/opt/triple-c-skills/$1"
     local _dest="/home/claude/.claude/skills/$1"
 
-    # A blank name would make the disabled branch `rm -rf` the whole skills
-    # directory, Mission Control's included, under a persisted volume.
-    [ -n "$_name" ] || { echo "entrypoint: install_feature_skill called with no name"; return 1; }
+    # Reject anything that is not a plain directory name. The disabled branch
+    # `rm -rf`s $_dest under a *persisted volume*, so a blank name would take the
+    # whole skills directory (Mission Control's included) and `../x` would escape
+    # it entirely. Only the literal `pia-vpn` is passed today; this is so that
+    # stays true.
+    case "$_name" in
+        ''|*/*|.*) echo "entrypoint: install_feature_skill: bad skill name '$_name'"; return 1 ;;
+    esac
 
     if [ "$_enabled" = "1" ]; then
         if [ ! -d "$_src" ]; then
             echo "entrypoint: $_name skill unavailable — this container's base image predates it; migrate the project to get it"
             return 0
         fi
-        mkdir -p /home/claude/.claude/skills
+        # Checked, not assumed: with no `set -e` in this script every step here
+        # can fail (full volume, read-only mount, a file where the directory
+        # should be) and the success line would still print.
+        mkdir -p /home/claude/.claude/skills || {
+            echo "entrypoint: $_name skill install FAILED (cannot create ~/.claude/skills)"; return 1; }
         # Not just $_dest: when Mission Control is off nothing else creates the
         # parent, so root would own it and `claude` could not add a skill there.
         chown claude:claude /home/claude/.claude/skills
         rm -rf "$_dest"
-        cp -r "$_src" "$_dest"
+        cp -r "$_src" "$_dest" || {
+            echo "entrypoint: $_name skill install FAILED (copy from $_src)"; return 1; }
         chown -R claude:claude "$_dest"
         echo "entrypoint: $_name skill installed to ~/.claude/skills/"
     elif [ -e "$_dest" ] || [ -L "$_dest" ]; then

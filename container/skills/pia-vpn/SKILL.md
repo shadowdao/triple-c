@@ -183,22 +183,34 @@ true in test mode too, and means much less than it sounds like.
 `down` restores `resolv.conf` from its backup (only if that backup still looks
 like a resolver file — restoring a truncated one would leave the container with
 no DNS at all), removes exactly the routes that were added, in reverse order,
-deletes the interface, and shreds the WireGuard private key. It is safe to run
-when nothing is up, and `up` runs it first so a repeat `up` cannot stack state.
-Confirm afterwards that the public address is back to the container's own.
+and deletes the interface. It is safe to run when nothing is up. Confirm
+afterwards that the public address is back to the container's own.
 
-The key deletion is not housekeeping: `/run` is in the container's writable
-layer, so `docker commit` bakes whatever is there into the project's snapshot
-image. A key left behind rides that image into every future container.
+`up` calls it too, but only *after* every network fetch has succeeded, so a
+failed `up` leaves an existing tunnel alone rather than tearing it down to
+report a bad password. From that point on a rollback is armed: if any step of
+the setup fails, the tunnel is torn down rather than left half-configured.
+
+The private key is deleted earlier still — the moment `wg set` has read it,
+while the tunnel is being built. That is not housekeeping: `/run` is in the
+container's writable layer, and recreating or migrating the project runs
+`docker commit` over it *without* tearing the tunnel down first. A key that
+lived for the tunnel's lifetime would be baked into the snapshot image and
+copied forward from then on. The kernel keeps its own copy, so nothing is lost.
 
 ## What this deliberately does not do
 
-- **No killswitch.** Blocking non-tunnel egress needs `iptables`, which is not
-  in the image, and would cut Claude Code's API traffic whenever the tunnel is
-  down. If the user needs guaranteed egress rather than convenient egress, say
-  so plainly rather than improvising one — it is a real design decision.
+- **No killswitch.** `iptables` *is* in the image, so one is buildable — this
+  is a deliberate omission, not a missing dependency. Blocking non-tunnel egress
+  cuts Claude Code's own API traffic the moment the tunnel drops, which ends the
+  session that would otherwise fix it. If the user needs guaranteed egress
+  rather than convenient egress, say so plainly and let them decide, rather than
+  improvising one.
 - **No autostart.** There is no service manager in the container and Triple-C
-  has no start hook, so nothing can re-establish the tunnel automatically.
+  has no start hook, so nothing re-establishes the tunnel on its own. `cron` is
+  in the image and `triple-c-scheduler` runs on it, so a scheduled reconnect is
+  possible if the user wants one — it is just not set up, and a tunnel that
+  reconnects unattended deserves an explicit decision.
 - **Not PIA's desktop client.** `pia-daemon` and `piactl` are installable but
   cannot work headless: the daemon never accepts a client connection without
   the GUI, and `piactl --help` states that connecting requires it. If you find
