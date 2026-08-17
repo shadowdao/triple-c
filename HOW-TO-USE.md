@@ -477,19 +477,19 @@ When enabled, the container is given the three things a VPN client needs to buil
 the `NET_ADMIN` capability, the `/dev/net/tun` device, and the `net.ipv4.conf.all.src_valid_mark`
 sysctl that WireGuard requires. This is **off by default**.
 
-The `ip`, `wg` and `nft` commands ship in the container image so there is something able to use
+The `ip`, `wg` and `iptables` commands ship in the container image so there is something able to use
 them. If your project's container was created from an older base image it will not have them, and
 `wg` will simply not be found — **migrating the project onto the current base image** is what picks
-them up. Installing them by hand with `sudo apt install wireguard-tools` works in the meantime, but
-lives in the writable layer, so it is undone by a **Reset** and by a migration.
+them up. `sudo apt install iproute2 wireguard-tools iptables` works in the meantime, but lives in
+the writable layer, so it is undone by a **Reset** and by a migration.
 
 **This setting makes a tunnel possible; it does not make one.** Nothing is connected, no traffic is
 redirected, and no tunnel is configured or started on your behalf. Enabling it and expecting the
 container's traffic to start leaving through a VPN is the most common misreading of what it does —
 configuring a tunnel and routing traffic into it remains yours to do.
 
-Without it, a client such as PIA, WireGuard or OpenVPN installs and its daemon starts normally, but
-the connection attempt **hangs until it times out** — a default container has no tun device to open
+With the setting **off**, a client such as PIA or OpenVPN installs and its daemon starts normally,
+but the connection attempt **hangs until it times out** — a default container has no tun device to open
 and no permission to add an interface or a route, and most clients report that as a generic timeout
 rather than a permissions error.
 
@@ -528,10 +528,19 @@ Things worth knowing:
   address via the original gateway, or the tunnel's encrypted packets try to route through the
   tunnel. Note that a health check which fetches an IP literal such as `1.1.1.1` passes cleanly
   while DNS is broken — resolve a name instead.
-- **`wg-quick` cannot bring up a full tunnel on Docker Desktop for Windows.** Its `Table=auto` mode
-  routes by firewall mark and needs `xt_CONNMARK` from the host kernel, which WSL2's does not have
-  and a container cannot load. Split tunnels (a specific `AllowedIPs`) work fine, as does adding
-  the routes yourself with `ip route`. Native Linux and Docker Desktop for Mac are unaffected.
+- **Delete a client's key material when you tear a tunnel down.** Anything written under `/run` is
+  in the container's writable layer, and recreating or migrating the project runs `docker commit`
+  over it — so a WireGuard private key left there gets baked into the project's snapshot image and
+  copied forward from then on. This is not hypothetical; it has already happened here.
+- **Strip the `DNS =` line from a provider's `.conf` before `wg-quick up`.** Every commercial
+  provider ships one, and `wg-quick` hands it to `resolvconf`, which is not installed — so it fails
+  at `resolvconf: command not found` and deletes the interface again. This happens before any
+  routing, so it takes **split tunnels down too**. Set the resolver another way instead, or drive
+  `wg` and `ip route` directly rather than going through `wg-quick`.
+- **`wg-quick` full tunnels also need `xt_CONNMARK` from the host kernel.** Native Linux, Docker
+  Desktop for Mac and WSL2 kernels from 6.6 have it; older WSL2 kernels do not, and a container
+  cannot load one. There the answer is again to add the routes yourself with `ip route`, which
+  needs no firewall backend on any platform.
 
 > This setting can only be changed when the container is stopped. Capabilities and devices are
 > fixed when a container is created, so toggling it recreates the container on the next start.
@@ -1291,6 +1300,7 @@ The sandbox container (Ubuntu 24.04) comes pre-installed with:
 | ruff | Latest | Python linter/formatter |
 | Rust | Stable | Rust development (via rustup) |
 | Docker CLI | Latest | Container management (when spawning is enabled) |
+| iproute2, WireGuard tools, iptables | Latest | Building a tunnel (when VPN Support is enabled) |
 | git | Latest | Version control |
 | GitHub CLI (gh) | Latest | GitHub integration |
 | AWS CLI | v2 | AWS services and Bedrock |

@@ -135,7 +135,7 @@ pub const FEATURE_PROBES: &[(&str, &str)] = &[
     ("/usr/local/bin/triple-c-task-runner", "Scheduled task runner"),
     ("/usr/local/bin/triple-c-sso-refresh", "AWS SSO auto-refresh"),
     ("/opt/mission-control", "Mission Control (Flight Control)"),
-    ("/usr/bin/wg", "VPN support (WireGuard tools)"),
+    ("/usr/bin/wg", "VPN tooling (WireGuard, for the VPN Support toggle)"),
 ];
 
 /// Headroom demanded on Docker's storage backend on top of the measured

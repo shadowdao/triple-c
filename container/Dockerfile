@@ -36,7 +36,7 @@ RUN for i in 1 2 3 4 5; do \
     socat \
     iproute2 \
     wireguard-tools \
-    nftables \
+    iptables \
     && rm -rf /var/lib/apt/lists/*
 
 # `libnss3-tools` above provides `certutil`. Chrome/Chromium read neither
@@ -45,7 +45,7 @@ RUN for i in 1 2 3 4 5; do \
 # corporate CA, no matter what the system trust store says. entrypoint.sh
 # degrades to a warning if it is ever missing.
 
-# `iproute2`, `wireguard-tools` and `nftables` above are what the VPN support
+# `iproute2`, `wireguard-tools` and `iptables` above are what the VPN support
 # toggle (`vpn_support_enabled`) grants capability *for*. That toggle hands a
 # project CAP_NET_ADMIN and /dev/net/tun; without `ip` there is then no way to
 # add a route, and without `wg` no way to build the tunnel those two exist to
@@ -58,42 +58,62 @@ RUN for i in 1 2 3 4 5; do \
 # — silently, since a VPN that fails to come up looks exactly like one that was
 # never started.
 #
-# Measured against the *current base image*, not a bare ubuntu:24.04 — the base
-# already ships libelf1t64, so measuring on bare ubuntu over-counts by ~209 kB:
-# +9 packages, 5,614 kB on amd64 (4,153 kB of that is iproute2+wireguard-tools,
-# 1,461 kB is nftables). The same set on arm64 is 7,422 kB, measured against
-# ubuntu:24.04 since the arm64 base is not cached here.
+# Measured against the *current base image*, since a bare ubuntu:24.04 also
+# pulls libelf1t64 and netbase, which this base already has, and so over-reports
+# by ~258 kB: **+12 packages, 7,203 kB on amd64**. The same set on arm64 is
+# ~14.4 MB — the package list is identical on both arches, the binaries are
+# simply larger (measured as 14.7 MB on arm64 ubuntu:24.04, less that 258 kB).
 #
-# ## Why `nftables` specifically
+# ## Why `iptables`, and not `nftables`
 #
 # `wireguard-tools` declares `Recommends: nftables | iptables`, which the
 # `--no-install-recommends` above strips. That is not cosmetic: `wg-quick`'s
 # `add_default()` runs whenever a config has `AllowedIPs = 0.0.0.0/0` — i.e.
 # every stock full-tunnel config every provider hands out — and it shells out to
-# a firewall backend with no `type -p` guard. Measured without one:
+# a firewall backend with no `type -p` guard. Measured with neither installed:
 #
 #     [#] iptables-restore -n
 #     /usr/bin/wg-quick: line 32: iptables-restore: command not found
-#     wg-quick EXIT=127        (interface rolled back, split tunnels unaffected)
+#     wg-quick EXIT=127
 #
-# `nftables` rather than `iptables` because `wg-quick` prefers it (`if type -p
-# nft`, so with both installed iptables is dead weight), it is the first
-# alternative in the package's own Recommends, and it is roughly half the size.
+# `nftables` looks like the better pick — wg-quick prefers it, it is first in
+# that Recommends, it is half the size — and it is the wrong one. wg-quick picks
+# nft *unconditionally* when present (`if type -p nft`, line 241), so installing
+# it makes the iptables path unreachable; and its nft ruleset needs three
+# expression families where the iptables path needs one. Isolating them on a
+# WSL2 host, the two connmark rules install fine and this is what fails:
 #
-# This does NOT make `wg-quick`'s full-tunnel mode work everywhere. `Table=auto`
-# routes by fwmark and needs connection-mark tracking from the *host* kernel:
+#     nft add rule ... fib saddr type != local drop
+#     Error: Could not process rule: No such file or directory
+#                                   ^^^^^^^^^^^^^^  needs nft_fib_ipv4
 #
-#     Warning: Extension CONNMARK revision 0 not supported, missing kernel module?
+# That matters because of how the two hosts we ship to are configured. From
+# LinuxKit's kernel config — Docker Desktop for Mac, identical on both arches:
 #
-# WSL2's kernel has no `xt_CONNMARK` and containers have no /lib/modules to load
-# one from, so on Docker Desktop for Windows `wg-quick up` on a full tunnel fails
-# regardless of what is installed here. Native Linux and Docker Desktop for Mac
-# have it. Shipping the backend is what makes the difference on those two;
-# nothing shipped here can make the difference on WSL2, where the way out is to
-# add the routes with `ip route` instead of going through `wg-quick` at all.
+#     CONFIG_NETFILTER_XT_CONNMARK=y      <- the iptables path works
+#     # CONFIG_NFT_FIB_IPV4 is not set    <- the nft path does not
 #
-# `iptables` is deliberately still NOT here: with `nftables` present `wg-quick`
-# never reaches for it, so it would add size and firewall surface for nothing.
+# So shipping `nftables` would forfeit the platform it was meant to fix. With
+# `iptables`, full tunnels work on native Linux, on Docker Desktop for Mac, and
+# on WSL2 kernels from 6.6 (which added xt_CONNMARK as a module). Only WSL2
+# older than that is left out, and nothing installable here changes it — the way
+# out there is to add the routes with `ip route` instead of using `wg-quick`,
+# which is what the pia-vpn skill does on every platform.
+#
+# ## What this still does not fix
+#
+# `wireguard-tools` only *Suggests* `openresolv | resolvconf`, so neither is
+# installed, and every provider's stock config carries a `DNS =` line. That
+# fails in `set_dns()`, *before* the firewall step, so it takes split tunnels
+# down too:
+#
+#     [#] resolvconf -a wg0 -m 0 -x
+#     /usr/bin/wg-quick: line 32: resolvconf: command not found
+#
+# Deliberately not fixed here: `openresolv` has no installation candidate on
+# noble, and `resolvconf` resolves only by pulling in systemd-resolved — a
+# resolver daemon and systemd units, into a container with no systemd. Strip the
+# `DNS =` line and set the resolver another way. Documented in HOW-TO-USE.md.
 
 # Remove default ubuntu user to free UID 1000 for host-user remapping
 RUN if id ubuntu >/dev/null 2>&1; then userdel -r ubuntu 2>/dev/null || userdel ubuntu; fi \

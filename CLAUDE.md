@@ -204,7 +204,7 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
 
 - **`Dockerfile`** — Ubuntu 24.04 base with Claude Code, Node.js 22, Python 3.12, Rust, Docker CLI, git, gh, AWS CLI v2, ripgrep, pnpm, uv, ruff pre-installed, plus the shared
   libraries a browser links against (see below) and the VPN tooling the `vpn_support_enabled`
-  toggle grants capability for (`iproute2`, `wireguard-tools`, `nftables`)
+  toggle grants capability for (`iproute2`, `wireguard-tools`, `iptables`)
 - **Browser runtime libraries are baked in; browser *binaries* are not.** A layer runs
   `npx --yes playwright@latest install-deps chromium` as root, so Playwright names its own
   dependencies and the list cannot rot against Ubuntu 24.04's `t64` renames or a new Chromium
@@ -327,12 +327,19 @@ container is created once by a very long function where a dropped capability is 
   `/run`. Anything writing key material there inherits the problem — the same `docker commit`
   hazard as `triple-c.git-token-hash` and the custom-env fingerprint, in a directory that looks
   ephemeral and is not. A VPN client that does this should delete its key on teardown.
-- **`wg-quick` full tunnels need `xt_CONNMARK` from the host kernel**, which WSL2 does not have and
-  a container cannot load; `Recommends: nftables | iptables` is also stripped by
-  `--no-install-recommends`, so `nftables` is baked explicitly. See the Dockerfile comment — the
-  short version is that shipping the backend fixes native Linux and Docker Desktop for Mac, nothing
-  fixes Docker Desktop for Windows, and adding the routes directly with `ip route` sidesteps it on
-  all three.
+- **`iptables` is baked, and picking `nftables` instead would have been wrong.** `Recommends:
+  nftables | iptables` is stripped by `--no-install-recommends`, and `wg-quick` needs a backend for
+  any `AllowedIPs = 0.0.0.0/0`. `nftables` is the tempting choice — preferred by `wg-quick`, half
+  the size — but `wg-quick` picks nft *unconditionally* when present, and its nft ruleset needs
+  `nft_fib_ipv4`, which LinuxKit (Docker Desktop for Mac) does not build while it *does* build
+  `xt_CONNMARK`. Shipping nftables would therefore have forfeited Mac. See the Dockerfile comment;
+  the kernel-config evidence is quoted there.
+- **Two `wg-quick` failures remain, and only one is ours to fix.** Full tunnels still need
+  `xt_CONNMARK`, which WSL2 before 6.6 lacks — nothing installable changes that. And every
+  provider's stock config carries a `DNS =` line that fails in `set_dns()` before any routing, so it
+  breaks split tunnels too; `openresolv` has no candidate on noble and `resolvconf` drags in
+  systemd-resolved, so that one is documented rather than fixed. Driving `wg` and `ip route`
+  directly avoids both, which is what the skill does.
 
 ### Container Lifecycle
 
