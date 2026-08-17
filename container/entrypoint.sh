@@ -338,6 +338,35 @@ if [ "$MISSION_CONTROL_ENABLED" = "1" ]; then
     unset MISSION_CONTROL_ENABLED
 fi
 
+# ── Feature skills ──────────────────────────────────────────────────────────
+# Skills owned by a Triple-C feature rather than by Mission Control. Installed
+# when the feature is on, removed when it is off: ~/.claude is a persisted
+# volume, so a skill left behind after its feature is disabled would keep
+# telling an agent to use a capability the container no longer has.
+#
+# Copied on every start rather than only when absent, so a fix to a skill
+# reaches projects that already have the old copy. Local edits under these
+# directories do not survive — treat /opt/triple-c-skills as the source.
+install_feature_skill() {
+    _name=$1
+    _enabled=$2
+    _dest="/home/claude/.claude/skills/$_name"
+    if [ "$_enabled" = "1" ]; then
+        [ -d "/opt/triple-c-skills/$_name" ] || return 0
+        mkdir -p /home/claude/.claude/skills
+        rm -rf "$_dest"
+        cp -r "/opt/triple-c-skills/$_name" "$_dest"
+        chown -R claude:claude "$_dest"
+        echo "entrypoint: $_name skill installed to ~/.claude/skills/"
+    elif [ -d "$_dest" ]; then
+        rm -rf "$_dest"
+        echo "entrypoint: $_name skill removed (feature disabled)"
+    fi
+}
+
+install_feature_skill pia-vpn "${VPN_SUPPORT_ENABLED:-0}"
+unset VPN_SUPPORT_ENABLED
+
 # ── Claude Code settings ────────────────────────────────────────────────────
 # Merge Claude Code settings into ~/.claude/settings.json (preserves existing
 # keys). Creates the file if it doesn't exist. These control TUI mode, effort

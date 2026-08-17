@@ -394,6 +394,15 @@ RUN chmod +x /usr/local/bin/triple-c-sso-refresh
 
 COPY mission-control /opt/mission-control
 
+# Skills that ship with a Triple-C feature rather than with Mission Control.
+# entrypoint.sh installs them into ~/.claude/skills/ when the feature that owns
+# them is enabled, and removes them when it is not — a skill telling an agent to
+# build a tunnel in a container that no longer has CAP_NET_ADMIN is worse than
+# no skill at all. Staged in /opt because ~/.claude is a volume mount: an image
+# copy underneath it would be masked from the project's first start onward.
+COPY skills /opt/triple-c-skills
+RUN chmod +x /opt/triple-c-skills/*/*.sh
+
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 COPY triple-c-scheduler /usr/local/bin/triple-c-scheduler

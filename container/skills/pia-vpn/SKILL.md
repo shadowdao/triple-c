@@ -1,0 +1,149 @@
+---
+name: pia-vpn
+description: Connect this container's traffic through a PIA VPN tunnel over WireGuard, or diagnose one that is not working. Use when asked to enable, route through, check, or tear down a VPN, when traffic needs to leave from a different location, or when DNS or connectivity broke after a VPN was brought up.
+---
+
+# PIA VPN
+
+Bring this container's traffic out through Private Internet Access over
+WireGuard, using the API PIA documents for headless use.
+
+Run `sudo ~/.claude/skills/pia-vpn/pia-wg.sh` with `up`, `up --full`, `down` or
+`status`. Read the rest of this page before the first `up --full` — two of the
+behaviours below are actively misleading if you meet them without warning.
+
+## Before anything else: what the toggle does not do
+
+Triple-C's **VPN support** setting grants three things — `CAP_NET_ADMIN`, the
+`/dev/net/tun` device, and the `net.ipv4.conf.all.src_valid_mark` sysctl — and
+stops there. It starts no client, builds no tunnel and changes no route.
+
+So "the VPN is enabled but traffic isn't going through it" is normally not a
+fault. It means the capability is present and nothing has used it yet. Check
+with `status` before assuming something is broken.
+
+If the toggle is off, the script says so and names the setting. It cannot be
+turned on from inside the container; the user changes it in Config → Runtime,
+and it recreates the container on the next start (home and `.claude` volumes
+are preserved — it is not a Reset).
+
+## Two modes
+
+| | routes | use when |
+|---|---|---|
+| `up` | only `1.1.1.1/32` | verifying the tunnel works without disturbing anything |
+| `up --full` | all public traffic | you actually want traffic leaving via PIA |
+
+Prefer `up` first. It proves the handshake, credentials and region are good
+while your own connectivity is untouched, so a failure is cheap.
+
+**`up --full` routes Claude Code's own API traffic through PIA.** If the tunnel
+drops, that traffic stops until it recovers or you run `down`. Say so before
+running it — the user may be mid-session, and they will experience the failure
+as Claude going away, not as a VPN problem.
+
+## Trap 1: a full tunnel takes DNS with it
+
+The container resolves through an address on the Docker network — under Docker
+Desktop, `192.168.65.7` — which sits **outside** the container's own subnet. A
+default route of `0.0.0.0/0`, or the `0.0.0.0/1` + `128.0.0.0/1` pair, captures
+it and posts every lookup into a tunnel that cannot carry private traffic.
+
+Nothing resolves after that. The visible symptom is Claude Code reporting it
+cannot connect, because `api.anthropic.com` no longer resolves:
+
+```
+$ curl https://api.anthropic.com/v1/messages
+* Could not resolve host: api.anthropic.com     (rc=6)
+```
+
+`pia-wg.sh` already handles this: it routes `10.0.0.0/8`, `172.16.0.0/12`,
+`192.168.0.0/16` and `169.254.0.0/16` back via the original gateway, then pins
+PIA's own resolvers through the tunnel with `/32` routes that outrank the
+`10/8` exclusion. If you ever route traffic by hand, you owe both halves — the
+exclusions *and* a resolver reachable from wherever you pointed the default.
+
+## Trap 2: an IP-literal health check cannot see a dead resolver
+
+`curl https://1.1.1.1/cdn-cgi/trace` needs no DNS, so it returns a cheerful
+PIA exit address while name resolution is entirely broken. A tunnel verified
+that way looks perfect and works for nothing.
+
+`status` resolves a real name for this reason. Trust its `DNS:` line, and if
+you check by hand, resolve a name rather than fetching an address.
+
+## Trap 3: no tunnel survives a restart, and it fails open
+
+The network namespace is rebuilt every time the container starts, and nothing
+inside reconnects anything. After a stop/start, Reset or any config change that
+recreates the container, the interface and its routes are gone.
+
+State under `/run/pia-wg` rides the snapshot and persists, so leftover files
+make it look as though the tunnel is still configured. It is not. Traffic goes
+out the real address with no error and nothing visibly different.
+
+Never infer from `/run/pia-wg` that a tunnel is up. Run `status` — if the
+handshake line is missing, there is no tunnel. Re-run `up` after every start.
+
+## Credentials
+
+Two lines in `~/pia-creds` — username, then password:
+
+```
+p1234567
+your-password
+```
+
+Set `PIA_CREDS` to use a different path. Treat the contents as secret: never
+print the file, never echo the values, and never include them in a commit, a
+log or a message. The script reads it directly and does not echo it.
+
+## Regions
+
+Defaults to `us_chicago`. Override with `PIA_REGION`:
+
+```bash
+sudo PIA_REGION=uk_london ~/.claude/skills/pia-vpn/pia-wg.sh up --full
+```
+
+List the ids:
+
+```bash
+curl -s https://serverlist.piaservers.net/vpninfo/servers/v6 \
+  | head -1 | jq -r '.regions[].id'
+```
+
+## Verifying
+
+`status` prints three things — handshake, DNS, and the public address:
+
+```
+  latest handshake: 2 seconds ago
+  transfer: 92 B received, 180 B sent
+DNS: ok (via 10.0.0.243 10.0.0.242)
+public IP: 64.113.5.244
+```
+
+All three matter. A handshake with `DNS: BROKEN` is trap 1. A handshake with an
+unchanged public address means routing did not take — you are probably in `up`
+rather than `up --full`.
+
+## Tearing down
+
+`down` restores `resolv.conf` from its backup and removes exactly the routes
+that were added, in reverse order, then deletes the interface. It is safe to
+run when nothing is up. Confirm afterwards that the public address is back to
+the container's own.
+
+## What this deliberately does not do
+
+- **No killswitch.** Blocking non-tunnel egress needs `iptables`, which is not
+  in the image, and would cut Claude Code's API traffic whenever the tunnel is
+  down. If the user needs guaranteed egress rather than convenient egress, say
+  so plainly rather than improvising one — it is a real design decision.
+- **No autostart.** There is no service manager in the container and Triple-C
+  has no start hook, so nothing can re-establish the tunnel automatically.
+- **Not PIA's desktop client.** `pia-daemon` and `piactl` are installable but
+  cannot work headless: the daemon never accepts a client connection without
+  the GUI, and `piactl --help` states that connecting requires it. If you find
+  one installed, it is not a working alternative to this script.

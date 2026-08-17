@@ -488,6 +488,13 @@ redirected, and no tunnel is configured or started on your behalf. Enabling it a
 container's traffic to start leaving through a VPN is the most common misreading of what it does —
 configuring a tunnel and routing traffic into it remains yours to do.
 
+To make that second half easier, enabling this also installs a **`pia-vpn` skill** into the
+container's `~/.claude/skills/`, so Claude Code can bring up a Private Internet Access tunnel over
+WireGuard for you — ask it to connect the VPN and it will. The skill carries the parts that are
+easy to get wrong (see the DNS note below), and it is removed again when you turn the setting off.
+It needs your PIA credentials in `~/pia-creds`, two lines, username then password. If you use a
+different provider, ignore it and set up your own client; nothing else depends on it.
+
 With the setting **off**, a client such as PIA or OpenVPN installs and its daemon starts normally,
 but the connection attempt **hangs until it times out** — a default container has no tun device to open
 and no permission to add an interface or a route, and most clients report that as a generic timeout

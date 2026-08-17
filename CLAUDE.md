@@ -341,6 +341,14 @@ container is created once by a very long function where a dropped capability is 
   breaks split tunnels too; `openresolv` has no candidate on noble and `resolvconf` drags in
   systemd-resolved, so that one is documented rather than fixed. Driving `wg` and `ip route`
   directly avoids both, which is what the skill does.
+- **The `pia-vpn` skill is installed *and removed* from `VPN_SUPPORT_ENABLED`.** `container/skills/`
+  is baked to `/opt/triple-c-skills` and `install_feature_skill()` in `entrypoint.sh` copies it into
+  `~/.claude/skills/` on every start — refreshed each time, so a fix reaches existing projects, and
+  `rm -rf`'d first, so files dropped from a later version do not linger. The removal branch matters
+  as much as the install: `~/.claude` is a persisted volume, so a skill left behind after the toggle
+  goes off would keep instructing an agent to use a capability the container no longer has. Which is
+  also why the variable is sent as `0` rather than omitted, and why it is in `RESERVED_ENV_EXACT` —
+  a custom env var of that name could otherwise claim the skill without the capability behind it.
 
 ### Container Lifecycle
 

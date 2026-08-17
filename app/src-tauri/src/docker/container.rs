@@ -233,6 +233,7 @@ const RESERVED_ENV_EXACT: &[&str] = &[
     "MCP_SERVERS_JSON",
     "CLAUDE_CODE_SETTINGS_JSON",
     "MISSION_CONTROL_ENABLED",
+    "VPN_SUPPORT_ENABLED",
     "TRIPLE_C_PERMISSION_MODE",
     CLAUDE_OAUTH_TOKEN_ENV,
     // The model-alias vars are already covered by the `ANTHROPIC_` prefix
@@ -1274,6 +1275,15 @@ pub async fn create_container(
     if project.mission_control_enabled {
         env_vars.push("MISSION_CONTROL_ENABLED=1".to_string());
     }
+
+    // Drives the pia-vpn skill install in entrypoint.sh. Sent as 0 rather than
+    // omitted when off, because ~/.claude is a persisted volume: entrypoint has
+    // to be told to *remove* a skill left there by an earlier run with the
+    // toggle on, and an absent variable cannot say that.
+    env_vars.push(format!(
+        "VPN_SUPPORT_ENABLED={}",
+        u8::from(project.vpn_support_enabled)
+    ));
 
     // Permission mode — read by triple-c-task-runner for scheduled (headless)
     // Claude Code runs. Interactive terminals get the flags directly instead.
@@ -2787,6 +2797,23 @@ mod tests {
         // one, so pin the set.
         let (cap_add, _, _) = vpn_host_config(true);
         assert_eq!(cap_add.unwrap(), vec!["NET_ADMIN"]);
+    }
+
+    #[test]
+    fn the_vpn_skill_flag_is_reserved_from_custom_env() {
+        // entrypoint.sh installs and removes the pia-vpn skill from this
+        // variable. A custom env var of the same name would let a project claim
+        // the skill without the capability behind it — or keep it after the
+        // toggle is off — so it has to be unsettable like the others.
+        assert!(is_reserved_env_key("VPN_SUPPORT_ENABLED"));
+        assert!(is_reserved_env_key("vpn_support_enabled"));
+        assert_eq!(
+            compute_env_fingerprint(&[EnvVar {
+                key: "VPN_SUPPORT_ENABLED".to_string(),
+                value: "1".to_string(),
+            }]),
+            ""
+        );
     }
 
     /// What bollard actually hands us when a tun-less host rejects the device.
