@@ -347,18 +347,37 @@ fi
 # Copied on every start rather than only when absent, so a fix to a skill
 # reaches projects that already have the old copy. Local edits under these
 # directories do not survive — treat /opt/triple-c-skills as the source.
+#
+# The source lives in the *base image*, so a project whose container predates it
+# recreates from its own snapshot and has no /opt/triple-c-skills to copy from.
+# That case says so rather than returning silently: the toggle is on, the
+# capability is there, and the skill simply never appears — which is impossible
+# to work out from the outside.
 install_feature_skill() {
-    _name=$1
-    _enabled=$2
-    _dest="/home/claude/.claude/skills/$_name"
+    local _name="$1"
+    local _enabled="$2"
+    local _src="/opt/triple-c-skills/$1"
+    local _dest="/home/claude/.claude/skills/$1"
+
+    # A blank name would make the disabled branch `rm -rf` the whole skills
+    # directory, Mission Control's included, under a persisted volume.
+    [ -n "$_name" ] || { echo "entrypoint: install_feature_skill called with no name"; return 1; }
+
     if [ "$_enabled" = "1" ]; then
-        [ -d "/opt/triple-c-skills/$_name" ] || return 0
+        if [ ! -d "$_src" ]; then
+            echo "entrypoint: $_name skill unavailable — this container's base image predates it; migrate the project to get it"
+            return 0
+        fi
         mkdir -p /home/claude/.claude/skills
+        # Not just $_dest: when Mission Control is off nothing else creates the
+        # parent, so root would own it and `claude` could not add a skill there.
+        chown claude:claude /home/claude/.claude/skills
         rm -rf "$_dest"
-        cp -r "/opt/triple-c-skills/$_name" "$_dest"
+        cp -r "$_src" "$_dest"
         chown -R claude:claude "$_dest"
         echo "entrypoint: $_name skill installed to ~/.claude/skills/"
-    elif [ -d "$_dest" ]; then
+    elif [ -e "$_dest" ] || [ -L "$_dest" ]; then
+        # -e/-L rather than -d: a leftover *file* at that path must go too.
         rm -rf "$_dest"
         echo "entrypoint: $_name skill removed (feature disabled)"
     fi

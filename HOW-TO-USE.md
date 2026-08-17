@@ -495,6 +495,10 @@ easy to get wrong (see the DNS note below), and it is removed again when you tur
 It needs your PIA credentials in `~/pia-creds`, two lines, username then password. If you use a
 different provider, ignore it and set up your own client; nothing else depends on it.
 
+Like the VPN tooling above, the skill ships in the container image, so a project whose container
+predates it will not get one by toggling the setting — **migrate the project** and it appears; the
+migration pre-flight lists it among what you would gain.
+
 With the setting **off**, a client such as PIA or OpenVPN installs and its daemon starts normally,
 but the connection attempt **hangs until it times out** — a default container has no tun device to open
 and no permission to add an interface or a route, and most clients report that as a generic timeout

@@ -401,7 +401,9 @@ COPY mission-control /opt/mission-control
 # no skill at all. Staged in /opt because ~/.claude is a volume mount: an image
 # copy underneath it would be masked from the project's first start onward.
 COPY skills /opt/triple-c-skills
-RUN chmod +x /opt/triple-c-skills/*/*.sh
+# `find`, not a `*/*.sh` glob: the glob fails the build the day a skill ships
+# without a script, which is a legitimate thing for a skill to do.
+RUN find /opt/triple-c-skills -name '*.sh' -exec chmod +x {} +
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh

@@ -343,12 +343,20 @@ container is created once by a very long function where a dropped capability is 
   directly avoids both, which is what the skill does.
 - **The `pia-vpn` skill is installed *and removed* from `VPN_SUPPORT_ENABLED`.** `container/skills/`
   is baked to `/opt/triple-c-skills` and `install_feature_skill()` in `entrypoint.sh` copies it into
-  `~/.claude/skills/` on every start — refreshed each time, so a fix reaches existing projects, and
-  `rm -rf`'d first, so files dropped from a later version do not linger. The removal branch matters
-  as much as the install: `~/.claude` is a persisted volume, so a skill left behind after the toggle
-  goes off would keep instructing an agent to use a capability the container no longer has. Which is
-  also why the variable is sent as `0` rather than omitted, and why it is in `RESERVED_ENV_EXACT` —
-  a custom env var of that name could otherwise claim the skill without the capability behind it.
+  `~/.claude/skills/` on every start — refreshed each time, so a fix reaches any project whose base
+  image has the source, and `rm -rf`'d first, so files dropped from a later version do not linger.
+  The removal branch matters as much as the install: `~/.claude` is a persisted volume, so a skill
+  left behind after the toggle goes off would keep instructing an agent to use a capability the
+  container no longer has. Which is also why the variable is sent as `0` rather than omitted (see
+  `vpn_env_var`, tested), and why it is in `RESERVED_ENV_EXACT` — a custom env var of that name
+  could otherwise claim the skill without the capability behind it.
+- **Both halves of that live in the base image, so neither reaches an existing project.** A
+  recreation builds from the project's *own snapshot*, which has no `/opt/triple-c-skills` and no
+  updated `entrypoint.sh`; only a migration or a Reset delivers them. The install path says so out
+  loud rather than returning silently, and `/opt/triple-c-skills` is in `FEATURE_PROBES` so the
+  migration pre-flight lists it as missing. Worth knowing before adding anything else behind an
+  existing toggle: the label fingerprints *the setting*, not the set of things the setting drives,
+  so a project already at `true` gets no recreation at all on upgrade.
 
 ### Container Lifecycle
 

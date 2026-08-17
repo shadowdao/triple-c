@@ -65,6 +65,19 @@ PIA's own resolvers through the tunnel with `/32` routes that outrank the
 `10/8` exclusion. If you ever route traffic by hand, you owe both halves — the
 exclusions *and* a resolver reachable from wherever you pointed the default.
 
+The failure has a quiet twin. Do only the first half — exclude the private
+ranges, leave the resolver alone — and everything *works*, while every DNS
+query travels outside the tunnel to your ISP. A VPN that leaks the full list of
+what you looked up is worse than one that is visibly broken, so `up --full`
+refuses to proceed if PIA does not hand back resolvers rather than carrying on
+without them.
+
+The mechanism above is Docker Desktop's. On a user-defined Docker network the
+resolver is `127.0.0.11`, which is loopback and never captured by a default
+route — the trap still exists there (that resolver forwards upstream from
+inside the container's namespace) but arrives by a different path. Check
+`/etc/resolv.conf` rather than assuming which case you are in.
+
 ## Trap 2: an IP-literal health check cannot see a dead resolver
 
 `curl https://1.1.1.1/cdn-cgi/trace` needs no DNS, so it returns a cheerful
@@ -116,9 +129,20 @@ p1234567
 your-password
 ```
 
-Set `PIA_CREDS` to use a different path. Treat the contents as secret: never
-print the file, never echo the values, and never include them in a commit, a
-log or a message. The script reads it directly and does not echo it.
+Treat the contents as secret: never print the file, never echo the values, and
+never include them in a commit, a log or a message. The script reads it directly
+and does not echo it, and passes PIA's session token to `curl` on stdin rather
+than in the argv, where `ps` would expose it to everything in the container.
+
+`PIA_CREDS` points somewhere else — but `sudo` resets the environment, so it
+only takes effect **after** the word `sudo`:
+
+```bash
+sudo PIA_CREDS=/path/to/creds ~/.claude/skills/pia-vpn/pia-wg.sh up   # works
+PIA_CREDS=/path/to/creds sudo ~/.claude/skills/pia-vpn/pia-wg.sh up   # ignored
+```
+
+The second form fails silently back to the default path. Same for `PIA_REGION`.
 
 ## Regions
 
@@ -156,10 +180,16 @@ true in test mode too, and means much less than it sounds like.
 
 ## Tearing down
 
-`down` restores `resolv.conf` from its backup and removes exactly the routes
-that were added, in reverse order, then deletes the interface. It is safe to
-run when nothing is up. Confirm afterwards that the public address is back to
-the container's own.
+`down` restores `resolv.conf` from its backup (only if that backup still looks
+like a resolver file — restoring a truncated one would leave the container with
+no DNS at all), removes exactly the routes that were added, in reverse order,
+deletes the interface, and shreds the WireGuard private key. It is safe to run
+when nothing is up, and `up` runs it first so a repeat `up` cannot stack state.
+Confirm afterwards that the public address is back to the container's own.
+
+The key deletion is not housekeeping: `/run` is in the container's writable
+layer, so `docker commit` bakes whatever is there into the project's snapshot
+image. A key left behind rides that image into every future container.
 
 ## What this deliberately does not do
 
@@ -173,3 +203,11 @@ the container's own.
   cannot work headless: the daemon never accepts a client connection without
   the GUI, and `piactl --help` states that connecting requires it. If you find
   one installed, it is not a working alternative to this script.
+- **Not `wg-quick`.** Its `Table=auto` full-tunnel mode routes by firewall mark
+  and needs `xt_CONNMARK` from the host kernel, which Docker Desktop for
+  Windows (WSL2) does not have and a container cannot load. This script adds
+  the routes with `ip route` directly, which works on every host.
+- **IPv4 only.** The `0.0.0.0/1` + `128.0.0.0/1` pair covers v4. A container
+  with a global IPv6 address and a v6 default route would leak all v6 traffic
+  outside the tunnel; Triple-C's containers do not have one by default, but
+  check `ip -6 route show default` before relying on this where it matters.

@@ -841,6 +841,23 @@ type VpnHostConfigParts = (
 /// host-kernel module auto-loading. It is also enough to flush netfilter rules
 /// inside the container, so pair it with `sandbox_mode_enabled` advisedly.
 /// Hence opt-in, per project, rather than on for everyone.
+/// The env var `entrypoint.sh` installs and removes the `pia-vpn` skill from.
+///
+/// **Emitted either way, never omitted.** `~/.claude` is a persisted volume, so
+/// turning the toggle off has to actively tell entrypoint to remove a skill an
+/// earlier run left there, and an absent variable cannot say that. It is also
+/// what stops a `=1` baked into a snapshot by `docker commit` from outliving
+/// the setting — the explicit `=0` overwrites it.
+///
+/// Extracted for the same reason as [`vpn_host_config`]: the emitting code sits
+/// in a very long function where a dropped or inverted value is invisible, and
+/// `MISSION_CONTROL_ENABLED` twenty lines above shows the failure this avoids —
+/// it is pushed only when true, so a snapshot's baked `=1` survives the toggle
+/// going off.
+fn vpn_env_var(enabled: bool) -> String {
+    format!("VPN_SUPPORT_ENABLED={}", u8::from(enabled))
+}
+
 fn vpn_host_config(enabled: bool) -> VpnHostConfigParts {
     if !enabled {
         return (None, None, None);
@@ -1276,14 +1293,7 @@ pub async fn create_container(
         env_vars.push("MISSION_CONTROL_ENABLED=1".to_string());
     }
 
-    // Drives the pia-vpn skill install in entrypoint.sh. Sent as 0 rather than
-    // omitted when off, because ~/.claude is a persisted volume: entrypoint has
-    // to be told to *remove* a skill left there by an earlier run with the
-    // toggle on, and an absent variable cannot say that.
-    env_vars.push(format!(
-        "VPN_SUPPORT_ENABLED={}",
-        u8::from(project.vpn_support_enabled)
-    ));
+    env_vars.push(vpn_env_var(project.vpn_support_enabled));
 
     // Permission mode — read by triple-c-task-runner for scheduled (headless)
     // Claude Code runs. Interactive terminals get the flags directly instead.
@@ -2797,6 +2807,17 @@ mod tests {
         // one, so pin the set.
         let (cap_add, _, _) = vpn_host_config(true);
         assert_eq!(cap_add.unwrap(), vec!["NET_ADMIN"]);
+    }
+
+    #[test]
+    fn the_vpn_skill_flag_is_emitted_either_way_never_omitted() {
+        // The whole removal path depends on this. If `false` ever became "emit
+        // nothing", a project that had the toggle on would keep the skill
+        // forever: the container recreates from a snapshot whose baked
+        // VPN_SUPPORT_ENABLED=1 would then go unchallenged, and entrypoint
+        // would reinstall a skill for a capability the container no longer has.
+        assert_eq!(vpn_env_var(true), "VPN_SUPPORT_ENABLED=1");
+        assert_eq!(vpn_env_var(false), "VPN_SUPPORT_ENABLED=0");
     }
 
     #[test]
