@@ -36,6 +36,7 @@ RUN for i in 1 2 3 4 5; do \
     socat \
     iproute2 \
     wireguard-tools \
+    nftables \
     && rm -rf /var/lib/apt/lists/*
 
 # `libnss3-tools` above provides `certutil`. Chrome/Chromium read neither
@@ -44,22 +45,55 @@ RUN for i in 1 2 3 4 5; do \
 # corporate CA, no matter what the system trust store says. entrypoint.sh
 # degrades to a warning if it is ever missing.
 
-# `iproute2` and `wireguard-tools` above are what the VPN support toggle
-# (`vpn_support_enabled`) grants capability *for*. That toggle hands a project
-# CAP_NET_ADMIN and /dev/net/tun; without `ip` there is then no way to add a
-# route, and without `wg` no way to build the tunnel those two exist to serve —
-# a capability with nothing able to use it.
+# `iproute2`, `wireguard-tools` and `nftables` above are what the VPN support
+# toggle (`vpn_support_enabled`) grants capability *for*. That toggle hands a
+# project CAP_NET_ADMIN and /dev/net/tun; without `ip` there is then no way to
+# add a route, and without `wg` no way to build the tunnel those two exist to
+# serve — a capability with nothing able to use it.
 #
 # They are baked rather than left to a runtime `apt-get install` for the same
 # reason as the Playwright libraries below: the writable layer is re-paid after
 # every Reset and lost on base-image migration. A hand-installed `wg` therefore
 # works right up until an upgrade, then disappears and takes the tunnel with it
 # — silently, since a VPN that fails to come up looks exactly like one that was
-# never started. Together they are ~4.3 MB including dependencies.
+# never started.
 #
-# `iptables` is deliberately NOT here. The only thing that wants it is a desktop
-# VPN client's killswitch, and those clients need a GUI that a container has no
-# way to give them; leaving it out keeps the reach of CAP_NET_ADMIN smaller.
+# Measured against the *current base image*, not a bare ubuntu:24.04 — the base
+# already ships libelf1t64, so measuring on bare ubuntu over-counts by ~209 kB:
+# +9 packages, 5,614 kB on amd64 (4,153 kB of that is iproute2+wireguard-tools,
+# 1,461 kB is nftables). The same set on arm64 is 7,422 kB, measured against
+# ubuntu:24.04 since the arm64 base is not cached here.
+#
+# ## Why `nftables` specifically
+#
+# `wireguard-tools` declares `Recommends: nftables | iptables`, which the
+# `--no-install-recommends` above strips. That is not cosmetic: `wg-quick`'s
+# `add_default()` runs whenever a config has `AllowedIPs = 0.0.0.0/0` — i.e.
+# every stock full-tunnel config every provider hands out — and it shells out to
+# a firewall backend with no `type -p` guard. Measured without one:
+#
+#     [#] iptables-restore -n
+#     /usr/bin/wg-quick: line 32: iptables-restore: command not found
+#     wg-quick EXIT=127        (interface rolled back, split tunnels unaffected)
+#
+# `nftables` rather than `iptables` because `wg-quick` prefers it (`if type -p
+# nft`, so with both installed iptables is dead weight), it is the first
+# alternative in the package's own Recommends, and it is roughly half the size.
+#
+# This does NOT make `wg-quick`'s full-tunnel mode work everywhere. `Table=auto`
+# routes by fwmark and needs connection-mark tracking from the *host* kernel:
+#
+#     Warning: Extension CONNMARK revision 0 not supported, missing kernel module?
+#
+# WSL2's kernel has no `xt_CONNMARK` and containers have no /lib/modules to load
+# one from, so on Docker Desktop for Windows `wg-quick up` on a full tunnel fails
+# regardless of what is installed here. Native Linux and Docker Desktop for Mac
+# have it. Shipping the backend is what makes the difference on those two;
+# nothing shipped here can make the difference on WSL2, where the way out is to
+# add the routes with `ip route` instead of going through `wg-quick` at all.
+#
+# `iptables` is deliberately still NOT here: with `nftables` present `wg-quick`
+# never reaches for it, so it would add size and firewall surface for nothing.
 
 # Remove default ubuntu user to free UID 1000 for host-user remapping
 RUN if id ubuntu >/dev/null 2>&1; then userdel -r ubuntu 2>/dev/null || userdel ubuntu; fi \

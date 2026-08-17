@@ -203,7 +203,8 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
 ### Container (`container/`)
 
 - **`Dockerfile`** — Ubuntu 24.04 base with Claude Code, Node.js 22, Python 3.12, Rust, Docker CLI, git, gh, AWS CLI v2, ripgrep, pnpm, uv, ruff pre-installed, plus the shared
-  libraries a browser links against (see below)
+  libraries a browser links against (see below) and the VPN tooling the `vpn_support_enabled`
+  toggle grants capability for (`iproute2`, `wireguard-tools`, `nftables`)
 - **Browser runtime libraries are baked in; browser *binaries* are not.** A layer runs
   `npx --yes playwright@latest install-deps chromium` as root, so Playwright names its own
   dependencies and the list cannot rot against Ubuntu 24.04's `t64` renames or a new Chromium
@@ -316,9 +317,22 @@ container is created once by a very long function where a dropped capability is 
   base-image migration — leaving a project holding the capability with nothing able to exercise it,
   and no error that points at why. `iptables` is deliberately absent; see the Dockerfile comment.
 - **Anything built on this fails open.** The network namespace is rebuilt on every start and no
-  service manager runs inside, so a tunnel never survives stop/start or recreation while `/run`
-  state persists through the snapshot and makes it look as though it did. Traffic silently reverts
-  to the real address. Any future autostart or killswitch work starts here.
+  service manager runs inside, so a tunnel never survives stop/start or recreation — while leftover
+  `/run` state makes it look as though it did. Note the two different mechanisms: `/run` is in the
+  writable layer, so on a stop/start it is simply the same container's files, and on a recreation
+  `docker commit` has carried it into the snapshot. Traffic silently reverts to the real address.
+  Any future autostart or killswitch work starts here.
+- **`/run` riding the snapshot means a VPN client's key material can end up in an image.** Verified:
+  a fresh container off the whp snapshot already contained the `wg.priv` a previous tunnel left in
+  `/run`. Anything writing key material there inherits the problem — the same `docker commit`
+  hazard as `triple-c.git-token-hash` and the custom-env fingerprint, in a directory that looks
+  ephemeral and is not. A VPN client that does this should delete its key on teardown.
+- **`wg-quick` full tunnels need `xt_CONNMARK` from the host kernel**, which WSL2 does not have and
+  a container cannot load; `Recommends: nftables | iptables` is also stripped by
+  `--no-install-recommends`, so `nftables` is baked explicitly. See the Dockerfile comment — the
+  short version is that shipping the backend fixes native Linux and Docker Desktop for Mac, nothing
+  fixes Docker Desktop for Windows, and adding the routes directly with `ip route` sidesteps it on
+  all three.
 
 ### Container Lifecycle
 
