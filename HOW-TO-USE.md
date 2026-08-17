@@ -475,7 +475,13 @@ When enabled, the host Docker socket is mounted into the container so Claude Cod
 
 When enabled, the container is given the three things a VPN client needs to build a tunnel:
 the `NET_ADMIN` capability, the `/dev/net/tun` device, and the `net.ipv4.conf.all.src_valid_mark`
-sysctl that WireGuard requires. This is **off by default**.
+sysctl that WireGuard requires. The `ip` and `wg` commands are always present to use them. This is
+**off by default**.
+
+**This setting makes a tunnel possible; it does not make one.** Nothing is connected, no traffic is
+redirected, and no client is installed or started on your behalf. Enabling it and expecting the
+container's traffic to start leaving through a VPN is the most common misreading of what it does —
+installing a client and routing traffic into it remains yours to do.
 
 Without it, a client such as PIA, WireGuard or OpenVPN installs and its daemon starts normally, but
 the connection attempt **hangs until it times out** — a default container has no tun device to open
@@ -497,6 +503,21 @@ Things worth knowing:
   **start**, with an error naming `/dev/net/tun` and pointing back at this setting.
 - A VPN client's kill switch applies to everything in the container, Claude Code included. If the
   tunnel drops, expect API calls to fail until it reconnects or the kill switch is turned off.
+- **No tunnel survives a restart.** The network namespace is built fresh every time the container
+  starts, and there is no service manager inside to reconnect anything. Files under `/run` may
+  persist via the snapshot and make it *look* like the tunnel is still configured, but after any
+  stop/start, Reset or recreation the interface and its routes are gone and traffic goes out your
+  real address again — with no error and nothing visibly different. Re-establish it after every
+  start, and check rather than assume.
+- **A full tunnel breaks DNS unless the client is told to leave private ranges alone.** Containers
+  resolve through an address on the Docker network (`192.168.65.7` under Docker Desktop) that sits
+  outside the container's own subnet, so a default route of `0.0.0.0/0` — or a `0.0.0.0/1` plus
+  `128.0.0.0/1` pair — captures it and sends every lookup into a tunnel that cannot carry it. The
+  symptom is total: Claude Code reports it cannot connect, because it cannot resolve
+  `api.anthropic.com`. Route `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` and `169.254.0.0/16`
+  via the original gateway, and use the VPN provider's own resolver for everything else. Note that
+  a health check which fetches an IP literal such as `1.1.1.1` passes cleanly while this is broken —
+  resolve a name instead.
 
 > This setting can only be changed when the container is stopped. Capabilities and devices are
 > fixed when a container is created, so toggling it recreates the container on the next start.

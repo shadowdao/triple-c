@@ -34,6 +34,8 @@ RUN for i in 1 2 3 4 5; do \
     cron \
     bubblewrap \
     socat \
+    iproute2 \
+    wireguard-tools \
     && rm -rf /var/lib/apt/lists/*
 
 # `libnss3-tools` above provides `certutil`. Chrome/Chromium read neither
@@ -41,6 +43,23 @@ RUN for i in 1 2 3 4 5; do \
 # ~/.pki/nssdb — so without it the browser-view pane cannot be made to trust a
 # corporate CA, no matter what the system trust store says. entrypoint.sh
 # degrades to a warning if it is ever missing.
+
+# `iproute2` and `wireguard-tools` above are what the VPN support toggle
+# (`vpn_support_enabled`) grants capability *for*. That toggle hands a project
+# CAP_NET_ADMIN and /dev/net/tun; without `ip` there is then no way to add a
+# route, and without `wg` no way to build the tunnel those two exist to serve —
+# a capability with nothing able to use it.
+#
+# They are baked rather than left to a runtime `apt-get install` for the same
+# reason as the Playwright libraries below: the writable layer is re-paid after
+# every Reset and lost on base-image migration. A hand-installed `wg` therefore
+# works right up until an upgrade, then disappears and takes the tunnel with it
+# — silently, since a VPN that fails to come up looks exactly like one that was
+# never started. Together they are ~4.3 MB including dependencies.
+#
+# `iptables` is deliberately NOT here. The only thing that wants it is a desktop
+# VPN client's killswitch, and those clients need a GUI that a container has no
+# way to give them; leaving it out keeps the reach of CAP_NET_ADMIN smaller.
 
 # Remove default ubuntu user to free UID 1000 for host-user remapping
 RUN if id ubuntu >/dev/null 2>&1; then userdel -r ubuntu 2>/dev/null || userdel ubuntu; fi \

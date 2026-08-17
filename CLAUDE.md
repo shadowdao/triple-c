@@ -307,6 +307,18 @@ container is created once by a very long function where a dropped capability is 
   container and make the switch impossible to turn off.
 - Off is byte-identical to a container created before the feature existed, and a missing label
   reads as `false`, so no existing project is churned.
+- **The toggle grants capability and stops there — it routes nothing.** `vpn_host_config()` returns
+  a cap, a device and a sysctl; no client is installed, no route is touched, no tunnel is started
+  or restored. Users read the name as "turn the VPN on" and report the default network not routing
+  through it as a bug. It isn't, and the docs say so explicitly; keep it that way.
+- **The tooling is baked, not installed at runtime.** `iproute2` and `wireguard-tools` are in
+  `container/Dockerfile` because a runtime install lands in the writable layer and is lost on
+  base-image migration — leaving a project holding the capability with nothing able to exercise it,
+  and no error that points at why. `iptables` is deliberately absent; see the Dockerfile comment.
+- **Anything built on this fails open.** The network namespace is rebuilt on every start and no
+  service manager runs inside, so a tunnel never survives stop/start or recreation while `/run`
+  state persists through the snapshot and makes it look as though it did. Traffic silently reverts
+  to the real address. Any future autostart or killswitch work starts here.
 
 ### Container Lifecycle
 
