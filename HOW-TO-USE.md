@@ -477,8 +477,19 @@ When enabled, the container is given the three things a VPN client needs to buil
 the `NET_ADMIN` capability, the `/dev/net/tun` device, and the `net.ipv4.conf.all.src_valid_mark`
 sysctl that WireGuard requires. This is **off by default**.
 
-Without it, a client such as PIA, WireGuard or OpenVPN installs and its daemon starts normally, but
-the connection attempt **hangs until it times out** — a default container has no tun device to open
+The `ip`, `wg` and `iptables` commands ship in the container image so there is something able to use
+them. If your project's container was created from an older base image it will not have them, and
+`wg` will simply not be found — **migrating the project onto the current base image** is what picks
+them up. `sudo apt install iproute2 wireguard-tools iptables` works in the meantime, but lives in
+the writable layer, so it is undone by a **Reset** and by a migration.
+
+**This setting makes a tunnel possible; it does not make one.** Nothing is connected, no traffic is
+redirected, and no tunnel is configured or started on your behalf. Enabling it and expecting the
+container's traffic to start leaving through a VPN is the most common misreading of what it does —
+configuring a tunnel and routing traffic into it remains yours to do.
+
+With the setting **off**, a client such as PIA or OpenVPN installs and its daemon starts normally,
+but the connection attempt **hangs until it times out** — a default container has no tun device to open
 and no permission to add an interface or a route, and most clients report that as a generic timeout
 rather than a permissions error.
 
@@ -497,6 +508,40 @@ Things worth knowing:
   **start**, with an error naming `/dev/net/tun` and pointing back at this setting.
 - A VPN client's kill switch applies to everything in the container, Claude Code included. If the
   tunnel drops, expect API calls to fail until it reconnects or the kill switch is turned off.
+- **No tunnel survives a restart.** The network namespace is built fresh every time the container
+  starts, and there is no service manager inside to reconnect anything. Leftover state under `/run`
+  makes it *look* like the tunnel is still configured — that directory is in the container's
+  writable layer, so it is simply still there after a stop/start, and `docker commit` carries it
+  into the snapshot that a recreation is built from. Either way the interface and its routes are
+  gone and traffic goes out your real address again, with no error and nothing visibly different.
+  Re-establish it after every start, and check rather than assume.
+- **A full tunnel breaks DNS unless the client is told to leave private ranges alone.** Your
+  resolver is whatever `/etc/resolv.conf` says, and if that address is outside the container's own
+  subnet then a default route of `0.0.0.0/0` — or a `0.0.0.0/1` plus `128.0.0.0/1` pair — captures
+  it and sends every lookup into a tunnel that cannot carry it. Under Docker Desktop it is
+  `192.168.65.7`, which is exactly that case; on a user-defined Docker network it is `127.0.0.11`,
+  which is loopback and unaffected. Check yours rather than assuming. The symptom when it bites is
+  total: Claude Code reports it cannot connect, because it cannot resolve `api.anthropic.com`.
+  Route `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` and `169.254.0.0/16` via the original
+  gateway — and give the tunnel a resolver it can actually reach, normally the VPN provider's own,
+  or you have a tunnel that leaks every DNS query outside itself. Also pin the VPN endpoint's own
+  address via the original gateway, or the tunnel's encrypted packets try to route through the
+  tunnel. Note that a health check which fetches an IP literal such as `1.1.1.1` passes cleanly
+  while DNS is broken — resolve a name instead.
+- **Delete a client's key material when you tear a tunnel down.** Anything written under `/run` is
+  in the container's writable layer, and recreating or migrating the project runs `docker commit`
+  over it — so a WireGuard private key left there gets baked into the project's snapshot image and
+  copied forward from then on. This is not hypothetical; it has already happened here.
+- **Strip the `DNS =` line from a provider's `.conf` before `wg-quick up`.** Every commercial
+  provider ships one, and `wg-quick` hands it to `resolvconf`, which is not installed — so it fails
+  at `resolvconf: command not found` and deletes the interface again. This happens before any
+  routing, so it takes **split tunnels down too**. Set the resolver another way instead, or drive
+  `wg` and `ip route` directly rather than going through `wg-quick`.
+- **`wg-quick` full tunnels additionally need `xt_CONNMARK` from the host kernel.** WSL2 kernels
+  before 6.6 do not have it and a container cannot load one — on Windows, `wsl --update` moves you
+  to a current kernel, which does. Failing that, add the routes yourself with `ip route`, which
+  needs no firewall backend on any platform. Note this is the *second* hurdle: clear the `DNS =`
+  one above first, or you will not reach this.
 
 > This setting can only be changed when the container is stopped. Capabilities and devices are
 > fixed when a container is created, so toggling it recreates the container on the next start.
@@ -1256,6 +1301,7 @@ The sandbox container (Ubuntu 24.04) comes pre-installed with:
 | ruff | Latest | Python linter/formatter |
 | Rust | Stable | Rust development (via rustup) |
 | Docker CLI | Latest | Container management (when spawning is enabled) |
+| iproute2, WireGuard tools, iptables | Latest | Building a tunnel (when VPN Support is enabled) |
 | git | Latest | Version control |
 | GitHub CLI (gh) | Latest | GitHub integration |
 | AWS CLI | v2 | AWS services and Bedrock |

@@ -34,6 +34,9 @@ RUN for i in 1 2 3 4 5; do \
     cron \
     bubblewrap \
     socat \
+    iproute2 \
+    wireguard-tools \
+    iptables \
     && rm -rf /var/lib/apt/lists/*
 
 # `libnss3-tools` above provides `certutil`. Chrome/Chromium read neither
@@ -41,6 +44,83 @@ RUN for i in 1 2 3 4 5; do \
 # ~/.pki/nssdb — so without it the browser-view pane cannot be made to trust a
 # corporate CA, no matter what the system trust store says. entrypoint.sh
 # degrades to a warning if it is ever missing.
+
+# `iproute2`, `wireguard-tools` and `iptables` above are what the VPN support
+# toggle (`vpn_support_enabled`) grants capability *for*. That toggle hands a
+# project CAP_NET_ADMIN and /dev/net/tun; without `ip` there is then no way to
+# add a route, and without `wg` no way to build the tunnel those two exist to
+# serve — a capability with nothing able to use it.
+#
+# They are baked rather than left to a runtime `apt-get install` for the same
+# reason as the Playwright libraries below: the writable layer is re-paid after
+# every Reset and lost on base-image migration. A hand-installed `wg` therefore
+# works right up until an upgrade, then disappears and takes the tunnel with it
+# — silently, since a VPN that fails to come up looks exactly like one that was
+# never started.
+#
+# Measured against the *current base image*, since a bare ubuntu:24.04 also
+# pulls libelf1t64 and netbase, which this base already has, and so over-reports
+# by ~258 kB: **+12 packages, 7,203 kB on amd64**. The same set on arm64 is
+# ~14.4 MB — the package list is identical on both arches, the binaries are
+# simply larger (measured as 14.7 MB on arm64 ubuntu:24.04, less that 258 kB).
+#
+# ## Why `iptables`, and not `nftables`
+#
+# `wireguard-tools` declares `Recommends: nftables | iptables`, which the
+# `--no-install-recommends` above strips. That is not cosmetic: `wg-quick`'s
+# `add_default()` runs whenever a config has `AllowedIPs = 0.0.0.0/0` — i.e.
+# every stock full-tunnel config every provider hands out — and it shells out to
+# a firewall backend with no `type -p` guard. Measured with neither installed:
+#
+#     [#] iptables-restore -n
+#     /usr/bin/wg-quick: line 32: iptables-restore: command not found
+#     wg-quick EXIT=127
+#
+# `nftables` looks like the better pick — wg-quick prefers it, it is first in
+# that Recommends, it is half the size — and it is the wrong one. wg-quick picks
+# nft *unconditionally* when present (`if type -p nft`, line 241), so installing
+# it makes the iptables path unreachable; and its nft ruleset needs three
+# expression families where the iptables path needs one. Isolating them on a
+# WSL2 host, the two connmark rules install fine and this is what fails:
+#
+#     nft add rule ... fib saddr type != local drop
+#     Error: Could not process rule: No such file or directory
+#                                   ^^^^^^^^^^^^^^  needs nft_fib_ipv4
+#
+# The choice therefore turns on which kernel symbol each path needs, and the two
+# are not equally safe to bet on. `xt_CONNMARK` (iptables) was present in every
+# kernel config examined — LinuxKit's for both arches, and WSL2's from 6.6.
+# `nft_fib_ipv4` (nftables) was absent from the LinuxKit config read here, and a
+# later review argued Docker Desktop has since enabled it and no longer builds
+# from that config at all. That may well be true; it could not be settled from a
+# Linux host, and it is the point: nftables' viability varies by Docker Desktop
+# version in a way nobody here can pin down, while iptables' requirement did not
+# vary anywhere it was checked.
+#
+# So `iptables` is chosen for being robust to that uncertainty rather than for
+# beating nftables on any particular host. If nft_fib_ipv4 is present, wg-quick
+# never reaches the iptables path and this costs 1.6 MB and nothing else; if it
+# is absent, this is the difference between a working full tunnel and none.
+#
+# The residual gap is WSL2 before 6.6, which has neither symbol. Nothing
+# installable in the container changes that — but `wsl --update` does, and moves
+# the host to a far newer kernel. Add the routes with `ip route` in the meantime;
+# that needs no firewall backend on any platform.
+#
+# ## What this still does not fix
+#
+# `wireguard-tools` only *Suggests* `openresolv | resolvconf`, so neither is
+# installed, and every provider's stock config carries a `DNS =` line. That
+# fails in `set_dns()`, *before* the firewall step, so it takes split tunnels
+# down too:
+#
+#     [#] resolvconf -a wg0 -m 0 -x
+#     /usr/bin/wg-quick: line 32: resolvconf: command not found
+#
+# Deliberately not fixed here: `openresolv` has no installation candidate on
+# noble, and `resolvconf` resolves only by pulling in systemd-resolved — a
+# resolver daemon and systemd units, into a container with no systemd. Strip the
+# `DNS =` line and set the resolver another way. Documented in HOW-TO-USE.md.
 
 # Remove default ubuntu user to free UID 1000 for host-user remapping
 RUN if id ubuntu >/dev/null 2>&1; then userdel -r ubuntu 2>/dev/null || userdel ubuntu; fi \

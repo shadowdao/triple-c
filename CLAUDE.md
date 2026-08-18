@@ -203,7 +203,8 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
 ### Container (`container/`)
 
 - **`Dockerfile`** — Ubuntu 24.04 base with Claude Code, Node.js 22, Python 3.12, Rust, Docker CLI, git, gh, AWS CLI v2, ripgrep, pnpm, uv, ruff pre-installed, plus the shared
-  libraries a browser links against (see below)
+  libraries a browser links against (see below) and the VPN tooling the `vpn_support_enabled`
+  toggle grants capability for (`iproute2`, `wireguard-tools`, `iptables`)
 - **Browser runtime libraries are baked in; browser *binaries* are not.** A layer runs
   `npx --yes playwright@latest install-deps chromium` as root, so Playwright names its own
   dependencies and the list cannot rot against Ubuntu 24.04's `t64` renames or a new Chromium
@@ -307,6 +308,39 @@ container is created once by a very long function where a dropped capability is 
   container and make the switch impossible to turn off.
 - Off is byte-identical to a container created before the feature existed, and a missing label
   reads as `false`, so no existing project is churned.
+- **The toggle grants capability and stops there — it routes nothing.** `vpn_host_config()` returns
+  a cap, a device and a sysctl; no client is installed, no route is touched, no tunnel is started
+  or restored. Users read the name as "turn the VPN on" and report the default network not routing
+  through it as a bug. It isn't, and the docs say so explicitly; keep it that way.
+- **The tooling is baked, not installed at runtime.** `iproute2` and `wireguard-tools` are in
+  `container/Dockerfile` because a runtime install lands in the writable layer and is lost on
+  base-image migration — leaving a project holding the capability with nothing able to exercise it,
+  and no error that points at why. `iptables` is included and `nftables` deliberately is not; see
+  the Dockerfile comment for why that way round.
+- **Anything built on this fails open.** The network namespace is rebuilt on every start and no
+  service manager runs inside, so a tunnel never survives stop/start or recreation — while leftover
+  `/run` state makes it look as though it did. Note the two different mechanisms: `/run` is in the
+  writable layer, so on a stop/start it is simply the same container's files, and on a recreation
+  `docker commit` has carried it into the snapshot. Traffic silently reverts to the real address.
+  Any future autostart or killswitch work starts here.
+- **`/run` riding the snapshot means a VPN client's key material can end up in an image.** Verified:
+  a fresh container off the whp snapshot already contained the `wg.priv` a previous tunnel left in
+  `/run`. Anything writing key material there inherits the problem — the same `docker commit`
+  hazard as `triple-c.git-token-hash` and the custom-env fingerprint, in a directory that looks
+  ephemeral and is not. A VPN client that does this should delete its key on teardown.
+- **`iptables` is baked, and picking `nftables` instead would have been wrong.** `Recommends:
+  nftables | iptables` is stripped by `--no-install-recommends`, and `wg-quick` needs a backend for
+  any `AllowedIPs = 0.0.0.0/0`. `nftables` is the tempting choice — preferred by `wg-quick`, half
+  the size — but `wg-quick` picks nft *unconditionally* when present, and its nft ruleset needs
+  `nft_fib_ipv4`, which LinuxKit (Docker Desktop for Mac) does not build while it *does* build
+  `xt_CONNMARK`. Shipping nftables would therefore have forfeited Mac. See the Dockerfile comment;
+  the kernel-config evidence is quoted there.
+- **Two `wg-quick` failures remain, and only one is ours to fix.** Full tunnels still need
+  `xt_CONNMARK`, which WSL2 before 6.6 lacks — nothing installable changes that. And every
+  provider's stock config carries a `DNS =` line that fails in `set_dns()` before any routing, so it
+  breaks split tunnels too; `openresolv` has no candidate on noble and `resolvconf` drags in
+  systemd-resolved, so that one is documented rather than fixed. Driving `wg` and `ip route`
+  directly avoids both, which is what the skill does.
 
 ### Container Lifecycle
 
