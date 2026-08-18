@@ -9,7 +9,7 @@ Bring this container's traffic out through Private Internet Access over
 WireGuard, using the API PIA documents for headless use.
 
 Run `sudo ~/.claude/skills/pia-vpn/pia-wg.sh` with `up`, `up --full`, `down` or
-`status`. Read the rest of this page before the first `up --full` — three of the
+`status`. Read the rest of this page before the first `up --full` — four of the
 behaviours below are actively misleading if you meet them without warning, and
 each one presents as "the VPN is fine" or "Claude is broken" rather than as
 what it is.
@@ -107,7 +107,21 @@ mode: test route only (1.1.1.1 through the tunnel, nothing else)
 Two different addresses there is correct and expected in test mode. If you want
 the second line to change, you want `up --full`.
 
-## Trap 4: no tunnel survives a restart, and it fails open
+## Trap 4: a full tunnel hides the Docker host unless the name is pinned
+
+`host.docker.internal` is answered *only* by the resolver that `up --full`
+replaces — it is not in `/etc/hosts`. Triple-C hands that name to the container
+for the LiteLLM gateway, and host-side Ollama and custom endpoints default to
+it, so losing the name takes the project's model backend down with it.
+
+The nasty part is what a naive check reports. PIA's resolvers answer public
+names perfectly well, so a probe of `api.anthropic.com` says everything is fine
+while the Docker host has vanished. `pia-wg.sh` pins the address into
+`/etc/hosts` before swapping the resolver and restores the file on teardown, and
+`status` probes both names — but if you ever rewrite `resolv.conf` by hand, this
+is the one that will not announce itself.
+
+## Trap 5: no tunnel survives a restart, and it fails open
 
 The network namespace is rebuilt every time the container starts, and nothing
 inside reconnects anything. After a stop/start, Reset or any config change that
@@ -186,10 +200,11 @@ no DNS at all), removes exactly the routes that were added, in reverse order,
 and deletes the interface. It is safe to run when nothing is up. Confirm
 afterwards that the public address is back to the container's own.
 
-`up` calls it too, but only *after* every network fetch has succeeded, so a
-failed `up` leaves an existing tunnel alone rather than tearing it down to
-report a bad password. From that point on a rollback is armed: if any step of
-the setup fails, the tunnel is torn down rather than left half-configured.
+`up` calls it too, but only after the last network fetch — the key registration
+— has succeeded, so a failed `up` leaves an existing tunnel alone rather than
+tearing it down to report a bad password or an unreachable gateway. From that
+point on a rollback is armed: if any step of the setup fails, the tunnel is torn
+down rather than left half-configured.
 
 The private key is deleted earlier still — the moment `wg set` has read it,
 while the tunnel is being built. That is not housekeeping: `/run` is in the

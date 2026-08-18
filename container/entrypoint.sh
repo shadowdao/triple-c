@@ -381,10 +381,18 @@ install_feature_skill() {
         # Not just $_dest: when Mission Control is off nothing else creates the
         # parent, so root would own it and `claude` could not add a skill there.
         chown claude:claude /home/claude/.claude/skills
+        # Stage then swap. Copying over the live path meant a failure (full
+        # volume, read-only mount) left a truncated SKILL.md and no script
+        # behind, root-owned, on a persisted volume — which Claude Code then
+        # discovers and loads.
+        rm -rf "$_dest.new"
+        cp -r "$_src" "$_dest.new" || {
+            rm -rf "$_dest.new"
+            echo "entrypoint: $_name skill install FAILED (copy from $_src); previous copy left intact"
+            return 1; }
+        chown -R claude:claude "$_dest.new"
         rm -rf "$_dest"
-        cp -r "$_src" "$_dest" || {
-            echo "entrypoint: $_name skill install FAILED (copy from $_src)"; return 1; }
-        chown -R claude:claude "$_dest"
+        mv "$_dest.new" "$_dest"
         echo "entrypoint: $_name skill installed to ~/.claude/skills/"
     elif [ -e "$_dest" ] || [ -L "$_dest" ]; then
         # -e/-L rather than -d: a leftover *file* at that path must go too.

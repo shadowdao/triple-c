@@ -121,9 +121,15 @@ up() {
   u=$(sed -n 1p "$CREDS"); p=$(sed -n 2p "$CREDS")
   [ -n "$u" ] && [ -n "$p" ] || die "$CREDS needs two lines: username, then password"
 
-  tok=$(run "PIA rejected the credentials in $CREDS, or could not be reached" \
-    curl -sf -m 25 -u "$u:$p" \
-    https://www.privateinternetaccess.com/gtoken/generateToken | jq -r .token)
+  # Via stdin, not `-u`. curl does blank the password in its own argv, but only
+  # once it is running: sampling /proc/<pid>/cmdline in a tight loop caught the
+  # plaintext in 3 of 200 tries, in the window between exec and the overwrite.
+  # Small, but this is the permanent account password, and the mechanism to
+  # avoid it entirely is already here for the token.
+  tok=$(printf -- '--user "%s:%s"\n' "$u" "$p" \
+    | run "PIA rejected the credentials in $CREDS, or could not be reached" \
+        curl -sf -m 25 -K - \
+        https://www.privateinternetaccess.com/gtoken/generateToken | jq -r .token)
   [ -n "$tok" ] && [ "$tok" != null ] || die "PIA returned no token - check the credentials in $CREDS"
 
   run "could not fetch PIA's server list" \
@@ -133,31 +139,9 @@ up() {
   sip=$(echo "$srv" | jq -r .ip); scn=$(echo "$srv" | jq -r .cn)
   [ -n "$sip" ] && [ "$sip" != null ] || die "no WireGuard server for region '$REGION'"
 
-  # Only now tear down any previous tunnel. Doing it up front (as an earlier
-  # version did) meant a failed token fetch or an unreachable server list took
-  # a *working* tunnel down with it and silently reverted the container to its
-  # real address, while the error talked about credentials. Everything above
-  # this line can fail; nothing above it has touched the network stack.
-  #
-  # It also still does the job it was added for: clearing a stale resolv.conf
-  # backup so a second `up` cannot save PIA's own resolvers over the real ones.
-  down >/dev/null 2>&1 || true
-
-  # From here on the network stack is being modified, so any failure has to put
-  # it back rather than exit half-configured. `down` is idempotent and restores
-  # routes and resolv.conf exactly.
-  #
-  # EXIT rather than ERR, and a flag rather than the trap's own exit status: an
-  # ERR trap is not inherited by shell functions without `set -E`, so a failure
-  # inside add_route would not fire it, and `die` exits explicitly, which is not
-  # an error and would not fire it either. EXIT catches both.
-  SETUP_OK=0
-  trap '[ "$SETUP_OK" = 1 ] || { echo "pia-wg: setup failed - rolling back" >&2; down >/dev/null 2>&1; }' EXIT
-
-  # umask, not a later chmod: the file is created under the inherited 0022
-  # otherwise, so the key is world-readable for the moment in between.
-  ( umask 077; priv=$(wg genkey); printf '%s' "$priv" > wg.priv )
-  priv=$(cat wg.priv); pub=$(printf '%s' "$priv" | wg pubkey)
+  # The key is generated but NOT written yet -- `down` below deletes wg.priv, and
+  # the teardown has to come after every fetch that can fail.
+  priv=$(wg genkey); pub=$(printf '%s' "$priv" | wg pubkey)
 
   # The token goes in on stdin as a curl config rather than in the argv, where
   # `ps` and /proc/*/cmdline expose it to every process in the container --
@@ -169,6 +153,32 @@ up() {
         curl -sf -m 25 -G -K - --connect-to "$scn::$sip:" \
         --cacert ca.rsa.4096.crt "https://$scn:1337/addKey")
   [ "$(echo "$resp" | jq -r .status)" = OK ] || die "key registration failed: $resp"
+
+  # Only now tear down any previous tunnel. Every network call above this line
+  # can fail, and an earlier version tore down first -- so a failed token fetch,
+  # an unreachable server list, or a refused key registration took a *working*
+  # tunnel with it and silently reverted the container to its real address while
+  # the error talked about credentials. Nothing above this line has touched the
+  # network stack. addKey is the most failure-prone of the three: it reaches one
+  # individual gateway by CN with a pinned certificate.
+  #
+  # It also still does the job it was added for: clearing a stale resolv.conf
+  # backup so a second `up` cannot save PIA's own resolvers over the real ones.
+  down >/dev/null 2>&1 || true
+
+  # From here on the network stack is being modified, so any failure has to put
+  # it back rather than exit half-configured.
+  #
+  # EXIT rather than ERR, and a flag rather than the trap's own exit status: an
+  # ERR trap is not inherited by shell functions without `set -E`, so a failure
+  # inside add_route would not fire it, and `die` exits explicitly, which is not
+  # an error and would not fire it either. EXIT catches both.
+  SETUP_OK=0
+  trap '[ "$SETUP_OK" = 1 ] || { echo "pia-wg: setup failed - rolling back" >&2; down >/dev/null 2>&1 || true; }' EXIT
+
+  # umask, not a later chmod: created under the inherited 0022 otherwise, so the
+  # key would be world-readable for the moment in between.
+  ( umask 077; printf '%s' "$priv" > wg.priv )
 
   : > "$STATE/routes"
   ip link add "$IFACE" type wireguard 2>/dev/null || \
@@ -216,6 +226,19 @@ up() {
 
     # PIA's resolvers live inside 10/8, so pin them back through the tunnel with
     # /32s -- longer still, so they beat the exclusion just added.
+    # `host.docker.internal` is answered only by the resolver about to be
+    # replaced -- it is not in /etc/hosts. Triple-C hands that name to the
+    # container for the LiteLLM gateway and defaults host-side Ollama and custom
+    # endpoints to it, so losing it takes the project's model backend with it.
+    # The *route* to it is already excluded above; only the name needs pinning.
+    # Resolve it with the old resolver and write it into /etc/hosts first.
+    local hdi
+    hdi=$(getent ahostsv4 host.docker.internal 2>/dev/null | awk '{print $1; exit}')
+    if [ -n "$hdi" ]; then
+      cp /etc/hosts "$STATE/hosts.bak"
+      printf '%s host.docker.internal\n' "$hdi" >> /etc/hosts
+    fi
+
     cp /etc/resolv.conf "$STATE/resolv.conf.bak"
     for d in $dns; do add_route "$d/32" dev "$IFACE"; done
     # resolv.conf is a bind mount: write through it, never replace it.
@@ -229,10 +252,16 @@ up() {
   # A tunnel with no handshake still routes -- into a black hole. Without this
   # `up --full` would exit 0 having pointed all traffic *and* resolv.conf at a
   # peer that never answered, and `status` would print "mode: full tunnel".
-  local waited=0
-  until [ "$(wg show "$IFACE" latest-handshakes | awk '{print $2; exit}')" != 0 ]; do
+  # Demand a number, not just "different from 0". `wg show` prints nothing at
+  # all when the interface has no peer, and writes to stderr when the interface
+  # is gone -- both leave $2 empty, and `[ "" != 0 ]` is true, so the original
+  # form treated a missing tunnel as a completed handshake and exited 0. `until`
+  # suspends both `set -e` and `pipefail`, so nothing else was going to catch it.
+  local waited=0 hs
+  until hs=$(wg show "$IFACE" latest-handshakes 2>/dev/null | awk 'NR==1{print $2}')
+        [[ $hs =~ ^[0-9]+$ ]] && [ "$hs" -gt 0 ]; do
     waited=$((waited + 1))
-    [ "$waited" -lt 20 ] || die "no handshake from $REGION after 10s - rolled back"
+    [ "$waited" -lt 40 ] || die "no handshake from $REGION after 20s"
     sleep 0.5
   done
 
@@ -243,6 +272,11 @@ up() {
 
 down() {
   [ "$(id -u)" = 0 ] || die "run with sudo"
+  # Teardown must finish even if a step fails; a half-rollback is the state this
+  # exists to prevent. Deliberately not inherited from the caller's `set -e`.
+  set +e
+  # First, because removing the interface removes every route that points at it.
+  ip link del "$IFACE" 2>/dev/null
   # Only restore something that actually looks like a resolver file. Restoring
   # an empty or truncated backup leaves the container with no DNS at all, which
   # is worse than leaving the current one alone.
@@ -254,6 +288,10 @@ down() {
     fi
     rm -f "$STATE/resolv.conf.bak"
   fi
+  if [ -f "$STATE/hosts.bak" ]; then
+    cat "$STATE/hosts.bak" > /etc/hosts
+    rm -f "$STATE/hosts.bak"
+  fi
   if [ -f "$STATE/routes" ]; then
     # Reverse order: the specific overrides go before the ranges they sit in.
     tac "$STATE/routes" | while read -r r; do
@@ -261,7 +299,6 @@ down() {
     done
     rm -f "$STATE/routes"
   fi
-  ip link del "$IFACE" 2>/dev/null || true
   # /run is in the writable layer and `docker commit` bakes it into the
   # project's snapshot image, so a key left here rides that image into every
   # future container. Verified: a snapshot already carried one.
@@ -287,10 +324,15 @@ status() {
   # Resolve a name, not an IP literal. A curl to 1.1.1.1 succeeds while DNS is
   # completely broken, which is exactly how a dead resolver goes unnoticed.
   printf 'DNS: '
-  if timeout 10 getent hosts api.anthropic.com >/dev/null 2>&1; then
-    echo "ok (via $(sed -n 's/^nameserver //p' /etc/resolv.conf | tr '\n' ' '))"
-  else
+  if ! timeout 10 getent hosts api.anthropic.com >/dev/null 2>&1; then
     echo "BROKEN - cannot resolve api.anthropic.com"
+  elif ! timeout 10 getent hosts host.docker.internal >/dev/null 2>&1; then
+    # PIA's resolvers answer public names happily, so probing only
+    # api.anthropic.com reports "ok" on a container that has just lost the
+    # Docker host -- and with it the LiteLLM gateway and any host-side Ollama.
+    echo "public ok, but host.docker.internal is UNRESOLVABLE (gateway/Ollama backends will fail)"
+  else
+    echo "ok (via $(sed -n 's/^nameserver //p' /etc/resolv.conf | tr '\n' ' '))"
   fi
 
   # Report the exit per mode. In test mode the probe address is itself the one
