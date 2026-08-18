@@ -338,6 +338,72 @@ if [ "$MISSION_CONTROL_ENABLED" = "1" ]; then
     unset MISSION_CONTROL_ENABLED
 fi
 
+# ── Feature skills ──────────────────────────────────────────────────────────
+# Skills owned by a Triple-C feature rather than by Mission Control. Installed
+# when the feature is on, removed when it is off: ~/.claude is a persisted
+# volume, so a skill left behind after its feature is disabled would keep
+# telling an agent to use a capability the container no longer has.
+#
+# Copied on every start rather than only when absent, so a fix to a skill
+# reaches projects that already have the old copy. Local edits under these
+# directories do not survive — treat /opt/triple-c-skills as the source.
+#
+# The source lives in the *base image*, so a project whose container predates it
+# recreates from its own snapshot and has no /opt/triple-c-skills to copy from.
+# That case says so rather than returning silently: the toggle is on, the
+# capability is there, and the skill simply never appears — which is impossible
+# to work out from the outside.
+install_feature_skill() {
+    local _name="$1"
+    local _enabled="$2"
+    local _src="/opt/triple-c-skills/$1"
+    local _dest="/home/claude/.claude/skills/$1"
+
+    # Reject anything that is not a plain directory name. The disabled branch
+    # `rm -rf`s $_dest under a *persisted volume*, so a blank name would take the
+    # whole skills directory (Mission Control's included) and `../x` would escape
+    # it entirely. Only the literal `pia-vpn` is passed today; this is so that
+    # stays true.
+    case "$_name" in
+        ''|*/*|.*) echo "entrypoint: install_feature_skill: bad skill name '$_name'"; return 1 ;;
+    esac
+
+    if [ "$_enabled" = "1" ]; then
+        if [ ! -d "$_src" ]; then
+            echo "entrypoint: $_name skill unavailable — this container's base image predates it; migrate the project to get it"
+            return 0
+        fi
+        # Checked, not assumed: with no `set -e` in this script every step here
+        # can fail (full volume, read-only mount, a file where the directory
+        # should be) and the success line would still print.
+        mkdir -p /home/claude/.claude/skills || {
+            echo "entrypoint: $_name skill install FAILED (cannot create ~/.claude/skills)"; return 1; }
+        # Not just $_dest: when Mission Control is off nothing else creates the
+        # parent, so root would own it and `claude` could not add a skill there.
+        chown claude:claude /home/claude/.claude/skills
+        # Stage then swap. Copying over the live path meant a failure (full
+        # volume, read-only mount) left a truncated SKILL.md and no script
+        # behind, root-owned, on a persisted volume — which Claude Code then
+        # discovers and loads.
+        rm -rf "$_dest.new"
+        cp -r "$_src" "$_dest.new" || {
+            rm -rf "$_dest.new"
+            echo "entrypoint: $_name skill install FAILED (copy from $_src); previous copy left intact"
+            return 1; }
+        chown -R claude:claude "$_dest.new"
+        rm -rf "$_dest"
+        mv "$_dest.new" "$_dest"
+        echo "entrypoint: $_name skill installed to ~/.claude/skills/"
+    elif [ -e "$_dest" ] || [ -L "$_dest" ]; then
+        # -e/-L rather than -d: a leftover *file* at that path must go too.
+        rm -rf "$_dest"
+        echo "entrypoint: $_name skill removed (feature disabled)"
+    fi
+}
+
+install_feature_skill pia-vpn "${VPN_SUPPORT_ENABLED:-0}"
+unset VPN_SUPPORT_ENABLED
+
 # ── Claude Code settings ────────────────────────────────────────────────────
 # Merge Claude Code settings into ~/.claude/settings.json (preserves existing
 # keys). Creates the file if it doesn't exist. These control TUI mode, effort
