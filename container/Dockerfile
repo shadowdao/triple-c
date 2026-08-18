@@ -87,18 +87,25 @@ RUN for i in 1 2 3 4 5; do \
 #     Error: Could not process rule: No such file or directory
 #                                   ^^^^^^^^^^^^^^  needs nft_fib_ipv4
 #
-# That matters because of how the two hosts we ship to are configured. From
-# LinuxKit's kernel config — Docker Desktop for Mac, identical on both arches:
+# The choice therefore turns on which kernel symbol each path needs, and the two
+# are not equally safe to bet on. `xt_CONNMARK` (iptables) was present in every
+# kernel config examined — LinuxKit's for both arches, and WSL2's from 6.6.
+# `nft_fib_ipv4` (nftables) was absent from the LinuxKit config read here, and a
+# later review argued Docker Desktop has since enabled it and no longer builds
+# from that config at all. That may well be true; it could not be settled from a
+# Linux host, and it is the point: nftables' viability varies by Docker Desktop
+# version in a way nobody here can pin down, while iptables' requirement did not
+# vary anywhere it was checked.
 #
-#     CONFIG_NETFILTER_XT_CONNMARK=y      <- the iptables path works
-#     # CONFIG_NFT_FIB_IPV4 is not set    <- the nft path does not
+# So `iptables` is chosen for being robust to that uncertainty rather than for
+# beating nftables on any particular host. If nft_fib_ipv4 is present, wg-quick
+# never reaches the iptables path and this costs 1.6 MB and nothing else; if it
+# is absent, this is the difference between a working full tunnel and none.
 #
-# So shipping `nftables` would forfeit the platform it was meant to fix. With
-# `iptables`, full tunnels work on native Linux, on Docker Desktop for Mac, and
-# on WSL2 kernels from 6.6 (which added xt_CONNMARK as a module). Only WSL2
-# older than that is left out, and nothing installable here changes it — the way
-# out there is to add the routes with `ip route` instead of using `wg-quick`,
-# which is what the pia-vpn skill does on every platform.
+# The residual gap is WSL2 before 6.6, which has neither symbol. Nothing
+# installable in the container changes that — but `wsl --update` does, and moves
+# the host to a far newer kernel. Add the routes with `ip route` in the meantime;
+# that needs no firewall backend on any platform.
 #
 # ## What this still does not fix
 #

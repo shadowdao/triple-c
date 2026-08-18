@@ -537,10 +537,11 @@ Things worth knowing:
   at `resolvconf: command not found` and deletes the interface again. This happens before any
   routing, so it takes **split tunnels down too**. Set the resolver another way instead, or drive
   `wg` and `ip route` directly rather than going through `wg-quick`.
-- **`wg-quick` full tunnels also need `xt_CONNMARK` from the host kernel.** Native Linux, Docker
-  Desktop for Mac and WSL2 kernels from 6.6 have it; older WSL2 kernels do not, and a container
-  cannot load one. There the answer is again to add the routes yourself with `ip route`, which
-  needs no firewall backend on any platform.
+- **`wg-quick` full tunnels additionally need `xt_CONNMARK` from the host kernel.** WSL2 kernels
+  before 6.6 do not have it and a container cannot load one — on Windows, `wsl --update` moves you
+  to a current kernel, which does. Failing that, add the routes yourself with `ip route`, which
+  needs no firewall backend on any platform. Note this is the *second* hurdle: clear the `DNS =`
+  one above first, or you will not reach this.
 
 > This setting can only be changed when the container is stopped. Capabilities and devices are
 > fixed when a container is created, so toggling it recreates the container on the next start.

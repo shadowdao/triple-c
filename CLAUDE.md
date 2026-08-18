@@ -315,7 +315,8 @@ container is created once by a very long function where a dropped capability is 
 - **The tooling is baked, not installed at runtime.** `iproute2` and `wireguard-tools` are in
   `container/Dockerfile` because a runtime install lands in the writable layer and is lost on
   base-image migration — leaving a project holding the capability with nothing able to exercise it,
-  and no error that points at why. `iptables` is deliberately absent; see the Dockerfile comment.
+  and no error that points at why. `iptables` is included and `nftables` deliberately is not; see
+  the Dockerfile comment for why that way round.
 - **Anything built on this fails open.** The network namespace is rebuilt on every start and no
   service manager runs inside, so a tunnel never survives stop/start or recreation — while leftover
   `/run` state makes it look as though it did. Note the two different mechanisms: `/run` is in the
