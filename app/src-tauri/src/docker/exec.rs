@@ -301,21 +301,10 @@ impl ExecSessionManager {
     ) -> Result<String, String> {
         let docker = get_docker()?;
 
-        // Build a tar archive in memory containing the file
-        let mut tar_buf = Vec::new();
-        {
-            let mut builder = tar::Builder::new(&mut tar_buf);
-            let mut header = tar::Header::new_gnu();
-            header.set_size(data.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            builder
-                .append_data(&mut header, file_name, data)
-                .map_err(|e| format!("Failed to create tar entry: {}", e))?;
-            builder
-                .finish()
-                .map_err(|e| format!("Failed to finalize tar: {}", e))?;
-        }
+        // Owned by the container user, stamped now: a default tar header would
+        // land it as root:root/1970 and Claude Code could not rewrite it.
+        let (uid, gid) = container_user_ids(container_id).await;
+        let tar_buf = build_single_file_tar(file_name, data, 0o644, uid, gid, now_epoch_secs())?;
 
         docker
             .upload_to_container(
@@ -347,26 +336,13 @@ pub async fn upload_host_file_to_container(
     let host_path = host_path.to_string();
     let dest_name = dest_name.to_string();
     let dest_for_blk = dest_name.clone();
+    let (uid, gid) = container_user_ids(container_id).await;
+    let mtime = now_epoch_secs();
 
     let tar_buf = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
         let data = std::fs::read(&host_path)
             .map_err(|e| format!("Failed to read {}: {}", host_path, e))?;
-        let mut tar_buf = Vec::with_capacity(data.len() + 1024);
-        {
-            let mut builder = tar::Builder::new(&mut tar_buf);
-            let mut header = tar::Header::new_gnu();
-            // Size comes from the bytes in hand, so header and payload can't disagree.
-            header.set_size(data.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            builder
-                .append_data(&mut header, &dest_for_blk, &data[..])
-                .map_err(|e| format!("Failed to create tar entry: {}", e))?;
-            builder
-                .finish()
-                .map_err(|e| format!("Failed to finalize tar: {}", e))?;
-        }
-        Ok(tar_buf)
+        build_single_file_tar(&dest_for_blk, &data[..], 0o644, uid, gid, mtime)
     })
     .await
     .map_err(|e| format!("Upload task panicked: {}", e))??;
@@ -402,20 +378,10 @@ pub async fn upload_bytes_to_container(
 ) -> Result<String, String> {
     let docker = get_docker()?;
 
-    let mut tar_buf = Vec::with_capacity(data.len() + 1024);
-    {
-        let mut builder = tar::Builder::new(&mut tar_buf);
-        let mut header = tar::Header::new_gnu();
-        header.set_size(data.len() as u64);
-        header.set_mode(mode);
-        header.set_cksum();
-        builder
-            .append_data(&mut header, file_name, data)
-            .map_err(|e| format!("Failed to create tar entry: {}", e))?;
-        builder
-            .finish()
-            .map_err(|e| format!("Failed to finalize tar: {}", e))?;
-    }
+    // Root-owned on purpose: the only caller is migration, whose `tar -T` list
+    // is read back as root. The mtime still gets stamped so the file doesn't
+    // read as 1970.
+    let tar_buf = build_single_file_tar(file_name, data, mode, 0, 0, now_epoch_secs())?;
 
     docker
         .upload_to_container(
@@ -430,6 +396,74 @@ pub async fn upload_bytes_to_container(
         .map_err(|e| format!("Failed to upload file to container: {}", e))?;
 
     Ok(format!("{}/{}", dest_dir.trim_end_matches('/'), file_name))
+}
+
+/// Build an in-memory tar archive holding a single regular file.
+///
+/// The uid/gid/mtime arguments exist because `tar::Header::new_gnu()` zeroes
+/// them and Docker's archive extractor honours the header verbatim: a header
+/// left at the defaults lands the file inside the container as `root:root`
+/// with a 1970-01-01 mtime — not writable by `claude`, and confusing in any
+/// listing. Callers that upload on a user's behalf should pass the container
+/// user's ids from [`container_user_ids`].
+pub fn build_single_file_tar(
+    file_name: &str,
+    data: &[u8],
+    mode: u32,
+    uid: u64,
+    gid: u64,
+    mtime: u64,
+) -> Result<Vec<u8>, String> {
+    let mut tar_buf = Vec::with_capacity(data.len() + 1024);
+    {
+        let mut builder = tar::Builder::new(&mut tar_buf);
+        let mut header = tar::Header::new_gnu();
+        // Size comes from the bytes in hand, so header and payload can't disagree.
+        header.set_size(data.len() as u64);
+        header.set_mode(mode);
+        header.set_uid(uid);
+        header.set_gid(gid);
+        header.set_mtime(mtime);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, file_name, data)
+            .map_err(|e| format!("Failed to create tar entry: {}", e))?;
+        builder
+            .finish()
+            .map_err(|e| format!("Failed to finalize tar: {}", e))?;
+    }
+    Ok(tar_buf)
+}
+
+/// Seconds since the Unix epoch, for a tar header mtime.
+pub fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The numeric uid/gid of the container's `claude` user.
+///
+/// It is not a constant: `entrypoint.sh` remaps `claude` to the *host* user's
+/// ids on Unix so bind-mounted project files stay writable, and deliberately
+/// does not on Windows. So the only reliable answer comes from asking the
+/// container. Falls back to 1000:1000 (the image's build-time ids) if the exec
+/// fails, which is strictly better than the 0:0 a default tar header carries.
+pub async fn container_user_ids(container_id: &str) -> (u64, u64) {
+    let out = exec_oneshot_limited(
+        container_id,
+        vec!["sh".to_string(), "-c".to_string(), "id -u; id -g".to_string()],
+        256,
+    )
+    .await
+    .unwrap_or_default();
+
+    let mut ids = out.lines().filter_map(|l| l.trim().parse::<u64>().ok());
+    match (ids.next(), ids.next()) {
+        (Some(uid), Some(gid)) => (uid, gid),
+        _ => (1000, 1000),
+    }
 }
 
 /// Ceiling on how much container output a one-shot exec will buffer into the

@@ -1,3 +1,5 @@
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use bollard::container::{DownloadFromContainerOptions, LogOutput, UploadToContainerOptions};
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use futures_util::StreamExt;
@@ -5,18 +7,48 @@ use serde::Serialize;
 use tauri::State;
 
 use crate::docker::client::get_docker;
-use crate::docker::exec::exec_oneshot;
+use crate::docker::exec::{
+    build_single_file_tar, container_user_ids, exec_oneshot, exec_oneshot_as, now_epoch_secs,
+};
 use crate::AppState;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, PartialEq, Serialize)]
 pub struct FileEntry {
     pub name: String,
     pub path: String,
+    /// Whether the entry behaves as a directory — *dereferenced*, so a symlink
+    /// pointing at one is navigable rather than a dead row.
     pub is_directory: bool,
+    /// Whether the entry itself is a symlink, which `is_directory` no longer
+    /// tells you now that it follows the link.
+    pub is_symlink: bool,
     pub size: u64,
     pub modified: String,
     pub permissions: String,
 }
+
+/// What a viewer read out of the container.
+#[derive(Debug, Serialize)]
+pub struct FileContents {
+    /// Base64 rather than a byte vec: Tauri serialises `Vec<u8>` over IPC as a
+    /// JSON array of numbers, which is roughly 4x the bytes and pathological at
+    /// MB scale.
+    pub contents_base64: String,
+    /// True when the file is larger than the cap and only a prefix came back.
+    pub truncated: bool,
+    /// The file's real size, from the tar header — not the length of what was
+    /// returned.
+    pub size: u64,
+}
+
+/// Hard ceiling on a single viewer read, whatever the caller asks for. The tar
+/// path buffers the whole payload in host RAM, so a caller-supplied cap is not
+/// something to take on trust.
+const MAX_READ_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Ceiling on a single upload, mirroring the terminal drop path's guard. The
+/// file is packed into an in-memory tar before it goes anywhere.
+const MAX_UPLOAD_BYTES: u64 = 256 * 1024 * 1024;
 
 #[tauri::command]
 pub async fn list_container_files(
@@ -34,6 +66,11 @@ pub async fn list_container_files(
         .as_ref()
         .ok_or_else(|| "Container not running".to_string())?;
 
+    // `%y` is the entry's own type, `%Y` the type it *dereferences* to. Both
+    // are printed: `%Y` is what decides navigability (a symlinked directory
+    // reports `l` under `%y`, which used to make it an unopenable row), while
+    // `%y` is the only way left to tell the user it is a link at all. `%Y` is
+    // `N` for a broken link and `L` for a loop, neither of which is `d`.
     let cmd = vec![
         "find".to_string(),
         path.clone(),
@@ -42,24 +79,33 @@ pub async fn list_container_files(
         "-maxdepth".to_string(),
         "1".to_string(),
         "-printf".to_string(),
-        "%f\t%y\t%s\t%T@\t%m\n".to_string(),
+        "%f\t%y\t%Y\t%s\t%T@\t%m\n".to_string(),
     ];
 
     let output = exec_oneshot(container_id, cmd).await?;
 
+    Ok(parse_find_output(&path, &output))
+}
+
+/// Turn `find -printf '%f\t%y\t%Y\t%s\t%T@\t%m\n'` output into sorted entries.
+///
+/// Split out from the command so it can be tested without a container: it is
+/// the half where a format change silently mis-types every row.
+fn parse_find_output(dir: &str, output: &str) -> Vec<FileEntry> {
     let mut entries: Vec<FileEntry> = output
         .lines()
         .filter(|line| !line.trim().is_empty())
         .filter_map(|line| {
             let parts: Vec<&str> = line.split('\t').collect();
-            if parts.len() < 5 {
+            if parts.len() < 6 {
                 return None;
             }
             let name = parts[0].to_string();
-            let is_directory = parts[1] == "d";
-            let size = parts[2].parse::<u64>().unwrap_or(0);
-            let modified_epoch = parts[3].parse::<f64>().unwrap_or(0.0);
-            let permissions = parts[4].to_string();
+            let is_symlink = parts[1] == "l";
+            let is_directory = parts[2] == "d";
+            let size = parts[3].parse::<u64>().unwrap_or(0);
+            let modified_epoch = parts[4].parse::<f64>().unwrap_or(0.0);
+            let permissions = parts[5].to_string();
 
             // Convert epoch to ISO-ish string
             let modified = {
@@ -69,16 +115,11 @@ pub async fn list_container_files(
                 dt.format("%Y-%m-%d %H:%M:%S").to_string()
             };
 
-            let entry_path = if path.ends_with('/') {
-                format!("{}{}", path, name)
-            } else {
-                format!("{}/{}", path, name)
-            };
-
             Some(FileEntry {
-                name,
-                path: entry_path,
+                name: name.clone(),
+                path: join_path(dir, &name),
                 is_directory,
+                is_symlink,
                 size,
                 modified,
                 permissions,
@@ -93,7 +134,54 @@ pub async fn list_container_files(
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
 
-    Ok(entries)
+    entries
+}
+
+/// Join a container directory and a child name without doubling the separator.
+fn join_path(dir: &str, name: &str) -> String {
+    if dir.ends_with('/') {
+        format!("{}{}", dir, name)
+    } else {
+        format!("{}/{}", dir, name)
+    }
+}
+
+/// The directory holding `path`. `/` is its own parent.
+fn parent_dir(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    match trimmed.rfind('/') {
+        None | Some(0) => "/".to_string(),
+        Some(i) => trimmed[..i].to_string(),
+    }
+}
+
+/// Validate the *new name* half of a rename, or a new folder's name.
+///
+/// This is user-typed text that ends up in `mv`/`mkdir` argv, and the operation
+/// is deliberately a rename rather than a move: a name carrying `/` would
+/// relocate the entry, and `..` would walk it out of the directory entirely.
+/// A leading `-` is left alone because every call site passes `--` first.
+fn validate_entry_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("Name cannot be empty".to_string());
+    }
+    if name.contains('/') {
+        return Err(
+            "Name cannot contain '/' — this renames inside the folder, it does not move."
+                .to_string(),
+        );
+    }
+    // Can't survive argv anyway; caught here so the failure is legible.
+    if name.contains('\0') {
+        return Err("Name cannot contain a null byte".to_string());
+    }
+    if name == "." || name == ".." {
+        return Err("\".\" and \"..\" are not valid names".to_string());
+    }
+    if name.len() > 255 {
+        return Err("Name is too long (255 bytes maximum)".to_string());
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -113,43 +201,257 @@ pub async fn download_container_file(
         .as_ref()
         .ok_or_else(|| "Container not running".to_string())?;
 
+    let fetched = fetch_container_file(container_id, &container_path, None).await?;
+
+    tokio::fs::write(&host_path, &fetched.bytes)
+        .await
+        .map_err(|e| format!("Failed to write file to host: {}", e))?;
+
+    Ok(())
+}
+
+/// One regular file's bytes, pulled out of a container.
+struct FetchedFile {
+    bytes: Vec<u8>,
+    /// The size the tar header declared, i.e. the file's real size — which is
+    /// not `bytes.len()` once `max_bytes` has cut the read short.
+    size: u64,
+    truncated: bool,
+}
+
+/// Fetch a single regular file from a container as exact bytes.
+///
+/// Shared by the "Save to host…" download and the viewer, so both get the same
+/// answer. It deliberately goes through Docker's archive endpoint rather than
+/// `exec_oneshot`: that reader runs every chunk through `String::from_utf8_lossy`
+/// and merges stderr into stdout, so it would both corrupt any non-UTF-8 file
+/// and be able to splice diagnostics into what the caller believes is content.
+///
+/// With `max_bytes` set the transfer is abandoned once the cap (plus enough
+/// slack for the tar framing) is in hand, so previewing a huge file does not
+/// pull the whole thing across the socket.
+async fn fetch_container_file(
+    container_id: &str,
+    container_path: &str,
+    max_bytes: Option<u64>,
+) -> Result<FetchedFile, String> {
     let docker = get_docker()?;
 
     let mut stream = docker.download_from_container(
         container_id,
         Some(DownloadFromContainerOptions {
-            path: container_path.clone(),
+            path: container_path.to_string(),
         }),
     );
 
-    let mut tar_bytes = Vec::new();
+    // A tar member is a 512-byte header plus payload padded to 512. 8 KiB of
+    // slack past the payload cap guarantees the header and the whole capped
+    // prefix are present even with the stream cut short.
+    const TAR_SLACK: u64 = 8 * 1024;
+    let stop_after = max_bytes.map(|m| m.saturating_add(TAR_SLACK));
+
+    let mut tar_bytes: Vec<u8> = Vec::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("Failed to download file: {}", e))?;
         tar_bytes.extend_from_slice(&chunk);
+        if stop_after.is_some_and(|cap| tar_bytes.len() as u64 >= cap) {
+            // Dropping the stream cancels the rest of the transfer.
+            break;
+        }
     }
 
-    // Extract single file from tar archive
     let mut archive = tar::Archive::new(&tar_bytes[..]);
-    let mut found = false;
-    for entry in archive
+    let mut entries = archive
         .entries()
-        .map_err(|e| format!("Failed to read tar entries: {}", e))?
-    {
-        let mut entry = entry.map_err(|e| format!("Failed to read tar entry: {}", e))?;
-        let mut contents = Vec::new();
-        std::io::Read::read_to_end(&mut entry, &mut contents)
-            .map_err(|e| format!("Failed to read file contents: {}", e))?;
-        std::fs::write(&host_path, &contents)
-            .map_err(|e| format!("Failed to write file to host: {}", e))?;
-        found = true;
-        break;
+        .map_err(|e| format!("Failed to read tar entries: {}", e))?;
+    let mut entry = match entries.next() {
+        Some(entry) => entry.map_err(|e| format!("Failed to read tar entry: {}", e))?,
+        None => return Err(format!("{} not found in the container", container_path)),
+    };
+
+    // Docker tars whatever the path names, so a directory arrives as a whole
+    // tree. Reading only its first member used to write a silently wrong file;
+    // say so instead.
+    let entry_type = entry.header().entry_type();
+    if entry_type.is_dir() {
+        return Err(format!(
+            "{} is a folder — download its files individually, or use Backup to archive a whole tree.",
+            container_path
+        ));
+    }
+    if entry_type.is_symlink() || entry_type.is_hard_link() {
+        return Err(format!("{} is a link — open its target instead.", container_path));
+    }
+    if !entry_type.is_file() {
+        return Err(format!("{} is not a regular file.", container_path));
     }
 
-    if !found {
-        return Err("File not found in tar archive".to_string());
+    let size = entry.header().size().unwrap_or(0);
+    let truncated = max_bytes.is_some_and(|cap| size > cap);
+    let want = max_bytes.map(|cap| cap.min(size)).unwrap_or(size);
+
+    let mut bytes = Vec::with_capacity(want.min(1024 * 1024) as usize);
+    std::io::Read::read_to_end(&mut std::io::Read::take(&mut entry, want), &mut bytes)
+        .map_err(|e| format!("Failed to read file contents: {}", e))?;
+
+    Ok(FetchedFile {
+        bytes,
+        size,
+        truncated,
+    })
+}
+
+/// Read a file out of the container for the in-app viewer.
+///
+/// `max_bytes` is the caller's ceiling (the viewer asks for more when it is
+/// about to decode an image, which is what usually goes over a text-sized cap);
+/// it is clamped to [`MAX_READ_BYTES`] regardless, because the whole payload is
+/// buffered in host RAM on the way through.
+#[tauri::command]
+pub async fn read_container_file(
+    project_id: String,
+    path: String,
+    max_bytes: Option<u64>,
+    state: State<'_, AppState>,
+) -> Result<FileContents, String> {
+    let project = state
+        .projects_store
+        .get(&project_id)
+        .ok_or_else(|| format!("Project {} not found", project_id))?;
+
+    let container_id = project
+        .container_id
+        .as_ref()
+        .ok_or_else(|| "Container not running".to_string())?;
+
+    let cap = max_bytes.unwrap_or(MAX_READ_BYTES).min(MAX_READ_BYTES);
+    let fetched = fetch_container_file(container_id, &path, Some(cap)).await?;
+
+    Ok(FileContents {
+        contents_base64: BASE64.encode(&fetched.bytes),
+        truncated: fetched.truncated,
+        size: fetched.size,
+    })
+}
+
+/// Rename an entry in place. `to_path` is the **new name**, not a destination
+/// path — moving between directories is deliberately not offered here, so the
+/// name is validated to carry no `/`.
+///
+/// Runs through `exec_oneshot_as` rather than `exec_oneshot` because the exit
+/// code is the only reliable signal: `exec_oneshot` discards the status, so a
+/// permission failure (renaming under `/etc` or `/usr`, which the container
+/// user genuinely cannot do) would return `Ok` with the error text as its
+/// "output". Returns the new full path.
+#[tauri::command]
+pub async fn rename_container_path(
+    project_id: String,
+    from_path: String,
+    to_path: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let project = state
+        .projects_store
+        .get(&project_id)
+        .ok_or_else(|| format!("Project {} not found", project_id))?;
+
+    let container_id = project
+        .container_id
+        .as_ref()
+        .ok_or_else(|| "Container not running".to_string())?;
+
+    let new_name = to_path.trim();
+    validate_entry_name(new_name)?;
+
+    let dest = join_path(&parent_dir(&from_path), new_name);
+    if dest == from_path {
+        return Ok(dest);
     }
 
-    Ok(())
+    // `mv -n` refuses to clobber, but GNU coreutils makes that refusal *silent*
+    // and exits 0 — so `-n` on its own would report a rename that never
+    // happened. The existence check is what turns it into an error the user
+    // sees; `-n` stays as the belt-and-braces against the race between them.
+    let (_, exists) = exec_oneshot_as(
+        container_id,
+        "claude",
+        vec!["test".to_string(), "-e".to_string(), dest.clone()],
+        Vec::new(),
+    )
+    .await?;
+    if exists == 0 {
+        return Err(format!("\"{}\" already exists in this folder", new_name));
+    }
+
+    let (output, code) = exec_oneshot_as(
+        container_id,
+        "claude",
+        vec![
+            "mv".to_string(),
+            "-n".to_string(),
+            "--".to_string(),
+            from_path.clone(),
+            dest.clone(),
+        ],
+        Vec::new(),
+    )
+    .await?;
+
+    if code != 0 {
+        // Surface `mv`'s own words: "Permission denied" is the common case
+        // outside /workspace and a generic message would hide why.
+        let detail = output.trim();
+        return Err(if detail.is_empty() {
+            format!("Rename failed (exit {})", code)
+        } else {
+            detail.to_string()
+        });
+    }
+
+    Ok(dest)
+}
+
+/// Create a directory under `parent_path`. Fails rather than succeeding
+/// silently if the name is taken — `mkdir` without `-p` is what gives that.
+#[tauri::command]
+pub async fn create_container_directory(
+    project_id: String,
+    parent_path: String,
+    name: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let project = state
+        .projects_store
+        .get(&project_id)
+        .ok_or_else(|| format!("Project {} not found", project_id))?;
+
+    let container_id = project
+        .container_id
+        .as_ref()
+        .ok_or_else(|| "Container not running".to_string())?;
+
+    let name = name.trim();
+    validate_entry_name(name)?;
+    let dest = join_path(&parent_path, name);
+
+    let (output, code) = exec_oneshot_as(
+        container_id,
+        "claude",
+        vec!["mkdir".to_string(), "--".to_string(), dest.clone()],
+        Vec::new(),
+    )
+    .await?;
+
+    if code != 0 {
+        let detail = output.trim();
+        return Err(if detail.is_empty() {
+            format!("Could not create folder (exit {})", code)
+        } else {
+            detail.to_string()
+        });
+    }
+
+    Ok(dest)
 }
 
 /// Create a `.tar.gz` backup of the container and stream it to a host file.
@@ -364,8 +666,26 @@ pub async fn upload_file_to_container(
 
     let docker = get_docker()?;
 
-    let file_data = std::fs::read(&host_path)
-        .map_err(|e| format!("Failed to read host file: {}", e))?;
+    let meta = tokio::fs::metadata(&host_path)
+        .await
+        .map_err(|e| format!("Cannot access {}: {}", host_path, e))?;
+
+    // A directory here used to reach `std::fs::read`, whose "Is a directory"
+    // error says nothing about what to do. Recursive upload is a bigger feature
+    // than this panel needs; refuse clearly instead.
+    if meta.is_dir() {
+        return Err(format!(
+            "{} is a folder — drop or upload its files individually.",
+            host_path
+        ));
+    }
+    if meta.len() > MAX_UPLOAD_BYTES {
+        return Err(format!(
+            "File too large to upload ({:.0} MB; limit {} MB). Mount it into the project instead.",
+            meta.len() as f64 / (1024.0 * 1024.0),
+            MAX_UPLOAD_BYTES / (1024 * 1024)
+        ));
+    }
 
     let file_name = std::path::Path::new(&host_path)
         .file_name()
@@ -373,21 +693,28 @@ pub async fn upload_file_to_container(
         .to_string_lossy()
         .to_string();
 
-    // Build tar archive in memory
-    let mut tar_buf = Vec::new();
-    {
-        let mut builder = tar::Builder::new(&mut tar_buf);
-        let mut header = tar::Header::new_gnu();
-        header.set_size(file_data.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        builder
-            .append_data(&mut header, &file_name, &file_data[..])
-            .map_err(|e| format!("Failed to create tar entry: {}", e))?;
-        builder
-            .finish()
-            .map_err(|e| format!("Failed to finalize tar: {}", e))?;
-    }
+    // Own the file as the container user and keep the host's mtime. A default
+    // tar header would land it root:root with a 1970-01-01 timestamp — i.e.
+    // not editable by Claude Code, and misleading in the listing.
+    let (uid, gid) = container_user_ids(container_id).await;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or_else(now_epoch_secs);
+
+    // `std::fs::read` plus the tar build are synchronous and can be hundreds of
+    // MB, so they run on a blocking thread rather than stalling an async worker
+    // (the same discipline as `upload_host_file_to_container`).
+    let read_path = host_path.clone();
+    let tar_buf = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+        let file_data = std::fs::read(&read_path)
+            .map_err(|e| format!("Failed to read host file: {}", e))?;
+        build_single_file_tar(&file_name, &file_data[..], 0o644, uid, gid, mtime)
+    })
+    .await
+    .map_err(|e| format!("Upload task panicked: {}", e))??;
 
     docker
         .upload_to_container(
@@ -402,4 +729,124 @@ pub async fn upload_file_to_container(
         .map_err(|e| format!("Failed to upload file to container: {}", e))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A line as `find -printf '%f\t%y\t%Y\t%s\t%T@\t%m\n'` emits it.
+    fn line(name: &str, own: &str, deref: &str, size: &str) -> String {
+        format!("{}\t{}\t{}\t{}\t1700000000.0000000000\t644", name, own, deref, size)
+    }
+
+    #[test]
+    fn parses_a_plain_file_row() {
+        let entries = parse_find_output("/workspace", &line("notes.txt", "f", "f", "42"));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "notes.txt");
+        assert_eq!(entries[0].path, "/workspace/notes.txt");
+        assert!(!entries[0].is_directory);
+        assert!(!entries[0].is_symlink);
+        assert_eq!(entries[0].size, 42);
+        assert_eq!(entries[0].permissions, "644");
+        assert_eq!(entries[0].modified, "2023-11-14 22:13:20");
+    }
+
+    #[test]
+    fn a_symlink_to_a_directory_is_navigable_and_still_flagged_as_a_link() {
+        // The bug this guards: `%y` reports `l`, so keying `is_directory` off it
+        // made every symlinked directory an unopenable row.
+        let entries = parse_find_output("/workspace", &line("app", "l", "d", "12"));
+        assert!(entries[0].is_directory);
+        assert!(entries[0].is_symlink);
+    }
+
+    #[test]
+    fn a_broken_symlink_is_not_a_directory() {
+        // `%Y` is `N` when the target is missing, `L` on a loop.
+        for deref in ["N", "L", "?"] {
+            let entries = parse_find_output("/workspace", &line("dangling", "l", deref, "9"));
+            assert!(!entries[0].is_directory, "deref type {} became a directory", deref);
+            assert!(entries[0].is_symlink);
+        }
+    }
+
+    #[test]
+    fn directories_sort_first_then_case_insensitively() {
+        let output = [
+            line("Zeta", "f", "f", "1"),
+            line("alpha", "f", "f", "1"),
+            line("src", "d", "d", "4096"),
+        ]
+        .join("\n");
+        let entries = parse_find_output("/workspace", &output);
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["src", "alpha", "Zeta"]);
+    }
+
+    #[test]
+    fn short_and_blank_rows_are_dropped_rather_than_mis_parsed() {
+        let output = format!("\n  \nbroken\ttoo\tshort\n{}\n", line("ok", "f", "f", "1"));
+        let entries = parse_find_output("/workspace", &output);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "ok");
+    }
+
+    #[test]
+    fn the_root_directory_does_not_get_a_doubled_separator() {
+        let entries = parse_find_output("/", &line("etc", "d", "d", "4096"));
+        assert_eq!(entries[0].path, "/etc");
+    }
+
+    #[test]
+    fn unparseable_size_and_mtime_fall_back_instead_of_dropping_the_row() {
+        let output = "weird\tf\tf\t-\t-\t644";
+        let entries = parse_find_output("/workspace", output);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].size, 0);
+    }
+
+    #[test]
+    fn parent_dir_walks_up_one_level_and_stops_at_root() {
+        assert_eq!(parent_dir("/workspace/app/src"), "/workspace/app");
+        assert_eq!(parent_dir("/workspace/app/src/"), "/workspace/app");
+        assert_eq!(parent_dir("/workspace"), "/");
+        assert_eq!(parent_dir("/"), "/");
+    }
+
+    #[test]
+    fn a_rename_target_may_not_relocate_the_entry() {
+        // The whole point of the validator: this is argv for `mv`, and a name
+        // with a separator in it would be a move, not a rename.
+        assert!(validate_entry_name("sub/dir").is_err());
+        assert!(validate_entry_name("../escape").is_err());
+        assert!(validate_entry_name("/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn dot_and_dotdot_and_empty_are_refused() {
+        assert!(validate_entry_name("").is_err());
+        assert!(validate_entry_name(".").is_err());
+        assert!(validate_entry_name("..").is_err());
+        assert!(validate_entry_name("\0").is_err());
+        assert!(validate_entry_name(&"x".repeat(256)).is_err());
+    }
+
+    #[test]
+    fn ordinary_names_including_awkward_ones_are_allowed() {
+        // Nothing goes through a shell, so metacharacters are just characters —
+        // and a leading `-` is safe because every call site passes `--` first.
+        for name in [".hidden", "a b.txt", "$(whoami)", "it's", "-rf", "…unicode…"] {
+            assert!(validate_entry_name(name).is_ok(), "{} was refused", name);
+        }
+    }
+
+    #[test]
+    fn the_viewer_cap_is_never_larger_than_the_hard_ceiling() {
+        // The frontend picks a cap per file type; Rust still gets the last word
+        // because the whole payload is buffered in host RAM.
+        assert_eq!(Some(u64::MAX).unwrap().min(MAX_READ_BYTES), MAX_READ_BYTES);
+        assert!(MAX_READ_BYTES < MAX_UPLOAD_BYTES);
+    }
 }

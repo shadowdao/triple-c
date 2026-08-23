@@ -329,10 +329,22 @@ export interface ImageUpdateInfo {
 export interface FileEntry {
   name: string;
   path: string;
+  /** Dereferenced: a symlink pointing at a directory reads as one. */
   is_directory: boolean;
+  is_symlink: boolean;
   size: number;
   modified: string;
   permissions: string;
+}
+
+/** A file read out of the container for the in-app viewer. */
+export interface FileContents {
+  /** Base64 — a byte array would cross IPC as JSON numbers. */
+  contents_base64: string;
+  /** The file was larger than the cap; only a prefix came back. */
+  truncated: boolean;
+  /** The file's real size, not the length of what was returned. */
+  size: number;
 }
 
 export interface InstallOptions {
