@@ -134,12 +134,19 @@ export interface OpenAiCompatibleConfig {
 }
 
 export interface ClaudeCodeSettings {
+  /** `null` = let Claude Code choose the renderer; `"default"` = classic, `"fullscreen"` = alt-screen. */
   tui_mode: string | null;
+  /** `null` = unset, else `"low" | "medium" | "high" | "xhigh"`. Written as `effortLevel`. */
   effort: string | null;
   auto_scroll_disabled: boolean;
+  /** Written as `viewMode: "focus"`. */
   focus_mode: boolean;
   show_thinking_summaries: boolean;
-  enable_session_recap: boolean;
+  /**
+   * Turns the session recap **off**. Held in the disabled sense because Claude
+   * Code's recap is on by default — see the Rust doc on `ClaudeCodeSettings`.
+   */
+  session_recap_disabled: boolean;
   env_scrub: boolean;
   prompt_caching_1h: boolean;
 }

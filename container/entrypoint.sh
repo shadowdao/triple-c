@@ -405,22 +405,37 @@ install_feature_skill pia-vpn "${VPN_SUPPORT_ENABLED:-0}"
 unset VPN_SUPPORT_ENABLED
 
 # ── Claude Code settings ────────────────────────────────────────────────────
-# Merge Claude Code settings into ~/.claude/settings.json (preserves existing
-# keys). Creates the file if it doesn't exist. These control TUI mode, effort
-# level, focus mode, thinking summaries, and other CLI behavior.
+# Apply the managed Claude Code settings to ~/.claude/settings.json, keeping
+# every key the user set inside the container.
+#
+# `settings.json` lives on the persisted triple-c-claude-config-{id} volume, so
+# it outlives the container and a plain `.[0] * .[1]` merge could only ever
+# *add*. That is what made every one of these settings one-way: switching one
+# off in Triple-C omitted its key, the merge preserved the old on-value, and the
+# setting stayed on until a destructive Reset. So the payload from Rust states
+# the whole managed key set on every start, and a JSON **null** in it means
+# "delete this key" rather than "merge a null" — which is how a setting whose
+# neutral state is *unset* (`tui`, `effortLevel`, `viewMode`,
+# `awaySummaryEnabled`) is turned back off without pinning a stand-in value.
+# See `build_claude_code_settings_json` in app/src-tauri/src/docker/container.rs.
 if [ -n "$CLAUDE_CODE_SETTINGS_JSON" ]; then
     SETTINGS_FILE="/home/claude/.claude/settings.json"
     mkdir -p /home/claude/.claude
-    if [ -f "$SETTINGS_FILE" ]; then
-        # Merge: existing settings + new settings (new keys override on conflict)
-        MERGED=$(jq -s '.[0] * .[1]' "$SETTINGS_FILE" <(printf '%s' "$CLAUDE_CODE_SETTINGS_JSON") 2>/dev/null)
-        if [ -n "$MERGED" ]; then
-            printf '%s\n' "$MERGED" > "$SETTINGS_FILE"
-        else
-            echo "entrypoint: warning — failed to merge Claude Code settings into $SETTINGS_FILE"
-        fi
+    # One code path for "file exists" and "file doesn't": seeding an empty
+    # object means the null-deleting merge below runs in both cases, so a fresh
+    # container never gets a settings.json with literal nulls written into it.
+    [ -f "$SETTINGS_FILE" ] || printf '{}\n' > "$SETTINGS_FILE"
+    MERGED=$(jq -s '
+        .[0] as $current
+        | .[1] as $managed
+        | ($managed | with_entries(select(.value != null)))          as $set
+        | ($managed | to_entries | map(select(.value == null) | [.key])) as $clear
+        | ($current * $set) | delpaths($clear)
+    ' "$SETTINGS_FILE" <(printf '%s' "$CLAUDE_CODE_SETTINGS_JSON") 2>/dev/null)
+    if [ -n "$MERGED" ]; then
+        printf '%s\n' "$MERGED" > "$SETTINGS_FILE"
     else
-        printf '%s\n' "$CLAUDE_CODE_SETTINGS_JSON" > "$SETTINGS_FILE"
+        echo "entrypoint: warning — failed to merge Claude Code settings into $SETTINGS_FILE"
     fi
     chown claude:claude "$SETTINGS_FILE"
     chmod 600 "$SETTINGS_FILE"

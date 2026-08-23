@@ -863,7 +863,7 @@ pub async fn confirm_migration(
     // waiting for the project's next recreation would leave it lying around
     // indefinitely.
     tauri::async_runtime::spawn(async {
-        crate::docker::sweep_orphaned_snapshots().await;
+        crate::docker::sweep_orphaned_snapshots_logged("after migration confirmed").await;
     });
 
     Ok(())
@@ -957,6 +957,16 @@ pub async fn rollback_migration(
     let _ = mig::untag_image(&rollback_ref).await;
     migration_store::clear_staging(&project_id)?;
     migration_store::clear(&project_id)?;
+
+    // Retagging above moved `:latest` off the *migrated* snapshot, and the
+    // container that was built from it was removed a few lines up — so a
+    // multi-gigabyte image is sitting there untagged and unreferenced with
+    // nothing else in the app that would ever look at it again. The confirm
+    // path sweeps for exactly this reason; rolling back orphans just as much
+    // and did not.
+    tauri::async_runtime::spawn(async {
+        crate::docker::sweep_orphaned_snapshots_logged("after migration rollback").await;
+    });
     emit_progress(
         &app_handle,
         &project_id,

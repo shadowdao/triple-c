@@ -1200,9 +1200,14 @@ pub async fn add_scheduled_task(
 /// * **In that order**, so a rejected `add` leaves the original untouched
 ///   rather than deleting a prompt the user cannot get back. The cost is a
 ///   sub-second window in which both tasks are in the crontab.
-/// * The task therefore gets a **new id**. Its old log directory
-///   (`~/.claude/scheduler/logs/<old-id>/`) stays behind under the old id; the
-///   UI warns about this before saving.
+/// * The task therefore gets a **new id**, and its old log directory
+///   (`~/.claude/scheduler/logs/<old-id>/`) goes with the removal — the
+///   scheduler reaps a task's logs when the task stops existing, because
+///   nothing can name that id again afterwards. The UI warns before saving.
+///   (A project still running an older base image carries the older
+///   `/usr/local/bin/triple-c-scheduler`, which left the directory behind;
+///   `/usr/local/bin` only changes on a base-image migration or a Reset. The
+///   copy is deliberately written for the case that loses data.)
 /// * `enabled` is carried over explicitly, because `add` always creates an
 ///   enabled task and silently re-enabling a task the user had switched off
 ///   would schedule a run they did not ask for.

@@ -459,7 +459,7 @@ pub async fn start_project_container(
                 // just this one, so recreations that happened before the sweep
                 // existed are cleaned up too.
                 tauri::async_runtime::spawn(async {
-                    docker::sweep_orphaned_snapshots().await;
+                    docker::sweep_orphaned_snapshots_logged("after recreation").await;
                 });
 
                 new_id

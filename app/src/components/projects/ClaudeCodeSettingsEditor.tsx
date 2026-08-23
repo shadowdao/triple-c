@@ -16,7 +16,7 @@ export const CLAUDE_CODE_DEFAULTS: ClaudeCodeSettings = {
   auto_scroll_disabled: false,
   focus_mode: false,
   show_thinking_summaries: false,
-  enable_session_recap: false,
+  session_recap_disabled: false,
   env_scrub: false,
   prompt_caching_1h: false,
 };
@@ -28,16 +28,25 @@ function isAllDefaults(s: ClaudeCodeSettings): boolean {
     s.auto_scroll_disabled === false &&
     s.focus_mode === false &&
     s.show_thinking_summaries === false &&
-    s.enable_session_recap === false &&
+    s.session_recap_disabled === false &&
     s.env_scrub === false &&
     s.prompt_caching_1h === false
   );
 }
 
+/**
+ * Two of Claude Code's settings are **on by default**, so the field behind them
+ * stores the *disabled* sense (`auto_scroll_disabled`, `session_recap_disabled`)
+ * — that is what makes an untouched project mean "leave Claude Code alone"
+ * rather than "the user turned this off". `invert` is what lets those still
+ * read as an ordinary on/off switch here: the toggle shows the feature's state,
+ * the field stores the deviation from the default.
+ */
 const BOOLEAN_FIELDS: {
   key: keyof Omit<ClaudeCodeSettings, "tui_mode" | "effort">;
   label: string;
   hint: string;
+  invert?: boolean;
 }[] = [
   { key: "focus_mode", label: "Focus mode", hint: "Collapses tool output to one-line summaries." },
   {
@@ -46,14 +55,16 @@ const BOOLEAN_FIELDS: {
     hint: "Shows Claude's thinking process as summaries.",
   },
   {
-    key: "enable_session_recap",
+    key: "session_recap_disabled",
     label: "Session recap",
-    hint: "Provides context when returning to a session.",
+    hint: "Shows a one-line recap when you return to the terminal after a few minutes away.",
+    invert: true,
   },
   {
     key: "auto_scroll_disabled",
-    label: "Auto-scroll disabled",
-    hint: "Disables auto-scroll when in fullscreen TUI mode.",
+    label: "Auto-scroll",
+    hint: "Follows new output to the bottom in fullscreen rendering.",
+    invert: true,
   },
   {
     key: "env_scrub",
@@ -95,9 +106,16 @@ export default function ClaudeCodeSettingsEditor({
         </p>
       )}
 
+      {/*
+        Three states, not two. Leaving `tui` unset is what lets Claude Code pick
+        the renderer for itself, which is not the same as pinning the classic
+        one — and the key is now always written (or explicitly deleted), so
+        "Automatic" has to be selectable rather than merely being what you get
+        when nothing is emitted.
+      */}
       <SwitchRow
         label="TUI mode"
-        hint="Enables flicker-free alt-screen rendering."
+        hint="Classic renders in your terminal's scrollback; fullscreen is the flicker-free alt-screen."
         control={
           <select
             value={local.tui_mode ?? ""}
@@ -106,7 +124,8 @@ export default function ClaudeCodeSettingsEditor({
             disabled={disabled}
             className={selectClass}
           >
-            <option value="">Default</option>
+            <option value="">Automatic</option>
+            <option value="default">Classic</option>
             <option value="fullscreen">Fullscreen</option>
           </select>
         }
@@ -127,11 +146,12 @@ export default function ClaudeCodeSettingsEditor({
             <option value="low">Low</option>
             <option value="medium">Medium</option>
             <option value="high">High</option>
+            <option value="xhigh">Extra high</option>
           </select>
         }
       />
 
-      {BOOLEAN_FIELDS.map(({ key, label, hint }) => (
+      {BOOLEAN_FIELDS.map(({ key, label, hint, invert }) => (
         <SwitchRow
           key={key}
           label={label}
@@ -139,9 +159,11 @@ export default function ClaudeCodeSettingsEditor({
           control={
             <Toggle
               label={label}
-              checked={local[key]}
+              checked={invert ? !local[key] : local[key]}
               disabled={disabled}
-              onChange={(v) => apply({ [key]: v } as Partial<ClaudeCodeSettings>)}
+              onChange={(v) =>
+                apply({ [key]: invert ? !v : v } as Partial<ClaudeCodeSettings>)
+              }
             />
           }
         />

@@ -125,6 +125,37 @@ fi
     echo "=== Exit code: $EXIT_CODE ==="
 } >> "$LOG_FILE"
 
+# ── Cap the size of this run's log ──────────────────────────────────────────
+# `claude -p` output is unbounded — a task told to walk a large tree can emit
+# hundreds of megabytes in one run — and the pruning below counts *files*, not
+# bytes, so twenty logs of any size are twenty logs. One chatty task can
+# therefore fill the home volume, which is also where ~/.claude and the OAuth
+# credential live.
+#
+# The tail is the half worth keeping: `claude -p` writes its answer at the end,
+# and the footer just appended carries the exit code that `status` and the app
+# both grep for. So an oversize log is rewritten as a marker line plus its last
+# MAX_LOG_BYTES rather than being deleted or capped from the front. This runs
+# before the notification below so the summary is taken from the capped file.
+#
+# Best effort throughout: the run's real result is already recorded, so a
+# failure here must not change the exit status. Note that `run` may be tailing
+# this file — it has already streamed everything up to here, and nothing is
+# appended after this point, so replacing the inode is invisible to it.
+MAX_LOG_BYTES=$(( 5 * 1024 * 1024 ))
+LOG_BYTES=$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)
+if [ "${LOG_BYTES:-0}" -gt "$MAX_LOG_BYTES" ]; then
+    TRUNC_FILE="${LOG_FILE}.trunc"
+    if {
+        echo "=== Log truncated: $(( LOG_BYTES - MAX_LOG_BYTES )) bytes dropped from the start (cap ${MAX_LOG_BYTES} bytes) ==="
+        tail -c "$MAX_LOG_BYTES" "$LOG_FILE"
+    } > "$TRUNC_FILE" 2>/dev/null; then
+        mv -f "$TRUNC_FILE" "$LOG_FILE" 2>/dev/null || rm -f "$TRUNC_FILE"
+    else
+        rm -f "$TRUNC_FILE"
+    fi
+fi
+
 # ── Write notification ──────────────────────────────────────────────────────
 mkdir -p "$NOTIFICATIONS_DIR"
 NOTIFY_FILE="${NOTIFICATIONS_DIR}/${TASK_ID}_${TIMESTAMP}.notify"
@@ -175,6 +206,35 @@ LOG_COUNT=$(find "$TASK_LOG_DIR" -name "*.log" -type f 2>/dev/null | wc -l)
 if [ "$LOG_COUNT" -gt 20 ]; then
     find "$TASK_LOG_DIR" -name "*.log" -type f | sort | head -n $((LOG_COUNT - 20)) | xargs rm -f
 fi
+
+# ── Reap log dirs of tasks that no longer exist ─────────────────────────────
+# `triple-c-scheduler remove` deletes a task's log dir with the task, but a
+# one-time task deletes its own task file above, so `remove` can never be run
+# for it — nothing knows the id any more — and its directory would sit on the
+# home volume forever. This is the sweep for that case.
+#
+# Deliberately delayed rather than done in the cleanup above: the run that just
+# finished has only just written the sole record of itself, `run` and the app's
+# Automation tab may still be tailing it, and `logs --id` keeps working for a
+# task whose file is gone. So a dir is reaped only once nothing in it has been
+# touched for LOG_RETENTION_DAYS, and never while a run is publishing state for
+# that id. The sweep rides on task runs, so a container whose only task was
+# one-time keeps that one directory until something else runs.
+#
+# Same paranoia as reap_task_logs() in triple-c-scheduler: the id comes from a
+# directory name and is re-validated before it is used to build an `rm -rf`
+# path, so no empty or path-bearing name can reach beyond $LOGS_DIR.
+LOG_RETENTION_DAYS=7
+for ORPHAN_DIR in "$LOGS_DIR"/*/; do
+    [ -d "$ORPHAN_DIR" ] || continue
+    ORPHAN_ID=$(basename "$ORPHAN_DIR")
+    [[ "$ORPHAN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || continue
+    [ -f "${TASKS_DIR}/${ORPHAN_ID}.json" ] && continue
+    [ -f "${RUNNING_DIR}/${ORPHAN_ID}.json" ] && continue
+    # Anything modified inside the window keeps the whole directory.
+    [ -n "$(find "$ORPHAN_DIR" -mmin "-$(( LOG_RETENTION_DAYS * 1440 ))" -print -quit 2>/dev/null)" ] && continue
+    rm -rf -- "${LOGS_DIR:?}/${ORPHAN_ID}"
+done
 
 # ── Prune old notifications (keep 50 total) ─────────────────────────────────
 NOTIFY_COUNT=$(find "$NOTIFICATIONS_DIR" -name "*.notify" -type f 2>/dev/null | wc -l)

@@ -235,6 +235,30 @@ pub fn run() {
                 }
             }
 
+            // ── Startup disk housekeeping ────────────────────────────────
+            // Until now the only sweep ran *after* a recreation, so a user who
+            // simply stopped launching a project kept its orphaned snapshot
+            // layers forever, and anything a crash left behind (a probe
+            // container pinning a base image, a rollback pin whose migration
+            // record is gone) had no path back at all. All three are
+            // read-mostly and finish in well under a second on an idle daemon,
+            // but they are detached anyway: housekeeping must never delay the
+            // window appearing, and a daemon that is not running yet is a
+            // logged warning rather than a failed start.
+            //
+            // Ordering matters. Probes are removed first because a probe holds
+            // an image open and the sweep will not force; pins are untagged
+            // second so the images they were holding are dangling by the time
+            // the sweep lists them; the sweep runs last and collects both.
+            tauri::async_runtime::spawn(async {
+                crate::docker::reap_probe_containers().await;
+                let reaped = crate::docker::reap_stale_migration_pins().await;
+                if reaped > 0 {
+                    log::info!("Startup housekeeping dropped {} stale rollback pin(s)", reaped);
+                }
+                crate::docker::sweep_orphaned_snapshots_logged("startup").await;
+            });
+
             // Auto-start web terminal server if enabled in settings
             let settings = settings_store_setup.get();
             if settings.web_terminal.enabled {
