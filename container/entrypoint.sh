@@ -412,25 +412,29 @@ unset VPN_SUPPORT_ENABLED
 # it outlives the container and a plain `.[0] * .[1]` merge could only ever
 # *add*. That is what made every one of these settings one-way: switching one
 # off in Triple-C omitted its key, the merge preserved the old on-value, and the
-# setting stayed on until a destructive Reset. So the payload from Rust states
-# the whole managed key set on every start, and a JSON **null** in it means
-# "delete this key" rather than "merge a null" — which is how a setting whose
-# neutral state is *unset* (`tui`, `effortLevel`, `viewMode`,
-# `awaySummaryEnabled`) is turned back off without pinning a stand-in value.
+# setting stayed on until a destructive Reset. So Rust states the whole managed
+# key set on every start, in two parts: CLAUDE_CODE_SETTINGS_JSON holds the keys
+# that have a value, and CLAUDE_CODE_SETTINGS_CLEAR is a JSON array of the key
+# names whose neutral state is *unset* (`tui`, `effortLevel`, `viewMode`,
+# `awaySummaryEnabled`) and which must therefore be deleted rather than pinned
+# to a stand-in value.
+#
+# The two are kept apart rather than using a null-means-delete payload because
+# a project recreates from its own snapshot image, which carries whatever
+# entrypoint it was built with. An older one merges with a plain `.[0] * .[1]`
+# and would write literal nulls into the user's settings.json; it ignores
+# CLAUDE_CODE_SETTINGS_CLEAR instead, keeping the old sticky behaviour until the
+# project is migrated or Reset.
 # See `build_claude_code_settings_json` in app/src-tauri/src/docker/container.rs.
 if [ -n "$CLAUDE_CODE_SETTINGS_JSON" ]; then
     SETTINGS_FILE="/home/claude/.claude/settings.json"
     mkdir -p /home/claude/.claude
-    # One code path for "file exists" and "file doesn't": seeding an empty
-    # object means the null-deleting merge below runs in both cases, so a fresh
-    # container never gets a settings.json with literal nulls written into it.
+    # One code path for "file exists" and "file doesn't".
     [ -f "$SETTINGS_FILE" ] || printf '{}\n' > "$SETTINGS_FILE"
-    MERGED=$(jq -s '
+    MERGED=$(jq -s --argjson clear "${CLAUDE_CODE_SETTINGS_CLEAR:-[]}" '
         .[0] as $current
-        | .[1] as $managed
-        | ($managed | with_entries(select(.value != null)))          as $set
-        | ($managed | to_entries | map(select(.value == null) | [.key])) as $clear
-        | ($current * $set) | delpaths($clear)
+        | .[1] as $set
+        | ($current * $set) | delpaths($clear | map([.]))
     ' "$SETTINGS_FILE" <(printf '%s' "$CLAUDE_CODE_SETTINGS_JSON") 2>/dev/null)
     if [ -n "$MERGED" ]; then
         printf '%s\n' "$MERGED" > "$SETTINGS_FILE"
@@ -440,6 +444,7 @@ if [ -n "$CLAUDE_CODE_SETTINGS_JSON" ]; then
     chown claude:claude "$SETTINGS_FILE"
     chmod 600 "$SETTINGS_FILE"
     unset CLAUDE_CODE_SETTINGS_JSON
+    unset CLAUDE_CODE_SETTINGS_CLEAR
 fi
 
 # ── AWS SSO auth refresh command ──────────────────────────────────────────────

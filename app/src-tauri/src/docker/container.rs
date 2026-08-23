@@ -238,6 +238,7 @@ const RESERVED_ENV_EXACT: &[&str] = &[
     "CLAUDE_INSTRUCTIONS",
     "MCP_SERVERS_JSON",
     "CLAUDE_CODE_SETTINGS_JSON",
+    "CLAUDE_CODE_SETTINGS_CLEAR",
     "MISSION_CONTROL_ENABLED",
     "VPN_SUPPORT_ENABLED",
     "TRIPLE_C_PERMISSION_MODE",
@@ -867,6 +868,48 @@ fn build_claude_code_settings_json(
     serde_json::Value::Object(map).to_string()
 }
 
+/// Split the managed payload into the half that is safe to merge anywhere and
+/// the list of keys to delete.
+///
+/// The null-means-delete convention is only understood by the `entrypoint.sh`
+/// shipped alongside this code — and an existing project recreates from *its
+/// own snapshot image*, which carries whatever entrypoint it was built with. An
+/// older one merges with a plain `.[0] * .[1]`, which would write the literal
+/// `null`s straight into the user's `settings.json` rather than clearing the
+/// keys. A settings file Claude Code then rejects would take the user's own
+/// `model`, `statusLine` and everything else in it down with it.
+///
+/// So the nulls never leave Rust. `CLAUDE_CODE_SETTINGS_JSON` carries only real
+/// values and stays safe under either merge; `CLAUDE_CODE_SETTINGS_CLEAR`
+/// carries the key names to delete and is simply ignored by an entrypoint that
+/// predates it. Such a project keeps the old sticky behaviour until it is
+/// migrated or Reset — which is the pre-existing state, not a regression.
+pub(crate) fn split_claude_code_settings_payload(payload: &str) -> (String, String) {
+    let parsed: serde_json::Value = match serde_json::from_str(payload) {
+        Ok(v) => v,
+        // Not our business to fix; hand it through and let the merge fail loudly.
+        Err(_) => return (payload.to_string(), "[]".to_string()),
+    };
+    let Some(obj) = parsed.as_object() else {
+        return (payload.to_string(), "[]".to_string());
+    };
+
+    let mut set = serde_json::Map::new();
+    let mut clear: Vec<serde_json::Value> = Vec::new();
+    for (k, v) in obj {
+        if v.is_null() {
+            clear.push(serde_json::json!(k));
+        } else {
+            set.insert(k.clone(), v.clone());
+        }
+    }
+
+    (
+        serde_json::Value::Object(set).to_string(),
+        serde_json::Value::Array(clear).to_string(),
+    )
+}
+
 pub async fn find_existing_container(project: &Project) -> Result<Option<String>, String> {
     let docker = get_docker()?;
     let container_name = project.container_name();
@@ -1471,10 +1514,14 @@ pub async fn create_container(
     // even with no `ClaudeCodeSettings` struct present: the payload asserts the
     // *whole* managed key set, so "no settings" still has to be stated over a
     // settings.json left behind on the config volume by a previous config.
-    env_vars.push(format!(
-        "CLAUDE_CODE_SETTINGS_JSON={}",
-        build_claude_code_settings_json(merged_cc_settings.as_ref(), project.sandbox_mode_enabled)
-    ));
+    // Split so the payload is safe under an older entrypoint that has never
+    // heard of the null-means-delete convention — see
+    // `split_claude_code_settings_payload`.
+    let (cc_settings_set, cc_settings_clear) = split_claude_code_settings_payload(
+        &build_claude_code_settings_json(merged_cc_settings.as_ref(), project.sandbox_mode_enabled),
+    );
+    env_vars.push(format!("CLAUDE_CODE_SETTINGS_JSON={}", cc_settings_set));
+    env_vars.push(format!("CLAUDE_CODE_SETTINGS_CLEAR={}", cc_settings_clear));
 
     let mut mounts: Vec<Mount> = Vec::new();
 
@@ -3627,6 +3674,73 @@ mod tests {
         "awaySummaryEnabled",
         "sandbox",
     ];
+
+    #[test]
+    fn split_payload_never_emits_a_null_to_an_older_entrypoint() {
+        // An existing project recreates from its own snapshot, which carries
+        // whatever entrypoint it was built with. An older one merges with a
+        // plain `.[0] * .[1]`, so a null reaching it would be written into the
+        // user's settings.json verbatim instead of clearing the key.
+        let payload = build_claude_code_settings_json(None, false);
+        assert!(
+            payload.contains("null"),
+            "precondition: the unsplit payload uses null to mean delete"
+        );
+
+        let (set, clear) = split_claude_code_settings_payload(&payload);
+
+        let set_val: serde_json::Value = serde_json::from_str(&set).unwrap();
+        for (k, v) in set_val.as_object().unwrap() {
+            assert!(!v.is_null(), "key {} reached the merge half as a null", k);
+        }
+
+        let clear_val: serde_json::Value = serde_json::from_str(&clear).unwrap();
+        let cleared: Vec<&str> = clear_val
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        // The four whose neutral state is genuinely "unset".
+        for k in ["tui", "effortLevel", "viewMode", "awaySummaryEnabled"] {
+            assert!(cleared.contains(&k), "{} should be cleared, not pinned", k);
+        }
+    }
+
+    #[test]
+    fn split_payload_keeps_every_key_exactly_once() {
+        // Nothing may be dropped or duplicated between the two halves, or a
+        // managed key would silently stop being asserted.
+        let settings = ClaudeCodeSettings {
+            tui_mode: Some("fullscreen".to_string()),
+            focus_mode: true,
+            ..Default::default()
+        };
+        let payload = build_claude_code_settings_json(Some(&settings), true);
+        let original: serde_json::Value = serde_json::from_str(&payload).unwrap();
+
+        let (set, clear) = split_claude_code_settings_payload(&payload);
+        let set_val: serde_json::Value = serde_json::from_str(&set).unwrap();
+        let clear_val: serde_json::Value = serde_json::from_str(&clear).unwrap();
+
+        let mut seen: Vec<String> = set_val
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .chain(
+                clear_val
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_str().unwrap().to_string()),
+            )
+            .collect();
+        seen.sort();
+        let mut expected: Vec<String> = original.as_object().unwrap().keys().cloned().collect();
+        expected.sort();
+        assert_eq!(seen, expected);
+    }
 
     #[test]
     fn turning_a_setting_off_clears_it_rather_than_omitting_it() {
