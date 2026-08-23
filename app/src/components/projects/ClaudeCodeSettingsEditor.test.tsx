@@ -3,10 +3,18 @@ import { render, screen, fireEvent } from "@testing-library/react";
 import ClaudeCodeSettingsEditor, { CLAUDE_CODE_DEFAULTS } from "./ClaudeCodeSettingsEditor";
 import type { ClaudeCodeSettings } from "../../lib/types";
 
-function renderEditor(settings: ClaudeCodeSettings | null) {
+function renderEditor(
+  settings: ClaudeCodeSettings | null,
+  scope: "global" | "project" = "global",
+) {
   const onSave = vi.fn().mockResolvedValue(undefined);
   render(
-    <ClaudeCodeSettingsEditor settings={settings} disabled={false} onSave={onSave} />,
+    <ClaudeCodeSettingsEditor
+      scope={scope}
+      settings={settings}
+      disabled={false}
+      onSave={onSave}
+    />,
   );
   return onSave;
 }
@@ -58,5 +66,58 @@ describe("ClaudeCodeSettingsEditor", () => {
         screen.getByLabelText("Effort level").querySelectorAll("option"),
       ).map((o) => o.getAttribute("value")),
     ).toEqual(["", "low", "medium", "high", "xhigh"]);
+  });
+
+  describe("project scope", () => {
+    it("offers Global as a third state so a project can decline to have an opinion", () => {
+      renderEditor(null, "project");
+      const focus = screen.getByLabelText("Focus mode");
+      expect(
+        Array.from(focus.querySelectorAll("option")).map((o) => o.getAttribute("value")),
+      ).toEqual(["global", "off", "on"]);
+      expect((focus as HTMLSelectElement).value).toBe("global");
+    });
+
+    it("stores a deliberate false so the project can turn a global On back off", () => {
+      // The reason the field widened from boolean to boolean|null. Under the
+      // old merge there was no project value that could produce this.
+      const onSave = renderEditor(null, "project");
+      fireEvent.change(screen.getByLabelText("Focus mode"), { target: { value: "off" } });
+      expect(onSave).toHaveBeenCalledWith(
+        expect.objectContaining({ focus_mode: false }),
+      );
+    });
+
+    it("does not collapse a deliberate off to null", () => {
+      // `null` means inherit. Collapsing here would silently hand the setting
+      // straight back to the global value the user just overrode.
+      const onSave = renderEditor(null, "project");
+      fireEvent.change(screen.getByLabelText("Focus mode"), { target: { value: "off" } });
+      expect(onSave).not.toHaveBeenCalledWith(null);
+    });
+
+    it("round-trips the inverted fields through the disabled sense", () => {
+      // Session recap stores `session_recap_disabled`, so choosing "off" has to
+      // store `true` and choosing "on" has to store `false`.
+      const onSave = renderEditor(null, "project");
+      const recap = screen.getByLabelText("Session recap");
+
+      fireEvent.change(recap, { target: { value: "off" } });
+      expect(onSave).toHaveBeenCalledWith(
+        expect.objectContaining({ session_recap_disabled: true }),
+      );
+
+      fireEvent.change(recap, { target: { value: "on" } });
+      expect(onSave).toHaveBeenCalledWith(
+        expect.objectContaining({ session_recap_disabled: false }),
+      );
+    });
+
+    it("shows a stored override rather than the inherited state", () => {
+      renderEditor({ ...CLAUDE_CODE_DEFAULTS, session_recap_disabled: true }, "project");
+      expect((screen.getByLabelText("Session recap") as HTMLSelectElement).value).toBe(
+        "off",
+      );
+    });
   });
 });

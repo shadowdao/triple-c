@@ -133,22 +133,28 @@ export interface OpenAiCompatibleConfig {
   haiku_model_id: string | null;
 }
 
+/**
+ * Every field is three-state. `null` means "not set at this level": on a
+ * project that is "inherit the global value", and on the global settings it is
+ * "leave Claude Code's own default alone". `false` is a deliberate off, which
+ * is what lets a project turn a globally-enabled setting back off.
+ */
 export interface ClaudeCodeSettings {
   /** `null` = let Claude Code choose the renderer; `"default"` = classic, `"fullscreen"` = alt-screen. */
   tui_mode: string | null;
   /** `null` = unset, else `"low" | "medium" | "high" | "xhigh"`. Written as `effortLevel`. */
   effort: string | null;
-  auto_scroll_disabled: boolean;
+  auto_scroll_disabled: boolean | null;
   /** Written as `viewMode: "focus"`. */
-  focus_mode: boolean;
-  show_thinking_summaries: boolean;
+  focus_mode: boolean | null;
+  show_thinking_summaries: boolean | null;
   /**
    * Turns the session recap **off**. Held in the disabled sense because Claude
    * Code's recap is on by default — see the Rust doc on `ClaudeCodeSettings`.
    */
-  session_recap_disabled: boolean;
-  env_scrub: boolean;
-  prompt_caching_1h: boolean;
+  session_recap_disabled: boolean | null;
+  env_scrub: boolean | null;
+  prompt_caching_1h: boolean | null;
 }
 
 export interface ContainerInfo {

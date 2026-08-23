@@ -85,6 +85,14 @@ impl PermissionMode {
 /// Settings for Claude Code CLI behavior inside the container.
 /// These map to Claude Code env vars and ~/.claude/settings.json entries.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+/// Every field is three-state, and the third state is load-bearing.
+///
+/// `None` means "not set at this level". For a *project* that is "inherit
+/// whatever the global settings say"; for the *global* settings it is "leave
+/// Claude Code's own default alone". `Some(false)` is a deliberate off, which
+/// is what lets a project turn a globally-enabled setting back off — with a
+/// plain `bool` there is no value that can express that, which is why these
+/// were widened from `bool`.
 pub struct ClaudeCodeSettings {
     /// TUI renderer. `None` leaves settings.json's `tui` key unset, which is
     /// what lets Claude Code pick the renderer itself; `Some("default")` pins
@@ -101,14 +109,14 @@ pub struct ClaudeCodeSettings {
     /// because Claude Code's `autoScrollEnabled` defaults to `true`, so the
     /// zero value of this field has to mean "leave it on".
     #[serde(default)]
-    pub auto_scroll_disabled: bool,
+    pub auto_scroll_disabled: Option<bool>,
     /// Collapse tool output to one-line summaries. Written to settings.json as
     /// `viewMode: "focus"`; there is no `focusMode` key in Claude Code.
     #[serde(default)]
-    pub focus_mode: bool,
+    pub focus_mode: Option<bool>,
     /// Show thinking summaries in responses
     #[serde(default)]
-    pub show_thinking_summaries: bool,
+    pub show_thinking_summaries: Option<bool>,
     /// Turn the session recap **off**.
     ///
     /// Held in the disabled sense for the same reason as `auto_scroll_disabled`,
@@ -121,13 +129,13 @@ pub struct ClaudeCodeSettings {
     /// silently disabled it for all of them. A new name lets the old key be
     /// ignored, which lands every existing project on the correct default.
     #[serde(default)]
-    pub session_recap_disabled: bool,
+    pub session_recap_disabled: Option<bool>,
     /// Strip credentials from subprocess environments
     #[serde(default)]
-    pub env_scrub: bool,
+    pub env_scrub: Option<bool>,
     /// Enable 1-hour prompt cache TTL (vs default 5-minute)
     #[serde(default)]
-    pub prompt_caching_1h: bool,
+    pub prompt_caching_1h: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -109,9 +109,10 @@ export default function RuntimeSection({
 
       <ConfigGroup
         title="Claude Code settings"
-        description="Per-project CLI behaviour. These override the global defaults in Settings."
+        description="Per-project CLI behaviour. Anything left on Global follows Settings; Off overrides a global On."
       >
         <ClaudeCodeSettingsEditor
+          scope="project"
           settings={project.claude_code_settings}
           disabled={disabled}
           disabledReason={disabledReason}

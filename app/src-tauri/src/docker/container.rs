@@ -631,8 +631,14 @@ fn compute_ports_fingerprint(port_mappings: &[PortMapping]) -> String {
     sha256_hex(&joined)
 }
 
-/// Merge global and per-project ClaudeCodeSettings.
-/// Per-project fields override global fields when set (non-default).
+/// Merge global and per-project `ClaudeCodeSettings`.
+///
+/// A project field that is `Some` wins outright — **including `Some(false)`**.
+/// That is the point of the widening: these used to be plain `bool`s ORed
+/// together (`if p.x { true } else { g.x }`), so a project could only ever add
+/// to the global set and never turn a globally-enabled setting off. `None` at
+/// project level means "inherit", which is now a state the project can
+/// actually be in rather than the only state an off switch could produce.
 fn merge_claude_code_settings(
     global: Option<&ClaudeCodeSettings>,
     project: Option<&ClaudeCodeSettings>,
@@ -642,16 +648,15 @@ fn merge_claude_code_settings(
         (Some(g), None) => Some(g.clone()),
         (None, Some(p)) => Some(p.clone()),
         (Some(g), Some(p)) => {
-            // Project overrides global for each field when the project value is non-default
             Some(ClaudeCodeSettings {
                 tui_mode: p.tui_mode.clone().or_else(|| g.tui_mode.clone()),
                 effort: p.effort.clone().or_else(|| g.effort.clone()),
-                auto_scroll_disabled: if p.auto_scroll_disabled { true } else { g.auto_scroll_disabled },
-                focus_mode: if p.focus_mode { true } else { g.focus_mode },
-                show_thinking_summaries: if p.show_thinking_summaries { true } else { g.show_thinking_summaries },
-                session_recap_disabled: if p.session_recap_disabled { true } else { g.session_recap_disabled },
-                env_scrub: if p.env_scrub { true } else { g.env_scrub },
-                prompt_caching_1h: if p.prompt_caching_1h { true } else { g.prompt_caching_1h },
+                auto_scroll_disabled: p.auto_scroll_disabled.or(g.auto_scroll_disabled),
+                focus_mode: p.focus_mode.or(g.focus_mode),
+                show_thinking_summaries: p.show_thinking_summaries.or(g.show_thinking_summaries),
+                session_recap_disabled: p.session_recap_disabled.or(g.session_recap_disabled),
+                env_scrub: p.env_scrub.or(g.env_scrub),
+                prompt_caching_1h: p.prompt_caching_1h.or(g.prompt_caching_1h),
             })
         }
     }
@@ -673,12 +678,16 @@ fn compute_claude_code_settings_fingerprint(
             let parts = vec![
                 s.tui_mode.as_deref().unwrap_or("").to_string(),
                 s.effort.as_deref().unwrap_or("").to_string(),
-                format!("{}", s.auto_scroll_disabled),
-                format!("{}", s.focus_mode),
-                format!("{}", s.show_thinking_summaries),
-                format!("{}", s.session_recap_disabled),
-                format!("{}", s.env_scrub),
-                format!("{}", s.prompt_caching_1h),
+                // `{:?}` rather than `{}` so `None` and `Some(false)` produce
+                // different text. They mean different things — inherit versus a
+                // deliberate off — and a fingerprint that conflated them would
+                // leave the container un-recreated on a real change.
+                format!("{:?}", s.auto_scroll_disabled),
+                format!("{:?}", s.focus_mode),
+                format!("{:?}", s.show_thinking_summaries),
+                format!("{:?}", s.session_recap_disabled),
+                format!("{:?}", s.env_scrub),
+                format!("{:?}", s.prompt_caching_1h),
             ];
             sha256_hex(&parts.join("|"))
         }
@@ -738,15 +747,15 @@ fn claude_code_env_vars(settings: Option<&ClaudeCodeSettings>) -> Vec<String> {
         ),
         format!(
             "CLAUDE_CODE_ENABLE_AWAY_SUMMARY={}",
-            if s.session_recap_disabled { "0" } else { "" }
+            if s.session_recap_disabled.unwrap_or(false) { "0" } else { "" }
         ),
         format!(
             "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB={}",
-            if s.env_scrub { "1" } else { "0" }
+            if s.env_scrub.unwrap_or(false) { "1" } else { "0" }
         ),
         format!(
             "ENABLE_PROMPT_CACHING_1H={}",
-            if s.prompt_caching_1h { "1" } else { "0" }
+            if s.prompt_caching_1h.unwrap_or(false) { "1" } else { "0" }
         ),
     ]
 }
@@ -817,12 +826,12 @@ fn build_claude_code_settings_json(
     // Documented default `true`, so the neutral value is a value.
     map.insert(
         "autoScrollEnabled".to_string(),
-        serde_json::json!(!s.auto_scroll_disabled),
+        serde_json::json!(!s.auto_scroll_disabled.unwrap_or(false)),
     );
     // Documented default `false`.
     map.insert(
         "showThinkingSummaries".to_string(),
-        serde_json::json!(s.show_thinking_summaries),
+        serde_json::json!(s.show_thinking_summaries.unwrap_or(false)),
     );
     // `viewMode: "focus"` is the real setting behind what the UI calls focus
     // mode — "collapses tool output to one-line summaries" is that key's
@@ -830,7 +839,7 @@ fn build_claude_code_settings_json(
     // did nothing.
     map.insert(
         "viewMode".to_string(),
-        if s.focus_mode {
+        if s.focus_mode.unwrap_or(false) {
             serde_json::json!("focus")
         } else {
             serde_json::Value::Null
@@ -842,7 +851,7 @@ fn build_claude_code_settings_json(
     // is here so the container's settings.json does not contradict it.
     map.insert(
         "awaySummaryEnabled".to_string(),
-        if s.session_recap_disabled {
+        if s.session_recap_disabled.unwrap_or(false) {
             serde_json::json!(false)
         } else {
             serde_json::Value::Null
@@ -3676,6 +3685,52 @@ mod tests {
     ];
 
     #[test]
+    fn a_project_can_turn_a_globally_enabled_setting_back_off() {
+        // The whole reason the booleans are `Option<bool>`. Under the old
+        // `if p.x { true } else { g.x }` merge there was no project value that
+        // could produce `false` here.
+        let global = ClaudeCodeSettings {
+            focus_mode: Some(true),
+            env_scrub: Some(true),
+            prompt_caching_1h: Some(true),
+            ..Default::default()
+        };
+        let project = ClaudeCodeSettings {
+            focus_mode: Some(false),
+            ..Default::default()
+        };
+
+        let merged = merge_claude_code_settings(Some(&global), Some(&project)).unwrap();
+
+        assert_eq!(merged.focus_mode, Some(false), "project off must win");
+        // Untouched project fields still inherit.
+        assert_eq!(merged.env_scrub, Some(true));
+        assert_eq!(merged.prompt_caching_1h, Some(true));
+
+        // And it has to survive into what the container actually receives.
+        let payload = build_claude_code_settings_json(Some(&merged), false);
+        let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert!(
+            v.get("viewMode").is_some_and(|m| m.is_null()),
+            "viewMode should be cleared, got {:?}",
+            v.get("viewMode")
+        );
+    }
+
+    #[test]
+    fn inherit_and_deliberate_off_fingerprint_differently() {
+        // If these collided, switching a project from "inherit" to an explicit
+        // "off" would not recreate the container and the change would silently
+        // not apply.
+        let inherit = ClaudeCodeSettings { focus_mode: None, ..Default::default() };
+        let off = ClaudeCodeSettings { focus_mode: Some(false), ..Default::default() };
+        assert_ne!(
+            compute_claude_code_settings_fingerprint(Some(&inherit), false),
+            compute_claude_code_settings_fingerprint(Some(&off), false),
+        );
+    }
+
+    #[test]
     fn split_payload_never_emits_a_null_to_an_older_entrypoint() {
         // An existing project recreates from its own snapshot, which carries
         // whatever entrypoint it was built with. An older one merges with a
@@ -3713,7 +3768,7 @@ mod tests {
         // managed key would silently stop being asserted.
         let settings = ClaudeCodeSettings {
             tui_mode: Some("fullscreen".to_string()),
-            focus_mode: true,
+            focus_mode: Some(true),
             ..Default::default()
         };
         let payload = build_claude_code_settings_json(Some(&settings), true);
@@ -3752,10 +3807,10 @@ mod tests {
         let on = ClaudeCodeSettings {
             tui_mode: Some("fullscreen".to_string()),
             effort: Some("xhigh".to_string()),
-            auto_scroll_disabled: true,
-            focus_mode: true,
-            show_thinking_summaries: true,
-            session_recap_disabled: true,
+            auto_scroll_disabled: Some(true),
+            focus_mode: Some(true),
+            show_thinking_summaries: Some(true),
+            session_recap_disabled: Some(true),
             ..Default::default()
         };
         let hot = settings_json(Some(&on), true);
@@ -3801,7 +3856,7 @@ mod tests {
     fn the_settings_payload_uses_the_key_names_claude_code_actually_reads() {
         let s = ClaudeCodeSettings {
             effort: Some("high".to_string()),
-            focus_mode: true,
+            focus_mode: Some(true),
             ..Default::default()
         };
         let json = settings_json(Some(&s), false);
@@ -3835,7 +3890,7 @@ mod tests {
         // has to be "don't interfere". Getting this backwards would have
         // silently disabled recaps for every existing project.
         let untouched = ClaudeCodeSettings::default();
-        assert!(!untouched.session_recap_disabled);
+        assert_eq!(untouched.session_recap_disabled, None);
         assert_eq!(
             settings_json(Some(&untouched), false)["awaySummaryEnabled"],
             serde_json::Value::Null
@@ -3847,7 +3902,7 @@ mod tests {
         // `container_needs_recreation` is label-based and never diffs env, so
         // the settings only reach a container if the fingerprint moves.
         let on = ClaudeCodeSettings {
-            focus_mode: true,
+            focus_mode: Some(true),
             ..Default::default()
         };
         let off = ClaudeCodeSettings::default();
@@ -3856,7 +3911,7 @@ mod tests {
             compute_claude_code_settings_fingerprint(Some(&off), false),
         );
         let recap_off = ClaudeCodeSettings {
-            session_recap_disabled: true,
+            session_recap_disabled: Some(true),
             ..Default::default()
         };
         assert_ne!(
@@ -3917,7 +3972,7 @@ mod tests {
         // The whole point of B3: `=1` when enabled was a no-op against a
         // feature that was already on, and there was no off path at all.
         let off = ClaudeCodeSettings {
-            session_recap_disabled: true,
+            session_recap_disabled: Some(true),
             ..Default::default()
         };
         assert!(claude_code_env_vars(Some(&off))

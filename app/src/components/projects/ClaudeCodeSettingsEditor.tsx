@@ -8,29 +8,44 @@ interface Props {
   disabled: boolean;
   disabledReason?: string;
   onSave: (settings: ClaudeCodeSettings | null) => Promise<unknown>;
+  /**
+   * `"project"` adds a third "Global" state to every switch, because a project
+   * has somewhere to inherit *from*. The global editor has no such fallback —
+   * unset there just means Claude Code's own default — so it stays a plain
+   * on/off and never renders the extra choice.
+   */
+  scope?: "global" | "project";
 }
 
 export const CLAUDE_CODE_DEFAULTS: ClaudeCodeSettings = {
   tui_mode: null,
   effort: null,
-  auto_scroll_disabled: false,
-  focus_mode: false,
-  show_thinking_summaries: false,
-  session_recap_disabled: false,
-  env_scrub: false,
-  prompt_caching_1h: false,
+  auto_scroll_disabled: null,
+  focus_mode: null,
+  show_thinking_summaries: null,
+  session_recap_disabled: null,
+  env_scrub: null,
+  prompt_caching_1h: null,
 };
 
+/**
+ * "Nothing is set at this level", which is saved as `null` rather than as a
+ * struct of nulls so that a project with no opinion is indistinguishable from
+ * one that never opened this editor.
+ *
+ * Note `false` is *not* a default any more: it is a deliberate off that
+ * overrides a global on, so a settings object holding one has to be persisted.
+ */
 function isAllDefaults(s: ClaudeCodeSettings): boolean {
   return (
     s.tui_mode === null &&
     s.effort === null &&
-    s.auto_scroll_disabled === false &&
-    s.focus_mode === false &&
-    s.show_thinking_summaries === false &&
-    s.session_recap_disabled === false &&
-    s.env_scrub === false &&
-    s.prompt_caching_1h === false
+    s.auto_scroll_disabled === null &&
+    s.focus_mode === null &&
+    s.show_thinking_summaries === null &&
+    s.session_recap_disabled === null &&
+    s.env_scrub === null &&
+    s.prompt_caching_1h === null
   );
 }
 
@@ -83,6 +98,7 @@ export default function ClaudeCodeSettingsEditor({
   disabled,
   disabledReason,
   onSave,
+  scope = "global",
 }: Props) {
   const [local, setLocal] = useState<ClaudeCodeSettings>(
     settings ?? { ...CLAUDE_CODE_DEFAULTS },
@@ -151,23 +167,71 @@ export default function ClaudeCodeSettingsEditor({
         }
       />
 
-      {BOOLEAN_FIELDS.map(({ key, label, hint, invert }) => (
-        <SwitchRow
-          key={key}
-          label={label}
-          hint={hint}
-          control={
-            <Toggle
+      {BOOLEAN_FIELDS.map(({ key, label, hint, invert }) => {
+        const stored = local[key];
+
+        if (scope === "global") {
+          // No level above this one to inherit from, so "unset" and "off" are
+          // the same instruction here and a plain switch is the honest control.
+          // Unset therefore has to *display* as Claude Code's own default —
+          // which for the two inverted fields is on, not off.
+          const checked = invert ? stored !== true : stored === true;
+          return (
+            <SwitchRow
+              key={key}
               label={label}
-              checked={invert ? !local[key] : local[key]}
-              disabled={disabled}
-              onChange={(v) =>
-                apply({ [key]: invert ? !v : v } as Partial<ClaudeCodeSettings>)
+              hint={hint}
+              control={
+                <Toggle
+                  label={label}
+                  checked={checked}
+                  disabled={disabled}
+                  onChange={(v) => {
+                    // Collapse back to null at the default rather than storing
+                    // a redundant `false`, so an untouched global stays
+                    // indistinguishable from one that was never opened.
+                    const atDefault = invert ? v : !v;
+                    apply({
+                      [key]: atDefault ? null : invert ? !v : v,
+                    } as Partial<ClaudeCodeSettings>);
+                  }}
+                />
               }
             />
-          }
-        />
-      ))}
+          );
+        }
+
+        // `stored` holds the deviation from Claude Code's default, so an
+        // inverted field reads back the other way round — see BOOLEAN_FIELDS.
+        const selected =
+          stored === null ? "global" : (invert ? !stored : stored) ? "on" : "off";
+
+        return (
+          <SwitchRow
+            key={key}
+            label={label}
+            hint={hint}
+            control={
+              <select
+                value={selected}
+                aria-label={label}
+                disabled={disabled}
+                onChange={(e) => {
+                  const choice = e.target.value;
+                  const next =
+                    choice === "global" ? null : invert ? choice === "off" : choice === "on";
+                  apply({ [key]: next } as Partial<ClaudeCodeSettings>);
+                }}
+                className={selectClass}
+              >
+                <option value="global">Global</option>
+                <option value="off">Off</option>
+                <option value="on">On</option>
+              </select>
+            }
+          />
+        );
+      })}
     </div>
   );
 }
