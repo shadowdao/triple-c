@@ -213,7 +213,6 @@ pub fn run() {
     let lifecycle_setup = lifecycle.clone();
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         // Drag a file from the Files tab onto the host desktop. The gesture is

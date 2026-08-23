@@ -13,7 +13,6 @@ path = "src/main.rs"
 
 [dependencies]
 tauri = { version = "2", features = ["image-png", "image-ico"] }
-tauri-plugin-store = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }

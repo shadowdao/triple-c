@@ -96,6 +96,13 @@ pub enum ProjectOp {
     /// write `:latest`, but it must not run while the container is being
     /// removed out from under it.
     CacheClear,
+    /// `container::scrub_secrets_from_snapshots` — the third writer of
+    /// `triple-c-snapshot-{id}:latest`, reached from `clear_claude_token`. It
+    /// creates a scratch container from the snapshot and commits back over the
+    /// same tag, so it is the same read-modify-write shape as a compaction and
+    /// loses the same race: any `:latest` move landing between its create and
+    /// its commit is overwritten by an image derived from the pre-read state.
+    SecretScrub,
 }
 
 impl ProjectOp {
@@ -108,6 +115,7 @@ impl ProjectOp {
             ProjectOp::Reset => "This project is being reset",
             ProjectOp::Destroy => "Something of this project's is being deleted",
             ProjectOp::CacheClear => "This project's caches are being cleared",
+            ProjectOp::SecretScrub => "A revoked credential is being removed from this project's snapshot",
         }
     }
 
@@ -120,6 +128,7 @@ impl ProjectOp {
             ProjectOp::Reset => "resetting it",
             ProjectOp::Destroy => "deleting anything of its",
             ProjectOp::CacheClear => "clearing its caches",
+            ProjectOp::SecretScrub => "removing a credential from its snapshot",
         }
     }
 }

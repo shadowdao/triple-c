@@ -394,6 +394,60 @@ fn the_daemon_wide_buckets_leave_a_young_container_alone() {
 }
 
 #[test]
+fn a_claimed_scrub_container_is_spared_however_old_it_looks() {
+    // Age is the backstop, not the rule. A credential rewrite that outruns the
+    // 15-minute gate — a slow daemon, a huge snapshot, a machine asleep between
+    // the create and the commit — must still not be force-removed while this
+    // process is holding the project's claim, because killing it there leaves
+    // the revoked token baked into the snapshot's `Config.Env`.
+    let project_id = "11111111-2222-3333-4444-555555555555";
+    let now = chrono::Utc::now().timestamp();
+
+    let mut scrub = summary(&["/triple-c-scrub-deadbeef"], &[]);
+    scrub.image = Some(format!("triple-c-snapshot-{}:latest", project_id));
+    // Far past any age gate, so nothing but the claim can spare it.
+    scrub.created = Some(now - SCRATCH_CONTAINER_MIN_AGE_SECS * 100);
+
+    // Unclaimed: an old leftover, and reapable.
+    assert!(
+        is_reapable_scrub_container(&scrub),
+        "an old, unclaimed scrub container is a leftover"
+    );
+
+    // Claimed: the same container is a live rewrite.
+    let claim = crate::project_lock::try_acquire(project_id, crate::project_lock::ProjectOp::SecretScrub)
+        .expect("nothing else holds this project in a unit test");
+    assert!(
+        !is_reapable_scrub_container(&scrub),
+        "a scrub container whose project is claimed is a live credential rewrite"
+    );
+
+    // And releasing the claim makes it reapable again, so the guard is the
+    // claim itself rather than something sticky.
+    drop(claim);
+    assert!(is_reapable_scrub_container(&scrub));
+}
+
+#[test]
+fn a_scrub_containers_project_is_read_off_the_image_it_was_created_from() {
+    // The claim lookup only works if the project id can be recovered from the
+    // container. The name is a bare uuid unrelated to the project, so the image
+    // reference is the only link.
+    let mut scrub = summary(&["/triple-c-scrub-abc"], &[]);
+    scrub.image = Some("triple-c-snapshot-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:latest".to_string());
+    assert_eq!(
+        scrub_container_project(&scrub).as_deref(),
+        Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+    );
+
+    // A leftover whose image has since been removed reads as unowned, and
+    // falls back to the age gate rather than being spared forever.
+    let mut orphaned = scrub.clone();
+    orphaned.image = Some("sha256:0123456789abcdef".to_string());
+    assert_eq!(scrub_container_project(&orphaned), None);
+}
+
+#[test]
 fn a_probe_container_is_matched_on_its_label_not_on_the_daemons_filter() {
     // The `label=triple-c.probe=migration` filter is an exact match and would
     // be enough on its own — but a filter is a string assembled elsewhere in

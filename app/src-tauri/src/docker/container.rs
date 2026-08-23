@@ -217,6 +217,10 @@ pub const SECRET_ENV_KEYS: &[&str] = &[
 /// commits. [`sweep_orphaned_snapshots`] treats it as the mark of provenance,
 /// which is what keeps the sweep away from the user's own images.
 pub(crate) const LABEL_MANAGED: &str = "triple-c.managed";
+/// Marks the throwaway container [`rewrite_image_without_secrets`] commits
+/// from. It exists so the Disk panel's reclaim bucket can distinguish a live
+/// credential rewrite from a leftover by label rather than by age.
+pub(crate) const LABEL_SCRUB: &str = "triple-c.scrub";
 
 /// Marks the image built from `container/Dockerfile` itself, as opposed to a
 /// project snapshot committed from a container. Only ever `"true"` on a base
@@ -2826,6 +2830,37 @@ pub async fn scrub_secrets_from_snapshots() -> SnapshotScrubReport {
             continue;
         }
 
+        // Claim the project before touching its snapshot.
+        //
+        // This is the third writer of `triple-c-snapshot-{id}:latest`, after a
+        // recreate's commit and a compaction, and it has the same
+        // read-modify-write shape: create a scratch container *from* the
+        // snapshot, then commit back over the same tag. A `:latest` move
+        // landing in between is silently overwritten by an image derived from
+        // the pre-read state — which here would mean re-baking the very
+        // credential this function exists to remove.
+        //
+        // A snapshot whose project is busy is left for the next call rather
+        // than rewritten unsafely, and it is *reported*: silently skipping a
+        // credential removal is the one outcome worse than failing it.
+        let project_id = summary
+            .repo_tags
+            .iter()
+            .find_map(|t| crate::docker::migration::parse_snapshot_reference(t))
+            .map(|(id, _tag)| id);
+        let _claim = match project_id.as_deref() {
+            Some(id) => match crate::project_lock::try_acquire(id, crate::project_lock::ProjectOp::SecretScrub) {
+                Ok(guard) => Some(guard),
+                Err(reason) => {
+                    report.failed.push((summary.repo_tags.join(", "), reason));
+                    continue;
+                }
+            },
+            // Not a `triple-c-snapshot-{uuid}` reference despite the filter.
+            // Nothing owns it, so there is nothing to serialise against.
+            None => None,
+        };
+
         // Rewrite every tag this image answers to, so an old tag cannot keep
         // serving the un-scrubbed config.
         let mut all_tags_rewritten = true;
@@ -2884,6 +2919,15 @@ async fn rewrite_image_without_secrets(
 ) -> Result<(), String> {
     let scratch_name = format!("triple-c-scrub-{}", uuid::Uuid::new_v4().simple());
 
+    // `triple-c.scrub=true` so the Disk panel's scrub-container bucket can tell
+    // a *live* rewrite from a leftover by label rather than by age. An age gate
+    // alone was the previous discriminator, and a clock is a poor proxy for
+    // "somebody is using this": killing this container between the create and
+    // the commit below leaves the revoked credential baked into the snapshot's
+    // `Config.Env`, which is precisely the state this function exists to end.
+    let scratch_labels: HashMap<String, String> =
+        HashMap::from([(LABEL_SCRUB.to_string(), "true".to_string())]);
+
     let created = docker
         .create_container(
             Some(CreateContainerOptions {
@@ -2892,6 +2936,7 @@ async fn rewrite_image_without_secrets(
             }),
             Config::<String> {
                 image: Some(source_image.to_string()),
+                labels: Some(scratch_labels),
                 // Deliberately nothing else. The container is never started;
                 // its only job is to be a config to commit from, and every
                 // field left unset here is inherited from the image and
@@ -4240,53 +4285,39 @@ mod tests {
     /// against the same wording in `fold_shell_script`.
     #[cfg(unix)]
     #[test]
-    fn the_scrub_script_survives_being_folded_onto_one_run_line() {
-        use std::io::Write;
-        use std::process::{Command, Stdio};
-
-        let script = snapshot_scrub_script();
-        for line in script.lines() {
-            // A `#` only starts a comment at the beginning of a word, so the
-            // quoted `###TRIPLE-C-SCRUBBED` marker is fine; anything else is a
-            // comment that eats the rest of the program once folded.
-            assert!(
-                !line.trim_start().starts_with('#') && !line.contains(" #"),
-                "a `#` comment swallows the rest of the program once folded: {}",
-                line
-            );
-        }
-        let folded = script
+    fn a_compaction_runs_this_module_s_scrub_script_byte_for_byte() {
+        // The compaction build used to fold the script onto one `RUN` line by
+        // joining its lines with a space, which turned `for p in …; do` into
+        // `do` in statement position and made every compaction fail with
+        // `syntax error: unexpected "do"`. That fold is gone — `disk.rs` now
+        // emits the JSON exec form, whose string escapes carry newlines — so
+        // the assertion worth pinning from this side is no longer "the folded
+        // one-liner still parses" but the stronger one: whatever encoding
+        // `disk.rs` chooses, the bytes that reach `sh` are *this* script.
+        //
+        // This is what stops the two files drifting. `container.rs` owns the
+        // containment rules in `snapshot_scrub_script`; a compaction that ran a
+        // mangled copy would be running a scrub with those rules altered, and
+        // the mangling would be silent.
+        let expected = snapshot_scrub_script();
+        // Build the real Dockerfile the compaction would, then pull the script
+        // back out of it — going through `compaction_dockerfile` rather than a
+        // helper means a change to how the RUN line is emitted is caught here.
+        let dockerfile = crate::docker::disk::compaction_dockerfile(
+            "triple-c-snapshot-00000000-0000-0000-0000-000000000000:latest",
+            &expected,
+        );
+        let run_line = dockerfile
             .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(!folded.contains('\n'));
-
-        for candidate in [script.as_str(), folded.as_str()] {
-            let mut child = Command::new("/bin/sh")
-                .arg("-n")
-                .stdin(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("spawn /bin/sh -n");
-            child
-                .stdin
-                .take()
-                .expect("stdin")
-                .write_all(candidate.as_bytes())
-                .expect("write the script");
-            let out = child.wait_with_output().expect("wait");
-            assert!(
-                out.status.success(),
-                "the scrub script does not parse: {}\n---\n{}",
-                String::from_utf8_lossy(&out.stderr),
-                candidate
-            );
-        }
+            .find(|l| l.starts_with("RUN "))
+            .expect("the compaction Dockerfile should carry a RUN line");
+        let actual = crate::docker::disk::script_from_run_line(run_line)
+            .expect("the compaction RUN line should be the JSON exec form");
+        assert_eq!(
+            actual, expected,
+            "the compaction runs a different script than snapshot_scrub_script() produces"
+        );
     }
-
-    // ── Container log rotation (A2) ──────────────────────────────────────────
 
     #[test]
     fn every_container_is_created_with_a_bounded_log() {

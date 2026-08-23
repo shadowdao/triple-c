@@ -2455,11 +2455,36 @@ fn is_scrub_container(summary: &ContainerSummary) -> bool {
         .any(|name| name.trim_start_matches('/').starts_with("triple-c-scrub-"))
 }
 
-/// A scrub container this module is allowed to force-remove: ours *and* old
-/// enough not to be a live rewrite. This is the predicate the survey and the
-/// reclaim both use; [`is_scrub_container`] answers only "is this name ours".
+/// A scrub container this module is allowed to force-remove: ours, *not*
+/// currently claimed, and old enough not to be a live rewrite. This is the
+/// predicate the survey and the reclaim both use; [`is_scrub_container`]
+/// answers only "is this name ours".
+///
+/// The label is the real discriminator and the age is the backstop. A live
+/// rewrite now carries `triple-c.scrub=true` **and** holds its project's
+/// `ProjectOp::SecretScrub` claim, so within this process the answer is exact.
+/// Age still matters because the claim is process-local: a second app instance
+/// mid-rewrite is invisible here, and killing that container between its create
+/// and its commit leaves the revoked credential baked into the snapshot's
+/// `Config.Env` — the state `scrub_secrets_from_snapshots` exists to end.
 fn is_reapable_scrub_container(summary: &ContainerSummary) -> bool {
-    is_scrub_container(summary) && is_stale_scratch(summary)
+    if !is_scrub_container(summary) {
+        return false;
+    }
+    if scrub_container_project(summary)
+        .is_some_and(|id| crate::project_lock::is_held_by(&id, crate::project_lock::ProjectOp::SecretScrub))
+    {
+        return false;
+    }
+    is_stale_scratch(summary)
+}
+
+/// The project a live scrub container is rewriting, read off the image it was
+/// created from. `None` when the image is not a `triple-c-snapshot-*`
+/// reference, which is the case for a leftover whose image has since gone.
+fn scrub_container_project(summary: &ContainerSummary) -> Option<String> {
+    let image = summary.image.as_deref()?;
+    crate::docker::migration::parse_snapshot_reference(image).map(|(id, _tag)| id)
 }
 
 /// How old a `triple-c-scrub-*` / `triple-c-compact-*` scratch container must be
