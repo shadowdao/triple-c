@@ -836,8 +836,14 @@ export interface ProjectDiskRow {
   /** Bytes shared with another image — almost always the base. */
   snapshot_shared_bytes: number;
   /** Layers stacked above the base image: **one per container recreation**.
-   *  This is the number that explains why a snapshot grows. */
+   *  This is the number that explains why a snapshot grows — but only when
+   *  `base_lineage_known` is true. Otherwise it counts the base's layers too. */
   snapshot_commit_layers: number;
+  /** Whether the base image this snapshot descends from could be identified.
+   *  False is the normal case for a project created before the
+   *  `triple-c.base-image-id` label existed; the layer count must not be
+   *  presented as a recreation count then. */
+  base_lineage_known: boolean;
   /** Bytes those layers account for. `null` when the base image is gone and
    *  the split cannot be measured — never a guess. */
   snapshot_above_base_bytes: number | null;
@@ -989,7 +995,11 @@ export interface ReclaimPlan {
 }
 
 export interface ReclaimResult {
-  target: ReclaimTarget;
+  /** The reclaim target this reports on, or `null` when it reports a destroy.
+   *  Exactly one of `target` / `destroyed` is ever set — a destroy used to come
+   *  back wearing a `ReclaimTarget` that named work it had not done. */
+  target: ReclaimTarget | null;
+  destroyed: DestructiveTarget | null;
   ok: boolean;
   freed_bytes: number;
   /** What was projected beforehand, for the one action that projects. */

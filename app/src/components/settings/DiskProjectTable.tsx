@@ -11,6 +11,12 @@ interface Props {
   onDestroy: (item: DestructiveItem) => void;
 }
 
+const LAYERS_HELP =
+  "Commit layers stacked above the base image — one for every time this project's container was recreated. Nothing merges them, so each one is paid for permanently until the snapshot is compacted.";
+
+const NEXT_COMMIT_HELP =
+  "The container's writable layer. This is exactly what the next recreation will stack onto the snapshot, and it never comes back after that.";
+
 /** `—` for a column with nothing in it, so an empty cell never reads as zero. */
 function cell(bytes: number, present: boolean) {
   return present ? formatBytes(bytes) : "—";
@@ -59,11 +65,18 @@ export default function DiskProjectTable({ rows, destructive, onDestroy }: Props
             </th>
             <th scope="col" className="font-medium py-1.5 px-3 text-right whitespace-nowrap">
               Layers
-              <Tooltip text="Commit layers stacked above the base image — one for every time this project's container was recreated. Nothing merges them, so each one is paid for permanently until the snapshot is compacted." />
+              {/* `Tooltip` renders a portalled div with no `role` and no
+                  `aria-describedby`, so its text reaches no assistive tech and
+                  the trigger announces as "Help". These two headers are
+                  meaningless without their explanation, so it is also emitted
+                  as screen-reader-only text. */}
+              <Tooltip text={LAYERS_HELP} />
+              <span className="sr-only"> — {LAYERS_HELP}</span>
             </th>
             <th scope="col" className="font-medium py-1.5 px-3 text-right whitespace-nowrap">
               Next commit adds
-              <Tooltip text="The container's writable layer. This is exactly what the next recreation will stack onto the snapshot, and it never comes back after that." />
+              <Tooltip text={NEXT_COMMIT_HELP} />
+              <span className="sr-only"> — {NEXT_COMMIT_HELP}</span>
             </th>
             <th scope="col" className="font-medium py-1.5 px-3 text-right">
               Home vol
@@ -104,7 +117,12 @@ export default function DiskProjectTable({ rows, destructive, onDestroy }: Props
                   </span>
                 </th>
                 <td className="py-1.5 px-3 text-right tabular-nums whitespace-nowrap">
-                  {cell(row.snapshot_above_base_bytes ?? 0, row.snapshot_exists)}
+                  {/* `null` means the split could not be measured. Rendering it
+                      as 0 B would be the one guessed number in this table. */}
+                  {cell(
+                    row.snapshot_above_base_bytes ?? -1,
+                    row.snapshot_exists && row.snapshot_above_base_bytes !== null,
+                  )}
                   {row.snapshot_exists && (
                     <span className="block text-[11px] text-[var(--text-secondary)]">
                       {/* The base is shared by every project, so charging it to
@@ -117,18 +135,28 @@ export default function DiskProjectTable({ rows, destructive, onDestroy }: Props
                   )}
                 </td>
                 <td className="py-1.5 px-3 text-right tabular-nums">
-                  {row.snapshot_exists ? (
-                    <span
-                      className={
-                        row.snapshot_commit_layers > 5
-                          ? "text-[var(--warning)]"
-                          : "text-[var(--text-primary)]"
-                      }
-                    >
-                      {row.snapshot_commit_layers}
-                    </span>
-                  ) : (
+                  {!row.snapshot_exists ? (
                     "—"
+                  ) : !row.base_lineage_known ? (
+                    // The base this descends from is unknown, so the count
+                    // includes the base's own layers and does not mean
+                    // "recreations". Saying so beats printing a wrong number.
+                    <Tooltip
+                      text={`${row.snapshot_commit_layers} layers in total, but this project predates the base-image label, so there is no way to tell which of them are commits. Migrating it to the current base restores the count.`}
+                    >
+                      <span className="text-[var(--text-secondary)]">unknown</span>
+                    </Tooltip>
+                  ) : (
+                    <span className="text-[var(--text-primary)]">
+                      {row.snapshot_commit_layers}
+                      {/* Never colour alone: a count worth acting on says so in
+                          a word, which is also what a screen reader gets. */}
+                      {row.snapshot_commit_layers > 5 && (
+                        <span className="ml-1 text-[11px] text-[var(--warning)]">
+                          stacked
+                        </span>
+                      )}
+                    </span>
                   )}
                 </td>
                 <td className="py-1.5 px-3 text-right tabular-nums whitespace-nowrap">

@@ -45,6 +45,24 @@ describe("formatBytes", () => {
     expect(formatBytes(2_500_000_000_000)).toBe("2.5 TB");
   });
 
+  it("promotes the unit when rounding lands on a whole step", () => {
+    // `toFixed` runs after the divide loop, so a value just under a boundary
+    // rounds up into a unit the loop had already ruled out. This is the app's
+    // only byte formatter and the panel is full of near-boundary sizes.
+    expect(formatBytes(999_999)).toBe("1.0 MB");
+    expect(formatBytes(999_999_999)).toBe("1.0 GB");
+    expect(formatBytes(999_999_999_999)).toBe("1.0 TB");
+    expect(formatBytes(1_048_575, { binary: true })).toBe("1.0 MB");
+
+    // Just below the rounding threshold it must NOT promote.
+    expect(formatBytes(999_949)).toBe("999.9 KB");
+    expect(formatBytes(999_400, { precision: 0 })).toBe("999 KB");
+
+    // The top unit has nowhere to go: it renders a whole step rather than
+    // running off the end of the unit array.
+    expect(formatBytes(999_999_999_999_999_999)).toBe("1000.0 PB");
+  });
+
   it("renders an em dash for a size the daemon did not compute", () => {
     // Docker reports -1 for "not calculated" on shared sizes and volume ref
     // counts. `NaN GB` in the middle of a table is worse than nothing.

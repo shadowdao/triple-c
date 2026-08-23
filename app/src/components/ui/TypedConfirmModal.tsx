@@ -1,4 +1,4 @@
-import { useRef, useState, type ReactNode } from "react";
+import { useId, useRef, useState, type ReactNode } from "react";
 import Modal from "./Modal";
 import Button from "./Button";
 import { inputClass } from "./Field";
@@ -47,6 +47,9 @@ export default function TypedConfirmModal({
 }: Props) {
   const [typed, setTyped] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
+  // Every other `ui/` component uses `useId`; a hardcoded id breaks the
+  // label association as soon as two of these are mounted at once.
+  const inputId = useId();
   const matches = expected.trim().length > 0 && typed.trim() === expected.trim();
 
   return (
@@ -80,13 +83,13 @@ export default function TypedConfirmModal({
         {children}
         <div>
           <label
-            htmlFor="typed-confirm-input"
+            htmlFor={inputId}
             className="block text-[13px] text-[var(--text-primary)] mb-1.5"
           >
             Type <strong className="font-mono">{expected}</strong> to confirm
           </label>
           <input
-            id="typed-confirm-input"
+            id={inputId}
             ref={inputRef}
             value={typed}
             onChange={(e) => setTyped(e.target.value)}

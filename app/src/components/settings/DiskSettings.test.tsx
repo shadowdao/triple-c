@@ -35,6 +35,7 @@ const row = (over: Partial<ProjectDiskRow> = {}): ProjectDiskRow => ({
   snapshot_bytes: 12_273_392_374,
   snapshot_shared_bytes: 3_832_425_659,
   snapshot_commit_layers: 14,
+  base_lineage_known: true,
   snapshot_above_base_bytes: 8_440_966_715,
   container_exists: true,
   container_running: false,
@@ -170,6 +171,36 @@ describe("DiskSettings", () => {
     expect(within(projectRow).getByText("14.6 GB")).toBeInTheDocument();
   });
 
+  it("refuses to present a layer count that does not mean recreations", async () => {
+    // Without `triple-c.base-image-id` — the normal case for a project created
+    // before that label existed — the count includes the base's own ~15 layers.
+    // Printing it beside a header that says "one per recreation" would be a
+    // wrong number in the column the table exists for.
+    getDockerDiskUsage.mockResolvedValue(
+      report({ projects: [row({ base_lineage_known: false, snapshot_commit_layers: 17 })] }),
+    );
+    await renderAndScan();
+    const projectRow = await screen.findByTestId("disk-row-p-whp");
+    expect(within(projectRow).getByText("unknown")).toBeInTheDocument();
+    expect(within(projectRow).queryByText("17")).not.toBeInTheDocument();
+  });
+
+  it("renders an unmeasurable snapshot split as a dash, never as zero", async () => {
+    getDockerDiskUsage.mockResolvedValue(
+      report({ projects: [row({ snapshot_above_base_bytes: null })] }),
+    );
+    await renderAndScan();
+    const projectRow = await screen.findByTestId("disk-row-p-whp");
+    expect(within(projectRow).queryByText("0 B")).not.toBeInTheDocument();
+    expect(within(projectRow).getAllByText("—").length).toBeGreaterThan(0);
+  });
+
+  it("marks a heavily stacked snapshot with a word, not just a colour", async () => {
+    await renderAndScan();
+    const projectRow = await screen.findByTestId("disk-row-p-whp");
+    expect(within(projectRow).getByText("stacked")).toBeInTheDocument();
+  });
+
   it("charges the shared base to the globals, not to every project row", async () => {
     // The base is one 4.7 GB image every project descends from. Counting it per
     // row would show it eight times and make the column meaningless.
@@ -216,6 +247,45 @@ describe("DiskSettings", () => {
       fireEvent.click(screen.getByRole("button", { name: "Reclaim" }));
     });
     expect(reclaim).toHaveBeenCalledWith([{ kind: "migration_staging" }]);
+  });
+
+  it("clears the tick list once the reclaim has run", async () => {
+    // The plan's rows describe objects the reclaim just removed; leaving them
+    // ticked lets the user fire the same call again against nothing.
+    await renderAndScan();
+    await screen.findByTestId("disk-safe-bucket");
+    fireEvent.click(screen.getAllByRole("checkbox")[0]);
+    expect(screen.getByText(/1 selected/)).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Reclaim" }));
+    });
+    expect(screen.queryByTestId("disk-safe-bucket")).not.toBeInTheDocument();
+    expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
+    // And it says why the list is gone rather than claiming nothing was found.
+    expect(screen.getByTestId("disk-plan-stale").textContent).toMatch(
+      /measured before that last action/,
+    );
+  });
+
+  it("says why the build-cache figure is the under-reporting one", async () => {
+    // Without this, a `buildx du` failure silently shows `docker system df`'s
+    // number, which under-reports what a prune would free.
+    getDockerDiskUsage.mockResolvedValue(
+      report({
+        build_cache: {
+          total_bytes: 28_000_000_000,
+          reclaimable_bytes: 1_000_000,
+          stale_bytes: 0,
+          source: "system df",
+          cli_error: "`docker buildx du` failed: executable not found",
+        },
+      }),
+    );
+    await renderAndScan();
+    const globals = await screen.findByTestId("disk-globals");
+    expect(globals.textContent).toMatch(/under-reports what a prune would free/);
+    expect(globals.textContent).toMatch(/executable not found/);
   });
 
   it("cannot reclaim with nothing ticked", async () => {
@@ -380,9 +450,7 @@ describe("DiskSettings", () => {
     );
     await renderAndScan();
     const note = await screen.findByTestId("disk-vhdx-note");
-    expect(
-      within(note).getByText("Reclaiming here will not shrink your C: drive"),
-    ).toBeInTheDocument();
+    expect(note.textContent).toMatch(/Warning: reclaiming here will not shrink your C: drive/);
     expect(within(note).getByText(/wsl --shutdown/)).toBeInTheDocument();
     expect(within(note).getByText(/Optimize-VHD/)).toBeInTheDocument();
     expect(within(note).getByText(/Purge data/)).toBeInTheDocument();
@@ -415,7 +483,8 @@ describe("DiskSettings", () => {
       }),
     );
     destroyProjectDiskObject.mockResolvedValue({
-      target: { kind: "orphan_volume", name: "triple-c-claude-config-p-whp" },
+      target: null,
+      destroyed: { kind: "config_volume", project_id: "p-whp" },
       ok: true,
       freed_bytes: 427_000_000,
       projected_bytes: null,
@@ -450,6 +519,57 @@ describe("DiskSettings", () => {
     );
   });
 
+  it("keeps the confirmation open and busy while the deletion runs", async () => {
+    // The modal used to be unmounted before the call was awaited, which made
+    // its whole busy path dead code and left a multi-second volume removal with
+    // no indication it was happening.
+    listReclaimable.mockResolvedValue(
+      plan({
+        destructive: [
+          {
+            target: { kind: "home_volume", project_id: "p-whp" },
+            project_id: "p-whp",
+            project_name: "whp",
+            label: "Home volume",
+            loses: "Shell history and toolchains.",
+            bytes: 4_860_000_000,
+            blocked: null,
+          },
+        ],
+      }),
+    );
+    let finish: (value: unknown) => void = () => {};
+    destroyProjectDiskObject.mockReturnValue(new Promise((r) => (finish = r)));
+
+    await renderAndScan();
+    await screen.findByTestId("disk-row-p-whp");
+    fireEvent.click(screen.getByRole("button", { name: "Delete whp data" }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("menuitem", { name: /Delete home volume/ }));
+    });
+
+    const dialog = screen.getByRole("dialog");
+    fireEvent.change(within(dialog).getByLabelText(/Type/), { target: { value: "whp" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Delete home volume" }));
+
+    // Still open, and saying so.
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Working…" })).toBeDisabled(),
+    );
+
+    await act(async () => {
+      finish({
+        target: null,
+        destroyed: { kind: "home_volume", project_id: "p-whp" },
+        ok: true,
+        freed_bytes: 4_860_000_000,
+        projected_bytes: null,
+        message: "Removed volume.",
+      });
+    });
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  });
+
   it("never routes a destructive object through the bulk Reclaim button", async () => {
     listReclaimable.mockResolvedValue(
       plan({
@@ -479,6 +599,7 @@ describe("DiskSettings", () => {
       results: [
         {
           target: { kind: "compact_snapshot", project_id: "p-whp" },
+          destroyed: null,
           ok: true,
           freed_bytes: 5_100_000_000,
           projected_bytes: 7_000_000_000,
@@ -499,7 +620,7 @@ describe("DiskSettings", () => {
     expect(within(outcome).getByText(/projected up to 7\.0 GB, actually 5\.1 GB/)).toBeInTheDocument();
   });
 
-  it("surfaces a scan failure rather than showing stale numbers", async () => {
+  it("surfaces a scan failure as an alert", async () => {
     getDockerDiskUsage.mockRejectedValue("Could not read Docker disk usage: no such host");
     render(<DiskSettings />);
     await act(async () => {

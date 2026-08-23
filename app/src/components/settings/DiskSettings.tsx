@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import Button from "../ui/Button";
 import StatusIndicator, { type StatusTone } from "../ui/StatusIndicator";
 import Modal from "../ui/Modal";
@@ -38,11 +38,28 @@ function targetKey(target: ReclaimTarget): string {
  * and the backend refuses it in bulk by taking a different type entirely.
  */
 export default function DiskSettings() {
-  const { report, plan, scanning, working, error, outcome, scan, runReclaim, destroy } =
-    useDiskUsage();
+  const {
+    report,
+    plan,
+    scanning,
+    working,
+    error,
+    outcome,
+    scan,
+    runReclaim,
+    destroy,
+    runSweep,
+    clearOutcome,
+  } = useDiskUsage();
   const [ticked, setTicked] = useState<Set<string>>(new Set());
   const [confirming, setConfirming] = useState<ReclaimItem | null>(null);
   const [destroying, setDestroying] = useState<DestructiveItem | null>(null);
+
+  // The plan is dropped after any reclaim, so a tick can never outlive the row
+  // it was made against and be re-fired at an object that is already gone.
+  useEffect(() => {
+    if (!plan) setTicked(new Set());
+  }, [plan]);
 
   const safeItems = plan?.items.filter((i) => i.safety === "safe") ?? [];
   const semiItems = plan?.items.filter((i) => i.safety === "semi_safe") ?? [];
@@ -112,11 +129,14 @@ export default function DiskSettings() {
               className="border border-[var(--warning)]/40 bg-[var(--warning-muted)] rounded-[var(--radius-panel)] px-3.5 py-3 space-y-2"
               data-testid="disk-vhdx-note"
             >
-              <StatusIndicator
-                tone="error"
-                label="Reclaiming here will not shrink your C: drive"
-                className="text-xs"
-              />
+              {/* `StatusIndicator` has no warning tone — `error` would put a
+                  red glyph in a warning-toned panel. This is advisory, so it
+                  carries its own glyph beside the words rather than relying on
+                  the panel's colour. */}
+              <p className="text-xs font-medium text-[var(--text-primary)]">
+                <span aria-hidden="true">&#9650;</span> Warning: reclaiming here will not
+                shrink your C: drive
+              </p>
               <p className="text-xs text-[var(--text-primary)] leading-relaxed">
                 {report.host.vhdx_note}
               </p>
@@ -203,11 +223,20 @@ export default function DiskSettings() {
                 )}
               </dd>
             </dl>
+            {report.build_cache.cli_error && (
+              <p className="text-[11px] text-[var(--warning)]">
+                {/* Without this the panel silently shows `docker system df`'s
+                    under-reported build-cache figure and the user has no way
+                    to know why it disagrees with their terminal. */}
+                Build-cache figures fell back to <code>docker system df</code>, which
+                under-reports what a prune would free: {report.build_cache.cli_error}
+              </p>
+            )}
             {report.orphan_volumes.length > 0 && (
               <p className="text-[11px] text-[var(--text-secondary)] leading-relaxed">
-                That last figure means only that the volume&rsquo;s project id is not in
-                your project list &mdash; it is <em>not</em> inferred from a project
-                being stopped or having no image. A project you have not opened in a
+                &ldquo;Volumes with no matching project&rdquo; above means only that the
+                volume&rsquo;s project id is not in your project list &mdash; it is{" "}
+                <em>not</em> inferred from a project being stopped or having no image. A project you have not opened in a
                 while has no container and no snapshot either, and that is normal, so
                 each of these is ticked individually and shows the date Docker created
                 it.
@@ -223,7 +252,7 @@ export default function DiskSettings() {
           {/* --- Store failure, if any ------------------------------------ */}
           {report.orphan_volumes_unavailable && (
             <section
-              className="border border-[var(--warning)]/40 bg-[var(--warning-muted)] rounded-[var(--radius-panel)] px-3.5 py-3"
+              className="border border-[var(--error)]/40 bg-[var(--error-muted)] rounded-[var(--radius-panel)] px-3.5 py-3"
               data-testid="disk-store-error"
             >
               <StatusIndicator
@@ -237,7 +266,16 @@ export default function DiskSettings() {
             </section>
           )}
 
+          {/* --- The plan was dropped by a reclaim -------------------------- */}
+          {!plan && (
+            <p className="text-xs text-[var(--text-secondary)]" data-testid="disk-plan-stale">
+              The totals above were measured before that last action. Scan again to see
+              what is left to reclaim.
+            </p>
+          )}
+
           {/* --- Safe reclaim ---------------------------------------------- */}
+          {plan && (
           <section className="space-y-2" data-testid="disk-safe-bucket">
             <h3 className="text-[13px] font-medium text-[var(--text-primary)]">
               Safe to reclaim
@@ -260,7 +298,10 @@ export default function DiskSettings() {
                         <label className="flex items-start gap-2.5 cursor-pointer">
                           <input
                             type="checkbox"
-                            checked={ticked.has(key)}
+                            // A tick that survived onto a now-blocked row is
+                            // excluded from `selected`, so showing it checked
+                            // would make the count disagree with the screen.
+                            checked={item.blocked === null && ticked.has(key)}
                             disabled={item.blocked !== null}
                             onChange={() => toggle(item)}
                             className="mt-0.5 accent-[var(--accent-emphasis)]"
@@ -317,6 +358,7 @@ export default function DiskSettings() {
               </>
             )}
           </section>
+          )}
 
           {/* --- Semi-safe -------------------------------------------------- */}
           {semiItems.length > 0 && (
@@ -371,16 +413,13 @@ export default function DiskSettings() {
 
           {/* --- Sweep ------------------------------------------------------ */}
           <section className="flex items-center gap-3 flex-wrap">
-            <Button
-              size="sm"
-              disabled={working}
-              onClick={() => runReclaim([{ kind: "dangling_snapshots" }])}
-            >
+            <Button size="sm" disabled={working} onClick={runSweep}>
               Sweep superseded images now
             </Button>
             <span className="text-xs text-[var(--text-secondary)]">
-              The same sweep that runs at startup and after every recreation — here you
-              can see what it found.
+              The same sweep that runs at startup and after every recreation. Unlike the
+              tick above it also reports what it <em>refused</em> to remove, which is how
+              a superseded image pinned by a stopped project shows itself.
             </span>
           </section>
         </>
@@ -394,11 +433,16 @@ export default function DiskSettings() {
           aria-live="polite"
           data-testid="disk-outcome"
         >
-          <StatusIndicator
-            tone={outcome.results.every((r) => r.ok) ? "ok" : "error"}
-            label={`Reclaimed ${formatBytes(outcome.total_freed_bytes)}`}
-            className="text-xs"
-          />
+          <div className="flex items-center justify-between gap-3">
+            <StatusIndicator
+              tone={outcome.results.every((r) => r.ok) ? "ok" : "error"}
+              label={`Reclaimed ${formatBytes(outcome.total_freed_bytes)}`}
+              className="text-xs"
+            />
+            <Button size="sm" variant="ghost" onClick={clearOutcome}>
+              Dismiss
+            </Button>
+          </div>
           <ul className="space-y-1 text-xs text-[var(--text-secondary)]">
             {outcome.results.map((result, index) => (
               <li key={index}>
@@ -433,10 +477,11 @@ export default function DiskSettings() {
                 size="md"
                 variant="primary"
                 disabled={working}
-                onClick={() => {
-                  const target = confirming.target;
+                onClick={async () => {
+                  // Same reasoning as the destructive modal: a compaction takes
+                  // minutes, and the dialog reporting it beats it vanishing.
+                  await runReclaim([confirming.target]);
                   setConfirming(null);
-                  void runReclaim([target]);
                 }}
               >
                 {working ? "Working…" : "Run it"}
@@ -487,10 +532,12 @@ export default function DiskSettings() {
           confirmLabel={`Delete ${destroying.label.toLowerCase()}`}
           busy={working}
           onCancel={() => setDestroying(null)}
-          onConfirm={(typed) => {
-            const target = destroying.target;
+          onConfirm={async (typed) => {
+            // The modal stays mounted until the call settles, so its `busy`
+            // state is what the user sees while a multi-second volume removal
+            // runs. Clearing it first made the whole busy path dead code.
+            await destroy(destroying.target, typed);
             setDestroying(null);
-            void destroy(target, typed);
           }}
         >
           <p>

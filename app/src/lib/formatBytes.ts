@@ -1,10 +1,14 @@
 /**
  * The one byte formatter.
  *
- * Before this existed the app had four of them — `projects/home/format.ts`,
+ * The app had four of them — `projects/home/format.ts`,
  * `projects/migrationCopy.ts`, `settings/UpdateDialog.tsx` and an inline
  * `toFixed(1)` in `useProjectActions.ts` — disagreeing about the divisor, the
- * unit labels and the precision. They are now expressed in terms of this.
+ * unit labels and the precision. The first two now delegate here.
+ *
+ * The other two deliberately do not, yet: `UpdateDialog` renders KB at
+ * `toFixed(0)`, so re-pointing it would change what a download size reads as,
+ * and neither is on the Disk panel's path. They are the remaining copies.
  *
  * ## Why the default is base 1000
  *
@@ -14,8 +18,12 @@
  * same build cache would read as a bug in the panel. So decimal is the default
  * and binary is opt-in, rather than the other way round.
  *
- * Both existing conventions are preserved exactly, so re-pointing the old
- * call sites changed no rendered string:
+ * Both existing conventions are preserved for every size either call site can
+ * realistically produce — a file size or a payload size, i.e. a non-negative
+ * finite number below a terabyte. Outside that range this deliberately differs
+ * from what it replaced: a negative or `NaN` input now renders `—` rather than
+ * `-1 B` or `NaN GB`, and the unit ladder continues past GB instead of
+ * stopping there.
  *
  * - `{ }`                        → `41.0 MB`   (decimal, what migration used)
  * - `{ binary: true }`           → `1.5 GB`    (÷1024 with decimal-style
@@ -56,6 +64,17 @@ export function formatBytes(bytes: number, options: FormatBytesOptions = {}): st
     value /= step;
     unit += 1;
   }
+
+  // **Promote again if rounding pushed the value back up to a whole step.**
+  // `toFixed` runs after the loop, so 999,999 B divides to 999.999 KB and then
+  // renders as "1000.0 KB" — a unit the loop had already decided against. The
+  // same happens at every boundary (999,999,999 → "1000.0 MB", and 1,048,575
+  // → "1024.0 KB" in binary).
+  if (unit < units.length - 1 && Number(value.toFixed(precision)) >= step) {
+    value /= step;
+    unit += 1;
+  }
+
   // Whole bytes never get a decimal point: `512 B`, not `512.0 B`.
   return unit === 0
     ? `${Math.round(bytes)} ${units[0]}`
@@ -73,7 +92,7 @@ export function formatBytesDelta(bytes: number, options?: FormatBytesOptions): s
 }
 
 /**
- * `up to 12.3 GB` / `nothing` — for a bound rather than a measurement.
+ * `up to 12.3 GB` — for a bound rather than a measurement.
  *
  * The Disk panel is careful about this distinction: every figure it shows is
  * measured except a compaction's yield, which cannot be known until it runs.

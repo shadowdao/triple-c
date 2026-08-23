@@ -97,7 +97,19 @@ pub struct ProjectDiskRow {
     pub snapshot_shared_bytes: i64,
     /// How many layers the snapshot has stacked **above its base image**. This
     /// is the number that explains the growth: one per recreation.
+    ///
+    /// Only means that when [`Self::base_lineage_known`] is true. Otherwise it
+    /// is every layer carrying bytes, base included — an upper bound, and a
+    /// misleading one to present as a recreation count.
     pub snapshot_commit_layers: u32,
+    /// Whether the base image this snapshot descends from could be identified.
+    ///
+    /// False when `triple-c.base-image-id` is absent, which is the **normal**
+    /// case for a project created before that label existed. The UI must not
+    /// present `snapshot_commit_layers` as a recreation count in that state,
+    /// and compaction is not offered, because a never-recreated project would
+    /// otherwise report its base's ~15 layers and qualify.
+    pub base_lineage_known: bool,
     /// Bytes those stacked layers account for. `None` when the base image the
     /// snapshot descends from is no longer on the daemon, so the split cannot
     /// be measured and must not be guessed.
@@ -422,7 +434,18 @@ pub struct ReclaimOutcome {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ReclaimResult {
-    pub target: ReclaimTarget,
+    /// The reclaim target this reports on, or `None` when it reports a
+    /// [`destroy`].
+    ///
+    /// Deliberately not reused to carry a destructive action: an earlier
+    /// version returned `OrphanVolume { name }` for a home-volume deletion,
+    /// which named a volume that was never an orphan and would attribute the
+    /// outcome to a plan row the user never ticked. `destroyed` carries it
+    /// instead, and exactly one of the two is ever set.
+    pub target: Option<ReclaimTarget>,
+    /// The destructive action this reports on, when it is one.
+    #[serde(default)]
+    pub destroyed: Option<DestructiveTarget>,
     pub ok: bool,
     /// Bytes actually freed, measured after the fact.
     pub freed_bytes: i64,
@@ -763,6 +786,14 @@ pub fn parse_reclaimed_space(output: &str) -> i64 {
 /// [`restore_image_config`], which is why this function does not try to emit it
 /// as Dockerfile instructions. A multi-line `CLAUDE_INSTRUCTIONS` env var alone
 /// makes that escaping a bad bet.
+///
+/// The one label it *does* emit is `triple-c.managed=true`, and it is not
+/// decoration. Everything that cleans up after this build — the discard path
+/// when the result is not smaller, the untag after a successful commit — relies
+/// on `sweep_orphaned_snapshots` collecting the intermediate, and that sweep
+/// filters on `dangling=true` **and** this label. Without it the sweep can
+/// never match, and the flattened intermediate is left to whatever `untag_image`
+/// happens to delete on its own.
 pub fn compaction_dockerfile(snapshot_ref: &str, scrub_script: &str) -> String {
     // The scrub script is multi-line shell. `RUN` takes it verbatim only if the
     // newlines are escaped, so it is folded onto one line with `;` separators —
@@ -773,7 +804,8 @@ pub fn compaction_dockerfile(snapshot_ref: &str, scrub_script: &str) -> String {
         "FROM {snapshot_ref} AS src\n\
          RUN {folded}\n\
          FROM scratch\n\
-         COPY --from=src / /\n"
+         COPY --from=src / /\n\
+         LABEL {LABEL_MANAGED}=true\n"
     )
 }
 
@@ -1000,7 +1032,13 @@ fn projects_json_health() -> (bool, bool) {
 /// `LABEL` lines carries neither label, and a globals block that could not name
 /// the 4.7 GB image every project sits on would be missing the obvious.
 fn is_base_image_reference(reference: &str) -> bool {
-    let repo = reference.split(':').next().unwrap_or(reference);
+    // Split on the *tag*, not the first colon: `localhost:5000/triple-c-sandbox:latest`
+    // has a registry port, and splitting on the first colon would yield
+    // `localhost`. A tag never contains `/`, which is what tells the two apart.
+    let repo = match reference.rsplit_once(':') {
+        Some((repo, tag)) if !tag.contains('/') => repo,
+        _ => reference,
+    };
     repo == "triple-c"
         || repo.ends_with("/triple-c-sandbox")
         || repo == "triple-c-sandbox"
@@ -1081,6 +1119,7 @@ pub async fn scan(projects: &[Project]) -> Result<DiskUsageReport, String> {
         };
 
         let mut stats = LayerStats::default();
+        let mut base_lineage_known = false;
         if let Some(image) = snapshot {
             let history = docker
                 .image_history(&image.id)
@@ -1112,6 +1151,7 @@ pub async fn scan(projects: &[Project]) -> Result<DiskUsageReport, String> {
                 },
                 None => None,
             };
+            base_lineage_known = base_len.is_some();
             stats = layer_stats(&history, base_len);
         }
 
@@ -1140,6 +1180,7 @@ pub async fn scan(projects: &[Project]) -> Result<DiskUsageReport, String> {
             snapshot_bytes,
             snapshot_shared_bytes,
             snapshot_commit_layers: stats.commit_layers,
+            base_lineage_known,
             // Prefer the daemon's own measurement of what is unique to this
             // image over layer arithmetic; fall back to the layer sum when
             // `df()` did not compute a shared size.
@@ -1209,6 +1250,12 @@ pub async fn scan(projects: &[Project]) -> Result<DiskUsageReport, String> {
         }
     }
     base_images.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    // Full size per base, not `size - shared_size`: a base's shared bytes are
+    // shared with *its own snapshots*, so netting them out would report the
+    // 4.7 GB image every project sits on as ~0. The residual imprecision is two
+    // *different* bases that share lower layers with each other, whose common
+    // layers are counted twice here — worth knowing before treating this total
+    // as exact.
     let base_images_bytes = base_images.iter().map(|b| b.bytes).sum();
 
     let (json_exists, json_parsed) = projects_json_health();
@@ -1663,7 +1710,11 @@ pub async fn list_reclaimable(
                 )
             })
             .unwrap_or(0);
-        if row.snapshot_exists && row.snapshot_commit_layers > 1 && ceiling > 0 {
+        if row.snapshot_exists
+            && row.base_lineage_known
+            && row.snapshot_commit_layers > 1
+            && ceiling > 0
+        {
             items.push({
                 // Safety and reach are read off the target, never restated: a literal
                 // here that disagreed with the classifier is exactly the drift this
@@ -1763,7 +1814,9 @@ pub async fn list_reclaimable(
                 project_name: row.project_name.clone(),
                 label: "Home volume".to_string(),
                 loses: "Shell history, dotfiles, every toolchain installed under $HOME, and any \
-                        Playwright browsers. Not recoverable."
+                        Playwright browsers. Not recoverable. The project's container is removed \
+                        too, because a stopped container still holds its volumes open — it is \
+                        rebuilt from the snapshot on the next start."
                     .to_string(),
                 bytes: row.home_volume_bytes,
                 blocked: blocked.clone(),
@@ -1778,7 +1831,9 @@ pub async fn list_reclaimable(
                 project_name: row.project_name.clone(),
                 label: "Claude config volume".to_string(),
                 loses: "The Claude login credential, installed plugins and skills, and EVERY \
-                        conversation transcript for this project. Not recoverable."
+                        conversation transcript for this project. Not recoverable. The project's \
+                        container is removed too, because a stopped container still holds its \
+                        volumes open — it is rebuilt from the snapshot on the next start."
                     .to_string(),
                 bytes: row.config_volume_bytes,
                 blocked: blocked.clone(),
@@ -2112,7 +2167,8 @@ fn find_project<'a>(projects: &'a [Project], project_id: &str) -> Result<&'a Pro
 
 fn failed(target: ReclaimTarget, message: String) -> ReclaimResult {
     ReclaimResult {
-        target,
+        target: Some(target),
+        destroyed: None,
         ok: false,
         freed_bytes: 0,
         projected_bytes: None,
@@ -2196,7 +2252,8 @@ async fn reclaim_dangling(target: &ReclaimTarget) -> ReclaimResult {
         message.push_str(&format!(" {} could not be removed; see the log.", errors));
     }
     ReclaimResult {
-        target: target.clone(),
+        target: Some(target.clone()),
+        destroyed: None,
         ok: errors == 0,
         freed_bytes: freed,
         projected_bytes: None,
@@ -2222,7 +2279,8 @@ async fn reclaim_build_cache(all: bool) -> ReclaimResult {
     }
     match docker_cli(&args).await {
         Ok(output) => ReclaimResult {
-            target,
+            target: Some(target),
+            destroyed: None,
             ok: true,
             freed_bytes: parse_reclaimed_space(&output),
             projected_bytes: None,
@@ -2302,7 +2360,8 @@ async fn reclaim_migration_pins() -> ReclaimResult {
         sweep.reclaimed_bytes
     );
     ReclaimResult {
-        target,
+        target: Some(target),
+        destroyed: None,
         ok: true,
         freed_bytes: sweep.reclaimed_bytes,
         projected_bytes: None,
@@ -2352,7 +2411,8 @@ fn reclaim_migration_staging(projects: &[Project]) -> ReclaimResult {
         }
     }
     ReclaimResult {
-        target,
+        target: Some(target),
+        destroyed: None,
         ok: true,
         freed_bytes: freed,
         projected_bytes: None,
@@ -2407,7 +2467,8 @@ async fn reclaim_containers(
         }
     }
     ReclaimResult {
-        target,
+        target: Some(target),
+        destroyed: None,
         ok: errors == 0,
         freed_bytes: freed,
         projected_bytes: None,
@@ -2459,7 +2520,8 @@ async fn reclaim_orphan_volume(name: &str, projects: &[Project]) -> ReclaimResul
 
     match docker.remove_volume(name, None).await {
         Ok(()) => ReclaimResult {
-            target,
+            target: Some(target),
+            destroyed: None,
             ok: true,
             freed_bytes: volume.bytes,
             projected_bytes: None,
@@ -2606,7 +2668,8 @@ pub async fn compact_snapshot(project: &Project) -> ReclaimResult {
         let _ = migration::untag_image(&staging_ref).await;
         let _ = container::sweep_orphaned_snapshots().await;
         return ReclaimResult {
-            target,
+            target: Some(target),
+            destroyed: None,
             ok: true,
             freed_bytes: 0,
             projected_bytes: projected,
@@ -2647,7 +2710,8 @@ pub async fn compact_snapshot(project: &Project) -> ReclaimResult {
         sweep.removed.len()
     );
     ReclaimResult {
-        target,
+        target: Some(target),
+        destroyed: None,
         ok: true,
         freed_bytes: freed,
         projected_bytes: projected,
@@ -2726,6 +2790,59 @@ async fn build_from_dockerfile(dockerfile: &str, tag: &str) -> Result<(), String
     Ok(())
 }
 
+/// Name prefix for the throwaway container that replays a compacted image's
+/// config. Distinct from `triple-c-scrub-*` on purpose — see
+/// [`restore_image_config`].
+const COMPACTION_CONTAINER_PREFIX: &str = "triple-c-compact-";
+
+/// Remove any container left behind by an interrupted compaction.
+///
+/// Runs at the start of a compaction rather than from a reclaim bucket, so
+/// nothing can ever remove the container of a compaction that is still running:
+/// by the time this is called, this task owns the compaction path.
+async fn remove_stale_compaction_containers() {
+    let Ok(docker) = get_docker() else {
+        return;
+    };
+    let containers = docker
+        .list_containers(Some(ListContainersOptions {
+            all: true,
+            size: false,
+            filters: HashMap::from([(
+                "name".to_string(),
+                vec![COMPACTION_CONTAINER_PREFIX.to_string()],
+            )]),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_or_default();
+    for summary in containers {
+        // Docker's `name` filter is a substring match; the full name decides.
+        if !is_compaction_container(&summary) {
+            continue;
+        }
+        if let Some(id) = summary.id.as_deref() {
+            match container::remove_container(id).await {
+                Ok(()) => log::info!("Removed stale compaction container {}", id),
+                Err(e) => log::warn!("Could not remove stale compaction container {}: {}", id, e),
+            }
+        }
+    }
+}
+
+/// Whether a container is one of ours from an interrupted compaction.
+fn is_compaction_container(summary: &ContainerSummary) -> bool {
+    summary
+        .names
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .any(|name| {
+            name.trim_start_matches('/')
+                .starts_with(COMPACTION_CONTAINER_PREFIX)
+        })
+}
+
 /// Put a captured image config back onto a flattened image, under the original
 /// tag.
 ///
@@ -2748,12 +2865,20 @@ async fn restore_image_config(
     use bollard::image::CommitContainerOptions;
 
     let docker = get_docker()?;
-    // Deliberately the same `triple-c-scrub-*` name `rewrite_image_without_secrets`
-    // uses. If this process dies between the create and the remove below, the
-    // leftover is already covered by the "secret-scrub scratch containers"
-    // bucket in this very panel rather than needing a second reaper. The two
-    // never run at once: `reclaim` executes its targets in sequence.
-    let scratch_name = format!("triple-c-scrub-{}", uuid::Uuid::new_v4().simple());
+
+    // **Its own prefix, not `triple-c-scrub-*`.** An earlier version reused the
+    // secret-rewrite name on the grounds that the existing reclaim bucket would
+    // then collect any leftover. It would — including the live one: that bucket
+    // removes with `force: true`, so a "remove scrub containers" reclaim fired
+    // from a second window while a compaction was mid-flight would destroy the
+    // container the commit is about to run against. Sequential execution inside
+    // one `reclaim` call is not a guarantee when two can be in flight.
+    //
+    // Stale ones are instead swept here, at the start of the next compaction —
+    // a created-but-never-started container has no writable layer, so a
+    // leftover costs almost nothing until then.
+    remove_stale_compaction_containers().await;
+    let scratch_name = format!("{}{}", COMPACTION_CONTAINER_PREFIX, uuid::Uuid::new_v4().simple());
 
     // `image` is the flat build; everything else is copied from the original so
     // the committed image is byte-for-byte the same configuration.
@@ -2877,7 +3002,8 @@ pub async fn clear_caches(project: &Project, include_rustup: bool) -> ReclaimRes
     match super::exec::exec_oneshot_as(&container_id, "claude", cmd, Vec::new()).await {
         Ok((output, _exit)) => match parse_cache_total(&output) {
             Some(bytes) => ReclaimResult {
-                target,
+                target: Some(target),
+                destroyed: None,
                 ok: true,
                 freed_bytes: bytes as i64,
                 projected_bytes: None,
@@ -2934,8 +3060,9 @@ pub async fn destroy(
     // A running container holds all three of these open, and Docker's refusal
     // is not something to lean on for the volumes: it would happily leave a
     // half-removed project behind.
-    if let Ok(Some(container_id)) = container::find_existing_container(project).await {
-        if container::is_container_running(&container_id)
+    let existing_container = container::find_existing_container(project).await.ok().flatten();
+    if let Some(container_id) = existing_container.as_deref() {
+        if container::is_container_running(container_id)
             .await
             .unwrap_or(false)
         {
@@ -2953,13 +3080,37 @@ pub async fn destroy(
             };
             // Size it before it goes, so the report is a measurement.
             let bytes = volume_size(&name).await;
+
+            // **A stopped container still pins its volumes.** Docker refuses
+            // `remove_volume` with a 409 while any container references one,
+            // and every project that has ever been started has exactly that —
+            // a stopped container is the resting state, not an edge case. So
+            // the container is removed first rather than letting the user type
+            // a project name and then meet a raw 409. It is regenerable from
+            // the snapshot; `DestructiveItem::loses` says so.
+            if let Some(container_id) = existing_container.as_deref() {
+                container::remove_container(container_id).await.map_err(|e| {
+                    format!(
+                        "Could not remove this project's container, which still holds the volume \
+                         open: {}. Nothing was removed.",
+                        e
+                    )
+                })?;
+                log::info!(
+                    "Removed container {} so {} could be deleted",
+                    container_id,
+                    name
+                );
+            }
+
             docker
                 .remove_volume(&name, None)
                 .await
                 .map_err(|e| format!("Could not remove volume {}: {}", name, e))?;
             log::info!("Removed volume {} on explicit confirmation", name);
             Ok(ReclaimResult {
-                target: ReclaimTarget::OrphanVolume { name: name.clone() },
+                target: None,
+                destroyed: Some(target.clone()),
                 ok: true,
                 freed_bytes: bytes,
                 projected_bytes: None,
@@ -2974,7 +3125,8 @@ pub async fn destroy(
             container::remove_snapshot_image(project).await?;
             let sweep = container::sweep_orphaned_snapshots().await;
             Ok(ReclaimResult {
-                target: ReclaimTarget::DanglingSnapshots,
+                target: None,
+                destroyed: Some(target.clone()),
                 ok: true,
                 freed_bytes: bytes + sweep.reclaimed_bytes,
                 projected_bytes: None,
@@ -2985,6 +3137,19 @@ pub async fn destroy(
             })
         }
         DestructiveTarget::RollbackPin { tag, .. } => {
+            // **The one destructive variant carrying a free-form string.**
+            // Every other arm builds its target from constants; this one takes
+            // a tag over IPC and interpolates it into an image reference that
+            // is then removed. Unvalidated, `tag: "latest"` names the project's
+            // live snapshot — deleted under a dialog that says "rollback pin".
+            // `parse_rollback_tag` accepts only `pre-migration-<YYYYmmdd-HHMMSS>`,
+            // which is exactly what `rollback_tag` produces and nothing else.
+            if migration::parse_rollback_tag(tag).is_none() {
+                return Err(format!(
+                    "{:?} is not a rollback pin tag. Nothing was removed.",
+                    tag
+                ));
+            }
             let reference = format!("triple-c-snapshot-{}:{}", project.id, tag);
             migration::untag_image(&reference).await?;
             // Untagging only makes the image dangling. Whatever came back came
@@ -2992,7 +3157,8 @@ pub async fn destroy(
             let sweep = container::sweep_orphaned_snapshots().await;
             log::info!("Dropped rollback pin {} on explicit confirmation", reference);
             Ok(ReclaimResult {
-                target: ReclaimTarget::MigrationPins,
+                target: None,
+                destroyed: Some(target.clone()),
                 ok: true,
                 freed_bytes: sweep.reclaimed_bytes,
                 projected_bytes: None,
@@ -3011,8 +3177,13 @@ pub async fn destroy(
 /// The plain `Size` from `inspect_image` includes the base, which several other
 /// projects are still built from and which is not going anywhere. Reporting it
 /// as freed would overstate a snapshot removal by ~4.7 GB every time. Only
-/// `df()` computes `SharedSize`, so this costs one — acceptable on the
-/// destructive path, which handles exactly one object per call.
+/// `df()` computes `SharedSize`, so each call costs a full daemon walk.
+///
+/// That is three `df()`s on a compaction (before, after, and the scan that
+/// planned it) and one per destructive removal. Acceptable because both are
+/// single-object, user-initiated actions that already take seconds to minutes —
+/// but it is why nothing in the *scan* path calls this: `scan` gets shared
+/// sizes from the one `df()` it already makes.
 async fn image_unique_bytes(reference: &str) -> i64 {
     let Ok(docker) = get_docker() else {
         return 0;

@@ -14,8 +14,10 @@ vi.mock("../lib/tauri-commands", () => ({
   reclaim: (targets: unknown) => reclaim(targets),
   destroyProjectDiskObject: (target: unknown, confirmation: string) =>
     destroyProjectDiskObject(target, confirmation),
-  sweepOrphanedSnapshots: vi.fn(),
+  sweepOrphanedSnapshots: () => sweepOrphanedSnapshots(),
 }));
+
+const sweepOrphanedSnapshots = vi.fn();
 
 const report = (scanned_at: string): DiskUsageReport =>
   ({ scanned_at, projects: [] }) as unknown as DiskUsageReport;
@@ -149,13 +151,94 @@ describe("useDiskUsage", () => {
     expect(result.current.outcome?.total_freed_bytes).toBe(100);
   });
 
-  it("surfaces a failure rather than leaving a stale report on screen", async () => {
-    getDockerDiskUsage.mockRejectedValue("daemon unreachable");
+  it("reports a scan failure and keeps the last good measurement", async () => {
+    // The old report is still an accurate measurement of an earlier moment,
+    // and the error says the refresh failed. Blanking it would leave the panel
+    // with nothing while telling the user nothing more.
+    getDockerDiskUsage.mockResolvedValueOnce(report("first"));
     const { result } = renderHook(() => useDiskUsage());
     await act(async () => {
       await result.current.scan();
     });
+
+    getDockerDiskUsage.mockRejectedValueOnce("daemon unreachable");
+    await act(async () => {
+      await result.current.scan();
+    });
     await waitFor(() => expect(result.current.error).toMatch(/daemon unreachable/));
+    expect(result.current.report?.scanned_at).toBe("first");
     expect(result.current.scanning).toBe(false);
+  });
+
+  it("never shows fresh totals beside a stale tick list", async () => {
+    // `setReport` used to land before the plan call was awaited, so a plan
+    // failure rendered this scan's numbers above the previous scan's rows.
+    getDockerDiskUsage.mockResolvedValueOnce(report("first"));
+    const { result } = renderHook(() => useDiskUsage());
+    await act(async () => {
+      await result.current.scan();
+    });
+
+    getDockerDiskUsage.mockResolvedValueOnce(report("second"));
+    listReclaimable.mockRejectedValueOnce("planner exploded");
+    await act(async () => {
+      await result.current.scan();
+    });
+    expect(result.current.error).toMatch(/planner exploded/);
+    expect(result.current.report?.scanned_at).toBe("first");
+  });
+
+  it("drops the plan after a reclaim so ticks cannot be re-fired at nothing", async () => {
+    getDockerDiskUsage.mockResolvedValue(report("first"));
+    const { result } = renderHook(() => useDiskUsage());
+    await act(async () => {
+      await result.current.scan();
+    });
+    expect(result.current.plan).toEqual(plan);
+
+    await act(async () => {
+      await result.current.runReclaim([{ kind: "dangling_snapshots" }]);
+    });
+    expect(result.current.plan).toBeNull();
+    // The totals stay — they were measured before the reclaim and the outcome
+    // says what changed.
+    expect(result.current.report?.scanned_at).toBe("first");
+  });
+
+  it("runs the sweep through its own command and reports what it refused", async () => {
+    // The sweep's `in_use` count — orphans Docker refused to delete because a
+    // stopped project still needs them — is invisible everywhere else in the
+    // app, because every other caller throws the report away.
+    sweepOrphanedSnapshots.mockResolvedValue({
+      removed: ["sha256:a", "sha256:b"],
+      reclaimed_bytes: 11_900_000_000,
+      in_use: 3,
+      failed: [],
+      unavailable: null,
+    });
+    const { result } = renderHook(() => useDiskUsage());
+    await act(async () => {
+      await result.current.runSweep();
+    });
+    expect(sweepOrphanedSnapshots).toHaveBeenCalled();
+    expect(result.current.outcome?.total_freed_bytes).toBe(11_900_000_000);
+    expect(result.current.outcome?.results[0].message).toMatch(/Swept 2 superseded image/);
+    expect(result.current.outcome?.results[0].message).toMatch(/3 were left alone/);
+  });
+
+  it("treats an unreachable daemon in the sweep report as an error", async () => {
+    sweepOrphanedSnapshots.mockResolvedValue({
+      removed: [],
+      reclaimed_bytes: 0,
+      in_use: 0,
+      failed: [],
+      unavailable: "Could not reach the Docker engine",
+    });
+    const { result } = renderHook(() => useDiskUsage());
+    await act(async () => {
+      await result.current.runSweep();
+    });
+    expect(result.current.error).toMatch(/Could not reach the Docker engine/);
+    expect(result.current.outcome).toBeNull();
   });
 });

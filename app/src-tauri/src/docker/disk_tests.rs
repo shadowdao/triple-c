@@ -339,6 +339,26 @@ fn a_scrub_container_is_matched_on_its_whole_name_not_a_substring() {
 }
 
 #[test]
+fn a_compaction_container_is_never_matched_by_the_scrub_bucket() {
+    // These had the same `triple-c-scrub-*` prefix once. The scrub bucket
+    // removes with `force: true`, so a reclaim fired from a second window while
+    // a compaction was mid-flight would have destroyed the container the commit
+    // was about to run against. Separate prefixes, and neither predicate may
+    // reach the other's containers.
+    let compaction = summary(&["/triple-c-compact-abc123"], &[]);
+    let scrub = summary(&["/triple-c-scrub-abc123"], &[]);
+
+    assert!(is_compaction_container(&compaction));
+    assert!(!is_scrub_container(&compaction), "the scrub bucket must not reach it");
+
+    assert!(is_scrub_container(&scrub));
+    assert!(!is_compaction_container(&scrub));
+
+    // Same substring-filter hazard applies to the new prefix.
+    assert!(!is_compaction_container(&summary(&["/my-triple-c-compact-notes"], &[])));
+}
+
+#[test]
 fn a_probe_container_is_matched_on_its_label_not_on_the_daemons_filter() {
     // The `label=triple-c.probe=migration` filter is an exact match and would
     // be enough on its own — but a filter is a string assembled elsewhere in
@@ -628,6 +648,24 @@ fn the_compaction_dockerfile_reuses_the_one_scrub_list() {
 }
 
 #[test]
+fn the_compaction_build_is_labelled_so_the_sweep_can_collect_it() {
+    // Everything that cleans up after this build — the discard path when the
+    // result is not smaller, the untag after a successful commit — leans on
+    // `sweep_orphaned_snapshots`, and that sweep filters on `dangling=true`
+    // AND `triple-c.managed=true`. Without the label it can never match, and
+    // the flattened intermediate is stranded.
+    let df = compaction_dockerfile("x:latest", &container::snapshot_scrub_script());
+    assert!(
+        df.contains("LABEL triple-c.managed=true"),
+        "the sweep filters on this label and would never match: {}",
+        df
+    );
+    // It has to be on the *final* stage, not the discarded `src` one.
+    let after_scratch = df.split("FROM scratch").nth(1).expect("no final stage");
+    assert!(after_scratch.contains("LABEL triple-c.managed=true"), "{}", df);
+}
+
+#[test]
 fn the_compaction_dockerfile_never_reaches_a_bind_mount() {
     let df = compaction_dockerfile("x:latest", &container::snapshot_scrub_script());
     // `/workspace/{mount_name}` subtrees are the user's real project
@@ -730,6 +768,77 @@ fn a_typed_confirmation_must_match_the_project_name_exactly() {
     assert!(!confirmation_matches("", ""));
 }
 
+#[test]
+fn only_a_real_rollback_tag_can_name_an_image_to_delete() {
+    // `DestructiveTarget::RollbackPin` is the one destructive variant carrying
+    // a free-form string from the frontend, and `destroy` interpolates it into
+    // an image reference it then removes. Unguarded, `tag: "latest"` names the
+    // project's *live snapshot* — deleted under a dialog that says "rollback
+    // pin". The guard is `parse_rollback_tag`, so this pins what it accepts.
+    assert!(migration::parse_rollback_tag("pre-migration-20260101-101500").is_some());
+
+    for hostile in [
+        "latest",
+        "",
+        "pre-migration-",
+        "pre-migration-notatimestamp",
+        "../latest",
+        "latest\npre-migration-20260101-101500",
+    ] {
+        assert!(
+            migration::parse_rollback_tag(hostile).is_none(),
+            "{:?} must not be accepted as a rollback pin tag",
+            hostile
+        );
+    }
+}
+
+#[test]
+fn a_destroy_result_never_claims_to_be_reclaim_work() {
+    // An earlier version returned `OrphanVolume { name }` for a home-volume
+    // deletion — naming a volume that was never an orphan, and attributing the
+    // outcome to a plan row the user never ticked. Exactly one of the two
+    // fields is ever set.
+    let reclaim_shaped = ReclaimResult {
+        target: Some(ReclaimTarget::DanglingSnapshots),
+        destroyed: None,
+        ok: true,
+        freed_bytes: 1,
+        projected_bytes: None,
+        message: String::new(),
+    };
+    let destroy_shaped = ReclaimResult {
+        target: None,
+        destroyed: Some(DestructiveTarget::HomeVolume {
+            project_id: "p1".to_string(),
+        }),
+        ..reclaim_shaped.clone()
+    };
+    assert!(reclaim_shaped.target.is_some() != reclaim_shaped.destroyed.is_some());
+    assert!(destroy_shaped.target.is_some() != destroy_shaped.destroyed.is_some());
+
+    // And both shapes survive the wire.
+    let json = serde_json::to_string(&destroy_shaped).unwrap();
+    assert_eq!(serde_json::from_str::<ReclaimResult>(&json).unwrap(), destroy_shaped);
+}
+
+#[test]
+fn a_snapshot_with_no_known_base_is_not_offered_for_compaction() {
+    // With `triple-c.base-image-id` absent — the normal case for a project
+    // created before that label existed — `layer_stats` counts every layer that
+    // carries bytes, base included. A never-recreated project then reports ~15
+    // "commit layers" and would sail past a `> 1` check. `base_lineage_known`
+    // is what stops the plan offering a rewrite sized from a number that does
+    // not mean what its name says.
+    let unknown = layer_stats(&[10, 20, 30, 40], None);
+    assert_eq!(unknown.commit_layers, 4);
+    assert_eq!(unknown.above_base_bytes, None, "the split must not be guessed");
+
+    let known = layer_stats(&[10, 20, 30, 40], Some(3));
+    assert_eq!(known.commit_layers, 1);
+    assert_eq!(known.above_base_bytes, Some(10));
+}
+
 // ---------------------------------------------------------------------------
 // Host detection
 // ---------------------------------------------------------------------------
@@ -763,9 +872,14 @@ fn base_images_are_recognised_by_reference_for_display_only() {
     assert!(is_base_image_reference("triple-c-sandbox:latest"));
     assert!(is_base_image_reference("triple-c:latest"));
 
+    // A registry port must not be mistaken for a tag separator.
+    assert!(is_base_image_reference("localhost:5000/triple-c-sandbox:latest"));
+    assert!(is_base_image_reference("registry.example.com:8443/triple-c-sandbox"));
+
     // A project's own snapshot is not a base image, and neither is anything of
     // the user's.
     assert!(!is_base_image_reference("triple-c-snapshot-abc:latest"));
+    assert!(!is_base_image_reference("localhost:5000/postgres:17"));
     assert!(!is_base_image_reference("triple-c-gateway:latest"));
     assert!(!is_base_image_reference("postgres:17-alpine"));
 }
@@ -815,6 +929,7 @@ fn the_report_serialises_as_snake_case_like_every_other_ipc_struct() {
     };
     let json = serde_json::to_value(&report).unwrap();
     assert_eq!(json["projects"][0]["snapshot_commit_layers"], 14);
+    assert_eq!(json["projects"][0]["base_lineage_known"], false);
     assert_eq!(json["projects"][0]["container_writable_bytes"], 868_000_000i64);
     assert!(json["orphan_volumes_unavailable"].is_null());
     // `Option<i64>` must reach the frontend as null, not be omitted — the TS
