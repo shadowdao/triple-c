@@ -159,6 +159,42 @@ export function sanitizeRelayUrl(
 }
 
 /**
+ * Whether `next` is the same link as `current`, only longer.
+ *
+ * The single rule that lets a later candidate displace an earlier one when both
+ * were scraped from the same untrusted stream. A repainting TUI lands a
+ * truncated copy of a link in the transcript before the complete one, and this
+ * is what joins them back up — safely, because a longer string sharing a prefix
+ * with the current pick necessarily has the same scheme, host and port, so an
+ * attacker cannot use it to move the origin.
+ *
+ * Longest-wins without the prefix test is what this replaced, and it handed the
+ * choice to the attacker: pad a hostile URL and it displaces the real one.
+ *
+ * Used by `pickSignInUrl` (`hooks/useClaudeAuth.ts`) and by the terminal's URL
+ * prompt slot (`components/terminal/TerminalView.tsx`). One implementation, on
+ * purpose.
+ */
+export function extendsUrl(next: string, current: string): boolean {
+  return next.length > current.length && next.startsWith(current);
+}
+
+/**
+ * Whether this is a URL that signs the user in to Anthropic.
+ *
+ * Used to decide *presentation*, not permission — the toast makes the
+ * container-side browser the default action for these, because the OAuth
+ * callback listener is inside the container and the host has nothing to catch
+ * it with. It is deliberately the same host allowlist the sign-in flow itself
+ * uses, so the two cannot disagree about what a sign-in link is.
+ */
+export function isAnthropicSignInUrl(url: string): boolean {
+  const safe = sanitizeRelayUrl(url, { allowHosts: ANTHROPIC_SIGN_IN_HOSTS });
+  if (!safe) return false;
+  return /oauth|authorize|login|sign-?in/i.test(safe);
+}
+
+/**
  * The origin of an already-sanitized URL, for display.
  *
  * The origin is the only part of a URL that decides where the user's

@@ -4,6 +4,7 @@ import { ConfigGroup, SwitchRow } from "../../../ui/Field";
 import PermissionModeControl, { permissionModePatch } from "../../PermissionModeControl";
 import ClaudeInstructionsEditor from "../../ClaudeInstructionsEditor";
 import ClaudeCodeSettingsEditor from "../../ClaudeCodeSettingsEditor";
+import AuthBridgeRow from "./AuthBridgeRow";
 
 interface Props {
   project: Project;
@@ -69,6 +70,12 @@ export default function RuntimeSection({
             />
           }
         />
+
+        {/* Not gated on `disabled`: the bridge is host-side and has its own
+            command, so it can be switched on while a login is hanging — which
+            is the only moment anyone reaches for it. It owns its state rather
+            than going through `save`. */}
+        <AuthBridgeRow project={project} />
 
         <SwitchRow
           label="Mission Control"

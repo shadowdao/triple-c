@@ -13,10 +13,11 @@ import {
   uploadHostFileToTerminal,
 } from "../../lib/tauri-commands";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { UrlDetector } from "../../lib/urlDetector";
+import { UrlDetector, type UrlSource } from "../../lib/urlDetector";
 import {
   RelayRateLimiter,
   URL_RELAY_OSC,
+  extendsUrl,
   parseUrlRelayOsc,
   sanitizeRelayUrl,
 } from "../../lib/urlRelay";
@@ -27,6 +28,58 @@ import TerminalContextMenu from "./TerminalContextMenu";
 interface Props {
   sessionId: string;
   active: boolean;
+}
+
+/**
+ * Where a prompted URL came from.
+ *
+ * `relay` is the container asking explicitly, over OSC 7777, with the URL
+ * base64-encoded — exact by construction. `osc8` is lifted verbatim out of a
+ * hyperlink parameter — also exact, but nobody asked for it. `heuristic` was
+ * reassembled from painted text and is the only one that can be a *truncated
+ * guess* at the link it is showing.
+ */
+export type PromptSource = "relay" | UrlSource;
+
+/** Higher wins. Provenance, not recency. */
+const SOURCE_RANK: Record<PromptSource, number> = {
+  heuristic: 0,
+  osc8: 1,
+  relay: 2,
+};
+
+/**
+ * Whether `next` may take over the prompt slot from `current`.
+ *
+ * The bug this exists for: `claude login` relays its OAuth URL over OSC 7777,
+ * base64-encoded and therefore complete; the screen-scraper's 300 ms debounce
+ * then fires, finds the same link cut into terminal-width pieces, and — under
+ * the old last-writer-wins slot — replaced the good URL with a truncated one
+ * that still parses, still points at the right host, and cannot authorise
+ * anything. The user is the one who has to notice.
+ *
+ * Two rules, in order:
+ *
+ *  - Better provenance always wins, worse provenance never does. A scraped
+ *    guess cannot displace an exact copy.
+ *  - Between equals, only an *extension* of what is showing may replace it.
+ *    That is {@link extendsUrl}, the same rule and the same reasoning as
+ *    `pickSignInUrl` in `hooks/useClaudeAuth.ts`: a repaint can land a
+ *    truncated copy before the complete one, and a longer string sharing a
+ *    prefix cannot move the origin. The relay is exempt because each OSC 7777
+ *    is a fresh deliberate request rather than another view of the last one —
+ *    a second `gh auth login` must be able to replace the first.
+ */
+export function supersedes(
+  next: { url: string; source: PromptSource },
+  current: { url: string; source: PromptSource } | null,
+): boolean {
+  if (!current) return true;
+  if (SOURCE_RANK[next.source] !== SOURCE_RANK[current.source]) {
+    return SOURCE_RANK[next.source] > SOURCE_RANK[current.source];
+  }
+  if (next.source === "relay") return true;
+  return extendsUrl(next.url, current.url);
 }
 
 export default function TerminalView({ sessionId, active }: Props) {
@@ -47,13 +100,24 @@ export default function TerminalView({ sessionId, active }: Props) {
     (s) => s.sessions.find((sess) => sess.id === sessionId)?.projectId
   );
 
-  // One toast slot, two producers: the heuristic long-URL detector and the
-  // container's explicit "open this in the host browser" relay (OSC 7777).
-  // Sharing the slot keeps them from stacking on top of each other.
+  // Which program is on the other end of the PTY. Read through a ref because
+  // the key handler is registered once, in the mount effect keyed on
+  // `sessionId`, and a value captured there would go stale if the session
+  // record arrived after the first render.
+  const sessionType = useAppState(
+    (s) => s.sessions.find((sess) => sess.id === sessionId)?.sessionType
+  );
+  const sessionTypeRef = useRef(sessionType);
+  sessionTypeRef.current = sessionType;
+
+  // One toast slot, three producers: the container's explicit "open this in the
+  // host browser" relay (OSC 7777), OSC 8 hyperlink targets, and the heuristic
+  // long-URL detector. Sharing the slot keeps them from stacking on top of each
+  // other.
   //
-  // Both producers read the container's PTY output, so both are untrusted, and
-  // both must go through `sanitizeRelayUrl` before anything is stored here —
-  // see `promptUrl` below, which is the only writer.
+  // All three read the container's PTY output, so all three are untrusted, and
+  // all three must go through `sanitizeRelayUrl` before anything is stored here
+  // — see `promptUrl` below, which is the only writer.
   //
   // `seq` exists because the slot is shared and long-lived: a second prompt
   // replacing a first would otherwise mutate the toast in place, swapping the
@@ -62,6 +126,7 @@ export default function TerminalView({ sessionId, active }: Props) {
   const [urlPrompt, setUrlPrompt] = useState<{
     url: string;
     label: string;
+    source: PromptSource;
     seq: number;
   } | null>(null);
   const promptSeqRef = useRef(0);
@@ -72,16 +137,27 @@ export default function TerminalView({ sessionId, active }: Props) {
    * found: the OSC relay branch has already been through `parseUrlRelayOsc`,
    * but the heuristic detector branch has been through nothing at all, and a
    * raw regex match is exactly the input `sanitizeRelayUrl` exists to refuse.
+   *
+   * Last-writer-wins is what this used to be, and it lost the OAuth URL every
+   * time: the relay delivers the link base64-encoded and therefore exact, and
+   * ~300 ms later the screen-scraper's debounce fired and overwrote it with a
+   * truncated guess at the same link. `supersedes` is the fix — see there.
    */
-  const promptUrl = useCallback((raw: string, label: string) => {
-    const url = sanitizeRelayUrl(raw);
-    if (!url) {
-      console.warn("Refusing to prompt for a URL that failed validation");
-      return;
-    }
-    promptSeqRef.current += 1;
-    setUrlPrompt({ url, label, seq: promptSeqRef.current });
-  }, []);
+  const promptUrl = useCallback(
+    (raw: string, label: string, source: PromptSource) => {
+      const url = sanitizeRelayUrl(raw);
+      if (!url) {
+        console.warn("Refusing to prompt for a URL that failed validation");
+        return;
+      }
+      setUrlPrompt((current) => {
+        if (!supersedes({ url, source }, current)) return current;
+        promptSeqRef.current += 1;
+        return { url, label, source, seq: promptSeqRef.current };
+      });
+    },
+    [],
+  );
   const [imagePasteMsg, setImagePasteMsg] = useState<string | null>(null);
   const [isAtBottom, setIsAtBottom] = useState(true);
   const [isAutoFollow, setIsAutoFollow] = useState(true);
@@ -234,6 +310,34 @@ export default function TerminalView({ sessionId, active }: Props) {
         useAppState.getState().sttToggle();
         return false;
       }
+      // Shift+Enter inserts a newline in Claude Code's prompt instead of
+      // submitting it. xterm.js does not consult `shiftKey` for Enter
+      // (`Keyboard.ts`, `case 13`), so without this branch Shift+Enter is
+      // byte-identical to Enter and submits.
+      //
+      // `\x1b\r` — ESC then CR — is what Claude Code parses as `return` with
+      // meta, and it is exactly what its own `/terminal-setup` writes into the
+      // VS Code, Cursor, Alacritty and Zed keymaps. These are the in-band
+      // bytes, not a guess, which is why this must NOT be "simplified" to
+      // `\n`: Claude Code accepts `\n` too, but a shell would *run* the line,
+      // so the two session types would quietly diverge.
+      //
+      // Scoped to Claude sessions for the same reason. A bash tab runs
+      // `bash -l`, where readline has no binding for `\e\r` and answers with a
+      // bell — harmless, but there is nothing to gain from sending it.
+      if (
+        event.type === "keydown" &&
+        event.key === "Enter" &&
+        event.shiftKey &&
+        !event.ctrlKey &&
+        !event.altKey &&
+        !event.metaKey &&
+        !event.isComposing &&
+        sessionTypeRef.current === "claude"
+      ) {
+        sendInput(sessionId, "\x1b\r");
+        return false; // xterm must not also send a bare CR, which submits
+      }
       return true;
     });
 
@@ -287,7 +391,7 @@ export default function TerminalView({ sessionId, active }: Props) {
         console.warn("URL relay: rate-limited", url);
         return true;
       }
-      promptUrl(url, "Container asked to open a URL");
+      promptUrl(url, "Container asked to open a URL", "relay");
       return true;
     });
 
@@ -374,11 +478,17 @@ export default function TerminalView({ sessionId, active }: Props) {
     // Handle backend output -> terminal
     let aborted = false;
 
-    // The width is read per scan, not captured: only a break the terminal
+    // The detector samples this getter on every `feed`, so what it reassembles
+    // with is the width the bytes were *printed* at — only a break the terminal
     // itself inserted may be deleted, and where that is moves with every
     // resize.
     const detector = new UrlDetector(
-      (url) => promptUrl(url, "Long URL detected"),
+      (url, source) =>
+        promptUrl(
+          url,
+          source === "osc8" ? "Link detected" : "Long URL detected",
+          source,
+        ),
       () => termRef.current?.cols ?? 0,
     );
     detectorRef.current = detector;

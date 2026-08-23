@@ -277,8 +277,13 @@ export const setBrowserViewPopoutAlwaysOnTop = (projectId: string, onTop: boolea
 // lives in the OS keychain and is injected as a container env var.
 //
 // `acquireClaudeToken` borrows the given project's running container to run the
-// login (temporarily enabling its auth bridge), and streams progress on the
-// `claude-token-progress` and `claude-token-output` events. It resolves only
+// login and streams progress on the `claude-token-progress` and
+// `claude-token-output` events. It deliberately does *not* touch the project's
+// auth bridge: `setup-token` finishes on an Anthropic-hosted page and pastes a
+// code back, so there is no loopback callback for a bridge to carry — and an
+// earlier version that enabled it "just in case" persisted that flag to
+// projects.json and left it latched on whenever the flow was killed. See the
+// module comment in `commands/auth_token_commands.rs`. It resolves only
 // once the whole flow finishes, so call it without awaiting the UI on it.
 //
 // Partway through, `claude setup-token` prints a sign-in URL and then waits at

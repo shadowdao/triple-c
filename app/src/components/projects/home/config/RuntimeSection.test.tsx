@@ -1,7 +1,21 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import RuntimeSection from "./RuntimeSection";
-import type { Project } from "../../../../lib/types";
+import type { AuthBridgeStatus, Project } from "../../../../lib/types";
+
+// The auth-bridge row owns its own IPC — see `AuthBridgeRow.tsx` for why it
+// does not go through `save`.
+const OFF_BRIDGE: AuthBridgeStatus = { enabled: false, active_ports: [], conflicts: [] };
+const setAuthBridgeEnabled = vi.fn(async () => ({ ...OFF_BRIDGE, enabled: true }));
+
+vi.mock("../../../../lib/tauri-commands", () => ({
+  getAuthBridgeStatus: vi.fn(async () => OFF_BRIDGE),
+  setAuthBridgeEnabled: (id: string, on: boolean) => setAuthBridgeEnabled(id, on),
+}));
+
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn(async () => () => {}),
+}));
 
 const baseProject: Project = {
   id: "p1",
@@ -90,5 +104,26 @@ describe("RuntimeSection — VPN support toggle", () => {
     expect(
       screen.getByText(/recreates the container on its next start/i),
     ).toBeInTheDocument();
+  });
+});
+
+describe("RuntimeSection — auth bridge toggle", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("is reachable while the container is running", async () => {
+    // The rest of the tab is gated on a stopped container because those
+    // settings are baked in at creation. This one is host-side and has its own
+    // command, and the moment a user needs it is the moment a login is hanging
+    // in a *running* container — so the tab's `disabled` must not reach it.
+    renderSection({ status: "running" }, true);
+
+    const toggle = screen.getByRole("switch", { name: "Auth bridge" });
+    await waitFor(() => expect(toggle).not.toBeDisabled());
+
+    fireEvent.click(toggle);
+    await waitFor(() => expect(setAuthBridgeEnabled).toHaveBeenCalledWith("p1", true));
+    // And never through the generic project save, which would drop it on the
+    // floor while the container runs.
+    expect(save).not.toHaveBeenCalled();
   });
 });

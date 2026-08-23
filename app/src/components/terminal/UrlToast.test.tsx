@@ -58,4 +58,79 @@ describe("UrlToast", () => {
     screen.getByRole("button", { name: "Open" }).click();
     expect(onOpen).toHaveBeenCalledTimes(1);
   });
+
+  describe("Anthropic sign-in links", () => {
+    // The callback listener a `claude login` is waiting on is *inside* the
+    // container. Sending the user to their host browser completes the sign-in
+    // and then posts the result where nothing is listening, and the terminal
+    // hangs to its timeout — so for these, and only these, the container-side
+    // browser leads.
+    const SIGN_IN =
+      "https://claude.ai/oauth/authorize?code=true&client_id=abc&response_type=code";
+
+    function actions() {
+      return screen
+        .getAllByRole("button")
+        .map((b) => b.textContent)
+        .filter((t) => t === "Open" || t === "In container");
+    }
+
+    it("puts the container browser first", () => {
+      render(
+        <UrlToast
+          url={SIGN_IN}
+          onOpen={noop}
+          onOpenInContainer={noop}
+          onDismiss={noop}
+        />,
+      );
+      expect(actions()).toEqual(["In container", "Open"]);
+      expect(screen.getByTestId("url-toast-signin-hint")).toHaveTextContent(
+        /callback listener is inside the container/i,
+      );
+    });
+
+    it("keeps the host browser available as a fallback", () => {
+      const onOpen = vi.fn();
+      render(
+        <UrlToast
+          url={SIGN_IN}
+          onOpen={onOpen}
+          onOpenInContainer={noop}
+          onDismiss={noop}
+        />,
+      );
+      screen.getByRole("button", { name: "Open" }).click();
+      expect(onOpen).toHaveBeenCalledTimes(1);
+    });
+
+    it("leaves an ordinary URL alone", () => {
+      // A `gh auth login` device code, a docs page, a preview build — the host
+      // browser is the right answer for all of them and stays the default.
+      render(
+        <UrlToast
+          url="https://github.com/login/device?code=ABCD-EFGH"
+          onOpen={noop}
+          onOpenInContainer={noop}
+          onDismiss={noop}
+        />,
+      );
+      expect(actions()).toEqual(["Open", "In container"]);
+      expect(screen.queryByTestId("url-toast-signin-hint")).not.toBeInTheDocument();
+    });
+
+    it("is not fooled by a lookalike host", () => {
+      // `isAnthropicSignInUrl` uses the same allowlist the sign-in flow does,
+      // so a URL that merely says "claude.ai" somewhere is not one.
+      render(
+        <UrlToast
+          url="https://claude.ai.evil.tld/oauth/authorize?x=1"
+          onOpen={noop}
+          onOpenInContainer={noop}
+          onDismiss={noop}
+        />,
+      );
+      expect(actions()).toEqual(["Open", "In container"]);
+    });
+  });
 });

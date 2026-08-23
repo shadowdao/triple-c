@@ -458,6 +458,29 @@ elif [ -f "$CLAUDE_JSON" ] && grep -q '"awsAuthRefresh"' "$CLAUDE_JSON" 2>/dev/n
     fi
 fi
 
+# ── Shift+Enter key binding ───────────────────────────────────────────────────
+# Triple-C's terminals send ESC+CR (`\e\r`) on Shift+Enter — the same bytes
+# `/terminal-setup` installs for VS Code, Cursor, Alacritty and Zed — and Claude
+# Code decodes those unconditionally. What it cannot see is that the binding is
+# already in place, so it keeps printing its "run /terminal-setup" tip. This
+# flag is what that tip is gated on: purely cosmetic, and it changes nothing
+# about how the sequence is decoded.
+CLAUDE_JSON="/home/claude/.claude.json"
+if [ -f "$CLAUDE_JSON" ]; then
+    # Only rewrite when the value isn't already true, to avoid a needless jq
+    # reformat of ~/.claude.json on every single start.
+    if ! grep -q '"shiftEnterKeyBindingInstalled"[[:space:]]*:[[:space:]]*true' "$CLAUDE_JSON" 2>/dev/null; then
+        MERGED=$(jq '.shiftEnterKeyBindingInstalled = true' "$CLAUDE_JSON" 2>/dev/null)
+        if [ -n "$MERGED" ]; then
+            printf '%s\n' "$MERGED" > "$CLAUDE_JSON"
+        fi
+    fi
+else
+    printf '{"shiftEnterKeyBindingInstalled":true}\n' > "$CLAUDE_JSON"
+fi
+chown claude:claude "$CLAUDE_JSON"
+chmod 600 "$CLAUDE_JSON"
+
 # ── Docker socket permissions ────────────────────────────────────────────────
 if [ -S /var/run/docker.sock ]; then
     DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)

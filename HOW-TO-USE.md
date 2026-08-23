@@ -128,8 +128,11 @@ Anthropic-backend project uses that token without its own login. See
 2. Claude prints an OAuth URL. Triple-C detects long URLs and shows a clickable toast at the top of the terminal — click **Open** to open it in your browser.
 3. Complete the login in your browser. The token is saved and persists across container stops, starts and recreations. A **Reset** deletes it — see below.
 
-> If the login hangs after the browser step, the callback could not reach the container. Enable the
-> [Auth Bridge](#browser-logins-inside-the-container-auth-bridge) for that project.
+> If the login hangs after the browser step, the callback could not reach the container. Either
+> click **In container** on the toast instead of **Open** — the callback then never has to leave the
+> container at all — or turn on the
+> [Auth Bridge](#browser-logins-inside-the-container-auth-bridge) in the project's
+> **Config → Runtime** section.
 
 **AWS Bedrock:**
 
@@ -789,6 +792,19 @@ web server they started on `localhost`. `claude login`, `aws sso login` and Conc
 
 The **Auth Bridge** fixes this. It is **opt-in per project** and **off by default**.
 
+### Where the switch is
+
+Project Home → **Config** → **Runtime** → **Auth bridge**.
+
+Unlike the rest of that tab, it is **not** greyed out while the container is running — it is a
+host-side feature that recreates nothing, and the moment you want it is usually the moment a login
+is already hanging in a running container. Switch it on, then retry the login.
+
+Beside the switch is its live state: **Off**, **Watching** (on, nothing to bridge yet — normal,
+there is only something to bridge while a login is waiting), **Bridging *n* ports**, **IPv4 only**,
+or **Port conflict** with the port and the reason. A conflict means the host port was already taken
+and the callback will not arrive; free the port, or use **In container** instead.
+
 ### What it does
 
 - Every couple of seconds it looks inside the container for programs listening on the container's
@@ -1293,8 +1309,18 @@ triple-c-scheduler add --name "test" --schedule "0 */6 * * *" --prompt "Run test
 | **Ctrl+Shift+V** | Paste |
 | **Ctrl+V** | Paste an image from the clipboard into the container |
 | **Ctrl+Shift+M** | Toggle speech-to-text recording (when enabled) |
+| **Shift+Enter** | Insert a newline in Claude Code's prompt instead of submitting it |
+| **Alt+Enter** | The same thing, and it has always worked — it was simply never written down |
 
 Everything else goes straight through to the program running in the container.
+
+> **Shift+Enter** sends `ESC` + `CR`, the same bytes Claude Code's own `/terminal-setup` installs
+> for VS Code, Cursor, Alacritty and Zed — so there is nothing to run and no tip to follow. It is
+> bound in **Claude** tabs only: in a **bash** tab that sequence means nothing to readline, and
+> Shift+Enter there submits the line as it always has.
+>
+> In the [Web Terminal](#web-terminal-remote-access) the same chord works, and there is an **↵+**
+> key beside **Enter** on the mobile key row for devices with no Shift.
 
 ---
 
@@ -1402,8 +1428,18 @@ your machine (anything that isn't `http`/`https`).
 
 You opened the URL, signed in successfully, and the CLI in the terminal is still waiting. The
 callback from your browser is landing on your host's `localhost` while the CLI is listening on the
-*container's*. Enable the
-[Auth Bridge](#browser-logins-inside-the-container-auth-bridge) for that project and try again.
+*container's*.
+
+Two ways out, in order of least effort:
+
+1. Dismiss and re-trigger the login, then click **In container** on the toast rather than **Open**.
+   The page opens in a browser *inside* the container, so the callback never has to cross to the
+   host. This needs no auth bridge — only a running container with Playwright installed (Project
+   Home → **Browser**). For a recognised Anthropic sign-in link this is already the default button.
+2. Turn on the [Auth Bridge](#browser-logins-inside-the-container-auth-bridge) — Project Home →
+   **Config** → **Runtime** → **Auth bridge** — and try again. It can be switched on while the
+   container is running. Check the indicator beside it: **Port conflict** means the host port was
+   already taken and the callback still will not arrive.
 
 For Claude specifically, the simpler answer is usually
 [Shared Claude Authentication](#shared-claude-authentication), which finishes on an Anthropic-hosted

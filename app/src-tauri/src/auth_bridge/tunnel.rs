@@ -52,6 +52,15 @@ pub struct PortForward {
     pub port: u16,
     pub family: PortFamily,
     pub bridged_at: String,
+    /// Why `[::1]` could not be taken alongside `127.0.0.1`, if it could not.
+    ///
+    /// A half-bound forward is the one failure mode that looks like a success:
+    /// the status says the port is bridged, and a browser that resolves
+    /// `localhost` to `::1` and does not fall back still gets a refused
+    /// connection. It is not a conflict — the IPv4 half really is carrying
+    /// traffic — so it rides along with the port it belongs to and the UI says
+    /// so, rather than being logged at debug where nobody sees it.
+    pub ipv6_warning: Option<String>,
     task: JoinHandle<()>,
 }
 
@@ -86,18 +95,33 @@ impl PortForward {
         // first, so a v4-only host listener would miss those callbacks. This is
         // best-effort: if ::1 is unavailable (no IPv6, or that half is taken)
         // the v4 listener alone still works, so it is not treated as a conflict.
-        let v6 = match TcpListener::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, port))).await {
-            Ok(l) => Some(l),
-            Err(e) => {
-                log::debug!(
-                    "Auth bridge: bound 127.0.0.1:{} but not [::1]:{} ({}) — continuing with IPv4 only",
-                    port,
-                    port,
-                    e
-                );
-                None
-            }
-        };
+        let (v6, ipv6_warning) =
+            match TcpListener::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, port))).await {
+                Ok(l) => (Some(l), None),
+                Err(e) => {
+                    // Warn, not debug. Best-effort is about whether to *fail*,
+                    // not about whether to say anything: on a host where
+                    // `localhost` resolves to `::1` and the client does not
+                    // fall back to IPv4, the callback is refused while the
+                    // bridge reports itself healthy — a silent failure with no
+                    // thread back to this line.
+                    log::warn!(
+                        "Auth bridge: bound 127.0.0.1:{} but not [::1]:{} ({}) — continuing with IPv4 only; \
+                         a client that resolves localhost to ::1 without falling back will not reach it",
+                        port,
+                        port,
+                        e
+                    );
+                    (
+                        None,
+                        Some(format!(
+                            "IPv4 only — [::1]:{} could not be bound ({}). A browser that resolves \
+                             localhost to ::1 without falling back will not reach this port.",
+                            port, e
+                        )),
+                    )
+                }
+            };
 
         let target = family.socat_target(port);
         let task = tokio::spawn(accept_loop(container_id, port, target, v4, v6));
@@ -106,6 +130,7 @@ impl PortForward {
             port,
             family,
             bridged_at: chrono::Utc::now().to_rfc3339(),
+            ipv6_warning,
             task,
         })
     }

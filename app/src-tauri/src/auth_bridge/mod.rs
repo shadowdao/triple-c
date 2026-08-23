@@ -82,6 +82,10 @@ pub struct BridgedPort {
     pub family: PortFamily,
     /// RFC 3339 timestamp of when the host listener was bound.
     pub bridged_at: String,
+    /// Set when only the IPv4 half of the host listener could be bound. The
+    /// port still works, but not for a client that insists on `::1` — see
+    /// [`tunnel::PortForward::ipv6_warning`].
+    pub ipv6_warning: Option<String>,
 }
 
 /// A loopback listener that was discovered but could not be bridged.
@@ -132,6 +136,7 @@ impl BridgeState {
                     port: f.port,
                     family: f.family,
                     bridged_at: f.bridged_at.clone(),
+                    ipv6_warning: f.ipv6_warning.clone(),
                 })
                 .collect(),
             conflicts: self

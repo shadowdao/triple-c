@@ -437,6 +437,11 @@ export interface BridgedPort {
   family: AuthBridgePortFamily;
   /** RFC 3339 timestamp of when the host listener was bound. */
   bridged_at: string;
+  /** Set when only the IPv4 half of the host listener could be bound. The port
+   *  is carrying traffic, but a client that resolves `localhost` to `::1` and
+   *  does not fall back will still be refused — which otherwise presents as a
+   *  login that hangs while the bridge reports itself healthy. */
+  ipv6_warning: string | null;
 }
 
 /** A discovered loopback listener that could not be bridged (host port taken). */

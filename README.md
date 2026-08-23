@@ -76,8 +76,21 @@ Implemented in `hooks/useKeyboardShortcuts.ts` (document-level, capture phase):
 
 `Ctrl+W` is deliberately **not** bound: it is readline's `kill-word`, used constantly in the
 terminal this app is built around. Plain `Ctrl+←/→` is readline's word-wise cursor motion, which is
-why moving a tab takes Shift as well. Terminal-scoped keys (`Ctrl+Shift+C`, `Ctrl+Shift+Alt+C`,
-`Ctrl+Shift+M`) are handled in `TerminalView.tsx`.
+why moving a tab takes Shift as well.
+
+Terminal-scoped keys are handled in `TerminalView.tsx`:
+
+| Shortcut | Action |
+|---|---|
+| `Ctrl+Shift+C` / `Ctrl+Shift+Alt+C` | Copy the selection, trimmed / exactly as-is |
+| `Ctrl+Shift+M` | Toggle speech-to-text recording |
+| `Shift+Enter` | Insert a newline in Claude Code's prompt instead of submitting |
+| `Alt+Enter` | The same thing — xterm.js already ESC-prefixes on Alt, so this has always worked |
+
+`Shift+Enter` sends `ESC` + `CR`, which is what Claude Code's own `/terminal-setup` installs for
+VS Code, Cursor, Alacritty and Zed. It is bound in Claude sessions only: in a bash tab those bytes
+are unbound in readline. The web terminal does the same, and adds an `↵+` key beside Enter for
+devices with no Shift.
 
 ### Project Home
 
