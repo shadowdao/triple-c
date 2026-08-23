@@ -216,13 +216,13 @@ pub const SECRET_ENV_KEYS: &[&str] = &[
 /// `docker commit` copies a container's labels onto the image, every snapshot it
 /// commits. [`sweep_orphaned_snapshots`] treats it as the mark of provenance,
 /// which is what keeps the sweep away from the user's own images.
-const LABEL_MANAGED: &str = "triple-c.managed";
+pub(crate) const LABEL_MANAGED: &str = "triple-c.managed";
 
 /// Marks the image built from `container/Dockerfile` itself, as opposed to a
 /// project snapshot committed from a container. Only ever `"true"` on a base
 /// image; `create_container` writes it explicitly empty so an inherited value
 /// cannot travel onto a snapshot. See the `LABEL` block in the Dockerfile.
-const LABEL_BASE: &str = "triple-c.base";
+pub(crate) const LABEL_BASE: &str = "triple-c.base";
 
 const RESERVED_ENV_PREFIXES: &[&str] = &["ANTHROPIC_", "AWS_", "GIT_", "HOST_", "TRIPLE_C_"];
 
@@ -1541,7 +1541,7 @@ pub async fn create_container(
     // container stop/start cycles.
     mounts.push(Mount {
         target: Some("/home/claude".to_string()),
-        source: Some(format!("triple-c-home-{}", project.id)),
+        source: Some(home_volume_name(&project.id)),
         typ: Some(MountTypeEnum::VOLUME),
         read_only: Some(false),
         ..Default::default()
@@ -1551,7 +1551,7 @@ pub async fn create_container(
     // inside the home volume; Docker gives the more-specific mount precedence.
     mounts.push(Mount {
         target: Some("/home/claude/.claude".to_string()),
-        source: Some(format!("triple-c-claude-config-{}", project.id)),
+        source: Some(config_volume_name(&project.id)),
         typ: Some(MountTypeEnum::VOLUME),
         read_only: Some(false),
         ..Default::default()
@@ -1877,6 +1877,29 @@ pub fn get_snapshot_image_name(project: &Project) -> String {
     format!("triple-c-snapshot-{}:latest", project.id)
 }
 
+/// Name of the named volume mounted at `/home/claude`.
+///
+/// Takes the id rather than the `Project` because the disk view runs this
+/// mapping backwards: it reads volume names off the daemon and has to decide
+/// which project — if any — each one belongs to. See [`HOME_VOLUME_PREFIX`].
+pub fn home_volume_name(project_id: &str) -> String {
+    format!("{}{}", HOME_VOLUME_PREFIX, project_id)
+}
+
+/// Name of the named volume mounted at `/home/claude/.claude`, nested inside
+/// the home volume. This is the one holding the OAuth credential, the plugins
+/// and every session transcript.
+pub fn config_volume_name(project_id: &str) -> String {
+    format!("{}{}", CONFIG_VOLUME_PREFIX, project_id)
+}
+
+/// Prefix of [`home_volume_name`]. Split out because orphan detection scans the
+/// daemon's volume list for these prefixes and strips them back to a project id.
+pub const HOME_VOLUME_PREFIX: &str = "triple-c-home-";
+
+/// Prefix of [`config_volume_name`]. See [`HOME_VOLUME_PREFIX`].
+pub const CONFIG_VOLUME_PREFIX: &str = "triple-c-claude-config-";
+
 /// Keep the container's `~/.aws/credentials` in sync with the project's Bedrock
 /// auth on every container start:
 ///   - **Bedrock + static credentials**: (re)write `~/.aws/credentials` from the
@@ -2058,7 +2081,7 @@ const SCRUB_MARKER: &str = "###TRIPLE-C-SCRUBBED ";
 /// matches nothing is a no-op rather than an `rm` of a literal path.
 /// Inside the loop `$p` is quoted, so a filename containing whitespace is one
 /// argument.
-fn snapshot_scrub_script() -> String {
+pub(crate) fn snapshot_scrub_script() -> String {
     format!(
         r#"total=0
 for p in {paths}; do
@@ -2650,8 +2673,8 @@ pub async fn remove_snapshot_image(project: &Project) -> Result<(), String> {
 pub async fn remove_project_volumes(project: &Project) -> Result<(), String> {
     let docker = get_docker()?;
     for vol in [
-        format!("triple-c-home-{}", project.id),
-        format!("triple-c-claude-config-{}", project.id),
+        home_volume_name(&project.id),
+        config_volume_name(&project.id),
     ] {
         match docker.remove_volume(&vol, None).await {
             Ok(_) => log::info!("Removed volume {}", vol),

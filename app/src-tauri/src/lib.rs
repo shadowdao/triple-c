@@ -436,6 +436,12 @@ pub fn run() {
             commands::docker_commands::build_image,
             commands::docker_commands::get_container_info,
             commands::docker_commands::list_sibling_containers,
+            // Disk
+            commands::docker_commands::get_docker_disk_usage,
+            commands::docker_commands::list_reclaimable,
+            commands::docker_commands::reclaim,
+            commands::docker_commands::destroy_project_disk_object,
+            commands::docker_commands::sweep_orphaned_snapshots,
             // Projects
             commands::project_commands::list_projects,
             commands::project_commands::add_project,
