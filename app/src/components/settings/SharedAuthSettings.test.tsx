@@ -189,4 +189,115 @@ describe("SharedAuthSettings", () => {
     expect(toast.kind).toBe("success");
     expect(toast.message).toBe("Shared Claude token removed from the keychain.");
   });
+
+  // ── A skipped scrub is not a success, and must stay retryable ────────────
+  // `scrub_secrets_from_snapshots` refuses a project another operation holds
+  // rather than racing its `:latest` tag. That leaves a live ~1-year token in
+  // the image, so it can be neither folded into the success message nor
+  // described as a permanent failure whose remedy is Reset.
+
+  it("reports a skipped snapshot as an incomplete revocation, not a success", async () => {
+    const toast = await revoke({
+      snapshots_skipped: [
+        "triple-c-snapshot-p1:latest: This project's container is being started or recreated. Wait for it to finish before removing a credential from its snapshot.",
+      ],
+    });
+    expect(toast.kind).toBe("error");
+    expect(toast.message).toMatch(/still in 1 snapshot image/i);
+    expect(toast.detail).toMatch(/run the\s+cleanup again/i);
+    // The wrong advice for a transient refusal.
+    expect(toast.detail).not.toMatch(/Reset/i);
+  });
+
+  it("keeps a retry available after the revoke has cleared the keychain", async () => {
+    projects = [running()];
+    // Stored when the panel mounts, gone after the revoke — which is exactly
+    // the state that used to remove the only button able to finish the job.
+    hasClaudeToken.mockResolvedValueOnce(true).mockResolvedValue(false);
+    clearClaudeToken.mockResolvedValue({
+      snapshots_scrubbed: [],
+      snapshots_failed: [],
+      snapshots_skipped: ["triple-c-snapshot-p1:latest: busy"],
+      snapshots_superseded: [],
+      docker_unavailable: null,
+    });
+    render(<SharedAuthSettings />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke token" }));
+
+    const retry = await screen.findByTestId("shared-auth-retry");
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Revoke" })).not.toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("shared-auth-leftover")).toHaveTextContent(
+      /still readable/i,
+    );
+    expect(retry).toBeEnabled();
+  });
+
+  it("clears the warning when a retry finally finishes the job", async () => {
+    projects = [running()];
+    hasClaudeToken.mockResolvedValueOnce(true).mockResolvedValue(false);
+    clearClaudeToken.mockResolvedValueOnce({
+      snapshots_scrubbed: [],
+      snapshots_failed: [],
+      snapshots_skipped: ["triple-c-snapshot-p1:latest: busy"],
+      snapshots_superseded: [],
+      docker_unavailable: null,
+    });
+    render(<SharedAuthSettings />);
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke token" }));
+    const retry = await screen.findByTestId("shared-auth-retry");
+
+    clearClaudeToken.mockResolvedValueOnce({
+      snapshots_scrubbed: ["triple-c-snapshot-p1:latest"],
+      snapshots_failed: [],
+      snapshots_skipped: [],
+      snapshots_superseded: [],
+      docker_unavailable: null,
+    });
+    fireEvent.click(retry);
+
+    await waitFor(() =>
+      expect(screen.queryByTestId("shared-auth-leftover")).not.toBeInTheDocument(),
+    );
+    expect(clearClaudeToken).toHaveBeenCalledTimes(2);
+    const toast = useAppState.getState().toasts.at(-1)!;
+    expect(toast.kind).toBe("success");
+    expect(toast.message).toMatch(/cleared from 1 snapshot image/i);
+  });
+
+  it("offers a snapshot sweep even when no token is stored", async () => {
+    // Snapshots committed by an older build carry the token whether or not
+    // anything is in the keychain today, so the sweep cannot be gated on it.
+    projects = [running()];
+    hasClaudeToken.mockResolvedValue(false);
+    clearClaudeToken.mockResolvedValue({
+      snapshots_scrubbed: [],
+      snapshots_failed: [],
+      snapshots_skipped: [],
+      snapshots_superseded: [],
+      docker_unavailable: null,
+    });
+    render(<SharedAuthSettings />);
+
+    const sweep = await screen.findByTestId("shared-auth-sweep");
+    expect(screen.queryByRole("button", { name: "Revoke" })).not.toBeInTheDocument();
+    fireEvent.click(sweep);
+
+    await waitFor(() => expect(clearClaudeToken).toHaveBeenCalled());
+    const toast = useAppState.getState().toasts.at(-1)!;
+    expect(toast.kind).toBe("success");
+    expect(toast.message).toBe("No snapshot image is holding the token.");
+  });
+
+  it("tolerates a backend that does not report skipped snapshots", async () => {
+    // `snapshots_skipped` is newer than the rest of the payload; its absence
+    // must read as "none", never as undefined reaching the UI.
+    const toast = await revoke({ snapshots_scrubbed: ["triple-c-snapshot-p1:latest"] });
+    expect(toast.kind).toBe("success");
+    expect(screen.queryByTestId("shared-auth-leftover")).not.toBeInTheDocument();
+  });
 });

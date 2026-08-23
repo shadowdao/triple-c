@@ -1188,16 +1188,51 @@ pub async fn has_claude_token() -> Result<bool, String> {
     Ok(secure::has_claude_oauth_token())
 }
 
-/// What [`clear_claude_token`] managed to reach. The keychain entry is always
-/// gone by the time this is returned — the rest is about copies of the token
-/// that live outside it.
-#[derive(Debug, Default, serde::Serialize)]
+/// The tail of every refusal [`crate::project_lock::try_acquire`] produces.
+///
+/// [`crate::docker::container::scrub_secrets_from_snapshots`] folds two very
+/// different things into one `failed` list: an image that genuinely could not
+/// be rewritten, and one that was never *attempted* because another operation
+/// held the project. Only the second is retryable, and only the second should
+/// be described to the user as "come back in a minute" rather than "reset this
+/// project". Splitting them needs a discriminator, and the refusal string is
+/// the only one that crosses the module boundary — `try_acquire` returns
+/// `Result<ProjectGuard, String>`, and `container.rs` pushes that `String`
+/// through unchanged.
+///
+/// Matching on prose is normally a mistake, so this is pinned by
+/// [`tests::a_real_lock_refusal_is_recognised_as_retryable`], which builds a
+/// refusal by actually taking a guard rather than by copying the wording. If
+/// `project_lock` ever rephrases, that test fails instead of this silently
+/// misclassifying a credential that was left in place.
+const PROJECT_BUSY_MARKER: &str = "Wait for it to finish before ";
+
+/// Whether a scrub failure means "somebody else has this project right now",
+/// which is transient, rather than "this image cannot be rewritten", which is
+/// not. Nothing bollard returns contains [`PROJECT_BUSY_MARKER`].
+fn is_project_busy_refusal(reason: &str) -> bool {
+    reason.contains(PROJECT_BUSY_MARKER)
+}
+
+/// What [`clear_claude_token`] managed to reach. The keychain entry is gone by
+/// the time this is returned — the rest is about copies of the token that live
+/// outside it.
+///
+/// Three lists rather than one, because "we rewrote it", "we could not rewrite
+/// it" and "we did not try" are three different things to tell somebody who
+/// just revoked a credential, and only the last one is fixed by waiting.
+#[derive(Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct ClearTokenOutcome {
     /// Snapshot images that were holding the token and have been rewritten.
     pub snapshots_scrubbed: Vec<String>,
     /// Images still holding it, with the reason each could not be rewritten.
     /// Non-empty means the revocation is **incomplete** and the UI must say so.
     pub snapshots_failed: Vec<String>,
+    /// Images still holding it that were **not attempted**, because another
+    /// operation held the project (a start, a compaction, a migration). Also an
+    /// incomplete revocation — but a retryable one, and the UI must not offer
+    /// "Reset the project" as the remedy for it.
+    pub snapshots_skipped: Vec<String>,
     /// Rewritten, but the pre-rewrite image object could not be deleted because
     /// a container is still running off it. Worth mentioning, not worth
     /// alarming about — see `SnapshotScrubReport::superseded_retained`.
@@ -1207,7 +1242,43 @@ pub struct ClearTokenOutcome {
     pub docker_unavailable: Option<String>,
 }
 
-/// Forget the shared Claude token.
+impl ClearTokenOutcome {
+    /// Whether a copy of the credential is known — or suspected — to still be
+    /// reachable, so the caller should offer to run the sweep again.
+    ///
+    /// `snapshots_superseded` is deliberately not counted: that image is
+    /// untagged, nothing new is built from it, and it goes away on the next
+    /// restart. Re-running would report it forever and train the user to
+    /// ignore the warning.
+    pub fn needs_another_pass(&self) -> bool {
+        !self.snapshots_failed.is_empty()
+            || !self.snapshots_skipped.is_empty()
+            || self.docker_unavailable.is_some()
+    }
+}
+
+/// Fold a scrub report into the IPC shape, splitting the busy projects out of
+/// the failures. Separate from the command so it can be tested without Docker.
+fn summarise_scrub(report: crate::docker::container::SnapshotScrubReport) -> ClearTokenOutcome {
+    let mut outcome = ClearTokenOutcome {
+        snapshots_scrubbed: report.scrubbed,
+        snapshots_superseded: report.superseded_retained,
+        docker_unavailable: report.unavailable,
+        ..Default::default()
+    };
+    for (image, reason) in report.failed {
+        let line = format!("{}: {}", image, reason);
+        if is_project_busy_refusal(&reason) {
+            outcome.snapshots_skipped.push(line);
+        } else {
+            outcome.snapshots_failed.push(line);
+        }
+    }
+    outcome
+}
+
+/// Forget the shared Claude token, and remove the copies of it that outlive the
+/// keychain entry.
 ///
 /// Deleting the keychain entry is the easy half. The token also exists in two
 /// other places, and a "Revoke" button that leaves either of them behind is
@@ -1223,34 +1294,83 @@ pub struct ClearTokenOutcome {
 ///    as long as the image exists. New commits no longer bake it in (see
 ///    [`crate::docker::container::commit_container_snapshot`]), but images
 ///    committed by earlier builds have to be rewritten, which is what
-///    [`scrub_secrets_from_snapshots`] does here.
+///    [`crate::docker::container::scrub_secrets_from_snapshots`] does here.
+///
+/// ## Why the snapshots go first
+///
+/// They used to go second, and that ordering had no recovery path. The scrub
+/// runs **once** and skips any project another operation holds; the keychain
+/// entry, already deleted, made `has_claude_token` false; and the frontend only
+/// rendered Revoke while a token was stored. So a project that happened to be
+/// starting during a revoke kept a live ~1-year OAuth token in its snapshot's
+/// `Config.Env` permanently, and the only remedy the UI still offered was Reset,
+/// which destroys both volumes.
+///
+/// Scrubbing first closes the crash window in that story: the app can be killed
+/// at any point during the sweep and the *next* launch still says
+/// "authenticated", so the same button is still there and still does the same
+/// thing. Nothing is lost by the reorder — `rewrite_image_without_secrets`
+/// never reads the keychain, and `commit_container_snapshot` no longer bakes
+/// the token in, so there is no window in which a scrubbed image is re-poisoned
+/// by the entry we have not deleted yet.
+///
+/// ## This command is the retry
+///
+/// It is idempotent and safe to call with no token stored: `delete_entry`
+/// treats a missing entry as success, and the sweep re-derives what is left
+/// from Docker rather than from any record we would have to keep. So "try the
+/// snapshot cleanup again" needs no second command and no persisted to-do
+/// list — the images themselves are the durable record, and calling this again
+/// is how the user acts on [`ClearTokenOutcome::needs_another_pass`].
 ///
 /// The keychain deletion is never rolled back if the scrub fails; a partially
 /// completed revocation is still better than none, and the outcome is reported
 /// so the UI can be explicit about what is left.
 #[tauri::command]
 pub async fn clear_claude_token() -> Result<ClearTokenOutcome, String> {
-    secure::delete_claude_oauth_token()?;
+    let report = crate::docker::container::scrub_secrets_from_snapshots().await;
+    let swept_clean = !report.left_something_behind();
+    let outcome = summarise_scrub(report);
+
+    // The keychain second — see "Why the snapshots go first". An error here is
+    // the loud case (the token may still be usable), so it wins over the
+    // report, which is logged rather than dropped on the floor.
+    if let Err(e) = secure::delete_claude_oauth_token() {
+        log::error!(
+            "Could not delete the shared Claude token from the keychain; the snapshot sweep had \
+             already scrubbed {} image(s), failed on {}, skipped {}",
+            outcome.snapshots_scrubbed.len(),
+            outcome.snapshots_failed.len(),
+            outcome.snapshots_skipped.len()
+        );
+        return Err(e);
+    }
     log::info!("Cleared the shared Claude authentication token");
 
-    let report = crate::docker::container::scrub_secrets_from_snapshots().await;
-    if report.left_something_behind() {
+    for image in &outcome.snapshots_failed {
+        log::warn!("Revoked the shared Claude token but could not clear it from {}", image);
+    }
+    for image in &outcome.snapshots_skipped {
         log::warn!(
-            "Revoked the shared Claude token but {} snapshot image(s) may still contain it",
-            report.failed.len()
+            "Revoked the shared Claude token but left it in {} — the project was busy; \
+             revoking again will retry",
+            image
+        );
+    }
+    if let Some(ref reason) = outcome.docker_unavailable {
+        log::warn!(
+            "Revoked the shared Claude token without checking any snapshot image: {}",
+            reason
+        );
+    }
+    if swept_clean && !outcome.needs_another_pass() {
+        log::info!(
+            "No snapshot image is still holding the shared Claude token ({} rewritten)",
+            outcome.snapshots_scrubbed.len()
         );
     }
 
-    Ok(ClearTokenOutcome {
-        snapshots_scrubbed: report.scrubbed,
-        snapshots_failed: report
-            .failed
-            .into_iter()
-            .map(|(image, reason)| format!("{}: {}", image, reason))
-            .collect(),
-        snapshots_superseded: report.superseded_retained,
-        docker_unavailable: report.unavailable,
-    })
+    Ok(outcome)
 }
 
 #[cfg(test)]
@@ -1761,5 +1881,135 @@ mod tests {
         seen.push_str(&s.push(format!("\nYour token: {}\n", tok).as_bytes()));
         assert_eq!(parse_setup_token(&seen), Some(tok));
     }
-}
 
+    // ── Revocation: what the sweep leaves behind, and how it is described ──
+
+    use crate::docker::container::SnapshotScrubReport;
+    use crate::project_lock::{try_acquire, ProjectOp};
+
+    /// The classifier is a substring match on a message another module owns,
+    /// which is only safe if something notices when that module rephrases. So
+    /// build the refusal the way production does — by actually losing the
+    /// race — rather than by pasting the wording in here.
+    #[test]
+    fn a_real_lock_refusal_is_recognised_as_retryable() {
+        let project = "auth-token-test-busy-project";
+        let _held = try_acquire(project, ProjectOp::Compaction).expect("first claim");
+        let refusal = try_acquire(project, ProjectOp::SecretScrub)
+            .expect_err("a second claim on the same project must be refused");
+
+        assert!(
+            is_project_busy_refusal(&refusal),
+            "project_lock's refusal is no longer recognised as retryable: {:?}",
+            refusal
+        );
+    }
+
+    #[test]
+    fn a_docker_failure_is_not_mistaken_for_a_busy_project() {
+        for reason in [
+            "could not inspect: error trying to connect: No such file or directory",
+            "could not create a scratch container: conflict: name already in use",
+            "an untagged snapshot image holds a credential and cannot be rewritten",
+        ] {
+            assert!(
+                !is_project_busy_refusal(reason),
+                "{:?} was misclassified as a transient lock refusal",
+                reason
+            );
+        }
+    }
+
+    #[test]
+    fn summarise_scrub_separates_a_busy_project_from_a_broken_image() {
+        let project = "auth-token-test-summarise-busy";
+        let _held = try_acquire(project, ProjectOp::Recreate).expect("first claim");
+        let refusal = try_acquire(project, ProjectOp::SecretScrub).expect_err("refused");
+
+        let outcome = summarise_scrub(SnapshotScrubReport {
+            scrubbed: vec!["triple-c-snapshot-a:latest".into()],
+            failed: vec![
+                ("triple-c-snapshot-b:latest".into(), refusal),
+                (
+                    "triple-c-snapshot-c:latest".into(),
+                    "could not create a scratch container: no such image".into(),
+                ),
+            ],
+            superseded_retained: vec!["triple-c-snapshot-a:latest".into()],
+            unavailable: None,
+        });
+
+        assert_eq!(outcome.snapshots_scrubbed, vec!["triple-c-snapshot-a:latest"]);
+        assert_eq!(outcome.snapshots_skipped.len(), 1, "{:?}", outcome);
+        assert!(outcome.snapshots_skipped[0].starts_with("triple-c-snapshot-b:latest: "));
+        assert_eq!(outcome.snapshots_failed.len(), 1, "{:?}", outcome);
+        assert!(outcome.snapshots_failed[0].starts_with("triple-c-snapshot-c:latest: "));
+        // The whole point: a skipped image is never folded into the scrubbed
+        // list, which is what "success" is rendered from.
+        assert!(!outcome.snapshots_scrubbed.iter().any(|s| s.contains("snapshot-b")));
+    }
+
+    #[test]
+    fn a_clean_sweep_needs_no_second_pass() {
+        let outcome = summarise_scrub(SnapshotScrubReport {
+            scrubbed: vec!["triple-c-snapshot-a:latest".into()],
+            ..Default::default()
+        });
+        assert!(!outcome.needs_another_pass());
+    }
+
+    #[test]
+    fn a_retained_superseded_image_alone_does_not_ask_for_a_second_pass() {
+        // The tag is clean; what is left is untagged and dies with the running
+        // container. Asking the user to sweep again would never stop.
+        let outcome = summarise_scrub(SnapshotScrubReport {
+            scrubbed: vec!["triple-c-snapshot-a:latest".into()],
+            superseded_retained: vec!["triple-c-snapshot-a:latest".into()],
+            ..Default::default()
+        });
+        assert!(!outcome.needs_another_pass());
+    }
+
+    #[test]
+    fn anything_still_holding_the_credential_asks_for_a_second_pass() {
+        let skipped = summarise_scrub(SnapshotScrubReport {
+            failed: vec![(
+                "triple-c-snapshot-b:latest".into(),
+                format!("This project is being reset. {}resetting it.", PROJECT_BUSY_MARKER),
+            )],
+            ..Default::default()
+        });
+        assert!(skipped.needs_another_pass());
+        assert_eq!(skipped.snapshots_skipped.len(), 1);
+
+        let failed = summarise_scrub(SnapshotScrubReport {
+            failed: vec![("triple-c-snapshot-c:latest".into(), "could not inspect: boom".into())],
+            ..Default::default()
+        });
+        assert!(failed.needs_another_pass());
+
+        let blind = summarise_scrub(SnapshotScrubReport {
+            unavailable: Some("Docker is not running".into()),
+            ..Default::default()
+        });
+        assert!(blind.needs_another_pass());
+        assert!(blind.snapshots_scrubbed.is_empty());
+    }
+
+    /// The IPC contract the frontend reads. A field renamed on this side and
+    /// not on that one is a silent "nothing was skipped".
+    #[test]
+    fn the_outcome_serialises_under_the_names_the_frontend_reads() {
+        let json = serde_json::to_value(ClearTokenOutcome::default()).expect("serialise");
+        let object = json.as_object().expect("an object");
+        for key in [
+            "snapshots_scrubbed",
+            "snapshots_failed",
+            "snapshots_skipped",
+            "snapshots_superseded",
+            "docker_unavailable",
+        ] {
+            assert!(object.contains_key(key), "missing {} in {:?}", key, object);
+        }
+    }
+}
