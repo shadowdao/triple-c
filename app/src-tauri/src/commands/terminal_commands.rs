@@ -196,6 +196,12 @@ pub async fn upload_host_file_to_terminal(
     host_path: String,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
+    // The drop target is a host path chosen by the webview, not by the OS drag
+    // itself, so it gets the same host-read policy as the Files pane's upload:
+    // absolute, no traversal, and nothing out of a hidden directory
+    // (`~/.ssh`, `~/.aws`) or a system location.
+    let host_path = crate::commands::file_commands::validate_host_read_path(&host_path)?;
+
     let container_id = state.exec_manager.get_container_id(&session_id).await?;
 
     let meta = tokio::fs::metadata(&host_path)

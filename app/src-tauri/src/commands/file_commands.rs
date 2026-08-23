@@ -12,7 +12,7 @@ use tauri::{AppHandle, Manager, State};
 
 use crate::docker::client::get_docker;
 use crate::docker::exec::{
-    build_single_file_tar, container_user_ids, exec_oneshot, exec_oneshot_as, now_epoch_secs,
+    build_single_file_tar, container_user_ids, exec_oneshot_as, now_epoch_secs,
 };
 use crate::AppState;
 
@@ -60,6 +60,10 @@ pub async fn list_container_files(
     path: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<FileEntry>, String> {
+    // Before anything else: an unvalidated `path` here is not a listing bug, it
+    // is an argument-injection one. See the module's path-validation section.
+    validate_container_path("Folder", &path)?;
+
     let project = state
         .projects_store
         .get(&project_id)
@@ -70,46 +74,96 @@ pub async fn list_container_files(
         .as_ref()
         .ok_or_else(|| "Container not running".to_string())?;
 
-    // `%y` is the entry's own type, `%Y` the type it *dereferences* to. Both
-    // are printed: `%Y` is what decides navigability (a symlinked directory
-    // reports `l` under `%y`, which used to make it an unopenable row), while
-    // `%y` is the only way left to tell the user it is a link at all. `%Y` is
-    // `N` for a broken link and `L` for a loop, neither of which is `d`.
-    let cmd = vec![
+    // `exec_oneshot` discards the exit code, which is how a `find` that listed
+    // nothing at all reached the UI as a cheerful "Empty directory". The status
+    // only decides what an *empty* result means, though: `find` also exits
+    // non-zero when a single child vanished mid-scan, and the rows it did
+    // print are still the right answer.
+    let (output, code) =
+        exec_oneshot_as(container_id, "claude", list_argv(&path), Vec::new()).await?;
+
+    let entries = parse_find_output(&path, &output);
+    if code != 0 && entries.is_empty() {
+        // `find`'s own words — "Permission denied", "No such file or directory"
+        // — are the whole diagnosis, and stderr is merged into `output`.
+        let detail = output.trim();
+        return Err(if detail.is_empty() {
+            format!("Could not list {} (exit {})", path, code)
+        } else {
+            detail.to_string()
+        });
+    }
+    if code != 0 {
+        log::warn!(
+            "find exited {} listing {}; returning the {} entries it did print",
+            code,
+            path,
+            entries.len()
+        );
+    }
+
+    Ok(entries)
+}
+
+/// The argv `list_container_files` runs, in one place so the format and the
+/// parser can be pinned together.
+///
+/// `%y` is the entry's own type, `%Y` the type it *dereferences* to. Both are
+/// printed: `%Y` is what decides navigability (a symlinked directory reports
+/// `l` under `%y`, which used to make it an unopenable row), while `%y` is the
+/// only way left to tell the user it is a link at all. `%Y` is `N` for a broken
+/// link and `L` for a loop, neither of which is `d`.
+///
+/// `%f` comes *last* and records are terminated by NUL, both because of what a
+/// filename is allowed to contain: a tab in a name used to shift every column
+/// after it (a crafted name rendered as a directory row), and a newline in a
+/// name could forge a whole extra row. With the name last there is nothing left
+/// to shift, and NUL is the one byte a Linux filename cannot hold.
+///
+/// The separators are passed as the two-character escapes `\t` and `\0` for
+/// `find` itself to expand: a literal NUL cannot travel in argv, which would
+/// truncate the format string at the terminator.
+fn list_argv(path: &str) -> Vec<String> {
+    vec![
         "find".to_string(),
-        path.clone(),
+        path.to_string(),
         "-mindepth".to_string(),
         "1".to_string(),
         "-maxdepth".to_string(),
         "1".to_string(),
         "-printf".to_string(),
-        "%f\t%y\t%Y\t%s\t%T@\t%m\n".to_string(),
-    ];
-
-    let output = exec_oneshot(container_id, cmd).await?;
-
-    Ok(parse_find_output(&path, &output))
+        "%y\\t%Y\\t%s\\t%T@\\t%m\\t%f\\0".to_string(),
+    ]
 }
 
-/// Turn `find -printf '%f\t%y\t%Y\t%s\t%T@\t%m\n'` output into sorted entries.
+/// Turn `find -printf '%y\t%Y\t%s\t%T@\t%m\t%f\0'` output into sorted entries.
 ///
 /// Split out from the command so it can be tested without a container: it is
 /// the half where a format change silently mis-types every row.
+///
+/// Records are NUL-terminated and the name is the *last* field, so the split is
+/// capped at six pieces: whatever tabs a filename contains land inside the name
+/// instead of shifting the type, size and permission columns along one.
 fn parse_find_output(dir: &str, output: &str) -> Vec<FileEntry> {
     let mut entries: Vec<FileEntry> = output
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| {
-            let parts: Vec<&str> = line.split('\t').collect();
-            if parts.len() < 6 {
+        .split('\0')
+        .filter(|record| !record.trim().is_empty())
+        .filter_map(|record| {
+            let mut parts = record.splitn(6, '\t');
+            let own_type = parts.next()?;
+            let deref_type = parts.next()?;
+            let size_field = parts.next()?;
+            let mtime_field = parts.next()?;
+            let mode_field = parts.next()?;
+            let name = parts.next()?.to_string();
+            if name.is_empty() {
                 return None;
             }
-            let name = parts[0].to_string();
-            let is_symlink = parts[1] == "l";
-            let is_directory = parts[2] == "d";
-            let size = parts[3].parse::<u64>().unwrap_or(0);
-            let modified_epoch = parts[4].parse::<f64>().unwrap_or(0.0);
-            let permissions = parts[5].to_string();
+            let is_symlink = own_type == "l";
+            let is_directory = deref_type == "d";
+            let size = size_field.parse::<u64>().unwrap_or(0);
+            let modified_epoch = mtime_field.parse::<f64>().unwrap_or(0.0);
+            let permissions = mode_field.to_string();
 
             // Convert epoch to ISO-ish string
             let modified = {
@@ -188,6 +242,307 @@ fn validate_entry_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Path validation
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// `validate_entry_name` above covers the *new name* half of rename and mkdir.
+// The paths themselves — `path`, `from_path`, `parent_path`, `container_dir`,
+// `container_path`, `host_path` — arrived over IPC entirely unchecked, and both
+// ends of the trip are real: a container path under `/workspace/{mount_name}`
+// is a host bind mount, i.e. the user's actual repository, and a host path is
+// the host.
+//
+// The listing command is the reason this section exists. `find` ends its list
+// of starting points at the first argument beginning with `-`, so a `path` of
+// `-delete` supplied zero starting points (it defaults to `.`, and the exec
+// inherits the container's WorkingDir — the bind-mounted project) and an
+// expression of `-delete -mindepth 1 -maxdepth 1 -printf …`. Verified against a
+// live container on findutils 4.9.0 and again on 4.10.0: it deletes files and
+// empty directories out of the bind mount, and `exec_oneshot` threw away the
+// exit status, so the panel reported an empty folder afterwards. A `--`
+// separator is *not* the fix — `find` has no such convention for starting
+// points — but requiring the path to be absolute is, and it is the same check
+// that stops `..` traversal.
+
+/// `PATH_MAX` on Linux. Nothing legitimate comes close; a path longer than this
+/// cannot name a file in the container anyway.
+const MAX_CONTAINER_PATH_LEN: usize = 4096;
+
+/// Container roots this panel may *create, rename or upload into*.
+///
+/// Reads are deliberately not restricted this way (see
+/// [`validate_container_path`]): the Files tab is a browser, `/etc/os-release`
+/// and `/usr/lib` are legitimate things to look at, and for reading, the
+/// container user's own permissions are the boundary that matters.
+///
+/// Writes are restricted, because a write here lands in one of exactly two
+/// places worth protecting and nowhere else is worth reaching:
+///   * `/workspace` — the project bind mounts, i.e. host files;
+///   * `/home/claude` — the persisted home volume (settings, skills, session
+///     history), which users legitimately reorganise from this panel, so it
+///     cannot be excluded even though `.claude/.credentials.json` lives there;
+///   * `/tmp` — where terminal drops and pasted images are staged.
+/// Everything else is either read-only image content or a system directory
+/// where the container user's `mv` fails anyway. Refusing up front turns a
+/// confusing "Permission denied" into a clear sentence, and keeps a caller out
+/// of `/etc` in a container that happens to run as root.
+const CONTAINER_WRITE_ROOTS: &[&str] = &["/workspace", "/home/claude", "/tmp"];
+
+/// Structural validation for any container path arriving over IPC.
+///
+/// `what` names the parameter in the error, because these messages are shown to
+/// a user who is looking at a folder, not at argv.
+fn validate_container_path(what: &str, path: &str) -> Result<(), String> {
+    if path.is_empty() {
+        return Err(format!("{} path cannot be empty", what));
+    }
+    if !path.starts_with('/') {
+        // Absoluteness is what makes the string a *path* rather than an
+        // argument: `-delete` is refused right here, and so is anything that
+        // would otherwise be resolved against a working directory nobody chose.
+        return Err(format!(
+            "{} path must be absolute (start with \"/\"): {}",
+            what, path
+        ));
+    }
+    if path.contains('\0') {
+        return Err(format!("{} path cannot contain a null byte", what));
+    }
+    // Rejected rather than normalised: a `..` in a path the UI built is a bug,
+    // and a `..` in a path the UI did not build is an attempt to leave the
+    // folder the user is looking at.
+    if path.split('/').any(|segment| segment == "..") {
+        return Err(format!("{} path cannot contain \"..\": {}", what, path));
+    }
+    if path.len() > MAX_CONTAINER_PATH_LEN {
+        return Err(format!("{} path is too long ({} bytes maximum)", what, MAX_CONTAINER_PATH_LEN));
+    }
+    Ok(())
+}
+
+/// [`validate_container_path`] plus containment in [`CONTAINER_WRITE_ROOTS`],
+/// for every path this module is about to change something at.
+fn validate_container_write_path(what: &str, path: &str) -> Result<(), String> {
+    validate_container_path(what, path)?;
+    if CONTAINER_WRITE_ROOTS
+        .iter()
+        .any(|root| is_under_root(path, root))
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "{} path is outside the folders this panel can change ({}): {}",
+        what,
+        CONTAINER_WRITE_ROOTS.join(", "),
+        path
+    ))
+}
+
+/// Whether `path` is `root` itself or something beneath it.
+///
+/// Compared by whole segments, so `/workspace-backup` is not "under"
+/// `/workspace` — a plain `starts_with` is the classic way to get that wrong.
+fn is_under_root(path: &str, root: &str) -> bool {
+    let path = path.trim_end_matches('/');
+    let root = root.trim_end_matches('/');
+    path == root || path.strip_prefix(root).is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// What a host path is about to be used for. The two directions differ over
+/// hidden names — see [`validate_host_path`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum HostPathUse {
+    /// Host bytes are about to be read *into* the container.
+    Read,
+    /// Container bytes are about to be written *onto* the host.
+    Write,
+}
+
+/// Host directories nothing in this app has any business reading a file out of
+/// or writing one into.
+///
+/// Defence in depth, not the boundary: most of these are root-owned and the
+/// write would fail anyway. They are listed so that a build running with more
+/// privilege than usual still cannot be talked into replacing a system file,
+/// and so the refusal is a sentence rather than an errno. Compared after
+/// lowercasing and mapping `\` to `/`, which is what makes the Windows entries
+/// work.
+const HOST_SYSTEM_ROOTS: &[&str] = &[
+    "/bin", "/boot", "/dev", "/etc", "/lib", "/lib32", "/lib64", "/libx32", "/proc", "/root",
+    "/sbin", "/sys", "/usr", "/var",
+    // macOS keeps its own copies of the same idea.
+    "/system", "/library",
+    // Windows.
+    "c:/windows", "c:/program files", "c:/program files (x86)", "c:/programdata",
+];
+
+/// Validate a host path that arrived over IPC, returning it as a [`PathBuf`].
+///
+/// The `save()`/`open()` dialog the Files pane puts in front of these commands
+/// is a UI convention, not a boundary — every one of them is a single `invoke`
+/// away from any code running in the webview, with a container-controlled
+/// payload on one side. So the backend has its own policy, and it is deliberately
+/// blunt:
+///
+///   * absolute, no `..`, no NUL — the same structural rules as a container
+///     path, using [`Path::components`] so a Windows path is judged as one;
+///   * nothing under [`HOST_SYSTEM_ROOTS`];
+///   * no *hidden* path components. This is the rule that matters. The
+///     interesting targets for "write a container-controlled file to an
+///     arbitrary host path" are all dot directories — `~/.ssh/authorized_keys`,
+///     `~/.config/autostart/`, `~/.claude/` — and the interesting targets for
+///     the reverse, reading a host file into the container, are the same ones
+///     plus `~/.aws/credentials`. A download is refused a hidden *name* too
+///     (creating `~/.bashrc` is escape all by itself); an upload only cares
+///     about hidden *directories*, because dragging a project's own `.env` into
+///     the container is an ordinary thing to do and its parent is not hidden.
+///
+/// What it costs: saving a container file to a hidden host location now has to
+/// go somewhere visible first. That is a small, explainable price for closing a
+/// container→host write primitive.
+fn validate_host_path(path: &str, use_for: HostPathUse) -> Result<PathBuf, String> {
+    use std::path::Component;
+
+    if path.trim().is_empty() {
+        return Err("No host path was given".to_string());
+    }
+    if path.contains('\0') {
+        return Err("Host path cannot contain a null byte".to_string());
+    }
+
+    let candidate = PathBuf::from(path);
+    if !candidate.is_absolute() {
+        return Err(format!("Host path must be absolute: {}", path));
+    }
+
+    let components: Vec<Component> = candidate.components().collect();
+    if components.iter().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(format!("Host path cannot contain \"..\": {}", path));
+    }
+
+    // The final component is the file itself; everything before it is a
+    // directory the path passes *through*.
+    let names: Vec<String> = components
+        .iter()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .collect();
+    let hidden_limit = match use_for {
+        HostPathUse::Write => names.len(),
+        HostPathUse::Read => names.len().saturating_sub(1),
+    };
+    if let Some(hidden) = names[..hidden_limit].iter().find(|n| n.starts_with('.')) {
+        return Err(format!(
+            "\"{}\" is a hidden {} — Triple-C will not {} there. Choose a visible location.",
+            hidden,
+            if names.last() == Some(hidden) { "file" } else { "folder" },
+            if use_for == HostPathUse::Write { "save" } else { "read" }
+        ));
+    }
+
+    let normalized = path.replace('\\', "/").to_lowercase();
+    if let Some(root) = HOST_SYSTEM_ROOTS
+        .iter()
+        .find(|root| is_under_root(&normalized, root))
+    {
+        return Err(format!(
+            "{} is a system location — Triple-C will not {} files there.",
+            root,
+            if use_for == HostPathUse::Write { "write" } else { "read" }
+        ));
+    }
+
+    Ok(candidate)
+}
+
+/// [`validate_host_path`] for a host file about to be read into a container,
+/// handed back as a `String`.
+///
+/// Public because the terminal's drag-and-drop drop target
+/// (`terminal_commands::upload_host_file_to_terminal`) is the same primitive as
+/// the Files pane's upload and must not have a different policy.
+pub fn validate_host_read_path(path: &str) -> Result<String, String> {
+    Ok(validate_host_path(path, HostPathUse::Read)?
+        .to_string_lossy()
+        .to_string())
+}
+
+/// Where a download is written before it becomes the file the user asked for.
+///
+/// Same directory as the destination, so the last step is a rename within one
+/// filesystem: atomic, and the destination is not touched *at all* until the
+/// whole transfer has succeeded. That ordering is the fix for the worst part of
+/// the old code, which created (i.e. truncated) the destination first and then
+/// deleted it when the stream failed — turning "your download failed" into
+/// "your download failed and the file that used to be there is gone".
+///
+/// A rename also handles an existing destination better than an `open` would:
+/// it replaces a symlink rather than following it out of the vetted directory.
+///
+/// Deliberately not a hidden name: if a crash leaves one behind, it should be
+/// visible next to the file it was going to become.
+fn partial_download_path(dest: &Path) -> Result<PathBuf, String> {
+    let name = dest
+        .file_name()
+        .ok_or_else(|| format!("{} does not name a file", dest.display()))?;
+    let mut partial = name.to_os_string();
+    partial.push(format!(
+        ".triple-c-part-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    ));
+    Ok(dest.with_file_name(partial))
+}
+
+/// Move a finished partial file onto the destination the user chose.
+///
+/// A plain rename is the whole story on Unix: atomic, and it replaces an
+/// existing file. Windows refuses to rename onto an existing path, so the
+/// destination is removed and the rename retried — deliberately *only here*,
+/// after the payload is completely written and only for a destination the user
+/// picked in a save dialog that already asked about overwriting. That is the
+/// difference from the old code, which deleted the destination on the *failure*
+/// path, when the replacement did not exist.
+async fn finish_download(partial: &Path, dest: &Path) -> Result<(), String> {
+    match tokio::fs::rename(partial, dest).await {
+        Ok(()) => Ok(()),
+        Err(_) if tokio::fs::try_exists(dest).await.unwrap_or(false) => {
+            tokio::fs::remove_file(dest)
+                .await
+                .map_err(|e| format!("Failed to replace {}: {}", dest.display(), e))?;
+            tokio::fs::rename(partial, dest)
+                .await
+                .map_err(|e| format!("Failed to save {}: {}", dest.display(), e))
+        }
+        Err(e) => Err(format!("Failed to save {}: {}", dest.display(), e)),
+    }
+}
+
+/// Ceiling on one "Save to host…" download, checked against the size the tar
+/// entry declares — i.e. before a byte of payload is read.
+///
+/// The transfer itself is streamed, so this is not a memory bound any more; it
+/// is the bound on how much of the user's disk a single mis-aimed or hostile
+/// download can consume before anyone notices. Comfortably past any file this
+/// panel is used for, and the message names Backup as the way to take a whole
+/// tree instead.
+const MAX_DOWNLOAD_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Refuse an oversize download by its declared size. Split out so the ceiling
+/// and its wording are testable without a container.
+fn check_download_size(size: u64) -> Result<(), String> {
+    if size > MAX_DOWNLOAD_BYTES {
+        return Err(format!(
+            "{:.1} GB is too large to save ({} GB limit) — use Backup for a whole tree, or read it from the mounted project directly.",
+            size as f64 / (1024.0 * 1024.0 * 1024.0),
+            MAX_DOWNLOAD_BYTES / (1024 * 1024 * 1024)
+        ));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn download_container_file(
     project_id: String,
@@ -195,6 +550,9 @@ pub async fn download_container_file(
     host_path: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    validate_container_path("File", &container_path)?;
+    let dest = validate_host_path(&host_path, HostPathUse::Write)?;
+
     let project = state
         .projects_store
         .get(&project_id)
@@ -205,13 +563,181 @@ pub async fn download_container_file(
         .as_ref()
         .ok_or_else(|| "Container not running".to_string())?;
 
-    let fetched = fetch_container_file(container_id, &container_path, None).await?;
+    // Written beside the destination and renamed on success, so a failure
+    // anywhere below leaves whatever was already at `dest` untouched.
+    let partial = partial_download_path(&dest)?;
 
-    tokio::fs::write(&host_path, &fetched.bytes)
-        .await
-        .map_err(|e| format!("Failed to write file to host: {}", e))?;
+    let streamed = stream_container_file_to_host(container_id, &container_path, &partial).await;
 
-    Ok(())
+    match streamed {
+        Ok(written) => {
+            if let Err(e) = finish_download(&partial, &dest).await {
+                let _ = tokio::fs::remove_file(&partial).await;
+                return Err(e);
+            }
+            log::info!(
+                "Saved {} bytes from {} to {}",
+                written,
+                container_path,
+                dest.display()
+            );
+            Ok(())
+        }
+        Err(e) => {
+            // Only ever our own partial file — never the user's destination.
+            let _ = tokio::fs::remove_file(&partial).await;
+            Err(e)
+        }
+    }
+}
+
+/// Copy one regular file out of a container straight onto a host path,
+/// streaming, and return the number of bytes written.
+///
+/// The old download path called [`fetch_container_file`] with no cap, which
+/// buffered the entire transfer in host RAM twice (the tar, then the extracted
+/// bytes) and only refused a *directory* after that buffer had been filled — so
+/// `container_path = "/"` pulled the whole container filesystem into memory
+/// before erroring, and a 40 GB sparse file was an out-of-memory kill.
+///
+/// Nothing here holds more than a few chunks at a time: Docker's tar stream is
+/// pumped through a small bounded channel into a blocking task, which is where
+/// the `tar` crate (synchronous, and the only thing that correctly understands
+/// PAX/GNU long-name and large-size members) reads the header, refuses anything
+/// that is not a regular file *before creating the host file*, checks the
+/// declared size against [`MAX_DOWNLOAD_BYTES`], and only then copies payload to
+/// disk.
+async fn stream_container_file_to_host(
+    container_id: &str,
+    container_path: &str,
+    dest: &Path,
+) -> Result<u64, String> {
+    let docker = get_docker()?;
+
+    let mut stream = docker.download_from_container(
+        container_id,
+        Some(DownloadFromContainerOptions {
+            path: container_path.to_string(),
+        }),
+    );
+
+    // Four chunks of backpressure: the feeder stops pulling from the socket as
+    // soon as the writer stops consuming, which is what bounds memory here.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, String>>(4);
+    let feeder = tokio::spawn(async move {
+        while let Some(chunk) = stream.next().await {
+            let failed = chunk.is_err();
+            let item = chunk
+                .map(|bytes| bytes.to_vec())
+                .map_err(|e| format!("Failed to download file: {}", e));
+            // A closed receiver means the reader is done (or gave up) — dropping
+            // the stream cancels the rest of the transfer.
+            if tx.send(item).await.is_err() || failed {
+                break;
+            }
+        }
+    });
+
+    let reader = ChannelReader::new(rx);
+    let dest = dest.to_path_buf();
+    let label = container_path.to_string();
+
+    let result = tokio::task::spawn_blocking(move || -> Result<u64, String> {
+        let mut archive = tar::Archive::new(reader);
+        let mut entries = archive
+            .entries()
+            .map_err(|e| format!("Failed to read tar entries: {}", e))?;
+        let mut entry = match entries.next() {
+            Some(entry) => entry.map_err(|e| format!("Failed to read tar entry: {}", e))?,
+            None => return Err(format!("{} not found in the container", label)),
+        };
+
+        // Type first, size second, host file third. That order is the fix.
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_dir() {
+            return Err(format!(
+                "{} is a folder — download its files individually, or use Backup to archive a whole tree.",
+                label
+            ));
+        }
+        if entry_type.is_symlink() || entry_type.is_hard_link() {
+            return Err(format!("{} is a link — save its target instead.", label));
+        }
+        if !entry_type.is_file() {
+            return Err(format!("{} is not a regular file.", label));
+        }
+
+        // `entry.size()`, not `header().size()`: the ustar header's size field
+        // is 12 octal digits, i.e. it tops out just under 8 GiB, and Docker's Go
+        // tar writer puts anything larger in a preceding PAX record instead.
+        // Reading the raw header field made a 9 GiB file look like an 8 GiB one
+        // and a 40 GiB file look like nothing at all — verified against a real
+        // container, where the ceiling below simply did not fire.
+        let size = entry.size();
+        check_download_size(size)?;
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&dest)
+            .map_err(|e| format!("Failed to create {}: {}", dest.display(), e))?;
+        // `take` as well as the header check: the header is container-controlled
+        // and a stream that keeps going past it must not keep filling the disk.
+        let mut capped = std::io::Read::take(&mut entry, MAX_DOWNLOAD_BYTES);
+        let written = std::io::copy(&mut capped, &mut file)
+            .map_err(|e| format!("Failed to write {}: {}", dest.display(), e))?;
+        Ok(written)
+    })
+    .await;
+
+    // The blocking side is finished with the stream either way.
+    feeder.abort();
+
+    result.map_err(|e| format!("Download task panicked: {}", e))?
+}
+
+/// A blocking [`std::io::Read`] over an async channel of chunks.
+///
+/// The bridge between Docker's async byte stream and the `tar` crate, which is
+/// synchronous. It holds one chunk at a time; the channel's capacity is the
+/// whole memory budget of a download.
+struct ChannelReader {
+    rx: tokio::sync::mpsc::Receiver<Result<Vec<u8>, String>>,
+    current: Vec<u8>,
+    pos: usize,
+}
+
+impl ChannelReader {
+    fn new(rx: tokio::sync::mpsc::Receiver<Result<Vec<u8>, String>>) -> Self {
+        Self {
+            rx,
+            current: Vec::new(),
+            pos: 0,
+        }
+    }
+}
+
+impl std::io::Read for ChannelReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if self.pos < self.current.len() {
+                let n = (self.current.len() - self.pos).min(buf.len());
+                buf[..n].copy_from_slice(&self.current[self.pos..self.pos + n]);
+                self.pos += n;
+                return Ok(n);
+            }
+            match self.rx.blocking_recv() {
+                Some(Ok(chunk)) => {
+                    self.current = chunk;
+                    self.pos = 0;
+                }
+                Some(Err(e)) => return Err(std::io::Error::other(e)),
+                // Stream finished: EOF, which is also how a tar with no trailing
+                // zero blocks (a cancelled transfer) ends.
+                None => return Ok(0),
+            }
+        }
+    }
 }
 
 /// One regular file's bytes, pulled out of a container.
@@ -231,13 +757,20 @@ struct FetchedFile {
 /// and merges stderr into stdout, so it would both corrupt any non-UTF-8 file
 /// and be able to splice diagnostics into what the caller believes is content.
 ///
-/// With `max_bytes` set the transfer is abandoned once the cap (plus enough
-/// slack for the tar framing) is in hand, so previewing a huge file does not
-/// pull the whole thing across the socket.
+/// The transfer is abandoned once the cap (plus enough slack for the tar
+/// framing) is in hand, so previewing a huge file does not pull the whole thing
+/// across the socket.
+///
+/// `max_bytes` is deliberately not optional. It used to be, and the download
+/// command passed `None`: the cap below then did nothing and the whole file —
+/// or the whole *directory tree*, since the type check happens after the read —
+/// landed in host RAM twice. Downloads now stream (see
+/// [`stream_container_file_to_host`]); everything still using this function
+/// buffers, so everything still using it must name a ceiling.
 async fn fetch_container_file(
     container_id: &str,
     container_path: &str,
-    max_bytes: Option<u64>,
+    max_bytes: u64,
 ) -> Result<FetchedFile, String> {
     let docker = get_docker()?;
 
@@ -252,13 +785,13 @@ async fn fetch_container_file(
     // slack past the payload cap guarantees the header and the whole capped
     // prefix are present even with the stream cut short.
     const TAR_SLACK: u64 = 8 * 1024;
-    let stop_after = max_bytes.map(|m| m.saturating_add(TAR_SLACK));
+    let stop_after = max_bytes.saturating_add(TAR_SLACK);
 
     let mut tar_bytes: Vec<u8> = Vec::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("Failed to download file: {}", e))?;
         tar_bytes.extend_from_slice(&chunk);
-        if stop_after.is_some_and(|cap| tar_bytes.len() as u64 >= cap) {
+        if tar_bytes.len() as u64 >= stop_after {
             // Dropping the stream cancels the rest of the transfer.
             break;
         }
@@ -290,9 +823,13 @@ async fn fetch_container_file(
         return Err(format!("{} is not a regular file.", container_path));
     }
 
-    let size = entry.header().size().unwrap_or(0);
-    let truncated = max_bytes.is_some_and(|cap| size > cap);
-    let want = max_bytes.map(|cap| cap.min(size)).unwrap_or(size);
+    // `entry.size()` rather than the raw header field: see
+    // `stream_container_file_to_host`. A file past the ustar 8 GiB octal limit
+    // carries its real size in a PAX record, and reading the header field
+    // instead reported it as 0 — an empty preview of a very large file.
+    let size = entry.size();
+    let truncated = size > max_bytes;
+    let want = max_bytes.min(size);
 
     let mut bytes = Vec::with_capacity(want.min(1024 * 1024) as usize);
     std::io::Read::read_to_end(&mut std::io::Read::take(&mut entry, want), &mut bytes)
@@ -318,6 +855,8 @@ pub async fn read_container_file(
     max_bytes: Option<u64>,
     state: State<'_, AppState>,
 ) -> Result<FileContents, String> {
+    validate_container_path("File", &path)?;
+
     let project = state
         .projects_store
         .get(&project_id)
@@ -329,7 +868,7 @@ pub async fn read_container_file(
         .ok_or_else(|| "Container not running".to_string())?;
 
     let cap = max_bytes.unwrap_or(MAX_READ_BYTES).min(MAX_READ_BYTES);
-    let fetched = fetch_container_file(container_id, &path, Some(cap)).await?;
+    let fetched = fetch_container_file(container_id, &path, cap).await?;
 
     Ok(FileContents {
         contents_base64: BASE64.encode(&fetched.bytes),
@@ -535,6 +1074,8 @@ pub async fn stage_container_file_for_drag(
     path: String,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
+    validate_container_path("File", &path)?;
+
     let project = state
         .projects_store
         .get(&project_id)
@@ -549,8 +1090,8 @@ pub async fn stage_container_file_for_drag(
     // worth a round trip.
     let file_name = stage_file_name(&path)?;
 
-    let fetched = fetch_container_file(container_id, &path, Some(MAX_DRAG_STAGE_BYTES)).await?;
-    // `size` is the tar header's, i.e. the file's real size, which is exactly
+    let fetched = fetch_container_file(container_id, &path, MAX_DRAG_STAGE_BYTES).await?;
+    // `size` is the tar entry's, i.e. the file's real size, which is exactly
     // what a truncated fetch does not tell you from `bytes.len()`.
     check_stage_size(fetched.size)?;
 
@@ -596,6 +1137,12 @@ pub async fn rename_container_path(
         .container_id
         .as_ref()
         .ok_or_else(|| "Container not running".to_string())?;
+
+    // The name is checked by `validate_entry_name`; the path it is applied to
+    // was checked by nothing at all, which is how an `invoke` naming
+    // `/home/claude/.claude/.credentials.json` used to move the OAuth
+    // credential out from under Claude Code.
+    validate_container_write_path("Item", &from_path)?;
 
     let new_name = to_path.trim();
     validate_entry_name(new_name)?;
@@ -667,6 +1214,8 @@ pub async fn create_container_directory(
         .as_ref()
         .ok_or_else(|| "Container not running".to_string())?;
 
+    validate_container_write_path("Folder", &parent_path)?;
+
     let name = name.trim();
     validate_entry_name(name)?;
     let dest = join_path(&parent_path, name);
@@ -711,6 +1260,12 @@ pub async fn download_container_backup(
     container_path: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<u64, String> {
+    // `host_path` reached `File::create` unchecked, which truncated whatever was
+    // there before the exec had even started — and the error path then deleted
+    // it, so a backup of a non-existent container path took the user's file with
+    // it. Validate first, write to a partial file second, rename last.
+    let dest = validate_host_path(&host_path, HostPathUse::Write)?;
+
     let project = state
         .projects_store
         .get(&project_id)
@@ -737,6 +1292,8 @@ pub async fn download_container_backup(
     }
 
     let path = container_path.unwrap_or_else(|| "/workspace".to_string());
+    // Read-only source: `tar -C` it, so absoluteness and `..` are what matter.
+    validate_container_path("Backup", &path)?;
 
     // Stage a sanitized home config, then tar+gzip workspace + staged config to
     // stdout. mktemp/jq output go nowhere near stdout, so the only thing the
@@ -806,7 +1363,11 @@ tar czf - --ignore-failed-read \
     };
 
     use tokio::io::AsyncWriteExt;
-    let file = tokio::fs::File::create(&host_path)
+    let partial = partial_download_path(&dest)?;
+    let file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&partial)
         .await
         .map_err(|e| format!("Failed to create backup file: {}", e))?;
     let mut writer = tokio::io::BufWriter::new(file);
@@ -870,18 +1431,41 @@ tar czf - --ignore-failed-read \
     }
 
     if let Some(err) = stream_err {
-        // Don't leave a partial/corrupt archive behind.
-        let _ = tokio::fs::remove_file(&host_path).await;
+        // Only our own partial archive is deleted — never whatever the user
+        // already had at `dest`, which has not been touched yet.
+        let _ = tokio::fs::remove_file(&partial).await;
         return Err(err);
+    }
+
+    if let Err(e) = finish_download(&partial, &dest).await {
+        let _ = tokio::fs::remove_file(&partial).await;
+        return Err(e);
     }
 
     log::info!(
         "Wrote {} byte backup for project {} to {}",
         total,
         project_id,
-        host_path
+        dest.display()
     );
     Ok(total)
+}
+
+/// Marker on the "there is already a file called that" refusal, so the frontend
+/// can tell it apart from every other upload failure and raise a
+/// Replace/Skip prompt instead of reporting a dead end.
+///
+/// A marker in the string rather than a typed error because these commands
+/// return `Result<_, String>` throughout; changing that shape is a bigger edit
+/// than this bug is worth. The token and the "full container path" shape are a
+/// contract with `app/src/lib/uploadErrors.ts` — `isFileExistsError` looks for
+/// exactly this, and the prompt names the file.
+pub const UPLOAD_EXISTS_MARKER: &str = "FILE_EXISTS";
+
+/// The refusal itself. Split out so the marker and the sentence after it are
+/// testable without a container.
+fn upload_exists_error(dest: &str) -> String {
+    format!("{}: {} already exists", UPLOAD_EXISTS_MARKER, dest)
 }
 
 #[tauri::command]
@@ -889,8 +1473,19 @@ pub async fn upload_file_to_container(
     project_id: String,
     host_path: String,
     container_dir: String,
+    // Absent or false means refuse a collision; the frontend re-invokes with
+    // `true` once the user has answered Replace. Defaulting to refusal is the
+    // point — the safe behaviour is what you get by not asking.
+    overwrite: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    // An upload writes into `/workspace/{mount_name}`, i.e. the user's real
+    // project directory, so the destination gets the write-root check; the
+    // source is a host file being read *into* the container, so it gets the
+    // host-read policy.
+    validate_container_write_path("Folder", &container_dir)?;
+    let host_path = validate_host_read_path(&host_path)?;
+
     let project = state
         .projects_store
         .get(&project_id)
@@ -930,6 +1525,30 @@ pub async fn upload_file_to_container(
         .to_string_lossy()
         .to_string();
 
+    // Nothing in this stack checked whether the destination already existed:
+    // there was no probe, and `noOverwriteDirNonDir` only stops a directory
+    // being replaced by a non-directory (and vice versa) — Docker's extractor
+    // overwrites a file with a file quite happily. So dragging a host
+    // `.credentials.json` onto the folder holding the container's one destroyed
+    // it with no prompt and no undo, while `create_container_directory`
+    // deliberately omits `-p` and `rename_container_path` refuses an existing
+    // destination. Silence here was an inconsistency, not a policy: refuse by
+    // default, and say so in the words the frontend turns into a Replace/Skip
+    // prompt.
+    let dest = join_path(&container_dir, &file_name);
+    if !overwrite.unwrap_or(false) {
+        let (_, exists) = exec_oneshot_as(
+            container_id,
+            "claude",
+            vec!["test".to_string(), "-e".to_string(), dest.clone()],
+            Vec::new(),
+        )
+        .await?;
+        if exists == 0 {
+            return Err(upload_exists_error(&dest));
+        }
+    }
+
     // Own the file as the container user and keep the host's mtime. A default
     // tar header would land it root:root with a 1970-01-01 timestamp — i.e.
     // not editable by Claude Code, and misleading in the listing.
@@ -958,7 +1577,10 @@ pub async fn upload_file_to_container(
             container_id,
             Some(UploadToContainerOptions {
                 path: container_dir,
-                ..Default::default()
+                // Belt to the existence check's braces: this is the only thing
+                // Docker itself will refuse, and it closes the race between the
+                // `test -e` above and the extraction.
+                no_overwrite_dir_non_dir: "true".to_string(),
             }),
             tar_buf.into(),
         )
@@ -972,9 +1594,10 @@ pub async fn upload_file_to_container(
 mod tests {
     use super::*;
 
-    /// A line as `find -printf '%f\t%y\t%Y\t%s\t%T@\t%m\n'` emits it.
+    /// A record as `find -printf '%y\t%Y\t%s\t%T@\t%m\t%f\0'` emits it —
+    /// fields first, name last, NUL-terminated.
     fn line(name: &str, own: &str, deref: &str, size: &str) -> String {
-        format!("{}\t{}\t{}\t{}\t1700000000.0000000000\t644", name, own, deref, size)
+        format!("{}\t{}\t{}\t1700000000.0000000000\t644\t{}\0", own, deref, size, name)
     }
 
     #[test]
@@ -1016,7 +1639,7 @@ mod tests {
             line("alpha", "f", "f", "1"),
             line("src", "d", "d", "4096"),
         ]
-        .join("\n");
+        .concat();
         let entries = parse_find_output("/workspace", &output);
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["src", "alpha", "Zeta"]);
@@ -1024,7 +1647,7 @@ mod tests {
 
     #[test]
     fn short_and_blank_rows_are_dropped_rather_than_mis_parsed() {
-        let output = format!("\n  \nbroken\ttoo\tshort\n{}\n", line("ok", "f", "f", "1"));
+        let output = format!("\0  \0broken\ttoo\tshort\0{}", line("ok", "f", "f", "1"));
         let entries = parse_find_output("/workspace", &output);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "ok");
@@ -1038,10 +1661,49 @@ mod tests {
 
     #[test]
     fn unparseable_size_and_mtime_fall_back_instead_of_dropping_the_row() {
-        let output = "weird\tf\tf\t-\t-\t644";
+        let output = "f\tf\t-\t-\t644\tweird";
         let entries = parse_find_output("/workspace", output);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].size, 0);
+    }
+
+    #[test]
+    fn the_listing_argv_puts_the_name_last_and_terminates_records_with_nul() {
+        // Pinned together with the parser: these two only work as a pair, and
+        // the separators must reach `find` as escapes — a literal NUL cannot
+        // travel in argv.
+        let argv = list_argv("/workspace");
+        assert_eq!(argv[0], "find");
+        assert_eq!(argv[1], "/workspace");
+        let format = argv.last().unwrap();
+        assert!(format.ends_with("%f\\0"), "{}", format);
+        assert!(!format.contains('\0'));
+        assert!(!format.contains('\n'));
+    }
+
+    #[test]
+    fn a_tab_in_a_filename_cannot_forge_the_type_and_size_columns() {
+        // The bug this guards: with the name first, `evil.txt\td\td\t4096…`
+        // rendered as a *directory* of the attacker's chosen size. The name is
+        // last now, so the tabs stay inside it.
+        let entries = parse_find_output(
+            "/workspace",
+            &line("evil.txt\td\td\t4096", "f", "f", "3"),
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "evil.txt\td\td\t4096");
+        assert!(!entries[0].is_directory);
+        assert_eq!(entries[0].size, 3);
+    }
+
+    #[test]
+    fn a_newline_in_a_filename_cannot_forge_a_whole_row() {
+        // A filename may contain a newline, so a line-terminated format let one
+        // name print two rows. NUL is the byte a filename cannot contain.
+        let entries = parse_find_output("/workspace", &line("two\nlines", "f", "f", "5"));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "two\nlines");
+        assert_eq!(entries[0].path, "/workspace/two\nlines");
     }
 
     #[test]
@@ -1085,6 +1747,187 @@ mod tests {
         // because the whole payload is buffered in host RAM.
         assert_eq!(Some(u64::MAX).unwrap().min(MAX_READ_BYTES), MAX_READ_BYTES);
         assert!(MAX_READ_BYTES < MAX_UPLOAD_BYTES);
+    }
+
+    // ── Path validation ─────────────────────────────────────────────────────
+
+    #[test]
+    fn a_listing_path_that_is_really_an_argument_is_refused() {
+        // C2. `find` ends its starting-point list at the first argument
+        // beginning with `-`, so `path = "-delete"` listed nothing and ran
+        // `-delete` over the exec's working directory — the bind-mounted
+        // project. Verified deleting on findutils 4.9.0. `--` does not help;
+        // absoluteness does.
+        for path in ["-delete", "-exec", "--", "-mindepth"] {
+            let err = validate_container_path("Folder", path).unwrap_err();
+            assert!(err.contains("absolute"), "{} → {}", path, err);
+        }
+    }
+
+    #[test]
+    fn a_container_path_must_be_absolute_and_traversal_free() {
+        assert!(validate_container_path("Folder", "/workspace").is_ok());
+        assert!(validate_container_path("Folder", "/home/claude/.claude").is_ok());
+        // A name that merely *starts* with a dot-dot is not traversal.
+        assert!(validate_container_path("Folder", "/workspace/..hidden").is_ok());
+
+        assert!(validate_container_path("Folder", "").is_err());
+        assert!(validate_container_path("Folder", "workspace/app").is_err());
+        assert!(validate_container_path("Folder", "/workspace/../etc").is_err());
+        assert!(validate_container_path("Folder", "/workspace/..").is_err());
+        assert!(validate_container_path("Folder", "/work\0space").is_err());
+        assert!(validate_container_path("Folder", &format!("/{}", "x".repeat(4096))).is_err());
+    }
+
+    #[test]
+    fn only_the_folders_the_app_owns_can_be_written_to() {
+        for path in ["/workspace", "/workspace/app/src", "/home/claude", "/tmp/x"] {
+            assert!(validate_container_write_path("Item", path).is_ok(), "{}", path);
+        }
+        // Reading these is fine — changing them is not this panel's business,
+        // and outside /workspace it would be a permission error anyway.
+        for path in ["/", "/etc/passwd", "/usr/lib", "/home/other", "/workspace-backup/x"] {
+            assert!(validate_container_write_path("Item", path).is_err(), "{}", path);
+        }
+    }
+
+    #[test]
+    fn containment_is_compared_by_whole_segments() {
+        // The classic `starts_with` bug: `/workspace-backup` is not under
+        // `/workspace`.
+        assert!(is_under_root("/workspace", "/workspace"));
+        assert!(is_under_root("/workspace/", "/workspace"));
+        assert!(is_under_root("/workspace/app", "/workspace"));
+        assert!(!is_under_root("/workspaces", "/workspace"));
+        assert!(!is_under_root("/workspace-backup/x", "/workspace"));
+        assert!(!is_under_root("/", "/workspace"));
+    }
+
+    #[test]
+    fn an_ordinary_save_location_is_accepted() {
+        for path in ["/home/jo/Downloads/report.pdf", "/tmp/out.txt", "/media/usb/a b.md"] {
+            assert!(validate_host_path(path, HostPathUse::Write).is_ok(), "{}", path);
+            assert!(validate_host_path(path, HostPathUse::Read).is_ok(), "{}", path);
+        }
+    }
+
+    #[test]
+    fn a_host_path_must_be_absolute_and_traversal_free() {
+        assert!(validate_host_path("", HostPathUse::Write).is_err());
+        assert!(validate_host_path("report.pdf", HostPathUse::Write).is_err());
+        assert!(validate_host_path("/home/jo/../../etc/hosts", HostPathUse::Write).is_err());
+        assert!(validate_host_path("/home/jo/re\0port", HostPathUse::Write).is_err());
+    }
+
+    #[test]
+    fn a_hidden_host_directory_is_refused_in_both_directions() {
+        // The container→host write primitive worth closing: container-controlled
+        // bytes at a path of the caller's choosing.
+        assert!(validate_host_path("/home/jo/.ssh/authorized_keys", HostPathUse::Write).is_err());
+        assert!(validate_host_path("/home/jo/.config/autostart/x", HostPathUse::Write).is_err());
+        // …and the host→container read that pairs with it.
+        assert!(validate_host_path("/home/jo/.aws/credentials", HostPathUse::Read).is_err());
+        assert!(validate_host_path("/home/jo/.ssh/id_rsa", HostPathUse::Read).is_err());
+    }
+
+    #[test]
+    fn a_hidden_file_name_may_be_uploaded_but_not_created() {
+        // Dragging a project's own `.env` into the container is ordinary; being
+        // handed a container-controlled `~/.bashrc` is not.
+        assert!(validate_host_path("/home/jo/project/.env", HostPathUse::Read).is_ok());
+        assert!(validate_host_path("/home/jo/.bashrc", HostPathUse::Write).is_err());
+    }
+
+    #[test]
+    fn host_system_locations_are_refused_including_windows_ones() {
+        assert!(validate_host_path("/etc/cron.d/x", HostPathUse::Write).is_err());
+        assert!(validate_host_path("/usr/bin/tool", HostPathUse::Write).is_err());
+        assert!(validate_host_path("/etc/shadow", HostPathUse::Read).is_err());
+        // Case and separator are normalised before the comparison.
+        let windows = "C:\\Windows\\System32\\drivers\\etc\\hosts";
+        assert!(validate_host_path(windows, HostPathUse::Write).is_err());
+        // A user directory that merely shares a prefix is not a system one.
+        assert!(validate_host_path("/home/jo/etcetera/notes.txt", HostPathUse::Write).is_ok());
+    }
+
+    // ── Downloads ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_download_is_staged_beside_its_destination_and_renamed() {
+        // Why: the destination must not be touched until the transfer has
+        // succeeded, and the rename that finishes the job must not cross a
+        // filesystem.
+        let dest = Path::new("/home/jo/Downloads/report.pdf");
+        let partial = partial_download_path(dest).unwrap();
+        assert_eq!(partial.parent(), dest.parent());
+        assert_ne!(partial, dest);
+        let name = partial.file_name().unwrap().to_string_lossy().to_string();
+        assert!(name.starts_with("report.pdf."), "{}", name);
+        assert!(name.contains("triple-c-part-"), "{}", name);
+        // Visible on purpose: a crash leaves it next to the file it meant to be.
+        assert!(!name.starts_with('.'), "{}", name);
+        // Two downloads of the same file must not share a partial.
+        assert_ne!(partial_download_path(dest).unwrap(), partial);
+        assert!(partial_download_path(Path::new("/")).is_err());
+    }
+
+    #[tokio::test]
+    async fn finishing_a_download_replaces_the_destination_only_once_it_is_whole() {
+        // The destination the user picked already holds something — the save
+        // dialog asked about that — and what must never happen is losing it to a
+        // download that did not arrive. Here the payload *has* arrived, so the
+        // swap goes through, on Windows (rename refuses an existing target) as
+        // well as Unix.
+        let dir = std::env::temp_dir().join(format!("tc-finish-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let dest = dir.join("thesis.docx");
+        tokio::fs::write(&dest, b"the original").await.unwrap();
+
+        let partial = partial_download_path(&dest).unwrap();
+        tokio::fs::write(&partial, b"the download").await.unwrap();
+
+        finish_download(&partial, &dest).await.unwrap();
+        assert_eq!(tokio::fs::read(&dest).await.unwrap(), b"the download");
+        assert!(!partial.exists(), "the partial file was left behind");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[test]
+    fn the_download_ceiling_is_checked_against_the_declared_size() {
+        // The bug this guards: the download path passed `None` for the cap, so
+        // a 40 GB (sparse, near-free in the container) file was buffered whole
+        // in host RAM — twice.
+        assert!(check_download_size(MAX_DOWNLOAD_BYTES).is_ok());
+        let err = check_download_size(40 * 1024 * 1024 * 1024).unwrap_err();
+        assert!(err.contains("40.0 GB"), "{}", err);
+        // A ceiling with no way forward is the one thing a ceiling must not be.
+        assert!(err.contains("Backup"), "{}", err);
+    }
+
+    #[test]
+    fn every_buffering_read_has_to_name_a_ceiling() {
+        // `fetch_container_file` takes a plain `u64` now, so the `None` that
+        // made the cap inert cannot be written again. These are the two callers
+        // left, and both buffer.
+        assert!(MAX_READ_BYTES <= MAX_DRAG_STAGE_BYTES);
+        assert!(MAX_DRAG_STAGE_BYTES < MAX_DOWNLOAD_BYTES);
+    }
+
+    #[test]
+    fn an_upload_collision_is_reported_so_the_ui_can_offer_to_overwrite() {
+        // H5: Docker's extractor overwrites a file with a file silently, and
+        // dropping a `.credentials.json` onto the folder holding one was
+        // irrecoverable. The prefix is what lets the frontend tell this refusal
+        // apart from a real failure.
+        let err = upload_exists_error("/home/claude/.claude/.credentials.json");
+        // The token and the full path are a contract with
+        // `app/src/lib/uploadErrors.ts`, which turns this into the prompt.
+        assert!(err.contains(UPLOAD_EXISTS_MARKER), "{}", err);
+        assert_eq!(
+            err,
+            "FILE_EXISTS: /home/claude/.claude/.credentials.json already exists"
+        );
     }
 
     // ── Drag-out staging ────────────────────────────────────────────────────
