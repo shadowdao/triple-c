@@ -5,6 +5,7 @@ mod docker;
 mod install_helper;
 mod logging;
 mod models;
+mod project_lock;
 mod storage;
 pub mod web_terminal;
 
@@ -263,6 +264,19 @@ pub fn run() {
             let drag_temp_dir = app.path().temp_dir().ok();
             tauri::async_runtime::spawn(async move {
                 crate::docker::reap_probe_containers().await;
+                // Before the sweep, and for the same reason the pins are:
+                // `triple-c-snapshot-*:compacting` is a *tagged* image, so the
+                // sweep's `dangling=true` filter cannot see it, and the
+                // `triple-c-compact-*` container a crashed compaction leaves
+                // behind pins that image open. Untagging first is what turns
+                // both into something the sweep can collect on the same pass.
+                let stranded = crate::docker::disk::reap_stale_compaction_artifacts().await;
+                if stranded > 0 {
+                    log::info!(
+                        "Startup housekeeping dropped {} stranded compaction staging tag(s)",
+                        stranded
+                    );
+                }
                 let reaped = crate::docker::reap_stale_migration_pins().await;
                 if reaped > 0 {
                     log::info!("Startup housekeeping dropped {} stale rollback pin(s)", reaped);

@@ -75,6 +75,23 @@ use crate::storage::migration_store;
 /// its warm cache and short enough that abandoned trees are collected.
 pub const BUILD_CACHE_DEFAULT_UNTIL_HOURS: i64 = 168;
 
+/// How long [`docker_cli`] waits for the `docker` command line tool.
+///
+/// Long enough for `buildx du` over a large build tree on a cold daemon, short
+/// enough that a wedged daemon does not hold the Scan button down forever. A
+/// prune uses the same bound; a prune that outruns it has still done its work
+/// on the daemon, and the next scan reports the result.
+const DOCKER_CLI_TIMEOUT_SECS: u64 = 45;
+
+/// The bound for a `builder prune`, which is a different kind of wait.
+///
+/// `buildx du` is a query and 45 seconds is generous for it. A prune of a
+/// 60 GB cache genuinely takes minutes, and cancelling it does not undo the
+/// daemon-side work — it only loses the `Total reclaimed space:` line, so the
+/// run would be reported as a failure that in fact freed the space. Ten minutes
+/// is a bound against a wedged daemon rather than against a slow one.
+const DOCKER_PRUNE_TIMEOUT_SECS: u64 = 600;
+
 // ---------------------------------------------------------------------------
 // Scan result
 // ---------------------------------------------------------------------------
@@ -123,6 +140,27 @@ pub struct ProjectDiskRow {
     pub home_volume_present: bool,
     pub config_volume_bytes: i64,
     pub config_volume_present: bool,
+    /// **The one snapshot figure the row adds up from.**
+    ///
+    /// The Snapshot column shows this and [`Self::total_bytes`] is computed
+    /// from it, so the Total column reconciles with its parts. It did not
+    /// before: `total_bytes` used `size - shared_size` unconditionally while
+    /// the column fell back to [`Self::snapshot_above_base_bytes`] or to `—`,
+    /// and in that fallback branch `size - shared_size` is the *whole base
+    /// image*. A row could show `—` for its snapshot and still carry 4.7 GB of
+    /// base in its total, which `triple_c_total_bytes` then added again as a
+    /// base-image row.
+    ///
+    /// The rule, in order:
+    ///
+    /// 1. `df()` computed a shared size → `size - shared`, the daemon's own
+    ///    measurement of what is unique to this image.
+    /// 2. No shared size but the base lineage is known → the layer arithmetic
+    ///    in [`layer_stats`].
+    /// 3. Neither → the full size. Not a fallback to zero: an image nothing
+    ///    shares with and whose lineage is unknown really does cost its whole
+    ///    size, and a flattened snapshot is exactly that shape.
+    pub snapshot_attributed_bytes: i64,
     pub total_bytes: i64,
     /// A migration is in flight; every action on this row is blocked.
     pub migrating: bool,
@@ -293,8 +331,6 @@ pub enum ReclaimTarget {
     ProbeContainers,
     /// `triple-c-scrub-*` containers left by an interrupted secret rewrite.
     ScrubContainers,
-    /// One orphaned volume, ticked individually by name.
-    OrphanVolume { name: String },
     /// Rewrite a project's stacked commit layers into a single layer. The
     /// highest-yield action in this module.
     CompactSnapshot { project_id: String },
@@ -325,6 +361,27 @@ pub enum DestructiveTarget {
     /// A rollback pin whose migration is still awaiting confirmation — the only
     /// copy of that migration's rollback target.
     RollbackPin { project_id: String, tag: String },
+    /// A `triple-c-home-*` / `triple-c-claude-config-*` volume whose project id
+    /// is in no `projects.json` this app can find.
+    ///
+    /// **It was a `ReclaimTarget` at `Safety::Safe`** — a tick and the group
+    /// Reclaim button, no confirmation. The object behind that tick is a
+    /// `triple-c-claude-config-*` volume holding a Claude OAuth credential,
+    /// every installed plugin and skill, and every conversation transcript the
+    /// project ever had, and the *same volume* for a project still in the store
+    /// requires typing the project's name. The only difference between the two
+    /// is a lookup against a file this app has been wrong about before: a
+    /// second app instance's project is absent from an in-memory list, a
+    /// corrupt `projects.json` empties it, and a data directory restored
+    /// without it empties it too. So it is confirmed like everything else that
+    /// has no other copy — see [`destroy`], where the typed string is the
+    /// **volume name**, there being no project name to type.
+    OrphanVolume {
+        name: String,
+        /// The id parsed out of the volume name. Display only — it names no
+        /// project in the store, which is the whole reason this variant exists.
+        project_id: String,
+    },
 }
 
 impl ReclaimTarget {
@@ -339,7 +396,6 @@ impl ReclaimTarget {
             | ReclaimTarget::MigrationStaging
             | ReclaimTarget::ProbeContainers
             | ReclaimTarget::ScrubContainers
-            | ReclaimTarget::OrphanVolume { .. }
             | ReclaimTarget::BuildCache { .. } => Safety::Safe,
             // A rewrite and a cache flush: nothing is lost, but time is.
             ReclaimTarget::CompactSnapshot { .. } | ReclaimTarget::ClearCaches { .. } => {
@@ -373,9 +429,11 @@ impl DestructiveTarget {
             DestructiveTarget::HomeVolume { project_id }
             | DestructiveTarget::ConfigVolume { project_id }
             | DestructiveTarget::SnapshotImage { project_id }
-            | DestructiveTarget::RollbackPin { project_id, .. } => project_id,
+            | DestructiveTarget::RollbackPin { project_id, .. }
+            | DestructiveTarget::OrphanVolume { project_id, .. } => project_id,
         }
     }
+
 }
 
 /// One offered action, with its measured cost.
@@ -575,6 +633,33 @@ pub fn parse_project_volume_name(name: &str) -> Option<(&str, &'static str)> {
         return Some((id, "home"));
     }
     None
+}
+
+/// This project's share of its snapshot image, in bytes.
+///
+/// The single rule behind [`ProjectDiskRow::snapshot_attributed_bytes`], pulled
+/// out of [`scan`] so it can be tested without a daemon — the bug it fixes was
+/// two call sites disagreeing, and a rule that lives in one function cannot
+/// disagree with itself.
+///
+/// 1. `df()` computed a shared size → `size - shared`. The daemon's own
+///    measurement of what is unique to this image, and the only exact answer
+///    available.
+/// 2. No shared size, but the base lineage is known → the layer arithmetic from
+///    [`layer_stats`].
+/// 3. Neither → `size - shared`, which with no shared size is the full image.
+///    Deliberately not zero: an image that shares nothing measurable really
+///    does cost its whole size, and a flattened snapshot is exactly that shape.
+pub fn snapshot_attribution(
+    snapshot_bytes: i64,
+    snapshot_shared_bytes: i64,
+    above_base_bytes: Option<i64>,
+) -> i64 {
+    let unique = (snapshot_bytes - snapshot_shared_bytes.max(0)).max(0);
+    if snapshot_shared_bytes > 0 {
+        return unique;
+    }
+    above_base_bytes.map(|b| b.max(0)).unwrap_or(unique)
 }
 
 /// What a snapshot's layer stack looks like relative to its base.
@@ -795,34 +880,85 @@ pub fn parse_reclaimed_space(output: &str) -> i64 {
 /// never match, and the flattened intermediate is left to whatever `untag_image`
 /// happens to delete on its own.
 pub fn compaction_dockerfile(snapshot_ref: &str, scrub_script: &str) -> String {
-    // The scrub script is multi-line shell. `RUN` takes it verbatim only if the
-    // newlines are escaped, so it is folded onto one line with `;` separators —
-    // the script is already a sequence of statements and a `for` loop, both of
-    // which survive that.
-    let folded = fold_shell_script(scrub_script);
     format!(
         "FROM {snapshot_ref} AS src\n\
-         RUN {folded}\n\
+         RUN {run}\n\
          FROM scratch\n\
          COPY --from=src / /\n\
-         LABEL {LABEL_MANAGED}=true\n"
+         LABEL {LABEL_MANAGED}=true\n",
+        run = run_exec_form(scrub_script)
     )
 }
 
-/// Collapse a multi-line `/bin/sh` program into a single `RUN` line.
+/// Render a multi-line `/bin/sh` program as a `RUN` the daemon will actually
+/// execute.
 ///
-/// Blank lines go; every other line is joined with a space. The script's own
-/// syntax already terminates its statements (`;` inside the `for`, newlines
-/// after each simple command are not load-bearing because each line here is a
-/// complete word sequence), so this is a join and not a rewrite — but it is
-/// pinned by a test against the real script for exactly that reason.
-fn fold_shell_script(script: &str) -> String {
-    script
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
+/// ## What was here before, and why it never worked once
+///
+/// The scrub script is multi-line shell, and a Dockerfile instruction does not
+/// continue over a bare newline — so the script was folded onto one line by
+/// joining its lines **with a space**. That is not a rewrite the shell
+/// tolerates. `for p in …` on one line and `do` on the next are separated by a
+/// newline that *is* load-bearing; joining them produces
+/// `… for p in …; do [ -e "$p" ] || continue sz=$(…) …`, and `sh` stops at:
+///
+/// ```text
+/// /bin/sh: line 0: syntax error: unexpected "do"
+/// ERROR: process "/bin/sh -c total=0 for p in …" did not complete successfully: exit code: 2
+/// ```
+///
+/// Verified with a real `docker build`, not reasoned about. The build failed on
+/// its first stage every single time, so `compact_snapshot` has always returned
+/// a failure — the headline action of the whole panel, broken since it landed.
+/// Nothing was lost, because the failure is before anything is removed, but
+/// nothing was ever reclaimed either. The test that was supposed to catch this
+/// asserted only that the `RUN` was *one line*, which the broken fold satisfied
+/// perfectly.
+///
+/// ## Why the JSON exec form rather than a better fold
+///
+/// Any fold is a rewrite of somebody else's shell, and the script is not this
+/// module's to own — `container::snapshot_scrub_script` is free to grow a
+/// `case`, an `if`, a heredoc or a function, and each of those breaks a
+/// different set of join rules. Inserting `;` between lines is wrong for
+/// exactly the same reason a space was: `; do` is fine, but `if x; then; y` is
+/// not.
+///
+/// So the script is not transformed at all. `RUN ["/bin/sh", "-c", "<script>"]`
+/// is the exec form, its arguments are a JSON array, and JSON strings carry
+/// newlines as `\n` escapes — so the program reaches `sh` byte-for-byte as
+/// written, on one Dockerfile line, with no assumption about its shape. The
+/// exec form does not go through a shell of its own, which is why `/bin/sh -c`
+/// is named explicitly.
+///
+/// A BuildKit heredoc (`RUN <<EOF`) would also work and is not available here:
+/// [`build_from_dockerfile`] goes through bollard's plain `POST /build`, i.e.
+/// the classic builder with no BuildKit session, where the heredoc syntax is
+/// not parsed.
+fn run_exec_form(script: &str) -> String {
+    // `serde_json` does the escaping, so a quote, a backslash or a newline in
+    // the script cannot break out of the array — the failure mode a
+    // hand-rolled escaper would eventually have.
+    serde_json::to_string(&["/bin/sh", "-c", script])
+        .unwrap_or_else(|_| "[\"/bin/sh\", \"-c\", \"exit 1\"]".to_string())
+}
+
+/// Recover the shell program out of a [`run_exec_form`] `RUN` line.
+///
+/// Exists for the test that runs `sh -n` over it: a Dockerfile is a string, and
+/// the only way to assert the thing the daemon will execute is syntactically
+/// valid is to pull that exact string back out and hand it to a shell.
+///
+/// `pub(crate)` rather than `#[cfg(test)]` deliberately. `container.rs` owns the
+/// scrub script and wants to assert that a compaction runs *its* script, not a
+/// mangled copy — and the honest form of that assertion is
+/// `script_from_run_line(run) == snapshot_scrub_script()`, byte for byte, which
+/// is a far stronger statement than "the folded one-liner still parses".
+#[allow(dead_code)] // used by `disk_tests.rs`, and by `container.rs`'s own test
+pub(crate) fn script_from_run_line(run_line: &str) -> Option<String> {
+    let json = run_line.strip_prefix("RUN ")?;
+    let parts: Vec<String> = serde_json::from_str(json).ok()?;
+    parts.get(2).cloned()
 }
 
 /// The `rm -rf` program that clears a project's regenerable package caches.
@@ -983,16 +1119,29 @@ pub fn is_docker_desktop(operating_system: &str) -> bool {
 pub fn project_store_trust(
     projects: &[Project],
     json_exists: bool,
-    json_parsed: bool,
+    json_ids: Option<&[String]>,
 ) -> Result<HashSet<String>, String> {
-    if !json_parsed {
+    let Some(json_ids) = json_ids else {
         return Err(
             "projects.json could not be read, so there is no way to tell an orphaned volume from a \
              live project's. Nothing is listed here until it can be."
                 .to_string(),
         );
-    }
-    if projects.is_empty() && json_exists {
+    };
+    // **The union, not the in-memory list.** `projects` is
+    // `state.projects_store.list()`, a snapshot this process loaded at startup.
+    // A project added by a *second* copy of the app — the same daemon, the same
+    // data directory, a different process — is on disk and not in that list, so
+    // its live home and config volumes matched "no project claims this" and
+    // were offered for deletion, at `Safety::Safe`, while the very same volumes
+    // for a project this instance knows about require typing the project name.
+    // Reading the file is the only way to close that; the in-memory list is
+    // still unioned in because a project added here a moment ago is authoritative
+    // too, and because the ids on disk are read as opaque strings.
+    let mut known: HashSet<String> = json_ids.iter().cloned().collect();
+    known.extend(projects.iter().map(|p| p.id.clone()));
+
+    if known.is_empty() && json_exists {
         return Err(
             "The project list loaded empty from a projects.json that exists, which is what a \
              recovered-from-corrupt store looks like. Orphan detection is suppressed rather than \
@@ -1000,24 +1149,52 @@ pub fn project_store_trust(
                 .to_string(),
         );
     }
-    Ok(projects.iter().map(|p| p.id.clone()).collect())
+    Ok(known)
 }
 
-/// Re-read `projects.json` from disk to answer [`project_store_trust`]'s two
-/// questions. The in-memory store cannot answer them: by the time it is
-/// consulted, a corrupt file has already been swallowed into an empty list.
-fn projects_json_health() -> (bool, bool) {
+/// Re-read `projects.json` from disk: whether it exists, and the project ids it
+/// actually holds.
+///
+/// The in-memory store cannot answer either question. By the time it is
+/// consulted a corrupt file has already been swallowed into an empty list, and
+/// a second app instance's writes are not in it at all.
+///
+/// `None` for the ids means "could not be read or parsed", which is not the
+/// same as "holds no projects" and must never be collapsed into it. An id that
+/// is not a string is skipped rather than failing the whole read — the file is
+/// still parseable, so the honest answer is the ids it does carry.
+///
+/// Blocking `std::fs`, so every async caller goes through
+/// [`projects_json_snapshot_async`].
+fn projects_json_snapshot() -> (bool, Option<Vec<String>>) {
     let Some(path) = dirs::data_dir().map(|d| d.join("triple-c").join("projects.json")) else {
-        return (false, false);
+        return (false, None);
     };
     if !path.exists() {
-        return (false, true);
+        return (false, Some(Vec::new()));
     }
     let parsed = std::fs::read_to_string(&path)
         .ok()
         .and_then(|data| serde_json::from_str::<Vec<serde_json::Value>>(&data).ok())
-        .is_some();
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.get("id")?.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        });
     (true, parsed)
+}
+
+/// [`projects_json_snapshot`] off the async worker.
+///
+/// A `read_to_string` on a spinning disk, a network home directory or a
+/// Windows volume behind an antivirus filter blocks the whole tokio worker
+/// thread it lands on, and this one is called from inside [`scan`] — the
+/// longest-running command in the app.
+async fn projects_json_snapshot_async() -> (bool, Option<Vec<String>>) {
+    tokio::task::spawn_blocking(projects_json_snapshot)
+        .await
+        .unwrap_or((false, None))
 }
 
 // ---------------------------------------------------------------------------
@@ -1172,6 +1349,15 @@ pub async fn scan(projects: &[Project]) -> Result<DiskUsageReport, String> {
         // same image once per project and make the column meaningless.
         let snapshot_unique = (snapshot_bytes - snapshot_shared_bytes).max(0);
 
+        // See `ProjectDiskRow::snapshot_attributed_bytes`. One function, so the
+        // column and the total cannot be derived from two different rules
+        // again.
+        let snapshot_attributed_bytes = snapshot_attribution(
+            snapshot_bytes,
+            snapshot_shared_bytes,
+            stats.above_base_bytes,
+        );
+
         rows.push(ProjectDiskRow {
             project_id: project.id.clone(),
             project_name: project.name.clone(),
@@ -1196,7 +1382,8 @@ pub async fn scan(projects: &[Project]) -> Result<DiskUsageReport, String> {
             home_volume_present: home.is_some(),
             config_volume_bytes,
             config_volume_present: config.is_some(),
-            total_bytes: snapshot_unique
+            snapshot_attributed_bytes,
+            total_bytes: snapshot_attributed_bytes
                 + container_writable_bytes
                 + home_volume_bytes
                 + config_volume_bytes,
@@ -1258,9 +1445,9 @@ pub async fn scan(projects: &[Project]) -> Result<DiskUsageReport, String> {
     // as exact.
     let base_images_bytes = base_images.iter().map(|b| b.bytes).sum();
 
-    let (json_exists, json_parsed) = projects_json_health();
+    let (json_exists, json_ids) = projects_json_snapshot_async().await;
     let (orphan_volumes_list, orphan_volumes_unavailable) =
-        match project_store_trust(projects, json_exists, json_parsed) {
+        match project_store_trust(projects, json_exists, json_ids.as_deref()) {
             Ok(known) => {
                 let facts: Vec<VolumeFacts> = volumes.iter().map(volume_facts).collect();
                 (orphan_volumes(&facts, &known, true), None)
@@ -1271,6 +1458,14 @@ pub async fn scan(projects: &[Project]) -> Result<DiskUsageReport, String> {
 
     let build_cache = build_cache_usage(&build_cache_records).await;
 
+    // `total_bytes` now excludes each snapshot's shared base wherever the base
+    // could be identified, so adding `base_images_bytes` counts each base
+    // exactly once rather than once per project on top of once per project.
+    // The residue is the case where a snapshot shares nothing measurable *and*
+    // its lineage is unknown: its full size is attributed to the project, which
+    // is right, and if the base it descends from is also on the daemon it
+    // appears as its own row too. Docker would have reported a shared size if
+    // those two genuinely shared layers, so that combination means they do not.
     let triple_c_total_bytes = rows.iter().map(|r| r.total_bytes).sum::<i64>()
         + base_images_bytes
         + orphan_image_bytes
@@ -1287,7 +1482,17 @@ pub async fn scan(projects: &[Project]) -> Result<DiskUsageReport, String> {
         orphan_volume_bytes,
         orphan_volumes_unavailable,
         build_cache,
-        images_total_bytes: images.iter().map(|i| i.size).sum(),
+        // **`layers_size`, not the sum of the images.** Every image's `size`
+        // includes every layer it inherits, so summing them counts a shared
+        // 4.7 GB base once per snapshot — measured at ~33 GB of phantom on a
+        // real ten-project daemon, presented under "Everything on this daemon"
+        // right beside "Attributable to Triple-C". `df()` already returns the
+        // deduplicated figure and nothing read it. The sum is kept only for a
+        // daemon that does not report one.
+        images_total_bytes: usage
+            .layers_size
+            .filter(|size| *size > 0)
+            .unwrap_or_else(|| images.iter().map(|i| i.size).sum()),
         containers_total_bytes: containers
             .iter()
             .map(|c| c.size_rw.unwrap_or(0).max(0))
@@ -1378,11 +1583,38 @@ async fn build_cache_usage(records: &[BuildCache]) -> BuildCacheUsage {
 /// (or a Windows named pipe) for one endpoint is a worse trade than shelling
 /// out, which `commands/aws_commands.rs` already does for the AWS CLI.
 async fn docker_cli(args: &[&str]) -> Result<String, String> {
-    let output = tokio::process::Command::new("docker")
+    docker_cli_with_timeout(args, DOCKER_CLI_TIMEOUT_SECS).await
+}
+
+async fn docker_cli_with_timeout(args: &[&str], timeout_secs: u64) -> Result<String, String> {
+    // **A timeout, because this sits inside `scan`.** `buildx du` talks to the
+    // daemon, and a daemon that is wedged — a hung storage driver, a Docker
+    // Desktop VM mid-restart — simply never answers. Without a bound the panel
+    // shows "Scanning…" for as long as the app is open, with no error and
+    // nothing to retry. On expiry the build-cache figures fall back to `df()`'s
+    // and say so in `cli_error`, which is the same degradation path a missing
+    // CLI already takes.
+    //
+    // `kill_on_drop` is what makes the timeout real: dropping the future
+    // otherwise leaves the child running and still holding whatever it was
+    // waiting on.
+    let run = tokio::process::Command::new("docker")
         .args(args)
-        .output()
-        .await
-        .map_err(|e| format!("Could not run `docker {}`: {}", args.join(" "), e))?;
+        .kill_on_drop(true)
+        .output();
+    let output = match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), run).await
+    {
+        Ok(result) => result
+            .map_err(|e| format!("Could not run `docker {}`: {}", args.join(" "), e))?,
+        Err(_) => {
+            return Err(format!(
+                "`docker {}` did not answer within {} seconds and was cancelled — the daemon may \
+                 be busy or wedged",
+                args.join(" "),
+                timeout_secs
+            ))
+        }
+    };
     if !output.status.success() {
         return Err(format!(
             "`docker {}` failed: {}",
@@ -1549,10 +1781,14 @@ pub async fn list_reclaimable(
                 daemon_wide: target.is_daemon_wide(),
                 target,
             label: format!("Ownerless rollback pins ({} images)", pin_count),
-            detail: "`pre-migration-*` tags whose migration record is gone, so nothing can roll \
-                     back to them. Untagged here; the image is then collected as a superseded \
-                     snapshot layer under the same rules."
-                .to_string(),
+            detail: format!(
+                "`pre-migration-*` tags whose migration record has been gone for more than {} \
+                 days, so nothing can roll back to them. A pin that lost its record more \
+                 recently is not here — it is listed under this project's own removals, where \
+                 deleting it takes a typed confirmation. Untagged here; the image is then \
+                 collected as a superseded snapshot layer under the same rules.",
+                migration::STALE_PIN_MAX_AGE_DAYS
+            ),
             bytes: pin_bytes,
             bytes_are_exact: true,
             bytes_floor: None,
@@ -1561,7 +1797,14 @@ pub async fn list_reclaimable(
         });
     }
 
-    let staging_bytes = survey_migration_staging(projects);
+    let staging_bytes = {
+        // Same reason as the executor below: `read_dir` + `metadata` per entry
+        // is blocking IO, and this runs inside the panel's plan step.
+        let owned: Vec<Project> = projects.to_vec();
+        tokio::task::spawn_blocking(move || survey_migration_staging(&owned))
+            .await
+            .unwrap_or(0)
+    };
     if staging_bytes > 0 {
         items.push({
             // Safety and reach are read off the target, never restated: a literal
@@ -1596,7 +1839,7 @@ pub async fn list_reclaimable(
                 migration::PROBE_LABEL_MIGRATION
             )],
         )]),
-        is_migration_probe,
+        is_reapable_migration_probe,
     )
     .await;
     if probes.1 > 0 {
@@ -1611,7 +1854,8 @@ pub async fn list_reclaimable(
                 target,
             label: format!("Migration probe containers ({})", probes.1),
             detail: "Throwaway containers a migration used to read a filesystem manifest and \
-                     did not get to remove."
+                     did not get to remove. Only ones that have been sitting there for a while \
+                     are listed — a probe that is still running looks exactly the same."
                 .to_string(),
             bytes: probes.0,
             bytes_are_exact: true,
@@ -1623,7 +1867,7 @@ pub async fn list_reclaimable(
 
     let scrubs = survey_containers_by_filter(
         HashMap::from([("name".to_string(), vec!["triple-c-scrub-".to_string()])]),
-        is_scrub_container,
+        is_reapable_scrub_container,
     )
     .await;
     if scrubs.1 > 0 {
@@ -1638,7 +1882,8 @@ pub async fn list_reclaimable(
                 target,
             label: format!("Secret-scrub scratch containers ({})", scrubs.1),
             detail: "`triple-c-scrub-*` containers left by an interrupted rewrite of a snapshot's \
-                     baked-in environment."
+                     baked-in environment. Only ones that have been sitting there for a while \
+                     are listed — the same name is used by a rewrite that is still running."
                 .to_string(),
             bytes: scrubs.0,
             bytes_are_exact: true,
@@ -1648,53 +1893,18 @@ pub async fn list_reclaimable(
         });
     }
 
-    // --- Orphaned volumes, one tick each ------------------------------------
-    //
-    // Deliberately not aggregated. Each of these was some project's home or
-    // `.claude` directory, and the user is the only one who can say whether the
-    // project it belonged to is really gone.
-    for volume in &report.orphan_volumes {
-        items.push({
-            // Safety and reach are read off the target, never restated: a literal
-            // here that disagreed with the classifier is exactly the drift this
-            // module cannot afford.
-            let target = ReclaimTarget::OrphanVolume {
-                name: volume.name.clone(),
-            };
-            ReclaimItem {
-                safety: target.safety(),
-                daemon_wide: target.is_daemon_wide(),
-                target,
-            label: format!("{} ({} volume)", volume.name, volume.role),
-            detail: format!(
-                "Named for project id {}, which is not in Triple-C's project list, and no \
-                 container is attached to it.{} {}",
-                volume.project_id,
-                match &volume.created_at {
-                    Some(created) => format!(" Docker created it on {}.", created),
-                    None => String::new(),
-                },
-                if volume.role == "config" {
-                    "This is a `.claude` volume — it held that project's Claude credential, \
-                     plugins and session transcripts."
-                } else {
-                    "This is a home volume — it held that project's dotfiles, shell history and \
-                     installed toolchains."
-                }
-            ),
-            bytes: volume.bytes,
-            bytes_are_exact: true,
-            bytes_floor: None,
-            blocked: None,
-        }
-        });
-    }
-
     // --- Per-project semi-safe work -----------------------------------------
     for row in &report.projects {
-        let blocked_by_migration = row
-            .migrating
-            .then(|| "A base-image migration is in flight for this project.".to_string());
+        // The **live** lock first, then the scan's own snapshot as a fallback.
+        // `row.migrating` is as old as the scan that produced it — seconds or
+        // minutes — and it only ever knew about migrations. The lock knows
+        // about a compaction, a Reset and a start too, and it knows now.
+        let blocked_by_migration = crate::project_lock::held(&row.project_id)
+            .map(|holder| format!("{}.", holder.describe()))
+            .or_else(|| {
+                row.migrating
+                    .then(|| "A base-image migration is in flight for this project.".to_string())
+            });
 
         // A ceiling of zero means flattening this snapshot cannot come out
         // ahead — almost always because its unique delta is smaller than the
@@ -1801,10 +2011,51 @@ pub async fn list_reclaimable(
 
     // --- Destructive, for display only --------------------------------------
     let mut destructive = Vec::new();
+
+    // Orphaned volumes, one item each and never aggregated. Each of these was
+    // some project's home or `.claude` directory, and the user is the only one
+    // who can say whether the project it belonged to is really gone — which is
+    // why this is here rather than in `items`. See
+    // `DestructiveTarget::OrphanVolume`.
+    for volume in &report.orphan_volumes {
+        destructive.push(DestructiveItem {
+            target: DestructiveTarget::OrphanVolume {
+                name: volume.name.clone(),
+                project_id: volume.project_id.clone(),
+            },
+            project_id: volume.project_id.clone(),
+            // No project in the store answers to this id — the volume's own
+            // name is the only handle there is, and it is what has to be typed.
+            project_name: volume.name.clone(),
+            label: format!("{} ({} volume)", volume.name, volume.role),
+            loses: format!(
+                "Named for project id {}, which is not in Triple-C's project list, and no \
+                 container is attached to it.{} {} Not recoverable. Type the volume name to \
+                 confirm.",
+                volume.project_id,
+                match &volume.created_at {
+                    Some(created) => format!(" Docker created it on {}.", created),
+                    None => String::new(),
+                },
+                if volume.role == "config" {
+                    "This is a `.claude` volume — it held that project's Claude credential, \
+                     plugins and session transcripts."
+                } else {
+                    "This is a home volume — it held that project's dotfiles, shell history and \
+                     installed toolchains."
+                }
+            ),
+            bytes: volume.bytes,
+            blocked: None,
+        });
+    }
     for row in &report.projects {
-        let blocked = row
-            .migrating
-            .then(|| "A base-image migration is in flight for this project.".to_string());
+        let blocked = crate::project_lock::held(&row.project_id)
+            .map(|holder| format!("{}.", holder.describe()))
+            .or_else(|| {
+                row.migrating
+                    .then(|| "A base-image migration is in flight for this project.".to_string())
+            });
         if row.home_volume_present {
             destructive.push(DestructiveItem {
                 target: DestructiveTarget::HomeVolume {
@@ -1851,25 +2102,25 @@ pub async fn list_reclaimable(
                         The project falls back to the base image next time it starts, and \
                         rebuilds from there. Volumes are untouched."
                     .to_string(),
-                bytes: row.snapshot_above_base_bytes.unwrap_or(row.snapshot_bytes),
+                // The same figure the Snapshot column shows, so the
+                // confirmation and the table cannot quote different numbers for
+                // the same image.
+                bytes: row.snapshot_attributed_bytes,
                 blocked: blocked.clone(),
             });
         }
     }
-    for (project_id, project_name, tag, bytes) in live_pins {
+    for pin in live_pins {
         destructive.push(DestructiveItem {
             target: DestructiveTarget::RollbackPin {
-                project_id: project_id.clone(),
-                tag: tag.clone(),
+                project_id: pin.project_id.clone(),
+                tag: pin.tag.clone(),
             },
-            project_id,
-            project_name,
-            label: format!("Rollback pin {}", tag),
-            loses: "The only copy of this project's pre-migration system layer. Its migration is \
-                    still waiting to be confirmed or rolled back — delete this and rolling back \
-                    becomes impossible."
-                .to_string(),
-            bytes,
+            project_id: pin.project_id,
+            project_name: pin.project_name,
+            label: format!("Rollback pin {}", pin.tag),
+            loses: pin.loses,
+            bytes: pin.bytes,
             blocked: None,
         });
     }
@@ -1929,14 +2180,83 @@ fn compaction_ceiling_for(unique_bytes: i64, shared_bytes: i64, commit_layers: u
     superseded_ceiling.min(after_base_penalty).max(0)
 }
 
-/// Rollback pins, split into the ones nothing claims and the ones a live
-/// migration still needs.
+/// What this module may do with one `pre-migration-*` tag.
 ///
-/// Returns `(ownerless_bytes, ownerless_count, live_pins)` where each live pin
-/// is `(project_id, project_name, tag, bytes)`.
-async fn survey_rollback_pins(
-    projects: &[Project],
-) -> (i64, usize, Vec<(String, String, String, i64)>) {
+/// The single rule behind both the survey and the reclaim, so the count on the
+/// button and the work the button does cannot disagree — and so the guards can
+/// be tested without a daemon. Before this existed the two paths applied
+/// *different* rules and the reclaim's was the weaker one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinDisposition {
+    /// Not a tag `migration::rollback_tag` produced. Never touched, never
+    /// offered, never given a tombstone — a hand-made `pre-migration-keepme` is
+    /// somebody's deliberate pin.
+    NotOurs,
+    /// Nothing claims it and its grace period has expired.
+    Reapable,
+    /// A migration record still claims it. The only copy of a rollback target
+    /// that is still awaiting a decision.
+    Claimed,
+    /// Nothing claims it, but the grace period that starts when a pin loses its
+    /// record has not run out — including the case where no reaper has recorded
+    /// a sighting yet, which is where the clock starts rather than where it
+    /// ends.
+    WithinGrace,
+}
+
+/// Classify one rollback pin. Pure; see [`PinDisposition`].
+pub fn pin_disposition(
+    tag: &str,
+    has_record: bool,
+    ownerless_since: Option<chrono::DateTime<chrono::Utc>>,
+    now: &chrono::DateTime<chrono::Utc>,
+) -> PinDisposition {
+    if migration::parse_rollback_tag(tag).is_none() {
+        return PinDisposition::NotOurs;
+    }
+    if has_record {
+        return PinDisposition::Claimed;
+    }
+    if migration::pin_is_reapable(tag, has_record, ownerless_since, now) {
+        PinDisposition::Reapable
+    } else {
+        PinDisposition::WithinGrace
+    }
+}
+
+/// One rollback pin this panel will not collect on its own, with the reason.
+struct RetainedPin {
+    project_id: String,
+    project_name: String,
+    tag: String,
+    /// The image's own size, charged **once per image** — see
+    /// [`survey_rollback_pins`].
+    bytes: i64,
+    /// The sentence the destructive confirmation shows.
+    loses: String,
+}
+
+/// Rollback pins, split into the ones the reaper may drop and the ones it may
+/// not.
+///
+/// ## Two things this used to get wrong
+///
+/// * **It applied no guard but `has_record`.** `reap_stale_migration_pins`
+///   requires `parse_rollback_tag` *and* `pin_is_reapable`, and `destroy`'s
+///   `RollbackPin` arm requires `parse_rollback_tag` with a comment explaining
+///   why. This offered anything whose repo matched `triple-c-snapshot-*` and
+///   whose tag merely began `pre-migration-` — a hand-made pin included — with
+///   no age gate at all, under `Safety::Safe`, i.e. one button and no
+///   confirmation.
+/// * **It double-counted.** The loop is over `repo_tags`, so an image answering
+///   to two `pre-migration-*` tags added its full size twice.
+///
+/// The survey only ever *peeks* at the ownerless clock. Starting one is a
+/// reaper's job — [`reclaim_migration_pins`] and
+/// `migration::reap_stale_migration_pins` — because a function whose job is to
+/// describe the world should not be the thing that makes a pin collectable
+/// fourteen days later.
+async fn survey_rollback_pins(projects: &[Project]) -> (i64, usize, Vec<RetainedPin>) {
     let Ok(docker) = get_docker() else {
         return (0, 0, Vec::new());
     };
@@ -1957,10 +2277,18 @@ async fn survey_rollback_pins(
         .await
         .unwrap_or_default();
 
-    let mut ownerless_bytes = 0;
-    let mut ownerless_count = 0;
-    let mut live = Vec::new();
+    let now = chrono::Utc::now();
+    let mut reapable_bytes = 0;
+    let mut reapable_count = 0;
+    let mut retained = Vec::new();
     for image in images {
+        // Per *image*, not per tag: two `pre-migration-*` tags on one image are
+        // two names for the same layers, and removing both frees them once.
+        let mut image_is_reapable = false;
+        // Set once the image's bytes have been charged to one of its retained
+        // tags, so a second tag on the same image is listed but not counted.
+        let mut image_bytes_charged = false;
+
         for reference in &image.repo_tags {
             let Some((project_id, tag)) = migration::parse_snapshot_reference(reference) else {
                 continue;
@@ -1969,19 +2297,53 @@ async fn survey_rollback_pins(
             // must still count as "somebody may want this back". Same rule the
             // pin reaper uses, for the same reason.
             let has_record = migration_store::has_record(&project_id).unwrap_or(true);
-            if has_record {
-                let name = names
-                    .get(project_id.as_str())
-                    .map(|n| (*n).to_string())
-                    .unwrap_or_else(|| project_id.clone());
-                live.push((project_id, name, tag, image.size));
-            } else {
-                ownerless_bytes += image.size;
-                ownerless_count += 1;
+            let ownerless_since = migration_store::peek_ownerless_since(&project_id, &tag);
+            let disposition = pin_disposition(&tag, has_record, ownerless_since, &now);
+            match disposition {
+                // Never offered anywhere, at any safety level — the same
+                // refusal `destroy` makes.
+                PinDisposition::NotOurs => continue,
+                PinDisposition::Reapable => {
+                    image_is_reapable = true;
+                    continue;
+                }
+                PinDisposition::Claimed | PinDisposition::WithinGrace => {}
             }
+            let name = names
+                .get(project_id.as_str())
+                .map(|n| (*n).to_string())
+                .unwrap_or_else(|| project_id.clone());
+            let loses = if disposition == PinDisposition::Claimed {
+                "The only copy of this project's pre-migration system layer. Its migration is \
+                 still waiting to be confirmed or rolled back — delete this and rolling back \
+                 becomes impossible."
+                    .to_string()
+            } else {
+                format!(
+                    "The only copy of this project's pre-migration system layer. Nothing claims \
+                     it any more, but it is still inside the {}-day grace period that starts \
+                     when a pin loses its migration record — it is collected automatically after \
+                     that. Delete it here only if you are sure you will never roll that \
+                     migration back.",
+                    migration::STALE_PIN_MAX_AGE_DAYS
+                )
+            };
+            retained.push(RetainedPin {
+                project_id,
+                project_name: name,
+                tag,
+                bytes: if image_bytes_charged { 0 } else { image.size },
+                loses,
+            });
+            image_bytes_charged = true;
+        }
+
+        if image_is_reapable {
+            reapable_bytes += image.size;
+            reapable_count += 1;
         }
     }
-    (ownerless_bytes, ownerless_count, live)
+    (reapable_bytes, reapable_count, retained)
 }
 
 /// Total bytes of `*-payload.tar` staging files no migration record claims.
@@ -2036,10 +2398,54 @@ fn is_migration_probe(summary: &ContainerSummary) -> bool {
         == Some(migration::PROBE_LABEL_MIGRATION)
 }
 
-/// A scratch container from an interrupted secret rewrite.
+/// A migration probe this bucket is allowed to force-remove.
+///
+/// The label is daemon-wide, and this target's `project_id()` is `None` — so
+/// `reclaim`'s per-project guard never fires for it and a tick here reaches
+/// *every* probe on the daemon, including a live one belonging to another
+/// instance's migration or to a migration this process started a second ago.
+/// The same age gate `migration::reap_probe_containers` applies is the only
+/// discriminator there is; a probe is a short `df`, `find` or `apt-get update`,
+/// so nothing legitimate is older than it.
+fn is_reapable_migration_probe(summary: &ContainerSummary) -> bool {
+    if !is_migration_probe(summary) {
+        return false;
+    }
+    match summary.created {
+        Some(created) => {
+            chrono::Utc::now().timestamp() - created >= migration::PROBE_REAP_MIN_AGE_SECS
+        }
+        // Unknown is never permission — the same rule the volume ref count and
+        // the scratch containers follow.
+        None => false,
+    }
+}
+
+/// A scratch container from an **interrupted** secret rewrite.
 ///
 /// **Docker's `name` filter is a substring match**, so it also returns a user's
 /// own `my-triple-c-scrub-notes`. The full name is what decides.
+///
+/// ## The age gate is not tidiness, it is the point of the whole function
+///
+/// `triple-c-scrub-*` is not a dead name. It is the **live** name
+/// `container::rewrite_image_without_secrets` creates its scratch container
+/// under, and that is still reachable today from `clear_claude_token`. Between
+/// the `create` and the `commit` there is a window in which this bucket —
+/// `Safety::Safe`, one button, no confirmation, and `force: true` on the
+/// removal — destroys the container the commit is about to run against. The
+/// rewrite then fails, the superseded image is *not* removed, and a revoked
+/// OAuth token stays baked into that snapshot's `Config.Env`: precisely the
+/// condition `scrub_secrets_from_snapshots` exists to remove, produced by the
+/// panel that offers to clean up after it.
+///
+/// The right discriminator would be a label — the scrub containers carry none,
+/// and this module cannot add one without editing `container.rs`. Age is the
+/// discriminator available from here. A scrub container is created, committed
+/// and removed within one function with no I/O between the steps but a
+/// `docker commit`; anything older than [`SCRATCH_CONTAINER_MIN_AGE_SECS`] is
+/// therefore a leftover, and anything younger is assumed to belong to a live
+/// rewrite — this process's or another instance's.
 fn is_scrub_container(summary: &ContainerSummary) -> bool {
     summary
         .names
@@ -2047,6 +2453,33 @@ fn is_scrub_container(summary: &ContainerSummary) -> bool {
         .unwrap_or(&[])
         .iter()
         .any(|name| name.trim_start_matches('/').starts_with("triple-c-scrub-"))
+}
+
+/// A scrub container this module is allowed to force-remove: ours *and* old
+/// enough not to be a live rewrite. This is the predicate the survey and the
+/// reclaim both use; [`is_scrub_container`] answers only "is this name ours".
+fn is_reapable_scrub_container(summary: &ContainerSummary) -> bool {
+    is_scrub_container(summary) && is_stale_scratch(summary)
+}
+
+/// How old a `triple-c-scrub-*` / `triple-c-compact-*` scratch container must be
+/// before anything here will force-remove it.
+///
+/// Both names are used by live code, neither carries a label to tell a leftover
+/// from a live one, and the removals are unconditional `force: true`. See
+/// [`is_scrub_container`]. Fifteen minutes is far longer than either scratch
+/// container's real lifetime (a `create`, a `commit`, a `rm`) and far shorter
+/// than "until the user notices".
+pub const SCRATCH_CONTAINER_MIN_AGE_SECS: i64 = 15 * 60;
+
+/// Whether a scratch container is old enough to be a leftover rather than a
+/// live one. A summary with no creation time is treated as young: unknown is
+/// never permission, the same rule the volume ref count follows.
+fn is_stale_scratch(summary: &ContainerSummary) -> bool {
+    match summary.created {
+        Some(created) => chrono::Utc::now().timestamp() - created >= SCRATCH_CONTAINER_MIN_AGE_SECS,
+        None => false,
+    }
 }
 
 /// `(writable_bytes, count)` for containers matching a filter *and* a predicate
@@ -2094,14 +2527,16 @@ pub async fn reclaim(targets: &[ReclaimTarget], projects: &[Project]) -> Reclaim
     let mut outcome = ReclaimOutcome::default();
     for target in targets {
         // Anything that stops, removes or rewrites a project's container or
-        // image consults `is_migrating` first — the same rule the rest of the
-        // app obeys. Checked once here so a new project-scoped target cannot
-        // be added without it; the executors re-check for their own callers.
+        // image consults the project's lock first — the same rule the rest of
+        // the app obeys. Checked once here so a new project-scoped target
+        // cannot be added without it, and so a busy project is reported per
+        // item rather than failing the whole batch; the executors *acquire*
+        // for their own callers, which is the check that actually holds.
         if let Some(project_id) = target.project_id() {
-            if crate::commands::migration_commands::is_migrating(project_id) {
+            if let Some(holder) = crate::project_lock::held(project_id) {
                 let result = failed(
                     target.clone(),
-                    "A base-image migration is in flight for this project.".to_string(),
+                    format!("{}. Nothing was done for it.", holder.describe()),
                 );
                 outcome.results.push(result);
                 continue;
@@ -2113,7 +2548,20 @@ pub async fn reclaim(targets: &[ReclaimTarget], projects: &[Project]) -> Reclaim
             }
             ReclaimTarget::BuildCache { all } => reclaim_build_cache(*all).await,
             ReclaimTarget::MigrationPins => reclaim_migration_pins().await,
-            ReclaimTarget::MigrationStaging => reclaim_migration_staging(projects),
+            ReclaimTarget::MigrationStaging => {
+                // `std::fs` over a directory of multi-gigabyte tars, from an
+                // async worker. `spawn_blocking` or the whole runtime thread
+                // stalls behind it.
+                let owned: Vec<Project> = projects.to_vec();
+                tokio::task::spawn_blocking(move || reclaim_migration_staging(&owned))
+                    .await
+                    .unwrap_or_else(|e| {
+                        failed(
+                            ReclaimTarget::MigrationStaging,
+                            format!("The staging cleanup task did not finish: {}", e),
+                        )
+                    })
+            }
             ReclaimTarget::ProbeContainers => {
                 reclaim_containers(
                     HashMap::from([(
@@ -2124,7 +2572,7 @@ pub async fn reclaim(targets: &[ReclaimTarget], projects: &[Project]) -> Reclaim
                             migration::PROBE_LABEL_MIGRATION
                         )],
                     )]),
-                    is_migration_probe,
+                    is_reapable_migration_probe,
                     ReclaimTarget::ProbeContainers,
                 )
                 .await
@@ -2132,12 +2580,11 @@ pub async fn reclaim(targets: &[ReclaimTarget], projects: &[Project]) -> Reclaim
             ReclaimTarget::ScrubContainers => {
                 reclaim_containers(
                     HashMap::from([("name".to_string(), vec!["triple-c-scrub-".to_string()])]),
-                    is_scrub_container,
+                    is_reapable_scrub_container,
                     ReclaimTarget::ScrubContainers,
                 )
                 .await
             }
-            ReclaimTarget::OrphanVolume { name } => reclaim_orphan_volume(name, projects).await,
             ReclaimTarget::CompactSnapshot { project_id } => {
                 match find_project(projects, project_id) {
                     Ok(project) => compact_snapshot(project).await,
@@ -2277,7 +2724,7 @@ async fn reclaim_build_cache(all: bool) -> ReclaimResult {
         args.push("--filter");
         args.push(&filter);
     }
-    match docker_cli(&args).await {
+    match docker_cli_with_timeout(&args, DOCKER_PRUNE_TIMEOUT_SECS).await {
         Ok(output) => ReclaimResult {
             target: Some(target),
             destroyed: None,
@@ -2300,7 +2747,32 @@ async fn reclaim_build_cache(all: bool) -> ReclaimResult {
     }
 }
 
-/// Untag the rollback pins nothing claims.
+/// Untag the rollback pins nothing claims *and* that are past their grace
+/// period.
+///
+/// ## The guards this was missing
+///
+/// It used to discard the tag entirely (`let Some((project_id, _tag)) = …`) and
+/// untag on `has_record` alone. Everything else that touches a pin applies two
+/// more conditions: `migration::parse_rollback_tag`, which is the only thing
+/// separating `pre-migration-20260101-101500` from a hand-made
+/// `pre-migration-keepme` somebody pinned deliberately, and the fourteen-day
+/// grace period in `migration::pin_is_reapable`. `reap_stale_migration_pins`
+/// requires both, and `destroy`'s `RollbackPin` arm requires the first with a
+/// comment explaining exactly this hazard.
+///
+/// The gap mattered more here than anywhere else, because this path has none of
+/// the brakes the others do: it is `Safety::Safe`, so one button with no
+/// confirmation reaches it; its `ReclaimTarget::project_id()` is `None`, so
+/// `reclaim`'s `is_migrating` guard never fires for it; and
+/// `sweep_orphaned_snapshots` four lines below turns the untag into a deletion
+/// on the same pass. A record that had merely gone missing for a minute was
+/// enough to lose the only copy of a project's pre-migration system layer.
+///
+/// Unlike [`survey_rollback_pins`] this **starts** the ownerless clock for pins
+/// nothing has sighted yet — it is a reaper, and that is a reaper's job. Those
+/// pins are not dropped on this pass; they become collectable fourteen days
+/// later.
 ///
 /// Untag only, never `rmi`: dropping the tag makes the image dangling, and it
 /// already carries `triple-c.managed=true` because `docker commit` created it,
@@ -2327,18 +2799,36 @@ async fn reclaim_migration_pins() -> ReclaimResult {
         Err(e) => return failed(target, format!("Could not list rollback pins: {}", e)),
     };
 
+    let now = chrono::Utc::now();
     let mut freed = 0i64;
     let mut dropped = 0usize;
+    let mut held_back = 0usize;
     for image in images {
         for reference in &image.repo_tags {
-            let Some((project_id, _tag)) = migration::parse_snapshot_reference(reference) else {
+            let Some((project_id, tag)) = migration::parse_snapshot_reference(reference) else {
                 continue;
             };
-            if migration_store::has_record(&project_id).unwrap_or(true) {
+            if migration::parse_rollback_tag(&tag).is_none() {
+                continue;
+            }
+            let has_record = migration_store::has_record(&project_id).unwrap_or(true);
+            if has_record {
+                migration_store::clear_ownerless(&project_id, &tag);
+                held_back += 1;
+                continue;
+            }
+            // Starts the clock when nothing has sighted this pin before, which
+            // is what makes the first pass a no-op for it.
+            let ownerless_since =
+                migration_store::note_ownerless_since(&project_id, &tag, &now);
+            if pin_disposition(&tag, has_record, ownerless_since, &now) != PinDisposition::Reapable
+            {
+                held_back += 1;
                 continue;
             }
             match migration::untag_image(reference).await {
                 Ok(()) => {
+                    migration_store::clear_ownerless(&project_id, &tag);
                     freed += image.size;
                     dropped += 1;
                 }
@@ -2365,15 +2855,30 @@ async fn reclaim_migration_pins() -> ReclaimResult {
         ok: true,
         freed_bytes: sweep.reclaimed_bytes,
         projected_bytes: None,
-        message: format!(
-            "Dropped {} ownerless pin(s) and swept {} image(s).",
-            dropped,
-            sweep.removed.len()
-        ),
+        message: {
+            let mut message = format!(
+                "Dropped {} ownerless pin(s) and swept {} image(s).",
+                dropped,
+                sweep.removed.len()
+            );
+            if held_back > 0 {
+                message.push_str(&format!(
+                    " {} pin(s) were left alone — still claimed by a migration record, or inside \
+                     the {}-day grace period that starts when a pin loses one.",
+                    held_back,
+                    migration::STALE_PIN_MAX_AGE_DAYS
+                ));
+            }
+            message
+        },
     }
 }
 
 /// Delete ownerless `*-payload.tar` staging files.
+///
+/// Blocking `std::fs` throughout — `read_dir`, `metadata` and `remove_file` on
+/// what can be multi-gigabyte tars — so [`reclaim`] calls it through
+/// `spawn_blocking` rather than on the async worker it is running on.
 fn reclaim_migration_staging(projects: &[Project]) -> ReclaimResult {
     let target = ReclaimTarget::MigrationStaging;
     let dir = match migration_store::migrations_dir() {
@@ -2387,6 +2892,7 @@ fn reclaim_migration_staging(projects: &[Project]) -> ReclaimResult {
 
     let mut freed = 0i64;
     let mut removed = 0usize;
+    let mut errors = 0usize;
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
         let Some(project_id) = name.strip_suffix("-payload.tar") else {
@@ -2407,16 +2913,23 @@ fn reclaim_migration_staging(projects: &[Project]) -> ReclaimResult {
                 freed += size;
                 removed += 1;
             }
-            Err(e) => log::warn!("Could not remove {}: {}", entry.path().display(), e),
+            Err(e) => {
+                log::warn!("Could not remove {}: {}", entry.path().display(), e);
+                errors += 1;
+            }
         }
+    }
+    let mut message = format!("Removed {} staging file(s).", removed);
+    if errors > 0 {
+        message.push_str(&format!(" {} could not be removed; see the log.", errors));
     }
     ReclaimResult {
         target: Some(target),
         destroyed: None,
-        ok: true,
+        ok: errors == 0,
         freed_bytes: freed,
         projected_bytes: None,
-        message: format!("Removed {} staging file(s).", removed),
+        message,
     }
 }
 
@@ -2466,74 +2979,76 @@ async fn reclaim_containers(
             }
         }
     }
+    // **The failures have to be in the message.** `ok: false` alone was not
+    // enough: a partially failed run returned "Removed 2 container(s)." with
+    // three more that could not be touched, and the panel renders that string
+    // under a success headline. The count belongs in the sentence the user
+    // actually reads.
+    let mut message = format!("Removed {} container(s).", removed);
+    if errors > 0 {
+        message.push_str(&format!(
+            " {} could not be removed; see the log.",
+            errors
+        ));
+    }
     ReclaimResult {
         target: Some(target),
         destroyed: None,
         ok: errors == 0,
         freed_bytes: freed,
         projected_bytes: None,
-        message: format!("Removed {} container(s).", removed),
+        message,
     }
 }
 
 /// Remove one orphaned volume, re-checking every safety condition first.
 ///
 /// The plan that offered this was computed against a `df()` from some seconds
-/// ago. A project could have been added since, and a container could have
-/// attached. So the name is re-parsed, the store is re-consulted and the live
-/// ref count is re-read here — the tick is permission to act, not a promise
-/// that the world stood still.
-async fn reclaim_orphan_volume(name: &str, projects: &[Project]) -> ReclaimResult {
-    let target = ReclaimTarget::OrphanVolume {
-        name: name.to_string(),
-    };
-    let docker = match get_docker() {
-        Ok(d) => d,
-        Err(e) => return failed(target, e),
-    };
+/// ago. A project could have been added since — by this app or by a second copy
+/// of it — and a container could have attached. So the store is re-consulted
+/// *from disk*, the name is re-parsed and the live ref count is re-read here:
+/// the typed confirmation is permission to act, not a promise that the world
+/// stood still. Both of those re-checks predate the move to the destructive
+/// path and are deliberately unchanged.
+async fn destroy_orphan_volume(name: &str, projects: &[Project]) -> Result<ReclaimResult, String> {
+    let docker = get_docker()?;
 
-    let (json_exists, json_parsed) = projects_json_health();
-    let known = match project_store_trust(projects, json_exists, json_parsed) {
-        Ok(known) => known,
-        Err(reason) => return failed(target, reason),
-    };
+    let (json_exists, json_ids) = projects_json_snapshot_async().await;
+    let known = project_store_trust(projects, json_exists, json_ids.as_deref())?;
 
-    let usage = match docker.df().await {
-        Ok(usage) => usage,
-        Err(e) => return failed(target, format!("Could not re-check volume usage: {}", e)),
-    };
+    let usage = docker
+        .df()
+        .await
+        .map_err(|e| format!("Could not re-check volume usage: {}", e))?;
     let volumes = usage.volumes.unwrap_or_default();
     let facts: Vec<VolumeFacts> = volumes.iter().map(volume_facts).collect();
     let still_orphaned = orphan_volumes(&facts, &known, true)
         .into_iter()
         .find(|v| v.name == name);
     let Some(volume) = still_orphaned else {
-        return failed(
-            target,
-            format!(
-                "{} now matches a project in your project list, or a container has attached to \
-                 it, so it is no longer unclaimed. Nothing was removed.",
-                name
-            ),
-        );
+        return Err(format!(
+            "{} now matches a project in your project list, or a container has attached to it, \
+             so it is no longer unclaimed. Nothing was removed.",
+            name
+        ));
     };
 
-    match docker.remove_volume(name, None).await {
-        Ok(()) => ReclaimResult {
-            target: Some(target),
-            destroyed: None,
-            ok: true,
-            freed_bytes: volume.bytes,
-            projected_bytes: None,
-            message: format!("Removed volume {}.", name),
-        },
-        Err(e) => failed(
-            ReclaimTarget::OrphanVolume {
-                name: name.to_string(),
-            },
-            format!("Could not remove volume {}: {}", name, e),
-        ),
-    }
+    docker
+        .remove_volume(name, None)
+        .await
+        .map_err(|e| format!("Could not remove volume {}: {}", name, e))?;
+    log::info!("Removed orphaned volume {} on explicit confirmation", name);
+    Ok(ReclaimResult {
+        target: None,
+        destroyed: Some(DestructiveTarget::OrphanVolume {
+            name: name.to_string(),
+            project_id: volume.project_id.clone(),
+        }),
+        ok: true,
+        freed_bytes: volume.bytes,
+        projected_bytes: None,
+        message: format!("Removed volume {}.", name),
+    })
 }
 
 /// Rewrite a project's stacked commit layers into a single layer.
@@ -2567,18 +3082,36 @@ pub async fn compact_snapshot(project: &Project) -> ReclaimResult {
     let target = ReclaimTarget::CompactSnapshot {
         project_id: project.id.clone(),
     };
-    if crate::commands::migration_commands::is_migrating(&project.id) {
-        return failed(
-            target,
-            "A base-image migration is in flight for this project.".to_string(),
-        );
-    }
+
+    // **Acquired, and held for the whole rewrite.** This is the operation the
+    // per-project lock was written for. Compaction resolves
+    // `triple-c-snapshot-{id}:latest` when its build starts and commits back
+    // over that same tag minutes later, and the Settings panel is a sidebar
+    // rather than a modal, so Project Home stays live with Start, Reset and
+    // Migrate clickable the whole time. A one-shot `is_migrating` read at the
+    // door — which is all this used to have — covered none of that: it could
+    // not see a Start, a Reset or a second compaction at all, and it could not
+    // see a migration that began *after* the check.
+    let _guard =
+        match crate::project_lock::try_acquire(&project.id, crate::project_lock::ProjectOp::Compaction)
+        {
+            Ok(guard) => guard,
+            Err(reason) => return failed(target, reason),
+        };
 
     let docker = match get_docker() {
         Ok(d) => d,
         Err(e) => return failed(target, e),
     };
     let snapshot_ref = get_snapshot_image_name(project);
+
+    // Before anything is created, so a leftover from a previous run's crash is
+    // gone and nothing this run creates can be mistaken for one. The guard
+    // above is already held, which is why this passes the project id: the sweep
+    // excludes this compaction's own claim rather than seeing it and skipping.
+    // See [`remove_stale_compaction_containers`] for why it moved here from the
+    // end of `restore_image_config`.
+    reap_stale_compaction_artifacts_for(&project.id).await;
 
     // The container must be stopped: this rewrites the image it is running
     // from, and a running container also means the writable layer holds work
@@ -2643,11 +3176,10 @@ pub async fn compact_snapshot(project: &Project) -> ReclaimResult {
     };
 
     // `:compacting` rather than `:latest`. Nothing starts from this tag, and it
-    // is removed on every exit path below.
-    let staging_ref = format!(
-        "triple-c-snapshot-{}:compacting",
-        project.id
-    );
+    // is removed on every exit path below — every *in-process* one. A process
+    // that dies mid-build leaves it behind, which is what
+    // [`reap_stale_compaction_artifacts`] exists to collect.
+    let staging_ref = compaction_staging_ref(&project.id);
     let dockerfile = compaction_dockerfile(&snapshot_ref, &container::snapshot_scrub_script());
 
     if let Err(e) = build_from_dockerfile(&dockerfile, &staging_ref).await {
@@ -2729,11 +3261,22 @@ pub async fn compact_snapshot(project: &Project) -> ReclaimResult {
 /// Base 1000, matching `docker system df` and the frontend's `formatBytes` —
 /// a message saying 4.4 GiB beside a table saying 4.7 GB would read as two
 /// different numbers for the same thing.
-fn human(bytes: i64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+pub(crate) fn human(bytes: i64) -> String {
+    const UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
     let mut value = bytes as f64;
     let mut unit = 0;
     while value.abs() >= 1000.0 && unit < UNITS.len() - 1 {
+        value /= 1000.0;
+        unit += 1;
+    }
+    // **The rounding has to be applied before the unit is settled.** 999,999
+    // divides to 999.999 KB, which is under the loop's threshold, and then
+    // `{:.1}` rounds it up to "1000.0 KB" — a unit the ladder is supposed to
+    // make impossible. That is the exact bug `formatBytes.ts` was written to
+    // fix on the frontend, and this function's output is rendered on the same
+    // line as `formatBytes`' in a reclaim message, so the two disagreeing about
+    // it is visible in one sentence.
+    if unit > 0 && (value.abs() * 10.0).round() / 10.0 >= 1000.0 && unit < UNITS.len() - 1 {
         value /= 1000.0;
         unit += 1;
     }
@@ -2795,12 +3338,148 @@ async fn build_from_dockerfile(dockerfile: &str, tag: &str) -> Result<(), String
 /// [`restore_image_config`].
 const COMPACTION_CONTAINER_PREFIX: &str = "triple-c-compact-";
 
+/// The tag a compaction builds to before it commits back over `:latest`.
+pub fn compaction_staging_ref(project_id: &str) -> String {
+    format!("triple-c-snapshot-{}:compacting", project_id)
+}
+
+/// Collect what a **crashed** compaction leaves on the daemon.
+///
+/// ## The stranded image nothing could find
+///
+/// `triple-c-snapshot-{id}:compacting` is dropped on every exit path inside
+/// [`compact_snapshot`] — every path that runs *in this process*. Kill the app
+/// mid-build and the tag survives, holding a whole flattened copy of a
+/// multi-gigabyte snapshot, and it was invisible to every single reclaim path
+/// in this module:
+///
+/// * the startup sweep filters `dangling=true`, and a tagged image is not
+///   dangling;
+/// * the pin reaper matches `:pre-migration-*`;
+/// * the per-project scan joins on `:latest`, so the row does not mention it;
+/// * `list_reclaimable` has no bucket that names it.
+///
+/// So it sat there forever with nothing in the UI that would ever say why the
+/// daemon was several gigabytes larger than the panel's own total. The same is
+/// true of a leftover `triple-c-compact-*` container, which is worse: it also
+/// *pins* the flattened image, so even untagging would not let the sweep
+/// collect it.
+///
+/// ## What it will not touch
+///
+/// A `:compacting` tag belonging to a compaction that is still running. In this
+/// process that is the project lock; in another instance of the app there is no
+/// lock to consult, so the image's own age is the brake — the tag exists for
+/// the few seconds to minutes between the build finishing and the commit, and
+/// [`SCRATCH_CONTAINER_MIN_AGE_SECS`] is far longer than that.
+pub async fn reap_stale_compaction_artifacts() -> usize {
+    reap_stale_compaction_artifacts_for("").await
+}
+
+/// [`reap_stale_compaction_artifacts`], ignoring `owner_project_id`'s own claim
+/// and its own staging tag age.
+///
+/// Called at the top of [`compact_snapshot`], which is already holding that
+/// project's lock: without the exclusion the sweep would see its own claim and
+/// skip, and the leftovers it is there to clear would survive the very run that
+/// went looking for them.
+async fn reap_stale_compaction_artifacts_for(owner_project_id: &str) -> usize {
+    remove_stale_compaction_containers(owner_project_id).await;
+
+    let Ok(docker) = get_docker() else {
+        return 0;
+    };
+    let images = docker
+        .list_images(Some(ListImagesOptions {
+            all: false,
+            filters: HashMap::from([(
+                "reference".to_string(),
+                vec!["triple-c-snapshot-*:compacting".to_string()],
+            )]),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_or_default();
+
+    let now = chrono::Utc::now().timestamp();
+    let mut dropped = 0usize;
+    for image in images {
+        for reference in &image.repo_tags {
+            let Some((project_id, tag)) = migration::parse_snapshot_reference(reference) else {
+                continue;
+            };
+            if tag != "compacting" {
+                continue;
+            }
+            let is_owner = project_id == owner_project_id;
+            if !is_owner
+                && crate::project_lock::is_held_by(
+                    &project_id,
+                    crate::project_lock::ProjectOp::Compaction,
+                )
+            {
+                continue;
+            }
+            // Age is the only thing that can see another instance's live
+            // compaction, so it applies to the owner's own tag too.
+            if now - image.created < SCRATCH_CONTAINER_MIN_AGE_SECS {
+                log::info!(
+                    "Leaving {} alone — it was built less than {} minutes ago and may belong to \
+                     a compaction that is still running",
+                    reference,
+                    SCRATCH_CONTAINER_MIN_AGE_SECS / 60
+                );
+                continue;
+            }
+            match migration::untag_image(reference).await {
+                Ok(()) => {
+                    log::info!(
+                        "Dropped stranded compaction staging tag {} ({:.2} GB) — the compaction \
+                         that built it never finished",
+                        reference,
+                        image.size as f64 / 1_073_741_824.0
+                    );
+                    dropped += 1;
+                }
+                Err(e) => log::warn!("Could not drop {}: {}", reference, e),
+            }
+        }
+    }
+    dropped
+}
+
 /// Remove any container left behind by an interrupted compaction.
 ///
-/// Runs at the start of a compaction rather than from a reclaim bucket, so
-/// nothing can ever remove the container of a compaction that is still running:
-/// by the time this is called, this task owns the compaction path.
-async fn remove_stale_compaction_containers() {
+/// ## It was called from the wrong end of the compaction
+///
+/// The doc used to say "runs at the start of a compaction … by the time this is
+/// called, this task owns the compaction path". It did not: the only call was
+/// from inside [`restore_image_config`], which is the *last* step of a
+/// compaction. So it ran at the end, and it force-removed every
+/// `triple-c-compact-*` container on the daemon — including the one a second,
+/// concurrent compaction had just created and was about to commit. The claim in
+/// the comment is now true because the call moved to the top of
+/// [`compact_snapshot`], before anything is created.
+///
+/// Two brakes on top of the move, because the name carries a random uuid rather
+/// than a project id and so cannot be attributed to an owner:
+///
+/// * [`crate::project_lock::any_held_excluding`] — if this process is compacting anything
+///   at all, every `triple-c-compact-*` container might be that compaction's,
+///   and none is touched.
+/// * [`SCRATCH_CONTAINER_MIN_AGE_SECS`] — the same age gate the scrub bucket
+///   uses, which is the only thing that can see *another instance's* live
+///   compaction.
+async fn remove_stale_compaction_containers(owner_project_id: &str) {
+    if crate::project_lock::any_held_excluding(
+        crate::project_lock::ProjectOp::Compaction,
+        owner_project_id,
+    ) {
+        log::debug!(
+            "Skipping the compaction-container sweep: a compaction is in flight in this process"
+        );
+        return;
+    }
     let Ok(docker) = get_docker() else {
         return;
     };
@@ -2819,6 +3498,15 @@ async fn remove_stale_compaction_containers() {
     for summary in containers {
         // Docker's `name` filter is a substring match; the full name decides.
         if !is_compaction_container(&summary) {
+            continue;
+        }
+        if !is_stale_scratch(&summary) {
+            log::info!(
+                "Leaving compaction container {} alone — it is younger than {} minutes, so it \
+                 may belong to another Triple-C instance's live compaction",
+                summary.id.as_deref().unwrap_or("<unknown>"),
+                SCRATCH_CONTAINER_MIN_AGE_SECS / 60
+            );
             continue;
         }
         if let Some(id) = summary.id.as_deref() {
@@ -2874,10 +3562,10 @@ async fn restore_image_config(
     // container the commit is about to run against. Sequential execution inside
     // one `reclaim` call is not a guarantee when two can be in flight.
     //
-    // Stale ones are instead swept here, at the start of the next compaction —
-    // a created-but-never-started container has no writable layer, so a
-    // leftover costs almost nothing until then.
-    remove_stale_compaction_containers().await;
+    // Stale ones are instead swept at the *start* of the next compaction. That
+    // call used to be right here — i.e. at the end of a compaction, contradicting
+    // its own doc comment — where it force-removed a concurrent compaction's
+    // live container. It now sits at the top of `compact_snapshot`.
     let scratch_name = format!("{}{}", COMPACTION_CONTAINER_PREFIX, uuid::Uuid::new_v4().simple());
 
     // `image` is the flat build; everything else is copied from the original so
@@ -2966,12 +3654,16 @@ pub async fn clear_caches(project: &Project, include_rustup: bool) -> ReclaimRes
         project_id: project.id.clone(),
         include_rustup,
     };
-    if crate::commands::migration_commands::is_migrating(&project.id) {
-        return failed(
-            target,
-            "A base-image migration is in flight for this project.".to_string(),
-        );
-    }
+    // Held rather than polled, for the same reason as everything else here: a
+    // Reset removes both volumes, and an exec `rm -rf`-ing paths inside one of
+    // them while it is being deleted is not a race worth having.
+    let _guard = match crate::project_lock::try_acquire(
+        &project.id,
+        crate::project_lock::ProjectOp::CacheClear,
+    ) {
+        Ok(guard) => guard,
+        Err(reason) => return failed(target, reason),
+    };
 
     let container_id = match container::find_existing_container(project).await {
         Ok(Some(id)) => id,
@@ -3041,6 +3733,20 @@ pub async fn destroy(
     confirmation: &str,
     projects: &[Project],
 ) -> Result<ReclaimResult, String> {
+    // **The orphan arm comes first, because it has no project to find.** Its id
+    // is parsed out of a volume name and matches nothing in the store — that is
+    // its definition — so `find_project` would refuse it and the typed subject
+    // is the volume's own name.
+    if let DestructiveTarget::OrphanVolume { name, .. } = target {
+        if !confirmation_matches(name, confirmation) {
+            return Err(format!(
+                "Type the volume name ({}) exactly to confirm. Nothing was removed.",
+                name
+            ));
+        }
+        return destroy_orphan_volume(name, projects).await;
+    }
+
     let project = find_project(projects, target.project_id())?;
     if !confirmation_matches(&project.name, confirmation) {
         return Err(format!(
@@ -3048,12 +3754,13 @@ pub async fn destroy(
             project.name
         ));
     }
-    if crate::commands::migration_commands::is_migrating(&project.id) {
-        return Err(
-            "A base-image migration is in flight for this project. Finish or roll it back first."
-                .to_string(),
-        );
-    }
+    // **Held for the whole removal, not polled at the door.** The old check was
+    // a single `is_migrating` read, so a compaction that had already resolved
+    // `:latest` could commit its flattened result back over a snapshot this
+    // function had just deleted, resurrecting the layer the user typed a
+    // project name to be rid of.
+    let _guard =
+        crate::project_lock::try_acquire(&project.id, crate::project_lock::ProjectOp::Destroy)?;
 
     let docker = get_docker()?;
 
@@ -3136,6 +3843,12 @@ pub async fn destroy(
                 ),
             })
         }
+        DestructiveTarget::OrphanVolume { .. } => {
+            // Handled above, before the project lookup that this arm's siblings
+            // all depend on. Unreachable, and an `unreachable!()` here would be
+            // a panic in a function that deletes things.
+            Err("An orphaned volume is not a project object.".to_string())
+        }
         DestructiveTarget::RollbackPin { tag, .. } => {
             // **The one destructive variant carrying a free-form string.**
             // Every other arm builds its target from constants; this one takes
@@ -3152,6 +3865,10 @@ pub async fn destroy(
             }
             let reference = format!("triple-c-snapshot-{}:{}", project.id, tag);
             migration::untag_image(&reference).await?;
+            // The grace clock this pin may have had is meaningless once the tag
+            // is gone; leaving the marker would keep a dead file in the
+            // migrations directory forever.
+            migration_store::clear_ownerless(&project.id, tag);
             // Untagging only makes the image dangling. Whatever came back came
             // back through the sweep, under its own refusal rules.
             let sweep = container::sweep_orphaned_snapshots().await;

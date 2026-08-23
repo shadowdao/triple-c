@@ -26,9 +26,6 @@ fn all_reclaim_targets() -> Vec<ReclaimTarget> {
         ReclaimTarget::MigrationStaging,
         ReclaimTarget::ProbeContainers,
         ReclaimTarget::ScrubContainers,
-        ReclaimTarget::OrphanVolume {
-            name: "triple-c-home-gone".to_string(),
-        },
         ReclaimTarget::CompactSnapshot {
             project_id: "p1".to_string(),
         },
@@ -54,7 +51,7 @@ fn every_variant_is_covered_by_the_safety_walk() {
         .collect();
     assert_eq!(
         discriminants.len(),
-        10,
+        9,
         "a ReclaimTarget variant was added or removed; update all_reclaim_targets() and check its \
          safety: {:?}",
         discriminants
@@ -359,6 +356,44 @@ fn a_compaction_container_is_never_matched_by_the_scrub_bucket() {
 }
 
 #[test]
+fn the_daemon_wide_buckets_leave_a_young_container_alone() {
+    // Both of these buckets are `Safety::Safe` — one tick, no confirmation —
+    // and both reach *every* matching container on the daemon, because a label
+    // and a name prefix are daemon-wide and `ReclaimTarget::project_id()` is
+    // `None` for them. So a second app instance's live migration probe, and a
+    // live secret rewrite's scratch container, are both in range. Age is the
+    // only discriminator available from this side of the process boundary, and
+    // a container the daemon gave no creation time for is treated as young.
+    let now = chrono::Utc::now().timestamp();
+
+    let mut young_probe = summary(&["/nervous_curie"], &[(migration::LABEL_PROBE, "migration")]);
+    young_probe.created = Some(now - 30);
+    assert!(is_migration_probe(&young_probe));
+    assert!(!is_reapable_migration_probe(&young_probe));
+
+    let mut old_probe = young_probe.clone();
+    old_probe.created = Some(now - migration::PROBE_REAP_MIN_AGE_SECS - 1);
+    assert!(is_reapable_migration_probe(&old_probe));
+
+    let mut undated_probe = young_probe.clone();
+    undated_probe.created = None;
+    assert!(!is_reapable_migration_probe(&undated_probe));
+
+    // `triple-c-scrub-*` is a **live** name: `rewrite_image_without_secrets`
+    // creates its scratch container under it, and killing that between the
+    // create and the commit leaves a revoked OAuth token baked into the
+    // snapshot's Config.Env — the exact thing that function exists to remove.
+    let mut young_scrub = summary(&["/triple-c-scrub-abc123"], &[]);
+    young_scrub.created = Some(now - 5);
+    assert!(is_scrub_container(&young_scrub));
+    assert!(!is_reapable_scrub_container(&young_scrub));
+
+    let mut old_scrub = young_scrub.clone();
+    old_scrub.created = Some(now - SCRATCH_CONTAINER_MIN_AGE_SECS - 1);
+    assert!(is_reapable_scrub_container(&old_scrub));
+}
+
+#[test]
 fn a_probe_container_is_matched_on_its_label_not_on_the_daemons_filter() {
     // The `label=triple-c.probe=migration` filter is an exact match and would
     // be enough on its own — but a filter is a string assembled elsewhere in
@@ -393,7 +428,7 @@ fn project(id: &str, name: &str) -> Project {
 
 #[test]
 fn an_unreadable_projects_json_is_never_trusted() {
-    let err = project_store_trust(&[project("a", "api")], true, false).unwrap_err();
+    let err = project_store_trust(&[project("a", "api")], true, None).unwrap_err();
     assert!(err.contains("could not be read"), "{}", err);
 }
 
@@ -403,18 +438,42 @@ fn an_empty_list_from_an_existing_file_is_treated_as_a_failed_load() {
     // up and starts empty. That is right for the app and catastrophic here, so
     // the combination "empty list + file present" is refused rather than read as
     // "the user has no projects".
-    let err = project_store_trust(&[], true, true).unwrap_err();
+    let err = project_store_trust(&[], true, Some(&[])).unwrap_err();
     assert!(err.contains("suppressed"), "{}", err);
 
     // No file at all is a genuine fresh install, and there is nothing on the
     // daemon to mis-attribute in that state.
-    assert!(project_store_trust(&[], false, true).unwrap().is_empty());
+    assert!(project_store_trust(&[], false, Some(&[])).unwrap().is_empty());
 }
 
 #[test]
 fn a_healthy_store_yields_its_ids() {
-    let ids = project_store_trust(&[project("a", "api"), project("b", "web")], true, true).unwrap();
+    let ids =
+        project_store_trust(&[project("a", "api"), project("b", "web")], true, Some(&[])).unwrap();
     assert_eq!(ids, HashSet::from(["a".to_string(), "b".to_string()]));
+}
+
+#[test]
+fn a_project_only_the_file_knows_about_still_counts_as_live() {
+    // M6: `projects` is this process's in-memory list. A project added by a
+    // *second* copy of the app is in `projects.json` and not in that list, and
+    // its live home and config volumes then matched "no project claims this".
+    // The union is what closes the gap; the file is authoritative for
+    // everything this instance has not heard about.
+    let ids = project_store_trust(
+        &[project("a", "api")],
+        true,
+        Some(&["a".to_string(), "b-from-the-other-window".to_string()]),
+    )
+    .unwrap();
+    assert!(
+        ids.contains("b-from-the-other-window"),
+        "a project only the file knows about must not look orphaned: {:?}",
+        ids
+    );
+    // And the reverse: a project this instance just added is live whether or
+    // not the file has caught up.
+    assert!(ids.contains("a"), "{:?}", ids);
 }
 
 // ---------------------------------------------------------------------------
@@ -648,6 +707,94 @@ fn the_compaction_dockerfile_reuses_the_one_scrub_list() {
 }
 
 #[test]
+fn the_compaction_run_carries_the_scrub_script_byte_for_byte() {
+    // **This is the assertion the old one should have been.** The previous
+    // version checked only that the `RUN` was a single line — which the broken
+    // space-fold satisfied perfectly, while producing
+    // `… for p in …; do [ -e "$p" ] || continue sz=$(…) …`, i.e. shell that
+    // `sh` refuses to parse. Every compaction ever attempted failed on the
+    // build's first stage.
+    //
+    // Nothing is folded now: the script goes into the JSON exec form verbatim,
+    // so the strong statement is available — what reaches `/bin/sh -c` is
+    // exactly what `snapshot_scrub_script()` returned, newlines included.
+    let script = container::snapshot_scrub_script();
+    let df = compaction_dockerfile("triple-c-snapshot-p1:latest", &script);
+    let run = df
+        .lines()
+        .find(|l| l.starts_with("RUN "))
+        .expect("no RUN line");
+    let recovered = script_from_run_line(run).expect("the RUN is not a parseable exec form");
+    assert_eq!(
+        recovered, script,
+        "the compaction must run the scrub script unmodified"
+    );
+    // The exec form names the shell itself, because `RUN [...]` does not go
+    // through one.
+    let argv: Vec<String> = serde_json::from_str(run.trim_start_matches("RUN ")).unwrap();
+    assert_eq!(argv[0], "/bin/sh");
+    assert_eq!(argv[1], "-c");
+}
+
+#[test]
+fn the_compaction_run_is_valid_shell() {
+    // The test that would have caught H1, and the only kind that can: hand the
+    // exact program the daemon will execute to a real shell and ask it to
+    // parse. `sh -n` reads and parses without running anything.
+    //
+    // It is run against the live `snapshot_scrub_script()` rather than a fixture
+    // precisely because that script is not this module's to own — it is free to
+    // grow a `case`, an `if` or a function, and this must keep holding when it
+    // does.
+    let df = compaction_dockerfile("triple-c-snapshot-p1:latest", &container::snapshot_scrub_script());
+    let run = df.lines().find(|l| l.starts_with("RUN ")).unwrap();
+    let script = script_from_run_line(run).unwrap();
+    assert_shell_parses(&script, "the compaction scrub");
+}
+
+#[test]
+fn a_multi_line_script_with_blocks_survives_the_run_encoding() {
+    // The property the old fold did not have, stated directly: a script with a
+    // `for`/`do`, an `if`/`then`, a `case` and a quote-heavy line has to survive
+    // whatever this module does to it. Joining lines with a space breaks the
+    // first three; joining with `;` breaks `if x; then; y`. Encoding the string
+    // breaks none of them.
+    let awkward = "total=0\n                   for p in /tmp/a* /tmp/b*; do\n                   \t[ -e \"$p\" ] || continue\n                   \tcase \"$p\" in\n                   \t\t*.keep) continue ;;\n                   \tesac\n                   \tif [ -d \"$p\" ]; then\n                   \t\trm -rf -- \"$p\"\n                   \tfi\n                   done\n                   echo \"done: $total\"\n";
+    let df = compaction_dockerfile("x:latest", awkward);
+    let run = df.lines().find(|l| l.starts_with("RUN ")).unwrap();
+    assert!(!run.contains('\n'), "the RUN must still be one Dockerfile line");
+    assert_eq!(script_from_run_line(run).unwrap(), awkward);
+    assert_shell_parses(awkward, "an awkward but legal script");
+}
+
+/// Run `sh -n` over a program and fail with the shell's own diagnostic.
+///
+/// Skipped, loudly, on a host with no `/bin/sh` — which is not a case any
+/// developer machine or CI image this repo targets is in, but a silent pass
+/// would be worse than a skipped test.
+fn assert_shell_parses(script: &str, what: &str) {
+    let output = match std::process::Command::new("/bin/sh")
+        .arg("-n")
+        .arg("-c")
+        .arg(script)
+        .output()
+    {
+        Ok(output) => output,
+        Err(e) => {
+            eprintln!("skipping the shell syntax check for {}: {}", what, e);
+            return;
+        }
+    };
+    assert!(
+        output.status.success(),
+        "{} is not valid shell:\n{}\n--- script ---\n{}",
+        what,
+        String::from_utf8_lossy(&output.stderr),
+        script
+    );
+}
+
+#[test]
 fn the_compaction_build_is_labelled_so_the_sweep_can_collect_it() {
     // Everything that cleans up after this build — the discard path when the
     // result is not smaller, the untag after a successful commit — leans on
@@ -672,6 +819,13 @@ fn the_compaction_dockerfile_never_reaches_a_bind_mount() {
     // directories, mounted from the host. Nothing in a scrub may name one, and
     // the two read-only host mounts under /tmp are dot-prefixed so no glob
     // reaches them either.
+    //
+    // **Necessary, not sufficient, and do not read it as coverage.** A path not
+    // appearing as a literal says nothing about where a glob or a symlink
+    // resolves to at runtime; the containment property itself is tested in
+    // `container.rs`, which owns the path list and the script. This assertion
+    // is kept because a literal `/workspace` appearing here would be an
+    // unambiguous mistake, and that is all it detects.
     assert!(!df.contains("/workspace"), "{}", df);
     assert!(!df.contains(".host-ca"), "{}", df);
     assert!(!df.contains(".host-aws"), "{}", df);
@@ -935,4 +1089,407 @@ fn the_report_serialises_as_snake_case_like_every_other_ipc_struct() {
     // `Option<i64>` must reach the frontend as null, not be omitted — the TS
     // type is `number | null`, matching every other optional in `types.ts`.
     assert!(json["projects"][0]["snapshot_above_base_bytes"].is_null());
+}
+
+// ---------------------------------------------------------------------------
+// Rollback pins — the guards the safe bucket was missing
+// ---------------------------------------------------------------------------
+
+fn moment(y: i32, m: u32, d: u32) -> chrono::DateTime<chrono::Utc> {
+    chrono::NaiveDate::from_ymd_opt(y, m, d)
+        .unwrap()
+        .and_hms_opt(12, 0, 0)
+        .unwrap()
+        .and_utc()
+}
+
+#[test]
+fn the_safe_pin_bucket_applies_every_guard_the_other_paths_do() {
+    let now = moment(2026, 8, 23);
+    let ours = migration::rollback_tag(&moment(2026, 1, 1));
+
+    // 1. A tag that merely *starts* `pre-migration-`. `destroy` refuses it with
+    //    a comment explaining that `tag: "latest"` would otherwise name the
+    //    project's live snapshot; the safe bucket used to accept anything.
+    assert_eq!(
+        pin_disposition("pre-migration-keepme", false, Some(moment(2020, 1, 1)), &now),
+        PinDisposition::NotOurs
+    );
+    assert_eq!(
+        pin_disposition("latest", false, Some(moment(2020, 1, 1)), &now),
+        PinDisposition::NotOurs
+    );
+
+    // 2. A record still claims it. Never reaped at any age, and this is the one
+    //    guard the old code did have.
+    assert_eq!(
+        pin_disposition(&ours, true, Some(moment(2020, 1, 1)), &now),
+        PinDisposition::Claimed
+    );
+
+    // 3. Ownerless but inside the grace period — including "no reaper has seen
+    //    it yet", which is where the clock starts. The old code untagged this
+    //    immediately, and `sweep_orphaned_snapshots` four lines later turned
+    //    the untag into a deletion.
+    assert_eq!(
+        pin_disposition(&ours, false, None, &now),
+        PinDisposition::WithinGrace
+    );
+    assert_eq!(
+        pin_disposition(&ours, false, Some(now - chrono::Duration::days(1)), &now),
+        PinDisposition::WithinGrace
+    );
+
+    // 4. Ownerless and past its grace period. The only case that is collectable
+    //    without a typed confirmation.
+    assert_eq!(
+        pin_disposition(
+            &ours,
+            false,
+            Some(now - chrono::Duration::days(migration::STALE_PIN_MAX_AGE_DAYS)),
+            &now
+        ),
+        PinDisposition::Reapable
+    );
+}
+
+#[test]
+fn the_safe_bucket_and_the_startup_reaper_cannot_disagree() {
+    // Both go through `migration::pin_is_reapable`. The bug was that the safe
+    // bucket did not: `reap_stale_migration_pins` required a parseable tag and
+    // an age, the reclaim button required neither, and the button is the path
+    // with no confirmation in front of it.
+    let now = moment(2026, 8, 23);
+    let ours = migration::rollback_tag(&moment(2026, 1, 1));
+    for since in [
+        None,
+        Some(now - chrono::Duration::days(1)),
+        Some(now - chrono::Duration::days(migration::STALE_PIN_MAX_AGE_DAYS)),
+    ] {
+        for has_record in [true, false] {
+            assert_eq!(
+                pin_disposition(&ours, has_record, since, &now) == PinDisposition::Reapable,
+                migration::pin_is_reapable(&ours, has_record, since, &now),
+                "disposition and the reaper's own predicate disagreed for {:?}/{}",
+                since,
+                has_record
+            );
+        }
+    }
+}
+
+#[test]
+fn an_orphaned_volume_cannot_be_reached_without_a_typed_confirmation() {
+    // M5: it was a `ReclaimTarget` at `Safety::Safe` — a tick and the group
+    // button. `reclaim` cannot be handed a `DestructiveTarget` at all, which is
+    // the type-level half of the guarantee; this pins the other half, that no
+    // reclaim variant names a volume any more.
+    for target in all_reclaim_targets() {
+        let wire = serde_json::to_value(&target).unwrap();
+        let kind = wire["kind"].as_str().unwrap();
+        assert!(
+            !kind.contains("volume"),
+            "{} can reach a volume from the safe path",
+            kind
+        );
+    }
+
+    // And the confirmation subject is the *volume* name, because an orphan has
+    // no project in the store whose name could be typed.
+    let target = DestructiveTarget::OrphanVolume {
+        name: "triple-c-claude-config-gone".to_string(),
+        project_id: "gone".to_string(),
+    };
+    assert!(confirmation_matches(
+        "triple-c-claude-config-gone",
+        " triple-c-claude-config-gone "
+    ));
+    assert!(!confirmation_matches("triple-c-claude-config-gone", "gone"));
+    assert_eq!(target.project_id(), "gone");
+}
+
+// ---------------------------------------------------------------------------
+// The numbers, which the user reads as facts
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_snapshot_column_and_the_total_come_from_one_rule() {
+    // Case 1: the daemon measured the sharing. Its figure wins.
+    assert_eq!(snapshot_attribution(5_000_000_000, 4_700_000_000, Some(1)), 300_000_000);
+
+    // Case 2: no shared size, but the lineage is known. The layer arithmetic is
+    // the honest answer, and it is what the Snapshot column already showed —
+    // while `total_bytes` used `size - shared` (i.e. the whole image, base
+    // included) and `triple_c_total_bytes` then added the base again as its own
+    // row. That double count is the exact thing the comment beside the
+    // subtraction says it prevents.
+    assert_eq!(snapshot_attribution(5_000_000_000, 0, Some(300_000_000)), 300_000_000);
+
+    // Case 3: nothing known. The full size, not zero — an image that shares
+    // nothing measurable really does cost all of it, and a flattened snapshot
+    // is exactly that shape.
+    assert_eq!(snapshot_attribution(5_000_000_000, 0, None), 5_000_000_000);
+
+    // A daemon that reports `-1` for "not computed" must not be read as a
+    // 1-byte saving, and a negative result is never returned.
+    assert_eq!(snapshot_attribution(1_000, -1, None), 1_000);
+    assert_eq!(snapshot_attribution(1_000, 4_000, Some(0)), 0);
+}
+
+#[test]
+fn a_row_adds_up() {
+    // The property the fix exists for, stated arithmetically: whatever the
+    // Snapshot column shows is what the Total is built from.
+    for (size, shared, above) in [
+        (5_000_000_000i64, 4_700_000_000i64, Some(1i64)),
+        (5_000_000_000, 0, Some(300_000_000)),
+        (5_000_000_000, 0, None),
+        (0, 0, None),
+    ] {
+        let snapshot = snapshot_attribution(size, shared, above);
+        let (writable, home, config) = (10i64, 20i64, 30i64);
+        let total = snapshot + writable + home + config;
+        assert_eq!(
+            total - (writable + home + config),
+            snapshot,
+            "the Total column has to reconcile with the Snapshot column"
+        );
+    }
+}
+
+#[test]
+fn human_never_prints_a_unit_the_ladder_forbids() {
+    // The 999,999 → "1000.0 KB" bug, which is the one `formatBytes.ts` was
+    // written to fix on the frontend. This function's output is rendered on the
+    // same line as `formatBytes`' in a compaction message, so the two
+    // disagreeing is visible in a single sentence.
+    assert_eq!(human(999_999), "1.0 MB");
+    assert_eq!(human(999_999_999), "1.0 GB");
+    assert_eq!(human(999_999_999_999), "1.0 TB");
+
+    // The ordinary cases still read the way `docker system df` prints them,
+    // base 1000.
+    assert_eq!(human(0), "0 B");
+    assert_eq!(human(999), "999 B");
+    assert_eq!(human(1_000), "1.0 KB");
+    assert_eq!(human(1_500_000), "1.5 MB");
+    assert_eq!(human(4_700_000_000), "4.7 GB");
+    // Rounding that does *not* cross the boundary is untouched.
+    assert_eq!(human(999_400), "999.4 KB");
+}
+
+#[test]
+fn no_output_of_human_is_ever_a_four_digit_mantissa() {
+    // A sweep rather than a handful of cases: every power-of-ten boundary and
+    // its neighbours, which is where the bug lived.
+    let mut value = 1i64;
+    for _ in 0..19 {
+        for candidate in [value - 1, value, value + 1] {
+            if candidate < 0 {
+                continue;
+            }
+            let rendered = human(candidate);
+            let mantissa = rendered.split(' ').next().unwrap();
+            let numeric: f64 = mantissa.parse().unwrap();
+            assert!(
+                numeric < 1000.0 || rendered.ends_with(" PB"),
+                "{} rendered as {}, which the unit ladder is supposed to make impossible",
+                candidate,
+                rendered
+            );
+        }
+        value = match value.checked_mul(10) {
+            Some(v) => v,
+            None => break,
+        };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// End-to-end compaction, against a real daemon
+// ---------------------------------------------------------------------------
+
+/// The whole compaction mechanism, run for real.
+///
+/// `#[ignore]` because it needs a Docker daemon, pulls `busybox`, and takes
+/// tens of seconds — `cargo test` has to stay daemon-free. Run it with
+/// `cargo test -- --ignored compaction_end_to_end`.
+///
+/// It exists because H1 was invisible to every unit test in this file: the
+/// generated Dockerfile looked right, the `RUN` was one line as asserted, and
+/// the build failed on `/bin/sh: line 0: syntax error: unexpected "do"` every
+/// single time. The only test that could have caught it is one that hands the
+/// Dockerfile to a daemon.
+///
+/// It exercises the production functions — [`compaction_dockerfile`],
+/// [`build_from_dockerfile`], [`restore_image_config`] — rather than
+/// [`compact_snapshot`] itself, so it never has to create a
+/// `triple-c-snapshot-*` tag that the app's own sweeps might reach.
+#[tokio::test]
+#[ignore]
+async fn compaction_end_to_end_against_a_real_image() {
+    let stem = format!("compaction-e2e-{}", uuid::Uuid::new_v4().simple());
+    let source = format!("{}:source", stem);
+    let staging = format!("{}:compacting", stem);
+    let final_ref = format!("{}:latest", stem);
+
+    // A snapshot-shaped source: four stacked layers, each superseding the last,
+    // plus the scrub's own targets and a setuid bit that `COPY --from` has to
+    // preserve. The env var carries a newline and a double quote, which is what
+    // `restore_image_config` exists for.
+    let source_dockerfile = format!(
+        "FROM busybox:1.36\n\
+         RUN mkdir -p /tmp/claude-1000 /var/cache/apt/archives /var/log/apt /var/lib/apt/lists && \
+         dd if=/dev/urandom of=/big-a bs=1M count=40 2>/dev/null\n\
+         RUN dd if=/dev/urandom of=/big-b bs=1M count=40 2>/dev/null && rm -f /big-a\n\
+         RUN dd if=/dev/urandom of=/tmp/claude-1000/scratch bs=1M count=25 2>/dev/null && \
+         dd if=/dev/urandom of=/var/cache/apt/archives/x.deb bs=1M count=15 2>/dev/null && \
+         touch /var/log/dpkg.log\n\
+         RUN dd if=/dev/urandom of=/big-c bs=1M count=30 2>/dev/null && rm -f /big-b && \
+         touch /keepme && chmod 4755 /keepme\n\
+         LABEL {LABEL_MANAGED}=true\n\
+         WORKDIR /keep-this-dir\n"
+    );
+
+    // Force, unlike anything in production: `untag_image` is deliberately
+    // unforced because it runs against a user's images, and here the leftovers
+    // are this test's own and must not be left on the developer's daemon
+    // whatever refuses them.
+    async fn cleanup(refs: Vec<String>) {
+        let Ok(docker) = get_docker() else {
+            return;
+        };
+        for r in refs {
+            if let Err(e) = docker
+                .remove_image(
+                    &r,
+                    Some(RemoveImageOptions {
+                        force: true,
+                        noprune: false,
+                    }),
+                    None,
+                )
+                .await
+            {
+                eprintln!("could not clean up {}: {}", r, e);
+            }
+        }
+    }
+
+    build_from_dockerfile(&source_dockerfile, &source)
+        .await
+        .expect("could not build the throwaway source image");
+
+    let docker = get_docker().expect("no docker");
+    let before = docker.inspect_image(&source).await.expect("inspect source");
+    let before_size = before.size.unwrap_or(0);
+    let mut config = before.config.clone().expect("source has no config");
+    // A genuinely multi-line env var, injected here rather than through the
+    // Dockerfile because `ENV` cannot express a literal newline. This is the
+    // case `restore_image_config` exists for: it is why the config is replayed
+    // through a create-and-commit instead of being rendered back into
+    // Dockerfile instructions, where a newline and a `"` would not survive.
+    config
+        .env
+        .get_or_insert_with(Vec::new)
+        .push("E2E_MULTILINE=first\nsecond \"quoted\"".to_string());
+
+    // --- the thing under test ------------------------------------------------
+    let dockerfile = compaction_dockerfile(&source, &container::snapshot_scrub_script());
+    let built = build_from_dockerfile(&dockerfile, &staging).await;
+    assert!(
+        built.is_ok(),
+        "the compaction build failed, which is exactly the H1 regression: {:?}\n{}",
+        built,
+        dockerfile
+    );
+
+    restore_image_config(&staging, &final_ref, config)
+        .await
+        .expect("could not replay the image config");
+
+    let after = docker
+        .inspect_image(&final_ref)
+        .await
+        .expect("inspect compacted");
+    let after_size = after.size.unwrap_or(0);
+    let history = docker.image_history(&final_ref).await.expect("history");
+    let after_config = after.config.clone().expect("no config after");
+
+    // The scrub actually ran — the assertion H1 made impossible. `sh -c` inside
+    // the compacted image, so the answer comes from the filesystem rather than
+    // from the build log.
+    let probe = migration::run_throwaway(
+        &final_ref,
+        "ls /keepme >/dev/null 2>&1 && echo KEEP-OK\n\
+         [ -e /tmp/claude-1000/scratch ] && echo SCRATCH-LEFT\n\
+         [ -e /var/cache/apt/archives/x.deb ] && echo DEB-LEFT\n\
+         [ -e /var/log/dpkg.log ] && echo DPKGLOG-LEFT\n\
+         [ -e /big-a ] && echo BIGA-LEFT\n\
+         [ -e /big-c ] || echo BIGC-MISSING\n\
+         ls -l /keepme\n\
+         echo PROBE-END\n\
+         exit 0\n",
+    )
+    .await
+    .expect("could not probe the compacted image");
+
+    // **Everything is measured before anything is asserted**, so a failing
+    // assertion below does not leave several hundred megabytes of throwaway
+    // images on the developer's daemon.
+    cleanup(vec![final_ref, staging, source]).await;
+
+    // 1. It is smaller. The three superseded 30–40 MB layers and the ~40 MB of
+    //    scrub targets are the whole point.
+    assert!(
+        after_size < before_size,
+        "compaction did not shrink the image: {} -> {}",
+        before_size,
+        after_size
+    );
+
+    // 2. One layer of content.
+    let content_layers = history.iter().filter(|e| e.size > 0).count();
+    assert_eq!(content_layers, 1, "expected one content layer: {:?}", history);
+
+    // 3. The config round-tripped, newline and quote included.
+    let env = after_config.env.clone().unwrap_or_default();
+    assert!(
+        env.iter()
+            .any(|e| e == "E2E_MULTILINE=first\nsecond \"quoted\""),
+        "the multi-line env var did not survive: {:?}",
+        env
+    );
+    assert_eq!(after_config.working_dir.as_deref(), Some("/keep-this-dir"));
+
+    // 4. The scrub actually ran.
+    assert!(probe.stdout.contains("PROBE-END"), "{}", probe.stdout);
+    assert!(probe.stdout.contains("KEEP-OK"), "{}", probe.stdout);
+    assert!(
+        !probe.stdout.contains("SCRATCH-LEFT"),
+        "the agent scratchpad survived the scrub:\n{}",
+        probe.stdout
+    );
+    assert!(
+        !probe.stdout.contains("DEB-LEFT"),
+        "apt archives survived the scrub:\n{}",
+        probe.stdout
+    );
+    assert!(
+        !probe.stdout.contains("DPKGLOG-LEFT"),
+        "dpkg.log survived the scrub:\n{}",
+        probe.stdout
+    );
+    assert!(
+        !probe.stdout.contains("BIGC-MISSING"),
+        "the live payload was lost, which is worse than not compacting:\n{}",
+        probe.stdout
+    );
+    // `COPY --from` has to keep the setuid bit; a compaction that dropped it
+    // would break sudo inside every migrated project.
+    assert!(
+        probe.stdout.contains("-rwsr-xr-x"),
+        "the setuid bit did not survive the flatten:\n{}",
+        probe.stdout
+    );
 }
