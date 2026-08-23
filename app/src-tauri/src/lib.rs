@@ -475,6 +475,9 @@ pub fn run() {
             commands::file_commands::download_container_file,
             commands::file_commands::download_container_backup,
             commands::file_commands::upload_file_to_container,
+            commands::file_commands::read_container_file,
+            commands::file_commands::rename_container_path,
+            commands::file_commands::create_container_directory,
             // AWS
             commands::aws_commands::aws_sso_refresh,
             // Updates

@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, ImageUpdateInfo, FileEntry, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, BrowserPageState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo } from "./types";
+import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, ImageUpdateInfo, FileEntry, FileContents, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, BrowserPageState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo } from "./types";
 
 // Docker
 export const checkDocker = () => invoke<boolean>("check_docker");
@@ -77,6 +77,13 @@ export const downloadContainerBackup = (projectId: string, hostPath: string, con
   invoke<number>("download_container_backup", { projectId, hostPath, containerPath });
 export const uploadFileToContainer = (projectId: string, hostPath: string, containerDir: string) =>
   invoke<void>("upload_file_to_container", { projectId, hostPath, containerDir });
+export const readContainerFile = (projectId: string, path: string, maxBytes?: number) =>
+  invoke<FileContents>("read_container_file", { projectId, path, maxBytes });
+/** `toPath` is the new *name*, not a destination — renames never move. */
+export const renameContainerPath = (projectId: string, fromPath: string, toPath: string) =>
+  invoke<string>("rename_container_path", { projectId, fromPath, toPath });
+export const createContainerDirectory = (projectId: string, parentPath: string, name: string) =>
+  invoke<string>("create_container_directory", { projectId, parentPath, name });
 
 // Updates
 export const getAppVersion = () => invoke<string>("get_app_version");
