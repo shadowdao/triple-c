@@ -1,14 +1,22 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { startDrag } from "@crabnebula/tauri-plugin-drag";
 import type { FileEntry, Project } from "../../../lib/types";
 import { useFileManager } from "../../../hooks/useFileManager";
 import Button from "../../ui/Button";
 import FileViewerModal from "./FileViewerModal";
+import { dragPreviewIcon } from "./dragPreview";
 import { formatBytes } from "./format";
 
 interface Props {
   project: Project;
 }
+
+/**
+ * How far the pointer must travel before a press becomes a drag. Same few
+ * pixels of slop as the tab strip, so a click that trembles stays a click.
+ */
+const DRAG_THRESHOLD = 4;
 
 /**
  * The project's file manager.
@@ -32,8 +40,10 @@ export default function FilesTab({ project }: Props) {
     downloadFile,
     uploadFile,
     uploadPaths,
+    stageForDrag,
     renameEntry,
     createFolder,
+    setError,
   } = useFileManager(project.id);
 
   const running = project.status === "running";
@@ -47,6 +57,8 @@ export default function FilesTab({ project }: Props) {
   const [viewing, setViewing] = useState<FileEntry | null>(null);
   /** A host drag is currently over this pane. */
   const [dragOver, setDragOver] = useState(false);
+  /** Name of a file staged for drag-out whose gesture did not reach the OS. */
+  const [dragNotice, setDragNotice] = useState<string | null>(null);
 
   const paneRef = useRef<HTMLDivElement>(null);
   const renameInputRef = useRef<HTMLInputElement>(null);
@@ -61,6 +73,7 @@ export default function FilesTab({ project }: Props) {
   useEffect(() => {
     setSelected(null);
     setRenaming(null);
+    setDragNotice(null);
   }, [currentPath]);
 
   useEffect(() => {
@@ -118,6 +131,112 @@ export default function FilesTab({ project }: Props) {
     },
     [navigate],
   );
+
+  // Container → host drag-out.
+  //
+  // The mirror image of the drop path below, and it has the same constraint
+  // pushing it: `dragDropEnabled` blocks HTML5 drag inside the webview, so
+  // `draggable` + `DataTransfer` is not available and the gesture is driven
+  // from pointer events into the native drag plugin — exactly the shape the tab
+  // strip uses, and for the same reason.
+  //
+  // What makes it more than a pointer gesture is that the file being dragged
+  // does not exist on the host at all: it lives in the container, and the OS
+  // can only drag a real host path. So every drag-out is a copy first (see
+  // `stageForDrag`) and a drag second, which is why the gesture has an async
+  // gap in the middle of something that feels instantaneous.
+  const dragOut = useRef<{
+    path: string;
+    x: number;
+    y: number;
+    down: boolean;
+    started: boolean;
+  } | null>(null);
+
+  // Pointer-up almost never lands on the row it started on — the pointer has
+  // moved off it by definition, and once the OS takes the drag the webview stops
+  // seeing the pointer at all, which is what makes a lost focus the only
+  // "the button came up" signal left.
+  useEffect(() => {
+    const release = () => {
+      if (dragOut.current) dragOut.current.down = false;
+    };
+    window.addEventListener("pointerup", release);
+    window.addEventListener("pointercancel", release);
+    window.addEventListener("blur", release);
+    return () => {
+      window.removeEventListener("pointerup", release);
+      window.removeEventListener("pointercancel", release);
+      window.removeEventListener("blur", release);
+    };
+  }, []);
+
+  const beginDragOut = useCallback(
+    async (entry: FileEntry) => {
+      setDragNotice(null);
+      const staged = await stageForDrag(entry);
+      // `stageForDrag` has already put the reason in `error`.
+      if (!staged) return;
+
+      // The OS only adopts a drag while the button is still down, and the copy
+      // that just ran can easily outlast a flick of the wrist. Say so rather
+      // than leaving a gesture that did nothing and explained nothing — and it
+      // is a real instruction, not an apology: the copy is kept, so the second
+      // attempt starts immediately.
+      if (dragOut.current?.path !== entry.path || !dragOut.current.down) {
+        setDragNotice(entry.name);
+        return;
+      }
+
+      try {
+        await startDrag({ item: [staged.hostPath], icon: dragPreviewIcon(entry.name) });
+      } catch (e) {
+        // Drag-out is the enhancement; "Save to host…" is the path that always
+        // works, so a platform that refuses the drag says where to go instead.
+        setError(`Could not start the drag: ${e}. Use "Save to host…" instead.`);
+      }
+    },
+    [stageForDrag, setError],
+  );
+
+  /**
+   * Pointer wiring for one row. Directories get none of it: staging copies a
+   * single regular file, and a folder would only ever produce an error.
+   */
+  const dragOutProps = (entry: FileEntry) => {
+    if (entry.is_directory) return {};
+    return {
+      onPointerDown: (e: React.PointerEvent<HTMLTableRowElement>) => {
+        if (e.button !== 0 || renaming === entry.name) return;
+        // The row's own controls, and the rename input, where a drag is a text
+        // selection.
+        if ((e.target as HTMLElement).closest("button, input")) return;
+        dragOut.current = {
+          path: entry.path,
+          x: e.clientX,
+          y: e.clientY,
+          down: true,
+          started: false,
+        };
+        // Deliberately no `setPointerCapture` — unlike the tab strip, which
+        // draws its own ghost. Here the OS has to take the pointer over, and a
+        // capture held in the webview is exactly what stops it.
+      },
+      onPointerMove: (e: React.PointerEvent<HTMLTableRowElement>) => {
+        const gesture = dragOut.current;
+        if (!gesture || gesture.started || !gesture.down) return;
+        if (gesture.path !== entry.path) return;
+        if (
+          Math.abs(e.clientX - gesture.x) < DRAG_THRESHOLD &&
+          Math.abs(e.clientY - gesture.y) < DRAG_THRESHOLD
+        ) {
+          return;
+        }
+        gesture.started = true;
+        void beginDragOut(entry);
+      },
+    };
+  };
 
   // Host → container drag and drop.
   //
@@ -226,6 +345,11 @@ export default function FilesTab({ project }: Props) {
             {busy}
           </span>
         )}
+        {!busy && dragNotice && (
+          <span role="status" className="mr-2 text-[var(--text-secondary)] whitespace-nowrap">
+            "{dragNotice}" is ready — drag it again to drop it on the desktop.
+          </span>
+        )}
         <Button
           onClick={() => {
             setFolderDraft("");
@@ -310,6 +434,7 @@ export default function FilesTab({ project }: Props) {
                     aria-selected={isSelected}
                     onClick={() => setSelected(entry.name)}
                     onDoubleClick={() => openEntry(entry)}
+                    {...dragOutProps(entry)}
                     onKeyDown={(e) => {
                       if (isRenaming) return;
                       if (e.key === "Enter") {

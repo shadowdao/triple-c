@@ -9,6 +9,7 @@ const uploadFileToContainer = vi.fn(async () => {});
 const renameContainerPath = vi.fn(async () => "");
 const createContainerDirectory = vi.fn(async () => "");
 const readContainerFile = vi.fn();
+const stageContainerFileForDrag = vi.fn(async () => "/tmp/triple-c-drag-out/s1/notes.txt");
 
 vi.mock("../../../lib/tauri-commands", () => ({
   listContainerFiles: (p: string, path: string) => listContainerFiles(p, path),
@@ -18,6 +19,13 @@ vi.mock("../../../lib/tauri-commands", () => ({
   createContainerDirectory: (p: string, parent: string, n: string) =>
     createContainerDirectory(p, parent, n),
   readContainerFile: (p: string, path: string, max?: number) => readContainerFile(p, path, max),
+  stageContainerFileForDrag: (p: string, path: string) => stageContainerFileForDrag(p, path),
+}));
+
+/** The OS-level drag. Nothing in jsdom can start one, so it is only observed. */
+const startDrag = vi.fn(async () => {});
+vi.mock("@crabnebula/tauri-plugin-drag", () => ({
+  startDrag: (opts: unknown) => startDrag(opts),
 }));
 
 const save = vi.fn(async () => "/host/out");
@@ -78,9 +86,32 @@ async function drop(paths: string[], position = { x: 100, y: 100 }) {
   });
 }
 
+/**
+ * A pointer event carrying real coordinates.
+ *
+ * jsdom implements no `PointerEvent` and Testing Library's synthesized one has
+ * no coordinates — which is the whole gesture here, since the drag only starts
+ * once the pointer has travelled past the threshold. `MouseEvent` has them, and
+ * React dispatches on the type name either way.
+ */
+function pointer(el: Element, type: string, clientX: number, clientY: number) {
+  fireEvent(
+    el,
+    new MouseEvent(type, { bubbles: true, cancelable: true, clientX, clientY, button: 0 }),
+  );
+}
+
+/** Press on a row and move far enough to become a drag, leaving the button down. */
+function dragRow(el: Element) {
+  pointer(el, "pointerdown", 10, 10);
+  pointer(el, "pointermove", 60, 10);
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   dragHandler = null;
+  stageContainerFileForDrag.mockResolvedValue("/tmp/triple-c-drag-out/s1/notes.txt");
+  startDrag.mockResolvedValue(undefined);
   listContainerFiles.mockResolvedValue([
     entry("src", { is_directory: true, path: "/workspace/src" }),
     entry("notes.txt"),
@@ -93,6 +124,10 @@ beforeEach(() => {
   // Not implemented in jsdom; the image preview needs both halves.
   URL.createObjectURL = vi.fn(() => "blob:mock-url");
   URL.revokeObjectURL = vi.fn();
+  // Nor is canvas, which the drag preview draws on. Stubbed to the null jsdom
+  // would return anyway, minus the "not implemented" noise on every drag —
+  // `dragPreview.test.ts` covers what the fallback then produces.
+  vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null);
 });
 
 describe("FilesTab listing", () => {
@@ -346,5 +381,122 @@ describe("FilesTab save to host", () => {
   it("does not offer a directory download, which cannot work", async () => {
     await renderTab();
     expect(screen.queryByRole("button", { name: "Save src to host" })).toBeNull();
+  });
+});
+
+describe("FilesTab drag-out", () => {
+  it("stages the file on the host and starts the native drag on that copy", async () => {
+    // The container path is not draggable — only the host copy is — so the
+    // thing handed to the OS must be what staging returned.
+    await renderTab();
+    dragRow(screen.getByText("notes.txt").closest("tr")!);
+
+    await waitFor(() => expect(startDrag).toHaveBeenCalled());
+    expect(stageContainerFileForDrag).toHaveBeenCalledWith("p1", "/workspace/notes.txt");
+    expect(startDrag).toHaveBeenCalledWith(
+      expect.objectContaining({ item: ["/tmp/triple-c-drag-out/s1/notes.txt"] }),
+    );
+  });
+
+  it("never drags a directory, which cannot be staged as one file", async () => {
+    await renderTab();
+    dragRow(screen.getByText("src").closest("tr")!);
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(stageContainerFileForDrag).not.toHaveBeenCalled();
+    expect(startDrag).not.toHaveBeenCalled();
+  });
+
+  it("stays a click until the pointer has actually travelled", async () => {
+    await renderTab();
+    const row = screen.getByText("notes.txt").closest("tr")!;
+    pointer(row, "pointerdown", 10, 10);
+    pointer(row, "pointermove", 12, 11);
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(stageContainerFileForDrag).not.toHaveBeenCalled();
+  });
+
+  it("says what went wrong instead of leaving a gesture that did nothing", async () => {
+    stageContainerFileForDrag.mockRejectedValue(
+      '900 MB is too large to drag out (limit 256 MB) — use "Save to host…" instead.',
+    );
+    await renderTab();
+    dragRow(screen.getByText("notes.txt").closest("tr")!);
+
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("too large"));
+    expect(startDrag).not.toHaveBeenCalled();
+  });
+
+  it("points at the fallback when the platform refuses the drag itself", async () => {
+    startDrag.mockRejectedValue("drag image not found");
+    await renderTab();
+    dragRow(screen.getByText("notes.txt").closest("tr")!);
+
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("Save to host"));
+  });
+
+  it("tells the user the copy is ready when the drag outlived the gesture", async () => {
+    // Staging is a whole-file copy, and the OS only adopts a drag while the
+    // button is down. Releasing mid-copy used to be — and must not be — a
+    // gesture that did nothing and explained nothing.
+    let release: (path: string) => void = () => {};
+    stageContainerFileForDrag.mockReturnValue(
+      new Promise<string>((resolve) => {
+        release = resolve;
+      }),
+    );
+
+    await renderTab();
+    const row = screen.getByText("notes.txt").closest("tr")!;
+    dragRow(row);
+    pointer(row, "pointerup", 60, 10);
+
+    await act(async () => {
+      release("/tmp/triple-c-drag-out/s1/notes.txt");
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(screen.getByText(/is ready/).textContent).toContain("notes.txt"));
+    expect(startDrag).not.toHaveBeenCalled();
+  });
+
+  it("drags immediately on the retry, reusing the copy it already made", async () => {
+    // The instruction "drag it again" is only honest if the second attempt does
+    // not repeat the copy that made the first one too slow.
+    await renderTab();
+    const row = screen.getByText("notes.txt").closest("tr")!;
+
+    dragRow(row);
+    await waitFor(() => expect(startDrag).toHaveBeenCalledTimes(1));
+    pointer(row, "pointerup", 60, 10);
+
+    dragRow(row);
+    await waitFor(() => expect(startDrag).toHaveBeenCalledTimes(2));
+    expect(stageContainerFileForDrag).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves Save to host… working — drag-out is the enhancement, not the replacement", async () => {
+    await renderTab();
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText("Save notes.txt to host"));
+    });
+    expect(downloadContainerFile).toHaveBeenCalledWith("p1", "/workspace/notes.txt", "/host/out");
+    expect(startDrag).not.toHaveBeenCalled();
+  });
+
+  it("still accepts a drop into the pane — the two directions coexist", async () => {
+    // The drag-out gesture is pointer-driven precisely so it does not need the
+    // HTML5 machinery that Tauri's native drop listener rules out.
+    await renderTab();
+    dragRow(screen.getByText("notes.txt").closest("tr")!);
+    await waitFor(() => expect(startDrag).toHaveBeenCalled());
+
+    await drop(["/host/a.txt"]);
+    expect(uploadFileToContainer).toHaveBeenCalledWith("p1", "/host/a.txt", "/workspace");
   });
 });
