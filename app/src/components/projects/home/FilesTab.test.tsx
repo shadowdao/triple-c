@@ -14,7 +14,7 @@ const stageContainerFileForDrag = vi.fn(async () => "/tmp/triple-c-drag-out/s1/n
 vi.mock("../../../lib/tauri-commands", () => ({
   listContainerFiles: (p: string, path: string) => listContainerFiles(p, path),
   downloadContainerFile: (p: string, c: string, h: string) => downloadContainerFile(p, c, h),
-  uploadFileToContainer: (p: string, h: string, d: string) => uploadFileToContainer(p, h, d),
+  uploadFileToContainer: (...args: unknown[]) => uploadFileToContainer(...args),
   renameContainerPath: (p: string, f: string, t: string) => renameContainerPath(p, f, t),
   createContainerDirectory: (p: string, parent: string, n: string) =>
     createContainerDirectory(p, parent, n),
@@ -22,11 +22,28 @@ vi.mock("../../../lib/tauri-commands", () => ({
   stageContainerFileForDrag: (p: string, path: string) => stageContainerFileForDrag(p, path),
 }));
 
-/** The OS-level drag. Nothing in jsdom can start one, so it is only observed. */
-const startDrag = vi.fn(async () => {});
+/**
+ * The OS-level drag. Nothing in jsdom can start one, so it is only observed —
+ * including its `onEvent` channel, which is how the plugin reports that the
+ * gesture ended and therefore how the pane knows to start accepting drops
+ * again. `endDragOut` below drives it.
+ */
+type DragCallback = (payload: { result: "Dropped" | "Cancelled" }) => void;
+const startDrag = vi.fn(async (_opts: unknown, _onEvent?: DragCallback) => {});
 vi.mock("@crabnebula/tauri-plugin-drag", () => ({
-  startDrag: (opts: unknown) => startDrag(opts),
+  startDrag: (opts: unknown, onEvent?: DragCallback) => startDrag(opts, onEvent),
 }));
+
+/** Transient failures land in `ToastHost`, not in an inline string. */
+const pushToast = vi.fn();
+vi.mock("../../../store/appState", () => ({
+  useAppState: { getState: () => ({ pushToast }) },
+}));
+
+const toastText = () =>
+  pushToast.mock.calls
+    .map(([toast]) => `${toast.kind}: ${toast.message} ${toast.detail ?? ""}`)
+    .join("\n");
 
 const save = vi.fn(async () => "/host/out");
 vi.mock("@tauri-apps/plugin-dialog", () => ({
@@ -107,6 +124,32 @@ function dragRow(el: Element) {
   pointer(el, "pointermove", 60, 10);
 }
 
+/**
+ * Tell the pane the OS finished with the drag it started — what the plugin's
+ * `onEvent` channel does for real. Until this arrives the pane deliberately
+ * ignores drops, because a drag-out released back over the app arrives as one.
+ */
+function endDragOut(result: "Dropped" | "Cancelled" = "Dropped") {
+  const onEvent = startDrag.mock.calls.at(-1)?.[1];
+  act(() => {
+    onEvent?.({ result });
+  });
+}
+
+/** Every row that is part of the grid's roving tabindex, in order. */
+const gridRows = () => Array.from(document.querySelectorAll("tr[data-file-row]"));
+/** The rows that are actually tab stops. There must never be more than one. */
+const tabStops = () => gridRows().filter((r) => r.getAttribute("tabindex") === "0");
+
+/** Fire a drop without awaiting it — for the paths that stop to ask a question. */
+function dropWithoutWaiting(paths: string[], position = { x: 100, y: 100 }) {
+  let pending: unknown;
+  act(() => {
+    pending = dragHandler?.({ payload: { type: "drop", position, paths } });
+  });
+  return pending as Promise<void> | undefined;
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   dragHandler = null;
@@ -184,7 +227,9 @@ describe("FilesTab open semantics", () => {
     await renderTab();
     listContainerFiles.mockClear();
     const row = screen.getByText("src").closest("tr")!;
-    expect(row.getAttribute("tabindex")).toBe("0");
+    // Not a tab stop — `..` holds the grid's single one until the arrows move
+    // it — but still focusable and still openable from the keyboard.
+    expect(row.getAttribute("tabindex")).toBe("-1");
     await act(async () => {
       fireEvent.keyDown(row, { key: "Enter" });
     });
@@ -261,7 +306,7 @@ describe("FilesTab viewer", () => {
 describe("FilesTab rename", () => {
   it("commits an inline rename on Enter and re-lists", async () => {
     await renderTab();
-    fireEvent.click(screen.getByRole("button", { name: "Rename notes.txt" }));
+    fireEvent.click(screen.getByRole("button", { name: "Rename — notes.txt" }));
     const input = screen.getByLabelText("New name for notes.txt") as HTMLInputElement;
     fireEvent.change(input, { target: { value: "renamed.txt" } });
     await act(async () => {
@@ -273,7 +318,7 @@ describe("FilesTab rename", () => {
 
   it("abandons the rename on Escape", async () => {
     await renderTab();
-    fireEvent.click(screen.getByRole("button", { name: "Rename notes.txt" }));
+    fireEvent.click(screen.getByRole("button", { name: "Rename — notes.txt" }));
     const input = screen.getByLabelText("New name for notes.txt");
     fireEvent.change(input, { target: { value: "nope.txt" } });
     await act(async () => {
@@ -290,16 +335,22 @@ describe("FilesTab rename", () => {
     expect(screen.getByLabelText("New name for notes.txt")).toBeTruthy();
   });
 
-  it("shows what the container said when a rename is refused", async () => {
+  it("reports a refused rename where it can be seen, not three hundred rows down", async () => {
+    // The inline `error` div is the first child of the *scrolling* list, so
+    // deep in a directory this used to be a rename box that stayed open and
+    // said nothing. `ToastHost` is fixed, above the modal layer, and persists.
     renameContainerPath.mockRejectedValue("mv: cannot move '/etc/hosts': Permission denied");
     await renderTab();
-    fireEvent.click(screen.getByRole("button", { name: "Rename notes.txt" }));
+    fireEvent.click(screen.getByRole("button", { name: "Rename — notes.txt" }));
     const input = screen.getByLabelText("New name for notes.txt");
     fireEvent.change(input, { target: { value: "x" } });
     await act(async () => {
       fireEvent.blur(input);
     });
-    expect(screen.getByRole("alert").textContent).toContain("Permission denied");
+    expect(toastText()).toContain("Permission denied");
+    expect(screen.queryByRole("alert")).toBeNull();
+    // The editor stays open, because the rename did not happen.
+    expect(screen.getByLabelText("New name for notes.txt")).toBeTruthy();
   });
 });
 
@@ -373,14 +424,14 @@ describe("FilesTab save to host", () => {
   it("copies a file out to the path the user picks", async () => {
     await renderTab();
     await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Save notes.txt to host" }));
+      fireEvent.click(screen.getByRole("button", { name: "Save to host… — notes.txt" }));
     });
     expect(downloadContainerFile).toHaveBeenCalledWith("p1", "/workspace/notes.txt", "/host/out");
   });
 
   it("does not offer a directory download, which cannot work", async () => {
     await renderTab();
-    expect(screen.queryByRole("button", { name: "Save src to host" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Save to host… — src" })).toBeNull();
   });
 });
 
@@ -395,6 +446,9 @@ describe("FilesTab drag-out", () => {
     expect(stageContainerFileForDrag).toHaveBeenCalledWith("p1", "/workspace/notes.txt");
     expect(startDrag).toHaveBeenCalledWith(
       expect.objectContaining({ item: ["/tmp/triple-c-drag-out/s1/notes.txt"] }),
+      // The `onEvent` channel: without it, "the drag finished" is unobservable
+      // and a drag released back over the pane reads as a host drop.
+      expect.any(Function),
     );
   });
 
@@ -428,7 +482,7 @@ describe("FilesTab drag-out", () => {
     await renderTab();
     dragRow(screen.getByText("notes.txt").closest("tr")!);
 
-    await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("too large"));
+    await waitFor(() => expect(toastText()).toContain("too large"));
     expect(startDrag).not.toHaveBeenCalled();
   });
 
@@ -437,7 +491,7 @@ describe("FilesTab drag-out", () => {
     await renderTab();
     dragRow(screen.getByText("notes.txt").closest("tr")!);
 
-    await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("Save to host"));
+    await waitFor(() => expect(toastText()).toContain("Save to host"));
   });
 
   it("tells the user the copy is ready when the drag outlived the gesture", async () => {
@@ -483,7 +537,7 @@ describe("FilesTab drag-out", () => {
   it("leaves Save to host… working — drag-out is the enhancement, not the replacement", async () => {
     await renderTab();
     await act(async () => {
-      fireEvent.click(screen.getByLabelText("Save notes.txt to host"));
+      fireEvent.click(screen.getByLabelText("Save to host… — notes.txt"));
     });
     expect(downloadContainerFile).toHaveBeenCalledWith("p1", "/workspace/notes.txt", "/host/out");
     expect(startDrag).not.toHaveBeenCalled();
@@ -495,8 +549,278 @@ describe("FilesTab drag-out", () => {
     await renderTab();
     dragRow(screen.getByText("notes.txt").closest("tr")!);
     await waitFor(() => expect(startDrag).toHaveBeenCalled());
+    // The OS is done with it — anything arriving now is a genuine host drop.
+    endDragOut();
 
     await drop(["/host/a.txt"]);
     expect(uploadFileToContainer).toHaveBeenCalledWith("p1", "/host/a.txt", "/workspace");
+  });
+});
+
+describe("FilesTab drag-out released back over the app", () => {
+  it("does not re-import its own staged copy while the drag is in flight", async () => {
+    // The damaging case, and the reason this is HIGH: the staged copy is keyed
+    // off the *last listing*, so uploading it back is not even idempotent — a
+    // file an agent rewrote since then would be replaced by a stale snapshot.
+    await renderTab();
+    dragRow(screen.getByText("notes.txt").closest("tr")!);
+    await waitFor(() => expect(startDrag).toHaveBeenCalled());
+
+    await drop(["/tmp/triple-c-drag-out/s1/notes.txt"]);
+
+    expect(uploadFileToContainer).not.toHaveBeenCalled();
+  });
+
+  it("still refuses the staged copy after the drag has ended", async () => {
+    // Second line of defence, and the one that survives a platform whose
+    // `onEvent` never arrives: the path is known to be ours, exactly.
+    await renderTab();
+    dragRow(screen.getByText("notes.txt").closest("tr")!);
+    await waitFor(() => expect(startDrag).toHaveBeenCalled());
+    endDragOut("Cancelled");
+
+    await drop(["/tmp/triple-c-drag-out/s1/notes.txt"]);
+
+    expect(uploadFileToContainer).not.toHaveBeenCalled();
+  });
+
+  it("uploads the rest of a mixed drop, minus our own copy", async () => {
+    await renderTab();
+    dragRow(screen.getByText("notes.txt").closest("tr")!);
+    await waitFor(() => expect(startDrag).toHaveBeenCalled());
+    endDragOut();
+
+    await drop(["/tmp/triple-c-drag-out/s1/notes.txt", "/host/real.png"]);
+
+    expect(uploadFileToContainer).toHaveBeenCalledTimes(1);
+    expect(uploadFileToContainer).toHaveBeenCalledWith("p1", "/host/real.png", "/workspace");
+  });
+
+  it("does not offer to accept files during its own export", async () => {
+    await renderTab();
+    dragRow(screen.getByText("notes.txt").closest("tr")!);
+    await waitFor(() => expect(startDrag).toHaveBeenCalled());
+
+    await act(async () => {
+      await dragHandler?.({ payload: { type: "enter", position: { x: 100, y: 100 }, paths: [] } });
+    });
+    expect(screen.queryByText(/Drop files into/)).toBeNull();
+
+    await act(async () => {
+      await dragHandler?.({ payload: { type: "over", position: { x: 100, y: 100 }, paths: [] } });
+    });
+    expect(screen.queryByText(/Drop files into/)).toBeNull();
+
+    // …and it comes back once the gesture is over.
+    endDragOut();
+    await act(async () => {
+      await dragHandler?.({ payload: { type: "over", position: { x: 100, y: 100 }, paths: [] } });
+    });
+    expect(screen.getByText(/Drop files into \/workspace/)).toBeTruthy();
+  });
+});
+
+describe("FilesTab drop hit test", () => {
+  it("uploads nothing when a dialog is covering the pane", async () => {
+    // The pane still has its rect underneath the viewer's `fixed inset-0`
+    // portal, which is exactly why a rect alone was the wrong test.
+    readContainerFile.mockResolvedValue(contents("hello"));
+    await renderTab();
+    await act(async () => {
+      fireEvent.doubleClick(screen.getByText("notes.txt"));
+    });
+    await screen.findByRole("dialog");
+
+    await drop(["/host/a.png"]);
+
+    expect(uploadFileToContainer).not.toHaveBeenCalled();
+  });
+
+  it("does not paint the hint under a dialog either", async () => {
+    readContainerFile.mockResolvedValue(contents("hello"));
+    await renderTab();
+    await act(async () => {
+      fireEvent.doubleClick(screen.getByText("notes.txt"));
+    });
+    await screen.findByRole("dialog");
+
+    await act(async () => {
+      await dragHandler?.({ payload: { type: "over", position: { x: 100, y: 100 }, paths: [] } });
+    });
+    expect(screen.queryByText(/Drop files into/)).toBeNull();
+  });
+});
+
+describe("FilesTab grid focus", () => {
+  it("gives the grid exactly one tab stop and moves it with the arrows", async () => {
+    // Every row used to be `tabIndex={0}`: a 400-entry directory was ~1200 tab
+    // stops and Tab could not get out of the list.
+    await renderTab();
+    expect(gridRows()).toHaveLength(3); // .. , src, notes.txt
+    expect(tabStops()).toHaveLength(1);
+    expect(tabStops()[0].getAttribute("data-file-row")).toBe("..");
+
+    fireEvent.keyDown(tabStops()[0], { key: "ArrowDown" });
+    expect(tabStops()).toHaveLength(1);
+    expect(tabStops()[0].getAttribute("data-file-row")).toBe("src");
+    expect(document.activeElement).toBe(tabStops()[0]);
+
+    fireEvent.keyDown(tabStops()[0], { key: "End" });
+    expect(tabStops()[0].getAttribute("data-file-row")).toBe("notes.txt");
+    fireEvent.keyDown(tabStops()[0], { key: "Home" });
+    expect(tabStops()[0].getAttribute("data-file-row")).toBe("..");
+  });
+
+  it("keeps focus inside the grid after Enter opens a directory", async () => {
+    // Rows are keyed by name, so navigating unmounts the focused `<tr>` — and
+    // nothing used to re-focus, which ejected the user to `<body>`.
+    await renderTab();
+    const row = screen.getByText("src").closest("tr")!;
+    row.focus();
+    listContainerFiles.mockResolvedValueOnce([
+      entry("index.ts", { path: "/workspace/src/index.ts" }),
+    ]);
+    await act(async () => {
+      fireEvent.keyDown(row, { key: "Enter" });
+    });
+
+    expect(screen.getByText("index.ts")).toBeTruthy();
+    expect(document.activeElement).not.toBe(document.body);
+    expect((document.activeElement as HTMLElement).closest("tr[data-file-row]")).toBeTruthy();
+    expect(tabStops()).toHaveLength(1);
+  });
+
+  it("puts focus back on the row after a rename is abandoned", async () => {
+    await renderTab();
+    const row = screen.getByText("notes.txt").closest("tr")!;
+    fireEvent.keyDown(row, { key: "F2" });
+    const input = screen.getByLabelText("New name for notes.txt");
+    await act(async () => {
+      fireEvent.keyDown(input, { key: "Escape" });
+    });
+    expect(document.activeElement).toBe(
+      gridRows().find((r) => r.getAttribute("data-file-row") === "notes.txt"),
+    );
+  });
+
+  it("follows a committed rename to the row's new name", async () => {
+    // Explicit, because `clearAllMocks` clears calls but not implementations,
+    // and an earlier test in this file leaves this one rejecting.
+    renameContainerPath.mockResolvedValue("/workspace/renamed.txt");
+    await renderTab();
+    fireEvent.click(screen.getByRole("button", { name: "Rename — notes.txt" }));
+    const input = screen.getByLabelText("New name for notes.txt");
+    fireEvent.change(input, { target: { value: "renamed.txt" } });
+    listContainerFiles.mockResolvedValueOnce([
+      entry("src", { is_directory: true, path: "/workspace/src" }),
+      entry("renamed.txt"),
+    ]);
+    await act(async () => {
+      fireEvent.blur(input);
+    });
+    expect(document.activeElement).toBe(
+      gridRows().find((r) => r.getAttribute("data-file-row") === "renamed.txt"),
+    );
+  });
+});
+
+describe("FilesTab grid semantics", () => {
+  it("names its columns", async () => {
+    await renderTab();
+    for (const name of ["Name", "Size", "Modified", "Actions"]) {
+      expect(screen.getByRole("columnheader", { name })).toBeTruthy();
+    }
+  });
+
+  it("says folder or file in words, not in hue and a hidden emoji", async () => {
+    await renderTab();
+    const dir = screen.getByText("src").closest("tr")!;
+    const plain = screen.getByText("notes.txt").closest("tr")!;
+    expect(dir.textContent).toContain("Folder");
+    expect(plain.textContent).toContain("File");
+  });
+
+  it("keeps the visible label inside the accessible name (WCAG 2.5.3)", async () => {
+    await renderTab();
+    const rename = screen.getByRole("button", { name: "Rename — notes.txt" });
+    expect(rename.textContent).toBe("Rename");
+    expect(rename.getAttribute("aria-label")).toContain("Rename");
+    const saveTo = screen.getByRole("button", { name: "Save to host… — notes.txt" });
+    expect(saveTo.getAttribute("aria-label")).toContain(saveTo.textContent!);
+  });
+
+  it("mounts the live region empty, then fills it", async () => {
+    // A `role="status"` node inserted already carrying its text is frequently
+    // not announced at all, which is how every one of these went by in silence.
+    await renderTab();
+    const live = screen.getByRole("status");
+    expect(live.textContent).toBe("");
+
+    await drop(["/host/a.png"]);
+    // Same node throughout — it is never unmounted.
+    expect(screen.getByRole("status")).toBe(live);
+    expect(live.textContent).toContain("Uploaded 1 item");
+  });
+
+  it("keeps a listing failure inline, where the rows it explains are missing", async () => {
+    // The one failure that does *not* go to the toast host: it is on screen,
+    // in context, and there is nothing for it to scroll behind.
+    listContainerFiles.mockRejectedValue("Permission denied");
+    await renderTab();
+    expect(screen.getByRole("alert").textContent).toContain("Permission denied");
+  });
+});
+
+describe("FilesTab overwrite prompt", () => {
+  it("asks before replacing, and re-uploads with overwrite on Replace", async () => {
+    uploadFileToContainer.mockRejectedValueOnce("FILE_EXISTS: /workspace/notes.txt already exists");
+    await renderTab();
+
+    const pending = dropWithoutWaiting(["/host/notes.txt"]);
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog.textContent).toContain("notes.txt");
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Replace" }));
+      await pending;
+    });
+
+    expect(uploadFileToContainer).toHaveBeenLastCalledWith(
+      "p1",
+      "/host/notes.txt",
+      "/workspace",
+      true,
+    );
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("uploads nothing more on Skip", async () => {
+    uploadFileToContainer.mockRejectedValueOnce("FILE_EXISTS: /workspace/notes.txt already exists");
+    await renderTab();
+
+    const pending = dropWithoutWaiting(["/host/notes.txt"]);
+    await screen.findByRole("dialog");
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Skip" }));
+      await pending;
+    });
+
+    expect(uploadFileToContainer).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("offers the blanket answers only when files are queued behind this one", async () => {
+    uploadFileToContainer.mockRejectedValueOnce("FILE_EXISTS: /workspace/a.txt already exists");
+    await renderTab();
+
+    const pending = dropWithoutWaiting(["/host/a.txt", "/host/b.txt"]);
+    await screen.findByRole("dialog");
+    expect(screen.getByRole("button", { name: "Replace all" })).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Skip all" }));
+      await pending;
+    });
+    expect(screen.queryByRole("dialog")).toBeNull();
   });
 });

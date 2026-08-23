@@ -29,6 +29,22 @@ describe("formatBytes", () => {
     expect(formatBytes(1_610_612_736, { binary: true })).toBe("1.5 GB");
   });
 
+  it("absorbs the last two ad-hoc formatters, behaviour change and all", () => {
+    // `UpdateDialog.formatSize` and the inline `toFixed(1)` in
+    // `useProjectActions` both divided by 1024 and both stopped at MB. Routing
+    // them here is what finally makes this the *only* byte formatter, and it
+    // changes two things on purpose — pinned so neither reads as a regression
+    // to whoever meets them next.
+    //
+    // KB gains a decimal, matching every other size in the app:
+    expect(formatBytes(512 * 1024, { binary: true })).toBe("512.0 KB");
+    // and the ladder no longer bottoms out at a five-digit megabyte count:
+    expect(formatBytes(2 * 1024 ** 3, { binary: true })).toBe("2.0 GB");
+    // Sub-kilobyte sizes stop rendering as "0 KB", which is what the old
+    // `(bytes / 1024).toFixed(0)` said about every release asset under 512 B.
+    expect(formatBytes(400, { binary: true })).toBe("400 B");
+  });
+
   it("reproduces the migration convention exactly by default", () => {
     // `migrationCopy.formatDataSize` is now a call to this, and its output is
     // asserted in MigrateContainerModal.test.tsx.

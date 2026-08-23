@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { FileEntry } from "../../../lib/types";
 import { readContainerFile } from "../../../lib/tauri-commands";
 import Button from "../../ui/Button";
@@ -40,11 +40,28 @@ type Preview =
 export default function FileViewerModal({ projectId, entry, onClose, onSaveToHost }: Props) {
   const [preview, setPreview] = useState<Preview>({ kind: "loading" });
 
+  /**
+   * The object URL currently on screen.
+   *
+   * This used to be an effect-local variable revoked from the effect's own
+   * cleanup, which runs *before* the replacement effect body — so switching
+   * entries (or any re-run of the effect for the same entry) released the URL
+   * the `<img>` was still pointing at, and a blank image was the result until
+   * the new read landed. If the new read failed, it stayed blank. So the
+   * hand-over is explicit instead: a URL is revoked only once its replacement
+   * exists, and unmount is what releases the last one.
+   */
+  const objectUrlRef = useRef<string | null>(null);
+
+  /** Release the previous URL now that something else is on screen. */
+  const replaceObjectUrl = (next: string | null) => {
+    const previous = objectUrlRef.current;
+    objectUrlRef.current = next;
+    if (previous && previous !== next) URL.revokeObjectURL(previous);
+  };
+
   useEffect(() => {
     let cancelled = false;
-    // Tracked separately from `preview` so cleanup can revoke it without
-    // depending on which state the component ended up in.
-    let objectUrl: string | null = null;
 
     (async () => {
       try {
@@ -58,16 +75,20 @@ export default function FileViewerModal({ projectId, entry, onClose, onSaveToHos
           // A truncated image is not a smaller image, it is a broken one.
           if (result.truncated) {
             setPreview({ kind: "too-large" });
+            replaceObjectUrl(null);
             return;
           }
           const blob = new Blob([bytes], { type: imageMimeFor(entry.name) ?? "image/png" });
-          objectUrl = URL.createObjectURL(blob);
-          setPreview({ kind: "image", url: objectUrl });
+          const url = URL.createObjectURL(blob);
+          // The replacement is in hand, so the previous one can go.
+          setPreview({ kind: "image", url });
+          replaceObjectUrl(url);
           return;
         }
 
         if (looksBinary(bytes)) {
           setPreview({ kind: "unsupported" });
+          replaceObjectUrl(null);
           return;
         }
 
@@ -78,6 +99,7 @@ export default function FileViewerModal({ projectId, entry, onClose, onSaveToHos
           shownBytes: bytes.length,
           trueSize: result.size,
         });
+        replaceObjectUrl(null);
       } catch (e) {
         if (!cancelled) setPreview({ kind: "error", message: String(e) });
       }
@@ -85,9 +107,18 @@ export default function FileViewerModal({ projectId, entry, onClose, onSaveToHos
 
     return () => {
       cancelled = true;
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
   }, [projectId, entry.name, entry.path]);
+
+  // The bytes are released when the dialog goes, which is the whole reason the
+  // preview is a `blob:` URL rather than a `data:` one.
+  useEffect(
+    () => () => {
+      if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
+      objectUrlRef.current = null;
+    },
+    [],
+  );
 
   const footer = (
     <>
@@ -143,7 +174,18 @@ export default function FileViewerModal({ projectId, entry, onClose, onSaveToHos
               Showing the first {formatBytes(preview.shownBytes)} of {formatBytes(preview.trueSize)}.
             </p>
           )}
-          <pre className="whitespace-pre-wrap break-words font-mono text-xs text-[var(--text-primary)]">
+          {/* Focusable, and its own scroll container, because a megabyte of
+              text in an unfocusable `<pre>` is reachable by mouse wheel and by
+              nothing else — no PageDown, no arrows, no keyboard at all. A
+              scrollable region needs an accessible name to be worth landing
+              on, hence the role and label. No `focus:outline-none`: the global
+              `:focus-visible` ring is what says where the caret went. */}
+          <pre
+            tabIndex={0}
+            role="region"
+            aria-label={`${entry.name} contents`}
+            className="max-h-[60vh] overflow-auto whitespace-pre-wrap break-words font-mono text-xs text-[var(--text-primary)]"
+          >
             {preview.text}
           </pre>
         </>

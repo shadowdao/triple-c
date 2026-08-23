@@ -1,5 +1,32 @@
-import type { CSSProperties, MouseEvent } from "react";
+import type { KeyboardEvent } from "react";
 import { isAnthropicSignInUrl, urlOrigin } from "../../lib/urlRelay";
+import Button from "../ui/Button";
+
+/**
+ * Marks the toast's subtree. `TerminalView` uses it to answer "is focus inside
+ * the thing I am about to unmount?", which is what decides whether dismissing
+ * has to hand focus back to the terminal.
+ */
+export const URL_TOAST_SELECTOR = '[data-testid="url-toast"]';
+
+/**
+ * The chord that jumps from the terminal into this toast.
+ *
+ * Bound in `TerminalView` on `document` in the capture phase, the same way
+ * `useKeyboardShortcuts` binds the app's other chords, because xterm would
+ * otherwise forward it to the shell. Shift is what keeps it clear of the
+ * terminal: plain Ctrl+O is readline's `operate-and-get-next`.
+ */
+export const URL_TOAST_SHORTCUT = "Ctrl+Shift+O";
+
+/**
+ * Marks the *default* action inside the toast, so the owner can put focus
+ * there without a ref threaded through `ui/Button` — which is a plain function
+ * component and not this file's to change. Which button it is depends on the
+ * URL (see the sign-in note below), so the attribute moves with the decision
+ * rather than the caller having to repeat it.
+ */
+export const URL_TOAST_PRIMARY_SELECTOR = '[data-url-toast-primary="true"]';
 
 interface Props {
   /** Already validated by `sanitizeRelayUrl` — this component never opens it. */
@@ -41,6 +68,28 @@ interface Props {
  * with no host round trip and no auth bridge, so it leads — and the host button
  * stays, because a user who has the auth bridge on, or who wants their existing
  * browser session, still needs it.
+ *
+ * ## Reachable without a mouse, and it does not take focus to manage it
+ *
+ * This toast is the only route to completing a sign-in started in a terminal,
+ * and it used to be mouse-only: xterm's helper textarea swallows Tab, so there
+ * was no way to reach these buttons at all from the keyboard.
+ *
+ * The obvious fix — focus the default action when the toast appears — was
+ * rejected on two counts. The terminal underneath is *live*: the user may be
+ * mid-command, and every keystroke after the steal would go to a button instead
+ * of the shell. Worse, the default action opens a URL chosen by the untrusted
+ * side of the sandbox, and a focused button is one stray Space or Enter away
+ * from doing it. This prompt exists precisely to make that a deliberate act.
+ *
+ * So focus stays where the user put it and the toast is reachable on demand:
+ * {@link URL_TOAST_SHORTCUT} jumps to the default action (the hint is on
+ * screen, next to the label, because a shortcut nobody is told about is not a
+ * route), Tab then moves between the actions normally — this subtree is not
+ * inside xterm — and Escape dismisses. Escape is handled *here*, on the
+ * toast's own subtree, rather than globally: Escape belongs to whatever is
+ * running in the terminal, and a document-level binding for it would break vim
+ * for everyone who never looked at this toast.
  */
 export default function UrlToast({
   url,
@@ -55,82 +104,56 @@ export default function UrlToast({
   // host button is the only action there is, so it stays primary.
   const signIn = !!onOpenInContainer && isAnthropicSignInUrl(url);
 
-  // Filled uses `--accent-emphasis`, never `--accent` — the latter is the
+  // `Button` already owns the filled/outlined variants — including the rule
+  // that filled uses `--accent-emphasis` and never `--accent`, which is the
   // foreground/link accent and fails WCAG AA behind white text.
-  const primaryStyle: CSSProperties = {
-    padding: "4px 12px",
-    fontSize: 12,
-    fontWeight: 600,
-    color: "#fff",
-    background: "var(--accent-emphasis)",
-    border: "1px solid transparent",
-    borderRadius: 4,
-    cursor: "pointer",
-    whiteSpace: "nowrap",
-    flexShrink: 0,
-  };
-  const secondaryStyle: CSSProperties = {
-    padding: "4px 10px",
-    fontSize: 12,
-    fontWeight: 600,
-    color: "var(--text-primary)",
-    background: "transparent",
-    border: "1px solid var(--border-color)",
-    borderRadius: 4,
-    cursor: "pointer",
-    whiteSpace: "nowrap",
-    flexShrink: 0,
-  };
-
-  /** Hover feedback for whichever button is currently the filled one. */
-  const hover = (primary: boolean) =>
-    primary
-      ? {
-          onMouseEnter: (e: MouseEvent<HTMLButtonElement>) =>
-            (e.currentTarget.style.background = "var(--accent-emphasis-hover)"),
-          onMouseLeave: (e: MouseEvent<HTMLButtonElement>) =>
-            (e.currentTarget.style.background = "var(--accent-emphasis)"),
-        }
-      : {
-          onMouseEnter: (e: MouseEvent<HTMLButtonElement>) =>
-            (e.currentTarget.style.background = "var(--bg-tertiary)"),
-          onMouseLeave: (e: MouseEvent<HTMLButtonElement>) =>
-            (e.currentTarget.style.background = "transparent"),
-        };
-
   const hostButton = (
-    <button
+    <Button
+      variant={signIn ? "secondary" : "primary"}
+      data-url-toast-primary={signIn ? undefined : "true"}
       onClick={onOpen}
+      className="flex-shrink-0"
       title={
         signIn
           ? "Open in your own browser instead — the callback then has to reach the container by some other route"
           : undefined
       }
-      style={signIn ? secondaryStyle : primaryStyle}
-      {...hover(!signIn)}
     >
       Open
-    </button>
+    </Button>
   );
 
   const containerButton = onOpenInContainer && (
     // A sign-in completed in the *container's* browser lands its callback on
     // the container's own loopback, which is where the tool waiting for it is
     // listening — no host round trip, no auth bridge.
-    <button
+    <Button
+      variant={signIn ? "primary" : "secondary"}
+      data-url-toast-primary={signIn ? "true" : undefined}
       onClick={onOpenInContainer}
+      className="flex-shrink-0"
       title="Open in a browser inside the container, and watch it in the Browser tab"
-      style={signIn ? primaryStyle : secondaryStyle}
-      {...hover(signIn)}
     >
       In container
-    </button>
+    </Button>
   );
+
+  const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
+    if (e.key !== "Escape") return;
+    // Scoped to this subtree, so the terminal's own Escape is untouched.
+    e.preventDefault();
+    e.stopPropagation();
+    onDismiss();
+  };
 
   return (
     <div
       className="animate-slide-down"
+      data-testid="url-toast"
       role="status"
+      aria-atomic="true"
+      aria-keyshortcuts="Control+Shift+O"
+      onKeyDown={onKeyDown}
       style={{
         position: "absolute",
         top: 12,
@@ -144,7 +167,7 @@ export default function UrlToast({
         background: "var(--bg-secondary)",
         border: "1px solid var(--border-color)",
         borderRadius: 8,
-        boxShadow: "0 4px 12px rgba(0,0,0,0.4)",
+        boxShadow: "var(--shadow-overlay)",
         maxWidth: "min(90%, 600px)",
       }}
     >
@@ -157,6 +180,11 @@ export default function UrlToast({
           }}
         >
           {label}
+          {" · "}
+          <span data-testid="url-toast-shortcut" style={{ fontFamily: "monospace" }}>
+            {URL_TOAST_SHORTCUT}
+          </span>{" "}
+          to reach the buttons, Esc to dismiss
         </div>
         <div
           data-testid="url-toast-url"
@@ -226,29 +254,15 @@ export default function UrlToast({
         </>
       )}
 
-      <button
+      <Button
+        variant="ghost"
         onClick={onDismiss}
-        style={{
-          padding: "2px 6px",
-          fontSize: 14,
-          lineHeight: 1,
-          color: "var(--text-secondary)",
-          background: "transparent",
-          border: "none",
-          borderRadius: 4,
-          cursor: "pointer",
-          flexShrink: 0,
-        }}
-        onMouseEnter={(e) =>
-          (e.currentTarget.style.color = "var(--text-primary)")
-        }
-        onMouseLeave={(e) =>
-          (e.currentTarget.style.color = "var(--text-secondary)")
-        }
+        className="flex-shrink-0"
         aria-label="Dismiss"
+        title="Dismiss (Esc)"
       >
         ✕
-      </button>
+      </Button>
     </div>
   );
 }

@@ -14,6 +14,13 @@ interface Props {
   onConfirm: (typed: string) => void;
   onCancel: () => void;
   busy?: boolean;
+  /**
+   * Why the last attempt did not happen. The caller keeps the dialog open when
+   * its action fails, so the failure has to be readable *here* — the panel
+   * behind this one is several screens long and its error line is at the top
+   * of it, which is not where the user is looking.
+   */
+  error?: string | null;
 }
 
 /**
@@ -44,6 +51,7 @@ export default function TypedConfirmModal({
   onConfirm,
   onCancel,
   busy = false,
+  error = null,
 }: Props) {
   const [typed, setTyped] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
@@ -104,12 +112,22 @@ export default function TypedConfirmModal({
             {matches ? (
               <span className="text-[var(--text-secondary)]">Name matches.</span>
             ) : (
-              <span className="text-[var(--text-disabled)]">
+              // Not disabled content — the gate is live and waiting on the
+              // user. `--text-disabled` is ~4.1:1 and fails AA at 12px.
+              <span className="text-[var(--text-secondary)]">
                 Waiting for the exact project name.
               </span>
             )}
           </p>
         </div>
+        {error && (
+          // Rendered last, next to the button that was just pressed, and as an
+          // `alert` so it is announced on arrival rather than waiting to be
+          // found.
+          <p role="alert" className="text-[var(--error)]">
+            {error}
+          </p>
+        )}
       </div>
     </Modal>
   );

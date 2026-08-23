@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { act, renderHook, waitFor } from "@testing-library/react";
-import { useDiskUsage } from "./useDiskUsage";
+import { useDiskUsage, type DiskUsageState } from "./useDiskUsage";
 import type { DiskUsageReport } from "../lib/types";
 
 const getDockerDiskUsage = vi.fn();
@@ -224,6 +224,157 @@ describe("useDiskUsage", () => {
     expect(result.current.outcome?.total_freed_bytes).toBe(11_900_000_000);
     expect(result.current.outcome?.results[0].message).toMatch(/Swept 2 superseded image/);
     expect(result.current.outcome?.results[0].message).toMatch(/3 were left alone/);
+  });
+
+  // -------------------------------------------------------------------------
+  // The scan-versus-mutation race
+  // -------------------------------------------------------------------------
+
+  it("throws away a scan that a reclaim overtook", async () => {
+    // The live race the generation counter used to miss entirely. A scan takes
+    // seconds and does not set `working`, so nothing stopped the user
+    // reclaiming on top of one — and when the scan landed it repainted the
+    // pre-reclaim report *and* a fresh, clickable plan listing objects the
+    // reclaim had just deleted.
+    let resolveScan: (value: DiskUsageReport) => void = () => {};
+    getDockerDiskUsage.mockReturnValueOnce(
+      new Promise<DiskUsageReport>((r) => {
+        resolveScan = r;
+      }),
+    );
+
+    const { result } = renderHook(() => useDiskUsage());
+    let inFlight: Promise<void> = Promise.resolve();
+    act(() => {
+      inFlight = result.current.scan();
+    });
+    expect(result.current.scanning).toBe(true);
+
+    await act(async () => {
+      await result.current.runReclaim([{ kind: "dangling_snapshots" }]);
+    });
+    expect(result.current.plan).toBeNull();
+
+    // The overtaken scan finishes last, and must land nothing at all.
+    await act(async () => {
+      resolveScan(report("measured before the reclaim"));
+      await inFlight;
+    });
+    expect(result.current.report).toBeNull();
+    expect(result.current.plan).toBeNull();
+    // It does not even get as far as re-planning: a plan built from a report
+    // this stale is the clickable half of the bug.
+    expect(listReclaimable).not.toHaveBeenCalled();
+  });
+
+  it("does not strand `scanning` when a mutation retires the scan", async () => {
+    // `scanning` is cleared against the newest *scan*, not the newest
+    // generation — a mutation bumps the generation without starting a scan, so
+    // guarding on that would leave the button reading "Scanning…" forever.
+    let resolveScan: (value: DiskUsageReport) => void = () => {};
+    getDockerDiskUsage.mockReturnValueOnce(
+      new Promise<DiskUsageReport>((r) => {
+        resolveScan = r;
+      }),
+    );
+
+    const { result } = renderHook(() => useDiskUsage());
+    let inFlight: Promise<void> = Promise.resolve();
+    act(() => {
+      inFlight = result.current.scan();
+    });
+    await act(async () => {
+      await result.current.runReclaim([{ kind: "dangling_snapshots" }]);
+    });
+    await act(async () => {
+      resolveScan(report("stale"));
+      await inFlight;
+    });
+    expect(result.current.scanning).toBe(false);
+  });
+
+  it("retires an in-flight scan for a destroy and a sweep too", async () => {
+    // Every mutation invalidates a measurement, not just the bulk one.
+    destroyProjectDiskObject.mockResolvedValue({
+      target: null,
+      destroyed: { kind: "home_volume", project_id: "p1" },
+      ok: true,
+      freed_bytes: 1,
+      projected_bytes: null,
+      message: "gone",
+    });
+    sweepOrphanedSnapshots.mockResolvedValue({
+      removed: [],
+      reclaimed_bytes: 0,
+      in_use: 0,
+      failed: [],
+      unavailable: null,
+    });
+
+    for (const mutate of [
+      (r: DiskUsageState) => r.destroy({ kind: "home_volume", project_id: "p1" }, "whp"),
+      (r: DiskUsageState) => r.runSweep(),
+    ]) {
+      let resolveScan: (value: DiskUsageReport) => void = () => {};
+      getDockerDiskUsage.mockReturnValueOnce(
+        new Promise<DiskUsageReport>((r) => {
+          resolveScan = r;
+        }),
+      );
+      const { result } = renderHook(() => useDiskUsage());
+      let inFlight: Promise<void> = Promise.resolve();
+      act(() => {
+        inFlight = result.current.scan();
+      });
+      await act(async () => {
+        await mutate(result.current);
+      });
+      await act(async () => {
+        resolveScan(report("stale"));
+        await inFlight;
+      });
+      expect(result.current.report).toBeNull();
+      expect(result.current.plan).toBeNull();
+      expect(result.current.scanning).toBe(false);
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Reporting failure back to the caller
+  // -------------------------------------------------------------------------
+
+  it("tells the caller a reclaim failed instead of only swallowing it into `error`", async () => {
+    // The confirmation dialogs close on completion. Without a return value
+    // they closed on failure too, leaving the error at the top of a panel the
+    // user had scrolled well past.
+    reclaim.mockRejectedValueOnce("compaction failed: no space left on device");
+    const { result } = renderHook(() => useDiskUsage());
+    let ok: boolean | undefined;
+    await act(async () => {
+      ok = await result.current.runReclaim([{ kind: "compact_snapshot", project_id: "p1" }]);
+    });
+    expect(ok).toBe(false);
+    expect(result.current.error).toMatch(/no space left on device/);
+  });
+
+  it("tells the caller a destroy failed", async () => {
+    destroyProjectDiskObject.mockRejectedValueOnce("volume is in use by a running container");
+    const { result } = renderHook(() => useDiskUsage());
+    let ok: boolean | undefined;
+    await act(async () => {
+      ok = await result.current.destroy({ kind: "home_volume", project_id: "p1" }, "whp");
+    });
+    expect(ok).toBe(false);
+    expect(result.current.error).toMatch(/in use by a running container/);
+  });
+
+  it("reports success when the call came back", async () => {
+    const { result } = renderHook(() => useDiskUsage());
+    let ok: boolean | undefined;
+    await act(async () => {
+      ok = await result.current.runReclaim([{ kind: "dangling_snapshots" }]);
+    });
+    expect(ok).toBe(true);
   });
 
   it("treats an unreachable daemon in the sweep report as an error", async () => {

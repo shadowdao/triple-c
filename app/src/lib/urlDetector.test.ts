@@ -225,6 +225,55 @@ describe("UrlDetector — OSC 8", () => {
     expect(seen).toEqual([[url, "heuristic"]]);
   });
 
+  it("never hands back a truncated guess at a link it has already seen exactly", () => {
+    // The defect: the prompt slot is emptied (dismissed, or auto-dismissed
+    // after 30 s), the OSC 8 target is deduped for the session and cannot come
+    // back, and the next repaint — sliced at a different offset, so a *new*
+    // string — reassembles into a prefix of the real link that fills the empty
+    // slot. It parses, it points at claude.ai, and it authorises nothing.
+    //
+    // Nothing here knows the slot was emptied, and that is the point: the rule
+    // holds however many times it is.
+    const seen: [string, UrlSource][] = [];
+    const d = new UrlDetector((u, s) => seen.push([u, s]), () => COLS);
+
+    feed(d, "Open this link to sign in:\r\n" + slicedHyperlink(SIGN_IN_URL) + "\r\ndone\r\n");
+    expect(seen).toEqual([[SIGN_IN_URL, "osc8"]]);
+
+    // …the user dismisses the toast; the TUI repaints the same link as plain
+    // text, cut short by the frame it was painted into.
+    feed(d, SIGN_IN_URL.slice(0, 150) + "\r\nWaiting for the browser…\r\n");
+
+    expect(seen).toHaveLength(1);
+    expect(seen.map(([u]) => u)).not.toContain(SIGN_IN_URL.slice(0, 150));
+  });
+
+  it("still offers a genuinely different link after an exact one", () => {
+    // The suppression is a prefix rule, not "one prompt per session".
+    const seen: string[] = [];
+    const d = new UrlDetector((u) => seen.push(u), () => COLS);
+    const other = "https://github.com/login/device?code=" + "x".repeat(90);
+
+    feed(d, slicedHyperlink(SIGN_IN_URL) + "\r\n");
+    feed(d, other + "\r\nnext\r\n");
+
+    expect(seen).toEqual([SIGN_IN_URL, other]);
+  });
+
+  it("suppresses a guess at a URL the consumer reported from the relay", () => {
+    // The OSC 7777 relay hands `TerminalView` a base64-encoded — therefore
+    // exact — URL that this detector never sees. `noteExactUrl` is how it gets
+    // told, so a dismissed relay prompt cannot be replaced by a scrape of the
+    // same link either.
+    const seen: string[] = [];
+    const d = new UrlDetector((u) => seen.push(u), () => COLS);
+    d.noteExactUrl(SIGN_IN_URL);
+
+    feed(d, SIGN_IN_URL.slice(0, 150) + "\r\nnext\r\n");
+
+    expect(seen).toEqual([]);
+  });
+
   it("ignores a short hyperlink", () => {
     // `ls --hyperlink` decorates every filename; none of that is a prompt.
     const seen: string[] = [];

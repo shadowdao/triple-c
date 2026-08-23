@@ -103,6 +103,19 @@ describe("TypedConfirmModal", () => {
     expect(onConfirm).not.toHaveBeenCalled();
   });
 
+  it("carries a failed attempt inside the dialog, as an alert", () => {
+    // The caller keeps this dialog open when the deletion fails, because the
+    // panel behind it is several screens long and its error line sits at the
+    // top — nowhere near the row this was opened from.
+    renderModal({ error: "volume triple-c-home-p-whp is in use by a running container" });
+    expect(screen.getByRole("alert")).toHaveTextContent(/in use by a running container/);
+  });
+
+  it("says nothing about failure when there has been none", () => {
+    renderModal();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
   it("cannot be satisfied by an empty box when there is no name to type", () => {
     const { confirm } = renderModal({ expected: "" });
     expect(confirm).toBeDisabled();

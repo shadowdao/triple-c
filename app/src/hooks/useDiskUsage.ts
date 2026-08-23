@@ -32,9 +32,24 @@ import type {
  * A user who hits Scan twice can have two `df()` calls in flight, and they can
  * land out of order — the second one is not necessarily slower. Every async
  * write in `scan` checks it is still the newest before it lands, the same
- * pattern `useContainerMigration` uses. `runReclaim` and `destroy` do not need
- * it: the UI disables their buttons while `working` is set, so there is never
- * a second one to race.
+ * pattern `useContainerMigration` uses.
+ *
+ * The race that actually bites, though, is not scan-versus-scan: it is
+ * scan-versus-**mutation**. A scan takes seconds and does not set `working`, so
+ * nothing stopped a reclaim starting on top of one. The reclaim correctly drops
+ * the plan — and then the still-running scan landed, passed its own generation
+ * check, and repainted a pre-reclaim report *plus a fresh, clickable plan
+ * listing objects that had just been deleted*. So every mutation bumps the
+ * counter as well: whatever a scan is holding was measured before the mutation
+ * and is now a lie, and throwing it away is the only honest thing to do with
+ * it. (The Scan button is disabled while `working` for the mirror-image case,
+ * so a scan can never start *during* a mutation.)
+ *
+ * That is also why `scanning` is not cleared against the same counter: a
+ * mutation bumping it mid-scan would strand the flag at true and leave the
+ * button reading "Scanning…" forever. `latestScan` records the generation the
+ * newest *scan* owns — only a newer scan may take the flag away — and that is
+ * what the `finally` compares against.
  */
 export interface DiskUsageState {
   report: DiskUsageReport | null;
@@ -47,8 +62,15 @@ export interface DiskUsageState {
   /** The outcome of the last reclaim, kept on screen until the next scan. */
   outcome: ReclaimOutcome | null;
   scan: () => Promise<void>;
-  runReclaim: (targets: ReclaimTarget[]) => Promise<void>;
-  destroy: (target: DestructiveTarget, confirmation: string) => Promise<void>;
+  /**
+   * Resolves `true` when the call came back, `false` when it threw and the
+   * failure went into `error`. Callers that dismiss UI on completion — the
+   * confirmation dialogs — must only dismiss on `true`, or the failure is left
+   * with nowhere on screen the user is looking.
+   */
+  runReclaim: (targets: ReclaimTarget[]) => Promise<boolean>;
+  /** Same contract as `runReclaim`: `false` means it failed and `error` says how. */
+  destroy: (target: DestructiveTarget, confirmation: string) => Promise<boolean>;
   /** Run the orphaned-snapshot sweep and report what it found *and refused*. */
   runSweep: () => Promise<void>;
   clearOutcome: () => void;
@@ -62,9 +84,21 @@ export function useDiskUsage(): DiskUsageState {
   const [error, setError] = useState<string | null>(null);
   const [outcome, setOutcome] = useState<ReclaimOutcome | null>(null);
   const generation = useRef(0);
+  /** The generation belonging to the most recently *started* scan. */
+  const latestScan = useRef(0);
+
+  /**
+   * Retire every in-flight scan. Called at the top of each mutation, because
+   * the moment we start deleting things, a measurement taken before that is no
+   * longer describing the daemon the user is looking at.
+   */
+  const invalidateScans = useCallback(() => {
+    generation.current += 1;
+  }, []);
 
   const scan = useCallback(async () => {
     const mine = ++generation.current;
+    latestScan.current = mine;
     setScanning(true);
     setError(null);
     // The previous outcome describes a state that no longer holds once a new
@@ -92,49 +126,66 @@ export function useDiskUsage(): DiskUsageState {
       // user can no longer see the totals for, but that cannot happen: the two
       // only ever move together.
     } finally {
-      if (generation.current === mine) setScanning(false);
+      // Deliberately `latestScan`, not `generation`: a mutation that retired
+      // this scan did not start another one, so this scan is still the last
+      // word on whether a scan is running.
+      if (latestScan.current === mine) setScanning(false);
     }
   }, []);
 
-  const runReclaim = useCallback(async (targets: ReclaimTarget[]) => {
-    if (targets.length === 0) return;
-    setWorking(true);
-    setError(null);
-    try {
-      const result = await commands.reclaim(targets);
-      setOutcome(result);
-      // **The plan is now stale and must not stay clickable.** Its rows
-      // describe objects this call just removed, so leaving them ticked lets
-      // the user fire the same reclaim again against nothing. Dropping the plan
-      // (not the report) leaves the totals on screen, marked as measured before
-      // the reclaim, with the tick list gone.
-      //
-      // Deliberately no automatic re-scan: it costs another `df()`, and the
-      // outcome already reports measured bytes for every target — a user who
-      // wants the new totals asks for them.
-      setPlan(null);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setWorking(false);
-    }
-  }, []);
+  const runReclaim = useCallback(
+    async (targets: ReclaimTarget[]): Promise<boolean> => {
+      // Nothing was asked for, so nothing failed — a caller gating a dialog on
+      // this must not be left staring at an error that has no cause.
+      if (targets.length === 0) return true;
+      invalidateScans();
+      setWorking(true);
+      setError(null);
+      try {
+        const result = await commands.reclaim(targets);
+        setOutcome(result);
+        // **The plan is now stale and must not stay clickable.** Its rows
+        // describe objects this call just removed, so leaving them ticked lets
+        // the user fire the same reclaim again against nothing. Dropping the plan
+        // (not the report) leaves the totals on screen, marked as measured before
+        // the reclaim, with the tick list gone.
+        //
+        // Deliberately no automatic re-scan: it costs another `df()`, and the
+        // outcome already reports measured bytes for every target — a user who
+        // wants the new totals asks for them.
+        setPlan(null);
+        return true;
+      } catch (e) {
+        setError(String(e));
+        return false;
+      } finally {
+        setWorking(false);
+      }
+    },
+    [invalidateScans],
+  );
 
-  const destroy = useCallback(async (target: DestructiveTarget, confirmation: string) => {
-    setWorking(true);
-    setError(null);
-    try {
-      const result = await commands.destroyProjectDiskObject(target, confirmation);
-      setOutcome({ results: [result], total_freed_bytes: result.freed_bytes });
-      // Same reasoning as `runReclaim`: the destructive list named an object
-      // that is now gone.
-      setPlan(null);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setWorking(false);
-    }
-  }, []);
+  const destroy = useCallback(
+    async (target: DestructiveTarget, confirmation: string): Promise<boolean> => {
+      invalidateScans();
+      setWorking(true);
+      setError(null);
+      try {
+        const result = await commands.destroyProjectDiskObject(target, confirmation);
+        setOutcome({ results: [result], total_freed_bytes: result.freed_bytes });
+        // Same reasoning as `runReclaim`: the destructive list named an object
+        // that is now gone.
+        setPlan(null);
+        return true;
+      } catch (e) {
+        setError(String(e));
+        return false;
+      } finally {
+        setWorking(false);
+      }
+    },
+    [invalidateScans],
+  );
 
   /**
    * The startup sweep, on demand.
@@ -147,6 +198,7 @@ export function useDiskUsage(): DiskUsageState {
    * report away.
    */
   const runSweep = useCallback(async () => {
+    invalidateScans();
     setWorking(true);
     setError(null);
     try {
@@ -178,7 +230,7 @@ export function useDiskUsage(): DiskUsageState {
     } finally {
       setWorking(false);
     }
-  }, []);
+  }, [invalidateScans]);
 
   const clearOutcome = useCallback(() => setOutcome(null), []);
 

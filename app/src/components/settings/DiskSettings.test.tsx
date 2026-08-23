@@ -6,6 +6,7 @@ import type {
   ProjectDiskRow,
   ReclaimItem,
   ReclaimPlan,
+  ReclaimResult,
   ReclaimTarget,
 } from "../../lib/types";
 
@@ -101,6 +102,16 @@ const item = (over: Partial<ReclaimItem> = {}): ReclaimItem => ({
   bytes_are_exact: true,
   bytes_floor: null,
   blocked: null,
+  ...over,
+});
+
+const result = (over: Partial<ReclaimResult> = {}): ReclaimResult => ({
+  target: { kind: "dangling_snapshots" },
+  destroyed: null,
+  ok: true,
+  freed_bytes: 0,
+  projected_bytes: null,
+  message: "Removed 3 images.",
   ...over,
 });
 
@@ -618,6 +629,209 @@ describe("DiskSettings", () => {
     const outcome = await screen.findByTestId("disk-outcome");
     expect(within(outcome).getByText("Reclaimed 5.1 GB")).toBeInTheDocument();
     expect(within(outcome).getByText(/projected up to 7\.0 GB, actually 5\.1 GB/)).toBeInTheDocument();
+  });
+
+  // -------------------------------------------------------------------------
+  // Failure has to reach the words, and the place the user is looking
+  // -------------------------------------------------------------------------
+
+  it("puts a partial failure in the headline, not only in the glyph's hue", async () => {
+    // This panel is where the "never encode status in colour alone" rule is
+    // documented, and the outcome headline used to say "Reclaimed 1.2 GB" for
+    // a run where most of the targets threw — only the glyph and its colour
+    // changed, which is exactly nothing to a screen reader or to anyone who
+    // does not read red as bad.
+    reclaim.mockResolvedValue({
+      results: [
+        result({ freed_bytes: 1_200_000_000 }),
+        result({ target: { kind: "migration_pins" } }),
+        result({ target: { kind: "probe_containers" } }),
+        result({ target: { kind: "build_cache", all: true }, ok: false }),
+        result({ target: { kind: "orphan_volume", name: "v" }, ok: false }),
+      ],
+      total_freed_bytes: 1_200_000_000,
+    });
+    await renderAndScan();
+    await screen.findByTestId("disk-safe-bucket");
+    fireEvent.click(screen.getAllByRole("checkbox")[0]);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Reclaim" }));
+    });
+
+    const outcome = await screen.findByTestId("disk-outcome");
+    expect(
+      within(outcome).getByText("Reclaimed 1.2 GB — 2 of 5 failed"),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps the plain wording when every target succeeded", async () => {
+    reclaim.mockResolvedValue({
+      results: [result({ freed_bytes: 1_200_000_000 }), result()],
+      total_freed_bytes: 1_200_000_000,
+    });
+    await renderAndScan();
+    await screen.findByTestId("disk-safe-bucket");
+    fireEvent.click(screen.getAllByRole("checkbox")[0]);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Reclaim" }));
+    });
+
+    const outcome = await screen.findByTestId("disk-outcome");
+    expect(within(outcome).getByText("Reclaimed 1.2 GB")).toBeInTheDocument();
+    expect(outcome.textContent).not.toMatch(/failed/);
+  });
+
+  it("keeps the typed confirmation open, and says why, when the deletion fails", async () => {
+    // The dialog used to close regardless, leaving the failure in a line at
+    // the very top of a panel the user had scrolled past to reach the row.
+    listReclaimable.mockResolvedValue(
+      plan({
+        destructive: [
+          {
+            target: { kind: "home_volume", project_id: "p-whp" },
+            project_id: "p-whp",
+            project_name: "whp",
+            label: "Home volume",
+            loses: "Shell history and toolchains.",
+            bytes: 4_860_000_000,
+            blocked: null,
+          },
+        ],
+      }),
+    );
+    destroyProjectDiskObject.mockRejectedValue(
+      "volume triple-c-home-p-whp is in use by a running container",
+    );
+
+    await renderAndScan();
+    await screen.findByTestId("disk-row-p-whp");
+    fireEvent.click(screen.getByRole("button", { name: "Delete whp data" }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("menuitem", { name: /Delete home volume/ }));
+    });
+
+    const dialog = screen.getByRole("dialog");
+    fireEvent.change(within(dialog).getByLabelText(/Type/), { target: { value: "whp" } });
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole("button", { name: "Delete home volume" }));
+    });
+
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    expect(within(screen.getByRole("dialog")).getByRole("alert")).toHaveTextContent(
+      /in use by a running container/,
+    );
+  });
+
+  it("keeps the semi-safe confirmation open when the action fails", async () => {
+    listReclaimable.mockResolvedValue(
+      plan({
+        items: [
+          item({
+            target: { kind: "compact_snapshot", project_id: "p-whp" },
+            safety: "semi_safe",
+            label: "Compact whp's snapshot",
+            bytes: 5_100_000_000,
+            bytes_are_exact: false,
+            bytes_floor: 0,
+          }),
+        ],
+      }),
+    );
+    reclaim.mockRejectedValue("compaction failed: no space left on device");
+
+    await renderAndScan();
+    const semi = await screen.findByTestId("disk-semi-bucket");
+    await act(async () => {
+      fireEvent.click(within(semi).getByRole("button", { name: "Run…" }));
+    });
+    await act(async () => {
+      fireEvent.click(
+        within(screen.getByRole("dialog")).getByRole("button", { name: "Run it" }),
+      );
+    });
+
+    const dialog = screen.getByRole("dialog");
+    expect(dialog).toBeInTheDocument();
+    expect(within(dialog).getByRole("alert")).toHaveTextContent(/no space left on device/);
+  });
+
+  it("closes the confirmation once the action succeeds", async () => {
+    listReclaimable.mockResolvedValue(
+      plan({
+        items: [
+          item({
+            target: { kind: "clear_caches", project_id: "p-whp", include_rustup: false },
+            safety: "semi_safe",
+            label: "Clear whp's caches",
+          }),
+        ],
+      }),
+    );
+    await renderAndScan();
+    const semi = await screen.findByTestId("disk-semi-bucket");
+    await act(async () => {
+      fireEvent.click(within(semi).getByRole("button", { name: "Run…" }));
+    });
+    await act(async () => {
+      fireEvent.click(
+        within(screen.getByRole("dialog")).getByRole("button", { name: "Run it" }),
+      );
+    });
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  // -------------------------------------------------------------------------
+  // Scan status: announced, and not startable mid-mutation
+  // -------------------------------------------------------------------------
+
+  it("announces the scan status through a live region", async () => {
+    // The status flips between three states with no other signal; without a
+    // live region wrapping it the change is silent.
+    render(<DiskSettings />);
+    const live = screen.getByRole("status");
+    expect(live).toHaveAttribute("aria-live", "polite");
+    expect(live).toHaveTextContent("Not scanned");
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Scan" }));
+    });
+    // The glyph is `aria-hidden` but still part of `textContent`.
+    expect(screen.getByRole("status")).toHaveTextContent(/Scanned \d/);
+  });
+
+  it("cannot start a scan while a reclaim is still running", async () => {
+    // A scan launched on top of a mutation measures a daemon that is being
+    // changed underneath it — the hook can only throw such a result away, so
+    // the seconds are better not spent.
+    let finish: (value: unknown) => void = () => {};
+    reclaim.mockReturnValue(new Promise((r) => (finish = r)));
+
+    await renderAndScan();
+    await screen.findByTestId("disk-safe-bucket");
+    fireEvent.click(screen.getAllByRole("checkbox")[0]);
+    fireEvent.click(screen.getByRole("button", { name: "Reclaim" }));
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Scan again" })).toBeDisabled(),
+    );
+
+    await act(async () => {
+      finish({ results: [], total_freed_bytes: 0 });
+    });
+    expect(screen.getByRole("button", { name: "Scan again" })).toBeEnabled();
+  });
+
+  it("gives the unknown layer count its explanation without a hover", async () => {
+    // The tooltip portals a div with no role and no `aria-describedby`, and
+    // wrapped around children it has no focus handlers either — so without the
+    // sr-only copy "unknown" reads as a bug to everyone not using a mouse.
+    getDockerDiskUsage.mockResolvedValue(
+      report({ projects: [row({ base_lineage_known: false, snapshot_commit_layers: 17 })] }),
+    );
+    await renderAndScan();
+    const projectRow = await screen.findByTestId("disk-row-p-whp");
+    expect(projectRow.textContent).toMatch(/predates the base-image label/);
+    expect(projectRow.textContent).toMatch(/Migrating it to the current base restores the count/);
   });
 
   it("surfaces a scan failure as an alert", async () => {

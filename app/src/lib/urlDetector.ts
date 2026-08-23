@@ -45,7 +45,26 @@
  *
  * So each emitted candidate is tagged with where it came from, and the consumer
  * refuses to let a `heuristic` candidate displace an `osc8` one.
+ *
+ * ## …and the exact copy keeps winning after the prompt is gone
+ *
+ * The consumer's precedence rule only compares a new candidate against what is
+ * *currently* in the prompt slot. Empty the slot — the user dismisses the
+ * toast, or its 30 s auto-dismiss fires — and it has nothing to compare
+ * against, so the next truncated guess walks straight in. Meanwhile the OSC 8
+ * target is deduped for the life of the session and cannot come back to
+ * displace it. The user is then holding a URL that parses, points at
+ * claude.ai, and authorises nothing, which is the exact bug the OSC 8 branch
+ * was added to kill.
+ *
+ * That is fixed *here* rather than in the consumer, because this is the side
+ * that knows both halves: {@link UrlDetector} remembers every exact URL it has
+ * seen and refuses to emit a heuristic candidate that is a strict prefix of
+ * one — see `truncatesKnownExact`. The rule then holds however often the slot
+ * is emptied, and needs no cooperation from whoever owns it.
  */
+
+import { extendsUrl } from "./urlRelay";
 
 const ANSI_RE =
   /\x1b(?:\[[0-9;?]*[A-Za-z]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[()#][A-Za-z0-9]|.)/g;
@@ -196,6 +215,21 @@ export class UrlDetector {
   /** OSC 8 targets already offered, so a hyperlink repainted every frame does
    *  not re-prompt. Bounded by {@link MAX_REMEMBERED_LINKS}. */
   private emittedLinks = new Set<string>();
+  /**
+   * Every *exact* URL this session has seen — OSC 8 parameters, plus whatever
+   * the consumer reports through {@link noteExactUrl} (the OSC 7777 relay).
+   *
+   * Kept separately from `emittedLinks` because the two answer different
+   * questions: that one is "have I already prompted for this?", this one is "do
+   * I know the full text of a link some guess might be a prefix of?". The
+   * second answer must survive the prompt being dismissed; the whole defect is
+   * that a truncated guess fills the slot the moment it is empty.
+   *
+   * Bounded the same way, and cleared wholesale rather than evicted one by one:
+   * a program printing a fresh hyperlink every frame is not a program whose
+   * older links are still on screen to be mis-scraped.
+   */
+  private exactUrls = new Set<string>();
 
   constructor(callback: UrlCallback, columns: ColumnsGetter) {
     this.callback = callback;
@@ -285,7 +319,7 @@ export class UrlDetector {
 
       // 6. URL is clearly complete (more content follows) — dedup + emit
       this.pendingUrl = null;
-      if (url !== this.lastEmitted) {
+      if (url !== this.lastEmitted && !this.truncatesKnownExact(url)) {
         this.lastEmitted = url;
         this.callback(url, "heuristic");
       }
@@ -304,10 +338,23 @@ export class UrlDetector {
    * `lastEmitted` is moved along with them so an identical string arriving on
    * the heuristic path a moment later is recognised as the same candidate
    * rather than fired a second time.
+   *
+   * Every target is remembered as exact whether or not it is offered — a
+   * hyperlink repainted a second time is the same known link, and the dedup
+   * that stops it re-prompting must not also stop it counting as something a
+   * later guess can be a truncation of.
+   *
+   * The alternative fix considered here was to make this dedup *releasable*,
+   * so the consumer could hand the exact URL back and have it re-offered once
+   * the prompt slot emptied. Rejected: it re-offers on the very next repaint,
+   * so dismissing the toast would put it straight back on screen — and it
+   * still would not establish the invariant, because a truncated guess and the
+   * released exact URL would simply race for the empty slot.
    */
   private scanLinks(): void {
     for (const uri of osc8Targets(this.buffer)) {
       if (uri.length < MIN_URL_LENGTH) continue;
+      this.rememberExact(uri);
       if (this.emittedLinks.has(uri)) continue;
       if (this.emittedLinks.size >= MAX_REMEMBERED_LINKS) {
         this.emittedLinks.clear();
@@ -319,11 +366,54 @@ export class UrlDetector {
   }
 
   private emitPending(): void {
-    if (this.pendingUrl && this.pendingUrl !== this.lastEmitted) {
+    if (
+      this.pendingUrl &&
+      this.pendingUrl !== this.lastEmitted &&
+      !this.truncatesKnownExact(this.pendingUrl)
+    ) {
       this.lastEmitted = this.pendingUrl;
       this.callback(this.pendingUrl, "heuristic");
     }
     this.pendingUrl = null;
+  }
+
+  /**
+   * Whether `url` is a strict prefix of an exact URL already seen — i.e. a
+   * truncated guess at a link whose full text is known.
+   *
+   * {@link extendsUrl} is the predicate, used in the direction that asks "does
+   * the link I already have *extend* this guess?". It is the same rule the
+   * prompt slot uses to let a candidate grow into its complete form, which is
+   * the point: the two must agree about what "the same link, only shorter"
+   * means, so there is one implementation of it.
+   *
+   * Deliberately *not* symmetric. A candidate that is longer than a known exact
+   * URL and starts with it is a different problem (text glued onto the end by a
+   * wrap that was not a wrap), and it is still shown in full and confirmed by
+   * the user before anything opens.
+   */
+  private truncatesKnownExact(url: string): boolean {
+    for (const exact of this.exactUrls) {
+      if (extendsUrl(exact, url)) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Record a URL that arrived somewhere exact, outside this detector.
+   *
+   * The OSC 7777 relay hands `TerminalView` a base64-encoded URL — exact by
+   * construction, and never seen here. Without this the suppression rule above
+   * would cover hyperlinks and miss the relay, and a dismissed relay prompt
+   * could still be replaced by a truncated scrape of the same link.
+   */
+  noteExactUrl(url: string): void {
+    this.rememberExact(url);
+  }
+
+  private rememberExact(url: string): void {
+    if (this.exactUrls.size >= MAX_REMEMBERED_LINKS) this.exactUrls.clear();
+    this.exactUrls.add(url);
   }
 
   dispose(): void {

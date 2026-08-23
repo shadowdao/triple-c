@@ -1,7 +1,24 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, fireEvent, cleanup } from "@testing-library/react";
+import { render, fireEvent, cleanup, act } from "@testing-library/react";
 import TerminalView, { supersedes } from "./TerminalView";
 import { useAppState } from "../../store/appState";
+import { uploadHostFileToTerminal } from "../../lib/tauri-commands";
+
+/**
+ * The window-wide native drag-drop listener, captured at registration.
+ *
+ * Tauri routes *every* file drop to *every* listener, which is the whole reason
+ * `TerminalView` hit-tests one — so a test that wants to know what the hit test
+ * decides has to be able to fire the event itself.
+ */
+const dragDrop = vi.hoisted(() => ({
+  handler: null as null | ((event: unknown) => unknown),
+}));
+
+/** The `terminal-output-{id}` listeners, so a test can be the PTY. */
+const ptyOutput = vi.hoisted(() => ({
+  listeners: new Map<string, (e: { payload: number[] }) => void>(),
+}));
 
 /**
  * Shift+Enter has to reach the container as ESC+CR.
@@ -30,7 +47,10 @@ vi.mock("../../lib/tauri-commands", () => ({
 }));
 
 vi.mock("@tauri-apps/api/event", () => ({
-  listen: vi.fn(async () => () => {}),
+  listen: async (event: string, cb: (e: { payload: number[] }) => void) => {
+    ptyOutput.listeners.set(event, cb);
+    return () => ptyOutput.listeners.delete(event);
+  },
 }));
 
 vi.mock("@tauri-apps/plugin-opener", () => ({
@@ -38,7 +58,14 @@ vi.mock("@tauri-apps/plugin-opener", () => ({
 }));
 
 vi.mock("@tauri-apps/api/webview", () => ({
-  getCurrentWebview: () => ({ onDragDropEvent: vi.fn(async () => () => {}) }),
+  getCurrentWebview: () => ({
+    onDragDropEvent: async (cb: (event: unknown) => unknown) => {
+      dragDrop.handler = cb;
+      return () => {
+        dragDrop.handler = null;
+      };
+    },
+  }),
 }));
 
 /** jsdom has no ResizeObserver, and the mount effect installs one. */
@@ -96,6 +123,11 @@ beforeEach(() => {
     }),
   );
   terminalInput.mockClear();
+  vi.mocked(uploadHostFileToTerminal).mockClear();
+  vi.mocked(uploadHostFileToTerminal).mockResolvedValue("/workspace/api/dropped.txt");
+  dragDrop.handler = null;
+  ptyOutput.listeners.clear();
+  document.body.innerHTML = "";
   useAppState.setState({ sessions: [] });
 });
 
@@ -200,6 +232,14 @@ describe("supersedes — who owns the prompt slot", () => {
     expect(supersedes(relay(COMPLETE), guess(TRUNCATED))).toBe(true);
   });
 
+  it("refuses to let a truncated guess replace another guess it truncates", () => {
+    // The same rule one rank down. Both are scrapes of the same repainting
+    // frame, so recency says the newer one wins and recency is wrong: a
+    // repaint that lands a *shorter* view of the link already on screen is
+    // showing less of it, not something new.
+    expect(supersedes(guess(TRUNCATED), guess(COMPLETE))).toBe(false);
+  });
+
   it("lets a scraped candidate grow into the complete link", () => {
     // A repaint can land the truncated copy first. Extending it is safe: a
     // longer string with the same prefix has the same origin.
@@ -220,5 +260,164 @@ describe("supersedes — who owns the prompt slot", () => {
     expect(
       supersedes(relay("https://github.com/login/device"), relay(COMPLETE)),
     ).toBe(true);
+  });
+});
+
+describe("TerminalView — where a dropped file lands", () => {
+  /** Mount, let the async drag-drop registration settle, and give the pane a
+   *  rect — jsdom has no layout, so every element is 0×0 and would be rejected
+   *  as a hidden pane. */
+  async function mountWithLayout() {
+    const view = mountSession("bash");
+    await act(async () => {});
+    const pane = view.container.querySelector(".xterm")?.parentElement;
+    if (!pane) throw new Error("terminal host element not found");
+    pane.getBoundingClientRect = () =>
+      ({
+        left: 0,
+        top: 0,
+        right: 800,
+        bottom: 600,
+        width: 800,
+        height: 600,
+        x: 0,
+        y: 0,
+        toJSON: () => ({}),
+      }) as DOMRect;
+    return view;
+  }
+
+  async function drop(x: number, y: number) {
+    if (!dragDrop.handler) throw new Error("no drag-drop listener registered");
+    await act(async () => {
+      await dragDrop.handler!({
+        payload: { type: "drop", position: { x, y }, paths: ["/host/dropped.txt"] },
+      });
+    });
+  }
+
+  it("uploads a file dropped onto the pane", async () => {
+    await mountWithLayout();
+    await drop(400, 300);
+    expect(vi.mocked(uploadHostFileToTerminal)).toHaveBeenCalledWith(
+      "s1",
+      "/host/dropped.txt",
+    );
+  });
+
+  it("ignores a drop that lands outside the pane", async () => {
+    await mountWithLayout();
+    await drop(4000, 300);
+    expect(vi.mocked(uploadHostFileToTerminal)).not.toHaveBeenCalled();
+  });
+
+  it("ignores a drop released onto an open modal", async () => {
+    // The hit test used to be purely geometric, and a `Modal` is a
+    // `fixed inset-0 z-50` portal painted *over* the whole window — so the pane
+    // underneath still had its rect and happily uploaded the file into the
+    // directory the dialog was covering. Same for the shutdown overlay, which is
+    // up precisely while nothing should be accepting work.
+    await mountWithLayout();
+    const dialog = document.createElement("div");
+    dialog.setAttribute("role", "dialog");
+    dialog.setAttribute("aria-modal", "true");
+    document.body.appendChild(dialog);
+
+    await drop(400, 300);
+
+    expect(vi.mocked(uploadHostFileToTerminal)).not.toHaveBeenCalled();
+
+    // …and it is the modal, not the mount, that is refusing: close it and the
+    // very same drop goes through.
+    dialog.remove();
+    await drop(400, 300);
+    expect(vi.mocked(uploadHostFileToTerminal)).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("TerminalView — reaching the URL prompt without a mouse", () => {
+  // This toast is the only route to completing a sign-in started in a terminal.
+  // It used to be mouse-only: nothing moved focus to it, nothing dismissed it
+  // from the keyboard, and xterm's helper textarea eats Tab, so its buttons
+  // could not be reached at all.
+  const SIGN_IN =
+    "https://claude.ai/oauth/authorize?code=true&client_id=abc&response_type=code";
+
+  /** What `container/triple-c-open` writes to its controlling terminal. */
+  function relaySequence(url: string): number[] {
+    const payload = btoa(url);
+    return Array.from(
+      new TextEncoder().encode(`\x1b]7777;open;${payload}\x07`),
+    );
+  }
+
+  /** Mount, and let the container ask for a URL to be opened. */
+  async function mountWithPrompt() {
+    const view = mountSession("claude");
+    await act(async () => {});
+    const emit = ptyOutput.listeners.get("terminal-output-s1");
+    if (!emit) throw new Error("no terminal-output listener registered");
+    await act(async () => {
+      emit({ payload: relaySequence(SIGN_IN) });
+      // xterm parses on its own write queue.
+      await new Promise((r) => setTimeout(r, 0));
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    return view;
+  }
+
+  function primaryAction(): HTMLElement {
+    const el = document.querySelector<HTMLElement>('[data-url-toast-primary="true"]');
+    if (!el) throw new Error("toast default action not found");
+    return el;
+  }
+
+  it("does not take focus away from the terminal when the prompt appears", async () => {
+    // Deliberate: the terminal is live, and the default action opens a URL the
+    // *container* chose. A focused button is one stray Enter from doing it.
+    const { container } = await mountWithPrompt();
+    expect(document.querySelector('[data-testid="url-toast"]')).not.toBeNull();
+    expect(document.activeElement).toBe(helperTextarea(container));
+  });
+
+  it("jumps to the default action on Ctrl+Shift+O", async () => {
+    const { container } = await mountWithPrompt();
+
+    fireEvent.keyDown(helperTextarea(container), {
+      key: "O",
+      ctrlKey: true,
+      shiftKey: true,
+    });
+
+    expect(document.activeElement).toBe(primaryAction());
+  });
+
+  it("dismisses on Escape and hands focus back to the terminal", async () => {
+    // Not back to `document.body`, where the next keystroke goes nowhere.
+    const { container } = await mountWithPrompt();
+    fireEvent.keyDown(helperTextarea(container), {
+      key: "O",
+      ctrlKey: true,
+      shiftKey: true,
+    });
+
+    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
+
+    expect(document.querySelector('[data-testid="url-toast"]')).toBeNull();
+    expect(document.activeElement).toBe(helperTextarea(container));
+  });
+
+  it("leaves Ctrl+Shift+O to the terminal when there is no prompt", async () => {
+    const { container } = mountSession("claude");
+    await act(async () => {});
+    const before = document.activeElement;
+
+    fireEvent.keyDown(helperTextarea(container), {
+      key: "O",
+      ctrlKey: true,
+      shiftKey: true,
+    });
+
+    expect(document.activeElement).toBe(before);
   });
 });
