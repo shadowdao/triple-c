@@ -256,10 +256,25 @@ pub(crate) fn is_migrating(project_id: &str) -> bool {
 struct ActiveGuard(#[allow(dead_code)] crate::project_lock::ProjectGuard);
 
 impl ActiveGuard {
-    /// `None` when a migration — or anything else — already holds this project.
-    fn acquire(project_id: &str) -> Option<Self> {
+    /// `Err` with the registry's own refusal when a migration — **or anything
+    /// else** — already holds this project.
+    ///
+    /// The error string is the point. This returned `Option`, and all three
+    /// callers replaced the discarded reason with a sentence about a migration
+    /// — so a user blocked by a *compaction*, a reset or a cache clear was told
+    /// to wait for a base update that was not running, with nothing in the UI
+    /// that could ever name what actually held the project.
+    /// `project_lock::try_acquire` already composes "what holds it" with "what
+    /// you were trying to do"; there is nothing to add to it here.
+    ///
+    /// The tail it composes is `ProjectOp::Migration`'s — "…before starting a
+    /// base update" — for confirm and rollback as well as for the migration
+    /// itself. That is the class all three belong to, and splitting it would
+    /// mean a `ProjectOp` variant per command: the wrong place to encode a
+    /// verb, for a phrase that is at worst imprecise where the old one was
+    /// simply wrong.
+    fn acquire(project_id: &str) -> Result<Self, String> {
         crate::project_lock::try_acquire(project_id, crate::project_lock::ProjectOp::Migration)
-            .ok()
             .map(Self)
     }
 }
@@ -276,10 +291,9 @@ pub async fn migrate_project_to_base(
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<MigrationReport, String> {
-    let Some(_guard) = ActiveGuard::acquire(&project_id) else {
-        return Ok(MigrationReport::failed_preflight(
-            "A migration is already running for this project.",
-        ));
+    let _guard = match ActiveGuard::acquire(&project_id) {
+        Ok(guard) => guard,
+        Err(busy) => return Ok(MigrationReport::failed_preflight(&busy)),
     };
 
     let existing = migration_store::load(&project_id)?;
@@ -817,12 +831,7 @@ pub async fn confirm_migration(
     let _ = &state;
     // Confirming drops the only way back. Doing that underneath a running
     // migration would delete the pin it is relying on mid-flight.
-    let Some(_guard) = ActiveGuard::acquire(&project_id) else {
-        return Err(
-            "A container base update is running for this project right now. Wait for it to finish."
-                .to_string(),
-        );
-    };
+    let _guard = ActiveGuard::acquire(&project_id)?;
     let Some(mstate) = migration_store::load(&project_id)? else {
         return Ok(());
     };
@@ -869,12 +878,7 @@ pub async fn rollback_migration(
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let Some(_guard) = ActiveGuard::acquire(&project_id) else {
-        return Err(
-            "A container base update is running for this project right now. Wait for it to finish."
-                .to_string(),
-        );
-    };
+    let _guard = ActiveGuard::acquire(&project_id)?;
 
     let mut project = state
         .projects_store
@@ -987,7 +991,21 @@ pub async fn get_migration_state(
 pub async fn reconcile_migration(project: &Project, app_handle: &tauri::AppHandle) {
     // A migration running right now is indistinguishable from a crashed one
     // from the outside; only this process knows the difference.
-    if is_migrating(&project.id) {
+    //
+    // **Any holder, not just a migration.** This asked `is_migrating`, which is
+    // `held() == Some(Migration)` — so a compaction, a reset or a destroy
+    // holding the project made this fall straight through and start rewriting
+    // the migration record's phase and untagging its rollback image underneath
+    // whatever was running. `reconcile_project_statuses` is a command, not just
+    // a startup step, so "nothing else can be running yet" is not available as
+    // an argument.
+    if let Some(holder) = crate::project_lock::held(&project.id) {
+        log::debug!(
+            "Skipping migration reconcile for '{}' ({}): {}",
+            project.name,
+            project.id,
+            holder.describe()
+        );
         return;
     }
     let state = match migration_store::load(&project.id) {
@@ -1897,16 +1915,23 @@ mod tests {
         {
             let g = ActiveGuard::acquire(id).expect("first acquire must succeed");
             assert!(is_migrating(id));
+            let refused = ActiveGuard::acquire(id)
+                .err()
+                .expect("a second concurrent migration must be refused");
+            // The refusal has to say what is holding the project, not what the
+            // caller happens to be — the three commands used to substitute
+            // their own sentence for this and lost the distinction.
             assert!(
-                ActiveGuard::acquire(id).is_none(),
-                "a second concurrent migration must be refused"
+                refused.contains("base update"),
+                "the refusal must name the holder: {}",
+                refused
             );
             drop(g);
         }
         assert!(!is_migrating(id), "the guard must release on drop");
         // …including when the migration bailed out through an early return.
         fn early_return(id: &str) -> Option<()> {
-            let _g = ActiveGuard::acquire(id)?;
+            let _g = ActiveGuard::acquire(id).ok()?;
             None
         }
         assert!(early_return(id).is_none());
