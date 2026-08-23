@@ -431,6 +431,18 @@
   const mobileInput = document.getElementById('mobileInput');
   const btnEnter = document.getElementById('btnEnter');
   const btnNewline = document.getElementById('btnNewline');
+
+  // Whether the *active* session understands ESC+CR as "insert a newline".
+  //
+  // Only Claude Code does. `bash -l` has no readline binding for `\e\r`, so
+  // sending it there is a silent no-op — which is worse from the mobile bar
+  // than from a hardware key, because the bar puts a dedicated button on
+  // screen that appears to do nothing. The xterm key handler is already scoped
+  // this way; these two paths were not.
+  function activeSessionTakesEscCr() {
+    const s = activeSessionId && sessions[activeSessionId];
+    return !!s && s.type === 'claude';
+  }
   const btnTab = document.getElementById('btnTab');
   const btnCtrlC = document.getElementById('btnCtrlC');
   const scrollBottomBtn = document.getElementById('scrollBottomBtn');
@@ -791,6 +803,7 @@
       switchToSession(remaining[remaining.length - 1]);
     } else {
       activeSessionId = null;
+      syncNewlineButton();
       emptyState.style.display = '';
     }
   }
@@ -817,6 +830,7 @@
 
   function switchToSession(sessionId) {
     activeSessionId = sessionId;
+    syncNewlineButton();
 
     // Update tab styles
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
@@ -896,7 +910,7 @@
       // reasoning, as the terminal's own key handler above. A hardware
       // keyboard on a tablet is the only way to reach this; the phone case is
       // the dedicated newline button beside Enter.
-      sendTerminalInput(e.shiftKey ? '\x1b\r' : '\r');
+      sendTerminalInput(e.shiftKey && activeSessionTakesEscCr() ? '\x1b\r' : '\r');
     } else if (e.key === 'Tab') {
       e.preventDefault();
       sendTerminalInput('\t');
@@ -904,7 +918,27 @@
   });
 
   btnEnter.onclick = () => { sendTerminalInput('\r'); mobileInput.focus(); };
-  btnNewline.onclick = () => { sendTerminalInput('\x1b\r'); mobileInput.focus(); };
+  btnNewline.onclick = () => {
+    if (!activeSessionTakesEscCr()) { mobileInput.focus(); return; }
+    sendTerminalInput('\x1b\r');
+    mobileInput.focus();
+  };
+
+  // Keep the button's affordance honest: on a shell tab there is no byte that
+  // means "newline without running the line", so the control is disabled
+  // rather than left looking live.
+  function syncNewlineButton() {
+    const usable = activeSessionTakesEscCr();
+    btnNewline.disabled = !usable;
+    btnNewline.title = usable
+      ? 'Insert a newline without submitting (Shift+Enter)'
+      : 'Only Claude sessions support this — a shell runs the line instead';
+  }
+
+  // With no session open yet, `activeSessionTakesEscCr()` is already false —
+  // but nothing had called this, so the button rendered live before the first
+  // tab existed.
+  syncNewlineButton();
   btnTab.onclick = () => { sendTerminalInput('\t'); mobileInput.focus(); };
   btnCtrlC.onclick = () => { sendTerminalInput('\x03'); mobileInput.focus(); };
 

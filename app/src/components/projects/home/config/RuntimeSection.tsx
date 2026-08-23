@@ -109,7 +109,14 @@ export default function RuntimeSection({
 
       <ConfigGroup
         title="Claude Code settings"
-        description="Per-project CLI behaviour. Anything left on Global follows Settings; Off overrides a global On."
+        description={
+          "Per-project CLI behaviour. Anything left on Global follows Settings; " +
+          "Off overrides a global On. Turning TUI mode, Effort level or Focus mode " +
+          "back to Global needs the container's base image updated first — those " +
+          "three are cleared by removing a key, and an older image's startup script " +
+          "ignores the instruction to remove it. Update the base image from Overview " +
+          "if one of them will not switch off."
+        }
       >
         <ClaudeCodeSettingsEditor
           scope="project"

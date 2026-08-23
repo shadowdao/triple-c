@@ -1216,10 +1216,14 @@ change. Remember that a headless run cannot answer a permission prompt, so in an
 **Bypass** a task may stop early when Claude Code asks for approval; the run log records the mode
 that was used.
 
-### Creating Tasks (In the Container)
+### Creating Tasks
 
-There is no "add task" form in the app. Create tasks from a terminal in the container — either type
-the commands yourself in a **Shell** session, or just ask Claude to do it.
+The quickest route is the **New task** button on a project's **Automation** tab, which gives you a
+form for the name, the schedule and the prompt.
+
+You can also create tasks from a terminal in the container — type the commands yourself in a
+**Shell** session, or just ask Claude to do it. That is the better route when you want Claude to
+work out the schedule or the prompt for you, and it is what the rest of this section covers.
 
 ### Create a Recurring Task
 

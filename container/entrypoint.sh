@@ -491,9 +491,31 @@ if [ -f "$CLAUDE_JSON" ]; then
     # Only rewrite when the value isn't already true, to avoid a needless jq
     # reformat of ~/.claude.json on every single start.
     if ! grep -q '"shiftEnterKeyBindingInstalled"[[:space:]]*:[[:space:]]*true' "$CLAUDE_JSON" 2>/dev/null; then
+        # Write to a temp file and rename, never `> "$CLAUDE_JSON"`.
+        #
+        # `>` truncates before it writes, so a write that fails part-way — a
+        # full home volume is the obvious way, and bounding that volume is
+        # what half this release is about — leaves the file unparseable. This
+        # file holds the OAuth account, and the damage does not self-heal: the
+        # next start's `jq` fails on the corrupt file, `MERGED` is empty, and
+        # the guard below skips the write that would have repaired it. So the
+        # failure mode is a permanently lost login, for a purely cosmetic flag
+        # that suppresses a "run /terminal-setup" tip.
+        #
+        # `triple-c-task-runner` already does it this way; this block was
+        # modelled on the awsAuthRefresh one above, which has the same flaw but
+        # only fires when a Bedrock SSO command is configured.
         MERGED=$(jq '.shiftEnterKeyBindingInstalled = true' "$CLAUDE_JSON" 2>/dev/null)
         if [ -n "$MERGED" ]; then
-            printf '%s\n' "$MERGED" > "$CLAUDE_JSON"
+            CLAUDE_JSON_TMP="${CLAUDE_JSON}.triple-c-tmp"
+            if printf '%s\n' "$MERGED" > "$CLAUDE_JSON_TMP" 2>/dev/null; then
+                mv -f "$CLAUDE_JSON_TMP" "$CLAUDE_JSON" 2>/dev/null || rm -f "$CLAUDE_JSON_TMP"
+            else
+                # Out of space, or the volume went read-only. The original is
+                # untouched, which is the whole point.
+                rm -f "$CLAUDE_JSON_TMP"
+                echo "entrypoint: warning — could not set shiftEnterKeyBindingInstalled (leaving ~/.claude.json as it was)"
+            fi
         fi
     fi
 else
