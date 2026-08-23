@@ -636,11 +636,17 @@ fn require_exit_code(code: Option<i64>) -> Result<i64, String> {
 
 /// Poll `inspect_exec` until the exec reports finished and return its exit code.
 /// Returns `None` if the code can't be determined (inspect error, or the exec
-/// doesn't report finished within ~1s — which shouldn't happen once its output
+/// doesn't report finished within ~5s — which shouldn't happen once its output
 /// stream has drained).
+///
+/// The window is generous because `None` is no longer a shrug: since
+/// [`require_exit_code`], it fails the whole call. Waiting a few seconds longer
+/// for a busy daemon to settle costs nothing in the normal case — the loop exits
+/// on the first poll that reports finished — and it is the difference between a
+/// spurious "the rename failed" and a real one.
 pub async fn wait_for_exec_exit(exec_id: &str) -> Option<i64> {
     let docker = get_docker().ok()?;
-    for _ in 0..40 {
+    for _ in 0..200 {
         match docker.inspect_exec(exec_id).await {
             Ok(info) => {
                 if info.running != Some(true) {
