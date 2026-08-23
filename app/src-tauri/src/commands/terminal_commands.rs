@@ -199,8 +199,11 @@ pub async fn upload_host_file_to_terminal(
     // The drop target is a host path chosen by the webview, not by the OS drag
     // itself, so it gets the same host-read policy as the Files pane's upload:
     // absolute, no traversal, and nothing out of a hidden directory
-    // (`~/.ssh`, `~/.aws`) or a system location.
-    let host_path = crate::commands::file_commands::validate_host_read_path(&host_path)?;
+    // (`~/.ssh`, `~/.aws`) or a system location — applied to the path with its
+    // symlinks already resolved, so a visible directory that *leads* to `~/.ssh`
+    // is refused too. What comes back is that resolved path, and it is what
+    // gets opened.
+    let host_path = crate::commands::file_commands::resolve_host_read_path(&host_path).await?;
 
     let container_id = state.exec_manager.get_container_id(&session_id).await?;
 
@@ -212,8 +215,11 @@ pub async fn upload_host_file_to_terminal(
     }
 
     // Guard against ballooning host RAM: the file is packed into an in-memory
-    // tar before upload, so cap the size of a dropped file.
-    const MAX_DROP_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
+    // tar before upload, so cap the size of a dropped file. The ceiling lives
+    // with the code that does the reading, which re-applies it to the open
+    // descriptor — this check is here only so the refusal reads like a sentence
+    // instead of arriving after a 300 MB read.
+    use crate::docker::exec::MAX_DROP_BYTES;
     if meta.len() > MAX_DROP_BYTES {
         return Err(format!(
             "File too large to drop into the terminal ({:.0} MB; limit {} MB). Mount it into the project or use the Files panel instead.",
