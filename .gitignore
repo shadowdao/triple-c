@@ -10,3 +10,6 @@ code-review.md
 
 # Local bug-report screenshots, same spirit as Screenshot*.png above.
 screenshot_for_fix/
+
+# Package files pulled in by ad-hoc verification runs.
+*.deb
