@@ -52,7 +52,13 @@ export interface Project {
    *  certificate file or a directory of them). null falls back to
    *  `AppSettings.ca_cert_path`. Changing it recreates the container. */
   ca_cert_path: string | null;
-  git_token: string | null;
+  /** **Write-only.** Rust marks this `#[serde(skip_serializing)]`, so it is
+   *  absent from every project the backend hands back — reading it gives
+   *  `undefined`, never `null`. Optional here so that is the type, and so a
+   *  `=== null` test against it is a compile error rather than a branch that
+   *  silently never runs. Still sent on the way *in*: this is how the secret
+   *  is set. */
+  git_token?: string | null;
   git_user_name: string | null;
   git_user_email: string | null;
   custom_env_vars: EnvVar[];
@@ -96,11 +102,23 @@ export type BedrockAuthMethod = "static_credentials" | "profile" | "bearer_token
 export interface BedrockConfig {
   auth_method: BedrockAuthMethod;
   aws_region: string;
-  aws_access_key_id: string | null;
-  aws_secret_access_key: string | null;
-  aws_session_token: string | null;
+  /** **Write-only.** Rust marks this `#[serde(skip_serializing)]`, so it is
+   *  absent from every project the backend hands back — reading it gives
+   *  `undefined`, never `null`. Optional here so that is the type, and so a
+   *  `=== null` test against it is a compile error rather than a branch that
+   *  silently never runs. Still sent on the way *in*: this is how the secret
+   *  is set. */
+  aws_access_key_id?: string | null;
+  aws_secret_access_key?: string | null;
+  aws_session_token?: string | null;
   aws_profile: string | null;
-  aws_bearer_token: string | null;
+  /** **Write-only.** Rust marks this `#[serde(skip_serializing)]`, so it is
+   *  absent from every project the backend hands back — reading it gives
+   *  `undefined`, never `null`. Optional here so that is the type, and so a
+   *  `=== null` test against it is a compile error rather than a branch that
+   *  silently never runs. Still sent on the way *in*: this is how the secret
+   *  is set. */
+  aws_bearer_token?: string | null;
   model_id: string | null;
   disable_prompt_caching: boolean;
   service_tier: string | null;
@@ -127,7 +145,13 @@ export interface LlamaCppConfig {
  *  implement the **Anthropic** Messages API — e.g. LiteLLM. */
 export interface OpenAiCompatibleConfig {
   base_url: string;
-  api_key: string | null;
+  /** **Write-only.** Rust marks this `#[serde(skip_serializing)]`, so it is
+   *  absent from every project the backend hands back — reading it gives
+   *  `undefined`, never `null`. Optional here so that is the type, and so a
+   *  `=== null` test against it is a compile error rather than a branch that
+   *  silently never runs. Still sent on the way *in*: this is how the secret
+   *  is set. */
+  api_key?: string | null;
   model_id: string | null;
   /** See `OllamaConfig.haiku_model_id`. */
   haiku_model_id: string | null;
