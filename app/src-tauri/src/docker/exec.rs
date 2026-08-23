@@ -601,6 +601,44 @@ pub async fn exec_oneshot_as(
     exec_oneshot_inner(container_id, user, cmd, env, MAX_ONESHOT_OUTPUT).await
 }
 
+/// [`exec_oneshot_as`] with a wall-clock ceiling on the whole call.
+///
+/// H8. Nothing in this module bounds how long a container command may take,
+/// which is right for the callers that need it — a base-image migration replays
+/// `apt-get` and takes minutes — and wrong for a short command that can be made
+/// to block forever by a *file* the caller does not control. The upload
+/// reservation is the one that bit: a shell redirect onto a FIFO blocks in
+/// `open(2)` until a reader appears, so a single `mkfifo` in a project
+/// directory left the Files pane on "Uploading…" for the rest of the session
+/// with the rest of the batch abandoned.
+///
+/// So the ceiling is opt-in per call site rather than global. Note what it can
+/// and cannot do: dropping the future closes our end of the stream, but Docker
+/// has no "kill an exec" API, so a process that is genuinely wedged stays
+/// wedged in the container's process table. That is why the primitive matters
+/// more than the timeout — this turns "the app never comes back" into "that
+/// upload failed", and it is the caller's job not to run something that blocks.
+pub async fn exec_oneshot_as_within(
+    container_id: &str,
+    user: &str,
+    cmd: Vec<String>,
+    env: Vec<String>,
+    limit: std::time::Duration,
+) -> Result<(String, i64), String> {
+    match tokio::time::timeout(
+        limit,
+        exec_oneshot_inner(container_id, user, cmd, env, MAX_ONESHOT_OUTPUT),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "The container did not answer within {}s — the command may still be running inside it.",
+            limit.as_secs()
+        )),
+    }
+}
+
 /// What a one-shot exec printed, with the two streams still tellable apart.
 ///
 /// `combined` is stdout and stderr interleaved in arrival order — the shape
