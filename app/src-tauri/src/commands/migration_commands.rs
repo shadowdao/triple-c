@@ -460,6 +460,13 @@ async fn fresh_migration(
         }
     }
 
+    // Scrub *before* the stop, not inside the commit below. `scrub_writable_layer`
+    // is a `docker exec`, which only works on a running container — and the
+    // pre-swap commit is the single largest snapshot Triple-C ever takes, so
+    // letting this one path commit unscrubbed is what the scrub exists to
+    // prevent. Failure is swallowed inside; it must never block a migration.
+    docker::scrub_writable_layer(&container_id).await;
+
     emit_progress(&app_handle, &project_id, "Stopping the container...");
     let _ = state
         .projects_store

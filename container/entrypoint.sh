@@ -480,7 +480,8 @@ fi
 # already in place, so it keeps printing its "run /terminal-setup" tip. This
 # flag is what that tip is gated on: purely cosmetic, and it changes nothing
 # about how the sequence is decoded.
-CLAUDE_JSON="/home/claude/.claude.json"
+#
+# $CLAUDE_JSON is already set by the awsAuthRefresh block above.
 if [ -f "$CLAUDE_JSON" ]; then
     # Only rewrite when the value isn't already true, to avoid a needless jq
     # reformat of ~/.claude.json on every single start.

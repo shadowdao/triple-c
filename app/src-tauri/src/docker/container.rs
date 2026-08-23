@@ -2047,9 +2047,10 @@ fn parse_scrub_total(output: &str) -> Option<u64> {
 /// **Never fails the caller, by design.** A scrub is an optimisation; a commit
 /// is the only copy of the user's system layer. Losing some disk is a strictly
 /// better outcome than refusing to snapshot, so every failure here is a log
-/// line and nothing more. Note that one caller (the pre-swap commit in
-/// `migrate_project_to_base`) has already *stopped* the container, so `docker
-/// exec` legitimately fails there — that path simply commits unscrubbed.
+/// line and nothing more. Note that this is a `docker exec` and therefore only
+/// works while the container runs: `migrate_project_to_base` stops its
+/// container before the pre-swap commit, so it calls this itself beforehand
+/// rather than relying on the call inside [`commit_container_snapshot`].
 pub async fn scrub_writable_layer(container_id: &str) -> u64 {
     let script = snapshot_scrub_script();
     let cmd = vec!["/bin/sh".to_string(), "-c".to_string(), script];

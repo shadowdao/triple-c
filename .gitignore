@@ -3,3 +3,10 @@ app/dist/
 app/src-tauri/target/
 Screenshot*.png
 code-review.md
+
+# Windows NTFS alternate-data-stream artifacts, created when files arrive
+# through the WSL/host bind mount.
+*:Zone.Identifier
+
+# Local bug-report screenshots, same spirit as Screenshot*.png above.
+screenshot_for_fix/
