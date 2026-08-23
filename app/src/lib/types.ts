@@ -823,3 +823,208 @@ export interface MigrationState {
   options: MigrationOptions;
   plan: MigrationPlan | null;
 }
+
+// ---------------------------------------------------------------------------
+// Disk
+// ---------------------------------------------------------------------------
+//
+// Mirrors `app/src-tauri/src/docker/disk.rs`. Plain snake_case, like every
+// other IPC struct in this app.
+
+/** One row of the per-project disk table. */
+export interface ProjectDiskRow {
+  project_id: string;
+  project_name: string;
+  snapshot_image: string;
+  snapshot_exists: boolean;
+  /** Total size of the snapshot image, base image included. */
+  snapshot_bytes: number;
+  /** Bytes shared with another image — almost always the base. */
+  snapshot_shared_bytes: number;
+  /** Layers stacked above the base image: **one per container recreation**.
+   *  This is the number that explains why a snapshot grows — but only when
+   *  `base_lineage_known` is true. Otherwise it counts the base's layers too. */
+  snapshot_commit_layers: number;
+  /** Whether the base image this snapshot descends from could be identified.
+   *  False is the normal case for a project created before the
+   *  `triple-c.base-image-id` label existed; the layer count must not be
+   *  presented as a recreation count then. */
+  base_lineage_known: boolean;
+  /** Bytes those layers account for. `null` when the base image is gone and
+   *  the split cannot be measured — never a guess. */
+  snapshot_above_base_bytes: number | null;
+  container_exists: boolean;
+  container_running: boolean;
+  /** The writable layer, i.e. exactly what the next commit will add. */
+  container_writable_bytes: number;
+  home_volume_bytes: number;
+  home_volume_present: boolean;
+  config_volume_bytes: number;
+  config_volume_present: boolean;
+  total_bytes: number;
+  migrating: boolean;
+}
+
+export interface BaseImageRow {
+  reference: string;
+  bytes: number;
+  shared_bytes: number;
+  containers: number;
+  is_labelled_base: boolean;
+}
+
+/** Where the daemon keeps its bytes, and the Windows/WSL2 caveat if it applies.
+ *  The vhdx copy comes from Rust so the wording cannot drift from the
+ *  constants its tests pin. */
+export interface HostStorage {
+  docker_root_dir: string;
+  operating_system: string;
+  is_docker_desktop: boolean;
+  is_windows_host: boolean;
+  vhdx_applies: boolean;
+  /** Empty unless `vhdx_applies`. */
+  vhdx_note: string;
+  vhdx_fix: string[];
+  vhdx_fix_gui: string;
+}
+
+export interface BuildCacheUsage {
+  total_bytes: number;
+  reclaimable_bytes: number;
+  /** What a `--filter until=168h` prune would reach. */
+  stale_bytes: number;
+  /** `"buildx du"` or `"system df"` — `docker system df` under-reports build
+   *  cache, so which one produced the number is worth showing. */
+  source: string;
+  cli_error: string | null;
+}
+
+/** A per-project volume whose project id is not in Triple-C's project store.
+ *
+ *  **Not "a volume with no container".** From the daemon's side an idle live
+ *  project and a deleted one look identical — volumes present, no container,
+ *  nothing running — so only the project store can tell them apart. */
+export interface OrphanVolume {
+  name: string;
+  project_id: string;
+  bytes: number;
+  /** `"home"` or `"config"`. */
+  role: string;
+  /** When Docker created it. Evidence a user can recognise a project by; a
+   *  size and a UUID identify nothing. From `df()` metadata — volumes are
+   *  never mounted to inspect them, because `docker run -v` *creates* a
+   *  volume that does not exist. */
+  created_at: string | null;
+}
+
+/** The result of one Scan. Expensive to produce — see `getDockerDiskUsage`. */
+export interface DiskUsageReport {
+  scanned_at: string;
+  projects: ProjectDiskRow[];
+  base_images: BaseImageRow[];
+  base_images_bytes: number;
+  orphan_image_bytes: number;
+  orphan_image_count: number;
+  orphan_volumes: OrphanVolume[];
+  orphan_volume_bytes: number;
+  /** Why orphan detection was suppressed, when it was. */
+  orphan_volumes_unavailable: string | null;
+  build_cache: BuildCacheUsage;
+  images_total_bytes: number;
+  containers_total_bytes: number;
+  volumes_total_bytes: number;
+  triple_c_total_bytes: number;
+  host: HostStorage;
+}
+
+/** Mirrors Rust `Safety` (serde snake_case). */
+export type ReclaimSafety = "safe" | "semi_safe";
+
+/** Mirrors Rust `ReclaimTarget`, an internally tagged enum.
+ *
+ *  This type **cannot express a destructive action** — that is
+ *  `DestructiveTarget`, and the Rust `reclaim` command cannot be handed one.
+ *  The separation is structural on both sides on purpose. */
+export type ReclaimTarget =
+  | { kind: "dangling_snapshots" }
+  | { kind: "superseded_base_images" }
+  | { kind: "build_cache"; all: boolean }
+  | { kind: "migration_pins" }
+  | { kind: "migration_staging" }
+  | { kind: "probe_containers" }
+  | { kind: "scrub_containers" }
+  | { kind: "orphan_volume"; name: string }
+  | { kind: "compact_snapshot"; project_id: string }
+  | { kind: "clear_caches"; project_id: string; include_rustup: boolean };
+
+/** Mirrors Rust `DestructiveTarget`. Every one of these deletes something with
+ *  no other copy, and needs the project's name typed to confirm. */
+export type DestructiveTarget =
+  | { kind: "home_volume"; project_id: string }
+  | { kind: "config_volume"; project_id: string }
+  | { kind: "snapshot_image"; project_id: string }
+  | { kind: "rollback_pin"; project_id: string; tag: string };
+
+export interface ReclaimItem {
+  target: ReclaimTarget;
+  safety: ReclaimSafety;
+  /** Reaches beyond Triple-C's own objects — true only for the build cache,
+   *  and the UI must say so. */
+  daemon_wide: boolean;
+  label: string;
+  detail: string;
+  bytes: number;
+  /** `false` means `bytes` is a bound, not a measurement. Render it as
+   *  "up to …" — only snapshot compaction sets this. */
+  bytes_are_exact: boolean;
+  bytes_floor: number | null;
+  /** Why this cannot run right now. */
+  blocked: string | null;
+}
+
+export interface DestructiveItem {
+  target: DestructiveTarget;
+  project_id: string;
+  project_name: string;
+  label: string;
+  /** Spelled out in full — this is the confirmation copy. */
+  loses: string;
+  bytes: number;
+  blocked: string | null;
+}
+
+export interface ReclaimPlan {
+  items: ReclaimItem[];
+  /** Display only. `reclaim` cannot act on these. */
+  destructive: DestructiveItem[];
+  store_error: string | null;
+}
+
+export interface ReclaimResult {
+  /** The reclaim target this reports on, or `null` when it reports a destroy.
+   *  Exactly one of `target` / `destroyed` is ever set — a destroy used to come
+   *  back wearing a `ReclaimTarget` that named work it had not done. */
+  target: ReclaimTarget | null;
+  destroyed: DestructiveTarget | null;
+  ok: boolean;
+  freed_bytes: number;
+  /** What was projected beforehand, for the one action that projects. */
+  projected_bytes: number | null;
+  message: string;
+}
+
+export interface ReclaimOutcome {
+  results: ReclaimResult[];
+  total_freed_bytes: number;
+}
+
+/** Mirrors Rust `SnapshotSweepReport`. Note `failed` is a list of
+ *  `[reference, error]` pairs — a Rust tuple serialises as an array. */
+export interface SnapshotSweepReport {
+  removed: string[];
+  reclaimed_bytes: number;
+  /** Refused because a container is still built from them. Normal. */
+  in_use: number;
+  failed: [string, string][];
+  unavailable: string | null;
+}

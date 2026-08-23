@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, ImageUpdateInfo, FileEntry, FileContents, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, BrowserPageState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo } from "./types";
+import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, ImageUpdateInfo, FileEntry, FileContents, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, BrowserPageState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo, DiskUsageReport, ReclaimPlan, ReclaimTarget, ReclaimOutcome, ReclaimResult, DestructiveTarget, SnapshotSweepReport } from "./types";
 
 // Docker
 export const checkDocker = () => invoke<boolean>("check_docker");
@@ -356,3 +356,34 @@ export const rollbackMigration = (projectId: string) =>
  *  app crash shows up here as phase "interrupted". */
 export const getMigrationState = (projectId: string) =>
   invoke<MigrationState | null>("get_migration_state", { projectId });
+
+// Disk
+
+/** Measure where the daemon's bytes have gone.
+ *
+ *  **Expensive — keep it behind an explicit Scan button.** This is
+ *  `GET /system/df`, which walks every image, container and volume on the
+ *  daemon to compute shared-layer sizes, plus an `image_history` per image.
+ *  Seconds on a 100 GB store. Never call it on mount and never poll it. */
+export const getDockerDiskUsage = () => invoke<DiskUsageReport>("get_docker_disk_usage");
+
+/** Classify what could be reclaimed, with measured bytes. Takes the report
+ *  from `getDockerDiskUsage` so re-planning costs no second scan. */
+export const listReclaimable = (report: DiskUsageReport) =>
+  invoke<ReclaimPlan>("list_reclaimable", { report });
+
+/** Run the ticked targets. `ReclaimTarget` cannot name a destructive action,
+ *  so no selection built here can delete a live project's data. */
+export const reclaim = (targets: ReclaimTarget[]) =>
+  invoke<ReclaimOutcome>("reclaim", { targets });
+
+/** Delete one object that has no other copy. `confirmation` must be the
+ *  project's name, typed by the user. One target per call, never bulk. */
+export const destroyProjectDiskObject = (target: DestructiveTarget, confirmation: string) =>
+  invoke<ReclaimResult>("destroy_project_disk_object", { target, confirmation });
+
+/** Run the orphaned-snapshot sweep on demand and see its report — the same
+ *  sweep that runs at startup and after every recreation, whose result every
+ *  existing caller throws away. */
+export const sweepOrphanedSnapshots = () =>
+  invoke<SnapshotSweepReport>("sweep_orphaned_snapshots");
