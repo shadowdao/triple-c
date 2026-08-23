@@ -83,9 +83,9 @@ pub fn load(project_id: &str) -> Result<Option<MigrationState>, String> {
         Ok(state) => Ok(Some(state)),
         Err(e) => {
             let backup = corrupt_backup_path(&path, &chrono::Utc::now());
-            let copied = if backup.exists() {
-                // Already kept a copy of this exact corruption this second;
-                // nothing to add.
+            let copied = if backup.exists() || corrupt_backups_full(&path) {
+                // Already kept a copy of this exact corruption this second, or
+                // kept as many as are worth keeping. Either way nothing to add.
                 Ok(())
             } else {
                 fs::copy(&path, &backup).map(|_| ())
@@ -112,6 +112,50 @@ pub fn load(project_id: &str) -> Result<Option<MigrationState>, String> {
 /// the case where they were most likely to be gone.
 fn corrupt_backup_path(path: &std::path::Path, now: &chrono::DateTime<chrono::Utc>) -> PathBuf {
     path.with_extension(format!("json.corrupt-{}.bak", now.format("%Y%m%d-%H%M%S")))
+}
+
+/// How many timestamped copies of one project's corrupt record are kept.
+///
+/// Timestamping fixed the "second corruption overwrote the first" bug and
+/// introduced its opposite: [`load`] runs on every reconcile, every survey and
+/// every reaper pass, so a record that is *persistently* unparseable — the
+/// normal case, since nothing repairs it — mints a new copy every time the
+/// clock's second changes. Nothing ever reads them back and nothing ever
+/// removed them.
+///
+/// Four is enough for the only use there is: a human looking at what the file
+/// held. See [`corrupt_backups_full`] for why the cap is applied before the
+/// copy rather than by pruning after it.
+const MAX_CORRUPT_BACKUPS: usize = 4;
+
+/// Whether [`MAX_CORRUPT_BACKUPS`] copies of this record already exist.
+///
+/// Asked *before* the copy rather than pruning after it, so the cap is not
+/// implemented by writing a file and deleting it again on every pass — and so
+/// the copies that survive are the oldest, which are the ones taken closest to
+/// whatever produced the corruption.
+///
+/// A directory that cannot be listed answers "not full": failing open here
+/// costs at most one extra file, and failing closed would drop the very first
+/// copy of a record nothing else has kept.
+fn corrupt_backups_full(path: &std::path::Path) -> bool {
+    let (Some(dir), Some(stem)) = (path.parent(), path.file_stem()) else {
+        return false;
+    };
+    // `{stem}.json.corrupt-` — the same shape `corrupt_backup_path` builds, so
+    // this can never match another project's copies or an unrelated `.bak`.
+    let prefix = format!("{}.json.corrupt-", stem.to_string_lossy());
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            name.starts_with(&prefix) && name.ends_with(".bak")
+        })
+        .count()
+        >= MAX_CORRUPT_BACKUPS
 }
 
 /// Whether a project has a migration record on disk *at all*, without parsing
@@ -251,6 +295,22 @@ pub fn peek_ownerless_since(
 /// the period below what has actually elapsed on the *marker's* terms, because
 /// there is nothing to compare against but wall time; what it cannot do any
 /// more is make every pin instantly reapable, which dating from the tag did.
+///
+/// ## Why the write re-checks `has_record`
+///
+/// Both reapers ask [`has_record`] and only call this when the answer is no,
+/// which leaves a window: a [`save`] landing between the two runs its
+/// `clear_ownerless_for_project` against a marker that does not exist yet, and
+/// this then plants one — dated *now* — behind a perfectly valid record. The
+/// marker is invisible while the record stands, so nothing notices. It only
+/// matters later, if that record is legitimately lost: the pin is then already
+/// fourteen days ownerless on its very first check and is reaped with **zero**
+/// grace, which is the exact failure the tombstone exists to prevent.
+///
+/// So the write is followed by a second `has_record`, and a marker that turns
+/// out to sit behind a record is removed again. The two orderings that remain
+/// are both safe: a `save` completing *after* this re-check clears the marker
+/// itself, and one completing before it is what the re-check sees.
 pub fn note_ownerless_since(
     project_id: &str,
     tag: &str,
@@ -274,6 +334,19 @@ pub fn note_ownerless_since(
                     tag,
                     e
                 );
+                return None;
+            }
+            // A record that appeared while this was being written owns the pin,
+            // and a tombstone behind an owned pin is a fourteen-day head start
+            // on reaping it the moment that record is next lost.
+            if has_record(project_id).unwrap_or(false) {
+                log::debug!(
+                    "A migration record for {} appeared while marking {} ownerless; \
+                     the marker was dropped again",
+                    project_id,
+                    tag
+                );
+                clear_ownerless(project_id, tag);
             }
             None
         }
@@ -338,6 +411,39 @@ pub fn clear_staging(project_id: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn corrupt_copies_of_one_record_are_capped() {
+        // `load` runs on every reconcile, every survey and every reaper pass,
+        // and nothing repairs an unparseable record — so a persistently corrupt
+        // one minted a new timestamped copy every time the clock's second
+        // changed, and nothing ever removed them.
+        let dir = std::env::temp_dir().join(format!(
+            "triple-c-corrupt-cap-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let record = dir.join("some-project.json");
+
+        assert!(!corrupt_backups_full(&record), "an empty directory is not full");
+        for n in 0..MAX_CORRUPT_BACKUPS {
+            fs::write(
+                dir.join(format!("some-project.json.corrupt-2026010{}-000000.bak", n)),
+                "x",
+            )
+            .unwrap();
+        }
+        assert!(corrupt_backups_full(&record));
+
+        // Another project's copies, and an unrelated `.bak`, are not this
+        // record's — the prefix is the whole point of the naming.
+        let other = dir.join("other-project.json");
+        assert!(!corrupt_backups_full(&other));
+        fs::write(dir.join("some-project.json.bak"), "x").unwrap();
+        assert!(!corrupt_backups_full(&other));
+
+        fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn project_ids_cannot_escape_the_migrations_directory() {

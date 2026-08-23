@@ -1059,6 +1059,48 @@ pub fn confirmation_matches(expected_project_name: &str, typed: &str) -> bool {
     !expected_project_name.is_empty() && typed.trim() == expected_project_name.trim()
 }
 
+/// Longest project id this will accept. A UUID is 36 characters; the slack is
+/// for a hand-edited `projects.json`, not for anything structural.
+const PROJECT_ID_MAX_LEN: usize = 64;
+
+/// Whether a string may be interpolated into a Docker object name.
+///
+/// ## This is a path-injection guard, not a tidiness check
+///
+/// `project_id` reaches [`destroy`] as a free-form string over IPC, and the
+/// destructive paths interpolate it into `triple-c-snapshot-{id}:{tag}` — which
+/// bollard puts straight into a request path. **bollard does not percent-encode
+/// it.** `bollard::uri::Uri::parse` builds `unix://…/v1.47/images/{reference}`
+/// and then calls `Url::join(path)` on it; `path` starts with `/`, so the join
+/// *replaces* the whole path and RFC 3986 dot-segment removal is applied to the
+/// result. An id of `a/../../v1.47/volumes/{name}?` therefore turns
+/// `DELETE /v1.47/images/triple-c-snapshot-a/../../v1.47/volumes/{name}?…`
+/// into `DELETE /v1.47/volumes/{name}` — the trailing `?` swallowing the tag
+/// into a query string that bollard then overwrites with its own. Reproduced
+/// against the live daemon: it answered 204 and the volume was gone.
+///
+/// The typed confirmation is no defence, because [`confirmation_matches`]
+/// compares the caller's own two strings and an attacker-shaped id can be typed
+/// back verbatim.
+///
+/// ## Why a character class and not a UUID parse
+///
+/// Ids have been `uuid::Uuid::new_v4().to_string()` since the first commit, so
+/// a UUID parse would be correct today — and would silently strand a project
+/// whose id a user or an import tool wrote by hand. What actually has to hold
+/// is that the id cannot leave the path segment it is interpolated into, and
+/// alphanumerics plus `-`/`_` cannot: no `/`, no `.` (so no `..`), no `?`, `#`,
+/// `%`, `:` or `@`. That alphabet is also exactly what
+/// `migration_store::sanitize` leaves untouched, so an id that passes here
+/// names the same tombstone file it did before.
+pub fn is_project_id(candidate: &str) -> bool {
+    !candidate.is_empty()
+        && candidate.len() <= PROJECT_ID_MAX_LEN
+        && candidate
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 /// The Windows/WSL2 caveat, in one place so the UI and the logs cannot drift.
 ///
 /// Docker Desktop keeps the whole daemon inside `ext4.vhdx` under
@@ -1112,14 +1154,36 @@ pub fn is_docker_desktop(operating_system: &str) -> bool {
 /// volume looks unclaimed. Deleting them would take the user's credentials,
 /// transcripts and toolchains for every project they have.
 ///
-/// So an empty list is only believed when the file is *also* absent, which is
-/// the genuine fresh-install case and the one where there is nothing on the
-/// daemon to mis-attribute anyway. Anything else returns the reason, and orphan
-/// detection is suppressed rather than run optimistically.
+/// ## Why an empty list is never believed, and why the shape of the list is not
+/// the test any more
+///
+/// The old rule was "an empty list is believed when the file is *also* absent",
+/// on the reasoning that a missing file is the fresh-install case and a fresh
+/// install has nothing on the daemon to mis-attribute. Both halves were wrong:
+///
+/// * **A missing `projects.json` is not the same as a new one.** A data
+///   directory that was moved, restored from a partial backup, or reached with
+///   a different `XDG_DATA_HOME` than the one the app ran under before looks
+///   identical, and every one of those has a daemon full of live volumes behind
+///   it. And a genuinely fresh install loses nothing by being refused, because
+///   there is by definition nothing for it to find — which is what makes
+///   refusing the cheap side of the trade.
+/// * **"The list is empty" stops being true the moment anything is saved.**
+///   `ProjectsStore::new()` swallows a corrupt file into an empty list *without
+///   rewriting it*, and the next `save()` — `update_status()`, i.e. merely
+///   starting a project — writes `[{that one project}]` over it. The list is
+///   then non-empty, this guard passes, and every pre-existing project's
+///   volumes are offered as orphans. Reproduced against a byte-exact replica.
+///
+/// So the corrupt load is recorded on disk by the store itself and read back
+/// here through `corrupt_since`, rather than being inferred from a symptom that
+/// erases itself; see [`crate::storage::projects_store::corrupt_since`]. And an
+/// empty `known` set is refused unconditionally.
 pub fn project_store_trust(
     projects: &[Project],
     json_exists: bool,
     json_ids: Option<&[String]>,
+    corrupt_since: Option<&str>,
 ) -> Result<HashSet<String>, String> {
     let Some(json_ids) = json_ids else {
         return Err(
@@ -1141,19 +1205,39 @@ pub fn project_store_trust(
     let mut known: HashSet<String> = json_ids.iter().cloned().collect();
     known.extend(projects.iter().map(|p| p.id.clone()));
 
-    if known.is_empty() && json_exists {
-        return Err(
+    // **Checked before the list is looked at, because the list looks fine.**
+    // This is the state where `known` is non-empty, parses, and is still
+    // missing every project that was in the file before it stopped parsing.
+    if let Some(since) = corrupt_since {
+        return Err(format!(
+            "This data directory loaded a projects.json it could not parse ({}), so the project \
+             list here is known to be incomplete and a live project's volumes cannot be told \
+             from an orphan. A copy of the unreadable file was kept beside it as \
+             projects.json.bak. Restore it, or delete the projects.json.corrupt marker next to \
+             it to say the loss is accepted.",
+            since
+        ));
+    }
+
+    if known.is_empty() {
+        return Err(if json_exists {
             "The project list loaded empty from a projects.json that exists, which is what a \
              recovered-from-corrupt store looks like. Orphan detection is suppressed rather than \
              treat every project's volumes as unclaimed."
-                .to_string(),
-        );
+                .to_string()
+        } else {
+            "There is no projects.json in this data directory, so there is no list to tell a \
+             live project's volumes from an orphan — a moved or partially restored data \
+             directory looks exactly like a fresh install. Nothing is listed here until one \
+             exists."
+                .to_string()
+        });
     }
     Ok(known)
 }
 
-/// Re-read `projects.json` from disk: whether it exists, and the project ids it
-/// actually holds.
+/// Re-read `projects.json` from disk: whether it exists, the project ids it
+/// actually holds, and whether this data directory has ever failed to parse it.
 ///
 /// The in-memory store cannot answer either question. By the time it is
 /// consulted a corrupt file has already been swallowed into an empty list, and
@@ -1164,14 +1248,19 @@ pub fn project_store_trust(
 /// is not a string is skipped rather than failing the whole read — the file is
 /// still parseable, so the honest answer is the ids it does carry.
 ///
+/// The third element is the sticky corrupt-load marker
+/// (`projects_store::corrupt_since`), read on the same pass because a file that
+/// parses *now* says nothing about whether the ids in it are all of them.
+///
 /// Blocking `std::fs`, so every async caller goes through
 /// [`projects_json_snapshot_async`].
-fn projects_json_snapshot() -> (bool, Option<Vec<String>>) {
+fn projects_json_snapshot() -> (bool, Option<Vec<String>>, Option<String>) {
+    let corrupt_since = crate::storage::projects_store::corrupt_since();
     let Some(path) = dirs::data_dir().map(|d| d.join("triple-c").join("projects.json")) else {
-        return (false, None);
+        return (false, None, corrupt_since);
     };
     if !path.exists() {
-        return (false, Some(Vec::new()));
+        return (false, Some(Vec::new()), corrupt_since);
     }
     let parsed = std::fs::read_to_string(&path)
         .ok()
@@ -1182,7 +1271,7 @@ fn projects_json_snapshot() -> (bool, Option<Vec<String>>) {
                 .filter_map(|entry| entry.get("id")?.as_str().map(str::to_string))
                 .collect::<Vec<_>>()
         });
-    (true, parsed)
+    (true, parsed, corrupt_since)
 }
 
 /// [`projects_json_snapshot`] off the async worker.
@@ -1191,10 +1280,10 @@ fn projects_json_snapshot() -> (bool, Option<Vec<String>>) {
 /// Windows volume behind an antivirus filter blocks the whole tokio worker
 /// thread it lands on, and this one is called from inside [`scan`] — the
 /// longest-running command in the app.
-async fn projects_json_snapshot_async() -> (bool, Option<Vec<String>>) {
+async fn projects_json_snapshot_async() -> (bool, Option<Vec<String>>, Option<String>) {
     tokio::task::spawn_blocking(projects_json_snapshot)
         .await
-        .unwrap_or((false, None))
+        .unwrap_or((false, None, None))
 }
 
 // ---------------------------------------------------------------------------
@@ -1445,9 +1534,14 @@ pub async fn scan(projects: &[Project]) -> Result<DiskUsageReport, String> {
     // as exact.
     let base_images_bytes = base_images.iter().map(|b| b.bytes).sum();
 
-    let (json_exists, json_ids) = projects_json_snapshot_async().await;
+    let (json_exists, json_ids, corrupt_since) = projects_json_snapshot_async().await;
     let (orphan_volumes_list, orphan_volumes_unavailable) =
-        match project_store_trust(projects, json_exists, json_ids.as_deref()) {
+        match project_store_trust(
+            projects,
+            json_exists,
+            json_ids.as_deref(),
+            corrupt_since.as_deref(),
+        ) {
             Ok(known) => {
                 let facts: Vec<VolumeFacts> = volumes.iter().map(volume_facts).collect();
                 (orphan_volumes(&facts, &known, true), None)
@@ -2843,7 +2937,9 @@ async fn reclaim_migration_pins() -> ReclaimResult {
                 continue;
             }
             // Starts the clock when nothing has sighted this pin before, which
-            // is what makes the first pass a no-op for it.
+            // is what makes the first pass a no-op for it. The window between
+            // the `has_record` above and this write is closed inside
+            // `note_ownerless_since` — see its docs.
             let ownerless_since =
                 migration_store::note_ownerless_since(&project_id, &tag, &now);
             if pin_disposition(&tag, has_record, ownerless_since, &now) != PinDisposition::Reapable
@@ -3026,34 +3122,103 @@ async fn reclaim_containers(
     }
 }
 
-/// Remove one orphaned volume, re-checking every safety condition first.
-///
-/// The plan that offered this was computed against a `df()` from some seconds
-/// ago. A project could have been added since — by this app or by a second copy
-/// of it — and a container could have attached. So the store is re-consulted
-/// *from disk*, the name is re-parsed and the live ref count is re-read here:
-/// the typed confirmation is permission to act, not a promise that the world
-/// stood still. Both of those re-checks predate the move to the destructive
-/// path and are deliberately unchanged.
 /// Drop a rollback pin whose project is no longer in `projects.json`.
 ///
-/// The owned case ([`destroy`]'s `RollbackPin` arm) takes the project's claim
-/// and clears the ownerless marker. Neither applies here: there is no project
-/// to claim, and nothing else can be mid-operation on an id the store does not
-/// know. What *does* still apply is the tag validation — this is the one
-/// destructive variant carrying a free-form string over IPC, and `latest` would
-/// name a live snapshot rather than a pin.
+/// ## Both of its strings come from IPC, and both are checked
+///
+/// This arm is reached *because* `find_project` failed, which means
+/// `project_id` matched nothing and is an unconstrained string straight off the
+/// wire — and it was interpolated into `triple-c-snapshot-{id}:{tag}` and handed
+/// to bollard, which does not percent-encode a path. See [`is_project_id`] for
+/// the traversal that bought and the daemon transcript that confirmed it. The
+/// tag check was always here (`latest` would name the project's live snapshot);
+/// the id check is the other half of the same rule and is applied first,
+/// because a malformed id makes every later refusal message a lie about what
+/// would have been touched.
+///
+/// [`confirmation_matches`] is not a barrier for either: it compares the
+/// caller's own two strings, so a crafted id is simply typed back verbatim.
+///
+/// ## And it re-derives the reference from the daemon
+///
+/// Validation says the id *could* name a pin; it does not say one exists. So
+/// the daemon is asked for `triple-c-snapshot-*:pre-migration-*` and the
+/// reference that is actually removed is **the daemon's own string**, matched
+/// on the `(project_id, tag)` pair. Nothing built out of IPC input reaches
+/// `remove_image` at all — the same shape as [`destroy_orphan_volume`], which
+/// discards the frontend's `project_id` and re-derives it from a volume name
+/// the daemon reported.
+///
+/// ## Guards its sibling applies, that this used to skip
+///
+/// Ownership was decided from the *in-memory* project list alone, and that was
+/// the only check: no `project_store_trust`, no `has_record`, no lock. A
+/// corrupt `projects.json` makes every live project's pin look ownerless — and
+/// this arm calls `sweep_orphaned_snapshots()`, which deletes the freshly
+/// dangling image on the same pass. That was the one construction that could
+/// reap a pin whose migration is still **awaiting confirmation**, the invariant
+/// `pin_is_reapable` orders its conditions to protect. So, in order:
+///
+/// 1. The store is re-read *from disk* and put through `project_store_trust`,
+///    which refuses outright when it cannot be trusted.
+/// 2. An id the trusted store *does* know is refused: this is the ownerless
+///    path, and a pin with an owner belongs to [`destroy`]'s owned arm, which
+///    asks for the project's name rather than its id.
+/// 3. The lock is taken **before** anything is read that a decision rests on.
+///    The old comment justified returning before the lock with "nothing else
+///    can be mid-operation on an id the store does not know", which is false:
+///    a migration holds the lock under exactly the id being typed here, and it
+///    is the thing most likely to be writing the record checked next.
+/// 4. `has_record` — filesystem presence, not `load`, the same conservative
+///    question both reapers ask. A record still claims this pin.
 async fn destroy_ownerless_rollback_pin(
     project_id: &str,
     tag: &str,
+    projects: &[Project],
 ) -> Result<ReclaimResult, String> {
+    if !is_project_id(project_id) {
+        return Err(format!(
+            "{:?} is not a project id. Nothing was removed.",
+            project_id
+        ));
+    }
     if migration::parse_rollback_tag(tag).is_none() {
         return Err(format!(
             "{:?} is not a rollback pin tag. Nothing was removed.",
             tag
         ));
     }
-    let reference = format!("triple-c-snapshot-{}:{}", project_id, tag);
+
+    let (json_exists, json_ids, corrupt_since) = projects_json_snapshot_async().await;
+    let known = project_store_trust(
+        projects,
+        json_exists,
+        json_ids.as_deref(),
+        corrupt_since.as_deref(),
+    )?;
+    if known.contains(project_id) {
+        return Err(format!(
+            "Project {} is in your project list after all, so this pin is not ownerless. \
+             Reopen the disk panel and confirm it by project name instead. Nothing was removed.",
+            project_id
+        ));
+    }
+
+    let _guard =
+        crate::project_lock::try_acquire(project_id, crate::project_lock::ProjectOp::Destroy)?;
+
+    if migration_store::has_record(project_id).unwrap_or(true) {
+        return Err(format!(
+            "A migration record for {} is still on disk, so something can still ask for this \
+             rollback. Nothing was removed.",
+            project_id
+        ));
+    }
+
+    // The reference the daemon itself reports for this pin. `None` means the
+    // plan is stale — the pin was reaped or confirmed since the panel drew it.
+    let reference = live_rollback_pin_reference(project_id, tag).await?;
+
     migration::untag_image(&reference).await?;
     // The grace clock is meaningless once the tag is gone, and the marker file
     // would otherwise outlive everything that could ever read it.
@@ -3081,11 +3246,68 @@ async fn destroy_ownerless_rollback_pin(
     })
 }
 
+/// The daemon's own `repo_tag` for one rollback pin, or why it is not there.
+///
+/// The point is the *provenance* of the returned string, not the existence
+/// check: it is a tag Docker listed, so removing it cannot address anything but
+/// an image. A reference assembled here from a caller's id would be a string
+/// the daemon never vouched for, which is the whole of C-2.
+///
+/// The `reference` filter matches on `repo:tag` and is the same one every other
+/// pin path uses, so this asks for the shape `rollback_tag` produces and
+/// nothing else. The match is still made on the parsed `(project_id, tag)` pair
+/// rather than on the filter's word, because a filter is never the only guard
+/// on a removal here.
+async fn live_rollback_pin_reference(project_id: &str, tag: &str) -> Result<String, String> {
+    let docker = get_docker()?;
+    let images = docker
+        .list_images(Some(ListImagesOptions {
+            all: false,
+            filters: HashMap::from([(
+                "reference".to_string(),
+                vec!["triple-c-snapshot-*:pre-migration-*".to_string()],
+            )]),
+            ..Default::default()
+        }))
+        .await
+        .map_err(|e| format!("Could not re-check rollback pins: {}", e))?;
+
+    images
+        .iter()
+        .flat_map(|image| image.repo_tags.iter())
+        .find(|reference| {
+            migration::parse_snapshot_reference(reference)
+                .is_some_and(|(id, t)| id == project_id && t == tag)
+        })
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "There is no rollback pin {} for {} on the daemon any more. Nothing was \
+                 removed.",
+                tag, project_id
+            )
+        })
+}
+
+/// Remove one orphaned volume, re-checking every safety condition first.
+///
+/// The plan that offered this was computed against a `df()` from some seconds
+/// ago. A project could have been added since — by this app or by a second copy
+/// of it — and a container could have attached. So the store is re-consulted
+/// *from disk*, the name is re-parsed and the live ref count is re-read here:
+/// the typed confirmation is permission to act, not a promise that the world
+/// stood still. Both of those re-checks predate the move to the destructive
+/// path and are deliberately unchanged.
 async fn destroy_orphan_volume(name: &str, projects: &[Project]) -> Result<ReclaimResult, String> {
     let docker = get_docker()?;
 
-    let (json_exists, json_ids) = projects_json_snapshot_async().await;
-    let known = project_store_trust(projects, json_exists, json_ids.as_deref())?;
+    let (json_exists, json_ids, corrupt_since) = projects_json_snapshot_async().await;
+    let known = project_store_trust(
+        projects,
+        json_exists,
+        json_ids.as_deref(),
+        corrupt_since.as_deref(),
+    )?;
 
     let usage = docker
         .df()
@@ -3153,6 +3375,22 @@ pub async fn compact_snapshot(project: &Project) -> ReclaimResult {
     let target = ReclaimTarget::CompactSnapshot {
         project_id: project.id.clone(),
     };
+
+    // The same guard [`destroy`] applies, for the same reason: this resolves
+    // `triple-c-snapshot-{id}:latest`, builds `…:compacting`, names a
+    // `triple-c-compact-*` container and commits back over `:latest`. An id
+    // that cannot be safely interpolated into a Docker name is refused before
+    // any of that starts rather than at whichever step happens to notice.
+    if !is_project_id(&project.id) {
+        return failed(
+            target,
+            format!(
+                "Project {:?} has an id that is not a project id, so its snapshot cannot be \
+                 addressed safely on the daemon.",
+                project.name
+            ),
+        );
+    }
 
     // **Acquired, and held for the whole rewrite.** This is the operation the
     // per-project lock was written for. Compaction resolves
@@ -3830,15 +4068,35 @@ pub async fn destroy(
         if find_project(projects, target.project_id()).is_err() {
             if !confirmation_matches(project_id, confirmation) {
                 return Err(format!(
-                    "This pin's project is no longer in Triple-C, so there is no name to type.                      Type the project id ({}) exactly to confirm. Nothing was removed.",
+                    "This pin's project is no longer in Triple-C, so there is no name to type. \
+                     Type the project id ({}) exactly to confirm. Nothing was removed.",
                     project_id
                 ));
             }
-            return destroy_ownerless_rollback_pin(project_id, tag).await;
+            // **The in-memory list is not the ownership decision.** It is only
+            // what routes to this arm; `destroy_ownerless_rollback_pin` re-reads
+            // `projects.json` and refuses if the store cannot be trusted, or if
+            // it turns out to know this id after all.
+            return destroy_ownerless_rollback_pin(project_id, tag, projects).await;
         }
     }
 
     let project = find_project(projects, target.project_id())?;
+    // **Every arm below interpolates this id into a Docker object name** — two
+    // volume names, a snapshot reference, a rollback reference — and bollard
+    // puts those straight into a request path without encoding them. The id
+    // came from the store rather than from IPC here, which is a weaker source
+    // than it sounds: `projects.json` is a plain file a user or an import tool
+    // can write. One check in front of all four is cheaper than four, and the
+    // only thing it can refuse is a project whose id was never one this app
+    // generated. See [`is_project_id`].
+    if !is_project_id(&project.id) {
+        return Err(format!(
+            "Project {:?} has an id that is not a project id, so nothing of its can be addressed \
+             safely on the daemon. Nothing was removed.",
+            project.name
+        ));
+    }
     if !confirmation_matches(&project.name, confirmation) {
         return Err(format!(
             "Type the project name ({}) exactly to confirm. Nothing was removed.",
@@ -3941,13 +4199,19 @@ pub async fn destroy(
             Err("An orphaned volume is not a project object.".to_string())
         }
         DestructiveTarget::RollbackPin { tag, .. } => {
-            // **The one destructive variant carrying a free-form string.**
-            // Every other arm builds its target from constants; this one takes
-            // a tag over IPC and interpolates it into an image reference that
-            // is then removed. Unvalidated, `tag: "latest"` names the project's
-            // live snapshot — deleted under a dialog that says "rollback pin".
+            // **The variant carrying a free-form string.** Every other arm
+            // builds its target from constants; this one takes a tag over IPC
+            // and interpolates it into an image reference that is then removed.
+            // Unvalidated, `tag: "latest"` names the project's live snapshot —
+            // deleted under a dialog that says "rollback pin".
             // `parse_rollback_tag` accepts only `pre-migration-<YYYYmmdd-HHMMSS>`,
             // which is exactly what `rollback_tag` produces and nothing else.
+            //
+            // The *id* in the reference below is `project.id`, taken from the
+            // record `find_project` matched — not the one the caller sent. That
+            // is what makes this arm safe and is the difference from
+            // `destroy_ownerless_rollback_pin`, which has no record to match
+            // and must validate the id itself; see [`is_project_id`].
             if migration::parse_rollback_tag(tag).is_none() {
                 return Err(format!(
                     "{:?} is not a rollback pin tag. Nothing was removed.",

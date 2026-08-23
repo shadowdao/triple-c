@@ -482,7 +482,7 @@ fn project(id: &str, name: &str) -> Project {
 
 #[test]
 fn an_unreadable_projects_json_is_never_trusted() {
-    let err = project_store_trust(&[project("a", "api")], true, None).unwrap_err();
+    let err = project_store_trust(&[project("a", "api")], true, None, None).unwrap_err();
     assert!(err.contains("could not be read"), "{}", err);
 }
 
@@ -492,18 +492,53 @@ fn an_empty_list_from_an_existing_file_is_treated_as_a_failed_load() {
     // up and starts empty. That is right for the app and catastrophic here, so
     // the combination "empty list + file present" is refused rather than read as
     // "the user has no projects".
-    let err = project_store_trust(&[], true, Some(&[])).unwrap_err();
+    let err = project_store_trust(&[], true, Some(&[]), None).unwrap_err();
     assert!(err.contains("suppressed"), "{}", err);
+}
 
-    // No file at all is a genuine fresh install, and there is nothing on the
-    // daemon to mis-attribute in that state.
-    assert!(project_store_trust(&[], false, Some(&[])).unwrap().is_empty());
+#[test]
+fn a_missing_projects_json_is_not_evidence_of_a_fresh_install() {
+    // H-3: this used to return `Ok(empty)` here, on the reasoning that no file
+    // means a fresh install and a fresh install has nothing to mis-attribute.
+    // A data directory that was moved, partially restored, or reached under a
+    // different XDG_DATA_HOME is indistinguishable from that — and has a daemon
+    // full of live volumes behind it. The genuinely fresh case loses nothing by
+    // being refused, because there is nothing there for it to find.
+    let err = project_store_trust(&[], false, Some(&[]), None).unwrap_err();
+    assert!(err.contains("no projects.json"), "{}", err);
+}
+
+#[test]
+fn a_recorded_corrupt_load_is_not_undone_by_the_next_write() {
+    // H-3, the shape that made the old guard evaporate: `ProjectsStore::new()`
+    // swallows a corrupt file into an empty list *without rewriting it*, and
+    // the first `save()` after that — `update_status()`, i.e. merely starting a
+    // project — writes `[{that one project}]` over it. `known` is then
+    // non-empty and the "empty list + file present" guard passes, so every
+    // pre-existing project's volumes are offered as orphans.
+    //
+    // The store's sticky marker is what survives that write, so it is checked
+    // before the list is looked at at all.
+    let err = project_store_trust(
+        &[project("the-one-project-started-since", "api")],
+        true,
+        Some(&["the-one-project-started-since".to_string()]),
+        Some("2026-08-23T00:00:00Z"),
+    )
+    .unwrap_err();
+    assert!(err.contains("could not parse"), "{}", err);
+    assert!(
+        err.contains("projects.json.corrupt"),
+        "the refusal must name the marker the user has to delete: {}",
+        err
+    );
 }
 
 #[test]
 fn a_healthy_store_yields_its_ids() {
     let ids =
-        project_store_trust(&[project("a", "api"), project("b", "web")], true, Some(&[])).unwrap();
+        project_store_trust(&[project("a", "api"), project("b", "web")], true, Some(&[]), None)
+            .unwrap();
     assert_eq!(ids, HashSet::from(["a".to_string(), "b".to_string()]));
 }
 
@@ -518,6 +553,7 @@ fn a_project_only_the_file_knows_about_still_counts_as_live() {
         &[project("a", "api")],
         true,
         Some(&["a".to_string(), "b-from-the-other-window".to_string()]),
+        None,
     )
     .unwrap();
     assert!(
@@ -1589,6 +1625,349 @@ async fn an_ownerless_rollback_pin_still_refuses_a_tag_that_is_not_a_pin() {
     assert!(
         err.contains("not a rollback pin tag"),
         "got: {}",
+        err
+    );
+}
+
+/// The exact string that was reproduced against the live daemon: an id built to
+/// climb out of `/images/` and land on `/volumes/`, with a trailing `?` to
+/// swallow the tag into a query string bollard then overwrites with its own.
+const C2_TRAVERSAL_ID: &str = "a/../../v1.47/volumes/tcaudit-victim?";
+
+#[test]
+fn a_project_id_cannot_leave_the_path_segment_it_is_interpolated_into() {
+    // C-2. `format!("triple-c-snapshot-{}:{}", project_id, tag)` goes to
+    // bollard, which does not percent-encode: `Uri::parse` joins an absolute
+    // path onto the base URL, which *replaces* the path and applies RFC 3986
+    // dot-segment removal. Verified against the daemon: this id turned a
+    // `DELETE /v1.47/images/…` into `DELETE /v1.47/volumes/tcaudit-victim`,
+    // answered 204, and the volume was gone.
+    assert!(!is_project_id(C2_TRAVERSAL_ID));
+    // Each ingredient on its own, so a future relaxation of the alphabet has to
+    // fail here rather than only in the composed payload.
+    assert!(!is_project_id("a/b"), "a path separator escapes the segment");
+    assert!(!is_project_id(".."), "dot segments are what the join removes");
+    assert!(!is_project_id("a?x=1"), "a query terminates the path");
+    assert!(!is_project_id("a#f"), "a fragment terminates the path");
+    assert!(!is_project_id("a%2f"), "percent-encoding is decoded by the daemon");
+    assert!(!is_project_id("a:b"), "a colon would forge the tag separator");
+    assert!(!is_project_id("a b"));
+    assert!(!is_project_id(""));
+    assert!(!is_project_id(&"a".repeat(PROJECT_ID_MAX_LEN + 1)));
+
+    // The real shape has to survive untouched, or every existing pin becomes
+    // undeletable through the panel that exists to find it.
+    assert!(is_project_id("dead0000-0000-0000-0000-000000000000"));
+    assert!(is_project_id(&Project::new("api".to_string(), Vec::new()).id));
+    // And the alphabet is the one `migration_store::sanitize` leaves alone, so
+    // an id that passes here names the same tombstone file it always did.
+    assert!(is_project_id("legacy_id-2"));
+}
+
+#[tokio::test]
+async fn an_ownerless_rollback_pin_refuses_an_id_that_is_not_a_project_id() {
+    // C-2 end to end, through the public entry point. Note the confirmation:
+    // it is the crafted id typed back verbatim, which `confirmation_matches`
+    // accepts — it compares the caller's own two strings and was never a
+    // barrier here. The refusal has to come from the id check.
+    let projects: Vec<Project> = Vec::new();
+    let target = DestructiveTarget::RollbackPin {
+        project_id: C2_TRAVERSAL_ID.to_string(),
+        tag: "pre-migration-20260101-101500".to_string(),
+    };
+    let err = destroy(&target, C2_TRAVERSAL_ID, &projects)
+        .await
+        .expect_err("a traversal id must never reach the Docker API");
+    // Remove `is_project_id` from `destroy_ownerless_rollback_pin` and this is
+    // the assertion that fails: the call gets as far as the store re-read and
+    // comes back with some other refusal — or, with a store present and a
+    // daemon behind it, with a 204 and somebody's volume gone.
+    assert!(
+        err.contains("not a project id"),
+        "the id must be refused before anything else is consulted, got: {}",
+        err
+    );
+    assert!(err.contains("Nothing was removed"), "{}", err);
+}
+
+// ---------------------------------------------------------------------------
+// C-2 and H-3, against a real daemon and a real data directory
+// ---------------------------------------------------------------------------
+
+/// Serialises the tests that redirect `XDG_DATA_HOME`.
+///
+/// The process environment is process-wide and `cargo test` runs test functions
+/// on a thread pool, so two of these racing would have one reading the other's
+/// data directory. `#[ignore]` keeps them out of the default run; this keeps
+/// them out of each other's way when the whole ignored set is run at once.
+fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// H-3 as it actually unfolds, against a real `ProjectsStore` on a real disk.
+///
+/// `#[ignore]` because it redirects `XDG_DATA_HOME` for the whole process —
+/// `cargo test` has to stay free of that. Run it with
+/// `cargo test -- --ignored a_corrupt_projects_json_stays_untrusted`.
+///
+/// The sequence is the one that was reproduced against a byte-exact replica of
+/// a real data directory, and every step of it is ordinary app behaviour:
+///
+/// 1. `projects.json` holds two live projects and stops parsing.
+/// 2. `ProjectsStore::new()` backs it up, starts empty, and the app runs on.
+/// 3. The user starts a project. `update_status()` calls `save()`, which writes
+///    `[{that one project}]` over the file.
+/// 4. `projects.json` now parses and holds one id — so "the list loaded empty
+///    from a file that exists" is false, the guard passes, and both original
+///    projects' home and config volumes are offered as orphans at
+///    `Safety::Safe`.
+///
+/// Step 4 is what this asserts is no longer reachable.
+#[test]
+#[ignore]
+fn a_corrupt_projects_json_stays_untrusted_after_the_next_write() {
+    let _env = env_lock();
+    let data_home =
+        std::env::temp_dir().join(format!("triple-c-h3-{}", uuid::Uuid::new_v4().simple()));
+    let dir = data_home.join("triple-c");
+    std::fs::create_dir_all(&dir).expect("temp data dir");
+    let previous = std::env::var_os("XDG_DATA_HOME");
+    std::env::set_var("XDG_DATA_HOME", &data_home);
+
+    // 1. Two live projects, and a file that no longer parses.
+    std::fs::write(dir.join("projects.json"), "[{\"id\":\"live-a\"},{\"id\":\"liv")
+        .expect("corrupt projects.json");
+
+    // 2. The app starts and recovers.
+    let store = crate::storage::projects_store::ProjectsStore::new().expect("store");
+    assert!(store.list().is_empty(), "the corrupt file loads as an empty list");
+
+    // 3. The user adds and starts a project — the ordinary write that used to
+    //    erase the only evidence of step 1.
+    let started = store
+        .add(project("new-project-added-after-the-corruption", "api"))
+        .expect("add");
+    store
+        .update_status(&started.id, crate::models::ProjectStatus::Running)
+        .expect("update_status");
+    let rewritten = std::fs::read_to_string(dir.join("projects.json")).unwrap();
+    assert!(
+        rewritten.contains("new-project-added-after-the-corruption")
+            && !rewritten.contains("live-a"),
+        "the precondition for H-3 is that the file now parses and has lost the old ids: {}",
+        rewritten
+    );
+
+    // 4. The state the old guard could not see.
+    let (json_exists, json_ids, corrupt_since) = projects_json_snapshot();
+    assert!(json_exists);
+    assert_eq!(json_ids.as_deref().map(<[String]>::len), Some(1));
+    assert!(
+        corrupt_since.is_some(),
+        "the corrupt load must still be on the record after the rewrite"
+    );
+    let err = project_store_trust(
+        &store.list(),
+        json_exists,
+        json_ids.as_deref(),
+        corrupt_since.as_deref(),
+    )
+    .unwrap_err();
+    assert!(err.contains("could not parse"), "{}", err);
+
+    // And the consequence: `live-a`'s volumes are not offered to anyone.
+    let volumes = vec![VolumeFacts {
+        name: "triple-c-home-live-a".to_string(),
+        bytes: 8_000_000_000,
+        links: 0,
+        created_at: None,
+    }];
+    assert!(
+        orphan_volumes(&volumes, &HashSet::new(), false).is_empty(),
+        "a suppressed store must offer nothing"
+    );
+
+    std::fs::remove_dir_all(&data_home).ok();
+    match previous {
+        Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+        None => std::env::remove_var("XDG_DATA_HOME"),
+    }
+}
+
+/// The traversal, run for real, plus the legitimate case it must not break.
+///
+/// `#[ignore]` for the same reason as the compaction test: `cargo test` has to
+/// stay daemon-free. Run it with
+/// `cargo test -- --ignored a_traversal_project_id_cannot_reach_the_docker_api`.
+///
+/// It exists because the unit test above can only assert a *message*. The thing
+/// that made C-2 critical is not that a string was unvalidated, it is that the
+/// daemon honoured what the string turned the request into — and no pure test
+/// can show that. This one creates a volume, points a rollback-pin removal at
+/// it through `destroy`, and checks the volume is still there afterwards.
+///
+/// It also does the other half, which is the half a validator can easily break:
+/// a genuinely ownerless pin still has to be removable, or the panel that
+/// exists to find multi-gigabyte orphans can no longer act on them.
+///
+/// `XDG_DATA_HOME` is redirected for the duration so the store re-read, the
+/// migration records and the ownerless tombstones all land in a temp directory
+/// rather than the developer's real one.
+#[tokio::test]
+#[ignore]
+async fn a_traversal_project_id_cannot_reach_the_docker_api() {
+    let _env = env_lock();
+    let run = uuid::Uuid::new_v4().simple().to_string();
+    let data_home = std::env::temp_dir().join(format!("triple-c-c2-{}", run));
+    std::fs::create_dir_all(data_home.join("triple-c")).expect("temp data dir");
+    // A store that parses and knows about *some other* project, so
+    // `project_store_trust` is satisfied and the id under test is genuinely not
+    // in it. `projects_json_snapshot` reads ids as opaque JSON strings.
+    std::fs::write(
+        data_home.join("triple-c").join("projects.json"),
+        r#"[{"id":"c2-some-other-project"}]"#,
+    )
+    .expect("temp projects.json");
+    let previous_data_home = std::env::var_os("XDG_DATA_HOME");
+    std::env::set_var("XDG_DATA_HOME", &data_home);
+
+    let docker = get_docker().expect("a daemon");
+
+    // ---- 1. The attack -----------------------------------------------------
+    let victim = format!("triple-c-c2-victim-{}", run);
+    docker
+        .create_volume(bollard::volume::CreateVolumeOptions {
+            name: victim.clone(),
+            ..Default::default()
+        })
+        .await
+        .expect("create the victim volume");
+
+    // `a/` gives the join something to climb out of; the two `..` segments eat
+    // `triple-c-snapshot-a` and `images`; the trailing `?` turns `:{tag}` into
+    // a query string, which bollard then replaces with `force`/`noprune`.
+    let traversal_id = format!("a/../../v1.47/volumes/{}?", victim);
+    let target = DestructiveTarget::RollbackPin {
+        project_id: traversal_id.clone(),
+        tag: "pre-migration-20250101-000000".to_string(),
+    };
+    // The confirmation is the crafted id itself — which is exactly why the
+    // typed confirmation was never a defence here.
+    let err = destroy(&target, &traversal_id, &[])
+        .await
+        .expect_err("a traversal id must be refused");
+    assert!(err.contains("not a project id"), "got: {}", err);
+    assert!(
+        docker.inspect_volume(&victim).await.is_ok(),
+        "the volume was deleted by an image-tag removal — C-2 is not fixed"
+    );
+
+    // ---- 2. The legitimate case, which must still work ---------------------
+    let orphan_id = uuid::Uuid::new_v4().to_string();
+    let tag = "pre-migration-20250101-000000";
+    let pin = format!("triple-c-snapshot-{}:{}", orphan_id, tag);
+    // Deliberately *not* labelled `triple-c.managed`: this test's leftovers
+    // must never be something `sweep_orphaned_snapshots` can act on, and the
+    // sweep is called on the success path.
+    build_from_dockerfile("FROM busybox:1.36
+RUN touch /c2-pin
+", &pin)
+        .await
+        .expect("build the pin image");
+
+    let result = destroy(
+        &DestructiveTarget::RollbackPin {
+            project_id: orphan_id.clone(),
+            tag: tag.to_string(),
+        },
+        &orphan_id,
+        &[],
+    )
+    .await
+    .expect("a well-formed ownerless pin must still be removable");
+    assert!(result.ok, "{}", result.message);
+    assert!(
+        docker.inspect_image(&pin).await.is_err(),
+        "the pin tag survived the removal that reported success"
+    );
+
+    // ---- cleanup -----------------------------------------------------------
+    let _ = docker.remove_volume(&victim, None).await;
+    let _ = docker
+        .remove_image(
+            &pin,
+            Some(RemoveImageOptions {
+                force: true,
+                noprune: false,
+            }),
+            None,
+        )
+        .await;
+    let _ = std::fs::remove_dir_all(&data_home);
+    match previous_data_home {
+        Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+        None => std::env::remove_var("XDG_DATA_HOME"),
+    }
+}
+
+#[tokio::test]
+async fn an_owned_target_is_refused_when_the_stored_id_is_not_a_project_id() {
+    // The owned arms take their id from the record `find_project` matched
+    // rather than from IPC — which is a weaker source than it sounds, because
+    // `projects.json` is a plain file. All four of them (two volume names, the
+    // snapshot reference, the rollback reference) go on to be interpolated into
+    // a Docker request path, so one check stands in front of all four.
+    let mut bad = project(C2_TRAVERSAL_ID, "api");
+    bad.name = "api".to_string();
+    let projects = vec![bad];
+    for target in [
+        DestructiveTarget::HomeVolume {
+            project_id: C2_TRAVERSAL_ID.to_string(),
+        },
+        DestructiveTarget::SnapshotImage {
+            project_id: C2_TRAVERSAL_ID.to_string(),
+        },
+        DestructiveTarget::RollbackPin {
+            project_id: C2_TRAVERSAL_ID.to_string(),
+            tag: "pre-migration-20260101-101500".to_string(),
+        },
+    ] {
+        let err = destroy(&target, "api", &projects)
+            .await
+            .expect_err("a stored id that is not a project id must be refused");
+        assert!(err.contains("not a project id"), "{:?}: {}", target, err);
+        // And before the confirmation is even compared, so the refusal cannot
+        // be walked past by typing the right name.
+        assert!(err.contains("Nothing was removed"), "{}", err);
+    }
+}
+
+#[tokio::test]
+async fn the_ownerless_arm_will_not_touch_a_pin_the_store_still_claims() {
+    // H-1. Ownership was decided from the in-memory list alone, and this arm
+    // then calls `sweep_orphaned_snapshots()`, which deletes the freshly
+    // dangling image on the same pass — so a `projects.json` that failed to
+    // load made every live project's pin "ownerless", including one whose
+    // migration is still awaiting confirmation. The re-read is the fix; here it
+    // is the union with the in-memory list that carries the id.
+    //
+    // Called directly rather than through `destroy`, because `destroy` routes
+    // by the in-memory list and a project that is *in* it never reaches this
+    // arm. The point is that the arm refuses on its own account.
+    let projects = vec![project("dead0000-0000-0000-0000-000000000000", "api")];
+    let err = destroy_ownerless_rollback_pin(
+        "dead0000-0000-0000-0000-000000000000",
+        "pre-migration-20260101-101500",
+        &projects,
+    )
+    .await
+    .expect_err("a pin whose project the store knows is not ownerless");
+    assert!(
+        err.contains("not ownerless"),
+        "the store's answer must override the caller's, got: {}",
         err
     );
 }

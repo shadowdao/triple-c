@@ -1233,6 +1233,14 @@ pub async fn reap_stale_migration_pins() -> usize {
             }
             // Records the first sighting when there is none, which is why this
             // returns `None` on that pass and the pin survives it.
+            //
+            // A `save` can land between the `has_record` above and this write,
+            // which would plant a tombstone dated *now* behind a perfectly
+            // valid record — invisible until that record is legitimately lost,
+            // at which point the pin is already past its grace period and is
+            // reaped on the first check. `note_ownerless_since` re-asks
+            // `has_record` after the write and removes the marker again; the
+            // reasoning for why that closes the window is on it.
             let ownerless_since =
                 crate::storage::migration_store::note_ownerless_since(&project_id, &tag, &now);
             if !pin_is_reapable(&tag, has_record, ownerless_since, &now) {
