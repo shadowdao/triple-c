@@ -105,6 +105,85 @@ pub(crate) fn load_secrets_for_project(project: &mut Project) {
     }
 }
 
+/// Validate the folder list a project is about to be stored with.
+///
+/// ## Why this is not cosmetic
+///
+/// `mount_name` is interpolated straight into a container mount target —
+/// `docker::create_container` builds `/workspace/{mount_name}` — and the daemon
+/// **normalises** what it is given. Confirmed against Engine 29.7 through the
+/// same API bollard uses: a mount named `../tmp/claude-x` is created with a
+/// destination of `/tmp/claude-x`, i.e. the host directory is mounted straight
+/// on top of one of the paths the pre-commit scrub owns. The next recreate then
+/// runs the scrub, as root, over the user's own project directory. That is the
+/// C1 data-loss chain end to end, and the character check is the half of it
+/// that stops the path ever being spelled.
+///
+/// `..` on its own passes a check for "alphanumeric, dash, underscore or dot",
+/// which is why it is called out separately: it is the only single component
+/// that walks *up*, and `/workspace/..` is `/`.
+///
+/// `host_path` is the other side of the same mount. `/` there bind-mounts the
+/// entire host filesystem read-write into a container whose agent has
+/// passwordless sudo. Anything short of a filesystem root is the user choosing
+/// a folder — the Browse button and the free-text field lead to the same place
+/// — so only the roots themselves are refused.
+fn validate_project_paths(paths: &[ProjectPath]) -> Result<(), String> {
+    let mut seen_names = std::collections::HashSet::new();
+    for p in paths {
+        // The Config tab's "+ Add folder" inserts an empty row and saves the
+        // whole list on the next blur, so a wholly blank entry is the UI's
+        // placeholder rather than an attempt at anything. It is stored as it
+        // always was; a half-filled one is refused.
+        if p.host_path.is_empty() && p.mount_name.is_empty() {
+            continue;
+        }
+        if p.mount_name.is_empty() {
+            return Err("Mount name cannot be empty.".to_string());
+        }
+        if !p.mount_name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.') {
+            return Err(format!("Mount name '{}' contains invalid characters. Use alphanumeric, dash, underscore, or dot.", p.mount_name));
+        }
+        if p.mount_name.chars().all(|c| c == '.') {
+            return Err(format!(
+                "Mount name '{}' is not a folder name — it names the directory the mount would sit in.",
+                p.mount_name
+            ));
+        }
+        if p.host_path.is_empty() {
+            return Err(format!(
+                "Folder mounted at '/workspace/{}' has no host path.",
+                p.mount_name
+            ));
+        }
+        if is_filesystem_root(&p.host_path) {
+            return Err(format!(
+                "'{}' is a filesystem root. Choose the project folder itself — mounting the whole drive gives the container everything on it.",
+                p.host_path
+            ));
+        }
+        if !seen_names.insert(p.mount_name.clone()) {
+            return Err(format!("Duplicate mount name '{}'.", p.mount_name));
+        }
+    }
+    Ok(())
+}
+
+/// Whether a host path is the root of a filesystem, in any spelling the three
+/// desktop platforms produce: `/`, a Windows drive root, or a bare UNC/share
+/// prefix. Trailing separators are ignored, so `C:\\` and `C:/` are the same
+/// answer.
+fn is_filesystem_root(host_path: &str) -> bool {
+    let trimmed = host_path.trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() {
+        // Nothing but separators: `/`, `\\`, `//`.
+        return true;
+    }
+    // `C:` — a drive with no path on it.
+    let bytes = trimmed.as_bytes();
+    bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
 #[tauri::command]
 pub async fn list_projects(state: State<'_, AppState>) -> Result<Vec<Project>, String> {
     Ok(state.projects_store.list())
@@ -117,21 +196,16 @@ pub async fn add_project(
     state: State<'_, AppState>,
 ) -> Result<Project, String> {
     // Validate paths
-    if paths.is_empty() {
+    // A new project needs a folder; the blank row `validate_project_paths`
+    // tolerates is the Config tab's placeholder on an *existing* one.
+    if paths.is_empty()
+        || paths
+            .iter()
+            .all(|p| p.host_path.is_empty() && p.mount_name.is_empty())
+    {
         return Err("At least one folder path is required.".to_string());
     }
-    let mut seen_names = std::collections::HashSet::new();
-    for p in &paths {
-        if p.mount_name.is_empty() {
-            return Err("Mount name cannot be empty.".to_string());
-        }
-        if !p.mount_name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.') {
-            return Err(format!("Mount name '{}' contains invalid characters. Use alphanumeric, dash, underscore, or dot.", p.mount_name));
-        }
-        if !seen_names.insert(p.mount_name.clone()) {
-            return Err(format!("Duplicate mount name '{}'.", p.mount_name));
-        }
-    }
+    validate_project_paths(&paths)?;
     let project = Project::new(name, paths);
     store_secrets_for_project(&project)?;
     state.projects_store.add(project)
@@ -142,6 +216,22 @@ pub async fn remove_project(
     project_id: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    // **H-2: the only writer of these three categories that held nothing.**
+    // This purges migration artifacts, removes `triple-c-snapshot-{id}` and
+    // both named volumes — and a compaction resolves that same tag when its
+    // build starts and commits back over it minutes later. Compact a project,
+    // then remove it from the sidebar, and `restore_image_config` commits a
+    // flat image back onto `triple-c-snapshot-{id}:latest` for a project that
+    // no longer exists: not dangling, not a `:pre-migration-*` tag, and not
+    // reachable by the per-project scan, so no reclaim path can ever see it
+    // again. Taken for the whole removal, like every other writer.
+    //
+    // Refusing is safe for the UI: `useProjects.remove` only drops the sidebar
+    // row *after* the command resolves, and `ProjectHome` turns the rejection
+    // into a toast, so the row stays and the message names what is running.
+    let _guard =
+        crate::project_lock::try_acquire(&project_id, crate::project_lock::ProjectOp::Destroy)?;
+
     // Release any host loopback ports the auth bridge holds for this project
     // before the container (and the project record) go away.
     state.auth_bridge.stop(&project_id).await;
@@ -183,10 +273,43 @@ pub async fn remove_project(
 
 #[tauri::command]
 pub async fn update_project(
-    project: Project,
+    mut project: Project,
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Project, String> {
+    // **This takes a whole `Project` over IPC and used to store it verbatim.**
+    // `add_project` validated its folder list and this did not, so every check
+    // there was one edit away from being bypassed — and the Config tab's mount
+    // name is a free-text field on an existing project, saved on blur, calling
+    // exactly this command. See [`validate_project_paths`] for what a mount
+    // name of `../tmp/claude-x` does to the user's files.
+    validate_project_paths(&project.paths)?;
+
+    // Fields this command does not get to write, whoever is calling it.
+    //
+    // `container_id` is the one that matters: it is the handle the whole file
+    // command surface resolves against, `list_sibling_containers` hands the
+    // webview the ids of every other container on the daemon, and a project
+    // save is not the place a container is adopted. It is assigned by
+    // `start_project_container` through `projects_store::set_container_id` and
+    // read back here. `status` has its own setter (`update_status`) for the
+    // same reason, and neither `id` nor `created_at` is a thing a save can
+    // mean to change.
+    //
+    // The privileged *toggles* — `allow_docker_access`, `vpn_support_enabled`,
+    // `sandbox_mode_enabled`, `permission_mode` — are deliberately not in this
+    // list: they are what the Config tab's own switches write, through this
+    // command, and there is nothing here that can tell that call apart from
+    // any other. Their boundary is the webview, not this function.
+    let stored = state
+        .projects_store
+        .get(&project.id)
+        .ok_or_else(|| format!("Project {} not found", project.id))?;
+    project.container_id = stored.container_id;
+    project.status = stored.status;
+    project.created_at = stored.created_at;
+    project.updated_at = chrono::Utc::now().to_rfc3339();
+
     store_secrets_for_project(&project)?;
     let updated = state.projects_store.update(project)?;
 
@@ -737,5 +860,80 @@ fn default_docker_socket() -> String {
         "//./pipe/docker_engine".to_string()
     } else {
         "/var/run/docker.sock".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn path(host: &str, mount: &str) -> ProjectPath {
+        ProjectPath {
+            host_path: host.to_string(),
+            mount_name: mount.to_string(),
+        }
+    }
+
+    /// The mount name that reaches the scrub. `docker::create_container` builds
+    /// `/workspace/{mount_name}`, and the daemon normalises `..` out of it —
+    /// verified against Engine 29.7, where a mount created with a target of
+    /// `/workspace/../tmp/claude-x` is reported by `inspect` as `/tmp/claude-x`.
+    #[test]
+    fn a_mount_name_cannot_walk_out_of_workspace() {
+        for escape in ["..", "../tmp/claude-x", "../../etc", "/tmp/claude-x", "a/../.."] {
+            assert!(
+                validate_project_paths(&[path("/home/u/project", escape)]).is_err(),
+                "mount name '{}' was accepted, which puts the host folder somewhere \
+                 /workspace/{{name}} does not reach",
+                escape
+            );
+        }
+        // The dotted names that are *not* a traversal stay usable.
+        for ok in ["my.project", ".hidden", "a.b-c_d", "workspace2"] {
+            assert!(
+                validate_project_paths(&[path("/home/u/project", ok)]).is_ok(),
+                "mount name '{}' should be usable",
+                ok
+            );
+        }
+    }
+
+    #[test]
+    fn the_whole_host_filesystem_cannot_be_mounted() {
+        // A read-write bind of `/` into a container whose agent has
+        // passwordless sudo.
+        for root in ["/", "//", "\\", "C:\\", "c:/", "D:"] {
+            assert!(
+                validate_project_paths(&[path(root, "everything")]).is_err(),
+                "host path '{}' was accepted as a project folder",
+                root
+            );
+        }
+        assert!(validate_project_paths(&[path("/home/u/project", "project")]).is_ok());
+        assert!(validate_project_paths(&[path("C:\\Users\\u\\project", "project")]).is_ok());
+    }
+
+    #[test]
+    fn duplicate_and_half_filled_rows_are_refused_but_the_blank_row_is_not() {
+        assert!(validate_project_paths(&[
+            path("/home/u/a", "same"),
+            path("/home/u/b", "same"),
+        ])
+        .is_err());
+        assert!(validate_project_paths(&[path("/home/u/a", "")]).is_err());
+        assert!(validate_project_paths(&[path("", "a")]).is_err());
+        // "+ Add folder" inserts this and the next blur saves the whole list;
+        // refusing it would turn an empty row into an error toast.
+        assert!(validate_project_paths(&[path("/home/u/a", "a"), path("", "")]).is_ok());
+    }
+
+    #[test]
+    fn add_and_update_cannot_disagree_about_what_a_folder_list_may_contain() {
+        // `update_project` used to validate nothing at all, so every rule in
+        // `add_project` was one save-on-blur away from being bypassed. Both go
+        // through the same function now; this fails if either grows its own
+        // copy.
+        let bad = [path("/home/u/project", "../tmp/claude-x")];
+        assert!(validate_project_paths(&bad).is_err());
     }
 }
