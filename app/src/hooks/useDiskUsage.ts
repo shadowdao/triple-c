@@ -63,13 +63,25 @@ export interface DiskUsageState {
   outcome: ReclaimOutcome | null;
   scan: () => Promise<void>;
   /**
-   * Resolves `true` when the call came back, `false` when it threw and the
-   * failure went into `error`. Callers that dismiss UI on completion — the
-   * confirmation dialogs — must only dismiss on `true`, or the failure is left
-   * with nowhere on screen the user is looking.
+   * Resolves `true` only when the work actually happened.
+   *
+   * Two different failures reach here and both have to answer `false`. One is
+   * the call throwing, which lands in `error`. The other is the backend coming
+   * back inside `Ok` with a *refusal* — `reclaim` reports per-target results,
+   * and a compaction declined because the project is busy is a `ReclaimResult`
+   * with `ok: false` and a sentence saying why. Reading only "did it throw"
+   * treated that refusal as a success: the confirmation dialog closed, the plan
+   * was dropped, and the explanation appeared in the outcome panel several
+   * screens above the row the user had clicked.
+   *
+   * Callers that dismiss UI on completion — the confirmation dialogs — must
+   * only dismiss on `true`, and take the wording from `outcome`'s per-result
+   * `message` rather than writing their own: the backend's sentence is the one
+   * that names the real blocker.
    */
   runReclaim: (targets: ReclaimTarget[]) => Promise<boolean>;
-  /** Same contract as `runReclaim`: `false` means it failed and `error` says how. */
+  /** Same contract as `runReclaim`: `false` means it did not happen, and either
+   *  `error` or the outcome's `message` says why. */
   destroy: (target: DestructiveTarget, confirmation: string) => Promise<boolean>;
   /** Run the orphaned-snapshot sweep and report what it found *and refused*. */
   runSweep: () => Promise<void>;
@@ -153,8 +165,15 @@ export function useDiskUsage(): DiskUsageState {
         // Deliberately no automatic re-scan: it costs another `df()`, and the
         // outcome already reports measured bytes for every target — a user who
         // wants the new totals asks for them.
-        setPlan(null);
-        return true;
+        //
+        // The exception is a call that removed *nothing at all* because every
+        // target was refused: those objects are all still there, so the plan
+        // still describes the daemon accurately and taking it away would leave
+        // the user re-scanning to get back a list that never went stale.
+        const everythingRefused =
+          result.results.length > 0 && result.results.every((r) => !r.ok);
+        if (!everythingRefused) setPlan(null);
+        return result.results.every((r) => r.ok);
       } catch (e) {
         setError(String(e));
         return false;
@@ -173,10 +192,11 @@ export function useDiskUsage(): DiskUsageState {
       try {
         const result = await commands.destroyProjectDiskObject(target, confirmation);
         setOutcome({ results: [result], total_freed_bytes: result.freed_bytes });
-        // Same reasoning as `runReclaim`: the destructive list named an object
-        // that is now gone.
-        setPlan(null);
-        return true;
+        // Same reasoning as `runReclaim`, refusal included: the destructive
+        // list named an object that is now gone — unless the backend declined,
+        // in which case it is still there and so is the row for it.
+        if (result.ok) setPlan(null);
+        return result.ok;
       } catch (e) {
         setError(String(e));
         return false;

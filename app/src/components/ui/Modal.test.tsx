@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, act } from "@testing-library/react";
 import Modal from "./Modal";
+import { PaneVisibilityProvider } from "./PaneVisibility";
+import { dropIsBlocked } from "../../lib/dropTarget";
 
 /**
  * Modal focuses asynchronously via rAF so the panel is laid out first; jsdom
@@ -100,6 +102,64 @@ describe("Modal", () => {
     fireEvent.click(overlay!);
     expect(onClose).toHaveBeenCalledTimes(2);
     expect(container).toBeTruthy();
+  });
+
+  // -------------------------------------------------------------------------
+  // Stepping aside with the pane that owns it
+  // -------------------------------------------------------------------------
+
+  it("marks its backdrop as swallowing native file drops", async () => {
+    // The backdrop, not the panel, is what `elementFromPoint` returns for a
+    // drop released beside the dialog — so it is the element that has to carry
+    // the marker `lib/dropTarget` looks for.
+    render(
+      <Modal title="Reset" onClose={vi.fn()}>
+        <p>body</p>
+      </Modal>,
+    );
+    const backdrop = document.querySelector(".fixed.inset-0");
+    expect(backdrop).toHaveAttribute("data-blocks-drop", "true");
+    expect(dropIsBlocked()).toBe(true);
+  });
+
+  it("paints nothing, traps nothing and blocks no drop while its pane is hidden", async () => {
+    // A dialog portals to `document.body`, where the `hidden` class its pane
+    // uses to step aside for another tab cannot reach it. Left to itself it
+    // stayed on screen over the tab the user switched to, kept its Escape
+    // binding, and refused every native file drop in the window.
+    const onClose = vi.fn();
+    const { rerender } = render(
+      <PaneVisibilityProvider visible={false}>
+        <Modal title="Reset" onClose={onClose}>
+          <button>Confirm</button>
+        </Modal>
+      </PaneVisibilityProvider>,
+    );
+    await flushFocus();
+
+    const backdrop = document.querySelector(".fixed.inset-0") as HTMLElement;
+    expect(backdrop.hidden).toBe(true);
+    expect(backdrop.style.display).toBe("none");
+    expect(dropIsBlocked()).toBe(false);
+    expect(backdrop.contains(document.activeElement)).toBe(false);
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(onClose).not.toHaveBeenCalled();
+
+    // Back on screen: the same dialog, still mounted, resumes everything.
+    rerender(
+      <PaneVisibilityProvider visible={true}>
+        <Modal title="Reset" onClose={onClose}>
+          <button>Confirm</button>
+        </Modal>
+      </PaneVisibilityProvider>,
+    );
+    await flushFocus();
+    expect(backdrop.hidden).toBe(false);
+    expect(dropIsBlocked()).toBe(true);
+    expect(screen.getByRole("dialog").contains(document.activeElement)).toBe(true);
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(onClose).toHaveBeenCalledTimes(1);
   });
 
   it("ignores Escape and overlay clicks when not dismissible", async () => {

@@ -25,6 +25,26 @@
  * a `#[derive(Serialize)]` error enum, or an `Error` if a JS layer wrapped it
  * on the way through. All three are the same refusal, and the UI must not
  * behave differently depending on which one a future refactor produces.
+ *
+ * **Tolerant about shape is not the same as tolerant about content.** This
+ * used to normalise the whole error (lower-case, `_`/`-` stripped) and ask
+ * whether `fileexists` appeared *anywhere* in it — which a host file named
+ * `file-exists.txt` satisfies on its way through any error at all. Uploading
+ * that file and hitting "permission denied" therefore raised the overwrite
+ * prompt, and answering Replace re-invoked the upload with `overwrite: true`:
+ * an unrelated failure silently promoted into an overwrite of whatever shared
+ * the name in the container. So the marker now has to appear in a form a
+ * *filename* cannot produce:
+ *
+ * - in prose, the canonical `FILE_EXISTS` (or `FILE-EXISTS`) in upper case,
+ *   standing alone — end of string, or followed by the `:`/`=` of the agreed
+ *   `FILE_EXISTS: <path>` form. `file-exists.txt`, `FILE_EXISTS.txt` and
+ *   `/workspace/FILE_EXISTS` all fail that, because a filename brings its own
+ *   extension, quote or path separator along with it.
+ * - in a discriminant field, the *whole* value, case- and separator-insensitive
+ *   (`FileExists`, `file_exists`, `file-exists`, `FileExistsError`) — a
+ *   discriminant is a variant name, not a sentence, so equality is the right
+ *   test and a filename never gets to be one.
  */
 
 /** Marker the backend puts in the error for "a file with this name is already there". */
@@ -47,6 +67,26 @@ function normaliseKind(value: string): string {
 
 const KIND_NEEDLE = normaliseKind(FILE_EXISTS_MARKER);
 
+/**
+ * The marker standing on its own inside a sentence.
+ *
+ * Derived from `FILE_EXISTS_MARKER` so the two cannot drift. Upper case is
+ * load-bearing (a lower-case `file-exists` is a plausible filename, the
+ * upper-case token is not), and so is the lookahead: the marker must end the
+ * string or be followed by the `:`/`=` that introduces the path. That is what
+ * a path or a filename cannot forge — `FILE_EXISTS.txt`, `"FILE_EXISTS"` and
+ * `/workspace/FILE_EXISTS` are each rejected by one end or the other.
+ */
+const PROSE_MARKER = new RegExp(
+  `(?:^|[\\s:;(\\[{"'\`])${FILE_EXISTS_MARKER.replace(/_/g, "[_-]")}(?=$|[\\s:=])`,
+);
+
+/** A discriminant *is* the refusal, rather than mentioning it. */
+function isFileExistsDiscriminant(value: string): boolean {
+  const normalised = normaliseKind(value);
+  return normalised === KIND_NEEDLE || normalised === `${KIND_NEEDLE}error`;
+}
+
 function asRecord(e: unknown): Record<string, unknown> | null {
   return typeof e === "object" && e !== null ? (e as Record<string, unknown>) : null;
 }
@@ -57,17 +97,40 @@ function asRecord(e: unknown): Record<string, unknown> | null {
  * because a wrapped error (`{ error: { kind: … } }`) is the same refusal.
  */
 function stringsIn(e: unknown, depth = 0): string[] {
-  if (typeof e === "string") return [e];
-  if (e instanceof Error) return [e.message, e.name];
+  const { prose, kinds } = partitionStrings(e, depth);
+  return [...prose, ...kinds];
+}
+
+/**
+ * The same flattening, but keeping track of *where* each string came from.
+ *
+ * A discriminant field and a message field are held to different standards
+ * (see the module comment), so they cannot be pooled. `error` is listed as a
+ * discriminant field and yet routinely carries a whole sentence, which is why
+ * a kind string is tested against both rules and a prose string only against
+ * the prose one.
+ */
+function partitionStrings(
+  e: unknown,
+  depth = 0,
+): { prose: string[]; kinds: string[] } {
+  if (typeof e === "string") return { prose: [e], kinds: [] };
+  if (e instanceof Error) return { prose: [e.message], kinds: [e.name] };
   const record = asRecord(e);
-  if (!record || depth > 1) return [];
-  const out: string[] = [];
-  for (const field of [...KIND_FIELDS, ...MESSAGE_FIELDS]) {
-    const value = record[field];
-    if (typeof value === "string") out.push(value);
-    else if (value !== undefined) out.push(...stringsIn(value, depth + 1));
-  }
-  return out;
+  if (!record || depth > 1) return { prose: [], kinds: [] };
+  const prose: string[] = [];
+  const kinds: string[] = [];
+  const walk = (value: unknown, into: string[]) => {
+    if (typeof value === "string") into.push(value);
+    else if (value !== undefined) {
+      const nested = partitionStrings(value, depth + 1);
+      prose.push(...nested.prose);
+      kinds.push(...nested.kinds);
+    }
+  };
+  for (const field of KIND_FIELDS) walk(record[field], kinds);
+  for (const field of MESSAGE_FIELDS) walk(record[field], prose);
+  return { prose, kinds };
 }
 
 /**
@@ -78,7 +141,11 @@ function stringsIn(e: unknown, depth = 0): string[] {
  * to work.
  */
 export function isFileExistsError(e: unknown): boolean {
-  return stringsIn(e).some((s) => normaliseKind(s).includes(KIND_NEEDLE));
+  const { prose, kinds } = partitionStrings(e);
+  return (
+    kinds.some((s) => isFileExistsDiscriminant(s) || PROSE_MARKER.test(s)) ||
+    prose.some((s) => PROSE_MARKER.test(s))
+  );
 }
 
 /**

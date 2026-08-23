@@ -158,6 +158,18 @@ export default function DiskSettings() {
   // five targets can come back with two failures and a real byte total.
   const failedCount = outcome?.results.filter((r) => !r.ok).length ?? 0;
 
+  // What the backend said about the parts it refused, rendered **verbatim**.
+  // A refusal arrives inside `Ok` — the command succeeded at declining — so it
+  // never reaches `error`, and the dialog that asked for the work has nothing
+  // else to show. Not a sentence of our own: the backend is the only side that
+  // knows which blocker is actually holding the project, and one written here
+  // would go stale the day that answer improves.
+  const refusalText =
+    outcome?.results
+      .filter((r) => !r.ok)
+      .map((r) => r.message)
+      .join(" ") ?? "";
+
   const tone: StatusTone = scanning ? "unknown" : report ? "ok" : "off";
   const statusLabel = scanning
     ? "Scanning"
@@ -706,6 +718,9 @@ export default function DiskSettings() {
                   // minutes, and the dialog reporting it beats it vanishing —
                   // and if it fails, the dialog is the only place the user is
                   // still looking, so it stays open and reports it here.
+                  // `false` covers both a throw and a refusal that came back
+                  // inside `Ok`; either way the work did not happen, so the
+                  // dialog stays put and reports it where the user is looking.
                   const ok = await runReclaim([confirming.target]);
                   setActionFailed(!ok);
                   if (ok) setConfirming(null);
@@ -721,7 +736,7 @@ export default function DiskSettings() {
                 line, which this dialog is covering. */}
             {actionFailed && (
               <p role="alert" className="text-[var(--error)]">
-                {error ?? "That did not run. Nothing was changed."}
+                {error ?? (refusalText || "That did not run. Nothing was changed.")}
               </p>
             )}
             <p>{confirming.detail}</p>
@@ -787,7 +802,11 @@ export default function DiskSettings() {
           // A failure here has to land inside the dialog. The panel's own
           // error line is at the top of several screens of scroll, and this
           // dialog was reached from a project row far below it.
-          error={actionFailed ? (error ?? "That did not run. Nothing was deleted.") : null}
+          error={
+            actionFailed
+              ? (error ?? (refusalText || "That did not run. Nothing was deleted."))
+              : null
+          }
           onCancel={closeDestroying}
           onConfirm={async (typed) => {
             // The modal stays mounted until the call settles, so its `busy`
