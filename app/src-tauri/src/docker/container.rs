@@ -2149,6 +2149,42 @@ const SCRUB_CONTAINMENT_PREFIXES: &[&str] = &["/tmp", "/var/log", "/var/lib/apt"
 /// exec's interleaved stdout/stderr.
 const SCRUB_MARKER: &str = "###TRIPLE-C-SCRUBBED ";
 
+/// Marker the scrub script prints **instead of** [`SCRUB_MARKER`] when it
+/// cannot run at all, followed by what was missing.
+///
+/// H3: the script needs six external tools and the root filesystem's device id,
+/// and on a base image that has none of them where it looked it used to run its
+/// seven patterns, delete nothing, and print `###TRIPLE-C-SCRUBBED 0` — a
+/// number indistinguishable from an honest "there was nothing to take". A scrub
+/// that could not run must never read as one that ran, so it says so in a line
+/// the caller can tell apart, and prints no total at all.
+///
+/// Deliberately **not** a prefix of [`SCRUB_MARKER`] and not prefixed by it, so
+/// `parse_scrub_total` can never mistake one for the other.
+const SCRUB_UNAVAILABLE_MARKER: &str = "###TRIPLE-C-SCRUB-UNAVAILABLE ";
+
+/// Environment the scrub exec sets explicitly, rather than inheriting.
+///
+/// The exec inherits the container's configured env, and a project's *custom*
+/// env vars are part of that: `is_reserved_env_key` reserves the `ANTHROPIC_`,
+/// `AWS_`, `GIT_`, `HOST_` and `TRIPLE_C_` families and a handful of exact
+/// names, none of which is `LD_PRELOAD`. So a custom env var naming a shared
+/// object inside the container's *persisted home volume* injects code into
+/// every tool the scrub runs — as **root**, since that is the user the exec is
+/// created as — and decides the answer to checks 3 and 4 without ever touching
+/// `PATH`. `docker commit` bakes env into the snapshot, so it rides along too.
+///
+/// Blanking them in the exec closes that without breaking anything: nothing
+/// legitimate preloads into `/bin/sh`, `stat`, `du`, `cut`, `find` or `rm`, and
+/// this env applies to the scrub exec **only** — a terminal session, which is a
+/// different exec, is untouched. Verified against Engine 29.7 that a
+/// `docker exec -e LD_PRELOAD=` overrides a container-level `LD_PRELOAD`.
+///
+/// `LD_LIBRARY_PATH` is here for the same reason as `LD_PRELOAD`: it is
+/// searched ahead of the cache for every `DT_NEEDED` library, so a planted
+/// `libselinux.so.1` is as good as a preload.
+const SCRUB_EXEC_ENV: &[&str] = &["LD_PRELOAD=", "LD_AUDIT=", "LD_LIBRARY_PATH="];
+
 /// Split a [`SNAPSHOT_SCRUB_PATHS`] entry into the literal directory it is
 /// anchored to and the glob to expand inside it.
 ///
@@ -2204,19 +2240,32 @@ pub(crate) fn snapshot_scrub_script() -> String {
 ///    symlink is not the only way to name the wrong directory; this refuses to
 ///    operate outside the trees the scrub owns whatever the path list says.
 /// 3. It must be on the same filesystem as the root. Check 1 does not see a
-///    *bind mount*, which is not a symlink — but a bind mount and a named
-///    volume each have a different `st_dev` from the overlay, and neither is
-///    part of the writable layer the commit is about to capture. So anything on
-///    another device is both dangerous to delete and pointless to.
+///    *bind mount*, which is not a symlink — but under `overlay2` a bind mount
+///    and a named volume each have a different `st_dev` from the overlay, and
+///    neither is part of the writable layer the commit is about to capture. So
+///    anything on another device is both dangerous to delete and pointless to.
 ///
 /// The fifth is about each *match*, and it is the one the parent checks cannot
 /// stand in for:
 ///
 /// 4. Every expansion of the glob must itself be on the root's filesystem, or
-///    it is skipped. Since the parent has already been proved to be, this is
-///    exactly a "the match is not a mount point" test — the device of a
-///    directory differs from its parent's precisely when something is mounted
-///    on it.
+///    it is skipped. Since the parent has already been proved to be, that is a
+///    "the match is not a mount point" test — the device of a directory differs
+///    from its parent's precisely when something is mounted on it.
+///
+///    **On `overlay2`, which is what these were measured against.** The overlay
+///    synthesises its own `st_dev`, so *every* mount into the container differs
+///    from it and checks 3 and 4 catch all of them. Under the `vfs` graph
+///    driver there is no overlay: the container root is a plain directory tree
+///    on the host filesystem, so a bind mount of a host directory that happens
+///    to live on that same filesystem reports the *same* `st_dev` and these two
+///    checks see nothing. Checks 1 and 2 — resolved path, and containment in
+///    [`SCRUB_CONTAINMENT_PREFIXES`] — are what still hold there, and they are
+///    why a `vfs` host is a narrower gap rather than an open one: the mount has
+///    to be planted inside `/tmp`, `/var/log`, `/var/lib/apt` or
+///    `/var/cache/apt` and match one of the seven globs to be reached at all.
+///    Do not describe the device test as a mount test without that
+///    qualification.
 ///
 ///    Checks 0–3 validate the *parent*, and `rm --one-file-system` compares
 ///    against the device of **its own command-line argument** — so when the
@@ -2240,23 +2289,58 @@ pub(crate) fn snapshot_scrub_script() -> String {
 /// busybox's `rm` would reject it) refuses to recurse across a mount planted
 /// *below* a match — which is the only mount position it does cover.
 ///
-/// ## Why the tools are named absolutely
+/// ## How the byte total is counted
 ///
-/// Every external tool is called by absolute path, and `PATH` is reset before
-/// anything runs. The image's `PATH` starts
+/// `du` before the `rm`, `du` again after it if anything is still there, and
+/// the difference is what was reclaimed. The obvious form —
+/// `rm … && acc=$((acc + sz))` — was wrong in exactly the case
+/// `--one-file-system` exists for: `rm` walking into a match that has a mount
+/// planted *below* it removes everything else and still exits non-zero, so the
+/// whole subtree's size was dropped from the total rather than the part that
+/// survived. Under-reporting a scrub is the same class of quiet as reporting
+/// zero for one that never ran. The second `du` only runs when the path is
+/// still present, i.e. on the failure path, so the ordinary case pays nothing;
+/// the figure is clamped at the pre-`rm` size so a directory something else is
+/// concurrently growing cannot make it negative.
+///
+/// ## Why `PATH` is reset, and why the tools are *not* named absolutely (H3)
+///
+/// The first statement in the script sets `PATH={root}/usr/bin:{root}/bin` and
+/// exports it, before any external tool runs. That is the whole shim defence.
+/// The image's `PATH` starts
 /// `/home/claude/.claude/bin:/home/claude/.local/bin:/home/claude/.cargo/bin`,
 /// all of which live in the container's *persisted home volume* and are
 /// writable by the agent — so a three-line `stat` on the front of it decides
 /// the answer to checks 3 and 4. That was reproduced: with such a shim planted,
 /// a volume mounted at `/var/log/apt` — refused by an unshimmed scrub — had its
-/// entire contents deleted. A *missing* `stat` does fail closed (an empty
-/// device string matches nothing), but a shimmed one answers, so failing closed
-/// was never the property that mattered here. `auth_bridge` calls
-/// `/usr/bin/cat` for the same reason.
+/// entire contents deleted. The shim lives in the home volume; it cannot live
+/// in `/usr/bin` or `/bin`, which uid 1000 cannot write. Resetting `PATH` to
+/// exactly those two directories therefore defeats it just as completely as
+/// spelling `/usr/bin/stat` out does.
 ///
-/// This does not defend against something that can write `/usr/bin` itself,
-/// which the agent's passwordless sudo can. It closes the part of the gap that
-/// survives a container restart and needs no privileges at all.
+/// Spelling them out as well was strictly *worse*, and it is what H3 was.
+/// `/usr/bin/stat` is not where coreutils live on every base image — Settings →
+/// Docker → **Custom** accepts any image, and on Alpine `stat` and `rm` are in
+/// `/bin`. There, `/usr/bin/stat` is simply absent, `rootdev` comes back empty,
+/// and `[ -n "$rootdev" ] || exit 0` fires for all seven patterns. Measured on
+/// one seeded tree: the absolute-path script reported
+/// `###TRIPLE-C-SCRUBBED 0` and left every planted file in place, where the
+/// `PATH`-based one reclaimed 73738 bytes. Failing closed is correct; failing
+/// closed while printing a number that reads as success is not, which is why
+/// the tool probe and [`SCRUB_UNAVAILABLE_MARKER`] exist below.
+///
+/// So: the six tools are named bare and resolved through a `PATH` the script
+/// controls, and the script refuses to delete anything at all unless
+/// `command -v` finds every one of them and the root device id reads back as a
+/// number. `find` is required along with the rest even though its absence would
+/// only disable the age gate, because "ran with one hand tied" is exactly the
+/// half-working state this whole section exists to stop being silent.
+///
+/// This does not defend against something that can write `/usr/bin` or `/bin`
+/// itself, which the agent's passwordless sudo can. It closes the part of the
+/// gap that survives a container restart and needs no privileges at all — and
+/// see [`SCRUB_EXEC_ENV`] for the `LD_PRELOAD` half of the same question, which
+/// `PATH` does nothing about.
 ///
 /// ## Why every line ends in `;`, and why there are no `#` comments
 ///
@@ -2309,9 +2393,13 @@ fn snapshot_scrub_script_under(root: &str) -> String {
     format!(
         r#"PATH={root}/usr/bin:{root}/bin; export PATH;
 total=0;
-rootdev=$({root}/usr/bin/stat -c %d '{root}/' 2>/dev/null);
+missing=;
+for t in stat rm du cut find; do command -v "$t" >/dev/null 2>&1 || missing="$missing $t"; done;
+rootdev=$(stat -c %d '{root}/' 2>/dev/null);
+case "$rootdev" in ''|*[!0-9]*) rootdev=; missing="$missing root-device-id" ;; esac;
+[ -z "$missing" ] || {{ echo "{unavailable}$missing"; exit 0; }};
 rmopt=;
-{root}/usr/bin/rm --one-file-system --help >/dev/null 2>&1 && rmopt=--one-file-system;
+rm --one-file-system --help >/dev/null 2>&1 && rmopt=--one-file-system;
 scrub_in() {{
 n=$(
 d=${{1%/*}}; [ -n "$d" ] || d=/;
@@ -2320,16 +2408,21 @@ cd -P "$d" 2>/dev/null || exit 0;
 [ "$(pwd -P)" = "$d" ] || exit 0;
 case "$d" in {allowed}) ;; *) exit 0 ;; esac;
 [ -n "$rootdev" ] || exit 0;
-[ "$({root}/usr/bin/stat -c %d . 2>/dev/null)" = "$rootdev" ] || exit 0;
+[ "$(stat -c %d . 2>/dev/null)" = "$rootdev" ] || exit 0;
 acc=0;
 for p in $g; do
 case "$p" in */*|.|..) continue ;; esac;
 {{ [ -e "$p" ] || [ -L "$p" ]; }} || continue;
-[ "$({root}/usr/bin/stat -c %d -- "$p" 2>/dev/null)" = "$rootdev" ] || continue;
-[ "$2" = "-" ] || [ -n "$({root}/usr/bin/find "./$p" -maxdepth 0 -mtime +"$2" -print 2>/dev/null)" ] || continue;
-sz=$({root}/usr/bin/du -sb -- "$p" 2>/dev/null | {root}/usr/bin/cut -f1);
+[ "$(stat -c %d -- "$p" 2>/dev/null)" = "$rootdev" ] || continue;
+[ "$2" = "-" ] || [ -n "$(find "./$p" -maxdepth 0 -mtime +"$2" -print 2>/dev/null)" ] || continue;
+sz=$(du -sb -- "$p" 2>/dev/null | cut -f1);
 case "$sz" in ''|*[!0-9]*) sz=0 ;; esac;
-{root}/usr/bin/rm -rf $rmopt -- "$p" 2>/dev/null && acc=$((acc + sz));
+rm -rf $rmopt -- "$p" 2>/dev/null;
+rest=0;
+{{ [ -e "$p" ] || [ -L "$p" ]; }} && rest=$(du -sb -- "$p" 2>/dev/null | cut -f1);
+case "$rest" in ''|*[!0-9]*) rest=0 ;; esac;
+[ "$rest" -le "$sz" ] || rest=$sz;
+acc=$((acc + sz - rest));
 done;
 echo "$acc";
 );
@@ -2343,17 +2436,44 @@ exit 0
         allowed = allowed,
         calls = calls,
         marker = SCRUB_MARKER,
+        unavailable = SCRUB_UNAVAILABLE_MARKER,
     )
 }
 
 /// Parse the byte total the scrub script reports. Returns `None` when the
 /// marker is absent, which is how a container that never ran the script (or a
 /// `sh` that died early) is told apart from one that reclaimed nothing.
+///
+/// A script that decided it could not run prints [`SCRUB_UNAVAILABLE_MARKER`]
+/// and no total at all, so this returns `None` for that too — but callers must
+/// ask [`parse_scrub_unavailable`] **first**, because "could not run" and
+/// "printed nothing recognisable" deserve different words in the log.
 fn parse_scrub_total(output: &str) -> Option<u64> {
     output
         .lines()
         .rev()
         .find_map(|line| line.trim().strip_prefix(SCRUB_MARKER)?.trim().parse().ok())
+}
+
+/// What the scrub script said was missing, if it declined to run at all.
+///
+/// H3: the failure this exists for is silent by construction — a scrub with no
+/// usable `stat` deletes nothing and, before this, printed the same
+/// `###TRIPLE-C-SCRUBBED 0` a healthy container with nothing to clean prints.
+/// The script now says which tools it could not find; this reads that back so
+/// [`ScrubOutcome::Unavailable`] can carry it into the log.
+fn parse_scrub_unavailable(output: &str) -> Option<String> {
+    output.lines().rev().find_map(|line| {
+        let missing = line.trim().strip_prefix(SCRUB_UNAVAILABLE_MARKER)?.trim();
+        Some(if missing.is_empty() {
+            "the image is missing the tools the scrub needs".to_string()
+        } else {
+            format!(
+                "the image has no usable {} on /usr/bin or /bin",
+                missing.split_whitespace().collect::<Vec<_>>().join(", ")
+            )
+        })
+    })
 }
 
 /// How long [`scrub_writable_layer`] waits for its exec before the commit goes
@@ -2389,20 +2509,39 @@ pub enum ScrubOutcome {
     TimedOut,
     /// The container was running and the scrub genuinely failed.
     Failed,
+    /// The exec ran, but the container's image does not have the tools the
+    /// scrub needs where it can reach them, so it deleted nothing.
+    ///
+    /// Separate from [`ScrubOutcome::Failed`] because the exec itself worked
+    /// and the script ran to its own conclusion — and separate from
+    /// `Reclaimed(0)`, which is the whole of H3: a custom base image without
+    /// usr-merged coreutils reclaimed nothing and reported it as a completed
+    /// scrub of zero bytes.
+    Unavailable,
 }
 
 impl ScrubOutcome {
     /// What the commit's log line should say about the scrub — **empty when
     /// there is nothing to say**.
     ///
-    /// Every migration used to log "0.00 MB dropped by the pre-commit scrub",
-    /// because the migration path scrubs the container itself while it is
-    /// still running and stops it before committing, so the call here finds
-    /// nothing to exec into. A figure of zero reads as a scrub that ran and
-    /// found nothing, which is a different and more alarming thing than a
-    /// scrub that correctly had no work left.
+    /// Two different zeros used to render identically here. Every migration
+    /// logged "0.00 MB dropped by the pre-commit scrub", because the migration
+    /// path scrubs the container itself while it is still running and stops it
+    /// before committing, so the call here finds nothing to exec into. A figure
+    /// of zero reads as a scrub that ran and found nothing, which is a
+    /// different and more alarming thing than a scrub that correctly had no
+    /// work left.
+    ///
+    /// The other zero was H3: a scrub that could not find its tools also
+    /// reclaimed nothing, and rendered as the same reassuring "0.00 MB
+    /// dropped". That one is [`ScrubOutcome::Unavailable`] now, and even a
+    /// genuine `Reclaimed(0)` says it *ran* rather than quoting a figure that
+    /// cannot be told apart from a broken scrub's.
     pub(crate) fn commit_log_suffix(&self) -> String {
         match self {
+            Self::Reclaimed(0) => {
+                " (the pre-commit scrub ran and found nothing to drop)".to_string()
+            }
             Self::Reclaimed(bytes) => format!(
                 " ({:.2} MB dropped by the pre-commit scrub)",
                 *bytes as f64 / 1_048_576.0
@@ -2410,6 +2549,7 @@ impl ScrubOutcome {
             Self::NotRunning => String::new(),
             Self::TimedOut => " (the pre-commit scrub timed out, so the layer keeps whatever it had)".to_string(),
             Self::Failed => " (the pre-commit scrub did not run, so the layer keeps whatever it had)".to_string(),
+            Self::Unavailable => " (the pre-commit scrub could not run in this image, so nothing was reclaimed and the layer keeps whatever it had)".to_string(),
         }
     }
 }
@@ -2465,7 +2605,12 @@ pub async fn scrub_writable_layer(container_id: &str) -> ScrubOutcome {
 
     let script = snapshot_scrub_script();
     let cmd = vec!["/bin/sh".to_string(), "-c".to_string(), script];
-    let exec = crate::docker::exec::exec_oneshot_as(container_id, "root", cmd, Vec::new());
+    let exec = crate::docker::exec::exec_oneshot_as(
+        container_id,
+        "root",
+        cmd,
+        SCRUB_EXEC_ENV.iter().map(|e| (*e).to_string()).collect(),
+    );
 
     // M12: nothing under `docker/` has a timeout, and this is the one call on
     // the critical path of every recreate. Dropping the future stops us
@@ -2485,26 +2630,50 @@ pub async fn scrub_writable_layer(container_id: &str) -> ScrubOutcome {
     };
 
     match exec_result {
-        Ok((output, _exit_code)) => match parse_scrub_total(&output) {
-            Some(bytes) => {
-                if bytes > 0 {
+        Ok((output, _exit_code)) => {
+            // H3, first of the three silences: ask about "could not run"
+            // *before* reading a total, because the script prints no total in
+            // that case and a bare `None` would be reported as a generic
+            // failure without naming what the image is missing.
+            if let Some(reason) = parse_scrub_unavailable(&output) {
+                log::warn!(
+                    "Pre-commit scrub of container {} could not run ({}); nothing was reclaimed and the commit will carry whatever the writable layer held",
+                    container_id,
+                    reason
+                );
+                return ScrubOutcome::Unavailable;
+            }
+            match parse_scrub_total(&output) {
+                // H3, second of the three: this used to log only when there
+                // was something to report, so a scrub that reclaimed nothing
+                // left no trace at all. A genuine zero is routine, so it is a
+                // debug line rather than a warning — the alarming zero is the
+                // `Unavailable` above, and that one is not quiet.
+                Some(0) => {
+                    log::debug!(
+                        "Pre-commit scrub of container {} ran and found nothing to reclaim",
+                        container_id
+                    );
+                    ScrubOutcome::Reclaimed(0)
+                }
+                Some(bytes) => {
                     log::info!(
                         "Pre-commit scrub of container {} reclaimed {:.2} MB before it could be committed",
                         container_id,
                         bytes as f64 / 1_048_576.0
                     );
+                    ScrubOutcome::Reclaimed(bytes)
                 }
-                ScrubOutcome::Reclaimed(bytes)
+                None => {
+                    log::warn!(
+                        "Pre-commit scrub of container {} did not report a total; committing anyway. Output: {}",
+                        container_id,
+                        output.trim()
+                    );
+                    ScrubOutcome::Failed
+                }
             }
-            None => {
-                log::warn!(
-                    "Pre-commit scrub of container {} did not report a total; committing anyway. Output: {}",
-                    container_id,
-                    output.trim()
-                );
-                ScrubOutcome::Failed
-            }
-        },
+        }
         Err(e) => {
             log::warn!(
                 "Pre-commit scrub of container {} could not run ({}); committing anyway",
@@ -4174,16 +4343,14 @@ mod tests {
         //    volume is not part of the writable layer and must never be
         //    touched.
         assert!(script.contains(r#"[ -n "$rootdev" ] || exit 0;"#));
-        assert!(script
-            .contains(r#"[ "$(/usr/bin/stat -c %d . 2>/dev/null)" = "$rootdev" ] || exit 0;"#));
+        assert!(script.contains(r#"[ "$(stat -c %d . 2>/dev/null)" = "$rootdev" ] || exit 0;"#));
         // 4. and *each match* on it too. Check 3 says nothing about a mount
         //    planted at the match itself, and `rm --one-file-system` compares
         //    against its own argument's device, so without this line a volume
         //    mounted at `/tmp/claude-x` has its contents deleted — reproduced
         //    against a live daemon before this existed.
-        assert!(script.contains(
-            r#"[ "$(/usr/bin/stat -c %d -- "$p" 2>/dev/null)" = "$rootdev" ] || continue;"#
-        ));
+        assert!(script
+            .contains(r#"[ "$(stat -c %d -- "$p" 2>/dev/null)" = "$rootdev" ] || continue;"#));
         // 5. an expansion carrying a separator means the list changed shape
         assert!(script.contains(r#"case "$p" in */*|.|..) continue ;; esac;"#));
     }
@@ -4195,32 +4362,81 @@ mod tests {
         // persisted home volume. A three-line `stat` shim planted in the first
         // of them made an unshimmed-refused mount at `/var/log/apt` delete its
         // whole contents, so "no `stat` means no deletion" was never the
-        // property that mattered. Every tool is therefore named absolutely and
-        // `PATH` is reset before anything runs.
+        // property that mattered. The defence is the `PATH` reset, and it has
+        // to be the *first* statement in the script.
         let script = snapshot_scrub_script();
         assert!(
             script.starts_with("PATH=/usr/bin:/bin; export PATH;\n"),
             "the scrub inherits the container's PATH:\n{}",
             script
         );
+        // Nothing may run before the reset takes effect.
+        let reset_at = script.find("export PATH;").expect("the PATH reset");
+        assert!(
+            !script[..reset_at].contains('$'),
+            "something is expanded before PATH is reset:\n{}",
+            script
+        );
+        // H3: and the tools are *not* named absolutely on top of that.
+        // `/usr/bin/stat` is where coreutils live on Ubuntu and not where they
+        // live on Alpine, which Settings → Docker → Custom accepts — so an
+        // absolute path turned the whole scrub into a silent no-op there while
+        // buying nothing the reset above had not already bought.
+        assert!(
+            !script.contains("/usr/bin/stat"),
+            "the scrub hardcodes a coreutils location that is not universal:\n{}",
+            script
+        );
         for tool in ["stat", "du", "find", "cut", "rm"] {
-            for (at, _) in script.match_indices(tool) {
-                // Skip the ones that are part of a longer word (`rmopt`,
-                // `--one-file-system`) rather than a command being run.
-                let before = &script[..at];
-                let after = &script[at + tool.len()..];
-                let is_word = !before.ends_with(|c: char| c.is_alphanumeric() || c == '-')
-                    && !after.starts_with(|c: char| c.is_alphanumeric() || c == '-');
-                if !is_word {
-                    continue;
-                }
-                assert!(
-                    before.ends_with("/usr/bin/"),
-                    "`{}` is invoked without an absolute path, so the container decides which one runs:\n{}",
-                    tool,
-                    script
-                );
-            }
+            assert!(
+                !script.contains(&format!("/usr/bin/{}", tool)),
+                "`{}` is called by absolute path, which fails closed and silently on any image \
+                 that does not put it there:\n{}",
+                tool,
+                script
+            );
+        }
+    }
+
+    #[test]
+    fn the_scrub_refuses_to_run_at_all_when_a_tool_is_missing() {
+        // H3, the structural half. Every one of the six things the script needs
+        // is probed up front, and a script that cannot find one prints a marker
+        // the caller can tell from a total instead of printing `0`.
+        let script = snapshot_scrub_script();
+        assert!(script.contains(
+            r#"for t in stat rm du cut find; do command -v "$t" >/dev/null 2>&1 || missing="$missing $t"; done;"#
+        ));
+        assert!(script.contains(&format!(
+            r#"[ -z "$missing" ] || {{ echo "{}$missing"; exit 0; }};"#,
+            SCRUB_UNAVAILABLE_MARKER
+        )));
+        // The two markers must be un-confusable in both directions, since the
+        // caller reads whichever it finds out of one interleaved stream.
+        assert!(!SCRUB_UNAVAILABLE_MARKER.starts_with(SCRUB_MARKER));
+        assert!(!SCRUB_MARKER.starts_with(SCRUB_UNAVAILABLE_MARKER));
+        assert_eq!(parse_scrub_total("###TRIPLE-C-SCRUB-UNAVAILABLE stat"), None);
+        assert!(parse_scrub_unavailable("###TRIPLE-C-SCRUBBED 0").is_none());
+    }
+
+    #[test]
+    fn the_scrub_exec_blanks_the_dynamic_linker_hooks() {
+        // The exec inherits the container's env, and a project's custom env
+        // vars are part of it: `LD_PRELOAD` is in none of the reserved
+        // families, so it reaches a root exec unfiltered and injects code into
+        // every tool the scrub runs, `PATH` reset or not.
+        for key in ["LD_PRELOAD", "LD_AUDIT", "LD_LIBRARY_PATH"] {
+            assert!(
+                SCRUB_EXEC_ENV.contains(&format!("{}=", key).as_str()),
+                "{} reaches the scrub exec from the container's env",
+                key
+            );
+            // Blanked, never given a value — an empty `LD_PRELOAD` is what
+            // glibc reads as "no preload".
+            assert!(!is_reserved_env_key(key), "the reserved list has changed shape");
+        }
+        for entry in SCRUB_EXEC_ENV {
+            assert!(entry.ends_with('='), "{} carries a value into the scrub", entry);
         }
     }
 
@@ -4357,20 +4573,32 @@ mod tests {
         );
     }
 
-    /// Put the tools the re-anchored script calls where it will call them.
+    /// Put the tools the re-anchored script resolves through its own `PATH`
+    /// where it will look for them.
     ///
     /// Symlinks to the real ones, so a test can replace exactly one — which is
     /// how a mount point is simulated below without the privileges no test
     /// process has.
     #[cfg(target_os = "linux")]
     fn plant_scrub_tools(root: &std::path::Path) {
-        std::fs::create_dir_all(root.join("usr/bin")).expect("mkdir usr/bin");
+        plant_scrub_tools_in(root, "usr/bin");
+    }
+
+    /// [`plant_scrub_tools`] into a chosen directory of the test root.
+    ///
+    /// The script's `PATH` is `{root}/usr/bin:{root}/bin`, so `bin` is the
+    /// non-usr-merged layout — Alpine's — that H3 was a silent no-op on.
+    #[cfg(target_os = "linux")]
+    fn plant_scrub_tools_in(root: &std::path::Path, rel: &str) {
+        std::fs::create_dir_all(root.join(rel)).expect("mkdir the tool directory");
         for tool in ["stat", "du", "find", "cut", "rm"] {
-            std::os::unix::fs::symlink(
-                std::path::Path::new("/usr/bin").join(tool),
-                root.join("usr/bin").join(tool),
-            )
-            .expect("link a tool into the test root");
+            let real = ["/usr/bin", "/bin"]
+                .iter()
+                .map(|d| std::path::Path::new(d).join(tool))
+                .find(|c| c.exists())
+                .unwrap_or_else(|| panic!("no {} on this host to link", tool));
+            std::os::unix::fs::symlink(real, root.join(rel).join(tool))
+                .expect("link a tool into the test root");
         }
     }
 
@@ -4445,7 +4673,14 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(hostile.join("stat"), fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let hostile_path = format!("{}:/usr/bin:/bin", hostile.display());
+        // The shim first, then the test root's own tool directory: without the
+        // reset the script finds the shim, with it the script finds neither
+        // this `PATH` nor the shim.
+        let hostile_path = format!(
+            "{}:{}/usr/bin:/usr/bin:/bin",
+            hostile.display(),
+            root_str
+        );
 
         let real = snapshot_scrub_script_under(&root_str);
         // Negative control 1: the same script with check 4 deleted.
@@ -4454,10 +4689,15 @@ mod tests {
             .filter(|l| !l.contains(r#"-- "$p" 2>/dev/null)" = "$rootdev" ] || continue;"#))
             .map(|l| format!("{}\n", l))
             .collect();
-        // Negative control 2: the script as it was before the tools were named
-        // absolutely — bare names, resolved through whatever `PATH` says.
-        let with_bare_tools: String = real
-            .replace(&format!("{}/usr/bin/", root_str), "")
+        // Negative control 2: the same script with the `PATH` reset deleted,
+        // so its bare tool names resolve through whatever `PATH` says. This is
+        // what the scrub was before the reset existed, and the shim below owns
+        // it. (Naming the tools absolutely *also* defeated the shim — and was
+        // H3, because `/usr/bin/stat` is not where every image keeps `stat`.
+        // The reset defeats it without that failure mode: the shim lives in
+        // the home volume, which the reset drops off `PATH` entirely, and uid
+        // 1000 cannot write `/usr/bin` or `/bin`.)
+        let without_path_reset: String = real
             .lines()
             .filter(|l| !l.starts_with("PATH="))
             .map(|l| format!("{}\n", l))
@@ -4482,7 +4722,7 @@ mod tests {
         let no_check_kept = mounted_survived();
 
         seed();
-        run(&with_bare_tools, &hostile_path);
+        run(&without_path_reset, &hostile_path);
         let bare_kept = mounted_survived();
 
         fs::remove_dir_all(&root).ok();
@@ -4514,6 +4754,211 @@ mod tests {
         );
     }
 
+    /// H3, the behavioural half: a base image whose coreutils are not under
+    /// `/usr/bin`.
+    ///
+    /// Settings → Docker → **Custom** takes any image name, and on Alpine
+    /// `stat` and `rm` are in `/bin`. Measured in a real `alpine:latest`
+    /// container against the same seeded tree: the absolute-path script printed
+    /// `###TRIPLE-C-SCRUBBED 0` and left every planted file where it was, while
+    /// the `PATH`-resolved one reclaimed 73738 bytes. Both halves are asserted
+    /// here — the negative control is the script this replaced, rebuilt by
+    /// putting the `/usr/bin/` prefixes back — so a regression cannot pass by
+    /// the harness quietly losing the ability to tell them apart.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_scrub_finds_its_tools_when_coreutils_are_not_usr_merged() {
+        use std::fs;
+        use std::process::Command;
+
+        let base = fs::canonicalize(std::env::temp_dir()).expect("a real temp dir");
+        let root = base.join(format!("triple-c-scrub-{}", uuid::Uuid::new_v4().simple()));
+        let root_str = root.to_str().expect("a UTF-8 temp path").to_string();
+
+        // The whole point: `bin`, and deliberately no `usr/bin` at all.
+        plant_scrub_tools_in(&root, "bin");
+        assert!(!root.join("usr/bin").exists());
+
+        let seed = || {
+            fs::remove_dir_all(root.join("tmp")).ok();
+            fs::create_dir_all(root.join("tmp/claude-scratch")).expect("mkdir");
+            fs::write(root.join("tmp/claude-scratch/blob"), vec![0u8; 64 * 1024]).unwrap();
+        };
+
+        let script = snapshot_scrub_script_under(&root_str);
+        // The pre-fix shape, rebuilt: every tool named absolutely under a
+        // `/usr/bin` this root does not have.
+        let absolute: String = script
+            .replace(r#"$(stat "#, &format!("$({}/usr/bin/stat ", root_str))
+            .replace("\nrm --one-file-system", &format!("\n{}/usr/bin/rm --one-file-system", root_str))
+            .replace("\nrm -rf ", &format!("\n{}/usr/bin/rm -rf ", root_str))
+            .replace("$(du -sb", &format!("$({}/usr/bin/du -sb", root_str))
+            .replace("| cut -f1", &format!("| {}/usr/bin/cut -f1", root_str))
+            .replace("$(find ", &format!("$({}/usr/bin/find ", root_str))
+            .lines()
+            // The probe is what makes the pre-fix shape *loud*; the control has
+            // to be the quiet version it replaced, so drop it.
+            .filter(|l| !l.starts_with("for t in ") && !l.starts_with(r#"[ -z "$missing" ]"#))
+            .map(|l| format!("{}\n", l))
+            .collect();
+
+        let run = |sh: &str| {
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg(sh)
+                .output()
+                .expect("run the generated script")
+        };
+
+        seed();
+        let before = run(&absolute);
+        let before_out = String::from_utf8_lossy(&before.stdout).into_owned();
+        let before_kept = root.join("tmp/claude-scratch/blob").exists();
+
+        seed();
+        let after = run(&script);
+        let after_out = String::from_utf8_lossy(&after.stdout).into_owned();
+        let after_gone = !root.join("tmp/claude-scratch").exists();
+
+        fs::remove_dir_all(&root).ok();
+
+        assert!(
+            before_kept,
+            "the harness cannot tell the difference: the absolute-path script reclaimed on a \
+             root with no /usr/bin, so this proves nothing.\nstdout: {}",
+            before_out
+        );
+        assert_eq!(
+            parse_scrub_total(&before_out),
+            Some(0),
+            "the control is supposed to be the *silent* failure — a clean-looking zero"
+        );
+        assert!(
+            after_gone,
+            "the scrub is still a no-op where coreutils are in /bin.\nstdout: {}\nstderr: {}",
+            after_out,
+            String::from_utf8_lossy(&after.stderr)
+        );
+        assert!(
+            parse_scrub_total(&after_out).unwrap_or(0) >= 64 * 1024,
+            "reported total {:?} does not account for the planted debris",
+            parse_scrub_total(&after_out)
+        );
+        assert!(parse_scrub_unavailable(&after_out).is_none());
+    }
+
+    /// H3's third silence: a scrub that could not run must not read as one that
+    /// ran and found nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_scrub_that_cannot_find_its_tools_says_so_instead_of_reporting_zero() {
+        use std::fs;
+        use std::process::Command;
+
+        let base = fs::canonicalize(std::env::temp_dir()).expect("a real temp dir");
+        let root = base.join(format!("triple-c-scrub-{}", uuid::Uuid::new_v4().simple()));
+        let root_str = root.to_str().expect("a UTF-8 temp path").to_string();
+        fs::create_dir_all(root.join("tmp/claude-scratch")).expect("mkdir");
+        fs::write(root.join("tmp/claude-scratch/blob"), vec![0u8; 64 * 1024]).unwrap();
+        // No tools planted anywhere: `PATH` names two directories that do not
+        // exist, which is what a base image the scrub cannot run in looks like.
+
+        let script = snapshot_scrub_script_under(&root_str);
+        let out = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .expect("run the generated script");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let debris_kept = root.join("tmp/claude-scratch/blob").exists();
+        fs::remove_dir_all(&root).ok();
+
+        assert!(debris_kept, "the scrub deleted with no tools to validate with");
+        assert_eq!(
+            parse_scrub_total(&stdout),
+            None,
+            "a scrub that could not run still printed a total: {}",
+            stdout
+        );
+        let reason = parse_scrub_unavailable(&stdout)
+            .unwrap_or_else(|| panic!("no unavailable marker in: {}", stdout));
+        assert!(reason.contains("stat"), "the reason does not name what is missing: {}", reason);
+        // And the outcome the caller derives from it is not a success.
+        assert_ne!(ScrubOutcome::Unavailable, ScrubOutcome::Reclaimed(0));
+        assert!(!ScrubOutcome::Unavailable.commit_log_suffix().contains("MB"));
+    }
+
+    /// The byte total counts what a partly failed `rm` actually removed.
+    ///
+    /// `rm --one-file-system` walking into a match with a mount planted below
+    /// it removes everything else and exits non-zero. The old
+    /// `rm … && acc=$((acc + sz))` dropped the whole subtree from the figure,
+    /// so the one case the `--one-file-system` probe exists for was also the
+    /// one that under-reported. A mount cannot be created by a test process, so
+    /// the partial failure is produced the only other way it happens: an `rm`
+    /// that removes part of its argument and returns non-zero.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_byte_total_counts_what_a_partly_failed_rm_removed() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let base = fs::canonicalize(std::env::temp_dir()).expect("a real temp dir");
+        let root = base.join(format!("triple-c-scrub-{}", uuid::Uuid::new_v4().simple()));
+        let root_str = root.to_str().expect("a UTF-8 temp path").to_string();
+        plant_scrub_tools(&root);
+        fs::create_dir_all(root.join("tmp/claude-partial")).expect("mkdir");
+        fs::write(root.join("tmp/claude-partial/gone"), vec![0u8; 64 * 1024]).unwrap();
+        fs::write(root.join("tmp/claude-partial/keep"), vec![0u8; 8 * 1024]).unwrap();
+
+        let real_rm = ["/usr/bin/rm", "/bin/rm"]
+            .iter()
+            .find(|c| std::path::Path::new(c).exists())
+            .expect("an rm on this host")
+            .to_string();
+        fs::remove_file(root.join("usr/bin/rm")).expect("drop the symlink to the real rm");
+        fs::write(
+            root.join("usr/bin/rm"),
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in claude-partial) {rm} -rf -- \
+                 ./claude-partial/gone; exit 1 ;; esac; done\nexec {rm} \"$@\"\n",
+                rm = real_rm
+            ),
+        )
+        .expect("plant a partly-failing rm");
+        fs::set_permissions(root.join("usr/bin/rm"), fs::Permissions::from_mode(0o755)).unwrap();
+
+        let script = snapshot_scrub_script_under(&root_str);
+        let out = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .expect("run the generated script");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let gone = !root.join("tmp/claude-partial/gone").exists();
+        let kept = root.join("tmp/claude-partial/keep").exists();
+        let total = parse_scrub_total(&stdout);
+        fs::remove_dir_all(&root).ok();
+
+        assert!(
+            gone && kept,
+            "the harness cannot tell the difference: the planted rm did not fail partly \
+             (gone={}, kept={})\nstdout: {}",
+            gone,
+            kept,
+            stdout
+        );
+        let total = total.expect("the marker line is missing");
+        assert!(
+            total >= 64 * 1024,
+            "a partly failed rm was counted as having reclaimed {} bytes",
+            total
+        );
+        // And what survived is not counted as reclaimed.
+        assert!(total < 72 * 1024, "the total {} counts bytes that are still there", total);
+    }
+
     #[test]
     fn the_scrub_total_is_read_back_from_the_marker_line() {
         assert_eq!(
@@ -4526,6 +4971,17 @@ mod tests {
         // from reclaiming nothing, and the caller logs it differently.
         assert_eq!(parse_scrub_total("sh: du: not found"), None);
         assert_eq!(parse_scrub_total(""), None);
+        // H3: and "could not run" is a third thing again, told apart by its
+        // own marker rather than by a total that looks healthy.
+        assert_eq!(
+            parse_scrub_total("###TRIPLE-C-SCRUB-UNAVAILABLE stat rm"),
+            None
+        );
+        let reason = parse_scrub_unavailable("noise\n###TRIPLE-C-SCRUB-UNAVAILABLE stat rm\n")
+            .expect("the unavailable marker");
+        assert!(reason.contains("stat, rm"), "{}", reason);
+        assert!(parse_scrub_unavailable("###TRIPLE-C-SCRUBBED 41").is_none());
+        assert!(parse_scrub_unavailable("").is_none());
     }
 
     #[test]
@@ -4537,10 +4993,12 @@ mod tests {
         assert_eq!(ScrubOutcome::NotRunning.commit_log_suffix(), "");
         assert!(!ScrubOutcome::TimedOut.commit_log_suffix().contains("MB"));
         assert!(!ScrubOutcome::Failed.commit_log_suffix().contains("MB"));
+        assert!(!ScrubOutcome::Unavailable.commit_log_suffix().contains("MB"));
         assert!(ScrubOutcome::Reclaimed(4096)
             .commit_log_suffix()
             .contains("MB"));
         assert_ne!(ScrubOutcome::NotRunning, ScrubOutcome::Failed);
+        assert_ne!(ScrubOutcome::Unavailable, ScrubOutcome::Reclaimed(0));
     }
 
     #[test]
@@ -4552,11 +5010,16 @@ mod tests {
         assert_eq!(ScrubOutcome::NotRunning.commit_log_suffix(), "");
         assert!(!ScrubOutcome::TimedOut.commit_log_suffix().contains("MB"));
         assert!(!ScrubOutcome::Failed.commit_log_suffix().contains("MB"));
-        // A scrub that really ran still reports, zero included — that zero is
-        // an answer about a container that was there to be scrubbed.
-        assert!(ScrubOutcome::Reclaimed(0)
-            .commit_log_suffix()
-            .contains("0.00 MB"));
+        // A scrub that really ran still reports, zero included — but H3 is
+        // that "0.00 MB dropped" was also what a scrub that *could not run*
+        // printed, and the two must not render the same. A genuine zero says it
+        // ran; the broken one says it could not.
+        let ran = ScrubOutcome::Reclaimed(0).commit_log_suffix();
+        assert!(ran.contains("ran"), "{}", ran);
+        assert!(!ran.contains("MB"), "a zero that reads as a figure: {}", ran);
+        let broken = ScrubOutcome::Unavailable.commit_log_suffix();
+        assert!(broken.contains("could not run"), "{}", broken);
+        assert_ne!(ran, broken);
         assert!(ScrubOutcome::Reclaimed(2 * 1_048_576)
             .commit_log_suffix()
             .contains("2.00 MB"));

@@ -472,13 +472,23 @@ async fn fresh_migration(
     // The outcome is logged rather than discarded: this is the one scrub whose
     // silence would be expensive, because the layer it declined to clean is
     // about to be committed into a snapshot that outlives the migration.
-    log::info!(
-        "Pre-migration scrub of {}{}",
-        container_id,
-        docker::scrub_writable_layer(&container_id)
-            .await
-            .commit_log_suffix()
-    );
+    //
+    // H2: **bind it first.** `ScrubOutcome` is `#[must_use]`, and the way that
+    // was satisfied here was by folding the awaited call into `log::info!`'s
+    // argument list. `log::info!` expands to
+    // `if Info <= max_level() { … }` — so the arguments, this data-integrity
+    // step among them, live inside the level check and do not run at all when
+    // the global filter is `Off`. That is reachable: `logging::init` tolerates
+    // `dispatch.apply()` failing, and fern returns *before* `set_max_level` on
+    // error, so a process that failed to install a logger sits at `Off` with
+    // every `log::` argument list silently dead. The scrub would then never
+    // run, and the unscrubbed layer would be committed into the longest-lived
+    // snapshot the app takes. `commit_container_snapshot` gets this right for
+    // the same reason; nothing may put an effect inside a log macro's
+    // arguments. (`logging::init` now also restores the level on failure, but
+    // the call site is not allowed to depend on that.)
+    let scrub = docker::scrub_writable_layer(&container_id).await;
+    log::info!("Pre-migration scrub of {}{}", container_id, scrub.commit_log_suffix());
 
     emit_progress(&app_handle, &project_id, "Stopping the container...");
     let _ = state
@@ -1016,15 +1026,142 @@ pub async fn reconcile_migration(project: &Project, app_handle: &tauri::AppHandl
     // whatever was running. `reconcile_project_statuses` is a command, not just
     // a startup step, so "nothing else can be running yet" is not available as
     // an argument.
+    //
+    // Yielding is right; yielding *forever* was not. The only caller fires once
+    // per "Docker became available", so a project that happened to be held at
+    // that instant was never looked at again for the rest of the session: its
+    // phase stayed un-normalised, no resume or rollback was ever offered, and
+    // its `:pre-migration-*` pin stayed `Claimed`. So the visit is deferred
+    // rather than dropped — see [`defer_migration_reconcile`].
     if let Some(holder) = crate::project_lock::held(&project.id) {
         log::debug!(
-            "Skipping migration reconcile for '{}' ({}): {}",
+            "Deferring migration reconcile for '{}' ({}): {}",
             project.name,
             project.id,
             holder.describe()
         );
+        defer_migration_reconcile(project, app_handle);
         return;
     }
+    reconcile_migration_now(project, app_handle).await;
+}
+
+/// How long [`defer_migration_reconcile`] waits between looks, and how many
+/// times it looks.
+///
+/// The operations it is waiting behind are minutes long — a Reset recreates a
+/// container from a base image, a compaction rebuilds a multi-gigabyte
+/// snapshot — so the interval is coarse on purpose: this is a `held()` read
+/// against an in-process map, but every wakeup is a task and the point is to
+/// catch the release, not to catch it promptly. Twenty seconds × ninety is
+/// thirty minutes, comfortably past the longest measured compaction, after
+/// which the project is left for the next `reconcile_project_statuses`.
+const RECONCILE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+const RECONCILE_RETRY_ATTEMPTS: usize = 90;
+
+/// Project ids with a deferred reconcile already waiting.
+///
+/// `reconcile_project_statuses` is a command the frontend can call more than
+/// once — every "Docker became available" — and each call walks every project.
+/// Without this, a project held for a few minutes would accumulate one waiting
+/// task per call, all of which would then reconcile the same record in a row.
+fn reconcile_retries() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static RETRIES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    RETRIES.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Claim the right to be the one deferred reconcile for `project_id`.
+/// `false` means somebody else already is.
+fn claim_reconcile_retry(project_id: &str) -> bool {
+    reconcile_retries()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(project_id.to_string())
+}
+
+/// Give the claim back, so a later `reconcile_project_statuses` can defer again.
+fn release_reconcile_retry(project_id: &str) {
+    reconcile_retries()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(project_id);
+}
+
+/// Come back to a project that was held when [`reconcile_migration`] reached it.
+///
+/// Only for projects that have a record on disk: [`migration_store::has_record`]
+/// is filesystem presence, so it costs nothing and is deliberately the *cheap*
+/// question — every project is walked on every reconcile and almost none of
+/// them have a migration in flight. A record that exists but cannot be parsed
+/// answers `true` here and is handled, conservatively, by `load` when the
+/// retry lands.
+///
+/// The wait is a poll rather than a notification because `project_lock` has no
+/// release hook and giving it one would mean a guard's `Drop` waking tasks
+/// while it still holds the map's mutex. A read of an in-process `HashMap`
+/// every twenty seconds, for as long as one operation is running on one
+/// project, is not worth a condvar.
+fn defer_migration_reconcile(project: &Project, app_handle: &tauri::AppHandle) {
+    // No record means nothing to come back for. An unreadable migrations
+    // directory answers "maybe", and maybe is worth a look.
+    if !migration_store::has_record(&project.id).unwrap_or(true) {
+        return;
+    }
+    if !claim_reconcile_retry(&project.id) {
+        return;
+    }
+
+    let project = project.clone();
+    let app_handle = app_handle.clone();
+    tauri::async_runtime::spawn(async move {
+        let released =
+            await_release(&project.id, RECONCILE_RETRY_INTERVAL, RECONCILE_RETRY_ATTEMPTS).await;
+        if released {
+            // Whatever was holding it may have finished the migration itself or
+            // cleared the record — `reconcile_migration_now` loads the record
+            // first and returns on `None`, so that is a no-op rather than a
+            // special case here.
+            reconcile_migration_now(&project, &app_handle).await;
+        } else {
+            log::warn!(
+                "Gave up waiting to reconcile the migration record for '{}' ({}): it has been \
+                 held for {} minutes. Its phase is unchanged and its rollback pin is still \
+                 claimed; the next reconcile pass will try again.",
+                project.name,
+                project.id,
+                RECONCILE_RETRY_INTERVAL.as_secs() as usize * RECONCILE_RETRY_ATTEMPTS / 60
+            );
+        }
+        release_reconcile_retry(&project.id);
+    });
+}
+
+/// Wait for `project_id` to stop being held, up to `attempts` looks
+/// `interval` apart. `true` means it was released, `false` that the budget ran
+/// out with it still held.
+///
+/// Split out of [`defer_migration_reconcile`] so the waiting can be tested
+/// against a real [`crate::project_lock`] guard on a paused clock — the part
+/// that is easy to get wrong is "gives up while still holding the claim" and
+/// "never looks again", neither of which is visible from the constants.
+async fn await_release(
+    project_id: &str,
+    interval: std::time::Duration,
+    attempts: usize,
+) -> bool {
+    for _ in 0..attempts {
+        tokio::time::sleep(interval).await;
+        if crate::project_lock::held(project_id).is_none() {
+            return true;
+        }
+    }
+    false
+}
+
+/// [`reconcile_migration`] with the "is anything holding this project" question
+/// already answered.
+async fn reconcile_migration_now(project: &Project, app_handle: &tauri::AppHandle) {
     let state = match migration_store::load(&project.id) {
         Ok(Some(s)) => s,
         Ok(None) => return,
@@ -1961,5 +2098,140 @@ mod tests {
         assert_eq!(r.phase, MigrationPhase::Failed);
         assert!(!r.rollback_available);
         assert!(r.packages_requested.is_empty());
+    }
+
+    /// No `await` may sit inside a `log::*!` argument list — H2, generalised.
+    ///
+    /// `log::info!(a, b)` expands to `if Info <= max_level() { … a … b … }`, so
+    /// an argument is only evaluated while the level admits the record. Folding
+    /// `scrub_writable_layer(&id).await.commit_log_suffix()` into the arguments
+    /// here — done to satisfy `#[must_use]` on `ScrubOutcome` — therefore made
+    /// the pre-migration scrub conditional on the log level, and
+    /// `logging::init` deliberately tolerates failing to install a logger,
+    /// which leaves `max_level()` at `Off`. A scrub that never runs before the
+    /// largest snapshot the app takes is not something a log level may decide.
+    ///
+    /// Scanned over the source rather than asserted at one call site: the bug
+    /// is a shape, and it is reintroduced by whoever next has a `#[must_use]`
+    /// value they only want to log.
+    #[test]
+    fn nothing_awaits_inside_a_log_macros_arguments() {
+        let sources: &[(&str, &str)] = &[
+            ("commands/migration_commands.rs", include_str!("migration_commands.rs")),
+            ("docker/container.rs", include_str!("../docker/container.rs")),
+            ("docker/migration.rs", include_str!("../docker/migration.rs")),
+            ("logging.rs", include_str!("../logging.rs")),
+        ];
+        let macros = ["log::error!(", "log::warn!(", "log::info!(", "log::debug!(", "log::trace!("];
+        let mut scanned = 0usize;
+        for (name, src) in sources {
+            for mac in macros {
+                let mut from = 0usize;
+                while let Some(at) = src[from..].find(mac) {
+                    let start = from + at + mac.len();
+                    // Balance the macro's own parentheses. String literals in
+                    // these call sites never contain an unbalanced one, and a
+                    // `(` inside a format string would only ever widen the
+                    // slice, i.e. fail safe.
+                    let mut depth = 1usize;
+                    let mut end = start;
+                    for (i, c) in src[start..].char_indices() {
+                        match c {
+                            '(' => depth += 1,
+                            ')' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    end = start + i;
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    let args = &src[start..end];
+                    // This test's own name mentions the thing it forbids.
+                    assert!(
+                        !args.contains(".await"),
+                        "{}: an `.await` inside a `{}` argument list stops happening whenever the \
+                         log level does not admit the record:\n{}",
+                        name,
+                        mac.trim_end_matches('('),
+                        args
+                    );
+                    scanned += 1;
+                    from = end.max(start);
+                }
+            }
+        }
+        // A scanner that matched nothing would pass silently forever.
+        assert!(scanned > 80, "only {} log call sites were scanned", scanned);
+    }
+
+    /// MEDIUM: a project held when the reconcile pass reached it must be
+    /// revisited, not dropped for the session.
+    ///
+    /// `reconcile_project_statuses` fires once per "Docker became available",
+    /// so the old `return` meant a project that happened to be mid-Reset at
+    /// that instant never had its migration phase normalised, was never offered
+    /// resume or rollback, and kept its `:pre-migration-*` pin `Claimed` — for
+    /// the rest of the session. On a paused clock, so the thirty-minute budget
+    /// costs nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_project_is_revisited_once_the_holder_lets_go() {
+        let id = format!("await-release-{}", uuid::Uuid::new_v4().simple());
+        let guard = crate::project_lock::try_acquire(&id, crate::project_lock::ProjectOp::Reset)
+            .expect("a fresh project id is not held");
+
+        let waiting = {
+            let id = id.clone();
+            tokio::spawn(async move {
+                await_release(&id, RECONCILE_RETRY_INTERVAL, RECONCILE_RETRY_ATTEMPTS).await
+            })
+        };
+
+        // Long enough that several looks have already happened and found it
+        // held, so this cannot pass by the waiter never having polled.
+        tokio::time::sleep(RECONCILE_RETRY_INTERVAL * 3).await;
+        assert!(!waiting.is_finished(), "the waiter returned while the project was held");
+
+        drop(guard);
+        assert!(
+            waiting.await.expect("the waiter task"),
+            "the holder let go and the reconcile never came back"
+        );
+    }
+
+    /// And the budget is finite: a project held indefinitely does not leave a
+    /// task waiting on it forever, and the claim is handed back either way.
+    #[tokio::test(start_paused = true)]
+    async fn waiting_for_a_holder_gives_up_eventually() {
+        let id = format!("await-release-{}", uuid::Uuid::new_v4().simple());
+        let _guard =
+            crate::project_lock::try_acquire(&id, crate::project_lock::ProjectOp::Migration)
+                .expect("a fresh project id is not held");
+        assert!(!await_release(&id, RECONCILE_RETRY_INTERVAL, RECONCILE_RETRY_ATTEMPTS).await);
+        // Thirty minutes: past the longest measured compaction, and the thing
+        // being waited on is always a bounded, user-initiated operation.
+        assert!(RECONCILE_RETRY_ATTEMPTS > 0, "deferring would be a no-op");
+        let budget = RECONCILE_RETRY_INTERVAL * RECONCILE_RETRY_ATTEMPTS as u32;
+        assert!(budget >= std::time::Duration::from_secs(15 * 60), "{:?}", budget);
+    }
+
+    #[test]
+    fn only_one_deferred_reconcile_waits_per_project() {
+        // Every "Docker became available" walks every project, so without the
+        // claim a project held for a few minutes accumulates one waiting task
+        // per call — all of which then reconcile the same record in a row.
+        let id = format!("retry-claim-{}", uuid::Uuid::new_v4().simple());
+        let other = format!("retry-claim-{}", uuid::Uuid::new_v4().simple());
+        assert!(claim_reconcile_retry(&id));
+        assert!(!claim_reconcile_retry(&id), "a second waiter was allowed in");
+        assert!(claim_reconcile_retry(&other), "the claim is not per-project");
+        release_reconcile_retry(&id);
+        assert!(claim_reconcile_retry(&id), "the claim was never handed back");
+        release_reconcile_retry(&id);
+        release_reconcile_retry(&other);
+        // Releasing something that was never claimed is not an error.
+        release_reconcile_retry(&id);
     }
 }
