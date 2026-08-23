@@ -322,6 +322,14 @@ impl ExecSessionManager {
     }
 }
 
+/// Ceiling on one host file packed into a container upload.
+///
+/// The file goes through host RAM twice — once as bytes, once inside the tar —
+/// so this is a memory bound, and it is checked against the *descriptor* that
+/// was opened rather than a `metadata` call that described whatever the path
+/// meant a moment earlier.
+pub const MAX_DROP_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Upload a host file into the container's `/tmp` under `dest_name`. The file is
 /// read and packed into the tar inside a blocking task, so the synchronous IO
 /// runs off the async worker. The tar's declared entry size is taken from the
@@ -340,8 +348,29 @@ pub async fn upload_host_file_to_container(
     let mtime = now_epoch_secs();
 
     let tar_buf = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
-        let data = std::fs::read(&host_path)
+        // The caller resolved this path (`resolve_host_read_path`); opening it
+        // is a second trip through the same directories, so the descriptor is
+        // checked against the path that was validated before its bytes are
+        // packed into anything. Same policy as the Files pane's upload — this
+        // is the terminal's drop target, and the two must not differ.
+        let file = std::fs::File::open(&host_path)
             .map_err(|e| format!("Failed to read {}: {}", host_path, e))?;
+        crate::commands::file_commands::verify_opened_path(
+            &file,
+            std::path::Path::new(&host_path),
+        )?;
+        let mut data = Vec::new();
+        std::io::Read::read_to_end(
+            &mut std::io::Read::take(file, MAX_DROP_BYTES.saturating_add(1)),
+            &mut data,
+        )
+        .map_err(|e| format!("Failed to read {}: {}", host_path, e))?;
+        if data.len() as u64 > MAX_DROP_BYTES {
+            return Err(format!(
+                "File too large to upload (limit {} MB)",
+                MAX_DROP_BYTES / (1024 * 1024)
+            ));
+        }
         build_single_file_tar(&dest_for_blk, &data[..], 0o644, uid, gid, mtime)
     })
     .await
@@ -484,14 +513,31 @@ pub const MAX_ONESHOT_OUTPUT: usize = 8 * 1024 * 1024;
 /// past anything genuine, far short of a problem.
 pub const PROC_NET_OUTPUT_LIMIT: usize = 1024 * 1024;
 
-/// Append to `buf` while it stays inside `limit`. Returns `false` once the
-/// limit is exceeded, at which point the caller must stop reading.
-fn push_capped(buf: &mut String, chunk: &str, limit: usize) -> bool {
+/// Marker on the "that command printed more than this will buffer" refusal.
+///
+/// The byte count on its own is a fact about the transport, not about what the
+/// user did — "Command output exceeded 8388608 bytes" is not a sentence anybody
+/// can act on. A caller that knows what it was reading can recognise this and
+/// say the useful thing instead; see `list_container_files`, where the real
+/// cause is a directory with more entries than the panel can render.
+pub const OUTPUT_LIMIT_MARKER: &str = "OUTPUT_LIMIT";
+
+/// Append to `buf` while it stays inside `limit`, returning the range the chunk
+/// now occupies. `None` once the limit is exceeded, at which point the caller
+/// must stop reading — and nothing is appended, so a caller that ignored the
+/// answer cannot parse a half-read document.
+///
+/// Bytes rather than `str` on purpose: Docker frames a stream wherever it
+/// likes, so a chunk boundary can fall inside a UTF-8 sequence. Decoding each
+/// chunk on its own turned that into two replacement characters in the middle
+/// of a filename; the decode happens once, at the end, over the whole buffer.
+fn push_capped(buf: &mut Vec<u8>, chunk: &[u8], limit: usize) -> Option<(usize, usize)> {
     if buf.len() + chunk.len() > limit {
-        return false;
+        return None;
     }
-    buf.push_str(chunk);
-    true
+    let start = buf.len();
+    buf.extend_from_slice(chunk);
+    Some((start, buf.len()))
 }
 
 /// Run a one-shot (non-interactive) exec command in a container and collect stdout.
@@ -555,6 +601,65 @@ pub async fn exec_oneshot_as(
     exec_oneshot_inner(container_id, user, cmd, env, MAX_ONESHOT_OUTPUT).await
 }
 
+/// What a one-shot exec printed, with the two streams still tellable apart.
+///
+/// `combined` is stdout and stderr interleaved in arrival order — the shape
+/// every existing caller reads, and the right one for surfacing "why did that
+/// fail". `stdout_ranges` indexes the parts of it that came from stdout, so a
+/// caller that is *parsing* output can have just that without the buffer being
+/// held twice.
+struct OneshotOutput {
+    combined: Vec<u8>,
+    stdout_ranges: Vec<(usize, usize)>,
+    exit_code: i64,
+}
+
+impl OneshotOutput {
+    /// Everything the command printed, in the order it printed it.
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.combined).into_owned()
+    }
+
+    /// stdout alone — for callers that parse it, where a diagnostic spliced in
+    /// mid-record is a parse error at best.
+    fn stdout(&self) -> String {
+        let mut out = Vec::with_capacity(self.combined.len());
+        for (start, end) in &self.stdout_ranges {
+            out.extend_from_slice(&self.combined[*start..*end]);
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// stderr alone — the complement of [`Self::stdout`], i.e. the diagnostics.
+    fn stderr(&self) -> String {
+        let mut out = Vec::with_capacity(self.combined.len());
+        let mut cursor = 0usize;
+        for (start, end) in &self.stdout_ranges {
+            out.extend_from_slice(&self.combined[cursor..*start]);
+            cursor = *end;
+        }
+        out.extend_from_slice(&self.combined[cursor..]);
+        String::from_utf8_lossy(&out).into_owned()
+    }
+}
+
+/// [`exec_oneshot_as`] with the two streams kept apart, for callers that parse
+/// stdout.
+///
+/// `find`'s own diagnostics ("Permission denied") used to arrive inside the
+/// records its `-printf` was emitting. GNU `find` escapes tabs and newlines in
+/// those messages, so the listing parser held — but "the parser holds" is not
+/// the same as "the input is trustworthy", and the fix costs one enum match.
+pub async fn exec_oneshot_streams_as(
+    container_id: &str,
+    user: &str,
+    cmd: Vec<String>,
+    env: Vec<String>,
+) -> Result<(String, String, i64), String> {
+    let out = exec_oneshot_raw(container_id, user, cmd, env, MAX_ONESHOT_OUTPUT).await?;
+    Ok((out.stdout(), out.stderr(), out.exit_code))
+}
+
 async fn exec_oneshot_inner(
     container_id: &str,
     user: &str,
@@ -562,6 +667,17 @@ async fn exec_oneshot_inner(
     env: Vec<String>,
     limit: usize,
 ) -> Result<(String, i64), String> {
+    let out = exec_oneshot_raw(container_id, user, cmd, env, limit).await?;
+    Ok((out.text(), out.exit_code))
+}
+
+async fn exec_oneshot_raw(
+    container_id: &str,
+    user: &str,
+    cmd: Vec<String>,
+    env: Vec<String>,
+    limit: usize,
+) -> Result<OneshotOutput, String> {
     let docker = get_docker()?;
 
     let exec = docker
@@ -584,22 +700,31 @@ async fn exec_oneshot_inner(
         .await
         .map_err(|e| format!("Failed to start exec: {}", e))?;
 
-    let mut combined = String::new();
+    let mut combined: Vec<u8> = Vec::new();
+    let mut stdout_ranges: Vec<(usize, usize)> = Vec::new();
     match result {
         StartExecResults::Attached { mut output, .. } => {
             while let Some(msg) = output.next().await {
                 match msg {
                     Ok(data) => {
-                        let chunk = String::from_utf8_lossy(&data.into_bytes()).into_owned();
-                        if !push_capped(&mut combined, &chunk, limit) {
+                        let from_stdout = matches!(data, LogOutput::StdOut { .. });
+                        let bytes = data.into_bytes();
+                        match push_capped(&mut combined, &bytes, limit) {
+                            Some(range) => {
+                                if from_stdout {
+                                    stdout_ranges.push(range);
+                                }
+                            }
                             // Stop reading rather than truncate silently: every
                             // caller parses this output, and a half-read
                             // manifest or JSON array is worse than an error.
                             // Dropping `output` kills the exec's stream.
-                            return Err(format!(
-                                "Command output exceeded {} bytes and was abandoned",
-                                limit
-                            ));
+                            None => {
+                                return Err(format!(
+                                    "{}: Command output exceeded {} bytes and was abandoned",
+                                    OUTPUT_LIMIT_MARKER, limit
+                                ))
+                            }
                         }
                     }
                     Err(e) => return Err(format!("Exec output error: {}", e)),
@@ -613,7 +738,11 @@ async fn exec_oneshot_inner(
     // final exit_code populated yet, so poll until the exec reports finished.
     let exit_code = require_exit_code(wait_for_exec_exit(&exec.id).await)?;
 
-    Ok((combined, exit_code))
+    Ok(OneshotOutput {
+        combined,
+        stdout_ranges,
+        exit_code,
+    })
 }
 
 /// Turn "the exit code could not be determined" into an error rather than a 0.
@@ -665,29 +794,84 @@ pub async fn wait_for_exec_exit(exec_id: &str) -> Option<i64> {
 mod tests {
     use super::*;
 
+    /// The frames a demultiplexed exec hands back, as `(is_stdout, bytes)`.
+    fn collect(frames: &[(bool, &[u8])]) -> OneshotOutput {
+        let mut combined = Vec::new();
+        let mut stdout_ranges = Vec::new();
+        for (from_stdout, bytes) in frames {
+            let range = push_capped(&mut combined, bytes, usize::MAX).unwrap();
+            if *from_stdout {
+                stdout_ranges.push(range);
+            }
+        }
+        OneshotOutput {
+            combined,
+            stdout_ranges,
+            exit_code: 0,
+        }
+    }
+
     #[test]
     fn output_under_the_limit_is_buffered_whole() {
-        let mut buf = String::new();
-        assert!(push_capped(&mut buf, "hello ", 16));
-        assert!(push_capped(&mut buf, "world", 16));
-        assert_eq!(buf, "hello world");
+        let mut buf = Vec::new();
+        assert_eq!(push_capped(&mut buf, b"hello ", 16), Some((0, 6)));
+        assert_eq!(push_capped(&mut buf, b"world", 16), Some((6, 11)));
+        assert_eq!(buf, b"hello world");
     }
 
     #[test]
     fn output_over_the_limit_is_refused_rather_than_truncated() {
         // The abandoned chunk must not land in the buffer either: a caller that
         // ignored the error would otherwise parse a half-read document.
-        let mut buf = String::new();
-        assert!(push_capped(&mut buf, "0123456789", 12));
-        assert!(!push_capped(&mut buf, "0123456789", 12));
-        assert_eq!(buf, "0123456789");
+        let mut buf = Vec::new();
+        assert!(push_capped(&mut buf, b"0123456789", 12).is_some());
+        assert!(push_capped(&mut buf, b"0123456789", 12).is_none());
+        assert_eq!(buf, b"0123456789");
     }
 
     #[test]
     fn a_single_oversized_chunk_is_refused() {
-        let mut buf = String::new();
-        assert!(!push_capped(&mut buf, "0123456789", 4));
+        let mut buf = Vec::new();
+        assert!(push_capped(&mut buf, b"0123456789", 4).is_none());
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn a_character_split_across_two_frames_survives_the_decode() {
+        // Docker frames a stream wherever it likes, and a filename is where
+        // that shows: decoding each chunk on its own turned the two halves of
+        // `ü` into two replacement characters in the middle of a name.
+        let out = collect(&[(true, &[0xc3]), (true, &[0xbc, b'.', b't', b'x', b't'])]);
+        assert_eq!(out.stdout(), "ü.txt");
+        assert_eq!(out.text(), "ü.txt");
+    }
+
+    #[test]
+    fn a_diagnostic_never_lands_in_the_stream_a_caller_parses() {
+        // `find`'s "Permission denied" used to arrive inside the records its
+        // `-printf` was emitting. Arrival order is still available for the
+        // error message; the parser gets stdout alone.
+        let out = collect(&[
+            (true, b"first"),
+            (false, b"find: /x: Permission denied\n"),
+            (true, b"second"),
+        ]);
+        assert_eq!(out.stdout(), "firstsecond");
+        assert_eq!(out.stderr(), "find: /x: Permission denied\n");
+        assert_eq!(out.text(), "firstfind: /x: Permission denied\nsecond");
+    }
+
+    #[test]
+    fn an_output_limit_refusal_is_marked_so_a_caller_can_reword_it() {
+        // "Command output exceeded 8388608 bytes" is a fact about a buffer.
+        // The marker is what lets `list_container_files` say "too many entries"
+        // instead, which is the thing that actually happened.
+        assert!(!OUTPUT_LIMIT_MARKER.is_empty());
+        let refusal = format!(
+            "{}: Command output exceeded {} bytes and was abandoned",
+            OUTPUT_LIMIT_MARKER, MAX_ONESHOT_OUTPUT
+        );
+        assert!(refusal.starts_with(OUTPUT_LIMIT_MARKER));
     }
 
     #[test]

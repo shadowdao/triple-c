@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -12,7 +13,8 @@ use tauri::{AppHandle, Manager, State};
 
 use crate::docker::client::get_docker;
 use crate::docker::exec::{
-    build_single_file_tar, container_user_ids, exec_oneshot_as, now_epoch_secs,
+    build_single_file_tar, container_user_ids, exec_oneshot_as, exec_oneshot_streams_as,
+    now_epoch_secs, OUTPUT_LIMIT_MARKER,
 };
 use crate::AppState;
 
@@ -79,14 +81,20 @@ pub async fn list_container_files(
     // only decides what an *empty* result means, though: `find` also exits
     // non-zero when a single child vanished mid-scan, and the rows it did
     // print are still the right answer.
-    let (output, code) =
-        exec_oneshot_as(container_id, "claude", list_argv(&path), Vec::new()).await?;
+    //
+    // The two streams are taken apart rather than merged: `find`'s diagnostics
+    // are the error message, its `-printf` records are the listing, and the
+    // parser should never be handed the former.
+    let (records, diagnostics, code) =
+        exec_oneshot_streams_as(container_id, "claude", list_argv(&path), Vec::new())
+            .await
+            .map_err(|e| describe_listing_failure(&path, e))?;
 
-    let entries = parse_find_output(&path, &output);
+    let entries = parse_find_output(&path, &records);
     if code != 0 && entries.is_empty() {
         // `find`'s own words — "Permission denied", "No such file or directory"
-        // — are the whole diagnosis, and stderr is merged into `output`.
-        let detail = output.trim();
+        // — are the whole diagnosis.
+        let detail = diagnostics.trim();
         return Err(if detail.is_empty() {
             format!("Could not list {} (exit {})", path, code)
         } else {
@@ -134,6 +142,24 @@ fn list_argv(path: &str) -> Vec<String> {
         "-printf".to_string(),
         "%y\\t%Y\\t%s\\t%T@\\t%m\\t%f\\0".to_string(),
     ]
+}
+
+/// Turn a listing exec's failure into something the person looking at the
+/// folder can act on.
+///
+/// One case is worth naming: a directory with more entries than
+/// [`crate::docker::exec::MAX_ONESHOT_OUTPUT`] will hold. Roughly 100k names is
+/// the point where a `find` record set passes 8 MiB, and what the panel showed
+/// was "Command output exceeded 8388608 bytes and was abandoned" — a true
+/// statement about a buffer, and no help at all about a directory.
+fn describe_listing_failure(path: &str, error: String) -> String {
+    if error.starts_with(OUTPUT_LIMIT_MARKER) {
+        return format!(
+            "{} holds too many entries for this panel to list. Open it in a terminal, or look at a subfolder.",
+            path
+        );
+    }
+    error
 }
 
 /// Turn `find -printf '%y\t%Y\t%s\t%T@\t%m\t%f\0'` output into sorted entries.
@@ -323,6 +349,18 @@ fn validate_container_path(what: &str, path: &str) -> Result<(), String> {
 
 /// [`validate_container_path`] plus containment in [`CONTAINER_WRITE_ROOTS`],
 /// for every path this module is about to change something at.
+///
+/// **Lexical, and only lexical.** `/workspace/link/x` is "under `/workspace`"
+/// as a string no matter what `/workspace/link` points at, so this on its own
+/// does not keep an operation inside the write roots — [`resolve_container_dir`]
+/// is what asks the container where the path actually goes.
+///
+/// Worth being clear about what that resolution is and is not for. It is not a
+/// containment boundary: the container user has a shell, and anything this
+/// panel could be tricked into writing through a symlink it could write
+/// directly. What it buys is that the *panel* keeps its promise — the roots
+/// named in the refusal are the roots it writes to — and that a mis-aimed drop
+/// cannot quietly land outside them.
 fn validate_container_write_path(what: &str, path: &str) -> Result<(), String> {
     validate_container_path(what, path)?;
     if CONTAINER_WRITE_ROOTS
@@ -337,6 +375,60 @@ fn validate_container_write_path(what: &str, path: &str) -> Result<(), String> {
         CONTAINER_WRITE_ROOTS.join(", "),
         path
     ))
+}
+
+/// Resolve a container *directory* and check where it really lands.
+///
+/// `realpath -m` because the path is being written into rather than read: `-m`
+/// wants no component to exist, which is what makes it usable for the parent of
+/// a `mkdir`. The resolved answer goes back through
+/// [`validate_container_write_path`], so a symlink out of `/workspace` is
+/// refused by the same sentence a literal `/etc` would be.
+///
+/// The caller keeps operating on the path the *user* typed rather than on the
+/// resolved one: they name the same directory, and the unresolved form is the
+/// one the listing shows and the UI navigates back to. What is validated and
+/// what is operated on can therefore drift if a link is swapped in between —
+/// this is a container-side TOCTOU with the same shape as H4's, and unlike H4's
+/// it costs nothing, because both sides of the window are already inside the
+/// container's own trust boundary.
+///
+/// A `realpath` that cannot run at all (an image without coreutils) is logged
+/// and the lexical answer stands: failing every write closed would break the
+/// panel outright for a risk the container user does not need this code path to
+/// take.
+async fn resolve_container_dir(container_id: &str, what: &str, dir: &str) -> Result<(), String> {
+    validate_container_write_path(what, dir)?;
+
+    let (output, code) = exec_oneshot_as(
+        container_id,
+        "claude",
+        vec![
+            "realpath".to_string(),
+            "-m".to_string(),
+            "--".to_string(),
+            dir.to_string(),
+        ],
+        Vec::new(),
+    )
+    .await?;
+
+    let resolved = output.trim();
+    if code != 0 || resolved.is_empty() {
+        log::warn!(
+            "Could not resolve {} in the container (exit {}); using the literal path",
+            dir,
+            code
+        );
+        return Ok(());
+    }
+    if resolved == dir {
+        return Ok(());
+    }
+
+    validate_container_write_path(what, resolved).map_err(|e| {
+        format!("{} leads to {} — {}", dir, resolved, e)
+    })
 }
 
 /// Whether `path` is `root` itself or something beneath it.
@@ -366,70 +458,217 @@ enum HostPathUse {
 /// write would fail anyway. They are listed so that a build running with more
 /// privilege than usual still cannot be talked into replacing a system file,
 /// and so the refusal is a sentence rather than an errno. Compared after
-/// lowercasing and mapping `\` to `/`, which is what makes the Windows entries
-/// work.
+/// [`normalize_host_path`] and lowercasing, which is what makes the Windows
+/// entries work.
 const HOST_SYSTEM_ROOTS: &[&str] = &[
-    "/bin", "/boot", "/dev", "/etc", "/lib", "/lib32", "/lib64", "/libx32", "/proc", "/root",
-    "/sbin", "/sys", "/usr", "/var",
-    // macOS keeps its own copies of the same idea.
-    "/system", "/library",
+    "/bin", "/boot", "/dev", "/etc", "/lib", "/lib32", "/lib64", "/libx32", "/opt", "/proc",
+    "/root", "/sbin", "/snap", "/srv", "/sys", "/usr", "/var",
+    // macOS keeps its own copies of the same idea. Its `/etc` and `/var` are
+    // symlinks into `/private`, and the check now runs on the *resolved* path
+    // (see [`resolve_host_path`]), so the resolved spellings have to be here
+    // too. `/private/tmp` deliberately is not: that is what an entirely
+    // ordinary `/tmp/report.pdf` resolves to on a Mac.
+    "/system", "/library", "/applications", "/private/etc", "/private/var",
     // Windows.
     "c:/windows", "c:/program files", "c:/program files (x86)", "c:/programdata",
 ];
 
-/// Validate a host path that arrived over IPC, returning it as a [`PathBuf`].
+/// Places that sit *under* a [`HOST_SYSTEM_ROOTS`] entry and are nonetheless
+/// entirely ordinary, because a real system puts real user data there.
+///
+/// Both of these only started to matter once the check ran on the *resolved*
+/// path: `/home` is a symlink to `/var/home` on rpm-ostree systems (Fedora
+/// Silverblue and friends), and a Mac's per-user temp directory resolves into
+/// `/private/var/folders`. Without these, saving a download to your own home
+/// directory on Silverblue is "that is a system location".
+const HOST_SYSTEM_ROOT_EXCEPTIONS: &[&str] = &["/var/home", "/var/folders", "/private/var/folders"];
+
+/// Directory *tails* whose contents the OS runs on the user's behalf at login.
+///
+/// The same defence-in-depth footing as [`HOST_SYSTEM_ROOTS`], and the same
+/// caveat in stronger form: this is a list of places that happen to be known,
+/// not a description of the ones that exist. See [`validate_host_path`] for why
+/// the write policy cannot be finished here.
+const HOST_AUTORUN_DIRS: &[&[&str]] = &[
+    &["library", "launchagents"],
+    &["library", "launchdaemons"],
+    &["library", "startupitems"],
+    &["start menu", "programs", "startup"],
+];
+
+/// Length of a `C:` drive prefix at the head of `path`, or 0.
+fn drive_prefix_len(path: &str) -> usize {
+    let b = path.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        2
+    } else {
+        0
+    }
+}
+
+/// Whether `path` is written in Windows form, and so whether `\` separates its
+/// components. On Linux a backslash is an ordinary filename character, which is
+/// why this is a question rather than an unconditional substitution.
+fn is_windows_style_path(path: &str) -> bool {
+    cfg!(windows) || path.starts_with("\\\\") || drive_prefix_len(path) > 0
+}
+
+/// `path` with its separators unified and any Win32 verbatim/device prefix
+/// removed — the form every rule below is expressed against.
+///
+/// `\\?\C:\Windows` and `\\?\UNC\server\share` name the *same locations* as
+/// `C:\Windows` and `\\server\share`; the prefix only turns off Win32 path
+/// parsing. Stripping it is what stops four characters being a bypass of
+/// [`HOST_SYSTEM_ROOTS`] — and it has to run on our own output as well, because
+/// `std::fs::canonicalize` hands back exactly that spelling on Windows.
+fn normalize_host_path(path: &str) -> String {
+    let mut s = if is_windows_style_path(path) {
+        path.replace('\\', "/")
+    } else {
+        path.to_string()
+    };
+    // Slicing by byte index is safe here only because a prefix matched
+    // case-insensitively as ASCII is ASCII, so its end is a char boundary.
+    for prefix in ["//?/unc/", "//./unc/"] {
+        if s.len() >= prefix.len() && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes()) {
+            return format!("//{}", &s[prefix.len()..]);
+        }
+    }
+    for prefix in ["//?/", "//./"] {
+        if s.len() >= prefix.len() && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes()) {
+            s = s[prefix.len()..].to_string();
+            break;
+        }
+    }
+    s
+}
+
+/// The named components of a host path, with the drive letter, the separators
+/// and any `.` dropped.
+fn host_path_names(path: &str) -> Vec<String> {
+    let norm = normalize_host_path(path);
+    norm[drive_prefix_len(&norm)..]
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Whether `path` names a location at all, on whichever platform wrote it.
+///
+/// Deliberately not [`Path::is_absolute`], which answers for the *host*
+/// platform: under it a Windows path on Linux is simply "not absolute", every
+/// Windows rule below goes unreached, and the tests that thought they were
+/// exercising them were only ever exercising this line.
+fn is_absolute_host_path(path: &str) -> bool {
+    let norm = normalize_host_path(path);
+    norm.starts_with('/') || norm[drive_prefix_len(&norm)..].starts_with('/')
+}
+
+/// A UNC path rewritten as the local path it actually reaches, when the share
+/// is an administrative one: `\\host\C$\Windows` *is* `C:\Windows`, and
+/// `\\host\ADMIN$` is the Windows directory itself. An ordinary file share has
+/// no local equivalent and gets `None` — [`HOST_SYSTEM_ROOTS`] cannot reason
+/// about someone else's server, and says so rather than guessing.
+fn admin_share_target(norm_lower: &str) -> Option<String> {
+    let mut parts = norm_lower.strip_prefix("//")?.splitn(3, '/');
+    let _server = parts.next()?;
+    let share = parts.next()?;
+    let tail = parts.next().unwrap_or("");
+    let b = share.as_bytes();
+    if b.len() == 2 && b[0].is_ascii_alphabetic() && b[1] == b'$' {
+        Some(format!("{}:/{}", b[0] as char, tail))
+    } else if share == "admin$" {
+        Some(format!("c:/windows/{}", tail))
+    } else {
+        None
+    }
+}
+
+/// The [`HOST_SYSTEM_ROOTS`] entry `path` falls under, if any.
+///
+/// Pure, and platform-independent on purpose: this is the whole of the Windows
+/// policy, so it is also the whole of what the tests have to be able to drive
+/// from a Linux CI box.
+fn host_system_root_for(path: &str) -> Option<&'static str> {
+    let norm = normalize_host_path(path).to_lowercase();
+    if HOST_SYSTEM_ROOT_EXCEPTIONS
+        .iter()
+        .any(|allowed| is_under_root(&norm, allowed))
+    {
+        return None;
+    }
+    let admin = admin_share_target(&norm);
+    HOST_SYSTEM_ROOTS.iter().copied().find(|root| {
+        is_under_root(&norm, root) || admin.as_deref().is_some_and(|p| is_under_root(p, root))
+    })
+}
+
+/// Whether these directory components end in one of [`HOST_AUTORUN_DIRS`].
+fn is_autorun_dir(names: &[String]) -> bool {
+    HOST_AUTORUN_DIRS.iter().any(|tail| {
+        names.len() >= tail.len()
+            && names[names.len() - tail.len()..]
+                .iter()
+                .zip(tail.iter())
+                .all(|(have, want)| have.eq_ignore_ascii_case(want))
+    })
+}
+
+/// Structural and policy checks on a host path *as written*, returning it as a
+/// [`PathBuf`].
 ///
 /// The `save()`/`open()` dialog the Files pane puts in front of these commands
 /// is a UI convention, not a boundary — every one of them is a single `invoke`
 /// away from any code running in the webview, with a container-controlled
-/// payload on one side. So the backend has its own policy, and it is deliberately
-/// blunt:
+/// payload on one side. So the backend has its own policy:
 ///
-///   * absolute, no `..`, no NUL — the same structural rules as a container
-///     path, using [`Path::components`] so a Windows path is judged as one;
-///   * nothing under [`HOST_SYSTEM_ROOTS`];
-///   * no *hidden* path components. This is the rule that matters. The
-///     interesting targets for "write a container-controlled file to an
-///     arbitrary host path" are all dot directories — `~/.ssh/authorized_keys`,
-///     `~/.config/autostart/`, `~/.claude/` — and the interesting targets for
-///     the reverse, reading a host file into the container, are the same ones
-///     plus `~/.aws/credentials`. A download is refused a hidden *name* too
-///     (creating `~/.bashrc` is escape all by itself); an upload only cares
-///     about hidden *directories*, because dragging a project's own `.env` into
-///     the container is an ordinary thing to do and its parent is not hidden.
+///   * absolute, no `..`, no NUL — judged on the path's own components, so a
+///     Windows path is judged as one wherever this runs;
+///   * nothing under [`HOST_SYSTEM_ROOTS`] or in a login-item directory;
+///   * no *hidden* path components. The interesting targets for "write a
+///     container-controlled file to an arbitrary host path" are mostly dot
+///     directories — `~/.ssh/authorized_keys`, `~/.config/autostart/`,
+///     `~/.claude/` — and the interesting targets for the reverse, reading a
+///     host file into the container, are the same ones plus `~/.aws/credentials`.
+///     A download is refused a hidden *name* too (creating `~/.bashrc` is escape
+///     all by itself); an upload only cares about hidden *directories*, because
+///     dragging a project's own `.env` into the container is an ordinary thing
+///     to do and its parent is not hidden.
 ///
-/// What it costs: saving a container file to a hidden host location now has to
-/// go somewhere visible first. That is a small, explainable price for closing a
-/// container→host write primitive.
+/// **This is a lexical check on a string, and lexical is not enough on its own.**
+/// A path whose components are all visible can still lead somewhere hidden, so
+/// nothing calls this directly any more: [`resolve_host_path`] resolves the
+/// symlinks first and then applies this to the answer. Keeping the two apart is
+/// what lets the policy stay pure and testable while the thing it judges is the
+/// path that will really be opened.
+///
+/// **And the policy itself is a denylist, which is losing by construction.**
+/// `~/Library/LaunchAgents`, `%AppData%\…\Startup`, `~/bin` and `/opt` are only
+/// refused because someone thought of them; the next persistence directory is
+/// not. The honest fix is not a longer list — it is for the *backend* to own the
+/// file dialog (`tauri-plugin-dialog` can be driven from Rust) so that the only
+/// host paths these commands accept are ones the user just pointed at, and no
+/// path arrives over IPC at all. That is a frontend change as well as this one.
+/// Until then: this list is defence in depth, and the dialog is the boundary.
 fn validate_host_path(path: &str, use_for: HostPathUse) -> Result<PathBuf, String> {
-    use std::path::Component;
-
     if path.trim().is_empty() {
         return Err("No host path was given".to_string());
     }
     if path.contains('\0') {
         return Err("Host path cannot contain a null byte".to_string());
     }
-
-    let candidate = PathBuf::from(path);
-    if !candidate.is_absolute() {
+    if !is_absolute_host_path(path) {
         return Err(format!("Host path must be absolute: {}", path));
     }
 
-    let components: Vec<Component> = candidate.components().collect();
-    if components.iter().any(|c| matches!(c, Component::ParentDir)) {
+    let names = host_path_names(path);
+    if names.iter().any(|n| n == "..") {
         return Err(format!("Host path cannot contain \"..\": {}", path));
     }
 
     // The final component is the file itself; everything before it is a
     // directory the path passes *through*.
-    let names: Vec<String> = components
-        .iter()
-        .filter_map(|c| match c {
-            Component::Normal(s) => Some(s.to_string_lossy().to_string()),
-            _ => None,
-        })
-        .collect();
     let hidden_limit = match use_for {
         HostPathUse::Write => names.len(),
         HostPathUse::Read => names.len().saturating_sub(1),
@@ -443,11 +682,15 @@ fn validate_host_path(path: &str, use_for: HostPathUse) -> Result<PathBuf, Strin
         ));
     }
 
-    let normalized = path.replace('\\', "/").to_lowercase();
-    if let Some(root) = HOST_SYSTEM_ROOTS
-        .iter()
-        .find(|root| is_under_root(&normalized, root))
-    {
+    let dirs = &names[..names.len().saturating_sub(1)];
+    if use_for == HostPathUse::Write && is_autorun_dir(dirs) {
+        return Err(format!(
+            "{} is a startup folder — Triple-C will not save there. Choose an ordinary location.",
+            dirs.last().map(String::as_str).unwrap_or(path)
+        ));
+    }
+
+    if let Some(root) = host_system_root_for(path) {
         return Err(format!(
             "{} is a system location — Triple-C will not {} files there.",
             root,
@@ -455,17 +698,122 @@ fn validate_host_path(path: &str, use_for: HostPathUse) -> Result<PathBuf, Strin
         ));
     }
 
-    Ok(candidate)
+    Ok(PathBuf::from(path))
 }
 
-/// [`validate_host_path`] for a host file about to be read into a container,
+/// The host path a command is really going to open: every symlink in it
+/// resolved by the OS, and [`validate_host_path`]'s policy applied a second
+/// time to the answer.
+///
+/// H4, and the reason the lexical check alone was not a check. Nothing here
+/// used to call `canonicalize`, so the rules above were being applied to a
+/// string rather than to a location: with `~/Downloads/pub` a symlink to
+/// `~/.ssh`, a `host_path` of `~/Downloads/pub/authorized_keys` has no hidden
+/// component, is under no system root, and lands in `~/.ssh` anyway. The
+/// container can plant that link *and know where to plant it* —
+/// `/proc/self/mountinfo` inside a Triple-C container spells the host's
+/// project paths out verbatim. The same trick worked in the other direction,
+/// reading `~/.ssh/id_rsa` into the container through a visible name.
+///
+/// A write resolves the *parent* and keeps the caller's leaf, because the leaf
+/// is never followed: the partial file is created with `create_new`
+/// (`O_EXCL`, which refuses a symlink outright) and [`finish_download`]
+/// finishes with a rename, which replaces a link rather than writing through
+/// it. A read resolves the whole path, because the whole path is opened.
+///
+/// What this does **not** close by itself is the swap between resolving and
+/// opening; [`verify_opened_path`] is the other half.
+async fn resolve_host_path(path: &str, use_for: HostPathUse) -> Result<PathBuf, String> {
+    let candidate = validate_host_path(path, use_for)?;
+
+    let resolved = match use_for {
+        HostPathUse::Read => tokio::fs::canonicalize(&candidate)
+            .await
+            .map_err(|e| format!("Cannot access {}: {}", candidate.display(), e))?,
+        HostPathUse::Write => {
+            let parent = candidate
+                .parent()
+                .ok_or_else(|| format!("{} does not name a file", candidate.display()))?;
+            let name = candidate
+                .file_name()
+                .ok_or_else(|| format!("{} does not name a file", candidate.display()))?;
+            let dir = tokio::fs::canonicalize(parent)
+                .await
+                .map_err(|e| format!("Cannot save into {}: {}", parent.display(), e))?;
+            let joined = dir.join(name);
+            // Windows hands out 8.3 aliases, and `BASHRC~1` is a perfectly
+            // ordinary-looking name for `.bashrc`. So a leaf that already
+            // exists is judged under the name the filesystem gives it as well
+            // as the one the caller typed. Only the *name* is taken from the
+            // canonical form: a destination that is a symlink gets replaced by
+            // the rename, never followed, so its target is not what is at risk.
+            if let Ok(full) = tokio::fs::canonicalize(&joined).await {
+                let real = full.file_name().map(|n| n.to_string_lossy().to_string());
+                if real.as_deref().is_some_and(|n| n.starts_with('.')) {
+                    return Err(format!(
+                        "\"{}\" is a hidden file — Triple-C will not save there. Choose a visible location.",
+                        real.unwrap_or_default()
+                    ));
+                }
+            }
+            joined
+        }
+    };
+
+    validate_host_path(&resolved.to_string_lossy(), use_for).map_err(|e| {
+        if resolved == candidate {
+            e
+        } else {
+            format!("{} resolves to {} — {}", path, resolved.display(), e)
+        }
+    })?;
+
+    Ok(resolved)
+}
+
+/// Confirm that the handle we are holding is the file we validated.
+///
+/// The other half of H4. `resolve_host_path` answers "where does this path lead
+/// *now*", and a component can be replaced between that answer and the `open`
+/// that acts on it — the classic TOCTOU, and a live one here because the
+/// attacker owns a directory the path passes through. On Linux the kernel will
+/// simply say where an open descriptor ended up, so we ask it and compare;
+/// anything else is refused before a byte of payload is written or read.
+///
+/// Elsewhere — macOS, Windows — there is no equivalent that needs no new
+/// dependency, so this is a no-op and the guarantee is the weaker one:
+/// resolve-then-open, plus `O_EXCL` on the create, plus a rename whose source
+/// must exist at the resolved path under a name carrying 32 random bits.
+pub(crate) fn verify_opened_path(file: &std::fs::File, expected: &Path) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        if let Ok(actual) = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())) {
+            if actual != expected {
+                return Err(format!(
+                    "Refusing to use {}: while it was being opened it became {}.",
+                    expected.display(),
+                    actual.display()
+                ));
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (file, expected);
+    }
+    Ok(())
+}
+
+/// [`resolve_host_path`] for a host file about to be read into a container,
 /// handed back as a `String`.
 ///
 /// Public because the terminal's drag-and-drop drop target
 /// (`terminal_commands::upload_host_file_to_terminal`) is the same primitive as
 /// the Files pane's upload and must not have a different policy.
-pub fn validate_host_read_path(path: &str) -> Result<String, String> {
-    Ok(validate_host_path(path, HostPathUse::Read)?
+pub async fn resolve_host_read_path(path: &str) -> Result<String, String> {
+    Ok(resolve_host_path(path, HostPathUse::Read)
+        .await?
         .to_string_lossy()
         .to_string())
 }
@@ -543,6 +891,58 @@ fn check_download_size(size: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// The host half of "Save to host…": work out where the file is really going,
+/// fill a partial file beside it, and rename that into place.
+///
+/// Split out from the command because it is the half that carries the security,
+/// and because it is then something a test can drive. `fill` never sees the path
+/// the caller asked for — only the resolved partial — and every failure path
+/// deletes exactly what `fill` created and nothing else. Returns the resolved
+/// destination alongside the byte count, because after [`resolve_host_path`]
+/// that is not necessarily the path the caller named.
+async fn save_to_host<F, Fut>(host_path: &str, fill: F) -> Result<(PathBuf, u64), String>
+where
+    F: FnOnce(PathBuf, Arc<AtomicBool>) -> Fut,
+    Fut: std::future::Future<Output = Result<u64, String>>,
+{
+    // Resolved, not merely inspected: this is the path that will be opened,
+    // with every symlink in its directories already followed. See H4 in
+    // [`resolve_host_path`].
+    let dest = resolve_host_path(host_path, HostPathUse::Write).await?;
+
+    // Written beside the destination and renamed on success, so a failure
+    // anywhere below leaves whatever was already at `dest` untouched.
+    let partial = partial_download_path(&dest)?;
+
+    // Set once `fill` has actually created the file, and read on every failure
+    // path. Without it the cleanup deleted `partial` whichever way the transfer
+    // failed — including the one failure that means "something was already
+    // there": 32 bits of UUID make a collision vanishingly unlikely, but
+    // "vanishingly unlikely" is not a reason to delete a file this app did not
+    // create.
+    let created = Arc::new(AtomicBool::new(false));
+
+    match fill(partial.clone(), Arc::clone(&created)).await {
+        Ok(written) => {
+            if let Err(e) = finish_download(&partial, &dest).await {
+                if created.load(Ordering::SeqCst) {
+                    let _ = tokio::fs::remove_file(&partial).await;
+                }
+                return Err(e);
+            }
+            Ok((dest, written))
+        }
+        Err(e) => {
+            // Only ever our own partial file — never the user's destination,
+            // and never a file that was already sitting at the partial's name.
+            if created.load(Ordering::SeqCst) {
+                let _ = tokio::fs::remove_file(&partial).await;
+            }
+            Err(e)
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn download_container_file(
     project_id: String,
@@ -551,7 +951,6 @@ pub async fn download_container_file(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     validate_container_path("File", &container_path)?;
-    let dest = validate_host_path(&host_path, HostPathUse::Write)?;
 
     let project = state
         .projects_store
@@ -560,35 +959,22 @@ pub async fn download_container_file(
 
     let container_id = project
         .container_id
-        .as_ref()
+        .clone()
         .ok_or_else(|| "Container not running".to_string())?;
 
-    // Written beside the destination and renamed on success, so a failure
-    // anywhere below leaves whatever was already at `dest` untouched.
-    let partial = partial_download_path(&dest)?;
+    let source = container_path.clone();
+    let (dest, written) = save_to_host(&host_path, move |partial, created| async move {
+        stream_container_file_to_host(&container_id, &source, &partial, created).await
+    })
+    .await?;
 
-    let streamed = stream_container_file_to_host(container_id, &container_path, &partial).await;
-
-    match streamed {
-        Ok(written) => {
-            if let Err(e) = finish_download(&partial, &dest).await {
-                let _ = tokio::fs::remove_file(&partial).await;
-                return Err(e);
-            }
-            log::info!(
-                "Saved {} bytes from {} to {}",
-                written,
-                container_path,
-                dest.display()
-            );
-            Ok(())
-        }
-        Err(e) => {
-            // Only ever our own partial file — never the user's destination.
-            let _ = tokio::fs::remove_file(&partial).await;
-            Err(e)
-        }
-    }
+    log::info!(
+        "Saved {} bytes from {} to {}",
+        written,
+        container_path,
+        dest.display()
+    );
+    Ok(())
 }
 
 /// Copy one regular file out of a container straight onto a host path,
@@ -611,6 +997,7 @@ async fn stream_container_file_to_host(
     container_id: &str,
     container_path: &str,
     dest: &Path,
+    created: Arc<AtomicBool>,
 ) -> Result<u64, String> {
     let docker = get_docker()?;
 
@@ -681,6 +1068,13 @@ async fn stream_container_file_to_host(
             .create_new(true)
             .open(&dest)
             .map_err(|e| format!("Failed to create {}: {}", dest.display(), e))?;
+        // From here on the file is ours, so the caller may delete it on failure.
+        created.store(true, Ordering::SeqCst);
+        // `create_new` is `O_EXCL`, so this open cannot have followed a symlink
+        // at the final component — but a *directory* on the way could have been
+        // swapped since the path was resolved, so ask the kernel where the
+        // descriptor actually landed before writing a byte into it.
+        verify_opened_path(&file, &dest)?;
         // `take` as well as the header check: the header is container-controlled
         // and a stream that keeps going past it must not keep filling the disk.
         let mut capped = std::io::Read::take(&mut entry, MAX_DOWNLOAD_BYTES);
@@ -1143,6 +1537,14 @@ pub async fn rename_container_path(
     // `/home/claude/.claude/.credentials.json` used to move the OAuth
     // credential out from under Claude Code.
     validate_container_write_path("Item", &from_path)?;
+    // The *parent* is resolved, never the item itself: `realpath` would follow
+    // a symlink to its target, and renaming a link has always meant renaming
+    // the link. `/` as a parent means a one-component path, which has no
+    // directory component to resolve.
+    let parent = parent_dir(&from_path);
+    if parent != "/" {
+        resolve_container_dir(container_id, "Item", &parent).await?;
+    }
 
     let new_name = to_path.trim();
     validate_entry_name(new_name)?;
@@ -1214,7 +1616,7 @@ pub async fn create_container_directory(
         .as_ref()
         .ok_or_else(|| "Container not running".to_string())?;
 
-    validate_container_write_path("Folder", &parent_path)?;
+    resolve_container_dir(container_id, "Folder", &parent_path).await?;
 
     let name = name.trim();
     validate_entry_name(name)?;
@@ -1264,7 +1666,7 @@ pub async fn download_container_backup(
     // there before the exec had even started — and the error path then deleted
     // it, so a backup of a non-existent container path took the user's file with
     // it. Validate first, write to a partial file second, rename last.
-    let dest = validate_host_path(&host_path, HostPathUse::Write)?;
+    let dest = resolve_host_path(&host_path, HostPathUse::Write).await?;
 
     let project = state
         .projects_store
@@ -1364,12 +1766,23 @@ tar czf - --ignore-failed-read \
 
     use tokio::io::AsyncWriteExt;
     let partial = partial_download_path(&dest)?;
-    let file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&partial)
-        .await
-        .map_err(|e| format!("Failed to create backup file: {}", e))?;
+    // Opened synchronously so the descriptor can be checked against the path
+    // that was resolved a moment ago (H4): `create_new` is `O_EXCL`, so this
+    // cannot have followed a symlink at the final component, but a directory
+    // on the way could have been swapped since.
+    let open_at = partial.clone();
+    let file = tokio::task::spawn_blocking(move || -> Result<std::fs::File, String> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&open_at)
+            .map_err(|e| format!("Failed to create backup file: {}", e))?;
+        verify_opened_path(&file, &open_at)?;
+        Ok(file)
+    })
+    .await
+    .map_err(|e| format!("Backup task panicked: {}", e))??;
+    let file = tokio::fs::File::from_std(file);
     let mut writer = tokio::io::BufWriter::new(file);
     let mut total: u64 = 0;
     let mut stderr_text = String::new();
@@ -1468,6 +1881,67 @@ fn upload_exists_error(dest: &str) -> String {
     format!("{}: {} already exists", UPLOAD_EXISTS_MARKER, dest)
 }
 
+/// The argv that claims an upload destination inside the container, but only if
+/// nothing is there.
+///
+/// `set -C` is the shell's noclobber: under it `>` opens with `O_CREAT|O_EXCL`,
+/// so "is it taken?" and "take it" are a single syscall and there is no window
+/// between them. That is the whole point — the file this guard exists for is
+/// `~/.claude/.credentials.json`, which Claude Code writes from inside the
+/// container at a moment nobody schedules, and a `test -e` followed by an
+/// upload is two operations with exactly that moment in between.
+///
+/// The path travels as a separate argv element and is read back as `$0`, so no
+/// part of it is ever parsed as script. `sh -c` with an interpolated path would
+/// be the same class of bug as the `find` argv above, and is refused for the
+/// same reason.
+fn upload_reservation_argv(dest: &str) -> Vec<String> {
+    vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        "set -C; : > \"$0\"".to_string(),
+        dest.to_string(),
+    ]
+}
+
+/// Create `dest` exclusively, or say why not.
+///
+/// The two failures that land here are very different and the frontend treats
+/// them differently: "the name is taken" is the refusal it offers a Replace
+/// for, everything else (a read-only mount, a missing directory) is a dead end.
+/// The exit status alone cannot tell them apart, so the taken case is confirmed
+/// rather than assumed.
+async fn reserve_upload_destination(container_id: &str, dest: &str) -> Result<(), String> {
+    let (output, code) = exec_oneshot_as(
+        container_id,
+        "claude",
+        upload_reservation_argv(dest),
+        Vec::new(),
+    )
+    .await?;
+    if code == 0 {
+        return Ok(());
+    }
+
+    let (_, exists) = exec_oneshot_as(
+        container_id,
+        "claude",
+        vec!["test".to_string(), "-e".to_string(), dest.to_string()],
+        Vec::new(),
+    )
+    .await?;
+    if exists == 0 {
+        return Err(upload_exists_error(dest));
+    }
+
+    let detail = output.trim();
+    Err(if detail.is_empty() {
+        format!("Could not create {} (exit {})", dest, code)
+    } else {
+        detail.to_string()
+    })
+}
+
 #[tauri::command]
 pub async fn upload_file_to_container(
     project_id: String,
@@ -1484,7 +1958,7 @@ pub async fn upload_file_to_container(
     // source is a host file being read *into* the container, so it gets the
     // host-read policy.
     validate_container_write_path("Folder", &container_dir)?;
-    let host_path = validate_host_read_path(&host_path)?;
+    let host_path = resolve_host_read_path(&host_path).await?;
 
     let project = state
         .projects_store
@@ -1497,6 +1971,10 @@ pub async fn upload_file_to_container(
         .ok_or_else(|| "Container not running".to_string())?;
 
     let docker = get_docker()?;
+
+    // Deferred to here rather than sitting with the lexical check above,
+    // because resolving the destination needs the container it lives in.
+    resolve_container_dir(container_id, "Folder", &container_dir).await?;
 
     let meta = tokio::fs::metadata(&host_path)
         .await
@@ -1525,29 +2003,7 @@ pub async fn upload_file_to_container(
         .to_string_lossy()
         .to_string();
 
-    // Nothing in this stack checked whether the destination already existed:
-    // there was no probe, and `noOverwriteDirNonDir` only stops a directory
-    // being replaced by a non-directory (and vice versa) — Docker's extractor
-    // overwrites a file with a file quite happily. So dragging a host
-    // `.credentials.json` onto the folder holding the container's one destroyed
-    // it with no prompt and no undo, while `create_container_directory`
-    // deliberately omits `-p` and `rename_container_path` refuses an existing
-    // destination. Silence here was an inconsistency, not a policy: refuse by
-    // default, and say so in the words the frontend turns into a Replace/Skip
-    // prompt.
     let dest = join_path(&container_dir, &file_name);
-    if !overwrite.unwrap_or(false) {
-        let (_, exists) = exec_oneshot_as(
-            container_id,
-            "claude",
-            vec!["test".to_string(), "-e".to_string(), dest.clone()],
-            Vec::new(),
-        )
-        .await?;
-        if exists == 0 {
-            return Err(upload_exists_error(&dest));
-        }
-    }
 
     // Own the file as the container user and keep the host's mtime. A default
     // tar header would land it root:root with a 1970-01-01 timestamp — i.e.
@@ -1560,32 +2016,91 @@ pub async fn upload_file_to_container(
         .map(|d| d.as_secs())
         .unwrap_or_else(now_epoch_secs);
 
-    // `std::fs::read` plus the tar build are synchronous and can be hundreds of
-    // MB, so they run on a blocking thread rather than stalling an async worker
-    // (the same discipline as `upload_host_file_to_container`).
+    // Reading is a second open of a path that was resolved a moment ago, so the
+    // descriptor is checked before its bytes are trusted (H4) and the size
+    // ceiling is applied to *it* rather than to the `metadata` call above,
+    // which described whatever the path meant at the time. `std::fs::read` plus
+    // the tar build are synchronous and can be hundreds of MB, so they run on a
+    // blocking thread rather than stalling an async worker (the same discipline
+    // as `upload_host_file_to_container`).
     let read_path = host_path.clone();
+    let tar_name = file_name.clone();
     let tar_buf = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
-        let file_data = std::fs::read(&read_path)
+        let file = std::fs::File::open(&read_path)
             .map_err(|e| format!("Failed to read host file: {}", e))?;
-        build_single_file_tar(&file_name, &file_data[..], 0o644, uid, gid, mtime)
+        verify_opened_path(&file, Path::new(&read_path))?;
+        let mut file_data = Vec::new();
+        std::io::Read::read_to_end(
+            &mut std::io::Read::take(file, MAX_UPLOAD_BYTES.saturating_add(1)),
+            &mut file_data,
+        )
+        .map_err(|e| format!("Failed to read host file: {}", e))?;
+        if file_data.len() as u64 > MAX_UPLOAD_BYTES {
+            return Err(format!(
+                "File too large to upload (limit {} MB). Mount it into the project instead.",
+                MAX_UPLOAD_BYTES / (1024 * 1024)
+            ));
+        }
+        build_single_file_tar(&tar_name, &file_data[..], 0o644, uid, gid, mtime)
     })
     .await
     .map_err(|e| format!("Upload task panicked: {}", e))??;
 
-    docker
+    // Nothing in this stack checked whether the destination already existed:
+    // there was no probe, and `noOverwriteDirNonDir` only stops a directory
+    // being replaced by a non-directory (and vice versa) — Docker's extractor
+    // overwrites a file with a file quite happily. So dragging a host
+    // `.credentials.json` onto the folder holding the container's one destroyed
+    // it with no prompt and no undo, while `create_container_directory`
+    // deliberately omits `-p` and `rename_container_path` refuses an existing
+    // destination. Silence here was an inconsistency, not a policy: refuse by
+    // default, and say so in the words the frontend turns into a Replace/Skip
+    // prompt.
+    //
+    // The refusal has to be the *creation*, not a probe before it. A `test -e`
+    // and then an upload is two operations with a gap in between, and the file
+    // the gap is about is `.credentials.json` — written by Claude Code, inside
+    // the container, at a moment nobody controls. [`upload_reservation_argv`]
+    // closes that gap by making the check and the creation one `O_EXCL` open.
+    let reserved = if overwrite.unwrap_or(false) {
+        false
+    } else {
+        reserve_upload_destination(container_id, &dest).await?;
+        true
+    };
+
+    let uploaded = docker
         .upload_to_container(
             container_id,
             Some(UploadToContainerOptions {
                 path: container_dir,
-                // Belt to the existence check's braces: this is the only thing
-                // Docker itself will refuse, and it closes the race between the
-                // `test -e` above and the extraction.
+                // Not the race-closer this comment used to claim it was: all
+                // Docker refuses here is a directory being replaced by a file
+                // and vice versa. It stays because that is worth refusing —
+                // the reservation above is what makes a file-over-file upload
+                // wait for an answer.
                 no_overwrite_dir_non_dir: "true".to_string(),
             }),
             tar_buf.into(),
         )
-        .await
-        .map_err(|e| format!("Failed to upload file to container: {}", e))?;
+        .await;
+
+    if let Err(e) = uploaded {
+        if reserved {
+            // The placeholder is ours and it is empty. Leaving a 0-byte file
+            // where the user had nothing would be a worse outcome than the
+            // failed upload, and it would make the next attempt look like a
+            // collision.
+            let _ = exec_oneshot_as(
+                container_id,
+                "claude",
+                vec!["rm".to_string(), "-f".to_string(), "--".to_string(), dest.clone()],
+                Vec::new(),
+            )
+            .await;
+        }
+        return Err(format!("Failed to upload file to container: {}", e));
+    }
 
     Ok(())
 }
@@ -2038,5 +2553,554 @@ mod tests {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let age = Duration::from_secs(3_600);
         assert!(!drag_stage_is_stale(now + Duration::from_secs(60), now, age));
+    }
+
+    // ── Host path normalisation, on every platform ──────────────────────────
+
+    #[test]
+    fn windows_system_locations_are_recognised_wherever_this_runs() {
+        // The bug this guards is a *test* bug with a real hole behind it. The
+        // old assertion was `validate_host_path("C:\\Windows\\…").is_err()`,
+        // and on Linux it passed because `Path::is_absolute` is false for a
+        // Windows path there — so the four Windows entries in
+        // `HOST_SYSTEM_ROOTS` were never once compared against anything in CI.
+        // The rule is a pure function over a string now, and this drives it.
+        assert_eq!(
+            host_system_root_for("C:\\Windows\\System32\\drivers\\etc\\hosts"),
+            Some("c:/windows")
+        );
+        assert_eq!(host_system_root_for("c:/Program Files/x"), Some("c:/program files"));
+
+        // `\\?\` turns off Win32 path parsing; it does not name a different
+        // place. `std::fs::canonicalize` returns this spelling on Windows, so
+        // the check has to understand its own output.
+        assert_eq!(
+            host_system_root_for("\\\\?\\C:\\Windows\\System32\\x"),
+            Some("c:/windows")
+        );
+        assert_eq!(
+            host_system_root_for("\\\\.\\C:\\ProgramData\\x"),
+            Some("c:/programdata")
+        );
+
+        // An administrative share reaches the same drive over UNC.
+        assert_eq!(host_system_root_for("\\\\localhost\\C$\\Windows\\x"), Some("c:/windows"));
+        assert_eq!(host_system_root_for("\\\\?\\UNC\\host\\C$\\Windows\\x"), Some("c:/windows"));
+        assert_eq!(host_system_root_for("\\\\host\\ADMIN$\\System32\\x"), Some("c:/windows"));
+
+        // An ordinary file share has no local equivalent, and this list does
+        // not pretend to know what is on someone else's server.
+        assert_eq!(host_system_root_for("\\\\host\\share\\report.pdf"), None);
+        // A user directory that merely shares a prefix is not a system one.
+        assert_eq!(host_system_root_for("/home/jo/etcetera/notes.txt"), None);
+    }
+
+    #[test]
+    fn a_windows_path_is_split_into_components_wherever_this_runs() {
+        // Same shape of bug one rule along: `Path::components` treats `\` as a
+        // separator only on Windows, so on Linux the whole of
+        // `C:\Users\jo\.ssh\id_rsa` was a single component and the
+        // hidden-directory rule had nothing to find.
+        assert_eq!(
+            host_path_names("C:\\Users\\jo\\Downloads\\a.txt"),
+            ["Users", "jo", "Downloads", "a.txt"]
+        );
+        assert_eq!(host_path_names("\\\\?\\C:\\Users\\jo\\x"), ["Users", "jo", "x"]);
+        assert!(validate_host_path("C:\\Users\\jo\\.ssh\\authorized_keys", HostPathUse::Write).is_err());
+        assert!(validate_host_path("C:\\Users\\jo\\..\\admin\\x", HostPathUse::Write).is_err());
+        assert!(validate_host_path("C:\\Users\\jo\\Downloads\\report.pdf", HostPathUse::Write).is_ok());
+        assert!(is_absolute_host_path("C:\\Users\\jo\\x"));
+        assert!(!is_absolute_host_path("C:x"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_backslash_in_a_unix_filename_is_not_a_separator() {
+        // Unifying separators unconditionally would split a legal Linux name.
+        assert_eq!(host_path_names("/home/jo/a\\b.txt"), ["home", "jo", "a\\b.txt"]);
+    }
+
+    #[test]
+    fn a_login_item_directory_is_refused_for_a_write() {
+        // Defence in depth, and deliberately not called a fix: see
+        // `validate_host_path` for why a denylist of persistence directories is
+        // losing by construction.
+        assert!(validate_host_path("/Users/jo/Library/LaunchAgents/x.plist", HostPathUse::Write).is_err());
+        assert!(validate_host_path(
+            "C:\\Users\\jo\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\x.lnk",
+            HostPathUse::Write
+        )
+        .is_err());
+        // A directory that merely happens to be called Library is not one.
+        assert!(validate_host_path("/Users/jo/Documents/Library/notes.md", HostPathUse::Write).is_ok());
+    }
+
+    #[test]
+    fn the_unix_system_roots_cover_the_places_a_mac_resolves_them_to() {
+        // Resolution happens before this check now, and on macOS `/etc` and
+        // `/var` resolve into `/private`.
+        assert!(validate_host_path("/private/etc/hosts", HostPathUse::Write).is_err());
+        assert!(validate_host_path("/private/var/db/x", HostPathUse::Write).is_err());
+        assert!(validate_host_path("/opt/homebrew/bin/x", HostPathUse::Write).is_err());
+        assert!(validate_host_path("/srv/www/index.html", HostPathUse::Write).is_err());
+        // …but `/tmp` resolves to `/private/tmp` there, and saving into the
+        // temp directory is entirely ordinary.
+        assert!(validate_host_path("/private/tmp/report.pdf", HostPathUse::Write).is_ok());
+    }
+
+    #[test]
+    fn a_home_directory_that_lives_under_a_system_root_is_still_a_home_directory() {
+        // Only a problem once the check ran on the resolved path: `/home` is a
+        // symlink to `/var/home` on rpm-ostree systems, and a Mac's per-user
+        // temp directory resolves into `/private/var/folders`.
+        assert!(validate_host_path("/var/home/jo/Downloads/report.pdf", HostPathUse::Write).is_ok());
+        assert!(validate_host_path("/private/var/folders/qx/T/report.pdf", HostPathUse::Write).is_ok());
+        // The rest of `/var` is exactly as refused as it was.
+        assert!(validate_host_path("/var/lib/docker/x", HostPathUse::Write).is_err());
+        assert!(validate_host_path("/var/log/syslog", HostPathUse::Read).is_err());
+    }
+
+    // ── H4: a symlinked component, and where the bytes actually land ────────
+
+    /// A throwaway host tree shaped like the real attack: a visible
+    /// `Downloads/pub` that is really `~/.ssh`.
+    ///
+    /// This is the scenario verbatim — and the container end of it is not
+    /// hypothetical: `/proc/self/mountinfo` inside a Triple-C container spells
+    /// the host's project paths out, so code in there knows both where to plant
+    /// the link and what host path to ask the backend for.
+    #[cfg(unix)]
+    fn plant_symlinked_downloads() -> (PathBuf, PathBuf, PathBuf) {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("tc-h4-{}", uuid::Uuid::new_v4()));
+        let home = root.join("home");
+        let downloads = home.join("Downloads");
+        let ssh = home.join(".ssh");
+        std::fs::create_dir_all(&downloads).unwrap();
+        std::fs::create_dir_all(&ssh).unwrap();
+        let secret = ssh.join("authorized_keys");
+        std::fs::write(&secret, b"the key that was already there").unwrap();
+        std::os::unix::fs::symlink(&ssh, downloads.join("pub")).unwrap();
+        (root, downloads, secret)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlinked_component_passes_the_lexical_check_and_is_still_refused() {
+        let (root, downloads, secret) = plant_symlinked_downloads();
+        let evil = downloads.join("pub").join("authorized_keys");
+        let evil = evil.to_string_lossy().to_string();
+
+        // The hole, stated: every rule the old code had says yes. No hidden
+        // component, no `..`, no system root — because those are properties of
+        // a string, and the string is not where the file goes.
+        assert!(validate_host_path(&evil, HostPathUse::Write).is_ok());
+
+        // Resolving first is what turns the string into a location.
+        let err = resolve_host_path(&evil, HostPathUse::Write).await.unwrap_err();
+        assert!(err.contains(".ssh"), "{}", err);
+        assert!(err.contains("resolves to"), "{}", err);
+
+        // Reading out through the same link is the same bypass backwards.
+        assert!(resolve_host_path(&evil, HostPathUse::Read).await.is_err());
+        assert_eq!(
+            std::fs::read(&secret).unwrap(),
+            b"the key that was already there"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_download_through_a_symlinked_component_writes_nothing_anywhere() {
+        // The whole pipeline the command runs, with the container half stubbed
+        // out: if the destination is refused, `fill` is never called, so there
+        // is no payload to land anywhere.
+        let (root, downloads, secret) = plant_symlinked_downloads();
+        let evil = downloads
+            .join("pub")
+            .join("authorized_keys")
+            .to_string_lossy()
+            .to_string();
+
+        let called = Arc::new(AtomicBool::new(false));
+        let saw = Arc::clone(&called);
+        let result = save_to_host(&evil, move |partial, created| async move {
+            saw.store(true, Ordering::SeqCst);
+            std::fs::write(&partial, b"container-controlled bytes").unwrap();
+            created.store(true, Ordering::SeqCst);
+            Ok(26)
+        })
+        .await;
+
+        assert!(result.is_err(), "the write was allowed through");
+        assert!(!called.load(Ordering::SeqCst), "the transfer started anyway");
+        assert_eq!(
+            std::fs::read(&secret).unwrap(),
+            b"the key that was already there"
+        );
+        // Nothing new in the protected directory either — no partial, no key.
+        let names: Vec<String> = std::fs::read_dir(secret.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["authorized_keys".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_download_to_an_ordinary_location_still_arrives() {
+        // The other half of the proof: the check has to refuse the escape
+        // without refusing the feature.
+        let (root, downloads, _secret) = plant_symlinked_downloads();
+        let good = downloads.join("report.txt").to_string_lossy().to_string();
+
+        let (dest, written) = save_to_host(&good, |partial, created| async move {
+            std::fs::write(&partial, b"a perfectly ordinary file").unwrap();
+            created.store(true, Ordering::SeqCst);
+            Ok(25)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(written, 25);
+        assert_eq!(dest, downloads.join("report.txt"));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"a perfectly ordinary file");
+        // And the staging file is gone, not left beside it.
+        let names: Vec<String> = std::fs::read_dir(&downloads)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains("triple-c-part"))
+            .collect();
+        assert!(names.is_empty(), "{:?}", names);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlinked_file_cannot_be_read_into_the_container_under_a_visible_name() {
+        // The upload direction, where the *final* component is the link:
+        // `Downloads/key.txt` is a perfectly visible name for `~/.ssh/id_rsa`.
+        let (root, downloads, secret) = plant_symlinked_downloads();
+        let alias = downloads.join("key.txt");
+        std::os::unix::fs::symlink(&secret, &alias).unwrap();
+
+        let err = resolve_host_read_path(&alias.to_string_lossy())
+            .await
+            .unwrap_err();
+        assert!(err.contains(".ssh"), "{}", err);
+
+        // An ordinary file next to it is still readable, and comes back as the
+        // path that will be opened.
+        let ordinary = downloads.join("notes.md");
+        std::fs::write(&ordinary, b"hello").unwrap();
+        assert_eq!(
+            resolve_host_read_path(&ordinary.to_string_lossy()).await.unwrap(),
+            ordinary.to_string_lossy()
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_open_descriptor_is_checked_against_the_path_that_was_validated() {
+        // The other half of H4. Resolving answers "where does this lead *now*",
+        // and a directory can be swapped between that answer and the open — so
+        // the kernel is asked where the descriptor actually landed.
+        let dir = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("tc-fd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("report.pdf");
+        let elsewhere = dir.join("authorized_keys");
+        std::fs::write(&real, b"x").unwrap();
+
+        let file = std::fs::File::open(&real).unwrap();
+        assert!(verify_opened_path(&file, &real).is_ok());
+        let err = verify_opened_path(&file, &elsewhere).unwrap_err();
+        assert!(err.contains("while it was being opened"), "{}", err);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_failed_download_never_deletes_a_file_it_did_not_create() {
+        // The partial's name carries 32 bits of UUID, so colliding with an
+        // existing file is vanishingly unlikely — and "vanishingly unlikely" is
+        // not a reason to delete somebody's file. The cleanup runs only when
+        // the transfer actually created one.
+        let dir = std::env::temp_dir().join(format!("tc-part-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let dest = dir.join("report.pdf");
+
+        let err = save_to_host(&dest.to_string_lossy(), |partial, _created| async move {
+            // Stands in for the collision: something is already at the partial's
+            // name, so `create_new` fails and nothing here is ours.
+            std::fs::write(&partial, b"someone else's file").unwrap();
+            Err("Failed to create the partial file".to_string())
+        })
+        .await
+        .unwrap_err();
+        assert!(err.contains("Failed to create"), "{}", err);
+
+        let survivors: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(survivors.len(), 1, "{:?}", survivors);
+        assert!(survivors[0].contains("triple-c-part"), "{:?}", survivors);
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn a_download_into_a_directory_that_does_not_exist_says_so() {
+        // Resolution needs the parent to exist, which it always does behind a
+        // save dialog — but the refusal has to be a sentence, not an errno on
+        // its own.
+        let missing = std::env::temp_dir()
+            .join(format!("tc-missing-{}", uuid::Uuid::new_v4()))
+            .join("report.pdf");
+        let err = resolve_host_path(&missing.to_string_lossy(), HostPathUse::Write)
+            .await
+            .unwrap_err();
+        assert!(err.starts_with("Cannot save into"), "{}", err);
+    }
+
+    // ── Uploads ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn the_upload_reservation_is_one_exclusive_create_not_a_check_and_then_a_write() {
+        // What the old comment claimed: `no_overwrite_dir_non_dir` "closes the
+        // race" between the `test -e` probe and the extraction. It does not —
+        // Docker refuses only a directory replaced by a non-directory and the
+        // reverse, and file-over-file extraction proceeds, which is exactly the
+        // `.credentials.json` case the guard exists for. There was no test of
+        // any of it: the only occurrence of that name in the repository was the
+        // bollard field itself. This is that test, against the thing that
+        // actually closes the window.
+        let argv = upload_reservation_argv("/workspace/notes.txt");
+        assert_eq!(argv[0], "sh");
+        assert_eq!(argv[1], "-c");
+        // noclobber: `>` becomes an O_CREAT|O_EXCL open, so the check and the
+        // creation are one syscall.
+        assert!(argv[2].contains("set -C"), "{}", argv[2]);
+        assert!(argv[2].contains('>'), "{}", argv[2]);
+        // The path is an argument read back as `$0`, never part of the script.
+        assert_eq!(argv[3], "/workspace/notes.txt");
+        assert!(!argv[2].contains("/workspace"), "{}", argv[2]);
+
+        // So a path that would be an injection anywhere else changes nothing
+        // about what the shell is asked to run.
+        let hostile = upload_reservation_argv("/workspace/$(touch pwned)`id`; rm -rf ~");
+        assert_eq!(hostile[2], argv[2]);
+        assert_eq!(hostile[3], "/workspace/$(touch pwned)`id`; rm -rf ~");
+        assert_eq!(hostile.len(), 4);
+    }
+
+    #[test]
+    fn the_collision_refusal_matches_the_shape_the_frontend_parses() {
+        // `app/src/lib/uploadErrors.ts` matches the marker as a standalone
+        // upper-case token followed by `:` — so that an unrelated failure
+        // quoting a file called `FILE_EXISTS.txt` is not read as a collision
+        // and answered with an overwrite.
+        let err = upload_exists_error("/home/claude/.claude/.credentials.json");
+        assert!(err.starts_with("FILE_EXISTS:"), "{}", err);
+        assert_eq!(UPLOAD_EXISTS_MARKER, "FILE_EXISTS");
+        assert_eq!(
+            err,
+            "FILE_EXISTS: /home/claude/.claude/.credentials.json already exists"
+        );
+    }
+
+    // ── Listings ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_directory_too_big_to_buffer_is_described_as_one() {
+        // What the panel used to show for a directory past ~100k entries:
+        // "Command output exceeded 8388608 bytes and was abandoned" — true
+        // about a buffer, no help about a folder.
+        let refusal = format!("{}: Command output exceeded 8388608 bytes", OUTPUT_LIMIT_MARKER);
+        let described = describe_listing_failure("/workspace/big", refusal);
+        assert!(described.contains("too many entries"), "{}", described);
+        assert!(described.contains("/workspace/big"), "{}", described);
+        // Everything else is passed through as it arrived.
+        let other = describe_listing_failure("/workspace", "Exec output error: eof".to_string());
+        assert_eq!(other, "Exec output error: eof");
+    }
+
+    // ── Live Docker ─────────────────────────────────────────────────────────
+
+    /// The whole of H4 against a real daemon: plant the symlink, ask for the
+    /// download, show it is refused, then show an ordinary download still
+    /// arrives byte for byte. Also drives the container-side write-root
+    /// resolution, which cannot be tested any other way.
+    ///
+    /// Ignored because it needs Docker and pulls a container up; run it with
+    ///
+    /// ```text
+    /// cargo test -- --ignored --nocapture symlink_escape
+    /// ```
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon; creates and removes a throwaway container"]
+    async fn the_symlink_escape_is_closed_against_a_live_container() {
+        fn docker_cli(args: &[&str]) -> String {
+            let out = std::process::Command::new("docker")
+                .args(args)
+                .output()
+                .expect("docker CLI");
+            assert!(
+                out.status.success(),
+                "docker {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        let name = format!("tc-h4-live-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        docker_cli(&["run", "-d", "--name", &name, "ubuntu:24.04", "sleep", "300"]);
+        docker_cli(&["exec", &name, "useradd", "-m", "claude"]);
+        docker_cli(&[
+            "exec",
+            &name,
+            "sh",
+            "-c",
+            "mkdir -p /workspace && printf 'the payload' > /workspace/report.txt && ln -s /etc /workspace/escape && chown -R claude /workspace",
+        ]);
+
+        let (root, downloads, secret) = plant_symlinked_downloads();
+        let evil = downloads
+            .join("pub")
+            .join("authorized_keys")
+            .to_string_lossy()
+            .to_string();
+        let good = downloads.join("report.txt").to_string_lossy().to_string();
+
+        let cid = name.clone();
+        let refused = save_to_host(&evil, move |partial, created| async move {
+            stream_container_file_to_host(&cid, "/workspace/report.txt", &partial, created).await
+        })
+        .await;
+        println!("refused: {:?}", refused);
+        assert!(refused.is_err());
+        assert_eq!(
+            std::fs::read(&secret).unwrap(),
+            b"the key that was already there"
+        );
+
+        let cid = name.clone();
+        let (dest, written) = save_to_host(&good, move |partial, created| async move {
+            stream_container_file_to_host(&cid, "/workspace/report.txt", &partial, created).await
+        })
+        .await
+        .expect("an ordinary download");
+        println!("saved {} bytes to {}", written, dest.display());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"the payload");
+
+        // Container side: `/workspace/escape` is under a write root as a
+        // string and is `/etc` as a location.
+        let escaped = resolve_container_dir(&name, "Folder", "/workspace/escape").await;
+        println!("container escape: {:?}", escaped);
+        assert!(escaped.is_err(), "a symlink out of /workspace was accepted");
+        resolve_container_dir(&name, "Folder", "/workspace")
+            .await
+            .expect("/workspace itself");
+
+        let _ = std::fs::remove_dir_all(&root);
+        docker_cli(&["rm", "-f", &name]);
+    }
+
+    /// The claim the old comment made, checked against a real daemon: Docker's
+    /// `noOverwriteDirNonDir` does **not** stop a file replacing a file, and the
+    /// reservation does.
+    ///
+    /// Ignored for the same reason as the test above; run it with
+    ///
+    /// ```text
+    /// cargo test -- --ignored --nocapture overwrites_a_file
+    /// ```
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon; creates and removes a throwaway container"]
+    async fn docker_overwrites_a_file_with_a_file_and_the_reservation_is_what_refuses() {
+        fn docker_cli(args: &[&str]) -> String {
+            let out = std::process::Command::new("docker")
+                .args(args)
+                .output()
+                .expect("docker CLI");
+            assert!(
+                out.status.success(),
+                "docker {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        let name = format!("tc-h5-live-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        docker_cli(&["run", "-d", "--name", &name, "ubuntu:24.04", "sleep", "300"]);
+        docker_cli(&["exec", &name, "useradd", "-m", "claude"]);
+        docker_cli(&[
+            "exec",
+            &name,
+            "sh",
+            "-c",
+            "mkdir -p /workspace && printf 'the original' > /workspace/keep.txt && chown -R claude /workspace",
+        ]);
+
+        // 1. The flag the comment leaned on, exercised exactly as the upload
+        //    command sets it.
+        let tar = build_single_file_tar("keep.txt", b"replaced", 0o644, 0, 0, now_epoch_secs()).unwrap();
+        get_docker()
+            .unwrap()
+            .upload_to_container(
+                &name,
+                Some(UploadToContainerOptions {
+                    path: "/workspace".to_string(),
+                    no_overwrite_dir_non_dir: "true".to_string(),
+                }),
+                tar.into(),
+            )
+            .await
+            .expect("docker accepted the upload");
+        let after = docker_cli(&["exec", &name, "cat", "/workspace/keep.txt"]);
+        println!("after a file-over-file upload with noOverwriteDirNonDir: {:?}", after);
+        assert_eq!(after, "replaced", "Docker refused it after all — check the comment");
+
+        // 2. What actually refuses: one exclusive create.
+        let taken = reserve_upload_destination(&name, "/workspace/keep.txt").await;
+        println!("reservation over an existing file: {:?}", taken);
+        let err = taken.unwrap_err();
+        assert!(err.starts_with("FILE_EXISTS:"), "{}", err);
+        assert!(err.contains("/workspace/keep.txt"), "{}", err);
+        // …and the file it refused to touch is untouched.
+        assert_eq!(docker_cli(&["exec", &name, "cat", "/workspace/keep.txt"]), "replaced");
+
+        // 3. A free name is claimed, once.
+        reserve_upload_destination(&name, "/workspace/fresh.txt")
+            .await
+            .expect("a free name");
+        assert_eq!(docker_cli(&["exec", &name, "stat", "-c", "%s", "/workspace/fresh.txt"]), "0");
+        let again = reserve_upload_destination(&name, "/workspace/fresh.txt").await;
+        println!("reservation of the same name again: {:?}", again);
+        assert!(again.unwrap_err().starts_with("FILE_EXISTS:"));
+
+        // 4. A destination the container user cannot create is not reported as
+        //    a collision — the frontend would offer a Replace that cannot work.
+        let denied = reserve_upload_destination(&name, "/root/nope.txt").await;
+        println!("reservation somewhere unwritable: {:?}", denied);
+        let err = denied.unwrap_err();
+        assert!(!err.starts_with("FILE_EXISTS:"), "{}", err);
+
+        docker_cli(&["rm", "-f", &name]);
     }
 }
