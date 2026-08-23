@@ -4,8 +4,10 @@ import type { FileEntry } from "../lib/types";
 import * as commands from "../lib/tauri-commands";
 import { useAppState } from "../store/appState";
 import {
+  errorText,
   fileExistsPath,
   isFileExistsError,
+  readableRefusal,
   type OverwriteChoice,
 } from "../lib/uploadErrors";
 
@@ -99,8 +101,34 @@ export function useFileManager(projectId: string) {
     setCompleted(null);
   }, []);
 
-  const report = useCallback((message: string, detail?: string) => {
-    useAppState.getState().pushToast({ kind: "error", message, detail });
+  /**
+   * Report a failed operation, given the headline this hook would write and the
+   * raw failures behind it.
+   *
+   * The headline is what the *hook* knows ("Could not rename …"); it is a
+   * category, not an explanation. Some backend refusals are already a finished
+   * sentence written for the person reading it — a hidden host folder, a
+   * container path outside the roots this panel may change — and those used to
+   * arrive as the toast's `detail`, which `ToastHost` renders as collapsed
+   * monospace behind a "Details" button. So the sentence that said what was
+   * wrong and what to do about it was hidden under a headline that said
+   * neither. When every failure reduces to the *same* such sentence — which is
+   * the normal case, since these refusals are about the target directory and so
+   * fail identically for every file in a batch — it becomes the headline and
+   * there is nothing left to hide.
+   */
+  const report = useCallback((message: string, ...causes: unknown[]) => {
+    const refusals = causes.map(readableRefusal);
+    const shared =
+      causes.length > 0 && refusals.every((r) => r !== null)
+        ? [...new Set(refusals as string[])]
+        : [];
+    const promoted = shared.length === 1 ? shared[0] : null;
+    useAppState.getState().pushToast({
+      kind: "error",
+      message: promoted ?? message,
+      detail: promoted || causes.length === 0 ? undefined : causes.map(errorText).join("\n"),
+    });
   }, []);
 
   const confirm = useCallback((message: string) => {
@@ -161,7 +189,7 @@ export function useFileManager(projectId: string) {
           setBusy(null);
         }
       } catch (e) {
-        report(`Could not save "${entry.name}" to the host`, String(e));
+        report(`Could not save "${entry.name}" to the host`, e);
       }
     },
     [projectId, startWork, report, confirm],
@@ -194,6 +222,14 @@ export function useFileManager(projectId: string) {
   const askOverwrite = useCallback(
     (hostPath: string, directory: string, remaining: number, containerPath: string | null) =>
       new Promise<OverwriteChoice>((resolve) => {
+        // One batch asks one question at a time — the loop awaits each answer —
+        // so a resolver still sitting here belongs to a *different* batch (two
+        // drops in flight at once, or a drop landing while the Upload button's
+        // batch is still copying). Installing over it would leave that batch
+        // awaiting an answer no dialog can ever produce: a silent hang, with
+        // its file neither uploaded nor skipped. Skipping it is the same
+        // reading of "the dialog went away" the unmount cleanup uses.
+        conflictResolver.current?.("skip");
         conflictResolver.current = resolve;
         setConflict({
           hostPath,
@@ -221,7 +257,8 @@ export function useFileManager(projectId: string) {
       // the end, because the user is free to walk away while it copies.
       const target = currentPathRef.current;
       startWork(`Uploading ${hostPaths.length} item${hostPaths.length > 1 ? "s" : ""}…`);
-      const failures: string[] = [];
+      /** Raw failures, kept unstringified so `report` can read their shape. */
+      const failures: unknown[] = [];
       let uploaded = 0;
       let skipped = 0;
       /** A "…all" answer, applied to every remaining clash without asking. */
@@ -235,7 +272,7 @@ export function useFileManager(projectId: string) {
             continue;
           } catch (e) {
             if (!isFileExistsError(e)) {
-              failures.push(String(e));
+              failures.push(e);
               continue;
             }
             const choice: OverwriteChoice =
@@ -256,7 +293,7 @@ export function useFileManager(projectId: string) {
             await commands.uploadFileToContainer(projectId, hostPath, target, true);
             uploaded++;
           } catch (e) {
-            failures.push(String(e));
+            failures.push(e);
           }
         }
       } finally {
@@ -273,7 +310,7 @@ export function useFileManager(projectId: string) {
       if (failures.length > 0) {
         report(
           failures.length === 1 ? "A file could not be uploaded" : `${failures.length} files could not be uploaded`,
-          failures.join("\n"),
+          ...failures,
         );
       }
       // Only re-list if the user is still looking at the directory this went
@@ -331,7 +368,7 @@ export function useFileManager(projectId: string) {
         setCompleted(`"${entry.name}" is ready to drag.`);
         return { hostPath, cached: false };
       } catch (e) {
-        report(`Could not prepare "${entry.name}" for dragging`, String(e));
+        report(`Could not prepare "${entry.name}" for dragging`, e);
         return null;
       } finally {
         setBusy(null);
@@ -346,7 +383,7 @@ export function useFileManager(projectId: string) {
       if (!selected) return;
       await uploadPaths(Array.isArray(selected) ? selected : [selected as string]);
     } catch (e) {
-      report("Could not open the file picker", String(e));
+      report("Could not open the file picker", e);
     }
   }, [uploadPaths, report]);
 
@@ -366,7 +403,7 @@ export function useFileManager(projectId: string) {
         if (currentPathRef.current === target) await navigate(target);
         return true;
       } catch (e) {
-        report(`Could not rename "${entry.name}"`, String(e));
+        report(`Could not rename "${entry.name}"`, e);
         return false;
       }
     },
@@ -384,7 +421,7 @@ export function useFileManager(projectId: string) {
         if (currentPathRef.current === target) await navigate(target);
         return true;
       } catch (e) {
-        report(`Could not create "${trimmed}"`, String(e));
+        report(`Could not create "${trimmed}"`, e);
         return false;
       }
     },

@@ -571,4 +571,57 @@ describe("BrowserTab", () => {
     // The view is still in the tab, where it was.
     expect(screen.getByTitle("Playwright browser view for api-server")).toBeInTheDocument();
   });
+
+  it("pins the pane's sandbox: same-origin kept, top-navigation never granted", async () => {
+    await renderLive();
+    const frame = await screen.findByTitle("Playwright browser view for api-server");
+    const tokens = new Set(
+      (frame.getAttribute("sandbox") ?? "").split(/\s+/).filter(Boolean),
+    );
+
+    // What is framed here is served by a process *inside* the container, which
+    // is the untrusted side of this app. A top-navigation grant would let that
+    // page set `top.location` and steer the whole Triple-C app window away from
+    // itself — a sandbox escape from the app's point of view — and
+    // `allow-popups-to-escape-sandbox` is the same hole one step removed: it
+    // hands a popup an entirely unsandboxed context. Checked token by token so
+    // the failure names the one that was added.
+    for (const forbidden of [
+      "allow-top-navigation",
+      "allow-top-navigation-by-user-activation",
+      "allow-top-navigation-to-custom-protocols",
+      "allow-popups-to-escape-sandbox",
+    ]) {
+      expect(
+        tokens.has(forbidden),
+        `FORBIDDEN iframe sandbox token "${forbidden}" on the browser view pane. ` +
+          "A page served from inside the container could then navigate the whole " +
+          "Triple-C app window away from itself (or run a popup unsandboxed) — a " +
+          "sandbox escape. Remove it from the iframe in BrowserTab.tsx.",
+      ).toBe(false);
+    }
+
+    // `allow-same-origin` must stay. The browser_view proxy's token gate
+    // recognises the pane's own sub-resource requests by their `Origin`/
+    // `Referer` header; dropping this token gives the frame an opaque origin,
+    // which sends `null`, so the proxy refuses those requests and the pane
+    // renders blank.
+    expect(
+      tokens.has("allow-same-origin"),
+      'REQUIRED iframe sandbox token "allow-same-origin" is missing from the ' +
+        "browser view pane. Without it the frame has an opaque origin and sends " +
+        "`Origin: null`, which the browser_view proxy's token gate refuses — the " +
+        "pane goes blank.",
+    ).toBe(true);
+
+    // And the exact set, so any *other* new grant is a deliberate edit here too.
+    expect([...tokens].sort()).toEqual([
+      "allow-downloads",
+      "allow-forms",
+      "allow-modals",
+      "allow-popups",
+      "allow-same-origin",
+      "allow-scripts",
+    ]);
+  });
 });

@@ -13,6 +13,23 @@ function targetKey(target: ReclaimTarget): string {
   return JSON.stringify(target);
 }
 
+/** The same, for a destructive object — never ticked, but still listed. */
+function destructiveKey(item: DestructiveItem): string {
+  return JSON.stringify(item.target);
+}
+
+/**
+ * An orphaned volume is confirmed against **its own name**, not a project's.
+ *
+ * There is no project to name: the whole definition of the variant is that its
+ * id matches nothing in the store, and `disk.rs`'s `destroy` takes the orphan
+ * arm before it ever looks a project up. `DestructiveItem.project_name` carries
+ * the volume name for exactly these items, which is what the gate compares.
+ */
+function isOrphanVolume(item: DestructiveItem): boolean {
+  return item.target.kind === "orphan_volume";
+}
+
 /**
  * Where the disk went, and how to get it back.
  *
@@ -25,17 +42,31 @@ function targetKey(target: ReclaimTarget): string {
  *
  * ## Why the buckets are separated the way they are
  *
- * Safe work (dangling images, ownerless pins, build cache, volumes whose
- * project id is not in the project store) gets one list of ticks and one
- * button, because none of it can lose anything a user has. Note what the last
- * of those is derived from: membership in Triple-C's own project list, never
- * "this project has no container" — an idle live project looks exactly like a
- * deleted one from the daemon's side, and mistaking the two would delete
- * credentials and transcripts. Semi-safe work (compaction, cache clearing) is a rewrite or a
- * re-download and is confirmed one at a time. Destructive work — a live
- * project's volumes, its snapshot, a live rollback pin — is not in either list:
- * it is reached only from that project's own row, behind a typed confirmation,
- * and the backend refuses it in bulk by taking a different type entirely.
+ * Safe work (dangling images, ownerless pins, build cache) gets one list of
+ * ticks and one button, because none of it can lose anything a user has.
+ * Semi-safe work (compaction, cache clearing) is a rewrite or a re-download and
+ * is confirmed one at a time. Destructive work — a live project's volumes, its
+ * snapshot, a live rollback pin, **and an orphaned volume** — is not in either
+ * list: it is reached one object at a time, behind a typed confirmation, and
+ * the backend refuses it in bulk by taking a different type entirely.
+ *
+ * ## Why orphaned volumes are down there and not in the tick list
+ *
+ * They used to be a `ReclaimTarget` at `Safety::Safe`: a tick and the group
+ * Reclaim button, no confirmation. The object behind that tick is a
+ * `triple-c-claude-config-*` volume holding a Claude OAuth credential, every
+ * plugin and skill installed into that project, and every conversation
+ * transcript it ever had — and the *same volume* for a project still in the
+ * store required typing the project's name. The only difference between the two
+ * is a lookup against `projects.json`, which this app has been wrong about
+ * before: a second instance's project is absent from an in-memory list, a
+ * corrupt store empties it, a restored data directory empties it too. It once
+ * flagged two live projects as orphaned.
+ *
+ * So "no matching project" means one thing only — the id is not in the project
+ * list. It is never inferred from a project being stopped, having no container
+ * or having no image; an idle live project looks identical from the daemon's
+ * side. Each volume is deleted on its own, against its own name typed out.
  */
 export default function DiskSettings() {
   const {
@@ -67,6 +98,14 @@ export default function DiskSettings() {
   useEffect(() => {
     if (!plan) setTicked(new Set());
   }, [plan]);
+
+  // Split before anything renders. The per-project table keys off
+  // `project_id`, and an orphan's id matches no row by definition — so without
+  // this split those items are simply invisible, which is how a variant that
+  // moved from the tick list to the destructive list can vanish from the UI
+  // entirely rather than reappear behind a confirmation.
+  const orphanVolumes = plan?.destructive.filter(isOrphanVolume) ?? [];
+  const projectDestructive = plan?.destructive.filter((d) => !isOrphanVolume(d)) ?? [];
 
   const safeItems = plan?.items.filter((i) => i.safety === "safe") ?? [];
   const semiItems = plan?.items.filter((i) => i.safety === "semi_safe") ?? [];
@@ -201,7 +240,7 @@ export default function DiskSettings() {
             </h3>
             <DiskProjectTable
               rows={report.projects}
-              destructive={plan?.destructive ?? []}
+              destructive={projectDestructive}
               onDestroy={openDestroying}
             />
           </section>
@@ -282,8 +321,9 @@ export default function DiskSettings() {
                 volume&rsquo;s project id is not in your project list &mdash; it is{" "}
                 <em>not</em> inferred from a project being stopped or having no image. A project you have not opened in a
                 while has no container and no snapshot either, and that is normal, so
-                each of these is ticked individually and shows the date Docker created
-                it.
+                nothing here is deleted in a group: each one is listed below on its own,
+                with the date Docker created it, and removing it takes typing that
+                volume&rsquo;s name.
               </p>
             )}
             <p className="text-[11px] text-[var(--text-secondary)]">
@@ -455,6 +495,72 @@ export default function DiskSettings() {
             </section>
           )}
 
+          {/* --- Orphaned volumes: destructive, one at a time ---------------- */}
+          {orphanVolumes.length > 0 && (
+            <section className="space-y-2" data-testid="disk-orphan-bucket">
+              <h3 className="text-[13px] font-medium text-[var(--text-primary)]">
+                Volumes with no matching project
+              </h3>
+              <p className="text-xs text-[var(--text-secondary)] leading-relaxed">
+                A volume here is one whose project id is not in your project list. That
+                is <em>all</em> it means &mdash; it is <em>not</em> inferred from a
+                project being stopped, having no container or having no image. An idle
+                live project looks exactly the same from Docker&rsquo;s side, and that
+                inference has already flagged two live projects here once.
+              </p>
+              <p className="text-xs text-[var(--text-secondary)] leading-relaxed">
+                Deleting a{" "}
+                <span className="font-mono">triple-c-claude-config-*</span> volume
+                deletes{" "}
+                <strong className="text-[var(--text-primary)]">
+                  the Claude login credential that project signed in with, every plugin
+                  and skill installed into it, and every conversation transcript it ever
+                  had
+                </strong>
+                . A <span className="font-mono">triple-c-home-*</span> volume holds its
+                dotfiles, shell history and installed toolchains. There is no other copy
+                of either and nothing regenerates, so each one is deleted on its own,
+                against that volume&rsquo;s name typed out &mdash; never as part of a
+                group.
+              </p>
+              <ul className="space-y-1.5">
+                {orphanVolumes.map((item) => (
+                  <li
+                    key={destructiveKey(item)}
+                    className="flex items-start justify-between gap-3"
+                    data-testid={`disk-orphan-${item.project_name}`}
+                  >
+                    <span className="flex-1 min-w-0">
+                      <span className="block text-[var(--text-primary)] font-mono break-all">
+                        {item.label}
+                      </span>
+                      <span className="block text-xs text-[var(--text-secondary)] leading-snug">
+                        {item.loses}
+                      </span>
+                      {item.blocked && (
+                        <span className="block text-xs text-[var(--text-disabled)]">
+                          {item.blocked}
+                        </span>
+                      )}
+                    </span>
+                    <span className="flex items-center gap-2 whitespace-nowrap">
+                      <span className="text-xs text-[var(--text-secondary)] tabular-nums">
+                        {formatBytes(item.bytes)}
+                      </span>
+                      <Button
+                        size="sm"
+                        disabled={item.blocked !== null || working}
+                        onClick={() => openDestroying(item)}
+                      >
+                        Delete&hellip;
+                      </Button>
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+
           {/* --- Sweep ------------------------------------------------------ */}
           <section className="flex items-center gap-3 flex-wrap">
             <Button size="sm" disabled={working} onClick={runSweep}>
@@ -590,11 +696,24 @@ export default function DiskSettings() {
       )}
 
       {/* --- Destructive confirmation --------------------------------------- */}
-      {destroying && (
+      {destroying && (() => {
+        // An orphaned volume has no project, so nothing about this dialog can
+        // be phrased in terms of one: the gate takes the volume's own name (as
+        // `disk.rs`'s `destroy` does), and the name is never lower-cased on its
+        // way to the title, because the comparison the backend makes is
+        // case-sensitive and a mangled name in the heading is a name the user
+        // cannot type.
+        const orphan = isOrphanVolume(destroying);
+        return (
         <TypedConfirmModal
-          title={`Delete ${destroying.label.toLowerCase()}`}
+          title={
+            orphan
+              ? `Delete volume ${destroying.project_name}`
+              : `Delete ${destroying.label.toLowerCase()}`
+          }
           expected={destroying.project_name}
-          confirmLabel={`Delete ${destroying.label.toLowerCase()}`}
+          subject={orphan ? "volume name" : "project name"}
+          confirmLabel={orphan ? "Delete volume" : `Delete ${destroying.label.toLowerCase()}`}
           busy={working}
           // A failure here has to land inside the dialog. The panel's own
           // error line is at the top of several screens of scroll, and this
@@ -610,20 +729,39 @@ export default function DiskSettings() {
             if (ok) setDestroying(null);
           }}
         >
-          <p>
-            This removes{" "}
-            <strong className="text-[var(--text-primary)]">
-              {destroying.project_name}
-            </strong>
-            &rsquo;s {destroying.label.toLowerCase()}, freeing{" "}
-            {formatBytes(destroying.bytes)}.
-          </p>
+          {orphan ? (
+            <p>
+              This removes the volume{" "}
+              <strong className="text-[var(--text-primary)] font-mono break-all">
+                {destroying.project_name}
+              </strong>
+              , freeing {formatBytes(destroying.bytes)}. It is offered here for one
+              reason only: no project in your list has its id. That is a lookup against
+              a file, not a judgement about whether anything is using the volume.
+            </p>
+          ) : (
+            <p>
+              This removes{" "}
+              <strong className="text-[var(--text-primary)]">
+                {destroying.project_name}
+              </strong>
+              &rsquo;s {destroying.label.toLowerCase()}, freeing{" "}
+              {formatBytes(destroying.bytes)}.
+            </p>
+          )}
           <p className="text-[var(--error)]">{destroying.loses}</p>
+          {orphan && (
+            <p>
+              Nothing here can undo this. If you recognise that project id, close this
+              and leave the volume alone until you are certain.
+            </p>
+          )}
           <p>
             Your mounted project folders live on the host and are not affected by this.
           </p>
         </TypedConfirmModal>
-      )}
+        );
+      })()}
     </div>
   );
 }

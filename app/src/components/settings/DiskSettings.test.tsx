@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, act, waitFor, within } from "@testing-library/react";
 import DiskSettings from "./DiskSettings";
 import type {
+  DestructiveItem,
   DiskUsageReport,
   ProjectDiskRow,
   ReclaimItem,
@@ -45,6 +46,9 @@ const row = (over: Partial<ProjectDiskRow> = {}): ProjectDiskRow => ({
   home_volume_present: true,
   config_volume_bytes: 427_000_000,
   config_volume_present: true,
+  // The one figure the Snapshot column shows and the Total is built from.
+  // 8.44 + 0.868 + 4.86 + 0.427 == 14.596, and the table is expected to add up.
+  snapshot_attributed_bytes: 8_440_966_715,
   total_bytes: 14_595_966_715,
   migrating: false,
   ...over,
@@ -112,6 +116,26 @@ const result = (over: Partial<ReclaimResult> = {}): ReclaimResult => ({
   freed_bytes: 0,
   projected_bytes: null,
   message: "Removed 3 images.",
+  ...over,
+});
+
+/** An orphaned volume, as `list_reclaimable` now describes it: a
+ *  `DestructiveItem`, never a `ReclaimItem`. `project_name` carries the
+ *  *volume* name, because there is no project to name — that is the definition
+ *  of the variant, and it is what `destroy` compares the typed string against. */
+const orphan = (over: Partial<DestructiveItem> = {}): DestructiveItem => ({
+  target: {
+    kind: "orphan_volume",
+    name: "triple-c-claude-config-gone",
+    project_id: "gone",
+  },
+  project_id: "gone",
+  project_name: "triple-c-claude-config-gone",
+  label: "triple-c-claude-config-gone (config volume)",
+  loses:
+    "Named for project id gone, which is not in Triple-C's project list, and no container is attached to it. Docker created it on 2026-03-14T09:00:00Z. This is a `.claude` volume — it held that project's Claude credential, plugins and session transcripts. Not recoverable. Type the volume name to confirm.",
+  bytes: 900_000,
+  blocked: null,
   ...over,
 });
 
@@ -196,14 +220,43 @@ describe("DiskSettings", () => {
     expect(within(projectRow).queryByText("17")).not.toBeInTheDocument();
   });
 
-  it("renders an unmeasurable snapshot split as a dash, never as zero", async () => {
+  it("builds the Snapshot column and the Total from the same attributed figure", async () => {
+    // The bug this pins: the column rendered `snapshot_above_base_bytes` and
+    // fell back to `—`, while the total was `snapshot_bytes -
+    // snapshot_shared_bytes` regardless — which in the fallback branch is the
+    // whole 4.7 GB base image, charged to every row and then added again as a
+    // base-image row in the globals. One field, computed once in Rust.
+    await renderAndScan();
+    const projectRow = await screen.findByTestId("disk-row-p-whp");
+    expect(within(projectRow).getByText("8.4 GB")).toBeInTheDocument();
+    expect(within(projectRow).getByText("14.6 GB")).toBeInTheDocument();
+  });
+
+  it("says a snapshot figure is the whole image rather than passing it off as a share", async () => {
+    // `snapshot_above_base_bytes` is null in exactly one branch: nothing
+    // measurably shares layers with the snapshot *and* its base is gone. The
+    // attributed figure is then the whole image — an honest cost, not a guess
+    // and not zero — but it does not mean what the other rows' figures mean,
+    // so the sub-line has to say which one this is.
     getDockerDiskUsage.mockResolvedValue(
-      report({ projects: [row({ snapshot_above_base_bytes: null })] }),
+      report({
+        projects: [
+          row({
+            snapshot_shared_bytes: 0,
+            snapshot_above_base_bytes: null,
+            snapshot_attributed_bytes: 12_273_392_374,
+            total_bytes: 18_428_392_374,
+          }),
+        ],
+      }),
     );
     await renderAndScan();
     const projectRow = await screen.findByTestId("disk-row-p-whp");
     expect(within(projectRow).queryByText("0 B")).not.toBeInTheDocument();
-    expect(within(projectRow).getAllByText("—").length).toBeGreaterThan(0);
+    expect(within(projectRow).getByText("12.3 GB")).toBeInTheDocument();
+    expect(projectRow.textContent).toMatch(/whole image — base unknown/);
+    // And it must not still claim the "N with base" split it cannot measure.
+    expect(projectRow.textContent).not.toMatch(/with base/);
   });
 
   it("marks a heavily stacked snapshot with a word, not just a colour", async () => {
@@ -422,6 +475,79 @@ describe("DiskSettings", () => {
     expect(globals.textContent).toMatch(
       /A project you have not opened in a while has no container and no snapshot either, and that is normal/i,
     );
+  });
+
+  it("never offers an orphaned volume as a tick in the safe bucket", async () => {
+    // It used to be a `ReclaimTarget` at `Safety::Safe` — a tick and the group
+    // Reclaim button, no confirmation — for a volume holding a Claude
+    // credential and every transcript a project ever had. The Rust variant is
+    // gone; this pins that the frontend cannot resurrect it.
+    listReclaimable.mockResolvedValue(plan({ destructive: [orphan()] }));
+    await renderAndScan();
+    const safe = await screen.findByTestId("disk-safe-bucket");
+    expect(within(safe).getAllByRole("checkbox")).toHaveLength(1);
+    expect(safe.textContent).not.toMatch(/triple-c-claude-config-gone/);
+    // And it is reachable — an item that matches no project row would
+    // otherwise simply vanish from the UI.
+    expect(await screen.findByTestId("disk-orphan-bucket")).toBeInTheDocument();
+  });
+
+  it("keeps orphaned volumes out of the per-project table", async () => {
+    // The table keys off `project_id`, and an orphan's id matches no row by
+    // definition. Passing them in anyway is how one would leak into the wrong
+    // project's overflow menu if a row ever shared the id.
+    listReclaimable.mockResolvedValue(plan({ destructive: [orphan()] }));
+    await renderAndScan();
+    const projectRow = await screen.findByTestId("disk-row-p-whp");
+    expect(projectRow.textContent).not.toMatch(/triple-c-claude-config-gone/);
+  });
+
+  it("says what a config volume actually holds, not 'volume data'", async () => {
+    listReclaimable.mockResolvedValue(plan({ destructive: [orphan()] }));
+    await renderAndScan();
+    const bucket = await screen.findByTestId("disk-orphan-bucket");
+    expect(bucket.textContent).toMatch(/Claude login credential/i);
+    expect(bucket.textContent).toMatch(/every plugin and skill installed into it/i);
+    expect(bucket.textContent).toMatch(/every conversation transcript it ever had/i);
+    // The derivation caveat travels with the offer, not only with the totals.
+    expect(bucket.textContent).toMatch(/not.*inferred from a project being stopped/i);
+  });
+
+  it("confirms an orphaned volume against its own name, never a project's", async () => {
+    listReclaimable.mockResolvedValue(plan({ destructive: [orphan()] }));
+    destroyProjectDiskObject.mockResolvedValue({ results: [], total_freed_bytes: 0 });
+    await renderAndScan();
+    const bucket = await screen.findByTestId("disk-orphan-bucket");
+    await act(async () => {
+      fireEvent.click(within(bucket).getByRole("button", { name: /Delete/ }));
+    });
+
+    const dialog = screen.getByRole("dialog");
+    // Asking for "the exact project name" would be asking for a string that
+    // does not exist.
+    expect(within(dialog).getByRole("status")).toHaveTextContent(
+      "Waiting for the exact volume name.",
+    );
+    const input = within(dialog).getByLabelText(/Type/);
+    const confirm = within(dialog).getByRole("button", { name: "Delete volume" });
+
+    // The project id parsed out of the name is display only and must not open
+    // the gate.
+    fireEvent.change(input, { target: { value: "gone" } });
+    expect(confirm).toBeDisabled();
+
+    fireEvent.change(input, { target: { value: "triple-c-claude-config-gone" } });
+    expect(confirm).toBeEnabled();
+    await act(async () => {
+      fireEvent.click(confirm);
+    });
+
+    expect(destroyProjectDiskObject).toHaveBeenCalledWith(
+      { kind: "orphan_volume", name: "triple-c-claude-config-gone", project_id: "gone" },
+      "triple-c-claude-config-gone",
+    );
+    // One volume, one confirmation — `reclaim` never sees it.
+    expect(reclaim).not.toHaveBeenCalled();
   });
 
   it("explains a suppressed orphan list instead of showing an empty one", async () => {
@@ -647,7 +773,7 @@ describe("DiskSettings", () => {
         result({ target: { kind: "migration_pins" } }),
         result({ target: { kind: "probe_containers" } }),
         result({ target: { kind: "build_cache", all: true }, ok: false }),
-        result({ target: { kind: "orphan_volume", name: "v" }, ok: false }),
+        result({ target: { kind: "scrub_containers" }, ok: false }),
       ],
       total_freed_bytes: 1_200_000_000,
     });

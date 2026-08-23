@@ -861,6 +861,22 @@ export interface ProjectDiskRow {
   home_volume_present: boolean;
   config_volume_bytes: number;
   config_volume_present: boolean;
+  /** **The one snapshot figure a row adds up from.** The Snapshot column shows
+   *  this and `total_bytes` is computed from it, so the Total reconciles with
+   *  its parts. It did not before: the total used `snapshot_bytes -
+   *  snapshot_shared_bytes` unconditionally while the column fell back to
+   *  `snapshot_above_base_bytes` or to `—`, and in that fallback branch the
+   *  subtraction is the *whole base image* — 4.7 GB charged to every row.
+   *
+   *  Rust computes it in one function (`snapshot_attribution`), in this order:
+   *  a `df()` shared size gives `size - shared`; failing that a known base
+   *  lineage gives the layer arithmetic; failing both it is the full size,
+   *  which is the honest answer for an image nothing shares with.
+   *
+   *  It is always a number — never null. "Unknown" applies to
+   *  `snapshot_above_base_bytes` (the *split*, which really can be
+   *  unmeasurable) and to the layer count, not to this. */
+  snapshot_attributed_bytes: number;
   total_bytes: number;
   migrating: boolean;
 }
@@ -953,17 +969,38 @@ export type ReclaimTarget =
   | { kind: "migration_staging" }
   | { kind: "probe_containers" }
   | { kind: "scrub_containers" }
-  | { kind: "orphan_volume"; name: string }
   | { kind: "compact_snapshot"; project_id: string }
   | { kind: "clear_caches"; project_id: string; include_rustup: boolean };
 
-/** Mirrors Rust `DestructiveTarget`. Every one of these deletes something with
- *  no other copy, and needs the project's name typed to confirm. */
+/** Mirrors Rust `DestructiveTarget`, an internally tagged enum (serde
+ *  `tag = "kind"`, snake_case). Every one of these deletes something with no
+ *  other copy, and needs a name typed to confirm — the *project's* name for
+ *  every variant except `orphan_volume`, which has no project and takes the
+ *  volume's own name. `DestructiveItem.project_name` carries whichever string
+ *  is the one to type. */
 export type DestructiveTarget =
   | { kind: "home_volume"; project_id: string }
   | { kind: "config_volume"; project_id: string }
   | { kind: "snapshot_image"; project_id: string }
-  | { kind: "rollback_pin"; project_id: string; tag: string };
+  | { kind: "rollback_pin"; project_id: string; tag: string }
+  /** A `triple-c-home-*` / `triple-c-claude-config-*` volume whose project id
+   *  is in no `projects.json` this app can find.
+   *
+   *  **This was a `ReclaimTarget` at `Safety::Safe`** — a tick and a group
+   *  Reclaim button, no confirmation at all. The object behind that tick is a
+   *  `triple-c-claude-config-*` volume holding a Claude OAuth credential,
+   *  every installed plugin and skill, and every conversation transcript that
+   *  project ever had; the *same volume* for a project still in the store
+   *  required typing the project's name. The only difference between the two
+   *  is a lookup against a file this app has been wrong about before — a
+   *  second instance's project is absent from an in-memory list, a corrupt
+   *  `projects.json` empties it, a restored data directory empties it too.
+   *
+   *  `project_id` is parsed out of the volume name and is display only: it
+   *  names no project in the store, which is the entire definition of this
+   *  variant. Rust's `destroy` takes the orphan arm *before* looking a project
+   *  up, and compares the typed string against `name`. */
+  | { kind: "orphan_volume"; name: string; project_id: string };
 
 export interface ReclaimItem {
   target: ReclaimTarget;
