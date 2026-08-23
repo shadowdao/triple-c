@@ -70,7 +70,7 @@ export default function Modal({
   // A dialog portals to `document.body`, so the `hidden` class its pane uses to
   // step aside for another tab cannot reach it. `PaneVisibility` is how it
   // finds out, and while it is false this dialog paints nothing, traps
-  // nothing, and — via `[hidden]` — blocks no native file drop.
+  // nothing, holds no focus, and blocks no native file drop.
   const paneVisible = usePaneVisible();
   const paneVisibleRef = useRef(paneVisible);
   paneVisibleRef.current = paneVisible;
@@ -85,11 +85,19 @@ export default function Modal({
     };
   }, []);
 
-  // Move focus inside — on mount, and again whenever the pane comes back.
+  // Move focus inside — on mount, and again whenever the pane comes back. And
+  // move it *out* when the pane steps aside: the backdrop goes `display:none`
+  // with the keyboard focus still inside it, and nothing else relocates it, so
+  // the user lands on the new tab with focus held by a dialog they cannot see.
+  // Blurring puts it on `<body>`, which is where a fresh Tab starts.
   useEffect(() => {
-    if (!paneVisible) return;
     const panel = panelRef.current;
     if (!panel) return;
+    if (!paneVisible) {
+      const active = panel.ownerDocument.activeElement as HTMLElement | null;
+      if (active && panel.contains(active)) active.blur?.();
+      return;
+    }
     const target = initialFocusRef?.current ?? focusableWithin(panel)[0] ?? panel;
     // Defer so the panel is laid out (offsetParent) before we query it.
     const frame = requestAnimationFrame(() => target.focus?.());
@@ -151,10 +159,11 @@ export default function Modal({
       ref={overlayRef}
       onClick={handleOverlayClick}
       className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4"
-      /* The backdrop, not the panel, is what `elementFromPoint` returns for a
-         drop released beside the dialog — so it is the element that has to say
-         "I swallow drops". See `lib/dropTarget.ts`. */
-      data-blocks-drop="true"
+      /* This dialog swallows native file drops for as long as it is on screen.
+         Dropped while the owning pane is hidden, so a dialog parked on another
+         tab does not keep refusing drops here — `lib/dropTarget.ts` also
+         filters `[hidden]`, and these two must not disagree. */
+      data-blocks-drop={paneVisible ? "true" : undefined}
       hidden={!paneVisible}
       aria-hidden={paneVisible ? undefined : true}
       /* `hidden` is a base-layer rule and `flex` is a utility-layer one, so the
