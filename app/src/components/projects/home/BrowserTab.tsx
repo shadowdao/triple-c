@@ -457,6 +457,35 @@ export default function BrowserTab({ project, active }: Props) {
           // host-side gate checks before anything reaches the container.
           src={status.url ?? undefined}
           title={`Playwright browser view for ${project.name}`}
+          // What is framed here is served by a process inside the container,
+          // which is the untrusted side of this app. Unsandboxed, it could
+          // simply set `top.location` and navigate the *app's* webview
+          // somewhere of its choosing — the frame is cross-origin, so it cannot
+          // read the app, but steering the whole window is not something a
+          // viewer pane should be able to do.
+          //
+          // The allowances are what the Playwright dashboard actually needs and
+          // no more:
+          //   allow-scripts      — it is an application, not a document.
+          //   allow-same-origin  — it must reach its own WebSocket and assets,
+          //                        and the host-side gate recognises the pane's
+          //                        own sub-resource requests by their
+          //                        `Origin`/`Referer`; an opaque origin would
+          //                        send `null` and be refused. This does not
+          //                        grant access to *this* app: 127.0.0.1:4782x
+          //                        is a different origin from the app's.
+          //   allow-forms/-modals/-downloads/-popups — dashboard UI affordances
+          //                        (trace download, confirm dialogs, opening a
+          //                        page in a new window).
+          //
+          // Deliberately absent, and the point of the attribute:
+          // `allow-top-navigation`, `allow-top-navigation-by-user-activation`
+          // and `allow-popups-to-escape-sandbox`. Do not add them.
+          //
+          // No `referrerPolicy` either: the gate in `browser_view/proxy.rs`
+          // reads the token out of a same-origin `Referer`, so stripping it
+          // would break the pane.
+          sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-downloads allow-popups"
           className="flex-1 min-h-0 w-full border-0 bg-[var(--bg-primary)]"
         />
       ) : live ? (

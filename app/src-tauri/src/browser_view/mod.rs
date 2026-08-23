@@ -304,21 +304,7 @@ impl BrowserViewManager {
         // a container with no dashboard makes this a no-op.
         let _ = kill_dashboard(&container_id, &cli_entry).await;
 
-        let container_port = pick_viewer_port(&container_id).await?;
-        launch_viewer(&container_id, &cli_entry, container_port).await?;
-
-        // Wait for it to actually answer, and learn the entry URL while we're
-        // there — see `probe_entry_path` for why that matters. This, not the
-        // launcher's stdout, is the readiness signal: verified that the
-        // "Listening on …" line is printed only on the very first start.
-        let entry_path = match wait_until_ready(&container_id, container_port).await {
-            Ok(path) => path,
-            Err(e) => {
-                let log = read_viewer_log(&container_id).await;
-                let _ = kill_dashboard(&container_id, &cli_entry).await;
-                return Err(explain_start_failure(&e, &log));
-            }
-        };
+        let (container_port, entry_path) = start_viewer(&container_id, &cli_entry).await?;
 
         let token = generate_token();
         // `--host 127.0.0.1` is ours to set, so the family is known and there is
@@ -601,12 +587,91 @@ async fn read_viewer_log(container_id: &str) -> String {
 // Readiness, ports, URLs
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// First port in [`VIEWER_PORTS`] that nothing in the container is listening on.
-async fn pick_viewer_port(container_id: &str) -> Result<u16, String> {
+/// How many free ports a start will try before giving up.
+///
+/// More than one because port choice is a check-then-bind: the free list comes
+/// from a snapshot of the container's `/proc/net/tcp`, and anything in the
+/// container may bind the port we picked before the dashboard gets to it. One
+/// retry per lost race is the recovery; the cap is what stops a container that
+/// binds every candidate from holding a start open for
+/// `MAX_PORT_ATTEMPTS × READY_TIMEOUT`.
+const MAX_PORT_ATTEMPTS: usize = 3;
+
+/// Get a viewer listening inside the container and return the port it is on
+/// plus the path the pane should load.
+///
+/// ## The check/bind race
+///
+/// [`pick_viewer_port`] reads a *snapshot* of container listeners; the dashboard
+/// binds some milliseconds later. Nothing here can make that atomic — the bind
+/// happens in another process, in another namespace, and `playwright-cli show`
+/// reports the port it actually took only on a first-ever start (see
+/// [`wait_until_ready`]). What is possible is to stop treating the first
+/// candidate as the only one: if the port we picked does not come up, walk to
+/// the next free candidate rather than failing the whole start.
+///
+/// Residual, stated rather than glossed: a container-side process that binds the
+/// candidate port *and answers HTTP* is indistinguishable from the dashboard at
+/// this layer, and the pane would then front it. What contains that is
+/// downstream — the host proxy is loopback-only and token-gated, and the pane's
+/// iframe is sandboxed — not this function.
+async fn start_viewer(container_id: &str, cli_entry: &str) -> Result<(u16, String), String> {
+    let mut tried: Vec<u16> = Vec::new();
+    let mut last: Option<String> = None;
+
+    for _ in 0..MAX_PORT_ATTEMPTS {
+        // Re-read the listener snapshot each attempt: the port that was free a
+        // moment ago is exactly the one we may have just lost.
+        let port = match pick_viewer_port(container_id, &tried).await {
+            Ok(p) => p,
+            Err(e) => {
+                // Report why the *attempts* failed, not just "nothing free":
+                // the exhausted range is the symptom, the last start failure is
+                // the thing the user can act on.
+                return Err(match last {
+                    Some(prev) => format!("{} ({})", e, prev),
+                    None => e,
+                });
+            }
+        };
+        tried.push(port);
+
+        launch_viewer(container_id, cli_entry, port).await?;
+
+        // Wait for it to actually answer, and learn the entry URL while we're
+        // there — see `probe_entry_path` for why that matters. This, not the
+        // launcher's stdout, is the readiness signal: verified that the
+        // "Listening on …" line is printed only on the very first start.
+        match wait_until_ready(container_id, port).await {
+            Ok(path) => return Ok((port, path)),
+            Err(e) => {
+                let log = read_viewer_log(container_id).await;
+                // Always kill before retrying: the dashboard is a singleton, so
+                // a launcher that came up on some *other* port would otherwise
+                // make every further attempt a no-op that silently ignores the
+                // port we asked for.
+                let _ = kill_dashboard(container_id, cli_entry).await;
+                last = Some(explain_start_failure(&e, &log));
+            }
+        }
+    }
+
+    Err(last.unwrap_or_else(|| "The Playwright viewer did not start.".to_string()))
+}
+
+/// First port in [`VIEWER_PORTS`] that nothing in the container is listening on
+/// and that this start has not already tried.
+async fn pick_viewer_port(container_id: &str, tried: &[u16]) -> Result<u16, String> {
     let text = exec_oneshot(
         container_id,
         vec![
-            "cat".to_string(),
+            // Absolute path, deliberately, for the same reason the auth bridge
+            // uses one: `container/Dockerfile` puts a container-writable
+            // directory first on `PATH`, so a bare `cat` is a name the container
+            // can rebind to a shim. A shimmed listener list is a shimmed answer
+            // to "which port is free" — i.e. the container choosing which port
+            // the viewer, and therefore the host-side proxy, ends up on.
+            "/usr/bin/cat".to_string(),
             "/proc/net/tcp".to_string(),
             "/proc/net/tcp6".to_string(),
         ],
@@ -616,7 +681,7 @@ async fn pick_viewer_port(container_id: &str) -> Result<u16, String> {
     let taken = proc_net::parse_loopback_listeners(&text);
     VIEWER_PORTS
         .clone()
-        .find(|p| !taken.contains_key(p))
+        .find(|p| !taken.contains_key(p) && !tried.contains(p))
         .ok_or_else(|| {
             format!(
                 "No free port in {}–{} inside the container for the Playwright viewer.",

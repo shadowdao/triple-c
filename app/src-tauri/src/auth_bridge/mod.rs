@@ -334,7 +334,10 @@ async fn poll_loop(
             Ok(text) => {
                 exec_failures = 0;
                 let discovered = proc_net::parse_loopback_listeners(&text);
-                let skip = skipped_ports(&project);
+                // Re-read every tick: a project can gain a port mapping and the
+                // gateway/STT/web-terminal ports can be re-pointed while the
+                // bridge is running, and a stale reservation set is a hole.
+                let skip = skipped_ports(&project, &store.list(), &app_settings(&app));
                 if reconcile(&container_id, &discovered, &skip, &state).await {
                     emit_status(&app, &project_id, &state, true).await;
                 }
@@ -377,22 +380,99 @@ async fn poll_loop(
     }
 }
 
-/// Ports Docker already handles for this project. A container port that is
-/// explicitly published has a host-side path already, and the mapping's host
-/// port is a binding we must not fight over.
+/// Every port this project's bridge must not take.
 ///
-/// [`RESERVED_CONTAINER_PORTS`] is folded in as well: those are container
-/// loopback listeners another feature owns and exposes on its own,
-/// authenticated terms.
-fn skipped_ports(project: &crate::models::Project) -> HashSet<u16> {
+/// The bridge's rule is "a container loopback listener on port N becomes an
+/// **unauthenticated** host listener on port N". That is only safe for ports
+/// nothing else on the host owns, so everything that *is* owned has to be
+/// enumerated here. Four sources:
+///
+/// 1. **This project's own published ports** — a container port that Docker
+///    already publishes has a host-side path, and the mapping's host port is a
+///    binding we must not fight over.
+/// 2. **Every other project's published host ports.** The container names the
+///    *host* port, so project A's container listening on 8080 would otherwise
+///    have the bridge bind host 8080 — the port project B publishes on. Only
+///    the host end of another project's mapping is reserved: its container end
+///    is a number inside a different network namespace and means nothing here.
+/// 3. **This app's own host services** — the LiteLLM gateway, the STT sidecar
+///    and the web terminal. All three are off by default and bind on demand, so
+///    first-come would win: a container that binds container-loopback 4000
+///    while the gateway is stopped gets host `127.0.0.1:4000` mirrored to it
+///    within one [`POLL_INTERVAL`], after which the gateway cannot start and
+///    anything on the host dialling 4000 — including *other project
+///    containers*, which reach the gateway by host address — is talking to the
+///    squatting container instead. The web terminal is the worst of the three,
+///    because its access token travels in the URL query. Both the *configured*
+///    port and the shipped default are reserved: the configured one is what the
+///    service will bind next, and the default is what it falls back to for a
+///    fresh profile or a settings file that failed to parse.
+/// 4. [`RESERVED_CONTAINER_PORTS`] and [`RESERVED_HOST_PORTS`] — the
+///    browser-view pane's two ends, which it exposes on its own authenticated
+///    terms.
+///
+/// Pure on purpose: everything it needs is passed in, so the whole reservation
+/// policy is unit-testable without a store, a container or an app handle.
+fn skipped_ports(
+    project: &crate::models::Project,
+    all_projects: &[crate::models::Project],
+    settings: &crate::models::AppSettings,
+) -> HashSet<u16> {
     let mut skip: HashSet<u16> = project
         .port_mappings
         .iter()
         .flat_map(|m| [m.container_port, m.host_port])
         .collect();
+
+    // Other projects: host end only.
+    skip.extend(
+        all_projects
+            .iter()
+            .filter(|p| p.id != project.id)
+            .flat_map(|p| p.port_mappings.iter().map(|m| m.host_port)),
+    );
+
+    skip.extend(app_service_host_ports(settings));
     skip.extend(RESERVED_CONTAINER_PORTS.clone());
     skip.extend(RESERVED_HOST_PORTS.clone());
     skip
+}
+
+/// Current app settings, or defaults if the state is not reachable.
+///
+/// Falling back rather than unwrapping matters: the reservation set is a safety
+/// rail, and a rail that panics the poller when it cannot read its input is
+/// worse than one that falls back to the shipped port numbers — which are what
+/// the services use anyway until someone changes them.
+fn app_settings(app: &AppHandle) -> crate::models::AppSettings {
+    use tauri::Manager;
+    app.try_state::<crate::AppState>()
+        .map(|state| state.settings_store.get())
+        .unwrap_or_default()
+}
+
+/// Host ports this app's own sibling services bind, configured value and
+/// shipped default alike.
+///
+/// Read off the settings models rather than restated as literals here: a
+/// duplicated port number is exactly the kind of constant that drifts silently,
+/// and the failure mode of drift is a reservation that no longer covers the
+/// service it was written for.
+fn app_service_host_ports(settings: &crate::models::AppSettings) -> Vec<u16> {
+    use crate::models::{SttSettings, WebTerminalSettings};
+
+    vec![
+        // LiteLLM gateway (`docker/gateway.rs`).
+        settings.gateway.port,
+        crate::models::default_gateway_port(),
+        // Speech-to-text sidecar (`docker/stt.rs`).
+        settings.stt.port,
+        SttSettings::default().port,
+        // Remote web terminal (`web_terminal/server.rs`) — binds 0.0.0.0, and
+        // its access token is in the URL query.
+        settings.web_terminal.port,
+        WebTerminalSettings::default().port,
+    ]
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -591,7 +671,7 @@ async fn emit_status(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{PortMapping, Project, ProjectPath};
+    use crate::models::{AppSettings, PortMapping, Project, ProjectPath};
 
     fn project_with_mappings(mappings: Vec<(u16, u16)>) -> Project {
         let mut p = Project::new(
@@ -612,9 +692,14 @@ mod tests {
         p
     }
 
+    /// The common case: one project, no siblings, stock settings.
+    fn skip_for(project: &Project) -> HashSet<u16> {
+        skipped_ports(project, std::slice::from_ref(project), &AppSettings::default())
+    }
+
     #[test]
     fn ports_already_published_by_docker_are_skipped() {
-        let skip = skipped_ports(&project_with_mappings(vec![(3000, 3000), (8081, 8080)]));
+        let skip = skip_for(&project_with_mappings(vec![(3000, 3000), (8081, 8080)]));
         assert!(skip.contains(&3000));
         // Both ends of an asymmetric mapping are off limits: the container port
         // is already reachable, and the host port is Docker's binding.
@@ -624,12 +709,88 @@ mod tests {
     }
 
     #[test]
-    fn no_mappings_means_nothing_but_the_reserved_ranges_are_skipped() {
-        let skip = skipped_ports(&project_with_mappings(vec![]));
+    fn no_mappings_means_nothing_but_the_reservations_are_skipped() {
+        let settings = AppSettings::default();
+        let project = project_with_mappings(vec![]);
+        let skip = skip_for(&project);
+
+        let mut expected: HashSet<u16> = RESERVED_CONTAINER_PORTS.collect();
+        expected.extend(RESERVED_HOST_PORTS);
+        expected.extend(app_service_host_ports(&settings));
+        assert_eq!(skip, expected);
+
+        // The ranges and the service ports are disjoint, so nothing above is
+        // accidentally counting the same port twice.
         assert_eq!(
             skip.len(),
-            RESERVED_CONTAINER_PORTS.clone().count() + RESERVED_HOST_PORTS.clone().count()
+            RESERVED_CONTAINER_PORTS.clone().count()
+                + RESERVED_HOST_PORTS.clone().count()
+                + 3
         );
+    }
+
+    #[test]
+    fn this_apps_own_host_services_are_never_taken() {
+        // The bug this guards: the reserved set used to cover only the
+        // browser-view ranges and this project's own mappings, so a container
+        // binding container-loopback 4000 / 9876 / 7681 while the matching
+        // service was stopped had that port mirrored, unauthenticated, onto the
+        // host — taking the gateway's, the STT sidecar's or the web terminal's
+        // door before they could bind it.
+        let settings = AppSettings::default();
+        let skip = skip_for(&project_with_mappings(vec![]));
+
+        assert!(skip.contains(&settings.gateway.port), "LiteLLM gateway port");
+        assert!(skip.contains(&settings.stt.port), "STT sidecar port");
+        assert!(skip.contains(&settings.web_terminal.port), "web terminal port");
+
+        // The shipped defaults, spelled out once so a change to any of them is
+        // a change to this assertion and not a silent narrowing.
+        assert!(skip.contains(&4000));
+        assert!(skip.contains(&9876));
+        assert!(skip.contains(&7681));
+    }
+
+    #[test]
+    fn a_reconfigured_service_port_is_reserved_alongside_its_default() {
+        let mut settings = AppSettings::default();
+        settings.gateway.port = 4321;
+        settings.stt.port = 9000;
+        settings.web_terminal.port = 8443;
+        let project = project_with_mappings(vec![]);
+        let skip = skipped_ports(&project, std::slice::from_ref(&project), &settings);
+
+        for port in [4321, 9000, 8443] {
+            assert!(skip.contains(&port), "configured port {} should be reserved", port);
+        }
+        // The default stays reserved too: it is what the service falls back to
+        // for a fresh profile or an unparseable settings file, so leaving it
+        // open is leaving the same squat available one restart later.
+        for port in [4000, 9876, 7681] {
+            assert!(skip.contains(&port), "default port {} should be reserved", port);
+        }
+    }
+
+    #[test]
+    fn another_projects_published_host_port_is_not_stolen() {
+        // The container names the *host* port. Without this, project A's
+        // container listening on 8080 takes the host 8080 that project B
+        // publishes on — the bridge wins the race whenever B's container is not
+        // running yet.
+        let mine = project_with_mappings(vec![]);
+        let mut theirs = project_with_mappings(vec![(8080, 3000)]);
+        theirs.id = format!("{}-other", mine.id);
+
+        let skip = skipped_ports(
+            &mine,
+            &[mine.clone(), theirs.clone()],
+            &AppSettings::default(),
+        );
+        assert!(skip.contains(&8080), "another project's host port");
+        // …but not the other project's *container* port: that number lives in a
+        // different network namespace and means nothing on this host, and
+        // reserving it would refuse a legitimate login callback for no reason.
+        assert!(!skip.contains(&3000));
     }
 
     #[test]
@@ -637,7 +798,7 @@ mod tests {
         // The bridge binds *host* ports chosen by the container, so without
         // this it can take the port the browser-view proxy will want later —
         // that pane binds on demand, so first-come would win.
-        let skip = skipped_ports(&project_with_mappings(vec![]));
+        let skip = skip_for(&project_with_mappings(vec![]));
         for port in RESERVED_HOST_PORTS {
             assert!(skip.contains(&port), "host port {} should be reserved", port);
         }
@@ -693,14 +854,14 @@ mod tests {
         // Mirroring these would publish an ungated second door to the
         // Playwright dashboard, which the pane deliberately keeps behind a
         // token-checking listener.
-        let skip = skipped_ports(&project_with_mappings(vec![]));
+        let skip = skip_for(&project_with_mappings(vec![]));
         for port in RESERVED_CONTAINER_PORTS {
             assert!(skip.contains(&port), "port {} should be reserved", port);
         }
         assert!(!skip.contains(&(RESERVED_CONTAINER_PORTS.end() + 1)));
 
         // Reservations coexist with Docker's own published ports.
-        let skip = skipped_ports(&project_with_mappings(vec![(3000, 3000)]));
+        let skip = skip_for(&project_with_mappings(vec![(3000, 3000)]));
         assert!(skip.contains(RESERVED_CONTAINER_PORTS.start()));
         assert!(skip.contains(&3000));
     }

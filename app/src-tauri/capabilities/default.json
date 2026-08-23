@@ -1,6 +1,6 @@
 {
   "identifier": "default",
-  "description": "Default capabilities for Triple-C",
+  "description": "Default capabilities for Triple-C. Every entry here is an IPC command a compromised webview can call directly, so the set is kept to what the frontend actually uses. Two notes on what is deliberately absent and what is deliberately accepted: (1) the `store:*` grants were removed — nothing in `app/src` uses `@tauri-apps/plugin-store`, and the plugin's `resolve_store_path` is a `PathBuf::push` against AppData, which `push` discards outright when handed an absolute path, so the grant was an arbitrary host-file read/write primitive (`plugin:store|load` + `set` + `save` on `~/.claude/settings.json` is host code execution). (2) `drag:allow-start-drag` stays, and cannot be scoped — `tauri-plugin-drag` takes the item paths from the caller and has no scope mechanism, so a compromised webview could call `startDrag({ item: ['~/.ssh/id_rsa'] })` against any host path the user can read. It is not a silent exfiltration primitive: the drag only delivers anything if the user completes a real drop onto a real target, and the OS shows the drag under the cursor while it is in flight. Removing it would remove drag-out from the Files pane (`stage_container_file_for_drag`), whose fallback is the explicit \"Save to host…\" action. Accepted residual risk, recorded here rather than fixed.",
   "windows": ["main"],
   "permissions": [
     "core:default",
@@ -15,20 +15,10 @@
     "dialog:allow-message",
     "dialog:allow-ask",
     "dialog:allow-confirm",
-    "store:default",
-    "store:allow-get",
-    "store:allow-set",
-    "store:allow-delete",
-    "store:allow-keys",
-    "store:allow-values",
-    "store:allow-entries",
-    "store:allow-length",
-    "store:allow-load",
-    "store:allow-reset",
-    "store:allow-save",
-    "store:allow-clear",
-    "opener:default",
-    "opener:allow-open-url",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [{ "url": "http://*" }, { "url": "https://*" }]
+    },
     "drag:default",
     "drag:allow-start-drag"
   ]
