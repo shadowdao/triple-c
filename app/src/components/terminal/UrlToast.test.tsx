@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
-import UrlToast from "./UrlToast";
+import { fireEvent, render, screen } from "@testing-library/react";
+import UrlToast, { URL_TOAST_PRIMARY_SELECTOR } from "./UrlToast";
 
 /**
  * The toast is the *only* thing standing between a container-chosen URL and
@@ -57,6 +57,111 @@ describe("UrlToast", () => {
     expect(onOpen).not.toHaveBeenCalled();
     screen.getByRole("button", { name: "Open" }).click();
     expect(onOpen).toHaveBeenCalledTimes(1);
+  });
+
+  describe("keyboard", () => {
+    // This toast is the only route to completing a sign-in started in a
+    // terminal, and xterm's helper textarea swallows Tab — so without these it
+    // is unreachable for a keyboard-only user.
+    const SIGN_IN =
+      "https://claude.ai/oauth/authorize?code=true&client_id=abc&response_type=code";
+
+    it("does not take focus from the live terminal when it appears", () => {
+      // Deliberate. The user may be mid-command, and the default action opens a
+      // URL the *container* chose — a focused button is one stray Enter away
+      // from doing it. The shortcut hint below is what makes that affordable.
+      render(
+        <UrlToast url="https://example.com/" onOpen={noop} onDismiss={noop} />,
+      );
+      expect(document.activeElement).toBe(document.body);
+    });
+
+    it("says how to reach it, since nothing announces a shortcut by itself", () => {
+      render(
+        <UrlToast url="https://example.com/" onOpen={noop} onDismiss={noop} />,
+      );
+      expect(screen.getByTestId("url-toast-shortcut")).toHaveTextContent(
+        "Ctrl+Shift+O",
+      );
+    });
+
+    it("marks the default action so the shortcut has somewhere to land", () => {
+      // Which button that is depends on the URL, so the marker moves with the
+      // decision rather than the owner having to repeat it.
+      const { rerender } = render(
+        <UrlToast
+          url="https://github.com/login/device?code=ABCD"
+          onOpen={noop}
+          onOpenInContainer={noop}
+          onDismiss={noop}
+        />,
+      );
+      expect(
+        document.querySelector(URL_TOAST_PRIMARY_SELECTOR),
+      ).toHaveTextContent("Open");
+
+      rerender(
+        <UrlToast
+          url={SIGN_IN}
+          onOpen={noop}
+          onOpenInContainer={noop}
+          onDismiss={noop}
+        />,
+      );
+      expect(
+        document.querySelector(URL_TOAST_PRIMARY_SELECTOR),
+      ).toHaveTextContent("In container");
+    });
+
+    it("dismisses on Escape from anywhere inside it", () => {
+      const onDismiss = vi.fn();
+      render(
+        <UrlToast
+          url="https://example.com/"
+          onOpen={noop}
+          onDismiss={onDismiss}
+        />,
+      );
+      fireEvent.keyDown(screen.getByRole("button", { name: "Open" }), {
+        key: "Escape",
+      });
+      expect(onDismiss).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not answer Escape pressed outside it", () => {
+      // Escape belongs to whatever is running in the terminal — vim, above all.
+      // A document-level binding would break it for everyone who never looked
+      // at this toast.
+      const onDismiss = vi.fn();
+      render(
+        <UrlToast
+          url="https://example.com/"
+          onOpen={noop}
+          onDismiss={onDismiss}
+        />,
+      );
+      fireEvent.keyDown(document.body, { key: "Escape" });
+      expect(onDismiss).not.toHaveBeenCalled();
+    });
+
+    it("gives every action a real button, so Tab reaches all three", () => {
+      render(
+        <UrlToast
+          url={SIGN_IN}
+          onOpen={noop}
+          onOpenInContainer={noop}
+          onDismiss={noop}
+        />,
+      );
+      const names = screen
+        .getAllByRole("button")
+        .map((b) => b.getAttribute("aria-label") ?? b.textContent);
+      expect(names).toEqual(["In container", "Open", "Dismiss"]);
+      // Nothing is taken out of the tab order.
+      for (const b of screen.getAllByRole("button")) {
+        expect(b).not.toHaveAttribute("tabindex", "-1");
+      }
+    });
   });
 
   describe("Anthropic sign-in links", () => {

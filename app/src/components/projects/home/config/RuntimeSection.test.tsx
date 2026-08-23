@@ -107,6 +107,58 @@ describe("RuntimeSection — VPN support toggle", () => {
   });
 });
 
+/**
+ * `scope="project"` on the settings editor is one prop with no visible owner,
+ * and deleting it fails silently in the worst possible direction: the editor
+ * falls back to `"global"`, every three-state control collapses to an on/off
+ * switch, and a field the project is *inheriting* as on renders flat Off. The
+ * user then reads a lie and, worse, flipping that switch writes a deliberate
+ * `false` that overrides the global On they thought they were looking at.
+ *
+ * Nothing asserted the prop was passed, so these go through what is rendered
+ * rather than through props — a switch where a select belongs is exactly the
+ * regression, and it is visible from the outside.
+ */
+describe("RuntimeSection — Claude Code settings are edited at project scope", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("gives every setting the third Global state a project can inherit through", () => {
+    renderSection();
+    const focus = screen.getByLabelText("Focus mode") as HTMLSelectElement;
+    expect(
+      Array.from(focus.querySelectorAll("option")).map((o) => o.getAttribute("value")),
+    ).toEqual(["global", "off", "on"]);
+  });
+
+  it("renders an untouched setting as inheriting, not as Off", () => {
+    // `claude_code_settings: null` means "this project has no opinion", which
+    // is not the same instruction as off. At global scope the same field is a
+    // plain unchecked switch — indistinguishable from a user who turned it
+    // off, and the reason the missing prop would never be noticed.
+    renderSection({ claude_code_settings: null });
+    expect((screen.getByLabelText("Focus mode") as HTMLSelectElement).value).toBe(
+      "global",
+    );
+    expect(screen.queryByRole("switch", { name: "Focus mode" })).not.toBeInTheDocument();
+  });
+
+  it("keeps a stored project override visible over the inherited value", () => {
+    renderSection({
+      claude_code_settings: {
+        tui_mode: null,
+        effort: null,
+        auto_scroll_disabled: null,
+        focus_mode: true,
+        show_thinking_summaries: null,
+        session_recap_disabled: null,
+        env_scrub: null,
+        prompt_caching_1h: null,
+      },
+    });
+    expect((screen.getByLabelText("Focus mode") as HTMLSelectElement).value).toBe("on");
+  });
+});
+
 describe("RuntimeSection — auth bridge toggle", () => {
   beforeEach(() => vi.clearAllMocks());
 

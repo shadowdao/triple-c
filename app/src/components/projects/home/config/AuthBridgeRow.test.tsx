@@ -101,6 +101,80 @@ describe("AuthBridgeRow", () => {
     expect(screen.queryByText(/Port 1:/)).not.toBeInTheDocument();
   });
 
+  /**
+   * The two halves of this row disagree about *when*, not about *what*.
+   *
+   * `set_auth_bridge_enabled` resolves with a status sampled as it returned;
+   * the poller's event carries one sampled afterwards. Writing the awaited
+   * value unconditionally therefore rolls the row back in time whenever the
+   * two overlap — the row says "Watching" while a port is bound, which is the
+   * exact silent failure the event subscription was added to end. These two
+   * hold the ordering down from both the resolve and the reject side.
+   */
+  describe("a pushed event outranks an older awaited result", () => {
+    /** A toggle that will not settle until the test says so. */
+    function deferToggle() {
+      let settle!: (s: AuthBridgeStatus) => void;
+      let fail!: (e: unknown) => void;
+      setAuthBridgeEnabled.mockImplementation(
+        () =>
+          new Promise<AuthBridgeStatus>((resolve, reject) => {
+            settle = resolve;
+            fail = reject;
+          }),
+      );
+      return { settle: (s: AuthBridgeStatus) => settle(s), fail: (e: unknown) => fail(e) };
+    }
+
+    const BRIDGING: AuthBridgeStatus = {
+      enabled: true,
+      active_ports: [{ port: 54545, family: "v4", bridged_at: "", ipv6_warning: null }],
+      conflicts: [],
+    };
+
+    async function startToggleThenPush() {
+      render(<AuthBridgeRow project={project} />);
+      await waitFor(() => expect(getAuthBridgeStatus).toHaveBeenCalled());
+      await waitFor(() => expect(emit).not.toBeNull());
+
+      fireEvent.click(screen.getByRole("switch", { name: "Auth bridge" }));
+      await waitFor(() => expect(setAuthBridgeEnabled).toHaveBeenCalledWith("p1", true));
+
+      // The poller binds a port while the command is still in flight.
+      emit!({ project_id: "p1", status: BRIDGING });
+      expect(await screen.findByText("Bridging 1 port")).toBeInTheDocument();
+    }
+
+    it("keeps the newer state when the command settles with the older one", async () => {
+      const toggle = deferToggle();
+      await startToggleThenPush();
+
+      // …and only now returns the snapshot it took *before* that port existed.
+      toggle.settle({ enabled: true, active_ports: [], conflicts: [] });
+
+      await waitFor(() =>
+        expect(screen.getByRole("switch", { name: "Auth bridge" })).not.toBeDisabled(),
+      );
+      expect(screen.getByText("Bridging 1 port")).toBeInTheDocument();
+      expect(screen.getByText("127.0.0.1:54545")).toBeInTheDocument();
+      expect(screen.queryByText("Watching")).not.toBeInTheDocument();
+    });
+
+    it("does not let the rollback undo a status pushed while it was failing", async () => {
+      // The command failed, so the error belongs on screen — but the bridge
+      // demonstrably came up, and reverting the switch to off would contradict
+      // the port listed right beside it.
+      const toggle = deferToggle();
+      await startToggleThenPush();
+
+      toggle.fail("bridge probe timed out");
+
+      expect(await screen.findByText(/probe timed out/)).toBeInTheDocument();
+      expect(screen.getByText("Bridging 1 port")).toBeInTheDocument();
+      expect(screen.getByRole("switch", { name: "Auth bridge" })).toBeChecked();
+    });
+  });
+
   it("puts the switch back if the command rejects", async () => {
     setAuthBridgeEnabled.mockRejectedValue("Project p1 not found");
     render(<AuthBridgeRow project={project} />);

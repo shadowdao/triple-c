@@ -1,0 +1,116 @@
+/**
+ * The one place the frontend agrees with Rust about "that name is taken".
+ *
+ * `upload_file_to_container` used to clobber whatever was already at the
+ * destination, which is the wrong default for a drop: a drag is aimed with a
+ * mouse, and the file it lands on is frequently not the file the user meant to
+ * replace. So the backend refuses by default and the frontend asks — but only
+ * if it can tell *this* refusal apart from "permission denied" or "no space
+ * left", because an overwrite prompt raised over an unrelated failure would
+ * offer a button that cannot possibly work.
+ *
+ * **This module is the contract point, and the Rust half has to hold up its
+ * end**: `upload_file_to_container` must put `FILE_EXISTS_MARKER` in the error
+ * it returns when the destination already exists, ideally in the agreed shape
+ *
+ *     FILE_EXISTS: /workspace/notes.txt already exists
+ *
+ * and must accept an `overwrite: bool` argument that skips the check. Nothing
+ * here parses a human sentence — the marker is the whole agreement, and the
+ * path is a bonus that is only used to name the file in the prompt.
+ *
+ * The predicate is deliberately tolerant about the *shape* of the error rather
+ * than its wording, because a Tauri command error crosses the IPC boundary as
+ * whatever `serde` made of it: a bare string from `Err(String)`, an object from
+ * a `#[derive(Serialize)]` error enum, or an `Error` if a JS layer wrapped it
+ * on the way through. All three are the same refusal, and the UI must not
+ * behave differently depending on which one a future refactor produces.
+ */
+
+/** Marker the backend puts in the error for "a file with this name is already there". */
+export const FILE_EXISTS_MARKER = "FILE_EXISTS";
+
+/**
+ * Structured error shapes carry the marker in a discriminant rather than in
+ * prose. These are the field names a serialised Rust error realistically uses;
+ * matching is case-insensitive and ignores `_`/`-` so `FileExists`,
+ * `file_exists` and `FILE-EXISTS` all read as the same variant.
+ */
+const KIND_FIELDS = ["kind", "code", "type", "error", "reason"] as const;
+const MESSAGE_FIELDS = ["message", "msg", "detail", "description"] as const;
+const PATH_FIELDS = ["path", "container_path", "containerPath", "target", "file"] as const;
+
+/** `FileExists` / `file-exists` / `FILE_EXISTS` all normalise to `fileexists`. */
+function normaliseKind(value: string): string {
+  return value.toLowerCase().replace(/[\s_-]/g, "");
+}
+
+const KIND_NEEDLE = normaliseKind(FILE_EXISTS_MARKER);
+
+function asRecord(e: unknown): Record<string, unknown> | null {
+  return typeof e === "object" && e !== null ? (e as Record<string, unknown>) : null;
+}
+
+/**
+ * Every string an error carries, flattened: the error itself if it is one, its
+ * message-ish fields, and its kind-ish fields. Nesting is followed one level
+ * because a wrapped error (`{ error: { kind: … } }`) is the same refusal.
+ */
+function stringsIn(e: unknown, depth = 0): string[] {
+  if (typeof e === "string") return [e];
+  if (e instanceof Error) return [e.message, e.name];
+  const record = asRecord(e);
+  if (!record || depth > 1) return [];
+  const out: string[] = [];
+  for (const field of [...KIND_FIELDS, ...MESSAGE_FIELDS]) {
+    const value = record[field];
+    if (typeof value === "string") out.push(value);
+    else if (value !== undefined) out.push(...stringsIn(value, depth + 1));
+  }
+  return out;
+}
+
+/**
+ * True when the backend refused an upload because the destination is taken.
+ *
+ * Accepts a bare string, an `Error`, or an object with a `kind`/`code`
+ * discriminant or a `message` — see the module comment for why all three have
+ * to work.
+ */
+export function isFileExistsError(e: unknown): boolean {
+  return stringsIn(e).some((s) => normaliseKind(s).includes(KIND_NEEDLE));
+}
+
+/**
+ * The container path the conflict is about, when the error carries one — used
+ * only to name the file in the prompt, so `null` is a perfectly good answer
+ * and the caller falls back to the host path it was uploading.
+ */
+export function fileExistsPath(e: unknown): string | null {
+  const record = asRecord(e);
+  if (record) {
+    for (const field of PATH_FIELDS) {
+      const value = record[field];
+      if (typeof value === "string" && value.length > 0) return value;
+    }
+    // One level down, for `{ error: { path } }`.
+    for (const field of KIND_FIELDS) {
+      const nested = fileExistsPath(record[field]);
+      if (nested) return nested;
+    }
+  }
+  for (const s of stringsIn(e)) {
+    // The agreed prose form: `FILE_EXISTS: <path>` — everything up to the
+    // first space after the marker.
+    const match = new RegExp(`${FILE_EXISTS_MARKER}\\s*[:=]\\s*(\\S+)`).exec(s);
+    if (match) return match[1];
+  }
+  return null;
+}
+
+/**
+ * What the user answered to one conflict. The blanket answers exist because a
+ * ten-file drop onto a populated directory is ten prompts otherwise, which is
+ * the kind of dialog people dismiss without reading.
+ */
+export type OverwriteChoice = "replace" | "skip" | "replace-all" | "skip-all";

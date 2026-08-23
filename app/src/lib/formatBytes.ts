@@ -4,11 +4,16 @@
  * The app had four of them — `projects/home/format.ts`,
  * `projects/migrationCopy.ts`, `settings/UpdateDialog.tsx` and an inline
  * `toFixed(1)` in `useProjectActions.ts` — disagreeing about the divisor, the
- * unit labels and the precision. The first two now delegate here.
+ * unit labels and the precision. All four now delegate here, and there are no
+ * remaining copies.
  *
- * The other two deliberately do not, yet: `UpdateDialog` renders KB at
- * `toFixed(0)`, so re-pointing it would change what a download size reads as,
- * and neither is on the Disk panel's path. They are the remaining copies.
+ * The last two were held back because re-pointing them changes what they
+ * render, and that turned out to be the argument for doing it rather than
+ * against. `UpdateDialog` rendered KB at `toFixed(0)` (`512 KB` is now
+ * `512.0 KB`, consistent with every other size in the app) and both stopped
+ * the ladder at MB, so a 2 GB asset or backup read as a five-digit number of
+ * megabytes. Both are `{ binary: true }`: they describe files, and a host file
+ * browser shows the ÷1024 figure for the same bytes.
  *
  * ## Why the default is base 1000
  *

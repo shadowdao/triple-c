@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
   getAuthBridgeStatus,
@@ -77,13 +77,35 @@ export default function AuthBridgeRow({ project }: { project: Project }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  /**
+   * Which write to `status` is the newest — the same "is this still mine?"
+   * guard `useDiskUsage` and `useContainerMigration` use around their async
+   * writes, and needed here for a reason that is easy to miss.
+   *
+   * There are two sources of truth for this row and only one of them is
+   * ordered. `set_auth_bridge_enabled` resolves with a status *sampled at the
+   * moment it returned*; the poller's `auth-bridge-changed` event carries one
+   * sampled later. Awaiting the command therefore hands back a value that may
+   * already be historical, and writing it unconditionally is how the row ends
+   * up saying "Watching" while a port is in fact bound — the failure mode the
+   * event subscription exists to prevent, reintroduced one line below it.
+   *
+   * So every write claims a generation and only lands if it still holds it.
+   * A pushed event always claims a fresh one, which is what makes it win over
+   * an older awaited result no matter which order the two arrive in.
+   */
+  const generation = useRef(0);
+
   useEffect(() => {
+    const mine = ++generation.current;
     let cancelled = false;
     setStatus(null);
     setError(null);
     getAuthBridgeStatus(projectId)
       .then((s) => {
-        if (!cancelled) setStatus(s);
+        // The initial fetch races the poller exactly like the toggle does: an
+        // event can land first and describe a bridge this reply predates.
+        if (!cancelled && generation.current === mine) setStatus(s);
       })
       .catch((e) => {
         if (!cancelled) setError(String(e));
@@ -98,6 +120,9 @@ export default function AuthBridgeRow({ project }: { project: Project }) {
     let unlisten: (() => void) | undefined;
     listen<AuthBridgeChangedEvent>(AUTH_BRIDGE_EVENT, (event) => {
       if (event.payload.project_id !== projectId) return;
+      // A pushed status is the most recent observation that exists, so it
+      // claims the newest generation and invalidates anything still in flight.
+      generation.current += 1;
       setStatus(event.payload.status);
     })
       .then((un) => {
@@ -116,13 +141,24 @@ export default function AuthBridgeRow({ project }: { project: Project }) {
       setBusy(true);
       setError(null);
       // Optimistic, so the switch responds even though enabling has to await a
-      // container probe. The command's return value replaces it either way.
+      // container probe. It claims a generation like every other write, so a
+      // pushed event that lands mid-flight supersedes it rather than being
+      // undone by the settle below.
+      const mine = ++generation.current;
       setStatus((s) => (s ? { ...s, enabled: next } : s));
       try {
-        setStatus(await setAuthBridgeEnabled(projectId, next));
+        const settled = await setAuthBridgeEnabled(projectId, next);
+        // Stale by the time it arrived: the poller has already told us
+        // something newer, and `settled` predates it.
+        if (generation.current !== mine) return;
+        setStatus(settled);
       } catch (e) {
-        setStatus((s) => (s ? { ...s, enabled: !next } : s));
+        // The error is reported either way — the command really did fail — but
+        // the rollback must not resurrect the pre-toggle value over a status
+        // the poller pushed while the command was failing.
         setError(String(e));
+        if (generation.current !== mine) return;
+        setStatus((s) => (s ? { ...s, enabled: !next } : s));
       } finally {
         setBusy(false);
       }

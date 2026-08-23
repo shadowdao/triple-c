@@ -119,5 +119,78 @@ describe("ClaudeCodeSettingsEditor", () => {
         "off",
       );
     });
+
+    /**
+     * Auto-scroll is the second inverted field and had no project-scope test at
+     * all — every assertion above rides on `session_recap_disabled`, so a
+     * `BOOLEAN_FIELDS` entry that lost its `invert` flag would be caught for
+     * one of the two and pass silently for the other. It is stored as
+     * `auto_scroll_disabled`, so every value here reads back the other way up.
+     */
+    describe("auto-scroll", () => {
+      const AUTO = "Auto-scroll";
+
+      it("starts on Global, which is not the same as on", () => {
+        // Claude Code scrolls by default, so an inheriting project *behaves*
+        // as on — but it has taken no position, and rendering it as "On" would
+        // make a later global change look like it had no effect.
+        renderEditor(null, "project");
+        expect((screen.getByLabelText(AUTO) as HTMLSelectElement).value).toBe("global");
+      });
+
+      it("stores the disabled sense in both directions", () => {
+        const onSave = renderEditor(null, "project");
+        const auto = screen.getByLabelText(AUTO);
+
+        fireEvent.change(auto, { target: { value: "off" } });
+        expect(onSave).toHaveBeenCalledWith(
+          expect.objectContaining({ auto_scroll_disabled: true }),
+        );
+
+        fireEvent.change(auto, { target: { value: "on" } });
+        expect(onSave).toHaveBeenCalledWith(
+          expect.objectContaining({ auto_scroll_disabled: false }),
+        );
+      });
+
+      it("hands the setting back to the global level when Global is chosen", () => {
+        // Back to no opinion, and with nothing else set that collapses the
+        // whole object to `null` — the value that means "adds nothing over the
+        // global settings".
+        const onSave = renderEditor(
+          { ...CLAUDE_CODE_DEFAULTS, auto_scroll_disabled: true },
+          "project",
+        );
+        fireEvent.change(screen.getByLabelText(AUTO), { target: { value: "global" } });
+        expect(onSave).toHaveBeenCalledWith(null);
+      });
+
+      it("reads a stored override back the right way up", () => {
+        renderEditor({ ...CLAUDE_CODE_DEFAULTS, auto_scroll_disabled: true }, "project");
+        expect((screen.getByLabelText(AUTO) as HTMLSelectElement).value).toBe("off");
+      });
+    });
+  });
+
+  /**
+   * The inverted fields store a *deviation*, so a stored `false` is the one
+   * value that means "the user deliberately re-enabled the default". Nothing
+   * asserted it: every existing test drives the `true` (turned off) direction
+   * or the `null` (untouched) one, and both scopes would still read correctly
+   * if the inversion were dropped from the `false` branch alone.
+   */
+  describe.each([
+    ["session_recap_disabled", "Session recap"] as const,
+    ["auto_scroll_disabled", "Auto-scroll"] as const,
+  ])("a stored false on %s", (key, label) => {
+    it("reads as On at project scope, not as Off", () => {
+      renderEditor({ ...CLAUDE_CODE_DEFAULTS, [key]: false }, "project");
+      expect((screen.getByLabelText(label) as HTMLSelectElement).value).toBe("on");
+    });
+
+    it("reads as on at global scope, where the control is a switch", () => {
+      renderEditor({ ...CLAUDE_CODE_DEFAULTS, [key]: false });
+      expect(screen.getByRole("switch", { name: label })).toBeChecked();
+    });
   });
 });

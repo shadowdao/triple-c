@@ -17,6 +17,10 @@ const LAYERS_HELP =
 const NEXT_COMMIT_HELP =
   "The container's writable layer. This is exactly what the next recreation will stack onto the snapshot, and it never comes back after that.";
 
+/** Why a layer count reads "unknown" rather than as a number. */
+const layersUnknownHelp = (layers: number) =>
+  `${layers} layers in total, but this project predates the base-image label, so there is no way to tell which of them are commits. Migrating it to the current base restores the count.`;
+
 /** `—` for a column with nothing in it, so an empty cell never reads as zero. */
 function cell(bytes: number, present: boolean) {
   return present ? formatBytes(bytes) : "—";
@@ -141,11 +145,25 @@ export default function DiskProjectTable({ rows, destructive, onDestroy }: Props
                     // The base this descends from is unknown, so the count
                     // includes the base's own layers and does not mean
                     // "recreations". Saying so beats printing a wrong number.
-                    <Tooltip
-                      text={`${row.snapshot_commit_layers} layers in total, but this project predates the base-image label, so there is no way to tell which of them are commits. Migrating it to the current base restores the count.`}
-                    >
-                      <span className="text-[var(--text-secondary)]">unknown</span>
-                    </Tooltip>
+                    //
+                    // The explanation is the only thing standing between
+                    // "unknown" and reading as a bug, so it cannot live in the
+                    // tooltip alone: `Tooltip` portals a plain div with no
+                    // `role` and no `aria-describedby`, and wrapped around
+                    // children it has no focus handlers either — so on hover-
+                    // less input it is unreachable and to a screen reader it
+                    // does not exist. Same treatment as the column headers
+                    // above: tooltip for the mouse, `sr-only` text for
+                    // everything else.
+                    <>
+                      <Tooltip text={layersUnknownHelp(row.snapshot_commit_layers)}>
+                        <span className="text-[var(--text-secondary)]">unknown</span>
+                      </Tooltip>
+                      <span className="sr-only">
+                        {" "}
+                        &mdash; {layersUnknownHelp(row.snapshot_commit_layers)}
+                      </span>
+                    </>
                   ) : (
                     <span className="text-[var(--text-primary)]">
                       {row.snapshot_commit_layers}

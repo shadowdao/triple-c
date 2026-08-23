@@ -54,6 +54,13 @@ export default function DiskSettings() {
   const [ticked, setTicked] = useState<Set<string>>(new Set());
   const [confirming, setConfirming] = useState<ReclaimItem | null>(null);
   const [destroying, setDestroying] = useState<DestructiveItem | null>(null);
+  // A dialog whose action failed stays open and says so *inside itself*. The
+  // hook's `error` is rendered at the top of a panel that is metres of scroll
+  // long, so a user who reached a project row through the table would have
+  // watched the dialog vanish and seen nothing take its place. This flag is
+  // what distinguishes "this dialog's action just failed" from a stale scan
+  // error that happened to still be sitting in `error` when it opened.
+  const [actionFailed, setActionFailed] = useState(false);
 
   // The plan is dropped after any reclaim, so a tick can never outlive the row
   // it was made against and be re-fired at an object that is already gone.
@@ -68,6 +75,25 @@ export default function DiskSettings() {
   );
   const selectedBytes = selected.reduce((sum, i) => sum + i.bytes, 0);
 
+  // Opening or closing either dialog clears the in-dialog failure with it, so
+  // one never starts out showing the previous attempt's error.
+  const openConfirming = (item: ReclaimItem) => {
+    setConfirming(item);
+    setActionFailed(false);
+  };
+  const openDestroying = (item: DestructiveItem) => {
+    setDestroying(item);
+    setActionFailed(false);
+  };
+  const closeConfirming = () => {
+    setConfirming(null);
+    setActionFailed(false);
+  };
+  const closeDestroying = () => {
+    setDestroying(null);
+    setActionFailed(false);
+  };
+
   const toggle = (item: ReclaimItem) => {
     setTicked((prev) => {
       const next = new Set(prev);
@@ -77,6 +103,10 @@ export default function DiskSettings() {
       return next;
     });
   };
+
+  // Counted from the per-result list rather than from a flag: a reclaim of
+  // five targets can come back with two failures and a real byte total.
+  const failedCount = outcome?.results.filter((r) => !r.ok).length ?? 0;
 
   const tone: StatusTone = scanning ? "unknown" : report ? "ok" : "off";
   const statusLabel = scanning
@@ -99,10 +129,21 @@ export default function DiskSettings() {
 
       {/* --- Scan --------------------------------------------------------- */}
       <div className="flex items-center gap-3 flex-wrap">
-        <Button variant="primary" size="md" onClick={scan} disabled={scanning}>
+        {/* Disabled while a mutation runs, not only while scanning: a scan
+            started on top of a reclaim measures a daemon that is being changed
+            underneath it, and the hook can only discard such a result — better
+            not to spend the seconds. */}
+        <Button variant="primary" size="md" onClick={scan} disabled={scanning || working}>
           {scanning ? "Scanning…" : report ? "Scan again" : "Scan"}
         </Button>
-        <StatusIndicator tone={tone} label={statusLabel} className="text-xs" />
+        {/* The status flips between "Scanning", "Scanned HH:MM:SS" and "Not
+            scanned" with no other signal. The live region is mounted here
+            unconditionally — wrapping it around the indicator only once there
+            is something to say would make the region *appear* already
+            populated, which is the one shape assistive tech does not announce. */}
+        <span role="status" aria-live="polite">
+          <StatusIndicator tone={tone} label={statusLabel} className="text-xs" />
+        </span>
         <span className="text-xs text-[var(--text-secondary)]">
           Reads the whole Docker store; takes a few seconds on a large one.
         </span>
@@ -161,7 +202,7 @@ export default function DiskSettings() {
             <DiskProjectTable
               rows={report.projects}
               destructive={plan?.destructive ?? []}
-              onDestroy={setDestroying}
+              onDestroy={openDestroying}
             />
           </section>
 
@@ -196,7 +237,10 @@ export default function DiskSettings() {
               <dt className="text-[var(--text-secondary)]">
                 Build cache — <strong className="text-[var(--warning)]">whole daemon</strong>,
                 not just Triple-C{" "}
-                <span className="text-[var(--text-disabled)]">
+                {/* Live information about where the figure came from, not a
+                    disabled control — `--text-disabled` is ~4.1:1 and fails AA
+                    at this size. */}
+                <span className="text-[var(--text-secondary)]">
                   (via {report.build_cache.source})
                 </span>
               </dt>
@@ -400,7 +444,7 @@ export default function DiskSettings() {
                       <Button
                         size="sm"
                         disabled={item.blocked !== null || working}
-                        onClick={() => setConfirming(item)}
+                        onClick={() => openConfirming(item)}
                       >
                         Run…
                       </Button>
@@ -434,9 +478,18 @@ export default function DiskSettings() {
           data-testid="disk-outcome"
         >
           <div className="flex items-center justify-between gap-3">
+            {/* The headline has to carry the failure in words. A partial
+                reclaim that freed something still has a byte figure worth
+                printing, so the count is appended to it rather than replacing
+                it — and the per-result lines below say *which* ones and why,
+                so this stops at how many. */}
             <StatusIndicator
-              tone={outcome.results.every((r) => r.ok) ? "ok" : "error"}
-              label={`Reclaimed ${formatBytes(outcome.total_freed_bytes)}`}
+              tone={failedCount === 0 ? "ok" : "error"}
+              label={
+                failedCount === 0
+                  ? `Reclaimed ${formatBytes(outcome.total_freed_bytes)}`
+                  : `Reclaimed ${formatBytes(outcome.total_freed_bytes)} — ${failedCount} of ${outcome.results.length} failed`
+              }
               className="text-xs"
             />
             <Button size="sm" variant="ghost" onClick={clearOutcome}>
@@ -450,7 +503,9 @@ export default function DiskSettings() {
                 {result.projected_bytes !== null && (
                   <>
                     {" "}
-                    <span className="text-[var(--text-disabled)]">
+                    {/* The comparison that makes a compaction's yield
+                        readable — live information, so not the disabled ink. */}
+                    <span className="text-[var(--text-secondary)]">
                       (projected {formatBytesCeiling(result.projected_bytes)}, actually{" "}
                       {formatBytes(result.freed_bytes)})
                     </span>
@@ -466,11 +521,11 @@ export default function DiskSettings() {
       {confirming && (
         <Modal
           title={confirming.label}
-          onClose={() => setConfirming(null)}
+          onClose={closeConfirming}
           widthClassName="w-[30rem]"
           footer={
             <>
-              <Button size="md" variant="ghost" onClick={() => setConfirming(null)}>
+              <Button size="md" variant="ghost" onClick={closeConfirming}>
                 Cancel
               </Button>
               <Button
@@ -479,9 +534,12 @@ export default function DiskSettings() {
                 disabled={working}
                 onClick={async () => {
                   // Same reasoning as the destructive modal: a compaction takes
-                  // minutes, and the dialog reporting it beats it vanishing.
-                  await runReclaim([confirming.target]);
-                  setConfirming(null);
+                  // minutes, and the dialog reporting it beats it vanishing —
+                  // and if it fails, the dialog is the only place the user is
+                  // still looking, so it stays open and reports it here.
+                  const ok = await runReclaim([confirming.target]);
+                  setActionFailed(!ok);
+                  if (ok) setConfirming(null);
                 }}
               >
                 {working ? "Working…" : "Run it"}
@@ -490,6 +548,13 @@ export default function DiskSettings() {
           }
         >
           <div className="space-y-2.5 text-[13px] text-[var(--text-secondary)]">
+            {/* The failure lands here rather than only in the panel's error
+                line, which this dialog is covering. */}
+            {actionFailed && (
+              <p role="alert" className="text-[var(--error)]">
+                {error ?? "That did not run. Nothing was changed."}
+              </p>
+            )}
             <p>{confirming.detail}</p>
             {confirming.target.kind === "compact_snapshot" && (
               <>
@@ -531,13 +596,18 @@ export default function DiskSettings() {
           expected={destroying.project_name}
           confirmLabel={`Delete ${destroying.label.toLowerCase()}`}
           busy={working}
-          onCancel={() => setDestroying(null)}
+          // A failure here has to land inside the dialog. The panel's own
+          // error line is at the top of several screens of scroll, and this
+          // dialog was reached from a project row far below it.
+          error={actionFailed ? (error ?? "That did not run. Nothing was deleted.") : null}
+          onCancel={closeDestroying}
           onConfirm={async (typed) => {
             // The modal stays mounted until the call settles, so its `busy`
             // state is what the user sees while a multi-second volume removal
             // runs. Clearing it first made the whole busy path dead code.
-            await destroy(destroying.target, typed);
-            setDestroying(null);
+            const ok = await destroy(destroying.target, typed);
+            setActionFailed(!ok);
+            if (ok) setDestroying(null);
           }}
         >
           <p>

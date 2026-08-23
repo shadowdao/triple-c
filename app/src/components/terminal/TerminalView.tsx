@@ -21,7 +21,12 @@ import {
   parseUrlRelayOsc,
   sanitizeRelayUrl,
 } from "../../lib/urlRelay";
-import UrlToast from "./UrlToast";
+import { isDropTarget } from "../../lib/dropTarget";
+import UrlToast, {
+  URL_TOAST_PRIMARY_SELECTOR,
+  URL_TOAST_SELECTOR,
+  URL_TOAST_SHORTCUT,
+} from "./UrlToast";
 import { trimSelection } from "./trimSelection";
 import TerminalContextMenu from "./TerminalContextMenu";
 
@@ -131,6 +136,26 @@ export default function TerminalView({ sessionId, active }: Props) {
   } | null>(null);
   const promptSeqRef = useRef(0);
   const relayLimiterRef = useRef(new RelayRateLimiter());
+  // Read by the long-lived keyboard listener below, which is registered once
+  // and would otherwise close over the prompt as it was at mount.
+  const urlPromptRef = useRef<{ url: string } | null>(null);
+
+  /**
+   * Empty the prompt slot, and put focus somewhere real if it was inside the
+   * toast.
+   *
+   * The toast never *takes* focus — see the note in `UrlToast` — but a keyboard
+   * user who jumped into it with {@link URL_TOAST_SHORTCUT} is standing on a
+   * node that is about to unmount, and React does not rehome focus: it lands on
+   * `document.body`, where the terminal receives nothing and the next keystroke
+   * goes nowhere. Every route out of the toast goes through here for that
+   * reason — Open, In container, ✕, Escape and the auto-dismiss alike.
+   */
+  const dismissUrlPrompt = useCallback(() => {
+    const wasInside = !!document.activeElement?.closest(URL_TOAST_SELECTOR);
+    setUrlPrompt(null);
+    if (wasInside) termRef.current?.focus();
+  }, []);
 
   /**
    * The only writer of the prompt slot. Re-validates whatever the caller
@@ -158,6 +183,38 @@ export default function TerminalView({ sessionId, active }: Props) {
     },
     [],
   );
+  useEffect(() => {
+    urlPromptRef.current = urlPrompt;
+  }, [urlPrompt]);
+
+  /**
+   * The keyboard route into the toast.
+   *
+   * Registered on `document` in the capture phase for the same reason
+   * `useKeyboardShortcuts` does it there: xterm would otherwise forward the
+   * chord to the shell. It is *not* added to that hook because the target is
+   * this pane's own toast — the hook has no way to name it, and only one pane
+   * is on screen at a time, which is what `activeRef` checks.
+   *
+   * Nothing is swallowed unless there is a prompt to jump to, so Ctrl+Shift+O
+   * reaches the terminal untouched the rest of the time.
+   */
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (!e.ctrlKey || !e.shiftKey || e.altKey || e.metaKey) return;
+      if (e.key !== "o" && e.key !== "O") return;
+      if (!activeRef.current || !urlPromptRef.current) return;
+      const primary = terminalContainerRef.current?.querySelector<HTMLElement>(
+        `${URL_TOAST_SELECTOR} ${URL_TOAST_PRIMARY_SELECTOR}`,
+      );
+      if (!primary) return;
+      e.preventDefault();
+      e.stopPropagation();
+      primary.focus();
+    };
+    document.addEventListener("keydown", onKeyDown, true);
+    return () => document.removeEventListener("keydown", onKeyDown, true);
+  }, []);
   const [imagePasteMsg, setImagePasteMsg] = useState<string | null>(null);
   const [isAtBottom, setIsAtBottom] = useState(true);
   const [isAutoFollow, setIsAutoFollow] = useState(true);
@@ -177,23 +234,20 @@ export default function TerminalView({ sessionId, active }: Props) {
   // in-container paths typed into the prompt so Claude Code can read them.
   // Tauri intercepts OS file drops at the webview level, so we use
   // onDragDropEvent (HTML5 ondrop on the element wouldn't expose file paths).
-  // The listener is window-wide, so we route purely by a hit-test against this
-  // terminal's bounds: the pane the drop lands on handles it. Inactive panes are
-  // `display:none` (zero-size rect) so they never match — this works for the
-  // current tabbed layout and would also do the right thing with split panes.
+  //
+  // The listener is window-wide, so every pane decides for itself whether a
+  // drop was meant for it. `isDropTarget` is that decision, shared with the
+  // Files pane: the physical-pixel position ÷ `devicePixelRatio` against this
+  // pane's rect (a hidden pane is `display:none`, so its zero-size rect is what
+  // stops two panes both claiming the drop), plus z-order — which a rect alone
+  // cannot see. An open `Modal` is a `fixed inset-0` portal painted *over* the
+  // window and the pane underneath still has its rect, so the geometric test
+  // that used to live here uploaded files into the directory a dialog was
+  // covering. Same for the shutdown overlay, which is on screen precisely while
+  // nothing should be accepting work at all.
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     let cancelled = false;
-
-    const insideThisTerminal = (pos: { x: number; y: number }): boolean => {
-      const rect = containerRef.current?.getBoundingClientRect();
-      // A hidden (display:none) pane has a zero-size rect — never a drop target.
-      if (!rect || rect.width === 0 || rect.height === 0) return false;
-      const dpr = window.devicePixelRatio || 1;
-      const x = pos.x / dpr;
-      const y = pos.y / dpr;
-      return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
-    };
 
     // Always single-quote: a dropped filename can contain shell metacharacters
     // ($(), &&, ', spaces) even with no whitespace, and this path is typed into
@@ -203,7 +257,7 @@ export default function TerminalView({ sessionId, active }: Props) {
     (async () => {
       const un = await getCurrentWebview().onDragDropEvent(async (event) => {
         if (event.payload.type !== "drop") return;
-        if (!insideThisTerminal(event.payload.position)) return;
+        if (!isDropTarget(containerRef.current, event.payload.position)) return;
 
         const paths = event.payload.paths ?? [];
         if (paths.length === 0) return;
@@ -391,6 +445,10 @@ export default function TerminalView({ sessionId, active }: Props) {
         console.warn("URL relay: rate-limited", url);
         return true;
       }
+      // Exact by construction (base64 over OSC 7777), and the detector never
+      // sees it — so tell it, or a truncated scrape of the same link could
+      // still fill the slot once this prompt is dismissed.
+      detectorRef.current?.noteExactUrl(url);
       promptUrl(url, "Container asked to open a URL", "relay");
       return true;
     });
@@ -619,12 +677,19 @@ export default function TerminalView({ sessionId, active }: Props) {
     }
   }, [active]);
 
-  // Auto-dismiss toast after 30 seconds
+  // Auto-dismiss toast after 30 seconds — unless the user is standing in it.
+  // A keyboard user who has just jumped into the toast is mid-decision, and
+  // pulling it out from under them costs them the only route to finishing a
+  // sign-in. It goes when they act on it, which is the same thing a mouse user
+  // does by clicking.
   useEffect(() => {
     if (!urlPrompt) return;
-    const timer = setTimeout(() => setUrlPrompt(null), 30_000);
+    const timer = setTimeout(() => {
+      if (document.activeElement?.closest(URL_TOAST_SELECTOR)) return;
+      dismissUrlPrompt();
+    }, 30_000);
     return () => clearTimeout(timer);
-  }, [urlPrompt]);
+  }, [urlPrompt, dismissUrlPrompt]);
 
   // Auto-dismiss image paste message after 3 seconds
   useEffect(() => {
@@ -639,13 +704,13 @@ export default function TerminalView({ sessionId, active }: Props) {
     // sanitizes, so this can only fail if that invariant is broken — which is
     // precisely when it matters that the last thing before `openUrl` checks.
     const safe = sanitizeRelayUrl(urlPrompt.url);
-    setUrlPrompt(null);
+    dismissUrlPrompt();
     if (!safe) {
       console.warn("Refusing to open a URL that failed validation");
       return;
     }
     openUrl(safe).catch((e) => console.error("Failed to open URL:", e));
-  }, [urlPrompt]);
+  }, [urlPrompt, dismissUrlPrompt]);
 
   /**
    * Open the prompted URL in the container's own browser instead of the host's.
@@ -658,7 +723,7 @@ export default function TerminalView({ sessionId, active }: Props) {
   const handleOpenUrlInContainer = useCallback(() => {
     if (!urlPrompt) return;
     const safe = sanitizeRelayUrl(urlPrompt.url);
-    setUrlPrompt(null);
+    dismissUrlPrompt();
     if (!safe) {
       console.warn("Refusing to open a URL that failed validation");
       return;
@@ -690,7 +755,7 @@ export default function TerminalView({ sessionId, active }: Props) {
           detail: String(e),
         }),
       );
-  }, [urlPrompt, projectId]);
+  }, [urlPrompt, projectId, dismissUrlPrompt]);
 
   const handleScrollToBottom = useCallback(() => {
     const term = termRef.current;
@@ -770,7 +835,7 @@ export default function TerminalView({ sessionId, active }: Props) {
           label={urlPrompt.label}
           onOpen={handleOpenUrl}
           onOpenInContainer={handleOpenUrlInContainer}
-          onDismiss={() => setUrlPrompt(null)}
+          onDismiss={dismissUrlPrompt}
         />
       )}
       {imagePasteMsg && (

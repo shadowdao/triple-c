@@ -75,8 +75,21 @@ export const downloadContainerFile = (projectId: string, containerPath: string, 
   invoke<void>("download_container_file", { projectId, containerPath, hostPath });
 export const downloadContainerBackup = (projectId: string, hostPath: string, containerPath?: string) =>
   invoke<number>("download_container_backup", { projectId, hostPath, containerPath });
-export const uploadFileToContainer = (projectId: string, hostPath: string, containerDir: string) =>
-  invoke<void>("upload_file_to_container", { projectId, hostPath, containerDir });
+/**
+ * Copy a host file into a container directory.
+ *
+ * `overwrite` is opt-in because a drop is aimed with a mouse: the backend
+ * refuses by default when the name is already taken (see `lib/uploadErrors.ts`
+ * for the marker that refusal carries), and the caller re-runs with `true`
+ * only once the user has said "Replace" to that specific file. Leaving it off
+ * is the safe default every existing caller gets.
+ */
+export const uploadFileToContainer = (
+  projectId: string,
+  hostPath: string,
+  containerDir: string,
+  overwrite?: boolean,
+) => invoke<void>("upload_file_to_container", { projectId, hostPath, containerDir, overwrite });
 export const readContainerFile = (projectId: string, path: string, maxBytes?: number) =>
   invoke<FileContents>("read_container_file", { projectId, path, maxBytes });
 /** `toPath` is the new *name*, not a destination — renames never move. */
