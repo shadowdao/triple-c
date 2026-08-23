@@ -7,6 +7,16 @@ interface Props {
   title: string;
   /** What must be typed, verbatim, before the confirm button enables. */
   expected: string;
+  /**
+   * What `expected` *is*, for the waiting message — "project name" unless the
+   * caller says otherwise.
+   *
+   * An orphaned volume has no project by definition, so its gate takes the
+   * volume's own name (that is what `disk.rs`'s `destroy` compares against),
+   * and telling that user we are "waiting for the exact project name" would be
+   * asking for a string that does not exist.
+   */
+  subject?: string;
   /** The verb on the confirm button. Repeat the action — never "OK". */
   confirmLabel: string;
   /** What is about to be lost, in full. */
@@ -46,6 +56,7 @@ interface Props {
 export default function TypedConfirmModal({
   title,
   expected,
+  subject = "project name",
   confirmLabel,
   children,
   onConfirm,
@@ -115,7 +126,7 @@ export default function TypedConfirmModal({
               // Not disabled content — the gate is live and waiting on the
               // user. `--text-disabled` is ~4.1:1 and fails AA at 12px.
               <span className="text-[var(--text-secondary)]">
-                Waiting for the exact project name.
+                Waiting for the exact {subject}.
               </span>
             )}
           </p>

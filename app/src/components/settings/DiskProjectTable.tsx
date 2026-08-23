@@ -26,6 +26,29 @@ function cell(bytes: number, present: boolean) {
   return present ? formatBytes(bytes) : "—";
 }
 
+const SNAPSHOT_HELP =
+  "This project's share of its snapshot image — the bytes no other image carries. The base image is shared by every project, so charging it to each row would show the same 4.7 GB eight times over. It is the figure the Total is built from.";
+
+/** Why a snapshot figure is the whole image rather than a share of one. */
+const SPLIT_UNKNOWN_HELP =
+  "Nothing measurably shares layers with this snapshot, and the base image it descends from is no longer on the daemon, so there is no split to show and none is guessed. This is the whole image, which is what it actually costs — a compacted snapshot is exactly this shape.";
+
+/**
+ * How `snapshot_attributed_bytes` was arrived at, in the row's own terms.
+ *
+ * Rust computes the number in one function so the column and the Total cannot
+ * be derived from two different rules again — but the branches do not mean the
+ * same thing to a reader, so the sub-line has to say which one this row is.
+ * `snapshot_above_base_bytes` is `null` in exactly the branch where the figure
+ * *is* the whole image, which is what makes it the test.
+ */
+function attributionNote(row: ProjectDiskRow): { note: string; help: string | null } {
+  if (row.snapshot_above_base_bytes !== null) {
+    return { note: `${formatBytes(row.snapshot_bytes)} with base`, help: null };
+  }
+  return { note: "whole image — base unknown", help: SPLIT_UNKNOWN_HELP };
+}
+
 /**
  * The per-project table — the mental model users actually have of this app.
  *
@@ -64,8 +87,10 @@ export default function DiskProjectTable({ rows, destructive, onDestroy }: Props
             <th scope="col" className="font-medium py-1.5 pr-3">
               Project
             </th>
-            <th scope="col" className="font-medium py-1.5 px-3 text-right">
+            <th scope="col" className="font-medium py-1.5 px-3 text-right whitespace-nowrap">
               Snapshot
+              <Tooltip text={SNAPSHOT_HELP} />
+              <span className="sr-only"> — {SNAPSHOT_HELP}</span>
             </th>
             <th scope="col" className="font-medium py-1.5 px-3 text-right whitespace-nowrap">
               Layers
@@ -121,22 +146,33 @@ export default function DiskProjectTable({ rows, destructive, onDestroy }: Props
                   </span>
                 </th>
                 <td className="py-1.5 px-3 text-right tabular-nums whitespace-nowrap">
-                  {/* `null` means the split could not be measured. Rendering it
-                      as 0 B would be the one guessed number in this table. */}
-                  {cell(
-                    row.snapshot_above_base_bytes ?? -1,
-                    row.snapshot_exists && row.snapshot_above_base_bytes !== null,
-                  )}
-                  {row.snapshot_exists && (
-                    <span className="block text-[11px] text-[var(--text-secondary)]">
-                      {/* The base is shared by every project, so charging it to
-                          each row would show the same 4.7 GB eight times. The
-                          headline figure is what is unique to this project;
-                          the total is here for anyone reconciling against
-                          `docker images`. */}
-                      {formatBytes(row.snapshot_bytes)} with base
-                    </span>
-                  )}
+                  {/* `snapshot_attributed_bytes`, and nothing else. This column
+                      used to render `snapshot_above_base_bytes` and fall back
+                      to `—` while the Total was computed from
+                      `snapshot_bytes - snapshot_shared_bytes` regardless — so a
+                      row could show `—` here and still carry a whole 4.7 GB
+                      base image in its Total, once per project. One field, one
+                      rule, computed once in Rust: the parts add up. */}
+                  {row.snapshot_exists ? formatBytes(row.snapshot_attributed_bytes) : "—"}
+                  {row.snapshot_exists && (() => {
+                    const { note, help } = attributionNote(row);
+                    return help === null ? (
+                      <span className="block text-[11px] text-[var(--text-secondary)]">
+                        {note}
+                      </span>
+                    ) : (
+                      // Same treatment as the Layers column: `Tooltip` portals
+                      // a plain div with no `role` and no `aria-describedby`,
+                      // so the explanation is also emitted as screen-reader
+                      // text rather than living in the tooltip alone.
+                      <span className="block text-[11px] text-[var(--text-secondary)]">
+                        <Tooltip text={help}>
+                          <span>{note}</span>
+                        </Tooltip>
+                        <span className="sr-only"> &mdash; {help}</span>
+                      </span>
+                    );
+                  })()}
                 </td>
                 <td className="py-1.5 px-3 text-right tabular-nums">
                   {!row.snapshot_exists ? (

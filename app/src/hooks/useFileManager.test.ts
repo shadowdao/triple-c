@@ -499,3 +499,223 @@ describe("useFileManager staged host paths", () => {
     expect(result.current.isStagedHostPath("/home/me/a.txt")).toBe(false);
   });
 });
+
+/**
+ * The loop, end to end. The prompt only earns its place if the *batch* survives
+ * it: one answer, given once, has to leave every other file in the drop exactly
+ * where it would have been.
+ */
+describe("useFileManager overwrite prompt closes the loop", () => {
+  const clash = (name: string) => `FILE_EXISTS: /workspace/${name} already exists`;
+
+  /**
+   * Start an upload and wait for it to stop at the prompt, handing back the
+   * still-unsettled batch.
+   *
+   * Wrapped in an object on purpose: an `async` function that returned the
+   * promise itself would *adopt* it, so awaiting the helper would wait for the
+   * whole upload — which cannot finish until the question is answered, which
+   * cannot happen until the helper returns. That deadlock looks exactly like
+   * the hang these tests exist to rule out.
+   */
+  async function uploadUntilPrompt(
+    result: { current: ReturnType<typeof useFileManager> },
+    paths: string[],
+  ): Promise<{ batch: Promise<void> }> {
+    let batch!: Promise<void>;
+    await act(async () => {
+      batch = result.current.uploadPaths(paths);
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(result.current.conflict).not.toBeNull());
+    return { batch };
+  }
+
+  it("replaces the file that clashed and still uploads the rest of the batch", async () => {
+    uploadFileToContainer
+      .mockRejectedValueOnce(clash("a.txt")) // 1: a.txt, no overwrite
+      .mockResolvedValueOnce(undefined) // 2: a.txt, overwrite: true
+      .mockResolvedValueOnce(undefined); // 3: b.txt, no clash
+    const { result } = renderHook(() => useFileManager("p1"));
+
+    const { batch } = await uploadUntilPrompt(result, ["/host/a.txt", "/host/b.txt"]);
+    expect(result.current.conflict?.name).toBe("a.txt");
+    expect(result.current.conflict?.remaining).toBe(1);
+
+    await act(async () => {
+      result.current.resolveConflict("replace");
+      await batch;
+    });
+
+    expect(uploadFileToContainer).toHaveBeenCalledTimes(3);
+    // The retry is the whole point: same file, same directory, overwrite on.
+    expect(uploadFileToContainer).toHaveBeenNthCalledWith(2, "p1", "/host/a.txt", "/workspace", true);
+    // …and "Replace" answered for *that* file only, so the next one is offered
+    // to the backend the safe way round.
+    expect(uploadFileToContainer).toHaveBeenNthCalledWith(3, "p1", "/host/b.txt", "/workspace");
+    expect(result.current.conflict).toBeNull();
+    expect(result.current.completed).toContain("Uploaded 2 items");
+    expect(toastText()).not.toContain("could not be uploaded");
+  });
+
+  it("moves on to the next file on Skip rather than ending the batch", async () => {
+    uploadFileToContainer
+      .mockRejectedValueOnce(clash("a.txt"))
+      .mockResolvedValueOnce(undefined); // b.txt still goes
+    const { result } = renderHook(() => useFileManager("p1"));
+
+    const { batch } = await uploadUntilPrompt(result, ["/host/a.txt", "/host/b.txt"]);
+    await act(async () => {
+      result.current.resolveConflict("skip");
+      await batch;
+    });
+
+    expect(uploadFileToContainer).toHaveBeenCalledTimes(2);
+    expect(uploadFileToContainer).toHaveBeenNthCalledWith(2, "p1", "/host/b.txt", "/workspace");
+    // Nothing was overwritten.
+    expect(uploadFileToContainer.mock.calls.some((c) => c[3] === true)).toBe(false);
+    expect(result.current.completed).toContain("skipped 1");
+  });
+
+  it("dismissing the dialog is a Skip — the batch carries on", async () => {
+    // `OverwriteConfirmModal` maps Escape / ✕ / click-outside onto this exact
+    // call, so a dismissal must not hang the loop or abort the drop.
+    uploadFileToContainer
+      .mockRejectedValueOnce(clash("a.txt"))
+      .mockResolvedValueOnce(undefined);
+    const { result } = renderHook(() => useFileManager("p1"));
+
+    const { batch } = await uploadUntilPrompt(result, ["/host/a.txt", "/host/b.txt"]);
+    await act(async () => {
+      // What `Modal`'s `onClose` produces.
+      result.current.resolveConflict("skip");
+      await batch;
+    });
+
+    expect(uploadFileToContainer).toHaveBeenCalledTimes(2);
+    expect(result.current.completed).toContain("Uploaded 1 item, skipped 1");
+    expect(result.current.busy).toBeNull();
+  });
+
+  it("answers every remaining clash with Skip all, asking only once", async () => {
+    uploadFileToContainer
+      .mockRejectedValueOnce(clash("a.txt"))
+      .mockRejectedValueOnce(clash("b.txt"))
+      .mockRejectedValueOnce(clash("c.txt"));
+    const { result } = renderHook(() => useFileManager("p1"));
+
+    const { batch } = await uploadUntilPrompt(result, ["/host/a.txt", "/host/b.txt", "/host/c.txt"]);
+    expect(result.current.conflict?.remaining).toBe(2);
+    await act(async () => {
+      result.current.resolveConflict("skip-all");
+      await batch;
+    });
+
+    // Three attempts, no second prompt, nothing replaced.
+    expect(uploadFileToContainer).toHaveBeenCalledTimes(3);
+    expect(uploadFileToContainer.mock.calls.some((c) => c[3] === true)).toBe(false);
+    expect(result.current.conflict).toBeNull();
+    expect(result.current.completed).toContain("skipped 3");
+  });
+
+  it("puts a picked file through exactly the road a dropped one takes", async () => {
+    // The Upload button and the native drop listener are one routine —
+    // `uploadPaths` — so the prompt, the retry and the blanket answers cannot
+    // drift apart between them. This is that claim, from the picker end.
+    openDialog.mockResolvedValueOnce(["/host/a.txt", "/host/b.txt"]);
+    uploadFileToContainer
+      .mockRejectedValueOnce(clash("a.txt"))
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce(undefined);
+    const { result } = renderHook(() => useFileManager("p1"));
+
+    let picked!: Promise<void>;
+    await act(async () => {
+      picked = result.current.uploadFile();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(result.current.conflict?.name).toBe("a.txt"));
+    await act(async () => {
+      result.current.resolveConflict("replace");
+      await picked;
+    });
+
+    expect(uploadFileToContainer).toHaveBeenNthCalledWith(2, "p1", "/host/a.txt", "/workspace", true);
+    expect(uploadFileToContainer).toHaveBeenNthCalledWith(3, "p1", "/host/b.txt", "/workspace");
+  });
+
+  it("does not leave the batch waiting for an answer that can never arrive", async () => {
+    // The pane unmounted mid-prompt (tab closed, container stopped). The upload
+    // promise has to settle, or `busy` never clears and the loop leaks.
+    uploadFileToContainer.mockRejectedValueOnce(clash("a.txt"));
+    const { result, unmount } = renderHook(() => useFileManager("p1"));
+
+    const { batch } = await uploadUntilPrompt(result, ["/host/a.txt"]);
+    unmount();
+    await expect(batch).resolves.toBeUndefined();
+    expect(uploadFileToContainer).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * Refusals the backend already phrased for a person. `ToastHost` renders a
+ * `detail` as collapsed monospace behind a "Details" button, so a sentence
+ * reported that way is a sentence nobody reads.
+ */
+describe("useFileManager surfaces written refusals as prose", () => {
+  const hiddenFolder =
+    '".ssh" is a hidden folder — Triple-C will not save there. Choose a visible location.';
+  const outsideRoots =
+    "Folder path is outside the folders this panel can change (/workspace, /home/claude, /tmp): /etc";
+
+  /** The toast this operation pushed. */
+  const lastToast = () => pushToast.mock.calls.at(-1)?.[0];
+
+  it("puts the write-root refusal in the headline, not behind Details", async () => {
+    uploadFileToContainer.mockRejectedValueOnce(outsideRoots);
+    const { result } = renderHook(() => useFileManager("p1"));
+    await act(async () => {
+      await result.current.uploadPaths(["/host/a.txt"]);
+    });
+
+    expect(lastToast().message).toBe(outsideRoots);
+    expect(lastToast().detail).toBeUndefined();
+    expect(lastToast().message).not.toMatch(/^Error:/);
+  });
+
+  it("says it once for a whole batch that failed the same way", async () => {
+    // The refusal is about the target directory, so every file in the drop
+    // fails identically — three copies of the same sentence is not detail.
+    uploadFileToContainer.mockRejectedValue(outsideRoots);
+    const { result } = renderHook(() => useFileManager("p1"));
+    await act(async () => {
+      await result.current.uploadPaths(["/host/a.txt", "/host/b.txt"]);
+    });
+
+    expect(lastToast().message).toBe(outsideRoots);
+    expect(lastToast().detail).toBeUndefined();
+  });
+
+  it("does the same for a refused save to the host", async () => {
+    save.mockResolvedValue("/home/me/.ssh/a.txt");
+    downloadContainerFile.mockRejectedValueOnce(new Error(hiddenFolder));
+    const { result } = renderHook(() => useFileManager("p1"));
+    await act(async () => {
+      await result.current.downloadFile(file("a.txt"));
+    });
+
+    // Unwrapped: an `Error` on the way through must not stamp "Error:" on prose.
+    expect(lastToast().message).toBe(hiddenFolder);
+  });
+
+  it("keeps the hook's own headline when the failure is not a written refusal", async () => {
+    uploadFileToContainer.mockRejectedValueOnce("no space left on device");
+    const { result } = renderHook(() => useFileManager("p1"));
+    await act(async () => {
+      await result.current.uploadPaths(["/host/a.txt"]);
+    });
+
+    expect(lastToast().message).toBe("A file could not be uploaded");
+    expect(lastToast().detail).toBe("no space left on device");
+  });
+});

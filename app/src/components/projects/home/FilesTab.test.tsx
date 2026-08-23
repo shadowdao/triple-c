@@ -824,3 +824,76 @@ describe("FilesTab overwrite prompt", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 });
+
+/**
+ * Dismissal. `Modal` gives every dialog Escape, a ✕ and click-outside for free,
+ * and `OverwriteConfirmModal` maps all three onto `onChoose("skip")` — because
+ * the destructive answer has to be chosen, and because a dialog that is closed
+ * rather than answered must not leave the batch waiting forever or throw away
+ * the files behind it.
+ */
+describe("FilesTab overwrite prompt dismissal", () => {
+  /**
+   * Drop two files where the first name is taken, and stop at the dialog. The
+   * unsettled batch comes back wrapped — returning it bare from an `async`
+   * helper would adopt it, and awaiting the helper would then wait for an
+   * upload that cannot proceed until the helper has returned.
+   */
+  async function dropIntoConflict(): Promise<{ batch: Promise<void> | undefined }> {
+    uploadFileToContainer.mockRejectedValueOnce("FILE_EXISTS: /workspace/a.txt already exists");
+    await renderTab();
+    const batch = dropWithoutWaiting(["/host/a.txt", "/host/b.txt"]);
+    await screen.findByRole("dialog");
+    return { batch };
+  }
+
+  /** What every dismissal has to leave behind: one skip, one upload, no clobber. */
+  function expectSkippedAndCarriedOn() {
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(uploadFileToContainer).toHaveBeenCalledTimes(2);
+    expect(uploadFileToContainer).toHaveBeenLastCalledWith("p1", "/host/b.txt", "/workspace");
+    expect(uploadFileToContainer.mock.calls.some((call) => call[3] === true)).toBe(false);
+    expect(screen.getByRole("status").textContent).toContain("skipped 1");
+  }
+
+  it("counts Escape as a Skip", async () => {
+    const { batch } = await dropIntoConflict();
+    await act(async () => {
+      fireEvent.keyDown(document, { key: "Escape" });
+      await batch;
+    });
+    expectSkippedAndCarriedOn();
+  });
+
+  it("counts the ✕ as a Skip", async () => {
+    const { batch } = await dropIntoConflict();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Close dialog" }));
+      await batch;
+    });
+    expectSkippedAndCarriedOn();
+  });
+
+  it("counts a click on the backdrop as a Skip", async () => {
+    const { batch } = await dropIntoConflict();
+    // The overlay is the dialog panel's parent — `Modal` only closes when the
+    // click landed on the overlay itself, not on anything inside the panel.
+    const overlay = screen.getByRole("dialog").parentElement!;
+    await act(async () => {
+      fireEvent.click(overlay);
+      await batch;
+    });
+    expectSkippedAndCarriedOn();
+  });
+
+  it("does not dismiss on a click inside the dialog", async () => {
+    const { batch } = await dropIntoConflict();
+    fireEvent.click(screen.getByRole("dialog"));
+    expect(screen.queryByRole("dialog")).not.toBeNull();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Replace" }));
+      await batch;
+    });
+    expect(uploadFileToContainer).toHaveBeenNthCalledWith(2, "p1", "/host/a.txt", "/workspace", true);
+  });
+});

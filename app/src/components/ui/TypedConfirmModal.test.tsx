@@ -71,6 +71,16 @@ describe("TypedConfirmModal", () => {
     expect(screen.getByRole("status")).toHaveTextContent("Name matches.");
   });
 
+  it("names what it is waiting for, when that is not a project", () => {
+    // An orphaned volume has no project — its id matches nothing in the store,
+    // which is the definition of the variant — so the gate takes the volume's
+    // own name and must not ask for a string that does not exist.
+    renderModal({ expected: "triple-c-claude-config-gone", subject: "volume name" });
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Waiting for the exact volume name.",
+    );
+  });
+
   it("spells out what is lost, from the caller's copy", () => {
     renderModal();
     expect(screen.getByText("Everything goes.")).toBeInTheDocument();
