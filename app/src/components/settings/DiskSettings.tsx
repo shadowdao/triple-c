@@ -105,7 +105,18 @@ export default function DiskSettings() {
   // moved from the tick list to the destructive list can vanish from the UI
   // entirely rather than reappear behind a confirmation.
   const orphanVolumes = plan?.destructive.filter(isOrphanVolume) ?? [];
-  const projectDestructive = plan?.destructive.filter((d) => !isOrphanVolume(d)) ?? [];
+  // A destructive item is rendered inside its project's row, so one whose
+  // project id matches no row would be measured and shown nowhere. That is not
+  // hypothetical: `survey_rollback_pins` walks *images*, not projects, and
+  // deliberately tolerates an absent project by falling back to the raw id as
+  // the display name — so a pin left behind by a deleted project is exactly
+  // this case, and it is the multi-GB kind. Anything unmatched gets its own
+  // section rather than being silently dropped.
+  const rowIds = new Set((report?.projects ?? []).map((r) => r.project_id));
+  const projectDestructive =
+    plan?.destructive.filter((d) => !isOrphanVolume(d) && rowIds.has(d.project_id)) ?? [];
+  const unmatchedDestructive =
+    plan?.destructive.filter((d) => !isOrphanVolume(d) && !rowIds.has(d.project_id)) ?? [];
 
   const safeItems = plan?.items.filter((i) => i.safety === "safe") ?? [];
   const semiItems = plan?.items.filter((i) => i.safety === "semi_safe") ?? [];
@@ -495,6 +506,58 @@ export default function DiskSettings() {
             </section>
           )}
 
+          {/* --- Destructive leftovers with no project row ------------------- */}
+          {unmatchedDestructive.length > 0 && (
+            <section className="space-y-2" data-testid="disk-unmatched-bucket">
+              <h3 className="text-[13px] font-medium text-[var(--text-primary)]">
+                Leftovers from projects no longer in Triple-C
+              </h3>
+              <p className="text-xs text-[var(--text-secondary)] leading-relaxed">
+                These belong to a project id that is not in your project list, so there
+                is no row above to show them under. The same caveat as the volumes below
+                applies: &ldquo;not in your project list&rdquo; is the only thing this
+                means, and an idle live project is indistinguishable from a deleted one
+                from Docker&rsquo;s side. Because there is no project name to type, each
+                one is confirmed against its project <em>id</em>.
+              </p>
+              <ul className="space-y-1.5">
+                {unmatchedDestructive.map((item) => (
+                  <li
+                    key={destructiveKey(item)}
+                    className="flex items-start justify-between gap-3"
+                    data-testid={`disk-unmatched-${destructiveKey(item)}`}
+                  >
+                    <span className="flex-1 min-w-0">
+                      <span className="block text-[var(--text-primary)] font-mono break-all">
+                        {item.label}
+                      </span>
+                      <span className="block text-xs text-[var(--text-secondary)] leading-snug">
+                        {item.loses}
+                      </span>
+                      {item.blocked && (
+                        <span className="block text-xs text-[var(--text-secondary)]">
+                          {item.blocked}
+                        </span>
+                      )}
+                    </span>
+                    <span className="flex items-center gap-2 whitespace-nowrap">
+                      <span className="text-xs text-[var(--text-secondary)] tabular-nums">
+                        {formatBytes(item.bytes)}
+                      </span>
+                      <Button
+                        size="sm"
+                        disabled={item.blocked !== null || working}
+                        onClick={() => openDestroying(item)}
+                      >
+                        Delete&hellip;
+                      </Button>
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+
           {/* --- Orphaned volumes: destructive, one at a time ---------------- */}
           {orphanVolumes.length > 0 && (
             <section className="space-y-2" data-testid="disk-orphan-bucket">
@@ -704,6 +767,12 @@ export default function DiskSettings() {
         // case-sensitive and a mangled name in the heading is a name the user
         // cannot type.
         const orphan = isOrphanVolume(destroying);
+        // A leftover whose project is gone has no name either. `project_name`
+        // is the raw id in that case — which is deliberate on the Rust side and
+        // is exactly what `destroy` compares against — so the gate works, but
+        // the label has to say "id" or it asks for something that does not
+        // exist.
+        const ownerless = !orphan && !rowIds.has(destroying.project_id);
         return (
         <TypedConfirmModal
           title={
@@ -712,7 +781,7 @@ export default function DiskSettings() {
               : `Delete ${destroying.label.toLowerCase()}`
           }
           expected={destroying.project_name}
-          subject={orphan ? "volume name" : "project name"}
+          subject={orphan ? "volume name" : ownerless ? "project id" : "project name"}
           confirmLabel={orphan ? "Delete volume" : `Delete ${destroying.label.toLowerCase()}`}
           busy={working}
           // A failure here has to land inside the dialog. The panel's own

@@ -1547,3 +1547,48 @@ async fn compaction_end_to_end_against_a_real_image() {
         probe.stdout
     );
 }
+
+#[tokio::test]
+async fn an_ownerless_rollback_pin_is_confirmed_against_its_id_not_a_project_name() {
+    // `survey_rollback_pins` walks images, not projects, so a pin outlives the
+    // project that made it. Before the early return, `destroy` called
+    // `find_project` first and refused such a pin every single time — a
+    // multi-GB image measured by the panel and deletable by nothing in it.
+    let projects: Vec<Project> = Vec::new();
+    let target = DestructiveTarget::RollbackPin {
+        project_id: "dead0000-0000-0000-0000-000000000000".to_string(),
+        tag: "pre-migration-20260101-101500".to_string(),
+    };
+
+    // The wrong subject is refused, and the message says what to type instead
+    // of the "project not found" the old path produced.
+    let err = destroy(&target, "some-project-name", &projects)
+        .await
+        .expect_err("a mismatched confirmation must refuse");
+    assert!(
+        err.contains("dead0000-0000-0000-0000-000000000000"),
+        "the refusal should name the id to type, got: {}",
+        err
+    );
+    assert!(err.contains("Nothing was removed"));
+}
+
+#[tokio::test]
+async fn an_ownerless_rollback_pin_still_refuses_a_tag_that_is_not_a_pin() {
+    // The tag is the one free-form string a destructive target carries, and
+    // `latest` names the project's live snapshot. The owned arm validates it;
+    // the ownerless arm must not be the way around that check.
+    let projects: Vec<Project> = Vec::new();
+    let target = DestructiveTarget::RollbackPin {
+        project_id: "dead0000-0000-0000-0000-000000000000".to_string(),
+        tag: "latest".to_string(),
+    };
+    let err = destroy(&target, "dead0000-0000-0000-0000-000000000000", &projects)
+        .await
+        .expect_err("`latest` is not a rollback pin tag");
+    assert!(
+        err.contains("not a rollback pin tag"),
+        "got: {}",
+        err
+    );
+}

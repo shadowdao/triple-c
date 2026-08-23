@@ -492,6 +492,68 @@ describe("DiskSettings", () => {
     expect(await screen.findByTestId("disk-orphan-bucket")).toBeInTheDocument();
   });
 
+  it("shows a rollback pin whose project is gone, instead of dropping it", async () => {
+    // `survey_rollback_pins` walks images, not projects, and falls back to the
+    // raw id when the project is absent. The per-project table joins
+    // destructive items to rows by `project_id`, and rows come only from
+    // projects in the store — so before the unmatched bucket, such a pin was
+    // measured by the scan and rendered nowhere at all. A multi-GB image the
+    // panel knew about and offered no way to remove.
+    const ownerlessPin: DestructiveItem = {
+      target: {
+        kind: "rollback_pin",
+        project_id: "dead0000-0000-0000-0000-000000000000",
+        tag: "pre-migration-20260101-101500",
+      },
+      project_id: "dead0000-0000-0000-0000-000000000000",
+      // The Rust falls back to the id, and it is what `destroy` compares
+      // against — so this is the string the user has to type.
+      project_name: "dead0000-0000-0000-0000-000000000000",
+      label: "Rollback pin pre-migration-20260101-101500",
+      loses: "The only copy of that migration's rollback target.",
+      bytes: 5_400_000_000,
+      blocked: null,
+    };
+    listReclaimable.mockResolvedValue(plan({ destructive: [ownerlessPin] }));
+    await renderAndScan();
+
+    const bucket = await screen.findByTestId("disk-unmatched-bucket");
+    expect(within(bucket).getByText(/Rollback pin pre-migration-20260101-101500/)).toBeInTheDocument();
+    // And it is not silently folded into the project table.
+    const table = screen.queryByTestId("disk-project-table");
+    if (table) {
+      expect(table.textContent).not.toMatch(/pre-migration-20260101-101500/);
+    }
+  });
+
+  it("asks for the project id, not a project name, when there is no project", async () => {
+    // The gate compares against `project_name`, which is the raw id here. That
+    // works — but a dialog captioned "type the project name" for a project that
+    // no longer exists asks for something the user cannot supply.
+    const ownerlessPin: DestructiveItem = {
+      target: {
+        kind: "rollback_pin",
+        project_id: "dead0000-0000-0000-0000-000000000000",
+        tag: "pre-migration-20260101-101500",
+      },
+      project_id: "dead0000-0000-0000-0000-000000000000",
+      project_name: "dead0000-0000-0000-0000-000000000000",
+      label: "Rollback pin pre-migration-20260101-101500",
+      loses: "The only copy of that migration's rollback target.",
+      bytes: 5_400_000_000,
+      blocked: null,
+    };
+    listReclaimable.mockResolvedValue(plan({ destructive: [ownerlessPin] }));
+    await renderAndScan();
+
+    const bucket = await screen.findByTestId("disk-unmatched-bucket");
+    fireEvent.click(within(bucket).getByRole("button", { name: /Delete/ }));
+
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog.textContent).toMatch(/project id/i);
+    expect(dialog.textContent).not.toMatch(/type the project name/i);
+  });
+
   it("keeps orphaned volumes out of the per-project table", async () => {
     // The table keys off `project_id`, and an orphan's id matches no row by
     // definition. Passing them in anyway is how one would leak into the wrong

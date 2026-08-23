@@ -3035,6 +3035,52 @@ async fn reclaim_containers(
 /// the typed confirmation is permission to act, not a promise that the world
 /// stood still. Both of those re-checks predate the move to the destructive
 /// path and are deliberately unchanged.
+/// Drop a rollback pin whose project is no longer in `projects.json`.
+///
+/// The owned case ([`destroy`]'s `RollbackPin` arm) takes the project's claim
+/// and clears the ownerless marker. Neither applies here: there is no project
+/// to claim, and nothing else can be mid-operation on an id the store does not
+/// know. What *does* still apply is the tag validation — this is the one
+/// destructive variant carrying a free-form string over IPC, and `latest` would
+/// name a live snapshot rather than a pin.
+async fn destroy_ownerless_rollback_pin(
+    project_id: &str,
+    tag: &str,
+) -> Result<ReclaimResult, String> {
+    if migration::parse_rollback_tag(tag).is_none() {
+        return Err(format!(
+            "{:?} is not a rollback pin tag. Nothing was removed.",
+            tag
+        ));
+    }
+    let reference = format!("triple-c-snapshot-{}:{}", project_id, tag);
+    migration::untag_image(&reference).await?;
+    // The grace clock is meaningless once the tag is gone, and the marker file
+    // would otherwise outlive everything that could ever read it.
+    migration_store::clear_ownerless(project_id, tag);
+    // Untagging only makes the image dangling; the sweep applies its own
+    // refusal rules to whatever that turns out to be.
+    let sweep = container::sweep_orphaned_snapshots().await;
+    log::info!(
+        "Dropped ownerless rollback pin {} on explicit confirmation",
+        reference
+    );
+    Ok(ReclaimResult {
+        target: None,
+        destroyed: Some(DestructiveTarget::RollbackPin {
+            project_id: project_id.to_string(),
+            tag: tag.to_string(),
+        }),
+        ok: true,
+        freed_bytes: sweep.reclaimed_bytes,
+        projected_bytes: None,
+        message: format!(
+            "Dropped rollback pin {} for a project that is no longer in Triple-C.",
+            tag
+        ),
+    })
+}
+
 async fn destroy_orphan_volume(name: &str, projects: &[Project]) -> Result<ReclaimResult, String> {
     let docker = get_docker()?;
 
@@ -3770,6 +3816,26 @@ pub async fn destroy(
             ));
         }
         return destroy_orphan_volume(name, projects).await;
+    }
+
+    // **A rollback pin can outlive the project it belongs to.**
+    // `survey_rollback_pins` walks *images*, not projects, and deliberately
+    // tolerates an absent project by falling back to the raw id as the display
+    // name. So a pin left by a project the user has since deleted is measured
+    // and listed — and `find_project` below would refuse it on every attempt,
+    // making a multi-GB image permanently undeletable through the panel that
+    // exists to find exactly that. Take the same early return `OrphanVolume`
+    // takes, confirming against the subject the UI actually showed: the id.
+    if let DestructiveTarget::RollbackPin { project_id, tag } = target {
+        if find_project(projects, target.project_id()).is_err() {
+            if !confirmation_matches(project_id, confirmation) {
+                return Err(format!(
+                    "This pin's project is no longer in Triple-C, so there is no name to type.                      Type the project id ({}) exactly to confirm. Nothing was removed.",
+                    project_id
+                ));
+            }
+            return destroy_ownerless_rollback_pin(project_id, tag).await;
+        }
     }
 
     let project = find_project(projects, target.project_id())?;
