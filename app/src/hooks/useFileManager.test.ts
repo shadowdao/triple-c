@@ -8,7 +8,6 @@ const downloadContainerFile = vi.fn();
 const uploadFileToContainer = vi.fn();
 const renameContainerPath = vi.fn();
 const createContainerDirectory = vi.fn();
-const stageContainerFileForDrag = vi.fn();
 
 vi.mock("../lib/tauri-commands", () => ({
   listContainerFiles: (p: string, path: string) => listContainerFiles(p, path),
@@ -18,7 +17,6 @@ vi.mock("../lib/tauri-commands", () => ({
   createContainerDirectory: (p: string, parent: string, n: string) =>
     createContainerDirectory(p, parent, n),
   readContainerFile: vi.fn(),
-  stageContainerFileForDrag: (p: string, path: string) => stageContainerFileForDrag(p, path),
 }));
 
 /**
@@ -231,85 +229,6 @@ describe("useFileManager save to host", () => {
   });
 });
 
-describe("useFileManager drag-out staging", () => {
-  it("copies the file onto the host and hands back the host path", async () => {
-    stageContainerFileForDrag.mockResolvedValue("/tmp/triple-c-drag-out/s1/a.txt");
-    const { result } = renderHook(() => useFileManager("p1"));
-
-    let staged: { hostPath: string; cached: boolean } | null = null;
-    await act(async () => {
-      staged = await result.current.stageForDrag(file("a.txt"));
-    });
-
-    expect(stageContainerFileForDrag).toHaveBeenCalledWith("p1", "/workspace/a.txt");
-    expect(staged).toEqual({ hostPath: "/tmp/triple-c-drag-out/s1/a.txt", cached: false });
-    // The note is transient — it must not still be sitting there afterwards.
-    expect(result.current.busy).toBeNull();
-  });
-
-  it("reuses the copy on a second drag of the same entry", async () => {
-    // The whole point of the cache: the copy is the slow half of the gesture,
-    // and a retry after a drag the OS missed has to be immediate.
-    stageContainerFileForDrag.mockResolvedValue("/tmp/triple-c-drag-out/s1/a.txt");
-    const { result } = renderHook(() => useFileManager("p1"));
-
-    let second: { hostPath: string; cached: boolean } | null = null;
-    await act(async () => {
-      await result.current.stageForDrag(file("a.txt"));
-      second = await result.current.stageForDrag(file("a.txt"));
-    });
-
-    expect(stageContainerFileForDrag).toHaveBeenCalledTimes(1);
-    expect(second).toEqual({ hostPath: "/tmp/triple-c-drag-out/s1/a.txt", cached: true });
-  });
-
-  it("re-stages once the entry has changed underneath it", async () => {
-    // Keyed on size and mtime, so a file edited in the container is copied
-    // again rather than dragged out at its old contents.
-    stageContainerFileForDrag.mockResolvedValue("/tmp/triple-c-drag-out/s1/a.txt");
-    const { result } = renderHook(() => useFileManager("p1"));
-
-    await act(async () => {
-      await result.current.stageForDrag(file("a.txt", { size: 10 }));
-      await result.current.stageForDrag(file("a.txt", { size: 4096 }));
-    });
-
-    expect(stageContainerFileForDrag).toHaveBeenCalledTimes(2);
-  });
-
-  it("surfaces a refused staging instead of returning a path that is not there", async () => {
-    stageContainerFileForDrag.mockRejectedValue(
-      '900 MB is too large to drag out (limit 256 MB) — use "Save to host…" instead.',
-    );
-    const { result } = renderHook(() => useFileManager("p1"));
-
-    let staged: { hostPath: string; cached: boolean } | null = null;
-    await act(async () => {
-      staged = await result.current.stageForDrag(file("huge.bin"));
-    });
-
-    expect(staged).toBeNull();
-    expect(toastText()).toContain("too large to drag out");
-    expect(toastText()).toContain("Save to host");
-    expect(result.current.busy).toBeNull();
-  });
-
-  it("does not cache a failure, so a retry actually retries", async () => {
-    stageContainerFileForDrag.mockRejectedValueOnce("Container not running");
-    stageContainerFileForDrag.mockResolvedValueOnce("/tmp/triple-c-drag-out/s1/a.txt");
-    const { result } = renderHook(() => useFileManager("p1"));
-
-    let staged: { hostPath: string; cached: boolean } | null = null;
-    await act(async () => {
-      await result.current.stageForDrag(file("a.txt"));
-      staged = await result.current.stageForDrag(file("a.txt"));
-    });
-
-    expect(stageContainerFileForDrag).toHaveBeenCalledTimes(2);
-    expect(staged).toEqual({ hostPath: "/tmp/triple-c-drag-out/s1/a.txt", cached: false });
-  });
-});
-
 describe("useFileManager stays where the user is", () => {
   it("does not drag the pane back when the user navigates away mid-upload", async () => {
     // The closure captured `/workspace`; the user is in `/workspace/src` by the
@@ -482,21 +401,6 @@ describe("useFileManager overwrite prompt", () => {
     });
     expect(result.current.conflict).toBeNull();
     expect(toastText()).toContain("too large");
-  });
-});
-
-describe("useFileManager staged host paths", () => {
-  it("recognises a path it staged, and only that path", async () => {
-    stageContainerFileForDrag.mockResolvedValue("/tmp/triple-c-drag-out/s1/a.txt");
-    const { result } = renderHook(() => useFileManager("p1"));
-
-    expect(result.current.isStagedHostPath("/tmp/triple-c-drag-out/s1/a.txt")).toBe(false);
-    await act(async () => {
-      await result.current.stageForDrag(file("a.txt"));
-    });
-    expect(result.current.isStagedHostPath("/tmp/triple-c-drag-out/s1/a.txt")).toBe(true);
-    // Same basename, a real host file the user actually wants uploaded.
-    expect(result.current.isStagedHostPath("/home/me/a.txt")).toBe(false);
   });
 });
 

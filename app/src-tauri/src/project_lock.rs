@@ -61,8 +61,7 @@
 //! does do about it is bound the damage: [`any_held_excluding`] lets the daemon-wide
 //! reapers skip work while this process is mid-operation, and the reapers
 //! themselves gained age gates so a young container belonging to somebody else
-//! is left alone (see `docker::disk::reap_stale_compaction_artifacts` and
-//! `docker::migration::reap_probe_containers`).
+//! is left alone (see `docker::migration::reap_probe_containers`).
 //!
 //! ## Refuse, do not queue
 //!
@@ -85,6 +84,13 @@ pub enum ProjectOp {
     /// `confirm_migration`.
     Migration,
     /// `disk::compact_snapshot` — the long one, and the reason this exists.
+    ///
+    /// Not constructed on this branch: the Disk panel and its compaction were
+    /// held back for separate hardening and live on `hold/disk-and-dragout`.
+    /// The variant stays because this registry is the thing that made those
+    /// operations safe to re-land, and a re-land that had to re-derive the
+    /// claim classes would be re-deriving the bug.
+    #[allow(dead_code)]
     Compaction,
     /// Start / stop / recreate. Anything in `start_project_container`'s path.
     Recreate,
@@ -95,6 +101,10 @@ pub enum ProjectOp {
     /// `disk::clear_caches` — an exec into the live container. It does not
     /// write `:latest`, but it must not run while the container is being
     /// removed out from under it.
+    ///
+    /// Not constructed on this branch, for the same reason as
+    /// [`ProjectOp::Compaction`].
+    #[allow(dead_code)]
     CacheClear,
     /// `container::scrub_secrets_from_snapshots` — the third writer of
     /// `triple-c-snapshot-{id}:latest`, reached from `clear_claude_token`. It
@@ -220,6 +230,12 @@ pub fn is_held_by(project_id: &str, op: ProjectOp) -> bool {
 /// only in-process question they can ask before force-removing one. The
 /// exclusion is for the reaper that runs *inside* a compaction, which is
 /// already holding a claim of its own and would otherwise see it and skip.
+///
+/// No production caller on this branch: the compaction reaper it was written
+/// for went to `hold/disk-and-dragout` with the rest of the Disk panel. Kept
+/// (and still tested) because it is the only bound this module offers on the
+/// cross-process case documented above.
+#[allow(dead_code)]
 pub fn any_held_excluding(op: ProjectOp, exclude_project_id: &str) -> bool {
     holders()
         .lock()

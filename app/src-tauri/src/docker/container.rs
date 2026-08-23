@@ -2184,8 +2184,8 @@ pub(crate) fn snapshot_scrub_script() -> String {
 /// expands to itself and is skipped by the existence guard.
 ///
 /// Passing the whole pattern rather than the two halves also keeps each entry
-/// readable verbatim in the compaction `RUN` line — `disk.rs` asserts exactly
-/// that, to catch a second forked copy of the list.
+/// readable verbatim in the generated script, so a test can assert the script
+/// names this list rather than a second forked copy of it.
 ///
 /// ## The containment guarantee (C1)
 ///
@@ -2258,15 +2258,15 @@ pub(crate) fn snapshot_scrub_script() -> String {
 /// which the agent's passwordless sudo can. It closes the part of the gap that
 /// survives a container restart and needs no privileges at all.
 ///
-/// ## Why every line ends in `;`
+/// ## Why every line ends in `;`, and why there are no `#` comments
 ///
-/// `disk.rs` folds this script onto a single `RUN` line for the compaction
-/// build, joining non-blank lines with a space. That is only a join and not a
-/// rewrite if each line already terminates its own statement — the previous
-/// version did not, and its folded form was a `"do" unexpected` syntax error,
-/// so compaction had been running no scrub at all. It also means the script
-/// carries **no `#` comments**: folded, one would swallow the rest of the
-/// program. A test pins both the multi-line and the folded form.
+/// A self-terminating statement per line, and no comments, is what makes the
+/// script safe to join onto one line: any embedder that folds it with spaces
+/// gets a join rather than a rewrite. That property was learnt the hard way —
+/// an earlier version's folded form was a `"do" unexpected` syntax error, so
+/// the scrub ran not at all — and it is kept even though the folding caller is
+/// gone, because a script that survives being flattened is the cheap invariant
+/// and re-learning it is not.
 ///
 /// ## Why `root` exists
 ///
@@ -2903,8 +2903,8 @@ pub async fn scrub_secrets_from_snapshots() -> SnapshotScrubReport {
 
         // Claim the project before touching its snapshot.
         //
-        // This is the third writer of `triple-c-snapshot-{id}:latest`, after a
-        // recreate's commit and a compaction, and it has the same
+        // This is the second writer of `triple-c-snapshot-{id}:latest`, after a
+        // recreate's commit, and it has the same
         // read-modify-write shape: create a scratch container *from* the
         // snapshot, then commit back over the same tag. A `:latest` move
         // landing in between is silently overwritten by an image derived from
@@ -4233,8 +4233,7 @@ mod tests {
         assert!(script.contains("scrub_in '/var/log/apt/*' '-';"));
         assert!(script.contains("scrub_in '/tmp/triple-c-drops/*' '14';"));
         // The parent/glob split happens in the shell, so every entry stays
-        // readable verbatim — `disk.rs` folds this onto one `RUN` line and
-        // asserts each pattern appears there rather than a forked copy.
+        // readable verbatim in the script rather than as a forked copy.
         for pattern in SNAPSHOT_SCRUB_PATHS {
             assert!(script.contains(pattern), "{} is not named in the script", pattern);
         }
@@ -4570,51 +4569,6 @@ mod tests {
         // recreate with the UI on "Saving container state…" and no cancel.
         assert!(SCRUB_TIMEOUT.as_secs() >= 30, "too tight to survive a slow but healthy scrub");
         assert!(SCRUB_TIMEOUT.as_secs() <= 300, "long enough that a user would force-quit first");
-    }
-
-    /// `disk.rs` folds this script onto one `RUN` line for the compaction
-    /// build by joining its non-blank lines with a space, so the script has to
-    /// be a sequence of self-terminating statements and carry no `#` comments.
-    /// The previous version was neither: its folded form was a `"do"
-    /// unexpected` syntax error, which means compaction had been scrubbing
-    /// nothing at all. The fold is reproduced here rather than imported
-    /// because it is private to the other module — a divergence would show up
-    /// as this test passing while the real Dockerfile broke, so it is pinned
-    /// against the same wording in `fold_shell_script`.
-    #[cfg(unix)]
-    #[test]
-    fn a_compaction_runs_this_module_s_scrub_script_byte_for_byte() {
-        // The compaction build used to fold the script onto one `RUN` line by
-        // joining its lines with a space, which turned `for p in …; do` into
-        // `do` in statement position and made every compaction fail with
-        // `syntax error: unexpected "do"`. That fold is gone — `disk.rs` now
-        // emits the JSON exec form, whose string escapes carry newlines — so
-        // the assertion worth pinning from this side is no longer "the folded
-        // one-liner still parses" but the stronger one: whatever encoding
-        // `disk.rs` chooses, the bytes that reach `sh` are *this* script.
-        //
-        // This is what stops the two files drifting. `container.rs` owns the
-        // containment rules in `snapshot_scrub_script`; a compaction that ran a
-        // mangled copy would be running a scrub with those rules altered, and
-        // the mangling would be silent.
-        let expected = snapshot_scrub_script();
-        // Build the real Dockerfile the compaction would, then pull the script
-        // back out of it — going through `compaction_dockerfile` rather than a
-        // helper means a change to how the RUN line is emitted is caught here.
-        let dockerfile = crate::docker::disk::compaction_dockerfile(
-            "triple-c-snapshot-00000000-0000-0000-0000-000000000000:latest",
-            &expected,
-        );
-        let run_line = dockerfile
-            .lines()
-            .find(|l| l.starts_with("RUN "))
-            .expect("the compaction Dockerfile should carry a RUN line");
-        let actual = crate::docker::disk::script_from_run_line(run_line)
-            .expect("the compaction RUN line should be the JSON exec form");
-        assert_eq!(
-            actual, expected,
-            "the compaction runs a different script than snapshot_scrub_script() produces"
-        );
     }
 
     #[test]

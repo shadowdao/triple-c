@@ -1,7 +1,6 @@
 pub mod ca_certs;
 pub mod client;
 pub mod container;
-pub mod disk;
 pub mod image;
 pub mod exec;
 pub mod gateway;
@@ -25,10 +24,6 @@ pub use exec::*;
 pub use legacy_cleanup::*;
 #[allow(unused_imports)]
 pub use migration::*;
-// `disk` is also deliberately kept namespaced. Its `scan`, `reclaim` and
-// `destroy` are meaningless as bare names, and `disk::destroy` reading as what
-// it is at every call site is worth more than the brevity.
-
 // Deliberately *not* re-exported flat: `ca_certs::resolve` and
 // `ca_certs::CA_MOUNT_DIR` are far clearer than bare `resolve` in a module that
 // already re-exports five other namespaces.

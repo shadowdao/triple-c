@@ -79,7 +79,7 @@ export default function AuthBridgeRow({ project }: { project: Project }) {
 
   /**
    * Which write to `status` is the newest — the same "is this still mine?"
-   * guard `useDiskUsage` and `useContainerMigration` use around their async
+   * guard `useContainerMigration` uses around its async
    * writes, and needed here for a reason that is easy to miss.
    *
    * There are two sources of truth for this row and only one of them is

@@ -79,23 +79,27 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
 - **`components/projects/home/`** — **Project Home**, the main-area view for a project:
   Overview / Sessions / Automation / Config / Files. Per-project configuration lives here, not in
   modals — see "UI conventions" below.
-  - **Files moves in both directions and neither direction uses HTML5 drag.** Dropping *into*
-    the pane is Tauri's native `onDragDropEvent`, which is window-wide and therefore routed by
-    a hit-test of the physical-pixel payload position against the pane's rect ÷
+  - **Files takes drops *in*, and that path does not use HTML5 drag.** Dropping into the pane
+    is Tauri's native `onDragDropEvent`, which is window-wide and therefore routed by a
+    hit-test of the physical-pixel payload position against the pane's rect ÷
     `devicePixelRatio` — a hidden pane has a zero-size rect, which is what stops it and
-    `TerminalView`'s listener both firing. Dragging *out* is pointer events into
-    `tauri-plugin-drag`, for the same `dragDropEnabled` reason the tab strip is pointer-driven.
-  - **A drag-out is a copy first and a drag second.** The OS can only drag a path that exists
-    on the host, and these files are inside a container, so `stage_container_file_for_drag`
-    materialises one into `<os-temp>/triple-c-drag-out/<session>/` (via the shared
-    `fetch_container_file`, keeping the original filename, capped at the same 256 MiB as an
-    upload) and `startDrag` is handed *that*. Two consequences worth keeping: the copy is an
-    async gap inside a gesture that feels instantaneous, so the staged path is cached and the
-    UI says "drag it again" when the pointer came up first; and the staging directory is
-    cleared on exit **and** reaped at startup, because a drag-out quietly filling the host temp
-    dir with whole files would be the disk problem this project just fixed, in a new place.
-    "Save to host…" stays — `startDrag` is an enhancement and can fail per platform.
-- **`components/settings/`** — Host-level settings: Docker, AWS, Web Terminal, STT, shared auth
+    `TerminalView`'s listener both firing. Keep `lib/dropTarget.ts` and both listeners.
+  - **Getting a file *out* is "Save to host…", and there is no other route.** OS drag-out —
+    `tauri-plugin-drag`, `stage_container_file_for_drag` and its host staging directory — was
+    removed from the ship branch and held back for separate hardening; it lives on
+    `hold/disk-and-dragout`. Do not re-add `drag:allow-start-drag` or a staging command
+    without taking that work back whole: the plugin has no scope mechanism, so the grant lets
+    a compromised webview start a drag on *any* host path the user can read, and the staging
+    directory is a host-temp disk leak with a gesture attached unless its exit-clear and
+    startup-reap come back with it.
+- **`components/settings/`** — Host-level settings: Docker, AWS, Web Terminal, STT, shared auth.
+  There is deliberately **no Disk panel** here. The disk survey and its reclaim / destroy /
+  compaction surface were held back for separate hardening and live on `hold/disk-and-dragout`;
+  one of their IPC commands was a verified arbitrary-DELETE primitive, so if that work returns it
+  returns whole, `generate_handler!` entries and typed confirmations included. The *prevention*
+  half stayed and is not disk-panel code: the pre-commit scrub in `docker/container.rs`, capped
+  container logs, the `triple-c.base` / `triple-c.managed` labels, `sweep_orphaned_snapshots` and
+  the startup housekeeping in `lib.rs`, the migration reapers, and `project_lock.rs`.
 - **`components/ui/`** — Shared primitives. **Use these; do not hand-roll replacements.**
   `Modal` (the only correct way to build a dialog — it supplies `role="dialog"`, `aria-modal`,
   focus trap and restore), `Button`, `Toggle`, `Field`, `SegmentedControl`, `StatusIndicator`,

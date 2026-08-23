@@ -1164,8 +1164,10 @@ When you scroll up in the terminal to review previous output, a **Jump to Curren
 The **Files** tab of Project Home browses inside a running container. You can:
 
 - **Browse** the container filesystem, starting at `/workspace`, with breadcrumb navigation
-- **Download** any file to your host machine via the **Download** button on each file entry
-- **Upload file** from your host into the current container directory
+- **Save to host…** — copy any file out to a location you pick. This is the way to get a file out
+  of a container; there is one button per file entry, and the file viewer offers it too
+- **Upload file** from your host into the current container directory — or **drop files straight
+  onto the pane** from your desktop, which uploads them into the directory on screen
 - **Refresh** the directory listing at any time
 
 The listing shows file names, sizes, and modification dates.

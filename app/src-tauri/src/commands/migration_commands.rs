@@ -243,6 +243,13 @@ async fn container_label(container_id: &str, label: &str) -> Option<String> {
 /// function is the specialisation of it that reconcile still needs: a *live*
 /// migration is indistinguishable from a crashed one from the outside, and only
 /// this process knows which it is looking at.
+///
+/// No production caller on this branch: the Disk panel's survey was the last
+/// one, and it went to `hold/disk-and-dragout`. Kept — and still exercised by
+/// `a_live_migration_is_distinguishable_from_a_crashed_one` — because it is the
+/// one named answer to that question and re-inventing it is how the two
+/// disagreeing answers happened the first time.
+#[allow(dead_code)]
 pub(crate) fn is_migrating(project_id: &str) -> bool {
     crate::project_lock::is_held_by(project_id, crate::project_lock::ProjectOp::Migration)
 }

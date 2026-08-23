@@ -19,7 +19,6 @@ import WebTerminalSettings from "./WebTerminalSettings";
 import SttSettings from "./SttSettings";
 import SharedAuthSettings from "./SharedAuthSettings";
 import CertificateSettings from "./CertificateSettings";
-import DiskSettings from "./DiskSettings";
 
 export default function SettingsPanel() {
   const { appSettings, saveSettings } = useSettings();
@@ -172,10 +171,6 @@ export default function SettingsPanel() {
 
       <AccordionSection id="container" title="Container" defaultOpen={false}>
         <DockerSettings />
-      </AccordionSection>
-
-      <AccordionSection id="disk" title="Disk" defaultOpen={false}>
-        <DiskSettings />
       </AccordionSection>
 
       <AccordionSection id="certificates" title="Certificates" defaultOpen={false}>

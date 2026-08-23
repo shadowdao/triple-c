@@ -33,15 +33,6 @@ function baseName(path: string): string {
 }
 
 /**
- * Host paths compare on separators, not on case: the OS hands a dropped path
- * back in whatever form its file dialog produced, and on Windows that is not
- * reliably the form `stage_container_file_for_drag` returned.
- */
-function normaliseHostPath(path: string): string {
-  return path.replace(/\\/g, "/").replace(/\/+$/, "");
-}
-
-/**
  * ## Where failures are reported
  *
  * Two audiences, two places, and the split is deliberate.
@@ -51,7 +42,7 @@ function normaliseHostPath(path: string): string {
  * no rows, and it is not transient — it stands until the directory lists.
  *
  * Every **transient operation** failure — upload, rename, create folder,
- * save-to-host, drag staging — goes to `ToastHost` instead. Those used to land
+ * save-to-host — goes to `ToastHost` instead. Those used to land
  * in the same inline `error` div, which is the first child of the *scrolling*
  * list: three hundred rows down, a refused rename produced no visible change
  * at all, just a rename box that stayed open for no stated reason. Worse, the
@@ -91,7 +82,7 @@ export function useFileManager(projectId: string) {
   /**
    * A slow listing can land after a newer one and set both the rows and the
    * breadcrumb back to a directory the user already left. Same generation
-   * guard `useDiskUsage` and `useContainerMigration` use: every async write
+   * guard `useContainerMigration` uses: every async write
    * checks it is still the newest before it lands.
    */
   const navGeneration = useRef(0);
@@ -320,63 +311,6 @@ export function useFileManager(projectId: string) {
     [projectId, navigate, startWork, report, askOverwrite],
   );
 
-  /**
-   * Host paths already copied out this session, keyed by the entry they came
-   * from. Size and mtime are in the key, so an entry that changed since the
-   * last listing re-stages rather than dragging a stale copy.
-   */
-  const stagedRef = useRef(new Map<string, string>());
-  /**
-   * The same paths the other way round, as a set.
-   *
-   * A drag-out released back inside the app arrives as an ordinary host drop
-   * carrying the staged copy's path, and uploading that would write the app's
-   * own temp copy over the container file it came from — which is worse than a
-   * no-op, because the key above is built from the *last listing*, so a file an
-   * agent rewrote since then would be replaced by a minutes-old snapshot. This
-   * set is what makes the "is this ours?" test exact instead of a guess at the
-   * temp directory's name.
-   */
-  const stagedHostPathsRef = useRef(new Set<string>());
-
-  /** True when `path` is a copy this pane staged for a drag-out. */
-  const isStagedHostPath = useCallback(
-    (path: string) => stagedHostPathsRef.current.has(normaliseHostPath(path)),
-    [],
-  );
-
-  /**
-   * Copy an entry onto the host so the OS can drag it, and return the absolute
-   * host path — or `null`, having reported why, if it could not be staged.
-   *
-   * `cached` is what the caller needs to tell a gesture that will feel
-   * instantaneous from one that has a whole-file copy in front of it: the copy
-   * is the slow half of a drag-out, and the OS only picks a drag up while the
-   * button is still down.
-   */
-  const stageForDrag = useCallback(
-    async (entry: FileEntry): Promise<{ hostPath: string; cached: boolean } | null> => {
-      const key = `${entry.path}|${entry.size}|${entry.modified}`;
-      const cached = stagedRef.current.get(key);
-      if (cached) return { hostPath: cached, cached: true };
-
-      startWork(`Preparing "${entry.name}"…`);
-      try {
-        const hostPath = await commands.stageContainerFileForDrag(projectId, entry.path);
-        stagedRef.current.set(key, hostPath);
-        stagedHostPathsRef.current.add(normaliseHostPath(hostPath));
-        setCompleted(`"${entry.name}" is ready to drag.`);
-        return { hostPath, cached: false };
-      } catch (e) {
-        report(`Could not prepare "${entry.name}" for dragging`, e);
-        return null;
-      } finally {
-        setBusy(null);
-      }
-    },
-    [projectId, startWork, report],
-  );
-
   const uploadFile = useCallback(async () => {
     try {
       const selected = await openDialog({ multiple: true, directory: false });
@@ -447,8 +381,6 @@ export function useFileManager(projectId: string) {
     downloadFile,
     uploadFile,
     uploadPaths,
-    stageForDrag,
-    isStagedHostPath,
     renameEntry,
     createFolder,
   };

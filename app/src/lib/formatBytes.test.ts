@@ -3,9 +3,9 @@ import { formatBytes, formatBytesCeiling, formatBytesDelta } from "./formatBytes
 
 describe("formatBytes", () => {
   it("defaults to base 1000, because that is what Docker prints", () => {
-    // The Disk panel exists to explain `docker system df`, which formats with
-    // `units.HumanSize` — base 1000. Showing 26.1 GB against a terminal saying
-    // 28.0 GB for the same build cache reads as a bug in the panel.
+    // Anything explaining `docker system df` has to match it, and Docker
+    // formats with `units.HumanSize` — base 1000. Showing 26.1 GB against a
+    // terminal saying 28.0 GB for the same object reads as a bug in the app.
     expect(formatBytes(28_000_000_000)).toBe("28.0 GB");
     expect(formatBytes(1_000)).toBe("1.0 KB");
     expect(formatBytes(1_500_000)).toBe("1.5 MB");
@@ -108,9 +108,9 @@ describe("formatBytesDelta", () => {
 
 describe("formatBytesCeiling", () => {
   it("says 'up to', because a compaction's yield is a bound not a promise", () => {
-    // Every other figure in the Disk panel is measured. This one cannot be
-    // known until the rewrite runs, and rendering it through a separate
-    // function is what stops it being read as a guarantee.
+    // A projected yield cannot be known until the work runs, unlike every
+    // measured figure beside it — rendering it through a separate function is
+    // what stops it being read as a guarantee.
     expect(formatBytesCeiling(5_100_000_000)).toBe("up to 5.1 GB");
   });
 

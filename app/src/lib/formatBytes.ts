@@ -17,11 +17,11 @@
  *
  * ## Why the default is base 1000
  *
- * The Disk panel exists to explain what `docker system df` reports, and Docker
- * formats every size it prints with `units.HumanSize`, which is **base 1000**.
- * A panel that showed 26.1 GB where the user's terminal said 28.0 GB for the
- * same build cache would read as a bug in the panel. So decimal is the default
- * and binary is opt-in, rather than the other way round.
+ * Anything explaining what Docker reports has to match it, and Docker formats
+ * every size it prints with `units.HumanSize`, which is **base 1000**. Showing
+ * 26.1 GB where the user's terminal said 28.0 GB for the same object would read
+ * as a bug in the app. So decimal is the default and binary is opt-in, rather
+ * than the other way round.
  *
  * Both existing conventions are preserved for every size either call site can
  * realistically produce — a file size or a payload size, i.e. a non-negative
@@ -90,6 +90,10 @@ export function formatBytes(bytes: number, options: FormatBytesOptions = {}): st
  * `12.3 GB` → `+12.3 GB`, for a figure that is being *added* rather than
  * measured. Used for "next commit adds …", which is the number that explains
  * why a snapshot grows.
+ *
+ * **No caller on this branch**, for the same reason as [`formatBytesCeiling`]:
+ * the Disk panel's per-project table was the last one, and it went to
+ * `hold/disk-and-dragout`.
  */
 export function formatBytesDelta(bytes: number, options?: FormatBytesOptions): string {
   const formatted = formatBytes(bytes, options);
@@ -99,10 +103,13 @@ export function formatBytesDelta(bytes: number, options?: FormatBytesOptions): s
 /**
  * `up to 12.3 GB` — for a bound rather than a measurement.
  *
- * The Disk panel is careful about this distinction: every figure it shows is
- * measured except a compaction's yield, which cannot be known until it runs.
- * Rendering that one through a different function is what stops it being read
- * as a promise.
+ * A figure that cannot be known until an operation runs must not render like
+ * one that was measured; going through a different function is what stops it
+ * being read as a promise.
+ *
+ * **No caller on this branch.** Its last one was the Disk panel's projected
+ * compaction yield, which went to `hold/disk-and-dragout`. Kept with its tests
+ * because the distinction it encodes is the reusable part.
  */
 export function formatBytesCeiling(bytes: number, options?: FormatBytesOptions): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return "an unknown amount";

@@ -13,43 +13,6 @@ fn corrupt_marker_for(file_path: &Path) -> PathBuf {
     file_path.with_extension("json.corrupt")
 }
 
-/// `<data_dir>/triple-c/projects.json.corrupt`, whether or not it exists.
-pub fn corrupt_marker_path() -> Option<PathBuf> {
-    dirs::data_dir().map(|d| corrupt_marker_for(&d.join("triple-c").join("projects.json")))
-}
-
-/// When this data directory last loaded a `projects.json` it could not parse,
-/// as the RFC3339 instant recorded in the marker.
-///
-/// ## Why this outlives the load that wrote it
-///
-/// A corrupt load is *recoverable for the app* — the list starts empty and
-/// everything keeps working — and that recovery is precisely what makes it
-/// dangerous for anything that reasons about which projects exist. The
-/// in-memory symptom does not survive: the first [`ProjectsStore::save`] after
-/// the failure, which is as little as starting one project (`update_status`),
-/// writes `[{that one project}]` over the file. From then on `projects.json`
-/// parses, holds one id, and looks exactly like a user with one project — while
-/// every *other* project's home and config volume is on the daemon claimed by
-/// nobody.
-///
-/// The guard in `project_store_trust` keyed on "the list is empty and the file
-/// exists", which that write silently ends. So the fact is recorded on disk
-/// instead of inferred from the list's shape, and it is **sticky**: nothing in
-/// this app clears it, because nothing in this app can reconstruct what the
-/// unreadable file held. The refusal names the marker so a user who has
-/// restored their list — or accepted the loss — can delete it deliberately.
-pub fn corrupt_since() -> Option<String> {
-    let raw = fs::read_to_string(corrupt_marker_path()?).ok()?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        // The marker's presence is the signal; an empty one still means a
-        // corrupt load happened, it just cannot say when.
-        return Some("an unknown time".to_string());
-    }
-    Some(trimmed.lines().next().unwrap_or(trimmed).to_string())
-}
-
 /// Keep the bytes of an unparseable `projects.json`, and record that it
 /// happened.
 ///
@@ -76,15 +39,21 @@ fn record_corrupt_load(file_path: &Path, now: &chrono::DateTime<chrono::Utc>) {
         }
     }
 
+    // Sticky, and written even though nothing in the app reads it back on this
+    // branch: the Disk panel's `project_store_trust` was the reader and went to
+    // `hold/disk-and-dragout`. The marker stays because it is the only durable
+    // record that a project list was lost — the in-memory symptom does not
+    // survive the next save — and because re-deriving *when* it happened is
+    // impossible after the fact.
     let marker = corrupt_marker_for(file_path);
     if marker.exists() {
-        // Sticky: the *first* corruption is the one that dates the loss.
+        // The *first* corruption is the one that dates the loss.
         return;
     }
     if let Err(e) = fs::write(&marker, now.to_rfc3339()) {
         log::error!(
-            "Could not record the corrupt projects.json load at {}: {} — orphan detection will \
-             not know the project list is incomplete",
+            "Could not record the corrupt projects.json load at {}: {} — nothing will be able to \
+             tell later that the project list was incomplete",
             marker.display(),
             e
         );

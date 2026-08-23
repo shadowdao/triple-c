@@ -267,22 +267,6 @@ fn ownerless_marker_path(project_id: &str, tag: &str) -> Result<PathBuf, String>
     )))
 }
 
-/// When this pin was first observed ownerless, **without recording anything**.
-///
-/// For the survey paths, which describe the world and must not change it.
-/// `None` means "no reaper has seen it yet", which is not the same as "seen
-/// just now" and must not be treated as a start date.
-pub fn peek_ownerless_since(
-    project_id: &str,
-    tag: &str,
-) -> Option<chrono::DateTime<chrono::Utc>> {
-    let path = ownerless_marker_path(project_id, tag).ok()?;
-    let raw = fs::read_to_string(path).ok()?;
-    chrono::DateTime::parse_from_rfc3339(raw.trim())
-        .ok()
-        .map(|t| t.with_timezone(&chrono::Utc))
-}
-
 /// Read the first-observed instant for a pin, creating the marker if this is
 /// the first sighting. Returns `None` when the clock has not started yet.
 ///

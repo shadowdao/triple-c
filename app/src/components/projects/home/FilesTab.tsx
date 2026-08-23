@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { startDrag } from "@crabnebula/tauri-plugin-drag";
 import type { FileEntry, Project } from "../../../lib/types";
 import { useFileManager } from "../../../hooks/useFileManager";
 import { classifyDrop, isDropTarget } from "../../../lib/dropTarget";
@@ -8,31 +7,11 @@ import { useAppState } from "../../../store/appState";
 import Button from "../../ui/Button";
 import FileViewerModal from "./FileViewerModal";
 import OverwriteConfirmModal from "./OverwriteConfirmModal";
-import { dragPreviewIcon } from "./dragPreview";
 import { formatBytes } from "./format";
 
 interface Props {
   project: Project;
 }
-
-/**
- * How far the pointer must travel before a press becomes a drag. Same few
- * pixels of slop as the tab strip, so a click that trembles stays a click.
- */
-const DRAG_THRESHOLD = 4;
-
-/**
- * Belt and braces for the in-flight drag-out flag.
- *
- * The flag is cleared by the drag plugin's own `onEvent` channel, which fires
- * `Dropped` or `Cancelled` for every gesture the OS finishes. A platform that
- * never fires it would leave the flag stuck and this pane deaf to drops, so it
- * also times out. Long enough that a deliberate, slow drag across two monitors
- * is not cut short; short enough that a wedged flag heals within one coffee
- * sip. The staged-path filter below is the real protection either way — this
- * only decides how long the *hint* stays suppressed.
- */
-const DRAG_OUT_WATCHDOG_MS = 30_000;
 
 /** Key of the synthetic "go up one level" row. No listing ever contains `..`. */
 const PARENT_ROW = "..";
@@ -73,8 +52,6 @@ export default function FilesTab({ project }: Props) {
     downloadFile,
     uploadFile,
     uploadPaths,
-    stageForDrag,
-    isStagedHostPath,
     renameEntry,
     createFolder,
   } = useFileManager(project.id);
@@ -90,8 +67,6 @@ export default function FilesTab({ project }: Props) {
   const [viewing, setViewing] = useState<FileEntry | null>(null);
   /** A host drag is currently over this pane. */
   const [dragOver, setDragOver] = useState(false);
-  /** Name of a file staged for drag-out whose gesture did not reach the OS. */
-  const [dragNotice, setDragNotice] = useState<string | null>(null);
   /** The row that owns the grid's single tab stop. */
   const [activeRow, setActiveRow] = useState<string | null>(null);
 
@@ -108,7 +83,6 @@ export default function FilesTab({ project }: Props) {
   useEffect(() => {
     setSelected(null);
     setRenaming(null);
-    setDragNotice(null);
   }, [currentPath]);
 
   useEffect(() => {
@@ -260,153 +234,6 @@ export default function FilesTab({ project }: Props) {
     goUp();
   }, [currentPath, goUp]);
 
-  // Container → host drag-out.
-  //
-  // The mirror image of the drop path below, and it has the same constraint
-  // pushing it: `dragDropEnabled` blocks HTML5 drag inside the webview, so
-  // `draggable` + `DataTransfer` is not available and the gesture is driven
-  // from pointer events into the native drag plugin — exactly the shape the tab
-  // strip uses, and for the same reason.
-  //
-  // What makes it more than a pointer gesture is that the file being dragged
-  // does not exist on the host at all: it lives in the container, and the OS
-  // can only drag a real host path. So every drag-out is a copy first (see
-  // `stageForDrag`) and a drag second, which is why the gesture has an async
-  // gap in the middle of something that feels instantaneous.
-  const dragOut = useRef<{
-    path: string;
-    x: number;
-    y: number;
-    down: boolean;
-    started: boolean;
-  } | null>(null);
-
-  /**
-   * A drag-out the OS has taken and not yet finished.
-   *
-   * Without this, releasing a drag-out back over the Files pane fed the app its
-   * own export as if it were a host drop: the staged copy was uploaded straight
-   * back over the container file it came from. Not even idempotent — the staged
-   * copy is cached against the *last listing*, so a file rewritten in the
-   * container since then was replaced by a minutes-old snapshot. The `enter`
-   * and `over` branches consult it too, so the pane does not offer to accept
-   * files during its own export.
-   *
-   * Cleared from the drag plugin's `onEvent` channel, which reports `Dropped`
-   * or `Cancelled` when the gesture ends — the installed
-   * `@crabnebula/tauri-plugin-drag` (2.1.0) takes it as `startDrag`'s second
-   * argument. `startDrag`'s own promise is *not* the signal: on some platforms
-   * it resolves as soon as the OS adopts the drag, i.e. while it is still in
-   * flight. See `DRAG_OUT_WATCHDOG_MS` for what happens if `onEvent` never
-   * arrives.
-   */
-  const dragOutInFlight = useRef(false);
-  const dragOutWatchdog = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const endDragOut = useCallback(() => {
-    dragOutInFlight.current = false;
-    if (dragOutWatchdog.current !== null) {
-      clearTimeout(dragOutWatchdog.current);
-      dragOutWatchdog.current = null;
-    }
-  }, []);
-
-  useEffect(() => endDragOut, [endDragOut]);
-
-  // Pointer-up almost never lands on the row it started on — the pointer has
-  // moved off it by definition, and once the OS takes the drag the webview stops
-  // seeing the pointer at all, which is what makes a lost focus the only
-  // "the button came up" signal left.
-  useEffect(() => {
-    const release = () => {
-      if (dragOut.current) dragOut.current.down = false;
-    };
-    window.addEventListener("pointerup", release);
-    window.addEventListener("pointercancel", release);
-    window.addEventListener("blur", release);
-    return () => {
-      window.removeEventListener("pointerup", release);
-      window.removeEventListener("pointercancel", release);
-      window.removeEventListener("blur", release);
-    };
-  }, []);
-
-  const beginDragOut = useCallback(
-    async (entry: FileEntry) => {
-      setDragNotice(null);
-      const staged = await stageForDrag(entry);
-      // `stageForDrag` has already reported the reason through the toast host.
-      if (!staged) return;
-
-      // The OS only adopts a drag while the button is still down, and the copy
-      // that just ran can easily outlast a flick of the wrist. Say so rather
-      // than leaving a gesture that did nothing and explained nothing — and it
-      // is a real instruction, not an apology: the copy is kept, so the second
-      // attempt starts immediately.
-      if (dragOut.current?.path !== entry.path || !dragOut.current.down) {
-        setDragNotice(entry.name);
-        return;
-      }
-
-      dragOutInFlight.current = true;
-      dragOutWatchdog.current = setTimeout(endDragOut, DRAG_OUT_WATCHDOG_MS);
-      try {
-        await startDrag({ item: [staged.hostPath], icon: dragPreviewIcon(entry.name) }, () =>
-          endDragOut(),
-        );
-      } catch (e) {
-        endDragOut();
-        // Drag-out is the enhancement; "Save to host…" is the path that always
-        // works, so a platform that refuses the drag says where to go instead.
-        useAppState.getState().pushToast({
-          kind: "error",
-          message: 'Could not start the drag — use "Save to host…" instead.',
-          detail: String(e),
-        });
-      }
-    },
-    [stageForDrag, endDragOut],
-  );
-
-  /**
-   * Pointer wiring for one row. Directories get none of it: staging copies a
-   * single regular file, and a folder would only ever produce an error.
-   */
-  const dragOutProps = (entry: FileEntry) => {
-    if (entry.is_directory) return {};
-    return {
-      onPointerDown: (e: React.PointerEvent<HTMLTableRowElement>) => {
-        if (e.button !== 0 || renaming === entry.name) return;
-        // The row's own controls, and the rename input, where a drag is a text
-        // selection.
-        if ((e.target as HTMLElement).closest("button, input")) return;
-        dragOut.current = {
-          path: entry.path,
-          x: e.clientX,
-          y: e.clientY,
-          down: true,
-          started: false,
-        };
-        // Deliberately no `setPointerCapture` — unlike the tab strip, which
-        // draws its own ghost. Here the OS has to take the pointer over, and a
-        // capture held in the webview is exactly what stops it.
-      },
-      onPointerMove: (e: React.PointerEvent<HTMLTableRowElement>) => {
-        const gesture = dragOut.current;
-        if (!gesture || gesture.started || !gesture.down) return;
-        if (gesture.path !== entry.path) return;
-        if (
-          Math.abs(e.clientX - gesture.x) < DRAG_THRESHOLD &&
-          Math.abs(e.clientY - gesture.y) < DRAG_THRESHOLD
-        ) {
-          return;
-        }
-        gesture.started = true;
-        void beginDragOut(entry);
-      },
-    };
-  };
-
   // Host → container drag and drop.
   //
   // This is Tauri's *native* drag-drop event, not HTML5 `ondrop`, for the same
@@ -418,10 +245,6 @@ export default function FilesTab({ project }: Props) {
   // point? (Not "is that element mine": chrome painted over a pane — a toast,
   // a button — is not something that swallows a drop, and treating it as such
   // made permanent dead zones.)
-  //
-  // Two further filters sit in front of it, both about our own drag-out:
-  // `dragOutInFlight`, and the staged-path check, which is exact because
-  // `useFileManager` remembers every host path it staged.
   useEffect(() => {
     if (!running) return;
     let unlisten: (() => void) | undefined;
@@ -435,14 +258,11 @@ export default function FilesTab({ project }: Props) {
           return;
         }
         if (payload.type === "enter" || payload.type === "over") {
-          setDragOver(
-            !dragOutInFlight.current && isDropTarget(paneRef.current, payload.position),
-          );
+          setDragOver(isDropTarget(paneRef.current, payload.position));
           return;
         }
         if (payload.type !== "drop") return;
         setDragOver(false);
-        if (dragOutInFlight.current) return;
         const verdict = classifyDrop(paneRef.current, payload.position);
         // Aimed at this pane and refused anyway: say so. Nothing else would —
         // the file just never appears in the listing.
@@ -460,10 +280,7 @@ export default function FilesTab({ project }: Props) {
           return;
         }
         if (verdict !== "accept") return;
-        // Anything we staged for a drag-out is our own copy of a file that is
-        // already in the container; re-importing it would overwrite the
-        // original with a snapshot.
-        const paths = (payload.paths ?? []).filter((path) => !isStagedHostPath(path));
+        const paths = payload.paths ?? [];
         if (paths.length === 0) return;
         await uploadPaths(paths);
       });
@@ -475,7 +292,7 @@ export default function FilesTab({ project }: Props) {
       cancelled = true;
       unlisten?.();
     };
-  }, [running, uploadPaths, isStagedHostPath]);
+  }, [running, uploadPaths]);
 
   const breadcrumbs =
     currentPath === "/"
@@ -518,11 +335,7 @@ export default function FilesTab({ project }: Props) {
    * frequently not announced at all, which is how "uploading 3 items…" and
    * every completion notice used to go by in silence.
    */
-  const liveText = busy
-    ? busy
-    : dragNotice
-      ? `"${dragNotice}" is ready — drag it again to drop it on the desktop.`
-      : (completed ?? "");
+  const liveText = busy ? busy : (completed ?? "");
 
   return (
     <div ref={paneRef} className="relative flex flex-col h-full min-h-0">
@@ -568,7 +381,7 @@ export default function FilesTab({ project }: Props) {
         {/* The one failure that stays inline: it explains why the grid below is
             empty, it is in context, and there are no rows for it to scroll
             behind. Every *transient* failure — upload, rename, mkdir,
-            save-to-host, staging — goes to `ToastHost` instead, which is above
+            save-to-host — goes to `ToastHost` instead, which is above
             the file viewer's overlay and does not scroll away. */}
         {error && (
           <div role="alert" className="px-4 py-2 text-xs text-[var(--error)]">
@@ -665,7 +478,6 @@ export default function FilesTab({ project }: Props) {
                       setActiveRow(entry.name);
                     }}
                     onDoubleClick={() => openEntry(entry)}
-                    {...dragOutProps(entry)}
                     onKeyDown={(e) => {
                       if (isRenaming) return;
                       if (e.key === "Enter") {
