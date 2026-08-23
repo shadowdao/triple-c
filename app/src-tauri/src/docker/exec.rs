@@ -611,18 +611,42 @@ async fn exec_oneshot_inner(
 
     // The output stream draining doesn't strictly guarantee inspect_exec has the
     // final exit_code populated yet, so poll until the exec reports finished.
-    let exit_code = wait_for_exec_exit(&exec.id).await.unwrap_or(0);
+    let exit_code = require_exit_code(wait_for_exec_exit(&exec.id).await)?;
 
     Ok((combined, exit_code))
 }
 
+/// Turn "the exit code could not be determined" into an error rather than a 0.
+///
+/// `unwrap_or(0)` is how a rename that never happened reported success: callers
+/// branch on `code != 0`, so an unreadable status silently became "it worked",
+/// the UI closed its rename box and the file had not moved. An exec whose
+/// outcome cannot be established has not been established to have succeeded —
+/// fail closed and let the caller surface it.
+///
+/// The `test -e` probe in `rename_container_path` also fails closed under this:
+/// it propagates the error instead of reading an undeterminable status as
+/// "the destination does not exist".
+fn require_exit_code(code: Option<i64>) -> Result<i64, String> {
+    code.ok_or_else(|| {
+        "Could not determine whether the command finished (Docker did not report an exit status)"
+            .to_string()
+    })
+}
+
 /// Poll `inspect_exec` until the exec reports finished and return its exit code.
 /// Returns `None` if the code can't be determined (inspect error, or the exec
-/// doesn't report finished within ~1s — which shouldn't happen once its output
+/// doesn't report finished within ~5s — which shouldn't happen once its output
 /// stream has drained).
+///
+/// The window is generous because `None` is no longer a shrug: since
+/// [`require_exit_code`], it fails the whole call. Waiting a few seconds longer
+/// for a busy daemon to settle costs nothing in the normal case — the loop exits
+/// on the first poll that reports finished — and it is the difference between a
+/// spurious "the rename failed" and a real one.
 pub async fn wait_for_exec_exit(exec_id: &str) -> Option<i64> {
     let docker = get_docker().ok()?;
-    for _ in 0..40 {
+    for _ in 0..200 {
         match docker.inspect_exec(exec_id).await {
             Ok(info) => {
                 if info.running != Some(true) {
@@ -664,6 +688,16 @@ mod tests {
         let mut buf = String::new();
         assert!(!push_capped(&mut buf, "0123456789", 4));
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn an_undeterminable_exit_status_is_an_error_not_a_zero() {
+        // The bug this guards: `unwrap_or(0)` made every caller that branches on
+        // `code != 0` — rename, mkdir — report success for an exec whose outcome
+        // nobody could read.
+        assert_eq!(require_exit_code(Some(0)).unwrap(), 0);
+        assert_eq!(require_exit_code(Some(1)).unwrap(), 1);
+        assert!(require_exit_code(None).is_err());
     }
 
     #[test]
