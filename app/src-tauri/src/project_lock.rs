@@ -151,6 +151,10 @@ fn holders() -> &'static Mutex<HashMap<String, ProjectOp>> {
 /// predecessor already learned: a plain release statement is skipped by an
 /// early `?`, by a panic, and by the future simply being dropped. A guard is
 /// not.
+/// Dropping this releases the claim, so a caller that discards it has taken no
+/// lock at all — `let _ = try_acquire(...)` drops immediately and reads as
+/// success. `#[must_use]` makes that a compile warning rather than a race.
+#[must_use = "the claim is released as soon as this guard is dropped; bind it for the whole operation"]
 #[derive(Debug)]
 pub struct ProjectGuard {
     project_id: String,
@@ -245,8 +249,11 @@ mod tests {
         assert!(err.contains("snapshot is being compacted"), "{}", err);
         assert!(err.contains("starting or recreating"), "{}", err);
         drop(first);
-        // And it has to be retakeable the moment the holder goes away.
-        try_acquire(&p, ProjectOp::Recreate).expect("released on drop");
+        // And it has to be retakeable the moment the holder goes away. Bound
+        // rather than discarded: `#[must_use]` is what stops a real caller
+        // writing `try_acquire(...)` and believing it holds something.
+        let retaken = try_acquire(&p, ProjectOp::Recreate).expect("released on drop");
+        drop(retaken);
     }
 
     #[test]

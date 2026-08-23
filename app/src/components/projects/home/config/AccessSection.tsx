@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useSecretField } from "../../../../hooks/useSecretField";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { Project } from "../../../../lib/types";
 import Button from "../../../ui/Button";
@@ -24,14 +25,15 @@ export default function AccessSection({
   const [caCertPath, setCaCertPath] = useState(project.ca_cert_path ?? "");
   const [gitName, setGitName] = useState(project.git_user_name ?? "");
   const [gitEmail, setGitEmail] = useState(project.git_user_email ?? "");
-  const [gitToken, setGitToken] = useState(project.git_token ?? "");
+  // Never seeded from `project` — the backend does not serialize secrets, so
+  // the box is always empty and only an edit may speak about the stored value.
+  const gitToken = useSecretField(project.id);
 
   useEffect(() => {
     setSshKeyPath(project.ssh_key_path ?? "");
     setCaCertPath(project.ca_cert_path ?? "");
     setGitName(project.git_user_name ?? "");
     setGitEmail(project.git_user_email ?? "");
-    setGitToken(project.git_token ?? "");
   }, [project]);
 
   return (
@@ -101,15 +103,19 @@ export default function AccessSection({
 
       <Field
         label="Git HTTPS token"
-        hint="A personal access token (e.g. a GitHub PAT) for HTTPS git operations inside the container."
+        hint={
+          gitToken.edited
+            ? "Saved when you click away. Clearing the box removes the stored token."
+            : "A personal access token (e.g. a GitHub PAT) for HTTPS git operations inside the container. A stored token is not shown; leave this empty to keep it."
+        }
       >
         {(id) => (
           <input
             id={id}
             type="password"
-            value={gitToken}
-            onChange={(e) => setGitToken(e.target.value)}
-            onBlur={() => save({ git_token: gitToken || null })}
+            value={gitToken.value}
+            onChange={(e) => gitToken.setValue(e.target.value)}
+            onBlur={() => save({ ...gitToken.patch("git_token") })}
             placeholder="ghp_…"
             disabled={disabled}
             className={inputClass}

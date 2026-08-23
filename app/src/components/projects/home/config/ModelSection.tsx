@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useSecretField, withoutUntouchedSecrets } from "../../../../hooks/useSecretField";
 import type {
   Backend,
   BedrockAuthMethod,
@@ -15,6 +16,17 @@ import Field, {
   selectClass,
 } from "../../../ui/Field";
 import Toggle from "../../../ui/Toggle";
+
+/** Bedrock fields held in the OS keychain, never serialized back to us. */
+const BEDROCK_SECRET_KEYS = [
+  "aws_access_key_id",
+  "aws_secret_access_key",
+  "aws_session_token",
+  "aws_bearer_token",
+] as const;
+
+/** The same, for the OpenAI-compatible backend. */
+const OPENAI_SECRET_KEYS = ["api_key"] as const;
 
 export const DEFAULT_BEDROCK_CONFIG: BedrockConfig = {
   auth_method: "static_credentials",
@@ -65,11 +77,12 @@ export default function ModelSection({ project, save, disabled }: Props) {
 
   // Local text state — saved on blur, not on every keystroke.
   const [bedrockRegion, setBedrockRegion] = useState(bedrock.aws_region);
-  const [accessKeyId, setAccessKeyId] = useState(bedrock.aws_access_key_id ?? "");
-  const [secretKey, setSecretKey] = useState(bedrock.aws_secret_access_key ?? "");
-  const [sessionToken, setSessionToken] = useState(bedrock.aws_session_token ?? "");
+  // Secrets are never seeded from `project` — see `useSecretField`.
+  const accessKeyId = useSecretField(project.id);
+  const secretKey = useSecretField(project.id);
+  const sessionToken = useSecretField(project.id);
   const [profile, setProfile] = useState(bedrock.aws_profile ?? "");
-  const [bearerToken, setBearerToken] = useState(bedrock.aws_bearer_token ?? "");
+  const bearerToken = useSecretField(project.id);
   const [bedrockModelId, setBedrockModelId] = useState(bedrock.model_id ?? "");
   const [serviceTier, setServiceTier] = useState(bedrock.service_tier ?? "");
 
@@ -97,9 +110,7 @@ export default function ModelSection({ project, save, disabled }: Props) {
     project.openai_compatible_config?.base_url ??
       DEFAULT_OPENAI_COMPATIBLE_CONFIG.base_url,
   );
-  const [oaiApiKey, setOaiApiKey] = useState(
-    project.openai_compatible_config?.api_key ?? "",
-  );
+  const oaiApiKey = useSecretField(project.id);
   const [oaiModelId, setOaiModelId] = useState(
     project.openai_compatible_config?.model_id ?? "",
   );
@@ -107,14 +118,13 @@ export default function ModelSection({ project, save, disabled }: Props) {
     project.openai_compatible_config?.haiku_model_id ?? "",
   );
 
+  // Secret fields are deliberately absent here: `useSecretField` owns its own
+  // reset, and re-seeding one from `project` would write an empty string over
+  // whatever the user had half-typed on any unrelated project update.
   useEffect(() => {
     const bc = project.bedrock_config ?? DEFAULT_BEDROCK_CONFIG;
     setBedrockRegion(bc.aws_region);
-    setAccessKeyId(bc.aws_access_key_id ?? "");
-    setSecretKey(bc.aws_secret_access_key ?? "");
-    setSessionToken(bc.aws_session_token ?? "");
     setProfile(bc.aws_profile ?? "");
-    setBearerToken(bc.aws_bearer_token ?? "");
     setBedrockModelId(bc.model_id ?? "");
     setServiceTier(bc.service_tier ?? "");
     setOllamaBaseUrl(project.ollama_config?.base_url ?? DEFAULT_OLLAMA_CONFIG.base_url);
@@ -129,13 +139,18 @@ export default function ModelSection({ project, save, disabled }: Props) {
       project.openai_compatible_config?.base_url ??
         DEFAULT_OPENAI_COMPATIBLE_CONFIG.base_url,
     );
-    setOaiApiKey(project.openai_compatible_config?.api_key ?? "");
     setOaiModelId(project.openai_compatible_config?.model_id ?? "");
     setOaiHaikuModelId(project.openai_compatible_config?.haiku_model_id ?? "");
   }, [project]);
 
   const saveBedrock = (patch: Partial<BedrockConfig>) =>
-    save({ bedrock_config: { ...bedrock, ...patch } });
+    save({
+      bedrock_config: withoutUntouchedSecrets(
+        { ...bedrock, ...patch },
+        patch,
+        BEDROCK_SECRET_KEYS,
+      ),
+    });
 
   const saveOllama = (patch: Partial<OllamaConfig>) =>
     save({
@@ -152,10 +167,14 @@ export default function ModelSection({ project, save, disabled }: Props) {
 
   const saveOpenAi = (patch: Partial<OpenAiCompatibleConfig>) =>
     save({
-      openai_compatible_config: {
-        ...(project.openai_compatible_config ?? DEFAULT_OPENAI_COMPATIBLE_CONFIG),
-        ...patch,
-      },
+      openai_compatible_config: withoutUntouchedSecrets(
+        {
+          ...(project.openai_compatible_config ?? DEFAULT_OPENAI_COMPATIBLE_CONFIG),
+          ...patch,
+        },
+        patch,
+        OPENAI_SECRET_KEYS,
+      ),
     });
 
   // Defaults to on: projects created before the field existed, and any data
@@ -261,9 +280,9 @@ export default function ModelSection({ project, save, disabled }: Props) {
                 {(id) => (
                   <input
                     id={id}
-                    value={accessKeyId}
-                    onChange={(e) => setAccessKeyId(e.target.value)}
-                    onBlur={() => saveBedrock({ aws_access_key_id: accessKeyId || null })}
+                    value={accessKeyId.value}
+                    onChange={(e) => accessKeyId.setValue(e.target.value)}
+                    onBlur={() => saveBedrock(accessKeyId.patch("aws_access_key_id"))}
                     placeholder="AKIA…"
                     disabled={disabled}
                     className={monoInputClass}
@@ -278,10 +297,10 @@ export default function ModelSection({ project, save, disabled }: Props) {
                   <input
                     id={id}
                     type="password"
-                    value={secretKey}
-                    onChange={(e) => setSecretKey(e.target.value)}
+                    value={secretKey.value}
+                    onChange={(e) => secretKey.setValue(e.target.value)}
                     onBlur={() =>
-                      saveBedrock({ aws_secret_access_key: secretKey || null })
+                      saveBedrock(secretKey.patch("aws_secret_access_key"))
                     }
                     disabled={disabled}
                     className={monoInputClass}
@@ -296,10 +315,10 @@ export default function ModelSection({ project, save, disabled }: Props) {
                   <input
                     id={id}
                     type="password"
-                    value={sessionToken}
-                    onChange={(e) => setSessionToken(e.target.value)}
+                    value={sessionToken.value}
+                    onChange={(e) => sessionToken.setValue(e.target.value)}
                     onBlur={() =>
-                      saveBedrock({ aws_session_token: sessionToken || null })
+                      saveBedrock(sessionToken.patch("aws_session_token"))
                     }
                     disabled={disabled}
                     className={monoInputClass}
@@ -337,9 +356,9 @@ export default function ModelSection({ project, save, disabled }: Props) {
                 <input
                   id={id}
                   type="password"
-                  value={bearerToken}
-                  onChange={(e) => setBearerToken(e.target.value)}
-                  onBlur={() => saveBedrock({ aws_bearer_token: bearerToken || null })}
+                  value={bearerToken.value}
+                  onChange={(e) => bearerToken.setValue(e.target.value)}
+                  onBlur={() => saveBedrock(bearerToken.patch("aws_bearer_token"))}
                   disabled={disabled}
                   className={monoInputClass}
                 />
@@ -507,9 +526,9 @@ export default function ModelSection({ project, save, disabled }: Props) {
               <input
                 id={id}
                 type="password"
-                value={oaiApiKey}
-                onChange={(e) => setOaiApiKey(e.target.value)}
-                onBlur={() => saveOpenAi({ api_key: oaiApiKey || null })}
+                value={oaiApiKey.value}
+                onChange={(e) => oaiApiKey.setValue(e.target.value)}
+                onBlur={() => saveOpenAi(oaiApiKey.patch("api_key"))}
                 placeholder="sk-…"
                 disabled={disabled}
                 className={monoInputClass}

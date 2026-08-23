@@ -643,6 +643,12 @@ export interface ClearTokenOutcome {
   snapshots_scrubbed: string[];
   /** Images still holding it, each with the reason. Non-empty = incomplete. */
   snapshots_failed: string[];
+  /** Images left alone because the project was busy under the per-project lock
+   *  (a compaction, a migration, a recreate). **Not a failure and not a
+   *  success** — the token is still baked into these, and `clearClaudeToken`
+   *  is itself the retry. Kept separate from `snapshots_failed` so a skipped
+   *  credential removal can never be reported as a completed one. */
+  snapshots_skipped: string[];
   /** Rewritten, but the pre-rewrite image object could not be deleted because a
    *  container still runs off it. Clears itself when that container is
    *  recreated — worth mentioning, not worth alarming about. */

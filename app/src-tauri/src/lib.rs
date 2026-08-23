@@ -727,4 +727,68 @@ mod tests {
         lifecycle.settle_startup_tasks().await;
         assert!(started.elapsed() <= STARTUP_CANCEL_BUDGET + Duration::from_secs(1));
     }
+
+    /// The capability file is the app's entire IPC attack surface, and it is
+    /// data — nothing in `cargo test` reads it, so a widened grant lands with a
+    /// green suite. This is what noticing looks like.
+    ///
+    /// It exists because `core:default` was granted for months. That alias
+    /// pulls in `core:image:default` → `allow-from-path`, which is an
+    /// unconditional `std::fs::read` of any host path with no scope check, and
+    /// nothing in the frontend has ever imported `@tauri-apps/api/image`.
+    #[test]
+    fn the_capability_grants_are_the_ones_that_were_reviewed() {
+        let raw = include_str!("../capabilities/default.json");
+        let parsed: serde_json::Value =
+            serde_json::from_str(raw).expect("capabilities/default.json must parse");
+        let listed: Vec<String> = parsed["permissions"]
+            .as_array()
+            .expect("a `permissions` array")
+            .iter()
+            .map(|p| match p {
+                // A scoped grant is an object; its identifier is what matters here.
+                serde_json::Value::Object(o) => o["identifier"]
+                    .as_str()
+                    .expect("a scoped grant needs an identifier")
+                    .to_string(),
+                other => other.as_str().expect("a grant is a string or an object").to_string(),
+            })
+            .collect();
+
+        let mut sorted = listed.clone();
+        sorted.sort();
+        let mut expected = vec![
+            "core:event:allow-listen",
+            "core:event:allow-unlisten",
+            "core:webview:allow-internal-toggle-devtools",
+            "dialog:allow-open",
+            "dialog:allow-save",
+            "opener:allow-open-url",
+            "drag:allow-start-drag",
+        ];
+        expected.sort();
+        assert_eq!(
+            sorted, expected,
+            "the capability set changed. That is allowed — but it is the IPC \
+             surface a compromised webview can call, so update this list \
+             deliberately rather than to make the test pass."
+        );
+
+        // Belt and braces: the `*:default` aliases are the specific trap here,
+        // because they expand to a set the file never spells out. `store:*` in
+        // particular was an arbitrary host-file read/write primitive.
+        for grant in &listed {
+            assert!(
+                !grant.ends_with(":default"),
+                "{} is an alias — it expands to permissions this file does not \
+                 name. Enumerate them instead.",
+                grant
+            );
+            assert!(
+                !grant.starts_with("store:"),
+                "store:* is `PathBuf::push` against AppData, which an absolute \
+                 path discards: an arbitrary host-file read/write."
+            );
+        }
+    }
 }

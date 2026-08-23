@@ -2371,6 +2371,10 @@ const SCRUB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 /// The distinction that earns this type is [`ScrubOutcome::NotRunning`] versus
 /// [`ScrubOutcome::Failed`]: "there was nothing to exec into" is routine, while
 /// "the exec ran and broke" is the one case worth a warning in the log.
+/// `#[must_use]` because the variants mean different things to a caller and
+/// three of the four are easy to ignore by accident: a `Failed` swallowed at a
+/// call site is exactly how a scrub that stopped working would stay quiet.
+#[must_use = "a scrub that was skipped, timed out or failed reads the same as one that worked unless the outcome is inspected"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScrubOutcome {
     /// The scrub ran to completion and freed this many bytes — possibly zero,
@@ -2397,7 +2401,7 @@ impl ScrubOutcome {
     /// nothing to exec into. A figure of zero reads as a scrub that ran and
     /// found nothing, which is a different and more alarming thing than a
     /// scrub that correctly had no work left.
-    fn commit_log_suffix(&self) -> String {
+    pub(crate) fn commit_log_suffix(&self) -> String {
         match self {
             Self::Reclaimed(bytes) => format!(
                 " ({:.2} MB dropped by the pre-commit scrub)",

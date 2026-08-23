@@ -46,12 +46,12 @@ const STATUS_DISPLAY: Record<
  * snapshot was never attempted, so the remedy is to run the sweep again, not
  * to Reset the project and lose both its volumes.
  *
- * `snapshots_skipped` is read defensively: it is newer than `ClearTokenOutcome`
- * in `lib/types.ts`, which another change in this round owns. Until that lands
- * the field arrives over IPC but is not in the declared type, and an older
- * backend would not send it at all.
+ * `snapshots_skipped` is declared on `ClearTokenOutcome`, but it is still read
+ * through `list()` rather than indexed directly: a backend older than this
+ * change does not send the field at all, and a missing skip list must read as
+ * "nothing was skipped" rather than crashing the panel that reports it.
  */
-type RevokeOutcome = ClearTokenOutcome & { snapshots_skipped?: string[] };
+type RevokeOutcome = ClearTokenOutcome;
 
 const list = (values: string[] | undefined): string[] => values ?? [];
 

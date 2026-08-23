@@ -461,7 +461,17 @@ async fn fresh_migration(
     // pre-swap commit is the single largest snapshot Triple-C ever takes, so
     // letting this one path commit unscrubbed is what the scrub exists to
     // prevent. Failure is swallowed inside; it must never block a migration.
-    docker::scrub_writable_layer(&container_id).await;
+    //
+    // The outcome is logged rather than discarded: this is the one scrub whose
+    // silence would be expensive, because the layer it declined to clean is
+    // about to be committed into a snapshot that outlives the migration.
+    log::info!(
+        "Pre-migration scrub of {}{}",
+        container_id,
+        docker::scrub_writable_layer(&container_id)
+            .await
+            .commit_log_suffix()
+    );
 
     emit_progress(&app_handle, &project_id, "Stopping the container...");
     let _ = state

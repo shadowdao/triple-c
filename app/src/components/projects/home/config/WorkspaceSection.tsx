@@ -19,6 +19,22 @@ export default function WorkspaceSection({ project, save, disabled }: Props) {
     setPaths(project.paths ?? []);
   }, [project]);
 
+  /**
+   * Save only when every row is fully filled in.
+   *
+   * Both inputs save on blur, so tabbing from the host path to the mount name
+   * fires a save with the name still empty. `update_project` now validates —
+   * a half-filled row is refused — so the unconditional save turned an ordinary
+   * keystroke into an error toast. A blank row is *not* incomplete: the
+   * "+ Add folder" button adds one deliberately, and it is dropped on save.
+   */
+  const saveIfComplete = () => {
+    const filled = paths.filter((p) => p.host_path.trim() || p.mount_name.trim());
+    const halfFilled = filled.some((p) => !p.host_path.trim() || !p.mount_name.trim());
+    if (halfFilled) return;
+    return save({ paths });
+  };
+
   return (
     <ConfigGroup
       title="Workspace"
@@ -70,7 +86,7 @@ export default function WorkspaceSection({ project, save, disabled }: Props) {
                   updated[i] = { ...updated[i], host_path: e.target.value };
                   setPaths(updated);
                 }}
-                onBlur={() => save({ paths })}
+                onBlur={() => saveIfComplete()}
                 placeholder="/path/to/folder"
                 disabled={disabled}
                 className={`flex-1 min-w-0 ${inputClass}`}
@@ -107,7 +123,7 @@ export default function WorkspaceSection({ project, save, disabled }: Props) {
                     updated[i] = { ...updated[i], mount_name: e.target.value };
                     setPaths(updated);
                   }}
-                  onBlur={() => save({ paths })}
+                  onBlur={() => saveIfComplete()}
                   placeholder="name"
                   disabled={disabled}
                   className={`w-40 ${monoInputClass}`}
