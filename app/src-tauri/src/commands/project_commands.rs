@@ -187,18 +187,20 @@ pub(crate) fn load_secrets_for_project(project: &mut Project) {
 /// destination of `/tmp/claude-x`, i.e. the host directory is mounted straight
 /// on top of one of the paths the pre-commit scrub owns. The next recreate then
 /// runs the scrub, as root, over the user's own project directory. That is the
-/// C1 data-loss chain end to end, and the character check is the half of it
-/// that stops the path ever being spelled.
-///
-/// `..` on its own passes a check for "alphanumeric, dash, underscore or dot",
-/// which is why it is called out separately: it is the only single component
-/// that walks *up*, and `/workspace/..` is `/`.
+/// C1 data-loss chain end to end, and
+/// [`check_mount_name_stays_under_workspace`] is the half of it that stops the
+/// path ever being spelled.
 ///
 /// `host_path` is the other side of the same mount. `/` there bind-mounts the
 /// entire host filesystem read-write into a container whose agent has
 /// passwordless sudo. Anything short of a filesystem root is the user choosing
 /// a folder — the Browse button and the free-text field lead to the same place
 /// — so only the roots themselves are refused.
+///
+/// This is the **whole** rule set, and it belongs to `add_project`, where every
+/// row is new by definition. `update_project` runs
+/// [`validate_project_paths_update`] instead: see there for why a list that is
+/// already in `projects.json` cannot be held to all of it.
 fn validate_project_paths(paths: &[ProjectPath]) -> Result<(), String> {
     let mut seen_names = std::collections::HashSet::new();
     for p in paths {
@@ -209,33 +211,180 @@ fn validate_project_paths(paths: &[ProjectPath]) -> Result<(), String> {
         if p.host_path.is_empty() && p.mount_name.is_empty() {
             continue;
         }
-        if p.mount_name.is_empty() {
-            return Err("Mount name cannot be empty.".to_string());
-        }
-        if !p.mount_name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.') {
-            return Err(format!("Mount name '{}' contains invalid characters. Use alphanumeric, dash, underscore, or dot.", p.mount_name));
-        }
-        if p.mount_name.chars().all(|c| c == '.') {
-            return Err(format!(
-                "Mount name '{}' is not a folder name — it names the directory the mount would sit in.",
-                p.mount_name
-            ));
-        }
-        if p.host_path.is_empty() {
-            return Err(format!(
-                "Folder mounted at '/workspace/{}' has no host path.",
-                p.mount_name
-            ));
-        }
-        if is_filesystem_root(&p.host_path) {
-            return Err(format!(
-                "'{}' is a filesystem root. Choose the project folder itself — mounting the whole drive gives the container everything on it.",
-                p.host_path
-            ));
-        }
+        validate_one_path(p)?;
         if !seen_names.insert(p.mount_name.clone()) {
             return Err(format!("Duplicate mount name '{}'.", p.mount_name));
         }
+    }
+    Ok(())
+}
+
+/// Every rule that applies to a single folder row, duplicates aside.
+fn validate_one_path(p: &ProjectPath) -> Result<(), String> {
+    if p.mount_name.is_empty() {
+        return Err("Mount name cannot be empty.".to_string());
+    }
+    if !p.mount_name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.') {
+        return Err(format!("Mount name '{}' contains invalid characters. Use alphanumeric, dash, underscore, or dot.", p.mount_name));
+    }
+    check_mount_name_stays_under_workspace(&p.mount_name)?;
+    if p.host_path.is_empty() {
+        return Err(format!(
+            "Folder mounted at '/workspace/{}' has no host path.",
+            p.mount_name
+        ));
+    }
+    if is_filesystem_root(&p.host_path) {
+        return Err(format!(
+            "'{}' is a filesystem root. Choose the project folder itself — mounting the whole drive gives the container everything on it.",
+            p.host_path
+        ));
+    }
+    Ok(())
+}
+
+/// The one rule that survives every exemption: the mount has to land under
+/// `/workspace`.
+///
+/// A name carrying a path separator, or one that is nothing but dots, does not
+/// name a folder inside `/workspace` — it moves the mount. `/workspace/..` is
+/// `/`, `/workspace/../tmp/claude-x` normalises to `/tmp/claude-x`, and
+/// `/workspace/.` is `/workspace` itself, shadowing every other mount. The
+/// first of those is the C1 chain: a host directory mounted over a path the
+/// pre-commit scrub empties as root.
+///
+/// Everything else `validate_one_path` checks is hygiene — a space or an `@` in
+/// a mount name is untidy, not an escape — which is why only this one is
+/// applied to rows [`validate_project_paths_update`] otherwise grandfathers.
+fn check_mount_name_stays_under_workspace(mount_name: &str) -> Result<(), String> {
+    if mount_name.contains('/') || mount_name.contains('\\') {
+        return Err(format!(
+            "Mount name '{}' contains a path separator, so the folder would be mounted somewhere \
+             /workspace/{{name}} does not reach. Use a plain folder name.",
+            mount_name
+        ));
+    }
+    if !mount_name.is_empty() && mount_name.chars().all(|c| c == '.') {
+        return Err(format!(
+            "Mount name '{}' is not a folder name — it names the directory the mount would sit in.",
+            mount_name
+        ));
+    }
+    Ok(())
+}
+
+/// Validate the folder list of a project that **already exists**, admitting the
+/// rows it is already stored with.
+///
+/// ## Why this is not just [`validate_project_paths`]
+///
+/// `update_project` validated nothing at all until recently, while
+/// `WorkspaceSection` saved `{paths}` on every blur — so `projects.json` files
+/// in the field hold rows that the full rule set refuses: a half-filled row, a
+/// mount name with a space in it, two rows sharing a name, `/` as a host path.
+///
+/// Running the full check on every save made every such project **entirely
+/// unsavable**. Not just its folder list: `update_project` is the one command
+/// behind the Config tab, so every toggle, every permission-mode change and
+/// `useTerminal.ts`'s tab rename came back with a message about folders. The
+/// remedy exists — fix the row in the Workspace section — but nothing about
+/// "cannot save" on a sandbox switch points at it.
+///
+/// And blocking the save bought nothing for the rows it was blocking. They are
+/// *already stored*, and already mounted on every container start; refusing to
+/// persist an unrelated field does not unmount them.
+///
+/// So: a row carried over verbatim from what is stored is admitted, and a row
+/// that is new or edited is held to every rule. That is enough to keep the
+/// escalation closed, because escalation means *introducing* a bad value
+/// through this command, and an introduced row is never a carried-over one.
+///
+/// The single exception is [`check_mount_name_stays_under_workspace`], which
+/// runs on every row either way. A stored `..` is a live data-loss chain rather
+/// than untidy data, its remedy is one edit in the Workspace section, and the
+/// message names the mount rather than talking about folders in the abstract.
+fn validate_project_paths_update(
+    stored: &[ProjectPath],
+    incoming: &[ProjectPath],
+) -> Result<(), String> {
+    let is_blank = |p: &ProjectPath| p.host_path.is_empty() && p.mount_name.is_empty();
+
+    // Rows carried over, counted rather than set-tested: a *second* copy of an
+    // existing row is a new row, and has to be checked like one.
+    let mut carried: std::collections::HashMap<(&str, &str), usize> =
+        std::collections::HashMap::new();
+    for p in stored.iter().filter(|p| !is_blank(p)) {
+        *carried
+            .entry((p.host_path.as_str(), p.mount_name.as_str()))
+            .or_insert(0) += 1;
+    }
+
+    for p in incoming.iter().filter(|p| !is_blank(p)) {
+        check_mount_name_stays_under_workspace(&p.mount_name)?;
+
+        match carried.get_mut(&(p.host_path.as_str(), p.mount_name.as_str())) {
+            Some(remaining) if *remaining > 0 => {
+                *remaining -= 1;
+                log::debug!(
+                    "Admitting a stored folder row unchanged: '{}' at /workspace/{}",
+                    p.host_path,
+                    p.mount_name
+                );
+            }
+            _ => validate_one_path(p)?,
+        }
+    }
+
+    // Duplicates get the same treatment, one level up: a name may repeat as
+    // many times as it already did, and no more. Counting both sides keeps the
+    // answer independent of the order the rows arrive in.
+    let count_names = |rows: &[ProjectPath]| {
+        let mut counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for p in rows.iter().filter(|p| !is_blank(p)) {
+            *counts.entry(p.mount_name.clone()).or_insert(0) += 1;
+        }
+        counts
+    };
+    let stored_names = count_names(stored);
+    for (name, count) in count_names(incoming) {
+        let allowed = stored_names.get(&name).copied().unwrap_or(0).max(1);
+        if count > allowed {
+            return Err(format!("Duplicate mount name '{}'.", name));
+        }
+    }
+
+    Ok(())
+}
+
+/// Refuse a filesystem root newly set as `ssh_key_path` or `ca_cert_path`.
+///
+/// Both are bind-mounted into the container by `docker::create_container` —
+/// `/tmp/.host-ssh` and `/tmp/.host-ca` — and neither had any check at all, so
+/// `/` handed the whole host filesystem to the agent to read. Read-only, so
+/// this is disclosure rather than the read-write hole a `/` project folder is,
+/// but the fix is the same one line.
+///
+/// Same grandfathering as the folder list, for the same reason: a value already
+/// stored is already mounted on every start, and refusing an unrelated save
+/// does not unmount it. Only a *change* is held to the rule.
+fn validate_mounted_host_path(
+    label: &str,
+    stored: Option<&str>,
+    incoming: Option<&str>,
+) -> Result<(), String> {
+    let Some(value) = incoming.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(());
+    };
+    if stored.map(str::trim) == Some(value) {
+        return Ok(());
+    }
+    if is_filesystem_root(value) {
+        return Err(format!(
+            "'{}' is a filesystem root, so setting it as {} would mount the whole drive into the \
+             container. Choose the folder itself.",
+            value, label
+        ));
     }
     Ok(())
 }
@@ -358,14 +507,6 @@ pub async fn update_project(
     let mut project: Project = serde_json::from_value(project)
         .map_err(|e| format!("Could not read the project being saved: {}", e))?;
 
-    // **This takes a whole `Project` over IPC and used to store it verbatim.**
-    // `add_project` validated its folder list and this did not, so every check
-    // there was one edit away from being bypassed — and the Config tab's mount
-    // name is a free-text field on an existing project, saved on blur, calling
-    // exactly this command. See [`validate_project_paths`] for what a mount
-    // name of `../tmp/claude-x` does to the user's files.
-    validate_project_paths(&project.paths)?;
-
     // Fields this command does not get to write, whoever is calling it.
     //
     // `container_id` is the one that matters: it is the handle the whole file
@@ -386,6 +527,30 @@ pub async fn update_project(
         .projects_store
         .get(&project.id)
         .ok_or_else(|| format!("Project {} not found", project.id))?;
+
+    // **This takes a whole `Project` over IPC and used to store it verbatim.**
+    // `add_project` validated its folder list and this did not, so every check
+    // there was one edit away from being bypassed — and the Config tab's mount
+    // name is a free-text field on an existing project, saved on blur, calling
+    // exactly this command. See [`validate_project_paths`] for what a mount
+    // name of `../tmp/claude-x` does to the user's files.
+    //
+    // Validated against what is *stored*, not in isolation: a rule this command
+    // never enforced can be violated by data already on disk, and a project
+    // that cannot be saved at all is a Config tab that cannot be used at all.
+    // See [`validate_project_paths_update`].
+    validate_project_paths_update(&stored.paths, &project.paths)?;
+    validate_mounted_host_path(
+        "the SSH key folder",
+        stored.ssh_key_path.as_deref(),
+        project.ssh_key_path.as_deref(),
+    )?;
+    validate_mounted_host_path(
+        "the CA certificate path",
+        stored.ca_cert_path.as_deref(),
+        project.ca_cert_path.as_deref(),
+    )?;
+
     project.container_id = stored.container_id;
     project.status = stored.status;
     project.created_at = stored.created_at;
@@ -1065,10 +1230,177 @@ mod tests {
     #[test]
     fn add_and_update_cannot_disagree_about_what_a_folder_list_may_contain() {
         // `update_project` used to validate nothing at all, so every rule in
-        // `add_project` was one save-on-blur away from being bypassed. Both go
-        // through the same function now; this fails if either grows its own
-        // copy.
+        // `add_project` was one save-on-blur away from being bypassed. It now
+        // validates against what is stored rather than in isolation, but a row
+        // it has never seen before is held to exactly the same rules — this
+        // fails if either side grows its own copy.
         let bad = [path("/home/u/project", "../tmp/claude-x")];
         assert!(validate_project_paths(&bad).is_err());
+        assert!(validate_project_paths_update(&[], &bad).is_err());
+        let good = [path("/home/u/project", "project")];
+        assert!(validate_project_paths(&good).is_ok());
+        assert!(validate_project_paths_update(&[], &good).is_ok());
+    }
+
+    // ── Folder lists that are already in `projects.json` ──────────────────
+    //
+    // `update_project` validated nothing while `WorkspaceSection` saved
+    // `{paths}` on every blur, so a stored list can break rules that only
+    // `add_project` ever enforced. Holding a save to all of them turned every
+    // such project into one that cannot be saved *at all* — not its folders:
+    // `update_project` is the single command behind the whole Config tab, so a
+    // sandbox toggle, a permission-mode change and `useTerminal.ts`'s tab
+    // rename all came back with a message about folders.
+
+    /// The shapes a real `projects.json` can be holding. None of them is an
+    /// escape from `/workspace`; all of them used to brick the editor.
+    fn legacy_rows() -> Vec<Vec<ProjectPath>> {
+        vec![
+            // Half-filled: "+ Add folder", a host path typed, no name yet, and
+            // an unrelated blur saved the list.
+            vec![path("/home/u/a", "a"), path("/home/u/b", "")],
+            vec![path("/home/u/a", "a"), path("", "b")],
+            // A mount name the character check refuses but the daemon puts
+            // exactly where it says: /workspace/my project.
+            vec![path("/home/u/a", "my project")],
+            vec![path("/home/u/a", "web@2")],
+            // Two rows sharing a name.
+            vec![path("/home/u/a", "same"), path("/home/u/b", "same")],
+            // The whole drive, from before anything refused it.
+            vec![path("/", "everything")],
+            vec![path("C:\\", "everything")],
+        ]
+    }
+
+    #[test]
+    fn a_project_stored_with_a_bad_row_can_still_be_saved() {
+        for rows in legacy_rows() {
+            // The full rule set is what made these unsavable…
+            assert!(
+                validate_project_paths(&rows).is_err(),
+                "fixture {:?} is not actually a rule violation",
+                rows
+            );
+            // …and an unrelated Config save re-sends the list it was given.
+            assert!(
+                validate_project_paths_update(&rows, &rows).is_ok(),
+                "saving an unrelated setting on a project stored as {:?} is refused, so every \
+                 toggle in the Config tab fails with a message about folders",
+                rows
+            );
+        }
+    }
+
+    #[test]
+    fn the_same_bad_row_is_refused_when_it_is_new() {
+        let stored = [path("/home/u/project", "project")];
+        for rows in legacy_rows() {
+            assert!(
+                validate_project_paths_update(&stored, &rows).is_err(),
+                "{:?} was introduced through update_project, which is the escalation the \
+                 validation exists to stop",
+                rows
+            );
+        }
+    }
+
+    /// The one rule no exemption reaches. `/workspace/../tmp/claude-x`
+    /// normalises to `/tmp/claude-x` — a path the pre-commit scrub owns and
+    /// empties as root — so a stored one is a live data-loss chain rather than
+    /// untidy data, and the Workspace section is one edit away.
+    #[test]
+    fn a_mount_that_leaves_workspace_is_refused_however_it_got_there() {
+        for escape in ["..", "../tmp/claude-x", "../../etc", "/tmp/claude-x", "a/../..", ".", "..\\x"] {
+            let rows = [path("/home/u/project", escape)];
+            assert!(
+                validate_project_paths_update(&rows, &rows).is_err(),
+                "mount name '{}' was grandfathered, so the C1 chain stays open for anyone who \
+                 already has it stored",
+                escape
+            );
+            assert!(validate_project_paths_update(&[], &rows).is_err());
+        }
+    }
+
+    #[test]
+    fn editing_a_grandfathered_row_holds_it_to_every_rule_again() {
+        let stored = [path("/", "everything")];
+        // Renaming the mount but keeping the root host path is a new row.
+        assert!(
+            validate_project_paths_update(&stored, &[path("/", "all")]).is_err(),
+            "an edited row was admitted on the strength of the row it replaced"
+        );
+        // Fixing the host path is what the message asks for, and it saves.
+        assert!(
+            validate_project_paths_update(&stored, &[path("/home/u/a", "everything")]).is_ok()
+        );
+        // Dropping the row entirely is always fine.
+        assert!(validate_project_paths_update(&stored, &[]).is_ok());
+    }
+
+    #[test]
+    fn a_stored_duplicate_may_be_kept_but_not_multiplied() {
+        let stored = [path("/home/u/a", "same"), path("/home/u/b", "same")];
+        assert!(validate_project_paths_update(&stored, &stored).is_ok());
+        // Order must not change the answer.
+        let reordered = [stored[1].clone(), stored[0].clone()];
+        assert!(validate_project_paths_update(&stored, &reordered).is_ok());
+        // A third row taking the same name is new, and refused.
+        let more = [
+            stored[0].clone(),
+            stored[1].clone(),
+            path("/home/u/c", "same"),
+        ];
+        assert!(validate_project_paths_update(&stored, &more).is_err());
+        // And a second copy of a name that was unique stays refused.
+        let unique = [path("/home/u/a", "a")];
+        assert!(validate_project_paths_update(
+            &unique,
+            &[path("/home/u/a", "a"), path("/home/u/b", "a")]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn the_blank_placeholder_row_is_still_not_an_error_on_either_path() {
+        let stored = [path("/home/u/a", "a")];
+        let with_placeholder = [path("/home/u/a", "a"), path("", "")];
+        assert!(validate_project_paths(&with_placeholder).is_ok());
+        assert!(validate_project_paths_update(&stored, &with_placeholder).is_ok());
+    }
+
+    // ── The two host paths that had no check at all ───────────────────────
+
+    #[test]
+    fn a_filesystem_root_cannot_be_newly_set_as_an_ssh_or_ca_path() {
+        for root in ["/", "//", "\\", "C:\\", "c:/", "D:"] {
+            assert!(
+                validate_mounted_host_path("the SSH key folder", None, Some(root)).is_err(),
+                "'{}' was accepted as an SSH key path, which read-only bind-mounts the whole \
+                 host filesystem at /tmp/.host-ssh",
+                root
+            );
+            assert!(
+                validate_mounted_host_path("the CA certificate path", Some("/etc/ssl"), Some(root))
+                    .is_err(),
+                "'{}' was accepted as a CA certificate path",
+                root
+            );
+        }
+        // A real folder, a cleared value and an absent one are all fine.
+        assert!(validate_mounted_host_path("x", None, Some("/home/u/.ssh")).is_ok());
+        assert!(validate_mounted_host_path("x", Some("/home/u/.ssh"), None).is_ok());
+        assert!(validate_mounted_host_path("x", Some("/home/u/.ssh"), Some("")).is_ok());
+    }
+
+    #[test]
+    fn an_ssh_path_already_stored_does_not_brick_the_editor_either() {
+        // Nothing ever validated this field, so it can hold a root today — and
+        // it is mounted on every container start whether or not an unrelated
+        // Config save is allowed through.
+        assert!(validate_mounted_host_path("x", Some("/"), Some("/")).is_ok());
+        assert!(validate_mounted_host_path("x", Some("/"), Some(" / ")).is_ok());
+        // Changing it to a different root is a change, and refused.
+        assert!(validate_mounted_host_path("x", Some("/"), Some("C:\\")).is_err());
     }
 }

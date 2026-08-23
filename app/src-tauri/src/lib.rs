@@ -476,6 +476,7 @@ pub fn run() {
             commands::auth_token_commands::cancel_claude_token,
             commands::auth_token_commands::has_claude_token,
             commands::auth_token_commands::clear_claude_token,
+            commands::auth_token_commands::sweep_claude_token_snapshots,
             // Settings
             commands::settings_commands::get_settings,
             commands::settings_commands::update_settings,
