@@ -218,6 +218,12 @@ pub const SECRET_ENV_KEYS: &[&str] = &[
 /// which is what keeps the sweep away from the user's own images.
 const LABEL_MANAGED: &str = "triple-c.managed";
 
+/// Marks the image built from `container/Dockerfile` itself, as opposed to a
+/// project snapshot committed from a container. Only ever `"true"` on a base
+/// image; `create_container` writes it explicitly empty so an inherited value
+/// cannot travel onto a snapshot. See the `LABEL` block in the Dockerfile.
+const LABEL_BASE: &str = "triple-c.base";
+
 const RESERVED_ENV_PREFIXES: &[&str] = &["ANTHROPIC_", "AWS_", "GIT_", "HOST_", "TRIPLE_C_"];
 
 /// Exact env var names Triple-C manages itself. Not covered by
@@ -235,6 +241,15 @@ const RESERVED_ENV_EXACT: &[&str] = &[
     "MISSION_CONTROL_ENABLED",
     "VPN_SUPPORT_ENABLED",
     "TRIPLE_C_PERMISSION_MODE",
+    // The four env vars the Claude Code settings editor drives. Reserved for
+    // the `VPN_SUPPORT_ENABLED` reason: each is now written on every create,
+    // including its off value, so a hand-set custom var of the same name would
+    // either be overridden without explanation or override the setting behind
+    // the UI's back, depending on which one Docker kept.
+    "CLAUDE_CODE_NO_FLICKER",
+    "CLAUDE_CODE_ENABLE_AWAY_SUMMARY",
+    "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB",
+    "ENABLE_PROMPT_CACHING_1H",
     CLAUDE_OAUTH_TOKEN_ENV,
     // The model-alias vars are already covered by the `ANTHROPIC_` prefix
     // above; they are listed explicitly so that a future narrowing of the
@@ -633,7 +648,7 @@ fn merge_claude_code_settings(
                 auto_scroll_disabled: if p.auto_scroll_disabled { true } else { g.auto_scroll_disabled },
                 focus_mode: if p.focus_mode { true } else { g.focus_mode },
                 show_thinking_summaries: if p.show_thinking_summaries { true } else { g.show_thinking_summaries },
-                enable_session_recap: if p.enable_session_recap { true } else { g.enable_session_recap },
+                session_recap_disabled: if p.session_recap_disabled { true } else { g.session_recap_disabled },
                 env_scrub: if p.env_scrub { true } else { g.env_scrub },
                 prompt_caching_1h: if p.prompt_caching_1h { true } else { g.prompt_caching_1h },
             })
@@ -660,7 +675,7 @@ fn compute_claude_code_settings_fingerprint(
                 format!("{}", s.auto_scroll_disabled),
                 format!("{}", s.focus_mode),
                 format!("{}", s.show_thinking_summaries),
-                format!("{}", s.enable_session_recap),
+                format!("{}", s.session_recap_disabled),
                 format!("{}", s.env_scrub),
                 format!("{}", s.prompt_caching_1h),
             ];
@@ -674,34 +689,164 @@ fn compute_claude_code_settings_fingerprint(
     }
 }
 
-/// Build the settings.json content for Claude Code.
-/// Returns a JSON string of the settings to be written to ~/.claude/settings.json.
-/// Always emits a `sandbox.enabled` key reflecting the current per-project
-/// toggle so that flipping it off in triple-c overrides any prior on-state
-/// stored in the persisted settings.json (which lives in a named volume).
+/// The four Claude Code env vars the settings editor drives, as `KEY=VALUE`.
+///
+/// **All four are emitted on every create, including their off value.** This is
+/// the `MANAGED_AUTH_KEYS` rule: `docker commit` bakes a container's env into
+/// the snapshot image, and the next container inherits anything the create does
+/// not override. A `=1` written once would ride that snapshot into every future
+/// container and make the switch impossible to turn back off — the same
+/// stickiness [`build_claude_code_settings_json`] fixes on the settings.json
+/// side, in a place where it is even less visible.
+///
+/// Two of them use an **empty** value for "off", and the distinction matters:
+///
+/// * `CLAUDE_CODE_NO_FLICKER` documents `1` as fullscreen-on and `0` as
+///   fullscreen-*off*, and it overrides the `tui` setting. `0` is therefore not
+///   neutral — it would silently pin every project that has expressed no
+///   preference to the classic renderer, when an unset `tui` is supposed to let
+///   Claude Code choose. Empty is neither value, so it reads as unset while
+///   still overriding a baked `1`.
+/// * `CLAUDE_CODE_ENABLE_AWAY_SUMMARY` outranks both `awaySummaryEnabled` and
+///   the in-container `/config` toggle. `0` is exactly right for "the user
+///   turned the recap off in Triple-C", but a blanket `1` for the default state
+///   would force the recap back on for someone who had turned it off with
+///   `/config` inside their own container. Triple-C's default must not overrule
+///   a choice it never asked about.
+///
+/// The other two are documented as "set to `1` to …" with no meaning attached
+/// to `0`, so `0` is unambiguously neutral and is stated outright.
+fn claude_code_env_vars(settings: Option<&ClaudeCodeSettings>) -> Vec<String> {
+    let owned;
+    let s = match settings {
+        Some(s) => s,
+        None => {
+            owned = ClaudeCodeSettings::default();
+            &owned
+        }
+    };
+
+    vec![
+        format!(
+            "CLAUDE_CODE_NO_FLICKER={}",
+            match s.tui_mode.as_deref() {
+                Some("fullscreen") => "1",
+                Some("default") => "0",
+                _ => "",
+            }
+        ),
+        format!(
+            "CLAUDE_CODE_ENABLE_AWAY_SUMMARY={}",
+            if s.session_recap_disabled { "0" } else { "" }
+        ),
+        format!(
+            "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB={}",
+            if s.env_scrub { "1" } else { "0" }
+        ),
+        format!(
+            "ENABLE_PROMPT_CACHING_1H={}",
+            if s.prompt_caching_1h { "1" } else { "0" }
+        ),
+    ]
+}
+
+/// Build the settings.json payload for Claude Code, handed to the container as
+/// `CLAUDE_CODE_SETTINGS_JSON` and applied by `entrypoint.sh`.
+///
+/// ## Every managed key is always present, and `null` means "delete"
+///
+/// The settings file lives on `triple-c-claude-config-{projectId}`, a named
+/// volume that outlives the container, and the entrypoint *merges* into it. So
+/// a key emitted only when it is non-default can be written once and never
+/// taken back: turning the setting off simply omits the key, the merge
+/// preserves whatever was there, and the setting stays on forever. Only a
+/// destructive Reset — which also deletes the OAuth login, skills and
+/// transcripts — ever cleared it. Four of the five keys here were sticky that
+/// way; the `sandbox` block already carried the workaround and the comment
+/// explaining it, and this is the same treatment applied to the rest.
+///
+/// Two shapes of "off" are needed, because Claude Code's own defaults differ:
+///
+/// * **A boolean with a documented default** (`autoScrollEnabled` is `true`,
+///   `showThinkingSummaries` is `false`) is emitted with that neutral value.
+/// * **A key whose neutral state is *unset*** (`tui`, `effortLevel`,
+///   `viewMode`, `awaySummaryEnabled`) is emitted as JSON `null`, and the
+///   entrypoint deletes rather than merges those. Writing a stand-in value
+///   would not be neutral: an unset `tui` lets Claude Code choose the renderer
+///   (`"default"` pins the classic one), and an unset `viewMode` lets the
+///   user's own sticky `/focus` choice and `verbose` setting apply
+///   (`"default"` overrides both).
+///
+/// Returns a `String` rather than an `Option<String>`: there is no longer any
+/// input for which this produces nothing to say.
 fn build_claude_code_settings_json(
     settings: Option<&ClaudeCodeSettings>,
     sandbox_enabled: bool,
-) -> Option<String> {
+) -> String {
+    let owned;
+    let s = match settings {
+        Some(s) => s,
+        // No struct at all is not "say nothing" — it is "every setting is at
+        // its default", which still has to be asserted over a stale file.
+        None => {
+            owned = ClaudeCodeSettings::default();
+            &owned
+        }
+    };
+
     let mut map = serde_json::Map::new();
 
-    if let Some(s) = settings {
-        if let Some(ref tui) = s.tui_mode {
-            map.insert("tui".to_string(), serde_json::json!(tui));
-        }
-        if let Some(ref effort) = s.effort {
-            map.insert("effort".to_string(), serde_json::json!(effort));
-        }
-        if s.auto_scroll_disabled {
-            map.insert("autoScrollEnabled".to_string(), serde_json::json!(false));
-        }
+    // `null` clears; see the module doc above.
+    map.insert(
+        "tui".to_string(),
+        match s.tui_mode {
+            Some(ref tui) => serde_json::json!(tui),
+            None => serde_json::Value::Null,
+        },
+    );
+    // `effortLevel`, not `effort`. Claude Code has never read a key called
+    // `effort`, so the previous value was written and silently ignored.
+    map.insert(
+        "effortLevel".to_string(),
+        match s.effort {
+            Some(ref effort) => serde_json::json!(effort),
+            None => serde_json::Value::Null,
+        },
+    );
+    // Documented default `true`, so the neutral value is a value.
+    map.insert(
+        "autoScrollEnabled".to_string(),
+        serde_json::json!(!s.auto_scroll_disabled),
+    );
+    // Documented default `false`.
+    map.insert(
+        "showThinkingSummaries".to_string(),
+        serde_json::json!(s.show_thinking_summaries),
+    );
+    // `viewMode: "focus"` is the real setting behind what the UI calls focus
+    // mode — "collapses tool output to one-line summaries" is that key's
+    // documented behaviour. The `focusMode` key it replaces was invented and
+    // did nothing.
+    map.insert(
+        "viewMode".to_string(),
         if s.focus_mode {
-            map.insert("focusMode".to_string(), serde_json::json!(true));
-        }
-        if s.show_thinking_summaries {
-            map.insert("showThinkingSummaries".to_string(), serde_json::json!(true));
-        }
-    }
+            serde_json::json!("focus")
+        } else {
+            serde_json::Value::Null
+        },
+    );
+    // The recap is on by default, so only the *off* case has anything to write.
+    // `CLAUDE_CODE_ENABLE_AWAY_SUMMARY` (set unconditionally at creation) takes
+    // precedence over this key and is what actually enforces the choice; this
+    // is here so the container's settings.json does not contradict it.
+    map.insert(
+        "awaySummaryEnabled".to_string(),
+        if s.session_recap_disabled {
+            serde_json::json!(false)
+        } else {
+            serde_json::Value::Null
+        },
+    );
 
     // Always emit `sandbox.enabled` so that toggling the per-project sandbox
     // off in triple-c clears any prior on-state in the persisted
@@ -719,11 +864,7 @@ fn build_claude_code_settings_json(
     };
     map.insert("sandbox".to_string(), sandbox_obj);
 
-    if map.is_empty() {
-        None
-    } else {
-        Some(serde_json::Value::Object(map).to_string())
-    }
+    serde_json::Value::Object(map).to_string()
 }
 
 pub async fn find_existing_container(project: &Project) -> Result<Option<String>, String> {
@@ -1320,31 +1461,20 @@ pub async fn create_container(
         global_claude_code_settings,
         project.claude_code_settings.as_ref(),
     );
-    if let Some(ref cc) = merged_cc_settings {
-        // Env-var-based settings (these are read directly by Claude Code)
-        if cc.tui_mode.as_deref() == Some("fullscreen") {
-            env_vars.push("CLAUDE_CODE_NO_FLICKER=1".to_string());
-        }
-        if cc.enable_session_recap {
-            env_vars.push("CLAUDE_CODE_ENABLE_AWAY_SUMMARY=1".to_string());
-        }
-        if cc.env_scrub {
-            env_vars.push("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1".to_string());
-        }
-        if cc.prompt_caching_1h {
-            env_vars.push("ENABLE_PROMPT_CACHING_1H=1".to_string());
-        }
-    }
+    // Env-var-based settings, read directly by Claude Code. Extracted and unit
+    // tested for the `vpn_host_config` reason: a container is created once, by
+    // a very long function, and a variable emitted with the wrong value here is
+    // invisible until someone wonders why a switch does nothing.
+    env_vars.extend(claude_code_env_vars(merged_cc_settings.as_ref()));
 
-    // settings.json-based settings (written by the entrypoint).
-    // Always invoked so per-project sandbox state is injected even when no
-    // ClaudeCodeSettings struct is present.
-    if let Some(settings_json) = build_claude_code_settings_json(
-        merged_cc_settings.as_ref(),
-        project.sandbox_mode_enabled,
-    ) {
-        env_vars.push(format!("CLAUDE_CODE_SETTINGS_JSON={}", settings_json));
-    }
+    // settings.json-based settings (applied by the entrypoint). Always emitted,
+    // even with no `ClaudeCodeSettings` struct present: the payload asserts the
+    // *whole* managed key set, so "no settings" still has to be stated over a
+    // settings.json left behind on the config volume by a previous config.
+    env_vars.push(format!(
+        "CLAUDE_CODE_SETTINGS_JSON={}",
+        build_claude_code_settings_json(merged_cc_settings.as_ref(), project.sandbox_mode_enabled)
+    ));
 
     let mut mounts: Vec<Mount> = Vec::new();
 
@@ -1571,6 +1701,14 @@ pub async fn create_container(
     // always meant to do.
     labels.insert("triple-c.mcp-fingerprint".to_string(), String::new());
 
+    // Same defence, for the label `container/Dockerfile` now stamps on the base
+    // image. Docker merges an image's labels into the container it creates, and
+    // `docker commit` copies the container's labels onto the snapshot — so
+    // without this line every project snapshot would inherit
+    // `triple-c.base=true` from the base it descends from and claim to *be* a
+    // base image. Writing it explicitly empty overrides the inherited value.
+    labels.insert(LABEL_BASE.to_string(), String::new());
+
     for (key, value) in extras.extra_labels {
         labels.insert((*key).to_string(), (*value).to_string());
     }
@@ -1581,6 +1719,7 @@ pub async fn create_container(
         mounts: Some(mounts),
         port_bindings: if port_bindings.is_empty() { None } else { Some(port_bindings) },
         init: Some(true),
+        log_config: Some(capped_log_config()),
         cap_add,
         devices,
         sysctls,
@@ -1616,6 +1755,36 @@ pub async fn create_container(
         .map_err(|e| explain_container_failure("create", &e.to_string()))?;
 
     Ok(response.id)
+}
+
+/// The rotation policy every Triple-C container is created with.
+///
+/// Without this a container inherits the daemon's `json-file` default, which
+/// has **no size limit at all** — `docker logs` for a container that has been
+/// up for weeks is a single file that grows until the disk does not have room
+/// for it. Triple-C containers are long-lived by design (stop/start, not
+/// create/destroy), and the entrypoint plus anything a session leaves running
+/// on stdout all land in that one file.
+///
+/// 10 MiB × 3 keeps roughly the last 30 MiB, which is far more scrollback than
+/// anything reads, and bounds the worst case at 30 MiB per project instead of
+/// unbounded.
+///
+/// **Deliberately not part of `container_needs_recreation`.** That check is
+/// label-based, so participating would mean a new `triple-c.*` label whose only
+/// effect is to recreate every existing project once — and a recreation costs a
+/// `docker commit`, i.e. a permanent multi-gigabyte layer, which is the very
+/// thing this whole change set exists to avoid. Containers pick the policy up
+/// on their next natural recreation instead; an existing container keeps its
+/// unbounded log until then, which is exactly the status quo.
+fn capped_log_config() -> bollard::models::HostConfigLogConfig {
+    bollard::models::HostConfigLogConfig {
+        typ: Some("json-file".to_string()),
+        config: Some(HashMap::from([
+            ("max-size".to_string(), "10m".to_string()),
+            ("max-file".to_string(), "3".to_string()),
+        ])),
+    }
 }
 
 pub async fn start_container(container_id: &str) -> Result<(), String> {
@@ -1768,6 +1937,155 @@ chmod 600 "$HOME/.aws/credentials""#;
     Ok(())
 }
 
+/// Paths deleted from a container's writable layer immediately before
+/// [`commit_container_snapshot`] runs.
+///
+/// ## Why this exists
+///
+/// Every recreation commits the container, and a commit **stacks a new layer**
+/// on top of the previous snapshot — it never rewrites one. Deleting a file
+/// after it has been committed does not give the bytes back; it writes a
+/// whiteout entry and the original bytes stay in the layer below, forever. One
+/// project was measured carrying 14 stacked commit layers and ~5.1 GB above its
+/// base image, and 24 different conditions trigger a recreation, so changing a
+/// single settings field costs a multi-gigabyte layer that nothing can reclaim.
+///
+/// The only moment the bytes are still free to drop is *before* the commit that
+/// captures them. Measured on one container's 4.48 GB pending writable layer:
+/// 3.0 GB of agent scratchpad under `/tmp/claude-*`, the drag-and-drop staging
+/// area (up to 256 MiB per dropped file, and nothing in the app ever removes
+/// one), one PNG per pasted image, and the apt lists/cache/logs left by every
+/// runtime `apt-get install` the browser-view installer and the Playwright
+/// healer run — none of which has an `apt-get clean` behind it.
+///
+/// ## Why a hardcoded list and not a heuristic
+///
+/// A snapshot is the user's system layer: their packages, their `/opt`, their
+/// `/var/lib/postgresql`. Nothing here may guess. Every entry is an absolute
+/// path anchored to a directory Triple-C or a package manager owns, and the
+/// three globs are anchored to `/tmp` specifically:
+///
+/// * `/workspace/{mount_name}` subtrees are **host bind mounts** — the user's
+///   real project directories. No entry may ever reach one, which is why no
+///   pattern here starts with `/workspace`.
+/// * The only bind mounts under `/tmp` are `/tmp/.host-ca` and `/tmp/.host-aws`
+///   (both read-only). A leading-dot name is not matched by a shell glob, and
+///   none of the three patterns share their prefix, so neither can be selected
+///   even by accident.
+/// * The apt entries keep their parent directory and remove only its contents
+///   (`lists/*`, `archives/*.deb`, `apt/*`); `apt-get` is unhappy when the
+///   directories themselves are missing.
+///
+/// A unit test pins the list, because the blast radius of a wrong entry here is
+/// a user's data and the code that consumes it is a shell string.
+pub(crate) const SNAPSHOT_SCRUB_PATHS: &[&str] = &[
+    // Agent scratchpads. The user's global CLAUDE.md instructs every agent to
+    // put temporary files under a scratchpad directory in /tmp, so this is
+    // where a long-running project's writable layer actually goes.
+    "/tmp/claude-*",
+    // Files drag-dropped into a terminal, staged by
+    // `commands/terminal_commands.rs` at up to 256 MiB each. Nothing in the
+    // repo deletes them.
+    "/tmp/triple-c-drops/*",
+    // One PNG per pasted image, from the same module. Also never deleted.
+    "/tmp/clipboard_*.png",
+    // Runtime apt debris. `browser_view/install.rs` and
+    // `container/triple-c-playwright-heal` both run `apt-get install` inside a
+    // live container without an `apt-get clean` after it.
+    "/var/lib/apt/lists/*",
+    "/var/cache/apt/archives/*.deb",
+    "/var/log/apt/*",
+    "/var/log/dpkg.log",
+];
+
+/// Marker the scrub script prints so the byte total can be read back out of the
+/// exec's interleaved stdout/stderr.
+const SCRUB_MARKER: &str = "###TRIPLE-C-SCRUBBED ";
+
+/// The `/bin/sh` program run inside the container to perform the scrub.
+///
+/// Built here rather than inline so a test can read it. The path list is
+/// interpolated **unquoted** on the `for` line, which is the whole point: the
+/// shell expands the three globs there. An unmatched glob expands to itself,
+/// the `[ -e ]` guard then fails, and the entry is skipped — so a pattern that
+/// matches nothing is a no-op rather than an `rm` of a literal path.
+/// Inside the loop `$p` is quoted, so a filename containing whitespace is one
+/// argument.
+fn snapshot_scrub_script() -> String {
+    format!(
+        r#"total=0
+for p in {paths}; do
+    [ -e "$p" ] || continue
+    sz=$(du -sb "$p" 2>/dev/null | cut -f1)
+    case "$sz" in ''|*[!0-9]*) sz=0 ;; esac
+    rm -rf -- "$p" 2>/dev/null && total=$((total + sz))
+done
+echo "{marker}$total"
+exit 0
+"#,
+        paths = SNAPSHOT_SCRUB_PATHS.join(" "),
+        marker = SCRUB_MARKER,
+    )
+}
+
+/// Parse the byte total the scrub script reports. Returns `None` when the
+/// marker is absent, which is how a container that never ran the script (or a
+/// `sh` that died early) is told apart from one that reclaimed nothing.
+fn parse_scrub_total(output: &str) -> Option<u64> {
+    output
+        .lines()
+        .rev()
+        .find_map(|line| line.trim().strip_prefix(SCRUB_MARKER)?.trim().parse().ok())
+}
+
+/// Delete the throwaway files listed in [`SNAPSHOT_SCRUB_PATHS`] from a
+/// container's writable layer so the commit that follows does not bake them in.
+///
+/// Runs as **root**: the apt debris is root-owned while the scratchpads belong
+/// to `claude`, and root can remove both.
+///
+/// **Never fails the caller, by design.** A scrub is an optimisation; a commit
+/// is the only copy of the user's system layer. Losing some disk is a strictly
+/// better outcome than refusing to snapshot, so every failure here is a log
+/// line and nothing more. Note that one caller (the pre-swap commit in
+/// `migrate_project_to_base`) has already *stopped* the container, so `docker
+/// exec` legitimately fails there — that path simply commits unscrubbed.
+pub async fn scrub_writable_layer(container_id: &str) -> u64 {
+    let script = snapshot_scrub_script();
+    let cmd = vec!["/bin/sh".to_string(), "-c".to_string(), script];
+
+    match crate::docker::exec::exec_oneshot_as(container_id, "root", cmd, Vec::new()).await {
+        Ok((output, _exit_code)) => match parse_scrub_total(&output) {
+            Some(bytes) => {
+                if bytes > 0 {
+                    log::info!(
+                        "Pre-commit scrub of container {} reclaimed {:.2} MB before it could be committed",
+                        container_id,
+                        bytes as f64 / 1_048_576.0
+                    );
+                }
+                bytes
+            }
+            None => {
+                log::warn!(
+                    "Pre-commit scrub of container {} did not report a total; committing anyway. Output: {}",
+                    container_id,
+                    output.trim()
+                );
+                0
+            }
+        },
+        Err(e) => {
+            log::warn!(
+                "Pre-commit scrub of container {} could not run ({}); committing anyway",
+                container_id,
+                e
+            );
+            0
+        }
+    }
+}
+
 /// Commit the container's filesystem to a snapshot image so that system-level
 /// changes (apt/pip/npm installs, ~/.claude.json, etc.) survive container
 /// removal.
@@ -1795,9 +2113,20 @@ chmod 600 "$HOME/.aws/credentials""#;
 ///
 /// Non-secret env (PATH, TZ, model aliases, instructions) is inherited as
 /// before, so nothing about the snapshot's behaviour changes.
+///
+/// ## Why it scrubs first
+///
+/// See [`SNAPSHOT_SCRUB_PATHS`]. Every commit stacks a layer, so a file present
+/// here is a file the project's image carries for the rest of its life.
 pub async fn commit_container_snapshot(container_id: &str, project: &Project) -> Result<(), String> {
     let docker = get_docker()?;
     let image_name = get_snapshot_image_name(project);
+
+    // Drop the throwaway files *before* the commit captures them. A commit
+    // stacks a layer and never rewrites one, so anything present at this
+    // instant is paid for permanently — see [`SNAPSHOT_SCRUB_PATHS`]. Failure
+    // is swallowed inside; a scrub must never be able to block a snapshot.
+    scrub_writable_layer(container_id).await;
 
     // Parse repo:tag
     let (repo, tag) = match image_name.rsplit_once(':') {
@@ -1890,15 +2219,30 @@ fn orphan_sweep_filters() -> HashMap<String, Vec<String>> {
 ///   `triple-c-snapshot-{id}:latest` is what a project is rebuilt from, and a
 ///   migration's `pre-migration-*` pin is the only copy of a rollback target.
 ///   Neither can ever match this filter, so neither can be swept.
-/// * **`triple-c.managed=true`** — only images Triple-C itself committed.
-///   `docker commit` copies the container's labels onto the image, which is what
-///   makes the label a reliable mark of provenance. The user's own dangling
-///   images are none of our business.
+/// * **`triple-c.managed=true`** — only images Triple-C itself built or
+///   committed. `docker commit` copies the container's labels onto the image,
+///   and `container/Dockerfile` stamps the same label on the base, which is
+///   what makes it a reliable mark of provenance. The user's own dangling
+///   images are none of our business — the daemon this runs against is shared
+///   with their unrelated work, so an unfiltered prune is never an option.
+///
+/// **Superseded base images are collected by exactly the same two conditions.**
+/// They used to be unreachable: `container/Dockerfile` carried no `LABEL` at
+/// all, so a base image left untagged when a newer build claimed
+/// `triple-c-sandbox:latest` was dangling but not labelled and could never
+/// match. ~11.9 GB was measured stranded that way. The Dockerfile now stamps
+/// `triple-c.managed=true`, so no change is needed here beyond knowing that
+/// this function is what reclaims them.
 ///
 /// Removal is not forced, so Docker refuses (409) while any container is still
 /// built from the image — including the stopped containers of projects that are
 /// not running. That refusal is the third safety net and it is the daemon's,
 /// not ours; those orphans are simply counted and left for a later sweep.
+/// **This is why `force: false` stays.** Forcing would untag and delete an
+/// image out from under a stopped project, and Docker would leave that
+/// container unable to start. A superseded base image pinned by one stopped
+/// container is therefore not reclaimed until that project is next recreated or
+/// removed, which the startup sweep will notice on some later run.
 ///
 /// Never fails the caller: this is housekeeping, and a full disk is a better
 /// outcome than a project that will not start.
@@ -1967,6 +2311,38 @@ pub async fn sweep_orphaned_snapshots() -> SnapshotSweepReport {
     }
 
     report
+}
+
+/// Run [`sweep_orphaned_snapshots`] and write the whole outcome to the log,
+/// tagged with *why* the sweep ran.
+///
+/// Every caller of the sweep is housekeeping fired off in a detached task, and
+/// every one of them dropped the `SnapshotSweepReport` on the floor — including
+/// `reclaimed_bytes`, `failed` and `unavailable`, which are the only evidence
+/// that a sweep ever happened or that it could not. When a user asks where
+/// 116 GB went, "nothing was logged" is not an answer. There is no UI for this
+/// yet by deliberate choice (prevention first), so the log is the whole
+/// interface.
+pub async fn sweep_orphaned_snapshots_logged(context: &str) {
+    let report = sweep_orphaned_snapshots().await;
+
+    if let Some(ref why) = report.unavailable {
+        log::warn!("Snapshot sweep ({}) could not run: {}", context, why);
+        return;
+    }
+
+    log::info!(
+        "Snapshot sweep ({}): {} removed, {:.2} GB reclaimed, {} still pinned by a container, {} failed",
+        context,
+        report.removed.len(),
+        report.reclaimed_bytes as f64 / 1_073_741_824.0,
+        report.in_use,
+        report.failed.len(),
+    );
+
+    for (id, error) in &report.failed {
+        log::warn!("Snapshot sweep ({}) could not remove {}: {}", context, id, error);
+    }
 }
 
 /// Outcome of [`scrub_secrets_from_snapshots`], so callers can tell the user
@@ -3118,5 +3494,335 @@ mod tests {
             ..Default::default()
         };
         assert!(blind.left_something_behind());
+    }
+
+    // ── Pre-commit scrub (A1) ────────────────────────────────────────────────
+
+    #[test]
+    fn no_scrub_path_can_reach_a_host_bind_mount() {
+        // `/workspace/{mount_name}` is the user's own project directory, bound
+        // in from the host. Nothing in this list may ever name one — and the
+        // two read-only host mounts under /tmp must be equally unreachable.
+        for path in SNAPSHOT_SCRUB_PATHS {
+            assert!(
+                path.starts_with('/'),
+                "{} is not absolute, so the shell would resolve it against an unknown cwd",
+                path
+            );
+            assert!(
+                !path.starts_with("/workspace"),
+                "{} reaches into a host bind mount",
+                path
+            );
+            assert!(
+                !path.starts_with("/tmp/."),
+                "{} could select /tmp/.host-ca or /tmp/.host-aws",
+                path
+            );
+            assert!(
+                !path.starts_with("/home"),
+                "{} reaches into the persisted home volume",
+                path
+            );
+        }
+    }
+
+    #[test]
+    fn no_scrub_path_is_a_whole_system_directory() {
+        // A trailing `/*` on a directory the system needs is fine; the
+        // directory *itself* is not. Guards against an edit that shortens an
+        // entry by one path component.
+        const FORBIDDEN: &[&str] = &[
+            "/", "/tmp", "/var", "/var/lib", "/var/log", "/var/cache", "/etc", "/usr", "/opt",
+            "/workspace", "/home", "/home/claude", "/var/lib/apt", "/var/cache/apt",
+        ];
+        for path in SNAPSHOT_SCRUB_PATHS {
+            let trimmed = path.trim_end_matches('/');
+            assert!(
+                !FORBIDDEN.contains(&trimmed),
+                "{} would delete a directory the container needs",
+                path
+            );
+        }
+    }
+
+    #[test]
+    fn the_scrub_list_covers_every_measured_source_of_writable_layer_growth() {
+        // Each of these was measured in a real container's pending commit.
+        // Dropping one silently gives back multiple gigabytes per project.
+        for expected in [
+            "/tmp/claude-*",                 // agent scratchpads, 3.0 GB measured
+            "/tmp/triple-c-drops/*",         // terminal drag-and-drop staging
+            "/tmp/clipboard_*.png",          // pasted images
+            "/var/lib/apt/lists/*",          // runtime apt, no `apt-get clean` behind it
+            "/var/cache/apt/archives/*.deb",
+            "/var/log/apt/*",
+            "/var/log/dpkg.log",
+        ] {
+            assert!(
+                SNAPSHOT_SCRUB_PATHS.contains(&expected),
+                "{} is no longer scrubbed before commit",
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn the_scrub_script_expands_globs_but_quotes_the_match() {
+        let script = snapshot_scrub_script();
+        // Unquoted on the `for` line — that is what makes the shell expand the
+        // globs at all.
+        assert!(script.contains("for p in /tmp/claude-* /tmp/triple-c-drops/*"));
+        // Quoted everywhere it is *used*, so a filename with a space is one
+        // argument and not two paths.
+        assert!(script.contains(r#"[ -e "$p" ] || continue"#));
+        assert!(script.contains(r#"rm -rf -- "$p""#));
+        // `rm -rf /` would be catastrophic and is exactly what a botched
+        // interpolation produces.
+        assert!(!script.contains("rm -rf -- /\n"));
+        assert!(!script.contains(" / "));
+    }
+
+    #[test]
+    fn the_scrub_total_is_read_back_from_the_marker_line() {
+        assert_eq!(
+            parse_scrub_total("some noise\n###TRIPLE-C-SCRUBBED 4812345\n"),
+            Some(4812345)
+        );
+        // Nothing reclaimed is a real answer and must not read as a failure.
+        assert_eq!(parse_scrub_total("###TRIPLE-C-SCRUBBED 0"), Some(0));
+        // No marker means the script never got to the end — a different thing
+        // from reclaiming nothing, and the caller logs it differently.
+        assert_eq!(parse_scrub_total("sh: du: not found"), None);
+        assert_eq!(parse_scrub_total(""), None);
+    }
+
+    // ── Container log rotation (A2) ──────────────────────────────────────────
+
+    #[test]
+    fn every_container_is_created_with_a_bounded_log() {
+        let cfg = capped_log_config();
+        assert_eq!(cfg.typ.as_deref(), Some("json-file"));
+        let config = cfg.config.expect("a json-file driver with no config is unbounded");
+        assert_eq!(config.get("max-size").map(String::as_str), Some("10m"));
+        assert_eq!(config.get("max-file").map(String::as_str), Some("3"));
+    }
+
+    // ── Claude Code settings.json (Part B) ───────────────────────────────────
+
+    fn settings_json(s: Option<&ClaudeCodeSettings>, sandbox: bool) -> serde_json::Value {
+        serde_json::from_str(&build_claude_code_settings_json(s, sandbox))
+            .expect("the payload must be valid JSON — the entrypoint pipes it into jq")
+    }
+
+    /// The five keys that used to be emitted only when non-default, plus the
+    /// sandbox block that already knew better.
+    const MANAGED_SETTINGS_KEYS: &[&str] = &[
+        "tui",
+        "effortLevel",
+        "autoScrollEnabled",
+        "showThinkingSummaries",
+        "viewMode",
+        "awaySummaryEnabled",
+        "sandbox",
+    ];
+
+    #[test]
+    fn turning_a_setting_off_clears_it_rather_than_omitting_it() {
+        // This is the whole bug. `~/.claude/settings.json` lives on a persisted
+        // volume and the entrypoint merges into it, so a key that is merely
+        // *absent* when the setting is off leaves the previous on-value in
+        // place — the setting could never be turned back off short of a
+        // destructive Reset.
+        let on = ClaudeCodeSettings {
+            tui_mode: Some("fullscreen".to_string()),
+            effort: Some("xhigh".to_string()),
+            auto_scroll_disabled: true,
+            focus_mode: true,
+            show_thinking_summaries: true,
+            session_recap_disabled: true,
+            ..Default::default()
+        };
+        let hot = settings_json(Some(&on), true);
+        assert_eq!(hot["tui"], serde_json::json!("fullscreen"));
+        assert_eq!(hot["effortLevel"], serde_json::json!("xhigh"));
+        assert_eq!(hot["autoScrollEnabled"], serde_json::json!(false));
+        assert_eq!(hot["showThinkingSummaries"], serde_json::json!(true));
+        assert_eq!(hot["viewMode"], serde_json::json!("focus"));
+        assert_eq!(hot["awaySummaryEnabled"], serde_json::json!(false));
+        assert_eq!(hot["sandbox"]["enabled"], serde_json::json!(true));
+
+        // Now everything back to default. Every key must still be *present*,
+        // carrying either its neutral value or a null the entrypoint deletes.
+        let cold = settings_json(Some(&ClaudeCodeSettings::default()), false);
+        for key in MANAGED_SETTINGS_KEYS {
+            assert!(
+                cold.get(*key).is_some(),
+                "{} is missing when the setting is off, so a stale on-value survives the merge",
+                key
+            );
+        }
+        assert_eq!(cold["tui"], serde_json::Value::Null);
+        assert_eq!(cold["effortLevel"], serde_json::Value::Null);
+        assert_eq!(cold["autoScrollEnabled"], serde_json::json!(true));
+        assert_eq!(cold["showThinkingSummaries"], serde_json::json!(false));
+        assert_eq!(cold["viewMode"], serde_json::Value::Null);
+        assert_eq!(cold["awaySummaryEnabled"], serde_json::Value::Null);
+        assert_eq!(cold["sandbox"]["enabled"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn no_settings_struct_at_all_still_asserts_every_key() {
+        // "This project has no Claude Code settings" is not "say nothing" —
+        // the file on the config volume may still hold a previous project
+        // configuration's values.
+        let cold = settings_json(None, false);
+        for key in MANAGED_SETTINGS_KEYS {
+            assert!(cold.get(*key).is_some(), "{} is missing with no settings struct", key);
+        }
+    }
+
+    #[test]
+    fn the_settings_payload_uses_the_key_names_claude_code_actually_reads() {
+        let s = ClaudeCodeSettings {
+            effort: Some("high".to_string()),
+            focus_mode: true,
+            ..Default::default()
+        };
+        let json = settings_json(Some(&s), false);
+        // `effort` and `focusMode` were both invented; Claude Code reads
+        // `effortLevel` and `viewMode`.
+        assert!(json.get("effort").is_none(), "`effort` is not a Claude Code setting");
+        assert!(json.get("focusMode").is_none(), "`focusMode` is not a Claude Code setting");
+        assert_eq!(json["effortLevel"], serde_json::json!("high"));
+        assert_eq!(json["viewMode"], serde_json::json!("focus"));
+    }
+
+    #[test]
+    fn tui_can_be_pinned_to_the_classic_renderer_as_well_as_left_automatic() {
+        // Three distinct states; "automatic" is not "classic".
+        let auto = settings_json(Some(&ClaudeCodeSettings::default()), false);
+        assert_eq!(auto["tui"], serde_json::Value::Null);
+
+        let classic = settings_json(
+            Some(&ClaudeCodeSettings {
+                tui_mode: Some("default".to_string()),
+                ..Default::default()
+            }),
+            false,
+        );
+        assert_eq!(classic["tui"], serde_json::json!("default"));
+    }
+
+    #[test]
+    fn a_project_that_never_touched_session_recap_leaves_it_alone() {
+        // Claude Code's recap is on by default, so the zero value of the field
+        // has to be "don't interfere". Getting this backwards would have
+        // silently disabled recaps for every existing project.
+        let untouched = ClaudeCodeSettings::default();
+        assert!(!untouched.session_recap_disabled);
+        assert_eq!(
+            settings_json(Some(&untouched), false)["awaySummaryEnabled"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn a_disabled_setting_changes_the_recreation_fingerprint() {
+        // `container_needs_recreation` is label-based and never diffs env, so
+        // the settings only reach a container if the fingerprint moves.
+        let on = ClaudeCodeSettings {
+            focus_mode: true,
+            ..Default::default()
+        };
+        let off = ClaudeCodeSettings::default();
+        assert_ne!(
+            compute_claude_code_settings_fingerprint(Some(&on), false),
+            compute_claude_code_settings_fingerprint(Some(&off), false),
+        );
+        let recap_off = ClaudeCodeSettings {
+            session_recap_disabled: true,
+            ..Default::default()
+        };
+        assert_ne!(
+            compute_claude_code_settings_fingerprint(Some(&recap_off), false),
+            compute_claude_code_settings_fingerprint(Some(&off), false),
+        );
+    }
+
+    #[test]
+    fn the_claude_code_env_vars_are_reserved_from_custom_env() {
+        for key in [
+            "CLAUDE_CODE_NO_FLICKER",
+            "CLAUDE_CODE_ENABLE_AWAY_SUMMARY",
+            "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB",
+            "ENABLE_PROMPT_CACHING_1H",
+        ] {
+            assert!(is_reserved_env_key(key), "{} must not be hand-settable", key);
+            assert!(is_reserved_env_key(&key.to_lowercase()));
+        }
+    }
+
+    #[test]
+    fn every_claude_code_env_var_is_emitted_on_every_create() {
+        // `docker commit` bakes env into the snapshot image, so a name that
+        // goes missing when its setting is off keeps whatever the image
+        // carries. All four must appear whatever the settings say.
+        for settings in [None, Some(&ClaudeCodeSettings::default())] {
+            let emitted = claude_code_env_vars(settings);
+            let names: Vec<&str> = emitted
+                .iter()
+                .map(|entry| entry.split_once('=').expect("every entry is KEY=VALUE").0)
+                .collect();
+            for expected in [
+                "CLAUDE_CODE_NO_FLICKER",
+                "CLAUDE_CODE_ENABLE_AWAY_SUMMARY",
+                "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB",
+                "ENABLE_PROMPT_CACHING_1H",
+            ] {
+                assert!(names.contains(&expected), "{} was not emitted", expected);
+            }
+        }
+    }
+
+    #[test]
+    fn the_neutral_state_of_the_overriding_env_vars_is_empty_not_zero() {
+        // Both of these outrank a setting the user can change from inside the
+        // container, so their "off" has to be silence, not an instruction.
+        let vars = claude_code_env_vars(Some(&ClaudeCodeSettings::default()));
+        assert!(vars.contains(&"CLAUDE_CODE_NO_FLICKER=".to_string()));
+        assert!(vars.contains(&"CLAUDE_CODE_ENABLE_AWAY_SUMMARY=".to_string()));
+        // These two have no documented meaning for `0`, so it is safe to say.
+        assert!(vars.contains(&"CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=0".to_string()));
+        assert!(vars.contains(&"ENABLE_PROMPT_CACHING_1H=0".to_string()));
+    }
+
+    #[test]
+    fn turning_the_session_recap_off_actually_forces_it_off() {
+        // The whole point of B3: `=1` when enabled was a no-op against a
+        // feature that was already on, and there was no off path at all.
+        let off = ClaudeCodeSettings {
+            session_recap_disabled: true,
+            ..Default::default()
+        };
+        assert!(claude_code_env_vars(Some(&off))
+            .contains(&"CLAUDE_CODE_ENABLE_AWAY_SUMMARY=0".to_string()));
+    }
+
+    #[test]
+    fn the_tui_choice_reaches_the_env_var_that_outranks_the_setting() {
+        let fullscreen = ClaudeCodeSettings {
+            tui_mode: Some("fullscreen".to_string()),
+            ..Default::default()
+        };
+        assert!(claude_code_env_vars(Some(&fullscreen))
+            .contains(&"CLAUDE_CODE_NO_FLICKER=1".to_string()));
+
+        let classic = ClaudeCodeSettings {
+            tui_mode: Some("default".to_string()),
+            ..Default::default()
+        };
+        assert!(claude_code_env_vars(Some(&classic))
+            .contains(&"CLAUDE_CODE_NO_FLICKER=0".to_string()));
     }
 }

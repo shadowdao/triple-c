@@ -86,24 +86,42 @@ impl PermissionMode {
 /// These map to Claude Code env vars and ~/.claude/settings.json entries.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct ClaudeCodeSettings {
-    /// TUI rendering mode: None = default, Some("fullscreen") = flicker-free alt-screen
+    /// TUI renderer. `None` leaves settings.json's `tui` key unset, which is
+    /// what lets Claude Code pick the renderer itself; `Some("default")` pins
+    /// the classic main-screen renderer and `Some("fullscreen")` the alt-screen
+    /// one. All three are distinct — "let it choose" is not "classic".
     #[serde(default)]
     pub tui_mode: Option<String>,
-    /// Effort level: None = default, Some("low"|"medium"|"high")
+    /// Saved `/effort` level: `None` = unset, otherwise one of
+    /// `"low" | "medium" | "high" | "xhigh"`. Written to settings.json as
+    /// `effortLevel` (**not** `effort`, which Claude Code has never read).
     #[serde(default)]
     pub effort: Option<String>,
-    /// Disable auto-scroll in fullscreen TUI mode
+    /// Disable auto-scroll in fullscreen TUI mode. Held in the *disabled* sense
+    /// because Claude Code's `autoScrollEnabled` defaults to `true`, so the
+    /// zero value of this field has to mean "leave it on".
     #[serde(default)]
     pub auto_scroll_disabled: bool,
-    /// Enable focus mode (collapsed tool output)
+    /// Collapse tool output to one-line summaries. Written to settings.json as
+    /// `viewMode: "focus"`; there is no `focusMode` key in Claude Code.
     #[serde(default)]
     pub focus_mode: bool,
     /// Show thinking summaries in responses
     #[serde(default)]
     pub show_thinking_summaries: bool,
-    /// Enable session recap when returning to a session
+    /// Turn the session recap **off**.
+    ///
+    /// Held in the disabled sense for the same reason as `auto_scroll_disabled`,
+    /// and the rename from the old `enable_session_recap` is load-bearing rather
+    /// than cosmetic. Claude Code's recap is on by default, so the old field was
+    /// inverted: switching it on was a no-op and switching it off did nothing at
+    /// all. Reusing the name with the opposite meaning would have read every
+    /// stored `enable_session_recap: false` — which is what every project that
+    /// never touched the control holds — as "the user turned the recap off" and
+    /// silently disabled it for all of them. A new name lets the old key be
+    /// ignored, which lands every existing project on the correct default.
     #[serde(default)]
-    pub enable_session_recap: bool,
+    pub session_recap_disabled: bool,
     /// Strip credentials from subprocess environments
     #[serde(default)]
     pub env_scrub: bool,

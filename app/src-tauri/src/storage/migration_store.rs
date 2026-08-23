@@ -49,6 +49,16 @@ fn sanitize(project_id: &str) -> String {
 /// Read a project's migration state. `Ok(None)` means no migration is in
 /// flight; an unparseable file is treated the same way (and logged) rather than
 /// blocking every future migration on a corrupt record.
+///
+/// **A corrupt record is moved aside, not merely ignored.** Reporting "absent"
+/// while leaving the file in place strands the rollback pin it describes: the
+/// `:pre-migration-*` tag holding a 4–12 GB image stays on disk, no code path
+/// can find it again (every one of them starts here and is told there is no
+/// migration), and the leftover file goes on making the project look like it
+/// has a migration in flight to anything that checks for the file rather than
+/// parsing it — including [`has_record`], which the pin reaper relies on.
+/// Renaming to `.bak` follows the same convention as `projects.json`: the
+/// user's bytes are kept, but they stop pinning gigabytes.
 pub fn load(project_id: &str) -> Result<Option<MigrationState>, String> {
     let path = state_path(project_id)?;
     if !path.exists() {
@@ -59,14 +69,32 @@ pub fn load(project_id: &str) -> Result<Option<MigrationState>, String> {
     match serde_json::from_str::<MigrationState>(&data) {
         Ok(state) => Ok(Some(state)),
         Err(e) => {
+            let backup = path.with_extension("json.bak");
+            let moved = fs::rename(&path, &backup);
             log::error!(
-                "Failed to parse migration state for project {}: {} — treating as absent",
+                "Failed to parse migration state for project {}: {} — treating as absent{}",
                 project_id,
-                e
+                e,
+                match moved {
+                    Ok(()) => format!(" and moved the record to {}", backup.display()),
+                    Err(ref e) => format!(" (could not move the record aside: {})", e),
+                }
             );
             Ok(None)
         }
     }
+}
+
+/// Whether a project has a migration record on disk *at all*, without parsing
+/// it.
+///
+/// The pin reaper needs "is this project's rollback image still somebody's only
+/// copy?" and must answer it conservatively. [`load`] cannot be used for that
+/// question on its own — it deliberately reports a corrupt record as absent —
+/// so this asks the filesystem instead. `load` moving a corrupt record aside is
+/// what keeps the two answers from disagreeing forever.
+pub fn has_record(project_id: &str) -> Result<bool, String> {
+    Ok(state_path(project_id)?.exists())
 }
 
 /// Atomically write a project's migration state.

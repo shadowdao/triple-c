@@ -505,7 +505,7 @@ Triple-C includes optional speech-to-text powered by [Faster Whisper](https://gi
 | `app/src/components/projects/home/OpenPageDialog.tsx` | Open a URL in the container's browser at a chosen viewport |
 | `app/src/components/projects/home/ContainerMigrationBanner.tsx` | Base-image staleness banner, migration progress, resume/rollback |
 | `app/src/components/projects/home/CapabilityTiles.tsx` | Read-only skills/agents/commands/hooks/plugins/MCP counts |
-| `app/src/components/projects/ClaudeCodeSettingsEditor.tsx` | Claude Code CLI settings (TUI mode, effort, focus, caching) |
+| `app/src/components/projects/ClaudeCodeSettingsEditor.tsx` | Claude Code CLI settings → `tui`, `effortLevel`, `viewMode`, `autoScrollEnabled`, `showThinkingSummaries`, `awaySummaryEnabled`, plus the env-var flags (scrub, 1h caching). Every managed key is re-emitted on each start, `null` meaning "delete". |
 
 ### Frontend — settings, terminal and hooks
 

@@ -26,20 +26,35 @@ scheduler, and the fleet view across many projects.
 
 ## Current coverage (v0.3.0)
 
-Triple-C sets exactly five `settings.json` keys, plus a sandbox block:
+Triple-C sets exactly six `settings.json` keys, plus a sandbox block:
 
 | Key | Surfaced as |
 |---|---|
-| `tui` | TUI Mode select (`fullscreen`) |
-| `effort` | Effort Level select (`low`/`medium`/`high`) |
-| `autoScrollEnabled` | Auto-Scroll Disabled toggle |
-| `focusMode` | Focus Mode toggle |
-| `showThinkingSummaries` | Thinking Summaries toggle |
+| `tui` | TUI mode select — unset (Claude Code chooses), `default` (classic renderer), `fullscreen` (flicker-free alt-screen). Three distinct states, not two. |
+| `effortLevel` | Effort level select (`low`/`medium`/`high`/`xhigh`) |
+| `viewMode` | Focus mode toggle, written as `"focus"`. Unset means the user's own `verbose` setting and sticky `/focus` choice still apply. |
+| `autoScrollEnabled` | Auto-scroll toggle. Claude Code's default is `true`, so it is the *off* state that writes `false`. |
+| `showThinkingSummaries` | Thinking summaries toggle (Claude Code default `false`) |
+| `awaySummaryEnabled` | Session recap toggle. Claude Code's recap is **on** by default, so again it is the off state that writes `false`. |
 | `sandbox.*` | Sandbox toggle (`enabled`, `enableWeakerNestedSandbox`, `allowUnsandboxedCommands`) |
+
+Every one of those keys is emitted on **every** start, with a JSON `null` standing for
+"delete this key". `~/.claude/settings.json` sits on the config volume and the entrypoint
+merges into it, so a key merely omitted when its control goes off left the previous
+on-value in place forever.
 
 Plus four env feature flags — `CLAUDE_CODE_NO_FLICKER`, `CLAUDE_CODE_ENABLE_AWAY_SUMMARY`,
 `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB`, `ENABLE_PROMPT_CACHING_1H` — and arbitrary user-set
-`CLAUDE_CODE_*` vars via the Env Vars modal.
+`CLAUDE_CODE_*` vars via the Env Vars modal. The four are written on every container
+create *including* their off value, because `docker commit` bakes a container's env into
+the snapshot image: a value written once would otherwise ride that snapshot into every
+future container. That also makes them Triple-C's to own, so all four are reserved names
+— hand-setting one in the Env Vars modal is skipped with a warning, the same as any other
+`triple-c.*`-managed variable. `CLAUDE_CODE_ENABLE_AWAY_SUMMARY` is what actually enforces
+the recap choice — it takes precedence over `awaySummaryEnabled` *and* over the
+in-container `/config` toggle, so turning the control off sends `0` while leaving it on
+sends an empty value rather than `1`: Triple-C's default must not overrule a `/config`
+choice it never asked about.
 
 Also covered: per-project auth backends (Anthropic OAuth, Bedrock incl. SSO refresh,
 Ollama, OpenAI-compatible), user-level `CLAUDE.md` composition, `claude update` on every
