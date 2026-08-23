@@ -317,10 +317,16 @@ export const submitClaudeTokenCode = (code: string) =>
 /** Abort an in-flight acquisition and release the single-flight guard. No-op if nothing is running. */
 export const cancelClaudeToken = () => invoke<void>("cancel_claude_token");
 export const hasClaudeToken = () => invoke<boolean>("has_claude_token");
-/** Revoke the shared token. Also rewrites any snapshot image that still has it
- *  baked into its env — see `ClearTokenOutcome` for what may be left behind. */
+/** Revoke the shared token: delete the keychain entry **first**, then rewrite
+ *  any snapshot image that still has it baked into its env — see
+ *  `ClearTokenOutcome` for what may be left behind. Destructive; confirm it. */
 export const clearClaudeToken = () =>
   invoke<ClearTokenOutcome>("clear_claude_token");
+/** Rewrite snapshot images that still carry a credential, **without touching
+ *  the keychain**. This is the retry behind an incomplete revocation, and the
+ *  standalone "check my images" sweep; it never deletes a token. */
+export const sweepClaudeTokenSnapshots = () =>
+  invoke<ClearTokenOutcome>("sweep_claude_token_snapshots");
 
 // Container base-image migration — move a project onto the current base image
 // without deleting its volumes. Reset is the destructive alternative: it wipes

@@ -6,12 +6,36 @@ import type { ClearTokenOutcome, Project } from "../../lib/types";
 
 const hasClaudeToken = vi.fn();
 const clearClaudeToken = vi.fn();
+const sweepClaudeTokenSnapshots = vi.fn();
 
 vi.mock("../../lib/tauri-commands", () => ({
   hasClaudeToken: () => hasClaudeToken(),
   clearClaudeToken: () => clearClaudeToken(),
+  sweepClaudeTokenSnapshots: () => sweepClaudeTokenSnapshots(),
   acquireClaudeToken: vi.fn(),
   submitClaudeTokenCode: vi.fn(),
+}));
+
+// Stood in for so a sign-in can be *completed* in a test. The panel's reaction
+// to `onAuthenticated` is the subject of the H1 sequence below, and driving the
+// real acquisition dialog to get there would test the dialog instead.
+vi.mock("./ClaudeAuthModal", () => ({
+  default: ({
+    onAuthenticated,
+    onClose,
+  }: {
+    onAuthenticated: () => void;
+    onClose: () => void;
+  }) => (
+    <button
+      onClick={() => {
+        onAuthenticated();
+        onClose();
+      }}
+    >
+      finish sign-in
+    </button>
+  ),
 }));
 
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => vi.fn()) }));
@@ -59,11 +83,22 @@ const running = (over: Partial<Project> = {}): Project => ({
   ...over,
 });
 
+/** A `ClearTokenOutcome` with nothing left behind, plus any overrides. */
+const outcome = (over: Partial<ClearTokenOutcome> = {}): ClearTokenOutcome => ({
+  snapshots_scrubbed: [],
+  snapshots_failed: [],
+  snapshots_skipped: [],
+  snapshots_superseded: [],
+  docker_unavailable: null,
+  ...over,
+});
+
 describe("SharedAuthSettings", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     projects = [];
     hasClaudeToken.mockResolvedValue(false);
+    sweepClaudeTokenSnapshots.mockResolvedValue(outcome());
     useAppState.setState({ toasts: [] });
   });
 
@@ -251,19 +286,17 @@ describe("SharedAuthSettings", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Revoke token" }));
     const retry = await screen.findByTestId("shared-auth-retry");
 
-    clearClaudeToken.mockResolvedValueOnce({
-      snapshots_scrubbed: ["triple-c-snapshot-p1:latest"],
-      snapshots_failed: [],
-      snapshots_skipped: [],
-      snapshots_superseded: [],
-      docker_unavailable: null,
-    });
+    sweepClaudeTokenSnapshots.mockResolvedValueOnce(
+      outcome({ snapshots_scrubbed: ["triple-c-snapshot-p1:latest"] }),
+    );
     fireEvent.click(retry);
 
     await waitFor(() =>
       expect(screen.queryByTestId("shared-auth-leftover")).not.toBeInTheDocument(),
     );
-    expect(clearClaudeToken).toHaveBeenCalledTimes(2);
+    // One revoke, one sweep — the retry must not be a second revoke.
+    expect(clearClaudeToken).toHaveBeenCalledTimes(1);
+    expect(sweepClaudeTokenSnapshots).toHaveBeenCalledTimes(1);
     const toast = useAppState.getState().toasts.at(-1)!;
     expect(toast.kind).toBe("success");
     expect(toast.message).toMatch(/cleared from 1 snapshot image/i);
@@ -274,20 +307,14 @@ describe("SharedAuthSettings", () => {
     // anything is in the keychain today, so the sweep cannot be gated on it.
     projects = [running()];
     hasClaudeToken.mockResolvedValue(false);
-    clearClaudeToken.mockResolvedValue({
-      snapshots_scrubbed: [],
-      snapshots_failed: [],
-      snapshots_skipped: [],
-      snapshots_superseded: [],
-      docker_unavailable: null,
-    });
     render(<SharedAuthSettings />);
 
     const sweep = await screen.findByTestId("shared-auth-sweep");
     expect(screen.queryByRole("button", { name: "Revoke" })).not.toBeInTheDocument();
     fireEvent.click(sweep);
 
-    await waitFor(() => expect(clearClaudeToken).toHaveBeenCalled());
+    await waitFor(() => expect(sweepClaudeTokenSnapshots).toHaveBeenCalled());
+    expect(clearClaudeToken).not.toHaveBeenCalled();
     const toast = useAppState.getState().toasts.at(-1)!;
     expect(toast.kind).toBe("success");
     expect(toast.message).toBe("No snapshot image is holding the token.");
@@ -299,5 +326,117 @@ describe("SharedAuthSettings", () => {
     const toast = await revoke({ snapshots_scrubbed: ["triple-c-snapshot-p1:latest"] });
     expect(toast.kind).toBe("success");
     expect(screen.queryByTestId("shared-auth-leftover")).not.toBeInTheDocument();
+  });
+
+  // ── The retry must not be a revoke in disguise ───────────────────────────
+  // The sequence that shipped green: revoke, get a skipped image, re-authenticate
+  // from the button directly above the warning, then press the retry the warning
+  // is still offering. One command was behind both, so that press deleted the
+  // token acquired seconds earlier — no confirmation, and a toast that mentioned
+  // only images. The deliberate Revoke needs a modal; this needed nothing.
+
+  it("does not leave a stale cleanup panel over a freshly acquired token", async () => {
+    projects = [running()];
+    // Stored when the panel mounts, gone after the revoke, stored again once
+    // the sign-in finishes.
+    hasClaudeToken
+      .mockResolvedValueOnce(true)
+      .mockResolvedValueOnce(false)
+      .mockResolvedValue(true);
+    clearClaudeToken.mockResolvedValue(
+      outcome({ snapshots_skipped: ["triple-c-snapshot-p1:latest: busy"] }),
+    );
+    render(<SharedAuthSettings />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke token" }));
+    await screen.findByTestId("shared-auth-leftover");
+
+    // Re-authenticate from the button above the warning.
+    fireEvent.click(await screen.findByRole("button", { name: "Authenticate" }));
+    fireEvent.click(await screen.findByRole("button", { name: "finish sign-in" }));
+
+    await screen.findByRole("button", { name: "Revoke" });
+    expect(screen.queryByTestId("shared-auth-leftover")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("shared-auth-retry")).not.toBeInTheDocument();
+
+    // The images can still be cleaned up — and doing so does not spend the new
+    // token.
+    fireEvent.click(screen.getByTestId("shared-auth-sweep"));
+    await waitFor(() => expect(sweepClaudeTokenSnapshots).toHaveBeenCalled());
+    expect(clearClaudeToken).toHaveBeenCalledTimes(1);
+  });
+
+  it("sends the retry to the sweep-only command, never to the revoke", async () => {
+    projects = [running()];
+    hasClaudeToken.mockResolvedValueOnce(true).mockResolvedValue(false);
+    clearClaudeToken.mockResolvedValue(
+      outcome({ snapshots_skipped: ["triple-c-snapshot-p1:latest: busy"] }),
+    );
+    sweepClaudeTokenSnapshots.mockResolvedValue(
+      outcome({ snapshots_skipped: ["triple-c-snapshot-p1:latest: busy"] }),
+    );
+    render(<SharedAuthSettings />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke token" }));
+    const retry = await screen.findByTestId("shared-auth-retry");
+
+    fireEvent.click(retry);
+    await waitFor(() => expect(sweepClaudeTokenSnapshots).toHaveBeenCalledTimes(1));
+    fireEvent.click(await screen.findByTestId("shared-auth-retry"));
+    await waitFor(() => expect(sweepClaudeTokenSnapshots).toHaveBeenCalledTimes(2));
+
+    // However many times it is pressed, the keychain is touched exactly once —
+    // by the revoke the user confirmed.
+    expect(clearClaudeToken).toHaveBeenCalledTimes(1);
+    // …and a retry that still finds a busy project says so without ever
+    // claiming a token was removed.
+    const toast = useAppState.getState().toasts.at(-1)!;
+    expect(toast.message).not.toMatch(/keychain/i);
+  });
+
+  it("will not start a sign-in while a cleanup is still running", async () => {
+    // A sweep is a per-image inspect/create/commit/rmi over the Docker socket
+    // and runs for minutes. Acquiring a token inside that window races the
+    // rewrite that is meant to be removing one.
+    projects = [running()];
+    hasClaudeToken.mockResolvedValue(false);
+    sweepClaudeTokenSnapshots.mockReturnValue(new Promise(() => {}));
+    render(<SharedAuthSettings />);
+
+    const authenticate = await screen.findByRole("button", { name: "Authenticate" });
+    expect(authenticate).toBeEnabled();
+
+    fireEvent.click(await screen.findByTestId("shared-auth-sweep"));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Authenticate" })).toBeDisabled(),
+    );
+  });
+
+  // ── A keychain that refuses the delete has to leave something to press ───
+
+  it("keeps both remedies on screen when the keychain refuses the delete", async () => {
+    projects = [running()];
+    hasClaudeToken.mockResolvedValue(true);
+    clearClaudeToken.mockRejectedValue("the keychain is locked");
+    render(<SharedAuthSettings />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke token" }));
+
+    await waitFor(() =>
+      expect(useAppState.getState().toasts.length).toBeGreaterThan(0),
+    );
+    const toast = useAppState.getState().toasts[0];
+    expect(toast.kind).toBe("error");
+    expect(toast.detail).toMatch(/still stored/i);
+
+    // The token is still there, so Revoke is still the retry for it — and the
+    // images, which the failed delete says nothing about, have their own sweep.
+    await screen.findByRole("button", { name: "Revoke" });
+    const sweep = screen.getByTestId("shared-auth-sweep");
+    fireEvent.click(sweep);
+    await waitFor(() => expect(sweepClaudeTokenSnapshots).toHaveBeenCalled());
   });
 });
