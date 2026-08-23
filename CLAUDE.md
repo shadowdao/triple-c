@@ -79,6 +79,22 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
 - **`components/projects/home/`** — **Project Home**, the main-area view for a project:
   Overview / Sessions / Automation / Config / Files. Per-project configuration lives here, not in
   modals — see "UI conventions" below.
+  - **Files moves in both directions and neither direction uses HTML5 drag.** Dropping *into*
+    the pane is Tauri's native `onDragDropEvent`, which is window-wide and therefore routed by
+    a hit-test of the physical-pixel payload position against the pane's rect ÷
+    `devicePixelRatio` — a hidden pane has a zero-size rect, which is what stops it and
+    `TerminalView`'s listener both firing. Dragging *out* is pointer events into
+    `tauri-plugin-drag`, for the same `dragDropEnabled` reason the tab strip is pointer-driven.
+  - **A drag-out is a copy first and a drag second.** The OS can only drag a path that exists
+    on the host, and these files are inside a container, so `stage_container_file_for_drag`
+    materialises one into `<os-temp>/triple-c-drag-out/<session>/` (via the shared
+    `fetch_container_file`, keeping the original filename, capped at the same 256 MiB as an
+    upload) and `startDrag` is handed *that*. Two consequences worth keeping: the copy is an
+    async gap inside a gesture that feels instantaneous, so the staged path is cached and the
+    UI says "drag it again" when the pointer came up first; and the staging directory is
+    cleared on exit **and** reaped at startup, because a drag-out quietly filling the host temp
+    dir with whole files would be the disk problem this project just fixed, in a new place.
+    "Save to host…" stays — `startDrag` is an enhancement and can fail per platform.
 - **`components/settings/`** — Host-level settings: Docker, AWS, Web Terminal, STT, shared auth
 - **`components/ui/`** — Shared primitives. **Use these; do not hand-roll replacements.**
   `Modal` (the only correct way to build a dialog — it supplies `role="dialog"`, `aria-modal`,

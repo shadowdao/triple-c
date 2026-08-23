@@ -84,6 +84,13 @@ export const renameContainerPath = (projectId: string, fromPath: string, toPath:
   invoke<string>("rename_container_path", { projectId, fromPath, toPath });
 export const createContainerDirectory = (projectId: string, parentPath: string, name: string) =>
   invoke<string>("create_container_directory", { projectId, parentPath, name });
+/**
+ * Copy a container file into an app-owned host temp directory and return the
+ * absolute host path. The OS can only drag a file that exists on the host, so
+ * this is the first half of every drag-out.
+ */
+export const stageContainerFileForDrag = (projectId: string, path: string) =>
+  invoke<string>("stage_container_file_for_drag", { projectId, path });
 
 // Updates
 export const getAppVersion = () => invoke<string>("get_app_version");

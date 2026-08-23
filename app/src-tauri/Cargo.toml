@@ -37,6 +37,7 @@ tower-http = { version = "0.6", features = ["cors"] }
 base64 = "0.22"
 rand = "0.9"
 local-ip-address = "0.6"
+tauri-plugin-drag = "2.1"
 
 [dev-dependencies]
 # `test-util` (not part of tokio's `full`) lets the auto-start retry tests run

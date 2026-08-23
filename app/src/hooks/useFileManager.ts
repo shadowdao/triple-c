@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useRef } from "react";
 import { save, open as openDialog } from "@tauri-apps/plugin-dialog";
 import type { FileEntry } from "../lib/types";
 import * as commands from "../lib/tauri-commands";
@@ -83,6 +83,44 @@ export function useFileManager(projectId: string) {
     [projectId, currentPath, navigate],
   );
 
+  /**
+   * Host paths already copied out this session, keyed by the entry they came
+   * from. Size and mtime are in the key, so an entry that changed since the
+   * last listing re-stages rather than dragging a stale copy.
+   */
+  const stagedRef = useRef(new Map<string, string>());
+
+  /**
+   * Copy an entry onto the host so the OS can drag it, and return the absolute
+   * host path — or `null`, having set `error`, if it could not be staged.
+   *
+   * `cached` is what the caller needs to tell a gesture that will feel
+   * instantaneous from one that has a whole-file copy in front of it: the copy
+   * is the slow half of a drag-out, and the OS only picks a drag up while the
+   * button is still down.
+   */
+  const stageForDrag = useCallback(
+    async (entry: FileEntry): Promise<{ hostPath: string; cached: boolean } | null> => {
+      const key = `${entry.path}|${entry.size}|${entry.modified}`;
+      const cached = stagedRef.current.get(key);
+      if (cached) return { hostPath: cached, cached: true };
+
+      setError(null);
+      setBusy(`Preparing "${entry.name}"…`);
+      try {
+        const hostPath = await commands.stageContainerFileForDrag(projectId, entry.path);
+        stagedRef.current.set(key, hostPath);
+        return { hostPath, cached: false };
+      } catch (e) {
+        setError(String(e));
+        return null;
+      } finally {
+        setBusy(null);
+      }
+    },
+    [projectId],
+  );
+
   const uploadFile = useCallback(async () => {
     try {
       const selected = await openDialog({ multiple: true, directory: false });
@@ -145,6 +183,7 @@ export function useFileManager(projectId: string) {
     downloadFile,
     uploadFile,
     uploadPaths,
+    stageForDrag,
     renameEntry,
     createFolder,
   };

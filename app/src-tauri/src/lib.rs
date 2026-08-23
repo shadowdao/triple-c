@@ -215,6 +215,11 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        // Drag a file from the Files tab onto the host desktop. The gesture is
+        // pointer-driven for the same reason the tab drag is (see MainTabs):
+        // `dragDropEnabled` is on for the terminal's sake and blocks HTML5 drag
+        // inside the webview, so this plugin's native drag is the only route out.
+        .plugin(tauri_plugin_drag::init())
         .manage(AppState {
             projects_store,
             settings_store,
@@ -250,13 +255,22 @@ pub fn run() {
             // an image open and the sweep will not force; pins are untagged
             // second so the images they were holding are dangling by the time
             // the sweep lists them; the sweep runs last and collects both.
-            tauri::async_runtime::spawn(async {
+            //
+            // Drag-out staging is swept here too, and it is the *other* half of
+            // a lifecycle whose first half is the exit cleanup below: a run that
+            // crashed never got to clear its staged copies, and those are whole
+            // files, not metadata.
+            let drag_temp_dir = app.path().temp_dir().ok();
+            tauri::async_runtime::spawn(async move {
                 crate::docker::reap_probe_containers().await;
                 let reaped = crate::docker::reap_stale_migration_pins().await;
                 if reaped > 0 {
                     log::info!("Startup housekeeping dropped {} stale rollback pin(s)", reaped);
                 }
                 crate::docker::sweep_orphaned_snapshots_logged("startup").await;
+                if let Some(temp_dir) = drag_temp_dir {
+                    commands::file_commands::reap_drag_staging(temp_dir).await;
+                }
             });
 
             // Auto-start web terminal server if enabled in settings
@@ -383,6 +397,10 @@ pub fn run() {
                 let _ = window.emit("app-shutting-down", ());
 
                 let app_handle = window.app_handle().clone();
+                // Resolved here rather than inside the teardown, which is
+                // already under a wall-clock budget and should not spend any of
+                // it asking where the temp dir is.
+                let drag_temp_dir = app_handle.path().temp_dir().ok();
                 tauri::async_runtime::spawn(async move {
                     let teardown = async {
                         // First: let the auto-starts unwind. Anything they are
@@ -409,10 +427,20 @@ pub fn run() {
                                 log::warn!("Failed to stop the model gateway on exit: {}", e);
                             }
                         };
+                        // Whole files copied out of containers for drag-out.
+                        // Left behind they are a disk leak with a gesture
+                        // attached; startup housekeeping is the backstop for a
+                        // run that never reaches this point.
+                        let clear_drag_staging = async {
+                            if let Some(temp_dir) = drag_temp_dir {
+                                commands::file_commands::clear_drag_staging(temp_dir).await;
+                            }
+                        };
                         tokio::join!(
                             web_terminal,
                             stop_stt,
                             stop_gateway,
+                            clear_drag_staging,
                             exec_manager.close_all_sessions(),
                             auth_bridge.stop_all(),
                             browser_view::manager().stop_all(),
@@ -502,6 +530,7 @@ pub fn run() {
             commands::file_commands::read_container_file,
             commands::file_commands::rename_container_path,
             commands::file_commands::create_container_directory,
+            commands::file_commands::stage_container_file_for_drag,
             // AWS
             commands::aws_commands::aws_sso_refresh,
             // Updates
