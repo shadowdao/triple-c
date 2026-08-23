@@ -16,29 +16,100 @@ pub(crate) fn emit_progress(app_handle: &tauri::AppHandle, project_id: &str, mes
     );
 }
 
-/// Extract secret fields from a project and store them in the OS keychain.
-fn store_secrets_for_project(project: &Project) -> Result<(), String> {
-    if let Some(ref token) = project.git_token {
-        secure::store_project_secret(&project.id, "git-token", token)?;
+/// Every project secret, as the JSON pointer it arrives under and the keychain
+/// key it is stored as.
+///
+/// The keychain keys are the ones already in users' keychains — changing one
+/// orphans the secret rather than migrating it.
+const PROJECT_SECRET_FIELDS: &[(&str, &str)] = &[
+    ("/git_token", "git-token"),
+    ("/bedrock_config/aws_access_key_id", "aws-access-key-id"),
+    ("/bedrock_config/aws_secret_access_key", "aws-secret-access-key"),
+    ("/bedrock_config/aws_session_token", "aws-session-token"),
+    ("/bedrock_config/aws_bearer_token", "aws-bearer-token"),
+    ("/openai_compatible_config/api_key", "openai-compatible-api-key"),
+];
+
+/// The keychain keys the caller sent an explicit `null` for.
+///
+/// **Absent and `null` are different things here, and treating them alike
+/// destroys credentials.** Every secret field is `#[serde(skip_serializing)]`,
+/// so the `Project` the frontend holds has no `git_token` key at all — a save
+/// from the Workspace, Runtime or Model section spreads that object and sends
+/// the field *absent*, while the editor that owns the field sends
+/// `git_token: null` when the user blanks it (`AccessSection.tsx`:
+/// `save({ git_token: gitToken || null })`). Serde maps both to `None`, which
+/// is why this reads the payload rather than the deserialised struct: absent
+/// means "not mine to touch", `null` means "the user emptied it".
+fn explicitly_cleared_secrets(payload: &serde_json::Value) -> Vec<&'static str> {
+    PROJECT_SECRET_FIELDS
+        .iter()
+        .filter(|(pointer, _)| matches!(payload.pointer(pointer), Some(serde_json::Value::Null)))
+        .map(|(_, key)| *key)
+        .collect()
+}
+
+/// Store one secret, clear it, or leave it alone — see
+/// [`explicitly_cleared_secrets`] for which is which.
+fn save_secret(
+    project_id: &str,
+    key_name: &str,
+    value: Option<&str>,
+    explicitly_cleared: &[&str],
+) -> Result<(), String> {
+    if value.is_none() && !explicitly_cleared.contains(&key_name) {
+        return Ok(());
     }
+    secure::store_or_clear_project_secret(project_id, key_name, value)
+}
+
+/// Extract secret fields from a project and store them in the OS keychain,
+/// **deleting the ones the caller blanked**.
+///
+/// The `if let Some(v) = …` this replaces could only ever write: a blanked
+/// token left the old value in the keychain, `load_secrets_for_project` read it
+/// straight back onto the project, and the container went on getting the
+/// credential the user had just revoked.
+fn store_secrets_for_project(project: &Project, explicitly_cleared: &[&str]) -> Result<(), String> {
+    save_secret(
+        &project.id,
+        "git-token",
+        project.git_token.as_deref(),
+        explicitly_cleared,
+    )?;
     if let Some(ref bedrock) = project.bedrock_config {
-        if let Some(ref v) = bedrock.aws_access_key_id {
-            secure::store_project_secret(&project.id, "aws-access-key-id", v)?;
-        }
-        if let Some(ref v) = bedrock.aws_secret_access_key {
-            secure::store_project_secret(&project.id, "aws-secret-access-key", v)?;
-        }
-        if let Some(ref v) = bedrock.aws_session_token {
-            secure::store_project_secret(&project.id, "aws-session-token", v)?;
-        }
-        if let Some(ref v) = bedrock.aws_bearer_token {
-            secure::store_project_secret(&project.id, "aws-bearer-token", v)?;
-        }
+        save_secret(
+            &project.id,
+            "aws-access-key-id",
+            bedrock.aws_access_key_id.as_deref(),
+            explicitly_cleared,
+        )?;
+        save_secret(
+            &project.id,
+            "aws-secret-access-key",
+            bedrock.aws_secret_access_key.as_deref(),
+            explicitly_cleared,
+        )?;
+        save_secret(
+            &project.id,
+            "aws-session-token",
+            bedrock.aws_session_token.as_deref(),
+            explicitly_cleared,
+        )?;
+        save_secret(
+            &project.id,
+            "aws-bearer-token",
+            bedrock.aws_bearer_token.as_deref(),
+            explicitly_cleared,
+        )?;
     }
     if let Some(ref oai_config) = project.openai_compatible_config {
-        if let Some(ref v) = oai_config.api_key {
-            secure::store_project_secret(&project.id, "openai-compatible-api-key", v)?;
-        }
+        save_secret(
+            &project.id,
+            "openai-compatible-api-key",
+            oai_config.api_key.as_deref(),
+            explicitly_cleared,
+        )?;
     }
     Ok(())
 }
@@ -207,7 +278,8 @@ pub async fn add_project(
     }
     validate_project_paths(&paths)?;
     let project = Project::new(name, paths);
-    store_secrets_for_project(&project)?;
+    // Nothing can have been blanked on a project that did not exist a line ago.
+    store_secrets_for_project(&project, &[])?;
     state.projects_store.add(project)
 }
 
@@ -273,10 +345,19 @@ pub async fn remove_project(
 
 #[tauri::command]
 pub async fn update_project(
-    mut project: Project,
+    project: serde_json::Value,
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Project, String> {
+    // Taken as raw JSON, then deserialised, for one reason: a secret field that
+    // arrived as `null` is a credential the user cleared, and a secret field
+    // that did not arrive at all belongs to whichever editor is not saving
+    // right now. `Option<String>` cannot tell those apart — see
+    // [`explicitly_cleared_secrets`].
+    let explicitly_cleared = explicitly_cleared_secrets(&project);
+    let mut project: Project = serde_json::from_value(project)
+        .map_err(|e| format!("Could not read the project being saved: {}", e))?;
+
     // **This takes a whole `Project` over IPC and used to store it verbatim.**
     // `add_project` validated its folder list and this did not, so every check
     // there was one edit away from being bypassed — and the Config tab's mount
@@ -310,7 +391,7 @@ pub async fn update_project(
     project.created_at = stored.created_at;
     project.updated_at = chrono::Utc::now().to_rfc3339();
 
-    store_secrets_for_project(&project)?;
+    store_secrets_for_project(&project, &explicitly_cleared)?;
     let updated = state.projects_store.update(project)?;
 
     // `auth_bridge_enabled` can arrive through this generic save as well as
@@ -925,6 +1006,60 @@ mod tests {
         // "+ Add folder" inserts this and the next blur saves the whole list;
         // refusing it would turn an empty row into an error toast.
         assert!(validate_project_paths(&[path("/home/u/a", "a"), path("", "")]).is_ok());
+    }
+
+    /// The distinction the whole secret-clearing path rests on.
+    ///
+    /// Every secret field is `#[serde(skip_serializing)]`, so the project
+    /// object the frontend holds has no `git_token` key — a save from the
+    /// Workspace or Runtime section sends it *absent*, and clearing on absent
+    /// would delete the token every time an unrelated setting was changed. The
+    /// editor that owns the field sends an explicit `null`.
+    #[test]
+    fn a_blanked_secret_is_cleared_and_an_absent_one_is_left_alone() {
+        let blanked = serde_json::json!({
+            "id": "p1",
+            "git_token": null,
+            "bedrock_config": { "aws_bearer_token": null },
+        });
+        let cleared = explicitly_cleared_secrets(&blanked);
+        assert!(cleared.contains(&"git-token"));
+        assert!(cleared.contains(&"aws-bearer-token"));
+        // Present in the same payload, absent from the clear list.
+        assert!(!cleared.contains(&"aws-access-key-id"));
+
+        // What a Workspace-section save looks like: no secret keys at all.
+        let unrelated = serde_json::json!({ "id": "p1", "name": "renamed" });
+        assert!(explicitly_cleared_secrets(&unrelated).is_empty());
+
+        // And a value is neither.
+        let written = serde_json::json!({ "id": "p1", "git_token": "ghp_xxx" });
+        assert!(explicitly_cleared_secrets(&written).is_empty());
+    }
+
+    #[test]
+    fn every_secret_field_can_be_cleared() {
+        // A field the frontend can blank but this list does not name is a
+        // credential that cannot be revoked through the UI, which is the bug
+        // this exists to close. The keychain keys must match the ones
+        // `load_secrets_for_project` reads back, or a save writes one name and
+        // the container is handed another.
+        for (pointer, key) in PROJECT_SECRET_FIELDS {
+            let field = pointer.rsplit('/').next().unwrap();
+            let payload = match pointer.matches('/').count() {
+                1 => serde_json::json!({ field: null }),
+                _ => {
+                    let parent = pointer.trim_start_matches('/').split('/').next().unwrap();
+                    serde_json::json!({ parent: { field: null } })
+                }
+            };
+            assert!(
+                explicitly_cleared_secrets(&payload).contains(key),
+                "{} does not reach the keychain key {}",
+                pointer,
+                key
+            );
+        }
     }
 
     #[test]
