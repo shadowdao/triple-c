@@ -203,6 +203,13 @@ pub async fn upload_host_file_to_terminal(
     // symlinks already resolved, so a visible directory that *leads* to `~/.ssh`
     // is refused too. What comes back is that resolved path, and it is what
     // gets opened.
+    // The name is taken from the path the user actually dropped, *before*
+    // resolution. Deriving it from the resolved path renames the file behind
+    // the user's back: dropping `~/Downloads/latest.log`, where `latest.log` is
+    // a symlink, would land it in the container as `2026-08-23.log`. The Files
+    // pane's upload had the same bug and fixes it the same way — one helper, so
+    // the two drop targets cannot drift.
+    let base = crate::commands::file_commands::host_upload_name(&host_path)?;
     let host_path = crate::commands::file_commands::resolve_host_read_path(&host_path).await?;
 
     let container_id = state.exec_manager.get_container_id(&session_id).await?;
@@ -228,11 +235,7 @@ pub async fn upload_host_file_to_terminal(
         ));
     }
 
-    let base = std::path::Path::new(&host_path)
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "dropped-file".to_string());
+
 
     // Ensure the destination directory exists rather than relying on Docker's
     // archive extractor to create the parent for the uploaded tar entry.
@@ -294,4 +297,39 @@ pub async fn stop_audio_bridge(
     let audio_session_id = format!("audio-{}", session_id);
     state.exec_manager.close_session(&audio_session_id).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// Both drop targets must name a dropped file the way the *user* named it.
+    ///
+    /// The bug this pins: `upload_host_file_to_terminal` derived the tar entry
+    /// name from the path *after* symlink resolution, so dropping
+    /// `~/Downloads/latest.log` — where `latest.log` is a symlink to
+    /// `2026-08-23.log` — silently landed the file in the container under the
+    /// target's name. Nothing errored; the user just got a name they never
+    /// typed. The Files pane had the identical bug.
+    ///
+    /// What actually keeps the two from drifting is that they now call one
+    /// helper, so this asserts that helper's contract from the terminal side:
+    /// the answer comes from the spelling, and a path that does not name a file
+    /// is refused rather than silently substituted (it used to fall back to
+    /// `"dropped-file"`).
+    #[test]
+    fn a_dropped_file_keeps_the_name_the_user_dropped() {
+        use crate::commands::file_commands::host_upload_name;
+
+        assert_eq!(
+            host_upload_name("/home/u/Downloads/latest.log").unwrap(),
+            "latest.log"
+        );
+        assert!(
+            host_upload_name("/home/u/Downloads/").is_err(),
+            "a directory is not a file to drop"
+        );
+        assert!(
+            host_upload_name("/home/u/..").is_err(),
+            "the name becomes a tar entry, a container path and an argv element"
+        );
+    }
 }

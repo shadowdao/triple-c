@@ -978,7 +978,7 @@ pub async fn resolve_host_read_path(path: &str) -> Result<String, String> {
 /// `Path::file_name` so a Windows path is split as one wherever this runs, and
 /// the answer goes through [`validate_entry_name`] because it becomes a tar
 /// entry name, a container path and an argv element.
-fn host_upload_name(path: &str) -> Result<String, String> {
+pub(crate) fn host_upload_name(path: &str) -> Result<String, String> {
     if normalize_host_path(path).ends_with('/') {
         // A trailing separator names a directory, and `Downloads` is not the
         // name of a file to upload. The recursive-upload refusal further down

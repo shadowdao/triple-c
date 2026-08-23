@@ -82,27 +82,57 @@ pub fn load(project_id: &str) -> Result<Option<MigrationState>, String> {
     match serde_json::from_str::<MigrationState>(&data) {
         Ok(state) => Ok(Some(state)),
         Err(e) => {
+            // Three outcomes, and they must not be conflated: a copy was made,
+            // a copy was deliberately not made, or a copy failed. The previous
+            // version folded "already kept enough" into `Ok(())` and then told
+            // the user "a copy was kept at <path>" — naming a file that was
+            // never created. A message that invents a backup is worse than no
+            // message, because it is what someone reads before going to look
+            // for their data.
             let backup = corrupt_backup_path(&path, &chrono::Utc::now());
-            let copied = if backup.exists() || corrupt_backups_full(&path) {
-                // Already kept a copy of this exact corruption this second, or
-                // kept as many as are worth keeping. Either way nothing to add.
-                Ok(())
+            let kept = if backup.exists() {
+                Kept::AlreadyThere
+            } else if corrupt_backups_full(&path) {
+                Kept::EnoughAlready(MAX_CORRUPT_BACKUPS)
             } else {
-                fs::copy(&path, &backup).map(|_| ())
+                match fs::copy(&path, &backup) {
+                    Ok(_) => Kept::Copied,
+                    Err(e) => Kept::Failed(e.to_string()),
+                }
             };
             log::error!(
                 "Failed to parse migration state for project {}: {} — treating as absent, but \
                  the record is left in place so `has_record` still protects its rollback pin{}",
                 project_id,
                 e,
-                match copied {
-                    Ok(()) => format!(" (a copy was kept at {})", backup.display()),
-                    Err(ref e) => format!(" (could not keep a copy: {})", e),
+                match kept {
+                    Kept::Copied | Kept::AlreadyThere =>
+                        format!(" (a copy is at {})", backup.display()),
+                    // The earliest copies are the ones worth having, so the cap
+                    // keeps those and drops this one. Say so, rather than
+                    // implying a file exists.
+                    Kept::EnoughAlready(n) => format!(
+                        " (no copy kept — {} earlier copies of this record are already saved \
+                         alongside it)",
+                        n
+                    ),
+                    Kept::Failed(ref e) => format!(" (could not keep a copy: {})", e),
                 }
             );
             Ok(None)
         }
     }
+}
+
+/// What [`load`] did about a copy of an unparseable record, so the log line can
+/// tell the truth about whether a file exists.
+enum Kept {
+    Copied,
+    /// This exact second's copy was already on disk.
+    AlreadyThere,
+    /// The cap is reached; the earlier copies are kept and this one is not.
+    EnoughAlready(usize),
+    Failed(String),
 }
 
 /// Where a copy of an unparseable record is kept.
@@ -439,5 +469,44 @@ mod tests {
             sanitize("ab62cd24-51aa-4645-8f5c-17a124062050"),
             "ab62cd24-51aa-4645-8f5c-17a124062050"
         );
+    }
+
+    /// The log line must not name a backup that was never written.
+    ///
+    /// `load` runs on every reconcile, every survey and every reaper pass, so a
+    /// persistently corrupt record hits the `MAX_CORRUPT_BACKUPS` cap within
+    /// seconds. The previous code folded "already kept enough" into `Ok(())`
+    /// and then reported " (a copy was kept at <path>)" — pointing at a file
+    /// that does not exist. That is the message someone reads immediately
+    /// before going to look for their data.
+    #[test]
+    fn the_corrupt_record_message_only_claims_a_copy_that_exists() {
+        let dir = std::env::temp_dir().join(format!(
+            "tc-mstore-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.json");
+        std::fs::write(&path, b"{ not json").unwrap();
+
+        // Fill the cap with copies that really are on disk.
+        for i in 0..MAX_CORRUPT_BACKUPS {
+            let b = path.with_extension(format!("json.corrupt-2026010{}-000000.bak", i));
+            std::fs::write(&b, b"{ not json").unwrap();
+        }
+        assert!(corrupt_backups_full(&path), "precondition: the cap is reached");
+
+        // With the cap reached, no new copy may be created — and that is the
+        // state in which the old message lied.
+        let before: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+        let fresh = corrupt_backup_path(&path, &chrono::Utc::now());
+        assert!(
+            !fresh.exists(),
+            "the cap is reached, so this timestamped copy must not be written"
+        );
+        let after: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+        assert_eq!(before.len(), after.len(), "nothing new appeared on disk");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
