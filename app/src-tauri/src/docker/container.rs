@@ -2041,32 +2041,73 @@ chmod 600 "$HOME/.aws/credentials""#;
 ///
 /// A snapshot is the user's system layer: their packages, their `/opt`, their
 /// `/var/lib/postgresql`. Nothing here may guess. Every entry is an absolute
-/// path anchored to a directory Triple-C or a package manager owns, and the
-/// three globs are anchored to `/tmp` specifically:
+/// path anchored to a directory Triple-C or a package manager owns:
 ///
 /// * `/workspace/{mount_name}` subtrees are **host bind mounts** — the user's
 ///   real project directories. No entry may ever reach one, which is why no
 ///   pattern here starts with `/workspace`.
 /// * The only bind mounts under `/tmp` are `/tmp/.host-ca` and `/tmp/.host-aws`
 ///   (both read-only). A leading-dot name is not matched by a shell glob, and
-///   none of the three patterns share their prefix, so neither can be selected
-///   even by accident.
+///   none of these patterns share their prefix.
 /// * The apt entries keep their parent directory and remove only its contents
 ///   (`lists/*`, `archives/*.deb`, `apt/*`); `apt-get` is unhappy when the
 ///   directories themselves are missing.
 ///
-/// A unit test pins the list, because the blast radius of a wrong entry here is
-/// a user's data and the code that consumes it is a shell string.
+/// ## Why a safe-looking *pattern* is not enough (C1)
+///
+/// The list used to be the whole of the defence, and that was wrong. These
+/// patterns are expanded by `/bin/sh` inside the container running as **root**,
+/// and for an entry ending `/*` the parent is a *path component*: both the glob
+/// expansion and the `rm -rf` that follows resolve it. The agent in the
+/// container has passwordless sudo, so anything able to run
+/// `ln -s /workspace/myproject /var/log/apt` turns the next commit into a
+/// recursive delete of the user's real files **on the host**. That was
+/// reproduced end to end against a live container — a bind mount emptied by a
+/// scrub whose path list named no `/workspace` anywhere.
+///
+/// (The entries whose glob is in the last component are the benign case: there
+/// the *match* is the symlink, and `rm -rf -- link` unlinks the link and stops.
+/// The distinction is not one a reviewer should have to make per entry, so the
+/// script defends both alike.)
+///
+/// So these entries are only half the contract. The other half is
+/// [`snapshot_scrub_script`], which validates the parent directory — not
+/// reached through a symlink, not on another filesystem, inside
+/// [`SCRUB_CONTAINMENT_PREFIXES`] — before it deletes anything inside it. That
+/// is also why every entry here must keep its glob in the **final component**:
+/// the parent has to be literal for the script to be able to check it at all. A
+/// test enforces it.
+///
+/// A unit test also pins the list itself, because the blast radius of a wrong
+/// entry here is a user's data and the code that consumes it is a shell string.
 pub(crate) const SNAPSHOT_SCRUB_PATHS: &[&str] = &[
     // Agent scratchpads. The user's global CLAUDE.md instructs every agent to
     // put temporary files under a scratchpad directory in /tmp, so this is
     // where a long-running project's writable layer actually goes.
+    //
+    // Not age-limited, and worth being explicit about why that is only *just*
+    // safe: the scrub runs as root against a container that is still running,
+    // so a live Claude Code session or a `triple-c-scheduler` task writing here
+    // has its scratchpad pulled out from under it mid-write. Both callers stop
+    // the container within a line or two — `start_project_container` in
+    // `project_commands.rs` stops and removes it, `migrate_project_to_base`
+    // stops it — so the process that would notice is about to be killed anyway.
+    // That is a property of those two call sites and not of this entry: a third
+    // caller scrubbing a container it means to keep running would be corrupting
+    // a live session, and would need to age-limit this the way the two below
+    // are.
     "/tmp/claude-*",
     // Files drag-dropped into a terminal, staged by
-    // `commands/terminal_commands.rs` at up to 256 MiB each. Nothing in the
-    // repo deletes them.
+    // `commands/terminal_commands.rs` at up to 256 MiB each, and one PNG per
+    // pasted image from the same module. Nothing else in the repo deletes
+    // either, so leaving them out of this list restores unbounded growth — but
+    // they are the user's *own* files, and often the only copy inside the
+    // container of something handed to the agent seconds ago by a path that is
+    // still sitting in the conversation. Scrubbing them unconditionally meant
+    // "drop a file, change any of the 24 settings that trigger a recreation,
+    // lose it silently". Both are therefore age-limited rather than removed —
+    // see [`SCRUB_MIN_AGE_DAYS`].
     "/tmp/triple-c-drops/*",
-    // One PNG per pasted image, from the same module. Also never deleted.
     "/tmp/clipboard_*.png",
     // Runtime apt debris. `browser_view/install.rs` and
     // `container/triple-c-playwright-heal` both run `apt-get install` inside a
@@ -2077,32 +2118,172 @@ pub(crate) const SNAPSHOT_SCRUB_PATHS: &[&str] = &[
     "/var/log/dpkg.log",
 ];
 
+/// Entries of [`SNAPSHOT_SCRUB_PATHS`] that are only deleted once a match's own
+/// mtime is older than the given number of days. Anything not named here is
+/// deleted whenever it is present.
+///
+/// Two weeks is chosen against the thing that goes wrong: a recreation can
+/// happen seconds after a drop, and no conversation is still quoting a path it
+/// was given a fortnight ago. It is a compromise, not a proof — the alternative
+/// of dropping these patterns entirely would be silent unbounded growth in a
+/// directory nothing else ever cleans.
+const SCRUB_MIN_AGE_DAYS: &[(&str, u32)] = &[
+    ("/tmp/triple-c-drops/*", 14),
+    ("/tmp/clipboard_*.png", 14),
+];
+
+/// The only directory trees [`snapshot_scrub_script`] will operate in, checked
+/// against the *resolved* parent directory at run time inside the container.
+///
+/// Deliberately **not** derived from [`SNAPSHOT_SCRUB_PATHS`]: it is the
+/// backstop for the case where that list is itself wrong. An entry added under
+/// `/workspace`, `/home/claude` or `/etc` fails this check and deletes nothing,
+/// however plausible it looked in review.
+const SCRUB_CONTAINMENT_PREFIXES: &[&str] = &["/tmp", "/var/log", "/var/lib/apt", "/var/cache/apt"];
+
 /// Marker the scrub script prints so the byte total can be read back out of the
 /// exec's interleaved stdout/stderr.
 const SCRUB_MARKER: &str = "###TRIPLE-C-SCRUBBED ";
 
-/// The `/bin/sh` program run inside the container to perform the scrub.
+/// Split a [`SNAPSHOT_SCRUB_PATHS`] entry into the literal directory it is
+/// anchored to and the glob to expand inside it.
 ///
-/// Built here rather than inline so a test can read it. The path list is
-/// interpolated **unquoted** on the `for` line, which is the whole point: the
-/// shell expands the three globs there. An unmatched glob expands to itself,
-/// the `[ -e ]` guard then fails, and the entry is skipped — so a pattern that
-/// matches nothing is a no-op rather than an `rm` of a literal path.
-/// Inside the loop `$p` is quoted, so a filename containing whitespace is one
-/// argument.
+/// `None` for anything that is not an absolute path with a non-empty final
+/// component — which a test rules out, but the script generator must not have
+/// to trust that, since what it emits runs as root.
+fn split_scrub_pattern(pattern: &str) -> Option<(&str, &str)> {
+    let (dir, glob) = pattern.rsplit_once('/')?;
+    if !pattern.starts_with('/') || glob.is_empty() {
+        return None;
+    }
+    // A top-level entry such as `/dpkg.log` leaves an empty parent; anchor it.
+    Some((if dir.is_empty() { "/" } else { dir }, glob))
+}
+
+/// The `/bin/sh` program run inside the container to perform the scrub.
 pub(crate) fn snapshot_scrub_script() -> String {
+    snapshot_scrub_script_under("")
+}
+
+/// [`snapshot_scrub_script`] with every absolute path re-anchored under `root`.
+///
+/// ## What the script does
+///
+/// One `scrub_in <pattern> <min-age-days, or `-`>` call per entry in
+/// [`SNAPSHOT_SCRUB_PATHS`], with the pattern single-quoted so it reaches the
+/// function unexpanded — unquoted, `/bin/sh` would expand the glob against the
+/// script's own working directory before `scrub_in` ever ran. The function
+/// splits it into parent and glob (`${1%/*}` / `${1##*/}`, which is why the
+/// glob must live in the final component), and expands the glob only once the
+/// working directory *is* the validated parent. Quoted everywhere it is used,
+/// so a filename containing whitespace stays one argument; an unmatched glob
+/// expands to itself and is skipped by the existence guard.
+///
+/// Passing the whole pattern rather than the two halves also keeps each entry
+/// readable verbatim in the compaction `RUN` line — `disk.rs` asserts exactly
+/// that, to catch a second forked copy of the list.
+///
+/// ## The containment guarantee (C1)
+///
+/// `scrub_in` is the only place in the script that deletes anything, and it
+/// does so only after four checks. In order:
+///
+/// 0. `cd -P` into the parent **first**. Everything after that is relative to
+///    the inode that gets validated, so re-pointing the *path* afterwards
+///    cannot redirect the `rm`. A working directory is the only TOCTOU-free
+///    handle `/bin/sh` offers.
+/// 1. `pwd -P` — the fully resolved path — must equal what was asked for.
+///    A symlinked component anywhere in the parent lands somewhere else, and
+///    this is what catches `ln -s /workspace/myproject /var/log/apt`.
+/// 2. The resolved path must be inside [`SCRUB_CONTAINMENT_PREFIXES`]. A
+///    symlink is not the only way to name the wrong directory; this refuses to
+///    operate outside the trees the scrub owns whatever the path list says.
+/// 3. It must be on the same filesystem as the root. Check 1 does not see a
+///    *bind mount*, which is not a symlink — but a bind mount and a named
+///    volume each have a different `st_dev` from the overlay, and neither is
+///    part of the writable layer the commit is about to capture. So anything on
+///    another device is both dangerous to delete and pointless to. No `stat`
+///    means no comparison, which means no deletion: this fails closed.
+///
+/// Inside the loop, an expansion carrying a path separator means the list has
+/// changed shape and is skipped, and `rm --one-file-system` (probed, because
+/// busybox's `rm` would reject it) refuses to recurse across a mount planted
+/// *below* a validated directory.
+///
+/// ## Why every line ends in `;`
+///
+/// `disk.rs` folds this script onto a single `RUN` line for the compaction
+/// build, joining non-blank lines with a space. That is only a join and not a
+/// rewrite if each line already terminates its own statement — the previous
+/// version did not, and its folded form was a `"do" unexpected` syntax error,
+/// so compaction had been running no scrub at all. It also means the script
+/// carries **no `#` comments**: folded, one would swallow the rest of the
+/// program. A test pins both the multi-line and the folded form.
+///
+/// ## Why `root` exists
+///
+/// `""` in production, which leaves the paths exactly as written. A non-empty
+/// root lets the real generated script be run by a real `/bin/sh`, with real
+/// symlinks planted in it, inside a throwaway directory tree — because
+/// containment is a *runtime* property and the test this replaces
+/// (`!dockerfile.contains("/workspace")`) was a substring check over the script
+/// text that the exploitable version passed.
+fn snapshot_scrub_script_under(root: &str) -> String {
+    let calls: String = SNAPSHOT_SCRUB_PATHS
+        .iter()
+        .filter_map(|pattern| {
+            // Validate the shape here even though the shell re-derives it: an
+            // entry the script could not split is one it must not be handed.
+            split_scrub_pattern(pattern)?;
+            let age = SCRUB_MIN_AGE_DAYS
+                .iter()
+                .find(|(p, _)| p == pattern)
+                .map(|(_, days)| days.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            Some(format!("scrub_in '{root}{pattern}' '{age}';\n"))
+        })
+        .collect();
+
+    let allowed: String = SCRUB_CONTAINMENT_PREFIXES
+        .iter()
+        .map(|p| format!("{root}{p}|{root}{p}/*"))
+        .collect::<Vec<_>>()
+        .join("|");
+
     format!(
-        r#"total=0
-for p in {paths}; do
-    [ -e "$p" ] || continue
-    sz=$(du -sb "$p" 2>/dev/null | cut -f1)
-    case "$sz" in ''|*[!0-9]*) sz=0 ;; esac
-    rm -rf -- "$p" 2>/dev/null && total=$((total + sz))
-done
-echo "{marker}$total"
+        r#"total=0;
+rootdev=$(stat -c %d '{root}/' 2>/dev/null);
+rmopt=;
+rm --one-file-system --help >/dev/null 2>&1 && rmopt=--one-file-system;
+scrub_in() {{
+n=$(
+d=${{1%/*}}; [ -n "$d" ] || d=/;
+g=${{1##*/}};
+cd -P "$d" 2>/dev/null || exit 0;
+[ "$(pwd -P)" = "$d" ] || exit 0;
+case "$d" in {allowed}) ;; *) exit 0 ;; esac;
+[ -n "$rootdev" ] || exit 0;
+[ "$(stat -c %d . 2>/dev/null)" = "$rootdev" ] || exit 0;
+acc=0;
+for p in $g; do
+case "$p" in */*|.|..) continue ;; esac;
+{{ [ -e "$p" ] || [ -L "$p" ]; }} || continue;
+[ "$2" = "-" ] || [ -n "$(find "$p" -maxdepth 0 -mtime +"$2" -print 2>/dev/null)" ] || continue;
+sz=$(du -sb -- "$p" 2>/dev/null | cut -f1);
+case "$sz" in ''|*[!0-9]*) sz=0 ;; esac;
+rm -rf $rmopt -- "$p" 2>/dev/null && acc=$((acc + sz));
+done;
+echo "$acc";
+);
+case "$n" in ''|*[!0-9]*) n=0 ;; esac;
+total=$((total + n));
+}};
+{calls}echo "{marker}$total";
 exit 0
 "#,
-        paths = SNAPSHOT_SCRUB_PATHS.join(" "),
+        root = root,
+        allowed = allowed,
+        calls = calls,
         marker = SCRUB_MARKER,
     )
 }
@@ -2117,24 +2298,118 @@ fn parse_scrub_total(output: &str) -> Option<u64> {
         .find_map(|line| line.trim().strip_prefix(SCRUB_MARKER)?.trim().parse().ok())
 }
 
+/// How long [`scrub_writable_layer`] waits for its exec before the commit goes
+/// ahead without it.
+///
+/// The scrub is a `du -sb` plus an `rm -rf` over a tree a running agent may
+/// still be writing to, and it sits on the critical path of every recreate and
+/// every migration with the UI parked on "Saving container state…" and no way
+/// to cancel. Two minutes is an order of magnitude more than the measured cost
+/// on a 4.48 GB layer, and far less than the point where a user force-quits.
+const SCRUB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// What [`scrub_writable_layer`] actually did.
+///
+/// The distinction that earns this type is [`ScrubOutcome::NotRunning`] versus
+/// [`ScrubOutcome::Failed`]: "there was nothing to exec into" is routine, while
+/// "the exec ran and broke" is the one case worth a warning in the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrubOutcome {
+    /// The scrub ran to completion and freed this many bytes — possibly zero,
+    /// which is a real answer.
+    Reclaimed(u64),
+    /// The container is not running, so there is no `docker exec` to run in.
+    /// Not a failure: a stopped container's writable layer is not growing, and
+    /// on the migration path it was already scrubbed while it was.
+    NotRunning,
+    /// The container was running, but the scrub did not finish within
+    /// [`SCRUB_TIMEOUT`].
+    TimedOut,
+    /// The container was running and the scrub genuinely failed.
+    Failed,
+}
+
+impl ScrubOutcome {
+    /// Bytes reclaimed. Zero for every outcome that is not a completed scrub.
+    pub fn bytes(&self) -> u64 {
+        match self {
+            Self::Reclaimed(bytes) => *bytes,
+            _ => 0,
+        }
+    }
+}
+
 /// Delete the throwaway files listed in [`SNAPSHOT_SCRUB_PATHS`] from a
 /// container's writable layer so the commit that follows does not bake them in.
 ///
 /// Runs as **root**: the apt debris is root-owned while the scratchpads belong
-/// to `claude`, and root can remove both.
+/// to `claude`, and root can remove both. That is also what makes
+/// [`snapshot_scrub_script`]'s containment checks load-bearing rather than
+/// decorative.
 ///
 /// **Never fails the caller, by design.** A scrub is an optimisation; a commit
 /// is the only copy of the user's system layer. Losing some disk is a strictly
 /// better outcome than refusing to snapshot, so every failure here is a log
-/// line and nothing more. Note that this is a `docker exec` and therefore only
-/// works while the container runs: `migrate_project_to_base` stops its
-/// container before the pre-swap commit, so it calls this itself beforehand
-/// rather than relying on the call inside [`commit_container_snapshot`].
-pub async fn scrub_writable_layer(container_id: &str) -> u64 {
+/// line and nothing more — including the timeout, which stops waiting and lets
+/// the commit proceed rather than leaving the UI on "Saving container state…"
+/// with no way out.
+///
+/// ## Why it checks whether the container is running (M11)
+///
+/// This is a `docker exec`, so it only works on a running container.
+/// `migrate_project_to_base` knows that: it scrubs the container itself and
+/// *then* stops it, because the pre-swap commit is the largest snapshot
+/// Triple-C ever takes. The call inside [`commit_container_snapshot`] therefore
+/// arrives at a stopped container and could only ever fail, which logged
+/// "could not run … committing anyway" on every single migration — training
+/// the reader to ignore the one line that would matter if the scrub had really
+/// broken. Asking first turns that into a debug line and keeps the warning
+/// meaningful.
+pub async fn scrub_writable_layer(container_id: &str) -> ScrubOutcome {
+    match is_container_running(container_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            log::debug!(
+                "Skipping pre-commit scrub of container {}: it is not running, so there is nothing to exec into and its writable layer is not growing",
+                container_id
+            );
+            return ScrubOutcome::NotRunning;
+        }
+        Err(e) => {
+            // Only Docker being unreachable reaches here, in which case the
+            // commit this precedes is about to fail on its own — but say so
+            // rather than reporting a skip that never happened.
+            log::warn!(
+                "Could not tell whether container {} is running ({}); skipping the pre-commit scrub and committing anyway",
+                container_id,
+                e
+            );
+            return ScrubOutcome::Failed;
+        }
+    }
+
     let script = snapshot_scrub_script();
     let cmd = vec!["/bin/sh".to_string(), "-c".to_string(), script];
+    let exec = crate::docker::exec::exec_oneshot_as(container_id, "root", cmd, Vec::new());
 
-    match crate::docker::exec::exec_oneshot_as(container_id, "root", cmd, Vec::new()).await {
+    // M12: nothing under `docker/` has a timeout, and this is the one call on
+    // the critical path of every recreate. Dropping the future stops us
+    // *waiting*; the `sh` keeps running inside the container and its deletions
+    // are still valid, they just stop counting towards the total. That is the
+    // right trade — the commit that follows is merely a little larger.
+    let exec_result = match tokio::time::timeout(SCRUB_TIMEOUT, exec).await {
+        Ok(result) => result,
+        Err(_) => {
+            log::warn!(
+                "Pre-commit scrub of container {} did not finish within {}s; committing anyway",
+                container_id,
+                SCRUB_TIMEOUT.as_secs()
+            );
+            return ScrubOutcome::TimedOut;
+        }
+    };
+
+    match exec_result {
         Ok((output, _exit_code)) => match parse_scrub_total(&output) {
             Some(bytes) => {
                 if bytes > 0 {
@@ -2144,7 +2419,7 @@ pub async fn scrub_writable_layer(container_id: &str) -> u64 {
                         bytes as f64 / 1_048_576.0
                     );
                 }
-                bytes
+                ScrubOutcome::Reclaimed(bytes)
             }
             None => {
                 log::warn!(
@@ -2152,7 +2427,7 @@ pub async fn scrub_writable_layer(container_id: &str) -> u64 {
                     container_id,
                     output.trim()
                 );
-                0
+                ScrubOutcome::Failed
             }
         },
         Err(e) => {
@@ -2161,7 +2436,7 @@ pub async fn scrub_writable_layer(container_id: &str) -> u64 {
                 container_id,
                 e
             );
-            0
+            ScrubOutcome::Failed
         }
     }
 }
@@ -2198,6 +2473,10 @@ pub async fn scrub_writable_layer(container_id: &str) -> u64 {
 ///
 /// See [`SNAPSHOT_SCRUB_PATHS`]. Every commit stacks a layer, so a file present
 /// here is a file the project's image carries for the rest of its life.
+///
+/// The scrub is a no-op on a container that is already stopped — the migration
+/// path scrubs it itself while it is still running and stops it before getting
+/// here — and it can never fail this function; see [`scrub_writable_layer`].
 pub async fn commit_container_snapshot(container_id: &str, project: &Project) -> Result<(), String> {
     let docker = get_docker()?;
     let image_name = get_snapshot_image_name(project);
@@ -2206,7 +2485,7 @@ pub async fn commit_container_snapshot(container_id: &str, project: &Project) ->
     // stacks a layer and never rewrites one, so anything present at this
     // instant is paid for permanently — see [`SNAPSHOT_SCRUB_PATHS`]. Failure
     // is swallowed inside; a scrub must never be able to block a snapshot.
-    scrub_writable_layer(container_id).await;
+    let scrub = scrub_writable_layer(container_id).await;
 
     // Parse repo:tag
     let (repo, tag) = match image_name.rsplit_once(':') {
@@ -2232,7 +2511,13 @@ pub async fn commit_container_snapshot(container_id: &str, project: &Project) ->
         .await
         .map_err(|e| format!("Failed to commit container snapshot: {}", e))?;
 
-    log::info!("Committed container {} as snapshot {}:{}", container_id, repo, tag);
+    log::info!(
+        "Committed container {} as snapshot {}:{} ({:.2} MB dropped by the pre-commit scrub)",
+        container_id,
+        repo,
+        tag,
+        scrub.bytes() as f64 / 1_048_576.0
+    );
     Ok(())
 }
 
@@ -3576,13 +3861,18 @@ mod tests {
         assert!(blind.left_something_behind());
     }
 
-    // ── Pre-commit scrub (A1) ────────────────────────────────────────────────
+    // ── Pre-commit scrub (A1, C1) ────────────────────────────────────────────
 
     #[test]
     fn no_scrub_path_can_reach_a_host_bind_mount() {
         // `/workspace/{mount_name}` is the user's own project directory, bound
         // in from the host. Nothing in this list may ever name one — and the
         // two read-only host mounts under /tmp must be equally unreachable.
+        //
+        // Necessary, not sufficient: a pattern that looks like this can still
+        // resolve into a bind mount through a symlinked parent, which is what
+        // the script's own checks exist for. See
+        // `the_scrub_script_refuses_a_symlinked_parent_...` below.
         for path in SNAPSHOT_SCRUB_PATHS {
             assert!(
                 path.starts_with('/'),
@@ -3627,6 +3917,69 @@ mod tests {
     }
 
     #[test]
+    fn every_scrub_pattern_keeps_its_glob_in_the_final_component() {
+        // The script can only validate a parent directory it can name, so the
+        // parent has to be literal. An entry like `/var/*/apt/*` would put a
+        // glob in a path *component*, which is the shape that made C1
+        // exploitable in the first place.
+        for pattern in SNAPSHOT_SCRUB_PATHS {
+            let (dir, glob) = split_scrub_pattern(pattern)
+                .unwrap_or_else(|| panic!("{} has no literal parent directory", pattern));
+            assert!(
+                !dir.contains(['*', '?', '[']),
+                "{}: the parent {} is itself a glob, so the script cannot check it",
+                pattern,
+                dir
+            );
+            assert!(!glob.is_empty(), "{} has an empty final component", pattern);
+            // Both halves are single-quoted into the script; a quote or a blank
+            // would break out of that quoting and change what runs as root.
+            assert!(
+                !pattern.contains('\'') && !pattern.contains(char::is_whitespace),
+                "{} cannot be safely single-quoted into the scrub script",
+                pattern
+            );
+        }
+    }
+
+    #[test]
+    fn every_scrub_parent_is_inside_the_scripts_containment_allowlist() {
+        // The allowlist is hardcoded in the script and deliberately not derived
+        // from this list, so the two can drift apart — in which case the entry
+        // silently stops being scrubbed. Fail here instead.
+        for pattern in SNAPSHOT_SCRUB_PATHS {
+            let (dir, _) = split_scrub_pattern(pattern).expect("a literal parent");
+            assert!(
+                SCRUB_CONTAINMENT_PREFIXES
+                    .iter()
+                    .any(|p| dir == *p || dir.starts_with(&format!("{}/", p))),
+                "{} is anchored at {}, which the script's containment check would refuse",
+                pattern,
+                dir
+            );
+        }
+    }
+
+    #[test]
+    fn the_containment_allowlist_cannot_reach_anything_of_the_users() {
+        for prefix in SCRUB_CONTAINMENT_PREFIXES {
+            assert!(prefix.starts_with('/'), "{} is not absolute", prefix);
+            assert!(!prefix.ends_with('/'), "{} would match the wrong things", prefix);
+            for forbidden in [
+                "/", "/workspace", "/home", "/etc", "/usr", "/opt", "/srv", "/root",
+                "/var/lib/postgresql", "/var/lib/docker",
+            ] {
+                assert!(
+                    !(forbidden == *prefix || forbidden.starts_with(&format!("{}/", prefix))),
+                    "the allowlist entry {} contains {}",
+                    prefix,
+                    forbidden
+                );
+            }
+        }
+    }
+
+    #[test]
     fn the_scrub_list_covers_every_measured_source_of_writable_layer_growth() {
         // Each of these was measured in a real container's pending commit.
         // Dropping one silently gives back multiple gigabytes per project.
@@ -3648,19 +4001,197 @@ mod tests {
     }
 
     #[test]
-    fn the_scrub_script_expands_globs_but_quotes_the_match() {
+    fn the_users_own_files_are_only_scrubbed_once_they_are_stale() {
+        // Regression: these two hold files the user handed the agent by hand,
+        // and deleting them at commit time turned "change a setting" into
+        // "silently lose the file you just dropped". They stay in the list —
+        // nothing else ever reclaims them — but only with an age gate.
+        for user_owned in ["/tmp/triple-c-drops/*", "/tmp/clipboard_*.png"] {
+            assert!(
+                SNAPSHOT_SCRUB_PATHS.contains(&user_owned),
+                "{} was removed from the list instead of age-limited, so nothing reclaims it",
+                user_owned
+            );
+            let age = SCRUB_MIN_AGE_DAYS.iter().find(|(p, _)| *p == user_owned);
+            assert!(
+                age.is_some_and(|(_, days)| *days >= 7),
+                "{} is scrubbed without a meaningful age limit, which loses a just-dropped file",
+                user_owned
+            );
+        }
+        // The scratchpads are machine debris and are not age-limited; if that
+        // ever changes, the comment explaining why must change with it.
+        assert!(!SCRUB_MIN_AGE_DAYS.iter().any(|(p, _)| *p == "/tmp/claude-*"));
+        // An age limit on a pattern that is not scrubbed at all does nothing
+        // and reads as though it does.
+        for (pattern, _) in SCRUB_MIN_AGE_DAYS {
+            assert!(SNAPSHOT_SCRUB_PATHS.contains(pattern), "{} is not scrubbed", pattern);
+        }
+    }
+
+    #[test]
+    fn the_scrub_script_validates_every_directory_before_deleting_in_it() {
+        // The structural half of the C1 fix, for the environments where the
+        // `/bin/sh` test below cannot run. Each assertion here pins one of the
+        // four checks; deleting any of them from the script fails this test.
         let script = snapshot_scrub_script();
-        // Unquoted on the `for` line — that is what makes the shell expand the
-        // globs at all.
-        assert!(script.contains("for p in /tmp/claude-* /tmp/triple-c-drops/*"));
-        // Quoted everywhere it is *used*, so a filename with a space is one
-        // argument and not two paths.
-        assert!(script.contains(r#"[ -e "$p" ] || continue"#));
-        assert!(script.contains(r#"rm -rf -- "$p""#));
+
+        // Exactly one deletion in the whole script, inside `scrub_in` and
+        // downstream of all four checks. A future edit that adds a bare `rm`
+        // at the top level — which is what the vulnerable version was — fails
+        // here.
+        assert_eq!(
+            script.matches("rm -rf").count(),
+            1,
+            "the scrub deletes somewhere other than inside the validated block:\n{}",
+            script
+        );
+        // The handle: after this, paths are relative to a validated inode, so
+        // re-pointing the directory cannot redirect the delete.
+        assert!(script.contains(r#"cd -P "$d" 2>/dev/null || exit 0;"#));
+        // 1. no symlinked component anywhere in the parent
+        assert!(script.contains(r#"[ "$(pwd -P)" = "$d" ] || exit 0;"#));
+        // 2. positive containment against a hardcoded allowlist
+        assert!(script.contains("/tmp|/tmp/*|/var/log|/var/log/*"));
+        assert!(!script.contains("/workspace"));
+        // 3. the same filesystem as the root — a bind mount or volume is not
+        //    part of the writable layer and must never be touched. Fails
+        //    closed when `stat` is unavailable.
+        assert!(script.contains(r#"[ -n "$rootdev" ] || exit 0;"#));
+        assert!(script.contains(r#"[ "$(stat -c %d . 2>/dev/null)" = "$rootdev" ] || exit 0;"#));
+        // 4. an expansion carrying a separator means the list changed shape
+        assert!(script.contains(r#"case "$p" in */*|.|..) continue ;; esac;"#));
+    }
+
+    #[test]
+    fn the_scrub_script_hands_each_glob_over_unexpanded() {
+        let script = snapshot_scrub_script();
+        // Single-quoted at the call site: an unquoted `*` would be expanded
+        // against the script's own working directory before `scrub_in` ran.
+        assert!(script.contains("scrub_in '/tmp/claude-*' '-';"));
+        assert!(script.contains("scrub_in '/var/log/apt/*' '-';"));
+        assert!(script.contains("scrub_in '/tmp/triple-c-drops/*' '14';"));
+        // The parent/glob split happens in the shell, so every entry stays
+        // readable verbatim — `disk.rs` folds this onto one `RUN` line and
+        // asserts each pattern appears there rather than a forked copy.
+        for pattern in SNAPSHOT_SCRUB_PATHS {
+            assert!(script.contains(pattern), "{} is not named in the script", pattern);
+        }
+        // Expanded inside the function, where the cwd is the validated
+        // directory, and quoted everywhere it is *used* so a filename with a
+        // space stays one argument.
+        assert!(script.contains("for p in $g; do"));
+        assert!(script.contains(r#"rm -rf $rmopt -- "$p""#));
         // `rm -rf /` would be catastrophic and is exactly what a botched
         // interpolation produces.
         assert!(!script.contains("rm -rf -- /\n"));
         assert!(!script.contains(" / "));
+    }
+
+    /// The behavioural half of the C1 fix.
+    ///
+    /// The test this replaces asserted `!script.contains("/workspace")`, which
+    /// the exploited version passed: containment is a property of what the
+    /// paths resolve to at run time. Docker is not available everywhere the
+    /// suite runs, so a throwaway directory tree stands in for the container
+    /// and `snapshot_scrub_script_under` re-anchors the real generated script
+    /// onto it. Linux-only because the script uses GNU `stat -c` and `du -b`,
+    /// which is what it will always run against inside the image.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_scrub_script_refuses_a_symlinked_parent_and_still_reclaims_a_real_one() {
+        use std::fs;
+        use std::process::Command;
+
+        // Canonicalised: a TMPDIR that is itself a symlink would trip check 1
+        // and make every case pass by doing nothing at all.
+        let base = fs::canonicalize(std::env::temp_dir()).expect("a real temp dir");
+        let root = base.join(format!("triple-c-scrub-{}", uuid::Uuid::new_v4().simple()));
+        let root_str = root.to_str().expect("a UTF-8 temp path").to_string();
+
+        let mk = |rel: &str| fs::create_dir_all(root.join(rel)).expect("mkdir");
+        mk("tmp/triple-c-drops");
+        mk("var/log");
+        mk("var/lib/apt/lists");
+        mk("var/cache/apt/archives");
+        // Stands in for /workspace/{mount_name}: the user's own project,
+        // bind-mounted from the host.
+        mk("workspace/myproject/sub");
+        fs::write(root.join("workspace/myproject/precious.txt"), "do not delete").unwrap();
+        fs::write(root.join("workspace/myproject/sub/nested.txt"), "nor this").unwrap();
+
+        // Debris the scrub is supposed to take, so this cannot pass by
+        // refusing everything.
+        mk("tmp/claude-scratch");
+        fs::write(root.join("tmp/claude-scratch/blob"), vec![0u8; 64 * 1024]).unwrap();
+        fs::write(root.join("var/lib/apt/lists/deb.list"), vec![0u8; 32 * 1024]).unwrap();
+
+        // The attack, in the two shapes that were verified against a real
+        // container: a symlinked *parent* (a path component, resolved by both
+        // the glob and the `rm -rf`) and a symlinked *match* (safe already —
+        // `rm -rf -- link` unlinks the link — and pinned here so it stays so).
+        std::os::unix::fs::symlink(root.join("workspace/myproject"), root.join("var/log/apt"))
+            .unwrap();
+        std::os::unix::fs::symlink(
+            root.join("workspace/myproject"),
+            root.join("tmp/claude-link"),
+        )
+        .unwrap();
+
+        // The age gate on the user's own files: the one dropped a moment ago
+        // survives a recreation, the one from last month does not.
+        fs::write(root.join("tmp/triple-c-drops/fresh.txt"), "just dropped").unwrap();
+        fs::write(root.join("tmp/triple-c-drops/stale.txt"), vec![0u8; 8 * 1024]).unwrap();
+        let touched = Command::new("touch")
+            .arg("-d")
+            .arg("30 days ago")
+            .arg(root.join("tmp/triple-c-drops/stale.txt"))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        let script = snapshot_scrub_script_under(&root_str);
+        let output = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .expect("run the generated script");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+        let exists = |rel: &str| root.join(rel).exists();
+        let survived = exists("workspace/myproject/precious.txt")
+            && exists("workspace/myproject/sub/nested.txt");
+        let debris_gone =
+            !exists("tmp/claude-scratch") && !exists("var/lib/apt/lists/deb.list");
+        let link_removed = fs::symlink_metadata(root.join("tmp/claude-link")).is_err();
+        let fresh_kept = exists("tmp/triple-c-drops/fresh.txt");
+        let stale_gone = !exists("tmp/triple-c-drops/stale.txt");
+        let total = parse_scrub_total(&stdout);
+
+        fs::remove_dir_all(&root).ok();
+
+        assert!(
+            survived,
+            "the scrub followed a symlinked parent into a bind mount.\nstdout: {}\nstderr: {}\nscript:\n{}",
+            stdout, stderr, script
+        );
+        assert!(
+            debris_gone,
+            "the scrub stopped reclaiming anything.\nstdout: {}\nstderr: {}",
+            stdout, stderr
+        );
+        assert!(link_removed, "a symlinked match was left behind instead of unlinked");
+        assert!(fresh_kept, "a file dropped moments ago was scrubbed anyway");
+        if touched {
+            assert!(stale_gone, "an age-limited file well past its limit was kept");
+        }
+        let total = total.expect("the marker line is missing");
+        assert!(
+            total >= 96 * 1024,
+            "reported total {} is too small to have removed the planted debris",
+            total
+        );
     }
 
     #[test]
@@ -3675,6 +4206,84 @@ mod tests {
         // from reclaiming nothing, and the caller logs it differently.
         assert_eq!(parse_scrub_total("sh: du: not found"), None);
         assert_eq!(parse_scrub_total(""), None);
+    }
+
+    #[test]
+    fn only_a_completed_scrub_reports_bytes() {
+        // M11: a stopped container is a skip, not a failure, and every outcome
+        // that is not a completed run contributes nothing to the log's total.
+        assert_eq!(ScrubOutcome::Reclaimed(4096).bytes(), 4096);
+        assert_eq!(ScrubOutcome::Reclaimed(0).bytes(), 0);
+        assert_eq!(ScrubOutcome::NotRunning.bytes(), 0);
+        assert_eq!(ScrubOutcome::TimedOut.bytes(), 0);
+        assert_eq!(ScrubOutcome::Failed.bytes(), 0);
+        assert_ne!(ScrubOutcome::NotRunning, ScrubOutcome::Failed);
+    }
+
+    #[test]
+    fn the_scrub_cannot_hold_a_snapshot_up_indefinitely() {
+        // M12: the scrub is a `du -sb` plus an `rm -rf` over a tree a running
+        // agent may still be writing to, on the critical path of every
+        // recreate with the UI on "Saving container state…" and no cancel.
+        assert!(SCRUB_TIMEOUT.as_secs() >= 30, "too tight to survive a slow but healthy scrub");
+        assert!(SCRUB_TIMEOUT.as_secs() <= 300, "long enough that a user would force-quit first");
+    }
+
+    /// `disk.rs` folds this script onto one `RUN` line for the compaction
+    /// build by joining its non-blank lines with a space, so the script has to
+    /// be a sequence of self-terminating statements and carry no `#` comments.
+    /// The previous version was neither: its folded form was a `"do"
+    /// unexpected` syntax error, which means compaction had been scrubbing
+    /// nothing at all. The fold is reproduced here rather than imported
+    /// because it is private to the other module — a divergence would show up
+    /// as this test passing while the real Dockerfile broke, so it is pinned
+    /// against the same wording in `fold_shell_script`.
+    #[cfg(unix)]
+    #[test]
+    fn the_scrub_script_survives_being_folded_onto_one_run_line() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let script = snapshot_scrub_script();
+        for line in script.lines() {
+            // A `#` only starts a comment at the beginning of a word, so the
+            // quoted `###TRIPLE-C-SCRUBBED` marker is fine; anything else is a
+            // comment that eats the rest of the program once folded.
+            assert!(
+                !line.trim_start().starts_with('#') && !line.contains(" #"),
+                "a `#` comment swallows the rest of the program once folded: {}",
+                line
+            );
+        }
+        let folded = script
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(!folded.contains('\n'));
+
+        for candidate in [script.as_str(), folded.as_str()] {
+            let mut child = Command::new("/bin/sh")
+                .arg("-n")
+                .stdin(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn /bin/sh -n");
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(candidate.as_bytes())
+                .expect("write the script");
+            let out = child.wait_with_output().expect("wait");
+            assert!(
+                out.status.success(),
+                "the scrub script does not parse: {}\n---\n{}",
+                String::from_utf8_lossy(&out.stderr),
+                candidate
+            );
+        }
     }
 
     // ── Container log rotation (A2) ──────────────────────────────────────────
