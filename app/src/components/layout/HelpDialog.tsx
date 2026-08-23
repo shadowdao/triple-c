@@ -12,21 +12,67 @@ function slugify(text: string): string {
   return text
     .toLowerCase()
     .replace(/<[^>]+>/g, "")       // strip HTML tags (e.g. from inline code)
+    // Quote characters are escaped to entities before this runs (see
+    // `renderMarkdown`). Drop those two entities whole, so a header with an
+    // apostrophe or a quote slugifies to what it did when the character was
+    // simply stripped — otherwise every such anchor id silently changes and
+    // the in-document links pointing at it stop resolving. `&amp;`/`&lt;`/
+    // `&gt;` are deliberately not in this list: they were already entities
+    // before, so their existing (odd) slugs are the established ones.
+    .replace(/&quot;|&#39;/g, "")
     .replace(/[^\w\s-]/g, "")      // remove non-word chars except spaces/dashes
     .replace(/\s+/g, "-")          // spaces to dashes
     .replace(/-+/g, "-")           // collapse consecutive dashes
     .replace(/^-|-$/g, "");        // trim leading/trailing dashes
 }
 
-/** Simple markdown-to-HTML converter for the help content. */
-function renderMarkdown(md: string): string {
+/**
+ * Escape a captured markdown value that is about to be interpolated into an
+ * HTML *attribute* value.
+ *
+ * `renderMarkdown` entity-escapes the whole document first, but that pass only
+ * covered `&`, `<` and `>` — not the quote characters, which is all an
+ * attribute value is delimited by. `[x](https://a" onload="…)` therefore closed
+ * `href="` and started a new attribute, because the URL capture is `[^)]+` and
+ * `"` is in `[^)]`. The document is remote GitHub markdown, so that capture is
+ * not ours to trust.
+ *
+ * Only quotes are escaped here: `&`, `<` and `>` have already been converted by
+ * the caller, and re-escaping the `&` would double-encode every `&amp;` in a
+ * query string.
+ */
+function attr(value: string): string {
+  return value.replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+/**
+ * Simple markdown-to-HTML converter for the help content.
+ *
+ * Exported for `HelpDialog.test.tsx`: the output goes to
+ * `dangerouslySetInnerHTML`, so the escaping rules below are security rules and
+ * need to be asserted rather than assumed.
+ */
+export function renderMarkdown(md: string): string {
   let html = md;
 
   // Normalize line endings
   html = html.replace(/\r\n/g, "\n");
 
-  // Escape HTML entities (but we'll re-introduce tags below)
-  html = html.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  // Escape HTML entities (but we'll re-introduce tags below).
+  //
+  // The quote characters are part of this on purpose. Everything below builds
+  // HTML by regex substitution, and several of those substitutions drop a
+  // capture straight into an attribute value (`href="$2"`). Leaving `"` and `'`
+  // live meant a link target could close the attribute and open another one —
+  // in a document fetched from GitHub at runtime and handed to
+  // `dangerouslySetInnerHTML`. Escaping here closes every such sink at the
+  // source; `attr()` below is the belt to this pair of braces.
+  html = html
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 
   // Fenced code blocks (```...```)
   html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_m, _lang, code) => {
@@ -84,13 +130,15 @@ function renderMarkdown(md: string): string {
   // Markdown-style anchor links [text](#anchor)
   html = html.replace(
     /\[([^\]]+)\]\(#([^)]+)\)/g,
-    '<a class="help-link" href="#$2">$1</a>',
+    (_m, text: string, anchor: string) =>
+      `<a class="help-link" href="#${attr(anchor)}">${text}</a>`,
   );
 
   // Markdown-style external links [text](url)
   html = html.replace(
     /\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g,
-    '<a class="help-link" href="$2" target="_blank" rel="noopener noreferrer">$1</a>',
+    (_m, text: string, url: string) =>
+      `<a class="help-link" href="${attr(url)}" target="_blank" rel="noopener noreferrer">${text}</a>`,
   );
 
   // Unordered list items (- ...)
@@ -117,7 +165,8 @@ function renderMarkdown(md: string): string {
   // Links - convert bare URLs to clickable links (skip already-wrapped URLs)
   html = html.replace(
     /(?<!="|'>)(https?:\/\/[^\s<)]+)/g,
-    '<a class="help-link" href="$1" target="_blank" rel="noopener noreferrer">$1</a>',
+    (_m, url: string) =>
+      `<a class="help-link" href="${attr(url)}" target="_blank" rel="noopener noreferrer">${url}</a>`,
   );
 
   // Wrap remaining loose text lines in paragraphs
