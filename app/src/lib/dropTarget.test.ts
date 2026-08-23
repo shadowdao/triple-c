@@ -1,4 +1,4 @@
-import { describe, expect, it, beforeEach, afterEach } from "vitest";
+import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import { classifyDrop, dropIsBlocked, isDropTarget } from "./dropTarget";
 
 function pane(rect: Partial<DOMRect>): HTMLElement {
@@ -23,16 +23,22 @@ function pane(rect: Partial<DOMRect>): HTMLElement {
 /**
  * **jsdom has no `elementFromPoint`.** That single fact is how a z-order gate
  * that refused every drop under a button, a toast and a dialog shipped green
- * through 81 drop tests: the branch was never entered, in any of them. So the
- * tests below install one. A test that passes because the environment lacks
- * the API under test is not a test.
+ * through 81 drop tests: the branch was never entered, in any of them.
+ *
+ * The gate no longer asks a per-point question at all, so the gap can no
+ * longer hide anything here — but the tests below still *install* an
+ * `elementFromPoint` and hand it the most misleading answer available, because
+ * "the module ignores it" is now a property worth pinning. `spy.mock.calls`
+ * proves it directly.
  */
-function stubElementFromPoint(top: Element | null): void {
+function stubElementFromPoint(top: Element | null): ReturnType<typeof vi.fn> {
+  const spy = vi.fn(() => top);
   Object.defineProperty(document, "elementFromPoint", {
     configurable: true,
     writable: true,
-    value: () => top,
+    value: spy,
   });
+  return spy;
 }
 
 function removeElementFromPoint(): void {
@@ -125,148 +131,193 @@ describe("dropTarget", () => {
   });
 
   // ---------------------------------------------------------------------
-  // Z-order — the branch jsdom cannot reach on its own
+  // The gate itself: document-wide, and provably not geometric
   // ---------------------------------------------------------------------
 
-  describe("z-order, with elementFromPoint actually present", () => {
-    it("confirms the environment gap this whole block exists for", () => {
-      // If jsdom ever grows layout, this fails and the stubs below can be
-      // reconsidered — but until then, *nothing* reaches the z-order branch
-      // unless a test puts the API there itself.
-      expect(typeof document.elementFromPoint).toBe("undefined");
-    });
-
-    it("accepts a drop onto chrome the pane paints over itself", () => {
-      // The regression. `TerminalView`'s "▼ Following / ▽ Paused" toggle is
-      // `absolute top-2 right-4 z-50` and is rendered *unconditionally*, as a
-      // sibling of the xterm host rather than a child — so a gate asking "does
-      // the pane contain what is painted here?" turned the terminal's top-right
-      // corner into a dead zone that no user action could clear.
-      const el = pane({});
-      const following = document.createElement("button");
-      document.body.appendChild(following); // sibling, not a child of the pane
-      stubElementFromPoint(following);
-
-      expect(classifyDrop(el, { x: 90, y: 5 }, { devicePixelRatio: 1 })).toBe("accept");
-    });
-
-    it("accepts a drop onto a toast floating above every pane", () => {
-      // `ToastHost` is `fixed bottom-4 right-4 z-[60]`, 24rem wide, and its
-      // error cards never time out — so under the containment rule the
-      // bottom-right corner of both the terminal and the Files pane stopped
-      // accepting drops for as long as one error stayed on screen.
-      const el = pane({});
-      const toastCard = document.createElement("div");
-      document.body.appendChild(toastCard);
-      stubElementFromPoint(toastCard);
-
-      expect(classifyDrop(el, { x: 95, y: 95 }, { devicePixelRatio: 1 })).toBe("accept");
-    });
-
-    it("accepts a drop onto the pane's own content", () => {
+  describe("the blocking gate is document-wide, with no z-order in it", () => {
+    it("never consults elementFromPoint, however tempting its answer", () => {
+      // Round 2 asked `elementFromPoint` whether a *blocker* was painted at
+      // the drop point, and trusted the answer absolutely. Anything painted
+      // above the `z-50` backdrop in the same stacking context — `ToastHost`
+      // at `z-[60]`, `TerminalContextMenu` at `z-[60]` — answered "no blocker
+      // here" on a point the dialog was covering. The fix is not a better
+      // answer, it is not asking: this pins that the call is gone, so a
+      // future edit that reintroduces it fails here rather than in the wild.
       const el = pane({});
       const child = document.createElement("span");
       el.appendChild(child);
-      stubElementFromPoint(child);
+      const spy = stubElementFromPoint(child);
 
       expect(classifyDrop(el, { x: 50, y: 50 }, { devicePixelRatio: 1 })).toBe("accept");
+      expect(spy).not.toHaveBeenCalled();
     });
 
-    it("refuses a drop released onto a dialog's backdrop", () => {
+    it("refuses a covered drop even when a toast is painted over the dialog", () => {
+      // C1, exactly. A refused drop pushes a toast; `ToastHost` is
+      // `fixed bottom-4 right-4 z-[60]` and an error card stays until
+      // dismissed; the *next* drop released on that card had a topmost
+      // element with no blocker in it, and landed in the directory the dialog
+      // was covering. The gate had armed its own hole.
+      const el = pane({});
+      openModal(); // z-50 backdrop, covering the pane
+      const toastCard = document.createElement("div"); // z-[60], over the backdrop
+      document.body.appendChild(toastCard);
+      const spy = stubElementFromPoint(toastCard);
+
+      expect(classifyDrop(el, { x: 50, y: 50 }, { devicePixelRatio: 1 })).toBe("blocked");
+      expect(spy).not.toHaveBeenCalled();
+    });
+
+    it("refuses a drop anywhere in the window while a dialog is open", () => {
+      // Deliberately stricter than "the points the dialog covers". A dialog
+      // is a state the user entered on purpose and leaves with Escape, the
+      // refusal is announced, and nothing is written — whereas being precise
+      // about coverage has silently uploaded into a covered directory twice.
       const el = pane({});
       const { backdrop } = openModal();
-      stubElementFromPoint(backdrop);
+      stubElementFromPoint(document.createElement("div")); // "nothing here"
 
-      expect(classifyDrop(el, { x: 50, y: 50 }, { devicePixelRatio: 1 })).toBe("blocked");
+      expect(classifyDrop(el, { x: 5, y: 5 }, { devicePixelRatio: 1 })).toBe("blocked");
+      expect(classifyDrop(el, { x: 95, y: 95 }, { devicePixelRatio: 1 })).toBe("blocked");
+
+      backdrop.remove();
+      expect(classifyDrop(el, { x: 5, y: 5 }, { devicePixelRatio: 1 })).toBe("accept");
     });
 
-    it("refuses a drop released onto the dialog panel or anything inside it", () => {
+    it("refuses under the shutdown overlay, which is not a dialog", () => {
       const el = pane({});
-      const { panel, button } = openModal();
-
-      stubElementFromPoint(panel);
-      expect(classifyDrop(el, { x: 50, y: 50 }, { devicePixelRatio: 1 })).toBe("blocked");
-
-      stubElementFromPoint(button);
+      const overlay = document.createElement("div");
+      overlay.setAttribute("data-blocks-drop", "true");
+      document.body.appendChild(overlay);
       expect(classifyDrop(el, { x: 50, y: 50 }, { devicePixelRatio: 1 })).toBe("blocked");
     });
 
-    it("refuses a drop under an unmarked overlay that wraps a dialog", () => {
-      // Belt to the braces: a dialog built without `ui/Modal`'s marked
-      // backdrop is still refused, because the element painted at the point
-      // *contains* something modal.
+    it("still refuses a dialog built without ui/Modal's marked backdrop", () => {
+      // Only `aria-modal` is needed; `ui/Modal` is the supported route, but a
+      // hand-rolled dialog must not be a hole either.
       const el = pane({});
       const backdrop = document.createElement("div");
       const panel = document.createElement("div");
       panel.setAttribute("aria-modal", "true");
       backdrop.appendChild(panel);
       document.body.appendChild(backdrop);
-      stubElementFromPoint(backdrop);
 
       expect(classifyDrop(el, { x: 50, y: 50 }, { devicePixelRatio: 1 })).toBe("blocked");
     });
 
-    it("refuses a drop under the shutdown overlay", () => {
+    it("counts a blocker that is only decoratively hidden from assistive tech", () => {
+      // `aria-hidden="true"` used to disqualify a blocker, and it is not a
+      // visibility statement — `ui/Modal`'s own ✕ glyph carries it while
+      // perfectly visible. A blocker nested inside such a wrapper would have
+      // silently stopped blocking. Only `[hidden]` counts now.
       const el = pane({});
+      const wrapper = document.createElement("div");
+      wrapper.setAttribute("aria-hidden", "true");
       const overlay = document.createElement("div");
       overlay.setAttribute("data-blocks-drop", "true");
-      document.body.appendChild(overlay);
-      stubElementFromPoint(overlay);
+      wrapper.appendChild(overlay);
+      document.body.appendChild(wrapper);
 
+      expect(dropIsBlocked()).toBe(true);
       expect(classifyDrop(el, { x: 50, y: 50 }, { devicePixelRatio: 1 })).toBe("blocked");
-    });
-
-    it("scopes a dialog's refusal to the points it actually covers", () => {
-      // `dropIsBlocked` is document-wide and `ui/Modal` portals to
-      // `document.body`, so an open dialog used to refuse every drop in the
-      // window. Asked per point, a dialog only swallows what lands on it.
-      const el = pane({});
-      openModal();
-      const paneContent = document.createElement("span");
-      el.appendChild(paneContent);
-      stubElementFromPoint(paneContent);
-
-      expect(classifyDrop(el, { x: 50, y: 50 }, { devicePixelRatio: 1 })).toBe("accept");
     });
 
     it("ignores a blocker whose pane has stepped aside", () => {
       // `ui/Modal` marks itself `hidden` when the tab that owns it is not the
       // one on screen. A dialog left open in project A must not keep refusing
-      // drops in project B.
+      // drops in project B — this is the one case where over-refusal would be
+      // unbounded, since the user cannot see the dialog to close it.
       const el = pane({});
       const { backdrop } = openModal();
       backdrop.setAttribute("hidden", "");
 
       expect(dropIsBlocked()).toBe(false);
-      stubElementFromPoint(backdrop);
       expect(classifyDrop(el, { x: 50, y: 50 }, { devicePixelRatio: 1 })).toBe("accept");
     });
+  });
 
-    it("falls back to the document-wide question when the point cannot be resolved", () => {
-      // `elementFromPoint` answers `null` for a point outside the viewport, and
-      // `<body>` for a point over nothing in particular. Neither is evidence
-      // that the pane is clear, so the conservative answer is the old one.
+  // ---------------------------------------------------------------------
+  // Round 1's shape: chrome painted over a pane must never refuse a drop
+  // ---------------------------------------------------------------------
+
+  describe("chrome over a pane, with no dialog open", () => {
+    /** Everything that is painted over a pane and is not a blocker. */
+    const CHROME: Array<[string, () => HTMLElement]> = [
+      // `TerminalView`'s "▼ Following / ▽ Paused" toggle: `absolute top-2
+      // right-4 z-50`, rendered unconditionally, and a *sibling* of the xterm
+      // host — so "does the pane contain what is painted here?" made the
+      // terminal's top-right corner a dead zone no user action could clear.
+      ["the Following/Paused toggle", () => document.createElement("button")],
+      // `ToastHost`: `fixed bottom-4 right-4 z-[60]`, 24rem wide, over every
+      // pane, and its error cards stay until dismissed.
+      ["a toast card", () => document.createElement("div")],
+      // The drop hint is `pointer-events-none`, so a real `elementFromPoint`
+      // skips it — but nothing may depend on that any more.
+      ["the pane's own drop hint", () => document.createElement("div")],
+      // `Tooltip` portals to `document.body`, so it is nobody's child.
+      ["a portaled tooltip", () => document.createElement("div")],
+    ];
+
+    for (const [name, make] of CHROME) {
+      it(`accepts a drop released onto ${name}`, () => {
+        const el = pane({});
+        const chrome = make();
+        document.body.appendChild(chrome); // a sibling, not a child of the pane
+        stubElementFromPoint(chrome);
+
+        expect(classifyDrop(el, { x: 90, y: 5 }, { devicePixelRatio: 1 })).toBe("accept");
+        expect(classifyDrop(el, { x: 95, y: 95 }, { devicePixelRatio: 1 })).toBe("accept");
+      });
+    }
+
+    it("accepts a drop on the gutter around the terminal, and on its content", () => {
       const el = pane({});
-      openModal();
+      const child = document.createElement("span");
+      el.appendChild(child);
+      stubElementFromPoint(child);
+      expect(classifyDrop(el, { x: 50, y: 50 }, { devicePixelRatio: 1 })).toBe("accept");
 
-      stubElementFromPoint(null);
-      expect(classifyDrop(el, { x: 50, y: 50 }, { devicePixelRatio: 1 })).toBe("blocked");
-
-      stubElementFromPoint(document.body);
-      expect(classifyDrop(el, { x: 50, y: 50 }, { devicePixelRatio: 1 })).toBe("blocked");
+      stubElementFromPoint(el); // the gutter: the wrapper itself is topmost
+      expect(classifyDrop(el, { x: 1, y: 99 }, { devicePixelRatio: 1 })).toBe("accept");
     });
 
-    it("tells a refused drop apart from someone else's drop", () => {
-      // The caller reports one and stays silent about the other: a drop that
-      // was aimed at this pane and swallowed by an overlay is invisible unless
-      // something says so, while a drop into another pane is not ours to
-      // narrate.
+    it("accepts a drop the view could not resolve to any element", () => {
+      // `elementFromPoint` answers `null` outside the viewport and `<body>`
+      // over nothing in particular. With no dialog open neither is a reason
+      // to refuse a drop that is inside the pane's rect.
       const el = pane({});
-      const { backdrop } = openModal();
-      stubElementFromPoint(backdrop);
+      stubElementFromPoint(null);
+      expect(classifyDrop(el, { x: 50, y: 50 }, { devicePixelRatio: 1 })).toBe("accept");
+      stubElementFromPoint(document.body);
+      expect(classifyDrop(el, { x: 50, y: 50 }, { devicePixelRatio: 1 })).toBe("accept");
+    });
+  });
 
-      expect(classifyDrop(el, { x: 50, y: 50 }, { devicePixelRatio: 1 })).toBe("blocked");
-      expect(classifyDrop(el, { x: 900, y: 900 }, { devicePixelRatio: 1 })).toBe("elsewhere");
+  // ---------------------------------------------------------------------
+  // Routing: exactly one listener speaks for a given drop
+  // ---------------------------------------------------------------------
+
+  describe("routing", () => {
+    it("lets only the pane the drop landed on report a refusal", () => {
+      // Geometry is asked before the gate for this reason: both listeners are
+      // live for every drop, and if the gate came first they would both push
+      // "File drop ignored" for one drop.
+      const hit = pane({});
+      const missed = pane({ left: 200, right: 300, top: 200, bottom: 300 });
+      openModal();
+
+      expect(classifyDrop(hit, { x: 50, y: 50 }, { devicePixelRatio: 1 })).toBe("blocked");
+      expect(classifyDrop(missed, { x: 50, y: 50 }, { devicePixelRatio: 1 })).toBe(
+        "elsewhere",
+      );
+    });
+
+    it("says elsewhere, not blocked, for a hidden pane's zero-size rect", () => {
+      const hidden = pane({ right: 0, bottom: 0, width: 0, height: 0 });
+      openModal();
+      expect(classifyDrop(hidden, { x: 0, y: 0 }, { devicePixelRatio: 1 })).toBe(
+        "elsewhere",
+      );
     });
   });
 

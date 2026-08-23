@@ -381,11 +381,13 @@ describe("FilesTab host drag-and-drop", () => {
   });
 
   it("accepts a drop that lands on a toast floating over the pane", async () => {
-    // `ToastHost` is `fixed bottom-4 right-4 z-[60]` and 24rem wide, and its
-    // error cards stay until dismissed — so a z-order gate asking "is what is
-    // painted here part of my pane?" made the bottom-right corner of this pane
-    // refuse drops for as long as one error was on screen. jsdom has no
-    // `elementFromPoint`, so that branch only runs when a test supplies one.
+    // Round 1. `ToastHost` is `fixed bottom-4 right-4 z-[60]` and 24rem wide,
+    // and its error cards stay until dismissed — so a z-order gate asking "is
+    // what is painted here part of my pane?" made the bottom-right corner of
+    // this pane refuse drops for as long as one error was on screen. jsdom has
+    // no `elementFromPoint`, so that branch only ran when a test supplied one;
+    // the gate no longer asks, and this pins that nothing painted over a pane
+    // can refuse a drop on its own account.
     await renderTab();
     const toastCard = document.createElement("div");
     document.body.appendChild(toastCard);
@@ -402,21 +404,37 @@ describe("FilesTab host drag-and-drop", () => {
     toastCard.remove();
   });
 
-  it("refuses a drop that lands on a dialog painted over the pane", async () => {
+  it("refuses a drop while a dialog is open, toast painted over it or not", async () => {
+    // Round 2, which is the reason this file exists in its current shape. The
+    // refusal pushes a toast; `ToastHost` is `z-[60]` and the `Modal` backdrop
+    // is `z-50` in the same stacking context, so the *toast* becomes the
+    // topmost element over a covered pane. A gate that asked `elementFromPoint`
+    // "is a blocker painted here?" then answered no and uploaded into the
+    // directory the dialog was covering — one refused drop was all it took to
+    // open the hole. Both stubs below therefore have to be refused.
     await renderTab();
     const backdrop = document.createElement("div");
     backdrop.setAttribute("data-blocks-drop", "true");
     document.body.appendChild(backdrop);
-    Object.defineProperty(document, "elementFromPoint", {
-      configurable: true,
-      writable: true,
-      value: () => backdrop,
-    });
+    const toastCard = document.createElement("div"); // z-[60], above the backdrop
+    document.body.appendChild(toastCard);
+    const stub = (top: Element) =>
+      Object.defineProperty(document, "elementFromPoint", {
+        configurable: true,
+        writable: true,
+        value: () => top,
+      });
 
+    stub(backdrop);
     await drop(["/host/a.png"], { x: 400, y: 300 });
     expect(uploadFileToContainer).not.toHaveBeenCalled();
 
+    stub(toastCard);
+    await drop(["/host/a.png"], { x: 700, y: 550 });
+    expect(uploadFileToContainer).not.toHaveBeenCalled();
+
     delete (document as Partial<Document>).elementFromPoint;
+    toastCard.remove();
     backdrop.remove();
   });
 

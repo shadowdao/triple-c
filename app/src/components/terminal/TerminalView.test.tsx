@@ -292,9 +292,12 @@ describe("TerminalView — where a dropped file lands", () => {
     return view;
   }
 
-  /** jsdom has no `elementFromPoint`, so the z-order branch is unreachable
+  /** jsdom has no `elementFromPoint`, so a z-order branch is unreachable
    *  unless a test supplies one — which is exactly how a gate that refused
-   *  every drop under the Following toggle shipped through this file green. */
+   *  every drop under the Following toggle shipped through this file green.
+   *  The gate asks no per-point question any more, but the tests below still
+   *  install one and feed it the most misleading answer available, to pin
+   *  that the routing does not change when it is there. */
   function stubElementFromPoint(top: Element | null) {
     Object.defineProperty(document, "elementFromPoint", {
       configurable: true,
@@ -369,7 +372,8 @@ describe("TerminalView — where a dropped file lands", () => {
     delete (document as Partial<Document>).elementFromPoint;
   });
 
-  it("refuses — and says so — when a dialog is painted over the drop point", async () => {
+  it("refuses — and says so — while a dialog is open", async () => {
+    useAppState.setState({ toasts: [] });
     await mountWithLayout();
     const backdrop = document.createElement("div");
     backdrop.setAttribute("data-blocks-drop", "true");
@@ -383,10 +387,49 @@ describe("TerminalView — where a dropped file lands", () => {
 
     expect(vi.mocked(uploadHostFileToTerminal)).not.toHaveBeenCalled();
     // A refused drop is otherwise indistinguishable from a broken one.
-    expect(
-      useAppState.getState().toasts.some((t) => t.message === "File drop ignored"),
-    ).toBe(true);
+    const notice = useAppState
+      .getState()
+      .toasts.find((t) => t.message === "File drop ignored");
+    expect(notice).toBeTruthy();
+    // Not an error: the user has a dialog open, which is a state they chose
+    // and can leave with Escape. An error card would sit there until
+    // dismissed, and `ToastHost` paints at `z-[60]`.
+    expect(notice?.kind).toBe("info");
 
+    backdrop.remove();
+    delete (document as Partial<Document>).elementFromPoint;
+  });
+
+  it("keeps refusing when the refusal's own toast is painted over the dialog", async () => {
+    // C1, end to end. Refusing pushes a toast; `ToastHost` is `fixed
+    // bottom-4 right-4 z-[60]` and the `Modal` backdrop is `z-50` in the same
+    // stacking context — so the toast is the topmost element over the covered
+    // pane, and a gate that asked "is a blocker painted here?" answered no and
+    // uploaded into the directory the dialog was covering. The gate had armed
+    // its own hole: one refused drop was all it took to open it.
+    useAppState.setState({ toasts: [] });
+    await mountWithLayout();
+    const backdrop = document.createElement("div");
+    backdrop.setAttribute("data-blocks-drop", "true");
+    document.body.appendChild(backdrop);
+    stubElementFromPoint(backdrop);
+
+    await drop(400, 300);
+    expect(vi.mocked(uploadHostFileToTerminal)).not.toHaveBeenCalled();
+    expect(useAppState.getState().toasts).toHaveLength(1);
+
+    // The toast is now on screen, above the backdrop, and the user drops again
+    // on the very point it occupies.
+    const toastCard = document.createElement("div");
+    document.body.appendChild(toastCard);
+    stubElementFromPoint(toastCard);
+
+    await drop(700, 550);
+    expect(vi.mocked(uploadHostFileToTerminal)).not.toHaveBeenCalled();
+    // …and a second refusal replaces the first notice rather than stacking.
+    expect(useAppState.getState().toasts).toHaveLength(1);
+
+    toastCard.remove();
     backdrop.remove();
     delete (document as Partial<Document>).elementFromPoint;
   });

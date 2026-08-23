@@ -109,9 +109,9 @@ describe("Modal", () => {
   // -------------------------------------------------------------------------
 
   it("marks its backdrop as swallowing native file drops", async () => {
-    // The backdrop, not the panel, is what `elementFromPoint` returns for a
-    // drop released beside the dialog — so it is the element that has to carry
-    // the marker `lib/dropTarget` looks for.
+    // `lib/dropTarget` refuses every drop in the window while a dialog is on
+    // screen, and this marker is half of how it knows one is (the panel's
+    // `aria-modal` is the other half).
     render(
       <Modal title="Reset" onClose={vi.fn()}>
         <p>body</p>
@@ -141,12 +141,16 @@ describe("Modal", () => {
     expect(backdrop.hidden).toBe(true);
     expect(backdrop.style.display).toBe("none");
     expect(dropIsBlocked()).toBe(false);
+    // Two independent reasons it does not block, because they are maintained
+    // in two files: the marker is gone *and* `[hidden]` disqualifies it.
+    expect(backdrop.hasAttribute("data-blocks-drop")).toBe(false);
     expect(backdrop.contains(document.activeElement)).toBe(false);
 
     fireEvent.keyDown(document, { key: "Escape" });
     expect(onClose).not.toHaveBeenCalled();
 
     // Back on screen: the same dialog, still mounted, resumes everything.
+    // (Including the marker: it is dropped on hide, not written once at mount.)
     rerender(
       <PaneVisibilityProvider visible={true}>
         <Modal title="Reset" onClose={onClose}>
@@ -160,6 +164,46 @@ describe("Modal", () => {
     expect(screen.getByRole("dialog").contains(document.activeElement)).toBe(true);
     fireEvent.keyDown(document, { key: "Escape" });
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not leave focus inside itself when its pane steps aside", async () => {
+    // The dialog goes `display:none` with the keyboard focus still inside it,
+    // and nothing else relocates it — so the user arrives on the tab they
+    // switched to with focus held by a dialog they cannot see, Tab resuming
+    // from inside it. jsdom does not blur on `display:none` either, so this
+    // is exactly the state the assertion below describes.
+    const { rerender } = render(
+      <PaneVisibilityProvider visible={true}>
+        <Modal title="Reset" onClose={vi.fn()}>
+          <button>Confirm</button>
+        </Modal>
+      </PaneVisibilityProvider>,
+    );
+    await flushFocus();
+    const panel = screen.getByRole("dialog");
+    expect(panel.contains(document.activeElement)).toBe(true);
+
+    rerender(
+      <PaneVisibilityProvider visible={false}>
+        <Modal title="Reset" onClose={vi.fn()}>
+          <button>Confirm</button>
+        </Modal>
+      </PaneVisibilityProvider>,
+    );
+    await flushFocus();
+    expect(panel.contains(document.activeElement)).toBe(false);
+    expect(document.activeElement).toBe(document.body);
+
+    // …and coming back puts it where it was: inside the dialog.
+    rerender(
+      <PaneVisibilityProvider visible={true}>
+        <Modal title="Reset" onClose={vi.fn()}>
+          <button>Confirm</button>
+        </Modal>
+      </PaneVisibilityProvider>,
+    );
+    await flushFocus();
+    expect(screen.getByRole("dialog").contains(document.activeElement)).toBe(true);
   });
 
   it("ignores Escape and overlay clicks when not dismissible", async () => {

@@ -21,7 +21,7 @@ import {
   parseUrlRelayOsc,
   sanitizeRelayUrl,
 } from "../../lib/urlRelay";
-import { classifyDrop } from "../../lib/dropTarget";
+import { classifyDrop, DROP_BLOCKED_TOAST } from "../../lib/dropTarget";
 import UrlToast, {
   URL_TOAST_PRIMARY_SELECTOR,
   URL_TOAST_SELECTOR,
@@ -236,23 +236,22 @@ export default function TerminalView({ sessionId, active }: Props) {
   // onDragDropEvent (HTML5 ondrop on the element wouldn't expose file paths).
   //
   // The listener is window-wide, so every pane decides for itself whether a
-  // drop was meant for it. `isDropTarget` is that decision, shared with the
-  // Files pane: the payload position against this pane's rect (a hidden pane is
-  // `display:none`, so its zero-size rect is what stops two panes both claiming
-  // the drop), plus z-order — which a rect alone cannot see. An open `Modal` is
-  // a `fixed inset-0` portal painted *over* the window and the pane underneath
-  // still has its rect, so the geometric test that used to live here uploaded
-  // files into the directory a dialog was covering. Same for the shutdown
-  // overlay, which is on screen precisely while nothing should be accepting
-  // work at all.
+  // drop was meant for it. `classifyDrop` is that decision, shared with the
+  // Files pane, and it asks two things in order: is the payload position
+  // inside this pane's rect (a hidden pane is `display:none`, so its zero-size
+  // rect is what stops two panes both claiming the drop), and — document-wide,
+  // with no geometry — is a modal or blocking overlay on screen at all? An
+  // open `Modal` is a `fixed inset-0` portal painted *over* the window and the
+  // pane underneath still has its rect, so a rect alone uploaded files into
+  // the directory a dialog was covering. See `lib/dropTarget.ts` for why the
+  // blocking half is deliberately not a per-point z-order test.
   //
   // The rect asked about is the **pane wrapper**, not the xterm host inside it:
   // the pane is what the user sees as "the terminal", gutter included, and the
   // chrome painted over it (the Following toggle, the URL toast) is a sibling
-  // of the host rather than a child. `classifyDrop` answers "is a *blocking
-  // overlay* here?" rather than "is this element mine?" for the same reason —
-  // asking the second question turned every pixel under that chrome into a
-  // permanent dead zone.
+  // of the host rather than a child. Nothing painted over the pane refuses a
+  // drop on its own account — asking "is this element mine?" once turned every
+  // pixel under that chrome into a permanent dead zone.
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     let cancelled = false;
@@ -276,15 +275,10 @@ export default function TerminalView({ sessionId, active }: Props) {
         // sits above it.
         if (verdict === "blocked") {
           console.warn(
-            "[drop] refused: an overlay is covering the drop point",
+            "[drop] refused: a dialog or overlay is open",
             event.payload.position,
           );
-          useAppState.getState().pushToast({
-            kind: "info",
-            message: "File drop ignored",
-            detail:
-              "A dialog or full-window overlay is covering that point. Close it and drop the file again.",
-          });
+          useAppState.getState().pushToast(DROP_BLOCKED_TOAST);
           return;
         }
         if (verdict !== "accept") return;

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type { FileEntry, Project } from "../../../lib/types";
 import { useFileManager } from "../../../hooks/useFileManager";
-import { classifyDrop, isDropTarget } from "../../../lib/dropTarget";
+import { classifyDrop, isDropTarget, DROP_BLOCKED_TOAST } from "../../../lib/dropTarget";
 import { useAppState } from "../../../store/appState";
 import Button from "../../ui/Button";
 import FileViewerModal from "./FileViewerModal";
@@ -240,11 +240,11 @@ export default function FilesTab({ project }: Props) {
   // reason `TerminalView` uses it: `dragDropEnabled` is on (the terminal needs
   // it), which blocks HTML5 drag inside the webview on Windows, and only the
   // native payload carries real file *paths*. The listener is window-wide, so
-  // routing is `classifyDrop` — the rect hit test *plus* the z-order question
-  // a rect cannot answer: is a modal or a blocking overlay painted at that
-  // point? (Not "is that element mine": chrome painted over a pane — a toast,
-  // a button — is not something that swallows a drop, and treating it as such
-  // made permanent dead zones.)
+  // routing is `classifyDrop` — the rect hit test, which says *whose* drop it
+  // is, plus the document-wide question a rect cannot answer: is a modal or a
+  // blocking overlay on screen at all? That second half is deliberately not a
+  // per-point z-order test; `lib/dropTarget.ts` records the two ways that went
+  // wrong.
   useEffect(() => {
     if (!running) return;
     let unlisten: (() => void) | undefined;
@@ -267,16 +267,8 @@ export default function FilesTab({ project }: Props) {
         // Aimed at this pane and refused anyway: say so. Nothing else would —
         // the file just never appears in the listing.
         if (verdict === "blocked") {
-          console.warn(
-            "[drop] refused: an overlay is covering the drop point",
-            payload.position,
-          );
-          useAppState.getState().pushToast({
-            kind: "info",
-            message: "File drop ignored",
-            detail:
-              "A dialog or full-window overlay is covering that point. Close it and drop the file again.",
-          });
+          console.warn("[drop] refused: a dialog or overlay is open", payload.position);
+          useAppState.getState().pushToast(DROP_BLOCKED_TOAST);
           return;
         }
         if (verdict !== "accept") return;
