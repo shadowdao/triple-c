@@ -49,6 +49,42 @@ describe("isFileExistsError", () => {
     expect(isFileExistsError(42)).toBe(false);
     expect(isFileExistsError({})).toBe(false);
   });
+
+  it("cannot be forged by the name of the file being uploaded", () => {
+    // The one that mattered. Matching `fileexists` anywhere in a normalised
+    // error meant a host file called `file-exists.txt` turned *every* failure
+    // into a collision: the overwrite prompt appeared over a permission error,
+    // and Replace re-invoked the upload with `overwrite: true`, clobbering
+    // whatever shared that name in the container.
+    expect(
+      isFileExistsError("Failed to upload /host/file-exists.txt: Permission denied"),
+    ).toBe(false);
+    expect(
+      isFileExistsError({
+        message: "cp: cannot create regular file '/workspace/FILE_EXISTS.txt'",
+      }),
+    ).toBe(false);
+    expect(isFileExistsError("no space left on device: /host/File Exists.png")).toBe(
+      false,
+    );
+    // A path that merely ends in the marker is a path, not the marker.
+    expect(isFileExistsError("cannot stat /workspace/FILE_EXISTS: no such file")).toBe(
+      false,
+    );
+    // …while the contract's own shape still reads as the refusal it is.
+    expect(
+      isFileExistsError("FILE_EXISTS: /workspace/file-exists.txt already exists"),
+    ).toBe(true);
+  });
+
+  it("still reads a wrapped error whose `error` field is a whole sentence", () => {
+    // `error` is listed as a discriminant field but routinely carries prose,
+    // so it is held to both standards.
+    expect(
+      isFileExistsError({ error: "FILE_EXISTS: /workspace/a.txt already exists" }),
+    ).toBe(true);
+    expect(isFileExistsError({ error: "upload of file-exists.txt failed" })).toBe(false);
+  });
 });
 
 describe("fileExistsPath", () => {

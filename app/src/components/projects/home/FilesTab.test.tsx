@@ -394,15 +394,83 @@ describe("FilesTab host drag-and-drop", () => {
     expect(uploadFileToContainer).not.toHaveBeenCalled();
   });
 
-  it("divides the payload position by devicePixelRatio", async () => {
-    // The native payload is in physical pixels; the rect is in CSS pixels.
-    // At dpr 2 a physical (900, 900) is a CSS (450, 450) — inside an 800x600 pane.
-    const original = window.devicePixelRatio;
+  it("divides the payload position by devicePixelRatio on Windows only", async () => {
+    // Only wry's WebView2 backend hands over *physical* pixels; the macOS and
+    // GTK ones deliver logical points and `tauri-runtime-wry` does not rescale
+    // them. At dpr 2 a physical (900, 900) is a CSS (450, 450) — inside the
+    // 800x600 pane — but the same payload on a HiDPI Mac or Linux box really
+    // is (900, 900) and belongs to nobody.
+    const originalDpr = window.devicePixelRatio;
+    const originalUa = window.navigator.userAgent;
     Object.defineProperty(window, "devicePixelRatio", { value: 2, configurable: true });
+    Object.defineProperty(window.navigator, "userAgent", {
+      value: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+      configurable: true,
+    });
     await renderTab();
     await drop(["/host/a.png"], { x: 900, y: 900 });
     expect(uploadFileToContainer).toHaveBeenCalled();
-    Object.defineProperty(window, "devicePixelRatio", { value: original, configurable: true });
+
+    Object.defineProperty(window.navigator, "userAgent", {
+      value: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15",
+      configurable: true,
+    });
+    vi.mocked(uploadFileToContainer).mockClear();
+    await drop(["/host/a.png"], { x: 900, y: 900 });
+    expect(uploadFileToContainer).not.toHaveBeenCalled();
+    // …and the *unhalved* point still lands, which is the half a HiDPI Mac
+    // user was losing.
+    await drop(["/host/a.png"], { x: 400, y: 300 });
+    expect(uploadFileToContainer).toHaveBeenCalled();
+
+    Object.defineProperty(window, "devicePixelRatio", {
+      value: originalDpr,
+      configurable: true,
+    });
+    Object.defineProperty(window.navigator, "userAgent", {
+      value: originalUa,
+      configurable: true,
+    });
+  });
+
+  it("accepts a drop that lands on a toast floating over the pane", async () => {
+    // `ToastHost` is `fixed bottom-4 right-4 z-[60]` and 24rem wide, and its
+    // error cards stay until dismissed — so a z-order gate asking "is what is
+    // painted here part of my pane?" made the bottom-right corner of this pane
+    // refuse drops for as long as one error was on screen. jsdom has no
+    // `elementFromPoint`, so that branch only runs when a test supplies one.
+    await renderTab();
+    const toastCard = document.createElement("div");
+    document.body.appendChild(toastCard);
+    Object.defineProperty(document, "elementFromPoint", {
+      configurable: true,
+      writable: true,
+      value: () => toastCard,
+    });
+
+    await drop(["/host/a.png"], { x: 700, y: 550 });
+    expect(uploadFileToContainer).toHaveBeenCalled();
+
+    delete (document as Partial<Document>).elementFromPoint;
+    toastCard.remove();
+  });
+
+  it("refuses a drop that lands on a dialog painted over the pane", async () => {
+    await renderTab();
+    const backdrop = document.createElement("div");
+    backdrop.setAttribute("data-blocks-drop", "true");
+    document.body.appendChild(backdrop);
+    Object.defineProperty(document, "elementFromPoint", {
+      configurable: true,
+      writable: true,
+      value: () => backdrop,
+    });
+
+    await drop(["/host/a.png"], { x: 400, y: 300 });
+    expect(uploadFileToContainer).not.toHaveBeenCalled();
+
+    delete (document as Partial<Document>).elementFromPoint;
+    backdrop.remove();
   });
 
   it("highlights the pane while a drag hovers it, and drops the highlight on leave", async () => {

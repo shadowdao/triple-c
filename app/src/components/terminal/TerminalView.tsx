@@ -21,7 +21,7 @@ import {
   parseUrlRelayOsc,
   sanitizeRelayUrl,
 } from "../../lib/urlRelay";
-import { isDropTarget } from "../../lib/dropTarget";
+import { classifyDrop } from "../../lib/dropTarget";
 import UrlToast, {
   URL_TOAST_PRIMARY_SELECTOR,
   URL_TOAST_SELECTOR,
@@ -237,14 +237,22 @@ export default function TerminalView({ sessionId, active }: Props) {
   //
   // The listener is window-wide, so every pane decides for itself whether a
   // drop was meant for it. `isDropTarget` is that decision, shared with the
-  // Files pane: the physical-pixel position ÷ `devicePixelRatio` against this
-  // pane's rect (a hidden pane is `display:none`, so its zero-size rect is what
-  // stops two panes both claiming the drop), plus z-order — which a rect alone
-  // cannot see. An open `Modal` is a `fixed inset-0` portal painted *over* the
-  // window and the pane underneath still has its rect, so the geometric test
-  // that used to live here uploaded files into the directory a dialog was
-  // covering. Same for the shutdown overlay, which is on screen precisely while
-  // nothing should be accepting work at all.
+  // Files pane: the payload position against this pane's rect (a hidden pane is
+  // `display:none`, so its zero-size rect is what stops two panes both claiming
+  // the drop), plus z-order — which a rect alone cannot see. An open `Modal` is
+  // a `fixed inset-0` portal painted *over* the window and the pane underneath
+  // still has its rect, so the geometric test that used to live here uploaded
+  // files into the directory a dialog was covering. Same for the shutdown
+  // overlay, which is on screen precisely while nothing should be accepting
+  // work at all.
+  //
+  // The rect asked about is the **pane wrapper**, not the xterm host inside it:
+  // the pane is what the user sees as "the terminal", gutter included, and the
+  // chrome painted over it (the Following toggle, the URL toast) is a sibling
+  // of the host rather than a child. `classifyDrop` answers "is a *blocking
+  // overlay* here?" rather than "is this element mine?" for the same reason —
+  // asking the second question turned every pixel under that chrome into a
+  // permanent dead zone.
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     let cancelled = false;
@@ -257,7 +265,29 @@ export default function TerminalView({ sessionId, active }: Props) {
     (async () => {
       const un = await getCurrentWebview().onDragDropEvent(async (event) => {
         if (event.payload.type !== "drop") return;
-        if (!isDropTarget(containerRef.current, event.payload.position)) return;
+        const verdict = classifyDrop(
+          terminalContainerRef.current,
+          event.payload.position,
+        );
+        // A refused drop is invisible — the file simply does not arrive — so
+        // the one case where the user aimed at us and we said no gets both a
+        // log line and something on screen. The toast, not `imagePasteMsg`:
+        // whatever refused this is painted over the terminal, and `ToastHost`
+        // sits above it.
+        if (verdict === "blocked") {
+          console.warn(
+            "[drop] refused: an overlay is covering the drop point",
+            event.payload.position,
+          );
+          useAppState.getState().pushToast({
+            kind: "info",
+            message: "File drop ignored",
+            detail:
+              "A dialog or full-window overlay is covering that point. Close it and drop the file again.",
+          });
+          return;
+        }
+        if (verdict !== "accept") return;
 
         const paths = event.payload.paths ?? [];
         if (paths.length === 0) return;

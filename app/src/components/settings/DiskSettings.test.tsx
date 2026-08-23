@@ -943,6 +943,65 @@ describe("DiskSettings", () => {
     expect(within(dialog).getByRole("alert")).toHaveTextContent(/no space left on device/);
   });
 
+  it("keeps the semi-safe confirmation open, in the backend's words, when it is refused", async () => {
+    // A refusal comes back inside `Ok` — the command succeeded at declining —
+    // so it never reaches `error`, and reading only "did it throw" closed the
+    // dialog, dropped the tick list, and left the explanation in the outcome
+    // panel several screens above the row that was clicked. The sentence shown
+    // is the backend's own: it is the only side that knows which blocker is
+    // actually holding the project.
+    listReclaimable.mockResolvedValue(
+      plan({
+        items: [
+          item({
+            target: { kind: "compact_snapshot", project_id: "p-whp" },
+            safety: "semi_safe",
+            label: "Compact whp's snapshot",
+            bytes: 5_100_000_000,
+            bytes_are_exact: false,
+            bytes_floor: 0,
+          }),
+        ],
+      }),
+    );
+    reclaim.mockResolvedValue({
+      results: [
+        {
+          target: { kind: "compact_snapshot", project_id: "p-whp" },
+          destroyed: null,
+          ok: false,
+          freed_bytes: 0,
+          projected_bytes: null,
+          message: "Cannot compact whp: a terminal session is still attached.",
+        } as ReclaimResult,
+      ],
+      total_freed_bytes: 0,
+    });
+
+    await renderAndScan();
+    const semi = await screen.findByTestId("disk-semi-bucket");
+    await act(async () => {
+      fireEvent.click(within(semi).getByRole("button", { name: "Run…" }));
+    });
+    await act(async () => {
+      fireEvent.click(
+        within(screen.getByRole("dialog")).getByRole("button", { name: "Run it" }),
+      );
+    });
+
+    const dialog = screen.getByRole("dialog");
+    expect(dialog).toBeInTheDocument();
+    expect(within(dialog).getByRole("alert")).toHaveTextContent(
+      /a terminal session is still attached/,
+    );
+    // Nothing was removed, so the row that offered the action is still there.
+    expect(
+      within(await screen.findByTestId("disk-semi-bucket")).getByRole("button", {
+        name: "Run…",
+      }),
+    ).toBeInTheDocument();
+  });
+
   it("closes the confirmation once the action succeeds", async () => {
     listReclaimable.mockResolvedValue(
       plan({

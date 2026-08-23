@@ -266,12 +266,17 @@ describe("supersedes — who owns the prompt slot", () => {
 describe("TerminalView — where a dropped file lands", () => {
   /** Mount, let the async drag-drop registration settle, and give the pane a
    *  rect — jsdom has no layout, so every element is 0×0 and would be rejected
-   *  as a hidden pane. */
+   *  as a hidden pane.
+   *
+   *  The rect goes on the *pane wrapper*, which is what the hit test asks
+   *  about: it is what the user sees as the terminal (gutter included), and
+   *  the chrome painted over it — the Following toggle, the URL toast — are
+   *  its children rather than the xterm host's. */
   async function mountWithLayout() {
     const view = mountSession("bash");
     await act(async () => {});
-    const pane = view.container.querySelector(".xterm")?.parentElement;
-    if (!pane) throw new Error("terminal host element not found");
+    const pane = view.container.firstElementChild as HTMLElement | null;
+    if (!pane) throw new Error("terminal pane not found");
     pane.getBoundingClientRect = () =>
       ({
         left: 0,
@@ -285,6 +290,17 @@ describe("TerminalView — where a dropped file lands", () => {
         toJSON: () => ({}),
       }) as DOMRect;
     return view;
+  }
+
+  /** jsdom has no `elementFromPoint`, so the z-order branch is unreachable
+   *  unless a test supplies one — which is exactly how a gate that refused
+   *  every drop under the Following toggle shipped through this file green. */
+  function stubElementFromPoint(top: Element | null) {
+    Object.defineProperty(document, "elementFromPoint", {
+      configurable: true,
+      writable: true,
+      value: () => top,
+    });
   }
 
   async function drop(x: number, y: number) {
@@ -332,6 +348,47 @@ describe("TerminalView — where a dropped file lands", () => {
     dialog.remove();
     await drop(400, 300);
     expect(vi.mocked(uploadHostFileToTerminal)).toHaveBeenCalledTimes(1);
+  });
+
+  it("uploads a file dropped onto the always-present Following toggle", async () => {
+    // The regression this file could not see. The toggle is `absolute top-2
+    // right-4 z-50` and is rendered unconditionally, so `elementFromPoint`
+    // returns *it* for the terminal's top-right corner — and a gate asking
+    // "is what is painted here inside the xterm host?" answered no, forever,
+    // with no message and no log line. jsdom never ran that branch.
+    const view = await mountWithLayout();
+    const toggle = view.getByTitle(/Auto-scroll/i);
+    stubElementFromPoint(toggle);
+
+    await drop(780, 10);
+
+    expect(vi.mocked(uploadHostFileToTerminal)).toHaveBeenCalledWith(
+      "s1",
+      "/host/dropped.txt",
+    );
+    delete (document as Partial<Document>).elementFromPoint;
+  });
+
+  it("refuses — and says so — when a dialog is painted over the drop point", async () => {
+    await mountWithLayout();
+    const backdrop = document.createElement("div");
+    backdrop.setAttribute("data-blocks-drop", "true");
+    const panel = document.createElement("div");
+    panel.setAttribute("aria-modal", "true");
+    backdrop.appendChild(panel);
+    document.body.appendChild(backdrop);
+    stubElementFromPoint(backdrop);
+
+    await drop(400, 300);
+
+    expect(vi.mocked(uploadHostFileToTerminal)).not.toHaveBeenCalled();
+    // A refused drop is otherwise indistinguishable from a broken one.
+    expect(
+      useAppState.getState().toasts.some((t) => t.message === "File drop ignored"),
+    ).toBe(true);
+
+    backdrop.remove();
+    delete (document as Partial<Document>).elementFromPoint;
   });
 });
 

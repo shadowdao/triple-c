@@ -368,6 +368,84 @@ describe("useDiskUsage", () => {
     expect(result.current.error).toMatch(/in use by a running container/);
   });
 
+  it("calls a refusal that came back inside `Ok` a failure, and keeps the plan", async () => {
+    // `reclaim` reports per-target results, and a compaction the backend
+    // declined is `ok: false` with a sentence saying why — not a thrown error.
+    // Treating that as success closed the dialog that asked for it and took
+    // the tick list away, even though every object it listed is still there.
+    getDockerDiskUsage.mockResolvedValue(report("first"));
+    reclaim.mockResolvedValue({
+      results: [
+        {
+          target: { kind: "compact_snapshot", project_id: "p1" },
+          destroyed: null,
+          ok: false,
+          freed_bytes: 0,
+          projected_bytes: null,
+          message: "Cannot compact p1: a terminal session is still attached.",
+        },
+      ],
+      total_freed_bytes: 0,
+    });
+    const { result } = renderHook(() => useDiskUsage());
+    await act(async () => {
+      await result.current.scan();
+    });
+    let ok: boolean | undefined;
+    await act(async () => {
+      ok = await result.current.runReclaim([{ kind: "compact_snapshot", project_id: "p1" }]);
+    });
+    expect(ok).toBe(false);
+    expect(result.current.plan).toEqual(plan);
+    expect(result.current.outcome?.results[0].message).toMatch(/still attached/);
+  });
+
+  it("drops the plan when part of a batch did happen", async () => {
+    getDockerDiskUsage.mockResolvedValue(report("first"));
+    reclaim.mockResolvedValue({
+      results: [
+        { target: { kind: "dangling_snapshots" }, destroyed: null, ok: true, freed_bytes: 12, projected_bytes: null, message: "Removed 3 images" },
+        { target: { kind: "compact_snapshot", project_id: "p1" }, destroyed: null, ok: false, freed_bytes: 0, projected_bytes: null, message: "Refused" },
+      ],
+      total_freed_bytes: 12,
+    });
+    const { result } = renderHook(() => useDiskUsage());
+    await act(async () => {
+      await result.current.scan();
+    });
+    let ok: boolean | undefined;
+    await act(async () => {
+      ok = await result.current.runReclaim([
+        { kind: "dangling_snapshots" },
+        { kind: "compact_snapshot", project_id: "p1" },
+      ]);
+    });
+    expect(ok).toBe(false);
+    expect(result.current.plan).toBeNull();
+  });
+
+  it("calls a refused destroy a failure and leaves its row in the plan", async () => {
+    getDockerDiskUsage.mockResolvedValue(report("first"));
+    destroyProjectDiskObject.mockResolvedValue({
+      target: null,
+      destroyed: { kind: "home_volume", project_id: "p1" },
+      ok: false,
+      freed_bytes: 0,
+      projected_bytes: null,
+      message: "The volume is still attached to a running container.",
+    });
+    const { result } = renderHook(() => useDiskUsage());
+    await act(async () => {
+      await result.current.scan();
+    });
+    let ok: boolean | undefined;
+    await act(async () => {
+      ok = await result.current.destroy({ kind: "home_volume", project_id: "p1" }, "whp");
+    });
+    expect(ok).toBe(false);
+    expect(result.current.plan).toEqual(plan);
+  });
+
   it("reports success when the call came back", async () => {
     const { result } = renderHook(() => useDiskUsage());
     let ok: boolean | undefined;

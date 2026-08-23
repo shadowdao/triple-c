@@ -3,7 +3,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { startDrag } from "@crabnebula/tauri-plugin-drag";
 import type { FileEntry, Project } from "../../../lib/types";
 import { useFileManager } from "../../../hooks/useFileManager";
-import { isDropTarget } from "../../../lib/dropTarget";
+import { classifyDrop, isDropTarget } from "../../../lib/dropTarget";
 import { useAppState } from "../../../store/appState";
 import Button from "../../ui/Button";
 import FileViewerModal from "./FileViewerModal";
@@ -413,8 +413,11 @@ export default function FilesTab({ project }: Props) {
   // reason `TerminalView` uses it: `dragDropEnabled` is on (the terminal needs
   // it), which blocks HTML5 drag inside the webview on Windows, and only the
   // native payload carries real file *paths*. The listener is window-wide, so
-  // routing is `isDropTarget` — the rect hit test, in CSS pixels, *plus* the
-  // z-order and "is anything modal on screen" questions a rect cannot answer.
+  // routing is `classifyDrop` — the rect hit test *plus* the z-order question
+  // a rect cannot answer: is a modal or a blocking overlay painted at that
+  // point? (Not "is that element mine": chrome painted over a pane — a toast,
+  // a button — is not something that swallows a drop, and treating it as such
+  // made permanent dead zones.)
   //
   // Two further filters sit in front of it, both about our own drag-out:
   // `dragOutInFlight`, and the staged-path check, which is exact because
@@ -440,7 +443,23 @@ export default function FilesTab({ project }: Props) {
         if (payload.type !== "drop") return;
         setDragOver(false);
         if (dragOutInFlight.current) return;
-        if (!isDropTarget(paneRef.current, payload.position)) return;
+        const verdict = classifyDrop(paneRef.current, payload.position);
+        // Aimed at this pane and refused anyway: say so. Nothing else would —
+        // the file just never appears in the listing.
+        if (verdict === "blocked") {
+          console.warn(
+            "[drop] refused: an overlay is covering the drop point",
+            payload.position,
+          );
+          useAppState.getState().pushToast({
+            kind: "info",
+            message: "File drop ignored",
+            detail:
+              "A dialog or full-window overlay is covering that point. Close it and drop the file again.",
+          });
+          return;
+        }
+        if (verdict !== "accept") return;
         // Anything we staged for a drag-out is our own copy of a file that is
         // already in the container; re-importing it would overwrite the
         // original with a snapshot.
