@@ -227,58 +227,40 @@ async fn container_label(container_id: &str, label: &str) -> Option<String> {
 // Migrate
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Project ids with a migration running **in this process right now**.
-///
-/// Two things need it. `reconcile_project_statuses` is callable from the
-/// frontend at any time, not only at startup, and a live migration looks
-/// exactly like a crashed one from the outside (state file says `in-progress`,
-/// container carries the label) — without this guard a reconcile mid-run would
-/// rewrite the phase to `interrupted` underneath a migration that is fine.
-/// It also makes a second concurrent `migrate_project_to_base` for the same
-/// project impossible.
-static ACTIVE_MIGRATIONS: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashSet<String>>,
-> = std::sync::OnceLock::new();
-
-fn active_migrations() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
-    ACTIVE_MIGRATIONS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
-}
-
 /// Whether a migration for this project is running **in this process right
 /// now**. Every command that stops, removes or recreates the project's
 /// container has to consult it: the window between `remove_container` and the
 /// create that follows looks exactly like "no container", and an ordinary
 /// Start landing in it creates a second container under the same name.
+///
+/// **This is now a view onto [`crate::project_lock`], not a set of its own.**
+/// It used to be the app's only mutual-exclusion primitive, and it was one-way:
+/// a migration claimed a project, everything else merely polled this once at
+/// entry and never claimed anything. Two non-migration writers of
+/// `triple-c-snapshot-{id}:latest` — a compaction and a recreate — could not
+/// see each other at all. Folding the set into the shared registry means there
+/// is exactly one answer to "is something happening to this project", and this
+/// function is the specialisation of it that reconcile still needs: a *live*
+/// migration is indistinguishable from a crashed one from the outside, and only
+/// this process knows which it is looking at.
 pub(crate) fn is_migrating(project_id: &str) -> bool {
-    active_migrations()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .contains(project_id)
+    crate::project_lock::is_held_by(project_id, crate::project_lock::ProjectOp::Migration)
 }
 
-/// RAII marker: removes the project from [`ACTIVE_MIGRATIONS`] however the
-/// migration ends, including an early `?`.
-struct ActiveGuard(String);
+/// RAII marker: releases the project's [`crate::project_lock`] claim however
+/// the migration ends, including an early `?`.
+///
+/// Kept as a named type rather than using [`crate::project_lock::ProjectGuard`]
+/// directly so the migration path keeps reading as "take the migration guard",
+/// and so the one place that decides what a migration's claim *is* stays here.
+struct ActiveGuard(#[allow(dead_code)] crate::project_lock::ProjectGuard);
 
 impl ActiveGuard {
-    /// `None` when a migration is already running for this project.
+    /// `None` when a migration — or anything else — already holds this project.
     fn acquire(project_id: &str) -> Option<Self> {
-        let mut set = active_migrations()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if !set.insert(project_id.to_string()) {
-            return None;
-        }
-        Some(Self(project_id.to_string()))
-    }
-}
-
-impl Drop for ActiveGuard {
-    fn drop(&mut self) {
-        active_migrations()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.0);
+        crate::project_lock::try_acquire(project_id, crate::project_lock::ProjectOp::Migration)
+            .ok()
+            .map(Self)
     }
 }
 
@@ -1163,7 +1145,23 @@ pub(crate) async fn purge_migration_artifacts(project_id: &str) {
                 }
             }
         }
-        Ok(None) => return,
+        Ok(None) => {
+            // **`Ok(None)` is not the same as "no file".** `migration_store::load`
+            // now reports an *unparseable* record as absent while deliberately
+            // leaving it on disk, so that `has_record` goes on protecting the
+            // rollback pin it describes. Returning here on that would leave the
+            // file — and therefore a permanently "claimed" pin — behind a Reset
+            // that has just deleted the snapshot and both volumes the record
+            // could possibly refer to.
+            if !migration_store::has_record(project_id).unwrap_or(false) {
+                return;
+            }
+            log::warn!(
+                "Project {} has a migration record that could not be read; removing it anyway \
+                 because a Reset supersedes it",
+                project_id
+            );
+        }
         Err(e) => log::warn!(
             "Could not read the migration record for {} while cleaning up: {}",
             project_id,
@@ -1172,6 +1170,10 @@ pub(crate) async fn purge_migration_artifacts(project_id: &str) {
     }
     let _ = migration_store::clear_staging(project_id);
     let _ = migration_store::clear(project_id);
+    // The pins this project had are gone with the snapshot; their grace clocks
+    // are meaningless and would otherwise sit in the migrations directory
+    // forever.
+    migration_store::clear_ownerless_for_project(project_id);
 }
 
 fn default_docker_socket() -> String {

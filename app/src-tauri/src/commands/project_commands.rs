@@ -221,20 +221,35 @@ pub async fn start_project_container(
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Project, String> {
-    // A migration removes the container and creates its replacement moments
-    // later. Starting in that window finds no container, creates a second one
-    // under the same name, and the migration's own create then fails on the
-    // name conflict — which sends it into an auto-rollback that also cannot
-    // create. The UI already refuses (`canMigrate` gates on the container being
-    // stopped and no run being in flight); this is the same gate on the side
-    // that actually owns the invariant.
-    if crate::commands::migration_commands::is_migrating(&project_id) {
-        return Err(
-            "A container base update is running for this project. Wait for it to finish, then start the project."
-                .to_string(),
-        );
-    }
+    // **Acquired, not polled.** A migration removes the container and creates
+    // its replacement moments later. Starting in that window finds no
+    // container, creates a second one under the same name, and the migration's
+    // own create then fails on the name conflict — which sends it into an
+    // auto-rollback that also cannot create. This used to be a one-shot
+    // `is_migrating` read, which covered that case and no other: a start also
+    // commits `triple-c-snapshot-{id}:latest`, so it races a *compaction*
+    // committing the same tag with nothing between them. The claim is held for
+    // the whole start rather than checked at its door.
+    //
+    // The UI already refuses (`canMigrate` gates on the container being stopped
+    // and no run being in flight); this is the same gate on the side that
+    // actually owns the invariant.
+    let _guard =
+        crate::project_lock::try_acquire(&project_id, crate::project_lock::ProjectOp::Recreate)?;
+    start_project_container_locked(project_id, app_handle, state).await
+}
 
+/// The body of [`start_project_container`], with **no claim of its own**.
+///
+/// Split out for exactly one caller: [`rebuild_project_container`] already
+/// holds the project under [`crate::project_lock::ProjectOp::Reset`] for its
+/// whole run, and a Reset that then went through the public command would be
+/// refused by its own guard. Every other path must go through the command.
+async fn start_project_container_locked(
+    project_id: String,
+    app_handle: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Project, String> {
     let mut project = state
         .projects_store
         .get(&project_id)
@@ -539,6 +554,14 @@ pub async fn stop_project_container(
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    // Stop had **no** exclusion at all, which is the one gap CLAUDE.md's "every
+    // command that stops, removes or recreates the container consults
+    // `is_migrating`" rule already named and this function did not honour. A
+    // stop lands on the container a migration is mid-swap on, and it closes the
+    // exec sessions a compaction's config replay is not expecting to lose.
+    let _guard =
+        crate::project_lock::try_acquire(&project_id, crate::project_lock::ProjectOp::Recreate)?;
+
     let project = state
         .projects_store
         .get(&project_id)
@@ -571,13 +594,13 @@ pub async fn rebuild_project_container(
 ) -> Result<Project, String> {
     // Reset deletes both volumes and the snapshot image. Doing that while a
     // migration is mid-flight pulls the ground out from under it and leaves an
-    // orphan migration record pointing at images that no longer exist.
-    if crate::commands::migration_commands::is_migrating(&project_id) {
-        return Err(
-            "A container base update is running for this project. Wait for it to finish before resetting."
-                .to_string(),
-        );
-    }
+    // orphan migration record pointing at images that no longer exist — and
+    // doing it while a *compaction* is mid-flight is worse, because the
+    // compaction then commits `flat(old)` back over the `:latest` this just
+    // destroyed and resurrects the system layer the user asked to be rid of.
+    // Held for the whole Reset, including the start at the end of it.
+    let _guard =
+        crate::project_lock::try_acquire(&project_id, crate::project_lock::ProjectOp::Reset)?;
 
     let project = state
         .projects_store
@@ -611,8 +634,9 @@ pub async fn rebuild_project_container(
         log::warn!("Failed to remove project volumes for project {}: {}", project_id, e);
     }
 
-    // Start fresh
-    start_project_container(project_id, app_handle, state).await
+    // Start fresh. The locked variant, because `_guard` above is this project's
+    // claim and the public command would be refused by it.
+    start_project_container_locked(project_id, app_handle, state).await
 }
 
 /// Reconcile project statuses against actual Docker container state.
@@ -656,9 +680,14 @@ pub async fn reconcile_project_statuses(
         ) {
             continue;
         }
-        // ...but never for a project this process is actively migrating: the
-        // container is legitimately absent for part of that run.
-        if crate::commands::migration_commands::is_migrating(&project.id) {
+        // ...but never for a project this process is actively working on. A
+        // migration's container is legitimately absent between the
+        // `remove_container` and the create that follows, and so is a Reset's,
+        // and so is a start's before its create returns. Reconciling into any
+        // of those windows writes `Stopped` over a project that is mid-run.
+        // Broadened from `is_migrating` to the whole lock for exactly that
+        // reason — the migration was never the only operation with a gap.
+        if crate::project_lock::held(&project.id).is_some() {
             continue;
         }
 
