@@ -10,6 +10,14 @@ interface Props {
   disabled: boolean;
 }
 
+/** Whether two folder lists are the same rows in the same order. */
+function sameRows(a: ProjectPath[], b: ProjectPath[]): boolean {
+  return (
+    a.length === b.length &&
+    a.every((row, i) => row.host_path === b[i].host_path && row.mount_name === b[i].mount_name)
+  );
+}
+
 export default function WorkspaceSection({ project, save, disabled }: Props) {
   const [name, setName] = useState(project.name);
   const [paths, setPaths] = useState<ProjectPath[]>(project.paths ?? []);
@@ -20,6 +28,27 @@ export default function WorkspaceSection({ project, save, disabled }: Props) {
   }, [project]);
 
   /**
+   * Persist a folder list, minus the rows that are only in it because the UI
+   * put them there.
+   *
+   * **The blank row must never reach the store.** "+ Add folder" inserts
+   * `{host_path: "", mount_name: ""}` deliberately, and `create_container`
+   * mounts every stored row unfiltered — a stored blank one becomes
+   * `{"Target": "/workspace/", "Source": ""}`, which the daemon rejects with
+   * `field Source must not be empty`. The project then cannot be started or
+   * recreated at all, from a click and a blur. `AddProjectDialog` has always
+   * filtered this; this section computed the filtered list and then saved the
+   * unfiltered one.
+   *
+   * Every save goes through here for that reason — Browse and Remove write the
+   * list too, and either can be holding a blank row from an earlier click.
+   */
+  const persist = (rows: ProjectPath[]) => {
+    const filled = rows.filter((p) => p.host_path.trim() || p.mount_name.trim());
+    return save({ paths: filled });
+  };
+
+  /**
    * Save only when every row is fully filled in.
    *
    * Both inputs save on blur, so tabbing from the host path to the mount name
@@ -27,12 +56,18 @@ export default function WorkspaceSection({ project, save, disabled }: Props) {
    * a half-filled row is refused — so the unconditional save turned an ordinary
    * keystroke into an error toast. A blank row is *not* incomplete: the
    * "+ Add folder" button adds one deliberately, and it is dropped on save.
+   *
+   * A blur that changed nothing saves nothing, which is what keeps the blank
+   * row on screen while it is being filled in: persisting the filtered list
+   * would round-trip through `project` and take the empty row away under the
+   * cursor.
    */
   const saveIfComplete = () => {
     const filled = paths.filter((p) => p.host_path.trim() || p.mount_name.trim());
     const halfFilled = filled.some((p) => !p.host_path.trim() || !p.mount_name.trim());
     if (halfFilled) return;
-    return save({ paths });
+    if (sameRows(filled, project.paths ?? [])) return;
+    return persist(paths);
   };
 
   return (
@@ -106,7 +141,7 @@ export default function WorkspaceSection({ project, save, disabled }: Props) {
                         mount_name: updated[i].mount_name || basename,
                       };
                       setPaths(updated);
-                      save({ paths: updated });
+                      persist(updated);
                     }
                   }}
                 >
@@ -137,7 +172,7 @@ export default function WorkspaceSection({ project, save, disabled }: Props) {
                     onClick={() => {
                       const updated = paths.filter((_, j) => j !== i);
                       setPaths(updated);
-                      save({ paths: updated });
+                      persist(updated);
                     }}
                   >
                     Remove
