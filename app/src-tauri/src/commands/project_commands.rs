@@ -402,7 +402,7 @@ fn validate_project_paths_update(
 /// Same grandfathering as the folder list, for the same reason: a value already
 /// stored is already mounted on every start, and refusing an unrelated save
 /// does not unmount it. Only a *change* is held to the rule.
-fn validate_mounted_host_path(
+pub(crate) fn validate_mounted_host_path(
     label: &str,
     stored: Option<&str>,
     incoming: Option<&str>,
@@ -615,6 +615,22 @@ fn classify_mount_source(host_path: &str) -> Option<UnmountableHostPath> {
         });
     }
 
+    // Absoluteness is judged on what the user typed, **before** resolution.
+    //
+    // `canonicalize` resolves a relative path against Triple-C's own working
+    // directory, so it hands back an absolute path and the `NotAbsolute` branch
+    // below never fires — it was reachable only when canonicalize *failed*,
+    // i.e. only for relative paths that happened not to exist. That made the
+    // verdict depend on where the app was launched from: `.` and `..` were
+    // accepted from the repo, refused from `/`. The daemon then refuses the
+    // mount outright (`invalid mount path: '..' mount path must be absolute`),
+    // so the project saved cleanly and could never start again — the bricking
+    // mode `project_path_mounts`'s filter exists to prevent, reached through
+    // the host-path half of the row instead of the mount-name half.
+    if split_host_root(&normalize_host_path(raw)).is_none() {
+        return Some(UnmountableHostPath::NotAbsolute);
+    }
+
     let canonical = std::fs::canonicalize(raw)
         .ok()
         .map(|p| p.to_string_lossy().into_owned());
@@ -754,7 +770,7 @@ pub async fn update_project(
     // Fields this command does not get to write, whoever is calling it.
     //
     // `container_id` is the one that matters: it is the handle the whole file
-    // command surface resolves against, `list_sibling_containers` hands the
+    // command surface resolves against, `list_sibling_containers` used to hand the
     // webview the ids of every other container on the daemon, and a project
     // save is not the place a container is adopted. It is assigned by
     // `start_project_container` through `projects_store::set_container_id` and
@@ -1467,6 +1483,37 @@ mod tests {
     /// A drive-relative path (`C:x`, no separator) means "x under whatever the
     /// current directory on C: happens to be" — a location decided by the
     /// process rather than by the user, so it may be the drive root.
+    #[test]
+    fn a_relative_path_is_refused_however_it_resolves_from_here() {
+        // The previous test for this passed by coincidence: its four examples
+        // did not exist under `app/src-tauri`, so `canonicalize` failed and the
+        // `NotAbsolute` branch fired for the wrong reason. Creating a directory
+        // named `project` there flipped it red.
+        //
+        // These are paths that *do* exist relative to wherever the test runs,
+        // so they exercise the branch that used to be unreachable. Judged on
+        // the typed string, the answer is the same from any working directory —
+        // which is the property that matters, because the daemon refuses a
+        // relative mount source and the project would save fine and then never
+        // start.
+        for existing in [".", "..", "src", "./src"] {
+            assert!(
+                matches!(
+                    classify_mount_source(existing),
+                    Some(UnmountableHostPath::NotAbsolute)
+                ),
+                "{} is relative and must be refused regardless of cwd",
+                existing
+            );
+        }
+
+        // And the fix must not have made an absolute path unreachable.
+        assert!(
+            classify_mount_source("/usr").is_none(),
+            "an ordinary absolute folder must still be accepted"
+        );
+    }
+
     #[test]
     fn a_path_that_names_no_location_is_refused_rather_than_guessed_at() {
         for relative in ["C:x", "C:Users\\jo", "relative/path", "./project"] {

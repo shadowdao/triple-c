@@ -454,27 +454,48 @@ fi
 # previous Bedrock-profile session — ~/.claude.json lives in the persisted home
 # volume, so without this the container keeps trying to run the SSO refresh even
 # after switching to a non-SSO backend (Anthropic/Ollama) or to static creds.
+# Replace ~/.claude.json atomically: write a sibling temp file, then rename.
+#
+# `> "$CLAUDE_JSON"` truncates before it writes, so a write that fails part-way
+# — a full home volume being the obvious way, and bounding that volume is what
+# half this release is about — leaves the file unparseable. It holds the OAuth
+# account, and the damage does not self-heal: the next start's `jq` fails on the
+# corrupt file, `MERGED` comes back empty, and the `[ -n "$MERGED" ]` guard
+# skips the write that would have repaired it. `triple-c-task-runner` has done
+# it this way all along.
+write_claude_json() {
+    _wcj_tmp="${CLAUDE_JSON}.triple-c-tmp"
+    if printf '%s\n' "$1" > "$_wcj_tmp" 2>/dev/null; then
+        mv -f "$_wcj_tmp" "$CLAUDE_JSON" 2>/dev/null || rm -f "$_wcj_tmp"
+    else
+        rm -f "$_wcj_tmp"
+        echo "entrypoint: warning — could not write $CLAUDE_JSON (leaving it as it was)"
+        return 1
+    fi
+    # By name, after the rename, so these land on the new inode.
+    chown claude:claude "$CLAUDE_JSON"
+    chmod 600 "$CLAUDE_JSON"
+}
+
 CLAUDE_JSON="/home/claude/.claude.json"
 if [ -n "$AWS_SSO_AUTH_REFRESH_CMD" ]; then
     if [ -f "$CLAUDE_JSON" ]; then
         MERGED=$(jq --arg cmd "$AWS_SSO_AUTH_REFRESH_CMD" '.awsAuthRefresh = $cmd' "$CLAUDE_JSON" 2>/dev/null)
         if [ -n "$MERGED" ]; then
-            printf '%s\n' "$MERGED" > "$CLAUDE_JSON"
+            write_claude_json "$MERGED"
         fi
     else
-        printf '{"awsAuthRefresh":"%s"}\n' "$AWS_SSO_AUTH_REFRESH_CMD" > "$CLAUDE_JSON"
+        # No existing file, so there is nothing to destroy — but go through the
+        # same helper so the owner and mode are set in one place.
+        write_claude_json "$(printf '{"awsAuthRefresh":"%s"}' "$AWS_SSO_AUTH_REFRESH_CMD")"
     fi
-    chown claude:claude "$CLAUDE_JSON"
-    chmod 600 "$CLAUDE_JSON"
     unset AWS_SSO_AUTH_REFRESH_CMD
 elif [ -f "$CLAUDE_JSON" ] && grep -q '"awsAuthRefresh"' "$CLAUDE_JSON" 2>/dev/null; then
     # Only rewrite when the key is actually present, to avoid a needless jq
     # reformat of ~/.claude.json on every start of a non-SSO backend.
     MERGED=$(jq 'del(.awsAuthRefresh)' "$CLAUDE_JSON" 2>/dev/null)
     if [ -n "$MERGED" ]; then
-        printf '%s\n' "$MERGED" > "$CLAUDE_JSON"
-        chown claude:claude "$CLAUDE_JSON"
-        chmod 600 "$CLAUDE_JSON"
+        write_claude_json "$MERGED"
     fi
 fi
 
@@ -491,38 +512,17 @@ if [ -f "$CLAUDE_JSON" ]; then
     # Only rewrite when the value isn't already true, to avoid a needless jq
     # reformat of ~/.claude.json on every single start.
     if ! grep -q '"shiftEnterKeyBindingInstalled"[[:space:]]*:[[:space:]]*true' "$CLAUDE_JSON" 2>/dev/null; then
-        # Write to a temp file and rename, never `> "$CLAUDE_JSON"`.
-        #
-        # `>` truncates before it writes, so a write that fails part-way — a
-        # full home volume is the obvious way, and bounding that volume is
-        # what half this release is about — leaves the file unparseable. This
-        # file holds the OAuth account, and the damage does not self-heal: the
-        # next start's `jq` fails on the corrupt file, `MERGED` is empty, and
-        # the guard below skips the write that would have repaired it. So the
-        # failure mode is a permanently lost login, for a purely cosmetic flag
-        # that suppresses a "run /terminal-setup" tip.
-        #
-        # `triple-c-task-runner` already does it this way; this block was
-        # modelled on the awsAuthRefresh one above, which has the same flaw but
-        # only fires when a Bedrock SSO command is configured.
+        # Atomic, via `write_claude_json` — see its comment for why a plain
+        # `>` on this file can permanently destroy the OAuth login.
         MERGED=$(jq '.shiftEnterKeyBindingInstalled = true' "$CLAUDE_JSON" 2>/dev/null)
         if [ -n "$MERGED" ]; then
-            CLAUDE_JSON_TMP="${CLAUDE_JSON}.triple-c-tmp"
-            if printf '%s\n' "$MERGED" > "$CLAUDE_JSON_TMP" 2>/dev/null; then
-                mv -f "$CLAUDE_JSON_TMP" "$CLAUDE_JSON" 2>/dev/null || rm -f "$CLAUDE_JSON_TMP"
-            else
-                # Out of space, or the volume went read-only. The original is
-                # untouched, which is the whole point.
-                rm -f "$CLAUDE_JSON_TMP"
-                echo "entrypoint: warning — could not set shiftEnterKeyBindingInstalled (leaving ~/.claude.json as it was)"
-            fi
+            write_claude_json "$MERGED"
         fi
     fi
 else
-    printf '{"shiftEnterKeyBindingInstalled":true}\n' > "$CLAUDE_JSON"
+    # Nothing to destroy, but the helper owns the owner/mode too.
+    write_claude_json '{"shiftEnterKeyBindingInstalled":true}'
 fi
-chown claude:claude "$CLAUDE_JSON"
-chmod 600 "$CLAUDE_JSON"
 
 # ── Docker socket permissions ────────────────────────────────────────────────
 if [ -S /var/run/docker.sock ]; then

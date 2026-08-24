@@ -602,7 +602,7 @@
         updateProjectList(msg.projects);
         break;
       case 'opened':
-        onSessionOpened(msg.session_id, msg.project_name);
+        onSessionOpened(msg.session_id, msg.project_name, msg.session_type);
         break;
       case 'output':
         onSessionOutput(msg.session_id, msg.data);
@@ -653,8 +653,18 @@
     });
   }
 
-  function onSessionOpened(sessionId, projectName) {
-    const sessionType = pendingSessionType || 'claude';
+  function onSessionOpened(sessionId, projectName, serverSessionType) {
+    // Prefer the type the *server* reports for this session. The old path read
+    // a single `pendingSessionType` global set at request time, so opening two
+    // sessions before the first reply landed swapped their labels — routine on
+    // mobile, where nothing disables the buttons. That was cosmetic until
+    // Shift+Enter became type-dependent: a Claude session labelled `shell`
+    // sends a bare CR and submits a half-written prompt.
+    //
+    // The fallback keeps an older server working, and defaults to `claude`,
+    // which is the safe direction — ESC+CR is an unbound no-op in bash, while
+    // a bare CR in Claude Code loses the prompt.
+    const sessionType = serverSessionType || pendingSessionType || 'claude';
     pendingSessionType = null;
 
     // Create terminal

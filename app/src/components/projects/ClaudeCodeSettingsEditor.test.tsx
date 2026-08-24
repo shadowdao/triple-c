@@ -60,12 +60,18 @@ describe("ClaudeCodeSettingsEditor", () => {
   });
 
   it("offers every effort level Claude Code accepts", () => {
+    // Verified against the shipped `claude` binary's own schema rather than
+    // inferred: low/medium/high/xhigh/max. `max` was missing until an audit
+    // checked externally — which is the whole weakness of this test. It can
+    // only prove the editor agrees with this list, never that the list is the
+    // one Claude Code reads. The same blind spot is why `effort` and
+    // `focusMode` were confidently wrong for months.
     renderEditor(null);
     expect(
       Array.from(
         screen.getByLabelText("Effort level").querySelectorAll("option"),
       ).map((o) => o.getAttribute("value")),
-    ).toEqual(["", "low", "medium", "high", "xhigh"]);
+    ).toEqual(["", "low", "medium", "high", "xhigh", "max"]);
   });
 
   describe("project scope", () => {

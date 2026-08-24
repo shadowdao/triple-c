@@ -111,11 +111,13 @@ export default function RuntimeSection({
         title="Claude Code settings"
         description={
           "Per-project CLI behaviour. Anything left on Global follows Settings; " +
-          "Off overrides a global On. Turning TUI mode, Effort level or Focus mode " +
-          "back to Global needs the container's base image updated first — those " +
-          "three are cleared by removing a key, and an older image's startup script " +
-          "ignores the instruction to remove it. Update the base image from Overview " +
-          "if one of them will not switch off."
+          "Off overrides a global On. Changing any of these recreates the container, " +
+          "which commits a new image layer — so flipping switches repeatedly costs disk. " +
+          "Turning TUI mode, Effort level, Focus mode or Session recap back to Global " +
+          "also needs the base image updated first: those four are cleared by removing a " +
+          "key, and an older image's startup script ignores the instruction to remove it. " +
+          "Update the base image from Overview. TUI mode, Effort level and Focus mode " +
+          "visibly refuse to switch off until you do; Session recap just stays off silently."
         }
       >
         <ClaudeCodeSettingsEditor

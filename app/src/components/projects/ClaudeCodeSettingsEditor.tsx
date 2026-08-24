@@ -68,7 +68,15 @@ const BOOLEAN_FIELDS: {
   hint: string;
   invert?: boolean;
 }[] = [
-  { key: "focus_mode", label: "Focus mode", hint: "Collapses tool output to one-line summaries." },
+  {
+    key: "focus_mode",
+    label: "Focus mode",
+    // It summarises tool *calls*, not all output — and it does nothing at all
+    // unless the fullscreen renderer is on, which is a separate switch above.
+    // Saying so here is cheaper than the user concluding the setting is broken,
+    // which is the complaint that started this whole round of work.
+    hint: "Summarises each tool call to one line, showing the last prompt and the final response. Needs TUI mode set to Fullscreen.",
+  },
   {
     key: "show_thinking_summaries",
     label: "Thinking summaries",
@@ -168,6 +176,9 @@ export default function ClaudeCodeSettingsEditor({
             <option value="medium">Medium</option>
             <option value="high">High</option>
             <option value="xhigh">Extra high</option>
+            {/* `max` is accepted by the CLI and was missing here. Confirmed
+                against the shipped claude binary's own schema, not just docs. */}
+            <option value="max">Maximum</option>
           </select>
         }
       />

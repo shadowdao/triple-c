@@ -216,8 +216,23 @@ pub async fn upload_host_file_to_terminal(
     let meta = tokio::fs::metadata(&host_path)
         .await
         .map_err(|e| format!("Cannot access {}: {}", host_path, e))?;
-    if meta.is_dir() {
-        return Err(format!("{} is a directory — drop individual files", host_path));
+    // `!is_file()`, not `!is_dir()`. A FIFO is neither a directory nor a
+    // regular file, reports `len() == 0`, and passes both the directory check
+    // and the size cap below — and `std::fs::File::open` on one blocks forever
+    // with no writer, with no timeout anywhere on this path. The upload then
+    // never returns, the toast sticks on "Adding N files…" for the session and
+    // the rest of the batch is abandoned. Sockets and device nodes are the same
+    // shape. With the Files tab's upload removed, this is the only route for
+    // getting a file into a container, so it is the wrong place to be clever.
+    if !meta.is_file() {
+        return Err(if meta.is_dir() {
+            format!("{} is a directory — drop individual files", host_path)
+        } else {
+            format!(
+                "{} is not a regular file — only ordinary files can be dropped into a terminal",
+                host_path
+            )
+        });
     }
 
     // Guard against ballooning host RAM: the file is packed into an in-memory

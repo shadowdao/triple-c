@@ -46,6 +46,16 @@ enum ServerMessage {
     Opened {
         session_id: String,
         project_name: String,
+        /// Echoed back so the client can label the session from the reply
+        /// rather than from a global set at request time.
+        ///
+        /// Without it the client correlates through a single
+        /// `pendingSessionType`, so opening two sessions before the first
+        /// reply lands swaps their labels. That used to be cosmetic; it stopped
+        /// being cosmetic when Shift+Enter became type-dependent, because a
+        /// Claude session mislabelled as a shell now submits a half-written
+        /// prompt instead of inserting a newline.
+        session_type: String,
     },
     Output {
         session_id: String,
@@ -319,6 +329,11 @@ async fn handle_open(
     let _ = out_tx.send(ServerMessage::Opened {
         session_id,
         project_name,
+        // Derived from the same match that chose `cmd` above, not echoed from
+        // the request: anything that is not exactly "bash" runs Claude, so
+        // echoing the raw value would label an unrecognised string as its own
+        // type and put the client back where it started.
+        session_type: if session_type == Some("bash") { "bash" } else { "claude" }.to_string(),
     });
 
     Ok(())

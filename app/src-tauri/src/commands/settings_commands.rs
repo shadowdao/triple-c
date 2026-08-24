@@ -25,6 +25,29 @@ pub async fn update_settings(
         &settings.global_custom_env_vars,
     )?;
 
+    // The same for the two host paths this struct owns. `update_project`
+    // validated its per-project overrides and this side validated nothing,
+    // which left the wider hole of the two: `default_ssh_key_path` is the
+    // fallback for **every** project without an override
+    // (`container.rs`'s `create_container`), so `/` here read-only bind-mounts
+    // the whole host at `/tmp/.host-ssh` for all of them — and `entrypoint.sh`
+    // then does `cp -a /tmp/.host-ssh ~/.ssh`, recursively copying it into the
+    // home volume this release exists to bound.
+    //
+    // Grandfathered the same way project paths are: a value carried over
+    // unchanged still saves, so a store written before this check cannot lock
+    // the user out of their own settings.
+    crate::commands::project_commands::validate_mounted_host_path(
+        "SSH key path",
+        before.default_ssh_key_path.as_deref(),
+        settings.default_ssh_key_path.as_deref(),
+    )?;
+    crate::commands::project_commands::validate_mounted_host_path(
+        "CA certificate path",
+        before.ca_cert_path.as_deref(),
+        settings.ca_cert_path.as_deref(),
+    )?;
+
     let saved = state.settings_store.update(settings)?;
 
     // Persisting a setting is not the same as applying it. The gateway is the

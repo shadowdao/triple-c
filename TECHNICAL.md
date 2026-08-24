@@ -504,7 +504,7 @@ triple-c/
             │   ├── auth_token_commands.rs   # claude setup-token flow, redaction, keychain
             │   ├── aws_commands.rs          # AWS profile/region discovery
             │   ├── docker_commands.rs       # Docker status, image ops
-            │   ├── file_commands.rs         # File browser (list/download/upload)
+            │   ├── file_commands.rs         # File browser (browse, view, rename)
             │   ├── help_commands.rs         # Serves HOW-TO-USE.md to the Help dialog
             │   ├── inspect_commands.rs      # Sessions, capabilities, scheduler tasks
             │   ├── install_helper_commands.rs # Guided Docker installation

@@ -369,6 +369,15 @@ pub fn set_delta(from: &BTreeSet<String>, base: &BTreeSet<String>) -> Vec<String
 pub fn bind_mount_exclusions(paths: &[ProjectPath]) -> Vec<String> {
     let mut out: Vec<String> = paths
         .iter()
+        // **The same filter `project_path_mounts` applies, and it has to be.**
+        // That function skips a row with an empty `host_path` or `mount_name`
+        // so a legacy row cannot brick the create. The consequence is that
+        // `/workspace/<name>` for such a row is *not* a bind mount — it is
+        // ordinary writable-layer content. Excluding it here would tell
+        // `compute_verbatim_paths` to skip staging it, and the container swap
+        // would then destroy whatever the user has put there. The two
+        // predicates must agree or a migration silently eats a directory.
+        .filter(|p| !p.mount_name.trim().is_empty() && !p.host_path.trim().is_empty())
         .map(|p| format!("/workspace/{}", p.mount_name))
         .collect();
     out.sort();
@@ -1368,6 +1377,30 @@ pub fn parse_preflight(raw: &str) -> PreflightEnvironment {
 
 #[cfg(test)]
 mod tests {
+
+    /// The mount filter and the migration's exclusion list must agree.
+    ///
+    /// `project_path_mounts` skips a row with an empty `host_path` so a legacy
+    /// row cannot brick the create. That makes `/workspace/<name>` ordinary
+    /// writable-layer content rather than a bind mount — and if this function
+    /// still excluded it, `compute_verbatim_paths` would skip staging it and
+    /// the container swap would destroy whatever is there. A migration eating a
+    /// directory is the quietest kind of data loss there is.
+    #[test]
+    fn an_unmountable_row_is_not_excluded_from_the_migration_payload() {
+        let paths = vec![
+            ProjectPath { host_path: "/home/u/code".into(), mount_name: "code".into() },
+            // Legacy shapes that `project_path_mounts` skips.
+            ProjectPath { host_path: "".into(), mount_name: "data".into() },
+            ProjectPath { host_path: "/home/u/x".into(), mount_name: "  ".into() },
+        ];
+        let excluded = bind_mount_exclusions(&paths);
+        assert_eq!(
+            excluded,
+            vec!["/workspace/code".to_string()],
+            "only rows that are actually mounted may be excluded from staging"
+        );
+    }
     use super::*;
     use crate::models::{
         MIGRATION_PHASE_AWAITING, MIGRATION_PHASE_INTERRUPTED, MIGRATION_PHASE_IN_PROGRESS,

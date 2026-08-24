@@ -668,10 +668,23 @@ fn merge_claude_code_settings(
 
 /// Compute a fingerprint for the Claude Code settings so we can detect changes.
 /// The `sandbox_enabled` flag is included so that toggling sandbox mode forces
-/// a container recreation (re-injecting the merged settings.json). When
-/// sandbox is off the historical fingerprint is preserved unchanged so that
-/// upgrading triple-c does not spuriously flag every existing container for
-/// recreation.
+/// a container recreation (re-injecting the merged settings.json).
+///
+/// **This formula changed, and the change is not free.** It used to read
+/// `format!("{}", bool)`; the booleans are now `Option<bool>` and it reads
+/// `format!("{:?}")`, because `None` (inherit) and `Some(false)` (a deliberate
+/// off) must not hash alike — conflating them leaves a container un-recreated
+/// on a real change. The consequence is that **every existing project holding
+/// a settings object gets a different fingerprint on first launch after this
+/// upgrade, and is recreated once.** A recreation commits a snapshot layer, so
+/// that is a one-off disk cost per project, paid silently.
+///
+/// An earlier version of this comment claimed the opposite — that "the
+/// historical fingerprint is preserved unchanged so that upgrading triple-c
+/// does not spuriously flag every existing container for recreation." That was
+/// carried over from before the widening and was false the moment the format
+/// string changed. It is recorded here because a reviewer who believed it would
+/// conclude the churn cannot happen.
 fn compute_claude_code_settings_fingerprint(
     settings: Option<&ClaudeCodeSettings>,
     sandbox_enabled: bool,
@@ -775,7 +788,7 @@ fn claude_code_env_vars(settings: Option<&ClaudeCodeSettings>) -> Vec<String> {
 /// taken back: turning the setting off simply omits the key, the merge
 /// preserves whatever was there, and the setting stays on forever. Only a
 /// destructive Reset — which also deletes the OAuth login, skills and
-/// transcripts — ever cleared it. Four of the five keys here were sticky that
+/// transcripts — ever cleared it. Four of the six keys here were sticky that
 /// way; the `sandbox` block already carried the workaround and the comment
 /// explaining it, and this is the same treatment applied to the rest.
 ///
@@ -1150,7 +1163,22 @@ fn project_path_mounts(paths: &[crate::models::project::ProjectPath]) -> Vec<Mou
         // Trimmed, because a name of `" "` targets `/workspace/ ` and a source
         // of `" "` is a path the daemon will happily create at the filesystem
         // root — neither is what anyone typed on purpose.
-        .filter(|pp| !pp.mount_name.trim().is_empty() && !pp.host_path.trim().is_empty())
+        .filter(|pp| {
+            let keep = !pp.mount_name.trim().is_empty() && !pp.host_path.trim().is_empty();
+            if !keep {
+                // Silence here means a folder the user configured simply does
+                // not appear in the container, with no error and no toast.
+                // Skipping is still right — the alternative is a project that
+                // cannot start — but it should leave a trace.
+                log::warn!(
+                    "Skipping an unmountable project path row (host_path={:?}, mount_name={:?}): \
+                     both are required. The project will start without it.",
+                    pp.host_path,
+                    pp.mount_name
+                );
+            }
+            keep
+        })
         .map(|pp| Mount {
             target: Some(format!("/workspace/{}", pp.mount_name)),
             source: Some(pp.host_path.clone()),
@@ -2187,7 +2215,8 @@ const SCRUB_MARKER: &str = "###TRIPLE-C-SCRUBBED ";
 /// Marker the scrub script prints **instead of** [`SCRUB_MARKER`] when it
 /// cannot run at all, followed by what was missing.
 ///
-/// H3: the script needs six external tools and the root filesystem's device id,
+/// H3: the script needs five external tools, the root filesystem's device id,
+/// and an `rm` that honours `--one-file-system` — seven prerequisites in all,
 /// and on a base image that has none of them where it looked it used to run its
 /// seven patterns, delete nothing, and print `###TRIPLE-C-SCRUBBED 0` — a
 /// number indistinguishable from an honest "there was nothing to take". A scrub
@@ -2469,7 +2498,7 @@ pub(crate) fn snapshot_scrub_script() -> String {
 /// volume was untouched and the figure was `65536` — exactly the debris that
 /// really was next to the mount, so the byte accounting follows the flag too.
 ///
-/// It is one of the six prerequisites now, and an image without it is
+/// It is one of the seven prerequisites now, and an image without it is
 /// [`SCRUB_UNAVAILABLE_MARKER`] rather than a scrub that runs unguarded. That
 /// is a real cost — an Alpine or busybox base image stops being scrubbed and
 /// keeps its debris — and it is the cheaper of the two: declining costs disk,

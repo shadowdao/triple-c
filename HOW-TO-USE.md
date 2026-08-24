@@ -615,18 +615,27 @@ The **Claude Code settings** editor, also at the bottom of the Config tab, confi
 
 | Setting | What It Does |
 |---------|-------------|
-| **TUI Mode** | Set to **Fullscreen** for flicker-free alt-screen rendering (uses `CLAUDE_CODE_NO_FLICKER=1`) |
-| **Effort Level** | Controls reasoning depth: **Low** (fast, less thorough), **Medium**, **High** (deep reasoning) |
-| **Focus Mode** | Collapses tool output to one-line summaries, showing only the prompt and final response |
-| **Thinking Summaries** | Shows Claude's thinking process as summaries during responses |
-| **Session Recap** | Provides context when returning to a session after being away |
-| **Auto-Scroll Disabled** | Disables auto-scroll when in fullscreen TUI mode |
+| **TUI Mode** | **Automatic** lets Claude Code choose; **Classic** pins the main-screen renderer; **Fullscreen** pins the flicker-free alt-screen one |
+| **Effort Level** | Reasoning depth: **Low**, **Medium**, **High**, **Extra high** |
+| **Focus Mode** | Summarises tool *calls* to one line each, showing the last prompt and the final response. **Needs the fullscreen renderer** — set TUI Mode to Fullscreen or this does nothing |
+| **Thinking Summaries** | Shows Claude's thinking as summaries rather than a collapsed stub |
+| **Session Recap** | A one-line recap when you return to the terminal after a few minutes away. **On by default** — the switch is how you turn it off |
+| **Auto-Scroll** | Follows new output to the bottom in fullscreen rendering. On by default |
 | **Env Scrub** | Strips credentials from subprocess environments for security |
-| **Prompt Caching (1h)** | Enables 1-hour prompt cache TTL instead of the default 5 minutes |
+| **Prompt Caching (1h)** | Requests a 1-hour prompt cache TTL instead of the default 5 minutes |
 
-Per-project settings override global defaults set in Settings. If all settings are at their defaults, no configuration is injected.
+Each switch has three states on a project: **Global** (follow Settings), **On**, and **Off**. Off is a
+real choice — it overrides a global On, which a project could not previously do.
 
-> These settings map to Claude Code environment variables and `~/.claude/settings.json` entries. Changes require stopping and restarting the container to take effect.
+> These map to Claude Code environment variables and `~/.claude/settings.json` keys, and are applied
+> when the container starts. Changing one stops and recreates the container.
+>
+> **Two caveats on an existing project.** Changing any of these recreates the container, and a
+> recreation commits a new image layer — so flipping switches repeatedly costs disk. And
+> **TUI Mode, Effort Level, Focus Mode and Session Recap cannot be returned to Global** until the
+> project's base image is updated: those four are cleared by *removing* a key, and an older image's
+> startup script ignores the instruction to remove it. Update the base image from the project's
+> Overview tab first. The other switches work on any image.
 
 ### MCP Servers
 

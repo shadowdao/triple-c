@@ -713,8 +713,22 @@ mod tests {
 
         let mut defined: BTreeSet<String> = BTreeSet::new();
 
-        // Walk the source tree for `#[tauri::command]` and take the `fn` name
-        // on the following non-attribute line.
+        // Walk the source tree for the command attribute and take the `fn` name
+        // that follows.
+        //
+        // The first version of this matched `line.trim() == "#[tauri::command]"`
+        // exactly and broke on the first non-`#` line. An audit got five real,
+        // compiling, unregistered commands past it — `#[tauri::command(async)]`,
+        // `#[tauri::command(rename_all = "snake_case")]`, a trailing comment,
+        // spaces in the path, and a bare `#[command]` after `use tauri::command`
+        // — plus `pub(crate) fn` and a `///` line between attribute and `fn`.
+        // Every one of those is a command the frontend could not call, which is
+        // the bug this test exists for, and the test stayed green.
+        //
+        // The asymmetry matters: confusion on the *definition* side is a silent
+        // pass, while on the *registration* side it fails loudly against
+        // legitimate code — and rustc already covers that direction. So this
+        // errs toward over-matching definitions.
         fn collect(dir: &std::path::Path, out: &mut BTreeSet<String>) {
             let Ok(entries) = std::fs::read_dir(dir) else { return };
             for entry in entries.flatten() {
@@ -725,20 +739,39 @@ mod tests {
                     let Ok(text) = std::fs::read_to_string(&path) else { continue };
                     let lines: Vec<&str> = text.lines().collect();
                     for (i, line) in lines.iter().enumerate() {
-                        if line.trim() != "#[tauri::command]" {
+                        let t = line.trim();
+                        // `#[tauri::command]`, `#[tauri::command(async)]`,
+                        // `#[tauri :: command]`, a bare `#[command]` under
+                        // `use tauri::command`, and any of those with a
+                        // trailing comment.
+                        let attr = t.strip_prefix("#[").map(|a| {
+                            a.split(']').next().unwrap_or("").replace(' ', "")
+                        });
+                        let is_command_attr = attr.is_some_and(|a| {
+                            a == "command" || a == "tauri::command"
+                                || a.starts_with("command(")
+                                || a.starts_with("tauri::command(")
+                        });
+                        if !is_command_attr {
                             continue;
                         }
+                        // Skip further attributes and doc comments rather than
+                        // giving up at the first line that is not an attribute.
                         for next in lines.iter().skip(i + 1) {
                             let t = next.trim();
-                            if t.starts_with('#') {
+                            if t.starts_with('#') || t.starts_with("//") || t.is_empty() {
                                 continue;
                             }
-                            if let Some(rest) = t
-                                .strip_prefix("pub async fn ")
-                                .or_else(|| t.strip_prefix("pub fn "))
-                                .or_else(|| t.strip_prefix("async fn "))
-                                .or_else(|| t.strip_prefix("fn "))
-                            {
+                            // Any visibility, then `fn` or `async fn`.
+                            let after_vis = t
+                                .strip_prefix("pub(crate) ")
+                                .or_else(|| t.strip_prefix("pub(super) "))
+                                .or_else(|| t.strip_prefix("pub(in crate) "))
+                                .or_else(|| t.strip_prefix("pub "))
+                                .unwrap_or(t);
+                            let after_async =
+                                after_vis.strip_prefix("async ").unwrap_or(after_vis);
+                            if let Some(rest) = after_async.strip_prefix("fn ") {
                                 if let Some(name) = rest.split(['(', '<']).next() {
                                     out.insert(name.trim().to_string());
                                 }
@@ -798,6 +831,35 @@ mod tests {
             undefined.is_empty(),
             "these are registered but no `#[tauri::command]` defines them: {:?}",
             undefined
+        );
+
+        // "exactly once" was in this test's name and not in its body: both
+        // sides were sets, so registering the same command twice in a
+        // hand-maintained 118-line list compiled, warned about nothing, and
+        // passed here.
+        let mut seen: Vec<&str> = Vec::new();
+        let mut duplicated: Vec<&str> = Vec::new();
+        for line in handler
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("//"))
+        {
+            if let Some(name) = line.trim_end_matches(',').rsplit("::").next() {
+                let name = name.trim();
+                if name.is_empty() {
+                    continue;
+                }
+                if seen.contains(&name) {
+                    duplicated.push(name);
+                } else {
+                    seen.push(name);
+                }
+            }
+        }
+        assert!(
+            duplicated.is_empty(),
+            "these are registered more than once: {:?}",
+            duplicated
         );
     }
 
