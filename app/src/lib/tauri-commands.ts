@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, ImageUpdateInfo, FileEntry, FileContents, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, BrowserPageState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo } from "./types";
+import type { Project, ProjectPath, ContainerInfo, AppSettings, UpdateInfo, ImageUpdateInfo, FileEntry, FileContents, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, BrowserPageState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo } from "./types";
 
 // Docker
 export const checkDocker = () => invoke<boolean>("check_docker");
@@ -7,8 +7,6 @@ export const checkImageExists = () => invoke<boolean>("check_image_exists");
 export const buildImage = () => invoke<void>("build_image");
 export const getContainerInfo = (projectId: string) =>
   invoke<ContainerInfo | null>("get_container_info", { projectId });
-export const listSiblingContainers = () =>
-  invoke<SiblingContainer[]>("list_sibling_containers");
 
 // Projects
 export const listProjects = () => invoke<Project[]>("list_projects");

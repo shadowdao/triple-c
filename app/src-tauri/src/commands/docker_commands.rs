@@ -37,20 +37,3 @@ pub async fn get_container_info(
     docker::get_container_info(&project).await
 }
 
-#[tauri::command]
-pub async fn list_sibling_containers() -> Result<Vec<serde_json::Value>, String> {
-    let containers = docker::list_sibling_containers().await?;
-    let result: Vec<serde_json::Value> = containers
-        .into_iter()
-        .map(|c| {
-            serde_json::json!({
-                "id": c.id,
-                "names": c.names,
-                "image": c.image,
-                "state": c.state,
-                "status": c.status,
-            })
-        })
-        .collect();
-    Ok(result)
-}

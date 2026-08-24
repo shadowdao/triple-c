@@ -3895,30 +3895,6 @@ pub async fn is_container_running(container_id: &str) -> Result<bool, String> {
     }
 }
 
-pub async fn list_sibling_containers() -> Result<Vec<ContainerSummary>, String> {
-    let docker = get_docker()?;
-
-    let all_containers: Vec<ContainerSummary> = docker
-        .list_containers(Some(ListContainersOptions::<String> {
-            all: true,
-            ..Default::default()
-        }))
-        .await
-        .map_err(|e| format!("Failed to list containers: {}", e))?;
-
-    let siblings: Vec<ContainerSummary> = all_containers
-        .into_iter()
-        .filter(|c| {
-            if let Some(labels) = &c.labels {
-                !labels.contains_key(LABEL_MANAGED)
-            } else {
-                true
-            }
-        })
-        .collect();
-
-    Ok(siblings)
-}
 
 #[cfg(test)]
 mod tests {

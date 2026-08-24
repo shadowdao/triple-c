@@ -193,13 +193,6 @@ export interface ContainerInfo {
   image: string;
 }
 
-export interface SiblingContainer {
-  id: string;
-  names: string[] | null;
-  image: string;
-  state: string;
-  status: string;
-}
 
 export interface TerminalSession {
   id: string;

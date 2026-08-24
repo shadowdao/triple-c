@@ -435,7 +435,6 @@ pub fn run() {
             commands::docker_commands::check_image_exists,
             commands::docker_commands::build_image,
             commands::docker_commands::get_container_info,
-            commands::docker_commands::list_sibling_containers,
             // Projects
             commands::project_commands::list_projects,
             commands::project_commands::add_project,
@@ -699,9 +698,11 @@ mod tests {
     ///
     /// The reverse direction matters too, and for a sharper reason: a command
     /// that is registered but reachable from nowhere is still IPC surface a
-    /// compromised webview can call. `list_sibling_containers` — which returns
+    /// compromised webview can call. `list_sibling_containers` — which returned
     /// every container on the daemon, including the user's unrelated work —
-    /// sat in exactly that state.
+    /// sat in exactly that state, and this test is what found it. It has since
+    /// been removed at all four levels: registration, command, docker helper,
+    /// and the frontend wrapper and type.
     ///
     /// So this asserts the two lists agree, and leaves *deciding* what belongs
     /// on them to a human. It cannot see frontend call sites; `tsc` and the
