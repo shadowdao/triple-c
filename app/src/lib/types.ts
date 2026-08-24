@@ -162,23 +162,28 @@ export interface OpenAiCompatibleConfig {
  * project that is "inherit the global value", and on the global settings it is
  * "leave Claude Code's own default alone". `false` is a deliberate off, which
  * is what lets a project turn a globally-enabled setting back off.
+ *
+ * Every field is optional as well as nullable: the Rust struct skips
+ * serialising a field it has no value for, so an object with nothing set at
+ * this level arrives as `{}`. Absent and `null` mean the same thing, which is
+ * why every read of one of these has to use `== null` rather than `=== null`.
  */
 export interface ClaudeCodeSettings {
   /** `null` = let Claude Code choose the renderer; `"default"` = classic, `"fullscreen"` = alt-screen. */
-  tui_mode: string | null;
+  tui_mode?: string | null;
   /** `null` = unset, else `"low" | "medium" | "high" | "xhigh"`. Written as `effortLevel`. */
-  effort: string | null;
-  auto_scroll_disabled: boolean | null;
+  effort?: string | null;
+  auto_scroll_disabled?: boolean | null;
   /** Written as `viewMode: "focus"`. */
-  focus_mode: boolean | null;
-  show_thinking_summaries: boolean | null;
+  focus_mode?: boolean | null;
+  show_thinking_summaries?: boolean | null;
   /**
    * Turns the session recap **off**. Held in the disabled sense because Claude
    * Code's recap is on by default — see the Rust doc on `ClaudeCodeSettings`.
    */
-  session_recap_disabled: boolean | null;
-  env_scrub: boolean | null;
-  prompt_caching_1h: boolean | null;
+  session_recap_disabled?: boolean | null;
+  env_scrub?: boolean | null;
+  prompt_caching_1h?: boolean | null;
 }
 
 export interface ContainerInfo {

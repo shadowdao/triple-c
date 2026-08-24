@@ -195,7 +195,9 @@ pub(crate) fn load_secrets_for_project(project: &mut Project) {
 /// entire host filesystem read-write into a container whose agent has
 /// passwordless sudo. Anything short of a filesystem root is the user choosing
 /// a folder — the Browse button and the free-text field lead to the same place
-/// — so only the roots themselves are refused.
+/// — so only the roots themselves are refused, and *root* is answered by
+/// resolving the path rather than by reading it: `/..` is spelled like a folder
+/// and is the root. See [`classify_mount_source`].
 ///
 /// This is the **whole** rule set, and it belongs to `add_project`, where every
 /// row is new by definition. `update_project` runs
@@ -228,17 +230,31 @@ fn validate_one_path(p: &ProjectPath) -> Result<(), String> {
         return Err(format!("Mount name '{}' contains invalid characters. Use alphanumeric, dash, underscore, or dot.", p.mount_name));
     }
     check_mount_name_stays_under_workspace(&p.mount_name)?;
-    if p.host_path.is_empty() {
+    // Trimmed: a host path of spaces is not a folder, and `classify_mount_source`
+    // is deliberately silent about a path with nothing in it — this is the
+    // message that names the mount it belongs to.
+    if p.host_path.trim().is_empty() {
         return Err(format!(
             "Folder mounted at '/workspace/{}' has no host path.",
             p.mount_name
         ));
     }
-    if is_filesystem_root(&p.host_path) {
-        return Err(format!(
-            "'{}' is a filesystem root. Choose the project folder itself — mounting the whole drive gives the container everything on it.",
-            p.host_path
-        ));
+    match classify_mount_source(&p.host_path) {
+        None => {}
+        Some(UnmountableHostPath::FilesystemRoot { resolved }) => {
+            return Err(filesystem_root_message(
+                &p.host_path,
+                &resolved,
+                "using it as a project folder",
+            ));
+        }
+        Some(UnmountableHostPath::NotAbsolute) => {
+            return Err(format!(
+                "'{}' is not a full path to a folder — where it lands is decided by wherever \
+                 Triple-C is running from rather than by you. Give the whole path.",
+                p.host_path
+            ));
+        }
     }
     Ok(())
 }
@@ -264,6 +280,23 @@ fn check_mount_name_stays_under_workspace(mount_name: &str) -> Result<(), String
             mount_name
         ));
     }
+    // **An empty name is not refused here, and that is a live residual.** It
+    // makes the target `/workspace/`, which the daemon normalises to
+    // `/workspace` — so the host folder shadows the directory the other mounts
+    // land in, and Docker then creates their mount points *inside it*, on the
+    // host. It is not refused because it cannot be: an empty name is what a
+    // half-filled row holds, `legacy_rows` shows those are already in
+    // `projects.json`, and this function runs on grandfathered rows too, so
+    // refusing it would make every such project unsavable — the exact
+    // regression [`validate_project_paths_update`] exists to prevent.
+    //
+    // Introducing one is closed at both ends: `validate_one_path` refuses an
+    // empty name on any new or edited row, and `WorkspaceSection` no longer
+    // sends half-filled or blank ones. What remains is the *stored* row, and it
+    // belongs where the mount is built — `docker::create_container` should skip
+    // a row with no mount name or no host path, which is the same filter that
+    // stops a stored blank row failing the create with
+    // `field Source must not be empty`.
     if !mount_name.is_empty() && mount_name.chars().all(|c| c == '.') {
         return Err(format!(
             "Mount name '{}' is not a folder name — it names the directory the mount would sit in.",
@@ -363,7 +396,8 @@ fn validate_project_paths_update(
 /// `/tmp/.host-ssh` and `/tmp/.host-ca` — and neither had any check at all, so
 /// `/` handed the whole host filesystem to the agent to read. Read-only, so
 /// this is disclosure rather than the read-write hole a `/` project folder is,
-/// but the fix is the same one line.
+/// but it is the same check: [`classify_mount_source`], resolved rather than
+/// spelled, so `/..` and `/home/..` are refused here too.
 ///
 /// Same grandfathering as the folder list, for the same reason: a value already
 /// stored is already mounted on every start, and refusing an unrelated save
@@ -379,29 +413,239 @@ fn validate_mounted_host_path(
     if stored.map(str::trim) == Some(value) {
         return Ok(());
     }
-    if is_filesystem_root(value) {
-        return Err(format!(
-            "'{}' is a filesystem root, so setting it as {} would mount the whole drive into the \
-             container. Choose the folder itself.",
-            value, label
-        ));
+    match classify_mount_source(value) {
+        None => {}
+        Some(UnmountableHostPath::FilesystemRoot { resolved }) => {
+            return Err(filesystem_root_message(
+                value,
+                &resolved,
+                &format!("setting it as {}", label),
+            ));
+        }
+        Some(UnmountableHostPath::NotAbsolute) => {
+            return Err(format!(
+                "'{}' is not a full path, so it cannot be used as {}. Give the whole path.",
+                value, label
+            ));
+        }
     }
     Ok(())
 }
 
-/// Whether a host path is the root of a filesystem, in any spelling the three
-/// desktop platforms produce: `/`, a Windows drive root, or a bare UNC/share
-/// prefix. Trailing separators are ignored, so `C:\\` and `C:/` are the same
-/// answer.
-fn is_filesystem_root(host_path: &str) -> bool {
-    let trimmed = host_path.trim_end_matches(['/', '\\']);
-    if trimmed.is_empty() {
-        // Nothing but separators: `/`, `\\`, `//`.
-        return true;
+/// Why a host path may not be used as the source of a bind mount.
+///
+/// Two answers rather than a `bool` because they need different sentences, and
+/// because "is a root" is no longer a question about how the path is *spelled*
+/// — the refusal has to be able to say where the path actually landed.
+#[derive(Debug, PartialEq)]
+enum UnmountableHostPath {
+    /// The path is, or resolves to, the root of a filesystem. `resolved` is
+    /// what it lands on, which is the same string only when a root was typed
+    /// outright.
+    FilesystemRoot { resolved: String },
+    /// The path does not name a location at all. Where it lands is decided by
+    /// whatever directory Triple-C happens to be running from, so it can be a
+    /// root tomorrow and a folder today, and nothing here can judge it.
+    NotAbsolute,
+}
+
+/// Length of a `C:` drive prefix at the head of `path`, or 0.
+///
+/// Duplicated from `commands::file_commands::drive_prefix_len`, together with
+/// [`is_windows_style_path`] and [`normalize_host_path`] below. Those are
+/// private to that module and it is not this branch's file to change; if the
+/// two copies are ever merged, that one is the original and carries the wider
+/// test coverage.
+fn drive_prefix_len(path: &str) -> usize {
+    let b = path.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        2
+    } else {
+        0
     }
-    // `C:` — a drive with no path on it.
-    let bytes = trimmed.as_bytes();
-    bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+/// Whether `path` is written in Windows form, and so whether `\` separates its
+/// components. On Linux a backslash is an ordinary filename character, which is
+/// why this is a question rather than an unconditional substitution.
+///
+/// Copy of `file_commands::is_windows_style_path` — see [`drive_prefix_len`].
+fn is_windows_style_path(path: &str) -> bool {
+    cfg!(windows) || path.starts_with("\\\\") || drive_prefix_len(path) > 0
+}
+
+/// `path` with its separators unified and any Win32 verbatim/device prefix
+/// removed — the form every rule below is expressed against.
+///
+/// `\\?\C:\Windows` and `\\?\UNC\server\share` name the *same locations* as
+/// `C:\Windows` and `\\server\share`; the prefix only turns off Win32 path
+/// parsing. Stripping it is what stops four characters being a bypass — and it
+/// has to run on our own output as well, because `std::fs::canonicalize` hands
+/// back exactly that spelling on Windows.
+///
+/// Copy of `file_commands::normalize_host_path` — see [`drive_prefix_len`].
+fn normalize_host_path(path: &str) -> String {
+    let mut s = if is_windows_style_path(path) {
+        path.replace('\\', "/")
+    } else {
+        path.to_string()
+    };
+    // Slicing by byte index is safe here only because a prefix matched
+    // case-insensitively as ASCII is ASCII, so its end is a char boundary.
+    for prefix in ["//?/unc/", "//./unc/"] {
+        if s.len() >= prefix.len()
+            && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+        {
+            return format!("//{}", &s[prefix.len()..]);
+        }
+    }
+    for prefix in ["//?/", "//./"] {
+        if s.len() >= prefix.len()
+            && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+        {
+            s = s[prefix.len()..].to_string();
+            break;
+        }
+    }
+    s
+}
+
+/// A normalised absolute path split into the root it hangs off and the part
+/// below it, or `None` when it names no location at all.
+///
+/// The three roots the desktop platforms have: `/`, a drive (`C:/`), and a UNC
+/// share (`//server/share` — the share *is* the root; `//server` alone names a
+/// machine and nothing on it).
+fn split_host_root(norm: &str) -> Option<(&str, &str)> {
+    if let Some(rest) = norm.strip_prefix("//") {
+        let mut parts = rest.splitn(3, '/');
+        let server = parts.next().unwrap_or("");
+        let share = parts.next().unwrap_or("");
+        if server.is_empty() || share.is_empty() {
+            // `//server`, `//server/`: no share, so nothing under it is named.
+            return Some((norm, ""));
+        }
+        let root_len = 2 + server.len() + 1 + share.len();
+        return Some((&norm[..root_len], &norm[root_len..]));
+    }
+    let drive = drive_prefix_len(norm);
+    if drive > 0 {
+        // `C:x` is drive-*relative* — it means "x under the current directory
+        // on C:", which is a location only the process's own state decides.
+        return match norm[drive..].strip_prefix('/') {
+            Some(tail) => Some((&norm[..drive + 1], tail)),
+            None if norm.len() == drive => Some((norm, "")),
+            None => None,
+        };
+    }
+    norm.strip_prefix('/').map(|tail| (&norm[..1], tail))
+}
+
+/// How many named components deep `tail` ends up, with `.` dropped and `..`
+/// applied — clamped at the root, because `/..` is `/` and not an error.
+fn depth_below_root(tail: &str) -> usize {
+    let mut depth = 0usize;
+    for segment in tail.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => depth = depth.saturating_sub(1),
+            _ => depth += 1,
+        }
+    }
+    depth
+}
+
+/// Whether a host path can be handed to Docker as a bind-mount source, and if
+/// not, why.
+///
+/// ## Resolved, not spelled
+///
+/// This used to be `is_filesystem_root`, and it was purely lexical: trim the
+/// trailing separators, say yes to what was left over only if it was empty or a
+/// bare `C:`. Nothing in this file called `canonicalize`, so `/..`, `/./`,
+/// `/home/..`, `/etc/../` and `C:\..` all sailed through and were passed
+/// verbatim to `docker::create_container`, which builds a
+/// `Mount { source, read_only: Some(false) }` out of them. Verified against the
+/// daemon: `-v /..:/mnt/probe` mounts the host root. That is the whole host
+/// filesystem, read-write, in a container whose agent has passwordless sudo —
+/// the same escalation `check_mount_name_stays_under_workspace` exists to
+/// close, reached through the host-path half of the mount instead of the
+/// mount-name half.
+///
+/// So the answer comes from the OS where the OS can give one: `canonicalize`
+/// applies `..`, follows every symlink in the path, and on Windows returns the
+/// long name for an 8.3 alias and the verbatim spelling of a UNC share — all
+/// things a string comparison cannot see.
+///
+/// ## When the path cannot be resolved
+///
+/// `canonicalize` fails on a path that does not exist *here*, which is an
+/// ordinary state rather than an attack: `projects.json` syncs between machines
+/// and names `C:\Users\jo\code` on a box that has never had a `C:`, and a
+/// folder can be created after the project is. Refusing outright would make
+/// every such project unsavable, which is the exact failure
+/// [`validate_project_paths_update`] exists to avoid — so an unresolvable path
+/// falls back to the lexical answer, with `.` and `..` collapsed by
+/// [`depth_below_root`] rather than ignored.
+///
+/// That is a weaker guarantee, not a wrong one, and the gap is bounded: what
+/// resolution adds over the lexical rule is symlinks and 8.3 aliases, and both
+/// of those are properties of a path that *exists* — precisely the case where
+/// `canonicalize` answers. What is left is a path that does not exist at save
+/// time and is a symlink to the root by the time the container starts, i.e. the
+/// user doing it to themselves after being asked.
+///
+/// Blocking on the filesystem here is deliberate: this runs on a save, once per
+/// row, and is a single `realpath` walk.
+fn classify_mount_source(host_path: &str) -> Option<UnmountableHostPath> {
+    let raw = host_path.trim();
+    if raw.is_empty() {
+        // Emptiness is somebody else's error message — see
+        // `validate_one_path`, which names the mount it belongs to.
+        return None;
+    }
+
+    // Nothing but separators, in either spelling: `/`, `//`, `\`, `\\`. Taken
+    // first because a lone `\` is a *relative* name on Linux, and reporting a
+    // Windows root as "not a full path" would be answering a question the user
+    // did not ask.
+    if raw.chars().all(|c| c == '/' || c == '\\') {
+        return Some(UnmountableHostPath::FilesystemRoot {
+            resolved: raw.to_string(),
+        });
+    }
+
+    let canonical = std::fs::canonicalize(raw)
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned());
+    let judged = canonical.as_deref().unwrap_or(raw);
+    let norm = normalize_host_path(judged);
+
+    let Some((root, tail)) = split_host_root(&norm) else {
+        return Some(UnmountableHostPath::NotAbsolute);
+    };
+    if depth_below_root(tail) == 0 {
+        return Some(UnmountableHostPath::FilesystemRoot {
+            resolved: root.to_string(),
+        });
+    }
+    None
+}
+
+/// The refusal for a host path that lands on a filesystem root, naming the
+/// resolved location as well as what was typed when those differ. `/..` reads
+/// as a folder; `/..` *is* `/`, and a message that only quoted it back would
+/// leave the user with nothing to act on.
+fn filesystem_root_message(typed: &str, resolved: &str, use_for: &str) -> String {
+    let where_it_lands = if typed.trim() == resolved {
+        format!("'{}' is a filesystem root", typed)
+    } else {
+        format!("'{}' resolves to '{}', which is a filesystem root", typed, resolved)
+    };
+    format!(
+        "{}, so {} would mount the whole drive into the container. Choose the folder itself.",
+        where_it_lands, use_for
+    )
 }
 
 #[tauri::command]
@@ -550,6 +794,12 @@ pub async fn update_project(
         stored.ca_cert_path.as_deref(),
         project.ca_cert_path.as_deref(),
     )?;
+
+    // Custom env var names had no charset check anywhere, so a key like
+    // `BASH_FUNC_stat%%` reached the container environment verbatim. Same
+    // grandfathering as the folder list, for the same reason — see
+    // [`crate::models::validate_env_vars_update`].
+    crate::models::validate_env_vars_update(&stored.custom_env_vars, &project.custom_env_vars)?;
 
     project.container_id = stored.container_id;
     project.status = stored.status;
@@ -1157,6 +1407,130 @@ mod tests {
         }
         assert!(validate_project_paths(&[path("/home/u/project", "project")]).is_ok());
         assert!(validate_project_paths(&[path("C:\\Users\\u\\project", "project")]).is_ok());
+    }
+
+    /// Every spelling of a root that is not *spelled* like one.
+    ///
+    /// The predicate this replaces trimmed trailing separators and compared
+    /// what was left, so `/..` — which the daemon mounts as the host root,
+    /// verified with `docker run -v /..:/mnt/probe` — was indistinguishable
+    /// from a project folder called `..`. No test in the repo contained a `.`
+    /// or a `..` in a host path, which is why it shipped.
+    #[test]
+    fn a_host_path_that_resolves_to_a_root_is_refused() {
+        let escapes = [
+            "/..",
+            "/../",
+            "/./",
+            "/.",
+            "/home/..",
+            "/etc/../",
+            "/tmp/../..",
+            // Deliberately not present on any machine, so this is the
+            // unresolvable path taking the lexical route.
+            "/no-such-dir-here/../..",
+            "C:\\..",
+            "C:\\Users\\..",
+            "c:/foo/..",
+            // Win32 verbatim spelling of a drive root.
+            "\\\\?\\C:\\",
+            "\\\\?\\C:\\..",
+            // A UNC share root is the root of everything on that share, which
+            // the old predicate accepted despite its doc comment claiming
+            // otherwise.
+            "\\\\server\\share",
+            "//server/share/",
+        ];
+        for escape in escapes {
+            assert!(
+                validate_project_paths(&[path(escape, "everything")]).is_err(),
+                "host path '{}' was accepted as a project folder, which bind-mounts a whole \
+                 filesystem read-write into a container with passwordless sudo",
+                escape
+            );
+            // The same value must not be reachable through the editor either.
+            assert!(
+                validate_project_paths_update(&[], &[path(escape, "everything")]).is_err(),
+                "host path '{}' was accepted through update_project",
+                escape
+            );
+            // And the two read-only mounts are the same check.
+            assert!(
+                validate_mounted_host_path("the SSH key folder", None, Some(escape)).is_err(),
+                "'{}' was accepted as an SSH key path, which read-only bind-mounts a whole \
+                 filesystem at /tmp/.host-ssh",
+                escape
+            );
+        }
+    }
+
+    /// A drive-relative path (`C:x`, no separator) means "x under whatever the
+    /// current directory on C: happens to be" — a location decided by the
+    /// process rather than by the user, so it may be the drive root.
+    #[test]
+    fn a_path_that_names_no_location_is_refused_rather_than_guessed_at() {
+        for relative in ["C:x", "C:Users\\jo", "relative/path", "./project"] {
+            assert!(
+                validate_project_paths(&[path(relative, "project")]).is_err(),
+                "'{}' was accepted, though where it lands depends on Triple-C's own \
+                 working directory",
+                relative
+            );
+        }
+    }
+
+    /// The dots that are *not* an escape have to keep working — a folder can
+    /// legitimately be reached through `.` or a `..` that goes back down again,
+    /// and the Browse button produces paths on machines this list is not
+    /// running on.
+    #[test]
+    fn an_ordinary_folder_is_still_accepted_however_it_is_spelled() {
+        for ok in [
+            "/home/u/./project",
+            "/home/u/x/../project",
+            "/home/u/..project",
+            "/home/u/project/..hidden",
+            "C:\\Users\\u\\x\\..\\project",
+            "\\\\server\\share\\project",
+            "\\\\?\\C:\\Users\\u\\project",
+        ] {
+            assert!(
+                validate_project_paths(&[path(ok, "project")]).is_ok(),
+                "host path '{}' should be usable",
+                ok
+            );
+        }
+    }
+
+    /// The half of this that only resolution can answer.
+    ///
+    /// A lexical check sees a two-component path under `/tmp` and stops. The
+    /// container is what plants the link — `/proc/self/mountinfo` inside a
+    /// Triple-C container spells the host's project paths out verbatim — so the
+    /// symlink is reachable, and the mount that follows it is read-write.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_the_root_is_refused_because_resolution_is_what_answers() {
+        let dir = std::env::temp_dir().join(format!(
+            "triple-c-root-link-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let link = dir.join("innocent");
+        std::os::unix::fs::symlink("/", &link).unwrap();
+
+        let verdict = validate_project_paths(&[path(&link.to_string_lossy(), "project")]);
+        std::fs::remove_file(&link).ok();
+        std::fs::remove_dir(&dir).ok();
+
+        assert!(
+            verdict.is_err(),
+            "a symlink to / was accepted as a project folder; only canonicalisation can see it"
+        );
     }
 
     #[test]

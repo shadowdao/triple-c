@@ -16,6 +16,15 @@ pub async fn update_settings(
     state: State<'_, AppState>,
 ) -> Result<AppSettings, String> {
     let before = state.settings_store.get();
+
+    // The global half of the same rule the project half gets in
+    // `update_project`: a global custom env var is merged into every project's
+    // container environment, so an unchecked name here reaches all of them.
+    crate::models::validate_env_vars_update(
+        &before.global_custom_env_vars,
+        &settings.global_custom_env_vars,
+    )?;
+
     let saved = state.settings_store.update(settings)?;
 
     // Persisting a setting is not the same as applying it. The gateway is the

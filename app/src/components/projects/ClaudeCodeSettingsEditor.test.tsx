@@ -193,4 +193,27 @@ describe("ClaudeCodeSettingsEditor", () => {
       expect(screen.getByRole("switch", { name: label })).toBeChecked();
     });
   });
+
+  /**
+   * A settings object with nothing set at this level arrives as `{}`: the Rust
+   * struct skips serialising a field it has no value for, which is what keeps
+   * an older binary able to parse `projects.json` after a downgrade. It is also
+   * the exact shape a project stored before the fields were widened is read
+   * back as — every one of its `false`s meant "unset" — so reading absent as
+   * "off" would show a switch the user never touched as a deliberate choice.
+   */
+  it("reads an absent field as Global rather than as Off", () => {
+    renderEditor({} as ClaudeCodeSettings, "project");
+    expect((screen.getByLabelText("Env scrub") as HTMLSelectElement).value).toBe("global");
+    expect((screen.getByLabelText("Session recap") as HTMLSelectElement).value).toBe("global");
+  });
+
+  it("still collapses to null when an absent-field object is edited back", () => {
+    const onSave = renderEditor({} as ClaudeCodeSettings, "global");
+    // Off and straight back on: the round trip has to land on `null`, or an
+    // untouched global stops being indistinguishable from one never opened.
+    fireEvent.click(screen.getByRole("switch", { name: "Session recap" }));
+    fireEvent.click(screen.getByRole("switch", { name: "Session recap" }));
+    expect(onSave).toHaveBeenLastCalledWith(null);
+  });
 });

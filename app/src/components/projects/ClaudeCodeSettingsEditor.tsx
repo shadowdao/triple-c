@@ -37,15 +37,20 @@ export const CLAUDE_CODE_DEFAULTS: ClaudeCodeSettings = {
  * overrides a global on, so a settings object holding one has to be persisted.
  */
 function isAllDefaults(s: ClaudeCodeSettings): boolean {
+  // `== null`, not `===`: an unset field is *absent* on the wire, not null.
+  // The Rust struct skips serialising one it has no value for, so a project
+  // whose stored settings were all "unset" arrives here as `{}` — and reading
+  // that as "off" is exactly the mistake the three-state control exists to
+  // avoid. See the note on `ClaudeCodeSettings` in `lib/types.ts`.
   return (
-    s.tui_mode === null &&
-    s.effort === null &&
-    s.auto_scroll_disabled === null &&
-    s.focus_mode === null &&
-    s.show_thinking_summaries === null &&
-    s.session_recap_disabled === null &&
-    s.env_scrub === null &&
-    s.prompt_caching_1h === null
+    s.tui_mode == null &&
+    s.effort == null &&
+    s.auto_scroll_disabled == null &&
+    s.focus_mode == null &&
+    s.show_thinking_summaries == null &&
+    s.session_recap_disabled == null &&
+    s.env_scrub == null &&
+    s.prompt_caching_1h == null
   );
 }
 
@@ -204,7 +209,7 @@ export default function ClaudeCodeSettingsEditor({
         // `stored` holds the deviation from Claude Code's default, so an
         // inverted field reads back the other way round — see BOOLEAN_FIELDS.
         const selected =
-          stored === null ? "global" : (invert ? !stored : stored) ? "on" : "off";
+          stored == null ? "global" : (invert ? !stored : stored) ? "on" : "off";
 
         return (
           <SwitchRow
