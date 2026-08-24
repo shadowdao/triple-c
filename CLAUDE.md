@@ -79,14 +79,34 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
 - **`components/projects/home/`** — **Project Home**, the main-area view for a project:
   Overview / Sessions / Automation / Config / Files. Per-project configuration lives here, not in
   modals — see "UI conventions" below.
-  - **Files takes drops *in*, and that path does not use HTML5 drag.** Dropping into the pane
-    is Tauri's native `onDragDropEvent`, which is window-wide and therefore routed by a
-    hit-test of the physical-pixel payload position against the pane's rect ÷
-    `devicePixelRatio` — a hidden pane has a zero-size rect, which is what stops it and
-    `TerminalView`'s listener both firing. Keep `lib/dropTarget.ts` and both listeners.
-  - **Getting a file *out* is "Save to host…", and there is no other route.** OS drag-out —
-    `tauri-plugin-drag`, `stage_container_file_for_drag` and its host staging directory — was
-    removed from the ship branch and held back for separate hardening; it lives on
+  - **Files is container-side only. It does no host filesystem I/O, and must not grow any.**
+    The tab lists, opens (text and image viewer), renames and creates folders *inside* the
+    container: `list_container_files`, `read_container_file`, `rename_container_path`,
+    `create_container_directory`. There is no upload button, no "Save to host…", and no
+    drop-into-the-pane. Four successive audits found that host filesystem paths crossing IPC
+    were where the criticals lived — a caller-named host destination for container-controlled
+    bytes, an arbitrary host source read into the container, a `link(2)` upload reservation
+    that succeeded against a directory and failed forever on any filesystem without hard
+    links — so the feature was narrowed rather than fixed a fifth time. If a host path ever
+    needs to reach this pane again, the honest shape is for the *backend* to drive
+    `tauri-plugin-dialog`, so no host path arrives over IPC at all.
+  - **A file gets *in* by being dropped on the Terminal, and *out* through "Back up
+    container".** Those two are the whole host↔container story, they predate the Files work,
+    and their hardening is not to be weakened. `TerminalView`'s `onDragDropEvent` is Tauri's
+    native drop event (window-wide, so routed by `lib/dropTarget.ts` — geometry for *whose*
+    drop it is, a document-wide `dropIsBlocked` for whether the app should accept one at all;
+    keep both halves and keep `PaneVisibility`). Backup is
+    `file_commands::download_container_backup`.
+  - **`resolve_host_path` applies the full lexical predicate twice — as written, and again
+    after canonicalisation.** That includes the general hidden-component rule, which
+    deliberately over-catches: a path resolving through `node_modules/.pnpm`, `~/.cache` or
+    `~/.local/share` is refused. Do not narrow it back to a list of "credential" directories.
+    That was tried, and allow-by-omission let `~/.local/bin` (write there and you own the
+    user's next shell command), `~/.password-store`, browser profiles and `~/.pki/nssdb`
+    through a planted symlink with a perfectly visible name. The two callers left are
+    occasional, so over-refusing is the cheaper mistake.
+  - **OS drag-out is not here.** `tauri-plugin-drag`, `stage_container_file_for_drag` and its
+    host staging directory were held back for separate hardening and live on
     `hold/disk-and-dragout`. Do not re-add `drag:allow-start-drag` or a staging command
     without taking that work back whole: the plugin has no scope mechanism, so the grant lets
     a compromised webview start a drag on *any* host path the user can read, and the staging

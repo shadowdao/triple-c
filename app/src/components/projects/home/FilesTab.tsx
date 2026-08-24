@@ -1,12 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type { FileEntry, Project } from "../../../lib/types";
 import { useFileManager } from "../../../hooks/useFileManager";
-import { classifyDrop, isDropTarget, DROP_BLOCKED_TOAST } from "../../../lib/dropTarget";
-import { useAppState } from "../../../store/appState";
 import Button from "../../ui/Button";
 import FileViewerModal from "./FileViewerModal";
-import OverwriteConfirmModal from "./OverwriteConfirmModal";
 import { formatBytes } from "./format";
 
 interface Props {
@@ -17,7 +13,15 @@ interface Props {
 const PARENT_ROW = "..";
 
 /**
- * The project's file manager.
+ * The project's file browser.
+ *
+ * Container-side only: it lists, opens, renames and creates folders inside the
+ * container, and it does no host filesystem I/O at all. A file gets *into* a
+ * container by being dropped onto the Terminal tab, and a whole tree comes back
+ * out through "Back up container" in the project's Workspace settings. Four
+ * successive audits found that host paths crossing IPC were where the criticals
+ * lived; those two paths are the ones that survived, and this pane is not one
+ * of them.
  *
  * Interaction model, chosen to match every desktop file manager rather than
  * the old half-and-half: **single click selects, double click opens**. That
@@ -42,16 +46,10 @@ export default function FilesTab({ project }: Props) {
     entries,
     loading,
     error,
-    busy,
     completed,
-    conflict,
-    resolveConflict,
     navigate,
     goUp,
     refresh,
-    downloadFile,
-    uploadFile,
-    uploadPaths,
     renameEntry,
     createFolder,
   } = useFileManager(project.id);
@@ -65,8 +63,6 @@ export default function FilesTab({ project }: Props) {
   const [creatingFolder, setCreatingFolder] = useState(false);
   const [folderDraft, setFolderDraft] = useState("");
   const [viewing, setViewing] = useState<FileEntry | null>(null);
-  /** A host drag is currently over this pane. */
-  const [dragOver, setDragOver] = useState(false);
   /** The row that owns the grid's single tab stop. */
   const [activeRow, setActiveRow] = useState<string | null>(null);
 
@@ -234,58 +230,6 @@ export default function FilesTab({ project }: Props) {
     goUp();
   }, [currentPath, goUp]);
 
-  // Host → container drag and drop.
-  //
-  // This is Tauri's *native* drag-drop event, not HTML5 `ondrop`, for the same
-  // reason `TerminalView` uses it: `dragDropEnabled` is on (the terminal needs
-  // it), which blocks HTML5 drag inside the webview on Windows, and only the
-  // native payload carries real file *paths*. The listener is window-wide, so
-  // routing is `classifyDrop` — the rect hit test, which says *whose* drop it
-  // is, plus the document-wide question a rect cannot answer: is a modal or a
-  // blocking overlay on screen at all? That second half is deliberately not a
-  // per-point z-order test; `lib/dropTarget.ts` records the two ways that went
-  // wrong.
-  useEffect(() => {
-    if (!running) return;
-    let unlisten: (() => void) | undefined;
-    let cancelled = false;
-
-    (async () => {
-      const un = await getCurrentWebview().onDragDropEvent(async (event) => {
-        const payload = event.payload;
-        if (payload.type === "leave") {
-          setDragOver(false);
-          return;
-        }
-        if (payload.type === "enter" || payload.type === "over") {
-          setDragOver(isDropTarget(paneRef.current, payload.position));
-          return;
-        }
-        if (payload.type !== "drop") return;
-        setDragOver(false);
-        const verdict = classifyDrop(paneRef.current, payload.position);
-        // Aimed at this pane and refused anyway: say so. Nothing else would —
-        // the file just never appears in the listing.
-        if (verdict === "blocked") {
-          console.warn("[drop] refused: a dialog or overlay is open", payload.position);
-          useAppState.getState().pushToast(DROP_BLOCKED_TOAST);
-          return;
-        }
-        if (verdict !== "accept") return;
-        const paths = payload.paths ?? [];
-        if (paths.length === 0) return;
-        await uploadPaths(paths);
-      });
-      if (cancelled) un();
-      else unlisten = un;
-    })();
-
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
-  }, [running, uploadPaths]);
-
   const breadcrumbs =
     currentPath === "/"
       ? [{ label: "/", path: "/" }]
@@ -324,10 +268,10 @@ export default function FilesTab({ project }: Props) {
   /**
    * The live region's text. One region, always mounted, filled and emptied —
    * a `role="status"` node that is *inserted* already carrying its text is
-   * frequently not announced at all, which is how "uploading 3 items…" and
-   * every completion notice used to go by in silence.
+   * frequently not announced at all, which is how every completion notice used
+   * to go by in silence.
    */
-  const liveText = busy ? busy : (completed ?? "");
+  const liveText = completed ?? "";
 
   return (
     <div ref={paneRef} className="relative flex flex-col h-full min-h-0">
@@ -361,9 +305,6 @@ export default function FilesTab({ project }: Props) {
         >
           New folder
         </Button>
-        <Button onClick={uploadFile} className="ml-1">
-          Upload file
-        </Button>
         <Button onClick={refresh} disabled={loading} className="ml-1">
           Refresh
         </Button>
@@ -372,9 +313,9 @@ export default function FilesTab({ project }: Props) {
       <div className="flex-1 overflow-y-auto min-h-0">
         {/* The one failure that stays inline: it explains why the grid below is
             empty, it is in context, and there are no rows for it to scroll
-            behind. Every *transient* failure — upload, rename, mkdir,
-            save-to-host — goes to `ToastHost` instead, which is above
-            the file viewer's overlay and does not scroll away. */}
+            behind. Every *transient* failure — rename, new folder — goes to
+            `ToastHost` instead, which is above the file viewer's overlay and
+            does not scroll away. */}
         {error && (
           <div role="alert" className="px-4 py-2 text-xs text-[var(--error)]">
             {error}
@@ -560,18 +501,6 @@ export default function FilesTab({ project }: Props) {
                           >
                             Rename
                           </Button>
-                          {!entry.is_directory && (
-                            <Button
-                              aria-label={`Save to host… — ${entry.name}`}
-                              className="ml-1"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                downloadFile(entry);
-                              }}
-                            >
-                              Save to host…
-                            </Button>
-                          )}
                         </>
                       )}
                     </td>
@@ -594,34 +523,11 @@ export default function FilesTab({ project }: Props) {
         )}
       </div>
 
-      {/* Drop hint. Purely decorative — the native listener is what accepts the
-          drop, so this must never intercept pointer events. */}
-      {dragOver && (
-        <div
-          aria-hidden="true"
-          className="pointer-events-none absolute inset-0 flex items-center justify-center border-2 border-dashed border-[var(--accent)] bg-[var(--bg-primary)]/70"
-        >
-          <span className="text-[13px] font-medium text-[var(--text-primary)]">
-            Drop files into {currentPath}
-          </span>
-        </div>
-      )}
-
-      {conflict && (
-        <OverwriteConfirmModal
-          name={conflict.name}
-          directory={conflict.directory}
-          remaining={conflict.remaining}
-          onChoose={resolveConflict}
-        />
-      )}
-
       {viewing && (
         <FileViewerModal
           projectId={project.id}
           entry={viewing}
           onClose={() => setViewing(null)}
-          onSaveToHost={downloadFile}
         />
       )}
     </div>

@@ -105,7 +105,7 @@ configuration. Per-project configuration lives in the Config tab rather than in 
 | **Sessions** | Past Claude Code conversations read from the config volume, with **Resume** |
 | **Automation** | The container's `triple-c-scheduler` tasks — create, edit, enable/disable, run now, read logs, remove, and completion notifications |
 | **Config** | Workspace (name, folders), Model (backend), Access (SSH, git, env vars, port mappings), Runtime (permission mode, sandbox, Docker access, Mission Control, instructions, Claude Code settings) |
-| **Files** | Browse, download and upload files inside the container |
+| **Files** | Browse, view and rename files inside the container. Container-side only: to get a file *in*, drop it on the Terminal tab; to get files *out*, use **Back up container** |
 | **Browser** | Watch and take over the Playwright browser inside the container — see [Browser View](#browser-view) |
 
 Container start/stop progress is reported inline (on the sidebar row and in the Project Home
@@ -513,7 +513,7 @@ Triple-C includes optional speech-to-text powered by [Faster Whisper](https://gi
 | `app/src/components/projects/home/AutomationTab.tsx` | Scheduler tasks: create, toggle, run now, logs, remove, notifications |
 | `app/src/components/projects/home/TaskEditorModal.tsx` | Create/edit a scheduled task; `taskValidation.ts` holds the cron and schedule rules |
 | `app/src/components/projects/home/ConfigTab.tsx` | Config sections (Workspace, Model, Access, Runtime) |
-| `app/src/components/projects/home/FilesTab.tsx` | File browser (browse, download, upload) |
+| `app/src/components/projects/home/FilesTab.tsx` | Container-side file browser (navigate, view, rename, new folder) |
 | `app/src/components/projects/home/BrowserTab.tsx` | Browser view pane: detect, install, watch, take over, pop out |
 | `app/src/components/projects/home/OpenPageDialog.tsx` | Open a URL in the container's browser at a chosen viewport |
 | `app/src/components/projects/home/ContainerMigrationBanner.tsx` | Base-image staleness banner, migration progress, resume/rollback |
@@ -536,7 +536,7 @@ Triple-C includes optional speech-to-text powered by [Faster Whisper](https://gi
 | `app/src/hooks/useTerminal.ts` | Terminal session management (claude and bash modes) |
 | `app/src/hooks/useProjectActions.ts` | Start/stop/reset/backup and terminal-opening helpers |
 | `app/src/hooks/useContainerMigration.ts` | Staleness polling, migration run, resume and rollback |
-| `app/src/hooks/useFileManager.ts` | File manager operations (list, download, upload) |
+| `app/src/hooks/useFileManager.ts` | File browser operations (list, navigate, rename, mkdir) |
 | `app/src/hooks/useClaudeAuth.ts` | Shared-token status and acquisition |
 | `app/src/hooks/useSTT.ts` | Speech-to-text recording, transcription, and container management |
 | `app/src/lib/urlRelay.ts` | Host-side relay validation: OSC 7777 parsing, http/https allowlist, rate limiting |
@@ -547,7 +547,7 @@ Triple-C includes optional speech-to-text powered by [Faster Whisper](https://gi
 | File | Purpose |
 |---|---|
 | `app/src-tauri/src/docker/container.rs` | Container creation, mounts, env vars, labels, recreation checks, `remove_project_volumes` |
-| `app/src-tauri/src/docker/exec.rs` | `create_attached_exec()` — the single attached-exec path; file upload/download via tar |
+| `app/src-tauri/src/docker/exec.rs` | `create_attached_exec()` — the single attached-exec path; one-shot execs and single-file tar building |
 | `app/src-tauri/src/docker/image.rs` | Image building/pulling |
 | `app/src-tauri/src/docker/migration.rs` | Base-image migration: manifest capture, delta computation, crash-recovery state machine |
 | `app/src-tauri/src/docker/ca_certs.rs` | CA certificate discovery, `.crt` renaming, fingerprinting |
@@ -561,7 +561,7 @@ Triple-C includes optional speech-to-text powered by [Faster Whisper](https://gi
 | `app/src-tauri/src/commands/inspect_commands.rs` | Read-only container views: sessions, capabilities, scheduler tasks |
 | `app/src-tauri/src/commands/auth_token_commands.rs` | `claude setup-token` flow, redaction, keychain storage |
 | `app/src-tauri/src/commands/auth_bridge_commands.rs` | Auth bridge enable/status commands |
-| `app/src-tauri/src/commands/file_commands.rs` | File manager Tauri commands (list, download, upload) |
+| `app/src-tauri/src/commands/file_commands.rs` | Container-side file commands (list, read, rename, mkdir) plus `download_container_backup` |
 | `app/src-tauri/src/commands/stt_commands.rs` | STT start/stop/transcribe Tauri commands |
 | `app/src-tauri/src/commands/web_terminal_commands.rs` | Web terminal start/stop/status Tauri commands |
 | `app/src-tauri/src/models/project.rs` | Project struct (backend, `PermissionMode`, Docker access, Claude Code settings, Mission Control, auth bridge, browser view, CA path, shared-token opt-out) |

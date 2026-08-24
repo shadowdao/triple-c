@@ -497,9 +497,7 @@ pub fn run() {
             commands::terminal_commands::stop_audio_bridge,
             // Files
             commands::file_commands::list_container_files,
-            commands::file_commands::download_container_file,
             commands::file_commands::download_container_backup,
-            commands::file_commands::upload_file_to_container,
             commands::file_commands::read_container_file,
             commands::file_commands::rename_container_path,
             commands::file_commands::create_container_directory,
