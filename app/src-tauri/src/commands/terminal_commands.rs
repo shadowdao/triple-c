@@ -197,18 +197,17 @@ pub async fn upload_host_file_to_terminal(
     state: State<'_, AppState>,
 ) -> Result<String, String> {
     // The drop target is a host path chosen by the webview, not by the OS drag
-    // itself, so it gets the same host-read policy as the Files pane's upload:
-    // absolute, no traversal, and nothing out of a hidden directory
-    // (`~/.ssh`, `~/.aws`) or a system location — applied to the path with its
-    // symlinks already resolved, so a visible directory that *leads* to `~/.ssh`
-    // is refused too. What comes back is that resolved path, and it is what
-    // gets opened.
+    // itself, so it goes through `file_commands`' host-read policy: absolute,
+    // no traversal, and nothing whose path passes through a hidden directory
+    // (`~/.ssh`, `~/.aws`, `~/.local/bin`) or a system location — applied to
+    // the path with its symlinks already resolved, so a visible directory that
+    // *leads* to one of those is refused too. What comes back is that resolved
+    // path, and it is what gets opened. This is now one of only two commands
+    // that touch a host path at all; the other is `download_container_backup`.
     // The name is taken from the path the user actually dropped, *before*
     // resolution. Deriving it from the resolved path renames the file behind
     // the user's back: dropping `~/Downloads/latest.log`, where `latest.log` is
-    // a symlink, would land it in the container as `2026-08-23.log`. The Files
-    // pane's upload had the same bug and fixes it the same way — one helper, so
-    // the two drop targets cannot drift.
+    // a symlink, would land it in the container as `2026-08-23.log`.
     let base = crate::commands::file_commands::host_upload_name(&host_path)?;
     let host_path = crate::commands::file_commands::resolve_host_read_path(&host_path).await?;
 
@@ -229,7 +228,7 @@ pub async fn upload_host_file_to_terminal(
     use crate::docker::exec::MAX_DROP_BYTES;
     if meta.len() > MAX_DROP_BYTES {
         return Err(format!(
-            "File too large to drop into the terminal ({:.0} MB; limit {} MB). Mount it into the project or use the Files panel instead.",
+            "File too large to drop into the terminal ({:.0} MB; limit {} MB). Mount it into the project instead.",
             meta.len() as f64 / (1024.0 * 1024.0),
             MAX_DROP_BYTES / (1024 * 1024)
         ));
@@ -301,19 +300,18 @@ pub async fn stop_audio_bridge(
 
 #[cfg(test)]
 mod tests {
-    /// Both drop targets must name a dropped file the way the *user* named it.
+    /// A dropped file must be named the way the *user* named it.
     ///
     /// The bug this pins: `upload_host_file_to_terminal` derived the tar entry
     /// name from the path *after* symlink resolution, so dropping
     /// `~/Downloads/latest.log` — where `latest.log` is a symlink to
     /// `2026-08-23.log` — silently landed the file in the container under the
     /// target's name. Nothing errored; the user just got a name they never
-    /// typed. The Files pane had the identical bug.
+    /// typed.
     ///
-    /// What actually keeps the two from drifting is that they now call one
-    /// helper, so this asserts that helper's contract from the terminal side:
-    /// the answer comes from the spelling, and a path that does not name a file
-    /// is refused rather than silently substituted (it used to fall back to
+    /// This asserts the shared helper's contract from the terminal side: the
+    /// answer comes from the spelling, and a path that does not name a file is
+    /// refused rather than silently substituted (it used to fall back to
     /// `"dropped-file"`).
     #[test]
     fn a_dropped_file_keeps_the_name_the_user_dropped() {

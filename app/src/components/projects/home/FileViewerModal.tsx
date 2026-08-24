@@ -16,14 +16,12 @@ interface Props {
   projectId: string;
   entry: FileEntry;
   onClose: () => void;
-  /** "Save to host…" — the way out for anything the viewer can't render. */
-  onSaveToHost: (entry: FileEntry) => void;
 }
 
 type Preview =
   | { kind: "loading" }
   | { kind: "error"; message: string }
-  /** Too big to render whole — offered as a download rather than a half-file. */
+  /** Too big to render whole — said so rather than shown as a half-file. */
   | { kind: "too-large" }
   | { kind: "text"; text: string; truncated: boolean; shownBytes: number; trueSize: number }
   | { kind: "image"; url: string }
@@ -37,7 +35,7 @@ type Preview =
  * keeps a multi-megabyte base64 string out of the DOM. `blob:` is in the app's
  * `img-src` for exactly this; the asset protocol deliberately is not enabled.
  */
-export default function FileViewerModal({ projectId, entry, onClose, onSaveToHost }: Props) {
+export default function FileViewerModal({ projectId, entry, onClose }: Props) {
   const [preview, setPreview] = useState<Preview>({ kind: "loading" });
 
   /**
@@ -121,19 +119,9 @@ export default function FileViewerModal({ projectId, entry, onClose, onSaveToHos
   );
 
   const footer = (
-    <>
-      <Button
-        size="md"
-        onClick={() => {
-          onSaveToHost(entry);
-        }}
-      >
-        Save to host…
-      </Button>
-      <Button size="md" variant="primary" onClick={onClose}>
-        Close
-      </Button>
-    </>
+    <Button size="md" variant="primary" onClick={onClose}>
+      Close
+    </Button>
   );
 
   return (
@@ -156,14 +144,15 @@ export default function FileViewerModal({ projectId, entry, onClose, onSaveToHos
 
       {preview.kind === "too-large" && (
         <p className="text-[13px] text-[var(--text-secondary)]">
-          This file is {formatBytes(entry.size)} — too large to preview in the app. Save it
-          to the host to open it there.
+          This file is {formatBytes(entry.size)} — too large to preview in the app. Open it
+          from a terminal in the container, or take a backup and open it on the host.
         </p>
       )}
 
       {preview.kind === "unsupported" && (
         <p className="text-[13px] text-[var(--text-secondary)]">
-          There is no preview for this file type. Save it to the host to open it there.
+          There is no preview for this file type. Open it from a terminal in the container,
+          or take a backup and open it on the host.
         </p>
       )}
 

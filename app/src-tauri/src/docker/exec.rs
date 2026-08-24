@@ -351,8 +351,8 @@ pub async fn upload_host_file_to_container(
         // The caller resolved this path (`resolve_host_read_path`); opening it
         // is a second trip through the same directories, so the descriptor is
         // checked against the path that was validated before its bytes are
-        // packed into anything. Same policy as the Files pane's upload — this
-        // is the terminal's drop target, and the two must not differ.
+        // packed into anything. This is the terminal's drop target, and it is
+        // the only path by which host bytes enter a container.
         let file = std::fs::File::open(&host_path)
             .map_err(|e| format!("Failed to read {}: {}", host_path, e))?;
         crate::commands::file_commands::verify_opened_path(
@@ -599,44 +599,6 @@ pub async fn exec_oneshot_as(
     env: Vec<String>,
 ) -> Result<(String, i64), String> {
     exec_oneshot_inner(container_id, user, cmd, env, MAX_ONESHOT_OUTPUT).await
-}
-
-/// [`exec_oneshot_as`] with a wall-clock ceiling on the whole call.
-///
-/// H8. Nothing in this module bounds how long a container command may take,
-/// which is right for the callers that need it — a base-image migration replays
-/// `apt-get` and takes minutes — and wrong for a short command that can be made
-/// to block forever by a *file* the caller does not control. The upload
-/// reservation is the one that bit: a shell redirect onto a FIFO blocks in
-/// `open(2)` until a reader appears, so a single `mkfifo` in a project
-/// directory left the Files pane on "Uploading…" for the rest of the session
-/// with the rest of the batch abandoned.
-///
-/// So the ceiling is opt-in per call site rather than global. Note what it can
-/// and cannot do: dropping the future closes our end of the stream, but Docker
-/// has no "kill an exec" API, so a process that is genuinely wedged stays
-/// wedged in the container's process table. That is why the primitive matters
-/// more than the timeout — this turns "the app never comes back" into "that
-/// upload failed", and it is the caller's job not to run something that blocks.
-pub async fn exec_oneshot_as_within(
-    container_id: &str,
-    user: &str,
-    cmd: Vec<String>,
-    env: Vec<String>,
-    limit: std::time::Duration,
-) -> Result<(String, i64), String> {
-    match tokio::time::timeout(
-        limit,
-        exec_oneshot_inner(container_id, user, cmd, env, MAX_ONESHOT_OUTPUT),
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(_) => Err(format!(
-            "The container did not answer within {}s — the command may still be running inside it.",
-            limit.as_secs()
-        )),
-    }
 }
 
 /// What a one-shot exec printed, with the two streams still tellable apart.

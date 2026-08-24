@@ -7,8 +7,10 @@
  *
  * 1. **Which pane is this drop for?** Geometry, and nothing else: is the
  *    payload position inside my rect? A hidden pane is `display:none` and so
- *    has a zero-size rect, which is what stops `TerminalView` and `FilesTab`
- *    both claiming the same drop.
+ *    has a zero-size rect, which is what stops two panes both claiming the
+ *    same drop. `TerminalView` is the only pane that takes dropped files
+ *    today — the Files pane is container-side only — but the routing is what
+ *    keeps it honest when a second one appears.
  * 2. **Should the app accept a drop at all right now?** `dropIsBlocked` —
  *    document-wide, no geometry, no z-order. While a modal or a blocking
  *    overlay is on screen anywhere, every drop is refused.
@@ -16,7 +18,7 @@
  * ## Why there is no z-order test here, and must not be one
  *
  * A drop that lands underneath a dialog and silently uploads into the
- * directory the dialog is covering is the failure mode that matters: it is
+ * container behind it is the failure mode that matters: it is
  * invisible, it writes to the container, and the user did not ask for it.
  * Every attempt to be *precise* about which points a dialog covers has gone
  * wrong, twice, in opposite directions:
