@@ -414,7 +414,19 @@ export default function TerminalView({ sessionId, active }: Props) {
         sessionTypeRef.current === "claude"
       ) {
         sendInput(sessionId, "\x1b\r");
-        return false; // xterm must not also send a bare CR, which submits
+        // **`preventDefault()` is what stops the submit, not the `return false`.**
+        //
+        // xterm's `_keyDown` returns the instant a custom handler says `false`
+        // — *before* it sets `_keyDownHandled` and before it cancels the event.
+        // `_keyPress` then checks that same flag, finds it still false, and
+        // emits a bare CR for Enter's charCode 13. So returning `false` alone
+        // sent ESC+CR *and* a submit: the newline was inserted and the
+        // half-written prompt went to Claude with a stray blank line in it.
+        // Cancelling the keydown is what stops the browser firing keypress at
+        // all. Verified in Chromium; jsdom never synthesizes the follow-up
+        // keypress, which is why the unit test could not see this.
+        event.preventDefault();
+        return false;
       }
       return true;
     });

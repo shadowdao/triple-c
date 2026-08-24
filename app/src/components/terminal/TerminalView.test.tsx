@@ -137,19 +137,36 @@ afterEach(() => {
 });
 
 describe("TerminalView — Shift+Enter", () => {
-  it("sends ESC+CR and nothing else in a Claude session", () => {
+  it("sends ESC+CR and cancels the keydown, so no bare CR follows", () => {
+    // **The cancel is the load-bearing half, and this test could not see it.**
+    //
+    // Returning `false` from xterm's custom key handler does not cancel the
+    // event: `_keyDown` returns before setting `_keyDownHandled`, so
+    // `_keyPress` still runs and emits a bare CR for Enter's charCode 13. In a
+    // real browser that submitted the prompt straight after inserting the
+    // newline. jsdom never synthesizes the follow-up keypress, so the old
+    // `expect(sent()).not.toContain("\r")` assertion below could not fail no
+    // matter what the code did — it was named for a behaviour it could not
+    // exercise.
+    //
+    // Asserting `defaultPrevented` pins the actual mechanism that stops the
+    // keypress, which is a property jsdom *can* observe.
     const { container } = mountSession("claude");
 
-    fireEvent.keyDown(helperTextarea(container), {
+    const event = new KeyboardEvent("keydown", {
       key: "Enter",
       keyCode: 13,
       shiftKey: true,
+      bubbles: true,
+      cancelable: true,
     });
+    helperTextarea(container).dispatchEvent(event);
 
     // The bytes `/terminal-setup` installs for every other editor.
     expect(sent()).toEqual(["\x1b\r"]);
-    // And specifically not the bare CR that would have submitted the prompt.
     expect(sent()).not.toContain("\r");
+    // Without this, the browser fires keypress and xterm submits.
+    expect(event.defaultPrevented).toBe(true);
   });
 
   it("leaves a plain Enter alone", () => {

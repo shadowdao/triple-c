@@ -757,7 +757,13 @@
         sessionType === 'claude'
       ) {
         sendTerminalInput('\x1b\r');
-        return false; // xterm must not also send a bare CR, which submits
+        // `preventDefault()` is what stops the submit, not the `return false`.
+        // xterm's `_keyDown` returns before setting `_keyDownHandled`, so
+        // `_keyPress` still fires and emits a bare CR for Enter — inserting the
+        // newline and then submitting the prompt anyway. See the same comment
+        // in TerminalView.tsx.
+        e.preventDefault();
+        return false;
       }
       return true;
     });
