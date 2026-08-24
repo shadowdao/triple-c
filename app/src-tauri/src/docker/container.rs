@@ -1118,6 +1118,49 @@ fn explain_container_failure(action: &str, err: &str) -> String {
     format!("Failed to {} container: {}", action, err)
 }
 
+/// One bind mount per stored project path, skipping the rows that cannot
+/// produce a usable one.
+///
+/// Both halves of the filter are about data that is **already on disk**, which
+/// is why this is a silent skip and not a validation error. `project_commands`
+/// now refuses an empty `mount_name` or `host_path` on save, and the Workspace
+/// pane can no longer send a half-filled row — but neither of those reaches a
+/// record written before they existed, and the two failures such a record
+/// causes are not equally visible:
+///
+/// * An empty `host_path` becomes `{"Target":"/workspace/x","Source":""}`, and
+///   the daemon answers `invalid mount config for type "bind": field Source
+///   must not be empty` for the whole create. The project cannot be started or
+///   recreated at all — it is bricked, and it stays bricked however carefully
+///   the next save is validated. Skipping the row lets it start again, minus a
+///   mount that was never going to work.
+/// * An empty `mount_name` targets `/workspace/` itself, mounting the row's
+///   host directory *over* the workspace volume. The daemon then creates the
+///   other rows' mount points inside the user's real folder, which is a
+///   directory tree appearing in their project from nowhere.
+///
+/// Failing louder is the wrong instinct here: the loud version is the one that
+/// already happened, and it took the project down with it. See
+/// `project_commands.rs`'s `check_mount_name_stays_under_workspace` for the
+/// save-time half — deliberately still tolerant of an empty name there, since
+/// refusing it would re-brick every project holding a legacy row.
+fn project_path_mounts(paths: &[crate::models::project::ProjectPath]) -> Vec<Mount> {
+    paths
+        .iter()
+        // Trimmed, because a name of `" "` targets `/workspace/ ` and a source
+        // of `" "` is a path the daemon will happily create at the filesystem
+        // root — neither is what anyone typed on purpose.
+        .filter(|pp| !pp.mount_name.trim().is_empty() && !pp.host_path.trim().is_empty())
+        .map(|pp| Mount {
+            target: Some(format!("/workspace/{}", pp.mount_name)),
+            source: Some(pp.host_path.clone()),
+            typ: Some(MountTypeEnum::BIND),
+            read_only: Some(false),
+            ..Default::default()
+        })
+        .collect()
+}
+
 pub async fn create_container(
     project: &Project,
     docker_socket_path: &str,
@@ -1539,15 +1582,7 @@ pub async fn create_container(
     let mut mounts: Vec<Mount> = Vec::new();
 
     // Project directories -> /workspace/{mount_name}
-    for pp in &project.paths {
-        mounts.push(Mount {
-            target: Some(format!("/workspace/{}", pp.mount_name)),
-            source: Some(pp.host_path.clone()),
-            typ: Some(MountTypeEnum::BIND),
-            read_only: Some(false),
-            ..Default::default()
-        });
-    }
+    mounts.extend(project_path_mounts(&project.paths));
 
     // Named volume for the entire home directory — preserves ~/.claude.json,
     // ~/.local (pip/npm globals), and any other user-level state across
@@ -2163,6 +2198,16 @@ const SCRUB_MARKER: &str = "###TRIPLE-C-SCRUBBED ";
 /// `parse_scrub_total` can never mistake one for the other.
 const SCRUB_UNAVAILABLE_MARKER: &str = "###TRIPLE-C-SCRUB-UNAVAILABLE ";
 
+/// The external tools [`snapshot_scrub_script`] probes for before it will
+/// delete anything, in the order the probe names them.
+///
+/// Named once rather than spelled into the script text, because
+/// [`parse_scrub_unavailable`] has to be able to tell a missing *tool* from the
+/// other two prerequisites — the root device id, and an `rm` that takes
+/// `--one-file-system` — so that the log line reads as a sentence rather than
+/// as a list with `root-device-id` wedged into it.
+const SCRUB_PREREQ_TOOLS: &[&str] = &["stat", "rm", "du", "cut", "find"];
+
 /// Environment the scrub exec sets explicitly, rather than inheriting.
 ///
 /// The exec inherits the container's configured env, and a project's *custom*
@@ -2183,7 +2228,92 @@ const SCRUB_UNAVAILABLE_MARKER: &str = "###TRIPLE-C-SCRUB-UNAVAILABLE ";
 /// `LD_LIBRARY_PATH` is here for the same reason as `LD_PRELOAD`: it is
 /// searched ahead of the cache for every `DT_NEEDED` library, so a planted
 /// `libselinux.so.1` is as good as a preload.
+///
+/// M2: [`SCRUB_BOOTSTRAP`] now starts the shell that runs the script under
+/// `env -i`, so none of these three reaches the script's own tools whatever
+/// this list says. They are kept because they still reach the *two processes
+/// in front of it* — the `/bin/sh` that runs the bootstrap and the `env` it
+/// calls — and an `env` with a preload in it is an `env` that can hand its
+/// child any environment it likes. Blanking here and emptying there are the
+/// same defence applied at the two points it has to hold at.
 const SCRUB_EXEC_ENV: &[&str] = &["LD_PRELOAD=", "LD_AUDIT=", "LD_LIBRARY_PATH="];
+
+/// The `/bin/sh -c` program that starts the real scrub, with
+/// [`snapshot_scrub_script`] passed to it as `$1` rather than spliced into it.
+///
+/// ## Why the script is not simply the exec's command (M2)
+///
+/// `docker exec` cannot *replace* a container's environment, only add to and
+/// override it — which is why [`SCRUB_EXEC_ENV`] works by naming keys. The env
+/// a project carries is therefore inherited by whatever shell the exec starts,
+/// and a shell reads more out of its environment than variables.
+///
+/// `bash` imports **functions** from the environment: an env var named
+/// `BASH_FUNC_stat%%` becomes a shell function called `stat`. Function lookup
+/// happens *before* `PATH` is ever consulted, so resetting `PATH` does not
+/// touch it, and `command -v` reports a function as found — so a planted
+/// function passes the prerequisite probe and then answers the containment
+/// checks. Measured against `bash` 5.2 on `ubuntu:24.04`, an environment
+/// carrying `BASH_FUNC_stat%%` had `stat -c %d` return a constant of its
+/// choosing while `command -v stat` said the tool was present.
+///
+/// Every in-shell answer to that was tried and measured, and each one is
+/// itself importable: `unset -f stat` is defeated by `BASH_FUNC_unset%%`,
+/// `command stat` by `BASH_FUNC_command%%`, and — this is what settles it —
+/// `[`, `test`, `pwd` and `cd` import just as readily, which is checks 0, 1
+/// and 2 of the containment guarantee, not merely the tools. There is no
+/// subset of the script that can be written in shell and still be trusted
+/// inside a shell that has already imported the attacker's functions.
+///
+/// So the script is not run by that shell. This bootstrap is, and everything
+/// it uses is either a reserved word (`case`, `esac`), a parameter expansion,
+/// or a command word containing a `/` — and `bash` refuses to import a
+/// function whose name contains a `/`, verified on the same image. It hands
+/// the script to a **second** `/bin/sh` started by `env -i`, which has no
+/// environment at all: no `BASH_FUNC_*`, no `LD_*`, no `ENV`/`BASH_ENV`, and
+/// no `PATH` but the one named here. The inner shell's builtins are its own
+/// again, and the script does not have to care what `/bin/sh` is.
+///
+/// Measured on an `ubuntu:24.04` with `/bin/sh -> bash`, a project env var of
+/// `BASH_FUNC_stat%%=() { echo 1; }` set on the container the way a custom env
+/// var is, and a named volume mounted **at** the match `/tmp/claude-x` — the
+/// position checks 3 and 4 exist for:
+///
+/// * `/bin/sh -c <script>`, which is what the exec used to be, emptied the
+///   volume and printed `###TRIPLE-C-SCRUBBED 306565`;
+/// * `/bin/sh -c <bootstrap> triple-c-scrub <script>` left the volume intact,
+///   reclaimed the real scratchpad beside it, and printed `65536`.
+///
+/// The same script, unchanged, in both runs.
+///
+/// `env` is not assumed to be usr-merged, for the reason spelled out under
+/// [`snapshot_scrub_script_under`]: `/usr/bin/env` first, `/bin/env` on a
+/// literal 127, which is the pair that covers `ubuntu`, `debian`, `alpine`,
+/// `busybox` and `node:*-slim` (checked). An image with neither runs nothing,
+/// prints no marker, and is reported as [`ScrubOutcome::Failed`] — loud, and
+/// preferable to falling back to a shell that would run the script in the
+/// environment this exists to keep away from it.
+///
+/// Passing the script as `$1` rather than interpolating it into a quoted inner
+/// command string is not a style choice: the script contains single quotes in
+/// every `scrub_in` call, and a nested quoting bug in a string that runs
+/// `rm -rf` as root is the whole class of defect this module keeps having.
+const SCRUB_BOOTSTRAP: &str = concat!(
+    r#"/usr/bin/env -i PATH=/usr/bin:/bin /bin/sh -c "$1"; "#,
+    r#"case $? in 127) /bin/env -i PATH=/usr/bin:/bin /bin/sh -c "$1" ;; esac"#,
+);
+
+/// The argv the scrub exec is created with: [`SCRUB_BOOTSTRAP`], then the
+/// `$0` a diagnostic would name the shell by, then the script itself as `$1`.
+fn scrub_exec_cmd(script: &str) -> Vec<String> {
+    vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        SCRUB_BOOTSTRAP.to_string(),
+        "triple-c-scrub".to_string(),
+        script.to_string(),
+    ]
+}
 
 /// Split a [`SNAPSHOT_SCRUB_PATHS`] entry into the literal directory it is
 /// anchored to and the glob to expand inside it.
@@ -2201,6 +2331,23 @@ fn split_scrub_pattern(pattern: &str) -> Option<(&str, &str)> {
 }
 
 /// The `/bin/sh` program run inside the container to perform the scrub.
+///
+/// ## Never run the string this returns anywhere but inside a container
+///
+/// It is anchored at `/`, and its first pattern is `/tmp/claude-*`. A Triple-C
+/// development container keeps every agent's scratchpad — working files,
+/// backups of the very sources being edited, task output — under
+/// `/tmp/claude-<uid>/`, which that glob matches exactly. Running this as root
+/// on a development machine or in the dev container deletes all of it, reports
+/// a healthy byte total, and leaves nothing to say what happened.
+///
+/// Anything that wants to *exercise* the scrub outside a container must use
+/// [`snapshot_scrub_script_under`] with a freshly generated, uuid-named
+/// throwaway root, and that applies to negative controls too: a control that
+/// plants a symlink to show the vulnerable version follows it must point that
+/// symlink **inside the same throwaway root**, never at a path derived from
+/// the crate, the repository or the environment. The whole point of those
+/// controls is that they delete what they are aimed at.
 pub(crate) fn snapshot_scrub_script() -> String {
     snapshot_scrub_script_under("")
 }
@@ -2273,8 +2420,10 @@ pub(crate) fn snapshot_scrub_script() -> String {
 ///    deletes everything under it. Verified in real containers against
 ///    `docker run -v vol:/tmp/claude-x`: mounted at the parent (`/var/log/apt`)
 ///    was refused, mounted one level below the match
-///    (`/tmp/claude-x/inner`) was refused, and mounted *as* the match
-///    (`/tmp/claude-x`) emptied the volume. In production that mount is the
+///    (`/tmp/claude-x/inner`) was refused **on the strength of the flag
+///    alone**, and mounted *as* the match (`/tmp/claude-x`) emptied the volume.
+///    That middle case is why the flag is a prerequisite rather than an
+///    option — see the section on M1 below. In production that mount is the
 ///    user's own project directory, because a mount name of `../tmp/claude-x`
 ///    reaches it: the daemon normalises the `/workspace/{mount_name}` target
 ///    built at [`create_container`] straight back to `/tmp/claude-x`.
@@ -2285,9 +2434,58 @@ pub(crate) fn snapshot_scrub_script() -> String {
 ///    component have always relied on.
 ///
 /// Inside the loop, an expansion carrying a path separator means the list has
-/// changed shape and is skipped, and `rm --one-file-system` (probed, because
-/// busybox's `rm` would reject it) refuses to recurse across a mount planted
-/// *below* a match — which is the only mount position it does cover.
+/// changed shape and is skipped, and `rm --one-file-system` refuses to recurse
+/// across a mount planted *below* a match — the one mount position none of the
+/// five checks above can see, because it is not the parent and it is not the
+/// match.
+///
+/// ## Why `--one-file-system` is a prerequisite and not an option (M1)
+///
+/// It used to be probed into a variable:
+///
+/// ```sh
+/// rmopt=;
+/// rm --one-file-system --help >/dev/null 2>&1 && rmopt=--one-file-system;
+/// rm -rf $rmopt -- "$p";
+/// ```
+///
+/// which fails **open**. `busybox`'s `rm` answers `unrecognized option
+/// '--one-file-system'` and exits 1 for that probe, so on any
+/// `ImageSource::Custom` busybox- or toybox-derived image `$rmopt` was empty
+/// and `rm -rf` ran as root with no cross-filesystem bound at all — and
+/// reported the result as a completed `Reclaimed(n)`.
+///
+/// Measured end to end, `busybox:latest` (BusyBox 1.38), a named volume
+/// mounted one level below the match at `/tmp/claude-x/inner`:
+///
+/// * the probed shape emptied the volume and printed
+///   `###TRIPLE-C-SCRUBBED 102423`;
+/// * this shape prints `###TRIPLE-C-SCRUB-UNAVAILABLE rm-one-file-system` and
+///   removes nothing at all.
+///
+/// And on `ubuntu:24.04` (GNU coreutils 9.4), same mount, to show the flag is
+/// honoured rather than merely accepted: with `--one-file-system` deleted from
+/// the one `rm` the volume was emptied and `306565` reported, with it the
+/// volume was untouched and the figure was `65536` — exactly the debris that
+/// really was next to the mount, so the byte accounting follows the flag too.
+///
+/// It is one of the six prerequisites now, and an image without it is
+/// [`SCRUB_UNAVAILABLE_MARKER`] rather than a scrub that runs unguarded. That
+/// is a real cost — an Alpine or busybox base image stops being scrubbed and
+/// keeps its debris — and it is the cheaper of the two: declining costs disk,
+/// proceeding costs the mount.
+///
+/// The probe is `rm --one-file-system -f -- ''` rather than `--help`. It is
+/// the same question asked of the code path that matters — option parsing
+/// followed by an actual run — where `--help` only asks whether a usage
+/// message can be printed; and the empty operand is the one argument no
+/// filesystem can ever name, so a probe that *does* run cannot remove
+/// anything. `-f` makes the resulting `ENOENT` an exit of 0, on GNU
+/// `coreutils` and by POSIX both.
+///
+/// What it cannot check is that the flag is *honoured* rather than merely
+/// accepted; that needs a real mount, and it is covered by the container runs
+/// recorded above rather than by the probe.
 ///
 /// ## How the byte total is counted
 ///
@@ -2315,8 +2513,19 @@ pub(crate) fn snapshot_scrub_script() -> String {
 /// a volume mounted at `/var/log/apt` — refused by an unshimmed scrub — had its
 /// entire contents deleted. The shim lives in the home volume; it cannot live
 /// in `/usr/bin` or `/bin`, which uid 1000 cannot write. Resetting `PATH` to
-/// exactly those two directories therefore defeats it just as completely as
-/// spelling `/usr/bin/stat` out does.
+/// exactly those two directories therefore defeats *a shim on `PATH`* as
+/// completely as spelling `/usr/bin/stat` out does, and buys the portability
+/// that spelling it out gives away.
+///
+/// M2: that sentence used to stop one clause earlier, at "defeats it just as
+/// completely", and read as though the reset settled command lookup. It does
+/// not. `PATH` is the **last** step of lookup: a shell tries functions, then
+/// builtins, then `PATH`, and `command -v` reports a function as found — so a
+/// planted shell function is invisible to everything in this section and
+/// passes the tool probe below into the bargain. Nothing written in this
+/// script can fix that, because the shell that would run the fix has already
+/// imported the function. It is fixed one level up, by [`SCRUB_BOOTSTRAP`],
+/// which gives the shell that runs this script no environment to import from.
 ///
 /// Spelling them out as well was strictly *worse*, and it is what H3 was.
 /// `/usr/bin/stat` is not where coreutils live on every base image — Settings →
@@ -2337,10 +2546,19 @@ pub(crate) fn snapshot_scrub_script() -> String {
 /// half-working state this whole section exists to stop being silent.
 ///
 /// This does not defend against something that can write `/usr/bin` or `/bin`
-/// itself, which the agent's passwordless sudo can. It closes the part of the
-/// gap that survives a container restart and needs no privileges at all — and
-/// see [`SCRUB_EXEC_ENV`] for the `LD_PRELOAD` half of the same question, which
-/// `PATH` does nothing about.
+/// itself, which the agent's passwordless sudo can — and note what that is
+/// *not*: it is not a gap that a container restart closes. A `sudo`-written
+/// `/usr/bin/stat` lands in the writable layer, which is precisely what the
+/// `docker commit` this runs in front of is about to capture, so it survives
+/// into the snapshot and into every container made from it. What the reset
+/// closes is the unprivileged half — the three home-volume directories on the
+/// front of the image's `PATH`, which the agent writes without `sudo` and
+/// which no restart clears either. Both halves persist; only one of them needs
+/// a privilege the scrub could not have defended against anyway.
+///
+/// See [`SCRUB_EXEC_ENV`] for the `LD_PRELOAD` half of the same question and
+/// [`SCRUB_BOOTSTRAP`] for the shell-function half, neither of which `PATH`
+/// does anything about.
 ///
 /// ## Why every line ends in `;`, and why there are no `#` comments
 ///
@@ -2394,12 +2612,11 @@ fn snapshot_scrub_script_under(root: &str) -> String {
         r#"PATH={root}/usr/bin:{root}/bin; export PATH;
 total=0;
 missing=;
-for t in stat rm du cut find; do command -v "$t" >/dev/null 2>&1 || missing="$missing $t"; done;
+for t in {tools}; do command -v "$t" >/dev/null 2>&1 || missing="$missing $t"; done;
+command -v rm >/dev/null 2>&1 && {{ rm --one-file-system -f -- '' >/dev/null 2>&1 || missing="$missing rm-one-file-system"; }};
 rootdev=$(stat -c %d '{root}/' 2>/dev/null);
 case "$rootdev" in ''|*[!0-9]*) rootdev=; missing="$missing root-device-id" ;; esac;
 [ -z "$missing" ] || {{ echo "{unavailable}$missing"; exit 0; }};
-rmopt=;
-rm --one-file-system --help >/dev/null 2>&1 && rmopt=--one-file-system;
 scrub_in() {{
 n=$(
 d=${{1%/*}}; [ -n "$d" ] || d=/;
@@ -2417,7 +2634,7 @@ case "$p" in */*|.|..) continue ;; esac;
 [ "$2" = "-" ] || [ -n "$(find "./$p" -maxdepth 0 -mtime +"$2" -print 2>/dev/null)" ] || continue;
 sz=$(du -sb -- "$p" 2>/dev/null | cut -f1);
 case "$sz" in ''|*[!0-9]*) sz=0 ;; esac;
-rm -rf $rmopt -- "$p" 2>/dev/null;
+rm --one-file-system -rf -- "$p" 2>/dev/null;
 rest=0;
 {{ [ -e "$p" ] || [ -L "$p" ]; }} && rest=$(du -sb -- "$p" 2>/dev/null | cut -f1);
 case "$rest" in ''|*[!0-9]*) rest=0 ;; esac;
@@ -2435,6 +2652,7 @@ exit 0
         root = root,
         allowed = allowed,
         calls = calls,
+        tools = SCRUB_PREREQ_TOOLS.join(" "),
         marker = SCRUB_MARKER,
         unavailable = SCRUB_UNAVAILABLE_MARKER,
     )
@@ -2465,14 +2683,33 @@ fn parse_scrub_total(output: &str) -> Option<u64> {
 fn parse_scrub_unavailable(output: &str) -> Option<String> {
     output.lines().rev().find_map(|line| {
         let missing = line.trim().strip_prefix(SCRUB_UNAVAILABLE_MARKER)?.trim();
-        Some(if missing.is_empty() {
-            "the image is missing the tools the scrub needs".to_string()
-        } else {
-            format!(
-                "the image has no usable {} on /usr/bin or /bin",
-                missing.split_whitespace().collect::<Vec<_>>().join(", ")
-            )
-        })
+        if missing.is_empty() {
+            return Some("the image is missing the tools the scrub needs".to_string());
+        }
+        // Three different things can be missing and only one of them is a file
+        // on a path, so they cannot share a sentence. M1 added the third and
+        // it is the one most likely to be read by somebody who does not know
+        // the history, so it says what the flag is *for* rather than naming it.
+        let (tools, others): (Vec<&str>, Vec<&str>) = missing
+            .split_whitespace()
+            .partition(|t| SCRUB_PREREQ_TOOLS.contains(t));
+        let mut parts = Vec::new();
+        if !tools.is_empty() {
+            parts.push(format!(
+                "has no usable {} on /usr/bin or /bin",
+                tools.join(", ")
+            ));
+        }
+        parts.extend(others.into_iter().map(|other| match other {
+            "rm-one-file-system" => "has an `rm` that does not take `--one-file-system`, \
+                 which is the only thing bounding a recursive delete run as root"
+                .to_string(),
+            "root-device-id" => {
+                "will not say which device its root filesystem is on".to_string()
+            }
+            other => format!("is missing {}", other),
+        }));
+        Some(format!("the image {}", parts.join("; it ")))
     })
 }
 
@@ -2603,8 +2840,10 @@ pub async fn scrub_writable_layer(container_id: &str) -> ScrubOutcome {
         }
     }
 
-    let script = snapshot_scrub_script();
-    let cmd = vec!["/bin/sh".to_string(), "-c".to_string(), script];
+    // M2: not `/bin/sh -c script`. The shell an exec starts has already read
+    // the container's environment by the time the script's first line runs —
+    // see [`SCRUB_BOOTSTRAP`], which hands the script to one that has not.
+    let cmd = scrub_exec_cmd(&snapshot_scrub_script());
     let exec = crate::docker::exec::exec_oneshot_as(
         container_id,
         "root",
@@ -4146,6 +4385,61 @@ mod tests {
         assert!(blind.left_something_behind());
     }
 
+    /// A stored row that cannot make a usable mount makes none.
+    ///
+    /// Both shapes here are records already written to disk, which is the whole
+    /// point: an empty `host_path` sends
+    /// `field Source must not be empty` back for the *entire* create, so the
+    /// project cannot be started or recreated at all until the row is gone —
+    /// and validating the next save does nothing for a record that is already
+    /// there. An empty `mount_name` is the quieter one: it targets
+    /// `/workspace/` itself, so the daemon mounts that row over the workspace
+    /// volume and then creates the other rows' mount points inside the user's
+    /// real folder.
+    #[test]
+    fn a_stored_path_row_that_cannot_mount_produces_no_mount() {
+        use crate::models::project::ProjectPath;
+        let row = |host: &str, name: &str| ProjectPath {
+            host_path: host.to_string(),
+            mount_name: name.to_string(),
+        };
+
+        let mounts = project_path_mounts(&[
+            row("/home/me/code", "code"),
+            // Bricks the create outright.
+            row("", "orphan"),
+            // Mounts over /workspace itself.
+            row("/home/me/other", ""),
+            // Whitespace is not a name and not a path, however it got there.
+            row("   ", "blank-source"),
+            row("/home/me/third", "  "),
+            row("/home/me/docs", "docs"),
+        ]);
+
+        assert_eq!(
+            mounts.len(),
+            2,
+            "a row that cannot mount was turned into a mount anyway: {:?}",
+            mounts
+        );
+        assert_eq!(mounts[0].target.as_deref(), Some("/workspace/code"));
+        assert_eq!(mounts[0].source.as_deref(), Some("/home/me/code"));
+        assert_eq!(mounts[1].target.as_deref(), Some("/workspace/docs"));
+        // The two failures, spelled out so a future edit cannot reintroduce
+        // either by relaxing half the filter.
+        for m in &mounts {
+            assert_ne!(m.source.as_deref(), Some(""), "an empty Source reaches the daemon");
+            assert_ne!(
+                m.target.as_deref(),
+                Some("/workspace/"),
+                "a row is mounted over the workspace volume"
+            );
+        }
+        // And the good rows are unchanged: this is a filter, not a rewrite.
+        assert!(mounts.iter().all(|m| m.read_only == Some(false)));
+        assert!(project_path_mounts(&[]).is_empty());
+    }
+
     // ── Pre-commit scrub (A1, C1) ────────────────────────────────────────────
 
     #[test]
@@ -4326,9 +4620,22 @@ mod tests {
         // at the top level — which is what the vulnerable version was — fails
         // here.
         assert_eq!(
-            script.matches("rm -rf").count(),
+            script.matches(r#"rm --one-file-system -rf -- "$p""#).count(),
             1,
             "the scrub deletes somewhere other than inside the validated block:\n{}",
+            script
+        );
+        // M1: and the flag is spelled into that one deletion rather than
+        // reaching it through a `$rmopt` an unsupported `rm` leaves empty.
+        assert!(
+            !script.contains("rmopt"),
+            "the cross-filesystem guard is optional again:\n{}",
+            script
+        );
+        assert_eq!(
+            script.matches("rm -rf").count(),
+            0,
+            "an unguarded recursive delete is back in the script:\n{}",
             script
         );
         // The handle: after this, paths are relative to a validated inode, so
@@ -4407,6 +4714,12 @@ mod tests {
         assert!(script.contains(
             r#"for t in stat rm du cut find; do command -v "$t" >/dev/null 2>&1 || missing="$missing $t"; done;"#
         ));
+        // M1: the seventh. `rm` existing is not `rm` taking the one flag that
+        // bounds a recursive delete run as root, and the difference used to be
+        // an empty variable nobody could see from the outside.
+        assert!(script.contains(
+            r#"command -v rm >/dev/null 2>&1 && { rm --one-file-system -f -- '' >/dev/null 2>&1 || missing="$missing rm-one-file-system"; };"#
+        ));
         assert!(script.contains(&format!(
             r#"[ -z "$missing" ] || {{ echo "{}$missing"; exit 0; }};"#,
             SCRUB_UNAVAILABLE_MARKER
@@ -4457,7 +4770,7 @@ mod tests {
         // directory, and quoted everywhere it is *used* so a filename with a
         // space stays one argument.
         assert!(script.contains("for p in $g; do"));
-        assert!(script.contains(r#"rm -rf $rmopt -- "$p""#));
+        assert!(script.contains(r#"rm --one-file-system -rf -- "$p""#));
         // `rm -rf /` would be catastrophic and is exactly what a botched
         // interpolation produces.
         assert!(!script.contains("rm -rf -- /\n"));
@@ -4754,6 +5067,427 @@ mod tests {
         );
     }
 
+    /// M1: an `rm` that cannot bound a recursive delete stops the scrub; it
+    /// does not turn the scrub into an unbounded one.
+    ///
+    /// `--one-file-system` is the only thing between `rm -rf` run as root and a
+    /// mount planted *below* a match — the one position checks 0–4 cannot see,
+    /// because it is neither the parent they validate nor the match they
+    /// `stat`. It used to be probed into `$rmopt`, and every busybox- or
+    /// toybox-derived `rm` leaves that empty (BusyBox 1.38 answers
+    /// `unrecognized option '--one-file-system'` and exits 1, measured), so the
+    /// guard was absent on exactly the images that reach this code through
+    /// `ImageSource::Custom` — and the run still reported `Reclaimed(n)`.
+    ///
+    /// The `rm` planted here answers the way busybox's does. The negative
+    /// control is the shape this replaces, rebuilt from the real script: it
+    /// deletes, which is what makes the assertion that the real script does not
+    /// mean anything.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_rm_without_the_cross_filesystem_guard_stops_the_scrub() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let base = fs::canonicalize(std::env::temp_dir()).expect("a real temp dir");
+        let root = base.join(format!("triple-c-scrub-{}", uuid::Uuid::new_v4().simple()));
+        let root_str = root.to_str().expect("a UTF-8 temp path").to_string();
+        plant_scrub_tools(&root);
+
+        let real_rm = ["/usr/bin/rm", "/bin/rm"]
+            .iter()
+            .find(|c| std::path::Path::new(c).exists())
+            .expect("an rm on this host")
+            .to_string();
+        fs::remove_file(root.join("usr/bin/rm")).expect("drop the symlink to the real rm");
+        fs::write(
+            root.join("usr/bin/rm"),
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in --one-file-system) echo \"rm: \
+                 unrecognized option '--one-file-system'\" >&2; exit 1 ;; esac; done\nexec {rm} \
+                 \"$@\"\n",
+                rm = real_rm
+            ),
+        )
+        .expect("plant a busybox-shaped rm");
+        fs::set_permissions(root.join("usr/bin/rm"), fs::Permissions::from_mode(0o755)).unwrap();
+
+        let seed = || {
+            fs::remove_dir_all(root.join("tmp")).ok();
+            fs::create_dir_all(root.join("tmp/claude-scratch")).expect("mkdir");
+            fs::write(root.join("tmp/claude-scratch/blob"), vec![0u8; 64 * 1024]).unwrap();
+        };
+
+        let script = snapshot_scrub_script_under(&root_str);
+        // The pre-M1 shape: the flag asked for with `--help` and kept in a
+        // variable, which this `rm` leaves empty.
+        let fail_open = script
+            .replace(
+                r#"command -v rm >/dev/null 2>&1 && { rm --one-file-system -f -- '' >/dev/null 2>&1 || missing="$missing rm-one-file-system"; };"#,
+                "rmopt=;\nrm --one-file-system --help >/dev/null 2>&1 && rmopt=--one-file-system;",
+            )
+            .replace(r#"rm --one-file-system -rf -- "$p""#, r#"rm -rf $rmopt -- "$p""#);
+        assert_ne!(fail_open, script, "the control was rebuilt from stale text");
+
+        let run = |sh: &str| {
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg(sh)
+                .output()
+                .expect("run the generated script")
+        };
+
+        seed();
+        let control = run(&fail_open);
+        let control_deleted = !root.join("tmp/claude-scratch").exists();
+
+        seed();
+        let real = run(&script);
+        let real_out = String::from_utf8_lossy(&real.stdout).into_owned();
+        let real_kept = root.join("tmp/claude-scratch/blob").exists();
+
+        fs::remove_dir_all(&root).ok();
+
+        assert!(
+            control_deleted,
+            "the harness cannot tell the difference: the fail-open shape deleted nothing either, \
+             so the assertions below prove nothing.\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&control.stdout),
+            String::from_utf8_lossy(&control.stderr),
+        );
+        assert!(
+            real_kept,
+            "the scrub deleted as root with no cross-filesystem bound.\nstdout: {}\nstderr: {}",
+            real_out,
+            String::from_utf8_lossy(&real.stderr),
+        );
+        // And it is loud about it: a refusal must never render as the `0` a
+        // healthy container with nothing to clean prints.
+        assert_eq!(
+            parse_scrub_total(&real_out),
+            None,
+            "a scrub that refused to run still printed a total: {}",
+            real_out
+        );
+        let reason = parse_scrub_unavailable(&real_out)
+            .unwrap_or_else(|| panic!("no unavailable marker in: {}", real_out));
+        assert!(
+            reason.contains("--one-file-system"),
+            "the reason does not name the guard that is missing: {}",
+            reason
+        );
+    }
+
+    /// M1, the other half: the guard is attached to the delete that actually
+    /// runs, not merely to the script text.
+    ///
+    /// The only assertion this position had was that the string
+    /// `rm -rf $rmopt -- "$p"` appeared in the script — which says nothing
+    /// about what `rm` is handed once the shell has expanded it, and an empty
+    /// `$rmopt` was precisely the defect. So the `rm` the script resolves
+    /// records its own argv here and the argv is what is asserted.
+    ///
+    /// A test process cannot create the mount that would exercise the flag for
+    /// real — no `CAP_SYS_ADMIN`, and this container refuses `unshare -Urm` as
+    /// well — so "the flag is honoured at a nested boundary" is measured in
+    /// containers and recorded on [`snapshot_scrub_script_under`]. "The flag is
+    /// there at all, on every match" is this.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn every_delete_reaches_rm_with_the_cross_filesystem_guard_attached() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let base = fs::canonicalize(std::env::temp_dir()).expect("a real temp dir");
+        let root = base.join(format!("triple-c-scrub-{}", uuid::Uuid::new_v4().simple()));
+        let root_str = root.to_str().expect("a UTF-8 temp path").to_string();
+        plant_scrub_tools(&root);
+
+        let real_rm = ["/usr/bin/rm", "/bin/rm"]
+            .iter()
+            .find(|c| std::path::Path::new(c).exists())
+            .expect("an rm on this host")
+            .to_string();
+        let argv_log = root.join("argv");
+        fs::remove_file(root.join("usr/bin/rm")).expect("drop the symlink to the real rm");
+        fs::write(
+            root.join("usr/bin/rm"),
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\nexec {rm} \"$@\"\n",
+                log = argv_log.display(),
+                rm = real_rm
+            ),
+        )
+        .expect("plant an argv-recording rm");
+        fs::set_permissions(root.join("usr/bin/rm"), fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Two matches of the same pattern, so "the flag is on the first one"
+        // cannot pass for "the flag is on every one".
+        let seed = || {
+            fs::remove_file(&argv_log).ok();
+            fs::remove_dir_all(root.join("tmp")).ok();
+            for name in ["tmp/claude-a", "tmp/claude-b"] {
+                fs::create_dir_all(root.join(name)).expect("mkdir");
+                fs::write(root.join(name).join("blob"), vec![0u8; 32 * 1024]).unwrap();
+            }
+        };
+        // Only the deletes, not the `rm --one-file-system -f -- ''` probe.
+        let deletes = || -> Vec<String> {
+            fs::read_to_string(&argv_log)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| l.contains("claude-"))
+                .map(|l| l.to_string())
+                .collect()
+        };
+
+        let script = snapshot_scrub_script_under(&root_str);
+        let unguarded = script.replace(
+            r#"rm --one-file-system -rf -- "$p""#,
+            r#"rm -rf -- "$p""#,
+        );
+        assert_ne!(unguarded, script, "the control was rebuilt from stale text");
+
+        let run = |sh: &str| {
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg(sh)
+                .output()
+                .expect("run the generated script")
+        };
+
+        seed();
+        run(&script);
+        let guarded_argv = deletes();
+
+        seed();
+        run(&unguarded);
+        let unguarded_argv = deletes();
+
+        fs::remove_dir_all(&root).ok();
+
+        assert_eq!(
+            guarded_argv.len(),
+            2,
+            "both matches should have reached rm exactly once: {:?}",
+            guarded_argv
+        );
+        assert!(
+            unguarded_argv.len() == 2
+                && unguarded_argv.iter().all(|a| !a.contains("--one-file-system")),
+            "the harness cannot tell the difference: stripping the flag from the script did not \
+             change the argv rm was handed: {:?}",
+            unguarded_argv
+        );
+        for argv in &guarded_argv {
+            assert!(
+                argv.starts_with("--one-file-system "),
+                "a delete reached rm without the cross-filesystem guard: {:?}",
+                guarded_argv
+            );
+        }
+    }
+
+    /// M2: the script cannot be steered by a shell function, because the shell
+    /// that runs it has no environment to import one from.
+    ///
+    /// `bash` builds shell functions out of environment variables named
+    /// `BASH_FUNC_<name>%%`, and function lookup happens *before* `PATH` — so
+    /// the `PATH` reset is no defence, and `command -v` reports the function as
+    /// found, which walks the planted function straight through the
+    /// prerequisite probe. Nor is any in-script answer one: `[`, `pwd`, `cd`,
+    /// `command` and `unset` all import just as readily (measured on `bash`
+    /// 5.2), which is checks 0–2 and both of the things that would remove the
+    /// function.
+    ///
+    /// The shipped image's `/bin/sh` is `dash`, which imports nothing, so this
+    /// is latent there — but the Dockerfile does not pin `/bin/sh` and the base
+    /// is inherited from `ubuntu:24.04`, and `ImageSource::Custom` takes any
+    /// image at all. So the inner shell is `bash` here on purpose: it stands in
+    /// for the image where this is not latent, and it is the only way to show
+    /// that what protects the script is `env -i` rather than the accident of
+    /// `dash` being what `/bin/sh` points at.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_planted_shell_function_cannot_answer_the_containment_checks() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let bash = ["/usr/bin/bash", "/bin/bash"]
+            .iter()
+            .find(|c| std::path::Path::new(c).exists())
+            .expect("a bash on this host to stand in for an image whose /bin/sh is bash")
+            .to_string();
+
+        let base = fs::canonicalize(std::env::temp_dir()).expect("a real temp dir");
+        let root = base.join(format!("triple-c-scrub-{}", uuid::Uuid::new_v4().simple()));
+        let root_str = root.to_str().expect("a UTF-8 temp path").to_string();
+        fs::create_dir_all(root.join("tmp")).expect("mkdir");
+        plant_scrub_tools(&root);
+
+        // The same simulation the mount-at-the-match test uses: a `stat` that
+        // reports a foreign device for one name is what the kernel reports for
+        // a mount point, and no test process can make a real one.
+        fs::remove_file(root.join("usr/bin/stat")).expect("drop the symlink to the real stat");
+        fs::write(
+            root.join("usr/bin/stat"),
+            "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in claude-mounted|*/claude-mounted) echo 999999; exit 0 ;; esac; done\nexec /usr/bin/stat \"$@\"\n",
+        )
+        .expect("overwrite the stat symlink with a stub");
+        fs::set_permissions(root.join("usr/bin/stat"), fs::Permissions::from_mode(0o755)).unwrap();
+
+        let seed = || {
+            fs::remove_dir_all(root.join("tmp/claude-mounted")).ok();
+            fs::remove_dir_all(root.join("tmp/claude-real")).ok();
+            fs::create_dir_all(root.join("tmp/claude-mounted/sub")).expect("mkdir");
+            fs::create_dir_all(root.join("tmp/claude-real")).expect("mkdir");
+            fs::write(root.join("tmp/claude-mounted/precious.txt"), "do not delete").unwrap();
+            fs::write(root.join("tmp/claude-mounted/sub/nested.txt"), "nor this").unwrap();
+            fs::write(root.join("tmp/claude-real/blob"), vec![0u8; 64 * 1024]).unwrap();
+        };
+        let mounted_survived = || {
+            root.join("tmp/claude-mounted/precious.txt").exists()
+                && root.join("tmp/claude-mounted/sub/nested.txt").exists()
+        };
+
+        let script = snapshot_scrub_script_under(&root_str);
+        // Production's bootstrap with the inner shell swapped for `bash`, i.e.
+        // the image where `/bin/sh` is bash. Nothing else about it changes.
+        let as_bash = |b: &str| b.replace("/bin/sh -c", &format!("{} -c", bash));
+        let bootstrap = as_bash(SCRUB_BOOTSTRAP);
+        // Negative control: the same bootstrap without the `-i`, which is the
+        // one character that separates "the inner shell has no environment"
+        // from "the inner shell has the caller's".
+        let without_env_reset = bootstrap.replace("env -i ", "env ");
+        assert_ne!(without_env_reset, bootstrap, "the control was rebuilt from stale text");
+
+        // One function is enough to own checks 3 and 4; the rest are there to
+        // show the bootstrap does not care how many of them there are.
+        let hostile: &[(&str, &str)] = &[
+            ("BASH_FUNC_stat%%", "() { echo 1; }"),
+            ("BASH_FUNC_command%%", "() { echo shadowed; }"),
+            ("BASH_FUNC_unset%%", "() { :; }"),
+            ("BASH_FUNC_[%%", "() { :; }"),
+            ("BASH_FUNC_pwd%%", "() { echo /; }"),
+            ("BASH_FUNC_cd%%", "() { :; }"),
+        ];
+        let run = |boot: &str, planted: &[(&str, &str)]| {
+            let mut c = Command::new(&bash);
+            c.arg("-c").arg(boot).arg("triple-c-scrub").arg(&script);
+            for (k, v) in planted {
+                c.env(k, v);
+            }
+            c.output().expect("run the bootstrap")
+        };
+
+        seed();
+        let control = run(&without_env_reset, &hostile[..1]);
+        let control_kept = mounted_survived();
+
+        seed();
+        let real = run(&bootstrap, &hostile[..1]);
+        let real_out = String::from_utf8_lossy(&real.stdout).into_owned();
+        let real_kept = mounted_survived();
+        let real_reclaimed = !root.join("tmp/claude-real/blob").exists();
+
+        seed();
+        let swarm = run(&bootstrap, hostile);
+        let swarm_out = String::from_utf8_lossy(&swarm.stdout).into_owned();
+        let swarm_kept = mounted_survived();
+        let swarm_reclaimed = !root.join("tmp/claude-real/blob").exists();
+
+        fs::remove_dir_all(&root).ok();
+
+        assert!(
+            !control_kept,
+            "the harness cannot tell the difference: a planted `stat` function reached an inner \
+             shell with the environment intact and the mount survived anyway, so the assertions \
+             below prove nothing.\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&control.stdout),
+            String::from_utf8_lossy(&control.stderr),
+        );
+        assert!(
+            real_kept,
+            "a planted shell function answered the containment checks.\nstdout: {}\nstderr: {}",
+            real_out,
+            String::from_utf8_lossy(&real.stderr),
+        );
+        assert!(real_reclaimed, "the scrub stopped reclaiming a real scratchpad");
+        assert_eq!(
+            parse_scrub_total(&real_out).map(|t| t >= 64 * 1024),
+            Some(true),
+            "the reported total does not account for the scratchpad that was removed: {}",
+            real_out
+        );
+        // And with every builtin the script leans on shadowed at once, it is
+        // still the script's own answers that decide.
+        assert!(
+            swarm_kept && swarm_reclaimed,
+            "a shadowed `[`/`pwd`/`cd`/`command`/`unset` changed what the scrub did.\nstdout: {}\nstderr: {}",
+            swarm_out,
+            String::from_utf8_lossy(&swarm.stderr),
+        );
+        assert_eq!(parse_scrub_total(&swarm_out).map(|t| t >= 64 * 1024), Some(true));
+    }
+
+    /// M2, the structural half: the exec hands the script over as an argument
+    /// to a shell that was started with no environment.
+    #[test]
+    fn the_scrub_exec_starts_its_shell_with_an_empty_environment() {
+        let script = snapshot_scrub_script();
+        let cmd = scrub_exec_cmd(&script);
+
+        assert_eq!(cmd.len(), 5);
+        assert_eq!(cmd[0], "/bin/sh");
+        assert_eq!(cmd[1], "-c");
+        assert_eq!(cmd[2], SCRUB_BOOTSTRAP);
+        // As `$1`, never spliced into the bootstrap: the script is full of
+        // single quotes and it runs `rm -rf` as root, so a nested-quoting bug
+        // there is the whole class of defect this module keeps having.
+        assert_eq!(cmd[4], script);
+        assert!(
+            !cmd[2].contains("scrub_in"),
+            "the script is interpolated into the bootstrap: {}",
+            cmd[2]
+        );
+        assert!(cmd[2].contains(r#"/usr/bin/env -i PATH=/usr/bin:/bin /bin/sh -c "$1""#));
+        // H3's lesson kept: `env` is no more usr-merged than `stat` is, and a
+        // hardcoded path that is simply absent must not be the quiet answer.
+        assert!(cmd[2].contains(r#"/bin/env -i PATH=/usr/bin:/bin /bin/sh -c "$1""#));
+        assert!(cmd[2].contains("case $? in 127)"));
+        // Everything the *outer* shell evaluates has to be a reserved word, a
+        // parameter expansion, or a command word containing a `/` — those are
+        // the three things a planted function cannot reach, and `bash` refuses
+        // to import a function whose name has a `/` in it.
+        assert_eq!(
+            cmd[2].matches("env -i").count(),
+            cmd[2].matches("/env -i").count(),
+            "the bootstrap calls `env` by a bare name: {}",
+            cmd[2]
+        );
+        assert_eq!(
+            cmd[2].matches("sh -c").count(),
+            cmd[2].matches("/sh -c").count(),
+            "the bootstrap calls `sh` by a bare name: {}",
+            cmd[2]
+        );
+
+        // And the one caller builds its argv here rather than assembling its
+        // own. Everything above is a property of `scrub_exec_cmd`, and a call
+        // site that quietly went back to `/bin/sh -c script` would satisfy all
+        // of it while running the script in the environment this exists to
+        // keep away from it. The needle is assembled rather than written out
+        // so that this line is not itself the match.
+        let needle = format!("{}(&{}())", "scrub_exec_cmd", "snapshot_scrub_script");
+        assert!(
+            include_str!("container.rs").contains(&needle),
+            "the scrub exec no longer goes through the bootstrap"
+        );
+    }
+
     /// H3, the behavioural half: a base image whose coreutils are not under
     /// `/usr/bin`.
     ///
@@ -4790,8 +5524,14 @@ mod tests {
         // `/usr/bin` this root does not have.
         let absolute: String = script
             .replace(r#"$(stat "#, &format!("$({}/usr/bin/stat ", root_str))
-            .replace("\nrm --one-file-system", &format!("\n{}/usr/bin/rm --one-file-system", root_str))
-            .replace("\nrm -rf ", &format!("\n{}/usr/bin/rm -rf ", root_str))
+            .replace(
+                "\nrm --one-file-system -rf ",
+                &format!("\n{}/usr/bin/rm --one-file-system -rf ", root_str),
+            )
+            .replace(
+                "&& { rm --one-file-system",
+                &format!("&& {{ {}/usr/bin/rm --one-file-system", root_str),
+            )
             .replace("$(du -sb", &format!("$({}/usr/bin/du -sb", root_str))
             .replace("| cut -f1", &format!("| {}/usr/bin/cut -f1", root_str))
             .replace("$(find ", &format!("$({}/usr/bin/find ", root_str))

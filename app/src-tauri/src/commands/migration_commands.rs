@@ -1071,21 +1071,54 @@ fn reconcile_retries() -> &'static std::sync::Mutex<std::collections::HashSet<St
     RETRIES.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
 }
 
+/// One project's place in [`reconcile_retries`], handed back on drop.
+///
+/// RAII for the reason [`crate::project_lock::ProjectGuard`] sets out, and this
+/// claim is the case that proves the rule: the release used to be a trailing
+/// statement at the bottom of the spawned task in
+/// [`defer_migration_reconcile`], sitting after an `.await` on
+/// [`reconcile_migration_now`]. A panic in there — or the future simply being
+/// dropped, which is what happens to every in-flight task at shutdown — skips
+/// the statement, and nothing else ever removes an id from that set. The
+/// project is then fenced off from *every* later deferral for the rest of the
+/// process: each `reconcile_project_statuses` pass finds it held, fails to
+/// claim, and returns, so the phase stays un-normalised, no resume or rollback
+/// is offered, and the `:pre-migration-*` pin stays `Claimed`. That is the
+/// session-long silence deferring was written to end, reintroduced one panic
+/// later and lasting until the app is restarted.
+///
+/// Dropping this hands the claim straight back, so a caller that discards the
+/// value has claimed nothing while reading as though it had; `#[must_use]`
+/// makes that a compile warning rather than a second waiter on one record.
+#[must_use = "the claim is handed back the moment this guard drops; bind it inside the waiting task, for the whole task"]
+struct ReconcileRetryClaim {
+    project_id: String,
+}
+
+impl Drop for ReconcileRetryClaim {
+    fn drop(&mut self) {
+        // `into_inner` past poisoning, as in `project_lock`: the only thing
+        // ever done while holding this mutex is a single `HashSet` insert or
+        // remove, so a panic on another thread cannot have left it half
+        // written — and declining to release here would strand the project
+        // permanently, which is the exact failure the guard exists to stop.
+        reconcile_retries()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.project_id);
+    }
+}
+
 /// Claim the right to be the one deferred reconcile for `project_id`.
-/// `false` means somebody else already is.
-fn claim_reconcile_retry(project_id: &str) -> bool {
+/// `None` means somebody else already is.
+fn claim_reconcile_retry(project_id: &str) -> Option<ReconcileRetryClaim> {
     reconcile_retries()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(project_id.to_string())
-}
-
-/// Give the claim back, so a later `reconcile_project_statuses` can defer again.
-fn release_reconcile_retry(project_id: &str) {
-    reconcile_retries()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(project_id);
+        .then(|| ReconcileRetryClaim {
+            project_id: project_id.to_string(),
+        })
 }
 
 /// Come back to a project that was held when [`reconcile_migration`] reached it.
@@ -1108,13 +1141,19 @@ fn defer_migration_reconcile(project: &Project, app_handle: &tauri::AppHandle) {
     if !migration_store::has_record(&project.id).unwrap_or(true) {
         return;
     }
-    if !claim_reconcile_retry(&project.id) {
+    let Some(claim) = claim_reconcile_retry(&project.id) else {
         return;
-    }
+    };
 
     let project = project.clone();
     let app_handle = app_handle.clone();
     tauri::async_runtime::spawn(async move {
+        // Moved in and bound for the whole body, rather than released by a
+        // statement at the bottom: everything below this line can panic or be
+        // dropped mid-await, and a claim that only comes back on the happy path
+        // is a claim that eventually does not come back at all. See
+        // [`ReconcileRetryClaim`].
+        let _claim = claim;
         let released =
             await_release(&project.id, RECONCILE_RETRY_INTERVAL, RECONCILE_RETRY_ATTEMPTS).await;
         if released {
@@ -1133,27 +1172,41 @@ fn defer_migration_reconcile(project: &Project, app_handle: &tauri::AppHandle) {
                 RECONCILE_RETRY_INTERVAL.as_secs() as usize * RECONCILE_RETRY_ATTEMPTS / 60
             );
         }
-        release_reconcile_retry(&project.id);
     });
 }
 
-/// Wait for `project_id` to stop being held, up to `attempts` looks
-/// `interval` apart. `true` means it was released, `false` that the budget ran
-/// out with it still held.
+/// Wait for `project_id` to stop being held: `attempts` looks, the first
+/// immediate and the rest `interval` apart. `true` means it was released,
+/// `false` that the budget ran out with it still held.
 ///
 /// Split out of [`defer_migration_reconcile`] so the waiting can be tested
-/// against a real [`crate::project_lock`] guard on a paused clock — the part
-/// that is easy to get wrong is "gives up while still holding the claim" and
-/// "never looks again", neither of which is visible from the constants.
+/// against a real [`crate::project_lock`] guard on a paused clock — the parts
+/// that are easy to get wrong are "gives up while still holding the claim",
+/// "never looks again", and the ordering of the look against the sleep, none of
+/// which is visible from the constants.
 async fn await_release(
     project_id: &str,
     interval: std::time::Duration,
     attempts: usize,
 ) -> bool {
-    for _ in 0..attempts {
-        tokio::time::sleep(interval).await;
+    for attempt in 0..attempts {
+        // Look first, sleep second. Sleeping first charged every deferral a
+        // full interval before anyone read the map even once, and the common
+        // case is a holder that has already let go: `held()` is sampled in
+        // `reconcile_migration`, a task is spawned, and by the time it is first
+        // polled the Reset that was on its last step is frequently finished.
+        // That bought nothing and cost twenty seconds of a startup pass waiting
+        // on a lock nobody holds, in front of a check that is one `HashMap`
+        // lookup.
         if crate::project_lock::held(project_id).is_none() {
             return true;
+        }
+        // And no sleep after the final look: nothing reads the map again
+        // afterwards, so it is twenty seconds of delay in front of a `false`
+        // that has already been decided. The budget is still `attempts` looks,
+        // which is what the constants above are chosen against.
+        if attempt + 1 < attempts {
+            tokio::time::sleep(interval).await;
         }
     }
     false
@@ -2217,6 +2270,34 @@ mod tests {
         assert!(budget >= std::time::Duration::from_secs(15 * 60), "{:?}", budget);
     }
 
+    /// MEDIUM: an unheld project is reconciled now, not in twenty seconds.
+    ///
+    /// The wait slept before its first look, so a holder that let go between
+    /// `reconcile_migration` sampling `held()` and this task being polled — the
+    /// *common* case, since a deferral is only taken when something was on its
+    /// way out — still cost a full `RECONCILE_RETRY_INTERVAL` of a startup pass
+    /// waiting on a lock nobody held. On a paused clock the assertion is exact:
+    /// the fixed shape returns without the clock moving at all, the sleep-first
+    /// shape cannot return before it has advanced one interval.
+    #[tokio::test(start_paused = true)]
+    async fn an_unheld_project_is_seen_without_waiting_out_an_interval() {
+        let id = format!("await-release-{}", uuid::Uuid::new_v4().simple());
+        assert!(
+            crate::project_lock::held(&id).is_none(),
+            "a fresh uuid is not held"
+        );
+
+        let before = tokio::time::Instant::now();
+        assert!(await_release(&id, RECONCILE_RETRY_INTERVAL, RECONCILE_RETRY_ATTEMPTS).await);
+        let waited = tokio::time::Instant::now() - before;
+        assert_eq!(
+            waited,
+            std::time::Duration::ZERO,
+            "an already-released project cost {:?} before anyone looked",
+            waited
+        );
+    }
+
     #[test]
     fn only_one_deferred_reconcile_waits_per_project() {
         // Every "Docker became available" walks every project, so without the
@@ -2224,14 +2305,72 @@ mod tests {
         // per call — all of which then reconcile the same record in a row.
         let id = format!("retry-claim-{}", uuid::Uuid::new_v4().simple());
         let other = format!("retry-claim-{}", uuid::Uuid::new_v4().simple());
-        assert!(claim_reconcile_retry(&id));
-        assert!(!claim_reconcile_retry(&id), "a second waiter was allowed in");
-        assert!(claim_reconcile_retry(&other), "the claim is not per-project");
-        release_reconcile_retry(&id);
-        assert!(claim_reconcile_retry(&id), "the claim was never handed back");
-        release_reconcile_retry(&id);
-        release_reconcile_retry(&other);
-        // Releasing something that was never claimed is not an error.
-        release_reconcile_retry(&id);
+        let first = claim_reconcile_retry(&id).expect("a fresh project id is unclaimed");
+        assert!(
+            claim_reconcile_retry(&id).is_none(),
+            "a second waiter was allowed in"
+        );
+        let other_claim =
+            claim_reconcile_retry(&other).expect("the claim is not per-project");
+        drop(first);
+        // Bound rather than discarded: the guard releases on drop, so
+        // `claim_reconcile_retry(&id);` as a bare statement would test nothing
+        // — which is what `#[must_use]` is there to catch in real callers.
+        let retaken = claim_reconcile_retry(&id).expect("the claim was never handed back");
+        drop(retaken);
+        drop(other_claim);
+        // And the other project's claim was never the same claim.
+        drop(claim_reconcile_retry(&other).expect("released independently"));
+    }
+
+    /// MEDIUM: the claim survives the task that holds it dying badly.
+    ///
+    /// The release used to be a trailing statement after
+    /// `reconcile_migration_now(...).await` at the bottom of the spawned task,
+    /// so a panic anywhere in that call — or the future being dropped at
+    /// shutdown — skipped it and left the id in the set with no task behind it.
+    /// Nothing removes it afterwards, so that project could never be deferred
+    /// again for the rest of the process: exactly the state deferring was added
+    /// to prevent, now permanent instead of one pass long. Fails against the
+    /// trailing-statement shape, which is the point.
+    #[tokio::test]
+    async fn a_panicking_deferred_reconcile_hands_its_claim_back() {
+        let id = format!("retry-claim-{}", uuid::Uuid::new_v4().simple());
+        let claimed = claim_reconcile_retry(&id).expect("a fresh project id is unclaimed");
+
+        // Spawned, not just called: the real claim is held across an await
+        // inside a `tauri::async_runtime::spawn`, and a task panic is caught by
+        // the runtime rather than unwinding the caller.
+        let task = {
+            let id = id.clone();
+            tokio::spawn(async move {
+                let _claim = claimed;
+                tokio::task::yield_now().await;
+                panic!("reconcile_migration_now blew up on '{}'", id);
+            })
+        };
+        assert!(task.await.is_err(), "the task was supposed to panic");
+
+        let after = claim_reconcile_retry(&id);
+        assert!(
+            after.is_some(),
+            "a panicking reconcile stranded the claim — this project can never be \
+             deferred again for the rest of the process"
+        );
+        drop(after);
+
+        // The other half of the same failure: a task that is simply dropped
+        // mid-flight, which is every in-flight task at shutdown.
+        let claimed = claim_reconcile_retry(&id).expect("released above");
+        let never_finishes = tokio::spawn(async move {
+            let _claim = claimed;
+            std::future::pending::<()>().await;
+        });
+        never_finishes.abort();
+        let _ = never_finishes.await;
+        assert!(
+            claim_reconcile_retry(&id).is_some(),
+            "a dropped task stranded the claim"
+        );
     }
 }
