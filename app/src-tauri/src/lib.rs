@@ -687,6 +687,119 @@ mod tests {
     /// pulls in `core:image:default` → `allow-from-path`, which is an
     /// unconditional `std::fs::read` of any host path with no scope check, and
     /// nothing in the frontend has ever imported `@tauri-apps/api/image`.
+    /// Every `#[tauri::command]` is registered, and every registration names a
+    /// command that exists.
+    ///
+    /// This is the shape of the bug that caused the original OAuth-callback
+    /// complaint: `set_auth_bridge_enabled` existed, worked, and had a typed
+    /// frontend wrapper — with **zero call sites**. The switch the docs told
+    /// users to flip was never wired to anything, so the bridge stayed off and
+    /// every login callback was refused. Nothing failed; the feature was simply
+    /// absent, and no test noticed because both halves compiled.
+    ///
+    /// The reverse direction matters too, and for a sharper reason: a command
+    /// that is registered but reachable from nowhere is still IPC surface a
+    /// compromised webview can call. `list_sibling_containers` — which returns
+    /// every container on the daemon, including the user's unrelated work —
+    /// sat in exactly that state.
+    ///
+    /// So this asserts the two lists agree, and leaves *deciding* what belongs
+    /// on them to a human. It cannot see frontend call sites; `tsc` and the
+    /// vitest suite cover that side.
+    #[test]
+    fn every_command_is_registered_exactly_once() {
+        use std::collections::BTreeSet;
+
+        let mut defined: BTreeSet<String> = BTreeSet::new();
+
+        // Walk the source tree for `#[tauri::command]` and take the `fn` name
+        // on the following non-attribute line.
+        fn collect(dir: &std::path::Path, out: &mut BTreeSet<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else { return };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    collect(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let Ok(text) = std::fs::read_to_string(&path) else { continue };
+                    let lines: Vec<&str> = text.lines().collect();
+                    for (i, line) in lines.iter().enumerate() {
+                        if line.trim() != "#[tauri::command]" {
+                            continue;
+                        }
+                        for next in lines.iter().skip(i + 1) {
+                            let t = next.trim();
+                            if t.starts_with('#') {
+                                continue;
+                            }
+                            if let Some(rest) = t
+                                .strip_prefix("pub async fn ")
+                                .or_else(|| t.strip_prefix("pub fn "))
+                                .or_else(|| t.strip_prefix("async fn "))
+                                .or_else(|| t.strip_prefix("fn "))
+                            {
+                                if let Some(name) = rest.split(['(', '<']).next() {
+                                    out.insert(name.trim().to_string());
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        collect(
+            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src")),
+            &mut defined,
+        );
+
+        // The registration list, read from this file rather than from a macro
+        // expansion so the test does not depend on `generate_handler!`'s shape.
+        let this = include_str!("lib.rs");
+        let handler = this
+            .split_once("generate_handler![")
+            .and_then(|(_, rest)| rest.split_once("])"))
+            .map(|(inside, _)| inside)
+            .expect("lib.rs should contain a generate_handler! list");
+        // Line-based, not `split(',')`: the list is grouped under `// Docker`
+        // style comments, and splitting on commas glues each comment to the
+        // command that follows it. A `starts_with("//")` filter then drops that
+        // command — silently, and once per group.
+        let registered: BTreeSet<String> = handler
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("//"))
+            .filter_map(|l| {
+                l.trim_end_matches(',')
+                    .rsplit("::")
+                    .next()
+                    .map(|n| n.trim().to_string())
+            })
+            .filter(|n| !n.is_empty())
+            .collect();
+
+        assert!(
+            !defined.is_empty() && !registered.is_empty(),
+            "the scan found nothing — it has stopped testing anything (defined={}, registered={})",
+            defined.len(),
+            registered.len()
+        );
+
+        let unregistered: Vec<&String> = defined.difference(&registered).collect();
+        assert!(
+            unregistered.is_empty(),
+            "these commands exist but are not registered, so the frontend cannot call them: {:?}",
+            unregistered
+        );
+
+        let undefined: Vec<&String> = registered.difference(&defined).collect();
+        assert!(
+            undefined.is_empty(),
+            "these are registered but no `#[tauri::command]` defines them: {:?}",
+            undefined
+        );
+    }
+
     #[test]
     fn the_capability_grants_are_the_ones_that_were_reviewed() {
         let raw = include_str!("../capabilities/default.json");
