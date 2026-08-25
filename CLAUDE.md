@@ -525,6 +525,33 @@ Anthropic and Bedrock deliberately keep Claude Code's own defaults.
   `models/project.rs` for anything that should default to true.
 - Cross-platform paths: Docker socket is `/var/run/docker.sock` on Linux/macOS, `//./pipe/docker_engine` on Windows
 
+## Secrets
+
+**`scripts/scan-secrets.sh` refuses a commit that adds something shaped like a live
+credential.** Enable the hook once per clone with `npm run hooks` (from `app/`), which sets
+`core.hooksPath` to `.githooks`. A repository cannot configure its own hooks path — cloning it
+would then be enough to run its code — so this is opt-in everywhere, and `--no-verify` skips it.
+The `Secret Scan` workflow is the half nobody can bypass; it carries **no `paths:` filter**, on
+purpose, because the incident that prompted all this lived in `app/**` and `build.yml` only runs
+for `container/**`.
+
+Three rules, and the second half of the third is what keeps it usable: vendor-prefixed tokens
+(`ghp_`, `sk-`, `AKIA`, `xox`, …), `BEGIN … PRIVATE KEY` blocks, and an opaque literal assigned to
+a secret-shaped name. That last one needs **both** halves — the identifier must read as a
+credential *and* the whole literal must be hex or base64 with no word structure. Name-proximity
+alone flags `secure::get_project_secret(&id, "aws-secret-access-key")`, which is a keychain key
+name; the literal test is what excludes it. Measured against the tree: 0 false positives, and it
+catches the real incident (`9b2f4fe`) when replayed.
+
+A line ending `pragma: allowlist secret` is skipped. Make a fixture obviously fake before reaching
+for it.
+
+**Why this exists:** `the_custom_env_fingerprint_never_carries_the_value` used the maintainer's
+real Gitea **site-admin** token as its fixture — a test about secrets not escaping, leaking one. It
+survived 92 commits and fourteen days in the public GitHub mirror, past five audit rounds and two
+independent reviews, because every one of them read the code under change and this sat in a test
+nobody had reason to open. Fixtures are never live values; there is no case where they need to be.
+
 ## Testing
 
 Frontend tests use Vitest with jsdom environment and React Testing Library. Setup file at `src/test/setup.ts`. Run a single test file:

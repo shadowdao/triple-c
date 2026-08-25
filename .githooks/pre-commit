@@ -1,0 +1,14 @@
+#!/bin/sh
+# Refuse a commit that adds something shaped like a live credential.
+#
+# Installed by pointing git at this directory:
+#
+#     git config core.hooksPath .githooks
+#
+# which `npm run hooks` in app/ does for you. It is per-clone — git will not let
+# a repository configure its own hooks path, for the obvious reason that cloning
+# a repo would then be enough to run its code. So this is opt-in on every
+# machine, `--no-verify` skips it, and neither of those is a flaw to fix here:
+# the CI job in `.gitea/workflows/build.yml` is the half nobody can bypass. The
+# hook exists to tell you in one second rather than in five minutes.
+exec "$(git rev-parse --show-toplevel)/scripts/scan-secrets.sh" --staged
