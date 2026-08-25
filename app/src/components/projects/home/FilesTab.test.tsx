@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, act, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, act, waitFor, within } from "@testing-library/react";
 import FilesTab from "./FilesTab";
 import type { FileContents, FileEntry, Project } from "../../../lib/types";
 
@@ -7,6 +7,8 @@ const listContainerFiles = vi.fn();
 const renameContainerPath = vi.fn(async () => "");
 const createContainerDirectory = vi.fn(async () => "");
 const readContainerFile = vi.fn();
+const uploadFilesToContainer = vi.fn();
+const downloadContainerFile = vi.fn();
 
 vi.mock("../../../lib/tauri-commands", () => ({
   listContainerFiles: (p: string, path: string) => listContainerFiles(p, path),
@@ -14,6 +16,8 @@ vi.mock("../../../lib/tauri-commands", () => ({
   createContainerDirectory: (p: string, parent: string, n: string) =>
     createContainerDirectory(p, parent, n),
   readContainerFile: (p: string, path: string, max?: number) => readContainerFile(p, path, max),
+  uploadFilesToContainer: (p: string, dir: string) => uploadFilesToContainer(p, dir),
+  downloadContainerFile: (p: string, path: string) => downloadContainerFile(p, path),
 }));
 
 /** Transient failures land in `ToastHost`, not in an inline string. */
@@ -175,9 +179,15 @@ describe("FilesTab viewer", () => {
     });
     expect(await screen.findByText(/too large to preview/)).toBeTruthy();
     expect(screen.queryByAltText("huge.png")).toBeNull();
-    // The way out is named, and it is not a host path this pane could write:
-    // a terminal inside the container, or a backup.
-    expect(screen.getByText(/take a backup/)).toBeTruthy();
+    // A refusal has to name the way out, and the way out is now the button on
+    // the row rather than the `cat`-it-in-a-terminal workaround that existed
+    // because the button did not.
+    // Scoped to the modal: every file row also carries a "Save to host…"
+    // button now, so an unscoped query matches the grid behind the overlay and
+    // would pass with the refusal saying nothing at all.
+    expect(
+      within(screen.getByRole("dialog")).getByText(/Save to host/),
+    ).toBeTruthy();
   });
 
   it("says so in words when only a prefix of a big text file came back", async () => {
@@ -390,5 +400,75 @@ describe("FilesTab grid semantics", () => {
     listContainerFiles.mockRejectedValue("Permission denied");
     await renderTab();
     expect(screen.getByRole("alert").textContent).toContain("Permission denied");
+  });
+});
+
+/**
+ * The pane's two host-transfer affordances.
+ *
+ * They are asserted at the *button* level and not only in the hook, because
+ * this is the half that was actually lost: the commands behind them had been
+ * deleted, but so had the controls, and a working command nobody can reach is
+ * the same regression. Neither button names a host path — Rust opens the
+ * dialog — so what a click is required to prove is that the container-side
+ * argument reaching the backend is the one the user is looking at.
+ */
+describe("FilesTab host transfers", () => {
+  beforeEach(() => {
+    uploadFilesToContainer.mockResolvedValue({ uploaded: [], failures: [] });
+    downloadContainerFile.mockResolvedValue(4);
+  });
+
+  it("uploads into the directory currently on screen", async () => {
+    listContainerFiles.mockResolvedValue([entry("src", { is_directory: true })]);
+    await renderTab();
+    await act(async () => {
+      fireEvent.doubleClick(screen.getByText("src"));
+    });
+    uploadFilesToContainer.mockResolvedValueOnce({
+      uploaded: ["/workspace/src/a.txt"],
+      failures: [],
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Upload…" }));
+    });
+    expect(uploadFilesToContainer).toHaveBeenCalledWith("p1", "/workspace/src");
+  });
+
+  it("offers Save to host on a file and not on a folder", async () => {
+    listContainerFiles.mockResolvedValue([
+      entry("notes.txt"),
+      entry("src", { is_directory: true }),
+    ]);
+    await renderTab();
+    // The accessible name carries the row, per WCAG 2.5.3 — and it is how a
+    // per-row action is told apart from every other row's copy of it.
+    expect(
+      screen.getByRole("button", { name: "Save to host — notes.txt" }),
+    ).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: "Save to host — src" }),
+    ).toBeNull();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save to host — notes.txt" }));
+    });
+    expect(downloadContainerFile).toHaveBeenCalledWith("p1", "/workspace/notes.txt");
+  });
+
+  it("does not open the file viewer when Save to host is double-clicked", async () => {
+    // Opening a file is a *double*-click on the row, and a double-click on a
+    // button inside that row still bubbles — `onClick`'s `stopPropagation` does
+    // nothing about it. So an impatient double-click on Save used to save the
+    // file and drop the viewer modal over the pane at the same time, on top of
+    // the save dialog the backend had just opened.
+    listContainerFiles.mockResolvedValue([entry("notes.txt")]);
+    readContainerFile.mockResolvedValue(contents("hello"));
+    await renderTab();
+    await act(async () => {
+      fireEvent.doubleClick(
+        screen.getByRole("button", { name: "Save to host — notes.txt" }),
+      );
+    });
+    expect(readContainerFile).not.toHaveBeenCalled();
   });
 });

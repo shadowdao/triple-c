@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ProjectPath, ContainerInfo, AppSettings, UpdateInfo, ImageUpdateInfo, FileEntry, FileContents, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, BrowserPageState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo } from "./types";
+import type { Project, ProjectPath, ContainerInfo, AppSettings, UpdateInfo, ImageUpdateInfo, FileEntry, FileContents, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, BrowserPageState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo, UploadOutcome } from "./types";
 
 // Docker
 export const checkDocker = () => invoke<boolean>("check_docker");
@@ -69,6 +69,25 @@ export const stopAudioBridge = (sessionId: string) =>
 // Files
 export const listContainerFiles = (projectId: string, path: string) =>
   invoke<FileEntry[]>("list_container_files", { projectId, path });
+/**
+ * Save one container file to the host.
+ *
+ * The **backend** opens the save dialog, so this call cannot name a place on
+ * the host — that is the point (see `pick_save_path` in `file_commands.rs`).
+ * Paths do come *back* inside error text; what is closed is the inbound
+ * direction.
+ * Resolves to the number of bytes written, or `null` if the user dismissed the
+ * dialog. Zero bytes is a success: an empty file is a file.
+ */
+export const downloadContainerFile = (projectId: string, containerPath: string) =>
+  invoke<number | null>("download_container_file", { projectId, containerPath });
+/**
+ * Upload host files into `containerDir`, with the backend opening the file
+ * picker. Resolves to `null` if the user dismissed it, otherwise to what
+ * happened — one dialog can select several files and they need not all succeed.
+ */
+export const uploadFilesToContainer = (projectId: string, containerDir: string) =>
+  invoke<UploadOutcome | null>("upload_files_to_container", { projectId, containerDir });
 export const downloadContainerBackup = (projectId: string, hostPath: string, containerPath?: string) =>
   invoke<number>("download_container_backup", { projectId, hostPath, containerPath });
 export const readContainerFile = (projectId: string, path: string, maxBytes?: number) =>

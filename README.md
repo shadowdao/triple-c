@@ -24,7 +24,7 @@ This file is the architectural tour: what each subsystem is and why it works the
 - [Permission Modes](#permission-modes)
 - [Containers](#containers) — lifecycle, base-image migration, mounts, CA certificates, sibling containers
 - [Models and Authentication](#models-and-authentication) — backends, model aliases, gateway, shared token
-- [Bridges to the Host](#bridges-to-the-host) — URL relay, auth bridge, browser view
+- [Bridges to the Host](#bridges-to-the-host) — URL relay, auth bridge, browser view, host file transfers
 - [Inside a Project](#inside-a-project) — capability tiles, Mission Control, web terminal, speech-to-text
 - [Key Files](#key-files) · [CSS / Styling Notes](#css--styling-notes) · [Container Image](#container-image)
 
@@ -105,7 +105,7 @@ configuration. Per-project configuration lives in the Config tab rather than in 
 | **Sessions** | Past Claude Code conversations read from the config volume, with **Resume** |
 | **Automation** | The container's `triple-c-scheduler` tasks — create, edit, enable/disable, run now, read logs, remove, and completion notifications |
 | **Config** | Workspace (name, folders), Model (backend), Access (SSH, git, env vars, port mappings), Runtime (permission mode, sandbox, Docker access, Mission Control, instructions, Claude Code settings) |
-| **Files** | Browse, view and rename files inside the container. Container-side only: to get a file *in*, drop it on the Terminal tab; to get files *out*, use **Back up container** |
+| **Files** | Browse, view, rename and create folders inside the container, upload host files into the directory on screen, and save one file back out to the host — see [Host File Transfers](#host-file-transfers). A whole tree still comes out through **Back up container** |
 | **Browser** | Watch and take over the Playwright browser inside the container — see [Browser View](#browser-view) |
 
 Container start/stop progress is reported inline (on the sidebar row and in the Project Home
@@ -442,6 +442,33 @@ per project.
   binds, but never `@playwright/cli`, which is the viewer. It is what binds sessions automatically
   once Playwright is present — not a setup route.
 
+### Host File Transfers
+
+Four routes move files across the boundary: **Upload…** and the per-row **Save to host…** in the
+Files tab, a file dropped onto the Terminal tab, and **Back up container**. All four share one path
+policy in `commands/file_commands.rs`.
+
+- **The OS dialogs are opened by Rust, not by the webview.** `upload_files_to_container` and
+  `download_container_file` drive `tauri-plugin-dialog` themselves and take nothing but a project
+  id and a container-side path; `FilesTab.tsx` imports no dialog plugin and `useFileManager`'s
+  `uploadFiles` takes no argument at all. No host path crosses IPC in either direction — the web UI
+  can ask for a dialog, and that is the whole of its influence over where a file comes from or goes.
+  This is a boundary rather than a convention: a dialog the page itself opens is only as trustworthy
+  as the page.
+- **One policy for every host path.** A source or destination whose path passes through a hidden
+  folder (`~/.ssh`, `~/.cache`, `~/.local/share`, anything dot-prefixed) or a system location is
+  refused, and the check is applied both to the path as written and to what it resolves to after
+  symlinks. It over-catches deliberately, so it will occasionally refuse somewhere a person
+  genuinely meant — `~/.config`, say — and the refusal is a sentence naming the folder that tripped
+  it, not an errno.
+- **Uploads are capped at 256 MB per file**; past that the answer is a mount, not a copy. One
+  dialog's selection is handled file by file, so a folder or an oversized file among the selection
+  is reported by name and does not stop the others. Uploaded files land owned by the container user,
+  not root. A cancelled dialog is silent — `Ok(None)`, not an error.
+- **`download_container_file` is one file and files only** — no button on a folder row. A directory
+  is what `download_container_backup` is for. There is no drop target on the Files pane; the
+  Terminal tab keeps the one it has.
+
 ## Inside a Project
 
 ### Container Introspection (Capability Tiles)
@@ -513,7 +540,7 @@ Triple-C includes optional speech-to-text powered by [Faster Whisper](https://gi
 | `app/src/components/projects/home/AutomationTab.tsx` | Scheduler tasks: create, toggle, run now, logs, remove, notifications |
 | `app/src/components/projects/home/TaskEditorModal.tsx` | Create/edit a scheduled task; `taskValidation.ts` holds the cron and schedule rules |
 | `app/src/components/projects/home/ConfigTab.tsx` | Config sections (Workspace, Model, Access, Runtime) |
-| `app/src/components/projects/home/FilesTab.tsx` | Container-side file browser (navigate, view, rename, new folder) |
+| `app/src/components/projects/home/FilesTab.tsx` | Container-side file browser (navigate, view, rename, new folder) plus **Upload…** and per-row **Save to host…**; imports no dialog plugin — the dialogs are Rust's |
 | `app/src/components/projects/home/BrowserTab.tsx` | Browser view pane: detect, install, watch, take over, pop out |
 | `app/src/components/projects/home/OpenPageDialog.tsx` | Open a URL in the container's browser at a chosen viewport |
 | `app/src/components/projects/home/ContainerMigrationBanner.tsx` | Base-image staleness banner, migration progress, resume/rollback |
@@ -536,7 +563,7 @@ Triple-C includes optional speech-to-text powered by [Faster Whisper](https://gi
 | `app/src/hooks/useTerminal.ts` | Terminal session management (claude and bash modes) |
 | `app/src/hooks/useProjectActions.ts` | Start/stop/reset/backup and terminal-opening helpers |
 | `app/src/hooks/useContainerMigration.ts` | Staleness polling, migration run, resume and rollback |
-| `app/src/hooks/useFileManager.ts` | File browser operations (list, navigate, rename, mkdir) |
+| `app/src/hooks/useFileManager.ts` | File browser operations (list, navigate, rename, mkdir) and the host transfers (upload, save one file out); never handles a host path |
 | `app/src/hooks/useClaudeAuth.ts` | Shared-token status and acquisition |
 | `app/src/hooks/useSTT.ts` | Speech-to-text recording, transcription, and container management |
 | `app/src/lib/urlRelay.ts` | Host-side relay validation: OSC 7777 parsing, http/https allowlist, rate limiting |
@@ -561,7 +588,7 @@ Triple-C includes optional speech-to-text powered by [Faster Whisper](https://gi
 | `app/src-tauri/src/commands/inspect_commands.rs` | Read-only container views: sessions, capabilities, scheduler tasks |
 | `app/src-tauri/src/commands/auth_token_commands.rs` | `claude setup-token` flow, redaction, keychain storage |
 | `app/src-tauri/src/commands/auth_bridge_commands.rs` | Auth bridge enable/status commands |
-| `app/src-tauri/src/commands/file_commands.rs` | Container-side file commands (list, read, rename, mkdir) plus `download_container_backup` |
+| `app/src-tauri/src/commands/file_commands.rs` | Container-side file commands (list, read, rename, mkdir), the host transfers `upload_files_to_container` and `download_container_file` — each opening its own OS dialog here in Rust — plus `download_container_backup`, and the hidden-folder path policy all of them share |
 | `app/src-tauri/src/commands/stt_commands.rs` | STT start/stop/transcribe Tauri commands |
 | `app/src-tauri/src/commands/web_terminal_commands.rs` | Web terminal start/stop/status Tauri commands |
 | `app/src-tauri/src/models/project.rs` | Project struct (backend, `PermissionMode`, Docker access, Claude Code settings, Mission Control, auth bridge, browser view, CA path, shared-token opt-out) |

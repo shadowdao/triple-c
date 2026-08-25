@@ -15,13 +15,26 @@ const PARENT_ROW = "..";
 /**
  * The project's file browser.
  *
- * Container-side only: it lists, opens, renames and creates folders inside the
- * container, and it does no host filesystem I/O at all. A file gets *into* a
- * container by being dropped onto the Terminal tab, and a whole tree comes back
- * out through "Back up container" in the project's Workspace settings. Four
- * successive audits found that host paths crossing IPC were where the criticals
- * lived; those two paths are the ones that survived, and this pane is not one
- * of them.
+ * It lists, opens, renames and creates folders inside the container, and it
+ * copies single files across the boundary: "Upload…" in the toolbar, and a
+ * per-row "Save to host…".
+ *
+ * **Neither of those names a host path, and this file must never learn how
+ * to.** Four successive audits found that host paths crossing IPC were where
+ * the criticals lived — a frontend `open()`/`save()` handing Rust a string is
+ * exactly the shape that failed — so the picker is opened by the *backend*
+ * (`pick_files_to_upload` / `pick_save_path` in `commands/file_commands.rs`).
+ * What this file *sends* is a project id and a container path; the host side of
+ * the transfer is chosen by a person in an OS dialog. That is why
+ * `uploadFiles()` takes no argument and `saveToHost()` takes only the entry.
+ * (A failed transfer does report a host path back, in the text of its error —
+ * the inbound direction is the one that is closed, not both.)
+ *
+ * Drag-and-drop is deliberately still absent, in both directions. A file also
+ * gets into a container by being dropped onto the Terminal tab, and a whole
+ * tree comes back out through "Back up container" in the project's ⋯ menu —
+ * which is still the right answer for a directory, since "Save to host…" is one
+ * file at a time and is not offered on folders.
  *
  * Interaction model, chosen to match every desktop file manager rather than
  * the old half-and-half: **single click selects, double click opens**. That
@@ -52,6 +65,10 @@ export default function FilesTab({ project }: Props) {
     refresh,
     renameEntry,
     createFolder,
+    uploadFiles,
+    saveToHost,
+    uploading,
+    savingPath,
   } = useFileManager(project.id);
 
   const running = project.status === "running";
@@ -305,6 +322,16 @@ export default function FilesTab({ project }: Props) {
         >
           New folder
         </Button>
+        {/* The file picker this opens belongs to Rust, not to the webview — so
+            this file imports no dialog plugin and never composes a host path.
+            `uploadFiles` takes no argument for the same reason. */}
+        <Button
+          onClick={() => void uploadFiles()}
+          disabled={uploading}
+          className="ml-1"
+        >
+          {uploading ? "Uploading…" : "Upload…"}
+        </Button>
         <Button onClick={refresh} disabled={loading} className="ml-1">
           Refresh
         </Button>
@@ -501,6 +528,34 @@ export default function FilesTab({ project }: Props) {
                           >
                             Rename
                           </Button>
+                          {/* Folders have no single-file equivalent — a
+                              recursive download is what "Back up container" is
+                              for, and offering one here would mean rebuilding
+                              the tree-walking this pane deliberately does not
+                              do. */}
+                          {!entry.is_directory && (
+                            <Button
+                              aria-label={`Save to host — ${entry.name}`}
+                              className="ml-1"
+                              // Only this row: a large file can take a while,
+                              // and there is no reason the rest of the pane
+                              // should go dead while it is written.
+                              disabled={savingPath === entry.path}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                void saveToHost(entry);
+                              }}
+                              // A double-click is its own event, and
+                              // `onClick`'s `stopPropagation` says nothing
+                              // about it — so an impatient double-click here
+                              // reached the row's `onDoubleClick` and dropped
+                              // the viewer modal over the pane, on top of the
+                              // save dialog the backend had just opened.
+                              onDoubleClick={(e) => e.stopPropagation()}
+                            >
+                              {savingPath === entry.path ? "Saving…" : "Save to host…"}
+                            </Button>
+                          )}
                         </>
                       )}
                     </td>

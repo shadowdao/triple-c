@@ -79,23 +79,34 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
 - **`components/projects/home/`** — **Project Home**, the main-area view for a project:
   Overview / Sessions / Automation / Config / Files. Per-project configuration lives here, not in
   modals — see "UI conventions" below.
-  - **Files is container-side only. It does no host filesystem I/O, and must not grow any.**
-    The tab lists, opens (text and image viewer), renames and creates folders *inside* the
-    container: `list_container_files`, `read_container_file`, `rename_container_path`,
-    `create_container_directory`. There is no upload button, no "Save to host…", and no
-    drop-into-the-pane. Four successive audits found that host filesystem paths crossing IPC
-    were where the criticals lived — a caller-named host destination for container-controlled
-    bytes, an arbitrary host source read into the container, a `link(2)` upload reservation
-    that succeeded against a directory and failed forever on any filesystem without hard
-    links — so the feature was narrowed rather than fixed a fifth time. If a host path ever
-    needs to reach this pane again, the honest shape is for the *backend* to drive
-    `tauri-plugin-dialog`, so no host path arrives over IPC at all.
-  - **A file gets *in* by being dropped on the Terminal, and *out* through "Back up
-    container".** Those two are the whole host↔container story, they predate the Files work,
-    and their hardening is not to be weakened. `TerminalView`'s `onDragDropEvent` is Tauri's
-    native drop event (window-wide, so routed by `lib/dropTarget.ts` — geometry for *whose*
-    drop it is, a document-wide `dropIsBlocked` for whether the app should accept one at all;
-    keep both halves and keep `PaneVisibility`). Backup is
+  - **The Files pane's host transfers open their dialog from Rust, and that is the whole
+    design — do not move it back into the webview.** The tab browses, views (text and image),
+    renames and creates folders inside the container (`list_container_files`,
+    `read_container_file`, `rename_container_path`, `create_container_directory`), and it
+    copies single files in and out (`upload_files_to_container`, `download_container_file`).
+    The second pair call `pick_files_to_upload` / `pick_save_path`, which drive
+    `tauri-plugin-dialog` from the *backend*: the webview can ask for a picker and that is the
+    entirety of its influence — it cannot name a host path as an *input*. The claim stops
+    there and should not be widened: host paths still travel outward in error text, canonical
+    ones included. What is closed is the direction that produced the criticals.
+    That shape is not decoration. Four successive audits found that host filesystem paths
+    crossing IPC were where the criticals lived — a caller-named host destination for
+    container-controlled bytes, an arbitrary host source read into the container, a `link(2)`
+    upload reservation that succeeded against a directory and failed forever on any filesystem
+    without hard links. The feature was removed rather than fixed a fifth time, and it came
+    back only in the shape that removes the class: a frontend-driven dialog handing Rust a
+    string is the exact thing that failed, so re-introducing `open()`/`save()` in `FilesTab`
+    would undo the whole point while looking like a simplification.
+    None of the reservation machinery came back with it. There is no destination reservation,
+    no placeholder rollback and no collision marker — the OS save dialog already asks about
+    overwriting, and Docker's archive extractor overwrites on upload the way `cp` does.
+  - **Drag-and-drop is still not it.** There is no drop-into-the-Files-pane and no OS
+    drag-out; the buttons are the gesture. A file also gets *in* by being dropped on the
+    Terminal, and a whole tree comes *out* through "Back up container" — those two predate the
+    Files work and their hardening is not to be weakened. `TerminalView`'s `onDragDropEvent`
+    is Tauri's native drop event (window-wide, so routed by `lib/dropTarget.ts` — geometry for
+    *whose* drop it is, a document-wide `dropIsBlocked` for whether the app should accept one
+    at all; keep both halves and keep `PaneVisibility`). Backup is
     `file_commands::download_container_backup`.
   - **`resolve_host_path` applies the full lexical predicate twice — as written, and again
     after canonicalisation.** That includes the general hidden-component rule, which
@@ -103,8 +114,12 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
     `~/.local/share` is refused. Do not narrow it back to a list of "credential" directories.
     That was tried, and allow-by-omission let `~/.local/bin` (write there and you own the
     user's next shell command), `~/.password-store`, browser profiles and `~/.pki/nssdb`
-    through a planted symlink with a perfectly visible name. The two callers left are
-    occasional, so over-refusing is the cheaper mistake.
+    through a planted symlink with a perfectly visible name. Over-refusing is the cheaper
+    mistake. Note the cost is real and has grown: of the four callers, the Files pane's two
+    are routine, and their path comes from a dialog — so an over-catch refuses a destination a
+    person actually chose (`~/.config` is the common one). Accepted, and not a reason to
+    narrow the rule, because the terminal drop and `download_container_backup` still take
+    their host path over IPC and this predicate is their only boundary.
   - **OS drag-out is not here.** `tauri-plugin-drag`, `stage_container_file_for_drag` and its
     host staging directory were held back for separate hardening and live on
     `hold/disk-and-dragout`. Do not re-add `drag:allow-start-drag` or a staging command

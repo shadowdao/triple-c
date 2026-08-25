@@ -9,8 +9,9 @@
  *    payload position inside my rect? A hidden pane is `display:none` and so
  *    has a zero-size rect, which is what stops two panes both claiming the
  *    same drop. `TerminalView` is the only pane that takes dropped files
- *    today — the Files pane is container-side only — but the routing is what
- *    keeps it honest when a second one appears.
+ *    today — the Files pane copies files through buttons and a backend-opened
+ *    dialog, not through a drop — but the routing is what keeps it honest when
+ *    a second one appears.
  * 2. **Should the app accept a drop at all right now?** `dropIsBlocked` —
  *    document-wide, no geometry, no z-order. While a modal or a blocking
  *    overlay is on screen anywhere, every drop is refused.

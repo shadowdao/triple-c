@@ -3,6 +3,7 @@ import type { FileEntry } from "../lib/types";
 import * as commands from "../lib/tauri-commands";
 import { useAppState } from "../store/appState";
 import { errorText, readableRefusal } from "../lib/refusalText";
+import { formatBytes } from "../lib/formatBytes";
 
 /**
  * ## Where failures are reported
@@ -13,8 +14,8 @@ import { errorText, readableRefusal } from "../lib/refusalText";
  * (empty) grid. It is on screen, it is in context, it explains why there are
  * no rows, and it is not transient — it stands until the directory lists.
  *
- * Every **transient operation** failure — rename, create folder — goes to
- * `ToastHost` instead. Those used to land in the same inline `error` div, which
+ * Every **transient operation** failure — rename, create folder, upload, save
+ * to host — goes to `ToastHost` instead. Those used to land in the same inline `error` div, which
  * is the first child of the *scrolling* list: three hundred rows down, a
  * refused rename produced no visible change at all, just a rename box that
  * stayed open for no stated reason. The toast host is a persistent `aria-live`
@@ -42,6 +43,20 @@ export function useFileManager(projectId: string) {
    * change a sighted user sees in the grid and a screen reader user does not.
    */
   const [completed, setCompleted] = useState<string | null>(null);
+  /**
+   * Which host transfers are in flight.
+   *
+   * Both actions open an OS dialog and can then run for a long time on a large
+   * file, with nothing on screen to say so. Without this the buttons stay live:
+   * a second click opens a second dialog and runs a second concurrent exec
+   * against the same file, and a multi-gigabyte save is indistinguishable from
+   * a click that did nothing.
+   *
+   * `savingPath` rather than a boolean, so only the row being saved is
+   * disabled — the pane stays usable while a big file is written.
+   */
+  const [uploading, setUploading] = useState(false);
+  const [savingPath, setSavingPath] = useState<string | null>(null);
 
   const currentPathRef = useRef(currentPath);
 
@@ -154,6 +169,76 @@ export function useFileManager(projectId: string) {
     [projectId, navigate, report],
   );
 
+  /**
+   * Copy host files into the directory on screen.
+   *
+   * The picker is opened by **Rust**, not here — `upload_files_to_container`
+   * shows it, reads what the user chose and never lets a host path near IPC.
+   * So this passes a directory and gets back an outcome; `null` means the user
+   * dismissed the dialog, which is not a failure and says nothing.
+   *
+   * One dialog can select several files and they need not agree, hence two
+   * lists. Every failure is reported, because "3 of 5 uploaded" without saying
+   * which two is not a report. The listing is refreshed once, at the end, and
+   * only if the user is still looking at the directory that was targeted.
+   */
+  const uploadFiles = useCallback(async () => {
+    const target = currentPathRef.current;
+    let outcome;
+    setUploading(true);
+    try {
+      outcome = await commands.uploadFilesToContainer(projectId, target);
+    } catch (e) {
+      // A failure *before* the picker: no container, not running, or a
+      // directory this pane may not write to. One toast, not one per file.
+      report("Could not upload", e);
+      return;
+    } finally {
+      setUploading(false);
+    }
+    if (!outcome) return;
+    for (const failure of outcome.failures) {
+      useAppState.getState().pushToast({ kind: "error", message: failure });
+    }
+    if (outcome.uploaded.length > 0) {
+      // The directory is named, not implied. `target` is captured at click
+      // time and the picker is a modal OS dialog — the user has all the time in
+      // the world to browse somewhere else while it is open, and the files land
+      // where they started. "Uploaded 2 files." in front of a grid that does not
+      // contain them is a worse answer than no message at all.
+      const count = outcome.uploaded.length;
+      setCompleted(
+        `Uploaded ${count === 1 ? "1 file" : `${count} files`} to ${target}.`,
+      );
+      if (currentPathRef.current === target) await navigate(target);
+    }
+  }, [projectId, navigate, report]);
+
+  /**
+   * Save one file out to the host, with Rust opening the save dialog.
+   *
+   * No refresh: nothing in the container changed. The save dialog is also what
+   * asks about overwriting an existing host file, which is why the backend has
+   * no collision handling of its own to get wrong. `null` is a dismissal.
+   */
+  const saveToHost = useCallback(
+    async (entry: FileEntry) => {
+      setSavingPath(entry.path);
+      try {
+        const bytes = await commands.downloadContainerFile(projectId, entry.path);
+        // `0` is a real answer — an empty file saved is a success — so this
+        // tests for the dismissal sentinel, not for falsiness.
+        if (bytes === null) return;
+        setCompleted(`Saved "${entry.name}" (${formatBytes(bytes)}).`);
+      } catch (e) {
+        report(`Could not save "${entry.name}"`, e);
+      } finally {
+        setSavingPath(null);
+      }
+    },
+    [projectId, report],
+  );
+
   return {
     currentPath,
     entries,
@@ -168,5 +253,10 @@ export function useFileManager(projectId: string) {
     refresh,
     renameEntry,
     createFolder,
+    uploadFiles,
+    saveToHost,
+    /** A host transfer is in flight — see the state declarations above. */
+    uploading,
+    savingPath,
   };
 }

@@ -660,13 +660,24 @@ fn is_autorun_dir(names: &[String]) -> bool {
 
 /// Structural and policy checks on a host path, returning it as a [`PathBuf`].
 ///
-/// Two callers are left, and both are occasional rather than routine: dropping
-/// a host file onto the terminal, and "Back up container". Neither is reached
-/// through a path the webview invented — a `save()`/`open()` dialog stands in
-/// front of both — but a dialog is a UI convention, not a boundary: every
-/// command is a single `invoke` away from any code running in the webview, with
-/// container-controlled bytes on one side of it. So the backend has its own
-/// policy:
+/// Four callers, and they no longer share a threat model — which is the thing
+/// to hold on to when changing any of this:
+///
+///   * [`download_container_file`] and [`upload_files_to_container`], the Files
+///     pane's own transfers, **open their dialog from Rust**. The webview can
+///     ask for a picker and that is the whole of its influence — it cannot name
+///     a host path as an input. (It still *sees* host paths in error text, and
+///     canonical ones at that; the inbound direction is what was closed.) For
+///     these two this policy is defence in depth.
+///   * `terminal_commands::upload_host_file_to_terminal` (the terminal drop)
+///     and [`download_container_backup`] still take a host path *from the
+///     webview* as a string. A `save()`/`open()` dialog stands in front of both
+///     in the UI, but a dialog is a UI convention, not a boundary: every
+///     command is a single `invoke` away from any code running in the webview,
+///     with container-controlled bytes on one side of it. For those two, this
+///     policy is the boundary itself.
+///
+/// So the backend has its own policy:
 ///
 ///   * absolute, no `..`, no NUL — judged on the path's own components, so a
 ///     Windows path is judged as one wherever this runs;
@@ -694,17 +705,29 @@ fn is_autorun_dir(names: &[String]) -> bool {
 /// denylist of "credential" directories, which is allow-by-omission for the
 /// whole of the rest of `$HOME`: `~/.local/bin` (a write there is the user's
 /// next shell command), `~/.password-store`, browser profiles, `~/.pki/nssdb`.
-/// For two occasional callers, over-refusing is the cheaper mistake, so the
-/// general rule stands and the refusal says plainly what tripped it.
+/// Over-refusing is the cheaper mistake, so the general rule stands and the
+/// refusal says plainly what tripped it. Note that the cost went **up** when
+/// the Files pane got its transfers back: those callers are routine rather than
+/// occasional, and because their path comes from a dialog the person is
+/// choosing a real destination when it is refused. That is a known, accepted
+/// wart — `~/.config` is not a place this pane will save to — and it is not a
+/// reason to narrow the rule, because the two IPC-fed callers above are still
+/// behind it.
 ///
 /// **The rest of the policy is still a denylist, which is losing by
 /// construction.** `~/Library/LaunchAgents`, `%AppData%\…\Startup` and `/opt`
 /// are only refused because someone thought of them; the next persistence
-/// directory is not. The honest fix is for the *backend* to own the file dialog
-/// (`tauri-plugin-dialog` can be driven from Rust) so that the only host paths
-/// these commands accept are ones the user just pointed at, and no path arrives
-/// over IPC at all. Until then: these lists are defence in depth, and the
-/// dialog is the boundary.
+/// directory is not. The honest fix is for the *backend* to own the file
+/// dialog, so that the only host paths a command accepts are ones the user just
+/// pointed at and no path arrives over IPC at all — and that fix is **done for
+/// two of the four callers**: see [`pick_save_path`]. The lists are defence in
+/// depth there.
+///
+/// It is still outstanding for the terminal drop and for
+/// [`download_container_backup`], where these lists remain the only boundary
+/// and losing-by-construction is the live risk. Both are worth converting the
+/// same way; the drop is the harder of the two, because its path comes from an
+/// OS drag rather than from a dialog Rust could have opened.
 fn validate_host_path(path: &str, use_for: HostPathUse) -> Result<PathBuf, String> {
     if path.trim().is_empty() {
         return Err("No host path was given".to_string());
@@ -795,8 +818,8 @@ fn validate_host_path(path: &str, use_for: HostPathUse) -> Result<PathBuf, Strin
 /// perfectly ordinary-looking name.
 ///
 /// So the general rule is back, over-catch and all — see [`validate_host_path`]
-/// for what that costs and why it is the right way round for the two callers
-/// that are left. This is a thin wrapper rather than a second body so the two
+/// for what that costs, and for why it is still the right way round now that
+/// there are four callers rather than two. This is a thin wrapper rather than a second body so the two
 /// questions cannot drift apart again; the caller supplies the "resolves to"
 /// context, because on this side the offending component is usually one the
 /// user never wrote.
@@ -932,10 +955,11 @@ pub(crate) fn verify_opened_path(file: &std::fs::File, expected: &Path) -> Resul
 /// [`resolve_host_path`] for a host file about to be read into a container,
 /// handed back as a `String`.
 ///
-/// Public because its one caller lives elsewhere: the terminal's drag-and-drop
-/// drop target, `terminal_commands::upload_host_file_to_terminal`. That is the
-/// only way a host file gets into a container now — the Files pane is a
-/// container-side browser and does no host I/O at all.
+/// Public because one of its callers lives elsewhere: the terminal's
+/// drag-and-drop drop target, `terminal_commands::upload_host_file_to_terminal`.
+/// The other is [`upload_files_to_container`] just below, the Files pane's own
+/// upload. Both routes apply this same policy, so which one a file arrives by
+/// does not change what it is allowed to be.
 pub async fn resolve_host_read_path(path: &str) -> Result<String, String> {
     Ok(resolve_host_path(path, HostPathUse::Read)
         .await?
@@ -968,8 +992,8 @@ pub(crate) fn host_upload_name(path: &str) -> Result<String, String> {
 
 /// Where a host write is staged before it becomes the file the user asked for.
 ///
-/// One caller left: [`download_container_backup`], which is the only command
-/// that still puts container bytes on the host.
+/// Two callers: [`download_container_backup`] and [`download_container_file`],
+/// the two commands that put container bytes on the host.
 ///
 /// Same directory as the destination, so the last step is a rename within one
 /// filesystem: atomic, and the destination is not touched *at all* until the
@@ -987,12 +1011,32 @@ fn partial_download_path(dest: &Path) -> Result<PathBuf, String> {
     let name = dest
         .file_name()
         .ok_or_else(|| format!("{} does not name a file", dest.display()))?;
-    let mut partial = name.to_os_string();
-    partial.push(format!(
+    let suffix = format!(
         ".triple-c-part-{}",
         &uuid::Uuid::new_v4().simple().to_string()[..8]
-    ));
-    Ok(dest.with_file_name(partial))
+    );
+    // The leaf has to be shortened to make room, or a destination name that fits
+    // its directory perfectly well produces a partial name that does not.
+    // `NAME_MAX` is 255 bytes on ext4, APFS and NTFS alike, and the suffix is
+    // 23 of them.
+    //
+    // This did not matter while the only caller was Backup, whose name a person
+    // types. It matters now that a name can come from the container: a bundler
+    // writing `<230-char content hash>.js` would be unsavable, with the refusal
+    // blaming a temporary name the user never saw. Lossy is fine for a partial
+    // — it is thrown away by the rename, and the uuid is what makes it unique.
+    const NAME_MAX: usize = 255;
+    let budget = NAME_MAX.saturating_sub(suffix.len());
+    let name = name.to_string_lossy();
+    let mut base: &str = &name;
+    if base.len() > budget {
+        let mut end = budget;
+        while end > 0 && !base.is_char_boundary(end) {
+            end -= 1;
+        }
+        base = &base[..end];
+    }
+    Ok(dest.with_file_name(format!("{}{}", base, suffix)))
 }
 
 /// Move a finished partial archive onto the destination the user chose.
@@ -1035,6 +1079,42 @@ async fn finish_download(partial: &Path, dest: &Path) -> Result<(), String> {
                 .map_err(|e| format!("Failed to save {}: {}", dest.display(), e))
         }
     }
+}
+
+/// How much of a container's stderr is worth keeping to explain a failure.
+///
+/// Every other reader of container output in this codebase is capped —
+/// `MAX_ONESHOT_OUTPUT`, `PROC_NET_OUTPUT_LIMIT` — for the reason named in
+/// their comments: the source is hostile. The two streaming commands were the
+/// exception, and their stdout is bounded by the disk it is being written to
+/// while their stderr was bounded by nothing at all. A container that puts a
+/// chattier `dd` earlier in `PATH` (it has passwordless sudo, so it can) could
+/// grow this `String` until the app was killed.
+///
+/// A few kilobytes is far more than any real diagnostic and far less than any
+/// pressure on the process.
+const MAX_EXEC_STDERR: usize = 8 * 1024;
+
+/// Append a container's stderr frame, stopping at [`MAX_EXEC_STDERR`].
+///
+/// Silently, and deliberately so: this text exists to explain a failure to a
+/// person, and "(truncated)" in the middle of a `dd` diagnostic explains
+/// nothing that the first eight kilobytes did not.
+fn push_capped(buf: &mut String, frame: &[u8]) {
+    if buf.len() >= MAX_EXEC_STDERR {
+        return;
+    }
+    let room = MAX_EXEC_STDERR - buf.len();
+    let text = String::from_utf8_lossy(frame);
+    if text.len() <= room {
+        buf.push_str(&text);
+        return;
+    }
+    let mut end = room;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    buf.push_str(&text[..end]);
 }
 
 /// One regular file's bytes, pulled out of a container.
@@ -1308,6 +1388,559 @@ pub async fn create_container_directory(
     Ok(dest)
 }
 
+/// Refuse, in a sentence, before a Docker error has to speak for us.
+///
+/// Both file transfers and the backup run through `docker exec`, which needs a
+/// running container. Without this the failure surfaces as bollard's
+/// `is not running` wrapped in whatever the caller was doing, and for the
+/// upload it surfaces even less usefully: `resolve_container_dir`'s `realpath`
+/// is the first thing to touch the container, so a stopped project fails inside
+/// path *validation* and reads like the path was the problem.
+async fn require_running(container_id: &str, action: &str) -> Result<(), String> {
+    let docker = get_docker()?;
+    let running = docker
+        .inspect_container(container_id, None)
+        .await
+        .ok()
+        .and_then(|info| info.state)
+        .and_then(|s| s.running)
+        .unwrap_or(false);
+    if running {
+        return Ok(());
+    }
+    Err(format!(
+        "Start the project before {} — it runs inside the running container.",
+        action
+    ))
+}
+
+/// Copy one regular file out of a container onto a host path the user chose in
+/// a save dialog.
+///
+/// ## Why this exists again
+///
+/// It was removed along with the rest of the Files pane's host I/O, on the
+/// reasoning that four audits had found their criticals in host paths crossing
+/// IPC. That reasoning was about the *reservation machinery* — the `link(2)`
+/// destination reservation, the placeholder rollback, the collision marker —
+/// and every one of those criticals lived there. Removing the machinery was
+/// right. Removing the feature with it took away something the app shipped
+/// before any of this work started, so the user upgraded into a regression.
+///
+/// None of the removed machinery comes back. The save dialog already asks about
+/// overwriting, so there is nothing to reserve and no collision to mark, and
+/// what is left is the sequence [`download_container_backup`] has been using
+/// unchanged: resolve the destination, stream into a partial file beside it,
+/// rename last. The destination the user already had is not touched until the
+/// transfer has completely succeeded.
+///
+/// ## Why `cat` rather than the archive endpoint
+///
+/// [`fetch_container_file`] buffers, which is why it takes a mandatory ceiling
+/// — it serves the viewer, where a cap is the correct behaviour. A download has
+/// no business refusing a 3 GB file, so this streams instead, and streaming
+/// means not reassembling a tar in host RAM. `exec_oneshot`'s reader is not
+/// usable here either: it runs chunks through `String::from_utf8_lossy` and
+/// merges stderr into stdout, so it would corrupt any non-UTF-8 file and let
+/// diagnostics splice themselves into content. Attaching to the exec directly
+/// gives pre-demuxed frames, and only `StdOut` frames are written.
+///
+/// The type check runs *inside* the same exec as the `cat`, not as a separate
+/// round trip, so there is no window between deciding the path is a regular
+/// file and reading it. `[ -f ]` follows symlinks — downloading through a
+/// symlink is ordinary and stays allowed — and is false for a directory, a
+/// device and, importantly, a FIFO: `cat` on one blocks forever with no writer
+/// and there is no timeout anywhere on this path.
+///
+/// Returns the number of bytes written. Zero is a success: an empty file is a
+/// file. (The backup's `total == 0` check is not copied down here — there it
+/// means the tar pipeline produced nothing, which is a failure.)
+#[tauri::command]
+pub async fn download_container_file(
+    project_id: String,
+    container_path: String,
+    window: tauri::Window,
+    state: State<'_, AppState>,
+) -> Result<Option<u64>, String> {
+    // Read-only source, so structure is what matters — not the write roots. A
+    // download may legitimately reach image content the panel cannot modify.
+    // Checked before the dialog: there is no point asking the user where to put
+    // something that was never going to be read.
+    validate_container_path("Download", &container_path)?;
+
+    // Before the dialog, matching `upload_files_to_container`: asking someone to
+    // choose a destination and only then telling them the project is stopped is
+    // the wrong order to find that out in. The window this opens — the project
+    // being stopped *during* the dialog — costs nothing, because the exec then
+    // fails with a Docker error and no host file has been touched.
+    let project = state
+        .projects_store
+        .get(&project_id)
+        .ok_or_else(|| format!("Project {} not found", project_id))?;
+
+    let container_id = project
+        .container_id
+        .as_ref()
+        .ok_or_else(|| "No container exists for this project yet — start it first".to_string())?;
+
+    require_running(container_id, "saving a file to the host").await?;
+
+    let Some(chosen) = pick_save_path(&window, suggested_save_name(&container_path)).await else {
+        // Dismissed. Not an error, and deliberately distinguishable from one:
+        // the frontend shows nothing at all rather than a "cancelled" toast.
+        return Ok(None);
+    };
+    let chosen = host_path_string(chosen)?;
+    // Still validated, even though the path came from an OS dialog rather than
+    // over IPC. It is no longer the only thing standing between a compromised
+    // webview and an arbitrary host write — that is what moving the dialog into
+    // Rust bought — but the rule is cheap and the two host-path commands
+    // agreeing about what is writable is worth more than the few refusals it
+    // costs. See the note on `pick_save_path` about which ones those are.
+    let dest = resolve_host_path(&chosen, HostPathUse::Write).await?;
+
+    let docker = get_docker()?;
+
+    // `$TC_SRC`, never argv interpolation: the path reaches the shell as an
+    // environment value, so a name containing a quote or a `$` is data.
+    //
+    // Three things here are load-bearing against a container that is actively
+    // hostile rather than merely surprising:
+    //
+    //   * `dd iflag=nonblock` rather than `cat`. `[ -f ]` and the `open` that
+    //     follows it are two syscalls, and the container owns the filesystem in
+    //     between — a loop replacing the file with a FIFO wins that race often
+    //     enough to matter. `cat` then blocks in `open(2)` forever with no
+    //     writer, and there is no timeout anywhere on this path: the `invoke`
+    //     never settles and a partial file is left in the user's directory for
+    //     good. `O_NONBLOCK` makes that open return instead of hang. On a
+    //     regular file the flag is ignored by the kernel, so this is
+    //     byte-for-byte what `cat` did — verified against a real container.
+    //   * the second `[ -f ]`, *after* the read. Non-blocking turns the hang
+    //     into an empty file that would otherwise be renamed over the user's
+    //     destination and reported as a successful save. Bracketing the read
+    //     means the adversarial case ends as a refusal, which deletes the
+    //     partial and leaves the destination alone.
+    //   * `dd` is not `exec`-ed, because a replaced shell cannot run the check
+    //     that follows it.
+    //
+    // The bracket can also fire honestly — a file deleted or replaced mid-read
+    // — and reporting that as a failure is the right answer, since the bytes on
+    // their way to disk are then a mix of two files.
+    let script = r#"if [ -d "$TC_SRC" ]; then
+  echo "$TC_SRC is a folder — save its files individually." >&2
+  exit 3
+fi
+if [ ! -f "$TC_SRC" ]; then
+  echo "$TC_SRC is not a regular file." >&2
+  exit 4
+fi
+dd iflag=nonblock bs=64k status=none if="$TC_SRC" || exit 5
+if [ ! -f "$TC_SRC" ]; then
+  echo "$TC_SRC changed while it was being read — nothing was saved." >&2
+  exit 6
+fi"#;
+
+    let exec = docker
+        .create_exec(
+            container_id,
+            CreateExecOptions {
+                attach_stdout: Some(true),
+                attach_stderr: Some(true),
+                cmd: Some(vec!["sh".to_string(), "-c".to_string(), script.to_string()]),
+                env: Some(vec![format!("TC_SRC={}", container_path)]),
+                user: Some("claude".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|e| format!("Failed to start download: {}", e))?;
+
+    let result = docker
+        .start_exec(&exec.id, None)
+        .await
+        .map_err(|e| format!("Failed to start download: {}", e))?;
+
+    let mut output = match result {
+        StartExecResults::Attached { output, .. } => output,
+        StartExecResults::Detached => return Err("Download exec started detached".to_string()),
+    };
+
+    use tokio::io::AsyncWriteExt;
+    let partial = partial_download_path(&dest)?;
+    // Same open-and-confirm as the backup: `create_new` is `O_EXCL` so the
+    // final component cannot be a symlink, and `verify_opened_path` catches a
+    // directory on the way having been swapped since it was resolved. The
+    // `created` flag separates "nothing was made" from "it is ours to remove".
+    let open_at = partial.clone();
+    let created = Arc::new(AtomicBool::new(false));
+    let opened = {
+        let created = Arc::clone(&created);
+        tokio::task::spawn_blocking(move || -> Result<std::fs::File, String> {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&open_at)
+                .map_err(|e| format!("Failed to create {}: {}", open_at.display(), e))?;
+            created.store(true, Ordering::SeqCst);
+            verify_opened_path(&file, &open_at)?;
+            Ok(file)
+        })
+        .await
+        .map_err(|e| format!("Download task panicked: {}", e))?
+    };
+    let file = match opened {
+        Ok(file) => file,
+        Err(e) => {
+            if created.load(Ordering::SeqCst) {
+                let _ = tokio::fs::remove_file(&partial).await;
+            }
+            return Err(e);
+        }
+    };
+    let file = tokio::fs::File::from_std(file);
+    let mut writer = tokio::io::BufWriter::new(file);
+    let mut total: u64 = 0;
+    let mut stderr_text = String::new();
+    let mut stream_err: Option<String> = None;
+
+    while let Some(msg) = output.next().await {
+        match msg {
+            Ok(LogOutput::StdOut { message }) => {
+                if let Err(e) = writer.write_all(&message).await {
+                    stream_err = Some(format!("Failed to write {}: {}", dest.display(), e));
+                    break;
+                }
+                total += message.len() as u64;
+            }
+            Ok(LogOutput::StdErr { message }) => {
+                push_capped(&mut stderr_text, &message);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                stream_err = Some(format!("Download stream error: {}", e));
+                break;
+            }
+        }
+    }
+    if stream_err.is_none() {
+        if let Err(e) = writer.flush().await {
+            stream_err = Some(format!("Failed to finalize {}: {}", dest.display(), e));
+        }
+    }
+    drop(writer);
+
+    // The read can be killed part-way through and still have sent bytes, so the
+    // exit code decides — not `total`.
+    //
+    // `!= Some(0)`, not `is_some_and(|c| c != 0)`. An *undeterminable* exit code
+    // is a failure here, and the difference is not academic: the backup catches
+    // this class with its `total == 0` check, which this command deliberately
+    // does not have because an empty file is a legitimate save. Restart a
+    // project mid-download and the exec is torn down — the attached stream ends
+    // at EOF rather than in an `Err`, and the exec instance is purged, so
+    // `inspect_exec` can no longer say how it ended. Reading that silence as
+    // success renames a truncated partial over the file the user already had
+    // and reports the byte count as if it were the whole thing. That is the one
+    // way this command could destroy data, so silence is failure.
+    let exit_code = crate::docker::exec::wait_for_exec_exit(&exec.id).await;
+    if stream_err.is_none() && exit_code != Some(0) {
+        // Framed, never verbatim. The script's own refusals are finished
+        // sentences, but they *quote the container's path* — and a directory
+        // can be named anything. `readableRefusal` on the frontend promotes a
+        // refusal that looks like one of ours to the toast headline, so an
+        // unframed string is an invitation to write the app's own error message
+        // from inside the container. The frame does not make the text
+        // trustworthy; it makes it visibly quoted.
+        let detail = stderr_text.trim();
+        stream_err = Some(match exit_code {
+            None => format!(
+                "Could not confirm that {} was read completely — nothing was saved.",
+                container_path
+            ),
+            Some(code) if detail.is_empty() => {
+                format!("Could not read {} (exit {})", container_path, code)
+            }
+            Some(code) => format!("Could not read {} (exit {}): {}", container_path, code, detail),
+        });
+    }
+
+    if let Some(err) = stream_err {
+        // Only our own partial is removed. Whatever the user already had at
+        // `dest` has not been touched at any point above.
+        let _ = tokio::fs::remove_file(&partial).await;
+        return Err(err);
+    }
+
+    if let Err(e) = finish_download(&partial, &dest).await {
+        let _ = tokio::fs::remove_file(&partial).await;
+        return Err(e);
+    }
+
+    log::info!(
+        "Saved {} from project {} to {} ({} bytes)",
+        container_path,
+        project_id,
+        dest.display(),
+        total
+    );
+    Ok(Some(total))
+}
+
+/// What one upload dialog's worth of files did.
+///
+/// Both halves are needed because one dialog can select several files and they
+/// do not have to agree: a folder among the selection, or one file over the
+/// size ceiling, must not cost the user the files either side of it. The
+/// failures are finished sentences, ready to show.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UploadOutcome {
+    /// In-container paths, in the order they landed.
+    pub uploaded: Vec<String>,
+    /// One sentence per file that did not.
+    pub failures: Vec<String>,
+}
+
+/// Copy host files the user picked in an open dialog into the container
+/// directory the Files pane is showing.
+///
+/// `Ok(None)` means the picker was dismissed, which is not a failure and is
+/// deliberately distinguishable from one. Otherwise the [`UploadOutcome`]
+/// says what each selected file did — see there for why that is two lists.
+///
+/// The other half of the restoration described on [`download_container_file`],
+/// and the same rule: nothing that was removed comes back. In particular there
+/// is no destination reservation. The audit that ended this feature found the
+/// `link(2)` reservation returning success against a *directory* — linking into
+/// it, leaving permanent stray files, and through a symlinked directory writing
+/// outside the validated root — and failing permanently on any filesystem
+/// without hard links. What it was defending against was a name collision, and
+/// Docker's archive extractor overwrites on collision the same way `cp` does,
+/// which is what a file manager's upload is expected to do.
+///
+/// Every step here already existed and is already hardened; this command is the
+/// wiring, not new machinery:
+///
+///   * the name comes from the path **as the user gave it**, before resolution
+///     ([`host_upload_name`]) — `~/Downloads/latest.log` is routinely a symlink,
+///     and taking the leaf off the resolved path renames the file on its way in;
+///   * the bytes come from [`resolve_host_read_path`], i.e. the host-read policy
+///     applied to the path with its symlinks resolved, so a visible directory
+///     that *leads* to `~/.ssh` is refused;
+///   * the destination goes through [`resolve_container_dir`], so it is inside
+///     [`CONTAINER_WRITE_ROOTS`] both as written and as it resolves;
+///   * the read, the size ceiling and the descriptor check are
+///     `docker::exec::upload_host_file_with_ids`', unchanged — including
+///     landing the file owned by the container user rather than root.
+///
+/// The dialog itself is opened from Rust ([`pick_files_to_upload`]), which is
+/// the whole reason this shape is acceptable at all.
+#[tauri::command]
+pub async fn upload_files_to_container(
+    project_id: String,
+    container_dir: String,
+    window: tauri::Window,
+    state: State<'_, AppState>,
+) -> Result<Option<UploadOutcome>, String> {
+    let project = state
+        .projects_store
+        .get(&project_id)
+        .ok_or_else(|| format!("Project {} not found", project_id))?;
+
+    let container_id = project
+        .container_id
+        .as_ref()
+        .ok_or_else(|| "No container exists for this project yet — start it first".to_string())?;
+
+    // Both checks before the dialog, so a project that cannot receive files
+    // says so instead of asking the user to choose some first.
+    require_running(container_id, "uploading files").await?;
+    resolve_container_dir(container_id, "Upload", &container_dir).await?;
+
+    let Some(picked) = pick_files_to_upload(&window).await else {
+        return Ok(None);
+    };
+
+    // Once for the whole selection, not once per file — see
+    // `upload_host_file_with_ids`.
+    let ids = crate::docker::exec::container_user_ids(container_id).await;
+
+    let mut outcome = UploadOutcome {
+        uploaded: Vec::new(),
+        failures: Vec::new(),
+    };
+    for path in picked {
+        let path = match host_path_string(path) {
+            Ok(path) => path,
+            Err(e) => {
+                outcome.failures.push(e);
+                continue;
+            }
+        };
+        match upload_one(container_id, &path, &container_dir, ids).await {
+            Ok(dest) => {
+                log::info!("Uploaded {} into project {} at {}", path, project_id, dest);
+                outcome.uploaded.push(dest);
+            }
+            Err(e) => outcome.failures.push(e),
+        }
+    }
+    Ok(Some(outcome))
+}
+
+/// One file of an upload selection. Every refusal it returns is a sentence
+/// naming the file, because the caller may be reporting several at once and
+/// "is a folder" on its own does not say which one.
+async fn upload_one(
+    container_id: &str,
+    host_path: &str,
+    container_dir: &str,
+    ids: (u64, u64),
+) -> Result<String, String> {
+    let name = host_upload_name(host_path)?;
+    let resolved = resolve_host_read_path(host_path).await?;
+
+    let meta = tokio::fs::metadata(&resolved)
+        .await
+        .map_err(|e| format!("Cannot access {}: {}", resolved, e))?;
+    // `!is_file()`, not `!is_dir()` — the same reasoning as the terminal drop.
+    // A FIFO is neither a directory nor a regular file, reports `len() == 0`,
+    // and `File::open` on one blocks forever with no writer and no timeout.
+    if !meta.is_file() {
+        return Err(if meta.is_dir() {
+            format!("{} is a folder — upload its files individually.", host_path)
+        } else {
+            format!("{} is not a regular file — only ordinary files can be uploaded.", host_path)
+        });
+    }
+    // The ceiling is enforced against the open descriptor inside the uploader;
+    // this copy of it exists so the refusal arrives as a sentence instead of
+    // after a 300 MB read.
+    use crate::docker::exec::MAX_DROP_BYTES;
+    if meta.len() > MAX_DROP_BYTES {
+        return Err(format!(
+            "{} is too large to upload ({:.0} MB; limit {} MB). Mount it into the project instead.",
+            host_path,
+            meta.len() as f64 / (1024.0 * 1024.0),
+            MAX_DROP_BYTES / (1024 * 1024)
+        ));
+    }
+
+    crate::docker::exec::upload_host_file_with_ids(
+        container_id,
+        &resolved,
+        container_dir,
+        &name,
+        ids,
+    )
+    .await
+}
+
+/// The path a dialog handed back, as a `String`, or a refusal.
+///
+/// Every host-path check in this module is `&str`-based, so a `PathBuf` has to
+/// become one somewhere. `to_string_lossy` is the wrong way to do it: invalid
+/// bytes become U+FFFD, which is a *different path*. For an upload that reads
+/// as "Cannot access …" on a file the user demonstrably just picked; for a save
+/// it is worse, because the write would go somewhere other than the file the
+/// dialog had just asked them to confirm overwriting.
+///
+/// Legacy Latin-1 filenames on Linux are the realistic way to meet this. Since
+/// nothing downstream can handle such a path honestly, it is refused by name
+/// rather than silently changed into another one.
+fn host_path_string(path: PathBuf) -> Result<String, String> {
+    path.into_os_string().into_string().map_err(|bad| {
+        format!(
+            "{} is not valid Unicode — Triple-C cannot transfer a file whose path it cannot spell exactly. Rename it, or move it somewhere with an ASCII name.",
+            PathBuf::from(bad).display()
+        )
+    })
+}
+
+/// The name the save dialog opens with.
+///
+/// `unwrap_or` is not enough on its own: `rsplit` on a path with a trailing
+/// separator yields `Some("")`, so the fallback never fires and the dialog
+/// opens with a blank name for the user to fill in from nothing. `filter` is
+/// what makes the fallback reachable.
+fn suggested_save_name(container_path: &str) -> &str {
+    container_path
+        .rsplit('/')
+        .next()
+        .filter(|leaf| !leaf.is_empty())
+        .unwrap_or("download")
+}
+
+/// Ask the user where to save, from Rust.
+///
+/// ## Why the dialog is here and not in the webview
+///
+/// This is the shape the previous round's threat model asked for by name. The
+/// frontend used to call `@tauri-apps/plugin-dialog` and hand the chosen path
+/// back over IPC as a string — at which point the backend has no way to tell a
+/// path a person picked from a path a compromised webview invented, and
+/// `resolve_host_path` is the *only* thing between `invoke` and an arbitrary
+/// host write. Four audits' worth of criticals lived in that gap.
+///
+/// Driving the dialog from Rust closes it structurally: the webview can ask for
+/// a save dialog, and that is the whole of its influence. It cannot name the
+/// destination, and it cannot proceed without a person choosing one.
+///
+/// ## What is still validated, and what that costs
+///
+/// The chosen path still goes through `resolve_host_path`, whose hidden-
+/// component rule deliberately over-catches (see [`validate_host_path`]). That
+/// rule was written for adversarial input, and against a *dialog* it will
+/// occasionally refuse something a person meant — saving into `~/.config`, or
+/// picking a file out of `~/.cache`. It is kept anyway: the refusal is a clear
+/// sentence, the destinations it costs are unusual ones for this pane, and
+/// having the two host-path commands disagree about what is writable is a worse
+/// failure than an occasional "choose somewhere else".
+///
+/// `None` means dismissed, which is not a failure. The `oneshot` is used rather
+/// than `blocking_save_file` because the blocking variants deadlock if they
+/// ever reach the main thread, and "which thread does this command run on" is
+/// not a property worth depending on.
+async fn pick_save_path(window: &tauri::Window, suggested: &str) -> Option<PathBuf> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    window
+        .dialog()
+        .file()
+        .set_parent(window)
+        .set_title("Save to host")
+        .set_file_name(suggested)
+        .save_file(move |picked| {
+            let _ = tx.send(picked);
+        });
+    rx.await.ok().flatten().and_then(|p| p.into_path().ok())
+}
+
+/// Ask the user which host files to upload, from Rust. See [`pick_save_path`]
+/// for why the dialog lives on this side.
+async fn pick_files_to_upload(window: &tauri::Window) -> Option<Vec<PathBuf>> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    window
+        .dialog()
+        .file()
+        .set_parent(window)
+        .set_title("Upload to container")
+        .pick_files(move |picked| {
+            let _ = tx.send(picked);
+        });
+    let picked: Vec<PathBuf> = rx
+        .await
+        .ok()
+        .flatten()?
+        .into_iter()
+        .filter_map(|p| p.into_path().ok())
+        .collect();
+    // An empty selection is a dismissal as far as the caller is concerned —
+    // there is nothing to report and nothing to refresh.
+    (!picked.is_empty()).then_some(picked)
+}
+
 /// Create a `.tar.gz` backup of the container and stream it to a host file.
 /// The archive contains:
 ///   - the workspace (default /workspace), minus regenerable build artifacts
@@ -1346,18 +1979,7 @@ pub async fn download_container_backup(
 
     let docker = get_docker()?;
 
-    // The backup runs inside the container via `docker exec`, which requires it
-    // to be running. Fail with a clear message rather than a raw Docker error.
-    let running = docker
-        .inspect_container(container_id, None)
-        .await
-        .ok()
-        .and_then(|info| info.state)
-        .and_then(|s| s.running)
-        .unwrap_or(false);
-    if !running {
-        return Err("Start the project before backing up — the backup runs inside the running container.".to_string());
-    }
+    require_running(container_id, "backing up").await?;
 
     let path = container_path.unwrap_or_else(|| "/workspace".to_string());
     // Read-only source: `tar -C` it, so absoluteness and `..` are what matter.
@@ -1485,7 +2107,7 @@ tar czf - --ignore-failed-read \
                 total += message.len() as u64;
             }
             Ok(LogOutput::StdErr { message }) => {
-                stderr_text.push_str(&String::from_utf8_lossy(&message));
+                push_capped(&mut stderr_text, &message);
             }
             Ok(_) => {}
             Err(e) => {
@@ -1554,6 +2176,109 @@ tar czf - --ignore-failed-read \
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A destination name that fits its directory must not become a partial
+    /// name that does not. The leaf can come from the *container* now — a
+    /// bundler's content-hashed chunk name is routinely 200+ characters — so
+    /// this is reachable without anyone typing anything unusual.
+    #[test]
+    fn a_partial_name_stays_within_name_max() {
+        let long = "x".repeat(250);
+        let partial = partial_download_path(Path::new(&format!("/home/j/{}", long))).unwrap();
+        let leaf = partial.file_name().unwrap().to_string_lossy().to_string();
+        assert!(leaf.len() <= 255, "partial leaf was {} bytes", leaf.len());
+        assert!(leaf.contains(".triple-c-part-"));
+        // Same directory as the destination — the last step has to be a rename
+        // within one filesystem.
+        assert_eq!(partial.parent(), Some(Path::new("/home/j")));
+    }
+
+    /// Truncation must not split a character in half, or the partial cannot be
+    /// spelled back on a filesystem that validates encoding.
+    #[test]
+    fn a_partial_name_truncates_on_a_character_boundary() {
+        // 3 bytes each, deliberately: the budget is 232, which 3 does not
+        // divide, so a naive byte slice lands mid-character. A 2-byte character
+        // would divide it evenly and the test would pass without the boundary
+        // walk existing at all — which is exactly what it did on the first
+        // attempt.
+        let long = "日".repeat(250);
+        let partial = partial_download_path(Path::new(&format!("/home/j/{}", long))).unwrap();
+        let leaf = partial.file_name().unwrap().to_string_lossy().to_string();
+        assert!(leaf.len() <= 255);
+        // The kept part must be a genuine prefix of the name, whole characters
+        // only — which rules out both a mid-character cut and the other way of
+        // "not splitting a character", throwing the whole name away.
+        let kept = leaf.split(".triple-c-part-").next().unwrap();
+        assert!(!kept.is_empty(), "the whole name was discarded");
+        assert!(long.starts_with(kept), "kept part is not a prefix of the name");
+        assert_eq!(kept.len() % 3, 0, "cut landed mid-character");
+    }
+
+    /// An ordinary name is left exactly as it is — the cap must not be paid by
+    /// every download.
+    #[test]
+    fn an_ordinary_partial_name_keeps_the_whole_leaf() {
+        let partial = partial_download_path(Path::new("/home/j/notes.txt")).unwrap();
+        let leaf = partial.file_name().unwrap().to_string_lossy().to_string();
+        assert!(leaf.starts_with("notes.txt.triple-c-part-"));
+    }
+
+    /// The container's stderr is attacker-controlled and unbounded at the
+    /// source; it must be bounded here.
+    #[test]
+    fn container_stderr_stops_growing_at_the_cap() {
+        let mut buf = String::new();
+        for _ in 0..1000 {
+            push_capped(&mut buf, &b"x".repeat(1024));
+        }
+        assert!(buf.len() <= MAX_EXEC_STDERR, "grew to {}", buf.len());
+        // …and it is not simply empty: the point is to explain a failure.
+        assert!(!buf.is_empty());
+    }
+
+    /// Capping must not split a character either — the text goes into an error
+    /// message that is rendered.
+    #[test]
+    fn capping_stderr_truncates_on_a_character_boundary() {
+        // 3 bytes each, and the cap is not a multiple of 3, so a naive byte
+        // slice lands mid-character.
+        let text = "日".repeat(MAX_EXEC_STDERR);
+        let mut buf = String::new();
+        push_capped(&mut buf, text.as_bytes());
+        assert!(buf.len() <= MAX_EXEC_STDERR);
+        assert!(!buf.is_empty(), "the whole diagnostic was discarded");
+        assert!(text.starts_with(&buf), "kept part is not a prefix");
+        assert_eq!(buf.len() % 3, 0, "cut landed mid-character");
+    }
+
+    /// A path a dialog produced that cannot be spelled exactly is refused, not
+    /// quietly turned into a different path by U+FFFD substitution.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_unicode_dialog_path_is_refused_rather_than_mangled() {
+        use std::os::unix::ffi::OsStringExt;
+        let bad = PathBuf::from(std::ffi::OsString::from_vec(b"/home/j/caf\xe9.txt".to_vec()));
+        let err = host_path_string(bad).unwrap_err();
+        assert!(err.contains("not valid Unicode"), "{}", err);
+        // An ordinary path still comes back untouched.
+        assert_eq!(
+            host_path_string(PathBuf::from("/home/j/café.txt")).unwrap(),
+            "/home/j/café.txt"
+        );
+    }
+
+    #[test]
+    fn a_save_dialog_always_opens_with_a_name() {
+        assert_eq!(suggested_save_name("/workspace/notes.txt"), "notes.txt");
+        assert_eq!(suggested_save_name("/notes.txt"), "notes.txt");
+        // A trailing separator is the case `unwrap_or` alone gets wrong: the
+        // leaf is `Some("")`, so the fallback is never consulted and the dialog
+        // opens blank.
+        assert_eq!(suggested_save_name("/workspace/logs/"), "download");
+        assert_eq!(suggested_save_name("/"), "download");
+        assert_eq!(suggested_save_name(""), "download");
+    }
 
     /// A record as `find -printf '%y\t%Y\t%s\t%T@\t%m\t%f\0'` emits it —
     /// fields first, name last, NUL-terminated.
@@ -2120,8 +2845,9 @@ mod tests {
         // denylist to buy those cases back, and the denylist let
         // `~/.local/bin` and `~/.password-store` straight through.
         //
-        // These two callers — the terminal drop and Backup — are occasional
-        // rather than routine, so paying the over-catch is the right way round.
+        // Two of the four callers — the terminal drop and Backup — take their
+        // host path from the webview, so this rule is their only boundary and
+        // paying the over-catch is the right way round.
         // What the refusal must not be is mysterious: it says which component
         // is hidden and that the path *resolves* through it.
         let root = std::env::temp_dir()

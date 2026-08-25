@@ -365,6 +365,22 @@ export interface FileEntry {
   permissions: string;
 }
 
+/**
+ * What one upload dialog's worth of files did — mirrors `UploadOutcome` in
+ * `commands/file_commands.rs`.
+ *
+ * Two lists rather than a count and a flag, because one dialog can select
+ * several files and they do not have to agree: a folder among the selection, or
+ * a file over the size ceiling, must not cost the user the ones either side of
+ * it. Each `failures` entry is already a finished sentence naming its file.
+ */
+export interface UploadOutcome {
+  /** In-container paths, in the order they landed. */
+  uploaded: string[];
+  /** One sentence per file that did not. */
+  failures: string[];
+}
+
 /** A file read out of the container for the in-app viewer. */
 export interface FileContents {
   /** Base64 — a byte array would cross IPC as JSON numbers. */

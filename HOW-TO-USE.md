@@ -228,7 +228,7 @@ buttons. Below that are six tabs:
 | **Sessions** | Past Claude Code conversations stored on this project's config volume, each with a **Resume** button |
 | **Automation** | The scheduled tasks running inside this container — see [Automation & Scheduled Tasks](#automation--scheduled-tasks) |
 | **Config** | All per-project configuration — see [Project Configuration](#project-configuration) |
-| **Files** | Browse, view and rename files inside the container — see [Files](#files) for how files get in and out |
+| **Files** | Browse, view and rename files inside the container, and move files between it and your own machine — see [Files](#files) |
 | **Browser** | Watch — and take over — the browser Claude is driving with Playwright, see [The Browser Tab](#the-browser-tab) |
 
 ### Sessions
@@ -351,7 +351,7 @@ it. The sidebar row carries only the two hover controls.
 | **Force stop** | Project Home header | Starting / Stopping | Interrupts a transition that is stuck |
 | **Open Claude Terminal** | Project Home header; sidebar hover control; `Ctrl+T` | Running | Opens a new Claude Code terminal tab |
 | **Shell** | Project Home header | Running | Opens a bash login shell tab in the container (no Claude Code) |
-| **Files** | Project Home header, and the **Files** tab | Running | Switches to the Files tab to browse, view and rename files inside the container |
+| **Files** | Project Home header, and the **Files** tab | Running | Switches to the Files tab to browse, view and rename files inside the container, upload files into it and save one back out |
 | **Config** | The **Config** tab | Always | Per-project configuration (most fields need the container stopped) |
 | **Back up container** | **⋯** overflow menu | A container exists | Saves a `.tar.gz` archive of the container to a location you choose |
 | **Reset container…** | **⋯** overflow menu | Stopped or Error | Destroys the container, snapshot image and both volumes, then recreates from the base image (wipes `~/.claude`) — asks first |
@@ -1170,8 +1170,8 @@ When you scroll up in the terminal to review previous output, a **Jump to Curren
 
 ### Files
 
-The **Files** tab of Project Home browses inside a running container. It works entirely on the
-container side — it never reads or writes anything on your own machine. You can:
+The **Files** tab of Project Home browses inside a running container, and moves files between it
+and your own machine. You can:
 
 - **Browse** the container filesystem, starting at `/workspace`, with breadcrumb navigation.
   Double-click a folder to open it, or the `..` row to go up; the arrow keys, Home and End move
@@ -1181,32 +1181,46 @@ container side — it never reads or writes anything on your own machine. You ca
 - **Rename** an entry, from the row's Rename button or by pressing `F2`. A rename never moves a
   file between folders
 - **New folder** in the directory on screen
+- **Upload…**, from the toolbar, to copy files from your machine into the directory on screen
+- **Save to host…**, from a file's own row, to write that one file out to your machine
 - **Refresh** the directory listing at any time
 
 The listing shows file names, sizes, and modification dates, and marks symbolic links.
 
 #### Getting files in and out
 
-The Files tab deliberately does **not** copy files between your computer and the container. There
-are two supported routes, and they are the ones to use:
+**Upload…** opens a file dialog on your machine, and whatever you choose is copied into the
+directory currently on screen. Uploaded files arrive owned by you inside the container, not by
+root. You can pick several files in one dialog; each is handled on its own, so if a folder or an
+over-sized file is among them, it is named in the message and the rest still arrive. Uploads are
+capped at **256 MB per file** — for anything larger, mount the folder into the project instead and
+skip the copying altogether.
 
-- **To get a file in:** drag it from your desktop and **drop it onto the Terminal tab**. The file
-  is copied into the container and its path is typed into the terminal for you, ready to hand to
-  Claude Code. (You can also drop it onto the terminal's *Following* toggle — the whole pane is a
-  drop target.)
-- **To get files out:** use **Back up container** in Project Home's **⋯** overflow menu. It writes
-  a `.tar.gz` of the workspace and the container's `~/.claude` config to a location you choose.
-  For a single file, `cat` it in a terminal, or work in a project folder that is mounted from your
-  host in the first place — those files are already on both sides.
+**Save to host…** does the reverse, for one file: a save dialog opens, you choose where the file
+goes, and it is written there. The button sits on the file's own row, and only on files. For a
+whole directory, use **Back up container** in Project Home's **⋯** overflow menu, which writes a
+`.tar.gz` of the workspace and the container's `~/.claude` config to a location you choose — that
+is still the right tool for a tree.
 
-Both routes refuse a destination whose path passes through a hidden folder — anything with a
-component beginning with `.`, such as `~/.ssh`, `~/.local/bin` or `~/.config`. That rule catches
-more than it strictly needs to (a path that happens to resolve through `~/.cache` or
-`node_modules/.pnpm` is refused as well), and the refusal says which folder tripped it. Choose a
-visible location such as `~/Documents` or `~/Downloads`.
+Dragging a file from your desktop and **dropping it onto the Terminal tab** works too, and is often
+the quickest way in when you are already typing: the file is copied into the container and its path
+is typed into the terminal for you, ready to hand to Claude Code. (The whole terminal pane is a
+drop target, including its *Following* toggle.) The Files pane itself is not a drop target.
+
+Both dialogs are opened by Triple-C itself rather than by the page you are looking at. The page
+cannot name a place on your machine — it can only ask for a dialog — and nothing is read or written
+until you pick somewhere in it. Closing a dialog without choosing is not an error: nothing happens,
+and nothing is said about it.
+
+Every one of these routes refuses a location whose path passes through a hidden folder — anything
+with a component beginning with `.`, such as `~/.ssh`, `~/.cache` or `~/.local/share` — or a system
+location, and it checks both the path as written and where it points after any symbolic links. That
+rule catches more than it strictly needs to, so now and then it will refuse a place you genuinely
+meant, `~/.config` among them. The refusal is a plain sentence saying so; choose a visible location
+such as `~/Documents` or `~/Downloads`.
 
 If you already keep the project in a folder mounted into the container, the simplest answer is
-usually neither of the above: edit the file on your host and it is already inside.
+usually none of the above: edit the file on your host and it is already inside.
 
 ### Terminal Rendering
 

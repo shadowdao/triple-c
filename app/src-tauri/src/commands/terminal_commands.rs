@@ -202,8 +202,11 @@ pub async fn upload_host_file_to_terminal(
     // (`~/.ssh`, `~/.aws`, `~/.local/bin`) or a system location — applied to
     // the path with its symlinks already resolved, so a visible directory that
     // *leads* to one of those is refused too. What comes back is that resolved
-    // path, and it is what gets opened. This is now one of only two commands
-    // that touch a host path at all; the other is `download_container_backup`.
+    // path, and it is what gets opened. Four commands touch a host path now,
+    // but only two take it *over IPC*: this one and `download_container_backup`.
+    // The Files pane's `download_container_file` and `upload_files_to_container`
+    // open their dialog from Rust instead, so for them the policy above is
+    // defence in depth and for these two it is the boundary itself.
     // The name is taken from the path the user actually dropped, *before*
     // resolution. Deriving it from the resolved path renames the file behind
     // the user's back: dropping `~/Downloads/latest.log`, where `latest.log` is
@@ -222,8 +225,9 @@ pub async fn upload_host_file_to_terminal(
     // with no writer, with no timeout anywhere on this path. The upload then
     // never returns, the toast sticks on "Adding N files…" for the session and
     // the rest of the batch is abandoned. Sockets and device nodes are the same
-    // shape. With the Files tab's upload removed, this is the only route for
-    // getting a file into a container, so it is the wrong place to be clever.
+    // shape. This is one of two routes for getting a host file into a
+    // container (the Files pane's upload is the other), so it is the wrong
+    // place to be clever.
     if !meta.is_file() {
         return Err(if meta.is_dir() {
             format!("{} is a directory — drop individual files", host_path)
@@ -260,7 +264,13 @@ pub async fn upload_host_file_to_terminal(
     .await?;
 
     let file_name = format!("triple-c-drops/{}", base);
-    crate::docker::exec::upload_host_file_to_container(&container_id, &host_path, &file_name).await
+    crate::docker::exec::upload_host_file_to_container(
+        &container_id,
+        &host_path,
+        "/tmp",
+        &file_name,
+    )
+    .await
 }
 
 #[tauri::command]

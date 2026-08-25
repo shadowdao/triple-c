@@ -6,12 +6,16 @@ import type { FileEntry } from "../lib/types";
 const listContainerFiles = vi.fn();
 const renameContainerPath = vi.fn();
 const createContainerDirectory = vi.fn();
+const uploadFilesToContainer = vi.fn();
+const downloadContainerFile = vi.fn();
 
 vi.mock("../lib/tauri-commands", () => ({
   listContainerFiles: (p: string, path: string) => listContainerFiles(p, path),
   renameContainerPath: (p: string, f: string, t: string) => renameContainerPath(p, f, t),
   createContainerDirectory: (p: string, parent: string, n: string) =>
     createContainerDirectory(p, parent, n),
+  uploadFilesToContainer: (p: string, dir: string) => uploadFilesToContainer(p, dir),
+  downloadContainerFile: (p: string, path: string) => downloadContainerFile(p, path),
   readContainerFile: vi.fn(),
 }));
 
@@ -45,6 +49,8 @@ const file = (name: string, extra: Partial<FileEntry> = {}): FileEntry => ({
 beforeEach(() => {
   vi.clearAllMocks();
   listContainerFiles.mockResolvedValue([file("a.txt")]);
+  uploadFilesToContainer.mockResolvedValue({ uploaded: [], failures: [] });
+  downloadContainerFile.mockResolvedValue(0);
 });
 
 describe("useFileManager navigation", () => {
@@ -290,5 +296,228 @@ describe("useFileManager surfaces written refusals as prose", () => {
 
     expect(lastToast().message).toBe('Could not create "new"');
     expect(lastToast().detail).toBe("no space left on device");
+  });
+});
+
+/**
+ * Both of these actions are *dialog-driven from Rust* — the hook passes a
+ * project and a directory and gets back an answer, and there is deliberately no
+ * host path anywhere in this file. What is worth pinning is the vocabulary of
+ * that answer, because two of its values look like failure and are not: `null`
+ * means the user dismissed the picker, and `0` bytes means an empty file was
+ * saved successfully.
+ */
+describe("useFileManager saving to the host", () => {
+  it("treats a zero-byte save as a success", async () => {
+    // The bug this exists for: `if (!bytes) return` reads a genuine
+    // zero-length file — an empty `.gitkeep`, a truncated log — as a
+    // dismissal, so the file lands on the host and the app says nothing at
+    // all. The sentinel is `null`, and only `null`.
+    downloadContainerFile.mockResolvedValueOnce(0);
+    const { result } = renderHook(() => useFileManager("p1"));
+    await act(async () => {
+      await result.current.saveToHost(file("empty.txt"));
+    });
+    expect(result.current.completed).toContain("empty.txt");
+    expect(pushToast).not.toHaveBeenCalled();
+  });
+
+  it("says nothing at all when the dialog is dismissed", async () => {
+    downloadContainerFile.mockResolvedValueOnce(null);
+    const { result } = renderHook(() => useFileManager("p1"));
+    await act(async () => {
+      await result.current.saveToHost(file("a.txt"));
+    });
+    expect(result.current.completed).toBeNull();
+    expect(pushToast).not.toHaveBeenCalled();
+  });
+
+  it("names the file in a refusal", async () => {
+    downloadContainerFile.mockRejectedValueOnce("/etc/shadow is not readable");
+    const { result } = renderHook(() => useFileManager("p1"));
+    await act(async () => {
+      await result.current.saveToHost(file("secret.txt"));
+    });
+    expect(toastText()).toContain("secret.txt");
+  });
+});
+
+describe("useFileManager uploading from the host", () => {
+  it("uploads into the directory on screen and shows the result", async () => {
+    uploadFilesToContainer.mockResolvedValueOnce({
+      uploaded: ["/workspace/app/one.txt", "/workspace/app/two.txt"],
+      failures: [],
+    });
+    const { result } = renderHook(() => useFileManager("p1"));
+    await act(async () => {
+      await result.current.navigate("/workspace/app");
+    });
+    listContainerFiles.mockClear();
+    await act(async () => {
+      await result.current.uploadFiles();
+    });
+    expect(uploadFilesToContainer).toHaveBeenCalledWith("p1", "/workspace/app");
+    expect(result.current.completed).toContain("2 files");
+    // The directory is named. `target` is captured at click time and the
+    // picker is a modal dialog, so "Uploaded 2 files." on its own can be shown
+    // in front of a grid those files are not in.
+    expect(result.current.completed).toContain("/workspace/app");
+    // The new files are only on screen if the listing was asked for again.
+    expect(listContainerFiles).toHaveBeenCalledWith("p1", "/workspace/app");
+  });
+
+  it("reports every file that failed, not just a count", async () => {
+    // "3 of 5 uploaded" without naming the two is not a report — the user
+    // cannot tell which ones to retry, or why.
+    uploadFilesToContainer.mockResolvedValueOnce({
+      uploaded: ["/workspace/ok.txt"],
+      failures: [
+        "/home/j/Pictures is a folder — upload its files individually.",
+        "/home/j/vm.img is too large to upload (900 MB; limit 256 MB).",
+      ],
+    });
+    const { result } = renderHook(() => useFileManager("p1"));
+    await act(async () => {
+      await result.current.uploadFiles();
+    });
+    expect(pushToast).toHaveBeenCalledTimes(2);
+    expect(toastText()).toContain("is a folder");
+    expect(toastText()).toContain("too large");
+    // A partial batch still succeeded partially, and the pane must show it.
+    expect(result.current.completed).toContain("1 file");
+  });
+
+  it("does not refresh when the picker was dismissed", async () => {
+    uploadFilesToContainer.mockResolvedValueOnce(null);
+    const { result } = renderHook(() => useFileManager("p1"));
+    await act(async () => {
+      await result.current.navigate("/workspace/app");
+    });
+    listContainerFiles.mockClear();
+    await act(async () => {
+      await result.current.uploadFiles();
+    });
+    expect(listContainerFiles).not.toHaveBeenCalled();
+    expect(pushToast).not.toHaveBeenCalled();
+    expect(result.current.completed).toBeNull();
+  });
+
+  it("reports a refusal that happened before the picker once, not per file", async () => {
+    // No container, not running, or a directory this pane may not write to.
+    // There is no selection yet, so there is nothing to enumerate.
+    uploadFilesToContainer.mockRejectedValueOnce(
+      "Start the project before uploading files — it runs inside the running container.",
+    );
+    const { result } = renderHook(() => useFileManager("p1"));
+    await act(async () => {
+      await result.current.uploadFiles();
+    });
+    expect(pushToast).toHaveBeenCalledTimes(1);
+    expect(toastText()).toContain("Start the project");
+  });
+
+  it("does not drag the pane back when the user navigated during the upload", async () => {
+    // The same rule rename and new-folder follow: a slow operation must not
+    // relist a directory the user has already left.
+    let release: (v: unknown) => void = () => {};
+    uploadFilesToContainer.mockReturnValueOnce(
+      new Promise((resolve) => {
+        release = resolve;
+      }),
+    );
+    const { result } = renderHook(() => useFileManager("p1"));
+    await act(async () => {
+      await result.current.navigate("/workspace/app");
+    });
+    let uploading: Promise<void>;
+    act(() => {
+      uploading = result.current.uploadFiles();
+    });
+    await act(async () => {
+      await result.current.navigate("/workspace/other");
+    });
+    listContainerFiles.mockClear();
+    await act(async () => {
+      release({ uploaded: ["/workspace/app/one.txt"], failures: [] });
+      await uploading;
+    });
+    expect(listContainerFiles).not.toHaveBeenCalled();
+    expect(result.current.currentPath).toBe("/workspace/other");
+  });
+});
+
+describe("useFileManager transfer state", () => {
+  it("marks an upload in flight for as long as it runs", async () => {
+    // Without this the button stays live: a second click opens a second OS
+    // dialog and runs a second concurrent exec, and a slow transfer looks
+    // exactly like a click that did nothing.
+    let release: (v: unknown) => void = () => {};
+    uploadFilesToContainer.mockReturnValueOnce(
+      new Promise((resolve) => {
+        release = resolve;
+      }),
+    );
+    const { result } = renderHook(() => useFileManager("p1"));
+    expect(result.current.uploading).toBe(false);
+    let uploading: Promise<void>;
+    act(() => {
+      uploading = result.current.uploadFiles();
+    });
+    expect(result.current.uploading).toBe(true);
+    await act(async () => {
+      release({ uploaded: [], failures: [] });
+      await uploading;
+    });
+    expect(result.current.uploading).toBe(false);
+  });
+
+  it("clears the upload flag when the transfer fails", async () => {
+    // The `catch` returns early, so without a `finally` the button is disabled
+    // for the rest of the session — the failure mode is a pane that can never
+    // upload again, with no error left on screen to explain it.
+    uploadFilesToContainer.mockRejectedValueOnce("Start the project first");
+    const { result } = renderHook(() => useFileManager("p1"));
+    await act(async () => {
+      await result.current.uploadFiles();
+    });
+    expect(result.current.uploading).toBe(false);
+  });
+
+  it("marks only the row being saved, and clears it on failure", async () => {
+    let release: (v: unknown) => void = () => {};
+    downloadContainerFile.mockReturnValueOnce(
+      new Promise((resolve) => {
+        release = resolve;
+      }),
+    );
+    const { result } = renderHook(() => useFileManager("p1"));
+    expect(result.current.savingPath).toBeNull();
+    let saving: Promise<void>;
+    act(() => {
+      saving = result.current.saveToHost(file("a.txt"));
+    });
+    // The path, not a boolean — the rest of the pane stays usable.
+    expect(result.current.savingPath).toBe("/workspace/a.txt");
+    await act(async () => {
+      release(10);
+      await saving;
+    });
+    expect(result.current.savingPath).toBeNull();
+
+    downloadContainerFile.mockRejectedValueOnce("Permission denied");
+    await act(async () => {
+      await result.current.saveToHost(file("b.txt"));
+    });
+    expect(result.current.savingPath).toBeNull();
+
+    // And on dismissal, which is the path that actually needs the `finally`:
+    // the dismissal check `return`s from inside the `try`, so a clear placed
+    // after the block instead is skipped and the row reads "Saving…" for the
+    // rest of the session with nothing running behind it.
+    downloadContainerFile.mockResolvedValueOnce(null);
+    await act(async () => {
+      await result.current.saveToHost(file("c.txt"));
+    });
+    expect(result.current.savingPath).toBeNull();
   });
 });

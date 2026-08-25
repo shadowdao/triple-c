@@ -144,15 +144,16 @@ export default function FileViewerModal({ projectId, entry, onClose }: Props) {
 
       {preview.kind === "too-large" && (
         <p className="text-[13px] text-[var(--text-secondary)]">
-          This file is {formatBytes(entry.size)} — too large to preview in the app. Open it
-          from a terminal in the container, or take a backup and open it on the host.
+          This file is {formatBytes(entry.size)} — too large to preview in the app. Use
+          “Save to host…” on its row to open it in a program that can, or read it from a
+          terminal in the container.
         </p>
       )}
 
       {preview.kind === "unsupported" && (
         <p className="text-[13px] text-[var(--text-secondary)]">
-          There is no preview for this file type. Open it from a terminal in the container,
-          or take a backup and open it on the host.
+          There is no preview for this file type. Use “Save to host…” on its row to open it
+          in a program that can, or read it from a terminal in the container.
         </p>
       )}
 

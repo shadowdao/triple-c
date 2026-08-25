@@ -330,29 +330,58 @@ impl ExecSessionManager {
 /// meant a moment earlier.
 pub const MAX_DROP_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Upload a host file into the container's `/tmp` under `dest_name`. The file is
+/// Upload a host file into `dest_dir` under `dest_name`. The file is
 /// read and packed into the tar inside a blocking task, so the synchronous IO
 /// runs off the async worker. The tar's declared entry size is taken from the
 /// bytes actually read (not a separate `stat`), so a file changing size between
 /// a size check and the read can't desync the header and corrupt the archive.
-/// Returns the in-container path (`/tmp/<dest_name>`).
+/// Returns the in-container path (`<dest_dir>/<dest_name>`).
+///
+/// `dest_dir` must already exist and must already have been checked by the
+/// caller — Docker's archive extractor writes wherever it is pointed. The two
+/// callers both do that first, by different routes because they are answering
+/// different questions: the terminal drop stages into a fixed `/tmp` path it
+/// creates itself, and the Files pane passes the directory the user is looking
+/// at, which `file_commands::resolve_container_dir` has already confirmed
+/// resolves inside `CONTAINER_WRITE_ROOTS`.
 pub async fn upload_host_file_to_container(
     container_id: &str,
     host_path: &str,
+    dest_dir: &str,
     dest_name: &str,
+) -> Result<String, String> {
+    let ids = container_user_ids(container_id).await;
+    upload_host_file_with_ids(container_id, host_path, dest_dir, dest_name, ids).await
+}
+
+/// [`upload_host_file_to_container`] for a caller that already knows the
+/// container user's ids.
+///
+/// `container_user_ids` is a `docker exec`, and the Files pane's upload is a
+/// *selection* — one dialog can hand back twenty files. Resolving the ids per
+/// file made twenty extra round trips to answer the same `id -u` twenty times,
+/// which is seconds of latency for a fact that cannot change inside one
+/// container's lifetime. So the loop resolves once and passes the answer in.
+/// The wrapper above keeps the single-file callers unchanged.
+pub async fn upload_host_file_with_ids(
+    container_id: &str,
+    host_path: &str,
+    dest_dir: &str,
+    dest_name: &str,
+    (uid, gid): (u64, u64),
 ) -> Result<String, String> {
     let host_path = host_path.to_string();
     let dest_name = dest_name.to_string();
     let dest_for_blk = dest_name.clone();
-    let (uid, gid) = container_user_ids(container_id).await;
     let mtime = now_epoch_secs();
 
     let tar_buf = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
         // The caller resolved this path (`resolve_host_read_path`); opening it
         // is a second trip through the same directories, so the descriptor is
         // checked against the path that was validated before its bytes are
-        // packed into anything. This is the terminal's drop target, and it is
-        // the only path by which host bytes enter a container.
+        // packed into anything. Two paths reach here: the terminal's drop
+        // target, and the Files pane's upload via `upload_host_file_with_ids`.
+        // Between them they are how host bytes enter a container.
         let file = std::fs::File::open(&host_path)
             .map_err(|e| format!("Failed to read {}: {}", host_path, e))?;
         crate::commands::file_commands::verify_opened_path(
@@ -381,7 +410,7 @@ pub async fn upload_host_file_to_container(
         .upload_to_container(
             container_id,
             Some(UploadToContainerOptions {
-                path: "/tmp".to_string(),
+                path: dest_dir.to_string(),
                 ..Default::default()
             }),
             tar_buf.into(),
@@ -389,7 +418,17 @@ pub async fn upload_host_file_to_container(
         .await
         .map_err(|e| format!("Failed to upload file to container: {}", e))?;
 
-    Ok(format!("/tmp/{}", dest_name))
+    Ok(container_join(dest_dir, &dest_name))
+}
+
+/// Join a container directory to a name that may itself carry separators.
+///
+/// Only the *reported* path — the bytes have already landed by the time this is
+/// called — but that path is what the terminal echoes and what the Files pane
+/// puts in its toast, so `/tmp//x` reading back as a different file than `/tmp/x`
+/// is worth the four lines. `"/"` trims to `""` and yields `/x`.
+fn container_join(dir: &str, name: &str) -> String {
+    format!("{}/{}", dir.trim_end_matches('/'), name.trim_start_matches('/'))
 }
 
 /// Write `data` into the container at `<dest_dir>/<file_name>` with `mode`.
@@ -891,5 +930,26 @@ mod tests {
         assert!(PROC_NET_OUTPUT_LIMIT < MAX_ONESHOT_OUTPUT);
         // …but still comfortably above a genuine /proc/net/tcp{,6} pair.
         assert!(PROC_NET_OUTPUT_LIMIT > 100 * 150);
+    }
+
+    /// The reported path, which is what the terminal echoes back to Claude and
+    /// what the Files pane puts in its log line. `/tmp//x` and `/tmp/x` are the
+    /// same file to the kernel and different strings to a person reading either
+    /// of those.
+    #[test]
+    fn container_join_produces_one_separator() {
+        assert_eq!(container_join("/tmp", "a.txt"), "/tmp/a.txt");
+        // The terminal's drop passes a nested name; it must not gain a second
+        // slash at the seam.
+        assert_eq!(
+            container_join("/tmp", "triple-c-drops/a.txt"),
+            "/tmp/triple-c-drops/a.txt"
+        );
+        // A directory the user navigated to can carry a trailing slash, and the
+        // container root is the case where trimming it must not eat the only
+        // separator there is.
+        assert_eq!(container_join("/workspace/", "a.txt"), "/workspace/a.txt");
+        assert_eq!(container_join("/", "a.txt"), "/a.txt");
+        assert_eq!(container_join("/", "/a.txt"), "/a.txt");
     }
 }
