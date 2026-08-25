@@ -4177,7 +4177,12 @@ mod tests {
         // It goes into `triple-c.custom-env-fingerprint`, which `docker inspect`
         // hands to anything on the host, `docker commit` copies onto the
         // project's snapshot image, and the recreation check logs on a mismatch.
-        let secret = "33da01c1b320644920c20d6b5e0a1c6b3c3451c2";
+        // **Never a real credential.** This literal was the maintainer's actual
+        // Gitea token for fourteen days and ninety-two commits, on a public
+        // mirror — in a test whose whole subject is that secrets do not escape.
+        // A fixture only has to be *a value*; it never has to be a live one, so
+        // there is no version of this that justifies pasting something real.
+        let secret = "not-a-real-token-0000000000000000000000";
         let fp = compute_env_fingerprint(&[EnvVar {
             key: "TEA_TOKEN".to_string(),
             value: secret.to_string(),
