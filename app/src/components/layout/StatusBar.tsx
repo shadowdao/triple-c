@@ -23,6 +23,11 @@ export default function StatusBar({ stt }: Props) {
     }))
   );
   const running = projects.filter((p) => p.status === "running").length;
+  // Only in a Claude tab: the chord is bound there and nowhere else, and a hint
+  // for a key that does nothing is worse than no hint.
+  const inClaudeSession = sessions.some(
+    (s) => s.id === activeSessionId && s.sessionType === "claude",
+  );
 
   return (
     <div className="flex items-center h-6 px-4 bg-[var(--bg-tertiary)] border border-[var(--border-color)] rounded-[var(--radius-panel)] text-xs text-[var(--text-secondary)]">
@@ -42,6 +47,14 @@ export default function StatusBar({ stt }: Props) {
           <span className="mx-2">|</span>
           <span className="text-[var(--accent)]">
             Ctrl+Shift+C: copy trimmed &middot; Ctrl+Shift+Alt+C: copy raw
+          </span>
+        </>
+      )}
+      {!terminalHasSelection && inClaudeSession && (
+        <>
+          <span className="mx-2">|</span>
+          <span title="Sends ESC+CR — the sequence Claude Code's own /terminal-setup installs. Alt+Enter does the same.">
+            Shift+Enter: newline
           </span>
         </>
       )}

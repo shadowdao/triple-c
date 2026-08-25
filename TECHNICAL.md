@@ -436,7 +436,7 @@ triple-c/
     │   │   ├── useClaudeAuth.ts   # Shared token status + acquisition
     │   │   ├── useContainerProgress.ts # container-progress events → inline progress
     │   │   ├── useDocker.ts       # Docker status, image build/pull
-    │   │   ├── useFileManager.ts  # File browser operations
+    │   │   ├── useFileManager.ts  # File browser operations + host transfers
     │   │   ├── useInstallHelper.ts # Guided Docker installation
     │   │   ├── useKeyboardShortcuts.ts # Ctrl+T / Ctrl+Shift+W / Ctrl+Tab / Ctrl+1..9
     │   │   ├── useProjectActions.ts # Start/stop/reset/backup, open terminals
@@ -464,7 +464,7 @@ triple-c/
     │       │   │   ├── SessionsTab.tsx   # Past Claude sessions + Resume
     │       │   │   ├── AutomationTab.tsx # Scheduler tasks + notifications
     │       │   │   ├── ConfigTab.tsx     # Config section host
-    │       │   │   ├── FilesTab.tsx      # In-container file browser
+    │       │   │   ├── FilesTab.tsx      # In-container file browser, upload / save to host
     │       │   │   ├── CapabilityTiles.tsx # Read-only capability counts
     │       │   │   ├── format.ts         # Age / size / uptime formatting
     │       │   │   └── config/           # WorkspaceSection, ModelSection,
@@ -504,7 +504,7 @@ triple-c/
             │   ├── auth_token_commands.rs   # claude setup-token flow, redaction, keychain
             │   ├── aws_commands.rs          # AWS profile/region discovery
             │   ├── docker_commands.rs       # Docker status, image ops
-            │   ├── file_commands.rs         # File browser (list/download/upload)
+            │   ├── file_commands.rs         # File browser + host transfers (Rust-opened dialogs)
             │   ├── help_commands.rs         # Serves HOW-TO-USE.md to the Help dialog
             │   ├── inspect_commands.rs      # Sessions, capabilities, scheduler tasks
             │   ├── install_helper_commands.rs # Guided Docker installation

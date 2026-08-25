@@ -24,17 +24,128 @@
  * When a URL match extends to the end of the flattened buffer, emission is
  * deferred (more chunks may still be arriving). A confirmation timer emits
  * the pending URL if no further data arrives within 500 ms.
+ *
+ * ## OSC 8 comes first, and the scraping is the fallback
+ *
+ * Everything above is guesswork over what a terminal *painted*. When the
+ * program emits an **OSC 8 hyperlink** there is no guesswork to do: the
+ * complete URL is in the sequence's parameter, contiguous and exact, however
+ * the visible text was sliced.
+ *
+ * That distinction is the whole reason this file grew a second branch. Claude
+ * Code prints its sign-in link as an OSC 8 hyperlink whose *visible* text is
+ * cut into terminal-width pieces on separate lines — measured against 2.1.226,
+ * a 346-character URL arrives as five emissions, each carrying the whole URL in
+ * its parameter and 80 characters of it on screen. `ANSI_RE` strips OSC
+ * sequences wholesale, so the scraper never saw the parameter and reassembled
+ * the visible pieces instead: a URL that parses, that points at claude.com, and
+ * that cannot authorise anything. The backend hit this first and solved it the
+ * same way — see `commands/auth_token_commands.rs`, whose `osc8_target` and
+ * `usable_sign_in_link` this mirrors.
+ *
+ * So each emitted candidate is tagged with where it came from, and the consumer
+ * refuses to let a `heuristic` candidate displace an `osc8` one.
+ *
+ * ## …and the exact copy keeps winning after the prompt is gone
+ *
+ * The consumer's precedence rule only compares a new candidate against what is
+ * *currently* in the prompt slot. Empty the slot — the user dismisses the
+ * toast, or its 30 s auto-dismiss fires — and it has nothing to compare
+ * against, so the next truncated guess walks straight in. Meanwhile the OSC 8
+ * target is deduped for the life of the session and cannot come back to
+ * displace it. The user is then holding a URL that parses, points at
+ * claude.ai, and authorises nothing, which is the exact bug the OSC 8 branch
+ * was added to kill.
+ *
+ * That is fixed *here* rather than in the consumer, because this is the side
+ * that knows both halves: {@link UrlDetector} remembers every exact URL it has
+ * seen and refuses to emit a heuristic candidate that is a strict prefix of
+ * one — see `truncatesKnownExact`. The rule then holds however often the slot
+ * is emptied, and needs no cooperation from whoever owns it.
  */
+
+import { extendsUrl } from "./urlRelay";
 
 const ANSI_RE =
   /\x1b(?:\[[0-9;?]*[A-Za-z]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[()#][A-Za-z0-9]|.)/g;
+
+/**
+ * OSC 8 hyperlink: `ESC ] 8 ; <params> ; <uri> (BEL | ESC \\)`.
+ *
+ * The params field is `key=value` pairs separated by `:`, never `;`, so the
+ * first `;` after the `8;` ends it — the same split `osc8_target` makes in
+ * Rust. The closing half of a hyperlink is `8;;` with an empty uri.
+ */
+// eslint-disable-next-line no-control-regex
+const OSC8_RE = /\x1b\]8;([^;\x07\x1b]*);([^\x07\x1b]*)(?:\x07|\x1b\\)/g;
 
 const MAX_BUFFER = 8 * 1024; // 8 KB rolling buffer cap
 const DEBOUNCE_MS = 300;
 const CONFIRM_MS = 500; // extra wait when URL reaches end of buffer
 const MIN_URL_LENGTH = 100;
 
-export type UrlCallback = (url: string) => void;
+/** Mirrors `MAX_LINK_LENGTH` in `commands/auth_token_commands.rs`. */
+const MAX_LINK_LENGTH = 8192;
+
+/** Bound on remembered OSC 8 targets, so a program printing a fresh hyperlink
+ *  every frame cannot grow this without limit. */
+const MAX_REMEMBERED_LINKS = 32;
+
+/**
+ * Where a candidate came from, which is the same thing as how much it can be
+ * trusted to be *complete*.
+ *
+ * `osc8` is lifted verbatim out of a hyperlink parameter; `heuristic` was
+ * reassembled from painted text and may be a truncated guess. The consumer
+ * uses this to decide precedence — see `promptUrl` in `TerminalView.tsx`.
+ */
+export type UrlSource = "osc8" | "heuristic";
+
+export type UrlCallback = (url: string, source: UrlSource) => void;
+
+/**
+ * Whether an OSC 8 target is worth offering as a candidate at all.
+ *
+ * A direct port of `usable_sign_in_link` in
+ * `commands/auth_token_commands.rs`, and deliberately just as shallow: this is
+ * a junk filter, not the security decision. `sanitizeRelayUrl` is still the
+ * only thing standing between any of this and `openUrl`, and duplicating its
+ * rules here would be a second place for them to go stale.
+ *
+ * The one rule from the Rust that is not ported is its `sk-ant-` check: that
+ * exists because the backend's link path bypasses `SecretRedactor`, and there
+ * is no redactor on this side to bypass.
+ */
+export function usableLink(uri: string): boolean {
+  if (!uri.startsWith("https://") && !uri.startsWith("http://")) return false;
+  if (uri.length > MAX_LINK_LENGTH) return false;
+  // Printable ASCII only. Control characters and whitespace are exactly how a
+  // URL is smuggled past a display, and `new URL()` strips some of them
+  // silently; a real authorize URL is percent-encoded anyway.
+  for (let i = 0; i < uri.length; i++) {
+    const code = uri.charCodeAt(i);
+    if (code < 0x21 || code > 0x7e) return false;
+  }
+  return true;
+}
+
+/**
+ * Every usable OSC 8 hyperlink target in `raw`, in the order they were emitted.
+ *
+ * Takes the *unstripped* stream: `ANSI_RE` deletes OSC sequences wholesale, so
+ * by the time the buffer is clean the parameter this reads is already gone.
+ */
+export function osc8Targets(raw: string): string[] {
+  const out: string[] = [];
+  OSC8_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = OSC8_RE.exec(raw)) !== null) {
+    const uri = m[2];
+    // `8;;` closes a hyperlink and carries no target.
+    if (uri && usableLink(uri)) out.push(uri);
+  }
+  return out;
+}
 
 /**
  * How wide the terminal is right now.
@@ -61,7 +172,13 @@ export type ColumnsGetter = () => number;
  * confirmed by the user before anything opens.
  */
 export function flatten(clean: string, columns: number): string {
-  const lines = clean.split(/\r?\n/);
+  // A bare `\r` is a break too. A TUI repaints a frame by returning to column
+  // 0 without a line feed, so splitting on `\r?\n` alone leaves a whole
+  // frame's worth of text on one "line" — which is then far longer than
+  // `columns`, so the `===` test below says "not wrapped" and a URL the
+  // terminal really did cut is never rejoined. Splitting here is also what the
+  // backend does with a lone CR (`strip_ansi_prefix`), for the same reason.
+  const lines = clean.split(/\r\n|\r|\n/);
   let out = "";
   for (let i = 0; i < lines.length; i++) {
     out += lines[i];
@@ -84,6 +201,35 @@ export class UrlDetector {
   private pendingUrl: string | null = null;
   private callback: UrlCallback;
   private columns: ColumnsGetter;
+  /**
+   * The width in effect when the buffered bytes were *printed*, sampled in
+   * `feed`.
+   *
+   * Not read in `scan`, which is where it used to be read: the scan happens
+   * 300 ms after the print, and a resize inside that window would reassemble
+   * text wrapped at 80 columns using a width of 120 — every join decision
+   * wrong, and a fabricated URL out the other end. `-1` means "nothing fed
+   * yet".
+   */
+  private feedColumns = -1;
+  /** OSC 8 targets already offered, so a hyperlink repainted every frame does
+   *  not re-prompt. Bounded by {@link MAX_REMEMBERED_LINKS}. */
+  private emittedLinks = new Set<string>();
+  /**
+   * Every *exact* URL this session has seen — OSC 8 parameters, plus whatever
+   * the consumer reports through {@link noteExactUrl} (the OSC 7777 relay).
+   *
+   * Kept separately from `emittedLinks` because the two answer different
+   * questions: that one is "have I already prompted for this?", this one is "do
+   * I know the full text of a link some guess might be a prefix of?". The
+   * second answer must survive the prompt being dismissed; the whole defect is
+   * that a truncated guess fills the slot the moment it is empty.
+   *
+   * Bounded the same way, and cleared wholesale rather than evicted one by one:
+   * a program printing a fresh hyperlink every frame is not a program whose
+   * older links are still on screen to be mis-scraped.
+   */
+  private exactUrls = new Set<string>();
 
   constructor(callback: UrlCallback, columns: ColumnsGetter) {
     this.callback = callback;
@@ -92,6 +238,18 @@ export class UrlDetector {
 
   /** Feed raw PTY output chunks. */
   feed(data: Uint8Array): void {
+    const columns = this.columns();
+    if (this.feedColumns !== -1 && columns !== this.feedColumns) {
+      // The buffered text was wrapped at a width that no longer applies, and
+      // the new text will be wrapped at this one. There is no single width
+      // that reassembles both, so the older half is dropped rather than
+      // joined by a rule that is now wrong for it. Costs a URL that was
+      // mid-print across a resize; never invents one.
+      this.buffer = "";
+      this.pendingUrl = null;
+    }
+    this.feedColumns = columns;
+
     this.buffer += this.decoder.decode(data, { stream: true });
 
     // Cap buffer to avoid unbounded growth
@@ -114,11 +272,19 @@ export class UrlDetector {
   }
 
   private scan(): void {
+    // 0. The exact copy first. An OSC 8 parameter needs no reassembly, so
+    //    anything found here beats whatever the steps below reconstruct — and
+    //    it has to be read from the raw buffer, because step 1 deletes the
+    //    sequence that carries it.
+    this.scanLinks();
+
     // 1. Strip ANSI escape sequences
     const clean = this.buffer.replace(ANSI_RE, "");
 
     // 2. Flatten the buffer: rejoin hard wraps, terminate on everything else.
-    const flat = flatten(clean, this.columns());
+    //    The width is the one that was in effect when these bytes were
+    //    printed, not the one the terminal happens to have now.
+    const flat = flatten(clean, this.feedColumns);
 
     if (!flat) return;
 
@@ -153,9 +319,9 @@ export class UrlDetector {
 
       // 6. URL is clearly complete (more content follows) — dedup + emit
       this.pendingUrl = null;
-      if (url !== this.lastEmitted) {
+      if (url !== this.lastEmitted && !this.truncatesKnownExact(url)) {
         this.lastEmitted = url;
-        this.callback(url);
+        this.callback(url, "heuristic");
       }
     }
 
@@ -166,12 +332,88 @@ export class UrlDetector {
     }
   }
 
+  /**
+   * Offer every OSC 8 target in the buffer that has not been offered before.
+   *
+   * `lastEmitted` is moved along with them so an identical string arriving on
+   * the heuristic path a moment later is recognised as the same candidate
+   * rather than fired a second time.
+   *
+   * Every target is remembered as exact whether or not it is offered — a
+   * hyperlink repainted a second time is the same known link, and the dedup
+   * that stops it re-prompting must not also stop it counting as something a
+   * later guess can be a truncation of.
+   *
+   * The alternative fix considered here was to make this dedup *releasable*,
+   * so the consumer could hand the exact URL back and have it re-offered once
+   * the prompt slot emptied. Rejected: it re-offers on the very next repaint,
+   * so dismissing the toast would put it straight back on screen — and it
+   * still would not establish the invariant, because a truncated guess and the
+   * released exact URL would simply race for the empty slot.
+   */
+  private scanLinks(): void {
+    for (const uri of osc8Targets(this.buffer)) {
+      if (uri.length < MIN_URL_LENGTH) continue;
+      this.rememberExact(uri);
+      if (this.emittedLinks.has(uri)) continue;
+      if (this.emittedLinks.size >= MAX_REMEMBERED_LINKS) {
+        this.emittedLinks.clear();
+      }
+      this.emittedLinks.add(uri);
+      this.lastEmitted = uri;
+      this.callback(uri, "osc8");
+    }
+  }
+
   private emitPending(): void {
-    if (this.pendingUrl && this.pendingUrl !== this.lastEmitted) {
+    if (
+      this.pendingUrl &&
+      this.pendingUrl !== this.lastEmitted &&
+      !this.truncatesKnownExact(this.pendingUrl)
+    ) {
       this.lastEmitted = this.pendingUrl;
-      this.callback(this.pendingUrl);
+      this.callback(this.pendingUrl, "heuristic");
     }
     this.pendingUrl = null;
+  }
+
+  /**
+   * Whether `url` is a strict prefix of an exact URL already seen — i.e. a
+   * truncated guess at a link whose full text is known.
+   *
+   * {@link extendsUrl} is the predicate, used in the direction that asks "does
+   * the link I already have *extend* this guess?". It is the same rule the
+   * prompt slot uses to let a candidate grow into its complete form, which is
+   * the point: the two must agree about what "the same link, only shorter"
+   * means, so there is one implementation of it.
+   *
+   * Deliberately *not* symmetric. A candidate that is longer than a known exact
+   * URL and starts with it is a different problem (text glued onto the end by a
+   * wrap that was not a wrap), and it is still shown in full and confirmed by
+   * the user before anything opens.
+   */
+  private truncatesKnownExact(url: string): boolean {
+    for (const exact of this.exactUrls) {
+      if (extendsUrl(exact, url)) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Record a URL that arrived somewhere exact, outside this detector.
+   *
+   * The OSC 7777 relay hands `TerminalView` a base64-encoded URL — exact by
+   * construction, and never seen here. Without this the suppression rule above
+   * would cover hyperlinks and miss the relay, and a dismissed relay prompt
+   * could still be replaced by a truncated scrape of the same link.
+   */
+  noteExactUrl(url: string): void {
+    this.rememberExact(url);
+  }
+
+  private rememberExact(url: string): void {
+    if (this.exactUrls.size >= MAX_REMEMBERED_LINKS) this.exactUrls.clear();
+    this.exactUrls.add(url);
   }
 
   dispose(): void {

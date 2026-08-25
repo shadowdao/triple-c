@@ -196,31 +196,64 @@ pub async fn upload_host_file_to_terminal(
     host_path: String,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
+    // The drop target is a host path chosen by the webview, not by the OS drag
+    // itself, so it goes through `file_commands`' host-read policy: absolute,
+    // no traversal, and nothing whose path passes through a hidden directory
+    // (`~/.ssh`, `~/.aws`, `~/.local/bin`) or a system location — applied to
+    // the path with its symlinks already resolved, so a visible directory that
+    // *leads* to one of those is refused too. What comes back is that resolved
+    // path, and it is what gets opened. Four commands touch a host path now,
+    // but only two take it *over IPC*: this one and `download_container_backup`.
+    // The Files pane's `download_container_file` and `upload_files_to_container`
+    // open their dialog from Rust instead, so for them the policy above is
+    // defence in depth and for these two it is the boundary itself.
+    // The name is taken from the path the user actually dropped, *before*
+    // resolution. Deriving it from the resolved path renames the file behind
+    // the user's back: dropping `~/Downloads/latest.log`, where `latest.log` is
+    // a symlink, would land it in the container as `2026-08-23.log`.
+    let base = crate::commands::file_commands::host_upload_name(&host_path)?;
+    let host_path = crate::commands::file_commands::resolve_host_read_path(&host_path).await?;
+
     let container_id = state.exec_manager.get_container_id(&session_id).await?;
 
     let meta = tokio::fs::metadata(&host_path)
         .await
         .map_err(|e| format!("Cannot access {}: {}", host_path, e))?;
-    if meta.is_dir() {
-        return Err(format!("{} is a directory — drop individual files", host_path));
+    // `!is_file()`, not `!is_dir()`. A FIFO is neither a directory nor a
+    // regular file, reports `len() == 0`, and passes both the directory check
+    // and the size cap below — and `std::fs::File::open` on one blocks forever
+    // with no writer, with no timeout anywhere on this path. The upload then
+    // never returns, the toast sticks on "Adding N files…" for the session and
+    // the rest of the batch is abandoned. Sockets and device nodes are the same
+    // shape. This is one of two routes for getting a host file into a
+    // container (the Files pane's upload is the other), so it is the wrong
+    // place to be clever.
+    if !meta.is_file() {
+        return Err(if meta.is_dir() {
+            format!("{} is a directory — drop individual files", host_path)
+        } else {
+            format!(
+                "{} is not a regular file — only ordinary files can be dropped into a terminal",
+                host_path
+            )
+        });
     }
 
     // Guard against ballooning host RAM: the file is packed into an in-memory
-    // tar before upload, so cap the size of a dropped file.
-    const MAX_DROP_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
+    // tar before upload, so cap the size of a dropped file. The ceiling lives
+    // with the code that does the reading, which re-applies it to the open
+    // descriptor — this check is here only so the refusal reads like a sentence
+    // instead of arriving after a 300 MB read.
+    use crate::docker::exec::MAX_DROP_BYTES;
     if meta.len() > MAX_DROP_BYTES {
         return Err(format!(
-            "File too large to drop into the terminal ({:.0} MB; limit {} MB). Mount it into the project or use the Files panel instead.",
+            "File too large to drop into the terminal ({:.0} MB; limit {} MB). Mount it into the project instead.",
             meta.len() as f64 / (1024.0 * 1024.0),
             MAX_DROP_BYTES / (1024 * 1024)
         ));
     }
 
-    let base = std::path::Path::new(&host_path)
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "dropped-file".to_string());
+
 
     // Ensure the destination directory exists rather than relying on Docker's
     // archive extractor to create the parent for the uploaded tar entry.
@@ -231,7 +264,13 @@ pub async fn upload_host_file_to_terminal(
     .await?;
 
     let file_name = format!("triple-c-drops/{}", base);
-    crate::docker::exec::upload_host_file_to_container(&container_id, &host_path, &file_name).await
+    crate::docker::exec::upload_host_file_to_container(
+        &container_id,
+        &host_path,
+        "/tmp",
+        &file_name,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -282,4 +321,38 @@ pub async fn stop_audio_bridge(
     let audio_session_id = format!("audio-{}", session_id);
     state.exec_manager.close_session(&audio_session_id).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// A dropped file must be named the way the *user* named it.
+    ///
+    /// The bug this pins: `upload_host_file_to_terminal` derived the tar entry
+    /// name from the path *after* symlink resolution, so dropping
+    /// `~/Downloads/latest.log` — where `latest.log` is a symlink to
+    /// `2026-08-23.log` — silently landed the file in the container under the
+    /// target's name. Nothing errored; the user just got a name they never
+    /// typed.
+    ///
+    /// This asserts the shared helper's contract from the terminal side: the
+    /// answer comes from the spelling, and a path that does not name a file is
+    /// refused rather than silently substituted (it used to fall back to
+    /// `"dropped-file"`).
+    #[test]
+    fn a_dropped_file_keeps_the_name_the_user_dropped() {
+        use crate::commands::file_commands::host_upload_name;
+
+        assert_eq!(
+            host_upload_name("/home/u/Downloads/latest.log").unwrap(),
+            "latest.log"
+        );
+        assert!(
+            host_upload_name("/home/u/Downloads/").is_err(),
+            "a directory is not a file to drop"
+        );
+        assert!(
+            host_upload_name("/home/u/..").is_err(),
+            "the name becomes a tar entry, a container path and an argv element"
+        );
+    }
 }

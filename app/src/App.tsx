@@ -9,6 +9,7 @@ import DockerInstallDialog from "./components/DockerInstallDialog";
 import ProjectHome from "./components/projects/home/ProjectHome";
 import AddProjectDialog from "./components/projects/AddProjectDialog";
 import ToastHost from "./components/ui/ToastHost";
+import { PaneVisibilityProvider } from "./components/ui/PaneVisibility";
 import StatusIndicator from "./components/ui/StatusIndicator";
 import Button from "./components/ui/Button";
 import { useDocker } from "./hooks/useDocker";
@@ -128,19 +129,34 @@ export default function App() {
             <WelcomeScreen />
           ) : (
             <div className="w-full h-full">
+              {/* Every tab stays mounted and the inactive ones are merely
+                  `hidden`, which a dialog's portal to `document.body` does not
+                  inherit: a confirmation opened in one project stayed painted
+                  over whatever tab the user switched to, kept its focus trap,
+                  and — being a blocking overlay — refused every native file
+                  drop in the window. `PaneVisibilityProvider` is how a `Modal`
+                  inside a pane finds out the pane stepped aside. */}
               {homeProjectIds.map((projectId) => (
-                <ProjectHome
+                <PaneVisibilityProvider
                   key={projectId}
-                  projectId={projectId}
-                  active={activeTabKey === homeTabKey(projectId)}
-                />
+                  visible={activeTabKey === homeTabKey(projectId)}
+                >
+                  <ProjectHome
+                    projectId={projectId}
+                    active={activeTabKey === homeTabKey(projectId)}
+                  />
+                </PaneVisibilityProvider>
               ))}
               {sessions.map((session) => (
-                <TerminalView
+                <PaneVisibilityProvider
                   key={session.id}
-                  sessionId={session.id}
-                  active={session.id === activeSessionId}
-                />
+                  visible={session.id === activeSessionId}
+                >
+                  <TerminalView
+                    sessionId={session.id}
+                    active={session.id === activeSessionId}
+                  />
+                </PaneVisibilityProvider>
               ))}
             </div>
           )}
@@ -156,6 +172,9 @@ export default function App() {
           className="fixed inset-0 z-50 flex items-center justify-center bg-[var(--bg-primary)]/95 backdrop-blur-sm"
           role="status"
           aria-live="polite"
+          /* Covers the whole window, so no pane underneath may accept a
+             native file drop while it is up — see `lib/dropTarget.ts`. */
+          data-blocks-drop="true"
           data-testid="shutdown-overlay"
         >
           <div className="flex flex-col items-center gap-2 px-6 text-center">

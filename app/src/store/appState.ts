@@ -47,6 +47,12 @@ export interface Toast {
   message: string;
   /** Long text (e.g. a bollard error) shown behind a "Details" disclosure. */
   detail?: string;
+  /**
+   * Optional identity for a *recurring* notice. Pushing another toast with the
+   * same key replaces the one already on screen instead of stacking a second
+   * copy of it — three refused file drops leave one card, not three.
+   */
+  dedupeKey?: string;
 }
 
 let toastCounter = 0;
@@ -355,7 +361,14 @@ export const useAppState = create<AppState>((set) => ({
   toasts: [],
   pushToast: (toast) => {
     const id = `toast-${++toastCounter}`;
-    set((state) => ({ toasts: [...state.toasts, { ...toast, id }] }));
+    set((state) => {
+      // A keyed toast supersedes the previous one with that key. The new card
+      // gets a new id, so it re-mounts and its dismissal timer restarts.
+      const kept = toast.dedupeKey
+        ? state.toasts.filter((t) => t.dedupeKey !== toast.dedupeKey)
+        : state.toasts;
+      return { toasts: [...kept, { ...toast, id }] };
+    });
     return id;
   },
   dismissToast: (id) =>

@@ -52,7 +52,13 @@ export interface Project {
    *  certificate file or a directory of them). null falls back to
    *  `AppSettings.ca_cert_path`. Changing it recreates the container. */
   ca_cert_path: string | null;
-  git_token: string | null;
+  /** **Write-only.** Rust marks this `#[serde(skip_serializing)]`, so it is
+   *  absent from every project the backend hands back — reading it gives
+   *  `undefined`, never `null`. Optional here so that is the type, and so a
+   *  `=== null` test against it is a compile error rather than a branch that
+   *  silently never runs. Still sent on the way *in*: this is how the secret
+   *  is set. */
+  git_token?: string | null;
   git_user_name: string | null;
   git_user_email: string | null;
   custom_env_vars: EnvVar[];
@@ -96,11 +102,23 @@ export type BedrockAuthMethod = "static_credentials" | "profile" | "bearer_token
 export interface BedrockConfig {
   auth_method: BedrockAuthMethod;
   aws_region: string;
-  aws_access_key_id: string | null;
-  aws_secret_access_key: string | null;
-  aws_session_token: string | null;
+  /** **Write-only.** Rust marks this `#[serde(skip_serializing)]`, so it is
+   *  absent from every project the backend hands back — reading it gives
+   *  `undefined`, never `null`. Optional here so that is the type, and so a
+   *  `=== null` test against it is a compile error rather than a branch that
+   *  silently never runs. Still sent on the way *in*: this is how the secret
+   *  is set. */
+  aws_access_key_id?: string | null;
+  aws_secret_access_key?: string | null;
+  aws_session_token?: string | null;
   aws_profile: string | null;
-  aws_bearer_token: string | null;
+  /** **Write-only.** Rust marks this `#[serde(skip_serializing)]`, so it is
+   *  absent from every project the backend hands back — reading it gives
+   *  `undefined`, never `null`. Optional here so that is the type, and so a
+   *  `=== null` test against it is a compile error rather than a branch that
+   *  silently never runs. Still sent on the way *in*: this is how the secret
+   *  is set. */
+  aws_bearer_token?: string | null;
   model_id: string | null;
   disable_prompt_caching: boolean;
   service_tier: string | null;
@@ -127,21 +145,45 @@ export interface LlamaCppConfig {
  *  implement the **Anthropic** Messages API — e.g. LiteLLM. */
 export interface OpenAiCompatibleConfig {
   base_url: string;
-  api_key: string | null;
+  /** **Write-only.** Rust marks this `#[serde(skip_serializing)]`, so it is
+   *  absent from every project the backend hands back — reading it gives
+   *  `undefined`, never `null`. Optional here so that is the type, and so a
+   *  `=== null` test against it is a compile error rather than a branch that
+   *  silently never runs. Still sent on the way *in*: this is how the secret
+   *  is set. */
+  api_key?: string | null;
   model_id: string | null;
   /** See `OllamaConfig.haiku_model_id`. */
   haiku_model_id: string | null;
 }
 
+/**
+ * Every field is three-state. `null` means "not set at this level": on a
+ * project that is "inherit the global value", and on the global settings it is
+ * "leave Claude Code's own default alone". `false` is a deliberate off, which
+ * is what lets a project turn a globally-enabled setting back off.
+ *
+ * Every field is optional as well as nullable: the Rust struct skips
+ * serialising a field it has no value for, so an object with nothing set at
+ * this level arrives as `{}`. Absent and `null` mean the same thing, which is
+ * why every read of one of these has to use `== null` rather than `=== null`.
+ */
 export interface ClaudeCodeSettings {
-  tui_mode: string | null;
-  effort: string | null;
-  auto_scroll_disabled: boolean;
-  focus_mode: boolean;
-  show_thinking_summaries: boolean;
-  enable_session_recap: boolean;
-  env_scrub: boolean;
-  prompt_caching_1h: boolean;
+  /** `null` = let Claude Code choose the renderer; `"default"` = classic, `"fullscreen"` = alt-screen. */
+  tui_mode?: string | null;
+  /** `null` = unset, else `"low" | "medium" | "high" | "xhigh"`. Written as `effortLevel`. */
+  effort?: string | null;
+  auto_scroll_disabled?: boolean | null;
+  /** Written as `viewMode: "focus"`. */
+  focus_mode?: boolean | null;
+  show_thinking_summaries?: boolean | null;
+  /**
+   * Turns the session recap **off**. Held in the disabled sense because Claude
+   * Code's recap is on by default — see the Rust doc on `ClaudeCodeSettings`.
+   */
+  session_recap_disabled?: boolean | null;
+  env_scrub?: boolean | null;
+  prompt_caching_1h?: boolean | null;
 }
 
 export interface ContainerInfo {
@@ -151,13 +193,6 @@ export interface ContainerInfo {
   image: string;
 }
 
-export interface SiblingContainer {
-  id: string;
-  names: string[] | null;
-  image: string;
-  state: string;
-  status: string;
-}
 
 export interface TerminalSession {
   id: string;
@@ -322,10 +357,38 @@ export interface ImageUpdateInfo {
 export interface FileEntry {
   name: string;
   path: string;
+  /** Dereferenced: a symlink pointing at a directory reads as one. */
   is_directory: boolean;
+  is_symlink: boolean;
   size: number;
   modified: string;
   permissions: string;
+}
+
+/**
+ * What one upload dialog's worth of files did — mirrors `UploadOutcome` in
+ * `commands/file_commands.rs`.
+ *
+ * Two lists rather than a count and a flag, because one dialog can select
+ * several files and they do not have to agree: a folder among the selection, or
+ * a file over the size ceiling, must not cost the user the ones either side of
+ * it. Each `failures` entry is already a finished sentence naming its file.
+ */
+export interface UploadOutcome {
+  /** In-container paths, in the order they landed. */
+  uploaded: string[];
+  /** One sentence per file that did not. */
+  failures: string[];
+}
+
+/** A file read out of the container for the in-app viewer. */
+export interface FileContents {
+  /** Base64 — a byte array would cross IPC as JSON numbers. */
+  contents_base64: string;
+  /** The file was larger than the cap; only a prefix came back. */
+  truncated: boolean;
+  /** The file's real size, not the length of what was returned. */
+  size: number;
 }
 
 export interface InstallOptions {
@@ -437,6 +500,11 @@ export interface BridgedPort {
   family: AuthBridgePortFamily;
   /** RFC 3339 timestamp of when the host listener was bound. */
   bridged_at: string;
+  /** Set when only the IPv4 half of the host listener could be bound. The port
+   *  is carrying traffic, but a client that resolves `localhost` to `::1` and
+   *  does not fall back will still be refused — which otherwise presents as a
+   *  login that hangs while the bridge reports itself healthy. */
+  ipv6_warning: string | null;
 }
 
 /** A discovered loopback listener that could not be bridged (host port taken). */
@@ -589,6 +657,12 @@ export interface ClearTokenOutcome {
   snapshots_scrubbed: string[];
   /** Images still holding it, each with the reason. Non-empty = incomplete. */
   snapshots_failed: string[];
+  /** Images left alone because the project was busy under the per-project lock
+   *  (a compaction, a migration, a recreate). **Not a failure and not a
+   *  success** — the token is still baked into these, and `clearClaudeToken`
+   *  is itself the retry. Kept separate from `snapshots_failed` so a skipped
+   *  credential removal can never be reported as a completed one. */
+  snapshots_skipped: string[];
   /** Rewritten, but the pre-rewrite image object could not be deleted because a
    *  container still runs off it. Clears itself when that container is
    *  recreated — worth mentioning, not worth alarming about. */

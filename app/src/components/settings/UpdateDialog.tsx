@@ -2,6 +2,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import type { UpdateInfo } from "../../lib/types";
 import Modal from "../ui/Modal";
 import Button from "../ui/Button";
+import { formatBytes } from "../../lib/formatBytes";
 
 interface Props {
   updateInfo: UpdateInfo;
@@ -22,11 +23,6 @@ export default function UpdateDialog({
     } catch (e) {
       console.error("Failed to open URL:", e);
     }
-  };
-
-  const formatSize = (bytes: number) => {
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
-    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   };
 
   return (
@@ -83,7 +79,11 @@ export default function UpdateDialog({
             >
               <span className="truncate font-mono">{asset.name}</span>
               <span className="text-[var(--text-secondary)] ml-2 flex-shrink-0">
-                {formatSize(asset.size)}
+                {/* `binary` because a release asset's size is the ÷1024 figure
+                    every OS file browser shows for the same download. This
+                    used to be a local copy that rendered KB whole and stopped
+                    the ladder at MB; see `formatBytes.ts`. */}
+                {formatBytes(asset.size, { binary: true })}
               </span>
             </button>
           ))}

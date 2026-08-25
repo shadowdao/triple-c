@@ -1,10 +1,16 @@
 /** Shared formatting helpers for the Project Home views. */
 
+import { formatBytes as shared } from "../../../lib/formatBytes";
+
+/**
+ * File sizes in Project Home, ÷1024 with `KB`/`MB`/`GB` labels.
+ *
+ * Kept as a named re-export rather than deleted: three modules import it from
+ * here, and the binary/decimal-label pairing is a Project Home convention
+ * rather than the app-wide default. The implementation is `lib/formatBytes`.
+ */
 export function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+  return shared(bytes, { binary: true });
 }
 
 /** "2h ago" / "3d ago". Returns null for unparseable timestamps. */

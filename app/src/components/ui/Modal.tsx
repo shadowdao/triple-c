@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useId, useRef, type ReactNode } from "react";
 import { createPortal } from "react-dom";
+import { usePaneVisible } from "./PaneVisibility";
 
 const FOCUSABLE_SELECTOR = [
   "a[href]",
@@ -66,26 +67,51 @@ export default function Modal({
   const restoreFocusRef = useRef<HTMLElement | null>(null);
   const titleId = useId();
   const descId = useId();
+  // A dialog portals to `document.body`, so the `hidden` class its pane uses to
+  // step aside for another tab cannot reach it. `PaneVisibility` is how it
+  // finds out, and while it is false this dialog paints nothing, traps
+  // nothing, holds no focus, and blocks no native file drop.
+  const paneVisible = usePaneVisible();
+  const paneVisibleRef = useRef(paneVisible);
+  paneVisibleRef.current = paneVisible;
 
-  // Remember what had focus, move focus inside, restore on unmount.
+  // Remember what had focus, and restore it on unmount — but not if the pane
+  // is hidden by then: a dialog closed while the user is on another tab would
+  // otherwise yank focus back to a control they cannot see.
   useEffect(() => {
     restoreFocusRef.current = document.activeElement as HTMLElement | null;
-    const panel = panelRef.current;
-    if (panel) {
-      const target =
-        initialFocusRef?.current ?? focusableWithin(panel)[0] ?? panel;
-      // Defer so the panel is laid out (offsetParent) before we query it.
-      requestAnimationFrame(() => target.focus?.());
-    }
     return () => {
-      restoreFocusRef.current?.focus?.();
+      if (paneVisibleRef.current) restoreFocusRef.current?.focus?.();
     };
-    // Mount/unmount only — re-running would steal focus mid-interaction.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Escape closes; Tab is trapped inside the panel.
+  // Move focus inside — on mount, and again whenever the pane comes back. And
+  // move it *out* when the pane steps aside: the backdrop goes `display:none`
+  // with the keyboard focus still inside it, and nothing else relocates it, so
+  // the user lands on the new tab with focus held by a dialog they cannot see.
+  // Blurring puts it on `<body>`, which is where a fresh Tab starts.
   useEffect(() => {
+    const panel = panelRef.current;
+    if (!panel) return;
+    if (!paneVisible) {
+      const active = panel.ownerDocument.activeElement as HTMLElement | null;
+      if (active && panel.contains(active)) active.blur?.();
+      return;
+    }
+    const target = initialFocusRef?.current ?? focusableWithin(panel)[0] ?? panel;
+    // Defer so the panel is laid out (offsetParent) before we query it.
+    const frame = requestAnimationFrame(() => target.focus?.());
+    return () => cancelAnimationFrame(frame);
+    // `initialFocusRef` is a ref object; re-running on its identity would steal
+    // focus mid-interaction.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [paneVisible]);
+
+  // Escape closes; Tab is trapped inside the panel. Neither applies while the
+  // pane is hidden — those keystrokes belong to whatever the user is looking
+  // at instead.
+  useEffect(() => {
+    if (!paneVisible) return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape" && dismissible) {
         e.stopPropagation();
@@ -119,7 +145,7 @@ export default function Modal({
     };
     document.addEventListener("keydown", onKeyDown, true);
     return () => document.removeEventListener("keydown", onKeyDown, true);
-  }, [dismissible, onClose]);
+  }, [dismissible, onClose, paneVisible]);
 
   const handleOverlayClick = useCallback(
     (e: React.MouseEvent<HTMLDivElement>) => {
@@ -133,6 +159,16 @@ export default function Modal({
       ref={overlayRef}
       onClick={handleOverlayClick}
       className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4"
+      /* This dialog swallows native file drops for as long as it is on screen.
+         Dropped while the owning pane is hidden, so a dialog parked on another
+         tab does not keep refusing drops here — `lib/dropTarget.ts` also
+         filters `[hidden]`, and these two must not disagree. */
+      data-blocks-drop={paneVisible ? "true" : undefined}
+      hidden={!paneVisible}
+      aria-hidden={paneVisible ? undefined : true}
+      /* `hidden` is a base-layer rule and `flex` is a utility-layer one, so the
+         attribute alone loses. Inline wins over both. */
+      style={paneVisible ? undefined : { display: "none" }}
     >
       <div
         ref={panelRef}

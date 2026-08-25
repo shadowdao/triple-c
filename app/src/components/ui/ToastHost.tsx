@@ -47,7 +47,16 @@ function ToastCard({ toast, onDismiss }: { toast: Toast; onDismiss: () => void }
         {tone.glyph}
       </span>
       <div className="flex-1 min-w-0">
-        <div className="text-[var(--text-primary)] break-words">{toast.message}</div>
+        {/* Clamped. A toast message is normally a sentence, but some of them
+            quote text a *container* wrote — and this card is `z-[60]`, above
+            every modal, with its dismiss button at the top. An unclamped
+            message of a few kilobytes is a card taller than the viewport whose
+            ✕ has been pushed off-screen, i.e. an unclosable overlay. The
+            `detail` block below has always had `max-h-40 overflow-auto`; this
+            half did not. */}
+        <div className="text-[var(--text-primary)] break-words max-h-40 overflow-y-auto">
+          {toast.message}
+        </div>
         {toast.detail && (
           <>
             <button

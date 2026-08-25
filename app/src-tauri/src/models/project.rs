@@ -8,6 +8,100 @@ pub struct EnvVar {
     pub value: String,
 }
 
+/// Whether `key` is a name a shell will read back as an ordinary variable:
+/// `[A-Za-z_][A-Za-z0-9_]*`.
+///
+/// ## Why a charset rule, and not just the reserved-name list
+///
+/// `docker::container::is_reserved_env_key` answers a different question — "is
+/// this one of the names Triple-C manages itself" — and nothing anywhere asked
+/// what the *characters* were. A key is joined into `KEY=VALUE` and handed to
+/// the daemon, which puts it in the container's environment verbatim, so a name
+/// that is not an identifier travels through unchallenged.
+///
+/// The one that matters is `BASH_FUNC_name%%`, bash's wire format for an
+/// exported shell function: bash imports those at startup and the *body* is the
+/// value. Today that is latent rather than live — the image's `/bin/sh` is
+/// dash, which does not import them, and an auditor confirmed the vector fires
+/// under `bash -c` and not under `sh -c` in the shipped image. But the
+/// pre-commit scrub runs `/bin/sh -c` **as root**, `/bin/sh` is whatever
+/// `ubuntu:24.04` points it at, and nothing pins that. One base-image change,
+/// or one call site spelled `bash`, turns a stored project setting into root
+/// code execution inside the container at commit time.
+///
+/// So the rule is the shape of the thing rather than a list of the names that
+/// are known to be dangerous: `IFS`, `LD_PRELOAD` and `PATH` are all perfectly
+/// good identifiers and are the user's business, while nothing legitimate needs
+/// a `%`, a `(` or a space in an environment variable name.
+///
+/// The key is judged **trimmed**, because that is what `create_container` sends
+/// — ` FOO ` already reaches the container as `FOO`, and refusing it here would
+/// break a setting that works.
+pub fn is_valid_env_key(key: &str) -> bool {
+    let mut chars = key.trim().chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Validate a custom environment variable list that is about to be stored,
+/// admitting the entries it is already stored with.
+///
+/// Same shape, and the same reasoning, as
+/// `commands::project_commands::validate_project_paths_update`: nothing ever
+/// checked these keys, so `projects.json` and `settings.json` in the field can
+/// hold whatever was typed. Holding every save to the new rule would make such
+/// a project unsavable *entirely* — `update_project` is the single command
+/// behind the whole Config tab — and would buy nothing, because the stored key
+/// is already being handed to every container that starts. An entry carried
+/// over verbatim is admitted; a new or edited one is held to the rule, which is
+/// what keeps the escalation closed, since escalation means *introducing* a bad
+/// key through this command.
+///
+/// Counted rather than set-tested, for the same reason as the folder rows: a
+/// second copy of an existing entry is a new entry.
+///
+/// The blank entry is not a violation. "+ Add variable" appends
+/// `{key: "", value: ""}` and saves the list immediately, so refusing it would
+/// turn the button itself into an error toast; `create_container` skips an
+/// empty key, so it reaches nothing.
+pub fn validate_env_vars_update(stored: &[EnvVar], incoming: &[EnvVar]) -> Result<(), String> {
+    // An entry with no key is the placeholder, whatever is in its value:
+    // `create_container` skips it, so it reaches nothing and there is nothing
+    // to refuse. The editor saves on every blur, and typing the value before
+    // the name is an ordinary way to fill a row in.
+    let is_blank = |v: &EnvVar| v.key.trim().is_empty();
+
+    let mut carried: std::collections::HashMap<(&str, &str), usize> =
+        std::collections::HashMap::new();
+    for v in stored.iter().filter(|v| !is_blank(v)) {
+        *carried
+            .entry((v.key.as_str(), v.value.as_str()))
+            .or_insert(0) += 1;
+    }
+
+    for v in incoming.iter().filter(|v| !is_blank(v)) {
+        match carried.get_mut(&(v.key.as_str(), v.value.as_str())) {
+            Some(remaining) if *remaining > 0 => {
+                *remaining -= 1;
+            }
+            _ => {
+                if !is_valid_env_key(&v.key) {
+                    return Err(format!(
+                        "'{}' is not a usable environment variable name. Use a letter or \
+                         underscore followed by letters, digits or underscores.",
+                        v.key
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProjectPath {
     pub host_path: String,
@@ -85,31 +179,141 @@ impl PermissionMode {
 /// Settings for Claude Code CLI behavior inside the container.
 /// These map to Claude Code env vars and ~/.claude/settings.json entries.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(from = "StoredClaudeCodeSettings")]
+/// Every field is three-state, and the third state is load-bearing.
+///
+/// `None` means "not set at this level". For a *project* that is "inherit
+/// whatever the global settings say"; for the *global* settings it is "leave
+/// Claude Code's own default alone". `Some(false)` is a deliberate off, which
+/// is what lets a project turn a globally-enabled setting back off — with a
+/// plain `bool` there is no value that can express that, which is why these
+/// were widened from `bool`.
 pub struct ClaudeCodeSettings {
-    /// TUI rendering mode: None = default, Some("fullscreen") = flicker-free alt-screen
-    #[serde(default)]
+    /// TUI renderer. `None` leaves settings.json's `tui` key unset, which is
+    /// what lets Claude Code pick the renderer itself; `Some("default")` pins
+    /// the classic main-screen renderer and `Some("fullscreen")` the alt-screen
+    /// one. All three are distinct — "let it choose" is not "classic".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tui_mode: Option<String>,
-    /// Effort level: None = default, Some("low"|"medium"|"high")
-    #[serde(default)]
+    /// Saved `/effort` level: `None` = unset, otherwise one of
+    /// `"low" | "medium" | "high" | "xhigh"`. Written to settings.json as
+    /// `effortLevel` (**not** `effort`, which Claude Code has never read).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
-    /// Disable auto-scroll in fullscreen TUI mode
-    #[serde(default)]
-    pub auto_scroll_disabled: bool,
-    /// Enable focus mode (collapsed tool output)
-    #[serde(default)]
-    pub focus_mode: bool,
+    /// Disable auto-scroll in fullscreen TUI mode. Held in the *disabled* sense
+    /// because Claude Code's `autoScrollEnabled` defaults to `true`, so the
+    /// zero value of this field has to mean "leave it on".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_scroll_disabled: Option<bool>,
+    /// Collapse tool output to one-line summaries. Written to settings.json as
+    /// `viewMode: "focus"`; there is no `focusMode` key in Claude Code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus_mode: Option<bool>,
     /// Show thinking summaries in responses
-    #[serde(default)]
-    pub show_thinking_summaries: bool,
-    /// Enable session recap when returning to a session
-    #[serde(default)]
-    pub enable_session_recap: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_thinking_summaries: Option<bool>,
+    /// Turn the session recap **off**.
+    ///
+    /// Held in the disabled sense for the same reason as `auto_scroll_disabled`,
+    /// and the rename from the old `enable_session_recap` is load-bearing rather
+    /// than cosmetic. Claude Code's recap is on by default, so the old field was
+    /// inverted: switching it on was a no-op and switching it off did nothing at
+    /// all. Reusing the name with the opposite meaning would have read every
+    /// stored `enable_session_recap: false` — which is what every project that
+    /// never touched the control holds — as "the user turned the recap off" and
+    /// silently disabled it for all of them. A new name lets the old key be
+    /// ignored, which lands every existing project on the correct default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_recap_disabled: Option<bool>,
     /// Strip credentials from subprocess environments
-    #[serde(default)]
-    pub env_scrub: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_scrub: Option<bool>,
     /// Enable 1-hour prompt cache TTL (vs default 5-minute)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_caching_1h: Option<bool>,
+}
+
+/// `ClaudeCodeSettings` in every shape `projects.json` and `settings.json` can
+/// be holding, which is what [`ClaudeCodeSettings`] is actually deserialised
+/// through.
+///
+/// ## The upgrade this exists to survive
+///
+/// Before the widening, the five booleans were plain `bool`s with
+/// `#[serde(default)]` and no `skip_serializing_if`, so **every** settings
+/// object ever written carries an explicit `"env_scrub": false` — not because
+/// anyone chose it, but because that is what a `bool` serialises to. Under the
+/// old merge (`if p.x { true } else { g.x }`) that `false` carried no
+/// information at all: it was the only value an unset switch could produce, and
+/// the global always won.
+///
+/// Read as `Some(false)` by the new code it becomes a *deliberate off* that
+/// beats a global `Some(true)` — so upgrading silently turned five settings off
+/// for every project that had ever opened this editor, `env_scrub` ("strip
+/// credentials from subprocess environments") among them. There is no store
+/// migration anywhere: `projects_store` parses these structs directly.
+///
+/// ## How an old record is told apart from a new one
+///
+/// By `enable_session_recap`. It was in the struct from the day it existed and
+/// was a plain `bool`, so its key is present in every pre-widening record and
+/// in no other — the field was *renamed* to `session_recap_disabled` precisely
+/// so the old key could be ignored (see the doc on that field), and the new
+/// code has never written it. Its presence is therefore an exact statement that
+/// these bytes were written by a binary in which `false` meant "unset", and the
+/// booleans are read back that way: `true` is a real choice and survives,
+/// `false` becomes `None` and inherits again.
+///
+/// Nothing marks a *new* record, and nothing needs to: absent is `None` (the
+/// fields skip serialising when unset) and a present `false` is the deliberate
+/// off the widening was for. That is also what keeps a downgrade survivable —
+/// an older binary reads an absent key as `false` through its own
+/// `#[serde(default)]`, where a `null` would fail to parse and take the whole
+/// of `projects.json` down with it, since `ProjectsStore` parses all-or-nothing
+/// and starts empty on an error.
+#[derive(Deserialize)]
+struct StoredClaudeCodeSettings {
     #[serde(default)]
-    pub prompt_caching_1h: bool,
+    tui_mode: Option<String>,
+    #[serde(default)]
+    effort: Option<String>,
+    #[serde(default)]
+    auto_scroll_disabled: Option<bool>,
+    #[serde(default)]
+    focus_mode: Option<bool>,
+    #[serde(default)]
+    show_thinking_summaries: Option<bool>,
+    #[serde(default)]
+    session_recap_disabled: Option<bool>,
+    #[serde(default)]
+    env_scrub: Option<bool>,
+    #[serde(default)]
+    prompt_caching_1h: Option<bool>,
+    /// The pre-widening spelling of `session_recap_disabled`, and the *only*
+    /// use of its value: presence dates the record. Its meaning was inverted
+    /// and it never worked, so it is read for the marker and discarded.
+    #[serde(default)]
+    enable_session_recap: Option<bool>,
+}
+
+impl From<StoredClaudeCodeSettings> for ClaudeCodeSettings {
+    fn from(stored: StoredClaudeCodeSettings) -> Self {
+        let pre_widening = stored.enable_session_recap.is_some();
+        // On a pre-widening record `false` is what an untouched switch wrote,
+        // so it means "not set at this level" and must inherit. A `true` was a
+        // real choice either way.
+        let read = |v: Option<bool>| if pre_widening { v.filter(|on| *on) } else { v };
+        ClaudeCodeSettings {
+            tui_mode: stored.tui_mode,
+            effort: stored.effort,
+            auto_scroll_disabled: read(stored.auto_scroll_disabled),
+            focus_mode: read(stored.focus_mode),
+            show_thinking_summaries: read(stored.show_thinking_summaries),
+            session_recap_disabled: read(stored.session_recap_disabled),
+            env_scrub: read(stored.env_scrub),
+            prompt_caching_1h: read(stored.prompt_caching_1h),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -439,5 +643,172 @@ impl Project {
             }
         }
         val
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Custom environment variable names ─────────────────────────────────
+
+    #[test]
+    fn an_env_var_name_has_to_be_a_shell_identifier() {
+        for ok in ["PATH", "_", "_x", "MY_VAR2", "a", " SPACED_BY_THE_EDITOR "] {
+            assert!(is_valid_env_key(ok), "'{}' should be a usable name", ok);
+        }
+        for bad in [
+            // bash's wire format for an exported shell function: the value is
+            // the body, and a `bash` that imports it runs it. The scrub exec is
+            // `/bin/sh -c` as root, and nothing pins `/bin/sh` to dash.
+            "BASH_FUNC_stat%%",
+            "BASH_FUNC_ls()",
+            "MY VAR",
+            "2FAST",
+            "WITH-DASH",
+            "WITH.DOT",
+            "",
+            "   ",
+            "$(id)",
+            "A=B",
+        ] {
+            assert!(!is_valid_env_key(bad), "'{}' should be refused", bad);
+        }
+    }
+
+    fn env(key: &str, value: &str) -> EnvVar {
+        EnvVar { key: key.to_string(), value: value.to_string() }
+    }
+
+    #[test]
+    fn a_bad_env_var_name_cannot_be_introduced_but_a_stored_one_does_not_brick_the_editor() {
+        let bad = [env("BASH_FUNC_stat%%", "() { id; }")];
+        // Introducing it through the Config tab is the escalation.
+        assert!(validate_env_vars_update(&[], &bad).is_err());
+        // Already stored: it is handed to every container that starts whether
+        // or not an unrelated save is allowed through, and refusing the save
+        // would make every toggle on the Config tab fail.
+        assert!(validate_env_vars_update(&bad, &bad).is_ok());
+        // Editing its value is a new entry, and refused again.
+        assert!(
+            validate_env_vars_update(&bad, &[env("BASH_FUNC_stat%%", "() { rm -rf /; }")]).is_err()
+        );
+        // Fixing the name is what the message asks for, and it saves.
+        assert!(validate_env_vars_update(&bad, &[env("STAT", "() { id; }")]).is_ok());
+        // Dropping it entirely is always fine.
+        assert!(validate_env_vars_update(&bad, &[]).is_ok());
+    }
+
+    #[test]
+    fn the_blank_row_the_add_button_saves_is_not_an_error() {
+        // "+ Add variable" appends an empty entry and saves the list at once,
+        // so this is the button, not an attempt at anything.
+        assert!(validate_env_vars_update(&[], &[env("", "")]).is_ok());
+        // Typing the value before the name is an ordinary way to fill it in,
+        // and an entry with no name reaches no container either way.
+        assert!(validate_env_vars_update(&[], &[env("", "value-first")]).is_ok());
+        assert!(validate_env_vars_update(&[], &[env("GOOD", "v"), env("", "")]).is_ok());
+    }
+
+    #[test]
+    fn a_stored_entry_may_be_kept_but_not_multiplied() {
+        let stored = [env("BAD NAME", "v")];
+        assert!(validate_env_vars_update(&stored, &stored).is_ok());
+        // A second copy is a new entry, and held to the rule.
+        assert!(
+            validate_env_vars_update(&stored, &[env("BAD NAME", "v"), env("BAD NAME", "v")])
+                .is_err()
+        );
+    }
+
+    // ── Claude Code settings written before the fields were widened ───────
+
+    /// `projects.json` exactly as the shipped `main` binary wrote it: the five
+    /// booleans were plain `bool`s that always serialised, so every project
+    /// that ever opened the editor carries `false` for the ones it never
+    /// touched.
+    const MAIN_SHAPE_PROJECT: &str = r#"{
+        "id": "p1",
+        "name": "demo",
+        "paths": [{ "host_path": "/home/u/demo", "mount_name": "demo" }],
+        "container_id": null,
+        "status": "stopped",
+        "backend": "anthropic",
+        "bedrock_config": null,
+        "ollama_config": null,
+        "openai_compatible_config": null,
+        "allow_docker_access": false,
+        "ssh_key_path": null,
+        "git_user_name": null,
+        "git_user_email": null,
+        "claude_code_settings": {
+            "tui_mode": "fullscreen",
+            "effort": null,
+            "auto_scroll_disabled": false,
+            "focus_mode": false,
+            "show_thinking_summaries": false,
+            "enable_session_recap": false,
+            "env_scrub": false,
+            "prompt_caching_1h": false
+        },
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z"
+    }"#;
+
+    #[test]
+    fn a_setting_stored_as_false_by_the_old_binary_still_inherits_the_global() {
+        let project: Project = serde_json::from_str(MAIN_SHAPE_PROJECT).unwrap();
+        let stored = project.claude_code_settings.expect("settings should parse");
+
+        // Read verbatim these would be `Some(false)`, which under
+        // `docker::container::merge_claude_code_settings` beats the global.
+        assert_eq!(stored.env_scrub, None);
+        assert_eq!(stored.auto_scroll_disabled, None);
+        assert_eq!(stored.focus_mode, None);
+        assert_eq!(stored.show_thinking_summaries, None);
+        assert_eq!(stored.prompt_caching_1h, None);
+        assert_eq!(stored.session_recap_disabled, None);
+        // A value the user did choose is untouched.
+        assert_eq!(stored.tui_mode.as_deref(), Some("fullscreen"));
+
+        // The merge rule itself, spelled the way
+        // `merge_claude_code_settings` spells it. `main` resolved this with
+        // `if p.env_scrub { true } else { g.env_scrub }`, i.e. the global won —
+        // and it has to go on winning, because the user never turned this off.
+        let global = ClaudeCodeSettings { env_scrub: Some(true), ..Default::default() };
+        assert_eq!(
+            stored.env_scrub.or(global.env_scrub),
+            Some(true),
+            "upgrading silently turned off 'strip credentials from subprocess environments'"
+        );
+    }
+
+    #[test]
+    fn an_off_chosen_in_the_new_editor_still_beats_a_global_on() {
+        // Same record without the pre-widening key: this `false` is the
+        // deliberate off the widening exists to make expressible.
+        let json = r#"{ "env_scrub": false }"#;
+        let chosen: ClaudeCodeSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(chosen.env_scrub, Some(false));
+        let global = ClaudeCodeSettings { env_scrub: Some(true), ..Default::default() };
+        assert_eq!(chosen.env_scrub.or(global.env_scrub), Some(false));
+    }
+
+    #[test]
+    fn an_unset_setting_is_written_as_absent_rather_than_null() {
+        // A downgrade parses these fields as plain `bool` with
+        // `#[serde(default)]`: an absent key is `false`, a `null` is a parse
+        // error — and `ProjectsStore` parses all-or-nothing, so one project
+        // with one null empties the whole list and the next save persists that.
+        let json = serde_json::to_string(&ClaudeCodeSettings::default()).unwrap();
+        assert_eq!(json, "{}");
+        assert!(!json.contains("null"));
+
+        let partial = ClaudeCodeSettings { env_scrub: Some(false), ..Default::default() };
+        let json = serde_json::to_string(&partial).unwrap();
+        assert_eq!(json, r#"{"env_scrub":false}"#);
+        // And it reads back as what it is.
+        let round_tripped: ClaudeCodeSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped, partial);
     }
 }

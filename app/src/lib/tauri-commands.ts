@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ProjectPath, ContainerInfo, SiblingContainer, AppSettings, UpdateInfo, ImageUpdateInfo, FileEntry, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, BrowserPageState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo } from "./types";
+import type { Project, ProjectPath, ContainerInfo, AppSettings, UpdateInfo, ImageUpdateInfo, FileEntry, FileContents, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, BrowserPageState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo, UploadOutcome } from "./types";
 
 // Docker
 export const checkDocker = () => invoke<boolean>("check_docker");
@@ -7,8 +7,6 @@ export const checkImageExists = () => invoke<boolean>("check_image_exists");
 export const buildImage = () => invoke<void>("build_image");
 export const getContainerInfo = (projectId: string) =>
   invoke<ContainerInfo | null>("get_container_info", { projectId });
-export const listSiblingContainers = () =>
-  invoke<SiblingContainer[]>("list_sibling_containers");
 
 // Projects
 export const listProjects = () => invoke<Project[]>("list_projects");
@@ -71,12 +69,34 @@ export const stopAudioBridge = (sessionId: string) =>
 // Files
 export const listContainerFiles = (projectId: string, path: string) =>
   invoke<FileEntry[]>("list_container_files", { projectId, path });
-export const downloadContainerFile = (projectId: string, containerPath: string, hostPath: string) =>
-  invoke<void>("download_container_file", { projectId, containerPath, hostPath });
+/**
+ * Save one container file to the host.
+ *
+ * The **backend** opens the save dialog, so this call cannot name a place on
+ * the host — that is the point (see `pick_save_path` in `file_commands.rs`).
+ * Paths do come *back* inside error text; what is closed is the inbound
+ * direction.
+ * Resolves to the number of bytes written, or `null` if the user dismissed the
+ * dialog. Zero bytes is a success: an empty file is a file.
+ */
+export const downloadContainerFile = (projectId: string, containerPath: string) =>
+  invoke<number | null>("download_container_file", { projectId, containerPath });
+/**
+ * Upload host files into `containerDir`, with the backend opening the file
+ * picker. Resolves to `null` if the user dismissed it, otherwise to what
+ * happened — one dialog can select several files and they need not all succeed.
+ */
+export const uploadFilesToContainer = (projectId: string, containerDir: string) =>
+  invoke<UploadOutcome | null>("upload_files_to_container", { projectId, containerDir });
 export const downloadContainerBackup = (projectId: string, hostPath: string, containerPath?: string) =>
   invoke<number>("download_container_backup", { projectId, hostPath, containerPath });
-export const uploadFileToContainer = (projectId: string, hostPath: string, containerDir: string) =>
-  invoke<void>("upload_file_to_container", { projectId, hostPath, containerDir });
+export const readContainerFile = (projectId: string, path: string, maxBytes?: number) =>
+  invoke<FileContents>("read_container_file", { projectId, path, maxBytes });
+/** `toPath` is the new *name*, not a destination — renames never move. */
+export const renameContainerPath = (projectId: string, fromPath: string, toPath: string) =>
+  invoke<string>("rename_container_path", { projectId, fromPath, toPath });
+export const createContainerDirectory = (projectId: string, parentPath: string, name: string) =>
+  invoke<string>("create_container_directory", { projectId, parentPath, name });
 
 // Updates
 export const getAppVersion = () => invoke<string>("get_app_version");
@@ -277,8 +297,13 @@ export const setBrowserViewPopoutAlwaysOnTop = (projectId: string, onTop: boolea
 // lives in the OS keychain and is injected as a container env var.
 //
 // `acquireClaudeToken` borrows the given project's running container to run the
-// login (temporarily enabling its auth bridge), and streams progress on the
-// `claude-token-progress` and `claude-token-output` events. It resolves only
+// login and streams progress on the `claude-token-progress` and
+// `claude-token-output` events. It deliberately does *not* touch the project's
+// auth bridge: `setup-token` finishes on an Anthropic-hosted page and pastes a
+// code back, so there is no loopback callback for a bridge to carry — and an
+// earlier version that enabled it "just in case" persisted that flag to
+// projects.json and left it latched on whenever the flow was killed. See the
+// module comment in `commands/auth_token_commands.rs`. It resolves only
 // once the whole flow finishes, so call it without awaiting the UI on it.
 //
 // Partway through, `claude setup-token` prints a sign-in URL and then waits at
@@ -292,10 +317,16 @@ export const submitClaudeTokenCode = (code: string) =>
 /** Abort an in-flight acquisition and release the single-flight guard. No-op if nothing is running. */
 export const cancelClaudeToken = () => invoke<void>("cancel_claude_token");
 export const hasClaudeToken = () => invoke<boolean>("has_claude_token");
-/** Revoke the shared token. Also rewrites any snapshot image that still has it
- *  baked into its env — see `ClearTokenOutcome` for what may be left behind. */
+/** Revoke the shared token: delete the keychain entry **first**, then rewrite
+ *  any snapshot image that still has it baked into its env — see
+ *  `ClearTokenOutcome` for what may be left behind. Destructive; confirm it. */
 export const clearClaudeToken = () =>
   invoke<ClearTokenOutcome>("clear_claude_token");
+/** Rewrite snapshot images that still carry a credential, **without touching
+ *  the keychain**. This is the retry behind an incomplete revocation, and the
+ *  standalone "check my images" sweep; it never deletes a token. */
+export const sweepClaudeTokenSnapshots = () =>
+  invoke<ClearTokenOutcome>("sweep_claude_token_snapshots");
 
 // Container base-image migration — move a project onto the current base image
 // without deleting its volumes. Reset is the destructive alternative: it wipes

@@ -405,26 +405,46 @@ install_feature_skill pia-vpn "${VPN_SUPPORT_ENABLED:-0}"
 unset VPN_SUPPORT_ENABLED
 
 # ── Claude Code settings ────────────────────────────────────────────────────
-# Merge Claude Code settings into ~/.claude/settings.json (preserves existing
-# keys). Creates the file if it doesn't exist. These control TUI mode, effort
-# level, focus mode, thinking summaries, and other CLI behavior.
+# Apply the managed Claude Code settings to ~/.claude/settings.json, keeping
+# every key the user set inside the container.
+#
+# `settings.json` lives on the persisted triple-c-claude-config-{id} volume, so
+# it outlives the container and a plain `.[0] * .[1]` merge could only ever
+# *add*. That is what made every one of these settings one-way: switching one
+# off in Triple-C omitted its key, the merge preserved the old on-value, and the
+# setting stayed on until a destructive Reset. So Rust states the whole managed
+# key set on every start, in two parts: CLAUDE_CODE_SETTINGS_JSON holds the keys
+# that have a value, and CLAUDE_CODE_SETTINGS_CLEAR is a JSON array of the key
+# names whose neutral state is *unset* (`tui`, `effortLevel`, `viewMode`,
+# `awaySummaryEnabled`) and which must therefore be deleted rather than pinned
+# to a stand-in value.
+#
+# The two are kept apart rather than using a null-means-delete payload because
+# a project recreates from its own snapshot image, which carries whatever
+# entrypoint it was built with. An older one merges with a plain `.[0] * .[1]`
+# and would write literal nulls into the user's settings.json; it ignores
+# CLAUDE_CODE_SETTINGS_CLEAR instead, keeping the old sticky behaviour until the
+# project is migrated or Reset.
+# See `build_claude_code_settings_json` in app/src-tauri/src/docker/container.rs.
 if [ -n "$CLAUDE_CODE_SETTINGS_JSON" ]; then
     SETTINGS_FILE="/home/claude/.claude/settings.json"
     mkdir -p /home/claude/.claude
-    if [ -f "$SETTINGS_FILE" ]; then
-        # Merge: existing settings + new settings (new keys override on conflict)
-        MERGED=$(jq -s '.[0] * .[1]' "$SETTINGS_FILE" <(printf '%s' "$CLAUDE_CODE_SETTINGS_JSON") 2>/dev/null)
-        if [ -n "$MERGED" ]; then
-            printf '%s\n' "$MERGED" > "$SETTINGS_FILE"
-        else
-            echo "entrypoint: warning — failed to merge Claude Code settings into $SETTINGS_FILE"
-        fi
+    # One code path for "file exists" and "file doesn't".
+    [ -f "$SETTINGS_FILE" ] || printf '{}\n' > "$SETTINGS_FILE"
+    MERGED=$(jq -s --argjson clear "${CLAUDE_CODE_SETTINGS_CLEAR:-[]}" '
+        .[0] as $current
+        | .[1] as $set
+        | ($current * $set) | delpaths($clear | map([.]))
+    ' "$SETTINGS_FILE" <(printf '%s' "$CLAUDE_CODE_SETTINGS_JSON") 2>/dev/null)
+    if [ -n "$MERGED" ]; then
+        printf '%s\n' "$MERGED" > "$SETTINGS_FILE"
     else
-        printf '%s\n' "$CLAUDE_CODE_SETTINGS_JSON" > "$SETTINGS_FILE"
+        echo "entrypoint: warning — failed to merge Claude Code settings into $SETTINGS_FILE"
     fi
     chown claude:claude "$SETTINGS_FILE"
     chmod 600 "$SETTINGS_FILE"
     unset CLAUDE_CODE_SETTINGS_JSON
+    unset CLAUDE_CODE_SETTINGS_CLEAR
 fi
 
 # ── AWS SSO auth refresh command ──────────────────────────────────────────────
@@ -434,28 +454,74 @@ fi
 # previous Bedrock-profile session — ~/.claude.json lives in the persisted home
 # volume, so without this the container keeps trying to run the SSO refresh even
 # after switching to a non-SSO backend (Anthropic/Ollama) or to static creds.
+# Replace ~/.claude.json atomically: write a sibling temp file, then rename.
+#
+# `> "$CLAUDE_JSON"` truncates before it writes, so a write that fails part-way
+# — a full home volume being the obvious way, and bounding that volume is what
+# half this release is about — leaves the file unparseable. It holds the OAuth
+# account, and the damage does not self-heal: the next start's `jq` fails on the
+# corrupt file, `MERGED` comes back empty, and the `[ -n "$MERGED" ]` guard
+# skips the write that would have repaired it. `triple-c-task-runner` has done
+# it this way all along.
+write_claude_json() {
+    _wcj_tmp="${CLAUDE_JSON}.triple-c-tmp"
+    if printf '%s\n' "$1" > "$_wcj_tmp" 2>/dev/null; then
+        mv -f "$_wcj_tmp" "$CLAUDE_JSON" 2>/dev/null || rm -f "$_wcj_tmp"
+    else
+        rm -f "$_wcj_tmp"
+        echo "entrypoint: warning — could not write $CLAUDE_JSON (leaving it as it was)"
+        return 1
+    fi
+    # By name, after the rename, so these land on the new inode.
+    chown claude:claude "$CLAUDE_JSON"
+    chmod 600 "$CLAUDE_JSON"
+}
+
 CLAUDE_JSON="/home/claude/.claude.json"
 if [ -n "$AWS_SSO_AUTH_REFRESH_CMD" ]; then
     if [ -f "$CLAUDE_JSON" ]; then
         MERGED=$(jq --arg cmd "$AWS_SSO_AUTH_REFRESH_CMD" '.awsAuthRefresh = $cmd' "$CLAUDE_JSON" 2>/dev/null)
         if [ -n "$MERGED" ]; then
-            printf '%s\n' "$MERGED" > "$CLAUDE_JSON"
+            write_claude_json "$MERGED"
         fi
     else
-        printf '{"awsAuthRefresh":"%s"}\n' "$AWS_SSO_AUTH_REFRESH_CMD" > "$CLAUDE_JSON"
+        # No existing file, so there is nothing to destroy — but go through the
+        # same helper so the owner and mode are set in one place.
+        write_claude_json "$(printf '{"awsAuthRefresh":"%s"}' "$AWS_SSO_AUTH_REFRESH_CMD")"
     fi
-    chown claude:claude "$CLAUDE_JSON"
-    chmod 600 "$CLAUDE_JSON"
     unset AWS_SSO_AUTH_REFRESH_CMD
 elif [ -f "$CLAUDE_JSON" ] && grep -q '"awsAuthRefresh"' "$CLAUDE_JSON" 2>/dev/null; then
     # Only rewrite when the key is actually present, to avoid a needless jq
     # reformat of ~/.claude.json on every start of a non-SSO backend.
     MERGED=$(jq 'del(.awsAuthRefresh)' "$CLAUDE_JSON" 2>/dev/null)
     if [ -n "$MERGED" ]; then
-        printf '%s\n' "$MERGED" > "$CLAUDE_JSON"
-        chown claude:claude "$CLAUDE_JSON"
-        chmod 600 "$CLAUDE_JSON"
+        write_claude_json "$MERGED"
     fi
+fi
+
+# ── Shift+Enter key binding ───────────────────────────────────────────────────
+# Triple-C's terminals send ESC+CR (`\e\r`) on Shift+Enter — the same bytes
+# `/terminal-setup` installs for VS Code, Cursor, Alacritty and Zed — and Claude
+# Code decodes those unconditionally. What it cannot see is that the binding is
+# already in place, so it keeps printing its "run /terminal-setup" tip. This
+# flag is what that tip is gated on: purely cosmetic, and it changes nothing
+# about how the sequence is decoded.
+#
+# $CLAUDE_JSON is already set by the awsAuthRefresh block above.
+if [ -f "$CLAUDE_JSON" ]; then
+    # Only rewrite when the value isn't already true, to avoid a needless jq
+    # reformat of ~/.claude.json on every single start.
+    if ! grep -q '"shiftEnterKeyBindingInstalled"[[:space:]]*:[[:space:]]*true' "$CLAUDE_JSON" 2>/dev/null; then
+        # Atomic, via `write_claude_json` — see its comment for why a plain
+        # `>` on this file can permanently destroy the OAuth login.
+        MERGED=$(jq '.shiftEnterKeyBindingInstalled = true' "$CLAUDE_JSON" 2>/dev/null)
+        if [ -n "$MERGED" ]; then
+            write_claude_json "$MERGED"
+        fi
+    fi
+else
+    # Nothing to destroy, but the helper owns the owner/mode too.
+    write_claude_json '{"shiftEnterKeyBindingInstalled":true}'
 fi
 
 # ── Docker socket permissions ────────────────────────────────────────────────

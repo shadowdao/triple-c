@@ -5,6 +5,7 @@ mod docker;
 mod install_helper;
 mod logging;
 mod models;
+mod project_lock;
 mod storage;
 pub mod web_terminal;
 
@@ -212,7 +213,6 @@ pub fn run() {
     let lifecycle_setup = lifecycle.clone();
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(AppState {
@@ -234,6 +234,30 @@ pub fn run() {
                     log::error!("Failed to load window icon: {}", e);
                 }
             }
+
+            // ── Startup disk housekeeping ────────────────────────────────
+            // Until now the only sweep ran *after* a recreation, so a user who
+            // simply stopped launching a project kept its orphaned snapshot
+            // layers forever, and anything a crash left behind (a probe
+            // container pinning a base image, a rollback pin whose migration
+            // record is gone) had no path back at all. All of it is
+            // read-mostly and finishes in well under a second on an idle daemon,
+            // but they are detached anyway: housekeeping must never delay the
+            // window appearing, and a daemon that is not running yet is a
+            // logged warning rather than a failed start.
+            //
+            // Ordering matters. Probes are removed first because a probe holds
+            // an image open and the sweep will not force; pins are untagged
+            // second so the images they were holding are dangling by the time
+            // the sweep lists them; the sweep runs last and collects both.
+            tauri::async_runtime::spawn(async move {
+                crate::docker::reap_probe_containers().await;
+                let reaped = crate::docker::reap_stale_migration_pins().await;
+                if reaped > 0 {
+                    log::info!("Startup housekeeping dropped {} stale rollback pin(s)", reaped);
+                }
+                crate::docker::sweep_orphaned_snapshots_logged("startup").await;
+            });
 
             // Auto-start web terminal server if enabled in settings
             let settings = settings_store_setup.get();
@@ -411,7 +435,6 @@ pub fn run() {
             commands::docker_commands::check_image_exists,
             commands::docker_commands::build_image,
             commands::docker_commands::get_container_info,
-            commands::docker_commands::list_sibling_containers,
             // Projects
             commands::project_commands::list_projects,
             commands::project_commands::add_project,
@@ -452,6 +475,7 @@ pub fn run() {
             commands::auth_token_commands::cancel_claude_token,
             commands::auth_token_commands::has_claude_token,
             commands::auth_token_commands::clear_claude_token,
+            commands::auth_token_commands::sweep_claude_token_snapshots,
             // Settings
             commands::settings_commands::get_settings,
             commands::settings_commands::update_settings,
@@ -472,9 +496,12 @@ pub fn run() {
             commands::terminal_commands::stop_audio_bridge,
             // Files
             commands::file_commands::list_container_files,
-            commands::file_commands::download_container_file,
             commands::file_commands::download_container_backup,
-            commands::file_commands::upload_file_to_container,
+            commands::file_commands::download_container_file,
+            commands::file_commands::upload_files_to_container,
+            commands::file_commands::read_container_file,
+            commands::file_commands::rename_container_path,
+            commands::file_commands::create_container_directory,
             // AWS
             commands::aws_commands::aws_sso_refresh,
             // Updates
@@ -651,5 +678,245 @@ mod tests {
         let started = tokio::time::Instant::now();
         lifecycle.settle_startup_tasks().await;
         assert!(started.elapsed() <= STARTUP_CANCEL_BUDGET + Duration::from_secs(1));
+    }
+
+    /// The capability file is the app's entire IPC attack surface, and it is
+    /// data — nothing in `cargo test` reads it, so a widened grant lands with a
+    /// green suite. This is what noticing looks like.
+    ///
+    /// It exists because `core:default` was granted for months. That alias
+    /// pulls in `core:image:default` → `allow-from-path`, which is an
+    /// unconditional `std::fs::read` of any host path with no scope check, and
+    /// nothing in the frontend has ever imported `@tauri-apps/api/image`.
+    /// Every `#[tauri::command]` is registered, and every registration names a
+    /// command that exists.
+    ///
+    /// This is the shape of the bug that caused the original OAuth-callback
+    /// complaint: `set_auth_bridge_enabled` existed, worked, and had a typed
+    /// frontend wrapper — with **zero call sites**. The switch the docs told
+    /// users to flip was never wired to anything, so the bridge stayed off and
+    /// every login callback was refused. Nothing failed; the feature was simply
+    /// absent, and no test noticed because both halves compiled.
+    ///
+    /// The reverse direction matters too, and for a sharper reason: a command
+    /// that is registered but reachable from nowhere is still IPC surface a
+    /// compromised webview can call. `list_sibling_containers` — which returned
+    /// every container on the daemon, including the user's unrelated work —
+    /// sat in exactly that state, and this test is what found it. It has since
+    /// been removed at all four levels: registration, command, docker helper,
+    /// and the frontend wrapper and type.
+    ///
+    /// So this asserts the two lists agree, and leaves *deciding* what belongs
+    /// on them to a human. It cannot see frontend call sites; `tsc` and the
+    /// vitest suite cover that side.
+    #[test]
+    fn every_command_is_registered_exactly_once() {
+        use std::collections::BTreeSet;
+
+        let mut defined: BTreeSet<String> = BTreeSet::new();
+
+        // Walk the source tree for the command attribute and take the `fn` name
+        // that follows.
+        //
+        // The first version of this matched `line.trim() == "#[tauri::command]"`
+        // exactly and broke on the first non-`#` line. An audit got five real,
+        // compiling, unregistered commands past it — `#[tauri::command(async)]`,
+        // `#[tauri::command(rename_all = "snake_case")]`, a trailing comment,
+        // spaces in the path, and a bare `#[command]` after `use tauri::command`
+        // — plus `pub(crate) fn` and a `///` line between attribute and `fn`.
+        // Every one of those is a command the frontend could not call, which is
+        // the bug this test exists for, and the test stayed green.
+        //
+        // The asymmetry matters: confusion on the *definition* side is a silent
+        // pass, while on the *registration* side it fails loudly against
+        // legitimate code — and rustc already covers that direction. So this
+        // errs toward over-matching definitions.
+        fn collect(dir: &std::path::Path, out: &mut BTreeSet<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else { return };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    collect(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let Ok(text) = std::fs::read_to_string(&path) else { continue };
+                    let lines: Vec<&str> = text.lines().collect();
+                    for (i, line) in lines.iter().enumerate() {
+                        let t = line.trim();
+                        // `#[tauri::command]`, `#[tauri::command(async)]`,
+                        // `#[tauri :: command]`, a bare `#[command]` under
+                        // `use tauri::command`, and any of those with a
+                        // trailing comment.
+                        let attr = t.strip_prefix("#[").map(|a| {
+                            a.split(']').next().unwrap_or("").replace(' ', "")
+                        });
+                        let is_command_attr = attr.is_some_and(|a| {
+                            a == "command" || a == "tauri::command"
+                                || a.starts_with("command(")
+                                || a.starts_with("tauri::command(")
+                        });
+                        if !is_command_attr {
+                            continue;
+                        }
+                        // Skip further attributes and doc comments rather than
+                        // giving up at the first line that is not an attribute.
+                        for next in lines.iter().skip(i + 1) {
+                            let t = next.trim();
+                            if t.starts_with('#') || t.starts_with("//") || t.is_empty() {
+                                continue;
+                            }
+                            // Any visibility, then `fn` or `async fn`.
+                            let after_vis = t
+                                .strip_prefix("pub(crate) ")
+                                .or_else(|| t.strip_prefix("pub(super) "))
+                                .or_else(|| t.strip_prefix("pub(in crate) "))
+                                .or_else(|| t.strip_prefix("pub "))
+                                .unwrap_or(t);
+                            let after_async =
+                                after_vis.strip_prefix("async ").unwrap_or(after_vis);
+                            if let Some(rest) = after_async.strip_prefix("fn ") {
+                                if let Some(name) = rest.split(['(', '<']).next() {
+                                    out.insert(name.trim().to_string());
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        collect(
+            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src")),
+            &mut defined,
+        );
+
+        // The registration list, read from this file rather than from a macro
+        // expansion so the test does not depend on `generate_handler!`'s shape.
+        let this = include_str!("lib.rs");
+        let handler = this
+            .split_once("generate_handler![")
+            .and_then(|(_, rest)| rest.split_once("])"))
+            .map(|(inside, _)| inside)
+            .expect("lib.rs should contain a generate_handler! list");
+        // Line-based, not `split(',')`: the list is grouped under `// Docker`
+        // style comments, and splitting on commas glues each comment to the
+        // command that follows it. A `starts_with("//")` filter then drops that
+        // command — silently, and once per group.
+        let registered: BTreeSet<String> = handler
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("//"))
+            .filter_map(|l| {
+                l.trim_end_matches(',')
+                    .rsplit("::")
+                    .next()
+                    .map(|n| n.trim().to_string())
+            })
+            .filter(|n| !n.is_empty())
+            .collect();
+
+        assert!(
+            !defined.is_empty() && !registered.is_empty(),
+            "the scan found nothing — it has stopped testing anything (defined={}, registered={})",
+            defined.len(),
+            registered.len()
+        );
+
+        let unregistered: Vec<&String> = defined.difference(&registered).collect();
+        assert!(
+            unregistered.is_empty(),
+            "these commands exist but are not registered, so the frontend cannot call them: {:?}",
+            unregistered
+        );
+
+        let undefined: Vec<&String> = registered.difference(&defined).collect();
+        assert!(
+            undefined.is_empty(),
+            "these are registered but no `#[tauri::command]` defines them: {:?}",
+            undefined
+        );
+
+        // "exactly once" was in this test's name and not in its body: both
+        // sides were sets, so registering the same command twice in a
+        // hand-maintained 118-line list compiled, warned about nothing, and
+        // passed here.
+        let mut seen: Vec<&str> = Vec::new();
+        let mut duplicated: Vec<&str> = Vec::new();
+        for line in handler
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("//"))
+        {
+            if let Some(name) = line.trim_end_matches(',').rsplit("::").next() {
+                let name = name.trim();
+                if name.is_empty() {
+                    continue;
+                }
+                if seen.contains(&name) {
+                    duplicated.push(name);
+                } else {
+                    seen.push(name);
+                }
+            }
+        }
+        assert!(
+            duplicated.is_empty(),
+            "these are registered more than once: {:?}",
+            duplicated
+        );
+    }
+
+    #[test]
+    fn the_capability_grants_are_the_ones_that_were_reviewed() {
+        let raw = include_str!("../capabilities/default.json");
+        let parsed: serde_json::Value =
+            serde_json::from_str(raw).expect("capabilities/default.json must parse");
+        let listed: Vec<String> = parsed["permissions"]
+            .as_array()
+            .expect("a `permissions` array")
+            .iter()
+            .map(|p| match p {
+                // A scoped grant is an object; its identifier is what matters here.
+                serde_json::Value::Object(o) => o["identifier"]
+                    .as_str()
+                    .expect("a scoped grant needs an identifier")
+                    .to_string(),
+                other => other.as_str().expect("a grant is a string or an object").to_string(),
+            })
+            .collect();
+
+        let mut sorted = listed.clone();
+        sorted.sort();
+        let mut expected = vec![
+            "core:event:allow-listen",
+            "core:event:allow-unlisten",
+            "core:webview:allow-internal-toggle-devtools",
+            "dialog:allow-open",
+            "dialog:allow-save",
+            "opener:allow-open-url",
+        ];
+        expected.sort();
+        assert_eq!(
+            sorted, expected,
+            "the capability set changed. That is allowed — but it is the IPC \
+             surface a compromised webview can call, so update this list \
+             deliberately rather than to make the test pass."
+        );
+
+        // Belt and braces: the `*:default` aliases are the specific trap here,
+        // because they expand to a set the file never spells out. `store:*` in
+        // particular was an arbitrary host-file read/write primitive.
+        for grant in &listed {
+            assert!(
+                !grant.ends_with(":default"),
+                "{} is an alias — it expands to permissions this file does not \
+                 name. Enumerate them instead.",
+                grant
+            );
+            assert!(
+                !grant.starts_with("store:"),
+                "store:* is `PathBuf::push` against AppData, which an absolute \
+                 path discards: an arbitrary host-file read/write."
+            );
+        }
     }
 }

@@ -4,7 +4,11 @@ import Modal from "../ui/Modal";
 import StatusIndicator, { type StatusTone } from "../ui/StatusIndicator";
 import { selectClass } from "../ui/Field";
 import ClaudeAuthModal from "./ClaudeAuthModal";
-import { clearClaudeToken } from "../../lib/tauri-commands";
+import {
+  clearClaudeToken,
+  sweepClaudeTokenSnapshots,
+} from "../../lib/tauri-commands";
+import type { ClearTokenOutcome } from "../../lib/types";
 import { useProjects } from "../../hooks/useProjects";
 import { useAppState } from "../../store/appState";
 import { authErrorMessage, useClaudeTokenStatus } from "../../hooks/useClaudeAuth";
@@ -38,6 +42,32 @@ const STATUS_DISPLAY: Record<
 };
 
 /**
+ * `clear_claude_token` reports three separate things about the snapshot images
+ * that `docker commit` baked the token into, and they need three different
+ * sentences. `snapshots_skipped` in particular is **not** a failure of the
+ * rewrite — the project was busy (starting, compacting, migrating) and its
+ * snapshot was never attempted, so the remedy is to run the sweep again, not
+ * to Reset the project and lose both its volumes.
+ *
+ * `snapshots_skipped` is declared on `ClearTokenOutcome`, but it is still read
+ * through `list()` rather than indexed directly: a backend older than this
+ * change does not send the field at all, and a missing skip list must read as
+ * "nothing was skipped" rather than crashing the panel that reports it.
+ */
+type RevokeOutcome = ClearTokenOutcome;
+
+const list = (values: string[] | undefined): string[] => values ?? [];
+
+/** Whether a copy of the token is known — or suspected — to still be reachable. */
+function needsAnotherPass(outcome: RevokeOutcome): boolean {
+  return (
+    list(outcome.snapshots_failed).length > 0 ||
+    list(outcome.snapshots_skipped).length > 0 ||
+    Boolean(outcome.docker_unavailable)
+  );
+}
+
+/**
  * Host-level control for the one long-lived Claude Code token shared by every
  * project. Acquisition needs a running container to run the CLI in, so the
  * user picks which project lends one.
@@ -50,7 +80,14 @@ export default function SharedAuthSettings() {
   const [pickedId, setPickedId] = useState<string | null>(null);
   const [authOpen, setAuthOpen] = useState(false);
   const [confirmRevoke, setConfirmRevoke] = useState(false);
-  const [revoking, setRevoking] = useState(false);
+  const [sweeping, setSweeping] = useState(false);
+
+  // What the last sweep could not finish. Held in its own state rather than
+  // derived from `status`, because that is exactly the bug this fixes: a
+  // revoke clears the keychain, `status` flips to "absent", and the button
+  // that could have retried the snapshot rewrite disappeared with it —
+  // leaving a live ~1-year token in an image and Reset as the only remedy.
+  const [leftover, setLeftover] = useState<RevokeOutcome | null>(null);
 
   // `claude setup-token` runs inside a container, so only running projects can
   // host the flow.
@@ -61,45 +98,95 @@ export default function SharedAuthSettings() {
 
   const display = STATUS_DISPLAY[status];
 
-  const handleRevoke = async () => {
-    setRevoking(true);
+  /**
+   * Run one of the two cleanups. **They are different commands**, and that is
+   * the point.
+   *
+   * `"revoke"` deletes the keychain entry and then rewrites the images. It is
+   * destructive, and it is only ever reached through the confirmation modal.
+   *
+   * `"sweep"` rewrites the images and never touches the keychain. Both the
+   * standalone check and the retry offered after an incomplete revocation use
+   * it, because neither is a request to delete a credential — the images are
+   * the durable record of what is left to do, so the work is re-derived from
+   * Docker rather than from any token that happens to be stored.
+   *
+   * While there was one command behind both, the retry button was an
+   * unconfirmed revoke: re-authenticate from the button above the panel, press
+   * "Retry snapshot cleanup", and the token acquired seconds earlier was gone,
+   * announced by a toast that mentioned only images.
+   */
+  const runCleanup = async (mode: "revoke" | "sweep") => {
+    setSweeping(true);
     try {
-      const outcome = await clearClaudeToken();
+      const outcome = (await (mode === "revoke"
+        ? clearClaudeToken()
+        : sweepClaudeTokenSnapshots())) as RevokeOutcome;
       setConfirmRevoke(false);
-      await refresh();
 
-      // The keychain entry is gone either way. What matters here is the copy of
-      // the token that `docker commit` baked into each project's snapshot
-      // image: that one outlives every container, and `docker image inspect`
-      // will keep printing it until the image is rewritten. If that could not
-      // be done, the revocation is incomplete and saying "removed" would be a
-      // lie.
+      const failed = list(outcome.snapshots_failed);
+      const skipped = list(outcome.snapshots_skipped);
+      const scrubbed = list(outcome.snapshots_scrubbed);
+      const superseded = list(outcome.snapshots_superseded);
+
+      setLeftover(needsAnotherPass(outcome) ? outcome : null);
+
+      // Whatever the mode, what is being reported here is the copy of the
+      // token that `docker commit` baked into each project's snapshot image:
+      // that one outlives every container, and `docker image inspect` will
+      // keep printing it until the image is rewritten. On a revoke the
+      // keychain entry is already gone by this point — the command deletes it
+      // before it touches an image — so if the rewrite could not be done the
+      // revocation is incomplete and saying "removed" would be a lie. On a
+      // sweep nothing was deleted at all, and the wording must not imply it.
       if (outcome.docker_unavailable) {
         pushToast({
           kind: "error",
-          message: "Token removed from the keychain, but snapshots were not checked.",
+          message:
+            mode === "revoke"
+              ? "Token removed from the keychain, but snapshots were not checked."
+              : "Snapshot images were not checked.",
           detail:
             `Docker could not be reached (${outcome.docker_unavailable}), so any snapshot image ` +
             "built before this version may still contain the token in its environment. " +
-            "Start Docker and revoke again to clear them.",
+            "Start Docker and run the cleanup again to clear them.",
         });
-      } else if (outcome.snapshots_failed.length > 0) {
+      } else if (failed.length > 0) {
         pushToast({
           kind: "error",
-          message: "Token removed from the keychain, but it is still in some images.",
+          message:
+            mode === "revoke"
+              ? "Token removed from the keychain, but it is still in some images."
+              : "A token is still readable in some snapshot images.",
           detail:
-            `${outcome.snapshots_failed.length} snapshot image(s) could not be rewritten and ` +
+            `${failed.length} snapshot image(s) could not be rewritten and ` +
             "still contain the token, readable via `docker image inspect`. Reset those " +
-            `projects to remove the images. Details: ${outcome.snapshots_failed.join("; ")}`,
+            `projects to remove the images. Details: ${failed.join("; ")}` +
+            (skipped.length > 0
+              ? ` A further ${skipped.length} image(s) were skipped because their projects ` +
+                "are busy; those can be cleared by running the cleanup again."
+              : ""),
         });
-      } else if (outcome.snapshots_scrubbed.length > 0) {
+      } else if (skipped.length > 0) {
+        pushToast({
+          kind: "error",
+          message: `Token still in ${skipped.length} snapshot image(s) — those projects were busy.`,
+          detail:
+            "Nothing was rewritten for them, so the token is still readable via " +
+            "`docker image inspect`. Wait for the operation in progress to finish and run the " +
+            `cleanup again. Details: ${skipped.join("; ")}`,
+        });
+      } else if (scrubbed.length > 0) {
         pushToast({
           kind: "success",
-          message: `Shared Claude token removed, and cleared from ${outcome.snapshots_scrubbed.length} snapshot image(s).`,
+          message:
+            mode === "revoke"
+              ? `Shared Claude token removed, and cleared from ${scrubbed.length} snapshot image(s).`
+              : `Token cleared from ${scrubbed.length} snapshot image(s).`,
           detail:
-            outcome.snapshots_superseded.length > 0
+            superseded.length > 0
               ? "The pre-rewrite image layer for " +
-                `${outcome.snapshots_superseded.join(", ")} is still on disk because a ` +
+                `${superseded.join(", ")} is still on disk because a ` +
                 "container is running from it. It goes away once that project is restarted " +
                 "(which recreates the container) and Docker prunes the leftover."
               : undefined,
@@ -107,22 +194,43 @@ export default function SharedAuthSettings() {
       } else {
         pushToast({
           kind: "success",
-          message: "Shared Claude token removed from the keychain.",
+          message:
+            mode === "revoke"
+              ? "Shared Claude token removed from the keychain."
+              : "No snapshot image is holding the token.",
         });
       }
     } catch (e) {
       pushToast({
         kind: "error",
-        message: "Could not remove the shared Claude token.",
-        detail: authErrorMessage(
-          e,
-          "The OS keychain rejected the delete. The token may still be stored.",
-        ),
+        message:
+          mode === "revoke"
+            ? "Could not remove the shared Claude token."
+            : "Could not clear the token from snapshot images.",
+        detail:
+          mode === "revoke"
+            ? // The keychain delete runs first and nothing else runs until it
+              // succeeds, so the consequence is knowable and worth stating
+              // rather than leaving the user with a raw keyring error: the
+              // token is still stored, and no image was touched. Revoke stays
+              // on screen because `status` is still "stored", and the snapshot
+              // sweep beside it does not need this delete to have worked.
+              `${authErrorMessage(e, "The OS keychain rejected the delete.")} ` +
+              "The token is still stored and no snapshot image was changed — try again, " +
+              "or use “Check snapshot images” to clean the images on their own."
+            : authErrorMessage(e, "The snapshot images could not be checked."),
       });
     } finally {
-      setRevoking(false);
+      // In `finally` rather than in the success path: a failed revoke leaves
+      // the token stored, and the panel has to say so rather than keeping
+      // whatever it believed before the attempt.
+      await refresh();
+      setSweeping(false);
     }
   };
+
+  const leftoverFailed = list(leftover?.snapshots_failed);
+  const leftoverSkipped = list(leftover?.snapshots_skipped);
 
   return (
     <div className="space-y-3">
@@ -179,7 +287,11 @@ export default function SharedAuthSettings() {
         <Button
           size="md"
           variant="primary"
-          disabled={!host}
+          // Also disabled while a cleanup is running. A sweep is a per-image
+          // inspect/create/commit/rmi over the Docker socket and takes minutes;
+          // acquiring a token in the middle of one races the rewrite, and a
+          // revoke started before it would delete the new token when it lands.
+          disabled={!host || sweeping}
           onClick={() => setAuthOpen(true)}
         >
           {status === "stored" ? "Re-authenticate" : "Authenticate"}
@@ -188,13 +300,80 @@ export default function SharedAuthSettings() {
           <Button
             size="md"
             variant="danger"
-            disabled={revoking}
+            disabled={sweeping}
             onClick={() => setConfirmRevoke(true)}
           >
             Revoke
           </Button>
         )}
+        {status !== "checking" && (
+          // Offered in every state, not just "absent". Three reasons, and the
+          // command behind it deletes nothing, so none of them costs anything:
+          // a snapshot committed by an older build carries a token whether or
+          // not one is stored today; a revoke that could not finish leaves one
+          // in an image while the keychain entry — and the Revoke button — is
+          // already gone; and when the keychain refuses the delete, `status`
+          // stays "stored", which used to leave the images with no affordance
+          // at all.
+          <Button
+            size="md"
+            variant="ghost"
+            disabled={sweeping}
+            data-testid="shared-auth-sweep"
+            onClick={() => void runCleanup("sweep")}
+          >
+            {sweeping ? "Checking…" : "Check snapshot images"}
+          </Button>
+        )}
       </div>
+
+      {leftover && (
+        <div
+          data-testid="shared-auth-leftover"
+          className="rounded-[var(--radius-control)] border border-[var(--error)]/40 bg-[var(--error-muted)] p-2"
+        >
+          <StatusIndicator
+            tone="error"
+            label="Token still readable"
+            className="text-xs"
+          />
+          <p className="mt-1 text-xs text-[var(--text-secondary)] leading-snug">
+            {leftover.docker_unavailable
+              ? `Docker could not be reached (${leftover.docker_unavailable}), so no snapshot image was checked.`
+              : null}
+            {leftoverSkipped.length > 0 ? (
+              <>
+                {leftoverSkipped.length} snapshot image(s) were skipped because their
+                projects were busy. Nothing was rewritten for them, so the token is
+                still readable with{" "}
+                <code className="font-mono">docker image inspect</code>. Running the
+                cleanup again once those projects are idle clears them.
+              </>
+            ) : null}
+            {leftoverFailed.length > 0 ? (
+              <>
+                {" "}
+                {leftoverFailed.length} snapshot image(s) could not be rewritten:{" "}
+                {leftoverFailed.join("; ")}. If retrying does not help, Reset those
+                projects to remove the images.
+              </>
+            ) : null}
+          </p>
+          <div className="mt-2">
+            <Button
+              size="md"
+              variant="secondary"
+              disabled={sweeping}
+              data-testid="shared-auth-retry"
+              // `runCleanup("sweep")` is `sweep_claude_token_snapshots`, which
+              // has no keychain delete on the wire at all — see `runCleanup`.
+              onClick={() => void runCleanup("sweep")}
+            >
+              {sweeping ? "Retrying…" : "Retry snapshot cleanup"}
+            </Button>
+          </div>
+        </div>
+      )}
 
       {!host && (
         <p
@@ -221,6 +400,13 @@ export default function SharedAuthSettings() {
           projectName={host.name}
           onClose={() => setAuthOpen(false)}
           onAuthenticated={() => {
+            // The panel is about a *previous* credential and the button that
+            // finishes it is a sweep, so leaving it up after a fresh sign-in
+            // is at best confusing and was at worst fatal: while the retry ran
+            // `clear_claude_token`, the obvious next click deleted the token
+            // just acquired. "Check snapshot images" stays available above, so
+            // nothing is lost by clearing this.
+            setLeftover(null);
             void refresh();
           }}
         />
@@ -237,17 +423,17 @@ export default function SharedAuthSettings() {
                 size="md"
                 variant="ghost"
                 onClick={() => setConfirmRevoke(false)}
-                disabled={revoking}
+                disabled={sweeping}
               >
                 Cancel
               </Button>
               <Button
                 size="md"
                 variant="danger"
-                disabled={revoking}
-                onClick={() => void handleRevoke()}
+                disabled={sweeping}
+                onClick={() => void runCleanup("revoke")}
               >
-                {revoking ? "Revoking…" : "Revoke token"}
+                {sweeping ? "Revoking…" : "Revoke token"}
               </Button>
             </>
           }
@@ -260,11 +446,13 @@ export default function SharedAuthSettings() {
             restarted.
           </p>
           <p className="mt-2 text-[13px] text-[var(--text-secondary)] leading-snug">
-            Each project&rsquo;s snapshot image is also rewritten, because{" "}
-            <code className="font-mono">docker commit</code> copies the token into it
-            and an image outlives every container built from it. If any image
-            cannot be rewritten you will be told which, and the token stays readable
-            in it until that project is Reset.
+            The keychain entry goes first, then each project&rsquo;s snapshot image is
+            rewritten &mdash; <code className="font-mono">docker commit</code> copies
+            the token into it, and an image outlives every container built from it.
+            That second half takes a while, and a project that is busy right now is
+            skipped rather than rewritten unsafely: you will be told which, and
+            &ldquo;Check snapshot images&rdquo; runs the cleanup again afterwards
+            without touching the keychain.
           </p>
         </Modal>
       )}

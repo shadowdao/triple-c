@@ -128,8 +128,11 @@ Anthropic-backend project uses that token without its own login. See
 2. Claude prints an OAuth URL. Triple-C detects long URLs and shows a clickable toast at the top of the terminal — click **Open** to open it in your browser.
 3. Complete the login in your browser. The token is saved and persists across container stops, starts and recreations. A **Reset** deletes it — see below.
 
-> If the login hangs after the browser step, the callback could not reach the container. Enable the
-> [Auth Bridge](#browser-logins-inside-the-container-auth-bridge) for that project.
+> If the login hangs after the browser step, the callback could not reach the container. Either
+> click **In container** on the toast instead of **Open** — the callback then never has to leave the
+> container at all — or turn on the
+> [Auth Bridge](#browser-logins-inside-the-container-auth-bridge) in the project's
+> **Config → Runtime** section.
 
 **AWS Bedrock:**
 
@@ -225,7 +228,7 @@ buttons. Below that are six tabs:
 | **Sessions** | Past Claude Code conversations stored on this project's config volume, each with a **Resume** button |
 | **Automation** | The scheduled tasks running inside this container — see [Automation & Scheduled Tasks](#automation--scheduled-tasks) |
 | **Config** | All per-project configuration — see [Project Configuration](#project-configuration) |
-| **Files** | Browse, download and upload files inside the container |
+| **Files** | Browse, view and rename files inside the container, and move files between it and your own machine — see [Files](#files) |
 | **Browser** | Watch — and take over — the browser Claude is driving with Playwright, see [The Browser Tab](#the-browser-tab) |
 
 ### Sessions
@@ -348,7 +351,7 @@ it. The sidebar row carries only the two hover controls.
 | **Force stop** | Project Home header | Starting / Stopping | Interrupts a transition that is stuck |
 | **Open Claude Terminal** | Project Home header; sidebar hover control; `Ctrl+T` | Running | Opens a new Claude Code terminal tab |
 | **Shell** | Project Home header | Running | Opens a bash login shell tab in the container (no Claude Code) |
-| **Files** | Project Home header, and the **Files** tab | Running | Switches to the Files tab to browse, download and upload files |
+| **Files** | Project Home header, and the **Files** tab | Running | Switches to the Files tab to browse, view and rename files inside the container, upload files into it and save one back out |
 | **Config** | The **Config** tab | Always | Per-project configuration (most fields need the container stopped) |
 | **Back up container** | **⋯** overflow menu | A container exists | Saves a `.tar.gz` archive of the container to a location you choose |
 | **Reset container…** | **⋯** overflow menu | Stopped or Error | Destroys the container, snapshot image and both volumes, then recreates from the base image (wipes `~/.claude`) — asks first |
@@ -612,18 +615,27 @@ The **Claude Code settings** editor, also at the bottom of the Config tab, confi
 
 | Setting | What It Does |
 |---------|-------------|
-| **TUI Mode** | Set to **Fullscreen** for flicker-free alt-screen rendering (uses `CLAUDE_CODE_NO_FLICKER=1`) |
-| **Effort Level** | Controls reasoning depth: **Low** (fast, less thorough), **Medium**, **High** (deep reasoning) |
-| **Focus Mode** | Collapses tool output to one-line summaries, showing only the prompt and final response |
-| **Thinking Summaries** | Shows Claude's thinking process as summaries during responses |
-| **Session Recap** | Provides context when returning to a session after being away |
-| **Auto-Scroll Disabled** | Disables auto-scroll when in fullscreen TUI mode |
+| **TUI Mode** | **Automatic** lets Claude Code choose; **Classic** pins the main-screen renderer; **Fullscreen** pins the flicker-free alt-screen one |
+| **Effort Level** | Reasoning depth: **Low**, **Medium**, **High**, **Extra high** |
+| **Focus Mode** | Summarises tool *calls* to one line each, showing the last prompt and the final response. **Needs the fullscreen renderer** — set TUI Mode to Fullscreen or this does nothing |
+| **Thinking Summaries** | Shows Claude's thinking as summaries rather than a collapsed stub |
+| **Session Recap** | A one-line recap when you return to the terminal after a few minutes away. **On by default** — the switch is how you turn it off |
+| **Auto-Scroll** | Follows new output to the bottom in fullscreen rendering. On by default |
 | **Env Scrub** | Strips credentials from subprocess environments for security |
-| **Prompt Caching (1h)** | Enables 1-hour prompt cache TTL instead of the default 5 minutes |
+| **Prompt Caching (1h)** | Requests a 1-hour prompt cache TTL instead of the default 5 minutes |
 
-Per-project settings override global defaults set in Settings. If all settings are at their defaults, no configuration is injected.
+Each switch has three states on a project: **Global** (follow Settings), **On**, and **Off**. Off is a
+real choice — it overrides a global On, which a project could not previously do.
 
-> These settings map to Claude Code environment variables and `~/.claude/settings.json` entries. Changes require stopping and restarting the container to take effect.
+> These map to Claude Code environment variables and `~/.claude/settings.json` keys, and are applied
+> when the container starts. Changing one stops and recreates the container.
+>
+> **Two caveats on an existing project.** Changing any of these recreates the container, and a
+> recreation commits a new image layer — so flipping switches repeatedly costs disk. And
+> **TUI Mode, Effort Level, Focus Mode and Session Recap cannot be returned to Global** until the
+> project's base image is updated: those four are cleared by *removing* a key, and an older image's
+> startup script ignores the instruction to remove it. Update the base image from the project's
+> Overview tab first. The other switches work on any image.
 
 ### MCP Servers
 
@@ -788,6 +800,19 @@ web server they started on `localhost`. `claude login`, `aws sso login` and Conc
 *container's* — the browser on your host calls back into nothing and the login hangs forever.
 
 The **Auth Bridge** fixes this. It is **opt-in per project** and **off by default**.
+
+### Where the switch is
+
+Project Home → **Config** → **Runtime** → **Auth bridge**.
+
+Unlike the rest of that tab, it is **not** greyed out while the container is running — it is a
+host-side feature that recreates nothing, and the moment you want it is usually the moment a login
+is already hanging in a running container. Switch it on, then retry the login.
+
+Beside the switch is its live state: **Off**, **Watching** (on, nothing to bridge yet — normal,
+there is only something to bridge while a login is waiting), **Bridging *n* ports**, **IPv4 only**,
+or **Port conflict** with the port and the reason. A conflict means the host port was already taken
+and the callback will not arrive; free the port, or use **In container** instead.
 
 ### What it does
 
@@ -1145,14 +1170,61 @@ When you scroll up in the terminal to review previous output, a **Jump to Curren
 
 ### Files
 
-The **Files** tab of Project Home browses inside a running container. You can:
+The **Files** tab of Project Home browses inside a running container, and moves files between it
+and your own machine. You can:
 
-- **Browse** the container filesystem, starting at `/workspace`, with breadcrumb navigation
-- **Download** any file to your host machine via the **Download** button on each file entry
-- **Upload file** from your host into the current container directory
+- **Browse** the container filesystem, starting at `/workspace`, with breadcrumb navigation.
+  Double-click a folder to open it, or the `..` row to go up; the arrow keys, Home and End move
+  between rows and Enter opens the selected one
+- **View** a file — double-click it, or press Enter. Text files and images render in a read-only
+  viewer
+- **Rename** an entry, from the row's Rename button or by pressing `F2`. A rename never moves a
+  file between folders
+- **New folder** in the directory on screen
+- **Upload…**, from the toolbar, to copy files from your machine into the directory on screen
+- **Save to host…**, from a file's own row, to write that one file out to your machine
 - **Refresh** the directory listing at any time
 
-The listing shows file names, sizes, and modification dates.
+The listing shows file names, sizes, and modification dates, and marks symbolic links.
+
+#### Getting files in and out
+
+**Upload…** opens a file dialog on your machine, and whatever you choose is copied into the
+directory currently on screen. Uploaded files arrive owned by you inside the container, not by
+root. You can pick several files in one dialog; each is handled on its own, so if a folder or an
+over-sized file is among them, it is named in the message and the rest still arrive. Uploads are
+capped at **256 MB per file** — for anything larger, mount the folder into the project instead and
+skip the copying altogether.
+
+**Save to host…** does the reverse, for one file: a save dialog opens, you choose where the file
+goes, and it is written there. The button sits on the file's own row, and only on files. For a
+whole directory, use **Back up container** in Project Home's **⋯** overflow menu, which writes a
+`.tar.gz` of the workspace and the container's `~/.claude` config to a location you choose — that
+is still the right tool for a tree.
+
+Dragging a file from your desktop and **dropping it onto the Terminal tab** works too, and is often
+the quickest way in when you are already typing: the file is copied into the container and its path
+is typed into the terminal for you, ready to hand to Claude Code. (The whole terminal pane is a
+drop target, including its *Following* toggle.) The Files pane itself is not a drop target.
+
+Both dialogs are opened by Triple-C itself rather than by the page you are looking at. The page
+cannot name a place on your machine — it can only ask for a dialog — and nothing is read or written
+until you pick somewhere in it. Closing a dialog without choosing is not an error: nothing happens,
+and nothing is said about it.
+
+Every one of these routes refuses a location whose path passes through a hidden *folder* — anything
+with a component beginning with `.`, such as `~/.ssh`, `~/.cache` or `~/.local/share` — or a system
+location, and it checks both the path as written and where it points after any symbolic links. That
+rule catches more than it strictly needs to, so now and then it will refuse a place you genuinely
+meant, `~/.config` among them. The refusal is a plain sentence saying so; choose a visible location
+such as `~/Documents` or `~/Downloads`.
+
+The *file's own name* is a different matter, and dotfiles are fine: `.env`, `.gitignore` and the
+rest save normally, since you chose the name in the save dialog yourself. Only the folders on the
+way are judged.
+
+If you already keep the project in a folder mounted into the container, the simplest answer is
+usually none of the above: edit the file on your host and it is already inside.
 
 ### Terminal Rendering
 
@@ -1198,10 +1270,14 @@ change. Remember that a headless run cannot answer a permission prompt, so in an
 **Bypass** a task may stop early when Claude Code asks for approval; the run log records the mode
 that was used.
 
-### Creating Tasks (In the Container)
+### Creating Tasks
 
-There is no "add task" form in the app. Create tasks from a terminal in the container — either type
-the commands yourself in a **Shell** session, or just ask Claude to do it.
+The quickest route is the **New task** button on a project's **Automation** tab, which gives you a
+form for the name, the schedule and the prompt.
+
+You can also create tasks from a terminal in the container — type the commands yourself in a
+**Shell** session, or just ask Claude to do it. That is the better route when you want Claude to
+work out the schedule or the prompt for you, and it is what the rest of this section covers.
 
 ### Create a Recurring Task
 
@@ -1293,8 +1369,18 @@ triple-c-scheduler add --name "test" --schedule "0 */6 * * *" --prompt "Run test
 | **Ctrl+Shift+V** | Paste |
 | **Ctrl+V** | Paste an image from the clipboard into the container |
 | **Ctrl+Shift+M** | Toggle speech-to-text recording (when enabled) |
+| **Shift+Enter** | Insert a newline in Claude Code's prompt instead of submitting it |
+| **Alt+Enter** | The same thing, and it has always worked — it was simply never written down |
 
 Everything else goes straight through to the program running in the container.
+
+> **Shift+Enter** sends `ESC` + `CR`, the same bytes Claude Code's own `/terminal-setup` installs
+> for VS Code, Cursor, Alacritty and Zed — so there is nothing to run and no tip to follow. It is
+> bound in **Claude** tabs only: in a **bash** tab that sequence means nothing to readline, and
+> Shift+Enter there submits the line as it always has.
+>
+> In the [Web Terminal](#web-terminal-remote-access) the same chord works, and there is an **↵+**
+> key beside **Enter** on the mobile key row for devices with no Shift.
 
 ---
 
@@ -1402,8 +1488,18 @@ your machine (anything that isn't `http`/`https`).
 
 You opened the URL, signed in successfully, and the CLI in the terminal is still waiting. The
 callback from your browser is landing on your host's `localhost` while the CLI is listening on the
-*container's*. Enable the
-[Auth Bridge](#browser-logins-inside-the-container-auth-bridge) for that project and try again.
+*container's*.
+
+Two ways out, in order of least effort:
+
+1. Dismiss and re-trigger the login, then click **In container** on the toast rather than **Open**.
+   The page opens in a browser *inside* the container, so the callback never has to cross to the
+   host. This needs no auth bridge — only a running container with Playwright installed (Project
+   Home → **Browser**). For a recognised Anthropic sign-in link this is already the default button.
+2. Turn on the [Auth Bridge](#browser-logins-inside-the-container-auth-bridge) — Project Home →
+   **Config** → **Runtime** → **Auth bridge** — and try again. It can be switched on while the
+   container is running. Check the indicator beside it: **Port conflict** means the host port was
+   already taken and the callback still will not arrive.
 
 For Claude specifically, the simpler answer is usually
 [Shared Claude Authentication](#shared-claude-authentication), which finishes on an Anthropic-hosted

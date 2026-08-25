@@ -216,7 +216,17 @@ pub const SECRET_ENV_KEYS: &[&str] = &[
 /// `docker commit` copies a container's labels onto the image, every snapshot it
 /// commits. [`sweep_orphaned_snapshots`] treats it as the mark of provenance,
 /// which is what keeps the sweep away from the user's own images.
-const LABEL_MANAGED: &str = "triple-c.managed";
+pub(crate) const LABEL_MANAGED: &str = "triple-c.managed";
+/// Marks the throwaway container [`rewrite_image_without_secrets`] commits
+/// from. It exists so the Disk panel's reclaim bucket can distinguish a live
+/// credential rewrite from a leftover by label rather than by age.
+pub(crate) const LABEL_SCRUB: &str = "triple-c.scrub";
+
+/// Marks the image built from `container/Dockerfile` itself, as opposed to a
+/// project snapshot committed from a container. Only ever `"true"` on a base
+/// image; `create_container` writes it explicitly empty so an inherited value
+/// cannot travel onto a snapshot. See the `LABEL` block in the Dockerfile.
+pub(crate) const LABEL_BASE: &str = "triple-c.base";
 
 const RESERVED_ENV_PREFIXES: &[&str] = &["ANTHROPIC_", "AWS_", "GIT_", "HOST_", "TRIPLE_C_"];
 
@@ -232,9 +242,19 @@ const RESERVED_ENV_EXACT: &[&str] = &[
     "CLAUDE_INSTRUCTIONS",
     "MCP_SERVERS_JSON",
     "CLAUDE_CODE_SETTINGS_JSON",
+    "CLAUDE_CODE_SETTINGS_CLEAR",
     "MISSION_CONTROL_ENABLED",
     "VPN_SUPPORT_ENABLED",
     "TRIPLE_C_PERMISSION_MODE",
+    // The four env vars the Claude Code settings editor drives. Reserved for
+    // the `VPN_SUPPORT_ENABLED` reason: each is now written on every create,
+    // including its off value, so a hand-set custom var of the same name would
+    // either be overridden without explanation or override the setting behind
+    // the UI's back, depending on which one Docker kept.
+    "CLAUDE_CODE_NO_FLICKER",
+    "CLAUDE_CODE_ENABLE_AWAY_SUMMARY",
+    "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB",
+    "ENABLE_PROMPT_CACHING_1H",
     CLAUDE_OAUTH_TOKEN_ENV,
     // The model-alias vars are already covered by the `ANTHROPIC_` prefix
     // above; they are listed explicitly so that a future narrowing of the
@@ -615,8 +635,14 @@ fn compute_ports_fingerprint(port_mappings: &[PortMapping]) -> String {
     sha256_hex(&joined)
 }
 
-/// Merge global and per-project ClaudeCodeSettings.
-/// Per-project fields override global fields when set (non-default).
+/// Merge global and per-project `ClaudeCodeSettings`.
+///
+/// A project field that is `Some` wins outright — **including `Some(false)`**.
+/// That is the point of the widening: these used to be plain `bool`s ORed
+/// together (`if p.x { true } else { g.x }`), so a project could only ever add
+/// to the global set and never turn a globally-enabled setting off. `None` at
+/// project level means "inherit", which is now a state the project can
+/// actually be in rather than the only state an off switch could produce.
 fn merge_claude_code_settings(
     global: Option<&ClaudeCodeSettings>,
     project: Option<&ClaudeCodeSettings>,
@@ -626,16 +652,15 @@ fn merge_claude_code_settings(
         (Some(g), None) => Some(g.clone()),
         (None, Some(p)) => Some(p.clone()),
         (Some(g), Some(p)) => {
-            // Project overrides global for each field when the project value is non-default
             Some(ClaudeCodeSettings {
                 tui_mode: p.tui_mode.clone().or_else(|| g.tui_mode.clone()),
                 effort: p.effort.clone().or_else(|| g.effort.clone()),
-                auto_scroll_disabled: if p.auto_scroll_disabled { true } else { g.auto_scroll_disabled },
-                focus_mode: if p.focus_mode { true } else { g.focus_mode },
-                show_thinking_summaries: if p.show_thinking_summaries { true } else { g.show_thinking_summaries },
-                enable_session_recap: if p.enable_session_recap { true } else { g.enable_session_recap },
-                env_scrub: if p.env_scrub { true } else { g.env_scrub },
-                prompt_caching_1h: if p.prompt_caching_1h { true } else { g.prompt_caching_1h },
+                auto_scroll_disabled: p.auto_scroll_disabled.or(g.auto_scroll_disabled),
+                focus_mode: p.focus_mode.or(g.focus_mode),
+                show_thinking_summaries: p.show_thinking_summaries.or(g.show_thinking_summaries),
+                session_recap_disabled: p.session_recap_disabled.or(g.session_recap_disabled),
+                env_scrub: p.env_scrub.or(g.env_scrub),
+                prompt_caching_1h: p.prompt_caching_1h.or(g.prompt_caching_1h),
             })
         }
     }
@@ -643,10 +668,23 @@ fn merge_claude_code_settings(
 
 /// Compute a fingerprint for the Claude Code settings so we can detect changes.
 /// The `sandbox_enabled` flag is included so that toggling sandbox mode forces
-/// a container recreation (re-injecting the merged settings.json). When
-/// sandbox is off the historical fingerprint is preserved unchanged so that
-/// upgrading triple-c does not spuriously flag every existing container for
-/// recreation.
+/// a container recreation (re-injecting the merged settings.json).
+///
+/// **This formula changed, and the change is not free.** It used to read
+/// `format!("{}", bool)`; the booleans are now `Option<bool>` and it reads
+/// `format!("{:?}")`, because `None` (inherit) and `Some(false)` (a deliberate
+/// off) must not hash alike — conflating them leaves a container un-recreated
+/// on a real change. The consequence is that **every existing project holding
+/// a settings object gets a different fingerprint on first launch after this
+/// upgrade, and is recreated once.** A recreation commits a snapshot layer, so
+/// that is a one-off disk cost per project, paid silently.
+///
+/// An earlier version of this comment claimed the opposite — that "the
+/// historical fingerprint is preserved unchanged so that upgrading triple-c
+/// does not spuriously flag every existing container for recreation." That was
+/// carried over from before the widening and was false the moment the format
+/// string changed. It is recorded here because a reviewer who believed it would
+/// conclude the churn cannot happen.
 fn compute_claude_code_settings_fingerprint(
     settings: Option<&ClaudeCodeSettings>,
     sandbox_enabled: bool,
@@ -657,12 +695,16 @@ fn compute_claude_code_settings_fingerprint(
             let parts = vec![
                 s.tui_mode.as_deref().unwrap_or("").to_string(),
                 s.effort.as_deref().unwrap_or("").to_string(),
-                format!("{}", s.auto_scroll_disabled),
-                format!("{}", s.focus_mode),
-                format!("{}", s.show_thinking_summaries),
-                format!("{}", s.enable_session_recap),
-                format!("{}", s.env_scrub),
-                format!("{}", s.prompt_caching_1h),
+                // `{:?}` rather than `{}` so `None` and `Some(false)` produce
+                // different text. They mean different things — inherit versus a
+                // deliberate off — and a fingerprint that conflated them would
+                // leave the container un-recreated on a real change.
+                format!("{:?}", s.auto_scroll_disabled),
+                format!("{:?}", s.focus_mode),
+                format!("{:?}", s.show_thinking_summaries),
+                format!("{:?}", s.session_recap_disabled),
+                format!("{:?}", s.env_scrub),
+                format!("{:?}", s.prompt_caching_1h),
             ];
             sha256_hex(&parts.join("|"))
         }
@@ -674,34 +716,164 @@ fn compute_claude_code_settings_fingerprint(
     }
 }
 
-/// Build the settings.json content for Claude Code.
-/// Returns a JSON string of the settings to be written to ~/.claude/settings.json.
-/// Always emits a `sandbox.enabled` key reflecting the current per-project
-/// toggle so that flipping it off in triple-c overrides any prior on-state
-/// stored in the persisted settings.json (which lives in a named volume).
+/// The four Claude Code env vars the settings editor drives, as `KEY=VALUE`.
+///
+/// **All four are emitted on every create, including their off value.** This is
+/// the `MANAGED_AUTH_KEYS` rule: `docker commit` bakes a container's env into
+/// the snapshot image, and the next container inherits anything the create does
+/// not override. A `=1` written once would ride that snapshot into every future
+/// container and make the switch impossible to turn back off — the same
+/// stickiness [`build_claude_code_settings_json`] fixes on the settings.json
+/// side, in a place where it is even less visible.
+///
+/// Two of them use an **empty** value for "off", and the distinction matters:
+///
+/// * `CLAUDE_CODE_NO_FLICKER` documents `1` as fullscreen-on and `0` as
+///   fullscreen-*off*, and it overrides the `tui` setting. `0` is therefore not
+///   neutral — it would silently pin every project that has expressed no
+///   preference to the classic renderer, when an unset `tui` is supposed to let
+///   Claude Code choose. Empty is neither value, so it reads as unset while
+///   still overriding a baked `1`.
+/// * `CLAUDE_CODE_ENABLE_AWAY_SUMMARY` outranks both `awaySummaryEnabled` and
+///   the in-container `/config` toggle. `0` is exactly right for "the user
+///   turned the recap off in Triple-C", but a blanket `1` for the default state
+///   would force the recap back on for someone who had turned it off with
+///   `/config` inside their own container. Triple-C's default must not overrule
+///   a choice it never asked about.
+///
+/// The other two are documented as "set to `1` to …" with no meaning attached
+/// to `0`, so `0` is unambiguously neutral and is stated outright.
+fn claude_code_env_vars(settings: Option<&ClaudeCodeSettings>) -> Vec<String> {
+    let owned;
+    let s = match settings {
+        Some(s) => s,
+        None => {
+            owned = ClaudeCodeSettings::default();
+            &owned
+        }
+    };
+
+    vec![
+        format!(
+            "CLAUDE_CODE_NO_FLICKER={}",
+            match s.tui_mode.as_deref() {
+                Some("fullscreen") => "1",
+                Some("default") => "0",
+                _ => "",
+            }
+        ),
+        format!(
+            "CLAUDE_CODE_ENABLE_AWAY_SUMMARY={}",
+            if s.session_recap_disabled.unwrap_or(false) { "0" } else { "" }
+        ),
+        format!(
+            "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB={}",
+            if s.env_scrub.unwrap_or(false) { "1" } else { "0" }
+        ),
+        format!(
+            "ENABLE_PROMPT_CACHING_1H={}",
+            if s.prompt_caching_1h.unwrap_or(false) { "1" } else { "0" }
+        ),
+    ]
+}
+
+/// Build the settings.json payload for Claude Code, handed to the container as
+/// `CLAUDE_CODE_SETTINGS_JSON` and applied by `entrypoint.sh`.
+///
+/// ## Every managed key is always present, and `null` means "delete"
+///
+/// The settings file lives on `triple-c-claude-config-{projectId}`, a named
+/// volume that outlives the container, and the entrypoint *merges* into it. So
+/// a key emitted only when it is non-default can be written once and never
+/// taken back: turning the setting off simply omits the key, the merge
+/// preserves whatever was there, and the setting stays on forever. Only a
+/// destructive Reset — which also deletes the OAuth login, skills and
+/// transcripts — ever cleared it. Four of the six keys here were sticky that
+/// way; the `sandbox` block already carried the workaround and the comment
+/// explaining it, and this is the same treatment applied to the rest.
+///
+/// Two shapes of "off" are needed, because Claude Code's own defaults differ:
+///
+/// * **A boolean with a documented default** (`autoScrollEnabled` is `true`,
+///   `showThinkingSummaries` is `false`) is emitted with that neutral value.
+/// * **A key whose neutral state is *unset*** (`tui`, `effortLevel`,
+///   `viewMode`, `awaySummaryEnabled`) is emitted as JSON `null`, and the
+///   entrypoint deletes rather than merges those. Writing a stand-in value
+///   would not be neutral: an unset `tui` lets Claude Code choose the renderer
+///   (`"default"` pins the classic one), and an unset `viewMode` lets the
+///   user's own sticky `/focus` choice and `verbose` setting apply
+///   (`"default"` overrides both).
+///
+/// Returns a `String` rather than an `Option<String>`: there is no longer any
+/// input for which this produces nothing to say.
 fn build_claude_code_settings_json(
     settings: Option<&ClaudeCodeSettings>,
     sandbox_enabled: bool,
-) -> Option<String> {
+) -> String {
+    let owned;
+    let s = match settings {
+        Some(s) => s,
+        // No struct at all is not "say nothing" — it is "every setting is at
+        // its default", which still has to be asserted over a stale file.
+        None => {
+            owned = ClaudeCodeSettings::default();
+            &owned
+        }
+    };
+
     let mut map = serde_json::Map::new();
 
-    if let Some(s) = settings {
-        if let Some(ref tui) = s.tui_mode {
-            map.insert("tui".to_string(), serde_json::json!(tui));
-        }
-        if let Some(ref effort) = s.effort {
-            map.insert("effort".to_string(), serde_json::json!(effort));
-        }
-        if s.auto_scroll_disabled {
-            map.insert("autoScrollEnabled".to_string(), serde_json::json!(false));
-        }
-        if s.focus_mode {
-            map.insert("focusMode".to_string(), serde_json::json!(true));
-        }
-        if s.show_thinking_summaries {
-            map.insert("showThinkingSummaries".to_string(), serde_json::json!(true));
-        }
-    }
+    // `null` clears; see the module doc above.
+    map.insert(
+        "tui".to_string(),
+        match s.tui_mode {
+            Some(ref tui) => serde_json::json!(tui),
+            None => serde_json::Value::Null,
+        },
+    );
+    // `effortLevel`, not `effort`. Claude Code has never read a key called
+    // `effort`, so the previous value was written and silently ignored.
+    map.insert(
+        "effortLevel".to_string(),
+        match s.effort {
+            Some(ref effort) => serde_json::json!(effort),
+            None => serde_json::Value::Null,
+        },
+    );
+    // Documented default `true`, so the neutral value is a value.
+    map.insert(
+        "autoScrollEnabled".to_string(),
+        serde_json::json!(!s.auto_scroll_disabled.unwrap_or(false)),
+    );
+    // Documented default `false`.
+    map.insert(
+        "showThinkingSummaries".to_string(),
+        serde_json::json!(s.show_thinking_summaries.unwrap_or(false)),
+    );
+    // `viewMode: "focus"` is the real setting behind what the UI calls focus
+    // mode — "collapses tool output to one-line summaries" is that key's
+    // documented behaviour. The `focusMode` key it replaces was invented and
+    // did nothing.
+    map.insert(
+        "viewMode".to_string(),
+        if s.focus_mode.unwrap_or(false) {
+            serde_json::json!("focus")
+        } else {
+            serde_json::Value::Null
+        },
+    );
+    // The recap is on by default, so only the *off* case has anything to write.
+    // `CLAUDE_CODE_ENABLE_AWAY_SUMMARY` (set unconditionally at creation) takes
+    // precedence over this key and is what actually enforces the choice; this
+    // is here so the container's settings.json does not contradict it.
+    map.insert(
+        "awaySummaryEnabled".to_string(),
+        if s.session_recap_disabled.unwrap_or(false) {
+            serde_json::json!(false)
+        } else {
+            serde_json::Value::Null
+        },
+    );
 
     // Always emit `sandbox.enabled` so that toggling the per-project sandbox
     // off in triple-c clears any prior on-state in the persisted
@@ -719,11 +891,49 @@ fn build_claude_code_settings_json(
     };
     map.insert("sandbox".to_string(), sandbox_obj);
 
-    if map.is_empty() {
-        None
-    } else {
-        Some(serde_json::Value::Object(map).to_string())
+    serde_json::Value::Object(map).to_string()
+}
+
+/// Split the managed payload into the half that is safe to merge anywhere and
+/// the list of keys to delete.
+///
+/// The null-means-delete convention is only understood by the `entrypoint.sh`
+/// shipped alongside this code — and an existing project recreates from *its
+/// own snapshot image*, which carries whatever entrypoint it was built with. An
+/// older one merges with a plain `.[0] * .[1]`, which would write the literal
+/// `null`s straight into the user's `settings.json` rather than clearing the
+/// keys. A settings file Claude Code then rejects would take the user's own
+/// `model`, `statusLine` and everything else in it down with it.
+///
+/// So the nulls never leave Rust. `CLAUDE_CODE_SETTINGS_JSON` carries only real
+/// values and stays safe under either merge; `CLAUDE_CODE_SETTINGS_CLEAR`
+/// carries the key names to delete and is simply ignored by an entrypoint that
+/// predates it. Such a project keeps the old sticky behaviour until it is
+/// migrated or Reset — which is the pre-existing state, not a regression.
+pub(crate) fn split_claude_code_settings_payload(payload: &str) -> (String, String) {
+    let parsed: serde_json::Value = match serde_json::from_str(payload) {
+        Ok(v) => v,
+        // Not our business to fix; hand it through and let the merge fail loudly.
+        Err(_) => return (payload.to_string(), "[]".to_string()),
+    };
+    let Some(obj) = parsed.as_object() else {
+        return (payload.to_string(), "[]".to_string());
+    };
+
+    let mut set = serde_json::Map::new();
+    let mut clear: Vec<serde_json::Value> = Vec::new();
+    for (k, v) in obj {
+        if v.is_null() {
+            clear.push(serde_json::json!(k));
+        } else {
+            set.insert(k.clone(), v.clone());
+        }
     }
+
+    (
+        serde_json::Value::Object(set).to_string(),
+        serde_json::Value::Array(clear).to_string(),
+    )
 }
 
 pub async fn find_existing_container(project: &Project) -> Result<Option<String>, String> {
@@ -919,6 +1129,64 @@ fn explain_container_failure(action: &str, err: &str) -> String {
     }
 
     format!("Failed to {} container: {}", action, err)
+}
+
+/// One bind mount per stored project path, skipping the rows that cannot
+/// produce a usable one.
+///
+/// Both halves of the filter are about data that is **already on disk**, which
+/// is why this is a silent skip and not a validation error. `project_commands`
+/// now refuses an empty `mount_name` or `host_path` on save, and the Workspace
+/// pane can no longer send a half-filled row — but neither of those reaches a
+/// record written before they existed, and the two failures such a record
+/// causes are not equally visible:
+///
+/// * An empty `host_path` becomes `{"Target":"/workspace/x","Source":""}`, and
+///   the daemon answers `invalid mount config for type "bind": field Source
+///   must not be empty` for the whole create. The project cannot be started or
+///   recreated at all — it is bricked, and it stays bricked however carefully
+///   the next save is validated. Skipping the row lets it start again, minus a
+///   mount that was never going to work.
+/// * An empty `mount_name` targets `/workspace/` itself, mounting the row's
+///   host directory *over* the workspace volume. The daemon then creates the
+///   other rows' mount points inside the user's real folder, which is a
+///   directory tree appearing in their project from nowhere.
+///
+/// Failing louder is the wrong instinct here: the loud version is the one that
+/// already happened, and it took the project down with it. See
+/// `project_commands.rs`'s `check_mount_name_stays_under_workspace` for the
+/// save-time half — deliberately still tolerant of an empty name there, since
+/// refusing it would re-brick every project holding a legacy row.
+fn project_path_mounts(paths: &[crate::models::project::ProjectPath]) -> Vec<Mount> {
+    paths
+        .iter()
+        // Trimmed, because a name of `" "` targets `/workspace/ ` and a source
+        // of `" "` is a path the daemon will happily create at the filesystem
+        // root — neither is what anyone typed on purpose.
+        .filter(|pp| {
+            let keep = !pp.mount_name.trim().is_empty() && !pp.host_path.trim().is_empty();
+            if !keep {
+                // Silence here means a folder the user configured simply does
+                // not appear in the container, with no error and no toast.
+                // Skipping is still right — the alternative is a project that
+                // cannot start — but it should leave a trace.
+                log::warn!(
+                    "Skipping an unmountable project path row (host_path={:?}, mount_name={:?}): \
+                     both are required. The project will start without it.",
+                    pp.host_path,
+                    pp.mount_name
+                );
+            }
+            keep
+        })
+        .map(|pp| Mount {
+            target: Some(format!("/workspace/{}", pp.mount_name)),
+            source: Some(pp.host_path.clone()),
+            typ: Some(MountTypeEnum::BIND),
+            read_only: Some(false),
+            ..Default::default()
+        })
+        .collect()
 }
 
 pub async fn create_container(
@@ -1320,51 +1588,36 @@ pub async fn create_container(
         global_claude_code_settings,
         project.claude_code_settings.as_ref(),
     );
-    if let Some(ref cc) = merged_cc_settings {
-        // Env-var-based settings (these are read directly by Claude Code)
-        if cc.tui_mode.as_deref() == Some("fullscreen") {
-            env_vars.push("CLAUDE_CODE_NO_FLICKER=1".to_string());
-        }
-        if cc.enable_session_recap {
-            env_vars.push("CLAUDE_CODE_ENABLE_AWAY_SUMMARY=1".to_string());
-        }
-        if cc.env_scrub {
-            env_vars.push("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1".to_string());
-        }
-        if cc.prompt_caching_1h {
-            env_vars.push("ENABLE_PROMPT_CACHING_1H=1".to_string());
-        }
-    }
+    // Env-var-based settings, read directly by Claude Code. Extracted and unit
+    // tested for the `vpn_host_config` reason: a container is created once, by
+    // a very long function, and a variable emitted with the wrong value here is
+    // invisible until someone wonders why a switch does nothing.
+    env_vars.extend(claude_code_env_vars(merged_cc_settings.as_ref()));
 
-    // settings.json-based settings (written by the entrypoint).
-    // Always invoked so per-project sandbox state is injected even when no
-    // ClaudeCodeSettings struct is present.
-    if let Some(settings_json) = build_claude_code_settings_json(
-        merged_cc_settings.as_ref(),
-        project.sandbox_mode_enabled,
-    ) {
-        env_vars.push(format!("CLAUDE_CODE_SETTINGS_JSON={}", settings_json));
-    }
+    // settings.json-based settings (applied by the entrypoint). Always emitted,
+    // even with no `ClaudeCodeSettings` struct present: the payload asserts the
+    // *whole* managed key set, so "no settings" still has to be stated over a
+    // settings.json left behind on the config volume by a previous config.
+    // Split so the payload is safe under an older entrypoint that has never
+    // heard of the null-means-delete convention — see
+    // `split_claude_code_settings_payload`.
+    let (cc_settings_set, cc_settings_clear) = split_claude_code_settings_payload(
+        &build_claude_code_settings_json(merged_cc_settings.as_ref(), project.sandbox_mode_enabled),
+    );
+    env_vars.push(format!("CLAUDE_CODE_SETTINGS_JSON={}", cc_settings_set));
+    env_vars.push(format!("CLAUDE_CODE_SETTINGS_CLEAR={}", cc_settings_clear));
 
     let mut mounts: Vec<Mount> = Vec::new();
 
     // Project directories -> /workspace/{mount_name}
-    for pp in &project.paths {
-        mounts.push(Mount {
-            target: Some(format!("/workspace/{}", pp.mount_name)),
-            source: Some(pp.host_path.clone()),
-            typ: Some(MountTypeEnum::BIND),
-            read_only: Some(false),
-            ..Default::default()
-        });
-    }
+    mounts.extend(project_path_mounts(&project.paths));
 
     // Named volume for the entire home directory — preserves ~/.claude.json,
     // ~/.local (pip/npm globals), and any other user-level state across
     // container stop/start cycles.
     mounts.push(Mount {
         target: Some("/home/claude".to_string()),
-        source: Some(format!("triple-c-home-{}", project.id)),
+        source: Some(home_volume_name(&project.id)),
         typ: Some(MountTypeEnum::VOLUME),
         read_only: Some(false),
         ..Default::default()
@@ -1374,7 +1627,7 @@ pub async fn create_container(
     // inside the home volume; Docker gives the more-specific mount precedence.
     mounts.push(Mount {
         target: Some("/home/claude/.claude".to_string()),
-        source: Some(format!("triple-c-claude-config-{}", project.id)),
+        source: Some(config_volume_name(&project.id)),
         typ: Some(MountTypeEnum::VOLUME),
         read_only: Some(false),
         ..Default::default()
@@ -1571,6 +1824,14 @@ pub async fn create_container(
     // always meant to do.
     labels.insert("triple-c.mcp-fingerprint".to_string(), String::new());
 
+    // Same defence, for the label `container/Dockerfile` now stamps on the base
+    // image. Docker merges an image's labels into the container it creates, and
+    // `docker commit` copies the container's labels onto the snapshot — so
+    // without this line every project snapshot would inherit
+    // `triple-c.base=true` from the base it descends from and claim to *be* a
+    // base image. Writing it explicitly empty overrides the inherited value.
+    labels.insert(LABEL_BASE.to_string(), String::new());
+
     for (key, value) in extras.extra_labels {
         labels.insert((*key).to_string(), (*value).to_string());
     }
@@ -1581,6 +1842,7 @@ pub async fn create_container(
         mounts: Some(mounts),
         port_bindings: if port_bindings.is_empty() { None } else { Some(port_bindings) },
         init: Some(true),
+        log_config: Some(capped_log_config()),
         cap_add,
         devices,
         sysctls,
@@ -1616,6 +1878,36 @@ pub async fn create_container(
         .map_err(|e| explain_container_failure("create", &e.to_string()))?;
 
     Ok(response.id)
+}
+
+/// The rotation policy every Triple-C container is created with.
+///
+/// Without this a container inherits the daemon's `json-file` default, which
+/// has **no size limit at all** — `docker logs` for a container that has been
+/// up for weeks is a single file that grows until the disk does not have room
+/// for it. Triple-C containers are long-lived by design (stop/start, not
+/// create/destroy), and the entrypoint plus anything a session leaves running
+/// on stdout all land in that one file.
+///
+/// 10 MiB × 3 keeps roughly the last 30 MiB, which is far more scrollback than
+/// anything reads, and bounds the worst case at 30 MiB per project instead of
+/// unbounded.
+///
+/// **Deliberately not part of `container_needs_recreation`.** That check is
+/// label-based, so participating would mean a new `triple-c.*` label whose only
+/// effect is to recreate every existing project once — and a recreation costs a
+/// `docker commit`, i.e. a permanent multi-gigabyte layer, which is the very
+/// thing this whole change set exists to avoid. Containers pick the policy up
+/// on their next natural recreation instead; an existing container keeps its
+/// unbounded log until then, which is exactly the status quo.
+fn capped_log_config() -> bollard::models::HostConfigLogConfig {
+    bollard::models::HostConfigLogConfig {
+        typ: Some("json-file".to_string()),
+        config: Some(HashMap::from([
+            ("max-size".to_string(), "10m".to_string()),
+            ("max-file".to_string(), "3".to_string()),
+        ])),
+    }
 }
 
 pub async fn start_container(container_id: &str) -> Result<(), String> {
@@ -1660,6 +1952,29 @@ pub async fn remove_container(container_id: &str) -> Result<(), String> {
 pub fn get_snapshot_image_name(project: &Project) -> String {
     format!("triple-c-snapshot-{}:latest", project.id)
 }
+
+/// Name of the named volume mounted at `/home/claude`.
+///
+/// Takes the id rather than the `Project` because the disk view runs this
+/// mapping backwards: it reads volume names off the daemon and has to decide
+/// which project — if any — each one belongs to. See [`HOME_VOLUME_PREFIX`].
+pub fn home_volume_name(project_id: &str) -> String {
+    format!("{}{}", HOME_VOLUME_PREFIX, project_id)
+}
+
+/// Name of the named volume mounted at `/home/claude/.claude`, nested inside
+/// the home volume. This is the one holding the OAuth credential, the plugins
+/// and every session transcript.
+pub fn config_volume_name(project_id: &str) -> String {
+    format!("{}{}", CONFIG_VOLUME_PREFIX, project_id)
+}
+
+/// Prefix of [`home_volume_name`]. Split out because orphan detection scans the
+/// daemon's volume list for these prefixes and strips them back to a project id.
+pub const HOME_VOLUME_PREFIX: &str = "triple-c-home-";
+
+/// Prefix of [`config_volume_name`]. See [`HOME_VOLUME_PREFIX`].
+pub const CONFIG_VOLUME_PREFIX: &str = "triple-c-claude-config-";
 
 /// Keep the container's `~/.aws/credentials` in sync with the project's Bedrock
 /// auth on every container start:
@@ -1768,6 +2083,876 @@ chmod 600 "$HOME/.aws/credentials""#;
     Ok(())
 }
 
+/// Paths deleted from a container's writable layer immediately before
+/// [`commit_container_snapshot`] runs.
+///
+/// ## Why this exists
+///
+/// Every recreation commits the container, and a commit **stacks a new layer**
+/// on top of the previous snapshot — it never rewrites one. Deleting a file
+/// after it has been committed does not give the bytes back; it writes a
+/// whiteout entry and the original bytes stay in the layer below, forever. One
+/// project was measured carrying 14 stacked commit layers and ~5.1 GB above its
+/// base image, and 24 different conditions trigger a recreation, so changing a
+/// single settings field costs a multi-gigabyte layer that nothing can reclaim.
+///
+/// The only moment the bytes are still free to drop is *before* the commit that
+/// captures them. Measured on one container's 4.48 GB pending writable layer:
+/// 3.0 GB of agent scratchpad under `/tmp/claude-*`, the drag-and-drop staging
+/// area (up to 256 MiB per dropped file, and nothing in the app ever removes
+/// one), one PNG per pasted image, and the apt lists/cache/logs left by every
+/// runtime `apt-get install` the browser-view installer and the Playwright
+/// healer run — none of which has an `apt-get clean` behind it.
+///
+/// ## Why a hardcoded list and not a heuristic
+///
+/// A snapshot is the user's system layer: their packages, their `/opt`, their
+/// `/var/lib/postgresql`. Nothing here may guess. Every entry is an absolute
+/// path anchored to a directory Triple-C or a package manager owns:
+///
+/// * `/workspace/{mount_name}` subtrees are **host bind mounts** — the user's
+///   real project directories. No entry may ever reach one, which is why no
+///   pattern here starts with `/workspace`.
+/// * The only bind mounts under `/tmp` are `/tmp/.host-ca` and `/tmp/.host-aws`
+///   (both read-only). A leading-dot name is not matched by a shell glob, and
+///   none of these patterns share their prefix.
+/// * The apt entries keep their parent directory and remove only its contents
+///   (`lists/*`, `archives/*.deb`, `apt/*`); `apt-get` is unhappy when the
+///   directories themselves are missing.
+///
+/// ## Why a safe-looking *pattern* is not enough (C1)
+///
+/// The list used to be the whole of the defence, and that was wrong. These
+/// patterns are expanded by `/bin/sh` inside the container running as **root**,
+/// and for an entry ending `/*` the parent is a *path component*: both the glob
+/// expansion and the `rm -rf` that follows resolve it. The agent in the
+/// container has passwordless sudo, so anything able to run
+/// `ln -s /workspace/myproject /var/log/apt` turns the next commit into a
+/// recursive delete of the user's real files **on the host**. That was
+/// reproduced end to end against a live container — a bind mount emptied by a
+/// scrub whose path list named no `/workspace` anywhere.
+///
+/// (The entries whose glob is in the last component are the benign case: there
+/// the *match* is the symlink, and `rm -rf -- link` unlinks the link and stops.
+/// The distinction is not one a reviewer should have to make per entry, so the
+/// script defends both alike.)
+///
+/// So these entries are only half the contract. The other half is
+/// [`snapshot_scrub_script`], which validates the parent directory — not
+/// reached through a symlink, not on another filesystem, inside
+/// [`SCRUB_CONTAINMENT_PREFIXES`] — before it deletes anything inside it. That
+/// is also why every entry here must keep its glob in the **final component**:
+/// the parent has to be literal for the script to be able to check it at all. A
+/// test enforces it.
+///
+/// A unit test also pins the list itself, because the blast radius of a wrong
+/// entry here is a user's data and the code that consumes it is a shell string.
+pub(crate) const SNAPSHOT_SCRUB_PATHS: &[&str] = &[
+    // Agent scratchpads. The user's global CLAUDE.md instructs every agent to
+    // put temporary files under a scratchpad directory in /tmp, so this is
+    // where a long-running project's writable layer actually goes.
+    //
+    // Not age-limited, and worth being explicit about why that is only *just*
+    // safe: the scrub runs as root against a container that is still running,
+    // so a live Claude Code session or a `triple-c-scheduler` task writing here
+    // has its scratchpad pulled out from under it mid-write. Both callers stop
+    // the container within a line or two — `start_project_container` in
+    // `project_commands.rs` stops and removes it, `migrate_project_to_base`
+    // stops it — so the process that would notice is about to be killed anyway.
+    // That is a property of those two call sites and not of this entry: a third
+    // caller scrubbing a container it means to keep running would be corrupting
+    // a live session, and would need to age-limit this the way the two below
+    // are.
+    "/tmp/claude-*",
+    // Files drag-dropped into a terminal, staged by
+    // `commands/terminal_commands.rs` at up to 256 MiB each, and one PNG per
+    // pasted image from the same module. Nothing else in the repo deletes
+    // either, so leaving them out of this list restores unbounded growth — but
+    // they are the user's *own* files, and often the only copy inside the
+    // container of something handed to the agent seconds ago by a path that is
+    // still sitting in the conversation. Scrubbing them unconditionally meant
+    // "drop a file, change any of the 24 settings that trigger a recreation,
+    // lose it silently". Both are therefore age-limited rather than removed —
+    // see [`SCRUB_MIN_AGE_DAYS`].
+    "/tmp/triple-c-drops/*",
+    "/tmp/clipboard_*.png",
+    // Runtime apt debris. `browser_view/install.rs` and
+    // `container/triple-c-playwright-heal` both run `apt-get install` inside a
+    // live container without an `apt-get clean` after it.
+    "/var/lib/apt/lists/*",
+    "/var/cache/apt/archives/*.deb",
+    "/var/log/apt/*",
+    "/var/log/dpkg.log",
+];
+
+/// Entries of [`SNAPSHOT_SCRUB_PATHS`] that are only deleted once a match's own
+/// mtime is older than the given number of days. Anything not named here is
+/// deleted whenever it is present.
+///
+/// Two weeks is chosen against the thing that goes wrong: a recreation can
+/// happen seconds after a drop, and no conversation is still quoting a path it
+/// was given a fortnight ago. It is a compromise, not a proof — the alternative
+/// of dropping these patterns entirely would be silent unbounded growth in a
+/// directory nothing else ever cleans.
+const SCRUB_MIN_AGE_DAYS: &[(&str, u32)] = &[
+    ("/tmp/triple-c-drops/*", 14),
+    ("/tmp/clipboard_*.png", 14),
+];
+
+/// The only directory trees [`snapshot_scrub_script`] will operate in, checked
+/// against the *resolved* parent directory at run time inside the container.
+///
+/// Deliberately **not** derived from [`SNAPSHOT_SCRUB_PATHS`]: it is the
+/// backstop for the case where that list is itself wrong. An entry added under
+/// `/workspace`, `/home/claude` or `/etc` fails this check and deletes nothing,
+/// however plausible it looked in review.
+const SCRUB_CONTAINMENT_PREFIXES: &[&str] = &["/tmp", "/var/log", "/var/lib/apt", "/var/cache/apt"];
+
+/// Marker the scrub script prints so the byte total can be read back out of the
+/// exec's interleaved stdout/stderr.
+const SCRUB_MARKER: &str = "###TRIPLE-C-SCRUBBED ";
+
+/// Marker the scrub script prints **instead of** [`SCRUB_MARKER`] when it
+/// cannot run at all, followed by what was missing.
+///
+/// H3: the script needs five external tools, the root filesystem's device id,
+/// and an `rm` that honours `--one-file-system` — seven prerequisites in all,
+/// and on a base image that has none of them where it looked it used to run its
+/// seven patterns, delete nothing, and print `###TRIPLE-C-SCRUBBED 0` — a
+/// number indistinguishable from an honest "there was nothing to take". A scrub
+/// that could not run must never read as one that ran, so it says so in a line
+/// the caller can tell apart, and prints no total at all.
+///
+/// Deliberately **not** a prefix of [`SCRUB_MARKER`] and not prefixed by it, so
+/// `parse_scrub_total` can never mistake one for the other.
+const SCRUB_UNAVAILABLE_MARKER: &str = "###TRIPLE-C-SCRUB-UNAVAILABLE ";
+
+/// The external tools [`snapshot_scrub_script`] probes for before it will
+/// delete anything, in the order the probe names them.
+///
+/// Named once rather than spelled into the script text, because
+/// [`parse_scrub_unavailable`] has to be able to tell a missing *tool* from the
+/// other two prerequisites — the root device id, and an `rm` that takes
+/// `--one-file-system` — so that the log line reads as a sentence rather than
+/// as a list with `root-device-id` wedged into it.
+const SCRUB_PREREQ_TOOLS: &[&str] = &["stat", "rm", "du", "cut", "find"];
+
+/// Environment the scrub exec sets explicitly, rather than inheriting.
+///
+/// The exec inherits the container's configured env, and a project's *custom*
+/// env vars are part of that: `is_reserved_env_key` reserves the `ANTHROPIC_`,
+/// `AWS_`, `GIT_`, `HOST_` and `TRIPLE_C_` families and a handful of exact
+/// names, none of which is `LD_PRELOAD`. So a custom env var naming a shared
+/// object inside the container's *persisted home volume* injects code into
+/// every tool the scrub runs — as **root**, since that is the user the exec is
+/// created as — and decides the answer to checks 3 and 4 without ever touching
+/// `PATH`. `docker commit` bakes env into the snapshot, so it rides along too.
+///
+/// Blanking them in the exec closes that without breaking anything: nothing
+/// legitimate preloads into `/bin/sh`, `stat`, `du`, `cut`, `find` or `rm`, and
+/// this env applies to the scrub exec **only** — a terminal session, which is a
+/// different exec, is untouched. Verified against Engine 29.7 that a
+/// `docker exec -e LD_PRELOAD=` overrides a container-level `LD_PRELOAD`.
+///
+/// `LD_LIBRARY_PATH` is here for the same reason as `LD_PRELOAD`: it is
+/// searched ahead of the cache for every `DT_NEEDED` library, so a planted
+/// `libselinux.so.1` is as good as a preload.
+///
+/// M2: [`SCRUB_BOOTSTRAP`] now starts the shell that runs the script under
+/// `env -i`, so none of these three reaches the script's own tools whatever
+/// this list says. They are kept because they still reach the *two processes
+/// in front of it* — the `/bin/sh` that runs the bootstrap and the `env` it
+/// calls — and an `env` with a preload in it is an `env` that can hand its
+/// child any environment it likes. Blanking here and emptying there are the
+/// same defence applied at the two points it has to hold at.
+const SCRUB_EXEC_ENV: &[&str] = &["LD_PRELOAD=", "LD_AUDIT=", "LD_LIBRARY_PATH="];
+
+/// The `/bin/sh -c` program that starts the real scrub, with
+/// [`snapshot_scrub_script`] passed to it as `$1` rather than spliced into it.
+///
+/// ## Why the script is not simply the exec's command (M2)
+///
+/// `docker exec` cannot *replace* a container's environment, only add to and
+/// override it — which is why [`SCRUB_EXEC_ENV`] works by naming keys. The env
+/// a project carries is therefore inherited by whatever shell the exec starts,
+/// and a shell reads more out of its environment than variables.
+///
+/// `bash` imports **functions** from the environment: an env var named
+/// `BASH_FUNC_stat%%` becomes a shell function called `stat`. Function lookup
+/// happens *before* `PATH` is ever consulted, so resetting `PATH` does not
+/// touch it, and `command -v` reports a function as found — so a planted
+/// function passes the prerequisite probe and then answers the containment
+/// checks. Measured against `bash` 5.2 on `ubuntu:24.04`, an environment
+/// carrying `BASH_FUNC_stat%%` had `stat -c %d` return a constant of its
+/// choosing while `command -v stat` said the tool was present.
+///
+/// Every in-shell answer to that was tried and measured, and each one is
+/// itself importable: `unset -f stat` is defeated by `BASH_FUNC_unset%%`,
+/// `command stat` by `BASH_FUNC_command%%`, and — this is what settles it —
+/// `[`, `test`, `pwd` and `cd` import just as readily, which is checks 0, 1
+/// and 2 of the containment guarantee, not merely the tools. There is no
+/// subset of the script that can be written in shell and still be trusted
+/// inside a shell that has already imported the attacker's functions.
+///
+/// So the script is not run by that shell. This bootstrap is, and everything
+/// it uses is either a reserved word (`case`, `esac`), a parameter expansion,
+/// or a command word containing a `/` — and `bash` refuses to import a
+/// function whose name contains a `/`, verified on the same image. It hands
+/// the script to a **second** `/bin/sh` started by `env -i`, which has no
+/// environment at all: no `BASH_FUNC_*`, no `LD_*`, no `ENV`/`BASH_ENV`, and
+/// no `PATH` but the one named here. The inner shell's builtins are its own
+/// again, and the script does not have to care what `/bin/sh` is.
+///
+/// Measured on an `ubuntu:24.04` with `/bin/sh -> bash`, a project env var of
+/// `BASH_FUNC_stat%%=() { echo 1; }` set on the container the way a custom env
+/// var is, and a named volume mounted **at** the match `/tmp/claude-x` — the
+/// position checks 3 and 4 exist for:
+///
+/// * `/bin/sh -c <script>`, which is what the exec used to be, emptied the
+///   volume and printed `###TRIPLE-C-SCRUBBED 306565`;
+/// * `/bin/sh -c <bootstrap> triple-c-scrub <script>` left the volume intact,
+///   reclaimed the real scratchpad beside it, and printed `65536`.
+///
+/// The same script, unchanged, in both runs.
+///
+/// `env` is not assumed to be usr-merged, for the reason spelled out under
+/// [`snapshot_scrub_script_under`]: `/usr/bin/env` first, `/bin/env` on a
+/// literal 127, which is the pair that covers `ubuntu`, `debian`, `alpine`,
+/// `busybox` and `node:*-slim` (checked). An image with neither runs nothing,
+/// prints no marker, and is reported as [`ScrubOutcome::Failed`] — loud, and
+/// preferable to falling back to a shell that would run the script in the
+/// environment this exists to keep away from it.
+///
+/// Passing the script as `$1` rather than interpolating it into a quoted inner
+/// command string is not a style choice: the script contains single quotes in
+/// every `scrub_in` call, and a nested quoting bug in a string that runs
+/// `rm -rf` as root is the whole class of defect this module keeps having.
+const SCRUB_BOOTSTRAP: &str = concat!(
+    r#"/usr/bin/env -i PATH=/usr/bin:/bin /bin/sh -c "$1"; "#,
+    r#"case $? in 127) /bin/env -i PATH=/usr/bin:/bin /bin/sh -c "$1" ;; esac"#,
+);
+
+/// The argv the scrub exec is created with: [`SCRUB_BOOTSTRAP`], then the
+/// `$0` a diagnostic would name the shell by, then the script itself as `$1`.
+fn scrub_exec_cmd(script: &str) -> Vec<String> {
+    vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        SCRUB_BOOTSTRAP.to_string(),
+        "triple-c-scrub".to_string(),
+        script.to_string(),
+    ]
+}
+
+/// Split a [`SNAPSHOT_SCRUB_PATHS`] entry into the literal directory it is
+/// anchored to and the glob to expand inside it.
+///
+/// `None` for anything that is not an absolute path with a non-empty final
+/// component — which a test rules out, but the script generator must not have
+/// to trust that, since what it emits runs as root.
+fn split_scrub_pattern(pattern: &str) -> Option<(&str, &str)> {
+    let (dir, glob) = pattern.rsplit_once('/')?;
+    if !pattern.starts_with('/') || glob.is_empty() {
+        return None;
+    }
+    // A top-level entry such as `/dpkg.log` leaves an empty parent; anchor it.
+    Some((if dir.is_empty() { "/" } else { dir }, glob))
+}
+
+/// The `/bin/sh` program run inside the container to perform the scrub.
+///
+/// ## Never run the string this returns anywhere but inside a container
+///
+/// It is anchored at `/`, and its first pattern is `/tmp/claude-*`. A Triple-C
+/// development container keeps every agent's scratchpad — working files,
+/// backups of the very sources being edited, task output — under
+/// `/tmp/claude-<uid>/`, which that glob matches exactly. Running this as root
+/// on a development machine or in the dev container deletes all of it, reports
+/// a healthy byte total, and leaves nothing to say what happened.
+///
+/// Anything that wants to *exercise* the scrub outside a container must use
+/// [`snapshot_scrub_script_under`] with a freshly generated, uuid-named
+/// throwaway root, and that applies to negative controls too: a control that
+/// plants a symlink to show the vulnerable version follows it must point that
+/// symlink **inside the same throwaway root**, never at a path derived from
+/// the crate, the repository or the environment. The whole point of those
+/// controls is that they delete what they are aimed at.
+pub(crate) fn snapshot_scrub_script() -> String {
+    snapshot_scrub_script_under("")
+}
+
+/// [`snapshot_scrub_script`] with every absolute path re-anchored under `root`.
+///
+/// ## What the script does
+///
+/// One `scrub_in <pattern> <min-age-days, or `-`>` call per entry in
+/// [`SNAPSHOT_SCRUB_PATHS`], with the pattern single-quoted so it reaches the
+/// function unexpanded — unquoted, `/bin/sh` would expand the glob against the
+/// script's own working directory before `scrub_in` ever ran. The function
+/// splits it into parent and glob (`${1%/*}` / `${1##*/}`, which is why the
+/// glob must live in the final component), and expands the glob only once the
+/// working directory *is* the validated parent. Quoted everywhere it is used,
+/// so a filename containing whitespace stays one argument; an unmatched glob
+/// expands to itself and is skipped by the existence guard.
+///
+/// Passing the whole pattern rather than the two halves also keeps each entry
+/// readable verbatim in the generated script, so a test can assert the script
+/// names this list rather than a second forked copy of it.
+///
+/// ## The containment guarantee (C1)
+///
+/// `scrub_in` is the only place in the script that deletes anything, and it
+/// does so only after five checks. The first four are about the parent
+/// directory, in order:
+///
+/// 0. `cd -P` into the parent **first**. Everything after that is relative to
+///    the inode that gets validated, so re-pointing the *path* afterwards
+///    cannot redirect the `rm`. A working directory is the only TOCTOU-free
+///    handle `/bin/sh` offers.
+/// 1. `pwd -P` — the fully resolved path — must equal what was asked for.
+///    A symlinked component anywhere in the parent lands somewhere else, and
+///    this is what catches `ln -s /workspace/myproject /var/log/apt`.
+/// 2. The resolved path must be inside [`SCRUB_CONTAINMENT_PREFIXES`]. A
+///    symlink is not the only way to name the wrong directory; this refuses to
+///    operate outside the trees the scrub owns whatever the path list says.
+/// 3. It must be on the same filesystem as the root. Check 1 does not see a
+///    *bind mount*, which is not a symlink — but under `overlay2` a bind mount
+///    and a named volume each have a different `st_dev` from the overlay, and
+///    neither is part of the writable layer the commit is about to capture. So
+///    anything on another device is both dangerous to delete and pointless to.
+///
+/// The fifth is about each *match*, and it is the one the parent checks cannot
+/// stand in for:
+///
+/// 4. Every expansion of the glob must itself be on the root's filesystem, or
+///    it is skipped. Since the parent has already been proved to be, that is a
+///    "the match is not a mount point" test — the device of a directory differs
+///    from its parent's precisely when something is mounted on it.
+///
+///    **On `overlay2`, which is what these were measured against.** The overlay
+///    synthesises its own `st_dev`, so *every* mount into the container differs
+///    from it and checks 3 and 4 catch all of them. Under the `vfs` graph
+///    driver there is no overlay: the container root is a plain directory tree
+///    on the host filesystem, so a bind mount of a host directory that happens
+///    to live on that same filesystem reports the *same* `st_dev` and these two
+///    checks see nothing. Checks 1 and 2 — resolved path, and containment in
+///    [`SCRUB_CONTAINMENT_PREFIXES`] — are what still hold there, and they are
+///    why a `vfs` host is a narrower gap rather than an open one: the mount has
+///    to be planted inside `/tmp`, `/var/log`, `/var/lib/apt` or
+///    `/var/cache/apt` and match one of the seven globs to be reached at all.
+///    Do not describe the device test as a mount test without that
+///    qualification.
+///
+///    Checks 0–3 validate the *parent*, and `rm --one-file-system` compares
+///    against the device of **its own command-line argument** — so when the
+///    argument *is* the mount root, `rm` is inside the mount already and
+///    deletes everything under it. Verified in real containers against
+///    `docker run -v vol:/tmp/claude-x`: mounted at the parent (`/var/log/apt`)
+///    was refused, mounted one level below the match
+///    (`/tmp/claude-x/inner`) was refused **on the strength of the flag
+///    alone**, and mounted *as* the match (`/tmp/claude-x`) emptied the volume.
+///    That middle case is why the flag is a prerequisite rather than an
+///    option — see the section on M1 below. In production that mount is the
+///    user's own project directory, because a mount name of `../tmp/claude-x`
+///    reaches it: the daemon normalises the `/workspace/{mount_name}` target
+///    built at [`create_container`] straight back to `/tmp/claude-x`.
+///
+///    `stat` is not asked to dereference: a *symlinked* match reports the
+///    link's own device, so it still passes and `rm -rf -- link` unlinks it and
+///    stops — which is the behaviour the entries whose glob is in the last
+///    component have always relied on.
+///
+/// Inside the loop, an expansion carrying a path separator means the list has
+/// changed shape and is skipped, and `rm --one-file-system` refuses to recurse
+/// across a mount planted *below* a match — the one mount position none of the
+/// five checks above can see, because it is not the parent and it is not the
+/// match.
+///
+/// ## Why `--one-file-system` is a prerequisite and not an option (M1)
+///
+/// It used to be probed into a variable:
+///
+/// ```sh
+/// rmopt=;
+/// rm --one-file-system --help >/dev/null 2>&1 && rmopt=--one-file-system;
+/// rm -rf $rmopt -- "$p";
+/// ```
+///
+/// which fails **open**. `busybox`'s `rm` answers `unrecognized option
+/// '--one-file-system'` and exits 1 for that probe, so on any
+/// `ImageSource::Custom` busybox- or toybox-derived image `$rmopt` was empty
+/// and `rm -rf` ran as root with no cross-filesystem bound at all — and
+/// reported the result as a completed `Reclaimed(n)`.
+///
+/// Measured end to end, `busybox:latest` (BusyBox 1.38), a named volume
+/// mounted one level below the match at `/tmp/claude-x/inner`:
+///
+/// * the probed shape emptied the volume and printed
+///   `###TRIPLE-C-SCRUBBED 102423`;
+/// * this shape prints `###TRIPLE-C-SCRUB-UNAVAILABLE rm-one-file-system` and
+///   removes nothing at all.
+///
+/// And on `ubuntu:24.04` (GNU coreutils 9.4), same mount, to show the flag is
+/// honoured rather than merely accepted: with `--one-file-system` deleted from
+/// the one `rm` the volume was emptied and `306565` reported, with it the
+/// volume was untouched and the figure was `65536` — exactly the debris that
+/// really was next to the mount, so the byte accounting follows the flag too.
+///
+/// It is one of the seven prerequisites now, and an image without it is
+/// [`SCRUB_UNAVAILABLE_MARKER`] rather than a scrub that runs unguarded. That
+/// is a real cost — an Alpine or busybox base image stops being scrubbed and
+/// keeps its debris — and it is the cheaper of the two: declining costs disk,
+/// proceeding costs the mount.
+///
+/// The probe is `rm --one-file-system -f -- ''` rather than `--help`. It is
+/// the same question asked of the code path that matters — option parsing
+/// followed by an actual run — where `--help` only asks whether a usage
+/// message can be printed; and the empty operand is the one argument no
+/// filesystem can ever name, so a probe that *does* run cannot remove
+/// anything. `-f` makes the resulting `ENOENT` an exit of 0, on GNU
+/// `coreutils` and by POSIX both.
+///
+/// What it cannot check is that the flag is *honoured* rather than merely
+/// accepted; that needs a real mount, and it is covered by the container runs
+/// recorded above rather than by the probe.
+///
+/// ## How the byte total is counted
+///
+/// `du` before the `rm`, `du` again after it if anything is still there, and
+/// the difference is what was reclaimed. The obvious form —
+/// `rm … && acc=$((acc + sz))` — was wrong in exactly the case
+/// `--one-file-system` exists for: `rm` walking into a match that has a mount
+/// planted *below* it removes everything else and still exits non-zero, so the
+/// whole subtree's size was dropped from the total rather than the part that
+/// survived. Under-reporting a scrub is the same class of quiet as reporting
+/// zero for one that never ran. The second `du` only runs when the path is
+/// still present, i.e. on the failure path, so the ordinary case pays nothing;
+/// the figure is clamped at the pre-`rm` size so a directory something else is
+/// concurrently growing cannot make it negative.
+///
+/// ## Why `PATH` is reset, and why the tools are *not* named absolutely (H3)
+///
+/// The first statement in the script sets `PATH={root}/usr/bin:{root}/bin` and
+/// exports it, before any external tool runs. That is the whole shim defence.
+/// The image's `PATH` starts
+/// `/home/claude/.claude/bin:/home/claude/.local/bin:/home/claude/.cargo/bin`,
+/// all of which live in the container's *persisted home volume* and are
+/// writable by the agent — so a three-line `stat` on the front of it decides
+/// the answer to checks 3 and 4. That was reproduced: with such a shim planted,
+/// a volume mounted at `/var/log/apt` — refused by an unshimmed scrub — had its
+/// entire contents deleted. The shim lives in the home volume; it cannot live
+/// in `/usr/bin` or `/bin`, which uid 1000 cannot write. Resetting `PATH` to
+/// exactly those two directories therefore defeats *a shim on `PATH`* as
+/// completely as spelling `/usr/bin/stat` out does, and buys the portability
+/// that spelling it out gives away.
+///
+/// M2: that sentence used to stop one clause earlier, at "defeats it just as
+/// completely", and read as though the reset settled command lookup. It does
+/// not. `PATH` is the **last** step of lookup: a shell tries functions, then
+/// builtins, then `PATH`, and `command -v` reports a function as found — so a
+/// planted shell function is invisible to everything in this section and
+/// passes the tool probe below into the bargain. Nothing written in this
+/// script can fix that, because the shell that would run the fix has already
+/// imported the function. It is fixed one level up, by [`SCRUB_BOOTSTRAP`],
+/// which gives the shell that runs this script no environment to import from.
+///
+/// Spelling them out as well was strictly *worse*, and it is what H3 was.
+/// `/usr/bin/stat` is not where coreutils live on every base image — Settings →
+/// Docker → **Custom** accepts any image, and on Alpine `stat` and `rm` are in
+/// `/bin`. There, `/usr/bin/stat` is simply absent, `rootdev` comes back empty,
+/// and `[ -n "$rootdev" ] || exit 0` fires for all seven patterns. Measured on
+/// one seeded tree: the absolute-path script reported
+/// `###TRIPLE-C-SCRUBBED 0` and left every planted file in place, where the
+/// `PATH`-based one reclaimed 73738 bytes. Failing closed is correct; failing
+/// closed while printing a number that reads as success is not, which is why
+/// the tool probe and [`SCRUB_UNAVAILABLE_MARKER`] exist below.
+///
+/// So: the six tools are named bare and resolved through a `PATH` the script
+/// controls, and the script refuses to delete anything at all unless
+/// `command -v` finds every one of them and the root device id reads back as a
+/// number. `find` is required along with the rest even though its absence would
+/// only disable the age gate, because "ran with one hand tied" is exactly the
+/// half-working state this whole section exists to stop being silent.
+///
+/// This does not defend against something that can write `/usr/bin` or `/bin`
+/// itself, which the agent's passwordless sudo can — and note what that is
+/// *not*: it is not a gap that a container restart closes. A `sudo`-written
+/// `/usr/bin/stat` lands in the writable layer, which is precisely what the
+/// `docker commit` this runs in front of is about to capture, so it survives
+/// into the snapshot and into every container made from it. What the reset
+/// closes is the unprivileged half — the three home-volume directories on the
+/// front of the image's `PATH`, which the agent writes without `sudo` and
+/// which no restart clears either. Both halves persist; only one of them needs
+/// a privilege the scrub could not have defended against anyway.
+///
+/// See [`SCRUB_EXEC_ENV`] for the `LD_PRELOAD` half of the same question and
+/// [`SCRUB_BOOTSTRAP`] for the shell-function half, neither of which `PATH`
+/// does anything about.
+///
+/// ## Why every line ends in `;`, and why there are no `#` comments
+///
+/// A self-terminating statement per line, and no comments, is what makes the
+/// script safe to join onto one line: any embedder that folds it with spaces
+/// gets a join rather than a rewrite. That property was learnt the hard way —
+/// an earlier version's folded form was a `"do" unexpected` syntax error, so
+/// the scrub ran not at all — and it is kept even though the folding caller is
+/// gone, because a script that survives being flattened is the cheap invariant
+/// and re-learning it is not.
+///
+/// ## Why `root` exists
+///
+/// `""` in production, which leaves the paths exactly as written. A non-empty
+/// root lets the real generated script be run by a real `/bin/sh`, with real
+/// symlinks planted in it, inside a throwaway directory tree — because
+/// containment is a *runtime* property and the test this replaces
+/// (`!dockerfile.contains("/workspace")`) was a substring check over the script
+/// text that the exploitable version passed.
+///
+/// The tool paths are re-anchored with everything else, so a test root can put
+/// its own `usr/bin/stat` where the script will look. That is how check 4 is
+/// exercised without a mount: no unprivileged test can create a device
+/// boundary (this container cannot even `unshare -Urm`), but a `stat` that
+/// reports a foreign device for one directory is what the kernel would report
+/// for a mount point, and the real boundary is covered by the container runs
+/// recorded above.
+fn snapshot_scrub_script_under(root: &str) -> String {
+    let calls: String = SNAPSHOT_SCRUB_PATHS
+        .iter()
+        .filter_map(|pattern| {
+            // Validate the shape here even though the shell re-derives it: an
+            // entry the script could not split is one it must not be handed.
+            split_scrub_pattern(pattern)?;
+            let age = SCRUB_MIN_AGE_DAYS
+                .iter()
+                .find(|(p, _)| p == pattern)
+                .map(|(_, days)| days.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            Some(format!("scrub_in '{root}{pattern}' '{age}';\n"))
+        })
+        .collect();
+
+    let allowed: String = SCRUB_CONTAINMENT_PREFIXES
+        .iter()
+        .map(|p| format!("{root}{p}|{root}{p}/*"))
+        .collect::<Vec<_>>()
+        .join("|");
+
+    format!(
+        r#"PATH={root}/usr/bin:{root}/bin; export PATH;
+total=0;
+missing=;
+for t in {tools}; do command -v "$t" >/dev/null 2>&1 || missing="$missing $t"; done;
+command -v rm >/dev/null 2>&1 && {{ rm --one-file-system -f -- '' >/dev/null 2>&1 || missing="$missing rm-one-file-system"; }};
+rootdev=$(stat -c %d '{root}/' 2>/dev/null);
+case "$rootdev" in ''|*[!0-9]*) rootdev=; missing="$missing root-device-id" ;; esac;
+[ -z "$missing" ] || {{ echo "{unavailable}$missing"; exit 0; }};
+scrub_in() {{
+n=$(
+d=${{1%/*}}; [ -n "$d" ] || d=/;
+g=${{1##*/}};
+cd -P "$d" 2>/dev/null || exit 0;
+[ "$(pwd -P)" = "$d" ] || exit 0;
+case "$d" in {allowed}) ;; *) exit 0 ;; esac;
+[ -n "$rootdev" ] || exit 0;
+[ "$(stat -c %d . 2>/dev/null)" = "$rootdev" ] || exit 0;
+acc=0;
+for p in $g; do
+case "$p" in */*|.|..) continue ;; esac;
+{{ [ -e "$p" ] || [ -L "$p" ]; }} || continue;
+[ "$(stat -c %d -- "$p" 2>/dev/null)" = "$rootdev" ] || continue;
+[ "$2" = "-" ] || [ -n "$(find "./$p" -maxdepth 0 -mtime +"$2" -print 2>/dev/null)" ] || continue;
+sz=$(du -sb -- "$p" 2>/dev/null | cut -f1);
+case "$sz" in ''|*[!0-9]*) sz=0 ;; esac;
+rm --one-file-system -rf -- "$p" 2>/dev/null;
+rest=0;
+{{ [ -e "$p" ] || [ -L "$p" ]; }} && rest=$(du -sb -- "$p" 2>/dev/null | cut -f1);
+case "$rest" in ''|*[!0-9]*) rest=0 ;; esac;
+[ "$rest" -le "$sz" ] || rest=$sz;
+acc=$((acc + sz - rest));
+done;
+echo "$acc";
+);
+case "$n" in ''|*[!0-9]*) n=0 ;; esac;
+total=$((total + n));
+}};
+{calls}echo "{marker}$total";
+exit 0
+"#,
+        root = root,
+        allowed = allowed,
+        calls = calls,
+        tools = SCRUB_PREREQ_TOOLS.join(" "),
+        marker = SCRUB_MARKER,
+        unavailable = SCRUB_UNAVAILABLE_MARKER,
+    )
+}
+
+/// Parse the byte total the scrub script reports. Returns `None` when the
+/// marker is absent, which is how a container that never ran the script (or a
+/// `sh` that died early) is told apart from one that reclaimed nothing.
+///
+/// A script that decided it could not run prints [`SCRUB_UNAVAILABLE_MARKER`]
+/// and no total at all, so this returns `None` for that too — but callers must
+/// ask [`parse_scrub_unavailable`] **first**, because "could not run" and
+/// "printed nothing recognisable" deserve different words in the log.
+fn parse_scrub_total(output: &str) -> Option<u64> {
+    output
+        .lines()
+        .rev()
+        .find_map(|line| line.trim().strip_prefix(SCRUB_MARKER)?.trim().parse().ok())
+}
+
+/// What the scrub script said was missing, if it declined to run at all.
+///
+/// H3: the failure this exists for is silent by construction — a scrub with no
+/// usable `stat` deletes nothing and, before this, printed the same
+/// `###TRIPLE-C-SCRUBBED 0` a healthy container with nothing to clean prints.
+/// The script now says which tools it could not find; this reads that back so
+/// [`ScrubOutcome::Unavailable`] can carry it into the log.
+fn parse_scrub_unavailable(output: &str) -> Option<String> {
+    output.lines().rev().find_map(|line| {
+        let missing = line.trim().strip_prefix(SCRUB_UNAVAILABLE_MARKER)?.trim();
+        if missing.is_empty() {
+            return Some("the image is missing the tools the scrub needs".to_string());
+        }
+        // Three different things can be missing and only one of them is a file
+        // on a path, so they cannot share a sentence. M1 added the third and
+        // it is the one most likely to be read by somebody who does not know
+        // the history, so it says what the flag is *for* rather than naming it.
+        let (tools, others): (Vec<&str>, Vec<&str>) = missing
+            .split_whitespace()
+            .partition(|t| SCRUB_PREREQ_TOOLS.contains(t));
+        let mut parts = Vec::new();
+        if !tools.is_empty() {
+            parts.push(format!(
+                "has no usable {} on /usr/bin or /bin",
+                tools.join(", ")
+            ));
+        }
+        parts.extend(others.into_iter().map(|other| match other {
+            "rm-one-file-system" => "has an `rm` that does not take `--one-file-system`, \
+                 which is the only thing bounding a recursive delete run as root"
+                .to_string(),
+            "root-device-id" => {
+                "will not say which device its root filesystem is on".to_string()
+            }
+            other => format!("is missing {}", other),
+        }));
+        Some(format!("the image {}", parts.join("; it ")))
+    })
+}
+
+/// How long [`scrub_writable_layer`] waits for its exec before the commit goes
+/// ahead without it.
+///
+/// The scrub is a `du -sb` plus an `rm -rf` over a tree a running agent may
+/// still be writing to, and it sits on the critical path of every recreate and
+/// every migration with the UI parked on "Saving container state…" and no way
+/// to cancel. Two minutes is an order of magnitude more than the measured cost
+/// on a 4.48 GB layer, and far less than the point where a user force-quits.
+const SCRUB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// What [`scrub_writable_layer`] actually did.
+///
+/// The distinction that earns this type is [`ScrubOutcome::NotRunning`] versus
+/// [`ScrubOutcome::Failed`]: "there was nothing to exec into" is routine, while
+/// "the exec ran and broke" is the one case worth a warning in the log.
+/// `#[must_use]` because the variants mean different things to a caller and
+/// three of the four are easy to ignore by accident: a `Failed` swallowed at a
+/// call site is exactly how a scrub that stopped working would stay quiet.
+#[must_use = "a scrub that was skipped, timed out or failed reads the same as one that worked unless the outcome is inspected"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrubOutcome {
+    /// The scrub ran to completion and freed this many bytes — possibly zero,
+    /// which is a real answer.
+    Reclaimed(u64),
+    /// The container is not running, so there is no `docker exec` to run in.
+    /// Not a failure: a stopped container's writable layer is not growing, and
+    /// on the migration path it was already scrubbed while it was.
+    NotRunning,
+    /// The container was running, but the scrub did not finish within
+    /// [`SCRUB_TIMEOUT`].
+    TimedOut,
+    /// The container was running and the scrub genuinely failed.
+    Failed,
+    /// The exec ran, but the container's image does not have the tools the
+    /// scrub needs where it can reach them, so it deleted nothing.
+    ///
+    /// Separate from [`ScrubOutcome::Failed`] because the exec itself worked
+    /// and the script ran to its own conclusion — and separate from
+    /// `Reclaimed(0)`, which is the whole of H3: a custom base image without
+    /// usr-merged coreutils reclaimed nothing and reported it as a completed
+    /// scrub of zero bytes.
+    Unavailable,
+}
+
+impl ScrubOutcome {
+    /// What the commit's log line should say about the scrub — **empty when
+    /// there is nothing to say**.
+    ///
+    /// Two different zeros used to render identically here. Every migration
+    /// logged "0.00 MB dropped by the pre-commit scrub", because the migration
+    /// path scrubs the container itself while it is still running and stops it
+    /// before committing, so the call here finds nothing to exec into. A figure
+    /// of zero reads as a scrub that ran and found nothing, which is a
+    /// different and more alarming thing than a scrub that correctly had no
+    /// work left.
+    ///
+    /// The other zero was H3: a scrub that could not find its tools also
+    /// reclaimed nothing, and rendered as the same reassuring "0.00 MB
+    /// dropped". That one is [`ScrubOutcome::Unavailable`] now, and even a
+    /// genuine `Reclaimed(0)` says it *ran* rather than quoting a figure that
+    /// cannot be told apart from a broken scrub's.
+    pub(crate) fn commit_log_suffix(&self) -> String {
+        match self {
+            Self::Reclaimed(0) => {
+                " (the pre-commit scrub ran and found nothing to drop)".to_string()
+            }
+            Self::Reclaimed(bytes) => format!(
+                " ({:.2} MB dropped by the pre-commit scrub)",
+                *bytes as f64 / 1_048_576.0
+            ),
+            Self::NotRunning => String::new(),
+            Self::TimedOut => " (the pre-commit scrub timed out, so the layer keeps whatever it had)".to_string(),
+            Self::Failed => " (the pre-commit scrub did not run, so the layer keeps whatever it had)".to_string(),
+            Self::Unavailable => " (the pre-commit scrub could not run in this image, so nothing was reclaimed and the layer keeps whatever it had)".to_string(),
+        }
+    }
+}
+
+/// Delete the throwaway files listed in [`SNAPSHOT_SCRUB_PATHS`] from a
+/// container's writable layer so the commit that follows does not bake them in.
+///
+/// Runs as **root**: the apt debris is root-owned while the scratchpads belong
+/// to `claude`, and root can remove both. That is also what makes
+/// [`snapshot_scrub_script`]'s containment checks load-bearing rather than
+/// decorative.
+///
+/// **Never fails the caller, by design.** A scrub is an optimisation; a commit
+/// is the only copy of the user's system layer. Losing some disk is a strictly
+/// better outcome than refusing to snapshot, so every failure here is a log
+/// line and nothing more — including the timeout, which stops waiting and lets
+/// the commit proceed rather than leaving the UI on "Saving container state…"
+/// with no way out.
+///
+/// ## Why it checks whether the container is running (M11)
+///
+/// This is a `docker exec`, so it only works on a running container.
+/// `migrate_project_to_base` knows that: it scrubs the container itself and
+/// *then* stops it, because the pre-swap commit is the largest snapshot
+/// Triple-C ever takes. The call inside [`commit_container_snapshot`] therefore
+/// arrives at a stopped container and could only ever fail, which logged
+/// "could not run … committing anyway" on every single migration — training
+/// the reader to ignore the one line that would matter if the scrub had really
+/// broken. Asking first turns that into a debug line and keeps the warning
+/// meaningful.
+pub async fn scrub_writable_layer(container_id: &str) -> ScrubOutcome {
+    match is_container_running(container_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            log::debug!(
+                "Skipping pre-commit scrub of container {}: it is not running, so there is nothing to exec into and its writable layer is not growing",
+                container_id
+            );
+            return ScrubOutcome::NotRunning;
+        }
+        Err(e) => {
+            // Only Docker being unreachable reaches here, in which case the
+            // commit this precedes is about to fail on its own — but say so
+            // rather than reporting a skip that never happened.
+            log::warn!(
+                "Could not tell whether container {} is running ({}); skipping the pre-commit scrub and committing anyway",
+                container_id,
+                e
+            );
+            return ScrubOutcome::Failed;
+        }
+    }
+
+    // M2: not `/bin/sh -c script`. The shell an exec starts has already read
+    // the container's environment by the time the script's first line runs —
+    // see [`SCRUB_BOOTSTRAP`], which hands the script to one that has not.
+    let cmd = scrub_exec_cmd(&snapshot_scrub_script());
+    let exec = crate::docker::exec::exec_oneshot_as(
+        container_id,
+        "root",
+        cmd,
+        SCRUB_EXEC_ENV.iter().map(|e| (*e).to_string()).collect(),
+    );
+
+    // M12: nothing under `docker/` has a timeout, and this is the one call on
+    // the critical path of every recreate. Dropping the future stops us
+    // *waiting*; the `sh` keeps running inside the container and its deletions
+    // are still valid, they just stop counting towards the total. That is the
+    // right trade — the commit that follows is merely a little larger.
+    let exec_result = match tokio::time::timeout(SCRUB_TIMEOUT, exec).await {
+        Ok(result) => result,
+        Err(_) => {
+            log::warn!(
+                "Pre-commit scrub of container {} did not finish within {}s; committing anyway",
+                container_id,
+                SCRUB_TIMEOUT.as_secs()
+            );
+            return ScrubOutcome::TimedOut;
+        }
+    };
+
+    match exec_result {
+        Ok((output, _exit_code)) => {
+            // H3, first of the three silences: ask about "could not run"
+            // *before* reading a total, because the script prints no total in
+            // that case and a bare `None` would be reported as a generic
+            // failure without naming what the image is missing.
+            if let Some(reason) = parse_scrub_unavailable(&output) {
+                log::warn!(
+                    "Pre-commit scrub of container {} could not run ({}); nothing was reclaimed and the commit will carry whatever the writable layer held",
+                    container_id,
+                    reason
+                );
+                return ScrubOutcome::Unavailable;
+            }
+            match parse_scrub_total(&output) {
+                // H3, second of the three: this used to log only when there
+                // was something to report, so a scrub that reclaimed nothing
+                // left no trace at all. A genuine zero is routine, so it is a
+                // debug line rather than a warning — the alarming zero is the
+                // `Unavailable` above, and that one is not quiet.
+                Some(0) => {
+                    log::debug!(
+                        "Pre-commit scrub of container {} ran and found nothing to reclaim",
+                        container_id
+                    );
+                    ScrubOutcome::Reclaimed(0)
+                }
+                Some(bytes) => {
+                    log::info!(
+                        "Pre-commit scrub of container {} reclaimed {:.2} MB before it could be committed",
+                        container_id,
+                        bytes as f64 / 1_048_576.0
+                    );
+                    ScrubOutcome::Reclaimed(bytes)
+                }
+                None => {
+                    log::warn!(
+                        "Pre-commit scrub of container {} did not report a total; committing anyway. Output: {}",
+                        container_id,
+                        output.trim()
+                    );
+                    ScrubOutcome::Failed
+                }
+            }
+        }
+        Err(e) => {
+            log::warn!(
+                "Pre-commit scrub of container {} could not run ({}); committing anyway",
+                container_id,
+                e
+            );
+            ScrubOutcome::Failed
+        }
+    }
+}
+
 /// Commit the container's filesystem to a snapshot image so that system-level
 /// changes (apt/pip/npm installs, ~/.claude.json, etc.) survive container
 /// removal.
@@ -1795,9 +2980,24 @@ chmod 600 "$HOME/.aws/credentials""#;
 ///
 /// Non-secret env (PATH, TZ, model aliases, instructions) is inherited as
 /// before, so nothing about the snapshot's behaviour changes.
+///
+/// ## Why it scrubs first
+///
+/// See [`SNAPSHOT_SCRUB_PATHS`]. Every commit stacks a layer, so a file present
+/// here is a file the project's image carries for the rest of its life.
+///
+/// The scrub is a no-op on a container that is already stopped — the migration
+/// path scrubs it itself while it is still running and stops it before getting
+/// here — and it can never fail this function; see [`scrub_writable_layer`].
 pub async fn commit_container_snapshot(container_id: &str, project: &Project) -> Result<(), String> {
     let docker = get_docker()?;
     let image_name = get_snapshot_image_name(project);
+
+    // Drop the throwaway files *before* the commit captures them. A commit
+    // stacks a layer and never rewrites one, so anything present at this
+    // instant is paid for permanently — see [`SNAPSHOT_SCRUB_PATHS`]. Failure
+    // is swallowed inside; a scrub must never be able to block a snapshot.
+    let scrub = scrub_writable_layer(container_id).await;
 
     // Parse repo:tag
     let (repo, tag) = match image_name.rsplit_once(':') {
@@ -1823,7 +3023,13 @@ pub async fn commit_container_snapshot(container_id: &str, project: &Project) ->
         .await
         .map_err(|e| format!("Failed to commit container snapshot: {}", e))?;
 
-    log::info!("Committed container {} as snapshot {}:{}", container_id, repo, tag);
+    log::info!(
+        "Committed container {} as snapshot {}:{}{}",
+        container_id,
+        repo,
+        tag,
+        scrub.commit_log_suffix()
+    );
     Ok(())
 }
 
@@ -1890,15 +3096,30 @@ fn orphan_sweep_filters() -> HashMap<String, Vec<String>> {
 ///   `triple-c-snapshot-{id}:latest` is what a project is rebuilt from, and a
 ///   migration's `pre-migration-*` pin is the only copy of a rollback target.
 ///   Neither can ever match this filter, so neither can be swept.
-/// * **`triple-c.managed=true`** — only images Triple-C itself committed.
-///   `docker commit` copies the container's labels onto the image, which is what
-///   makes the label a reliable mark of provenance. The user's own dangling
-///   images are none of our business.
+/// * **`triple-c.managed=true`** — only images Triple-C itself built or
+///   committed. `docker commit` copies the container's labels onto the image,
+///   and `container/Dockerfile` stamps the same label on the base, which is
+///   what makes it a reliable mark of provenance. The user's own dangling
+///   images are none of our business — the daemon this runs against is shared
+///   with their unrelated work, so an unfiltered prune is never an option.
+///
+/// **Superseded base images are collected by exactly the same two conditions.**
+/// They used to be unreachable: `container/Dockerfile` carried no `LABEL` at
+/// all, so a base image left untagged when a newer build claimed
+/// `triple-c-sandbox:latest` was dangling but not labelled and could never
+/// match. ~11.9 GB was measured stranded that way. The Dockerfile now stamps
+/// `triple-c.managed=true`, so no change is needed here beyond knowing that
+/// this function is what reclaims them.
 ///
 /// Removal is not forced, so Docker refuses (409) while any container is still
 /// built from the image — including the stopped containers of projects that are
 /// not running. That refusal is the third safety net and it is the daemon's,
 /// not ours; those orphans are simply counted and left for a later sweep.
+/// **This is why `force: false` stays.** Forcing would untag and delete an
+/// image out from under a stopped project, and Docker would leave that
+/// container unable to start. A superseded base image pinned by one stopped
+/// container is therefore not reclaimed until that project is next recreated or
+/// removed, which the startup sweep will notice on some later run.
 ///
 /// Never fails the caller: this is housekeeping, and a full disk is a better
 /// outcome than a project that will not start.
@@ -1967,6 +3188,38 @@ pub async fn sweep_orphaned_snapshots() -> SnapshotSweepReport {
     }
 
     report
+}
+
+/// Run [`sweep_orphaned_snapshots`] and write the whole outcome to the log,
+/// tagged with *why* the sweep ran.
+///
+/// Every caller of the sweep is housekeeping fired off in a detached task, and
+/// every one of them dropped the `SnapshotSweepReport` on the floor — including
+/// `reclaimed_bytes`, `failed` and `unavailable`, which are the only evidence
+/// that a sweep ever happened or that it could not. When a user asks where
+/// 116 GB went, "nothing was logged" is not an answer. There is no UI for this
+/// yet by deliberate choice (prevention first), so the log is the whole
+/// interface.
+pub async fn sweep_orphaned_snapshots_logged(context: &str) {
+    let report = sweep_orphaned_snapshots().await;
+
+    if let Some(ref why) = report.unavailable {
+        log::warn!("Snapshot sweep ({}) could not run: {}", context, why);
+        return;
+    }
+
+    log::info!(
+        "Snapshot sweep ({}): {} removed, {:.2} GB reclaimed, {} still pinned by a container, {} failed",
+        context,
+        report.removed.len(),
+        report.reclaimed_bytes as f64 / 1_073_741_824.0,
+        report.in_use,
+        report.failed.len(),
+    );
+
+    for (id, error) in &report.failed {
+        log::warn!("Snapshot sweep ({}) could not remove {}: {}", context, id, error);
+    }
 }
 
 /// Outcome of [`scrub_secrets_from_snapshots`], so callers can tell the user
@@ -2085,6 +3338,37 @@ pub async fn scrub_secrets_from_snapshots() -> SnapshotScrubReport {
             continue;
         }
 
+        // Claim the project before touching its snapshot.
+        //
+        // This is the second writer of `triple-c-snapshot-{id}:latest`, after a
+        // recreate's commit, and it has the same
+        // read-modify-write shape: create a scratch container *from* the
+        // snapshot, then commit back over the same tag. A `:latest` move
+        // landing in between is silently overwritten by an image derived from
+        // the pre-read state — which here would mean re-baking the very
+        // credential this function exists to remove.
+        //
+        // A snapshot whose project is busy is left for the next call rather
+        // than rewritten unsafely, and it is *reported*: silently skipping a
+        // credential removal is the one outcome worse than failing it.
+        let project_id = summary
+            .repo_tags
+            .iter()
+            .find_map(|t| crate::docker::migration::parse_snapshot_reference(t))
+            .map(|(id, _tag)| id);
+        let _claim = match project_id.as_deref() {
+            Some(id) => match crate::project_lock::try_acquire(id, crate::project_lock::ProjectOp::SecretScrub) {
+                Ok(guard) => Some(guard),
+                Err(reason) => {
+                    report.failed.push((summary.repo_tags.join(", "), reason));
+                    continue;
+                }
+            },
+            // Not a `triple-c-snapshot-{uuid}` reference despite the filter.
+            // Nothing owns it, so there is nothing to serialise against.
+            None => None,
+        };
+
         // Rewrite every tag this image answers to, so an old tag cannot keep
         // serving the un-scrubbed config.
         let mut all_tags_rewritten = true;
@@ -2143,6 +3427,15 @@ async fn rewrite_image_without_secrets(
 ) -> Result<(), String> {
     let scratch_name = format!("triple-c-scrub-{}", uuid::Uuid::new_v4().simple());
 
+    // `triple-c.scrub=true` so the Disk panel's scrub-container bucket can tell
+    // a *live* rewrite from a leftover by label rather than by age. An age gate
+    // alone was the previous discriminator, and a clock is a poor proxy for
+    // "somebody is using this": killing this container between the create and
+    // the commit below leaves the revoked credential baked into the snapshot's
+    // `Config.Env`, which is precisely the state this function exists to end.
+    let scratch_labels: HashMap<String, String> =
+        HashMap::from([(LABEL_SCRUB.to_string(), "true".to_string())]);
+
     let created = docker
         .create_container(
             Some(CreateContainerOptions {
@@ -2151,6 +3444,7 @@ async fn rewrite_image_without_secrets(
             }),
             Config::<String> {
                 image: Some(source_image.to_string()),
+                labels: Some(scratch_labels),
                 // Deliberately nothing else. The container is never started;
                 // its only job is to be a config to commit from, and every
                 // field left unset here is inherited from the image and
@@ -2226,8 +3520,8 @@ pub async fn remove_snapshot_image(project: &Project) -> Result<(), String> {
 pub async fn remove_project_volumes(project: &Project) -> Result<(), String> {
     let docker = get_docker()?;
     for vol in [
-        format!("triple-c-home-{}", project.id),
-        format!("triple-c-claude-config-{}", project.id),
+        home_volume_name(&project.id),
+        config_volume_name(&project.id),
     ] {
         match docker.remove_volume(&vol, None).await {
             Ok(_) => log::info!("Removed volume {}", vol),
@@ -2630,30 +3924,6 @@ pub async fn is_container_running(container_id: &str) -> Result<bool, String> {
     }
 }
 
-pub async fn list_sibling_containers() -> Result<Vec<ContainerSummary>, String> {
-    let docker = get_docker()?;
-
-    let all_containers: Vec<ContainerSummary> = docker
-        .list_containers(Some(ListContainersOptions::<String> {
-            all: true,
-            ..Default::default()
-        }))
-        .await
-        .map_err(|e| format!("Failed to list containers: {}", e))?;
-
-    let siblings: Vec<ContainerSummary> = all_containers
-        .into_iter()
-        .filter(|c| {
-            if let Some(labels) = &c.labels {
-                !labels.contains_key(LABEL_MANAGED)
-            } else {
-                true
-            }
-        })
-        .collect();
-
-    Ok(siblings)
-}
 
 #[cfg(test)]
 mod tests {
@@ -3118,5 +4388,1734 @@ mod tests {
             ..Default::default()
         };
         assert!(blind.left_something_behind());
+    }
+
+    /// A stored row that cannot make a usable mount makes none.
+    ///
+    /// Both shapes here are records already written to disk, which is the whole
+    /// point: an empty `host_path` sends
+    /// `field Source must not be empty` back for the *entire* create, so the
+    /// project cannot be started or recreated at all until the row is gone —
+    /// and validating the next save does nothing for a record that is already
+    /// there. An empty `mount_name` is the quieter one: it targets
+    /// `/workspace/` itself, so the daemon mounts that row over the workspace
+    /// volume and then creates the other rows' mount points inside the user's
+    /// real folder.
+    #[test]
+    fn a_stored_path_row_that_cannot_mount_produces_no_mount() {
+        use crate::models::project::ProjectPath;
+        let row = |host: &str, name: &str| ProjectPath {
+            host_path: host.to_string(),
+            mount_name: name.to_string(),
+        };
+
+        let mounts = project_path_mounts(&[
+            row("/home/me/code", "code"),
+            // Bricks the create outright.
+            row("", "orphan"),
+            // Mounts over /workspace itself.
+            row("/home/me/other", ""),
+            // Whitespace is not a name and not a path, however it got there.
+            row("   ", "blank-source"),
+            row("/home/me/third", "  "),
+            row("/home/me/docs", "docs"),
+        ]);
+
+        assert_eq!(
+            mounts.len(),
+            2,
+            "a row that cannot mount was turned into a mount anyway: {:?}",
+            mounts
+        );
+        assert_eq!(mounts[0].target.as_deref(), Some("/workspace/code"));
+        assert_eq!(mounts[0].source.as_deref(), Some("/home/me/code"));
+        assert_eq!(mounts[1].target.as_deref(), Some("/workspace/docs"));
+        // The two failures, spelled out so a future edit cannot reintroduce
+        // either by relaxing half the filter.
+        for m in &mounts {
+            assert_ne!(m.source.as_deref(), Some(""), "an empty Source reaches the daemon");
+            assert_ne!(
+                m.target.as_deref(),
+                Some("/workspace/"),
+                "a row is mounted over the workspace volume"
+            );
+        }
+        // And the good rows are unchanged: this is a filter, not a rewrite.
+        assert!(mounts.iter().all(|m| m.read_only == Some(false)));
+        assert!(project_path_mounts(&[]).is_empty());
+    }
+
+    // ── Pre-commit scrub (A1, C1) ────────────────────────────────────────────
+
+    #[test]
+    fn no_scrub_path_can_reach_a_host_bind_mount() {
+        // `/workspace/{mount_name}` is the user's own project directory, bound
+        // in from the host. Nothing in this list may ever name one — and the
+        // two read-only host mounts under /tmp must be equally unreachable.
+        //
+        // Necessary, not sufficient: a pattern that looks like this can still
+        // resolve into a bind mount through a symlinked parent, which is what
+        // the script's own checks exist for. See
+        // `the_scrub_script_refuses_a_symlinked_parent_...` below.
+        for path in SNAPSHOT_SCRUB_PATHS {
+            assert!(
+                path.starts_with('/'),
+                "{} is not absolute, so the shell would resolve it against an unknown cwd",
+                path
+            );
+            assert!(
+                !path.starts_with("/workspace"),
+                "{} reaches into a host bind mount",
+                path
+            );
+            assert!(
+                !path.starts_with("/tmp/."),
+                "{} could select /tmp/.host-ca or /tmp/.host-aws",
+                path
+            );
+            assert!(
+                !path.starts_with("/home"),
+                "{} reaches into the persisted home volume",
+                path
+            );
+        }
+    }
+
+    #[test]
+    fn no_scrub_path_is_a_whole_system_directory() {
+        // A trailing `/*` on a directory the system needs is fine; the
+        // directory *itself* is not. Guards against an edit that shortens an
+        // entry by one path component.
+        const FORBIDDEN: &[&str] = &[
+            "/", "/tmp", "/var", "/var/lib", "/var/log", "/var/cache", "/etc", "/usr", "/opt",
+            "/workspace", "/home", "/home/claude", "/var/lib/apt", "/var/cache/apt",
+        ];
+        for path in SNAPSHOT_SCRUB_PATHS {
+            let trimmed = path.trim_end_matches('/');
+            assert!(
+                !FORBIDDEN.contains(&trimmed),
+                "{} would delete a directory the container needs",
+                path
+            );
+        }
+    }
+
+    #[test]
+    fn every_scrub_pattern_keeps_its_glob_in_the_final_component() {
+        // The script can only validate a parent directory it can name, so the
+        // parent has to be literal. An entry like `/var/*/apt/*` would put a
+        // glob in a path *component*, which is the shape that made C1
+        // exploitable in the first place.
+        for pattern in SNAPSHOT_SCRUB_PATHS {
+            let (dir, glob) = split_scrub_pattern(pattern)
+                .unwrap_or_else(|| panic!("{} has no literal parent directory", pattern));
+            assert!(
+                !dir.contains(['*', '?', '[']),
+                "{}: the parent {} is itself a glob, so the script cannot check it",
+                pattern,
+                dir
+            );
+            assert!(!glob.is_empty(), "{} has an empty final component", pattern);
+            // Both halves are single-quoted into the script; a quote or a blank
+            // would break out of that quoting and change what runs as root.
+            assert!(
+                !pattern.contains('\'') && !pattern.contains(char::is_whitespace),
+                "{} cannot be safely single-quoted into the scrub script",
+                pattern
+            );
+        }
+    }
+
+    #[test]
+    fn every_scrub_parent_is_inside_the_scripts_containment_allowlist() {
+        // The allowlist is hardcoded in the script and deliberately not derived
+        // from this list, so the two can drift apart — in which case the entry
+        // silently stops being scrubbed. Fail here instead.
+        for pattern in SNAPSHOT_SCRUB_PATHS {
+            let (dir, _) = split_scrub_pattern(pattern).expect("a literal parent");
+            assert!(
+                SCRUB_CONTAINMENT_PREFIXES
+                    .iter()
+                    .any(|p| dir == *p || dir.starts_with(&format!("{}/", p))),
+                "{} is anchored at {}, which the script's containment check would refuse",
+                pattern,
+                dir
+            );
+        }
+    }
+
+    #[test]
+    fn the_containment_allowlist_cannot_reach_anything_of_the_users() {
+        for prefix in SCRUB_CONTAINMENT_PREFIXES {
+            assert!(prefix.starts_with('/'), "{} is not absolute", prefix);
+            assert!(!prefix.ends_with('/'), "{} would match the wrong things", prefix);
+            for forbidden in [
+                "/", "/workspace", "/home", "/etc", "/usr", "/opt", "/srv", "/root",
+                "/var/lib/postgresql", "/var/lib/docker",
+            ] {
+                assert!(
+                    !(forbidden == *prefix || forbidden.starts_with(&format!("{}/", prefix))),
+                    "the allowlist entry {} contains {}",
+                    prefix,
+                    forbidden
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_scrub_list_covers_every_measured_source_of_writable_layer_growth() {
+        // Each of these was measured in a real container's pending commit.
+        // Dropping one silently gives back multiple gigabytes per project.
+        for expected in [
+            "/tmp/claude-*",                 // agent scratchpads, 3.0 GB measured
+            "/tmp/triple-c-drops/*",         // terminal drag-and-drop staging
+            "/tmp/clipboard_*.png",          // pasted images
+            "/var/lib/apt/lists/*",          // runtime apt, no `apt-get clean` behind it
+            "/var/cache/apt/archives/*.deb",
+            "/var/log/apt/*",
+            "/var/log/dpkg.log",
+        ] {
+            assert!(
+                SNAPSHOT_SCRUB_PATHS.contains(&expected),
+                "{} is no longer scrubbed before commit",
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn the_users_own_files_are_only_scrubbed_once_they_are_stale() {
+        // Regression: these two hold files the user handed the agent by hand,
+        // and deleting them at commit time turned "change a setting" into
+        // "silently lose the file you just dropped". They stay in the list —
+        // nothing else ever reclaims them — but only with an age gate.
+        for user_owned in ["/tmp/triple-c-drops/*", "/tmp/clipboard_*.png"] {
+            assert!(
+                SNAPSHOT_SCRUB_PATHS.contains(&user_owned),
+                "{} was removed from the list instead of age-limited, so nothing reclaims it",
+                user_owned
+            );
+            let age = SCRUB_MIN_AGE_DAYS.iter().find(|(p, _)| *p == user_owned);
+            assert!(
+                age.is_some_and(|(_, days)| *days >= 7),
+                "{} is scrubbed without a meaningful age limit, which loses a just-dropped file",
+                user_owned
+            );
+        }
+        // The scratchpads are machine debris and are not age-limited; if that
+        // ever changes, the comment explaining why must change with it.
+        assert!(!SCRUB_MIN_AGE_DAYS.iter().any(|(p, _)| *p == "/tmp/claude-*"));
+        // An age limit on a pattern that is not scrubbed at all does nothing
+        // and reads as though it does.
+        for (pattern, _) in SCRUB_MIN_AGE_DAYS {
+            assert!(SNAPSHOT_SCRUB_PATHS.contains(pattern), "{} is not scrubbed", pattern);
+        }
+    }
+
+    #[test]
+    fn the_scrub_script_validates_every_directory_before_deleting_in_it() {
+        // The structural half of the C1 fix, for the environments where the
+        // `/bin/sh` test below cannot run. Each assertion here pins one of the
+        // five checks; deleting any of them from the script fails this test.
+        let script = snapshot_scrub_script();
+
+        // Exactly one deletion in the whole script, inside `scrub_in` and
+        // downstream of all five checks. A future edit that adds a bare `rm`
+        // at the top level — which is what the vulnerable version was — fails
+        // here.
+        assert_eq!(
+            script.matches(r#"rm --one-file-system -rf -- "$p""#).count(),
+            1,
+            "the scrub deletes somewhere other than inside the validated block:\n{}",
+            script
+        );
+        // M1: and the flag is spelled into that one deletion rather than
+        // reaching it through a `$rmopt` an unsupported `rm` leaves empty.
+        assert!(
+            !script.contains("rmopt"),
+            "the cross-filesystem guard is optional again:\n{}",
+            script
+        );
+        assert_eq!(
+            script.matches("rm -rf").count(),
+            0,
+            "an unguarded recursive delete is back in the script:\n{}",
+            script
+        );
+        // The handle: after this, paths are relative to a validated inode, so
+        // re-pointing the directory cannot redirect the delete.
+        assert!(script.contains(r#"cd -P "$d" 2>/dev/null || exit 0;"#));
+        // 1. no symlinked component anywhere in the parent
+        assert!(script.contains(r#"[ "$(pwd -P)" = "$d" ] || exit 0;"#));
+        // 2. positive containment against a hardcoded allowlist
+        assert!(script.contains("/tmp|/tmp/*|/var/log|/var/log/*"));
+        assert!(!script.contains("/workspace"));
+        // 3. the parent on the same filesystem as the root — a bind mount or
+        //    volume is not part of the writable layer and must never be
+        //    touched.
+        assert!(script.contains(r#"[ -n "$rootdev" ] || exit 0;"#));
+        assert!(script.contains(r#"[ "$(stat -c %d . 2>/dev/null)" = "$rootdev" ] || exit 0;"#));
+        // 4. and *each match* on it too. Check 3 says nothing about a mount
+        //    planted at the match itself, and `rm --one-file-system` compares
+        //    against its own argument's device, so without this line a volume
+        //    mounted at `/tmp/claude-x` has its contents deleted — reproduced
+        //    against a live daemon before this existed.
+        assert!(script
+            .contains(r#"[ "$(stat -c %d -- "$p" 2>/dev/null)" = "$rootdev" ] || continue;"#));
+        // 5. an expansion carrying a separator means the list changed shape
+        assert!(script.contains(r#"case "$p" in */*|.|..) continue ;; esac;"#));
+    }
+
+    #[test]
+    fn the_scrub_script_cannot_be_steered_by_path() {
+        // Checks 3 and 4 are `stat` answering a question, and the image's
+        // `PATH` starts with three directories inside the container's own
+        // persisted home volume. A three-line `stat` shim planted in the first
+        // of them made an unshimmed-refused mount at `/var/log/apt` delete its
+        // whole contents, so "no `stat` means no deletion" was never the
+        // property that mattered. The defence is the `PATH` reset, and it has
+        // to be the *first* statement in the script.
+        let script = snapshot_scrub_script();
+        assert!(
+            script.starts_with("PATH=/usr/bin:/bin; export PATH;\n"),
+            "the scrub inherits the container's PATH:\n{}",
+            script
+        );
+        // Nothing may run before the reset takes effect.
+        let reset_at = script.find("export PATH;").expect("the PATH reset");
+        assert!(
+            !script[..reset_at].contains('$'),
+            "something is expanded before PATH is reset:\n{}",
+            script
+        );
+        // H3: and the tools are *not* named absolutely on top of that.
+        // `/usr/bin/stat` is where coreutils live on Ubuntu and not where they
+        // live on Alpine, which Settings → Docker → Custom accepts — so an
+        // absolute path turned the whole scrub into a silent no-op there while
+        // buying nothing the reset above had not already bought.
+        assert!(
+            !script.contains("/usr/bin/stat"),
+            "the scrub hardcodes a coreutils location that is not universal:\n{}",
+            script
+        );
+        for tool in ["stat", "du", "find", "cut", "rm"] {
+            assert!(
+                !script.contains(&format!("/usr/bin/{}", tool)),
+                "`{}` is called by absolute path, which fails closed and silently on any image \
+                 that does not put it there:\n{}",
+                tool,
+                script
+            );
+        }
+    }
+
+    #[test]
+    fn the_scrub_refuses_to_run_at_all_when_a_tool_is_missing() {
+        // H3, the structural half. Every one of the six things the script needs
+        // is probed up front, and a script that cannot find one prints a marker
+        // the caller can tell from a total instead of printing `0`.
+        let script = snapshot_scrub_script();
+        assert!(script.contains(
+            r#"for t in stat rm du cut find; do command -v "$t" >/dev/null 2>&1 || missing="$missing $t"; done;"#
+        ));
+        // M1: the seventh. `rm` existing is not `rm` taking the one flag that
+        // bounds a recursive delete run as root, and the difference used to be
+        // an empty variable nobody could see from the outside.
+        assert!(script.contains(
+            r#"command -v rm >/dev/null 2>&1 && { rm --one-file-system -f -- '' >/dev/null 2>&1 || missing="$missing rm-one-file-system"; };"#
+        ));
+        assert!(script.contains(&format!(
+            r#"[ -z "$missing" ] || {{ echo "{}$missing"; exit 0; }};"#,
+            SCRUB_UNAVAILABLE_MARKER
+        )));
+        // The two markers must be un-confusable in both directions, since the
+        // caller reads whichever it finds out of one interleaved stream.
+        assert!(!SCRUB_UNAVAILABLE_MARKER.starts_with(SCRUB_MARKER));
+        assert!(!SCRUB_MARKER.starts_with(SCRUB_UNAVAILABLE_MARKER));
+        assert_eq!(parse_scrub_total("###TRIPLE-C-SCRUB-UNAVAILABLE stat"), None);
+        assert!(parse_scrub_unavailable("###TRIPLE-C-SCRUBBED 0").is_none());
+    }
+
+    #[test]
+    fn the_scrub_exec_blanks_the_dynamic_linker_hooks() {
+        // The exec inherits the container's env, and a project's custom env
+        // vars are part of it: `LD_PRELOAD` is in none of the reserved
+        // families, so it reaches a root exec unfiltered and injects code into
+        // every tool the scrub runs, `PATH` reset or not.
+        for key in ["LD_PRELOAD", "LD_AUDIT", "LD_LIBRARY_PATH"] {
+            assert!(
+                SCRUB_EXEC_ENV.contains(&format!("{}=", key).as_str()),
+                "{} reaches the scrub exec from the container's env",
+                key
+            );
+            // Blanked, never given a value — an empty `LD_PRELOAD` is what
+            // glibc reads as "no preload".
+            assert!(!is_reserved_env_key(key), "the reserved list has changed shape");
+        }
+        for entry in SCRUB_EXEC_ENV {
+            assert!(entry.ends_with('='), "{} carries a value into the scrub", entry);
+        }
+    }
+
+    #[test]
+    fn the_scrub_script_hands_each_glob_over_unexpanded() {
+        let script = snapshot_scrub_script();
+        // Single-quoted at the call site: an unquoted `*` would be expanded
+        // against the script's own working directory before `scrub_in` ran.
+        assert!(script.contains("scrub_in '/tmp/claude-*' '-';"));
+        assert!(script.contains("scrub_in '/var/log/apt/*' '-';"));
+        assert!(script.contains("scrub_in '/tmp/triple-c-drops/*' '14';"));
+        // The parent/glob split happens in the shell, so every entry stays
+        // readable verbatim in the script rather than as a forked copy.
+        for pattern in SNAPSHOT_SCRUB_PATHS {
+            assert!(script.contains(pattern), "{} is not named in the script", pattern);
+        }
+        // Expanded inside the function, where the cwd is the validated
+        // directory, and quoted everywhere it is *used* so a filename with a
+        // space stays one argument.
+        assert!(script.contains("for p in $g; do"));
+        assert!(script.contains(r#"rm --one-file-system -rf -- "$p""#));
+        // `rm -rf /` would be catastrophic and is exactly what a botched
+        // interpolation produces.
+        assert!(!script.contains("rm -rf -- /\n"));
+        assert!(!script.contains(" / "));
+    }
+
+    /// The behavioural half of the C1 fix.
+    ///
+    /// The test this replaces asserted `!script.contains("/workspace")`, which
+    /// the exploited version passed: containment is a property of what the
+    /// paths resolve to at run time. Docker is not available everywhere the
+    /// suite runs, so a throwaway directory tree stands in for the container
+    /// and `snapshot_scrub_script_under` re-anchors the real generated script
+    /// onto it. Linux-only because the script uses GNU `stat -c` and `du -b`,
+    /// which is what it will always run against inside the image.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_scrub_script_refuses_a_symlinked_parent_and_still_reclaims_a_real_one() {
+        use std::fs;
+        use std::process::Command;
+
+        // Canonicalised: a TMPDIR that is itself a symlink would trip check 1
+        // and make every case pass by doing nothing at all.
+        let base = fs::canonicalize(std::env::temp_dir()).expect("a real temp dir");
+        let root = base.join(format!("triple-c-scrub-{}", uuid::Uuid::new_v4().simple()));
+        let root_str = root.to_str().expect("a UTF-8 temp path").to_string();
+
+        let mk = |rel: &str| fs::create_dir_all(root.join(rel)).expect("mkdir");
+        // The script calls its tools by absolute path, so the re-anchored copy
+        // needs them where it will look for them.
+        plant_scrub_tools(&root);
+        mk("tmp/triple-c-drops");
+        mk("var/log");
+        mk("var/lib/apt/lists");
+        mk("var/cache/apt/archives");
+        // Stands in for /workspace/{mount_name}: the user's own project,
+        // bind-mounted from the host.
+        mk("workspace/myproject/sub");
+        fs::write(root.join("workspace/myproject/precious.txt"), "do not delete").unwrap();
+        fs::write(root.join("workspace/myproject/sub/nested.txt"), "nor this").unwrap();
+
+        // Debris the scrub is supposed to take, so this cannot pass by
+        // refusing everything.
+        mk("tmp/claude-scratch");
+        fs::write(root.join("tmp/claude-scratch/blob"), vec![0u8; 64 * 1024]).unwrap();
+        fs::write(root.join("var/lib/apt/lists/deb.list"), vec![0u8; 32 * 1024]).unwrap();
+
+        // The attack, in the two shapes that were verified against a real
+        // container: a symlinked *parent* (a path component, resolved by both
+        // the glob and the `rm -rf`) and a symlinked *match* (safe already —
+        // `rm -rf -- link` unlinks the link — and pinned here so it stays so).
+        std::os::unix::fs::symlink(root.join("workspace/myproject"), root.join("var/log/apt"))
+            .unwrap();
+        std::os::unix::fs::symlink(
+            root.join("workspace/myproject"),
+            root.join("tmp/claude-link"),
+        )
+        .unwrap();
+
+        // The age gate on the user's own files: the one dropped a moment ago
+        // survives a recreation, the one from last month does not.
+        fs::write(root.join("tmp/triple-c-drops/fresh.txt"), "just dropped").unwrap();
+        fs::write(root.join("tmp/triple-c-drops/stale.txt"), vec![0u8; 8 * 1024]).unwrap();
+        let touched = Command::new("touch")
+            .arg("-d")
+            .arg("30 days ago")
+            .arg(root.join("tmp/triple-c-drops/stale.txt"))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        let script = snapshot_scrub_script_under(&root_str);
+        let output = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .expect("run the generated script");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+        let exists = |rel: &str| root.join(rel).exists();
+        let survived = exists("workspace/myproject/precious.txt")
+            && exists("workspace/myproject/sub/nested.txt");
+        let debris_gone =
+            !exists("tmp/claude-scratch") && !exists("var/lib/apt/lists/deb.list");
+        let link_removed = fs::symlink_metadata(root.join("tmp/claude-link")).is_err();
+        let fresh_kept = exists("tmp/triple-c-drops/fresh.txt");
+        let stale_gone = !exists("tmp/triple-c-drops/stale.txt");
+        let total = parse_scrub_total(&stdout);
+
+        fs::remove_dir_all(&root).ok();
+
+        assert!(
+            survived,
+            "the scrub followed a symlinked parent into a bind mount.\nstdout: {}\nstderr: {}\nscript:\n{}",
+            stdout, stderr, script
+        );
+        assert!(
+            debris_gone,
+            "the scrub stopped reclaiming anything.\nstdout: {}\nstderr: {}",
+            stdout, stderr
+        );
+        assert!(link_removed, "a symlinked match was left behind instead of unlinked");
+        assert!(fresh_kept, "a file dropped moments ago was scrubbed anyway");
+        if touched {
+            assert!(stale_gone, "an age-limited file well past its limit was kept");
+        }
+        let total = total.expect("the marker line is missing");
+        assert!(
+            total >= 96 * 1024,
+            "reported total {} is too small to have removed the planted debris",
+            total
+        );
+    }
+
+    /// Put the tools the re-anchored script resolves through its own `PATH`
+    /// where it will look for them.
+    ///
+    /// Symlinks to the real ones, so a test can replace exactly one — which is
+    /// how a mount point is simulated below without the privileges no test
+    /// process has.
+    #[cfg(target_os = "linux")]
+    fn plant_scrub_tools(root: &std::path::Path) {
+        plant_scrub_tools_in(root, "usr/bin");
+    }
+
+    /// [`plant_scrub_tools`] into a chosen directory of the test root.
+    ///
+    /// The script's `PATH` is `{root}/usr/bin:{root}/bin`, so `bin` is the
+    /// non-usr-merged layout — Alpine's — that H3 was a silent no-op on.
+    #[cfg(target_os = "linux")]
+    fn plant_scrub_tools_in(root: &std::path::Path, rel: &str) {
+        std::fs::create_dir_all(root.join(rel)).expect("mkdir the tool directory");
+        for tool in ["stat", "du", "find", "cut", "rm"] {
+            let real = ["/usr/bin", "/bin"]
+                .iter()
+                .map(|d| std::path::Path::new(d).join(tool))
+                .find(|c| c.exists())
+                .unwrap_or_else(|| panic!("no {} on this host to link", tool));
+            std::os::unix::fs::symlink(real, root.join(rel).join(tool))
+                .expect("link a tool into the test root");
+        }
+    }
+
+    /// The other half of C1: a mount at the *match* rather than at its parent.
+    ///
+    /// Checks 0–3 validate the parent and `rm --one-file-system` compares
+    /// against its own argument, so with the match itself a mount root there
+    /// was nothing left between the scrub and the mounted filesystem's
+    /// contents. Confirmed end to end before the fix — `docker run -v
+    /// vol:/tmp/claude-x` came back with the volume empty, and the same run
+    /// against a host directory bound at `/workspace/../tmp/claude-x` (the
+    /// target the daemon builds from a mount name of `../tmp/claude-x`) emptied
+    /// the host directory.
+    ///
+    /// A test process cannot mount anything — no `CAP_SYS_ADMIN`, and this
+    /// container refuses `unshare -Urm` as well — so the boundary is simulated
+    /// by the one thing that reports it: a `stat` that answers with a foreign
+    /// device for one directory. Both negative controls are asserted, so a
+    /// harness that had stopped being able to show the difference fails rather
+    /// than passing quietly.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_scrub_script_refuses_a_match_that_is_a_mount_point_and_ignores_a_shimmed_stat() {
+        use std::fs;
+        use std::process::Command;
+
+        let base = fs::canonicalize(std::env::temp_dir()).expect("a real temp dir");
+        let root = base.join(format!("triple-c-scrub-{}", uuid::Uuid::new_v4().simple()));
+        let root_str = root.to_str().expect("a UTF-8 temp path").to_string();
+        fs::create_dir_all(root.join("tmp")).expect("mkdir");
+        plant_scrub_tools(&root);
+
+        // `claude-mounted` stands in for the user's project directory bound
+        // over a scratchpad path; `claude-real` is the debris the scrub is
+        // still expected to take, so nothing here can pass by refusing
+        // everything.
+        let seed = || {
+            fs::remove_dir_all(root.join("tmp/claude-mounted")).ok();
+            fs::remove_dir_all(root.join("tmp/claude-real")).ok();
+            fs::create_dir_all(root.join("tmp/claude-mounted/sub")).expect("mkdir");
+            fs::create_dir_all(root.join("tmp/claude-real")).expect("mkdir");
+            fs::write(root.join("tmp/claude-mounted/precious.txt"), "do not delete").unwrap();
+            fs::write(root.join("tmp/claude-mounted/sub/nested.txt"), "nor this").unwrap();
+            fs::write(root.join("tmp/claude-real/blob"), vec![0u8; 64 * 1024]).unwrap();
+        };
+        let mounted_survived = || {
+            root.join("tmp/claude-mounted/precious.txt").exists()
+                && root.join("tmp/claude-mounted/sub/nested.txt").exists()
+        };
+
+        // The kernel reports a mount point as a directory whose device differs
+        // from its parent's. This says exactly that, for one name, and
+        // otherwise answers honestly.
+        fs::remove_file(root.join("usr/bin/stat")).expect("drop the symlink to the real stat");
+        fs::write(
+            root.join("usr/bin/stat"),
+            "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in claude-mounted|*/claude-mounted) echo 999999; exit 0 ;; esac; done\nexec /usr/bin/stat \"$@\"\n",
+        )
+        .expect("overwrite the stat symlink with a stub");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(root.join("usr/bin/stat"), fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+
+        // A shim of the shape an agent can plant in its own home volume, first
+        // on `PATH`: one constant device makes every comparison agree.
+        let hostile = root.join("hostile");
+        fs::create_dir_all(&hostile).expect("mkdir");
+        fs::write(hostile.join("stat"), "#!/bin/sh\necho 1\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(hostile.join("stat"), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // The shim first, then the test root's own tool directory: without the
+        // reset the script finds the shim, with it the script finds neither
+        // this `PATH` nor the shim.
+        let hostile_path = format!(
+            "{}:{}/usr/bin:/usr/bin:/bin",
+            hostile.display(),
+            root_str
+        );
+
+        let real = snapshot_scrub_script_under(&root_str);
+        // Negative control 1: the same script with check 4 deleted.
+        let without_match_check: String = real
+            .lines()
+            .filter(|l| !l.contains(r#"-- "$p" 2>/dev/null)" = "$rootdev" ] || continue;"#))
+            .map(|l| format!("{}\n", l))
+            .collect();
+        // Negative control 2: the same script with the `PATH` reset deleted,
+        // so its bare tool names resolve through whatever `PATH` says. This is
+        // what the scrub was before the reset existed, and the shim below owns
+        // it. (Naming the tools absolutely *also* defeated the shim — and was
+        // H3, because `/usr/bin/stat` is not where every image keeps `stat`.
+        // The reset defeats it without that failure mode: the shim lives in
+        // the home volume, which the reset drops off `PATH` entirely, and uid
+        // 1000 cannot write `/usr/bin` or `/bin`.)
+        let without_path_reset: String = real
+            .lines()
+            .filter(|l| !l.starts_with("PATH="))
+            .map(|l| format!("{}\n", l))
+            .collect();
+
+        let run = |script: &str, path: &str| {
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg(script)
+                .env("PATH", path)
+                .output()
+                .expect("run the generated script")
+        };
+
+        seed();
+        let real_out = run(&real, &hostile_path);
+        let real_kept = mounted_survived();
+        let real_reclaimed = !root.join("tmp/claude-real/blob").exists();
+
+        seed();
+        run(&without_match_check, &hostile_path);
+        let no_check_kept = mounted_survived();
+
+        seed();
+        run(&without_path_reset, &hostile_path);
+        let bare_kept = mounted_survived();
+
+        fs::remove_dir_all(&root).ok();
+
+        assert!(
+            !no_check_kept,
+            "the harness cannot tell the difference: the mount-point check was removed and the \
+             directory survived anyway, so the assertion below proves nothing"
+        );
+        assert!(
+            !bare_kept,
+            "the harness cannot tell the difference: the shimmed `stat` was reachable and did not \
+             change the outcome, so PATH hardening cannot be shown either way"
+        );
+        assert!(
+            real_kept,
+            "the scrub emptied a mount planted at the match.\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&real_out.stdout),
+            String::from_utf8_lossy(&real_out.stderr),
+        );
+        assert!(
+            real_reclaimed,
+            "the scrub stopped reclaiming a real scratchpad next to the mount"
+        );
+        assert_eq!(
+            parse_scrub_total(&String::from_utf8_lossy(&real_out.stdout)).map(|t| t >= 64 * 1024),
+            Some(true),
+            "the reported total does not account for the scratchpad that was removed"
+        );
+    }
+
+    /// M1: an `rm` that cannot bound a recursive delete stops the scrub; it
+    /// does not turn the scrub into an unbounded one.
+    ///
+    /// `--one-file-system` is the only thing between `rm -rf` run as root and a
+    /// mount planted *below* a match — the one position checks 0–4 cannot see,
+    /// because it is neither the parent they validate nor the match they
+    /// `stat`. It used to be probed into `$rmopt`, and every busybox- or
+    /// toybox-derived `rm` leaves that empty (BusyBox 1.38 answers
+    /// `unrecognized option '--one-file-system'` and exits 1, measured), so the
+    /// guard was absent on exactly the images that reach this code through
+    /// `ImageSource::Custom` — and the run still reported `Reclaimed(n)`.
+    ///
+    /// The `rm` planted here answers the way busybox's does. The negative
+    /// control is the shape this replaces, rebuilt from the real script: it
+    /// deletes, which is what makes the assertion that the real script does not
+    /// mean anything.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_rm_without_the_cross_filesystem_guard_stops_the_scrub() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let base = fs::canonicalize(std::env::temp_dir()).expect("a real temp dir");
+        let root = base.join(format!("triple-c-scrub-{}", uuid::Uuid::new_v4().simple()));
+        let root_str = root.to_str().expect("a UTF-8 temp path").to_string();
+        plant_scrub_tools(&root);
+
+        let real_rm = ["/usr/bin/rm", "/bin/rm"]
+            .iter()
+            .find(|c| std::path::Path::new(c).exists())
+            .expect("an rm on this host")
+            .to_string();
+        fs::remove_file(root.join("usr/bin/rm")).expect("drop the symlink to the real rm");
+        fs::write(
+            root.join("usr/bin/rm"),
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in --one-file-system) echo \"rm: \
+                 unrecognized option '--one-file-system'\" >&2; exit 1 ;; esac; done\nexec {rm} \
+                 \"$@\"\n",
+                rm = real_rm
+            ),
+        )
+        .expect("plant a busybox-shaped rm");
+        fs::set_permissions(root.join("usr/bin/rm"), fs::Permissions::from_mode(0o755)).unwrap();
+
+        let seed = || {
+            fs::remove_dir_all(root.join("tmp")).ok();
+            fs::create_dir_all(root.join("tmp/claude-scratch")).expect("mkdir");
+            fs::write(root.join("tmp/claude-scratch/blob"), vec![0u8; 64 * 1024]).unwrap();
+        };
+
+        let script = snapshot_scrub_script_under(&root_str);
+        // The pre-M1 shape: the flag asked for with `--help` and kept in a
+        // variable, which this `rm` leaves empty.
+        let fail_open = script
+            .replace(
+                r#"command -v rm >/dev/null 2>&1 && { rm --one-file-system -f -- '' >/dev/null 2>&1 || missing="$missing rm-one-file-system"; };"#,
+                "rmopt=;\nrm --one-file-system --help >/dev/null 2>&1 && rmopt=--one-file-system;",
+            )
+            .replace(r#"rm --one-file-system -rf -- "$p""#, r#"rm -rf $rmopt -- "$p""#);
+        assert_ne!(fail_open, script, "the control was rebuilt from stale text");
+
+        let run = |sh: &str| {
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg(sh)
+                .output()
+                .expect("run the generated script")
+        };
+
+        seed();
+        let control = run(&fail_open);
+        let control_deleted = !root.join("tmp/claude-scratch").exists();
+
+        seed();
+        let real = run(&script);
+        let real_out = String::from_utf8_lossy(&real.stdout).into_owned();
+        let real_kept = root.join("tmp/claude-scratch/blob").exists();
+
+        fs::remove_dir_all(&root).ok();
+
+        assert!(
+            control_deleted,
+            "the harness cannot tell the difference: the fail-open shape deleted nothing either, \
+             so the assertions below prove nothing.\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&control.stdout),
+            String::from_utf8_lossy(&control.stderr),
+        );
+        assert!(
+            real_kept,
+            "the scrub deleted as root with no cross-filesystem bound.\nstdout: {}\nstderr: {}",
+            real_out,
+            String::from_utf8_lossy(&real.stderr),
+        );
+        // And it is loud about it: a refusal must never render as the `0` a
+        // healthy container with nothing to clean prints.
+        assert_eq!(
+            parse_scrub_total(&real_out),
+            None,
+            "a scrub that refused to run still printed a total: {}",
+            real_out
+        );
+        let reason = parse_scrub_unavailable(&real_out)
+            .unwrap_or_else(|| panic!("no unavailable marker in: {}", real_out));
+        assert!(
+            reason.contains("--one-file-system"),
+            "the reason does not name the guard that is missing: {}",
+            reason
+        );
+    }
+
+    /// M1, the other half: the guard is attached to the delete that actually
+    /// runs, not merely to the script text.
+    ///
+    /// The only assertion this position had was that the string
+    /// `rm -rf $rmopt -- "$p"` appeared in the script — which says nothing
+    /// about what `rm` is handed once the shell has expanded it, and an empty
+    /// `$rmopt` was precisely the defect. So the `rm` the script resolves
+    /// records its own argv here and the argv is what is asserted.
+    ///
+    /// A test process cannot create the mount that would exercise the flag for
+    /// real — no `CAP_SYS_ADMIN`, and this container refuses `unshare -Urm` as
+    /// well — so "the flag is honoured at a nested boundary" is measured in
+    /// containers and recorded on [`snapshot_scrub_script_under`]. "The flag is
+    /// there at all, on every match" is this.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn every_delete_reaches_rm_with_the_cross_filesystem_guard_attached() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let base = fs::canonicalize(std::env::temp_dir()).expect("a real temp dir");
+        let root = base.join(format!("triple-c-scrub-{}", uuid::Uuid::new_v4().simple()));
+        let root_str = root.to_str().expect("a UTF-8 temp path").to_string();
+        plant_scrub_tools(&root);
+
+        let real_rm = ["/usr/bin/rm", "/bin/rm"]
+            .iter()
+            .find(|c| std::path::Path::new(c).exists())
+            .expect("an rm on this host")
+            .to_string();
+        let argv_log = root.join("argv");
+        fs::remove_file(root.join("usr/bin/rm")).expect("drop the symlink to the real rm");
+        fs::write(
+            root.join("usr/bin/rm"),
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\nexec {rm} \"$@\"\n",
+                log = argv_log.display(),
+                rm = real_rm
+            ),
+        )
+        .expect("plant an argv-recording rm");
+        fs::set_permissions(root.join("usr/bin/rm"), fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Two matches of the same pattern, so "the flag is on the first one"
+        // cannot pass for "the flag is on every one".
+        let seed = || {
+            fs::remove_file(&argv_log).ok();
+            fs::remove_dir_all(root.join("tmp")).ok();
+            for name in ["tmp/claude-a", "tmp/claude-b"] {
+                fs::create_dir_all(root.join(name)).expect("mkdir");
+                fs::write(root.join(name).join("blob"), vec![0u8; 32 * 1024]).unwrap();
+            }
+        };
+        // Only the deletes, not the `rm --one-file-system -f -- ''` probe.
+        let deletes = || -> Vec<String> {
+            fs::read_to_string(&argv_log)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| l.contains("claude-"))
+                .map(|l| l.to_string())
+                .collect()
+        };
+
+        let script = snapshot_scrub_script_under(&root_str);
+        let unguarded = script.replace(
+            r#"rm --one-file-system -rf -- "$p""#,
+            r#"rm -rf -- "$p""#,
+        );
+        assert_ne!(unguarded, script, "the control was rebuilt from stale text");
+
+        let run = |sh: &str| {
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg(sh)
+                .output()
+                .expect("run the generated script")
+        };
+
+        seed();
+        run(&script);
+        let guarded_argv = deletes();
+
+        seed();
+        run(&unguarded);
+        let unguarded_argv = deletes();
+
+        fs::remove_dir_all(&root).ok();
+
+        assert_eq!(
+            guarded_argv.len(),
+            2,
+            "both matches should have reached rm exactly once: {:?}",
+            guarded_argv
+        );
+        assert!(
+            unguarded_argv.len() == 2
+                && unguarded_argv.iter().all(|a| !a.contains("--one-file-system")),
+            "the harness cannot tell the difference: stripping the flag from the script did not \
+             change the argv rm was handed: {:?}",
+            unguarded_argv
+        );
+        for argv in &guarded_argv {
+            assert!(
+                argv.starts_with("--one-file-system "),
+                "a delete reached rm without the cross-filesystem guard: {:?}",
+                guarded_argv
+            );
+        }
+    }
+
+    /// M2: the script cannot be steered by a shell function, because the shell
+    /// that runs it has no environment to import one from.
+    ///
+    /// `bash` builds shell functions out of environment variables named
+    /// `BASH_FUNC_<name>%%`, and function lookup happens *before* `PATH` — so
+    /// the `PATH` reset is no defence, and `command -v` reports the function as
+    /// found, which walks the planted function straight through the
+    /// prerequisite probe. Nor is any in-script answer one: `[`, `pwd`, `cd`,
+    /// `command` and `unset` all import just as readily (measured on `bash`
+    /// 5.2), which is checks 0–2 and both of the things that would remove the
+    /// function.
+    ///
+    /// The shipped image's `/bin/sh` is `dash`, which imports nothing, so this
+    /// is latent there — but the Dockerfile does not pin `/bin/sh` and the base
+    /// is inherited from `ubuntu:24.04`, and `ImageSource::Custom` takes any
+    /// image at all. So the inner shell is `bash` here on purpose: it stands in
+    /// for the image where this is not latent, and it is the only way to show
+    /// that what protects the script is `env -i` rather than the accident of
+    /// `dash` being what `/bin/sh` points at.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_planted_shell_function_cannot_answer_the_containment_checks() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let bash = ["/usr/bin/bash", "/bin/bash"]
+            .iter()
+            .find(|c| std::path::Path::new(c).exists())
+            .expect("a bash on this host to stand in for an image whose /bin/sh is bash")
+            .to_string();
+
+        let base = fs::canonicalize(std::env::temp_dir()).expect("a real temp dir");
+        let root = base.join(format!("triple-c-scrub-{}", uuid::Uuid::new_v4().simple()));
+        let root_str = root.to_str().expect("a UTF-8 temp path").to_string();
+        fs::create_dir_all(root.join("tmp")).expect("mkdir");
+        plant_scrub_tools(&root);
+
+        // The same simulation the mount-at-the-match test uses: a `stat` that
+        // reports a foreign device for one name is what the kernel reports for
+        // a mount point, and no test process can make a real one.
+        fs::remove_file(root.join("usr/bin/stat")).expect("drop the symlink to the real stat");
+        fs::write(
+            root.join("usr/bin/stat"),
+            "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in claude-mounted|*/claude-mounted) echo 999999; exit 0 ;; esac; done\nexec /usr/bin/stat \"$@\"\n",
+        )
+        .expect("overwrite the stat symlink with a stub");
+        fs::set_permissions(root.join("usr/bin/stat"), fs::Permissions::from_mode(0o755)).unwrap();
+
+        let seed = || {
+            fs::remove_dir_all(root.join("tmp/claude-mounted")).ok();
+            fs::remove_dir_all(root.join("tmp/claude-real")).ok();
+            fs::create_dir_all(root.join("tmp/claude-mounted/sub")).expect("mkdir");
+            fs::create_dir_all(root.join("tmp/claude-real")).expect("mkdir");
+            fs::write(root.join("tmp/claude-mounted/precious.txt"), "do not delete").unwrap();
+            fs::write(root.join("tmp/claude-mounted/sub/nested.txt"), "nor this").unwrap();
+            fs::write(root.join("tmp/claude-real/blob"), vec![0u8; 64 * 1024]).unwrap();
+        };
+        let mounted_survived = || {
+            root.join("tmp/claude-mounted/precious.txt").exists()
+                && root.join("tmp/claude-mounted/sub/nested.txt").exists()
+        };
+
+        let script = snapshot_scrub_script_under(&root_str);
+        // Production's bootstrap with the inner shell swapped for `bash`, i.e.
+        // the image where `/bin/sh` is bash. Nothing else about it changes.
+        let as_bash = |b: &str| b.replace("/bin/sh -c", &format!("{} -c", bash));
+        let bootstrap = as_bash(SCRUB_BOOTSTRAP);
+        // Negative control: the same bootstrap without the `-i`, which is the
+        // one character that separates "the inner shell has no environment"
+        // from "the inner shell has the caller's".
+        let without_env_reset = bootstrap.replace("env -i ", "env ");
+        assert_ne!(without_env_reset, bootstrap, "the control was rebuilt from stale text");
+
+        // One function is enough to own checks 3 and 4; the rest are there to
+        // show the bootstrap does not care how many of them there are.
+        let hostile: &[(&str, &str)] = &[
+            ("BASH_FUNC_stat%%", "() { echo 1; }"),
+            ("BASH_FUNC_command%%", "() { echo shadowed; }"),
+            ("BASH_FUNC_unset%%", "() { :; }"),
+            ("BASH_FUNC_[%%", "() { :; }"),
+            ("BASH_FUNC_pwd%%", "() { echo /; }"),
+            ("BASH_FUNC_cd%%", "() { :; }"),
+        ];
+        let run = |boot: &str, planted: &[(&str, &str)]| {
+            let mut c = Command::new(&bash);
+            c.arg("-c").arg(boot).arg("triple-c-scrub").arg(&script);
+            for (k, v) in planted {
+                c.env(k, v);
+            }
+            c.output().expect("run the bootstrap")
+        };
+
+        seed();
+        let control = run(&without_env_reset, &hostile[..1]);
+        let control_kept = mounted_survived();
+
+        seed();
+        let real = run(&bootstrap, &hostile[..1]);
+        let real_out = String::from_utf8_lossy(&real.stdout).into_owned();
+        let real_kept = mounted_survived();
+        let real_reclaimed = !root.join("tmp/claude-real/blob").exists();
+
+        seed();
+        let swarm = run(&bootstrap, hostile);
+        let swarm_out = String::from_utf8_lossy(&swarm.stdout).into_owned();
+        let swarm_kept = mounted_survived();
+        let swarm_reclaimed = !root.join("tmp/claude-real/blob").exists();
+
+        fs::remove_dir_all(&root).ok();
+
+        assert!(
+            !control_kept,
+            "the harness cannot tell the difference: a planted `stat` function reached an inner \
+             shell with the environment intact and the mount survived anyway, so the assertions \
+             below prove nothing.\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&control.stdout),
+            String::from_utf8_lossy(&control.stderr),
+        );
+        assert!(
+            real_kept,
+            "a planted shell function answered the containment checks.\nstdout: {}\nstderr: {}",
+            real_out,
+            String::from_utf8_lossy(&real.stderr),
+        );
+        assert!(real_reclaimed, "the scrub stopped reclaiming a real scratchpad");
+        assert_eq!(
+            parse_scrub_total(&real_out).map(|t| t >= 64 * 1024),
+            Some(true),
+            "the reported total does not account for the scratchpad that was removed: {}",
+            real_out
+        );
+        // And with every builtin the script leans on shadowed at once, it is
+        // still the script's own answers that decide.
+        assert!(
+            swarm_kept && swarm_reclaimed,
+            "a shadowed `[`/`pwd`/`cd`/`command`/`unset` changed what the scrub did.\nstdout: {}\nstderr: {}",
+            swarm_out,
+            String::from_utf8_lossy(&swarm.stderr),
+        );
+        assert_eq!(parse_scrub_total(&swarm_out).map(|t| t >= 64 * 1024), Some(true));
+    }
+
+    /// M2, the structural half: the exec hands the script over as an argument
+    /// to a shell that was started with no environment.
+    #[test]
+    fn the_scrub_exec_starts_its_shell_with_an_empty_environment() {
+        let script = snapshot_scrub_script();
+        let cmd = scrub_exec_cmd(&script);
+
+        assert_eq!(cmd.len(), 5);
+        assert_eq!(cmd[0], "/bin/sh");
+        assert_eq!(cmd[1], "-c");
+        assert_eq!(cmd[2], SCRUB_BOOTSTRAP);
+        // As `$1`, never spliced into the bootstrap: the script is full of
+        // single quotes and it runs `rm -rf` as root, so a nested-quoting bug
+        // there is the whole class of defect this module keeps having.
+        assert_eq!(cmd[4], script);
+        assert!(
+            !cmd[2].contains("scrub_in"),
+            "the script is interpolated into the bootstrap: {}",
+            cmd[2]
+        );
+        assert!(cmd[2].contains(r#"/usr/bin/env -i PATH=/usr/bin:/bin /bin/sh -c "$1""#));
+        // H3's lesson kept: `env` is no more usr-merged than `stat` is, and a
+        // hardcoded path that is simply absent must not be the quiet answer.
+        assert!(cmd[2].contains(r#"/bin/env -i PATH=/usr/bin:/bin /bin/sh -c "$1""#));
+        assert!(cmd[2].contains("case $? in 127)"));
+        // Everything the *outer* shell evaluates has to be a reserved word, a
+        // parameter expansion, or a command word containing a `/` — those are
+        // the three things a planted function cannot reach, and `bash` refuses
+        // to import a function whose name has a `/` in it.
+        assert_eq!(
+            cmd[2].matches("env -i").count(),
+            cmd[2].matches("/env -i").count(),
+            "the bootstrap calls `env` by a bare name: {}",
+            cmd[2]
+        );
+        assert_eq!(
+            cmd[2].matches("sh -c").count(),
+            cmd[2].matches("/sh -c").count(),
+            "the bootstrap calls `sh` by a bare name: {}",
+            cmd[2]
+        );
+
+        // And the one caller builds its argv here rather than assembling its
+        // own. Everything above is a property of `scrub_exec_cmd`, and a call
+        // site that quietly went back to `/bin/sh -c script` would satisfy all
+        // of it while running the script in the environment this exists to
+        // keep away from it. The needle is assembled rather than written out
+        // so that this line is not itself the match.
+        let needle = format!("{}(&{}())", "scrub_exec_cmd", "snapshot_scrub_script");
+        assert!(
+            include_str!("container.rs").contains(&needle),
+            "the scrub exec no longer goes through the bootstrap"
+        );
+    }
+
+    /// H3, the behavioural half: a base image whose coreutils are not under
+    /// `/usr/bin`.
+    ///
+    /// Settings → Docker → **Custom** takes any image name, and on Alpine
+    /// `stat` and `rm` are in `/bin`. Measured in a real `alpine:latest`
+    /// container against the same seeded tree: the absolute-path script printed
+    /// `###TRIPLE-C-SCRUBBED 0` and left every planted file where it was, while
+    /// the `PATH`-resolved one reclaimed 73738 bytes. Both halves are asserted
+    /// here — the negative control is the script this replaced, rebuilt by
+    /// putting the `/usr/bin/` prefixes back — so a regression cannot pass by
+    /// the harness quietly losing the ability to tell them apart.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_scrub_finds_its_tools_when_coreutils_are_not_usr_merged() {
+        use std::fs;
+        use std::process::Command;
+
+        let base = fs::canonicalize(std::env::temp_dir()).expect("a real temp dir");
+        let root = base.join(format!("triple-c-scrub-{}", uuid::Uuid::new_v4().simple()));
+        let root_str = root.to_str().expect("a UTF-8 temp path").to_string();
+
+        // The whole point: `bin`, and deliberately no `usr/bin` at all.
+        plant_scrub_tools_in(&root, "bin");
+        assert!(!root.join("usr/bin").exists());
+
+        let seed = || {
+            fs::remove_dir_all(root.join("tmp")).ok();
+            fs::create_dir_all(root.join("tmp/claude-scratch")).expect("mkdir");
+            fs::write(root.join("tmp/claude-scratch/blob"), vec![0u8; 64 * 1024]).unwrap();
+        };
+
+        let script = snapshot_scrub_script_under(&root_str);
+        // The pre-fix shape, rebuilt: every tool named absolutely under a
+        // `/usr/bin` this root does not have.
+        let absolute: String = script
+            .replace(r#"$(stat "#, &format!("$({}/usr/bin/stat ", root_str))
+            .replace(
+                "\nrm --one-file-system -rf ",
+                &format!("\n{}/usr/bin/rm --one-file-system -rf ", root_str),
+            )
+            .replace(
+                "&& { rm --one-file-system",
+                &format!("&& {{ {}/usr/bin/rm --one-file-system", root_str),
+            )
+            .replace("$(du -sb", &format!("$({}/usr/bin/du -sb", root_str))
+            .replace("| cut -f1", &format!("| {}/usr/bin/cut -f1", root_str))
+            .replace("$(find ", &format!("$({}/usr/bin/find ", root_str))
+            .lines()
+            // The probe is what makes the pre-fix shape *loud*; the control has
+            // to be the quiet version it replaced, so drop it.
+            .filter(|l| !l.starts_with("for t in ") && !l.starts_with(r#"[ -z "$missing" ]"#))
+            .map(|l| format!("{}\n", l))
+            .collect();
+
+        let run = |sh: &str| {
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg(sh)
+                .output()
+                .expect("run the generated script")
+        };
+
+        seed();
+        let before = run(&absolute);
+        let before_out = String::from_utf8_lossy(&before.stdout).into_owned();
+        let before_kept = root.join("tmp/claude-scratch/blob").exists();
+
+        seed();
+        let after = run(&script);
+        let after_out = String::from_utf8_lossy(&after.stdout).into_owned();
+        let after_gone = !root.join("tmp/claude-scratch").exists();
+
+        fs::remove_dir_all(&root).ok();
+
+        assert!(
+            before_kept,
+            "the harness cannot tell the difference: the absolute-path script reclaimed on a \
+             root with no /usr/bin, so this proves nothing.\nstdout: {}",
+            before_out
+        );
+        assert_eq!(
+            parse_scrub_total(&before_out),
+            Some(0),
+            "the control is supposed to be the *silent* failure — a clean-looking zero"
+        );
+        assert!(
+            after_gone,
+            "the scrub is still a no-op where coreutils are in /bin.\nstdout: {}\nstderr: {}",
+            after_out,
+            String::from_utf8_lossy(&after.stderr)
+        );
+        assert!(
+            parse_scrub_total(&after_out).unwrap_or(0) >= 64 * 1024,
+            "reported total {:?} does not account for the planted debris",
+            parse_scrub_total(&after_out)
+        );
+        assert!(parse_scrub_unavailable(&after_out).is_none());
+    }
+
+    /// H3's third silence: a scrub that could not run must not read as one that
+    /// ran and found nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_scrub_that_cannot_find_its_tools_says_so_instead_of_reporting_zero() {
+        use std::fs;
+        use std::process::Command;
+
+        let base = fs::canonicalize(std::env::temp_dir()).expect("a real temp dir");
+        let root = base.join(format!("triple-c-scrub-{}", uuid::Uuid::new_v4().simple()));
+        let root_str = root.to_str().expect("a UTF-8 temp path").to_string();
+        fs::create_dir_all(root.join("tmp/claude-scratch")).expect("mkdir");
+        fs::write(root.join("tmp/claude-scratch/blob"), vec![0u8; 64 * 1024]).unwrap();
+        // No tools planted anywhere: `PATH` names two directories that do not
+        // exist, which is what a base image the scrub cannot run in looks like.
+
+        let script = snapshot_scrub_script_under(&root_str);
+        let out = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .expect("run the generated script");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let debris_kept = root.join("tmp/claude-scratch/blob").exists();
+        fs::remove_dir_all(&root).ok();
+
+        assert!(debris_kept, "the scrub deleted with no tools to validate with");
+        assert_eq!(
+            parse_scrub_total(&stdout),
+            None,
+            "a scrub that could not run still printed a total: {}",
+            stdout
+        );
+        let reason = parse_scrub_unavailable(&stdout)
+            .unwrap_or_else(|| panic!("no unavailable marker in: {}", stdout));
+        assert!(reason.contains("stat"), "the reason does not name what is missing: {}", reason);
+        // And the outcome the caller derives from it is not a success.
+        assert_ne!(ScrubOutcome::Unavailable, ScrubOutcome::Reclaimed(0));
+        assert!(!ScrubOutcome::Unavailable.commit_log_suffix().contains("MB"));
+    }
+
+    /// The byte total counts what a partly failed `rm` actually removed.
+    ///
+    /// `rm --one-file-system` walking into a match with a mount planted below
+    /// it removes everything else and exits non-zero. The old
+    /// `rm … && acc=$((acc + sz))` dropped the whole subtree from the figure,
+    /// so the one case the `--one-file-system` probe exists for was also the
+    /// one that under-reported. A mount cannot be created by a test process, so
+    /// the partial failure is produced the only other way it happens: an `rm`
+    /// that removes part of its argument and returns non-zero.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_byte_total_counts_what_a_partly_failed_rm_removed() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let base = fs::canonicalize(std::env::temp_dir()).expect("a real temp dir");
+        let root = base.join(format!("triple-c-scrub-{}", uuid::Uuid::new_v4().simple()));
+        let root_str = root.to_str().expect("a UTF-8 temp path").to_string();
+        plant_scrub_tools(&root);
+        fs::create_dir_all(root.join("tmp/claude-partial")).expect("mkdir");
+        fs::write(root.join("tmp/claude-partial/gone"), vec![0u8; 64 * 1024]).unwrap();
+        fs::write(root.join("tmp/claude-partial/keep"), vec![0u8; 8 * 1024]).unwrap();
+
+        let real_rm = ["/usr/bin/rm", "/bin/rm"]
+            .iter()
+            .find(|c| std::path::Path::new(c).exists())
+            .expect("an rm on this host")
+            .to_string();
+        fs::remove_file(root.join("usr/bin/rm")).expect("drop the symlink to the real rm");
+        fs::write(
+            root.join("usr/bin/rm"),
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in claude-partial) {rm} -rf -- \
+                 ./claude-partial/gone; exit 1 ;; esac; done\nexec {rm} \"$@\"\n",
+                rm = real_rm
+            ),
+        )
+        .expect("plant a partly-failing rm");
+        fs::set_permissions(root.join("usr/bin/rm"), fs::Permissions::from_mode(0o755)).unwrap();
+
+        let script = snapshot_scrub_script_under(&root_str);
+        let out = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .expect("run the generated script");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let gone = !root.join("tmp/claude-partial/gone").exists();
+        let kept = root.join("tmp/claude-partial/keep").exists();
+        let total = parse_scrub_total(&stdout);
+        fs::remove_dir_all(&root).ok();
+
+        assert!(
+            gone && kept,
+            "the harness cannot tell the difference: the planted rm did not fail partly \
+             (gone={}, kept={})\nstdout: {}",
+            gone,
+            kept,
+            stdout
+        );
+        let total = total.expect("the marker line is missing");
+        assert!(
+            total >= 64 * 1024,
+            "a partly failed rm was counted as having reclaimed {} bytes",
+            total
+        );
+        // And what survived is not counted as reclaimed.
+        assert!(total < 72 * 1024, "the total {} counts bytes that are still there", total);
+    }
+
+    #[test]
+    fn the_scrub_total_is_read_back_from_the_marker_line() {
+        assert_eq!(
+            parse_scrub_total("some noise\n###TRIPLE-C-SCRUBBED 4812345\n"),
+            Some(4812345)
+        );
+        // Nothing reclaimed is a real answer and must not read as a failure.
+        assert_eq!(parse_scrub_total("###TRIPLE-C-SCRUBBED 0"), Some(0));
+        // No marker means the script never got to the end — a different thing
+        // from reclaiming nothing, and the caller logs it differently.
+        assert_eq!(parse_scrub_total("sh: du: not found"), None);
+        assert_eq!(parse_scrub_total(""), None);
+        // H3: and "could not run" is a third thing again, told apart by its
+        // own marker rather than by a total that looks healthy.
+        assert_eq!(
+            parse_scrub_total("###TRIPLE-C-SCRUB-UNAVAILABLE stat rm"),
+            None
+        );
+        let reason = parse_scrub_unavailable("noise\n###TRIPLE-C-SCRUB-UNAVAILABLE stat rm\n")
+            .expect("the unavailable marker");
+        assert!(reason.contains("stat, rm"), "{}", reason);
+        assert!(parse_scrub_unavailable("###TRIPLE-C-SCRUBBED 41").is_none());
+        assert!(parse_scrub_unavailable("").is_none());
+    }
+
+    #[test]
+    fn only_a_completed_scrub_reports_bytes() {
+        // M11: a stopped container is a skip, not a failure, and every outcome
+        // that is not a completed run has no figure to contribute at all —
+        // which is a stronger statement than the "contributes zero" this used
+        // to make, and the reason the zero stopped being printed.
+        assert_eq!(ScrubOutcome::NotRunning.commit_log_suffix(), "");
+        assert!(!ScrubOutcome::TimedOut.commit_log_suffix().contains("MB"));
+        assert!(!ScrubOutcome::Failed.commit_log_suffix().contains("MB"));
+        assert!(!ScrubOutcome::Unavailable.commit_log_suffix().contains("MB"));
+        assert!(ScrubOutcome::Reclaimed(4096)
+            .commit_log_suffix()
+            .contains("MB"));
+        assert_ne!(ScrubOutcome::NotRunning, ScrubOutcome::Failed);
+        assert_ne!(ScrubOutcome::Unavailable, ScrubOutcome::Reclaimed(0));
+    }
+
+    #[test]
+    fn a_skipped_scrub_reports_no_reclaim_figure() {
+        // Every migration logged "0.00 MB dropped by the pre-commit scrub":
+        // the migration path scrubs the container while it is still running and
+        // stops it before committing, so this second call has nothing to exec
+        // into. A zero there reads as a scrub that ran and found nothing.
+        assert_eq!(ScrubOutcome::NotRunning.commit_log_suffix(), "");
+        assert!(!ScrubOutcome::TimedOut.commit_log_suffix().contains("MB"));
+        assert!(!ScrubOutcome::Failed.commit_log_suffix().contains("MB"));
+        // A scrub that really ran still reports, zero included — but H3 is
+        // that "0.00 MB dropped" was also what a scrub that *could not run*
+        // printed, and the two must not render the same. A genuine zero says it
+        // ran; the broken one says it could not.
+        let ran = ScrubOutcome::Reclaimed(0).commit_log_suffix();
+        assert!(ran.contains("ran"), "{}", ran);
+        assert!(!ran.contains("MB"), "a zero that reads as a figure: {}", ran);
+        let broken = ScrubOutcome::Unavailable.commit_log_suffix();
+        assert!(broken.contains("could not run"), "{}", broken);
+        assert_ne!(ran, broken);
+        assert!(ScrubOutcome::Reclaimed(2 * 1_048_576)
+            .commit_log_suffix()
+            .contains("2.00 MB"));
+    }
+
+    #[test]
+    fn the_scrub_cannot_hold_a_snapshot_up_indefinitely() {
+        // M12: the scrub is a `du -sb` plus an `rm -rf` over a tree a running
+        // agent may still be writing to, on the critical path of every
+        // recreate with the UI on "Saving container state…" and no cancel.
+        assert!(SCRUB_TIMEOUT.as_secs() >= 30, "too tight to survive a slow but healthy scrub");
+        assert!(SCRUB_TIMEOUT.as_secs() <= 300, "long enough that a user would force-quit first");
+    }
+
+    #[test]
+    fn every_container_is_created_with_a_bounded_log() {
+        let cfg = capped_log_config();
+        assert_eq!(cfg.typ.as_deref(), Some("json-file"));
+        let config = cfg.config.expect("a json-file driver with no config is unbounded");
+        assert_eq!(config.get("max-size").map(String::as_str), Some("10m"));
+        assert_eq!(config.get("max-file").map(String::as_str), Some("3"));
+    }
+
+    // ── Claude Code settings.json (Part B) ───────────────────────────────────
+
+    fn settings_json(s: Option<&ClaudeCodeSettings>, sandbox: bool) -> serde_json::Value {
+        serde_json::from_str(&build_claude_code_settings_json(s, sandbox))
+            .expect("the payload must be valid JSON — the entrypoint pipes it into jq")
+    }
+
+    /// The five keys that used to be emitted only when non-default, plus the
+    /// sandbox block that already knew better.
+    const MANAGED_SETTINGS_KEYS: &[&str] = &[
+        "tui",
+        "effortLevel",
+        "autoScrollEnabled",
+        "showThinkingSummaries",
+        "viewMode",
+        "awaySummaryEnabled",
+        "sandbox",
+    ];
+
+    #[test]
+    fn a_project_can_turn_a_globally_enabled_setting_back_off() {
+        // The whole reason the booleans are `Option<bool>`. Under the old
+        // `if p.x { true } else { g.x }` merge there was no project value that
+        // could produce `false` here.
+        let global = ClaudeCodeSettings {
+            focus_mode: Some(true),
+            env_scrub: Some(true),
+            prompt_caching_1h: Some(true),
+            ..Default::default()
+        };
+        let project = ClaudeCodeSettings {
+            focus_mode: Some(false),
+            ..Default::default()
+        };
+
+        let merged = merge_claude_code_settings(Some(&global), Some(&project)).unwrap();
+
+        assert_eq!(merged.focus_mode, Some(false), "project off must win");
+        // Untouched project fields still inherit.
+        assert_eq!(merged.env_scrub, Some(true));
+        assert_eq!(merged.prompt_caching_1h, Some(true));
+
+        // And it has to survive into what the container actually receives.
+        let payload = build_claude_code_settings_json(Some(&merged), false);
+        let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert!(
+            v.get("viewMode").is_some_and(|m| m.is_null()),
+            "viewMode should be cleared, got {:?}",
+            v.get("viewMode")
+        );
+    }
+
+    #[test]
+    fn inherit_and_deliberate_off_fingerprint_differently() {
+        // If these collided, switching a project from "inherit" to an explicit
+        // "off" would not recreate the container and the change would silently
+        // not apply.
+        let inherit = ClaudeCodeSettings { focus_mode: None, ..Default::default() };
+        let off = ClaudeCodeSettings { focus_mode: Some(false), ..Default::default() };
+        assert_ne!(
+            compute_claude_code_settings_fingerprint(Some(&inherit), false),
+            compute_claude_code_settings_fingerprint(Some(&off), false),
+        );
+    }
+
+    #[test]
+    fn split_payload_never_emits_a_null_to_an_older_entrypoint() {
+        // An existing project recreates from its own snapshot, which carries
+        // whatever entrypoint it was built with. An older one merges with a
+        // plain `.[0] * .[1]`, so a null reaching it would be written into the
+        // user's settings.json verbatim instead of clearing the key.
+        let payload = build_claude_code_settings_json(None, false);
+        assert!(
+            payload.contains("null"),
+            "precondition: the unsplit payload uses null to mean delete"
+        );
+
+        let (set, clear) = split_claude_code_settings_payload(&payload);
+
+        let set_val: serde_json::Value = serde_json::from_str(&set).unwrap();
+        for (k, v) in set_val.as_object().unwrap() {
+            assert!(!v.is_null(), "key {} reached the merge half as a null", k);
+        }
+
+        let clear_val: serde_json::Value = serde_json::from_str(&clear).unwrap();
+        let cleared: Vec<&str> = clear_val
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        // The four whose neutral state is genuinely "unset".
+        for k in ["tui", "effortLevel", "viewMode", "awaySummaryEnabled"] {
+            assert!(cleared.contains(&k), "{} should be cleared, not pinned", k);
+        }
+    }
+
+    #[test]
+    fn split_payload_keeps_every_key_exactly_once() {
+        // Nothing may be dropped or duplicated between the two halves, or a
+        // managed key would silently stop being asserted.
+        let settings = ClaudeCodeSettings {
+            tui_mode: Some("fullscreen".to_string()),
+            focus_mode: Some(true),
+            ..Default::default()
+        };
+        let payload = build_claude_code_settings_json(Some(&settings), true);
+        let original: serde_json::Value = serde_json::from_str(&payload).unwrap();
+
+        let (set, clear) = split_claude_code_settings_payload(&payload);
+        let set_val: serde_json::Value = serde_json::from_str(&set).unwrap();
+        let clear_val: serde_json::Value = serde_json::from_str(&clear).unwrap();
+
+        let mut seen: Vec<String> = set_val
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .chain(
+                clear_val
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_str().unwrap().to_string()),
+            )
+            .collect();
+        seen.sort();
+        let mut expected: Vec<String> = original.as_object().unwrap().keys().cloned().collect();
+        expected.sort();
+        assert_eq!(seen, expected);
+    }
+
+    #[test]
+    fn turning_a_setting_off_clears_it_rather_than_omitting_it() {
+        // This is the whole bug. `~/.claude/settings.json` lives on a persisted
+        // volume and the entrypoint merges into it, so a key that is merely
+        // *absent* when the setting is off leaves the previous on-value in
+        // place — the setting could never be turned back off short of a
+        // destructive Reset.
+        let on = ClaudeCodeSettings {
+            tui_mode: Some("fullscreen".to_string()),
+            effort: Some("xhigh".to_string()),
+            auto_scroll_disabled: Some(true),
+            focus_mode: Some(true),
+            show_thinking_summaries: Some(true),
+            session_recap_disabled: Some(true),
+            ..Default::default()
+        };
+        let hot = settings_json(Some(&on), true);
+        assert_eq!(hot["tui"], serde_json::json!("fullscreen"));
+        assert_eq!(hot["effortLevel"], serde_json::json!("xhigh"));
+        assert_eq!(hot["autoScrollEnabled"], serde_json::json!(false));
+        assert_eq!(hot["showThinkingSummaries"], serde_json::json!(true));
+        assert_eq!(hot["viewMode"], serde_json::json!("focus"));
+        assert_eq!(hot["awaySummaryEnabled"], serde_json::json!(false));
+        assert_eq!(hot["sandbox"]["enabled"], serde_json::json!(true));
+
+        // Now everything back to default. Every key must still be *present*,
+        // carrying either its neutral value or a null the entrypoint deletes.
+        let cold = settings_json(Some(&ClaudeCodeSettings::default()), false);
+        for key in MANAGED_SETTINGS_KEYS {
+            assert!(
+                cold.get(*key).is_some(),
+                "{} is missing when the setting is off, so a stale on-value survives the merge",
+                key
+            );
+        }
+        assert_eq!(cold["tui"], serde_json::Value::Null);
+        assert_eq!(cold["effortLevel"], serde_json::Value::Null);
+        assert_eq!(cold["autoScrollEnabled"], serde_json::json!(true));
+        assert_eq!(cold["showThinkingSummaries"], serde_json::json!(false));
+        assert_eq!(cold["viewMode"], serde_json::Value::Null);
+        assert_eq!(cold["awaySummaryEnabled"], serde_json::Value::Null);
+        assert_eq!(cold["sandbox"]["enabled"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn no_settings_struct_at_all_still_asserts_every_key() {
+        // "This project has no Claude Code settings" is not "say nothing" —
+        // the file on the config volume may still hold a previous project
+        // configuration's values.
+        let cold = settings_json(None, false);
+        for key in MANAGED_SETTINGS_KEYS {
+            assert!(cold.get(*key).is_some(), "{} is missing with no settings struct", key);
+        }
+    }
+
+    #[test]
+    fn the_settings_payload_uses_the_key_names_claude_code_actually_reads() {
+        let s = ClaudeCodeSettings {
+            effort: Some("high".to_string()),
+            focus_mode: Some(true),
+            ..Default::default()
+        };
+        let json = settings_json(Some(&s), false);
+        // `effort` and `focusMode` were both invented; Claude Code reads
+        // `effortLevel` and `viewMode`.
+        assert!(json.get("effort").is_none(), "`effort` is not a Claude Code setting");
+        assert!(json.get("focusMode").is_none(), "`focusMode` is not a Claude Code setting");
+        assert_eq!(json["effortLevel"], serde_json::json!("high"));
+        assert_eq!(json["viewMode"], serde_json::json!("focus"));
+    }
+
+    #[test]
+    fn tui_can_be_pinned_to_the_classic_renderer_as_well_as_left_automatic() {
+        // Three distinct states; "automatic" is not "classic".
+        let auto = settings_json(Some(&ClaudeCodeSettings::default()), false);
+        assert_eq!(auto["tui"], serde_json::Value::Null);
+
+        let classic = settings_json(
+            Some(&ClaudeCodeSettings {
+                tui_mode: Some("default".to_string()),
+                ..Default::default()
+            }),
+            false,
+        );
+        assert_eq!(classic["tui"], serde_json::json!("default"));
+    }
+
+    #[test]
+    fn a_project_that_never_touched_session_recap_leaves_it_alone() {
+        // Claude Code's recap is on by default, so the zero value of the field
+        // has to be "don't interfere". Getting this backwards would have
+        // silently disabled recaps for every existing project.
+        let untouched = ClaudeCodeSettings::default();
+        assert_eq!(untouched.session_recap_disabled, None);
+        assert_eq!(
+            settings_json(Some(&untouched), false)["awaySummaryEnabled"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn a_disabled_setting_changes_the_recreation_fingerprint() {
+        // `container_needs_recreation` is label-based and never diffs env, so
+        // the settings only reach a container if the fingerprint moves.
+        let on = ClaudeCodeSettings {
+            focus_mode: Some(true),
+            ..Default::default()
+        };
+        let off = ClaudeCodeSettings::default();
+        assert_ne!(
+            compute_claude_code_settings_fingerprint(Some(&on), false),
+            compute_claude_code_settings_fingerprint(Some(&off), false),
+        );
+        let recap_off = ClaudeCodeSettings {
+            session_recap_disabled: Some(true),
+            ..Default::default()
+        };
+        assert_ne!(
+            compute_claude_code_settings_fingerprint(Some(&recap_off), false),
+            compute_claude_code_settings_fingerprint(Some(&off), false),
+        );
+    }
+
+    #[test]
+    fn the_claude_code_env_vars_are_reserved_from_custom_env() {
+        for key in [
+            "CLAUDE_CODE_NO_FLICKER",
+            "CLAUDE_CODE_ENABLE_AWAY_SUMMARY",
+            "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB",
+            "ENABLE_PROMPT_CACHING_1H",
+        ] {
+            assert!(is_reserved_env_key(key), "{} must not be hand-settable", key);
+            assert!(is_reserved_env_key(&key.to_lowercase()));
+        }
+    }
+
+    #[test]
+    fn every_claude_code_env_var_is_emitted_on_every_create() {
+        // `docker commit` bakes env into the snapshot image, so a name that
+        // goes missing when its setting is off keeps whatever the image
+        // carries. All four must appear whatever the settings say.
+        for settings in [None, Some(&ClaudeCodeSettings::default())] {
+            let emitted = claude_code_env_vars(settings);
+            let names: Vec<&str> = emitted
+                .iter()
+                .map(|entry| entry.split_once('=').expect("every entry is KEY=VALUE").0)
+                .collect();
+            for expected in [
+                "CLAUDE_CODE_NO_FLICKER",
+                "CLAUDE_CODE_ENABLE_AWAY_SUMMARY",
+                "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB",
+                "ENABLE_PROMPT_CACHING_1H",
+            ] {
+                assert!(names.contains(&expected), "{} was not emitted", expected);
+            }
+        }
+    }
+
+    #[test]
+    fn the_neutral_state_of_the_overriding_env_vars_is_empty_not_zero() {
+        // Both of these outrank a setting the user can change from inside the
+        // container, so their "off" has to be silence, not an instruction.
+        let vars = claude_code_env_vars(Some(&ClaudeCodeSettings::default()));
+        assert!(vars.contains(&"CLAUDE_CODE_NO_FLICKER=".to_string()));
+        assert!(vars.contains(&"CLAUDE_CODE_ENABLE_AWAY_SUMMARY=".to_string()));
+        // These two have no documented meaning for `0`, so it is safe to say.
+        assert!(vars.contains(&"CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=0".to_string()));
+        assert!(vars.contains(&"ENABLE_PROMPT_CACHING_1H=0".to_string()));
+    }
+
+    #[test]
+    fn turning_the_session_recap_off_actually_forces_it_off() {
+        // The whole point of B3: `=1` when enabled was a no-op against a
+        // feature that was already on, and there was no off path at all.
+        let off = ClaudeCodeSettings {
+            session_recap_disabled: Some(true),
+            ..Default::default()
+        };
+        assert!(claude_code_env_vars(Some(&off))
+            .contains(&"CLAUDE_CODE_ENABLE_AWAY_SUMMARY=0".to_string()));
+    }
+
+    #[test]
+    fn the_tui_choice_reaches_the_env_var_that_outranks_the_setting() {
+        let fullscreen = ClaudeCodeSettings {
+            tui_mode: Some("fullscreen".to_string()),
+            ..Default::default()
+        };
+        assert!(claude_code_env_vars(Some(&fullscreen))
+            .contains(&"CLAUDE_CODE_NO_FLICKER=1".to_string()));
+
+        let classic = ClaudeCodeSettings {
+            tui_mode: Some("default".to_string()),
+            ..Default::default()
+        };
+        assert!(claude_code_env_vars(Some(&classic))
+            .contains(&"CLAUDE_CODE_NO_FLICKER=0".to_string()));
     }
 }

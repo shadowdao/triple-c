@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import * as commands from "../lib/tauri-commands";
-import { ANTHROPIC_SIGN_IN_HOSTS, sanitizeRelayUrl } from "../lib/urlRelay";
+import { ANTHROPIC_SIGN_IN_HOSTS, extendsUrl, sanitizeRelayUrl } from "../lib/urlRelay";
 import type {
   ClaudeTokenCodeRejectedEvent,
   ClaudeTokenLinkEvent,
@@ -67,7 +67,8 @@ export function authErrorMessage(e: unknown, fallback: string): string {
  *    starts with it. That is the case longest-wins existed for — a repainting
  *    TUI can land a truncated copy of the same link in the transcript before
  *    the complete one — and it cannot swap the origin, because a longer string
- *    with the same prefix has the same host.
+ *    with the same prefix has the same host. {@link extendsUrl} is that rule;
+ *    the terminal's URL prompt slot shares it.
  */
 export function pickSignInUrl(candidates: readonly string[]): string | null {
   const cleaned = candidates
@@ -79,7 +80,7 @@ export function pickSignInUrl(candidates: readonly string[]): string | null {
 
   let best: string | null = null;
   for (const url of pool) {
-    if (best === null || url.startsWith(best)) best = url;
+    if (best === null || extendsUrl(url, best)) best = url;
   }
   return best;
 }

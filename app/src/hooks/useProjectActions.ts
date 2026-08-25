@@ -2,6 +2,7 @@ import { useCallback, useState } from "react";
 import { save } from "@tauri-apps/plugin-dialog";
 import type { Project } from "../lib/types";
 import * as commands from "../lib/tauri-commands";
+import { formatBytes } from "../lib/formatBytes";
 import { useAppState } from "../store/appState";
 import { useProjects } from "./useProjects";
 import { useTerminal } from "./useTerminal";
@@ -122,10 +123,15 @@ export function useProjectActions(project: Project) {
       if (!hostPath) return;
       setBackingUp(true);
       const bytes = await commands.downloadContainerBackup(project.id, hostPath);
-      const mb = (bytes / (1024 * 1024)).toFixed(1);
+      // `binary` matches what the host's file browser will say about the
+      // tarball this just wrote. The unit is part of the formatted string, so
+      // there is no separate " MB" to append — and unlike the inline
+      // `toFixed(1)` this replaced, a multi-gigabyte backup no longer reports
+      // itself as a five-digit number of megabytes.
+      const size = formatBytes(bytes, { binary: true });
       pushToast({
         kind: "success",
-        message: `Backup saved (${mb} MB).`,
+        message: `Backup saved (${size}).`,
         detail:
           "Includes Claude config — may contain API keys. Keep the archive private.",
       });

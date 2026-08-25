@@ -3,11 +3,78 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<!--
+  This page is served by an axum server bound 0.0.0.0 (remote access is the
+  feature) behind a permissive CORS layer, and it fronts a shell in a container.
+  It gets a CSP of its own because nothing else gives it one: the app's
+  `tauri.conf.json` CSP covers the desktop webview, never this document.
+
+  `default-src 'none'` is the base, so anything not named below is refused
+  outright. What is named:
+    script-src  jsdelivr for the three xterm bundles, plus 'unsafe-inline' for
+                this page's own inline <script>. Nonces/hashes were considered
+                and rejected: the file is a static `include_str!()` asset, so a
+                hash would have to be recomputed by hand on every edit to the
+                script, and the failure mode of getting that wrong is a terminal
+                that silently will not start.
+    style-src   the xterm stylesheet, this page's <style>, and the one inline
+                `style=` attribute below (style attributes need 'unsafe-inline').
+    connect-src the WebSocket back to this same server. `ws:`/`wss:` as schemes
+                rather than an origin, because the host and port are whatever
+                the user reached this page on and are not knowable at build time.
+    form-action / base-uri / object-src / frame-ancestors — all 'none'. Note
+                `frame-ancestors` is ignored in a <meta> CSP; it is here as a
+                statement of intent, and the real protection would be a response
+                header from `server.rs`.
+  Deliberately absent: 'unsafe-eval', and any origin other than jsdelivr.
+-->
+<meta http-equiv="Content-Security-Policy" content="
+  default-src 'none';
+  script-src 'unsafe-inline' https://cdn.jsdelivr.net;
+  style-src 'unsafe-inline' https://cdn.jsdelivr.net;
+  img-src 'self' data:;
+  font-src 'self' data:;
+  connect-src 'self' ws: wss:;
+  form-action 'none';
+  base-uri 'none';
+  object-src 'none';
+  frame-ancestors 'none';
+">
 <title>Triple-C Web Terminal</title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
-<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0.11.0/lib/addon-web-links.min.js"></script>
+<!--
+  Subresource Integrity on every CDN asset.
+
+  Without it this page executes whatever jsdelivr returns, inside a document
+  that holds the web terminal's access token and drives a shell in a container —
+  an upstream compromise, a hijacked package version or a MITM on a phone's
+  network is arbitrary code with that reach. The hashes below were computed
+  from the exact bytes at these pinned versions. `crossorigin="anonymous"` is
+  required for SRI to be checked on a cross-origin fetch.
+
+  Bumping a version means recomputing its hash:
+      curl -sS <url> | openssl dgst -sha384 -binary | openssl base64 -A
+  A mismatched hash blocks the asset, so a stale hash shows up immediately as a
+  terminal that does not render — never as an unverified load.
+
+  These are still remote loads: the remote terminal does not work with no
+  internet on the client side, and vendoring the ~300 KB of minified xterm into
+  this file would fix that. It was not done here — SRI already closes the
+  integrity half, which is the security half, and the availability half is a
+  separate call about binary size and diff readability.
+-->
+<link rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css"
+      integrity="sha384-tStR1zLfWgsiXCF3IgfB3lBa8KmBe/lG287CL9WCeKgQYcp1bjb4/+mwN6oti4Co"
+      crossorigin="anonymous">
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"
+        integrity="sha384-J4qzUjBl1FxyLsl/kQPQIOeINsmp17OHYXDOMpMxlKX53ZfYsL+aWHpgArvOuof9"
+        crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"
+        integrity="sha384-XGqKrV8Jrukp1NITJbOEHwg01tNkuXr6uB6YEj69ebpYU3v7FvoGgEg23C1Gcehk"
+        crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0.11.0/lib/addon-web-links.min.js"
+        integrity="sha384-S1biLeI8L/bFduIVvCxbn/l4EtaG4nTqQjGF7qCYTbsGXGFe8KgIKXtw4+UWxprv"
+        crossorigin="anonymous"></script>
 <style>
   :root {
     --bg-primary: #1a1b26;
@@ -334,6 +401,9 @@
     autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
     enterkeyhint="send" inputmode="text">
   <button class="key-btn" id="btnEnter">Enter</button>
+  <!-- A newline *without* submitting. There is no Shift on a phone keyboard,
+       so the chord the desktop app binds needs a key of its own here. -->
+  <button class="key-btn" id="btnNewline" title="Insert a newline without submitting (Shift+Enter)">&#8629;+</button>
   <button class="key-btn" id="btnTab">Tab</button>
   <button class="key-btn" id="btnCtrlC">^C</button>
 </div>
@@ -360,6 +430,19 @@
   const emptyState = document.getElementById('emptyState');
   const mobileInput = document.getElementById('mobileInput');
   const btnEnter = document.getElementById('btnEnter');
+  const btnNewline = document.getElementById('btnNewline');
+
+  // Whether the *active* session understands ESC+CR as "insert a newline".
+  //
+  // Only Claude Code does. `bash -l` has no readline binding for `\e\r`, so
+  // sending it there is a silent no-op — which is worse from the mobile bar
+  // than from a hardware key, because the bar puts a dedicated button on
+  // screen that appears to do nothing. The xterm key handler is already scoped
+  // this way; these two paths were not.
+  function activeSessionTakesEscCr() {
+    const s = activeSessionId && sessions[activeSessionId];
+    return !!s && s.type === 'claude';
+  }
   const btnTab = document.getElementById('btnTab');
   const btnCtrlC = document.getElementById('btnCtrlC');
   const scrollBottomBtn = document.getElementById('scrollBottomBtn');
@@ -519,7 +602,7 @@
         updateProjectList(msg.projects);
         break;
       case 'opened':
-        onSessionOpened(msg.session_id, msg.project_name);
+        onSessionOpened(msg.session_id, msg.project_name, msg.session_type);
         break;
       case 'output':
         onSessionOutput(msg.session_id, msg.data);
@@ -570,8 +653,18 @@
     });
   }
 
-  function onSessionOpened(sessionId, projectName) {
-    const sessionType = pendingSessionType || 'claude';
+  function onSessionOpened(sessionId, projectName, serverSessionType) {
+    // Prefer the type the *server* reports for this session. The old path read
+    // a single `pendingSessionType` global set at request time, so opening two
+    // sessions before the first reply landed swapped their labels — routine on
+    // mobile, where nothing disables the buttons. That was cosmetic until
+    // Shift+Enter became type-dependent: a Claude session labelled `shell`
+    // sends a bare CR and submits a half-written prompt.
+    //
+    // The fallback keeps an older server working, and defaults to `claude`,
+    // which is the safe direction — ESC+CR is an unbound no-op in bash, while
+    // a bare CR in Claude Code loses the prompt.
+    const sessionType = serverSessionType || pendingSessionType || 'claude';
     pendingSessionType = null;
 
     // Create terminal
@@ -647,6 +740,34 @@
       });
     });
 
+    // Shift+Enter inserts a newline in Claude Code's prompt instead of
+    // submitting it. xterm.js does not consult `shiftKey` for Enter, so
+    // without this Shift+Enter is byte-identical to Enter.
+    //
+    // `\x1b\r` — ESC then CR — is what Claude Code parses as `return` with
+    // meta, and it is the same sequence its own `/terminal-setup` installs for
+    // VS Code, Cursor, Alacritty and Zed. Do not "simplify" it to `\n`: that
+    // also works in Claude Code, but a shell would *run* the line, so the two
+    // session types would diverge. Claude sessions only, for that reason —
+    // `bash -l` has no readline binding for `\e\r`.
+    term.attachCustomKeyEventHandler(e => {
+      if (
+        e.type === 'keydown' && e.key === 'Enter' && e.shiftKey &&
+        !e.ctrlKey && !e.altKey && !e.metaKey && !e.isComposing &&
+        sessionType === 'claude'
+      ) {
+        sendTerminalInput('\x1b\r');
+        // `preventDefault()` is what stops the submit, not the `return false`.
+        // xterm's `_keyDown` returns before setting `_keyDownHandled`, so
+        // `_keyPress` still fires and emits a bare CR for Enter — inserting the
+        // newline and then submitting the prompt anyway. See the same comment
+        // in TerminalView.tsx.
+        e.preventDefault();
+        return false;
+      }
+      return true;
+    });
+
     // Track scroll position for scroll-to-bottom button
     term.onScroll(() => updateScrollButton());
 
@@ -698,6 +819,7 @@
       switchToSession(remaining[remaining.length - 1]);
     } else {
       activeSessionId = null;
+      syncNewlineButton();
       emptyState.style.display = '';
     }
   }
@@ -724,6 +846,7 @@
 
   function switchToSession(sessionId) {
     activeSessionId = sessionId;
+    syncNewlineButton();
 
     // Update tab styles
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
@@ -799,7 +922,11 @@
         sendTerminalInput(val);
         mobileInput.value = '';
       }
-      sendTerminalInput('\r');
+      // Shift+Enter is a newline, not a submit — same bytes, and the same
+      // reasoning, as the terminal's own key handler above. A hardware
+      // keyboard on a tablet is the only way to reach this; the phone case is
+      // the dedicated newline button beside Enter.
+      sendTerminalInput(e.shiftKey && activeSessionTakesEscCr() ? '\x1b\r' : '\r');
     } else if (e.key === 'Tab') {
       e.preventDefault();
       sendTerminalInput('\t');
@@ -807,6 +934,27 @@
   });
 
   btnEnter.onclick = () => { sendTerminalInput('\r'); mobileInput.focus(); };
+  btnNewline.onclick = () => {
+    if (!activeSessionTakesEscCr()) { mobileInput.focus(); return; }
+    sendTerminalInput('\x1b\r');
+    mobileInput.focus();
+  };
+
+  // Keep the button's affordance honest: on a shell tab there is no byte that
+  // means "newline without running the line", so the control is disabled
+  // rather than left looking live.
+  function syncNewlineButton() {
+    const usable = activeSessionTakesEscCr();
+    btnNewline.disabled = !usable;
+    btnNewline.title = usable
+      ? 'Insert a newline without submitting (Shift+Enter)'
+      : 'Only Claude sessions support this — a shell runs the line instead';
+  }
+
+  // With no session open yet, `activeSessionTakesEscCr()` is already false —
+  // but nothing had called this, so the button rendered live before the first
+  // tab existed.
+  syncNewlineButton();
   btnTab.onclick = () => { sendTerminalInput('\t'); mobileInput.focus(); };
   btnCtrlC.onclick = () => { sendTerminalInput('\x03'); mobileInput.focus(); };
 

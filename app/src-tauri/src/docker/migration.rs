@@ -369,6 +369,15 @@ pub fn set_delta(from: &BTreeSet<String>, base: &BTreeSet<String>) -> Vec<String
 pub fn bind_mount_exclusions(paths: &[ProjectPath]) -> Vec<String> {
     let mut out: Vec<String> = paths
         .iter()
+        // **The same filter `project_path_mounts` applies, and it has to be.**
+        // That function skips a row with an empty `host_path` or `mount_name`
+        // so a legacy row cannot brick the create. The consequence is that
+        // `/workspace/<name>` for such a row is *not* a bind mount — it is
+        // ordinary writable-layer content. Excluding it here would tell
+        // `compute_verbatim_paths` to skip staging it, and the container swap
+        // would then destroy whatever the user has put there. The two
+        // predicates must agree or a migration silently eats a directory.
+        .filter(|p| !p.mount_name.trim().is_empty() && !p.host_path.trim().is_empty())
         .map(|p| format!("/workspace/{}", p.mount_name))
         .collect();
     out.sort();
@@ -712,13 +721,83 @@ pub async fn run_throwaway(image: &str, script: &str) -> Result<ThrowawayResult,
         )
         .await
         .map_err(|e| format!("Failed to create probe container for {}: {}", image, e))?;
-    let id = created.id;
 
-    let result = run_throwaway_inner(&id).await;
+    // From here on the container's removal is owned by a guard rather than by
+    // the statement that used to sit after the await below. A plain statement
+    // only runs if this future is *polled to completion*: an `Err(...)?` was
+    // already handled, but a **dropped** future — the app quitting mid-flight,
+    // a timeout, any `select!` that loses — skipped it silently and left a
+    // container behind holding a multi-gigabyte base image open. That image is
+    // then unsweepable (removal is deliberately unforced) and there is nothing
+    // in the UI that would ever mention it.
+    let guard = ProbeContainerGuard::new(created.id);
 
-    if let Err(e) = docker
+    let result = run_throwaway_inner(guard.id()).await;
+
+    // The happy path still removes it *synchronously*, so a caller that goes on
+    // to `docker rmi` the image it probed does not race the removal.
+    guard.remove_now().await;
+
+    result
+}
+
+/// Owns the lifetime of a probe container.
+///
+/// [`Self::remove_now`] is the normal path and awaits the removal. `Drop` is the
+/// safety net for the abnormal one: it cannot await, so it hands the removal to
+/// a detached task. That covers a dropped future while the process lives; it
+/// cannot cover the process dying, which is what
+/// [`reap_probe_containers`] is for.
+struct ProbeContainerGuard {
+    id: String,
+    /// Cleared by `remove_now` so `Drop` does not queue a second removal.
+    armed: bool,
+}
+
+impl ProbeContainerGuard {
+    fn new(id: String) -> Self {
+        Self { id, armed: true }
+    }
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// **Disarm after the await, never before it.** Clearing `armed` first
+    /// looked equivalent and was the exact inverse of this guard's purpose: on
+    /// the one path it exists for — this future being dropped part-way through
+    /// the removal — `Drop` then saw a disarmed guard and did nothing, so the
+    /// container survived with no background removal queued behind it. Setting
+    /// it afterwards means a cancelled `remove_now` falls back to `Drop`'s
+    /// detached removal, and only a removal that actually completed disarms.
+    async fn remove_now(mut self) {
+        remove_probe_container(&self.id).await;
+        self.armed = false;
+    }
+}
+
+impl Drop for ProbeContainerGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let id = std::mem::take(&mut self.id);
+        log::warn!("Probe container {} was abandoned; removing it in the background", id);
+        tauri::async_runtime::spawn(async move {
+            remove_probe_container(&id).await;
+        });
+    }
+}
+
+/// Force-remove one probe container. Missing is success — the point is that the
+/// container is gone.
+async fn remove_probe_container(id: &str) {
+    let Ok(docker) = get_docker() else {
+        return;
+    };
+    match docker
         .remove_container(
-            &id,
+            id,
             Some(RemoveContainerOptions {
                 force: true,
                 v: true,
@@ -727,11 +806,95 @@ pub async fn run_throwaway(image: &str, script: &str) -> Result<ThrowawayResult,
         )
         .await
     {
-        log::warn!("Failed to remove probe container {}: {}", id, e);
+        Ok(())
+        | Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => {}
+        Err(e) => log::warn!("Failed to remove probe container {}: {}", id, e),
     }
-
-    result
 }
+
+/// Remove probe containers left behind by a previous run of the app.
+///
+/// A probe is labelled [`LABEL_PROBE`] precisely so it stays findable after a
+/// crash, but until now nothing ever went looking. One leftover probe pins the
+/// base image it was created from — several gigabytes that
+/// `sweep_orphaned_snapshots` then reports as "in use" and correctly refuses to
+/// touch, with no way for the user to find out why.
+///
+/// Safe to run at startup: a probe is a short-lived `/bin/sh` with no mounts
+/// and no volumes, owned entirely by a `run_throwaway` call. If one is running
+/// right now it belongs to this process — and this runs before any migration
+/// can be started, so there is none to interrupt.
+///
+/// **Except that "belongs to this process" is not something this can know.**
+/// The filter is a label, and labels are daemon-wide: a second copy of the app
+/// migrating a project on the same daemon has probe containers carrying exactly
+/// this label, and force-removing one mid-manifest-capture fails that
+/// migration. In-process state cannot see the other instance, so the only
+/// available brake is age — [`PROBE_REAP_MIN_AGE_SECS`]. A probe runs a `df`, an
+/// `apt-get update` or a `find` over a root filesystem; none of those is a
+/// multi-minute job, so anything younger than the gate is far more likely to be
+/// someone's live probe than a leftover, and a leftover simply waits for the
+/// next start.
+pub async fn reap_probe_containers() {
+    let Ok(docker) = get_docker() else {
+        return;
+    };
+
+    let filters: HashMap<String, Vec<String>> = HashMap::from([(
+        "label".to_string(),
+        vec![format!("{}={}", LABEL_PROBE, PROBE_LABEL_MIGRATION)],
+    )]);
+
+    let containers = match docker
+        .list_containers(Some(bollard::container::ListContainersOptions {
+            all: true,
+            filters,
+            ..Default::default()
+        }))
+        .await
+    {
+        Ok(list) => list,
+        Err(e) => {
+            log::warn!("Could not list leftover probe containers: {}", e);
+            return;
+        }
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    for c in containers {
+        // `created` is a unix timestamp; a summary without one is treated as
+        // too young to touch, because unknown is never permission.
+        let age = c.created.map(|created| now - created);
+        match age {
+            Some(age) if age >= PROBE_REAP_MIN_AGE_SECS => {}
+            _ => {
+                log::info!(
+                    "Leaving migration probe container {} alone — it is younger than {} minutes, \
+                     so it may belong to another Triple-C instance's live migration",
+                    c.id.as_deref().unwrap_or("<unknown>"),
+                    PROBE_REAP_MIN_AGE_SECS / 60
+                );
+                continue;
+            }
+        }
+        if let Some(id) = c.id {
+            log::info!("Removing leftover migration probe container {}", id);
+            remove_probe_container(&id).await;
+        }
+    }
+}
+
+/// How old a `triple-c.probe=migration` container must be before
+/// [`reap_probe_containers`] will force-remove it, in seconds.
+///
+/// The label is daemon-wide and this process cannot tell its own leftovers from
+/// another instance's live probe, so this is the whole guard. Generous against
+/// the longest probe there is (an `apt-get update` inside a throwaway container
+/// on a slow link) and still short enough that a crashed run's probe stops
+/// pinning a multi-gigabyte base image within the hour.
+pub const PROBE_REAP_MIN_AGE_SECS: i64 = 30 * 60;
 
 async fn run_throwaway_inner(id: &str) -> Result<ThrowawayResult, String> {
     let docker = get_docker()?;
@@ -910,6 +1073,210 @@ pub fn rollback_tag(now: &chrono::DateTime<chrono::Utc>) -> String {
     format!("pre-migration-{}", now.format("%Y%m%d-%H%M%S"))
 }
 
+/// How long a rollback pin may sit with no migration record behind it before
+/// [`reap_stale_migration_pins`] drops the tag.
+///
+/// Two weeks, chosen to be far longer than anyone deliberates over a base
+/// update and far shorter than "forever", which is what it was.
+///
+/// **Measured from when the record went missing, not from the tag.** See
+/// [`pin_is_reapable`] and
+/// [`crate::storage::migration_store::note_ownerless_since`].
+pub const STALE_PIN_MAX_AGE_DAYS: i64 = 14;
+
+/// Recover the timestamp encoded in a tag produced by [`rollback_tag`].
+///
+/// `None` for anything that is not one of ours — a tag that merely *starts*
+/// with `pre-migration-` but does not carry a parseable timestamp is left alone
+/// rather than guessed at, because the consequence of guessing wrong is
+/// deleting the only copy of somebody's system layer.
+pub fn parse_rollback_tag(tag: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let stamp = tag.strip_prefix("pre-migration-")?;
+    let naive = chrono::NaiveDateTime::parse_from_str(stamp, "%Y%m%d-%H%M%S").ok()?;
+    Some(naive.and_utc())
+}
+
+/// Split `triple-c-snapshot-<projectId>:<tag>` into the project id and the tag.
+///
+/// `None` when the reference is not a snapshot repo at all.
+pub fn parse_snapshot_reference(reference: &str) -> Option<(String, String)> {
+    let (repo, tag) = split_image_ref(reference);
+    let project_id = repo.strip_prefix("triple-c-snapshot-")?.to_string();
+    if project_id.is_empty() {
+        return None;
+    }
+    Some((project_id, tag))
+}
+
+/// Whether a rollback pin is safe to drop, given whether the project it belongs
+/// to still has a migration record and how long it has been without one.
+///
+/// Pure so the decision can be tested without a daemon. The order of the
+/// conditions is the point: **a pin whose migration is still awaiting
+/// confirmation is never reaped at any age**, because it is the only copy of
+/// the rollback target and the user has not yet said they are happy with the
+/// new base.
+///
+/// ## `ownerless_since`, and why it is not the tag's timestamp
+///
+/// This used to compute the age from `parse_rollback_tag(tag)` — the instant
+/// the migration *started*. A migration is allowed to sit at
+/// `awaiting-confirmation` for as long as the user likes; that is what
+/// `keep_rollback` is for. A project parked there for a month whose record is
+/// then lost had a tag a month old, so the pin was reapable on the very next
+/// check and the startup sweep deleted the image immediately after. The
+/// fourteen days were nominal: the real grace period for the case the constant
+/// was written for was zero.
+///
+/// So the clock starts when the claim was lost, which is recorded by
+/// [`crate::storage::migration_store::note_ownerless_since`] the first time a
+/// reaper notices. `None` means no reaper has recorded a sighting yet, and that
+/// is **not** "sighted now": returning false there is what gives a pin its
+/// first full fourteen days instead of none.
+///
+/// ## Clock skew
+///
+/// A `now` earlier than `ownerless_since` — a host clock that ran fast and was
+/// corrected, or a data directory carried between machines — yields a negative
+/// elapsed time. That is treated as not reapable, and the marker writer
+/// re-anchors it, rather than letting a negative `num_days()` mean "never" or
+/// an inflated one mean "immediately".
+pub fn pin_is_reapable(
+    tag: &str,
+    has_migration_record: bool,
+    ownerless_since: Option<chrono::DateTime<chrono::Utc>>,
+    now: &chrono::DateTime<chrono::Utc>,
+) -> bool {
+    if has_migration_record {
+        return false;
+    }
+    // Still required: the tag has to be one of ours. A hand-made
+    // `pre-migration-keepme` is somebody's deliberate pin and is never guessed
+    // at, whatever a marker beside it says.
+    if parse_rollback_tag(tag).is_none() {
+        return false;
+    }
+    let Some(since) = ownerless_since else {
+        return false;
+    };
+    let elapsed = *now - since;
+    elapsed >= chrono::Duration::days(STALE_PIN_MAX_AGE_DAYS)
+}
+
+/// Drop `triple-c-snapshot-*:pre-migration-*` tags that no migration record
+/// claims any more, so the images behind them become sweepable.
+///
+/// ## Why this scans tags instead of reading the records
+///
+/// Every other path to a rollback pin starts from
+/// `migration_store::load`, and `load` reports an unparseable state file as
+/// *absent* — so a single corrupt record used to strand a 4–12 GB image that no
+/// code could ever name again. Confirming or rolling back both remove the
+/// record and drop the tag together, so a `pre-migration-*` tag with no record
+/// beside it is by definition one that lost its owner: a crash between the two,
+/// a record that was deleted by hand, or the corrupt-file case.
+///
+/// Scanning the *tag pattern* is the only way to find those. `load` moving a
+/// corrupt record aside (see `migration_store::load`) is what stops that case
+/// from being permanently invisible here too.
+///
+/// ## Why it only untags
+///
+/// Dropping the tag turns the image dangling, and it is already labelled
+/// `triple-c.managed=true` because `docker commit` created it — so
+/// `sweep_orphaned_snapshots` collects it on the same pass, under the same two
+/// safety conditions, with the daemon's "still in use by a container" refusal
+/// still in front of it. Nothing here calls `docker rmi` on a reachable image.
+pub async fn reap_stale_migration_pins() -> usize {
+    use bollard::image::ListImagesOptions;
+
+    let Ok(docker) = get_docker() else {
+        return 0;
+    };
+
+    // `reference` matches against `repo:tag`, so this asks the daemon for
+    // exactly the shape [`rollback_tag`] produces and nothing else.
+    let filters: HashMap<String, Vec<String>> = HashMap::from([(
+        "reference".to_string(),
+        vec!["triple-c-snapshot-*:pre-migration-*".to_string()],
+    )]);
+
+    let images = match docker
+        .list_images(Some(ListImagesOptions {
+            all: false,
+            filters,
+            ..Default::default()
+        }))
+        .await
+    {
+        Ok(images) => images,
+        Err(e) => {
+            log::warn!("Could not list rollback pins: {}", e);
+            return 0;
+        }
+    };
+
+    let now = chrono::Utc::now();
+    let mut reaped = 0usize;
+
+    for summary in images {
+        for reference in &summary.repo_tags {
+            let Some((project_id, tag)) = parse_snapshot_reference(reference) else {
+                continue;
+            };
+            // Filesystem presence, not `load`: a record we cannot parse must
+            // still count as "somebody may want this back".
+            let has_record =
+                crate::storage::migration_store::has_record(&project_id).unwrap_or(true);
+            if has_record {
+                // Owned again (or still owned): throw away any grace clock a
+                // previous pass started, so a pin that loses its record twice
+                // gets a fresh fourteen days rather than inheriting a stale one.
+                crate::storage::migration_store::clear_ownerless(&project_id, &tag);
+                continue;
+            }
+            // Only a *well-formed* pin gets a marker written for it — a tag
+            // that is not one of ours is left entirely alone, files included.
+            if parse_rollback_tag(&tag).is_none() {
+                continue;
+            }
+            // Records the first sighting when there is none, which is why this
+            // returns `None` on that pass and the pin survives it.
+            //
+            // A `save` can land between the `has_record` above and this write,
+            // which would plant a tombstone dated *now* behind a perfectly
+            // valid record — invisible until that record is legitimately lost,
+            // at which point the pin is already past its grace period and is
+            // reaped on the first check. `note_ownerless_since` re-asks
+            // `has_record` after the write and removes the marker again; the
+            // reasoning for why that closes the window is on it.
+            let ownerless_since =
+                crate::storage::migration_store::note_ownerless_since(&project_id, &tag, &now);
+            if !pin_is_reapable(&tag, has_record, ownerless_since, &now) {
+                continue;
+            }
+            match untag_image(reference).await {
+                Ok(()) => {
+                    crate::storage::migration_store::clear_ownerless(&project_id, &tag);
+                    log::info!(
+                        "Dropped stale rollback pin {} ({:.2} GB) — no migration record has claimed it since {}, more than {} days",
+                        reference,
+                        summary.size as f64 / 1_073_741_824.0,
+                        ownerless_since
+                            .map(|t| t.to_rfc3339())
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        STALE_PIN_MAX_AGE_DAYS,
+                    );
+                    reaped += 1;
+                }
+                Err(e) => log::warn!("Could not drop stale rollback pin {}: {}", reference, e),
+            }
+        }
+    }
+
+    reaped
+}
+
 /// Split `repo:tag` into its parts, defaulting the tag to `latest`.
 pub fn split_image_ref(image: &str) -> (String, String) {
     match image.rsplit_once(':') {
@@ -1010,6 +1377,30 @@ pub fn parse_preflight(raw: &str) -> PreflightEnvironment {
 
 #[cfg(test)]
 mod tests {
+
+    /// The mount filter and the migration's exclusion list must agree.
+    ///
+    /// `project_path_mounts` skips a row with an empty `host_path` so a legacy
+    /// row cannot brick the create. That makes `/workspace/<name>` ordinary
+    /// writable-layer content rather than a bind mount — and if this function
+    /// still excluded it, `compute_verbatim_paths` would skip staging it and
+    /// the container swap would destroy whatever is there. A migration eating a
+    /// directory is the quietest kind of data loss there is.
+    #[test]
+    fn an_unmountable_row_is_not_excluded_from_the_migration_payload() {
+        let paths = vec![
+            ProjectPath { host_path: "/home/u/code".into(), mount_name: "code".into() },
+            // Legacy shapes that `project_path_mounts` skips.
+            ProjectPath { host_path: "".into(), mount_name: "data".into() },
+            ProjectPath { host_path: "/home/u/x".into(), mount_name: "  ".into() },
+        ];
+        let excluded = bind_mount_exclusions(&paths);
+        assert_eq!(
+            excluded,
+            vec!["/workspace/code".to_string()],
+            "only rows that are actually mounted may be excluded from staging"
+        );
+    }
     use super::*;
     use crate::models::{
         MIGRATION_PHASE_AWAITING, MIGRATION_PHASE_INTERRUPTED, MIGRATION_PHASE_IN_PROGRESS,
@@ -1622,4 +2013,137 @@ mod tests {
         assert_eq!(shell_single_quote("/opt/a'b"), r#"'/opt/a'\''b'"#);
     }
 
+
+    // ── Stale rollback pins (A5) ─────────────────────────────────────────────
+
+    fn at(y: i32, m: u32, d: u32) -> chrono::DateTime<chrono::Utc> {
+        chrono::NaiveDate::from_ymd_opt(y, m, d)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_utc()
+    }
+
+    #[test]
+    fn a_rollback_tag_round_trips_through_its_parser() {
+        let made = at(2026, 3, 14);
+        assert_eq!(parse_rollback_tag(&rollback_tag(&made)), Some(made));
+    }
+
+    #[test]
+    fn only_a_real_rollback_tag_parses() {
+        assert_eq!(parse_rollback_tag("latest"), None);
+        assert_eq!(parse_rollback_tag("pre-migration-"), None);
+        // Looks like ours but carries no timestamp we produced. Guessing here
+        // would mean deleting the only copy of somebody's system layer.
+        assert_eq!(parse_rollback_tag("pre-migration-keepme"), None);
+        assert_eq!(parse_rollback_tag("pre-migration-20260231-000000"), None);
+    }
+
+    #[test]
+    fn a_snapshot_reference_yields_its_project_id() {
+        assert_eq!(
+            parse_snapshot_reference("triple-c-snapshot-abc-123:pre-migration-20260101-101500"),
+            Some(("abc-123".to_string(), "pre-migration-20260101-101500".to_string()))
+        );
+        // Not ours: a base image, and a repo that merely shares a prefix.
+        assert_eq!(parse_snapshot_reference("triple-c-sandbox:latest"), None);
+        assert_eq!(parse_snapshot_reference("triple-c-snapshot-:latest"), None);
+    }
+
+    #[test]
+    fn a_pin_awaiting_confirmation_is_never_reaped_at_any_age() {
+        // The one rule that cannot bend: while a migration record exists, this
+        // image is the only copy of the rollback target and the user has not
+        // yet said they are happy on the new base.
+        let ancient = rollback_tag(&at(2020, 1, 1));
+        assert!(!pin_is_reapable(
+            &ancient,
+            true,
+            Some(at(2020, 1, 1)),
+            &at(2026, 8, 23)
+        ));
+    }
+
+    #[test]
+    fn an_unclaimed_pin_is_reaped_only_once_it_is_old() {
+        let tag = rollback_tag(&at(2026, 8, 1));
+        // The clock runs from when the record went missing, which here is well
+        // after the migration started.
+        let lost = at(2026, 8, 10);
+        assert!(!pin_is_reapable(&tag, false, Some(lost), &at(2026, 8, 11)));
+        assert!(!pin_is_reapable(
+            &tag,
+            false,
+            Some(lost),
+            &(lost + chrono::Duration::days(STALE_PIN_MAX_AGE_DAYS) - chrono::Duration::seconds(1))
+        ));
+        assert!(pin_is_reapable(
+            &tag,
+            false,
+            Some(lost),
+            &(lost + chrono::Duration::days(STALE_PIN_MAX_AGE_DAYS))
+        ));
+    }
+
+    #[test]
+    fn the_grace_period_runs_from_the_lost_record_not_from_the_tag() {
+        // The bug this replaced, stated as a test. A migration parked at
+        // `awaiting-confirmation` for a month — supported, that is what
+        // `keep_rollback` is for — whose record is then lost had a
+        // month-old tag, so the old rule made its pin reapable on the very
+        // next app start with the startup sweep deleting the image two lines
+        // later. Zero grace, on the one case the fourteen days exist for.
+        let started = at(2026, 6, 1);
+        let tag = rollback_tag(&started);
+        let record_lost = at(2026, 7, 1);
+        let noticed_immediately_after = record_lost + chrono::Duration::minutes(5);
+        assert!(
+            !pin_is_reapable(&tag, false, Some(record_lost), &noticed_immediately_after),
+            "a tag a month old must still get its full grace period once orphaned"
+        );
+    }
+
+    #[test]
+    fn an_unsighted_pin_is_never_reaped_on_the_pass_that_first_sees_it() {
+        // `None` means no reaper has recorded a sighting. Treating that as
+        // "sighted now" would be harmless; treating it as "sighted long ago"
+        // would not, and neither is what it means — the marker is written on
+        // this pass and the pin becomes reapable fourteen days later.
+        let tag = rollback_tag(&at(2020, 1, 1));
+        assert!(!pin_is_reapable(&tag, false, None, &at(2026, 8, 23)));
+    }
+
+    #[test]
+    fn a_clock_that_ran_backwards_neither_reaps_nor_strands() {
+        // A marker dated after `now`: the host clock was fast and got
+        // corrected, or the data directory came from another machine. A
+        // negative elapsed time must read as "not yet", not as a huge age.
+        let tag = rollback_tag(&at(2026, 1, 1));
+        let marker = at(2026, 9, 1);
+        assert!(!pin_is_reapable(&tag, false, Some(marker), &at(2026, 8, 1)));
+        // The other direction is bounded by the marker rather than by the tag:
+        // a wildly future `now` can only expire a clock that was actually
+        // started, and a pin with no marker (the case above) still cannot be
+        // reaped at all — which is what stops a fast host clock from making
+        // *every* pin on the daemon instantly collectable.
+        assert!(pin_is_reapable(
+            &tag,
+            false,
+            Some(at(2026, 8, 20)),
+            &at(2030, 1, 1)
+        ));
+        assert!(!pin_is_reapable(&tag, false, None, &at(2030, 1, 1)));
+    }
+
+    #[test]
+    fn a_tag_we_cannot_date_is_left_alone() {
+        // Even with an ancient ownerless marker sitting beside it: a tag that
+        // merely *starts* `pre-migration-` is somebody's deliberate pin, and
+        // the reaper never writes a marker for one in the first place.
+        let ancient = Some(at(2020, 1, 1));
+        let now = at(2026, 8, 23);
+        assert!(!pin_is_reapable("pre-migration-handmade", false, ancient, &now));
+        assert!(!pin_is_reapable("latest", false, ancient, &now));
+    }
 }

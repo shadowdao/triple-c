@@ -311,10 +311,22 @@ export default function TaskEditorModal({ project, task, onClose, onSaved }: Pro
         </div>
 
         {task && (
+          /*
+            An edit is `add` then `remove` (see `update_scheduled_task`), and
+            `triple-c-scheduler`'s remove now reaps the task's log directory —
+            so on a current container the old logs are gone, not merely filed
+            under the old id, which is what this used to promise.
+
+            It is deliberately not stated as a certainty. `/usr/local/bin` only
+            changes on base-image migration or Reset, so a project still running
+            an older base image carries the older scheduler, whose remove leaves
+            the log directory behind. "Assume they go with it" is true in both
+            worlds and spares the user a paragraph about which one they are in.
+          */
           <p className="text-xs text-[var(--text-secondary)]">
             The scheduler has no edit command, so saving re-creates this task under a new id and
-            removes <code className="font-mono">{task.id}</code>. Its previous run logs stay under
-            the old id.
+            removes <code className="font-mono">{task.id}</code>. Assume its earlier run logs go
+            with it.
           </p>
         )}
 

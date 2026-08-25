@@ -1,5 +1,24 @@
 FROM ubuntu:24.04
 
+# ── Provenance labels ────────────────────────────────────────────────────────
+# Without these the base image carries no labels at all, and
+# `sweep_orphaned_snapshots` (app/src-tauri/src/docker/container.rs) filters on
+# `dangling=true` **and** `triple-c.managed=true` — so a superseded base image,
+# left untagged when a newer build claims `triple-c-sandbox:latest`, could never
+# match and was never collected. ~11.9 GB of stranded base images was measured
+# on one developer's daemon this way.
+#
+# `triple-c.managed=true` is what makes them sweepable. Note that Docker merges
+# an image's labels into the containers created from it and `docker commit`
+# copies a container's labels onto the image, so this value also arrives on
+# every container and every snapshot — which is harmless, because
+# `create_container` writes the same key explicitly anyway.
+#
+# `triple-c.base=true` marks *this* image specifically, so a base image can be
+# told apart from a project snapshot without parsing repository names.
+LABEL triple-c.managed=true
+LABEL triple-c.base=true
+
 # Multi-arch: builds for linux/amd64 and linux/arm64 (Apple Silicon)
 # Avoid interactive prompts during package install
 ENV DEBIAN_FRONTEND=noninteractive

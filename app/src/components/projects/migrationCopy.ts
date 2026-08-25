@@ -7,6 +7,7 @@
  */
 
 import type { PackageFailure } from "../../lib/types";
+import { formatBytes } from "../../lib/formatBytes";
 
 /**
  * What re-attaches untouched. These are not copied, rebuilt or re-authenticated
@@ -62,14 +63,7 @@ export const REPLAY_COST =
 
 /** `41.0 MB`. Sizes here are informational, so the friendlier decimal unit. */
 export function formatDataSize(bytes: number): string {
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let value = bytes;
-  let unit = 0;
-  while (value >= 1000 && unit < units.length - 1) {
-    value /= 1000;
-    unit += 1;
-  }
-  return unit === 0 ? `${bytes} B` : `${value.toFixed(1)} ${units[unit]}`;
+  return formatBytes(bytes);
 }
 
 /** `1 Mar` — short enough to sit inline in the banner sentence. */

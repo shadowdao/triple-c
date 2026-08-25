@@ -20,6 +20,27 @@ generate_id() {
     head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n'
 }
 
+# Delete a task's log directory, called wherever a task stops existing.
+#
+# The task file is the only index of a task, so a log directory that outlives
+# it is unreachable — `logs --id` needs an id nothing can hand you any more —
+# and it sits on the home volume for the life of the project. The moment of
+# removal is the last point at which we still know what to delete.
+#
+# The `rm -rf` deserves paranoia, so the id is re-validated here rather than
+# trusted from the caller: the pattern rejects an empty id (which would expand
+# to $LOGS_DIR itself), anything containing `/` or `.` (which could climb out
+# of $LOGS_DIR), and a leading `-`. It matches validate_task_id() in
+# app/src-tauri/src/commands/inspect_commands.rs. Always one literal path,
+# never a glob.
+reap_task_logs() {
+    local id="${1:-}"
+    [[ "$id" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || return 0
+    local dir="${LOGS_DIR:?}/${id}"
+    [ -d "$dir" ] || return 0
+    rm -rf -- "$dir"
+}
+
 # Live run state for a task: prints "pid<TAB>started_epoch<TAB>log" and returns
 # 0 when the task is genuinely running, returns 1 otherwise.
 #
@@ -292,6 +313,7 @@ cmd_remove() {
     local name
     name=$(jq -r '.name' "$task_file")
     rm -f "$task_file"
+    reap_task_logs "$id"
     rebuild_crontab
     echo "Removed task '$name' ($id)"
 }
