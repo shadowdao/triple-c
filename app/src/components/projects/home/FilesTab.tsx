@@ -68,7 +68,7 @@ export default function FilesTab({ project }: Props) {
     uploadFiles,
     saveToHost,
     uploading,
-    savingPath,
+    savingPaths,
   } = useFileManager(project.id);
 
   const running = project.status === "running";
@@ -540,7 +540,7 @@ export default function FilesTab({ project }: Props) {
                               // Only this row: a large file can take a while,
                               // and there is no reason the rest of the pane
                               // should go dead while it is written.
-                              disabled={savingPath === entry.path}
+                              disabled={savingPaths.has(entry.path)}
                               onClick={(e) => {
                                 e.stopPropagation();
                                 void saveToHost(entry);
@@ -553,7 +553,7 @@ export default function FilesTab({ project }: Props) {
                               // save dialog the backend had just opened.
                               onDoubleClick={(e) => e.stopPropagation()}
                             >
-                              {savingPath === entry.path ? "Saving…" : "Save to host…"}
+                              {savingPaths.has(entry.path) ? "Saving…" : "Save to host…"}
                             </Button>
                           )}
                         </>

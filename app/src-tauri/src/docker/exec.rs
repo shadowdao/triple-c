@@ -818,8 +818,17 @@ pub async fn wait_for_exec_exit(exec_id: &str) -> Option<i64> {
         match docker.inspect_exec(exec_id).await {
             Ok(info) => {
                 if info.running != Some(true) {
-                    // Finished: use the reported code (default 0 if somehow absent).
-                    return Some(info.exit_code.unwrap_or(0));
+                    // Finished. `exit_code` rather than `unwrap_or(0)`: an exec
+                    // that has stopped without a reported code is a status
+                    // nobody can vouch for, and flattening it to *success* is
+                    // the wrong default when a caller is deciding whether to
+                    // rename a downloaded file over the user's own.
+                    // `download_container_file` treats `None` as a failure
+                    // precisely because it cannot tell that silence from a
+                    // clean exit; an `unwrap_or` here made that check
+                    // unreachable. Callers that only care about "did it fail
+                    // loudly" use `is_some_and`, which reads `None` as before.
+                    return info.exit_code;
                 }
             }
             Err(_) => return None,

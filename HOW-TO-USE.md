@@ -1212,12 +1212,16 @@ cannot name a place on your machine — it can only ask for a dialog — and not
 until you pick somewhere in it. Closing a dialog without choosing is not an error: nothing happens,
 and nothing is said about it.
 
-Every one of these routes refuses a location whose path passes through a hidden folder — anything
+Every one of these routes refuses a location whose path passes through a hidden *folder* — anything
 with a component beginning with `.`, such as `~/.ssh`, `~/.cache` or `~/.local/share` — or a system
 location, and it checks both the path as written and where it points after any symbolic links. That
 rule catches more than it strictly needs to, so now and then it will refuse a place you genuinely
 meant, `~/.config` among them. The refusal is a plain sentence saying so; choose a visible location
 such as `~/Documents` or `~/Downloads`.
+
+The *file's own name* is a different matter, and dotfiles are fine: `.env`, `.gitignore` and the
+rest save normally, since you chose the name in the save dialog yourself. Only the folders on the
+way are judged.
 
 If you already keep the project in a folder mounted into the container, the simplest answer is
 usually none of the above: edit the file on your host and it is already inside.

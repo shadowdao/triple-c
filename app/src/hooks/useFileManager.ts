@@ -52,11 +52,19 @@ export function useFileManager(projectId: string) {
    * against the same file, and a multi-gigabyte save is indistinguishable from
    * a click that did nothing.
    *
-   * `savingPath` rather than a boolean, so only the row being saved is
-   * disabled — the pane stays usable while a big file is written.
+   * `savingPaths` is a **set**, not one path. Keeping only the row being
+   * disabled is what makes the pane usable during a big transfer — and that is
+   * precisely what makes a *second* save startable, so the state has to be able
+   * to hold two. As a scalar it could not: starting a save on `notes.txt` while
+   * `big.bin` was still streaming overwrote it, so `big.bin`'s button went live
+   * again mid-transfer; and whichever save finished first cleared the flag for
+   * both. Dismissing the second dialog was enough to do it.
+   *
+   * Paths are unique within a listing, so a path is a usable key — `FilesTab`
+   * relies on the same fact for its row keys.
    */
   const [uploading, setUploading] = useState(false);
-  const [savingPath, setSavingPath] = useState<string | null>(null);
+  const [savingPaths, setSavingPaths] = useState<ReadonlySet<string>>(new Set());
 
   const currentPathRef = useRef(currentPath);
 
@@ -184,33 +192,37 @@ export function useFileManager(projectId: string) {
    */
   const uploadFiles = useCallback(async () => {
     const target = currentPathRef.current;
-    let outcome;
     setUploading(true);
     try {
-      outcome = await commands.uploadFilesToContainer(projectId, target);
-    } catch (e) {
-      // A failure *before* the picker: no container, not running, or a
-      // directory this pane may not write to. One toast, not one per file.
-      report("Could not upload", e);
-      return;
-    } finally {
-      setUploading(false);
-    }
-    if (!outcome) return;
-    for (const failure of outcome.failures) {
-      useAppState.getState().pushToast({ kind: "error", message: failure });
-    }
-    if (outcome.uploaded.length > 0) {
-      // The directory is named, not implied. `target` is captured at click
-      // time and the picker is a modal OS dialog — the user has all the time in
-      // the world to browse somewhere else while it is open, and the files land
-      // where they started. "Uploaded 2 files." in front of a grid that does not
-      // contain them is a worse answer than no message at all.
+      let outcome;
+      try {
+        outcome = await commands.uploadFilesToContainer(projectId, target);
+      } catch (e) {
+        // A failure *before* the picker: no container, not running, or a
+        // directory this pane may not write to. One toast, not one per file.
+        report("Could not upload", e);
+        return;
+      }
+      if (!outcome) return;
+      for (const failure of outcome.failures) {
+        useAppState.getState().pushToast({ kind: "error", message: failure });
+      }
+      if (outcome.uploaded.length === 0) return;
+      // The directory is named, not implied. `target` is captured at click time
+      // and the picker is a modal OS dialog — the user has all the time in the
+      // world to browse somewhere else while it is open, and the files land
+      // where they started. "Uploaded 2 files." in front of a grid that does
+      // not contain them is a worse answer than no message at all.
       const count = outcome.uploaded.length;
       setCompleted(
         `Uploaded ${count === 1 ? "1 file" : `${count} files`} to ${target}.`,
       );
       if (currentPathRef.current === target) await navigate(target);
+    } finally {
+      // Around the *whole* body, refresh included. Clearing it the moment the
+      // command settled put the button back before the re-listing had run, so
+      // a second click landed mid-refresh on a grid that was still the old one.
+      setUploading(false);
     }
   }, [projectId, navigate, report]);
 
@@ -223,7 +235,7 @@ export function useFileManager(projectId: string) {
    */
   const saveToHost = useCallback(
     async (entry: FileEntry) => {
-      setSavingPath(entry.path);
+      setSavingPaths((live) => new Set(live).add(entry.path));
       try {
         const bytes = await commands.downloadContainerFile(projectId, entry.path);
         // `0` is a real answer — an empty file saved is a success — so this
@@ -233,7 +245,13 @@ export function useFileManager(projectId: string) {
       } catch (e) {
         report(`Could not save "${entry.name}"`, e);
       } finally {
-        setSavingPath(null);
+        // Remove only this one. A save that finishes while another is still
+        // streaming must not re-enable the other's row.
+        setSavingPaths((live) => {
+          const next = new Set(live);
+          next.delete(entry.path);
+          return next;
+        });
       }
     },
     [projectId, report],
@@ -257,6 +275,6 @@ export function useFileManager(projectId: string) {
     saveToHost,
     /** A host transfer is in flight — see the state declarations above. */
     uploading,
-    savingPath,
+    savingPaths,
   };
 }

@@ -484,14 +484,39 @@ fn is_under_root(path: &str, root: &str) -> bool {
     path == root || path.strip_prefix(root).is_some_and(|rest| rest.starts_with('/'))
 }
 
-/// What a host path is about to be used for. The two directions differ over
-/// hidden names — see [`validate_host_path`].
+/// What a host path is about to be used for. The three modes differ over which
+/// components may be hidden — see [`validate_host_path`] and the variants.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum HostPathUse {
     /// Host bytes are about to be read *into* the container.
     Read,
-    /// Container bytes are about to be written *onto* the host.
+    /// Container bytes are about to be written *onto* the host, at a path that
+    /// arrived **over IPC as a string** — `download_container_backup`.
+    ///
+    /// The strictest of the three, and the leaf is judged along with every
+    /// directory above it, because creating `~/.bashrc` is escape all by
+    /// itself and nothing here can tell a path a person picked from one a
+    /// compromised webview invented.
     Write,
+    /// Container bytes are about to be written onto the host, at a name a
+    /// person typed or accepted in an **OS save dialog opened by Rust** —
+    /// `download_container_file`.
+    ///
+    /// Identical to [`HostPathUse::Write`] except that the final component is
+    /// not judged for hiddenness, which is the difference between a rule and a
+    /// bug. Under `Write`, saving `/workspace/.env` was refused *after* the
+    /// modal and the overwrite prompt, with the message "\".env\" is a hidden
+    /// file — Triple-C will not save there" — and the app had pre-filled that
+    /// exact name itself. `.gitignore`, `.dockerignore`, `.eslintrc.json`,
+    /// `.nvmrc` and the rest of an ordinary workspace were all unsavable, while
+    /// uploading them worked, so a dotfile could go in and never come out.
+    ///
+    /// What justifies dropping it *here* and nowhere else is that the dialog is
+    /// a real boundary for this caller and only this caller: the name is on
+    /// screen, the user chose the directory, and the OS asked before
+    /// overwriting anything. Every *directory* rule still applies, so `~/.ssh`
+    /// and `~/.config` are as refused as they ever were.
+    WriteChosenName,
 }
 
 /// Host directories nothing in this app has any business reading a file out of
@@ -583,7 +608,35 @@ fn normalize_host_path(path: &str) -> String {
             break;
         }
     }
-    s
+    // Collapse runs of separators, keeping any leading pair (a UNC root is
+    // `//server/share` and means something).
+    //
+    // Without this the *lexical* system-root rule was quietly absent for
+    // Windows paths: `C:\\Windows\System32\x.dll` normalises to
+    // `c://windows/...`, which `is_under_root` does not match, while the
+    // single-separator form is refused. Nothing was exploitable — `resolve_host_path`
+    // runs the same policy again over the canonical form and `canonicalize`
+    // collapses the run — but a documented layer that silently does nothing is
+    // a trap for the next caller who reaches for it without the resolved pass.
+    let lead = if s.starts_with("//") { "//" } else { "" };
+    let body: String = {
+        let rest = &s[lead.len()..];
+        let mut out = String::with_capacity(rest.len());
+        let mut prev_sep = false;
+        for c in rest.chars() {
+            if c == '/' {
+                if !prev_sep {
+                    out.push(c);
+                }
+                prev_sep = true;
+            } else {
+                out.push(c);
+                prev_sep = false;
+            }
+        }
+        out
+    };
+    format!("{}{}", lead, body)
 }
 
 /// The named components of a host path, with the drive letter, the separators
@@ -763,7 +816,9 @@ fn validate_host_path(path: &str, use_for: HostPathUse) -> Result<PathBuf, Strin
     // directory the path passes *through*.
     let hidden_limit = match use_for {
         HostPathUse::Write => names.len(),
-        HostPathUse::Read => names.len().saturating_sub(1),
+        // The leaf is the user's own choice in both of these — dropped from a
+        // file manager, or typed into a save dialog. See the enum.
+        HostPathUse::Read | HostPathUse::WriteChosenName => names.len().saturating_sub(1),
     };
     if let Some(hidden) = names[..hidden_limit].iter().find(|n| n.starts_with('.')) {
         let verb = if use_for == HostPathUse::Write { "save" } else { "read" };
@@ -861,7 +916,10 @@ async fn resolve_host_path(path: &str, use_for: HostPathUse) -> Result<PathBuf, 
         HostPathUse::Read => tokio::fs::canonicalize(&candidate)
             .await
             .map_err(|e| format!("Cannot access {}: {}", candidate.display(), e))?,
-        HostPathUse::Write => {
+        // Both write modes resolve the *parent* and keep the caller's leaf; they
+        // differ only in whether that leaf may be hidden, which
+        // `validate_host_path` has already decided by this point.
+        HostPathUse::Write | HostPathUse::WriteChosenName => {
             let parent = candidate
                 .parent()
                 .ok_or_else(|| format!("{} does not name a file", candidate.display()))?;
@@ -878,13 +936,15 @@ async fn resolve_host_path(path: &str, use_for: HostPathUse) -> Result<PathBuf, 
             // as the one the caller typed. Only the *name* is taken from the
             // canonical form: a destination that is a symlink gets replaced by
             // the rename, never followed, so its target is not what is at risk.
-            if let Ok(full) = tokio::fs::canonicalize(&joined).await {
-                let real = full.file_name().map(|n| n.to_string_lossy().to_string());
-                if real.as_deref().is_some_and(|n| n.starts_with('.')) {
-                    return Err(format!(
-                        "\"{}\" is a hidden file — Triple-C will not save there. Choose a visible name.",
-                        real.unwrap_or_default()
-                    ));
+            if use_for == HostPathUse::Write {
+                if let Ok(full) = tokio::fs::canonicalize(&joined).await {
+                    let real = full.file_name().map(|n| n.to_string_lossy().to_string());
+                    if real.as_deref().is_some_and(|n| n.starts_with('.')) {
+                        return Err(format!(
+                            "\"{}\" is a hidden file — Triple-C will not save there. Choose a visible name.",
+                            real.unwrap_or_default()
+                        ));
+                    }
                 }
             }
             joined
@@ -1485,7 +1545,7 @@ pub async fn download_container_file(
 
     require_running(container_id, "saving a file to the host").await?;
 
-    let Some(chosen) = pick_save_path(&window, suggested_save_name(&container_path)).await else {
+    let Some(chosen) = pick_save_path(&window, &suggested_save_name(&container_path)).await else {
         // Dismissed. Not an error, and deliberately distinguishable from one:
         // the frontend shows nothing at all rather than a "cancelled" toast.
         return Ok(None);
@@ -1497,36 +1557,56 @@ pub async fn download_container_file(
     // Rust bought — but the rule is cheap and the two host-path commands
     // agreeing about what is writable is worth more than the few refusals it
     // costs. See the note on `pick_save_path` about which ones those are.
-    let dest = resolve_host_path(&chosen, HostPathUse::Write).await?;
+    let dest = resolve_host_path(&chosen, HostPathUse::WriteChosenName).await?;
 
     let docker = get_docker()?;
 
     // `$TC_SRC`, never argv interpolation: the path reaches the shell as an
     // environment value, so a name containing a quote or a `$` is data.
     //
-    // Three things here are load-bearing against a container that is actively
-    // hostile rather than merely surprising:
+    // ## Why `dd iflag=nonblock` and not `cat`
     //
-    //   * `dd iflag=nonblock` rather than `cat`. `[ -f ]` and the `open` that
-    //     follows it are two syscalls, and the container owns the filesystem in
-    //     between — a loop replacing the file with a FIFO wins that race often
-    //     enough to matter. `cat` then blocks in `open(2)` forever with no
-    //     writer, and there is no timeout anywhere on this path: the `invoke`
-    //     never settles and a partial file is left in the user's directory for
-    //     good. `O_NONBLOCK` makes that open return instead of hang. On a
-    //     regular file the flag is ignored by the kernel, so this is
-    //     byte-for-byte what `cat` did — verified against a real container.
-    //   * the second `[ -f ]`, *after* the read. Non-blocking turns the hang
-    //     into an empty file that would otherwise be renamed over the user's
-    //     destination and reported as a successful save. Bracketing the read
-    //     means the adversarial case ends as a refusal, which deletes the
-    //     partial and leaves the destination alone.
-    //   * `dd` is not `exec`-ed, because a replaced shell cannot run the check
-    //     that follows it.
+    // `[ -f ]` and the `open` that follows it are two syscalls, and the
+    // container owns the filesystem in between — a loop replacing the file with
+    // a FIFO wins that race often enough to matter. `cat` then blocks in
+    // `open(2)` forever with no writer, and there is no timeout anywhere on this
+    // path: the `invoke` never settles and a partial file is left in the user's
+    // directory for good. `O_NONBLOCK` makes that open return instead of hang.
+    // On a regular file the kernel ignores the flag, so this is byte-for-byte
+    // what `cat` did — verified against a real container, `cmp`-clean.
     //
-    // The bracket can also fire honestly — a file deleted or replaced mid-read
-    // — and reporting that as a failure is the right answer, since the bytes on
-    // their way to disk are then a mix of two files.
+    // ## Why the size, and not a second `[ -f ]`
+    //
+    // The first version of this bracketed the read with `[ -f ]` again, on the
+    // reasoning that a file which stopped being a regular file had changed
+    // underneath us. That check was wrong in **both** directions, and a review
+    // demonstrated both against a real container:
+    //
+    //   * it did not catch the case that loses data. Truncation *in place* —
+    //     `> file`, log rotation, `tar -x`, most build tools — leaves a regular
+    //     file behind, so `dd` stopped at the new EOF, exited 0, and a 34 MB
+    //     partial of a 600 MB file was renamed over the user's own copy and
+    //     reported as `Saved (34.1 MB)`. Same for truncate-to-zero, which needs
+    //     no adversary at all.
+    //   * it failed *good* downloads. `dd` already holds the fd, and neither
+    //     `rm` nor `mv` can affect an open one — the bytes are complete and
+    //     correct. But `rm` makes `[ -f ]` false, so a finished 600 MB transfer
+    //     of a file a bundler happened to unlink was deleted and reported as
+    //     "nothing was saved".
+    //
+    // So the question asked is the one that actually matters: **did we get at
+    // least as many bytes as the file had when we started?** `TC_SIZE=` on
+    // stderr carries the answer out (stdout is the payload and must stay
+    // pristine), and Rust compares it against what it wrote.
+    //
+    // That single rule subsumes everything the bracket was for and gets the two
+    // cases above right: a deleted or renamed source still delivers its whole
+    // length and passes; a truncated one delivers less and fails; the FIFO race
+    // delivers zero against a non-zero size and fails. A file *growing* during
+    // the read delivers more than it started with, which passes — correct, and
+    // the reason the test is `>=`.
+    //
+    // `dd` is not `exec`-ed: a replaced shell cannot run what follows it.
     let script = r#"if [ -d "$TC_SRC" ]; then
   echo "$TC_SRC is a folder — save its files individually." >&2
   exit 3
@@ -1535,11 +1615,12 @@ if [ ! -f "$TC_SRC" ]; then
   echo "$TC_SRC is not a regular file." >&2
   exit 4
 fi
-dd iflag=nonblock bs=64k status=none if="$TC_SRC" || exit 5
-if [ ! -f "$TC_SRC" ]; then
-  echo "$TC_SRC changed while it was being read — nothing was saved." >&2
-  exit 6
-fi"#;
+SZ=$(stat -c %s -- "$TC_SRC" 2>/dev/null) || SZ=""
+case "$SZ" in
+  ''|*[!0-9]*) echo "Could not measure $TC_SRC before reading it." >&2; exit 7 ;;
+esac
+echo "TC_SIZE=$SZ" >&2
+dd iflag=nonblock bs=64k status=none if="$TC_SRC" || exit 5"#;
 
     let exec = docker
         .create_exec(
@@ -1603,6 +1684,10 @@ fi"#;
     let mut total: u64 = 0;
     let mut stderr_text = String::new();
     let mut stream_err: Option<String> = None;
+    // The size the container reported before the read, if it has arrived yet.
+    // It is the first thing the script writes, so in practice it is in hand
+    // before the first payload frame — but the loop does not depend on that.
+    let mut declared: Option<u64> = None;
 
     while let Some(msg) = output.next().await {
         match msg {
@@ -1612,9 +1697,36 @@ fi"#;
                     break;
                 }
                 total += message.len() as u64;
+                // A ceiling, derived from what the container itself said the
+                // file was. Without one, a single click on a file the panel
+                // lists as 2 KB can fill the host disk: `dd` is resolved
+                // through the container's `PATH`, which its agent owns with
+                // passwordless sudo, and a replacement that writes forever was
+                // measured at ~6 GB/s against a real container. The UI shows
+                // only "Saving…" while that happens and has no cancel.
+                //
+                // Generous, because a file can legitimately grow while it is
+                // being read — an active log is the ordinary case — and cutting
+                // one of those off would be a bug of our own. What this bounds
+                // is the *unbounded* case: the worst a single click can now
+                // cost is the slack, not the volume.
+                if let Some(limit) = declared.map(download_ceiling) {
+                    if total > limit {
+                        stream_err = Some(format!(
+                            "{} kept producing data long past the {} it reported — stopped at {}. Nothing was saved.",
+                            container_path,
+                            human_bytes(declared.unwrap_or(0)),
+                            human_bytes(total),
+                        ));
+                        break;
+                    }
+                }
             }
             Ok(LogOutput::StdErr { message }) => {
                 push_capped(&mut stderr_text, &message);
+                if declared.is_none() {
+                    declared = parse_declared_size(&stderr_text);
+                }
             }
             Ok(_) => {}
             Err(e) => {
@@ -1645,14 +1757,26 @@ fi"#;
     // way this command could destroy data, so silence is failure.
     let exit_code = crate::docker::exec::wait_for_exec_exit(&exec.id).await;
     if stream_err.is_none() && exit_code != Some(0) {
-        // Framed, never verbatim. The script's own refusals are finished
-        // sentences, but they *quote the container's path* — and a directory
-        // can be named anything. `readableRefusal` on the frontend promotes a
-        // refusal that looks like one of ours to the toast headline, so an
-        // unframed string is an invitation to write the app's own error message
-        // from inside the container. The frame does not make the text
-        // trustworthy; it makes it visibly quoted.
-        let detail = stderr_text.trim();
+        // Framed and clipped, never verbatim.
+        //
+        // Be precise about what the frame buys, because the first version of
+        // this comment overstated it. `readableRefusal` on the frontend matches
+        // its markers with `includes`, not a prefix test — and it has to, since
+        // the app's own refusals carry those markers mid-sentence. So a frame
+        // does **not** stop container text reaching the toast headline: text
+        // containing "Triple-C will not" is promoted wherever it sits.
+        //
+        // What the frame does buy is that the app's own words come first, so
+        // the quoted part is visibly quoted. What the *clip* buys is the part
+        // that actually mattered: `MAX_EXEC_STDERR` is 8 KiB, which is room for
+        // a convincing forged instruction, and a toast is rendered above every
+        // modal. A couple of hundred characters on one line is a diagnostic;
+        // eight kilobytes of prose is a phishing surface with a scrollbar.
+        //
+        // Newlines and control characters go too: they are what let quoted text
+        // fake the structure of a message the app wrote.
+        let detail = clip_container_text(&stderr_text);
+        let detail = detail.as_str();
         stream_err = Some(match exit_code {
             None => format!(
                 "Could not confirm that {} was read completely — nothing was saved.",
@@ -1663,6 +1787,41 @@ fi"#;
             }
             Some(code) => format!("Could not read {} (exit {}): {}", container_path, code, detail),
         });
+    }
+
+    // Short of what the file measured is the data-loss case, and it is the one
+    // an exit code cannot see: `dd` reports success for a file truncated under
+    // it, because it faithfully read to the EOF it was given. Verified against
+    // a real container — a 600 MB source truncated mid-read delivered 34 MB at
+    // exit 0, and before this check that 34 MB was renamed over the user's own
+    // copy and toasted as `Saved (34.1 MB)`.
+    //
+    // `>=`, not `==`: a file being appended to during the read delivers more
+    // than it measured, and that is a complete read, not a failure. A file
+    // deleted or renamed mid-read also passes, correctly — `dd` holds the fd
+    // and neither operation can touch it, so the bytes are whole.
+    if stream_err.is_none() {
+        match declared {
+            Some(size) if total < size => {
+                stream_err = Some(format!(
+                    "{} was {} when the copy started and only {} arrived — it changed while it was being read, so nothing was saved.",
+                    container_path,
+                    human_bytes(size),
+                    human_bytes(total),
+                ));
+            }
+            // The script exits 7 rather than staying quiet if it cannot measure
+            // the file, so a missing size here means the exec never got that
+            // far — and a zero exit with no measurement is not something to
+            // rename over the user's file on trust.
+            None => {
+                stream_err = Some(format!(
+                    "Could not confirm how much of {} arrived — nothing was saved.",
+                    container_path
+                ));
+            }
+            Some(_) => {}
+        }
     }
 
     if let Some(err) = stream_err {
@@ -1761,6 +1920,16 @@ pub async fn upload_files_to_container(
         return Ok(None);
     };
 
+    // Again, now that the picker has closed. The check above is there so a
+    // stopped or unwritable project says so *before* asking anyone to choose
+    // files; this one is the check that actually guards the extraction. A modal
+    // has no time limit, and `resolve_container_dir` answers a question about
+    // the container's filesystem — which the container is free to change while
+    // the dialog is open. Without this, `docker::exec`'s doc comment claim that
+    // the destination "has already been confirmed" would be true only of a
+    // moment that had passed.
+    resolve_container_dir(container_id, "Upload", &container_dir).await?;
+
     // Once for the whole selection, not once per file — see
     // `upload_host_file_with_ids`.
     let ids = crate::docker::exec::container_user_ids(container_id).await;
@@ -1836,6 +2005,87 @@ async fn upload_one(
     .await
 }
 
+/// Container-authored diagnostic text, cut down to something safe to quote.
+///
+/// One line, a couple of hundred characters, no control characters. See the
+/// call site for why each of those three matters; the short version is that
+/// this text ends up inside a toast that renders above every modal, and its
+/// author is the container.
+fn clip_container_text(text: &str) -> String {
+    const MAX: usize = 200;
+    let flattened: String = text
+        .trim()
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let flattened = flattened.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flattened.chars().count() <= MAX {
+        return flattened;
+    }
+    let kept: String = flattened.chars().take(MAX).collect();
+    format!("{}…", kept.trim_end())
+}
+
+/// Pull `TC_SIZE=<n>` out of what the download script wrote to stderr.
+///
+/// A line rather than a second channel because there is no second channel: the
+/// exec has exactly two streams and stdout is the payload, which has to stay
+/// pristine — running it through anything is how a download corrupts a binary.
+///
+/// Deliberately strict. The container writes this, so it is parsed as one
+/// well-formed line and nothing else: an unparseable value yields `None`, and
+/// `None` fails the transfer rather than waving it through. The script has
+/// already refused (exit 7) if `stat` could not answer, so a missing value here
+/// means something further upstream went wrong.
+fn parse_declared_size(stderr: &str) -> Option<u64> {
+    stderr
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("TC_SIZE="))
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
+/// How much more than its measured size a file may deliver before the transfer
+/// is treated as runaway.
+///
+/// Two shapes at once, because the two ends of the range need different things.
+/// A small file needs *absolute* slack — a 2 KB file that grows to 40 MB is
+/// unremarkable, and a multiplier would strangle it. A large one needs
+/// *proportional* slack — doubling is plenty, and a fixed 256 MiB on top of
+/// 3 GB is noise. So: whichever is larger.
+///
+/// This is a bound on the pathological case, not an attempt to predict the
+/// honest one. The honest case is bounded by the file; this exists so that a
+/// container answering a 2 KB read with an infinite stream costs the slack
+/// rather than the disk.
+fn download_ceiling(declared: u64) -> u64 {
+    const FLOOR: u64 = 256 * 1024 * 1024;
+    declared.saturating_mul(2).max(declared.saturating_add(FLOOR))
+}
+
+/// Bytes as a person reads them, for a refusal.
+///
+/// The frontend has `formatBytes` and these strings are built in Rust, so they
+/// cannot share it. Kept deliberately small — this is for error text, not for
+/// the UI, which formats its own.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [(&str, u64); 4] = [
+        ("GB", 1024 * 1024 * 1024),
+        ("MB", 1024 * 1024),
+        ("KB", 1024),
+        ("bytes", 1),
+    ];
+    for (unit, scale) in UNITS {
+        if bytes >= scale {
+            return if scale == 1 {
+                format!("{} {}", bytes, unit)
+            } else {
+                format!("{:.1} {}", bytes as f64 / scale as f64, unit)
+            };
+        }
+    }
+    "0 bytes".to_string()
+}
+
 /// The path a dialog handed back, as a `String`, or a refusal.
 ///
 /// Every host-path check in this module is `&str`-based, so a `PathBuf` has to
@@ -1859,16 +2109,58 @@ fn host_path_string(path: PathBuf) -> Result<String, String> {
 
 /// The name the save dialog opens with.
 ///
-/// `unwrap_or` is not enough on its own: `rsplit` on a path with a trailing
-/// separator yields `Some("")`, so the fallback never fires and the dialog
-/// opens with a blank name for the user to fill in from nothing. `filter` is
-/// what makes the fallback reachable.
-fn suggested_save_name(container_path: &str) -> &str {
-    container_path
+/// ## This string is container-authored, and it is a *name*, not a path
+///
+/// It goes straight to `rfd`'s `set_file_name`, and on Windows the common file
+/// dialog parses its File-name box as a **path** on Save. A container can name
+/// a file anything a Linux filesystem accepts, backslashes included, and
+/// `validate_container_path` has no reason to object: it rejects a `..`
+/// *segment*, and `..\..\Users\vic\…` is one POSIX segment.
+///
+/// So `rsplit('/')` alone — which is what this was — let the container choose
+/// the destination on Windows, not just the file name:
+///
+/// ```text
+/// /workspace/proj/..\..\..\Users\vic\AppData\Roaming\Microsoft\Word\STARTUP\x.dotm
+///   -> "..\..\..\Users\vic\AppData\Roaming\Microsoft\Word\STARTUP\x.dotm"
+/// ```
+///
+/// One un-read click on Save and that resolves. `resolve_host_path` still runs
+/// on whatever the dialog produced, but Word's `STARTUP` and Excel's `XLSTART`
+/// are auto-loading persistence directories that the denylist does not name —
+/// and this file's own docs concede the denylist is "losing by construction".
+/// It was never meant to be the boundary for this caller.
+///
+/// The fix is to make the string incapable of being a path on any platform this
+/// ships to: every separator, the drive colon, and the rest of the characters
+/// NTFS refuses are replaced rather than removed, so the name stays the same
+/// length and stays recognisable. `?` and `*` are legal on Linux and go too —
+/// this is a *suggestion* the user can edit, and a pre-filled name Windows
+/// would reject is its own small bug.
+///
+/// The empty check is separate and also load-bearing: `rsplit` on a path with a
+/// trailing separator yields `Some("")`, so without it the fallback never fires
+/// and the dialog opens with a blank name.
+fn suggested_save_name(container_path: &str) -> String {
+    let leaf = container_path
         .rsplit('/')
         .next()
         .filter(|leaf| !leaf.is_empty())
-        .unwrap_or("download")
+        .unwrap_or("download");
+    let cleaned: String = leaf
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    // `.` and `..` are names the dialog cannot use, and a name that sanitised
+    // down to nothing has nothing left to suggest.
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        return "download".to_string();
+    }
+    cleaned
 }
 
 /// Ask the user where to save, from Rust.
@@ -1889,13 +2181,18 @@ fn suggested_save_name(container_path: &str) -> &str {
 /// ## What is still validated, and what that costs
 ///
 /// The chosen path still goes through `resolve_host_path`, whose hidden-
-/// component rule deliberately over-catches (see [`validate_host_path`]). That
-/// rule was written for adversarial input, and against a *dialog* it will
+/// *directory* rule deliberately over-catches (see [`validate_host_path`]).
+/// That rule was written for adversarial input, and against a dialog it will
 /// occasionally refuse something a person meant — saving into `~/.config`, or
 /// picking a file out of `~/.cache`. It is kept anyway: the refusal is a clear
-/// sentence, the destinations it costs are unusual ones for this pane, and
-/// having the two host-path commands disagree about what is writable is a worse
-/// failure than an occasional "choose somewhere else".
+/// sentence and the destinations it costs are unusual ones for this pane.
+///
+/// The hidden *leaf* rule is not kept, and the distinction matters. Under it,
+/// saving `/workspace/.env` was refused after the modal and after the overwrite
+/// prompt, quoting a name the app had pre-filled itself — and every
+/// `.gitignore`, `.eslintrc.json` and `.nvmrc` in an ordinary workspace with
+/// it, while uploading the same files worked. That is what
+/// [`HostPathUse::WriteChosenName`] exists for.
 ///
 /// `None` means dismissed, which is not a failure. The `oneshot` is used rather
 /// than `blocking_save_file` because the blocking variants deadlock if they
@@ -2266,6 +2563,121 @@ mod tests {
             host_path_string(PathBuf::from("/home/j/café.txt")).unwrap(),
             "/home/j/café.txt"
         );
+    }
+
+    /// The dialog's pre-filled name is authored by the **container**, and on
+    /// Windows the save dialog parses its name box as a path. So the string
+    /// must be incapable of being one.
+    #[test]
+    fn a_suggested_name_can_never_be_a_path() {
+        // The finding this exists for, verbatim: `..` segments plus backslashes
+        // reach Word's auto-loading STARTUP directory, which the host-path
+        // denylist does not name.
+        let evil = r"/workspace/proj/..\..\..\Users\vic\AppData\Roaming\Microsoft\Word\STARTUP\x.dotm";
+        let got = suggested_save_name(evil);
+        assert!(!got.contains('\\'), "{}", got);
+        assert!(!got.contains('/'), "{}", got);
+        // A drive letter is a path on Windows too.
+        let drive = r"/workspace/proj/C:\Users\vic\Desktop\payload.exe";
+        let got = suggested_save_name(drive);
+        assert!(!got.contains(':'), "{}", got);
+        assert!(!got.contains('\\'), "{}", got);
+    }
+
+    /// Sanitising must not damage the ordinary case — the whole point of a
+    /// suggestion is that it is the file's name.
+    #[test]
+    fn an_ordinary_suggested_name_is_untouched() {
+        assert_eq!(suggested_save_name("/workspace/notes.txt"), "notes.txt");
+        assert_eq!(suggested_save_name("/workspace/my report (v2).pdf"), "my report (v2).pdf");
+        // Dotfiles are the common case this pane browses, and they are saveable
+        // now — see `HostPathUse::WriteChosenName`.
+        assert_eq!(suggested_save_name("/workspace/.env"), ".env");
+    }
+
+    /// A name that sanitises down to nothing usable still has to open the
+    /// dialog with something.
+    #[test]
+    fn a_suggested_name_always_has_something_in_it() {
+        assert_eq!(suggested_save_name("/workspace/logs/"), "download");
+        assert_eq!(suggested_save_name("/"), "download");
+        assert_eq!(suggested_save_name(""), "download");
+        // `/` alone sanitises to `_`, not to nothing — that is fine and still a
+        // name. But a leaf that *is* `..` is not usable as one.
+        assert_eq!(suggested_save_name("/workspace/.."), "download");
+    }
+
+    /// A dotfile must be saveable to the host. Under the old rule the leaf was
+    /// judged for hiddenness on every write, so `.env` was refused *after* the
+    /// modal — with the name the app itself had pre-filled.
+    #[test]
+    fn a_dotfile_can_be_saved_when_the_user_named_it_in_a_dialog() {
+        let dest = "/home/j/Documents/.env";
+        assert!(
+            validate_host_path(dest, HostPathUse::WriteChosenName).is_ok(),
+            "a name chosen in a save dialog should be allowed to be hidden"
+        );
+        // But only the leaf. A hidden *directory* is refused exactly as before.
+        assert!(validate_host_path("/home/j/.ssh/authorized_keys", HostPathUse::WriteChosenName).is_err());
+        assert!(validate_host_path("/home/j/.config/x.txt", HostPathUse::WriteChosenName).is_err());
+        // And the IPC-fed writer keeps the strict rule, because for it the
+        // dialog is not a boundary.
+        assert!(validate_host_path(dest, HostPathUse::Write).is_err());
+    }
+
+    /// The size line the download script emits is the only thing standing
+    /// between a truncated read and a rename over the user's own file.
+    #[test]
+    fn the_declared_size_is_read_out_of_stderr() {
+        assert_eq!(parse_declared_size("TC_SIZE=600000000\n"), Some(600000000));
+        // Real diagnostics can share the stream.
+        assert_eq!(
+            parse_declared_size("dd: warning: something\nTC_SIZE=42\n"),
+            Some(42)
+        );
+        assert_eq!(parse_declared_size("TC_SIZE=0"), Some(0));
+        // Container-authored, so anything unparseable is *no answer*, which the
+        // caller turns into a refusal rather than a pass.
+        assert_eq!(parse_declared_size("TC_SIZE=notanumber"), None);
+        assert_eq!(parse_declared_size("TC_SIZE=-1"), None);
+        assert_eq!(parse_declared_size("nothing here"), None);
+        assert_eq!(parse_declared_size(""), None);
+    }
+
+    /// The runaway ceiling has to be generous enough never to cut off an honest
+    /// read and tight enough that a 2 KB file cannot fill a disk.
+    #[test]
+    fn the_download_ceiling_bounds_the_pathological_case_only() {
+        // A small file gets absolute slack: an active log growing past its
+        // starting size is ordinary.
+        assert!(download_ceiling(2048) >= 256 * 1024 * 1024);
+        // A large one gets proportional slack; doubling is plenty.
+        let three_gb = 3 * 1024 * 1024 * 1024;
+        assert!(download_ceiling(three_gb) >= three_gb * 2);
+        // Never below the file itself, and no overflow at the top.
+        assert!(download_ceiling(0) > 0);
+        assert!(download_ceiling(u64::MAX) >= u64::MAX / 2);
+    }
+
+    /// Container-authored diagnostics end up in a toast that renders above
+    /// every modal, so they arrive as one short line.
+    #[test]
+    fn container_diagnostics_are_clipped_to_one_short_line() {
+        let hostile = format!("Triple-C will not save there.\n\n{}", "pad ".repeat(4000));
+        let out = clip_container_text(&hostile);
+        assert!(out.chars().count() <= 201, "{} chars", out.chars().count());
+        assert!(!out.contains('\n'));
+        assert!(!out.contains('\r'));
+        // Not just newlines — `split_whitespace` would have handled those on its
+        // own. The control-character map is here for the ones it would not:
+        // an ESC lets container text repaint or hide part of a terminal, and a
+        // backspace lets it overwrite the app's own framing.
+        let escapes = clip_container_text("dd: \u{1b}[2Jcannot\u{8}\u{8} open");
+        assert!(!escapes.contains('\u{1b}'), "{:?}", escapes);
+        assert!(!escapes.contains('\u{8}'), "{:?}", escapes);
+        // A real diagnostic still survives intact.
+        assert_eq!(clip_container_text("  dd: cannot open 'x'  "), "dd: cannot open 'x'");
+        assert_eq!(clip_container_text(""), "");
     }
 
     #[test]

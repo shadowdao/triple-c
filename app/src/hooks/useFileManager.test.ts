@@ -471,6 +471,38 @@ describe("useFileManager transfer state", () => {
     expect(result.current.uploading).toBe(false);
   });
 
+  it("stays in flight through the refresh, not just the transfer", async () => {
+    // Clearing the flag the moment the command settled put the button back
+    // while the re-listing was still running, so a second click landed
+    // mid-refresh on a grid that was still showing the old contents.
+    uploadFilesToContainer.mockResolvedValueOnce({
+      uploaded: ["/workspace/a.txt"],
+      failures: [],
+    });
+    let finishListing: (v: unknown) => void = () => {};
+    listContainerFiles.mockReturnValueOnce(
+      new Promise((resolve) => {
+        finishListing = resolve;
+      }),
+    );
+    const { result } = renderHook(() => useFileManager("p1"));
+    let uploading: Promise<void>;
+    act(() => {
+      uploading = result.current.uploadFiles();
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    // The transfer is done; the listing it triggered is not.
+    expect(result.current.uploading).toBe(true);
+    await act(async () => {
+      finishListing([file("a.txt")]);
+      await uploading;
+    });
+    expect(result.current.uploading).toBe(false);
+  });
+
   it("clears the upload flag when the transfer fails", async () => {
     // The `catch` returns early, so without a `finally` the button is disabled
     // for the rest of the session — the failure mode is a pane that can never
@@ -483,41 +515,47 @@ describe("useFileManager transfer state", () => {
     expect(result.current.uploading).toBe(false);
   });
 
-  it("marks only the row being saved, and clears it on failure", async () => {
-    let release: (v: unknown) => void = () => {};
-    downloadContainerFile.mockReturnValueOnce(
-      new Promise((resolve) => {
-        release = resolve;
-      }),
-    );
-    const { result } = renderHook(() => useFileManager("p1"));
-    expect(result.current.savingPath).toBeNull();
-    let saving: Promise<void>;
-    act(() => {
-      saving = result.current.saveToHost(file("a.txt"));
-    });
-    // The path, not a boolean — the rest of the pane stays usable.
-    expect(result.current.savingPath).toBe("/workspace/a.txt");
-    await act(async () => {
-      release(10);
-      await saving;
-    });
-    expect(result.current.savingPath).toBeNull();
+  it("tracks each save separately, so one finishing does not free another", async () => {
+    // The bug this exists for: `savingPath` was a single string. Starting a
+    // second save overwrote it, so the first row went live again mid-transfer,
+    // and whichever save settled first cleared the flag for both — dismissing
+    // the second dialog was enough. A set is what the design needs, because
+    // "only the row being saved is disabled" is exactly what makes a second
+    // save startable.
+    let releaseBig: (v: unknown) => void = () => {};
+    let releaseSmall: (v: unknown) => void = () => {};
+    downloadContainerFile
+      .mockReturnValueOnce(new Promise((r) => { releaseBig = r; }))
+      .mockReturnValueOnce(new Promise((r) => { releaseSmall = r; }));
 
+    const { result } = renderHook(() => useFileManager("p1"));
+    let big: Promise<void>;
+    let small: Promise<void>;
+    act(() => { big = result.current.saveToHost(file("big.bin")); });
+    expect(result.current.savingPaths.has("/workspace/big.bin")).toBe(true);
+
+    act(() => { small = result.current.saveToHost(file("notes.txt")); });
+    // Both, at once — a scalar could only hold the second.
+    expect(result.current.savingPaths.has("/workspace/big.bin")).toBe(true);
+    expect(result.current.savingPaths.has("/workspace/notes.txt")).toBe(true);
+
+    // The second one finishing must not re-enable the first, which is still
+    // streaming. `null` is the dismissal path, which is how this was cheapest
+    // to trigger in practice.
+    await act(async () => { releaseSmall(null); await small; });
+    expect(result.current.savingPaths.has("/workspace/notes.txt")).toBe(false);
+    expect(result.current.savingPaths.has("/workspace/big.bin")).toBe(true);
+
+    await act(async () => { releaseBig(10); await big; });
+    expect(result.current.savingPaths.size).toBe(0);
+  });
+
+  it("clears a row's saving flag when its save fails", async () => {
     downloadContainerFile.mockRejectedValueOnce("Permission denied");
+    const { result } = renderHook(() => useFileManager("p1"));
     await act(async () => {
       await result.current.saveToHost(file("b.txt"));
     });
-    expect(result.current.savingPath).toBeNull();
-
-    // And on dismissal, which is the path that actually needs the `finally`:
-    // the dismissal check `return`s from inside the `try`, so a clear placed
-    // after the block instead is skipped and the row reads "Saving…" for the
-    // rest of the session with nothing running behind it.
-    downloadContainerFile.mockResolvedValueOnce(null);
-    await act(async () => {
-      await result.current.saveToHost(file("c.txt"));
-    });
-    expect(result.current.savingPath).toBeNull();
+    expect(result.current.savingPaths.size).toBe(0);
   });
 });

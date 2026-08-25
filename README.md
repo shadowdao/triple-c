@@ -451,10 +451,16 @@ policy in `commands/file_commands.rs`.
 - **The OS dialogs are opened by Rust, not by the webview.** `upload_files_to_container` and
   `download_container_file` drive `tauri-plugin-dialog` themselves and take nothing but a project
   id and a container-side path; `FilesTab.tsx` imports no dialog plugin and `useFileManager`'s
-  `uploadFiles` takes no argument at all. No host path crosses IPC in either direction — the web UI
-  can ask for a dialog, and that is the whole of its influence over where a file comes from or goes.
+  `uploadFiles` takes no argument at all. The web UI can ask for a dialog, and that is the whole of
+  its influence over where a file comes from or goes — it cannot name a host path as an *input*.
   This is a boundary rather than a convention: a dialog the page itself opens is only as trustworthy
-  as the page.
+  as the page. Be precise about the limit, though — host paths still travel *outward* in error text,
+  canonical ones included, so this closes the inbound direction and not both.
+- **The dialog's pre-filled name is sanitized, because a container authored it.** On Windows the
+  save dialog parses its name box as a path, and a container can name a file
+  `..\..\Users\you\…\Word\STARTUP\x.dotm` — one POSIX segment, so nothing upstream objects.
+  `suggested_save_name` replaces every separator and every character NTFS refuses, so the string
+  cannot be a path on any platform this ships to.
 - **One policy for every host path.** A source or destination whose path passes through a hidden
   folder (`~/.ssh`, `~/.cache`, `~/.local/share`, anything dot-prefixed) or a system location is
   refused, and the check is applied both to the path as written and to what it resolves to after
