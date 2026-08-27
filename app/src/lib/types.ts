@@ -77,6 +77,37 @@ export type ProjectStatus =
   | "stopping"
   | "error";
 
+/** What `removeProject` could not delete. The project is removed from the
+ *  sidebar either way. When `retry_scheduled` is true, anything named here
+ *  was recorded on the host and will be retried automatically the next time
+ *  the app starts; when false, the record itself could not be saved and
+ *  nothing will retry it. `retry_scheduled` is meaningless when nothing was
+ *  left behind. */
+export interface ProjectRemovalReport {
+  container: string | null;
+  image: string | null;
+  volumes: string[];
+  retry_scheduled: boolean;
+}
+
+/** True when a `ProjectRemovalReport` left nothing behind. Mirrors the
+ *  Rust-side `ProjectRemovalReport::is_clean`. */
+export function projectRemovalIsClean(report: ProjectRemovalReport): boolean {
+  return !report.container && !report.image && report.volumes.length === 0;
+}
+
+/** What Reset (`rebuildProjectContainer`) produced: the project as it stands
+ *  after restarting, and any volume Reset could not clear — which is reused
+ *  as-is by the new container instead of starting clean. */
+export interface ProjectResetOutcome {
+  project: Project;
+  /** The saved container image, if Reset could not remove it — the new
+   *  container is built from it whenever it exists, so this means Reset
+   *  silently rebuilt the system layer it was asked to discard. */
+  leftover_image: string | null;
+  leftover_volumes: string[];
+}
+
 export type Backend =
   | "anthropic"
   | "bedrock"

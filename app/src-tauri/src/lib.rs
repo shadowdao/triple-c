@@ -250,6 +250,7 @@ pub fn run() {
             // an image open and the sweep will not force; pins are untagged
             // second so the images they were holding are dangling by the time
             // the sweep lists them; the sweep runs last and collects both.
+            let projects_store_for_cleanup = projects_store_setup.clone();
             tauri::async_runtime::spawn(async move {
                 crate::docker::reap_probe_containers().await;
                 let reaped = crate::docker::reap_stale_migration_pins().await;
@@ -257,6 +258,15 @@ pub fn run() {
                     log::info!("Startup housekeeping dropped {} stale rollback pin(s)", reaped);
                 }
                 crate::docker::sweep_orphaned_snapshots_logged("startup").await;
+                // A container/image/volume `remove_project` could not delete
+                // is recorded rather than lost — see triple-c#31 — and this is
+                // the only place anything ever retries it. Takes the store so
+                // it can refuse to touch a project that turns out to still be
+                // live — see the long comment on the function itself.
+                crate::commands::project_commands::retry_pending_cleanup_logged(
+                    &projects_store_for_cleanup,
+                )
+                .await;
             });
 
             // Auto-start web terminal server if enabled in settings

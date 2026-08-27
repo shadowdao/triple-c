@@ -140,3 +140,27 @@ describe("useProjects puts the status back when a refused command never ran", ()
     expect(statusOf()).toBe("stopped");
   });
 });
+
+describe("useProjects.rebuild on success", () => {
+  it("puts the outcome's project, not the whole outcome, into the list", async () => {
+    const rebuilt = project("running");
+    rebuildProjectContainer.mockResolvedValue({
+      project: rebuilt,
+      leftover_image: null,
+      leftover_volumes: [],
+    });
+
+    const { result } = renderHook(() => useProjects());
+    let outcome!: Awaited<ReturnType<typeof result.current.rebuild>>;
+    await act(async () => {
+      outcome = await result.current.rebuild("p1");
+    });
+
+    // A regression here would put the `{ project, leftover_image,
+    // leftover_volumes }` wrapper into the projects list instead of the
+    // `Project` it wraps — a shape mismatch `tsc` would not catch inside a
+    // callback typed to take `unknown` per Tauri's `invoke`.
+    expect(useAppState.getState().projects.find((p) => p.id === "p1")).toEqual(rebuilt);
+    expect(outcome.leftover_volumes).toEqual([]);
+  });
+});

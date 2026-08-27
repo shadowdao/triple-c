@@ -44,8 +44,9 @@ export function useProjects() {
 
   const remove = useCallback(
     async (id: string) => {
-      await commands.removeProject(id);
+      const report = await commands.removeProject(id);
       removeProjectFromList(id);
+      return report;
     },
     [removeProjectFromList],
   );
@@ -135,9 +136,9 @@ export function useProjects() {
   const rebuild = useCallback(
     (id: string) =>
       withOptimisticStatus(id, "starting", async () => {
-        const updated = await commands.rebuildProjectContainer(id);
-        updateProjectInList(updated);
-        return updated;
+        const outcome = await commands.rebuildProjectContainer(id);
+        updateProjectInList(outcome.project);
+        return outcome;
       }),
     [updateProjectInList, withOptimisticStatus],
   );

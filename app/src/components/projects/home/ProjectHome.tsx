@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
+import { projectRemovalIsClean } from "../../../lib/types";
 import { useAppState } from "../../../store/appState";
 import { useProjectActions } from "../../../hooks/useProjectActions";
 import { useProjects } from "../../../hooks/useProjects";
@@ -18,6 +19,7 @@ import ConfigTab from "./ConfigTab";
 import FilesTab from "./FilesTab";
 import BrowserTab from "./BrowserTab";
 import { formatUptime } from "./format";
+import { describeLeftovers, leftoverPronoun, leftoverVerb } from "./removalReport";
 
 const TABS = [
   { id: "overview", label: "Overview" },
@@ -282,7 +284,25 @@ export default function ProjectHome({ projectId, active }: Props) {
           onConfirm={async () => {
             setConfirmRemove(false);
             try {
-              await remove(project.id);
+              const report = await remove(project.id);
+              if (!projectRemovalIsClean(report)) {
+                const verb = leftoverVerb(report);
+                if (report.retry_scheduled) {
+                  useAppState.getState().pushToast({
+                    kind: "info",
+                    message: `“${project.name}” was removed, but Triple-C could not confirm all its Docker resources were removed`,
+                    detail: `Triple-C could not confirm ${describeLeftovers(report)} ${verb} removed. It will check again the next time it starts.`,
+                  });
+                } else {
+                  // The pending-cleanup record itself failed to save — no
+                  // retry will happen, so this must not promise one.
+                  useAppState.getState().pushToast({
+                    kind: "error",
+                    message: `“${project.name}” was removed, but Triple-C could not confirm its Docker resources were removed`,
+                    detail: `Triple-C could not confirm ${describeLeftovers(report)} ${verb} removed, and could not record this for a retry. You may need to remove ${leftoverPronoun(report)} manually (\`docker rm\` / \`docker rmi\` / \`docker volume rm\`).`,
+                  });
+                }
+              }
             } catch (e) {
               useAppState.getState().pushToast({
                 kind: "error",

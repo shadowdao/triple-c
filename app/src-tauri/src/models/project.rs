@@ -422,6 +422,61 @@ pub enum ProjectStatus {
     Error,
 }
 
+/// What `remove_project` could not delete, named so the UI can say so instead
+/// of reporting a clean removal that was not one.
+///
+/// The project record is dropped from `projects.json` regardless — see the
+/// long comment on `remove_project` for why refusing is not the answer — but
+/// anything named here is also written to a pending-cleanup record that
+/// startup housekeeping retries, so it stays reachable after the project it
+/// belonged to no longer exists.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct ProjectRemovalReport {
+    /// The project's container, if it could not be removed. Named by its
+    /// deterministic `triple-c-{id}` name (see `Project::container_name`),
+    /// not the container id, since the id can be stale or absent and the
+    /// name is what a later retry can still resolve.
+    pub container: Option<String>,
+    /// The `triple-c-snapshot-{id}` image, if it could not be removed.
+    pub image: Option<String>,
+    /// Named volumes (home, claude config) that could not be removed.
+    pub volumes: Vec<String>,
+    /// True once the leftovers above were durably recorded for automatic
+    /// retry on the next launch. False means the pending-cleanup record
+    /// itself could not be written — nothing will retry these, and the UI
+    /// must say so rather than promising a retry that will not happen.
+    /// Meaningless (and left at its default) when `is_clean()` is true.
+    pub retry_scheduled: bool,
+}
+
+impl ProjectRemovalReport {
+    /// True when nothing was left behind.
+    pub fn is_clean(&self) -> bool {
+        self.container.is_none() && self.image.is_none() && self.volumes.is_empty()
+    }
+}
+
+/// What `rebuild_project_container` (Reset) produced: the project as it
+/// stands after restarting, and anything Reset could not clear.
+///
+/// Reset's contract is "back to a clean base image", so a leftover volume or
+/// image here is reused/rebuilt-from as-is by the container this creates —
+/// the opposite of what was asked for — and unlike [`ProjectRemovalReport`]
+/// there is no pending-cleanup record for either: the project id survives
+/// Reset, so a later Reset attempt can retry them itself.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectResetOutcome {
+    pub project: Project,
+    /// The `triple-c-snapshot-{id}` image, if Reset could not remove it. The
+    /// more serious of the two leftovers here: the new container is created
+    /// from this image whenever it exists, so a surviving image means Reset
+    /// silently rebuilt the exact system layer it was asked to discard.
+    pub leftover_image: Option<String>,
+    /// Volumes that survived Reset and were mounted into the new container
+    /// unchanged.
+    pub leftover_volumes: Vec<String>,
+}
+
 /// Which AI model backend/provider the project uses.
 /// - `Anthropic`: Direct Anthropic API (user runs `claude login` inside the container)
 /// - `Bedrock`: AWS Bedrock with per-project AWS credentials
@@ -649,6 +704,25 @@ impl Project {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── ProjectRemovalReport ────────────────────────────────────────────────
+
+    #[test]
+    fn a_report_is_clean_only_with_nothing_left_behind() {
+        assert!(ProjectRemovalReport::default().is_clean());
+
+        let mut r = ProjectRemovalReport::default();
+        r.container = Some("abc123".to_string());
+        assert!(!r.is_clean(), "a leftover container must not read as clean");
+
+        let mut r = ProjectRemovalReport::default();
+        r.image = Some("triple-c-snapshot-x:latest".to_string());
+        assert!(!r.is_clean(), "a leftover image must not read as clean");
+
+        let mut r = ProjectRemovalReport::default();
+        r.volumes.push("triple-c-home-x".to_string());
+        assert!(!r.is_clean(), "a leftover volume must not read as clean");
+    }
 
     // ── Custom environment variable names ─────────────────────────────────
 
