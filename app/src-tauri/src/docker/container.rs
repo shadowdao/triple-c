@@ -3585,7 +3585,7 @@ pub async fn remove_volumes_by_name(names: &[String]) -> Vec<String> {
 
     let mut leftover = Vec::new();
     for vol in names {
-        match docker.remove_volume(vol, None).await {
+        match remove_one_volume_with_retry(&docker, vol).await {
             Ok(_) => log::info!("Removed volume {}", vol),
             Err(bollard::errors::Error::DockerResponseServerError {
                 status_code: 404, ..
@@ -3597,6 +3597,28 @@ pub async fn remove_volumes_by_name(names: &[String]) -> Vec<String> {
         }
     }
     leftover
+}
+
+/// Remove one volume, retrying once after a short delay on a 409 ("volume is
+/// in use"). Docker releasing a volume's mount reference after the container
+/// using it is removed is not always instantaneous, so the very first call
+/// site of this — `remove_project`, whose container removal lands
+/// immediately before its volume removal — could otherwise turn an ordinary
+/// race into a permanent pending-cleanup record and an alarming toast for
+/// something that would have cleared itself half a second later.
+async fn remove_one_volume_with_retry(
+    docker: &bollard::Docker,
+    name: &str,
+) -> Result<(), bollard::errors::Error> {
+    match docker.remove_volume(name, None).await {
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 409, ..
+        }) => {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            docker.remove_volume(name, None).await
+        }
+        other => other,
+    }
 }
 
 /// Check whether the existing container's configuration still matches the

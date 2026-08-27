@@ -28,13 +28,14 @@ export function useProjectActions(project: Project) {
   );
 
   const run = useCallback(
-    async (label: string, fn: () => Promise<unknown>) => {
+    async <T,>(label: string, fn: () => Promise<T>): Promise<T | undefined> => {
       setBusy(true);
       setContainerProgress(project.id, null);
       try {
-        await fn();
+        return await fn();
       } catch (e) {
         fail(`${label} failed for “${project.name}”`, e);
+        return undefined;
       } finally {
         setContainerProgress(project.id, null);
         setBusy(false);
@@ -54,8 +55,22 @@ export function useProjectActions(project: Project) {
   );
 
   const handleReset = useCallback(
-    () => run("Reset", () => rebuild(project.id)),
-    [run, rebuild, project.id],
+    () =>
+      run("Reset", async () => {
+        const outcome = await rebuild(project.id);
+        if (outcome.leftover_volumes.length > 0) {
+          const n = outcome.leftover_volumes.length;
+          pushToast({
+            kind: "error",
+            message: `Reset for “${project.name}” could not fully clean up`,
+            detail: `${n === 1 ? "A volume" : `${n} volumes`} could not be removed, so the new \
+container may still contain data from before the reset. You may need to remove ${n === 1 ? "it" : "them"} \
+manually with \`docker volume rm\`.`,
+          });
+        }
+        return outcome;
+      }),
+    [run, rebuild, project.id, project.name, pushToast],
   );
 
   const openClaudeTerminal = useCallback(async () => {

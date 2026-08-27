@@ -10,13 +10,21 @@
 //! `commands::project_commands::retry_pending_cleanup_logged`) and deletes
 //! the ones that fully succeed.
 //!
-//! Same write-temp-then-rename shape as `projects.json` and the migration
-//! store, and the same per-project-file layout as
-//! `storage::migration_store` — a stuck cleanup record for one project must
-//! never block the retry of another's.
+//! **This record is written in the same instant its record in `projects.json`
+//! is destroyed, and it is the only remaining handle on the leftover
+//! resource** — which is a stronger claim on durability than an ordinary
+//! write-temp-then-rename gives. `storage::migration_store::save` carries the
+//! same reasoning for the migration state file: `fs::write` returns once the
+//! bytes are in the page cache, and a rename over them is atomic with respect
+//! to other readers, not to power loss. A crash in that window leaves the
+//! rename applied and the data half-written, which [`list`] then treats as
+//! unparseable and skips — reproducing the exact bug this module exists to
+//! close, silently, with only a startup log line as evidence. So `save` here
+//! takes the same `File::create` → `write_all` → `sync_all` → `rename` →
+//! directory-sync shape `migration_store` does.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +35,11 @@ pub struct PendingCleanup {
     /// second lookup — the project record itself is already gone by the time
     /// this is read back.
     pub project_name: String,
+    /// The project's container, if it could not be removed. Named by its
+    /// deterministic `triple-c-{id}` name rather than the (possibly stale)
+    /// container id Docker handed out — Docker's remove-container API
+    /// accepts either, and the name is the one identifier guaranteed to still
+    /// resolve to the same container by the time a retry runs.
     pub container_id: Option<String>,
     pub image: Option<String>,
     pub volumes: Vec<String>,
@@ -63,29 +76,15 @@ fn sanitize(project_id: &str) -> String {
         .collect()
 }
 
-fn path_for(project_id: &str) -> Result<PathBuf, String> {
-    Ok(dir()?.join(format!("{}.json", sanitize(project_id))))
-}
-
 /// Write (or overwrite) a project's pending-cleanup record.
 pub fn save(record: &PendingCleanup) -> Result<(), String> {
-    let path = path_for(&record.project_id)?;
-    let data = serde_json::to_string_pretty(record)
-        .map_err(|e| format!("Failed to serialize pending cleanup record: {}", e))?;
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, data).map_err(|e| format!("Failed to write pending cleanup record: {}", e))?;
-    fs::rename(&tmp, &path).map_err(|e| format!("Failed to commit pending cleanup record: {}", e))
+    save_in(&dir()?, record)
 }
 
 /// Remove a project's pending-cleanup record. Missing is success — this is
 /// how a fully-succeeded retry (or a record that never existed) is expressed.
 pub fn clear(project_id: &str) -> Result<(), String> {
-    let path = path_for(project_id)?;
-    match fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("Failed to remove pending cleanup record: {}", e)),
-    }
+    clear_in(&dir()?, project_id)
 }
 
 /// Every pending-cleanup record on disk. An unparseable file is logged and
@@ -93,7 +92,50 @@ pub fn clear(project_id: &str) -> Result<(), String> {
 /// "one bad record can't wedge the rest" reasoning as the migration store.
 pub fn list() -> Vec<PendingCleanup> {
     let Ok(dir) = dir() else { return Vec::new() };
-    let Ok(entries) = fs::read_dir(&dir) else { return Vec::new() };
+    list_in(&dir)
+}
+
+fn path_in(dir: &Path, project_id: &str) -> PathBuf {
+    dir.join(format!("{}.json", sanitize(project_id)))
+}
+
+/// Durable write: fsync the file before the rename, and fsync the directory
+/// after it — see the module doc comment for why a plain
+/// write-temp-then-rename is not enough here. Mirrors
+/// `storage::migration_store::save`/`sync_dir`.
+fn save_in(dir: &Path, record: &PendingCleanup) -> Result<(), String> {
+    let path = path_in(dir, &record.project_id);
+    let data = serde_json::to_string_pretty(record)
+        .map_err(|e| format!("Failed to serialize pending cleanup record: {}", e))?;
+    let tmp = path.with_extension("json.tmp");
+
+    {
+        use std::io::Write;
+        let mut file = fs::File::create(&tmp)
+            .map_err(|e| format!("Failed to write pending cleanup record: {}", e))?;
+        file.write_all(data.as_bytes())
+            .map_err(|e| format!("Failed to write pending cleanup record: {}", e))?;
+        file.sync_all()
+            .map_err(|e| format!("Failed to flush pending cleanup record to disk: {}", e))?;
+    }
+
+    fs::rename(&tmp, &path)
+        .map_err(|e| format!("Failed to commit pending cleanup record: {}", e))?;
+    sync_dir(&path);
+    Ok(())
+}
+
+fn clear_in(dir: &Path, project_id: &str) -> Result<(), String> {
+    let path = path_in(dir, project_id);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("Failed to remove pending cleanup record: {}", e)),
+    }
+}
+
+fn list_in(dir: &Path) -> Vec<PendingCleanup> {
+    let Ok(entries) = fs::read_dir(dir) else { return Vec::new() };
 
     entries
         .flatten()
@@ -116,28 +158,50 @@ pub fn list() -> Vec<PendingCleanup> {
         .collect()
 }
 
+/// fsync the directory holding `path`, so a rename into it survives power
+/// loss. Best effort only on the platforms where it is meaningless: Windows
+/// has no directory handle to sync and errors on the attempt, so failure is
+/// logged rather than propagated — the file's own `sync_all` above is what
+/// carries the data. Mirrors `storage::migration_store::sync_dir`, which is
+/// private to that module, so this is a small deliberate duplicate rather
+/// than a shared dependency between two otherwise-independent stores.
+fn sync_dir(path: &Path) {
+    let Some(dir) = path.parent() else { return };
+    match fs::File::open(dir).and_then(|d| d.sync_all()) {
+        Ok(()) => {}
+        Err(e) => log::debug!(
+            "Could not fsync the pending-cleanup directory {}: {} — the record itself was flushed",
+            dir.display(),
+            e
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn temp_data_dir(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("triple-c-pending-cleanup-{}-{}", name, uuid::Uuid::new_v4().simple()))
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "triple-c-pending-cleanup-{}-{}",
+            name,
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     fn record(project_id: &str) -> PendingCleanup {
         PendingCleanup {
             project_id: project_id.to_string(),
             project_name: "Some Project".to_string(),
-            container_id: Some("abc123".to_string()),
+            container_id: Some("triple-c-abc".to_string()),
             image: Some("triple-c-snapshot-abc:latest".to_string()),
             volumes: vec!["triple-c-home-abc".to_string()],
             recorded_at: "2026-08-25T00:00:00Z".to_string(),
         }
     }
 
-    /// `list`/`save`/`clear` go through `dirs::data_dir()`, so these exercise
-    /// the pure parts directly against a temp directory rather than the real
-    /// one — same approach `migration_store`'s tests take for `sanitize`.
     #[test]
     fn project_ids_cannot_escape_the_pending_cleanup_directory() {
         assert_eq!(sanitize("../../etc/passwd"), "______etc_passwd");
@@ -161,26 +225,43 @@ mod tests {
         assert!(r.is_empty());
     }
 
-    /// Save-then-list-then-clear against a real (temp) directory, bypassing
-    /// `dir()`'s hardcoded `dirs::data_dir()` join by writing/reading the
-    /// files directly the way `save`/`list` do internally.
+    /// Exercises the real `save_in`/`list_in`/`clear_in` — not a
+    /// re-implementation of their bodies — against a temp directory standing
+    /// in for `dir()`.
     #[test]
     fn a_saved_record_round_trips_and_clearing_removes_it() {
-        let dir = temp_data_dir("roundtrip");
-        fs::create_dir_all(&dir).unwrap();
+        let dir = temp_dir("roundtrip");
         let rec = record("proj-1");
-        let path = dir.join(format!("{}.json", sanitize(&rec.project_id)));
 
-        let data = serde_json::to_string_pretty(&rec).unwrap();
-        fs::write(&path, data).unwrap();
+        save_in(&dir, &rec).expect("save");
+        let found = list_in(&dir);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].project_id, "proj-1");
+        assert_eq!(found[0].volumes, vec!["triple-c-home-abc".to_string()]);
 
-        let loaded: PendingCleanup =
-            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(loaded.project_id, "proj-1");
-        assert_eq!(loaded.volumes, vec!["triple-c-home-abc".to_string()]);
+        clear_in(&dir, "proj-1").expect("clear");
+        assert!(list_in(&dir).is_empty());
 
-        fs::remove_file(&path).unwrap();
-        assert!(!path.exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A second `save` for the same project overwrites rather than appending
+    /// — a retry that narrows the leftovers must not leave the old, wider
+    /// record behind it.
+    #[test]
+    fn saving_the_same_project_twice_overwrites_not_appends() {
+        let dir = temp_dir("overwrite");
+        let mut rec = record("proj-1");
+        save_in(&dir, &rec).expect("save");
+
+        rec.container_id = None;
+        rec.image = None;
+        save_in(&dir, &rec).expect("save again");
+
+        let found = list_in(&dir);
+        assert_eq!(found.len(), 1, "one file per project, not one per save");
+        assert!(found[0].container_id.is_none());
+        assert_eq!(found[0].volumes, vec!["triple-c-home-abc".to_string()]);
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -188,29 +269,43 @@ mod tests {
     /// A record that fails to parse must not poison the rest of the listing.
     #[test]
     fn an_unparseable_record_is_skipped_not_fatal() {
-        let dir = temp_data_dir("corrupt");
-        fs::create_dir_all(&dir).unwrap();
+        let dir = temp_dir("corrupt");
         fs::write(dir.join("bad.json"), "{ not json").unwrap();
-        let good = record("proj-2");
-        fs::write(
-            dir.join("proj-2.json"),
-            serde_json::to_string_pretty(&good).unwrap(),
-        )
-        .unwrap();
+        save_in(&dir, &record("proj-2")).expect("save");
 
-        let mut found = Vec::new();
-        for entry in fs::read_dir(&dir).unwrap().flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "json") {
-                if let Ok(data) = fs::read_to_string(&path) {
-                    if let Ok(r) = serde_json::from_str::<PendingCleanup>(&data) {
-                        found.push(r);
-                    }
-                }
-            }
-        }
+        let found = list_in(&dir);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].project_id, "proj-2");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `list_in` must not pick up the `.json.tmp` staging file `save_in`
+    /// leaves behind if a crash lands between the write and the rename — the
+    /// whole point of the temp-then-rename dance is that only the renamed
+    /// file is ever a complete record.
+    #[test]
+    fn a_leftover_tmp_file_is_not_listed() {
+        let dir = temp_dir("tmp-leftover");
+        fs::write(dir.join("proj-3.json.tmp"), "not a complete record").unwrap();
+        assert!(list_in(&dir).is_empty());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Clearing by project id must remove exactly the file that id maps to
+    /// under `sanitize`, and nothing else.
+    #[test]
+    fn clearing_one_project_does_not_touch_another() {
+        let dir = temp_dir("clear-scoped");
+        save_in(&dir, &record("proj-a")).unwrap();
+        save_in(&dir, &record("proj-b")).unwrap();
+
+        clear_in(&dir, "proj-a").unwrap();
+
+        let found = list_in(&dir);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].project_id, "proj-b");
 
         fs::remove_dir_all(&dir).ok();
     }

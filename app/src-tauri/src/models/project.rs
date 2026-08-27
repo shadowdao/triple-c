@@ -432,12 +432,21 @@ pub enum ProjectStatus {
 /// belonged to no longer exists.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ProjectRemovalReport {
-    /// The project's container, if it could not be removed.
+    /// The project's container, if it could not be removed. Named by its
+    /// deterministic `triple-c-{id}` name (see `Project::container_name`),
+    /// not the container id, since the id can be stale or absent and the
+    /// name is what a later retry can still resolve.
     pub container: Option<String>,
     /// The `triple-c-snapshot-{id}` image, if it could not be removed.
     pub image: Option<String>,
     /// Named volumes (home, claude config) that could not be removed.
     pub volumes: Vec<String>,
+    /// True once the leftovers above were durably recorded for automatic
+    /// retry on the next launch. False means the pending-cleanup record
+    /// itself could not be written — nothing will retry these, and the UI
+    /// must say so rather than promising a retry that will not happen.
+    /// Meaningless (and left at its default) when `is_clean()` is true.
+    pub retry_scheduled: bool,
 }
 
 impl ProjectRemovalReport {
@@ -445,6 +454,22 @@ impl ProjectRemovalReport {
     pub fn is_clean(&self) -> bool {
         self.container.is_none() && self.image.is_none() && self.volumes.is_empty()
     }
+}
+
+/// What `rebuild_project_container` (Reset) produced: the project as it
+/// stands after restarting, and any volume Reset could not clear.
+///
+/// Reset's contract is "back to a clean base image", so a leftover volume
+/// here is reused as-is by the container this creates — the opposite of what
+/// was asked for — and unlike [`ProjectRemovalReport`] there is no
+/// pending-cleanup record for it: the project id survives Reset, so a later
+/// Reset attempt can retry the same volume itself.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectResetOutcome {
+    pub project: Project,
+    /// Volumes that survived Reset and were mounted into the new container
+    /// unchanged.
+    pub leftover_volumes: Vec<String>,
 }
 
 /// Which AI model backend/provider the project uses.

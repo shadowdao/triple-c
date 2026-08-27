@@ -2,7 +2,7 @@ use tauri::{Emitter, State};
 
 use crate::commands::aws_commands;
 use crate::docker;
-use crate::models::{container_config, AppSettings, Backend, BedrockAuthMethod, Project, ProjectPath, ProjectRemovalReport, ProjectStatus};
+use crate::models::{container_config, AppSettings, Backend, BedrockAuthMethod, Project, ProjectPath, ProjectRemovalReport, ProjectResetOutcome, ProjectStatus};
 use crate::storage::secure;
 use crate::AppState;
 
@@ -730,7 +730,21 @@ pub async fn remove_project(
     let existing_project = state.projects_store.get(&project_id);
 
     if let Some(ref project) = existing_project {
-        if let Some(ref container_id) = project.container_id {
+        // `project.container_id` can be `None` or stale — a crash between
+        // creating a container and persisting its id is the same race every
+        // other destroyer of a project's container already guards against
+        // with `find_existing_container` (`start_project_container`,
+        // migration's recreate paths). Removal is the one place that
+        // mattered least before this fix, because a container `remove_project`
+        // missed just sat there; now a miss here poisons the volume removal
+        // right after it (Docker refuses to delete a volume a container still
+        // references) and mints a pending-cleanup record for volumes with no
+        // way to name the container actually blocking them.
+        let container_ref = match &project.container_id {
+            Some(id) => Some(id.clone()),
+            None => docker::find_existing_container(project).await.ok().flatten(),
+        };
+        if let Some(ref container_id) = container_ref {
             state.exec_manager.close_sessions_for_container(container_id).await;
             let _ = docker::stop_container(container_id).await;
             if let Err(e) = docker::remove_container(container_id).await {
@@ -738,7 +752,11 @@ pub async fn remove_project(
                     "Failed to remove container {} for project {}: {}",
                     container_id, project_id, e
                 );
-                report.container = Some(container_id.clone());
+                // Recorded by name, not id: the name is the stable handle a
+                // later retry can still resolve (Docker's remove-container
+                // call accepts either), and it is what `container_ref` above
+                // falls back to finding in the first place.
+                report.container = Some(project.container_name());
             }
         }
 
@@ -770,17 +788,23 @@ pub async fn remove_project(
             recorded_at: chrono::Utc::now().to_rfc3339(),
         };
         match crate::storage::pending_cleanup::save(&record) {
-            Ok(()) => log::warn!(
-                "Project {} removed with Docker resources still present: {:?} — recorded for \
-                 automatic retry on next launch",
-                project_id, report
-            ),
-            Err(e) => log::error!(
-                "Project {} removed with Docker resources still present ({:?}), and the \
-                 pending-cleanup record could not be written ({}) — nothing will retry removing \
-                 them",
-                project_id, report, e
-            ),
+            Ok(()) => {
+                report.retry_scheduled = true;
+                log::warn!(
+                    "Project {} removed with Docker resources still present: {:?} — recorded for \
+                     automatic retry on next launch",
+                    project_id, report
+                );
+            }
+            Err(e) => {
+                report.retry_scheduled = false;
+                log::error!(
+                    "Project {} removed with Docker resources still present ({:?}), and the \
+                     pending-cleanup record could not be written ({}) — nothing will retry \
+                     removing them",
+                    project_id, report, e
+                );
+            }
         }
     }
 
@@ -852,6 +876,26 @@ pub async fn retry_pending_cleanup_logged() {
             cleaned += 1;
         } else {
             still_pending += 1;
+            // `recorded_at` is otherwise write-only — nothing read it back,
+            // which is exactly the shape `storage::migration_store` calls out
+            // as a bug in its own history ("nothing ever removed them"). A
+            // record that has failed every retry for a week is no longer
+            // routine: escalate the log level so it is not indistinguishable
+            // from one seen for the first time.
+            let age = chrono::DateTime::parse_from_rfc3339(&record.recorded_at)
+                .ok()
+                .map(|t| chrono::Utc::now().signed_duration_since(t.with_timezone(&chrono::Utc)));
+            match age {
+                Some(age) if age > chrono::Duration::days(PENDING_CLEANUP_STALE_AFTER_DAYS) => {
+                    log::error!(
+                        "Pending cleanup for project {} ({}) has not succeeded in over {} days: \
+                         {:?} — this may need a manual `docker volume rm` / `docker rmi` / \
+                         `docker rm`",
+                        record.project_id, record.project_name, PENDING_CLEANUP_STALE_AFTER_DAYS, record
+                    );
+                }
+                _ => {}
+            }
             if let Err(e) = crate::storage::pending_cleanup::save(&record) {
                 log::warn!(
                     "Could not update pending cleanup record for project {} ({}): {}",
@@ -866,6 +910,11 @@ pub async fn retry_pending_cleanup_logged() {
         cleaned, still_pending
     );
 }
+
+/// After this many days of a pending-cleanup record failing every retry,
+/// `retry_pending_cleanup_logged` escalates its log line from `warn` to
+/// `error` — see the comment at its call site.
+const PENDING_CLEANUP_STALE_AFTER_DAYS: i64 = 7;
 
 #[tauri::command]
 pub async fn update_project(
@@ -1341,7 +1390,7 @@ pub async fn rebuild_project_container(
     project_id: String,
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
-) -> Result<Project, String> {
+) -> Result<ProjectResetOutcome, String> {
     // Reset deletes both volumes and the snapshot image. Doing that while a
     // migration is mid-flight pulls the ground out from under it and leaves an
     // orphan migration record pointing at images that no longer exist — and
@@ -1368,8 +1417,16 @@ pub async fn rebuild_project_container(
     // `start_project_container` below re-arms it against the new one.
     state.auth_bridge.stop(&project_id).await;
 
-    // Remove existing container
-    if let Some(ref container_id) = project.container_id {
+    // Remove existing container. Resolved the same way `remove_project` now
+    // is — `project.container_id` can be `None` or stale — because a
+    // container this misses blocks the volume removal immediately below with
+    // a 409, and Reset silently keeping the old volumes is exactly the bug
+    // this whole change is closing.
+    let container_ref = match &project.container_id {
+        Some(id) => Some(id.clone()),
+        None => docker::find_existing_container(&project).await.ok().flatten(),
+    };
+    if let Some(ref container_id) = container_ref {
         state.exec_manager.close_sessions_for_container(container_id).await;
         let _ = docker::stop_container(container_id).await;
         docker::remove_container(container_id).await?;
@@ -1397,7 +1454,8 @@ pub async fn rebuild_project_container(
 
     // Start fresh. The locked variant, because `_guard` above is this project's
     // claim and the public command would be refused by it.
-    start_project_container_locked(project_id, app_handle, state).await
+    let project = start_project_container_locked(project_id, app_handle, state).await?;
+    Ok(ProjectResetOutcome { project, leftover_volumes })
 }
 
 /// Reconcile project statuses against actual Docker container state.
