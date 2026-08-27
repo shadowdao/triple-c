@@ -1554,3 +1554,9 @@ cp ~/.claude.json ~/.claude.json.bak && jq 'with_entries(select(.key | startswit
 ```
 
 This backs up your config and removes the corrupted marketplace entries. Claude Code will re-download them cleanly on the next startup.
+
+### App Icon Missing After Installing (Linux)
+
+If Triple-C's icon shows as generic or blank right after installing — in the app menu, taskbar, and window titlebar alike — **log out and back in.**
+
+Desktop shells (GNOME Shell, KDE Plasma) cache the list of installed apps and their resolved icons in memory when the shell starts, for performance. A freshly installed package's icon files land on disk correctly and its install hooks do rebuild the on-disk icon cache, but an already-running shell doesn't always notice — on X11 there used to be a way to soft-restart just the shell (GNOME's Alt+F2 → `r`) to force a reload, but under Wayland the shell *is* the compositor, so restarting it means ending the session. Logging out and back in starts a fresh shell that reads the current on-disk state, which picks the icon up.
