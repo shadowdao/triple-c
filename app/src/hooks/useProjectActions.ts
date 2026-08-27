@@ -3,6 +3,7 @@ import { save } from "@tauri-apps/plugin-dialog";
 import type { Project } from "../lib/types";
 import * as commands from "../lib/tauri-commands";
 import { formatBytes } from "../lib/formatBytes";
+import { describeResetLeftovers, resetLeftoverPronoun } from "../lib/resetOutcome";
 import { useAppState } from "../store/appState";
 import { useProjects } from "./useProjects";
 import { useTerminal } from "./useTerminal";
@@ -58,12 +59,7 @@ export function useProjectActions(project: Project) {
     () =>
       run("Reset", async () => {
         const outcome = await rebuild(project.id);
-        const { leftover_image, leftover_volumes } = outcome;
-        if (leftover_image || leftover_volumes.length > 0) {
-          const parts: string[] = [];
-          if (leftover_image) parts.push("its previous container image");
-          if (leftover_volumes.length === 1) parts.push("a volume");
-          else if (leftover_volumes.length > 1) parts.push(`${leftover_volumes.length} volumes`);
+        if (outcome.leftover_image || outcome.leftover_volumes.length > 0) {
           // Not "run `docker volume rm`" — by the time this renders, the new
           // container this same call just started already has the leftover
           // volume mounted, so that command would just hit the same 409
@@ -71,9 +67,9 @@ export function useProjectActions(project: Project) {
           pushToast({
             kind: "error",
             message: `Reset for “${project.name}” did not fully clean up`,
-            detail: `Triple-C could not remove ${parts.join(" and ")} from before the reset, so \
+            detail: `Triple-C could not remove ${describeResetLeftovers(outcome)} from before the reset, so \
 the new container may still be built from, or contain, old data. Stop the project, then try \
-Reset again, or remove ${parts.length > 1 ? "them" : "it"} manually once stopped.`,
+Reset again, or remove ${resetLeftoverPronoun(outcome)} manually once stopped.`,
           });
         }
         return outcome;

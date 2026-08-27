@@ -751,6 +751,20 @@ pub async fn remove_project(
         // `remove_volumes_by_name`'s fail-closed handling of the same
         // situation — the alternative silently drops the one resource most
         // likely to block everything else if it does exist.
+        //
+        // Exec sessions are closed for `project.container_id` unconditionally,
+        // before the lookup above and regardless of whether it succeeds —
+        // that is host-side state with no Docker dependency, so it must not
+        // wait on a daemon that might not answer. Resolving through
+        // `find_existing_container` instead of using it directly would leave
+        // these open in exactly the two cases this whole change exists to
+        // handle: Docker unreachable (no id resolved, no way to ever close
+        // them again once the project record is gone) and the stale-id race
+        // (sessions were opened against the container that actually exists,
+        // which is what gets resolved below, not the stored id).
+        if let Some(ref stored_id) = project.container_id {
+            state.exec_manager.close_sessions_for_container(stored_id).await;
+        }
         let container_ref = match docker::find_existing_container(project).await {
             Ok(found) => found,
             Err(e) => {
@@ -763,7 +777,9 @@ pub async fn remove_project(
             }
         };
         if let Some(ref container_id) = container_ref {
-            state.exec_manager.close_sessions_for_container(container_id).await;
+            if project.container_id.as_deref() != Some(container_id.as_str()) {
+                state.exec_manager.close_sessions_for_container(container_id).await;
+            }
             let _ = docker::stop_container(container_id).await;
             if let Err(e) = docker::remove_container(container_id).await {
                 log::warn!(
@@ -832,9 +848,24 @@ pub async fn remove_project(
     // record would tell startup housekeeping to delete its container and
     // volumes out from under it. Roll the record back rather than leaving
     // that mismatch for the retry to discover the hard way.
+    //
+    // This is a second, narrower line of defence, not the only one — a crash
+    // between the `save` above and the `remove` below leaves exactly the same
+    // mismatch with no error for either side to catch, which is why
+    // `retry_pending_cleanup_logged` also refuses to act on a record whose
+    // project is still listed in `projects.json`. Belt and suspenders: a
+    // caught failure here is handled immediately rather than waiting for the
+    // next launch to notice.
     if let Err(e) = state.projects_store.remove(&project_id) {
         if !report.is_clean() {
-            let _ = crate::storage::pending_cleanup::clear(&project_id);
+            if let Err(clear_err) = crate::storage::pending_cleanup::clear(&project_id) {
+                log::error!(
+                    "Project {} was not removed ({}), and its pending-cleanup record could not \
+                     be rolled back either ({}) — it will name this still-live project until \
+                     startup housekeeping's own guard clears it",
+                    project_id, e, clear_err
+                );
+            }
         }
         return Err(e);
     }
@@ -853,7 +884,21 @@ pub async fn remove_project(
 /// reasoning), so there is no IPC contract to keep. A record that still has
 /// leftovers after this is written back so the next run does not lose track
 /// of what changed; one that is now empty is deleted.
-pub async fn retry_pending_cleanup_logged() {
+///
+/// Takes the `ProjectsStore` so it can refuse to touch a project that is
+/// still live: `remove_project` writes a pending-cleanup record durably
+/// (fsync'd) *before* it asks the store to drop the project, and that
+/// store write is a plain `fs::write` with no fsync of its own. A crash or
+/// power loss in the gap between the two — or the store write failing
+/// outright, on top of the round-2 fix that only rolls the record back when
+/// that failure is caught in-process — can leave a record on disk pointing
+/// at a project `projects.json` still lists. Without this check, the very
+/// first retry after such a crash deletes that project's container,
+/// snapshot image and *both volumes, including the one holding the OAuth
+/// credential and every session transcript*, out from under a project the
+/// user still sees in the sidebar. A record whose project still exists is
+/// therefore always stale — cleared without touching Docker, not retried.
+pub async fn retry_pending_cleanup_logged(projects_store: &crate::storage::projects_store::ProjectsStore) {
     let records = crate::storage::pending_cleanup::list();
     if records.is_empty() {
         return;
@@ -863,6 +908,23 @@ pub async fn retry_pending_cleanup_logged() {
     let mut still_pending = 0usize;
 
     for mut record in records {
+        if projects_store.get(&record.project_id).is_some() {
+            log::warn!(
+                "Pending cleanup record for project {} ({}) names a project that still exists — \
+                 clearing the record without touching Docker rather than risk deleting a live \
+                 project's resources",
+                record.project_id, record.project_name
+            );
+            if let Err(e) = crate::storage::pending_cleanup::clear(&record.project_id) {
+                log::error!(
+                    "Could not clear the stale pending-cleanup record for still-live project {} \
+                     ({}): {}",
+                    record.project_id, record.project_name, e
+                );
+            }
+            continue;
+        }
+
         if let Some(container_id) = record.container_id.take() {
             match docker::remove_container(&container_id).await {
                 Ok(()) => {}
@@ -1472,9 +1534,17 @@ pub async fn rebuild_project_container(
     // handling of the same lookup failing, `?` here aborts Reset outright:
     // every step after this one needs Docker too, so there is no useful
     // partial progress to make without it.
+    // Closed for the stored id unconditionally, then again for the resolved
+    // one if it differs — see the matching comment in `remove_project` for
+    // why the stale-id race can leave sessions open under either identity.
+    if let Some(ref stored_id) = project.container_id {
+        state.exec_manager.close_sessions_for_container(stored_id).await;
+    }
     let container_ref = docker::find_existing_container(&project).await?;
     if let Some(ref container_id) = container_ref {
-        state.exec_manager.close_sessions_for_container(container_id).await;
+        if project.container_id.as_deref() != Some(container_id.as_str()) {
+            state.exec_manager.close_sessions_for_container(container_id).await;
+        }
         let _ = docker::stop_container(container_id).await;
         docker::remove_container(container_id).await?;
         state.projects_store.set_container_id(&project_id, None)?;

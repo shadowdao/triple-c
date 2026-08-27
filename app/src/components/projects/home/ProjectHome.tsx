@@ -19,7 +19,7 @@ import ConfigTab from "./ConfigTab";
 import FilesTab from "./FilesTab";
 import BrowserTab from "./BrowserTab";
 import { formatUptime } from "./format";
-import { describeLeftovers, leftoverVerb } from "./removalReport";
+import { describeLeftovers, leftoverPronoun, leftoverVerb } from "./removalReport";
 
 const TABS = [
   { id: "overview", label: "Overview" },
@@ -299,7 +299,7 @@ export default function ProjectHome({ projectId, active }: Props) {
                   useAppState.getState().pushToast({
                     kind: "error",
                     message: `“${project.name}” was removed, but Triple-C could not confirm its Docker resources were removed`,
-                    detail: `Triple-C could not confirm ${describeLeftovers(report)} ${verb} removed, and could not record this for a retry. You may need to remove them manually (\`docker rm\` / \`docker rmi\` / \`docker volume rm\`).`,
+                    detail: `Triple-C could not confirm ${describeLeftovers(report)} ${verb} removed, and could not record this for a retry. You may need to remove ${leftoverPronoun(report)} manually (\`docker rm\` / \`docker rmi\` / \`docker volume rm\`).`,
                   });
                 }
               }

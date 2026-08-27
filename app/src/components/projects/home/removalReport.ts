@@ -18,9 +18,22 @@ export function describeLeftovers(report: ProjectRemovalReport): string {
   return parts.join(", ");
 }
 
+/** How many distinct things `describeLeftovers` is describing — a container
+ *  and an image each count as one, however many volumes are named. Shared by
+ *  `leftoverVerb` and `leftoverPronoun` so the two can never disagree about
+ *  singular vs. plural. */
+function leftoverCount(report: ProjectRemovalReport): number {
+  return (report.container ? 1 : 0) + (report.image ? 1 : 0) + report.volumes.length;
+}
+
 /** Verb agreement for `describeLeftovers`'s output — "its container" needs
  *  "was", "its container, a volume" needs "were". */
 export function leftoverVerb(report: ProjectRemovalReport): "was" | "were" {
-  const count = (report.container ? 1 : 0) + (report.image ? 1 : 0) + report.volumes.length;
-  return count === 1 ? "was" : "were";
+  return leftoverCount(report) === 1 ? "was" : "were";
+}
+
+/** Pronoun agreement for referring back to `describeLeftovers`'s output —
+ *  "remove it manually" for one thing, "remove them manually" for more. */
+export function leftoverPronoun(report: ProjectRemovalReport): "it" | "them" {
+  return leftoverCount(report) === 1 ? "it" : "them";
 }

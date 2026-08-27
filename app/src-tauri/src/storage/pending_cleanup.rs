@@ -295,6 +295,28 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// A record that fails to parse is moved aside once, rather than left in
+    /// place to be re-warned about — and re-warned about — on every future
+    /// launch forever.
+    #[test]
+    fn an_unparseable_record_is_moved_aside_exactly_once() {
+        let dir = temp_dir("corrupt-aside");
+        let bad = dir.join("bad.json");
+        fs::write(&bad, "{ not json").unwrap();
+
+        list_in(&dir);
+        assert!(!bad.exists(), "the bad file should have been moved aside");
+        let corrupt = dir.join("bad.json.corrupt");
+        assert!(corrupt.exists(), "and the moved copy should be at .json.corrupt");
+
+        // A second pass must not warn about `bad.json` again — it is gone —
+        // and must not choke on `.json.corrupt` already being there.
+        assert!(list_in(&dir).is_empty());
+        assert!(corrupt.exists(), "the aside copy is not itself deleted");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
     /// `list_in` must not pick up the `.json.tmp` staging file `save_in`
     /// leaves behind if a crash lands between the write and the rename — the
     /// whole point of the temp-then-rename dance is that only the renamed
