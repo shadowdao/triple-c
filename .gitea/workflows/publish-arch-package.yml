@@ -1,37 +1,36 @@
-name: Publish AUR Package
+name: Publish Arch Package
 
-# Builds and pushes the `triple-c-bin` AUR package (packaging/arch/PKGBUILD)
-# for a given release, or the latest one if none is given. Manual dispatch
-# only — deliberately not triggered by `release` or `push`, for the same
-# reason sync-release.yml (removed in triple-c#32) never worked safely as an
-# automatic trigger: this repo's releases are assembled by build-app.yml
-# across three separate platform jobs, and there is no single automatic event
-# that fires only once everything (including the Linux .deb this workflow
-# needs) is actually uploaded. A human deciding "this release is ready, go
-# package it" is the correct trigger, the same reasoning
+# Builds the `triple-c-bin` Arch package (packaging/arch/PKGBUILD) for a
+# given release, or the latest one if none is given, and attaches the built
+# .pkg.tar.zst to that release on GitHub as a downloadable asset. Manual
+# dispatch only — deliberately not triggered by `release` or `push`, for the
+# same reason sync-release.yml (removed in triple-c#32) never worked safely
+# as an automatic trigger: this repo's releases are assembled by
+# build-app.yml across three separate platform jobs, and there is no single
+# automatic event that fires only once everything (including the Linux .deb
+# this workflow needs) is actually uploaded. A human deciding "this release
+# is ready, go package it" is the correct trigger, the same reasoning
 # backfill-releases.yml already uses for its own manual-only GitHub sync.
 #
 # ## What this does and does not do
 #
 # It renders `packaging/arch/PKGBUILD` for one specific version (real
-# download URL, real sha256sums — never guessed; see the resolve-asset step)
-# and pushes the rendered PKGBUILD plus a regenerated `.SRCINFO` to AUR. It
-# does NOT commit anything back to this repo — `packaging/arch/PKGBUILD` stays
-# a hand-maintained template with a placeholder version, and every real,
-# published version lives only in AUR's own git history, which is where a
-# PKGBUILD's revision history is expected to live. A corollary worth knowing:
-# a hand-edit made directly in the AUR repo (outside this workflow) is
-# silently overwritten the next time this runs, since every run renders fresh
-# from this repo's template rather than starting from AUR's current state.
+# download URL, real sha256sums — never guessed; see the resolve-asset step),
+# validates it with `makepkg`/`namcap` in a real Arch container, and uploads
+# the resulting `.pkg.tar.zst` to the GitHub release it was built from —
+# installable by hand with `pacman -U`. It does NOT commit anything back to
+# this repo — `packaging/arch/PKGBUILD` stays a hand-maintained template with
+# a placeholder version, and the workflow never starts from or writes to it.
 #
-# ## Required secret
+# ## Not published to the AUR (yet)
 #
-# `AUR_SSH_PRIVATE_KEY` — an SSH private key registered against an AUR
-# account that has already created (or been given co-maintainer access to)
-# the `triple-c-bin` package. This workflow cannot create that AUR account or
-# register the key for you — both are manual, one-time steps on
-# https://aur.archlinux.org. Until this secret exists, every run fails at the
-# "Push to AUR" step with a clear error rather than silently doing nothing.
+# This originally also pushed the rendered PKGBUILD to an AUR git repo, which
+# needs a maintainer AUR account and its SSH key registered as a secret here
+# — both manual, one-time steps neither this workflow nor anyone but a
+# maintainer can do. Until that setup happens, a downloadable release asset
+# gets the same package to users without it. The AUR push step is still in
+# this file's git history (see the commit that added this comment) if that
+# setup is ever done and it's worth reinstating.
 on:
   workflow_dispatch:
     inputs:
@@ -43,7 +42,6 @@ on:
 
 env:
   GITHUB_REPO: shadowdao/triple-c
-  AUR_REPO: ssh://aur@aur.archlinux.org/triple-c-bin.git
 
 jobs:
   publish:
@@ -97,10 +95,20 @@ jobs:
           fi
           echo "Found asset: ${DEB_NAME}"
 
+          # For attaching the built package to this same release later —
+          # every release object carries its own `upload_url` regardless of
+          # whether it was just created or (as here) already existed, and
+          # the `{?name,label}` URI-template suffix has to come off before
+          # this is usable as a plain URL to POST to.
+          RELEASE_ID=$(echo "$RELEASE_JSON" | jq -r '.id')
+          UPLOAD_URL=$(echo "$RELEASE_JSON" | jq -r '.upload_url' | sed 's/{?name,label}//')
+
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "deb_url=${DEB_URL}" >> "$GITHUB_OUTPUT"
           echo "deb_name=${DEB_NAME}" >> "$GITHUB_OUTPUT"
+          echo "release_id=${RELEASE_ID}" >> "$GITHUB_OUTPUT"
+          echo "upload_url=${UPLOAD_URL}" >> "$GITHUB_OUTPUT"
 
       - name: Download the release asset and compute real checksums
         id: checksums
@@ -197,6 +205,7 @@ jobs:
           ! grep -q "SKIP" PKGBUILD
 
       - name: Validate with makepkg and namcap
+        id: build
         run: |
           set -euo pipefail
 
@@ -218,6 +227,13 @@ jobs:
             echo "builder ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/builder
             sudo -u builder bash -c "cd /work && makepkg --printsrcinfo > .SRCINFO"
             sudo -u builder bash -c "cd /work && makepkg -s --noconfirm"
+            # Named once here, inside the container, rather than guessed
+            # from options=(!strip !debug) plus pkgver/pkgrel/arch on the
+            # host after the fact — makepkg is the one place that actually
+            # knows its own output name, and `!debug` already guarantees
+            # this glob can only ever match the one real package (no
+            # -debug split package gets produced).
+            basename /work/*.pkg.tar.* > /work/.pkgfile
             echo "--- namcap ---"
             NAMCAP_OUT=$(sudo -u builder bash -c "cd /work && namcap PKGBUILD *.pkg.tar.*" || true)
             echo "$NAMCAP_OUT"
@@ -238,50 +254,45 @@ jobs:
           # bind mount still fails the job the same way.
           docker start -a "${CID}"
           docker cp "${CID}:/work/.SRCINFO" rendered/.SRCINFO
+          docker cp "${CID}:/work/.pkgfile" rendered/.pkgfile
+          PKG_FILE=$(cat rendered/.pkgfile)
+          docker cp "${CID}:/work/${PKG_FILE}" "rendered/${PKG_FILE}"
           docker rm -f "${CID}" >/dev/null
 
-      - name: Push to AUR
+          echo "pkg_file=${PKG_FILE}" >> "$GITHUB_OUTPUT"
+
+      - name: Attach the package to the GitHub release
         env:
-          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
-          VERSION: ${{ steps.resolve.outputs.version }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+          RELEASE_ID: ${{ steps.resolve.outputs.release_id }}
+          UPLOAD_URL: ${{ steps.resolve.outputs.upload_url }}
+          PKG_FILE: ${{ steps.build.outputs.pkg_file }}
         run: |
           set -euo pipefail
-          if [ -z "${AUR_SSH_PRIVATE_KEY}" ]; then
-            echo "AUR_SSH_PRIVATE_KEY is not set — see this workflow file's header comment for" >&2
-            echo "the one-time AUR account setup this needs before it can publish anything." >&2
+          if [ -z "${GH_PAT}" ]; then
+            echo "GH_PAT is not set — this step needs it to attach a release asset." >&2
             exit 1
           fi
 
-          mkdir -p ~/.ssh
-          # Created with the final mode before any bytes land in it, rather
-          # than a plain redirect followed by chmod, which leaves the key
-          # world-readable for whatever window falls between the two calls.
-          install -m 600 /dev/null ~/.ssh/aur
-          echo "${AUR_SSH_PRIVATE_KEY}" > ~/.ssh/aur
-          # TOFU, not verification — accepted here because pinning AUR's
-          # actual host key needs a value fetched from somewhere trusted
-          # ahead of time, which this workflow doesn't have, and getting a
-          # pinned value wrong fails every future run rather than just this
-          # one. A keyscan failure below surfaces later as an opaque
-          # "Host key verification failed" rather than a clear one here.
-          ssh-keyscan -H aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
-          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur -o IdentitiesOnly=yes -o UserKnownHostsFile=~/.ssh/known_hosts"
-
-          git clone "${AUR_REPO}" aur-repo
-          cp rendered/PKGBUILD rendered/.SRCINFO aur-repo/
-          cd aur-repo
-          git config user.name "Triple-C CI"
-          git config user.email "noreply@triple-c.invalid"
-          git add PKGBUILD .SRCINFO
-          if git diff --cached --quiet; then
-            echo "No change from what's already published on AUR for ${VERSION}"
-            exit 0
+          # A manual re-dispatch for a version that's already been packaged
+          # would otherwise hit GitHub's 422 "already_exists" here instead
+          # of just replacing the stale build with this one.
+          EXISTING_ID=$(curl -fsS -H "Authorization: Bearer ${GH_PAT}" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPO}/releases/${RELEASE_ID}/assets" \
+            | jq -r --arg name "$PKG_FILE" '.[] | select(.name == $name) | .id')
+          if [ -n "$EXISTING_ID" ]; then
+            echo "Replacing the existing ${PKG_FILE} (asset id ${EXISTING_ID}) already on ${TAG}"
+            curl -fsS -X DELETE -H "Authorization: Bearer ${GH_PAT}" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_REPO}/releases/assets/${EXISTING_ID}"
           fi
-          git commit -m "triple-c-bin: update to ${VERSION}"
-          # AUR itself uses `master`, which is what a fresh, not-yet-created
-          # AUR package's empty repo advertises on clone — but the *local*
-          # branch name after cloning an empty repo falls back to whatever
-          # this runner's `init.defaultBranch` is if the server sends no
-          # symref, so naming the destination explicitly is what keeps this
-          # working if that default is ever `main` instead of `master`.
-          git push origin HEAD:master
+
+          curl -fsS -X POST \
+            -H "Authorization: Bearer ${GH_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary "@rendered/${PKG_FILE}" \
+            "${UPLOAD_URL}?name=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1]))" "${PKG_FILE}")" \
+            > /dev/null
+
+          echo "Attached ${PKG_FILE} to ${TAG}"
