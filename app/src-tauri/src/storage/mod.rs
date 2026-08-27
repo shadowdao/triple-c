@@ -2,6 +2,7 @@ pub mod migration_store;
 pub mod pending_cleanup;
 pub mod projects_store;
 pub mod secure;
+pub mod settings_crypto;
 pub mod settings_store;
 
 #[allow(unused_imports)]

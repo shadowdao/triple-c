@@ -321,12 +321,20 @@ pub fn delete_gateway_api_key() -> Result<(), String> {
 /// only enforces auth when a master key is configured, so Triple-C always
 /// configures one.
 pub fn get_or_create_gateway_master_key() -> Result<String, String> {
-    if let Some(existing) = read_entry(GATEWAY_MASTER_KEY_SERVICE, "the gateway master key")? {
-        if !existing.trim().is_empty() {
-            return Ok(existing);
-        }
+    if let Some(existing) = get_gateway_master_key()? {
+        return Ok(existing);
     }
     regenerate_gateway_master_key()
+}
+
+/// Read the gateway master key without minting one if none exists yet.
+/// Distinct from [`get_or_create_gateway_master_key`], which mints as a side
+/// effect the read half of that function must not have — settings export
+/// (triple-c#35) needs "is there one, and if so what is it", not "make sure
+/// one exists".
+pub fn get_gateway_master_key() -> Result<Option<String>, String> {
+    Ok(read_entry(GATEWAY_MASTER_KEY_SERVICE, "the gateway master key")?
+        .filter(|k| !k.trim().is_empty()))
 }
 
 /// Mint a new gateway master key, invalidating the old one. Projects using the
@@ -334,15 +342,31 @@ pub fn get_or_create_gateway_master_key() -> Result<String, String> {
 pub fn regenerate_gateway_master_key() -> Result<String, String> {
     // LiteLLM requires the master key to start with `sk-`.
     let key = format!("sk-triple-c-{}", uuid::Uuid::new_v4().simple());
+    store_gateway_master_key(&key)?;
+    Ok(key)
+}
+
+/// Store an exact given gateway master key, replacing any previous one.
+///
+/// Distinct from [`regenerate_gateway_master_key`], which always mints a
+/// fresh random value: this exists for settings import (triple-c#35), where
+/// restoring the *same* key an export captured is the point — projects on
+/// the destination machine may not exist yet, but a project migrated or
+/// re-added later that still has the old key pasted into its config must
+/// keep working against it. Blank input is rejected rather than silently
+/// stored, matching every other `store_*` function in this module.
+pub fn store_gateway_master_key(key: &str) -> Result<(), String> {
+    if key.trim().is_empty() {
+        return Err("Refusing to store an empty gateway master key.".to_string());
+    }
 
     let entry = keyring::Entry::new(GATEWAY_MASTER_KEY_SERVICE, KEYCHAIN_ACCOUNT)
         .map_err(|e| format!("Keyring error: {}", e))?;
     entry
-        .set_password(&key)
+        .set_password(key.trim())
         .map_err(|e| format!("Failed to store the gateway master key: {}", e))?;
 
-    bump_gateway_secret_version()?;
-    Ok(key)
+    bump_gateway_secret_version()
 }
 
 

@@ -10,19 +10,24 @@ pub async fn get_settings(state: State<'_, AppState>) -> Result<AppSettings, Str
     Ok(state.settings_store.get())
 }
 
-#[tauri::command]
-pub async fn update_settings(
-    settings: AppSettings,
-    state: State<'_, AppState>,
-) -> Result<AppSettings, String> {
-    let before = state.settings_store.get();
-
+/// Everything `update_settings` refuses a save over, run against the store's
+/// *current* value and the incoming one.
+///
+/// Pulled out so a caller that does other, harder-to-undo work alongside a
+/// settings save — `settings_export_commands::apply_settings_import`
+/// restores three keychain secrets in the same command — can run this
+/// *first* and bail before touching anything, rather than discovering the
+/// rejection only when `update_settings` itself runs partway through.
+pub fn validate_settings_update(
+    before: &AppSettings,
+    incoming: &AppSettings,
+) -> Result<(), String> {
     // The global half of the same rule the project half gets in
     // `update_project`: a global custom env var is merged into every project's
     // container environment, so an unchecked name here reaches all of them.
     crate::models::validate_env_vars_update(
         &before.global_custom_env_vars,
-        &settings.global_custom_env_vars,
+        &incoming.global_custom_env_vars,
     )?;
 
     // The same for the two host paths this struct owns. `update_project`
@@ -40,13 +45,36 @@ pub async fn update_settings(
     crate::commands::project_commands::validate_mounted_host_path(
         "SSH key path",
         before.default_ssh_key_path.as_deref(),
-        settings.default_ssh_key_path.as_deref(),
+        incoming.default_ssh_key_path.as_deref(),
     )?;
     crate::commands::project_commands::validate_mounted_host_path(
         "CA certificate path",
         before.ca_cert_path.as_deref(),
-        settings.ca_cert_path.as_deref(),
+        incoming.ca_cert_path.as_deref(),
     )?;
+
+    // Third host path this struct owns, same reasoning: any project with
+    // `allow_docker_access` bind-mounts this path in as the Docker socket
+    // (`project_commands.rs`'s container creation), so an unchecked value
+    // here is a read-write bind mount of whatever it names into every such
+    // project's container.
+    crate::commands::project_commands::validate_mounted_host_path(
+        "Docker socket path",
+        before.docker_socket_path.as_deref(),
+        incoming.docker_socket_path.as_deref(),
+    )?;
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn update_settings(
+    settings: AppSettings,
+    state: State<'_, AppState>,
+) -> Result<AppSettings, String> {
+    let before = state.settings_store.get();
+
+    validate_settings_update(&before, &settings)?;
 
     let saved = state.settings_store.update(settings)?;
 
@@ -122,7 +150,10 @@ async fn reconcile_gateway(before: &GatewaySettings, after: &GatewaySettings) {
         GatewayAction::StopIfRunning => {
             log::info!("Model gateway disabled in settings — stopping the container");
             if let Err(e) = docker::gateway::stop_gateway_container().await {
-                log::error!("Failed to stop the model gateway after it was disabled: {}", e);
+                log::error!(
+                    "Failed to stop the model gateway after it was disabled: {}",
+                    e
+                );
             }
         }
         GatewayAction::RestartIfRunning => {
@@ -138,10 +169,7 @@ async fn reconcile_gateway(before: &GatewaySettings, after: &GatewaySettings) {
 }
 
 #[tauri::command]
-pub async fn pull_image(
-    image_name: String,
-    app_handle: tauri::AppHandle,
-) -> Result<(), String> {
+pub async fn pull_image(image_name: String, app_handle: tauri::AppHandle) -> Result<(), String> {
     use tauri::Emitter;
     docker::pull_image(&image_name, move |msg| {
         let _ = app_handle.emit("image-pull-progress", msg);
@@ -334,7 +362,10 @@ mod tests {
         let before = enabled_gateway();
         let mut after = before.clone();
         after.enabled = false;
-        assert_eq!(gateway_action(&before, &after), GatewayAction::StopIfRunning);
+        assert_eq!(
+            gateway_action(&before, &after),
+            GatewayAction::StopIfRunning
+        );
         // Still true when it was already off — a stray running container is
         // still a container that shouldn't be up.
         assert_eq!(gateway_action(&after, &after), GatewayAction::StopIfRunning);

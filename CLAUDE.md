@@ -552,6 +552,131 @@ survived 92 commits and fourteen days in the public GitHub mirror, past five aud
 independent reviews, because every one of them read the code under change and this sat in a test
 nobody had reason to open. Fixtures are never live values; there is no case where they need to be.
 
+## Settings export/import
+
+`commands::settings_export_commands`, `storage::settings_crypto`, `models::settings_export`
+(triple-c#35). Exports the *host* environment — global `AppSettings` plus the global secrets that
+live in the OS keychain instead: the shared Claude Code OAuth login and the model gateway's two
+keys. Per-project settings, per-project secrets, and anything in a project's Docker volumes are
+deliberately out of scope — this is not a project backup.
+
+- **`AppSettings` is not entirely the non-secret shape it looks like, and a review of this feature
+  caught the one place that isn't.** `WebTerminalSettings::access_token` is a live bearer
+  credential for a server that binds every interface — exporting `AppSettings` wholesale would
+  have carried it along as if it were as inert as a port number, and importing it would have
+  applied `web_terminal.enabled` and the token together with no more warning than any other
+  setting, letting a crafted export silently stand up a LAN-listening terminal on the next launch.
+  `export_settings`/`apply_settings_import` carve this one field out into `ExportedSecrets`
+  instead, with the same "only overwrite what the import actually has" treatment as the other
+  three secrets — except "leave it alone" has to be done by hand in `apply_settings_import`, since
+  unlike the keychain secrets this one lives inside the `AppSettings` blob that gets replaced
+  wholesale. `SettingsImportPreview::enables_web_terminal` also exists because of this: `enabled`
+  and the token are independent fields, and "this turns on a listening service" must not hide
+  inside a generic "settings replaced" summary. Read this as the standing example of the class of
+  thing to keep checking for in this feature, not a one-off fixed bug — any other field that looks
+  like config but is actually a live credential would have the same problem.
+- **Encrypted because it can carry live credentials, not for appearance's sake.** Argon2id derives
+  a 256-bit key from the user's password (memory-hard — meaningfully resistant to GPU/ASIC
+  brute-forcing, unlike PBKDF2 at any reasonable iteration count), AES-256-GCM does the actual
+  encryption. A wrong password fails GCM's authentication tag rather than producing silent
+  garbage. The salt and nonce are not secret and are written in the clear in the file's own
+  header — the salt's job is only to make two exports of the same password derive different keys,
+  and the nonce's only requirement is per-encryption uniqueness, which a fresh random draw on
+  every export already gives it.
+- **The save/open dialogs are opened from Rust**, the same boundary `file_commands.rs`'s
+  `pick_save_path`/`pick_files_to_upload` draw and document at length: a frontend-driven dialog
+  handing Rust a host path string is the exact shape of bug that produced this app's past
+  criticals. `preview_settings_import` resolves the chosen path itself and remembers it
+  (`AppState::pending_settings_import`) so `apply_settings_import` re-reads the same file without
+  a path ever crossing back over IPC. It also pins a hash of the file's ciphertext next to that
+  path, and `apply_settings_import` refuses to proceed if the file on disk no longer matches it —
+  otherwise confirming a preview would not actually be binding on what gets applied, which matters
+  given this feature's own threat model: a file shared between people may sit in a synced or
+  otherwise shared directory that changes between the two calls.
+- **The decrypted payload is not cached between preview and apply — only the password is reused.**
+  The frontend holds the password in React state and passes it to both calls; nothing in Rust
+  holds decrypted plaintext — secrets included — in memory for longer than one command's
+  execution, so `apply_settings_import` always re-decrypts rather than reusing anything
+  `preview_settings_import` computed. `preview_settings_import` returns counts and presence flags
+  only (`SettingsImportPreview`), never a secret value, so it's safe to hand to the frontend and
+  render directly.
+- **Import replaces settings wholesale, but only writes secrets actually present in the file.**
+  An import is "restore this environment," so the settings half is a full replace, not a
+  field-by-field merge. Secrets are different on purpose: an absent secret in the export means
+  "the source machine never had this configured," not "delete this on import" — a user who wants
+  to clear a secret already has dedicated UI for that (signing out of shared auth, clearing the
+  gateway key). Secrets are restored *before* the settings replace runs, not after — replacing
+  settings is what triggers `reconcile_gateway`, and restoring the other way round leaves a real
+  window where a gateway recreation happens against the destination's old keys.
+- **A restored gateway secret nudges a running gateway container to recreate itself, even when
+  nothing about the gateway's *shape* changed.** `reconcile_gateway`'s `gateway_shape_changed` only
+  compares port/provider/base URL/models — deliberately, since that's what's rendered into the
+  container's config — so a secret-only change (same shape, new key) is invisible to it. Left
+  alone, a running container would keep serving the old key material indefinitely after an import
+  that restored a new one. `apply_settings_import` tracks whether either gateway secret was
+  actually written and, if the gateway is enabled and its container both exists and is running,
+  calls `docker::gateway::ensure_gateway_running` directly afterward — its own fingerprint already
+  includes the secret rotation id (`storage::secure::get_gateway_secret_version`), so it recreates
+  exactly when it should and no more.
+- **A keychain write failing during import is reported back, not only logged.** Each of the three
+  `secure::store_*` calls collects its error into `SettingsImportOutcome::secret_restore_warnings`
+  in addition to logging it — an import that silently restores two of three secrets but not the
+  third must not read as unqualified success just because the settings half of the import (which
+  runs after, and is validated before any of this) went through. `apply_settings_import` returns
+  `SettingsImportOutcome { settings, secret_restore_warnings }` rather than bare `AppSettings` for
+  this reason; `ImportSettingsModal` shows any warnings alongside the "Settings imported" message.
+- **The imported settings are validated *before* any secret is written, not just before the
+  settings replace.** `apply_settings_import` calls
+  `settings_commands::validate_settings_update(&current, &settings)` — the same checks
+  `update_settings` runs internally, pulled out into its own function specifically so this caller
+  can run them first — and only proceeds to the three keychain writes if that passes. A review
+  caught the earlier ordering: writing secrets first meant a rejected import (a bad env var name, a
+  disallowed host path) still left the keychain overwritten with the file's secrets while the
+  settings themselves stayed unchanged, a silently half-applied state the error message gave no
+  hint of.
+- **`read_and_decrypt` checks `format_version` before attempting to parse the full payload, not
+  after.** A version bump that isn't deserialize-compatible is exactly the case that check exists
+  for, and parsing the full struct first would fail on the shape mismatch before the version check
+  ever ran. Neither error path interpolates what `serde_json` actually says into the message
+  shown to the user — its type-mismatch errors quote the offending value inline, and the plaintext
+  here can hold a live credential.
+- **The 8-character password minimum is enforced in `export_settings` itself, not only in the
+  export modal.** The frontend minimum is a UX nudge; the Rust command is the actual boundary a
+  weak password has to cross, and Argon2id's memory-hardness buys little against an attacker who
+  can just try a short password directly. Measured with `.chars().count()` (Unicode scalar values)
+  rather than `.len()` (bytes), to stay as close as this pair of languages allows to the frontend's
+  `.length` check (UTF-16 code units) — the two only diverge on astral-plane characters. The
+  derived key and both plaintext buffers — the payload built for export, and whatever `decrypt`
+  recovers on import — are wrapped in `zeroize::Zeroizing` for the same reason every other secret
+  in this codebase gets handled carefully — cheap insurance (`zeroize` is already pulled in
+  transitively via `aes-gcm`) for material that exists only to hold or produce live credentials.
+- **The preview also discloses non-blank custom base URLs** (`global_ollama`, `global_llamacpp`,
+  `global_openai_compatible`, `gateway.api_base`) so an import that would redirect model traffic to
+  a different server is visible in the confirmation dialog rather than discovered later — these are
+  endpoints, not secrets, so `SettingsImportPreview` carries and `describeImport` renders the actual
+  URL rather than just a presence flag. `describeImportWarnings` additionally calls out a web
+  terminal token that arrives with the terminal left *off*: `start_web_terminal` only mints a fresh
+  token when none is already set, so a planted token would otherwise activate silently the next
+  time someone turns the terminal on, with no import-time signal that it wasn't freshly generated.
+- **The preview also discloses a custom Docker image, and warns on one every time — not just on
+  change.** `custom_image_name`/`image_source` weren't in scope for the base-URL disclosure above,
+  but a review pointed out they're a sharper version of the same problem: this is the image *every*
+  project container is created from (`models::container_config::resolve_image_name`), so a crafted
+  export pointing it at an attacker-controlled image is a path to running arbitrary code with
+  whatever a project's containers are allowed to reach, not merely a redirected API endpoint.
+  `describeImportWarnings` fires on `image_source == Custom` unconditionally rather than only when
+  it differs from the destination's current value, since re-importing the same risky configuration
+  is still worth surfacing every time a user confirms an import.
+- **Every free-form string a preview surfaces is sanitized and length-capped before it's built.**
+  `SettingsImportPreview::from_payload`'s `sanitize_for_preview` strips control characters and caps
+  at 100 characters (`MAX_PREVIEW_STRING_LEN`) for every base URL and the custom image name — a
+  review noted that, unlike the count- and boolean-derived fields the preview started with, these
+  are verbatim strings from a not-yet-trusted decrypted payload rendered directly into the
+  confirmation dialog. Unbounded, a single pathological value (very long, or holding embedded
+  newlines) could push the security warnings above the scroll fold in the dialog that exists
+  specifically to make them unmissable — the frontend's `<li>`/warning boxes also get `break-all`
+  as a second layer against the same failure mode.
+
 ## Testing
 
 Frontend tests use Vitest with jsdom environment and React Testing Library. Setup file at `src/test/setup.ts`. Run a single test file:

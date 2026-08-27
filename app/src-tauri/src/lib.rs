@@ -29,6 +29,21 @@ pub struct AppState {
     pub auth_bridge: Arc<AuthBridgeManager>,
     pub web_terminal_server: Arc<tokio::sync::Mutex<Option<WebTerminalServer>>>,
     pub lifecycle: Arc<Lifecycle>,
+    /// The file `preview_settings_import` last decrypted successfully, held
+    /// so `apply_settings_import` can re-read and re-decrypt the same file
+    /// without the frontend ever passing a host path back to Rust as an
+    /// argument — see the doc comment on `commands::settings_export_commands`
+    /// for why that direction specifically is the one this app treats as
+    /// dangerous. Deliberately re-decrypted rather than cached in plaintext:
+    /// nothing here holds a decrypted secret in memory for longer than one
+    /// command's execution.
+    ///
+    /// Also pins a hash of the file's ciphertext at preview time, so
+    /// `apply_settings_import` can refuse to proceed if the file on disk
+    /// changed underneath the pending import — otherwise confirming a
+    /// preview is not actually binding on what gets applied.
+    pub pending_settings_import:
+        Arc<tokio::sync::Mutex<Option<commands::settings_export_commands::PendingSettingsImport>>>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -222,6 +237,7 @@ pub fn run() {
             auth_bridge,
             web_terminal_server: Arc::new(tokio::sync::Mutex::new(None)),
             lifecycle,
+            pending_settings_import: Arc::new(tokio::sync::Mutex::new(None)),
         })
         .setup(move |app| {
             match tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png")) {
@@ -494,6 +510,10 @@ pub fn run() {
             commands::settings_commands::inspect_ca_cert_path,
             commands::settings_commands::list_aws_profiles,
             commands::settings_commands::detect_host_timezone,
+            // Settings export/import
+            commands::settings_export_commands::export_settings,
+            commands::settings_export_commands::preview_settings_import,
+            commands::settings_export_commands::apply_settings_import,
             // Terminal
             commands::terminal_commands::open_terminal_session,
             commands::terminal_commands::terminal_input,

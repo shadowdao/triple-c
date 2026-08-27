@@ -10,6 +10,7 @@ pub mod install_helper_commands;
 pub mod migration_commands;
 pub mod project_commands;
 pub mod settings_commands;
+pub mod settings_export_commands;
 pub mod stt_commands;
 pub mod terminal_commands;
 pub mod update_commands;

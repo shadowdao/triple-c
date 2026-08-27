@@ -292,6 +292,46 @@ export interface AppSettings {
   global_claude_code_settings: ClaudeCodeSettings | null;
 }
 
+/** What `preview_settings_import` returns before anything is applied —
+ *  counts and presence flags only, never a secret value itself. Built from
+ *  this, not from the raw import file, which the frontend never sees. */
+export interface SettingsImportPreview {
+  exported_at: string;
+  app_version: string;
+  custom_env_var_count: number;
+  gateway_model_count: number;
+  has_claude_code_settings: boolean;
+  has_claude_oauth_token: boolean;
+  has_gateway_api_key: boolean;
+  has_gateway_master_key: boolean;
+  has_web_terminal_access_token: boolean;
+  /** Whether the import turns the web terminal on — surfaced separately
+   *  from the token above since either can be true without the other, and
+   *  "this enables a service that listens on your network" must not hide
+   *  inside a generic "settings replaced" summary. */
+  enables_web_terminal: boolean;
+  /** Non-blank custom base URLs the import would set — endpoints, not
+   *  secrets, so shown verbatim to disclose a redirect of model traffic. */
+  ollama_base_url: string | null;
+  llamacpp_base_url: string | null;
+  openai_compatible_base_url: string | null;
+  gateway_api_base: string | null;
+  /** Whether the import sets a custom Docker image, and its name if so —
+   *  this is the image every project container is created from, so worth
+   *  more attention than an ordinary setting. */
+  image_source: ImageSource;
+  custom_image_name: string | null;
+}
+
+/** What `apply_settings_import` returns: the settings that were actually
+ *  saved, plus a note for each keychain secret the import carried but could
+ *  not be restored (a partial keychain failure must not read as unqualified
+ *  success just because the settings half went through). */
+export interface SettingsImportOutcome {
+  settings: AppSettings;
+  secret_restore_warnings: string[];
+}
+
 /** What `inspect_ca_cert_path` reports about a corporate CA path. Errors ride
  *  in the payload rather than rejecting, so the field can render them inline
  *  while the user is still typing. */
