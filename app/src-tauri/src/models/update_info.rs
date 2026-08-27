@@ -36,11 +36,12 @@ pub struct GitHubRelease {
     ///
     /// `build-app.yml`'s own mirror never publishes a prerelease, but
     /// `.gitea/workflows/backfill-releases.yml` forwards every Gitea release
-    /// unfiltered, `prerelease` included — so if it were ever dispatched
-    /// while a preview release existed, this field is what stops
-    /// `check_for_updates` from offering it (the `preview-<sha>` tag shape
-    /// already fails semver parsing independently, but this is real
-    /// defence-in-depth, not a no-op).
+    /// unfiltered, `prerelease` included. A preview release's `preview-<sha>`
+    /// tag already fails semver parsing on its own, so this field is not what
+    /// stops *that* case — it is what stops the case tag-parsing can't catch:
+    /// a normally-tagged release (`v0.4.13`) that someone marks as a
+    /// prerelease on Gitea (a hotfix candidate, an RC) and a backfill then
+    /// mirrors as-is. Real defence for that case, not a no-op.
     #[serde(default)]
     pub prerelease: bool,
 }

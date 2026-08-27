@@ -16,7 +16,7 @@ const REGISTRY_API_BASE: &str =
 const GHCR_TOKEN_URL: &str =
     "https://ghcr.io/token?scope=repository:shadowdao/triple-c-sandbox:pull";
 
-/// `CARGO_PKG_VERSION`, plus a build-time suffix when one was baked in.
+/// The build-time preview suffix, if one was baked in and isn't blank.
 ///
 /// The bundle version itself (`tauri.conf.json`, `Cargo.toml`, `package.json`)
 /// is never given a `-preview.<sha>` suffix — `build-app-preview.yml` strips
@@ -26,7 +26,17 @@ const GHCR_TOKEN_URL: &str =
 /// is the workaround: set as a build-time env var in the preview workflow
 /// only, so `option_env!` bakes it into the binary without the bundle version
 /// ever seeing it. A production build sets nothing, so `option_env!` reads
-/// `None` and this is a no-op — see triple-c#32.
+/// `None` here — see triple-c#32.
+///
+/// The single source of truth for "is this a preview build": both
+/// `get_app_version()` (what the About panel shows) and `check_for_updates()`
+/// (whether a same-numbered release counts as an update — see `pick_update`)
+/// read this rather than each calling `option_env!` themselves, so the two
+/// can never silently disagree about which build this is.
+fn preview_build_suffix() -> Option<&'static str> {
+    option_env!("TRIPLE_C_BUILD_SUFFIX").filter(|s| !s.is_empty())
+}
+
 fn format_app_version(base: &str, build_suffix: Option<&str>) -> String {
     match build_suffix {
         Some(suffix) if !suffix.is_empty() => format!("{}-{}", base, suffix),
@@ -36,7 +46,7 @@ fn format_app_version(base: &str, build_suffix: Option<&str>) -> String {
 
 #[tauri::command]
 pub fn get_app_version() -> String {
-    format_app_version(env!("CARGO_PKG_VERSION"), option_env!("TRIPLE_C_BUILD_SUFFIX"))
+    format_app_version(env!("CARGO_PKG_VERSION"), preview_build_suffix())
 }
 
 #[tauri::command]
@@ -79,7 +89,7 @@ pub async fn check_for_updates() -> Result<Option<UpdateInfo>, String> {
     // relaxes that one comparison to `>=` so "there is a real release at my
     // own number" reads as an update, without touching the production case
     // — see `pick_update`.
-    let is_preview_build = option_env!("TRIPLE_C_BUILD_SUFFIX").is_some_and(|s| !s.is_empty());
+    let is_preview_build = preview_build_suffix().is_some();
 
     match pick_update(&releases, current_semver, platform_extensions, is_preview_build) {
         Some(release) => {
@@ -121,10 +131,11 @@ pub async fn check_for_updates() -> Result<Option<UpdateInfo>, String> {
 /// Three filters, all of which must pass: not a prerelease (see the long
 /// comment on `GitHubRelease::prerelease`), at least one asset for this
 /// platform, and a tag that parses as semver *and* beats what is running. A
-/// tag that does not parse — a `-preview.<sha>` suffix, most realistically —
-/// is skipped rather than erroring, the same as it always has been; nothing
-/// here changes what an update tag is expected to look like, only what
-/// channel it is allowed to come from.
+/// tag that does not parse — `preview-<sha>` (the shape
+/// `build-app-preview.yml` actually creates release tags with), most
+/// realistically — is skipped rather than erroring, the same as it always
+/// has been; nothing here changes what an update tag is expected to look
+/// like, only what channel it is allowed to come from.
 ///
 /// `is_preview_build` relaxes "beats" from `>` to `>=`. A preview build's
 /// `current_semver` is the bare number it was compiled with, which is by
