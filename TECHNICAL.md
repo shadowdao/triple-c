@@ -412,12 +412,18 @@ triple-c/
 │
 ├── .gitea/
 │   └── workflows/
-│       ├── build-app.yml          # Build Tauri app (Linux/macOS/Windows); mirrors releases to GitHub inline
-│       ├── build-app-preview.yml  # Preview builds
-│       ├── build.yml              # Build container image (multi-arch)
-│       ├── build-stt.yml          # Build the STT image
-│       ├── backfill-releases.yml  # Bulk copy releases to GitHub
-│       └── cleanup-releases.yml   # Prune old releases
+│       ├── build-app.yml            # Build Tauri app (Linux/macOS/Windows); mirrors releases to GitHub inline
+│       ├── build-app-preview.yml    # Preview builds
+│       ├── build.yml                # Build container image (multi-arch)
+│       ├── build-stt.yml            # Build the STT image
+│       ├── backfill-releases.yml    # Bulk copy releases to GitHub
+│       ├── cleanup-releases.yml     # Prune old releases
+│       └── publish-aur-package.yml  # Publish triple-c-bin to the AUR (packaging/arch/)
+│
+├── packaging/
+│   └── arch/                      # AUR triple-c-bin package — see packaging/arch/README.md
+│       ├── PKGBUILD
+│       └── README.md
 │
 └── app/                           # Tauri v2 desktop application
     ├── package.json               # React, xterm.js, zustand, tailwindcss
