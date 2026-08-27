@@ -43,7 +43,18 @@ name: Build App (Preview)
 # prunes previous previews itself, keeping the newest few. Bundles are ~130 MB a
 # release; the point of a preview is the build you are testing now.
 #
-# `sync-release.yml` is workflow_dispatch-only, so nothing here reaches GitHub.
+# A preview release is not meant to reach GitHub. `build-app.yml`'s inline
+# mirror never sees one (it only runs for its own `push`-triggered release),
+# but `backfill-releases.yml` pulls every Gitea release unfiltered and would
+# faithfully forward a preview's `prerelease: true` if it were ever dispatched
+# while one existed — so `GitHubRelease::prerelease` in `update_commands.rs`
+# is real defence, not a no-op, even though the `preview-<sha>` tag shape
+# (never valid semver) already blocks it independently. (The previous
+# mechanism here, `sync-release.yml`, was `workflow_dispatch`-only and read
+# `gitea.event.release.*` fields that are only ever populated by a `release`
+# trigger, so it could never have actually run; deleted rather than fixed,
+# since build-app.yml's inline mirror already does what it was meant to do
+# for real releases. See triple-c#32.)
 
 env:
   GITEA_URL: ${{ gitea.server_url }}
@@ -70,11 +81,22 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.VERSION }}
       sha: ${{ steps.version.outputs.SHA }}
+      # Everything after the first `-` in VERSION (e.g. `preview.a1b2c3d`).
+      # The bundle version fields never see this — see "Set app version" in
+      # each build job — but it is baked into the binary as
+      # `TRIPLE_C_BUILD_SUFFIX` so `get_app_version()` can still report it.
+      # An installed preview otherwise reports the same bare number a
+      # production build would, indistinguishable in the About panel and to
+      # `check_for_updates`. See triple-c#32.
+      suffix: ${{ steps.version.outputs.SUFFIX }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Fetch all tags
+        run: git fetch --tags
 
       - name: Compute preview version
         id: version
@@ -86,21 +108,60 @@ jobs:
           # is testing and not something to hang a tag on.
           echo "SHA=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
 
-          # The patch number is computed exactly as build-app.yml does it, so a
-          # preview is labelled with the version the release it previews would
-          # carry. This used to be hard-coded `.0`, which made every preview
-          # installer claim to be x.y.0 no matter what it contained.
-          LATEST_TAG=$(git tag -l "v${MAJOR_MINOR}.*" --sort=-v:refname | grep -E "^v${MAJOR_MINOR}\.[0-9]+$" | head -1 || true)
-          if [ -n "$LATEST_TAG" ]; then
-            PATCH=$(git rev-list --count "${LATEST_TAG}..HEAD")
-            echo "Latest matching tag: ${LATEST_TAG} (+${PATCH} commits)"
+          # The patch number must be the same "one past the highest patch
+          # already used" build-app.yml computes for a real release — not a
+          # distance from the latest tag. It used to be
+          # `git rev-list --count <latest tag>..HEAD`, which build-app.yml's
+          # own history section documents as broken for exactly this reason:
+          # it resets to zero on every tag cut, so previews went *backwards*
+          # (0.4.62 -> 0.4.0) the moment a release landed, and nothing stopped
+          # a preview number from later colliding with a real release's.
+          #
+          # Reading the same `v${MAJOR_MINOR}.*` tags (including the `-mac`
+          # / `-win` suffixed ones a partially-published release can leave
+          # behind) means a preview built right before a release computes the
+          # exact number that release is about to take — e.g. `0.4.13` for
+          # both. That makes the two numerically *equal*, not "preview less
+          # than release" — plain semver ordering does not make a
+          # `-preview.<sha>` suffix sort lower on its own here, because
+          # `check_for_updates` compares against the bare, stripped
+          # `CARGO_PKG_VERSION`, never the suffixed display string. What
+          # closes the loop is `update_commands.rs`'s `is_preview_build`
+          # check, which relaxes that one comparison to `>=` specifically so
+          # "a release exists at my own number" reads as an update. See
+          # triple-c#32.
+          HIGHEST=$(git tag -l "v${MAJOR_MINOR}.*" \
+            | grep -E "^v${MAJOR_MINOR}\.[0-9]+(-mac|-win)?$" \
+            | sed -E "s/^v${MAJOR_MINOR}\.([0-9]+).*/\1/" \
+            | sort -n | tail -1 || true)
+
+          # Mirrors build-app.yml's own `EXISTING` guard: this workflow is
+          # also `workflow_dispatch`-able on `main`, not just PR-triggered, so
+          # HEAD can be a commit a release was already cut from. Without this,
+          # dispatching a preview there would compute `HIGHEST + 1` — one past
+          # that release — and produce exactly the "preview outranks
+          # production" failure triple-c#32 was filed over, just reintroduced
+          # through the manual-dispatch door instead of the automatic one.
+          EXISTING=$(git tag --points-at HEAD \
+            | grep -E "^v${MAJOR_MINOR}\.[0-9]+$" \
+            | sed -E "s/^v${MAJOR_MINOR}\.([0-9]+)$/\1/" \
+            | sort -n | tail -1 || true)
+
+          if [ -n "$EXISTING" ]; then
+            echo "HEAD is already tagged v${MAJOR_MINOR}.${EXISTING} — matching it"
+            PATCH="${EXISTING}"
+          elif [ -n "$HIGHEST" ]; then
+            echo "Highest patch already used on this line: ${HIGHEST}"
+            PATCH=$((HIGHEST + 1))
           else
             echo "No v${MAJOR_MINOR}.* tag yet — starting this line at .0"
             PATCH=0
           fi
 
-          VERSION="${MAJOR_MINOR}.${PATCH}-preview.${SHORT_SHA}"
+          SUFFIX="preview.${SHORT_SHA}"
+          VERSION="${MAJOR_MINOR}.${PATCH}-${SUFFIX}"
           echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+          echo "SUFFIX=${SUFFIX}" >> $GITHUB_OUTPUT
           echo "Computed preview version: ${VERSION}"
 
   # One release, created once. The three build jobs run concurrently, so
@@ -249,6 +310,13 @@ jobs:
 
       - name: Build Tauri app
         working-directory: ./app
+        env:
+          # Baked into the binary via `option_env!` in `get_app_version()` —
+          # the bundle version above stays bare (WiX/MSI's ProductVersion has
+          # no room for a suffix), so this is the only place a preview build
+          # can still tell itself apart from a production one. See
+          # triple-c#32.
+          TRIPLE_C_BUILD_SUFFIX: ${{ needs.compute-version.outputs.suffix }}
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
           npx tauri build
@@ -361,6 +429,9 @@ jobs:
 
       - name: Build Tauri app (universal)
         working-directory: ./app
+        env:
+          # See the matching comment on the Linux job's "Build Tauri app" step.
+          TRIPLE_C_BUILD_SUFFIX: ${{ needs.compute-version.outputs.suffix }}
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
           npx tauri build --target universal-apple-darwin
@@ -489,6 +560,8 @@ jobs:
         working-directory: ./app
         env:
           TAURI_CONFIG: "{\"build\":{\"beforeBuildCommand\":\"\"}}"
+          # See the matching comment on the Linux job's "Build Tauri app" step.
+          TRIPLE_C_BUILD_SUFFIX: ${{ needs.compute-version.outputs.suffix }}
         run: |
           set "PATH=%USERPROFILE%\.cargo\bin;C:\Program Files\nodejs;%PATH%"
           cargo tauri build

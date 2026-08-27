@@ -26,6 +26,24 @@ pub struct GitHubRelease {
     pub body: String,
     pub assets: Vec<GitHubAsset>,
     pub published_at: String,
+    /// Whether GitHub itself has this release marked as a prerelease.
+    /// `#[serde(default)]` rather than required: every response GitHub sends
+    /// carries this, but nothing here should refuse to parse the rest of a
+    /// release over one missing field. Defaults to `false` (offered) rather
+    /// than `true` (excluded) — a missing field only happens if GitHub's API
+    /// shape changes, and "API changed, therefore updates silently stop
+    /// working forever" is the worse failure of the two.
+    ///
+    /// `build-app.yml`'s own mirror never publishes a prerelease, but
+    /// `.gitea/workflows/backfill-releases.yml` forwards every Gitea release
+    /// unfiltered, `prerelease` included. A preview release's `preview-<sha>`
+    /// tag already fails semver parsing on its own, so this field is not what
+    /// stops *that* case — it is what stops the case tag-parsing can't catch:
+    /// a normally-tagged release (`v0.4.13`) that someone marks as a
+    /// prerelease on Gitea (a hotfix candidate, an RC) and a backfill then
+    /// mirrors as-is. Real defence for that case, not a no-op.
+    #[serde(default)]
+    pub prerelease: bool,
 }
 
 /// GitHub API asset response (internal).
