@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ProjectPath, ProjectRemovalReport, ProjectResetOutcome, ContainerInfo, AppSettings, UpdateInfo, ImageUpdateInfo, FileEntry, FileContents, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, BrowserPageState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo, UploadOutcome } from "./types";
+import type { Project, ProjectPath, ProjectRemovalReport, ProjectResetOutcome, ContainerInfo, AppSettings, SettingsImportPreview, UpdateInfo, ImageUpdateInfo, FileEntry, FileContents, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, BrowserPageState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo, UploadOutcome } from "./types";
 
 // Docker
 export const checkDocker = () => invoke<boolean>("check_docker");
@@ -41,6 +41,15 @@ export const inspectCaCertPath = (path: string) =>
   invoke<CaCertInfo>("inspect_ca_cert_path", { path });
 export const detectHostTimezone = () =>
   invoke<string>("detect_host_timezone");
+
+// Settings export/import — `false`/`null` mean the save/open dialog was
+// dismissed, not an error.
+export const exportSettings = (password: string) =>
+  invoke<boolean>("export_settings", { password });
+export const previewSettingsImport = (password: string) =>
+  invoke<SettingsImportPreview | null>("preview_settings_import", { password });
+export const applySettingsImport = (password: string) =>
+  invoke<AppSettings>("apply_settings_import", { password });
 
 // AWS
 export const awsSsoRefresh = (projectId: string) =>

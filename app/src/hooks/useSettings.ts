@@ -36,5 +36,9 @@ export function useSettings() {
     appSettings,
     loadSettings,
     saveSettings,
+    /** For a command that already returns the new `AppSettings` itself
+     *  (settings import) — updates the store without a redundant
+     *  `updateSettings` round trip through the backend. */
+    setAppSettings,
   };
 }

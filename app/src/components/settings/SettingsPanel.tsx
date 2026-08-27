@@ -19,9 +19,11 @@ import WebTerminalSettings from "./WebTerminalSettings";
 import SttSettings from "./SttSettings";
 import SharedAuthSettings from "./SharedAuthSettings";
 import CertificateSettings from "./CertificateSettings";
+import ExportSettingsModal from "./ExportSettingsModal";
+import ImportSettingsModal from "./ImportSettingsModal";
 
 export default function SettingsPanel() {
-  const { appSettings, saveSettings } = useSettings();
+  const { appSettings, saveSettings, setAppSettings } = useSettings();
   const { appVersion, imageUpdateInfo, checkForUpdates, checkImageUpdate } = useUpdates();
   const [globalInstructions, setGlobalInstructions] = useState(appSettings?.global_claude_instructions ?? "");
   const [globalEnvVars, setGlobalEnvVars] = useState<EnvVar[]>(appSettings?.global_custom_env_vars ?? []);
@@ -33,6 +35,8 @@ export default function SettingsPanel() {
   const [showInstructionsModal, setShowInstructionsModal] = useState(false);
   const [showEnvVarsModal, setShowEnvVarsModal] = useState(false);
   const [showClaudeCodeSettingsModal, setShowClaudeCodeSettingsModal] = useState(false);
+  const [showExportModal, setShowExportModal] = useState(false);
+  const [showImportModal, setShowImportModal] = useState(false);
 
   // Sync local state when appSettings change
   useEffect(() => {
@@ -268,6 +272,39 @@ export default function SettingsPanel() {
           )}
         </div>
       </AccordionSection>
+
+      <AccordionSection id="backup" title="Backup" defaultOpen={false}>
+        <div className="space-y-2">
+          <p className="text-xs text-[var(--text-secondary)] leading-snug">
+            Export your global settings and stored credentials (a shared Claude login,
+            gateway keys) to one password-encrypted file, or restore them on a new machine.
+            Project-specific settings and container data are never included.
+          </p>
+          <div className="flex gap-2">
+            <button
+              onClick={() => setShowExportModal(true)}
+              className="px-3 py-1.5 text-xs bg-[var(--bg-primary)] border border-[var(--border-color)] rounded hover:bg-[var(--border-color)] transition-colors"
+            >
+              Export settings…
+            </button>
+            <button
+              onClick={() => setShowImportModal(true)}
+              className="px-3 py-1.5 text-xs bg-[var(--bg-primary)] border border-[var(--border-color)] rounded hover:bg-[var(--border-color)] transition-colors"
+            >
+              Import settings…
+            </button>
+          </div>
+        </div>
+      </AccordionSection>
+
+      {showExportModal && <ExportSettingsModal onClose={() => setShowExportModal(false)} />}
+
+      {showImportModal && (
+        <ImportSettingsModal
+          onClose={() => setShowImportModal(false)}
+          onImported={(settings) => setAppSettings(settings)}
+        />
+      )}
 
       {showInstructionsModal && (
         <ClaudeInstructionsModal

@@ -292,6 +292,20 @@ export interface AppSettings {
   global_claude_code_settings: ClaudeCodeSettings | null;
 }
 
+/** What `preview_settings_import` returns before anything is applied —
+ *  counts and presence flags only, never a secret value itself. Built from
+ *  this, not from the raw import file, which the frontend never sees. */
+export interface SettingsImportPreview {
+  exported_at: string;
+  app_version: string;
+  custom_env_var_count: number;
+  gateway_model_count: number;
+  has_claude_code_settings: boolean;
+  has_claude_oauth_token: boolean;
+  has_gateway_api_key: boolean;
+  has_gateway_master_key: boolean;
+}
+
 /** What `inspect_ca_cert_path` reports about a corporate CA path. Errors ride
  *  in the payload rather than rejecting, so the field can render them inline
  *  while the user is still typing. */

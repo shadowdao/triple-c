@@ -552,6 +552,40 @@ survived 92 commits and fourteen days in the public GitHub mirror, past five aud
 independent reviews, because every one of them read the code under change and this sat in a test
 nobody had reason to open. Fixtures are never live values; there is no case where they need to be.
 
+## Settings export/import
+
+`commands::settings_export_commands`, `storage::settings_crypto`, `models::settings_export`
+(triple-c#35). Exports the *host* environment — global `AppSettings` (already the non-secret
+shape persisted to `settings.json`) plus the global secrets that live in the OS keychain instead:
+the shared Claude Code OAuth login and the model gateway's two keys. Per-project settings,
+per-project secrets, and anything in a project's Docker volumes are deliberately out of scope —
+this is not a project backup.
+
+- **Encrypted because it can carry live credentials, not for appearance's sake.** Argon2id derives
+  a 256-bit key from the user's password (memory-hard — meaningfully resistant to GPU/ASIC
+  brute-forcing, unlike PBKDF2 at any reasonable iteration count), AES-256-GCM does the actual
+  encryption. A wrong password fails GCM's authentication tag rather than producing silent
+  garbage. The salt and nonce are not secret and are written in the clear in the file's own
+  header — the salt's job is only to make two exports of the same password derive different keys,
+  and the nonce's only requirement is per-encryption uniqueness, which a fresh random draw on
+  every export already gives it.
+- **The save/open dialogs are opened from Rust**, the same boundary `file_commands.rs`'s
+  `pick_save_path`/`pick_files_to_upload` draw and document at length: a frontend-driven dialog
+  handing Rust a host path string is the exact shape of bug that produced this app's past
+  criticals. `preview_settings_import` resolves the chosen path itself and remembers it
+  (`AppState::pending_settings_import`) so `apply_settings_import` re-reads the same file without
+  a path ever crossing back over IPC.
+- **The password is re-entered, not cached, between preview and apply.** Nothing here holds
+  decrypted plaintext — secrets included — in memory for longer than one command's execution.
+  `preview_settings_import` returns counts and presence flags only (`SettingsImportPreview`),
+  never a secret value, so it's safe to hand to the frontend and render directly.
+- **Import replaces settings wholesale, but only writes secrets actually present in the file.**
+  An import is "restore this environment," so the settings half is a full replace, not a
+  field-by-field merge. Secrets are different on purpose: an absent secret in the export means
+  "the source machine never had this configured," not "delete this on import" — a user who wants
+  to clear a secret already has dedicated UI for that (signing out of shared auth, clearing the
+  gateway key).
+
 ## Testing
 
 Frontend tests use Vitest with jsdom environment and React Testing Library. Setup file at `src/test/setup.ts`. Run a single test file:
