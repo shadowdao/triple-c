@@ -3,7 +3,7 @@ import Modal from "../ui/Modal";
 import Button from "../ui/Button";
 import Field, { inputClass } from "../ui/Field";
 import { applySettingsImport, previewSettingsImport } from "../../lib/tauri-commands";
-import { describeImport } from "../../lib/settingsImportPreview";
+import { describeImport, describeImportWarnings } from "../../lib/settingsImportPreview";
 import type { AppSettings, SettingsImportPreview } from "../../lib/types";
 
 interface Props {
@@ -114,6 +114,14 @@ export default function ImportSettingsModal({ onClose, onImported }: Props) {
               ))}
             </ul>
           </div>
+          {describeImportWarnings(preview).map((warning) => (
+            <p
+              key={warning}
+              className="px-2.5 py-2 text-xs text-[var(--warning)] bg-[var(--warning-muted)] border border-[var(--warning)]/40 rounded-[var(--radius-control)] leading-snug"
+            >
+              {warning}
+            </p>
+          ))}
           {error && <p className="text-xs text-[var(--error)]">{error}</p>}
         </div>
       ) : (

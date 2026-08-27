@@ -24,6 +24,7 @@ use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use argon2::{Algorithm, Argon2, Params, Version};
 use rand::RngCore;
+use zeroize::Zeroizing;
 
 /// Identifies the file as a Triple-C settings export and pins the format —
 /// a change to the salt/nonce lengths or the KDF/cipher choice below needs a
@@ -44,11 +45,16 @@ fn argon2_params() -> Params {
     Params::new(19 * 1024, 2, 1, Some(KEY_LEN)).expect("hardcoded Argon2 params are valid")
 }
 
-fn derive_key(password: &str, salt: &[u8]) -> Result<[u8; KEY_LEN], String> {
+/// The derived key is wrapped in `Zeroizing` so it is overwritten with zeros
+/// when it drops rather than left in freed memory for whatever reuses that
+/// stack slot next — cheap insurance (`zeroize` is already in the dependency
+/// tree via `aes-gcm`) for material that exists only to decrypt live
+/// credentials.
+fn derive_key(password: &str, salt: &[u8]) -> Result<Zeroizing<[u8; KEY_LEN]>, String> {
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, argon2_params());
-    let mut key = [0u8; KEY_LEN];
+    let mut key = Zeroizing::new([0u8; KEY_LEN]);
     argon2
-        .hash_password_into(password.as_bytes(), salt, &mut key)
+        .hash_password_into(password.as_bytes(), salt, &mut *key)
         .map_err(|e| format!("Failed to derive encryption key: {}", e))?;
     Ok(key)
 }
@@ -64,7 +70,7 @@ pub fn encrypt(plaintext: &[u8], password: &str) -> Result<Vec<u8>, String> {
     rand::rng().fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    let cipher = Aes256Gcm::new_from_slice(&key)
+    let cipher = Aes256Gcm::new_from_slice(&*key)
         .map_err(|e| format!("Failed to initialize cipher: {}", e))?;
     let ciphertext = cipher
         .encrypt(nonce, plaintext)
@@ -84,7 +90,12 @@ pub fn encrypt(plaintext: &[u8], password: &str) -> Result<Vec<u8>, String> {
 /// fails to verify for the wrong key on essentially any ciphertext, so there
 /// is no reliable way to tell "wrong password" from "corrupted file" apart,
 /// and guessing would be worse than saying so.
-pub fn decrypt(data: &[u8], password: &str) -> Result<Vec<u8>, String> {
+///
+/// Returns `Zeroizing<Vec<u8>>` rather than a plain `Vec<u8>` — the plaintext
+/// this recovers is the whole settings-plus-secrets payload, so it gets the
+/// same "wipe it when it drops" treatment as the derived key in
+/// [`derive_key`].
+pub fn decrypt(data: &[u8], password: &str) -> Result<Zeroizing<Vec<u8>>, String> {
     if data.len() < HEADER_LEN {
         return Err("This does not look like a Triple-C settings export (file too short).".to_string());
     }
@@ -96,11 +107,12 @@ pub fn decrypt(data: &[u8], password: &str) -> Result<Vec<u8>, String> {
     let ciphertext = &data[HEADER_LEN..];
 
     let key = derive_key(password, salt)?;
-    let cipher = Aes256Gcm::new_from_slice(&key)
+    let cipher = Aes256Gcm::new_from_slice(&*key)
         .map_err(|e| format!("Failed to initialize cipher: {}", e))?;
     let nonce = Nonce::from_slice(nonce_bytes);
     cipher
         .decrypt(nonce, ciphertext)
+        .map(Zeroizing::new)
         .map_err(|_| "Wrong password, or the file is corrupted.".to_string())
 }
 
@@ -113,7 +125,7 @@ mod tests {
         let plaintext = b"{\"settings\": \"whatever\"}";
         let encrypted = encrypt(plaintext, "correct horse battery staple").unwrap();
         let decrypted = decrypt(&encrypted, "correct horse battery staple").unwrap();
-        assert_eq!(decrypted, plaintext);
+        assert_eq!(&*decrypted, plaintext);
     }
 
     #[test]

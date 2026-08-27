@@ -2,12 +2,28 @@
 //!
 //! `SettingsExportPayload` is the whole plaintext export before encryption
 //! and after decryption (see `storage::settings_crypto`). It bundles
-//! `AppSettings` (already the non-secret shape persisted to `settings.json`)
-//! with the global secrets that live in the OS keychain instead — the shared
-//! Claude Code OAuth login and the model gateway's two keys. Per-project
-//! settings, per-project secrets, and anything living in a project's Docker
-//! volumes are deliberately out of scope: this exports the *host*
-//! environment, not any one project's.
+//! `AppSettings` — with one field carved out, see below — with the global
+//! secrets that live in the OS keychain instead: the shared Claude Code
+//! OAuth login and the model gateway's two keys. Per-project settings,
+//! per-project secrets, and anything living in a project's Docker volumes
+//! are deliberately out of scope: this exports the *host* environment, not
+//! any one project's.
+//!
+//! **`AppSettings` is not entirely the non-secret shape it looks like.**
+//! `WebTerminalSettings::access_token` is a live bearer credential for a
+//! server that binds every interface, stored as a plain field on the
+//! struct that is otherwise safe to treat as config. A review of this
+//! feature caught it: exporting `AppSettings` wholesale would have carried
+//! that token along as if it were as inert as a port number, and — worse —
+//! importing it would apply `web_terminal.enabled` and the token together
+//! with no more warning than any other setting, letting a crafted export
+//! silently stand up a LAN-listening terminal server with an
+//! attacker-known token on the next launch. `export_settings` /
+//! `apply_settings_import` blank this field out of the `settings` they
+//! read from and write to, and it travels only through
+//! [`ExportedSecrets::web_terminal_access_token`] instead, with the same
+//! "only overwrite what the import actually has" treatment as the other
+//! three secrets.
 
 use serde::{Deserialize, Serialize};
 
@@ -34,6 +50,12 @@ pub struct ExportedSecrets {
     pub gateway_api_key: Option<String>,
     #[serde(default)]
     pub gateway_master_key: Option<String>,
+    /// See the module doc comment — this is `AppSettings::web_terminal
+    /// .access_token`, carved out because it is a live bearer credential,
+    /// not config, despite living on a struct that is otherwise safe to
+    /// export wholesale.
+    #[serde(default)]
+    pub web_terminal_access_token: Option<String>,
 }
 
 impl ExportedSecrets {
@@ -41,6 +63,7 @@ impl ExportedSecrets {
         self.claude_oauth_token.is_none()
             && self.gateway_api_key.is_none()
             && self.gateway_master_key.is_none()
+            && self.web_terminal_access_token.is_none()
     }
 }
 
@@ -78,31 +101,31 @@ pub struct SettingsImportPreview {
     pub has_claude_oauth_token: bool,
     pub has_gateway_api_key: bool,
     pub has_gateway_master_key: bool,
+    pub has_web_terminal_access_token: bool,
+    /// Whether the imported settings turn the web terminal on. Named
+    /// separately from the token above: `enabled` and the token are two
+    /// different fields, either can be true without the other, and
+    /// "this import turns on a service that listens on your network" is
+    /// exactly the kind of change a wholesale settings replace must not
+    /// bury in a generic "settings replaced" line — see the module doc
+    /// comment on why this field exists at all.
+    pub enables_web_terminal: bool,
 }
 
 impl SettingsImportPreview {
     pub fn from_payload(payload: &SettingsExportPayload) -> Self {
+        let non_blank = |s: &Option<String>| s.as_deref().is_some_and(|v| !v.trim().is_empty());
         Self {
             exported_at: payload.exported_at.clone(),
             app_version: payload.app_version.clone(),
             custom_env_var_count: payload.settings.global_custom_env_vars.len(),
             gateway_model_count: payload.settings.gateway.models.len(),
             has_claude_code_settings: payload.settings.global_claude_code_settings.is_some(),
-            has_claude_oauth_token: payload
-                .secrets
-                .claude_oauth_token
-                .as_deref()
-                .is_some_and(|t| !t.trim().is_empty()),
-            has_gateway_api_key: payload
-                .secrets
-                .gateway_api_key
-                .as_deref()
-                .is_some_and(|k| !k.trim().is_empty()),
-            has_gateway_master_key: payload
-                .secrets
-                .gateway_master_key
-                .as_deref()
-                .is_some_and(|k| !k.trim().is_empty()),
+            has_claude_oauth_token: non_blank(&payload.secrets.claude_oauth_token),
+            has_gateway_api_key: non_blank(&payload.secrets.gateway_api_key),
+            has_gateway_master_key: non_blank(&payload.secrets.gateway_master_key),
+            has_web_terminal_access_token: non_blank(&payload.secrets.web_terminal_access_token),
+            enables_web_terminal: payload.settings.web_terminal.enabled,
         }
     }
 }
@@ -133,6 +156,7 @@ mod tests {
             claude_oauth_token: Some("sk-super-secret-token".to_string()),
             gateway_api_key: Some("sk-another-secret".to_string()),
             gateway_master_key: Some("sk-triple-c-yet-another".to_string()),
+            web_terminal_access_token: Some("wt-super-secret-token".to_string()),
         });
         let preview = SettingsImportPreview::from_payload(&payload);
         let serialized = serde_json::to_string(&preview).unwrap();
@@ -140,9 +164,11 @@ mod tests {
         assert!(!serialized.contains("sk-super-secret-token"));
         assert!(!serialized.contains("sk-another-secret"));
         assert!(!serialized.contains("sk-triple-c-yet-another"));
+        assert!(!serialized.contains("wt-super-secret-token"));
         assert!(preview.has_claude_oauth_token);
         assert!(preview.has_gateway_api_key);
         assert!(preview.has_gateway_master_key);
+        assert!(preview.has_web_terminal_access_token);
     }
 
     #[test]
@@ -154,11 +180,27 @@ mod tests {
             claude_oauth_token: Some("   ".to_string()),
             gateway_api_key: None,
             gateway_master_key: None,
+            web_terminal_access_token: Some("   ".to_string()),
         });
         let preview = SettingsImportPreview::from_payload(&payload);
         assert!(!preview.has_claude_oauth_token);
         assert!(!preview.has_gateway_api_key);
         assert!(!preview.has_gateway_master_key);
+        assert!(!preview.has_web_terminal_access_token);
+    }
+
+    #[test]
+    fn enabling_the_web_terminal_is_surfaced_regardless_of_whether_a_token_came_with_it() {
+        // `enabled` and the token are independent fields — a crafted export
+        // could set one without the other, and both are worth a user's
+        // attention: this is the field that exists specifically so "this
+        // import turns on a service that listens on your network" cannot
+        // hide inside a generic "settings replaced" summary.
+        let mut payload = payload_with(ExportedSecrets::default());
+        payload.settings.web_terminal.enabled = true;
+        let preview = SettingsImportPreview::from_payload(&payload);
+        assert!(preview.enables_web_terminal);
+        assert!(!preview.has_web_terminal_access_token);
     }
 
     #[test]

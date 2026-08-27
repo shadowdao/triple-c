@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { describeImport } from "./settingsImportPreview";
+import { describeImport, describeImportWarnings } from "./settingsImportPreview";
 import type { SettingsImportPreview } from "./types";
 
 function preview(overrides: Partial<SettingsImportPreview> = {}): SettingsImportPreview {
@@ -12,6 +12,8 @@ function preview(overrides: Partial<SettingsImportPreview> = {}): SettingsImport
     has_claude_oauth_token: false,
     has_gateway_api_key: false,
     has_gateway_master_key: false,
+    has_web_terminal_access_token: false,
+    enables_web_terminal: false,
     ...overrides,
   };
 }
@@ -51,5 +53,33 @@ describe("describeImport", () => {
     // None of the count-based items, since both counts are 0.
     expect(items.some((i) => i.includes("env var"))).toBe(false);
     expect(items.some((i) => i.includes("gateway model"))).toBe(false);
+  });
+
+  it("names the web terminal access token like any other present secret", () => {
+    const items = describeImport(preview({ has_web_terminal_access_token: true }));
+    expect(items).toContain("The web terminal access token");
+  });
+});
+
+describe("describeImportWarnings", () => {
+  it("is empty when nothing about the import needs extra attention", () => {
+    expect(describeImportWarnings(preview())).toEqual([]);
+  });
+
+  it("warns when the import enables the web terminal, regardless of the token", () => {
+    // `enabled` and the token are independent — the warning is about the
+    // service turning on, whether or not a token came with it.
+    expect(describeImportWarnings(preview({ enables_web_terminal: true }))).toEqual([
+      "Enables the remote web terminal, which listens on your network.",
+    ]);
+    expect(
+      describeImportWarnings(
+        preview({ enables_web_terminal: true, has_web_terminal_access_token: true }),
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("does not warn just because a web terminal token is present but the terminal is off", () => {
+    expect(describeImportWarnings(preview({ has_web_terminal_access_token: true }))).toEqual([]);
   });
 });

@@ -555,12 +555,26 @@ nobody had reason to open. Fixtures are never live values; there is no case wher
 ## Settings export/import
 
 `commands::settings_export_commands`, `storage::settings_crypto`, `models::settings_export`
-(triple-c#35). Exports the *host* environment — global `AppSettings` (already the non-secret
-shape persisted to `settings.json`) plus the global secrets that live in the OS keychain instead:
-the shared Claude Code OAuth login and the model gateway's two keys. Per-project settings,
-per-project secrets, and anything in a project's Docker volumes are deliberately out of scope —
-this is not a project backup.
+(triple-c#35). Exports the *host* environment — global `AppSettings` plus the global secrets that
+live in the OS keychain instead: the shared Claude Code OAuth login and the model gateway's two
+keys. Per-project settings, per-project secrets, and anything in a project's Docker volumes are
+deliberately out of scope — this is not a project backup.
 
+- **`AppSettings` is not entirely the non-secret shape it looks like, and a review of this feature
+  caught the one place that isn't.** `WebTerminalSettings::access_token` is a live bearer
+  credential for a server that binds every interface — exporting `AppSettings` wholesale would
+  have carried it along as if it were as inert as a port number, and importing it would have
+  applied `web_terminal.enabled` and the token together with no more warning than any other
+  setting, letting a crafted export silently stand up a LAN-listening terminal on the next launch.
+  `export_settings`/`apply_settings_import` carve this one field out into `ExportedSecrets`
+  instead, with the same "only overwrite what the import actually has" treatment as the other
+  three secrets — except "leave it alone" has to be done by hand in `apply_settings_import`, since
+  unlike the keychain secrets this one lives inside the `AppSettings` blob that gets replaced
+  wholesale. `SettingsImportPreview::enables_web_terminal` also exists because of this: `enabled`
+  and the token are independent fields, and "this turns on a listening service" must not hide
+  inside a generic "settings replaced" summary. Read this as the standing example of the class of
+  thing to keep checking for in this feature, not a one-off fixed bug — any other field that looks
+  like config but is actually a live credential would have the same problem.
 - **Encrypted because it can carry live credentials, not for appearance's sake.** Argon2id derives
   a 256-bit key from the user's password (memory-hard — meaningfully resistant to GPU/ASIC
   brute-forcing, unlike PBKDF2 at any reasonable iteration count), AES-256-GCM does the actual
@@ -584,7 +598,22 @@ this is not a project backup.
   field-by-field merge. Secrets are different on purpose: an absent secret in the export means
   "the source machine never had this configured," not "delete this on import" — a user who wants
   to clear a secret already has dedicated UI for that (signing out of shared auth, clearing the
-  gateway key).
+  gateway key). Secrets are restored *before* the settings replace runs, not after — replacing
+  settings is what triggers `reconcile_gateway`, and restoring the other way round leaves a real
+  window where a gateway recreation happens against the destination's old keys.
+- **`read_and_decrypt` checks `format_version` before attempting to parse the full payload, not
+  after.** A version bump that isn't deserialize-compatible is exactly the case that check exists
+  for, and parsing the full struct first would fail on the shape mismatch before the version check
+  ever ran. Neither error path interpolates what `serde_json` actually says into the message
+  shown to the user — its type-mismatch errors quote the offending value inline, and the plaintext
+  here can hold a live credential.
+- **The 8-character password minimum is enforced in `export_settings` itself, not only in the
+  export modal.** The frontend minimum is a UX nudge; the Rust command is the actual boundary a
+  weak password has to cross, and Argon2id's memory-hardness buys little against an attacker who
+  can just try a short password directly. The derived key and the decrypted plaintext are both
+  wrapped in `zeroize::Zeroizing` for the same reason every other secret in this codebase gets
+  handled carefully — cheap insurance (`zeroize` is already pulled in transitively via `aes-gcm`)
+  for material that exists only to hold or produce live credentials.
 
 ## Testing
 

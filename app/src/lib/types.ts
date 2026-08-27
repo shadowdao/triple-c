@@ -304,6 +304,12 @@ export interface SettingsImportPreview {
   has_claude_oauth_token: boolean;
   has_gateway_api_key: boolean;
   has_gateway_master_key: boolean;
+  has_web_terminal_access_token: boolean;
+  /** Whether the import turns the web terminal on — surfaced separately
+   *  from the token above since either can be true without the other, and
+   *  "this enables a service that listens on your network" must not hide
+   *  inside a generic "settings replaced" summary. */
+  enables_web_terminal: boolean;
 }
 
 /** What `inspect_ca_cert_path` reports about a corporate CA path. Errors ride

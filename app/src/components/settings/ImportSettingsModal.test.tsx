@@ -24,6 +24,8 @@ const samplePreview: SettingsImportPreview = {
   has_claude_oauth_token: true,
   has_gateway_api_key: false,
   has_gateway_master_key: false,
+  has_web_terminal_access_token: false,
+  enables_web_terminal: false,
 };
 
 describe("ImportSettingsModal", () => {
@@ -52,6 +54,16 @@ describe("ImportSettingsModal", () => {
     await waitFor(() => expect(applySettingsImport).toHaveBeenCalledWith("hunter2"));
     await waitFor(() => expect(onImported).toHaveBeenCalledWith({}));
     expect(await screen.findByText(/settings imported/i)).toBeInTheDocument();
+  });
+
+  it("shows a distinct warning when the import would enable the web terminal", async () => {
+    previewSettingsImport.mockResolvedValue({ ...samplePreview, enables_web_terminal: true });
+    render(<ImportSettingsModal onClose={vi.fn()} onImported={vi.fn()} />);
+
+    fireEvent.change(screen.getByLabelText("Password"), { target: { value: "hunter2" } });
+    fireEvent.click(screen.getByRole("button", { name: /choose file/i }));
+
+    expect(await screen.findByText(/enables the remote web terminal/i)).toBeInTheDocument();
   });
 
   it("closes quietly when the file picker is dismissed", async () => {

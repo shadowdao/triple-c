@@ -38,6 +38,7 @@ rand = "0.9"
 local-ip-address = "0.6"
 argon2 = "0.5"
 aes-gcm = "0.10"
+zeroize = "1"
 
 [dev-dependencies]
 # `test-util` (not part of tokio's `full`) lets the auto-start retry tests run
