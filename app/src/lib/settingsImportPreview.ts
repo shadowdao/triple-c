@@ -25,6 +25,9 @@ export function describeImport(preview: SettingsImportPreview): string[] {
     items.push(`OpenAI-compatible server: ${preview.openai_compatible_base_url}`);
   }
   if (preview.gateway_api_base) items.push(`Gateway upstream: ${preview.gateway_api_base}`);
+  if (preview.image_source === "custom") {
+    items.push(`Docker image: ${preview.custom_image_name ?? "(no image name set)"}`);
+  }
   return items;
 }
 
@@ -41,6 +44,10 @@ export function describeImport(preview: SettingsImportPreview): string[] {
  * would silently become live the next time someone flips the terminal on
  * through the UI, with no import-time signal that it wasn't freshly
  * generated.
+ *
+ * A custom Docker image gets a warning every time, not just on change: it's
+ * the image every project container is created from, so it's worth calling
+ * out regardless of what was configured before the import.
  */
 export function describeImportWarnings(preview: SettingsImportPreview): string[] {
   const warnings: string[] = [];
@@ -49,6 +56,11 @@ export function describeImportWarnings(preview: SettingsImportPreview): string[]
   } else if (preview.has_web_terminal_access_token) {
     warnings.push(
       "Includes a web terminal access token that will activate the next time the web terminal is turned on.",
+    );
+  }
+  if (preview.image_source === "custom") {
+    warnings.push(
+      `Runs every project container from a custom Docker image: ${preview.custom_image_name ?? "(no image name set)"}.`,
     );
   }
   return warnings;

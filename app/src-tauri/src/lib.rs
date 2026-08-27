@@ -37,7 +37,13 @@ pub struct AppState {
     /// dangerous. Deliberately re-decrypted rather than cached in plaintext:
     /// nothing here holds a decrypted secret in memory for longer than one
     /// command's execution.
-    pub pending_settings_import: Arc<tokio::sync::Mutex<Option<std::path::PathBuf>>>,
+    ///
+    /// Also pins a hash of the file's ciphertext at preview time, so
+    /// `apply_settings_import` can refuse to proceed if the file on disk
+    /// changed underneath the pending import — otherwise confirming a
+    /// preview is not actually binding on what gets applied.
+    pub pending_settings_import:
+        Arc<tokio::sync::Mutex<Option<commands::settings_export_commands::PendingSettingsImport>>>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

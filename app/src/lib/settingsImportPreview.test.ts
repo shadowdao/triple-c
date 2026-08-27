@@ -18,6 +18,8 @@ function preview(overrides: Partial<SettingsImportPreview> = {}): SettingsImport
     llamacpp_base_url: null,
     openai_compatible_base_url: null,
     gateway_api_base: null,
+    image_source: "registry",
+    custom_image_name: null,
     ...overrides,
   };
 }
@@ -76,6 +78,18 @@ describe("describeImport", () => {
     expect(items.some((i) => i.includes("llama.cpp"))).toBe(false);
     expect(items.some((i) => i.includes("OpenAI-compatible"))).toBe(false);
   });
+
+  it("names a custom Docker image when set, falling back to a placeholder if unnamed", () => {
+    expect(
+      describeImport(preview({ image_source: "custom", custom_image_name: "ghcr.io/me/triple-c" })),
+    ).toContain("Docker image: ghcr.io/me/triple-c");
+    expect(describeImport(preview({ image_source: "custom", custom_image_name: null }))).toContain(
+      "Docker image: (no image name set)",
+    );
+    expect(describeImport(preview({ image_source: "registry" })).some((i) => i.includes("Docker image"))).toBe(
+      false,
+    );
+  });
 });
 
 describe("describeImportWarnings", () => {
@@ -100,5 +114,12 @@ describe("describeImportWarnings", () => {
     expect(describeImportWarnings(preview({ has_web_terminal_access_token: true }))).toEqual([
       "Includes a web terminal access token that will activate the next time the web terminal is turned on.",
     ]);
+  });
+
+  it("warns about a custom Docker image every time, not only when it changes", () => {
+    expect(
+      describeImportWarnings(preview({ image_source: "custom", custom_image_name: "evil:latest" })),
+    ).toEqual(["Runs every project container from a custom Docker image: evil:latest."]);
+    expect(describeImportWarnings(preview({ image_source: "registry" }))).toEqual([]);
   });
 });

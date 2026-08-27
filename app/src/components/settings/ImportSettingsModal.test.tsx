@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import ImportSettingsModal from "./ImportSettingsModal";
-import type { AppSettings, SettingsImportPreview } from "../../lib/types";
+import type { AppSettings, SettingsImportOutcome, SettingsImportPreview } from "../../lib/types";
 
 const previewSettingsImport = vi.fn();
 const applySettingsImport = vi.fn();
@@ -30,7 +30,13 @@ const samplePreview: SettingsImportPreview = {
   llamacpp_base_url: null,
   openai_compatible_base_url: null,
   gateway_api_base: null,
+  image_source: "registry",
+  custom_image_name: null,
 };
+
+function outcome(settings: AppSettings, secretRestoreWarnings: string[] = []): SettingsImportOutcome {
+  return { settings, secret_restore_warnings: secretRestoreWarnings };
+}
 
 describe("ImportSettingsModal", () => {
   it("keeps 'Choose file' disabled until a password is entered", () => {
@@ -43,7 +49,7 @@ describe("ImportSettingsModal", () => {
 
   it("shows the preview and confirms with the same password used to open it", async () => {
     previewSettingsImport.mockResolvedValue(samplePreview);
-    applySettingsImport.mockResolvedValue({} as AppSettings);
+    applySettingsImport.mockResolvedValue(outcome({} as AppSettings));
     const onImported = vi.fn();
     render(<ImportSettingsModal onClose={vi.fn()} onImported={onImported} />);
 
@@ -68,6 +74,38 @@ describe("ImportSettingsModal", () => {
     fireEvent.click(screen.getByRole("button", { name: /choose file/i }));
 
     expect(await screen.findByText(/enables the remote web terminal/i)).toBeInTheDocument();
+  });
+
+  it("warns about a custom Docker image every time, not just on change", async () => {
+    previewSettingsImport.mockResolvedValue({
+      ...samplePreview,
+      image_source: "custom",
+      custom_image_name: "ghcr.io/attacker/triple-c:latest",
+    });
+    render(<ImportSettingsModal onClose={vi.fn()} onImported={vi.fn()} />);
+
+    fireEvent.change(screen.getByLabelText("Password"), { target: { value: "hunter2" } });
+    fireEvent.click(screen.getByRole("button", { name: /choose file/i }));
+
+    expect(
+      await screen.findByText(/custom docker image: ghcr\.io\/attacker\/triple-c:latest/i),
+    ).toBeInTheDocument();
+  });
+
+  it("shows a secret-restore warning alongside success rather than hiding it", async () => {
+    previewSettingsImport.mockResolvedValue(samplePreview);
+    applySettingsImport.mockResolvedValue(
+      outcome({} as AppSettings, ["Could not restore the gateway master key: keychain locked"]),
+    );
+    render(<ImportSettingsModal onClose={vi.fn()} onImported={vi.fn()} />);
+
+    fireEvent.change(screen.getByLabelText("Password"), { target: { value: "hunter2" } });
+    fireEvent.click(screen.getByRole("button", { name: /choose file/i }));
+    await screen.findByText(/2 global custom env vars/i);
+
+    fireEvent.click(screen.getByRole("button", { name: /^import$/i }));
+    expect(await screen.findByText(/settings imported/i)).toBeInTheDocument();
+    expect(await screen.findByText(/could not restore the gateway master key/i)).toBeInTheDocument();
   });
 
   it("closes quietly when the file picker is dismissed", async () => {

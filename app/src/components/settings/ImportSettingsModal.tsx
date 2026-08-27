@@ -27,6 +27,7 @@ export default function ImportSettingsModal({ onClose, onImported }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [preview, setPreview] = useState<SettingsImportPreview | null>(null);
   const [applied, setApplied] = useState(false);
+  const [secretWarnings, setSecretWarnings] = useState<string[]>([]);
 
   const handleChooseFile = async () => {
     setError(null);
@@ -46,9 +47,10 @@ export default function ImportSettingsModal({ onClose, onImported }: Props) {
     setError(null);
     setBusy(true);
     try {
-      const settings = await applySettingsImport(password);
+      const outcome = await applySettingsImport(password);
       setApplied(true);
-      onImported(settings);
+      setSecretWarnings(outcome.secret_restore_warnings);
+      onImported(outcome.settings);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -99,29 +101,46 @@ export default function ImportSettingsModal({ onClose, onImported }: Props) {
       }
     >
       {applied ? (
-        <p className="text-[13px] text-[var(--success)]">Settings imported.</p>
+        <div className="space-y-2">
+          <p className="text-[13px] text-[var(--success)]">Settings imported.</p>
+          {secretWarnings.map((warning) => (
+            <p
+              key={warning}
+              className="px-2.5 py-2 text-xs text-[var(--error)] bg-[var(--error-muted)] border border-[var(--error)]/40 rounded-[var(--radius-control)] leading-snug"
+            >
+              {warning}
+            </p>
+          ))}
+        </div>
       ) : preview ? (
         <div className="space-y-3">
           <p className="text-xs text-[var(--text-secondary)]">
             Exported {new Date(preview.exported_at).toLocaleString()} from Triple-C{" "}
             {preview.app_version}.
           </p>
-          <div>
-            <p className="text-[13px] font-medium text-[var(--text-primary)]">This will replace:</p>
-            <ul className="mt-1 list-disc pl-4 text-[13px] text-[var(--text-secondary)] space-y-0.5">
-              {describeImport(preview).map((item) => (
-                <li key={item}>{item}</li>
-              ))}
-            </ul>
-          </div>
+          {/* Warnings render before the replace list, deliberately: the list
+           *  below can run long, and the one thing here that most needs to
+           *  stay above the fold while scrolling is "this turns on a
+           *  network-listening service" or "this runs a different image" —
+           *  not a bullet buried among ordinary settings. */}
           {describeImportWarnings(preview).map((warning) => (
             <p
               key={warning}
-              className="px-2.5 py-2 text-xs text-[var(--warning)] bg-[var(--warning-muted)] border border-[var(--warning)]/40 rounded-[var(--radius-control)] leading-snug"
+              className="px-2.5 py-2 text-xs text-[var(--warning)] bg-[var(--warning-muted)] border border-[var(--warning)]/40 rounded-[var(--radius-control)] leading-snug break-all"
             >
               {warning}
             </p>
           ))}
+          <div>
+            <p className="text-[13px] font-medium text-[var(--text-primary)]">This will replace:</p>
+            <ul className="mt-1 list-disc pl-4 text-[13px] text-[var(--text-secondary)] space-y-0.5">
+              {describeImport(preview).map((item) => (
+                <li key={item} className="break-all">
+                  {item}
+                </li>
+              ))}
+            </ul>
+          </div>
           {error && <p className="text-xs text-[var(--error)]">{error}</p>}
         </div>
       ) : (

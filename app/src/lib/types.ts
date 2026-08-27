@@ -316,6 +316,20 @@ export interface SettingsImportPreview {
   llamacpp_base_url: string | null;
   openai_compatible_base_url: string | null;
   gateway_api_base: string | null;
+  /** Whether the import sets a custom Docker image, and its name if so —
+   *  this is the image every project container is created from, so worth
+   *  more attention than an ordinary setting. */
+  image_source: ImageSource;
+  custom_image_name: string | null;
+}
+
+/** What `apply_settings_import` returns: the settings that were actually
+ *  saved, plus a note for each keychain secret the import carried but could
+ *  not be restored (a partial keychain failure must not read as unqualified
+ *  success just because the settings half went through). */
+export interface SettingsImportOutcome {
+  settings: AppSettings;
+  secret_restore_warnings: string[];
 }
 
 /** What `inspect_ca_cert_path` reports about a corporate CA path. Errors ride

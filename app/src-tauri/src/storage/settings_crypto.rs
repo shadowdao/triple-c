@@ -19,8 +19,14 @@
 //! GCM's requirement that a (key, nonce) pair never repeat. Both hold
 //! because a fresh random value is drawn for each, on every call to
 //! [`encrypt`].
+//!
+//! The whole header (magic + salt + nonce) is passed to AES-GCM as
+//! associated data, not just placed alongside the ciphertext — free to do,
+//! and it makes tampering with any header byte fail the same authentication
+//! check the ciphertext gets, by construction rather than as a side effect
+//! of the salt/nonce also feeding key derivation and the cipher.
 
-use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use argon2::{Algorithm, Argon2, Params, Version};
 use rand::RngCore;
@@ -70,16 +76,23 @@ pub fn encrypt(plaintext: &[u8], password: &str) -> Result<Vec<u8>, String> {
     rand::rng().fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
+    let mut header = Vec::with_capacity(HEADER_LEN);
+    header.extend_from_slice(MAGIC);
+    header.extend_from_slice(&salt);
+    header.extend_from_slice(&nonce_bytes);
+
     let cipher = Aes256Gcm::new_from_slice(&*key)
         .map_err(|e| format!("Failed to initialize cipher: {}", e))?;
+    // The header (magic + salt + nonce) is authenticated as associated data
+    // even though none of it is secret: it costs nothing extra here, and it
+    // means tampering with any header byte is caught by the same tag check
+    // that already covers the ciphertext, by construction rather than as a
+    // side effect of the header also feeding key/nonce derivation.
     let ciphertext = cipher
-        .encrypt(nonce, plaintext)
+        .encrypt(nonce, Payload { msg: plaintext, aad: &header })
         .map_err(|e| format!("Encryption failed: {}", e))?;
 
-    let mut out = Vec::with_capacity(HEADER_LEN + ciphertext.len());
-    out.extend_from_slice(MAGIC);
-    out.extend_from_slice(&salt);
-    out.extend_from_slice(&nonce_bytes);
+    let mut out = header;
     out.extend_from_slice(&ciphertext);
     Ok(out)
 }
@@ -102,6 +115,7 @@ pub fn decrypt(data: &[u8], password: &str) -> Result<Zeroizing<Vec<u8>>, String
     if &data[..MAGIC.len()] != MAGIC {
         return Err("This does not look like a Triple-C settings export (unrecognized file).".to_string());
     }
+    let header = &data[..HEADER_LEN];
     let salt = &data[MAGIC.len()..MAGIC.len() + SALT_LEN];
     let nonce_bytes = &data[MAGIC.len() + SALT_LEN..HEADER_LEN];
     let ciphertext = &data[HEADER_LEN..];
@@ -111,7 +125,7 @@ pub fn decrypt(data: &[u8], password: &str) -> Result<Zeroizing<Vec<u8>>, String
         .map_err(|e| format!("Failed to initialize cipher: {}", e))?;
     let nonce = Nonce::from_slice(nonce_bytes);
     cipher
-        .decrypt(nonce, ciphertext)
+        .decrypt(nonce, Payload { msg: ciphertext, aad: header })
         .map(Zeroizing::new)
         .map_err(|_| "Wrong password, or the file is corrupted.".to_string())
 }

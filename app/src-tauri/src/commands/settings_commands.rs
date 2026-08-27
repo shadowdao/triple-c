@@ -53,6 +53,17 @@ pub fn validate_settings_update(
         incoming.ca_cert_path.as_deref(),
     )?;
 
+    // Third host path this struct owns, same reasoning: any project with
+    // `allow_docker_access` bind-mounts this path in as the Docker socket
+    // (`project_commands.rs`'s container creation), so an unchecked value
+    // here is a read-write bind mount of whatever it names into every such
+    // project's container.
+    crate::commands::project_commands::validate_mounted_host_path(
+        "Docker socket path",
+        before.docker_socket_path.as_deref(),
+        incoming.docker_socket_path.as_deref(),
+    )?;
+
     Ok(())
 }
 

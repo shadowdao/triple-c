@@ -27,7 +27,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::AppSettings;
+use super::{AppSettings, ImageSource};
 
 /// Bumped when the shape of [`SettingsExportPayload`] changes in a way that
 /// isn't just an additive, `#[serde(default)]`-covered field — e.g. if a
@@ -60,11 +60,24 @@ pub struct ExportedSecrets {
 
 impl ExportedSecrets {
     pub fn is_empty(&self) -> bool {
-        self.claude_oauth_token.is_none()
-            && self.gateway_api_key.is_none()
-            && self.gateway_master_key.is_none()
-            && self.web_terminal_access_token.is_none()
+        let blank = |s: &Option<String>| s.as_deref().is_none_or(|v| v.trim().is_empty());
+        blank(&self.claude_oauth_token)
+            && blank(&self.gateway_api_key)
+            && blank(&self.gateway_master_key)
+            && blank(&self.web_terminal_access_token)
     }
+}
+
+/// What `apply_settings_import` hands back: the settings that were actually
+/// saved, plus a human-readable note for each keychain secret this import
+/// carried but could not be restored. A keychain write failing partway
+/// through must not read as unqualified success just because the settings
+/// half of the import went through.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SettingsImportOutcome {
+    pub settings: AppSettings,
+    #[serde(default)]
+    pub secret_restore_warnings: Vec<String>,
 }
 
 /// The full plaintext payload — this is what gets encrypted on export and
@@ -122,12 +135,49 @@ pub struct SettingsImportPreview {
     pub openai_compatible_base_url: Option<String>,
     #[serde(default)]
     pub gateway_api_base: Option<String>,
+    /// Whether the import sets a custom Docker image, and its name if so —
+    /// disclosed for the same reason as the base URLs above, and arguably
+    /// more sharply: this is the image *every* project container is created
+    /// from (`models::container_config::resolve_image_name`), so a crafted
+    /// export pointing it at an attacker-controlled image is a path to
+    /// running arbitrary code with whatever a project's containers are
+    /// allowed to reach (the Docker socket, an SSH key, project files) —
+    /// not merely a redirected API endpoint.
+    #[serde(default)]
+    pub image_source: ImageSource,
+    #[serde(default)]
+    pub custom_image_name: Option<String>,
+}
+
+/// A cap on how much of a decrypted, not-yet-trusted string gets echoed back
+/// into a preview a user reads and a UI renders without truncation of its
+/// own. Applied to every field above that carries free-form text straight
+/// from the import file rather than a count or a boolean — a base URL or an
+/// image name a hostile export author controls has had no validation done
+/// on it yet at preview time, and nothing stops it from being pathological
+/// (embedded control characters, or long enough to blow out the confirmation
+/// dialog and push the security warnings below it off screen).
+const MAX_PREVIEW_STRING_LEN: usize = 100;
+
+fn sanitize_for_preview(value: &str) -> String {
+    let cleaned: String = value.chars().filter(|c| !c.is_control()).collect();
+    let trimmed = cleaned.trim();
+    if trimmed.chars().count() > MAX_PREVIEW_STRING_LEN {
+        let truncated: String = trimmed.chars().take(MAX_PREVIEW_STRING_LEN).collect();
+        format!("{}…", truncated)
+    } else {
+        trimmed.to_string()
+    }
 }
 
 impl SettingsImportPreview {
     pub fn from_payload(payload: &SettingsExportPayload) -> Self {
         let non_blank = |s: &Option<String>| s.as_deref().is_some_and(|v| !v.trim().is_empty());
-        let non_blank_value = |s: &Option<String>| s.clone().filter(|v| !v.trim().is_empty());
+        let sanitized_non_blank = |s: &Option<String>| {
+            s.as_deref()
+                .map(sanitize_for_preview)
+                .filter(|v| !v.is_empty())
+        };
         Self {
             exported_at: payload.exported_at.clone(),
             app_version: payload.app_version.clone(),
@@ -139,12 +189,14 @@ impl SettingsImportPreview {
             has_gateway_master_key: non_blank(&payload.secrets.gateway_master_key),
             has_web_terminal_access_token: non_blank(&payload.secrets.web_terminal_access_token),
             enables_web_terminal: payload.settings.web_terminal.enabled,
-            ollama_base_url: non_blank_value(&payload.settings.global_ollama.base_url),
-            llamacpp_base_url: non_blank_value(&payload.settings.global_llamacpp.base_url),
-            openai_compatible_base_url: non_blank_value(
+            ollama_base_url: sanitized_non_blank(&payload.settings.global_ollama.base_url),
+            llamacpp_base_url: sanitized_non_blank(&payload.settings.global_llamacpp.base_url),
+            openai_compatible_base_url: sanitized_non_blank(
                 &payload.settings.global_openai_compatible.base_url,
             ),
-            gateway_api_base: non_blank_value(&payload.settings.gateway.api_base),
+            gateway_api_base: sanitized_non_blank(&payload.settings.gateway.api_base),
+            image_source: payload.settings.image_source.clone(),
+            custom_image_name: sanitized_non_blank(&payload.settings.custom_image_name),
         }
     }
 }
@@ -155,17 +207,19 @@ mod tests {
     use crate::models::AppSettings;
 
     fn payload_with(secrets: ExportedSecrets) -> SettingsExportPayload {
-        let mut settings = AppSettings::default();
-        settings.global_custom_env_vars = vec![
-            crate::models::EnvVar {
-                key: "A".to_string(),
-                value: "1".to_string(),
-            },
-            crate::models::EnvVar {
-                key: "B".to_string(),
-                value: "2".to_string(),
-            },
-        ];
+        let settings = AppSettings {
+            global_custom_env_vars: vec![
+                crate::models::EnvVar {
+                    key: "A".to_string(),
+                    value: "1".to_string(),
+                },
+                crate::models::EnvVar {
+                    key: "B".to_string(),
+                    value: "2".to_string(),
+                },
+            ],
+            ..AppSettings::default()
+        };
         SettingsExportPayload {
             format_version: SETTINGS_EXPORT_FORMAT_VERSION,
             exported_at: "2026-08-27T00:00:00Z".to_string(),
@@ -263,5 +317,50 @@ mod tests {
             ..Default::default()
         }
         .is_empty());
+    }
+
+    #[test]
+    fn a_secrets_bundle_holding_only_whitespace_still_reports_itself_as_empty() {
+        // Matches the "blank counts as absent" rule every other consumer of
+        // these fields applies (`has_claude_oauth_token` and friends above) —
+        // a keychain entry that exists but holds only whitespace carries
+        // nothing usable, so the export-time "nothing to export" log line
+        // must still fire for it.
+        assert!(ExportedSecrets {
+            claude_oauth_token: Some("   ".to_string()),
+            ..Default::default()
+        }
+        .is_empty());
+    }
+
+    #[test]
+    fn a_custom_docker_image_is_surfaced() {
+        let mut payload = payload_with(ExportedSecrets::default());
+        payload.settings.image_source = crate::models::ImageSource::Custom;
+        payload.settings.custom_image_name = Some("ghcr.io/attacker/triple-c:latest".to_string());
+
+        let preview = SettingsImportPreview::from_payload(&payload);
+        assert_eq!(preview.image_source, crate::models::ImageSource::Custom);
+        assert_eq!(
+            preview.custom_image_name.as_deref(),
+            Some("ghcr.io/attacker/triple-c:latest")
+        );
+    }
+
+    #[test]
+    fn preview_strings_are_stripped_of_control_characters_and_capped_in_length() {
+        let mut payload = payload_with(ExportedSecrets::default());
+        payload.settings.global_ollama.base_url =
+            Some(format!("http://example.test/{}\u{0007}bell", "x".repeat(200)));
+
+        let preview = SettingsImportPreview::from_payload(&payload);
+        let shown = preview.ollama_base_url.expect("non-blank base url");
+        assert!(!shown.contains('\u{0007}'), "control character leaked into the preview");
+        // +1 for the trailing ellipsis appended when truncated.
+        assert!(
+            shown.chars().count() <= MAX_PREVIEW_STRING_LEN + 1,
+            "preview string was not capped: {} chars",
+            shown.chars().count()
+        );
     }
 }

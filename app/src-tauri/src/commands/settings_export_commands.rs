@@ -17,9 +17,12 @@
 //! (`AppState::pending_settings_import`) so `apply_settings_import` re-reads
 //! the same file without the path ever crossing back over IPC.
 //!
-//! The password is re-entered (not cached) between preview and apply, so
-//! that nothing here holds decrypted plaintext — export/import secrets
-//! included — in memory for longer than one command's execution.
+//! The *decrypted payload* is not cached between preview and apply — the
+//! password the frontend passes to each call is what it already held for
+//! the first, not a fresh secret extracted from the user, but nothing here
+//! keeps the plaintext itself — export/import secrets included — around for
+//! longer than one command's execution; `apply_settings_import` re-decrypts
+//! the file rather than reusing anything `preview_settings_import` computed.
 //!
 //! **This is new attack surface**: a settings export is a file one person
 //! can hand another and ask them to import, together with a password, and
@@ -29,18 +32,38 @@
 //! and treat that as the standing example of the class of thing to keep
 //! checking for here, not a one-off fixed bug.
 
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 
+use sha2::{Digest, Sha256};
 use tauri::State;
 use tauri_plugin_dialog::DialogExt;
 use zeroize::Zeroizing;
 
 use crate::models::{
-    AppSettings, ExportedSecrets, SettingsExportPayload, SettingsImportPreview,
-    SETTINGS_EXPORT_FORMAT_VERSION,
+    AppSettings, ExportedSecrets, SettingsExportPayload, SettingsImportOutcome,
+    SettingsImportPreview, SETTINGS_EXPORT_FORMAT_VERSION,
 };
 use crate::storage::{secure, settings_crypto};
 use crate::AppState;
+
+/// What `preview_settings_import` pins so `apply_settings_import` can tell
+/// whether the file it's about to re-read is the same one the user actually
+/// saw a preview of. Confirming a preview is only meaningful if it's binding
+/// on what gets applied — without this, a file replaced on disk between the
+/// two calls (this app's own stated threat model is a file shared between
+/// people, which may sit in a synced or shared directory) would decrypt and
+/// apply silently different content than what the confirmation dialog showed.
+#[derive(Debug, Clone)]
+pub struct PendingSettingsImport {
+    path: PathBuf,
+    ciphertext_hash: [u8; 32],
+}
+
+fn hash_ciphertext(data: &[u8]) -> [u8; 32] {
+    Sha256::digest(data).into()
+}
 
 const FILE_EXTENSION: &str = "triplec";
 
@@ -166,10 +189,13 @@ pub async fn export_settings(
 /// preview (counts and presence flags only — never a secret value) for a
 /// confirmation UI. `Ok(None)` means the picker was dismissed.
 ///
-/// Remembers the resolved path in `AppState::pending_settings_import` for
-/// `apply_settings_import` to re-read; does **not** remember the decrypted
-/// payload itself, so the password must be supplied again to actually apply
-/// it — seeing the preview is not the same as committing to it.
+/// Remembers the resolved path *and a hash of the file's ciphertext* in
+/// `AppState::pending_settings_import` for `apply_settings_import` to check
+/// against — does **not** remember the decrypted payload itself, so the
+/// password must be supplied again to actually apply it — seeing the preview
+/// is not the same as committing to it. The hash exists so it also can't be
+/// swapped out from under that commitment: `apply_settings_import` refuses to
+/// proceed if the file on disk no longer matches what was just previewed.
 #[tauri::command]
 pub async fn preview_settings_import(
     password: String,
@@ -184,10 +210,14 @@ pub async fn preview_settings_import(
         return Ok(None);
     };
 
-    let payload = read_and_decrypt(&path, &password)?;
+    let encrypted = std::fs::read(&path).map_err(|e| format!("Failed to read export file: {}", e))?;
+    let payload = read_and_decrypt_bytes(&encrypted, &password)?;
     let preview = SettingsImportPreview::from_payload(&payload);
 
-    *state.pending_settings_import.lock().await = Some(path);
+    *state.pending_settings_import.lock().await = Some(PendingSettingsImport {
+        path,
+        ciphertext_hash: hash_ciphertext(&encrypted),
+    });
 
     Ok(Some(preview))
 }
@@ -196,7 +226,14 @@ pub async fn preview_settings_import(
 /// for. Fails if no preview is pending — this is not a general "decrypt and
 /// apply this file" entry point, deliberately: seeing the preview first is
 /// required, not just encouraged, since it is the only place a user is told
-/// what an import is about to touch before it touches it.
+/// what an import is about to touch before it touches it. That requirement
+/// is only real if the file can't change out from under it, so this also
+/// refuses to proceed if the file's ciphertext no longer matches the hash
+/// `preview_settings_import` pinned — a file replaced on disk between the
+/// two calls (this feature's own threat model is a file shared between
+/// people, which may sit in a synced or shared directory) must not be able
+/// to apply silently different content than what the confirmation dialog
+/// showed.
 ///
 /// Global settings are replaced wholesale — an import is "restore this
 /// environment," not a field-by-field merge. Global secrets are handled
@@ -227,30 +264,48 @@ pub async fn preview_settings_import(
 /// `reconcile_gateway`), so a gateway recreation that replace provokes sees
 /// the final key material rather than racing it — restoring the other way
 /// round left a real window where the running gateway and the keychain
-/// briefly disagreed.
+/// briefly disagreed. A gateway *secret* alone (same shape, new key) is
+/// invisible to `reconcile_gateway`'s shape comparison, so this additionally
+/// nudges a running gateway container to recreate itself whenever a secret
+/// this import carried was actually written — otherwise the running
+/// container keeps serving the old key material indefinitely while every
+/// project container is handed the new one.
 ///
-/// The pending path is only cleared on success. A failure here (rejected by
-/// the validation above, or some other error) leaves the import pending so
-/// the frontend can let the user retry `apply` without making them pick the
-/// file and re-enter the password again — the preview's job was confirming
-/// *what* to import, not spending the one attempt at applying it.
+/// A keychain write failing is reported back rather than only logged: an
+/// import that silently restores two of three secrets but not the third
+/// must not read as unqualified success.
+///
+/// The pending import is only cleared on success. A failure here (rejected
+/// by the validation above, a stale-file mismatch, or some other error)
+/// leaves it pending so the frontend can let the user retry `apply` without
+/// making them pick the file and re-enter the password again — the
+/// preview's job was confirming *what* to import, not spending the one
+/// attempt at applying it.
 #[tauri::command]
 pub async fn apply_settings_import(
     password: String,
     state: State<'_, AppState>,
-) -> Result<AppSettings, String> {
+) -> Result<SettingsImportOutcome, String> {
     if password.is_empty() {
         return Err("A password is required to import settings.".to_string());
     }
 
-    let path = state
+    let pending = state
         .pending_settings_import
         .lock()
         .await
         .clone()
         .ok_or_else(|| "No import is pending — choose a file first.".to_string())?;
 
-    let payload = read_and_decrypt(&path, &password)?;
+    let encrypted = std::fs::read(&pending.path)
+        .map_err(|e| format!("Failed to read export file: {}", e))?;
+    if hash_ciphertext(&encrypted) != pending.ciphertext_hash {
+        return Err(
+            "This file changed since you reviewed it — choose it again to see an up-to-date preview."
+                .to_string(),
+        );
+    }
+    let payload = read_and_decrypt_bytes(&encrypted, &password)?;
 
     let current = state.settings_store.get();
 
@@ -266,37 +321,81 @@ pub async fn apply_settings_import(
 
     crate::commands::settings_commands::validate_settings_update(&current, &settings)?;
 
+    let mut secret_restore_warnings = Vec::new();
+    let mut gateway_secret_changed = false;
+
     if let Some(token) = non_blank(payload.secrets.claude_oauth_token) {
         if let Err(e) = secure::store_claude_oauth_token(&token) {
             log::warn!(
                 "Settings import: could not restore the shared Claude login: {}",
                 e
             );
+            secret_restore_warnings
+                .push(format!("Could not restore your shared Claude login: {}", e));
         }
     }
     if let Some(key) = non_blank(payload.secrets.gateway_api_key) {
-        if let Err(e) = secure::store_gateway_api_key(&key) {
-            log::warn!(
-                "Settings import: could not restore the gateway provider API key: {}",
-                e
-            );
+        match secure::store_gateway_api_key(&key) {
+            Ok(()) => gateway_secret_changed = true,
+            Err(e) => {
+                log::warn!(
+                    "Settings import: could not restore the gateway provider API key: {}",
+                    e
+                );
+                secret_restore_warnings.push(format!(
+                    "Could not restore the gateway provider API key: {}",
+                    e
+                ));
+            }
         }
     }
     if let Some(key) = non_blank(payload.secrets.gateway_master_key) {
-        if let Err(e) = secure::store_gateway_master_key(&key) {
-            log::warn!(
-                "Settings import: could not restore the gateway master key: {}",
-                e
-            );
+        match secure::store_gateway_master_key(&key) {
+            Ok(()) => gateway_secret_changed = true,
+            Err(e) => {
+                log::warn!(
+                    "Settings import: could not restore the gateway master key: {}",
+                    e
+                );
+                secret_restore_warnings
+                    .push(format!("Could not restore the gateway master key: {}", e));
+            }
         }
     }
 
     let saved =
         crate::commands::settings_commands::update_settings(settings, state.clone()).await?;
 
+    // `reconcile_gateway` (inside `update_settings`) only reacts to a changed
+    // *shape* — port, provider, base URL, models — because that's what's
+    // rendered into the container's config. A secret changing with the shape
+    // held constant is invisible to it, so a running gateway container would
+    // otherwise keep serving the old key material forever after an import
+    // that restored a new one, while `docker::gateway`'s own fingerprint
+    // (which does include the secret rotation id) means the *next* unrelated
+    // settings save would suddenly and confusingly recreate it instead.
+    if gateway_secret_changed && saved.gateway.enabled {
+        match crate::docker::gateway::gateway_container_presence().await {
+            Ok((true, true)) => {
+                if let Err(e) = crate::docker::gateway::ensure_gateway_running(&saved.gateway).await
+                {
+                    log::error!(
+                        "Settings import: could not apply the restored gateway credentials to the running gateway container: {}",
+                        e
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(e) => log::debug!("Settings import: gateway reconcile skipped ({})", e),
+        }
+    }
+
     state.pending_settings_import.lock().await.take();
 
-    Ok(saved)
+    Ok(SettingsImportOutcome {
+        settings: saved,
+        secret_restore_warnings,
+    })
 }
 
 fn non_blank(value: Option<String>) -> Option<String> {
@@ -310,8 +409,22 @@ struct FormatVersionProbe {
     format_version: u32,
 }
 
-/// Decrypt and parse an export file, checking the format version **before**
-/// attempting to deserialize the full payload.
+/// Read and decrypt an export file at `path`, then parse it — see
+/// `read_and_decrypt_bytes` for why the format-version check runs before the
+/// full parse. Every real caller already has the file's bytes in hand by the
+/// time it needs this (`preview_settings_import`/`apply_settings_import`
+/// both hash the ciphertext first) and calls `read_and_decrypt_bytes`
+/// directly to avoid reading the file twice; this path-based wrapper only
+/// exists now for tests that don't need that.
+#[cfg(test)]
+fn read_and_decrypt(path: &Path, password: &str) -> Result<SettingsExportPayload, String> {
+    let encrypted =
+        std::fs::read(path).map_err(|e| format!("Failed to read export file: {}", e))?;
+    read_and_decrypt_bytes(&encrypted, password)
+}
+
+/// Decrypt and parse an already-read export file's bytes, checking the
+/// format version **before** attempting to deserialize the full payload.
 ///
 /// That ordering is not just tidiness: a version bump that isn't
 /// deserialize-compatible (a field's type changes, not just a new
@@ -324,10 +437,8 @@ struct FormatVersionProbe {
 /// password), but the plaintext it decrypts to can hold a live credential,
 /// so neither error path below ever interpolates what `serde_json`
 /// actually says — only a fixed, generic message.
-fn read_and_decrypt(path: &Path, password: &str) -> Result<SettingsExportPayload, String> {
-    let encrypted =
-        std::fs::read(path).map_err(|e| format!("Failed to read export file: {}", e))?;
-    let plaintext = settings_crypto::decrypt(&encrypted, password)?;
+fn read_and_decrypt_bytes(encrypted: &[u8], password: &str) -> Result<SettingsExportPayload, String> {
+    let plaintext = settings_crypto::decrypt(encrypted, password)?;
 
     let probe: FormatVersionProbe = serde_json::from_slice(&plaintext)
         .map_err(|_| "This file doesn't look like a valid settings export.".to_string())?;
@@ -354,6 +465,21 @@ mod tests {
         assert_eq!(non_blank(Some("".to_string())), None);
         assert_eq!(non_blank(None), None);
         assert_eq!(non_blank(Some(" a ".to_string())), Some(" a ".to_string()));
+    }
+
+    #[test]
+    fn ciphertext_hashing_is_deterministic_and_tamper_sensitive() {
+        // What `apply_settings_import` compares against the pinned hash from
+        // `preview_settings_import` to detect a file swapped out from under a
+        // pending import — this only defends anything if identical bytes
+        // always hash identically and any change to those bytes changes the
+        // hash.
+        let bytes = b"pretend this is an encrypted export file";
+        assert_eq!(hash_ciphertext(bytes), hash_ciphertext(bytes));
+
+        let mut tampered = bytes.to_vec();
+        tampered[0] ^= 0xFF;
+        assert_ne!(hash_ciphertext(bytes), hash_ciphertext(&tampered));
     }
 
     fn write_export(
