@@ -16,11 +16,14 @@ name: Publish Arch Package
 #
 # It renders `packaging/arch/PKGBUILD` for one specific version (real
 # download URL, real sha256sums — never guessed; see the resolve-asset step),
-# validates it with `makepkg`/`namcap` in a real Arch container, and uploads
-# the resulting `.pkg.tar.zst` to the GitHub release it was built from —
-# installable by hand with `pacman -U`. It does NOT commit anything back to
-# this repo — `packaging/arch/PKGBUILD` stays a hand-maintained template with
-# a placeholder version, and the workflow never starts from or writes to it.
+# validates it with `makepkg`/`namcap` in a real Arch container, and attaches
+# the resulting `.pkg.tar.zst` — installable by hand with `pacman -U` — to
+# *both* the GitHub release it was built from and the corresponding Gitea
+# release (the plain, unsuffixed `vX.Y.Z` tag build-app.yml's Linux job
+# creates; the `-win`/`-mac` suffixed Gitea releases are a different tag and
+# don't get this asset). It does NOT commit anything back to this repo —
+# `packaging/arch/PKGBUILD` stays a hand-maintained template with a
+# placeholder version, and the workflow never starts from or writes to it.
 #
 # ## Not published to the AUR (yet)
 #
@@ -42,6 +45,8 @@ on:
 
 env:
   GITHUB_REPO: shadowdao/triple-c
+  GITEA_URL: ${{ gitea.server_url }}
+  REPO: ${{ gitea.repository }}
 
 jobs:
   publish:
@@ -295,4 +300,69 @@ jobs:
             "${UPLOAD_URL}?name=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1]))" "${PKG_FILE}")" \
             > /dev/null
 
-          echo "Attached ${PKG_FILE} to ${TAG}"
+          echo "Attached ${PKG_FILE} to ${TAG} on GitHub"
+
+      - name: Attach the package to the Gitea release
+        env:
+          TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+          PKG_FILE: ${{ steps.build.outputs.pkg_file }}
+        run: |
+          set -euo pipefail
+
+          # Same get-or-create-by-tag, delete-existing-asset,
+          # upload-as-octet-stream shape build-app.yml's own Gitea upload
+          # step already uses — this is expected to always hit the "reuse"
+          # branch, since build-app.yml's Linux job already created this
+          # exact release for this exact tag; the create fallback is here
+          # only so this doesn't hard-depend on that ordering.
+          HTTP_CODE=$(curl -sS -o release.json -w '%{http_code}' \
+            -H "Authorization: token ${TOKEN}" \
+            "${GITEA_URL}/api/v1/repos/${REPO}/releases/tags/${TAG}")
+          case "${HTTP_CODE}" in
+            200)
+              echo "Release ${TAG} already exists on Gitea, reusing"
+              ;;
+            404)
+              echo "Creating release ${TAG} on Gitea"
+              curl -fsS -X POST \
+                -H "Authorization: token ${TOKEN}" \
+                -H "Content-Type: application/json" \
+                -d "{\"tag_name\": \"${TAG}\", \"name\": \"Triple-C ${TAG} (Linux)\"}" \
+                "${GITEA_URL}/api/v1/repos/${REPO}/releases" > release.json
+              ;;
+            *)
+              echo "Unexpected ${HTTP_CODE} looking up release ${TAG} on Gitea:" >&2
+              cat release.json >&2
+              exit 1
+              ;;
+          esac
+
+          RELEASE_ID=$(python3 -c "import json; print(json.load(open('release.json')).get('id',''))")
+          if [ -z "${RELEASE_ID}" ]; then
+            echo "No Gitea release id for ${TAG}; refusing to upload into nothing:" >&2
+            cat release.json >&2
+            exit 1
+          fi
+
+          EXISTING_ID=$(curl -sS \
+            -H "Authorization: token ${TOKEN}" \
+            "${GITEA_URL}/api/v1/repos/${REPO}/releases/${RELEASE_ID}/assets" \
+            | python3 -c "import json,sys; t=sys.argv[1]; print(next((a['id'] for a in json.load(sys.stdin) if a.get('name')==t), ''))" "${PKG_FILE}")
+          if [ -n "${EXISTING_ID}" ]; then
+            echo "Replacing the existing ${PKG_FILE} (asset id ${EXISTING_ID}) already on ${TAG}"
+            curl -fsS -X DELETE \
+              -H "Authorization: token ${TOKEN}" \
+              "${GITEA_URL}/api/v1/repos/${REPO}/releases/${RELEASE_ID}/assets/${EXISTING_ID}"
+          fi
+
+          curl -fsS --http1.1 \
+            --retry 5 --retry-all-errors --retry-delay 5 \
+            --max-time 600 \
+            -X POST \
+            -H "Authorization: token ${TOKEN}" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary "@rendered/${PKG_FILE}" \
+            "${GITEA_URL}/api/v1/repos/${REPO}/releases/${RELEASE_ID}/assets?name=${PKG_FILE}"
+
+          echo "Attached ${PKG_FILE} to ${TAG} on Gitea"
