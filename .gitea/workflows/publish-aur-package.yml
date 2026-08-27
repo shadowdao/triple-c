@@ -160,10 +160,23 @@ jobs:
           text, n = re.subn(r"(?m)^pkgrel=.*$", "pkgrel=1", text, count=1)
           assert n == 1, "pkgrel=... line not found"
 
+          # Built with a "$" variable and plain "+" concatenation rather than
+          # an f-string's double-brace escape for a literal brace: writing
+          # this as an f-string put a dollar sign directly against two open
+          # braces, right here in this workflow's own YAML text — and this
+          # runner's own expression templating scans a run: block for that
+          # exact two-character opening sequence and tries to evaluate
+          # whatever sits inside as one of ITS OWN expressions (a step
+          # output, a secret, ...) before the shell ever sees this script.
+          # "pkgver" isn't one of those, so that lookup failed and silently
+          # emptied this whole step rather than raising anything here.
+          # Spelling the dollar sign out of a variable instead means this
+          # file's own text never contains that trigger sequence.
+          DOLLAR = "$"
           old_source = (
-              f'source=("Triple-C_${{pkgver}}_amd64.deb::'
-              f'https://github.com/{github_repo}/releases/download/v${{pkgver}}/'
-              f'Triple-C_${{pkgver}}_amd64.deb"'
+              "source=(\"Triple-C_" + DOLLAR + "{pkgver}_amd64.deb::"
+              + "https://github.com/" + github_repo + "/releases/download/v" + DOLLAR + "{pkgver}/"
+              + "Triple-C_" + DOLLAR + "{pkgver}_amd64.deb\""
           )
           new_source = (
               f'source=("{deb_name}::'
