@@ -310,6 +310,12 @@ export interface SettingsImportPreview {
    *  "this enables a service that listens on your network" must not hide
    *  inside a generic "settings replaced" summary. */
   enables_web_terminal: boolean;
+  /** Non-blank custom base URLs the import would set — endpoints, not
+   *  secrets, so shown verbatim to disclose a redirect of model traffic. */
+  ollama_base_url: string | null;
+  llamacpp_base_url: string | null;
+  openai_compatible_base_url: string | null;
+  gateway_api_base: string | null;
 }
 
 /** What `inspect_ca_cert_path` reports about a corporate CA path. Errors ride

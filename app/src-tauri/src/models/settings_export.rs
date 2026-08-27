@@ -110,11 +110,24 @@ pub struct SettingsImportPreview {
     /// bury in a generic "settings replaced" line — see the module doc
     /// comment on why this field exists at all.
     pub enables_web_terminal: bool,
+    /// Non-blank custom base URLs the import would set, so a redirect of
+    /// model traffic to somewhere other than the usual provider is visible
+    /// at import time rather than discovered later. These are endpoints, not
+    /// secrets — safe to show verbatim, unlike everything above.
+    #[serde(default)]
+    pub ollama_base_url: Option<String>,
+    #[serde(default)]
+    pub llamacpp_base_url: Option<String>,
+    #[serde(default)]
+    pub openai_compatible_base_url: Option<String>,
+    #[serde(default)]
+    pub gateway_api_base: Option<String>,
 }
 
 impl SettingsImportPreview {
     pub fn from_payload(payload: &SettingsExportPayload) -> Self {
         let non_blank = |s: &Option<String>| s.as_deref().is_some_and(|v| !v.trim().is_empty());
+        let non_blank_value = |s: &Option<String>| s.clone().filter(|v| !v.trim().is_empty());
         Self {
             exported_at: payload.exported_at.clone(),
             app_version: payload.app_version.clone(),
@@ -126,6 +139,12 @@ impl SettingsImportPreview {
             has_gateway_master_key: non_blank(&payload.secrets.gateway_master_key),
             has_web_terminal_access_token: non_blank(&payload.secrets.web_terminal_access_token),
             enables_web_terminal: payload.settings.web_terminal.enabled,
+            ollama_base_url: non_blank_value(&payload.settings.global_ollama.base_url),
+            llamacpp_base_url: non_blank_value(&payload.settings.global_llamacpp.base_url),
+            openai_compatible_base_url: non_blank_value(
+                &payload.settings.global_openai_compatible.base_url,
+            ),
+            gateway_api_base: non_blank_value(&payload.settings.gateway.api_base),
         }
     }
 }
@@ -138,8 +157,14 @@ mod tests {
     fn payload_with(secrets: ExportedSecrets) -> SettingsExportPayload {
         let mut settings = AppSettings::default();
         settings.global_custom_env_vars = vec![
-            crate::models::EnvVar { key: "A".to_string(), value: "1".to_string() },
-            crate::models::EnvVar { key: "B".to_string(), value: "2".to_string() },
+            crate::models::EnvVar {
+                key: "A".to_string(),
+                value: "1".to_string(),
+            },
+            crate::models::EnvVar {
+                key: "B".to_string(),
+                value: "2".to_string(),
+            },
         ];
         SettingsExportPayload {
             format_version: SETTINGS_EXPORT_FORMAT_VERSION,
@@ -201,6 +226,26 @@ mod tests {
         let preview = SettingsImportPreview::from_payload(&payload);
         assert!(preview.enables_web_terminal);
         assert!(!preview.has_web_terminal_access_token);
+    }
+
+    #[test]
+    fn custom_base_urls_are_surfaced_but_blank_ones_read_as_absent() {
+        let mut payload = payload_with(ExportedSecrets::default());
+        payload.settings.global_ollama.base_url = Some("http://attacker.example:11434".to_string());
+        payload.settings.global_llamacpp.base_url = Some("   ".to_string());
+        payload.settings.gateway.api_base = Some("https://gateway.example/v1".to_string());
+
+        let preview = SettingsImportPreview::from_payload(&payload);
+        assert_eq!(
+            preview.ollama_base_url.as_deref(),
+            Some("http://attacker.example:11434")
+        );
+        assert_eq!(preview.llamacpp_base_url, None);
+        assert_eq!(preview.openai_compatible_base_url, None);
+        assert_eq!(
+            preview.gateway_api_base.as_deref(),
+            Some("https://gateway.example/v1")
+        );
     }
 
     #[test]

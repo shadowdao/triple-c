@@ -14,6 +14,10 @@ function preview(overrides: Partial<SettingsImportPreview> = {}): SettingsImport
     has_gateway_master_key: false,
     has_web_terminal_access_token: false,
     enables_web_terminal: false,
+    ollama_base_url: null,
+    llamacpp_base_url: null,
+    openai_compatible_base_url: null,
+    gateway_api_base: null,
     ...overrides,
   };
 }
@@ -59,6 +63,19 @@ describe("describeImport", () => {
     const items = describeImport(preview({ has_web_terminal_access_token: true }));
     expect(items).toContain("The web terminal access token");
   });
+
+  it("names custom base URLs verbatim, since they're endpoints rather than secrets", () => {
+    const items = describeImport(
+      preview({
+        ollama_base_url: "http://10.0.0.5:11434",
+        gateway_api_base: "https://gateway.example/v1",
+      }),
+    );
+    expect(items).toContain("Ollama server: http://10.0.0.5:11434");
+    expect(items).toContain("Gateway upstream: https://gateway.example/v1");
+    expect(items.some((i) => i.includes("llama.cpp"))).toBe(false);
+    expect(items.some((i) => i.includes("OpenAI-compatible"))).toBe(false);
+  });
 });
 
 describe("describeImportWarnings", () => {
@@ -79,7 +96,9 @@ describe("describeImportWarnings", () => {
     ).toHaveLength(1);
   });
 
-  it("does not warn just because a web terminal token is present but the terminal is off", () => {
-    expect(describeImportWarnings(preview({ has_web_terminal_access_token: true }))).toEqual([]);
+  it("warns about a dormant web terminal token even while the terminal stays off", () => {
+    expect(describeImportWarnings(preview({ has_web_terminal_access_token: true }))).toEqual([
+      "Includes a web terminal access token that will activate the next time the web terminal is turned on.",
+    ]);
   });
 });

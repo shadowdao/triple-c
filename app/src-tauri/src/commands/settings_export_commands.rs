@@ -33,6 +33,7 @@ use std::path::{Path, PathBuf};
 
 use tauri::State;
 use tauri_plugin_dialog::DialogExt;
+use zeroize::Zeroizing;
 
 use crate::models::{
     AppSettings, ExportedSecrets, SettingsExportPayload, SettingsImportPreview,
@@ -122,7 +123,11 @@ pub async fn export_settings(
     window: tauri::Window,
     state: State<'_, AppState>,
 ) -> Result<bool, String> {
-    if password.len() < MIN_PASSWORD_LEN {
+    // `.chars().count()` — Unicode scalar values, not bytes — to stay as
+    // close as this pair of languages allows to the frontend's `.length`
+    // check (UTF-16 code units); the two only diverge on astral-plane
+    // characters, which no reasonable password touches.
+    if password.chars().count() < MIN_PASSWORD_LEN {
         return Err(format!(
             "Use a password of at least {} characters.",
             MIN_PASSWORD_LEN
@@ -146,8 +151,10 @@ pub async fn export_settings(
         secrets,
     };
 
-    let plaintext = serde_json::to_vec(&payload)
-        .map_err(|e| format!("Failed to prepare settings for export: {}", e))?;
+    let plaintext = Zeroizing::new(
+        serde_json::to_vec(&payload)
+            .map_err(|e| format!("Failed to prepare settings for export: {}", e))?,
+    );
     let encrypted = settings_crypto::encrypt(&plaintext, &password)?;
 
     std::fs::write(&dest, &encrypted).map_err(|e| format!("Failed to write export file: {}", e))?;
@@ -200,18 +207,33 @@ pub async fn preview_settings_import(
 /// on import." A user who wants to clear a secret already has dedicated UI
 /// for that (signing out of shared auth, clearing the gateway key).
 ///
-/// Order matters here: secrets are restored **before** the settings replace
-/// runs (which is what triggers `reconcile_gateway`), so a gateway
-/// recreation that replace provokes sees the final key material rather than
-/// racing it — restoring the other way round left a real window where the
-/// running gateway and the keychain briefly disagreed.
+/// Order matters here, twice over.
 ///
-/// The pending path is only cleared on success. A failure here (a rejected
-/// host path, a keychain write failure surfaced some other way) leaves the
-/// import pending so the frontend can let the user retry `apply` without
-/// making them pick the file and re-enter the password again — the
-/// preview's job was confirming *what* to import, not spending the one
-/// attempt at applying it.
+/// First: the imported settings are **validated before any secret is
+/// written**, using the same checks `update_settings` itself runs
+/// (`settings_commands::validate_settings_update`). Restoring a secret is
+/// hard to undo unnoticed — a stale env-var-name rejection or a disallowed
+/// host path used to be caught only when `update_settings` ran, by which
+/// point the three keychain secrets below were already overwritten with the
+/// file's, each with a fresh rotation id, silently flagging every project
+/// container for recreation — while the error the user saw talked only
+/// about the rejected setting and said nothing about the credentials that
+/// had already moved. Failing this check first makes a rejected import
+/// leave nothing touched, matching what "the import failed" is supposed to
+/// mean.
+///
+/// Second, among the things that *do* get written: secrets are restored
+/// **before** the settings replace runs (which is what triggers
+/// `reconcile_gateway`), so a gateway recreation that replace provokes sees
+/// the final key material rather than racing it — restoring the other way
+/// round left a real window where the running gateway and the keychain
+/// briefly disagreed.
+///
+/// The pending path is only cleared on success. A failure here (rejected by
+/// the validation above, or some other error) leaves the import pending so
+/// the frontend can let the user retry `apply` without making them pick the
+/// file and re-enter the password again — the preview's job was confirming
+/// *what* to import, not spending the one attempt at applying it.
 #[tauri::command]
 pub async fn apply_settings_import(
     password: String,
@@ -230,21 +252,7 @@ pub async fn apply_settings_import(
 
     let payload = read_and_decrypt(&path, &password)?;
 
-    if let Some(token) = non_blank(payload.secrets.claude_oauth_token) {
-        if let Err(e) = secure::store_claude_oauth_token(&token) {
-            log::warn!("Settings import: could not restore the shared Claude login: {}", e);
-        }
-    }
-    if let Some(key) = non_blank(payload.secrets.gateway_api_key) {
-        if let Err(e) = secure::store_gateway_api_key(&key) {
-            log::warn!("Settings import: could not restore the gateway provider API key: {}", e);
-        }
-    }
-    if let Some(key) = non_blank(payload.secrets.gateway_master_key) {
-        if let Err(e) = secure::store_gateway_master_key(&key) {
-            log::warn!("Settings import: could not restore the gateway master key: {}", e);
-        }
-    }
+    let current = state.settings_store.get();
 
     // The web-terminal token lives inside `AppSettings` itself rather than
     // the keychain, so "leave an absent secret alone" has to be done by
@@ -254,9 +262,37 @@ pub async fn apply_settings_import(
     // `split_settings_and_secrets`).
     let mut settings = payload.settings;
     settings.web_terminal.access_token = non_blank(payload.secrets.web_terminal_access_token)
-        .or_else(|| state.settings_store.get().web_terminal.access_token);
+        .or_else(|| current.web_terminal.access_token.clone());
 
-    let saved = crate::commands::settings_commands::update_settings(settings, state.clone()).await?;
+    crate::commands::settings_commands::validate_settings_update(&current, &settings)?;
+
+    if let Some(token) = non_blank(payload.secrets.claude_oauth_token) {
+        if let Err(e) = secure::store_claude_oauth_token(&token) {
+            log::warn!(
+                "Settings import: could not restore the shared Claude login: {}",
+                e
+            );
+        }
+    }
+    if let Some(key) = non_blank(payload.secrets.gateway_api_key) {
+        if let Err(e) = secure::store_gateway_api_key(&key) {
+            log::warn!(
+                "Settings import: could not restore the gateway provider API key: {}",
+                e
+            );
+        }
+    }
+    if let Some(key) = non_blank(payload.secrets.gateway_master_key) {
+        if let Err(e) = secure::store_gateway_master_key(&key) {
+            log::warn!(
+                "Settings import: could not restore the gateway master key: {}",
+                e
+            );
+        }
+    }
+
+    let saved =
+        crate::commands::settings_commands::update_settings(settings, state.clone()).await?;
 
     state.pending_settings_import.lock().await.take();
 
@@ -289,7 +325,8 @@ struct FormatVersionProbe {
 /// so neither error path below ever interpolates what `serde_json`
 /// actually says — only a fixed, generic message.
 fn read_and_decrypt(path: &Path, password: &str) -> Result<SettingsExportPayload, String> {
-    let encrypted = std::fs::read(path).map_err(|e| format!("Failed to read export file: {}", e))?;
+    let encrypted =
+        std::fs::read(path).map_err(|e| format!("Failed to read export file: {}", e))?;
     let plaintext = settings_crypto::decrypt(&encrypted, password)?;
 
     let probe: FormatVersionProbe = serde_json::from_slice(&plaintext)
@@ -302,8 +339,9 @@ fn read_and_decrypt(path: &Path, password: &str) -> Result<SettingsExportPayload
         ));
     }
 
-    serde_json::from_slice(&plaintext)
-        .map_err(|_| "This file doesn't look like a valid settings export (unexpected shape).".to_string())
+    serde_json::from_slice(&plaintext).map_err(|_| {
+        "This file doesn't look like a valid settings export (unexpected shape).".to_string()
+    })
 }
 
 #[cfg(test)]
@@ -318,12 +356,52 @@ mod tests {
         assert_eq!(non_blank(Some(" a ".to_string())), Some(" a ".to_string()));
     }
 
-    fn write_export(dir: &std::path::Path, name: &str, payload: &SettingsExportPayload, password: &str) -> PathBuf {
-        let plaintext = serde_json::to_vec(payload).unwrap();
+    fn write_export(
+        dir: &std::path::Path,
+        name: &str,
+        payload: &SettingsExportPayload,
+        password: &str,
+    ) -> PathBuf {
+        write_raw_export(dir, name, &serde_json::to_value(payload).unwrap(), password)
+    }
+
+    /// Like `write_export`, but takes an arbitrary `serde_json::Value` rather
+    /// than a real `SettingsExportPayload` — for fixtures that are
+    /// deliberately not shape-compatible, which the typed helper above can't
+    /// produce at all.
+    fn write_raw_export(
+        dir: &std::path::Path,
+        name: &str,
+        value: &serde_json::Value,
+        password: &str,
+    ) -> PathBuf {
+        let plaintext = serde_json::to_vec(value).unwrap();
         let encrypted = settings_crypto::encrypt(&plaintext, password).unwrap();
         let path = dir.join(name);
         std::fs::write(&path, &encrypted).unwrap();
         path
+    }
+
+    #[test]
+    fn splitting_settings_moves_the_web_terminal_token_out_rather_than_copying_it() {
+        let mut settings = AppSettings::default();
+        settings.web_terminal.access_token = Some("super-secret-token".to_string());
+
+        let (settings, secrets) = split_settings_and_secrets(settings);
+
+        assert_eq!(settings.web_terminal.access_token, None);
+        assert_eq!(
+            secrets.web_terminal_access_token,
+            Some("super-secret-token".to_string())
+        );
+    }
+
+    #[test]
+    fn splitting_settings_with_no_token_leaves_it_absent_on_both_sides() {
+        let (settings, secrets) = split_settings_and_secrets(AppSettings::default());
+
+        assert_eq!(settings.web_terminal.access_token, None);
+        assert_eq!(secrets.web_terminal_access_token, None);
     }
 
     fn sample_payload(format_version: u32) -> SettingsExportPayload {
@@ -348,11 +426,24 @@ mod tests {
 
     #[test]
     fn a_file_from_a_newer_format_is_refused_before_the_full_shape_is_parsed() {
+        // Shape-incompatible with the *current* `SettingsExportPayload` (a
+        // future version could easily have changed `settings` from an object
+        // to something else) as well as newer — so this only passes under
+        // the probe-first ordering. Parsing the full struct first (the old
+        // behavior) would fail on the shape mismatch and never reach the
+        // version check, producing the "unexpected shape" message instead of
+        // "newer version" / "Update Triple-C".
         let dir = temp_dir("newer-format");
-        let path = write_export(
+        let path = write_raw_export(
             &dir,
             "export.triplec",
-            &sample_payload(SETTINGS_EXPORT_FORMAT_VERSION + 1),
+            &serde_json::json!({
+                "format_version": SETTINGS_EXPORT_FORMAT_VERSION + 1,
+                "exported_at": "2026-08-27T00:00:00Z",
+                "app_version": "9.9.9",
+                "settings": "this-app-version-stores-settings-differently",
+                "secrets": {},
+            }),
             "correct password",
         );
 
@@ -381,18 +472,35 @@ mod tests {
 
     #[test]
     fn a_malformed_payload_produces_a_generic_error_not_a_raw_serde_message() {
-        // Encrypt something that decrypts fine but isn't a valid payload
-        // shape at all — this must not happen in practice (only this app
-        // ever writes these files), but the error path must still never
-        // echo back plaintext content, generic malformed-shape or not.
+        // A `format_version` the probe accepts, but a `settings` field of
+        // the wrong *type* rather than just a missing field — this is what
+        // makes `serde_json` produce an "invalid type: string `...`, expected
+        // struct AppSettings" error that quotes the offending value
+        // verbatim. That value here stands in for plaintext that, in a real
+        // export, could be a live credential — the assertion below is only
+        // meaningful against a fixture that actually exercises serde's
+        // value-quoting behavior, which a merely-missing-field fixture does
+        // not.
         let dir = temp_dir("malformed");
-        let plaintext = b"{\"not\": \"a real export\"}".to_vec();
-        let encrypted = settings_crypto::encrypt(&plaintext, "correct password").unwrap();
-        let path = dir.join("export.triplec");
-        std::fs::write(&path, &encrypted).unwrap();
+        let path = write_raw_export(
+            &dir,
+            "export.triplec",
+            &serde_json::json!({
+                "format_version": SETTINGS_EXPORT_FORMAT_VERSION,
+                "exported_at": "2026-08-27T00:00:00Z",
+                "app_version": "0.4.14",
+                "settings": "NOT-A-REAL-CREDENTIAL-abc123",
+                "secrets": {},
+            }),
+            "correct password",
+        );
 
         let err = read_and_decrypt(&path, "correct password").unwrap_err();
-        assert!(!err.contains("not a real export"), "leaked plaintext into the error: {}", err);
+        assert!(
+            !err.contains("NOT-A-REAL-CREDENTIAL-abc123"),
+            "leaked plaintext into the error: {}",
+            err
+        );
         assert!(err.contains("doesn't look like a valid settings export"));
 
         std::fs::remove_dir_all(&dir).ok();
@@ -409,7 +517,11 @@ mod tests {
         );
 
         let err = read_and_decrypt(&path, "wrong password").unwrap_err();
-        assert!(err.contains("Wrong password"), "unexpected message: {}", err);
+        assert!(
+            err.contains("Wrong password"),
+            "unexpected message: {}",
+            err
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -601,6 +601,15 @@ deliberately out of scope — this is not a project backup.
   gateway key). Secrets are restored *before* the settings replace runs, not after — replacing
   settings is what triggers `reconcile_gateway`, and restoring the other way round leaves a real
   window where a gateway recreation happens against the destination's old keys.
+- **The imported settings are validated *before* any secret is written, not just before the
+  settings replace.** `apply_settings_import` calls
+  `settings_commands::validate_settings_update(&current, &settings)` — the same checks
+  `update_settings` runs internally, pulled out into its own function specifically so this caller
+  can run them first — and only proceeds to the three keychain writes if that passes. A review
+  caught the earlier ordering: writing secrets first meant a rejected import (a bad env var name, a
+  disallowed host path) still left the keychain overwritten with the file's secrets while the
+  settings themselves stayed unchanged, a silently half-applied state the error message gave no
+  hint of.
 - **`read_and_decrypt` checks `format_version` before attempting to parse the full payload, not
   after.** A version bump that isn't deserialize-compatible is exactly the case that check exists
   for, and parsing the full struct first would fail on the shape mismatch before the version check
@@ -610,10 +619,21 @@ deliberately out of scope — this is not a project backup.
 - **The 8-character password minimum is enforced in `export_settings` itself, not only in the
   export modal.** The frontend minimum is a UX nudge; the Rust command is the actual boundary a
   weak password has to cross, and Argon2id's memory-hardness buys little against an attacker who
-  can just try a short password directly. The derived key and the decrypted plaintext are both
-  wrapped in `zeroize::Zeroizing` for the same reason every other secret in this codebase gets
-  handled carefully — cheap insurance (`zeroize` is already pulled in transitively via `aes-gcm`)
-  for material that exists only to hold or produce live credentials.
+  can just try a short password directly. Measured with `.chars().count()` (Unicode scalar values)
+  rather than `.len()` (bytes), to stay as close as this pair of languages allows to the frontend's
+  `.length` check (UTF-16 code units) — the two only diverge on astral-plane characters. The
+  derived key and both plaintext buffers — the payload built for export, and whatever `decrypt`
+  recovers on import — are wrapped in `zeroize::Zeroizing` for the same reason every other secret
+  in this codebase gets handled carefully — cheap insurance (`zeroize` is already pulled in
+  transitively via `aes-gcm`) for material that exists only to hold or produce live credentials.
+- **The preview also discloses non-blank custom base URLs** (`global_ollama`, `global_llamacpp`,
+  `global_openai_compatible`, `gateway.api_base`) so an import that would redirect model traffic to
+  a different server is visible in the confirmation dialog rather than discovered later — these are
+  endpoints, not secrets, so `SettingsImportPreview` carries and `describeImport` renders the actual
+  URL rather than just a presence flag. `describeImportWarnings` additionally calls out a web
+  terminal token that arrives with the terminal left *off*: `start_web_terminal` only mints a fresh
+  token when none is already set, so a planted token would otherwise activate silently the next
+  time someone turns the terminal on, with no import-time signal that it wasn't freshly generated.
 
 ## Testing
 

@@ -26,6 +26,10 @@ const samplePreview: SettingsImportPreview = {
   has_gateway_master_key: false,
   has_web_terminal_access_token: false,
   enables_web_terminal: false,
+  ollama_base_url: null,
+  llamacpp_base_url: null,
+  openai_compatible_base_url: null,
+  gateway_api_base: null,
 };
 
 describe("ImportSettingsModal", () => {
