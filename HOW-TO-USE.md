@@ -6,6 +6,7 @@ Triple-C (Claude-Code-Container) is a desktop application that runs Claude Code 
 
 ## Table of Contents
 
+- [Installation](#installation)
 - [Prerequisites](#prerequisites)
 - [First Launch](#first-launch)
 - [The Interface](#the-interface)
@@ -31,6 +32,23 @@ Triple-C (Claude-Code-Container) is a desktop application that runs Claude Code 
 - [Troubleshooting](#troubleshooting)
 
 ---
+
+## Installation
+
+Download the build for your platform from [GitHub Releases](https://github.com/shadowdao/triple-c/releases/latest).
+
+| Platform | File | Install |
+|----------|------|---------|
+| **Windows** | `Triple-C_<version>_x64-setup.exe` or `.msi` | Run the installer. |
+| **macOS** | `Triple-C_<version>_universal.dmg` | Open the `.dmg` and drag Triple-C to Applications. |
+| **Debian / Ubuntu** | `Triple-C_<version>_amd64.deb` | `sudo apt install ./Triple-C_<version>_amd64.deb` |
+| **Fedora / RHEL** | `Triple-C-<version>-1.x86_64.rpm` | `sudo dnf install ./Triple-C-<version>-1.x86_64.rpm` |
+| **Arch / CachyOS** | `triple-c-bin-<version>-1-x86_64.pkg.tar.zst` | `sudo pacman -U ./triple-c-bin-<version>-1-x86_64.pkg.tar.zst` |
+| **Other Linux** | `Triple-C_<version>_amd64.AppImage` | `chmod +x` it, then run it directly. |
+
+> **macOS note:** The app is not signed or notarized. On first launch, macOS Gatekeeper may block it — right-click the app and select "Open" to bypass, or remove the quarantine attribute: `xattr -cr /Applications/Triple-C.app`.
+
+> **Arch / CachyOS note:** This package is not on the AUR — it's a `pacman`-installable file built and attached to each GitHub release by a maintainer-triggered step (`.gitea/workflows/publish-arch-package.yml`), so it can lag behind the very latest release by a bit. See [`packaging/arch/README.md`](packaging/arch/README.md) for details, including why "-bin" and what's verified about it.
 
 ## Prerequisites
 
