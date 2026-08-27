@@ -77,6 +77,15 @@ export type ProjectStatus =
   | "stopping"
   | "error";
 
+/** What `removeProject` could not delete. The project is removed from the
+ *  sidebar either way; anything named here is recorded on the host and
+ *  retried automatically the next time the app starts. */
+export interface ProjectRemovalReport {
+  container: string | null;
+  image: string | null;
+  volumes: string[];
+}
+
 export type Backend =
   | "anthropic"
   | "bedrock"

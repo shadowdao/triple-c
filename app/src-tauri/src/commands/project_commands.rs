@@ -2,7 +2,7 @@ use tauri::{Emitter, State};
 
 use crate::commands::aws_commands;
 use crate::docker;
-use crate::models::{container_config, AppSettings, Backend, BedrockAuthMethod, Project, ProjectPath, ProjectStatus};
+use crate::models::{container_config, AppSettings, Backend, BedrockAuthMethod, Project, ProjectPath, ProjectRemovalReport, ProjectStatus};
 use crate::storage::secure;
 use crate::AppState;
 
@@ -696,7 +696,7 @@ pub async fn add_project(
 pub async fn remove_project(
     project_id: String,
     state: State<'_, AppState>,
-) -> Result<(), String> {
+) -> Result<ProjectRemovalReport, String> {
     // **H-2: the only writer of these three categories that held nothing.**
     // This purges migration artifacts, removes `triple-c-snapshot-{id}` and
     // both named volumes — and a compaction resolves that same tag when its
@@ -722,12 +722,24 @@ pub async fn remove_project(
     // holding an entire snapshot image that nothing will ever reference again.
     crate::commands::migration_commands::purge_migration_artifacts(&project_id).await;
 
-    // Stop and remove container if it exists
-    if let Some(ref project) = state.projects_store.get(&project_id) {
+    // Stop and remove container if it exists. Everything named in `report`
+    // below is what will be unreachable the moment this function drops the
+    // project record — see [`ProjectRemovalReport`] and
+    // `storage::pending_cleanup`, which is what makes it reachable anyway.
+    let mut report = ProjectRemovalReport::default();
+    let existing_project = state.projects_store.get(&project_id);
+
+    if let Some(ref project) = existing_project {
         if let Some(ref container_id) = project.container_id {
             state.exec_manager.close_sessions_for_container(container_id).await;
             let _ = docker::stop_container(container_id).await;
-            let _ = docker::remove_container(container_id).await;
+            if let Err(e) = docker::remove_container(container_id).await {
+                log::warn!(
+                    "Failed to remove container {} for project {}: {}",
+                    container_id, project_id, e
+                );
+                report.container = Some(container_id.clone());
+            }
         }
 
         // Legacy MCP cleanup (pre-MCP-removal installs): drop any leftover MCP
@@ -738,10 +750,9 @@ pub async fn remove_project(
         // Clean up the snapshot image + volumes
         if let Err(e) = docker::remove_snapshot_image(project).await {
             log::warn!("Failed to remove snapshot image for project {}: {}", project_id, e);
+            report.image = Some(docker::get_snapshot_image_name(project));
         }
-        if let Err(e) = docker::remove_project_volumes(project).await {
-            log::warn!("Failed to remove project volumes for project {}: {}", project_id, e);
-        }
+        report.volumes = docker::remove_project_volumes(project).await;
     }
 
     // Clean up keychain secrets for this project
@@ -749,7 +760,111 @@ pub async fn remove_project(
         log::warn!("Failed to delete keychain secrets for project {}: {}", project_id, e);
     }
 
-    state.projects_store.remove(&project_id)
+    if !report.is_clean() {
+        let record = crate::storage::pending_cleanup::PendingCleanup {
+            project_id: project_id.clone(),
+            project_name: existing_project.map(|p| p.name).unwrap_or_default(),
+            container_id: report.container.clone(),
+            image: report.image.clone(),
+            volumes: report.volumes.clone(),
+            recorded_at: chrono::Utc::now().to_rfc3339(),
+        };
+        match crate::storage::pending_cleanup::save(&record) {
+            Ok(()) => log::warn!(
+                "Project {} removed with Docker resources still present: {:?} — recorded for \
+                 automatic retry on next launch",
+                project_id, report
+            ),
+            Err(e) => log::error!(
+                "Project {} removed with Docker resources still present ({:?}), and the \
+                 pending-cleanup record could not be written ({}) — nothing will retry removing \
+                 them",
+                project_id, report, e
+            ),
+        }
+    }
+
+    state.projects_store.remove(&project_id)?;
+    Ok(report)
+}
+
+/// Retry every pending-cleanup record left behind by a [`remove_project`]
+/// that could not finish. Run once at startup alongside the other reapers
+/// (see `lib.rs`'s "Startup disk housekeeping" block) — never on a timer and
+/// never blocking anything, since a locked volume or an in-use image can sit
+/// unresolved for an arbitrary amount of time and the daemon may not even be
+/// up yet.
+///
+/// Not a `#[tauri::command]`: nothing in the UI surfaces this list yet
+/// (deliberately — see `SnapshotSweepReport`'s doc comment for the same
+/// reasoning), so there is no IPC contract to keep. A record that still has
+/// leftovers after this is written back so the next run does not lose track
+/// of what changed; one that is now empty is deleted.
+pub async fn retry_pending_cleanup_logged() {
+    let records = crate::storage::pending_cleanup::list();
+    if records.is_empty() {
+        return;
+    }
+
+    let mut cleaned = 0usize;
+    let mut still_pending = 0usize;
+
+    for mut record in records {
+        if let Some(container_id) = record.container_id.take() {
+            match docker::remove_container(&container_id).await {
+                Ok(()) => {}
+                Err(e) => {
+                    log::warn!(
+                        "Pending cleanup: still could not remove container {} for project {} \
+                         ({}): {}",
+                        container_id, record.project_id, record.project_name, e
+                    );
+                    record.container_id = Some(container_id);
+                }
+            }
+        }
+
+        if let Some(image) = record.image.take() {
+            match docker::remove_image_by_name(&image).await {
+                Ok(()) => {}
+                Err(e) => {
+                    log::warn!(
+                        "Pending cleanup: still could not remove image {} for project {} ({}): {}",
+                        image, record.project_id, record.project_name, e
+                    );
+                    record.image = Some(image);
+                }
+            }
+        }
+
+        if !record.volumes.is_empty() {
+            record.volumes = docker::remove_volumes_by_name(&record.volumes).await;
+        }
+
+        if record.is_empty() {
+            if let Err(e) = crate::storage::pending_cleanup::clear(&record.project_id) {
+                log::warn!(
+                    "Pending cleanup for project {} ({}) finished but the record could not be \
+                     deleted: {}",
+                    record.project_id, record.project_name, e
+                );
+            }
+            cleaned += 1;
+        } else {
+            still_pending += 1;
+            if let Err(e) = crate::storage::pending_cleanup::save(&record) {
+                log::warn!(
+                    "Could not update pending cleanup record for project {} ({}): {}",
+                    record.project_id, record.project_name, e
+                );
+            }
+        }
+    }
+
+    log::info!(
+        "Pending cleanup retry: {} project(s) fully cleaned up, {} still have leftovers",
+        cleaned, still_pending
+    );
 }
 
 #[tauri::command]
@@ -1265,8 +1380,19 @@ pub async fn rebuild_project_container(
     if let Err(e) = docker::remove_snapshot_image(&project).await {
         log::warn!("Failed to remove snapshot image for project {}: {}", project_id, e);
     }
-    if let Err(e) = docker::remove_project_volumes(&project).await {
-        log::warn!("Failed to remove project volumes for project {}: {}", project_id, e);
+    let leftover_volumes = docker::remove_project_volumes(&project).await;
+    if !leftover_volumes.is_empty() {
+        // Unlike `remove_project`, Reset keeps the project record — but a
+        // volume that survives this is reused as-is by the container
+        // `start_project_container_locked` creates below, which is exactly
+        // what Reset promises not to do. No pending-cleanup record: the
+        // project id is still live, so a later Reset attempt can retry this
+        // itself rather than needing startup housekeeping to do it.
+        log::warn!(
+            "Reset could not remove volume(s) {:?} for project {} — the new container may reuse \
+             their old contents instead of starting clean",
+            leftover_volumes, project_id
+        );
     }
 
     // Start fresh. The locked variant, because `_guard` above is this project's

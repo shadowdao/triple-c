@@ -422,6 +422,31 @@ pub enum ProjectStatus {
     Error,
 }
 
+/// What `remove_project` could not delete, named so the UI can say so instead
+/// of reporting a clean removal that was not one.
+///
+/// The project record is dropped from `projects.json` regardless — see the
+/// long comment on `remove_project` for why refusing is not the answer — but
+/// anything named here is also written to a pending-cleanup record that
+/// startup housekeeping retries, so it stays reachable after the project it
+/// belonged to no longer exists.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct ProjectRemovalReport {
+    /// The project's container, if it could not be removed.
+    pub container: Option<String>,
+    /// The `triple-c-snapshot-{id}` image, if it could not be removed.
+    pub image: Option<String>,
+    /// Named volumes (home, claude config) that could not be removed.
+    pub volumes: Vec<String>,
+}
+
+impl ProjectRemovalReport {
+    /// True when nothing was left behind.
+    pub fn is_clean(&self) -> bool {
+        self.container.is_none() && self.image.is_none() && self.volumes.is_empty()
+    }
+}
+
 /// Which AI model backend/provider the project uses.
 /// - `Anthropic`: Direct Anthropic API (user runs `claude login` inside the container)
 /// - `Bedrock`: AWS Bedrock with per-project AWS credentials
@@ -649,6 +674,25 @@ impl Project {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── ProjectRemovalReport ────────────────────────────────────────────────
+
+    #[test]
+    fn a_report_is_clean_only_with_nothing_left_behind() {
+        assert!(ProjectRemovalReport::default().is_clean());
+
+        let mut r = ProjectRemovalReport::default();
+        r.container = Some("abc123".to_string());
+        assert!(!r.is_clean(), "a leftover container must not read as clean");
+
+        let mut r = ProjectRemovalReport::default();
+        r.image = Some("triple-c-snapshot-x:latest".to_string());
+        assert!(!r.is_clean(), "a leftover image must not read as clean");
+
+        let mut r = ProjectRemovalReport::default();
+        r.volumes.push("triple-c-home-x".to_string());
+        assert!(!r.is_clean(), "a leftover volume must not read as clean");
+    }
 
     // ── Custom environment variable names ─────────────────────────────────
 

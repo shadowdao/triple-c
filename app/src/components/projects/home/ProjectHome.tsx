@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
+import type { ProjectRemovalReport } from "../../../lib/types";
 import { useAppState } from "../../../store/appState";
 import { useProjectActions } from "../../../hooks/useProjectActions";
 import { useProjects } from "../../../hooks/useProjects";
@@ -29,6 +30,16 @@ const TABS = [
 ] as const;
 
 export type ProjectHomeTabId = (typeof TABS)[number]["id"];
+
+/** Names what a `ProjectRemovalReport` says survived, for the leftover toast. */
+function describeLeftovers(report: ProjectRemovalReport): string {
+  const parts: string[] = [];
+  if (report.container) parts.push("its container");
+  if (report.image) parts.push("its saved image");
+  if (report.volumes.length === 1) parts.push("a volume");
+  else if (report.volumes.length > 1) parts.push(`${report.volumes.length} volumes`);
+  return parts.join(", ");
+}
 
 interface Props {
   projectId: string;
@@ -282,7 +293,14 @@ export default function ProjectHome({ projectId, active }: Props) {
           onConfirm={async () => {
             setConfirmRemove(false);
             try {
-              await remove(project.id);
+              const report = await remove(project.id);
+              if (report.container || report.image || report.volumes.length > 0) {
+                useAppState.getState().pushToast({
+                  kind: "info",
+                  message: `“${project.name}” was removed, but some Docker resources are still on disk`,
+                  detail: `Triple-C will retry removing ${describeLeftovers(report)} the next time it starts.`,
+                });
+              }
             } catch (e) {
               useAppState.getState().pushToast({
                 kind: "error",

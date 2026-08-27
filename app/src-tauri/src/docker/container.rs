@@ -1935,7 +1935,7 @@ pub async fn remove_container(container_id: &str) -> Result<(), String> {
         "Removing container {} (v=false: named volumes such as claude config are preserved)",
         container_id
     );
-    docker
+    match docker
         .remove_container(
             container_id,
             Some(RemoveContainerOptions {
@@ -1945,7 +1945,17 @@ pub async fn remove_container(container_id: &str) -> Result<(), String> {
             }),
         )
         .await
-        .map_err(|e| format!("Failed to remove container: {}", e))
+    {
+        Ok(()) => Ok(()),
+        // Already gone is the outcome this call wants, not a failure — a
+        // caller retrying a leftover from a previous, partially-failed removal
+        // (see `remove_project`) must not be told it failed forever just
+        // because a *different* attempt already succeeded.
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => Ok(()),
+        Err(e) => Err(format!("Failed to remove container: {}", e)),
+    }
 }
 
 /// Return the snapshot image name for a project.
@@ -3496,13 +3506,27 @@ async fn rewrite_image_without_secrets(
 }
 
 /// Remove the snapshot image for a project (used on Reset / project removal).
+///
+/// A project that never started never built a snapshot, so "no such image" is
+/// the ordinary case, not a failure — it is treated the same as success and
+/// logged at most at `info`. A real failure (the image is in use, a
+/// permission error, the daemon dropped the connection) is the one thing this
+/// returns `Err` for, and callers must not throw that away: see the
+/// `remove_project` doc comment on `ProjectRemovalReport` for why an
+/// unreported failure here used to make the resource unreachable forever.
 pub async fn remove_snapshot_image(project: &Project) -> Result<(), String> {
-    let docker = get_docker()?;
-    let image_name = get_snapshot_image_name(project);
+    remove_image_by_name(&get_snapshot_image_name(project)).await
+}
 
-    docker
+/// Remove a Docker image by name/tag, treating "does not exist" as success.
+/// Shared by [`remove_snapshot_image`] and the pending-cleanup retry, which
+/// only has the image name (the project record is already gone by then).
+pub async fn remove_image_by_name(image_name: &str) -> Result<(), String> {
+    let docker = get_docker()?;
+
+    match docker
         .remove_image(
-            &image_name,
+            image_name,
             Some(RemoveImageOptions {
                 force: true,
                 noprune: false,
@@ -3510,25 +3534,69 @@ pub async fn remove_snapshot_image(project: &Project) -> Result<(), String> {
             None,
         )
         .await
-        .map_err(|e| format!("Failed to remove snapshot image {}: {}", image_name, e))?;
-
-    log::info!("Removed snapshot image {}", image_name);
-    Ok(())
+    {
+        Ok(_) => {
+            log::info!("Removed snapshot image {}", image_name);
+            Ok(())
+        }
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => Ok(()),
+        Err(e) => Err(format!("Failed to remove snapshot image {}: {}", image_name, e)),
+    }
 }
 
 /// Remove both named volumes for a project (used on Reset / project removal).
-pub async fn remove_project_volumes(project: &Project) -> Result<(), String> {
-    let docker = get_docker()?;
-    for vol in [
+///
+/// Returns the names of volumes that still exist afterwards — empty means
+/// both are gone (removed here, or never created). This used to always
+/// return `Ok(())` regardless of what actually happened, which made the
+/// `if let Err(e)` at every call site unreachable by construction; see
+/// triple-c#31. A volume Docker reports as simply not existing is not a
+/// leftover and is not included.
+pub async fn remove_project_volumes(project: &Project) -> Vec<String> {
+    remove_volumes_by_name(&[
         home_volume_name(&project.id),
         config_volume_name(&project.id),
-    ] {
-        match docker.remove_volume(&vol, None).await {
+    ])
+    .await
+}
+
+/// Remove a set of named volumes, treating "does not exist" as success.
+/// Returns the names that still exist afterwards — empty means every one is
+/// gone (removed here, or never created).
+///
+/// Shared by [`remove_project_volumes`] and the pending-cleanup retry, the
+/// latter calling this with whatever the former could not remove the first
+/// time. Used to always report success regardless of what actually happened,
+/// which made every `if let Err(e)` at its call sites unreachable by
+/// construction; see triple-c#31.
+pub async fn remove_volumes_by_name(names: &[String]) -> Vec<String> {
+    let docker = match get_docker() {
+        Ok(d) => d,
+        Err(e) => {
+            // Can't reach the daemon to even try, so nothing here can be
+            // confirmed removed. Reporting all as leftover is the safe
+            // direction: worst case a later retry finds them already gone.
+            log::warn!("Could not remove volumes {:?}: {}", names, e);
+            return names.to_vec();
+        }
+    };
+
+    let mut leftover = Vec::new();
+    for vol in names {
+        match docker.remove_volume(vol, None).await {
             Ok(_) => log::info!("Removed volume {}", vol),
-            Err(e) => log::warn!("Failed to remove volume {} (may not exist): {}", vol, e),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => {}
+            Err(e) => {
+                log::warn!("Failed to remove volume {}: {}", vol, e);
+                leftover.push(vol.clone());
+            }
         }
     }
-    Ok(())
+    leftover
 }
 
 /// Check whether the existing container's configuration still matches the

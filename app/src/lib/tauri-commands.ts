@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ProjectPath, ContainerInfo, AppSettings, UpdateInfo, ImageUpdateInfo, FileEntry, FileContents, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, BrowserPageState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo, UploadOutcome } from "./types";
+import type { Project, ProjectPath, ProjectRemovalReport, ContainerInfo, AppSettings, UpdateInfo, ImageUpdateInfo, FileEntry, FileContents, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, BrowserPageState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo, UploadOutcome } from "./types";
 
 // Docker
 export const checkDocker = () => invoke<boolean>("check_docker");
@@ -13,7 +13,7 @@ export const listProjects = () => invoke<Project[]>("list_projects");
 export const addProject = (name: string, paths: ProjectPath[]) =>
   invoke<Project>("add_project", { name, paths });
 export const removeProject = (projectId: string) =>
-  invoke<void>("remove_project", { projectId });
+  invoke<ProjectRemovalReport>("remove_project", { projectId });
 export const updateProject = (project: Project) =>
   invoke<Project>("update_project", { project });
 export const startProjectContainer = (projectId: string) =>

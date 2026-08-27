@@ -44,8 +44,9 @@ export function useProjects() {
 
   const remove = useCallback(
     async (id: string) => {
-      await commands.removeProject(id);
+      const report = await commands.removeProject(id);
       removeProjectFromList(id);
+      return report;
     },
     [removeProjectFromList],
   );

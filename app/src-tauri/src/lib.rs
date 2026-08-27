@@ -257,6 +257,10 @@ pub fn run() {
                     log::info!("Startup housekeeping dropped {} stale rollback pin(s)", reaped);
                 }
                 crate::docker::sweep_orphaned_snapshots_logged("startup").await;
+                // A container/image/volume `remove_project` could not delete
+                // is recorded rather than lost — see triple-c#31 — and this is
+                // the only place anything ever retries it.
+                crate::commands::project_commands::retry_pending_cleanup_logged().await;
             });
 
             // Auto-start web terminal server if enabled in settings
