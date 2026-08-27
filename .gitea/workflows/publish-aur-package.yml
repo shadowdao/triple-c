@@ -1,0 +1,274 @@
+name: Publish AUR Package
+
+# Builds and pushes the `triple-c-bin` AUR package (packaging/arch/PKGBUILD)
+# for a given release, or the latest one if none is given. Manual dispatch
+# only — deliberately not triggered by `release` or `push`, for the same
+# reason sync-release.yml (removed in triple-c#32) never worked safely as an
+# automatic trigger: this repo's releases are assembled by build-app.yml
+# across three separate platform jobs, and there is no single automatic event
+# that fires only once everything (including the Linux .deb this workflow
+# needs) is actually uploaded. A human deciding "this release is ready, go
+# package it" is the correct trigger, the same reasoning
+# backfill-releases.yml already uses for its own manual-only GitHub sync.
+#
+# ## What this does and does not do
+#
+# It renders `packaging/arch/PKGBUILD` for one specific version (real
+# download URL, real sha256sums — never guessed; see the resolve-asset step)
+# and pushes the rendered PKGBUILD plus a regenerated `.SRCINFO` to AUR. It
+# does NOT commit anything back to this repo — `packaging/arch/PKGBUILD` stays
+# a hand-maintained template with a placeholder version, and every real,
+# published version lives only in AUR's own git history, which is where a
+# PKGBUILD's revision history is expected to live. A corollary worth knowing:
+# a hand-edit made directly in the AUR repo (outside this workflow) is
+# silently overwritten the next time this runs, since every run renders fresh
+# from this repo's template rather than starting from AUR's current state.
+#
+# ## Required secret
+#
+# `AUR_SSH_PRIVATE_KEY` — an SSH private key registered against an AUR
+# account that has already created (or been given co-maintainer access to)
+# the `triple-c-bin` package. This workflow cannot create that AUR account or
+# register the key for you — both are manual, one-time steps on
+# https://aur.archlinux.org. Until this secret exists, every run fails at the
+# "Push to AUR" step with a clear error rather than silently doing nothing.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: >-
+          Release version to package, without a leading "v" (e.g. "0.4.14").
+          Leave empty to use the latest published GitHub release.
+        required: false
+
+env:
+  GITHUB_REPO: shadowdao/triple-c
+  AUR_REPO: ssh://aur@aur.archlinux.org/triple-c-bin.git
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version and find the Linux asset
+        id: resolve
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          set -euo pipefail
+
+          # Authenticated when the secret is available (it is, everywhere
+          # else in this repo's workflows) to avoid the unauthenticated
+          # 60-requests/hour-per-IP cap; still works without it, just at that
+          # lower limit, since this hits nothing but a public repo's public
+          # releases.
+          AUTH=()
+          [ -n "${GH_PAT}" ] && AUTH=(-H "Authorization: Bearer ${GH_PAT}")
+
+          if [ -z "${VERSION_INPUT}" ]; then
+            echo "No version given — resolving the latest GitHub release"
+            RELEASE_JSON=$(curl -fsS "${AUTH[@]}" "https://api.github.com/repos/${GITHUB_REPO}/releases/latest")
+          else
+            echo "Using requested version ${VERSION_INPUT}"
+            RELEASE_JSON=$(curl -fsS "${AUTH[@]}" "https://api.github.com/repos/${GITHUB_REPO}/releases/tags/v${VERSION_INPUT}")
+          fi
+
+          TAG=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
+          VERSION="${TAG#v}"
+          echo "Resolved to ${TAG}"
+
+          # Discovered from the real release, not assumed: Tauri names the
+          # asset after `productName` verbatim ("Triple-C"), not the
+          # lowercase Cargo binary name, and asset naming is exactly the kind
+          # of thing that silently drifts if a future Tauri upgrade changes
+          # bundler defaults — a hardcoded pattern here would then 404
+          # forever until someone noticed. `head -1` guards against a release
+          # somehow carrying more than one matching asset, which would
+          # otherwise pass the emptiness check below and then break the
+          # download step with two URLs on one line.
+          DEB_URL=$(echo "$RELEASE_JSON" | jq -r '.assets[] | select(.name | endswith("_amd64.deb")) | .browser_download_url' | head -1)
+          DEB_NAME=$(echo "$RELEASE_JSON" | jq -r '.assets[] | select(.name | endswith("_amd64.deb")) | .name' | head -1)
+          if [ -z "$DEB_URL" ] || [ "$DEB_URL" = "null" ]; then
+            echo "No *_amd64.deb asset found on release ${TAG}" >&2
+            exit 1
+          fi
+          echo "Found asset: ${DEB_NAME}"
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "deb_url=${DEB_URL}" >> "$GITHUB_OUTPUT"
+          echo "deb_name=${DEB_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Download the release asset and compute real checksums
+        id: checksums
+        env:
+          DEB_URL: ${{ steps.resolve.outputs.deb_url }}
+          DEB_NAME: ${{ steps.resolve.outputs.deb_name }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "${DEB_NAME}" "${DEB_URL}"
+          curl -fsSL -o LICENSE "https://raw.githubusercontent.com/${GITHUB_REPO}/${TAG}/LICENSE"
+
+          echo "deb_sha256=$(sha256sum "${DEB_NAME}" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "license_sha256=$(sha256sum LICENSE | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Render PKGBUILD
+        id: render
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+          DEB_NAME: ${{ steps.resolve.outputs.deb_name }}
+          DEB_SHA256: ${{ steps.checksums.outputs.deb_sha256 }}
+          LICENSE_SHA256: ${{ steps.checksums.outputs.license_sha256 }}
+        run: |
+          set -euo pipefail
+          mkdir -p rendered
+          cp packaging/arch/PKGBUILD rendered/PKGBUILD
+          cd rendered
+
+          # Plain string replacement throughout, not sed — the source URL
+          # contains slashes and the repo name does too, and getting a sed
+          # delimiter choice AND its escaping right for that is exactly the
+          # kind of thing that looks correct, passes review, and breaks the
+          # next time someone touches it. `re.sub` with `count=1` and an
+          # exact `.format`-free literal match is boring and that's the
+          # point: every substitution below fails loudly (an assertion /
+          # the checks after) rather than silently no-op'ing if the
+          # template's shape ever drifts from what this expects.
+          #
+          # pkgrel resets to 1 for a new pkgver — a packaging-only fix to the
+          # same upstream version (a dependency bump, say) is what pkgrel is
+          # for, and this workflow always republishes the current PKGBUILD
+          # verbatim rather than incrementing anything, so 1 is always
+          # correct for what this workflow does. It is NOT correct for a
+          # dependency-only fix republished at the *same* pkgver: pkgrel
+          # would be forced back to 1, and no existing installation sees an
+          # upgrade. That case needs a manual pkgrel bump in the template
+          # before dispatching, which this workflow has no input for.
+          python3 - "$VERSION" "$DEB_NAME" "$DEB_SHA256" "$LICENSE_SHA256" "$GITHUB_REPO" <<'PY'
+          import re, sys
+          version, deb_name, deb_sha, license_sha, github_repo = sys.argv[1:6]
+
+          with open("PKGBUILD") as f:
+              text = f.read()
+
+          text, n = re.subn(r"(?m)^pkgver=.*$", f"pkgver={version}", text, count=1)
+          assert n == 1, "pkgver=... line not found"
+          text, n = re.subn(r"(?m)^pkgrel=.*$", "pkgrel=1", text, count=1)
+          assert n == 1, "pkgrel=... line not found"
+
+          old_source = (
+              f'source=("Triple-C_${{pkgver}}_amd64.deb::'
+              f'https://github.com/{github_repo}/releases/download/v${{pkgver}}/'
+              f'Triple-C_${{pkgver}}_amd64.deb"'
+          )
+          new_source = (
+              f'source=("{deb_name}::'
+              f'https://github.com/{github_repo}/releases/download/v{version}/{deb_name}"'
+          )
+          assert old_source in text, "source=() line does not match the expected template shape"
+          text = text.replace(old_source, new_source, 1)
+
+          old_sums = "sha256sums=('SKIP'\n            'SKIP')"
+          assert old_sums in text, "sha256sums=() placeholders not found"
+          text = text.replace(old_sums, f"sha256sums=('{deb_sha}'\n            '{license_sha}')", 1)
+
+          with open("PKGBUILD", "w") as f:
+              f.write(text)
+          PY
+
+          grep -q "pkgver=${VERSION}$" PKGBUILD
+          ! grep -q "SKIP" PKGBUILD
+
+      - name: Validate with makepkg and namcap
+        run: |
+          set -euo pipefail
+
+          # A bind mount (`docker run -v "$PWD/...":/work`) is the more
+          # obvious way to write this, and was the first draft — but on a
+          # containerized Gitea act_runner job, `$PWD` is a path inside this
+          # job's own container, which the daemon's host cannot resolve; the
+          # mount would silently attach an empty directory instead of failing
+          # loudly. `docker cp` moves real bytes across that boundary
+          # regardless of where the daemon actually lives, which is what
+          # makes this work under both a bind-mount-capable runner and a
+          # containerized one.
+          docker pull archlinux:latest
+          CID=$(docker create -w /work archlinux:latest bash -c '
+            set -euo pipefail
+            pacman -Syu --noconfirm --needed base-devel namcap sudo git openssh >/dev/null
+            useradd -m builder
+            chown -R builder:builder /work
+            echo "builder ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/builder
+            sudo -u builder bash -c "cd /work && makepkg --printsrcinfo > .SRCINFO"
+            sudo -u builder bash -c "cd /work && makepkg -s --noconfirm"
+            echo "--- namcap ---"
+            NAMCAP_OUT=$(sudo -u builder bash -c "cd /work && namcap PKGBUILD *.pkg.tar.*" || true)
+            echo "$NAMCAP_OUT"
+            # Matches "triple-c-bin E:", "PKGBUILD (triple-c-bin) E:" and any
+            # split-package variant ("triple-c-bin-debug E:") alike — namcap
+            # uses more than one line shape for its two rule families, and
+            # namcap itself exits 0 regardless of what it reports, so this
+            # grep is the only thing standing between an E: and a green job.
+            if echo "$NAMCAP_OUT" | grep -q " E: "; then
+              echo "namcap reported an error — see above" >&2
+              exit 1
+            fi
+          ')
+          mkdir -p rendered
+          docker cp rendered/. "${CID}:/work"
+          # `docker start -a` streams output and its exit code is the
+          # container's own — the same failure this would have hit with a
+          # bind mount still fails the job the same way.
+          docker start -a "${CID}"
+          docker cp "${CID}:/work/.SRCINFO" rendered/.SRCINFO
+          docker rm -f "${CID}" >/dev/null
+
+      - name: Push to AUR
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -z "${AUR_SSH_PRIVATE_KEY}" ]; then
+            echo "AUR_SSH_PRIVATE_KEY is not set — see this workflow file's header comment for" >&2
+            echo "the one-time AUR account setup this needs before it can publish anything." >&2
+            exit 1
+          fi
+
+          mkdir -p ~/.ssh
+          # Created with the final mode before any bytes land in it, rather
+          # than a plain redirect followed by chmod, which leaves the key
+          # world-readable for whatever window falls between the two calls.
+          install -m 600 /dev/null ~/.ssh/aur
+          echo "${AUR_SSH_PRIVATE_KEY}" > ~/.ssh/aur
+          # TOFU, not verification — accepted here because pinning AUR's
+          # actual host key needs a value fetched from somewhere trusted
+          # ahead of time, which this workflow doesn't have, and getting a
+          # pinned value wrong fails every future run rather than just this
+          # one. A keyscan failure below surfaces later as an opaque
+          # "Host key verification failed" rather than a clear one here.
+          ssh-keyscan -H aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur -o IdentitiesOnly=yes -o UserKnownHostsFile=~/.ssh/known_hosts"
+
+          git clone "${AUR_REPO}" aur-repo
+          cp rendered/PKGBUILD rendered/.SRCINFO aur-repo/
+          cd aur-repo
+          git config user.name "Triple-C CI"
+          git config user.email "noreply@triple-c.invalid"
+          git add PKGBUILD .SRCINFO
+          if git diff --cached --quiet; then
+            echo "No change from what's already published on AUR for ${VERSION}"
+            exit 0
+          fi
+          git commit -m "triple-c-bin: update to ${VERSION}"
+          # AUR itself uses `master`, which is what a fresh, not-yet-created
+          # AUR package's empty repo advertises on clone — but the *local*
+          # branch name after cloning an empty repo falls back to whatever
+          # this runner's `init.defaultBranch` is if the server sends no
+          # symref, so naming the destination explicitly is what keeps this
+          # working if that default is ever `main` instead of `master`.
+          git push origin HEAD:master
