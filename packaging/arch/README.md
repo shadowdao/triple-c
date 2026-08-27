@@ -44,3 +44,10 @@ the workflow rewrites them for every real publish and never commits the
 result back here, so don't read this file's `pkgver` as "the last published
 version." Everything else (`depends`, `pkgdesc`, `package()`) is meant to be
 edited by hand normally, the same as any other PKGBUILD.
+
+**A hand-edit made directly in the AUR repo is silently overwritten the
+next time this workflow runs.** Every run renders fresh from *this*
+repo's template rather than starting from whatever AUR's copy currently
+looks like, so a quick fix pushed straight to AUR (bumping `pkgrel` for a
+packaging-only issue, say) survives only until the next dispatch. Make
+the fix here instead.

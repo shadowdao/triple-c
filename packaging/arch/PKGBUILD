@@ -41,11 +41,15 @@ provides=('triple-c')
 conflicts=('triple-c')
 # !strip: the upstream .deb's binary is already the release build Tauri
 # produced and tested; re-stripping a prebuilt binary is unnecessary risk for
-# no benefit. !debug: there is no debug info in a release binary for
-# makepkg's debug-package machinery to extract, so without this it builds an
-# empty usr/src/debug/ tree for nothing (confirmed with namcap against a real
-# build — this was its only non-cosmetic complaint, once the license file
-# below was added).
+# no benefit. It's also what actually suppresses makepkg's debug-package
+# machinery here (debug-package extraction requires strip; verified in a
+# real build — with !strip alone, no debug package is produced at all).
+# !debug is kept anyway, explicit about intent rather than relying on that
+# side effect. Without either, makepkg built a usr/src/debug/triple-c-bin
+# tree containing a dangling .build-id symlink, which is a real namcap
+# error (not just the empty-directory warning it looks like) — there is no
+# debug info in this release binary for the machinery to have extracted in
+# the first place.
 options=('!strip' '!debug')
 # Tauri names the asset after `productName` verbatim ("Triple-C"), not the
 # lowercase Cargo binary name — verified against the real release, not
@@ -68,7 +72,14 @@ package() {
   # this app carries no separate resource directory under usr/lib/, so there
   # is nothing that could disagree between Debian's and Arch's package trees
   # for it to land in the wrong place.
-  ar x "Triple-C_${pkgver}_amd64.deb"
+  #
+  # Globbed rather than named literally: the publish workflow discovers the
+  # real asset name from the release itself specifically so a Tauri bundler
+  # naming change can't silently break this — naming the file again here
+  # would throw that away and fail this one line with an opaque "No such
+  # file or directory" instead. `source=()` above guarantees exactly one
+  # `*_amd64.deb` entry, so the glob can only ever match that one file.
+  ar x ./*_amd64.deb
   tar xf data.tar.* -C "$pkgdir"
 
   install -Dm644 "$srcdir/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
