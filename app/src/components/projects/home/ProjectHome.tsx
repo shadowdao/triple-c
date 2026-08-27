@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
-import { projectRemovalIsClean, type ProjectRemovalReport } from "../../../lib/types";
+import { projectRemovalIsClean } from "../../../lib/types";
 import { useAppState } from "../../../store/appState";
 import { useProjectActions } from "../../../hooks/useProjectActions";
 import { useProjects } from "../../../hooks/useProjects";
@@ -19,6 +19,7 @@ import ConfigTab from "./ConfigTab";
 import FilesTab from "./FilesTab";
 import BrowserTab from "./BrowserTab";
 import { formatUptime } from "./format";
+import { describeLeftovers, leftoverVerb } from "./removalReport";
 
 const TABS = [
   { id: "overview", label: "Overview" },
@@ -30,24 +31,6 @@ const TABS = [
 ] as const;
 
 export type ProjectHomeTabId = (typeof TABS)[number]["id"];
-
-/**
- * Names what a `ProjectRemovalReport` says survived, for the leftover toast.
- *
- * Worded as "could not confirm" rather than "is still on disk": the same
- * report shape covers a genuine leftover (a locked volume) and a daemon that
- * was simply unreachable at the time, in which case nothing was ever created
- * and there is nothing to find — asserting certainty either way would be
- * wrong in one of those cases.
- */
-function describeLeftovers(report: ProjectRemovalReport): string {
-  const parts: string[] = [];
-  if (report.container) parts.push("its container");
-  if (report.image) parts.push("its saved image");
-  if (report.volumes.length === 1) parts.push("a volume");
-  else if (report.volumes.length > 1) parts.push(`${report.volumes.length} volumes`);
-  return parts.join(", ");
-}
 
 interface Props {
   projectId: string;
@@ -303,19 +286,20 @@ export default function ProjectHome({ projectId, active }: Props) {
             try {
               const report = await remove(project.id);
               if (!projectRemovalIsClean(report)) {
+                const verb = leftoverVerb(report);
                 if (report.retry_scheduled) {
                   useAppState.getState().pushToast({
                     kind: "info",
-                    message: `“${project.name}” was removed, but Triple-C could not confirm all its Docker resources were cleaned up`,
-                    detail: `Triple-C could not confirm ${describeLeftovers(report)} were removed. It will check again the next time it starts.`,
+                    message: `“${project.name}” was removed, but Triple-C could not confirm all its Docker resources were removed`,
+                    detail: `Triple-C could not confirm ${describeLeftovers(report)} ${verb} removed. It will check again the next time it starts.`,
                   });
                 } else {
                   // The pending-cleanup record itself failed to save — no
                   // retry will happen, so this must not promise one.
                   useAppState.getState().pushToast({
                     kind: "error",
-                    message: `“${project.name}” was removed, but its Docker resources could not be cleaned up`,
-                    detail: `Triple-C could not confirm ${describeLeftovers(report)} were removed, and could not record this for a retry. You may need to remove them manually (\`docker rm\` / \`docker rmi\` / \`docker volume rm\`).`,
+                    message: `“${project.name}” was removed, but Triple-C could not confirm its Docker resources were removed`,
+                    detail: `Triple-C could not confirm ${describeLeftovers(report)} ${verb} removed, and could not record this for a retry. You may need to remove them manually (\`docker rm\` / \`docker rmi\` / \`docker volume rm\`).`,
                   });
                 }
               }

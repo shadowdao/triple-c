@@ -457,16 +457,21 @@ impl ProjectRemovalReport {
 }
 
 /// What `rebuild_project_container` (Reset) produced: the project as it
-/// stands after restarting, and any volume Reset could not clear.
+/// stands after restarting, and anything Reset could not clear.
 ///
-/// Reset's contract is "back to a clean base image", so a leftover volume
-/// here is reused as-is by the container this creates — the opposite of what
-/// was asked for — and unlike [`ProjectRemovalReport`] there is no
-/// pending-cleanup record for it: the project id survives Reset, so a later
-/// Reset attempt can retry the same volume itself.
+/// Reset's contract is "back to a clean base image", so a leftover volume or
+/// image here is reused/rebuilt-from as-is by the container this creates —
+/// the opposite of what was asked for — and unlike [`ProjectRemovalReport`]
+/// there is no pending-cleanup record for either: the project id survives
+/// Reset, so a later Reset attempt can retry them itself.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProjectResetOutcome {
     pub project: Project,
+    /// The `triple-c-snapshot-{id}` image, if Reset could not remove it. The
+    /// more serious of the two leftovers here: the new container is created
+    /// from this image whenever it exists, so a surviving image means Reset
+    /// silently rebuilt the exact system layer it was asked to discard.
+    pub leftover_image: Option<String>,
     /// Volumes that survived Reset and were mounted into the new container
     /// unchanged.
     pub leftover_volumes: Vec<String>,

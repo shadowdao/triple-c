@@ -730,19 +730,37 @@ pub async fn remove_project(
     let existing_project = state.projects_store.get(&project_id);
 
     if let Some(ref project) = existing_project {
-        // `project.container_id` can be `None` or stale — a crash between
-        // creating a container and persisting its id is the same race every
-        // other destroyer of a project's container already guards against
-        // with `find_existing_container` (`start_project_container`,
-        // migration's recreate paths). Removal is the one place that
-        // mattered least before this fix, because a container `remove_project`
-        // missed just sat there; now a miss here poisons the volume removal
-        // right after it (Docker refuses to delete a volume a container still
-        // references) and mints a pending-cleanup record for volumes with no
-        // way to name the container actually blocking them.
-        let container_ref = match &project.container_id {
-            Some(id) => Some(id.clone()),
-            None => docker::find_existing_container(project).await.ok().flatten(),
+        // Resolved via `find_existing_container` unconditionally rather than
+        // trusting `project.container_id` — that field can be *stale*, not
+        // just absent: `start_project_container_locked`'s recreate path
+        // removes the old container, creates a new one, and does not persist
+        // the new id until after `start_container` succeeds, so a start
+        // failure in between (a missing `/dev/net/tun`, an image that exits
+        // immediately) leaves the stored id pointing at a container that no
+        // longer exists while a live one sits under the same deterministic
+        // name. Removing by a stale id then 404s — success as far as Docker
+        // is concerned — while the real container survives to block every
+        // subsequent volume removal with a 409, with nothing in the report
+        // ever naming it. `find_existing_container` is what every other
+        // destroyer of a project's container already resolves through
+        // (`start_project_container`, migration's recreate paths) for this
+        // exact reason.
+        //
+        // A `Docker unreachable` error here is treated as "assume a
+        // container is still there" rather than "assume none is", matching
+        // `remove_volumes_by_name`'s fail-closed handling of the same
+        // situation — the alternative silently drops the one resource most
+        // likely to block everything else if it does exist.
+        let container_ref = match docker::find_existing_container(project).await {
+            Ok(found) => found,
+            Err(e) => {
+                log::warn!(
+                    "Could not check for an existing container for project {}: {}",
+                    project_id, e
+                );
+                report.container = Some(project.container_name());
+                None
+            }
         };
         if let Some(ref container_id) = container_ref {
             state.exec_manager.close_sessions_for_container(container_id).await;
@@ -791,24 +809,35 @@ pub async fn remove_project(
             Ok(()) => {
                 report.retry_scheduled = true;
                 log::warn!(
-                    "Project {} removed with Docker resources still present: {:?} — recorded for \
-                     automatic retry on next launch",
+                    "Project {} removed; could not confirm these Docker resources were removed: \
+                     {:?} — recorded for automatic retry on next launch",
                     project_id, report
                 );
             }
             Err(e) => {
                 report.retry_scheduled = false;
                 log::error!(
-                    "Project {} removed with Docker resources still present ({:?}), and the \
-                     pending-cleanup record could not be written ({}) — nothing will retry \
-                     removing them",
+                    "Project {} removed; could not confirm these Docker resources were removed \
+                     ({:?}), and the pending-cleanup record could not be written ({}) — nothing \
+                     will retry removing them",
                     project_id, report, e
                 );
             }
         }
     }
 
-    state.projects_store.remove(&project_id)?;
+    // The pending-cleanup record above must not outlive the project record it
+    // describes: if the store's own write fails (full disk, permissions) the
+    // project is still on disk and will reload on the next launch, but the
+    // record would tell startup housekeeping to delete its container and
+    // volumes out from under it. Roll the record back rather than leaving
+    // that mismatch for the retry to discover the hard way.
+    if let Err(e) = state.projects_store.remove(&project_id) {
+        if !report.is_clean() {
+            let _ = crate::storage::pending_cleanup::clear(&project_id);
+        }
+        return Err(e);
+    }
     Ok(report)
 }
 
@@ -882,19 +911,23 @@ pub async fn retry_pending_cleanup_logged() {
             // record that has failed every retry for a week is no longer
             // routine: escalate the log level so it is not indistinguishable
             // from one seen for the first time.
-            let age = chrono::DateTime::parse_from_rfc3339(&record.recorded_at)
-                .ok()
-                .map(|t| chrono::Utc::now().signed_duration_since(t.with_timezone(&chrono::Utc)));
-            match age {
-                Some(age) if age > chrono::Duration::days(PENDING_CLEANUP_STALE_AFTER_DAYS) => {
+            match pending_cleanup_is_stale(&record.recorded_at, chrono::Utc::now()) {
+                Some(true) => {
                     log::error!(
-                        "Pending cleanup for project {} ({}) has not succeeded in over {} days: \
-                         {:?} — this may need a manual `docker volume rm` / `docker rmi` / \
-                         `docker rm`",
+                        "Pending cleanup for project {} ({}) has not succeeded in over {} \
+                         days: {:?} — this may need a manual `docker volume rm` / \
+                         `docker rmi` / `docker rm`",
                         record.project_id, record.project_name, PENDING_CLEANUP_STALE_AFTER_DAYS, record
                     );
                 }
-                _ => {}
+                Some(false) => {}
+                // Silent otherwise would mean a record with a corrupted
+                // timestamp never escalates and nothing says why.
+                None => log::debug!(
+                    "Pending cleanup record for project {} ({}) has an unreadable recorded_at \
+                     ({:?}) — its age cannot be tracked",
+                    record.project_id, record.project_name, record.recorded_at
+                ),
             }
             if let Err(e) = crate::storage::pending_cleanup::save(&record) {
                 log::warn!(
@@ -915,6 +948,19 @@ pub async fn retry_pending_cleanup_logged() {
 /// `retry_pending_cleanup_logged` escalates its log line from `warn` to
 /// `error` — see the comment at its call site.
 const PENDING_CLEANUP_STALE_AFTER_DAYS: i64 = 7;
+
+/// Whether a pending-cleanup record's `recorded_at` is older than
+/// [`PENDING_CLEANUP_STALE_AFTER_DAYS`], measured against `now`. `None` means
+/// the timestamp could not be parsed at all — a corrupted or (hypothetically)
+/// hand-edited record — which callers must not silently treat as "not stale"
+/// without saying why. `now` is a parameter rather than read internally so
+/// this is testable without a live clock.
+fn pending_cleanup_is_stale(recorded_at: &str, now: chrono::DateTime<chrono::Utc>) -> Option<bool> {
+    let recorded = chrono::DateTime::parse_from_rfc3339(recorded_at)
+        .ok()?
+        .with_timezone(&chrono::Utc);
+    Some(now.signed_duration_since(recorded) > chrono::Duration::days(PENDING_CLEANUP_STALE_AFTER_DAYS))
+}
 
 #[tauri::command]
 pub async fn update_project(
@@ -1417,15 +1463,16 @@ pub async fn rebuild_project_container(
     // `start_project_container` below re-arms it against the new one.
     state.auth_bridge.stop(&project_id).await;
 
-    // Remove existing container. Resolved the same way `remove_project` now
-    // is — `project.container_id` can be `None` or stale — because a
+    // Remove existing container. Resolved via `find_existing_container`
+    // unconditionally, not `project.container_id` — see the long comment in
+    // `remove_project` for why that field can be stale, not just absent. A
     // container this misses blocks the volume removal immediately below with
     // a 409, and Reset silently keeping the old volumes is exactly the bug
-    // this whole change is closing.
-    let container_ref = match &project.container_id {
-        Some(id) => Some(id.clone()),
-        None => docker::find_existing_container(&project).await.ok().flatten(),
-    };
+    // this whole change is closing. Unlike `remove_project`'s best-effort
+    // handling of the same lookup failing, `?` here aborts Reset outright:
+    // every step after this one needs Docker too, so there is no useful
+    // partial progress to make without it.
+    let container_ref = docker::find_existing_container(&project).await?;
     if let Some(ref container_id) = container_ref {
         state.exec_manager.close_sessions_for_container(container_id).await;
         let _ = docker::stop_container(container_id).await;
@@ -1433,29 +1480,33 @@ pub async fn rebuild_project_container(
         state.projects_store.set_container_id(&project_id, None)?;
     }
 
-    // Remove snapshot image + volumes so Reset creates from the clean base image
+    // Remove snapshot image + volumes so Reset creates from the clean base
+    // image. Both leftovers are surfaced, not just logged — an image that
+    // survives is the more serious of the two, since
+    // `start_project_container_locked` below builds from
+    // `triple-c-snapshot-{id}:latest` whenever it exists, so a leftover image
+    // means Reset silently rebuilds the exact system layer it promised to
+    // discard. No pending-cleanup record for either: unlike `remove_project`,
+    // Reset keeps the project record, so a later Reset attempt can retry
+    // these itself rather than needing startup housekeeping to do it.
+    let mut leftover_image = None;
     if let Err(e) = docker::remove_snapshot_image(&project).await {
         log::warn!("Failed to remove snapshot image for project {}: {}", project_id, e);
+        leftover_image = Some(docker::get_snapshot_image_name(&project));
     }
     let leftover_volumes = docker::remove_project_volumes(&project).await;
-    if !leftover_volumes.is_empty() {
-        // Unlike `remove_project`, Reset keeps the project record — but a
-        // volume that survives this is reused as-is by the container
-        // `start_project_container_locked` creates below, which is exactly
-        // what Reset promises not to do. No pending-cleanup record: the
-        // project id is still live, so a later Reset attempt can retry this
-        // itself rather than needing startup housekeeping to do it.
+    if leftover_image.is_some() || !leftover_volumes.is_empty() {
         log::warn!(
-            "Reset could not remove volume(s) {:?} for project {} — the new container may reuse \
-             their old contents instead of starting clean",
-            leftover_volumes, project_id
+            "Reset for project {} could not fully clean up — image: {:?}, volumes: {:?} — the \
+             new container may be built from, or reuse, old contents instead of starting clean",
+            project_id, leftover_image, leftover_volumes
         );
     }
 
     // Start fresh. The locked variant, because `_guard` above is this project's
     // claim and the public command would be refused by it.
     let project = start_project_container_locked(project_id, app_handle, state).await?;
-    Ok(ProjectResetOutcome { project, leftover_volumes })
+    Ok(ProjectResetOutcome { project, leftover_image, leftover_volumes })
 }
 
 /// Reconcile project statuses against actual Docker container state.
@@ -1562,6 +1613,54 @@ fn default_docker_socket() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Pending-cleanup aging ────────────────────────────────────────────
+
+    #[test]
+    fn a_record_younger_than_the_threshold_is_not_stale() {
+        let now = "2026-08-25T00:00:00Z".parse().unwrap();
+        let recorded_at = "2026-08-19T00:00:00Z"; // 6 days before `now`
+        assert_eq!(pending_cleanup_is_stale(recorded_at, now), Some(false));
+    }
+
+    #[test]
+    fn a_record_exactly_at_the_threshold_is_not_yet_stale() {
+        let now = "2026-08-25T00:00:00Z".parse().unwrap();
+        let recorded_at = "2026-08-18T00:00:00Z"; // exactly 7 days before `now`
+        assert_eq!(
+            pending_cleanup_is_stale(recorded_at, now),
+            Some(false),
+            "the boundary itself must not already read as stale"
+        );
+    }
+
+    #[test]
+    fn a_record_older_than_the_threshold_is_stale() {
+        let now = "2026-08-25T00:00:00Z".parse().unwrap();
+        let recorded_at = "2026-08-17T00:00:00Z"; // 8 days before `now`
+        assert_eq!(pending_cleanup_is_stale(recorded_at, now), Some(true));
+    }
+
+    /// A clock that ran fast when the record was written leaves a timestamp
+    /// in the future. This must read as "not stale" rather than underflow or
+    /// panic — `signed_duration_since` returns a negative `Duration` here,
+    /// which compares less than any positive threshold correctly.
+    #[test]
+    fn a_timestamp_in_the_future_is_not_stale() {
+        let now = "2026-08-25T00:00:00Z".parse().unwrap();
+        let recorded_at = "2026-08-26T00:00:00Z"; // one day after `now`
+        assert_eq!(pending_cleanup_is_stale(recorded_at, now), Some(false));
+    }
+
+    /// A corrupted or hand-edited `recorded_at` must not silently read as
+    /// "not stale" through some default — callers need to be able to tell
+    /// "definitely not stale" apart from "cannot tell".
+    #[test]
+    fn an_unparseable_recorded_at_reports_unknown_rather_than_not_stale() {
+        let now = "2026-08-25T00:00:00Z".parse().unwrap();
+        assert_eq!(pending_cleanup_is_stale("not a timestamp", now), None);
+        assert_eq!(pending_cleanup_is_stale("", now), None);
+    }
 
     fn path(host: &str, mount: &str) -> ProjectPath {
         ProjectPath {

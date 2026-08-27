@@ -101,6 +101,10 @@ export function projectRemovalIsClean(report: ProjectRemovalReport): boolean {
  *  as-is by the new container instead of starting clean. */
 export interface ProjectResetOutcome {
   project: Project;
+  /** The saved container image, if Reset could not remove it — the new
+   *  container is built from it whenever it exists, so this means Reset
+   *  silently rebuilt the system layer it was asked to discard. */
+  leftover_image: string | null;
   leftover_volumes: string[];
 }
 

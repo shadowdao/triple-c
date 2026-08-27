@@ -146,10 +146,25 @@ fn list_in(dir: &Path) -> Vec<PendingCleanup> {
             match serde_json::from_str::<PendingCleanup>(&data) {
                 Ok(record) => Some(record),
                 Err(err) => {
+                    // Moved aside rather than left in place: a record nothing
+                    // ever repairs would otherwise warn on every single
+                    // startup forever, same as an ordinary `.json` file it
+                    // would keep looking like one to `list_in` on the next
+                    // call too. One aside-copy is enough here — this only
+                    // ever holds names to retry removing, not the class of
+                    // once-in-a-lifetime crash evidence `migration_store`
+                    // keeps multiple timestamped backups of.
+                    let corrupt = path.with_extension("json.corrupt");
+                    let moved = !corrupt.exists() && fs::rename(&path, &corrupt).is_ok();
                     log::warn!(
-                        "Could not parse pending cleanup record {}: {} — skipping it this run",
+                        "Could not parse pending cleanup record {}: {}{}",
                         path.display(),
-                        err
+                        err,
+                        if moved {
+                            format!(" — moved aside to {}", corrupt.display())
+                        } else {
+                            " — leaving it in place".to_string()
+                        }
                     );
                     None
                 }

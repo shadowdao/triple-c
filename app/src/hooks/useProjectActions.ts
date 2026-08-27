@@ -58,14 +58,22 @@ export function useProjectActions(project: Project) {
     () =>
       run("Reset", async () => {
         const outcome = await rebuild(project.id);
-        if (outcome.leftover_volumes.length > 0) {
-          const n = outcome.leftover_volumes.length;
+        const { leftover_image, leftover_volumes } = outcome;
+        if (leftover_image || leftover_volumes.length > 0) {
+          const parts: string[] = [];
+          if (leftover_image) parts.push("its previous container image");
+          if (leftover_volumes.length === 1) parts.push("a volume");
+          else if (leftover_volumes.length > 1) parts.push(`${leftover_volumes.length} volumes`);
+          // Not "run `docker volume rm`" — by the time this renders, the new
+          // container this same call just started already has the leftover
+          // volume mounted, so that command would just hit the same 409
+          // Reset did. Stopping the project first is what actually frees it.
           pushToast({
             kind: "error",
-            message: `Reset for “${project.name}” could not fully clean up`,
-            detail: `${n === 1 ? "A volume" : `${n} volumes`} could not be removed, so the new \
-container may still contain data from before the reset. You may need to remove ${n === 1 ? "it" : "them"} \
-manually with \`docker volume rm\`.`,
+            message: `Reset for “${project.name}” did not fully clean up`,
+            detail: `Triple-C could not remove ${parts.join(" and ")} from before the reset, so \
+the new container may still be built from, or contain, old data. Stop the project, then try \
+Reset again, or remove ${parts.length > 1 ? "them" : "it"} manually once stopped.`,
           });
         }
         return outcome;
