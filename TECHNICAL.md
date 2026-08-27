@@ -412,11 +412,10 @@ triple-c/
 │
 ├── .gitea/
 │   └── workflows/
-│       ├── build-app.yml          # Build Tauri app (Linux/macOS/Windows)
+│       ├── build-app.yml          # Build Tauri app (Linux/macOS/Windows); mirrors releases to GitHub inline
 │       ├── build-app-preview.yml  # Preview builds
 │       ├── build.yml              # Build container image (multi-arch)
 │       ├── build-stt.yml          # Build the STT image
-│       ├── sync-release.yml       # Mirror releases to GitHub
 │       ├── backfill-releases.yml  # Bulk copy releases to GitHub
 │       └── cleanup-releases.yml   # Prune old releases
 │

@@ -26,6 +26,15 @@ pub struct GitHubRelease {
     pub body: String,
     pub assets: Vec<GitHubAsset>,
     pub published_at: String,
+    /// Whether GitHub itself has this release marked as a prerelease.
+    /// `#[serde(default)]` rather than required: every response GitHub sends
+    /// carries this, but nothing here should refuse to parse the rest of a
+    /// release over one missing field. No production release is ever
+    /// mirrored with this `true` today — see `check_for_updates`, which
+    /// filters on it explicitly rather than relying on that being an
+    /// accident of what happens to get mirrored.
+    #[serde(default)]
+    pub prerelease: bool,
 }
 
 /// GitHub API asset response (internal).

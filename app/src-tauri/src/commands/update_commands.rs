@@ -16,9 +16,27 @@ const REGISTRY_API_BASE: &str =
 const GHCR_TOKEN_URL: &str =
     "https://ghcr.io/token?scope=repository:shadowdao/triple-c-sandbox:pull";
 
+/// `CARGO_PKG_VERSION`, plus a build-time suffix when one was baked in.
+///
+/// The bundle version itself (`tauri.conf.json`, `Cargo.toml`, `package.json`)
+/// is never given a `-preview.<sha>` suffix — `build-app-preview.yml` strips
+/// it before patching those files, because the Windows MSI's `ProductVersion`
+/// is a fixed-width numeric field with no room for one, and nothing here can
+/// verify a change to that without an actual Windows build. `TRIPLE_C_BUILD_SUFFIX`
+/// is the workaround: set as a build-time env var in the preview workflow
+/// only, so `option_env!` bakes it into the binary without the bundle version
+/// ever seeing it. A production build sets nothing, so `option_env!` reads
+/// `None` and this is a no-op — see triple-c#32.
+fn format_app_version(base: &str, build_suffix: Option<&str>) -> String {
+    match build_suffix {
+        Some(suffix) if !suffix.is_empty() => format!("{}-{}", base, suffix),
+        _ => base.to_string(),
+    }
+}
+
 #[tauri::command]
 pub fn get_app_version() -> String {
-    env!("CARGO_PKG_VERSION").to_string()
+    format_app_version(env!("CARGO_PKG_VERSION"), option_env!("TRIPLE_C_BUILD_SUFFIX"))
 }
 
 #[tauri::command]
@@ -51,30 +69,8 @@ pub async fn check_for_updates() -> Result<Option<UpdateInfo>, String> {
         &[".AppImage", ".deb", ".rpm"]
     };
 
-    // Filter releases that have at least one asset matching the current platform
-    let platform_releases: Vec<&GitHubRelease> = releases
-        .iter()
-        .filter(|r| {
-            r.assets.iter().any(|a| {
-                platform_extensions.iter().any(|ext| a.name.ends_with(ext))
-            })
-        })
-        .collect();
-
-    // Find the latest release with a higher semver version
-    let mut best: Option<(&GitHubRelease, (u32, u32, u32))> = None;
-    for release in &platform_releases {
-        if let Some(ver) = parse_semver_from_tag(&release.tag_name) {
-            if ver > current_semver {
-                if best.is_none() || ver > best.unwrap().1 {
-                    best = Some((release, ver));
-                }
-            }
-        }
-    }
-
-    match best {
-        Some((release, _)) => {
+    match pick_update(&releases, current_semver, platform_extensions) {
+        Some(release) => {
             // Only include assets matching the current platform
             let assets = release
                 .assets
@@ -105,6 +101,37 @@ pub async fn check_for_updates() -> Result<Option<UpdateInfo>, String> {
     }
 }
 
+/// Pick the newest available update out of a release list, or `None` if
+/// nothing beats `current_semver`. Pure and synchronous — split out of
+/// `check_for_updates` so the prerelease/platform/version filtering can be
+/// tested without a live HTTP call.
+///
+/// Three filters, all of which must pass: not a prerelease (see the long
+/// comment on `GitHubRelease::prerelease`), at least one asset for this
+/// platform, and a tag that parses as semver *and* is newer than what is
+/// running. A tag that does not parse — a `-preview.<sha>` suffix, most
+/// realistically — is skipped rather than erroring, the same as it always
+/// has been; nothing here changes what an update tag is expected to look
+/// like, only what channel it is allowed to come from.
+fn pick_update<'a>(
+    releases: &'a [GitHubRelease],
+    current_semver: (u32, u32, u32),
+    platform_extensions: &[&str],
+) -> Option<&'a GitHubRelease> {
+    releases
+        .iter()
+        .filter(|r| !r.prerelease)
+        .filter(|r| {
+            r.assets
+                .iter()
+                .any(|a| platform_extensions.iter().any(|ext| a.name.ends_with(ext)))
+        })
+        .filter_map(|r| parse_semver_from_tag(&r.tag_name).map(|ver| (r, ver)))
+        .filter(|(_, ver)| *ver > current_semver)
+        .max_by_key(|(_, ver)| *ver)
+        .map(|(r, _)| r)
+}
+
 /// Parse a semver string like "0.2.5" -> (0, 2, 5)
 fn parse_semver(version: &str) -> Option<(u32, u32, u32)> {
     let clean = version.trim_start_matches('v');
@@ -129,6 +156,92 @@ fn parse_semver_from_tag(tag: &str) -> Option<(u32, u32, u32)> {
 fn extract_version_from_tag(tag: &str) -> Option<String> {
     let (major, minor, patch) = parse_semver_from_tag(tag)?;
     Some(format!("{}.{}.{}", major, minor, patch))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::GitHubAsset;
+
+    // ── format_app_version ──────────────────────────────────────────────
+
+    #[test]
+    fn a_production_build_reports_the_bare_version() {
+        assert_eq!(format_app_version("0.4.12", None), "0.4.12");
+        // An empty env var (set but blank) must not print a trailing dash.
+        assert_eq!(format_app_version("0.4.12", Some("")), "0.4.12");
+    }
+
+    #[test]
+    fn a_preview_build_reports_its_suffix() {
+        assert_eq!(
+            format_app_version("0.4.12", Some("preview.a1b2c3d")),
+            "0.4.12-preview.a1b2c3d"
+        );
+    }
+
+    // ── pick_update ──────────────────────────────────────────────────────
+
+    fn release(tag: &str, prerelease: bool, asset_names: &[&str]) -> GitHubRelease {
+        GitHubRelease {
+            tag_name: tag.to_string(),
+            html_url: format!("https://example.invalid/{}", tag),
+            body: String::new(),
+            assets: asset_names
+                .iter()
+                .map(|name| GitHubAsset {
+                    name: name.to_string(),
+                    browser_download_url: String::new(),
+                    size: 0,
+                })
+                .collect(),
+            published_at: "2026-01-01T00:00:00Z".to_string(),
+            prerelease,
+        }
+    }
+
+    const LINUX_EXTENSIONS: &[&str] = &[".AppImage", ".deb", ".rpm"];
+
+    #[test]
+    fn a_prerelease_is_never_offered_even_if_its_tag_would_otherwise_win() {
+        let releases = vec![release("v9.9.9", true, &["app-9.9.9.AppImage"])];
+        assert!(pick_update(&releases, (0, 4, 10), LINUX_EXTENSIONS).is_none());
+    }
+
+    #[test]
+    fn a_release_with_no_asset_for_this_platform_is_skipped() {
+        let releases = vec![release("v0.4.12", false, &["app-0.4.12.msi"])];
+        assert!(pick_update(&releases, (0, 4, 10), LINUX_EXTENSIONS).is_none());
+    }
+
+    #[test]
+    fn a_release_that_is_not_newer_is_not_offered() {
+        let releases = vec![release("v0.4.10", false, &["app.AppImage"])];
+        assert!(pick_update(&releases, (0, 4, 10), LINUX_EXTENSIONS).is_none());
+    }
+
+    #[test]
+    fn an_untagged_or_unparseable_release_is_skipped_not_fatal() {
+        // A `-preview.<sha>` tag is exactly the shape this must not choke on
+        // or mistake for an update — it simply never parses as a bare semver.
+        let releases = vec![
+            release("preview-a1b2c3d", false, &["app.AppImage"]),
+            release("v0.4.12", false, &["app.AppImage"]),
+        ];
+        let best = pick_update(&releases, (0, 4, 10), LINUX_EXTENSIONS).unwrap();
+        assert_eq!(best.tag_name, "v0.4.12");
+    }
+
+    #[test]
+    fn the_highest_qualifying_version_wins_not_the_first_or_last_in_the_list() {
+        let releases = vec![
+            release("v0.4.11", false, &["app.AppImage"]),
+            release("v0.4.13", false, &["app.AppImage"]),
+            release("v0.4.12", false, &["app.AppImage"]),
+        ];
+        let best = pick_update(&releases, (0, 4, 10), LINUX_EXTENSIONS).unwrap();
+        assert_eq!(best.tag_name, "v0.4.13");
+    }
 }
 
 /// Check whether a newer container image is available in the registry.
