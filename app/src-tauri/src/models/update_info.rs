@@ -29,10 +29,18 @@ pub struct GitHubRelease {
     /// Whether GitHub itself has this release marked as a prerelease.
     /// `#[serde(default)]` rather than required: every response GitHub sends
     /// carries this, but nothing here should refuse to parse the rest of a
-    /// release over one missing field. No production release is ever
-    /// mirrored with this `true` today — see `check_for_updates`, which
-    /// filters on it explicitly rather than relying on that being an
-    /// accident of what happens to get mirrored.
+    /// release over one missing field. Defaults to `false` (offered) rather
+    /// than `true` (excluded) — a missing field only happens if GitHub's API
+    /// shape changes, and "API changed, therefore updates silently stop
+    /// working forever" is the worse failure of the two.
+    ///
+    /// `build-app.yml`'s own mirror never publishes a prerelease, but
+    /// `.gitea/workflows/backfill-releases.yml` forwards every Gitea release
+    /// unfiltered, `prerelease` included — so if it were ever dispatched
+    /// while a preview release existed, this field is what stops
+    /// `check_for_updates` from offering it (the `preview-<sha>` tag shape
+    /// already fails semver parsing independently, but this is real
+    /// defence-in-depth, not a no-op).
     #[serde(default)]
     pub prerelease: bool,
 }

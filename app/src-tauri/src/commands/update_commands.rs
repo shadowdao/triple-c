@@ -69,7 +69,19 @@ pub async fn check_for_updates() -> Result<Option<UpdateInfo>, String> {
         &[".AppImage", ".deb", ".rpm"]
     };
 
-    match pick_update(&releases, current_semver, platform_extensions) {
+    // `current_version` above is always the bare, stripped `CARGO_PKG_VERSION`
+    // — the preview workflow patches `Cargo.toml` with that before compiling,
+    // never the `-preview.<sha>`-suffixed one `get_app_version()` reports —
+    // so a preview build and the release it precedes compile to the identical
+    // numeric tuple by construction (see `build-app-preview.yml`'s "highest
+    // tag used, +1" computation). A strict `>` therefore never fires for the
+    // one release a preview most needs to be offered. `is_preview_build`
+    // relaxes that one comparison to `>=` so "there is a real release at my
+    // own number" reads as an update, without touching the production case
+    // — see `pick_update`.
+    let is_preview_build = option_env!("TRIPLE_C_BUILD_SUFFIX").is_some_and(|s| !s.is_empty());
+
+    match pick_update(&releases, current_semver, platform_extensions, is_preview_build) {
         Some(release) => {
             // Only include assets matching the current platform
             let assets = release
@@ -108,15 +120,22 @@ pub async fn check_for_updates() -> Result<Option<UpdateInfo>, String> {
 ///
 /// Three filters, all of which must pass: not a prerelease (see the long
 /// comment on `GitHubRelease::prerelease`), at least one asset for this
-/// platform, and a tag that parses as semver *and* is newer than what is
-/// running. A tag that does not parse — a `-preview.<sha>` suffix, most
-/// realistically — is skipped rather than erroring, the same as it always
-/// has been; nothing here changes what an update tag is expected to look
-/// like, only what channel it is allowed to come from.
+/// platform, and a tag that parses as semver *and* beats what is running. A
+/// tag that does not parse — a `-preview.<sha>` suffix, most realistically —
+/// is skipped rather than erroring, the same as it always has been; nothing
+/// here changes what an update tag is expected to look like, only what
+/// channel it is allowed to come from.
+///
+/// `is_preview_build` relaxes "beats" from `>` to `>=`. A preview build's
+/// `current_semver` is the bare number it was compiled with, which is by
+/// construction identical to the release it precedes — see the comment at
+/// `check_for_updates`'s call site — so a strict `>` would never fire for
+/// exactly the release a preview install most needs to be told about.
 fn pick_update<'a>(
     releases: &'a [GitHubRelease],
     current_semver: (u32, u32, u32),
     platform_extensions: &[&str],
+    is_preview_build: bool,
 ) -> Option<&'a GitHubRelease> {
     releases
         .iter()
@@ -127,7 +146,13 @@ fn pick_update<'a>(
                 .any(|a| platform_extensions.iter().any(|ext| a.name.ends_with(ext)))
         })
         .filter_map(|r| parse_semver_from_tag(&r.tag_name).map(|ver| (r, ver)))
-        .filter(|(_, ver)| *ver > current_semver)
+        .filter(|(_, ver)| {
+            if is_preview_build {
+                *ver >= current_semver
+            } else {
+                *ver > current_semver
+            }
+        })
         .max_by_key(|(_, ver)| *ver)
         .map(|(r, _)| r)
 }
@@ -205,19 +230,19 @@ mod tests {
     #[test]
     fn a_prerelease_is_never_offered_even_if_its_tag_would_otherwise_win() {
         let releases = vec![release("v9.9.9", true, &["app-9.9.9.AppImage"])];
-        assert!(pick_update(&releases, (0, 4, 10), LINUX_EXTENSIONS).is_none());
+        assert!(pick_update(&releases, (0, 4, 10), LINUX_EXTENSIONS, false).is_none());
     }
 
     #[test]
     fn a_release_with_no_asset_for_this_platform_is_skipped() {
         let releases = vec![release("v0.4.12", false, &["app-0.4.12.msi"])];
-        assert!(pick_update(&releases, (0, 4, 10), LINUX_EXTENSIONS).is_none());
+        assert!(pick_update(&releases, (0, 4, 10), LINUX_EXTENSIONS, false).is_none());
     }
 
     #[test]
     fn a_release_that_is_not_newer_is_not_offered() {
         let releases = vec![release("v0.4.10", false, &["app.AppImage"])];
-        assert!(pick_update(&releases, (0, 4, 10), LINUX_EXTENSIONS).is_none());
+        assert!(pick_update(&releases, (0, 4, 10), LINUX_EXTENSIONS, false).is_none());
     }
 
     #[test]
@@ -228,7 +253,7 @@ mod tests {
             release("preview-a1b2c3d", false, &["app.AppImage"]),
             release("v0.4.12", false, &["app.AppImage"]),
         ];
-        let best = pick_update(&releases, (0, 4, 10), LINUX_EXTENSIONS).unwrap();
+        let best = pick_update(&releases, (0, 4, 10), LINUX_EXTENSIONS, false).unwrap();
         assert_eq!(best.tag_name, "v0.4.12");
     }
 
@@ -239,8 +264,36 @@ mod tests {
             release("v0.4.13", false, &["app.AppImage"]),
             release("v0.4.12", false, &["app.AppImage"]),
         ];
-        let best = pick_update(&releases, (0, 4, 10), LINUX_EXTENSIONS).unwrap();
+        let best = pick_update(&releases, (0, 4, 10), LINUX_EXTENSIONS, false).unwrap();
         assert_eq!(best.tag_name, "v0.4.13");
+    }
+
+    // ── is_preview_build (>= instead of >) ─────────────────────────────────
+
+    /// The exact scenario triple-c#32 was filed to fix: a preview compiled as
+    /// `0.4.12-preview.<sha>` (bare `CARGO_PKG_VERSION` "0.4.12") must be
+    /// offered the `v0.4.12` release that follows it, even though the two
+    /// compute to the identical numeric tuple.
+    #[test]
+    fn a_preview_build_is_offered_the_release_it_precedes() {
+        let releases = vec![release("v0.4.12", false, &["app.AppImage"])];
+        assert!(pick_update(&releases, (0, 4, 12), LINUX_EXTENSIONS, false).is_none());
+        let best = pick_update(&releases, (0, 4, 12), LINUX_EXTENSIONS, true).unwrap();
+        assert_eq!(best.tag_name, "v0.4.12");
+    }
+
+    #[test]
+    fn a_preview_build_is_not_offered_an_older_release() {
+        let releases = vec![release("v0.4.11", false, &["app.AppImage"])];
+        assert!(pick_update(&releases, (0, 4, 12), LINUX_EXTENSIONS, true).is_none());
+    }
+
+    #[test]
+    fn a_production_build_still_requires_strictly_newer() {
+        // A production build must never treat "equal" as an update — that
+        // would perpetually re-offer the version already running.
+        let releases = vec![release("v0.4.12", false, &["app.AppImage"])];
+        assert!(pick_update(&releases, (0, 4, 12), LINUX_EXTENSIONS, false).is_none());
     }
 }
 
