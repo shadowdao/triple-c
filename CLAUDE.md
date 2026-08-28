@@ -677,6 +677,26 @@ deliberately out of scope — this is not a project backup.
   specifically to make them unmissable — the frontend's `<li>`/warning boxes also get `break-all`
   as a second layer against the same failure mode.
 
+## Packaging
+
+Linux ships as `.deb`, `.rpm` and AppImage, all three built by `build-app.yml` (releases) and
+`build-app-preview.yml` (the PR check). **There is deliberately no Arch package.** A
+`triple-c-bin` `PKGBUILD` and a `publish-arch-package.yml` existed and were removed; they live on
+`hold/arch-packaging`. Do not re-add them without the piece that was always missing: the package
+was never on the AUR, so it was a manual `pacman -U` of a downloaded file — the same gesture as
+the AppImage, for a second artifact to keep working. Being `workflow_dispatch`-only it also
+reached 1 release in 28, while `HOW-TO-USE.md` told Arch users to download it from every release.
+An AUR account and its SSH key as a repo secret are what would make it worth having; until then
+the AppImage is the Arch story.
+
+`scripts/install-appimage.sh` is the desktop-integration half, and it exists because an AppImage
+has no installer: it extracts the bundled icons into `~/.local/share/icons/hicolor` and writes a
+`.desktop` entry. It **rewrites** the `Exec` line rather than copying the bundled entry — the
+bundled one is `Exec=triple-c`, which resolves only inside the AppImage's own mount, so a
+verbatim copy yields a launcher entry that starts nothing. It keeps `StartupWMClass` exactly as
+the bundle sets it, which is what lets the shell match the window to the entry. Extraction uses
+`--appimage-extract`, which needs no FUSE, so the script works before `fuse2` is installed.
+
 ## Testing
 
 Frontend tests use Vitest with jsdom environment and React Testing Library. Setup file at `src/test/setup.ts`. Run a single test file:

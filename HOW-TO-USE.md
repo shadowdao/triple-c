@@ -43,12 +43,52 @@ Download the build for your platform from [GitHub Releases](https://github.com/s
 | **macOS** | `Triple-C_<version>_universal.dmg` | Open the `.dmg` and drag Triple-C to Applications. |
 | **Debian / Ubuntu** | `Triple-C_<version>_amd64.deb` | `sudo apt install ./Triple-C_<version>_amd64.deb` |
 | **Fedora / RHEL** | `Triple-C-<version>-1.x86_64.rpm` | `sudo dnf install ./Triple-C-<version>-1.x86_64.rpm` |
-| **Arch / CachyOS** | `triple-c-bin-<version>-1-x86_64.pkg.tar.zst` | `sudo pacman -U ./triple-c-bin-<version>-1-x86_64.pkg.tar.zst` |
-| **Other Linux** | `Triple-C_<version>_amd64.AppImage` | `chmod +x` it, then run it directly. |
+| **Arch / CachyOS / other Linux** | `Triple-C_<version>_amd64.AppImage` | `chmod +x` it, then run it directly. See the AppImage notes below. |
 
 > **macOS note:** The app is not signed or notarized. On first launch, macOS Gatekeeper may block it — right-click the app and select "Open" to bypass, or remove the quarantine attribute: `xattr -cr /Applications/Triple-C.app`.
 
-> **Arch / CachyOS note:** This package is not on the AUR — it's a `pacman`-installable file built and attached to each GitHub release by a maintainer-triggered step (`.gitea/workflows/publish-arch-package.yml`), so it can lag behind the very latest release by a bit. See [`packaging/arch/README.md`](packaging/arch/README.md) for details, including why "-bin" and what's verified about it.
+> **AppImage note:** Two things are worth knowing. Running an AppImage needs FUSE 2, which Arch and CachyOS do not install by default — `sudo pacman -S fuse2` once, or run it with `--appimage-extract-and-run` to sidestep FUSE entirely. And an AppImage is just an executable file: nothing registers it with the desktop, so it will not appear in your app launcher on its own. Run [`scripts/install-appimage.sh`](scripts/install-appimage.sh) to add a launcher entry and icons — see [Adding an AppImage to the app launcher](#adding-an-appimage-to-the-app-launcher).
+
+> **No Arch package.** There was a `triple-c-bin` `.pkg.tar.zst` attached to some releases, built by a maintainer-triggered workflow. It was never on the AUR, so installing it meant downloading a file and running `pacman -U` — no better than the AppImage — and being manual-only it reached 1 release in 28, which made the promise of it worse than not making it. The `PKGBUILD` and its workflow are preserved on the `hold/arch-packaging` branch if an AUR package is ever worth doing properly.
+
+### Adding an AppImage to the app launcher
+
+An AppImage is a single executable file and nothing else. It carries a `.desktop`
+entry and icons *inside* itself, but nothing on your system ever reads them,
+because nothing installed it — so it will not show up in your app launcher, and
+running it from a file manager gives you a generic icon in the taskbar.
+
+Put the AppImage somewhere stable first — `~/Apps` or `~/.local/bin`, not
+`~/Downloads` — because the launcher entry points at wherever the file is:
+
+```bash
+mkdir -p ~/Apps
+mv ~/Downloads/Triple-C_*_amd64.AppImage ~/Apps/
+./scripts/install-appimage.sh ~/Apps/Triple-C_0.4.17_amd64.AppImage
+```
+
+That copies the bundled icons into `~/.local/share/icons/hicolor` and writes
+`~/.local/share/applications/triple-c.desktop` pointing at the file you named.
+No sudo, nothing outside your home directory, and the AppImage itself is never
+copied or moved. To remove the entry again:
+
+```bash
+./scripts/install-appimage.sh --uninstall
+```
+
+The script rewrites the `Exec` line rather than reusing the bundled `.desktop`
+verbatim: the bundled one says `Exec=triple-c`, which resolves only inside the
+running AppImage's own mount, so a launcher entry copied straight out of the
+bundle would appear in the menu and then fail to start anything.
+
+Two follow-ups worth knowing:
+
+- **Upgrading.** The entry names one specific file. If you replace the AppImage
+  with a newer version under a different filename, re-run the script against the
+  new one. Keeping a stable name (`~/Apps/Triple-C.AppImage`) avoids this.
+- **The icon may not appear until you log out.** That is the desktop shell's
+  icon cache, not a failed install — see
+  [App Icon Missing After Installing (Linux)](#app-icon-missing-after-installing-linux).
 
 ## Prerequisites
 

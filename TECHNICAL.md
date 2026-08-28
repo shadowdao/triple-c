@@ -418,12 +418,6 @@ triple-c/
 │       ├── build-stt.yml            # Build the STT image
 │       ├── backfill-releases.yml    # Bulk copy releases to GitHub
 │       ├── cleanup-releases.yml     # Prune old releases
-│       └── publish-arch-package.yml # Build triple-c-bin, attach it to the GitHub release (packaging/arch/)
-│
-├── packaging/
-│   └── arch/                      # triple-c-bin Arch package — see packaging/arch/README.md
-│       ├── PKGBUILD
-│       └── README.md
 │
 └── app/                           # Tauri v2 desktop application
     ├── package.json               # React, xterm.js, zustand, tailwindcss
