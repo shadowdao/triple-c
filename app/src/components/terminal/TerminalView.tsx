@@ -28,6 +28,7 @@ import UrlToast, {
   URL_TOAST_SHORTCUT,
 } from "./UrlToast";
 import { trimSelection } from "./trimSelection";
+import { resolveTerminalGpuRendering } from "../../lib/terminalRenderer";
 import TerminalContextMenu from "./TerminalContextMenu";
 
 interface Props {
@@ -95,6 +96,7 @@ export default function TerminalView({ sessionId, active }: Props) {
   const webglRef = useRef<WebglAddon | null>(null);
   const detectorRef = useRef<UrlDetector | null>(null);
   const { sendInput, pasteImage, resize, onOutput, onExit } = useTerminal();
+  const gpuRenderingSetting = useAppState(s => s.appSettings?.terminal_gpu_rendering ?? null);
   const setTerminalHasSelection = useAppState(s => s.setTerminalHasSelection);
   const setTerminalAtBottom = useAppState(s => s.setTerminalAtBottom);
   const setScrollActiveToBottom = useAppState(s => s.setScrollActiveToBottom);
@@ -491,7 +493,11 @@ export default function TerminalView({ sessionId, active }: Props) {
 
     // Handle user input -> backend
     const inputDisposable = term.onData((data) => {
-      sendInput(sessionId, data);
+      // Ordered and coalesced by the queue in `useTerminal`; a rejection here
+      // means the session is gone, which the exit listener already reports.
+      sendInput(sessionId, data).catch((e) =>
+        console.error("Failed to send terminal input:", e)
+      );
     });
 
     // Detect user-initiated scroll-up (mouse wheel) to pause auto-follow.
@@ -684,7 +690,16 @@ export default function TerminalView({ sessionId, active }: Props) {
     const term = termRef.current;
     if (!term) return;
 
-    if (active) {
+    // Auto on macOS/Windows, off on Linux, overridable either way — see
+    // `resolveTerminalGpuRendering`. Loading the addon under a software-GL
+    // WebKitGTK is slower than xterm's canvas renderer, not faster.
+    const useGpu = resolveTerminalGpuRendering(gpuRenderingSetting, navigator.userAgent);
+
+    // The renderer and the activation work are independent: a terminal with
+    // GPU rendering switched off still has to fit and take focus when its tab
+    // becomes active. Keeping these in one branch made "GPU off" silently mean
+    // "never re-fit, never focus".
+    if (active && useGpu) {
       // Attach WebGL renderer
       if (!webglRef.current) {
         try {
@@ -699,19 +714,21 @@ export default function TerminalView({ sessionId, active }: Props) {
           // WebGL not available, canvas renderer is fine
         }
       }
+    } else if (webglRef.current) {
+      // Release the context — for inactive terminals, and when the setting
+      // turns GPU rendering off while this terminal is on screen.
+      try { webglRef.current.dispose(); } catch { /* ignore */ }
+      webglRef.current = null;
+    }
+
+    if (active) {
       fitRef.current?.fit();
       if (autoFollowRef.current) {
         term.scrollToBottom();
       }
       term.focus();
-    } else {
-      // Release WebGL context for inactive terminals
-      if (webglRef.current) {
-        try { webglRef.current.dispose(); } catch { /* ignore */ }
-        webglRef.current = null;
-      }
     }
-  }, [active]);
+  }, [active, gpuRenderingSetting]);
 
   // Auto-dismiss toast after 30 seconds — unless the user is standing in it.
   // A keyboard user who has just jumped into the toast is mid-decision, and

@@ -290,6 +290,12 @@ export interface AppSettings {
   stt: SttSettings;
   gateway: GatewaySettings;
   global_claude_code_settings: ClaudeCodeSettings | null;
+  /** Whether the terminal loads the WebGL renderer. `null` is auto: on
+   *  everywhere except Linux, where the DMA-BUF workaround leaves WebGL
+   *  backed by software rasterisation and the addon ends up slower than the
+   *  canvas renderer it would otherwise fall back to. See
+   *  `resolveTerminalGpuRendering` in `lib/terminalRenderer.ts`. */
+  terminal_gpu_rendering: boolean | null;
 }
 
 /** What `preview_settings_import` returns before anything is applied —

@@ -15,6 +15,8 @@ import type { EnvVar } from "../../lib/types";
 import Tooltip from "../ui/Tooltip";
 import AccordionSection from "../ui/AccordionSection";
 import Toggle from "../ui/Toggle";
+import SegmentedControl from "../ui/SegmentedControl";
+import { resolveTerminalGpuRendering } from "../../lib/terminalRenderer";
 import WebTerminalSettings from "./WebTerminalSettings";
 import SttSettings from "./SttSettings";
 import SharedAuthSettings from "./SharedAuthSettings";
@@ -65,6 +67,14 @@ export default function SettingsPanel() {
     } finally {
       setCheckingUpdates(false);
     }
+  };
+
+  const handleGpuRenderingChange = async (value: "auto" | "on" | "off") => {
+    if (!appSettings) return;
+    await saveSettings({
+      ...appSettings,
+      terminal_gpu_rendering: value === "auto" ? null : value === "on",
+    });
   };
 
   const handleAutoCheckToggle = async () => {
@@ -240,6 +250,45 @@ export default function SettingsPanel() {
       <AccordionSection id="tools" title="Tools" defaultOpen={false}>
         <WebTerminalSettings />
         <SttSettings />
+      </AccordionSection>
+
+      <AccordionSection id="terminal" title="Terminal" defaultOpen={false}>
+        <div className="space-y-2">
+          <label className="text-xs text-[var(--text-secondary)]">GPU rendering</label>
+          <SegmentedControl
+            label="Terminal GPU rendering"
+            value={
+              appSettings?.terminal_gpu_rendering == null
+                ? "auto"
+                : appSettings.terminal_gpu_rendering
+                  ? "on"
+                  : "off"
+            }
+            onChange={handleGpuRenderingChange}
+            segments={[
+              {
+                value: "auto",
+                label: "Auto",
+                hint: resolveTerminalGpuRendering(null, navigator.userAgent)
+                  ? "On for this platform."
+                  : "Off on Linux — the DMA-BUF workaround leaves WebGL on software rendering, which is slower than the canvas renderer.",
+              },
+              {
+                value: "on",
+                label: "On",
+                hint: "Always load the WebGL renderer.",
+              },
+              {
+                value: "off",
+                label: "Off",
+                hint: "Always use xterm's canvas renderer. Try this if typing feels laggy.",
+              },
+            ]}
+          />
+          <p className="text-xs text-[var(--text-secondary)]">
+            Takes effect when a terminal tab is next switched to.
+          </p>
+        </div>
       </AccordionSection>
 
       <AccordionSection id="updates" title="Updates" defaultOpen={false}>
