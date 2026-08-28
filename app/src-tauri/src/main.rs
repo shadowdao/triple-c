@@ -26,12 +26,27 @@
 /// their own init time, which happens inside the Tauri builder that
 /// function calls into, not at binary load.
 ///
-/// A user who has already set this themselves is left alone. That includes
-/// setting it to `0`, on the assumption WebKitGTK treats it as a boolean
-/// rather than presence-only — not verified against WebKitGTK's own source,
-/// so if it turns out to be presence-only, `=0` still reads as "set" here
-/// and disables DMA-BUF the same as any other value, which is at least the
-/// safe direction to be wrong in.
+/// A user who has already set this themselves is left alone — with one
+/// correction. The earlier version of this function left *any* pre-set value
+/// alone, including `0`, on the assumption WebKitGTK reads the variable as a
+/// boolean. WebKitGTK reads it as presence-only, so `WEBKIT_DISABLE_DMABUF_
+/// RENDERER=0` disabled DMA-BUF exactly like `=1` did, and there was no value
+/// at all a user could set to get the accelerated path back: the escape hatch
+/// the comment described did not exist. `0`, `false` and empty are now treated
+/// as an explicit opt-out and the variable is *removed*, which is the only
+/// thing WebKitGTK reads as "enabled". The default is unchanged — unset still
+/// means disabled on Linux, so nobody who was not deliberately overriding this
+/// sees any difference.
+///
+/// That matters more than it looks, because the trade described above is not
+/// the trade actually being made. `@xterm/addon-webgl` does not fall back to
+/// the canvas renderer here: its constructor throws only when WebGL is
+/// *absent*, and with DMA-BUF disabled WebGL is still present — served by
+/// software rasterisation. So the addon loads happily and every terminal frame
+/// is rendered on the CPU and copied, which is slower than the canvas renderer
+/// this comment assumed it would degrade to, not faster. See
+/// `terminal_gpu_rendering` in `AppSettings` for the switch that decides
+/// whether the addon is loaded at all.
 ///
 /// This env var also leaks to whatever the app spawns afterwards — notably
 /// a cold-launched default browser via the `opener` plugin's `xdg-open`
@@ -40,9 +55,76 @@
 /// worth knowing before chasing the "links don't open" half of triple-c#34
 /// as a separate, unrelated cause.
 #[cfg(target_os = "linux")]
+const DMABUF_VAR: &str = "WEBKIT_DISABLE_DMABUF_RENDERER";
+
+/// What to do with `WEBKIT_DISABLE_DMABUF_RENDERER`, given whatever it is
+/// already set to. Split from the mutation so it can be tested without
+/// touching process-wide environment state from a parallel test runner.
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+enum DmabufAction {
+    /// Not set by the user — apply the workaround.
+    Disable,
+    /// Explicitly opted out. WebKitGTK reads presence, not value, so the only
+    /// way to express "enabled" is for the variable not to exist.
+    Remove,
+    /// Set to something meaning "disabled". Already what we want; leave it.
+    LeaveAlone,
+}
+
+#[cfg(target_os = "linux")]
+fn dmabuf_action(current: Option<&str>) -> DmabufAction {
+    match current {
+        None => DmabufAction::Disable,
+        Some(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "" | "0" | "false" | "no" => DmabufAction::Remove,
+            _ => DmabufAction::LeaveAlone,
+        },
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn apply_webkit_wayland_workaround() {
-    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
-        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    let current = std::env::var(DMABUF_VAR).ok();
+    match dmabuf_action(current.as_deref()) {
+        DmabufAction::Disable => std::env::set_var(DMABUF_VAR, "1"),
+        DmabufAction::Remove => std::env::remove_var(DMABUF_VAR),
+        DmabufAction::LeaveAlone => {}
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::{dmabuf_action, DmabufAction};
+
+    #[test]
+    fn unset_gets_the_workaround() {
+        assert_eq!(dmabuf_action(None), DmabufAction::Disable);
+    }
+
+    #[test]
+    fn falsey_values_opt_out_by_removing_the_variable() {
+        // The bug this replaces: these all previously read as "user set it,
+        // leave it alone", and WebKitGTK then disabled DMA-BUF anyway because
+        // it only checks presence. There was no way to ask for the GPU path.
+        for value in ["0", "false", "no", "", "  0  ", "FALSE", "No"] {
+            assert_eq!(
+                dmabuf_action(Some(value)),
+                DmabufAction::Remove,
+                "{value:?} should opt out"
+            );
+        }
+    }
+
+    #[test]
+    fn other_values_are_left_alone() {
+        for value in ["1", "true", "yes", "anything"] {
+            assert_eq!(
+                dmabuf_action(Some(value)),
+                DmabufAction::LeaveAlone,
+                "{value:?} should be left alone"
+            );
+        }
     }
 }
 

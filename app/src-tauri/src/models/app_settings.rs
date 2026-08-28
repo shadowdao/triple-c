@@ -135,6 +135,26 @@ pub struct AppSettings {
     pub gateway: GatewaySettings,
     #[serde(default)]
     pub global_claude_code_settings: Option<ClaudeCodeSettings>,
+    /// Whether the terminal loads `@xterm/addon-webgl`.
+    ///
+    /// `None` is "auto", and auto is not the same answer on every platform.
+    /// On Linux the app disables WebKitGTK's DMA-BUF renderer at startup (see
+    /// `apply_webkit_wayland_workaround` in `main.rs`, and triple-c#34), which
+    /// does not remove WebGL — it leaves it backed by software rasterisation.
+    /// The addon therefore loads successfully and then renders every frame on
+    /// the CPU, which is slower than the canvas renderer it would otherwise
+    /// have fallen back to. So auto means enabled on macOS and Windows, and
+    /// disabled on Linux.
+    ///
+    /// `Some(true)` / `Some(false)` force it either way on any platform. A
+    /// Linux user running X11, or one whose driver stack is unaffected, can
+    /// turn it back on; anyone seeing terminal lag can turn it off without
+    /// waiting for a release. Deliberately `Option<bool>` rather than `bool`:
+    /// the zero value has to mean "we choose", not "off", or every existing
+    /// settings file would silently pin the answer at whatever the default was
+    /// the day it was written.
+    #[serde(default)]
+    pub terminal_gpu_rendering: Option<bool>,
 }
 
 fn default_stt_model() -> String {
@@ -226,6 +246,7 @@ impl Default for AppSettings {
             stt: SttSettings::default(),
             gateway: GatewaySettings::default(),
             global_claude_code_settings: None,
+            terminal_gpu_rendering: None,
         }
     }
 }
