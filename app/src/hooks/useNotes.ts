@@ -34,6 +34,8 @@ export function useNotes(projectId: string) {
   const [saveState, setSaveState] = useState<SaveState>({ status: "idle", error: null });
   const pushToast = useAppState((s) => s.pushToast);
   const resetTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const currentProjectId = useRef(projectId);
+  currentProjectId.current = projectId;
 
   useEffect(() => {
     if (!projectId) {
@@ -94,7 +96,12 @@ export function useNotes(projectId: string) {
         // what a reload would show.
         try {
           const reloaded = await commands.listNotes(projectId);
-          setNotes(reloaded);
+          // Guard against a stale callback: if the project changed while the save was in
+          // flight, don't overwrite the new project's list with the old one. The save itself
+          // still succeeded, so succeeded() still fires; only the list replacement is skipped.
+          if (currentProjectId.current === projectId) {
+            setNotes(reloaded);
+          }
         } catch {
           // Keep the save reported as successful (it was) and leave the existing list alone
           // rather than clearing it if the re-read fails.
@@ -126,7 +133,12 @@ export function useNotes(projectId: string) {
     async (noteId: string) => {
       try {
         await commands.deleteNote(projectId, noteId);
-        setNotes((current) => current.filter((n) => n.id !== noteId));
+        // Guard against a stale callback: if the project changed while the delete was in
+        // flight, don't modify the list. Note ids are UUIDs so a stale filter cannot match
+        // another project's note, but applying the same guard for consistency.
+        if (currentProjectId.current === projectId) {
+          setNotes((current) => current.filter((n) => n.id !== noteId));
+        }
         return true;
       } catch (e) {
         pushToast({ kind: "error", message: "Could not delete note", detail: String(e) });

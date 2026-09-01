@@ -163,4 +163,47 @@ describe("useNotes", () => {
     // listNotes should be called again after the save
     expect(listNotes).toHaveBeenCalledTimes(callCountBefore + 1);
   });
+
+  it("does not overwrite the new project's notes when a stale save resolves", async () => {
+    const { result, rerender } = renderHook(
+      ({ projectId }: { projectId: string }) => useNotes(projectId),
+      { initialProps: { projectId: "p1" } },
+    );
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.notes[0].id).toBe("n1");
+
+    // Start a save for p1 that hangs
+    let resolveSave: ((note: Note) => void) | undefined;
+    saveNote.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveSave = resolve;
+        }),
+    );
+
+    let savePromise: Promise<boolean> | undefined;
+    await act(async () => {
+      savePromise = result.current.saveNote(note({ id: "n1" }));
+    });
+
+    // Switch to p2 while the save is in flight
+    listNotes.mockResolvedValueOnce([note({ id: "n2", title: "Project 2 Note" })]);
+    rerender({ projectId: "p2" });
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    // Now p2's note should be displayed
+    expect(result.current.notes).toHaveLength(1);
+    expect(result.current.notes[0].id).toBe("n2");
+
+    // Resolve the stale p1 save
+    listNotes.mockResolvedValueOnce([note({ id: "n1", body: "edited" })]);
+    await act(async () => {
+      resolveSave?.(note({ id: "n1", body: "edited" }));
+      await savePromise;
+    });
+
+    // p2's note should still be displayed, not p1's
+    expect(result.current.notes).toHaveLength(1);
+    expect(result.current.notes[0].id).toBe("n2");
+  });
 });
