@@ -7,6 +7,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import "@xterm/xterm/css/xterm.css";
 import { useTerminal } from "../../hooks/useTerminal";
 import { useAppState } from "../../store/appState";
+import { CLAUDE_SOFT_NEWLINE } from "../../lib/claudeInput";
 import {
   awsSsoRefresh,
   openPageInContainerBrowser,
@@ -415,7 +416,7 @@ export default function TerminalView({ sessionId, active }: Props) {
         !event.isComposing &&
         sessionTypeRef.current === "claude"
       ) {
-        sendInput(sessionId, "\x1b\r");
+        sendInput(sessionId, CLAUDE_SOFT_NEWLINE);
         // **`preventDefault()` is what stops the submit, not the `return false`.**
         //
         // xterm's `_keyDown` returns the instant a custom handler says `false`

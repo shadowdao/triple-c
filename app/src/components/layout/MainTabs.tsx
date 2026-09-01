@@ -10,6 +10,7 @@ import {
 } from "../../store/appState";
 import { effectivePermissionMode } from "../projects/PermissionModeControl";
 import { ProjectStatusIndicator } from "../ui/StatusIndicator";
+import { sessionDisplayName } from "../../lib/sessionName";
 import type { PermissionMode } from "../../lib/types";
 
 interface ContextMenuState {
@@ -195,11 +196,10 @@ export default function MainTabs() {
     }
     const session = sessions.find((s) => s.id === tabKeyId(key));
     if (!session) return "";
-    const custom = getCustomName(session.projectId, session.id);
-    return custom
-      ? `${session.projectName}: ${custom}`
-      : (session.sessionName ?? session.projectName) +
-          (session.sessionType === "bash" ? " (bash)" : "");
+    return sessionDisplayName(
+      session,
+      projects.find((p) => p.id === session.projectId),
+    );
   };
 
   const endDrag = () => {
@@ -358,13 +358,7 @@ export default function MainTabs() {
     const session = sessions.find((s) => s.id === sessionId);
     if (!session) return null;
     const project = projects.find((p) => p.id === session.projectId);
-    const customName = getCustomName(session.projectId, session.id);
-    const baseLabel =
-      (session.sessionName ?? session.projectName) +
-      (session.sessionType === "bash" ? " (bash)" : "");
-    const displayLabel = customName
-      ? `${session.projectName}: ${customName}`
-      : baseLabel;
+    const displayLabel = sessionDisplayName(session, project);
     const isRenaming = renamingId === session.id;
     const badge = project ? MODE_BADGE[effectivePermissionMode(project)] : null;
 
