@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNotes } from "../../hooks/useNotes";
 import NoteEditor from "./NoteEditor";
 import Button from "../ui/Button";
@@ -30,22 +30,44 @@ export default function NotesPanel({ projectId }: Props) {
     [notes, selectedId],
   );
 
-  // Load the selected note's stored text into the draft. Keyed on the id, not
-  // the note object, so a save round trip does not stomp what is being typed.
+  // What was last copied out of the store into the draft fields. The draft is
+  // "untouched" exactly while it still matches this, which is how an edit made
+  // somewhere else can be shown without ever discarding something half-typed.
+  const seeded = useRef<{ id: string | null; title: string; body: string }>({
+    id: null,
+    title: "",
+    body: "",
+  });
+
+  // Load the selected note's stored text into the draft — on a change of note,
+  // and on a change to the *stored* text of the note already selected. The
+  // second case is the dock and the tab showing one project at once: an edit
+  // committed in one surface has to reach the other's editor, not just its
+  // list. It never overwrites text the user is part-way through typing; that
+  // blurs into a last-writer-wins save, as any blur-commit editor does.
   useEffect(() => {
     if (!selected) {
+      seeded.current = { id: null, title: "", body: "" };
       setTitle("");
       setBody("");
       return;
     }
-    setTitle(selected.title);
-    setBody(selected.body);
-  }, [selected?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+    const untouched =
+      title === seeded.current.title && body === seeded.current.body;
+    if (seeded.current.id !== selected.id || untouched) {
+      seeded.current = { id: selected.id, title: selected.title, body: selected.body };
+      setTitle(selected.title);
+      setBody(selected.body);
+    }
+  }, [selected?.id, selected?.title, selected?.body]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const commit = () => {
     if (!selected) return;
     // Reading is not editing: clicking through notes must not rewrite the file.
     if (title === selected.title && body === selected.body) return;
+    // Mark the draft as matching what was just committed, so the store update
+    // this save produces reads as "no change" rather than as a stale re-seed.
+    seeded.current = { id: selected.id, title, body };
     void saveNote({ ...selected, title, body });
   };
 

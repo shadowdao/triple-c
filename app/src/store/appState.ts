@@ -1,5 +1,12 @@
 import { create } from "zustand";
-import type { Project, TerminalSession, AppSettings, UpdateInfo, ImageUpdateInfo } from "../lib/types";
+import type {
+  Project,
+  TerminalSession,
+  AppSettings,
+  UpdateInfo,
+  ImageUpdateInfo,
+  Note,
+} from "../lib/types";
 
 const SIDEBAR_COLLAPSED_KEY = "triple-c.sidebar.collapsed";
 
@@ -145,6 +152,29 @@ interface AppState {
   moveTab: (key: string, toIndex: number) => void;
   /** Nudge the active tab left/right — the keyboard route to the same thing. */
   moveActiveTab: (delta: number) => void;
+
+  // Per-project notes, cached from the backend.
+  //
+  // Rust is the source of truth and this is a cache — but it has to be *one*
+  // cache. Notes are shown by two surfaces at once (the Project Home sub-tab
+  // and the dock, which resolves to the same project), and a hook-local
+  // `useState` in each gave them independent copies: an edit made in the dock
+  // was invisible to the tab, and the tab's next blur wrote its stale record
+  // back over it with no error and no indicator. Keyed by project id so a
+  // response that lands after the user has moved on updates the project it
+  // belongs to instead of whichever one is on screen.
+  //
+  // This is also the boundary a detached notes window would need: swap the
+  // transport for a `notes-changed` event and both windows feed the same slice.
+  notesByProject: Record<string, Note[]>;
+  /**
+   * Projects with a `list_notes` in flight, so two panels mounting for the
+   * same project make one read rather than two, and so a panel whose project
+   * has never been read can tell "loading" from "no notes".
+   */
+  notesLoading: Record<string, boolean>;
+  setProjectNotes: (projectId: string, notes: Note[]) => void;
+  setNotesLoading: (projectId: string, loading: boolean) => void;
 
   // Inline container progress, replacing the blocking progress modal.
   containerProgress: Record<string, string>;
@@ -393,6 +423,22 @@ export const useAppState = create<AppState>((set) => ({
       tabOrder.splice(from, 1);
       tabOrder.splice(to, 0, key);
       return { tabOrder };
+    }),
+
+  // Notes
+  notesByProject: {},
+  notesLoading: {},
+  setProjectNotes: (projectId, notes) =>
+    set((state) => ({
+      notesByProject: { ...state.notesByProject, [projectId]: notes },
+    })),
+  setNotesLoading: (projectId, loading) =>
+    set((state) => {
+      if ((state.notesLoading[projectId] ?? false) === loading) return {};
+      const next = { ...state.notesLoading };
+      if (loading) next[projectId] = true;
+      else delete next[projectId];
+      return { notesLoading: next };
     }),
 
   // Container progress
