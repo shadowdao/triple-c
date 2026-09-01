@@ -95,4 +95,19 @@ describe("NotesDock", () => {
     fireEvent.keyDown(handle, { key: "ArrowLeft" });
     expect(state.setNotesDockWidth).toHaveBeenCalled();
   });
+
+  it("widens on ArrowLeft and narrows on ArrowRight, by the exact step", () => {
+    // The dock sits on the right edge, so dragging or pressing left grows it
+    // and right shrinks it. Asserting only "was called" would pass even if
+    // the branches were swapped or the sign inverted.
+    state.activeTabKey = "home:p1";
+    render(<NotesDock />);
+    const handle = screen.getByRole("separator", { name: /resize notes/i });
+
+    fireEvent.keyDown(handle, { key: "ArrowLeft" });
+    expect(state.setNotesDockWidth).toHaveBeenLastCalledWith(368);
+
+    fireEvent.keyDown(handle, { key: "ArrowRight" });
+    expect(state.setNotesDockWidth).toHaveBeenLastCalledWith(336);
+  });
 });
