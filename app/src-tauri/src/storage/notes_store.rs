@@ -15,7 +15,31 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+use serde::{Deserialize, Serialize};
+
 use crate::models::Note;
+
+/// The version stamped into every notes file this build writes.
+const NOTES_FORMAT_VERSION: u32 = 1;
+
+/// What is actually on disk: a version envelope around the notes.
+///
+/// The list is wrapped rather than written bare because the wrapper costs
+/// nothing today and cannot be added cheaply later — once files exist in the
+/// field, every reader has to sniff two shapes forever. `version` is written
+/// and read back but nothing branches on it yet: it is the hook a future
+/// format change hangs off, and its value is only useful if it has been there
+/// since the first file.
+///
+/// Not in `models/` and not exposed over IPC: the frontend receives
+/// `Vec<Note>` from `list_notes` and never sees the envelope, so this is a
+/// storage detail rather than part of the IPC contract.
+#[derive(Debug, Serialize, Deserialize)]
+struct ProjectNotes {
+    version: u32,
+    #[serde(default)]
+    notes: Vec<Note>,
+}
 
 /// Serialises the read-modify-write half of an upsert or delete.
 ///
@@ -84,35 +108,139 @@ pub fn clear(project_id: &str) -> Result<(), String> {
 /// that project with no way out through the UI; deleting instead would destroy
 /// the only copy of what the user wrote. The copy is timestamped so a second
 /// corruption cannot overwrite the first — which is the one taken before
-/// anything rewrote the file, and therefore the one worth having.
+/// anything rewrote the file, and therefore the one worth having — and capped,
+/// because `list_notes` runs on *every* panel mount. See [`keep_corrupt_copy`].
 fn load_in(dir: &Path, project_id: &str) -> Result<Vec<Note>, String> {
     let path = notes_path_in(dir, project_id);
     if !path.exists() {
         return Ok(Vec::new());
     }
     let data = fs::read_to_string(&path).map_err(|e| format!("Failed to read notes: {}", e))?;
-    match serde_json::from_str::<Vec<Note>>(&data) {
+    match parse(&data) {
         Ok(notes) => Ok(notes),
         Err(e) => {
-            keep_corrupt_copy(&path, &chrono::Utc::now());
+            let kept = keep_corrupt_copy(&path, &chrono::Utc::now());
             log::error!(
                 "Failed to parse notes for project {}: {} — treating as empty; the file is \
-                 left in place and a copy was kept beside it",
+                 left in place{}",
                 project_id,
-                e
+                e,
+                kept.describe()
             );
             Ok(Vec::new())
         }
     }
 }
 
-fn keep_corrupt_copy(path: &Path, now: &chrono::DateTime<chrono::Utc>) {
-    let backup = path.with_extension(format!("json.corrupt-{}.bak", now.format("%Y%m%d-%H%M%S")));
-    if backup.exists() {
-        return;
+/// Parse a notes file: the versioned envelope, or a bare array.
+///
+/// The bare array is what this store wrote before [`ProjectNotes`] existed —
+/// only ever on a development build, but a developer's own notes are still
+/// prose nothing else holds a copy of, and the alternative is `load_in`
+/// declaring a perfectly readable file corrupt. It is read, never written: the
+/// first save rewrites the file with an envelope.
+fn parse(data: &str) -> Result<Vec<Note>, serde_json::Error> {
+    match serde_json::from_str::<ProjectNotes>(data) {
+        Ok(file) => Ok(file.notes),
+        // Report the envelope's error, not the array's — the envelope is the
+        // shape this store writes, so its message is the one that describes
+        // what is actually wrong with the file.
+        Err(envelope_err) => serde_json::from_str::<Vec<Note>>(data).map_err(|_| envelope_err),
     }
-    if let Err(e) = fs::copy(path, &backup) {
-        log::error!("Could not keep a copy of the unreadable notes file: {}", e);
+}
+
+/// How many timestamped copies of one project's corrupt notes file are kept.
+///
+/// Timestamping fixes "a second corruption overwrote the first" and introduces
+/// its opposite: `load_in` runs on every `list_notes`, which is every panel
+/// mount — every project switch, every dock-follows-tab change, every sub-tab
+/// toggle. A file that is *persistently* unparseable (the normal case, since
+/// nothing repairs it) would otherwise mint a fresh full copy of the user's
+/// prose every time the clock's second changed. Nothing ever reads them back
+/// and nothing ever removed them.
+///
+/// Four is enough for the only use there is: a human looking at what the file
+/// held. Same constant, same reasoning as `migration_store`.
+const MAX_CORRUPT_BACKUPS: usize = 4;
+
+/// What [`keep_corrupt_copy`] did, so the log line can tell the truth about
+/// whether a file exists.
+///
+/// Three outcomes, and they must not be conflated. Folding "already kept
+/// enough" into success and then saying "a copy was kept" names a file that
+/// was never created — which is what someone reads before going to look for
+/// their data.
+enum Kept {
+    Copied(PathBuf),
+    /// This exact second's copy was already on disk.
+    AlreadyThere(PathBuf),
+    /// The cap is reached; the earlier copies are kept and this one is not.
+    EnoughAlready(usize),
+    Failed(String),
+}
+
+impl Kept {
+    fn describe(&self) -> String {
+        match self {
+            Kept::Copied(p) | Kept::AlreadyThere(p) => format!(" (a copy is at {})", p.display()),
+            // The earliest copies are the ones worth having, so the cap keeps
+            // those and drops this one. Say so, rather than implying a file
+            // exists.
+            Kept::EnoughAlready(n) => format!(
+                " (no copy kept — {} earlier copies of this file are already saved alongside it)",
+                n
+            ),
+            Kept::Failed(e) => format!(" (could not keep a copy: {})", e),
+        }
+    }
+}
+
+/// Where a copy of an unreadable notes file is kept.
+fn corrupt_backup_path(path: &Path, now: &chrono::DateTime<chrono::Utc>) -> PathBuf {
+    path.with_extension(format!("json.corrupt-{}.bak", now.format("%Y%m%d-%H%M%S")))
+}
+
+/// Whether [`MAX_CORRUPT_BACKUPS`] copies of this project's file already exist.
+///
+/// Asked *before* the copy rather than pruning after it, so the cap is not
+/// implemented by writing a file and deleting it again on every pass — and so
+/// the copies that survive are the oldest, which are the ones taken closest to
+/// whatever produced the corruption.
+///
+/// A directory that cannot be listed answers "not full": failing open costs at
+/// most one extra file, and failing closed would drop the very first copy of
+/// prose nothing else has kept.
+fn corrupt_backups_full(path: &Path) -> bool {
+    let (Some(dir), Some(stem)) = (path.parent(), path.file_stem()) else {
+        return false;
+    };
+    // `{stem}.json.corrupt-` — the same shape `corrupt_backup_path` builds, so
+    // this can never match another project's copies or an unrelated `.bak`.
+    let prefix = format!("{}.json.corrupt-", stem.to_string_lossy());
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            name.starts_with(&prefix) && name.ends_with(".bak")
+        })
+        .count()
+        >= MAX_CORRUPT_BACKUPS
+}
+
+fn keep_corrupt_copy(path: &Path, now: &chrono::DateTime<chrono::Utc>) -> Kept {
+    let backup = corrupt_backup_path(path, now);
+    if backup.exists() {
+        return Kept::AlreadyThere(backup);
+    }
+    if corrupt_backups_full(path) {
+        return Kept::EnoughAlready(MAX_CORRUPT_BACKUPS);
+    }
+    match fs::copy(path, &backup) {
+        Ok(_) => Kept::Copied(backup),
+        Err(e) => Kept::Failed(e.to_string()),
     }
 }
 
@@ -170,7 +298,11 @@ fn clear_in(dir: &Path, project_id: &str) -> Result<(), String> {
 /// prose the user typed and nothing else holds a copy.
 fn save_all(dir: &Path, project_id: &str, notes: &[Note]) -> Result<(), String> {
     let path = notes_path_in(dir, project_id);
-    let data = serde_json::to_string_pretty(notes)
+    let file = ProjectNotes {
+        version: NOTES_FORMAT_VERSION,
+        notes: notes.to_vec(),
+    };
+    let data = serde_json::to_string_pretty(&file)
         .map_err(|e| format!("Failed to serialize notes: {}", e))?;
     let tmp = path.with_extension("json.tmp");
 
@@ -218,6 +350,15 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir
+    }
+
+    fn corrupt_copies(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".corrupt-"))
+            .collect()
     }
 
     #[test]
@@ -302,12 +443,116 @@ mod tests {
         assert_eq!(load_in(&dir, "p1").unwrap(), Vec::<Note>::new());
         assert!(path.exists(), "the unreadable file is left in place");
 
-        let copies: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .flatten()
-            .filter(|e| e.file_name().to_string_lossy().contains(".corrupt-"))
-            .collect();
-        assert_eq!(copies.len(), 1, "the bytes must be kept exactly once");
+        assert_eq!(
+            corrupt_copies(&dir).len(),
+            1,
+            "the bytes must be kept exactly once"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn what_is_written_is_a_version_envelope_not_a_bare_array() {
+        // The envelope costs nothing now and cannot be added cheaply once
+        // files exist in the field, so the very first file has to carry it.
+        let dir = temp_dir("envelope");
+        upsert_in(&dir, "p1", Note::new("t".into(), "b".into())).unwrap();
+
+        let raw = std::fs::read_to_string(notes_path_in(&dir, "p1")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["version"], NOTES_FORMAT_VERSION);
+        assert_eq!(parsed["notes"].as_array().unwrap().len(), 1);
+        assert_eq!(parsed["notes"][0]["body"], "b");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_pre_envelope_bare_array_still_reads_and_is_not_called_corrupt() {
+        // Only a development build ever wrote this shape, but declaring a
+        // perfectly readable file corrupt is the one outcome this store exists
+        // to avoid. It is read, never written back.
+        let dir = temp_dir("legacy");
+        let note = Note::new("Deploy".into(), "one\ntwo".into());
+        std::fs::write(
+            notes_path_in(&dir, "p1"),
+            serde_json::to_string(&vec![note.clone()]).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_in(&dir, "p1").unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].body, "one\ntwo");
+        let copies = corrupt_copies(&dir);
+        assert!(copies.is_empty(), "a readable file must not be copied aside");
+
+        // The next write upgrades it in place.
+        upsert_in(&dir, "p1", note).unwrap();
+        let raw = std::fs::read_to_string(notes_path_in(&dir, "p1")).unwrap();
+        assert!(raw.contains("\"version\""));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn corrupt_copies_are_capped_rather_than_one_per_second() {
+        // `list_notes` runs on every panel mount, so an unrepaired file would
+        // otherwise mint a full copy of the user's prose every time the
+        // clock's second changed.
+        let dir = temp_dir("cap");
+        let path = notes_path_in(&dir, "p1");
+        std::fs::write(&path, b"{ not json").unwrap();
+
+        let base = chrono::Utc::now();
+        for i in 0..MAX_CORRUPT_BACKUPS as i64 + 3 {
+            let at = base + chrono::Duration::seconds(i);
+            let kept = keep_corrupt_copy(&path, &at);
+            if i < MAX_CORRUPT_BACKUPS as i64 {
+                assert!(matches!(kept, Kept::Copied(_)), "copy {} should be kept", i);
+            } else {
+                assert!(
+                    matches!(kept, Kept::EnoughAlready(MAX_CORRUPT_BACKUPS)),
+                    "copy {} should be refused by the cap",
+                    i
+                );
+            }
+        }
+        assert_eq!(corrupt_copies(&dir).len(), MAX_CORRUPT_BACKUPS);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_second_read_in_the_same_second_does_not_re_copy() {
+        let dir = temp_dir("samesecond");
+        let path = notes_path_in(&dir, "p1");
+        std::fs::write(&path, b"{ not json").unwrap();
+
+        let at = chrono::Utc::now();
+        assert!(matches!(keep_corrupt_copy(&path, &at), Kept::Copied(_)));
+        assert!(matches!(
+            keep_corrupt_copy(&path, &at),
+            Kept::AlreadyThere(_)
+        ));
+        assert_eq!(corrupt_copies(&dir).len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_log_line_never_claims_a_backup_that_was_not_written() {
+        // A message that invents a backup is worse than no message: it is what
+        // someone reads before going to look for their data.
+        let dir = temp_dir("honesty");
+        let path = notes_path_in(&dir, "p1");
+        std::fs::write(&path, b"{ not json").unwrap();
+
+        let copied = keep_corrupt_copy(&path, &chrono::Utc::now()).describe();
+        assert!(copied.contains("a copy is at"));
+
+        let refused = Kept::EnoughAlready(MAX_CORRUPT_BACKUPS).describe();
+        assert!(refused.contains("no copy kept"));
+        assert!(!refused.contains("a copy is at"));
+
+        let failed = Kept::Failed("permission denied".into()).describe();
+        assert!(failed.contains("could not keep a copy"));
+        assert!(!failed.contains("a copy is at"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
