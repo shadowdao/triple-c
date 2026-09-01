@@ -369,4 +369,78 @@ describe("useNotes", () => {
     expect(dock.result.current.loading).toBe(false);
     expect(dock.result.current.notes).toHaveLength(1);
   });
+
+  it("does not let a slow mount read overwrite a fresher post-save refresh", async () => {
+    // One gesture, two requests. The tab is already loaded; the user clicks the
+    // dock toggle with the textarea focused, so `blur` → `saveNote` and the
+    // dock's mount → `list_notes` are issued in the same tick. The save's
+    // re-read writes the post-save list; the mount's read — issued earlier,
+    // still in flight — must not then land its pre-save snapshot on top of it.
+    const files = fakeBackend({ p1: [note({ body: "before" })] });
+    const tab = renderHook(() => useNotes("p1"));
+    await waitFor(() => expect(tab.result.current.loading).toBe(false));
+    expect(tab.result.current.notes[0].body).toBe("before");
+
+    // The dock's mount read: it snapshots the list as it is *now* (pre-save)
+    // and hangs, standing in for a plain read that is slower than
+    // `save_note`'s double-fsync write plus the re-read behind it.
+    let releaseMountRead: (() => void) | undefined;
+    listNotes.mockImplementationOnce(async (p: string) => {
+      const preSave = [...(files[p] ?? [])];
+      await new Promise<void>((resolve) => {
+        releaseMountRead = resolve;
+      });
+      return preSave;
+    });
+    const dock = renderHook(() => useNotes("p1"));
+    expect(releaseMountRead).toBeDefined();
+
+    // The save and its re-read complete while that read is still out.
+    await act(async () => {
+      await tab.result.current.saveNote(note({ body: "after" }));
+    });
+    expect(tab.result.current.notes[0].body).toBe("after");
+
+    // Now the stale read lands.
+    await act(async () => {
+      releaseMountRead!();
+      await Promise.resolve();
+    });
+
+    expect(tab.result.current.notes[0].body).toBe("after");
+    expect(dock.result.current.notes[0].body).toBe("after");
+  });
+
+  it("does not let a slow mount read resurrect a note deleted while it was in flight", async () => {
+    // The other half of the same ordering rule: a confirmed delete is newer
+    // than any read issued before it finished, so the read's pre-delete list
+    // must not be written back over the shortened one.
+    const files = fakeBackend({ p1: [note()] });
+    const tab = renderHook(() => useNotes("p1"));
+    await waitFor(() => expect(tab.result.current.loading).toBe(false));
+
+    let releaseMountRead: (() => void) | undefined;
+    listNotes.mockImplementationOnce(async (p: string) => {
+      const preDelete = [...(files[p] ?? [])];
+      await new Promise<void>((resolve) => {
+        releaseMountRead = resolve;
+      });
+      return preDelete;
+    });
+    const dock = renderHook(() => useNotes("p1"));
+    expect(releaseMountRead).toBeDefined();
+
+    await act(async () => {
+      await tab.result.current.deleteNote("n1");
+    });
+    expect(tab.result.current.notes).toHaveLength(0);
+
+    await act(async () => {
+      releaseMountRead!();
+      await Promise.resolve();
+    });
+
+    expect(tab.result.current.notes).toHaveLength(0);
+    expect(dock.result.current.notes).toHaveLength(0);
+  });
 });

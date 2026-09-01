@@ -57,17 +57,94 @@ function enqueueMutation<T>(projectId: string, run: () => Promise<T>): Promise<T
 }
 
 /**
+ * Per-project write ordering for the shared notes cache.
+ *
+ * `mutationChains` orders a project's *writes* against each other. It says
+ * nothing about reads, and the mount load is a read that runs outside it — so
+ * one gesture can put two requests in flight at once and let the slower one
+ * win. Clicking the dock toggle with the textarea focused fires `blur` →
+ * `saveNote` and the dock's mount → `list_notes` in the same tick: the save
+ * finishes, its re-read writes the post-save list, and then the mount's read —
+ * issued earlier, still out — lands its pre-save snapshot on top. Both panels
+ * show stale text until something else refreshes. It needs the plain read to
+ * be slower than `save_note`'s double-fsync write plus a second read, so it is
+ * narrow, but it was reproduced.
+ *
+ * The fix is a sequence number rather than a chain, because the two requests
+ * are not competing for a resource — the loser's result is simply *older*, and
+ * the cheapest correct thing to do with it is throw it away. Every write
+ * claims a sequence when the request behind it is issued, and `commitNotes`
+ * drops one whose sequence predates what is already cached. That also closes a
+ * hole identity comparison cannot: on a `p1 → p2 → p1` switch a read from the
+ * *first* p1 era is indistinguishable from a current one by project id, and
+ * would land its stale list on the second era's.
+ *
+ * Note what this deliberately does **not** replace. `isCurrent()` asks whether
+ * this *panel* is still showing the project a save was made for, which governs
+ * a per-panel `SaveIndicator` and not the shared cache at all; a per-project
+ * counter cannot answer it. Ordering and panel identity are two questions, and
+ * they keep two guards.
+ *
+ * Entries are two integers per project and are never pruned: they must outlive
+ * every request that could still land, and the map is monotone, so a stale
+ * sequence can never be reissued.
+ */
+const notesSequences = new Map<string, { issued: number; committed: number }>();
+
+function sequenceFor(projectId: string): { issued: number; committed: number } {
+  let seq = notesSequences.get(projectId);
+  if (!seq) notesSequences.set(projectId, (seq = { issued: 0, committed: 0 }));
+  return seq;
+}
+
+/**
+ * Claim the sequence for a write about to be issued.
+ *
+ * Called immediately before the request whose result it will commit, so that
+ * ordering is by *issue* time. Resolution order is exactly what cannot be
+ * trusted here.
+ */
+function issueNotesWrite(projectId: string): number {
+  const seq = sequenceFor(projectId);
+  seq.issued += 1;
+  return seq.issued;
+}
+
+/**
+ * Write a list into the cache under the sequence it was issued at, unless
+ * something newer has already been committed.
+ *
+ * A local patch — the filter behind a confirmed delete, say — is authoritative
+ * at the moment it applies rather than derived from an earlier read, so it
+ * claims its sequence here: `issued` is never below `committed`, so a freshly
+ * claimed one always wins, and anything still in flight behind it is correctly
+ * treated as stale.
+ */
+function commitNotes(projectId: string, seq: number, notes: Note[]): boolean {
+  const sequence = sequenceFor(projectId);
+  if (seq <= sequence.committed) return false;
+  sequence.committed = seq;
+  useAppState.getState().setProjectNotes(projectId, notes);
+  return true;
+}
+
+/**
  * Re-read the canonical list into the shared cache.
  *
  * A successful save stamps a new `updated_at` and the backend sorts on it, so
  * the record's position has changed and positional patching would disagree
  * with what a reload would show. The backend owns the order; the webview never
  * sorts. A failed re-read leaves the cache alone rather than clearing it.
+ *
+ * `true` means "the cache is current", which is why a superseded commit still
+ * returns it: whatever beat this read was issued later and therefore read the
+ * same write or a later one.
  */
 async function refresh(projectId: string): Promise<boolean> {
+  const seq = issueNotesWrite(projectId);
   try {
     const reloaded = await commands.listNotes(projectId);
-    useAppState.getState().setProjectNotes(projectId, reloaded);
+    commitNotes(projectId, seq, reloaded);
     return true;
   } catch {
     return false;
@@ -104,10 +181,11 @@ export function useNotes(projectId: string) {
     const store = useAppState.getState();
     if (store.notesLoading[projectId]) return;
     store.setNotesLoading(projectId, true);
+    const seq = issueNotesWrite(projectId);
     commands
       .listNotes(projectId)
       .then((loaded) => {
-        useAppState.getState().setProjectNotes(projectId, loaded);
+        commitNotes(projectId, seq, loaded);
       })
       .catch((e) => {
         // A project that has never been read caches the empty list, so a panel
@@ -117,9 +195,12 @@ export function useNotes(projectId: string) {
         // must not blank both of them. Same rule as `refresh()`. Neither
         // branch has a stale-project hazard, because the write is keyed by the
         // project it belongs to.
-        const store = useAppState.getState();
-        if (store.notesByProject[projectId] === undefined) {
-          store.setProjectNotes(projectId, []);
+        //
+        // The commit goes under this read's own sequence, not a fresh one: a
+        // *later* read still in flight has the newer answer and must not be
+        // dropped in favour of this failure's empty list.
+        if (useAppState.getState().notesByProject[projectId] === undefined) {
+          commitNotes(projectId, seq, []);
         }
         pushToast({
           kind: "error",
@@ -216,7 +297,7 @@ export function useNotes(projectId: string) {
             // The note exists; only the re-read failed. Show it rather than
             // leaving the user with a button that did nothing visible.
             const store = useAppState.getState();
-            store.setProjectNotes(projectId, [
+            commitNotes(projectId, issueNotesWrite(projectId), [
               saved,
               ...(store.notesByProject[projectId] ?? []),
             ]);
@@ -240,8 +321,9 @@ export function useNotes(projectId: string) {
         try {
           await commands.deleteNote(projectId, noteId);
           const store = useAppState.getState();
-          store.setProjectNotes(
+          commitNotes(
             projectId,
+            issueNotesWrite(projectId),
             (store.notesByProject[projectId] ?? []).filter((n) => n.id !== noteId),
           );
           return true;
