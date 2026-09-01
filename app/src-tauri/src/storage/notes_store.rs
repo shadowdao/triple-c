@@ -150,6 +150,7 @@ fn delete_in(dir: &Path, project_id: &str, note_id: &str) -> Result<(), String> 
 }
 
 fn clear_in(dir: &Path, project_id: &str) -> Result<(), String> {
+    let _guard = write_lock().lock().unwrap_or_else(|e| e.into_inner());
     let path = notes_path_in(dir, project_id);
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
@@ -332,6 +333,16 @@ mod tests {
         clear_in(&dir, "p1").unwrap();
         assert!(!notes_path_in(&dir, "p1").exists());
         clear_in(&dir, "p1").unwrap(); // idempotent
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn clearing_is_what_project_removal_calls_and_it_never_fails_on_absence() {
+        // `remove_project` must not be able to fail because a project simply
+        // never had any notes — an orphaned notes file is harmless, a project
+        // that cannot be removed is not.
+        let dir = temp_dir("removal");
+        assert!(clear_in(&dir, "never-had-notes").is_ok());
         std::fs::remove_dir_all(&dir).ok();
     }
 }
