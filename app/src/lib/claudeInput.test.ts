@@ -16,6 +16,21 @@ describe("toClaudePayload", () => {
     expect(toClaudePayload("one\r\ntwo")).toBe("one\x1b\rtwo");
   });
 
+  it("normalises a lone CR, which would otherwise submit", () => {
+    // A bare \r is a carriage return: it submits in a Claude prompt and runs
+    // the line in a shell — the terminator this function promises not to
+    // append. A textarea cannot make one, but a notes file that was
+    // hand-edited or written by something else can, and `load_in` hands it
+    // straight back.
+    expect(toClaudePayload("one\rtwo")).toBe("one\x1b\rtwo");
+    expect(toClaudePayload("one\rtwo\r\nthree\nfour")).toBe(
+      "one\x1b\rtwo\x1b\rthree\x1b\rfour",
+    );
+    expect(toClaudePayload("text\r").endsWith("\r")).toBe(true);
+    // …but only as the tail of the soft-newline sequence, never bare.
+    expect(toClaudePayload("text\r")).toBe("text\x1b\r");
+  });
+
   it("leaves single-line text untouched", () => {
     expect(toClaudePayload("just one line")).toBe("just one line");
   });

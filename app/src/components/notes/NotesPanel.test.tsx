@@ -99,7 +99,11 @@ describe("NotesPanel", () => {
     expect(screen.getByTestId("send")).toHaveTextContent("send:fresh");
   });
 
-  it("deletes the selected note and falls back to another", async () => {
+  it("asks the hook to delete the selected note", async () => {
+    // Only the call: `useNotes` is mocked here and the mocked list never
+    // changes, so nothing in this file can exercise what the panel selects
+    // afterwards. The fallback is covered against the real hook in
+    // NotesPanel.shared.test.tsx.
     notes = [note(), note({ id: "n2", title: "Gotchas" })];
     render(<NotesPanel projectId="p1" />);
     fireEvent.click(screen.getByRole("button", { name: /delete note/i }));

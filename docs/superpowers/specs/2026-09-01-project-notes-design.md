@@ -85,6 +85,13 @@ struct ProjectNotes { version: u32, notes: Vec<Note> }
 
 Order is pinned-first then `updated_at` descending. Manual reordering is deliberately out.
 
+**`pinned` is reserved, and nothing in v1 sets it.** The field is persisted and sorted on, but
+there is no pin control and no pinned indicator anywhere in the UI, so in v1 every note sorts
+by `updated_at` descending and the pinned-first half of the rule is inert. It is carried from
+the start because it is a field in a file: adding one later means every reader has to tolerate
+its absence forever, while an unused `bool` with a serde default costs nothing. Pinning itself
+is out of scope — see §8.
+
 ### Why not a field on `Project`
 
 `projects.json` is written on **every blur** by the debounced `useProjectSave` path
@@ -339,6 +346,9 @@ that — but anything touching real key handling needs a manual check in Chromiu
   generic write-a-file-to-container command today (only `write_file_to_container` for image
   paste and `upload_bytes_to_container` for migration), and a second storage path with a
   sync direction is a v2 conversation.
+- Pinning. `Note.pinned` exists on both sides of the IPC boundary and the backend sorts on
+  it, but no UI sets it and none indicates it — see §1. A pin control is a user-facing
+  affordance and belongs in the change that adds it, not in the storage that anticipates it.
 - Tags, full-text search, manual reordering, note history.
 - Any change to `claude_instructions`. The two features stay distinct: ambient context
   versus fired-on-demand items.

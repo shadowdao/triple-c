@@ -23,7 +23,14 @@ export const CLAUDE_SOFT_NEWLINE = "\x1b\r";
  * as N truncated prompts. Deliberately appends no terminator: the text lands
  * in the prompt and the user presses Enter, which is what speech-to-text does
  * for the same reason — an unsent prompt is recoverable and a sent one is not.
+ *
+ * A **lone** `\r` is matched too, not only the one in a CRLF. It is a carriage
+ * return: it submits in a Claude prompt and runs the line in a shell, which is
+ * exactly the terminator this function promises never to append. A `<textarea>`
+ * cannot produce one, but a note body is read back from a JSON file that can be
+ * hand-edited or written by something else, so the guarantee has to hold for
+ * whatever `load_in` returns rather than for whatever the editor can type.
  */
 export function toClaudePayload(text: string): string {
-  return text.replace(/\r?\n/g, CLAUDE_SOFT_NEWLINE);
+  return text.replace(/\r\n|\r|\n/g, CLAUDE_SOFT_NEWLINE);
 }
