@@ -19,6 +19,54 @@ function persistSidebarCollapsed(value: boolean) {
   }
 }
 
+const NOTES_DOCK_KEY = "triple-c.notes.dock";
+const NOTES_DOCK_WIDTH_KEY = "triple-c.notes.dock.width";
+
+/** Wide enough for a note, narrow enough to leave a usable terminal. */
+export const NOTES_DOCK_MIN_WIDTH = 260;
+export const NOTES_DOCK_MAX_WIDTH = 720;
+export const NOTES_DOCK_DEFAULT_WIDTH = 352;
+
+function loadNotesDockOpen(): boolean {
+  try {
+    return localStorage.getItem(NOTES_DOCK_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function persistNotesDockOpen(value: boolean) {
+  try {
+    localStorage.setItem(NOTES_DOCK_KEY, value ? "1" : "0");
+  } catch {
+    // ignore — storage may be unavailable
+  }
+}
+
+/** Clamped on the way in as well as out: a stored value can be anything a
+ *  previous version, a hand edit, or a different screen left behind. */
+export function clampDockWidth(value: number): number {
+  if (!Number.isFinite(value)) return NOTES_DOCK_DEFAULT_WIDTH;
+  return Math.min(NOTES_DOCK_MAX_WIDTH, Math.max(NOTES_DOCK_MIN_WIDTH, Math.round(value)));
+}
+
+function loadNotesDockWidth(): number {
+  try {
+    const raw = localStorage.getItem(NOTES_DOCK_WIDTH_KEY);
+    return raw === null ? NOTES_DOCK_DEFAULT_WIDTH : clampDockWidth(Number(raw));
+  } catch {
+    return NOTES_DOCK_DEFAULT_WIDTH;
+  }
+}
+
+function persistNotesDockWidth(value: number) {
+  try {
+    localStorage.setItem(NOTES_DOCK_WIDTH_KEY, String(value));
+  } catch {
+    // ignore — storage may be unavailable
+  }
+}
+
 /**
  * The main area hosts two tab kinds — terminals and Project Home views — in a
  * single ordered strip. Tabs are addressed by a string key so one array can
@@ -127,6 +175,13 @@ interface AppState {
   sidebarCollapsed: boolean;
   setSidebarCollapsed: (collapsed: boolean) => void;
   toggleSidebarCollapsed: () => void;
+  /** The notes dock, visible over any tab including a terminal. */
+  notesDockOpen: boolean;
+  setNotesDockOpen: (open: boolean) => void;
+  toggleNotesDock: () => void;
+  /** Dock width in CSS px, clamped and persisted per machine. */
+  notesDockWidth: number;
+  setNotesDockWidth: (width: number) => void;
   dockerAvailable: boolean | null;
   setDockerAvailable: (available: boolean | null) => void;
   imageExists: boolean | null;
@@ -396,6 +451,23 @@ export const useAppState = create<AppState>((set) => ({
       persistSidebarCollapsed(next);
       return { sidebarCollapsed: next };
     }),
+  notesDockOpen: loadNotesDockOpen(),
+  setNotesDockOpen: (open) => {
+    persistNotesDockOpen(open);
+    set({ notesDockOpen: open });
+  },
+  toggleNotesDock: () =>
+    set((state) => {
+      const open = !state.notesDockOpen;
+      persistNotesDockOpen(open);
+      return { notesDockOpen: open };
+    }),
+  notesDockWidth: loadNotesDockWidth(),
+  setNotesDockWidth: (width) => {
+    const clamped = clampDockWidth(width);
+    persistNotesDockWidth(clamped);
+    set({ notesDockWidth: clamped });
+  },
   dockerAvailable: null,
   setDockerAvailable: (available) => set({ dockerAvailable: available }),
   imageExists: null,

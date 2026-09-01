@@ -10,7 +10,7 @@ interface Props {
 export default function StatusBar({ stt }: Props) {
   const {
     projects, sessions, terminalHasSelection, activeSessionId, sttEnabled,
-    terminalAtBottom, scrollActiveToBottom,
+    terminalAtBottom, scrollActiveToBottom, notesDockOpen, toggleNotesDock,
   } = useAppState(
     useShallow(s => ({
       projects: s.projects,
@@ -20,6 +20,8 @@ export default function StatusBar({ stt }: Props) {
       sttEnabled: s.appSettings?.stt?.enabled,
       terminalAtBottom: s.terminalAtBottom,
       scrollActiveToBottom: s.scrollActiveToBottom,
+      notesDockOpen: s.notesDockOpen,
+      toggleNotesDock: s.toggleNotesDock,
     }))
   );
   const running = projects.filter((p) => p.status === "running").length;
@@ -69,6 +71,14 @@ export default function StatusBar({ stt }: Props) {
             Jump to Current ↓
           </button>
         )}
+        <button
+          onClick={toggleNotesDock}
+          aria-pressed={notesDockOpen}
+          className="text-[var(--accent)] hover:text-[var(--accent-hover)] cursor-pointer"
+          title="Show or hide the notes panel beside the current tab"
+        >
+          Notes
+        </button>
         {sttEnabled && activeSessionId && (
           <SttButton
             state={stt.state}
