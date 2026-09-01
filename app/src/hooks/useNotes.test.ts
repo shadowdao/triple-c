@@ -67,6 +67,9 @@ describe("useNotes", () => {
     const { result } = renderHook(() => useNotes("p1"));
     await waitFor(() => expect(result.current.loading).toBe(false));
 
+    // Mock the re-read to return the edited note
+    listNotes.mockResolvedValueOnce([note({ body: "edited" })]);
+
     await act(async () => {
       await result.current.saveNote(note({ body: "edited" }));
     });
@@ -92,5 +95,72 @@ describe("useNotes", () => {
     // for the empty string.
     renderHook(() => useNotes(""));
     await waitFor(() => expect(listNotes).not.toHaveBeenCalled());
+  });
+
+  it("clears the first project's notes when the projectId changes to another non-empty value", async () => {
+    const { result, rerender } = renderHook(
+      ({ projectId }: { projectId: string }) => useNotes(projectId),
+      { initialProps: { projectId: "p1" } },
+    );
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.notes).toHaveLength(1);
+
+    // Change to a different project before the new fetch resolves
+    listNotes.mockImplementationOnce(() => new Promise(() => {})); // never resolves
+    rerender({ projectId: "p2" });
+
+    // The old notes should be cleared immediately
+    expect(result.current.notes).toHaveLength(0);
+  });
+
+  it("leaves no stale notes on screen when a load fails", async () => {
+    listNotes.mockResolvedValueOnce([note()]);
+    const { result, rerender } = renderHook(
+      ({ projectId }: { projectId: string }) => useNotes(projectId),
+      { initialProps: { projectId: "p1" } },
+    );
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.notes).toHaveLength(1);
+
+    // Switch to a project whose load fails
+    listNotes.mockRejectedValueOnce(new Error("load failed"));
+    rerender({ projectId: "p2" });
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    expect(result.current.notes).toHaveLength(0);
+    expect(pushToast).toHaveBeenCalled();
+  });
+
+  it("ends with the list the backend returned when saving a new note", async () => {
+    // Initially one note
+    const { result } = renderHook(() => useNotes("p1"));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.notes).toHaveLength(1);
+
+    // Saving a new note (not in the current list) re-reads and ends with the backend's list
+    const newNote = note({ id: "n2", title: "New" });
+    listNotes.mockResolvedValueOnce([newNote, note()]);
+
+    await act(async () => {
+      await result.current.saveNote(newNote);
+    });
+
+    expect(result.current.notes).toHaveLength(2);
+    expect(result.current.notes[0].id).toBe("n2");
+  });
+
+  it("re-reads the list after a successful save rather than patching in place", async () => {
+    const { result } = renderHook(() => useNotes("p1"));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    const callCountBefore = listNotes.mock.calls.length;
+    listNotes.mockResolvedValueOnce([note({ body: "edited" })]);
+
+    await act(async () => {
+      await result.current.saveNote(note({ body: "edited" }));
+    });
+
+    // listNotes should be called again after the save
+    expect(listNotes).toHaveBeenCalledTimes(callCountBefore + 1);
   });
 });

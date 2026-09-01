@@ -43,6 +43,7 @@ export function useNotes(projectId: string) {
     }
     let cancelled = false;
     setLoading(true);
+    setNotes([]);
     commands
       .listNotes(projectId)
       .then((loaded) => {
@@ -50,6 +51,7 @@ export function useNotes(projectId: string) {
       })
       .catch((e) => {
         if (cancelled) return;
+        setNotes([]);
         pushToast({
           kind: "error",
           message: "Could not load notes for this project",
@@ -85,14 +87,18 @@ export function useNotes(projectId: string) {
       if (resetTimer.current) clearTimeout(resetTimer.current);
       setSaveState({ status: "saving", error: null });
       try {
-        const saved = await commands.saveNote(projectId, note);
-        setNotes((current) => {
-          const index = current.findIndex((n) => n.id === saved.id);
-          if (index === -1) return [saved, ...current];
-          const next = [...current];
-          next[index] = saved;
-          return next;
-        });
+        await commands.saveNote(projectId, note);
+        // Re-read the canonical list from the backend. A successful save stamps a new
+        // `updated_at`, and the backend sorts unpinned notes by `updated_at` descending,
+        // so the record's position has changed and positional patching would disagree with
+        // what a reload would show.
+        try {
+          const reloaded = await commands.listNotes(projectId);
+          setNotes(reloaded);
+        } catch {
+          // Keep the save reported as successful (it was) and leave the existing list alone
+          // rather than clearing it if the re-read fails.
+        }
         succeeded();
         return true;
       } catch (e) {
@@ -108,7 +114,10 @@ export function useNotes(projectId: string) {
   const createNote = useCallback(async () => {
     const note = draft();
     // Held locally first so the editor can focus it immediately; the save
-    // happens on blur like every other edit.
+    // happens on blur like every other edit. The note does not exist backend-side,
+    // so no re-read can place it and no backend ordering applies to it yet. Prepending
+    // puts it at the top where the user can see it immediately, and on the first save
+    // its canonical position is established.
     setNotes((current) => [note, ...current]);
     return note;
   }, []);
