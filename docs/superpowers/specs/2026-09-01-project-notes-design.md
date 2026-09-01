@@ -57,9 +57,19 @@ on `projects_store.rs`:
 
 - **`sanitize()` on the project id**, copied from `migration_store.rs:41-46`. The id arrives
   over IPC; it must not be able to steer the write.
-- **Atomic write** — `.tmp` then `rename()`, per `projects_store.rs:167-179` and the Key
-  Conventions rule in CLAUDE.md.
-- **Corrupt file is quarantined to `.bak`, not discarded** (`projects_store.rs:24-61`).
+- **Atomic *and durable* write** — `.tmp`, `sync_all()`, `rename()`, then fsync the
+  directory, per `migration_store.rs:203-261` rather than `projects_store.rs:167-179`. That
+  file's comment is explicit that write-temp-then-rename alone is only half of it: `fs::write`
+  returns once the bytes are in the page cache, so losing power in the window leaves the
+  rename applied and the data not written — a truncated file produced by the very code meant
+  to prevent one. Notes are user prose; that is the data least worth losing to a half-write.
+- **Corrupt file is copied aside and left in place**, per `migration_store.rs:49-125` —
+  timestamped, capped, and never overwriting an earlier copy, because the first copy is the
+  one taken before anything rewrote the file.
+- **Path resolution is split for testability.** `dirs::data_dir()` is resolved in thin public
+  wrappers; the real work takes an explicit `&Path`. `ProjectsStore::new()` hardcodes
+  `dirs::data_dir()` and is therefore not constructible against a temp dir, which is why its
+  own tests only exercise free functions. The notes store should not inherit that limit.
 
 ```rust
 struct Note {
@@ -102,8 +112,15 @@ Registered in `lib.rs` via `generate_handler!`. Per CLAUDE.md, application comma
 - `delete_note(projectId, noteId)`
 
 There is deliberately **no whole-list setter**. Bulk writes are the clobbering mechanism the
-storage choice above exists to avoid; a read-modify-write under the store's `Mutex` per note
-is both correct and cheap.
+storage choice above exists to avoid.
+
+`notes_store` is a **free-function module** keyed by project id, exactly like
+`migration_store` — no struct, nothing held in `AppState`, no in-memory copy of the notes.
+`ProjectsStore`'s `Mutex` exists because it caches the project list in memory; a notes store
+that reads and writes the file per call has nothing to cache and nothing to guard. What it
+does need is that each upsert's read-modify-write is not interleaved with another's, so the
+module holds one process-wide write lock (`OnceLock<Mutex<()>>`, the idiom already in
+`browser_view/popout.rs`) taken for the read-modify-write, not for the read path.
 
 Frontend: wrappers in `lib/tauri-commands.ts`, a `hooks/useNotes.ts`, and notes cached in
 zustand keyed by project id. Rust is the source of truth; the cache is a cache.
@@ -114,8 +131,11 @@ drawn so that a future detached window (§8) only swaps the transport: Rust emit
 
 ## 3. Editor — plain text, deliberately
 
-A note is a title and a `<textarea>`, with save-on-blur plus a debounce, following
-`ClaudeInstructionsEditor.tsx`. **No rich editor, no markdown library, and no markdown
+A note is a title and a `<textarea>`, saved on blur, following
+`ClaudeInstructionsEditor.tsx` (which saves in `onBlur` and holds no timer) and reporting
+the outcome through `ui/SaveIndicator`. There is no debounce anywhere in the existing save
+path — `useSaveState.ts`'s only timer is a 2500 ms reset of the "Saved ✓" label — and notes
+add none. **No rich editor, no markdown library, and no markdown
 rendering** — it is a scratchpad for reminders, and it stays one.
 
 The body is stored and displayed exactly as typed. There is no view/edit mode split, so
@@ -186,6 +206,12 @@ Two consequences follow from that same comment:
 | 0 | Button disabled, "no running session for this project" |
 | 1 | Send |
 | >1 | Menu of session display names (`Project.renamed_session_names` where set) |
+
+The display-name rule is currently written **twice**, both copies non-exported and local to
+`MainTabs.tsx` — `tabLabel` (:192-203) and inline in `renderTab` (:362-367). The picker would
+be a third copy of a rule that already disagrees with itself the moment one copy is edited,
+so it is extracted once to a shared helper and both existing sites call it. That is a
+targeted improvement to code this feature depends on, not unrelated refactoring.
 
 - **The target is pinned at click time**, per the hazard `useSTT.ts:20,30` guards against
   (it pins at record-start so text does not land in whatever tab is active at stop time).
