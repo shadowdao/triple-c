@@ -1,4 +1,5 @@
 pub mod migration_store;
+pub mod notes_store;
 pub mod pending_cleanup;
 pub mod projects_store;
 pub mod secure;
