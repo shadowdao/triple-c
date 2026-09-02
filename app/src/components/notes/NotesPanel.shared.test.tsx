@@ -1,19 +1,24 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, within, fireEvent, waitFor } from "@testing-library/react";
 import NotesPanel from "./NotesPanel";
+import NotesDockPanel from "./NotesDockPanel";
 import { useAppState } from "../../store/appState";
 import type { Note } from "../../lib/types";
 
 /**
  * Two panels, one project — the configuration the app actually runs in.
  *
- * `NotesTab` and `NotesDock` both mount a `NotesPanel`, and the dock follows
- * the active tab's project, so opening the dock over a Project Home tab mounts
- * two panels for the *same* project. Every other notes test mounts exactly
- * one, which is precisely the configuration in which a per-panel cache looks
- * correct: it is only with two that an edit made in one is seen — or lost — by
- * the other. `useNotes` is deliberately **not** mocked here; the cache is what
- * is under test.
+ * `NotesTab` mounts a `NotesPanel` and `NotesDock` mounts a `NotesDockPanel`,
+ * and the dock follows the active tab's project, so opening the dock over a
+ * Project Home tab mounts both for the *same* project. Every other notes test
+ * mounts exactly one, which is precisely the configuration in which a
+ * per-panel cache looks correct: it is only with two that an edit made in one
+ * is seen — or lost — by the other. `useNotes` is deliberately **not** mocked
+ * here; the cache is what is under test.
+ *
+ * The two are different components on purpose, which is exactly why this test
+ * pairs them rather than mounting the same one twice: the layouts diverged,
+ * and the cache and draft rules they share are what must not.
  */
 
 const files: Record<string, Note[]> = {};
@@ -54,7 +59,7 @@ function renderBothSurfaces() {
         <NotesPanel projectId="p1" />
       </div>
       <div data-testid="dock">
-        <NotesPanel projectId="p1" />
+        <NotesDockPanel projectId="p1" />
       </div>
     </>,
   );
@@ -70,7 +75,7 @@ beforeEach(() => {
   useAppState.setState({ notesByProject: {}, notesLoading: {}, toasts: [] });
 });
 
-describe("NotesPanel with the tab and the dock both open", () => {
+describe("the tab and the dock both open on one project", () => {
   it("shows an edit made in one surface in the other", async () => {
     const { tab, dock } = renderBothSurfaces();
     await waitFor(() => expect(tab().getByLabelText("Note body")).toHaveValue("one"));
@@ -157,7 +162,10 @@ describe("NotesPanel with the tab and the dock both open", () => {
     const { tab, dock } = renderBothSurfaces();
     await waitFor(() => expect(tab().getByLabelText("Note body")).toHaveValue("one"));
 
-    fireEvent.click(dock().getByRole("button", { name: /new note/i }));
+    // The dock keeps New behind its overflow menu — its height belongs to the
+    // note being written, not to a button row.
+    fireEvent.click(dock().getByRole("button", { name: /note actions/i }));
+    fireEvent.click(dock().getByRole("menuitem", { name: /new note/i }));
 
     await waitFor(() =>
       expect(tab().getAllByRole("button", { name: /untitled note/i })).toHaveLength(1),

@@ -9,6 +9,14 @@ import Button from "../ui/Button";
 interface Props {
   projectId: string;
   body: string;
+  /**
+   * Open the session menu above the button instead of below. The dock puts
+   * this at its foot, and the dock clips its own overflow, so a downward menu
+   * there is drawn outside the panel and never seen.
+   */
+  dropUp?: boolean;
+  /** Fill the row. The dock's send bar is the width of the dock. */
+  fullWidth?: boolean;
 }
 
 /**
@@ -21,7 +29,12 @@ interface Props {
  * Only `claude` sessions are offered. A bash tab would receive ESC+CR as an
  * unbound readline key and answer with a bell (see `lib/claudeInput.ts`).
  */
-export default function SendToAgentButton({ projectId, body }: Props) {
+export default function SendToAgentButton({
+  projectId,
+  body,
+  dropUp = false,
+  fullWidth = false,
+}: Props) {
   const { sessions, sendInput } = useTerminal();
   const { projects, setActiveTabKey, pushToast } = useAppState(
     useShallow((s) => ({
@@ -43,7 +56,7 @@ export default function SendToAgentButton({ projectId, body }: Props) {
 
   const project = projects.find((p) => p.id === projectId);
   const hasBody = body.trim().length > 0;
-  const disabled = targets.length === 0 || !hasBody;
+  const unavailable = targets.length === 0 || !hasBody;
 
   // Same dismissal contract as `ui/OverflowMenu` and the tab context menu.
   useEffect(() => {
@@ -102,10 +115,19 @@ export default function SendToAgentButton({ projectId, body }: Props) {
       : "Put this note into the agent's prompt (you press Enter)";
 
   return (
-    <div ref={rootRef} className="relative inline-block">
+    <div
+      ref={rootRef}
+      className={`relative ${fullWidth ? "block w-full" : "inline-block"}`}
+    >
       <Button
         variant="secondary"
-        disabled={disabled}
+        size={fullWidth ? "md" : "sm"}
+        className={fullWidth ? "w-full" : ""}
+        // Not `disabled`: every one of these reasons is information, and
+        // `disabled` takes the button — reason and all — out of the
+        // accessibility tree. `Button` guards the click for us.
+        unavailable={unavailable}
+        unavailableReason={title}
         onClick={onClick}
         aria-haspopup={targets.length > 1 ? "menu" : undefined}
         aria-expanded={targets.length > 1 ? menuOpen : undefined}
@@ -116,7 +138,9 @@ export default function SendToAgentButton({ projectId, body }: Props) {
       {menuOpen && targets.length > 1 && (
         <div
           role="menu"
-          className="absolute right-0 z-40 mt-1 min-w-[12rem] py-1 bg-[var(--bg-overlay)] border border-[var(--border-color)] rounded-[var(--radius-panel)] text-xs"
+          className={`absolute right-0 z-40 min-w-[12rem] py-1 bg-[var(--bg-overlay)] border border-[var(--border-color)] rounded-[var(--radius-panel)] text-xs ${
+            dropUp ? "bottom-full mb-1" : "mt-1"
+          }`}
           style={{ boxShadow: "var(--shadow-overlay)" }}
         >
           {targets.map((s) => (

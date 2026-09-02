@@ -3,7 +3,7 @@ import { render, screen, fireEvent } from "@testing-library/react";
 import NotesDock from "./NotesDock";
 import type { Project, TerminalSession } from "../../lib/types";
 
-vi.mock("../notes/NotesPanel", () => ({
+vi.mock("../notes/NotesDockPanel", () => ({
   default: ({ projectId }: { projectId: string }) => (
     <div data-testid="panel">{`panel:${projectId}`}</div>
   ),

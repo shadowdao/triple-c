@@ -7,7 +7,7 @@ import {
   NOTES_DOCK_MIN_WIDTH,
   NOTES_DOCK_MAX_WIDTH,
 } from "../../store/appState";
-import NotesPanel from "../notes/NotesPanel";
+import NotesDockPanel from "../notes/NotesDockPanel";
 import Button from "../ui/Button";
 
 /**
@@ -116,7 +116,7 @@ export default function NotesDock() {
       </div>
       <div className="flex-1 min-h-0">
         {projectId ? (
-          <NotesPanel projectId={projectId} />
+          <NotesDockPanel projectId={projectId} />
         ) : (
           <p className="p-4 text-[13px] text-[var(--text-secondary)]">
             Open a project or a terminal to see its notes.

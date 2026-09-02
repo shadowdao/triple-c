@@ -39,23 +39,55 @@ beforeEach(() => {
 });
 
 describe("SendToAgentButton", () => {
-  it("is disabled when the project has no running session", () => {
+  // Unavailable, not `disabled`: the reason a note cannot be sent is the whole
+  // content of these states, and native `disabled` announces it to nobody.
+  it("says why it cannot send when the project has no running session", () => {
     render(<SendToAgentButton projectId="p1" body="hello" />);
-    expect(screen.getByRole("button", { name: /send to agent/i })).toBeDisabled();
+    const button = screen.getByRole("button", { name: /send to agent/i });
+    expect(button).toHaveAttribute("aria-disabled", "true");
+    expect(button).toHaveAccessibleDescription(
+      "No running Claude session for this project",
+    );
   });
 
-  it("is disabled when the only session belongs to another project", () => {
+  it("says why it cannot send an empty note", () => {
+    sessions = [session()];
+    render(<SendToAgentButton projectId="p1" body="   " />);
+    expect(
+      screen.getByRole("button", { name: /send to agent/i }),
+    ).toHaveAccessibleDescription("Nothing to send — this note is empty");
+  });
+
+  it("is unavailable when the only session belongs to another project", () => {
     sessions = [session({ projectId: "other" })];
     render(<SendToAgentButton projectId="p1" body="hello" />);
-    expect(screen.getByRole("button", { name: /send to agent/i })).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: /send to agent/i }),
+    ).toHaveAttribute("aria-disabled", "true");
   });
 
-  it("is disabled when the only session is a bash tab", () => {
+  it("is unavailable when the only session is a bash tab", () => {
     // `bash -l`'s readline has no binding for ESC+CR and just bells, so a
     // shell is never a target.
     sessions = [session({ sessionType: "bash" })];
     render(<SendToAgentButton projectId="p1" body="hello" />);
-    expect(screen.getByRole("button", { name: /send to agent/i })).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: /send to agent/i }),
+    ).toHaveAttribute("aria-disabled", "true");
+  });
+
+  // `aria-disabled` is advisory — it blocks nothing on its own. Without the
+  // guard this swap would turn a greyed-out button into a live one.
+  it("sends nothing when activated while unavailable", () => {
+    render(<SendToAgentButton projectId="p1" body="hello" />);
+    const button = screen.getByRole("button", { name: /send to agent/i });
+
+    fireEvent.click(button);
+    fireEvent.keyDown(button, { key: "Enter" });
+    fireEvent.keyDown(button, { key: " " });
+
+    expect(sendInput).not.toHaveBeenCalled();
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
   });
 
   it("sends straight to the one session, with newlines converted and no terminator", async () => {
@@ -100,6 +132,21 @@ describe("SendToAgentButton", () => {
   it("does nothing for an empty note", () => {
     sessions = [session()];
     render(<SendToAgentButton projectId="p1" body="   " />);
-    expect(screen.getByRole("button", { name: /send to agent/i })).toBeDisabled();
+    const button = screen.getByRole("button", { name: /send to agent/i });
+    expect(button).toHaveAttribute("aria-disabled", "true");
+
+    fireEvent.click(button);
+    fireEvent.keyDown(button, { key: "Enter" });
+    expect(sendInput).not.toHaveBeenCalled();
+  });
+
+  it("opens the session menu upward when it sits at the foot of the dock", async () => {
+    sessions = [session({ id: "s1" }), session({ id: "s2" })];
+    render(<SendToAgentButton projectId="p1" body="hello" dropUp />);
+    fireEvent.click(screen.getByRole("button", { name: /send to agent/i }));
+
+    // Anchored to the button's top edge, not below it: the dock clips its own
+    // overflow, so a downward menu at the bottom edge is invisible.
+    await waitFor(() => expect(screen.getByRole("menu")).toHaveClass("bottom-full"));
   });
 });
