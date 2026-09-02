@@ -55,6 +55,10 @@ export default function AddProjectDialog({ onClose }: Props) {
 
   const handleSubmit = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
+    // The submit button is `aria-disabled` rather than `disabled` while an add
+    // is in flight, and Enter inside a text field submits the form without
+    // touching the button at all. Both routes end here, so the guard does too.
+    if (loading) return;
     if (!name.trim()) {
       setError("Project name is required");
       return;
@@ -97,7 +101,19 @@ export default function AddProjectDialog({ onClose }: Props) {
           <Button size="md" variant="ghost" onClick={onClose}>
             Cancel
           </Button>
-          <Button size="md" variant="primary" type="submit" form={formId} disabled={loading}>
+          <Button
+            size="md"
+            variant="primary"
+            type="submit"
+            form={formId}
+            unavailable={loading}
+            unavailableReason="The project is being added. Wait for it to finish."
+            title={
+              loading
+                ? "The project is being added. Wait for it to finish."
+                : undefined
+            }
+          >
             {loading ? "Adding…" : "Add Project"}
           </Button>
         </>
