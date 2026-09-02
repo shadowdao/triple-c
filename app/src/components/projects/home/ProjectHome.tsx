@@ -18,6 +18,7 @@ import AutomationTab from "./AutomationTab";
 import ConfigTab from "./ConfigTab";
 import FilesTab from "./FilesTab";
 import BrowserTab from "./BrowserTab";
+import NotesTab from "./NotesTab";
 import { formatUptime } from "./format";
 import { describeLeftovers, leftoverPronoun, leftoverVerb } from "./removalReport";
 
@@ -28,6 +29,7 @@ const TABS = [
   { id: "config", label: "Config" },
   { id: "files", label: "Files" },
   { id: "browser", label: "Browser" },
+  { id: "notes", label: "Notes" },
 ] as const;
 
 export type ProjectHomeTabId = (typeof TABS)[number]["id"];
@@ -255,6 +257,7 @@ export default function ProjectHome({ projectId, active }: Props) {
         {tab === "browser" && (
           <BrowserTab project={project} active={active && tab === "browser"} />
         )}
+        {tab === "notes" && <NotesTab project={project} />}
       </div>
 
       {showMigration && (

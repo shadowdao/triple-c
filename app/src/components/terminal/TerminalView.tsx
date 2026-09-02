@@ -7,6 +7,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import "@xterm/xterm/css/xterm.css";
 import { useTerminal } from "../../hooks/useTerminal";
 import { useAppState } from "../../store/appState";
+import { CLAUDE_SOFT_NEWLINE } from "../../lib/claudeInput";
 import {
   awsSsoRefresh,
   openPageInContainerBrowser,
@@ -415,7 +416,7 @@ export default function TerminalView({ sessionId, active }: Props) {
         !event.isComposing &&
         sessionTypeRef.current === "claude"
       ) {
-        sendInput(sessionId, "\x1b\r");
+        sendInput(sessionId, CLAUDE_SOFT_NEWLINE);
         // **`preventDefault()` is what stops the submit, not the `return false`.**
         //
         // xterm's `_keyDown` returns the instant a custom handler says `false`
@@ -729,6 +730,21 @@ export default function TerminalView({ sessionId, active }: Props) {
       term.focus();
     }
   }, [active, gpuRenderingSetting]);
+
+  // Focus on demand, for the caller that cannot rely on the effect above.
+  // That one keys off `active`, so it covers switching *to* a terminal and
+  // nothing else — and the notes dock sends to the terminal already on screen,
+  // where `active` never changes. Consumed once and cleared, so asking twice
+  // for the same terminal works.
+  const pendingTerminalFocus = useAppState((s) => s.pendingTerminalFocus);
+  const clearPendingTerminalFocus = useAppState(
+    (s) => s.clearPendingTerminalFocus,
+  );
+  useEffect(() => {
+    if (pendingTerminalFocus !== sessionId) return;
+    termRef.current?.focus();
+    clearPendingTerminalFocus();
+  }, [pendingTerminalFocus, sessionId, clearPendingTerminalFocus]);
 
   // Auto-dismiss toast after 30 seconds — unless the user is standing in it.
   // A keyboard user who has just jumped into the toast is mid-decision, and

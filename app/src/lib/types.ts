@@ -565,6 +565,16 @@ export interface SchedulerNotification {
   created_at: string;
 }
 
+/** One project note. Mirrors `models::Note` — field names are the Rust ones. */
+export interface Note {
+  id: string;
+  title: string;
+  body: string;
+  pinned: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
 // ── Auth bridge ──────────────────────────────────────────────────────────────
 
 /** Which loopback family the container-side listener was found on.

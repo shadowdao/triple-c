@@ -1,5 +1,12 @@
 import { create } from "zustand";
-import type { Project, TerminalSession, AppSettings, UpdateInfo, ImageUpdateInfo } from "../lib/types";
+import type {
+  Project,
+  TerminalSession,
+  AppSettings,
+  UpdateInfo,
+  ImageUpdateInfo,
+  Note,
+} from "../lib/types";
 
 const SIDEBAR_COLLAPSED_KEY = "triple-c.sidebar.collapsed";
 
@@ -14,6 +21,54 @@ function loadSidebarCollapsed(): boolean {
 function persistSidebarCollapsed(value: boolean) {
   try {
     localStorage.setItem(SIDEBAR_COLLAPSED_KEY, value ? "1" : "0");
+  } catch {
+    // ignore — storage may be unavailable
+  }
+}
+
+const NOTES_DOCK_KEY = "triple-c.notes.dock";
+const NOTES_DOCK_WIDTH_KEY = "triple-c.notes.dock.width";
+
+/** Wide enough for a note, narrow enough to leave a usable terminal. */
+export const NOTES_DOCK_MIN_WIDTH = 260;
+export const NOTES_DOCK_MAX_WIDTH = 720;
+export const NOTES_DOCK_DEFAULT_WIDTH = 352;
+
+function loadNotesDockOpen(): boolean {
+  try {
+    return localStorage.getItem(NOTES_DOCK_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function persistNotesDockOpen(value: boolean) {
+  try {
+    localStorage.setItem(NOTES_DOCK_KEY, value ? "1" : "0");
+  } catch {
+    // ignore — storage may be unavailable
+  }
+}
+
+/** Clamped on the way in as well as out: a stored value can be anything a
+ *  previous version, a hand edit, or a different screen left behind. */
+export function clampDockWidth(value: number): number {
+  if (!Number.isFinite(value)) return NOTES_DOCK_DEFAULT_WIDTH;
+  return Math.min(NOTES_DOCK_MAX_WIDTH, Math.max(NOTES_DOCK_MIN_WIDTH, Math.round(value)));
+}
+
+function loadNotesDockWidth(): number {
+  try {
+    const raw = localStorage.getItem(NOTES_DOCK_WIDTH_KEY);
+    return raw === null ? NOTES_DOCK_DEFAULT_WIDTH : clampDockWidth(Number(raw));
+  } catch {
+    return NOTES_DOCK_DEFAULT_WIDTH;
+  }
+}
+
+function persistNotesDockWidth(value: number) {
+  try {
+    localStorage.setItem(NOTES_DOCK_WIDTH_KEY, String(value));
   } catch {
     // ignore — storage may be unavailable
   }
@@ -89,6 +144,21 @@ interface AppState {
   /** Consumed once by `ProjectHome`, then cleared. */
   pendingHomeTab: { projectId: string; tab: string } | null;
   clearPendingHomeTab: () => void;
+  /**
+   * Ask a terminal to take keyboard focus.
+   *
+   * `TerminalView` already focuses when its tab *becomes* active, which covers
+   * switching to a terminal. It cannot cover being asked to focus the terminal
+   * that is already on screen — nothing changes, so no effect re-runs — and
+   * that is the ordinary case for the notes dock, which sits beside the
+   * terminal it sends to.
+   *
+   * Consumed once and cleared, like `pendingHomeTab`: holding the id would
+   * make a second request for the same terminal a no-op state write.
+   */
+  pendingTerminalFocus: string | null;
+  requestTerminalFocus: (sessionId: string) => void;
+  clearPendingTerminalFocus: () => void;
   closeHomeTab: (projectId: string) => void;
   setActiveTabKey: (key: string) => void;
   cycleTab: (delta: number) => void;
@@ -97,6 +167,29 @@ interface AppState {
   moveTab: (key: string, toIndex: number) => void;
   /** Nudge the active tab left/right — the keyboard route to the same thing. */
   moveActiveTab: (delta: number) => void;
+
+  // Per-project notes, cached from the backend.
+  //
+  // Rust is the source of truth and this is a cache — but it has to be *one*
+  // cache. Notes are shown by two surfaces at once (the Project Home sub-tab
+  // and the dock, which resolves to the same project), and a hook-local
+  // `useState` in each gave them independent copies: an edit made in the dock
+  // was invisible to the tab, and the tab's next blur wrote its stale record
+  // back over it with no error and no indicator. Keyed by project id so a
+  // response that lands after the user has moved on updates the project it
+  // belongs to instead of whichever one is on screen.
+  //
+  // This is also the boundary a detached notes window would need: swap the
+  // transport for a `notes-changed` event and both windows feed the same slice.
+  notesByProject: Record<string, Note[]>;
+  /**
+   * Projects with a `list_notes` in flight, so two panels mounting for the
+   * same project make one read rather than two, and so a panel whose project
+   * has never been read can tell "loading" from "no notes".
+   */
+  notesLoading: Record<string, boolean>;
+  setProjectNotes: (projectId: string, notes: Note[]) => void;
+  setNotesLoading: (projectId: string, loading: boolean) => void;
 
   // Inline container progress, replacing the blocking progress modal.
   containerProgress: Record<string, string>;
@@ -127,6 +220,13 @@ interface AppState {
   sidebarCollapsed: boolean;
   setSidebarCollapsed: (collapsed: boolean) => void;
   toggleSidebarCollapsed: () => void;
+  /** The notes dock, visible over any tab including a terminal. */
+  notesDockOpen: boolean;
+  setNotesDockOpen: (open: boolean) => void;
+  toggleNotesDock: () => void;
+  /** Dock width in CSS px, clamped and persisted per machine. */
+  notesDockWidth: number;
+  setNotesDockWidth: (width: number) => void;
   dockerAvailable: boolean | null;
   setDockerAvailable: (available: boolean | null) => void;
   imageExists: boolean | null;
@@ -267,6 +367,9 @@ export const useAppState = create<AppState>((set) => ({
     }),
   pendingHomeTab: null,
   clearPendingHomeTab: () => set({ pendingHomeTab: null }),
+  pendingTerminalFocus: null,
+  requestTerminalFocus: (sessionId) => set({ pendingTerminalFocus: sessionId }),
+  clearPendingTerminalFocus: () => set({ pendingTerminalFocus: null }),
   closeHomeTab: (projectId) =>
     set((state) => {
       const key = homeTabKey(projectId);
@@ -340,6 +443,22 @@ export const useAppState = create<AppState>((set) => ({
       return { tabOrder };
     }),
 
+  // Notes
+  notesByProject: {},
+  notesLoading: {},
+  setProjectNotes: (projectId, notes) =>
+    set((state) => ({
+      notesByProject: { ...state.notesByProject, [projectId]: notes },
+    })),
+  setNotesLoading: (projectId, loading) =>
+    set((state) => {
+      if ((state.notesLoading[projectId] ?? false) === loading) return {};
+      const next = { ...state.notesLoading };
+      if (loading) next[projectId] = true;
+      else delete next[projectId];
+      return { notesLoading: next };
+    }),
+
   // Container progress
   containerProgress: {},
   setContainerProgress: (projectId, message) =>
@@ -396,6 +515,23 @@ export const useAppState = create<AppState>((set) => ({
       persistSidebarCollapsed(next);
       return { sidebarCollapsed: next };
     }),
+  notesDockOpen: loadNotesDockOpen(),
+  setNotesDockOpen: (open) => {
+    persistNotesDockOpen(open);
+    set({ notesDockOpen: open });
+  },
+  toggleNotesDock: () =>
+    set((state) => {
+      const open = !state.notesDockOpen;
+      persistNotesDockOpen(open);
+      return { notesDockOpen: open };
+    }),
+  notesDockWidth: loadNotesDockWidth(),
+  setNotesDockWidth: (width) => {
+    const clamped = clampDockWidth(width);
+    persistNotesDockWidth(clamped);
+    set({ notesDockWidth: clamped });
+  },
   dockerAvailable: null,
   setDockerAvailable: (available) => set({ dockerAvailable: available }),
   imageExists: null,

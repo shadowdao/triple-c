@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ProjectPath, ProjectRemovalReport, ProjectResetOutcome, ContainerInfo, AppSettings, SettingsImportPreview, SettingsImportOutcome, UpdateInfo, ImageUpdateInfo, FileEntry, FileContents, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, BrowserPageState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo, UploadOutcome } from "./types";
+import type { Project, ProjectPath, ProjectRemovalReport, ProjectResetOutcome, ContainerInfo, AppSettings, SettingsImportPreview, SettingsImportOutcome, UpdateInfo, ImageUpdateInfo, FileEntry, FileContents, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, BrowserPageState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo, UploadOutcome, Note } from "./types";
 
 // Docker
 export const checkDocker = () => invoke<boolean>("check_docker");
@@ -24,6 +24,15 @@ export const rebuildProjectContainer = (projectId: string) =>
   invoke<ProjectResetOutcome>("rebuild_project_container", { projectId });
 export const reconcileProjectStatuses = () =>
   invoke<Project[]>("reconcile_project_statuses");
+
+// Notes — per-project, host-side, readable with the container stopped.
+export const listNotes = (projectId: string) =>
+  invoke<Note[]>("list_notes", { projectId });
+/** Insert or replace one note. `created_at` and `id` are owned by the backend. */
+export const saveNote = (projectId: string, note: Note) =>
+  invoke<Note>("save_note", { projectId, note });
+export const deleteNote = (projectId: string, noteId: string) =>
+  invoke<void>("delete_note", { projectId, noteId });
 
 // Settings
 export const getSettings = () => invoke<AppSettings>("get_settings");

@@ -112,3 +112,27 @@ describe("toasts", () => {
     expect(toasts()).toHaveLength(2);
   });
 });
+
+describe("terminal focus requests", () => {
+  beforeEach(() => useAppState.setState({ pendingTerminalFocus: null }));
+
+  const pending = () => useAppState.getState().pendingTerminalFocus;
+
+  it("names the session that should take focus", () => {
+    useAppState.getState().requestTerminalFocus("s1");
+    expect(pending()).toBe("s1");
+  });
+
+  // Consumed once, exactly like `pendingHomeTab`. Without the clear, the
+  // second send to a terminal already holding the request would set the same
+  // value, no state would change, and no effect would re-run — which is the
+  // failure this whole mechanism exists to fix.
+  it("is cleared once consumed, so the same terminal can be asked again", () => {
+    useAppState.getState().requestTerminalFocus("s1");
+    useAppState.getState().clearPendingTerminalFocus();
+    expect(pending()).toBeNull();
+
+    useAppState.getState().requestTerminalFocus("s1");
+    expect(pending()).toBe("s1");
+  });
+});

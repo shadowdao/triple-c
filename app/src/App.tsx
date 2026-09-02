@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import Sidebar from "./components/layout/Sidebar";
 import TopBar from "./components/layout/TopBar";
 import StatusBar from "./components/layout/StatusBar";
+import NotesDock from "./components/layout/NotesDock";
 import TerminalView from "./components/terminal/TerminalView";
 import DockerInstallDialog from "./components/DockerInstallDialog";
 import ProjectHome from "./components/projects/home/ProjectHome";
@@ -161,6 +162,7 @@ export default function App() {
             </div>
           )}
         </main>
+        <NotesDock />
       </div>
       <StatusBar stt={stt} />
       <ToastHost />

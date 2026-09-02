@@ -470,6 +470,10 @@ pub fn run() {
             commands::project_commands::stop_project_container,
             commands::project_commands::rebuild_project_container,
             commands::project_commands::reconcile_project_statuses,
+            // Notes
+            commands::notes_commands::list_notes,
+            commands::notes_commands::save_note,
+            commands::notes_commands::delete_note,
             // Container base-image migration
             commands::migration_commands::get_container_staleness,
             commands::migration_commands::migrate_project_to_base,

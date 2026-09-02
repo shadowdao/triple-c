@@ -722,6 +722,15 @@ pub async fn remove_project(
     // holding an entire snapshot image that nothing will ever reference again.
     crate::commands::migration_commands::purge_migration_artifacts(&project_id).await;
 
+    // A project's notes are the one piece of its state that is purely the
+    // user's prose, so removal takes them with it rather than leaving an
+    // orphan file keyed by an id nothing will ever look up again. Logged and
+    // not propagated: an orphaned notes file is harmless, and a project that
+    // cannot be removed is not.
+    if let Err(e) = crate::storage::notes_store::clear(&project_id) {
+        log::warn!("Could not remove notes for project {}: {}", project_id, e);
+    }
+
     // Stop and remove container if it exists. Everything named in `report`
     // below is what will be unreachable the moment this function drops the
     // project record — see [`ProjectRemovalReport`] and

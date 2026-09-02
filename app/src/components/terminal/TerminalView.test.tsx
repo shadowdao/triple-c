@@ -538,3 +538,59 @@ describe("TerminalView — reaching the URL prompt without a mouse", () => {
     expect(document.activeElement).toBe(before);
   });
 });
+
+describe("TerminalView — focus on request", () => {
+  /** Mount, then deliberately give focus away, so what the assertions below
+   *  observe is the *request* taking effect and never the focus `active`
+   *  already grants on mount. That distinction is the whole point: the notes
+   *  dock sends to a terminal whose tab is already active, where nothing
+   *  changes and no `active` effect re-runs. */
+  async function mountAndBlur() {
+    const view = mountSession("claude");
+    await act(async () => {});
+    const elsewhere = document.createElement("button");
+    document.body.appendChild(elsewhere);
+    elsewhere.focus();
+    expect(document.activeElement).toBe(elsewhere);
+    return view;
+  }
+
+  it("focuses the terminal named by the request", async () => {
+    const view = await mountAndBlur();
+
+    await act(async () => {
+      useAppState.getState().requestTerminalFocus("s1");
+    });
+
+    expect(document.activeElement).toBe(helperTextarea(view.container));
+  });
+
+  it("ignores a request meant for another session", async () => {
+    const view = await mountAndBlur();
+    const before = document.activeElement;
+
+    await act(async () => {
+      useAppState.getState().requestTerminalFocus("s2");
+    });
+
+    expect(document.activeElement).toBe(before);
+    expect(document.activeElement).not.toBe(helperTextarea(view.container));
+  });
+
+  it("clears the request, so a second send focuses again", async () => {
+    const view = await mountAndBlur();
+
+    await act(async () => {
+      useAppState.getState().requestTerminalFocus("s1");
+    });
+    expect(useAppState.getState().pendingTerminalFocus).toBeNull();
+
+    const elsewhere = document.querySelector("button");
+    (elsewhere as HTMLButtonElement).focus();
+
+    await act(async () => {
+      useAppState.getState().requestTerminalFocus("s1");
+    });
+    expect(document.activeElement).toBe(helperTextarea(view.container));
+  });
+});
