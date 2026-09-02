@@ -3,10 +3,19 @@
 
 /// WebKitGTK's DMA-BUF renderer (its default accelerated-compositing path
 /// since 2.42) fails outright on some Mesa/driver/compositor combinations
-/// under Wayland, printing `Could not create default EGL display:
-/// EGL_BAD_PARAMETER. Aborting.` straight to stderr from WebKitGTK's own C
-/// code and killing the webview before Triple-C's own logging even starts —
-/// see triple-c#34, reported on CachyOS/Arch with Wayland.
+/// under Wayland, killing the webview and leaving a blank window — see
+/// triple-c#34, reported on CachyOS/Arch with Wayland.
+///
+/// **This is not the only cause of a blank window, and the error text alone
+/// does not tell them apart.** An earlier version of this comment quoted
+/// `Could not create default EGL display: EGL_BAD_PARAMETER. Aborting.` as
+/// the error this fixes. The AppImage produces that same string for an
+/// entirely unrelated reason: it bundled a `libwayland-client.so.0` that
+/// shadowed the host's, and the host's `libEGL_mesa.so.0` has a hard
+/// DT_NEEDED on that library, so the EGL driver failed to load before any
+/// renderer choice was reachable. This flag was set, and correctly, and made no difference —
+/// which cost a round of debugging that started from the comment rather than
+/// from the evidence. See `scripts/unbundle-wayland-client.sh`.
 ///
 /// Set unconditionally on Linux rather than gated on `WAYLAND_DISPLAY`: that
 /// variable is exported into an XWayland client's environment too, so a

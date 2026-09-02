@@ -321,6 +321,13 @@ jobs:
           export PATH="$HOME/.cargo/bin:$PATH"
           npx tauri build
 
+      # linuxdeploy bundles a libwayland-client.so.0 that shadows the host's
+      # and breaks Mesa's EGL on systems newer than the build runner, so the
+      # window comes up blank. It has to come from the host; see the script
+      # header for the evidence and the trade.
+      - name: Unbundle the host-coupled Wayland client
+        run: bash scripts/unbundle-wayland-client.sh app/src-tauri/target/release/bundle/appimage
+
       - name: Collect artifacts
         run: |
           mkdir -p artifacts
