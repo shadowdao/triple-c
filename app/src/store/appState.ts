@@ -144,6 +144,21 @@ interface AppState {
   /** Consumed once by `ProjectHome`, then cleared. */
   pendingHomeTab: { projectId: string; tab: string } | null;
   clearPendingHomeTab: () => void;
+  /**
+   * Ask a terminal to take keyboard focus.
+   *
+   * `TerminalView` already focuses when its tab *becomes* active, which covers
+   * switching to a terminal. It cannot cover being asked to focus the terminal
+   * that is already on screen — nothing changes, so no effect re-runs — and
+   * that is the ordinary case for the notes dock, which sits beside the
+   * terminal it sends to.
+   *
+   * Consumed once and cleared, like `pendingHomeTab`: holding the id would
+   * make a second request for the same terminal a no-op state write.
+   */
+  pendingTerminalFocus: string | null;
+  requestTerminalFocus: (sessionId: string) => void;
+  clearPendingTerminalFocus: () => void;
   closeHomeTab: (projectId: string) => void;
   setActiveTabKey: (key: string) => void;
   cycleTab: (delta: number) => void;
@@ -352,6 +367,9 @@ export const useAppState = create<AppState>((set) => ({
     }),
   pendingHomeTab: null,
   clearPendingHomeTab: () => set({ pendingHomeTab: null }),
+  pendingTerminalFocus: null,
+  requestTerminalFocus: (sessionId) => set({ pendingTerminalFocus: sessionId }),
+  clearPendingTerminalFocus: () => set({ pendingTerminalFocus: null }),
   closeHomeTab: (projectId) =>
     set((state) => {
       const key = homeTabKey(projectId);

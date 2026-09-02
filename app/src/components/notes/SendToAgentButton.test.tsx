@@ -11,14 +11,22 @@ vi.mock("../../hooks/useTerminal", () => ({
 }));
 
 const setActiveTabKey = vi.fn();
+const requestTerminalFocus = vi.fn();
 const pushToast = vi.fn();
 let projects: Project[] = [];
 
 vi.mock("../../store/appState", () => ({
   useAppState: Object.assign(
     (selector: (s: unknown) => unknown) =>
-      selector({ projects, setActiveTabKey, pushToast }),
-    { getState: () => ({ projects, setActiveTabKey, pushToast }) },
+      selector({ projects, setActiveTabKey, requestTerminalFocus, pushToast }),
+    {
+      getState: () => ({
+        projects,
+        setActiveTabKey,
+        requestTerminalFocus,
+        pushToast,
+      }),
+    },
   ),
   terminalTabKey: (id: string) => `term:${id}`,
 }));
@@ -148,5 +156,36 @@ describe("SendToAgentButton", () => {
     // Anchored to the button's top edge, not below it: the dock clips its own
     // overflow, so a downward menu at the bottom edge is invisible.
     await waitFor(() => expect(screen.getByRole("menu")).toHaveClass("bottom-full"));
+  });
+
+  // Switching to the tab is not enough. When the dock is open beside the
+  // terminal it sends to, that terminal is already the active tab, so
+  // `setActiveTabKey` changes nothing and no effect re-runs — leaving focus on
+  // this button, one click short of the Enter the user came to press.
+  it("hands focus to the terminal so the next keystroke is Enter", async () => {
+    sessions = [session()];
+    render(<SendToAgentButton projectId="p1" body="hello" />);
+    fireEvent.click(screen.getByRole("button", { name: /send to agent/i }));
+
+    await waitFor(() => expect(requestTerminalFocus).toHaveBeenCalledWith("s1"));
+  });
+
+  it("leaves focus alone when the send failed", async () => {
+    sessions = [session()];
+    sendInput.mockRejectedValueOnce(new Error("pty gone"));
+    render(<SendToAgentButton projectId="p1" body="hello" />);
+    fireEvent.click(screen.getByRole("button", { name: /send to agent/i }));
+
+    await waitFor(() => expect(pushToast).toHaveBeenCalled());
+    expect(requestTerminalFocus).not.toHaveBeenCalled();
+  });
+
+  it("focuses the session picked from the menu, not the first one", async () => {
+    sessions = [session(), session({ id: "s2", sessionName: "review" })];
+    render(<SendToAgentButton projectId="p1" body="hello" />);
+    fireEvent.click(screen.getByRole("button", { name: /send to agent/i }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "review" }));
+
+    await waitFor(() => expect(requestTerminalFocus).toHaveBeenCalledWith("s2"));
   });
 });

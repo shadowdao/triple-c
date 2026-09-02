@@ -731,6 +731,21 @@ export default function TerminalView({ sessionId, active }: Props) {
     }
   }, [active, gpuRenderingSetting]);
 
+  // Focus on demand, for the caller that cannot rely on the effect above.
+  // That one keys off `active`, so it covers switching *to* a terminal and
+  // nothing else — and the notes dock sends to the terminal already on screen,
+  // where `active` never changes. Consumed once and cleared, so asking twice
+  // for the same terminal works.
+  const pendingTerminalFocus = useAppState((s) => s.pendingTerminalFocus);
+  const clearPendingTerminalFocus = useAppState(
+    (s) => s.clearPendingTerminalFocus,
+  );
+  useEffect(() => {
+    if (pendingTerminalFocus !== sessionId) return;
+    termRef.current?.focus();
+    clearPendingTerminalFocus();
+  }, [pendingTerminalFocus, sessionId, clearPendingTerminalFocus]);
+
   // Auto-dismiss toast after 30 seconds — unless the user is standing in it.
   // A keyboard user who has just jumped into the toast is mid-decision, and
   // pulling it out from under them costs them the only route to finishing a

@@ -36,13 +36,15 @@ export default function SendToAgentButton({
   fullWidth = false,
 }: Props) {
   const { sessions, sendInput } = useTerminal();
-  const { projects, setActiveTabKey, pushToast } = useAppState(
-    useShallow((s) => ({
-      projects: s.projects,
-      setActiveTabKey: s.setActiveTabKey,
-      pushToast: s.pushToast,
-    })),
-  );
+  const { projects, setActiveTabKey, requestTerminalFocus, pushToast } =
+    useAppState(
+      useShallow((s) => ({
+        projects: s.projects,
+        setActiveTabKey: s.setActiveTabKey,
+        requestTerminalFocus: s.requestTerminalFocus,
+        pushToast: s.pushToast,
+      })),
+    );
   const [menuOpen, setMenuOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
 
@@ -86,6 +88,11 @@ export default function SendToAgentButton({
         // A courtesy, not part of the send: if the tab cannot be focused the
         // text still went.
         setActiveTabKey(terminalTabKey(sessionId));
+        // Switching tabs is not the same as taking focus, and when the dock is
+        // open beside the terminal it just sent to, that tab is already the
+        // active one — so nothing above moves the caret off this button. The
+        // note is sitting in the prompt waiting for Enter; put the user there.
+        requestTerminalFocus(sessionId);
       } catch (e) {
         pushToast({
           kind: "error",
@@ -94,7 +101,7 @@ export default function SendToAgentButton({
         });
       }
     },
-    [body, sendInput, setActiveTabKey, pushToast],
+    [body, sendInput, setActiveTabKey, requestTerminalFocus, pushToast],
   );
 
   const onClick = useCallback(() => {
