@@ -122,14 +122,6 @@ describe("ProjectRow", () => {
   });
 
   it("only allows opening a terminal while the container runs", () => {
-    const { unmount } = render(<ProjectRow project={baseProject} />);
-    expect(
-      screen.getByRole("button", {
-        name: "Open a Claude terminal for Test Project",
-      }),
-    ).toBeDisabled();
-    unmount();
-
     render(<ProjectRow project={{ ...baseProject, status: "running" }} />);
     fireEvent.click(
       screen.getByRole("button", {
@@ -137,6 +129,38 @@ describe("ProjectRow", () => {
       }),
     );
     expect(mockOpenClaudeTerminal).toHaveBeenCalled();
+  });
+
+  it("keeps the terminal button announced, and explains why, while stopped", () => {
+    render(<ProjectRow project={baseProject} />);
+    const button = screen.getByRole("button", {
+      name: "Open a Claude terminal for Test Project",
+    });
+    // Native `disabled` would drop the button out of the accessibility tree
+    // and out of the tab order, taking the reason with it.
+    expect(button).not.toBeDisabled();
+    expect(button).toHaveAttribute("aria-disabled", "true");
+    expect(button).toHaveAccessibleDescription(/is not running/i);
+  });
+
+  it("ignores clicks and Enter/Space on the terminal button while stopped", () => {
+    render(<ProjectRow project={baseProject} />);
+    const button = screen.getByRole("button", {
+      name: "Open a Claude terminal for Test Project",
+    });
+    fireEvent.click(button);
+    fireEvent.keyDown(button, { key: "Enter" });
+    fireEvent.keyDown(button, { key: " " });
+    expect(mockOpenClaudeTerminal).not.toHaveBeenCalled();
+  });
+
+  it("drops aria-disabled once the container is running", () => {
+    render(<ProjectRow project={{ ...baseProject, status: "running" }} />);
+    const button = screen.getByRole("button", {
+      name: "Open a Claude terminal for Test Project",
+    });
+    expect(button).not.toHaveAttribute("aria-disabled");
+    expect(button).not.toHaveAccessibleDescription(/is not running/i);
   });
 
   it("shows container progress inline rather than in a blocking modal", () => {

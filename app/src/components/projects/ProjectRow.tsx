@@ -3,6 +3,7 @@ import type { Project } from "../../lib/types";
 import { useAppState, homeTabKey } from "../../store/appState";
 import { useProjectActions } from "../../hooks/useProjectActions";
 import { ProjectStatusIndicator } from "../ui/StatusIndicator";
+import { useUnavailable } from "../ui/unavailable";
 
 interface Props {
   project: Project;
@@ -30,6 +31,15 @@ export default function ProjectRow({ project }: Props) {
   const isRunning = project.status === "running";
   const isTransitioning =
     project.status === "starting" || project.status === "stopping";
+
+  // A terminal needs a running container. Saying so out loud beats a `disabled`
+  // attribute that hides the button — and the reason — from anyone not using a
+  // mouse and eyes.
+  const terminal = useUnavailable({
+    unavailable: !isRunning,
+    reason: `${project.name} is not running. Start it to open a terminal.`,
+    onClick: () => openClaudeTerminal(),
+  });
 
   return (
     <div
@@ -113,11 +123,14 @@ export default function ProjectRow({ project }: Props) {
         </button>
         <button
           type="button"
-          disabled={!isRunning}
-          onClick={() => openClaudeTerminal()}
-          title={`Open a Claude terminal for ${project.name}`}
+          {...terminal.controlProps}
+          title={
+            isRunning
+              ? `Open a Claude terminal for ${project.name}`
+              : `${project.name} is not running. Start it to open a terminal.`
+          }
           aria-label={`Open a Claude terminal for ${project.name}`}
-          className="w-6 h-6 flex items-center justify-center rounded-[var(--radius-control)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-primary)] disabled:text-[var(--text-disabled)] transition-colors"
+          className="w-6 h-6 flex items-center justify-center rounded-[var(--radius-control)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-primary)] disabled:text-[var(--text-disabled)] aria-disabled:text-[var(--text-disabled)] aria-disabled:hover:text-[var(--text-disabled)] aria-disabled:hover:bg-transparent aria-disabled:cursor-not-allowed transition-colors"
         >
           <svg
             className="w-3.5 h-3.5"
@@ -134,6 +147,7 @@ export default function ProjectRow({ project }: Props) {
             <line x1="13" y1="15" x2="17" y2="15" />
           </svg>
         </button>
+        {terminal.reasonNode}
       </div>
     </div>
   );
