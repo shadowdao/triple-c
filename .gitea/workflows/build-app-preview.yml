@@ -361,7 +361,6 @@ jobs:
         run: |
           mkdir -p artifacts
           cp app/src-tauri/target/release/bundle/appimage/*.AppImage artifacts/ 2>/dev/null || true
-          cp app/src-tauri/target/release/bundle/appimage/*.zsync artifacts/ 2>/dev/null || true
           ls -la artifacts/
 
       # Assets, not workflow artifacts — see the note at the top of this file.
