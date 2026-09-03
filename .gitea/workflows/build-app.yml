@@ -185,21 +185,23 @@ jobs:
         working-directory: ./app
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
-          npx tauri build
+          # AppImage only: the .deb and .rpm were dropped in favour of the one
+          # artifact that runs everywhere, and building them is pure cost.
+          # Left as "all" in tauri.conf.json so macOS and Windows are unaffected.
+          npx tauri build --bundles appimage
 
       # linuxdeploy bundles a libwayland-client.so.0 that shadows the host's
       # and breaks Mesa's EGL on systems newer than the build runner, so the
       # window comes up blank. It has to come from the host; see the script
       # header for the evidence and the trade.
-      - name: Unbundle the host-coupled Wayland client
-        run: bash scripts/unbundle-wayland-client.sh app/src-tauri/target/release/bundle/appimage
+      - name: Finalize the AppImage
+        run: bash scripts/finalize-appimage.sh app/src-tauri/target/release/bundle/appimage
 
       - name: Collect artifacts
         run: |
           mkdir -p artifacts
           cp app/src-tauri/target/release/bundle/appimage/*.AppImage artifacts/ 2>/dev/null || true
-          cp app/src-tauri/target/release/bundle/deb/*.deb artifacts/ 2>/dev/null || true
-          cp app/src-tauri/target/release/bundle/rpm/*.rpm artifacts/ 2>/dev/null || true
+          cp app/src-tauri/target/release/bundle/appimage/*.zsync artifacts/ 2>/dev/null || true
           ls -la artifacts/
 
       - name: Upload to Gitea release
@@ -276,6 +278,15 @@ jobs:
               --data-binary "@${file}" \
               "${GITEA_URL}/api/v1/repos/${REPO}/releases/${RELEASE_ID}/assets?name=${filename}"
           done
+
+      # The fixed tag every installed AppImage checks for updates. Separate
+      # from the versioned release above because the updater's URL must never
+      # move, and `releases/latest` does.
+      - name: Publish the Linux update channel
+        if: gitea.event_name == 'push'
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: bash scripts/publish-update-channel.sh artifacts
 
   build-macos:
     runs-on: macos-latest

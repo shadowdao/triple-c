@@ -41,13 +41,15 @@ Download the build for your platform from [GitHub Releases](https://github.com/s
 |----------|------|---------|
 | **Windows** | `Triple-C_<version>_x64-setup.exe` or `.msi` | Run the installer. |
 | **macOS** | `Triple-C_<version>_universal.dmg` | Open the `.dmg` and drag Triple-C to Applications. |
-| **Debian / Ubuntu** | `Triple-C_<version>_amd64.deb` | `sudo apt install ./Triple-C_<version>_amd64.deb` |
-| **Fedora / RHEL** | `Triple-C-<version>-1.x86_64.rpm` | `sudo dnf install ./Triple-C-<version>-1.x86_64.rpm` |
-| **Arch / CachyOS / other Linux** | `Triple-C_<version>_amd64.AppImage` | `chmod +x` it, then run it directly. See the AppImage notes below. |
+| **Linux (all distributions)** | `Triple-C_<version>_amd64.AppImage` | `chmod +x` it, then run it directly. See the AppImage notes below. |
 
 > **macOS note:** The app is not signed or notarized. On first launch, macOS Gatekeeper may block it — right-click the app and select "Open" to bypass, or remove the quarantine attribute: `xattr -cr /Applications/Triple-C.app`.
 
 > **AppImage note:** Two things are worth knowing. Running an AppImage needs FUSE 2, which Arch and CachyOS do not install by default — `sudo pacman -S fuse2` once, or run it with `--appimage-extract-and-run` to sidestep FUSE entirely. And an AppImage is just an executable file: nothing registers it with the desktop, so it will not appear in your app launcher on its own. Run [`scripts/install-appimage.sh`](scripts/install-appimage.sh) to add a launcher entry and icons — see [Adding an AppImage to the app launcher](#adding-an-appimage-to-the-app-launcher).
+
+> **Linux is AppImage only.** The `.deb` and `.rpm` were dropped. They were a second and third artifact to build, test and publish for an audience already served by the one file that runs on every distribution — and unlike the AppImage they could not be kept up to date automatically. Older releases still carry them if you need one.
+
+> **Updates.** The AppImage carries update information, so an AppImage manager (Gear Lever, AppImageLauncher and similar) can adopt it and update it in place — pulling only the changed blocks rather than re-downloading 85 MB. It reads a fixed `linux-latest` tag on GitHub, so the URL never moves between versions.
 
 > **No Arch package.** There was a `triple-c-bin` `.pkg.tar.zst` attached to some releases, built by a maintainer-triggered workflow. It was never on the AUR, so installing it meant downloading a file and running `pacman -U` — no better than the AppImage — and being manual-only it reached 1 release in 28, which made the promise of it worse than not making it. The `PKGBUILD` and its workflow are preserved on the `hold/arch-packaging` branch if an AUR package is ever worth doing properly.
 

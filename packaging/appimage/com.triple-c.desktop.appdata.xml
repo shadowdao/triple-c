@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AppStream metadata for the AppImage.
+
+  Without this an AppImage manager (Gear Lever, AppImageLauncher and the like)
+  can adopt the file but has nothing to show for it: no summary, no category,
+  no release history. appimagetool warns about its absence on every build.
+
+  The id matches `identifier` in tauri.conf.json and the .desktop basename, so
+  the desktop entry, the AppStream component and the AppImage all name the
+  same application. `@VERSION@` is substituted at build time.
+-->
+<component type="desktop-application">
+  <id>com.triple-c.desktop</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+
+  <name>Triple-C</name>
+  <summary>Run Claude Code sessions in isolated Docker containers</summary>
+
+  <description>
+    <p>
+      Triple-C sandboxes Claude Code inside per-project Docker containers, so an
+      agent can install packages, edit files and run commands without touching
+      the host. Each project gets its own container, its own credentials and its
+      own terminal sessions.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Per-project containers with persistent home and config volumes</li>
+      <li>Multiple terminal sessions per project, in one reorderable tab strip</li>
+      <li>Notes that can be sent straight into a running agent's prompt</li>
+      <li>Anthropic, AWS Bedrock, Ollama, llama.cpp and OpenAI-compatible backends</li>
+      <li>Remote access over a browser terminal, and speech-to-text input</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">Triple-C.desktop</launchable>
+  <categories>
+    <category>Development</category>
+    <category>Utility</category>
+  </categories>
+
+  <url type="homepage">https://github.com/shadowdao/triple-c</url>
+  <url type="bugtracker">https://github.com/shadowdao/triple-c/issues</url>
+
+  <provides>
+    <binary>triple-c</binary>
+  </provides>
+
+  <releases>
+    <release version="@VERSION@" date="@DATE@"/>
+  </releases>
+
+  <content_rating type="oars-1.1"/>
+</component>
