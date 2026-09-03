@@ -119,6 +119,14 @@ if [ ${#images[@]} -eq 0 ]; then
   echo "No .AppImage in $dir — nothing to do." >&2
   exit 0
 fi
+# Refused here rather than after the repack: with two present the old position
+# let the script download appimagetool, repack, overwrite the versioned
+# artifact and write the channel pair, *then* fail — and it silently picked
+# images[0], which is glob order, i.e. the older version.
+if [ ${#images[@]} -ne 1 ]; then
+  echo "Expected 1 AppImage in $dir, found ${#images[@]}: ${images[*]}" >&2
+  exit 1
+fi
 appimage="${images[0]}"
 here="$PWD"
 
@@ -210,11 +218,18 @@ else
 fi
 
 # linuxdeploy emits `Categories=` empty, which files the app nowhere.
-for desktop in "$root"/*.desktop; do
+#
+# The AppDir root entry is a **symlink** into usr/share/applications, so a
+# plain `sed -i` replaces the link with a regular file and leaves the real entry
+# untouched — two divergent copies, of which the empty one is the one that
+# actually ships and the filled one is the only one a root-only guard can see.
+# `--follow-symlinks` writes through. Both locations are globbed because the
+# layout is linuxdeploy's, not ours, and it is free to stop symlinking.
+for desktop in "$root"/*.desktop "$root"/usr/share/applications/*.desktop; do
   [ -e "$desktop" ] || continue
   if grep -q "^Categories=$" "$desktop"; then
-    sed -i "s/^Categories=$/Categories=$CATEGORIES/" "$desktop"
-    echo "Filled in Categories for $(basename "$desktop")."
+    sed -i --follow-symlinks "s/^Categories=$/Categories=$CATEGORIES/" "$desktop"
+    echo "Filled in Categories for ${desktop#"$root"/}."
   fi
 done
 
@@ -258,7 +273,17 @@ fi
 
 # An empty Categories or missing metadata ships an image a manager cannot file
 # or describe, and both fail silently at runtime rather than at build time.
-! grep -q "^Categories=$" "$out"/*.desktop || fail "a desktop file still has an empty Categories."
+# Asserted positively, over every entry: the earlier form checked only that no
+# *root* file held an empty value, which passed while the real entry under
+# usr/share/applications shipped empty, and also passed on a missing key.
+desktops=0
+for desktop in "$out"/*.desktop "$out"/usr/share/applications/*.desktop; do
+  [ -e "$desktop" ] || continue
+  desktops=$((desktops + 1))
+  grep -q "^Categories=$CATEGORIES$" "$desktop" \
+    || fail "${desktop#"$out"/} does not carry Categories=$CATEGORIES."
+done
+[ "$desktops" -gt 0 ] || fail "the image contains no .desktop entry at all."
 [ -f "$appdata_src" ] && { [ -e "$out/usr/share/metainfo/$appdata_installed_as" ] \
   || fail "AppStream metadata did not make it into the image."; }
 
@@ -284,5 +309,9 @@ shopt -u nullglob
 [ "${#beside[@]}" -eq 1 ] \
   || fail "expected 1 AppImage beside the release, found ${#beside[@]}."
 
-echo "OK: $appimage prefers the host $LIB (fallback kept) and carries AppStream"
-echo "    metadata. Channel pair in $CHANNEL_DIR/, updating from the $UPDATE_TAG tag."
+if [ "$demoted" = true ]; then
+  echo "OK: $appimage prefers the host $LIB (fallback kept) and carries"
+else
+  echo "OK: $appimage had no bundled $LIB to demote, and carries"
+fi
+echo "    AppStream metadata. Channel pair in $CHANNEL_DIR/, updating from $UPDATE_TAG."
