@@ -299,8 +299,34 @@ jobs:
       - name: Install frontend dependencies
         working-directory: ./app
         run: |
-          rm -rf node_modules package-lock.json
-          npm install
+          # `npm ci` — from the lockfile, never resolving afresh.
+          #
+          # This used to be `rm -rf node_modules package-lock.json && npm
+          # install`, which deleted the lockfile "to ensure correct
+          # platform-specific bindings" (2d4fce9). That made every build
+          # re-resolve the whole tree against the registry, so a dependency
+          # publishing a new version could break CI with no change to this
+          # repo — and one did. Deleting the lockfile then hit a null
+          # dereference in npm 10.9.8's arborist peer-set resolver:
+          #
+          #   npm error Cannot read properties of null (reading 'edgesOut')
+          #     at #loadPeerSet (.../build-ideal-tree.js:1289:38)
+          #
+          # reached through vite → @vitejs/devtools → @vitejs/devtools-vitest
+          # → vitest@* → @vitest/browser-playwright → jsdom@* → canvas.
+          # Reproduced exactly by removing the lockfile locally on the same
+          # Node 22.23.2 the runner installs.
+          #
+          # The binding worry is obsolete: the committed lockfile records 25
+          # rollup platform variants, and `npm ci` on Linux installs precisely
+          # rollup-linux-x64-{gnu,musl} and @esbuild/linux-x64. Verified, along
+          # with a clean tsc, a successful build and 752 passing tests from the
+          # resulting tree.
+          #
+          # Do not "fix" a future dependency error by deleting the lockfile
+          # again. If `npm ci` refuses, package.json and the lockfile have
+          # genuinely diverged, and the fix is to commit an updated lockfile.
+          npm ci
 
       - name: Install Tauri CLI
         working-directory: ./app
@@ -426,8 +452,10 @@ jobs:
       - name: Install frontend dependencies
         working-directory: ./app
         run: |
-          rm -rf node_modules
-          npm install
+          # `npm ci` here too, so all three platforms install identically and
+          # none of them can re-resolve the tree mid-release. Windows already
+          # did. See the Linux job for what a fresh resolution cost us.
+          npm ci
 
       - name: Install Tauri CLI
         working-directory: ./app
