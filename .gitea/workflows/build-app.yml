@@ -206,6 +206,17 @@ jobs:
           cp app/src-tauri/target/release/bundle/appimage/*.AppImage artifacts/ 2>/dev/null || true
           ls -la artifacts/
 
+          # A green job that published nothing is the worst outcome available:
+          # the release exists, carries no AppImage, and nobody is told. The
+          # `|| true` above is there so a missing bundle does not mask the real
+          # error, which makes this check the thing that catches it.
+          shopt -s nullglob
+          collected=(artifacts/*)
+          if [ ${#collected[@]} -eq 0 ]; then
+            echo "No artifacts collected — the bundler produced nothing." >&2
+            exit 1
+          fi
+
       - name: Upload to Gitea release
         if: gitea.event_name == 'push'
         env:

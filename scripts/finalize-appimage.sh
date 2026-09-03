@@ -103,8 +103,13 @@ CATEGORIES="Development;Utility;"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 appdata_src="$repo_root/packaging/appimage/$APP_ID.appdata.xml"
+# appimagetool looks for `<desktop basename>.appdata.xml` and warns the
+# metadata is missing under any other name — while the script cheerfully
+# reported it present. The AppStream id inside the file is unchanged and is
+# what actually identifies the component; only the filename follows the tool.
+appdata_installed_as="Triple-C.appdata.xml"
 
-dir="${1:?usage: unbundle-wayland-client.sh <bundle/appimage directory>}"
+dir="${1:?usage: finalize-appimage.sh <bundle/appimage directory>}"
 cd "$dir"
 
 shopt -s nullglob
@@ -125,15 +130,15 @@ echo "Inspecting $appimage"
 ( cd "$work" && "$here/$appimage" --appimage-extract >/dev/null )
 root="$work/squashfs-root"
 
-if [ ! -e "$root/usr/lib/$LIB" ]; then
-  # Not a failure: linuxdeploy may have stopped bundling it, which is the
-  # outcome this script exists to produce.
-  echo "$LIB is not bundled — leaving $appimage alone."
-  exit 0
-fi
+# The demotion and the metadata are independent jobs, and an absent library
+# must not skip the second. An early exit here also left `update-channel/`
+# uncreated, which killed the publish step on a missing directory and took the
+# tag and mirror jobs down with it — a half-published release.
+demoted=false
+if [ -e "$root/usr/lib/$LIB" ]; then
 
-mkdir -p "$root/$FALLBACK_DIR"
-mv "$root/usr/lib/$LIB" "$root/$FALLBACK_DIR/$LIB"
+  mkdir -p "$root/$FALLBACK_DIR"
+  mv "$root/usr/lib/$LIB" "$root/$FALLBACK_DIR/$LIB"
 
 cat > "$root/$HOOK" <<'HOOK_EOF'
 #! /usr/bin/env bash
@@ -182,6 +187,11 @@ src = src.replace(
 )
 open(path, "w").write(src)
 PATCH_EOF
+  fi
+  demoted=true
+  echo "Demoted $LIB to $FALLBACK_DIR."
+else
+  echo "$LIB is not bundled — nothing to demote."
 fi
 
 # --- metadata -------------------------------------------------------------
@@ -193,7 +203,7 @@ version="$(printf '%s' "$appimage" | sed -n 's/.*_\([0-9][0-9.]*\)_.*/\1/p')"
 if [ -f "$appdata_src" ]; then
   mkdir -p "$root/usr/share/metainfo"
   sed -e "s/@VERSION@/$version/" -e "s/@DATE@/$(date -u +%Y-%m-%d)/" \
-    "$appdata_src" > "$root/usr/share/metainfo/$APP_ID.appdata.xml"
+    "$appdata_src" > "$root/usr/share/metainfo/$appdata_installed_as"
   echo "Added AppStream metadata for $version."
 else
   echo "No AppStream source at $appdata_src — skipping." >&2
@@ -208,7 +218,7 @@ for desktop in "$root"/*.desktop; do
   fi
 done
 
-echo "Demoted $LIB to $FALLBACK_DIR; repacking."
+echo "Repacking."
 
 tool="$work/appimagetool"
 curl -fsSL -o "$tool" "$APPIMAGE_TOOL_URL"
@@ -216,6 +226,7 @@ chmod +x "$tool"
 
 # --appimage-extract-and-run: CI runners generally have no FUSE.
 # -u embeds the update string and writes "$STABLE_NAME.zsync" beside the image.
+rm -rf "$CHANNEL_DIR"
 mkdir -p "$CHANNEL_DIR"
 ARCH=x86_64 "$tool" --appimage-extract-and-run \
   -u "$UPDATE_INFO" "$root" "$CHANNEL_DIR/$STABLE_NAME" >/dev/null
@@ -237,16 +248,18 @@ out="$check/squashfs-root"
 
 fail() { echo "FAILED: $1" >&2; exit 1; }
 
-[ -e "$out/usr/lib/$LIB" ] && fail "$LIB is still on the loader path."
-[ -e "$out/$FALLBACK_DIR/$LIB" ] || fail "the fallback copy of $LIB is missing."
-[ -e "$out/$HOOK" ] || fail "the fallback hook is missing."
-grep -q "triple-c-wayland-fallback" "$out/AppRun" || fail "AppRun does not source the hook."
+if [ "$demoted" = true ]; then
+  [ -e "$out/usr/lib/$LIB" ] && fail "$LIB is still on the loader path."
+  [ -e "$out/$FALLBACK_DIR/$LIB" ] || fail "the fallback copy of $LIB is missing."
+  [ -e "$out/$HOOK" ] || fail "the fallback hook is missing."
+  grep -q "triple-c-wayland-fallback" "$out/AppRun" || fail "AppRun does not source the hook."
+fi
 [ -x "$out/usr/bin/triple-c" ] || fail "no executable usr/bin/triple-c."
 
 # An empty Categories or missing metadata ships an image a manager cannot file
 # or describe, and both fail silently at runtime rather than at build time.
-grep -q "^Categories=.\+" "$out"/*.desktop || fail "Categories is still empty."
-[ -f "$appdata_src" ] && { [ -e "$out/usr/share/metainfo/$APP_ID.appdata.xml" ] \
+! grep -q "^Categories=$" "$out"/*.desktop || fail "a desktop file still has an empty Categories."
+[ -f "$appdata_src" ] && { [ -e "$out/usr/share/metainfo/$appdata_installed_as" ] \
   || fail "AppStream metadata did not make it into the image."; }
 
 # The update string is the difference between adoptable and updatable. It
@@ -258,15 +271,18 @@ grep -q "^Categories=.\+" "$out"/*.desktop || fail "Categories is still empty."
 [ -e "$CHANNEL_DIR/$STABLE_NAME" ] || fail "the stable-named image is missing."
 [ -e "$CHANNEL_DIR/$STABLE_NAME.zsync" ] || fail "appimagetool wrote no .zsync."
 
-readelf -p .upd_info "$CHANNEL_DIR/$STABLE_NAME" 2>/dev/null | grep -q "$UPDATE_TAG" \
-  || fail "the image carries no update information for the $UPDATE_TAG tag."
+readelf -p .upd_info "$CHANNEL_DIR/$STABLE_NAME" 2>/dev/null | grep -qF "$UPDATE_INFO" \
+  || fail "the image does not carry exactly the expected update information."
 grep -aq "^Filename: $STABLE_NAME$" "$CHANNEL_DIR/$STABLE_NAME.zsync" \
   || fail "the .zsync names something other than $STABLE_NAME."
 
 # The versioned release must carry one AppImage, not two. This is the guard
 # for the duplicate that shipped in 0.4.20 and 0.4.21.
-count="$(ls -1 *.AppImage 2>/dev/null | wc -l)"
-[ "$count" = "1" ] || fail "expected 1 AppImage beside the release, found $count."
+shopt -s nullglob
+beside=(*.AppImage)
+shopt -u nullglob
+[ "${#beside[@]}" -eq 1 ] \
+  || fail "expected 1 AppImage beside the release, found ${#beside[@]}."
 
 echo "OK: $appimage prefers the host $LIB (fallback kept) and carries AppStream"
 echo "    metadata. Channel pair in $CHANNEL_DIR/, updating from the $UPDATE_TAG tag."

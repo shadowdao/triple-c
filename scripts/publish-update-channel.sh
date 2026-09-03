@@ -57,23 +57,63 @@ done
 gh() { curl -sf -H "Authorization: Bearer $GH_PAT" -H "Accept: application/vnd.github+json" "$@"; }
 tea() { curl -sf -H "Authorization: token $GITEA_TOKEN" -H "Content-Type: application/json" "$@"; }
 
-# Anchor the tag in Gitea first — see the header. Moved rather than left
-# alone: it has to name this build, and the mirror will carry whatever Gitea
-# holds over the top of GitHub's copy.
-echo "==> Anchoring the $TAG tag in Gitea at ${GITEA_SHA:0:9}"
-tea -X DELETE "$GITEA_API/repos/$GITEA_REPO/tags/$TAG" >/dev/null 2>&1 || true
-tea -X POST "$GITEA_API/repos/$GITEA_REPO/tags" \
-  -d "{\"tag_name\": \"$TAG\", \"target\": \"$GITEA_SHA\", \"message\": \"Rolling Linux update channel\"}" \
-  >/dev/null
+# Anchor the tag in Gitea — see the header. **Created if absent, never moved.**
+#
+# An earlier version deleted and recreated it so the tag would name the current
+# build. That was worse than useless: nothing about the channel depends on
+# which commit the tag points at — the update string resolves the tag by *name*
+# and the assets hang off the release object — while a DELETE followed by a
+# failed POST destroys a working anchor and leaves a window in which a mirror
+# run prunes GitHub's copy. A transient Gitea error would have converted a
+# healthy channel into a dead one, which is strictly worse than this step not
+# existing. Gitea's POST /tags has no force semantics, so the DELETE was only
+# ever there to get around a 409; asking first removes the need.
+echo "==> Anchoring the $TAG tag in Gitea"
+if tea "$GITEA_API/repos/$GITEA_REPO/tags/$TAG" >/dev/null 2>&1; then
+  echo "    already anchored — left alone"
+else
+  echo "    creating it at ${GITEA_SHA:0:9}"
+  tea -X POST "$GITEA_API/repos/$GITEA_REPO/tags" \
+    -d "{\"tag_name\": \"$TAG\", \"target\": \"$GITEA_SHA\", \"message\": \"Rolling Linux update channel\"}" \
+    >/dev/null
+fi
 
 # Not best-effort. Without this tag the mirror removes GitHub's and the
 # channel dies silently somewhere between now and four hours from now.
 tea "$GITEA_API/repos/$GITEA_REPO/tags/$TAG" >/dev/null 2>&1 \
   || { echo "FAILED: the $TAG tag does not exist in Gitea; the mirror would delete GitHub's copy." >&2; exit 1; }
 
-echo "==> Looking for the $TAG release"
-release="$(gh "$API/releases/tags/$TAG" 2>/dev/null || true)"
-release_id="$(printf '%s' "$release" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("id",""))' 2>/dev/null || true)"
+# Look through the authenticated list rather than /releases/tags/, which never
+# returns drafts. That matters here specifically: GitHub demotes a published
+# release to a draft when its tag is deleted, which is the state every mirror
+# run left behind, so the by-tag lookup reports "absent" while orphaned drafts
+# sit there holding 86 MB each. Reuse the newest and delete the rest, or they
+# accumulate one per release forever.
+echo "==> Looking for the $TAG release (drafts included)"
+all_releases="$(gh "$API/releases?per_page=100")"
+mapfile -t existing < <(printf '%s' "$all_releases" | python3 -c '
+import sys, json
+tag = sys.argv[1]
+rs = [r for r in json.load(sys.stdin) if r.get("tag_name") == tag]
+rs.sort(key=lambda r: r.get("created_at",""), reverse=True)
+for r in rs:
+    print(r["id"])
+' "$TAG")
+
+release_id="${existing[0]:-}"
+
+for stale in "${existing[@]:1}"; do
+  echo "    deleting orphaned duplicate release $stale"
+  gh -X DELETE "$API/releases/$stale" >/dev/null || true
+done
+
+if [ -n "$release_id" ]; then
+  # A draft has no tag and serves no download URL, so it has to be republished.
+  echo "    reusing release $release_id"
+  gh -X PATCH "$API/releases/$release_id" \
+    -d "{\"tag_name\": \"$TAG\", \"draft\": false}" >/dev/null
+  release="$(gh "$API/releases/$release_id")"
+fi
 
 if [ -z "$release_id" ]; then
   echo "==> Creating it"
@@ -107,9 +147,12 @@ for a in json.load(sys.stdin).get("assets", []):
   gh -X DELETE "$API/releases/assets/$asset_id" >/dev/null || true
 done
 
+# --retry/--max-time/--http1.1 for the reason the Gitea upload steps in this
+# repo carry them: real mid-stream failures on large assets (curl 92 and 28).
 for asset in "${ASSETS[@]}"; do
   echo "==> Uploading $asset ($(du -h "$asset" | cut -f1))"
-  curl -sf -X POST \
+  curl -sf --http1.1 --retry 5 --retry-all-errors --retry-delay 5 --max-time 900 \
+    -X POST \
     -H "Authorization: Bearer $GH_PAT" \
     -H "Content-Type: application/octet-stream" \
     --data-binary "@$asset" \
@@ -119,12 +162,22 @@ done
 # The updater is only as good as this URL, and a silent failure here means
 # every installed copy quietly stops updating. Confirm both are actually
 # fetchable at the address the AppImage was built to check.
+# Size as well as status: a 200 only proves something is served at the
+# address, not that it is this build. GitHub accepting a truncated upload
+# would pass a status-only check and then fail every client's checksum.
 echo "==> Verifying the published URLs"
 for asset in "${ASSETS[@]}"; do
   url="https://github.com/$REPO/releases/download/$TAG/$asset"
-  code="$(curl -s -o /dev/null -w '%{http_code}' -L "$url")"
-  [ "$code" = "200" ] || { echo "FAILED: $url returned $code" >&2; exit 1; }
-  echo "    $code  $url"
+  local_size="$(stat -c %s "$asset")"
+
+  headers="$(curl -sIL "$url" | tr -d '\r')"
+  code="$(printf '%s\n' "$headers" | awk '/^HTTP\//{c=$2} END{print c}')"
+  served="$(printf '%s\n' "$headers" | awk 'tolower($1)=="content-length:"{n=$2} END{print n}')"
+
+  [ "$code" = "200" ] || { echo "FAILED: $url returned ${code:-no status}" >&2; exit 1; }
+  [ "$served" = "$local_size" ] \
+    || { echo "FAILED: $url serves ${served:-unknown} bytes, built $local_size." >&2; exit 1; }
+  echo "    $code  $served bytes  $url"
 done
 
 echo "OK: $TAG updated, and anchored in Gitea so the mirror preserves it."
