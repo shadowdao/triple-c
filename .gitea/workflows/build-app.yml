@@ -200,8 +200,10 @@ jobs:
       - name: Collect artifacts
         run: |
           mkdir -p artifacts
+          # The versioned AppImage only. The update channel's copy lives in
+          # bundle/appimage/update-channel/ precisely so this glob cannot pick
+          # it up and publish an 80 MB duplicate under a second name.
           cp app/src-tauri/target/release/bundle/appimage/*.AppImage artifacts/ 2>/dev/null || true
-          cp app/src-tauri/target/release/bundle/appimage/*.zsync artifacts/ 2>/dev/null || true
           ls -la artifacts/
 
       - name: Upload to Gitea release
@@ -286,7 +288,11 @@ jobs:
         if: gitea.event_name == 'push'
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
-        run: bash scripts/publish-update-channel.sh artifacts
+          GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          GITEA_SHA: ${{ gitea.sha }}
+        run: |
+          bash scripts/publish-update-channel.sh \
+            app/src-tauri/target/release/bundle/appimage/update-channel
 
   build-macos:
     runs-on: macos-latest

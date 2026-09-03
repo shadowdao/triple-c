@@ -91,6 +91,11 @@ HOOK="apprun-hooks/triple-c-wayland-fallback.sh"
 APPIMAGE_TOOL_URL="https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
 
 APP_ID="com.triple-c.desktop"
+# The channel pair lives in its own directory. Left beside the versioned image
+# they are picked up by the release job's `*.AppImage` glob, and every release
+# then carries an eighty-megabyte byte-identical duplicate under a second name
+# — which is exactly as confusing on a downloads page as it sounds.
+CHANNEL_DIR="update-channel"
 STABLE_NAME="Triple-C_x86_64.AppImage"
 UPDATE_TAG="linux-latest"
 UPDATE_INFO="zsync|https://github.com/shadowdao/triple-c/releases/download/${UPDATE_TAG}/${STABLE_NAME}.zsync"
@@ -211,13 +216,18 @@ chmod +x "$tool"
 
 # --appimage-extract-and-run: CI runners generally have no FUSE.
 # -u embeds the update string and writes "$STABLE_NAME.zsync" beside the image.
+mkdir -p "$CHANNEL_DIR"
 ARCH=x86_64 "$tool" --appimage-extract-and-run \
-  -u "$UPDATE_INFO" "$root" "$STABLE_NAME" >/dev/null
-chmod +x "$STABLE_NAME"
+  -u "$UPDATE_INFO" "$root" "$CHANNEL_DIR/$STABLE_NAME" >/dev/null
+chmod +x "$CHANNEL_DIR/$STABLE_NAME"
 
 # The versioned name is what the per-version release publishes; the stable one
-# and its .zsync go to the rolling tag. Same bytes, two names.
-cp "$STABLE_NAME" "$appimage"
+# and its .zsync go to the rolling tag. Same bytes, two names, two places.
+# zsyncmake writes the .zsync into the working directory, not beside the image
+# it describes, so it has to be collected rather than assumed in place.
+[ -e "$STABLE_NAME.zsync" ] && mv "$STABLE_NAME.zsync" "$CHANNEL_DIR/"
+
+cp "$CHANNEL_DIR/$STABLE_NAME" "$appimage"
 chmod +x "$appimage"
 
 # The guards are the test. Each one is a way the repack could look like it
@@ -245,13 +255,18 @@ grep -q "^Categories=.\+" "$out"/*.desktop || fail "Categories is still empty."
 # the URL it fetched the .zsync from. That is exactly why the output is named
 # for the fixed tag: a versioned name here resolves to the build the client
 # already has.
-[ -e "$STABLE_NAME" ] || fail "the stable-named image is missing."
-[ -e "$STABLE_NAME.zsync" ] || fail "appimagetool wrote no $STABLE_NAME.zsync."
+[ -e "$CHANNEL_DIR/$STABLE_NAME" ] || fail "the stable-named image is missing."
+[ -e "$CHANNEL_DIR/$STABLE_NAME.zsync" ] || fail "appimagetool wrote no .zsync."
 
-readelf -p .upd_info "$STABLE_NAME" 2>/dev/null | grep -q "$UPDATE_TAG" \
+readelf -p .upd_info "$CHANNEL_DIR/$STABLE_NAME" 2>/dev/null | grep -q "$UPDATE_TAG" \
   || fail "the image carries no update information for the $UPDATE_TAG tag."
-grep -aq "^Filename: $STABLE_NAME$" "$STABLE_NAME.zsync" \
+grep -aq "^Filename: $STABLE_NAME$" "$CHANNEL_DIR/$STABLE_NAME.zsync" \
   || fail "the .zsync names something other than $STABLE_NAME."
 
-echo "OK: $appimage prefers the host $LIB (fallback kept), carries AppStream"
-echo "    metadata, and updates from the $UPDATE_TAG tag via $STABLE_NAME.zsync."
+# The versioned release must carry one AppImage, not two. This is the guard
+# for the duplicate that shipped in 0.4.20 and 0.4.21.
+count="$(ls -1 *.AppImage 2>/dev/null | wc -l)"
+[ "$count" = "1" ] || fail "expected 1 AppImage beside the release, found $count."
+
+echo "OK: $appimage prefers the host $LIB (fallback kept) and carries AppStream"
+echo "    metadata. Channel pair in $CHANNEL_DIR/, updating from the $UPDATE_TAG tag."

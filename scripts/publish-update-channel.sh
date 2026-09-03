@@ -17,7 +17,22 @@
 # It writes to GitHub rather than Gitea because that mirror is where updates
 # are pulled from. Needs GH_PAT with contents write on the mirror.
 #
-# Usage: GH_PAT=... publish-update-channel.sh <directory holding the artifacts>
+# **The tag has to exist in Gitea, not just on GitHub, and that is the whole
+# reason this script touches Gitea at all.** Gitea push-mirrors this repo to
+# GitHub, and a mirror push deletes remote refs that have no local counterpart.
+# A tag created only by GitHub's release API therefore survives until the next
+# mirror run and then vanishes — which is exactly what happened to 0.4.20 and
+# 0.4.21: the release was created and both URLs verified 200 at 00:38, and the
+# 13:04 mirror deleted the tag, leaving every installed copy checking a 404.
+# Versioned tags never had this problem because `create-tag` creates them in
+# Gitea first. So does this one, now, and before the GitHub release rather than
+# after, so there is no window where the two disagree.
+#
+# Note what this means for verification: publishing correctly is not evidence
+# the channel still works hours later. The Gitea tag is what makes it durable,
+# so its absence is treated as a failure rather than a warning.
+#
+# Usage: GH_PAT=... GITEA_TOKEN=... GITEA_SHA=... publish-update-channel.sh <dir>
 
 set -euo pipefail
 
@@ -26,7 +41,12 @@ TAG="linux-latest"
 API="https://api.github.com/repos/$REPO"
 ASSETS=("Triple-C_x86_64.AppImage" "Triple-C_x86_64.AppImage.zsync")
 
+GITEA_API="${GITEA_API:-https://repo.anhonesthost.net/api/v1}"
+GITEA_REPO="${GITEA_REPO:-CyberCoveLLC/Triple-C}"
+
 : "${GH_PAT:?GH_PAT is required to publish the update channel}"
+: "${GITEA_TOKEN:?GITEA_TOKEN is required to anchor the $TAG tag against the mirror}"
+: "${GITEA_SHA:?GITEA_SHA is required to point the $TAG tag at this build}"
 dir="${1:?usage: publish-update-channel.sh <artifacts directory>}"
 cd "$dir"
 
@@ -35,6 +55,21 @@ for asset in "${ASSETS[@]}"; do
 done
 
 gh() { curl -sf -H "Authorization: Bearer $GH_PAT" -H "Accept: application/vnd.github+json" "$@"; }
+tea() { curl -sf -H "Authorization: token $GITEA_TOKEN" -H "Content-Type: application/json" "$@"; }
+
+# Anchor the tag in Gitea first — see the header. Moved rather than left
+# alone: it has to name this build, and the mirror will carry whatever Gitea
+# holds over the top of GitHub's copy.
+echo "==> Anchoring the $TAG tag in Gitea at ${GITEA_SHA:0:9}"
+tea -X DELETE "$GITEA_API/repos/$GITEA_REPO/tags/$TAG" >/dev/null 2>&1 || true
+tea -X POST "$GITEA_API/repos/$GITEA_REPO/tags" \
+  -d "{\"tag_name\": \"$TAG\", \"target\": \"$GITEA_SHA\", \"message\": \"Rolling Linux update channel\"}" \
+  >/dev/null
+
+# Not best-effort. Without this tag the mirror removes GitHub's and the
+# channel dies silently somewhere between now and four hours from now.
+tea "$GITEA_API/repos/$GITEA_REPO/tags/$TAG" >/dev/null 2>&1 \
+  || { echo "FAILED: the $TAG tag does not exist in Gitea; the mirror would delete GitHub's copy." >&2; exit 1; }
 
 echo "==> Looking for the $TAG release"
 release="$(gh "$API/releases/tags/$TAG" 2>/dev/null || true)"
@@ -92,4 +127,4 @@ for asset in "${ASSETS[@]}"; do
   echo "    $code  $url"
 done
 
-echo "OK: $TAG updated."
+echo "OK: $TAG updated, and anchored in Gitea so the mirror preserves it."
