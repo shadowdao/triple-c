@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 #
-# Drop the bundled libwayland-client.so.0 out of a built AppImage.
+# Post-process a built AppImage: make it start on modern Mesa, and make it
+# adoptable and updatable by an AppImage manager.
+#
+# Tauri hands off to linuxdeploy, which offers no hook between building the
+# AppDir and packing it, so both jobs are done by unpacking the finished image
+# and repacking it. That is also why the update information is embedded here
+# rather than passed to the bundler.
+#
+# ---------------------------------------------------------------------------
+# 1. The bundled Wayland client
+# ---------------------------------------------------------------------------
 #
 # linuxdeploy-plugin-gtk bundles libwayland-client.so.0 as a dependency of
 # GTK, and `AppRun.wrapped` puts the bundled lib directory ahead of the host's
@@ -44,7 +54,34 @@
 # LD_LIBRARY_PATH after its own AppDir entries, so anything the hook exports
 # lands last: a fallback, never an override.
 #
-# Usage: unbundle-wayland-client.sh <directory holding the .AppImage>
+# ---------------------------------------------------------------------------
+# 2. Metadata an AppImage manager needs
+# ---------------------------------------------------------------------------
+#
+# Two things, neither of which the bundler produces:
+#
+#   * AppStream metadata, so a manager can show what the app is rather than a
+#     bare filename. appimagetool warns about its absence on every build.
+#   * Update information embedded in the image — the string that tells a
+#     manager where to look for a newer build. Without it the app can be
+#     adopted but never updated, which is the whole point.
+#
+# The update URL is a **fixed** tag on the GitHub mirror, which is where
+# updates are pulled from, rather than `releases/latest`. `latest` follows
+# whatever release is newest, and the Gitea-to-GitHub backfill creates one
+# GitHub release per Gitea tag — including the `-win` and `-mac` tags, which
+# carry no AppImage. A fixed tag cannot be pointed at a release that has none,
+# and is equally immune to a release marked prerelease.
+#
+# The output is named for the fixed tag too. zsync records the filename it was
+# generated for and a client resolves it relative to the .zsync URL, so a
+# versioned name would send every client looking for the version it already
+# has. The versioned copy is written afterwards for the normal release.
+#
+# It also fills in `Categories=`, which linuxdeploy leaves empty — that is what
+# a desktop menu and most managers use to file the application.
+#
+# Usage: finalize-appimage.sh <directory holding the .AppImage>
 
 set -euo pipefail
 
@@ -52,6 +89,15 @@ LIB="libwayland-client.so.0"
 FALLBACK_DIR="usr/lib/wayland-fallback"
 HOOK="apprun-hooks/triple-c-wayland-fallback.sh"
 APPIMAGE_TOOL_URL="https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
+
+APP_ID="com.triple-c.desktop"
+STABLE_NAME="Triple-C_x86_64.AppImage"
+UPDATE_TAG="linux-latest"
+UPDATE_INFO="zsync|https://github.com/shadowdao/triple-c/releases/download/${UPDATE_TAG}/${STABLE_NAME}.zsync"
+CATEGORIES="Development;Utility;"
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+appdata_src="$repo_root/packaging/appimage/$APP_ID.appdata.xml"
 
 dir="${1:?usage: unbundle-wayland-client.sh <bundle/appimage directory>}"
 cd "$dir"
@@ -133,6 +179,30 @@ open(path, "w").write(src)
 PATCH_EOF
 fi
 
+# --- metadata -------------------------------------------------------------
+
+# Version comes from the artifact rather than a second source that could drift.
+version="$(printf '%s' "$appimage" | sed -n 's/.*_\([0-9][0-9.]*\)_.*/\1/p')"
+[ -n "$version" ] || { echo "Could not read a version out of $appimage" >&2; exit 1; }
+
+if [ -f "$appdata_src" ]; then
+  mkdir -p "$root/usr/share/metainfo"
+  sed -e "s/@VERSION@/$version/" -e "s/@DATE@/$(date -u +%Y-%m-%d)/" \
+    "$appdata_src" > "$root/usr/share/metainfo/$APP_ID.appdata.xml"
+  echo "Added AppStream metadata for $version."
+else
+  echo "No AppStream source at $appdata_src — skipping." >&2
+fi
+
+# linuxdeploy emits `Categories=` empty, which files the app nowhere.
+for desktop in "$root"/*.desktop; do
+  [ -e "$desktop" ] || continue
+  if grep -q "^Categories=$" "$desktop"; then
+    sed -i "s/^Categories=$/Categories=$CATEGORIES/" "$desktop"
+    echo "Filled in Categories for $(basename "$desktop")."
+  fi
+done
+
 echo "Demoted $LIB to $FALLBACK_DIR; repacking."
 
 tool="$work/appimagetool"
@@ -140,7 +210,14 @@ curl -fsSL -o "$tool" "$APPIMAGE_TOOL_URL"
 chmod +x "$tool"
 
 # --appimage-extract-and-run: CI runners generally have no FUSE.
-ARCH=x86_64 "$tool" --appimage-extract-and-run "$root" "$appimage" >/dev/null
+# -u embeds the update string and writes "$STABLE_NAME.zsync" beside the image.
+ARCH=x86_64 "$tool" --appimage-extract-and-run \
+  -u "$UPDATE_INFO" "$root" "$STABLE_NAME" >/dev/null
+chmod +x "$STABLE_NAME"
+
+# The versioned name is what the per-version release publishes; the stable one
+# and its .zsync go to the rolling tag. Same bytes, two names.
+cp "$STABLE_NAME" "$appimage"
 chmod +x "$appimage"
 
 # The guards are the test. Each one is a way the repack could look like it
@@ -156,4 +233,25 @@ fail() { echo "FAILED: $1" >&2; exit 1; }
 grep -q "triple-c-wayland-fallback" "$out/AppRun" || fail "AppRun does not source the hook."
 [ -x "$out/usr/bin/triple-c" ] || fail "no executable usr/bin/triple-c."
 
-echo "OK: $appimage now prefers the host $LIB, with a bundled fallback."
+# An empty Categories or missing metadata ships an image a manager cannot file
+# or describe, and both fail silently at runtime rather than at build time.
+grep -q "^Categories=.\+" "$out"/*.desktop || fail "Categories is still empty."
+[ -f "$appdata_src" ] && { [ -e "$out/usr/share/metainfo/$APP_ID.appdata.xml" ] \
+  || fail "AppStream metadata did not make it into the image."; }
+
+# The update string is the difference between adoptable and updatable. It
+# lives in the image's own `.upd_info` ELF section, not in the .zsync — the
+# .zsync only records a *relative* filename, which a client resolves against
+# the URL it fetched the .zsync from. That is exactly why the output is named
+# for the fixed tag: a versioned name here resolves to the build the client
+# already has.
+[ -e "$STABLE_NAME" ] || fail "the stable-named image is missing."
+[ -e "$STABLE_NAME.zsync" ] || fail "appimagetool wrote no $STABLE_NAME.zsync."
+
+readelf -p .upd_info "$STABLE_NAME" 2>/dev/null | grep -q "$UPDATE_TAG" \
+  || fail "the image carries no update information for the $UPDATE_TAG tag."
+grep -aq "^Filename: $STABLE_NAME$" "$STABLE_NAME.zsync" \
+  || fail "the .zsync names something other than $STABLE_NAME."
+
+echo "OK: $appimage prefers the host $LIB (fallback kept), carries AppStream"
+echo "    metadata, and updates from the $UPDATE_TAG tag via $STABLE_NAME.zsync."

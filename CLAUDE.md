@@ -679,8 +679,26 @@ deliberately out of scope — this is not a project backup.
 
 ## Packaging
 
-Linux ships as `.deb`, `.rpm` and AppImage, all three built by `build-app.yml` (releases) and
-`build-app-preview.yml` (the PR check). **There is deliberately no Arch package.** A
+Linux ships as **AppImage only**, built by `build-app.yml` (releases) and
+`build-app-preview.yml` (the PR check). The `.deb` and `.rpm` were dropped: two more artifacts to
+build and publish for an audience the AppImage already serves, and neither could self-update. The
+Linux job passes `--bundles appimage`; `tauri.conf.json` still says `"targets": "all"` so macOS and
+Windows are untouched.
+
+`scripts/finalize-appimage.sh` post-processes every AppImage, and both things it does are
+load-bearing. **It demotes the bundled `libwayland-client.so.0`** off the loader path, keeping it as
+a fallback for a host that has none: `libEGL_mesa.so.0` has a hard `DT_NEEDED` on that library, so a
+bundled copy older than the host's Mesa stops the EGL driver loading at all and the window comes up
+blank — measured on wayland 1.26 / Mesa 26.2.1 against a 22.04-built image. Do not "fix" this by
+bundling a newer wayland: the floor is set by the user's Mesa, which moves independently of our
+releases, so this is a host-coupled library like libGL and libdrm. **It also embeds AppStream
+metadata and update information**, without which an AppImage manager can adopt the app but never
+update it. The update URL points at a fixed `linux-latest` tag on the GitHub mirror
+(`scripts/publish-update-channel.sh`), never `releases/latest` — that follows whichever release is
+newest, and the backfill creates a GitHub release per Gitea tag including the `-win` and `-mac` ones
+that carry no AppImage. The script's post-repack assertions are the only test any of this has.
+
+**There is deliberately no Arch package.** A
 `triple-c-bin` `PKGBUILD` and a `publish-arch-package.yml` existed and were removed; they live on
 `hold/arch-packaging`. Do not re-add them without the piece that was always missing: the package
 was never on the AUR, so it was a manual `pacman -U` of a downloaded file — the same gesture as
