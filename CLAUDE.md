@@ -413,6 +413,26 @@ container is created once by a very long function where a dropped capability is 
   existing toggle: the label fingerprints *the setting*, not the set of things the setting drives,
   so a project already at `true` gets no recreation at all on upgrade.
 
+### Keeping Claude Code current
+
+`claude update` runs in **two** places, and both are needed:
+
+- `container/entrypoint.sh` runs it once per container start, before any session exists.
+- `commands/terminal_commands.rs` (and its twin in `web_terminal/ws_handler.rs`) prepend it to the
+  command every Claude session launches with, because containers use a stop/start model and a
+  long-lived one would otherwise never re-check.
+
+Both are `timeout`-bounded and `|| echo`'d, so an offline or slow network delays a tab rather than
+failing it, and **both take the same `flock` on `/tmp/.triple-c-claude-update.lock`**. That lock is
+not tidiness: the entrypoint prints "container ready" only after its own update finishes, so
+starting a project and immediately opening a tab — or opening two tabs at once — otherwise runs two
+updaters against the same `~/.claude/bin`, and `|| echo` would hide a half-written install behind a
+friendly message one line before `exec claude` ran it. `-E 0` makes losing the race a success,
+because the holder just did the work. The per-session copy is what forced the non-Bedrock path from a bare `["claude", ...]`
+argv into a `bash -c` wrapper — the flags and the session name are interpolated into a shell
+string now, so **anything added there must go through `shell_quote_arg`**. Bash sessions are
+deliberately untouched.
+
 ### Container Lifecycle
 
 Containers use a **stop/start** model (not create/destroy). Installed packages persist across stops. The `.claude` config dir uses a named Docker volume (`triple-c-claude-config-{projectId}`), nested inside the home volume (`triple-c-home-{projectId}`), so OAuth tokens and Claude Code config survive container stop/start *and* container recreation.

@@ -3,6 +3,7 @@ import { render, fireEvent, cleanup, act } from "@testing-library/react";
 import TerminalView, { supersedes } from "./TerminalView";
 import { useAppState } from "../../store/appState";
 import { uploadHostFileToTerminal } from "../../lib/tauri-commands";
+import { URL_TOAST_SELECTOR } from "./UrlToast";
 
 /**
  * The window-wide native drag-drop listener, captured at registration.
@@ -370,15 +371,34 @@ describe("TerminalView — where a dropped file lands", () => {
     expect(vi.mocked(uploadHostFileToTerminal)).toHaveBeenCalledTimes(1);
   });
 
-  it("uploads a file dropped onto the always-present Following toggle", async () => {
-    // The regression this file could not see. The toggle is `absolute top-2
-    // right-4 z-50` and is rendered unconditionally, so `elementFromPoint`
-    // returns *it* for the terminal's top-right corner — and a gate asking
+  it("uploads a file dropped onto the chrome painted over the terminal", async () => {
+    // The regression this file could not see. Chrome like the URL toast is a
+    // *sibling* of the xterm host painted over the pane, so
+    // `elementFromPoint` returns it rather than the host — and a gate asking
     // "is what is painted here inside the xterm host?" answered no, forever,
     // with no message and no log line. jsdom never ran that branch.
-    const view = await mountWithLayout();
-    const toggle = view.getByTitle(/Auto-scroll/i);
-    stubElementFromPoint(toggle);
+    //
+    // The original fixture was the always-rendered "▼ Following" toggle. That
+    // control is retired and the mouse-release button that could have replaced
+    // it lives in the status bar now, so the toast is what stands in — it is
+    // real chrome over the pane, which is the only property under test.
+    await mountWithLayout();
+    const emit = ptyOutput.listeners.get("terminal-output-s1");
+    if (!emit) throw new Error("no terminal-output listener registered");
+    await act(async () => {
+      emit({
+        payload: Array.from(
+          new TextEncoder().encode(
+            `\x1b]7777;open;${btoa("https://example.com/x")}\x07`,
+          ),
+        ),
+      });
+      await new Promise((r) => setTimeout(r, 0));
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    const toast = document.querySelector(URL_TOAST_SELECTOR);
+    if (!toast) throw new Error("URL toast not shown");
+    stubElementFromPoint(toast);
 
     await drop(780, 10);
 
@@ -592,5 +612,90 @@ describe("TerminalView — focus on request", () => {
       useAppState.getState().requestTerminalFocus("s1");
     });
     expect(document.activeElement).toBe(helperTextarea(view.container));
+  });
+});
+describe("TerminalView — releasing a captured mouse", () => {
+  /** Feed raw bytes to the terminal as if the container had printed them, and
+   *  let xterm drain its write queue (it parses asynchronously). */
+  async function emitBytes(text: string) {
+    const emit = ptyOutput.listeners.get("terminal-output-s1");
+    if (!emit) throw new Error("no terminal-output listener registered");
+    await act(async () => {
+      emit({ payload: Array.from(new TextEncoder().encode(text)) });
+      await new Promise((r) => setTimeout(r, 0));
+      await new Promise((r) => setTimeout(r, 0));
+    });
+  }
+
+  /** What the status bar would render from: the active terminal publishes the
+   *  capture state, and the release action, into the store. The control itself
+   *  lives in `StatusBar` — deliberately, so it never sits on top of the TUI
+   *  that is asking for the mouse. */
+  function captured(): boolean {
+    return useAppState.getState().terminalMouseCaptured;
+  }
+
+  it("shows nothing while the container has not grabbed the mouse", async () => {
+    mountSession("claude");
+    await act(async () => {});
+
+    expect(captured()).toBe(false);
+  });
+
+  it("surfaces a release control once the container turns mouse tracking on", async () => {
+    // `?1003h` is any-event tracking: every mouse *move* over the terminal is
+    // reported to the app. When the TUI that asked for it dies without
+    // resetting the mode, xterm keeps routing moves to the PTY and drops text
+    // selection — the freeze this control exists to break out of.
+    mountSession("claude");
+    await act(async () => {});
+
+    await emitBytes("\x1b[?1003h\x1b[?1006h");
+
+    expect(captured()).toBe(true);
+  });
+
+  it("clears the mode locally, without sending a byte to the container", async () => {
+    // The reset is written into xterm's own parser, not onto the wire. The
+    // program inside is usually gone; if it is not, it must not be told the
+    // user pulled the mouse back, or a live TUI would just re-grab it.
+    mountSession("claude");
+    await act(async () => {});
+    await emitBytes("\x1b[?1003h");
+    terminalInput.mockClear();
+
+    // Exactly what the status-bar button's onClick does.
+    const release = useAppState.getState().releaseActiveMouse;
+    await act(async () => {
+      release();
+      await new Promise((r) => setTimeout(r, 0));
+      await new Promise((r) => setTimeout(r, 0));
+    });
+
+    // The published flag is bound to the live mode, so it going false *is* the
+    // assertion that xterm's mouse tracking is back to "none".
+    expect(captured()).toBe(false);
+    expect(terminalInput).not.toHaveBeenCalled();
+  });
+
+  it("releases on Ctrl+Shift+X, for when the pointer itself is unusable", async () => {
+    const { container } = mountSession("claude");
+    await act(async () => {});
+    await emitBytes("\x1b[?1002h");
+    terminalInput.mockClear();
+
+    await act(async () => {
+      fireEvent.keyDown(helperTextarea(container), {
+        key: "X",
+        ctrlKey: true,
+        shiftKey: true,
+      });
+      await new Promise((r) => setTimeout(r, 0));
+      await new Promise((r) => setTimeout(r, 0));
+    });
+
+    expect(captured()).toBe(false);
+    // The chord must not also reach the container as input.
+    expect(terminalInput).not.toHaveBeenCalled();
   });
 });

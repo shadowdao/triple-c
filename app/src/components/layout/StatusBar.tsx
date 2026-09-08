@@ -10,7 +10,7 @@ interface Props {
 export default function StatusBar({ stt }: Props) {
   const {
     projects, sessions, terminalHasSelection, activeSessionId, sttEnabled,
-    terminalAtBottom, scrollActiveToBottom, notesDockOpen, toggleNotesDock,
+    notesDockOpen, toggleNotesDock, terminalMouseCaptured, releaseActiveMouse,
   } = useAppState(
     useShallow(s => ({
       projects: s.projects,
@@ -18,10 +18,10 @@ export default function StatusBar({ stt }: Props) {
       terminalHasSelection: s.terminalHasSelection,
       activeSessionId: s.activeSessionId,
       sttEnabled: s.appSettings?.stt?.enabled,
-      terminalAtBottom: s.terminalAtBottom,
-      scrollActiveToBottom: s.scrollActiveToBottom,
       notesDockOpen: s.notesDockOpen,
       toggleNotesDock: s.toggleNotesDock,
+      terminalMouseCaptured: s.terminalMouseCaptured,
+      releaseActiveMouse: s.releaseActiveMouse,
     }))
   );
   const running = projects.filter((p) => p.status === "running").length;
@@ -60,15 +60,16 @@ export default function StatusBar({ stt }: Props) {
           </span>
         </>
       )}
-      {/* Right-aligned controls: Jump to Current + STT mic */}
+      {/* Right-aligned controls: mouse release + Notes + STT mic */}
       <div className="ml-auto flex items-center gap-3 pl-2">
-        {activeSessionId && !terminalAtBottom && (
+        {activeSessionId && terminalMouseCaptured && (
           <button
-            onClick={() => scrollActiveToBottom()}
+            data-mouse-release="true"
+            onClick={() => releaseActiveMouse()}
             className="text-[var(--accent)] hover:text-[var(--accent-hover)] cursor-pointer"
-            title="Scroll the terminal to the latest output"
+            title="A program in the container is reading the mouse, so clicks and drags go to it instead of selecting text. Click, or press Ctrl+Shift+X, to take it back. To select text without taking it back, hold Shift while dragging (Option on macOS)."
           >
-            Jump to Current ↓
+            🖱 Mouse captured — release
           </button>
         )}
         <button

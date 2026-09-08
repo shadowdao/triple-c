@@ -58,7 +58,7 @@ choice it never asked about.
 
 Also covered: per-project auth backends (Anthropic OAuth, Bedrock incl. SSO refresh,
 Ollama, OpenAI-compatible), user-level `CLAUDE.md` composition, `claude update` on every
-container start, terminal ergonomics (OAuth URL detection, OSC 52 clipboard, image paste,
+container start *and* before every Claude session launches, terminal ergonomics (OAuth URL detection, OSC 52 clipboard, image paste,
 file drag-drop, STT), the web terminal, and workspace backup.
 
 ---

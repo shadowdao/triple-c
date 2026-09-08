@@ -6,10 +6,58 @@ use crate::AppState;
 
 /// Build the command to run in the container terminal.
 ///
-/// For Bedrock Profile projects, wraps `claude` in a bash script that validates
-/// the AWS session first. If the SSO session is expired, runs `aws sso login`
-/// so the user can re-authenticate (the URL is clickable via xterm.js WebLinksAddon).
+/// Always a `bash -c` script, because every session runs [`UPDATE_PRELUDE`]
+/// before `exec claude`. For Bedrock Profile projects the script additionally
+/// validates the AWS session first, and runs `aws sso login` if it has expired
+/// so the user can re-authenticate (the URL is clickable via xterm.js
+/// WebLinksAddon).
 fn build_terminal_cmd(project: &Project, state: &AppState, session_name: Option<&str>) -> Vec<String> {
+    let settings = state.settings_store.get();
+    build_claude_terminal_cmd(
+        project,
+        settings.global_aws.aws_profile.as_deref(),
+        session_name,
+    )
+}
+
+/// Shell line run immediately before `exec claude` in every Claude terminal
+/// session.
+///
+/// `container/entrypoint.sh` already runs `claude update` when the container
+/// starts, but containers here use a stop/start (and often just keep running)
+/// model, so a long-lived container's CLI goes stale between restarts. Running
+/// it per session is what keeps a week-old container current.
+///
+/// Deliberately non-fatal and time-bounded: `|| echo` swallows a failure (no
+/// network, npm registry down) so a session always opens, and `timeout 60`
+/// bounds how long a user waits for a terminal.
+///
+/// **`flock` is load-bearing, not tidiness.** Nothing serialises this against
+/// the entrypoint's own `claude update`, and the entrypoint prints "container
+/// ready" only *after* its copy finishes — so "start the project, open a tab"
+/// races two updaters against the same `~/.claude/bin` install, as does
+/// opening two tabs at once. `|| echo` would then hide a half-written install
+/// behind a friendly message and the very next line (`exec claude`) would run
+/// it. `-w 90` gives the entrypoint's `timeout 120` copy room to finish rather
+/// than failing the wait, and `-E 0` makes losing the race a success: the
+/// other holder just updated, so there is nothing left to do.
+pub(crate) const UPDATE_PRELUDE: &str = concat!(
+    "flock -w 90 -E 0 /tmp/.triple-c-claude-update.lock ",
+    r#"timeout 60 claude update 2>&1 || echo "(update skipped — continuing)""#,
+);
+
+/// Single-quote one argument for interpolation into a shell script string.
+fn shell_quote_arg(arg: &str) -> String {
+    format!(" '{}'", arg.replace('\'', "'\\''"))
+}
+
+/// The testable core of [`build_terminal_cmd`], taking the resolved global AWS
+/// profile rather than the whole [`AppState`].
+fn build_claude_terminal_cmd(
+    project: &Project,
+    global_aws_profile: Option<&str>,
+    session_name: Option<&str>,
+) -> Vec<String> {
     let is_bedrock_profile = project.backend == Backend::Bedrock
         && project
             .bedrock_config
@@ -19,36 +67,27 @@ fn build_terminal_cmd(project: &Project, state: &AppState, session_name: Option<
 
     let permission_args = project.effective_permission_mode().cli_args();
 
+    // The args are interpolated into a shell script string, so single-quote
+    // each one.
+    let name_flag = session_name
+        .filter(|n| !n.is_empty())
+        .map(|n| format!(" -n{}", shell_quote_arg(n)))
+        .unwrap_or_default();
+    let permission_flags: String = permission_args.iter().map(|a| shell_quote_arg(a)).collect();
+    let claude_cmd = format!("exec claude{}{}", permission_flags, name_flag);
+
     if !is_bedrock_profile {
-        let mut cmd = vec!["claude".to_string()];
-        cmd.extend(permission_args);
-        if let Some(name) = session_name {
-            if !name.is_empty() {
-                cmd.push("-n".to_string());
-                cmd.push(name.to_string());
-            }
-        }
-        return cmd;
+        return vec![
+            "bash".to_string(),
+            "-c".to_string(),
+            format!("{}\n{}\n", UPDATE_PRELUDE, claude_cmd),
+        ];
     }
 
-    let profile = aws_commands::resolve_profile_for_project(
-        project,
-        state.settings_store.get().global_aws.aws_profile.as_deref(),
-    );
+    let profile = aws_commands::resolve_profile_for_project(project, global_aws_profile);
 
     // Build a bash wrapper that validates credentials, re-auths if needed,
     // then exec's into claude.
-    let name_flag = session_name
-        .filter(|n| !n.is_empty())
-        .map(|n| format!(" -n '{}'", n.replace('\'', "'\\''")))
-        .unwrap_or_default();
-    // The args are interpolated into a shell script string, so single-quote
-    // each one (same escaping style as name_flag above).
-    let permission_flags: String = permission_args
-        .iter()
-        .map(|a| format!(" '{}'", a.replace('\'', "'\\''")))
-        .collect();
-    let claude_cmd = format!("exec claude{}{}", permission_flags, name_flag);
 
     let script = format!(
         r#"
@@ -75,9 +114,11 @@ else
         echo ""
     fi
 fi
+{update_prelude}
 {claude_cmd}
 "#,
         profile = profile,
+        update_prelude = UPDATE_PRELUDE,
         claude_cmd = claude_cmd
     );
 
@@ -325,6 +366,9 @@ pub async fn stop_audio_bridge(
 
 #[cfg(test)]
 mod tests {
+    use super::{build_claude_terminal_cmd, UPDATE_PRELUDE};
+    use crate::models::Project;
+
     /// A dropped file must be named the way the *user* named it.
     ///
     /// The bug this pins: `upload_host_file_to_terminal` derived the tar entry
@@ -338,6 +382,122 @@ mod tests {
     /// answer comes from the spelling, and a path that does not name a file is
     /// refused rather than silently substituted (it used to fall back to
     /// `"dropped-file"`).
+    /// A `Project` with only the fields these tests care about set; the rest
+    /// come through serde so the test does not have to track every field.
+    fn project(backend: &str, bedrock_config: serde_json::Value) -> Project {
+        serde_json::from_value(serde_json::json!({
+            "id": "p1",
+            "name": "Test",
+            "paths": [],
+            "container_id": null,
+            "status": "running",
+            "backend": backend,
+            "bedrock_config": bedrock_config,
+            "ollama_config": null,
+            "openai_compatible_config": null,
+            "allow_docker_access": false,
+            "full_permissions": false,
+            "ssh_key_path": null,
+            "git_user_name": null,
+            "git_user_email": null,
+            "created_at": "now",
+            "updated_at": "now"
+        }))
+        .expect("test project deserializes")
+    }
+
+    /// Every Claude session updates the CLI before launching it.
+    ///
+    /// `container/entrypoint.sh` only updates at container *start*, and these
+    /// containers are long-lived, so a stale CLI is the normal case without
+    /// this. The plain (non-Bedrock) path therefore has to be a `bash -c`
+    /// wrapper rather than a bare `claude` argv.
+    #[test]
+    fn build_terminal_cmd_updates_before_launching_claude() {
+        let cmd = build_claude_terminal_cmd(&project("anthropic", serde_json::Value::Null), None, None);
+
+        assert_eq!(cmd[0], "bash");
+        assert_eq!(cmd[1], "-c");
+        assert!(
+            cmd[2].contains(UPDATE_PRELUDE),
+            "plain path must run the update prelude: {}",
+            cmd[2]
+        );
+        assert!(cmd[2].contains("exec claude"), "got: {}", cmd[2]);
+        // The update has to happen *before* the exec, which never returns.
+        assert!(
+            cmd[2].find(UPDATE_PRELUDE).unwrap() < cmd[2].find("exec claude").unwrap(),
+            "prelude must precede the exec: {}",
+            cmd[2]
+        );
+        assert!(
+            UPDATE_PRELUDE.contains("timeout 60") && UPDATE_PRELUDE.contains("||"),
+            "the update must stay time-bounded and non-fatal"
+        );
+    }
+
+    /// The session name is interpolated into a shell script, so a quote in it
+    /// must not break out of its single-quoted argument.
+    #[test]
+    fn build_terminal_cmd_escapes_a_quoted_session_name() {
+        let cmd = build_claude_terminal_cmd(
+            &project("anthropic", serde_json::Value::Null),
+            None,
+            Some("Bob's tab; rm -rf /"),
+        );
+
+        assert!(
+            cmd[2].contains(r#"exec claude -n 'Bob'\''s tab; rm -rf /'"#),
+            "session name must be single-quote escaped: {}",
+            cmd[2]
+        );
+    }
+
+    /// Permission flags travel the same escaped path, and an empty name adds
+    /// no `-n` at all.
+    #[test]
+    fn build_terminal_cmd_quotes_permission_flags_and_omits_an_empty_name() {
+        let mut p = project("anthropic", serde_json::Value::Null);
+        p.full_permissions = true;
+        let cmd = build_claude_terminal_cmd(&p, None, Some(""));
+
+        assert!(
+            cmd[2].contains("exec claude '--dangerously-skip-permissions'\n"),
+            "got: {}",
+            cmd[2]
+        );
+        assert!(!cmd[2].contains(" -n "), "empty name must add no flag: {}", cmd[2]);
+    }
+
+    /// The Bedrock-profile path keeps its AWS validation *and* gains the
+    /// prelude, immediately before the exec.
+    #[test]
+    fn build_terminal_cmd_bedrock_validates_aws_and_updates() {
+        let cmd = build_claude_terminal_cmd(
+            &project("bedrock", serde_json::json!({
+                "auth_method": "profile",
+                "aws_region": "us-east-1",
+                "aws_profile": "acme",
+                "model_id": null,
+                "disable_prompt_caching": false
+            })),
+            None,
+            Some("it's fine"),
+        );
+
+        assert_eq!(cmd[0], "bash");
+        let script = &cmd[2];
+        assert!(script.contains("aws sts get-caller-identity --profile 'acme'"), "got: {}", script);
+        assert!(script.contains("triple-c-sso-refresh"), "got: {}", script);
+        assert!(script.contains(UPDATE_PRELUDE), "got: {}", script);
+        assert!(script.contains(r#"exec claude -n 'it'\''s fine'"#), "got: {}", script);
+        assert!(
+            script.find(UPDATE_PRELUDE).unwrap() < script.find("exec claude").unwrap(),
+            "prelude must precede the exec: {}",
+            script
+        );
+    }
+
     #[test]
     fn a_dropped_file_keeps_the_name_the_user_dropped() {
         use crate::commands::file_commands::host_upload_name;

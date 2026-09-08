@@ -205,16 +205,20 @@ interface AppState {
   // UI state
   terminalHasSelection: boolean;
   setTerminalHasSelection: (has: boolean) => void;
+  // Whether a program in the active terminal is holding mouse reporting open,
+  // and how to take it back. Surfaced so the release control can live in the
+  // status bar: painted over the terminal it would sit on top of whatever TUI
+  // is asking for the mouse, and swallow clicks aimed at that program's own
+  // top-right corner for as long as it ran. Only the active TerminalView
+  // writes these.
+  terminalMouseCaptured: boolean;
+  setTerminalMouseCaptured: (captured: boolean) => void;
+  releaseActiveMouse: () => void;
+  setReleaseActiveMouse: (fn: () => void) => void;
   // STT toggle for the active session, registered by App so the terminal's
   // Ctrl+Shift+M shortcut can trigger the single status-bar mic instance.
   sttToggle: () => void;
   setSttToggle: (fn: () => void) => void;
-  // Active terminal scroll state, surfaced so the status bar can host the
-  // "Jump to Current" control. Only the active TerminalView writes these.
-  terminalAtBottom: boolean;
-  setTerminalAtBottom: (v: boolean) => void;
-  scrollActiveToBottom: () => void;
-  setScrollActiveToBottom: (fn: () => void) => void;
   sidebarView: "projects" | "settings";
   setSidebarView: (view: "projects" | "settings") => void;
   sidebarCollapsed: boolean;
@@ -496,12 +500,12 @@ export const useAppState = create<AppState>((set) => ({
   // UI state
   terminalHasSelection: false,
   setTerminalHasSelection: (has) => set({ terminalHasSelection: has }),
+  terminalMouseCaptured: false,
+  setTerminalMouseCaptured: (captured) => set({ terminalMouseCaptured: captured }),
+  releaseActiveMouse: () => {},
+  setReleaseActiveMouse: (fn) => set({ releaseActiveMouse: fn }),
   sttToggle: () => {},
   setSttToggle: (fn) => set({ sttToggle: fn }),
-  terminalAtBottom: true,
-  setTerminalAtBottom: (v) => set({ terminalAtBottom: v }),
-  scrollActiveToBottom: () => {},
-  setScrollActiveToBottom: (fn) => set({ scrollActiveToBottom: fn }),
   sidebarView: "projects",
   setSidebarView: (view) => set({ sidebarView: view }),
   sidebarCollapsed: loadSidebarCollapsed(),
