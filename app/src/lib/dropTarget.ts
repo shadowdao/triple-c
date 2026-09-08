@@ -26,8 +26,8 @@
  *
  * - Asking `el.contains(document.elementFromPoint(x, y))` — "is the thing
  *   painted here mine?" — refused drops onto anything painted *over* a pane
- *   that is not part of it: `TerminalView`'s always-rendered "▼ Following"
- *   toggle (a sibling of the xterm host), the URL toast, `ToastHost`'s stack.
+ *   that is not part of it: `TerminalView`'s mouse-release badge (a sibling
+ *   of the xterm host), the URL toast, `ToastHost`'s stack.
  *   Permanent dead zones no user action could clear.
  * - Replacing that with "is a *blocking overlay* painted here?" removed the
  *   dead zones and opened a hole instead. `elementFromPoint` returns the

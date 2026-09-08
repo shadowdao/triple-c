@@ -206,6 +206,11 @@ pub async fn handle_connection(socket: WebSocket, state: Arc<WebTerminalState>) 
     writer_handle.abort();
 }
 
+/// The desktop terminal's update prelude, reused verbatim. Shared rather than
+/// copied so the web terminal cannot drift from it — a duplicated `const` with
+/// a "keep these identical" comment is only as good as the next reader.
+use crate::commands::terminal_commands::UPDATE_PRELUDE;
+
 /// Build the command for a terminal session, mirroring terminal_commands.rs logic.
 fn build_terminal_cmd(project: &Project, settings_store: &crate::storage::settings_store::SettingsStore) -> Vec<String> {
     let is_bedrock_profile = project.backend == Backend::Bedrock
@@ -217,17 +222,6 @@ fn build_terminal_cmd(project: &Project, settings_store: &crate::storage::settin
 
     let permission_args = project.effective_permission_mode().cli_args();
 
-    if !is_bedrock_profile {
-        let mut cmd = vec!["claude".to_string()];
-        cmd.extend(permission_args);
-        return cmd;
-    }
-
-    let profile = aws_commands::resolve_profile_for_project(
-        project,
-        settings_store.get().global_aws.aws_profile.as_deref(),
-    );
-
     // The args are interpolated into a shell script string below, so
     // single-quote each one.
     let permission_flags: String = permission_args
@@ -235,6 +229,19 @@ fn build_terminal_cmd(project: &Project, settings_store: &crate::storage::settin
         .map(|a| format!(" '{}'", a.replace('\'', "'\\''")))
         .collect();
     let claude_cmd = format!("exec claude{}", permission_flags);
+
+    if !is_bedrock_profile {
+        return vec![
+            "bash".to_string(),
+            "-c".to_string(),
+            format!("{}\n{}\n", UPDATE_PRELUDE, claude_cmd),
+        ];
+    }
+
+    let profile = aws_commands::resolve_profile_for_project(
+        project,
+        settings_store.get().global_aws.aws_profile.as_deref(),
+    );
 
     let script = format!(
         r#"
@@ -260,9 +267,11 @@ else
         echo ""
     fi
 fi
+{update_prelude}
 {claude_cmd}
 "#,
         profile = profile,
+        update_prelude = UPDATE_PRELUDE,
         claude_cmd = claude_cmd
     );
 

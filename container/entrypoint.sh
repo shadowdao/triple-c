@@ -639,8 +639,14 @@ fi
 # any terminal session launches `claude`. Runs as the claude user (the CLI is
 # installed under /home/claude/.claude/bin). Non-fatal and time-bounded so a
 # slow or offline network never blocks container readiness.
+# The lock is shared with the per-session update that every Claude terminal
+# runs before `exec claude` (commands/terminal_commands.rs, UPDATE_PRELUDE).
+# "Container ready" is printed *after* this finishes, so a user who starts a
+# project and immediately opens a tab would otherwise have two updaters
+# rewriting ~/.claude/bin at once, and the session's `|| echo` would hide the
+# damage right before it ran the result.
 echo "entrypoint: checking for Claude Code updates..."
-timeout 120 su -s /bin/bash claude -c 'export PATH="/home/claude/.claude/bin:/home/claude/.local/bin:$PATH"; claude update' \
+timeout 120 su -s /bin/bash claude -c 'export PATH="/home/claude/.claude/bin:/home/claude/.local/bin:$PATH"; flock -w 90 -E 0 /tmp/.triple-c-claude-update.lock claude update' \
     && echo "entrypoint: Claude Code is up to date" \
     || echo "entrypoint: warning — Claude Code update skipped or failed (continuing)"
 

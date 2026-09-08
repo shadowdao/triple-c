@@ -528,7 +528,7 @@ Triple-C includes optional speech-to-text powered by [Faster Whisper](https://gi
 | `app/src/components/layout/TopBar.tsx` | Hosts MainTabs + Docker/Image status indicators + Help |
 | `app/src/components/layout/MainTabs.tsx` | The single main-area tab strip (Project Home + terminal tabs), pointer-event drag reordering |
 | `app/src/components/layout/Sidebar.tsx` | Responsive sidebar (25% width, min 224px, max 320px), collapsible to an icon rail |
-| `app/src/components/layout/StatusBar.tsx` | Project/terminal counts, Jump to Current, STT mic |
+| `app/src/components/layout/StatusBar.tsx` | Project/terminal counts, Notes toggle, STT mic |
 | `app/src/components/projects/ProjectRow.tsx` | Select-only sidebar row; opens Project Home, with hover start/stop and terminal controls |
 | `app/src/components/projects/ProjectList.tsx` | Project list in sidebar |
 | `app/src/components/projects/PermissionModeControl.tsx` | Plan / Default / Accept Edits / Bypass segmented control |

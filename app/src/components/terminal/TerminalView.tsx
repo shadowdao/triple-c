@@ -99,8 +99,8 @@ export default function TerminalView({ sessionId, active }: Props) {
   const { sendInput, pasteImage, resize, onOutput, onExit } = useTerminal();
   const gpuRenderingSetting = useAppState(s => s.appSettings?.terminal_gpu_rendering ?? null);
   const setTerminalHasSelection = useAppState(s => s.setTerminalHasSelection);
-  const setTerminalAtBottom = useAppState(s => s.setTerminalAtBottom);
-  const setScrollActiveToBottom = useAppState(s => s.setScrollActiveToBottom);
+  const setTerminalMouseCaptured = useAppState(s => s.setTerminalMouseCaptured);
+  const setReleaseActiveMouse = useAppState(s => s.setReleaseActiveMouse);
 
   const ssoBufferRef = useRef("");
   const ssoTriggeredRef = useRef(false);
@@ -219,14 +219,11 @@ export default function TerminalView({ sessionId, active }: Props) {
     return () => document.removeEventListener("keydown", onKeyDown, true);
   }, []);
   const [imagePasteMsg, setImagePasteMsg] = useState<string | null>(null);
-  const [isAtBottom, setIsAtBottom] = useState(true);
-  const [isAutoFollow, setIsAutoFollow] = useState(true);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
-  const isAtBottomRef = useRef(true);
-  // Tracks user intent to follow output — only set to false by explicit user
-  // actions (mouse wheel up), not by xterm scroll events during writes.
-  const autoFollowRef = useRef(true);
-  const lastUserScrollTimeRef = useRef(0);
+  // True while the program in the container holds mouse reporting open (any of
+  // the DECSET ?1000/?1002/?1003 tracking modes). See `syncMouseCapture`.
+  const [mouseCaptured, setMouseCaptured] = useState(false);
+  const mouseCapturedRef = useRef(false);
 
   // Keep latest `active` readable inside long-lived listeners (drag-drop below,
   // and the unmount-cleanup effect further down).
@@ -251,10 +248,10 @@ export default function TerminalView({ sessionId, active }: Props) {
   //
   // The rect asked about is the **pane wrapper**, not the xterm host inside it:
   // the pane is what the user sees as "the terminal", gutter included, and the
-  // chrome painted over it (the Following toggle, the URL toast) is a sibling
-  // of the host rather than a child. Nothing painted over the pane refuses a
-  // drop on its own account — asking "is this element mine?" once turned every
-  // pixel under that chrome into a permanent dead zone.
+  // chrome painted over it (the mouse-release badge, the URL toast) is a
+  // sibling of the host rather than a child. Nothing painted over the pane
+  // refuses a drop on its own account — asking "is this element mine?" once
+  // turned every pixel under that chrome into a permanent dead zone.
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     let cancelled = false;
@@ -315,12 +312,60 @@ export default function TerminalView({ sessionId, active }: Props) {
     };
   }, [sessionId, sendInput]);
 
+  /**
+   * Reconcile the badge with xterm's live mouse-tracking mode.
+   *
+   * There is no event for this, but there does not need to be a poll either:
+   * the mode only ever changes because the container printed a DECSET/DECRST
+   * sequence, so checking once per write covers every transition, exactly when
+   * it happens. The ref gate keeps the common case (mode unchanged, thousands
+   * of writes a second) down to one string comparison and no re-render.
+   */
+  const syncMouseCapture = useCallback(() => {
+    const term = termRef.current;
+    if (!term) return;
+    const captured = term.modes.mouseTrackingMode !== "none";
+    if (captured === mouseCapturedRef.current) return;
+    mouseCapturedRef.current = captured;
+    setMouseCaptured(captured);
+  }, []);
+
+  /**
+   * Take the mouse back from a program that grabbed it and never let go.
+   *
+   * A TUI that dies mid-menu (or is killed, or detaches) leaves its mouse
+   * tracking modes set. xterm goes on routing clicks, drags and — under
+   * `?1003` — every pointer *move* to the PTY, which kills text selection and
+   * floods the prompt with escape bytes. The result reads as a frozen
+   * terminal, and until now the only exit was closing the tab.
+   *
+   * The reset is `term.write`, deliberately, not `sendInput`: it goes into
+   * xterm's own parser and never onto the wire. The program that asked for
+   * tracking is usually already gone; if it is not, telling it the user pulled
+   * the mouse back would only invite it to grab again on its next repaint.
+   */
+  const releaseMouse = useCallback(() => {
+    const term = termRef.current;
+    if (!term) return;
+    // The three tracking modes, then the two encodings they report in. All
+    // five, because a program is free to have set any combination and a
+    // leftover encoding mode outlives the tracking mode that motivated it.
+    term.write("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l", syncMouseCapture);
+  }, [syncMouseCapture]);
+
   useEffect(() => {
     if (!containerRef.current) return;
 
     const term = new Terminal({
       cursorBlink: true,
       fontSize: 14,
+      // Let the user select text even while a program holds the mouse.
+      // xterm's force-selection modifier is Shift everywhere *except* macOS,
+      // where it is Option and is gated behind this option, which defaults to
+      // false — so without this line Mac users have no force-select at all and
+      // the only way to copy from a mouse-driven TUI is to take the mouse back
+      // first. `SelectionService.shouldForceSelection`.
+      macOptionClickForcesSelection: true,
       fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', Menlo, Monaco, monospace",
       theme: {
         background: "#0d1117",
@@ -389,6 +434,14 @@ export default function TerminalView({ sessionId, active }: Props) {
       // bar, bound to the active session; trigger it via the store).
       if (event.type === "keydown" && event.ctrlKey && event.shiftKey && event.key === "M") {
         useAppState.getState().sttToggle();
+        return false;
+      }
+      // Ctrl+Shift+X hands the mouse back. Same action as the badge, bound to
+      // a key because the failure this recovers from is *the pointer not
+      // working* — a control you have to click can be unreachable in exactly
+      // the situation that calls for it.
+      if (event.type === "keydown" && event.ctrlKey && event.shiftKey && event.key === "X") {
+        releaseMouse();
         return false;
       }
       // Shift+Enter inserts a newline in Claude Code's prompt instead of
@@ -501,42 +554,6 @@ export default function TerminalView({ sessionId, active }: Props) {
       );
     });
 
-    // Detect user-initiated scroll-up (mouse wheel) to pause auto-follow.
-    // Captured during capture phase so it fires before xterm's own handler.
-    const handleWheel = (e: WheelEvent) => {
-      lastUserScrollTimeRef.current = Date.now();
-      if (e.deltaY < 0) {
-        autoFollowRef.current = false;
-        setIsAutoFollow(false);
-        isAtBottomRef.current = false;
-        setIsAtBottom(false);
-      }
-    };
-    containerRef.current.addEventListener("wheel", handleWheel, { capture: true, passive: true });
-
-    // Track scroll position to show "Jump to Current" button.
-    // Debounce state updates via rAF to avoid excessive re-renders during rapid output.
-    let scrollStateRafId: number | null = null;
-    const scrollDisposable = term.onScroll(() => {
-      const buf = term.buffer.active;
-      const atBottom = buf.viewportY >= buf.baseY;
-      isAtBottomRef.current = atBottom;
-
-      // Re-enable auto-follow only when USER scrolls to bottom (not write-triggered)
-      const isUserScroll = (Date.now() - lastUserScrollTimeRef.current) < 300;
-      if (atBottom && isUserScroll && !autoFollowRef.current) {
-        autoFollowRef.current = true;
-        setIsAutoFollow(true);
-      }
-
-      if (scrollStateRafId === null) {
-        scrollStateRafId = requestAnimationFrame(() => {
-          scrollStateRafId = null;
-          setIsAtBottom(isAtBottomRef.current);
-        });
-      }
-    });
-
     // Track text selection to show copy hint in status bar
     const selectionDisposable = term.onSelectionChange(() => {
       setTerminalHasSelection(term.hasSelection());
@@ -599,15 +616,11 @@ export default function TerminalView({ sessionId, active }: Props) {
 
     const outputPromise = onOutput(sessionId, (data) => {
       if (aborted) return;
-      term.write(data, () => {
-        if (autoFollowRef.current) {
-          term.scrollToBottom();
-          if (!isAtBottomRef.current) {
-            isAtBottomRef.current = true;
-            setIsAtBottom(true);
-          }
-        }
-      });
+      // Scrolling on new output is xterm's own job, and it already gets it
+      // right: it follows the tail while the viewport is at the bottom and
+      // holds position while you are reading further up. The manual
+      // `scrollToBottom()` that used to live here fought that second half.
+      term.write(data, syncMouseCapture);
       detector.feed(data);
 
       // Scan for SSO refresh marker in terminal output
@@ -649,11 +662,18 @@ export default function TerminalView({ sessionId, active }: Props) {
       resizeRafId = requestAnimationFrame(() => {
         resizeRafId = null;
         if (!containerRef.current || containerRef.current.offsetWidth === 0) return;
+        // Whether the viewport was following the tail has to be sampled
+        // *before* the fit: reflowing wrapped lines moves `baseY`, so asking
+        // afterwards cannot tell "was at the bottom" from "was pushed off it".
+        const wasAtBottom =
+          term.buffer.active.viewportY >= term.buffer.active.baseY;
         fitAddon.fit();
         resize(sessionId, term.cols, term.rows);
-        if (autoFollowRef.current) {
-          term.scrollToBottom();
-        }
+        // Only re-anchor a viewport that was already on the tail. This
+        // observer fires for any pane size change — opening the Notes dock,
+        // dragging the sidebar, resizing the window — and none of those are a
+        // reason to yank someone away from the scrollback they are reading.
+        if (wasAtBottom) term.scrollToBottom();
       });
     });
     resizeObserver.observe(containerRef.current);
@@ -667,14 +687,11 @@ export default function TerminalView({ sessionId, active }: Props) {
       osc52Disposable.dispose();
       relayDisposable.dispose();
       inputDisposable.dispose();
-      scrollDisposable.dispose();
       selectionDisposable.dispose();
       setTerminalHasSelection(false);
-      containerRef.current?.removeEventListener("wheel", handleWheel, { capture: true });
       containerRef.current?.removeEventListener("paste", handlePaste, { capture: true });
       outputPromise.then((fn) => fn?.());
       exitPromise.then((fn) => fn?.());
-      if (scrollStateRafId !== null) cancelAnimationFrame(scrollStateRafId);
       if (resizeRafId !== null) cancelAnimationFrame(resizeRafId);
       resizeObserver.disconnect();
       try { webglRef.current?.dispose(); } catch { /* may already be disposed */ }
@@ -723,10 +740,12 @@ export default function TerminalView({ sessionId, active }: Props) {
     }
 
     if (active) {
+      // Same rule as the resize observer: re-anchor only what was already
+      // anchored, so a tab left scrolled up comes back where it was left.
+      const wasAtBottom =
+        term.buffer.active.viewportY >= term.buffer.active.baseY;
       fitRef.current?.fit();
-      if (autoFollowRef.current) {
-        term.scrollToBottom();
-      }
+      if (wasAtBottom) term.scrollToBottom();
       term.focus();
     }
   }, [active, gpuRenderingSetting]);
@@ -826,39 +845,6 @@ export default function TerminalView({ sessionId, active }: Props) {
       );
   }, [urlPrompt, projectId, dismissUrlPrompt]);
 
-  const handleScrollToBottom = useCallback(() => {
-    const term = termRef.current;
-    if (term) {
-      autoFollowRef.current = true;
-      setIsAutoFollow(true);
-      fitRef.current?.fit();
-      term.scrollToBottom();
-      isAtBottomRef.current = true;
-      setIsAtBottom(true);
-    }
-  }, []);
-
-  // Surface this terminal's scroll state to the status bar's "Jump to Current"
-  // control, but only while it's the active (visible) terminal.
-  useEffect(() => {
-    if (!active) return;
-    setTerminalAtBottom(isAtBottom);
-    setScrollActiveToBottom(handleScrollToBottom);
-  }, [active, isAtBottom, handleScrollToBottom, setTerminalAtBottom, setScrollActiveToBottom]);
-
-  // On unmount, if this was the active terminal, clear the status-bar scroll
-  // state so it doesn't point at a disposed terminal. (Tab switches don't
-  // unmount — the deactivating terminal stays mounted but hidden — so this
-  // only fires when the active session is actually closed.)
-  useEffect(() => {
-    return () => {
-      if (activeRef.current) {
-        setTerminalAtBottom(true);
-        setScrollActiveToBottom(() => {});
-      }
-    };
-  }, [setTerminalAtBottom, setScrollActiveToBottom]);
-
   const writeSelection = useCallback((mode: "trimmed" | "raw") => {
     const term = termRef.current;
     if (!term) return;
@@ -876,20 +862,26 @@ export default function TerminalView({ sessionId, active }: Props) {
     setContextMenu({ x: e.clientX, y: e.clientY });
   }, []);
 
-  const handleToggleAutoFollow = useCallback(() => {
-    const next = !autoFollowRef.current;
-    autoFollowRef.current = next;
-    setIsAutoFollow(next);
-    if (next) {
-      const term = termRef.current;
-      if (term) {
-        fitRef.current?.fit();
-        term.scrollToBottom();
-        isAtBottomRef.current = true;
-        setIsAtBottom(true);
+  // Surface the capture state and its escape hatch to the status bar, but only
+  // while this is the visible terminal.
+  useEffect(() => {
+    if (!active) return;
+    setTerminalMouseCaptured(mouseCaptured);
+    setReleaseActiveMouse(releaseMouse);
+  }, [active, mouseCaptured, releaseMouse, setTerminalMouseCaptured, setReleaseActiveMouse]);
+
+  // On unmount, if this was the active terminal, clear the status-bar state so
+  // it does not point at a disposed terminal. (Tab switches do not unmount —
+  // the deactivating terminal stays mounted but hidden — so this only fires
+  // when the active session is actually closed.)
+  useEffect(() => {
+    return () => {
+      if (activeRef.current) {
+        setTerminalMouseCaptured(false);
+        setReleaseActiveMouse(() => {});
       }
-    }
-  }, []);
+    };
+  }, [setTerminalMouseCaptured, setReleaseActiveMouse]);
 
   return (
     <div
@@ -915,18 +907,6 @@ export default function TerminalView({ sessionId, active }: Props) {
           {imagePasteMsg}
         </div>
       )}
-      {/* Auto-follow toggle - top right */}
-      <button
-        onClick={handleToggleAutoFollow}
-        className={`absolute top-2 right-4 z-50 px-2 py-1 rounded text-[10px] font-medium border shadow-sm transition-colors cursor-pointer ${
-          isAutoFollow
-            ? "bg-[#1a2332] text-[#3fb950] border-[#238636] hover:bg-[#1f2d3d]"
-            : "bg-[#1f2937] text-[#8b949e] border-[#30363d] hover:bg-[#2d3748]"
-        }`}
-        title={isAutoFollow ? "Auto-scrolling to latest output (click to pause)" : "Auto-scroll paused (click to resume)"}
-      >
-        {isAutoFollow ? "▼ Following" : "▽ Paused"}
-      </button>
       {/* Padding lives on this wrapper, NOT on the xterm host element. xterm's
           FitAddon measures the host element it's mounted into; padding there
           causes the grid to overhang and clip the rightmost column / bottom

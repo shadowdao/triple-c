@@ -243,7 +243,7 @@ Anthropic-backend project uses that token without its own login. See
 │             │  │                                                  │  │
 │             │  └──────────────────────────────────────────────────┘  │
 ├─────────────┴────────────────────────────────────────────────────────┤
-│  2 project(s) · 1 running · 2 terminal(s)          Jump to Current ↓ │
+│  2 project(s) · 1 running · 2 terminal(s)                      Notes │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -268,8 +268,8 @@ Anthropic-backend project uses that token without its own login. See
 - **Main area** — Shows the active tab: a Project Home view or an xterm.js terminal. With no tabs
   open you get a welcome screen with Docker/image/project readiness checks.
 - **StatusBar** — Counts of total projects, running containers and open terminal sessions; the
-  **Jump to Current ↓** button when a terminal is scrolled up; and the microphone button when
-  speech-to-text is enabled.
+  **🖱 Mouse captured — release** button while a program in the terminal is holding the mouse; the
+  **Notes** toggle; and the microphone button when speech-to-text is enabled.
 
 ---
 
@@ -1224,9 +1224,31 @@ Programs inside the container can copy text to your host clipboard. When a conta
 
 You can paste images from your clipboard into the terminal (Ctrl+V / Cmd+V). The image is uploaded to the container as `/tmp/clipboard_<timestamp>.png` and the file path is injected into the terminal input so Claude Code can reference it. A toast notification confirms the upload.
 
-### Jump to Current
+### Scrolling
 
-When you scroll up in the terminal to review previous output, a **Jump to Current** button appears in the bottom-right corner. Click it to scroll back to the latest output.
+Scrolling is the terminal's own: scroll up to read back and it holds position, scroll to the
+bottom and it follows new output again. There is no follow toggle — an earlier **Following /
+Paused** control and a **Jump to Current** button were retired once they stopped doing anything
+useful, because Claude Code draws its interface on the alternate screen, which has no scrollback
+for them to act on.
+
+### When the mouse stops working
+
+Some programs ask the terminal for the mouse, so that clicks and drags go to the program instead
+of selecting text. If one of them exits without handing the mouse back, the terminal looks stuck:
+you cannot select text, and stray characters can appear as you move the pointer.
+
+A **🖱 Mouse captured — release** button appears in the status bar whenever a program holds the
+mouse. Click it, or press **Ctrl+Shift+X**, to take the mouse back. Nothing is sent into the
+container — only the terminal's own state is reset.
+
+Note that holding the mouse is normal for programs like `htop`, `vim` and Claude Code itself, so
+the button is showing most of the time you are in one. It is there for when a program exits
+without handing the mouse back and the terminal is left stuck; releasing while a program is still
+running just takes the mouse away from that program.
+
+To select text *without* taking the mouse back, hold **Shift** while dragging — or **Option** on
+macOS.
 
 ### Files
 

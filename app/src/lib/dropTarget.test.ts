@@ -243,11 +243,12 @@ describe("dropTarget", () => {
   describe("chrome over a pane, with no dialog open", () => {
     /** Everything that is painted over a pane and is not a blocker. */
     const CHROME: Array<[string, () => HTMLElement]> = [
-      // `TerminalView`'s "▼ Following / ▽ Paused" toggle: `absolute top-2
-      // right-4 z-50`, rendered unconditionally, and a *sibling* of the xterm
-      // host — so "does the pane contain what is painted here?" made the
-      // terminal's top-right corner a dead zone no user action could clear.
-      ["the Following/Paused toggle", () => document.createElement("button")],
+      // `TerminalView`'s mouse-release badge: `absolute top-2 right-4 z-50`,
+      // and a *sibling* of the xterm host — so "does the pane contain what is
+      // painted here?" made the terminal's top-right corner a dead zone no
+      // user action could clear. (The retired Following toggle held the same
+      // corner and produced the original bug.)
+      ["the mouse-release badge", () => document.createElement("button")],
       // `ToastHost`: `fixed bottom-4 right-4 z-[60]`, 24rem wide, over every
       // pane, and its error cards stay until dismissed.
       ["a toast card", () => document.createElement("div")],
