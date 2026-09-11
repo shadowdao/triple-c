@@ -3052,6 +3052,118 @@ fn blanked_secret_env() -> Vec<String> {
         .collect()
 }
 
+/// Image-name prefix for the throwaway commit a staleness probe of a stopped
+/// container makes. The reaper's only handle on a leftover — see
+/// [`crate::docker::migration::reap_probe_images`] — so nothing else may use it.
+pub const PROBE_IMAGE_PREFIX: &str = "triple-c-probe-";
+
+/// The throwaway image a staleness probe of a **stopped** container commits to.
+///
+/// **Unique per call**, and both halves of the name earn their place: the
+/// container id prefix makes a leftover traceable in `docker images`, and the
+/// counter makes two overlapping probes independent.
+///
+/// An earlier version of this was deliberately *stable* per container, on the
+/// theory that the next probe would move the tag off an abandoned image and
+/// leave it dangling for [`sweep_orphaned_snapshots`]. That was wrong twice
+/// over. A container id does not survive a recreate, so for most leftovers
+/// there is no "next probe of the same container" and the image was stranded
+/// permanently; and a stable name made two concurrent probes fight over one
+/// tag, where whichever finished first force-removed the image the other was
+/// still reading and turned a healthy project into a bogus `probe_error`.
+/// Uniqueness fixes both, and [`crate::docker::migration::reap_probe_images`]
+/// is what collects the leftovers instead.
+pub fn get_probe_image_name(container_id: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let short: String = container_id.chars().take(12).collect();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "{}{}-{}-{}:latest",
+        PROBE_IMAGE_PREFIX,
+        short,
+        nanos,
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Commit a **stopped** container's filesystem to a throwaway image, returning
+/// its name. The caller owns the image and must remove it.
+///
+/// This exists so a stopped project can be read at all. `docker exec` needs a
+/// running container and the snapshot image is not a checkpoint — see
+/// [`crate::commands::migration_commands`]'s probe-source pick — so without
+/// this there is no way to see inside a project that is merely stopped.
+///
+/// ## Why it is tagged at all
+///
+/// An untagged commit would be tidier: untagged plus the `triple-c.managed=true`
+/// that `docker commit` copies off the container is exactly the pair
+/// [`sweep_orphaned_snapshots`] already collects, so a leftover would self-heal
+/// with no new machinery. **It is not available.** `bollard`'s `Commit` response
+/// model deserialises `"ID"` while the daemon sends `"Id"`, so
+/// `commit_container` hands back `id: None` every time and there is no
+/// reference left to probe. Neither existing commit site notices, because both
+/// discard the response. Verified against Engine 29.6, bollard 0.18.1.
+///
+/// So the image needs a name, a tagged image is not dangling, and the sweep
+/// therefore cannot be the safety net. [`crate::docker::migration::reap_probe_images`]
+/// is, and [`get_probe_image_name`] carries the rest of that argument.
+///
+/// ## What is in the image, and what is not
+///
+/// `pause: false` because nothing is running — pausing a stopped container is
+/// an error, the same reason [`recommit_without_secrets`]'s scratch commit
+/// passes `false`.
+///
+/// Secrets are blanked from the env for the same reason
+/// [`commit_container_snapshot`] blanks them: the commit bakes the container's
+/// full ENV into the image, and "it only lives a few seconds" is not a property
+/// this function can promise after a crash.
+///
+/// **The writable layer is committed unscrubbed, and that is unavoidable here.**
+/// [`commit_container_snapshot`] runs [`scrub_writable_layer`] first precisely
+/// because a commit stacks a layer and never rewrites one — but that scrub is a
+/// `docker exec`, which is exactly what a stopped container cannot serve, and
+/// scrubbing is not wanted anyway: the probe's whole job is to report the
+/// filesystem as it actually is. What makes it acceptable is that this copies
+/// bytes that are *already on this disk* in the container's own writable layer,
+/// into an image that is never pushed, never created from, and reaped — so it
+/// duplicates data inside one trust domain rather than widening it. That
+/// argument depends on the reaping actually happening; treat
+/// [`crate::docker::migration::reap_probe_images`] as load-bearing, not tidying.
+pub async fn commit_container_for_probe(container_id: &str) -> Result<String, String> {
+    let docker = get_docker()?;
+    let image_name = get_probe_image_name(container_id);
+    let (repo, tag) = image_name
+        .rsplit_once(':')
+        .map(|(r, t)| (r.to_string(), t.to_string()))
+        .expect("get_probe_image_name always emits a tag");
+
+    docker
+        .commit_container(
+            CommitContainerOptions {
+                container: container_id.to_string(),
+                repo,
+                tag,
+                pause: false,
+                ..Default::default()
+            },
+            Config::<String> {
+                env: Some(blanked_secret_env()),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|e| format!("Failed to commit stopped container {}: {}", container_id, e))?;
+
+    Ok(image_name)
+}
+
 /// Whether `env` (an image's `Config.Env`) holds a non-empty value for any
 /// name in [`SECRET_ENV_KEYS`].
 fn env_holds_a_secret(env: &[String]) -> bool {
@@ -3518,9 +3630,10 @@ pub async fn remove_snapshot_image(project: &Project) -> Result<(), String> {
     remove_image_by_name(&get_snapshot_image_name(project)).await
 }
 
-/// Remove a Docker image by name/tag, treating "does not exist" as success.
-/// Shared by [`remove_snapshot_image`] and the pending-cleanup retry, which
-/// only has the image name (the project record is already gone by then).
+/// Remove a Docker image by name, tag or **id**, treating "does not exist" as
+/// success. Shared by [`remove_snapshot_image`], the pending-cleanup retry
+/// (which only has the image name — the project record is already gone by
+/// then), and the staleness probe's throwaway commit, which has only an id.
 pub async fn remove_image_by_name(image_name: &str) -> Result<(), String> {
     let docker = get_docker()?;
 
@@ -3536,7 +3649,7 @@ pub async fn remove_image_by_name(image_name: &str) -> Result<(), String> {
         .await
     {
         Ok(_) => {
-            log::info!("Removed snapshot image {}", image_name);
+            log::info!("Removed image {}", image_name);
             Ok(())
         }
         Err(bollard::errors::Error::DockerResponseServerError {
@@ -4462,6 +4575,29 @@ mod tests {
     fn a_value_containing_an_equals_sign_is_still_recognised() {
         let env = vec!["ANTHROPIC_AUTH_TOKEN=abc=def==".to_string()];
         assert!(env_holds_a_secret(&env));
+    }
+
+    /// The probe image's name must be **unique per call**. A stable name was
+    /// tried and is wrong twice over: a container id does not survive a
+    /// recreate, so a crashed probe's leftover would never be reclaimed by "the
+    /// next probe of the same container"; and two concurrent probes sharing one
+    /// tag means whichever finishes first force-removes the image the other is
+    /// still reading. See `commit_container_for_probe` and `reap_probe_images`.
+    #[test]
+    fn probe_image_names_are_unique_per_call_and_reapable_by_prefix() {
+        let id = "75993e6d5e1ab473b029a408c5ff0339";
+        let a = get_probe_image_name(id);
+        let b = get_probe_image_name(id);
+        assert_ne!(a, b, "two probes of one container must not share a tag");
+
+        // The prefix is the reaper's only handle on a leftover, so every name
+        // has to carry it — and it must not be the snapshot namespace, which is
+        // what a project is rebuilt from.
+        assert!(a.starts_with(PROBE_IMAGE_PREFIX), "{}", a);
+        assert!(!a.starts_with("triple-c-snapshot-"), "{}", a);
+        // Traceable back to its container, which is the point of the prefix.
+        assert!(a.contains("75993e6d5e1a"), "{}", a);
+        assert!(a.ends_with(":latest"), "{}", a);
     }
 
     #[test]

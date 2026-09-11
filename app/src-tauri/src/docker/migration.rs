@@ -886,6 +886,100 @@ pub async fn reap_probe_containers() {
     }
 }
 
+/// Remove throwaway images left behind by a staleness probe of a stopped
+/// container — [`super::container::commit_container_for_probe`]'s commits.
+///
+/// **Load-bearing, not tidying.** A probe image is *tagged*, because bollard
+/// gives no image id back from a commit and there has to be something to probe.
+/// Tagged means not dangling, so [`super::container::sweep_orphaned_snapshots`]
+/// — which collects every other kind of orphan this app can leave — will never
+/// see one. Without this, a probe that dies between its commit and its own
+/// cleanup (SIGKILL, a crash, a 409 from a concurrent remove) strands a
+/// multi-gigabyte image that **no code path can ever reclaim**, and there is no
+/// UI to find it either. That is the one leak in this app with no floor on it,
+/// so this runs at startup beside [`reap_probe_containers`].
+///
+/// Age-gated for exactly the reason that one is: `reference=` is a daemon-wide
+/// filter, so a second copy of the app probing a project on the same daemon has
+/// images matching this glob, and removing one mid-capture fails that probe with
+/// "No such image" — the bogus `probe_error` the staleness work exists to get
+/// rid of. In-process state cannot see the other instance, so age is the only
+/// brake, and [`PROBE_REAP_MIN_AGE_SECS`] is already the right one: a probe is a
+/// `find` over a root filesystem, not a multi-minute job.
+///
+/// Never fails the caller. Housekeeping, like every other sweep here.
+pub async fn reap_probe_images() {
+    use bollard::image::{ListImagesOptions, RemoveImageOptions};
+
+    let docker = match get_docker() {
+        Ok(d) => d,
+        Err(e) => {
+            log::warn!("Could not reap leftover probe images: {}", e);
+            return;
+        }
+    };
+
+    let filters = HashMap::from([(
+        "reference".to_string(),
+        vec![format!("{}*", super::container::PROBE_IMAGE_PREFIX)],
+    )]);
+    let images = match docker
+        .list_images(Some(ListImagesOptions {
+            all: false,
+            filters,
+            ..Default::default()
+        }))
+        .await
+    {
+        Ok(images) => images,
+        Err(e) => {
+            log::warn!("Could not list leftover probe images: {}", e);
+            return;
+        }
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    for image in images {
+        // Unlike a container summary, an image summary always carries a
+        // `Created`, so there is no unknown-age case to defend against here.
+        if now - image.created < PROBE_REAP_MIN_AGE_SECS {
+            log::info!(
+                "Leaving probe image {:?} alone — it is younger than {} minutes, so it may belong \
+                 to another Triple-C instance's live probe",
+                image.repo_tags,
+                PROBE_REAP_MIN_AGE_SECS / 60
+            );
+            continue;
+        }
+        // By **tag**, never by image id. A `force` removal by id untags an
+        // image everywhere, so an id that happens to carry another name loses
+        // that name too — which is how a test fixture that tagged
+        // `alpine:latest` into this namespace deleted the user's alpine. A real
+        // leftover has exactly the one probe tag, so removing the tag removes
+        // the image; anything else keeps whatever other names it has.
+        for tag in image
+            .repo_tags
+            .iter()
+            .filter(|t| t.starts_with(super::container::PROBE_IMAGE_PREFIX))
+        {
+            log::info!("Removing leftover probe image {}", tag);
+            if let Err(e) = docker
+                .remove_image(
+                    tag,
+                    Some(RemoveImageOptions {
+                        force: true,
+                        noprune: false,
+                    }),
+                    None,
+                )
+                .await
+            {
+                log::warn!("Could not remove leftover probe image {}: {}", tag, e);
+            }
+        }
+    }
+}
+
 /// How old a `triple-c.probe=migration` container must be before
 /// [`reap_probe_containers`] will force-remove it, in seconds.
 ///
@@ -991,6 +1085,36 @@ pub async fn manifest_from_container(container_id: &str) -> Result<Manifest, Str
         ));
     }
     Ok(parse_manifest(&out))
+}
+
+/// Capture a [`Manifest`] from a **stopped** container.
+///
+/// Commits the container's writable layer to a throwaway image, probes that,
+/// and removes it. This is as current as [`manifest_from_container`] — it reads
+/// the same filesystem — and it is why a stopped project no longer has to fall
+/// back to its snapshot image, which may not exist at all and lags the
+/// container by everything installed since the last commit when it does.
+///
+/// The image is removed on every path, including a failed probe. See
+/// [`super::container::commit_container_for_probe`] for what a crash in the
+/// window between the two costs, and why it is bounded.
+pub async fn manifest_from_stopped_container(container_id: &str) -> Result<Manifest, String> {
+    let image = super::container::commit_container_for_probe(container_id).await?;
+
+    let manifest = manifest_from_image(&image)
+        .await
+        .map_err(|e| format!("Probe of the stopped container did not complete: {}", e));
+
+    if let Err(e) = super::container::remove_image_by_name(&image).await {
+        log::warn!(
+            "Could not remove the staleness probe's throwaway image {}: {} — the next probe of \
+             this container reuses the name, which leaves this one dangling for the orphan sweep",
+            image,
+            e
+        );
+    }
+
+    manifest
 }
 
 /// The image ID (`sha256:…`) of a local image, or `None` if it is not present.
@@ -2145,5 +2269,170 @@ mod tests {
         let now = at(2026, 8, 23);
         assert!(!pin_is_reapable("pre-migration-handmade", false, ancient, &now));
         assert!(!pin_is_reapable("latest", false, ancient, &now));
+    }
+
+    // ── Live Docker ─────────────────────────────────────────────────────────
+
+    /// The reaper finds a leftover probe image by prefix and — crucially —
+    /// refuses to remove a young one, because that image may be another
+    /// Triple-C instance's live probe. Only a real daemon can say whether the
+    /// `reference=` glob matches the names `get_probe_image_name` produces.
+    ///
+    /// The fixture is **committed**, not tagged and not built. An image's
+    /// `Created` is its own, not its tag's, so tagging something already on disk
+    /// into this namespace yields a fixture the reaper is right to call ancient
+    /// — and BuildKit stamps a fixed epoch on `docker build` output, so a built
+    /// one looks ancient too. A commit stamps *now*, verified against Engine
+    /// 29.6, which is also how real probe images get their age.
+    ///
+    /// Both of those mistakes were made here first, and one of them deleted an
+    /// unrelated `alpine:latest` — which is why `reap_probe_images` removes by
+    /// tag rather than by image id.
+    ///
+    /// ```text
+    /// cargo test -- --ignored --nocapture reaper_spares
+    /// ```
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon; builds and removes a throwaway image"]
+    async fn the_reaper_spares_a_probe_image_young_enough_to_be_someone_elses() {
+        use std::process::Command;
+
+        fn docker_out(args: &[&str]) -> std::process::Output {
+            Command::new("docker").args(args).output().expect("docker CLI")
+        }
+
+        let base = std::env::var("TRIPLE_C_TEST_IMAGE")
+            .unwrap_or_else(|_| "alpine:latest".to_string());
+        let name = crate::docker::container::get_probe_image_name("reapertest01234");
+
+        // A never-started container is enough to commit from, and leaves the
+        // daemon's run state alone entirely.
+        let created = docker_out(&["create", &base, "true"]);
+        assert!(
+            created.status.success(),
+            "could not create the fixture container from {}: {}",
+            base,
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let cid = String::from_utf8_lossy(&created.stdout).trim().to_string();
+
+        let committed = docker_out(&["commit", "--pause=false", &cid, &name]);
+        let _ = docker_out(&["rm", "-f", &cid]);
+        assert!(
+            committed.status.success(),
+            "could not commit the fixture image: {}",
+            String::from_utf8_lossy(&committed.stderr)
+        );
+
+        reap_probe_images().await;
+
+        let still_there = Command::new("docker")
+            .args(["image", "inspect", &name])
+            .output()
+            .expect("docker image inspect")
+            .status
+            .success();
+
+        let _ = Command::new("docker").args(["rmi", &name]).output();
+
+        assert!(
+            still_there,
+            "a probe image committed seconds ago was reaped — that is another \
+             instance's live probe being broken, see PROBE_REAP_MIN_AGE_SECS"
+        );
+    }
+
+    /// A *stopped* container is readable, and what comes back is its writable
+    /// layer rather than the image it was created from. This is the whole point
+    /// of the function: the base image cannot answer it, and the project may
+    /// well have no snapshot image at all.
+    ///
+    /// Also asserts the throwaway commit leaves nothing behind, which no unit
+    /// test can. It has to assert on the `triple-c-probe-*` tags specifically:
+    /// the probe image is *tagged*, so a leak never shows up as a dangling
+    /// image and a dangling-set assertion here would pass either way.
+    ///
+    /// Ignored because it needs Docker and commits a container; run it with
+    ///
+    /// ```text
+    /// cargo test -- --ignored --nocapture stopped_container
+    /// ```
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon; creates, commits and removes a throwaway container"]
+    async fn a_stopped_container_is_read_from_its_writable_layer() {
+        fn docker_cli(args: &[&str]) -> String {
+            let out = std::process::Command::new("docker")
+                .args(args)
+                .output()
+                .expect("docker CLI");
+            assert!(
+                out.status.success(),
+                "docker {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+        fn probe_images() -> Vec<String> {
+            let mut ids: Vec<String> = docker_cli(&[
+                "images", "-q",
+                "--filter",
+                &format!("reference={}*", crate::docker::container::PROBE_IMAGE_PREFIX),
+            ])
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+            ids.sort();
+            ids
+        }
+
+        let image = std::env::var("TRIPLE_C_TEST_IMAGE")
+            .unwrap_or_else(|_| "ghcr.io/shadowdao/triple-c-sandbox:latest".to_string());
+        // A marker only the writable layer can carry, under a MANIFEST_ROOTS root.
+        let marker = format!("/opt/probe-marker-{}", std::process::id());
+
+        // Another instance's live probe images are allowed to exist; what must
+        // hold is that this probe adds none of its own.
+        let before = probe_images();
+
+        let id = docker_cli(&[
+            "run", "-d", "--label", "triple-c.managed=true",
+            "--entrypoint", "/bin/sh",
+            &image, "-c", "sleep 300",
+        ]);
+        let cleanup = |id: &str| {
+            let _ = std::process::Command::new("docker")
+                .args(["rm", "-f", id])
+                .output();
+        };
+
+        docker_cli(&["exec", &id, "mkdir", "-p", &marker]);
+        docker_cli(&["stop", "-t", "1", &id]);
+
+        let result = manifest_from_stopped_container(&id).await;
+
+        cleanup(&id);
+
+        let manifest = result.expect("a stopped container must be probeable");
+        assert!(
+            manifest.paths.iter().any(|e| e.path == marker && e.is_dir()),
+            "the probe read the image, not the container's writable layer: {} missing",
+            marker
+        );
+        // Non-empty package sets prove the probe script really ran, rather than
+        // parsing an empty transcript into an empty-but-Ok manifest.
+        assert!(
+            !manifest.apt_manual.is_empty(),
+            "apt-mark showmanual came back empty, so the probe did not run"
+        );
+
+        assert_eq!(
+            probe_images(),
+            before,
+            "the throwaway probe image was not cleaned up"
+        );
     }
 }
