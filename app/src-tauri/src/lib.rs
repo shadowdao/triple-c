@@ -263,12 +263,20 @@ pub fn run() {
             // logged warning rather than a failed start.
             //
             // Ordering matters. Probes are removed first because a probe holds
-            // an image open and the sweep will not force; pins are untagged
+            // an image open and the sweep will not force — both the probe
+            // containers and the probe images, the latter being the one orphan
+            // the sweep can never reach on its own; pins are untagged
             // second so the images they were holding are dangling by the time
             // the sweep lists them; the sweep runs last and collects both.
             let projects_store_for_cleanup = projects_store_setup.clone();
             tauri::async_runtime::spawn(async move {
                 crate::docker::reap_probe_containers().await;
+                // Probe *images* too, and for a sharper reason: a probe
+                // container merely pins an image the sweep then refuses to
+                // touch, whereas a leftover probe image is tagged and so
+                // nothing else in this app can ever collect it. See
+                // `reap_probe_images`.
+                crate::docker::reap_probe_images().await;
                 let reaped = crate::docker::reap_stale_migration_pins().await;
                 if reaped > 0 {
                     log::info!("Startup housekeeping dropped {} stale rollback pin(s)", reaped);

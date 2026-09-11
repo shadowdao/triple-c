@@ -456,6 +456,63 @@ security update. Migration is the non-destructive way out; Reset is the destruct
   bump: churn on the old base, and it would consume the "you should migrate" signal without
   migrating. `get_container_staleness` surfaces it; `migrate_project_to_base` acts on it.
 - **A missing lineage label means "unknown, probe instead", never "stale".**
+- **The snapshot image is not a checkpoint — never read its absence as "nothing to inspect".**
+  `commit_container_snapshot` runs only before a container is destroyed (a config-change recreate)
+  or inside a migration. **Never on stop.** So a project in daily use for a year can legitimately
+  have no `triple-c-snapshot-{id}:latest` at all, and one that has is stale by everything installed
+  since. `pick_probe_source` therefore reads a *stopped* container directly — commit its writable
+  layer to a unique `triple-c-probe-*` image, probe that, drop it — and ranks it **above** the snapshot,
+  for the same reason a running container already outranked it. Assuming a snapshot existed is what
+  made a stopped, never-recreated project report "no container or snapshot image yet" with its
+  container sitting right there, and left Update disabled on the projects furthest behind.
+- **`bollard` never gives you the image id back from a commit.** Its `Commit` response model
+  deserialises `"ID"`; the daemon sends `"Id"`, so `commit_container` returns `id: None` every time
+  (verified: bollard 0.18.1, Engine 29.6). Neither long-standing commit site notices because both
+  discard the response — but it means any commit you need a *reference* to has to be **tagged**.
+- **A tagged leftover is the one orphan no sweep can reach, so the probe image has its own reaper.**
+  `sweep_orphaned_snapshots` collects `dangling` + `triple-c.managed=true`; `reap_stale_migration_pins`
+  and `scrub_secrets_from_snapshots` both filter `triple-c-snapshot-*`. A `triple-c-probe-*` image is
+  tagged and so matches none of them, which would make a crashed probe a permanent multi-gigabyte
+  leak with no UI to find it. `reap_probe_images` runs at startup beside `reap_probe_containers` and
+  is **load-bearing, not tidying** — it is also what makes the probe image's unscrubbed writable
+  layer acceptable. Two rules it earned the hard way:
+  - **Age-gate it** (`PROBE_REAP_MIN_AGE_SECS`, same as the container reaper). `reference=` is
+    daemon-wide, so a second copy of the app has live probe images matching the glob.
+  - **Remove by tag, never by image id.** A `force` removal by id untags an image *everywhere*; a
+    fixture that tagged `alpine:latest` into this namespace deleted the user's alpine that way.
+- **Probe image names are unique per call, and must stay that way.** A stable per-container name was
+  tried: container ids do not survive a recreate, so most leftovers were stranded permanently, and
+  two concurrent probes fought over one tag — whichever finished first force-removed the image the
+  other was still reading, reporting a bogus `probe_error` on a healthy project. `get_container_staleness`
+  takes no `project_lock` claim (the migration banner needs it to answer *during* a migration), so
+  uniqueness is what makes overlapping probes safe.
+- **The stopped-container probe is cached per stop, and that is not an optimisation you may drop.**
+  `getContainerStaleness` is called from a `useEffect` that fires whenever the container settles, so
+  merely opening a stopped project's Overview probes it. Uncached that is a `docker commit` of the
+  whole writable layer per visit — measured at 44 s on a real project, against ~3 s for the snapshot
+  probe it replaced. `STOPPED_MANIFEST_CACHE` is keyed on the container's `FinishedAt`, which is
+  exact rather than merely plausible: nothing can write to a stopped container's writable layer, and
+  `FinishedAt` moves on every stop. A live test asserts the restart case, because a cache that
+  failed to invalidate would plan a migration against a filesystem the project no longer has.
+- **Do not "skip the probe when the project is not stale" to save that cost.** It was tried. The
+  deltas would be empty while `probeSettled` (`!probing && staleness && !probe_error`) stayed *true*,
+  which leaves the migrate action in the project menu enabled — that action is not gated on the
+  banner — so the pre-flight would report nothing to copy while the backend was told to copy
+  nothing. That is the exact hazard `ProjectHome.tsx`'s `canMigrate` comment already warns about.
+- **A failed stopped-container probe falls back to the snapshot whenever one exists.** Before this
+  feature a stopped project read its snapshot directly, so surfacing a commit failure where the
+  snapshot could have answered would make the banner *worse* than it was — and the failure modes are
+  exactly the ones where the fallback earns its keep: a full disk (the commit allocates the whole
+  writable layer; the snapshot probe allocates nothing) and a 409 from a concurrent claim.
+- **`get_container_staleness` never commits while the project is claimed.** It takes no
+  `project_lock` claim itself, deliberately — the banner has to answer *during* a migration — so it
+  reads `project_lock::held` instead and probes the snapshot rather than the container. The
+  collision is not symmetric: the probe losing is a retryable `probe_error`, but
+  `start_project_container` removes the old container with a hard `?`, so a remove that raced a
+  commit would fail the user's Start with an opaque error.
+- **An image's `Created` is the image's own, not its tag's.** Tagging an existing image gives you
+  that image's age; BuildKit stamps `docker build` output with a fixed epoch. Only `docker commit`
+  stamps *now* — which is what real probe images do, and what any fixture for them must do.
 - **`:latest` keeps pointing at the old lineage until the final commit.** That is what makes every
   crash before that point self-heal — `start_project_container` just recreates from the old
   snapshot. After the container swap, the new container's `triple-c.migration-state=in-progress`

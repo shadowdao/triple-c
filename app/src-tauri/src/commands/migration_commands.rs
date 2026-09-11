@@ -92,8 +92,111 @@ fn pick_recorded_lineage(
         .or_else(|| from_snapshot.filter(|v| !v.is_empty()))
 }
 
-/// Read-only. Runs two filesystem probes (~3 s each) and is therefore meant to
-/// be called on demand, not polled.
+/// Reported as `probe_error` when there is genuinely nothing to read: no
+/// container, stopped or otherwise, and no snapshot image.
+///
+/// It used to be reported for a *stopped* container too, which was simply
+/// untrue — the container was sitting right there — and it disabled Update on
+/// exactly the long-lived projects that had never been recreated and so had no
+/// snapshot to fall back on.
+const NOTHING_TO_PROBE: &str = "This project has no container or snapshot image yet, so there is nothing to compare against the base image.";
+
+/// Where [`get_container_staleness`] reads the project's *current* filesystem
+/// from, in descending order of how current the answer is.
+#[derive(Debug, PartialEq, Eq)]
+enum ProbeSource {
+    /// `docker exec` into the live container. The only source that includes
+    /// everything installed since the last commit *in this session*.
+    RunningContainer,
+    /// Commit the stopped container's writable layer to a throwaway image and
+    /// probe that. Exactly as current as the container, which is what makes it
+    /// preferable to the snapshot — see below.
+    StoppedContainer,
+    /// A throwaway container from `triple-c-snapshot-<id>:latest`.
+    Snapshot,
+    /// Nothing to read: no container, no snapshot.
+    Nothing,
+}
+
+/// Pick the probe source. `container_running` is `None` when the project has no
+/// container at all, `Some(false)` when it has a stopped one.
+///
+/// **A stopped container outranks the snapshot.** The snapshot image is not a
+/// checkpoint — `commit_container_snapshot` runs only before a removal (a
+/// config-change recreate) or inside a migration, so a project that has never
+/// hit either has *no snapshot at all*, however long it has been in use, and
+/// one that has is stale by everything installed since. The container's
+/// writable layer is the truth in both cases. This is the same argument
+/// [`mig::manifest_from_container`] already makes for the running case; it does
+/// not stop applying when the container is stopped.
+///
+/// Getting this wrong is what made a stopped, never-recreated project report
+/// "no container or snapshot image yet" — with its container sitting right
+/// there — and left Update disabled on the projects that most needed it.
+fn pick_probe_source(container_running: Option<bool>, snapshot_exists: bool) -> ProbeSource {
+    match (container_running, snapshot_exists) {
+        (Some(true), _) => ProbeSource::RunningContainer,
+        (Some(false), _) => ProbeSource::StoppedContainer,
+        (None, true) => ProbeSource::Snapshot,
+        (None, false) => ProbeSource::Nothing,
+    }
+}
+
+/// Reported as `probe_error` when another operation owns the project and there
+/// is no snapshot image to read instead. Deliberately not a claim about the
+/// container: nothing is wrong with it, the answer is simply not safe to take
+/// right now. See [`stopped_probe_policy`].
+const PROJECT_BUSY: &str = "Another operation is running on this project, so its contents could not be inspected. Try again once it finishes.";
+
+/// What to do about a stopped container, whose probe is the expensive one: it
+/// commits the writable layer before it can read anything.
+#[derive(Debug, PartialEq, Eq)]
+enum StoppedProbe {
+    /// Commit and probe. The current answer, and the default.
+    Commit,
+    /// Probe the snapshot image instead. Less current — it lags the container by
+    /// everything installed since the last commit — but it allocates nothing and
+    /// touches nothing, which is what makes it the right answer while another
+    /// operation owns the container.
+    SnapshotInstead,
+    /// Report rather than guess.
+    Defer,
+}
+
+/// Pick what to do about a stopped container.
+///
+/// **Never commits while the project is claimed.** `get_container_staleness`
+/// takes no [`crate::project_lock`] claim of its own, by design, so a commit
+/// here can overlap a Recreate or Reset — and the collision is not symmetric.
+/// The probe losing is harmless: a surfaced `probe_error` the user retries. The
+/// *recreate* losing is not, because `start_project_container` removes the old
+/// container with a hard `?`, so a non-404 from a remove that raced this commit
+/// fails the whole Start with an opaque "Failed to remove container". Reading
+/// the claim costs nothing and takes that failure off the table.
+fn stopped_probe_policy(project_is_busy: bool, snapshot_exists: bool) -> StoppedProbe {
+    match (project_is_busy, snapshot_exists) {
+        (false, _) => StoppedProbe::Commit,
+        (true, true) => StoppedProbe::SnapshotInstead,
+        (true, false) => StoppedProbe::Defer,
+    }
+}
+
+/// Runs two filesystem probes (~3 s each) and is therefore meant to be called
+/// on demand, not polled.
+///
+/// **Not read-only, despite only reporting.** The stopped-container path commits
+/// a throwaway image and force-removes it, which makes this a writer of a
+/// `triple-c-probe-*` image and puts it in the class of thing
+/// [`crate::project_lock`] exists for — and it takes no claim. That is
+/// deliberate: this is what the migration banner calls to decide whether to
+/// offer an update, including while a migration is in flight, so refusing it
+/// under a claim would blank the banner exactly when it has the most to say.
+/// The exposure is bounded to a surfaced error — a concurrent Recreate, Reset or
+/// migration can remove the container out from under the commit, and the result
+/// is a `probe_error` the user can retry, never a damaged container or a
+/// mislabelled image. Two overlapping probes cannot collide either, because
+/// probe image names are unique per call; see
+/// [`crate::docker::container::get_probe_image_name`].
 #[tauri::command]
 pub async fn get_container_staleness(
     project_id: String,
@@ -145,16 +248,62 @@ pub async fn get_container_staleness(
     };
 
     // ── Probes ───────────────────────────────────────────────────────────
-    let running = match &container_id {
-        Some(id) => docker::is_container_running(id).await.unwrap_or(false),
-        None => false,
+    let container_running = match &container_id {
+        Some(id) => Some(docker::is_container_running(id).await.unwrap_or(false)),
+        None => None,
     };
-    let from_manifest = if running {
-        mig::manifest_from_container(container_id.as_ref().unwrap()).await
-    } else if docker::image_exists(&snapshot_image).await.unwrap_or(false) {
-        mig::manifest_from_image(&snapshot_image).await
-    } else {
-        Err("This project has no container or snapshot image yet, so there is nothing to compare against the base image.".to_string())
+    let snapshot_exists = docker::image_exists(&snapshot_image).await.unwrap_or(false);
+    let from_manifest = match (
+        pick_probe_source(container_running, snapshot_exists),
+        &container_id,
+    ) {
+        (ProbeSource::RunningContainer, Some(id)) => mig::manifest_from_container(id).await,
+        (ProbeSource::StoppedContainer, Some(id)) => {
+            let busy = crate::project_lock::held(&project_id).is_some();
+            match stopped_probe_policy(busy, snapshot_exists) {
+                StoppedProbe::Commit => {
+                    match mig::manifest_from_stopped_container_cached(id).await {
+                        Ok(m) => Ok(m),
+                        // **Never let a failed commit cost an answer the
+                        // snapshot could have given.** Before stopped
+                        // containers were readable at all, a stopped project
+                        // fell straight through to its snapshot, so surfacing
+                        // this error where the snapshot exists would make the
+                        // banner *worse* than it was — and the ways this fails
+                        // are the ones where the fallback matters most: a full
+                        // disk (the commit has to allocate the whole writable
+                        // layer; the snapshot probe allocates nothing) and a
+                        // 409 from an operation that claimed the project after
+                        // the check above.
+                        Err(e) if snapshot_exists => {
+                            log::warn!(
+                                "Probing the stopped container for project {} failed ({}) — \
+                                 falling back to its snapshot image, which may lag it",
+                                project_id,
+                                e
+                            );
+                            mig::manifest_from_image(&snapshot_image).await
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                StoppedProbe::SnapshotInstead => {
+                    log::info!(
+                        "Project {} is claimed by another operation — probing its snapshot image \
+                         rather than committing the container",
+                        project_id
+                    );
+                    mig::manifest_from_image(&snapshot_image).await
+                }
+                StoppedProbe::Defer => Err(PROJECT_BUSY.to_string()),
+            }
+        }
+        (ProbeSource::Snapshot, _) => mig::manifest_from_image(&snapshot_image).await,
+        // `container_running` is `Some` exactly when `container_id` is, so the
+        // two arms above are the only ones those variants can reach. This arm
+        // is `ProbeSource::Nothing` — and now *only* that: it used to also
+        // swallow every stopped container, which is the bug.
+        (_, _) => Err(NOTHING_TO_PROBE.to_string()),
     };
 
     let (from_manifest, base_manifest) = match from_manifest {
@@ -1962,6 +2111,59 @@ mod tests {
         assert_eq!(pick_recorded_lineage(None, None), None);
         assert_eq!(pick_recorded_lineage(some(""), some("")), None);
         assert_eq!(pick_recorded_lineage(some(""), None), None);
+    }
+
+    #[test]
+    fn a_stopped_container_is_probed_rather_than_reported_missing() {
+        // The regression: a container that exists but is stopped, with no
+        // snapshot ever taken, read as "nothing to compare against".
+        assert_eq!(
+            pick_probe_source(Some(false), false),
+            ProbeSource::StoppedContainer
+        );
+    }
+
+    #[test]
+    fn the_container_outranks_the_snapshot_whether_or_not_it_is_running() {
+        // The snapshot lags the container by everything installed since the
+        // last commit, in both states.
+        assert_eq!(
+            pick_probe_source(Some(true), true),
+            ProbeSource::RunningContainer
+        );
+        assert_eq!(
+            pick_probe_source(Some(false), true),
+            ProbeSource::StoppedContainer
+        );
+    }
+
+    #[test]
+    fn the_snapshot_is_the_fallback_only_once_the_container_is_gone() {
+        assert_eq!(pick_probe_source(None, true), ProbeSource::Snapshot);
+    }
+
+    #[test]
+    fn nothing_to_probe_is_reserved_for_no_container_and_no_snapshot() {
+        // The one case the "no container or snapshot image yet" message may
+        // still describe.
+        assert_eq!(pick_probe_source(None, false), ProbeSource::Nothing);
+    }
+
+    #[test]
+    fn a_stopped_container_is_committed_only_when_nothing_else_owns_the_project() {
+        assert_eq!(stopped_probe_policy(false, false), StoppedProbe::Commit);
+        assert_eq!(stopped_probe_policy(false, true), StoppedProbe::Commit);
+    }
+
+    #[test]
+    fn a_busy_project_falls_back_rather_than_racing_a_recreate() {
+        // The snapshot lags, but a stale answer beats failing someone's Start.
+        assert_eq!(
+            stopped_probe_policy(true, true),
+            StoppedProbe::SnapshotInstead
+        );
+        // Nothing to fall back to: say so instead of committing anyway.
+        assert_eq!(stopped_probe_policy(true, false), StoppedProbe::Defer);
     }
 
     #[test]
