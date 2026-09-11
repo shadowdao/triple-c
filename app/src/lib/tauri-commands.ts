@@ -350,8 +350,8 @@ export const sweepClaudeTokenSnapshots = () =>
 // without deleting its volumes. Reset is the destructive alternative: it wipes
 // ~/.claude, the OAuth credential, installed skills and every transcript.
 //
-// Flow: getContainerStaleness (read-only, ~6s — two filesystem probes, so call
-// it on demand rather than polling) → migrateProjectToBase → the project sits
+// Flow: getContainerStaleness (~6s — two filesystem probes, so call it on demand
+// rather than polling) → migrateProjectToBase → the project sits
 // in "awaiting-confirmation" while the user tries it → confirmMigration or
 // rollbackMigration.
 //
@@ -361,7 +361,19 @@ export const sweepClaudeTokenSnapshots = () =>
 //
 // Progress arrives on the existing `container-progress` event.
 
-/** Read-only. Runs two container/image filesystem probes; not for polling. */
+/**
+ * Runs two container/image filesystem probes; not for polling.
+ *
+ * **Not read-only, despite only reporting.** When the container is *stopped*
+ * the backend has to commit its writable layer to a throwaway image before it
+ * can read anything — `docker exec` needs a running container — so this writes
+ * (and then removes) an image. The result is cached per stop, so repeat calls
+ * while the container stays stopped are cheap, but the first one after each stop
+ * pays for a commit of the whole layer: seconds on a small project, tens of
+ * seconds on a large one. Do not add a caller that fires more often than "the
+ * container settled into a new state" without re-reading
+ * `get_container_staleness`'s doc comment first.
+ */
 export const getContainerStaleness = (projectId: string) =>
   invoke<ContainerStaleness>("get_container_staleness", { projectId });
 

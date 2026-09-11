@@ -142,6 +142,45 @@ fn pick_probe_source(container_running: Option<bool>, snapshot_exists: bool) -> 
     }
 }
 
+/// Reported as `probe_error` when another operation owns the project and there
+/// is no snapshot image to read instead. Deliberately not a claim about the
+/// container: nothing is wrong with it, the answer is simply not safe to take
+/// right now. See [`stopped_probe_policy`].
+const PROJECT_BUSY: &str = "Another operation is running on this project, so its contents could not be inspected. Try again once it finishes.";
+
+/// What to do about a stopped container, whose probe is the expensive one: it
+/// commits the writable layer before it can read anything.
+#[derive(Debug, PartialEq, Eq)]
+enum StoppedProbe {
+    /// Commit and probe. The current answer, and the default.
+    Commit,
+    /// Probe the snapshot image instead. Less current — it lags the container by
+    /// everything installed since the last commit — but it allocates nothing and
+    /// touches nothing, which is what makes it the right answer while another
+    /// operation owns the container.
+    SnapshotInstead,
+    /// Report rather than guess.
+    Defer,
+}
+
+/// Pick what to do about a stopped container.
+///
+/// **Never commits while the project is claimed.** `get_container_staleness`
+/// takes no [`crate::project_lock`] claim of its own, by design, so a commit
+/// here can overlap a Recreate or Reset — and the collision is not symmetric.
+/// The probe losing is harmless: a surfaced `probe_error` the user retries. The
+/// *recreate* losing is not, because `start_project_container` removes the old
+/// container with a hard `?`, so a non-404 from a remove that raced this commit
+/// fails the whole Start with an opaque "Failed to remove container". Reading
+/// the claim costs nothing and takes that failure off the table.
+fn stopped_probe_policy(project_is_busy: bool, snapshot_exists: bool) -> StoppedProbe {
+    match (project_is_busy, snapshot_exists) {
+        (false, _) => StoppedProbe::Commit,
+        (true, true) => StoppedProbe::SnapshotInstead,
+        (true, false) => StoppedProbe::Defer,
+    }
+}
+
 /// Runs two filesystem probes (~3 s each) and is therefore meant to be called
 /// on demand, not polled.
 ///
@@ -220,7 +259,44 @@ pub async fn get_container_staleness(
     ) {
         (ProbeSource::RunningContainer, Some(id)) => mig::manifest_from_container(id).await,
         (ProbeSource::StoppedContainer, Some(id)) => {
-            mig::manifest_from_stopped_container(id).await
+            let busy = crate::project_lock::held(&project_id).is_some();
+            match stopped_probe_policy(busy, snapshot_exists) {
+                StoppedProbe::Commit => {
+                    match mig::manifest_from_stopped_container_cached(id).await {
+                        Ok(m) => Ok(m),
+                        // **Never let a failed commit cost an answer the
+                        // snapshot could have given.** Before stopped
+                        // containers were readable at all, a stopped project
+                        // fell straight through to its snapshot, so surfacing
+                        // this error where the snapshot exists would make the
+                        // banner *worse* than it was — and the ways this fails
+                        // are the ones where the fallback matters most: a full
+                        // disk (the commit has to allocate the whole writable
+                        // layer; the snapshot probe allocates nothing) and a
+                        // 409 from an operation that claimed the project after
+                        // the check above.
+                        Err(e) if snapshot_exists => {
+                            log::warn!(
+                                "Probing the stopped container for project {} failed ({}) — \
+                                 falling back to its snapshot image, which may lag it",
+                                project_id,
+                                e
+                            );
+                            mig::manifest_from_image(&snapshot_image).await
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                StoppedProbe::SnapshotInstead => {
+                    log::info!(
+                        "Project {} is claimed by another operation — probing its snapshot image \
+                         rather than committing the container",
+                        project_id
+                    );
+                    mig::manifest_from_image(&snapshot_image).await
+                }
+                StoppedProbe::Defer => Err(PROJECT_BUSY.to_string()),
+            }
         }
         (ProbeSource::Snapshot, _) => mig::manifest_from_image(&snapshot_image).await,
         // `container_running` is `Some` exactly when `container_id` is, so the
@@ -2071,6 +2147,23 @@ mod tests {
         // The one case the "no container or snapshot image yet" message may
         // still describe.
         assert_eq!(pick_probe_source(None, false), ProbeSource::Nothing);
+    }
+
+    #[test]
+    fn a_stopped_container_is_committed_only_when_nothing_else_owns_the_project() {
+        assert_eq!(stopped_probe_policy(false, false), StoppedProbe::Commit);
+        assert_eq!(stopped_probe_policy(false, true), StoppedProbe::Commit);
+    }
+
+    #[test]
+    fn a_busy_project_falls_back_rather_than_racing_a_recreate() {
+        // The snapshot lags, but a stale answer beats failing someone's Start.
+        assert_eq!(
+            stopped_probe_policy(true, true),
+            StoppedProbe::SnapshotInstead
+        );
+        // Nothing to fall back to: say so instead of committing anyway.
+        assert_eq!(stopped_probe_policy(true, false), StoppedProbe::Defer);
     }
 
     #[test]
