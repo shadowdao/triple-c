@@ -199,15 +199,14 @@ describe("UrlToast", () => {
       );
     });
 
-    it("leads with the host when the caller says so, without hiding the other", () => {
-      // A live auth bridge, or a container with no browser installed. The pair
-      // is unchanged; only the order and which one is filled.
+    it("leads with the host, and promises the bridge, when the bridge is live", () => {
+      // The pair is unchanged; only the order and which one is filled.
       render(
         <UrlToast
           url={SIGN_IN}
           onOpen={noop}
           onOpenInContainer={noop}
-          signInDefault="host"
+          signInDefault="host-bridged"
           onDismiss={noop}
         />,
       );
@@ -215,15 +214,46 @@ describe("UrlToast", () => {
       expect(
         document.querySelector(URL_TOAST_PRIMARY_SELECTOR),
       ).toHaveTextContent("Open");
-      // Still recognised as a sign-in, so the explanation stays.
+      // Still recognised as a sign-in, so the explanation stays — and here the
+      // explanation is true, which is the only state in which it may be given.
       expect(screen.getByTestId("url-toast-signin-hint")).toHaveTextContent(
-        /auth bridge/i,
+        /the auth bridge is what carries the callback/i,
       );
     });
 
-    it("defaults to the host when the caller passes nothing", () => {
-      // The safe fallback: the answer more likely to work, and the one that
-      // reports its own failure.
+    it("says the callback has nothing carrying it when the host is the last resort", () => {
+      // `host-fallback`: bridge off or unknown *and* no browser in the
+      // container. The old two-state hint said the auth bridge would carry the
+      // callback here too, which is a false promise — the user opens the link
+      // in their own browser and `claude login` hangs to its timeout with
+      // nothing on screen explaining why.
+      render(
+        <UrlToast
+          url={SIGN_IN}
+          onOpen={noop}
+          onOpenInContainer={noop}
+          signInDefault="host-fallback"
+          onDismiss={noop}
+        />,
+      );
+      // Which button leads does not change — only what the hint claims.
+      expect(actions()).toEqual(["Open", "In container"]);
+      expect(
+        document.querySelector(URL_TOAST_PRIMARY_SELECTOR),
+      ).toHaveTextContent("Open");
+      const hint = screen.getByTestId("url-toast-signin-hint");
+      expect(hint).toHaveTextContent(/nothing is set up to reach it/i);
+      // And it points at the two things that would fix it, since a warning
+      // with no next step is only a nicer way to fail.
+      expect(hint).toHaveTextContent(/Auth bridge/);
+      expect(hint).toHaveTextContent(/install browser support/i);
+      expect(hint).not.toHaveTextContent(/the auth bridge is what carries the callback/i);
+    });
+
+    it("defaults to the least-bad reading when the caller passes nothing", () => {
+      // A caller that says nothing has not told us a bridge is live, so the
+      // hint must not invent one. The host still leads: it is the answer more
+      // likely to work, and the one that reports its own failure.
       render(
         <UrlToast
           url={SIGN_IN}
@@ -233,6 +263,9 @@ describe("UrlToast", () => {
         />,
       );
       expect(actions()).toEqual(["Open", "In container"]);
+      expect(screen.getByTestId("url-toast-signin-hint")).toHaveTextContent(
+        /nothing is set up to reach it/i,
+      );
     });
 
     it("keeps the host browser available as a fallback", () => {

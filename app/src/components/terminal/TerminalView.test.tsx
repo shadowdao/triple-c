@@ -626,7 +626,7 @@ describe("chooseSignInTarget — which action leads for a sign-in link", () => {
   // and the container-side target is Playwright's pane, whose browsers are not
   // in the image.
   it("prefers the host browser whenever the bridge is live", () => {
-    expect(chooseSignInTarget(LIVE_BRIDGE, usableDetection())).toBe("host");
+    expect(chooseSignInTarget(LIVE_BRIDGE, usableDetection())).toBe("host-bridged");
   });
 
   it("does not call a bridge live while it is holding a port conflict", () => {
@@ -644,13 +644,17 @@ describe("chooseSignInTarget — which action leads for a sign-in link", () => {
     // There is nothing to bridge until the CLI binds its listener, and that
     // races the URL reaching the transcript. Requiring a port would make the
     // default flip between two identical sign-ins.
-    expect(chooseSignInTarget(LIVE_BRIDGE, null)).toBe("host");
+    expect(chooseSignInTarget(LIVE_BRIDGE, null)).toBe("host-bridged");
   });
 
   it("falls to the container only when it has a browser to open", () => {
     const off: AuthBridgeStatus = { enabled: false, active_ports: [], conflicts: [] };
     expect(chooseSignInTarget(off, usableDetection())).toBe("container");
-    expect(chooseSignInTarget(off, null)).toBe("host");
+    // Not plain "host": with the bridge off and no browser inside, nothing is
+    // carrying the callback, and the toast's hint has to say so rather than
+    // promising a bridge. That distinction is the whole reason this answer is
+    // three-valued.
+    expect(chooseSignInTarget(off, null)).toBe("host-fallback");
     // Packages installed, cache empty — the fresh-project state, and the one
     // that used to be the silent default.
     expect(
@@ -658,13 +662,27 @@ describe("chooseSignInTarget — which action leads for a sign-in link", () => {
         off,
         usableDetection({ browsers: [], chromium_executable_exists: false }),
       ),
-    ).toBe("host");
+    ).toBe("host-fallback");
     // Playwright too old to bind: the pane cannot show it either.
-    expect(chooseSignInTarget(off, usableDetection({ has_bind: false }))).toBe("host");
+    expect(chooseSignInTarget(off, usableDetection({ has_bind: false }))).toBe(
+      "host-fallback",
+    );
   });
 
-  it("answers host when nothing is known at all", () => {
-    expect(chooseSignInTarget(null, null)).toBe("host");
+  it("answers the host *fallback* when nothing is known at all", () => {
+    // "Unknown" must not read as "bridged". A status call that never answered
+    // is not evidence that something will carry the callback home.
+    expect(chooseSignInTarget(null, null)).toBe("host-fallback");
+  });
+
+  it("separates a live bridge from the least-bad answer, though both lead with the host", () => {
+    const off: AuthBridgeStatus = { enabled: false, active_ports: [], conflicts: [] };
+    // The two states the old two-valued answer collapsed together. Folding them
+    // back into one is what let the toast tell a user with the bridge disabled
+    // that the bridge would carry their callback.
+    expect(chooseSignInTarget(LIVE_BRIDGE, null)).not.toBe(
+      chooseSignInTarget(off, null),
+    );
   });
 });
 
@@ -725,6 +743,26 @@ describe("TerminalView — the sign-in default follows the project", () => {
     // default at it failed on every platform, silently.
     await mountWithPrompt();
     expect(primaryLabel()).toBe("Open");
+  });
+
+  it("does not promise the auth bridge on a project that has it switched off", async () => {
+    // The end-to-end version of the three-state answer: bridge off, no browser
+    // inside. The host still leads, because it is the least bad of two answers
+    // that can both fail — but the hint must not tell the user the bridge is
+    // bringing their callback home, because there is no bridge. That hint is
+    // what sent people to a host browser and a login that hung to its timeout.
+    await mountWithPrompt();
+    const hint = document.querySelector('[data-testid="url-toast-signin-hint"]');
+    expect(hint?.textContent).toMatch(/nothing is set up/i);
+    expect(hint?.textContent).not.toMatch(/what carries the callback/i);
+  });
+
+  it("does promise it when the bridge is actually live", async () => {
+    containerEnv.bridge = LIVE_BRIDGE;
+    await mountWithPrompt();
+    const hint = document.querySelector('[data-testid="url-toast-signin-hint"]');
+    expect(hint?.textContent).toMatch(/auth bridge/i);
+    expect(hint?.textContent).not.toMatch(/nothing is set up/i);
   });
 });
 
@@ -790,6 +828,108 @@ describe("TerminalView — a host open that fails says so", () => {
       await Promise.resolve();
     });
     expect(openUrlExternal).toHaveBeenCalledWith(URL);
+    expect(document.querySelector(URL_TOAST_SELECTOR)).toBeNull();
+  });
+});
+
+describe("TerminalView — an open in flight must not blank a newer prompt", () => {
+  // The window is real and is measured in hundreds of milliseconds, not in
+  // microtasks: on Linux the opener sleeps `OPENER_GRACE` (400 ms, doubled when
+  // `xdg-open` fails and `gio` is tried) before resolving. The container is free
+  // to relay a second URL inside it — a `gh auth login` right after a
+  // `claude login` is the ordinary way that happens — and the toast slot is
+  // shared, so by the time the first open answers the slot may be holding a
+  // prompt the user has never seen. Blanking it loses that URL for good: it
+  // exists nowhere but the container's transcript.
+  const URL_A = "https://github.com/login/device?code=AAAA-1111";
+  const URL_B = "https://claude.ai/oauth/authorize?code=true&client_id=b";
+
+  function relaySequence(url: string): number[] {
+    return Array.from(
+      new TextEncoder().encode(`\x1b]7777;open;${btoa(url)}\x07`),
+    );
+  }
+
+  async function emitRelay(url: string) {
+    const emit = ptyOutput.listeners.get("terminal-output-s1");
+    if (!emit) throw new Error("no terminal-output listener registered");
+    await act(async () => {
+      emit({ payload: relaySequence(url) });
+      await new Promise((r) => setTimeout(r, 0));
+      await new Promise((r) => setTimeout(r, 0));
+    });
+  }
+
+  function openButton(): HTMLElement {
+    const el = Array.from(document.querySelectorAll("button")).find(
+      (b) => b.textContent === "Open",
+    );
+    if (!el) throw new Error("Open button not found");
+    return el as HTMLElement;
+  }
+
+  function promptedUrl(): string | null {
+    return (
+      document
+        .querySelector('[data-testid="url-toast-url"]')
+        ?.getAttribute("title") ?? null
+    );
+  }
+
+  /** An `openUrlExternal` that hangs until the test lets it finish. */
+  function deferredOpen(): () => void {
+    let finish: () => void = () => {};
+    vi.mocked(openUrlExternal).mockReturnValueOnce(
+      new Promise<void>((resolve) => {
+        finish = () => resolve();
+      }),
+    );
+    return () => finish();
+  }
+
+  it("keeps URL B's prompt when A's open resolves after B arrived", async () => {
+    const finishOpen = deferredOpen();
+    mountSession("claude");
+    await act(async () => {});
+    await emitRelay(URL_A);
+
+    await act(async () => {
+      fireEvent.click(openButton());
+    });
+    expect(openUrlExternal).toHaveBeenCalledWith(URL_A);
+
+    // The container supersedes it while the opener is still inside its grace.
+    await emitRelay(URL_B);
+    expect(promptedUrl()).toBe(URL_B);
+
+    await act(async () => {
+      finishOpen();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(document.querySelector(URL_TOAST_SELECTOR)).not.toBeNull();
+    expect(promptedUrl()).toBe(URL_B);
+  });
+
+  it("still dismisses when the slot is holding the prompt that was opened", async () => {
+    // The other half of the guard: it must not turn "dismiss on success" into
+    // "never dismiss". Same deferred open, nothing superseding it.
+    const finishOpen = deferredOpen();
+    mountSession("claude");
+    await act(async () => {});
+    await emitRelay(URL_A);
+
+    await act(async () => {
+      fireEvent.click(openButton());
+    });
+    expect(document.querySelector(URL_TOAST_SELECTOR)).not.toBeNull();
+
+    await act(async () => {
+      finishOpen();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
     expect(document.querySelector(URL_TOAST_SELECTOR)).toBeNull();
   });
 });

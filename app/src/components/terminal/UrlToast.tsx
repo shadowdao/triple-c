@@ -1,5 +1,6 @@
 import type { KeyboardEvent } from "react";
 import { isAnthropicSignInUrl, urlOrigin } from "../../lib/urlRelay";
+import type { SignInOpenTarget } from "../../hooks/useSignInOpenTarget";
 import Button from "../ui/Button";
 
 /**
@@ -38,17 +39,23 @@ interface Props {
    *  the project has no browser to open it in. */
   onOpenInContainer?: () => void;
   /**
-   * Which action leads for a *sign-in* link (see the note below). Nothing else
-   * in the toast moves: both buttons are offered either way, in either order.
+   * Which action leads for a *sign-in* link, and why (see the note below).
+   * Nothing else in the toast moves: both buttons are offered in all three
+   * states, in one of two orders.
    *
    * This component does not work it out, because the answer depends on the
    * project's auth bridge and on what is installed inside its container —
    * neither of which a presentational component should be reaching for.
-   * `hooks/useSignInOpenTarget.ts` owns the rule. `"host"` is the default here
-   * for the same reason it is the fallback there: it is the answer that is more
-   * likely to work, and the one that reports its own failure.
+   * `hooks/useSignInOpenTarget.ts` owns the rule.
+   *
+   * Two of the three lead with the host button and differ only in the hint,
+   * which is the whole point of carrying three: `"host-bridged"` may promise
+   * that the auth bridge brings the callback home, `"host-fallback"` may not,
+   * because in that state nothing does. `"host-fallback"` is the default for
+   * that reason — a caller that says nothing has not told us a bridge is live,
+   * and the hint must not invent one.
    */
-  signInDefault?: "host" | "container";
+  signInDefault?: SignInOpenTarget;
   onDismiss: () => void;
 }
 
@@ -84,6 +91,12 @@ interface Props {
  * passes {@link Props.signInDefault} and this only renders it: the leading
  * button is filled and comes first, the other keeps its place beside it.
  *
+ * The hint below the URL renders all *three* states, not the two orderings.
+ * "Neither is set up" also leads with the host, but it is not the same claim:
+ * there the callback has nothing carrying it, so the hint names what would fix
+ * that instead of describing a bridge that is off. A two-way hint keyed on
+ * which button leads is exactly how that false promise got shipped.
+ *
  * ## Reachable without a mouse, and it does not take focus to manage it
  *
  * This toast is the only route to completing a sign-in started in a terminal,
@@ -111,7 +124,7 @@ export default function UrlToast({
   label = "Long URL detected",
   onOpen,
   onOpenInContainer,
-  signInDefault = "host",
+  signInDefault = "host-fallback",
   onDismiss,
 }: Props) {
   const origin = urlOrigin(url);
@@ -123,6 +136,11 @@ export default function UrlToast({
   // container. Everything below keys off this rather than off `signIn`, so the
   // two orderings differ only in which of the pair leads.
   const containerLeads = signIn && signInDefault === "container";
+  // The third state. Both host states put the same button first, so this is
+  // read by the hint alone: no bridge and no container browser means nothing is
+  // carrying the callback back, and saying "the auth bridge is what carries it"
+  // here is a promise the project cannot keep.
+  const hostIsLastResort = signIn && signInDefault === "host-fallback";
 
   // `Button` already owns the filled/outlined variants — including the rule
   // that filled uses `--accent-emphasis` and never `--accent`, which is the
@@ -257,7 +275,9 @@ export default function UrlToast({
           >
             {containerLeads
               ? "Sign-in link — the callback listener is inside the container. Opening it there closes the loop; the host browser needs the auth bridge."
-              : "Sign-in link — the callback listener is inside the container. The auth bridge is what carries the callback back to it from your own browser."}
+              : hostIsLastResort
+                ? "Sign-in link — the callback listener is inside the container and nothing is set up to reach it. Turn on Auth bridge in the project’s Config tab, or install browser support to sign in inside the container."
+                : "Sign-in link — the callback listener is inside the container. The auth bridge is what carries the callback back to it from your own browser."}
           </div>
         )}
       </div>

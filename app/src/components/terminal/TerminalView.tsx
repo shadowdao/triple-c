@@ -49,6 +49,22 @@ interface Props {
  */
 export type PromptSource = "relay" | UrlSource;
 
+/**
+ * What the shared prompt slot holds.
+ *
+ * `seq` is identity: the slot is one long-lived place that several prompts pass
+ * through, so "is this still the prompt I acted on?" cannot be answered by the
+ * URL (the same link can legitimately be relayed twice) and must not be
+ * answered by "is anything there?". It keys the toast for remounting *and*
+ * guards the deferred dismissal — see `dismissUrlPromptIfCurrent`.
+ */
+interface UrlPrompt {
+  url: string;
+  label: string;
+  source: PromptSource;
+  seq: number;
+}
+
 /** Higher wins. Provenance, not recency. */
 const SOURCE_RANK: Record<PromptSource, number> = {
   heuristic: 0,
@@ -132,17 +148,22 @@ export default function TerminalView({ sessionId, active }: Props) {
   // replacing a first would otherwise mutate the toast in place, swapping the
   // text under a user who is mid-read and mid-click. Keying the toast on it
   // remounts the component, so a new URL is unmistakably a new prompt.
-  const [urlPrompt, setUrlPrompt] = useState<{
-    url: string;
-    label: string;
-    source: PromptSource;
-    seq: number;
-  } | null>(null);
+  const [urlPrompt, setUrlPrompt] = useState<UrlPrompt | null>(null);
   const promptSeqRef = useRef(0);
   const relayLimiterRef = useRef(new RelayRateLimiter());
-  // Read by the long-lived keyboard listener below, which is registered once
-  // and would otherwise close over the prompt as it was at mount.
-  const urlPromptRef = useRef<{ url: string } | null>(null);
+  /**
+   * A mirror of the prompt slot, written *eagerly* by the two functions that
+   * change it.
+   *
+   * Read by the long-lived keyboard listener below, which is registered once
+   * and would otherwise close over the prompt as it was at mount — and by
+   * {@link dismissUrlPromptIfCurrent}, which is the reason it is written on the
+   * spot rather than from an effect. An effect-synced mirror lags the state it
+   * mirrors by a commit, and the whole question that identity check answers is
+   * "did a new prompt land while I was awaiting?" — a mirror that has not
+   * caught up yet answers it wrong in exactly the window that matters.
+   */
+  const urlPromptRef = useRef<UrlPrompt | null>(null);
 
   /**
    * Empty the prompt slot, and put focus somewhere real if it was inside the
@@ -157,9 +178,39 @@ export default function TerminalView({ sessionId, active }: Props) {
    */
   const dismissUrlPrompt = useCallback(() => {
     const wasInside = !!document.activeElement?.closest(URL_TOAST_SELECTOR);
+    urlPromptRef.current = null;
     setUrlPrompt(null);
     if (wasInside) termRef.current?.focus();
   }, []);
+
+  /**
+   * Dismiss, but only if the slot is still holding the prompt the caller
+   * acted on.
+   *
+   * For anything that dismisses *after* awaiting. `openUrlExternal` takes at
+   * least `OPENER_GRACE` (400 ms, doubled when `xdg-open` fails and `gio` is
+   * tried) on Linux by construction, and the container can relay a second,
+   * superseding URL inside that window — at which point the slot has been
+   * remounted with prompt B and an unconditional `setUrlPrompt(null)` blanks
+   * it. The user never sees B, and B exists nowhere but the container's
+   * transcript, which is the exact failure "dismiss on success only" was
+   * introduced to prevent.
+   *
+   * This is a sibling of {@link dismissUrlPrompt} rather than an optional
+   * `expectedSeq` parameter on it, because `dismissUrlPrompt` is handed
+   * straight to `onClick`/`onDismiss`: React would call it with a `MouseEvent`
+   * as its first argument, that event would land in `expectedSeq`, and the ✕
+   * button would silently stop dismissing anything. A parameter that is only
+   * ever correct when nobody passes it by reference is not a safe signature
+   * here.
+   */
+  const dismissUrlPromptIfCurrent = useCallback(
+    (seq: number) => {
+      if (urlPromptRef.current?.seq !== seq) return;
+      dismissUrlPrompt();
+    },
+    [dismissUrlPrompt],
+  );
 
   /**
    * The only writer of the prompt slot. Re-validates whatever the caller
@@ -179,17 +230,19 @@ export default function TerminalView({ sessionId, active }: Props) {
         console.warn("Refusing to prompt for a URL that failed validation");
         return;
       }
-      setUrlPrompt((current) => {
-        if (!supersedes({ url, source }, current)) return current;
-        promptSeqRef.current += 1;
-        return { url, label, source, seq: promptSeqRef.current };
-      });
+      // Read and written through the ref rather than a functional update, so
+      // the mirror is current the instant this returns. Two prompts arriving in
+      // one tick still see each other — that is what the ref being the eager
+      // copy buys — and the seq counter no longer advances inside a state
+      // updater, which React is free to run twice.
+      if (!supersedes({ url, source }, urlPromptRef.current)) return;
+      promptSeqRef.current += 1;
+      const next: UrlPrompt = { url, label, source, seq: promptSeqRef.current };
+      urlPromptRef.current = next;
+      setUrlPrompt(next);
     },
     [],
   );
-  useEffect(() => {
-    urlPromptRef.current = urlPrompt;
-  }, [urlPrompt]);
 
   /**
    * The keyboard route into the toast.
@@ -803,11 +856,16 @@ export default function TerminalView({ sessionId, active }: Props) {
    *
    * Two things here are ordering, not decoration:
    *
-   *  - **The toast is dismissed on success only.** It used to go first, so a
-   *    failed open left the user with an empty screen and no way back to a URL
-   *    that only exists in the container's transcript. Now a failure keeps the
-   *    prompt exactly where it was, which also leaves "In container" one click
-   *    away — the fallback this failure is the argument for.
+   *  - **The toast is dismissed on success only, and only if it is still the
+   *    same toast.** Dismissing first is what this replaced: a failed open left
+   *    the user with an empty screen and no way back to a URL that only exists
+   *    in the container's transcript. Now a failure keeps the prompt exactly
+   *    where it was, which also leaves "In container" one click away — the
+   *    fallback this failure is the argument for. Waiting to dismiss opens a
+   *    second window, though: the open is awaited, the container can relay a
+   *    superseding URL while it is in flight, and blanking the slot on success
+   *    would then throw away a prompt the user has never seen. Hence the seq
+   *    check in `dismissUrlPromptIfCurrent` rather than a bare dismissal.
    *  - **The failure is a toast, not a `console.error`.** Same `pushToast` the
    *    container-browser branch below uses, because from the user's side the
    *    two actions fail identically: nothing happens.
@@ -829,8 +887,11 @@ export default function TerminalView({ sessionId, active }: Props) {
       dismissUrlPrompt();
       return;
     }
+    // The prompt this click was for. Captured before the await, because the
+    // slot may be holding a different one by the time the opener answers.
+    const openedSeq = urlPrompt.seq;
     openUrlExternal(safe)
-      .then(() => dismissUrlPrompt())
+      .then(() => dismissUrlPromptIfCurrent(openedSeq))
       .catch((e) =>
         useAppState.getState().pushToast({
           kind: "error",
@@ -839,7 +900,7 @@ export default function TerminalView({ sessionId, active }: Props) {
           dedupeKey: "host-open-failed",
         }),
       );
-  }, [urlPrompt, dismissUrlPrompt]);
+  }, [urlPrompt, dismissUrlPrompt, dismissUrlPromptIfCurrent]);
 
   /**
    * Which action leads when the prompt is holding an Anthropic sign-in link.
@@ -861,6 +922,13 @@ export default function TerminalView({ sessionId, active }: Props) {
   const handleOpenUrlInContainer = useCallback(() => {
     if (!urlPrompt) return;
     const safe = sanitizeRelayUrl(urlPrompt.url);
+    // Unconditional, and it needs no seq guard, because it happens *before* the
+    // first await: nothing else can have touched the slot between the click and
+    // this line. The success and failure reports below are toasts rather than
+    // this prompt coming back, so there is nothing here that has to survive the
+    // round trip — which is what makes dismissing up front correct here and
+    // wrong in `handleOpenUrl`. Anything that moves this dismissal after the
+    // `openPageInContainerBrowser` call has to take the seq with it.
     dismissUrlPrompt();
     if (!safe) {
       console.warn("Refusing to open a URL that failed validation");
