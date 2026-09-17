@@ -3,7 +3,6 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { WebLinksAddon } from "@xterm/addon-web-links";
-import { openUrl } from "@tauri-apps/plugin-opener";
 import "@xterm/xterm/css/xterm.css";
 import { useTerminal } from "../../hooks/useTerminal";
 import { useAppState } from "../../store/appState";
@@ -11,6 +10,7 @@ import { CLAUDE_SOFT_NEWLINE } from "../../lib/claudeInput";
 import {
   awsSsoRefresh,
   openPageInContainerBrowser,
+  openUrlExternal,
   uploadHostFileToTerminal,
 } from "../../lib/tauri-commands";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -413,7 +413,7 @@ export default function TerminalView({ sessionId, active }: Props) {
       // Same failure reporting as the toast's Open button — see the long note
       // on `handleOpenUrl`, including what this catch does *not* catch on
       // Linux. A click that appears to do nothing is the complaint either way.
-      openUrl(safe).catch((e) =>
+      openUrlExternal(safe).catch((e) =>
         useAppState.getState().pushToast({
           kind: "error",
           message: "Could not open that link in your browser",
@@ -822,14 +822,14 @@ export default function TerminalView({ sessionId, active }: Props) {
     if (!urlPrompt) return;
     // Validated again at the sink. `promptUrl` is the only writer and already
     // sanitizes, so this can only fail if that invariant is broken — which is
-    // precisely when it matters that the last thing before `openUrl` checks.
+    // precisely when it matters that the last thing before the opener checks.
     const safe = sanitizeRelayUrl(urlPrompt.url);
     if (!safe) {
       console.warn("Refusing to open a URL that failed validation");
       dismissUrlPrompt();
       return;
     }
-    openUrl(safe)
+    openUrlExternal(safe)
       .then(() => dismissUrlPrompt())
       .catch((e) =>
         useAppState.getState().pushToast({

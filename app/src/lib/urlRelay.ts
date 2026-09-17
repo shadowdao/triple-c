@@ -1,6 +1,7 @@
 /**
  * URL relay — host side of `container/triple-c-open` — and the single URL
- * validator every `openUrl` call site in the app is required to go through.
+ * validator every `openUrlExternal` call site in the app is required to go
+ * through.
  *
  * A CLI inside the container has no browser. When it wants to open a URL
  * (`gh auth login`, `aws sso login`, `gcloud auth login`, anything honouring

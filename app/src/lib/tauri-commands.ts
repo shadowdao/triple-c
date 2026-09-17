@@ -398,3 +398,18 @@ export const rollbackMigration = (projectId: string) =>
  *  app crash shows up here as phase "interrupted". */
 export const getMigrationState = (projectId: string) =>
   invoke<MigrationState | null>("get_migration_state", { projectId });
+
+/** Open a URL in the user's own browser.
+ *
+ *  Replaces `openUrl` from `@tauri-apps/plugin-opener` at every call site. On
+ *  Linux the app ships as an AppImage whose environment leaks into everything
+ *  it spawns, which kills a *cold-launched* browser before it paints while
+ *  `xdg-open` still exits 0 — so the plugin path reported success and did
+ *  nothing (triple-c#34). The Rust side hands the child a repaired environment
+ *  and re-validates the URL, which matters because these URLs originate in an
+ *  untrusted container. macOS and Windows still reach the plugin, just from
+ *  Rust, so there is no platform branch here.
+ *
+ *  Rejects with a string already phrased for a toast. */
+export const openUrlExternal = (url: string) =>
+  invoke<void>("open_url_external", { url });

@@ -11,14 +11,12 @@ vi.mock("../../lib/tauri-commands", () => ({
   hasClaudeToken: vi.fn(),
   clearClaudeToken: vi.fn(),
   cancelClaudeToken: (...args: unknown[]) => cancelClaudeToken(...args),
+  openUrlExternal: (...args: unknown[]) => openUrlExternal(...args),
 }));
 
 const cancelClaudeToken = vi.fn(() => Promise.resolve());
 
-const openUrl = vi.fn();
-vi.mock("@tauri-apps/plugin-opener", () => ({
-  openUrl: (...args: unknown[]) => openUrl(...args),
-}));
+const openUrlExternal = vi.fn();
 
 /** Captured event handlers, keyed by event name, so tests can emit. */
 const handlers = new Map<string, (event: { payload: unknown }) => void>();
@@ -174,7 +172,7 @@ describe("ClaudeAuthModal", () => {
 
     const link = await screen.findByRole("link", { name: url });
     fireEvent.click(link);
-    await waitFor(() => expect(openUrl).toHaveBeenCalledWith(url));
+    await waitFor(() => expect(openUrlExternal).toHaveBeenCalledWith(url));
   });
 
   it("ignores output belonging to a different project", async () => {
@@ -259,8 +257,8 @@ describe("ClaudeAuthModal", () => {
 
     const link = await screen.findByRole("link", { name: FULL_URL });
     fireEvent.click(link);
-    await waitFor(() => expect(openUrl).toHaveBeenCalledWith(FULL_URL));
-    expect(openUrl).not.toHaveBeenCalledWith(TRUNCATED_URL);
+    await waitFor(() => expect(openUrlExternal).toHaveBeenCalledWith(FULL_URL));
+    expect(openUrlExternal).not.toHaveBeenCalledWith(TRUNCATED_URL);
   });
 
   it("refuses a hyperlink target that is not an Anthropic sign-in address", async () => {
@@ -270,7 +268,7 @@ describe("ClaudeAuthModal", () => {
     emitLink("https://evil.tld/cai/oauth/authorize?code=true");
 
     expect(screen.queryByRole("link")).not.toBeInTheDocument();
-    expect(openUrl).not.toHaveBeenCalled();
+    expect(openUrlExternal).not.toHaveBeenCalled();
   });
 
   it("ignores a hyperlink belonging to a different project", async () => {

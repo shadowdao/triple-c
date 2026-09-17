@@ -1,5 +1,5 @@
-import { openUrl } from "@tauri-apps/plugin-opener";
 import type { UpdateInfo } from "../../lib/types";
+import { openUrlExternal } from "../../lib/tauri-commands";
 import Modal from "../ui/Modal";
 import Button from "../ui/Button";
 import { formatBytes } from "../../lib/formatBytes";
@@ -19,7 +19,7 @@ export default function UpdateDialog({
 }: Props) {
   const handleDownload = async (url: string) => {
     try {
-      await openUrl(url);
+      await openUrlExternal(url);
     } catch (e) {
       console.error("Failed to open URL:", e);
     }

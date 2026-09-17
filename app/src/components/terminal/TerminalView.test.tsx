@@ -2,8 +2,10 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, fireEvent, cleanup, act } from "@testing-library/react";
 import TerminalView, { supersedes } from "./TerminalView";
 import { useAppState } from "../../store/appState";
-import { uploadHostFileToTerminal } from "../../lib/tauri-commands";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import {
+  uploadHostFileToTerminal,
+  openUrlExternal,
+} from "../../lib/tauri-commands";
 import {
   chooseSignInTarget,
   resetBrowserSupportCache,
@@ -65,6 +67,7 @@ vi.mock("../../lib/tauri-commands", () => ({
   uploadHostFileToTerminal: vi.fn(async () => ""),
   getAuthBridgeStatus: vi.fn(async () => containerEnv.bridge),
   checkBrowserViewSupport: vi.fn(async () => containerEnv.detection),
+  openUrlExternal: vi.fn(async () => {}),
 }));
 
 vi.mock("@tauri-apps/api/event", () => ({
@@ -72,10 +75,6 @@ vi.mock("@tauri-apps/api/event", () => ({
     ptyOutput.listeners.set(event, cb);
     return () => ptyOutput.listeners.delete(event);
   },
-}));
-
-vi.mock("@tauri-apps/plugin-opener", () => ({
-  openUrl: vi.fn(async () => {}),
 }));
 
 vi.mock("@tauri-apps/api/webview", () => ({
@@ -148,8 +147,8 @@ beforeEach(() => {
   vi.mocked(uploadHostFileToTerminal).mockResolvedValue("/workspace/api/dropped.txt");
   dragDrop.handler = null;
   ptyOutput.listeners.clear();
-  vi.mocked(openUrl).mockReset();
-  vi.mocked(openUrl).mockResolvedValue(undefined);
+  vi.mocked(openUrlExternal).mockReset();
+  vi.mocked(openUrlExternal).mockResolvedValue(undefined);
   containerEnv.bridge = { enabled: false, active_ports: [], conflicts: [] };
   containerEnv.detection = null;
   // The Playwright probe is memoized across mounts (it is a container exec), so
@@ -760,7 +759,7 @@ describe("TerminalView — a host open that fails says so", () => {
   }
 
   it("pushes a toast instead of a console line nobody reads", async () => {
-    vi.mocked(openUrl).mockRejectedValueOnce(new Error("no opener"));
+    vi.mocked(openUrlExternal).mockRejectedValueOnce(new Error("no opener"));
     await mountWithPrompt();
     await act(async () => {
       fireEvent.click(openButton());
@@ -775,7 +774,7 @@ describe("TerminalView — a host open that fails says so", () => {
   it("keeps the prompt on screen, so the other route is still one click away", async () => {
     // Dismissing first is what this replaced: the toast vanished, nothing
     // opened, and the URL only existed in the container's transcript.
-    vi.mocked(openUrl).mockRejectedValueOnce(new Error("no opener"));
+    vi.mocked(openUrlExternal).mockRejectedValueOnce(new Error("no opener"));
     await mountWithPrompt();
     await act(async () => {
       fireEvent.click(openButton());
@@ -790,7 +789,7 @@ describe("TerminalView — a host open that fails says so", () => {
       fireEvent.click(openButton());
       await Promise.resolve();
     });
-    expect(openUrl).toHaveBeenCalledWith(URL);
+    expect(openUrlExternal).toHaveBeenCalledWith(URL);
     expect(document.querySelector(URL_TOAST_SELECTOR)).toBeNull();
   });
 });

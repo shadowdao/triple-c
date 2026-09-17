@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { openUrl } from "@tauri-apps/plugin-opener";
-import { cancelClaudeToken } from "../../lib/tauri-commands";
+import { cancelClaudeToken, openUrlExternal } from "../../lib/tauri-commands";
 import Modal from "../ui/Modal";
 import Button from "../ui/Button";
 import StatusIndicator, { type StatusTone } from "../ui/StatusIndicator";
@@ -118,7 +117,7 @@ export default function ClaudeAuthModal({
       return;
     }
     try {
-      await openUrl(target);
+      await openUrlExternal(target);
     } catch (e) {
       setLinkError(
         authErrorMessage(
