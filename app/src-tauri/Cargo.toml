@@ -39,6 +39,10 @@ local-ip-address = "0.6"
 argon2 = "0.5"
 aes-gcm = "0.10"
 zeroize = "1"
+# WHATWG URL parsing for `url_open`'s re-validation of URLs arriving from the
+# container. Already in the tree transitively (reqwest), and the point of
+# using it rather than hand-rolling is parity with the frontend's `new URL()`.
+url = "2"
 
 [dev-dependencies]
 # `test-util` (not part of tokio's `full`) lets the auto-start retry tests run

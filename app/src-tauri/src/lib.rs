@@ -7,6 +7,7 @@ mod logging;
 mod models;
 mod project_lock;
 mod storage;
+pub mod url_open;
 pub mod web_terminal;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -552,6 +553,9 @@ pub fn run() {
             commands::update_commands::check_image_update,
             // Help
             commands::help_commands::get_help_content,
+            // Opening a link in the host browser (see `url_open` for why this
+            // is not `@tauri-apps/plugin-opener` on Linux)
+            url_open::open_url_external,
             // Install helper
             commands::install_helper_commands::detect_install_options,
             commands::install_helper_commands::run_docker_install,
