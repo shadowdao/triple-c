@@ -15,6 +15,12 @@ use crate::AppState;
 /// non-`Running` status carrying an explanation rather than an error, so the
 /// pane always has something specific to say. This is host-side only — no
 /// container recreation is involved either way.
+///
+/// Either way the choice is persisted, so it survives an app restart. This is
+/// the only caller allowed to write `false`: every other path to
+/// [`BrowserViewManager::stop`](crate::browser_view::BrowserViewManager::stop)
+/// is a teardown rather than the user changing their mind. Enabling persists
+/// inside `start`, which is the single funnel for it.
 #[tauri::command]
 pub async fn set_browser_view_enabled(
     project_id: String,
@@ -23,9 +29,15 @@ pub async fn set_browser_view_enabled(
     state: State<'_, AppState>,
 ) -> Result<BrowserViewStatus, String> {
     if !enabled {
+        // Persist first, then tear down: the supervisor's own teardown emit
+        // reads this flag back out of the store, and reading it mid-stop would
+        // announce a view that is going away as still enabled.
+        state
+            .projects_store
+            .set_browser_view_enabled(&project_id, false)?;
         // Awaits the supervisor, so the host port is released before we return.
         manager().stop(&project_id).await;
-        return Ok(manager().status(&project_id).await);
+        return Ok(manager().status(&project_id, false).await);
     }
 
     let container_id = running_container(&state, &project_id, "opening the browser view").await?;
@@ -40,10 +52,17 @@ pub async fn set_browser_view_enabled(
         .await
 }
 
-/// Current status. Cheap: reads in-process state only, never the container.
+/// Current status. Cheap: the session map in this process plus the stored flag,
+/// never the container.
+///
+/// The two are independent on purpose — this is what the pane reads on mount,
+/// and after an app restart the honest answer is "enabled, nothing running".
 #[tauri::command]
-pub async fn get_browser_view_status(project_id: String) -> Result<BrowserViewStatus, String> {
-    Ok(manager().status(&project_id).await)
+pub async fn get_browser_view_status(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<BrowserViewStatus, String> {
+    Ok(manager().status(&project_id, enabled_for(&state, &project_id)).await)
 }
 
 /// Probe the container for Playwright without starting anything.
@@ -110,7 +129,9 @@ pub async fn open_browser_view_popout(
     app_handle: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let status = manager().status(&project_id).await;
+    let status = manager()
+        .status(&project_id, enabled_for(&state, &project_id))
+        .await;
     let (BrowserViewState::Running, Some(url)) = (status.state, status.url.as_deref()) else {
         return Err(
             "The browser view isn't running. Start it before opening it in its own window."
@@ -209,7 +230,9 @@ pub async fn open_page_in_container_browser(
     // the user to go and press Start in the Browser tab themselves — and from
     // the terminal's URL prompt, with no indication that was even needed.
     // Asking for a page *is* asking to watch it, so the viewer comes up too.
-    let status = manager().status(&project_id).await;
+    let status = manager()
+        .status(&project_id, enabled_for(&state, &project_id))
+        .await;
     if status.state != BrowserViewState::Running {
         crate::commands::project_commands::emit_progress(
             &app_handle,
@@ -229,7 +252,9 @@ pub async fn open_page_in_container_browser(
     // From the terminal there is no pane on screen to fill, so the page needs a
     // window of its own or it lands somewhere the user isn't looking.
     if show_window {
-        let status = manager().status(&project_id).await;
+        let status = manager()
+            .status(&project_id, enabled_for(&state, &project_id))
+            .await;
         if let Some(url) = status.url.as_deref() {
             let name = state
                 .projects_store
@@ -309,6 +334,20 @@ pub async fn set_browser_view_match_window(
 #[tauri::command]
 pub async fn get_browser_view_match_window(project_id: String) -> Result<bool, String> {
     Ok(popout::match_window(&project_id))
+}
+
+/// The project's stored browser-view opt-in.
+///
+/// The manager holds no copy of this — see
+/// [`BrowserViewManager`](crate::browser_view::BrowserViewManager) — so every
+/// status call reads it here, the way `get_auth_bridge_status` does. A project
+/// that has gone away reads as off, which is the only answer that can be given
+/// about a record that no longer exists.
+fn enabled_for(state: &State<'_, AppState>, project_id: &str) -> bool {
+    state
+        .projects_store
+        .get(project_id)
+        .is_some_and(|p| p.browser_view_enabled)
 }
 
 /// The project's container, or a sentence saying why there isn't one.

@@ -1100,6 +1100,15 @@ pub async fn update_project(
 
     project.container_id = stored.container_id;
     project.status = stored.status;
+    // `browser_view_enabled` is owned by `set_browser_view_enabled` and is
+    // restored here rather than taken from the payload, exactly like
+    // `container_id` and `status` above. The Config tab has no control for it
+    // — the Browser tab's toggle is the only way it ever changes — so the
+    // project object the frontend round-trips carries whatever it was told at
+    // load time and would silently undo a toggle made since. `auth_bridge_enabled`
+    // is different and does arrive through this save: the Config tab edits it,
+    // which is why the reconcile below follows whatever was just persisted.
+    project.browser_view_enabled = stored.browser_view_enabled;
     project.created_at = stored.created_at;
     project.updated_at = chrono::Utc::now().to_rfc3339();
 
