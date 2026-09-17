@@ -23,6 +23,7 @@ import {
   setBrowserViewMatchWindow,
   setBrowserViewPopoutAlwaysOnTop,
 } from "../../../lib/tauri-commands";
+import { isBrowserViewUsable } from "../../../lib/browserViewSupport";
 import { useAppState } from "../../../store/appState";
 import OpenPageDialog from "./OpenPageDialog";
 import AccordionSection from "../../ui/AccordionSection";
@@ -338,7 +339,7 @@ export default function BrowserTab({ project, active }: Props) {
   // Prefer the probe: it is the fresher of the two, and it is the one that
   // reflects an install that just finished.
   const probed = detection ?? status.detection;
-  const ready = isUsable(probed);
+  const ready = isBrowserViewUsable(probed);
   // Mirrors Rust `PlaywrightDetection::needs_browser`: the Chrome channel is an
   // apt package, so it never shows up in `browsers`, and a container that has
   // it is not missing a browser.
@@ -539,11 +540,6 @@ export default function BrowserTab({ project, active }: Props) {
   );
 }
 
-/** Mirrors Rust `PlaywrightDetection::is_usable`. */
-function isUsable(d: PlaywrightDetection | null): boolean {
-  return d !== null && d.playwright_version !== null && d.has_bind && d.cli_entry !== null;
-}
-
 /**
  * Mirrors Rust `PlaywrightDetection::revision_skew`.
  *
@@ -627,7 +623,7 @@ function Setup({
   onInstall: (which: Exclude<SetupJob, null>) => void;
 }) {
   const busy = job !== null;
-  const havePackages = isUsable(detection);
+  const havePackages = isBrowserViewUsable(detection);
   const missing = missingParts(detection);
   const browsers = detection?.browsers ?? [];
   const chrome = detection?.chrome_channel ?? null;

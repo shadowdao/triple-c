@@ -105,6 +105,7 @@ describe("UrlToast", () => {
           url={SIGN_IN}
           onOpen={noop}
           onOpenInContainer={noop}
+          signInDefault="container"
           onDismiss={noop}
         />,
       );
@@ -150,6 +151,7 @@ describe("UrlToast", () => {
           url={SIGN_IN}
           onOpen={noop}
           onOpenInContainer={noop}
+          signInDefault="container"
           onDismiss={noop}
         />,
       );
@@ -166,10 +168,11 @@ describe("UrlToast", () => {
 
   describe("Anthropic sign-in links", () => {
     // The callback listener a `claude login` is waiting on is *inside* the
-    // container. Sending the user to their host browser completes the sign-in
-    // and then posts the result where nothing is listening, and the terminal
-    // hangs to its timeout — so for these, and only these, the container-side
-    // browser leads.
+    // container, so a sign-in is the one case where the host browser may be the
+    // wrong lead. Whether it actually is depends on the project — a live auth
+    // bridge carries the callback back, and the container-side alternative is
+    // not installed on a fresh project — so the owner decides and passes
+    // `signInDefault`. This component only renders the decision.
     const SIGN_IN =
       "https://claude.ai/oauth/authorize?code=true&client_id=abc&response_type=code";
 
@@ -180,12 +183,13 @@ describe("UrlToast", () => {
         .filter((t) => t === "Open" || t === "In container");
     }
 
-    it("puts the container browser first", () => {
+    it("puts the container browser first when the caller asks for it", () => {
       render(
         <UrlToast
           url={SIGN_IN}
           onOpen={noop}
           onOpenInContainer={noop}
+          signInDefault="container"
           onDismiss={noop}
         />,
       );
@@ -195,6 +199,42 @@ describe("UrlToast", () => {
       );
     });
 
+    it("leads with the host when the caller says so, without hiding the other", () => {
+      // A live auth bridge, or a container with no browser installed. The pair
+      // is unchanged; only the order and which one is filled.
+      render(
+        <UrlToast
+          url={SIGN_IN}
+          onOpen={noop}
+          onOpenInContainer={noop}
+          signInDefault="host"
+          onDismiss={noop}
+        />,
+      );
+      expect(actions()).toEqual(["Open", "In container"]);
+      expect(
+        document.querySelector(URL_TOAST_PRIMARY_SELECTOR),
+      ).toHaveTextContent("Open");
+      // Still recognised as a sign-in, so the explanation stays.
+      expect(screen.getByTestId("url-toast-signin-hint")).toHaveTextContent(
+        /auth bridge/i,
+      );
+    });
+
+    it("defaults to the host when the caller passes nothing", () => {
+      // The safe fallback: the answer more likely to work, and the one that
+      // reports its own failure.
+      render(
+        <UrlToast
+          url={SIGN_IN}
+          onOpen={noop}
+          onOpenInContainer={noop}
+          onDismiss={noop}
+        />,
+      );
+      expect(actions()).toEqual(["Open", "In container"]);
+    });
+
     it("keeps the host browser available as a fallback", () => {
       const onOpen = vi.fn();
       render(
@@ -202,6 +242,7 @@ describe("UrlToast", () => {
           url={SIGN_IN}
           onOpen={onOpen}
           onOpenInContainer={noop}
+          signInDefault="container"
           onDismiss={noop}
         />,
       );
@@ -211,12 +252,14 @@ describe("UrlToast", () => {
 
     it("leaves an ordinary URL alone", () => {
       // A `gh auth login` device code, a docs page, a preview build — the host
-      // browser is the right answer for all of them and stays the default.
+      // browser is the right answer for all of them and stays the default,
+      // whatever the project's sign-in preference happens to be.
       render(
         <UrlToast
           url="https://github.com/login/device?code=ABCD-EFGH"
           onOpen={noop}
           onOpenInContainer={noop}
+          signInDefault="container"
           onDismiss={noop}
         />,
       );
@@ -232,6 +275,7 @@ describe("UrlToast", () => {
           url="https://claude.ai.evil.tld/oauth/authorize?x=1"
           onOpen={noop}
           onOpenInContainer={noop}
+          signInDefault="container"
           onDismiss={noop}
         />,
       );

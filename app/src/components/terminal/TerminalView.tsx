@@ -23,6 +23,7 @@ import {
   sanitizeRelayUrl,
 } from "../../lib/urlRelay";
 import { classifyDrop, DROP_BLOCKED_TOAST } from "../../lib/dropTarget";
+import { useSignInOpenTarget } from "../../hooks/useSignInOpenTarget";
 import UrlToast, {
   URL_TOAST_PRIMARY_SELECTOR,
   URL_TOAST_SELECTOR,
@@ -409,7 +410,18 @@ export default function TerminalView({ sessionId, active }: Props) {
         console.warn("Refusing to open a link that failed validation");
         return;
       }
-      openUrl(safe).catch((e) => console.error("Failed to open URL:", e));
+      // Same failure reporting as the toast's Open button — see the long note
+      // on `handleOpenUrl`, including what this catch does *not* catch on
+      // Linux. A click that appears to do nothing is the complaint either way.
+      openUrl(safe).catch((e) =>
+        useAppState.getState().pushToast({
+          kind: "error",
+          message: "Could not open that link in your browser",
+          detail: String(e),
+          // A dead opener fails for every link in the buffer. One card.
+          dedupeKey: "host-open-failed",
+        }),
+      );
     }, { urlRegex });
     term.loadAddon(webLinksAddon);
 
@@ -786,19 +798,57 @@ export default function TerminalView({ sessionId, active }: Props) {
     return () => clearTimeout(timer);
   }, [imagePasteMsg]);
 
+  /**
+   * Hand the prompted URL to the host's browser.
+   *
+   * Two things here are ordering, not decoration:
+   *
+   *  - **The toast is dismissed on success only.** It used to go first, so a
+   *    failed open left the user with an empty screen and no way back to a URL
+   *    that only exists in the container's transcript. Now a failure keeps the
+   *    prompt exactly where it was, which also leaves "In container" one click
+   *    away — the fallback this failure is the argument for.
+   *  - **The failure is a toast, not a `console.error`.** Same `pushToast` the
+   *    container-browser branch below uses, because from the user's side the
+   *    two actions fail identically: nothing happens.
+   *
+   * What this does *not* cover, and must not be described as covering: on Linux
+   * `xdg-open` routinely exits 0 having done nothing useful, so the most common
+   * Linux failure resolves this promise and reports success. Stripping the
+   * leaked AppImage environment before the browser is spawned is what addresses
+   * that; this is the complement that catches everything which does report.
+   */
   const handleOpenUrl = useCallback(() => {
     if (!urlPrompt) return;
     // Validated again at the sink. `promptUrl` is the only writer and already
     // sanitizes, so this can only fail if that invariant is broken — which is
     // precisely when it matters that the last thing before `openUrl` checks.
     const safe = sanitizeRelayUrl(urlPrompt.url);
-    dismissUrlPrompt();
     if (!safe) {
       console.warn("Refusing to open a URL that failed validation");
+      dismissUrlPrompt();
       return;
     }
-    openUrl(safe).catch((e) => console.error("Failed to open URL:", e));
+    openUrl(safe)
+      .then(() => dismissUrlPrompt())
+      .catch((e) =>
+        useAppState.getState().pushToast({
+          kind: "error",
+          message: "Could not open it in your browser",
+          detail: String(e),
+          dedupeKey: "host-open-failed",
+        }),
+      );
   }, [urlPrompt, dismissUrlPrompt]);
+
+  /**
+   * Which action leads when the prompt is holding an Anthropic sign-in link.
+   *
+   * Resolved per project, not per URL — see `useSignInOpenTarget`. The toast
+   * offers both regardless; this is only which one is filled in and reachable
+   * with {@link URL_TOAST_SHORTCUT}.
+   */
+  const signInDefault = useSignInOpenTarget(projectId);
 
   /**
    * Open the prompted URL in the container's own browser instead of the host's.
@@ -896,6 +946,7 @@ export default function TerminalView({ sessionId, active }: Props) {
           label={urlPrompt.label}
           onOpen={handleOpenUrl}
           onOpenInContainer={handleOpenUrlInContainer}
+          signInDefault={signInDefault}
           onDismiss={dismissUrlPrompt}
         />
       )}

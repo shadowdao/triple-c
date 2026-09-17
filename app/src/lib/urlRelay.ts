@@ -182,11 +182,22 @@ export function extendsUrl(next: string, current: string): boolean {
 /**
  * Whether this is a URL that signs the user in to Anthropic.
  *
- * Used to decide *presentation*, not permission — the toast makes the
- * container-side browser the default action for these, because the OAuth
- * callback listener is inside the container and the host has nothing to catch
- * it with. It is deliberately the same host allowlist the sign-in flow itself
- * uses, so the two cannot disagree about what a sign-in link is.
+ * Classification only. It answers "is this a sign-in link", never "where should
+ * it be opened" — that decision moved out to `hooks/useSignInOpenTarget.ts`,
+ * because it depends on things this module has no business knowing: whether the
+ * project's auth bridge is live, and whether a browser is actually installed in
+ * the container. This function stays here because the *rule* it encodes is a
+ * URL rule, and it is deliberately the same host allowlist the sign-in flow
+ * itself uses, so the two cannot disagree about what a sign-in link is.
+ *
+ * It used to carry the default with it — container-side always, on the grounds
+ * that "the OAuth callback listener is inside the container and the host has
+ * nothing to catch it with". Both halves of that are now wrong. The host does
+ * have something to catch it with (the auth bridge mirrors the container's
+ * loopback listener onto the same host port), and the container-side target is
+ * not a general browser but Playwright's dashboard pane, whose browsers are
+ * deliberately not baked into the image — so on a fresh project the default
+ * pointed at something that was not installed, on every platform.
  */
 export function isAnthropicSignInUrl(url: string): boolean {
   const safe = sanitizeRelayUrl(url, { allowHosts: ANTHROPIC_SIGN_IN_HOSTS });

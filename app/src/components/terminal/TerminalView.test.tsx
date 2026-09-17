@@ -3,6 +3,12 @@ import { render, fireEvent, cleanup, act } from "@testing-library/react";
 import TerminalView, { supersedes } from "./TerminalView";
 import { useAppState } from "../../store/appState";
 import { uploadHostFileToTerminal } from "../../lib/tauri-commands";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import {
+  chooseSignInTarget,
+  resetBrowserSupportCache,
+} from "../../hooks/useSignInOpenTarget";
+import type { AuthBridgeStatus, PlaywrightDetection } from "../../lib/types";
 import { URL_TOAST_SELECTOR } from "./UrlToast";
 
 /**
@@ -14,6 +20,18 @@ import { URL_TOAST_SELECTOR } from "./UrlToast";
  */
 const dragDrop = vi.hoisted(() => ({
   handler: null as null | ((event: unknown) => unknown),
+}));
+
+/**
+ * What the project's container answers about itself.
+ *
+ * `TerminalView` asks two questions on mount — is the auth bridge live, and is
+ * there a browser inside to open a page in — because together they decide which
+ * of the URL toast's two buttons leads for a sign-in link.
+ */
+const containerEnv = vi.hoisted(() => ({
+  bridge: { enabled: false, active_ports: [], conflicts: [] } as unknown,
+  detection: null as unknown,
 }));
 
 /** The `terminal-output-{id}` listeners, so a test can be the PTY. */
@@ -45,6 +63,8 @@ vi.mock("../../lib/tauri-commands", () => ({
   awsSsoRefresh: vi.fn(async () => {}),
   openPageInContainerBrowser: vi.fn(async () => ({ error: null })),
   uploadHostFileToTerminal: vi.fn(async () => ""),
+  getAuthBridgeStatus: vi.fn(async () => containerEnv.bridge),
+  checkBrowserViewSupport: vi.fn(async () => containerEnv.detection),
 }));
 
 vi.mock("@tauri-apps/api/event", () => ({
@@ -128,6 +148,14 @@ beforeEach(() => {
   vi.mocked(uploadHostFileToTerminal).mockResolvedValue("/workspace/api/dropped.txt");
   dragDrop.handler = null;
   ptyOutput.listeners.clear();
+  vi.mocked(openUrl).mockReset();
+  vi.mocked(openUrl).mockResolvedValue(undefined);
+  containerEnv.bridge = { enabled: false, active_ports: [], conflicts: [] };
+  containerEnv.detection = null;
+  // The Playwright probe is memoized across mounts (it is a container exec), so
+  // a case that changes the answer has to drop what an earlier one cached.
+  resetBrowserSupportCache();
+  useAppState.setState({ toasts: [] });
   document.body.innerHTML = "";
   useAppState.setState({ sessions: [] });
 });
@@ -556,6 +584,214 @@ describe("TerminalView — reaching the URL prompt without a mouse", () => {
     });
 
     expect(document.activeElement).toBe(before);
+  });
+});
+
+/**
+ * A container with Playwright *and* a browser in the cache — i.e. one where
+ * "In container" would actually open something.
+ */
+function usableDetection(
+  over: Partial<PlaywrightDetection> = {},
+): PlaywrightDetection {
+  return {
+    node_version: "v22.11.0",
+    playwright_version: "1.56.0",
+    playwright_path: "/workspace/node_modules/playwright",
+    playwright_cli: "/workspace/node_modules/playwright/cli.js",
+    has_bind: true,
+    cli_version: "1.56.0",
+    cli_entry: "/workspace/node_modules/@playwright/cli/index.js",
+    browsers: ["chromium-1200"],
+    chrome_channel: null,
+    chromium_executable: "/home/claude/.cache/ms-playwright/chromium-1200/chrome",
+    chromium_executable_exists: true,
+    script_playwright_version: "1.56.0",
+    script_chromium_executable: null,
+    script_chromium_executable_exists: false,
+    searched: [],
+    ...over,
+  };
+}
+
+const LIVE_BRIDGE: AuthBridgeStatus = {
+  enabled: true,
+  active_ports: [],
+  conflicts: [],
+};
+
+describe("chooseSignInTarget — which action leads for a sign-in link", () => {
+  // The rule this replaced was "container, always", justified by the callback
+  // listener living inside the container. Both halves of that justification
+  // stopped being true: the auth bridge mirrors that listener onto the host,
+  // and the container-side target is Playwright's pane, whose browsers are not
+  // in the image.
+  it("prefers the host browser whenever the bridge is live", () => {
+    expect(chooseSignInTarget(LIVE_BRIDGE, usableDetection())).toBe("host");
+  });
+
+  it("does not call a bridge live while it is holding a port conflict", () => {
+    // Enabled and unable to catch the callback anyway — the one state where
+    // "on" must not read as "will work".
+    const conflicted: AuthBridgeStatus = {
+      enabled: true,
+      active_ports: [],
+      conflicts: [{ port: 54545, reason: "already in use on the host" }],
+    };
+    expect(chooseSignInTarget(conflicted, usableDetection())).toBe("container");
+  });
+
+  it("does not wait for a bridged port before trusting an enabled bridge", () => {
+    // There is nothing to bridge until the CLI binds its listener, and that
+    // races the URL reaching the transcript. Requiring a port would make the
+    // default flip between two identical sign-ins.
+    expect(chooseSignInTarget(LIVE_BRIDGE, null)).toBe("host");
+  });
+
+  it("falls to the container only when it has a browser to open", () => {
+    const off: AuthBridgeStatus = { enabled: false, active_ports: [], conflicts: [] };
+    expect(chooseSignInTarget(off, usableDetection())).toBe("container");
+    expect(chooseSignInTarget(off, null)).toBe("host");
+    // Packages installed, cache empty — the fresh-project state, and the one
+    // that used to be the silent default.
+    expect(
+      chooseSignInTarget(
+        off,
+        usableDetection({ browsers: [], chromium_executable_exists: false }),
+      ),
+    ).toBe("host");
+    // Playwright too old to bind: the pane cannot show it either.
+    expect(chooseSignInTarget(off, usableDetection({ has_bind: false }))).toBe("host");
+  });
+
+  it("answers host when nothing is known at all", () => {
+    expect(chooseSignInTarget(null, null)).toBe("host");
+  });
+});
+
+describe("TerminalView — the sign-in default follows the project", () => {
+  const SIGN_IN =
+    "https://claude.ai/oauth/authorize?code=true&client_id=abc&response_type=code";
+
+  function relaySequence(url: string): number[] {
+    return Array.from(
+      new TextEncoder().encode(`\x1b]7777;open;${btoa(url)}\x07`),
+    );
+  }
+
+  async function mountWithPrompt() {
+    const view = mountSession("claude");
+    await act(async () => {});
+    const emit = ptyOutput.listeners.get("terminal-output-s1");
+    if (!emit) throw new Error("no terminal-output listener registered");
+    await act(async () => {
+      emit({ payload: relaySequence(SIGN_IN) });
+      await new Promise((r) => setTimeout(r, 0));
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    return view;
+  }
+
+  function primaryLabel(): string | null {
+    return document.querySelector<HTMLElement>(
+      '[data-url-toast-primary="true"]',
+    )?.textContent ?? null;
+  }
+
+  function actionOrder(): (string | null)[] {
+    return Array.from(document.querySelectorAll("button"))
+      .map((b) => b.textContent)
+      .filter((t) => t === "Open" || t === "In container");
+  }
+
+  it("leads with the host browser when the auth bridge is on", async () => {
+    containerEnv.bridge = LIVE_BRIDGE;
+    containerEnv.detection = usableDetection();
+    await mountWithPrompt();
+    expect(primaryLabel()).toBe("Open");
+    // Both are still offered — this changes which leads, never which exist.
+    expect(actionOrder()).toEqual(["Open", "In container"]);
+  });
+
+  it("leads with the container when the bridge is off and a browser is there", async () => {
+    containerEnv.detection = usableDetection();
+    await mountWithPrompt();
+    expect(primaryLabel()).toBe("In container");
+    expect(actionOrder()).toEqual(["In container", "Open"]);
+  });
+
+  it("leads with the host on a fresh project, where neither is set up", async () => {
+    // Playwright is deliberately not baked into the image, so this is what a
+    // project looks like until someone presses install — and pointing the
+    // default at it failed on every platform, silently.
+    await mountWithPrompt();
+    expect(primaryLabel()).toBe("Open");
+  });
+});
+
+describe("TerminalView — a host open that fails says so", () => {
+  const URL = "https://github.com/login/device?code=ABCD-EFGH";
+
+  function relaySequence(url: string): number[] {
+    return Array.from(
+      new TextEncoder().encode(`\x1b]7777;open;${btoa(url)}\x07`),
+    );
+  }
+
+  async function mountWithPrompt() {
+    const view = mountSession("claude");
+    await act(async () => {});
+    const emit = ptyOutput.listeners.get("terminal-output-s1");
+    if (!emit) throw new Error("no terminal-output listener registered");
+    await act(async () => {
+      emit({ payload: relaySequence(URL) });
+      await new Promise((r) => setTimeout(r, 0));
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    return view;
+  }
+
+  function openButton(): HTMLElement {
+    const el = Array.from(document.querySelectorAll("button")).find(
+      (b) => b.textContent === "Open",
+    );
+    if (!el) throw new Error("Open button not found");
+    return el as HTMLElement;
+  }
+
+  it("pushes a toast instead of a console line nobody reads", async () => {
+    vi.mocked(openUrl).mockRejectedValueOnce(new Error("no opener"));
+    await mountWithPrompt();
+    await act(async () => {
+      fireEvent.click(openButton());
+      await Promise.resolve();
+    });
+    const toasts = useAppState.getState().toasts;
+    expect(toasts).toHaveLength(1);
+    expect(toasts[0].kind).toBe("error");
+    expect(toasts[0].detail).toContain("no opener");
+  });
+
+  it("keeps the prompt on screen, so the other route is still one click away", async () => {
+    // Dismissing first is what this replaced: the toast vanished, nothing
+    // opened, and the URL only existed in the container's transcript.
+    vi.mocked(openUrl).mockRejectedValueOnce(new Error("no opener"));
+    await mountWithPrompt();
+    await act(async () => {
+      fireEvent.click(openButton());
+      await Promise.resolve();
+    });
+    expect(document.querySelector(URL_TOAST_SELECTOR)).not.toBeNull();
+  });
+
+  it("dismisses the prompt once the handoff actually succeeded", async () => {
+    await mountWithPrompt();
+    await act(async () => {
+      fireEvent.click(openButton());
+      await Promise.resolve();
+    });
+    expect(openUrl).toHaveBeenCalledWith(URL);
+    expect(document.querySelector(URL_TOAST_SELECTOR)).toBeNull();
   });
 });
 

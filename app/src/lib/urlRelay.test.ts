@@ -4,6 +4,7 @@ import {
   MAX_RELAY_URL_LENGTH,
   RelayRateLimiter,
   URL_RELAY_OSC,
+  isAnthropicSignInUrl,
   parseUrlRelayOsc,
   sanitizeRelayUrl,
   urlOrigin,
@@ -319,5 +320,55 @@ describe("RelayRateLimiter", () => {
     expect(rl.allow("https://b.example/", 100)).toBe(true);
     expect(rl.allow("https://c.example/", 200)).toBe(false);
     expect(rl.allow("https://c.example/", 10_200)).toBe(true);
+  });
+});
+
+describe("isAnthropicSignInUrl", () => {
+  // Classification only. Where a sign-in link should be opened is decided by
+  // `hooks/useSignInOpenTarget.ts`, from facts about the project — this answers
+  // the narrower question of whether it is a sign-in link at all, and it does
+  // so through the same allowlist the sign-in flow itself uses.
+  it("recognises the links `claude setup-token` and `claude login` print", () => {
+    expect(
+      isAnthropicSignInUrl(
+        "https://claude.ai/oauth/authorize?code=true&client_id=abc",
+      ),
+    ).toBe(true);
+    expect(
+      isAnthropicSignInUrl("https://platform.claude.com/oauth/code/callback?x=1"),
+    ).toBe(true);
+    expect(isAnthropicSignInUrl("https://console.anthropic.com/login?x=1")).toBe(
+      true,
+    );
+  });
+
+  it("is not fooled by a host that merely contains an allowed domain", () => {
+    // The thing the allowlist exists for: `claude.ai.evil.tld` ends with
+    // neither `claude.ai` nor `.claude.ai`.
+    expect(isAnthropicSignInUrl("https://claude.ai.evil.tld/oauth/authorize")).toBe(
+      false,
+    );
+    expect(isAnthropicSignInUrl("https://notclaude.ai/login")).toBe(false);
+  });
+
+  it("holds the full validator, not just the host test", () => {
+    // It runs `sanitizeRelayUrl`, so everything that cannot be opened at all
+    // is not a sign-in link either — no separate, weaker copy of the rules.
+    expect(isAnthropicSignInUrl("javascript:claude.ai/login")).toBe(false);
+    expect(isAnthropicSignInUrl("https://claude.ai@evil.tld/login")).toBe(false);
+    expect(isAnthropicSignInUrl("https://claude\nai/login")).toBe(false);
+  });
+
+  it("does not claim every allowlisted URL is a sign-in", () => {
+    expect(isAnthropicSignInUrl("https://claude.ai/chat/abc")).toBe(false);
+    expect(isAnthropicSignInUrl("https://www.anthropic.com/news")).toBe(false);
+  });
+
+  it("leaves an ordinary link alone, whatever it says in its path", () => {
+    // A `gh auth login` device code is the common one, and sending it to a
+    // container-side browser would be actively wrong.
+    expect(isAnthropicSignInUrl("https://github.com/login/device?code=A")).toBe(
+      false,
+    );
   });
 });
