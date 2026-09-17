@@ -71,13 +71,29 @@ npm ci
 npx tauri build
 ```
 
+Linux ships as **AppImage only**. To match what CI produces, pass the bundle
+explicitly:
+
+```bash
+npx tauri build --bundles appimage
+```
+
+The `.deb` and `.rpm` bundles were dropped — two more artifacts to build and
+publish for an audience the AppImage already serves, and neither could
+self-update. A bare `npx tauri build` still emits them, because
+`tauri.conf.json` keeps `"targets": "all"` so that macOS and Windows are
+untouched; they are not released and not tested.
+
 Build artifacts are located in `app/src-tauri/target/release/bundle/`:
 
-| Format     | Path                          |
-|------------|-------------------------------|
-| AppImage   | `appimage/*.AppImage`         |
-| Debian pkg | `deb/*.deb`                   |
-| RPM pkg    | `rpm/*.rpm`                   |
+| Format     | Path                          | Released |
+|------------|-------------------------------|----------|
+| AppImage   | `appimage/*.AppImage`         | yes      |
+| Debian pkg | `deb/*.deb`                   | no       |
+| RPM pkg    | `rpm/*.rpm`                   | no       |
+
+`scripts/finalize-appimage.sh` post-processes the AppImage; see the Packaging
+section of `CLAUDE.md` for why both of its steps are load-bearing.
 
 ## macOS
 
