@@ -1036,7 +1036,6 @@ fn pending_cleanup_is_stale(recorded_at: &str, now: chrono::DateTime<chrono::Utc
 #[tauri::command]
 pub async fn update_project(
     project: serde_json::Value,
-    app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Project, String> {
     // Taken as raw JSON, then deserialised, for one reason: a secret field that
@@ -1098,46 +1097,57 @@ pub async fn update_project(
     // [`crate::models::validate_env_vars_update`].
     crate::models::validate_env_vars_update(&stored.custom_env_vars, &project.custom_env_vars)?;
 
-    project.container_id = stored.container_id;
-    project.status = stored.status;
-    // `browser_view_enabled` is owned by `set_browser_view_enabled` and is
-    // restored here rather than taken from the payload, exactly like
-    // `container_id` and `status` above. The Config tab has no control for it
-    // — the Browser tab's toggle is the only way it ever changes — so the
-    // project object the frontend round-trips carries whatever it was told at
-    // load time and would silently undo a toggle made since. `auth_bridge_enabled`
-    // is different and does arrive through this save: the Config tab edits it,
-    // which is why the reconcile below follows whatever was just persisted.
-    project.browser_view_enabled = stored.browser_view_enabled;
-    project.created_at = stored.created_at;
+    restore_store_owned_fields(&mut project, &stored);
     project.updated_at = chrono::Utc::now().to_rfc3339();
 
     store_secrets_for_project(&project, &explicitly_cleared)?;
-    let updated = state.projects_store.update(project)?;
 
-    // `auth_bridge_enabled` can arrive through this generic save as well as
-    // through `set_auth_bridge_enabled`, so reconcile the running bridge with
-    // whatever was just persisted. `start` is idempotent and `stop` is a no-op
-    // when nothing is running, so this is safe on every project save.
-    if updated.auth_bridge_enabled {
-        if let Some(ref container_id) = updated.container_id {
-            if docker::is_container_running(container_id).await.unwrap_or(false) {
-                state
-                    .auth_bridge
-                    .start(
-                        updated.id.clone(),
-                        container_id.clone(),
-                        app_handle,
-                        state.projects_store.clone(),
-                    )
-                    .await;
-            }
-        }
-    } else {
-        state.auth_bridge.stop(&updated.id).await;
-    }
+    // Nothing reconciles the *running* auth bridge here any more, and there is
+    // nothing left for such a step to do. This command can no longer change
+    // `auth_bridge_enabled` at all (see [`restore_store_owned_fields`]), so a
+    // reconcile could only ever re-assert what was already true. The paths that
+    // do change it each own their own side effect: `set_auth_bridge_enabled`
+    // starts or stops the bridge itself, [`start_project_container`] arms it
+    // when the container comes up, and `reconcile_project_statuses` re-arms it
+    // for every already-running container at launch. The version of this that
+    // re-asserted on every save is what turned a stale flag in a payload into a
+    // restarted bridge.
+    state.projects_store.update(project)
+}
 
-    Ok(updated)
+/// Restore onto `project` the fields whose value belongs to the store rather
+/// than to whoever is saving the project. See the comment above `stored` in
+/// [`update_project`] for `container_id`, `status` and `created_at`.
+///
+/// **Both feature flags are in here, for one reason that covers them equally:
+/// neither ever arrives through this command as an edit.** Each has a
+/// dedicated setter — [`crate::browser_view::commands::set_browser_view_enabled`]
+/// and [`crate::commands::auth_bridge_commands::set_auth_bridge_enabled`] —
+/// and that setter is the only control the UI offers for it. Neither is wired
+/// into the Config tab's `save`: the browser view's toggle lives in the Browser
+/// tab, and `AuthBridgeRow`'s switch calls `set_auth_bridge_enabled` directly
+/// even though it is rendered *in* the Config tab, because that tab's editors
+/// are disabled while the container runs and the bridge is precisely the thing
+/// a user needs to flip while a login is hanging.
+///
+/// So the flags in an incoming payload are never a choice — they are whatever
+/// the frontend was told when it loaded the project, and the setters do not
+/// write their new value back into frontend app state. Every unrelated save
+/// (a renamed session, an env var, a mount name) carries that snapshot back.
+/// Taking it would silently undo a toggle made since.
+///
+/// This restored only `browser_view_enabled` before, on the stated belief that
+/// the Config tab edited `auth_bridge_enabled` through this save. It does not.
+/// The consequence was specific: a user turns the bridge off — having been told
+/// a bridged port is unauthenticated and reachable by any local process — then
+/// closes a renamed terminal tab, and the stale `true` in that save re-persisted
+/// and restarted the bridge.
+fn restore_store_owned_fields(project: &mut Project, stored: &Project) {
+    project.container_id = stored.container_id.clone();
+    project.status = stored.status.clone();
+    project.browser_view_enabled = stored.browser_view_enabled;
+    project.auth_bridge_enabled = stored.auth_bridge_enabled;
+    project.created_at = stored.created_at.clone();
 }
 
 #[tauri::command]
@@ -2194,5 +2204,90 @@ mod tests {
         assert!(validate_mounted_host_path("x", Some("/"), Some(" / ")).is_ok());
         // Changing it to a different root is a change, and refused.
         assert!(validate_mounted_host_path("x", Some("/"), Some("C:\\")).is_err());
+    }
+    // ── Fields a generic save does not get to write ───────────────────────
+
+    /// A project as the store holds it, plus the copy the frontend is about to
+    /// save back: same record, one unrelated edit, and the flags as they were
+    /// when the frontend last loaded it.
+    fn stored_and_stale_payload() -> (Project, Project) {
+        let mut stored = Project::new("demo".to_string(), Vec::new());
+        stored.container_id = Some("abc123".to_string());
+        stored.status = ProjectStatus::Running;
+
+        let mut payload = stored.clone();
+        payload.container_id = None;
+        payload.status = ProjectStatus::Stopped;
+        payload
+            .renamed_session_names
+            .insert("s1".to_string(), "build".to_string());
+
+        (stored, payload)
+    }
+
+    /// The regression. The user turns the auth bridge off — the switch calls
+    /// `set_auth_bridge_enabled`, which persists `false` and stops the bridge,
+    /// and writes nothing back into the frontend's copy of the project. Every
+    /// holder of that copy still has `auth_bridge_enabled: true`, and the next
+    /// unrelated save (closing a renamed terminal tab) posts it back. That save
+    /// must not re-enable the bridge.
+    #[test]
+    fn a_stale_auth_bridge_flag_in_a_save_cannot_re_enable_a_disabled_bridge() {
+        let (mut stored, mut payload) = stored_and_stale_payload();
+        stored.auth_bridge_enabled = false;
+        payload.auth_bridge_enabled = true;
+
+        restore_store_owned_fields(&mut payload, &stored);
+
+        assert!(
+            !payload.auth_bridge_enabled,
+            "a save must not be able to turn the bridge back on: the stored value is the user's"
+        );
+        // The edit the save was actually for still goes through.
+        assert_eq!(
+            payload.renamed_session_names.get("s1").map(String::as_str),
+            Some("build")
+        );
+    }
+
+    /// The mirror image, and the reason the serde default going to `true`
+    /// made this worse: a pre-existing record with no `auth_bridge_enabled`
+    /// key reads as enabled, so the stale payload is `true` for every project
+    /// that predates the field. A user who has *not* turned the bridge off is
+    /// equally entitled to have the store's answer win.
+    #[test]
+    fn an_enabled_bridge_is_left_enabled_by_the_same_rule() {
+        let (mut stored, mut payload) = stored_and_stale_payload();
+        stored.auth_bridge_enabled = true;
+        payload.auth_bridge_enabled = false;
+
+        restore_store_owned_fields(&mut payload, &stored);
+
+        assert!(payload.auth_bridge_enabled);
+    }
+
+    /// The flag that was already restored, kept under test beside the one that
+    /// was not — the two are owned by their setters for the same reason and
+    /// must not drift apart again.
+    #[test]
+    fn a_stale_browser_view_flag_cannot_undo_the_panes_toggle_either() {
+        let (mut stored, mut payload) = stored_and_stale_payload();
+        stored.browser_view_enabled = true;
+        payload.browser_view_enabled = false;
+
+        restore_store_owned_fields(&mut payload, &stored);
+
+        assert!(payload.browser_view_enabled);
+    }
+
+    #[test]
+    fn the_container_handle_status_and_creation_time_still_come_from_the_store() {
+        let (stored, mut payload) = stored_and_stale_payload();
+
+        restore_store_owned_fields(&mut payload, &stored);
+
+        assert_eq!(payload.container_id.as_deref(), Some("abc123"));
+        assert_eq!(payload.status, ProjectStatus::Running);
+        assert_eq!(payload.created_at, stored.created_at);
     }
 }

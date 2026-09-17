@@ -346,10 +346,46 @@ const OPENERS: &[(&str, &[&str])] = &[("xdg-open", &[]), ("gio", &["open"])];
 /// `xdg-open` usually returns immediately (it hands the URL to a running
 /// browser and exits), but in its generic fallback mode it *is* the browser's
 /// parent and stays alive for the session. So "still running" cannot be read
-/// as failure, and "exited non-zero quickly" is the only reliable signal
-/// there is.
+/// as failure, and "exited non-zero quickly" is the only negative signal there
+/// is — though not, on its own, a trustworthy one. See
+/// [`exit_code_means_nothing_was_launched`].
 #[cfg(target_os = "linux")]
 const OPENER_GRACE: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// Whether a non-zero exit says the opener certainly launched nothing, and so
+/// that the next candidate can be tried without risking a second tab.
+///
+/// The loop used to treat every quick non-zero exit as "it did nothing" and
+/// fall through. That is safe for most of `xdg-open`'s documented codes — 1
+/// (syntax), 2 (file not found) and 3 (a required tool could not be found) are
+/// all statements that it never got as far as launching a handler, and 3 is the
+/// missing-association case `gio open` is in [`OPENERS`] for. 127 is the same
+/// statement made by a shell, which is how a `$BROWSER` or `x-www-browser`
+/// wrapper naming a program that does not exist comes back.
+///
+/// Code 4 is the one that cannot be read that way, and it is the catch-all:
+/// "the action failed" also covers a handler that *was* launched and then
+/// returned non-zero. A browser that takes the URL, opens the tab in an already
+/// running instance and exits non-zero for its own reasons ends up here, as
+/// does a wrapper script that does its job and then returns the exit status of
+/// something else. Falling through on that hands the same URL to a second
+/// opener: two tabs for one click, and for an OAuth link two authorize
+/// requests.
+///
+/// So anything not recognised below — 4, an unfamiliar code, or a death by
+/// signal (`code()` is `None`) — ends the loop rather than continuing it. The
+/// caller is told the opener failed, which is the honest report of an
+/// ambiguous outcome, and no second request is made on the user's behalf. Note
+/// what this costs: an opener that genuinely failed with code 4 no longer falls
+/// through to `gio`, so a user whose `xdg-open` fails that way sees an error
+/// where they previously might have got a tab.
+///
+/// This is reasoning from `xdg-open`'s documented exit codes, not from an
+/// observed double-open in this app.
+#[cfg(target_os = "linux")]
+fn exit_code_means_nothing_was_launched(code: Option<i32>) -> bool {
+    matches!(code, Some(1 | 2 | 3 | 127))
+}
 
 /// Spawn `url` with an opener, under a sanitized environment.
 #[cfg(target_os = "linux")]
@@ -383,6 +419,10 @@ fn spawn_with_clean_env(url: &str) -> Result<(), String> {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
 
+        // A spawn failure — `ErrorKind::NotFound` for an opener that is not
+        // installed, `PermissionDenied` for one that cannot be executed — is
+        // the unambiguous case: nothing ran, so nothing was opened, and the
+        // next candidate is free to try.
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(err) => {
@@ -395,6 +435,14 @@ fn spawn_with_clean_env(url: &str) -> Result<(), String> {
         match child.try_wait() {
             Ok(Some(status)) if !status.success() => {
                 failures.push(format!("{program} exited with {status}"));
+                // A program that *ran* is not a program that did nothing.
+                if !exit_code_means_nothing_was_launched(status.code()) {
+                    return Err(format!(
+                        "Could not confirm the link opened. Tried: {}. It may have opened anyway \
+                         — check your browser before trying again.",
+                        failures.join("; ")
+                    ));
+                }
                 continue;
             }
             Ok(_) => {}
@@ -697,5 +745,47 @@ mod tests {
         ]);
         let changes = sanitize_child_env(&env, &env, Some("/tmp/.mount_abc/"));
         assert_eq!(changes, vec![("GTK_PATH".to_string(), None)]);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod opener_fallback_tests {
+    use super::*;
+
+    /// The codes `xdg-open` documents as "nothing was launched". Falling
+    /// through to the next opener on these is what keeps `gio open` reachable
+    /// for the case it was added for: no usable `x-scheme-handler/https`
+    /// association.
+    #[test]
+    fn the_codes_that_mean_no_handler_ran_fall_through() {
+        for code in [1, 2, 3, 127] {
+            assert!(
+                exit_code_means_nothing_was_launched(Some(code)),
+                "exit {code} means the opener never launched anything"
+            );
+        }
+    }
+
+    /// The regression this guards: `xdg-open` returns 4 both when it could not
+    /// act and when the handler it launched returned non-zero — including a
+    /// browser that had already opened the tab. Trying `gio open` next would
+    /// open it a second time, which for an OAuth URL is a second authorize
+    /// request.
+    #[test]
+    fn an_exit_that_may_follow_a_successful_open_does_not_fall_through() {
+        assert!(!exit_code_means_nothing_was_launched(Some(4)));
+        for code in [5, 7, 126, 255] {
+            assert!(
+                !exit_code_means_nothing_was_launched(Some(code)),
+                "exit {code} is not a documented 'did nothing', so it must not be assumed to be one"
+            );
+        }
+    }
+
+    /// Killed by a signal: `code()` is `None` and the outcome is unknowable,
+    /// so it is treated like any other unrecognised exit.
+    #[test]
+    fn a_death_by_signal_does_not_fall_through() {
+        assert!(!exit_code_means_nothing_was_launched(None));
     }
 }
