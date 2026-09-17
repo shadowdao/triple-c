@@ -938,7 +938,6 @@ mod tests {
             "core:webview:allow-internal-toggle-devtools",
             "dialog:allow-open",
             "dialog:allow-save",
-            "opener:allow-open-url",
         ];
         expected.sort();
         assert_eq!(
