@@ -63,6 +63,12 @@
 /// URL; most non-WebKitGTK browsers ignore the variable entirely), but
 /// worth knowing before chasing the "links don't open" half of triple-c#34
 /// as a separate, unrelated cause.
+///
+/// That leak is now plugged rather than merely documented: `url_open` hands
+/// the opener a child environment with this variable (and the AppImage's own
+/// `LD_LIBRARY_PATH`/`GTK_PATH`/... ) restored or removed. Setting it here
+/// stays process-wide because GTK/WebKitGTK need it; what changed is that the
+/// children no longer inherit it.
 #[cfg(target_os = "linux")]
 const DMABUF_VAR: &str = "WEBKIT_DISABLE_DMABUF_RENDERER";
 
@@ -138,6 +144,12 @@ mod tests {
 }
 
 fn main() {
+    // Before *any* `std::env::set_var` — `url_open` hands a child process the
+    // environment this app was started with, and the workaround below is one
+    // of the things that must not leak into it (see triple-c#34). Anything
+    // added here that mutates the environment belongs after this line.
+    triple_c_lib::url_open::capture_pristine_environment();
+
     #[cfg(target_os = "linux")]
     apply_webkit_wayland_workaround();
 

@@ -132,6 +132,26 @@ fn default_use_shared_auth_token() -> bool {
     true
 }
 
+/// `auth_bridge_enabled` defaults to **on**, and the default is what makes
+/// `claude login` work at all.
+///
+/// The login flow binds a *random* ephemeral loopback port inside the
+/// container and then sends the host's browser to `127.0.0.1:<that port>`.
+/// On the host nothing is listening there, so the callback lands on a closed
+/// port and the CLI waits for a redirect that can never arrive. The bridge
+/// mirrors the container's loopback listeners onto the same host port, which
+/// is the only thing that closes that loop — so off-by-default made a hang the
+/// out-of-the-box experience.
+///
+/// Returning `true` from a `#[serde(default)]` helper (rather than flipping the
+/// constructor alone) is deliberate: existing `projects.json` records were
+/// written before this field existed, or while it was off, and an absent key is
+/// what the default is read for. A project that wants the old behaviour turns
+/// the toggle off, which persists an explicit `false`.
+fn default_auth_bridge_enabled() -> bool {
+    true
+}
+
 /// How much autonomy Claude Code is granted inside the container.
 ///
 /// Maps onto Claude Code CLI flags — see [`PermissionMode::cli_args`], which is
@@ -336,17 +356,30 @@ pub struct Project {
     pub sandbox_mode_enabled: bool,
     #[serde(default)]
     pub mission_control_enabled: bool,
-    /// Opt in to the auth bridge: while the container runs, its loopback
-    /// listeners are mirrored onto the host's loopback so browser OAuth
-    /// callbacks (`claude login`, `fly login`, `aws sso login`) can reach them.
+    /// The auth bridge: while the container runs, its loopback listeners are
+    /// mirrored onto the host's loopback so browser OAuth callbacks
+    /// (`claude login`, `fly login`, `aws sso login`) can reach them.
     /// Purely host-side — it deliberately has no container-recreation label,
     /// because toggling it changes nothing about the container itself.
-    #[serde(default)]
+    ///
+    /// **On by default**, and opt-*out* rather than opt-in — see
+    /// [`default_auth_bridge_enabled`] for why the default is the feature.
+    #[serde(default = "default_auth_bridge_enabled")]
     pub auth_bridge_enabled: bool,
     /// Opt in to the browser-view pane, which watches and takes over the
     /// browser Claude drives with Playwright inside the container. Purely
     /// host-side like `auth_bridge_enabled`, so it likewise has no
     /// container-recreation label.
+    ///
+    /// This is the *durable* home of the flag: `BrowserViewManager` reads it
+    /// rather than keeping its own copy, so the pane comes back the way it was
+    /// left. Off by default, and unlike the auth bridge it stays that way — a
+    /// view costs a container exec, a Node daemon and a host port, and a
+    /// container without Playwright cannot serve one at all.
+    ///
+    /// Durable does **not** mean auto-started: nothing brings a viewer up on
+    /// app start, so a project left enabled reports `enabled` with a state of
+    /// `Off` until the pane (or `open_page_in_container_browser`) asks for one.
     #[serde(default)]
     pub browser_view_enabled: bool,
     /// Grant the container what a VPN client needs to build a tunnel:
@@ -639,7 +672,7 @@ impl Project {
             allow_docker_access: false,
             sandbox_mode_enabled: false,
             mission_control_enabled: false,
-            auth_bridge_enabled: false,
+            auth_bridge_enabled: default_auth_bridge_enabled(),
             browser_view_enabled: false,
             vpn_support_enabled: false,
             use_shared_auth_token: default_use_shared_auth_token(),
@@ -884,5 +917,70 @@ mod tests {
         // And it reads back as what it is.
         let round_tripped: ClaudeCodeSettings = serde_json::from_str(&json).unwrap();
         assert_eq!(round_tripped, partial);
+    }
+
+    // ── The host-side per-project toggles ─────────────────────────────────
+
+    #[test]
+    fn a_project_stored_before_the_auth_bridge_existed_gets_it_turned_on() {
+        // The whole point of the serde default: `MAIN_SHAPE_PROJECT` is a real
+        // record written by a shipped binary and has no `auth_bridge_enabled`
+        // key at all. Without this, every existing project keeps hanging on
+        // `claude login` until its owner finds the toggle.
+        assert!(!MAIN_SHAPE_PROJECT.contains("auth_bridge_enabled"));
+        let project: Project = serde_json::from_str(MAIN_SHAPE_PROJECT).unwrap();
+        assert!(project.auth_bridge_enabled);
+
+        // The browser view is the other way round and must stay so: it costs a
+        // Node daemon, a container exec loop and a host port, and most
+        // containers have no Playwright to serve it with.
+        assert!(!project.browser_view_enabled);
+    }
+
+    #[test]
+    fn turning_the_auth_bridge_off_survives_the_default() {
+        // Opt-out has to be expressible, or the toggle does nothing across a
+        // restart. An explicit `false` in the file beats the default.
+        let json = r#"{ "auth_bridge_enabled": false }"#;
+        #[derive(Deserialize)]
+        struct JustTheFlag {
+            #[serde(default = "default_auth_bridge_enabled")]
+            auth_bridge_enabled: bool,
+        }
+        let parsed: JustTheFlag = serde_json::from_str(json).unwrap();
+        assert!(!parsed.auth_bridge_enabled);
+
+        // And a saved project always writes the key, so the choice is pinned
+        // rather than re-defaulted on the next load.
+        let mut p = Project::new("demo".to_string(), Vec::new());
+        p.auth_bridge_enabled = false;
+        let round_tripped: Project =
+            serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert!(!round_tripped.auth_bridge_enabled);
+    }
+
+    #[test]
+    fn a_new_project_starts_with_the_bridge_on_and_the_view_off() {
+        let p = Project::new("demo".to_string(), Vec::new());
+        assert!(p.auth_bridge_enabled);
+        assert!(!p.browser_view_enabled);
+    }
+
+    #[test]
+    fn the_path_migration_never_writes_the_flags_and_so_cannot_defeat_the_default() {
+        // `ProjectsStore::new` runs every record through this before
+        // deserialising. If it inserted either key — even as `false` — the
+        // serde default above would never be consulted for an existing project
+        // and this change would be a no-op on exactly the projects it is for.
+        let legacy = serde_json::json!({
+            "id": "p1",
+            "name": "demo",
+            "path": "/home/u/demo",
+        });
+        let migrated = Project::migrate_from_value(legacy);
+        let obj = migrated.as_object().unwrap();
+        assert!(obj.contains_key("paths"), "the migration should still do its own job");
+        assert!(!obj.contains_key("auth_bridge_enabled"));
+        assert!(!obj.contains_key("browser_view_enabled"));
     }
 }

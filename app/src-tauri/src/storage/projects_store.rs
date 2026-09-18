@@ -241,6 +241,21 @@ impl ProjectsStore {
         }
     }
 
+    /// Granular setter for the browser view's opt-in, for the same reason
+    /// [`Self::set_auth_bridge_enabled`] has one: the pane toggles this while
+    /// the Config tab may be holding an older copy of the whole record.
+    pub fn set_browser_view_enabled(&self, project_id: &str, enabled: bool) -> Result<(), String> {
+        let mut projects = self.lock();
+        if let Some(p) = projects.iter_mut().find(|p| p.id == project_id) {
+            p.browser_view_enabled = enabled;
+            p.updated_at = chrono::Utc::now().to_rfc3339();
+            self.save(&projects)?;
+            Ok(())
+        } else {
+            Err(format!("Project {} not found", project_id))
+        }
+    }
+
     pub fn set_container_id(&self, project_id: &str, container_id: Option<String>) -> Result<(), String> {
         let mut projects = self.lock();
         if let Some(p) = projects.iter_mut().find(|p| p.id == project_id) {
@@ -335,6 +350,63 @@ mod tests {
             fs::read_to_string(corrupt_marker_for(&file)).unwrap(),
             first.to_rfc3339()
         );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A store over a temp file. `new()` insists on `dirs::data_dir()`, which
+    /// is the real user's; the fields are right here, so the granular setters
+    /// can be exercised against a directory the test owns.
+    fn store_over(dir: &Path, projects: Vec<Project>) -> ProjectsStore {
+        ProjectsStore {
+            projects: Mutex::new(projects),
+            file_path: dir.join("projects.json"),
+        }
+    }
+
+    #[test]
+    fn the_browser_view_flag_is_written_to_disk_and_read_back() {
+        // The point of the whole exercise: before this the flag lived in a
+        // `HashSet` in `BrowserViewManager` and an app restart forgot it.
+        let dir = temp_dir("browser-view");
+        let project = Project::new("demo".to_string(), Vec::new());
+        let id = project.id.clone();
+        let store = store_over(&dir, vec![project]);
+
+        assert!(!store.get(&id).unwrap().browser_view_enabled);
+        store.set_browser_view_enabled(&id, true).unwrap();
+        assert!(store.get(&id).unwrap().browser_view_enabled);
+
+        // Durable, not merely in memory — this is what a restart reads.
+        let on_disk: Vec<Project> =
+            serde_json::from_str(&fs::read_to_string(dir.join("projects.json")).unwrap()).unwrap();
+        assert!(on_disk[0].browser_view_enabled);
+
+        store.set_browser_view_enabled(&id, false).unwrap();
+        assert!(!store.get(&id).unwrap().browser_view_enabled);
+
+        assert!(store.set_browser_view_enabled("no-such-project", true).is_err());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_granular_toggle_leaves_every_other_field_alone() {
+        // Why these setters exist at all: the Config tab can be holding an
+        // older copy of the whole record while the pane flips one flag.
+        let dir = temp_dir("granular");
+        let mut project = Project::new("demo".to_string(), Vec::new());
+        project.claude_instructions = Some("keep me".to_string());
+        let id = project.id.clone();
+        let store = store_over(&dir, vec![project]);
+
+        store.set_browser_view_enabled(&id, true).unwrap();
+        store.set_auth_bridge_enabled(&id, false).unwrap();
+
+        let saved = store.get(&id).unwrap();
+        assert_eq!(saved.claude_instructions.as_deref(), Some("keep me"));
+        assert!(saved.browser_view_enabled);
+        assert!(!saved.auth_bridge_enabled);
 
         fs::remove_dir_all(&dir).ok();
     }

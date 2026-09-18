@@ -105,6 +105,7 @@ describe("UrlToast", () => {
           url={SIGN_IN}
           onOpen={noop}
           onOpenInContainer={noop}
+          signInDefault="container"
           onDismiss={noop}
         />,
       );
@@ -150,6 +151,7 @@ describe("UrlToast", () => {
           url={SIGN_IN}
           onOpen={noop}
           onOpenInContainer={noop}
+          signInDefault="container"
           onDismiss={noop}
         />,
       );
@@ -166,10 +168,11 @@ describe("UrlToast", () => {
 
   describe("Anthropic sign-in links", () => {
     // The callback listener a `claude login` is waiting on is *inside* the
-    // container. Sending the user to their host browser completes the sign-in
-    // and then posts the result where nothing is listening, and the terminal
-    // hangs to its timeout — so for these, and only these, the container-side
-    // browser leads.
+    // container, so a sign-in is the one case where the host browser may be the
+    // wrong lead. Whether it actually is depends on the project — a live auth
+    // bridge carries the callback back, and the container-side alternative is
+    // not installed on a fresh project — so the owner decides and passes
+    // `signInDefault`. This component only renders the decision.
     const SIGN_IN =
       "https://claude.ai/oauth/authorize?code=true&client_id=abc&response_type=code";
 
@@ -180,7 +183,77 @@ describe("UrlToast", () => {
         .filter((t) => t === "Open" || t === "In container");
     }
 
-    it("puts the container browser first", () => {
+    it("puts the container browser first when the caller asks for it", () => {
+      render(
+        <UrlToast
+          url={SIGN_IN}
+          onOpen={noop}
+          onOpenInContainer={noop}
+          signInDefault="container"
+          onDismiss={noop}
+        />,
+      );
+      expect(actions()).toEqual(["In container", "Open"]);
+      expect(screen.getByTestId("url-toast-signin-hint")).toHaveTextContent(
+        /callback listener is inside the container/i,
+      );
+    });
+
+    it("leads with the host, and promises the bridge, when the bridge is live", () => {
+      // The pair is unchanged; only the order and which one is filled.
+      render(
+        <UrlToast
+          url={SIGN_IN}
+          onOpen={noop}
+          onOpenInContainer={noop}
+          signInDefault="host-bridged"
+          onDismiss={noop}
+        />,
+      );
+      expect(actions()).toEqual(["Open", "In container"]);
+      expect(
+        document.querySelector(URL_TOAST_PRIMARY_SELECTOR),
+      ).toHaveTextContent("Open");
+      // Still recognised as a sign-in, so the explanation stays — and here the
+      // explanation is true, which is the only state in which it may be given.
+      expect(screen.getByTestId("url-toast-signin-hint")).toHaveTextContent(
+        /the auth bridge is what carries the callback/i,
+      );
+    });
+
+    it("says the callback has nothing carrying it when the host is the last resort", () => {
+      // `host-fallback`: bridge off or unknown *and* no browser in the
+      // container. The old two-state hint said the auth bridge would carry the
+      // callback here too, which is a false promise — the user opens the link
+      // in their own browser and `claude login` hangs to its timeout with
+      // nothing on screen explaining why.
+      render(
+        <UrlToast
+          url={SIGN_IN}
+          onOpen={noop}
+          onOpenInContainer={noop}
+          signInDefault="host-fallback"
+          onDismiss={noop}
+        />,
+      );
+      // Which button leads does not change — only what the hint claims.
+      expect(actions()).toEqual(["Open", "In container"]);
+      expect(
+        document.querySelector(URL_TOAST_PRIMARY_SELECTOR),
+      ).toHaveTextContent("Open");
+      const hint = screen.getByTestId("url-toast-signin-hint");
+      expect(hint).toHaveTextContent(/nothing is set up to reach it/i);
+      // And it points at the two things that would fix it, since a warning
+      // with no next step is only a nicer way to fail.
+      expect(hint).toHaveTextContent(/Auth bridge/);
+      expect(hint).toHaveTextContent(/install browser support/i);
+      expect(hint).not.toHaveTextContent(/the auth bridge is what carries the callback/i);
+    });
+
+    it("defaults to the least-bad reading when the caller passes nothing", () => {
+      // A caller that says nothing has not told us a bridge is live, so the
+      // hint must not invent one. The host still leads: it is the answer more
+      // likely to work, and the one that reports its own failure.
       render(
         <UrlToast
           url={SIGN_IN}
@@ -189,9 +262,9 @@ describe("UrlToast", () => {
           onDismiss={noop}
         />,
       );
-      expect(actions()).toEqual(["In container", "Open"]);
+      expect(actions()).toEqual(["Open", "In container"]);
       expect(screen.getByTestId("url-toast-signin-hint")).toHaveTextContent(
-        /callback listener is inside the container/i,
+        /nothing is set up to reach it/i,
       );
     });
 
@@ -202,6 +275,7 @@ describe("UrlToast", () => {
           url={SIGN_IN}
           onOpen={onOpen}
           onOpenInContainer={noop}
+          signInDefault="container"
           onDismiss={noop}
         />,
       );
@@ -211,12 +285,14 @@ describe("UrlToast", () => {
 
     it("leaves an ordinary URL alone", () => {
       // A `gh auth login` device code, a docs page, a preview build — the host
-      // browser is the right answer for all of them and stays the default.
+      // browser is the right answer for all of them and stays the default,
+      // whatever the project's sign-in preference happens to be.
       render(
         <UrlToast
           url="https://github.com/login/device?code=ABCD-EFGH"
           onOpen={noop}
           onOpenInContainer={noop}
+          signInDefault="container"
           onDismiss={noop}
         />,
       );
@@ -232,6 +308,7 @@ describe("UrlToast", () => {
           url="https://claude.ai.evil.tld/oauth/authorize?x=1"
           onOpen={noop}
           onOpenInContainer={noop}
+          signInDefault="container"
           onDismiss={noop}
         />,
       );

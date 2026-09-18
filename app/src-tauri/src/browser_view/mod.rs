@@ -34,14 +34,22 @@
 //!
 //! ## Lifecycle
 //!
-//! Off by default and per-project opt-in, exactly like `auth_bridge_enabled`.
+//! Off by default and per-project opt-in. The opt-in itself is
+//! [`Project::browser_view_enabled`](crate::models::Project), persisted like
+//! `auth_bridge_enabled` and read from the store on demand rather than cached
+//! here — so the pane comes back the way it was left. What does *not* persist
+//! is the session: nothing starts a viewer on app start, so a project left
+//! enabled reports `enabled: true` with a state of `Off` until the pane asks
+//! for one. That is deliberate, and the reason the flag and the session are
+//! separate ideas — see [`BrowserViewManager::status`].
+//!
 //! One supervisor task per session owns the proxy and the viewer process, and it
 //! is the only thing that tears them down, so every way a session can end funnels
 //! through one code path:
 //!
 //! | Trigger | Path |
 //! |---|---|
-//! | Turned off in the UI | `set_browser_view_enabled(false)` → [`BrowserViewManager::stop`] |
+//! | Turned off in the UI | `set_browser_view_enabled(false)` → persist `false`, then [`BrowserViewManager::stop`] |
 //! | Container stopped, by the UI or otherwise | supervisor's `is_container_running` check |
 //! | Project deleted | supervisor's `store.get()` check |
 //! | Container rebuilt | old container stops → supervisor exits; the new one is not auto-started |
@@ -59,7 +67,10 @@
 //! orphan is reachable on container loopback only: the host-side port dies with
 //! the app, and [`crate::auth_bridge::RESERVED_CONTAINER_PORTS`] is a constant
 //! precisely so the bridge will not mirror an orphan the next time the app
-//! starts. The next [`BrowserViewManager::start`] reclaims it.
+//! starts. The next [`BrowserViewManager::start`] reclaims it — and since the
+//! opt-in is now durable, the restarted app says `enabled` with nothing running,
+//! which is exactly the state that invites the user to press the button that
+//! reclaims it. Nothing reclaims it on its own, because nothing auto-starts.
 
 pub mod commands;
 pub mod detect;
@@ -134,7 +145,10 @@ pub enum BrowserViewState {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BrowserViewStatus {
-    /// The per-project opt-in. Off by default.
+    /// The per-project opt-in, read from the persisted project record. Off by
+    /// default, and true without a `Running` state whenever the view is turned
+    /// on but has nothing up — a stopped container, or an app that has just
+    /// restarted and does not auto-start viewers.
     pub enabled: bool,
     pub state: BrowserViewState,
     /// Fully-formed, token-bearing URL for the pane's iframe. Loopback only.
@@ -201,17 +215,20 @@ struct Session {
 
 type SessionMap = Arc<Mutex<HashMap<String, Session>>>;
 
+/// Live sessions, and nothing else.
+///
+/// The per-project opt-in deliberately is **not** a field here. It lives on
+/// the project record as
+/// [`browser_view_enabled`](crate::models::Project::browser_view_enabled) and
+/// is read from [`ProjectsStore`] at each use, exactly as
+/// [`crate::auth_bridge::AuthBridgeManager`] treats `auth_bridge_enabled`:
+/// one copy, durable across a restart, and impossible to get out of step with
+/// what the Config tab shows. A cached copy here was the previous design and
+/// its only observable behaviour was forgetting the user's choice on every
+/// app start.
 #[derive(Default)]
 pub struct BrowserViewManager {
     sessions: SessionMap,
-    /// The per-project opt-in.
-    ///
-    /// NOTE: in memory only, so it does not survive an app restart. The durable
-    /// home for this is a `browser_view_enabled: bool` field on
-    /// `models::Project` (see the report) — `models/project.rs` is out of scope
-    /// for this change, so the flag lives here and the wiring is otherwise
-    /// identical to `auth_bridge_enabled`.
-    enabled: Mutex<std::collections::HashSet<String>>,
     next_epoch: AtomicU64,
 }
 
@@ -226,22 +243,15 @@ pub fn manager() -> &'static Arc<BrowserViewManager> {
 }
 
 impl BrowserViewManager {
-    pub async fn is_enabled(&self, project_id: &str) -> bool {
-        self.enabled.lock().await.contains(project_id)
-    }
-
-    async fn set_enabled(&self, project_id: &str, enabled: bool) {
-        let mut set = self.enabled.lock().await;
-        if enabled {
-            set.insert(project_id.to_string());
-        } else {
-            set.remove(project_id);
-        }
-    }
-
     /// Current status without touching the container.
-    pub async fn status(&self, project_id: &str) -> BrowserViewStatus {
-        let enabled = self.is_enabled(project_id).await;
+    ///
+    /// `enabled` is passed in rather than looked up, the way
+    /// [`crate::auth_bridge::AuthBridgeManager::status`] takes it: the flag is
+    /// the caller's to read from the store, and keeping it out of here is what
+    /// stops a second copy of it appearing. A project whose view is enabled but
+    /// whose container is stopped — or whose app has just restarted — reports
+    /// `enabled: true` with a state of `Off`, which is the honest answer.
+    pub async fn status(&self, project_id: &str, enabled: bool) -> BrowserViewStatus {
         match self.sessions.lock().await.get(project_id) {
             Some(session) => BrowserViewStatus {
                 enabled,
@@ -261,6 +271,14 @@ impl BrowserViewManager {
     ///
     /// Idempotent: a call while a live session exists returns that session's
     /// status untouched, so re-opening the tab does not restart the dashboard.
+    ///
+    /// This is the single funnel for turning the view **on**, so it is also
+    /// where the durable flag is written — both call sites (the toggle and
+    /// `open_page_in_container_browser`, which opens a page and then shows it)
+    /// mean "on", and neither can forget. The **off** direction is not
+    /// symmetric and must not be: [`Self::stop`] is reached by teardown paths
+    /// that are not the user changing their mind, so the command owns that
+    /// write. See [`Self::stop`].
     pub async fn start(
         &self,
         project_id: String,
@@ -268,7 +286,7 @@ impl BrowserViewManager {
         app: AppHandle,
         store: Arc<ProjectsStore>,
     ) -> Result<BrowserViewStatus, String> {
-        self.set_enabled(&project_id, true).await;
+        store.set_browser_view_enabled(&project_id, true)?;
 
         // Bind the answer before acting on it: `status()` takes the same lock,
         // and this mutex is not reentrant.
@@ -279,7 +297,7 @@ impl BrowserViewManager {
             .get(&project_id)
             .is_some_and(|s| !s.supervisor.is_finished());
         if already_live {
-            return Ok(self.status(&project_id).await);
+            return Ok(self.status(&project_id, true).await);
         }
 
         let detection = detect::detect(&container_id).await?;
@@ -364,14 +382,21 @@ impl BrowserViewManager {
             },
         );
 
-        let status = self.status(&project_id).await;
+        let status = self.status(&project_id, true).await;
         emit(&app, &project_id, &status);
         Ok(status)
     }
 
     /// Stop one project's view and wait until its host port has been released.
+    ///
+    /// Tears the *session* down and deliberately leaves the durable flag alone.
+    /// Most callers are not the user turning the feature off — a migration
+    /// removes the container out from under a running view
+    /// (`migration_commands`), and the container can stop for any other reason
+    /// — and persisting `false` for those would quietly opt the project out of
+    /// a feature it never asked to lose. `set_browser_view_enabled(false)` is
+    /// the one caller that means it, and it writes the flag itself first.
     pub async fn stop(&self, project_id: &str) {
-        self.set_enabled(project_id, false).await;
         // Remove under the lock, then release it before awaiting: the
         // supervisor takes the same lock to deregister itself on exit.
         let session = self.sessions.lock().await.remove(project_id);
@@ -483,7 +508,12 @@ async fn supervise(
     // longer exists. The session owns it, and this is where the session ends.
     let _ = popout::close(&app, &project_id);
 
-    let enabled = manager().is_enabled(&project_id).await;
+    // Straight from the store, like the auth bridge's own teardown emit: the
+    // session is over, but the project may well still be opted in — a stopped
+    // container is not a changed mind, and the pane has to show the difference.
+    let enabled = store
+        .get(&project_id)
+        .is_some_and(|p| p.browser_view_enabled);
     emit(&app, &project_id, &BrowserViewStatus::off(enabled));
 }
 
@@ -913,6 +943,25 @@ mod tests {
         assert!(s.enabled);
         assert_eq!(s.state, BrowserViewState::Off);
         assert!(s.url.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_opt_in_and_the_live_session_are_separate_answers() {
+        let manager = BrowserViewManager::default();
+
+        // Exactly what the pane reads on mount after an app restart of a
+        // project that was left enabled: the durable flag says on, and nothing
+        // auto-starts, so the state is honestly `Off`. The old in-memory flag
+        // could not express this — it came back `false` and the pane silently
+        // showed the feature as never having been turned on.
+        let status = manager.status("p1", true).await;
+        assert!(status.enabled);
+        assert_eq!(status.state, BrowserViewState::Off);
+        assert!(status.url.is_none());
+
+        // The flag belongs to the caller, read from the store. The manager
+        // keeps no copy, so it has nothing to contradict it with.
+        assert!(!manager.status("p1", false).await.enabled);
     }
 
     #[test]

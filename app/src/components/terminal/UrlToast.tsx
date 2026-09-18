@@ -1,5 +1,6 @@
 import type { KeyboardEvent } from "react";
 import { isAnthropicSignInUrl, urlOrigin } from "../../lib/urlRelay";
+import type { SignInOpenTarget } from "../../hooks/useSignInOpenTarget";
 import Button from "../ui/Button";
 
 /**
@@ -37,6 +38,24 @@ interface Props {
   /** Open it in the container's own browser instead of the host's. Omitted when
    *  the project has no browser to open it in. */
   onOpenInContainer?: () => void;
+  /**
+   * Which action leads for a *sign-in* link, and why (see the note below).
+   * Nothing else in the toast moves: both buttons are offered in all three
+   * states, in one of two orders.
+   *
+   * This component does not work it out, because the answer depends on the
+   * project's auth bridge and on what is installed inside its container —
+   * neither of which a presentational component should be reaching for.
+   * `hooks/useSignInOpenTarget.ts` owns the rule.
+   *
+   * Two of the three lead with the host button and differ only in the hint,
+   * which is the whole point of carrying three: `"host-bridged"` may promise
+   * that the auth bridge brings the callback home, `"host-fallback"` may not,
+   * because in that state nothing does. `"host-fallback"` is the default for
+   * that reason — a caller that says nothing has not told us a bridge is live,
+   * and the hint must not invent one.
+   */
+  signInDefault?: SignInOpenTarget;
   onDismiss: () => void;
 }
 
@@ -57,17 +76,26 @@ interface Props {
  * text swaps with no animation, and a user reading URL A can click Open on URL
  * B that arrived a second later.
  *
- * ## Anthropic sign-in links default to the container's browser
+ * ## Anthropic sign-in links get their default from the caller
  *
  * For an ordinary URL the host browser is the right answer and stays the
- * default. For a sign-in it is the *wrong* one: the callback listener the CLI
- * is waiting on is inside the container, so a host browser completes the sign-in
- * and then posts the result somewhere nothing is listening, and the terminal
- * hangs until it times out. Making the host button primary there was quietly
- * steering every user into that. The container-side browser closes the loop
- * with no host round trip and no auth bridge, so it leads — and the host button
- * stays, because a user who has the auth bridge on, or who wants their existing
- * browser session, still needs it.
+ * default, unconditionally. A sign-in is the one case where it might not be:
+ * the callback listener the CLI is waiting on is inside the container, so a
+ * host browser can complete the sign-in and then post the result where nothing
+ * is listening, leaving the terminal to hang to its timeout.
+ *
+ * *Can*, not *does* — which is why this is no longer decided from the URL. The
+ * auth bridge mirrors that container listener onto the same host port, and the
+ * container-side alternative is Playwright's dashboard pane, which a fresh
+ * project has not installed. Both of those are project facts, so the owner
+ * passes {@link Props.signInDefault} and this only renders it: the leading
+ * button is filled and comes first, the other keeps its place beside it.
+ *
+ * The hint below the URL renders all *three* states, not the two orderings.
+ * "Neither is set up" also leads with the host, but it is not the same claim:
+ * there the callback has nothing carrying it, so the hint names what would fix
+ * that instead of describing a bridge that is off. A two-way hint keyed on
+ * which button leads is exactly how that false promise got shipped.
  *
  * ## Reachable without a mouse, and it does not take focus to manage it
  *
@@ -96,6 +124,7 @@ export default function UrlToast({
   label = "Long URL detected",
   onOpen,
   onOpenInContainer,
+  signInDefault = "host-fallback",
   onDismiss,
 }: Props) {
   const origin = urlOrigin(url);
@@ -103,18 +132,27 @@ export default function UrlToast({
   // Only when there is somewhere to send it: without `onOpenInContainer` the
   // host button is the only action there is, so it stays primary.
   const signIn = !!onOpenInContainer && isAnthropicSignInUrl(url);
+  // A sign-in link the caller has decided is better completed inside the
+  // container. Everything below keys off this rather than off `signIn`, so the
+  // two orderings differ only in which of the pair leads.
+  const containerLeads = signIn && signInDefault === "container";
+  // The third state. Both host states put the same button first, so this is
+  // read by the hint alone: no bridge and no container browser means nothing is
+  // carrying the callback back, and saying "the auth bridge is what carries it"
+  // here is a promise the project cannot keep.
+  const hostIsLastResort = signIn && signInDefault === "host-fallback";
 
   // `Button` already owns the filled/outlined variants — including the rule
   // that filled uses `--accent-emphasis` and never `--accent`, which is the
   // foreground/link accent and fails WCAG AA behind white text.
   const hostButton = (
     <Button
-      variant={signIn ? "secondary" : "primary"}
-      data-url-toast-primary={signIn ? undefined : "true"}
+      variant={containerLeads ? "secondary" : "primary"}
+      data-url-toast-primary={containerLeads ? undefined : "true"}
       onClick={onOpen}
       className="flex-shrink-0"
       title={
-        signIn
+        containerLeads
           ? "Open in your own browser instead — the callback then has to reach the container by some other route"
           : undefined
       }
@@ -128,8 +166,8 @@ export default function UrlToast({
     // the container's own loopback, which is where the tool waiting for it is
     // listening — no host round trip, no auth bridge.
     <Button
-      variant={signIn ? "primary" : "secondary"}
-      data-url-toast-primary={signIn ? "true" : undefined}
+      variant={containerLeads ? "primary" : "secondary"}
+      data-url-toast-primary={containerLeads ? "true" : undefined}
       onClick={onOpenInContainer}
       className="flex-shrink-0"
       title="Open in a browser inside the container, and watch it in the Browser tab"
@@ -235,14 +273,16 @@ export default function UrlToast({
               lineHeight: 1.35,
             }}
           >
-            Sign-in link — the callback listener is inside the container.
-            Opening it there closes the loop; the host browser needs the auth
-            bridge.
+            {containerLeads
+              ? "Sign-in link — the callback listener is inside the container. Opening it there closes the loop; the host browser needs the auth bridge."
+              : hostIsLastResort
+                ? "Sign-in link — the callback listener is inside the container and nothing is set up to reach it. Turn on Auth bridge in the project’s Config tab, or install browser support to sign in inside the container."
+                : "Sign-in link — the callback listener is inside the container. The auth bridge is what carries the callback back to it from your own browser."}
           </div>
         )}
       </div>
 
-      {signIn ? (
+      {containerLeads ? (
         <>
           {containerButton}
           {hostButton}

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
-import { openUrl } from "@tauri-apps/plugin-opener";
 import { useInstallHelper } from "../hooks/useInstallHelper";
+import { openUrlExternal } from "../lib/tauri-commands";
 import { useDocker } from "../hooks/useDocker";
 import Modal from "./ui/Modal";
 import Button from "./ui/Button";
@@ -41,7 +41,7 @@ export default function DockerInstallDialog({ onClose }: Props) {
   const handleOpenDocs = async () => {
     if (!options) return;
     try {
-      await openUrl(options.docs_url);
+      await openUrlExternal(options.docs_url);
     } catch (e) {
       console.error("Failed to open docs URL:", e);
     }

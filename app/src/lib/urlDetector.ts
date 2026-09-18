@@ -109,7 +109,8 @@ export type UrlCallback = (url: string, source: UrlSource) => void;
  * A direct port of `usable_sign_in_link` in
  * `commands/auth_token_commands.rs`, and deliberately just as shallow: this is
  * a junk filter, not the security decision. `sanitizeRelayUrl` is still the
- * only thing standing between any of this and `openUrl`, and duplicating its
+ * only thing standing between any of this and `openUrlExternal`, and
+ * duplicating its
  * rules here would be a second place for them to go stale.
  *
  * The one rule from the Rust that is not ported is its `sk-ant-` check: that
@@ -293,7 +294,7 @@ export class UrlDetector {
     //    include the *whole* C0 range and DEL, not just BEL: an escape or a NUL
     //    swallowed into the middle of a match becomes a URL that renders as one
     //    thing in the toast and resolves as another. Everything emitted here is
-    //    still re-validated by `sanitizeRelayUrl` before it can reach `openUrl`;
+    //    still re-validated by `sanitizeRelayUrl` before it can reach the opener;
     //    stopping the match early only means the legitimate prefix survives
     //    instead of the whole candidate being thrown away.
     // eslint-disable-next-line no-control-regex
