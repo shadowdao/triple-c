@@ -181,6 +181,80 @@ fn stopped_probe_policy(project_is_busy: bool, snapshot_exists: bool) -> Stopped
     }
 }
 
+/// Reported as `probe_error` when a probe input could not be read at all,
+/// because the Docker daemon did not answer.
+///
+/// Deliberately distinct from [`NOTHING_TO_PROBE`]: an unreachable daemon is
+/// not evidence that the project has no container, and saying "no container or
+/// snapshot image yet" on a transient socket fault was confidently wrong about
+/// a project that may well have both. The underlying error is carried through
+/// verbatim, because "Docker is not running" and "permission denied on
+/// /var/run/docker.sock" call for different fixes from the user.
+fn daemon_unreachable(e: &str) -> String {
+    format!(
+        "Docker could not be reached, so this project's container could not be inspected: {}",
+        e
+    )
+}
+
+/// The four daemon readings [`get_container_staleness`] needs before it can
+/// choose a probe source, once each has been confirmed to be an *answer*.
+#[derive(Debug)]
+struct ProbeInputs {
+    /// The current base image's ID, or `None` when it is not pulled locally —
+    /// which [`mig::image_id`] reports as `Ok(None)`, not an error.
+    current_base_image_id: Option<String>,
+    /// The project's container, or `None` when it genuinely has none.
+    container_id: Option<String>,
+    /// `None` when there is no container to ask about; otherwise its state.
+    container_running: Option<bool>,
+    snapshot_exists: bool,
+}
+
+/// Turn the four collected daemon readings into probe inputs, or into the first
+/// daemon error among them.
+///
+/// **Absence and unreachability are different answers, and only one of them is
+/// an answer.** All four callees already draw that line — `image_id` maps a 404
+/// to `Ok(None)`, `find_existing_container` and `image_exists` return `Ok` with
+/// an empty filtered list — so a call site that writes `.unwrap_or(None)` /
+/// `.unwrap_or(false)` is not defaulting, it is *discarding a distinction the
+/// callee went to the trouble of making*. That is what let an unreachable
+/// daemon reach [`pick_probe_source`] as `(None, false)` and report
+/// [`NOTHING_TO_PROBE`] — a confident claim about a project nothing had
+/// actually looked at.
+///
+/// The first error wins, in call order, because they are all the same fault:
+/// when the daemon is down, all four fail, and the user needs the reason once,
+/// not four times.
+///
+/// **A caveat this cannot fix here.** `docker::is_container_running` swallows
+/// `inspect_container` failures into `Ok(false)` itself and errors only when the
+/// client cannot be built, so a daemon that dies between the list and the
+/// inspect still reads as "stopped" rather than as an error. That is a fix
+/// inside that function, not at this call site; threading its `Result` through
+/// at least stops *this* layer from adding a second swallow on top.
+fn collect_probe_inputs(
+    base_image_id: Result<Option<String>, String>,
+    container_id: Result<Option<String>, String>,
+    // `None` when there was no container to ask about — not a swallowed error.
+    container_running: Option<Result<bool, String>>,
+    snapshot_exists: Result<bool, String>,
+) -> Result<ProbeInputs, String> {
+    let current_base_image_id = base_image_id.map_err(|e| daemon_unreachable(&e))?;
+    let container_id = container_id.map_err(|e| daemon_unreachable(&e))?;
+    let container_running = container_running
+        .transpose()
+        .map_err(|e| daemon_unreachable(&e))?;
+    let snapshot_exists = snapshot_exists.map_err(|e| daemon_unreachable(&e))?;
+    Ok(ProbeInputs {
+        current_base_image_id,
+        container_id,
+        container_running,
+        snapshot_exists,
+    })
+}
+
 /// Runs two filesystem probes (~3 s each) and is therefore meant to be called
 /// on demand, not polled.
 ///
@@ -214,7 +288,42 @@ pub async fn get_container_staleness(
     let snapshot_image = docker::get_snapshot_image_name(&project);
 
     let mut out = ContainerStaleness::default();
-    out.current_base_image_id = mig::image_id(&base_image).await.unwrap_or(None);
+
+    // Every reading the daemon owes us, taken up front and kept as a `Result`
+    // so that "could not ask" stays distinguishable from "asked, and the answer
+    // is no" — see [`collect_probe_inputs`], which is where that distinction is
+    // acted on. Nothing between here and there may collapse one into the other.
+    let base_image_id = mig::image_id(&base_image).await;
+    let container_id_result = docker::find_existing_container(&project).await;
+    let container_running_result = match &container_id_result {
+        Ok(Some(id)) => Some(docker::is_container_running(id).await),
+        // No container, or no usable reading of one: nothing to inspect, and
+        // the error below is the container lookup's, reported once.
+        _ => None,
+    };
+    let snapshot_exists_result = docker::image_exists(&snapshot_image).await;
+
+    let inputs = match collect_probe_inputs(
+        base_image_id,
+        container_id_result,
+        container_running_result,
+        snapshot_exists_result,
+    ) {
+        Ok(inputs) => inputs,
+        // **Reported, not returned.** The hook's `catch` sets `staleness` to
+        // `null`, and `ContainerMigrationBanner` renders nothing at all for a
+        // null staleness — so an `Err` here would make the banner vanish at
+        // exactly the moment it has something to say. A `probe_error` on an
+        // otherwise-default report keeps it on screen, reading "Container base
+        // could not be checked".
+        Err(e) => {
+            out.probe_error = Some(e);
+            return Ok(out);
+        }
+    };
+    let container_id = inputs.container_id;
+
+    out.current_base_image_id = inputs.current_base_image_id;
     out.snapshot_created_at = mig::image_created(&snapshot_image).await;
 
     // Lineage, most authoritative source first: the live container's label,
@@ -228,7 +337,6 @@ pub async fn get_container_staleness(
     // as an answer and skip the snapshot entirely, so a snapshot that *did*
     // record a lineage was never consulted and the project reported "unknown"
     // with the information sitting one lookup away.
-    let container_id = docker::find_existing_container(&project).await.unwrap_or(None);
     let from_container = match &container_id {
         Some(id) => container_label(id, mig::LABEL_BASE_IMAGE_ID).await,
         None => None,
@@ -248,11 +356,8 @@ pub async fn get_container_staleness(
     };
 
     // ── Probes ───────────────────────────────────────────────────────────
-    let container_running = match &container_id {
-        Some(id) => Some(docker::is_container_running(id).await.unwrap_or(false)),
-        None => None,
-    };
-    let snapshot_exists = docker::image_exists(&snapshot_image).await.unwrap_or(false);
+    let container_running = inputs.container_running;
+    let snapshot_exists = inputs.snapshot_exists;
     let from_manifest = match (
         pick_probe_source(container_running, snapshot_exists),
         &container_id,
@@ -2164,6 +2269,91 @@ mod tests {
         );
         // Nothing to fall back to: say so instead of committing anyway.
         assert_eq!(stopped_probe_policy(true, false), StoppedProbe::Defer);
+    }
+
+    #[test]
+    fn an_unreachable_daemon_is_never_read_as_an_absent_container() {
+        // The bug: every one of these used to be flattened to "no" by an
+        // `unwrap_or`, which reached `pick_probe_source` as (None, false) and
+        // reported "no container or snapshot image yet" about a project nobody
+        // had managed to look at.
+        // Generic over the reading that failed: when the socket is gone, every
+        // one of the four fails the same way, whatever it was going to return.
+        fn daemon<T>() -> Result<T, String> {
+            Err("Failed to list containers: connection refused".to_string())
+        }
+
+        let e = collect_probe_inputs(daemon(), Ok(None), None, Ok(false)).unwrap_err();
+        assert!(e.starts_with("Docker could not be reached"), "{}", e);
+        assert!(e.contains("connection refused"), "{}", e);
+
+        let e = collect_probe_inputs(Ok(None), daemon(), None, Ok(false)).unwrap_err();
+        assert!(e.contains("connection refused"), "{}", e);
+
+        let e =
+            collect_probe_inputs(Ok(None), Ok(Some("c1".into())), Some(daemon()), Ok(false))
+                .unwrap_err();
+        assert!(e.contains("connection refused"), "{}", e);
+
+        let e = collect_probe_inputs(Ok(None), Ok(None), None, daemon()).unwrap_err();
+        assert!(e.contains("connection refused"), "{}", e);
+
+        // And never the message that is only true of a project with neither.
+        assert_ne!(
+            collect_probe_inputs(Ok(None), daemon(), None, Ok(false)).unwrap_err(),
+            NOTHING_TO_PROBE
+        );
+    }
+
+    #[test]
+    fn the_first_daemon_error_is_the_one_reported() {
+        // When the daemon is down all four fail for the same reason, and the
+        // user needs that reason once rather than four times. Call order wins.
+        let e = collect_probe_inputs(
+            Err("first".into()),
+            Err("second".into()),
+            Some(Err("third".into())),
+            Err("fourth".into()),
+        )
+        .unwrap_err();
+        assert!(e.ends_with("first"), "{}", e);
+
+        let e = collect_probe_inputs(
+            Ok(None),
+            Err("second".into()),
+            Some(Err("third".into())),
+            Err("fourth".into()),
+        )
+        .unwrap_err();
+        assert!(e.ends_with("second"), "{}", e);
+    }
+
+    #[test]
+    fn a_daemon_that_answers_no_is_an_answer_and_passes_through() {
+        // No container, no snapshot, base image not pulled: all four are `Ok`,
+        // and the "nothing to probe" path downstream is then genuinely earned.
+        let inputs = collect_probe_inputs(Ok(None), Ok(None), None, Ok(false)).unwrap();
+        assert_eq!(inputs.current_base_image_id, None);
+        assert_eq!(inputs.container_id, None);
+        assert_eq!(inputs.container_running, None);
+        assert!(!inputs.snapshot_exists);
+        assert_eq!(
+            pick_probe_source(inputs.container_running, inputs.snapshot_exists),
+            ProbeSource::Nothing
+        );
+
+        // And the fully populated reading survives intact.
+        let inputs = collect_probe_inputs(
+            Ok(Some("sha256:base".into())),
+            Ok(Some("c1".into())),
+            Some(Ok(true)),
+            Ok(true),
+        )
+        .unwrap();
+        assert_eq!(inputs.current_base_image_id.as_deref(), Some("sha256:base"));
+        assert_eq!(inputs.container_id.as_deref(), Some("c1"));
+        assert_eq!(inputs.container_running, Some(true));
+        assert!(inputs.snapshot_exists);
     }
 
     #[test]
