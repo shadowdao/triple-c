@@ -1664,7 +1664,7 @@ describe("the link handler is wired into the terminal, and reads its live mode",
     await write("\x1b[?1002h");
 
     wiredHandler().activate(
-      new MouseEvent("click", { button: 0 }),
+      new MouseEvent("click", { button: 0, detail: 1 }),
       "https://example.com/x",
       range,
     );
@@ -1679,7 +1679,7 @@ describe("the link handler is wired into the terminal, and reads its live mode",
 
     await act(async () => {
       wiredHandler().activate(
-        new MouseEvent("click", { button: 0 }),
+        new MouseEvent("click", { button: 0, detail: 1 }),
         "https://example.com/x",
         range,
       );
