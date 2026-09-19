@@ -260,8 +260,14 @@ fn stopped_probe_policy(
 /// The underlying error is carried through verbatim, because "Docker is not
 /// running" and "permission denied on /var/run/docker.sock" call for different
 /// fixes from the user.
+///
+/// The sentence names *the check*, not the container, because only two of the
+/// four readings are about the container at all — the other two are the base
+/// image and the snapshot image. Saying "this project's container could not be
+/// inspected" for a malformed base image name in settings would point the user
+/// at the wrong object, which is the same mistake one size down.
 fn probe_failed(e: &str) -> String {
-    format!("This project's container could not be inspected: {}", e)
+    format!("This project could not be checked against its base image: {}", e)
 }
 
 /// The four daemon readings [`get_container_staleness`] takes before it can
@@ -342,11 +348,14 @@ enum ProbeStart {
 ///   container on a busy project. It travels as a `Result` so each of those can
 ///   surface it, and the states that never consult it are not punished for it.
 ///
-/// The first error wins, in call order, because when the daemon is unreachable
-/// they fail together and the user needs the reason once, not three times.
-/// `container_id` leads so that the reported error is most often the one that
-/// stopped the probe. (It is at most three, not four: `container_running` is
-/// only attempted when `container_id` answered with a container.)
+/// The first error wins, because when the daemon is unreachable they fail
+/// together and the user needs the reason once, not three times. The order is
+/// `container_id`, then `base_image_id`, then `container_running` — chosen
+/// priority, deliberately *not* the order the daemon was called in, so that the
+/// reported error is most often the one that stopped the probe rather than
+/// whichever reading happened to run first. (It is at most three, not four:
+/// `container_running` is only attempted when `container_id` answered with a
+/// container.)
 ///
 /// **A caveat this cannot fix here.** `docker::is_container_running` swallows
 /// `inspect_container` failures into `Ok(false)` itself and errors only when the
@@ -2560,17 +2569,24 @@ mod tests {
         // user-supplied, so a typo in settings lands here — and used to be
         // reported as "Docker could not be reached", sending the user to fix a
         // daemon that was running.
+        // The payload is the shape bollard really produces for this case, and
+        // it contains the word "Docker" itself — so asserting the *message*
+        // lacks that word would pass here only because a synthetic payload was
+        // chosen. What must be true is that nothing *we* add claims the daemon
+        // was unreachable, or names the container when the reading was about
+        // the base image.
+        let raw = "Docker responded with status code 400: invalid reference format";
         let e = collect_probe_inputs(ProbeReadings {
-            base_image_id: Err("invalid reference format".into()),
+            base_image_id: Err(raw.into()),
             ..readings()
         })
         .unwrap_err();
         assert!(!e.contains("could not be reached"), "{}", e);
-        assert!(!e.contains("Docker"), "{}", e);
+        assert!(!e.contains("container"), "{}", e);
         // The cause still comes through verbatim: "Docker isn't running" and
         // "permission denied on the socket" need different fixes and must stay
         // distinguishable.
-        assert!(e.contains("invalid reference format"), "{}", e);
+        assert!(e.contains(raw), "{}", e);
     }
 
     #[test]
