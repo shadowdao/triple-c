@@ -60,6 +60,18 @@ const xterm = vi.hoisted(() => ({
   instances: [] as unknown[],
 }));
 
+/**
+ * The click handler `TerminalView` hands `WebLinksAddon`.
+ *
+ * Captured for the same reason the `Terminal` constructor is: xterm decides
+ * when to call it from cell geometry jsdom has no layout for, so the only way
+ * to ask "does the plain-text-URL path apply the same gate as the OSC 8 one?"
+ * is to hold the function and call it.
+ */
+const webLinks = vi.hoisted(() => ({
+  handler: null as null | ((event: MouseEvent, uri: string) => void),
+}));
+
 vi.mock("@xterm/xterm", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@xterm/xterm")>();
   class SpyTerminal extends actual.Terminal {
@@ -70,6 +82,18 @@ vi.mock("@xterm/xterm", async (importOriginal) => {
     }
   }
   return { ...actual, Terminal: SpyTerminal };
+});
+
+vi.mock("@xterm/addon-web-links", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@xterm/addon-web-links")>();
+  type Args = ConstructorParameters<typeof actual.WebLinksAddon>;
+  class SpyWebLinksAddon extends actual.WebLinksAddon {
+    constructor(...args: Args) {
+      super(...args);
+      webLinks.handler = (args[0] ?? null) as typeof webLinks.handler;
+    }
+  }
+  return { ...actual, WebLinksAddon: SpyWebLinksAddon };
 });
 
 /**
@@ -190,6 +214,7 @@ beforeEach(() => {
   useAppState.setState({ sessions: [] });
   xterm.options = null;
   xterm.instances.length = 0;
+  webLinks.handler = null;
 });
 
 afterEach(() => {
@@ -1114,12 +1139,16 @@ describe("the hover hint names the key that actually works", () => {
   const original = navigator.platform;
   afterEach(() => platform(original));
 
-  const hoverHint = (tracking: boolean): string => {
+  const hoverHint = (
+    tracking: boolean,
+    macOptionClickForcesSelection = true,
+  ): string => {
     const host = document.createElement("div");
-    createOsc8LinkHandler(
-      () => host,
-      () => tracking,
-    ).hover?.(new MouseEvent("mousemove"), "https://example.com/x", {
+    createOsc8LinkHandler(() => host, () => ({
+      mouseTracking: tracking,
+      hasSelection: false,
+      macOptionClickForcesSelection,
+    })).hover?.(new MouseEvent("mousemove"), "https://example.com/x", {
       start: { x: 1, y: 1 },
       end: { x: 1, y: 1 },
     });
@@ -1151,6 +1180,18 @@ describe("the hover hint names the key that actually works", () => {
     platform("MacIntel");
     expect(hoverHint(false)).not.toContain("Option+click");
   });
+
+  // `macOptionClickForcesSelection` defaults to false in xterm and this view
+  // sets it true, so the Mac branch is only live because of that line. If it
+  // ever goes, Option stops being the force-selection modifier and the gate
+  // can never pass while a program holds the mouse — so the card must not go
+  // on naming a key that does nothing.
+  it("does not promise Option+click when the option behind it is off", () => {
+    platform("MacIntel");
+    const hint = hoverHint(true, false);
+    expect(hint).not.toContain("Option+click");
+    expect(hint).not.toContain("Shift+click");
+  });
 });
 
 describe("createOsc8LinkHandler — clicking a link Claude Code printed", () => {
@@ -1172,17 +1213,30 @@ describe("createOsc8LinkHandler — clicking a link Claude Code printed", () => 
 
   let host: HTMLDivElement;
   let handler: ReturnType<typeof createOsc8LinkHandler>;
-  /** What the terminal's live mouse-tracking mode says, per test. */
-  let tracking: boolean;
+  /**
+   * What the terminal answers about itself when the gate asks, per test.
+   *
+   * Mutable rather than fixed at construction because both of the first two
+   * change *under* the handler: the container sets the mouse mode with a
+   * DECSET, and the selection is whatever the gesture that ended in this
+   * mouseup left behind.
+   */
+  let state: {
+    mouseTracking: boolean;
+    hasSelection: boolean;
+    macOptionClickForcesSelection: boolean;
+  };
 
   beforeEach(() => {
     host = document.createElement("div");
     document.body.appendChild(host);
-    tracking = false;
-    handler = createOsc8LinkHandler(
-      () => host,
-      () => tracking,
-    );
+    state = {
+      mouseTracking: false,
+      hasSelection: false,
+      // What `TerminalView` sets on the real terminal.
+      macOptionClickForcesSelection: true,
+    };
+    handler = createOsc8LinkHandler(() => host, () => state);
   });
 
   afterEach(() => host.remove());
@@ -1191,8 +1245,9 @@ describe("createOsc8LinkHandler — clicking a link Claude Code printed", () => 
     return host.querySelector<HTMLElement>(`.${OSC8_HOVER_CLASS}`);
   }
 
+  /** A real single click: one press, one release, `detail` 1. */
   const click = (init: MouseEventInit = {}) =>
-    new MouseEvent("click", { button: 0, ...init });
+    new MouseEvent("click", { button: 0, detail: 1, ...init });
 
   it("refuses a target that fails validation, without reaching the opener", () => {
     // The visible text can be anything; the parameter is what gets opened, and
@@ -1233,7 +1288,7 @@ describe("createOsc8LinkHandler — clicking a link Claude Code printed", () => 
      * separates "I clicked the menu item" from "I asked to leave the app".
      */
     it("refuses a plain click while a program is tracking the mouse", () => {
-      tracking = true;
+      state.mouseTracking = true;
 
       handler.activate(click(), URL, range);
 
@@ -1241,7 +1296,7 @@ describe("createOsc8LinkHandler — clicking a link Claude Code printed", () => 
     });
 
     it("opens on the force-selection modifier while tracking", async () => {
-      tracking = true;
+      state.mouseTracking = true;
 
       await act(async () => {
         handler.activate(click({ shiftKey: true }), URL, range);
@@ -1255,7 +1310,7 @@ describe("createOsc8LinkHandler — clicking a link Claude Code printed", () => 
       // A normal shell. This is what `WebLinksAddon` does for the plain-text
       // URLs in the same buffer, and asking for a modifier here would read as
       // a broken link.
-      tracking = false;
+      state.mouseTracking = false;
 
       await act(async () => {
         handler.activate(click(), URL, range);
@@ -1268,13 +1323,193 @@ describe("createOsc8LinkHandler — clicking a link Claude Code printed", () => 
     it("ignores every button but the primary one", () => {
       // Right-click is the context menu this pane already binds; middle-click
       // is paste. Neither is a request to leave the app.
-      tracking = false;
+      state.mouseTracking = false;
 
       handler.activate(click({ button: 2 }), URL, range);
       handler.activate(click({ button: 1 }), URL, range);
       handler.activate(click({ button: 2, shiftKey: true }), URL, range);
 
       expect(openUrlExternal).not.toHaveBeenCalled();
+    });
+
+    /**
+     * Selecting text is not asking to leave the app.
+     *
+     * `Linkifier._handleMouseUp` has no `detail` check, no drag threshold and
+     * no timestamp — it activates whenever the mouseup lands on the same link
+     * the mousedown did. `SelectionService` is bound on the *document* and the
+     * Linkifier on `screenElement`, so the selection gesture and the link
+     * activation both run, the link layer first. Every gesture below is one a
+     * user makes to *copy* a string, and none of them may open a browser.
+     */
+    describe("a selection gesture is not a click", () => {
+      it("refuses a double-click, which selects the word under it", () => {
+        // xterm selects the word on the *mousedown* of the second click, so
+        // by this mouseup the selection is already there.
+        state.hasSelection = true;
+
+        handler.activate(click({ detail: 2 }), URL, range);
+
+        expect(openUrlExternal).not.toHaveBeenCalled();
+      });
+
+      it("refuses a triple-click, which selects the whole row", () => {
+        state.hasSelection = true;
+
+        handler.activate(click({ detail: 3 }), URL, range);
+
+        expect(openUrlExternal).not.toHaveBeenCalled();
+      });
+
+      // The one the click count cannot see: a drag is a single press and a
+      // single release, so `detail` is 1 throughout. Only the selection it
+      // left behind distinguishes it from a click.
+      it("refuses a drag that selected characters, at click count 1", () => {
+        state.hasSelection = true;
+
+        handler.activate(click(), URL, range);
+
+        expect(openUrlExternal).not.toHaveBeenCalled();
+      });
+
+      /**
+       * The worst version, and the reason the modifier alone is not a gate.
+       *
+       * While a program holds the mouse, Shift/Option+drag is the *only* way
+       * to select text at all — so "the deliberate request to leave the app"
+       * and "I am copying this line" are byte-identical gestures. A container
+       * that wraps each of its output rows in an OSC 8 turns every legitimate
+       * copy into a browser open.
+       */
+      it("refuses a force-selection drag while a program holds the mouse", () => {
+        state.mouseTracking = true;
+        state.hasSelection = true;
+
+        handler.activate(click({ shiftKey: true }), URL, range);
+
+        expect(openUrlExternal).not.toHaveBeenCalled();
+      });
+
+      // Belt to the selection check's braces: independent of whether xterm
+      // managed to select anything (a double-click on trailing whitespace
+      // selects nothing), a second click is not a first one.
+      it("refuses a repeat click even when nothing ended up selected", () => {
+        state.hasSelection = false;
+
+        handler.activate(click({ detail: 2 }), URL, range);
+
+        expect(openUrlExternal).not.toHaveBeenCalled();
+      });
+    });
+
+    /**
+     * The card and the gate must not disagree about what the user has to do.
+     *
+     * The hint is computed once, when the pointer arrives; the mode it was
+     * computed from is the container's to change, and `?1002l` takes effect
+     * synchronously with the write. So a card reading "Shift+click to open"
+     * can be on screen while the live mode says a bare click is enough —
+     * which is also the shape of the flicker attack in FINDING 2. The gate
+     * therefore honours the *stricter* of what was promised and what is true
+     * now: a modifier the card asked for is still required when the click
+     * lands.
+     */
+    describe("what the card promised still binds when the click lands", () => {
+      it("keeps demanding the modifier after the container drops tracking", () => {
+        state.mouseTracking = true;
+        handler.hover?.(new MouseEvent("mousemove"), URL, range);
+        expect(host.textContent).toContain("+click to open");
+
+        // `?1002l`, mid-hover.
+        state.mouseTracking = false;
+        handler.activate(click(), URL, range);
+
+        expect(openUrlExternal).not.toHaveBeenCalled();
+      });
+
+      it("still opens on the modifier the card named", async () => {
+        state.mouseTracking = true;
+        handler.hover?.(new MouseEvent("mousemove"), URL, range);
+        state.mouseTracking = false;
+
+        await act(async () => {
+          handler.activate(click({ shiftKey: true }), URL, range);
+          await Promise.resolve();
+        });
+
+        expect(openUrlExternal).toHaveBeenCalledWith(URL);
+      });
+
+      it("does not hold a stale demand against the next link", async () => {
+        state.mouseTracking = true;
+        handler.hover?.(new MouseEvent("mousemove"), URL, range);
+        handler.leave?.(new MouseEvent("mouseout"), URL, range);
+
+        // A plain shell now, and a fresh card that says so.
+        state.mouseTracking = false;
+        handler.hover?.(new MouseEvent("mousemove"), URL, range);
+        expect(host.textContent).toContain("Click to open");
+
+        await act(async () => {
+          handler.activate(click(), URL, range);
+          await Promise.resolve();
+        });
+
+        expect(openUrlExternal).toHaveBeenCalledWith(URL);
+      });
+    });
+
+    /**
+     * FINDING 6: the modifier is xterm's, including the option it hangs on.
+     *
+     * xterm's rule is `isMac ? altKey && macOptionClickForcesSelection :
+     * shiftKey`. Hardcoding `altKey` agrees with the app only for as long as
+     * the app keeps setting that option, and nothing tells you when it stops.
+     */
+    describe("the Mac modifier follows the terminal's own option", () => {
+      const platform = (value: string) =>
+        Object.defineProperty(navigator, "platform", {
+          value,
+          configurable: true,
+        });
+      const original = navigator.platform;
+      afterEach(() => platform(original));
+
+      it("opens on Option+click while the option is on", async () => {
+        platform("MacIntel");
+        state.mouseTracking = true;
+        state.macOptionClickForcesSelection = true;
+
+        await act(async () => {
+          handler.activate(click({ altKey: true }), URL, range);
+          await Promise.resolve();
+        });
+
+        expect(openUrlExternal).toHaveBeenCalledWith(URL);
+      });
+
+      it("refuses Option+click when the terminal does not treat it as force-select", () => {
+        platform("MacIntel");
+        state.mouseTracking = true;
+        state.macOptionClickForcesSelection = false;
+
+        handler.activate(click({ altKey: true }), URL, range);
+
+        expect(openUrlExternal).not.toHaveBeenCalled();
+      });
+
+      it("ignores the option off a Mac, where Shift is the modifier", async () => {
+        platform("Linux x86_64");
+        state.mouseTracking = true;
+        state.macOptionClickForcesSelection = false;
+
+        await act(async () => {
+          handler.activate(click({ shiftKey: true }), URL, range);
+          await Promise.resolve();
+        });
+
+        expect(openUrlExternal).toHaveBeenCalledWith(URL);
+      });
     });
   });
 
@@ -1452,5 +1687,98 @@ describe("the link handler is wired into the terminal, and reads its live mode",
     });
 
     expect(openUrlExternal).toHaveBeenCalledWith("https://example.com/x");
+  });
+});
+
+/**
+ * FINDING 4: the sibling path opens the same browser.
+ *
+ * `WebLinksAddon` matches rendered text and activates through the same
+ * `Linkifier._handleMouseUp`, with the same absence of any check. It also
+ * picks up links the OSC 8 handler never sees: `OscLinkProvider` drops a
+ * non-http(s) hyperlink target before `linkHandler` is reached, which leaves
+ * the addon free to match the *label* — so an OSC 8 with a `javascript:`
+ * target and an `https://evil.tld/x` label arrives here and nowhere else.
+ * Both routes end at `openUrlExternal`, so both ask the same question first.
+ */
+describe("the plain-text URL path is gated the same way", () => {
+  function webLinksHandler() {
+    if (!webLinks.handler) throw new Error("no handler was passed to WebLinksAddon");
+    return webLinks.handler;
+  }
+
+  function term() {
+    return xterm.instances.at(-1) as unknown as {
+      write(d: string, cb: () => void): void;
+      select(column: number, row: number, length: number): void;
+    };
+  }
+
+  async function write(data: string) {
+    await act(() => new Promise<void>((resolve) => term().write(data, resolve)));
+  }
+
+  const click = (init: MouseEventInit = {}) =>
+    new MouseEvent("click", { button: 0, detail: 1, ...init });
+  const URL = "https://example.com/x";
+
+  it("opens on a plain click in an ordinary shell", async () => {
+    mountSession("bash");
+
+    await act(async () => {
+      webLinksHandler()(click(), URL);
+      await Promise.resolve();
+    });
+
+    expect(openUrlExternal).toHaveBeenCalledWith(URL);
+  });
+
+  it("refuses a plain click while a program holds the mouse", async () => {
+    mountSession("claude");
+    await write("\x1b[?1002h");
+
+    webLinksHandler()(click(), URL);
+
+    expect(openUrlExternal).not.toHaveBeenCalled();
+  });
+
+  it("opens on the force-selection modifier while tracking", async () => {
+    mountSession("claude");
+    await write("\x1b[?1002h");
+
+    await act(async () => {
+      webLinksHandler()(click({ shiftKey: true }), URL);
+      await Promise.resolve();
+    });
+
+    expect(openUrlExternal).toHaveBeenCalledWith(URL);
+  });
+
+  it("refuses the mouseup that ended a selection", async () => {
+    mountSession("bash");
+    await write("https://example.com/x");
+    await act(async () => {
+      term().select(0, 0, 5);
+    });
+
+    webLinksHandler()(click(), URL);
+
+    expect(openUrlExternal).not.toHaveBeenCalled();
+  });
+
+  it("refuses a repeat click", async () => {
+    mountSession("bash");
+
+    webLinksHandler()(click({ detail: 2 }), URL);
+
+    expect(openUrlExternal).not.toHaveBeenCalled();
+  });
+
+  it("still refuses a target that fails validation", async () => {
+    mountSession("bash");
+
+    webLinksHandler()(click(), "https://claude.ai@evil.tld/authorize");
+
+    expect(openUrlExternal).not.toHaveBeenCalled();
   });
 });
