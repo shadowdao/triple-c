@@ -46,6 +46,33 @@ const ptyOutput = vi.hoisted(() => ({
 }));
 
 /**
+ * What `TerminalView` actually handed the `Terminal` constructor, and the
+ * instances it built.
+ *
+ * The real xterm is kept — these tests depend on its parser, its modes and its
+ * DOM — and only the constructor is wrapped, because the wiring of
+ * `linkHandler` is otherwise unobservable from outside: xterm decides when to
+ * call it from cell geometry that jsdom has no layout for, so deleting the
+ * `linkHandler:` line changed nothing any assertion could see.
+ */
+const xterm = vi.hoisted(() => ({
+  options: null as Record<string, unknown> | null,
+  instances: [] as unknown[],
+}));
+
+vi.mock("@xterm/xterm", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@xterm/xterm")>();
+  class SpyTerminal extends actual.Terminal {
+    constructor(options?: ConstructorParameters<typeof actual.Terminal>[0]) {
+      super(options);
+      xterm.options = (options ?? null) as Record<string, unknown> | null;
+      xterm.instances.push(this);
+    }
+  }
+  return { ...actual, Terminal: SpyTerminal };
+});
+
+/**
  * Shift+Enter has to reach the container as ESC+CR.
  *
  * xterm.js does not consult `shiftKey` for Enter, so Shift+Enter is
@@ -161,6 +188,8 @@ beforeEach(() => {
   useAppState.setState({ toasts: [] });
   document.body.innerHTML = "";
   useAppState.setState({ sessions: [] });
+  xterm.options = null;
+  xterm.instances.length = 0;
 });
 
 afterEach(() => {
@@ -1085,29 +1114,42 @@ describe("the hover hint names the key that actually works", () => {
   const original = navigator.platform;
   afterEach(() => platform(original));
 
-  // xterm gates this on its own `isMac`; if the hint and the gate disagree the
-  // user is told to press a key that does nothing.
+  const hoverHint = (tracking: boolean): string => {
+    const host = document.createElement("div");
+    createOsc8LinkHandler(
+      () => host,
+      () => tracking,
+    ).hover?.(new MouseEvent("mousemove"), "https://example.com/x", {
+      start: { x: 1, y: 1 },
+      end: { x: 1, y: 1 },
+    });
+    return host.textContent ?? "";
+  };
+
+  // The hint and the gate read one predicate; these pin that they cannot
+  // drift, because a hint naming a key the gate does not accept is the bug
+  // that was already fixed once on this branch.
   it("says Option on a Mac, because that is xterm's force-selection modifier there", () => {
     platform("MacIntel");
-    const host = document.createElement("div");
-    createOsc8LinkHandler(() => host).hover?.(
-      new MouseEvent("mousemove"),
-      "https://example.com/x",
-      { start: { x: 1, y: 1 }, end: { x: 1, y: 1 } },
-    );
-    expect(host.textContent).toContain("Option+click");
-    expect(host.textContent).not.toContain("Shift+click");
+    expect(hoverHint(true)).toContain("Option+click");
+    expect(hoverHint(true)).not.toContain("Shift+click");
   });
 
   it("says Shift everywhere else", () => {
     platform("Linux x86_64");
-    const host = document.createElement("div");
-    createOsc8LinkHandler(() => host).hover?.(
-      new MouseEvent("mousemove"),
-      "https://example.com/x",
-      { start: { x: 1, y: 1 }, end: { x: 1, y: 1 } },
-    );
-    expect(host.textContent).toContain("Shift+click");
+    expect(hoverHint(true)).toContain("Shift+click");
+  });
+
+  // No program holds the mouse, so no modifier is needed — and naming one
+  // would tell the user to press a key the gate ignores.
+  it("names no modifier at all while nothing is tracking the mouse", () => {
+    platform("Linux x86_64");
+    const hint = hoverHint(false);
+    expect(hint).toContain("Click to open");
+    expect(hint).not.toContain("Shift+click");
+
+    platform("MacIntel");
+    expect(hoverHint(false)).not.toContain("Option+click");
   });
 });
 
@@ -1130,28 +1172,35 @@ describe("createOsc8LinkHandler — clicking a link Claude Code printed", () => 
 
   let host: HTMLDivElement;
   let handler: ReturnType<typeof createOsc8LinkHandler>;
+  /** What the terminal's live mouse-tracking mode says, per test. */
+  let tracking: boolean;
 
   beforeEach(() => {
     host = document.createElement("div");
     document.body.appendChild(host);
-    handler = createOsc8LinkHandler(() => host);
+    tracking = false;
+    handler = createOsc8LinkHandler(
+      () => host,
+      () => tracking,
+    );
   });
+
+  afterEach(() => host.remove());
 
   function hoverCard(): HTMLElement | null {
     return host.querySelector<HTMLElement>(`.${OSC8_HOVER_CLASS}`);
   }
 
+  const click = (init: MouseEventInit = {}) =>
+    new MouseEvent("click", { button: 0, ...init });
+
   it("refuses a target that fails validation, without reaching the opener", () => {
     // The visible text can be anything; the parameter is what gets opened, and
     // a container is free to put a scheme in it that the host must never hand
     // to an OS-level opener.
-    handler.activate(new MouseEvent("click"), "javascript:alert(1)", range);
-    handler.activate(new MouseEvent("click"), "file:///etc/passwd", range);
-    handler.activate(
-      new MouseEvent("click"),
-      "https://claude.ai@evil.tld/authorize",
-      range,
-    );
+    handler.activate(click(), "javascript:alert(1)", range);
+    handler.activate(click(), "file:///etc/passwd", range);
+    handler.activate(click(), "https://claude.ai@evil.tld/authorize", range);
 
     expect(openUrlExternal).not.toHaveBeenCalled();
   });
@@ -1160,11 +1209,73 @@ describe("createOsc8LinkHandler — clicking a link Claude Code printed", () => 
     const url =
       "https://claude.ai/oauth/authorize?code=true&client_id=abc123&scope=user%3Ainference";
     await act(async () => {
-      handler.activate(new MouseEvent("click"), url, range);
+      handler.activate(click(), url, range);
       await Promise.resolve();
     });
 
     expect(openUrlExternal).toHaveBeenCalledWith(url);
+  });
+
+  describe("the gate on activation", () => {
+    const URL = "https://example.com/x";
+
+    /**
+     * The attack this gate exists for.
+     *
+     * xterm's mouse-reporting mousedown does *not* cancel anything —
+     * `cancelEvents` defaults to false — and the Linkifier is a descendant of
+     * the element those listeners are bound to, so the link layer sees every
+     * click first and `_handleMouseUp` activates with no modifier, button or
+     * mode check of its own. A TUI widget the user is meant to click can
+     * therefore be wrapped in an OSC 8 pointing anywhere, and a plain click
+     * opens the host browser on it while the mouse report still reaches the
+     * program, so nothing looks wrong. The modifier is the only thing that
+     * separates "I clicked the menu item" from "I asked to leave the app".
+     */
+    it("refuses a plain click while a program is tracking the mouse", () => {
+      tracking = true;
+
+      handler.activate(click(), URL, range);
+
+      expect(openUrlExternal).not.toHaveBeenCalled();
+    });
+
+    it("opens on the force-selection modifier while tracking", async () => {
+      tracking = true;
+
+      await act(async () => {
+        handler.activate(click({ shiftKey: true }), URL, range);
+        await Promise.resolve();
+      });
+
+      expect(openUrlExternal).toHaveBeenCalledWith(URL);
+    });
+
+    it("opens on a plain click when nothing holds the mouse", async () => {
+      // A normal shell. This is what `WebLinksAddon` does for the plain-text
+      // URLs in the same buffer, and asking for a modifier here would read as
+      // a broken link.
+      tracking = false;
+
+      await act(async () => {
+        handler.activate(click(), URL, range);
+        await Promise.resolve();
+      });
+
+      expect(openUrlExternal).toHaveBeenCalledWith(URL);
+    });
+
+    it("ignores every button but the primary one", () => {
+      // Right-click is the context menu this pane already binds; middle-click
+      // is paste. Neither is a request to leave the app.
+      tracking = false;
+
+      handler.activate(click({ button: 2 }), URL, range);
+      handler.activate(click({ button: 1 }), URL, range);
+      handler.activate(click({ button: 2, shiftKey: true }), URL, range);
+
+      expect(openUrlExternal).not.toHaveBeenCalled();
+    });
   });
 
   it("shows the real origin on hover, not the text on screen", () => {
@@ -1180,12 +1291,47 @@ describe("createOsc8LinkHandler — clicking a link Claude Code printed", () => 
     expect(card).not.toBeNull();
     const origin = card!.querySelector('[data-testid="osc8-hover-origin"]');
     expect(origin?.textContent).toBe("https://evil.example.com");
-    // Whole origin or nothing — a truncated one is the spoof this prevents.
-    expect(origin?.textContent).not.toContain("…");
     expect(card!.textContent).not.toContain("https://claude.ai");
 
     handler.leave?.(new MouseEvent("mouseout"), "https://evil.example.com/", range);
     expect(hoverCard()).toBeNull();
+  });
+
+  it("keeps a very long origin whole, and gives way in the remainder instead", () => {
+    // The attacker picks the origin's length. `https://claude.ai.<300 a's>
+    // .evil.tld/` parses, passes every `sanitizeRelayUrl` rule, and under a
+    // non-shrinking flex item runs off the right edge of the pane — which
+    // hides the registrable domain just as effectively as an ellipsis would.
+    const origin = `https://claude.ai.${"a".repeat(300)}.${"b".repeat(200)}.evil.tld`;
+    handler.hover?.(new MouseEvent("mousemove"), `${origin}/oauth?code=1`, range);
+
+    const originEl = hoverCard()!.querySelector<HTMLElement>(
+      '[data-testid="osc8-hover-origin"]',
+    )!;
+    // Whole origin or nothing: every character is in the DOM...
+    expect(originEl.textContent).toBe(origin);
+    // ...and it is allowed to wrap rather than be clipped or pushed off-pane.
+    expect(originEl.style.flexShrink).not.toBe("0");
+    expect(originEl.style.whiteSpace).not.toBe("nowrap");
+    expect(originEl.style.overflowWrap).toBe("anywhere");
+
+    // The truncatable half is the remainder, and only the remainder.
+    const restEl = hoverCard()!.querySelector<HTMLElement>(
+      '[data-testid="osc8-hover-rest"]',
+    )!;
+    expect(restEl.style.textOverflow).toBe("ellipsis");
+    expect(restEl.style.whiteSpace).toBe("nowrap");
+  });
+
+  it("cannot take the pointer away from the link that summoned it", () => {
+    // The card is appended to `Terminal.element`, a *sibling* of the
+    // `screenElement` the Linkifier listens on, so `xterm-hover` buys nothing
+    // here: a card under the pointer means `mouseleave` on screenElement, the
+    // card is torn down, and the mouseup that would activate the link lands on
+    // the card instead of the terminal.
+    handler.hover?.(new MouseEvent("mousemove"), "https://example.com/x", range);
+
+    expect(hoverCard()!.style.pointerEvents).toBe("none");
   });
 
   it("says so on hover when the target would be refused", () => {
@@ -1199,11 +1345,37 @@ describe("createOsc8LinkHandler — clicking a link Claude Code printed", () => 
     expect(card!.textContent).not.toContain("javascript:");
   });
 
+  it("does not call a refused web address something other than a web address", () => {
+    // `https://claude.ai@evil.tld/` is a perfectly good URL; it is refused
+    // because the userinfo makes the visible host a lie. Telling the user it
+    // "is not a web address" is false, and a false explanation teaches them to
+    // distrust the card.
+    handler.hover?.(
+      new MouseEvent("mousemove"),
+      "https://claude.ai@evil.tld/authorize",
+      range,
+    );
+
+    expect(hoverCard()!.textContent).not.toContain("not a web address");
+  });
+
+  it("drops a stale card when the pane is no longer on screen", () => {
+    // `leave` only ever arrives from the Linkifier's `_clearCurrentLink`, and
+    // switching tabs from the keyboard moves no pointer: without this, the
+    // card is still sitting there when the user comes back.
+    handler.hover?.(new MouseEvent("mousemove"), "https://example.com/x", range);
+    expect(hoverCard()).not.toBeNull();
+
+    handler.dismiss();
+
+    expect(hoverCard()).toBeNull();
+  });
+
   it("pushes the shared toast when the host opener fails", async () => {
     vi.mocked(openUrlExternal).mockRejectedValueOnce(new Error("no opener"));
 
     await act(async () => {
-      handler.activate(new MouseEvent("click"), "https://example.com/x", range);
+      handler.activate(click(), "https://example.com/x", range);
       await Promise.resolve();
     });
 
@@ -1213,5 +1385,72 @@ describe("createOsc8LinkHandler — clicking a link Claude Code printed", () => 
     expect(toasts[0].detail).toContain("no opener");
     // Same card as every other dead-opener report in this view.
     expect(toasts[0].dedupeKey).toBe("host-open-failed");
+  });
+});
+
+describe("the link handler is wired into the terminal, and reads its live mode", () => {
+  const range = {
+    start: { x: 1, y: 1 },
+    end: { x: 80, y: 1 },
+  } as unknown as Parameters<
+    NonNullable<ReturnType<typeof createOsc8LinkHandler>["hover"]>
+  >[2];
+
+  /** What the mounted view passed as `linkHandler`. */
+  function wiredHandler() {
+    const handler = xterm.options?.linkHandler as
+      | ReturnType<typeof createOsc8LinkHandler>
+      | undefined;
+    if (!handler) throw new Error("no linkHandler was passed to Terminal");
+    return handler;
+  }
+
+  /** Feed the terminal a DECSET the way the container would. */
+  async function write(data: string) {
+    const term = xterm.instances.at(-1) as { write(d: string, cb: () => void): void };
+    await act(
+      () => new Promise<void>((resolve) => term.write(data, resolve)),
+    );
+  }
+
+  it("passes one at all — without it OSC 8 links are inert", () => {
+    mountSession("claude");
+
+    const handler = wiredHandler();
+    expect(typeof handler.activate).toBe("function");
+    expect(typeof handler.hover).toBe("function");
+  });
+
+  // The gate has to ask the terminal, not a boolean captured at construction:
+  // the mode changes whenever the container prints a DECSET, which is several
+  // times a second in Claude Code.
+  it("refuses a plain click once the container turns mouse tracking on", async () => {
+    mountSession("claude");
+    await write("\x1b[?1002h");
+
+    wiredHandler().activate(
+      new MouseEvent("click", { button: 0 }),
+      "https://example.com/x",
+      range,
+    );
+
+    expect(openUrlExternal).not.toHaveBeenCalled();
+  });
+
+  it("opens again once the container gives the mouse back", async () => {
+    mountSession("claude");
+    await write("\x1b[?1002h");
+    await write("\x1b[?1002l");
+
+    await act(async () => {
+      wiredHandler().activate(
+        new MouseEvent("click", { button: 0 }),
+        "https://example.com/x",
+        range,
+      );
+      await Promise.resolve();
+    });
+
+    expect(openUrlExternal).toHaveBeenCalledWith("https://example.com/x");
   });
 });
