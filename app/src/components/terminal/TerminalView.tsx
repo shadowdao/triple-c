@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Terminal } from "@xterm/xterm";
+import { Terminal, type ILinkHandler } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { WebLinksAddon } from "@xterm/addon-web-links";
@@ -21,6 +21,7 @@ import {
   extendsUrl,
   parseUrlRelayOsc,
   sanitizeRelayUrl,
+  urlOrigin,
 } from "../../lib/urlRelay";
 import { classifyDrop, DROP_BLOCKED_TOAST } from "../../lib/dropTarget";
 import { useSignInOpenTarget } from "../../hooks/useSignInOpenTarget";
@@ -106,12 +107,460 @@ export function supersedes(
   return extendsUrl(next.url, current.url);
 }
 
+/**
+ * Marks the hover card, for xterm's stylesheet and for the tests.
+ *
+ * It does *not* make xterm route pointer events around the card. xterm only
+ * consults this class inside `Linkifier._handleMouseMove`, which is registered
+ * on `screenElement`; the card is appended to `Terminal.element`, a *sibling*
+ * of that node, so the check never sees it. What keeps the card out of the way
+ * is `pointerEvents: "none"` on the card itself — see `hover` below for what
+ * goes wrong without it.
+ */
+export const OSC8_HOVER_CLASS = "xterm-hover";
+
+/**
+ * Report a failed handoff to the host's browser.
+ *
+ * One sink, one card. See the long note on `handleOpenUrl` for what this catch
+ * does *not* catch on Linux; a click that appears to do nothing is the
+ * complaint either way, so every route that opens a URL says the same thing in
+ * the same place.
+ */
+function reportOpenFailure(e: unknown) {
+  useAppState.getState().pushToast({
+    kind: "error",
+    message: "Could not open that link in your browser",
+    detail: String(e),
+    // A dead opener fails for every link in the buffer. One card.
+    dedupeKey: "host-open-failed",
+  });
+}
+
+/**
+ * `ILinkHandler`, plus the one thing xterm never asks for.
+ *
+ * `leave` is only ever reached through `Linkifier._clearCurrentLink`, i.e. a
+ * pointer that moved. Switching tabs from the keyboard moves no pointer and
+ * the Linkifier's dispose path does not clear either, so the card outlives the
+ * pane and is still there when the user comes back. {@link dismiss} is how the
+ * view says "this pane is gone" without pretending to be a mouse event.
+ */
+export type Osc8LinkHandler = ILinkHandler & { dismiss(): void };
+
+/**
+ * Is a program holding the mouse?
+ *
+ * One expression, two readers that must never disagree: the status-bar badge
+ * (`syncMouseCapture`) and the gate on opening a link ({@link opensOnClick}).
+ * A gate that thought tracking was off while the badge said it was on would be
+ * the whole security hole back again.
+ */
+function terminalTracksMouse(term: Terminal): boolean {
+  return term.modes.mouseTrackingMode !== "none";
+}
+
+/**
+ * Everything the gate asks the terminal, sampled at the moment of the click.
+ *
+ * A struct rather than three getters because the three are read together and
+ * must describe one instant: `hasSelection` is only meaningful against the
+ * `mouseTracking` that decided which gestures could have produced it.
+ */
+export interface ClickContext {
+  /** {@link terminalTracksMouse} — the container's to change, at any time. */
+  mouseTracking: boolean;
+  /** Does the terminal hold a selection *right now*? See {@link opensOnClick}. */
+  hasSelection: boolean;
+  /** xterm's `macOptionClickForcesSelection`, read rather than assumed. */
+  macOptionClickForcesSelection: boolean;
+}
+
+function readClickContext(term: Terminal): ClickContext {
+  return {
+    mouseTracking: terminalTracksMouse(term),
+    hasSelection: term.hasSelection(),
+    macOptionClickForcesSelection:
+      term.options.macOptionClickForcesSelection ?? false,
+  };
+}
+
+/** xterm's `isMac` verbatim (`common/Platform.ts`), so we split where it does. */
+function isMacPlatform(): boolean {
+  const platform = typeof navigator === "undefined" ? "" : navigator.platform;
+  return ["Macintosh", "MacIntel", "MacPPC", "Mac68K"].includes(platform);
+}
+
+/**
+ * xterm's `SelectionService.shouldForceSelection`, mirrored.
+ *
+ * The modifier is not our choice and it must not drift: while a program holds
+ * the mouse, this is the one gesture the user already has for "this click is
+ * for the terminal, not for the program", so it is the gesture that may open a
+ * link. xterm's rule is
+ * `isMac ? e.altKey && rawOptions.macOptionClickForcesSelection : e.shiftKey`,
+ * and the option is read from the terminal rather than assumed: this view sets
+ * it true today, so the two agreed, but xterm's default is false and nothing
+ * would have reported the day that line went. A hardcoded `altKey` would then
+ * accept a modifier xterm no longer treats as force-select.
+ *
+ * The gate and the hint below both call this. A hint that names a key the gate
+ * does not accept is worse than no hint — the user concludes the link is
+ * broken — and that is a bug this branch has already shipped once, so the two
+ * are not allowed separate answers.
+ */
+function forcesSelection(
+  event: { altKey: boolean; shiftKey: boolean },
+  macOptionClickForcesSelection: boolean,
+): boolean {
+  return isMacPlatform()
+    ? event.altKey && macOptionClickForcesSelection
+    : event.shiftKey;
+}
+
+/**
+ * What the card tells the user to do, for the state the terminal is in *now*.
+ *
+ * Conditional because the gesture is: with no program tracking the mouse a
+ * plain click opens the link, and naming a modifier then would send the user
+ * hunting for a key that changes nothing. The last branch is the same rule
+ * once more: on a Mac with `macOptionClickForcesSelection` off there *is* no
+ * force-selection modifier, so {@link opensOnClick} can never pass while a
+ * program holds the mouse, and naming Option would be naming a dead key.
+ */
+function openHintLabel(ctx: ClickContext): string {
+  if (!ctx.mouseTracking) return "Click to open";
+  if (!isMacPlatform()) return "Shift+click to open";
+  if (!ctx.macOptionClickForcesSelection) {
+    return "Not clickable while a program holds the mouse";
+  }
+  return "Option+click to open";
+}
+
+/**
+ * Whether this mouseup is a request to leave the app for the host browser.
+ *
+ * xterm asks none of this. `Linkifier._handleMouseUp` activates whenever the
+ * mouseup lands on the same link the mousedown did — no button check, no mode
+ * check, no `detail`, no drag threshold, no timestamp (`SelectionService` has
+ * a `_mouseDownTimeStamp`; the Linkifier has nothing). Four refusals, for four
+ * different mistakes:
+ *
+ *  - **Anything but the primary button.** Without this a *right*-click
+ *    activates the link as well as opening this pane's context menu, and a
+ *    middle-click paste opens it too.
+ *  - **A mouseup that ended a selection.** This is the load-bearing one, and
+ *    the reason is that a drag is a single press and a single release, so its
+ *    click count is 1 and nothing else distinguishes it from a click. Both
+ *    gestures a user makes to *copy* a string end here: drag across a few
+ *    characters, or double-click a word (xterm selects it on the second
+ *    mousedown, so the selection is already in the model by the time this
+ *    runs). Worse, while a program holds the mouse Shift/Option+drag is the
+ *    *only* way to select at all — byte-identical to the modifier below — so
+ *    without this check a container that wraps each output row in an OSC 8
+ *    turns every legitimate copy into a browser open. The selection check is
+ *    also cheap to be wrong about in the safe direction: xterm's
+ *    `_handleSingleClick` clears the model on the mousedown of a plain click,
+ *    so an old selection elsewhere in the buffer is already gone by the time a
+ *    real click on a link arrives here.
+ *
+ *    The limit of this check, stated because the paragraph above reads
+ *    absolute: it sees a drag only once the drag has spanned a *cell*. A press
+ *    and release inside one character cell, or a drag walked back to where it
+ *    started, leaves `finalSelectionEnd === finalSelectionStart`, so
+ *    `hasSelection()` is false and the link opens. Nothing reached the
+ *    clipboard in that case and the card showed the real origin first, so the
+ *    cost is small — but it is the gap a mousedown/mouseup distance check
+ *    would have closed, and it is the price of not keeping that second source
+ *    of truth.
+ *  - **A repeat click**, `detail > 1`. Belt to the above's braces: it holds
+ *    even when the selection came out empty (a double-click on trailing
+ *    whitespace selects nothing) and it does not depend on xterm having
+ *    updated the selection model before the Linkifier's listener runs. It is
+ *    `!== 1`, not `> 1`: a mouseup derived from a real click always carries
+ *    `detail >= 1`, so `> 1` would have waved through anything synthesised
+ *    with `detail` 0. Nothing in the container can dispatch a DOM event, so
+ *    that is hardening rather than a hole being closed.
+ *    Comparing mousedown and mouseup *coordinates* would be a third signal,
+ *    but xterm hands this handler only the mouseup — the mousedown is not
+ *    ours to see without binding our own listener to the host element, which
+ *    is a second source of truth about the same gesture.
+ *  - **A plain click while a modifier is required.** OSC 8 lets the container
+ *    wrap any clickable TUI widget — a menu row, a "1. Yes", a file chip — in
+ *    a link to anywhere, and because the mouse report still reaches the
+ *    program the widget also responds, so nothing looks wrong. Requiring the
+ *    force-selection modifier there makes the two intents distinguishable.
+ *
+ * `modifierPromised` is that last requirement made sticky, and it is about the
+ * card rather than the click: the hint is rendered once, at hover, from a mode
+ * the container may change before the user's finger comes down. The gate
+ * honours the stricter of what the card promised and what is true now, so a
+ * card reading "Shift+click to open" cannot be on screen while a bare click
+ * opens the link.
+ *
+ * **What this does not close.** `mouseTracking` is a permission the attacker
+ * grants itself — see `activate`.
+ *
+ * With nothing tracking the mouse and nothing promised, a bare click is
+ * correct and expected: it is what `WebLinksAddon` does for the plain-text
+ * URLs in the same buffer, which is why that handler applies this same gate.
+ */
+function opensOnClick(
+  event: MouseEvent,
+  ctx: ClickContext,
+  modifierPromised = false,
+): boolean {
+  if (event.button !== 0) return false;
+  if (event.detail !== 1) return false;
+  if (ctx.hasSelection) return false;
+  if (!ctx.mouseTracking && !modifierPromised) return true;
+  return forcesSelection(event, ctx.macOptionClickForcesSelection);
+}
+
+/**
+ * Makes OSC 8 hyperlinks clickable, and shows where they actually go.
+ *
+ * ## Why xterm's own link matching is not enough
+ *
+ * `WebLinksAddon` matches *rendered text*, row by row. Claude Code prints its
+ * links as OSC 8 hyperlinks whose visible text is hard-wrapped into
+ * terminal-width pieces — measured against 2.1.226, a 346-character sign-in
+ * URL arrives as five emissions, each carrying the whole URL in its OSC 8
+ * parameter and about 80 characters of it on screen (see `lib/urlDetector.ts`,
+ * which had to grow the same second branch). So the addon matches a fragment
+ * or nothing at all, which is the entire reason the URL toast exists. xterm
+ * hands `linkHandler` the complete parameter instead, however the label was
+ * sliced, so this covers exactly the case the addon cannot — and the addon
+ * stays, because it covers the plain-text URLs in ordinary shell output that
+ * carry no OSC 8 at all.
+ *
+ * ## xterm applies no gate of its own, so this one does
+ *
+ * There is a tempting story in which xterm's mouse-reporting mousedown cancels
+ * the event before the link layer sees it, leaving only the force-selection
+ * modifier a way through. It is false in both halves. That branch calls
+ * `cancel(e)`, which is a no-op unless `cancelEvents` is set and it defaults to
+ * false; and the mouse-reporting listeners are bound on `Terminal.element`
+ * while the Linkifier is bound on `screenElement`, a descendant, so bubbling
+ * reaches the link first no matter what. `Linkifier._handleMouseUp` then
+ * activates the link with no check on the button, the modifier or the mouse
+ * mode.
+ *
+ * So the gate is {@link opensOnClick}, applied in `activate`, and everything it
+ * asks about is read from the terminal at the moment of the click rather than
+ * captured — the container changes the mouse mode whenever it likes, and the
+ * selection is whatever the gesture that ended in this mouseup left behind.
+ *
+ * ## What the mouse mode is worth, honestly
+ *
+ * Reading it fresh makes it *current*; it does not make it *trustworthy*. The
+ * mode is set by the container, with a DECSET, and `?1002l` takes effect as
+ * soon as xterm *parses* it (on its queued write task, not synchronously with
+ * the container's output) — so a hostile container can drop tracking for
+ * a few hundred milliseconds at a time and a plain click that lands in one of
+ * those windows passes the mode half of the gate. It cannot time the user's
+ * click, but it does not need to: a fraction of clicks is enough, and the only
+ * tell is the status-bar badge flickering. This is a **known residual**, not
+ * something this gate closes, and the freshness of the read must not be read
+ * as an answer to it.
+ *
+ * Two things narrow it, neither of which depends on the mode. The selection
+ * and click-count checks hold in either tracking state, so the gestures a user
+ * makes to copy text are refused whatever the container has the mode set to —
+ * which removes the "wrap every row in an OSC 8 and harvest the shift-drags"
+ * version entirely. And the hover card's promise is sticky (see
+ * `modifierPromised`): the flicker now has to cover the *hover* as well as the
+ * click, because a card drawn while tracking was on goes on demanding the
+ * modifier after the container drops it. What remains is a container that
+ * drops tracking before the pointer arrives and holds it off until the click —
+ * at which point the card also says "Click to open", so the user is at least
+ * not being told one thing and given another. The real fix is a signal the
+ * container cannot write, and there is none in this pane today.
+ *
+ * ## The hover card is the security half, not a nicety
+ *
+ * OSC 8 fully decouples the visible text from the target: the container can
+ * print `https://claude.ai` and link it anywhere. That is strictly worse than
+ * the userinfo spoofing `sanitizeRelayUrl` already rejects, because here
+ * nothing in the painted row is even *derived* from the destination. So the
+ * origin of the real target is shown before the user commits, the same way the
+ * URL toast shows it and for the same reason ({@link urlOrigin}'s note): the
+ * origin decides where the user's credentials end up, so it is rendered in
+ * full and the *remainder* is the only part an ellipsis may eat.
+ *
+ * The card sits at the bottom of the pane rather than beside the pointer —
+ * where a browser puts it, and never underneath the cursor, so it cannot
+ * flicker the link out from under the hover that summoned it.
+ *
+ * @param getHost returns `Terminal.element`, which does not exist until
+ *        `term.open()` has run — hence a getter rather than the element.
+ * @param readState samples {@link ClickContext} — a getter for the same
+ *        reason, and the *only* reason: every one of those answers changes
+ *        under us, between the hover and the click that follows it.
+ */
+export function createOsc8LinkHandler(
+  getHost: () => HTMLElement | null,
+  readState: () => ClickContext,
+): Osc8LinkHandler {
+  let card: HTMLDivElement | null = null;
+  /**
+   * Did the card the user is looking at name a modifier?
+   *
+   * Written whenever a card is drawn, and cleared with it — `hover()` clears
+   * and returns early when there is no host element, which leaves this false,
+   * the stricter of the two directions. xterm only activates a link
+   * it is currently hovering (`Linkifier._currentLink`), so there is always a
+   * fresh hover behind a click — which is what makes this the promise the user
+   * actually read, rather than a stale one. See `opensOnClick`.
+   */
+  let modifierPromised = false;
+
+  const clear = () => {
+    card?.remove();
+    card = null;
+    modifierPromised = false;
+  };
+
+  const span = (text: string, style: Partial<CSSStyleDeclaration>) => {
+    const el = document.createElement("span");
+    el.textContent = text;
+    Object.assign(el.style, style);
+    return el;
+  };
+
+  return {
+    activate(event, text) {
+      // Opening the host browser is the one thing in this pane the container
+      // may not provoke on its own *and* the one thing no selection gesture
+      // may provoke by accident. See `opensOnClick` — including the residual
+      // it does not close.
+      if (!opensOnClick(event, readState(), modifierPromised)) return;
+      // Same sink and same rule as the WebLinksAddon branch: this came off the
+      // container's output, so it is validated before it reaches the OS
+      // opener. One implementation — `sanitizeRelayUrl` — on purpose.
+      const safe = sanitizeRelayUrl(text);
+      if (!safe) {
+        console.warn("Refusing to open a link that failed validation");
+        return;
+      }
+      openUrlExternal(safe).catch(reportOpenFailure);
+    },
+
+    hover(_event, text) {
+      clear();
+      const host = getHost();
+      if (!host) return;
+      const ctx = readState();
+      // Sampled here and held, because this is what the card is about to tell
+      // the user — and the gate has to honour it even if the container has
+      // moved on by the time they click.
+      modifierPromised = ctx.mouseTracking;
+
+      card = document.createElement("div");
+      card.className = OSC8_HOVER_CLASS;
+      card.dataset.testid = "osc8-hover";
+      Object.assign(card.style, {
+        position: "absolute",
+        left: "8px",
+        bottom: "8px",
+        maxWidth: "calc(100% - 16px)",
+        boxSizing: "border-box",
+        zIndex: "30",
+        // The card lands under the pointer for a link in the bottom rows, and
+        // it is not a sibling the Linkifier hit-tests around (see
+        // `OSC8_HOVER_CLASS`). Without this, `screenElement` gets `mouseleave`
+        // the moment the card appears — card removed, pointer back on the
+        // link, card back: a flicker loop — and worse, the `mouseup` that
+        // activates the link lands on the card, so the link cannot be opened
+        // at all. Nothing here is interactive, so nothing is lost.
+        pointerEvents: "none",
+        display: "flex",
+        alignItems: "baseline",
+        gap: "6px",
+        padding: "3px 8px",
+        fontSize: "12px",
+        fontFamily: "monospace",
+        background: "var(--bg-secondary)",
+        border: "1px solid var(--border-color)",
+        // The origin wraps, so the card grows downward rather than sideways;
+        // this is the backstop for anything that still cannot fit.
+        overflow: "hidden",
+        borderRadius: "6px",
+        boxShadow: "var(--shadow-overlay)",
+        color: "var(--text-primary)",
+      } as Partial<CSSStyleDeclaration>);
+
+      const safe = sanitizeRelayUrl(text);
+      const origin = safe && urlOrigin(safe);
+      if (!safe || !origin) {
+        // Nothing of the rejected target is echoed into the DOM — it is
+        // untrusted text, and the only useful thing to say is that the click
+        // will not do anything. Deliberately not "it is not a web address":
+        // `https://claude.ai@evil.tld/` and an over-length URL both are one,
+        // and a card that explains a refusal wrongly teaches the user to
+        // distrust the card.
+        card.appendChild(
+          span("This link will not be opened — it failed the URL safety check", {
+            color: "var(--text-secondary)",
+          }),
+        );
+      } else {
+        const rest = safe.startsWith(origin) ? safe.slice(origin.length) : safe;
+        const originEl = span(origin, {
+          fontWeight: "700",
+          // The part that decides where the credentials go, so all of it is
+          // shown: truncating it *is* the spoof, and so is pushing its tail
+          // off the right edge of the pane. The attacker picks the length —
+          // `https://claude.ai.<300 chars>.evil.tld` parses and passes every
+          // `sanitizeRelayUrl` rule — so "do not shrink" is not enough:
+          // `flex-shrink: 0` pins a flex item at its max-content width and the
+          // text never wraps, it just overflows. It wraps instead, onto as
+          // many lines as it needs, and the truncatable remainder below is the
+          // thing that gives way.
+          flexShrink: "1",
+          minWidth: "0",
+          overflowWrap: "anywhere",
+          whiteSpace: "normal",
+        });
+        originEl.dataset.testid = "osc8-hover-origin";
+        card.appendChild(originEl);
+
+        const restEl = span(rest, {
+          color: "var(--text-secondary)",
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
+          minWidth: "0",
+        });
+        restEl.dataset.testid = "osc8-hover-rest";
+        card.appendChild(restEl);
+
+        const hint = span(openHintLabel(ctx), {
+          color: "var(--text-secondary)",
+          flexShrink: "0",
+          marginLeft: "4px",
+        });
+        card.appendChild(hint);
+      }
+
+      host.appendChild(card);
+    },
+
+    leave: clear,
+
+    dismiss: clear,
+  };
+}
+
 export default function TerminalView({ sessionId, active }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalContainerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const webglRef = useRef<WebglAddon | null>(null);
+  // Held only so the hover card can be taken down when this pane leaves the
+  // screen — see `Osc8LinkHandler.dismiss`.
+  const osc8LinkHandlerRef = useRef<Osc8LinkHandler | null>(null);
   const detectorRef = useRef<UrlDetector | null>(null);
   const { sendInput, pasteImage, resize, onOutput, onExit } = useTerminal();
   const gpuRenderingSetting = useAppState(s => s.appSettings?.terminal_gpu_rendering ?? null);
@@ -378,7 +827,7 @@ export default function TerminalView({ sessionId, active }: Props) {
   const syncMouseCapture = useCallback(() => {
     const term = termRef.current;
     if (!term) return;
-    const captured = term.modes.mouseTrackingMode !== "none";
+    const captured = terminalTracksMouse(term);
     if (captured === mouseCapturedRef.current) return;
     mouseCapturedRef.current = captured;
     setMouseCaptured(captured);
@@ -410,7 +859,10 @@ export default function TerminalView({ sessionId, active }: Props) {
   useEffect(() => {
     if (!containerRef.current) return;
 
-    const term = new Terminal({
+    // Annotated because `linkHandler` below refers to `term` (for the element
+    // it must anchor its hover card to, which does not exist until
+    // `term.open()`), and TypeScript cannot infer a type it is already using.
+    const term: Terminal = new Terminal({
       cursorBlink: true,
       fontSize: 14,
       // Let the user select text even while a program holds the mouse.
@@ -420,6 +872,17 @@ export default function TerminalView({ sessionId, active }: Props) {
       // the only way to copy from a mouse-driven TUI is to take the mouse back
       // first. `SelectionService.shouldForceSelection`.
       macOptionClickForcesSelection: true,
+      // OSC 8 hyperlinks — the form Claude Code prints its links in, and the
+      // one `WebLinksAddon` structurally cannot match. See
+      // `createOsc8LinkHandler`, including why opening one while a program
+      // holds the mouse needs the same Shift/Option the line above is about.
+      // Both arguments are getters because neither answer exists yet: the
+      // element arrives with `term.open()`, and the mouse mode changes
+      // whenever the container prints a DECSET.
+      linkHandler: (osc8LinkHandlerRef.current = createOsc8LinkHandler(
+        () => term.element ?? null,
+        () => readClickContext(term),
+      )),
       fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', Menlo, Monaco, monospace",
       theme: {
         background: "#0d1117",
@@ -453,28 +916,39 @@ export default function TerminalView({ sessionId, active }: Props) {
     // misses OAuth URLs that end mid-line).
     // eslint-disable-next-line no-control-regex
     const urlRegex = /https?:\/\/[^\s'"`<>\x00-\x20\x7f]+/;
-    const webLinksAddon = new WebLinksAddon((_event, uri) => {
-      // Same sink, same rule: what xterm matched came off the container's
-      // output, so it is validated before it reaches the OS opener. A click
-      // here is a deliberate act on visible text, but "visible" is exactly
-      // what a userinfo-spoofed URL subverts.
+    const webLinksAddon = new WebLinksAddon((event, uri) => {
+      // Same gate and same sink as `createOsc8LinkHandler`, because this
+      // reaches the same `openUrlExternal` through the same
+      // `Linkifier._handleMouseUp`, which checks nothing here either. Without
+      // it a container that prints a plausible-looking `https://` row in a TUI
+      // got a browser open on a plain click while it held the mouse, and a
+      // double-click that merely selected a URL opened it.
+      //
+      // It is also the only gate on a real bypass of the OSC 8 one:
+      // `OscLinkProvider` drops a hyperlink whose target is not http(s)
+      // *before* `linkHandler` sees it (`allowNonHttpProtocols` is unset), so
+      // an OSC 8 carrying a `javascript:` target and an `https://evil.tld/x`
+      // label leaves the addon free to match the label. That click arrives
+      // here and nowhere else.
+      //
+      // No `modifierPromised`: this path paints an underline rather than a
+      // card, so it promises the user nothing to be held to.
+      //
+      // This branch is the one where the click really is an act on visible
+      // text — the match *is* the painted characters — so the spoof it has to
+      // survive is a userinfo-spoofed URL, which `sanitizeRelayUrl` rejects.
+      // An OSC 8 link is not like that at all: its label and its target are
+      // unrelated strings, which is why that handler shows the target's origin
+      // on hover before a click can happen. Neither branch replaces the other:
+      // this one covers plain-text URLs in ordinary shell output, which carry
+      // no hyperlink parameter for xterm to hand over.
+      if (!opensOnClick(event, readClickContext(term))) return;
       const safe = sanitizeRelayUrl(uri);
       if (!safe) {
         console.warn("Refusing to open a link that failed validation");
         return;
       }
-      // Same failure reporting as the toast's Open button — see the long note
-      // on `handleOpenUrl`, including what this catch does *not* catch on
-      // Linux. A click that appears to do nothing is the complaint either way.
-      openUrlExternal(safe).catch((e) =>
-        useAppState.getState().pushToast({
-          kind: "error",
-          message: "Could not open that link in your browser",
-          detail: String(e),
-          // A dead opener fails for every link in the buffer. One card.
-          dedupeKey: "host-open-failed",
-        }),
-      );
+      openUrlExternal(safe).catch(reportOpenFailure);
     }, { urlRegex });
     term.loadAddon(webLinksAddon);
 
@@ -763,8 +1237,18 @@ export default function TerminalView({ sessionId, active }: Props) {
       webglRef.current = null;
       term.dispose();
       termRef.current = null;
+      osc8LinkHandlerRef.current = null;
     };
   }, [sessionId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // A hover card only ever clears on a *pointer* leaving the link, so switching
+  // tabs from the keyboard leaves one hanging over a pane nobody is looking at,
+  // to be found still there on the way back. Hiding the wrapper does not fire
+  // `mouseleave`, so nothing else would.
+  useEffect(() => {
+    if (active) return;
+    osc8LinkHandlerRef.current?.dismiss();
+  }, [active]);
 
   // Manage WebGL lifecycle and re-fit when tab becomes active.
   // Only the active terminal holds a WebGL context to avoid exhausting
