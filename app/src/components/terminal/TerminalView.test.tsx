@@ -1,6 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, fireEvent, cleanup, act } from "@testing-library/react";
-import TerminalView, { supersedes } from "./TerminalView";
+import TerminalView, {
+  OSC8_HOVER_CLASS,
+  createOsc8LinkHandler,
+  supersedes,
+} from "./TerminalView";
 import { useAppState } from "../../store/appState";
 import {
   uploadHostFileToTerminal,
@@ -1072,5 +1076,142 @@ describe("TerminalView — releasing a captured mouse", () => {
     expect(captured()).toBe(false);
     // The chord must not also reach the container as input.
     expect(terminalInput).not.toHaveBeenCalled();
+  });
+});
+
+describe("the hover hint names the key that actually works", () => {
+  const platform = (value: string) =>
+    Object.defineProperty(navigator, "platform", { value, configurable: true });
+  const original = navigator.platform;
+  afterEach(() => platform(original));
+
+  // xterm gates this on its own `isMac`; if the hint and the gate disagree the
+  // user is told to press a key that does nothing.
+  it("says Option on a Mac, because that is xterm's force-selection modifier there", () => {
+    platform("MacIntel");
+    const host = document.createElement("div");
+    createOsc8LinkHandler(() => host).hover?.(
+      new MouseEvent("mousemove"),
+      "https://example.com/x",
+      { start: { x: 1, y: 1 }, end: { x: 1, y: 1 } },
+    );
+    expect(host.textContent).toContain("Option+click");
+    expect(host.textContent).not.toContain("Shift+click");
+  });
+
+  it("says Shift everywhere else", () => {
+    platform("Linux x86_64");
+    const host = document.createElement("div");
+    createOsc8LinkHandler(() => host).hover?.(
+      new MouseEvent("mousemove"),
+      "https://example.com/x",
+      { start: { x: 1, y: 1 }, end: { x: 1, y: 1 } },
+    );
+    expect(host.textContent).toContain("Shift+click");
+  });
+});
+
+describe("createOsc8LinkHandler — clicking a link Claude Code printed", () => {
+  /**
+   * The handler is exercised directly rather than through a rendered terminal.
+   *
+   * xterm decides *when* to call it from cell geometry, and jsdom gives every
+   * element a zero-sized box — so a test driving the mouse over the pane would
+   * be asserting that jsdom's layout engine exists, not that this app validates
+   * what it opens. What xterm hands over is the OSC 8 parameter verbatim, which
+   * is exactly what these arguments are.
+   */
+  const range = {
+    start: { x: 1, y: 1 },
+    end: { x: 80, y: 1 },
+  } as unknown as Parameters<
+    NonNullable<ReturnType<typeof createOsc8LinkHandler>["hover"]>
+  >[2];
+
+  let host: HTMLDivElement;
+  let handler: ReturnType<typeof createOsc8LinkHandler>;
+
+  beforeEach(() => {
+    host = document.createElement("div");
+    document.body.appendChild(host);
+    handler = createOsc8LinkHandler(() => host);
+  });
+
+  function hoverCard(): HTMLElement | null {
+    return host.querySelector<HTMLElement>(`.${OSC8_HOVER_CLASS}`);
+  }
+
+  it("refuses a target that fails validation, without reaching the opener", () => {
+    // The visible text can be anything; the parameter is what gets opened, and
+    // a container is free to put a scheme in it that the host must never hand
+    // to an OS-level opener.
+    handler.activate(new MouseEvent("click"), "javascript:alert(1)", range);
+    handler.activate(new MouseEvent("click"), "file:///etc/passwd", range);
+    handler.activate(
+      new MouseEvent("click"),
+      "https://claude.ai@evil.tld/authorize",
+      range,
+    );
+
+    expect(openUrlExternal).not.toHaveBeenCalled();
+  });
+
+  it("opens a valid target through the one sink", async () => {
+    const url =
+      "https://claude.ai/oauth/authorize?code=true&client_id=abc123&scope=user%3Ainference";
+    await act(async () => {
+      handler.activate(new MouseEvent("click"), url, range);
+      await Promise.resolve();
+    });
+
+    expect(openUrlExternal).toHaveBeenCalledWith(url);
+  });
+
+  it("shows the real origin on hover, not the text on screen", () => {
+    // The point of the affordance. OSC 8 decouples label from target: the row
+    // can read `https://claude.ai` while the parameter points anywhere.
+    handler.hover?.(
+      new MouseEvent("mousemove"),
+      "https://evil.example.com/claude.ai/oauth/authorize?code=true",
+      range,
+    );
+
+    const card = hoverCard();
+    expect(card).not.toBeNull();
+    const origin = card!.querySelector('[data-testid="osc8-hover-origin"]');
+    expect(origin?.textContent).toBe("https://evil.example.com");
+    // Whole origin or nothing — a truncated one is the spoof this prevents.
+    expect(origin?.textContent).not.toContain("…");
+    expect(card!.textContent).not.toContain("https://claude.ai");
+
+    handler.leave?.(new MouseEvent("mouseout"), "https://evil.example.com/", range);
+    expect(hoverCard()).toBeNull();
+  });
+
+  it("says so on hover when the target would be refused", () => {
+    handler.hover?.(new MouseEvent("mousemove"), "javascript:alert(1)", range);
+
+    const card = hoverCard();
+    expect(card).not.toBeNull();
+    expect(card!.querySelector('[data-testid="osc8-hover-origin"]')).toBeNull();
+    // Never echo the rejected target: it is untrusted text on its way to a DOM
+    // node, and the only thing worth saying is that clicking does nothing.
+    expect(card!.textContent).not.toContain("javascript:");
+  });
+
+  it("pushes the shared toast when the host opener fails", async () => {
+    vi.mocked(openUrlExternal).mockRejectedValueOnce(new Error("no opener"));
+
+    await act(async () => {
+      handler.activate(new MouseEvent("click"), "https://example.com/x", range);
+      await Promise.resolve();
+    });
+
+    const toasts = useAppState.getState().toasts;
+    expect(toasts).toHaveLength(1);
+    expect(toasts[0].kind).toBe("error");
+    expect(toasts[0].detail).toContain("no opener");
+    // Same card as every other dead-opener report in this view.
+    expect(toasts[0].dedupeKey).toBe("host-open-failed");
   });
 });

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Terminal } from "@xterm/xterm";
+import { Terminal, type ILinkHandler } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { WebLinksAddon } from "@xterm/addon-web-links";
@@ -21,6 +21,7 @@ import {
   extendsUrl,
   parseUrlRelayOsc,
   sanitizeRelayUrl,
+  urlOrigin,
 } from "../../lib/urlRelay";
 import { classifyDrop, DROP_BLOCKED_TOAST } from "../../lib/dropTarget";
 import { useSignInOpenTarget } from "../../hooks/useSignInOpenTarget";
@@ -104,6 +105,205 @@ export function supersedes(
   }
   if (next.source === "relay") return true;
   return extendsUrl(next.url, current.url);
+}
+
+/**
+ * Class xterm requires on an element that floats over the terminal.
+ *
+ * Not decoration: `ILinkHandler.hover`'s contract is that the hover element
+ * lives inside `Terminal.element` and carries this class, otherwise xterm's
+ * own hit-testing does not know to stop at it and mouse events fall through to
+ * whatever link is underneath.
+ */
+export const OSC8_HOVER_CLASS = "xterm-hover";
+
+/**
+ * Report a failed handoff to the host's browser.
+ *
+ * One sink, one card. See the long note on `handleOpenUrl` for what this catch
+ * does *not* catch on Linux; a click that appears to do nothing is the
+ * complaint either way, so every route that opens a URL says the same thing in
+ * the same place.
+ */
+function reportOpenFailure(e: unknown) {
+  useAppState.getState().pushToast({
+    kind: "error",
+    message: "Could not open that link in your browser",
+    detail: String(e),
+    // A dead opener fails for every link in the buffer. One card.
+    dedupeKey: "host-open-failed",
+  });
+}
+
+/**
+ * Makes OSC 8 hyperlinks clickable, and shows where they actually go.
+ *
+ * ## Why xterm's own link matching is not enough
+ *
+ * `WebLinksAddon` matches *rendered text*, row by row. Claude Code prints its
+ * links as OSC 8 hyperlinks whose visible text is hard-wrapped into
+ * terminal-width pieces — measured against 2.1.226, a 346-character sign-in
+ * URL arrives as five emissions, each carrying the whole URL in its OSC 8
+ * parameter and about 80 characters of it on screen (see `lib/urlDetector.ts`,
+ * which had to grow the same second branch). So the addon matches a fragment
+ * or nothing at all, which is the entire reason the URL toast exists. xterm
+ * hands `linkHandler` the complete parameter instead, however the label was
+ * sliced, so this covers exactly the case the addon cannot — and the addon
+ * stays, because it covers the plain-text URLs in ordinary shell output that
+ * carry no OSC 8 at all.
+ *
+ * ## The gesture is Shift+click (Option+click on macOS)
+ *
+ * Claude holds mouse tracking (`?1000`/`?1002`/`?1003`), and xterm's mousedown
+ * handler cancels the event before the link layer whenever tracking is on —
+ * *unless* `shouldForceSelection(e)` is true, which is `e.shiftKey`, or
+ * `e.altKey` on macOS with `macOptionClickForcesSelection` set (this view sets
+ * it). So the modifier that already exists for selecting text is the one that
+ * reaches a link, and no new key handling is involved. A plain click keeps
+ * going to the program, which is what a TUI needs.
+ *
+ * ## The hover card is the security half, not a nicety
+ *
+ * OSC 8 fully decouples the visible text from the target: the container can
+ * print `https://claude.ai` and link it anywhere. That is strictly worse than
+ * the userinfo spoofing `sanitizeRelayUrl` already rejects, because here
+ * nothing in the painted row is even *derived* from the destination. So the
+ * origin of the real target is shown before the user commits, the same way the
+ * URL toast shows it and for the same reason ({@link urlOrigin}'s note): the
+ * origin decides where the user's credentials end up, so it is rendered in
+ * full and the *remainder* is the only part an ellipsis may eat.
+ *
+ * The card sits at the bottom of the pane rather than beside the pointer —
+ * where a browser puts it, and never underneath the cursor, so it cannot
+ * flicker the link out from under the hover that summoned it.
+ *
+ * @param getHost returns `Terminal.element`, which does not exist until
+ *        `term.open()` has run — hence a getter rather than the element.
+ */
+/**
+ * The modifier that opens an OSC 8 link, named the way the user's platform
+ * names it.
+ *
+ * This is not our choice and it must not drift: xterm only lets a click reach
+ * the link layer while a program holds the mouse when its own
+ * `shouldForceSelection` says so, and that is
+ * `isMac ? e.altKey && macOptionClickForcesSelection : e.shiftKey`. The list
+ * below is xterm's `isMac` verbatim (`common/Platform.ts`) so the hint cannot
+ * disagree with the behaviour it describes — a hint that names the wrong key
+ * is worse than no hint, because the user concludes the link is broken.
+ *
+ * `macOptionClickForcesSelection` is set on the terminal, so the Mac branch is
+ * live rather than theoretical.
+ */
+function openModifierLabel(): string {
+  const platform = typeof navigator === "undefined" ? "" : navigator.platform;
+  const isMac = ["Macintosh", "MacIntel", "MacPPC", "Mac68K"].includes(platform);
+  return isMac ? "Option+click to open" : "Shift+click to open";
+}
+
+export function createOsc8LinkHandler(
+  getHost: () => HTMLElement | null,
+): ILinkHandler {
+  let card: HTMLDivElement | null = null;
+
+  const clear = () => {
+    card?.remove();
+    card = null;
+  };
+
+  const span = (text: string, style: Partial<CSSStyleDeclaration>) => {
+    const el = document.createElement("span");
+    el.textContent = text;
+    Object.assign(el.style, style);
+    return el;
+  };
+
+  return {
+    activate(_event, text) {
+      // Same sink and same rule as the WebLinksAddon branch: this came off the
+      // container's output, so it is validated before it reaches the OS
+      // opener. One implementation — `sanitizeRelayUrl` — on purpose.
+      const safe = sanitizeRelayUrl(text);
+      if (!safe) {
+        console.warn("Refusing to open a link that failed validation");
+        return;
+      }
+      openUrlExternal(safe).catch(reportOpenFailure);
+    },
+
+    hover(_event, text) {
+      clear();
+      const host = getHost();
+      if (!host) return;
+
+      card = document.createElement("div");
+      card.className = OSC8_HOVER_CLASS;
+      card.dataset.testid = "osc8-hover";
+      Object.assign(card.style, {
+        position: "absolute",
+        left: "8px",
+        bottom: "8px",
+        maxWidth: "calc(100% - 16px)",
+        zIndex: "30",
+        display: "flex",
+        alignItems: "baseline",
+        gap: "6px",
+        padding: "3px 8px",
+        fontSize: "12px",
+        fontFamily: "monospace",
+        background: "var(--bg-secondary)",
+        border: "1px solid var(--border-color)",
+        borderRadius: "6px",
+        boxShadow: "var(--shadow-overlay)",
+        color: "var(--text-primary)",
+      } as Partial<CSSStyleDeclaration>);
+
+      const safe = sanitizeRelayUrl(text);
+      const origin = safe && urlOrigin(safe);
+      if (!safe || !origin) {
+        // Nothing of the rejected target is echoed into the DOM — it is
+        // untrusted text, and the only useful thing to say is that the click
+        // will not do anything.
+        card.appendChild(
+          span("This link will not be opened — it is not a web address", {
+            color: "var(--text-secondary)",
+          }),
+        );
+      } else {
+        const rest = safe.startsWith(origin) ? safe.slice(origin.length) : safe;
+        const originEl = span(origin, {
+          fontWeight: "700",
+          // The part that decides where the credentials go. Never truncated:
+          // truncating it *is* the spoof.
+          flexShrink: "0",
+          overflowWrap: "anywhere",
+        });
+        originEl.dataset.testid = "osc8-hover-origin";
+        card.appendChild(originEl);
+
+        const restEl = span(rest, {
+          color: "var(--text-secondary)",
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
+          minWidth: "0",
+        });
+        restEl.dataset.testid = "osc8-hover-rest";
+        card.appendChild(restEl);
+
+        const hint = span(openModifierLabel(), {
+          color: "var(--text-secondary)",
+          flexShrink: "0",
+          marginLeft: "4px",
+        });
+        card.appendChild(hint);
+      }
+
+      host.appendChild(card);
+    },
+
+    leave: clear,
+  };
 }
 
 export default function TerminalView({ sessionId, active }: Props) {
@@ -410,7 +610,10 @@ export default function TerminalView({ sessionId, active }: Props) {
   useEffect(() => {
     if (!containerRef.current) return;
 
-    const term = new Terminal({
+    // Annotated because `linkHandler` below refers to `term` (for the element
+    // it must anchor its hover card to, which does not exist until
+    // `term.open()`), and TypeScript cannot infer a type it is already using.
+    const term: Terminal = new Terminal({
       cursorBlink: true,
       fontSize: 14,
       // Let the user select text even while a program holds the mouse.
@@ -420,6 +623,11 @@ export default function TerminalView({ sessionId, active }: Props) {
       // the only way to copy from a mouse-driven TUI is to take the mouse back
       // first. `SelectionService.shouldForceSelection`.
       macOptionClickForcesSelection: true,
+      // OSC 8 hyperlinks — the form Claude Code prints its links in, and the
+      // one `WebLinksAddon` structurally cannot match. See
+      // `createOsc8LinkHandler`, including why the gesture is the same
+      // Shift/Option the line above is about.
+      linkHandler: createOsc8LinkHandler(() => term.element ?? null),
       fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', Menlo, Monaco, monospace",
       theme: {
         background: "#0d1117",
@@ -454,27 +662,24 @@ export default function TerminalView({ sessionId, active }: Props) {
     // eslint-disable-next-line no-control-regex
     const urlRegex = /https?:\/\/[^\s'"`<>\x00-\x20\x7f]+/;
     const webLinksAddon = new WebLinksAddon((_event, uri) => {
-      // Same sink, same rule: what xterm matched came off the container's
-      // output, so it is validated before it reaches the OS opener. A click
-      // here is a deliberate act on visible text, but "visible" is exactly
-      // what a userinfo-spoofed URL subverts.
+      // Same sink, same rule as `createOsc8LinkHandler`: what xterm matched
+      // came off the container's output, so it is validated before it reaches
+      // the OS opener.
+      //
+      // This branch is the one where the click really is an act on visible
+      // text — the match *is* the painted characters — so the spoof it has to
+      // survive is a userinfo-spoofed URL, which `sanitizeRelayUrl` rejects.
+      // An OSC 8 link is not like that at all: its label and its target are
+      // unrelated strings, which is why that handler shows the target's origin
+      // on hover before a click can happen. Neither branch replaces the other:
+      // this one covers plain-text URLs in ordinary shell output, which carry
+      // no hyperlink parameter for xterm to hand over.
       const safe = sanitizeRelayUrl(uri);
       if (!safe) {
         console.warn("Refusing to open a link that failed validation");
         return;
       }
-      // Same failure reporting as the toast's Open button — see the long note
-      // on `handleOpenUrl`, including what this catch does *not* catch on
-      // Linux. A click that appears to do nothing is the complaint either way.
-      openUrlExternal(safe).catch((e) =>
-        useAppState.getState().pushToast({
-          kind: "error",
-          message: "Could not open that link in your browser",
-          detail: String(e),
-          // A dead opener fails for every link in the buffer. One card.
-          dedupeKey: "host-open-failed",
-        }),
-      );
+      openUrlExternal(safe).catch(reportOpenFailure);
     }, { urlRegex });
     term.loadAddon(webLinksAddon);
 
