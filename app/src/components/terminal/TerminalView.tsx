@@ -263,11 +263,24 @@ function openHintLabel(ctx: ClickContext): string {
  *    `_handleSingleClick` clears the model on the mousedown of a plain click,
  *    so an old selection elsewhere in the buffer is already gone by the time a
  *    real click on a link arrives here.
+ *
+ *    The limit of this check, stated because the paragraph above reads
+ *    absolute: it sees a drag only once the drag has spanned a *cell*. A press
+ *    and release inside one character cell, or a drag walked back to where it
+ *    started, leaves `finalSelectionEnd === finalSelectionStart`, so
+ *    `hasSelection()` is false and the link opens. Nothing reached the
+ *    clipboard in that case and the card showed the real origin first, so the
+ *    cost is small — but it is the gap a mousedown/mouseup distance check
+ *    would have closed, and it is the price of not keeping that second source
+ *    of truth.
  *  - **A repeat click**, `detail > 1`. Belt to the above's braces: it holds
  *    even when the selection came out empty (a double-click on trailing
  *    whitespace selects nothing) and it does not depend on xterm having
- *    updated the selection model before the Linkifier's listener runs. `> 1`
- *    rather than `!== 1` because a synthesised event carries `detail` 0.
+ *    updated the selection model before the Linkifier's listener runs. It is
+ *    `!== 1`, not `> 1`: a mouseup derived from a real click always carries
+ *    `detail >= 1`, so `> 1` would have waved through anything synthesised
+ *    with `detail` 0. Nothing in the container can dispatch a DOM event, so
+ *    that is hardening rather than a hole being closed.
  *    Comparing mousedown and mouseup *coordinates* would be a third signal,
  *    but xterm hands this handler only the mouseup — the mousedown is not
  *    ours to see without binding our own listener to the host element, which
@@ -298,7 +311,7 @@ function opensOnClick(
   modifierPromised = false,
 ): boolean {
   if (event.button !== 0) return false;
-  if (event.detail > 1) return false;
+  if (event.detail !== 1) return false;
   if (ctx.hasSelection) return false;
   if (!ctx.mouseTracking && !modifierPromised) return true;
   return forcesSelection(event, ctx.macOptionClickForcesSelection);
@@ -341,8 +354,9 @@ function opensOnClick(
  * ## What the mouse mode is worth, honestly
  *
  * Reading it fresh makes it *current*; it does not make it *trustworthy*. The
- * mode is set by the container, with a DECSET, and `?1002l` takes effect
- * synchronously with the write — so a hostile container can drop tracking for
+ * mode is set by the container, with a DECSET, and `?1002l` takes effect as
+ * soon as xterm *parses* it (on its queued write task, not synchronously with
+ * the container's output) — so a hostile container can drop tracking for
  * a few hundred milliseconds at a time and a plain click that lands in one of
  * those windows passes the mode half of the gate. It cannot time the user's
  * click, but it does not need to: a fraction of clicks is enough, and the only
@@ -392,7 +406,9 @@ export function createOsc8LinkHandler(
   /**
    * Did the card the user is looking at name a modifier?
    *
-   * Written on every hover, cleared with the card. xterm only activates a link
+   * Written whenever a card is drawn, and cleared with it — `hover()` clears
+   * and returns early when there is no host element, which leaves this false,
+   * the stricter of the two directions. xterm only activates a link
    * it is currently hovering (`Linkifier._currentLink`), so there is always a
    * fresh hover behind a click — which is what makes this the promise the user
    * actually read, rather than a stale one. See `opensOnClick`.
