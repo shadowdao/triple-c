@@ -101,25 +101,56 @@ fn pick_recorded_lineage(
 /// snapshot to fall back on.
 const NOTHING_TO_PROBE: &str = "This project has no container or snapshot image yet, so there is nothing to compare against the base image.";
 
+/// The project's container, as the daemon reported it.
+///
+/// `running` lives *inside* `Present` because it is only ever read about a
+/// container that was found: `is_container_running` needs an id. Keeping the
+/// two in one variant makes "running, but no container" unrepresentable rather
+/// than merely unreached, which is what [`pick_probe_source`] relies on when it
+/// hands a container id to the container probe arms.
+#[derive(Debug, PartialEq, Eq)]
+enum ContainerState {
+    /// The project genuinely has no container — an answer, not a failure to
+    /// look.
+    Absent,
+    Present {
+        id: String,
+        running: bool,
+    },
+}
+
+impl ContainerState {
+    fn id(&self) -> Option<&str> {
+        match self {
+            ContainerState::Absent => None,
+            ContainerState::Present { id, .. } => Some(id),
+        }
+    }
+}
+
 /// Where [`get_container_staleness`] reads the project's *current* filesystem
 /// from, in descending order of how current the answer is.
+///
+/// The container variants carry the id they will be probed with, so that
+/// "there is a container to read" and "here is which one" cannot come apart
+/// downstream.
 #[derive(Debug, PartialEq, Eq)]
-enum ProbeSource {
+enum ProbeSource<'a> {
     /// `docker exec` into the live container. The only source that includes
     /// everything installed since the last commit *in this session*.
-    RunningContainer,
+    RunningContainer(&'a str),
     /// Commit the stopped container's writable layer to a throwaway image and
     /// probe that. Exactly as current as the container, which is what makes it
     /// preferable to the snapshot — see below.
-    StoppedContainer,
+    StoppedContainer(&'a str),
     /// A throwaway container from `triple-c-snapshot-<id>:latest`.
     Snapshot,
     /// Nothing to read: no container, no snapshot.
     Nothing,
 }
 
-/// Pick the probe source. `container_running` is `None` when the project has no
-/// container at all, `Some(false)` when it has a stopped one.
+/// Pick the probe source, or report the one reading this decision needed and
+/// did not get.
 ///
 /// **A stopped container outranks the snapshot.** The snapshot image is not a
 /// checkpoint — `commit_container_snapshot` runs only before a removal (a
@@ -133,12 +164,30 @@ enum ProbeSource {
 /// Getting this wrong is what made a stopped, never-recreated project report
 /// "no container or snapshot image yet" — with its container sitting right
 /// there — and left Update disabled on the projects that most needed it.
-fn pick_probe_source(container_running: Option<bool>, snapshot_exists: bool) -> ProbeSource {
-    match (container_running, snapshot_exists) {
-        (Some(true), _) => ProbeSource::RunningContainer,
-        (Some(false), _) => ProbeSource::StoppedContainer,
-        (None, true) => ProbeSource::Snapshot,
-        (None, false) => ProbeSource::Nothing,
+///
+/// **`snapshot_exists` is consulted only where it decides something.** When a
+/// container answered, the snapshot is not part of this decision at all, so a
+/// failed `image_exists` is passed over rather than surfaced: destroying a
+/// report the running container could have supplied in full would be the same
+/// mistake, in the other direction, as reading an unreachable daemon as an
+/// absent container. It is load-bearing only with no container at all, and
+/// there its failure *is* the answer this function cannot give.
+fn pick_probe_source<'a>(
+    container: &'a ContainerState,
+    snapshot_exists: &Result<bool, String>,
+) -> Result<ProbeSource<'a>, String> {
+    match container {
+        ContainerState::Present { id, running: true } => Ok(ProbeSource::RunningContainer(id)),
+        // The stopped path may still want the snapshot, but only as a fallback
+        // it can do without — see `stopped_probe_policy` and the commit-failure
+        // arm in `get_container_staleness`, which each handle an unreadable
+        // snapshot themselves.
+        ContainerState::Present { id, running: false } => Ok(ProbeSource::StoppedContainer(id)),
+        ContainerState::Absent => match snapshot_exists {
+            Ok(true) => Ok(ProbeSource::Snapshot),
+            Ok(false) => Ok(ProbeSource::Nothing),
+            Err(e) => Err(probe_failed(e)),
+        },
     }
 }
 
@@ -159,8 +208,8 @@ enum StoppedProbe {
     /// touches nothing, which is what makes it the right answer while another
     /// operation owns the container.
     SnapshotInstead,
-    /// Report rather than guess.
-    Defer,
+    /// Report rather than guess, with the message to report.
+    Defer(String),
 }
 
 /// Pick what to do about a stopped container.
@@ -173,12 +222,188 @@ enum StoppedProbe {
 /// container with a hard `?`, so a non-404 from a remove that raced this commit
 /// fails the whole Start with an opaque "Failed to remove container". Reading
 /// the claim costs nothing and takes that failure off the table.
-fn stopped_probe_policy(project_is_busy: bool, snapshot_exists: bool) -> StoppedProbe {
+///
+/// `snapshot_exists` matters only once the project is busy, because that is the
+/// only state in which the snapshot is the alternative to committing. An
+/// unreadable snapshot there leaves nothing to fall back *to*, so its error is
+/// what gets reported: "try again once it finishes" alone would be a claim that
+/// waiting is all that stands in the way, which a failed `image_exists` has not
+/// established.
+fn stopped_probe_policy(
+    project_is_busy: bool,
+    snapshot_exists: &Result<bool, String>,
+) -> StoppedProbe {
     match (project_is_busy, snapshot_exists) {
         (false, _) => StoppedProbe::Commit,
-        (true, true) => StoppedProbe::SnapshotInstead,
-        (true, false) => StoppedProbe::Defer,
+        (true, Ok(true)) => StoppedProbe::SnapshotInstead,
+        (true, Ok(false)) => StoppedProbe::Defer(PROJECT_BUSY.to_string()),
+        (true, Err(e)) => StoppedProbe::Defer(probe_failed(e)),
     }
+}
+
+/// Reported as `probe_error` when a probe input could not be read at all.
+///
+/// Deliberately distinct from [`NOTHING_TO_PROBE`]: a failed reading is not
+/// evidence that the project has no container, and saying "no container or
+/// snapshot image yet" on a transient fault was confidently wrong about a
+/// project that may well have both.
+///
+/// Deliberately *neutral about the cause*, too. Only one of the four readings
+/// implies an unreachable daemon: `mig::image_id` maps a 404 to `Ok(None)` and
+/// returns `Err` for any other status, and `find_existing_container` /
+/// `image_exists` wrap every list failure the same way — all of which a daemon
+/// that answered perfectly well can produce. The base image name comes from
+/// user settings, so a malformed reference alone reaches here, and telling that
+/// user to go fix a running daemon would be the same unestablished claim about
+/// a cause that this whole probe path exists to stop making.
+///
+/// The underlying error is carried through verbatim, because "Docker is not
+/// running" and "permission denied on /var/run/docker.sock" call for different
+/// fixes from the user.
+///
+/// The sentence names *the check*, not the container, because only two of the
+/// four readings are about the container at all — the other two are the base
+/// image and the snapshot image. Saying "this project's container could not be
+/// inspected" for a malformed base image name in settings would point the user
+/// at the wrong object, which is the same mistake one size down.
+fn probe_failed(e: &str) -> String {
+    format!("This project could not be checked against its base image: {}", e)
+}
+
+/// The four daemon readings [`get_container_staleness`] takes before it can
+/// choose a probe source, each still carrying whether it is an answer.
+///
+/// **Absence and unreachability are different answers, and only one of them is
+/// an answer.** All four callees already draw that line — `image_id` maps a 404
+/// to `Ok(None)`, `find_existing_container` and `image_exists` return `Ok` with
+/// an empty filtered list — so a call site that writes `.unwrap_or(None)` /
+/// `.unwrap_or(false)` is not defaulting, it is *discarding a distinction the
+/// callee went to the trouble of making*. That is what let an unreachable
+/// daemon reach [`pick_probe_source`] as "no container, no snapshot" and report
+/// [`NOTHING_TO_PROBE`] — a confident claim about a project nothing had
+/// actually looked at.
+///
+/// The `Result` fields are the guard against that returning: the call site
+/// hands over what the daemon said, unmodified, and an `.unwrap_or` there no
+/// longer type-checks.
+#[derive(Debug)]
+struct ProbeReadings {
+    /// `docker::find_existing_container`.
+    container_id: Result<Option<String>, String>,
+    /// `docker::is_container_running`, and `None` when there was no container
+    /// to ask about — not a swallowed error.
+    container_running: Option<Result<bool, String>>,
+    /// `mig::image_id` for the configured base image.
+    base_image_id: Result<Option<String>, String>,
+    /// `docker::image_exists` for the project's snapshot image.
+    snapshot_exists: Result<bool, String>,
+}
+
+/// The readings [`get_container_staleness`] carries past the point where a
+/// missing one would have stopped it.
+#[derive(Debug)]
+struct ProbeInputs {
+    /// The current base image's ID, or `None` when it is not pulled locally —
+    /// which [`mig::image_id`] reports as `Ok(None)`, not an error.
+    current_base_image_id: Option<String>,
+    container: ContainerState,
+    /// Still a `Result`, because whether it is load-bearing depends on the
+    /// container: see [`pick_probe_source`].
+    snapshot_exists: Result<bool, String>,
+}
+
+/// What [`get_container_staleness`] does next, once the readings are in.
+#[derive(Debug)]
+enum ProbeStart {
+    /// Go ahead, with these inputs.
+    Inputs(Box<ProbeInputs>),
+    /// Stop, and hand the user this report.
+    ///
+    /// **Reported, not returned.** The hook's `catch` sets `staleness` to
+    /// `null`, and `ContainerMigrationBanner` renders nothing at all for a null
+    /// staleness — so an `Err` out of the command would make the banner vanish
+    /// at exactly the moment it has something to say. A `probe_error` on an
+    /// otherwise-default report keeps it on screen, reading "Container base
+    /// could not be checked". Carrying a `ContainerStaleness` rather than an
+    /// error string is what keeps that decision here, where it is tested,
+    /// instead of in the `?` someone adds at the call site later.
+    Report(Box<ContainerStaleness>),
+}
+
+/// Decide whether the collected readings are enough to probe with.
+///
+/// Only the readings this decision actually rests on can stop it:
+///
+/// * `container_id` selects the probe source outright, so a failure to read it
+///   leaves nothing to choose between. Fatal.
+/// * `base_image_id` is fatal too, and deliberately so: it is the right-hand
+///   side of the staleness comparison, where `None` ("not pulled locally", an
+///   answer) and `Err` ("could not ask") both otherwise collapse into
+///   `stale: false`. Reporting a project as up to date because the base image
+///   could not be read is exactly the #56 mistake, one field over.
+/// * `container_running` is asked only about a container that was found, and
+///   decides between two live probe sources. Fatal when present.
+/// * `snapshot_exists` is *not* fatal here, because it is load-bearing in only
+///   two of the downstream states — no container at all, and a stopped
+///   container on a busy project. It travels as a `Result` so each of those can
+///   surface it, and the states that never consult it are not punished for it.
+///
+/// The first error wins, because when the daemon is unreachable they fail
+/// together and the user needs the reason once, not three times. The order is
+/// `container_id`, then `base_image_id`, then `container_running` — chosen
+/// priority, deliberately *not* the order the daemon was called in, so that the
+/// reported error is most often the one that stopped the probe rather than
+/// whichever reading happened to run first. (It is at most three, not four:
+/// `container_running` is only attempted when `container_id` answered with a
+/// container.)
+///
+/// **A caveat this cannot fix here.** `docker::is_container_running` swallows
+/// `inspect_container` failures into `Ok(false)` itself and errors only when the
+/// client cannot be built, so a daemon that dies between the list and the
+/// inspect still reads as "stopped" rather than as an error. That is a fix
+/// inside that function, not at this call site; threading its `Result` through
+/// at least stops *this* layer from adding a second swallow on top.
+fn start_probe(readings: ProbeReadings) -> ProbeStart {
+    match collect_probe_inputs(readings) {
+        Ok(inputs) => ProbeStart::Inputs(Box::new(inputs)),
+        Err(e) => ProbeStart::Report(Box::new(ContainerStaleness {
+            probe_error: Some(e),
+            ..Default::default()
+        })),
+    }
+}
+
+fn collect_probe_inputs(readings: ProbeReadings) -> Result<ProbeInputs, String> {
+    let ProbeReadings {
+        container_id,
+        container_running,
+        base_image_id,
+        snapshot_exists,
+    } = readings;
+
+    let container_id = container_id.map_err(|e| probe_failed(&e))?;
+    let current_base_image_id = base_image_id.map_err(|e| probe_failed(&e))?;
+    let container_running = container_running
+        .transpose()
+        .map_err(|e| probe_failed(&e))?;
+
+    let container = match (container_id, container_running) {
+        (Some(id), Some(running)) => ContainerState::Present { id, running },
+        // No container: whatever `container_running` says is about nothing, and
+        // the caller only produces `None` here anyway.
+        (None, _) => ContainerState::Absent,
+        // A container was found but nobody asked whether it was running. The
+        // caller cannot produce this, and guessing "stopped" would cost a
+        // running project the only probe source that sees this session's
+        // installs — so say what happened instead.
+        (Some(_), None) => return Err(probe_failed("the container's state was not read")),
+    };
+
+    Ok(ProbeInputs {
+        current_base_image_id,
+        container,
+        snapshot_exists,
+    })
 }
 
 /// Runs two filesystem probes (~3 s each) and is therefore meant to be called
@@ -214,7 +439,35 @@ pub async fn get_container_staleness(
     let snapshot_image = docker::get_snapshot_image_name(&project);
 
     let mut out = ContainerStaleness::default();
-    out.current_base_image_id = mig::image_id(&base_image).await.unwrap_or(None);
+
+    // Every reading the daemon owes us, taken up front and handed on exactly as
+    // it came back, so that "could not ask" stays distinguishable from "asked,
+    // and the answer is no". [`start_probe`] is where that distinction is acted
+    // on; nothing between here and there may collapse one into the other, and
+    // the `Result` fields of [`ProbeReadings`] are what stop it being possible.
+    let container_id_result = docker::find_existing_container(&project).await;
+    let container_running_result = match &container_id_result {
+        Ok(Some(id)) => Some(docker::is_container_running(id).await),
+        // No container, or no usable reading of one: nothing to inspect, and
+        // the container lookup's own error is what gets reported.
+        _ => None,
+    };
+    let readings = ProbeReadings {
+        container_id: container_id_result,
+        container_running: container_running_result,
+        base_image_id: mig::image_id(&base_image).await,
+        snapshot_exists: docker::image_exists(&snapshot_image).await,
+    };
+
+    let inputs = match start_probe(readings) {
+        ProbeStart::Inputs(inputs) => *inputs,
+        // Reported, not returned — see [`ProbeStart::Report`].
+        ProbeStart::Report(report) => return Ok(*report),
+    };
+    let container = inputs.container;
+    let container_id = container.id();
+
+    out.current_base_image_id = inputs.current_base_image_id;
     out.snapshot_created_at = mig::image_created(&snapshot_image).await;
 
     // Lineage, most authoritative source first: the live container's label,
@@ -228,8 +481,7 @@ pub async fn get_container_staleness(
     // as an answer and skip the snapshot entirely, so a snapshot that *did*
     // record a lineage was never consulted and the project reported "unknown"
     // with the information sitting one lookup away.
-    let container_id = docker::find_existing_container(&project).await.unwrap_or(None);
-    let from_container = match &container_id {
+    let from_container = match container_id {
         Some(id) => container_label(id, mig::LABEL_BASE_IMAGE_ID).await,
         None => None,
     };
@@ -248,17 +500,19 @@ pub async fn get_container_staleness(
     };
 
     // ── Probes ───────────────────────────────────────────────────────────
-    let container_running = match &container_id {
-        Some(id) => Some(docker::is_container_running(id).await.unwrap_or(false)),
-        None => None,
+    let snapshot_exists = &inputs.snapshot_exists;
+    let source = match pick_probe_source(&container, snapshot_exists) {
+        Ok(source) => source,
+        // The only reading this decision needed and did not get — see
+        // [`ProbeStart::Report`] for why this is a report and not an `Err`.
+        Err(e) => {
+            out.probe_error = Some(e);
+            return Ok(out);
+        }
     };
-    let snapshot_exists = docker::image_exists(&snapshot_image).await.unwrap_or(false);
-    let from_manifest = match (
-        pick_probe_source(container_running, snapshot_exists),
-        &container_id,
-    ) {
-        (ProbeSource::RunningContainer, Some(id)) => mig::manifest_from_container(id).await,
-        (ProbeSource::StoppedContainer, Some(id)) => {
+    let from_manifest = match source {
+        ProbeSource::RunningContainer(id) => mig::manifest_from_container(id).await,
+        ProbeSource::StoppedContainer(id) => {
             let busy = crate::project_lock::held(&project_id).is_some();
             match stopped_probe_policy(busy, snapshot_exists) {
                 StoppedProbe::Commit => {
@@ -275,7 +529,12 @@ pub async fn get_container_staleness(
                         // layer; the snapshot probe allocates nothing) and a
                         // 409 from an operation that claimed the project after
                         // the check above.
-                        Err(e) if snapshot_exists => {
+                        // `Ok(true)` specifically: an `image_exists` that
+                        // failed has not established that there is anything to
+                        // fall back to, and probing a snapshot that may not
+                        // exist would replace the commit's real error with a
+                        // confusing one.
+                        Err(e) if matches!(snapshot_exists, Ok(true)) => {
                             log::warn!(
                                 "Probing the stopped container for project {} failed ({}) — \
                                  falling back to its snapshot image, which may lag it",
@@ -295,15 +554,16 @@ pub async fn get_container_staleness(
                     );
                     mig::manifest_from_image(&snapshot_image).await
                 }
-                StoppedProbe::Defer => Err(PROJECT_BUSY.to_string()),
+                StoppedProbe::Defer(message) => Err(message),
             }
         }
-        (ProbeSource::Snapshot, _) => mig::manifest_from_image(&snapshot_image).await,
-        // `container_running` is `Some` exactly when `container_id` is, so the
-        // two arms above are the only ones those variants can reach. This arm
-        // is `ProbeSource::Nothing` — and now *only* that: it used to also
-        // swallow every stopped container, which is the bug.
-        (_, _) => Err(NOTHING_TO_PROBE.to_string()),
+        ProbeSource::Snapshot => mig::manifest_from_image(&snapshot_image).await,
+        // Reached only when there is genuinely neither a container nor a
+        // snapshot: `ProbeSource` carries the container id in its container
+        // variants, so a container that exists can no longer fall through to
+        // here — which is the bug this arm used to hide, swallowing every
+        // stopped container.
+        ProbeSource::Nothing => Err(NOTHING_TO_PROBE.to_string()),
     };
 
     let (from_manifest, base_manifest) = match from_manifest {
@@ -2113,13 +2373,39 @@ mod tests {
         assert_eq!(pick_recorded_lineage(some(""), None), None);
     }
 
+    /// The readings as the daemon answered them, all four healthy: no
+    /// container, nothing pulled, no snapshot. Tests override the one reading
+    /// they are about, which keeps it obvious which reading each case is
+    /// actually exercising.
+    fn readings() -> ProbeReadings {
+        ProbeReadings {
+            container_id: Ok(None),
+            container_running: None,
+            base_image_id: Ok(None),
+            snapshot_exists: Ok(false),
+        }
+    }
+
+    fn present(running: bool) -> ContainerState {
+        ContainerState::Present {
+            id: "c1".to_string(),
+            running,
+        }
+    }
+
+    /// What every one of the four readings looks like when the socket is gone:
+    /// generic over what it was going to return.
+    fn daemon<T>() -> Result<T, String> {
+        Err("Failed to list containers: connection refused".to_string())
+    }
+
     #[test]
     fn a_stopped_container_is_probed_rather_than_reported_missing() {
         // The regression: a container that exists but is stopped, with no
         // snapshot ever taken, read as "nothing to compare against".
         assert_eq!(
-            pick_probe_source(Some(false), false),
-            ProbeSource::StoppedContainer
+            pick_probe_source(&present(false), &Ok(false)),
+            Ok(ProbeSource::StoppedContainer("c1"))
         );
     }
 
@@ -2128,42 +2414,283 @@ mod tests {
         // The snapshot lags the container by everything installed since the
         // last commit, in both states.
         assert_eq!(
-            pick_probe_source(Some(true), true),
-            ProbeSource::RunningContainer
+            pick_probe_source(&present(true), &Ok(true)),
+            Ok(ProbeSource::RunningContainer("c1"))
         );
         assert_eq!(
-            pick_probe_source(Some(false), true),
-            ProbeSource::StoppedContainer
+            pick_probe_source(&present(false), &Ok(true)),
+            Ok(ProbeSource::StoppedContainer("c1"))
         );
     }
 
     #[test]
     fn the_snapshot_is_the_fallback_only_once_the_container_is_gone() {
-        assert_eq!(pick_probe_source(None, true), ProbeSource::Snapshot);
+        assert_eq!(
+            pick_probe_source(&ContainerState::Absent, &Ok(true)),
+            Ok(ProbeSource::Snapshot)
+        );
     }
 
     #[test]
     fn nothing_to_probe_is_reserved_for_no_container_and_no_snapshot() {
         // The one case the "no container or snapshot image yet" message may
         // still describe.
-        assert_eq!(pick_probe_source(None, false), ProbeSource::Nothing);
+        assert_eq!(
+            pick_probe_source(&ContainerState::Absent, &Ok(false)),
+            Ok(ProbeSource::Nothing)
+        );
+    }
+
+    #[test]
+    fn an_unreadable_snapshot_only_costs_the_report_where_the_snapshot_is_the_answer() {
+        // A container answered, so `image_exists` decides nothing: its failure
+        // must not cost a report the container can supply in full. Treating it
+        // as fatal turned "running container, one flaky `image_exists`" into a
+        // bare probe_error with Update disabled.
+        assert_eq!(
+            pick_probe_source(&present(true), &daemon()),
+            Ok(ProbeSource::RunningContainer("c1"))
+        );
+        assert_eq!(
+            pick_probe_source(&present(false), &daemon()),
+            Ok(ProbeSource::StoppedContainer("c1"))
+        );
+
+        // With no container, the snapshot is the whole decision, so its failure
+        // is reported — and never as "no container or snapshot image yet",
+        // which nothing has established.
+        let e = pick_probe_source(&ContainerState::Absent, &daemon()).unwrap_err();
+        assert!(e.contains("connection refused"), "{}", e);
+        assert_ne!(e, NOTHING_TO_PROBE);
     }
 
     #[test]
     fn a_stopped_container_is_committed_only_when_nothing_else_owns_the_project() {
-        assert_eq!(stopped_probe_policy(false, false), StoppedProbe::Commit);
-        assert_eq!(stopped_probe_policy(false, true), StoppedProbe::Commit);
+        assert_eq!(
+            stopped_probe_policy(false, &Ok(false)),
+            StoppedProbe::Commit
+        );
+        assert_eq!(stopped_probe_policy(false, &Ok(true)), StoppedProbe::Commit);
+        // Not the snapshot's business either way when the project is free: an
+        // unreadable `image_exists` does not stop the commit that would not
+        // have consulted it.
+        assert_eq!(stopped_probe_policy(false, &daemon()), StoppedProbe::Commit);
     }
 
     #[test]
     fn a_busy_project_falls_back_rather_than_racing_a_recreate() {
         // The snapshot lags, but a stale answer beats failing someone's Start.
         assert_eq!(
-            stopped_probe_policy(true, true),
+            stopped_probe_policy(true, &Ok(true)),
             StoppedProbe::SnapshotInstead
         );
         // Nothing to fall back to: say so instead of committing anyway.
-        assert_eq!(stopped_probe_policy(true, false), StoppedProbe::Defer);
+        assert_eq!(
+            stopped_probe_policy(true, &Ok(false)),
+            StoppedProbe::Defer(PROJECT_BUSY.to_string())
+        );
+
+        // Busy *and* the fallback could not be read: "try again once it
+        // finishes" would promise that waiting is all that stands in the way,
+        // which the failed reading has not established. Report what happened.
+        match stopped_probe_policy(true, &daemon()) {
+            StoppedProbe::Defer(message) => {
+                assert!(message.contains("connection refused"), "{}", message);
+                assert_ne!(message, PROJECT_BUSY);
+            }
+            other => panic!("expected Defer, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn an_unreachable_daemon_is_never_read_as_an_absent_container() {
+        // The bug: every one of these used to be flattened to "no" by an
+        // `unwrap_or`, which reached `pick_probe_source` as "no container, no
+        // snapshot" and reported "no container or snapshot image yet" about a
+        // project nobody had managed to look at.
+        let e = collect_probe_inputs(ProbeReadings {
+            container_id: daemon(),
+            ..readings()
+        })
+        .unwrap_err();
+        assert!(e.contains("connection refused"), "{}", e);
+        assert_ne!(e, NOTHING_TO_PROBE);
+
+        let e = collect_probe_inputs(ProbeReadings {
+            base_image_id: daemon(),
+            ..readings()
+        })
+        .unwrap_err();
+        assert!(e.contains("connection refused"), "{}", e);
+
+        let e = collect_probe_inputs(ProbeReadings {
+            container_id: Ok(Some("c1".into())),
+            container_running: Some(daemon()),
+            ..readings()
+        })
+        .unwrap_err();
+        assert!(e.contains("connection refused"), "{}", e);
+
+        // The fourth reading is not fatal here — see
+        // `an_unreadable_snapshot_only_costs_the_report_where_the_snapshot_is_the_answer`
+        // — but it must still arrive as an error rather than as "no snapshot".
+        let inputs = collect_probe_inputs(ProbeReadings {
+            snapshot_exists: daemon(),
+            ..readings()
+        })
+        .unwrap();
+        assert!(inputs.snapshot_exists.is_err());
+        let e = pick_probe_source(&inputs.container, &inputs.snapshot_exists).unwrap_err();
+        assert_ne!(e, NOTHING_TO_PROBE);
+    }
+
+    #[test]
+    fn a_base_image_that_could_not_be_read_is_never_reported_as_up_to_date() {
+        // `image_id` answers `Ok(None)` for "not pulled locally", which is a
+        // legitimate `stale: false`. An `Err` is not: it is the right-hand side
+        // of the comparison missing, and letting it through as `None` would
+        // report the project up to date on the strength of a reading nobody
+        // got. This is #56 one field over, so it is fatal on purpose.
+        let e = collect_probe_inputs(ProbeReadings {
+            base_image_id: Err("invalid reference format".into()),
+            container_id: Ok(Some("c1".into())),
+            container_running: Some(Ok(true)),
+            snapshot_exists: Ok(true),
+        })
+        .unwrap_err();
+        assert!(e.contains("invalid reference format"), "{}", e);
+    }
+
+    #[test]
+    fn a_failed_reading_is_not_blamed_on_a_daemon_that_answered() {
+        // Three of the four readings return `Err` from a daemon that replied
+        // perfectly well: `image_id` maps only a 404 to `Ok(None)`, and the two
+        // list-based readings wrap any failure. The base image name is
+        // user-supplied, so a typo in settings lands here — and used to be
+        // reported as "Docker could not be reached", sending the user to fix a
+        // daemon that was running.
+        // The payload is the shape bollard really produces for this case, and
+        // it contains the word "Docker" itself — so asserting the *message*
+        // lacks that word would pass here only because a synthetic payload was
+        // chosen. What must be true is that nothing *we* add claims the daemon
+        // was unreachable, or names the container when the reading was about
+        // the base image.
+        let raw = "Docker responded with status code 400: invalid reference format";
+        let e = collect_probe_inputs(ProbeReadings {
+            base_image_id: Err(raw.into()),
+            ..readings()
+        })
+        .unwrap_err();
+        assert!(!e.contains("could not be reached"), "{}", e);
+        assert!(!e.contains("container"), "{}", e);
+        // The cause still comes through verbatim: "Docker isn't running" and
+        // "permission denied on the socket" need different fixes and must stay
+        // distinguishable.
+        assert!(e.contains(raw), "{}", e);
+    }
+
+    #[test]
+    fn the_first_daemon_error_is_the_one_reported() {
+        // When the daemon is down these fail together, and the user needs the
+        // reason once rather than three times. Call order wins, and
+        // `container_id` leads because it is what selects the probe source.
+        //
+        // At most three fail, not four: `container_running` is only attempted
+        // when `container_id` answered with a container, so the caller cannot
+        // produce an `Err` container id alongside a `Some(..)` running reading.
+        let e = collect_probe_inputs(ProbeReadings {
+            container_id: Err("first".into()),
+            container_running: None,
+            base_image_id: Err("second".into()),
+            snapshot_exists: Err("third".into()),
+        })
+        .unwrap_err();
+        assert!(e.ends_with("first"), "{}", e);
+
+        let e = collect_probe_inputs(ProbeReadings {
+            container_id: Ok(Some("c1".into())),
+            container_running: Some(Err("third".into())),
+            base_image_id: Err("second".into()),
+            snapshot_exists: Err("fourth".into()),
+        })
+        .unwrap_err();
+        assert!(e.ends_with("second"), "{}", e);
+    }
+
+    #[test]
+    fn a_container_id_cannot_arrive_without_a_reading_of_its_state() {
+        // `ContainerState` makes "running, but no container" unrepresentable;
+        // this is the other half — a container found, but never asked about.
+        // The caller cannot produce it, and guessing "stopped" would cost a
+        // running project the only probe source that sees this session's
+        // installs.
+        let e = collect_probe_inputs(ProbeReadings {
+            container_id: Ok(Some("c1".into())),
+            container_running: None,
+            ..readings()
+        })
+        .unwrap_err();
+        assert!(e.contains("state was not read"), "{}", e);
+    }
+
+    #[test]
+    fn a_daemon_that_answers_no_is_an_answer_and_passes_through() {
+        // No container, no snapshot, base image not pulled: all the readings
+        // are `Ok`, and the "nothing to probe" path downstream is then
+        // genuinely earned.
+        let inputs = collect_probe_inputs(readings()).unwrap();
+        assert_eq!(inputs.current_base_image_id, None);
+        assert_eq!(inputs.container, ContainerState::Absent);
+        assert_eq!(inputs.snapshot_exists, Ok(false));
+        assert_eq!(
+            pick_probe_source(&inputs.container, &inputs.snapshot_exists),
+            Ok(ProbeSource::Nothing)
+        );
+
+        // And the fully populated reading survives intact.
+        let inputs = collect_probe_inputs(ProbeReadings {
+            container_id: Ok(Some("c1".into())),
+            container_running: Some(Ok(true)),
+            base_image_id: Ok(Some("sha256:base".into())),
+            snapshot_exists: Ok(true),
+        })
+        .unwrap();
+        assert_eq!(inputs.current_base_image_id.as_deref(), Some("sha256:base"));
+        assert_eq!(inputs.container, present(true));
+        assert_eq!(inputs.snapshot_exists, Ok(true));
+    }
+
+    #[test]
+    fn a_failed_reading_keeps_the_banner_on_screen_instead_of_erroring() {
+        // The load-bearing design decision of this path: a failed reading is a
+        // report with `probe_error` set, never an `Err` out of the command. An
+        // `Err` reaches the hook's `catch`, which nulls `staleness`, and
+        // `ContainerMigrationBanner` renders nothing at all for a null one — so
+        // the banner would vanish at exactly the moment it has something to say.
+        match start_probe(ProbeReadings {
+            container_id: daemon(),
+            ..readings()
+        }) {
+            ProbeStart::Report(report) => {
+                let message = report.probe_error.clone().expect("probe_error");
+                assert!(message.contains("connection refused"), "{}", message);
+                // Everything else at its default: a field being empty means
+                // "nothing found", and nothing was found because nothing was
+                // read. `stale: false` here is the absence of a claim, which is
+                // only honest because `probe_error` is carrying the reason.
+                assert_eq!(
+                    *report,
+                    ContainerStaleness {
+                        probe_error: Some(message),
+                        ..Default::default()
+                    }
+                );
+            }
+            ProbeStart::Inputs(_) => panic!("a failed reading must not be probed on"),
+        }
+
+        // And a healthy set of readings still goes on to probe.
+        assert!(matches!(start_probe(readings()), ProbeStart::Inputs(_)));
     }
 
     #[test]
