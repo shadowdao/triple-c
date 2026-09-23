@@ -843,3 +843,10 @@ Frontend tests use Vitest with jsdom environment and React Testing Library. Setu
 cd app
 npx vitest run src/path/to/test.test.ts
 ```
+
+CI runs both suites on every PR: the `test` job in `.gitea/workflows/build-app-preview.yml` does
+`npm run build`, `npx vitest run` and `cargo test --locked`, in parallel with the platform builds.
+It is the only place `cargo test` runs on merge, which matters most for the app-command ACL
+census — an ungranted command compiles and only fails at runtime. `build-app.yml` (releases
+from `main`) deliberately does not repeat it. The runner is root, so the few Rust tests that
+exercise file permissions skip themselves there.

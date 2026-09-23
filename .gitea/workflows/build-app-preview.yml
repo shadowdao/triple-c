@@ -5,9 +5,11 @@ name: Build App (Preview)
 # sync.
 #
 # This is also the **PR build check**: it compiles Linux, macOS and Windows, so
-# a push that breaks any of them fails here. build-app.yml used to do that job
-# in parallel and publish nothing, which meant six OS builds per push and one
-# unreachable set of bundles; it is now releases-only.
+# a push that breaks any of them fails here. Its `test` job runs vitest and
+# `cargo test` too, so a push that breaks either suite fails here as well.
+# build-app.yml used to do the build-check job in parallel and publish nothing,
+# which meant six OS builds per push and one unreachable set of bundles; it is
+# now releases-only.
 #
 # The cost of the swap, stated plainly: one prerelease per PR commit that
 # touches `app/**` — so the workflow prunes its own, keeping the newest
@@ -220,6 +222,102 @@ jobs:
           fi
           echo "RELEASE_ID=${RELEASE_ID}" >> $GITHUB_OUTPUT
           echo "Release ${TAG} is id ${RELEASE_ID}"
+
+  # The test suites. Before this job CI ran neither: every check below lived on
+  # a developer's machine. The one that matters most is the app-command ACL
+  # census — `cargo test` is what re-checks the committed capability files and
+  # `gen/schemas/acl-manifests.json` against `generate_handler!`, and vitest's
+  # `capabilities.test.ts` is what keeps each window's code to the wrappers its
+  # capability grants. A command left ungranted builds fine and only fails at
+  # runtime ("not allowed by ACL"), so these tests are the merge-time guard.
+  #
+  # Independent of the release: no `needs`, so it runs alongside the three
+  # platform builds rather than in front of them, and a red test fails the PR
+  # check without holding up a preview someone may want to try anyway.
+  #
+  # Setup mirrors build-linux on purpose — the same Node, the same apt set
+  # (`cargo test` compiles the whole Tauri crate, so it needs WebKitGTK like
+  # a real build) and `npm ci` from the lockfile for the reasons given there.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Node.js 22
+        run: |
+          NEED_INSTALL=false
+          if command -v node >/dev/null 2>&1; then
+            NODE_MAJOR=$(node --version | sed 's/v\([0-9]*\).*/\1/')
+            OLD_NODE_DIR=$(dirname "$(which node)")
+            echo "Found Node.js $(node --version) at $(which node) (major: ${NODE_MAJOR})"
+            if [ "$NODE_MAJOR" -lt 22 ]; then
+              echo "Node.js ${NODE_MAJOR} is too old, removing before installing 22..."
+              sudo rm -f "${OLD_NODE_DIR}/node" "${OLD_NODE_DIR}/npm" "${OLD_NODE_DIR}/npx" "${OLD_NODE_DIR}/corepack"
+              hash -r
+              NEED_INSTALL=true
+            fi
+          else
+            echo "Node.js not found, installing 22..."
+            NEED_INSTALL=true
+          fi
+          if [ "$NEED_INSTALL" = true ]; then
+            curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+            sudo apt-get install -y nodejs
+            hash -r
+          fi
+          node --version
+          npm --version
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libsoup-3.0-dev \
+            libssl-dev \
+            libxdo-dev \
+            pkg-config \
+            build-essential \
+            curl
+
+      - name: Install Rust stable
+        run: |
+          if command -v rustup >/dev/null 2>&1; then
+            rustup update stable
+            rustup default stable
+          else
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          fi
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustc --version
+          cargo --version
+
+      - name: Install frontend dependencies
+        working-directory: ./app
+        run: npm ci
+
+      # `npm run build` is `tsc && vite build`: the type check, and the
+      # `dist/` that `tauri::generate_context!` needs to exist before the Rust
+      # crate — and so `cargo test` — will compile at all.
+      - name: Type-check and build the frontend
+        working-directory: ./app
+        run: npm run build
+
+      - name: Frontend tests (vitest)
+        working-directory: ./app
+        run: npx vitest run
+
+      # `--locked`: test against the committed Cargo.lock, never a re-resolved
+      # one, for the same reason the frontend uses `npm ci`.
+      - name: Backend tests (cargo test)
+        working-directory: ./app/src-tauri
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo test --locked
 
   build-linux:
     runs-on: ubuntu-latest

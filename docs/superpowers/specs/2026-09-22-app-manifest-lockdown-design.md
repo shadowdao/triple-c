@@ -55,6 +55,9 @@ validation stays in Rust as today), changing any plugin grant, `removeUnusedComm
 - CI (`.gitea/workflows/build-app-preview.yml`, `build-app.yml`) runs `npm run build`
   (`tsc && vite build`) and `tauri build`. It runs **neither `cargo test` nor `vitest`**. Any
   check that must hold on every merge therefore has to fail the *build*, not a test.
+  *(2026-09-23: no longer true — `build-app-preview.yml` gained a `test` job that runs
+  `vitest` and `cargo test --locked` on every PR. The build-time check stays the backstop that
+  runs inside every `tauri build`, release builds included.)*
 
 ## 2. Mechanism (tauri-build 2.6.0 / tauri-utils 2.9.0 / tauri 2.11.0)
 
@@ -467,6 +470,7 @@ Manual (`npm run tauri dev`, then a release `tauri build` on Linux for the AppIm
    developer's machine. Recommendation to the user, not part of this change: add
    `cd app && npm run test` and `cd app/src-tauri && cargo test` steps to
    `build-app-preview.yml` after the dependency install.
+   *(Done 2026-09-23: the `test` job in `build-app-preview.yml`.)*
 2. **`Box::leak` in `build.rs`: acceptable** (controller ruling; either was allowed). Chosen
    over a generated include file because it is two lines, needs no `OUT_DIR` plumbing, and the
    build script exits immediately afterwards.
