@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ProjectPath, ProjectRemovalReport, ProjectResetOutcome, ContainerInfo, AppSettings, SettingsImportPreview, SettingsImportOutcome, UpdateInfo, ImageUpdateInfo, FileEntry, FileContents, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, BrowserPageState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo, UploadOutcome, Note } from "./types";
+import type { Project, ProjectPath, ProjectRemovalReport, ProjectResetOutcome, ContainerInfo, AppSettings, SettingsImportPreview, SettingsImportOutcome, UpdateInfo, ImageUpdateInfo, FileEntry, FileContents, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, BrowserPageState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo, UploadOutcome, Note, ViewerFile, ViewerPoll, ViewerSaved, ViewerState } from "./types";
 
 // Docker
 export const checkDocker = () => invoke<boolean>("check_docker");
@@ -413,3 +413,22 @@ export const getMigrationState = (projectId: string) =>
  *  Rejects with a string already phrased for a toast. */
 export const openUrlExternal = (url: string) =>
   invoke<void>("open_url_external", { url });
+
+// ---- Terminal file viewer ----
+
+export const openFileViewer = (
+  projectId: string,
+  path: string,
+  line?: number,
+  col?: number,
+  endLine?: number,
+) => invoke<void>("open_file_viewer", { projectId, path, line, col, endLine });
+
+export const viewerGetState = () => invoke<ViewerState>("viewer_get_state");
+export const viewerReadFile = (maxBytes: number) =>
+  invoke<ViewerFile>("viewer_read_file", { maxBytes });
+export const viewerPollFile = () => invoke<ViewerPoll>("viewer_poll_file");
+export const viewerWriteFile = (contentsBase64: string, baseHash: string) =>
+  invoke<ViewerSaved>("viewer_write_file", { contentsBase64, baseHash });
+export const viewerChooseFile = (index: number) =>
+  invoke<ViewerState>("viewer_choose_file", { index });

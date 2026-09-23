@@ -3,6 +3,7 @@ import {
   IMAGE_PREVIEW_LIMIT,
   TEXT_PREVIEW_LIMIT,
   decodeBase64,
+  encodeBase64,
   extensionOf,
   imageMimeFor,
   looksBinary,
@@ -74,5 +75,24 @@ describe("decodeBase64 / looksBinary", () => {
     const bytes = new Uint8Array(20000).fill(0x61);
     bytes[9000] = 0;
     expect(looksBinary(bytes)).toBe(false);
+  });
+});
+
+describe("encodeBase64", () => {
+  it("matches btoa on a small input", () => {
+    expect(encodeBase64(new Uint8Array([0xff, 0xd8, 0x00, 0x41]))).toBe(btoa("\xff\xd8\x00\x41"));
+  });
+
+  it("round-trips 1 MiB without overflowing the call stack", () => {
+    // Spreading a 1 MiB array into String.fromCharCode throws RangeError in V8.
+    const bytes = new Uint8Array(TEXT_PREVIEW_LIMIT);
+    for (let i = 0; i < bytes.length; i++) bytes[i] = (i * 31 + 7) & 0xff;
+    const back = decodeBase64(encodeBase64(bytes));
+    expect(back.length).toBe(bytes.length);
+    expect(back.every((b, i) => b === bytes[i])).toBe(true);
+  });
+
+  it("encodes an empty input as the empty string", () => {
+    expect(encodeBase64(new Uint8Array(0))).toBe("");
   });
 });

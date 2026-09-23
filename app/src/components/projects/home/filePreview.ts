@@ -97,6 +97,19 @@ export function decodeBase64(base64: string): Uint8Array<ArrayBuffer> {
 }
 
 /**
+ * Bytes → base64. Built 32 KiB at a time: spreading a whole buffer into
+ * `String.fromCharCode` overflows the argument limit well below 1 MiB.
+ */
+export function encodeBase64(bytes: Uint8Array): string {
+  const CHUNK = 0x8000;
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(binary);
+}
+
+/**
  * The classic heuristic: a NUL byte early on means this is not text. Cheap,
  * and it is what `git` and `grep` use to decide the same question.
  */

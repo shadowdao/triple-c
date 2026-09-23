@@ -1,7 +1,10 @@
 mod auth_bridge;
 mod browser_view;
+#[cfg(test)]
+mod command_census;
 mod commands;
 mod docker;
+pub mod file_viewer;
 mod install_helper;
 mod logging;
 mod models;
@@ -240,6 +243,7 @@ pub fn run() {
             lifecycle,
             pending_settings_import: Arc::new(tokio::sync::Mutex::new(None)),
         })
+        .manage(file_viewer::registry::ViewerRegistry::default())
         .setup(move |app| {
             match tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png")) {
                 Ok(icon) => {
@@ -545,6 +549,13 @@ pub fn run() {
             commands::file_commands::read_container_file,
             commands::file_commands::rename_container_path,
             commands::file_commands::create_container_directory,
+            // Terminal file viewer
+            commands::file_viewer_commands::open_file_viewer,
+            commands::file_viewer_commands::viewer_get_state,
+            commands::file_viewer_commands::viewer_choose_file,
+            commands::file_viewer_commands::viewer_read_file,
+            commands::file_viewer_commands::viewer_poll_file,
+            commands::file_viewer_commands::viewer_write_file,
             // AWS
             commands::aws_commands::aws_sso_refresh,
             // Updates
@@ -835,30 +846,11 @@ mod tests {
             &mut defined,
         );
 
-        // The registration list, read from this file rather than from a macro
-        // expansion so the test does not depend on `generate_handler!`'s shape.
-        let this = include_str!("lib.rs");
-        let handler = this
-            .split_once("generate_handler![")
-            .and_then(|(_, rest)| rest.split_once("])"))
-            .map(|(inside, _)| inside)
+        // The registration list, read from this file by the same parser `build.rs` uses to
+        // declare the AppManifest — so if this test can see a command, the ACL can too.
+        let ordered = crate::command_census::registered_commands(include_str!("lib.rs"))
             .expect("lib.rs should contain a generate_handler! list");
-        // Line-based, not `split(',')`: the list is grouped under `// Docker`
-        // style comments, and splitting on commas glues each comment to the
-        // command that follows it. A `starts_with("//")` filter then drops that
-        // command — silently, and once per group.
-        let registered: BTreeSet<String> = handler
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty() && !l.starts_with("//"))
-            .filter_map(|l| {
-                l.trim_end_matches(',')
-                    .rsplit("::")
-                    .next()
-                    .map(|n| n.trim().to_string())
-            })
-            .filter(|n| !n.is_empty())
-            .collect();
+        let registered: BTreeSet<String> = ordered.iter().cloned().collect();
 
         assert!(
             !defined.is_empty() && !registered.is_empty(),
@@ -887,21 +879,11 @@ mod tests {
         // passed here.
         let mut seen: Vec<&str> = Vec::new();
         let mut duplicated: Vec<&str> = Vec::new();
-        for line in handler
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty() && !l.starts_with("//"))
-        {
-            if let Some(name) = line.trim_end_matches(',').rsplit("::").next() {
-                let name = name.trim();
-                if name.is_empty() {
-                    continue;
-                }
-                if seen.contains(&name) {
-                    duplicated.push(name);
-                } else {
-                    seen.push(name);
-                }
+        for name in &ordered {
+            if seen.contains(&name.as_str()) {
+                duplicated.push(name);
+            } else {
+                seen.push(name);
             }
         }
         assert!(
@@ -930,7 +912,10 @@ mod tests {
             })
             .collect();
 
-        let mut sorted = listed.clone();
+        // Plugin and core grants: the exact reviewed list, unchanged by the lockdown.
+        let (bare, prefixed): (Vec<String>, Vec<String>) =
+            listed.iter().cloned().partition(|g| !g.contains(':'));
+        let mut sorted = prefixed;
         sorted.sort();
         let mut expected = vec![
             "core:event:allow-listen",
@@ -942,10 +927,30 @@ mod tests {
         expected.sort();
         assert_eq!(
             sorted, expected,
-            "the capability set changed. That is allowed — but it is the IPC \
+            "the plugin/core capability set changed. That is allowed — but it is the IPC \
              surface a compromised webview can call, so update this list \
              deliberately rather than to make the test pass."
         );
+
+        // App commands: since build.rs declares the AppManifest, the bare `allow-*` grants
+        // are the complete list of app commands the main window may call. `build.rs` already
+        // fails the build when they disagree with generate_handler!; this keeps the reviewed
+        // rule ("every non-viewer command, exactly") visible where the plugin census lives.
+        let registered = crate::command_census::registered_commands(include_str!("lib.rs"))
+            .expect("lib.rs should contain a generate_handler! list");
+        let mut expected_bare: Vec<String> = registered
+            .iter()
+            .filter(|c| crate::command_census::expected_windows(c) == ["main"])
+            .map(|c| crate::command_census::allow_permission(c))
+            .collect();
+        expected_bare.sort();
+        let mut bare = bare;
+        bare.sort();
+        assert_eq!(
+            bare, expected_bare,
+            "default.json's app-command grants must be exactly the main-window commands"
+        );
+        assert!(bare.len() >= 100, "the census found {} app grants; the parser has stopped seeing the list", bare.len());
 
         // Belt and braces: the `*:default` aliases are the specific trap here,
         // because they expand to a set the file never spells out. `store:*` in
@@ -963,5 +968,101 @@ mod tests {
                  path discards: an arbitrary host-file read/write."
             );
         }
+    }
+
+    /// `build.rs` derives the AppManifest from the handler list and this reads back what
+    /// tauri-build actually embedded. `cargo test` runs the build script first, so
+    /// `gen/schemas/acl-manifests.json` is fresh. This guards against the committed/generated
+    /// artifact diverging from `generate_handler!` — a stale `acl-manifests.json`, or a
+    /// tauri-build naming change — using the same `registered_commands` parser `build.rs` used
+    /// to derive the manifest in the first place. It is *not* independent of a parser dropout on
+    /// its own: if `registered_commands` lost half the list, `build.rs` would declare half a
+    /// manifest and this would still compare it against the same half. That guarantee is
+    /// transitive, not local — `every_command_is_registered_exactly_once` covers it, by
+    /// cross-checking the parser's output against an independent `#[tauri::command]` scan, so a
+    /// parser regression that silently dropped commands fails there rather than going unnoticed
+    /// here.
+    #[test]
+    fn the_generated_app_manifest_matches_the_handler_list() {
+        use std::collections::BTreeSet;
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/gen/schemas/acl-manifests.json");
+        let raw = std::fs::read_to_string(path)
+            .expect("gen/schemas/acl-manifests.json is written by build.rs on every build");
+        let manifests: serde_json::Value =
+            serde_json::from_str(&raw).expect("acl-manifests.json must parse");
+        let app = manifests.get("__app-acl__").expect(
+            "build.rs must declare an AppManifest — without it tauri skips the ACL for every \
+             app command",
+        );
+        let embedded: BTreeSet<String> = app["permissions"]
+            .as_object()
+            .expect("the app manifest has a permissions map")
+            .keys()
+            .cloned()
+            .collect();
+
+        let registered = crate::command_census::registered_commands(include_str!("lib.rs"))
+            .expect("lib.rs should contain a generate_handler! list");
+        let expected: BTreeSet<String> = registered
+            .iter()
+            .flat_map(|c| {
+                let allow = crate::command_census::allow_permission(c);
+                let deny = format!("deny-{}", &allow["allow-".len()..]);
+                [allow, deny]
+            })
+            .collect();
+
+        assert!(registered.len() >= 100, "the parser sees {} commands", registered.len());
+        assert_eq!(
+            embedded, expected,
+            "the embedded app manifest and generate_handler! disagree: build.rs and \
+             tauri-build should have produced the same list"
+        );
+        assert!(
+            app["permission_sets"].as_object().is_some_and(|s| s.is_empty()),
+            "no permission sets: every grant is a literal allow-* string in a capability file"
+        );
+        assert!(app["default_permission"].is_null(), "no app `default` permission set");
+    }
+
+    /// `build.rs`'s `check_tauri_config` (inline `app.security.capabilities`, a JSON5/TOML tauri
+    /// config, `TAURI_CONFIG`) only runs inside the build script, so it only re-runs on a clean
+    /// build or in CI — cargo's incremental build has no reason to notice a new
+    /// `tauri.<platform>.conf.json` dropped into an already-built tree (CLAUDE.md, "Known
+    /// limit"). This runs the same check, using the same `command_census` functions build.rs
+    /// calls, directly against the real `app/src-tauri` directory on every `cargo test`, so that
+    /// gap is closed locally too.
+    #[test]
+    fn the_tauri_config_capability_check_runs_against_the_real_tree() {
+        let dir = env!("CARGO_MANIFEST_DIR");
+        let mut problems = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("readable src-tauri/") {
+            let path = entry.expect("readable entry in src-tauri/").path();
+            let name = path
+                .file_name()
+                .expect("a directory entry has a file name")
+                .to_string_lossy()
+                .into_owned();
+            match crate::command_census::tauri_config_file(&name) {
+                None => {}
+                Some(false) => problems.push(format!(
+                    "{name}: the census reads JSON tauri configs only; a JSON5/TOML config \
+                     could declare capabilities it cannot see"
+                )),
+                Some(true) => {
+                    let json =
+                        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{name}: {e}"));
+                    problems.extend(crate::command_census::tauri_config_problem(&name, &json));
+                }
+            }
+        }
+        if let Ok(json) = std::env::var("TAURI_CONFIG") {
+            problems.extend(crate::command_census::tauri_config_problem("TAURI_CONFIG", &json));
+        }
+        assert!(
+            problems.is_empty(),
+            "cargo test found what build.rs would refuse on a clean build: {problems:?}"
+        );
     }
 }

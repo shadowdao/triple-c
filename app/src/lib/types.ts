@@ -954,3 +954,49 @@ export interface MigrationState {
   options: MigrationOptions;
   plan: MigrationPlan | null;
 }
+
+// ---- Terminal file viewer (commands/file_viewer_commands.rs) ----
+
+export interface ViewerLocation {
+  line: number | null;
+  col: number | null;
+  end_line: number | null;
+}
+
+export type ViewerTargetState =
+  | { kind: "resolved"; container_path: string }
+  | { kind: "choose"; candidates: string[] }
+  | { kind: "not_found"; tried: string[] };
+
+export interface ViewerState {
+  project_id: string;
+  project_name: string;
+  /** What was clicked, for the title and the not-found message. */
+  raw_path: string;
+  state: ViewerTargetState;
+  initial: ViewerLocation;
+}
+
+export interface ViewerFile {
+  contents_base64: string;
+  truncated: boolean;
+  size: number;
+  /** SHA-256 hex of the returned bytes; equals the file's hash when `truncated` is false. */
+  hash: string;
+  editable: boolean;
+  readonly_reason: string | null;
+}
+
+/** A successful save (`write.rs`'s `SavedFile`). */
+export interface ViewerSaved {
+  /** SHA-256 of the bytes written: the editor's new base hash. */
+  hash: string;
+  /** What the container hashed right after the swap; differs from `hash` only if another writer landed first. */
+  disk_hash: string;
+}
+
+export interface ViewerPoll {
+  exists: boolean;
+  hash: string | null;
+  size: number | null;
+}

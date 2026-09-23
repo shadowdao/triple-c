@@ -33,6 +33,15 @@
   /* Two radii only: controls and panels. */
   --radius-control: 6px;
   --radius-panel: 8px;
+  /* Syntax colours for the file viewer's editor (viewer/viewerTheme.ts). Same
+     GitHub-dark palette TerminalView.tsx already uses for ANSI, expressed as
+     tokens rather than hard-coded hex per the styling convention above. */
+  --syntax-keyword: #ff7b72;
+  --syntax-string: #a5d6ff;
+  --syntax-number: #79c0ff;
+  --syntax-function: #d2a8ff;
+  --syntax-type: #ffa657;
+  --syntax-property: #7ee787;
   color-scheme: dark;
 }
 

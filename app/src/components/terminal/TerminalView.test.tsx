@@ -5,10 +5,12 @@ import TerminalView, {
   createOsc8LinkHandler,
   supersedes,
 } from "./TerminalView";
+import { Terminal } from "@xterm/xterm";
 import { useAppState } from "../../store/appState";
 import {
   uploadHostFileToTerminal,
   openUrlExternal,
+  openFileViewer,
 } from "../../lib/tauri-commands";
 import {
   chooseSignInTarget,
@@ -123,6 +125,7 @@ vi.mock("../../lib/tauri-commands", () => ({
   getAuthBridgeStatus: vi.fn(async () => containerEnv.bridge),
   checkBrowserViewSupport: vi.fn(async () => containerEnv.detection),
   openUrlExternal: vi.fn(async () => {}),
+  openFileViewer: vi.fn(async () => {}),
 }));
 
 vi.mock("@tauri-apps/api/event", () => ({
@@ -1606,6 +1609,78 @@ describe("createOsc8LinkHandler — clicking a link Claude Code printed", () => 
     expect(hoverCard()).toBeNull();
   });
 
+  it("routes a file: target to the viewer and never to the opener", () => {
+    const onOpenFile = vi.fn();
+    const h = createOsc8LinkHandler(() => host, () => state, onOpenFile);
+    h.activate(click(), "file:///workspace/p/src/a.ts", range);
+    expect(onOpenFile).toHaveBeenCalledWith("/workspace/p/src/a.ts");
+    expect(openUrlExternal).not.toHaveBeenCalled();
+  });
+
+  it("with non-http targets now delivered, still refuses javascript: and garbage", () => {
+    const onOpenFile = vi.fn();
+    const h = createOsc8LinkHandler(() => host, () => state, onOpenFile);
+    h.activate(click(), "javascript:alert(1)", range);
+    h.activate(click(), "not a url", range);
+    h.hover?.(new MouseEvent("mousemove"), "javascript:alert(1)", range);
+    expect(onOpenFile).not.toHaveBeenCalled();
+    expect(openUrlExternal).not.toHaveBeenCalled();
+    // The refusal card (ruling (a)): present, no origin, never the target,
+    // never an offer to open it.
+    const card = hoverCard();
+    expect(card).not.toBeNull();
+    expect(card!.querySelector('[data-testid="osc8-hover-origin"]')).toBeNull();
+    expect(card!.textContent).toContain("will not be opened");
+    expect(card!.textContent).not.toContain("javascript:");
+    expect(card!.textContent).not.toContain("Open in viewer");
+  });
+
+  it("refuses a file: target whose escapes do not decode", () => {
+    const onOpenFile = vi.fn();
+    const h = createOsc8LinkHandler(() => host, () => state, onOpenFile);
+    h.activate(click(), "file:///workspace/%E0%A4%A", range);
+    h.hover?.(new MouseEvent("mousemove"), "file:///workspace/%E0%A4%A", range);
+    expect(onOpenFile).not.toHaveBeenCalled();
+    const card = hoverCard();
+    expect(card).not.toBeNull();
+    expect(card!.querySelector('[data-testid="osc8-hover-origin"]')).toBeNull();
+    expect(card!.textContent).toContain("will not be opened");
+    expect(card!.textContent).not.toContain("Open in viewer");
+  });
+
+  it("the file: hover card names the viewer and the path", () => {
+    const h = createOsc8LinkHandler(() => host, () => state, vi.fn());
+    h.hover?.(new MouseEvent("mousemove"), "file:///workspace/p/README.md", range);
+    expect(hoverCard()?.textContent).toContain("Open in viewer");
+    expect(hoverCard()?.textContent).toContain("/workspace/p/README.md");
+  });
+
+  it("shows a relative path's card with the path as printed (preflight P6)", () => {
+    const h = createOsc8LinkHandler(() => host, () => state, vi.fn());
+    h.showFileCard("src/foo.ts");
+    expect(hoverCard()?.textContent).toContain("Open in viewer");
+    expect(hoverCard()?.textContent).toContain("src/foo.ts");
+    h.dismiss();
+    expect(hoverCard()).toBeNull();
+  });
+
+  it("holds a file-path click to the modifier its card promised", () => {
+    const h = createOsc8LinkHandler(() => host, () => state, vi.fn());
+    state.mouseTracking = true;
+    h.showFileCard("src/foo.ts");
+    expect(hoverCard()?.textContent).toContain("Shift+click");
+    state.mouseTracking = false;
+    expect(h.opensFileLink(click())).toBe(false);
+    expect(h.opensFileLink(click({ shiftKey: true }))).toBe(true);
+    // A card drawn with nothing tracking promises nothing.
+    h.showFileCard("src/foo.ts");
+    expect(h.opensFileLink(click())).toBe(true);
+  });
+
+  it("declares allowNonHttpProtocols so file: targets reach it", () => {
+    expect(createOsc8LinkHandler(() => host, () => state).allowNonHttpProtocols).toBe(true);
+  });
+
   it("pushes the shared toast when the host opener fails", async () => {
     vi.mocked(openUrlExternal).mockRejectedValueOnce(new Error("no opener"));
 
@@ -1656,6 +1731,124 @@ describe("the link handler is wired into the terminal, and reads its live mode",
     expect(typeof handler.hover).toBe("function");
   });
 
+  it("opens a file: target in the viewer against the session's project", async () => {
+    vi.mocked(openFileViewer).mockClear();
+    mountSession("bash");
+
+    await act(async () => {
+      wiredHandler().activate(
+        new MouseEvent("click", { button: 0, detail: 1 }),
+        "file:///workspace/api/src/a%20b.ts",
+        range,
+      );
+      await Promise.resolve();
+    });
+
+    expect(openFileViewer).toHaveBeenCalledWith(
+      "p1", "/workspace/api/src/a b.ts", undefined, undefined, undefined,
+    );
+    expect(openUrlExternal).not.toHaveBeenCalled();
+  });
+
+  it("registers the file-path provider, which opens the viewer at the matched line", async () => {
+    vi.mocked(openFileViewer).mockClear();
+    const register = vi.spyOn(Terminal.prototype, "registerLinkProvider");
+    try {
+      mountSession("bash");
+      const provider = register.mock.calls.at(-1)?.[0];
+      if (!provider) throw new Error("no link provider was registered");
+
+      await write("Edited src/foo.ts:42 today");
+      const links = vi.fn();
+      provider.provideLinks(1, links);
+      const [link] = links.mock.calls[0][0];
+      expect(link.text).toBe("src/foo.ts:42");
+
+      await act(async () => {
+        link.activate(new MouseEvent("click", { button: 0, detail: 1 }), link.text);
+        await Promise.resolve();
+      });
+      expect(openFileViewer).toHaveBeenCalledWith("p1", "src/foo.ts", 42, undefined, undefined);
+    } finally {
+      register.mockRestore();
+    }
+  });
+
+  it("says so in a toast when the viewer refuses to open", async () => {
+    vi.mocked(openFileViewer).mockRejectedValueOnce(new Error("No such file: x.ts"));
+    mountSession("bash");
+
+    await act(async () => {
+      wiredHandler().activate(
+        new MouseEvent("click", { button: 0, detail: 1 }),
+        "file:///x.ts",
+        range,
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const toasts = useAppState.getState().toasts;
+    expect(toasts.at(-1)?.detail).toContain("No such file: x.ts");
+    expect(toasts.at(-1)?.dedupeKey).toBe("file-viewer-open");
+  });
+
+  it("holds a plain-text file link to the modifier its hover card promised", async () => {
+    vi.mocked(openFileViewer).mockClear();
+    const platform = navigator.platform;
+    Object.defineProperty(navigator, "platform", { value: "Linux x86_64", configurable: true });
+    const register = vi.spyOn(Terminal.prototype, "registerLinkProvider");
+    try {
+      mountSession("claude");
+      const provider = register.mock.calls.at(-1)?.[0];
+      if (!provider) throw new Error("no link provider was registered");
+      await write("Edited src/foo.ts:42 today");
+      const links = vi.fn();
+      provider.provideLinks(1, links);
+      const [link] = links.mock.calls[0][0];
+
+      await write("\x1b[?1002h");
+      link.hover?.(new MouseEvent("mousemove"), link.text);
+      expect(document.body.textContent).toContain("Shift+click to open");
+      await write("\x1b[?1002l");
+
+      await act(async () => {
+        link.activate(new MouseEvent("click", { button: 0, detail: 1 }), link.text);
+        await Promise.resolve();
+      });
+      expect(openFileViewer).not.toHaveBeenCalled();
+
+      await act(async () => {
+        link.activate(
+          new MouseEvent("click", { button: 0, detail: 1, shiftKey: true }),
+          link.text,
+        );
+        await Promise.resolve();
+      });
+      expect(openFileViewer).toHaveBeenCalledWith("p1", "src/foo.ts", 42, undefined, undefined);
+    } finally {
+      register.mockRestore();
+      Object.defineProperty(navigator, "platform", { value: platform, configurable: true });
+    }
+  });
+
+  it("says the project is not ready rather than doing nothing", async () => {
+    vi.mocked(openFileViewer).mockClear();
+    useAppState.setState({ sessions: [] });
+    render(<TerminalView sessionId="s-unknown" active />);
+
+    wiredHandler().activate(
+      new MouseEvent("click", { button: 0, detail: 1 }),
+      "file:///workspace/api/README.md",
+      range,
+    );
+
+    expect(openFileViewer).not.toHaveBeenCalled();
+    const toasts = useAppState.getState().toasts;
+    expect(toasts.at(-1)?.detail).toContain("not ready yet");
+    expect(toasts.at(-1)?.dedupeKey).toBe("file-viewer-open");
+  });
+
   // The gate has to ask the terminal, not a boolean captured at construction:
   // the mode changes whenever the container prints a DECSET, which is several
   // times a second in Claude Code.
@@ -1695,10 +1888,9 @@ describe("the link handler is wired into the terminal, and reads its live mode",
  *
  * `WebLinksAddon` matches rendered text and activates through the same
  * `Linkifier._handleMouseUp`, with the same absence of any check. It also
- * picks up links the OSC 8 handler never sees: `OscLinkProvider` drops a
- * non-http(s) hyperlink target before `linkHandler` is reached, which leaves
- * the addon free to match the *label* — so an OSC 8 with a `javascript:`
- * target and an `https://evil.tld/x` label arrives here and nowhere else.
+ * covers the plain-text URLs that carry no OSC 8 parameter at all. (Since the
+ * file viewer, `allowNonHttpProtocols` is on, so every OSC 8 target reaches
+ * the OSC 8 handler, which refuses anything but `file:` and `http(s):`.)
  * Both routes end at `openUrlExternal`, so both ask the same question first.
  */
 describe("the plain-text URL path is gated the same way", () => {

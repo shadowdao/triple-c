@@ -1,0 +1,16 @@
+{
+  "identifier": "file-viewer",
+  "description": "The terminal file viewer windows (`file-viewer-<n>`, opened by `open_file_viewer` on the app's own `viewer.html`). Same rules as `default.json`, including the layout checks: this file itself must stay a top-level `capabilities/*.json` with no `webviews` or `remote` key, or `build.rs` refuses the build rather than grant something the census cannot see. The five bare `allow-viewer-*` grants are the only app commands a viewer window can invoke: `build.rs` declares the AppManifest that makes tauri enforce that, and refuses any other bare grant in this file. The label gate inside `commands/file_viewer_commands.rs` is still what stops window A acting on window B's registry entry, because the ACL only decides which window may call. The rest of this file is the plugin-command surface a compromised viewer webview could reach, and it is the smallest one that lets the window work. `core:event:allow-listen`/`allow-unlisten` are for `file-viewer-goto` (Rust → this window; the viewer subscribes through `getCurrentWindow().listen`, because a bare `listen()` in *any* window receives an `emit_to`). `core:window:allow-destroy` is not optional: `getCurrentWindow().onCloseRequested` in @tauri-apps/api 2.11 makes Rust `prevent_close()` whenever a JS listener exists and then calls `destroy()` itself, so without this grant the window's X button does nothing once the unsaved-changes guard is installed. `allow-close` is deliberately absent — nothing calls it, and `destroy` is the only exit. No `set-title`/`set-focus`/`unminimize`: those are done from Rust when a second click targets an already-open file. `core:webview:allow-internal-toggle-devtools` is the same dev-only convenience `default.json` carries.",
+  "windows": ["file-viewer-*"],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "core:window:allow-destroy",
+    "core:webview:allow-internal-toggle-devtools",
+    "allow-viewer-get-state",
+    "allow-viewer-choose-file",
+    "allow-viewer-read-file",
+    "allow-viewer-poll-file",
+    "allow-viewer-write-file"
+  ]
+}

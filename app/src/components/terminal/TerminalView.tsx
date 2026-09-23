@@ -9,6 +9,7 @@ import { useAppState } from "../../store/appState";
 import { CLAUDE_SOFT_NEWLINE } from "../../lib/claudeInput";
 import {
   awsSsoRefresh,
+  openFileViewer,
   openPageInContainerBrowser,
   openUrlExternal,
   uploadHostFileToTerminal,
@@ -33,6 +34,8 @@ import UrlToast, {
 import { trimSelection } from "./trimSelection";
 import { resolveTerminalGpuRendering } from "../../lib/terminalRenderer";
 import TerminalContextMenu from "./TerminalContextMenu";
+import { createFilePathLinkProvider } from "./filePathLinkProvider";
+import type { FilePathMatch } from "../../lib/filePathLinks";
 
 interface Props {
   sessionId: string;
@@ -138,6 +141,40 @@ function reportOpenFailure(e: unknown) {
 }
 
 /**
+ * Open a path in the file viewer for this terminal's project, or say why not.
+ * The session record (and so the project) can arrive after the first render;
+ * a click in that window gets a toast rather than silently doing nothing.
+ */
+function openInViewer(
+  projectId: string | undefined,
+  path: string,
+  line?: number,
+  col?: number,
+  endLine?: number,
+): void {
+  if (!projectId) {
+    useAppState.getState().pushToast({
+      kind: "error",
+      message: "Could not open the file",
+      detail: "This terminal's project is not ready yet",
+      dedupeKey: "file-viewer-open",
+    });
+    return;
+  }
+  openFileViewer(projectId, path, line, col, endLine).catch(reportViewerFailure);
+}
+
+/** Report a file-viewer open that the backend refused (not found, no container, cap). */
+function reportViewerFailure(e: unknown): void {
+  useAppState.getState().pushToast({
+    kind: "error",
+    message: "Could not open the file",
+    detail: e instanceof Error ? e.message : String(e),
+    dedupeKey: "file-viewer-open",
+  });
+}
+
+/**
  * `ILinkHandler`, plus the one thing xterm never asks for.
  *
  * `leave` is only ever reached through `Linkifier._clearCurrentLink`, i.e. a
@@ -146,7 +183,50 @@ function reportOpenFailure(e: unknown) {
  * pane and is still there when the user comes back. {@link dismiss} is how the
  * view says "this pane is gone" without pretending to be a mouse event.
  */
-export type Osc8LinkHandler = ILinkHandler & { dismiss(): void };
+export type Osc8LinkHandler = ILinkHandler & {
+  dismiss(): void;
+  /**
+   * Draw the "Open in viewer" card for a path matched in plain text by the
+   * file-path link provider. Takes the raw path (a relative path stays
+   * relative — `file://src/x` would parse `src` as a host). Records the
+   * card's modifier promise exactly as `hover` does, so
+   * {@link opensFileLink} can hold the click to it.
+   */
+  showFileCard(path: string): void;
+  /**
+   * The file-path provider's click gate: {@link opensOnClick} with whatever
+   * the card on screen promised. There is only ever one card, and `clear()`
+   * resets the promise with it, so sharing the flag with OSC 8 links is exact.
+   */
+  opensFileLink(event: MouseEvent): boolean;
+};
+
+/**
+ * What an OSC 8 target is, now that `allowNonHttpProtocols` delivers every
+ * scheme here. `null` is anything this pane refuses: unparseable, a scheme
+ * other than `file:`/`http(s):`, or a `file:` path whose escapes do not decode.
+ * The host of a `file:` URL is ignored — `ls --hyperlink` writes the machine's
+ * hostname there, and the viewer only ever reads the container.
+ */
+function classifyOsc8Target(
+  text: string,
+): { kind: "file"; path: string } | { kind: "web" } | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(text);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol === "file:") {
+    try {
+      return { kind: "file", path: decodeURIComponent(parsed.pathname) };
+    } catch {
+      return null;
+    }
+  }
+  if (parsed.protocol === "http:" || parsed.protocol === "https:") return { kind: "web" };
+  return null;
+}
 
 /**
  * Is a program holding the mouse?
@@ -397,10 +477,14 @@ function opensOnClick(
  * @param readState samples {@link ClickContext} — a getter for the same
  *        reason, and the *only* reason: every one of those answers changes
  *        under us, between the hover and the click that follows it.
+ * @param onOpenFile receives the decoded path of a `file:` target, which
+ *        opens in the file viewer rather than the host browser. Without it a
+ *        `file:` target is inert.
  */
 export function createOsc8LinkHandler(
   getHost: () => HTMLElement | null,
   readState: () => ClickContext,
+  onOpenFile?: (path: string) => void,
 ): Osc8LinkHandler {
   let card: HTMLDivElement | null = null;
   /**
@@ -428,6 +512,64 @@ export function createOsc8LinkHandler(
     return el;
   };
 
+  const makeCard = (): HTMLDivElement => {
+    const el = document.createElement("div");
+    el.className = OSC8_HOVER_CLASS;
+    el.dataset.testid = "osc8-hover";
+    Object.assign(el.style, {
+      position: "absolute",
+      left: "8px",
+      bottom: "8px",
+      maxWidth: "calc(100% - 16px)",
+      boxSizing: "border-box",
+      zIndex: "30",
+      // The card lands under the pointer for a link in the bottom rows, and
+      // it is not a sibling the Linkifier hit-tests around (see
+      // `OSC8_HOVER_CLASS`). Without this, `screenElement` gets `mouseleave`
+      // the moment the card appears — card removed, pointer back on the
+      // link, card back: a flicker loop — and worse, the `mouseup` that
+      // activates the link lands on the card, so the link cannot be opened
+      // at all. Nothing here is interactive, so nothing is lost.
+      pointerEvents: "none",
+      display: "flex",
+      alignItems: "baseline",
+      gap: "6px",
+      padding: "3px 8px",
+      fontSize: "12px",
+      fontFamily: "monospace",
+      background: "var(--bg-secondary)",
+      border: "1px solid var(--border-color)",
+      // The origin wraps, so the card grows downward rather than sideways;
+      // this is the backstop for anything that still cannot fit.
+      overflow: "hidden",
+      borderRadius: "6px",
+      boxShadow: "var(--shadow-overlay)",
+      color: "var(--text-primary)",
+    } as Partial<CSSStyleDeclaration>);
+    return el;
+  };
+
+  /** "Open in viewer", the path, and the same hint line as a web link. */
+  const fillFileCard = (el: HTMLDivElement, path: string, ctx: ClickContext) => {
+    el.appendChild(span("Open in viewer", { fontWeight: "700", flexShrink: "0" }));
+    const pathEl = span(path, {
+      color: "var(--text-secondary)",
+      overflow: "hidden",
+      textOverflow: "ellipsis",
+      whiteSpace: "nowrap",
+      minWidth: "0",
+    });
+    pathEl.dataset.testid = "osc8-hover-path";
+    el.appendChild(pathEl);
+    el.appendChild(
+      span(openHintLabel(ctx), {
+        color: "var(--text-secondary)",
+        flexShrink: "0",
+        marginLeft: "4px",
+      }),
+    );
+  };
+
   return {
     activate(event, text) {
       // Opening the host browser is the one thing in this pane the container
@@ -435,6 +577,16 @@ export function createOsc8LinkHandler(
       // may provoke by accident. See `opensOnClick` — including the residual
       // it does not close.
       if (!opensOnClick(event, readState(), modifierPromised)) return;
+      const target = classifyOsc8Target(text);
+      if (!target) {
+        console.warn("Refusing to open a link with an unsupported or malformed target");
+        return;
+      }
+      if (target.kind === "file") {
+        if (!onOpenFile) return;
+        onOpenFile(target.path);
+        return;
+      }
       // Same sink and same rule as the WebLinksAddon branch: this came off the
       // container's output, so it is validated before it reaches the OS
       // opener. One implementation — `sanitizeRelayUrl` — on purpose.
@@ -456,39 +608,16 @@ export function createOsc8LinkHandler(
       // moved on by the time they click.
       modifierPromised = ctx.mouseTracking;
 
-      card = document.createElement("div");
-      card.className = OSC8_HOVER_CLASS;
-      card.dataset.testid = "osc8-hover";
-      Object.assign(card.style, {
-        position: "absolute",
-        left: "8px",
-        bottom: "8px",
-        maxWidth: "calc(100% - 16px)",
-        boxSizing: "border-box",
-        zIndex: "30",
-        // The card lands under the pointer for a link in the bottom rows, and
-        // it is not a sibling the Linkifier hit-tests around (see
-        // `OSC8_HOVER_CLASS`). Without this, `screenElement` gets `mouseleave`
-        // the moment the card appears — card removed, pointer back on the
-        // link, card back: a flicker loop — and worse, the `mouseup` that
-        // activates the link lands on the card, so the link cannot be opened
-        // at all. Nothing here is interactive, so nothing is lost.
-        pointerEvents: "none",
-        display: "flex",
-        alignItems: "baseline",
-        gap: "6px",
-        padding: "3px 8px",
-        fontSize: "12px",
-        fontFamily: "monospace",
-        background: "var(--bg-secondary)",
-        border: "1px solid var(--border-color)",
-        // The origin wraps, so the card grows downward rather than sideways;
-        // this is the backstop for anything that still cannot fit.
-        overflow: "hidden",
-        borderRadius: "6px",
-        boxShadow: "var(--shadow-overlay)",
-        color: "var(--text-primary)",
-      } as Partial<CSSStyleDeclaration>);
+      card = makeCard();
+
+      const target = classifyOsc8Target(text);
+      // Without a viewer to hand it to, a `file:` target falls through to the
+      // refusal card below rather than offering something the click won't do.
+      if (target?.kind === "file" && onOpenFile) {
+        fillFileCard(card, target.path, ctx);
+        host.appendChild(card);
+        return;
+      }
 
       const safe = sanitizeRelayUrl(text);
       const origin = safe && urlOrigin(safe);
@@ -549,6 +678,25 @@ export function createOsc8LinkHandler(
     leave: clear,
 
     dismiss: clear,
+
+    showFileCard(path) {
+      clear();
+      const host = getHost();
+      if (!host) return;
+      const ctx = readState();
+      // Same promise as `hover`: the card names a modifier, so the click is
+      // held to it even if the container drops tracking before it lands.
+      modifierPromised = ctx.mouseTracking;
+      card = makeCard();
+      fillFileCard(card, path, ctx);
+      host.appendChild(card);
+    },
+
+    opensFileLink(event) {
+      return opensOnClick(event, readState(), modifierPromised);
+    },
+
+    allowNonHttpProtocols: true,
   };
 }
 
@@ -573,6 +721,13 @@ export default function TerminalView({ sessionId, active }: Props) {
   const projectId = useAppState(
     (s) => s.sessions.find((sess) => sess.id === sessionId)?.projectId
   );
+  // The file viewer opens against the session's project. Read through a ref
+  // because the link handlers are built in the mount effect, keyed on
+  // `sessionId` only, and the session record can arrive after the first render.
+  const projectIdRef = useRef<string | undefined>(projectId);
+  useEffect(() => {
+    projectIdRef.current = projectId;
+  }, [projectId]);
 
   // Which program is on the other end of the PTY. Read through a ref because
   // the key handler is registered once, in the mount effect keyed on
@@ -882,6 +1037,7 @@ export default function TerminalView({ sessionId, active }: Props) {
       linkHandler: (osc8LinkHandlerRef.current = createOsc8LinkHandler(
         () => term.element ?? null,
         () => readClickContext(term),
+        (path) => openInViewer(projectIdRef.current, path),
       )),
       fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', Menlo, Monaco, monospace",
       theme: {
@@ -924,12 +1080,10 @@ export default function TerminalView({ sessionId, active }: Props) {
       // got a browser open on a plain click while it held the mouse, and a
       // double-click that merely selected a URL opened it.
       //
-      // It is also the only gate on a real bypass of the OSC 8 one:
-      // `OscLinkProvider` drops a hyperlink whose target is not http(s)
-      // *before* `linkHandler` sees it (`allowNonHttpProtocols` is unset), so
-      // an OSC 8 carrying a `javascript:` target and an `https://evil.tld/x`
-      // label leaves the addon free to match the label. That click arrives
-      // here and nowhere else.
+      // `allowNonHttpProtocols` is now **on**, so `OscLinkProvider` hands every
+      // OSC 8 target to `createOsc8LinkHandler`, which parses it and refuses
+      // anything but `file:` (the file viewer) and `http(s):` itself. This
+      // branch remains the only handler for plain-text URLs.
       //
       // No `modifierPromised`: this path paints an underline rather than a
       // card, so it promises the user nothing to be held to.
@@ -951,6 +1105,24 @@ export default function TerminalView({ sessionId, active }: Props) {
       openUrlExternal(safe).catch(reportOpenFailure);
     }, { urlRegex });
     term.loadAddon(webLinksAddon);
+
+    // File paths in plain text open in the file viewer. Registered after the
+    // addon so URLs are claimed first; the matcher also refuses anything
+    // inside a `scheme://` span. The hover card is the OSC 8 handler's, fed the
+    // raw path, and the click gate honours the modifier that card promised.
+    const filePathLinks = term.registerLinkProvider(
+      createFilePathLinkProvider(
+        term,
+        (m: FilePathMatch) =>
+          openInViewer(projectIdRef.current, m.path, m.line, m.col, m.endLine),
+        // Held to what the card promised, like OSC 8 links (see `showFileCard`).
+        (event) => osc8LinkHandlerRef.current?.opensFileLink(event) ?? false,
+        {
+          show: (path) => osc8LinkHandlerRef.current?.showFileCard(path),
+          hide: () => osc8LinkHandlerRef.current?.dismiss(),
+        },
+      ),
+    );
 
     term.open(containerRef.current);
 
@@ -1235,6 +1407,7 @@ export default function TerminalView({ sessionId, active }: Props) {
       resizeObserver.disconnect();
       try { webglRef.current?.dispose(); } catch { /* may already be disposed */ }
       webglRef.current = null;
+      filePathLinks.dispose();
       term.dispose();
       termRef.current = null;
       osc8LinkHandlerRef.current = null;

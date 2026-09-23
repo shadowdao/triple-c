@@ -345,6 +345,1386 @@
       "description": "Permission identifier",
       "oneOf": [
         {
+          "description": "Enables the acquire_claude_token command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-acquire-claude-token",
+          "markdownDescription": "Enables the acquire_claude_token command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the add_project command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-add-project",
+          "markdownDescription": "Enables the add_project command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the add_scheduled_task command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-add-scheduled-task",
+          "markdownDescription": "Enables the add_scheduled_task command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the apply_settings_import command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-apply-settings-import",
+          "markdownDescription": "Enables the apply_settings_import command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the aws_sso_refresh command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-aws-sso-refresh",
+          "markdownDescription": "Enables the aws_sso_refresh command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the build_gateway_image command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-build-gateway-image",
+          "markdownDescription": "Enables the build_gateway_image command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the build_image command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-build-image",
+          "markdownDescription": "Enables the build_image command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the build_stt_image command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-build-stt-image",
+          "markdownDescription": "Enables the build_stt_image command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cancel_claude_token command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-cancel-claude-token",
+          "markdownDescription": "Enables the cancel_claude_token command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the check_browser_view_support command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-check-browser-view-support",
+          "markdownDescription": "Enables the check_browser_view_support command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the check_docker command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-check-docker",
+          "markdownDescription": "Enables the check_docker command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the check_for_updates command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-check-for-updates",
+          "markdownDescription": "Enables the check_for_updates command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the check_gateway_health command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-check-gateway-health",
+          "markdownDescription": "Enables the check_gateway_health command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the check_image_exists command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-check-image-exists",
+          "markdownDescription": "Enables the check_image_exists command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the check_image_update command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-check-image-update",
+          "markdownDescription": "Enables the check_image_update command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the clear_claude_token command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-clear-claude-token",
+          "markdownDescription": "Enables the clear_claude_token command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the clear_gateway_api_key command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-clear-gateway-api-key",
+          "markdownDescription": "Enables the clear_gateway_api_key command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the clear_scheduler_notifications command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-clear-scheduler-notifications",
+          "markdownDescription": "Enables the clear_scheduler_notifications command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the close_browser_view_popout command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-close-browser-view-popout",
+          "markdownDescription": "Enables the close_browser_view_popout command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the close_container_page command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-close-container-page",
+          "markdownDescription": "Enables the close_container_page command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the close_terminal_session command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-close-terminal-session",
+          "markdownDescription": "Enables the close_terminal_session command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the confirm_migration command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-confirm-migration",
+          "markdownDescription": "Enables the confirm_migration command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the create_container_directory command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-create-container-directory",
+          "markdownDescription": "Enables the create_container_directory command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the delete_note command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-delete-note",
+          "markdownDescription": "Enables the delete_note command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the detect_aws_config command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-detect-aws-config",
+          "markdownDescription": "Enables the detect_aws_config command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the detect_host_timezone command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-detect-host-timezone",
+          "markdownDescription": "Enables the detect_host_timezone command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the detect_install_options command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-detect-install-options",
+          "markdownDescription": "Enables the detect_install_options command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the download_container_backup command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-download-container-backup",
+          "markdownDescription": "Enables the download_container_backup command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the download_container_file command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-download-container-file",
+          "markdownDescription": "Enables the download_container_file command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the export_settings command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-export-settings",
+          "markdownDescription": "Enables the export_settings command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_app_version command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-app-version",
+          "markdownDescription": "Enables the get_app_version command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_auth_bridge_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-auth-bridge-status",
+          "markdownDescription": "Enables the get_auth_bridge_status command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_browser_view_match_window command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-browser-view-match-window",
+          "markdownDescription": "Enables the get_browser_view_match_window command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_browser_view_popout_state command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-browser-view-popout-state",
+          "markdownDescription": "Enables the get_browser_view_popout_state command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_browser_view_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-browser-view-status",
+          "markdownDescription": "Enables the get_browser_view_status command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_container_info command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-container-info",
+          "markdownDescription": "Enables the get_container_info command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_container_page_state command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-container-page-state",
+          "markdownDescription": "Enables the get_container_page_state command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_container_staleness command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-container-staleness",
+          "markdownDescription": "Enables the get_container_staleness command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_gateway_auth_token command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-gateway-auth-token",
+          "markdownDescription": "Enables the get_gateway_auth_token command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_gateway_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-gateway-status",
+          "markdownDescription": "Enables the get_gateway_status command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_help_content command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-help-content",
+          "markdownDescription": "Enables the get_help_content command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_migration_state command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-migration-state",
+          "markdownDescription": "Enables the get_migration_state command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_scheduled_task_log command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-scheduled-task-log",
+          "markdownDescription": "Enables the get_scheduled_task_log command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_scheduler_notifications command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-scheduler-notifications",
+          "markdownDescription": "Enables the get_scheduler_notifications command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_settings command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-settings",
+          "markdownDescription": "Enables the get_settings command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_stt_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-stt-status",
+          "markdownDescription": "Enables the get_stt_status command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_web_terminal_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-web-terminal-status",
+          "markdownDescription": "Enables the get_web_terminal_status command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the has_claude_token command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-has-claude-token",
+          "markdownDescription": "Enables the has_claude_token command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the inspect_ca_cert_path command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-inspect-ca-cert-path",
+          "markdownDescription": "Enables the inspect_ca_cert_path command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the install_browser_view_browser command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-install-browser-view-browser",
+          "markdownDescription": "Enables the install_browser_view_browser command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the install_browser_view_support command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-install-browser-view-support",
+          "markdownDescription": "Enables the install_browser_view_support command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the list_aws_profiles command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-list-aws-profiles",
+          "markdownDescription": "Enables the list_aws_profiles command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the list_claude_sessions command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-list-claude-sessions",
+          "markdownDescription": "Enables the list_claude_sessions command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the list_container_capabilities command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-list-container-capabilities",
+          "markdownDescription": "Enables the list_container_capabilities command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the list_container_files command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-list-container-files",
+          "markdownDescription": "Enables the list_container_files command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the list_notes command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-list-notes",
+          "markdownDescription": "Enables the list_notes command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the list_projects command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-list-projects",
+          "markdownDescription": "Enables the list_projects command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the list_scheduled_tasks command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-list-scheduled-tasks",
+          "markdownDescription": "Enables the list_scheduled_tasks command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the migrate_project_to_base command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-migrate-project-to-base",
+          "markdownDescription": "Enables the migrate_project_to_base command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the open_browser_view_popout command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-open-browser-view-popout",
+          "markdownDescription": "Enables the open_browser_view_popout command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the open_file_viewer command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-open-file-viewer",
+          "markdownDescription": "Enables the open_file_viewer command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the open_page_in_container_browser command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-open-page-in-container-browser",
+          "markdownDescription": "Enables the open_page_in_container_browser command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the open_terminal_session command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-open-terminal-session",
+          "markdownDescription": "Enables the open_terminal_session command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the open_url_external command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-open-url-external",
+          "markdownDescription": "Enables the open_url_external command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the paste_image_to_terminal command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-paste-image-to-terminal",
+          "markdownDescription": "Enables the paste_image_to_terminal command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the preview_settings_import command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-preview-settings-import",
+          "markdownDescription": "Enables the preview_settings_import command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the pull_gateway_image command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-pull-gateway-image",
+          "markdownDescription": "Enables the pull_gateway_image command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the pull_image command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-pull-image",
+          "markdownDescription": "Enables the pull_image command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the pull_stt_image command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-pull-stt-image",
+          "markdownDescription": "Enables the pull_stt_image command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the read_container_file command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-read-container-file",
+          "markdownDescription": "Enables the read_container_file command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the rebuild_project_container command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-rebuild-project-container",
+          "markdownDescription": "Enables the rebuild_project_container command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the reconcile_project_statuses command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-reconcile-project-statuses",
+          "markdownDescription": "Enables the reconcile_project_statuses command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the regenerate_gateway_auth_token command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-regenerate-gateway-auth-token",
+          "markdownDescription": "Enables the regenerate_gateway_auth_token command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the regenerate_web_terminal_token command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-regenerate-web-terminal-token",
+          "markdownDescription": "Enables the regenerate_web_terminal_token command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the remove_project command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-remove-project",
+          "markdownDescription": "Enables the remove_project command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the remove_scheduled_task command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-remove-scheduled-task",
+          "markdownDescription": "Enables the remove_scheduled_task command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the rename_container_path command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-rename-container-path",
+          "markdownDescription": "Enables the rename_container_path command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the resume_session_command command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-resume-session-command",
+          "markdownDescription": "Enables the resume_session_command command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the rollback_migration command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-rollback-migration",
+          "markdownDescription": "Enables the rollback_migration command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the run_docker_install command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-run-docker-install",
+          "markdownDescription": "Enables the run_docker_install command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the run_scheduled_task_now command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-run-scheduled-task-now",
+          "markdownDescription": "Enables the run_scheduled_task_now command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the save_note command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-save-note",
+          "markdownDescription": "Enables the save_note command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the send_audio_data command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-send-audio-data",
+          "markdownDescription": "Enables the send_audio_data command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_auth_bridge_enabled command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-auth-bridge-enabled",
+          "markdownDescription": "Enables the set_auth_bridge_enabled command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_browser_view_enabled command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-browser-view-enabled",
+          "markdownDescription": "Enables the set_browser_view_enabled command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_browser_view_match_window command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-browser-view-match-window",
+          "markdownDescription": "Enables the set_browser_view_match_window command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_browser_view_popout_always_on_top command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-browser-view-popout-always-on-top",
+          "markdownDescription": "Enables the set_browser_view_popout_always_on_top command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_container_page_viewport command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-container-page-viewport",
+          "markdownDescription": "Enables the set_container_page_viewport command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_gateway_api_key command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-gateway-api-key",
+          "markdownDescription": "Enables the set_gateway_api_key command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_scheduled_task_enabled command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-scheduled-task-enabled",
+          "markdownDescription": "Enables the set_scheduled_task_enabled command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the start_audio_bridge command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-start-audio-bridge",
+          "markdownDescription": "Enables the start_audio_bridge command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the start_gateway command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-start-gateway",
+          "markdownDescription": "Enables the start_gateway command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the start_project_container command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-start-project-container",
+          "markdownDescription": "Enables the start_project_container command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the start_stt command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-start-stt",
+          "markdownDescription": "Enables the start_stt command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the start_web_terminal command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-start-web-terminal",
+          "markdownDescription": "Enables the start_web_terminal command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the stop_audio_bridge command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-stop-audio-bridge",
+          "markdownDescription": "Enables the stop_audio_bridge command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the stop_gateway command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-stop-gateway",
+          "markdownDescription": "Enables the stop_gateway command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the stop_project_container command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-stop-project-container",
+          "markdownDescription": "Enables the stop_project_container command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the stop_stt command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-stop-stt",
+          "markdownDescription": "Enables the stop_stt command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the stop_web_terminal command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-stop-web-terminal",
+          "markdownDescription": "Enables the stop_web_terminal command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the submit_claude_token_code command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-submit-claude-token-code",
+          "markdownDescription": "Enables the submit_claude_token_code command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the sweep_claude_token_snapshots command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-sweep-claude-token-snapshots",
+          "markdownDescription": "Enables the sweep_claude_token_snapshots command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the terminal_input command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-terminal-input",
+          "markdownDescription": "Enables the terminal_input command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the terminal_resize command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-terminal-resize",
+          "markdownDescription": "Enables the terminal_resize command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the transcribe_audio command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-transcribe-audio",
+          "markdownDescription": "Enables the transcribe_audio command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the update_project command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-update-project",
+          "markdownDescription": "Enables the update_project command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the update_scheduled_task command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-update-scheduled-task",
+          "markdownDescription": "Enables the update_scheduled_task command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the update_settings command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-update-settings",
+          "markdownDescription": "Enables the update_settings command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the upload_files_to_container command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-upload-files-to-container",
+          "markdownDescription": "Enables the upload_files_to_container command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the upload_host_file_to_terminal command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-upload-host-file-to-terminal",
+          "markdownDescription": "Enables the upload_host_file_to_terminal command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the viewer_choose_file command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-viewer-choose-file",
+          "markdownDescription": "Enables the viewer_choose_file command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the viewer_get_state command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-viewer-get-state",
+          "markdownDescription": "Enables the viewer_get_state command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the viewer_poll_file command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-viewer-poll-file",
+          "markdownDescription": "Enables the viewer_poll_file command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the viewer_read_file command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-viewer-read-file",
+          "markdownDescription": "Enables the viewer_read_file command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the viewer_write_file command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-viewer-write-file",
+          "markdownDescription": "Enables the viewer_write_file command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the acquire_claude_token command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-acquire-claude-token",
+          "markdownDescription": "Denies the acquire_claude_token command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the add_project command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-add-project",
+          "markdownDescription": "Denies the add_project command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the add_scheduled_task command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-add-scheduled-task",
+          "markdownDescription": "Denies the add_scheduled_task command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the apply_settings_import command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-apply-settings-import",
+          "markdownDescription": "Denies the apply_settings_import command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the aws_sso_refresh command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-aws-sso-refresh",
+          "markdownDescription": "Denies the aws_sso_refresh command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the build_gateway_image command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-build-gateway-image",
+          "markdownDescription": "Denies the build_gateway_image command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the build_image command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-build-image",
+          "markdownDescription": "Denies the build_image command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the build_stt_image command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-build-stt-image",
+          "markdownDescription": "Denies the build_stt_image command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cancel_claude_token command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-cancel-claude-token",
+          "markdownDescription": "Denies the cancel_claude_token command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the check_browser_view_support command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-check-browser-view-support",
+          "markdownDescription": "Denies the check_browser_view_support command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the check_docker command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-check-docker",
+          "markdownDescription": "Denies the check_docker command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the check_for_updates command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-check-for-updates",
+          "markdownDescription": "Denies the check_for_updates command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the check_gateway_health command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-check-gateway-health",
+          "markdownDescription": "Denies the check_gateway_health command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the check_image_exists command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-check-image-exists",
+          "markdownDescription": "Denies the check_image_exists command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the check_image_update command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-check-image-update",
+          "markdownDescription": "Denies the check_image_update command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the clear_claude_token command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-clear-claude-token",
+          "markdownDescription": "Denies the clear_claude_token command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the clear_gateway_api_key command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-clear-gateway-api-key",
+          "markdownDescription": "Denies the clear_gateway_api_key command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the clear_scheduler_notifications command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-clear-scheduler-notifications",
+          "markdownDescription": "Denies the clear_scheduler_notifications command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the close_browser_view_popout command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-close-browser-view-popout",
+          "markdownDescription": "Denies the close_browser_view_popout command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the close_container_page command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-close-container-page",
+          "markdownDescription": "Denies the close_container_page command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the close_terminal_session command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-close-terminal-session",
+          "markdownDescription": "Denies the close_terminal_session command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the confirm_migration command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-confirm-migration",
+          "markdownDescription": "Denies the confirm_migration command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the create_container_directory command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-create-container-directory",
+          "markdownDescription": "Denies the create_container_directory command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the delete_note command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-delete-note",
+          "markdownDescription": "Denies the delete_note command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the detect_aws_config command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-detect-aws-config",
+          "markdownDescription": "Denies the detect_aws_config command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the detect_host_timezone command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-detect-host-timezone",
+          "markdownDescription": "Denies the detect_host_timezone command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the detect_install_options command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-detect-install-options",
+          "markdownDescription": "Denies the detect_install_options command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the download_container_backup command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-download-container-backup",
+          "markdownDescription": "Denies the download_container_backup command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the download_container_file command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-download-container-file",
+          "markdownDescription": "Denies the download_container_file command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the export_settings command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-export-settings",
+          "markdownDescription": "Denies the export_settings command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_app_version command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-app-version",
+          "markdownDescription": "Denies the get_app_version command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_auth_bridge_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-auth-bridge-status",
+          "markdownDescription": "Denies the get_auth_bridge_status command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_browser_view_match_window command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-browser-view-match-window",
+          "markdownDescription": "Denies the get_browser_view_match_window command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_browser_view_popout_state command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-browser-view-popout-state",
+          "markdownDescription": "Denies the get_browser_view_popout_state command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_browser_view_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-browser-view-status",
+          "markdownDescription": "Denies the get_browser_view_status command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_container_info command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-container-info",
+          "markdownDescription": "Denies the get_container_info command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_container_page_state command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-container-page-state",
+          "markdownDescription": "Denies the get_container_page_state command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_container_staleness command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-container-staleness",
+          "markdownDescription": "Denies the get_container_staleness command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_gateway_auth_token command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-gateway-auth-token",
+          "markdownDescription": "Denies the get_gateway_auth_token command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_gateway_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-gateway-status",
+          "markdownDescription": "Denies the get_gateway_status command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_help_content command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-help-content",
+          "markdownDescription": "Denies the get_help_content command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_migration_state command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-migration-state",
+          "markdownDescription": "Denies the get_migration_state command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_scheduled_task_log command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-scheduled-task-log",
+          "markdownDescription": "Denies the get_scheduled_task_log command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_scheduler_notifications command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-scheduler-notifications",
+          "markdownDescription": "Denies the get_scheduler_notifications command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_settings command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-settings",
+          "markdownDescription": "Denies the get_settings command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_stt_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-stt-status",
+          "markdownDescription": "Denies the get_stt_status command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_web_terminal_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-web-terminal-status",
+          "markdownDescription": "Denies the get_web_terminal_status command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the has_claude_token command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-has-claude-token",
+          "markdownDescription": "Denies the has_claude_token command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the inspect_ca_cert_path command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-inspect-ca-cert-path",
+          "markdownDescription": "Denies the inspect_ca_cert_path command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the install_browser_view_browser command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-install-browser-view-browser",
+          "markdownDescription": "Denies the install_browser_view_browser command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the install_browser_view_support command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-install-browser-view-support",
+          "markdownDescription": "Denies the install_browser_view_support command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the list_aws_profiles command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-list-aws-profiles",
+          "markdownDescription": "Denies the list_aws_profiles command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the list_claude_sessions command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-list-claude-sessions",
+          "markdownDescription": "Denies the list_claude_sessions command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the list_container_capabilities command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-list-container-capabilities",
+          "markdownDescription": "Denies the list_container_capabilities command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the list_container_files command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-list-container-files",
+          "markdownDescription": "Denies the list_container_files command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the list_notes command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-list-notes",
+          "markdownDescription": "Denies the list_notes command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the list_projects command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-list-projects",
+          "markdownDescription": "Denies the list_projects command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the list_scheduled_tasks command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-list-scheduled-tasks",
+          "markdownDescription": "Denies the list_scheduled_tasks command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the migrate_project_to_base command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-migrate-project-to-base",
+          "markdownDescription": "Denies the migrate_project_to_base command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the open_browser_view_popout command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-open-browser-view-popout",
+          "markdownDescription": "Denies the open_browser_view_popout command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the open_file_viewer command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-open-file-viewer",
+          "markdownDescription": "Denies the open_file_viewer command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the open_page_in_container_browser command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-open-page-in-container-browser",
+          "markdownDescription": "Denies the open_page_in_container_browser command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the open_terminal_session command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-open-terminal-session",
+          "markdownDescription": "Denies the open_terminal_session command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the open_url_external command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-open-url-external",
+          "markdownDescription": "Denies the open_url_external command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the paste_image_to_terminal command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-paste-image-to-terminal",
+          "markdownDescription": "Denies the paste_image_to_terminal command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the preview_settings_import command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-preview-settings-import",
+          "markdownDescription": "Denies the preview_settings_import command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the pull_gateway_image command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-pull-gateway-image",
+          "markdownDescription": "Denies the pull_gateway_image command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the pull_image command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-pull-image",
+          "markdownDescription": "Denies the pull_image command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the pull_stt_image command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-pull-stt-image",
+          "markdownDescription": "Denies the pull_stt_image command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the read_container_file command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-read-container-file",
+          "markdownDescription": "Denies the read_container_file command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the rebuild_project_container command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-rebuild-project-container",
+          "markdownDescription": "Denies the rebuild_project_container command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the reconcile_project_statuses command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-reconcile-project-statuses",
+          "markdownDescription": "Denies the reconcile_project_statuses command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the regenerate_gateway_auth_token command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-regenerate-gateway-auth-token",
+          "markdownDescription": "Denies the regenerate_gateway_auth_token command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the regenerate_web_terminal_token command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-regenerate-web-terminal-token",
+          "markdownDescription": "Denies the regenerate_web_terminal_token command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the remove_project command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-remove-project",
+          "markdownDescription": "Denies the remove_project command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the remove_scheduled_task command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-remove-scheduled-task",
+          "markdownDescription": "Denies the remove_scheduled_task command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the rename_container_path command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-rename-container-path",
+          "markdownDescription": "Denies the rename_container_path command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the resume_session_command command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-resume-session-command",
+          "markdownDescription": "Denies the resume_session_command command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the rollback_migration command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-rollback-migration",
+          "markdownDescription": "Denies the rollback_migration command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the run_docker_install command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-run-docker-install",
+          "markdownDescription": "Denies the run_docker_install command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the run_scheduled_task_now command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-run-scheduled-task-now",
+          "markdownDescription": "Denies the run_scheduled_task_now command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the save_note command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-save-note",
+          "markdownDescription": "Denies the save_note command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the send_audio_data command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-send-audio-data",
+          "markdownDescription": "Denies the send_audio_data command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_auth_bridge_enabled command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-auth-bridge-enabled",
+          "markdownDescription": "Denies the set_auth_bridge_enabled command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_browser_view_enabled command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-browser-view-enabled",
+          "markdownDescription": "Denies the set_browser_view_enabled command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_browser_view_match_window command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-browser-view-match-window",
+          "markdownDescription": "Denies the set_browser_view_match_window command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_browser_view_popout_always_on_top command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-browser-view-popout-always-on-top",
+          "markdownDescription": "Denies the set_browser_view_popout_always_on_top command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_container_page_viewport command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-container-page-viewport",
+          "markdownDescription": "Denies the set_container_page_viewport command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_gateway_api_key command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-gateway-api-key",
+          "markdownDescription": "Denies the set_gateway_api_key command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_scheduled_task_enabled command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-scheduled-task-enabled",
+          "markdownDescription": "Denies the set_scheduled_task_enabled command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the start_audio_bridge command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-start-audio-bridge",
+          "markdownDescription": "Denies the start_audio_bridge command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the start_gateway command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-start-gateway",
+          "markdownDescription": "Denies the start_gateway command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the start_project_container command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-start-project-container",
+          "markdownDescription": "Denies the start_project_container command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the start_stt command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-start-stt",
+          "markdownDescription": "Denies the start_stt command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the start_web_terminal command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-start-web-terminal",
+          "markdownDescription": "Denies the start_web_terminal command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the stop_audio_bridge command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-stop-audio-bridge",
+          "markdownDescription": "Denies the stop_audio_bridge command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the stop_gateway command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-stop-gateway",
+          "markdownDescription": "Denies the stop_gateway command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the stop_project_container command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-stop-project-container",
+          "markdownDescription": "Denies the stop_project_container command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the stop_stt command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-stop-stt",
+          "markdownDescription": "Denies the stop_stt command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the stop_web_terminal command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-stop-web-terminal",
+          "markdownDescription": "Denies the stop_web_terminal command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the submit_claude_token_code command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-submit-claude-token-code",
+          "markdownDescription": "Denies the submit_claude_token_code command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the sweep_claude_token_snapshots command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-sweep-claude-token-snapshots",
+          "markdownDescription": "Denies the sweep_claude_token_snapshots command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the terminal_input command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-terminal-input",
+          "markdownDescription": "Denies the terminal_input command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the terminal_resize command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-terminal-resize",
+          "markdownDescription": "Denies the terminal_resize command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the transcribe_audio command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-transcribe-audio",
+          "markdownDescription": "Denies the transcribe_audio command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the update_project command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-update-project",
+          "markdownDescription": "Denies the update_project command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the update_scheduled_task command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-update-scheduled-task",
+          "markdownDescription": "Denies the update_scheduled_task command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the update_settings command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-update-settings",
+          "markdownDescription": "Denies the update_settings command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the upload_files_to_container command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-upload-files-to-container",
+          "markdownDescription": "Denies the upload_files_to_container command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the upload_host_file_to_terminal command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-upload-host-file-to-terminal",
+          "markdownDescription": "Denies the upload_host_file_to_terminal command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the viewer_choose_file command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-viewer-choose-file",
+          "markdownDescription": "Denies the viewer_choose_file command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the viewer_get_state command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-viewer-get-state",
+          "markdownDescription": "Denies the viewer_get_state command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the viewer_poll_file command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-viewer-poll-file",
+          "markdownDescription": "Denies the viewer_poll_file command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the viewer_read_file command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-viewer-read-file",
+          "markdownDescription": "Denies the viewer_read_file command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the viewer_write_file command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-viewer-write-file",
+          "markdownDescription": "Denies the viewer_write_file command without any pre-configured scope."
+        },
+        {
           "description": "Default core plugins set.\n#### This default permission set includes:\n\n- `core:path:default`\n- `core:event:default`\n- `core:window:default`\n- `core:webview:default`\n- `core:app:default`\n- `core:image:default`\n- `core:resources:default`\n- `core:menu:default`\n- `core:tray:default`",
           "type": "string",
           "const": "core:default",

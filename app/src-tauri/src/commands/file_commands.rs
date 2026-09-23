@@ -46,7 +46,7 @@ pub struct FileContents {
 /// Hard ceiling on a single viewer read, whatever the caller asks for. The tar
 /// path buffers the whole payload in host RAM, so a caller-supplied cap is not
 /// something to take on trust.
-const MAX_READ_BYTES: u64 = 8 * 1024 * 1024;
+pub(crate) const MAX_READ_BYTES: u64 = 8 * 1024 * 1024;
 
 #[tauri::command]
 pub async fn list_container_files(
@@ -352,7 +352,7 @@ const CONTAINER_WRITE_ROOTS: &[&str] = &["/workspace", "/home/claude", "/tmp"];
 ///
 /// `what` names the parameter in the error, because these messages are shown to
 /// a user who is looking at a folder, not at argv.
-fn validate_container_path(what: &str, path: &str) -> Result<(), String> {
+pub(crate) fn validate_container_path(what: &str, path: &str) -> Result<(), String> {
     if path.is_empty() {
         return Err(format!("{} path cannot be empty", what));
     }
@@ -394,7 +394,7 @@ fn validate_container_path(what: &str, path: &str) -> Result<(), String> {
 /// directly. What it buys is that the *panel* keeps its promise — the roots
 /// named in the refusal are the roots it writes to — and that a mis-aimed drop
 /// cannot quietly land outside them.
-fn validate_container_write_path(what: &str, path: &str) -> Result<(), String> {
+pub(crate) fn validate_container_write_path(what: &str, path: &str) -> Result<(), String> {
     validate_container_path(what, path)?;
     if CONTAINER_WRITE_ROOTS
         .iter()
@@ -1178,12 +1178,12 @@ fn push_capped(buf: &mut String, frame: &[u8]) {
 }
 
 /// One regular file's bytes, pulled out of a container.
-struct FetchedFile {
-    bytes: Vec<u8>,
+pub(crate) struct FetchedFile {
+    pub(crate) bytes: Vec<u8>,
     /// The size the tar header declared, i.e. the file's real size — which is
     /// not `bytes.len()` once `max_bytes` has cut the read short.
-    size: u64,
-    truncated: bool,
+    pub(crate) size: u64,
+    pub(crate) truncated: bool,
 }
 
 /// Fetch a single regular file from a container as exact bytes.
@@ -1202,7 +1202,7 @@ struct FetchedFile {
 /// file — or the whole *directory tree*, since the type check happens after the
 /// read — landed in host RAM twice. This function buffers, so every caller of
 /// it must name a ceiling.
-async fn fetch_container_file(
+pub(crate) async fn fetch_container_file(
     container_id: &str,
     container_path: &str,
     max_bytes: u64,
@@ -1448,6 +1448,14 @@ pub async fn create_container_directory(
     Ok(dest)
 }
 
+/// Every "container is not running" refusal starts with this, so a caller (the file
+/// viewer's poll, `app/src/viewer/ipcMessages.ts`) can tell it apart from any other failure.
+pub(crate) const NOT_RUNNING_PREFIX: &str = "Start the project before";
+
+pub(crate) fn not_running_message(action: &str, why: &str) -> String {
+    format!("{} {} — {}.", NOT_RUNNING_PREFIX, action, why)
+}
+
 /// Refuse, in a sentence, before a Docker error has to speak for us.
 ///
 /// Both file transfers and the backup run through `docker exec`, which needs a
@@ -1456,7 +1464,7 @@ pub async fn create_container_directory(
 /// upload it surfaces even less usefully: `resolve_container_dir`'s `realpath`
 /// is the first thing to touch the container, so a stopped project fails inside
 /// path *validation* and reads like the path was the problem.
-async fn require_running(container_id: &str, action: &str) -> Result<(), String> {
+pub(crate) async fn require_running(container_id: &str, action: &str) -> Result<(), String> {
     let docker = get_docker()?;
     let running = docker
         .inspect_container(container_id, None)
@@ -1468,10 +1476,7 @@ async fn require_running(container_id: &str, action: &str) -> Result<(), String>
     if running {
         return Ok(());
     }
-    Err(format!(
-        "Start the project before {} — it runs inside the running container.",
-        action
-    ))
+    Err(not_running_message(action, "it runs inside the running container"))
 }
 
 /// Copy one regular file out of a container onto a host path the user chose in
@@ -2011,7 +2016,7 @@ async fn upload_one(
 /// call site for why each of those three matters; the short version is that
 /// this text ends up inside a toast that renders above every modal, and its
 /// author is the container.
-fn clip_container_text(text: &str) -> String {
+pub(crate) fn clip_container_text(text: &str) -> String {
     const MAX: usize = 200;
     let flattened: String = text
         .trim()
