@@ -7,6 +7,8 @@ name: Build App (Preview)
 # This is also the **PR build check**: it compiles Linux, macOS and Windows, so
 # a push that breaks any of them fails here. Its `test` job runs vitest and
 # `cargo test` too, so a push that breaks either suite fails here as well.
+# Previews are not code-signed (releases are, in build-app.yml): see the
+# comment on the Windows job's "Build Tauri app" step.
 # build-app.yml used to do the build-check job in parallel and publish nothing,
 # which meant six OS builds per push and one unreachable set of bundles; it is
 # now releases-only.
@@ -669,7 +671,10 @@ jobs:
       - name: Install Tauri CLI via cargo
         run: |
           set "PATH=%USERPROFILE%\.cargo\bin;C:\Program Files\nodejs;%PATH%"
-          cargo install tauri-cli --version "^2"
+          rem Pinned to the @tauri-apps/cli version in app/package-lock.json, which
+          rem the Linux and macOS jobs run, and kept identical to build-app.yml so
+          rem a preview is built by the same bundler as the release it previews.
+          cargo install tauri-cli --version "=2.11.0" --locked
 
       - name: Fix npm platform detection
         run: |
@@ -692,13 +697,21 @@ jobs:
 
       - name: Build Tauri app
         working-directory: ./app
+        # Previews are not code-signed: signing is metered, previews are built
+        # on every PR push, and a PR's workflow runs the PR's own code - so the
+        # signing secrets stay out of this workflow entirely. Releases are
+        # signed in build-app.yml.
+        #
+        # beforeBuildCommand is blanked through --config because the frontend
+        # was built in the step above. Not TAURI_CONFIG: the v2 CLI never
+        # reads that variable, and the inline one this step used to set was a
+        # no-op.
         env:
-          TAURI_CONFIG: "{\"build\":{\"beforeBuildCommand\":\"\"}}"
           # See the matching comment on the Linux job's "Build Tauri app" step.
           TRIPLE_C_BUILD_SUFFIX: ${{ needs.compute-version.outputs.suffix }}
         run: |
           set "PATH=%USERPROFILE%\.cargo\bin;C:\Program Files\nodejs;%PATH%"
-          cargo tauri build
+          cargo tauri build --config "{\"build\":{\"beforeBuildCommand\":\"\"}}"
 
       - name: Collect artifacts
         run: |

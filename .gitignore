@@ -16,3 +16,6 @@ screenshot_for_fix/
 
 # Package files pulled in by ad-hoc verification runs.
 *.deb
+
+# Windows CI code signing (scripts/windows-signing-setup.ps1)
+.code-signing/

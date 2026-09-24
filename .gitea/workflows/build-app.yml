@@ -7,6 +7,7 @@ on:
       - "app/**"
       - "VERSION"
       - ".gitea/workflows/build-app.yml"
+      - "scripts/windows-*.ps1"
   workflow_dispatch:
 
 # Deliberately **not** on pull_request. Every publishing step here is gated on
@@ -611,7 +612,11 @@ jobs:
       - name: Install Tauri CLI via cargo
         run: |
           set "PATH=%USERPROFILE%\.cargo\bin;C:\Program Files\nodejs;%PATH%"
-          cargo install tauri-cli --version "^2"
+          rem Pinned to the @tauri-apps/cli version in app/package-lock.json, which
+          rem the Linux and macOS jobs run: the Windows code-signing path (sign
+          rem command, NSIS uninstaller signing) was verified against it, and "^2"
+          rem would change it underneath the pipeline on any Tauri release.
+          cargo install tauri-cli --version "=2.11.0" --locked
 
       - name: Fix npm platform detection
         run: |
@@ -632,10 +637,31 @@ jobs:
           set "PATH=%USERPROFILE%\.cargo\bin;C:\Program Files\nodejs;%PATH%"
           npm run build
 
+      # Releases are signed with Azure Artifact Signing (scripts/windows-*.ps1).
+      # The setup fetches the signing client and a job-local .NET runtime, and
+      # writes the Tauri config holding the sign command, which "Build Tauri
+      # app" passes with --config. A missing secret fails here, before the build.
+      - name: Prepare code signing
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          ARTIFACT_SIGNING_ENDPOINT: ${{ secrets.ARTIFACT_SIGNING_ENDPOINT }}
+          ARTIFACT_SIGNING_ACCOUNT_NAME: ${{ secrets.ARTIFACT_SIGNING_ACCOUNT_NAME }}
+          ARTIFACT_SIGNING_PROFILE_NAME: ${{ secrets.ARTIFACT_SIGNING_PROFILE_NAME }}
+        run: powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts\windows-signing-setup.ps1
+
       - name: Build Tauri app
         working-directory: ./app
+        # The sign command comes in through --config, from the file "Prepare
+        # code signing" wrote. Not TAURI_CONFIG: the v2 CLI never reads that
+        # variable (the inline one this step used to set was a no-op), and
+        # "Verify signatures" is what caught it.
         env:
-          TAURI_CONFIG: "{\"build\":{\"beforeBuildCommand\":\"\"}}"
+          # Read by the signing dlib itself, never passed on a command line.
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
         run: |
           set "PATH=%USERPROFILE%\.cargo\bin;C:\Program Files\nodejs;%PATH%"
           rem Every Tauri bundler it downloads - candle.exe, light.exe and
@@ -650,7 +676,20 @@ jobs:
           rem systemprofile\AppData\Local\tauri and systemprofile\.cache to the
           rem System32 originals, which makes the redirected view resolve. A
           rem runner running as a normal user needs no such patch.
-          cargo tauri build --bundles msi,nsis
+          cargo tauri build --bundles msi,nsis --config "%TRIPLE_C_TAURI_SIGN_CONFIG%"
+
+      - name: Verify signatures
+        run: >-
+          powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass
+          -File scripts\windows-verify-signatures.ps1
+          app\src-tauri\target\release\bundle\msi\*.msi
+          app\src-tauri\target\release\bundle\nsis\*.exe
+
+      # Tauri reports a failed sign command as just "failed to run powershell";
+      # windows-sign.ps1 keeps its own transcript, signtool /debug included.
+      - name: Show signing output
+        if: failure()
+        run: if exist .code-signing\sign-output.log type .code-signing\sign-output.log
 
       - name: Collect artifacts
         run: |

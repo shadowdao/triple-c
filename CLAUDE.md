@@ -836,6 +836,72 @@ verbatim copy yields a launcher entry that starts nothing. It keeps `StartupWMCl
 the bundle sets it, which is what lets the shell match the window to the entry. Extraction uses
 `--appimage-extract`, which needs no FUSE, so the script works before `fuse2` is installed.
 
+### Windows code signing
+
+Windows **releases** (`build-app.yml`) are signed with **Azure Artifact Signing**: the app binary,
+the MSI, the NSIS installer and its uninstaller. Three scripts do it, and "Verify signatures"
+fails the job if any of them is unsigned or untimestamped, so an unsigned installer cannot ship
+quietly. **PR previews are deliberately not signed**, and `build-app-preview.yml` must not
+reference the signing secrets. Two reasons: signing is metered (about 1000 signatures a month,
+against roughly 50 preview builds a month), and a PR's workflow runs the PR's own code, so a
+secret available there is available to whoever can push a branch. To exercise signing before a
+merge, dispatch `build-app.yml` on the branch. Every publishing step there is gated on
+`gitea.event_name == 'push'`, so a dispatch builds, signs and verifies without releasing.
+
+- `scripts/windows-signing-setup.ps1` runs once per job. It downloads the signing client
+  (`Microsoft.ArtifactSigning.Client`) and a .NET runtime into `.code-signing/` in the workspace,
+  **each pinned by version and hash**, writes the dlib's `metadata.json`, and writes a Tauri
+  config file with `bundle.windows.signCommand` that the build passes as
+  `cargo tauri build --config`. Nothing is installed on the build VM. To bump
+  a pin, take the hash from nuget.org / the .NET `releases.json`, never from your own download.
+- `scripts/windows-sign.ps1` is the sign command: `signtool sign /dlib` with SHA-256 and the
+  Microsoft timestamp server, retried. Credentials never reach a command line — the dlib reads
+  `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET` from the environment.
+  **It signs only an allowlist of what ships**: 5 signatures per release (the app binary twice,
+  because Tauri re-patches it between the MSI and NSIS bundles; the MSI; the NSIS installer;
+  and its uninstaller). Tauri also presents build-time tools, the WiX extension DLLs and NSIS
+  plugins, and signing those would more than double the metered count for no user-visible
+  benefit. If the app ever ships resource DLLs or sidecars, extend the
+  allowlist, or they will go out unsigned. Tauri reports a failed sign command only as
+  "failed to run powershell", so the script keeps a transcript (`.code-signing/sign-output.log`,
+  `signtool /debug` included), and the job prints it on failure.
+- `scripts/windows-verify-signatures.ps1` checks `signtool verify /pa` plus a timestamp on the
+  installers, and on the binaries **inside** the MSI (an administrative `msiexec /a` extract).
+  It deliberately does not check `target\release\triple-c.exe`: Tauri patches that file again
+  after packaging, so the loose copy is unsigned by design and is not what ships. For the NSIS
+  installer, which cannot be unpacked that way, it requires the signing log to show the app
+  binary and the uninstaller were signed.
+
+Secrets (repository): the three `AZURE_*` above plus `ARTIFACT_SIGNING_ENDPOINT`,
+`ARTIFACT_SIGNING_ACCOUNT_NAME`, `ARTIFACT_SIGNING_PROFILE_NAME`. They are referenced only by the
+two Windows steps of `build-app.yml` that need them ("Prepare code signing" and "Build Tauri
+app"), never by the preview workflow, never echoed, and never on a command line. The repo is
+public, so its Actions logs are too. Gitea masks the secret values, and the signing dlib's
+`/debug` output carries no tokens (checked against its strings). Anyone who can push to this
+repo can reach the secrets through a workflow file, so repo write access is the boundary.
+`main` is branch-protected (no direct or force pushes; changes land by merging a PR), so a signed
+release only ever comes from a merged, visible change. The
+Azure side should hold the rest: an app registration with only the signer role on this one
+certificate profile, and a client secret with an expiry. Four things are load-bearing:
+
+- **`metadata.json` excludes every credential but `EnvironmentCredential`.** The dlib uses
+  `DefaultAzureCredential`, whose chain ends in `InteractiveBrowserCredential`; the runners run as
+  SYSTEM, where that waits forever for a browser.
+- **The sign command goes in through `--config`, never `TAURI_CONFIG`.** The v2 CLI does not read
+  that variable — it only sets it, for tauri-build — so a config put there is dropped without an
+  error. The Windows jobs set an inline `TAURI_CONFIG` for years and it never applied;
+  "Verify signatures" is what exposed it, and it is what would catch a regression.
+- **The signing files and the job's `%TEMP%` live in the workspace.** The NSIS uninstaller is
+  written to `%TEMP%` and signed from inside 32-bit `makensis`, under 32-bit PowerShell; WOW64
+  redirects SYSTEM's own `%TEMP%` (under System32) for those processes but not for the x64
+  signtool, so they would disagree about where the file is. The workspace is under
+  `systemprofile\.cache`, which the VM junctions so both views resolve. makensis also ignores
+  the sign command's exit code for the uninstaller, so `windows-sign.ps1` logs every file it
+  signs and the verify step requires a logged signature under that temp directory.
+- **The build VM is `WindowsBuilder` (VM 110 on the Proxmox host `pve4`)**, carrying both the
+  `winvm-builder` and `virtual-builder` runners in host mode. It has the Windows SDK's
+  `signtool` (10.0.26100) but no .NET — hence the job-local runtime.
+
 ## Testing
 
 Frontend tests use Vitest with jsdom environment and React Testing Library. Setup file at `src/test/setup.ts`. Run a single test file:
