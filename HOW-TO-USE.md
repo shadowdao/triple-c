@@ -469,6 +469,7 @@ replaces the old Full Permissions on/off switch.
 | **Plan** | Proposes a plan and makes no changes | `--permission-mode plan` |
 | **Default** | Asks before each tool call | *(nothing — Claude Code's own default)* |
 | **Accept Edits** | Auto-approves file edits; other tools still prompt | `--permission-mode acceptEdits` |
+| **Auto** | A safety classifier approves routine actions and blocks risky ones, without prompting | `--permission-mode auto` |
 | **Bypass** | Auto-approves every tool call | `--dangerously-skip-permissions` |
 
 New projects start in **Default**. Projects created before permission modes existed keep behaving
@@ -480,12 +481,19 @@ the way they did: one that had Full Permissions on becomes **Bypass**, one that 
 > has Docker socket access or reaches services on your network. The Overview tab tells you whether
 > the in-container sandbox is also on.
 
+**Auto** sits between Accept Edits and Bypass: Claude Code's own classifier reviews each action,
+lets routine work through and blocks things that look risky (such as destructive or
+exfiltrating commands) — no prompts either way. Whether it is available depends on your Claude
+Code account, model and backend (local and OpenAI-compatible backends usually won't
+qualify). When it isn't available, Claude Code quietly starts in its normal prompting mode
+instead.
+
 ### When a change takes effect
 
 - **Terminals** — the mode is applied when a terminal is opened, so it affects terminals you open
   from then on. A Claude session that is already running keeps the permissions it started with;
   close the tab and open a new terminal to change it. The badge on each terminal tab shows the mode
-  that terminal was launched with (`plan`, `ask`, `edits`, `bypass`).
+  that terminal was launched with (`plan`, `ask`, `edits`, `auto`, `bypass`).
 - **Resumed sessions** — a session resumed from the **Sessions** tab uses the project's current
   mode.
 - **Scheduled tasks** — these now honour the permission mode too (they previously always ran with
@@ -494,8 +502,10 @@ the way they did: one that had Full Permissions on becomes **Bypass**, one that 
   mode change to reach the scheduler.
 
 > Scheduled tasks run headless (`claude -p`) and cannot answer a permission prompt. In any mode
-> other than **Bypass**, a task may simply stop early when Claude Code asks for approval. Its run
-> log records which mode it used.
+> other than **Auto** or **Bypass**, a task may simply stop early when Claude Code asks for
+> approval. In **Auto**, actions the classifier blocks are denied and the run carries on without
+> them — but if Auto isn't available for the project's model or backend, Claude Code falls back
+> to prompting and the task can stall the same way. Its run log records which mode it used.
 
 ---
 
@@ -1349,7 +1359,9 @@ Scheduled runs use the project's [permission mode](#permission-modes) — they n
 with `--dangerously-skip-permissions`. Because the mode travels into the container as an
 environment variable, **stop and start the project** after changing it for the scheduler to see the
 change. Remember that a headless run cannot answer a permission prompt, so in any mode other than
-**Bypass** a task may stop early when Claude Code asks for approval; the run log records the mode
+**Auto** or **Bypass** a task may stop early when Claude Code asks for approval (in Auto, blocked
+actions are denied instead, unless Auto is unavailable and Claude Code falls back to
+prompting); the run log records the mode
 that was used.
 
 ### Creating Tasks

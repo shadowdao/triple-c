@@ -75,11 +75,11 @@ describe("PermissionModeControl", () => {
     vi.clearAllMocks();
   });
 
-  it("renders all four modes as a radio group with the effective one checked", () => {
+  it("renders all five modes as a radio group with the effective one checked", () => {
     render(<PermissionModeControl project={baseProject} onChange={onChange} />);
     const group = screen.getByRole("radiogroup", { name: "Permission mode" });
     expect(group).toBeInTheDocument();
-    expect(screen.getAllByRole("radio")).toHaveLength(4);
+    expect(screen.getAllByRole("radio")).toHaveLength(5);
     expect(screen.getByRole("radio", { name: "Default" })).toHaveAttribute(
       "aria-checked",
       "true",
@@ -90,6 +90,14 @@ describe("PermissionModeControl", () => {
     render(<PermissionModeControl project={baseProject} onChange={onChange} />);
     fireEvent.click(screen.getByRole("radio", { name: "Accept Edits" }));
     expect(onChange).toHaveBeenCalledWith("acceptEdits");
+  });
+
+  it("offers Auto between Accept Edits and Bypass", () => {
+    render(<PermissionModeControl project={baseProject} onChange={onChange} />);
+    const labels = screen.getAllByRole("radio").map((r) => r.textContent);
+    expect(labels).toEqual(["Plan", "Default", "Accept Edits", "Auto", "Bypass"]);
+    fireEvent.click(screen.getByRole("radio", { name: "Auto" }));
+    expect(onChange).toHaveBeenCalledWith("auto");
   });
 
   it("moves selection with the arrow keys", () => {

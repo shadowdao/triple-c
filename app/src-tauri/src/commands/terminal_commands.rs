@@ -469,6 +469,20 @@ mod tests {
         assert!(!cmd[2].contains(" -n "), "empty name must add no flag: {}", cmd[2]);
     }
 
+    /// Auto mode is passed as a `--permission-mode` value, not its own flag.
+    #[test]
+    fn build_terminal_cmd_passes_auto_permission_mode() {
+        let mut p = project("anthropic", serde_json::Value::Null);
+        p.permission_mode = Some(crate::models::project::PermissionMode::Auto);
+        let cmd = build_claude_terminal_cmd(&p, None, None);
+
+        assert!(
+            cmd[2].contains("exec claude '--permission-mode' 'auto'"),
+            "got: {}",
+            cmd[2]
+        );
+    }
+
     /// The Bedrock-profile path keeps its AWS validation *and* gains the
     /// prelude, immediately before the exec.
     #[test]

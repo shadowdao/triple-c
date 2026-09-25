@@ -10,6 +10,11 @@ export const PERMISSION_MODES: Segment<PermissionMode>[] = [
     hint: "File edits are auto-approved; other tools still prompt.",
   },
   {
+    value: "auto",
+    label: "Auto",
+    hint: "A safety classifier approves routine actions and blocks risky ones, without prompting.",
+  },
+  {
     value: "bypass",
     label: "Bypass",
     hint: "Every tool call is auto-approved (--dangerously-skip-permissions).",

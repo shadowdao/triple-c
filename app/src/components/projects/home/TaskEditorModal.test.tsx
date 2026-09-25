@@ -159,10 +159,17 @@ describe("TaskEditorModal", () => {
   });
 
   it("warns that a headless run cannot answer a permission prompt", async () => {
-    // Bypass is the only mode where an unattended run is safe from stalling.
+    // Bypass (and Auto, below) are the modes where an unattended run cannot stall.
     await renderEditor(null, { ...baseProject, permission_mode: "bypass" });
     expect(screen.getByText(/headless/i)).toBeInTheDocument();
     expect(screen.queryByText(/cannot answer a permission prompt/i)).toBeNull();
+  });
+
+  it("tells Auto mode that blocked actions are denied, and warns of the fallback", async () => {
+    await renderEditor(null, { ...baseProject, permission_mode: "auto" });
+    expect(screen.queryByText(/cannot answer a permission prompt/i)).toBeNull();
+    expect(screen.getByText(/blocks are denied/i)).toBeInTheDocument();
+    expect(screen.getByText(/falls back to prompting/i)).toBeInTheDocument();
   });
 
   it("spells out the stall risk in any non-Bypass mode", async () => {

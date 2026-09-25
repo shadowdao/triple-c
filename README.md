@@ -114,7 +114,7 @@ progress modal.
 
 ## Permission Modes
 
-`PermissionMode` in `models/project.rs` replaces the old `full_permissions` boolean. Four states,
+`PermissionMode` in `models/project.rs` replaces the old `full_permissions` boolean. Five states,
 mapped to CLI flags by `PermissionMode::cli_args()`:
 
 | Mode | Serialized | CLI args passed to `claude` |
@@ -122,6 +122,7 @@ mapped to CLI flags by `PermissionMode::cli_args()`:
 | **Plan** | `plan` | `--permission-mode plan` |
 | **Default** | `default` | *(none)* |
 | **Accept Edits** | `acceptEdits` | `--permission-mode acceptEdits` |
+| **Auto** | `auto` | `--permission-mode auto` |
 | **Bypass** | `bypass` | `--dangerously-skip-permissions` |
 
 `Project.permission_mode` is `Option<PermissionMode>`; `effective_permission_mode()` falls back to
@@ -531,7 +532,7 @@ Triple-C includes optional speech-to-text powered by [Faster Whisper](https://gi
 | `app/src/components/layout/StatusBar.tsx` | Project/terminal counts, Notes toggle, STT mic |
 | `app/src/components/projects/ProjectRow.tsx` | Select-only sidebar row; opens Project Home, with hover start/stop and terminal controls |
 | `app/src/components/projects/ProjectList.tsx` | Project list in sidebar |
-| `app/src/components/projects/PermissionModeControl.tsx` | Plan / Default / Accept Edits / Bypass segmented control |
+| `app/src/components/projects/PermissionModeControl.tsx` | Plan / Default / Accept Edits / Auto / Bypass segmented control |
 | `app/src/components/ui/` | Shared primitives: `Modal`, `Button`, `Toggle`, `Field`, `SegmentedControl`, `StatusIndicator`, `SaveIndicator`, `OverflowMenu`, `ToastHost`, `Tooltip` |
 | `app/src/hooks/useKeyboardShortcuts.ts` | `Ctrl+T`, `Ctrl+Shift+W`, `Ctrl+Tab`, `Ctrl+1..9`, `Ctrl+Shift+←/→` |
 | `app/src/hooks/useContainerProgress.ts` | `container-progress` event → inline progress lines |

@@ -166,6 +166,9 @@ pub enum PermissionMode {
     Default,
     /// Auto-accept file edits, prompt for everything else.
     AcceptEdits,
+    /// Claude Code's classifier approves safe actions and blocks risky ones,
+    /// without prompting.
+    Auto,
     /// Skip all permission prompts.
     Bypass,
 }
@@ -180,6 +183,7 @@ impl PermissionMode {
             PermissionMode::AcceptEdits => {
                 vec!["--permission-mode".to_string(), "acceptEdits".to_string()]
             }
+            PermissionMode::Auto => vec!["--permission-mode".to_string(), "auto".to_string()],
             PermissionMode::Bypass => vec!["--dangerously-skip-permissions".to_string()],
         }
     }
@@ -191,6 +195,7 @@ impl PermissionMode {
             PermissionMode::Plan => "plan",
             PermissionMode::Default => "default",
             PermissionMode::AcceptEdits => "acceptEdits",
+            PermissionMode::Auto => "auto",
             PermissionMode::Bypass => "bypass",
         }
     }

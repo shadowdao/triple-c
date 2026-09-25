@@ -301,11 +301,18 @@ export default function TaskEditorModal({ project, task, onClose, onSaved }: Pro
             terminal attached, using this project&rsquo;s permission mode (
             <strong className="text-[var(--text-primary)]">{modeLabel}</strong>).
           </p>
-          {mode !== "bypass" && (
+          {mode === "auto" && (
+            <p className="text-xs text-[var(--warning)]">
+              In Auto mode, actions the safety classifier blocks are denied and the run carries on
+              without them. If Auto isn&rsquo;t available for this project&rsquo;s model or backend,
+              Claude Code falls back to prompting and the task may stall.
+            </p>
+          )}
+          {mode !== "bypass" && mode !== "auto" && (
             <p className="text-xs text-[var(--warning)]">
               A headless run cannot answer a permission prompt. In {modeLabel} mode the task may
-              stall and produce an empty log; set the mode to Bypass in the Config tab for
-              unattended runs.
+              stall and produce an empty log; set the mode to Auto or Bypass in the Config tab
+              for unattended runs.
             </p>
           )}
         </div>

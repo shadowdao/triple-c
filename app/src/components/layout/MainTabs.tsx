@@ -26,6 +26,7 @@ const MODE_BADGE: Record<PermissionMode, { text: string; className: string }> = 
   plan: { text: "plan", className: "bg-[var(--bg-tertiary)] text-[var(--text-secondary)]" },
   default: { text: "ask", className: "bg-[var(--bg-tertiary)] text-[var(--text-secondary)]" },
   acceptEdits: { text: "edits", className: "bg-[var(--accent-muted)] text-[var(--accent)]" },
+  auto: { text: "auto", className: "bg-[var(--accent-muted)] text-[var(--accent)]" },
   bypass: { text: "bypass", className: "bg-[var(--warning-muted)] text-[var(--warning)]" },
 };
 

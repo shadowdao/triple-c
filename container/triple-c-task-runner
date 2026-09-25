@@ -62,11 +62,15 @@ TASK_TYPE=$(jq -r '.type' "$TASK_FILE")
 # PermissionMode::cli_args() in app/src-tauri/src/models/project.rs.
 # NOTE: headless `claude -p` runs cannot answer a permission prompt, so any
 # mode other than "bypass" means the task may stop early when Claude Code asks
-# for permission. Unset or unrecognized values pass no flag (Claude's default).
+# for permission. In "auto", classifier-blocked actions are denied instead of
+# prompted, but if auto mode is unavailable for the session's model/backend,
+# Claude Code falls back to prompting and the same stall applies.
+# Unset or unrecognized values pass no flag (Claude's default).
 PERMISSION_ARGS=()
 case "${TRIPLE_C_PERMISSION_MODE:-}" in
     plan)        PERMISSION_ARGS=(--permission-mode plan) ;;
     acceptEdits) PERMISSION_ARGS=(--permission-mode acceptEdits) ;;
+    auto)        PERMISSION_ARGS=(--permission-mode auto) ;;
     bypass)      PERMISSION_ARGS=(--dangerously-skip-permissions) ;;
     *)           PERMISSION_ARGS=() ;;
 esac

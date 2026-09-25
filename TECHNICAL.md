@@ -186,7 +186,7 @@ host keychain secrets.
 
 ### Permission Modes
 
-`PermissionMode` (`models/project.rs`) is a four-state enum replacing the earlier `full_permissions`
+`PermissionMode` (`models/project.rs`) is a five-state enum replacing the earlier `full_permissions`
 boolean. It reaches Claude Code by two different routes:
 
 | Mode | `cli_args()` — interactive terminals | `as_env_value()` — scheduler |
@@ -194,6 +194,7 @@ boolean. It reaches Claude Code by two different routes:
 | `Plan` | `--permission-mode plan` | `plan` |
 | `Default` | *(no flag)* | `default` |
 | `AcceptEdits` | `--permission-mode acceptEdits` | `acceptEdits` |
+| `Auto` | `--permission-mode auto` | `auto` |
 | `Bypass` | `--dangerously-skip-permissions` | `bypass` |
 
 `Project.permission_mode` is `Option<PermissionMode>`, and `effective_permission_mode()` resolves
@@ -474,7 +475,7 @@ triple-c/
     │       │   ├── ProjectRow.tsx        # Select-only sidebar row
     │       │   ├── ProjectList.tsx       # Sidebar project list
     │       │   ├── AddProjectDialog.tsx  # New-project dialog
-    │       │   ├── PermissionModeControl.tsx # Plan/Default/Accept Edits/Bypass
+    │       │   ├── PermissionModeControl.tsx # Plan/Default/Accept Edits/Auto/Bypass
     │       │   ├── ConfirmRemoveModal.tsx    # Project removal confirmation
     │       │   └── *Editor.tsx / *Modal.tsx  # EnvVars, PortMappings,
     │       │                                 # ClaudeInstructions, ClaudeCodeSettings —

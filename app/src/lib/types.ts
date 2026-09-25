@@ -126,7 +126,7 @@ export const CUSTOM_ENDPOINT_BACKENDS: readonly Backend[] = [
 ];
 
 /** Mirrors Rust `PermissionMode` (serde camelCase). */
-export type PermissionMode = "plan" | "default" | "acceptEdits" | "bypass";
+export type PermissionMode = "plan" | "default" | "acceptEdits" | "auto" | "bypass";
 
 export type BedrockAuthMethod = "static_credentials" | "profile" | "bearer_token";
 
