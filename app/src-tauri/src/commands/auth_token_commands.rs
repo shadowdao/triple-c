@@ -106,6 +106,16 @@ const CODE_REJECTED_EVENT: &str = "claude-token-code-rejected";
 /// browser, sign in, and approve. Bounded so a wedged exec can't leak a task.
 const SETUP_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
+/// Pause between typing the pasted code and pressing Enter.
+///
+/// The CLI's prompt reads a multi-byte chunk as a paste, and a `\r` inside a
+/// paste is swallowed with it rather than submitting. Code and Enter in one
+/// write therefore fill the prompt and submit nothing, and the flow waits out
+/// [`SETUP_TIMEOUT`]. Measured against 2.1.283 under a pty: 20 ms apart
+/// already submits reliably; this leaves headroom for the extra hops through
+/// Docker's exec socket, which can merge writes that arrive close together.
+const SUBMIT_ENTER_DELAY: Duration = Duration::from_millis(250);
+
 /// Documented shape of a `setup-token` credential.
 const TOKEN_PREFIX: &str = "sk-ant-oat01-";
 
@@ -837,9 +847,23 @@ unset CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_B
       ANTHROPIC_MODEL CLAUDE_CODE_USE_BEDROCK AWS_BEARER_TOKEN_BEDROCK
 exec claude setup-token"#;
 
+/// Type `code` into the CLI's prompt, then press Enter as a separate keystroke.
+///
+/// See [`SUBMIT_ENTER_DELAY`] for why the two cannot share a write.
+async fn type_code_then_enter<W: tokio::io::AsyncWrite + Unpin>(
+    input: &mut W,
+    code: &[u8],
+) -> std::io::Result<()> {
+    input.write_all(code).await?;
+    input.flush().await?;
+    tokio::time::sleep(SUBMIT_ENTER_DELAY).await;
+    input.write_all(b"\r").await?;
+    input.flush().await
+}
+
 /// Run `claude setup-token` in the container and return the token it printed.
 /// Streams redacted output as it arrives and forwards anything arriving on
-/// `input_rx` (the user's pasted code) to the command's stdin.
+/// `input_rx` (the user's pasted code) to the command's stdin, each followed by Enter.
 async fn run_setup_token(
     app: &AppHandle,
     project_id: &str,
@@ -894,14 +918,13 @@ async fn run_setup_token(
                     "Authentication cancelled. No token was stored.".to_string()
                 );
             }
-            Some(data) = input_rx.recv() => {
-                if let Err(e) = input.write_all(&data).await {
+            Some(code) = input_rx.recv() => {
+                if let Err(e) = type_code_then_enter(&mut input, &code).await {
                     return Err(format!(
                         "Could not send the code to `claude setup-token`: {}. No token was stored.",
                         e
                     ));
                 }
-                let _ = input.flush().await;
                 // Arm the rejection detector. Anything the CLI says from here
                 // on is a verdict on *this* code.
                 awaiting_code_result = true;
@@ -1158,10 +1181,9 @@ pub async fn submit_claude_token_code(code: String) -> Result<(), String> {
             .to_string()
     })?;
 
-    let mut keystrokes = code.as_bytes().to_vec();
-    keystrokes.push(b'\r');
+    // Just the code: the flow presses Enter itself, as a separate keystroke.
     sender
-        .send(keystrokes)
+        .send(code.as_bytes().to_vec())
         .map_err(|_| "The authentication flow has already ended.".to_string())
 }
 
@@ -2228,5 +2250,51 @@ mod tests {
         assert!(outcome.needs_another_pass());
         assert_eq!(outcome.snapshots_skipped.len(), 1, "{:?}", outcome);
         assert!(outcome.snapshots_failed.is_empty(), "{:?}", outcome);
+    }
+
+    /// Records every `poll_write` as a separate entry, with when it landed, so
+    /// a test can see write boundaries that a byte pipe would merge.
+    #[derive(Default)]
+    struct RecordingWriter {
+        writes: Vec<(tokio::time::Instant, Vec<u8>)>,
+    }
+
+    impl tokio::io::AsyncWrite for RecordingWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.writes
+                .push((tokio::time::Instant::now(), buf.to_vec()));
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Code and Enter in one write is read by the CLI as a paste: the code
+    /// fills the prompt and the `\r` is swallowed with it, so nothing is
+    /// submitted and the flow sits until `SETUP_TIMEOUT`. Measured against
+    /// 2.1.283 under a pty; a separate Enter 20 ms later submits.
+    #[tokio::test(start_paused = true)]
+    async fn the_code_and_its_enter_are_separate_writes() {
+        let mut w = RecordingWriter::default();
+        type_code_then_enter(&mut w, b"abc#def").await.unwrap();
+
+        assert_eq!(w.writes.len(), 2, "expected two writes, got {:?}", w.writes);
+        assert_eq!(w.writes[0].1, b"abc#def");
+        assert_eq!(w.writes[1].1, b"\r");
+        assert!(w.writes[1].0 - w.writes[0].0 >= SUBMIT_ENTER_DELAY);
     }
 }
