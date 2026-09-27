@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ProjectPath, ProjectRemovalReport, ProjectResetOutcome, ContainerInfo, AppSettings, SettingsImportPreview, SettingsImportOutcome, UpdateInfo, ImageUpdateInfo, FileEntry, FileContents, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, BrowserPageState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo, UploadOutcome, Note, ViewerFile, ViewerPoll, ViewerSaved, ViewerState } from "./types";
+import type { Project, ProjectPath, ProjectRemovalReport, ProjectResetOutcome, ContainerInfo, AppSettings, SettingsImportPreview, SettingsImportOutcome, UpdateInfo, ImageUpdateInfo, FileEntry, FileContents, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, BrowserPageState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo, UploadOutcome, Note, ViewerFile, ViewerPoll, ViewerSaved, ViewerState, FileDiff, InstallScope, ItemUpdate, Marketplace, MarketplaceAccount, MarketplaceItemRef, MarketplaceSnapshot, ProjectSyncResult, SyncReport } from "./types";
 
 // Docker
 export const checkDocker = () => invoke<boolean>("check_docker");
@@ -432,3 +432,57 @@ export const viewerWriteFile = (contentsBase64: string, baseHash: string) =>
   invoke<ViewerSaved>("viewer_write_file", { contentsBase64, baseHash });
 export const viewerChooseFile = (index: number) =>
   invoke<ViewerState>("viewer_choose_file", { index });
+
+// ---- Marketplace ----
+
+export const listMarketplaceSnapshots = () =>
+  invoke<MarketplaceSnapshot[]>("list_marketplace_snapshots");
+export const refreshMarketplaces = (marketplaceId?: string) =>
+  invoke<MarketplaceSnapshot[]>("refresh_marketplaces", { marketplaceId: marketplaceId ?? null });
+export const addMarketplace = (
+  name: string,
+  url: string,
+  branch: string | null,
+  accountId: string | null,
+) => invoke<MarketplaceSnapshot>("add_marketplace", { name, url, branch, accountId });
+export const updateMarketplace = (marketplace: Marketplace) =>
+  invoke<AppSettings>("update_marketplace", { marketplace });
+export const removeMarketplace = (marketplaceId: string) =>
+  invoke<AppSettings>("remove_marketplace", { marketplaceId });
+/** `expectedCommit`: the head the user reviewed; the backend refuses if it moved. */
+export const installMarketplaceItem = (item: MarketplaceItemRef, scope: InstallScope, expectedCommit: string) =>
+  invoke<AppSettings>("install_marketplace_item", { item, scope, expectedCommit });
+export const uninstallMarketplaceItem = (item: MarketplaceItemRef, scope: InstallScope) =>
+  invoke<void>("uninstall_marketplace_item", { item, scope });
+export const setGlobalItemDisabled = (
+  projectId: string,
+  item: MarketplaceItemRef,
+  disabled: boolean,
+) => invoke<Project>("set_global_item_disabled", { projectId, item, disabled });
+export const forgetMarketplaceInstalls = (marketplaceId: string) =>
+  invoke<void>("forget_marketplace_installs", { marketplaceId });
+export const listMarketplaceUpdates = () => invoke<ItemUpdate[]>("list_marketplace_updates");
+export const marketplaceItemDiff = (
+  item: MarketplaceItemRef,
+  fromCommit: string,
+  toCommit: string,
+) => invoke<FileDiff[]>("marketplace_item_diff", { item, fromCommit, toCommit });
+/** `expectedCommit`: the head whose diff the user accepted; the backend refuses if it moved. */
+export const updateMarketplaceItem = (item: MarketplaceItemRef, scope: InstallScope, expectedCommit: string) =>
+  invoke<void>("update_marketplace_item", { item, scope, expectedCommit });
+export const applyMarketplaceNow = (projectId?: string) =>
+  invoke<ProjectSyncResult[]>("apply_marketplace_now", { projectId: projectId ?? null });
+export const getMarketplaceSyncReport = (projectId: string) =>
+  invoke<SyncReport | null>("get_marketplace_sync_report", { projectId });
+export const addMarketplaceTokenAccount = (label: string, host: string, token: string) =>
+  invoke<MarketplaceAccount>("add_marketplace_token_account", { label, host, token });
+export const addMarketplaceGhHostAccount = (label: string, host: string) =>
+  invoke<MarketplaceAccount>("add_marketplace_gh_host_account", { label, host });
+export const startMarketplaceGhContainerLogin = (label: string, host: string, projectId: string) =>
+  invoke<MarketplaceAccount>("start_marketplace_gh_container_login", { label, host, projectId });
+export const cancelMarketplaceGhLogin = () => invoke<void>("cancel_marketplace_gh_login");
+export const testMarketplaceAccount = (accountId: string) =>
+  invoke<string>("test_marketplace_account", { accountId });
+export const removeMarketplaceAccount = (accountId: string) =>
+  invoke<AppSettings>("remove_marketplace_account", { accountId });
+export const marketplaceGhHostAvailable = () => invoke<boolean>("marketplace_gh_host_available");

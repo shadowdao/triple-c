@@ -20,6 +20,7 @@ import { resolveTerminalGpuRendering } from "../../lib/terminalRenderer";
 import WebTerminalSettings from "./WebTerminalSettings";
 import SttSettings from "./SttSettings";
 import SharedAuthSettings from "./SharedAuthSettings";
+import MarketplaceSettings from "./MarketplaceSettings";
 import CertificateSettings from "./CertificateSettings";
 import ExportSettingsModal from "./ExportSettingsModal";
 import ImportSettingsModal from "./ImportSettingsModal";
@@ -169,6 +170,10 @@ export default function SettingsPanel() {
 
       <AccordionSection id="claude-auth" title="Claude Authentication" defaultOpen={false}>
         <SharedAuthSettings />
+      </AccordionSection>
+
+      <AccordionSection id="marketplace" title="Marketplace" defaultOpen={false}>
+        <MarketplaceSettings />
       </AccordionSection>
 
       <AccordionSection id="backends" title="Backends" defaultOpen={false}>

@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { renderHook } from "@testing-library/react";
 import { useKeyboardShortcuts } from "./useKeyboardShortcuts";
-import { useAppState, homeTabKey, terminalTabKey } from "../store/appState";
+import { useAppState, homeTabKey, terminalTabKey, MARKETPLACE_TAB_KEY } from "../store/appState";
 
 vi.mock("./useTerminal", () => ({
   useTerminal: () => ({ open: vi.fn(), close: vi.fn() }),
@@ -84,5 +84,18 @@ describe("Ctrl+Shift+←/→", () => {
     press("ArrowLeft");
 
     expect(order()).toEqual([HOME, S1, S2]);
+  });
+});
+
+describe("Ctrl+Shift+W on the Marketplace tab", () => {
+  it("closes the Marketplace tab", () => {
+    useAppState.setState({
+      tabOrder: [HOME, MARKETPLACE_TAB_KEY],
+      activeTabKey: MARKETPLACE_TAB_KEY,
+      activeSessionId: null,
+    });
+    renderHook(() => useKeyboardShortcuts());
+    press("W", { shift: true });
+    expect(useAppState.getState().tabOrder).toEqual([HOME]);
   });
 });

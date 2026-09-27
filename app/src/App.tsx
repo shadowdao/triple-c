@@ -21,7 +21,9 @@ import { useTerminal } from "./hooks/useTerminal";
 import { useSTT } from "./hooks/useSTT";
 import { useContainerProgress } from "./hooks/useContainerProgress";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
-import { useAppState, isHomeTab, tabKeyId, homeTabKey } from "./store/appState";
+import { useMarketplaceSyncToasts } from "./hooks/useMarketplace";
+import MarketplaceView from "./components/marketplace/MarketplaceView";
+import { useAppState, isHomeTab, tabKeyId, homeTabKey, MARKETPLACE_TAB_KEY } from "./store/appState";
 import { reconcileProjectStatuses } from "./lib/tauri-commands";
 
 export default function App() {
@@ -72,6 +74,7 @@ export default function App() {
 
   useContainerProgress();
   useKeyboardShortcuts();
+  useMarketplaceSyncToasts();
 
   // Initialize on mount
   useEffect(() => {
@@ -159,6 +162,11 @@ export default function App() {
                   />
                 </PaneVisibilityProvider>
               ))}
+              {tabOrder.includes(MARKETPLACE_TAB_KEY) && (
+                <PaneVisibilityProvider visible={activeTabKey === MARKETPLACE_TAB_KEY}>
+                  <MarketplaceView active={activeTabKey === MARKETPLACE_TAB_KEY} />
+                </PaneVisibilityProvider>
+              )}
             </div>
           )}
         </main>

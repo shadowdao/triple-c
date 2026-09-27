@@ -5,6 +5,7 @@ import WorkspaceSection from "./config/WorkspaceSection";
 import ModelSection from "./config/ModelSection";
 import AccessSection from "./config/AccessSection";
 import RuntimeSection from "./config/RuntimeSection";
+import MarketplaceSection from "./config/MarketplaceSection";
 
 interface Props {
   project: Project;
@@ -52,6 +53,7 @@ export default function ConfigTab({ project, save, saveState }: Props) {
         disabled={disabled}
         disabledReason={STOPPED_ONLY}
       />
+      <MarketplaceSection project={project} />
     </div>
   );
 }

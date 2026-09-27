@@ -446,6 +446,12 @@ pub struct Project {
     /// User-defined display names for terminal tabs, keyed by session id.
     #[serde(default)]
     pub renamed_session_names: HashMap<String, String>,
+    /// Marketplace items installed for this project only (spec §2).
+    #[serde(default)]
+    pub marketplace_installs: Vec<super::marketplace::MarketplaceInstall>,
+    /// Global marketplace installs this project opts out of.
+    #[serde(default)]
+    pub marketplace_disabled: Vec<super::marketplace::MarketplaceItemRef>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -693,6 +699,8 @@ impl Project {
             claude_instructions: None,
             claude_code_settings: None,
             renamed_session_names: HashMap::new(),
+            marketplace_installs: Vec::new(),
+            marketplace_disabled: Vec::new(),
             created_at: now.clone(),
             updated_at: now,
         }
@@ -789,7 +797,10 @@ mod tests {
     }
 
     fn env(key: &str, value: &str) -> EnvVar {
-        EnvVar { key: key.to_string(), value: value.to_string() }
+        EnvVar {
+            key: key.to_string(),
+            value: value.to_string(),
+        }
     }
 
     #[test]
@@ -887,7 +898,10 @@ mod tests {
         // `merge_claude_code_settings` spells it. `main` resolved this with
         // `if p.env_scrub { true } else { g.env_scrub }`, i.e. the global won —
         // and it has to go on winning, because the user never turned this off.
-        let global = ClaudeCodeSettings { env_scrub: Some(true), ..Default::default() };
+        let global = ClaudeCodeSettings {
+            env_scrub: Some(true),
+            ..Default::default()
+        };
         assert_eq!(
             stored.env_scrub.or(global.env_scrub),
             Some(true),
@@ -902,7 +916,10 @@ mod tests {
         let json = r#"{ "env_scrub": false }"#;
         let chosen: ClaudeCodeSettings = serde_json::from_str(json).unwrap();
         assert_eq!(chosen.env_scrub, Some(false));
-        let global = ClaudeCodeSettings { env_scrub: Some(true), ..Default::default() };
+        let global = ClaudeCodeSettings {
+            env_scrub: Some(true),
+            ..Default::default()
+        };
         assert_eq!(chosen.env_scrub.or(global.env_scrub), Some(false));
     }
 
@@ -916,7 +933,10 @@ mod tests {
         assert_eq!(json, "{}");
         assert!(!json.contains("null"));
 
-        let partial = ClaudeCodeSettings { env_scrub: Some(false), ..Default::default() };
+        let partial = ClaudeCodeSettings {
+            env_scrub: Some(false),
+            ..Default::default()
+        };
         let json = serde_json::to_string(&partial).unwrap();
         assert_eq!(json, r#"{"env_scrub":false}"#);
         // And it reads back as what it is.
@@ -984,7 +1004,10 @@ mod tests {
         });
         let migrated = Project::migrate_from_value(legacy);
         let obj = migrated.as_object().unwrap();
-        assert!(obj.contains_key("paths"), "the migration should still do its own job");
+        assert!(
+            obj.contains_key("paths"),
+            "the migration should still do its own job"
+        );
         assert!(!obj.contains_key("auth_bridge_enabled"));
         assert!(!obj.contains_key("browser_view_enabled"));
     }

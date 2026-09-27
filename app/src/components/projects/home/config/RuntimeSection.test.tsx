@@ -47,6 +47,8 @@ const baseProject: Project = {
   claude_instructions: null,
   claude_code_settings: null,
   renamed_session_names: {},
+  marketplace_installs: [],
+  marketplace_disabled: [],
   created_at: "2026-01-01T00:00:00Z",
   updated_at: "2026-01-01T00:00:00Z",
 };

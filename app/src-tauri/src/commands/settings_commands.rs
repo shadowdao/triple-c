@@ -67,14 +67,26 @@ pub fn validate_settings_update(
     Ok(())
 }
 
+/// Marketplace state is written only by the marketplace commands
+/// (`commands/marketplace_commands.rs`), each of which returns fresh settings.
+/// Every other settings save posts the frontend's copy back whole, and that
+/// copy can predate an install made a moment ago, so what is stored wins.
+/// `apply_settings_import` is the one caller that replaces it, explicitly.
+pub(crate) fn restore_marketplace_fields(incoming: &mut AppSettings, stored: &AppSettings) {
+    incoming.marketplace_accounts = stored.marketplace_accounts.clone();
+    incoming.marketplaces = stored.marketplaces.clone();
+    incoming.global_marketplace_installs = stored.global_marketplace_installs.clone();
+}
+
 #[tauri::command]
 pub async fn update_settings(
-    settings: AppSettings,
+    mut settings: AppSettings,
     state: State<'_, AppState>,
 ) -> Result<AppSettings, String> {
     let before = state.settings_store.get();
 
     validate_settings_update(&before, &settings)?;
+    restore_marketplace_fields(&mut settings, &before);
 
     let saved = state.settings_store.update(settings)?;
 
@@ -429,5 +441,29 @@ mod tests {
             model_id: String::new(),
         });
         assert_eq!(gateway_action(&before, &half_typed), GatewayAction::None);
+    }
+
+    #[test]
+    fn a_stale_settings_save_cannot_overwrite_marketplace_state() {
+        use crate::models::marketplace::Marketplace;
+        let mut stored = AppSettings::default();
+        stored.marketplaces.push(Marketplace {
+            id: "m1".into(),
+            name: "Team".into(),
+            url: "https://example.invalid/r.git".into(),
+            branch: None,
+            account_id: None,
+        });
+        // The frontend's copy predates the marketplace being added.
+        let mut incoming = AppSettings::default();
+        incoming.auto_check_updates = false;
+
+        restore_marketplace_fields(&mut incoming, &stored);
+
+        assert_eq!(incoming.marketplaces, stored.marketplaces);
+        assert!(
+            !incoming.auto_check_updates,
+            "the edit the save was for still applies"
+        );
     }
 }

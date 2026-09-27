@@ -20,6 +20,10 @@ function preview(overrides: Partial<SettingsImportPreview> = {}): SettingsImport
     gateway_api_base: null,
     image_source: "registry",
     custom_image_name: null,
+    marketplace_count: 0,
+    global_hook_install_count: 0,
+    global_plugin_install_count: 0,
+    marketplace_account_token_count: 0,
     ...overrides,
   };
 }
@@ -79,6 +83,13 @@ describe("describeImport", () => {
     expect(items.some((i) => i.includes("OpenAI-compatible"))).toBe(false);
   });
 
+  it("names marketplaces and marketplace account tokens, with counts", () => {
+    const items = describeImport(preview({ marketplace_count: 1, marketplace_account_token_count: 2 }));
+    expect(items).toContain("1 marketplace");
+    expect(items).toContain("2 marketplace account tokens");
+    expect(describeImport(preview()).some((i) => i.includes("marketplace"))).toBe(false);
+  });
+
   it("names a custom Docker image when set, falling back to a placeholder if unnamed", () => {
     expect(
       describeImport(preview({ image_source: "custom", custom_image_name: "ghcr.io/me/triple-c" })),
@@ -114,6 +125,24 @@ describe("describeImportWarnings", () => {
     expect(describeImportWarnings(preview({ has_web_terminal_access_token: true }))).toEqual([
       "Includes a web terminal access token that will activate the next time the web terminal is turned on.",
     ]);
+  });
+
+  it("warns when the import installs hooks for every project", () => {
+    expect(describeImportWarnings(preview({ global_hook_install_count: 1 }))).toEqual([
+      "Installs 1 marketplace hook for all projects. Hooks run commands in every project container, and these skip the confirmation that lists a hook's commands before a Marketplace tab install.",
+    ]);
+    expect(describeImportWarnings(preview({ global_hook_install_count: 3 }))[0]).toMatch(
+      /^Installs 3 marketplace hooks for all projects\./,
+    );
+  });
+
+  it("warns when the import installs plugins for every project", () => {
+    expect(describeImportWarnings(preview({ global_plugin_install_count: 1 }))).toEqual([
+      "Installs 1 marketplace plugin for all projects. Plugins can bring their own hooks, MCP servers and commands into every project container, and these skip the confirmation that lists what a plugin brings before a Marketplace tab install.",
+    ]);
+    expect(
+      describeImportWarnings(preview({ global_plugin_install_count: 2, global_hook_install_count: 1 })),
+    ).toHaveLength(2);
   });
 
   it("warns about a custom Docker image every time, not only when it changes", () => {

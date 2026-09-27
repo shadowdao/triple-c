@@ -369,6 +369,44 @@ pub fn store_gateway_master_key(key: &str) -> Result<(), String> {
     bump_gateway_secret_version()
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Marketplace account tokens (global, one entry per account)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Keychain service prefix; the account id completes it.
+const MARKETPLACE_TOKEN_SERVICE_PREFIX: &str = "triple-c-marketplace-account-";
+
+/// The service name for one account. Ids are uuids; anything else is refused
+/// before a keychain entry is constructed.
+fn marketplace_token_service(account_id: &str) -> Result<String, String> {
+    let ok = !account_id.is_empty()
+        && account_id.len() <= 64
+        && account_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    if !ok {
+        return Err(format!("Invalid marketplace account id {:?}", account_id));
+    }
+    Ok(format!("{}{}", MARKETPLACE_TOKEN_SERVICE_PREFIX, account_id))
+}
+
+pub fn store_marketplace_token(account_id: &str, token: &str) -> Result<(), String> {
+    let service = marketplace_token_service(account_id)?;
+    if token.trim().is_empty() {
+        return Err("Refusing to store an empty marketplace token.".to_string());
+    }
+    let entry = keyring::Entry::new(&service, KEYCHAIN_ACCOUNT)
+        .map_err(|e| format!("Keyring error: {}", e))?;
+    entry
+        .set_password(token.trim())
+        .map_err(|e| format!("Failed to store the marketplace account token: {}", e))
+}
+
+pub fn get_marketplace_token(account_id: &str) -> Result<Option<String>, String> {
+    read_entry(&marketplace_token_service(account_id)?, "the marketplace account token")
+}
+
+pub fn delete_marketplace_token(account_id: &str) -> Result<(), String> {
+    delete_entry(&marketplace_token_service(account_id)?, "the marketplace account token")
+}
 
 #[cfg(test)]
 mod tests {
@@ -424,6 +462,22 @@ mod tests {
         let err = delete_project_secret("some-project", "brand-new-token")
             .expect_err("an unlisted key must be refused on delete too");
         assert!(err.contains("brand-new-token"), "{}", err);
+    }
+
+    /// Account ids become part of a keychain service name, so a malformed one
+    /// is refused before any entry is constructed — and so before the
+    /// keychain is touched, which is also what lets this run in CI.
+    #[test]
+    fn marketplace_token_ids_are_validated_before_the_keychain() {
+        for bad in ["", "../x", "a b", "x;y", &"a".repeat(65)] {
+            let err = store_marketplace_token(bad, "test-token-not-real").unwrap_err();
+            assert!(err.contains("Invalid marketplace account id"), "{bad:?}: {err}");
+            assert!(!err.contains("test-token-not-real"));
+            assert!(get_marketplace_token(bad).is_err());
+            assert!(delete_marketplace_token(bad).is_err());
+        }
+        let err = store_marketplace_token("0b9e6a2c-1111-4222-8333-944445555666", "   ").unwrap_err();
+        assert!(err.contains("empty"));
     }
 
     /// The blanked-field case. `AccessSection.tsx` sends `gitToken || null`, so

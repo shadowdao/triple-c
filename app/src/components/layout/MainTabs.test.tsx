@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 import MainTabs from "./MainTabs";
-import { useAppState, homeTabKey, terminalTabKey } from "../../store/appState";
+import { useAppState, homeTabKey, terminalTabKey, MARKETPLACE_TAB_KEY } from "../../store/appState";
 import type { Project, TerminalSession } from "../../lib/types";
 
 const close = vi.fn();
@@ -263,5 +263,22 @@ describe("MainTabs reordering", () => {
     for (const tab of screen.getAllByRole("tab")) {
       expect(tab).not.toHaveAttribute("draggable", "true");
     }
+  });
+});
+
+describe("marketplace tab", () => {
+  beforeEach(() => {
+    useAppState.setState({
+      tabOrder: [HOME, MARKETPLACE_TAB_KEY],
+      activeTabKey: MARKETPLACE_TAB_KEY,
+      activeSessionId: null,
+    });
+  });
+
+  it("renders a Marketplace tab that closes", () => {
+    render(<MainTabs />);
+    expect(screen.getByRole("tab", { name: /marketplace/i })).toHaveAttribute("aria-selected", "true");
+    fireEvent.click(screen.getByRole("button", { name: "Close Marketplace tab" }));
+    expect(useAppState.getState().tabOrder).toEqual([HOME]);
   });
 });

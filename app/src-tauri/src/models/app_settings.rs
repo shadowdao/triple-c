@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::gateway_settings::GatewaySettings;
+use super::marketplace::{Marketplace, MarketplaceAccount, MarketplaceInstall};
 use super::project::{ClaudeCodeSettings, EnvVar};
 
 fn default_true() -> bool {
@@ -135,6 +136,16 @@ pub struct AppSettings {
     pub gateway: GatewaySettings,
     #[serde(default)]
     pub global_claude_code_settings: Option<ClaudeCodeSettings>,
+    /// Sign-in accounts for private marketplace repos. Secrets live in the
+    /// OS keychain (`storage::secure::*_marketplace_token`), never here.
+    #[serde(default)]
+    pub marketplace_accounts: Vec<MarketplaceAccount>,
+    /// Marketplace git repos the user added.
+    #[serde(default)]
+    pub marketplaces: Vec<Marketplace>,
+    /// Items installed for every project (projects may opt out per item).
+    #[serde(default)]
+    pub global_marketplace_installs: Vec<MarketplaceInstall>,
     /// Whether the terminal loads `@xterm/addon-webgl`.
     ///
     /// `None` is "auto", and auto is not the same answer on every platform.
@@ -246,6 +257,9 @@ impl Default for AppSettings {
             stt: SttSettings::default(),
             gateway: GatewaySettings::default(),
             global_claude_code_settings: None,
+            marketplace_accounts: Vec::new(),
+            marketplaces: Vec::new(),
+            global_marketplace_installs: Vec::new(),
             terminal_gpu_rendering: None,
         }
     }

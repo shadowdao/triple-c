@@ -646,6 +646,32 @@ Anthropic and Bedrock deliberately keep Claude Code's own defaults.
 - A new local window needs its own capability file (`capabilities/file-viewer.json` is the
   model), and `lib.rs`'s `on_window_event` stays guarded on `label() == "main"`.
 
+### Marketplace
+
+- Code: models in `models/marketplace.rs`; host-side logic in `src/marketplace/` (`git.rs` gix
+  cache + pins, `catalog.rs` repo format, `auth.rs` credentials, `gh_login.rs`, `payload.rs`,
+  `sync.rs`); commands in `commands/marketplace_commands.rs`; UI in `components/marketplace/` and
+  `projects/home/config/MarketplaceSection.tsx`. Spec:
+  `docs/superpowers/specs/2026-09-27-marketplace-design.md`.
+- **Tokens never enter containers.** Marketplaces are fetched on the host into
+  `<data_dir>/triple-c/marketplaces/<id>.git`; containers only ever receive a tar of pinned
+  files. Do not add a code path that passes a marketplace credential into an exec, env var, label
+  or file in a container.
+- **Sync model:** after every container start (next to `sync_bedrock_credentials`) and on "Apply
+  now", the host builds the project's effective set (`global − disabled ∪ project`), then uploads
+  `payload.tar` **and the app-embedded script `src/marketplace/sync.sh`** (`include_str!`, not a
+  file in `container/`) to `~/.claude/triple-c/marketplace/incoming/` and runs it as `claude`,
+  once the entrypoint has finished (`pgrep -x -f 'su -s /bin/bash claude -c exec sleep
+  infinity'`). The script is re-uploaded on every sync rather than baked into the image, so every
+  existing project always gets the version that matches the running app — `container/` is never
+  touched for this feature. The script only removes files and hook entries it recorded in
+  `~/.claude/triple-c/marketplace/state.json`; it must never overwrite or delete user-created
+  agents/skills/commands or user hooks. A sync failure must not fail the container start.
+- Installs are **pinned** to a commit; nothing updates without the user accepting a diff. Pinned
+  commits are kept alive by `refs/triple-c/pins/*` in the cache.
+- Marketplace changes need no container labels or recreation — they are applied by the sync, not
+  at create time.
+
 ## Secrets
 
 **`scripts/scan-secrets.sh` refuses a commit that adds something shaped like a live
@@ -677,9 +703,9 @@ nobody had reason to open. Fixtures are never live values; there is no case wher
 
 `commands::settings_export_commands`, `storage::settings_crypto`, `models::settings_export`
 (triple-c#35). Exports the *host* environment — global `AppSettings` plus the global secrets that
-live in the OS keychain instead: the shared Claude Code OAuth login and the model gateway's two
-keys. Per-project settings, per-project secrets, and anything in a project's Docker volumes are
-deliberately out of scope — this is not a project backup.
+live in the OS keychain instead: the shared Claude Code OAuth login, the model gateway's two keys,
+and every marketplace account's token. Per-project settings, per-project secrets, and anything in
+a project's Docker volumes are deliberately out of scope — this is not a project backup.
 
 - **`AppSettings` is not entirely the non-secret shape it looks like, and a review of this feature
   caught the one place that isn't.** `WebTerminalSettings::access_token` is a live bearer
@@ -696,6 +722,21 @@ deliberately out of scope — this is not a project backup.
   inside a generic "settings replaced" summary. Read this as the standing example of the class of
   thing to keep checking for in this feature, not a one-off fixed bug — any other field that looks
   like config but is actually a live credential would have the same problem.
+- **Marketplace account tokens travel in `ExportedSecrets`, not in `AppSettings`.** `Token` and
+  `GhContainer` accounts' tokens live in the keychain (`triple-c-marketplace-account-<id>`), so
+  they follow the same "carve out of the keychain, restore before the settings replace, only
+  overwrite what the file actually has" treatment as the other three secrets
+  (`ExportedSecrets::marketplace_account_tokens`, keyed by account id). Marketplaces and install
+  lists themselves are ordinary `AppSettings` fields and travel with the settings replace, but are
+  **validated** on import the same way the add-marketplace/install commands validate them
+  (`validate_imported_marketplace_state`) — an import is untrusted input, not a trusted restore.
+  The preview warns whenever the import carries one or more **global hook installs or global
+  plugin installs**, in addition to the base-URL and custom-image warnings above: a hook runs
+  commands in every project container, and a plugin can carry its own hooks, MCP/LSP servers and
+  commands into one. In the Marketplace tab both kinds have a confirm step before they install
+  (`HookConfirmModal` lists a hook's commands, `PluginConfirmModal` lists everything a plugin
+  brings that runs); an import installs them without either, so the preview warning is the only
+  place that confirmation happens for an import.
 - **Encrypted because it can carry live credentials, not for appearance's sake.** Argon2id derives
   a 256-bit key from the user's password (memory-hard — meaningfully resistant to GPU/ASIC
   brute-forcing, unlike PBKDF2 at any reasonable iteration count), AES-256-GCM does the actual

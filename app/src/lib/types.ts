@@ -66,6 +66,8 @@ export interface Project {
   claude_instructions: string | null;
   claude_code_settings: ClaudeCodeSettings | null;
   renamed_session_names: Record<string, string>;
+  marketplace_installs: MarketplaceInstall[];
+  marketplace_disabled: MarketplaceItemRef[];
   created_at: string;
   updated_at: string;
 }
@@ -296,6 +298,90 @@ export interface AppSettings {
    *  canvas renderer it would otherwise fall back to. See
    *  `resolveTerminalGpuRendering` in `lib/terminalRenderer.ts`. */
   terminal_gpu_rendering: boolean | null;
+  marketplace_accounts: MarketplaceAccount[];
+  marketplaces: Marketplace[];
+  global_marketplace_installs: MarketplaceInstall[];
+}
+
+// ── Marketplace (mirrors src-tauri/src/models/marketplace.rs) ───────────────
+
+export type ItemKind = "agent" | "skill" | "command" | "hook" | "plugin";
+export type AccountMethod = "gh_host" | "gh_container" | "token";
+export interface MarketplaceAccount {
+  id: string;
+  label: string;
+  host: string;
+  method: AccountMethod;
+  username: string | null;
+}
+export interface Marketplace {
+  id: string;
+  name: string;
+  url: string;
+  branch: string | null;
+  account_id: string | null;
+}
+export interface MarketplaceItemRef {
+  marketplace_id: string;
+  kind: ItemKind;
+  key: string;
+}
+export interface MarketplaceInstall extends MarketplaceItemRef {
+  commit: string;
+}
+export interface CatalogItem {
+  kind: ItemKind;
+  key: string;
+  name: string;
+  description: string;
+  path: string;
+  invalid: string | null;
+  hook_commands: string[];
+  preview: string;
+  /** Plugins only: what the plugin brings that runs or adds commands (entry + folder). */
+  plugin_components: PluginComponent[];
+}
+export interface PluginComponent {
+  /** Where it comes from, e.g. "marketplace.json entry: mcpServers". */
+  label: string;
+  content: string;
+}
+export interface MarketplaceSnapshot {
+  marketplace_id: string;
+  head_commit: string | null;
+  fetched_at: string | null;
+  fetch_error: string | null;
+  items: CatalogItem[];
+}
+export interface ItemUpdate {
+  item: MarketplaceItemRef;
+  pinned: string;
+  head: string;
+  /** Why the item cannot be installed at `head`, so the update would be refused; null when it applies. */
+  invalid_at_head: string | null;
+}
+export type FileChange = "added" | "removed" | "modified";
+export interface FileDiff {
+  path: string;
+  change: FileChange;
+  unified: string | null;
+}
+export interface SkippedItem {
+  item: string;
+  reason: string;
+}
+export interface SyncReport {
+  installed: string[];
+  updated: string[];
+  removed: string[];
+  skipped: SkippedItem[];
+  errors: string[];
+  finished_at: string;
+}
+export type InstallScope = { type: "global" } | { type: "project"; project_id: string };
+export interface ProjectSyncResult {
+  project_id: string;
+  report: SyncReport;
 }
 
 /** What `preview_settings_import` returns before anything is applied —
@@ -327,6 +413,17 @@ export interface SettingsImportPreview {
    *  more attention than an ordinary setting. */
   image_source: ImageSource;
   custom_image_name: string | null;
+  /** Marketplaces the import configures. */
+  marketplace_count: number;
+  /** Hooks the import installs for all projects — each runs commands in
+   *  every project container, without the confirm step a Marketplace-tab
+   *  install shows, so the preview warns about them. */
+  global_hook_install_count: number;
+  /** Plugins the import installs for all projects — a plugin can bring its
+   *  own hooks and MCP servers, and skips the same confirm step. */
+  global_plugin_install_count: number;
+  /** Marketplace account tokens the import restores to the keychain. */
+  marketplace_account_token_count: number;
 }
 
 /** What `apply_settings_import` returns: the settings that were actually

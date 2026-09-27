@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { useAppState, homeTabKey, terminalTabKey } from "./appState";
+import { useAppState, homeTabKey, terminalTabKey, MARKETPLACE_TAB_KEY } from "./appState";
 
 const A = homeTabKey("a");
 const B = terminalTabKey("b");
@@ -134,5 +134,47 @@ describe("terminal focus requests", () => {
 
     useAppState.getState().requestTerminalFocus("s1");
     expect(pending()).toBe("s1");
+  });
+});
+
+describe("marketplace tab", () => {
+  beforeEach(() => {
+    seed([A, B], A);
+    useAppState.setState({ marketplaceFilterProjectId: null });
+  });
+
+  it("opens once, activates, and records the project filter", () => {
+    useAppState.getState().openMarketplace("p9");
+    useAppState.getState().openMarketplace("p9");
+    const s = useAppState.getState();
+    expect(s.tabOrder).toEqual([A, B, MARKETPLACE_TAB_KEY]);
+    expect(s.activeTabKey).toBe(MARKETPLACE_TAB_KEY);
+    expect(s.activeSessionId).toBeNull();
+    expect(s.marketplaceFilterProjectId).toBe("p9");
+  });
+
+  it("clears the filter when opened without a project", () => {
+    useAppState.getState().openMarketplace("p9");
+    useAppState.getState().openMarketplace();
+    expect(useAppState.getState().marketplaceFilterProjectId).toBeNull();
+  });
+
+  it("does not select a project when activated", () => {
+    useAppState.getState().openMarketplace();
+    useAppState.getState().setActiveTabKey(MARKETPLACE_TAB_KEY);
+    expect(useAppState.getState().selectedProjectId).toBeNull();
+  });
+
+  it("closes and activates the neighbour", () => {
+    useAppState.getState().openMarketplace();
+    useAppState.getState().closeMarketplaceTab();
+    const s = useAppState.getState();
+    expect(s.tabOrder).toEqual([A, B]);
+    expect(s.activeTabKey).toBe(B);
+  });
+
+  it("closing when not open is a no-op", () => {
+    useAppState.getState().closeMarketplaceTab();
+    expect(useAppState.getState().tabOrder).toEqual([A, B]);
   });
 });

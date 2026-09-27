@@ -72,6 +72,8 @@ const baseProject: Project = {
   claude_instructions: null,
   claude_code_settings: null,
   renamed_session_names: {},
+  marketplace_installs: [],
+  marketplace_disabled: [],
   created_at: "2026-01-01T00:00:00Z",
   updated_at: "2026-01-01T00:00:00Z",
 };
@@ -138,6 +140,17 @@ describe("SharedAuthSettings", () => {
     render(<SharedAuthSettings />);
     expect(screen.getByRole("button", { name: "Authenticate" })).toBeDisabled();
     await waitFor(() => expect(hasClaudeToken).toHaveBeenCalled());
+  });
+
+  it("lets the action buttons wrap instead of running out of the sidebar", async () => {
+    // Re-authenticate, Revoke and Check snapshot images are each nowrap, and
+    // together they are wider than the settings sidebar.
+    projects = [running()];
+    hasClaudeToken.mockResolvedValue(true);
+    render(<SharedAuthSettings />);
+
+    const sweep = await screen.findByTestId("shared-auth-sweep");
+    expect(sweep.parentElement).toHaveClass("flex-wrap");
   });
 
   it("enables Authenticate once a container is running", async () => {

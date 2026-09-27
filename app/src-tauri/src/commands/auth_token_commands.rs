@@ -114,7 +114,7 @@ const SETUP_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// [`SETUP_TIMEOUT`]. Measured against 2.1.283 under a pty: 20 ms apart
 /// already submits reliably; this leaves headroom for the extra hops through
 /// Docker's exec socket, which can merge writes that arrive close together.
-const SUBMIT_ENTER_DELAY: Duration = Duration::from_millis(250);
+pub(crate) const SUBMIT_ENTER_DELAY: Duration = Duration::from_millis(250);
 
 /// Documented shape of a `setup-token` credential.
 const TOKEN_PREFIX: &str = "sk-ant-oat01-";
@@ -621,7 +621,7 @@ const MAX_ANSI_CARRY: usize = 64 * 1024;
 /// Stateful wrapper around [`strip_ansi_prefix`] that carries an incomplete
 /// trailing sequence over to the next chunk.
 #[derive(Default)]
-struct AnsiStripper {
+pub(crate) struct AnsiStripper {
     carry: Vec<u8>,
     /// OSC 8 link targets seen since the last [`AnsiStripper::take_links`].
     /// Kept out of the return value so every existing caller and test of
@@ -630,7 +630,7 @@ struct AnsiStripper {
 }
 
 impl AnsiStripper {
-    fn push(&mut self, chunk: &[u8]) -> String {
+    pub(crate) fn push(&mut self, chunk: &[u8]) -> String {
         self.carry.extend_from_slice(chunk);
         let (mut out, links, consumed) = strip_ansi_prefix(&self.carry);
         self.record_links(links);
@@ -644,7 +644,7 @@ impl AnsiStripper {
         // fresh chunk, which re-enters here.
         if self.carry.len() > MAX_ANSI_CARRY {
             log::warn!(
-                "`claude setup-token` emitted an unterminated control sequence \
+                "the command emitted an unterminated control sequence \
                  longer than {} bytes — treating it as text",
                 MAX_ANSI_CARRY
             );
@@ -734,7 +734,7 @@ const REJECTION_SCAN_WINDOW: usize = 4096;
 const CODE_REJECTED_MARKERS: &[&str] = &["invalid code", "press enter to retry"];
 
 /// Append `chunk` to `buf`, keeping no more than `cap` bytes of the tail.
-fn push_capped_tail(buf: &mut String, chunk: &str, cap: usize) {
+pub(crate) fn push_capped_tail(buf: &mut String, chunk: &str, cap: usize) {
     buf.push_str(chunk);
     if buf.len() <= cap {
         return;

@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { useAppState, isTerminalTab, tabKeyId } from "../store/appState";
+import { useAppState, isMarketplaceTab, isTerminalTab, tabKeyId } from "../store/appState";
 import { useTerminal } from "./useTerminal";
 
 /**
@@ -62,6 +62,8 @@ export function useKeyboardShortcuts() {
           closeTerminal(tabKeyId(key)).catch((err) =>
             console.error("Failed to close terminal:", err),
           );
+        } else if (isMarketplaceTab(key)) {
+          state.closeMarketplaceTab();
         } else {
           state.closeHomeTab(tabKeyId(key));
         }

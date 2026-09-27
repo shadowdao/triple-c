@@ -78,7 +78,7 @@ export default function NotesDock() {
   if (!notesDockOpen) return null;
 
   // Follow whatever is in front: a home tab is its own project, a terminal tab
-  // is the project it belongs to.
+  // is the project it belongs to. The Marketplace tab belongs to no project.
   let projectId: string | null = null;
   if (activeTabKey && isHomeTab(activeTabKey)) {
     projectId = tabKeyId(activeTabKey);

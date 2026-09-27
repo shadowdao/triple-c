@@ -85,6 +85,10 @@ export const isTerminalTab = (key: string) => key.startsWith("term:");
 export const isHomeTab = (key: string) => key.startsWith("home:");
 export const tabKeyId = (key: string) => key.slice(key.indexOf(":") + 1);
 
+/** The Marketplace view is a singleton main-area tab; its key has no id part. */
+export const MARKETPLACE_TAB_KEY = "marketplace";
+export const isMarketplaceTab = (key: string) => key === MARKETPLACE_TAB_KEY;
+
 /** activeSessionId is derived from the active tab so exactly one thing is "current". */
 function activation(activeTabKey: string | null) {
   return {
@@ -160,6 +164,12 @@ interface AppState {
   requestTerminalFocus: (sessionId: string) => void;
   clearPendingTerminalFocus: () => void;
   closeHomeTab: (projectId: string) => void;
+  /** Project the Marketplace view is filtered to, or null for all projects. */
+  marketplaceFilterProjectId: string | null;
+  setMarketplaceFilterProjectId: (projectId: string | null) => void;
+  /** Open (or focus) the singleton Marketplace tab, optionally filtered to one project. */
+  openMarketplace: (filterProjectId?: string | null) => void;
+  closeMarketplaceTab: () => void;
   setActiveTabKey: (key: string) => void;
   cycleTab: (delta: number) => void;
   focusTabIndex: (index: number) => void;
@@ -382,6 +392,27 @@ export const useAppState = create<AppState>((set) => ({
       const tabOrder = state.tabOrder.filter((k) => k !== key);
       const activeTabKey =
         state.activeTabKey === key
+          ? (tabOrder[Math.min(index, tabOrder.length - 1)] ?? null)
+          : state.activeTabKey;
+      return { tabOrder, ...activation(activeTabKey) };
+    }),
+  marketplaceFilterProjectId: null,
+  setMarketplaceFilterProjectId: (projectId) => set({ marketplaceFilterProjectId: projectId }),
+  openMarketplace: (filterProjectId = null) =>
+    set((state) => ({
+      marketplaceFilterProjectId: filterProjectId,
+      tabOrder: state.tabOrder.includes(MARKETPLACE_TAB_KEY)
+        ? state.tabOrder
+        : [...state.tabOrder, MARKETPLACE_TAB_KEY],
+      ...activation(MARKETPLACE_TAB_KEY),
+    })),
+  closeMarketplaceTab: () =>
+    set((state) => {
+      const index = state.tabOrder.indexOf(MARKETPLACE_TAB_KEY);
+      if (index === -1) return {};
+      const tabOrder = state.tabOrder.filter((k) => k !== MARKETPLACE_TAB_KEY);
+      const activeTabKey =
+        state.activeTabKey === MARKETPLACE_TAB_KEY
           ? (tabOrder[Math.min(index, tabOrder.length - 1)] ?? null)
           : state.activeTabKey;
       return { tabOrder, ...activation(activeTabKey) };

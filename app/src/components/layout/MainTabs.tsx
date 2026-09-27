@@ -5,6 +5,7 @@ import { useProjects } from "../../hooks/useProjects";
 import {
   useAppState,
   isHomeTab,
+  isMarketplaceTab,
   tabKeyId,
   terminalTabKey,
 } from "../../store/appState";
@@ -41,12 +42,13 @@ const MODE_BADGE: Record<PermissionMode, { text: string; className: string }> = 
 export default function MainTabs() {
   const { sessions, close } = useTerminal();
   const { projects, update } = useProjects();
-  const { tabOrder, activeTabKey, setActiveTabKey, closeHomeTab, moveTab } = useAppState(
+  const { tabOrder, activeTabKey, setActiveTabKey, closeHomeTab, closeMarketplaceTab, moveTab } = useAppState(
     useShallow((s) => ({
       tabOrder: s.tabOrder,
       activeTabKey: s.activeTabKey,
       setActiveTabKey: s.setActiveTabKey,
       closeHomeTab: s.closeHomeTab,
+      closeMarketplaceTab: s.closeMarketplaceTab,
       moveTab: s.moveTab,
     })),
   );
@@ -192,6 +194,7 @@ export default function MainTabs() {
    * worse than no ghost.
    */
   const tabLabel = (key: string): string => {
+    if (isMarketplaceTab(key)) return "Marketplace";
     if (isHomeTab(key)) {
       return projects.find((p) => p.id === tabKeyId(key))?.name ?? "";
     }
@@ -272,7 +275,7 @@ export default function MainTabs() {
         x: e.clientX - drag.offsetX,
         y: drag.top,
         label: tabLabel(drag.key),
-        icon: isHomeTab(drag.key) ? "⌂" : "▣",
+        icon: isMarketplaceTab(drag.key) ? "◈" : isHomeTab(drag.key) ? "⌂" : "▣",
       });
     },
     onPointerUp: (e: React.PointerEvent<HTMLDivElement>) => {
@@ -313,6 +316,41 @@ export default function MainTabs() {
 
   const renderTab = (key: string, index: number) => {
     const active = activeTabKey === key;
+
+    if (isMarketplaceTab(key)) {
+      return (
+        <div
+          role="tab"
+          aria-selected={active}
+          tabIndex={0}
+          data-tab-index={index}
+          onClick={() => activateTab(key)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              setActiveTabKey(key);
+            }
+          }}
+          {...pointerProps(key, false)}
+          className={tabClass(active, dragKey === key)}
+        >
+          <span aria-hidden="true" className="text-[var(--text-secondary)]">◈</span>
+          <span className="truncate max-w-[160px]">Marketplace</span>
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              closeMarketplaceTab();
+            }}
+            aria-label="Close Marketplace tab"
+            title="Close tab"
+            className="w-6 h-6 flex items-center justify-center rounded-[var(--radius-control)] text-[var(--text-secondary)] hover:text-[var(--error)] hover:bg-[var(--bg-tertiary)] transition-colors"
+          >
+            <span aria-hidden="true">×</span>
+          </button>
+        </div>
+      );
+    }
 
     if (isHomeTab(key)) {
       const projectId = tabKeyId(key);

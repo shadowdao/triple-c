@@ -43,11 +43,16 @@ zeroize = "1"
 # container. Already in the tree transitively (reqwest), and the point of
 # using it rather than hand-rolling is parity with the frontend's `new URL()`.
 url = "2"
+similar = "2"
+# Marketplace repos are fetched on the host into a bare cache (spec §3).
+# Blocking client + rustls: no git binary or OpenSSL needed on the host.
+gix = { version = "0.88", default-features = false, features = ["blocking-network-client", "blocking-http-transport-reqwest-rust-tls", "credentials", "sha1"] }
 
 [dev-dependencies]
 # `test-util` (not part of tokio's `full`) lets the auto-start retry tests run
 # their backoff schedule under a paused clock instead of in real seconds.
 tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

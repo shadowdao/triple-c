@@ -351,6 +351,24 @@
           "markdownDescription": "Enables the acquire_claude_token command without any pre-configured scope."
         },
         {
+          "description": "Enables the add_marketplace command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-add-marketplace",
+          "markdownDescription": "Enables the add_marketplace command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the add_marketplace_gh_host_account command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-add-marketplace-gh-host-account",
+          "markdownDescription": "Enables the add_marketplace_gh_host_account command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the add_marketplace_token_account command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-add-marketplace-token-account",
+          "markdownDescription": "Enables the add_marketplace_token_account command without any pre-configured scope."
+        },
+        {
           "description": "Enables the add_project command without any pre-configured scope.",
           "type": "string",
           "const": "allow-add-project",
@@ -361,6 +379,12 @@
           "type": "string",
           "const": "allow-add-scheduled-task",
           "markdownDescription": "Enables the add_scheduled_task command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the apply_marketplace_now command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-apply-marketplace-now",
+          "markdownDescription": "Enables the apply_marketplace_now command without any pre-configured scope."
         },
         {
           "description": "Enables the apply_settings_import command without any pre-configured scope.",
@@ -397,6 +421,12 @@
           "type": "string",
           "const": "allow-cancel-claude-token",
           "markdownDescription": "Enables the cancel_claude_token command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cancel_marketplace_gh_login command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-cancel-marketplace-gh-login",
+          "markdownDescription": "Enables the cancel_marketplace_gh_login command without any pre-configured scope."
         },
         {
           "description": "Enables the check_browser_view_support command without any pre-configured scope.",
@@ -525,6 +555,12 @@
           "markdownDescription": "Enables the export_settings command without any pre-configured scope."
         },
         {
+          "description": "Enables the forget_marketplace_installs command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-forget-marketplace-installs",
+          "markdownDescription": "Enables the forget_marketplace_installs command without any pre-configured scope."
+        },
+        {
           "description": "Enables the get_app_version command without any pre-configured scope.",
           "type": "string",
           "const": "allow-get-app-version",
@@ -591,6 +627,12 @@
           "markdownDescription": "Enables the get_help_content command without any pre-configured scope."
         },
         {
+          "description": "Enables the get_marketplace_sync_report command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-marketplace-sync-report",
+          "markdownDescription": "Enables the get_marketplace_sync_report command without any pre-configured scope."
+        },
+        {
           "description": "Enables the get_migration_state command without any pre-configured scope.",
           "type": "string",
           "const": "allow-get-migration-state",
@@ -651,6 +693,12 @@
           "markdownDescription": "Enables the install_browser_view_support command without any pre-configured scope."
         },
         {
+          "description": "Enables the install_marketplace_item command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-install-marketplace-item",
+          "markdownDescription": "Enables the install_marketplace_item command without any pre-configured scope."
+        },
+        {
           "description": "Enables the list_aws_profiles command without any pre-configured scope.",
           "type": "string",
           "const": "allow-list-aws-profiles",
@@ -675,6 +723,18 @@
           "markdownDescription": "Enables the list_container_files command without any pre-configured scope."
         },
         {
+          "description": "Enables the list_marketplace_snapshots command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-list-marketplace-snapshots",
+          "markdownDescription": "Enables the list_marketplace_snapshots command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the list_marketplace_updates command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-list-marketplace-updates",
+          "markdownDescription": "Enables the list_marketplace_updates command without any pre-configured scope."
+        },
+        {
           "description": "Enables the list_notes command without any pre-configured scope.",
           "type": "string",
           "const": "allow-list-notes",
@@ -691,6 +751,18 @@
           "type": "string",
           "const": "allow-list-scheduled-tasks",
           "markdownDescription": "Enables the list_scheduled_tasks command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the marketplace_gh_host_available command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-marketplace-gh-host-available",
+          "markdownDescription": "Enables the marketplace_gh_host_available command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the marketplace_item_diff command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-marketplace-item-diff",
+          "markdownDescription": "Enables the marketplace_item_diff command without any pre-configured scope."
         },
         {
           "description": "Enables the migrate_project_to_base command without any pre-configured scope.",
@@ -777,6 +849,12 @@
           "markdownDescription": "Enables the reconcile_project_statuses command without any pre-configured scope."
         },
         {
+          "description": "Enables the refresh_marketplaces command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-refresh-marketplaces",
+          "markdownDescription": "Enables the refresh_marketplaces command without any pre-configured scope."
+        },
+        {
           "description": "Enables the regenerate_gateway_auth_token command without any pre-configured scope.",
           "type": "string",
           "const": "allow-regenerate-gateway-auth-token",
@@ -787,6 +865,18 @@
           "type": "string",
           "const": "allow-regenerate-web-terminal-token",
           "markdownDescription": "Enables the regenerate_web_terminal_token command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the remove_marketplace command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-remove-marketplace",
+          "markdownDescription": "Enables the remove_marketplace command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the remove_marketplace_account command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-remove-marketplace-account",
+          "markdownDescription": "Enables the remove_marketplace_account command without any pre-configured scope."
         },
         {
           "description": "Enables the remove_project command without any pre-configured scope.",
@@ -879,6 +969,12 @@
           "markdownDescription": "Enables the set_gateway_api_key command without any pre-configured scope."
         },
         {
+          "description": "Enables the set_global_item_disabled command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-global-item-disabled",
+          "markdownDescription": "Enables the set_global_item_disabled command without any pre-configured scope."
+        },
+        {
           "description": "Enables the set_scheduled_task_enabled command without any pre-configured scope.",
           "type": "string",
           "const": "allow-set-scheduled-task-enabled",
@@ -895,6 +991,12 @@
           "type": "string",
           "const": "allow-start-gateway",
           "markdownDescription": "Enables the start_gateway command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the start_marketplace_gh_container_login command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-start-marketplace-gh-container-login",
+          "markdownDescription": "Enables the start_marketplace_gh_container_login command without any pre-configured scope."
         },
         {
           "description": "Enables the start_project_container command without any pre-configured scope.",
@@ -969,10 +1071,34 @@
           "markdownDescription": "Enables the terminal_resize command without any pre-configured scope."
         },
         {
+          "description": "Enables the test_marketplace_account command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-test-marketplace-account",
+          "markdownDescription": "Enables the test_marketplace_account command without any pre-configured scope."
+        },
+        {
           "description": "Enables the transcribe_audio command without any pre-configured scope.",
           "type": "string",
           "const": "allow-transcribe-audio",
           "markdownDescription": "Enables the transcribe_audio command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the uninstall_marketplace_item command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-uninstall-marketplace-item",
+          "markdownDescription": "Enables the uninstall_marketplace_item command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the update_marketplace command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-update-marketplace",
+          "markdownDescription": "Enables the update_marketplace command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the update_marketplace_item command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-update-marketplace-item",
+          "markdownDescription": "Enables the update_marketplace_item command without any pre-configured scope."
         },
         {
           "description": "Enables the update_project command without any pre-configured scope.",
@@ -1041,6 +1167,24 @@
           "markdownDescription": "Denies the acquire_claude_token command without any pre-configured scope."
         },
         {
+          "description": "Denies the add_marketplace command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-add-marketplace",
+          "markdownDescription": "Denies the add_marketplace command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the add_marketplace_gh_host_account command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-add-marketplace-gh-host-account",
+          "markdownDescription": "Denies the add_marketplace_gh_host_account command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the add_marketplace_token_account command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-add-marketplace-token-account",
+          "markdownDescription": "Denies the add_marketplace_token_account command without any pre-configured scope."
+        },
+        {
           "description": "Denies the add_project command without any pre-configured scope.",
           "type": "string",
           "const": "deny-add-project",
@@ -1051,6 +1195,12 @@
           "type": "string",
           "const": "deny-add-scheduled-task",
           "markdownDescription": "Denies the add_scheduled_task command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the apply_marketplace_now command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-apply-marketplace-now",
+          "markdownDescription": "Denies the apply_marketplace_now command without any pre-configured scope."
         },
         {
           "description": "Denies the apply_settings_import command without any pre-configured scope.",
@@ -1087,6 +1237,12 @@
           "type": "string",
           "const": "deny-cancel-claude-token",
           "markdownDescription": "Denies the cancel_claude_token command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cancel_marketplace_gh_login command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-cancel-marketplace-gh-login",
+          "markdownDescription": "Denies the cancel_marketplace_gh_login command without any pre-configured scope."
         },
         {
           "description": "Denies the check_browser_view_support command without any pre-configured scope.",
@@ -1215,6 +1371,12 @@
           "markdownDescription": "Denies the export_settings command without any pre-configured scope."
         },
         {
+          "description": "Denies the forget_marketplace_installs command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-forget-marketplace-installs",
+          "markdownDescription": "Denies the forget_marketplace_installs command without any pre-configured scope."
+        },
+        {
           "description": "Denies the get_app_version command without any pre-configured scope.",
           "type": "string",
           "const": "deny-get-app-version",
@@ -1281,6 +1443,12 @@
           "markdownDescription": "Denies the get_help_content command without any pre-configured scope."
         },
         {
+          "description": "Denies the get_marketplace_sync_report command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-marketplace-sync-report",
+          "markdownDescription": "Denies the get_marketplace_sync_report command without any pre-configured scope."
+        },
+        {
           "description": "Denies the get_migration_state command without any pre-configured scope.",
           "type": "string",
           "const": "deny-get-migration-state",
@@ -1341,6 +1509,12 @@
           "markdownDescription": "Denies the install_browser_view_support command without any pre-configured scope."
         },
         {
+          "description": "Denies the install_marketplace_item command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-install-marketplace-item",
+          "markdownDescription": "Denies the install_marketplace_item command without any pre-configured scope."
+        },
+        {
           "description": "Denies the list_aws_profiles command without any pre-configured scope.",
           "type": "string",
           "const": "deny-list-aws-profiles",
@@ -1365,6 +1539,18 @@
           "markdownDescription": "Denies the list_container_files command without any pre-configured scope."
         },
         {
+          "description": "Denies the list_marketplace_snapshots command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-list-marketplace-snapshots",
+          "markdownDescription": "Denies the list_marketplace_snapshots command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the list_marketplace_updates command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-list-marketplace-updates",
+          "markdownDescription": "Denies the list_marketplace_updates command without any pre-configured scope."
+        },
+        {
           "description": "Denies the list_notes command without any pre-configured scope.",
           "type": "string",
           "const": "deny-list-notes",
@@ -1381,6 +1567,18 @@
           "type": "string",
           "const": "deny-list-scheduled-tasks",
           "markdownDescription": "Denies the list_scheduled_tasks command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the marketplace_gh_host_available command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-marketplace-gh-host-available",
+          "markdownDescription": "Denies the marketplace_gh_host_available command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the marketplace_item_diff command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-marketplace-item-diff",
+          "markdownDescription": "Denies the marketplace_item_diff command without any pre-configured scope."
         },
         {
           "description": "Denies the migrate_project_to_base command without any pre-configured scope.",
@@ -1467,6 +1665,12 @@
           "markdownDescription": "Denies the reconcile_project_statuses command without any pre-configured scope."
         },
         {
+          "description": "Denies the refresh_marketplaces command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-refresh-marketplaces",
+          "markdownDescription": "Denies the refresh_marketplaces command without any pre-configured scope."
+        },
+        {
           "description": "Denies the regenerate_gateway_auth_token command without any pre-configured scope.",
           "type": "string",
           "const": "deny-regenerate-gateway-auth-token",
@@ -1477,6 +1681,18 @@
           "type": "string",
           "const": "deny-regenerate-web-terminal-token",
           "markdownDescription": "Denies the regenerate_web_terminal_token command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the remove_marketplace command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-remove-marketplace",
+          "markdownDescription": "Denies the remove_marketplace command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the remove_marketplace_account command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-remove-marketplace-account",
+          "markdownDescription": "Denies the remove_marketplace_account command without any pre-configured scope."
         },
         {
           "description": "Denies the remove_project command without any pre-configured scope.",
@@ -1569,6 +1785,12 @@
           "markdownDescription": "Denies the set_gateway_api_key command without any pre-configured scope."
         },
         {
+          "description": "Denies the set_global_item_disabled command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-global-item-disabled",
+          "markdownDescription": "Denies the set_global_item_disabled command without any pre-configured scope."
+        },
+        {
           "description": "Denies the set_scheduled_task_enabled command without any pre-configured scope.",
           "type": "string",
           "const": "deny-set-scheduled-task-enabled",
@@ -1585,6 +1807,12 @@
           "type": "string",
           "const": "deny-start-gateway",
           "markdownDescription": "Denies the start_gateway command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the start_marketplace_gh_container_login command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-start-marketplace-gh-container-login",
+          "markdownDescription": "Denies the start_marketplace_gh_container_login command without any pre-configured scope."
         },
         {
           "description": "Denies the start_project_container command without any pre-configured scope.",
@@ -1659,10 +1887,34 @@
           "markdownDescription": "Denies the terminal_resize command without any pre-configured scope."
         },
         {
+          "description": "Denies the test_marketplace_account command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-test-marketplace-account",
+          "markdownDescription": "Denies the test_marketplace_account command without any pre-configured scope."
+        },
+        {
           "description": "Denies the transcribe_audio command without any pre-configured scope.",
           "type": "string",
           "const": "deny-transcribe-audio",
           "markdownDescription": "Denies the transcribe_audio command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the uninstall_marketplace_item command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-uninstall-marketplace-item",
+          "markdownDescription": "Denies the uninstall_marketplace_item command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the update_marketplace command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-update-marketplace",
+          "markdownDescription": "Denies the update_marketplace command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the update_marketplace_item command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-update-marketplace-item",
+          "markdownDescription": "Denies the update_marketplace_item command without any pre-configured scope."
         },
         {
           "description": "Denies the update_project command without any pre-configured scope.",

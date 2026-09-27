@@ -7,6 +7,7 @@ mod docker;
 pub mod file_viewer;
 mod install_helper;
 mod logging;
+mod marketplace;
 mod models;
 mod project_lock;
 mod storage;
@@ -48,6 +49,7 @@ pub struct AppState {
     /// preview is not actually binding on what gets applied.
     pub pending_settings_import:
         Arc<tokio::sync::Mutex<Option<commands::settings_export_commands::PendingSettingsImport>>>,
+    pub marketplace: Arc<marketplace::MarketplaceManager>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -224,6 +226,12 @@ pub fn run() {
     let exec_manager = Arc::new(ExecSessionManager::new());
     let auth_bridge = Arc::new(AuthBridgeManager::new());
     let lifecycle = Arc::new(Lifecycle::new());
+    let marketplace = Arc::new(marketplace::MarketplaceManager::new(
+        dirs::data_dir()
+            .map(|d| d.join("triple-c"))
+            .unwrap_or_else(|| std::env::temp_dir().join("triple-c")),
+    ));
+    let marketplace_setup = marketplace.clone();
 
     // Clone Arcs for the setup closure (web terminal auto-start)
     let projects_store_setup = projects_store.clone();
@@ -242,6 +250,7 @@ pub fn run() {
             web_terminal_server: Arc::new(tokio::sync::Mutex::new(None)),
             lifecycle,
             pending_settings_import: Arc::new(tokio::sync::Mutex::new(None)),
+            marketplace,
         })
         .manage(file_viewer::registry::ViewerRegistry::default())
         .setup(move |app| {
@@ -297,6 +306,25 @@ pub fn run() {
                 )
                 .await;
             });
+
+            // Marketplaces: refresh each once at startup, in the background.
+            // Failures are logged, not toasted — the Marketplace tab shows them.
+            {
+                let settings = settings_store_setup.get();
+                let settings_store = settings_store_setup.clone();
+                let marketplace = marketplace_setup.clone();
+                tauri::async_runtime::spawn(async move {
+                    for m in &settings.marketplaces {
+                        // Reads the store again under the lock: one removed
+                        // since startup is skipped (PR review #6).
+                        let current = || settings_store.get();
+                        let snap = crate::marketplace::refresh_marketplace(&marketplace, &current, &m.id).await;
+                        if let Some(e) = snap.fetch_error {
+                            log::warn!("Marketplace \"{}\" could not be refreshed at startup: {}", m.name, e);
+                        }
+                    }
+                });
+            }
 
             // Auto-start web terminal server if enabled in settings
             let settings = settings_store_setup.get();
@@ -519,6 +547,28 @@ pub fn run() {
             commands::auth_token_commands::has_claude_token,
             commands::auth_token_commands::clear_claude_token,
             commands::auth_token_commands::sweep_claude_token_snapshots,
+            // Marketplace
+            commands::marketplace_commands::list_marketplace_snapshots,
+            commands::marketplace_commands::refresh_marketplaces,
+            commands::marketplace_commands::add_marketplace,
+            commands::marketplace_commands::update_marketplace,
+            commands::marketplace_commands::remove_marketplace,
+            commands::marketplace_commands::install_marketplace_item,
+            commands::marketplace_commands::uninstall_marketplace_item,
+            commands::marketplace_commands::set_global_item_disabled,
+            commands::marketplace_commands::forget_marketplace_installs,
+            commands::marketplace_commands::list_marketplace_updates,
+            commands::marketplace_commands::marketplace_item_diff,
+            commands::marketplace_commands::update_marketplace_item,
+            commands::marketplace_commands::apply_marketplace_now,
+            commands::marketplace_commands::get_marketplace_sync_report,
+            commands::marketplace_commands::add_marketplace_token_account,
+            commands::marketplace_commands::add_marketplace_gh_host_account,
+            commands::marketplace_commands::start_marketplace_gh_container_login,
+            commands::marketplace_commands::cancel_marketplace_gh_login,
+            commands::marketplace_commands::test_marketplace_account,
+            commands::marketplace_commands::remove_marketplace_account,
+            commands::marketplace_commands::marketplace_gh_host_available,
             // Settings
             commands::settings_commands::get_settings,
             commands::settings_commands::update_settings,

@@ -28,6 +28,13 @@ export function describeImport(preview: SettingsImportPreview): string[] {
   if (preview.image_source === "custom") {
     items.push(`Docker image: ${preview.custom_image_name ?? "(no image name set)"}`);
   }
+  if (preview.marketplace_count > 0) {
+    items.push(`${preview.marketplace_count} marketplace${preview.marketplace_count === 1 ? "" : "s"}`);
+  }
+  if (preview.marketplace_account_token_count > 0) {
+    const n = preview.marketplace_account_token_count;
+    items.push(`${n} marketplace account token${n === 1 ? "" : "s"}`);
+  }
   return items;
 }
 
@@ -45,6 +52,11 @@ export function describeImport(preview: SettingsImportPreview): string[] {
  * through the UI, with no import-time signal that it wasn't freshly
  * generated.
  *
+ * Global marketplace hooks get one too: a hook runs commands in every
+ * project container, and an imported install never passed the hook-confirm
+ * step an install from the Marketplace tab shows. Global plugins likewise:
+ * a plugin can carry its own hooks and MCP servers.
+ *
  * A custom Docker image gets a warning every time, not just on change: it's
  * the image every project container is created from, so it's worth calling
  * out regardless of what was configured before the import.
@@ -56,6 +68,18 @@ export function describeImportWarnings(preview: SettingsImportPreview): string[]
   } else if (preview.has_web_terminal_access_token) {
     warnings.push(
       "Includes a web terminal access token that will activate the next time the web terminal is turned on.",
+    );
+  }
+  if (preview.global_hook_install_count > 0) {
+    const n = preview.global_hook_install_count;
+    warnings.push(
+      `Installs ${n} marketplace hook${n === 1 ? "" : "s"} for all projects. Hooks run commands in every project container, and these skip the confirmation that lists a hook's commands before a Marketplace tab install.`,
+    );
+  }
+  if (preview.global_plugin_install_count > 0) {
+    const n = preview.global_plugin_install_count;
+    warnings.push(
+      `Installs ${n} marketplace plugin${n === 1 ? "" : "s"} for all projects. Plugins can bring their own hooks, MCP servers and commands into every project container, and these skip the confirmation that lists what a plugin brings before a Marketplace tab install.`,
     );
   }
   if (preview.image_source === "custom") {

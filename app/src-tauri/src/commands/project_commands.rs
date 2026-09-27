@@ -1112,7 +1112,14 @@ pub async fn update_project(
     // for every already-running container at launch. The version of this that
     // re-asserted on every save is what turned a stale flag in a payload into a
     // restarted bridge.
-    state.projects_store.update(project)
+    //
+    // The restore above served the validation; it is redone under the store's
+    // lock against the record as it is *now*, so a marketplace install, a
+    // status change or a container id landing since `stored` was read is kept
+    // rather than written over.
+    state
+        .projects_store
+        .update_restoring(project, restore_store_owned_fields)
 }
 
 /// Restore onto `project` the fields whose value belongs to the store rather
@@ -1148,6 +1155,9 @@ fn restore_store_owned_fields(project: &mut Project, stored: &Project) {
     project.browser_view_enabled = stored.browser_view_enabled;
     project.auth_bridge_enabled = stored.auth_bridge_enabled;
     project.created_at = stored.created_at.clone();
+    // Owned by the marketplace commands; a Config-tab save carries a stale copy.
+    project.marketplace_installs = stored.marketplace_installs.clone();
+    project.marketplace_disabled = stored.marketplace_disabled.clone();
 }
 
 #[tauri::command]
@@ -1448,6 +1458,16 @@ async fn start_project_container_locked(
         if let Err(e) = docker::sync_bedrock_credentials(&container_id, &project).await {
             log::warn!("Failed to sync AWS credentials for project {}: {}", project.id, e);
         }
+
+        // Marketplace items sync in the background — see `spawn_project_sync`
+        // for why the start never waits on it or fails because of it.
+        crate::marketplace::spawn_project_sync(
+            app_handle.clone(),
+            state.marketplace.clone(),
+            state.settings_store.get(),
+            project.clone(),
+            container_id.clone(),
+        );
 
         Ok(container_id)
     }.await;
@@ -2289,5 +2309,29 @@ mod tests {
         assert_eq!(payload.container_id.as_deref(), Some("abc123"));
         assert_eq!(payload.status, ProjectStatus::Running);
         assert_eq!(payload.created_at, stored.created_at);
+    }
+
+    /// The marketplace commands own a project's installs and opt-outs; the
+    /// Config tab's next unrelated save carries a stale copy of both.
+    #[test]
+    fn a_stale_save_cannot_undo_a_marketplace_install() {
+        use crate::models::marketplace::{ItemKind, MarketplaceInstall, MarketplaceItemRef};
+        let (mut stored, mut payload) = stored_and_stale_payload();
+        stored.marketplace_installs = vec![MarketplaceInstall {
+            marketplace_id: "m1".into(),
+            kind: ItemKind::Agent,
+            key: "code-reviewer".into(),
+            commit: "a".repeat(40),
+        }];
+        stored.marketplace_disabled = vec![MarketplaceItemRef {
+            marketplace_id: "m1".into(),
+            kind: ItemKind::Hook,
+            key: "h".into(),
+        }];
+
+        restore_store_owned_fields(&mut payload, &stored);
+
+        assert_eq!(payload.marketplace_installs, stored.marketplace_installs);
+        assert_eq!(payload.marketplace_disabled, stored.marketplace_disabled);
     }
 }

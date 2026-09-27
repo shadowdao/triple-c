@@ -15,6 +15,7 @@ Triple-C (Claude-Code-Container) is a desktop application that runs Claude Code 
 - [Permission Modes](#permission-modes)
 - [Project Configuration](#project-configuration)
 - [Shared Claude Authentication](#shared-claude-authentication)
+- [Marketplace](#marketplace)
 - [Opening URLs in Your Browser (URL Relay)](#opening-urls-in-your-browser-url-relay)
 - [Browser Logins Inside the Container (Auth Bridge)](#browser-logins-inside-the-container-auth-bridge)
 - [AWS Bedrock Configuration](#aws-bedrock-configuration)
@@ -770,6 +771,28 @@ is next started, at which point the same recreation clears the variable.
 > While `setup-token` is running, its output is filtered so anything resembling an `sk-ant-`
 > secret is masked before it reaches the screen — including a secret split across two chunks of
 > output.
+
+---
+
+## Marketplace
+
+The marketplace installs Claude Code **agents, skills, commands, hooks and plugins** from git repositories into your containers.
+
+1. **Settings → Marketplace → Open Marketplace** opens the Marketplace tab.
+2. **Add a marketplace**: on the Browse tab choose *Add marketplace* and enter an HTTPS clone URL, for example `https://github.com/shadowdao/triple-c-marketplace.git`. For a private repository, pick an account (see below). Triple-C checks it can read the repository before saving.
+3. **Install**: select an item to see what it contains. Turn on **All projects** to install it everywhere (including projects you add later), or tick individual projects. A project can opt out of an "All projects" item by unticking it, or from **Project → Config → Marketplace**.
+4. **Hooks** run shell commands, so Triple-C shows every command before installing one.
+5. **When it applies**: on the container's next start, or straight away for running containers with **Installed → Apply now**. New Claude sessions pick it up; sessions already open keep what they loaded.
+
+**Updates.** Every install is pinned to the commit it came from. When an item changes in its repository, the Installed tab shows *Update available*. Review the diff and accept to move the pin.
+
+**Accounts (private repositories).** On the Accounts tab:
+- *GitHub via gh* — if the GitHub CLI is installed and logged in on this computer, Triple-C uses it. If not, it runs `gh auth login` inside a running project's container and keeps only the resulting token in your OS keychain.
+- *Access token* — any host (GitHub, Gitea, GitLab). The token is stored in your OS keychain.
+
+Credentials never enter containers. If a private repository in a GitHub organisation cannot be read, the error explains the usual causes: the org has not approved the GitHub CLI, the token is not authorised for the org's SSO, or a fine-grained token belongs to a different owner.
+
+**If an item is skipped**: Triple-C never overwrites an agent, skill or command file you created yourself. If one has the same name as a marketplace item, the sync skips it and the project's Config → Marketplace section says so.
 
 ---
 

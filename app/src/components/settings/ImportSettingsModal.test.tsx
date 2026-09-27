@@ -32,6 +32,10 @@ const samplePreview: SettingsImportPreview = {
   gateway_api_base: null,
   image_source: "registry",
   custom_image_name: null,
+  marketplace_count: 0,
+  global_hook_install_count: 0,
+  global_plugin_install_count: 0,
+  marketplace_account_token_count: 0,
 };
 
 function outcome(settings: AppSettings, secretRestoreWarnings: string[] = []): SettingsImportOutcome {

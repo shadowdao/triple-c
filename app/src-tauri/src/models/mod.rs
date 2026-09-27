@@ -1,6 +1,7 @@
 pub mod app_settings;
 pub mod container_config;
 pub mod gateway_settings;
+pub mod marketplace;
 pub mod migration;
 pub mod note;
 pub mod project;

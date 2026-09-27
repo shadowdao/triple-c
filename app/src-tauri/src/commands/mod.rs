@@ -8,6 +8,7 @@ pub mod gateway_commands;
 pub mod help_commands;
 pub mod inspect_commands;
 pub mod install_helper_commands;
+pub mod marketplace_commands;
 pub mod migration_commands;
 pub mod notes_commands;
 pub mod project_commands;

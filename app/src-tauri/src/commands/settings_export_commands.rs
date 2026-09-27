@@ -41,6 +41,9 @@ use tauri::State;
 use tauri_plugin_dialog::DialogExt;
 use zeroize::Zeroizing;
 
+use std::collections::BTreeMap;
+
+use crate::models::marketplace::{AccountMethod, MarketplaceAccount};
 use crate::models::{
     AppSettings, ExportedSecrets, SettingsExportPayload, SettingsImportOutcome,
     SettingsImportPreview, SETTINGS_EXPORT_FORMAT_VERSION,
@@ -131,9 +134,54 @@ fn split_settings_and_secrets(current: AppSettings) -> (AppSettings, ExportedSec
         gateway_api_key: secure::get_gateway_api_key().unwrap_or_default(),
         gateway_master_key: secure::get_gateway_master_key().unwrap_or_default(),
         web_terminal_access_token,
+        marketplace_account_tokens: exported_marketplace_tokens(
+            &settings.marketplace_accounts,
+            secure::get_marketplace_token,
+        ),
     };
 
     (settings, secrets)
+}
+
+/// The stored token of every marketplace account that has one, by account
+/// id. A `GhHost` account stores none (its token is asked of the host's `gh`
+/// each time), so it is not read. A missing or unreadable token is left out,
+/// like the other keychain secrets above.
+fn exported_marketplace_tokens(
+    accounts: &[MarketplaceAccount],
+    get: impl Fn(&str) -> Result<Option<String>, String>,
+) -> BTreeMap<String, String> {
+    accounts
+        .iter()
+        .filter(|a| a.method != AccountMethod::GhHost)
+        .filter_map(|a| {
+            let token = non_blank(get(&a.id).unwrap_or_default())?;
+            Some((a.id.clone(), token))
+        })
+        .collect()
+}
+
+/// Write each imported marketplace token to the keychain, returning a
+/// warning (never containing the token) for each one that could not be.
+fn restore_marketplace_tokens(
+    tokens: &BTreeMap<String, String>,
+    mut store: impl FnMut(&str, &str) -> Result<(), String>,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (account_id, token) in tokens {
+        if let Err(e) = store(account_id, token) {
+            log::warn!(
+                "Settings import: could not restore the token of marketplace account {}: {}",
+                account_id,
+                e
+            );
+            warnings.push(format!(
+                "Could not restore a marketplace account's token ({}); sign that account in again.",
+                e
+            ));
+        }
+    }
+    warnings
 }
 
 /// Export the current global settings and secrets to a password-encrypted
@@ -320,6 +368,13 @@ pub async fn apply_settings_import(
         .or_else(|| current.web_terminal.access_token.clone());
 
     crate::commands::settings_commands::validate_settings_update(&current, &settings)?;
+    // The marketplace half, with the commands' own rules and normalisation,
+    // also before anything is written (pre-flight F10).
+    let marketplace_tokens = payload.secrets.marketplace_account_tokens;
+    crate::commands::marketplace_commands::validate_imported_marketplace_state(
+        &mut settings,
+        &marketplace_tokens,
+    )?;
 
     let mut secret_restore_warnings = Vec::new();
     let mut gateway_secret_changed = false;
@@ -363,8 +418,36 @@ pub async fn apply_settings_import(
         }
     }
 
+    secret_restore_warnings.extend(restore_marketplace_tokens(
+        &marketplace_tokens,
+        secure::store_marketplace_token,
+    ));
+
+    let imported_marketplace = (
+        settings.marketplace_accounts.clone(),
+        settings.marketplaces.clone(),
+        settings.global_marketplace_installs.clone(),
+    );
     let saved =
         crate::commands::settings_commands::update_settings(settings, state.clone()).await?;
+    // `update_settings` keeps marketplace state store-owned. An import is the
+    // one caller entitled to replace it wholesale.
+    let saved = {
+        let mut s = saved;
+        (
+            s.marketplace_accounts,
+            s.marketplaces,
+            s.global_marketplace_installs,
+        ) = imported_marketplace;
+        state.settings_store.update(s)?
+    };
+    // Caches of marketplaces the import dropped are dead weight now, and
+    // the pins must match the imported installs.
+    use crate::commands::marketplace_commands as mc;
+    for id in mc::dropped_marketplace_ids(&current, &saved) {
+        mc::remove_cache(&state, &id).await;
+    }
+    mc::refresh_pins(&state).await;
 
     // `reconcile_gateway` (inside `update_settings`) only reacts to a changed
     // *shape* — port, provider, base URL, models — because that's what's
@@ -650,5 +733,98 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn account(id: &str, method: AccountMethod) -> MarketplaceAccount {
+        MarketplaceAccount {
+            id: id.to_string(),
+            label: format!("Account {id}"),
+            host: "github.com".to_string(),
+            method,
+            username: None,
+        }
+    }
+
+    #[test]
+    fn export_carries_stored_tokens_of_token_and_container_accounts_only() {
+        let accounts = vec![
+            account("a-token", AccountMethod::Token),
+            account("a-container", AccountMethod::GhContainer),
+            account("a-host", AccountMethod::GhHost),
+            account("a-missing", AccountMethod::Token),
+            account("a-broken", AccountMethod::Token),
+        ];
+        let tokens = exported_marketplace_tokens(&accounts, |id| match id {
+            "a-token" => Ok(Some("test-token-not-real-1".to_string())),
+            "a-container" => Ok(Some("test-token-not-real-2".to_string())),
+            "a-host" => panic!("a gh-host account stores no token, so none is read"),
+            "a-missing" => Ok(None),
+            _ => Err("keychain locked".to_string()),
+        });
+        assert_eq!(
+            tokens,
+            BTreeMap::from([
+                ("a-container".to_string(), "test-token-not-real-2".to_string()),
+                ("a-token".to_string(), "test-token-not-real-1".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn marketplace_tokens_round_trip_through_an_export_and_validate_on_import() {
+        use crate::models::marketplace::Marketplace;
+        let id = "0f8fad5b-d9cb-469f-a165-70867728950e";
+        let mut payload = sample_payload(SETTINGS_EXPORT_FORMAT_VERSION);
+        payload
+            .settings
+            .marketplace_accounts
+            .push(account(id, AccountMethod::Token));
+        payload.settings.marketplaces.push(Marketplace {
+            id: "7c9e6679-7425-40de-944b-e07fc1f90ae7".into(),
+            name: "Team".into(),
+            url: "https://github.com/org/repo.git".into(),
+            branch: None,
+            account_id: Some(id.into()),
+        });
+        payload.secrets.marketplace_account_tokens =
+            BTreeMap::from([(id.to_string(), "test-token-not-real".to_string())]);
+
+        let dir = temp_dir("marketplace-round-trip");
+        let path = write_export(&dir, "x.triplec", &payload, "password123");
+        let mut back = read_and_decrypt(&path, "password123").unwrap();
+
+        assert_eq!(
+            back.secrets.marketplace_account_tokens,
+            payload.secrets.marketplace_account_tokens
+        );
+        assert_eq!(back.settings.marketplaces, payload.settings.marketplaces);
+        crate::commands::marketplace_commands::validate_imported_marketplace_state(
+            &mut back.settings,
+            &back.secrets.marketplace_account_tokens,
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_marketplace_token_that_fails_to_restore_is_reported_without_its_value() {
+        let tokens = BTreeMap::from([
+            ("a1".to_string(), "test-token-not-real-1".to_string()),
+            ("a2".to_string(), "test-token-not-real-2".to_string()),
+        ]);
+        let mut stored = Vec::new();
+        let warnings = restore_marketplace_tokens(&tokens, |id, token| {
+            if id == "a2" {
+                return Err("keychain locked".to_string());
+            }
+            stored.push((id.to_string(), token.to_string()));
+            Ok(())
+        });
+        assert_eq!(
+            stored,
+            vec![("a1".to_string(), "test-token-not-real-1".to_string())]
+        );
+        assert_eq!(warnings.len(), 1);
+        assert!(!warnings[0].contains("test-token-not-real"));
     }
 }

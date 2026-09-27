@@ -434,7 +434,8 @@ fn container_join(dir: &str, name: &str) -> String {
 /// Write `data` into the container at `<dest_dir>/<file_name>` with `mode`.
 ///
 /// For small, generated files — migration uses it for the `tar -T` include
-/// list, which can be too long to pass as argv. Anything large should be
+/// list, which can be too long to pass as argv, and the marketplace sync for
+/// its payload tar and script. Anything large should be
 /// streamed through an attached exec's stdin instead, since this buffers the
 /// whole payload in memory twice (once raw, once tarred).
 pub async fn upload_bytes_to_container(
@@ -446,9 +447,10 @@ pub async fn upload_bytes_to_container(
 ) -> Result<String, String> {
     let docker = get_docker()?;
 
-    // Root-owned on purpose: the only caller is migration, whose `tar -T` list
-    // is read back as root. The mtime still gets stamped so the file doesn't
-    // read as 1970.
+    // Root-owned on purpose: migration's `tar -T` list is read back as root,
+    // and the marketplace sync uploads into a `claude`-owned directory it
+    // prepares first, so `claude` can still read and delete the files. The
+    // mtime still gets stamped so the file doesn't read as 1970.
     let tar_buf = build_single_file_tar(file_name, data, mode, 0, 0, now_epoch_secs())?;
 
     docker

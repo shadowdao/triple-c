@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use crate::models::marketplace::{MarketplaceInstall, MarketplaceItemRef};
 use crate::models::Project;
 
 /// The sticky marker for `projects.json`: `projects.json.corrupt`, beside it.
@@ -204,6 +205,27 @@ impl ProjectsStore {
         }
     }
 
+    /// Replace a project with `updated`, after `restore` has copied onto it
+    /// the fields the store owns from the record *as stored under the lock*.
+    /// `update_project` restores from a copy it read earlier, so an install
+    /// or a status change landing in between would otherwise be written over
+    /// (re-review round 2).
+    pub fn update_restoring(
+        &self,
+        mut updated: Project,
+        restore: impl FnOnce(&mut Project, &Project),
+    ) -> Result<Project, String> {
+        let mut projects = self.lock();
+        let p = projects
+            .iter_mut()
+            .find(|p| p.id == updated.id)
+            .ok_or_else(|| format!("Project {} not found", updated.id))?;
+        restore(&mut updated, p);
+        *p = updated.clone();
+        self.save(&projects)?;
+        Ok(updated)
+    }
+
     pub fn remove(&self, id: &str) -> Result<(), String> {
         let mut projects = self.lock();
         let initial_len = projects.len();
@@ -254,6 +276,60 @@ impl ProjectsStore {
         } else {
             Err(format!("Project {} not found", project_id))
         }
+    }
+
+    /// Read-modify-write of one project's marketplace installs and opt-outs
+    /// under the store's lock, touching nothing else (PR review #2): the
+    /// marketplace commands must not write back a whole record read before a
+    /// start changed its status or container id. When `f` fails nothing is
+    /// saved. Returns `f`'s value and the saved project.
+    pub fn update_marketplace_fields<T>(
+        &self,
+        project_id: &str,
+        f: impl FnOnce(
+            &mut Vec<MarketplaceInstall>,
+            &mut Vec<MarketplaceItemRef>,
+        ) -> Result<T, String>,
+    ) -> Result<(T, Project), String> {
+        let mut projects = self.lock();
+        let p = projects
+            .iter_mut()
+            .find(|p| p.id == project_id)
+            .ok_or_else(|| format!("Project {} not found", project_id))?;
+        let mut installs = p.marketplace_installs.clone();
+        let mut disabled = p.marketplace_disabled.clone();
+        let out = f(&mut installs, &mut disabled)?;
+        p.marketplace_installs = installs;
+        p.marketplace_disabled = disabled;
+        p.updated_at = chrono::Utc::now().to_rfc3339();
+        let saved = p.clone();
+        self.save(&projects)?;
+        Ok((out, saved))
+    }
+
+    /// [`Self::update_marketplace_fields`] over every project at once, in one
+    /// save. Projects `f` leaves as they were are not touched at all.
+    pub fn update_all_marketplace_fields(
+        &self,
+        mut f: impl FnMut(&mut Vec<MarketplaceInstall>, &mut Vec<MarketplaceItemRef>),
+    ) -> Result<(), String> {
+        let mut projects = self.lock();
+        let mut changed = false;
+        for p in projects.iter_mut() {
+            let mut installs = p.marketplace_installs.clone();
+            let mut disabled = p.marketplace_disabled.clone();
+            f(&mut installs, &mut disabled);
+            if installs != p.marketplace_installs || disabled != p.marketplace_disabled {
+                p.marketplace_installs = installs;
+                p.marketplace_disabled = disabled;
+                p.updated_at = chrono::Utc::now().to_rfc3339();
+                changed = true;
+            }
+        }
+        if changed {
+            self.save(&projects)?;
+        }
+        Ok(())
     }
 
     pub fn set_container_id(&self, project_id: &str, container_id: Option<String>) -> Result<(), String> {
@@ -407,6 +483,124 @@ mod tests {
         assert_eq!(saved.claude_instructions.as_deref(), Some("keep me"));
         assert!(saved.browser_view_enabled);
         assert!(!saved.auth_bridge_enabled);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    fn market_install(key: &str) -> crate::models::marketplace::MarketplaceInstall {
+        crate::models::marketplace::MarketplaceInstall {
+            marketplace_id: "m1".into(),
+            kind: crate::models::marketplace::ItemKind::Agent,
+            key: key.into(),
+            commit: "a".repeat(40),
+        }
+    }
+
+    #[test]
+    fn marketplace_edits_keep_a_concurrent_status_and_container_change() {
+        // PR review #2: a marketplace install/uninstall used to write back a
+        // whole record read before a start flipped status and container_id,
+        // leaving the project stuck at Starting with no container.
+        let dir = temp_dir("marketplace-fields");
+        let project = Project::new("demo".to_string(), Vec::new());
+        let id = project.id.clone();
+        let store = store_over(&dir, vec![project]);
+
+        // The start flow moves on while a marketplace command is running.
+        store.set_container_id(&id, Some("cid-1".into())).unwrap();
+        store.update_status(&id, crate::models::ProjectStatus::Starting).unwrap();
+
+        let (added, saved) = store
+            .update_marketplace_fields(&id, |installs, disabled| {
+                installs.push(market_install("a"));
+                disabled.push(market_install("g").item_ref());
+                Ok(installs.len())
+            })
+            .unwrap();
+        assert_eq!(added, 1);
+        assert_eq!(saved.container_id.as_deref(), Some("cid-1"));
+        assert_eq!(saved.status, crate::models::ProjectStatus::Starting);
+        let on_disk: Vec<Project> =
+            serde_json::from_str(&fs::read_to_string(dir.join("projects.json")).unwrap()).unwrap();
+        assert_eq!(on_disk[0].container_id.as_deref(), Some("cid-1"));
+        assert_eq!(on_disk[0].marketplace_installs, vec![market_install("a")]);
+
+        // A refusal inside the closure writes nothing.
+        let before = fs::read_to_string(dir.join("projects.json")).unwrap();
+        let err = store
+            .update_marketplace_fields(&id, |installs, _| {
+                installs.clear();
+                Err::<(), _>("not installed".to_string())
+            })
+            .unwrap_err();
+        assert_eq!(err, "not installed");
+        assert_eq!(store.get(&id).unwrap().marketplace_installs.len(), 1);
+        assert_eq!(fs::read_to_string(dir.join("projects.json")).unwrap(), before);
+        assert!(store.update_marketplace_fields("nope", |_, _| Ok(())).is_err());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_project_save_keeps_a_marketplace_install_made_after_it_read_the_record() {
+        // Re-review round 2: `update_project` read the stored record, then
+        // wrote the whole payload back later. An install landing in between
+        // was lost. The restore now runs against the record under the lock.
+        let dir = temp_dir("save-restore");
+        let project = Project::new("demo".to_string(), Vec::new());
+        let id = project.id.clone();
+        let store = store_over(&dir, vec![project]);
+
+        let mut payload = store.get(&id).unwrap(); // the Config tab's copy
+        payload.name = "renamed".to_string();
+        store
+            .update_marketplace_fields(&id, |installs, _| {
+                installs.push(market_install("late"));
+                Ok(())
+            })
+            .unwrap();
+
+        let saved = store
+            .update_restoring(payload, |incoming, stored| {
+                incoming.marketplace_installs = stored.marketplace_installs.clone();
+                incoming.marketplace_disabled = stored.marketplace_disabled.clone();
+            })
+            .unwrap();
+        assert_eq!(saved.name, "renamed");
+        assert_eq!(saved.marketplace_installs, vec![market_install("late")]);
+        assert_eq!(store.get(&id).unwrap().marketplace_installs, vec![market_install("late")]);
+
+        let mut ghost = Project::new("ghost".to_string(), Vec::new());
+        ghost.id = "nope".into();
+        assert!(store.update_restoring(ghost, |_, _| {}).is_err());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn marketplace_edits_across_all_projects_touch_only_those_fields() {
+        let dir = temp_dir("marketplace-all");
+        let mut a = Project::new("a".to_string(), Vec::new());
+        a.marketplace_installs = vec![market_install("x")];
+        let b = Project::new("b".to_string(), Vec::new());
+        let (a_id, b_id) = (a.id.clone(), b.id.clone());
+        let store = store_over(&dir, vec![a, b]);
+        store.set_container_id(&b_id, Some("cid-b".into())).unwrap();
+        store.update_status(&a_id, crate::models::ProjectStatus::Running).unwrap();
+
+        let b_updated_at = store.get(&b_id).unwrap().updated_at;
+        store
+            .update_all_marketplace_fields(|installs, _| {
+                installs.retain(|i| i.marketplace_id != "m1")
+            })
+            .unwrap();
+
+        let a = store.get(&a_id).unwrap();
+        assert!(a.marketplace_installs.is_empty());
+        assert_eq!(a.status, crate::models::ProjectStatus::Running);
+        let b = store.get(&b_id).unwrap();
+        assert_eq!(b.container_id.as_deref(), Some("cid-b"));
+        assert_eq!(b.updated_at, b_updated_at, "an untouched project is not rewritten");
 
         fs::remove_dir_all(&dir).ok();
     }

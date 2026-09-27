@@ -25,6 +25,8 @@
 //! "only overwrite what the import actually has" treatment as the other
 //! three secrets.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use super::{AppSettings, ImageSource};
@@ -56,6 +58,12 @@ pub struct ExportedSecrets {
     /// export wholesale.
     #[serde(default)]
     pub web_terminal_access_token: Option<String>,
+    /// Marketplace account tokens (`Token` and `GhContainer` accounts; a
+    /// `GhHost` account stores none), keyed by account id. They live in the
+    /// keychain, not in `AppSettings::marketplace_accounts`, so they travel
+    /// here or an imported account could never fetch.
+    #[serde(default)]
+    pub marketplace_account_tokens: BTreeMap<String, String>,
 }
 
 impl ExportedSecrets {
@@ -65,6 +73,7 @@ impl ExportedSecrets {
             && blank(&self.gateway_api_key)
             && blank(&self.gateway_master_key)
             && blank(&self.web_terminal_access_token)
+            && self.marketplace_account_tokens.values().all(|v| v.trim().is_empty())
     }
 }
 
@@ -147,6 +156,21 @@ pub struct SettingsImportPreview {
     pub image_source: ImageSource,
     #[serde(default)]
     pub custom_image_name: Option<String>,
+    /// Marketplaces the import configures.
+    #[serde(default)]
+    pub marketplace_count: usize,
+    /// Hooks the import installs for every project. A hook runs commands in
+    /// each project container, and an imported install skips the confirm
+    /// step an install from the Marketplace tab shows, so the preview warns.
+    #[serde(default)]
+    pub global_hook_install_count: usize,
+    /// Plugins the import installs for every project. A plugin can bring
+    /// its own hooks and MCP servers, and skips the same confirm step.
+    #[serde(default)]
+    pub global_plugin_install_count: usize,
+    /// Non-blank marketplace account tokens the import restores.
+    #[serde(default)]
+    pub marketplace_account_token_count: usize,
 }
 
 /// A cap on how much of a decrypted, not-yet-trusted string gets echoed back
@@ -197,6 +221,25 @@ impl SettingsImportPreview {
             gateway_api_base: sanitized_non_blank(&payload.settings.gateway.api_base),
             image_source: payload.settings.image_source.clone(),
             custom_image_name: sanitized_non_blank(&payload.settings.custom_image_name),
+            marketplace_count: payload.settings.marketplaces.len(),
+            global_hook_install_count: payload
+                .settings
+                .global_marketplace_installs
+                .iter()
+                .filter(|i| i.kind == crate::models::marketplace::ItemKind::Hook)
+                .count(),
+            global_plugin_install_count: payload
+                .settings
+                .global_marketplace_installs
+                .iter()
+                .filter(|i| i.kind == crate::models::marketplace::ItemKind::Plugin)
+                .count(),
+            marketplace_account_token_count: payload
+                .secrets
+                .marketplace_account_tokens
+                .values()
+                .filter(|v| !v.trim().is_empty())
+                .count(),
         }
     }
 }
@@ -236,6 +279,7 @@ mod tests {
             gateway_api_key: Some("sk-another-secret".to_string()),
             gateway_master_key: Some("sk-triple-c-yet-another".to_string()),
             web_terminal_access_token: Some("wt-super-secret-token".to_string()),
+            ..Default::default()
         });
         let preview = SettingsImportPreview::from_payload(&payload);
         let serialized = serde_json::to_string(&preview).unwrap();
@@ -260,6 +304,7 @@ mod tests {
             gateway_api_key: None,
             gateway_master_key: None,
             web_terminal_access_token: Some("   ".to_string()),
+            ..Default::default()
         });
         let preview = SettingsImportPreview::from_payload(&payload);
         assert!(!preview.has_claude_oauth_token);
@@ -362,5 +407,74 @@ mod tests {
             "preview string was not capped: {} chars",
             shown.chars().count()
         );
+    }
+
+    #[test]
+    fn marketplaces_global_hooks_and_account_tokens_are_disclosed_without_the_tokens() {
+        use crate::models::marketplace::{ItemKind, Marketplace, MarketplaceInstall};
+        let mut payload = payload_with(ExportedSecrets {
+            marketplace_account_tokens: std::collections::BTreeMap::from([
+                ("a1".to_string(), "test-token-not-real-1".to_string()),
+                ("a2".to_string(), "   ".to_string()),
+            ]),
+            ..Default::default()
+        });
+        payload.settings.marketplaces.push(Marketplace {
+            id: "m1".into(),
+            name: "Team".into(),
+            url: "https://example.invalid/r.git".into(),
+            branch: None,
+            account_id: None,
+        });
+        let install = |kind, key: &str| MarketplaceInstall {
+            marketplace_id: "m1".into(),
+            kind,
+            key: key.into(),
+            commit: "a".repeat(40),
+        };
+        payload.settings.global_marketplace_installs = vec![
+            install(ItemKind::Hook, "fmt"),
+            install(ItemKind::Agent, "rev"),
+            install(ItemKind::Hook, "lint"),
+        ];
+
+        let preview = SettingsImportPreview::from_payload(&payload);
+        assert_eq!(preview.marketplace_count, 1);
+        assert_eq!(preview.global_hook_install_count, 2);
+        assert_eq!(preview.marketplace_account_token_count, 1, "a blank token is absent");
+        assert!(!serde_json::to_string(&preview).unwrap().contains("test-token-not-real"));
+    }
+
+    #[test]
+    fn a_bundle_holding_only_a_marketplace_token_is_not_empty() {
+        let secrets = ExportedSecrets {
+            marketplace_account_tokens: std::collections::BTreeMap::from([(
+                "a1".to_string(),
+                "test-token-not-real".to_string(),
+            )]),
+            ..Default::default()
+        };
+        assert!(!secrets.is_empty());
+    }
+
+    #[test]
+    fn global_plugin_installs_are_counted_apart_from_hooks() {
+        use crate::models::marketplace::{ItemKind, MarketplaceInstall};
+        let mut payload = payload_with(ExportedSecrets::default());
+        let install = |kind, key: &str| MarketplaceInstall {
+            marketplace_id: "m1".into(),
+            kind,
+            key: key.into(),
+            commit: "a".repeat(40),
+        };
+        payload.settings.global_marketplace_installs = vec![
+            install(ItemKind::Plugin, "p1"),
+            install(ItemKind::Hook, "h1"),
+            install(ItemKind::Plugin, "p2"),
+            install(ItemKind::Skill, "s1"),
+        ];
+        let preview = SettingsImportPreview::from_payload(&payload);
+        assert_eq!(preview.global_plugin_install_count, 2);
+        assert_eq!(preview.global_hook_install_count, 1);
     }
 }
