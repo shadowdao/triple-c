@@ -205,3 +205,137 @@ fn create_build_context() -> Result<Vec<u8>, std::io::Error> {
     let _ = buf.flush();
     Ok(buf)
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::ENTRYPOINT;
+    use std::fs;
+    use std::path::Path;
+    use std::process::Command;
+
+    /// The `sync_host_ssh` function from `entrypoint.sh`, cut out between its
+    /// markers so it can be run against temp dirs instead of the real ~/.ssh.
+    fn sync_fn() -> &'static str {
+        let start = ENTRYPOINT.find("# >>> sync_host_ssh").expect("start marker");
+        let end = ENTRYPOINT.find("# <<< sync_host_ssh").expect("end marker");
+        &ENTRYPOINT[start..end]
+    }
+
+    fn sync(src: &Path, dest: &Path) -> String {
+        let script = format!("{}\nsync_host_ssh \"$1\" \"$2\"\n", sync_fn());
+        let out = Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .arg("sync")
+            .arg(src)
+            .arg(dest)
+            .output()
+            .expect("run bash");
+        assert!(out.status.success(), "sync failed: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    fn read(p: &Path) -> String {
+        fs::read_to_string(p).unwrap()
+    }
+
+    #[test]
+    fn container_created_keys_survive_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, dest) = (tmp.path().join("host"), tmp.path().join("ssh"));
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("id_host"), "host-key").unwrap();
+
+        sync(&src, &dest);
+        fs::write(dest.join("id_container"), "made-in-container").unwrap();
+        sync(&src, &dest);
+
+        assert_eq!(read(&dest.join("id_container")), "made-in-container");
+        assert_eq!(read(&dest.join("id_host")), "host-key");
+    }
+
+    #[test]
+    fn container_file_wins_over_same_named_host_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, dest) = (tmp.path().join("host"), tmp.path().join("ssh"));
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("id_host"), "host-key").unwrap();
+        sync(&src, &dest);
+
+        fs::write(dest.join("id_ed25519"), "container-key").unwrap();
+        fs::write(src.join("id_ed25519"), "host-ed25519").unwrap();
+        let out = sync(&src, &dest);
+
+        assert_eq!(read(&dest.join("id_ed25519")), "container-key");
+        assert!(out.contains("keeping container's"), "{out}");
+    }
+
+    #[test]
+    fn host_changes_propagate_until_edited_in_container() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, dest) = (tmp.path().join("host"), tmp.path().join("ssh"));
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("config"), "v1").unwrap();
+        fs::write(src.join("id_old"), "old").unwrap();
+        sync(&src, &dest);
+
+        fs::write(src.join("config"), "v2").unwrap();
+        fs::remove_file(src.join("id_old")).unwrap();
+        sync(&src, &dest);
+        assert_eq!(read(&dest.join("config")), "v2");
+        assert!(!dest.join("id_old").exists(), "host-removed, unedited file is dropped");
+
+        fs::write(dest.join("config"), "edited in container").unwrap();
+        fs::write(src.join("config"), "v3").unwrap();
+        sync(&src, &dest);
+        assert_eq!(read(&dest.join("config")), "edited in container");
+
+        fs::remove_file(src.join("config")).unwrap();
+        sync(&src, &dest);
+        assert_eq!(read(&dest.join("config")), "edited in container");
+    }
+
+    #[test]
+    fn known_hosts_is_unioned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, dest) = (tmp.path().join("host"), tmp.path().join("ssh"));
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(src.join("known_hosts"), "hostA key\n").unwrap();
+        fs::write(dest.join("known_hosts"), "containerB key\n").unwrap();
+
+        sync(&src, &dest);
+        let kh = read(&dest.join("known_hosts"));
+        assert!(kh.contains("hostA key") && kh.contains("containerB key"), "{kh}");
+    }
+
+    #[test]
+    fn upgrade_from_wipe_and_copy_backs_up_differing_files() {
+        // No manifest yet: the state an existing project is in on its first
+        // start with this entrypoint.
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, dest) = (tmp.path().join("host"), tmp.path().join("ssh"));
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(src.join("id_rsa"), "host").unwrap();
+        fs::write(dest.join("id_rsa"), "container").unwrap();
+        fs::write(dest.join("id_extra"), "extra").unwrap();
+
+        sync(&src, &dest);
+
+        assert_eq!(read(&dest.join("id_rsa")), "host");
+        assert_eq!(read(&dest.join("id_rsa.triple-c-backup")), "container");
+        assert_eq!(read(&dest.join("id_extra")), "extra");
+    }
+
+    #[test]
+    fn nested_host_files_are_copied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, dest) = (tmp.path().join("host"), tmp.path().join("ssh"));
+        fs::create_dir_all(src.join("config.d")).unwrap();
+        fs::write(src.join("config.d/work"), "Host work").unwrap();
+
+        sync(&src, &dest);
+        assert_eq!(read(&dest.join("config.d/work")), "Host work");
+    }
+}
