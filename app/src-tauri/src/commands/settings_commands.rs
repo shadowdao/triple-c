@@ -36,7 +36,7 @@ pub fn validate_settings_update(
     // fallback for **every** project without an override
     // (`container.rs`'s `create_container`), so `/` here read-only bind-mounts
     // the whole host at `/tmp/.host-ssh` for all of them — and `entrypoint.sh`
-    // then does `cp -a /tmp/.host-ssh ~/.ssh`, recursively copying it into the
+    // then merges `/tmp/.host-ssh` into `~/.ssh`, recursively copying it into the
     // home volume this release exists to bound.
     //
     // Grandfathered the same way project paths are: a value carried over

@@ -220,14 +220,100 @@ install_corporate_ca() {
 install_corporate_ca
 
 # ── SSH key setup ──────────────────────────────────────────────────────────
-# Host SSH dir is mounted read-only at /tmp/.host-ssh.
-# Copy to /home/claude/.ssh so we can fix permissions.
+# Host SSH dir is mounted read-only at /tmp/.host-ssh and merged into
+# /home/claude/.ssh (which lives on the home volume) so we can fix permissions.
+#
+# This used to `rm -rf ~/.ssh` and copy the host dir over it on every start,
+# which silently deleted any key generated or saved inside the container and
+# overwrote container edits to config/known_hosts. Now it is a merge:
+#   - Files the container created are never touched, even if the host later
+#     gains a file of the same name (the host copy is skipped with a warning).
+#   - A file previously copied from the host is refreshed when the host copy
+#     changes, and removed when the host drops it — but only while it is still
+#     byte-identical to what we copied. Once edited in the container it is the
+#     container's.
+#   - known_hosts is unioned, never replaced (ssh appends to it at runtime).
+# `.triple-c-host-files` records "<sha256>\t<relative path>" for every file we
+# copied, which is how the two kinds of file are told apart. Without it (first
+# start after upgrading from the wipe-and-copy entrypoint) a differing file is
+# backed up to `<name>.triple-c-backup` before the host copy replaces it.
+#
+# The function body between the markers is executed by a unit test in
+# app/src-tauri/src/docker/image.rs; keep it self-contained.
+# >>> sync_host_ssh
+sync_host_ssh() {
+    local src="$1" dest="$2"
+    local manifest="$dest/.triple-c-host-files"
+    local legacy=0 new_manifest f rel target src_sum cur_sum recorded
+
+    _ssh_sum() {
+        if [ -L "$1" ]; then
+            printf 'link:%s' "$(readlink "$1")" | sha256sum | cut -d' ' -f1
+        else
+            sha256sum < "$1" | cut -d' ' -f1
+        fi
+    }
+
+    mkdir -p "$dest"
+    [ -f "$manifest" ] || legacy=1
+    new_manifest=$(mktemp)
+
+    while IFS= read -r -d '' f; do
+        rel="${f#"$src"/}"
+        [ "$rel" = "known_hosts" ] && continue
+        target="$dest/$rel"
+        src_sum=$(_ssh_sum "$f")
+        if [ -e "$target" ] || [ -L "$target" ]; then
+            cur_sum=$(_ssh_sum "$target")
+            if [ "$cur_sum" != "$src_sum" ]; then
+                recorded=""
+                [ "$legacy" = 0 ] && recorded=$(awk -F'\t' -v r="$rel" '$2 == r { print $1; exit }' "$manifest")
+                if [ "$legacy" = 1 ]; then
+                    cp -a "$target" "$target.triple-c-backup"
+                    echo "entrypoint: ~/.ssh/$rel differs from host copy; kept old version as $rel.triple-c-backup"
+                elif [ -z "$recorded" ] || [ "$recorded" != "$cur_sum" ]; then
+                    echo "entrypoint: keeping container's ~/.ssh/$rel (host copy not applied)"
+                    continue
+                fi
+                rm -f "$target"
+                mkdir -p "$(dirname "$target")"
+                cp -a "$f" "$target"
+            fi
+        else
+            mkdir -p "$(dirname "$target")"
+            cp -a "$f" "$target"
+        fi
+        printf '%s\t%s\n' "$src_sum" "$rel" >> "$new_manifest"
+    done < <(find "$src" \( -type f -o -type l \) -print0)
+
+    # Drop files the host no longer provides, unless edited in the container.
+    if [ "$legacy" = 0 ]; then
+        while IFS=$'\t' read -r recorded rel; do
+            [ -n "$rel" ] || continue
+            if [ ! -e "$src/$rel" ] && [ ! -L "$src/$rel" ] \
+                && { [ -e "$dest/$rel" ] || [ -L "$dest/$rel" ]; } \
+                && [ "$(_ssh_sum "$dest/$rel")" = "$recorded" ]; then
+                rm -f "$dest/$rel"
+            fi
+        done < "$manifest"
+    fi
+
+    if [ -f "$src/known_hosts" ]; then
+        cat "$src/known_hosts" >> "$dest/known_hosts"
+        sort -u -o "$dest/known_hosts" "$dest/known_hosts"
+    fi
+
+    mv "$new_manifest" "$manifest"
+    unset -f _ssh_sum
+}
+# <<< sync_host_ssh
+
 if [ -d /tmp/.host-ssh ]; then
-    rm -rf /home/claude/.ssh
-    cp -a /tmp/.host-ssh /home/claude/.ssh
+    sync_host_ssh /tmp/.host-ssh /home/claude/.ssh
     chown -R claude:claude /home/claude/.ssh
     chmod 700 /home/claude/.ssh
     find /home/claude/.ssh -type f -name "id_*" ! -name "*.pub" -exec chmod 600 {} \;
+    find /home/claude/.ssh -type f -name "*.triple-c-backup" -exec chmod 600 {} \;
     find /home/claude/.ssh -type f -name "*.pub" -exec chmod 644 {} \;
     if [ -f /home/claude/.ssh/known_hosts ]; then
         chmod 644 /home/claude/.ssh/known_hosts

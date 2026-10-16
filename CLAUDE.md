@@ -302,7 +302,7 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
     approach converges on the worst state: a 400 MB browser present with its libraries gone.
   - The layer sits immediately after Node (npx is its only prerequisite) and well above the shim
     `COPY`s, so editing a shim does not re-run a multi-hundred-megabyte apt install.
-- **`entrypoint.sh`** — UID/GID remapping to match host user, SSH key setup, git config, docker socket permissions, Claude Code settings.json injection, then `sleep infinity`
+- **`entrypoint.sh`** — UID/GID remapping to match host user, SSH key setup (`sync_host_ssh` *merges* the host dir into `~/.ssh`; never wipe it — container-made keys live there on the home volume), git config, docker socket permissions, Claude Code settings.json injection, then `sleep infinity`
 - **`triple-c-scheduler`** — Bash-based scheduled task system for recurring Claude Code invocations
 
 **`/home/claude` in the image is seed-only.** It is the mount point of the named volume
