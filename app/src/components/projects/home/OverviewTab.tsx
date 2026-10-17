@@ -4,7 +4,6 @@ import {
   listClaudeSessions,
   listScheduledTasks,
   getSchedulerNotifications,
-  resumeSessionCommand,
 } from "../../../lib/tauri-commands";
 import type { useProjectActions } from "../../../hooks/useProjectActions";
 import type { SaveState } from "../../../hooks/useSaveState";
@@ -78,14 +77,8 @@ export default function OverviewTab({
     };
   }, [project.id, running, project.container_id]);
 
-  const handleResume = async (session: ClaudeSession) => {
-    try {
-      const command = await resumeSessionCommand(project.id, session.id);
-      await actions.openTerminalWithCommand(command, session.name ?? "resume");
-    } catch (e) {
-      console.error("Failed to build the resume command:", e);
-    }
-  };
+  const handleResume = (session: ClaudeSession) =>
+    actions.resumeClaudeSession(session.id, session.name ?? "resume");
 
   return (
     <div className="p-4 space-y-6 max-w-4xl">

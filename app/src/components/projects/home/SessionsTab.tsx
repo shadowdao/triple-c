@@ -1,8 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import type { ClaudeSession, Project } from "../../../lib/types";
-import { listClaudeSessions, resumeSessionCommand } from "../../../lib/tauri-commands";
+import { listClaudeSessions } from "../../../lib/tauri-commands";
 import type { useProjectActions } from "../../../hooks/useProjectActions";
-import { useAppState } from "../../../store/appState";
 import Button from "../../ui/Button";
 import { formatAge, formatBytes } from "./format";
 
@@ -18,7 +17,6 @@ interface Props {
 export default function SessionsTab({ project, actions }: Props) {
   const [sessions, setSessions] = useState<ClaudeSession[]>([]);
   const [loading, setLoading] = useState(false);
-  const pushToast = useAppState((s) => s.pushToast);
   const running = project.status === "running";
 
   const load = useCallback(() => {
@@ -35,18 +33,8 @@ export default function SessionsTab({ project, actions }: Props) {
 
   useEffect(load, [load]);
 
-  const resume = async (session: ClaudeSession) => {
-    try {
-      const command = await resumeSessionCommand(project.id, session.id);
-      await actions.openTerminalWithCommand(command, session.name ?? "resume");
-    } catch (e) {
-      pushToast({
-        kind: "error",
-        message: "Could not resume that session",
-        detail: String(e),
-      });
-    }
-  };
+  const resume = (session: ClaudeSession) =>
+    actions.resumeClaudeSession(session.id, session.name ?? "resume");
 
   return (
     <div className="p-4 max-w-4xl">

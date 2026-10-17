@@ -301,7 +301,7 @@ fn validate_task_id(id: &str) -> Result<(), String> {
 }
 
 /// Strict allowlist for session ids (Claude Code uses UUIDs).
-fn validate_session_id(id: &str) -> Result<(), String> {
+pub(crate) fn validate_session_id(id: &str) -> Result<(), String> {
     let valid = !id.is_empty()
         && id.len() <= 64
         && id.starts_with(|c: char| c.is_ascii_alphanumeric())
@@ -420,36 +420,6 @@ pub async fn list_claude_sessions(
             cwd: s.cwd.filter(|v| !v.is_empty()),
         })
         .collect())
-}
-
-/// Build the shell command line that resumes a session, for the frontend to
-/// drop into a terminal.
-///
-/// The flag spelling was checked against the CLI in the container image:
-/// `claude --resume <session-id>` (short form `-r`).
-///
-/// The project's permission mode is folded in so the resumed session behaves
-/// like a freshly opened one. The session id is validated first, and the
-/// returned string contains only allowlisted characters.
-#[tauri::command]
-pub async fn resume_session_command(
-    project_id: String,
-    session_id: String,
-    state: State<'_, AppState>,
-) -> Result<String, String> {
-    validate_session_id(&session_id)?;
-
-    let project = state
-        .projects_store
-        .get(&project_id)
-        .ok_or_else(|| format!("Project {} not found", project_id))?;
-
-    let mut parts = vec!["claude".to_string()];
-    parts.extend(project.effective_permission_mode().cli_args());
-    parts.push("--resume".to_string());
-    parts.push(session_id);
-
-    Ok(parts.join(" "))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

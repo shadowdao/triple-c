@@ -11,12 +11,18 @@ use crate::AppState;
 /// validates the AWS session first, and runs `aws sso login` if it has expired
 /// so the user can re-authenticate (the URL is clickable via xterm.js
 /// WebLinksAddon).
-fn build_terminal_cmd(project: &Project, state: &AppState, session_name: Option<&str>) -> Vec<String> {
+fn build_terminal_cmd(
+    project: &Project,
+    state: &AppState,
+    session_name: Option<&str>,
+    resume_session_id: Option<&str>,
+) -> Vec<String> {
     let settings = state.settings_store.get();
     build_claude_terminal_cmd(
         project,
         settings.global_aws.aws_profile.as_deref(),
         session_name,
+        resume_session_id,
     )
 }
 
@@ -53,10 +59,16 @@ fn shell_quote_arg(arg: &str) -> String {
 
 /// The testable core of [`build_terminal_cmd`], taking the resolved global AWS
 /// profile rather than the whole [`AppState`].
+///
+/// `resume_session_id` adds `--resume <id>` (flag spelling checked against the
+/// CLI in the container image) and drops `-n`: the resumed conversation keeps
+/// the name it already has, and the tab label the caller passes as
+/// `session_name` — often just "resume" — must not overwrite it.
 fn build_claude_terminal_cmd(
     project: &Project,
     global_aws_profile: Option<&str>,
     session_name: Option<&str>,
+    resume_session_id: Option<&str>,
 ) -> Vec<String> {
     let is_bedrock_profile = project.backend == Backend::Bedrock
         && project
@@ -69,12 +81,15 @@ fn build_claude_terminal_cmd(
 
     // The args are interpolated into a shell script string, so single-quote
     // each one.
-    let name_flag = session_name
-        .filter(|n| !n.is_empty())
-        .map(|n| format!(" -n{}", shell_quote_arg(n)))
-        .unwrap_or_default();
+    let session_flags = match resume_session_id {
+        Some(id) => format!(" --resume{}", shell_quote_arg(id)),
+        None => session_name
+            .filter(|n| !n.is_empty())
+            .map(|n| format!(" -n{}", shell_quote_arg(n)))
+            .unwrap_or_default(),
+    };
     let permission_flags: String = permission_args.iter().map(|a| shell_quote_arg(a)).collect();
-    let claude_cmd = format!("exec claude{}{}", permission_flags, name_flag);
+    let claude_cmd = format!("exec claude{}{}", permission_flags, session_flags);
 
     if !is_bedrock_profile {
         return vec![
@@ -135,6 +150,7 @@ pub async fn open_terminal_session(
     session_id: String,
     session_type: Option<String>,
     session_name: Option<String>,
+    resume_session_id: Option<String>,
     app_handle: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
@@ -148,9 +164,21 @@ pub async fn open_terminal_session(
         .as_ref()
         .ok_or_else(|| "Container not running".to_string())?;
 
+    if let Some(id) = resume_session_id.as_deref() {
+        crate::commands::inspect_commands::validate_session_id(id)?;
+    }
+
     let cmd = match session_type.as_deref() {
+        Some("bash") if resume_session_id.is_some() => {
+            return Err("Only a Claude session can resume a conversation".to_string());
+        }
         Some("bash") => vec!["bash".to_string(), "-l".to_string()],
-        _ => build_terminal_cmd(&project, &state, session_name.as_deref()),
+        _ => build_terminal_cmd(
+            &project,
+            &state,
+            session_name.as_deref(),
+            resume_session_id.as_deref(),
+        ),
     };
 
     let output_event = format!("terminal-output-{}", session_id);
@@ -414,7 +442,7 @@ mod tests {
     /// wrapper rather than a bare `claude` argv.
     #[test]
     fn build_terminal_cmd_updates_before_launching_claude() {
-        let cmd = build_claude_terminal_cmd(&project("anthropic", serde_json::Value::Null), None, None);
+        let cmd = build_claude_terminal_cmd(&project("anthropic", serde_json::Value::Null), None, None, None);
 
         assert_eq!(cmd[0], "bash");
         assert_eq!(cmd[1], "-c");
@@ -444,6 +472,7 @@ mod tests {
             &project("anthropic", serde_json::Value::Null),
             None,
             Some("Bob's tab; rm -rf /"),
+            None,
         );
 
         assert!(
@@ -459,7 +488,7 @@ mod tests {
     fn build_terminal_cmd_quotes_permission_flags_and_omits_an_empty_name() {
         let mut p = project("anthropic", serde_json::Value::Null);
         p.full_permissions = true;
-        let cmd = build_claude_terminal_cmd(&p, None, Some(""));
+        let cmd = build_claude_terminal_cmd(&p, None, Some(""), None);
 
         assert!(
             cmd[2].contains("exec claude '--dangerously-skip-permissions'\n"),
@@ -474,7 +503,7 @@ mod tests {
     fn build_terminal_cmd_passes_auto_permission_mode() {
         let mut p = project("anthropic", serde_json::Value::Null);
         p.permission_mode = Some(crate::models::project::PermissionMode::Auto);
-        let cmd = build_claude_terminal_cmd(&p, None, None);
+        let cmd = build_claude_terminal_cmd(&p, None, None, None);
 
         assert!(
             cmd[2].contains("exec claude '--permission-mode' 'auto'"),
@@ -497,6 +526,7 @@ mod tests {
             })),
             None,
             Some("it's fine"),
+            None,
         );
 
         assert_eq!(cmd[0], "bash");
@@ -510,6 +540,31 @@ mod tests {
             "prelude must precede the exec: {}",
             script
         );
+    }
+
+    /// Resume goes through the same launch as a new session — prelude,
+    /// permission flags — and passes the id instead of the tab label, so a
+    /// label of "resume" does not rename the conversation.
+    #[test]
+    fn build_terminal_cmd_resumes_without_renaming() {
+        let mut p = project("anthropic", serde_json::Value::Null);
+        p.full_permissions = true;
+        let cmd = build_claude_terminal_cmd(
+            &p,
+            None,
+            Some("resume"),
+            Some("e13d312d-2f38-4cf6-b0e0-1db60208a74c"),
+        );
+
+        assert!(cmd[2].contains(UPDATE_PRELUDE), "got: {}", cmd[2]);
+        assert!(
+            cmd[2].contains(
+                "exec claude '--dangerously-skip-permissions' --resume 'e13d312d-2f38-4cf6-b0e0-1db60208a74c'\n"
+            ),
+            "got: {}",
+            cmd[2]
+        );
+        assert!(!cmd[2].contains(" -n "), "resume must not rename: {}", cmd[2]);
     }
 
     #[test]

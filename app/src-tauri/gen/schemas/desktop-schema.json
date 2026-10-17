@@ -897,12 +897,6 @@
           "markdownDescription": "Enables the rename_container_path command without any pre-configured scope."
         },
         {
-          "description": "Enables the resume_session_command command without any pre-configured scope.",
-          "type": "string",
-          "const": "allow-resume-session-command",
-          "markdownDescription": "Enables the resume_session_command command without any pre-configured scope."
-        },
-        {
           "description": "Enables the rollback_migration command without any pre-configured scope.",
           "type": "string",
           "const": "allow-rollback-migration",
@@ -1711,12 +1705,6 @@
           "type": "string",
           "const": "deny-rename-container-path",
           "markdownDescription": "Denies the rename_container_path command without any pre-configured scope."
-        },
-        {
-          "description": "Denies the resume_session_command command without any pre-configured scope.",
-          "type": "string",
-          "const": "deny-resume-session-command",
-          "markdownDescription": "Denies the resume_session_command command without any pre-configured scope."
         },
         {
           "description": "Denies the rollback_migration command without any pre-configured scope.",
