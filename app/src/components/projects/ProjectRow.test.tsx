@@ -17,6 +17,7 @@ vi.mock("../../hooks/useProjectActions", () => ({
     handleBackup: vi.fn(),
     openClaudeTerminal: mockOpenClaudeTerminal,
     openShell: vi.fn(),
+    resumeClaudeSession: vi.fn(),
     openTerminalWithCommand: vi.fn(),
   }),
 }));

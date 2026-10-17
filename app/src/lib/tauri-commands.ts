@@ -65,8 +65,14 @@ export const awsSsoRefresh = (projectId: string) =>
   invoke<void>("aws_sso_refresh", { projectId });
 
 // Terminal
-export const openTerminalSession = (projectId: string, sessionId: string, sessionType?: string, sessionName?: string) =>
-  invoke<void>("open_terminal_session", { projectId, sessionId, sessionType, sessionName });
+export const openTerminalSession = (
+  projectId: string,
+  sessionId: string,
+  sessionType?: string,
+  sessionName?: string,
+  resumeSessionId?: string,
+) =>
+  invoke<void>("open_terminal_session", { projectId, sessionId, sessionType, sessionName, resumeSessionId });
 export const terminalInput = (sessionId: string, data: number[]) =>
   invoke<void>("terminal_input", { sessionId, data });
 export const terminalResize = (sessionId: string, cols: number, rows: number) =>
@@ -168,8 +174,6 @@ export const runDockerInstall = () => invoke<void>("run_docker_install");
 // Container introspection — sessions
 export const listClaudeSessions = (projectId: string) =>
   invoke<ClaudeSession[]>("list_claude_sessions", { projectId });
-export const resumeSessionCommand = (projectId: string, sessionId: string) =>
-  invoke<string>("resume_session_command", { projectId, sessionId });
 
 // Container introspection — capabilities
 export const listContainerCapabilities = (projectId: string) =>

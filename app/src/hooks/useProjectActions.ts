@@ -96,9 +96,27 @@ Reset again, or remove ${resetLeftoverPronoun(outcome)} manually once stopped.`,
   }, [openTerminal, project.id, project.name, fail]);
 
   /**
-   * Open a shell tab and type `command` into it. Used for [Resume] and for the
-   * capability drawer's "Manage in terminal" — the backend has no
-   * run-a-command entry point, so we drive the shell we just opened.
+   * Open a Claude tab on a saved conversation. A real Claude session, not a
+   * shell with `claude --resume` typed into it: the tab's session type is
+   * what Shift+Enter, the status-bar hint and Send to agent key off, so a
+   * resumed conversation in a "bash" tab submitted on Shift+Enter.
+   */
+  const resumeClaudeSession = useCallback(
+    async (claudeSessionId: string, sessionLabel?: string) => {
+      try {
+        return await openTerminal(project.id, project.name, "claude", sessionLabel, claudeSessionId);
+      } catch (e) {
+        fail("Could not resume that session", e);
+        return null;
+      }
+    },
+    [openTerminal, project.id, project.name, fail],
+  );
+
+  /**
+   * Open a shell tab and type `command` into it. Used for the capability
+   * drawer's "Manage in terminal" — the backend has no run-a-command entry
+   * point, so we drive the shell we just opened.
    */
   const openTerminalWithCommand = useCallback(
     async (command: string, sessionLabel?: string) => {
@@ -170,6 +188,7 @@ Reset again, or remove ${resetLeftoverPronoun(outcome)} manually once stopped.`,
     handleBackup,
     openClaudeTerminal,
     openShell,
+    resumeClaudeSession,
     openTerminalWithCommand,
   };
 }

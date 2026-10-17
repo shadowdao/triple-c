@@ -81,3 +81,26 @@ describe("useTerminal input ordering", () => {
     expect(bySession).toContainEqual(["b", "2"]);
   });
 });
+
+describe("useTerminal open", () => {
+  it("opens a resumed conversation as a Claude session", async () => {
+    // Resume used to open a "bash" tab and type `claude --resume` into it, and
+    // Shift+Enter keys off the tab's type — so it submitted instead of adding
+    // a newline. The id has to travel to the backend *and* the tab has to be
+    // registered as "claude".
+    const commands = await import("../lib/tauri-commands");
+    const { useAppState } = await import("../store/appState");
+    const { result } = renderHook(() => useTerminal());
+
+    const id = await result.current.open("p1", "proj", "claude", "my chat", "e13d312d-2f38");
+
+    expect(commands.openTerminalSession).toHaveBeenCalledWith(
+      "p1",
+      id,
+      "claude",
+      "my chat",
+      "e13d312d-2f38",
+    );
+    expect(useAppState.getState().sessions.find((s) => s.id === id)?.sessionType).toBe("claude");
+  });
+});

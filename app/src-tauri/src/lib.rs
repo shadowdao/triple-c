@@ -645,7 +645,6 @@ pub fn run() {
             commands::gateway_commands::regenerate_gateway_auth_token,
             // Container introspection (sessions / capabilities / scheduler)
             commands::inspect_commands::list_claude_sessions,
-            commands::inspect_commands::resume_session_command,
             commands::inspect_commands::list_container_capabilities,
             commands::inspect_commands::list_scheduled_tasks,
             commands::inspect_commands::add_scheduled_task,

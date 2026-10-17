@@ -107,7 +107,6 @@
     "allow-get-gateway-auth-token",
     "allow-regenerate-gateway-auth-token",
     "allow-list-claude-sessions",
-    "allow-resume-session-command",
     "allow-list-container-capabilities",
     "allow-list-scheduled-tasks",
     "allow-add-scheduled-task",
