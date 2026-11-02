@@ -8,6 +8,9 @@ pub mod legacy_cleanup;
 pub mod migration;
 pub mod stt;
 
+/// The container user `claude`'s home directory, as the image creates it.
+pub(crate) const CONTAINER_HOME: &str = "/home/claude";
+
 #[allow(unused_imports)]
 pub use gateway::*;
 #[allow(unused_imports)]

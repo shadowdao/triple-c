@@ -28,12 +28,33 @@ ENV DEBIAN_FRONTEND=noninteractive
 # archive.ubuntu.com returns stale Packages.gz files with mismatched hashes
 # during hourly resyncs. Clearing /var/lib/apt/lists/* between attempts
 # forces a fresh fetch.
-RUN for i in 1 2 3 4 5; do \
+#
+# `apt-get upgrade` is what picks up security fixes for packages the
+# `ubuntu:24.04` image already ships. `install` below never touches those, so
+# without it a fix that lands in noble-security between two refreshes of the
+# base tag stays out of this image until the next refresh. Packages the later
+# layers install come straight from the archive, so this one upgrade is enough.
+#
+# CI builds with `cache-from: type=gha`, so this layer (and everything after
+# it) only re-runs when its cache key changes: the base digest, this layer's
+# text, or `APT_REFRESH`. CI sets that to the ISO week (`2026-W45`) and also
+# rebuilds weekly on a schedule, so a security fix published after the last
+# commit is in the image within a week. An ARG only changes the key of a RUN
+# that uses it, hence the `echo`. Local builds leave it empty.
+#
+# Scanned on 2026-11-02, the published image of 2026-10-16 carried
+# libbrotli1 1.1.0-2build2 (CVE-2026-111497, HIGH) and zlib1g 1.3.dfsg-3.1ubuntu2.2
+# (CVE-2026-85091), both with fixed versions in the archive, and pnpm's bundled
+# undici 6.29.0 (three HIGH CVEs, fixed in the pnpm 12.16.1 a rebuild installs).
+ARG APT_REFRESH=
+RUN echo "apt refresh: ${APT_REFRESH:-unset}" \
+    && for i in 1 2 3 4 5; do \
         apt-get -o Acquire::Retries=3 update && break; \
         echo "apt-get update failed (attempt $i), retrying in 10s..."; \
         rm -rf /var/lib/apt/lists/*; \
         sleep 10; \
     done \
+    && apt-get -o Acquire::Retries=3 upgrade -y \
     && apt-get install -y --no-install-recommends \
     git \
     curl \
@@ -274,7 +295,9 @@ RUN npx --yes playwright@latest --version \
     && rm -rf /var/lib/apt/lists/* /root/.npm
 
 # ── Python 3 + pip + uv + ruff ──────────────────────────────────────────────
-RUN for i in 1 2 3 4 5; do \
+ARG APT_REFRESH=
+RUN echo "apt refresh: ${APT_REFRESH:-unset}" \
+    && for i in 1 2 3 4 5; do \
         apt-get -o Acquire::Retries=3 update && break; \
         echo "apt-get update failed (attempt $i), retrying in 10s..."; \
         rm -rf /var/lib/apt/lists/*; \

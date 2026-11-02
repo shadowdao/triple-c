@@ -63,6 +63,7 @@ use tauri::State;
 use crate::docker::client::get_docker;
 use crate::docker::container::is_container_running;
 use crate::docker::exec::{exec_oneshot_env, exec_oneshot_env_status};
+use crate::docker::CONTAINER_HOME;
 use crate::AppState;
 
 /// Newest N session transcripts to inspect. Caps the work done inside the
@@ -71,8 +72,6 @@ const MAX_SESSIONS: usize = 50;
 
 /// Newest N scheduler notifications to return.
 const MAX_NOTIFICATIONS: usize = 50;
-
-const CONTAINER_HOME: &str = "/home/claude";
 
 /// Caps on the free-text fields of a scheduled task. They exist to keep a
 /// runaway paste out of the container's task JSON and out of the `docker exec`

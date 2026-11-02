@@ -11,6 +11,11 @@ on:
     paths:
       - "container/**"
       - ".gitea/workflows/build.yml"
+  # Weekly rebuild with no commit needed, so OS security fixes published since
+  # the last push reach the image (see APT_REFRESH in container/Dockerfile).
+  # Scheduled runs use the default branch, i.e. main.
+  schedule:
+    - cron: "17 4 * * 1"
 
 env:
   REGISTRY: repo.anhonesthost.net
@@ -64,13 +69,23 @@ jobs:
           username: shadowdao
           password: ${{ secrets.GH_PAT }}
 
+      # Changes once a week, which invalidates the cached `apt-get upgrade`
+      # layer (container/Dockerfile) so later security fixes are picked up.
+      - name: Compute the apt refresh stamp
+        id: apt
+        run: echo "stamp=$(date -u +%G-W%V)" >> $GITHUB_OUTPUT
+
       - name: Build and push container image
         uses: docker/build-push-action@v5
         with:
           context: ./container
           file: ./container/Dockerfile
           platforms: linux/amd64,linux/arm64
-          push: ${{ gitea.event_name == 'push' }}
+          # Publish from main pushes and the weekly scheduled rebuild (which
+          # runs on main); a pull_request run only validates.
+          push: ${{ gitea.event_name != 'pull_request' }}
+          build-args: |
+            APT_REFRESH=${{ steps.apt.outputs.stamp }}
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ gitea.sha }}

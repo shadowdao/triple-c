@@ -339,3 +339,54 @@ mod tests {
         assert_eq!(read(&dest.join("config.d/work")), "Host work");
     }
 }
+
+#[cfg(test)]
+mod apt_refresh_tests {
+    use super::DOCKERFILE;
+
+    const BUILD_WORKFLOW: &str = include_str!("../../../../.gitea/workflows/build.yml");
+
+    /// The `RUN` instruction (with its `\` continuations) that contains `needle`.
+    fn run_containing(needle: &str) -> String {
+        let mut run = String::new();
+        let mut current = String::new();
+        for line in DOCKERFILE.lines() {
+            if line.starts_with("RUN ") {
+                current.clear();
+            }
+            current.push_str(line);
+            current.push('\n');
+            if !line.trim_end().ends_with('\\') {
+                if current.contains(needle) && current.starts_with("RUN ") {
+                    run = current.clone();
+                }
+                current.clear();
+            }
+        }
+        run
+    }
+
+    /// CI builds with `cache-from: type=gha`, so the `apt-get upgrade` layer is
+    /// only re-run when its cache key changes. An ARG changes a RUN's key only
+    /// where it is *used*, so the upgrade's RUN must reference it, after an
+    /// `ARG APT_REFRESH` declared in its stage.
+    #[test]
+    fn the_apt_upgrade_layer_is_keyed_on_apt_refresh() {
+        let arg = DOCKERFILE.find("\nARG APT_REFRESH").expect("ARG APT_REFRESH declared");
+        let run = run_containing("upgrade -y");
+        assert!(!run.is_empty(), "no RUN with apt-get upgrade");
+        assert!(DOCKERFILE.find(&run).unwrap() > arg, "ARG must come before the RUN");
+        assert!(run.contains("${APT_REFRESH"), "RUN must use APT_REFRESH: {run}");
+    }
+
+    /// …and CI must actually pass a value that changes at least weekly, and
+    /// rebuild on a schedule so a week with no commits still gets the fixes.
+    #[test]
+    fn ci_passes_a_weekly_apt_refresh_and_rebuilds_on_a_schedule() {
+        assert!(BUILD_WORKFLOW.contains("APT_REFRESH=${{ steps.apt.outputs.stamp }}"));
+        assert!(BUILD_WORKFLOW.contains("date -u +%G-W%V"));
+        assert!(BUILD_WORKFLOW.contains("schedule:"));
+        // A scheduled run must publish, a PR run must not.
+        assert!(BUILD_WORKFLOW.contains("push: ${{ gitea.event_name != 'pull_request' }}"));
+    }
+}

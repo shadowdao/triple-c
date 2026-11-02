@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { createFilePathLinkProvider } from "./filePathLinkProvider";
 
-const fakeTerm = (rows: Array<[string, boolean]>) => ({
+const fakeTerm = (rows: Array<[string, boolean]>, cols?: number) => ({
+  cols,
   buffer: {
     active: {
       getLine: (y: number) => rows[y] && { isWrapped: rows[y][1], translateToString: () => rows[y][0] },
@@ -38,6 +39,29 @@ describe("createFilePathLinkProvider", () => {
     const links = vi.fn();
     provider.provideLinks(2, links);
     expect(links.mock.calls[0][0][0].range).toEqual({ start: { x: 5, y: 1 }, end: { x: 12, y: 2 } });
+  });
+
+  it("links a long /tmp path that Claude Code hard-wrapped, from either row", () => {
+    // Captured from Claude Code at 70 columns: the path is broken mid-word and
+    // the rest drawn two cells in on the next row, with no `isWrapped`.
+    const rows: Array<[string, boolean]> = [
+      ["\u25cf The file is at /tmp/claude-1000/-workspace/5e4ab145-915e-4902-9329-e", false],
+      ["  039e2a07562/scratchpad/notes.md ok", false],
+    ];
+    const onOpen = vi.fn();
+    const provider = createFilePathLinkProvider(fakeTerm(rows, 70), onOpen, () => true);
+    for (const row of [1, 2]) {
+      const links = vi.fn();
+      provider.provideLinks(row, links);
+      const [list] = links.mock.calls[0];
+      expect(list).toHaveLength(1);
+      expect(list[0].range).toEqual({ start: { x: 18, y: 1 }, end: { x: 33, y: 2 } });
+      list[0].activate(new MouseEvent("click"), list[0].text);
+    }
+    const scratch = "/tmp/claude-1000/-workspace/5e4ab145-915e-4902-9329-e039e2a07562/scratchpad/notes.md";
+    expect(onOpen).toHaveBeenCalledTimes(2);
+    expect(onOpen).toHaveBeenNthCalledWith(1, expect.objectContaining({ path: scratch }));
+    expect(onOpen).toHaveBeenNthCalledWith(2, expect.objectContaining({ path: scratch }));
   });
 
   it("answers undefined for a row with nothing", () => {

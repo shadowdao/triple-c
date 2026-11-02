@@ -146,6 +146,62 @@ describe("UrlDetector", () => {
   });
 });
 
+describe("UrlDetector — trailing punctuation", () => {
+  it("leaves a full stop after the link out of the candidate", () => {
+    const seen: string[] = [];
+    const d = new UrlDetector((u) => seen.push(u), () => COLS);
+
+    feed(d, `Open ${SIGN_IN_URL}. Then paste the code.\r\n`);
+
+    expect(seen).toEqual([SIGN_IN_URL]);
+  });
+
+  it("leaves wrapping brackets out of the candidate", () => {
+    const seen: string[] = [];
+    const d = new UrlDetector((u) => seen.push(u), () => COLS);
+
+    feed(d, `[Sign in](${SIGN_IN_URL}).\r\nmore\r\n`);
+
+    expect(seen).toEqual([SIGN_IN_URL]);
+  });
+
+  it("trims a link that ends the buffer once it is confirmed", () => {
+    const seen: string[] = [];
+    const d = new UrlDetector((u) => seen.push(u), () => COLS);
+
+    feed(d, `See ${SIGN_IN_URL}.`);
+
+    expect(seen).toEqual([SIGN_IN_URL]);
+  });
+
+  it("still waits for more when the buffer ends on a full stop", () => {
+    // A `.` at the end of a chunk may be the middle of the URL (`file.tar.gz`)
+    // with the rest still in flight. Whether to wait is decided by where the
+    // raw text ran to, not by where the trimmed URL ends.
+    const seen: string[] = [];
+    const d = new UrlDetector((u) => seen.push(u), () => 1000);
+    const head = "https://example.com/" + "a".repeat(90) + ".";
+    const url = head + "tar.gz";
+
+    d.feed(enc.encode(head));
+    vi.advanceTimersByTime(400); // scanned, but inside the confirmation wait
+    d.feed(enc.encode("tar.gz\r\nnext\r\n"));
+    vi.advanceTimersByTime(2000);
+
+    expect(seen).toEqual([url]);
+  });
+
+  it("measures the length threshold on the trimmed URL", () => {
+    const seen: string[] = [];
+    const d = new UrlDetector((u) => seen.push(u), () => COLS);
+    const url = "https://example.com/" + "a".repeat(79); // 99 characters
+
+    feed(d, `(${url}).\r\nmore\r\n`);
+
+    expect(seen).toEqual([]);
+  });
+});
+
 describe("usableLink", () => {
   // Ports `usable_sign_in_link` from `commands/auth_token_commands.rs` — a junk
   // filter, not the security decision. `sanitizeRelayUrl` is still what stands

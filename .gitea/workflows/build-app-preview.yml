@@ -61,6 +61,13 @@ name: Build App (Preview)
 # for real releases. See triple-c#32.)
 
 env:
+  # The ephemeral Proxmox runners (eph-pve3-*) ship needrestart, which after
+  # any apt-get install stops at an interactive "Daemons using outdated
+  # libraries" prompt and hangs the job until it times out. `sudo` resets the
+  # environment, so the apt-get calls below also pass these via `sudo env`;
+  # here they reach the NodeSource setup script through `sudo -E`.
+  NEEDRESTART_MODE: a
+  DEBIAN_FRONTEND: noninteractive
   GITEA_URL: ${{ gitea.server_url }}
   REPO: ${{ gitea.repository }}
   # How many preview releases survive a run, newest first — including the one
@@ -262,7 +269,7 @@ jobs:
           fi
           if [ "$NEED_INSTALL" = true ]; then
             curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
-            sudo apt-get install -y nodejs
+            sudo env NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs
             hash -r
           fi
           node --version
@@ -273,8 +280,8 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          sudo env NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get update
+          sudo env NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get install -y \
             libgtk-3-dev \
             libwebkit2gtk-4.1-dev \
             libayatana-appindicator3-dev \
@@ -344,7 +351,7 @@ jobs:
           fi
           if [ "$NEED_INSTALL" = true ]; then
             curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
-            sudo apt-get install -y nodejs
+            sudo env NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs
             hash -r
           fi
           node --version
@@ -367,8 +374,8 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          sudo env NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get update
+          sudo env NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get install -y \
             libgtk-3-dev \
             libwebkit2gtk-4.1-dev \
             libayatana-appindicator3-dev \
@@ -655,7 +662,7 @@ jobs:
           where node >nul 2>&1 && (
             node --version
           ) || (
-            curl -fSL -o node-install.msi "https://nodejs.org/dist/v22.14.0/node-v22.14.0-x64.msi"
+            curl -fSL -o node-install.msi "https://nodejs.org/dist/v22.23.4/node-v22.23.4-x64.msi"
             msiexec /i node-install.msi /quiet /norestart
             del node-install.msi
           )

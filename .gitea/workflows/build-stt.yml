@@ -55,5 +55,10 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ gitea.sha }}
             ghcr.io/shadowdao/triple-c-stt:latest
             ghcr.io/shadowdao/triple-c-stt:${{ gitea.sha }}
+          # The gha cache is served by the runner that picks the job up, and
+          # is unreachable from the job on some of ours (the home box's
+          # firewalled per-job bridge; ephemeral runners). Import failures
+          # only warn, but an export failure fails the build unless told not
+          # to -- the same setting build.yml already carries.
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-to: type=gha,mode=max,ignore-error=true

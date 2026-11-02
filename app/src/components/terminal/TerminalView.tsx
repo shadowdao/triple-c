@@ -16,6 +16,7 @@ import {
 } from "../../lib/tauri-commands";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { UrlDetector, type UrlSource } from "../../lib/urlDetector";
+import { TERMINAL_URL_REGEX } from "../../lib/urlMatch";
 import {
   RelayRateLimiter,
   URL_RELAY_OSC,
@@ -31,7 +32,8 @@ import UrlToast, {
   URL_TOAST_SELECTOR,
   URL_TOAST_SHORTCUT,
 } from "./UrlToast";
-import { trimSelection } from "./trimSelection";
+import { cleanSelection, sanitizeInvisibles, type CopyGeometry } from "./copyCleanup";
+import { decodeOsc52 } from "./osc52";
 import { resolveTerminalGpuRendering } from "../../lib/terminalRenderer";
 import TerminalContextMenu from "./TerminalContextMenu";
 import { createFilePathLinkProvider } from "./filePathLinkProvider";
@@ -121,6 +123,16 @@ export function supersedes(
  * goes wrong without it.
  */
 export const OSC8_HOVER_CLASS = "xterm-hover";
+
+/**
+ * What `cleanSelection` needs to tell Claude's hard wraps from real line
+ * breaks: the width it wrapped to, and where the selection's first row began.
+ * `getSelectionPosition().start.x` is documented as 1-based but xterm 5.5
+ * returns the selection model's 0-based column — which is what is wanted.
+ */
+function selectionGeometry(term: Terminal): CopyGeometry {
+  return { cols: term.cols, startCol: term.getSelectionPosition()?.start.x ?? 0 };
+}
 
 /**
  * Report a failed handoff to the host's browser.
@@ -1069,9 +1081,10 @@ export default function TerminalView({ sessionId, active }: Props) {
 
     // Web links addon — opens URLs in host browser via Tauri, with a permissive regex
     // that matches URLs even if they lack trailing path segments (the default regex
-    // misses OAuth URLs that end mid-line).
-    // eslint-disable-next-line no-control-regex
-    const urlRegex = /https?:\/\/[^\s'"`<>\x00-\x20\x7f]+/;
+    // misses OAuth URLs that end mid-line). `TERMINAL_URL_REGEX` also leaves
+    // trailing prose punctuation and wrapping brackets out of the match, which
+    // is what the addon underlines *and* what it hands the handler below.
+    const urlRegex = TERMINAL_URL_REGEX;
     const webLinksAddon = new WebLinksAddon((event, uri) => {
       // Same gate and same sink as `createOsc8LinkHandler`, because this
       // reaches the same `openUrlExternal` through the same
@@ -1126,15 +1139,17 @@ export default function TerminalView({ sessionId, active }: Props) {
 
     term.open(containerRef.current);
 
-    // Ctrl+Shift+C copies the selection with whitespace trimmed (UI padding
-    // stripped, internal indentation preserved). Ctrl+Shift+Alt+C copies raw.
+    // Ctrl+Shift+C copies the selection cleaned up for pasting (UI padding,
+    // Claude's gutter markers and hard wraps, and invisible characters removed;
+    // internal indentation preserved — see `copyCleanup.ts`). Ctrl+Shift+Alt+C
+    // copies raw.
     // Both prevent the keystroke from reaching the container (where Ctrl+C
     // would send SIGINT and cancel running work).
     term.attachCustomKeyEventHandler((event) => {
       if (event.type === "keydown" && event.ctrlKey && event.shiftKey && event.key === "C") {
         const sel = term.getSelection();
         if (sel) {
-          const out = event.altKey ? sel : trimSelection(sel);
+          const out = event.altKey ? sel : cleanSelection(sel, selectionGeometry(term));
           navigator.clipboard.writeText(out).catch((e) =>
             console.error("Ctrl+Shift+C clipboard write failed:", e),
           );
@@ -1214,16 +1229,18 @@ export default function TerminalView({ sessionId, active }: Props) {
     const osc52Disposable = term.parser.registerOscHandler(52, (data) => {
       const idx = data.indexOf(";");
       if (idx === -1) return false;
-      const payload = data.substring(idx + 1);
-      if (payload === "?") return false; // clipboard read request, not supported
-      try {
-        const decoded = atob(payload);
-        navigator.clipboard.writeText(decoded).catch((e) =>
-          console.error("OSC 52 clipboard write failed:", e),
-        );
-      } catch (e) {
-        console.error("OSC 52 decode failed:", e);
+      if (data.substring(idx + 1) === "?") return false; // clipboard read request, not supported
+      // Decoded as UTF-8 — `atob` alone mojibaked every non-ASCII character.
+      // Only invisible characters are normalized: the program chose this text,
+      // so it is not dedented or reflowed the way a terminal selection is.
+      const decoded = decodeOsc52(data);
+      if (decoded === null) {
+        console.error("OSC 52 decode failed: invalid base64");
+        return true;
       }
+      navigator.clipboard.writeText(sanitizeInvisibles(decoded)).catch((e) =>
+        console.error("OSC 52 clipboard write failed:", e),
+      );
       return true;
     });
 
@@ -1625,7 +1642,7 @@ export default function TerminalView({ sessionId, active }: Props) {
     if (!term) return;
     const sel = term.getSelection();
     if (!sel) return;
-    const out = mode === "raw" ? sel : trimSelection(sel);
+    const out = mode === "raw" ? sel : cleanSelection(sel, selectionGeometry(term));
     navigator.clipboard.writeText(out).catch((e) =>
       console.error("Context menu clipboard write failed:", e),
     );

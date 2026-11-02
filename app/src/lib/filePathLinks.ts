@@ -35,11 +35,22 @@ const KNOWN_BASENAMES = new Set([
 ]);
 
 /**
+ * The characters a path segment is made of, as a regex character-class body
+ * (no brackets). Shared with `xtermLineJoin`, which must agree with `TOKEN` on
+ * what counts as part of a path when it decides whether a row was broken
+ * mid-path.
+ */
+export const PATH_SEGMENT_CLASS = String.raw`A-Za-z0-9_.\-~+@`;
+
+/**
  * A candidate token: path characters, optionally starting with `/`, `./`, `../`
  * or `.` (dotfile). Excludes the wrapping characters the surrounding markdown
  * leaves (`(`, `)`, `[`, `]`, backtick, quotes) and whitespace.
  */
-const TOKEN = /(?:\.{1,2}\/|\/)?[A-Za-z0-9_.\-~+@]+(?:\/[A-Za-z0-9_.\-~+@]+)*\/?/g;
+const TOKEN = new RegExp(
+  String.raw`(?:\.{1,2}\/|\/)?[${PATH_SEGMENT_CLASS}]+(?:\/[${PATH_SEGMENT_CLASS}]+)*\/?`,
+  "g",
+);
 const URL_SCHEME = /[a-z][a-z0-9+.-]*:\/\//gi;
 const LINE_SUFFIX = /^(?::(\d+)(?::(\d+))?(?:-(\d+))?|#L(\d+)(?:-L?(\d+))?)/;
 const VERSION_LIKE = /^v?\d+(\.\d+)+$/;

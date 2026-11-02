@@ -73,6 +73,11 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
 - **`hooks/`** — All Tauri IPC calls are encapsulated in hooks (`useTerminal`, `useProjects`, `useDocker`, `useSettings`)
 - **`lib/tauri-commands.ts`** — Typed `invoke()` wrappers; TypeScript types in `lib/types.ts` must match Rust models
 - **`components/terminal/TerminalView.tsx`** — xterm.js integration with WebGL rendering, URL detection for OAuth flow
+  - **Copy paths** (`copyCleanup.ts`, `osc52.ts`). OSC 52 base64 is UTF-8 *bytes* — never hand
+    `atob()`'s output to the clipboard (that was the `â€™` mojibake); OSC 52 text then gets only
+    `sanitizeInvisibles`. Ctrl+Shift+C / "Copy trimmed" run `cleanSelection`, which also undoes
+    Claude Code's hard wraps (it wraps its own output and moves the cursor, so rows are never
+    `isWrapped`) using `term.cols` and the selection's start column. Ctrl+Shift+Alt+C stays raw.
 - **`viewer/`** — the terminal file viewer's window (second Vite entry `viewer.html` →
   `src/viewer/main.tsx`; CodeMirror 6). `lib/filePathLinks.ts` decides what a path is;
   `components/terminal/filePathLinkProvider.ts` registers it with xterm. The OSC 8 handler now
@@ -83,6 +88,11 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   lookup silently fall back to `index.html`, so the window just opens the *main app*, full UI and
   all, with no error anywhere; `file_viewer::tests::the_viewer_entry_exists_and_is_a_vite_input`
   in `file_viewer/mod.rs` is the only thing pinning this.
+  **Claude Code wraps its own output, so xterm's `isWrapped` misses most wrapped paths.** A word
+  longer than the line (a `/tmp/claude-<uid>/…` scratchpad path) is broken mid-word and the rest
+  drawn on the next row with cursor moves. `lib/xtermLineJoin.ts` bridges that when given `cols`
+  (row runs to the edge, next row continues with path characters, and the two runs could not
+  have fit on one line — the last test is what keeps prose from being glued together).
 - **`components/layout/`** — TopBar, MainTabs (the unified tab strip), Sidebar, StatusBar
 - **`components/projects/`** — `ProjectRow` (select-only list row), `ProjectList`, `AddProjectDialog`,
   and the editors reused by Project Home
@@ -172,7 +182,8 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   container — Claude sessions, installed capabilities, scheduler tasks), `auth_bridge_commands.rs`,
   `auth_token_commands.rs`.
 - **`file_viewer/`** — one window per click (`file-viewer-<n>`), a managed `ViewerRegistry`,
-  resolution by probing `/workspace/<p>` then `/workspace/<mount>/<p>` in one exec as `claude`,
+  resolution by probing `/workspace/<p>` then `/workspace/<mount>/<p>` in one exec as `claude`
+  (`~/p` is `/home/claude/p`; a relative miss gets a second exec at `/home/claude/<p>`, `/tmp/<p>`),
   polling by `sha256sum`, saves staged in `/tmp` and swapped in by a `sh` script as the container
   user (spec §5 says why the archive API never writes to the target directory). Commands take
   `window: tauri::Window`, gate on the label and act on the caller's own registry entry — no

@@ -235,6 +235,16 @@ done
 
 echo "Repacking."
 
+# The AppDir must be readable (and its directories and programs executable) by
+# everyone: the image is mounted with these modes and run by users other than
+# the packager. `--appimage-extract` writes it under the runner's umask, which
+# on some runners is 007 — the extracted root came out 0700 and AppRun.wrapped
+# 0770, and we used to repack exactly that. appimagetool's continuous build of
+# 2026-11-01 started refusing such an AppDir, which is right, so fix the modes
+# rather than pass --no-check-permissions. `a+rX` adds x only where some x bit
+# is already set (directories and programs), and grants no write to anyone.
+chmod -R a+rX "$root"
+
 tool="$work/appimagetool"
 curl -fsSL -o "$tool" "$APPIMAGE_TOOL_URL"
 chmod +x "$tool"
@@ -270,6 +280,15 @@ if [ "$demoted" = true ]; then
   grep -q "triple-c-wayland-fallback" "$out/AppRun" || fail "AppRun does not source the hook."
 fi
 [ -x "$out/usr/bin/triple-c" ] || fail "no executable usr/bin/triple-c."
+
+# Every file readable by all, every program executable by all — what the
+# `chmod -R a+rX` before the repack promised (AppRun.wrapped used to ship 0770).
+# Files only: the AppImage runtime's --appimage-extract creates every
+# *directory* 0700 whatever the image stores (verified by packing a 0755
+# AppDir and extracting it under umask 022), so directory modes cannot be
+# checked from an extraction. appimagetool's own check covers them pre-pack.
+unreadable="$(find "$out" -type f \( ! -perm -a+r -o \( -perm /111 ! -perm -a+x \) \) -print -quit)"
+[ -z "$unreadable" ] || fail "${unreadable#"$out"/} is not readable/executable by all users."
 
 # An empty Categories or missing metadata ships an image a manager cannot file
 # or describe, and both fail silently at runtime rather than at build time.

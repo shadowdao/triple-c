@@ -45,10 +45,11 @@ const GATEWAY_CONFIG_VOLUME: &str = "triple-c-gateway-config";
 /// Upstream LiteLLM, pinned to an exact release.
 ///
 /// LiteLLM 1.82.7 and 1.82.8 shipped credential-harvesting malware on PyPI, so
-/// nothing here may float a tag or resolve `litellm` at build time. v1.96.0 is
-/// also above the 1.84.0 floor set by the proxy auth-bypass CVEs — see the long
-/// comment in `gateway-container/Dockerfile`, and keep the two in lockstep.
-const GATEWAY_REGISTRY_IMAGE: &str = "ghcr.io/berriai/litellm:v1.96.0";
+/// nothing here may float a tag or resolve `litellm` at build time. v1.106.6 is
+/// also above the floors set by the proxy auth-bypass, SSRF and salt-key CVEs —
+/// see the long comment in `gateway-container/Dockerfile`, and keep the two in
+/// lockstep.
+const GATEWAY_REGISTRY_IMAGE: &str = "ghcr.io/berriai/litellm:v1.106.6";
 const GATEWAY_LOCAL_IMAGE: &str = "triple-c-gateway:latest";
 
 const GATEWAY_DOCKERFILE: &str = include_str!("../../../../gateway-container/Dockerfile");

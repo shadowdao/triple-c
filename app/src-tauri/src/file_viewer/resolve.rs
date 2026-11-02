@@ -2,13 +2,16 @@
 //!
 //! Relative paths are the common case (Claude prints project-relative paths). The
 //! terminal exec's cwd is `/workspace`, and each project path is mounted at
-//! `/workspace/<mount_name>`, so those are the roots probed, in that order. The probe
+//! `/workspace/<mount_name>`, so those are the roots probed, in that order.
+//! A relative path none of them has is then tried under `/home/claude` and `/tmp`
+//! ([`fallback_candidate_paths`]); `~/p` is `/home/claude/p`. The probe
 //! is one exec as the container user and prints `realpath -e` of every candidate that
 //! is a regular file: `fetch_container_file` refuses a symlink, so the registry must
 //! hold the resolved path, not the one that was clicked.
 
 use crate::commands::file_commands::validate_container_path;
 use crate::docker::exec::exec_oneshot_streams_as;
+use crate::docker::CONTAINER_HOME;
 
 pub const MAX_CANDIDATES: usize = 16;
 const MAX_RAW_LEN: usize = 4096;
@@ -36,11 +39,19 @@ pub fn candidate_paths(raw: &str, mount_names: &[String]) -> Result<Vec<String>,
         return Ok(vec![normalised]);
     }
 
-    let rel = collapse(raw.strip_prefix("./").unwrap_or(raw));
-    let rel = rel.trim_start_matches("./");
-    if rel.is_empty() {
-        return Err("The path is empty.".into());
+    // Claude Code prints paths under $HOME as `~/...`. Only the bare `~/` form:
+    // `~user/` names some other account's home and stays an ordinary name.
+    if let Some(rest) = raw.strip_prefix("~/") {
+        let rest = collapse(rest);
+        if rest.is_empty() {
+            return Err("The path is empty.".into());
+        }
+        let p = format!("{}/{}", CONTAINER_HOME, rest);
+        validate_container_path("File", &p)?;
+        return Ok(vec![p]);
     }
+
+    let rel = relative_part(raw).ok_or_else(|| "The path is empty.".to_string())?;
 
     let mut out: Vec<String> = Vec::new();
     let mut push = |candidate: String| {
@@ -59,6 +70,36 @@ pub fn candidate_paths(raw: &str, mount_names: &[String]) -> Result<Vec<String>,
         validate_container_path("File", c)?;
     }
     Ok(out)
+}
+
+/// Where a relative path is looked for when no project root has it, in order.
+/// The container user's home, then `/tmp` (drops, pastes and scratch files).
+/// Probed only after [`candidate_paths`] found nothing, so a project file never
+/// turns into a "which one?" chooser because a same-named file sits in `/tmp`.
+const FALLBACK_ROOTS: &[&str] = &[CONTAINER_HOME, "/tmp"];
+
+/// The second tier for a relative path: [`FALLBACK_ROOTS`]`/<p>`. Empty for an
+/// absolute or `~/` path (those name one place already) and for anything
+/// [`candidate_paths`] refuses — it is always called after that succeeded, but
+/// must not be a way around its checks.
+pub fn fallback_candidate_paths(raw: &str) -> Vec<String> {
+    if raw.starts_with('/') || raw.starts_with("~/") || candidate_paths(raw, &[]).is_err() {
+        return Vec::new();
+    }
+    let Some(rel) = relative_part(raw) else { return Vec::new() };
+    FALLBACK_ROOTS
+        .iter()
+        .map(|root| format!("{}/{}", root, rel))
+        .filter(|c| validate_container_path("File", c).is_ok())
+        .take(MAX_CANDIDATES)
+        .collect()
+}
+
+/// `./a//b` → `a/b`; `None` when nothing is left.
+fn relative_part(raw: &str) -> Option<String> {
+    let rel = collapse(raw.strip_prefix("./").unwrap_or(raw));
+    let rel = rel.trim_start_matches("./");
+    (!rel.is_empty()).then(|| rel.to_string())
 }
 
 /// `a//b/./c` → `a/b/c`. Never touches `..` (rejected before this runs).
@@ -127,6 +168,38 @@ mod tests {
     fn dot_prefix_and_duplicate_slashes_are_normalised_and_candidates_deduped() {
         let c = candidate_paths("./src//main.rs", &mounts(&["api", "api", ""])).unwrap();
         assert_eq!(c, vec!["/workspace/src/main.rs", "/workspace/api/src/main.rs"]);
+    }
+
+    #[test]
+    fn an_absolute_tmp_path_is_accepted_as_is() {
+        // Claude Code's scratchpad: long, and with a segment that starts with `-`.
+        let p = "/tmp/claude-1000/-workspace/5e4ab145-915e-4902-9329-e039e2a07562/scratchpad/notes.md";
+        assert_eq!(candidate_paths(p, &mounts(&["api"])).unwrap(), vec![p]);
+    }
+
+    #[test]
+    fn a_home_relative_path_is_the_container_users_home() {
+        // Claude Code prints paths under $HOME as `~/...`.
+        let c = candidate_paths("~/.claude/plans/plan.md", &mounts(&["api"])).unwrap();
+        assert_eq!(c, vec!["/home/claude/.claude/plans/plan.md"]);
+        assert!(candidate_paths("~/", &[]).is_err());
+        assert!(candidate_paths("~/../etc/passwd", &[]).is_err());
+        // `~user/` is not expanded; it stays an ordinary relative name.
+        assert_eq!(candidate_paths("~bob/x.md", &[]).unwrap(), vec!["/workspace/~bob/x.md"]);
+    }
+
+    #[test]
+    fn a_relative_path_falls_back_to_home_and_tmp() {
+        assert_eq!(
+            fallback_candidate_paths("scratch/notes.md"),
+            vec!["/home/claude/scratch/notes.md", "/tmp/scratch/notes.md"]
+        );
+        assert_eq!(fallback_candidate_paths("./notes.md"), vec!["/home/claude/notes.md", "/tmp/notes.md"]);
+        // Absolute, home-relative and refused paths have no fallbacks.
+        assert!(fallback_candidate_paths("/tmp/notes.md").is_empty());
+        assert!(fallback_candidate_paths("~/notes.md").is_empty());
+        assert!(fallback_candidate_paths("../notes.md").is_empty());
+        assert!(fallback_candidate_paths("").is_empty());
     }
 
     #[test]

@@ -60,6 +60,8 @@ const ptyOutput = vi.hoisted(() => ({
 const xterm = vi.hoisted(() => ({
   options: null as Record<string, unknown> | null,
   instances: [] as unknown[],
+  /** Every link provider registered on any terminal, for asking what gets underlined. */
+  linkProviders: [] as import("@xterm/xterm").ILinkProvider[],
 }));
 
 /**
@@ -81,6 +83,10 @@ vi.mock("@xterm/xterm", async (importOriginal) => {
       super(options);
       xterm.options = (options ?? null) as Record<string, unknown> | null;
       xterm.instances.push(this);
+    }
+    override registerLinkProvider(provider: import("@xterm/xterm").ILinkProvider) {
+      xterm.linkProviders.push(provider);
+      return super.registerLinkProvider(provider);
     }
   }
   return { ...actual, Terminal: SpyTerminal };
@@ -1972,5 +1978,153 @@ describe("the plain-text URL path is gated the same way", () => {
     webLinksHandler()(click(), "https://claude.ai@evil.tld/authorize");
 
     expect(openUrlExternal).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * The underline is the link: `WebLinksAddon` paints exactly what its regex
+ * matched and hands that same text to the click handler. So trailing prose
+ * punctuation has to be kept out of the *match*, not trimmed afterwards —
+ * otherwise `See https://x/docs.` underlines the full stop and opens it.
+ */
+describe("plain-text URLs stop before trailing punctuation", () => {
+  function term() {
+    return xterm.instances.at(-1) as unknown as {
+      write(d: string, cb: () => void): void;
+    };
+  }
+
+  async function write(data: string) {
+    await act(() => new Promise<void>((resolve) => term().write(data, resolve)));
+  }
+
+  /** The links every registered provider reports for buffer row 1. */
+  async function linksOnFirstRow() {
+    const found: Array<{ text: string; startX: number; endX: number }> = [];
+    for (const provider of xterm.linkProviders) {
+      await new Promise<void>((resolve) =>
+        provider.provideLinks(1, (links) => {
+          for (const l of links ?? []) {
+            found.push({ text: l.text, startX: l.range.start.x, endX: l.range.end.x });
+          }
+          resolve();
+        }),
+      );
+    }
+    return found.filter((l) => l.text.startsWith("http"));
+  }
+
+  beforeEach(() => {
+    xterm.linkProviders.length = 0;
+  });
+
+  it.each([
+    ["See https://example.com/docs.", "https://example.com/docs", 5],
+    ["(https://example.com/foo)", "https://example.com/foo", 2],
+    ["[text](https://x.example/z).", "https://x.example/z", 8],
+    ["<https://x.example/a>", "https://x.example/a", 2],
+    ["https://en.wikipedia.org/wiki/Foo_(bar)", "https://en.wikipedia.org/wiki/Foo_(bar)", 1],
+  ])("underlines only the URL in %j", async (line, url, startX) => {
+    mountSession("bash");
+    await write(line);
+
+    expect(await linksOnFirstRow()).toEqual([
+      { text: url, startX, endX: startX + url.length - 1 },
+    ]);
+  });
+});
+
+describe("TerminalView — copying text out", () => {
+  let writeText: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    writeText = vi.fn(async () => {});
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText },
+      configurable: true,
+    });
+  });
+
+  async function emitBytes(bytes: Uint8Array) {
+    const emit = ptyOutput.listeners.get("terminal-output-s1");
+    if (!emit) throw new Error("no terminal-output listener registered");
+    await act(async () => {
+      emit({ payload: Array.from(bytes) });
+      await new Promise((r) => setTimeout(r, 0));
+      await new Promise((r) => setTimeout(r, 0));
+    });
+  }
+  const utf8 = (s: string) => new TextEncoder().encode(s);
+
+  function pressCopy(container: HTMLElement, altKey = false) {
+    helperTextarea(container).dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "C",
+        ctrlKey: true,
+        shiftKey: true,
+        altKey,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+  }
+
+  it("puts OSC 52 text on the clipboard as UTF-8, not mojibake", async () => {
+    mountSession("claude");
+    await act(async () => {});
+    // What the xclip shim (`printf '%s' | base64`) and Claude Code both send.
+    const text = "it’s café — naïve 日本語\u00A0👍";
+    const b64 = Buffer.from(text, "utf8").toString("base64");
+    await emitBytes(utf8(`\x1b]52;c;${b64}\x07`));
+
+    expect(writeText).toHaveBeenCalledTimes(1);
+    // NBSP normalized; everything else exactly as sent.
+    expect(writeText).toHaveBeenCalledWith("it’s café — naïve 日本語 👍");
+  });
+
+  it("does not write anything for an OSC 52 read request", async () => {
+    mountSession("claude");
+    await act(async () => {});
+    await emitBytes(utf8("\x1b]52;c;?\x07"));
+    expect(writeText).not.toHaveBeenCalled();
+  });
+
+  // Claude Code's own hard wrap: it moves to the next row itself (CR + cursor
+  // moves in the real stream), so the rows are not `isWrapped` and the
+  // selection carries a newline at every break.
+  const CLAUDE_ROWS = [
+    "● The café’s naïve résumé handling means the parser — which was",
+    "  written years ago by someone who has since left the team — silently",
+    "  drops every accented character it cannot map.",
+  ];
+
+  it("Ctrl+Shift+C rejoins Claude's wrapped rows and drops its gutter", async () => {
+    const { container } = mountSession("claude");
+    await act(async () => {});
+    const term = xterm.instances[0] as Terminal;
+    act(() => term.resize(70, 24));
+    await emitBytes(utf8(CLAUDE_ROWS.join("\r\n")));
+    term.selectAll();
+
+    pressCopy(container);
+
+    expect(writeText).toHaveBeenCalledWith(
+      "The café’s naïve résumé handling means the parser — which was written years ago by someone who has since left the team — silently drops every accented character it cannot map.",
+    );
+  });
+
+  it("Ctrl+Shift+Alt+C copies the selection raw", async () => {
+    const { container } = mountSession("claude");
+    await act(async () => {});
+    const term = xterm.instances[0] as Terminal;
+    act(() => term.resize(70, 24));
+    await emitBytes(utf8(CLAUDE_ROWS.join("\r\n")));
+    term.selectAll();
+
+    pressCopy(container, true);
+
+    expect(writeText).toHaveBeenCalledTimes(1);
+    expect(writeText.mock.calls[0][0]).toBe(term.getSelection());
+    expect(writeText.mock.calls[0][0]).toContain("● The café’s");
   });
 });

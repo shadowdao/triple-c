@@ -15,7 +15,7 @@ use crate::file_viewer::poll::{poll_file, ViewerPoll};
 use crate::file_viewer::registry::{
     Choice, Location, Reservation, ViewerRegistry, ViewerTarget, ViewerTargetState,
 };
-use crate::file_viewer::resolve::{candidate_paths, probe_candidates};
+use crate::file_viewer::resolve::{candidate_paths, fallback_candidate_paths, probe_candidates};
 use crate::file_viewer::window::open_viewer_window;
 use crate::file_viewer::write::{sha256_hex, write_file, SavedFile, MAX_WRITE_BYTES};
 use crate::models::Project;
@@ -159,8 +159,17 @@ pub async fn open_file_viewer(
     let container_id = running_container_of(&project, "opening files").await?;
 
     let mounts: Vec<String> = project.paths.iter().map(|p| p.mount_name.clone()).collect();
-    let candidates = candidate_paths(&path, &mounts)?;
-    let matches = probe_candidates(&container_id, &candidates).await?;
+    let mut candidates = candidate_paths(&path, &mounts)?;
+    let mut matches = probe_candidates(&container_id, &candidates).await?;
+    // Not in the project: try home and /tmp, as a second exec so a project file
+    // never becomes a chooser because a namesake sits in /tmp.
+    if matches.is_empty() {
+        let fallbacks = fallback_candidate_paths(&path);
+        if !fallbacks.is_empty() {
+            matches = probe_candidates(&container_id, &fallbacks).await?;
+            candidates.extend(fallbacks);
+        }
+    }
     let initial = Location { line, col, end_line };
 
     let target_state = match matches.len() {

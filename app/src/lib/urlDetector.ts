@@ -65,6 +65,7 @@
  */
 
 import { extendsUrl } from "./urlRelay";
+import { findUrls } from "./urlMatch";
 
 const ANSI_RE =
   /\x1b(?:\[[0-9;?]*[A-Za-z]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[()#][A-Za-z0-9]|.)/g;
@@ -297,19 +298,19 @@ export class UrlDetector {
     //    still re-validated by `sanitizeRelayUrl` before it can reach the opener;
     //    stopping the match early only means the legitimate prefix survives
     //    instead of the whole candidate being thrown away.
-    // eslint-disable-next-line no-control-regex
-    const urlRe = /https?:\/\/[^\s'"`<>\x00-\x20\x7f]+/g;
-    let m: RegExpExecArray | null;
-
-    while ((m = urlRe.exec(flat)) !== null) {
-      const url = m[0];
-
+    //
+    //    `findUrls` also trims trailing prose punctuation and wrapping brackets
+    //    (`…/authorize?….` → no `.`), the same rule the terminal underline uses
+    //    — see `urlMatch.ts`. It reports the raw run's end separately, because
+    //    that, not the trimmed URL's end, is what says whether the text may
+    //    still be growing: a chunk ending `…/file.` may be followed by `tar.gz`.
+    for (const { url, rawEnd } of findUrls(flat)) {
       // 4. Filter by length
       if (url.length < MIN_URL_LENGTH) continue;
 
       // 5. If the match extends to the very end of the flattened string,
       //    more chunks may still be arriving — defer emission.
-      if (m.index + url.length >= flat.length) {
+      if (rawEnd >= flat.length) {
         this.pendingUrl = url;
         this.confirmTimer = setTimeout(() => {
           this.confirmTimer = null;

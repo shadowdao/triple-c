@@ -17,7 +17,7 @@ export interface FilePathHover {
 }
 
 export function createFilePathLinkProvider(
-  term: Pick<Terminal, "buffer">,
+  term: Pick<Terminal, "buffer" | "cols">,
   onOpen: (match: FilePathMatch) => void,
   gate: (event: MouseEvent) => boolean,
   hover?: FilePathHover,
@@ -27,7 +27,9 @@ export function createFilePathLinkProvider(
       const row = bufferLineNumber - 1;
       const line = term.buffer.active.getLine(row);
       if (!line) return callback(undefined);
-      const joined = joinWrappedRows(term.buffer.active, row);
+      // `cols` lets the join bridge Claude Code's own mid-word wraps, which is
+      // how a long `/tmp/claude-<uid>/...` path reaches the screen.
+      const joined = joinWrappedRows(term.buffer.active, row, { cols: term.cols });
       // `offsetToCell` has no row to map onto when nothing was joined.
       if (joined.rowStarts.length === 0) return callback(undefined);
       const matches = findFilePathLinks(joined.text);

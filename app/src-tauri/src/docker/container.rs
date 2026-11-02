@@ -124,6 +124,16 @@ Do not change `sandbox.enabled` in `settings.json` — Triple-C overwrites it
 on every container start. To turn sandbox off, stop the container in
 Triple-C, flip the "Sandbox mode" switch off, then start the container."#;
 
+/// The Triple-C terminal opens a printed path on click (Shift/Option+click while
+/// a program holds the mouse — `opensOnClick` in TerminalView) by looking for it
+/// in the project, then `~` and `/tmp`. A relative name for a file elsewhere
+/// (Claude Code's scratchpad under `/tmp/claude-<uid>/...` above all) cannot
+/// be found, so ask for the whole path. Part of the instructions fingerprint,
+/// so adding or changing it recreates each container once on its next start.
+const FILE_LINK_INSTRUCTIONS: &str = r#"## Referring to files
+
+The user can click a file path in this terminal to open it in a viewer (while a program holds the mouse: Shift+click, or Option+click on macOS). Paths relative to the project work. When you mention a file outside the project (for example in `/tmp`, including your scratchpad directory, or under `~`), print its full absolute path, not a shortened or relative one, so it can be opened."#;
+
 /// Build the full CLAUDE_INSTRUCTIONS value by merging global + project
 /// instructions, appending port mapping docs, and appending scheduler docs.
 /// Used by both create_container() and container_needs_recreation() to ensure
@@ -161,6 +171,11 @@ fn build_claude_instructions(
     combined = Some(match combined {
         Some(existing) => format!("{}\n\n{}", existing, SCHEDULER_INSTRUCTIONS),
         None => SCHEDULER_INSTRUCTIONS.to_string(),
+    });
+
+    combined = Some(match combined {
+        Some(existing) => format!("{}\n\n{}", existing, FILE_LINK_INSTRUCTIONS),
+        None => FILE_LINK_INSTRUCTIONS.to_string(),
     });
 
     if sandbox_enabled {
@@ -4136,6 +4151,31 @@ mod tests {
     const SONNET: &str = ANTHROPIC_DEFAULT_SONNET_MODEL;
     const HAIKU: &str = ANTHROPIC_DEFAULT_HAIKU_MODEL;
     const FABLE: &str = ANTHROPIC_DEFAULT_FABLE_MODEL;
+
+    /// The terminal can only open a file it can find: a bare name is looked
+    /// for in the project, home and /tmp, but a long scratchpad path printed
+    /// as `scratchpad/notes.md` is nowhere. Every container gets the ask to
+    /// print the full path, whatever else is configured.
+    #[test]
+    fn every_container_is_asked_to_print_full_paths_for_files_outside_the_project() {
+        for (global, project, sandbox) in [(None, None, false), (Some("g"), Some("p"), true)] {
+            let s = build_claude_instructions(global, project, &[], false, sandbox).unwrap();
+            assert!(s.contains(FILE_LINK_INSTRUCTIONS), "{:?}", (global, project, sandbox));
+        }
+        assert!(FILE_LINK_INSTRUCTIONS.contains("full absolute path"));
+        assert!(FILE_LINK_INSTRUCTIONS.contains("/tmp"));
+    }
+
+    /// The gesture is TerminalView's `opensOnClick`: a plain click, unless a
+    /// program holds the mouse — then xterm's force-selection modifier, which
+    /// is Shift except on macOS, where it is Option. Naming only Shift sent Mac
+    /// users to a key that does nothing.
+    #[test]
+    fn the_file_link_instructions_name_the_gesture_for_every_platform() {
+        assert!(FILE_LINK_INSTRUCTIONS.contains("can click a file path"));
+        assert!(FILE_LINK_INSTRUCTIONS.contains("Shift+click"));
+        assert!(FILE_LINK_INSTRUCTIONS.contains("Option+click on macOS"));
+    }
 
     fn aliases(model: Option<&str>, haiku: Option<&str>) -> Vec<(&'static str, String)> {
         compute_model_aliases(model, haiku)
