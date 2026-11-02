@@ -313,7 +313,13 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
     approach converges on the worst state: a 400 MB browser present with its libraries gone.
   - The layer sits immediately after Node (npx is its only prerequisite) and well above the shim
     `COPY`s, so editing a shim does not re-run a multi-hundred-megabyte apt install.
-- **`entrypoint.sh`** — UID/GID remapping to match host user, SSH key setup (`sync_host_ssh` *merges* the host dir into `~/.ssh`; never wipe it — container-made keys live there on the home volume), git config, docker socket permissions, Claude Code settings.json injection, then `sleep infinity`
+- **`entrypoint.sh`** — UID/GID remapping to match host user, SSH key setup (`sync_host_ssh` *merges* the host dir into `~/.ssh`; never wipe it — container-made keys live there on the home volume), git config, docker socket permissions, Claude Code settings.json injection, then stays resident **as root** waiting on a root-owned
+  `triple-c-keepalive` sleep (respawned if killed; SIGTERM trap so `docker stop` is immediate).
+  **Never hand the container's lifetime to a process the `claude` user owns** — it used to end in
+  `exec su … claude -c "exec sleep infinity"`, and any `pkill sleep` / `kill -9 -1` a Claude
+  session ran killed the whole container. `container_watch.rs` (one Docker `die`-event
+  subscription) is what flips a project whose container exits on its own to Stopped and emits
+  `project-status-changed`; `useProjectStatusEvents` applies it
 - **`triple-c-scheduler`** — Bash-based scheduled task system for recurring Claude Code invocations
 
 **`/home/claude` in the image is seed-only.** It is the mount point of the named volume
@@ -672,8 +678,9 @@ Anthropic and Bedrock deliberately keep Claude Code's own defaults.
   now", the host builds the project's effective set (`global − disabled ∪ project`), then uploads
   `payload.tar` **and the app-embedded script `src/marketplace/sync.sh`** (`include_str!`, not a
   file in `container/`) to `~/.claude/triple-c/marketplace/incoming/` and runs it as `claude`,
-  once the entrypoint has finished (`pgrep -x -f 'su -s /bin/bash claude -c exec sleep
-  infinity'`). The script is re-uploaded on every sync rather than baked into the image, so every
+  once the entrypoint has finished (`READY_PROBE`: a root `triple-c-keepalive infinity` process
+  on current images, `su -s /bin/bash claude -c exec sleep infinity` on older ones — keep both).
+  The script is re-uploaded on every sync rather than baked into the image, so every
   existing project always gets the version that matches the running app — `container/` is never
   touched for this feature. The script only removes files and hook entries it recorded in
   `~/.claude/triple-c/marketplace/state.json`; it must never overwrite or delete user-created

@@ -736,6 +736,39 @@ timeout 120 su -s /bin/bash claude -c 'export PATH="/home/claude/.claude/bin:/ho
     && echo "entrypoint: Claude Code is up to date" \
     || echo "entrypoint: warning — Claude Code update skipped or failed (continuing)"
 
-# ── Stay alive as claude ─────────────────────────────────────────────────────
+# ── Stay alive, as root ──────────────────────────────────────────────────────
+# The container lives exactly as long as this script: docker-init is PID 1 and
+# exits when its one child does. So what keeps it alive must be something the
+# claude user cannot kill. This used to end in
+#   exec su -s /bin/bash claude -c "exec sleep infinity"
+# which hung the container's whole lifetime on a `sleep` owned by claude — and
+# Claude Code runs as claude and routinely runs `pkill sleep`, `pkill -f …`,
+# `killall` or `kill -9 -1` while testing something. Any of those stopped the
+# container: every terminal disconnected and the app still said Running.
+# Dropping to claude there bought nothing (it dates from the initial commit,
+# with no stated reason, and nothing reads that process's owner); its one
+# reader is the app's marketplace readiness probe, which now also matches the
+# marker below (app/src-tauri/src/marketplace/sync.rs, READY_PROBE).
+#
+#  * Unprivileged kills get EPERM on both this script and its sleep. Even
+#    `sudo pkill sleep` only kills the child, which the loop replaces; it takes
+#    a root kill of this script itself.
+#  * `docker stop`: docker-init forwards SIGTERM here, and bash runs the trap
+#    as soon as `wait` returns, so the container stops at once rather than
+#    sitting out Docker's grace period and being SIGKILLed.
+#  * The sleep runs as `triple-c-keepalive infinity` (exec -a), a root-owned
+#    command line nothing else has, and it exists only once every step above
+#    has finished — that is the readiness marker. Keep the name in step with
+#    READY_PROBE.
 echo "Triple-C container ready."
-exec su -s /bin/bash claude -c "exec sleep infinity"
+keepalive_pid=""
+stop_keepalive() {
+    [ -n "$keepalive_pid" ] && kill "$keepalive_pid" 2>/dev/null
+    exit 0
+}
+trap stop_keepalive TERM INT HUP
+while :; do
+    (exec -a triple-c-keepalive sleep infinity) &
+    keepalive_pid=$!
+    wait "$keepalive_pid"
+done

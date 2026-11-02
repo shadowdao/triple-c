@@ -14,10 +14,17 @@ pub const INCOMING_DIR: &str = "/home/claude/.claude/triple-c/marketplace/incomi
 /// app version reaches existing containers without an image migration.
 pub const SYNC_SCRIPT: &str = include_str!("sync.sh");
 
-/// True once the entrypoint has finished: its last step execs this exact
-/// command line. Before that it may still be merging `settings.json` or running
-/// `claude update`, both of which the sync would race.
-const READY_PROBE: &str = "pgrep -x -f 'su -s /bin/bash claude -c exec sleep infinity' >/dev/null";
+/// True once the entrypoint has finished: its last step starts a process with
+/// one of these exact command lines. Before that it may still be merging
+/// `settings.json` or running `claude update`, both of which the sync would race.
+///
+/// Two, because there are two generations of entrypoint in the field. Current
+/// images keep the container alive with a root-owned `triple-c-keepalive`
+/// sleep (so a `pkill sleep` run as `claude` cannot stop the container — see
+/// the end of `container/entrypoint.sh`); older ones `exec su … claude -c exec
+/// sleep infinity`, and a project keeps its base image until it is migrated.
+const READY_PROBE: &str = "pgrep -u root -x -f 'triple-c-keepalive infinity' >/dev/null \
+                           || pgrep -x -f 'su -s /bin/bash claude -c exec sleep infinity' >/dev/null";
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
 const READY_POLL: Duration = Duration::from_secs(2);
 
@@ -196,14 +203,22 @@ mod tests {
 
     #[test]
     fn readiness_probes_the_entrypoints_final_exec() {
+        // Both generations of entrypoint: a project keeps the base image it
+        // was built from until it migrates, so the old `su … sleep` ending is
+        // the common case for years and must still read as ready.
         assert_eq!(
             ready_probe_cmd(),
             vec![
                 "sh",
                 "-c",
-                "pgrep -x -f 'su -s /bin/bash claude -c exec sleep infinity' >/dev/null"
+                "pgrep -u root -x -f 'triple-c-keepalive infinity' >/dev/null \
+                 || pgrep -x -f 'su -s /bin/bash claude -c exec sleep infinity' >/dev/null"
             ]
         );
+        // The marker name is shared with the entrypoint; a rename on one side
+        // only would leave every new container "not ready" for 180 s.
+        let entrypoint = include_str!("../../../../container/entrypoint.sh");
+        assert!(entrypoint.contains("exec -a triple-c-keepalive sleep infinity"));
         assert_eq!(READY_POLL, Duration::from_secs(2));
         assert_eq!(READY_TIMEOUT, Duration::from_secs(180));
     }
