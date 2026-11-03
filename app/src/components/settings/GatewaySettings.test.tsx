@@ -39,6 +39,7 @@ const status = (over: Partial<GatewayStatus> = {}): GatewayStatus => ({
   running: true,
   port: 4000,
   image_exists: true,
+  image_outdated: false,
   model_count: 0,
   has_api_key: false,
   base_url: "http://host.docker.internal:4000",
@@ -101,5 +102,36 @@ describe("GatewaySettings", () => {
       ),
     );
     await waitFor(() => expect(getGatewayStatus).toHaveBeenCalledTimes(2));
+  });
+  it("can stop a gateway running an outdated image, and says what to do", async () => {
+    appSettings = settingsWithGateway(true);
+    getGatewayStatus.mockResolvedValue(status({ image_outdated: true, image_exists: false }));
+    render(<GatewaySettings />);
+
+    const stop = await screen.findByRole("button", { name: "Stop" });
+    expect(screen.getByText(/image update available, Pull or Build/i)).toBeInTheDocument();
+
+    fireEvent.click(stop);
+    await waitFor(() => expect(stopGateway).toHaveBeenCalledTimes(1));
+  });
+
+  it("says Stop and Start applies a new image once it is present", async () => {
+    appSettings = settingsWithGateway(true);
+    getGatewayStatus.mockResolvedValue(status({ image_outdated: true }));
+    render(<GatewaySettings />);
+
+    expect(await screen.findByText(/image ready, Stop and Start/i)).toBeInTheDocument();
+  });
+
+  it("can restart a stopped gateway on its old image when no new image is present", async () => {
+    appSettings = settingsWithGateway(true);
+    getGatewayStatus.mockResolvedValue(
+      status({ running: false, image_exists: false, image_outdated: true }),
+    );
+    render(<GatewaySettings />);
+
+    expect(await screen.findByRole("button", { name: "Start" })).toBeInTheDocument();
+    // Starting it keeps the old LiteLLM, so say so.
+    expect(screen.getByText(/Stopped — gateway image update available/)).toBeInTheDocument();
   });
 });

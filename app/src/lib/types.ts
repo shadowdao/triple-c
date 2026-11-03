@@ -486,6 +486,8 @@ export interface GatewayStatus {
   running: boolean;
   port: number;
   image_exists: boolean;
+  /** The container runs something other than the pinned image. With `image_exists`, Stop + Start recreates it on the pinned image; without, it keeps its image until one is pulled or built. */
+  image_outdated: boolean;
   model_count: number;
   /** Presence only — the provider API key never leaves the keychain. */
   has_api_key: boolean;

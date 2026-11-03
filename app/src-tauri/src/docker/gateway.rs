@@ -21,7 +21,7 @@
 //!   `docker inspect`.
 
 use bollard::container::{
-    Config, CreateContainerOptions, ListContainersOptions, RemoveContainerOptions,
+    Config, CreateContainerOptions, ListContainersOptions,
     StartContainerOptions, StopContainerOptions, UploadToContainerOptions,
 };
 use bollard::image::BuildImageOptions;
@@ -49,8 +49,176 @@ const GATEWAY_CONFIG_VOLUME: &str = "triple-c-gateway-config";
 /// also above the floors set by the proxy auth-bypass, SSRF and salt-key CVEs —
 /// see the long comment in `gateway-container/Dockerfile`, and keep the two in
 /// lockstep.
-const GATEWAY_REGISTRY_IMAGE: &str = "ghcr.io/berriai/litellm:v1.106.6";
-const GATEWAY_LOCAL_IMAGE: &str = "triple-c-gateway:latest";
+const GATEWAY_REGISTRY_REPO: &str = "ghcr.io/berriai/litellm";
+const GATEWAY_LITELLM_VERSION: &str = "v1.106.6";
+
+/// The digest [`GATEWAY_REGISTRY_REPO`]:[`GATEWAY_LITELLM_VERSION`] is pinned to — the same one the
+/// Dockerfile's `FROM` uses. Pulls and lookups go by digest: a tag can be
+/// re-pushed upstream, a digest cannot.
+const GATEWAY_REGISTRY_DIGEST: &str =
+    "sha256:37e2dafb088a7723beb998590682957386dfc83ffea1848486f8e0e5cfac0b06";
+
+fn registry_image_ref() -> String {
+    format!("{}@{}", GATEWAY_REGISTRY_REPO, GATEWAY_REGISTRY_DIGEST)
+}
+
+/// Local builds are tagged with the pin plus a hash of the embedded build
+/// context (`triple-c-gateway:v1.106.6-1a2b3c4d`), never a floating tag. A
+/// build made by an app version with a different pin *or* a different
+/// Dockerfile/config then simply doesn't match, instead of quietly winning
+/// over the current image the way the old `triple-c-gateway:latest` tag did.
+/// Builds tagged `latest` by earlier app versions are no longer used.
+const GATEWAY_LOCAL_REPO: &str = "triple-c-gateway";
+
+/// The LiteLLM release this app is pinned to — the tag of
+/// [`GATEWAY_REGISTRY_REPO`]:[`GATEWAY_LITELLM_VERSION`], e.g. `v1.106.6`.
+fn pinned_litellm_version() -> &'static str {
+    GATEWAY_LITELLM_VERSION
+}
+
+fn local_image_ref() -> String {
+    static REF: OnceLock<String> = OnceLock::new();
+    REF.get_or_init(|| {
+        // config.yaml is hashed whole: a `#` line can sit inside a block
+        // scalar there, and it is rarely edited.
+        let context = sha256_hex(&format!(
+            "{}\0{}",
+            significant_lines(GATEWAY_DOCKERFILE),
+            GATEWAY_DEFAULT_CONFIG
+        ));
+        format!(
+            "{}:{}-{}",
+            GATEWAY_LOCAL_REPO,
+            pinned_litellm_version(),
+            &context[..8]
+        )
+    })
+    .clone()
+}
+
+/// The Dockerfile minus full-line comments and blank lines, so rewording a
+/// comment in a later release doesn't make every local build look outdated.
+/// Parser directives (`# syntax=`, `# escape=`, `# check=`) look like comments
+/// but change the build, so they are kept.
+fn significant_lines(text: &str) -> String {
+    text.lines()
+        .map(str::trim_end)
+        .filter(|l| {
+            let t = l.trim_start();
+            if t.is_empty() {
+                return false;
+            }
+            match t.strip_prefix('#') {
+                None => true,
+                Some(rest) => rest
+                    .split_once('=')
+                    .map(|(key, _)| key.trim())
+                    .is_some_and(|key| matches!(key, "syntax" | "escape" | "check")),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The image the gateway container should run, and its content id. The id goes
+/// into the container fingerprint so that a newly pulled or rebuilt image
+/// recreates the container instead of leaving the old one running.
+#[derive(Debug, Clone, PartialEq)]
+struct ChosenImage {
+    reference: String,
+    id: String,
+}
+
+/// Local build first (same precedence as the STT container), then the pinned
+/// upstream image. Both references name the pin, so either is current.
+fn choose_gateway_image(local_id: Option<String>, registry_id: Option<String>) -> Option<ChosenImage> {
+    local_id
+        .map(|id| ChosenImage {
+            reference: local_image_ref(),
+            id,
+        })
+        .or_else(|| {
+            registry_id.map(|id| ChosenImage {
+                reference: registry_image_ref(),
+                id,
+            })
+        })
+}
+
+/// The existing gateway container, as far as `ensure` and status need it.
+#[derive(Debug, Clone)]
+struct GatewayContainer {
+    id: String,
+    state: String,
+    /// The config-fingerprint label it was created with.
+    fingerprint: String,
+    image_id: Option<String>,
+}
+
+/// Ids of the locally present images that carry the current pin.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct PinnedImages {
+    local: Option<String>,
+    registry: Option<String>,
+}
+
+impl PinnedImages {
+    fn chosen(&self) -> Option<ChosenImage> {
+        choose_gateway_image(self.local.clone(), self.registry.clone())
+    }
+}
+
+/// A failed lookup of one image doesn't hide the other. An error is returned
+/// only when it leaves the answer unknown — so "Docker is unreachable" is not
+/// mistaken for "image missing".
+async fn pinned_images() -> Result<PinnedImages, String> {
+    let (local_ref, registry_ref) = (local_image_ref(), registry_image_ref());
+    let (local, registry) = tokio::join!(
+        super::migration::image_id(&local_ref),
+        super::migration::image_id(&registry_ref)
+    );
+    match (local, registry) {
+        (Ok(local), Ok(registry)) => Ok(PinnedImages { local, registry }),
+        // The local build is preferred, so it alone decides when present.
+        (Ok(Some(local)), Err(e)) => {
+            log::warn!("{}", e);
+            Ok(PinnedImages {
+                local: Some(local),
+                registry: None,
+            })
+        }
+        // But a failed lookup of the preferred local build leaves the answer
+        // unknown even when the registry image is there: choosing the
+        // registry image would swap a working local-build gateway over.
+        (Err(e), _) | (_, Err(e)) => Err(e),
+    }
+}
+
+/// Whether the container should be moved onto `pinned` — the image half of
+/// [`needs_recreate`]. A container whose image id is unknown counts as not on
+/// it, in both places.
+fn image_switch_pending(existing_image_id: Option<&str>, pinned: &ChosenImage) -> bool {
+    existing_image_id != Some(pinned.id.as_str())
+}
+
+/// Status's `image_outdated`: the container exists and isn't on a pinned
+/// image. With a pinned image present this is exactly [`image_switch_pending`]
+/// — what the next start or settings save acts on. With none (`Some(None)`) it
+/// is outdated, but `ensure` keeps it as is until one is pulled or built.
+/// `None` means the image check failed: unknown is reported as not outdated
+/// rather than guessed.
+fn container_image_outdated(
+    container_exists: bool,
+    container_image_id: Option<&str>,
+    chosen: Option<Option<&ChosenImage>>,
+) -> bool {
+    match chosen {
+        _ if !container_exists => false,
+        Some(Some(pinned)) => image_switch_pending(container_image_id, pinned),
+        Some(None) => true,
+        None => false,
+    }
+}
 
 const GATEWAY_DOCKERFILE: &str = include_str!("../../../../gateway-container/Dockerfile");
 const GATEWAY_DEFAULT_CONFIG: &str = include_str!("../../../../gateway-container/config.yaml");
@@ -201,6 +369,27 @@ async fn bridge_gateway_ip(docker: &Docker) -> Option<String> {
         .find_map(|c| c.gateway.filter(|g| !g.trim().is_empty()))
 }
 
+/// Config and secret version only — the same format earlier versions wrote,
+/// so updating the app doesn't by itself recreate every gateway. Image changes
+/// are handled separately by [`needs_recreate`].
+fn gateway_fingerprint(config_shape: &str, secret_version: &str) -> String {
+    sha256_hex(&format!("{}|{}", config_shape, secret_version))
+}
+
+/// The one rule for replacing an existing container: its config changed, or a
+/// pinned image is present and the container runs something else. With no
+/// pinned image (`pinned: None`) the container keeps its current image.
+/// [`container_image_outdated`] reports the image half of this to the UI.
+fn needs_recreate(
+    existing_fingerprint: &str,
+    fingerprint: &str,
+    existing_image_id: Option<&str>,
+    pinned: Option<&ChosenImage>,
+) -> bool {
+    existing_fingerprint != fingerprint
+        || pinned.is_some_and(|p| image_switch_pending(existing_image_id, p))
+}
+
 fn sha256_hex(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
@@ -208,23 +397,32 @@ fn sha256_hex(input: &str) -> String {
 }
 
 pub async fn get_gateway_status(settings: &GatewaySettings) -> Result<GatewayStatus, String> {
-    let image_exists = super::image::image_exists(GATEWAY_REGISTRY_IMAGE)
-        .await
-        .unwrap_or(false)
-        || super::image::image_exists(GATEWAY_LOCAL_IMAGE)
-            .await
-            .unwrap_or(false);
-
-    let (container_exists, running) = match find_gateway_container().await? {
-        Some((_, state, _)) => (true, state == "running"),
+    let (pinned, container) = tokio::join!(pinned_images(), find_gateway_container());
+    let chosen = match pinned {
+        Ok(p) => Some(p.chosen()),
+        Err(e) => {
+            log::warn!("Gateway image check failed: {}", e);
+            None
+        }
+    };
+    let image_exists = matches!(chosen, Some(Some(_)));
+    let container = container?;
+    let (container_exists, running) = match &container {
+        Some(c) => (true, c.state == "running"),
         None => (false, false),
     };
+    let image_outdated = container_image_outdated(
+        container_exists,
+        container.as_ref().and_then(|c| c.image_id.as_deref()),
+        chosen.as_ref().map(|c| c.as_ref()),
+    );
 
     Ok(GatewayStatus {
         container_exists,
         running,
         port: settings.port,
         image_exists,
+        image_outdated,
         model_count: settings.valid_models().len(),
         has_api_key: secure::has_gateway_api_key(),
         base_url: gateway_binding().await.base_url(settings.port),
@@ -235,7 +433,7 @@ pub async fn get_gateway_status(settings: &GatewaySettings) -> Result<GatewaySta
 /// settings reconcile, which must not start anything the user never started.
 pub async fn gateway_container_presence() -> Result<(bool, bool), String> {
     Ok(match find_gateway_container().await? {
-        Some((_, state, _)) => (true, state == "running"),
+        Some(c) => (true, c.state == "running"),
         None => (false, false),
     })
 }
@@ -252,8 +450,8 @@ fn is_gateway_container(names: Option<&Vec<String>>) -> bool {
     names.is_some_and(|names| names.iter().any(|n| n == &expected))
 }
 
-/// `(id, state, config fingerprint label)` for the gateway container, if any.
-async fn find_gateway_container() -> Result<Option<(String, String, String)>, String> {
+/// The gateway container, if any.
+async fn find_gateway_container() -> Result<Option<GatewayContainer>, String> {
     let docker = get_docker()?;
 
     let filters: HashMap<String, Vec<String>> = HashMap::from([(
@@ -284,7 +482,14 @@ async fn find_gateway_container() -> Result<Option<(String, String, String)>, St
             .cloned()
             .unwrap_or_default();
 
-        return Ok(Some((id, state, fingerprint)));
+        let image_id = container.image_id.clone().filter(|s| !s.is_empty());
+
+        return Ok(Some(GatewayContainer {
+            id,
+            state,
+            fingerprint,
+            image_id,
+        }));
     }
 
     Ok(None)
@@ -429,27 +634,10 @@ async fn upload_config(container_id: &str, config: &str) -> Result<(), String> {
 async fn create_gateway_container(
     settings: &GatewaySettings,
     binding: &GatewayBinding,
+    image: &ChosenImage,
     fingerprint: &str,
 ) -> Result<String, String> {
     let docker = get_docker()?;
-
-    // Local build first, then the pinned upstream image — same precedence as
-    // the STT container.
-    let image = if super::image::image_exists(GATEWAY_LOCAL_IMAGE)
-        .await
-        .unwrap_or(false)
-    {
-        GATEWAY_LOCAL_IMAGE.to_string()
-    } else if super::image::image_exists(GATEWAY_REGISTRY_IMAGE)
-        .await
-        .unwrap_or(false)
-    {
-        GATEWAY_REGISTRY_IMAGE.to_string()
-    } else {
-        return Err(
-            "Gateway image not found. Please pull or build the image first.".to_string(),
-        );
-    };
 
     let mut port_bindings = HashMap::new();
     port_bindings.insert(
@@ -491,7 +679,9 @@ async fn create_gateway_container(
     );
 
     let config = Config {
-        image: Some(image),
+        // The resolved id, not the tag: a build or pull retagging the image
+        // mid-create can't make the container disagree with its fingerprint.
+        image: Some(image.id.clone()),
         // The upstream entrypoint (`docker/prod_entrypoint.sh`) execs
         // `litellm "$@"`. Passed explicitly so the pulled upstream image and
         // our locally built one behave identically.
@@ -520,6 +710,20 @@ async fn create_gateway_container(
         .map_err(|e| format!("Failed to create gateway container: {}", e))?;
 
     Ok(response.id)
+}
+
+/// Stops a running container gracefully first, with Docker's default grace as
+/// before (so in-flight LiteLLM requests can drain; the shorter
+/// [`GATEWAY_STOP_GRACE_SECS`] is for app exit), then removes it, tolerating
+/// one already gone.
+async fn remove_gateway_container(docker: &Docker, id: &str, state: &str) -> Result<(), String> {
+    if state == "running" {
+        docker
+            .stop_container(id, None::<StopContainerOptions>)
+            .await
+            .map_err(|e| format!("Failed to stop gateway container: {}", e))?;
+    }
+    super::container::remove_container(id).await
 }
 
 /// Serialises every mutation of the single fixed-name gateway container.
@@ -565,14 +769,66 @@ async fn ensure_gateway_running_locked(
 
     // Rotation id, not a hash of either secret — see `storage::secure`.
     let secret_version = secure::get_gateway_secret_version()?.unwrap_or_default();
-    let fingerprint = sha256_hex(&format!(
-        "{}|{}",
-        config_shape(settings, &binding),
-        secret_version
-    ));
+    let (existing, pinned) = tokio::join!(find_gateway_container(), pinned_images());
+    let existing = existing?;
+    // A failed image lookup must not fail a gateway that's fine as it is: it
+    // takes the same path as "no pinned image" and keeps the current image.
+    let mut lookup_error = None;
+    let chosen = match pinned {
+        Ok(pinned) => pinned.chosen(),
+        Err(e) => {
+            log::warn!("Gateway image check failed: {}", e);
+            lookup_error = Some(e);
+            None
+        }
+    };
+    let on_pin = chosen.is_some();
+    let image = match chosen {
+        Some(image) => image,
+        // No pinned image yet (after an app update moved the pin, until the
+        // user pulls or builds). Never tear down a working gateway over that:
+        // keep it on the image it already runs — recreated with the new
+        // config if that changed — and let status report it as outdated.
+        None => match existing.as_ref().and_then(|c| c.image_id.clone()) {
+            Some(id) => {
+                log::warn!(
+                    "Gateway image for LiteLLM {} not present; keeping the gateway on its current image {}",
+                    pinned_litellm_version(),
+                    id
+                );
+                ChosenImage {
+                    reference: id.clone(),
+                    id,
+                }
+            }
+            None => {
+                return Err(match lookup_error {
+                    Some(e) => e,
+                    None => format!(
+                        "Gateway image for LiteLLM {} not found. Please pull or build the image first.",
+                        pinned_litellm_version()
+                    ),
+                })
+            }
+        },
+    };
 
-    if let Some((id, state, existing_fingerprint)) = find_gateway_container().await? {
-        if existing_fingerprint == fingerprint {
+    let fingerprint = gateway_fingerprint(&config_shape(settings, &binding), &secret_version);
+
+    if let Some(GatewayContainer {
+        id,
+        state,
+        fingerprint: existing_fingerprint,
+        image_id: existing_image_id,
+    }) = existing
+    {
+        let pinned = on_pin.then_some(&image);
+        if !needs_recreate(
+            &existing_fingerprint,
+            &fingerprint,
+            existing_image_id.as_deref(),
+            pinned,
+        ) {
             if state == "running" {
                 return get_gateway_status(settings).await;
             }
@@ -583,41 +839,21 @@ async fn ensure_gateway_running_locked(
             return get_gateway_status(settings).await;
         }
 
-        // Config or a secret changed — recreate so the new config is uploaded.
-        if state == "running" {
-            docker
-                .stop_container(&id, None::<StopContainerOptions>)
-                .await
-                .map_err(|e| format!("Failed to stop gateway container: {}", e))?;
-        }
-        docker
-            .remove_container(
-                &id,
-                Some(RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
-            )
-            .await
-            .map_err(|e| format!("Failed to remove gateway container: {}", e))?;
+        // Config, a secret or the image changed — recreate so the new config
+        // is uploaded and the pinned image is used.
+        remove_gateway_container(&docker, &id, &state).await?;
     }
 
-    let id = create_gateway_container(settings, &binding, &fingerprint).await?;
+    let id = create_gateway_container(settings, &binding, &image, &fingerprint).await?;
 
     // Upload before the first start: LiteLLM reads the config once at boot.
     let rendered = render_config(settings, &api_key, &master_key);
     if let Err(e) = upload_config(&id, &rendered).await {
         // Don't leave a half-configured container behind for the next run to
         // mistake for a good one.
-        let _ = docker
-            .remove_container(
-                &id,
-                Some(RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
-            )
-            .await;
+        if let Err(cleanup) = super::container::remove_container(&id).await {
+            log::warn!("{}", cleanup);
+        }
         return Err(e);
     }
 
@@ -627,12 +863,12 @@ async fn ensure_gateway_running_locked(
         .map_err(|e| format!("Failed to start gateway container: {}", e))?;
 
     log::info!(
-        "Model gateway started on {}:{} ({} model(s))",
+        "Model gateway started on {}:{} ({} model(s), {})",
         binding.host_ip,
         settings.port,
-        settings.valid_models().len()
+        settings.valid_models().len(),
+        image.reference
     );
-
     get_gateway_status(settings).await
 }
 
@@ -646,7 +882,7 @@ pub async fn stop_gateway_container() -> Result<(), String> {
     let _guard = gateway_lock().lock().await;
     let docker = get_docker()?;
 
-    if let Some((id, state, _)) = find_gateway_container().await? {
+    if let Some(GatewayContainer { id, state, .. }) = find_gateway_container().await? {
         if state == "running" {
             docker
                 .stop_container(
@@ -690,7 +926,27 @@ pub async fn pull_gateway_image<F>(on_progress: F) -> Result<(), String>
 where
     F: Fn(String) + Send + 'static,
 {
-    super::image::pull_image(GATEWAY_REGISTRY_IMAGE, on_progress).await
+    super::image::pull_image(&registry_image_ref(), on_progress).await?;
+    // A pull by digest leaves the image untagged, which `docker image prune`
+    // treats as dangling and deletes. Tag it locally; lookups still go by
+    // digest, so a re-pushed upstream tag changes nothing.
+    // Not fatal: the image is present and will be used either way.
+    if let Err(e) = get_docker()?
+        .tag_image(
+            &registry_image_ref(),
+            Some(bollard::image::TagImageOptions {
+                repo: GATEWAY_REGISTRY_REPO,
+                tag: GATEWAY_LITELLM_VERSION,
+            }),
+        )
+        .await
+    {
+        log::warn!(
+            "Pulled the gateway image but could not tag it (a prune may remove it): {}",
+            e
+        );
+    }
+    Ok(())
 }
 
 pub async fn build_gateway_image<F>(on_progress: F) -> Result<(), String>
@@ -702,8 +958,9 @@ where
     let tar_bytes = create_gateway_build_context()
         .map_err(|e| format!("Failed to create gateway build context: {}", e))?;
 
+    let tag = local_image_ref();
     let options = BuildImageOptions {
-        t: GATEWAY_LOCAL_IMAGE,
+        t: tag.as_str(),
         rm: true,
         forcerm: true,
         ..Default::default()
@@ -783,6 +1040,111 @@ mod tests {
                 },
             ],
         }
+    }
+
+    fn chosen(reference: &str, id: &str) -> ChosenImage {
+        ChosenImage {
+            reference: reference.to_string(),
+            id: id.to_string(),
+        }
+    }
+
+    #[test]
+    fn local_builds_are_tagged_with_the_pin_and_context() {
+        let v = pinned_litellm_version();
+        assert!(v.starts_with('v') && !v.contains(['/', '@', ':']), "bad pin tag {v:?}");
+        let tag = local_image_ref();
+        let suffix = tag
+            .strip_prefix(&format!("triple-c-gateway:{}-", v))
+            .expect("tag is repo:pin-hash");
+        assert_eq!(suffix.len(), 8);
+        assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn registry_lookups_go_by_digest() {
+        assert_eq!(
+            registry_image_ref(),
+            format!("ghcr.io/berriai/litellm@{}", GATEWAY_REGISTRY_DIGEST)
+        );
+    }
+
+    #[test]
+    fn dockerfile_from_matches_the_registry_pin() {
+        // Local builds are tagged with the pin; that is only truthful while the
+        // Dockerfile builds FROM the same tag.
+        let from = GATEWAY_DOCKERFILE
+            .lines()
+            .find(|l| l.starts_with("FROM "))
+            .expect("Dockerfile has a FROM line");
+        let expected = format!(
+            "FROM {}:{}@{}",
+            GATEWAY_REGISTRY_REPO, GATEWAY_LITELLM_VERSION, GATEWAY_REGISTRY_DIGEST
+        );
+        assert_eq!(from.trim(), expected, "gateway Dockerfile FROM is out of lockstep with the pin");
+    }
+
+    #[test]
+    fn local_build_wins_then_registry_then_nothing() {
+        assert_eq!(
+            choose_gateway_image(Some("sha256:local".into()), Some("sha256:reg".into())),
+            Some(chosen(&local_image_ref(), "sha256:local"))
+        );
+        assert_eq!(
+            choose_gateway_image(None, Some("sha256:reg".into())),
+            Some(chosen(&registry_image_ref(), "sha256:reg"))
+        );
+        assert_eq!(choose_gateway_image(None, None), None);
+    }
+
+    #[test]
+    fn outdated_matches_what_ensure_would_recreate() {
+        let pinned = chosen(&registry_image_ref(), "sha256:new");
+        assert!(!container_image_outdated(true, Some("sha256:new"), Some(Some(&pinned))));
+        assert!(container_image_outdated(true, Some("sha256:old"), Some(Some(&pinned))));
+        // No pinned image at all: whatever runs is not it.
+        assert!(container_image_outdated(true, Some("sha256:old"), Some(None)));
+        // No container, or the check failed: don't claim it.
+        assert!(!container_image_outdated(false, None, Some(Some(&pinned))));
+        assert!(!container_image_outdated(true, Some("sha256:old"), None));
+        // A container whose image id is unknown: status and ensure agree
+        // that it isn't on the pinned image.
+        assert!(container_image_outdated(true, None, Some(Some(&pinned))));
+        assert!(needs_recreate("fp", "fp", None, Some(&pinned)));
+    }
+
+    #[test]
+    fn comment_edits_dont_change_the_local_build_tag() {
+        let a = "# about\nFROM x\n\n  # indented note\nRUN y\n";
+        let b = "# reworded\nFROM x\nRUN y\n# trailing\n";
+        assert_eq!(significant_lines(a), significant_lines(b));
+        assert_ne!(significant_lines(a), significant_lines("FROM x\nRUN z\n"));
+        // A parser directive changes the build.
+        assert_ne!(
+            significant_lines(b),
+            significant_lines(&format!("# syntax=docker/dockerfile:1.7\n{b}"))
+        );
+    }
+
+    #[test]
+    fn fingerprint_format_is_unchanged_from_earlier_versions() {
+        // What main wrote: sha256 of "shape|secret". Keeping it means the app
+        // update alone recreates nothing.
+        assert_eq!(gateway_fingerprint("shape", "1"), sha256_hex("shape|1"));
+    }
+
+    #[test]
+    fn recreate_on_config_change_or_a_present_new_pinned_image() {
+        let pinned = chosen(&registry_image_ref(), "sha256:new");
+        // Unchanged config, already on the pinned image: keep.
+        assert!(!needs_recreate("fp", "fp", Some("sha256:new"), Some(&pinned)));
+        // Pinned image present, container on another: recreate.
+        assert!(needs_recreate("fp", "fp", Some("sha256:old"), Some(&pinned)));
+        // No pinned image: keep the working gateway on its image.
+        assert!(!needs_recreate("fp", "fp", Some("sha256:old"), None));
+        // Config changed: always recreate.
+        assert!(needs_recreate("old", "fp", Some("sha256:new"), Some(&pinned)));
+        assert!(needs_recreate("old", "fp", Some("sha256:old"), None));
     }
 
     #[test]

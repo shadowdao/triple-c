@@ -69,25 +69,32 @@ pub async fn get_local_image_digest(image_name: &str) -> Result<Option<String>, 
     Ok(None)
 }
 
+/// Split an image reference into the `fromImage` and `tag` the pull API takes.
+/// A digest reference (`repo@sha256:…`, optionally `repo:tag@sha256:…`) is
+/// pulled by digest: the API takes the digest in the `tag` field.
+fn split_image_ref(image_name: &str) -> (&str, &str) {
+    if let Some((name, digest)) = image_name.split_once('@') {
+        let repo = match name.rfind(':') {
+            Some(pos) if !name[pos + 1..].contains('/') => &name[..pos],
+            _ => name,
+        };
+        return (repo, digest);
+    }
+    match image_name.rfind(':') {
+        // The colon is part of a port (e.g., host:port/repo), not a tag.
+        Some(pos) if image_name[pos + 1..].contains('/') => (image_name, "latest"),
+        Some(pos) => (&image_name[..pos], &image_name[pos + 1..]),
+        None => (image_name, "latest"),
+    }
+}
+
 pub async fn pull_image<F>(image_name: &str, on_progress: F) -> Result<(), String>
 where
     F: Fn(String) + Send + 'static,
 {
     let docker = get_docker()?;
 
-    // Parse image name into from_image and tag
-    let (from_image, tag) = if let Some(pos) = image_name.rfind(':') {
-        // Check that the colon is part of a tag, not a port
-        let after_colon = &image_name[pos + 1..];
-        if after_colon.contains('/') {
-            // The colon is part of a port (e.g., host:port/repo)
-            (image_name, "latest")
-        } else {
-            (&image_name[..pos], after_colon)
-        }
-    } else {
-        (image_name, "latest")
-    };
+    let (from_image, tag) = split_image_ref(image_name);
 
     let options = CreateImageOptions {
         from_image,
@@ -388,5 +395,21 @@ mod apt_refresh_tests {
         assert!(BUILD_WORKFLOW.contains("schedule:"));
         // A scheduled run must publish, a PR run must not.
         assert!(BUILD_WORKFLOW.contains("push: ${{ gitea.event_name != 'pull_request' }}"));
+    }
+}
+
+#[cfg(test)]
+mod pull_ref_tests {
+    use super::split_image_ref;
+
+    #[test]
+    fn split_image_ref_handles_tags_ports_and_digests() {
+        assert_eq!(split_image_ref("repo:v1"), ("repo", "v1"));
+        assert_eq!(split_image_ref("repo"), ("repo", "latest"));
+        assert_eq!(split_image_ref("host:5000/repo"), ("host:5000/repo", "latest"));
+        assert_eq!(split_image_ref("host:5000/repo:v1"), ("host:5000/repo", "v1"));
+        assert_eq!(split_image_ref("ghcr.io/a/b@sha256:abc"), ("ghcr.io/a/b", "sha256:abc"));
+        assert_eq!(split_image_ref("ghcr.io/a/b:v1@sha256:abc"), ("ghcr.io/a/b", "sha256:abc"));
+        assert_eq!(split_image_ref("host:5000/b@sha256:abc"), ("host:5000/b", "sha256:abc"));
     }
 }

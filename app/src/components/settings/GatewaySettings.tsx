@@ -178,24 +178,29 @@ export default function GatewaySettings() {
     setTimeout(() => setCopied(null), 2000);
   };
 
-  const tone: StatusTone = !status?.image_exists
-    ? "off"
-    : status.running
-      ? healthy === false
-        ? "busy"
-        : "running"
-      : status.container_exists
-        ? "stopped"
-        : "off";
+  // A running container is shown (and stoppable) whatever its image.
+  const tone: StatusTone = status?.running
+    ? healthy === false
+      ? "busy"
+      : "running"
+    : status?.container_exists
+      ? "stopped"
+      : "off";
 
-  const statusLabel = !status?.image_exists
-    ? "No image"
-    : status.running
-      ? healthy === false
-        ? "Starting…"
+  const statusLabel = status?.running
+    ? healthy === false
+      ? "Starting…"
+      : status.image_outdated
+        ? status.image_exists
+          ? `Running on port ${status.port} — new gateway image ready, Stop and Start to apply`
+          : `Running on port ${status.port} — gateway image update available, Pull or Build to get it`
         : `Running on port ${status.port}`
-      : status.container_exists
-        ? "Stopped"
+    : status?.container_exists
+      ? status.image_outdated && !status.image_exists
+        ? "Stopped — gateway image update available, Pull or Build to get it"
+        : "Stopped"
+      : !status?.image_exists
+        ? "No image"
         : "Image ready";
 
   // Rendered in whichever branch is live — only one of them ever mounts.
@@ -254,7 +259,9 @@ export default function GatewaySettings() {
             {/* ── Container ─────────────────────────────────────────────── */}
             <div className="flex items-center gap-3 flex-wrap">
               <StatusIndicator tone={tone} label={statusLabel} className="text-xs" />
-              {status?.image_exists && (
+              {/* A stopped container can restart on the image it has, so Start
+                  needs either that container or a pinned image. */}
+              {(status?.image_exists || status?.container_exists) && (
                 <Button
                   variant={status.running ? "danger" : "primary"}
                   disabled={loading}

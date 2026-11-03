@@ -89,6 +89,12 @@ pub struct GatewayStatus {
     pub running: bool,
     pub port: u16,
     pub image_exists: bool,
+    /// The gateway container exists but runs something other than the pinned
+    /// image (e.g. after an app update moved the pin). If a pinned image is
+    /// present (`image_exists`), Stop and Start recreates it on that image;
+    /// otherwise the container keeps its current image until one is pulled or
+    /// built.
+    pub image_outdated: bool,
     /// Number of fully-specified models in the current settings.
     pub model_count: usize,
     /// Whether a provider API key is present in the keychain.
