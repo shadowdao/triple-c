@@ -521,8 +521,9 @@ pub fn now_epoch_secs() -> u64 {
 /// container. Falls back to 1000:1000 (the image's build-time ids) if the exec
 /// fails, which is strictly better than the 0:0 a default tar header carries.
 pub async fn container_user_ids(container_id: &str) -> (u64, u64) {
-    let out = exec_oneshot_limited(
+    let (out, _) = exec_oneshot_limited(
         container_id,
+        "claude",
         vec!["sh".to_string(), "-c".to_string(), "id -u; id -g".to_string()],
         256,
     )
@@ -543,9 +544,12 @@ pub async fn container_user_ids(container_id: &str) -> (u64, u64) {
 /// caller sees a byte, and what it is reading is *container-controlled* — the
 /// scheduler notifications reader `cat`s up to 50 files with no size cap, and
 /// the auth bridge reads `/proc/net/tcp` every two seconds. Neither has an
-/// upstream bound, so this is where the bound goes. Generous enough that no
-/// legitimate reader (the largest is a package manifest of a full image) comes
-/// close.
+/// upstream bound, so this is where the bound goes. It is the default, not a
+/// promise that every reader fits: the migration manifest of a running
+/// container did pass it (8.6 MB from a busy `/workspace`), and now runs under
+/// its own `migration::MANIFEST_OUTPUT_LIMIT` through [`exec_oneshot_limited`].
+/// A reader that can legitimately grow with the user's files should do the
+/// same rather than raise this.
 pub const MAX_ONESHOT_OUTPUT: usize = 8 * 1024 * 1024;
 
 /// The auth bridge's per-tick budget. It reads two procfs files whose rows are
@@ -586,16 +590,20 @@ pub async fn exec_oneshot(container_id: &str, cmd: Vec<String>) -> Result<String
     exec_oneshot_env(container_id, cmd, Vec::new()).await
 }
 
-/// [`exec_oneshot`] with a caller-chosen output ceiling, for readers whose
-/// input is fully container-controlled and whose legitimate output is small.
+/// A one-shot exec as `user` with a caller-chosen output ceiling, returning the
+/// combined output and the exit code.
+///
+/// For readers whose budget is not [`MAX_ONESHOT_OUTPUT`]: smaller where the
+/// input is container-controlled and the legitimate output tiny (the auth
+/// bridge's procfs poll, the uid probe), larger where it can genuinely pass
+/// 8 MiB (the migration manifest, as root).
 pub async fn exec_oneshot_limited(
     container_id: &str,
+    user: &str,
     cmd: Vec<String>,
     limit: usize,
-) -> Result<String, String> {
-    exec_oneshot_inner(container_id, "claude", cmd, Vec::new(), limit)
-        .await
-        .map(|(output, _)| output)
+) -> Result<(String, i64), String> {
+    exec_oneshot_inner(container_id, user, cmd, Vec::new(), limit).await
 }
 
 /// Like `exec_oneshot`, but passes additional environment variables to the exec

@@ -94,6 +94,68 @@ pub const MANIFEST_ROOTS: &[&str] = &[
     "/var/www",
 ];
 
+/// [`MANIFEST_ROOTS`] entries reported only to [`SUMMARY_DEPTH`], with every
+/// directory at that depth that holds at least one non-directory (at any depth)
+/// reported as one [`SUMMARY_KIND`] entry whose size is the sum of those
+/// files' sizes — exactly what [`verbatim_payload_bytes`] would have summed
+/// from a per-file listing. A directory holding no file is reported as a plain
+/// `d`, so the empty-tree filter still drops it.
+///
+/// **Why `/workspace`, and why it has to be.** It is the one root whose size is
+/// the user's rather than the image's: git worktrees, `node_modules`, a pnpm
+/// store and vendored trees all sit in the writable layer beside the bind
+/// mounts. A real container listed 94k entries — 8.6 MB of `find` output —
+/// under `/workspace` alone, which overflowed
+/// [`crate::docker::exec::MAX_ONESHOT_OUTPUT`] and failed the staleness check
+/// on every start and stop. Pruning by name (`node_modules`, `.git`) was
+/// measured on that container and only got it to 6.3 MB: most of it was a
+/// vendored phpMyAdmin in each of eight worktrees. Depth is what bounds it.
+///
+/// **Why summarising loses nothing.** Every per-path filter in
+/// [`compute_verbatim_paths`] is vacuous below `/workspace/<x>`: dpkg owns
+/// nothing there, no [`COPY_EXCLUSIONS`] entry is there, bind mounts are
+/// exactly `/workspace/<mount_name>` (a mount name cannot hold a `/`), and the
+/// base ships an empty `/workspace`. So the verbatim set was already pruned to
+/// first-level entries; a summary just stops listing what was going to be
+/// pruned away. Migration's `tar` still archives the directory recursively.
+///
+/// **One `find` pass, aggregated by `awk`.** The listing and the sizes come
+/// from the same walk, so they cannot disagree under concurrent writes, and
+/// `-xdev` keeps it off the bind mounts (a mount point is listed, never
+/// entered). Because the walk's presence then depends on `awk`, the pipeline
+/// prints `###SUMMARISED-OK` only when `awk` succeeded, and
+/// [`check_manifest_complete`] refuses a manifest without it — a missing
+/// `/workspace` must never read as an empty one.
+///
+/// **Why the base-presence exemption is safe.** See the check in
+/// [`compute_verbatim_paths`]; it rests on the base shipping nothing under
+/// these roots, which `the_base_ships_nothing_under_a_summarised_root` pins and
+/// which is logged loudly if it ever stops being true.
+pub const SUMMARISED_ROOTS: &[&str] = &["/workspace"];
+
+/// Depth below a [`SUMMARISED_ROOTS`] entry at which directories are
+/// summarised instead of listed. 1 would be just as correct for migration (the
+/// verbatim set prunes to first-level entries anyway); 2 keeps the immediate
+/// contents of each top-level folder visible in the manifest for debugging, at
+/// a few hundred lines on the container that overflowed.
+pub const SUMMARY_DEPTH: usize = 2;
+
+/// Marker the summarised walk prints after a successful pass, once per root.
+const SUMMARISED_OK: &str = "SUMMARISED-OK";
+
+/// [`ManifestEntry::kind`] of a summarised directory. Not a `find` `%y` letter.
+pub const SUMMARY_KIND: char = 'S';
+
+/// Output budget for one manifest exec against a running container.
+///
+/// Above [`crate::docker::exec::MAX_ONESHOT_OUTPUT`] on purpose. With
+/// [`SUMMARISED_ROOTS`] a real container's manifest is a few MB (`/usr/local`
+/// ~0.8 MB, `/var/lib` ~0.1 MB, the dpkg section a few hundred kB), but the
+/// non-summarised roots are still walked file by file and a user can install
+/// anything into `/opt`. Failing at 8 MiB cost the user every staleness check;
+/// 32 MiB keeps that rare while still bounding a container-controlled read.
+pub const MANIFEST_OUTPUT_LIMIT: usize = 32 * 1024 * 1024;
+
 /// Roots holding **state a base-image swap destroys and no replay can put
 /// back**. Reported by [`unpreserved_data`], never copied.
 ///
@@ -173,15 +235,27 @@ pub const PROBE_LABEL_MIGRATION: &str = "migration";
 /// One entry from the filesystem walk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestEntry {
-    /// `find`'s `%y`: `f` regular, `d` directory, `l` symlink, …
+    /// `find`'s `%y`: `f` regular, `d` directory, `l` symlink, … — or
+    /// [`SUMMARY_KIND`] for a directory under a [`SUMMARISED_ROOTS`] entry that
+    /// was not listed file by file.
     pub kind: char,
+    /// `find`'s `%s`; for a summary, the sum of `%s` over every non-directory
+    /// beneath it, from the same pass.
     pub size: u64,
     pub path: String,
 }
 
 impl ManifestEntry {
+    /// A directory reported as itself, with nothing implied about content.
+    /// A summary is deliberately *not* one: it stands for a subtree that holds
+    /// at least one file.
     pub fn is_dir(&self) -> bool {
         self.kind == 'd'
+    }
+
+    /// A directory whose contents were aggregated rather than listed.
+    pub fn is_summary(&self) -> bool {
+        self.kind == SUMMARY_KIND
     }
 }
 
@@ -202,6 +276,9 @@ pub struct Manifest {
     pub etc_paths: BTreeSet<String>,
     /// `package -> version` for every installed dpkg package.
     pub dpkg_versions: BTreeMap<String, String>,
+    /// How many [`SUMMARISED_ROOTS`] walks reported finishing. See
+    /// [`check_manifest_complete`].
+    pub summarised_roots_complete: usize,
 }
 
 impl Manifest {
@@ -217,18 +294,26 @@ impl Manifest {
 /// Sections are separated by sentinel lines so one exec answers every question;
 /// on a 5.49 GB image the whole thing takes about three seconds. Every command
 /// is failure-tolerant (`2>/dev/null`, no `set -e`) because a missing `npm` or
-/// an unreadable directory must degrade one section, not the run.
+/// an unreadable directory must degrade one section, not the run — with one
+/// exception, the summarised walk, whose failure [`check_manifest_complete`]
+/// turns into an error because degrading it would lose data.
 pub fn manifest_script() -> String {
     let feature_paths = FEATURE_PROBES
         .iter()
         .map(|(p, _)| shell_single_quote(p))
         .collect::<Vec<_>>()
         .join(" ");
-    let roots = MANIFEST_ROOTS
+    let plain_roots: Vec<&str> = MANIFEST_ROOTS
         .iter()
-        .map(|p| shell_single_quote(p))
+        .copied()
+        .filter(|p| !SUMMARISED_ROOTS.contains(p))
+        .collect();
+    let plain = plain_walk(&plain_roots);
+    let summarised = SUMMARISED_ROOTS
+        .iter()
+        .map(|r| summarised_walk(r))
         .collect::<Vec<_>>()
-        .join(" ");
+        .join("\necho '###PATHS'\n");
     // The dpkg grep is anchored to the manifest roots so the section stays a
     // few hundred kB instead of the ~40 MB a full ownership dump would be.
     let dpkg_filter = MANIFEST_ROOTS
@@ -239,7 +324,9 @@ pub fn manifest_script() -> String {
     format!(
         r#"
 echo '###PATHS'
-find {roots} -xdev -printf '%y\t%s\t%p\n' 2>/dev/null
+{plain}
+echo '###PATHS'
+{summarised}
 echo '###DPKG'
 cat /var/lib/dpkg/info/*.list 2>/dev/null | grep -E '^/({dpkg_filter})(/|$)'
 echo '###APT'
@@ -260,6 +347,90 @@ exit 0
     )
 }
 
+/// A per-file `find` over `roots`, or nothing at all when there are none.
+///
+/// The empty case is not cosmetic: `find -xdev …` with no starting point walks
+/// `.`, which in a probe container is `/` — the whole filesystem, straight into
+/// an output-capped manifest.
+fn plain_walk(roots: &[&str]) -> String {
+    if roots.is_empty() {
+        return String::new();
+    }
+    let roots = roots
+        .iter()
+        .map(|p| shell_single_quote(p))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("find {} -xdev -printf '%y\\t%s\\t%p\\n' 2>/dev/null", roots)
+}
+
+/// Aggregates a per-file `find` listing of one root (`kind<TAB>size<TAB>path`)
+/// into [`SUMMARY_DEPTH`]-limited `###PATHS` lines. See [`SUMMARISED_ROOTS`].
+///
+/// Entries above the boundary are printed as they arrive; a directory *at* the
+/// boundary is held back and printed at the end — as `S` with the summed size
+/// of every non-directory beneath it, or as its own `d` line when it has none,
+/// so an empty scaffold stays empty to the filter. A deeper entry whose
+/// boundary ancestor was never seen is printed rather than dropped (it cannot
+/// happen in a pre-order walk; erring towards over-listing is the safe side).
+/// The path is everything after the second tab, so a tab in a name survives.
+/// POSIX `awk` only: the image has `mawk`.
+const SUMMARY_AWK: &str = r#"BEGIN { FS = "\t"; rl = length(root) }
+{
+  kind = $1; size = $2
+  p = $0; sub(/^[^\t]*\t[^\t]*\t/, "", p)
+  if (p == root || substr(p, 1, rl + 1) != root "/") { print; next }
+  n = split(substr(p, rl + 2), c, "/")
+  if (n < depth) { print; next }
+  key = root
+  for (i = 1; i <= depth; i++) key = key "/" c[i]
+  if (n == depth) {
+    if (kind != "d") { print; next }
+    order[++nb] = key; dsize[key] = size; files[key] = 0; bytes[key] = 0
+    next
+  }
+  if (!(key in files)) { print; next }
+  if (kind != "d") { files[key]++; bytes[key] += size }
+}
+END {
+  for (i = 1; i <= nb; i++) {
+    k = order[i]
+    if (files[k] > 0) printf "S\t%.0f\t%s\n", bytes[k], k
+    else printf "d\t%s\t%s\n", dsize[k], k
+  }
+}"#;
+
+/// The `###PATHS` lines for one [`SUMMARISED_ROOTS`] entry, from one `find`
+/// pass piped through [`SUMMARY_AWK`], then `###SUMMARISED-OK` only if `awk`
+/// succeeded.
+fn summarised_walk(root: &str) -> String {
+    format!(
+        "find {q} -xdev -printf '%y\\t%s\\t%p\\n' 2>/dev/null | awk -v root={q} -v depth={d} {prog} && echo '###{ok}'",
+        q = shell_single_quote(root),
+        d = SUMMARY_DEPTH,
+        prog = shell_single_quote(SUMMARY_AWK),
+        ok = SUMMARISED_OK,
+    )
+}
+
+/// Refuse a manifest whose summarised walk did not finish.
+///
+/// Every other section degrades on failure, and that is right for them — a
+/// missing `npm` costs the npm delta. This one cannot: the summarised walk is
+/// the *only* record of what lives under `/workspace`, so a silently absent one
+/// reads as "nothing there" and the container swap would destroy it.
+pub fn check_manifest_complete(m: &Manifest) -> Result<(), String> {
+    if m.summarised_roots_complete < SUMMARISED_ROOTS.len() {
+        return Err(format!(
+            "Could not list {} inside the container (the probe's `awk` step did not finish), \
+             so Triple-C cannot tell what an update would need to carry across.",
+            SUMMARISED_ROOTS.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+
 /// Parse the output of [`manifest_script`].
 ///
 /// Unknown sections and malformed lines are skipped rather than failing: the
@@ -271,6 +442,9 @@ pub fn parse_manifest(raw: &str) -> Manifest {
     for line in raw.lines() {
         let line = line.strip_suffix('\r').unwrap_or(line);
         if let Some(name) = line.strip_prefix("###") {
+            if name == SUMMARISED_OK {
+                m.summarised_roots_complete += 1;
+            }
             section = match name {
                 "PATHS" | "DPKG" | "APT" | "NPM" | "FEATURES" | "ETC" | "PKGVER" | "END" => name,
                 _ => "",
@@ -416,7 +590,8 @@ pub fn prune_to_roots(paths: &BTreeSet<String>) -> Vec<String> {
 /// * it lives under a [`COPY_ROOTS`] entry,
 /// * it is not under a [`COPY_EXCLUSIONS`] entry or a bind-mount target,
 /// * neither image's dpkg database owns it,
-/// * the current base image does not already have it.
+/// * the current base image does not already have it (a [`SUMMARY_KIND`]
+///   entry is exempt from this one — see the comment at the check).
 ///
 /// The result is then pruned to subtree roots. An empty result means the copy
 /// step is skipped entirely.
@@ -446,7 +621,24 @@ pub fn compute_verbatim_paths(
         if from.dpkg_owned.contains(p) || base.dpkg_owned.contains(p) {
             continue;
         }
-        if base_paths.contains(p) {
+        // Not for a summary: "the base already has this path" is a per-path
+        // judgment, and a summary hides which paths are inside it. Skipping one
+        // would drop every user file under any subtree the base happens to ship
+        // too. Copying it is safe — the restore's `--skip-old-files` keeps the
+        // base's copy of anything both have, which is the per-file answer.
+        // What it cannot do is notice base content the new base *removed*, so
+        // this rests on the base shipping nothing under a summarised root —
+        // pinned by `the_base_ships_nothing_under_a_summarised_root`, and said
+        // out loud here if a base ever breaks it.
+        if base_paths.contains(p) && entry.is_summary() {
+            log::warn!(
+                "The base image ships {}, which this manifest only summarises — copying the \
+                 container's whole subtree and relying on --skip-old-files to keep the base's \
+                 files. SUMMARISED_ROOTS assumes the base ships nothing there; revisit it.",
+                p
+            );
+        }
+        if base_paths.contains(p) && !entry.is_summary() {
             continue;
         }
         candidates.insert(entry.path.clone());
@@ -1061,7 +1253,29 @@ pub async fn manifest_from_image(image: &str) -> Result<Manifest, String> {
             }
         ));
     }
-    Ok(parse_manifest(&out.stdout))
+    let m = parse_manifest(&out.stdout);
+    check_manifest_complete(&m)?;
+    Ok(m)
+}
+
+/// Turn a manifest exec's failure into something the user can act on.
+///
+/// The one case worth naming is the output ceiling: what reached the banner was
+/// "OUTPUT_LIMIT: Command output exceeded 8388608 bytes and was abandoned",
+/// true of a buffer and no help about a container. Same idea as
+/// `file_commands::describe_listing_failure`.
+pub fn describe_manifest_failure(error: String) -> String {
+    if error.starts_with(super::exec::OUTPUT_LIMIT_MARKER) {
+        return format!(
+            "This container has too many files for Triple-C to inspect for an update (its \
+             file listing passed {} MiB). The usual cause is a very large tree installed \
+             under /usr/local, /opt, /srv, /var/lib, /var/www or /etc, or a huge number of \
+             files directly in a top-level /workspace folder. Removing it, or moving it \
+             into a mounted project folder, will let the check run.",
+            MANIFEST_OUTPUT_LIMIT / (1024 * 1024)
+        );
+    }
+    error
 }
 
 /// Capture a [`Manifest`] from a *running* container.
@@ -1071,20 +1285,23 @@ pub async fn manifest_from_image(image: &str) -> Result<Manifest, String> {
 /// installed since the last commit, and a verbatim set computed from a stale
 /// manifest would silently fail to carry that work across.
 pub async fn manifest_from_container(container_id: &str) -> Result<Manifest, String> {
-    let (out, code) = super::exec::exec_oneshot_as(
+    let (out, code) = super::exec::exec_oneshot_limited(
         container_id,
         "root",
         vec!["/bin/sh".to_string(), "-c".to_string(), manifest_script()],
-        Vec::new(),
+        MANIFEST_OUTPUT_LIMIT,
     )
-    .await?;
+    .await
+    .map_err(describe_manifest_failure)?;
     if !out.contains("###END") {
         return Err(format!(
             "Probe of the running container did not complete (exit {})",
             code
         ));
     }
-    Ok(parse_manifest(&out))
+    let m = parse_manifest(&out);
+    check_manifest_complete(&m)?;
+    Ok(m)
 }
 
 /// Cached stopped-container manifests, keyed by container id, each paired with
@@ -2218,6 +2435,308 @@ mod tests {
     #[test]
     fn shell_quoting_survives_an_apostrophe() {
         assert_eq!(shell_single_quote("/opt/a'b"), r#"'/opt/a'\''b'"#);
+    }
+
+    // ── /workspace summarisation (the 8 MiB overflow) ───────────────────────
+
+
+    #[test]
+    fn a_summary_carries_its_own_size_and_is_not_a_directory() {
+        let raw = "###PATHS\n\
+                   d\t4096\t/workspace/wt\n\
+                   f\t10\t/workspace/wt/README.md\n\
+                   S\t123456\t/workspace/wt/node_modules\n\
+                   ###SUMMARISED-OK\n\
+                   ###DPKG\n\
+                   ###END\n";
+        let m = parse_manifest(raw);
+        assert_eq!(m.paths.len(), 3);
+        let s = &m.paths[2];
+        assert!(s.is_summary());
+        assert!(!s.is_dir(), "a summary stands for content, not an empty directory");
+        assert_eq!(s.size, 123456);
+        assert!(check_manifest_complete(&m).is_ok());
+    }
+
+    #[test]
+    fn a_manifest_whose_summarised_walk_did_not_finish_is_refused() {
+        // If the aggregating `awk` is missing or dies, the /workspace walk is
+        // simply absent. Read as "nothing there", the migration would destroy
+        // the user's top-level /workspace folders — so it is an error instead.
+        let raw = "###PATHS\nd\t4096\t/opt\n###DPKG\n###END\n";
+        let m = parse_manifest(raw);
+        let err = check_manifest_complete(&m).unwrap_err();
+        assert!(err.contains("/workspace"), "{}", err);
+    }
+
+    #[test]
+    fn a_summarised_subtree_is_copied_whole_and_counted_in_the_payload() {
+        // `/workspace/node_modules` holds nothing at its own level but deeper
+        // summaries: it must not look like an empty tree and be dropped.
+        let from = manifest(
+            &[
+                ('d', 4096, "/workspace/node_modules"),
+                ('S', 50_000, "/workspace/node_modules/typescript"),
+                ('S', 7_000, "/workspace/node_modules/.bin"),
+                ('d', 4096, "/workspace/wt"),
+                ('f', 10, "/workspace/wt/README.md"),
+                ('S', 1_000, "/workspace/wt/src"),
+            ],
+            &[],
+            &[],
+        );
+        let verbatim = compute_verbatim_paths(&from, &Manifest::default(), &[]);
+        assert_eq!(
+            verbatim,
+            vec!["/workspace/node_modules".to_string(), "/workspace/wt".to_string()]
+        );
+        assert_eq!(verbatim_payload_bytes(&from, &verbatim), 58_010);
+    }
+
+    #[test]
+    fn a_summary_the_base_also_has_is_still_copied() {
+        // The presence-in-base filter is a per-path judgment, and a summary
+        // hides which paths are inside it. Dropping it would lose the user's
+        // files under any subtree the base happens to ship; copying it is safe
+        // because the restore's `--skip-old-files` never clobbers the base.
+        // (Today's base ships an empty /workspace — the ignored live test
+        // `the_base_ships_nothing_under_a_summarised_root` pins that.)
+        let from = manifest(
+            &[
+                ('d', 4096, "/workspace/tools"),
+                ('S', 900, "/workspace/tools/lib"),
+            ],
+            &[],
+            &[],
+        );
+        let base = manifest(
+            &[
+                ('d', 4096, "/workspace/tools"),
+                ('S', 100, "/workspace/tools/lib"),
+            ],
+            &[],
+            &[],
+        );
+        assert_eq!(
+            compute_verbatim_paths(&from, &base, &[]),
+            vec!["/workspace/tools/lib".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_workspace_is_walked_once_and_never_file_by_file() {
+        let s = manifest_script();
+        assert_eq!(
+            s.matches("find '/workspace'").count(),
+            1,
+            "/workspace must be walked in a single pass:\n{}",
+            s
+        );
+        assert!(!s.contains("'/workspace' '/var/lib'"), "flat walk is back:\n{}", s);
+        assert!(!s.contains("du "), "sizes come from the same pass, not du:\n{}", s);
+        assert!(s.contains("###SUMMARISED-OK"));
+    }
+
+    #[test]
+    fn a_walk_of_no_roots_is_no_walk_at_all() {
+        // `find -xdev …` with no starting point walks `.`, which is `/` in a
+        // probe container — the whole filesystem, into the manifest.
+        assert_eq!(plain_walk(&[]), "");
+        assert!(plain_walk(&["/opt"]).starts_with("find '/opt' -xdev"));
+    }
+
+    /// Runs the real walk against a scratch tree shaped like the container that
+    /// overflowed, then a section after it, through the real parser.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_summarised_walk_is_small_exact_and_ends_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace");
+        for wt in 0..4 {
+            let nm = root.join(format!("wt{}", wt)).join("node_modules");
+            for pkg in 0..50 {
+                let p = nm.join(format!("pkg{}", pkg)).join("lib");
+                std::fs::create_dir_all(&p).unwrap();
+                for f in 0..10 {
+                    std::fs::write(p.join(format!("f{}.js", f)), b"0123456789").unwrap();
+                }
+            }
+            std::fs::write(root.join(format!("wt{}", wt)).join("README.md"), b"hi").unwrap();
+        }
+        // Second-level directories holding no file at any depth: one empty,
+        // one with only empty subdirectories. Neither is content.
+        std::fs::create_dir_all(root.join("wt0").join("empty")).unwrap();
+        std::fs::create_dir_all(root.join("scaffold").join("a").join("b").join("c")).unwrap();
+        std::fs::write(root.join("loose.txt"), b"x").unwrap();
+        let root_s = root.to_string_lossy().to_string();
+
+        let script = format!(
+            "echo '###PATHS'\n{}\necho '###APT'\necho socat\necho '###END'\n",
+            summarised_walk(&root_s)
+        );
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        let m = parse_manifest(&text);
+
+        // 2,000 files below; one line per first- and second-level entry above.
+        assert!(m.paths.len() < 20, "walk was not summarised: {}", text);
+        // Exactly the old per-file sum: 50 packages × 10 files × 10 bytes.
+        // Directory inode sizes are not content and must not be counted.
+        let nm0 = format!("{}/wt0/node_modules", root_s);
+        let entry = m.paths.iter().find(|e| e.path == nm0).expect("summary present");
+        assert!(entry.is_summary());
+        assert_eq!(entry.size, 5_000, "{:?}", entry);
+        for empty in [format!("{}/wt0/empty", root_s), format!("{}/scaffold/a", root_s)] {
+            let e = m.paths.iter().find(|e| e.path == empty).expect("listed");
+            assert!(e.is_dir(), "a tree with no files is not content: {:?}", e);
+        }
+        assert!(m.paths.iter().any(|e| e.path == format!("{}/loose.txt", root_s)));
+        // The walk terminates its section: the next one still parses.
+        assert_eq!(m.apt_manual, strs(&["socat"]));
+        assert_eq!(m.summarised_roots_complete, 1, "{}", text);
+
+        // And the migration sees the same thing it would have per file.
+        let from = Manifest {
+            paths: m
+                .paths
+                .iter()
+                .map(|e| ManifestEntry {
+                    path: e.path.replacen(&root_s, "/workspace", 1),
+                    ..e.clone()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let verbatim = compute_verbatim_paths(&from, &Manifest::default(), &[]);
+        assert!(!verbatim.contains(&"/workspace/scaffold".to_string()), "{:?}", verbatim);
+        assert_eq!(
+            verbatim_payload_bytes(&from, &["/workspace/wt0".to_string()]),
+            5_000 + 2
+        );
+    }
+
+    /// Pins the assumption that makes summaries safe to exempt from the
+    /// presence-in-base check: the base ships nothing under a summarised root.
+    /// If a future Dockerfile puts content in /workspace this fails, and
+    /// `compute_verbatim_paths` needs revisiting before it ships.
+    ///
+    /// ```text
+    /// cargo test -- --ignored --nocapture base_ships_nothing
+    /// ```
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon and the base image"]
+    async fn the_base_ships_nothing_under_a_summarised_root() {
+        let image = std::env::var("TRIPLE_C_TEST_IMAGE")
+            .unwrap_or_else(|_| "ghcr.io/shadowdao/triple-c-sandbox:latest".to_string());
+        let m = manifest_from_image(&image).await.expect("base probe");
+        for root in SUMMARISED_ROOTS {
+            let inside: Vec<_> = m
+                .paths
+                .iter()
+                .filter(|e| is_under(&e.path, root) && e.path != *root)
+                .map(|e| e.path.as_str())
+                .collect();
+            assert!(inside.is_empty(), "the base ships {:?} under {}", inside, root);
+        }
+    }
+
+    /// The overflow end to end, against a scratch container off the real base:
+    /// 80k files in a writable-layer `/workspace` tree (past 8 MiB unsummarised)
+    /// beside a bind-mounted project folder.
+    ///
+    /// ```text
+    /// cargo test -- --ignored --nocapture large_workspace
+    /// ```
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon; creates and removes a throwaway container"]
+    async fn a_large_workspace_is_probed_without_overflowing_and_still_copied() {
+        fn docker_cli(args: &[&str]) -> String {
+            let out = std::process::Command::new("docker")
+                .args(args)
+                .output()
+                .expect("docker CLI");
+            assert!(
+                out.status.success(),
+                "docker {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+        let image = std::env::var("TRIPLE_C_TEST_IMAGE")
+            .unwrap_or_else(|_| "ghcr.io/shadowdao/triple-c-sandbox:latest".to_string());
+        let host = tempfile::tempdir().unwrap();
+        for i in 0..50 {
+            std::fs::write(host.path().join(format!("host-{}.txt", i)), b"h").unwrap();
+        }
+        let mount = format!("{}:/workspace/proj", host.path().display());
+        let id = docker_cli(&[
+            "run", "-d", "--label", "triple-c.managed=true",
+            "-v", &mount,
+            "--entrypoint", "/bin/sh",
+            &image, "-c", "sleep 300",
+        ]);
+        // 80k files with long names, three levels down: ~9.2 MB as a flat walk.
+        let populate = "for w in 0 1 2 3 4 5 6 7; do for p in $(seq 1 100); do \
+             d=/workspace/worktree-number-$w/node_modules/package-with-a-long-name-$p/lib; \
+             mkdir -p $d; cd $d && seq -f 'module-file-with-a-long-name-%g.js' 1 100 | xargs touch; \
+             done; done; echo x > /workspace/worktree-number-0/README.md; \
+             head -c 4096 /dev/zero > /workspace/worktree-number-0/node_modules/real.js";
+        docker_cli(&["exec", "-u", "root", &id, "sh", "-c", populate]);
+
+        let result = manifest_from_container(&id).await;
+        let _ = std::process::Command::new("docker").args(["rm", "-f", &id]).output();
+
+        let m = result.expect("the probe must not overflow");
+        let ws: Vec<_> = m.paths.iter().filter(|e| is_under(&e.path, "/workspace")).collect();
+        assert!(ws.len() < 100, "/workspace was walked file by file: {} entries", ws.len());
+        assert!(
+            !ws.iter().any(|e| is_under(&e.path, "/workspace/proj") && e.path != "/workspace/proj"),
+            "the walk crossed into the bind mount"
+        );
+        let nm = m
+            .paths
+            .iter()
+            .find(|e| e.path == "/workspace/worktree-number-0/node_modules")
+            .expect("summary entry");
+        // Every file below is empty but `real.js`: the per-file sum, exactly,
+        // with no directory inode sizes in it — computed by the image's `mawk`.
+        assert!(nm.is_summary() && nm.size == 4096, "{:?}", nm);
+        assert_eq!(m.summarised_roots_complete, SUMMARISED_ROOTS.len());
+
+        let excl = bind_mount_exclusions(&[pp("proj")]);
+        let verbatim = compute_verbatim_paths(&m, &Manifest::default(), &excl);
+        let ws_verbatim: Vec<_> =
+            verbatim.iter().filter(|p| is_under(p, "/workspace")).cloned().collect();
+        assert_eq!(
+            ws_verbatim,
+            (0..8).map(|w| format!("/workspace/worktree-number-{}", w)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn an_overflowing_probe_says_what_to_do_rather_than_quoting_a_buffer() {
+        let raw = format!(
+            "{}: Command output exceeded 33554432 bytes and was abandoned",
+            crate::docker::exec::OUTPUT_LIMIT_MARKER
+        );
+        let msg = describe_manifest_failure(raw);
+        assert!(!msg.contains(crate::docker::exec::OUTPUT_LIMIT_MARKER), "{}", msg);
+        assert!(!msg.contains("33554432"), "{}", msg);
+        // Every root still walked file by file, so the advice is never wrong
+        // about where to look.
+        for root in MANIFEST_ROOTS.iter().chain(["/etc"].iter()) {
+            if !SUMMARISED_ROOTS.contains(root) {
+                assert!(msg.contains(root), "message omits {}: {}", root, msg);
+            }
+        }
+        // Anything else passes through untouched.
+        assert_eq!(describe_manifest_failure("boom".into()), "boom");
     }
 
 

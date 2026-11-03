@@ -327,7 +327,9 @@ async fn poll_loop(
         // bridge or stopping the container doesn't wait out an in-flight poll.
         let discovery = tokio::select! {
             _ = cancel.changed() => break,
-            res = exec_oneshot_limited(&container_id, cmd, PROC_NET_OUTPUT_LIMIT) => res,
+            res = exec_oneshot_limited(&container_id, "claude", cmd, PROC_NET_OUTPUT_LIMIT) => {
+                res.map(|(out, _)| out)
+            }
         };
 
         match discovery {

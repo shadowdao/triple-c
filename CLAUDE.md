@@ -579,6 +579,24 @@ security update. Migration is the non-destructive way out; Reset is the destruct
   the last commit. Migration diffs two filesystem manifests instead, filtered through dpkg
   ownership and presence-in-the-new-base. Measured on a real project, that turns 8,677 raw path
   differences into 2 genuinely user-authored ones.
+- **`/workspace` is reported two levels deep, never file by file** (`SUMMARISED_ROOTS`). One
+  `find -xdev` pass is piped through `awk`, which turns each depth-2 directory into one `S` entry
+  sized as the sum of the files beneath it (the same number the per-file sum gave the disk gate),
+  or a plain `d` if it holds no file at any depth (so empty scaffolds stay empty to the filter). A
+  user's worktrees and `node_modules` made a flat walk 8.6 MB — past the exec cap, so every
+  staleness check failed on start and stop — and pruning `node_modules`/`.git` by name only
+  reached 6.3 MB; now the whole manifest is ~1 MB. Summaries lose nothing: below `/workspace/<x>`
+  every per-path filter is vacuous, and `tar` copies a directory recursively. Three rules:
+  - **A failed `awk` is an error, never an empty `/workspace`.** The pipeline prints
+    `###SUMMARISED-OK` only on success and `check_manifest_complete` refuses a manifest without
+    it — otherwise the swap would destroy what the walk failed to see.
+  - **A summary is exempt from presence-in-the-base**, because it hides which paths are inside;
+    `--skip-old-files` on restore is the per-file answer. That rests on the base shipping nothing
+    under `/workspace` — pinned by the ignored live test
+    `the_base_ships_nothing_under_a_summarised_root`, and logged as a warning if a base breaks it.
+  - **Only `/workspace`.** The other roots stay per file: dpkg ownership and presence-in-the-base
+    are exactly what make their delta honest (`/usr/local/lib/node_modules`, base content in
+    `/opt`), and they are under 1 MB together.
 
 ### Authentication
 
