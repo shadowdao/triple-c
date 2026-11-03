@@ -23,8 +23,10 @@ pub const SYNC_SCRIPT: &str = include_str!("sync.sh");
 /// sleep (so a `pkill sleep` run as `claude` cannot stop the container — see
 /// the end of `container/entrypoint.sh`); older ones `exec su … claude -c exec
 /// sleep infinity`, and a project keeps its base image until it is migrated.
+/// Both are matched as root-owned only (the old image's `su` runs as root), so
+/// a `claude` process wearing either command line cannot fake readiness.
 const READY_PROBE: &str = "pgrep -u root -x -f 'triple-c-keepalive infinity' >/dev/null \
-                           || pgrep -x -f 'su -s /bin/bash claude -c exec sleep infinity' >/dev/null";
+                           || pgrep -u root -x -f 'su -s /bin/bash claude -c exec sleep infinity' >/dev/null";
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
 const READY_POLL: Duration = Duration::from_secs(2);
 
@@ -212,7 +214,7 @@ mod tests {
                 "sh",
                 "-c",
                 "pgrep -u root -x -f 'triple-c-keepalive infinity' >/dev/null \
-                 || pgrep -x -f 'su -s /bin/bash claude -c exec sleep infinity' >/dev/null"
+                 || pgrep -u root -x -f 'su -s /bin/bash claude -c exec sleep infinity' >/dev/null"
             ]
         );
         // The marker name is shared with the entrypoint; a rename on one side

@@ -760,6 +760,12 @@ timeout 120 su -s /bin/bash claude -c 'export PATH="/home/claude/.claude/bin:/ho
 #    command line nothing else has, and it exists only once every step above
 #    has finished — that is the readiness marker. Keep the name in step with
 #    READY_PROBE.
+#  * Respawns are throttled to about one a second. If the sleep cannot start
+#    (fork failing under a pids limit or a fork bomb) or dies at once, an
+#    unthrottled loop would spin a core at 100% exactly when the container is
+#    already in trouble. The pause is `read -t` on a FIFO nobody writes —
+#    a builtin, so it still works when fork does not — with `sleep 1` as the
+#    fallback should the FIFO be unavailable.
 echo "Triple-C container ready."
 keepalive_pid=""
 stop_keepalive() {
@@ -767,8 +773,19 @@ stop_keepalive() {
     exit 0
 }
 trap stop_keepalive TERM INT HUP
+throttle_fifo=/run/triple-c-keepalive.throttle
+rm -f "$throttle_fifo"
+mkfifo -m 600 "$throttle_fifo" 2>/dev/null && exec 3<>"$throttle_fifo"
+rm -f "$throttle_fifo"
+respawn_pause() {
+    read -r -t 1 -u 3 _ 2>/dev/null
+    # >128 is read's timeout, i.e. it paused; anything else means no FIFO.
+    [ $? -gt 128 ] || sleep 1
+}
 while :; do
-    (exec -a triple-c-keepalive sleep infinity) &
+    started=$SECONDS
+    (exec -a triple-c-keepalive sleep infinity 3>&-) &
     keepalive_pid=$!
     wait "$keepalive_pid"
+    [ $((SECONDS - started)) -ge 2 ] || respawn_pause
 done

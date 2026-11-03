@@ -319,7 +319,7 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   `exec su … claude -c "exec sleep infinity"`, and any `pkill sleep` / `kill -9 -1` a Claude
   session ran killed the whole container. `container_watch.rs` (one Docker `die`-event
   subscription) is what flips a project whose container exits on its own to Stopped and emits
-  `project-status-changed`; `useProjectStatusEvents` applies it
+  `project-container-exited` with a `reason` (`exited` toasts; `found_stopped`, the first look of a run, is silent); `useProjectStatusEvents` applies it
 - **`triple-c-scheduler`** — Bash-based scheduled task system for recurring Claude Code invocations
 
 **`/home/claude` in the image is seed-only.** It is the mount point of the named volume
