@@ -22,6 +22,7 @@ import { useSTT } from "./hooks/useSTT";
 import { useContainerProgress } from "./hooks/useContainerProgress";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useMarketplaceSyncToasts } from "./hooks/useMarketplace";
+import { useProjectStatusEvents } from "./hooks/useProjectStatusEvents";
 import MarketplaceView from "./components/marketplace/MarketplaceView";
 import { useAppState, isHomeTab, tabKeyId, homeTabKey, MARKETPLACE_TAB_KEY } from "./store/appState";
 import { reconcileProjectStatuses } from "./lib/tauri-commands";
@@ -75,6 +76,7 @@ export default function App() {
   useContainerProgress();
   useKeyboardShortcuts();
   useMarketplaceSyncToasts();
+  useProjectStatusEvents();
 
   // Initialize on mount
   useEffect(() => {

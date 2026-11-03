@@ -137,7 +137,7 @@ Implementation gotchas for the terminal view and its global controls (merged in 
 │                                                          │
 │  User: claude (UID/GID remapped to match host)           │
 │  Entrypoint: UID/GID remap → SSH setup → git config →   │
-│              docker socket perms → sleep infinity        │
+│              docker socket perms → root keepalive wait   │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -164,7 +164,7 @@ Terminal resize follows the same pattern: `ResizeObserver` detects container siz
 
 Containers follow a **stop/start** model, not create/destroy:
 
-1. **First start**: A new container is created with bind mounts, named volumes, environment variables, and labels. The entrypoint remaps UID/GID, configures SSH and git, rebuilds the scheduler crontab, then runs `sleep infinity` to keep the container alive.
+1. **First start**: A new container is created with bind mounts, named volumes, environment variables, and labels. The entrypoint remaps UID/GID, configures SSH and git, rebuilds the scheduler crontab, then stays resident as root waiting on a root-owned `triple-c-keepalive` sleep — never a process the `claude` user can kill, since any `pkill sleep` a Claude session runs would otherwise stop the container.
 2. **Terminal open**: `docker exec` launches `claude` with a PTY in the running container, with the permission-mode flags from `PermissionMode::cli_args()` (or `bash -l` for a shell session).
 3. **Stop**: `docker stop` halts the container but preserves its filesystem. Any packages Claude installed via `apt`, `pip`, `cargo`, etc. survive.
 4. **Restart**: `docker start` resumes the existing container — unless `container_needs_recreation()` finds a `triple-c.*` label that no longer matches the project's settings, in which case the container is committed to a snapshot image (`triple-c-snapshot-{projectId}:latest`), removed, and recreated from that snapshot. Installed tools survive; the named volumes are untouched.
@@ -348,7 +348,7 @@ The entrypoint solves this by:
 3. Relocating any existing system user/group that conflicts with the target UID/GID.
 4. Fixing ownership of `/home/claude` after the change.
 
-This runs as root in the entrypoint, then the final `exec su -s /bin/bash claude -c "exec sleep infinity"` drops to the remapped user.
+This runs as root in the entrypoint. The entrypoint itself then stays running as root to keep the container alive; sessions reach the remapped `claude` user through `docker exec --user`. (Older images ended in `exec su -s /bin/bash claude -c "exec sleep infinity"`, which let any `claude` process stop the container by killing that sleep.)
 
 ### SSH Key Handling
 

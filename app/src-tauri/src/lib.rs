@@ -3,6 +3,7 @@ mod browser_view;
 #[cfg(test)]
 mod command_census;
 mod commands;
+mod container_watch;
 mod docker;
 pub mod file_viewer;
 mod install_helper;
@@ -306,6 +307,16 @@ pub fn run() {
                 )
                 .await;
             });
+
+            // Notice a project container that stops without the app asking
+            // (its keepalive killed, an OOM, a `docker stop` from a shell) and
+            // flip the project to Stopped. One daemon-side-filtered event
+            // subscription for the app's lifetime — see `container_watch`.
+            lifecycle_setup.track(container_watch::spawn(
+                app.handle().clone(),
+                projects_store_setup.clone(),
+                lifecycle_setup.cancellation(),
+            ));
 
             // Marketplaces: refresh each once at startup, in the background.
             // Failures are logged, not toasted — the Marketplace tab shows them.

@@ -1,9 +1,41 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::models::marketplace::{MarketplaceInstall, MarketplaceItemRef};
 use crate::models::Project;
+
+/// Proof that, at some revision of the store, a project was `Running` on a
+/// given container. See [`ProjectsStore::running_on`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunningSighting {
+    revision: u64,
+}
+
+/// What [`ProjectsStore::mark_exited`] did.
+#[derive(Debug)]
+pub enum ExitMark {
+    /// Flipped to `Stopped`; the updated record.
+    Flipped(Box<Project>),
+    /// The store changed since the sighting while a project is still Running
+    /// on that container — the caller's Docker check may be stale. Re-check.
+    Changed,
+    /// No project is Running on that container, or a command owns it.
+    NotApplicable,
+}
+
+/// The one rule for "this project is Running on that container". Both ids
+/// must be at least a short id long: a blank or truncated value is a prefix
+/// of everything and would match every container on the daemon.
+fn is_running_on(p: &Project, container_id: &str) -> bool {
+    p.status == crate::models::ProjectStatus::Running
+        && container_id.len() >= 12
+        && p.container_id
+            .as_deref()
+            .filter(|stored| stored.len() >= 12)
+            .is_some_and(|stored| stored.starts_with(container_id) || container_id.starts_with(stored))
+}
 
 /// The sticky marker for `projects.json`: `projects.json.corrupt`, beside it.
 ///
@@ -64,6 +96,8 @@ fn record_corrupt_load(file_path: &Path, now: &chrono::DateTime<chrono::Utc>) {
 pub struct ProjectsStore {
     projects: Mutex<Vec<Project>>,
     file_path: PathBuf,
+    /// Bumped by every `save()`; see [`ProjectsStore::mark_exited`].
+    revision: AtomicU64,
 }
 
 impl ProjectsStore {
@@ -147,6 +181,7 @@ impl ProjectsStore {
         let store = Self {
             projects: Mutex::new(projects),
             file_path,
+            revision: AtomicU64::new(0),
         };
 
         // Persist migrated/reconciled format back to disk
@@ -161,11 +196,21 @@ impl ProjectsStore {
         Ok(store)
     }
 
+    /// A store over a file the test owns (`new()` insists on the real data dir).
+    #[cfg(test)]
+    pub(crate) fn over_file_for_test(file_path: PathBuf, projects: Vec<Project>) -> Self {
+        Self { projects: Mutex::new(projects), file_path, revision: AtomicU64::new(0) }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Project>> {
         self.projects.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn save(&self, projects: &[Project]) -> Result<(), String> {
+        // Every mutation saves with the lock held, so this counts every change
+        // to the in-memory list — bumped first, because a failed write has
+        // still changed what the list holds.
+        self.revision.fetch_add(1, Ordering::SeqCst);
         let data = serde_json::to_string_pretty(projects)
             .map_err(|e| format!("Failed to serialize projects: {}", e))?;
 
@@ -235,6 +280,69 @@ impl ProjectsStore {
         }
         self.save(&projects)?;
         Ok(())
+    }
+
+    /// Is some project `Running` on `container_id`? Checked under the lock
+    /// without cloning anything — the container watcher asks this for every
+    /// container death on the daemon, nearly all of them not ours.
+    ///
+    /// The answer carries the store's revision, which [`Self::mark_exited`]
+    /// needs: the caller confirms with Docker that the container really is
+    /// down *between* the two calls, and that inspect can be slow.
+    pub fn running_on(&self, container_id: &str) -> Option<RunningSighting> {
+        let projects = self.lock();
+        projects
+            .iter()
+            .any(|p| is_running_on(p, container_id))
+            .then(|| RunningSighting { revision: self.revision.load(Ordering::SeqCst) })
+    }
+
+    /// A container stopped without the app asking: flip the project that is
+    /// `Running` on it to `Stopped`.
+    ///
+    /// A compare-and-set under the store lock rather than a read followed by
+    /// `update_status`, and against two things:
+    ///
+    /// * **The store's revision as of `seen`.** Between [`Self::running_on`]
+    ///   and here the caller waited on a Docker inspect. If the user stopped
+    ///   and restarted the project meanwhile — same container id, stop/start
+    ///   model — that inspect's "not running" is about a container that has
+    ///   since come back, and flipping would mark a healthy project Stopped.
+    ///   Any write to the store in that window bumps the revision, and the
+    ///   answer is [`ExitMark::Changed`]: confirm again and retry.
+    /// * **`is_busy`** — the project lock. Stop, Start, Reset and migration
+    ///   hold it across their own container's death and write the status they
+    ///   mean themselves. A start that takes the project lock just after this
+    ///   check still blocks on the store lock before it writes `Starting`.
+    ///
+    /// `container_id` may be the short form; the store holds the full id.
+    pub fn mark_exited(
+        &self,
+        container_id: &str,
+        seen: &RunningSighting,
+        is_busy: impl Fn(&str) -> bool,
+    ) -> ExitMark {
+        let mut projects = self.lock();
+        let unchanged = self.revision.load(Ordering::SeqCst) == seen.revision;
+        let Some(p) = projects.iter_mut().find(|p| is_running_on(p, container_id)) else {
+            return ExitMark::NotApplicable;
+        };
+        if !unchanged {
+            return ExitMark::Changed;
+        }
+        if is_busy(&p.id) {
+            return ExitMark::NotApplicable;
+        }
+        p.status = crate::models::ProjectStatus::Stopped;
+        p.updated_at = chrono::Utc::now().to_rfc3339();
+        let changed = p.clone();
+        if let Err(e) = self.save(&projects) {
+            // The in-memory record is what the UI is told about and what every
+            // later command reads, so it stays flipped; the next save of any
+            // kind writes it out.
+            log::warn!("Could not persist Stopped for project {}: {}", changed.id, e);
+        }
+        ExitMark::Flipped(Box::new(changed))
     }
 
     pub fn update_status(&self, id: &str, status: crate::models::ProjectStatus) -> Result<(), String> {
@@ -437,6 +545,7 @@ mod tests {
         ProjectsStore {
             projects: Mutex::new(projects),
             file_path: dir.join("projects.json"),
+            revision: AtomicU64::new(0),
         }
     }
 
@@ -602,6 +711,140 @@ mod tests {
         assert_eq!(b.container_id.as_deref(), Some("cid-b"));
         assert_eq!(b.updated_at, b_updated_at, "an untouched project is not rewritten");
 
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── running_on / mark_exited: a container that died on its own ───────
+
+    /// A full-length id, as Docker's events and the store both carry.
+    const C0FFEE: &str = "c0ffee0000000000000000000000000000000000000000000000000000000000";
+
+    fn running_on(container_id: &str) -> Project {
+        let mut p = Project::new("p".to_string(), Vec::new());
+        p.container_id = Some(container_id.to_string());
+        p.status = crate::models::ProjectStatus::Running;
+        p
+    }
+
+    /// Sighting and flip back to back, as when Docker answers instantly.
+    fn sight_and_mark(store: &ProjectsStore, cid: &str, busy: impl Fn(&str) -> bool) -> Option<Project> {
+        let seen = store.running_on(cid)?;
+        match store.mark_exited(cid, &seen, busy) {
+            ExitMark::Flipped(p) => Some(*p),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_running_project_whose_container_exited_is_marked_stopped_and_saved() {
+        let dir = temp_dir("exited");
+        let p = running_on(C0FFEE);
+        let id = p.id.clone();
+        let store = store_over(&dir, vec![p]);
+
+        let changed = sight_and_mark(&store, C0FFEE, |_| false).expect("flipped");
+
+        assert_eq!(changed.id, id);
+        assert_eq!(changed.status, crate::models::ProjectStatus::Stopped);
+        assert_eq!(store.get(&id).unwrap().status, crate::models::ProjectStatus::Stopped);
+        let on_disk = fs::read_to_string(dir.join("projects.json")).unwrap();
+        assert!(on_disk.contains("\"stopped\""), "the flip must be persisted: {on_disk}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mark_exited_leaves_a_project_alone_while_a_command_owns_it() {
+        // Stop, Start-with-recreate, Reset and migration all hold the project
+        // lock across their own container's death; the command writes the
+        // status it means, and the watcher must not race it.
+        let dir = temp_dir("busy");
+        let p = running_on(C0FFEE);
+        let id = p.id.clone();
+        let store = store_over(&dir, vec![p]);
+
+        assert!(sight_and_mark(&store, C0FFEE, |pid| pid == id).is_none());
+        assert_eq!(store.get(&id).unwrap().status, crate::models::ProjectStatus::Running);
+        // ...and it was only the claim that held it back.
+        assert!(sight_and_mark(&store, C0FFEE, |_| false).is_some());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The slow-inspect race. The watcher sights the project Running, then
+    /// waits on Docker; meanwhile the user stops and starts it again on the
+    /// *same* container id (stop/start model). Docker's "not running" is now
+    /// about a container that has come back, so the flip must not land.
+    #[test]
+    fn a_stop_and_start_during_the_docker_check_invalidates_the_sighting() {
+        let dir = temp_dir("restarted");
+        let p = running_on(C0FFEE);
+        let id = p.id.clone();
+        let store = store_over(&dir, vec![p]);
+
+        let seen = store.running_on(C0FFEE).expect("sighted");
+        // ...the inspect is in flight...
+        store.update_status(&id, crate::models::ProjectStatus::Stopping).unwrap();
+        store.update_status(&id, crate::models::ProjectStatus::Stopped).unwrap();
+        store.update_status(&id, crate::models::ProjectStatus::Starting).unwrap();
+        store.update_status(&id, crate::models::ProjectStatus::Running).unwrap();
+
+        assert!(matches!(store.mark_exited(C0FFEE, &seen, |_| false), ExitMark::Changed));
+        assert_eq!(store.get(&id).unwrap().status, crate::models::ProjectStatus::Running);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_stale_sighting_of_a_project_no_longer_running_is_simply_not_applicable() {
+        let dir = temp_dir("gone");
+        let p = running_on(C0FFEE);
+        let id = p.id.clone();
+        let store = store_over(&dir, vec![p]);
+
+        let seen = store.running_on(C0FFEE).expect("sighted");
+        store.update_status(&id, crate::models::ProjectStatus::Stopped).unwrap();
+
+        assert!(matches!(store.mark_exited(C0FFEE, &seen, |_| false), ExitMark::NotApplicable));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn only_running_projects_on_that_container_are_sighted_or_touched() {
+        let dir = temp_dir("other");
+        let mut starting = running_on(C0FFEE);
+        starting.status = crate::models::ProjectStatus::Starting;
+        let other = running_on(&"b".repeat(64));
+        let (starting_id, other_id) = (starting.id.clone(), other.id.clone());
+        let store = store_over(&dir, vec![starting, other]);
+
+        assert!(store.running_on(C0FFEE).is_none(), "Starting is a command's");
+        assert!(store.running_on(&"d".repeat(64)).is_none(), "nobody's container");
+        assert!(store.running_on("").is_none());
+        assert!(sight_and_mark(&store, C0FFEE, |_| false).is_none());
+        assert_eq!(
+            store.get(&starting_id).unwrap().status,
+            crate::models::ProjectStatus::Starting
+        );
+        assert_eq!(store.get(&other_id).unwrap().status, crate::models::ProjectStatus::Running);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_blank_or_truncated_stored_id_matches_no_container() {
+        // A blank stored id is a prefix of everything.
+        let dir = temp_dir("blank");
+        let store = store_over(&dir, vec![running_on(""), running_on("abc")]);
+        assert!(store.running_on(&"f".repeat(64)).is_none());
+        assert!(store.running_on("abcdef0123456789").is_none());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_short_id_is_matched_against_the_stored_full_one() {
+        let dir = temp_dir("short");
+        let full = "a".repeat(12) + &"b".repeat(52);
+        let store = store_over(&dir, vec![running_on(&full)]);
+
+        assert!(store.running_on("aaaa").is_none(), "too short to be an id");
+        assert!(sight_and_mark(&store, &full[..12], |_| false).is_some());
         fs::remove_dir_all(&dir).ok();
     }
 }
