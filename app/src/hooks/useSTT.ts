@@ -2,6 +2,7 @@ import { useCallback, useRef, useState } from "react";
 import * as commands from "../lib/tauri-commands";
 import { encodeWav } from "../lib/wav";
 import { useAppState } from "../store/appState";
+import { getMicrophoneStream } from "../lib/get-microphone";
 
 export type SttState = "idle" | "recording" | "transcribing" | "error";
 
@@ -36,11 +37,8 @@ export function useSTT(sessionId: string, sendInput: (sessionId: string, data: s
         noiseSuppression: true,
         autoGainControl: true,
       };
-      if (deviceId) {
-        audioConstraints.deviceId = { exact: deviceId };
-      }
 
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
+      const stream = await getMicrophoneStream(audioConstraints, deviceId);
       streamRef.current = stream;
 
       const audioContext = new AudioContext({ sampleRate: 16000 });
@@ -59,7 +57,10 @@ export function useSTT(sessionId: string, sendInput: (sessionId: string, data: s
       source.connect(processor);
       processor.connect(audioContext.destination);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
+      // Include the DOMException name: "Invalid constraint" alone doesn't say
+      // whether it was OverconstrainedError, NotAllowedError, NotFoundError, etc.
+      const msg = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+      console.error("STT startRecording failed:", e);
       setError(msg);
       setState("error");
     }

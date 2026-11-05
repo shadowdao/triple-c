@@ -55,6 +55,28 @@
 # lands last: a fallback, never an override.
 #
 # ---------------------------------------------------------------------------
+# 1b. The bundled libpipewire (microphone capture)
+# ---------------------------------------------------------------------------
+#
+# `bundleMediaFramework` puts the GStreamer plugins in the image, including
+# libgstpipewire.so, which is what WebKitGTK uses to reach the microphone. That
+# plugin pulls libpipewire-0.3.so.0 in with it, and the copy linuxdeploy
+# bundles has the *builder's* plugin directories compiled in
+# (/usr/lib/x86_64-linux-gnu/spa-0.2 and .../pipewire-0.3). Neither is bundled
+# and neither exists on, say, Arch (/usr/lib/spa-0.2), so on the host:
+#
+#     [E] pw.loop [loop.c:67 pw_loop_new()] can't make support.system handle:
+#         No such file or directory
+#
+# and the microphone never opens. libpipewire is host-coupled in the same way
+# libwayland-client is: it has to agree with the SPA plugins, client config and
+# daemon actually running. Its client ABI is backward compatible, so the
+# bundled libgstpipewire.so links happily against a newer host copy. Unlike the
+# wayland case there is no useful fallback — without a host PipeWire daemon
+# there is nothing to capture from — so the bundled copy is simply removed;
+# GStreamer skips a plugin whose library will not load and the app still starts.
+#
+# ---------------------------------------------------------------------------
 # 2. Metadata an AppImage manager needs
 # ---------------------------------------------------------------------------
 #
@@ -202,6 +224,17 @@ else
   echo "$LIB is not bundled — nothing to demote."
 fi
 
+# Independent of the wayland demotion above, and equally unconditional on it.
+PW_LIB="libpipewire-0.3.so.0"
+pw_removed=false
+if [ -e "$root/usr/lib/$PW_LIB" ]; then
+  rm -f "$root/usr/lib/$PW_LIB"
+  pw_removed=true
+  echo "Removed bundled $PW_LIB (the host's is used)."
+else
+  echo "$PW_LIB is not bundled — nothing to remove."
+fi
+
 # --- metadata -------------------------------------------------------------
 
 # Version comes from the artifact rather than a second source that could drift.
@@ -278,6 +311,9 @@ if [ "$demoted" = true ]; then
   [ -e "$out/$FALLBACK_DIR/$LIB" ] || fail "the fallback copy of $LIB is missing."
   [ -e "$out/$HOOK" ] || fail "the fallback hook is missing."
   grep -q "triple-c-wayland-fallback" "$out/AppRun" || fail "AppRun does not source the hook."
+fi
+if [ "$pw_removed" = true ]; then
+  [ -e "$out/usr/lib/$PW_LIB" ] && fail "$PW_LIB is still bundled."
 fi
 [ -x "$out/usr/bin/triple-c" ] || fail "no executable usr/bin/triple-c."
 

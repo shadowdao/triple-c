@@ -48,6 +48,12 @@ similar = "2"
 # Blocking client + rustls: no git binary or OpenSSL needed on the host.
 gix = { version = "0.88", default-features = false, features = ["blocking-network-client", "blocking-http-transport-reqwest-rust-tls", "credentials", "sha1"] }
 
+# Linux only: WebKitGTK refuses getUserMedia until the embedder enables media
+# streams and answers the permission request (see src/linux_media.rs). Same
+# version tauri/wry already resolve, so this adds no second copy.
+[target.'cfg(target_os = "linux")'.dependencies]
+webkit2gtk = "2.0.2"
+
 [dev-dependencies]
 # `test-util` (not part of tokio's `full`) lets the auto-start retry tests run
 # their backoff schedule under a paused clock instead of in real seconds.

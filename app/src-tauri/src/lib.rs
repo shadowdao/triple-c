@@ -4,6 +4,8 @@ mod browser_view;
 mod command_census;
 mod commands;
 mod container_watch;
+#[cfg(target_os = "linux")]
+mod linux_media;
 mod docker;
 pub mod file_viewer;
 mod install_helper;
@@ -255,6 +257,9 @@ pub fn run() {
         })
         .manage(file_viewer::registry::ViewerRegistry::default())
         .setup(move |app| {
+            #[cfg(target_os = "linux")]
+            linux_media::enable_microphone(app.handle());
+
             match tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png")) {
                 Ok(icon) => {
                     if let Some(window) = app.get_webview_window("main") {

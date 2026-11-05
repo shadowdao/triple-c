@@ -284,6 +284,10 @@ jobs:
           sudo env NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get install -y \
             libgtk-3-dev \
             libwebkit2gtk-4.1-dev \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-pipewire \
+            gstreamer1.0-pulseaudio \
             libayatana-appindicator3-dev \
             librsvg2-dev \
             libsoup-3.0-dev \
@@ -378,6 +382,10 @@ jobs:
           sudo env NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get install -y \
             libgtk-3-dev \
             libwebkit2gtk-4.1-dev \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-pipewire \
+            gstreamer1.0-pulseaudio \
             libayatana-appindicator3-dev \
             librsvg2-dev \
             libsoup-3.0-dev \
