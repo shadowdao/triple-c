@@ -1,5 +1,6 @@
 import { useCallback, useRef, useState } from "react";
 import * as commands from "../lib/tauri-commands";
+import { getMicrophoneStream } from "../lib/get-microphone";
 
 type VoiceState = "inactive" | "starting" | "active" | "error";
 
@@ -27,13 +28,8 @@ export function useVoice(sessionId: string, deviceId?: string | null) {
         noiseSuppression: true,
         autoGainControl: true,
       };
-      if (deviceId) {
-        audioConstraints.deviceId = { exact: deviceId };
-      }
 
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: audioConstraints,
-      });
+      const stream = await getMicrophoneStream(audioConstraints, deviceId);
       streamRef.current = stream;
 
       // 3. Create AudioContext at 16kHz (browser handles resampling)
