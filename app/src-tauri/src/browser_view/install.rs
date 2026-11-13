@@ -238,16 +238,15 @@ pub struct BrowserSetupOutcome {
 pub async fn install_packages(
     app: &AppHandle,
     project_id: &str,
-    container_id: &str,
+    container: &ContainerTarget,
 ) -> Result<BrowserSetupOutcome, String> {
-    let container = ContainerTarget::docker(container_id);
     emit_progress(
         app,
         project_id,
         &format!("Installing @playwright/cli into {}/node_modules…", INSTALL_DIR),
     );
 
-    let mut step = npm_install(app, project_id, &container, &[VIEWER_PACKAGE]).await?;
+    let mut step = npm_install(app, project_id, container, &[VIEWER_PACKAGE]).await?;
     if step.exit_code != 0 {
         return Err(format!(
             "npm couldn't install the viewer package in this container (exit {}).\n\nnpm said:\n{}",
@@ -264,9 +263,9 @@ pub async fn install_packages(
     // see the note on `npm_install`. The pin can only be read after the first
     // install has written the manifest, which is why this stays two commands
     // rather than one.
-    let spec = pinned_playwright_spec(&container).await;
+    let spec = pinned_playwright_spec(container).await;
     emit_progress(app, project_id, &format!("Installing {}…", spec));
-    let second = npm_install(app, project_id, &container, &[VIEWER_PACKAGE, &spec]).await?;
+    let second = npm_install(app, project_id, container, &[VIEWER_PACKAGE, &spec]).await?;
     if second.exit_code != 0 {
         return Err(format!(
             "npm couldn't install {} in this container (exit {}).\n\nnpm said:\n{}",
@@ -278,7 +277,7 @@ pub async fn install_packages(
     step.log = merge_logs(step.log, second.log);
 
     emit_progress(app, project_id, "Re-checking what the container has…");
-    let detection = detect::detect_in(&container).await?;
+    let detection = detect::detect(container).await?;
 
     // A probe that still finds something missing after a successful npm run is
     // the interesting case, so it is surfaced rather than swallowed. And a
@@ -410,11 +409,10 @@ fn merge_logs(first: String, second: String) -> String {
 pub async fn install_browser(
     app: &AppHandle,
     project_id: &str,
-    container_id: &str,
+    container: &ContainerTarget,
     target: BrowserTarget,
 ) -> Result<BrowserSetupOutcome, String> {
-    let container = ContainerTarget::docker(container_id);
-    let before = detect::detect_in(&container).await?;
+    let before = detect::detect(container).await?;
     let Some(cli) = before.playwright_cli.clone() else {
         return Err(
             "Playwright isn't installed in this container yet, so there is nothing to install a \
@@ -458,7 +456,7 @@ pub async fn install_browser(
         project_id,
         "Step 1/3 — checking whether this container already has the browser system libraries…",
     );
-    let state = check_libraries(&container, &cli, target).await;
+    let state = check_libraries(container, &cli, target).await;
     match &state {
         LibraryState::Present => {
             emit_progress(
@@ -482,7 +480,7 @@ pub async fn install_browser(
             let deps = run_step(
                 app,
                 project_id,
-                &container,
+                container,
                 "root",
                 "/tmp",
                 vec![
@@ -530,7 +528,7 @@ pub async fn install_browser(
     let dl = run_step(
         app,
         project_id,
-        &container,
+        container,
         user,
         workdir,
         vec![
@@ -559,7 +557,7 @@ pub async fn install_browser(
         project_id,
         &format!("Step 3/3 — checking that {} actually launches…", target.cli_name()),
     );
-    let verdict = verify_launch(&container, &before, target).await;
+    let verdict = verify_launch(container, &before, target).await;
     push_section(&mut log, &verdict.detail);
     if !verdict.ok {
         warning = merge(
@@ -590,7 +588,7 @@ pub async fn install_browser(
     }
 
     emit_progress(app, project_id, "Re-checking what the container has…");
-    let detection = detect::detect_in(&container).await?;
+    let detection = detect::detect(container).await?;
 
     Ok(BrowserSetupOutcome {
         detection,

@@ -281,7 +281,7 @@ impl BrowserViewManager {
     pub async fn start(
         &self,
         project_id: String,
-        container_id: String,
+        container: ContainerTarget,
         app: AppHandle,
         store: Arc<ProjectsStore>,
     ) -> Result<BrowserViewStatus, String> {
@@ -299,8 +299,7 @@ impl BrowserViewManager {
             return Ok(self.status(&project_id, true).await);
         }
 
-        let container = ContainerTarget::docker(container_id.as_str());
-        let detection = detect::detect_in(&container).await?;
+        let detection = detect::detect(&container).await?;
         if !detection.is_usable() {
             let blocker = detection.blocker().unwrap_or_else(|| {
                 "Playwright is present but incomplete in this container.".to_string()
@@ -328,7 +327,7 @@ impl BrowserViewManager {
         // `--host 127.0.0.1` is ours to set, so the family is known and there is
         // no need to go back to /proc/net to work it out.
         let proxy = match BrowserViewProxy::bind(
-            container_id.clone(),
+            container.clone(),
             container_port,
             PortFamily::V4,
             token.clone(),

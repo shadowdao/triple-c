@@ -322,7 +322,7 @@ async fn tunnel_connection(
     }
 
     // The bytes already off the socket go back on the wire first, byte-exact.
-    tunnel_into_with_prelude(container, target, stream, port, head.into_buffer()).await
+    tunnel_connection_with_prelude(container, target, stream, port, head.into_buffer()).await
 }
 
 /// What the first bytes of an accepted connection turned out to be.
@@ -514,29 +514,7 @@ pub(crate) fn web_request_verdict(head: &str) -> Verdict {
 /// head off the socket to check a token, and then has to put those same bytes
 /// back on the wire. Passing them here keeps the byte stream exact, rather than
 /// re-serialising a parsed request.
-///
-/// Takes a Docker container id because that is what the browser-view proxy
-/// holds; [`tunnel_into_with_prelude`] is the same thing for a
-/// [`ContainerTarget`] already in hand.
 pub async fn tunnel_connection_with_prelude(
-    container_id: String,
-    target: String,
-    stream: TcpStream,
-    port: u16,
-    prelude: Vec<u8>,
-) {
-    tunnel_into_with_prelude(
-        ContainerTarget::docker(container_id),
-        target,
-        stream,
-        port,
-        prelude,
-    )
-    .await
-}
-
-/// [`tunnel_connection_with_prelude`] for a [`ContainerTarget`].
-pub async fn tunnel_into_with_prelude(
     container: ContainerTarget,
     target: String,
     stream: TcpStream,

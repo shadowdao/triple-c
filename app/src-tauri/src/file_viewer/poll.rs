@@ -40,7 +40,10 @@ pub fn parse_poll_output(code: i64, stdout: &str) -> ViewerPoll {
     ViewerPoll { exists: true, hash, size }
 }
 
-pub async fn poll_file(container_id: &str, container_path: &str) -> Result<ViewerPoll, String> {
+pub async fn poll_file(
+    container: &ContainerTarget,
+    container_path: &str,
+) -> Result<ViewerPoll, String> {
     let cmd = vec![
         "sh".to_string(),
         "-c".to_string(),
@@ -48,7 +51,7 @@ pub async fn poll_file(container_id: &str, container_path: &str) -> Result<Viewe
         "poll".to_string(),
         container_path.to_string(),
     ];
-    let (stdout, stderr, code) = ContainerTarget::docker(container_id)
+    let (stdout, stderr, code) = container
         .exec_oneshot_streams_as("claude", cmd, Vec::new())
         .await?;
     if code != 0 && code != 4 {
