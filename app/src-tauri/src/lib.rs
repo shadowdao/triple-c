@@ -7,6 +7,7 @@ mod container_watch;
 #[cfg(target_os = "linux")]
 mod linux_media;
 mod docker;
+mod host;
 pub mod file_viewer;
 mod install_helper;
 mod logging;
@@ -22,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use auth_bridge::AuthBridgeManager;
-use docker::exec::ExecSessionManager;
+use host::ExecSessionManager;
 use storage::projects_store::ProjectsStore;
 use storage::settings_store::SettingsStore;
 use tauri::async_runtime::JoinHandle;

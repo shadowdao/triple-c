@@ -189,7 +189,7 @@ pub async fn open_terminal_session(
     state
         .exec_manager
         .create_session(
-            container_id,
+            &crate::host::ContainerTarget::docker(container_id.as_str()),
             &session_id,
             cmd,
             move |data| {
@@ -250,7 +250,11 @@ pub async fn paste_image_to_terminal(
 
     state
         .exec_manager
-        .write_file_to_container(&container_id, &file_name, &image_data)
+        .write_file_to_container(
+            &crate::host::ContainerTarget::docker(container_id.as_str()),
+            &file_name,
+            &image_data,
+        )
         .await
 }
 
@@ -362,7 +366,7 @@ pub async fn start_audio_bridge(
     state
         .exec_manager
         .create_session_with_tty(
-            &container_id,
+            &crate::host::ContainerTarget::docker(container_id.as_str()),
             &audio_session_id,
             cmd,
             false,

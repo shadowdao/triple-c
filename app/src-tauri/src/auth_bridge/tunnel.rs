@@ -56,7 +56,7 @@
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
-use bollard::container::LogOutput;
+use crate::host::ExecChunk;
 use futures_util::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -587,12 +587,12 @@ pub async fn tunnel_connection_with_prelude(
             // Only stdout is payload. The exec is created with tty = false
             // precisely so Docker demultiplexes these, keeping socat's stderr
             // diagnostics out of the proxied byte stream.
-            Ok(LogOutput::StdOut { message }) => {
+            Ok(ExecChunk::StdOut(message)) => {
                 if host_tx.write_all(&message).await.is_err() {
                     break;
                 }
             }
-            Ok(LogOutput::StdErr { message }) => {
+            Ok(ExecChunk::StdErr(message)) => {
                 log::debug!(
                     "Auth bridge: socat stderr for port {}: {}",
                     port,

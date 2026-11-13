@@ -329,7 +329,13 @@ async fn handle_open(
 
     state
         .exec_manager
-        .create_session(container_id, &session_id, cmd, on_output, on_exit)
+        .create_session(
+            &crate::host::ContainerTarget::docker(container_id.as_str()),
+            &session_id,
+            cmd,
+            on_output,
+            on_exit,
+        )
         .await?;
 
     // Track this session for cleanup on disconnect

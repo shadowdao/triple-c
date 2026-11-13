@@ -1860,7 +1860,7 @@ async fn stage_payload(
     project_id: &str,
     verbatim: &[String],
 ) -> Result<String, String> {
-    use bollard::container::LogOutput;
+    use crate::host::ExecChunk;
     use futures_util::StreamExt;
     use tokio::io::AsyncWriteExt;
 
@@ -1913,14 +1913,14 @@ async fn stage_payload(
 
     while let Some(msg) = output.next().await {
         match msg {
-            Ok(LogOutput::StdOut { message }) => {
+            Ok(ExecChunk::StdOut(message)) => {
                 if let Err(e) = writer.write_all(&message).await {
                     stream_err = Some(format!("Failed to write the staging file: {}", e));
                     break;
                 }
                 total += message.len() as u64;
             }
-            Ok(LogOutput::StdErr { message }) => {
+            Ok(ExecChunk::StdErr(message)) => {
                 stderr_text.push_str(&String::from_utf8_lossy(&message));
             }
             Ok(_) => {}
@@ -1979,7 +1979,7 @@ async fn stage_payload(
 /// anything already present in the base, so collisions should be rare either
 /// way.)
 async fn restore_payload(container_id: &str, host_path: &str) -> Result<(), String> {
-    use bollard::container::LogOutput;
+    use crate::host::ExecChunk;
     use futures_util::StreamExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -2007,7 +2007,7 @@ async fn restore_payload(container_id: &str, host_path: &str) -> Result<(), Stri
         let mut text = String::new();
         while let Some(msg) = output.next().await {
             match msg {
-                Ok(LogOutput::StdErr { message }) | Ok(LogOutput::StdOut { message }) => {
+                Ok(ExecChunk::StdErr(message)) | Ok(ExecChunk::StdOut(message)) => {
                     text.push_str(&String::from_utf8_lossy(&message))
                 }
                 Ok(_) => {}

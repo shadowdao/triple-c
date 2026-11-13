@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tower_http::cors::CorsLayer;
 
-use crate::docker::exec::ExecSessionManager;
+use crate::host::ExecSessionManager;
 use crate::storage::projects_store::ProjectsStore;
 use crate::storage::settings_store::SettingsStore;
 

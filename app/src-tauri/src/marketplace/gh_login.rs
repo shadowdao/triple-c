@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use bollard::container::LogOutput;
+use crate::host::ExecChunk;
 use futures_util::{Stream, StreamExt};
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -187,7 +187,7 @@ async fn drive_login<S, W, E>(
     mut emit: E,
 ) -> Result<String, String>
 where
-    S: Stream<Item = Result<LogOutput, bollard::errors::Error>> + Unpin,
+    S: Stream<Item = Result<ExecChunk, String>> + Unpin,
     W: AsyncWrite + Unpin,
     E: FnMut(&'static str, serde_json::Value),
 {
@@ -496,23 +496,19 @@ mod tests {
     /// successful one does not.
     mod teardown {
         use super::super::*;
-        use bollard::container::LogOutput;
         use futures_util::stream;
         use std::pin::Pin;
         use std::sync::{Arc, Mutex};
         use std::task::{Context, Poll};
 
-        type Frame = Result<LogOutput, bollard::errors::Error>;
+        type Frame = Result<ExecChunk, String>;
 
         fn out(s: &'static str) -> Frame {
-            Ok(LogOutput::StdOut { message: s.into() })
+            Ok(ExecChunk::StdOut(s.into()))
         }
 
         fn lost() -> Frame {
-            Err(bollard::errors::Error::DockerResponseServerError {
-                status_code: 500,
-                message: "connection reset".to_string(),
-            })
+            Err("connection reset".to_string())
         }
 
         /// Records every write separately; or fails every write.
