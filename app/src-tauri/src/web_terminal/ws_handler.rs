@@ -295,9 +295,7 @@ async fn handle_open(
         return Err(format!("Project '{}' is not running", project.name));
     }
 
-    let container_id = project
-        .container_id
-        .as_ref()
+    let container = crate::host::ContainerTarget::for_project(&project)
         .ok_or_else(|| "Container not running".to_string())?;
 
     let cmd = match session_type {
@@ -330,7 +328,7 @@ async fn handle_open(
     state
         .exec_manager
         .create_session(
-            &crate::host::ContainerTarget::docker(container_id.as_str()),
+            &container,
             &session_id,
             cmd,
             on_output,

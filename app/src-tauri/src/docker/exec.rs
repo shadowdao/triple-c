@@ -5,40 +5,20 @@ use futures_util::StreamExt;
 use super::client::get_docker;
 use crate::host::{ExecChunk, ExecSpec};
 
-/// A `docker exec` that has been created and started with stdin/stdout/stderr
-/// attached — the raw duplex halves, before any policy about what to do with
-/// them.
-///
-/// This is the single place in the codebase that knows how to open an attached
-/// exec. Both consumers are built on it:
-///   * [`ExecSessionManager`] — interactive terminals and the audio bridge,
-///     which pump bytes through mpsc channels and a callback.
-///   * `auth_bridge` — per-connection `socat` tunnels, which pump bytes
-///     straight between a host TCP socket and these halves.
-///
-/// With `tty = false` the output stream is demultiplexed by Docker, so the
-/// consumer can tell [`LogOutput::StdOut`] from [`LogOutput::StdErr`]. That
-/// distinction matters for the auth bridge: `socat`'s diagnostics must not be
-/// spliced into the proxied byte stream.
+// `AttachedExec` lives in `host` now (host-neutral output chunks); this
+// module's job is to produce one from Docker. Its consumers are
+// `host::sessions::ExecSessionManager` (terminals, audio bridge) and the auth
+// bridge's per-connection `socat` tunnels, both through `host::ContainerTarget`.
+// With `tty = false` Docker demultiplexes stdout from stderr, which the auth
+// bridge relies on: `socat`'s diagnostics must not be spliced into the proxied
+// byte stream.
 pub use crate::host::AttachedExec;
 
-/// Create and start an exec with stdin + stdout + stderr attached, returning the
-/// raw duplex halves. Runs as `claude` in `/workspace`, like every other exec
-/// this app opens.
-pub async fn create_attached_exec(
-    container_id: &str,
-    cmd: Vec<String>,
-    tty: bool,
-) -> Result<AttachedExec, String> {
-    create_attached_exec_as(container_id, cmd, tty, "claude", "/workspace").await
-}
-
-/// [`create_attached_exec`] with the user and working directory spelled out.
+/// An attached exec with the user and working directory spelled out.
 ///
-/// Only base-image migration needs this: replaying `apt` and unpacking a
-/// payload tar at `/` have to run as **root**, and every other caller wants the
-/// `claude` / `/workspace` defaults that [`create_attached_exec`] supplies. It
-/// stays the single place an attached exec is opened.
+/// Only base-image migration calls this directly: replaying `apt` and unpacking
+/// a payload tar at `/` have to run as **root**. Everything else goes through
+/// `host::ContainerTarget::attach`.
 pub async fn create_attached_exec_as(
     container_id: &str,
     cmd: Vec<String>,
@@ -54,8 +34,8 @@ pub async fn create_attached_exec_as(
 }
 
 /// The single place an attached exec is opened on Docker. Everything else —
-/// [`create_attached_exec`], [`create_attached_exec_as`], and
-/// `host::ContainerTarget::attach` — is a thin wrapper over this.
+/// [`create_attached_exec_as`] and `host::ContainerTarget::attach` — is a thin
+/// wrapper over this.
 pub async fn create_attached_exec_spec(
     container_id: &str,
     spec: &ExecSpec,

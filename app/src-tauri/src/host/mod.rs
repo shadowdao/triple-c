@@ -29,7 +29,7 @@
 pub mod sessions;
 
 pub use crate::docker::exec::{
-    MAX_DROP_BYTES, MAX_ONESHOT_OUTPUT, OUTPUT_LIMIT_MARKER, PROC_NET_OUTPUT_LIMIT,
+    MAX_DROP_BYTES, OUTPUT_LIMIT_MARKER, PROC_NET_OUTPUT_LIMIT,
 };
 pub use sessions::ExecSessionManager;
 
@@ -434,22 +434,6 @@ mod tests {
             "commands/migration_commands.rs",
             // Phase 1b: lifecycle and the `die` event stream.
             "container_watch.rs",
-            // Phase 1a, not yet migrated. Each migration removes its own
-            // entries; the list must be empty before phase 1a merges.
-            "auth_bridge/mod.rs",
-            "auth_bridge/tunnel.rs",
-            "browser_view/detect.rs",
-            "browser_view/install.rs",
-            "browser_view/mod.rs",
-            "browser_view/page.rs",
-            "commands/auth_token_commands.rs",
-            "commands/file_commands.rs",
-            "commands/inspect_commands.rs",
-            "commands/terminal_commands.rs",
-            "file_viewer/poll.rs",
-            "file_viewer/resolve.rs",
-            "marketplace/gh_login.rs",
-            "marketplace/sync.rs",
         ];
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut offenders = Vec::new();

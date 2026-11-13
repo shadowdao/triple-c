@@ -1287,14 +1287,10 @@ pub async fn run_scheduled_task_now(
     ])
     .env(home_env())
     .no_stdin();
-    let exec_id = target.exec_detached(spec).await.map_err(|e| {
-        // Keep this command's own wording for a start failure ("Failed to start
-        // task: …"); a create failure reads "Failed to create exec: …" either way.
-        match e.strip_prefix("Failed to start exec: ") {
-            Some(rest) => format!("Failed to start task: {}", rest),
-            None => e,
-        }
-    })?;
+    let exec_id = target
+        .exec_detached(spec)
+        .await
+        .map_err(|e| format!("Failed to start task: {}", e))?;
 
     log::info!(
         "Triggered scheduler task {} in project {} (detached exec {})",

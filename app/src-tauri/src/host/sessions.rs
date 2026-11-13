@@ -187,12 +187,15 @@ impl ExecSessionManager {
         }
     }
 
-    pub async fn get_container_id(&self, session_id: &str) -> Result<String, String> {
+    /// The container a session was opened on — reuse it for side-channel work
+    /// on the same session (image paste, file drop, audio bridge) rather than
+    /// rebuilding a target from an id, which would assume the host.
+    pub async fn get_target(&self, session_id: &str) -> Result<ContainerTarget, String> {
         let sessions = self.sessions.lock().await;
         let session = sessions
             .get(session_id)
             .ok_or_else(|| format!("Session {} not found", session_id))?;
-        Ok(session.target.id().to_string())
+        Ok(session.target.clone())
     }
 
     pub async fn write_file_to_container(

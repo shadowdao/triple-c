@@ -1435,17 +1435,6 @@ pub async fn create_container_directory(
     Ok(dest)
 }
 
-/// The underlying cause of a [`ContainerTarget::attach`] failure, without the
-/// host layer's own "Failed to create exec: " / "Failed to start exec: "
-/// prefix, so the transfers below can keep framing it in their own words as
-/// they did when they opened the exec themselves. Anything else (an
-/// unreachable daemon, a detached start) passes through whole.
-fn strip_exec_error_prefix(e: &str) -> &str {
-    e.strip_prefix("Failed to create exec: ")
-        .or_else(|| e.strip_prefix("Failed to start exec: "))
-        .unwrap_or(e)
-}
-
 /// Every "container is not running" refusal starts with this, so a caller (the file
 /// viewer's poll, `app/src/viewer/ipcMessages.ts`) can tell it apart from any other failure.
 pub(crate) const NOT_RUNNING_PREFIX: &str = "Start the project before";
@@ -1630,7 +1619,7 @@ dd iflag=nonblock bs=64k status=none if="$TC_SRC" || exit 5"#;
                 .no_stdin(),
         )
         .await
-        .map_err(|e| format!("Failed to start download: {}", strip_exec_error_prefix(&e)))?;
+        .map_err(|e| format!("Failed to start download: {}", e))?;
     let exec_id = exec.exec_id;
     let mut output = exec.output;
 
@@ -2310,10 +2299,7 @@ tar czf - --ignore-failed-read \
                 .no_stdin(),
         )
         .await
-        .map_err(|e| match e.strip_prefix("Failed to create exec: ") {
-            Some(rest) => format!("Failed to create backup exec: {}", rest),
-            None => format!("Failed to start backup exec: {}", strip_exec_error_prefix(&e)),
-        })?;
+        .map_err(|e| format!("Failed to start backup: {}", e))?;
     let exec_id = exec.exec_id;
     let mut output = exec.output;
 

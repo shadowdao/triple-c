@@ -239,7 +239,7 @@ pub async fn paste_image_to_terminal(
     image_data: Vec<u8>,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    let target = ContainerTarget::docker(state.exec_manager.get_container_id(&session_id).await?);
+    let target = state.exec_manager.get_target(&session_id).await?;
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -282,7 +282,7 @@ pub async fn upload_host_file_to_terminal(
     let base = crate::commands::file_commands::host_upload_name(&host_path)?;
     let host_path = crate::commands::file_commands::resolve_host_read_path(&host_path).await?;
 
-    let target = ContainerTarget::docker(state.exec_manager.get_container_id(&session_id).await?);
+    let target = state.exec_manager.get_target(&session_id).await?;
 
     let meta = tokio::fs::metadata(&host_path)
         .await
@@ -345,7 +345,7 @@ pub async fn start_audio_bridge(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     // Get the container from the terminal session
-    let target = ContainerTarget::docker(state.exec_manager.get_container_id(&session_id).await?);
+    let target = state.exec_manager.get_target(&session_id).await?;
 
     // Create audio bridge exec session with ID "audio-{session_id}"
     // The loop handles reconnection when the FIFO reader (fake rec) is killed and restarted
