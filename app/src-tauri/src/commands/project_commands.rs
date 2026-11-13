@@ -2,7 +2,9 @@ use tauri::{Emitter, State};
 
 use crate::commands::aws_commands;
 use crate::docker;
-use crate::models::{container_config, AppSettings, Backend, BedrockAuthMethod, Project, ProjectPath, ProjectRemovalReport, ProjectResetOutcome, ProjectStatus};
+use crate::host::lifecycle::{DiscardLeftovers, ProjectHost};
+use crate::host::ContainerTarget;
+use crate::models::{Backend, BedrockAuthMethod, Project, ProjectPath, ProjectRemovalReport, ProjectResetOutcome, ProjectStatus};
 use crate::storage::secure;
 use crate::AppState;
 
@@ -112,48 +114,6 @@ fn store_secrets_for_project(project: &Project, explicitly_cleared: &[&str]) -> 
         )?;
     }
     Ok(())
-}
-
-/// Create the project's container, threading every global setting through.
-///
-/// Exists so that the two ordinary create paths below and base-image migration
-/// cannot drift apart — a container created by a migration must be
-/// indistinguishable from one created by a normal start, or the next
-/// `container_needs_recreation` would immediately throw it away.
-///
-/// `create_image` is what to create *from* (the snapshot or the base);
-/// `base_image_name` is the configured base, which `create_container` needs in
-/// order to tell those two apart when it stamps the lineage labels.
-pub(crate) async fn create_container_for_project(
-    project: &Project,
-    settings: &AppSettings,
-    docker_socket: &str,
-    aws_config_path: Option<&str>,
-    create_image: &str,
-    base_image_name: &str,
-    extras: docker::CreateExtras<'_>,
-) -> Result<String, String> {
-    docker::create_container(
-        project,
-        docker_socket,
-        create_image,
-        base_image_name,
-        extras,
-        aws_config_path,
-        &settings.global_aws,
-        &settings.global_ollama,
-        &settings.global_llamacpp,
-        &settings.global_openai_compatible,
-        settings.global_claude_instructions.as_deref(),
-        &settings.global_custom_env_vars,
-        settings.timezone.as_deref(),
-        settings.global_claude_code_settings.as_ref(),
-        settings.default_ssh_key_path.as_deref(),
-        settings.ca_cert_path.as_deref(),
-        settings.default_git_user_name.as_deref(),
-        settings.default_git_user_email.as_deref(),
-    )
-    .await
 }
 
 /// Populate secret fields on a project struct from the OS keychain.
@@ -774,7 +734,8 @@ pub async fn remove_project(
         if let Some(ref stored_id) = project.container_id {
             state.exec_manager.close_sessions_for_container(stored_id).await;
         }
-        let container_ref = match docker::find_existing_container(project).await {
+        let host = ProjectHost::for_project(project);
+        let container_ref = match host.find_current(project).await {
             Ok(found) => found,
             Err(e) => {
                 log::warn!(
@@ -785,15 +746,14 @@ pub async fn remove_project(
                 None
             }
         };
-        if let Some(ref container_id) = container_ref {
-            if project.container_id.as_deref() != Some(container_id.as_str()) {
-                state.exec_manager.close_sessions_for_container(container_id).await;
+        if let Some(ref container) = container_ref {
+            if project.container_id.as_deref() != Some(container.id()) {
+                state.exec_manager.close_sessions_for_container(container.id()).await;
             }
-            let _ = docker::stop_container(container_id).await;
-            if let Err(e) = docker::remove_container(container_id).await {
+            if let Err(e) = host.remove(container).await {
                 log::warn!(
                     "Failed to remove container {} for project {}: {}",
-                    container_id, project_id, e
+                    container.id(), project_id, e
                 );
                 // Recorded by name, not id: the name is the stable handle a
                 // later retry can still resolve (Docker's remove-container
@@ -805,15 +765,12 @@ pub async fn remove_project(
 
         // Legacy MCP cleanup (pre-MCP-removal installs): drop any leftover MCP
         // containers first, then the per-project network they were attached to.
-        docker::remove_legacy_mcp_containers(&project.id).await;
-        docker::remove_legacy_project_network(&project.id).await;
+        host.remove_legacy_leftovers(project).await;
 
         // Clean up the snapshot image + volumes
-        if let Err(e) = docker::remove_snapshot_image(project).await {
-            log::warn!("Failed to remove snapshot image for project {}: {}", project_id, e);
-            report.image = Some(docker::get_snapshot_image_name(project));
-        }
-        report.volumes = docker::remove_project_volumes(project).await;
+        let left = host.discard_project_state(project).await;
+        report.image = left.image;
+        report.volumes = left.volumes;
     }
 
     // Clean up keychain secrets for this project
@@ -1204,9 +1161,9 @@ async fn start_project_container_locked(
     // in memory when building environment variables for the container.
     load_secrets_for_project(&mut project);
 
-    // Load settings for image resolution and global AWS
+    // Load settings: backend validation below, and the host's start (image
+    // resolution, global AWS, …).
     let settings = state.settings_store.get();
-    let image_name = container_config::resolve_image_name(&settings.image_source, &settings.custom_image_name);
 
     // Validate backend requirements
     if project.backend == Backend::Bedrock {
@@ -1322,140 +1279,18 @@ async fn start_project_container_locked(
     }
 
     // Wrap container operations so that any failure resets status to Stopped.
-    let result: Result<String, String> = async {
-        // Ensure image exists
-        emit_progress(&app_handle, &project_id, "Checking image...");
-        if !docker::image_exists(&image_name).await? {
-            return Err(format!("Docker image '{}' not found. Please pull or build the image first.", image_name));
-        }
-
-        // Determine docker socket path
-        let docker_socket = settings.docker_socket_path
-            .as_deref()
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| default_docker_socket());
-
-        // AWS config path from global settings
-        let aws_config_path = settings.global_aws.aws_config_path.clone();
-
-        // What we would create this container from *right now*: the project's
-        // snapshot when one exists, else the configured base. This is the value
-        // `container_needs_recreation` compares against the container's
-        // `triple-c.create-image` label — the check that replaced the old
-        // tautological one. It is resolved *before* the commit below, so it
-        // describes the pre-commit world the existing container was born into.
-        let snapshot_image = docker::get_snapshot_image_name(&project);
-        let expected_create_image =
-            if docker::image_exists(&snapshot_image).await.unwrap_or(false) {
-                snapshot_image.clone()
-            } else {
-                image_name.clone()
-            };
-
-        let container_id = if let Some(existing_id) = docker::find_existing_container(&project).await? {
-            // Check if config changed — if so, snapshot + recreate
-            let needs_recreate = docker::container_needs_recreation(
-                &existing_id,
-                &project,
-                &expected_create_image,
-                &settings.global_aws,
-                &settings.global_ollama,
-                &settings.global_llamacpp,
-                &settings.global_openai_compatible,
-                settings.global_claude_instructions.as_deref(),
-                &settings.global_custom_env_vars,
-                settings.timezone.as_deref(),
-                settings.global_claude_code_settings.as_ref(),
-                settings.default_ssh_key_path.as_deref(),
-                settings.ca_cert_path.as_deref(),
-                settings.default_git_user_name.as_deref(),
-                settings.default_git_user_email.as_deref(),
-            ).await.unwrap_or(false);
-
-            if needs_recreate {
-                log::info!("Container config changed for project {} — committing snapshot and recreating", project.id);
-                // Snapshot the filesystem before destroying
-                emit_progress(&app_handle, &project_id, "Saving container state...");
-                if let Err(e) = docker::commit_container_snapshot(&existing_id, &project).await {
-                    log::warn!("Failed to snapshot container before recreation: {}", e);
-                }
-                emit_progress(&app_handle, &project_id, "Recreating container...");
-                let _ = docker::stop_container(&existing_id).await;
-                docker::remove_container(&existing_id).await?;
-
-                // Legacy MCP cleanup: the old container may have been attached to
-                // `triple-c-net-<projectId>`. Tear down leftover MCP containers and
-                // that network now, before the replacement is created without it.
-                docker::remove_legacy_mcp_containers(&project.id).await;
-                docker::remove_legacy_project_network(&project.id).await;
-
-                // Create from snapshot image (preserves system-level changes).
-                // Re-resolved after the commit above: when no snapshot existed
-                // before, one does now, and creating from the base instead
-                // would throw away the state that was just saved.
-                let create_image = if docker::image_exists(&snapshot_image).await.unwrap_or(false) {
-                    snapshot_image.clone()
-                } else {
-                    image_name.clone()
-                };
-
-                let new_id = create_container_for_project(
-                    &project,
-                    &settings,
-                    &docker_socket,
-                    aws_config_path.as_deref(),
-                    &create_image,
-                    &image_name,
-                    docker::CreateExtras::default(),
-                ).await?;
-                emit_progress(&app_handle, &project_id, "Starting container...");
-                docker::start_container(&new_id).await?;
-
-                // The commit above moved `:latest` and orphaned the image it
-                // used to point at; the container holding that image open was
-                // removed a few lines up, so now is when Docker will actually
-                // let it go. Detached because this is housekeeping and the
-                // project is already running — and it sweeps every orphan, not
-                // just this one, so recreations that happened before the sweep
-                // existed are cleaned up too.
-                tauri::async_runtime::spawn(async {
-                    docker::sweep_orphaned_snapshots_logged("after recreation").await;
-                });
-
-                new_id
-            } else {
-                emit_progress(&app_handle, &project_id, "Starting container...");
-                docker::start_container(&existing_id).await?;
-                existing_id
-            }
-        } else {
-            // Container doesn't exist (first start, or Docker pruned it).
-            // Check for a snapshot image first — it preserves system-level
-            // changes (apt/pip/npm installs) from the previous session.
-            if expected_create_image == snapshot_image {
-                log::info!("Creating container from snapshot image for project {}", project.id);
-            }
-            let create_image = expected_create_image.clone();
-
-            emit_progress(&app_handle, &project_id, "Creating container...");
-            let new_id = create_container_for_project(
-                &project,
-                &settings,
-                &docker_socket,
-                aws_config_path.as_deref(),
-                &create_image,
-                &image_name,
-                docker::CreateExtras::default(),
-            ).await?;
-            emit_progress(&app_handle, &project_id, "Starting container...");
-            docker::start_container(&new_id).await?;
-            new_id
-        };
+    let host = ProjectHost::for_project(&project);
+    let result: Result<ContainerTarget, String> = async {
+        let target = host
+            .ensure_started(&project, &settings, &|msg: &str| {
+                emit_progress(&app_handle, &project_id, msg)
+            })
+            .await?;
 
         // Sync Bedrock credentials on every start: refresh static/session creds
         // so rotated keys are picked up without a full container recreation, and
         // clear stale creds when the project no longer uses static-cred Bedrock.
-        if let Err(e) = docker::sync_bedrock_credentials(&container_id, &project).await {
+        if let Err(e) = docker::sync_bedrock_credentials(&target, &project).await {
             log::warn!("Failed to sync AWS credentials for project {}: {}", project.id, e);
         }
 
@@ -1466,10 +1301,10 @@ async fn start_project_container_locked(
             state.marketplace.clone(),
             state.settings_store.get(),
             project.clone(),
-            container_id.clone(),
+            target.clone(),
         );
 
-        Ok(container_id)
+        Ok(target)
     }.await;
 
     // On failure, reset status to Stopped so the project doesn't get stuck.
@@ -1478,7 +1313,8 @@ async fn start_project_container_locked(
         let _ = state.projects_store.update_status(&project_id, ProjectStatus::Stopped);
     }
 
-    let container_id = result?;
+    let target = result?;
+    let container_id = target.id().to_string();
 
     // Update project with container info using granular methods (Issue 14: TOCTOU)
     state.projects_store.set_container_id(&project_id, Some(container_id.clone()))?;
@@ -1491,8 +1327,7 @@ async fn start_project_container_locked(
             .auth_bridge
             .start(
                 project_id.clone(),
-                // phase 1b: lifecycle will hand out the target
-                crate::host::ContainerTarget::docker(container_id.clone()),
+                target.clone(),
                 app_handle.clone(),
                 state.projects_store.clone(),
             )
@@ -1528,13 +1363,13 @@ pub async fn stop_project_container(
     // Drop host listeners first: they only make sense while the container runs.
     state.auth_bridge.stop(&project_id).await;
 
-    if let Some(ref container_id) = project.container_id {
+    if let Some(container) = ContainerTarget::for_project(&project) {
         // Close exec sessions for this project
         emit_progress(&app_handle, &project_id, "Stopping container...");
-        state.exec_manager.close_sessions_for_container(container_id).await;
+        state.exec_manager.close_sessions_for_container(container.id()).await;
 
-        if let Err(e) = docker::stop_container(container_id).await {
-            log::warn!("Docker stop failed for container {} (project {}): {} — resetting to Stopped anyway", container_id, project_id, e);
+        if let Err(e) = ProjectHost::for_project(&project).stop(&container).await {
+            log::warn!("Stop failed for container {} (project {}): {} — resetting to Stopped anyway", container.id(), project_id, e);
         }
     }
 
@@ -1589,13 +1424,13 @@ pub async fn rebuild_project_container(
     if let Some(ref stored_id) = project.container_id {
         state.exec_manager.close_sessions_for_container(stored_id).await;
     }
-    let container_ref = docker::find_existing_container(&project).await?;
-    if let Some(ref container_id) = container_ref {
-        if project.container_id.as_deref() != Some(container_id.as_str()) {
-            state.exec_manager.close_sessions_for_container(container_id).await;
+    let host = ProjectHost::for_project(&project);
+    let container_ref = host.find_current(&project).await?;
+    if let Some(ref container) = container_ref {
+        if project.container_id.as_deref() != Some(container.id()) {
+            state.exec_manager.close_sessions_for_container(container.id()).await;
         }
-        let _ = docker::stop_container(container_id).await;
-        docker::remove_container(container_id).await?;
+        host.remove(container).await?;
         state.projects_store.set_container_id(&project_id, None)?;
     }
 
@@ -1608,12 +1443,10 @@ pub async fn rebuild_project_container(
     // discard. No pending-cleanup record for either: unlike `remove_project`,
     // Reset keeps the project record, so a later Reset attempt can retry
     // these itself rather than needing startup housekeeping to do it.
-    let mut leftover_image = None;
-    if let Err(e) = docker::remove_snapshot_image(&project).await {
-        log::warn!("Failed to remove snapshot image for project {}: {}", project_id, e);
-        leftover_image = Some(docker::get_snapshot_image_name(&project));
-    }
-    let leftover_volumes = docker::remove_project_volumes(&project).await;
+    let DiscardLeftovers {
+        image: leftover_image,
+        volumes: leftover_volumes,
+    } = host.discard_project_state(&project).await;
     if leftover_image.is_some() || !leftover_volumes.is_empty() {
         log::warn!(
             "Reset for project {} could not fully clean up — image: {:?}, volumes: {:?} — the \
@@ -1680,8 +1513,8 @@ pub async fn reconcile_project_statuses(
             continue;
         }
 
-        let is_running = if let Some(ref container_id) = project.container_id {
-            docker::is_container_running(container_id).await.unwrap_or(false)
+        let is_running = if let Some(container) = ContainerTarget::for_project(project) {
+            container.is_running().await.unwrap_or(false)
         } else {
             false
         };
@@ -1721,13 +1554,6 @@ pub async fn reconcile_project_statuses(
     Ok(state.projects_store.list())
 }
 
-fn default_docker_socket() -> String {
-    if cfg!(target_os = "windows") {
-        "//./pipe/docker_engine".to_string()
-    } else {
-        "/var/run/docker.sock".to_string()
-    }
-}
 
 #[cfg(test)]
 mod tests {

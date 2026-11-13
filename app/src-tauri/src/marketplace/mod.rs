@@ -557,16 +557,14 @@ pub fn spawn_project_sync(
     mgr: Arc<MarketplaceManager>,
     settings: AppSettings,
     project: Project,
-    container_id: String,
+    // The target the start just produced — not `ContainerTarget::for_project`:
+    // `project.container_id` is written after this is called, so it could name
+    // a container that was just replaced, or none at all.
+    container: ContainerTarget,
 ) {
     if !should_sync(&mgr, &settings, &project) {
         return;
     }
-    // phase 1b: lifecycle will hand out the target. Until then the start path
-    // only has the fresh container's id: `project.container_id` is written
-    // after this is called, so `ContainerTarget::for_project` could name a
-    // container that was just replaced, or none at all.
-    let container = ContainerTarget::docker(container_id);
     tauri::async_runtime::spawn(async move {
         let report = sync_project(&mgr, &settings, &project, &container).await;
         if !report.errors.is_empty() {

@@ -55,7 +55,8 @@
 
 use tauri::State;
 
-use crate::commands::project_commands::{create_container_for_project, emit_progress};
+use crate::commands::project_commands::emit_progress;
+use crate::docker::{create_container_for_project, default_docker_socket};
 use crate::docker;
 use crate::docker::migration::{self as mig, Recovery};
 use crate::models::{
@@ -1808,14 +1809,6 @@ pub(crate) async fn purge_migration_artifacts(project_id: &str) {
     // are meaningless and would otherwise sit in the migrations directory
     // forever.
     migration_store::clear_ownerless_for_project(project_id);
-}
-
-fn default_docker_socket() -> String {
-    if cfg!(target_os = "windows") {
-        "//./pipe/docker_engine".to_string()
-    } else {
-        "/var/run/docker.sock".to_string()
-    }
 }
 
 fn human_bytes(n: u64) -> String {

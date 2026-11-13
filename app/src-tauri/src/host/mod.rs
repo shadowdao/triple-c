@@ -26,6 +26,7 @@
 //! `no_container_interior_bollard_outside_the_host_layer` test pins which files
 //! may still do so.
 
+pub mod lifecycle;
 pub mod sessions;
 pub mod watch;
 
@@ -422,20 +423,11 @@ mod tests {
         assert_eq!(ContainerTarget::docker("abc").id(), "abc");
     }
 
-    /// Phase 1's boundary, pinned: outside `docker/` and `host/`, only the
-    /// files listed here may name bollard or `docker::exec`. Each entry is
-    /// Docker-only by nature (migration, snapshots, sidecars) or is scheduled
-    /// for phase 1b (lifecycle, the `die` event stream). Shrink this list; do
-    /// not grow it — new container-interior code goes through
-    /// [`ContainerTarget`].
-    #[test]
-    fn no_container_interior_bollard_outside_the_host_layer() {
-        const ALLOWED: &[&str] = &[
-            // Docker-only: base-image migration replays apt / restores a payload.
-            "commands/migration_commands.rs",
-        ];
+    /// Every non-`docker/`, non-`host/` source file, with its path relative to
+    /// `src/`, minus the files in `allowed`.
+    fn sources_outside_the_host_layer(allowed: &[&str]) -> Vec<(String, String)> {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut offenders = Vec::new();
+        let mut out = Vec::new();
         let mut stack = vec![src.clone()];
         while let Some(dir) = stack.pop() {
             for entry in std::fs::read_dir(&dir).unwrap() {
@@ -451,23 +443,83 @@ mod tests {
                     }
                     continue;
                 }
-                if !rel.ends_with(".rs") || ALLOWED.contains(&rel.as_str()) {
-                    continue;
-                }
-                let text = std::fs::read_to_string(&path).unwrap();
-                if text.contains("bollard::")
-                    || text.contains("docker::exec")
-                    || text.contains("get_docker")
-                {
-                    offenders.push(rel);
+                if rel.ends_with(".rs") && !allowed.contains(&rel.as_str()) {
+                    out.push((rel, std::fs::read_to_string(&path).unwrap()));
                 }
             }
         }
-        offenders.sort();
+        out.sort();
+        out
+    }
+
+    /// Docker-only by nature: base-image migration replays apt, restores a
+    /// payload, commits and swaps containers. It has no AWS meaning.
+    const DOCKER_ONLY: &[&str] = &["commands/migration_commands.rs"];
+
+    /// The host boundary, pinned: outside `docker/` and `host/`, nothing names
+    /// bollard or `docker::exec`. Container-interior code goes through
+    /// [`ContainerTarget`]. Shrink [`DOCKER_ONLY`]; do not grow it.
+    #[test]
+    fn no_container_interior_bollard_outside_the_host_layer() {
+        let offenders: Vec<String> = sources_outside_the_host_layer(DOCKER_ONLY)
+            .into_iter()
+            .filter(|(_, text)| {
+                text.contains("bollard::")
+                    || text.contains("docker::exec")
+                    || text.contains("get_docker")
+            })
+            .map(|(rel, _)| rel)
+            .collect();
         assert!(
             offenders.is_empty(),
             "these files reach into the container without going through host::ContainerTarget: {:?}",
             offenders
+        );
+    }
+
+    /// The lifecycle half of the boundary: outside `docker/` and `host/`, no
+    /// non-test code creates, starts, stops, finds or recreates a container
+    /// itself (that is [`lifecycle::ProjectHost`]'s job), and none builds a
+    /// [`ContainerTarget::docker`] from a bare id, which would hard-code the
+    /// host. Comments and `#[cfg(test)]` code are not checked.
+    ///
+    /// `docker::remove_container` is deliberately absent: startup's
+    /// pending-cleanup retry removes Docker leftovers it recorded *by name*,
+    /// which is Docker housekeeping, not lifecycle.
+    #[test]
+    fn no_container_lifecycle_or_bare_docker_targets_outside_the_host_layer() {
+        const BANNED: &[&str] = &[
+            "docker::create_container(",
+            "docker::start_container(",
+            "docker::stop_container(",
+            "docker::find_existing_container(",
+            "docker::container_needs_recreation(",
+            "docker::commit_container_snapshot(",
+            "docker::remove_snapshot_image(",
+            "docker::remove_project_volumes(",
+            "docker::is_container_running(",
+            "container::is_container_running(",
+            "ContainerTarget::docker(",
+        ];
+        let mut offenders = Vec::new();
+        for (rel, text) in sources_outside_the_host_layer(DOCKER_ONLY) {
+            let code = text.split("#[cfg(test)]").next().unwrap_or("");
+            for (n, line) in code.lines().enumerate() {
+                let line = line.trim_start();
+                if line.starts_with("//") {
+                    continue;
+                }
+                for pat in BANNED {
+                    if line.contains(pat) {
+                        offenders.push(format!("{}:{}: {}", rel, n + 1, pat));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "container lifecycle / bare Docker targets outside host::lifecycle:\n{}",
+            offenders.join("\n")
         );
     }
 }

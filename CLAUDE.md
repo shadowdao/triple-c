@@ -287,10 +287,14 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   wraps execs, file transfer and `is_running`; `sessions.rs` holds `ExecSessionManager`.
   **Container-interior code must go through `ContainerTarget`, never `docker::exec`, bollard or
   `get_docker()`** — `host::tests::no_container_interior_bollard_outside_the_host_layer` fails
-  the build on it. Its allowlist is Docker-only code (migration) plus lifecycle/`die` events,
-  which phase 1b moves; shrink it, never grow it. Prefer `ContainerTarget::for_project` or a
-  target a session already holds (`ExecSessionManager::get_target`) over
-  `ContainerTarget::docker(id)`, which hard-codes the host.
+  the build on it. `lifecycle.rs`'s `ProjectHost` owns create/start/stop/find/remove and
+  discarding a project's persistent state; the project commands keep only host-neutral steps
+  (validation, status, sessions, auth bridge, syncs). `watch.rs` gives `container_watch` its
+  death reports and positive-exit check. `no_container_lifecycle_or_bare_docker_targets_outside_the_host_layer`
+  fails on lifecycle calls or `ContainerTarget::docker(id)` in non-test code outside `host/` and
+  `docker/`; get a target from `ContainerTarget::for_project`, `ProjectHost`, or a session
+  (`ExecSessionManager::get_target`). Base-image migration is the one Docker-only exception
+  (`DOCKER_ONLY`); shrink it, never grow it.
 - **`web_terminal/`** — Remote terminal access via axum HTTP+WebSocket server:
   - `server.rs` — Axum server lifecycle (start/stop), serves embedded HTML and handles WS upgrades
   - `ws_handler.rs` — Per-connection WebSocket handler with JSON protocol, session management, cleanup on disconnect

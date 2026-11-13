@@ -9,6 +9,7 @@ use sha2::{Sha256, Digest};
 
 use super::ca_certs;
 use super::client::get_docker;
+use crate::models::AppSettings;
 use crate::models::{Backend, BedrockAuthMethod, ClaudeCodeSettings, ContainerInfo, EnvVar, GlobalAwsSettings, GlobalLlamaCppSettings, GlobalOllamaSettings, GlobalOpenAiCompatibleSettings, PortMapping, Project, ProjectPath};
 
 const SCHEDULER_INSTRUCTIONS: &str = r#"## Scheduled Tasks
@@ -2015,7 +2016,7 @@ pub const CONFIG_VOLUME_PREFIX: &str = "triple-c-claude-config-";
 /// `aws_config_path` is configured), since the entrypoint already refreshes
 /// `~/.aws` from the host on every start in that case.
 pub async fn sync_bedrock_credentials(
-    container_id: &str,
+    target: &crate::host::ContainerTarget,
     project: &Project,
 ) -> Result<(), String> {
     let static_bedrock = if project.backend == Backend::Bedrock {
@@ -2038,10 +2039,10 @@ pub async fn sync_bedrock_credentials(
             let script = r#"if [ ! -d /tmp/.host-aws ]; then rm -f "$HOME/.aws/credentials"; fi"#;
             let cmd = vec!["sh".to_string(), "-c".to_string(), script.to_string()];
             let env = vec!["HOME=/home/claude".to_string()];
-            if let Err(e) = crate::docker::exec::exec_oneshot_env(container_id, cmd, env).await {
+            if let Err(e) = target.exec_oneshot_env(cmd, env).await {
                 log::warn!(
                     "Failed to clear stale AWS credentials in container {}: {}",
-                    container_id,
+                    target.id(),
                     e
                 );
             }
@@ -2093,7 +2094,7 @@ chmod 600 "$HOME/.aws/credentials""#;
 
     let cmd = vec!["sh".to_string(), "-c".to_string(), script.to_string()];
     let (output, exit_code) =
-        crate::docker::exec::exec_oneshot_env_status(container_id, cmd, env)
+        target.exec_oneshot_env_status(cmd, env)
             .await
             .map_err(|e| format!("Failed to write AWS credentials into container: {}", e))?;
     if exit_code != 0 {
@@ -2104,7 +2105,7 @@ chmod 600 "$HOME/.aws/credentials""#;
         ));
     }
 
-    log::info!("Wrote Bedrock static credentials into container {}", container_id);
+    log::info!("Wrote Bedrock static credentials into container {}", target.id());
     Ok(())
 }
 
@@ -4142,6 +4143,49 @@ pub async fn is_container_running(container_id: &str) -> Result<bool, String> {
     }
 }
 
+
+
+/// Create the project's container, threading every global setting through.
+///
+/// Exists so that the ordinary create paths (`host::lifecycle`) and base-image migration
+/// cannot drift apart — a container created by a migration must be
+/// indistinguishable from one created by a normal start, or the next
+/// `container_needs_recreation` would immediately throw it away.
+///
+/// `create_image` is what to create *from* (the snapshot or the base);
+/// `base_image_name` is the configured base, which `create_container` needs in
+/// order to tell those two apart when it stamps the lineage labels.
+pub async fn create_container_for_project(
+    project: &Project,
+    settings: &AppSettings,
+    docker_socket: &str,
+    aws_config_path: Option<&str>,
+    create_image: &str,
+    base_image_name: &str,
+    extras: CreateExtras<'_>,
+) -> Result<String, String> {
+    create_container(
+        project,
+        docker_socket,
+        create_image,
+        base_image_name,
+        extras,
+        aws_config_path,
+        &settings.global_aws,
+        &settings.global_ollama,
+        &settings.global_llamacpp,
+        &settings.global_openai_compatible,
+        settings.global_claude_instructions.as_deref(),
+        &settings.global_custom_env_vars,
+        settings.timezone.as_deref(),
+        settings.global_claude_code_settings.as_ref(),
+        settings.default_ssh_key_path.as_deref(),
+        settings.ca_cert_path.as_deref(),
+        settings.default_git_user_name.as_deref(),
+        settings.default_git_user_email.as_deref(),
+    )
+    .await
+}
 
 #[cfg(test)]
 mod tests {
