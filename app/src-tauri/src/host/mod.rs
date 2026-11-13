@@ -7,8 +7,9 @@
 //! "is it running" — goes through [`ContainerTarget`] instead of naming
 //! `docker::exec` or bollard directly. Today the only variant is
 //! [`ContainerTarget::Docker`], which delegates to the existing code in
-//! `docker/exec.rs` and `docker/container.rs` with no change in behaviour. An
-//! AWS variant (reached through the in-container agent) slots in beside it.
+//! `docker/exec.rs` and `docker/container.rs` with no change in behaviour.
+//! [`ContainerTarget::Agent`] reaches a container through the in-container
+//! `triple-c-agent` instead (`agent.rs`), which is how the AWS host will get in.
 //!
 //! ## Why an enum and not a trait object
 //!
@@ -26,6 +27,7 @@
 //! `no_container_interior_bollard_outside_the_host_layer` test pins which files
 //! may still do so.
 
+pub mod agent;
 pub mod lifecycle;
 pub mod sessions;
 pub mod watch;
@@ -33,6 +35,7 @@ pub mod watch;
 pub use crate::docker::exec::{
     MAX_DROP_BYTES, OUTPUT_LIMIT_MARKER, PROC_NET_OUTPUT_LIMIT,
 };
+pub use agent::AgentEndpoint;
 pub use sessions::ExecSessionManager;
 
 use bytes::Bytes;
@@ -132,6 +135,12 @@ pub type ArchiveStream = Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send
 pub enum ContainerTarget {
     /// A container on the local Docker daemon, by id or name.
     Docker { container_id: String },
+    /// A container reached through the in-container `triple-c-agent`
+    /// (`host/agent.rs`; protocol in
+    /// `docs/superpowers/specs/2026-11-13-triple-c-agent-protocol.md`). Used
+    /// by the AWS host (later) and the local agent harness. The host that
+    /// runs the container, not this target, owns its lifecycle.
+    Agent(AgentEndpoint),
 }
 
 impl ContainerTarget {
@@ -151,6 +160,7 @@ impl ContainerTarget {
     pub fn id(&self) -> &str {
         match self {
             ContainerTarget::Docker { container_id } => container_id,
+            ContainerTarget::Agent(ep) => ep.base_url.as_str(),
         }
     }
 
@@ -163,6 +173,7 @@ impl ContainerTarget {
             ContainerTarget::Docker { container_id } => {
                 docker::container::is_container_running(container_id).await
             }
+            ContainerTarget::Agent(ep) => agent::is_running(ep).await,
         }
     }
 
@@ -175,6 +186,9 @@ impl ContainerTarget {
             ContainerTarget::Docker { container_id } => {
                 docker::exec::exec_oneshot(container_id, cmd).await
             }
+            ContainerTarget::Agent(ep) => agent::exec_oneshot_as(ep, "claude", cmd, Vec::new())
+                .await
+                .map(|(out, _)| out),
         }
     }
 
@@ -187,6 +201,9 @@ impl ContainerTarget {
             ContainerTarget::Docker { container_id } => {
                 docker::exec::exec_oneshot_env(container_id, cmd, env).await
             }
+            ContainerTarget::Agent(ep) => agent::exec_oneshot_as(ep, "claude", cmd, env)
+                .await
+                .map(|(out, _)| out),
         }
     }
 
@@ -199,6 +216,7 @@ impl ContainerTarget {
             ContainerTarget::Docker { container_id } => {
                 docker::exec::exec_oneshot_env_status(container_id, cmd, env).await
             }
+            ContainerTarget::Agent(ep) => agent::exec_oneshot_as(ep, "claude", cmd, env).await,
         }
     }
 
@@ -212,6 +230,7 @@ impl ContainerTarget {
             ContainerTarget::Docker { container_id } => {
                 docker::exec::exec_oneshot_as(container_id, user, cmd, env).await
             }
+            ContainerTarget::Agent(ep) => agent::exec_oneshot_as(ep, user, cmd, env).await,
         }
     }
 
@@ -224,6 +243,9 @@ impl ContainerTarget {
         match self {
             ContainerTarget::Docker { container_id } => {
                 docker::exec::exec_oneshot_limited(container_id, user, cmd, limit).await
+            }
+            ContainerTarget::Agent(ep) => {
+                agent::exec_oneshot_limited(ep, user, cmd, Vec::new(), limit).await
             }
         }
     }
@@ -239,6 +261,7 @@ impl ContainerTarget {
             ContainerTarget::Docker { container_id } => {
                 docker::exec::exec_oneshot_streams_as(container_id, user, cmd, env).await
             }
+            ContainerTarget::Agent(ep) => agent::exec_oneshot_streams_as(ep, user, cmd, env).await,
         }
     }
 
@@ -249,6 +272,7 @@ impl ContainerTarget {
             ContainerTarget::Docker { container_id } => {
                 docker::exec::exec_detached(container_id, &spec).await
             }
+            ContainerTarget::Agent(ep) => agent::exec_detached(ep, &spec).await,
         }
     }
 
@@ -264,6 +288,7 @@ impl ContainerTarget {
             ContainerTarget::Docker { container_id } => {
                 docker::exec::create_attached_exec_spec(container_id, &spec).await
             }
+            ContainerTarget::Agent(ep) => agent::attach(ep, &spec).await,
         }
     }
 
@@ -272,12 +297,14 @@ impl ContainerTarget {
     pub async fn wait_exec_exit(&self, exec_id: &str) -> Option<i64> {
         match self {
             ContainerTarget::Docker { .. } => docker::exec::wait_for_exec_exit(exec_id).await,
+            ContainerTarget::Agent(ep) => agent::wait_exec_exit(ep, exec_id).await,
         }
     }
 
     pub async fn resize_exec(&self, exec_id: &str, cols: u16, rows: u16) -> Result<(), String> {
         match self {
             ContainerTarget::Docker { .. } => docker::exec::resize_exec(exec_id, cols, rows).await,
+            ContainerTarget::Agent(ep) => agent::resize_exec(ep, exec_id, cols, rows).await,
         }
     }
 
@@ -289,6 +316,7 @@ impl ContainerTarget {
             ContainerTarget::Docker { container_id } => {
                 docker::exec::container_user_ids(container_id).await
             }
+            ContainerTarget::Agent(ep) => agent::user_ids(ep).await,
         }
     }
 
@@ -310,6 +338,9 @@ impl ContainerTarget {
                     mode,
                 )
                 .await
+            }
+            ContainerTarget::Agent(ep) => {
+                agent::upload_bytes_with_ids(ep, dest_dir, file_name, data, mode, (0, 0)).await
             }
         }
     }
@@ -335,6 +366,9 @@ impl ContainerTarget {
                 )
                 .await
             }
+            ContainerTarget::Agent(ep) => {
+                agent::upload_bytes_with_ids(ep, dest_dir, file_name, data, mode, ids).await
+            }
         }
     }
 
@@ -354,6 +388,10 @@ impl ContainerTarget {
                     dest_name,
                 )
                 .await
+            }
+            ContainerTarget::Agent(ep) => {
+                let ids = agent::user_ids(ep).await;
+                agent::upload_host_file_with_ids(ep, host_path, dest_dir, dest_name, ids).await
             }
         }
     }
@@ -377,6 +415,9 @@ impl ContainerTarget {
                 )
                 .await
             }
+            ContainerTarget::Agent(ep) => {
+                agent::upload_host_file_with_ids(ep, host_path, dest_dir, dest_name, ids).await
+            }
         }
     }
 
@@ -387,6 +428,7 @@ impl ContainerTarget {
             ContainerTarget::Docker { container_id } => {
                 docker::exec::download_archive(container_id, path)
             }
+            ContainerTarget::Agent(ep) => agent::download_archive(ep, path),
         }
     }
 }

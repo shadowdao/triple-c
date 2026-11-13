@@ -283,8 +283,12 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
     feature (containers labelled `triple-c.mcp-server`, `triple-c-net-*` networks). Deletable once
     users have migrated.
 - **`host/`** — Where a project's container runs, and the only way into it. `ContainerTarget`
-  (one `Docker` variant today; AWS planned — `docs/superpowers/specs/2026-11-13-aws-ecs-host-design.md`)
+  (`Docker`, and `Agent` — reached through the in-container `triple-c-agent` by `agent.rs`, per
+  `docs/superpowers/specs/2026-11-13-triple-c-agent-protocol.md`; AWS planned —
+  `docs/superpowers/specs/2026-11-13-aws-ecs-host-design.md`)
   wraps execs, file transfer and `is_running`; `sessions.rs` holds `ExecSessionManager`.
+  `agent.rs` reuses `docker/exec.rs`'s `OneshotOutput`, host-file reader and uid probe so the two
+  variants cannot drift; an `Agent` target's token never appears in `Debug` or error text.
   **Container-interior code must go through `ContainerTarget`, never `docker::exec`, bollard or
   `get_docker()`** — `host::tests::no_container_interior_bollard_outside_the_host_layer` fails
   the build on it. `lifecycle.rs`'s `ProjectHost` owns create/start/stop/find/remove and

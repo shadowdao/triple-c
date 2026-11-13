@@ -6642,6 +6642,8 @@ dependencies = [
  "tauri-plugin-opener",
  "tempfile",
  "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
  "tower-http",
  "url",
  "uuid",

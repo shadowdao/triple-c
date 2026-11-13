@@ -33,6 +33,13 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 iana-time-zone = "0.1"
 sha2 = "0.10"
 axum = { version = "0.8", features = ["ws"] }
+# Client side of triple-c-agent's two WebSocket endpoints (host/agent.rs). The
+# same version axum's `ws` already pulls in; plain ws:// only (the transport is
+# loopback or an SSM port-forward), so no TLS features.
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect"] }
+# `PollSender`: the agent attach's stdin `AsyncWrite` over a bounded channel.
+# Already in the tree through tokio's ecosystem.
+tokio-util = "0.7"
 tower-http = { version = "0.6", features = ["cors"] }
 base64 = "0.22"
 rand = "0.9"
