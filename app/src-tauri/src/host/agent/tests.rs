@@ -558,3 +558,73 @@ async fn is_running_follows_whether_the_agent_answers() {
     // Silence is not a positive exit.
     assert!(!gone.has_exited().await);
 }
+
+// ── a hostile agent ──────────────────────────────────────────────────────────
+// The agent runs inside the container, which is not trusted with the host.
+
+/// Serve `app` on an ephemeral loopback port; return the port.
+async fn serve(app: Router) -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    port
+}
+
+#[tokio::test]
+async fn a_redirect_from_the_agent_is_not_followed() {
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let elsewhere = {
+        let hits = hits.clone();
+        serve(Router::new().fallback(move || {
+            let hits = hits.clone();
+            async move {
+                hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                "followed"
+            }
+        }))
+        .await
+    };
+    let to = format!("http://127.0.0.1:{}/anything", elsewhere);
+    let agent = serve(Router::new().fallback(move || {
+        let to = to.clone();
+        async move { (StatusCode::TEMPORARY_REDIRECT, [(axum::http::header::LOCATION, to)]) }
+    }))
+    .await;
+    let t = ContainerTarget::Agent(AgentEndpoint::loopback(agent, TOKEN));
+
+    assert!(t.exec_detached(ExecSpec::new(cmd("true"))).await.is_err());
+    assert!(t.exec_oneshot(cmd("true")).await.is_err());
+    assert!(t.is_running().await.is_err(), "a 3xx health answer is not 'running'");
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0, "the client followed a redirect");
+}
+
+#[tokio::test]
+async fn an_oversized_error_body_is_neither_buffered_nor_passed_through_whole() {
+    // 8 MiB of error text: past the small-body cap, so it is not even parsed.
+    let huge = serve(Router::new().fallback(|| async {
+        let body = json!({ "error": "x".repeat(8 * 1024 * 1024) });
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(body))
+    }))
+    .await;
+    let e = ContainerTarget::Agent(AgentEndpoint::loopback(huge, TOKEN))
+        .exec_detached(ExecSpec::new(cmd("true")))
+        .await
+        .unwrap_err();
+    assert!(e.len() < 1024, "error was {} bytes", e.len());
+    assert!(e.contains("500"), "{e}");
+
+    // Under the body cap but long: parsed, then cut to the display cap.
+    let long = serve(Router::new().fallback(|| async {
+        let body = json!({ "error": "é".repeat(20 * 1024) });
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(body))
+    }))
+    .await;
+    let e = ContainerTarget::Agent(AgentEndpoint::loopback(long, TOKEN))
+        .exec_detached(ExecSpec::new(cmd("true")))
+        .await
+        .unwrap_err();
+    assert!(e.len() <= 4 * 1024 + 64, "error was {} bytes", e.len());
+    assert!(e.ends_with('…'), "{e}");
+}

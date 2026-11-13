@@ -127,6 +127,11 @@ fn http() -> &'static reqwest::Client {
         reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .no_proxy()
+            // The agent lives inside the container, which is not trusted with
+            // the host: a redirect would let it point this client — running in
+            // the host app — at any other URL. A 3xx is an error (it fails the
+            // `is_success` checks like any other non-2xx).
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("a reqwest client with no TLS config always builds")
     })
@@ -137,9 +142,33 @@ struct ErrorBody {
     error: String,
 }
 
-/// The agent's `{"error": …}` text, if the body has one.
+/// Ceiling on any small JSON body from the agent (errors, exec ids, exec
+/// status). The agent is inside the container, so a body it sends must not be
+/// able to grow host memory without bound; real ones are tens of bytes.
+const SMALL_BODY_CAP: usize = 64 * 1024;
+
+/// Ceiling on error text passed through to the UI.
+const ERROR_TEXT_CAP: usize = 4 * 1024;
+
+/// Parse a small JSON body, reading at most [`SMALL_BODY_CAP`] bytes.
+async fn small_json<T: serde::de::DeserializeOwned>(resp: reqwest::Response) -> Option<T> {
+    let raw = read_capped(resp, SMALL_BODY_CAP).await.ok()??;
+    serde_json::from_slice(&raw).ok()
+}
+
+/// The agent's `{"error": …}` text, if the body has one — bounded in both
+/// bytes read and length returned.
 async fn error_text(resp: reqwest::Response) -> Option<String> {
-    resp.json::<ErrorBody>().await.ok().map(|b| b.error)
+    let mut e = small_json::<ErrorBody>(resp).await?.error;
+    if e.len() > ERROR_TEXT_CAP {
+        let mut cut = ERROR_TEXT_CAP;
+        while !e.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        e.truncate(cut);
+        e.push('…');
+    }
+    Some(e)
 }
 
 /// `"<context>: <why>"` for a non-success response.
@@ -328,10 +357,10 @@ pub async fn exec_detached(ep: &AgentEndpoint, spec: &ExecSpec) -> Result<String
     if !resp.status().is_success() {
         return Err(status_error(CONTEXT, resp).await);
     }
-    resp.json::<ExecIdResponse>()
+    small_json::<ExecIdResponse>(resp)
         .await
         .map(|r| r.exec_id)
-        .map_err(|e| format!("{}: malformed agent response: {}", CONTEXT, e))
+        .ok_or_else(|| format!("{}: malformed agent response", CONTEXT))
 }
 
 #[derive(Deserialize)]
@@ -401,7 +430,7 @@ pub async fn wait_exec_exit(ep: &AgentEndpoint, exec_id: &str) -> Option<i64> {
         if !resp.status().is_success() {
             return None;
         }
-        let status: ExecStatus = resp.json().await.ok()?;
+        let status: ExecStatus = small_json(resp).await?;
         if !status.running {
             return status.exit_code;
         }
