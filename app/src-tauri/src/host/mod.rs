@@ -27,6 +27,7 @@
 //! may still do so.
 
 pub mod sessions;
+pub mod watch;
 
 pub use crate::docker::exec::{
     MAX_DROP_BYTES, OUTPUT_LIMIT_MARKER, PROC_NET_OUTPUT_LIMIT,
@@ -432,8 +433,6 @@ mod tests {
         const ALLOWED: &[&str] = &[
             // Docker-only: base-image migration replays apt / restores a payload.
             "commands/migration_commands.rs",
-            // Phase 1b: lifecycle and the `die` event stream.
-            "container_watch.rs",
         ];
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut offenders = Vec::new();

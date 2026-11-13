@@ -1,5 +1,6 @@
 pub mod ca_certs;
 pub mod client;
+pub mod events;
 pub mod container;
 pub mod image;
 pub mod exec;
