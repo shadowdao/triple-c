@@ -277,12 +277,7 @@ impl PlaywrightDetection {
 /// Playwright installed with `npm i -g`, or merely *run* once through
 /// `npx @playwright/mcp`, is found as readily as one in
 /// `/workspace/node_modules`.
-pub async fn detect(container_id: &str) -> Result<PlaywrightDetection, String> {
-    detect_in(&ContainerTarget::docker(container_id)).await
-}
-
-/// [`detect`] against a target already in hand.
-pub async fn detect_in(container: &ContainerTarget) -> Result<PlaywrightDetection, String> {
+pub async fn detect(container: &ContainerTarget) -> Result<PlaywrightDetection, String> {
     let output = container
         .exec_oneshot(vec![
             "node".to_string(),

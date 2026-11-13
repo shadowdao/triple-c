@@ -26,6 +26,7 @@ use crate::models::marketplace::{
     effective_installs, CatalogItem, ItemKind, ItemUpdate, Marketplace, MarketplaceInstall, MarketplaceSnapshot,
     SyncReport,
 };
+use crate::host::ContainerTarget;
 use crate::models::{AppSettings, Project};
 use catalog::{item_fingerprint, parse_catalog};
 use tree::GitTree;
@@ -505,7 +506,7 @@ pub async fn sync_project(
     mgr: &MarketplaceManager,
     settings: &AppSettings,
     project: &Project,
-    container_id: &str,
+    container: &ContainerTarget,
 ) -> SyncReport {
     let lock = mgr.sync_lock(&project.id);
     let _sync_guard = lock.lock().await;
@@ -533,7 +534,7 @@ pub async fn sync_project(
                 items,
                 p.skipped.len()
             );
-            let result = sync::sync_container(container_id, &p).await;
+            let result = sync::sync_container(container, &p).await;
             sync::with_payload_skips(sync::report_from_result(result), &p.skipped)
         }
         Err(e) => sync::report_from_result(Err(e)),
@@ -561,8 +562,13 @@ pub fn spawn_project_sync(
     if !should_sync(&mgr, &settings, &project) {
         return;
     }
+    // phase 1b: lifecycle will hand out the target. Until then the start path
+    // only has the fresh container's id: `project.container_id` is written
+    // after this is called, so `ContainerTarget::for_project` could name a
+    // container that was just replaced, or none at all.
+    let container = ContainerTarget::docker(container_id);
     tauri::async_runtime::spawn(async move {
-        let report = sync_project(&mgr, &settings, &project, &container_id).await;
+        let report = sync_project(&mgr, &settings, &project, &container).await;
         if !report.errors.is_empty() {
             log::warn!(
                 "Marketplace sync for project {} reported errors: {:?}",
@@ -1132,9 +1138,10 @@ mod tests {
 
         let lock = mgr.sync_lock(&project.id);
         let guard = lock.lock().await;
+        let nowhere = ContainerTarget::docker("no-such-container");
         let blocked = tokio::time::timeout(
             std::time::Duration::from_millis(300),
-            sync_project(&mgr, &settings, &project, "no-such-container"),
+            sync_project(&mgr, &settings, &project, &nowhere),
         )
         .await;
         assert!(blocked.is_err(), "sync must wait while another sync holds the lock");
@@ -1143,7 +1150,7 @@ mod tests {
 
         // No Docker (or no such container) here: the failure becomes a stored
         // report instead of an error.
-        let report = sync_project(&mgr, &settings, &project, "no-such-container").await;
+        let report = sync_project(&mgr, &settings, &project, &nowhere).await;
         assert_eq!(report.errors.len(), 1, "{report:?}");
         assert!(!report.finished_at.is_empty());
         assert_eq!(mgr.report(&project.id), Some(report));

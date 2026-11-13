@@ -5,6 +5,7 @@
 use tauri::{AppHandle, State};
 
 use crate::auth_bridge::AuthBridgeStatus;
+use crate::host::ContainerTarget;
 use crate::AppState;
 
 /// Turn the bridge on or off for a project and return the resulting status.
@@ -29,16 +30,13 @@ pub async fn set_auth_bridge_enabled(
             .projects_store
             .get(&project_id)
             .ok_or_else(|| format!("Project {} not found", project_id))?;
-        if let Some(container_id) = project.container_id {
-            if crate::docker::container::is_container_running(&container_id)
-                .await
-                .unwrap_or(false)
-            {
+        if let Some(container) = ContainerTarget::for_project(&project) {
+            if container.is_running().await.unwrap_or(false) {
                 state
                     .auth_bridge
                     .start(
                         project_id.clone(),
-                        container_id,
+                        container,
                         app_handle,
                         state.projects_store.clone(),
                     )

@@ -1491,7 +1491,8 @@ async fn start_project_container_locked(
             .auth_bridge
             .start(
                 project_id.clone(),
-                container_id.clone(),
+                // phase 1b: lifecycle will hand out the target
+                crate::host::ContainerTarget::docker(container_id.clone()),
                 app_handle.clone(),
                 state.projects_store.clone(),
             )
@@ -1695,12 +1696,12 @@ pub async fn reconcile_project_statuses(
             // bridge lives in this process, so re-arm it here. `start` is
             // idempotent, so a bridge that is already polling is untouched.
             if project.auth_bridge_enabled {
-                if let Some(ref container_id) = project.container_id {
+                if let Some(target) = crate::host::ContainerTarget::for_project(&project) {
                     state
                         .auth_bridge
                         .start(
                             project.id.clone(),
-                            container_id.clone(),
+                            target,
                             app_handle.clone(),
                             state.projects_store.clone(),
                         )

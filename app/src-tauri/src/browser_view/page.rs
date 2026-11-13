@@ -91,7 +91,7 @@ pub struct PageState {
 pub async fn open(
     app: &AppHandle,
     project_id: &str,
-    container_id: &str,
+    container: &ContainerTarget,
     detection: &PlaywrightDetection,
     url: &str,
     viewport: Viewport,
@@ -115,17 +115,17 @@ pub async fn open(
     // Reuse a helper that is already up. Relaunching would throw away the
     // browser's cookies and storage — which for the auth case means signing in
     // again to reach the second page, having just signed in on the first.
-    if state(container_id).await.ready {
+    if state(container).await.ready {
         emit_progress(app, project_id, "Navigating the container's browser…");
-        set_viewport(container_id, viewport).await?;
-        navigate(container_id, url).await?;
-        if let Some(state) = wait_for_url(container_id, url).await {
+        set_viewport(container, viewport).await?;
+        navigate(container, url).await?;
+        if let Some(state) = wait_for_url(container, url).await {
             return Ok(state);
         }
         // It stopped answering; fall through and start a fresh one.
     }
 
-    close(container_id).await;
+    close(container).await;
     // Cold start: a browser launch plus a page load, which is the several
     // seconds the user would otherwise spend wondering whether the click
     // registered.
@@ -150,7 +150,7 @@ pub async fn open(
         shell_quote(&script),
         HELPER_LOG
     );
-    ContainerTarget::docker(container_id)
+    container
         .exec_oneshot_as(
             "claude",
             vec!["sh".to_string(), "-c".to_string(), launcher],
@@ -160,36 +160,36 @@ pub async fn open(
         .map_err(|e| format!("Could not start the browser helper: {}", e))?;
 
     emit_progress(app, project_id, "Waiting for the page to load…");
-    wait_until_ready(container_id).await
+    wait_until_ready(container).await
 }
 
 /// Resize the open page. Cheap enough to call from a window-resize handler.
-pub async fn set_viewport(container_id: &str, viewport: Viewport) -> Result<(), String> {
+pub async fn set_viewport(container: &ContainerTarget, viewport: Viewport) -> Result<(), String> {
     write_control(
-        container_id,
+        container,
         serde_json::json!({ "viewport": viewport }).to_string(),
     )
     .await
 }
 
 /// Navigate the open page without relaunching the browser.
-pub async fn navigate(container_id: &str, url: &str) -> Result<(), String> {
-    write_control(container_id, serde_json::json!({ "url": url }).to_string()).await
+pub async fn navigate(container: &ContainerTarget, url: &str) -> Result<(), String> {
+    write_control(container, serde_json::json!({ "url": url }).to_string()).await
 }
 
 /// Ask the helper to shut down. Best effort: a container that has none is the
 /// normal case, and the caller is usually about to start one anyway.
-pub async fn close(container_id: &str) {
-    let _ = write_control(container_id, serde_json::json!({ "close": true }).to_string()).await;
+pub async fn close(container: &ContainerTarget) {
+    let _ = write_control(container, serde_json::json!({ "close": true }).to_string()).await;
 }
 
 /// Current state, or a default when no helper has ever run here.
-pub async fn state(container_id: &str) -> PageState {
+pub async fn state(container: &ContainerTarget) -> PageState {
     let script = format!(
         "try{{process.stdout.write(require('fs').readFileSync('{}','utf8'));}}catch(e){{}}",
         STATE_PATH
     );
-    let Ok((out, _)) = ContainerTarget::docker(container_id)
+    let Ok((out, _)) = container
         .exec_oneshot_as(
             "claude",
             vec!["node".to_string(), "-e".to_string(), script],
@@ -204,12 +204,12 @@ pub async fn state(container_id: &str) -> PageState {
 
 /// Write the control file through Node rather than a shell redirect, so a URL
 /// is never interpreted by `sh`.
-async fn write_control(container_id: &str, json: String) -> Result<(), String> {
+async fn write_control(container: &ContainerTarget, json: String) -> Result<(), String> {
     let script = format!(
         "require('fs').writeFileSync('{}',process.argv[1]);",
         CONTROL_PATH
     );
-    ContainerTarget::docker(container_id)
+    container
         .exec_oneshot_as(
             "claude",
             vec!["node".to_string(), "-e".to_string(), script, json],
@@ -225,10 +225,10 @@ async fn write_control(container_id: &str, json: String) -> Result<(), String> {
 /// Bounded much tighter than a cold start: the browser is already up, so this
 /// is one navigation. `None` means it stopped answering, and the caller starts
 /// a fresh helper rather than reporting a page that isn't there.
-async fn wait_for_url(container_id: &str, url: &str) -> Option<PageState> {
+async fn wait_for_url(container: &ContainerTarget, url: &str) -> Option<PageState> {
     let deadline = std::time::Instant::now() + REUSE_TIMEOUT;
     loop {
-        let state = state(container_id).await;
+        let state = state(container).await;
         if state.ready && state.url.as_deref() == Some(url) {
             return Some(state);
         }
@@ -240,10 +240,10 @@ async fn wait_for_url(container_id: &str, url: &str) -> Option<PageState> {
 }
 
 /// Poll the state file until the helper says the page is up, or says why not.
-async fn wait_until_ready(container_id: &str) -> Result<PageState, String> {
+async fn wait_until_ready(container: &ContainerTarget) -> Result<PageState, String> {
     let deadline = std::time::Instant::now() + READY_TIMEOUT;
     loop {
-        let state = state(container_id).await;
+        let state = state(container).await;
         if let Some(error) = state.error.clone() {
             return Err(error);
         }

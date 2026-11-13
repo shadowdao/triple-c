@@ -177,7 +177,7 @@ impl AuthBridgeManager {
     pub async fn start(
         &self,
         project_id: String,
-        container_id: String,
+        container: ContainerTarget,
         app: AppHandle,
         store: Arc<ProjectsStore>,
     ) {
@@ -199,12 +199,12 @@ impl AuthBridgeManager {
         log::info!(
             "Auth bridge: starting for project {} (container {})",
             project_id,
-            &container_id[..container_id.len().min(12)]
+            &container.id()[..container.id().len().min(12)]
         );
 
         let poller = tokio::spawn(poll_loop(
             project_id.clone(),
-            ContainerTarget::docker(container_id),
+            container,
             epoch,
             app,
             store,

@@ -131,12 +131,12 @@ pub fn parse_probe_output(stdout: &str) -> Vec<String> {
 }
 
 pub async fn probe_candidates(
-    container_id: &str,
+    container: &ContainerTarget,
     candidates: &[String],
 ) -> Result<Vec<String>, String> {
     let mut cmd: Vec<String> = vec!["sh".into(), "-c".into(), PROBE_SCRIPT.into(), "probe".into()];
     cmd.extend(candidates.iter().cloned());
-    let (stdout, _stderr, _code) = ContainerTarget::docker(container_id)
+    let (stdout, _stderr, _code) = container
         .exec_oneshot_streams_as("claude", cmd, Vec::new())
         .await?;
     Ok(parse_probe_output(&stdout))

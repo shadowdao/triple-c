@@ -1202,15 +1202,12 @@ pub(crate) struct FetchedFile {
 /// file — or the whole *directory tree*, since the type check happens after the
 /// read — landed in host RAM twice. This function buffers, so every caller of
 /// it must name a ceiling.
-///
-/// Takes a container id rather than a [`ContainerTarget`] because the file
-/// viewer's commands call it with the id they already hold.
 pub(crate) async fn fetch_container_file(
-    container_id: &str,
+    container: &ContainerTarget,
     container_path: &str,
     max_bytes: u64,
 ) -> Result<FetchedFile, String> {
-    let mut stream = ContainerTarget::docker(container_id).download_archive(container_path);
+    let mut stream = container.download_archive(container_path);
 
     // A tar member is a 512-byte header plus payload padded to 512. 8 KiB of
     // slack past the payload cap guarantees the header and the whole capped
@@ -1297,7 +1294,7 @@ pub async fn read_container_file(
         .ok_or_else(|| "Container not running".to_string())?;
 
     let cap = max_bytes.unwrap_or(MAX_READ_BYTES).min(MAX_READ_BYTES);
-    let fetched = fetch_container_file(target.id(), &path, cap).await?;
+    let fetched = fetch_container_file(&target, &path, cap).await?;
 
     Ok(FileContents {
         contents_base64: BASE64.encode(&fetched.bytes),
@@ -1451,14 +1448,14 @@ pub(crate) fn not_running_message(action: &str, why: &str) -> String {
 /// upload it surfaces even less usefully: `resolve_container_dir`'s `realpath`
 /// is the first thing to touch the container, so a stopped project fails inside
 /// path *validation* and reads like the path was the problem.
-///
-/// Takes a container id rather than a [`ContainerTarget`] because the file
-/// viewer's commands call it with the id they already hold.
-pub(crate) async fn require_running(container_id: &str, action: &str) -> Result<(), String> {
+pub(crate) async fn require_running(
+    container: &ContainerTarget,
+    action: &str,
+) -> Result<(), String> {
     // An unreachable daemon is an error; an inspect failure (container gone)
     // reads as "not running" — `is_running`'s contract, and what this did
     // when it inspected the container itself.
-    let running = ContainerTarget::docker(container_id).is_running().await?;
+    let running = container.is_running().await?;
     if running {
         return Ok(());
     }
@@ -1532,7 +1529,7 @@ pub async fn download_container_file(
     let target = ContainerTarget::for_project(&project)
         .ok_or_else(|| "No container exists for this project yet — start it first".to_string())?;
 
-    require_running(target.id(), "saving a file to the host").await?;
+    require_running(&target, "saving a file to the host").await?;
 
     let Some(chosen) = pick_save_path(&window, &suggested_save_name(&container_path)).await else {
         // Dismissed. Not an error, and deliberately distinguishable from one:
@@ -1887,7 +1884,7 @@ pub async fn upload_files_to_container(
 
     // Both checks before the dialog, so a project that cannot receive files
     // says so instead of asking the user to choose some first.
-    require_running(target.id(), "uploading files").await?;
+    require_running(&target, "uploading files").await?;
     resolve_container_dir(&target, "Upload", &container_dir).await?;
 
     let Some(picked) = pick_files_to_upload(&window).await else {
@@ -2241,7 +2238,7 @@ pub async fn download_container_backup(
     let target = ContainerTarget::for_project(&project)
         .ok_or_else(|| "No container exists for this project yet — start it first".to_string())?;
 
-    require_running(target.id(), "backing up").await?;
+    require_running(&target, "backing up").await?;
 
     let path = container_path.unwrap_or_else(|| "/workspace".to_string());
     // Read-only source: `tar -C` it, so absoluteness and `..` are what matter.

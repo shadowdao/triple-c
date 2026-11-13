@@ -62,6 +62,7 @@ use tokio::task::{JoinHandle, JoinSet};
 
 use crate::auth_bridge::proc_net::PortFamily;
 use crate::auth_bridge::tunnel::tunnel_connection_with_prelude;
+use crate::host::ContainerTarget;
 
 /// Host loopback ports the pane may be served on, and therefore the exact set of
 /// origins enumerated in the app's `frame-src`. Keep the two in sync: adding a
@@ -103,9 +104,9 @@ impl Drop for BrowserViewProxy {
 
 impl BrowserViewProxy {
     /// Take the first free port in [`PROXY_PORTS`] on the host loopback and
-    /// start gating connections into `container_id`'s `container_port`.
+    /// start gating connections into `container`'s `container_port`.
     pub async fn bind(
-        container_id: String,
+        container: ContainerTarget,
         container_port: u16,
         family: PortFamily,
         token: String,
@@ -121,7 +122,7 @@ impl BrowserViewProxy {
                 Ok(listener) => {
                     let task = tokio::spawn(accept_loop(
                         listener,
-                        container_id,
+                        container,
                         family.socat_target(container_port),
                         container_port,
                         token,
@@ -172,7 +173,7 @@ fn host_authorities(port: u16) -> Vec<String> {
 #[allow(clippy::too_many_arguments)]
 async fn accept_loop(
     listener: TcpListener,
-    container_id: String,
+    container: ContainerTarget,
     target: String,
     container_port: u16,
     token: String,
@@ -195,7 +196,7 @@ async fn accept_loop(
                 let _ = stream.set_nodelay(true);
                 conns.spawn(serve_connection(
                     stream,
-                    container_id.clone(),
+                    container.clone(),
                     target.clone(),
                     container_port,
                     token.clone(),
@@ -214,7 +215,7 @@ async fn accept_loop(
 #[allow(clippy::too_many_arguments)]
 async fn serve_connection(
     mut stream: TcpStream,
-    container_id: String,
+    container: ContainerTarget,
     target: String,
     container_port: u16,
     token: String,
@@ -249,7 +250,7 @@ async fn serve_connection(
 
     // Authorized: hand the socket to the same socat-over-Docker-exec tunnel the
     // auth bridge uses, replaying the head we had to buffer to make the call.
-    tunnel_connection_with_prelude(container_id, target, stream, container_port, head).await;
+    tunnel_connection_with_prelude(container, target, stream, container_port, head).await;
 }
 
 /// Read bytes until the end of the HTTP request head (`\r\n\r\n`), or fail.
