@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use super::payload::Payload;
-use crate::docker::exec::{exec_oneshot_as, exec_oneshot_streams_as, upload_bytes_to_container};
+use crate::host::ContainerTarget;
 use crate::models::marketplace::{SkippedItem, SyncReport};
 
 /// Where the payload and the script are uploaded. Owned by `claude`.
@@ -57,10 +57,12 @@ fn run_script_env() -> Vec<String> {
     vec!["HOME=/home/claude".to_string()]
 }
 
-async fn wait_until_ready(container_id: &str) -> Result<(), String> {
+async fn wait_until_ready(target: &ContainerTarget) -> Result<(), String> {
     let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
     loop {
-        let (_, code) = exec_oneshot_as(container_id, "root", ready_probe_cmd(), vec![]).await?;
+        let (_, code) = target
+            .exec_oneshot_as("root", ready_probe_cmd(), vec![])
+            .await?;
         if code == 0 {
             return Ok(());
         }
@@ -91,34 +93,28 @@ fn tail(text: &str, max: usize) -> &str {
 /// Wait for readiness, upload the payload and the script, run the script as
 /// `claude`, and return its report.
 pub async fn sync_container(container_id: &str, payload: &Payload) -> Result<SyncReport, String> {
-    wait_until_ready(container_id).await?;
+    let target = ContainerTarget::docker(container_id);
+    wait_until_ready(&target).await?;
 
-    let (out, code) = exec_oneshot_as(container_id, "root", sh(PREPARE_SCRIPT), vec![]).await?;
+    let (out, code) = target
+        .exec_oneshot_as("root", sh(PREPARE_SCRIPT), vec![])
+        .await?;
     if code != 0 {
         return Err(format!(
             "Could not prepare the container for the marketplace sync: {}",
             tail(&out, 500)
         ));
     }
-    upload_bytes_to_container(
-        container_id,
-        INCOMING_DIR,
-        "payload.tar",
-        &payload.tar,
-        0o644,
-    )
-    .await?;
-    upload_bytes_to_container(
-        container_id,
-        INCOMING_DIR,
-        "sync.sh",
-        SYNC_SCRIPT.as_bytes(),
-        0o755,
-    )
-    .await?;
+    target
+        .upload_bytes(INCOMING_DIR, "payload.tar", &payload.tar, 0o644)
+        .await?;
+    target
+        .upload_bytes(INCOMING_DIR, "sync.sh", SYNC_SCRIPT.as_bytes(), 0o755)
+        .await?;
 
-    let (stdout, stderr, code) =
-        exec_oneshot_streams_as(container_id, "claude", run_script_cmd(), run_script_env()).await?;
+    let (stdout, stderr, code) = target
+        .exec_oneshot_streams_as("claude", run_script_cmd(), run_script_env())
+        .await?;
     parse_report(&stdout).map_err(|e| {
         format!(
             "The marketplace sync script failed (exit {code}): {e}. {}",
