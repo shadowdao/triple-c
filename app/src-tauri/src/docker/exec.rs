@@ -206,31 +206,8 @@ pub async fn upload_host_file_with_ids(
     let mtime = now_epoch_secs();
 
     let tar_buf = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
-        // The caller resolved this path (`resolve_host_read_path`); opening it
-        // is a second trip through the same directories, so the descriptor is
-        // checked against the path that was validated before its bytes are
-        // packed into anything. Two paths reach here: the terminal's drop
-        // target, and the Files pane's upload via `upload_host_file_with_ids`.
-        // Between them they are how host bytes enter a container.
-        let file = std::fs::File::open(&host_path)
-            .map_err(|e| format!("Failed to read {}: {}", host_path, e))?;
-        crate::commands::file_commands::verify_opened_path(
-            &file,
-            std::path::Path::new(&host_path),
-        )?;
-        let mut data = Vec::new();
-        std::io::Read::read_to_end(
-            &mut std::io::Read::take(file, MAX_DROP_BYTES.saturating_add(1)),
-            &mut data,
-        )
-        .map_err(|e| format!("Failed to read {}: {}", host_path, e))?;
-        if data.len() as u64 > MAX_DROP_BYTES {
-            return Err(format!(
-                "File too large to upload (limit {} MB)",
-                MAX_DROP_BYTES / (1024 * 1024)
-            ));
-        }
-        build_single_file_tar(&dest_for_blk, &data[..], 0o644, uid, gid, mtime)
+        let data = read_host_file_for_upload(&host_path)?;
+        build_single_file_tar(&dest_for_blk, &data[..], HOST_FILE_UPLOAD_MODE, uid, gid, mtime)
     })
     .await
     .map_err(|e| format!("Upload task panicked: {}", e))??;
@@ -251,13 +228,46 @@ pub async fn upload_host_file_with_ids(
     Ok(container_join(dest_dir, &dest_name))
 }
 
+/// The mode a host file lands with in the container, on every host.
+pub(crate) const HOST_FILE_UPLOAD_MODE: u32 = 0o644;
+
+/// Read a host file that is about to be copied into a container. Blocking:
+/// call it from `spawn_blocking`. Shared by every host's upload so the checks
+/// cannot drift apart.
+///
+/// The caller resolved this path (`resolve_host_read_path`); opening it is a
+/// second trip through the same directories, so the descriptor is checked
+/// against the path that was validated before its bytes are packed into
+/// anything. Two paths reach here: the terminal's drop target, and the Files
+/// pane's upload via `upload_host_file_with_ids`. Between them they are how
+/// host bytes enter a container. [`MAX_DROP_BYTES`] is applied to what the
+/// open descriptor actually yields, not to an earlier `stat`.
+pub(crate) fn read_host_file_for_upload(host_path: &str) -> Result<Vec<u8>, String> {
+    let file = std::fs::File::open(host_path)
+        .map_err(|e| format!("Failed to read {}: {}", host_path, e))?;
+    crate::commands::file_commands::verify_opened_path(&file, std::path::Path::new(host_path))?;
+    let mut data = Vec::new();
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(file, MAX_DROP_BYTES.saturating_add(1)),
+        &mut data,
+    )
+    .map_err(|e| format!("Failed to read {}: {}", host_path, e))?;
+    if data.len() as u64 > MAX_DROP_BYTES {
+        return Err(format!(
+            "File too large to upload (limit {} MB)",
+            MAX_DROP_BYTES / (1024 * 1024)
+        ));
+    }
+    Ok(data)
+}
+
 /// Join a container directory to a name that may itself carry separators.
 ///
 /// Only the *reported* path — the bytes have already landed by the time this is
 /// called — but that path is what the terminal echoes and what the Files pane
 /// puts in its toast, so `/tmp//x` reading back as a different file than `/tmp/x`
 /// is worth the four lines. `"/"` trims to `""` and yields `/x`.
-fn container_join(dir: &str, name: &str) -> String {
+pub(crate) fn container_join(dir: &str, name: &str) -> String {
     format!("{}/{}", dir.trim_end_matches('/'), name.trim_start_matches('/'))
 }
 
@@ -362,12 +372,26 @@ pub async fn container_user_ids(container_id: &str) -> (u64, u64) {
     let (out, _) = exec_oneshot_limited(
         container_id,
         "claude",
-        vec!["sh".to_string(), "-c".to_string(), "id -u; id -g".to_string()],
-        256,
+        user_ids_cmd(),
+        USER_IDS_OUTPUT_LIMIT,
     )
     .await
     .unwrap_or_default();
+    parse_user_ids(&out)
+}
 
+/// The command [`container_user_ids`] runs (as `claude`, under
+/// [`USER_IDS_OUTPUT_LIMIT`]); every host asks the same question.
+pub(crate) fn user_ids_cmd() -> Vec<String> {
+    vec!["sh".to_string(), "-c".to_string(), "id -u; id -g".to_string()]
+}
+
+/// Output ceiling for the uid probe: two short numbers.
+pub(crate) const USER_IDS_OUTPUT_LIMIT: usize = 256;
+
+/// `id -u; id -g` output -> `(uid, gid)`, falling back to the image's
+/// build-time `(1000, 1000)`.
+pub(crate) fn parse_user_ids(out: &str) -> (u64, u64) {
     let mut ids = out.lines().filter_map(|l| l.trim().parse::<u64>().ok());
     match (ids.next(), ids.next()) {
         (Some(uid), Some(gid)) => (uid, gid),
@@ -495,21 +519,54 @@ pub async fn exec_oneshot_as(
 /// fail". `stdout_ranges` indexes the parts of it that came from stdout, so a
 /// caller that is *parsing* output can have just that without the buffer being
 /// held twice.
-struct OneshotOutput {
+pub(crate) struct OneshotOutput {
     combined: Vec<u8>,
     stdout_ranges: Vec<(usize, usize)>,
-    exit_code: i64,
+    pub(crate) exit_code: i64,
+}
+
+/// The refusal for output past `limit`, starting with [`OUTPUT_LIMIT_MARKER`].
+pub(crate) fn output_limit_error(limit: usize) -> String {
+    format!(
+        "{}: Command output exceeded {} bytes and was abandoned",
+        OUTPUT_LIMIT_MARKER, limit
+    )
 }
 
 impl OneshotOutput {
+    pub(crate) fn new() -> Self {
+        Self {
+            combined: Vec::new(),
+            stdout_ranges: Vec::new(),
+            exit_code: 0,
+        }
+    }
+
+    /// Append one chunk in arrival order, or refuse it (appending nothing)
+    /// once the combined output would pass `limit`. The caller must stop
+    /// reading on an error rather than truncate silently: every caller parses
+    /// this output, and a half-read manifest or JSON array is worse than an
+    /// error.
+    pub(crate) fn push(&mut self, from_stdout: bool, bytes: &[u8], limit: usize) -> Result<(), String> {
+        match push_capped(&mut self.combined, bytes, limit) {
+            Some(range) => {
+                if from_stdout {
+                    self.stdout_ranges.push(range);
+                }
+                Ok(())
+            }
+            None => Err(output_limit_error(limit)),
+        }
+    }
+
     /// Everything the command printed, in the order it printed it.
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         String::from_utf8_lossy(&self.combined).into_owned()
     }
 
     /// stdout alone — for callers that parse it, where a diagnostic spliced in
     /// mid-record is a parse error at best.
-    fn stdout(&self) -> String {
+    pub(crate) fn stdout(&self) -> String {
         let mut out = Vec::with_capacity(self.combined.len());
         for (start, end) in &self.stdout_ranges {
             out.extend_from_slice(&self.combined[*start..*end]);
@@ -518,7 +575,7 @@ impl OneshotOutput {
     }
 
     /// stderr alone — the complement of [`Self::stdout`], i.e. the diagnostics.
-    fn stderr(&self) -> String {
+    pub(crate) fn stderr(&self) -> String {
         let mut out = Vec::with_capacity(self.combined.len());
         let mut cursor = 0usize;
         for (start, end) in &self.stdout_ranges {
@@ -587,8 +644,7 @@ async fn exec_oneshot_raw(
         .await
         .map_err(|e| format!("Failed to start exec: {}", e))?;
 
-    let mut combined: Vec<u8> = Vec::new();
-    let mut stdout_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut out = OneshotOutput::new();
     match result {
         StartExecResults::Attached { mut output, .. } => {
             while let Some(msg) = output.next().await {
@@ -596,23 +652,9 @@ async fn exec_oneshot_raw(
                     Ok(data) => {
                         let from_stdout = matches!(data, LogOutput::StdOut { .. });
                         let bytes = data.into_bytes();
-                        match push_capped(&mut combined, &bytes, limit) {
-                            Some(range) => {
-                                if from_stdout {
-                                    stdout_ranges.push(range);
-                                }
-                            }
-                            // Stop reading rather than truncate silently: every
-                            // caller parses this output, and a half-read
-                            // manifest or JSON array is worse than an error.
-                            // Dropping `output` kills the exec's stream.
-                            None => {
-                                return Err(format!(
-                                    "{}: Command output exceeded {} bytes and was abandoned",
-                                    OUTPUT_LIMIT_MARKER, limit
-                                ))
-                            }
-                        }
+                        // Over the limit: returning drops `output`, which
+                        // kills the exec's stream.
+                        out.push(from_stdout, &bytes, limit)?;
                     }
                     Err(e) => return Err(format!("Exec output error: {}", e)),
                 }
@@ -623,13 +665,8 @@ async fn exec_oneshot_raw(
 
     // The output stream draining doesn't strictly guarantee inspect_exec has the
     // final exit_code populated yet, so poll until the exec reports finished.
-    let exit_code = require_exit_code(wait_for_exec_exit(&exec.id).await)?;
-
-    Ok(OneshotOutput {
-        combined,
-        stdout_ranges,
-        exit_code,
-    })
+    out.exit_code = require_exit_code(wait_for_exec_exit(&exec.id).await)?;
+    Ok(out)
 }
 
 /// Turn "the exit code could not be determined" into an error rather than a 0.
@@ -662,7 +699,7 @@ fn require_exit_code(code: Option<i64>) -> Result<i64, String> {
 /// spurious "the rename failed" and a real one.
 pub async fn wait_for_exec_exit(exec_id: &str) -> Option<i64> {
     let docker = get_docker().ok()?;
-    for _ in 0..200 {
+    for _ in 0..EXEC_EXIT_POLLS {
         match docker.inspect_exec(exec_id).await {
             Ok(info) => {
                 if info.running != Some(true) {
@@ -681,10 +718,15 @@ pub async fn wait_for_exec_exit(exec_id: &str) -> Option<i64> {
             }
             Err(_) => return None,
         }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        tokio::time::sleep(EXEC_EXIT_POLL_INTERVAL).await;
     }
     None
 }
+
+/// [`wait_for_exec_exit`]'s budget: polls, and the pause between them. Every
+/// host's `wait_exec_exit` uses the same numbers.
+pub(crate) const EXEC_EXIT_POLLS: usize = 200;
+pub(crate) const EXEC_EXIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 
 #[cfg(test)]
 mod tests {
@@ -692,19 +734,11 @@ mod tests {
 
     /// The frames a demultiplexed exec hands back, as `(is_stdout, bytes)`.
     fn collect(frames: &[(bool, &[u8])]) -> OneshotOutput {
-        let mut combined = Vec::new();
-        let mut stdout_ranges = Vec::new();
+        let mut out = OneshotOutput::new();
         for (from_stdout, bytes) in frames {
-            let range = push_capped(&mut combined, bytes, usize::MAX).unwrap();
-            if *from_stdout {
-                stdout_ranges.push(range);
-            }
+            out.push(*from_stdout, bytes, usize::MAX).unwrap();
         }
-        OneshotOutput {
-            combined,
-            stdout_ranges,
-            exit_code: 0,
-        }
+        out
     }
 
     #[test]
@@ -763,10 +797,7 @@ mod tests {
         // The marker is what lets `list_container_files` say "too many entries"
         // instead, which is the thing that actually happened.
         assert!(!OUTPUT_LIMIT_MARKER.is_empty());
-        let refusal = format!(
-            "{}: Command output exceeded {} bytes and was abandoned",
-            OUTPUT_LIMIT_MARKER, MAX_ONESHOT_OUTPUT
-        );
+        let refusal = output_limit_error(MAX_ONESHOT_OUTPUT);
         assert!(refusal.starts_with(OUTPUT_LIMIT_MARKER));
     }
 

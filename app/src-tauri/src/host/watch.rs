@@ -50,6 +50,11 @@ impl ContainerTarget {
     pub async fn has_exited(&self) -> bool {
         match self {
             ContainerTarget::Docker { container_id } => docker::events::has_exited(container_id).await,
+            // The agent can only say "I answer" or "I don't"; silence is not a
+            // positive exit (an SSM blip looks the same). Only the host that
+            // runs the container can confirm a death — an AWS host answers
+            // from ECS — so through the agent alone this never confirms one.
+            ContainerTarget::Agent(_) => false,
         }
     }
 }
