@@ -130,10 +130,10 @@ tunnel. This is used by idle auto-stop later.
 | `exec_oneshot*` (all variants) | `POST /v1/exec`, with `limit` = the variant's limit (`MAX_ONESHOT_OUTPUT` or explicit) |
 | `exec_detached` | `POST /v1/exec/detached` |
 | `attach` / `attach_exec` | `GET /v1/attach`; `input` is an `AsyncWrite` whose shutdown sends `close_stdin` |
-| `wait_exec_exit` | poll `GET /v1/exec/{id}` (same budget as the Docker version: 200 × 50 ms) |
+| `wait_exec_exit` | poll `GET /v1/exec/{id}` (same budget as the Docker version: 200 × 25 ms, shared constants in `docker/exec.rs`) |
 | `resize_exec` | `POST /v1/exec/{id}/resize` |
 | `user_ids` | one-shot `sh -c 'id -u; id -g'` as `claude`, falling back to `(1000, 1000)` |
-| `upload_bytes*`, `upload_host_file*` | `PUT /v1/files` |
+| `upload_bytes*`, `upload_host_file*` | `PUT /v1/files`; a multi-component `name` (the terminal drop's `triple-c-drops/<file>`) is split into `dir` + last component, `.`/`..` refused |
 | `download_archive` | `GET /v1/archive` |
 | `is_running` | `GET /v1/health` succeeds → `true`; a connection error → `false` |
 | `has_exited` | `false` (only the host can say positively; an AWS host answers from ECS) |
