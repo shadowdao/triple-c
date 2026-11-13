@@ -1,52 +1,24 @@
 use bollard::container::{LogOutput, UploadToContainerOptions};
 use bollard::exec::{CreateExecOptions, ResizeExecOptions, StartExecResults};
-use futures_util::{Stream, StreamExt};
-use std::collections::HashMap;
-use std::pin::Pin;
-use std::sync::Arc;
-use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, Mutex};
+use futures_util::StreamExt;
 
 use super::client::get_docker;
+use crate::host::{ExecChunk, ExecSpec};
 
-/// A `docker exec` that has been created and started with stdin/stdout/stderr
-/// attached — the raw duplex halves, before any policy about what to do with
-/// them.
-///
-/// This is the single place in the codebase that knows how to open an attached
-/// exec. Both consumers are built on it:
-///   * [`ExecSessionManager`] — interactive terminals and the audio bridge,
-///     which pump bytes through mpsc channels and a callback.
-///   * `auth_bridge` — per-connection `socat` tunnels, which pump bytes
-///     straight between a host TCP socket and these halves.
-///
-/// With `tty = false` the output stream is demultiplexed by Docker, so the
-/// consumer can tell [`LogOutput::StdOut`] from [`LogOutput::StdErr`]. That
-/// distinction matters for the auth bridge: `socat`'s diagnostics must not be
-/// spliced into the proxied byte stream.
-pub struct AttachedExec {
-    pub exec_id: String,
-    pub output: Pin<Box<dyn Stream<Item = Result<LogOutput, bollard::errors::Error>> + Send>>,
-    pub input: Pin<Box<dyn AsyncWrite + Send>>,
-}
+// `AttachedExec` lives in `host` now (host-neutral output chunks); this
+// module's job is to produce one from Docker. Its consumers are
+// `host::sessions::ExecSessionManager` (terminals, audio bridge) and the auth
+// bridge's per-connection `socat` tunnels, both through `host::ContainerTarget`.
+// With `tty = false` Docker demultiplexes stdout from stderr, which the auth
+// bridge relies on: `socat`'s diagnostics must not be spliced into the proxied
+// byte stream.
+pub use crate::host::AttachedExec;
 
-/// Create and start an exec with stdin + stdout + stderr attached, returning the
-/// raw duplex halves. Runs as `claude` in `/workspace`, like every other exec
-/// this app opens.
-pub async fn create_attached_exec(
-    container_id: &str,
-    cmd: Vec<String>,
-    tty: bool,
-) -> Result<AttachedExec, String> {
-    create_attached_exec_as(container_id, cmd, tty, "claude", "/workspace").await
-}
-
-/// [`create_attached_exec`] with the user and working directory spelled out.
+/// An attached exec with the user and working directory spelled out.
 ///
-/// Only base-image migration needs this: replaying `apt` and unpacking a
-/// payload tar at `/` have to run as **root**, and every other caller wants the
-/// `claude` / `/workspace` defaults that [`create_attached_exec`] supplies. It
-/// stays the single place an attached exec is opened.
+/// Only base-image migration calls this directly: replaying `apt` and unpacking
+/// a payload tar at `/` have to run as **root**. Everything else goes through
+/// `host::ContainerTarget::attach`.
 pub async fn create_attached_exec_as(
     container_id: &str,
     cmd: Vec<String>,
@@ -54,19 +26,34 @@ pub async fn create_attached_exec_as(
     user: &str,
     working_dir: &str,
 ) -> Result<AttachedExec, String> {
+    let spec = ExecSpec::new(cmd)
+        .tty(tty)
+        .user(user)
+        .working_dir(Some(working_dir));
+    create_attached_exec_spec(container_id, &spec).await
+}
+
+/// The single place an attached exec is opened on Docker. Everything else —
+/// [`create_attached_exec_as`] and `host::ContainerTarget::attach` — is a thin
+/// wrapper over this.
+pub async fn create_attached_exec_spec(
+    container_id: &str,
+    spec: &ExecSpec,
+) -> Result<AttachedExec, String> {
     let docker = get_docker()?;
 
     let exec = docker
         .create_exec(
             container_id,
             CreateExecOptions {
-                attach_stdin: Some(true),
+                attach_stdin: Some(spec.attach_stdin),
                 attach_stdout: Some(true),
                 attach_stderr: Some(true),
-                tty: Some(tty),
-                cmd: Some(cmd),
-                user: Some(user.to_string()),
-                working_dir: Some(working_dir.to_string()),
+                tty: Some(spec.tty),
+                cmd: Some(spec.cmd.clone()),
+                env: if spec.env.is_empty() { None } else { Some(spec.env.clone()) },
+                user: Some(spec.user.clone()),
+                working_dir: spec.working_dir.clone(),
                 ..Default::default()
             },
         )
@@ -82,244 +69,87 @@ pub async fn create_attached_exec_as(
     {
         StartExecResults::Attached { output, input } => Ok(AttachedExec {
             exec_id,
-            output,
+            output: Box::pin(output.map(|r| {
+                r.map(log_output_to_chunk)
+                    .map_err(|e| e.to_string())
+            })),
             input,
         }),
         StartExecResults::Detached => Err("Exec started in detached mode".to_string()),
     }
 }
 
-pub struct ExecSession {
-    pub exec_id: String,
-    pub container_id: String,
-    pub input_tx: mpsc::UnboundedSender<Vec<u8>>,
-    shutdown_tx: mpsc::Sender<()>,
-}
-
-impl ExecSession {
-    pub async fn send_input(&self, data: Vec<u8>) -> Result<(), String> {
-        self.input_tx
-            .send(data)
-            .map_err(|e| format!("Failed to send input: {}", e))
-    }
-
-    #[allow(dead_code)]
-    pub async fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
-        let docker = get_docker()?;
-        docker
-            .resize_exec(
-                &self.exec_id,
-                ResizeExecOptions {
-                    width: cols,
-                    height: rows,
-                },
-            )
-            .await
-            .map_err(|e| format!("Failed to resize exec: {}", e))
-    }
-
-    pub fn shutdown(&self) {
-        let _ = self.shutdown_tx.try_send(());
+/// bollard's `LogOutput` → the host-neutral [`ExecChunk`]. `Console` is what
+/// Docker calls a TTY stream; it has no stderr, so it is stdout.
+pub fn log_output_to_chunk(o: LogOutput) -> ExecChunk {
+    match o {
+        LogOutput::StdOut { message } | LogOutput::Console { message } => ExecChunk::StdOut(message),
+        LogOutput::StdErr { message } => ExecChunk::StdErr(message),
+        LogOutput::StdIn { message } => ExecChunk::Other(message),
     }
 }
 
-pub struct ExecSessionManager {
-    sessions: Arc<Mutex<HashMap<String, ExecSession>>>,
+/// Start a command with nothing attached and return its exec id without
+/// waiting for it.
+pub async fn exec_detached(container_id: &str, spec: &ExecSpec) -> Result<String, String> {
+    let docker = get_docker()?;
+    let exec = docker
+        .create_exec(
+            container_id,
+            CreateExecOptions {
+                attach_stdout: Some(false),
+                attach_stderr: Some(false),
+                tty: Some(spec.tty),
+                cmd: Some(spec.cmd.clone()),
+                env: if spec.env.is_empty() { None } else { Some(spec.env.clone()) },
+                user: Some(spec.user.clone()),
+                working_dir: spec.working_dir.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|e| format!("Failed to create exec: {}", e))?;
+    docker
+        .start_exec(
+            &exec.id,
+            Some(bollard::exec::StartExecOptions {
+                detach: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .map_err(|e| format!("Failed to start exec: {}", e))?;
+    Ok(exec.id)
 }
 
-impl ExecSessionManager {
-    pub fn new() -> Self {
-        Self {
-            sessions: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-
-    pub async fn create_session<F>(
-        &self,
-        container_id: &str,
-        session_id: &str,
-        cmd: Vec<String>,
-        on_output: F,
-        on_exit: Box<dyn FnOnce() + Send>,
-    ) -> Result<(), String>
-    where
-        F: Fn(Vec<u8>) + Send + 'static,
-    {
-        self.create_session_with_tty(container_id, session_id, cmd, true, on_output, on_exit)
-            .await
-    }
-
-    pub async fn create_session_with_tty<F>(
-        &self,
-        container_id: &str,
-        session_id: &str,
-        cmd: Vec<String>,
-        tty: bool,
-        on_output: F,
-        on_exit: Box<dyn FnOnce() + Send>,
-    ) -> Result<(), String>
-    where
-        F: Fn(Vec<u8>) + Send + 'static,
-    {
-        let AttachedExec {
+pub async fn resize_exec(exec_id: &str, cols: u16, rows: u16) -> Result<(), String> {
+    let docker = get_docker()?;
+    docker
+        .resize_exec(
             exec_id,
-            mut output,
-            mut input,
-        } = create_attached_exec(container_id, cmd, tty).await?;
+            ResizeExecOptions {
+                width: cols,
+                height: rows,
+            },
+        )
+        .await
+        .map_err(|e| format!("Failed to resize exec: {}", e))
+}
 
-        let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
-
-        // Output reader task
-        let session_id_clone = session_id.to_string();
-        let shutdown_tx_clone = shutdown_tx.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    msg = output.next() => {
-                        match msg {
-                            Some(Ok(output)) => {
-                                on_output(output.into_bytes().to_vec());
-                            }
-                            Some(Err(e)) => {
-                                log::error!("Exec output error for {}: {}", session_id_clone, e);
-                                break;
-                            }
-                            None => {
-                                log::info!("Exec output stream ended for {}", session_id_clone);
-                                break;
-                            }
-                        }
-                    }
-                    _ = shutdown_rx.recv() => {
-                        log::info!("Exec session {} shutting down", session_id_clone);
-                        break;
-                    }
-                }
-            }
-            on_exit();
-            let _ = shutdown_tx_clone;
-        });
-
-        // Input writer task
-        tokio::spawn(async move {
-            while let Some(data) = input_rx.recv().await {
-                if let Err(e) = input.write_all(&data).await {
-                    log::error!("Failed to write to exec stdin: {}", e);
-                    break;
-                }
-            }
-        });
-
-        let session = ExecSession {
-            exec_id,
-            container_id: container_id.to_string(),
-            input_tx,
-            shutdown_tx,
-        };
-
-        self.sessions
-            .lock()
-            .await
-            .insert(session_id.to_string(), session);
-
-        Ok(())
-    }
-
-    pub async fn send_input(&self, session_id: &str, data: Vec<u8>) -> Result<(), String> {
-        let sessions = self.sessions.lock().await;
-        let session = sessions
-            .get(session_id)
-            .ok_or_else(|| format!("Session {} not found", session_id))?;
-        session.send_input(data).await
-    }
-
-    pub async fn resize(&self, session_id: &str, cols: u16, rows: u16) -> Result<(), String> {
-        // Clone the exec_id under the lock, then drop the lock before the
-        // async Docker API call to avoid holding the mutex across await.
-        let exec_id = {
-            let sessions = self.sessions.lock().await;
-            let session = sessions
-                .get(session_id)
-                .ok_or_else(|| format!("Session {} not found", session_id))?;
-            session.exec_id.clone()
-        };
-        let docker = get_docker()?;
-        docker
-            .resize_exec(
-                &exec_id,
-                ResizeExecOptions {
-                    width: cols,
-                    height: rows,
-                },
-            )
-            .await
-            .map_err(|e| format!("Failed to resize exec: {}", e))
-    }
-
-    pub async fn close_session(&self, session_id: &str) {
-        let mut sessions = self.sessions.lock().await;
-        if let Some(session) = sessions.remove(session_id) {
-            session.shutdown();
-        }
-    }
-
-    pub async fn close_sessions_for_container(&self, container_id: &str) {
-        let mut sessions = self.sessions.lock().await;
-        let ids_to_close: Vec<String> = sessions
-            .iter()
-            .filter(|(_, s)| s.container_id == container_id)
-            .map(|(id, _)| id.clone())
-            .collect();
-        for id in ids_to_close {
-            if let Some(session) = sessions.remove(&id) {
-                session.shutdown();
-            }
-        }
-    }
-
-    pub async fn close_all_sessions(&self) {
-        let mut sessions = self.sessions.lock().await;
-        for (_, session) in sessions.drain() {
-            session.shutdown();
-        }
-    }
-
-    pub async fn get_container_id(&self, session_id: &str) -> Result<String, String> {
-        let sessions = self.sessions.lock().await;
-        let session = sessions
-            .get(session_id)
-            .ok_or_else(|| format!("Session {} not found", session_id))?;
-        Ok(session.container_id.clone())
-    }
-
-    pub async fn write_file_to_container(
-        &self,
-        container_id: &str,
-        file_name: &str,
-        data: &[u8],
-    ) -> Result<String, String> {
-        let docker = get_docker()?;
-
-        // Owned by the container user, stamped now: a default tar header would
-        // land it as root:root/1970 and Claude Code could not rewrite it.
-        let (uid, gid) = container_user_ids(container_id).await;
-        let tar_buf = build_single_file_tar(file_name, data, 0o644, uid, gid, now_epoch_secs())?;
-
-        docker
-            .upload_to_container(
-                container_id,
-                Some(UploadToContainerOptions {
-                    path: "/tmp".to_string(),
-                    ..Default::default()
-                }),
-                tar_buf.into(),
-            )
-            .await
-            .map_err(|e| format!("Failed to upload file to container: {}", e))?;
-
-        Ok(format!("/tmp/{}", file_name))
-    }
+/// Docker's archive API: `path` as a tar stream. Errors are stringified so the
+/// stream is host-neutral.
+pub fn download_archive(container_id: &str, path: &str) -> crate::host::ArchiveStream {
+    let docker = match get_docker() {
+        Ok(d) => d,
+        Err(e) => return Box::pin(futures_util::stream::once(async move { Err(e) })),
+    };
+    let stream = docker.download_from_container(
+        container_id,
+        Some(bollard::container::DownloadFromContainerOptions {
+            path: path.to_string(),
+        }),
+    );
+    Box::pin(stream.map(|r| r.map_err(|e| e.to_string())))
 }
 
 /// Ceiling on one host file packed into a container upload.
@@ -445,13 +275,21 @@ pub async fn upload_bytes_to_container(
     data: &[u8],
     mode: u32,
 ) -> Result<String, String> {
+    upload_bytes_with_ids(container_id, dest_dir, file_name, data, mode, (0, 0)).await
+}
+
+/// [`upload_bytes_to_container`] with the tar header's owner set, stamped now.
+pub async fn upload_bytes_with_ids(
+    container_id: &str,
+    dest_dir: &str,
+    file_name: &str,
+    data: &[u8],
+    mode: u32,
+    (uid, gid): (u64, u64),
+) -> Result<String, String> {
     let docker = get_docker()?;
 
-    // Root-owned on purpose: migration's `tar -T` list is read back as root,
-    // and the marketplace sync uploads into a `claude`-owned directory it
-    // prepares first, so `claude` can still read and delete the files. The
-    // mtime still gets stamped so the file doesn't read as 1970.
-    let tar_buf = build_single_file_tar(file_name, data, mode, 0, 0, now_epoch_secs())?;
+    let tar_buf = build_single_file_tar(file_name, data, mode, uid, gid, now_epoch_secs())?;
 
     docker
         .upload_to_container(

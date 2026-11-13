@@ -32,7 +32,7 @@
 //! |---|---|
 //! | Bridge disabled | `set_auth_bridge_enabled(false)` → [`AuthBridgeManager::stop`] |
 //! | Container stopped via UI | `stop_project_container` → [`AuthBridgeManager::stop`] |
-//! | Container stopped/died another way | poller's own `is_container_running` check → loop exits |
+//! | Container stopped/died another way | poller's own `is_running` check → loop exits |
 //! | Project deleted | `remove_project` → [`AuthBridgeManager::stop`]; also the poller's `store.get()` check |
 //! | Container rebuilt | `rebuild_project_container` → stop, then start re-arms it |
 //! | App exit | window `CloseRequested` → [`AuthBridgeManager::stop_all`] |
@@ -55,8 +55,7 @@ use tauri::{AppHandle, Emitter};
 use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
 
-use crate::docker::container::is_container_running;
-use crate::docker::exec::{exec_oneshot_limited, PROC_NET_OUTPUT_LIMIT};
+use crate::host::{ContainerTarget, PROC_NET_OUTPUT_LIMIT};
 use crate::storage::projects_store::ProjectsStore;
 
 use proc_net::PortFamily;
@@ -205,7 +204,7 @@ impl AuthBridgeManager {
 
         let poller = tokio::spawn(poll_loop(
             project_id.clone(),
-            container_id,
+            ContainerTarget::docker(container_id),
             epoch,
             app,
             store,
@@ -276,7 +275,7 @@ impl AuthBridgeManager {
 #[allow(clippy::too_many_arguments)]
 async fn poll_loop(
     project_id: String,
-    container_id: String,
+    container: ContainerTarget,
     epoch: u64,
     app: AppHandle,
     store: Arc<ProjectsStore>,
@@ -301,7 +300,7 @@ async fn poll_loop(
             log::info!("Auth bridge: disabled for project {} — tearing down", project_id);
             break;
         }
-        if !is_container_running(&container_id).await.unwrap_or(false) {
+        if !container.is_running().await.unwrap_or(false) {
             log::info!(
                 "Auth bridge: container for project {} is no longer running — tearing down",
                 project_id
@@ -327,7 +326,7 @@ async fn poll_loop(
         // bridge or stopping the container doesn't wait out an in-flight poll.
         let discovery = tokio::select! {
             _ = cancel.changed() => break,
-            res = exec_oneshot_limited(&container_id, "claude", cmd, PROC_NET_OUTPUT_LIMIT) => {
+            res = container.exec_oneshot_limited("claude", cmd, PROC_NET_OUTPUT_LIMIT) => {
                 res.map(|(out, _)| out)
             }
         };
@@ -340,7 +339,7 @@ async fn poll_loop(
                 // gateway/STT/web-terminal ports can be re-pointed while the
                 // bridge is running, and a stale reservation set is a hole.
                 let skip = skipped_ports(&project, &store.list(), &app_settings(&app));
-                if reconcile(&container_id, &discovered, &skip, &state).await {
+                if reconcile(&container, &discovered, &skip, &state).await {
                     emit_status(&app, &project_id, &state, true).await;
                 }
             }
@@ -530,7 +529,7 @@ const MAX_CONFLICTS: usize = 32;
 /// Bring the set of host listeners in line with what the container is currently
 /// listening on. Returns whether anything the UI cares about changed.
 async fn reconcile(
-    container_id: &str,
+    container: &ContainerTarget,
     discovered: &BTreeMap<u16, PortFamily>,
     skip: &HashSet<u16>,
     state: &Arc<Mutex<BridgeState>>,
@@ -583,7 +582,7 @@ async fn reconcile(
             );
             continue;
         }
-        match PortForward::bind(container_id.to_string(), port, family).await {
+        match PortForward::bind(container.clone(), port, family).await {
             Ok(forward) => {
                 if st.conflicts.remove(&port).is_some() {
                     log::info!("Auth bridge: host port {} became available", port);
@@ -833,7 +832,13 @@ mod tests {
             (45000u16..45200).map(|p| (p, PortFamily::V4)).collect();
         let state = Arc::new(Mutex::new(BridgeState::default()));
 
-        reconcile("no-such-container", &discovered, &HashSet::new(), &state).await;
+        reconcile(
+            &ContainerTarget::docker("no-such-container"),
+            &discovered,
+            &HashSet::new(),
+            &state,
+        )
+        .await;
 
         let mut st = state.lock().await;
         assert!(

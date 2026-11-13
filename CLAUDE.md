@@ -264,8 +264,8 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
 - **`docker/`** — Docker API layer using bollard:
   - `client.rs` — Singleton Docker connection via `OnceLock`
   - `container.rs` — Container lifecycle (create, start, stop, remove, inspect)
-  - `exec.rs` — Attached exec streaming. `create_attached_exec()` is the **single** place an
-    attached exec is opened; terminal sessions and the auth bridge both go through it.
+  - `exec.rs` — Docker's implementation of everything `host::ContainerTarget` does inside a
+    container. `create_attached_exec_spec()` is the **single** place an attached exec is opened.
   - `image.rs` — Image build/pull with progress streaming
   - `gateway.rs` — Optional LiteLLM sibling container giving Claude Code an Anthropic-format
     front end for providers that only speak OpenAI (see `gateway-container/`). Mirrors `stt.rs`.
@@ -282,6 +282,15 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   - `legacy_cleanup.rs` — One-release migration shim removing leftovers from the deleted MCP
     feature (containers labelled `triple-c.mcp-server`, `triple-c-net-*` networks). Deletable once
     users have migrated.
+- **`host/`** — Where a project's container runs, and the only way into it. `ContainerTarget`
+  (one `Docker` variant today; AWS planned — `docs/superpowers/specs/2026-11-13-aws-ecs-host-design.md`)
+  wraps execs, file transfer and `is_running`; `sessions.rs` holds `ExecSessionManager`.
+  **Container-interior code must go through `ContainerTarget`, never `docker::exec`, bollard or
+  `get_docker()`** — `host::tests::no_container_interior_bollard_outside_the_host_layer` fails
+  the build on it. Its allowlist is Docker-only code (migration) plus lifecycle/`die` events,
+  which phase 1b moves; shrink it, never grow it. Prefer `ContainerTarget::for_project` or a
+  target a session already holds (`ExecSessionManager::get_target`) over
+  `ContainerTarget::docker(id)`, which hard-codes the host.
 - **`web_terminal/`** — Remote terminal access via axum HTTP+WebSocket server:
   - `server.rs` — Axum server lifecycle (start/stop), serves embedded HTML and handles WS upgrades
   - `ws_handler.rs` — Per-connection WebSocket handler with JSON protocol, session management, cleanup on disconnect

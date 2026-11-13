@@ -10,8 +10,8 @@
 //! hold the resolved path, not the one that was clicked.
 
 use crate::commands::file_commands::validate_container_path;
-use crate::docker::exec::exec_oneshot_streams_as;
 use crate::docker::CONTAINER_HOME;
+use crate::host::ContainerTarget;
 
 pub const MAX_CANDIDATES: usize = 16;
 const MAX_RAW_LEN: usize = 4096;
@@ -136,8 +136,9 @@ pub async fn probe_candidates(
 ) -> Result<Vec<String>, String> {
     let mut cmd: Vec<String> = vec!["sh".into(), "-c".into(), PROBE_SCRIPT.into(), "probe".into()];
     cmd.extend(candidates.iter().cloned());
-    let (stdout, _stderr, _code) =
-        exec_oneshot_streams_as(container_id, "claude", cmd, Vec::new()).await?;
+    let (stdout, _stderr, _code) = ContainerTarget::docker(container_id)
+        .exec_oneshot_streams_as("claude", cmd, Vec::new())
+        .await?;
     Ok(parse_probe_output(&stdout))
 }
 

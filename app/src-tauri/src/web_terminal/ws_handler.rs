@@ -295,9 +295,7 @@ async fn handle_open(
         return Err(format!("Project '{}' is not running", project.name));
     }
 
-    let container_id = project
-        .container_id
-        .as_ref()
+    let container = crate::host::ContainerTarget::for_project(&project)
         .ok_or_else(|| "Container not running".to_string())?;
 
     let cmd = match session_type {
@@ -329,7 +327,13 @@ async fn handle_open(
 
     state
         .exec_manager
-        .create_session(container_id, &session_id, cmd, on_output, on_exit)
+        .create_session(
+            &container,
+            &session_id,
+            cmd,
+            on_output,
+            on_exit,
+        )
         .await?;
 
     // Track this session for cleanup on disconnect

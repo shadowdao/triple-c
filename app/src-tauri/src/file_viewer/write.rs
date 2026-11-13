@@ -11,7 +11,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::commands::file_commands::clip_container_text;
-use crate::docker::exec::{exec_oneshot_streams_as, ExecSessionManager};
+use crate::host::{ContainerTarget, ExecSessionManager};
 
 /// Spec §4/§5: only untruncated (≤ 1 MiB) text is editable, so nothing larger is saved.
 pub const MAX_WRITE_BYTES: usize = 1024 * 1024;
@@ -180,12 +180,14 @@ pub async fn write_file(
 ) -> Result<SavedFile, String> {
     check_write_input(bytes.len(), base_hash)?;
     let tmp_name = format!("triple-c-viewer-{}", uuid::Uuid::new_v4().simple());
+    let container = ContainerTarget::docker(container_id);
     let tmp_path = exec_manager
-        .write_file_to_container(container_id, &tmp_name, bytes)
+        .write_file_to_container(&container, &tmp_name, bytes)
         .await?;
     let cmd = write_command(target, &tmp_path, base_hash);
-    let (stdout, stderr, code) =
-        exec_oneshot_streams_as(container_id, "claude", cmd, Vec::new()).await?;
+    let (stdout, stderr, code) = container
+        .exec_oneshot_streams_as("claude", cmd, Vec::new())
+        .await?;
     saved_file(classify_write(code, &stdout, &stderr), bytes)
 }
 

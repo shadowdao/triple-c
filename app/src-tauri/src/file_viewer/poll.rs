@@ -7,7 +7,7 @@
 
 use serde::Serialize;
 
-use crate::docker::exec::exec_oneshot_streams_as;
+use crate::host::ContainerTarget;
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct ViewerPoll {
@@ -48,8 +48,9 @@ pub async fn poll_file(container_id: &str, container_path: &str) -> Result<Viewe
         "poll".to_string(),
         container_path.to_string(),
     ];
-    let (stdout, stderr, code) =
-        exec_oneshot_streams_as(container_id, "claude", cmd, Vec::new()).await?;
+    let (stdout, stderr, code) = ContainerTarget::docker(container_id)
+        .exec_oneshot_streams_as("claude", cmd, Vec::new())
+        .await?;
     if code != 0 && code != 4 {
         return Err(format!(
             "Could not check the file: {}",

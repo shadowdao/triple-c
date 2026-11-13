@@ -67,9 +67,7 @@ use serde::Serialize;
 use tauri::AppHandle;
 
 use crate::commands::project_commands::emit_progress;
-use crate::docker::exec::{
-    create_attached_exec_as, exec_oneshot_as, wait_for_exec_exit, AttachedExec,
-};
+use crate::host::{AttachedExec, ContainerTarget, ExecSpec};
 
 use super::detect::{self, PlaywrightDetection};
 
@@ -242,13 +240,14 @@ pub async fn install_packages(
     project_id: &str,
     container_id: &str,
 ) -> Result<BrowserSetupOutcome, String> {
+    let container = ContainerTarget::docker(container_id);
     emit_progress(
         app,
         project_id,
         &format!("Installing @playwright/cli into {}/node_modules…", INSTALL_DIR),
     );
 
-    let mut step = npm_install(app, project_id, container_id, &[VIEWER_PACKAGE]).await?;
+    let mut step = npm_install(app, project_id, &container, &[VIEWER_PACKAGE]).await?;
     if step.exit_code != 0 {
         return Err(format!(
             "npm couldn't install the viewer package in this container (exit {}).\n\nnpm said:\n{}",
@@ -265,9 +264,9 @@ pub async fn install_packages(
     // see the note on `npm_install`. The pin can only be read after the first
     // install has written the manifest, which is why this stays two commands
     // rather than one.
-    let spec = pinned_playwright_spec(container_id).await;
+    let spec = pinned_playwright_spec(&container).await;
     emit_progress(app, project_id, &format!("Installing {}…", spec));
-    let second = npm_install(app, project_id, container_id, &[VIEWER_PACKAGE, &spec]).await?;
+    let second = npm_install(app, project_id, &container, &[VIEWER_PACKAGE, &spec]).await?;
     if second.exit_code != 0 {
         return Err(format!(
             "npm couldn't install {} in this container (exit {}).\n\nnpm said:\n{}",
@@ -279,7 +278,7 @@ pub async fn install_packages(
     step.log = merge_logs(step.log, second.log);
 
     emit_progress(app, project_id, "Re-checking what the container has…");
-    let detection = detect::detect(container_id).await?;
+    let detection = detect::detect_in(&container).await?;
 
     // A probe that still finds something missing after a successful npm run is
     // the interesting case, so it is surfaced rather than swallowed. And a
@@ -331,7 +330,7 @@ pub async fn install_packages(
 async fn npm_install(
     app: &AppHandle,
     project_id: &str,
-    container_id: &str,
+    container: &ContainerTarget,
     specs: &[&str],
 ) -> Result<StepResult, String> {
     let mut cmd = vec![
@@ -348,7 +347,7 @@ async fn npm_install(
     run_step(
         app,
         project_id,
-        container_id,
+        container,
         "claude",
         INSTALL_DIR,
         cmd,
@@ -363,20 +362,20 @@ async fn npm_install(
 /// Read from the manifest npm just wrote rather than guessed, and falling back
 /// to `@latest` when it can't be read — an unreadable manifest is a reason to
 /// install something, not nothing.
-async fn pinned_playwright_spec(container_id: &str) -> String {
+async fn pinned_playwright_spec(container: &ContainerTarget) -> String {
     let script = format!(
         "try{{const d=require('{}/node_modules/@playwright/cli/package.json').dependencies||{{}};\
          process.stdout.write(d.playwright||'');}}catch(e){{}}",
         INSTALL_DIR
     );
-    let (out, _code) = exec_oneshot_as(
-        container_id,
-        "claude",
-        vec!["node".to_string(), "-e".to_string(), script],
-        Vec::new(),
-    )
-    .await
-    .unwrap_or_default();
+    let (out, _code) = container
+        .exec_oneshot_as(
+            "claude",
+            vec!["node".to_string(), "-e".to_string(), script],
+            Vec::new(),
+        )
+        .await
+        .unwrap_or_default();
 
     let version: &str = out.trim();
     // A version, not a range or a URL: anything else goes to the fallback
@@ -414,7 +413,8 @@ pub async fn install_browser(
     container_id: &str,
     target: BrowserTarget,
 ) -> Result<BrowserSetupOutcome, String> {
-    let before = detect::detect(container_id).await?;
+    let container = ContainerTarget::docker(container_id);
+    let before = detect::detect_in(&container).await?;
     let Some(cli) = before.playwright_cli.clone() else {
         return Err(
             "Playwright isn't installed in this container yet, so there is nothing to install a \
@@ -458,7 +458,7 @@ pub async fn install_browser(
         project_id,
         "Step 1/3 — checking whether this container already has the browser system libraries…",
     );
-    let state = check_libraries(container_id, &cli, target).await;
+    let state = check_libraries(&container, &cli, target).await;
     match &state {
         LibraryState::Present => {
             emit_progress(
@@ -482,7 +482,7 @@ pub async fn install_browser(
             let deps = run_step(
                 app,
                 project_id,
-                container_id,
+                &container,
                 "root",
                 "/tmp",
                 vec![
@@ -530,7 +530,7 @@ pub async fn install_browser(
     let dl = run_step(
         app,
         project_id,
-        container_id,
+        &container,
         user,
         workdir,
         vec![
@@ -559,7 +559,7 @@ pub async fn install_browser(
         project_id,
         &format!("Step 3/3 — checking that {} actually launches…", target.cli_name()),
     );
-    let verdict = verify_launch(container_id, &before, target).await;
+    let verdict = verify_launch(&container, &before, target).await;
     push_section(&mut log, &verdict.detail);
     if !verdict.ok {
         warning = merge(
@@ -590,7 +590,7 @@ pub async fn install_browser(
     }
 
     emit_progress(app, project_id, "Re-checking what the container has…");
-    let detection = detect::detect(container_id).await?;
+    let detection = detect::detect_in(&container).await?;
 
     Ok(BrowserSetupOutcome {
         detection,
@@ -642,9 +642,12 @@ impl LibraryState {
 /// dpkg's status file. A *missing* package on such an image is simply not in
 /// any index, so apt fails, Playwright reports the failure, and this returns
 /// [`LibraryState::Unknown`] — which installs, which is the right answer.
-async fn check_libraries(container_id: &str, cli: &str, target: BrowserTarget) -> LibraryState {
-    let run = exec_oneshot_as(
-        container_id,
+async fn check_libraries(
+    container: &ContainerTarget,
+    cli: &str,
+    target: BrowserTarget,
+) -> LibraryState {
+    let run = container.exec_oneshot_as(
         "root",
         vec![
             "node".to_string(),
@@ -708,7 +711,7 @@ struct LaunchVerdict {
 /// Launch the browser headless, load one page, and close it. Seconds, and it is
 /// the only thing that distinguishes "downloaded" from "usable".
 async fn verify_launch(
-    container_id: &str,
+    container: &ContainerTarget,
     detection: &PlaywrightDetection,
     target: BrowserTarget,
 ) -> LaunchVerdict {
@@ -724,8 +727,7 @@ async fn verify_launch(
     };
     let dir = manifest.trim_end_matches("package.json").trim_end_matches('/');
 
-    let run = exec_oneshot_as(
-        container_id,
+    let run = container.exec_oneshot_as(
         "claude",
         vec![
             "node".to_string(),
@@ -884,13 +886,13 @@ impl StepResult {
 /// Run one command in the container, streaming every line it prints to the pane
 /// as `container-progress` and keeping the tail for the result.
 ///
-/// Uses `create_attached_exec_as` — the single attached-exec path — rather than
+/// Uses [`ContainerTarget::attach`] — the single attached-exec path — rather than
 /// `exec_oneshot`, because these commands run for minutes and the point is that
 /// the user can watch them.
 async fn run_step(
     app: &AppHandle,
     project_id: &str,
-    container_id: &str,
+    container: &ContainerTarget,
     user: &str,
     workdir: &str,
     cmd: Vec<String>,
@@ -900,7 +902,14 @@ async fn run_step(
         exec_id,
         mut output,
         input,
-    } = create_attached_exec_as(container_id, cmd, false, user, workdir).await?;
+    } = container
+        .attach(
+            ExecSpec::new(cmd)
+                .tty(false)
+                .user(user)
+                .working_dir(Some(workdir)),
+        )
+        .await?;
 
     // Nothing is ever written to this exec. Closing stdin means anything that
     // would prompt sees EOF and gives up, instead of waiting for a person who
@@ -944,7 +953,7 @@ async fn run_step(
         )),
         Ok(Err(e)) => Err(e),
         Ok(Ok(())) => Ok(StepResult {
-            exit_code: wait_for_exec_exit(&exec_id).await.unwrap_or(0),
+            exit_code: container.wait_exec_exit(&exec_id).await.unwrap_or(0),
             log,
         }),
     }

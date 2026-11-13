@@ -76,8 +76,7 @@ use tauri::{AppHandle, Emitter, State};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot, Mutex};
 
-use crate::docker::container::is_container_running;
-use crate::docker::exec::{create_attached_exec, wait_for_exec_exit, AttachedExec};
+use crate::host::{AttachedExec, ContainerTarget};
 use crate::storage::secure;
 use crate::AppState;
 
@@ -867,7 +866,7 @@ async fn type_code_then_enter<W: tokio::io::AsyncWrite + Unpin>(
 async fn run_setup_token(
     app: &AppHandle,
     project_id: &str,
-    container_id: &str,
+    target: &ContainerTarget,
     mut input_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     mut cancel_rx: oneshot::Receiver<()>,
 ) -> Result<String, String> {
@@ -877,16 +876,16 @@ async fn run_setup_token(
         exec_id,
         mut output,
         mut input,
-    } = create_attached_exec(
-        container_id,
-        vec![
-            "sh".to_string(),
-            "-c".to_string(),
-            SETUP_TOKEN_SCRIPT.to_string(),
-        ],
-        true,
-    )
-    .await?;
+    } = target
+        .attach_exec(
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                SETUP_TOKEN_SCRIPT.to_string(),
+            ],
+            true,
+        )
+        .await?;
 
     let mut stripper = AnsiStripper::default();
     let mut redactor = SecretRedactor::default();
@@ -1041,7 +1040,7 @@ async fn run_setup_token(
     // Falling through to the token parse is right either way — a run that
     // printed a token succeeded whatever Docker says about it — but it is worth
     // saying so rather than silently calling it a clean exit.
-    match wait_for_exec_exit(&exec_id).await {
+    match target.wait_exec_exit(&exec_id).await {
         Some(0) => {}
         Some(code) => {
             return Err(format!(
@@ -1091,13 +1090,13 @@ pub async fn acquire_claude_token(
         .get(&project_id)
         .ok_or_else(|| format!("Project {} not found", project_id))?;
 
-    let container_id = project.container_id.clone().ok_or_else(|| {
+    let target = ContainerTarget::for_project(&project).ok_or_else(|| {
         format!(
             "Project '{}' has no container yet. Start it, then run authentication again.",
             project.name
         )
     })?;
-    if !is_container_running(&container_id).await.unwrap_or(false) {
+    if !target.is_running().await.unwrap_or(false) {
         return Err(format!(
             "The container for '{}' is not running. Start it, then run authentication again.",
             project.name
@@ -1133,8 +1132,7 @@ pub async fn acquire_claude_token(
         "Running `claude setup-token` — sign in at the URL below, then submit the code it gives you.",
     );
 
-    let result =
-        run_setup_token(&app_handle, &project_id, &container_id, input_rx, cancel_rx).await;
+    let result = run_setup_token(&app_handle, &project_id, &target, input_rx, cancel_rx).await;
 
     // Release the flow. Nothing else needs unwinding: this command changes no
     // persisted state until the token itself is stored, which is the point.

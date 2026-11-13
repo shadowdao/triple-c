@@ -12,8 +12,9 @@
 //!
 //! ## Container access
 //!
-//! All work happens inside the container via the existing `docker exec`
-//! plumbing in [`crate::docker::exec`] — no second mechanism is introduced.
+//! All work happens inside the container via the existing exec plumbing,
+//! reached through [`crate::host::ContainerTarget`] — no second mechanism is
+//! introduced.
 //! The heavy lifting (walking dirs, grepping transcripts, parsing JSON with
 //! `jq`) runs *in* the container and only a small JSON summary crosses the
 //! wire, so multi-megabyte transcripts are never streamed back.
@@ -56,14 +57,11 @@
 //! commands fail loudly, since they cannot do anything useful without a
 //! running container.
 
-use bollard::exec::{CreateExecOptions, StartExecOptions};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
-use crate::docker::client::get_docker;
-use crate::docker::container::is_container_running;
-use crate::docker::exec::{exec_oneshot_env, exec_oneshot_env_status};
 use crate::docker::CONTAINER_HOME;
+use crate::host::{ContainerTarget, ExecSpec};
 use crate::AppState;
 
 /// Newest N session transcripts to inspect. Caps the work done inside the
@@ -192,7 +190,7 @@ pub struct SchedulerNotification {
 // Shared helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Resolve a project to a *running* container id.
+/// Resolve a project to its *running* container.
 ///
 /// `Ok(None)` means "there is nothing to inspect" — no container recorded, or
 /// the container exists but is stopped. Callers that are read-only turn that
@@ -201,19 +199,19 @@ pub struct SchedulerNotification {
 async fn running_container_for(
     project_id: &str,
     state: &State<'_, AppState>,
-) -> Result<Option<String>, String> {
+) -> Result<Option<ContainerTarget>, String> {
     let project = state
         .projects_store
         .get(project_id)
         .ok_or_else(|| format!("Project {} not found", project_id))?;
 
-    let container_id = match project.container_id {
-        Some(id) => id,
+    let target = match ContainerTarget::for_project(&project) {
+        Some(t) => t,
         None => return Ok(None),
     };
 
-    if is_container_running(&container_id).await.unwrap_or(false) {
-        Ok(Some(container_id))
+    if target.is_running().await.unwrap_or(false) {
+        Ok(Some(target))
     } else {
         Ok(None)
     }
@@ -224,7 +222,7 @@ async fn running_container_for(
 async fn require_running_container(
     project_id: &str,
     state: &State<'_, AppState>,
-) -> Result<String, String> {
+) -> Result<ContainerTarget, String> {
     running_container_for(project_id, state).await?.ok_or_else(|| {
         "Container is not running — start the project first.".to_string()
     })
@@ -240,13 +238,13 @@ fn home_env() -> Vec<String> {
 /// the first line) so the combined stream `exec_oneshot_env` returns is pure
 /// stdout and stays parseable as JSON. A non-zero exit therefore surfaces as
 /// empty output, which the callers treat as "nothing to report".
-async fn run_script(container_id: &str, script: impl Into<String>) -> Result<String, String> {
-    exec_oneshot_env(
-        container_id,
-        vec!["sh".to_string(), "-c".to_string(), script.into()],
-        home_env(),
-    )
-    .await
+async fn run_script(target: &ContainerTarget, script: impl Into<String>) -> Result<String, String> {
+    target
+        .exec_oneshot_env(
+            vec!["sh".to_string(), "-c".to_string(), script.into()],
+            home_env(),
+        )
+        .await
 }
 
 /// Parse script output as JSON, degrading to a default value (and a log line)
@@ -315,11 +313,11 @@ pub(crate) fn validate_session_id(id: &str) -> Result<(), String> {
 /// Run `triple-c-scheduler <args…>` as a bare argv vector — no shell is
 /// involved, so caller-supplied ids cannot be interpreted as shell syntax.
 /// Returns the combined output, erroring with it on a non-zero exit.
-async fn run_scheduler(container_id: &str, args: Vec<String>) -> Result<String, String> {
+async fn run_scheduler(target: &ContainerTarget, args: Vec<String>) -> Result<String, String> {
     let mut cmd = vec!["triple-c-scheduler".to_string()];
     cmd.extend(args);
 
-    let (output, exit_code) = exec_oneshot_env_status(container_id, cmd, home_env()).await?;
+    let (output, exit_code) = target.exec_oneshot_env_status(cmd, home_env()).await?;
     if exit_code != 0 {
         let detail = output.trim();
         return Err(if detail.is_empty() {
@@ -395,8 +393,8 @@ pub async fn list_claude_sessions(
     project_id: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<ClaudeSession>, String> {
-    let container_id = match running_container_for(&project_id, &state).await? {
-        Some(id) => id,
+    let target = match running_container_for(&project_id, &state).await? {
+        Some(t) => t,
         None => return Ok(Vec::new()),
     };
 
@@ -404,7 +402,7 @@ pub async fn list_claude_sessions(
     // a const usize — never from the caller.
     let script = SESSIONS_SCRIPT.replace("__MAX__", &MAX_SESSIONS.to_string());
 
-    let raw = run_script(&container_id, script).await?;
+    let raw = run_script(&target, script).await?;
     let sessions: Vec<RawSession> = parse_or_default(&raw, "session list");
 
     Ok(sessions
@@ -566,12 +564,12 @@ pub async fn list_container_capabilities(
     project_id: String,
     state: State<'_, AppState>,
 ) -> Result<ContainerCapabilities, String> {
-    let container_id = match running_container_for(&project_id, &state).await? {
-        Some(id) => id,
+    let target = match running_container_for(&project_id, &state).await? {
+        Some(t) => t,
         None => return Ok(ContainerCapabilities::default()),
     };
 
-    let raw = run_script(&container_id, CAPABILITIES_SCRIPT).await?;
+    let raw = run_script(&target, CAPABILITIES_SCRIPT).await?;
     Ok(parse_or_default(&raw, "container capabilities"))
 }
 
@@ -681,12 +679,12 @@ pub async fn list_scheduled_tasks(
     project_id: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<ScheduledTask>, String> {
-    let container_id = match running_container_for(&project_id, &state).await? {
-        Some(id) => id,
+    let target = match running_container_for(&project_id, &state).await? {
+        Some(t) => t,
         None => return Ok(Vec::new()),
     };
 
-    let raw = run_script(&container_id, SCHEDULER_LIST_SCRIPT).await?;
+    let raw = run_script(&target, SCHEDULER_LIST_SCRIPT).await?;
     let tasks: Vec<RawScheduledTask> = parse_or_default(&raw, "scheduled tasks");
 
     Ok(tasks
@@ -731,13 +729,13 @@ pub async fn get_scheduled_task_log(
     // Clamped, and an integer by type — cannot carry shell syntax.
     let tail = tail_lines.unwrap_or(200).clamp(1, 5000);
 
-    let container_id = match running_container_for(&project_id, &state).await? {
-        Some(id) => id,
+    let target = match running_container_for(&project_id, &state).await? {
+        Some(t) => t,
         None => return Ok(String::new()),
     };
 
     run_scheduler(
-        &container_id,
+        &target,
         vec![
             "logs".to_string(),
             "--id".to_string(),
@@ -756,15 +754,15 @@ pub async fn get_scheduler_notifications(
     project_id: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<SchedulerNotification>, String> {
-    let container_id = match running_container_for(&project_id, &state).await? {
-        Some(id) => id,
+    let target = match running_container_for(&project_id, &state).await? {
+        Some(t) => t,
         None => return Ok(Vec::new()),
     };
 
     let script =
         SCHEDULER_NOTIFICATIONS_SCRIPT.replace("__MAX__", &MAX_NOTIFICATIONS.to_string());
 
-    let raw = run_script(&container_id, script).await?;
+    let raw = run_script(&target, script).await?;
     let notifications: Vec<RawNotification> = parse_or_default(&raw, "scheduler notifications");
 
     Ok(notifications
@@ -1140,9 +1138,9 @@ pub async fn add_scheduled_task(
         &schedule,
         working_dir.as_deref(),
     )?;
-    let container_id = require_running_container(&project_id, &state).await?;
+    let target = require_running_container(&project_id, &state).await?;
 
-    let output = run_scheduler(&container_id, input.add_args()).await?;
+    let output = run_scheduler(&target, input.add_args()).await?;
     let task_id = parse_created_task_id(&output).ok_or_else(|| {
         format!(
             "The scheduler did not report a task id. Its output was: {}",
@@ -1200,9 +1198,9 @@ pub async fn update_scheduled_task(
         &schedule,
         working_dir.as_deref(),
     )?;
-    let container_id = require_running_container(&project_id, &state).await?;
+    let target = require_running_container(&project_id, &state).await?;
 
-    let output = run_scheduler(&container_id, input.add_args()).await?;
+    let output = run_scheduler(&target, input.add_args()).await?;
     let new_id = parse_created_task_id(&output).ok_or_else(|| {
         format!(
             "The scheduler did not report a task id, so the original task was left in place. Its output was: {}",
@@ -1211,7 +1209,7 @@ pub async fn update_scheduled_task(
     })?;
 
     run_scheduler(
-        &container_id,
+        &target,
         vec!["remove".to_string(), "--id".to_string(), task_id.clone()],
     )
     .await
@@ -1224,7 +1222,7 @@ pub async fn update_scheduled_task(
 
     if enabled == Some(false) {
         if let Err(e) = run_scheduler(
-            &container_id,
+            &target,
             vec!["disable".to_string(), "--id".to_string(), new_id.clone()],
         )
         .await
@@ -1253,11 +1251,11 @@ pub async fn set_scheduled_task_enabled(
     state: State<'_, AppState>,
 ) -> Result<String, String> {
     validate_task_id(&task_id)?;
-    let container_id = require_running_container(&project_id, &state).await?;
+    let target = require_running_container(&project_id, &state).await?;
 
     let subcommand = if enabled { "enable" } else { "disable" };
     let output = run_scheduler(
-        &container_id,
+        &target,
         vec![subcommand.to_string(), "--id".to_string(), task_id],
     )
     .await?;
@@ -1277,39 +1275,20 @@ pub async fn run_scheduled_task_now(
     state: State<'_, AppState>,
 ) -> Result<String, String> {
     validate_task_id(&task_id)?;
-    let container_id = require_running_container(&project_id, &state).await?;
+    let target = require_running_container(&project_id, &state).await?;
 
-    let docker = get_docker()?;
-    let exec = docker
-        .create_exec(
-            &container_id,
-            CreateExecOptions {
-                attach_stdout: Some(false),
-                attach_stderr: Some(false),
-                // Argv vector — no shell, so `task_id` is inert as data.
-                cmd: Some(vec![
-                    "triple-c-scheduler".to_string(),
-                    "run".to_string(),
-                    "--id".to_string(),
-                    task_id.clone(),
-                ]),
-                env: Some(home_env()),
-                user: Some("claude".to_string()),
-                working_dir: Some("/workspace".to_string()),
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(|e| format!("Failed to create exec: {}", e))?;
-
-    docker
-        .start_exec(
-            &exec.id,
-            Some(StartExecOptions {
-                detach: true,
-                ..Default::default()
-            }),
-        )
+    // Argv vector — no shell, so `task_id` is inert as data. Stdin, stdout and
+    // stderr are all left unattached; the exec is started detached.
+    let spec = ExecSpec::new(vec![
+        "triple-c-scheduler".to_string(),
+        "run".to_string(),
+        "--id".to_string(),
+        task_id.clone(),
+    ])
+    .env(home_env())
+    .no_stdin();
+    let exec_id = target
+        .exec_detached(spec)
         .await
         .map_err(|e| format!("Failed to start task: {}", e))?;
 
@@ -1317,7 +1296,7 @@ pub async fn run_scheduled_task_now(
         "Triggered scheduler task {} in project {} (detached exec {})",
         task_id,
         project_id,
-        exec.id
+        exec_id
     );
     Ok(format!("Task {} started.", task_id))
 }
@@ -1330,10 +1309,10 @@ pub async fn remove_scheduled_task(
     state: State<'_, AppState>,
 ) -> Result<String, String> {
     validate_task_id(&task_id)?;
-    let container_id = require_running_container(&project_id, &state).await?;
+    let target = require_running_container(&project_id, &state).await?;
 
     let output = run_scheduler(
-        &container_id,
+        &target,
         vec!["remove".to_string(), "--id".to_string(), task_id],
     )
     .await?;
@@ -1346,9 +1325,9 @@ pub async fn clear_scheduler_notifications(
     project_id: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let container_id = require_running_container(&project_id, &state).await?;
+    let target = require_running_container(&project_id, &state).await?;
     run_scheduler(
-        &container_id,
+        &target,
         vec!["notifications".to_string(), "--clear".to_string()],
     )
     .await?;
