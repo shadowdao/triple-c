@@ -15,8 +15,16 @@ const TASK_RUNNER: &str = include_str!("../../../../container/triple-c-task-runn
 const OSC52_CLIPBOARD: &str = include_str!("../../../../container/osc52-clipboard");
 const AUDIO_SHIM: &str = include_str!("../../../../container/audio-shim");
 const SSO_REFRESH: &str = include_str!("../../../../container/triple-c-sso-refresh");
+const TRIPLE_C_OPEN: &str = include_str!("../../../../container/triple-c-open");
+const PLAYWRIGHT_HEAL: &str = include_str!("../../../../container/triple-c-playwright-heal");
 
 static MISSION_CONTROL_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/../../container/mission-control");
+static SKILLS_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/../../container/skills");
+// The agent crate's sources only — never the whole crate directory, which can
+// hold a multi-hundred-megabyte `target/` from a local build.
+const AGENT_CARGO_TOML: &str = include_str!("../../../../container/triple-c-agent/Cargo.toml");
+const AGENT_CARGO_LOCK: &str = include_str!("../../../../container/triple-c-agent/Cargo.lock");
+static AGENT_SRC_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/../../container/triple-c-agent/src");
 
 pub async fn image_exists(image_name: &str) -> Result<bool, String> {
     let docker = get_docker()?;
@@ -137,10 +145,28 @@ where
 
     let tar_bytes = create_build_context().map_err(|e| format!("Failed to create build context: {}", e))?;
 
+    // The Dockerfile builds `triple-c-agent` in a stage pinned to
+    // `$BUILDPLATFORM` and cross-compiles for `$TARGETARCH`, so CI's arm64
+    // image compiles natively instead of under QEMU. BuildKit predefines both;
+    // the classic builder this API call uses does not, and an empty
+    // `--platform=` fails the build outright (verified, Engine 29.9). So pass
+    // them, describing the daemon's own platform: a local build is always
+    // native.
+    let arch = docker
+        .version()
+        .await
+        .ok()
+        .and_then(|v| v.arch)
+        .filter(|a| !a.is_empty())
+        .unwrap_or_else(|| native_docker_arch().to_string());
+    let build_platform = format!("linux/{}", arch);
+    let buildargs = local_build_args(&build_platform, &arch);
+
     let options = BuildImageOptions {
         t: full_name.as_str(),
         rm: true,
         forcerm: true,
+        buildargs,
         ..Default::default()
     };
 
@@ -191,6 +217,20 @@ fn append_embedded_dir(
     Ok(())
 }
 
+/// Docker's name for this machine's architecture, for when the daemon does
+/// not say.
+fn native_docker_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "amd64",
+        other => other,
+    }
+}
+
+fn local_build_args<'a>(build_platform: &'a str, arch: &'a str) -> HashMap<&'a str, &'a str> {
+    HashMap::from([("BUILDPLATFORM", build_platform), ("TARGETARCH", arch)])
+}
+
 fn create_build_context() -> Result<Vec<u8>, std::io::Error> {
     let mut buf = Vec::new();
     {
@@ -203,14 +243,60 @@ fn create_build_context() -> Result<Vec<u8>, std::io::Error> {
         append_file_to_archive(&mut archive, "osc52-clipboard", OSC52_CLIPBOARD.as_bytes(), 0o755)?;
         append_file_to_archive(&mut archive, "audio-shim", AUDIO_SHIM.as_bytes(), 0o755)?;
         append_file_to_archive(&mut archive, "triple-c-sso-refresh", SSO_REFRESH.as_bytes(), 0o755)?;
+        append_file_to_archive(&mut archive, "triple-c-open", TRIPLE_C_OPEN.as_bytes(), 0o755)?;
+        append_file_to_archive(&mut archive, "triple-c-playwright-heal", PLAYWRIGHT_HEAL.as_bytes(), 0o755)?;
 
         append_embedded_dir(&mut archive, &MISSION_CONTROL_DIR, "mission-control")?;
+        append_embedded_dir(&mut archive, &SKILLS_DIR, "skills")?;
+        append_file_to_archive(&mut archive, "triple-c-agent/Cargo.toml", AGENT_CARGO_TOML.as_bytes(), 0o644)?;
+        append_file_to_archive(&mut archive, "triple-c-agent/Cargo.lock", AGENT_CARGO_LOCK.as_bytes(), 0o644)?;
+        append_embedded_dir(&mut archive, &AGENT_SRC_DIR, "triple-c-agent/src")?;
 
         archive.finish()?;
     }
 
     let _ = buf.flush();
     Ok(buf)
+}
+
+#[cfg(test)]
+mod build_context_tests {
+    use super::{create_build_context, DOCKERFILE};
+
+    /// The local build (`ImageSource::LocalBuild`) ships the Dockerfile with a
+    /// hand-assembled context, and nothing else checks the two agree: CI builds
+    /// from the real `container/` directory, so a `COPY` of something missing
+    /// here only fails for users who build locally. That went unnoticed for
+    /// `skills`, `triple-c-open` and `triple-c-playwright-heal`. Every `COPY`
+    /// source (not `--from=` stages) must be present as a file or directory
+    /// prefix in the archive.
+    #[test]
+    fn every_dockerfile_copy_source_is_in_the_local_build_context() {
+        let tar_bytes = create_build_context().expect("context builds");
+        let mut archive = tar::Archive::new(&tar_bytes[..]);
+        let paths: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+            .collect();
+        let mut missing = Vec::new();
+        for line in DOCKERFILE.lines() {
+            let line = line.trim();
+            let Some(rest) = line.strip_prefix("COPY ") else { continue };
+            let args: Vec<&str> = rest.split_whitespace().filter(|a| !a.starts_with("--")).collect();
+            if rest.contains("--from=") || args.len() < 2 {
+                continue;
+            }
+            for src in &args[..args.len() - 1] {
+                let src = src.trim_end_matches('/');
+                let present = paths.iter().any(|p| p == src || p.starts_with(&format!("{}/", src)));
+                if !present {
+                    missing.push(src.to_string());
+                }
+            }
+        }
+        assert!(missing.is_empty(), "COPY sources missing from the local build context: {:?}", missing);
+    }
 }
 
 #[cfg(all(test, unix))]

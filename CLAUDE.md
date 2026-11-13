@@ -283,8 +283,12 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
     feature (containers labelled `triple-c.mcp-server`, `triple-c-net-*` networks). Deletable once
     users have migrated.
 - **`host/`** — Where a project's container runs, and the only way into it. `ContainerTarget`
-  (one `Docker` variant today; AWS planned — `docs/superpowers/specs/2026-11-13-aws-ecs-host-design.md`)
+  (`Docker`, and `Agent` — reached through the in-container `triple-c-agent` by `agent.rs`, per
+  `docs/superpowers/specs/2026-11-13-triple-c-agent-protocol.md`; AWS planned —
+  `docs/superpowers/specs/2026-11-13-aws-ecs-host-design.md`)
   wraps execs, file transfer and `is_running`; `sessions.rs` holds `ExecSessionManager`.
+  `agent.rs` reuses `docker/exec.rs`'s `OneshotOutput`, host-file reader and uid probe so the two
+  variants cannot drift; an `Agent` target's token never appears in `Debug` or error text.
   **Container-interior code must go through `ContainerTarget`, never `docker::exec`, bollard or
   `get_docker()`** — `host::tests::no_container_interior_bollard_outside_the_host_layer` fails
   the build on it. `lifecycle.rs`'s `ProjectHost` owns create/start/stop/find/remove and
@@ -334,6 +338,19 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   subscription) is what flips a project whose container exits on its own to Stopped and emits
   `project-container-exited` with a `reason` (`exited` toasts; `found_stopped`, the first look of a run, is silent); `useProjectStatusEvents` applies it
 - **`triple-c-scheduler`** — Bash-based scheduled task system for recurring Claude Code invocations
+- **`triple-c-agent/`** — the in-container agent (its own Rust crate; protocol in
+  `docs/superpowers/specs/2026-11-13-triple-c-agent-protocol.md`). Built static by the Dockerfile's
+  `agent-build` stage, started by `entrypoint.sh` **only when a token is configured**, last, as root
+  under a supervisor loop. **Its contract is Docker parity**: an `ExecSpec` must behave through the
+  agent exactly as through `docker exec`. Any change to exec semantics on either side is checked by
+  `host::agent::live_tests::the_agent_answers_exactly_as_docker_exec_does` (ignored; needs an image
+  with the agent — see the crate README). The token never stays in the environment and never touches the
+  writable layer: the entrypoint moves it to a root-only file on `/dev/shm` (tmpfs — a file in the
+  writable layer would ride `docker commit` into the snapshot image) before anything runs, and the
+  agent refuses a token file others can read. The agent is started from an env/cwd snapshot taken
+  at the top of the entrypoint and held **in memory only** (it contains every API key in the env),
+  so execs see the container's configured env, not the script's. The app treats the agent as
+  untrusted: no redirects, capped bodies, timeouts on every small call (`host/agent.rs`).
 
 **`/home/claude` in the image is seed-only.** It is the mount point of the named volume
 `triple-c-home-{projectId}`, so after a project's *first* start the image's copy of that directory

@@ -13,6 +13,50 @@
 # upgradable content in /usr/local/bin or /opt, or seed it from here.
 # See "Container Lifecycle" in the repo's CLAUDE.md.
 
+# ── triple-c-agent token: off the environment before anything else runs ───
+# The agent (started at the very end, see start_agent) authenticates every
+# request with this token, and it runs as root, so the token is effectively
+# root in this container. Given as an env var it would be inherited by every
+# process this script starts (cron, the scheduler, Claude sessions spawned by
+# the agent). So it moves to a root-only file *first* and leaves the
+# environment; the agent reads the file. A `docker exec` session still sees
+# the container's configured env — the local test harness passes it that way
+# and accepts that; on AWS nothing is started by `docker exec`.
+#
+# The agent also takes its exec environment and default working directory
+# from how *it* was started, and execs must see what `docker exec` would: the
+# container's configured env and WorkingDir, not whatever this script has
+# exported or cd'd into by the time it gets to start_agent. So both are
+# snapshotted here, before anything else runs, and the agent is started from
+# the snapshot (`env -i`). The agent drops its own TRIPLEC_AGENT_* settings.
+# >>> agent_token
+agent_cwd=$PWD
+# The token goes on a tmpfs, never the container's writable layer: a file
+# there would persist after stop and ride `docker commit` into the project's
+# snapshot image (the commit's SECRET_ENV_KEYS scrub covers env, not files).
+# /dev/shm is a tmpfs in Docker and on Fargate; anything else is refused.
+if [ -n "${TRIPLEC_AGENT_TOKEN:-}" ]; then
+    if [ "$(stat -f -c %T /dev/shm 2>/dev/null)" = tmpfs ]; then
+        mkdir -p /dev/shm/triple-c
+        chown root:root /dev/shm/triple-c
+        chmod 700 /dev/shm/triple-c
+        ( umask 077; printf '%s' "$TRIPLEC_AGENT_TOKEN" > /dev/shm/triple-c/agent-token )
+        export TRIPLEC_AGENT_TOKEN_FILE=/dev/shm/triple-c/agent-token
+    else
+        echo "triple-c-agent: /dev/shm is not a tmpfs; not writing the token to disk — agent disabled" >&2
+    fi
+    unset TRIPLEC_AGENT_TOKEN
+fi
+# The exec environment snapshot stays in this script's memory — it holds the
+# container's whole configured env, API keys included, so it must not touch
+# disk either. Minus what bash itself exports (PWD, OLDPWD, SHLVL, `_`):
+# those are this script's, not the container's, and `docker exec` has none.
+agent_env=()
+if [ -n "${TRIPLEC_AGENT_TOKEN_FILE:-}" ]; then
+    mapfile -d '' agent_env < <(env -u PWD -u OLDPWD -u SHLVL -u _ -0)
+fi
+# <<< agent_token
+
 # ── UID/GID remapping ──────────────────────────────────────────────────────
 # Match the container's claude user to the host user's UID/GID so that
 # bind-mounted files (project dir, docker socket) have correct ownership.
@@ -766,6 +810,41 @@ timeout 120 su -s /bin/bash claude -c 'export PATH="/home/claude/.claude/bin:/ho
 #    already in trouble. The pause is `read -t` on a FIFO nobody writes —
 #    a builtin, so it still works when fork does not — with `sleep 1` as the
 #    fallback should the FIFO be unavailable.
+# ── triple-c-agent ──────────────────────────────────────────────────────────
+# The app's way into the container on hosts without a Docker API (AWS, over
+# an SSM port-forward). Started only when a token was provided, and only now,
+# after every setup step above, so "the agent answers /v1/health" also means
+# "the container is set up" — the AWS host's readiness signal.
+#
+# Same survival rules as the keepalive below, for the same reason: it runs as
+# root under a root supervisor loop, so a claude-user `pkill`/`kill -9 -1`
+# gets EPERM, and a crash is restarted (throttled: a binary that exits at
+# once must not spin a core).
+# >>> start_agent
+start_agent() {
+    [ -n "${TRIPLEC_AGENT_TOKEN_FILE:-}" ] || return 0
+    if [ ! -x /usr/local/bin/triple-c-agent ]; then
+        echo "triple-c-agent: token given but no agent binary in this image — not starting it" >&2
+        return 0
+    fi
+    (
+        # Keeps the supervisor alive through a stray HUP. The agent resets
+        # every signal disposition and the mask in each exec it spawns, so this
+        # does not leak into commands (an ignored SIGHUP otherwise survives
+        # exec and turns every exec into `nohup`).
+        trap '' HUP
+        cd "$agent_cwd" || cd /
+        while :; do
+            agent_started=$SECONDS
+            env -i "${agent_env[@]}" /usr/local/bin/triple-c-agent
+            echo "triple-c-agent exited ($?) — restarting" >&2
+            [ $((SECONDS - agent_started)) -ge 5 ] || sleep 5
+        done
+    ) &
+}
+# <<< start_agent
+start_agent
+
 echo "Triple-C container ready."
 keepalive_pid=""
 stop_keepalive() {

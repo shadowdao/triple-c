@@ -84,6 +84,9 @@ on:
       - "app/**"
       - "VERSION"
       - ".gitea/workflows/build-app-preview.yml"
+      # The app embeds the agent's sources for its local image build, and the
+      # agent's own tests run in the `test` job below.
+      - "container/triple-c-agent/**"
   workflow_dispatch:
 
 jobs:
@@ -328,6 +331,16 @@ jobs:
       # one, for the same reason the frontend uses `npm ci`.
       - name: Backend tests (cargo test)
         working-directory: ./app/src-tauri
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo test --locked
+
+      # The in-container agent is its own crate (container/triple-c-agent): a
+      # real server on loopback, exercised over HTTP/WebSocket as the current
+      # user. Its root-only test is #[ignore]d. The Docker-parity test against
+      # a real container lives in the app (host::agent::live_tests, ignored).
+      - name: Agent tests (cargo test)
+        working-directory: ./container/triple-c-agent
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
           cargo test --locked

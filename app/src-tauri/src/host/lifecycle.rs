@@ -25,6 +25,13 @@ pub enum ProjectHost {
     Docker,
 }
 
+/// An agent target is a way *into* a container, not a handle on its
+/// lifecycle: whatever runs the container (ECS, the local harness) stops and
+/// removes it. Reaching here means a caller paired the Docker host with an
+/// agent target, which is a bug to surface, not a panic.
+const AGENT_LIFECYCLE: &str =
+    "{op} a container is not supported for an agent target; the host that runs it owns its lifecycle";
+
 /// What a host could not clean up when asked to discard a project's state.
 /// Docker: the snapshot image and the named volumes.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -71,6 +78,7 @@ impl ProjectHost {
     pub async fn stop(&self, target: &ContainerTarget) -> Result<(), String> {
         match target {
             ContainerTarget::Docker { container_id } => docker::stop_container(container_id).await,
+            ContainerTarget::Agent(_) => Err(AGENT_LIFECYCLE.replace("{op}", "Stopping")),
         }
     }
 
@@ -81,6 +89,7 @@ impl ProjectHost {
                 let _ = docker::stop_container(container_id).await;
                 docker::remove_container(container_id).await
             }
+            ContainerTarget::Agent(_) => Err(AGENT_LIFECYCLE.replace("{op}", "Removing")),
         }
     }
 
