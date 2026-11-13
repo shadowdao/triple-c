@@ -29,6 +29,7 @@ use serde::Deserialize;
 use tokio::io::AsyncWrite;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
+use crate::host::OUTPUT_LIMIT_MARKER;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::PollSender;
 
@@ -45,6 +46,20 @@ use crate::docker::exec::{
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// `is_running` is a liveness probe; it answers quickly or says "no".
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
+/// Whole-request ceiling for the small calls (detached start, exec status,
+/// resize) and for reading any small body. The agent is not trusted: one that
+/// accepts a connection and then says nothing must not hang the app. One-shot
+/// execs, attach and archive have *no* overall timeout — commands can
+/// legitimately run long and send nothing until they finish, as with Docker.
+#[cfg(not(test))]
+const SMALL_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+/// Short in tests, so the hostile-agent tests finish quickly.
+#[cfg(test)]
+const SMALL_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
+/// Largest WebSocket message either side may send; the agent enforces the same
+/// (its output frames are at most 32 KiB). Stdin is split to fit.
+const WS_MAX_MESSAGE: usize = 1024 * 1024;
+const STDIN_FRAME_MAX: usize = 64 * 1024;
 /// How long an attach waits for the agent's `started` reply after the
 /// handshake. Spawning a process is fast; this only bounds a wedged agent.
 const ATTACH_START_TIMEOUT: Duration = Duration::from_secs(30);
@@ -86,9 +101,15 @@ impl AgentEndpoint {
         }
         base_url.set_query(None);
         base_url.set_fragment(None);
+        let token = token.into();
+        // It goes in an HTTP header; refuse anything that cannot, here, once,
+        // rather than failing (or silently degrading) on every request.
+        if token.is_empty() || !token.bytes().all(|b| b.is_ascii_graphic()) {
+            return Err("An agent token must be non-empty printable ASCII with no spaces".to_string());
+        }
         Ok(Self {
             base_url,
-            token: token.into(),
+            token,
         })
     }
 
@@ -113,6 +134,15 @@ impl AgentEndpoint {
 
     fn bearer(&self) -> String {
         format!("Bearer {}", self.token)
+    }
+
+    /// The `Authorization` header, marked sensitive so it is never logged or
+    /// shown by `Debug` (reqwest/hyper honour the flag).
+    fn auth(&self) -> HeaderValue {
+        let mut v = HeaderValue::from_str(&self.bearer())
+            .unwrap_or_else(|_| HeaderValue::from_static("Bearer invalid-token"));
+        v.set_sensitive(true);
+        v
     }
 }
 
@@ -152,7 +182,10 @@ const ERROR_TEXT_CAP: usize = 4 * 1024;
 
 /// Parse a small JSON body, reading at most [`SMALL_BODY_CAP`] bytes.
 async fn small_json<T: serde::de::DeserializeOwned>(resp: reqwest::Response) -> Option<T> {
-    let raw = read_capped(resp, SMALL_BODY_CAP).await.ok()??;
+    let raw = tokio::time::timeout(SMALL_REQUEST_TIMEOUT, read_capped(resp, SMALL_BODY_CAP))
+        .await
+        .ok()?
+        .ok()??;
     serde_json::from_slice(&raw).ok()
 }
 
@@ -254,16 +287,19 @@ async fn exec_oneshot_raw(
         CONTEXT,
         http()
             .post(ep.url("v1/exec"))
-            .header(reqwest::header::AUTHORIZATION, ep.bearer())
+            .header(reqwest::header::AUTHORIZATION, ep.auth())
             .json(&body),
     )
     .await?;
 
     let status = resp.status();
     if status == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
-        // Verbatim: it starts with OUTPUT_LIMIT_MARKER, which callers match.
+        // Verbatim when it is the limit message (callers match on
+        // OUTPUT_LIMIT_MARKER); anything else the agent puts in a 413 is not
+        // trusted to speak for it.
         return Err(error_text(resp)
             .await
+            .filter(|e| e.starts_with(OUTPUT_LIMIT_MARKER))
             .unwrap_or_else(|| output_limit_error(limit)));
     }
     if !status.is_success() {
@@ -350,7 +386,8 @@ pub async fn exec_detached(ep: &AgentEndpoint, spec: &ExecSpec) -> Result<String
         CONTEXT,
         http()
             .post(ep.url("v1/exec/detached"))
-            .header(reqwest::header::AUTHORIZATION, ep.bearer())
+            .timeout(SMALL_REQUEST_TIMEOUT)
+            .header(reqwest::header::AUTHORIZATION, ep.auth())
             .json(&spec_json(spec)),
     )
     .await?;
@@ -413,6 +450,13 @@ fn recorded_exit(base_url: &str, exec_id: &str) -> Option<i64> {
 /// unknown id, a finished exec with no code, or the budget running out —
 /// exactly where `docker::exec::wait_for_exec_exit` says `None`.
 pub async fn wait_exec_exit(ep: &AgentEndpoint, exec_id: &str) -> Option<i64> {
+    // Docker's budget is a number of polls; bound the wall clock too, so a
+    // slow-answering agent cannot stretch it (each poll is also bounded).
+    let budget = EXEC_EXIT_POLL_INTERVAL * EXEC_EXIT_POLLS as u32 + SMALL_REQUEST_TIMEOUT;
+    tokio::time::timeout(budget, wait_exec_exit_polls(ep, exec_id)).await.ok()?
+}
+
+async fn wait_exec_exit_polls(ep: &AgentEndpoint, exec_id: &str) -> Option<i64> {
     if let Some(code) = recorded_exit(ep.base_url.as_str(), exec_id) {
         return Some(code);
     }
@@ -423,7 +467,8 @@ pub async fn wait_exec_exit(ep: &AgentEndpoint, exec_id: &str) -> Option<i64> {
         }
         let resp = http()
             .get(url.clone())
-            .header(reqwest::header::AUTHORIZATION, ep.bearer())
+            .timeout(SMALL_REQUEST_TIMEOUT)
+            .header(reqwest::header::AUTHORIZATION, ep.auth())
             .send()
             .await
             .ok()?;
@@ -445,7 +490,8 @@ pub async fn resize_exec(ep: &AgentEndpoint, exec_id: &str, cols: u16, rows: u16
         CONTEXT,
         http()
             .post(ep.url(&format!("v1/exec/{}/resize", urlencode_segment(exec_id))))
-            .header(reqwest::header::AUTHORIZATION, ep.bearer())
+            .timeout(SMALL_REQUEST_TIMEOUT)
+            .header(reqwest::header::AUTHORIZATION, ep.auth())
             .json(&serde_json::json!({ "cols": cols, "rows": rows })),
     )
     .await?;
@@ -490,11 +536,18 @@ async fn connect_ws(ep: &AgentEndpoint, path: &str, context: &str) -> Result<Ws,
         .as_str()
         .into_client_request()
         .map_err(|e| format!("{}: {}", context, e))?;
-    let auth = HeaderValue::from_str(&ep.bearer())
-        .map_err(|_| format!("{}: the agent token is not a valid header value", context))?;
+    let auth = ep.auth();
     req.headers_mut()
         .insert(tokio_tungstenite::tungstenite::http::header::AUTHORIZATION, auth);
-    match tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(req)).await {
+    let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(WS_MAX_MESSAGE))
+        .max_frame_size(Some(WS_MAX_MESSAGE));
+    match tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        tokio_tungstenite::connect_async_with_config(req, Some(config), false),
+    )
+    .await
+    {
         Err(_) => Err(format!("{}: timed out connecting to the agent", context)),
         Ok(Err(tokio_tungstenite::tungstenite::Error::Http(resp)))
             if resp.status() == tokio_tungstenite::tungstenite::http::StatusCode::UNAUTHORIZED =>
@@ -657,10 +710,14 @@ impl AsyncWrite for AttachInput {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(_)) => Poll::Ready(Err(broken_pipe())),
             Poll::Ready(Ok(())) => {
+                // One frame per write, at most STDIN_FRAME_MAX; `write_all`
+                // loops for the rest. Keeps every frame under the agent's
+                // WebSocket message limit.
+                let n = buf.len().min(STDIN_FRAME_MAX);
                 this.tx
-                    .send_item(StdinCmd::Data(Bytes::copy_from_slice(buf)))
+                    .send_item(StdinCmd::Data(Bytes::copy_from_slice(&buf[..n])))
                     .map_err(|_| broken_pipe())?;
-                Poll::Ready(Ok(buf.len()))
+                Poll::Ready(Ok(n))
             }
         }
     }
@@ -742,11 +799,14 @@ async fn put_file(
         .append_pair("mode", &format!("{:o}", mode))
         .append_pair("uid", &uid.to_string())
         .append_pair("gid", &gid.to_string());
+    // Generous, but finite: a minute plus 256 KiB/s for the payload.
+    let timeout = Duration::from_secs(60 + (data.len() as u64) / (256 * 1024));
     let resp = send(
         CONTEXT,
         http()
             .put(url)
-            .header(reqwest::header::AUTHORIZATION, ep.bearer())
+            .timeout(timeout)
+            .header(reqwest::header::AUTHORIZATION, ep.auth())
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
             .body(data),
     )
@@ -795,7 +855,7 @@ pub fn download_archive(ep: &AgentEndpoint, path: &str) -> ArchiveStream {
     url.query_pairs_mut().append_pair("path", path);
     let req = http()
         .get(url)
-        .header(reqwest::header::AUTHORIZATION, ep.bearer());
+        .header(reqwest::header::AUTHORIZATION, ep.auth());
 
     enum State {
         Start(reqwest::RequestBuilder),
@@ -835,7 +895,7 @@ pub fn download_archive(ep: &AgentEndpoint, path: &str) -> ArchiveStream {
 pub async fn is_running(ep: &AgentEndpoint) -> Result<bool, String> {
     let resp = match http()
         .get(ep.url("v1/health"))
-        .header(reqwest::header::AUTHORIZATION, ep.bearer())
+        .header(reqwest::header::AUTHORIZATION, ep.auth())
         .timeout(HEALTH_TIMEOUT)
         .send()
         .await

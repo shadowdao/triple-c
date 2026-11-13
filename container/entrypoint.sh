@@ -31,19 +31,29 @@
 # the snapshot (`env -i`). The agent drops its own TRIPLEC_AGENT_* settings.
 # >>> agent_token
 agent_cwd=$PWD
+# The token goes on a tmpfs, never the container's writable layer: a file
+# there would persist after stop and ride `docker commit` into the project's
+# snapshot image (the commit's SECRET_ENV_KEYS scrub covers env, not files).
+# /dev/shm is a tmpfs in Docker and on Fargate; anything else is refused.
 if [ -n "${TRIPLEC_AGENT_TOKEN:-}" ]; then
-    mkdir -p /run/triple-c
-    chmod 700 /run/triple-c
-    ( umask 077; printf '%s' "$TRIPLEC_AGENT_TOKEN" > /run/triple-c/agent-token )
+    if [ "$(stat -f -c %T /dev/shm 2>/dev/null)" = tmpfs ]; then
+        mkdir -p /dev/shm/triple-c
+        chown root:root /dev/shm/triple-c
+        chmod 700 /dev/shm/triple-c
+        ( umask 077; printf '%s' "$TRIPLEC_AGENT_TOKEN" > /dev/shm/triple-c/agent-token )
+        export TRIPLEC_AGENT_TOKEN_FILE=/dev/shm/triple-c/agent-token
+    else
+        echo "triple-c-agent: /dev/shm is not a tmpfs; not writing the token to disk — agent disabled" >&2
+    fi
     unset TRIPLEC_AGENT_TOKEN
-    export TRIPLEC_AGENT_TOKEN_FILE=/run/triple-c/agent-token
 fi
+# The exec environment snapshot stays in this script's memory — it holds the
+# container's whole configured env, API keys included, so it must not touch
+# disk either. Minus what bash itself exports (PWD, OLDPWD, SHLVL, `_`):
+# those are this script's, not the container's, and `docker exec` has none.
+agent_env=()
 if [ -n "${TRIPLEC_AGENT_TOKEN_FILE:-}" ]; then
-    mkdir -p /run/triple-c
-    chmod 700 /run/triple-c
-    # Minus what bash itself exports (PWD, OLDPWD, SHLVL, `_`): those are this
-    # script's, not the container's, and `docker exec` has none of them.
-    ( umask 077; env -u PWD -u OLDPWD -u SHLVL -u _ -0 > /run/triple-c/agent-env )
+    mapfile -d '' agent_env < <(env -u PWD -u OLDPWD -u SHLVL -u _ -0)
 fi
 # <<< agent_token
 
@@ -817,9 +827,11 @@ start_agent() {
         echo "triple-c-agent: token given but no agent binary in this image — not starting it" >&2
         return 0
     fi
-    local -a agent_env=()
-    [ -r /run/triple-c/agent-env ] && mapfile -d '' agent_env < /run/triple-c/agent-env
     (
+        # Keeps the supervisor alive through a stray HUP. The agent resets
+        # every signal disposition and the mask in each exec it spawns, so this
+        # does not leak into commands (an ignored SIGHUP otherwise survives
+        # exec and turns every exec into `nohup`).
         trap '' HUP
         cd "$agent_cwd" || cd /
         while :; do

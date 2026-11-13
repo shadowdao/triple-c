@@ -344,10 +344,13 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   under a supervisor loop. **Its contract is Docker parity**: an `ExecSpec` must behave through the
   agent exactly as through `docker exec`. Any change to exec semantics on either side is checked by
   `host::agent::live_tests::the_agent_answers_exactly_as_docker_exec_does` (ignored; needs an image
-  with the agent — see the crate README). The token never stays in the environment: the entrypoint
-  moves it to a root-only file before anything runs, and the agent refuses a token file others can
-  read. The agent is started from an env/cwd snapshot taken at the top of the entrypoint so execs
-  see the container's configured env, not the script's.
+  with the agent — see the crate README). The token never stays in the environment and never touches the
+  writable layer: the entrypoint moves it to a root-only file on `/dev/shm` (tmpfs — a file in the
+  writable layer would ride `docker commit` into the snapshot image) before anything runs, and the
+  agent refuses a token file others can read. The agent is started from an env/cwd snapshot taken
+  at the top of the entrypoint and held **in memory only** (it contains every API key in the env),
+  so execs see the container's configured env, not the script's. The app treats the agent as
+  untrusted: no redirects, capped bodies, timeouts on every small call (`host/agent.rs`).
 
 **`/home/claude` in the image is seed-only.** It is the mount point of the named volume
 `triple-c-home-{projectId}`, so after a project's *first* start the image's copy of that directory

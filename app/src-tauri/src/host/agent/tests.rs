@@ -628,3 +628,46 @@ async fn an_oversized_error_body_is_neither_buffered_nor_passed_through_whole() 
     assert!(e.len() <= 4 * 1024 + 64, "error was {} bytes", e.len());
     assert!(e.ends_with('…'), "{e}");
 }
+
+#[tokio::test]
+async fn an_agent_that_accepts_and_then_says_nothing_cannot_hang_the_small_calls() {
+    // Accepts every connection, reads nothing, answers nothing, holds it open.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((sock, _)) = listener.accept().await {
+            held.push(sock);
+        }
+    });
+    let t = ContainerTarget::Agent(AgentEndpoint::loopback(port, TOKEN));
+    let started = std::time::Instant::now();
+    assert!(t.exec_detached(ExecSpec::new(cmd("true"))).await.is_err());
+    assert!(t.resize_exec("abc", 80, 24).await.is_err());
+    assert_eq!(t.wait_exec_exit("abc").await, None);
+    // Three calls, each bounded by SMALL_REQUEST_TIMEOUT (1 s under test).
+    assert!(started.elapsed() < std::time::Duration::from_secs(10), "took {:?}", started.elapsed());
+}
+
+#[test]
+fn a_token_that_cannot_be_a_header_value_is_refused_up_front() {
+    let url = url::Url::parse("http://127.0.0.1:1/").unwrap();
+    for bad in ["", "has space", "new\nline", "tab\there", "ünïcode"] {
+        assert!(AgentEndpoint::new(url.clone(), bad).is_err(), "{bad:?} accepted");
+    }
+    assert!(AgentEndpoint::new(url, TOKEN).is_ok());
+}
+
+#[tokio::test]
+async fn a_413_that_is_not_the_limit_message_is_not_passed_through() {
+    let port = serve(Router::new().fallback(|| async {
+        (StatusCode::PAYLOAD_TOO_LARGE, Json(json!({ "error": "click here: http://evil.example" })))
+    }))
+    .await;
+    let e = ContainerTarget::Agent(AgentEndpoint::loopback(port, TOKEN))
+        .exec_oneshot_limited("claude", cmd("true"), 1000)
+        .await
+        .unwrap_err();
+    assert!(e.starts_with(OUTPUT_LIMIT_MARKER), "{e}");
+    assert!(!e.contains("evil"), "{e}");
+}
