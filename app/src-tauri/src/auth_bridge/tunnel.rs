@@ -11,7 +11,7 @@
 //! and stdout wired to the TCP socket. `socat` ships in the container image.
 //!
 //! The exec plumbing itself is *not* reimplemented here: it comes from
-//! [`crate::docker::exec::create_attached_exec`], the same helper the
+//! [`crate::host::ContainerTarget::attach_exec`], the same helper the
 //! interactive terminal sessions are built on.
 //!
 //! ## What the host listener is, and is not
@@ -56,13 +56,11 @@
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
-use crate::host::ExecChunk;
+use crate::host::{AttachedExec, ContainerTarget, ExecChunk};
 use futures_util::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{JoinHandle, JoinSet};
-
-use crate::docker::exec::{create_attached_exec, AttachedExec};
 
 use super::proc_net::PortFamily;
 
@@ -143,13 +141,13 @@ impl Drop for PortForward {
 }
 
 impl PortForward {
-    /// Bind `port` on the host loopback and start proxying into `container_id`.
+    /// Bind `port` on the host loopback and start proxying into `container`.
     ///
     /// The bind happens before the task is spawned, so an already-taken port is
     /// reported to the caller as an error rather than disappearing into a
     /// background task.
     pub async fn bind(
-        container_id: String,
+        container: ContainerTarget,
         port: u16,
         family: PortFamily,
     ) -> Result<Self, std::io::Error> {
@@ -196,7 +194,7 @@ impl PortForward {
             };
 
         let target = family.socat_target(port);
-        let task = tokio::spawn(accept_loop(container_id, port, target, v4, v6));
+        let task = tokio::spawn(accept_loop(container, port, target, v4, v6));
 
         Ok(Self {
             port,
@@ -219,7 +217,7 @@ impl PortForward {
 /// Accept on both loopback listeners until aborted. Dropping this future drops
 /// the listeners (freeing the port) and the `JoinSet` (aborting live tunnels).
 async fn accept_loop(
-    container_id: String,
+    container: ContainerTarget,
     port: u16,
     target: String,
     v4: TcpListener,
@@ -258,7 +256,7 @@ async fn accept_loop(
                 log::debug!("Auth bridge: connection from {} to bridged port {}", peer, port);
                 let _ = stream.set_nodelay(true);
                 conns.spawn(tunnel_connection(
-                    container_id.clone(),
+                    container.clone(),
                     target.clone(),
                     stream,
                     port,
@@ -288,7 +286,12 @@ async fn accept_optional(
 ///
 /// Nothing is forwarded until that decision is made, so a refused request never
 /// reaches the container at all — not even a `docker exec`.
-async fn tunnel_connection(container_id: String, target: String, mut stream: TcpStream, port: u16) {
+async fn tunnel_connection(
+    container: ContainerTarget,
+    target: String,
+    mut stream: TcpStream,
+    port: u16,
+) {
     let head = match read_leading_bytes(&mut stream).await {
         Ok(head) => head,
         Err(e) => {
@@ -319,7 +322,7 @@ async fn tunnel_connection(container_id: String, target: String, mut stream: Tcp
     }
 
     // The bytes already off the socket go back on the wire first, byte-exact.
-    tunnel_connection_with_prelude(container_id, target, stream, port, head.into_buffer()).await
+    tunnel_into_with_prelude(container, target, stream, port, head.into_buffer()).await
 }
 
 /// What the first bytes of an accepted connection turned out to be.
@@ -511,8 +514,30 @@ pub(crate) fn web_request_verdict(head: &str) -> Verdict {
 /// head off the socket to check a token, and then has to put those same bytes
 /// back on the wire. Passing them here keeps the byte stream exact, rather than
 /// re-serialising a parsed request.
+///
+/// Takes a Docker container id because that is what the browser-view proxy
+/// holds; [`tunnel_into_with_prelude`] is the same thing for a
+/// [`ContainerTarget`] already in hand.
 pub async fn tunnel_connection_with_prelude(
     container_id: String,
+    target: String,
+    stream: TcpStream,
+    port: u16,
+    prelude: Vec<u8>,
+) {
+    tunnel_into_with_prelude(
+        ContainerTarget::docker(container_id),
+        target,
+        stream,
+        port,
+        prelude,
+    )
+    .await
+}
+
+/// [`tunnel_connection_with_prelude`] for a [`ContainerTarget`].
+pub async fn tunnel_into_with_prelude(
+    container: ContainerTarget,
     target: String,
     stream: TcpStream,
     port: u16,
@@ -524,7 +549,7 @@ pub async fn tunnel_connection_with_prelude(
         mut output,
         mut input,
         ..
-    } = match create_attached_exec(&container_id, cmd, false).await {
+    } = match container.attach_exec(cmd, false).await {
         Ok(e) => e,
         Err(e) => {
             log::warn!(

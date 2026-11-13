@@ -36,7 +36,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::docker::exec::exec_oneshot;
+use crate::host::ContainerTarget;
 
 /// Marks the JSON payload in the probe's stdout, so unrelated chatter on the
 /// same stream (npm notices, Node warnings) can't be mistaken for the result.
@@ -278,11 +278,18 @@ impl PlaywrightDetection {
 /// `npx @playwright/mcp`, is found as readily as one in
 /// `/workspace/node_modules`.
 pub async fn detect(container_id: &str) -> Result<PlaywrightDetection, String> {
-    let output = exec_oneshot(
-        container_id,
-        vec!["node".to_string(), "-e".to_string(), PROBE.to_string()],
-    )
-    .await?;
+    detect_in(&ContainerTarget::docker(container_id)).await
+}
+
+/// [`detect`] against a target already in hand.
+pub async fn detect_in(container: &ContainerTarget) -> Result<PlaywrightDetection, String> {
+    let output = container
+        .exec_oneshot(vec![
+            "node".to_string(),
+            "-e".to_string(),
+            PROBE.to_string(),
+        ])
+        .await?;
 
     parse_probe_output(&output)
 }
