@@ -5,16 +5,13 @@
 
 use std::time::Duration;
 
-use crate::host::ExecChunk;
 use futures_util::{Stream, StreamExt};
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::oneshot;
 
 use crate::commands::auth_token_commands::{push_capped_tail, AnsiStripper, SUBMIT_ENTER_DELAY};
-use crate::docker::exec::{
-    create_attached_exec_as, exec_oneshot_as, wait_for_exec_exit, AttachedExec,
-};
+use crate::host::{AttachedExec, ContainerTarget, ExecChunk, ExecSpec};
 
 pub const CODE_EVENT: &str = "marketplace-gh-login-code";
 pub const OUTPUT_EVENT: &str = "marketplace-gh-login-output";
@@ -32,8 +29,8 @@ const MAX_PENDING_LINE: usize = 4096;
 /// script around it (whose text contains the same words); errors are ignored.
 const CANCEL_PKILL: [&str; 3] = ["pkill", "-f", "gh auth login --hostname"];
 
-/// Constant script; the host is `$1` (argv, never interpolated), because
-/// `create_attached_exec_as` takes no env.
+/// Constant script; the host is `$1` (argv, never interpolated); the attached
+/// exec is opened with no extra env.
 ///
 /// * `GH_CONFIG_DIR` / `GIT_CONFIG_GLOBAL` live in a temp dir removed on exit,
 ///   so the container is never left logged in. The `HUP INT TERM` trap turns a
@@ -150,9 +147,9 @@ fn failure_tail(transcript: &str) -> String {
 
 /// Pre-flight N9 / review fix 1: stop the in-container login after any
 /// failed attempt.
-async fn kill_container_login(container_id: &str) {
+async fn kill_container_login(target: &ContainerTarget) {
     let cmd = CANCEL_PKILL.iter().map(|s| s.to_string()).collect();
-    let _ = exec_oneshot_as(container_id, "claude", cmd, vec![]).await;
+    let _ = target.exec_oneshot_as("claude", cmd, vec![]).await;
 }
 
 /// Hand `result` back, running `cleanup` first when it is a failure.
@@ -262,7 +259,7 @@ where
 pub async fn run_gh_container_login(
     app: &AppHandle,
     account_id: &str,
-    container_id: &str,
+    target: &ContainerTarget,
     host: &str,
     mut cancel: oneshot::Receiver<()>,
 ) -> Result<String, String> {
@@ -273,20 +270,20 @@ pub async fn run_gh_container_login(
         exec_id,
         output,
         input,
-    } = create_attached_exec_as(
-        container_id,
-        vec![
-            "sh".to_string(),
-            "-c".to_string(),
-            GH_LOGIN_SCRIPT.to_string(),
-            "triple-c-gh-login".to_string(),
-            host.to_string(),
-        ],
-        true,
-        "claude",
-        "/home/claude",
-    )
-    .await?;
+    } = target
+        .attach(
+            ExecSpec::new(vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                GH_LOGIN_SCRIPT.to_string(),
+                "triple-c-gh-login".to_string(),
+                host.to_string(),
+            ])
+            .tty(true)
+            .user("claude")
+            .working_dir(Some("/home/claude")),
+        )
+        .await?;
 
     let deadline = tokio::time::Instant::now() + LOGIN_TIMEOUT;
     let result = async {
@@ -305,7 +302,7 @@ pub async fn run_gh_container_login(
         if let Some(token) = extract_token(&transcript) {
             return Ok(token);
         }
-        let status = wait_for_exec_exit(&exec_id).await;
+        let status = target.wait_exec_exit(&exec_id).await;
         Err(format!(
             "gh did not complete the sign-in (exit status {}). Nothing was stored.\n{}",
             status
@@ -315,7 +312,7 @@ pub async fn run_gh_container_login(
         ))
     }
     .await;
-    cleanup_on_error(result, || kill_container_login(container_id)).await
+    cleanup_on_error(result, || kill_container_login(target)).await
 }
 
 #[cfg(test)]

@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashSet};
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::oneshot;
 
-use crate::docker::container::is_container_running;
+use crate::host::ContainerTarget;
 use crate::marketplace::{self as mk, auth, diff, gh_login, git, MarketplaceManager};
 use crate::models::marketplace::{
     is_valid_commit, is_valid_item_key, AccountMethod, FileDiff, InstallScope, ItemUpdate,
@@ -944,8 +944,8 @@ pub async fn apply_marketplace_now(
     };
     let mut results = Vec::new();
     for p in projects {
-        let running = match &p.container_id {
-            Some(cid) => is_container_running(cid).await.unwrap_or(false),
+        let running = match ContainerTarget::for_project(&p) {
+            Some(target) => target.is_running().await.unwrap_or(false),
             None => false,
         };
         if !running {
@@ -1051,13 +1051,13 @@ pub async fn start_marketplace_gh_container_login(
         return Err("Signing in through a container needs a host name without a port.".to_string());
     }
     let project = find_project(&state, &project_id)?;
-    let container_id = project.container_id.clone().ok_or_else(|| {
+    let target = ContainerTarget::for_project(&project).ok_or_else(|| {
         format!(
             "\"{}\" has no container yet. Start it, then try again.",
             project.name
         )
     })?;
-    if !is_container_running(&container_id).await.unwrap_or(false) {
+    if !target.is_running().await.unwrap_or(false) {
         return Err(format!(
             "\"{}\" is not running. Start it, then try again.",
             project.name
@@ -1070,7 +1070,7 @@ pub async fn start_marketplace_gh_container_login(
     }
     let account_id = uuid::Uuid::new_v4().to_string();
     let result =
-        gh_login::run_gh_container_login(&app_handle, &account_id, &container_id, &host, rx).await;
+        gh_login::run_gh_container_login(&app_handle, &account_id, &target, &host, rx).await;
     // `rx` is gone now, so this frees our slot and never a newer login's.
     state.marketplace.release_gh_login().await;
     let token = result?;

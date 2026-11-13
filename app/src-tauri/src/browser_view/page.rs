@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
 
 use crate::commands::project_commands::emit_progress;
-use crate::docker::exec::exec_oneshot_as;
+use crate::host::ContainerTarget;
 
 use super::detect::PlaywrightDetection;
 
@@ -150,14 +150,14 @@ pub async fn open(
         shell_quote(&script),
         HELPER_LOG
     );
-    exec_oneshot_as(
-        container_id,
-        "claude",
-        vec!["sh".to_string(), "-c".to_string(), launcher],
-        Vec::new(),
-    )
-    .await
-    .map_err(|e| format!("Could not start the browser helper: {}", e))?;
+    ContainerTarget::docker(container_id)
+        .exec_oneshot_as(
+            "claude",
+            vec!["sh".to_string(), "-c".to_string(), launcher],
+            Vec::new(),
+        )
+        .await
+        .map_err(|e| format!("Could not start the browser helper: {}", e))?;
 
     emit_progress(app, project_id, "Waiting for the page to load…");
     wait_until_ready(container_id).await
@@ -189,13 +189,13 @@ pub async fn state(container_id: &str) -> PageState {
         "try{{process.stdout.write(require('fs').readFileSync('{}','utf8'));}}catch(e){{}}",
         STATE_PATH
     );
-    let Ok((out, _)) = exec_oneshot_as(
-        container_id,
-        "claude",
-        vec!["node".to_string(), "-e".to_string(), script],
-        Vec::new(),
-    )
-    .await
+    let Ok((out, _)) = ContainerTarget::docker(container_id)
+        .exec_oneshot_as(
+            "claude",
+            vec!["node".to_string(), "-e".to_string(), script],
+            Vec::new(),
+        )
+        .await
     else {
         return PageState::default();
     };
@@ -209,15 +209,15 @@ async fn write_control(container_id: &str, json: String) -> Result<(), String> {
         "require('fs').writeFileSync('{}',process.argv[1]);",
         CONTROL_PATH
     );
-    exec_oneshot_as(
-        container_id,
-        "claude",
-        vec!["node".to_string(), "-e".to_string(), script, json],
-        Vec::new(),
-    )
-    .await
-    .map(|_| ())
-    .map_err(|e| format!("Could not reach the browser helper: {}", e))
+    ContainerTarget::docker(container_id)
+        .exec_oneshot_as(
+            "claude",
+            vec!["node".to_string(), "-e".to_string(), script, json],
+            Vec::new(),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("Could not reach the browser helper: {}", e))
 }
 
 /// Wait for a *running* helper to report the URL we just asked it for.

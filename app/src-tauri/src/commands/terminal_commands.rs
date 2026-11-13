@@ -1,6 +1,7 @@
 use tauri::{AppHandle, Emitter, State};
 
 use crate::commands::aws_commands;
+use crate::host::ContainerTarget;
 use crate::models::{Backend, BedrockAuthMethod, Project};
 use crate::AppState;
 
@@ -159,9 +160,7 @@ pub async fn open_terminal_session(
         .get(&project_id)
         .ok_or_else(|| format!("Project {} not found", project_id))?;
 
-    let container_id = project
-        .container_id
-        .as_ref()
+    let target = ContainerTarget::for_project(&project)
         .ok_or_else(|| "Container not running".to_string())?;
 
     if let Some(id) = resume_session_id.as_deref() {
@@ -189,7 +188,7 @@ pub async fn open_terminal_session(
     state
         .exec_manager
         .create_session(
-            &crate::host::ContainerTarget::docker(container_id.as_str()),
+            &target,
             &session_id,
             cmd,
             move |data| {
@@ -240,7 +239,7 @@ pub async fn paste_image_to_terminal(
     image_data: Vec<u8>,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    let container_id = state.exec_manager.get_container_id(&session_id).await?;
+    let target = ContainerTarget::docker(state.exec_manager.get_container_id(&session_id).await?);
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -250,11 +249,7 @@ pub async fn paste_image_to_terminal(
 
     state
         .exec_manager
-        .write_file_to_container(
-            &crate::host::ContainerTarget::docker(container_id.as_str()),
-            &file_name,
-            &image_data,
-        )
+        .write_file_to_container(&target, &file_name, &image_data)
         .await
 }
 
@@ -287,7 +282,7 @@ pub async fn upload_host_file_to_terminal(
     let base = crate::commands::file_commands::host_upload_name(&host_path)?;
     let host_path = crate::commands::file_commands::resolve_host_read_path(&host_path).await?;
 
-    let container_id = state.exec_manager.get_container_id(&session_id).await?;
+    let target = ContainerTarget::docker(state.exec_manager.get_container_id(&session_id).await?);
 
     let meta = tokio::fs::metadata(&host_path)
         .await
@@ -317,7 +312,7 @@ pub async fn upload_host_file_to_terminal(
     // with the code that does the reading, which re-applies it to the open
     // descriptor — this check is here only so the refusal reads like a sentence
     // instead of arriving after a 300 MB read.
-    use crate::docker::exec::MAX_DROP_BYTES;
+    use crate::host::MAX_DROP_BYTES;
     if meta.len() > MAX_DROP_BYTES {
         return Err(format!(
             "File too large to drop into the terminal ({:.0} MB; limit {} MB). Mount it into the project instead.",
@@ -330,20 +325,18 @@ pub async fn upload_host_file_to_terminal(
 
     // Ensure the destination directory exists rather than relying on Docker's
     // archive extractor to create the parent for the uploaded tar entry.
-    crate::docker::exec::exec_oneshot(
-        &container_id,
-        vec!["mkdir".to_string(), "-p".to_string(), "/tmp/triple-c-drops".to_string()],
-    )
-    .await?;
+    target
+        .exec_oneshot(vec![
+            "mkdir".to_string(),
+            "-p".to_string(),
+            "/tmp/triple-c-drops".to_string(),
+        ])
+        .await?;
 
     let file_name = format!("triple-c-drops/{}", base);
-    crate::docker::exec::upload_host_file_to_container(
-        &container_id,
-        &host_path,
-        "/tmp",
-        &file_name,
-    )
-    .await
+    target
+        .upload_host_file(&host_path, "/tmp", &file_name)
+        .await
 }
 
 #[tauri::command]
@@ -351,8 +344,8 @@ pub async fn start_audio_bridge(
     session_id: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    // Get container_id from the terminal session
-    let container_id = state.exec_manager.get_container_id(&session_id).await?;
+    // Get the container from the terminal session
+    let target = ContainerTarget::docker(state.exec_manager.get_container_id(&session_id).await?);
 
     // Create audio bridge exec session with ID "audio-{session_id}"
     // The loop handles reconnection when the FIFO reader (fake rec) is killed and restarted
@@ -366,7 +359,7 @@ pub async fn start_audio_bridge(
     state
         .exec_manager
         .create_session_with_tty(
-            &crate::host::ContainerTarget::docker(container_id.as_str()),
+            &target,
             &audio_session_id,
             cmd,
             false,

@@ -50,7 +50,7 @@
 //! | Trigger | Path |
 //! |---|---|
 //! | Turned off in the UI | `set_browser_view_enabled(false)` → persist `false`, then [`BrowserViewManager::stop`] |
-//! | Container stopped, by the UI or otherwise | supervisor's `is_container_running` check |
+//! | Container stopped, by the UI or otherwise | supervisor's `is_running` check |
 //! | Project deleted | supervisor's `store.get()` check |
 //! | Container rebuilt | old container stops → supervisor exits; the new one is not auto-started |
 //! | Viewer died in the container | supervisor's periodic HTTP liveness probe |
@@ -90,8 +90,7 @@ use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
 
 use crate::auth_bridge::proc_net::{self, PortFamily};
-use crate::docker::container::is_container_running;
-use crate::docker::exec::exec_oneshot;
+use crate::host::ContainerTarget;
 use crate::storage::projects_store::ProjectsStore;
 
 use detect::PlaywrightDetection;
@@ -300,7 +299,8 @@ impl BrowserViewManager {
             return Ok(self.status(&project_id, true).await);
         }
 
-        let detection = detect::detect(&container_id).await?;
+        let container = ContainerTarget::docker(container_id.as_str());
+        let detection = detect::detect_in(&container).await?;
         if !detection.is_usable() {
             let blocker = detection.blocker().unwrap_or_else(|| {
                 "Playwright is present but incomplete in this container.".to_string()
@@ -320,9 +320,9 @@ impl BrowserViewManager {
         // Doing this before choosing a port also frees the one a previous
         // session was using, so sessions don't walk up the range. Best-effort:
         // a container with no dashboard makes this a no-op.
-        let _ = kill_dashboard(&container_id, &cli_entry).await;
+        let _ = kill_dashboard(&container, &cli_entry).await;
 
-        let (container_port, entry_path) = start_viewer(&container_id, &cli_entry).await?;
+        let (container_port, entry_path) = start_viewer(&container, &cli_entry).await?;
 
         let token = generate_token();
         // `--host 127.0.0.1` is ours to set, so the family is known and there is
@@ -337,7 +337,7 @@ impl BrowserViewManager {
         {
             Ok(p) => p,
             Err(e) => {
-                let _ = kill_dashboard(&container_id, &cli_entry).await;
+                let _ = kill_dashboard(&container, &cli_entry).await;
                 return Err(e);
             }
         };
@@ -354,7 +354,7 @@ impl BrowserViewManager {
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let supervisor = tokio::spawn(supervise(
             project_id.clone(),
-            container_id.clone(),
+            container,
             cli_entry,
             container_port,
             epoch,
@@ -427,7 +427,7 @@ impl BrowserViewManager {
 #[allow(clippy::too_many_arguments)]
 async fn supervise(
     project_id: String,
-    container_id: String,
+    container: ContainerTarget,
     cli_entry: String,
     container_port: u16,
     epoch: u64,
@@ -443,7 +443,7 @@ async fn supervise(
             log::info!("Browser view: project {} is gone — tearing down", project_id);
             break;
         }
-        if !is_container_running(&container_id).await.unwrap_or(false) {
+        if !container.is_running().await.unwrap_or(false) {
             log::info!(
                 "Browser view: container for project {} is no longer running — tearing down",
                 project_id
@@ -459,7 +459,7 @@ async fn supervise(
             // view never waits out an in-flight exec.
             let alive = tokio::select! {
                 _ = cancel.changed() => break,
-                res = probe_entry_path(&container_id, container_port) => res.is_ok(),
+                res = probe_entry_path(&container, container_port) => res.is_ok(),
             };
             if !alive {
                 log::warn!(
@@ -477,7 +477,7 @@ async fn supervise(
     }
 
     proxy.shutdown().await;
-    let _ = kill_dashboard(&container_id, &cli_entry).await;
+    let _ = kill_dashboard(&container, &cli_entry).await;
 
     // Deregister, unless a newer session has already taken this project's slot.
     let superseded = {
@@ -538,7 +538,11 @@ const VIEWER_LOG: &str = "/tmp/triple-c-browser-view.log";
 /// redirected to [`VIEWER_LOG`] (both so `exec_oneshot` can return immediately
 /// rather than waiting on an inherited stdout, and so a failure has a trail),
 /// and readiness is established by [`wait_until_ready`] instead.
-async fn launch_viewer(container_id: &str, cli_entry: &str, port: u16) -> Result<(), String> {
+async fn launch_viewer(
+    container: &ContainerTarget,
+    cli_entry: &str,
+    port: u16,
+) -> Result<(), String> {
     // `NO_UPDATE_NOTIFIER` stops the CLI phoning registry.npmjs.org on every
     // launch; the container may have no egress, and we don't want to wait out a
     // DNS timeout before the dashboard binds.
@@ -549,13 +553,11 @@ async fn launch_viewer(container_id: &str, cli_entry: &str, port: u16) -> Result
         port,
         VIEWER_LOG
     );
-    exec_oneshot(
-        container_id,
-        vec!["sh".to_string(), "-c".to_string(), script],
-    )
-    .await
-    .map(|_| ())
-    .map_err(|e| format!("Could not start the Playwright viewer: {}", e))
+    container
+        .exec_oneshot(vec!["sh".to_string(), "-c".to_string(), script])
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("Could not start the Playwright viewer: {}", e))
 }
 
 /// The dashboard singleton is keyed on a hash of the working directory, so
@@ -567,17 +569,15 @@ async fn launch_viewer(container_id: &str, cli_entry: &str, port: u16) -> Result
 const WORKDIR_PREFIX: &str = "cd /workspace 2>/dev/null || true";
 
 /// Stop the dashboard daemon. Verified to free the port and stop answering.
-async fn kill_dashboard(container_id: &str, cli_entry: &str) -> Result<String, String> {
+async fn kill_dashboard(container: &ContainerTarget, cli_entry: &str) -> Result<String, String> {
     let script = format!(
         "{}; NO_UPDATE_NOTIFIER=1 node {} show --kill",
         WORKDIR_PREFIX,
         shell_quote(cli_entry)
     );
-    exec_oneshot(
-        container_id,
-        vec!["sh".to_string(), "-c".to_string(), script],
-    )
-    .await
+    container
+        .exec_oneshot(vec!["sh".to_string(), "-c".to_string(), script])
+        .await
 }
 
 /// Turn a failed start into something the user can act on.
@@ -604,13 +604,16 @@ fn explain_start_failure(err: &str, log: &str) -> String {
 }
 
 /// Tail of the viewer's own output, for a start that didn't come up.
-async fn read_viewer_log(container_id: &str) -> String {
-    exec_oneshot(
-        container_id,
-        vec!["tail".to_string(), "-n".to_string(), "40".to_string(), VIEWER_LOG.to_string()],
-    )
-    .await
-    .unwrap_or_default()
+async fn read_viewer_log(container: &ContainerTarget) -> String {
+    container
+        .exec_oneshot(vec![
+            "tail".to_string(),
+            "-n".to_string(),
+            "40".to_string(),
+            VIEWER_LOG.to_string(),
+        ])
+        .await
+        .unwrap_or_default()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -645,14 +648,17 @@ const MAX_PORT_ATTEMPTS: usize = 3;
 /// this layer, and the pane would then front it. What contains that is
 /// downstream — the host proxy is loopback-only and token-gated, and the pane's
 /// iframe is sandboxed — not this function.
-async fn start_viewer(container_id: &str, cli_entry: &str) -> Result<(u16, String), String> {
+async fn start_viewer(
+    container: &ContainerTarget,
+    cli_entry: &str,
+) -> Result<(u16, String), String> {
     let mut tried: Vec<u16> = Vec::new();
     let mut last: Option<String> = None;
 
     for _ in 0..MAX_PORT_ATTEMPTS {
         // Re-read the listener snapshot each attempt: the port that was free a
         // moment ago is exactly the one we may have just lost.
-        let port = match pick_viewer_port(container_id, &tried).await {
+        let port = match pick_viewer_port(container, &tried).await {
             Ok(p) => p,
             Err(e) => {
                 // Report why the *attempts* failed, not just "nothing free":
@@ -666,21 +672,21 @@ async fn start_viewer(container_id: &str, cli_entry: &str) -> Result<(u16, Strin
         };
         tried.push(port);
 
-        launch_viewer(container_id, cli_entry, port).await?;
+        launch_viewer(container, cli_entry, port).await?;
 
         // Wait for it to actually answer, and learn the entry URL while we're
         // there — see `probe_entry_path` for why that matters. This, not the
         // launcher's stdout, is the readiness signal: verified that the
         // "Listening on …" line is printed only on the very first start.
-        match wait_until_ready(container_id, port).await {
+        match wait_until_ready(container, port).await {
             Ok(path) => return Ok((port, path)),
             Err(e) => {
-                let log = read_viewer_log(container_id).await;
+                let log = read_viewer_log(container).await;
                 // Always kill before retrying: the dashboard is a singleton, so
                 // a launcher that came up on some *other* port would otherwise
                 // make every further attempt a no-op that silently ignores the
                 // port we asked for.
-                let _ = kill_dashboard(container_id, cli_entry).await;
+                let _ = kill_dashboard(container, cli_entry).await;
                 last = Some(explain_start_failure(&e, &log));
             }
         }
@@ -691,10 +697,9 @@ async fn start_viewer(container_id: &str, cli_entry: &str) -> Result<(u16, Strin
 
 /// First port in [`VIEWER_PORTS`] that nothing in the container is listening on
 /// and that this start has not already tried.
-async fn pick_viewer_port(container_id: &str, tried: &[u16]) -> Result<u16, String> {
-    let text = exec_oneshot(
-        container_id,
-        vec![
+async fn pick_viewer_port(container: &ContainerTarget, tried: &[u16]) -> Result<u16, String> {
+    let text = container
+        .exec_oneshot(vec![
             // Absolute path, deliberately, for the same reason the auth bridge
             // uses one: `container/Dockerfile` puts a container-writable
             // directory first on `PATH`, so a bare `cat` is a name the container
@@ -704,10 +709,9 @@ async fn pick_viewer_port(container_id: &str, tried: &[u16]) -> Result<u16, Stri
             "/usr/bin/cat".to_string(),
             "/proc/net/tcp".to_string(),
             "/proc/net/tcp6".to_string(),
-        ],
-    )
-    .await
-    .unwrap_or_default();
+        ])
+        .await
+        .unwrap_or_default();
     let taken = proc_net::parse_loopback_listeners(&text);
     VIEWER_PORTS
         .clone()
@@ -722,10 +726,10 @@ async fn pick_viewer_port(container_id: &str, tried: &[u16]) -> Result<u16, Stri
 }
 
 /// Poll the viewer until it answers, and return the path the pane should load.
-async fn wait_until_ready(container_id: &str, port: u16) -> Result<String, String> {
+async fn wait_until_ready(container: &ContainerTarget, port: u16) -> Result<String, String> {
     let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
     loop {
-        let last = match probe_entry_path(container_id, port).await {
+        let last = match probe_entry_path(container, port).await {
             Ok(path) => return Ok(path),
             Err(e) => e,
         };
@@ -751,7 +755,7 @@ const PROBE_MARKER: &str = "__TRIPLE_C_BV_PATH__";
 /// a redirect — which matters, because a redirect drops the `?token=` the proxy
 /// gate wants and would leave a fresh connection to be authorised with nothing.
 /// A `200` (no redirect) is fine too; then the entry point is just `/`.
-async fn probe_entry_path(container_id: &str, port: u16) -> Result<String, String> {
+async fn probe_entry_path(container: &ContainerTarget, port: u16) -> Result<String, String> {
     // The request is bounded on both sides. Verified: the dashboard answers a
     // bad WebSocket path by holding the socket open forever rather than
     // erroring, so "no reply" is a state this probe has to be able to leave —
@@ -766,10 +770,7 @@ async fn probe_entry_path(container_id: &str, port: u16) -> Result<String, Strin
     );
     let out = tokio::time::timeout(
         PROBE_TIMEOUT * 2,
-        exec_oneshot(
-            container_id,
-            vec!["node".to_string(), "-e".to_string(), script],
-        ),
+        container.exec_oneshot(vec!["node".to_string(), "-e".to_string(), script]),
     )
     .await
     .map_err(|_| "the viewer probe did not return".to_string())??;
