@@ -20,6 +20,12 @@ fn main() -> ExitCode {
     // Before the runtime starts any thread and before anything is spawned:
     // removing an env var is only sound while the process is single-threaded,
     // and every exec's base env is captured from this process's env below.
+    //
+    // This keeps the token out of every exec's env, and that is all it does:
+    // it edits libc's copy of the environment, not the block the kernel
+    // recorded at exec time, so `/proc/<agent pid>/environ` still shows the
+    // token to root and to anything running as the agent's uid. Use
+    // TRIPLEC_AGENT_TOKEN_FILE (what the entrypoint does) to avoid that.
     std::env::remove_var(TOKEN_ENV);
 
     // Loopback by default. A non-loopback address is only ever bound when

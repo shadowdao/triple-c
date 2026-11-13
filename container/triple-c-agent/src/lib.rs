@@ -22,7 +22,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Request, State};
 use axum::http::{header, StatusCode};
@@ -47,12 +47,29 @@ pub const MAX_ONESHOT_OUTPUT: usize = 8 * 1024 * 1024;
 /// and a short token is close enough to none that it is refused the same way.
 pub const MIN_TOKEN_BYTES: usize = 32;
 
-/// Name of the env var carrying the token; removed from the process env after
-/// it is read so no exec can inherit it.
+/// Name of the env var carrying the token. `main` removes it from the
+/// process's environment after reading it, so no exec inherits it — but that
+/// only edits libc's copy: the kernel's record of the environment the process
+/// was started with (`/proc/<pid>/environ`, readable by root and by the
+/// agent's own uid) still holds it. Prefer [`TOKEN_FILE_ENV`], which is what
+/// the entrypoint uses.
 pub const TOKEN_ENV: &str = "TRIPLEC_AGENT_TOKEN";
 pub const TOKEN_FILE_ENV: &str = "TRIPLEC_AGENT_TOKEN_FILE";
 pub const ADDR_ENV: &str = "TRIPLEC_AGENT_ADDR";
 pub const DEFAULT_ADDR: &str = "127.0.0.1:47900";
+
+/// How long a client gets to send a complete request head. Until its token
+/// has been checked a connection is anonymous, so this is what stops a
+/// slowloris from holding sockets open forever.
+pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Concurrent HTTP connections. Far above what the app opens; a bound on
+/// what an unauthenticated caller can make the agent hold.
+pub const MAX_CONNECTIONS: usize = 256;
+
+/// The largest WebSocket message (and frame) the agent accepts on attach and
+/// tunnel sockets. The app sends stdin in frames of at most 64 KiB.
+pub(crate) const MAX_WS_MESSAGE: usize = 1024 * 1024;
 
 /// Everything the server needs, captured once at startup.
 #[derive(Clone)]
@@ -70,6 +87,10 @@ pub struct Config {
     /// `PUT /v1/files` ceiling. [`MAX_DROP_BYTES`] in production; a field only
     /// so tests can exercise the refusal without a 256 MiB body.
     pub max_file_bytes: u64,
+    /// [`HEADER_READ_TIMEOUT`] in production; a field so tests need not wait.
+    pub header_read_timeout: Duration,
+    /// [`MAX_CONNECTIONS`] in production.
+    pub max_connections: usize,
 }
 
 impl Config {
@@ -87,6 +108,8 @@ impl Config {
                 .filter(|(k, _)| !k.to_string_lossy().starts_with("TRIPLEC_AGENT_"))
                 .collect(),
             max_file_bytes: MAX_DROP_BYTES,
+            header_read_timeout: HEADER_READ_TIMEOUT,
+            max_connections: MAX_CONNECTIONS,
         })
     }
 }
@@ -231,8 +254,33 @@ fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-/// Serve the protocol on `listener` until the listener fails.
+/// Serve the protocol on `listener`. Runs until the task is dropped: accept
+/// errors (a full fd table, a connection reset before accept) are transient
+/// and retried, as `axum::serve` does.
+///
+/// Our own accept loop rather than `axum::serve`, because that gives hyper no
+/// timer, so hyper's header-read timeout never fires and an anonymous
+/// connection that trickles (or never sends) its request head is held
+/// forever. Here every connection gets [`Config::header_read_timeout`] to
+/// deliver a complete head, and at most [`Config::max_connections`] are
+/// served at once. HTTP/1.1 only — all the protocol needs — with upgrades.
+///
+/// At the cap the loop **waits** for a slot before accepting, rather than
+/// accepting and dropping: excess clients queue in the kernel's backlog and
+/// are served as soon as a slot frees, which the header timeout guarantees
+/// for any slot an idle or slow client holds. Dropping would instead fail the
+/// app's own requests outright whenever the cap is reached.
+///
+/// A connection's slot is released when hyper is done with it. A WebSocket
+/// upgrade ends hyper's part (the socket then belongs to the session task),
+/// so attach and tunnel sessions do not count against the cap — and they only
+/// exist past the token check.
 pub async fn serve(listener: tokio::net::TcpListener, config: Config) -> std::io::Result<()> {
+    use hyper_util::rt::{TokioIo, TokioTimer};
+    use hyper_util::service::TowerToHyperService;
+
+    let header_timeout = config.header_read_timeout;
+    let slots = Arc::new(tokio::sync::Semaphore::new(config.max_connections.max(1)));
     let state = Arc::new(AppState {
         config,
         execs: exec::Registry::default(),
@@ -242,7 +290,37 @@ pub async fn serve(listener: tokio::net::TcpListener, config: Config) -> std::io
             tunnels: AtomicI64::new(0),
         },
     });
-    axum::serve(listener, router(state)).await
+    let app = router(state);
+    loop {
+        let permit = slots.clone().acquire_owned().await.expect("the semaphore is never closed");
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(e) => {
+                // ECONNABORTED and friends are per-connection; EMFILE/ENFILE
+                // clear as connections close. Either way, back off and retry.
+                if !matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::ConnectionReset
+                ) {
+                    eprintln!("triple-c-agent: accept failed: {e}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                continue;
+            }
+        };
+        let service = TowerToHyperService::new(app.clone());
+        tokio::spawn(async move {
+            let _slot = permit;
+            let conn = hyper::server::conn::http1::Builder::new()
+                .timer(TokioTimer::new())
+                .header_read_timeout(header_timeout)
+                .serve_connection(TokioIo::new(stream), service)
+                .with_upgrades();
+            // An error here is the client's (reset, malformed request, header
+            // timeout); there is nobody to report it to.
+            let _ = conn.await;
+        });
+    }
 }
 
 /// Bearer-token gate on every request. A failure is `401` with an **empty**
