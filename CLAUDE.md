@@ -338,6 +338,16 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   subscription) is what flips a project whose container exits on its own to Stopped and emits
   `project-container-exited` with a `reason` (`exited` toasts; `found_stopped`, the first look of a run, is silent); `useProjectStatusEvents` applies it
 - **`triple-c-scheduler`** — Bash-based scheduled task system for recurring Claude Code invocations
+- **`triple-c-agent/`** — the in-container agent (its own Rust crate; protocol in
+  `docs/superpowers/specs/2026-11-13-triple-c-agent-protocol.md`). Built static by the Dockerfile's
+  `agent-build` stage, started by `entrypoint.sh` **only when a token is configured**, last, as root
+  under a supervisor loop. **Its contract is Docker parity**: an `ExecSpec` must behave through the
+  agent exactly as through `docker exec`. Any change to exec semantics on either side is checked by
+  `host::agent::live_tests::the_agent_answers_exactly_as_docker_exec_does` (ignored; needs an image
+  with the agent — see the crate README). The token never stays in the environment: the entrypoint
+  moves it to a root-only file before anything runs, and the agent refuses a token file others can
+  read. The agent is started from an env/cwd snapshot taken at the top of the entrypoint so execs
+  see the container's configured env, not the script's.
 
 **`/home/claude` in the image is seed-only.** It is the mount point of the named volume
 `triple-c-home-{projectId}`, so after a project's *first* start the image's copy of that directory

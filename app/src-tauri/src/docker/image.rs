@@ -20,6 +20,11 @@ const PLAYWRIGHT_HEAL: &str = include_str!("../../../../container/triple-c-playw
 
 static MISSION_CONTROL_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/../../container/mission-control");
 static SKILLS_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/../../container/skills");
+// The agent crate's sources only — never the whole crate directory, which can
+// hold a multi-hundred-megabyte `target/` from a local build.
+const AGENT_CARGO_TOML: &str = include_str!("../../../../container/triple-c-agent/Cargo.toml");
+const AGENT_CARGO_LOCK: &str = include_str!("../../../../container/triple-c-agent/Cargo.lock");
+static AGENT_SRC_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/../../container/triple-c-agent/src");
 
 pub async fn image_exists(image_name: &str) -> Result<bool, String> {
     let docker = get_docker()?;
@@ -243,6 +248,9 @@ fn create_build_context() -> Result<Vec<u8>, std::io::Error> {
 
         append_embedded_dir(&mut archive, &MISSION_CONTROL_DIR, "mission-control")?;
         append_embedded_dir(&mut archive, &SKILLS_DIR, "skills")?;
+        append_file_to_archive(&mut archive, "triple-c-agent/Cargo.toml", AGENT_CARGO_TOML.as_bytes(), 0o644)?;
+        append_file_to_archive(&mut archive, "triple-c-agent/Cargo.lock", AGENT_CARGO_LOCK.as_bytes(), 0o644)?;
+        append_embedded_dir(&mut archive, &AGENT_SRC_DIR, "triple-c-agent/src")?;
 
         archive.finish()?;
     }

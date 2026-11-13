@@ -352,14 +352,15 @@ async fn a_non_root_agent_refuses_other_users_with_403() {
 }
 
 #[tokio::test]
-async fn env_merges_over_the_base_and_sets_home_user_logname_from_passwd() {
+async fn env_merges_over_the_base_and_sets_only_home_from_passwd() {
     let a = start().await;
-    let script = r#"printf '%s|%s|%s|%s|%s|%s|%s' "$FOO" "$BAR" "$BASE_ONLY" "$HOME" "$USER" "$LOGNAME" "${GONE-unset}""#;
+    let script = r#"printf '%s|%s|%s|%s|%s|%s|%s' "$FOO" "$BAR" "$BASE_ONLY" "$HOME" "${USER-unset}" "${LOGNAME-unset}" "${GONE-unset}""#;
     let (_, v) = a
         .exec(json!({ "cmd": sh(script), "env": ["FOO=spec", "BAR=1", "BAR=2", "GONE"] }))
         .await;
     let home = passwd_home(&a.user);
-    assert_eq!(decode(&v).1, format!("spec|2|base|{home}|{u}|{u}|unset", u = a.user));
+    // Like `docker exec`: HOME from passwd, and no USER/LOGNAME invented.
+    assert_eq!(decode(&v).1, format!("spec|2|base|{home}|unset|unset|unset"));
 
     // The spec's own HOME/USER/LOGNAME win over passwd.
     let (_, v) = a

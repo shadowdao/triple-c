@@ -22,13 +22,28 @@
 # environment; the agent reads the file. A `docker exec` session still sees
 # the container's configured env — the local test harness passes it that way
 # and accepts that; on AWS nothing is started by `docker exec`.
+#
+# The agent also takes its exec environment and default working directory
+# from how *it* was started, and execs must see what `docker exec` would: the
+# container's configured env and WorkingDir, not whatever this script has
+# exported or cd'd into by the time it gets to start_agent. So both are
+# snapshotted here, before anything else runs, and the agent is started from
+# the snapshot (`env -i`). The agent drops its own TRIPLEC_AGENT_* settings.
 # >>> agent_token
+agent_cwd=$PWD
 if [ -n "${TRIPLEC_AGENT_TOKEN:-}" ]; then
     mkdir -p /run/triple-c
     chmod 700 /run/triple-c
     ( umask 077; printf '%s' "$TRIPLEC_AGENT_TOKEN" > /run/triple-c/agent-token )
     unset TRIPLEC_AGENT_TOKEN
     export TRIPLEC_AGENT_TOKEN_FILE=/run/triple-c/agent-token
+fi
+if [ -n "${TRIPLEC_AGENT_TOKEN_FILE:-}" ]; then
+    mkdir -p /run/triple-c
+    chmod 700 /run/triple-c
+    # Minus what bash itself exports (PWD, OLDPWD, SHLVL, `_`): those are this
+    # script's, not the container's, and `docker exec` has none of them.
+    ( umask 077; env -u PWD -u OLDPWD -u SHLVL -u _ -0 > /run/triple-c/agent-env )
 fi
 # <<< agent_token
 
@@ -802,11 +817,14 @@ start_agent() {
         echo "triple-c-agent: token given but no agent binary in this image — not starting it" >&2
         return 0
     fi
+    local -a agent_env=()
+    [ -r /run/triple-c/agent-env ] && mapfile -d '' agent_env < /run/triple-c/agent-env
     (
         trap '' HUP
+        cd "$agent_cwd" || cd /
         while :; do
             agent_started=$SECONDS
-            /usr/local/bin/triple-c-agent
+            env -i "${agent_env[@]}" /usr/local/bin/triple-c-agent
             echo "triple-c-agent exited ($?) — restarting" >&2
             [ $((SECONDS - agent_started)) -ge 5 ] || sleep 5
         done

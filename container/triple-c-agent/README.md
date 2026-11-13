@@ -27,7 +27,7 @@ as itself and answers `403` for any other user. The tests rely on that.
 ## Tests
 
 ```bash
-cd agent
+cd container/triple-c-agent
 cargo test                                   # everything, as the current user
 cargo clippy --all-targets
 # The root-only test (user switch + chown), as root:
@@ -48,7 +48,7 @@ that comes with the toolchain. Verified with rustc 1.98.0:
 ```bash
 rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 
-cd agent
+cd container/triple-c-agent
 cargo build --release --target x86_64-unknown-linux-musl
 CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
   cargo build --release --target aarch64-unknown-linux-musl
@@ -65,3 +65,35 @@ Check a build with `file <binary>`. It must say `statically linked` or `static-p
 Do not add a dependency that needs a C compiler (`ring`, `openssl-sys`, anything using `cc`). The
 aarch64 build would then need a cross C toolchain or `cargo-zigbuild`. TLS is out of scope for v1
 anyway, because the transport is the SSM channel or loopback.
+
+In the image, `container/Dockerfile`'s `agent-build` stage does this on the build platform for
+`$TARGETARCH`; the app's local build passes those build args itself (`docker/image.rs`).
+
+## Docker parity test
+
+The requirement is that every operation through the agent comes back exactly as it does through
+`docker exec`. `app/src-tauri/src/host/agent/live_tests.rs` checks that in one real container,
+running each operation through both `ContainerTarget::Docker` and `ContainerTarget::Agent` and
+comparing. It needs an image whose entrypoint starts the agent. To build one from the published
+sandbox image plus this branch's agent and entrypoint:
+
+```bash
+cargo build --release --target x86_64-unknown-linux-musl     # or aarch64, on an arm64 host
+ctx=$(mktemp -d)
+cp target/x86_64-unknown-linux-musl/release/triple-c-agent ../entrypoint.sh "$ctx"/
+cat > "$ctx/Dockerfile" <<'DOCKERFILE'
+FROM ghcr.io/shadowdao/triple-c-sandbox:latest
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY triple-c-agent /usr/local/bin/triple-c-agent
+RUN chmod 0755 /usr/local/bin/entrypoint.sh /usr/local/bin/triple-c-agent
+DOCKERFILE
+docker build -t tc-agent-e2e:latest "$ctx"
+
+cd ../../app/src-tauri
+cargo test --lib the_agent_answers_exactly_as_docker_exec_does -- --ignored --nocapture
+```
+
+The test starts and removes its own container. It reaches the agent on the published loopback port
+when run on the host, or on the container's bridge address when run from inside another container
+on the same daemon. It has already caught one real divergence: `docker exec` sets only `HOME` for
+the exec's user, never `USER`/`LOGNAME`.

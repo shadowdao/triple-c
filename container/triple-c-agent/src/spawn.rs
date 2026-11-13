@@ -145,8 +145,11 @@ pub fn prepare(cfg: &Config, spec: &ExecSpec, tty: bool) -> Result<Prepared, Pre
 /// the base env; `PATH` defaulted if absent and `TERM=xterm` for a tty if
 /// absent (both Docker daemon defaults); then the spec's entries, later ones
 /// winning. An entry with no `=` *removes* that variable, as Docker does.
-/// Finally `HOME`/`USER`/`LOGNAME` come from passwd unless the **spec** set
-/// them — the agent's own `HOME=/root` must not leak into a `claude` exec.
+/// Finally `HOME` comes from passwd unless the **spec** set it — the agent's
+/// own `HOME=/root` must not leak into a `claude` exec. Only `HOME`: runc sets
+/// nothing else for an exec, so `USER`/`LOGNAME` stay unset unless the
+/// container's env or the spec has them (verified against `docker exec` by
+/// the app's parity test, `host::agent::live_tests`).
 fn merge_env(cfg: &Config, spec: &ExecSpec, user: &UserInfo, tty: bool) -> Vec<(OsString, OsString)> {
     let mut env: Vec<(OsString, OsString)> = cfg.base_env.clone();
     fn set(env: &mut Vec<(OsString, OsString)>, k: &OsStr, v: &OsStr) {
@@ -174,10 +177,8 @@ fn merge_env(cfg: &Config, spec: &ExecSpec, user: &UserInfo, tty: bool) -> Vec<(
             }
         }
     }
-    for (k, v) in [("HOME", &user.home), ("USER", &user.name), ("LOGNAME", &user.name)] {
-        if !spec_set.contains(&k) {
-            set(&mut env, OsStr::new(k), OsStr::new(v));
-        }
+    if !spec_set.contains(&"HOME") {
+        set(&mut env, OsStr::new("HOME"), OsStr::new(&user.home));
     }
     env.retain(|(k, v)| {
         !k.is_empty() && !k.as_bytes().contains(&b'=') && !k.as_bytes().contains(&0) && !v.as_bytes().contains(&0)

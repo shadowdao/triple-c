@@ -1,3 +1,31 @@
+# ── triple-c-agent ─────────────────────────────────────────────────────────
+# The in-container agent the AWS host reaches the container through
+# (docs/superpowers/specs/2026-11-13-triple-c-agent-protocol.md). A static
+# musl binary, so it needs nothing from the image below.
+#
+# The stage runs on the *build* machine's platform and cross-compiles for the
+# target: CI builds amd64 and arm64 together, and compiling Rust for arm64
+# under QEMU is many times slower. BuildKit predefines BUILDPLATFORM and
+# TARGETARCH; the app's local build (the classic builder) passes them itself
+# (docker/image.rs, `local_build_args`), because there an empty `--platform=`
+# fails the build. Pure-Rust dependencies only, so rust-lld links aarch64
+# with no C cross toolchain (see container/triple-c-agent/README.md).
+ARG BUILDPLATFORM
+FROM --platform=$BUILDPLATFORM rust:1.98-slim-bookworm AS agent-build
+ARG TARGETARCH
+RUN rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+WORKDIR /src
+COPY triple-c-agent/Cargo.toml triple-c-agent/Cargo.lock ./
+COPY triple-c-agent/src ./src
+RUN case "$TARGETARCH" in \
+        amd64) target=x86_64-unknown-linux-musl ;; \
+        arm64) target=aarch64-unknown-linux-musl ;; \
+        *) echo "triple-c-agent: unsupported TARGETARCH '$TARGETARCH'" >&2; exit 1 ;; \
+    esac \
+    && CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
+       cargo build --release --locked --target "$target" \
+    && install -D -m 0755 "target/$target/release/triple-c-agent" /out/triple-c-agent
+
 FROM ubuntu:24.04
 
 # ── Provenance labels ────────────────────────────────────────────────────────
@@ -460,5 +488,9 @@ COPY triple-c-playwright-heal /usr/local/bin/triple-c-playwright-heal
 RUN chmod +x /usr/local/bin/triple-c-playwright-heal
 COPY triple-c-task-runner /usr/local/bin/triple-c-task-runner
 RUN chmod +x /usr/local/bin/triple-c-task-runner
+# Root-owned in /usr/local/bin: entrypoint.sh starts it as root (only when a
+# token is configured), and it rides the snapshot and migration like the other
+# shims here.
+COPY --from=agent-build /out/triple-c-agent /usr/local/bin/triple-c-agent
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

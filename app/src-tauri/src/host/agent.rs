@@ -851,3 +851,5 @@ pub async fn is_running(ep: &AgentEndpoint) -> Result<bool, String> {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod live_tests;

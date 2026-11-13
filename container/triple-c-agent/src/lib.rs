@@ -80,7 +80,12 @@ impl Config {
         Ok(Config {
             token,
             default_cwd: std::env::current_dir()?,
-            base_env: std::env::vars_os().filter(|(k, _)| k != TOKEN_ENV).collect(),
+            // None of the agent's own settings (`TRIPLEC_AGENT_*`) reach an
+            // exec: the token is a secret, and the token-file path and listen
+            // address are the agent's business — `docker exec` sees neither.
+            base_env: std::env::vars_os()
+                .filter(|(k, _)| !k.to_string_lossy().starts_with("TRIPLEC_AGENT_"))
+                .collect(),
             max_file_bytes: MAX_DROP_BYTES,
         })
     }
@@ -102,8 +107,8 @@ pub fn load_token(env_token: Option<OsString>, file: Option<PathBuf>) -> Result<
         ),
         None => match file {
             Some(path) => (
-                std::fs::read_to_string(&path)
-                    .map_err(|e| format!("cannot read {TOKEN_FILE_ENV} ({}): {e}", path.display()))?,
+                read_private_file(&path)
+                    .map_err(|e| format!("cannot use {TOKEN_FILE_ENV} ({}): {e}", path.display()))?,
                 format!("{TOKEN_FILE_ENV} ({})", path.display()),
             ),
             None => {
@@ -121,6 +126,31 @@ pub fn load_token(env_token: Option<OsString>, file: Option<PathBuf>) -> Result<
         ));
     }
     Ok(token)
+}
+
+/// Read a secret file, refusing one that anyone but its owner could read or
+/// that this process does not own — as `ssh` does for key files. The token
+/// is effectively root in the container; a world-readable copy of it would be
+/// a way in for any process, not just root's. Checked on the opened file, so
+/// the file judged is the file read.
+fn read_private_file(path: &std::path::Path) -> Result<String, String> {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+    let mut f = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let meta = f.metadata().map_err(|e| e.to_string())?;
+    let euid = unsafe { libc::geteuid() };
+    if meta.uid() != euid {
+        return Err(format!("owned by uid {}, not this process's uid {euid}", meta.uid()));
+    }
+    if meta.mode() & 0o077 != 0 {
+        return Err(format!(
+            "mode {:o} lets others read it; it must be 0600 or stricter",
+            meta.mode() & 0o777
+        ));
+    }
+    let mut s = String::new();
+    f.read_to_string(&mut s).map_err(|e| e.to_string())?;
+    Ok(s)
 }
 
 /// Shared server state.
@@ -283,13 +313,30 @@ mod tests {
     }
 
     #[test]
+    fn a_token_file_others_can_read_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, "y".repeat(40)).unwrap();
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let e = load_token(None, Some(path.clone())).unwrap_err();
+        assert!(e.contains("0600"), "{e}");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(load_token(None, Some(path.clone())).unwrap(), "y".repeat(40));
+    }
+
+    #[test]
     fn the_token_never_reaches_the_exec_base_env() {
         // `main` removes the var before capturing; this is the second guard,
         // for a caller that forgets.
         std::env::set_var(TOKEN_ENV, "x".repeat(40));
+        std::env::set_var(TOKEN_FILE_ENV, "/run/triple-c/agent-token");
         let cfg = Config::from_process("t".into()).unwrap();
         std::env::remove_var(TOKEN_ENV);
-        assert!(cfg.base_env.iter().all(|(k, _)| k != TOKEN_ENV));
+        std::env::remove_var(TOKEN_FILE_ENV);
+        assert!(cfg.base_env.iter().all(|(k, _)| !k.to_string_lossy().starts_with("TRIPLEC_AGENT_")));
         assert!(cfg.base_env.iter().any(|(k, _)| k == "PATH"));
     }
 
@@ -303,6 +350,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("tok");
         std::fs::write(&f, format!("{long}\n")).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         assert_eq!(load_token(Some("".into()), Some(f.clone())).unwrap(), long);
         std::fs::write(&f, "\n").unwrap();
         assert!(load_token(None, Some(f)).is_err());

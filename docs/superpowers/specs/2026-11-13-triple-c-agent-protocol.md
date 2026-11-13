@@ -40,8 +40,9 @@ has a quirk the app relies on, the agent reproduces it, and this document names 
 - **Errors** are `4xx`/`5xx` with body `{"error": "<message>"}`, Content-Type `application/json`.
 - **JSON** is UTF-8. Raw bytes inside JSON are standard base64 with padding.
 - **Users** are names resolved through `/etc/passwd` and `/etc/group` in the container. An exec
-  runs with the user's uid, primary gid and supplementary groups (`initgroups`). `HOME`, `USER`
-  and `LOGNAME` are set from passwd **unless the spec's env already sets them**. When the agent is
+  runs with the user's uid, primary gid and supplementary groups (`initgroups`). `HOME` is set
+  from passwd **unless the spec's env already sets it**; `USER` and `LOGNAME` are *not* added
+  (runc sets only `HOME` for an exec, verified by the app's parity test). When the agent is
   not root (tests), a spec naming a user other than the agent's own fails with `403`.
 - **ExecSpec** (JSON):
   ```json

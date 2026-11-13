@@ -81,6 +81,15 @@ pub async fn put_file(
     if euid != 0 && (uid != euid || gid != egid) {
         return error(StatusCode::FORBIDDEN, "the agent is not root and cannot chown to another user");
     }
+    // `dir` is resolved following symlinks, and the write runs as root. That
+    // is deliberate parity, not an oversight: Docker's archive upload — what
+    // this replaces — also resolves symlinks inside the container. It is not
+    // a privilege boundary either: the `claude` user who could plant a
+    // symlink has passwordless sudo in this image (Dockerfile, sudoers.d), so
+    // redirecting a root write gains nothing `sudo` doesn't. The final
+    // component is still opened O_NOFOLLOW|O_CREAT|O_EXCL below, so an
+    // existing symlink *at* the name is replaced, never written through.
+    // Revisit with openat2(RESOLVE_NO_SYMLINKS) if that sudo ever goes.
     match std::fs::metadata(&q.dir) {
         Ok(m) if m.is_dir() => {}
         Ok(_) => return error(StatusCode::BAD_REQUEST, format!("{} is not a directory", q.dir)),
