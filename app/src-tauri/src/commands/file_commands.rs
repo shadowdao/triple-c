@@ -4,14 +4,11 @@ use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use bollard::container::{DownloadFromContainerOptions, LogOutput};
-use bollard::exec::{CreateExecOptions, StartExecResults};
 use futures_util::StreamExt;
 use serde::Serialize;
 use tauri::State;
 
-use crate::docker::client::get_docker;
-use crate::docker::exec::{exec_oneshot_as, exec_oneshot_streams_as, OUTPUT_LIMIT_MARKER};
+use crate::host::{ContainerTarget, ExecChunk, ExecSpec, OUTPUT_LIMIT_MARKER};
 use crate::AppState;
 
 #[derive(Debug, PartialEq, Serialize)]
@@ -63,9 +60,7 @@ pub async fn list_container_files(
         .get(&project_id)
         .ok_or_else(|| format!("Project {} not found", project_id))?;
 
-    let container_id = project
-        .container_id
-        .as_ref()
+    let target = ContainerTarget::for_project(&project)
         .ok_or_else(|| "Container not running".to_string())?;
 
     // `exec_oneshot` discards the exit code, which is how a `find` that listed
@@ -78,7 +73,8 @@ pub async fn list_container_files(
     // are the error message, its `-printf` records are the listing, and the
     // parser should never be handed the former.
     let (records, diagnostics, code) =
-        exec_oneshot_streams_as(container_id, "claude", list_argv(&path), Vec::new())
+        target
+            .exec_oneshot_streams_as("claude", list_argv(&path), Vec::new())
             .await
             .map_err(|e| describe_listing_failure(&path, e))?;
 
@@ -156,7 +152,7 @@ fn list_argv(path: &str) -> Vec<String> {
 /// folder can act on.
 ///
 /// One case is worth naming: a directory with more entries than
-/// [`crate::docker::exec::MAX_ONESHOT_OUTPUT`] will hold. Roughly 100k names is
+/// [`crate::host::MAX_ONESHOT_OUTPUT`] will hold. Roughly 100k names is
 /// the point where a `find` record set passes 8 MiB, and what the panel showed
 /// was "Command output exceeded 8388608 bytes and was abandoned" — a true
 /// statement about a buffer, and no help at all about a directory.
@@ -430,7 +426,11 @@ pub(crate) fn validate_container_write_path(what: &str, path: &str) -> Result<()
 /// and the lexical answer stands: failing every write closed would break the
 /// panel outright for a risk the container user does not need this code path to
 /// take.
-async fn resolve_container_dir(container_id: &str, what: &str, dir: &str) -> Result<(), String> {
+async fn resolve_container_dir(
+    target: &ContainerTarget,
+    what: &str,
+    dir: &str,
+) -> Result<(), String> {
     validate_container_write_path(what, dir)?;
 
     // Split streams, not the combined buffer: `realpath`'s answer is a *path*
@@ -438,18 +438,18 @@ async fn resolve_container_dir(container_id: &str, what: &str, dir: &str) -> Res
     // hazard the listing above took apart for `find`. A warning on stderr —
     // and there is one whenever a component is unreadable — used to be spliced
     // into the string this then compared against the write roots.
-    let (stdout, diagnostics, code) = exec_oneshot_streams_as(
-        container_id,
-        "claude",
-        vec![
-            "realpath".to_string(),
-            "-m".to_string(),
-            "--".to_string(),
-            dir.to_string(),
-        ],
-        Vec::new(),
-    )
-    .await?;
+    let (stdout, diagnostics, code) = target
+        .exec_oneshot_streams_as(
+            "claude",
+            vec![
+                "realpath".to_string(),
+                "-m".to_string(),
+                "--".to_string(),
+                dir.to_string(),
+            ],
+            Vec::new(),
+        )
+        .await?;
 
     let resolved = stdout.trim();
     if code != 0 || resolved.is_empty() {
@@ -1188,7 +1188,7 @@ pub(crate) struct FetchedFile {
 
 /// Fetch a single regular file from a container as exact bytes.
 ///
-/// The viewer's read. It deliberately goes through Docker's archive endpoint rather than
+/// The viewer's read. It deliberately goes through the archive endpoint rather than
 /// `exec_oneshot`: that reader runs every chunk through `String::from_utf8_lossy`
 /// and merges stderr into stdout, so it would both corrupt any non-UTF-8 file
 /// and be able to splice diagnostics into what the caller believes is content.
@@ -1202,19 +1202,15 @@ pub(crate) struct FetchedFile {
 /// file — or the whole *directory tree*, since the type check happens after the
 /// read — landed in host RAM twice. This function buffers, so every caller of
 /// it must name a ceiling.
+///
+/// Takes a container id rather than a [`ContainerTarget`] because the file
+/// viewer's commands call it with the id they already hold.
 pub(crate) async fn fetch_container_file(
     container_id: &str,
     container_path: &str,
     max_bytes: u64,
 ) -> Result<FetchedFile, String> {
-    let docker = get_docker()?;
-
-    let mut stream = docker.download_from_container(
-        container_id,
-        Some(DownloadFromContainerOptions {
-            path: container_path.to_string(),
-        }),
-    );
+    let mut stream = ContainerTarget::docker(container_id).download_archive(container_path);
 
     // A tar member is a 512-byte header plus payload padded to 512. 8 KiB of
     // slack past the payload cap guarantees the header and the whole capped
@@ -1297,13 +1293,11 @@ pub async fn read_container_file(
         .get(&project_id)
         .ok_or_else(|| format!("Project {} not found", project_id))?;
 
-    let container_id = project
-        .container_id
-        .as_ref()
+    let target = ContainerTarget::for_project(&project)
         .ok_or_else(|| "Container not running".to_string())?;
 
     let cap = max_bytes.unwrap_or(MAX_READ_BYTES).min(MAX_READ_BYTES);
-    let fetched = fetch_container_file(container_id, &path, cap).await?;
+    let fetched = fetch_container_file(target.id(), &path, cap).await?;
 
     Ok(FileContents {
         contents_base64: BASE64.encode(&fetched.bytes),
@@ -1333,9 +1327,7 @@ pub async fn rename_container_path(
         .get(&project_id)
         .ok_or_else(|| format!("Project {} not found", project_id))?;
 
-    let container_id = project
-        .container_id
-        .as_ref()
+    let target = ContainerTarget::for_project(&project)
         .ok_or_else(|| "Container not running".to_string())?;
 
     // The name is checked by `validate_entry_name`; the path it is applied to
@@ -1349,7 +1341,7 @@ pub async fn rename_container_path(
     // directory component to resolve.
     let parent = parent_dir(&from_path);
     if parent != "/" {
-        resolve_container_dir(container_id, "Item", &parent).await?;
+        resolve_container_dir(&target, "Item", &parent).await?;
     }
 
     let new_name = to_path.trim();
@@ -1364,8 +1356,7 @@ pub async fn rename_container_path(
     // and exits 0 — so `-n` on its own would report a rename that never
     // happened. The existence check is what turns it into an error the user
     // sees; `-n` stays as the belt-and-braces against the race between them.
-    let (_, exists) = exec_oneshot_as(
-        container_id,
+    let (_, exists) = target.exec_oneshot_as(
         "claude",
         vec!["test".to_string(), "-e".to_string(), dest.clone()],
         Vec::new(),
@@ -1375,8 +1366,7 @@ pub async fn rename_container_path(
         return Err(format!("\"{}\" already exists in this folder", new_name));
     }
 
-    let (output, code) = exec_oneshot_as(
-        container_id,
+    let (output, code) = target.exec_oneshot_as(
         "claude",
         vec![
             "mv".to_string(),
@@ -1417,19 +1407,16 @@ pub async fn create_container_directory(
         .get(&project_id)
         .ok_or_else(|| format!("Project {} not found", project_id))?;
 
-    let container_id = project
-        .container_id
-        .as_ref()
+    let target = ContainerTarget::for_project(&project)
         .ok_or_else(|| "Container not running".to_string())?;
 
-    resolve_container_dir(container_id, "Folder", &parent_path).await?;
+    resolve_container_dir(&target, "Folder", &parent_path).await?;
 
     let name = name.trim();
     validate_entry_name(name)?;
     let dest = join_path(&parent_path, name);
 
-    let (output, code) = exec_oneshot_as(
-        container_id,
+    let (output, code) = target.exec_oneshot_as(
         "claude",
         vec!["mkdir".to_string(), "--".to_string(), dest.clone()],
         Vec::new(),
@@ -1448,6 +1435,17 @@ pub async fn create_container_directory(
     Ok(dest)
 }
 
+/// The underlying cause of a [`ContainerTarget::attach`] failure, without the
+/// host layer's own "Failed to create exec: " / "Failed to start exec: "
+/// prefix, so the transfers below can keep framing it in their own words as
+/// they did when they opened the exec themselves. Anything else (an
+/// unreachable daemon, a detached start) passes through whole.
+fn strip_exec_error_prefix(e: &str) -> &str {
+    e.strip_prefix("Failed to create exec: ")
+        .or_else(|| e.strip_prefix("Failed to start exec: "))
+        .unwrap_or(e)
+}
+
 /// Every "container is not running" refusal starts with this, so a caller (the file
 /// viewer's poll, `app/src/viewer/ipcMessages.ts`) can tell it apart from any other failure.
 pub(crate) const NOT_RUNNING_PREFIX: &str = "Start the project before";
@@ -1459,20 +1457,19 @@ pub(crate) fn not_running_message(action: &str, why: &str) -> String {
 /// Refuse, in a sentence, before a Docker error has to speak for us.
 ///
 /// Both file transfers and the backup run through `docker exec`, which needs a
-/// running container. Without this the failure surfaces as bollard's
+/// running container. Without this the failure surfaces as Docker's
 /// `is not running` wrapped in whatever the caller was doing, and for the
 /// upload it surfaces even less usefully: `resolve_container_dir`'s `realpath`
 /// is the first thing to touch the container, so a stopped project fails inside
 /// path *validation* and reads like the path was the problem.
+///
+/// Takes a container id rather than a [`ContainerTarget`] because the file
+/// viewer's commands call it with the id they already hold.
 pub(crate) async fn require_running(container_id: &str, action: &str) -> Result<(), String> {
-    let docker = get_docker()?;
-    let running = docker
-        .inspect_container(container_id, None)
-        .await
-        .ok()
-        .and_then(|info| info.state)
-        .and_then(|s| s.running)
-        .unwrap_or(false);
+    // An unreachable daemon is an error; an inspect failure (container gone)
+    // reads as "not running" — `is_running`'s contract, and what this did
+    // when it inspected the container itself.
+    let running = ContainerTarget::docker(container_id).is_running().await?;
     if running {
         return Ok(());
     }
@@ -1543,12 +1540,10 @@ pub async fn download_container_file(
         .get(&project_id)
         .ok_or_else(|| format!("Project {} not found", project_id))?;
 
-    let container_id = project
-        .container_id
-        .as_ref()
+    let target = ContainerTarget::for_project(&project)
         .ok_or_else(|| "No container exists for this project yet — start it first".to_string())?;
 
-    require_running(container_id, "saving a file to the host").await?;
+    require_running(target.id(), "saving a file to the host").await?;
 
     let Some(chosen) = pick_save_path(&window, &suggested_save_name(&container_path)).await else {
         // Dismissed. Not an error, and deliberately distinguishable from one:
@@ -1563,8 +1558,6 @@ pub async fn download_container_file(
     // agreeing about what is writable is worth more than the few refusals it
     // costs. See the note on `pick_save_path` about which ones those are.
     let dest = resolve_host_path(&chosen, HostPathUse::WriteChosenName).await?;
-
-    let docker = get_docker()?;
 
     // `$TC_SRC`, never argv interpolation: the path reaches the shell as an
     // environment value, so a name containing a quote or a `$` is data.
@@ -1627,30 +1620,19 @@ esac
 echo "TC_SIZE=$SZ" >&2
 dd iflag=nonblock bs=64k status=none if="$TC_SRC" || exit 5"#;
 
-    let exec = docker
-        .create_exec(
-            container_id,
-            CreateExecOptions {
-                attach_stdout: Some(true),
-                attach_stderr: Some(true),
-                cmd: Some(vec!["sh".to_string(), "-c".to_string(), script.to_string()]),
-                env: Some(vec![format!("TC_SRC={}", container_path)]),
-                user: Some("claude".to_string()),
-                ..Default::default()
-            },
+    // As `claude`, no TTY, no stdin and no working directory (the image's
+    // default) — the options this exec has always been created with.
+    let exec = target
+        .attach(
+            ExecSpec::new(vec!["sh".to_string(), "-c".to_string(), script.to_string()])
+                .env(vec![format!("TC_SRC={}", container_path)])
+                .working_dir(None)
+                .no_stdin(),
         )
         .await
-        .map_err(|e| format!("Failed to start download: {}", e))?;
-
-    let result = docker
-        .start_exec(&exec.id, None)
-        .await
-        .map_err(|e| format!("Failed to start download: {}", e))?;
-
-    let mut output = match result {
-        StartExecResults::Attached { output, .. } => output,
-        StartExecResults::Detached => return Err("Download exec started detached".to_string()),
-    };
+        .map_err(|e| format!("Failed to start download: {}", strip_exec_error_prefix(&e)))?;
+    let exec_id = exec.exec_id;
+    let mut output = exec.output;
 
     use tokio::io::AsyncWriteExt;
     let partial = partial_download_path(&dest)?;
@@ -1696,7 +1678,7 @@ dd iflag=nonblock bs=64k status=none if="$TC_SRC" || exit 5"#;
 
     while let Some(msg) = output.next().await {
         match msg {
-            Ok(LogOutput::StdOut { message }) => {
+            Ok(ExecChunk::StdOut(message)) => {
                 if let Err(e) = writer.write_all(&message).await {
                     stream_err = Some(format!("Failed to write {}: {}", dest.display(), e));
                     break;
@@ -1727,7 +1709,7 @@ dd iflag=nonblock bs=64k status=none if="$TC_SRC" || exit 5"#;
                     }
                 }
             }
-            Ok(LogOutput::StdErr { message }) => {
+            Ok(ExecChunk::StdErr(message)) => {
                 push_capped(&mut stderr_text, &message);
                 if declared.is_none() {
                     declared = parse_declared_size(&stderr_text);
@@ -1760,7 +1742,7 @@ dd iflag=nonblock bs=64k status=none if="$TC_SRC" || exit 5"#;
     // success renames a truncated partial over the file the user already had
     // and reports the byte count as if it were the whole thing. That is the one
     // way this command could destroy data, so silence is failure.
-    let exit_code = crate::docker::exec::wait_for_exec_exit(&exec.id).await;
+    let exit_code = target.wait_exec_exit(&exec_id).await;
     if stream_err.is_none() && exit_code != Some(0) {
         // Framed and clipped, never verbatim.
         //
@@ -1894,7 +1876,7 @@ pub struct UploadOutcome {
 ///   * the destination goes through [`resolve_container_dir`], so it is inside
 ///     [`CONTAINER_WRITE_ROOTS`] both as written and as it resolves;
 ///   * the read, the size ceiling and the descriptor check are
-///     `docker::exec::upload_host_file_with_ids`', unchanged — including
+///     `ContainerTarget::upload_host_file_with_ids`', unchanged — including
 ///     landing the file owned by the container user rather than root.
 ///
 /// The dialog itself is opened from Rust ([`pick_files_to_upload`]), which is
@@ -1911,15 +1893,13 @@ pub async fn upload_files_to_container(
         .get(&project_id)
         .ok_or_else(|| format!("Project {} not found", project_id))?;
 
-    let container_id = project
-        .container_id
-        .as_ref()
+    let target = ContainerTarget::for_project(&project)
         .ok_or_else(|| "No container exists for this project yet — start it first".to_string())?;
 
     // Both checks before the dialog, so a project that cannot receive files
     // says so instead of asking the user to choose some first.
-    require_running(container_id, "uploading files").await?;
-    resolve_container_dir(container_id, "Upload", &container_dir).await?;
+    require_running(target.id(), "uploading files").await?;
+    resolve_container_dir(&target, "Upload", &container_dir).await?;
 
     let Some(picked) = pick_files_to_upload(&window).await else {
         return Ok(None);
@@ -1930,14 +1910,14 @@ pub async fn upload_files_to_container(
     // files; this one is the check that actually guards the extraction. A modal
     // has no time limit, and `resolve_container_dir` answers a question about
     // the container's filesystem — which the container is free to change while
-    // the dialog is open. Without this, `docker::exec`'s doc comment claim that
+    // the dialog is open. Without this, the uploader's doc comment claim that
     // the destination "has already been confirmed" would be true only of a
     // moment that had passed.
-    resolve_container_dir(container_id, "Upload", &container_dir).await?;
+    resolve_container_dir(&target, "Upload", &container_dir).await?;
 
     // Once for the whole selection, not once per file — see
     // `upload_host_file_with_ids`.
-    let ids = crate::docker::exec::container_user_ids(container_id).await;
+    let ids = target.user_ids().await;
 
     let mut outcome = UploadOutcome {
         uploaded: Vec::new(),
@@ -1951,7 +1931,7 @@ pub async fn upload_files_to_container(
                 continue;
             }
         };
-        match upload_one(container_id, &path, &container_dir, ids).await {
+        match upload_one(&target, &path, &container_dir, ids).await {
             Ok(dest) => {
                 log::info!("Uploaded {} into project {} at {}", path, project_id, dest);
                 outcome.uploaded.push(dest);
@@ -1966,7 +1946,7 @@ pub async fn upload_files_to_container(
 /// naming the file, because the caller may be reporting several at once and
 /// "is a folder" on its own does not say which one.
 async fn upload_one(
-    container_id: &str,
+    target: &ContainerTarget,
     host_path: &str,
     container_dir: &str,
     ids: (u64, u64),
@@ -1990,7 +1970,7 @@ async fn upload_one(
     // The ceiling is enforced against the open descriptor inside the uploader;
     // this copy of it exists so the refusal arrives as a sentence instead of
     // after a 300 MB read.
-    use crate::docker::exec::MAX_DROP_BYTES;
+    use crate::host::MAX_DROP_BYTES;
     if meta.len() > MAX_DROP_BYTES {
         return Err(format!(
             "{} is too large to upload ({:.0} MB; limit {} MB). Mount it into the project instead.",
@@ -2000,14 +1980,9 @@ async fn upload_one(
         ));
     }
 
-    crate::docker::exec::upload_host_file_with_ids(
-        container_id,
-        &resolved,
-        container_dir,
-        &name,
-        ids,
-    )
-    .await
+    target
+        .upload_host_file_with_ids(&resolved, container_dir, &name, ids)
+        .await
 }
 
 /// Container-authored diagnostic text, cut down to something safe to quote.
@@ -2274,14 +2249,10 @@ pub async fn download_container_backup(
         .get(&project_id)
         .ok_or_else(|| format!("Project {} not found", project_id))?;
 
-    let container_id = project
-        .container_id
-        .as_ref()
+    let target = ContainerTarget::for_project(&project)
         .ok_or_else(|| "No container exists for this project yet — start it first".to_string())?;
 
-    let docker = get_docker()?;
-
-    require_running(container_id, "backing up").await?;
+    require_running(target.id(), "backing up").await?;
 
     let path = container_path.unwrap_or_else(|| "/workspace".to_string());
     // Read-only source: `tar -C` it, so absoluteness and `..` are what matter.
@@ -2326,33 +2297,25 @@ tar czf - --ignore-failed-read \
 
     let cmd = vec!["sh".to_string(), "-c".to_string(), script.to_string()];
 
-    let exec = docker
-        .create_exec(
-            container_id,
-            CreateExecOptions {
-                attach_stdout: Some(true),
-                attach_stderr: Some(true),
-                cmd: Some(cmd),
-                env: Some(vec![
+    // As `claude`, no TTY, no stdin and no working directory (the image's
+    // default) — the options this exec has always been created with.
+    let exec = target
+        .attach(
+            ExecSpec::new(cmd)
+                .env(vec![
                     "HOME=/home/claude".to_string(),
                     format!("TC_BACKUP_SRC={}", path),
-                ]),
-                user: Some("claude".to_string()),
-                ..Default::default()
-            },
+                ])
+                .working_dir(None)
+                .no_stdin(),
         )
         .await
-        .map_err(|e| format!("Failed to create backup exec: {}", e))?;
-
-    let result = docker
-        .start_exec(&exec.id, None)
-        .await
-        .map_err(|e| format!("Failed to start backup exec: {}", e))?;
-
-    let mut output = match result {
-        StartExecResults::Attached { output, .. } => output,
-        StartExecResults::Detached => return Err("Backup exec started detached".to_string()),
-    };
+        .map_err(|e| match e.strip_prefix("Failed to create exec: ") {
+            Some(rest) => format!("Failed to create backup exec: {}", rest),
+            None => format!("Failed to start backup exec: {}", strip_exec_error_prefix(&e)),
+        })?;
+    let exec_id = exec.exec_id;
+    let mut output = exec.output;
 
     use tokio::io::AsyncWriteExt;
     let partial = partial_download_path(&dest)?;
@@ -2401,14 +2364,14 @@ tar czf - --ignore-failed-read \
 
     while let Some(msg) = output.next().await {
         match msg {
-            Ok(LogOutput::StdOut { message }) => {
+            Ok(ExecChunk::StdOut(message)) => {
                 if let Err(e) = writer.write_all(&message).await {
                     stream_err = Some(format!("Failed to write backup file: {}", e));
                     break;
                 }
                 total += message.len() as u64;
             }
-            Ok(LogOutput::StdErr { message }) => {
+            Ok(ExecChunk::StdErr(message)) => {
                 push_capped(&mut stderr_text, &message);
             }
             Ok(_) => {}
@@ -2430,7 +2393,7 @@ tar czf - --ignore-failed-read \
     // when `total > 0`. Poll until the exec actually reports finished so the
     // exit code is reliably populated; if it can't be determined we fall back to
     // the `total == 0` check below.
-    let exit_code = crate::docker::exec::wait_for_exec_exit(&exec.id).await;
+    let exit_code = target.wait_exec_exit(&exec_id).await;
 
     if stream_err.is_none() && exit_code.is_some_and(|c| c != 0) {
         stream_err = Some(format!(
@@ -3564,10 +3527,11 @@ mod tests {
 
         // `/workspace/escape` is under a write root as a string and is `/etc` as
         // a location.
-        let escaped = resolve_container_dir(&name, "Folder", "/workspace/escape").await;
+        let target = ContainerTarget::docker(name.clone());
+        let escaped = resolve_container_dir(&target, "Folder", "/workspace/escape").await;
         println!("container escape: {:?}", escaped);
         assert!(escaped.is_err(), "a symlink out of /workspace was accepted");
-        resolve_container_dir(&name, "Folder", "/workspace")
+        resolve_container_dir(&target, "Folder", "/workspace")
             .await
             .expect("/workspace itself");
 
@@ -3575,7 +3539,7 @@ mod tests {
         // reporting itself empty — `-H` follows the start point, and only the
         // start point.
         let (records, diagnostics, code) =
-            exec_oneshot_streams_as(&name, "claude", list_argv("/workspace/link"), Vec::new())
+            target.exec_oneshot_streams_as("claude", list_argv("/workspace/link"), Vec::new())
                 .await
                 .unwrap();
         println!("link: code={} diagnostics={:?}", code, diagnostics);
@@ -3588,7 +3552,7 @@ mod tests {
         // The link itself is still *marked* as one in its parent's listing, and
         // still navigable.
         let (records, _, _) =
-            exec_oneshot_streams_as(&name, "claude", list_argv("/workspace"), Vec::new())
+            target.exec_oneshot_streams_as("claude", list_argv("/workspace"), Vec::new())
                 .await
                 .unwrap();
         let parent = parse_find_output("/workspace", &records);
@@ -3607,7 +3571,7 @@ mod tests {
         for path in ["/workspace/broken", "/workspace/loop"] {
             let started = std::time::Instant::now();
             let (records, diagnostics, code) =
-                exec_oneshot_streams_as(&name, "claude", list_argv(path), Vec::new())
+                target.exec_oneshot_streams_as("claude", list_argv(path), Vec::new())
                     .await
                     .unwrap();
             let took = started.elapsed();
