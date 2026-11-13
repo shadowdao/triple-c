@@ -18,6 +18,7 @@ use crate::file_viewer::registry::{
 use crate::file_viewer::resolve::{candidate_paths, fallback_candidate_paths, probe_candidates};
 use crate::file_viewer::window::open_viewer_window;
 use crate::file_viewer::write::{sha256_hex, write_file, SavedFile, MAX_WRITE_BYTES};
+use crate::host::ContainerTarget;
 use crate::models::Project;
 use crate::AppState;
 
@@ -113,13 +114,11 @@ fn project_of(state: &AppState, project_id: &str) -> Result<Project, String> {
 }
 
 /// `action` completes "Start the project before …", e.g. "saving this file".
-async fn running_container_of(project: &Project, action: &str) -> Result<String, String> {
-    let container_id = project
-        .container_id
-        .clone()
+async fn running_container_of(project: &Project, action: &str) -> Result<ContainerTarget, String> {
+    let container = ContainerTarget::for_project(project)
         .ok_or_else(|| not_running_message(action, "files live in its container"))?;
-    require_running(&container_id, action).await?;
-    Ok(container_id)
+    require_running(&container, action).await?;
+    Ok(container)
 }
 
 /// The container of the project a viewer window belongs to, if it is running.
@@ -127,7 +126,7 @@ async fn running_container_for(
     state: &AppState,
     target: &ViewerTarget,
     action: &str,
-) -> Result<String, String> {
+) -> Result<ContainerTarget, String> {
     running_container_of(&project_of(state, &target.project_id)?, action).await
 }
 
@@ -156,17 +155,17 @@ pub async fn open_file_viewer(
 ) -> Result<(), String> {
     require_main(window.label())?;
     let project = project_of(&state, &project_id)?;
-    let container_id = running_container_of(&project, "opening files").await?;
+    let container = running_container_of(&project, "opening files").await?;
 
     let mounts: Vec<String> = project.paths.iter().map(|p| p.mount_name.clone()).collect();
     let mut candidates = candidate_paths(&path, &mounts)?;
-    let mut matches = probe_candidates(&container_id, &candidates).await?;
+    let mut matches = probe_candidates(&container, &candidates).await?;
     // Not in the project: try home and /tmp, as a second exec so a project file
     // never becomes a chooser because a namesake sits in /tmp.
     if matches.is_empty() {
         let fallbacks = fallback_candidate_paths(&path);
         if !fallbacks.is_empty() {
-            matches = probe_candidates(&container_id, &fallbacks).await?;
+            matches = probe_candidates(&container, &fallbacks).await?;
             candidates.extend(fallbacks);
         }
     }
@@ -253,9 +252,9 @@ pub async fn viewer_read_file(
 ) -> Result<ViewerFile, String> {
     let (_label, target) = own_target(&window, &registry)?;
     let path = resolved_path(&target)?;
-    let container_id = running_container_for(&state, &target, "opening files").await?;
+    let container = running_container_for(&state, &target, "opening files").await?;
     let cap = max_bytes.clamp(1, MAX_READ_BYTES);
-    let fetched = fetch_container_file(&container_id, &path, cap).await?;
+    let fetched = fetch_container_file(&container, &path, cap).await?;
     let (editable, readonly_reason) = match validate_container_write_path("File", &path) {
         Ok(()) => (true, None),
         Err(reason) => (false, Some(reason)),
@@ -278,8 +277,8 @@ pub async fn viewer_poll_file(
 ) -> Result<ViewerPoll, String> {
     let (_label, target) = own_target(&window, &registry)?;
     let path = resolved_path(&target)?;
-    let container_id = running_container_for(&state, &target, "checking this file for changes").await?;
-    poll_file(&container_id, &path).await
+    let container = running_container_for(&state, &target, "checking this file for changes").await?;
+    poll_file(&container, &path).await
 }
 
 /// Errors from `write_file` pass through unchanged: the frontend matches the
@@ -302,8 +301,8 @@ pub async fn viewer_write_file(
     let bytes = BASE64
         .decode(contents_base64.as_bytes())
         .map_err(|_| "The editor sent malformed content.".to_string())?;
-    let container_id = running_container_for(&state, &target, "saving this file").await?;
-    write_file(&container_id, &state.exec_manager, &path, &bytes, &base_hash).await
+    let container = running_container_for(&state, &target, "saving this file").await?;
+    write_file(&container, &state.exec_manager, &path, &bytes, &base_hash).await
 }
 
 #[cfg(test)]

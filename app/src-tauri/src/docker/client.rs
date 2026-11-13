@@ -26,3 +26,13 @@ pub async fn check_docker_available() -> Result<bool, String> {
         }
     }
 }
+
+/// The daemon socket a project container gets bind-mounted when Docker access
+/// is enabled and no path is configured.
+pub fn default_docker_socket() -> String {
+    if cfg!(target_os = "windows") {
+        "//./pipe/docker_engine".to_string()
+    } else {
+        "/var/run/docker.sock".to_string()
+    }
+}

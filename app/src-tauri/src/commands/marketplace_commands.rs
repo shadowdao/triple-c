@@ -945,10 +945,10 @@ pub async fn apply_marketplace_now(
     let mut results = Vec::new();
     for p in projects {
         let running = match ContainerTarget::for_project(&p) {
-            Some(target) => target.is_running().await.unwrap_or(false),
-            None => false,
+            Some(target) if target.is_running().await.unwrap_or(false) => Some(target),
+            _ => None,
         };
-        if !running {
+        let Some(target) = running else {
             if project_id.is_some() {
                 return Err(format!(
                     "\"{}\" is not running. Its marketplace items are applied when it starts.",
@@ -956,9 +956,8 @@ pub async fn apply_marketplace_now(
                 ));
             }
             continue;
-        }
-        let cid = p.container_id.clone().unwrap_or_default();
-        let report = mk::sync_project(&state.marketplace, &settings, &p, &cid).await;
+        };
+        let report = mk::sync_project(&state.marketplace, &settings, &p, &target).await;
         let _ = app_handle.emit(
             mk::SYNC_FINISHED_EVENT,
             serde_json::json!({ "project_id": p.id, "report": report }),

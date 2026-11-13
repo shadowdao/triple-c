@@ -255,15 +255,15 @@ fn on_resized(app: &AppHandle, project_id: &str, width: u32, height: u32) {
         }
 
         let state = app.state::<crate::AppState>();
-        let Some(container_id) = state
+        let Some(container) = state
             .projects_store
             .get(&project_id)
-            .and_then(|p| p.container_id)
+            .and_then(|p| crate::host::ContainerTarget::for_project(&p))
         else {
             return;
         };
         if let Err(e) = super::page::set_viewport(
-            &container_id,
+            &container,
             super::page::Viewport::sane(width, height),
         )
         .await

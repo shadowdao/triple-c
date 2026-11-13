@@ -6,6 +6,7 @@ use tauri::{AppHandle, State};
 
 use crate::browser_view::install::{self, BrowserSetupOutcome};
 use crate::browser_view::{manager, page, popout, BrowserViewState, BrowserViewStatus};
+use crate::host::ContainerTarget;
 use crate::AppState;
 
 /// Turn the pane on or off for a project.
@@ -57,12 +58,12 @@ pub async fn set_browser_view_enabled(
         return Ok(manager().status(&project_id, false).await);
     }
 
-    let container_id = running_container(&state, &project_id, "opening the browser view").await?;
+    let container = running_container(&state, &project_id, "opening the browser view").await?;
 
     manager()
         .start(
             project_id,
-            container_id,
+            container,
             app_handle,
             state.projects_store.clone(),
         )
@@ -106,8 +107,8 @@ pub async fn check_browser_view_support(
     project_id: String,
     state: State<'_, AppState>,
 ) -> Result<crate::browser_view::detect::PlaywrightDetection, String> {
-    let container_id = running_container(&state, &project_id, "checking for Playwright").await?;
-    crate::browser_view::detect::detect(&container_id).await
+    let container = running_container(&state, &project_id, "checking for Playwright").await?;
+    crate::browser_view::detect::detect(&container).await
 }
 
 /// Install `playwright` and `@playwright/cli` into the container.
@@ -125,8 +126,8 @@ pub async fn install_browser_view_support(
     app_handle: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<BrowserSetupOutcome, String> {
-    let container_id = running_container(&state, &project_id, "installing Playwright").await?;
-    install::install_packages(&app_handle, &project_id, &container_id).await
+    let container = running_container(&state, &project_id, "installing Playwright").await?;
+    install::install_packages(&app_handle, &project_id, &container).await
 }
 
 /// Install a browser — `chromium` (Playwright's own build, for scripts that
@@ -143,8 +144,8 @@ pub async fn install_browser_view_browser(
     state: State<'_, AppState>,
 ) -> Result<BrowserSetupOutcome, String> {
     let target = install::BrowserTarget::parse(&browser)?;
-    let container_id = running_container(&state, &project_id, "installing a browser").await?;
-    install::install_browser(&app_handle, &project_id, &container_id, target).await
+    let container = running_container(&state, &project_id, "installing a browser").await?;
+    install::install_browser(&app_handle, &project_id, &container, target).await
 }
 
 /// Detach the view into a window of its own, or raise the one already open.
@@ -240,17 +241,17 @@ pub async fn open_page_in_container_browser(
     if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
         return Err("Only http:// and https:// URLs can be opened in the browser.".to_string());
     }
-    let container_id = running_container(&state, &project_id, "opening a page").await?;
+    let container = running_container(&state, &project_id, "opening a page").await?;
     crate::commands::project_commands::emit_progress(
         &app_handle,
         &project_id,
         "Checking the container for Playwright…",
     );
-    let detection = crate::browser_view::detect::detect(&container_id).await?;
+    let detection = crate::browser_view::detect::detect(&container).await?;
     let opened = page::open(
         &app_handle,
         &project_id,
-        &container_id,
+        &container,
         &detection,
         trimmed,
         page::Viewport::sane(width, height),
@@ -273,7 +274,7 @@ pub async fn open_page_in_container_browser(
         manager()
             .start(
                 project_id.clone(),
-                container_id,
+                container,
                 app_handle.clone(),
                 state.projects_store.clone(),
             )
@@ -309,8 +310,8 @@ pub async fn set_container_page_viewport(
     height: u32,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let container_id = running_container(&state, &project_id, "resizing the page").await?;
-    page::set_viewport(&container_id, page::Viewport::sane(width, height)).await
+    let container = running_container(&state, &project_id, "resizing the page").await?;
+    page::set_viewport(&container, page::Viewport::sane(width, height)).await
 }
 
 /// State of the page this opened, if any. Never fails: "no page" is an answer.
@@ -319,10 +320,10 @@ pub async fn get_container_page_state(
     project_id: String,
     state: State<'_, AppState>,
 ) -> Result<page::PageState, String> {
-    let Ok(container_id) = running_container(&state, &project_id, "reading the page").await else {
+    let Ok(container) = running_container(&state, &project_id, "reading the page").await else {
         return Ok(page::PageState::default());
     };
-    Ok(page::state(&container_id).await)
+    Ok(page::state(&container).await)
 }
 
 /// Close the page this opened, leaving the view itself running.
@@ -331,8 +332,8 @@ pub async fn close_container_page(
     project_id: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let container_id = running_container(&state, &project_id, "closing the page").await?;
-    page::close(&container_id).await;
+    let container = running_container(&state, &project_id, "closing the page").await?;
+    page::close(&container).await;
     Ok(())
 }
 
@@ -356,8 +357,8 @@ pub async fn set_browser_view_match_window(
     let Some((width, height)) = popout::inner_size(&app_handle, &project_id) else {
         return Ok(());
     };
-    let container_id = running_container(&state, &project_id, "matching the window").await?;
-    page::set_viewport(&container_id, page::Viewport::sane(width, height)).await
+    let container = running_container(&state, &project_id, "matching the window").await?;
+    page::set_viewport(&container, page::Viewport::sane(width, height)).await
 }
 
 /// Whether match-window mode is on. Read on mount, like the rest of the
@@ -391,28 +392,25 @@ async fn running_container(
     state: &State<'_, AppState>,
     project_id: &str,
     action: &str,
-) -> Result<String, String> {
+) -> Result<ContainerTarget, String> {
     let project = state
         .projects_store
         .get(project_id)
         .ok_or_else(|| format!("Project {} not found", project_id))?;
 
-    let Some(container_id) = project.container_id.clone() else {
+    let Some(container) = ContainerTarget::for_project(&project) else {
         return Err(format!(
             "This project has no container yet. Start it before {}.",
             action
         ));
     };
-    if !crate::docker::container::is_container_running(&container_id)
-        .await
-        .unwrap_or(false)
-    {
+    if !container.is_running().await.unwrap_or(false) {
         return Err(format!(
             "The container for “{}” isn't running. Start it before {}.",
             project.name, action
         ));
     }
-    Ok(container_id)
+    Ok(container)
 }
 
 #[cfg(test)]

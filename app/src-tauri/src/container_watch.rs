@@ -8,9 +8,10 @@
 //! disconnected, while the sidebar, Start/Stop and Project Home all still
 //! described a live container.
 //!
-//! One subscription to Docker's event stream, filtered daemon-side to container
-//! `die` events, so an idle daemon costs nothing and the app hears about a death
-//! as it happens. No polling loop. Each `die` naming a project's container is
+//! One subscription to the host's death reports (`host::watch`; for Docker,
+//! the daemon's event stream filtered to container `die` events, so an idle
+//! daemon costs nothing and the app hears about a death as it happens — no
+//! polling loop). Each `die` naming a project's container is
 //! confirmed with one inspect before anything changes (an event can be
 //! replayed, and a restart can reuse the id), and the flip itself is
 //! [`ProjectsStore::mark_exited`]'s compare-and-set, which never touches a
@@ -22,20 +23,17 @@
 //! the only window that replay cannot cover is a daemon restart, which forgets
 //! its event history, and that is exactly when containers go away.
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bollard::errors::Error as DockerError;
-use bollard::models::{EventMessage, EventMessageTypeEnum};
-use bollard::system::EventsOptions;
-use bollard::Docker;
 use futures_util::StreamExt;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::watch;
 
+use crate::host::watch::ExitSource;
+use crate::host::ContainerTarget;
 use crate::models::{Project, ProjectStatus};
 use crate::storage::projects_store::{ExitMark, ProjectsStore};
 
@@ -72,46 +70,28 @@ pub struct ContainerExited<'a> {
     pub reason: ExitReason,
 }
 
-/// The container id a Docker event reports as having died, if it is one.
-pub(crate) fn died_container(msg: &EventMessage) -> Option<&str> {
-    if msg.typ != Some(EventMessageTypeEnum::CONTAINER) || msg.action.as_deref() != Some("die") {
-        return None;
-    }
-    msg.actor.as_ref()?.id.as_deref().filter(|id| !id.is_empty())
-}
-
-/// `true` only when Docker positively says the container is not running: it
-/// inspects as stopped, or it no longer exists. Any other failure is "don't
-/// know" — `docker::is_container_running` maps every error to `false`, which
-/// is right for its callers and wrong here, where it would mark every project
-/// Stopped the moment the daemon hiccups.
-async fn has_exited(docker: &Docker, container_id: &str) -> bool {
-    match docker.inspect_container(container_id, None).await {
-        Ok(info) => !info.state.and_then(|s| s.running).unwrap_or(false),
-        Err(DockerError::DockerResponseServerError { status_code: 404, .. }) => true,
-        Err(_) => false,
-    }
-}
-
 fn project_busy(project_id: &str) -> bool {
     crate::project_lock::held(project_id).is_some()
 }
 
-/// Confirm `container_id` really stopped and, if a project was Running on it,
+/// Confirm `container` really stopped and, if a project was Running on it,
 /// flip that project. Returns what changed.
-async fn settle(docker: &Docker, store: &ProjectsStore, container_id: &str) -> Option<Project> {
+async fn settle(store: &ProjectsStore, container: &ContainerTarget) -> Option<Project> {
+    let container_id = container.id();
     for _ in 0..SETTLE_ATTEMPTS {
         // Cheap and allocation-free: most containers that die are not ours
         // (probe and scratch containers, other software on the daemon), and
         // those cost no inspect at all.
         let seen = store.running_on(container_id)?;
-        if !has_exited(docker, container_id).await {
+        // Positive exit only: a host that can't answer must not mark every
+        // project Stopped.
+        if !container.has_exited().await {
             return None;
         }
         match store.mark_exited(container_id, &seen, project_busy) {
             ExitMark::Flipped(p) => return Some(*p),
             ExitMark::NotApplicable => return None,
-            // The store moved while Docker was answering — possibly a stop and
+            // The store moved while the host was answering — possibly a stop and
             // start of this very container. The inspect is stale; ask again.
             ExitMark::Changed => continue,
         }
@@ -120,25 +100,18 @@ async fn settle(docker: &Docker, store: &ProjectsStore, container_id: &str) -> O
 }
 
 /// Re-check every Running project once. Used on each (re)subscription.
-async fn sweep(docker: &Docker, store: &ProjectsStore) -> Vec<Project> {
+async fn sweep(store: &ProjectsStore) -> Vec<Project> {
     let mut changed = Vec::new();
     for p in store.list() {
         if p.status != ProjectStatus::Running {
             continue;
         }
-        let Some(cid) = p.container_id.as_deref() else { continue };
-        if let Some(c) = settle(docker, store, cid).await {
+        let Some(container) = ContainerTarget::for_project(&p) else { continue };
+        if let Some(c) = settle(store, &container).await {
             changed.push(c);
         }
     }
     changed
-}
-
-fn die_filter() -> HashMap<String, Vec<String>> {
-    HashMap::from([
-        ("type".to_string(), vec!["container".to_string()]),
-        ("event".to_string(), vec!["die".to_string()]),
-    ])
 }
 
 /// The wait before connection attempt `n + 1`, after `n` consecutive
@@ -148,7 +121,7 @@ fn retry_delay(consecutive_failures: u32) -> Duration {
     (RETRY_MIN * 2u32.pow(doublings)).min(RETRY_MAX)
 }
 
-/// `fut`, unless the app starts shutting down first. Every Docker call in here
+/// `fut`, unless the app starts shutting down first. Every host call in here
 /// goes through this: a wedged daemon must not hold shutdown for its full
 /// budget.
 async fn unless_cancelled<T>(
@@ -174,32 +147,26 @@ async fn watch_once(
     sweep_reason: ExitReason,
     on_change: &impl Fn(&Project, ExitReason),
 ) -> Option<bool> {
-    let Ok(docker) = crate::docker::get_docker() else { return Some(false) };
-    if unless_cancelled(cancel, docker.ping()).await?.is_err() {
+    let source = ExitSource::Docker;
+    if !unless_cancelled(cancel, source.reachable()).await? {
         return Some(false);
     }
-    // A second's overlap: the daemon replays from `since`, so a death during
+    // A second's overlap: the host replays from `since`, so a death during
     // the sweep below is still delivered. Duplicates are harmless — `settle`
     // confirms with an inspect every time.
-    let since = (chrono::Utc::now().timestamp() - 1).to_string();
-    for p in unless_cancelled(cancel, sweep(&docker, store)).await? {
+    let since = chrono::Utc::now().timestamp() - 1;
+    for p in unless_cancelled(cancel, sweep(store)).await? {
         on_change(&p, sweep_reason);
     }
-    let mut events = docker.events(Some(EventsOptions::<String> {
-        since: Some(since),
-        until: None,
-        filters: die_filter(),
-    }));
+    let mut deaths = source.deaths(since);
     let connected = Instant::now();
     let mut delivered = false;
     loop {
-        match unless_cancelled(cancel, events.next()).await? {
-            Some(Ok(msg)) => {
+        match unless_cancelled(cancel, deaths.next()).await? {
+            Some(Ok(container)) => {
                 delivered = true;
-                if let Some(cid) = died_container(&msg) {
-                    if let Some(p) = unless_cancelled(cancel, settle(&docker, store, cid)).await? {
-                        on_change(&p, ExitReason::Exited);
-                    }
+                if let Some(p) = unless_cancelled(cancel, settle(store, &container)).await? {
+                    on_change(&p, ExitReason::Exited);
                 }
             }
             Some(Err(e)) => {
@@ -265,41 +232,6 @@ pub fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bollard::models::EventActor;
-
-    fn event(typ: EventMessageTypeEnum, action: &str, id: Option<&str>) -> EventMessage {
-        EventMessage {
-            typ: Some(typ),
-            action: Some(action.to_string()),
-            actor: Some(EventActor { id: id.map(str::to_string), attributes: None }),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn only_a_container_die_names_a_container() {
-        let die = event(EventMessageTypeEnum::CONTAINER, "die", Some("abc"));
-        assert_eq!(died_container(&die), Some("abc"));
-
-        for (typ, action, id) in [
-            (EventMessageTypeEnum::CONTAINER, "stop", Some("abc")),
-            (EventMessageTypeEnum::CONTAINER, "start", Some("abc")),
-            (EventMessageTypeEnum::CONTAINER, "exec_die", Some("abc")),
-            (EventMessageTypeEnum::NETWORK, "die", Some("abc")),
-            (EventMessageTypeEnum::CONTAINER, "die", None),
-            (EventMessageTypeEnum::CONTAINER, "die", Some("")),
-        ] {
-            assert_eq!(died_container(&event(typ, action, id)), None, "{typ:?} {action} {id:?}");
-        }
-    }
-
-    #[test]
-    fn the_subscription_is_filtered_to_container_deaths_daemon_side() {
-        let f = die_filter();
-        assert_eq!(f.get("type"), Some(&vec!["container".to_string()]));
-        assert_eq!(f.get("event"), Some(&vec!["die".to_string()]));
-        assert_eq!(f.len(), 2);
-    }
 
     #[test]
     fn retries_back_off_to_a_minute_and_stay_there() {
@@ -321,7 +253,7 @@ mod tests {
         assert_eq!(CONTAINER_EXITED_EVENT, "project-container-exited");
     }
 
-    /// The shutdown path: a Docker call that never answers (a wedged daemon)
+    /// The shutdown path: a host call that never answers (a wedged daemon)
     /// must give way to cancellation at once, not hold teardown.
     #[tokio::test]
     async fn a_hung_docker_call_yields_to_cancellation() {

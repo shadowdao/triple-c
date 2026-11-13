@@ -172,7 +172,7 @@ fn saved_file(outcome: WriteOutcome, bytes: &[u8]) -> Result<SavedFile, String> 
 }
 
 pub async fn write_file(
-    container_id: &str,
+    container: &ContainerTarget,
     exec_manager: &ExecSessionManager,
     target: &str,
     bytes: &[u8],
@@ -180,9 +180,8 @@ pub async fn write_file(
 ) -> Result<SavedFile, String> {
     check_write_input(bytes.len(), base_hash)?;
     let tmp_name = format!("triple-c-viewer-{}", uuid::Uuid::new_v4().simple());
-    let container = ContainerTarget::docker(container_id);
     let tmp_path = exec_manager
-        .write_file_to_container(&container, &tmp_name, bytes)
+        .write_file_to_container(container, &tmp_name, bytes)
         .await?;
     let cmd = write_command(target, &tmp_path, base_hash);
     let (stdout, stderr, code) = container

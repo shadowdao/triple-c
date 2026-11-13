@@ -92,9 +92,11 @@ fn tail(text: &str, max: usize) -> &str {
 
 /// Wait for readiness, upload the payload and the script, run the script as
 /// `claude`, and return its report.
-pub async fn sync_container(container_id: &str, payload: &Payload) -> Result<SyncReport, String> {
-    let target = ContainerTarget::docker(container_id);
-    wait_until_ready(&target).await?;
+pub async fn sync_container(
+    target: &ContainerTarget,
+    payload: &Payload,
+) -> Result<SyncReport, String> {
+    wait_until_ready(target).await?;
 
     let (out, code) = target
         .exec_oneshot_as("root", sh(PREPARE_SCRIPT), vec![])
