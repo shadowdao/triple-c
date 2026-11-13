@@ -13,6 +13,25 @@
 # upgradable content in /usr/local/bin or /opt, or seed it from here.
 # See "Container Lifecycle" in the repo's CLAUDE.md.
 
+# ── triple-c-agent token: off the environment before anything else runs ───
+# The agent (started at the very end, see start_agent) authenticates every
+# request with this token, and it runs as root, so the token is effectively
+# root in this container. Given as an env var it would be inherited by every
+# process this script starts (cron, the scheduler, Claude sessions spawned by
+# the agent). So it moves to a root-only file *first* and leaves the
+# environment; the agent reads the file. A `docker exec` session still sees
+# the container's configured env — the local test harness passes it that way
+# and accepts that; on AWS nothing is started by `docker exec`.
+# >>> agent_token
+if [ -n "${TRIPLEC_AGENT_TOKEN:-}" ]; then
+    mkdir -p /run/triple-c
+    chmod 700 /run/triple-c
+    ( umask 077; printf '%s' "$TRIPLEC_AGENT_TOKEN" > /run/triple-c/agent-token )
+    unset TRIPLEC_AGENT_TOKEN
+    export TRIPLEC_AGENT_TOKEN_FILE=/run/triple-c/agent-token
+fi
+# <<< agent_token
+
 # ── UID/GID remapping ──────────────────────────────────────────────────────
 # Match the container's claude user to the host user's UID/GID so that
 # bind-mounted files (project dir, docker socket) have correct ownership.
@@ -766,6 +785,36 @@ timeout 120 su -s /bin/bash claude -c 'export PATH="/home/claude/.claude/bin:/ho
 #    already in trouble. The pause is `read -t` on a FIFO nobody writes —
 #    a builtin, so it still works when fork does not — with `sleep 1` as the
 #    fallback should the FIFO be unavailable.
+# ── triple-c-agent ──────────────────────────────────────────────────────────
+# The app's way into the container on hosts without a Docker API (AWS, over
+# an SSM port-forward). Started only when a token was provided, and only now,
+# after every setup step above, so "the agent answers /v1/health" also means
+# "the container is set up" — the AWS host's readiness signal.
+#
+# Same survival rules as the keepalive below, for the same reason: it runs as
+# root under a root supervisor loop, so a claude-user `pkill`/`kill -9 -1`
+# gets EPERM, and a crash is restarted (throttled: a binary that exits at
+# once must not spin a core).
+# >>> start_agent
+start_agent() {
+    [ -n "${TRIPLEC_AGENT_TOKEN_FILE:-}" ] || return 0
+    if [ ! -x /usr/local/bin/triple-c-agent ]; then
+        echo "triple-c-agent: token given but no agent binary in this image — not starting it" >&2
+        return 0
+    fi
+    (
+        trap '' HUP
+        while :; do
+            agent_started=$SECONDS
+            /usr/local/bin/triple-c-agent
+            echo "triple-c-agent exited ($?) — restarting" >&2
+            [ $((SECONDS - agent_started)) -ge 5 ] || sleep 5
+        done
+    ) &
+}
+# <<< start_agent
+start_agent
+
 echo "Triple-C container ready."
 keepalive_pid=""
 stop_keepalive() {
