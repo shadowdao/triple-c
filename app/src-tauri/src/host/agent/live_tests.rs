@@ -87,6 +87,21 @@ async fn parity(d: &ContainerTarget, a: &ContainerTarget) -> Result<(), String> 
 
     same("user ids", d.user_ids().await, a.user_ids().await)?;
 
+    // Signal state: an exec starts with nothing ignored or blocked, whatever
+    // the process that launched it had (the entrypoint's supervisor ignores
+    // SIGHUP; that must not turn every exec into `nohup`).
+    let sigs = sh("grep -E '^Sig(Ign|Blk):' /proc/self/status");
+    same("signal dispositions/mask", d.exec_oneshot(sigs.clone()).await?, a.exec_oneshot(sigs).await?)?;
+
+    // Stdio belongs to the exec user, as runc arranges: re-opening it by
+    // name works for a non-root user.
+    let reopen = sh("echo out > /dev/stdout; echo err > /dev/stderr");
+    same(
+        "re-opening stdio by name as claude",
+        d.exec_oneshot_streams_as("claude", reopen.clone(), vec![]).await?,
+        a.exec_oneshot_streams_as("claude", reopen, vec![]).await?,
+    )?;
+
     let flood = sh("head -c 100000 /dev/zero");
     let de = d.exec_oneshot_limited("claude", flood.clone(), 1000).await.unwrap_err();
     let ae = a.exec_oneshot_limited("claude", flood, 1000).await.unwrap_err();
@@ -157,6 +172,25 @@ async fn parity(d: &ContainerTarget, a: &ContainerTarget) -> Result<(), String> 
     }
     same("tty size after resize", sizes[0].clone(), sizes[1].clone())?;
     same("tty size value", "40 100".to_string(), sizes[1].clone())?;
+
+    // A tty session whose client goes away ends (SIGHUP), as a dropped
+    // `docker exec -t` does. Only checked through the agent: it is the agent's
+    // disconnect handling under test. Nothing else in this fresh container
+    // runs `sleep 600`, so counting exact matches is the probe.
+    let exec = a.attach(ExecSpec::new(vec!["sleep".into(), "600".into()]).tty(true)).await?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let count = sh("pgrep -xfc 'sleep 600' || true");
+    let before = a.exec_oneshot(count.clone()).await?;
+    drop(exec);
+    let mut after = String::new();
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        after = a.exec_oneshot(count.clone()).await?;
+        if after.trim() == "0" {
+            break;
+        }
+    }
+    same("tty session ends when its client goes away (sleep count before → after)", ("1".to_string(), "0".to_string()), (before.trim().to_string(), after.trim().to_string()))?;
 
     // ── detached ─────────────────────────────────────────────────────────────
     let mut codes = Vec::new();
