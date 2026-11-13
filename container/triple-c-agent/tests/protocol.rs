@@ -70,6 +70,8 @@ async fn start_with(tweak: impl FnOnce(&mut Config)) -> Agent {
             (OsString::from("HOME"), OsString::from("/agent-home-must-not-leak")),
         ],
         max_file_bytes: 1024,
+        header_read_timeout: triple_c_agent::HEADER_READ_TIMEOUT,
+        max_connections: triple_c_agent::MAX_CONNECTIONS,
     };
     tweak(&mut config);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -860,7 +862,117 @@ async fn activity_counts_execs_and_tunnels_and_ignores_its_own_probes() {
     }
 }
 
+// ── connection limits ──────────────────────────────────────────────────────
+
+/// Wait for the server to close `s`: `Ok(elapsed)` on EOF or reset,
+/// `Err` if it is still open after `within`.
+async fn closed_within(s: &mut tokio::net::TcpStream, within: Duration) -> Result<Duration, ()> {
+    let t0 = Instant::now();
+    let mut buf = [0u8; 1024];
+    loop {
+        match tokio::time::timeout(within.saturating_sub(t0.elapsed()), s.read(&mut buf)).await {
+            Err(_) => return Err(()),
+            Ok(Ok(0)) | Ok(Err(_)) => return Ok(t0.elapsed()),
+            // hyper may answer a timed-out head with a 408 before closing.
+            Ok(Ok(_)) => continue,
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_slow_request_head_is_cut_off_by_the_header_timeout() {
+    let a = start_with(|c| c.header_read_timeout = Duration::from_secs(1)).await;
+
+    // A partial request line, never finished: slowloris.
+    let mut partial = tokio::net::TcpStream::connect(a.addr).await.unwrap();
+    partial.write_all(b"GET /v1/heal").await.unwrap();
+    // A connection that sends nothing at all.
+    let mut silent = tokio::net::TcpStream::connect(a.addr).await.unwrap();
+    // A head that trickles in a byte at a time, each well inside the timeout.
+    let mut trickle = tokio::net::TcpStream::connect(a.addr).await.unwrap();
+    let trickler = tokio::spawn(async move {
+        for b in b"GET /v1/health HTTP/1.1\r\nHost: x\r\nX-Pad: aaaaaaaaaaaaaaaaaaaaaaaa".iter() {
+            if trickle.write_all(&[*b]).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        trickle
+    });
+
+    let e = closed_within(&mut partial, Duration::from_secs(15)).await.expect("partial head never closed");
+    assert!(e < Duration::from_secs(5), "closed only after {e:?}");
+    closed_within(&mut silent, Duration::from_secs(15)).await.expect("silent connection never closed");
+    let mut trickle = trickler.await.unwrap();
+    closed_within(&mut trickle, Duration::from_secs(15)).await.expect("trickling head never closed");
+
+    // The server is still serving, and a normal request is untouched.
+    let (s, v) = a.get("/v1/health").await;
+    assert_eq!(s, 200, "{v}");
+}
+
+#[tokio::test]
+async fn connections_past_the_cap_wait_for_a_slot_rather_than_failing() {
+    let a = start_with(|c| {
+        c.max_connections = 2;
+        c.header_read_timeout = Duration::from_secs(1);
+    })
+    .await;
+    // Fill both slots with connections that never send anything.
+    let _hog1 = tokio::net::TcpStream::connect(a.addr).await.unwrap();
+    let _hog2 = tokio::net::TcpStream::connect(a.addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // A real request queues until the header timeout frees a slot.
+    let t0 = Instant::now();
+    let (s, _) = a.get("/v1/health").await;
+    assert_eq!(s, 200);
+    assert!(t0.elapsed() >= Duration::from_millis(500), "was not held back: {:?}", t0.elapsed());
+}
+
 // ── root only ──────────────────────────────────────────────────────────────
+
+#[tokio::test]
+#[ignore = "needs root: runs execs as nobody to check stdio is chowned to the exec user"]
+async fn as_root_stdio_belongs_to_the_exec_user() {
+    assert!(is_root(), "run with sudo -E cargo test -- --ignored");
+    let a = start().await;
+
+    // One-shot: stdout/stderr are pipes; reopening them by path needs the
+    // user to own them, as runc arranges.
+    let (s, v) = a
+        .post(
+            "/v1/exec",
+            json!({ "cmd": sh("echo x > /dev/stdout && echo y > /dev/stderr && echo ok"), "user": "nobody" }),
+        )
+        .await;
+    assert_eq!(s, 200, "{v}");
+    let (_, out, err, _) = decode(&v);
+    assert_eq!(v["exit_code"], 0, "stdout={out:?} stderr={err:?}");
+    assert_eq!(out, "x\nok\n");
+    assert_eq!(err, "y\n");
+
+    // Non-tty attach: the same, over pipes the attach owns.
+    let (mut ws, _) = a
+        .attach(json!({ "cmd": sh("echo x > /dev/stdout && echo y > /dev/stderr"), "user": "nobody" }))
+        .await;
+    let (out, err, code) = collect_until_exit(&mut ws).await;
+    assert_eq!((code, out.as_slice(), err.as_slice()), (0, &b"x\n"[..], &b"y\n"[..]));
+
+    // Tty attach: the slave is the user's, not `root tty`.
+    let (mut ws, _) = a
+        .attach(json!({ "cmd": sh("stat -c %U $(tty)"), "user": "nobody", "tty": true }))
+        .await;
+    let (out, _, code) = collect_until_exit(&mut ws).await;
+    assert_eq!(code, 0);
+    assert_eq!(String::from_utf8_lossy(&out).trim(), "nobody");
+
+    // /dev/null is never handed over.
+    let (s, v) = a.post("/v1/exec/detached", json!({ "cmd": ["true"], "user": "nobody" })).await;
+    assert_eq!(s, 200, "{v}");
+    a.wait_finished(v["exec_id"].as_str().unwrap()).await;
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(std::fs::metadata("/dev/null").unwrap().uid(), 0);
+}
 
 #[tokio::test]
 #[ignore = "needs root: switches to another user (nobody) and chowns an upload"]
@@ -874,7 +986,9 @@ async fn as_root_execs_switch_user_and_uploads_chown() {
     let out = decode(&v).1;
     let lines: Vec<_> = out.lines().collect();
     assert_eq!(lines[0], "65534");
-    assert_eq!(lines[3], "nobody");
+    // runc sets only HOME for the exec's user; USER stays unset unless the
+    // container env has it (the base env here does not) — see `merge_env`.
+    assert_eq!(lines[3], "");
     assert_eq!(lines[2], passwd_home("nobody"));
 
     let dir = a.tmp.path().to_str().unwrap().to_string();

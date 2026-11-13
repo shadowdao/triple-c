@@ -9,11 +9,11 @@ use axum::response::Response;
 use bytes::Bytes;
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::pty;
 use crate::spawn::{self, ExecSpec, Io, PrepareError};
-use crate::{AppState, CountGuard};
+use crate::{AppState, CountGuard, MAX_WS_MESSAGE};
 
 /// How long the client has to send its spec after the upgrade.
 const SPEC_TIMEOUT: Duration = Duration::from_secs(30);
@@ -48,7 +48,9 @@ enum Input {
 }
 
 pub async fn upgrade(State(st): State<Arc<AppState>>, ws: WebSocketUpgrade) -> Response {
-    ws.on_upgrade(move |socket| session(socket, st))
+    ws.max_message_size(MAX_WS_MESSAGE)
+        .max_frame_size(MAX_WS_MESSAGE)
+        .on_upgrade(move |socket| session(socket, st))
 }
 
 fn text(v: serde_json::Value) -> Message {
@@ -121,7 +123,6 @@ async fn session(mut socket: WebSocket, st: Arc<AppState>) {
             Err(PrepareError::Refused(_, m)) => return fail(socket, m).await,
         }
     };
-    let pid = child.id();
     let exec_id = st.execs.insert_running(master.clone());
     if socket
         .send(text(serde_json::json!({ "type": "started", "exec_id": exec_id })))
@@ -137,6 +138,7 @@ async fn session(mut socket: WebSocket, st: Arc<AppState>) {
     // it records the exit code either way.
     let (ev_tx, mut ev_rx) = mpsc::channel::<Event>(64);
     let (in_tx, in_rx) = mpsc::unbounded_channel::<Input>();
+    let (hangup_tx, hangup_rx) = oneshot::channel::<()>();
     let guard = CountGuard::execs(&st);
     {
         let st = st.clone();
@@ -145,7 +147,7 @@ async fn session(mut socket: WebSocket, st: Arc<AppState>) {
         tokio::spawn(async move {
             let _active = guard;
             let code = match master {
-                Some(m) => pump_tty(child, m, in_rx, req.attach_stdin, &ev_tx).await,
+                Some(m) => pump_tty(child, m, in_rx, hangup_rx, req.attach_stdin, &ev_tx).await,
                 None => pump_pipes(child, in_rx, &ev_tx).await,
             };
             st.execs.finish(&exec_id, code);
@@ -206,9 +208,14 @@ async fn session(mut socket: WebSocket, st: Arc<AppState>) {
     // non-tty exec only loses stdin and is NOT killed: Docker does not kill
     // it either, and `gh_login`/`setup-token` clean up after themselves with
     // their own `pkill`. The pump keeps running and records the exit code.
+    //
+    // The pump sends the SIGHUP, not this task: only the pump knows whether it
+    // has already reaped the process, and once it has, the pid — which is the
+    // process-group id — may belong to someone else. If the pump is already
+    // gone the send just fails.
     drop(in_tx);
     if tty {
-        spawn::signal_group(pid, libc::SIGHUP);
+        let _ = hangup_tx.send(());
     }
 }
 
@@ -276,9 +283,13 @@ async fn pump_tty(
     mut child: tokio::process::Child,
     master: Arc<pty::PtyMaster>,
     mut input: mpsc::UnboundedReceiver<Input>,
+    hangup: oneshot::Receiver<()>,
     attach_stdin: bool,
     tx: &mpsc::Sender<Event>,
 ) -> i32 {
+    // `Some` until the client has gone (or the session ended without saying
+    // so), so a completed receiver is never polled again.
+    let mut hangup = Some(hangup);
     if attach_stdin {
         let master = master.clone();
         tokio::spawn(async move {
@@ -314,6 +325,15 @@ async fn pump_tty(
             },
             s = child.wait() => {
                 code = Some(s.map(spawn::exit_code).unwrap_or(255));
+            }
+            // Only reachable while `code` is `None`: `child.wait()` has not
+            // returned, so the process is unreaped (alive or a zombie) and its
+            // pid cannot have been reused for another process group.
+            r = async { hangup.as_mut().expect("guarded by is_some").await }, if hangup.is_some() => {
+                hangup = None;
+                if r.is_ok() {
+                    spawn::signal_group(child.id(), libc::SIGHUP);
+                }
             }
         }
     }

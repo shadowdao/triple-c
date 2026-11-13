@@ -14,7 +14,7 @@ use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::{error, AppState, CountGuard};
+use crate::{error, AppState, CountGuard, MAX_WS_MESSAGE};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -33,7 +33,9 @@ pub async fn upgrade(
         Ok(_) => return error(StatusCode::BAD_REQUEST, "port must be 1-65535"),
         Err(r) => return error(StatusCode::BAD_REQUEST, format!("invalid query: {}", r.body_text())),
     };
-    ws.on_upgrade(move |socket| session(socket, st, port))
+    ws.max_message_size(MAX_WS_MESSAGE)
+        .max_frame_size(MAX_WS_MESSAGE)
+        .on_upgrade(move |socket| session(socket, st, port))
 }
 
 async fn session(mut socket: WebSocket, st: Arc<AppState>, port: u16) {

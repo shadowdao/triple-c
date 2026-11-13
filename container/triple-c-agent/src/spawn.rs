@@ -250,11 +250,20 @@ impl Prepared {
         let (uid, gid) = (self.user.uid, self.user.gid);
         let groups = self.user.groups.clone();
         let cwd = self.cwd.clone();
+        let dev_null = dev_null_rdev();
         // Runs in the forked child: only async-signal-safe syscalls, nothing
         // that allocates (everything it touches was built above).
         //
-        // Order matters. `setsid` first (new session and process group). Then
-        // the controlling tty, which needs a session leader. Then gid,
+        // Order matters. Signal state first: dispositions and mask back to
+        // the defaults. `docker exec` children start from runc's clean state,
+        // but ours would otherwise inherit whatever started the agent — the
+        // entrypoint's supervisor runs it under `trap '' HUP`, and an ignored
+        // disposition survives `exec`, so every tty session would ignore the
+        // hangup a client disconnect sends and outlive its client. (Handled
+        // signals already reset on exec; std clears the mask too, but that
+        // is std's detail, so we do not rely on it.) Then `setsid` (new
+        // session and process group). Then the controlling tty, which needs a
+        // session leader. Then stdio ownership, while still root. Then gid,
         // supplementary groups (what `initgroups` sets — resolved in the
         // parent, see `UserInfo::groups`), and uid last, since dropping uid
         // first would forfeit the right to change the other two. `chdir` comes
@@ -262,6 +271,7 @@ impl Prepared {
         // it does under runc, rather than succeeding as root.
         unsafe {
             cmd.pre_exec(move || {
+                reset_signals()?;
                 if libc::setsid() < 0 {
                     return Err(io::Error::last_os_error());
                 }
@@ -269,6 +279,7 @@ impl Prepared {
                     return Err(io::Error::last_os_error());
                 }
                 if switch {
+                    fix_stdio_ownership(uid, dev_null)?;
                     if libc::setgid(gid) < 0 {
                         return Err(io::Error::last_os_error());
                     }
@@ -302,6 +313,95 @@ impl Prepared {
             )
         })
     }
+}
+
+/// Linux's `_NSIG`: signals are 1..=64. libc does not export it.
+const NSIG: libc::c_int = 65;
+
+/// Every catchable signal to `SIG_DFL` and an empty signal mask — the state a
+/// `docker exec` child starts in. For the forked child only.
+///
+/// Raw `rt_sigaction`/`rt_sigprocmask` syscalls, not the libc wrappers: libc
+/// refuses to touch the real-time signals it reserves for itself (glibc's 32
+/// and 33), and those can arrive ignored too — seen in practice, SigIgn bit
+/// 32 set under a test harness. The syscalls also take no libc locks, which
+/// matters between fork and exec. An all-zero kernel `struct sigaction` is
+/// `SIG_DFL` with no flags, no restorer and an empty mask on every Linux
+/// architecture, whatever its field order; its size is 4 words.
+///
+/// SIGKILL and SIGSTOP cannot be changed and are skipped. Any failure fails
+/// the exec rather than running a child in an unknown signal state.
+unsafe fn reset_signals() -> io::Result<()> {
+    const SIGSET_BYTES: libc::size_t = 8; // the kernel's sigset_t: 64 bits
+    let dfl = [0u64; 4];
+    for sig in 1..NSIG {
+        if sig == libc::SIGKILL || sig == libc::SIGSTOP {
+            continue;
+        }
+        let r = libc::syscall(
+            libc::SYS_rt_sigaction,
+            sig as libc::c_long,
+            dfl.as_ptr(),
+            std::ptr::null_mut::<u64>(),
+            SIGSET_BYTES,
+        );
+        if r < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    let empty: u64 = 0;
+    let r = libc::syscall(
+        libc::SYS_rt_sigprocmask,
+        libc::SIG_SETMASK as libc::c_long,
+        &empty as *const u64,
+        std::ptr::null_mut::<u64>(),
+        SIGSET_BYTES,
+    );
+    if r < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The device number of `/dev/null`, read in the parent (`stat` is not
+/// something to do between fork and exec when it can be done before).
+/// Falls back to Linux's fixed 1:3.
+fn dev_null_rdev() -> libc::dev_t {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata("/dev/null")
+        .map(|m| m.rdev() as libc::dev_t)
+        .unwrap_or_else(|_| libc::makedev(1, 3))
+}
+
+/// runc's `fixStdioPermissions`: give fds 0–2 to the exec's user, so it can
+/// reopen them — `echo x > /dev/stderr`, `tee /dev/stdout`, and on a tty the
+/// slave itself (gpg's pinentry, `screen`, `script`). Without it they stay
+/// `root`'s: a pipe is `prw------- root` and a pty slave `root tty`.
+///
+/// Like runc: only the uid changes (the gid is left to the mount), `/dev/null`
+/// is skipped (chowning it would hand the device to the user), so is an fd
+/// the user already owns, and `EINVAL`/`EPERM`/`EROFS` are ignored — an owner
+/// outside our user namespace or a read-only mount is not worth failing the
+/// exec over. For the forked child only: `fstat` and `fchown` are
+/// async-signal-safe.
+unsafe fn fix_stdio_ownership(uid: libc::uid_t, dev_null: libc::dev_t) -> io::Result<()> {
+    for fd in 0..=2 {
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::fstat(fd, &mut st) < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let is_dev_null = st.st_mode & libc::S_IFMT == libc::S_IFCHR && st.st_rdev == dev_null;
+        if st.st_uid == uid || is_dev_null {
+            continue;
+        }
+        if libc::fchown(fd, uid, libc::gid_t::MAX) < 0 {
+            let e = io::Error::last_os_error();
+            if !matches!(e.raw_os_error(), Some(libc::EINVAL | libc::EPERM | libc::EROFS)) {
+                return Err(e);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Docker's exit code for a process: its status, or 128 + signal when a

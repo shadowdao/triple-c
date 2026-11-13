@@ -12,9 +12,22 @@ It is a standalone crate: not part of any workspace, with its own `Cargo.lock`.
 
 | Variable | Meaning |
 |---|---|
-| `TRIPLEC_AGENT_TOKEN` | Bearer token, at least 32 bytes. Removed from the agent's env before anything is spawned. |
-| `TRIPLEC_AGENT_TOKEN_FILE` | Read when the env var is unset or empty. Surrounding whitespace is trimmed. |
+| `TRIPLEC_AGENT_TOKEN` | Bearer token, at least 32 bytes. Removed from the agent's env before anything is spawned, so no exec inherits it — but see below. |
+| `TRIPLEC_AGENT_TOKEN_FILE` | Read when the env var is unset or empty. Must be owned by the agent's uid and not readable by others. Surrounding whitespace is trimmed. **Preferred.** |
 | `TRIPLEC_AGENT_ADDR` | Listen address. Default `127.0.0.1:47900`. |
+
+Removing `TRIPLEC_AGENT_TOKEN` only edits the process's libc environment. The kernel keeps the
+environment the agent was started with, so `/proc/<agent pid>/environ` still shows the token to root
+and to any process running as the agent's uid. Use `TRIPLEC_AGENT_TOKEN_FILE`; the entrypoint does.
+
+Connections are HTTP/1.1. A client gets 10 seconds to send a complete request head, and at most 256
+connections are served at once; past that, new connections wait in the listen backlog for a slot.
+WebSocket sessions (attach, tunnel) stop counting once upgraded, and accept messages of at most
+1 MiB.
+
+Execs start with every signal at its default disposition and an empty signal mask, whatever the
+agent itself inherited (the entrypoint's supervisor ignores `SIGHUP`), and their stdin/stdout/stderr
+are owned by the exec's user unless they are `/dev/null`, as runc arranges for `docker exec`.
 
 Without a token of at least 32 bytes the agent exits with status 2. There is no unauthenticated mode. On
 startup it logs a single line, `triple-c-agent <version> listening on <addr>`, to stderr. The token
@@ -30,9 +43,9 @@ as itself and answers `403` for any other user. The tests rely on that.
 cd container/triple-c-agent
 cargo test                                   # everything, as the current user
 cargo clippy --all-targets
-# The root-only test (user switch + chown), as root:
+# The root-only tests (user switch, upload chown, stdio ownership), as root:
 sudo -E env "PATH=$PATH" CARGO_HOME="$HOME/.cargo" RUSTUP_HOME="$HOME/.rustup" \
-  cargo test --test protocol -- --include-ignored
+  cargo test -- --include-ignored
 sudo chown -R "$(id -u):$(id -g)" target    # sudo leaves root-owned build files behind
 ```
 
