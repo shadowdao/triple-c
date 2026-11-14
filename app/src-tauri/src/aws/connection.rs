@@ -1,13 +1,17 @@
 //! An `SdkConfig` built from a saved `HostConnection`, never from the
 //! process's default credentials chain.
 
+use aws_config::identity::IdentityCache;
 use aws_config::profile::ProfileFileCredentialsProvider;
 use aws_config::provider_config::ProviderConfig;
+use aws_config::retry::RetryConfig;
 use aws_config::{BehaviorVersion, Region, SdkConfig};
 use aws_credential_types::provider::error::CredentialsError;
-use aws_credential_types::provider::{future, ProvideCredentials};
+use aws_credential_types::provider::{future, ProvideCredentials, SharedCredentialsProvider};
 use aws_credential_types::Credentials;
 use aws_runtime::env_config::file::EnvConfigFiles;
+use aws_smithy_async::rt::sleep::default_async_sleep;
+use aws_smithy_async::time::SharedTimeSource;
 
 use super::error::{AwsError, ProfileCredentialsError};
 use crate::models::host_connection::{AwsAuth, HostConnection, HostKind};
@@ -29,39 +33,63 @@ pub(crate) async fn sdk_config_with(
 ) -> Result<SdkConfig, AwsError> {
     let HostKind::Aws { auth, .. } = &conn.kind;
     let region = Region::new(region.to_string());
-    let mut loader = aws_config::defaults(BehaviorVersion::latest()).region(region.clone());
-    match auth {
+    let credentials = match auth {
         AwsAuth::Profile { name } => {
+            // The profile is read for credentials only (static keys, SSO,
+            // assume-role, credential_process), never for endpoints or
+            // service settings.
             let mut builder = ProfileFileCredentialsProvider::builder()
-                .configure(&ProviderConfig::default().with_region(Some(region)))
+                .configure(&ProviderConfig::default().with_region(Some(region.clone())))
                 .profile_name(name);
-            if let Some(files) = &profile_files {
-                builder = builder.profile_files(files.clone());
-                loader = loader.profile_files(files.clone());
+            if let Some(files) = profile_files {
+                builder = builder.profile_files(files);
             }
-            // Non-credential settings (retry mode, endpoint overrides) come
-            // from the same profile the credentials do.
-            loader = loader
-                .profile_name(name)
-                .credentials_provider(NamedProfileProvider {
-                    profile: name.clone(),
-                    inner: builder.build(),
-                });
+            SharedCredentialsProvider::new(NamedProfileProvider {
+                profile: name.clone(),
+                inner: builder.build(),
+            })
         }
         AwsAuth::Keys { keyring_ref } => {
             let keys = secure::get_aws_keys(keyring_ref)
                 .map_err(|message| AwsError::Other { message })?
                 .ok_or(AwsError::KeysMissing)?;
-            loader = loader.credentials_provider(Credentials::new(
-                keys.access_key_id.as_str(),
-                keys.secret_access_key.as_str(),
-                keys.session_token.clone(),
-                None,
-                "triple-c-connection",
-            ));
+            keys_credentials(&keys)
         }
+    };
+    Ok(build_sdk_config(region, credentials))
+}
+
+fn keys_credentials(keys: &secure::AwsKeys) -> SharedCredentialsProvider {
+    SharedCredentialsProvider::new(Credentials::new(
+        keys.access_key_id.as_str(),
+        keys.secret_access_key.as_str(),
+        keys.session_token.clone(),
+        None,
+        "triple-c-connection",
+    ))
+}
+
+/// Built by hand rather than with `aws_config::defaults(..).load()`, which
+/// would read `AWS_ENDPOINT_URL[_<SERVICE>]`, FIPS/dual-stack, retry and
+/// other settings from the process environment and the default profile. A
+/// stray endpoint there would send every connection's signed requests (and
+/// the permission check) somewhere other than AWS. Connections talk to the
+/// real regional endpoints; a profile's own `endpoint_url` is ignored too.
+/// The HTTP client, timeouts and stalled-stream protection are each service
+/// client's defaults (the `default-https-client` stack every AWS crate here
+/// is built with).
+fn build_sdk_config(region: Region, credentials: SharedCredentialsProvider) -> SdkConfig {
+    let mut builder = SdkConfig::builder()
+        .behavior_version(BehaviorVersion::latest())
+        .region(region)
+        .credentials_provider(credentials)
+        .identity_cache(IdentityCache::lazy().build())
+        .retry_config(RetryConfig::standard())
+        .time_source(SharedTimeSource::default());
+    if let Some(sleep) = default_async_sleep() {
+        builder = builder.sleep_impl(sleep);
     }
-    Ok(loader.load().await)
+    builder.build()
 }
 
 /// Puts the profile's name into the source chain of every credentials error,
@@ -195,5 +223,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cfg.region().map(|r| r.as_ref()), Some("ap-south-1"));
+    }
+
+    /// Config files that try to redirect every call. A connection always
+    /// talks to the real regional AWS endpoints, so none of this may reach
+    /// the config: not the named profile's `endpoint_url`, not `[default]`'s,
+    /// not a per-service `services` section.
+    const REDIRECTING_CONFIG: &str = "[default]
+endpoint_url = http://127.0.0.1:9
+retry_mode = adaptive
+max_attempts = 9
+use_fips_endpoint = true
+
+[profile p]
+endpoint_url = http://127.0.0.1:9
+retry_mode = adaptive
+max_attempts = 9
+use_dualstack_endpoint = true
+services = redirect
+aws_access_key_id = AKIDTEST
+aws_secret_access_key = s
+
+[services redirect]
+sts =
+  endpoint_url = http://127.0.0.1:9
+";
+
+    fn assert_isolated(cfg: &aws_config::SdkConfig) {
+        assert_eq!(cfg.endpoint_url(), None);
+        assert!(
+            cfg.service_config().is_none(),
+            "service config loaded from env/profile"
+        );
+        assert_eq!(cfg.use_fips(), None);
+        assert_eq!(cfg.use_dual_stack(), None);
+        let retry = cfg.retry_config().expect("retry config");
+        assert_eq!(retry.mode(), aws_config::retry::RetryMode::Standard);
+        assert_eq!(retry.max_attempts(), 3);
+        assert_eq!(cfg.region().map(|r| r.as_ref()), Some("us-west-2"));
+    }
+
+    #[tokio::test]
+    async fn a_profile_connection_ignores_endpoint_and_service_settings_in_the_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config");
+        std::fs::write(&config, REDIRECTING_CONFIG).unwrap();
+        let files = EnvConfigFiles::builder()
+            .include_default_config_file(false)
+            .include_default_credentials_file(false)
+            .with_file(EnvConfigFileKind::Config, &config)
+            .build();
+        let cfg = sdk_config_with(&profile_conn("p"), "us-west-2", Some(files))
+            .await
+            .unwrap();
+        assert_isolated(&cfg);
+    }
+
+    /// The keys arm reads no files or environment at all: same isolation.
+    #[test]
+    fn a_keys_connection_config_is_isolated() {
+        let keys = crate::storage::secure::AwsKeys {
+            access_key_id: "AKIDTEST".into(),
+            secret_access_key: "s".into(),
+            session_token: None,
+        };
+        let cfg = build_sdk_config(Region::new("us-west-2"), keys_credentials(&keys));
+        assert_isolated(&cfg);
+        assert!(cfg.credentials_provider().is_some());
     }
 }

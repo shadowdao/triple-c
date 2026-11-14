@@ -7222,6 +7222,7 @@ dependencies = [
  "aws-sdk-secretsmanager",
  "aws-sdk-ssm",
  "aws-sdk-sts",
+ "aws-smithy-async",
  "axum",
  "base64 0.22.1",
  "bollard",

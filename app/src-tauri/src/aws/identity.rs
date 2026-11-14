@@ -337,6 +337,45 @@ mod tests {
         }
     }
 
+    /// SSO's GetRoleCredentials on a revoked or signed-out session. Inside a
+    /// profile connection's credentials that means "sign in again".
+    #[test]
+    fn a_revoked_sso_session_is_reported_as_sso_expired() {
+        use crate::aws::error::ProfileCredentialsError;
+        use aws_credential_types::provider::error::CredentialsError;
+        let leaf = CredentialsError::provider_error(
+            "service error: unhandled error (UnauthorizedException): Session token not found or invalid",
+        );
+        let err = CredentialsError::provider_error(ProfileCredentialsError {
+            profile: "dev".into(),
+            not_loaded: false,
+            source: leaf,
+        });
+        assert_eq!(
+            classify_sdk_error(
+                "sts:GetCallerIdentity",
+                &Msg("dispatch failure", Some(Box::new(err)))
+            ),
+            AwsError::SsoExpired {
+                profile: "dev".into()
+            }
+        );
+    }
+
+    /// The same error code from some other service, outside any profile's
+    /// credentials, is not an SSO problem.
+    #[test]
+    fn an_unauthorized_exception_outside_profile_credentials_is_not_sso() {
+        let err = Msg(
+            "service error: unhandled error (UnauthorizedException): Session token not found or invalid",
+            None,
+        );
+        assert!(!matches!(
+            classify_sdk_error("ecs:ListClusters", &err),
+            AwsError::SsoExpired { .. }
+        ));
+    }
+
     #[test]
     fn service_error_codes_are_classified() {
         let denied = Msg(

@@ -85,6 +85,10 @@ const SSO_EXPIRED: &[&str] = &[
     "Token has expired",
     "the SSO token has expired",
 ];
+const SSO_REVOKED: &[&str] = &[
+    "UnauthorizedException",
+    "Session token not found or invalid",
+];
 const DENIED_CODES: &[&str] = &[
     "AccessDeniedException",
     "AccessDenied",
@@ -116,6 +120,13 @@ pub fn classify_sdk_error(action: &str, err: &(dyn Error + 'static)) -> AwsError
     if SSO_EXPIRED.iter().any(|s| text.contains(s)) {
         return AwsError::SsoExpired {
             profile: profile.map(|p| p.profile.clone()).unwrap_or_default(),
+        };
+    }
+    // SSO's GetRoleCredentials on a revoked or signed-out session. Only
+    // inside a profile's credentials: other services use this code too.
+    if let Some(p) = profile.filter(|_| SSO_REVOKED.iter().any(|s| text.contains(s))) {
+        return AwsError::SsoExpired {
+            profile: p.profile.clone(),
         };
     }
     if let Some(p) = profile.filter(|p| p.not_loaded) {
