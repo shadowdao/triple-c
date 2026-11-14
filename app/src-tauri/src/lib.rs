@@ -1,4 +1,5 @@
 mod auth_bridge;
+mod aws;
 mod browser_view;
 #[cfg(test)]
 mod command_census;

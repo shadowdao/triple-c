@@ -367,10 +367,85 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-cloudformation"
+version = "1.139.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b77def03a5fb2442348afdd6ecd0eafbfa117243865cc78e899beb26edf7fb6d"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-query",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "aws-smithy-xml",
+ "aws-types",
+ "fastrand",
+ "http",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-ecs"
 version = "1.159.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ecd8f39cf3e41848314347fc3b5242cbf14291258c9b8f4f61156735627726bf"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "aws-types",
+ "fastrand",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
+name = "aws-sdk-iam"
+version = "1.136.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0f53b6d3c4f3f04b734a5ae6eea34491e5c356be99bc677fa7fd84eba0cc671b"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-query",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "aws-smithy-xml",
+ "aws-types",
+ "fastrand",
+ "http",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
+name = "aws-sdk-secretsmanager"
+version = "1.128.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d77ef7832d9e7c60fa7b8201bb2038ccc9821b6cf88746caab6dc1c8767882b5"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -7139,8 +7214,14 @@ dependencies = [
  "aes-gcm",
  "argon2",
  "aws-config",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-sdk-cloudformation",
  "aws-sdk-ecs",
+ "aws-sdk-iam",
+ "aws-sdk-secretsmanager",
  "aws-sdk-ssm",
+ "aws-sdk-sts",
  "axum",
  "base64 0.22.1",
  "bollard",
