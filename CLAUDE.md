@@ -907,6 +907,25 @@ a project's Docker volumes are deliberately out of scope — this is not a proje
 
 ## Packaging
 
+### Releases are cut by hand
+
+**Merging to `main` does not release anything users get.** A release is cut by dispatching
+`build-app.yml` on `main` (Actions -> Build App -> Run workflow). That one run publishes the Gitea
+and GitHub releases for all three platforms, the `vX.Y.Z` tag pinned to the dispatched commit, and
+the Linux update channel. Its last step dispatches `build.yml` and `build-stt.yml` with the new tag,
+and those rebuild that tag and move `:latest`, which is what installed apps pull.
+
+- Dispatching `build-app.yml` on any other branch is a **dry run**. It builds, signs and verifies,
+  and publishes nothing. Every publishing step and job is gated on
+  `gitea.event_name == 'workflow_dispatch' && gitea.ref == 'refs/heads/main'`, so give any new
+  publishing step the same `if:`.
+- A push to `main` that touches `container/` or `stt-container/` publishes only `:edge` and
+  `:<sha>`, never `:latest`. The weekly scheduled sandbox rebuild (OS security fixes) rebuilds the
+  **newest release tag**, not main.
+- This exists so that main can carry dormant work (a feature landing in phases) without each
+  merge shipping. Until the gate, every merge to main touching `app/` released, and every merge
+  touching `container/` moved `:latest`.
+
 Linux ships as **AppImage only**, built by `build-app.yml` (releases) and
 `build-app-preview.yml` (the PR check). The `.deb` and `.rpm` were dropped: two more artifacts to
 build and publish for an audience the AppImage already serves, and neither could self-update. The
@@ -952,8 +971,8 @@ quietly. **PR previews are deliberately not signed**, and `build-app-preview.yml
 reference the signing secrets. Two reasons: signing is metered (about 1000 signatures a month,
 against roughly 50 preview builds a month), and a PR's workflow runs the PR's own code, so a
 secret available there is available to whoever can push a branch. To exercise signing before a
-merge, dispatch `build-app.yml` on the branch. Every publishing step there is gated on
-`gitea.event_name == 'push'`, so a dispatch builds, signs and verifies without releasing.
+merge, dispatch `build-app.yml` on the branch. Off `main` it builds, signs and verifies
+without releasing (see Releases above).
 
 - `scripts/windows-signing-setup.ps1` runs once per job. It downloads the signing client
   (`Microsoft.ArtifactSigning.Client`) and a .NET runtime into `.code-signing/` in the workspace,
@@ -986,8 +1005,8 @@ app"), never by the preview workflow, never echoed, and never on a command line.
 public, so its Actions logs are too. Gitea masks the secret values, and the signing dlib's
 `/debug` output carries no tokens (checked against its strings). Anyone who can push to this
 repo can reach the secrets through a workflow file, so repo write access is the boundary.
-`main` is branch-protected (no direct or force pushes; changes land by merging a PR), so a signed
-release only ever comes from a merged, visible change. The
+`main` is branch-protected (no direct or force pushes; changes land by merging a PR), and only a
+dispatch on `main` publishes, so a signed release only ever comes from a merged, visible change. The
 Azure side should hold the rest: an app registration with only the signer role on this one
 certificate profile, and a client secret with an expiry. Four things are load-bearing:
 

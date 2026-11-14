@@ -11,6 +11,12 @@ on:
     paths:
       - "stt-container/**"
       - ".gitea/workflows/build-stt.yml"
+  # Dispatched by build-app.yml when a release is cut, with the release's tag.
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to build as :latest (default: the newest vX.Y.Z)"
+        required: false
 
 env:
   REGISTRY: repo.anhonesthost.net
@@ -22,6 +28,52 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # **`:latest` is what installed apps pull, so only a release moves it.**
+      # A push to main publishes `:edge` and `:<sha>` (for testing a merged
+      # image by hand); a pull request publishes nothing. The weekly rebuild
+      # and a release dispatch build a release tag and publish it as `:latest`
+      # — the tag, not main, so unreleased container changes never reach users.
+      - name: Pick the source and the tags to publish
+        id: src
+        env:
+          EVENT: ${{ gitea.event_name }}
+          RELEASE_TAG: ${{ gitea.event.inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            push|pull_request)
+              CHANNEL=edge
+              ;;
+            schedule|workflow_dispatch)
+              CHANNEL=latest
+              git fetch --tags --force
+              if [ -z "${RELEASE_TAG:-}" ]; then
+                RELEASE_TAG=$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+              fi
+              if ! echo "$RELEASE_TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+                echo "Not a release tag: '$RELEASE_TAG'" >&2
+                exit 1
+              fi
+              git checkout --detach "refs/tags/$RELEASE_TAG"
+              echo "Building release $RELEASE_TAG"
+              ;;
+            *)
+              echo "Unexpected event $EVENT" >&2
+              exit 1
+              ;;
+          esac
+          SHA=$(git rev-parse HEAD)
+          {
+            echo "tags<<EOF"
+            echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$CHANNEL"
+            echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$SHA"
+            echo "ghcr.io/shadowdao/triple-c-stt:$CHANNEL"
+            echo "ghcr.io/shadowdao/triple-c-stt:$SHA"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -49,12 +101,10 @@ jobs:
           context: ./stt-container
           file: ./stt-container/Dockerfile
           platforms: linux/amd64,linux/arm64
-          push: ${{ gitea.event_name == 'push' }}
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ gitea.sha }}
-            ghcr.io/shadowdao/triple-c-stt:latest
-            ghcr.io/shadowdao/triple-c-stt:${{ gitea.sha }}
+          # A pull_request run only validates; see the tag step for what each
+          # other event publishes.
+          push: ${{ gitea.event_name != 'pull_request' }}
+          tags: ${{ steps.src.outputs.tags }}
           # The gha cache is served by the runner that picks the job up, and
           # is unreachable from the job on some of ours (the home box's
           # firewalled per-job bridge; ephemeral runners). Import failures

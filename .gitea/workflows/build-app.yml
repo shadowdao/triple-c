@@ -1,20 +1,22 @@
 name: Build App
 
+# **Releases are cut by hand.** This runs only when someone dispatches it
+# (Actions -> Build App -> Run workflow). Merging to main does not release:
+# main can carry finished-but-dormant work (a feature landing in phases) and
+# nothing reaches users until a release is cut on purpose.
+#
+# Dispatched on `main` it releases: Gitea and GitHub releases, the version tag,
+# the Linux update channel, and then the container images' `:latest` (see the
+# create-tag job). Dispatched on any other branch it is a dry run that builds,
+# signs and verifies all three platforms and publishes nothing, which is how to
+# exercise Windows signing before a merge. Every publishing step and job
+# carries the same `if:` (dispatch event *and* ref main); keep them in step if
+# one is ever added.
 on:
-  push:
-    branches: [main]
-    paths:
-      - "app/**"
-      - "VERSION"
-      - ".gitea/workflows/build-app.yml"
-      - "scripts/windows-*.ps1"
   workflow_dispatch:
 
-# Deliberately **not** on pull_request. Every publishing step here is gated on
-# `gitea.event_name == 'push'`, so a PR run compiled all three platforms and
-# produced nothing — and it ran alongside build-app-preview.yml, which compiles
-# the same three and publishes them. Six OS builds per push, one set of which
-# was unreachable. Previews now carry the PR check; this workflow is releases.
+# Deliberately **not** on pull_request: build-app-preview.yml carries the PR
+# check (tests plus all three platforms), and this workflow is releases only.
 
 env:
   # The ephemeral Proxmox runners (eph-pve3-*) ship needrestart, which after
@@ -262,7 +264,7 @@ jobs:
           fi
 
       - name: Upload to Gitea release
-        if: gitea.event_name == 'push'
+        if: gitea.event_name == 'workflow_dispatch' && gitea.ref == 'refs/heads/main'
         env:
           TOKEN: ${{ secrets.REGISTRY_TOKEN }}
         run: |
@@ -288,7 +290,7 @@ jobs:
               curl -fsS -X POST \
                 -H "Authorization: token ${TOKEN}" \
                 -H "Content-Type: application/json" \
-                -d "{\"tag_name\": \"${TAG}\", \"name\": \"Triple-C ${TAG} (Linux)\", \"body\": \"Automated build from commit ${{ gitea.sha }}\"}" \
+                -d "{\"tag_name\": \"${TAG}\", \"target_commitish\": \"${{ gitea.sha }}\", \"name\": \"Triple-C ${TAG} (Linux)\", \"body\": \"Automated build from commit ${{ gitea.sha }}\"}" \
                 "${GITEA_URL}/api/v1/repos/${REPO}/releases" > release.json
               ;;
             *)
@@ -340,7 +342,7 @@ jobs:
       # from the versioned release above because the updater's URL must never
       # move, and `releases/latest` does.
       - name: Publish the Linux update channel
-        if: gitea.event_name == 'push'
+        if: gitea.event_name == 'workflow_dispatch' && gitea.ref == 'refs/heads/main'
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
           GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
@@ -429,7 +431,7 @@ jobs:
           ls -la artifacts/
 
       - name: Upload to Gitea release
-        if: gitea.event_name == 'push'
+        if: gitea.event_name == 'workflow_dispatch' && gitea.ref == 'refs/heads/main'
         env:
           TOKEN: ${{ secrets.REGISTRY_TOKEN }}
         run: |
@@ -455,7 +457,7 @@ jobs:
               curl -fsS -X POST \
                 -H "Authorization: token ${TOKEN}" \
                 -H "Content-Type: application/json" \
-                -d "{\"tag_name\": \"${TAG}\", \"name\": \"Triple-C v${{ needs.compute-version.outputs.version }} (macOS)\", \"body\": \"Automated build from commit ${{ gitea.sha }}\"}" \
+                -d "{\"tag_name\": \"${TAG}\", \"target_commitish\": \"${{ gitea.sha }}\", \"name\": \"Triple-C v${{ needs.compute-version.outputs.version }} (macOS)\", \"body\": \"Automated build from commit ${{ gitea.sha }}\"}" \
                 "${GITEA_URL}/api/v1/repos/${REPO}/releases" > release.json
               ;;
             *)
@@ -717,7 +719,7 @@ jobs:
           dir artifacts\
 
       - name: Upload to Gitea release
-        if: gitea.event_name == 'push'
+        if: gitea.event_name == 'workflow_dispatch' && gitea.ref == 'refs/heads/main'
         shell: powershell
         env:
           TOKEN: ${{ secrets.REGISTRY_TOKEN }}
@@ -741,8 +743,9 @@ jobs:
             if ($_.Exception.Response.StatusCode.value__ -eq 404) {
               Write-Host "Release $tag not found, creating"
               $body = @{
-                tag_name = $tag
-                name     = "Triple-C v$env:VERSION (Windows)"
+                tag_name         = $tag
+                target_commitish = $env:COMMIT_SHA
+                name             = "Triple-C v$env:VERSION (Windows)"
                 body     = "Automated build from commit $env:COMMIT_SHA"
               } | ConvertTo-Json
               $release = Invoke-RestMethod -Method Post -Headers $headers `
@@ -778,7 +781,7 @@ jobs:
   create-tag:
     runs-on: ubuntu-latest
     needs: [compute-version, build-linux, build-macos, build-windows]
-    if: gitea.event_name == 'push'
+    if: gitea.event_name == 'workflow_dispatch' && gitea.ref == 'refs/heads/main'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -788,24 +791,56 @@ jobs:
       - name: Create version tag
         env:
           TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          VERSION: ${{ needs.compute-version.outputs.version }}
+          SHA: ${{ gitea.sha }}
         run: |
-          VERSION="${{ needs.compute-version.outputs.version }}"
+          set -euo pipefail
           TAG="v${VERSION}"
-          echo "Creating tag ${TAG}..."
 
-          # Create annotated tag via Gitea API
-          curl -s -X POST \
-            -H "Authorization: token ${TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d "{\"tag_name\": \"${TAG}\", \"target\": \"${{ gitea.sha }}\", \"message\": \"Release ${TAG}\"}" \
-            "${GITEA_URL}/api/v1/repos/${REPO}/tags" || echo "Tag may already exist (created by release)"
+          # Usually already there: creating the Linux release creates its tag,
+          # at this commit (`target_commitish`). Create it if not, then insist
+          # it points here, because the container step below builds whatever
+          # the tag names.
+          if ! curl -fsS -o tag.json -H "Authorization: token ${TOKEN}" \
+              "${GITEA_URL}/api/v1/repos/${REPO}/tags/${TAG}"; then
+            echo "Creating tag ${TAG} at ${SHA}"
+            curl -fsS -X POST \
+              -H "Authorization: token ${TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "{\"tag_name\": \"${TAG}\", \"target\": \"${SHA}\", \"message\": \"Release ${TAG}\"}" \
+              "${GITEA_URL}/api/v1/repos/${REPO}/tags" > tag.json
+          fi
+          TAGGED=$(python3 -c "import json; print(json.load(open('tag.json'))['commit']['sha'])")
+          if [ "${TAGGED}" != "${SHA}" ]; then
+            echo "Tag ${TAG} points at ${TAGGED}, not the released commit ${SHA}" >&2
+            exit 1
+          fi
+          echo "Tag ${TAG} is at ${SHA}"
 
-          echo "Tag ${TAG} created successfully"
+      # The containers' `:latest` is what every installed app pulls, so it
+      # moves with an app release and at no other time (pushes to main only
+      # publish `:edge` and `:<sha>`). Each container workflow builds the tag
+      # it is handed, not main, so a merge landing mid-release cannot ride
+      # along.
+      - name: Release the container images
+        env:
+          TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          VERSION: ${{ needs.compute-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          for WORKFLOW in build.yml build-stt.yml; do
+            echo "Dispatching ${WORKFLOW} for v${VERSION}"
+            curl -fsS -X POST \
+              -H "Authorization: token ${TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "{\"ref\": \"main\", \"inputs\": {\"release_tag\": \"v${VERSION}\"}}" \
+              "${GITEA_URL}/api/v1/repos/${REPO}/actions/workflows/${WORKFLOW}/dispatches"
+          done
 
   sync-to-github:
     runs-on: ubuntu-latest
     needs: [compute-version, build-linux, build-macos, build-windows]
-    if: gitea.event_name == 'push'
+    if: gitea.event_name == 'workflow_dispatch' && gitea.ref == 'refs/heads/main'
     env:
       GH_PAT: ${{ secrets.GH_PAT }}
       GITHUB_REPO: shadowdao/triple-c
