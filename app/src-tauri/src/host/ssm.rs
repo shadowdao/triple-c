@@ -744,8 +744,11 @@ async fn run_supervisor<O: SessionOpener>(
         let _ = pid.send(None);
         // Let the drains catch the last lines.
         tokio::time::sleep(Duration::from_millis(50)).await;
+        // Both halves: SSM's own reason is in the output ("timed out due to
+        // inactivity"), but after a kill the last line is just whatever the
+        // plugin printed before, so the exit status has to be there too.
         let mut last_error = match running.output.last() {
-            Some(line) => format!("the SSM session ended ({line})"),
+            Some(line) => format!("the SSM session ended ({}; last output: {line})", describe_exit(exited)),
             None => format!("the SSM session ended ({})", describe_exit(exited)),
         };
         log::warn!("SSM port forward on 127.0.0.1:{local_port}: {last_error}; reconnecting");
