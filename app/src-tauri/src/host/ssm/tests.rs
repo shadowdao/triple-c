@@ -137,6 +137,9 @@ mod with_a_fake_plugin {
         opened: Arc<AtomicU32>,
         /// Fail opens whose 1-based number is in here, with this message.
         fail: Vec<(u32, &'static str)>,
+        /// Connections made to the local port (the fake plugin listens on
+        /// nothing, so the opener stands in for its listener).
+        connections: Arc<AtomicU32>,
     }
 
     impl FakeOpener {
@@ -147,6 +150,7 @@ mod with_a_fake_plugin {
                 terminated: Default::default(),
                 opened: Default::default(),
                 fail: vec![],
+                connections: Default::default(),
             }
         }
     }
@@ -157,6 +161,15 @@ mod with_a_fake_plugin {
             self.ports.lock().unwrap().push(local_port);
             if let Some((_, msg)) = self.fail.iter().find(|(i, _)| *i == n) {
                 return Err(msg.to_string());
+            }
+            if let Ok(listener) = tokio::net::TcpListener::bind(("127.0.0.1", local_port)).await {
+                let count = self.connections.clone();
+                tokio::spawn(async move {
+                    while let Ok((sock, _)) = listener.accept().await {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        drop(sock);
+                    }
+                });
             }
             let mut l = launch(self.plugin.clone(), "x");
             l.session_id = format!("s-{n}");
@@ -215,6 +228,19 @@ mod with_a_fake_plugin {
 
         pf.close().await;
         assert!(!alive(second));
+    }
+
+    #[tokio::test]
+    async fn an_up_tunnel_keeps_itself_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = script(dir.path(), "plugin", &format!("{READY}; exec sleep 30"));
+        let opener = FakeOpener::new(p);
+        let connections = opener.connections.clone();
+        let pf = PortForward::open_with(opener).await.expect("open");
+        tokio::time::sleep(KEEPALIVE_INTERVAL * 5 + KEEPALIVE_INTERVAL / 2).await;
+        let n = connections.load(Ordering::SeqCst);
+        assert!((3..=6).contains(&n), "{n} keepalives in 5.5 intervals");
+        pf.close().await;
     }
 
     #[tokio::test]
@@ -353,4 +379,24 @@ async fn a_dropped_open_still_ends_its_session() {
         .unwrap();
     assert!(req.contains("AmazonSSM.TerminateSession"), "{req}");
     assert!(req.contains("s-dropped"), "{req}");
+}
+
+/// The keepalive is the unauthenticated health probe: some traffic, no token.
+#[tokio::test]
+async fn the_keepalive_asks_for_health_without_a_token() {
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = sock.read(&mut buf).await.unwrap();
+        sock.write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n").await.unwrap();
+        String::from_utf8_lossy(&buf[..n]).into_owned()
+    });
+    keepalive_probe(port).await;
+    let req = server.await.unwrap();
+    assert!(req.starts_with("GET /v1/health HTTP/1.1\r\n"), "{req}");
+    assert!(!req.to_ascii_lowercase().contains("authorization"), "{req}");
 }

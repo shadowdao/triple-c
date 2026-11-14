@@ -81,6 +81,16 @@ const MAX_RECONNECT_ATTEMPTS: u32 = 25;
 /// Attempts to find a free local port for the first connection.
 const INITIAL_PORT_ATTEMPTS: u32 = 3;
 const TERMINATE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often an Up tunnel sends traffic of its own. Session Manager ends a
+/// session after 20 minutes with no data (its default `idleSessionTimeout`;
+/// measured: a silent tunnel was cut at 19.7 min), and with it every TCP
+/// connection inside — an idle terminal tab included.
+const KEEPALIVE_INTERVAL: Duration = if cfg!(test) {
+    Duration::from_millis(200)
+} else {
+    Duration::from_secs(5 * 60)
+};
+const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ── The task ─────────────────────────────────────────────────────────────────
 
@@ -710,15 +720,25 @@ async fn run_supervisor<O: SessionOpener>(
     cancel: CancellationToken,
 ) {
     loop {
-        // ── Up: wait for the plugin to exit, or for close ──
-        let exited = tokio::select! {
-            s = running.child.wait() => s,
-            _ = cancel.cancelled() => {
-                let _ = running.child.kill().await;
-                opener.terminate(running.session_id).await;
-                let _ = pid.send(None);
-                let _ = state.send(TunnelState::Closed);
-                return;
+        // ── Up: wait for the plugin to exit, or for close; keep it busy ──
+        let mut keepalive = tokio::time::interval_at(
+            tokio::time::Instant::now() + KEEPALIVE_INTERVAL,
+            KEEPALIVE_INTERVAL,
+        );
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let exited = loop {
+            tokio::select! {
+                s = running.child.wait() => break s,
+                _ = keepalive.tick() => {
+                    tokio::spawn(keepalive_probe(local_port));
+                }
+                _ = cancel.cancelled() => {
+                    let _ = running.child.kill().await;
+                    opener.terminate(running.session_id).await;
+                    let _ = pid.send(None);
+                    let _ = state.send(TunnelState::Closed);
+                    return;
+                }
             }
         };
         let _ = pid.send(None);
@@ -772,6 +792,27 @@ async fn run_supervisor<O: SessionOpener>(
         let _ = pid.send(running.child.id());
         let _ = state.send(TunnelState::Up);
         log::info!("SSM port forward on 127.0.0.1:{local_port}: reconnected after {attempt} attempt(s)");
+    }
+}
+
+/// One request through the tunnel so SSM sees data: an *unauthenticated*
+/// `GET /v1/health`. The agent answers `401` before it counts anything as
+/// activity, so this keeps the session alive without keeping the workspace
+/// "in use" for idle auto-stop — and it needs no token here.
+async fn keepalive_probe(local_port: u16) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let probe = async {
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", local_port)).await?;
+        s.write_all(b"GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .await?;
+        let mut sink = [0u8; 512];
+        while s.read(&mut sink).await? > 0 {}
+        Ok::<_, std::io::Error>(())
+    };
+    match tokio::time::timeout(KEEPALIVE_TIMEOUT, probe).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => log::debug!("SSM keepalive on 127.0.0.1:{local_port}: {e}"),
+        Err(_) => log::debug!("SSM keepalive on 127.0.0.1:{local_port}: timed out"),
     }
 }
 
