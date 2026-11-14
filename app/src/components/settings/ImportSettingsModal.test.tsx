@@ -36,6 +36,8 @@ const samplePreview: SettingsImportPreview = {
   global_hook_install_count: 0,
   global_plugin_install_count: 0,
   marketplace_account_token_count: 0,
+  aws_connections: [],
+  aws_connection_key_count: 0,
 };
 
 function outcome(settings: AppSettings, secretRestoreWarnings: string[] = []): SettingsImportOutcome {
@@ -78,6 +80,41 @@ describe("ImportSettingsModal", () => {
     fireEvent.click(screen.getByRole("button", { name: /choose file/i }));
 
     expect(await screen.findByText(/enables the remote web terminal/i)).toBeInTheDocument();
+  });
+
+  it("shows the AWS connections and key count, and flags overwrites", async () => {
+    previewSettingsImport.mockResolvedValue({
+      ...samplePreview,
+      aws_connections: [
+        {
+          name: "Prod",
+          auth: "keys",
+          profile_name: null,
+          default_region: "us-west-2",
+          overwrites_existing: true,
+          overwrites_keys: true,
+        },
+        {
+          name: "Dev",
+          auth: "profile",
+          profile_name: "dev-profile",
+          default_region: "eu-west-1",
+          overwrites_existing: false,
+          overwrites_keys: false,
+        },
+      ],
+      aws_connection_key_count: 1,
+    });
+    render(<ImportSettingsModal onClose={vi.fn()} onImported={vi.fn()} />);
+
+    fireEvent.change(screen.getByLabelText("Password"), { target: { value: "hunter2" } });
+    fireEvent.click(screen.getByRole("button", { name: /choose file/i }));
+
+    expect(await screen.findByText(/AWS connection "Prod" \(access keys, us-west-2\)/)).toBeInTheDocument();
+    expect(screen.getByText(/AWS connection "Dev" \(profile dev-profile, eu-west-1\)/)).toBeInTheDocument();
+    expect(screen.getByText(/1 AWS access key set$/)).toBeInTheDocument();
+    expect(screen.getByText(/Overwrites the AWS access keys stored for "Prod"/)).toBeInTheDocument();
+    expect(screen.getByText(/Replaces your existing AWS connection.*"Prod"/)).toBeInTheDocument();
   });
 
   it("warns about a custom Docker image every time, not just on change", async () => {

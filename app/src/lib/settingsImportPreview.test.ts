@@ -24,6 +24,8 @@ function preview(overrides: Partial<SettingsImportPreview> = {}): SettingsImport
     global_hook_install_count: 0,
     global_plugin_install_count: 0,
     marketplace_account_token_count: 0,
+    aws_connections: [],
+    aws_connection_key_count: 0,
     ...overrides,
   };
 }

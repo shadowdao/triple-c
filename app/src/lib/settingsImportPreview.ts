@@ -35,6 +35,14 @@ export function describeImport(preview: SettingsImportPreview): string[] {
     const n = preview.marketplace_account_token_count;
     items.push(`${n} marketplace account token${n === 1 ? "" : "s"}`);
   }
+  for (const c of preview.aws_connections) {
+    const auth = c.auth === "keys" ? "access keys" : `profile ${c.profile_name ?? ""}`.trim();
+    items.push(`AWS connection "${c.name}" (${auth}, ${c.default_region})`);
+  }
+  if (preview.aws_connection_key_count > 0) {
+    const n = preview.aws_connection_key_count;
+    items.push(`${n} AWS access key set${n === 1 ? "" : "s"}`);
+  }
   return items;
 }
 
@@ -81,6 +89,14 @@ export function describeImportWarnings(preview: SettingsImportPreview): string[]
     warnings.push(
       `Installs ${n} marketplace plugin${n === 1 ? "" : "s"} for all projects. Plugins can bring their own hooks, MCP servers and commands into every project container, and these skip the confirmation that lists what a plugin brings before a Marketplace tab install.`,
     );
+  }
+  for (const c of preview.aws_connections) {
+    if (c.overwrites_existing) {
+      warnings.push(`Replaces your existing AWS connection with different settings: "${c.name}".`);
+    }
+    if (c.overwrites_keys) {
+      warnings.push(`Overwrites the AWS access keys stored for "${c.name}".`);
+    }
   }
   if (preview.image_source === "custom") {
     warnings.push(

@@ -177,6 +177,30 @@ pub struct SettingsImportPreview {
     /// Non-blank marketplace account tokens the import restores.
     #[serde(default)]
     pub marketplace_account_token_count: usize,
+    /// The AWS connections the import brings. Applied wholesale, so a crafted
+    /// export could otherwise add or replace one unannounced. Names and
+    /// profile names are cleaned; no key values, only the count below.
+    #[serde(default)]
+    pub aws_connections: Vec<AwsConnectionPreview>,
+    /// Non-blank AWS access-key entries the import restores to the keychain.
+    #[serde(default)]
+    pub aws_connection_key_count: usize,
+}
+
+/// One imported AWS connection as the confirmation dialog shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AwsConnectionPreview {
+    pub name: String,
+    /// `"profile"` or `"keys"`.
+    pub auth: String,
+    /// The profile name, for a `profile` connection.
+    pub profile_name: Option<String>,
+    pub default_region: String,
+    /// A connection with this id exists here with different content.
+    pub overwrites_existing: bool,
+    /// The import carries keys for this id and a keychain entry for it
+    /// already exists here (its value is never read into the preview).
+    pub overwrites_keys: bool,
 }
 
 /// A cap on how much of a decrypted, not-yet-trusted string gets echoed back
@@ -202,6 +226,45 @@ fn sanitize_for_preview(value: &str) -> String {
 
 impl SettingsImportPreview {
     pub fn from_payload(payload: &SettingsExportPayload) -> Self {
+        Self::from_payload_against(payload, &[], |_| false)
+    }
+
+    /// As [`Self::from_payload`], also flagging what the import would
+    /// overwrite: `local_hosts` are the connections held now and
+    /// `local_has_keys` says whether a keychain entry exists for an id.
+    pub fn from_payload_against(
+        payload: &SettingsExportPayload,
+        local_hosts: &[crate::models::host_connection::HostConnection],
+        local_has_keys: impl Fn(&str) -> bool,
+    ) -> Self {
+        use crate::models::host_connection::{AwsAuth, HostKind};
+        let carried_keys = |id: &str| {
+            payload
+                .secrets
+                .aws_connection_keys
+                .get(id)
+                .is_some_and(|v| !v.trim().is_empty())
+        };
+        let aws_connections = payload
+            .settings
+            .hosts
+            .iter()
+            .map(|h| {
+                let HostKind::Aws { auth, default_region } = &h.kind;
+                let (auth_kind, profile_name) = match auth {
+                    AwsAuth::Profile { name } => ("profile", Some(sanitize_for_preview(name))),
+                    AwsAuth::Keys { .. } => ("keys", None),
+                };
+                AwsConnectionPreview {
+                    name: sanitize_for_preview(&h.name),
+                    auth: auth_kind.to_string(),
+                    profile_name,
+                    default_region: sanitize_for_preview(default_region),
+                    overwrites_existing: local_hosts.iter().any(|l| l.id == h.id && l != h),
+                    overwrites_keys: carried_keys(&h.id) && local_has_keys(&h.id),
+                }
+            })
+            .collect();
         let non_blank = |s: &Option<String>| s.as_deref().is_some_and(|v| !v.trim().is_empty());
         let sanitized_non_blank = |s: &Option<String>| {
             s.as_deref()
@@ -243,6 +306,13 @@ impl SettingsImportPreview {
             marketplace_account_token_count: payload
                 .secrets
                 .marketplace_account_tokens
+                .values()
+                .filter(|v| !v.trim().is_empty())
+                .count(),
+            aws_connections,
+            aws_connection_key_count: payload
+                .secrets
+                .aws_connection_keys
                 .values()
                 .filter(|v| !v.trim().is_empty())
                 .count(),
@@ -482,5 +552,65 @@ mod tests {
         let preview = SettingsImportPreview::from_payload(&payload);
         assert_eq!(preview.global_plugin_install_count, 2);
         assert_eq!(preview.global_hook_install_count, 1);
+    }
+
+    fn aws_host(id: &str, name: &str, keys: bool) -> crate::models::host_connection::HostConnection {
+        use crate::models::host_connection::*;
+        HostConnection {
+            id: id.into(),
+            name: name.into(),
+            kind: HostKind::Aws {
+                auth: if keys {
+                    AwsAuth::Keys { keyring_ref: id.into() }
+                } else {
+                    AwsAuth::Profile { name: "prod-profile".into() }
+                },
+                default_region: "us-west-2".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn import_preview_discloses_aws_connections_and_key_count() {
+        let mut payload = payload_with(ExportedSecrets {
+            aws_connection_keys: BTreeMap::from([
+                ("k1".to_string(), "{\"secret_access_key\":\"test-secret-not-real\"}".to_string()),
+                ("k2".to_string(), "  ".to_string()),
+            ]),
+            ..Default::default()
+        });
+        payload.settings.hosts = vec![aws_host("k1", "Ke\nys", true), aws_host("p1", "Prof", false)];
+        let preview = SettingsImportPreview::from_payload(&payload);
+        assert_eq!(preview.aws_connection_key_count, 1);
+        assert_eq!(preview.aws_connections.len(), 2);
+        assert_eq!(preview.aws_connections[0].name, "Keys");
+        assert_eq!(preview.aws_connections[0].auth, "keys");
+        assert_eq!(preview.aws_connections[1].auth, "profile");
+        assert_eq!(preview.aws_connections[1].profile_name.as_deref(), Some("prod-profile"));
+        assert_eq!(preview.aws_connections[1].default_region, "us-west-2");
+        assert!(!serde_json::to_string(&preview).unwrap().contains("test-secret-not-real"));
+    }
+
+    #[test]
+    fn import_preview_flags_aws_overwrites() {
+        let mut payload = payload_with(ExportedSecrets {
+            aws_connection_keys: BTreeMap::from([("k1".to_string(), "{}".to_string())]),
+            ..Default::default()
+        });
+        payload.settings.hosts = vec![
+            aws_host("k1", "Keys", true),
+            aws_host("same", "Same", false),
+            aws_host("changed", "New name", false),
+            aws_host("fresh", "Fresh", false),
+        ];
+        let local = vec![aws_host("same", "Same", false), aws_host("changed", "Old name", false)];
+        let preview =
+            SettingsImportPreview::from_payload_against(&payload, &local, |id| id == "k1");
+        let flags: Vec<_> = preview
+            .aws_connections
+            .iter()
+            .map(|c| (c.overwrites_existing, c.overwrites_keys))
+            .collect();
+        assert_eq!(flags, vec![(false, true), (false, false), (true, false), (false, false)]);
     }
 }

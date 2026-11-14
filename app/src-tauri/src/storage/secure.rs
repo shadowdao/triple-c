@@ -474,6 +474,14 @@ pub fn get_aws_keys(connection_id: &str) -> Result<Option<AwsKeys>, String> {
         .map_err(|_| "The stored AWS access keys are unreadable".to_string())
 }
 
+/// Whether any entry exists for the connection, readable or not. Never
+/// returns or logs a value.
+pub fn aws_keys_entry_exists(connection_id: &str) -> bool {
+    aws_connection_service(connection_id)
+        .and_then(|svc| read_entry(&svc, "the AWS access keys"))
+        .is_ok_and(|v| v.is_some())
+}
+
 /// Missing entry is success. Unused until connection removal lands.
 #[allow(dead_code)]
 pub fn delete_aws_keys(connection_id: &str) -> Result<(), String> {

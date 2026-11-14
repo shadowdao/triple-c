@@ -425,6 +425,21 @@ export interface SettingsImportPreview {
   global_plugin_install_count: number;
   /** Marketplace account tokens the import restores to the keychain. */
   marketplace_account_token_count: number;
+  /** AWS connections the import brings (names cleaned; no key values). */
+  aws_connections: AwsConnectionPreview[];
+  /** AWS access-key entries the import restores to the keychain. */
+  aws_connection_key_count: number;
+}
+
+export interface AwsConnectionPreview {
+  name: string;
+  auth: "profile" | "keys";
+  profile_name: string | null;
+  default_region: string;
+  /** A connection with this id exists here with different content. */
+  overwrites_existing: boolean;
+  /** The import carries keys for an id that already has keys stored here. */
+  overwrites_keys: boolean;
 }
 
 /** What `apply_settings_import` returns: the settings that were actually

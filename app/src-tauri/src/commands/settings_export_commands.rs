@@ -363,7 +363,8 @@ pub async fn preview_settings_import(
 
     let encrypted = std::fs::read(&path).map_err(|e| format!("Failed to read export file: {}", e))?;
     let payload = read_and_decrypt_bytes(&encrypted, &password)?;
-    let preview = SettingsImportPreview::from_payload(&payload);
+    let local_hosts = state.settings_store.get().hosts;
+    let preview = SettingsImportPreview::from_payload_against(&payload, &local_hosts, secure::aws_keys_entry_exists);
 
     *state.pending_settings_import.lock().await = Some(PendingSettingsImport {
         path,
