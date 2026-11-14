@@ -26,6 +26,7 @@ function preview(overrides: Partial<SettingsImportPreview> = {}): SettingsImport
     marketplace_account_token_count: 0,
     aws_connections: [],
     aws_connection_key_count: 0,
+    removed_aws_connections: [],
     ...overrides,
   };
 }

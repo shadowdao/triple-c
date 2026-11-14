@@ -474,12 +474,19 @@ pub fn get_aws_keys(connection_id: &str) -> Result<Option<AwsKeys>, String> {
         .map_err(|_| "The stored AWS access keys are unreadable".to_string())
 }
 
-/// Whether any entry exists for the connection, readable or not. Never
-/// returns or logs a value.
-pub fn aws_keys_entry_exists(connection_id: &str) -> bool {
-    aws_connection_service(connection_id)
-        .and_then(|svc| read_entry(&svc, "the AWS access keys"))
-        .is_ok_and(|v| v.is_some())
+/// Whether an entry exists for the connection, readable or not. `None` means
+/// the keychain could not be asked, so callers must not read it as "absent".
+/// Never returns or logs a value.
+pub fn aws_keys_entry_state(connection_id: &str) -> Option<bool> {
+    let svc = aws_connection_service(connection_id).ok()?;
+    let entry = keyring::Entry::new(&svc, KEYCHAIN_ACCOUNT).ok()?;
+    match entry.get_password() {
+        Ok(_) => Some(true),
+        Err(keyring::Error::NoEntry) => Some(false),
+        // Present but not a plain string, etc.: something is there.
+        Err(keyring::Error::BadEncoding(_)) => Some(true),
+        Err(_) => None,
+    }
 }
 
 /// Missing entry is success. Unused until connection removal lands.

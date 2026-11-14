@@ -38,6 +38,7 @@ const samplePreview: SettingsImportPreview = {
   marketplace_account_token_count: 0,
   aws_connections: [],
   aws_connection_key_count: 0,
+  removed_aws_connections: [],
 };
 
 function outcome(settings: AppSettings, secretRestoreWarnings: string[] = []): SettingsImportOutcome {
@@ -93,6 +94,8 @@ describe("ImportSettingsModal", () => {
           default_region: "us-west-2",
           overwrites_existing: true,
           overwrites_keys: true,
+          keys_check_failed: false,
+          local: { name: "Real Prod", auth: "keys", profile_name: null, default_region: "us-east-1" },
         },
         {
           name: "Dev",
@@ -101,9 +104,14 @@ describe("ImportSettingsModal", () => {
           default_region: "eu-west-1",
           overwrites_existing: false,
           overwrites_keys: false,
+          keys_check_failed: true,
+          local: null,
         },
       ],
       aws_connection_key_count: 1,
+      removed_aws_connections: [
+        { name: "Old", auth: "profile", profile_name: "old-p", default_region: "ap-south-1" },
+      ],
     });
     render(<ImportSettingsModal onClose={vi.fn()} onImported={vi.fn()} />);
 
@@ -113,8 +121,10 @@ describe("ImportSettingsModal", () => {
     expect(await screen.findByText(/AWS connection "Prod" \(access keys, us-west-2\)/)).toBeInTheDocument();
     expect(screen.getByText(/AWS connection "Dev" \(profile dev-profile, eu-west-1\)/)).toBeInTheDocument();
     expect(screen.getByText(/1 AWS access key set$/)).toBeInTheDocument();
-    expect(screen.getByText(/Overwrites the AWS access keys stored for "Prod"/)).toBeInTheDocument();
-    expect(screen.getByText(/Replaces your existing AWS connection.*"Prod"/)).toBeInTheDocument();
+    expect(screen.getByText(/Overwrites the AWS access keys stored for your connection "Real Prod"/)).toBeInTheDocument();
+    expect(screen.getByText(/Replaces your connection "Real Prod" \(access keys, us-east-1\) with "Prod"/)).toBeInTheDocument();
+    expect(screen.getByText(/Could not check whether keys are stored for "Dev".*may overwrite them/)).toBeInTheDocument();
+    expect(screen.getByText(/Removes your AWS connection "Old" \(profile old-p, ap-south-1\)/)).toBeInTheDocument();
   });
 
   it("warns about a custom Docker image every time, not just on change", async () => {

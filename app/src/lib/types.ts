@@ -429,6 +429,15 @@ export interface SettingsImportPreview {
   aws_connections: AwsConnectionPreview[];
   /** AWS access-key entries the import restores to the keychain. */
   aws_connection_key_count: number;
+  /** Local AWS connections the import drops (it replaces the whole list). */
+  removed_aws_connections: AwsConnectionSummary[];
+}
+
+export interface AwsConnectionSummary {
+  name: string;
+  auth: "profile" | "keys";
+  profile_name: string | null;
+  default_region: string;
 }
 
 export interface AwsConnectionPreview {
@@ -440,6 +449,10 @@ export interface AwsConnectionPreview {
   overwrites_existing: boolean;
   /** The import carries keys for an id that already has keys stored here. */
   overwrites_keys: boolean;
+  /** The keychain could not be asked whether keys are already stored. */
+  keys_check_failed: boolean;
+  /** The local connection with this id, when the import replaces it. */
+  local: AwsConnectionSummary | null;
 }
 
 /** What `apply_settings_import` returns: the settings that were actually
