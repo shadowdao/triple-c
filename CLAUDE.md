@@ -287,6 +287,11 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   `docs/superpowers/specs/2026-11-13-triple-c-agent-protocol.md`; AWS planned —
   `docs/superpowers/specs/2026-11-13-aws-ecs-host-design.md`)
   wraps execs, file transfer and `is_running`; `sessions.rs` holds `ExecSessionManager`.
+  `ssm.rs` is the AWS transport to an `Agent` target: one SSM port-forward per task, run through
+  AWS's `session-manager-plugin` as a child process and reopened **on the same loopback port**
+  when it drops, so an `AgentEndpoint` stays valid. The `StartSession` token goes to the plugin
+  through its environment, never argv, and the plugin's environment is stripped of every
+  inherited `AWS_*` variable before the session's own credentials are added.
   `agent.rs` reuses `docker/exec.rs`'s `OneshotOutput`, host-file reader and uid probe so the two
   variants cannot drift; an `Agent` target's token never appears in `Debug` or error text.
   **Container-interior code must go through `ContainerTarget`, never `docker::exec`, bollard or

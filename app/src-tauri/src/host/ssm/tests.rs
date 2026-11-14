@@ -62,10 +62,18 @@ mod with_a_fake_plugin {
         p
     }
 
-    fn launch(program: PathBuf, secret: &str) -> PluginLaunch {
+    /// Runs the script as `/bin/sh <script>`: the script is only ever read,
+    /// never exec'd, so a parallel test's fork holding it open for writing
+    /// for a moment cannot fail the spawn with ETXTBSY ("Text file busy").
+    fn launch(script: PathBuf, secret: &str) -> PluginLaunch {
         PluginLaunch {
-            program,
-            args: vec![RESPONSE_ENV.into(), "us-west-2".into(), "StartSession".into()],
+            program: "/bin/sh".into(),
+            args: vec![
+                script.display().to_string(),
+                RESPONSE_ENV.into(),
+                "us-west-2".into(),
+                "StartSession".into(),
+            ],
             env: vec![(RESPONSE_ENV.into(), Zeroizing::new(secret.into()))],
             session_id: "s-1".into(),
         }
@@ -288,4 +296,61 @@ mod with_a_fake_plugin {
         pf.close().await;
         assert_eq!(*state.borrow_and_update(), TunnelState::Closed);
     }
+}
+
+/// A cancelled open (its future dropped after `StartSession` succeeded) must
+/// still end the session: the guard's drop sends `TerminateSession`. Checked
+/// against a fake SSM endpoint that records what it is asked.
+#[tokio::test]
+async fn a_dropped_open_still_ends_its_session() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let tx = seen_tx.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 64 * 1024];
+                let mut req = Vec::new();
+                // Headers and the small JSON body arrive together here.
+                while let Ok(n) = sock.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    req.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&req);
+                    if text.contains("SessionId") {
+                        break;
+                    }
+                }
+                let _ = tx.send(String::from_utf8_lossy(&req).into_owned());
+                let body = r#"{"SessionId":"s-dropped"}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/x-amz-json-1.1\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+
+    let conf = aws_sdk_ssm::Config::builder()
+        .behavior_version(aws_sdk_ssm::config::BehaviorVersion::latest())
+        .region(aws_sdk_ssm::config::Region::new("us-west-2"))
+        .credentials_provider(aws_sdk_ssm::config::Credentials::new("AKIDTEST", "secret", None, None, "test"))
+        .endpoint_url(format!("http://127.0.0.1:{port}"))
+        .build();
+    let guard = SessionGuard {
+        ssm: aws_sdk_ssm::Client::from_conf(conf),
+        session_id: Some("s-dropped".into()),
+    };
+    drop(guard);
+    let req = tokio::time::timeout(Duration::from_secs(10), seen_rx.recv())
+        .await
+        .expect("no TerminateSession arrived")
+        .unwrap();
+    assert!(req.contains("AmazonSSM.TerminateSession"), "{req}");
+    assert!(req.contains("s-dropped"), "{req}");
 }

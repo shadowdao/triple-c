@@ -28,6 +28,10 @@
 //!   credentials on the **same local port**, so an [`AgentEndpoint`] built
 //!   once stays valid across reconnects (open connections do not survive that
 //!   path; new ones succeed).
+//! - **Whoever holds a [`PortForward`] must `close()` it when the app exits.**
+//!   Tauri exits through `std::process::exit`, which drops no runtime tasks,
+//!   so `kill_on_drop` never fires and the plugin would keep the session and
+//!   the port until SSM's idle timeout.
 //! - **The plugin listens on `127.0.0.1` only** (checked: plugin 1.2.896), and
 //!   the agent behind it still wants its bearer token. The SSM session's IAM
 //!   check is the outer gate.
@@ -380,6 +384,11 @@ trait SessionOpener: Send + Sync + 'static {
 
 struct SsmOpener {
     sdk: SdkConfig,
+    /// The credentials last handed to the plugin, reused until they near
+    /// expiry. Each fetch from the provider can be a `credential_process`
+    /// (an MFA or biometric prompt), an STS call or an SSO call, and the
+    /// provider in `SdkConfig` is not the SDK's cached one.
+    plugin_creds: tokio::sync::Mutex<Option<aws_sdk_ssm::config::Credentials>>,
     ssm: aws_sdk_ssm::Client,
     region: String,
     plugin: PathBuf,
@@ -400,6 +409,13 @@ impl SessionOpener for SsmOpener {
             .await
             .map_err(|e| format!("Could not start the SSM session: {}", sdk_error(&e)))?;
         let session_id = out.session_id().unwrap_or_default().to_string();
+        // From here the session exists on AWS's side. If this future is
+        // dropped before it returns — a close or drop racing a reconnect, a
+        // caller timing out the first open — the guard ends the session.
+        let guard = SessionGuard {
+            ssm: self.ssm.clone(),
+            session_id: Some(session_id.clone()),
+        };
         let response = Zeroizing::new(
             serde_json::json!({
                 "SessionId": session_id,
@@ -422,7 +438,7 @@ impl SessionOpener for SsmOpener {
             (RESPONSE_ENV.to_string(), response),
             ("AWS_REGION".to_string(), Zeroizing::new(self.region.clone())),
         ];
-        env.extend(plugin_credentials(&self.sdk).await);
+        env.extend(self.plugin_credentials().await);
 
         let launch = PluginLaunch {
             program: self.plugin.clone(),
@@ -440,55 +456,107 @@ impl SessionOpener for SsmOpener {
             session_id: session_id.clone(),
         };
         match spawn_plugin(launch).await {
-            Ok(r) => Ok(r),
+            Ok(r) => {
+                guard.disarm();
+                Ok(r)
+            }
             Err(e) => {
-                // The session exists on AWS's side even though no plugin is
-                // attached to it; don't leave it for the idle timeout.
-                self.terminate(session_id).await;
+                // No plugin is attached to the session; don't leave it open
+                // until the idle timeout.
+                guard.terminate().await;
                 Err(e)
             }
         }
     }
 
     async fn terminate(&self, session_id: String) {
-        if session_id.is_empty() {
-            return;
-        }
-        let call = self.ssm.terminate_session().session_id(&session_id).send();
-        match tokio::time::timeout(TERMINATE_TIMEOUT, call).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => log::warn!("TerminateSession {session_id}: {}", sdk_error(&e)),
-            Err(_) => log::warn!("TerminateSession {session_id}: timed out"),
+        terminate_session(&self.ssm, session_id).await
+    }
+}
+
+async fn terminate_session(ssm: &aws_sdk_ssm::Client, session_id: String) {
+    if session_id.is_empty() {
+        return;
+    }
+    let call = ssm.terminate_session().session_id(&session_id).send();
+    match tokio::time::timeout(TERMINATE_TIMEOUT, call).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => log::warn!("TerminateSession {session_id}: {}", sdk_error(&e)),
+        Err(_) => log::warn!("TerminateSession {session_id}: timed out"),
+    }
+}
+
+/// Ends a started session unless disarmed: on an error path explicitly, and
+/// on drop (a cancelled open) from a spawned task.
+struct SessionGuard {
+    ssm: aws_sdk_ssm::Client,
+    session_id: Option<String>,
+}
+
+impl SessionGuard {
+    fn disarm(mut self) {
+        self.session_id = None;
+    }
+
+    async fn terminate(mut self) {
+        if let Some(id) = self.session_id.take() {
+            terminate_session(&self.ssm, id).await;
         }
     }
 }
 
-/// The caller's current credentials as the plugin's environment, for its own
-/// `ResumeSession` calls. Without them a resume fails and the supervisor's
-/// full reconnect takes over, so a failure here is not fatal.
-async fn plugin_credentials(sdk: &SdkConfig) -> Vec<(String, Zeroizing<String>)> {
-    use aws_sdk_ssm::config::ProvideCredentials;
-    let Some(provider) = sdk.credentials_provider() else {
-        return vec![];
-    };
-    match provider.provide_credentials().await {
-        Ok(c) => {
-            let mut v = vec![
-                ("AWS_ACCESS_KEY_ID".to_string(), Zeroizing::new(c.access_key_id().to_string())),
-                (
-                    "AWS_SECRET_ACCESS_KEY".to_string(),
-                    Zeroizing::new(c.secret_access_key().to_string()),
-                ),
-            ];
-            if let Some(t) = c.session_token() {
-                v.push(("AWS_SESSION_TOKEN".to_string(), Zeroizing::new(t.to_string())));
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        if let Some(id) = self.session_id.take() {
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                let ssm = self.ssm.clone();
+                rt.spawn(async move { terminate_session(&ssm, id).await });
             }
-            v
         }
-        Err(e) => {
-            log::warn!("No credentials for the SSM plugin's resume: {}", sdk_error(&e));
-            vec![]
+    }
+}
+
+/// How long before expiry cached plugin credentials are refreshed. A plugin
+/// started with them may need them for a resume well after it starts.
+const PLUGIN_CREDS_MIN_REMAINING: Duration = Duration::from_secs(15 * 60);
+
+impl SsmOpener {
+    /// The caller's credentials as the plugin's environment, for its own
+    /// `ResumeSession` calls. Without them a resume fails and the
+    /// supervisor's full reconnect takes over, so a failure here is not fatal.
+    async fn plugin_credentials(&self) -> Vec<(String, Zeroizing<String>)> {
+        use aws_sdk_ssm::config::ProvideCredentials;
+        let mut cached = self.plugin_creds.lock().await;
+        let fresh = |c: &aws_sdk_ssm::config::Credentials| match c.expiry() {
+            None => true,
+            Some(exp) => exp
+                .duration_since(std::time::SystemTime::now())
+                .map(|left| left > PLUGIN_CREDS_MIN_REMAINING)
+                .unwrap_or(false),
+        };
+        if !cached.as_ref().is_some_and(fresh) {
+            *cached = None;
+            if let Some(provider) = self.sdk.credentials_provider() {
+                match provider.provide_credentials().await {
+                    Ok(c) => *cached = Some(c),
+                    Err(e) => log::warn!("No credentials for the SSM plugin's resume: {}", sdk_error(&e)),
+                }
+            }
         }
+        let Some(c) = cached.as_ref() else {
+            return vec![];
+        };
+        let mut v = vec![
+            ("AWS_ACCESS_KEY_ID".to_string(), Zeroizing::new(c.access_key_id().to_string())),
+            (
+                "AWS_SECRET_ACCESS_KEY".to_string(),
+                Zeroizing::new(c.secret_access_key().to_string()),
+            ),
+        ];
+        if let Some(t) = c.session_token() {
+            v.push(("AWS_SESSION_TOKEN".to_string(), Zeroizing::new(t.to_string())));
+        }
+        v
     }
 }
 
@@ -555,6 +623,7 @@ impl PortForward {
             .to_string();
         let opener = SsmOpener {
             sdk: sdk.clone(),
+            plugin_creds: Default::default(),
             ssm: aws_sdk_ssm::Client::new(sdk),
             region,
             plugin: find_plugin()?,
