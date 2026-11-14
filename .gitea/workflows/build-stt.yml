@@ -41,6 +41,7 @@ jobs:
         env:
           EVENT: ${{ gitea.event_name }}
           RELEASE_TAG: ${{ gitea.event.inputs.release_tag }}
+          REF: ${{ gitea.ref }}
         run: |
           set -euo pipefail
           case "$EVENT" in
@@ -49,12 +50,24 @@ jobs:
               ;;
             schedule|workflow_dispatch)
               CHANNEL=latest
+              # `:latest` reaches every user, so it only comes from main: a
+              # dispatch from another branch, or a tag cut on one, is refused.
+              # An older release tag is allowed on purpose — that is a rollback.
+              if [ "$REF" != "refs/heads/main" ]; then
+                echo "Refusing to publish :latest from $REF (only main)" >&2
+                exit 1
+              fi
               git fetch --tags --force
+              git fetch origin main
               if [ -z "${RELEASE_TAG:-}" ]; then
                 RELEASE_TAG=$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
               fi
               if ! echo "$RELEASE_TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
                 echo "Not a release tag: '$RELEASE_TAG'" >&2
+                exit 1
+              fi
+              if ! git merge-base --is-ancestor "refs/tags/$RELEASE_TAG" FETCH_HEAD; then
+                echo "$RELEASE_TAG is not on main; refusing to publish it as :latest" >&2
                 exit 1
               fi
               git checkout --detach "refs/tags/$RELEASE_TAG"
