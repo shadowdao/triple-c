@@ -55,6 +55,13 @@ similar = "2"
 # Marketplace repos are fetched on the host into a bare cache (spec §3).
 # Blocking client + rustls: no git binary or OpenSSL needed on the host.
 gix = { version = "0.88", default-features = false, features = ["blocking-network-client", "blocking-http-transport-reqwest-rust-tls", "credentials", "sha1"] }
+# AWS host (docs/superpowers/specs/2026-11-13-aws-ecs-host-design.md). The
+# service crates' default `rustls` feature is the *legacy* hyper 0.14 /
+# rustls 0.21 client, a second TLS stack next to the one reqwest already
+# brings; `default-https-client` is the current one, so defaults are off.
+aws-config = { version = "1.13.2", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso", "behavior-version-latest"] }
+aws-sdk-ssm = { version = "1.137.0", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
+aws-sdk-ecs = { version = "1.159.0", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
 
 # Linux only: WebKitGTK refuses getUserMedia until the embedder enables media
 # streams and answers the permission request (see src/linux_media.rs). Same

@@ -99,8 +99,15 @@ remap_uid_gid() {
 
 remap_uid_gid
 
-# Fix ownership of home directory after UID/GID change
-chown -R claude:claude /home/claude
+# Fix ownership of home directory after UID/GID change — only where it is
+# wrong. A blanket `chown -R` rewrites every inode, and where /home/claude is
+# the image's own copy rather than a volume (an ECS/Fargate task) that copies
+# the whole directory up into the writable layer: measured at ~5 minutes on
+# 1 vCPU before the agent could start. `find` only stats. `-h` and find's
+# default no-follow match `chown -R`'s physical walk (it changes a symlink
+# itself, never its target), and like `chown -R` this crosses into the nested
+# ~/.claude volume.
+find /home/claude \( ! -user claude -o ! -group claude \) -exec chown -h claude:claude {} +
 
 # ── Corporate CA certificates ───────────────────────────────────────────────
 # The host's CA material is bind-mounted read-only at /tmp/.host-ca. Triple-C
