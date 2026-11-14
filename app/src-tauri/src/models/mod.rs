@@ -1,6 +1,7 @@
 pub mod app_settings;
 pub mod container_config;
 pub mod gateway_settings;
+pub mod host_connection;
 pub mod marketplace;
 pub mod migration;
 pub mod note;
@@ -11,6 +12,7 @@ pub mod update_info;
 pub use app_settings::*;
 pub use container_config::*;
 pub use gateway_settings::*;
+pub use host_connection::*;
 pub use migration::*;
 pub use note::*;
 pub use project::*;

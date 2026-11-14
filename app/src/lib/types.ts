@@ -300,6 +300,7 @@ export interface AppSettings {
   terminal_gpu_rendering: boolean | null;
   marketplace_accounts: MarketplaceAccount[];
   marketplaces: Marketplace[];
+  hosts: HostConnection[];
   global_marketplace_installs: MarketplaceInstall[];
 }
 
@@ -1098,4 +1099,14 @@ export interface ViewerPoll {
   exists: boolean;
   hash: string | null;
   size: number | null;
+}
+
+export type AwsAuth =
+  | { method: "profile"; name: string }
+  | { method: "keys"; keyring_ref: string };
+
+export interface HostConnection {
+  id: string;
+  name: string;
+  kind: { type: "aws"; auth: AwsAuth; default_region: string };
 }

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::gateway_settings::GatewaySettings;
+use super::host_connection::HostConnection;
 use super::marketplace::{Marketplace, MarketplaceAccount, MarketplaceInstall};
 use super::project::{ClaudeCodeSettings, EnvVar};
 
@@ -143,6 +144,9 @@ pub struct AppSettings {
     /// Marketplace git repos the user added.
     #[serde(default)]
     pub marketplaces: Vec<Marketplace>,
+    /// Remote host connections (AWS). Secrets live in the OS keychain, never here.
+    #[serde(default)]
+    pub hosts: Vec<HostConnection>,
     /// Items installed for every project (projects may opt out per item).
     #[serde(default)]
     pub global_marketplace_installs: Vec<MarketplaceInstall>,
@@ -259,6 +263,7 @@ impl Default for AppSettings {
             global_claude_code_settings: None,
             marketplace_accounts: Vec::new(),
             marketplaces: Vec::new(),
+            hosts: Vec::new(),
             global_marketplace_installs: Vec::new(),
             terminal_gpu_rendering: None,
         }
