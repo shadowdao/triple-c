@@ -22,7 +22,13 @@ env:
   # libraries" prompt and hangs the job until it times out. `sudo` resets the
   # environment, so the apt-get calls below also pass these via `sudo env`;
   # here they reach the NodeSource setup script through `sudo -E`.
-  NEEDRESTART_MODE: a
+  #
+  # SUSPEND skips needrestart entirely. Mode `a` (restart automatically) is not
+  # safe: on a host-mode runner it restarted act-runner.service mid-job and
+  # killed the job. Mode `l` (list only) is a fallback for a needrestart that
+  # ignores SUSPEND; it never prompts and never restarts anything.
+  NEEDRESTART_SUSPEND: "1"
+  NEEDRESTART_MODE: l
   DEBIAN_FRONTEND: noninteractive
   GITEA_URL: ${{ gitea.server_url }}
   REPO: ${{ gitea.repository }}
@@ -125,7 +131,7 @@ jobs:
           fi
           if [ "$NEED_INSTALL" = true ]; then
             curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
-            sudo env NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs
+            sudo env NEEDRESTART_SUSPEND=1 NEEDRESTART_MODE=l DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs
             hash -r
           fi
           echo "Node.js at: $(which node)"
@@ -147,8 +153,8 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          sudo env NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get update
-          sudo env NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get install -y \
+          sudo env NEEDRESTART_SUSPEND=1 NEEDRESTART_MODE=l DEBIAN_FRONTEND=noninteractive apt-get update
+          sudo env NEEDRESTART_SUSPEND=1 NEEDRESTART_MODE=l DEBIAN_FRONTEND=noninteractive apt-get install -y \
             libgtk-3-dev \
             libwebkit2gtk-4.1-dev \
             gstreamer1.0-plugins-base \
