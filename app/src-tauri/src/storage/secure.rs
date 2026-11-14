@@ -384,10 +384,7 @@ const MARKETPLACE_TOKEN_SERVICE_PREFIX: &str = "triple-c-marketplace-account-";
 /// The service name for one account. Ids are uuids; anything else is refused
 /// before a keychain entry is constructed.
 fn marketplace_token_service(account_id: &str) -> Result<String, String> {
-    let ok = !account_id.is_empty()
-        && account_id.len() <= 64
-        && account_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
-    if !ok {
+    if !is_valid_connection_id(account_id) {
         return Err(format!("Invalid marketplace account id {:?}", account_id));
     }
     Ok(format!("{}{}", MARKETPLACE_TOKEN_SERVICE_PREFIX, account_id))
@@ -440,7 +437,9 @@ impl std::fmt::Debug for AwsKeys {
 }
 
 /// Whether `id` may be used as a connection id / keyring reference: 1..=64 of
-/// `[A-Za-z0-9-]`. The same rule as marketplace account ids.
+/// `[A-Za-z0-9-]`. The single definition of the keychain-id rule: marketplace
+/// account ids, AWS connection ids and `commands::marketplace_commands`'s
+/// `validate_id` all go through it.
 pub fn is_valid_connection_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
