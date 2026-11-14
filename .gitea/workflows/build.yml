@@ -13,9 +13,15 @@ on:
       - ".gitea/workflows/build.yml"
   # Weekly rebuild with no commit needed, so OS security fixes published since
   # the last push reach the image (see APT_REFRESH in container/Dockerfile).
-  # Scheduled runs use the default branch, i.e. main.
+  # It rebuilds the newest *release*, not main, because it moves `:latest`.
   schedule:
     - cron: "17 4 * * 1"
+  # Dispatched by build-app.yml when a release is cut, with the release's tag.
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to build as :latest (default: the newest vX.Y.Z)"
+        required: false
 
 env:
   REGISTRY: repo.anhonesthost.net
@@ -27,6 +33,65 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # **`:latest` is what installed apps pull, so only a release moves it.**
+      # A push to main publishes `:edge` and `:<sha>` (for testing a merged
+      # image by hand); a pull request publishes nothing. The weekly rebuild
+      # and a release dispatch build a release tag and publish it as `:latest`
+      # — the tag, not main, so unreleased container changes never reach users.
+      - name: Pick the source and the tags to publish
+        id: src
+        env:
+          EVENT: ${{ gitea.event_name }}
+          RELEASE_TAG: ${{ gitea.event.inputs.release_tag }}
+          REF: ${{ gitea.ref }}
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            push|pull_request)
+              CHANNEL=edge
+              ;;
+            schedule|workflow_dispatch)
+              CHANNEL=latest
+              # `:latest` reaches every user, so it only comes from main: a
+              # dispatch from another branch, or a tag cut on one, is refused.
+              # An older release tag is allowed on purpose — that is a rollback.
+              if [ "$REF" != "refs/heads/main" ]; then
+                echo "Refusing to publish :latest from $REF (only main)" >&2
+                exit 1
+              fi
+              git fetch --tags --force
+              git fetch origin main
+              if [ -z "${RELEASE_TAG:-}" ]; then
+                RELEASE_TAG=$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+              fi
+              if ! echo "$RELEASE_TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+                echo "Not a release tag: '$RELEASE_TAG'" >&2
+                exit 1
+              fi
+              if ! git merge-base --is-ancestor "refs/tags/$RELEASE_TAG" FETCH_HEAD; then
+                echo "$RELEASE_TAG is not on main; refusing to publish it as :latest" >&2
+                exit 1
+              fi
+              git checkout --detach "refs/tags/$RELEASE_TAG"
+              echo "Building release $RELEASE_TAG"
+              ;;
+            *)
+              echo "Unexpected event $EVENT" >&2
+              exit 1
+              ;;
+          esac
+          SHA=$(git rev-parse HEAD)
+          {
+            echo "tags<<EOF"
+            echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$CHANNEL"
+            echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$SHA"
+            echo "ghcr.io/shadowdao/triple-c-sandbox:$CHANNEL"
+            echo "ghcr.io/shadowdao/triple-c-sandbox:$SHA"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -81,16 +146,12 @@ jobs:
           context: ./container
           file: ./container/Dockerfile
           platforms: linux/amd64,linux/arm64
-          # Publish from main pushes and the weekly scheduled rebuild (which
-          # runs on main); a pull_request run only validates.
+          # A pull_request run only validates; see the tag step for what each
+          # other event publishes.
           push: ${{ gitea.event_name != 'pull_request' }}
           build-args: |
             APT_REFRESH=${{ steps.apt.outputs.stamp }}
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ gitea.sha }}
-            ghcr.io/shadowdao/triple-c-sandbox:latest
-            ghcr.io/shadowdao/triple-c-sandbox:${{ gitea.sha }}
+          tags: ${{ steps.src.outputs.tags }}
           # `ignore-error` is what stops a cache failure failing a build that
           # already succeeded. act_runner emulates the GitHub Actions cache
           # service on the runner host's LAN address, and the `docker-container`
