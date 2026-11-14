@@ -442,6 +442,29 @@ way.
   entrypoint. It doesn't depend on the app being open. Because a running scheduler job counts as
   activity, scheduled tasks keep a workspace alive. The admin's maximum lifetime is a hard cap
   either way.
+- **Health:** the task definition carries an ECS container health check against the agent, run
+  inside the container with the token from its tmpfs file, so the token never leaves the task:
+  `curl -sf --max-time 3 -H "Authorization: Bearer $(cat /dev/shm/triple-c/agent-token)"
+  http://127.0.0.1:47900/v1/health` (interval 30 s, retries 3, `startPeriod` 120 s). ECS reports it
+  as the container's and the task's `healthStatus` in `DescribeTasks`, so the same 15 s poll
+  shows *Starting* (`UNKNOWN`), *Ready* (`HEALTHY`) or *Unhealthy* (`UNHEALTHY`) with no
+  connection open. Measured 2026-11-14: `HEALTHY` 105 s after `RunTask`. The app still checks the
+  agent through its own tunnel before it calls a project connected.
+- **A workspace outlives the app.** Nothing about a task depends on the app or its tunnel:
+  - Quitting or crashing the app ends only the SSM session. Idle auto-stop and the admin's
+    lifetime cap are what stop the task.
+  - The next app (the same machine or another) resolves the task and opens a new tunnel.
+  - Measured 2026-11-14: a background job started through one tunnel kept writing every 5 s,
+    with no gap, after that tunnel's processes were killed with `-9`. A fresh tunnel found it
+    still running, and the agent still reported its exec as running.
+  - What does **not** survive is an attached exec. As with `docker exec`, the agent sends
+    SIGHUP to a tty's process group when its client disconnects. So a terminal tab's `claude`
+    ends with the app, and comes back through `claude --resume`, whose transcripts live on the
+    workspace's storage. Keeping live terminals across an app restart (a detached pty the agent
+    holds for re-attach) is a possible later feature, not v1.
+  - If the app dies without closing its tunnels, the plugin child can outlive it. Its session
+    then carries no keepalive (that lives in the app) and SSM ends it within its 20-minute idle
+    timeout. The host still closes every tunnel on a normal exit.
 - Logs: `awslogs` driver to the environment's log group, stream `<owner>/<project>/<task>`. The
   app shows start logs during startup and when a start fails.
 
@@ -571,9 +594,30 @@ aws/
 - ABAC condition keys for each action: ECS `RunTask` tag-on-create, `ExecuteCommand`, and
   `ssm:StartSession` against ECS targets; EFS `CreateAccessPoint` with request tags; Secrets
   Manager name-prefix plus tag conditions with `${aws:userid}` for SSO sessions.
-- That `session-manager-plugin` port forwarding to an ECS target is stable for hours-long
-  sessions, and how quickly it reconnects.
-- Fargate image-pull time for the sandbox image, and whether SOCI indexes help.
+- ~~That `session-manager-plugin` port forwarding to an ECS target is stable for hours-long
+  sessions, and how quickly it reconnects.~~ **Measured 2026-11-14** (phase 2b, us-west-2,
+  plugin 1.2.896, Fargate 1 vCPU / 2 GB, `host::ssm::live_tests`):
+  - Opening the port forward takes 0.6-0.7 s. A one-shot exec through it averages 35 ms, against
+    about 1 s for a fresh `execute-command`. A file moves at about 0.75 MB/s each way (4 MiB in
+    5.5 s), which is SSM's own throughput.
+  - When the plugin is killed, the supervisor reopens the session on the same local port in
+    about 0.55 s.
+  - **Session Manager's idle timeout applies to port forwards.** A tunnel with no traffic was cut
+    at 19.7 minutes ("timed out due to inactivity"), and every connection inside it went with it,
+    including a held-open attach (the test's stand-in for an idle terminal tab). The supervisor
+    reconnected at once and requests resumed, but open streams do not survive a reconnect. So an
+    Up tunnel sends an unauthenticated `GET /v1/health` every 5 minutes. The agent answers `401`
+    before it counts activity, so this doesn't defeat idle auto-stop. With it, a 44-minute hold
+    with 22 silent minutes had no reconnect at all, and the held-open attach survived to the end
+    (without it, the same attach died at the 20-minute cut).
+  - Over 60 minutes, no drop happened other than the idle timeout.
+- Fargate image-pull time for the sandbox image, and whether SOCI indexes help. **Measured
+  2026-11-14:** the 1.1 GB (compressed) amd64 image pulled from public GHCR in 55 s, and the task
+  reached RUNNING about 75 s after `RunTask`. **The entrypoint's `chown -R /home/claude` then took
+  about 5.5 minutes.** On ECS, `/home/claude` is the image's own copy (no volume), so it copied the
+  whole tree up, also costing about 2 GB of ephemeral storage. It now chowns only what isn't
+  already `claude`'s, and the agent answers 83 s after `RunTask`, 4 s after the container starts.
+  SOCI was not tried.
 - That GHCR pull-through cache works for the public image.
 - That the `SIGTERM` deadline on Fargate retirement and Spot leaves enough time for a WIP push.
 

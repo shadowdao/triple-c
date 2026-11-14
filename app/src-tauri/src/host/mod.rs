@@ -30,6 +30,10 @@
 pub mod agent;
 pub mod lifecycle;
 pub mod sessions;
+// Nothing in the app opens an SSM tunnel until the AWS host lands (phase 5 of
+// the AWS spec); its tests exercise it meanwhile. Remove this allow then.
+#[allow(dead_code)]
+pub mod ssm;
 pub mod watch;
 
 pub use crate::docker::exec::{
