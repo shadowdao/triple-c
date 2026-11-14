@@ -43,6 +43,7 @@ use zeroize::Zeroizing;
 
 use std::collections::BTreeMap;
 
+use crate::models::host_connection::{AwsAuth, HostConnection, HostKind};
 use crate::models::marketplace::{AccountMethod, MarketplaceAccount};
 use crate::models::{
     AppSettings, ExportedSecrets, SettingsExportPayload, SettingsImportOutcome,
@@ -138,6 +139,7 @@ fn split_settings_and_secrets(current: AppSettings) -> (AppSettings, ExportedSec
             &settings.marketplace_accounts,
             secure::get_marketplace_token,
         ),
+        aws_connection_keys: exported_aws_connection_keys(&settings.hosts, secure::get_aws_keys),
     };
 
     (settings, secrets)
@@ -182,6 +184,107 @@ fn restore_marketplace_tokens(
         }
     }
     warnings
+}
+
+/// The stored keys of every `Keys` host connection, by connection id, as the
+/// `AwsKeys` JSON. A `Profile` connection holds none. A missing or unreadable
+/// entry is left out, like the other keychain secrets above.
+fn exported_aws_connection_keys(
+    hosts: &[HostConnection],
+    get: impl Fn(&str) -> Result<Option<secure::AwsKeys>, String>,
+) -> BTreeMap<String, String> {
+    hosts
+        .iter()
+        .filter(|h| matches!(&h.kind, HostKind::Aws { auth: AwsAuth::Keys { .. }, .. }))
+        .filter_map(|h| {
+            let keys = get(&h.id).unwrap_or_default()?;
+            Some((h.id.clone(), serde_json::to_string(&keys).ok()?))
+        })
+        .collect()
+}
+
+/// Write each imported set of AWS keys to the keychain, returning a warning
+/// (naming the connection id, never the value) for each that could not be.
+fn restore_aws_connection_keys(
+    keys: &BTreeMap<String, String>,
+    mut store: impl FnMut(&str, &secure::AwsKeys) -> Result<(), String>,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (id, json) in keys {
+        if json.trim().is_empty() {
+            continue;
+        }
+        let Ok(parsed) = serde_json::from_str::<secure::AwsKeys>(json) else {
+            log::warn!("Settings import: the AWS keys of connection {} are malformed", id);
+            warnings.push(format!(
+                "The AWS access keys of connection {} in the file are malformed; enter them again.",
+                id
+            ));
+            continue;
+        };
+        if let Err(e) = store(id, &parsed) {
+            log::warn!(
+                "Settings import: could not restore the AWS keys of connection {}: {}",
+                id,
+                e
+            );
+            warnings.push(format!(
+                "Could not restore the AWS access keys of connection {} ({}); enter them again.",
+                id, e
+            ));
+        }
+    }
+    warnings
+}
+
+/// Checks the imported host connections with the rules the connection
+/// commands use, before anything is written; refuses the import (like
+/// `validate_imported_marketplace_state`) rather than applying a bad entry.
+/// A `Keys` connection's `keyring_ref` must be its own (valid) id, and keys
+/// may only be carried for a `Keys` connection in the file.
+fn validate_imported_hosts(
+    settings: &mut AppSettings,
+    keys: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    use crate::models::host_connection::{
+        validate_connection_name, validate_profile_name, validate_region,
+    };
+    let wrap = |e: String| format!("The file's host connections were refused: {e}");
+
+    let mut seen = std::collections::HashSet::new();
+    for h in &mut settings.hosts {
+        if !secure::is_valid_connection_id(&h.id) {
+            return Err(wrap("a connection has an invalid id.".into()));
+        }
+        if !seen.insert(h.id.clone()) {
+            return Err(wrap("a connection appears twice.".into()));
+        }
+        h.name = validate_connection_name(&h.name).map_err(wrap)?;
+        let HostKind::Aws { auth, default_region } = &h.kind;
+        validate_region(default_region).map_err(wrap)?;
+        match auth {
+            AwsAuth::Profile { name } => {
+                validate_profile_name(name).map_err(wrap)?;
+            }
+            AwsAuth::Keys { keyring_ref } => {
+                if !secure::is_valid_connection_id(keyring_ref) || *keyring_ref != h.id {
+                    return Err(wrap(format!(
+                        "the connection \"{}\" has an invalid key reference.",
+                        h.name
+                    )));
+                }
+            }
+        }
+    }
+    for id in keys.keys() {
+        let is_keys_connection = settings.hosts.iter().any(|h| {
+            h.id == *id && matches!(&h.kind, HostKind::Aws { auth: AwsAuth::Keys { .. }, .. })
+        });
+        if !is_keys_connection {
+            return Err(wrap("access keys are present for an unknown connection.".into()));
+        }
+    }
+    Ok(())
 }
 
 /// Export the current global settings and secrets to a password-encrypted
@@ -376,6 +479,9 @@ pub async fn apply_settings_import(
         &marketplace_tokens,
     )?;
 
+    let aws_keys = payload.secrets.aws_connection_keys;
+    validate_imported_hosts(&mut settings, &aws_keys)?;
+
     let mut secret_restore_warnings = Vec::new();
     let mut gateway_secret_changed = false;
 
@@ -421,6 +527,11 @@ pub async fn apply_settings_import(
     secret_restore_warnings.extend(restore_marketplace_tokens(
         &marketplace_tokens,
         secure::store_marketplace_token,
+    ));
+
+    secret_restore_warnings.extend(restore_aws_connection_keys(
+        &aws_keys,
+        secure::store_aws_keys,
     ));
 
     let imported_marketplace = (
@@ -826,5 +937,110 @@ mod tests {
         );
         assert_eq!(warnings.len(), 1);
         assert!(!warnings[0].contains("test-token-not-real"));
+    }
+
+    fn keys_host(id: &str) -> HostConnection {
+        HostConnection {
+            id: id.into(),
+            name: "Prod".into(),
+            kind: HostKind::Aws {
+                auth: AwsAuth::Keys { keyring_ref: id.into() },
+                default_region: "us-west-2".into(),
+            },
+        }
+    }
+
+    fn profile_host(id: &str) -> HostConnection {
+        HostConnection {
+            id: id.into(),
+            name: "Dev".into(),
+            kind: HostKind::Aws {
+                auth: AwsAuth::Profile { name: "default".into() },
+                default_region: "us-west-2".into(),
+            },
+        }
+    }
+
+    fn test_keys() -> secure::AwsKeys {
+        secure::AwsKeys {
+            access_key_id: "AKIATESTNOTREAL".into(),
+            secret_access_key: "test-secret-not-real".into(),
+            session_token: None,
+        }
+    }
+
+    #[test]
+    fn aws_connection_keys_round_trip_through_export() {
+        let hosts = vec![keys_host("k1"), profile_host("p1")];
+        let exported = exported_aws_connection_keys(&hosts, |id| match id {
+            "k1" => Ok(Some(test_keys())),
+            other => panic!("only a Keys connection is read, got {other}"),
+        });
+        assert_eq!(exported.keys().collect::<Vec<_>>(), vec!["k1"]);
+        assert_eq!(serde_json::from_str::<secure::AwsKeys>(&exported["k1"]).unwrap(), test_keys());
+
+        let mut stored = Vec::new();
+        let warnings = restore_aws_connection_keys(&exported, |id, keys| {
+            stored.push((id.to_string(), keys.clone()));
+            Ok(())
+        });
+        assert!(warnings.is_empty());
+        assert_eq!(stored, vec![("k1".to_string(), test_keys())]);
+    }
+
+    #[test]
+    fn aws_connection_keys_restore_failures_name_the_id_not_the_value() {
+        let keys = BTreeMap::from([
+            ("bad".to_string(), "not json test-secret-not-real".to_string()),
+            ("locked".to_string(), serde_json::to_string(&test_keys()).unwrap()),
+        ]);
+        let warnings = restore_aws_connection_keys(&keys, |_, _| Err("keychain locked".into()));
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[0].contains("bad"));
+        assert!(warnings[1].contains("locked"));
+        assert!(warnings.iter().all(|w| !w.contains("test-secret-not-real")));
+    }
+
+    #[test]
+    fn imported_hosts_are_validated() {
+        let check = |hosts: Vec<HostConnection>, keys: BTreeMap<String, String>| {
+            let mut s = AppSettings::default();
+            s.hosts = hosts;
+            validate_imported_hosts(&mut s, &keys)
+        };
+        let none = BTreeMap::new();
+        assert!(check(vec![keys_host("k1"), profile_host("p1")], none.clone()).is_ok());
+        assert!(check(vec![keys_host("k1")], BTreeMap::from([("k1".into(), "{}".into())])).is_ok());
+
+        let mut bad_name = profile_host("p1");
+        bad_name.name = "  ".into();
+        assert!(check(vec![bad_name], none.clone()).is_err());
+
+        let mut bad_region = profile_host("p1");
+        bad_region.kind = HostKind::Aws {
+            auth: AwsAuth::Profile { name: "default".into() },
+            default_region: "nowhere".into(),
+        };
+        assert!(check(vec![bad_region], none.clone()).is_err());
+
+        let mut bad_profile = profile_host("p1");
+        bad_profile.kind = HostKind::Aws {
+            auth: AwsAuth::Profile { name: "a b".into() },
+            default_region: "us-west-2".into(),
+        };
+        assert!(check(vec![bad_profile], none.clone()).is_err());
+
+        let mut other_ref = keys_host("k1");
+        other_ref.kind = HostKind::Aws {
+            auth: AwsAuth::Keys { keyring_ref: "someone-else".into() },
+            default_region: "us-west-2".into(),
+        };
+        assert!(check(vec![other_ref], none.clone()).is_err());
+
+        assert!(check(vec![profile_host("../x")], none.clone()).is_err());
+        assert!(check(vec![profile_host("p1"), profile_host("p1")], none.clone()).is_err());
+        // Keys carried for a connection that is not a Keys connection.
+        assert!(check(vec![profile_host("p1")], BTreeMap::from([("p1".into(), "{}".into())])).is_err());
+        assert!(check(vec![], BTreeMap::from([("ghost".into(), "{}".into())])).is_err());
     }
 }

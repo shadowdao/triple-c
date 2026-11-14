@@ -167,7 +167,12 @@ fn read_entry(service: &str, label: &str) -> Result<Option<String>, String> {
 fn delete_entry(service: &str, label: &str) -> Result<(), String> {
     let entry = keyring::Entry::new(service, KEYCHAIN_ACCOUNT)
         .map_err(|e| format!("Keyring error: {}", e))?;
-    match entry.delete_credential() {
+    delete_outcome(entry.delete_credential(), label)
+}
+
+/// "Wasn't there" is success; any other failure names the entry, not its value.
+fn delete_outcome(result: Result<(), keyring::Error>, label: &str) -> Result<(), String> {
+    match result {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(format!("Failed to delete {}: {}", label, e)),
     }
@@ -408,6 +413,74 @@ pub fn delete_marketplace_token(account_id: &str) -> Result<(), String> {
     delete_entry(&marketplace_token_service(account_id)?, "the marketplace account token")
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// AWS connection access keys (global, one entry per connection)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Keychain service prefix; the connection id completes it.
+const AWS_CONNECTION_SERVICE_PREFIX: &str = "triple-c-aws-connection-";
+
+/// Static AWS credentials for a `HostConnection` using `AwsAuth::Keys`. Held in
+/// the keychain as one JSON value. `Debug` redacts the secret and the token.
+#[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct AwsKeys {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub session_token: Option<String>,
+}
+
+impl std::fmt::Debug for AwsKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AwsKeys")
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"<redacted>")
+            .field("session_token", &self.session_token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// Whether `id` may be used as a connection id / keyring reference: 1..=64 of
+/// `[A-Za-z0-9-]`. The same rule as marketplace account ids.
+pub fn is_valid_connection_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+fn aws_connection_service(connection_id: &str) -> Result<String, String> {
+    if !is_valid_connection_id(connection_id) {
+        return Err(format!("Invalid AWS connection id {:?}", connection_id));
+    }
+    Ok(format!("{}{}", AWS_CONNECTION_SERVICE_PREFIX, connection_id))
+}
+
+pub fn store_aws_keys(connection_id: &str, keys: &AwsKeys) -> Result<(), String> {
+    let service = aws_connection_service(connection_id)?;
+    let json = serde_json::to_string(keys)
+        .map_err(|_| "Failed to encode the AWS access keys".to_string())?;
+    let entry = keyring::Entry::new(&service, KEYCHAIN_ACCOUNT)
+        .map_err(|e| format!("Keyring error: {}", e))?;
+    entry
+        .set_password(&json)
+        .map_err(|e| format!("Failed to store the AWS access keys: {}", e))
+}
+
+pub fn get_aws_keys(connection_id: &str) -> Result<Option<AwsKeys>, String> {
+    let Some(json) = read_entry(&aws_connection_service(connection_id)?, "the AWS access keys")?
+    else {
+        return Ok(None);
+    };
+    serde_json::from_str(&json)
+        .map(Some)
+        .map_err(|_| "The stored AWS access keys are unreadable".to_string())
+}
+
+/// Missing entry is success. Unused until connection removal lands.
+#[allow(dead_code)]
+pub fn delete_aws_keys(connection_id: &str) -> Result<(), String> {
+    delete_entry(&aws_connection_service(connection_id)?, "the AWS access keys")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,5 +568,40 @@ mod tests {
         assert_eq!(secret_to_store(Some("ghp_abc123")), Some("ghp_abc123"));
         // Pasted credentials routinely carry a trailing newline.
         assert_eq!(secret_to_store(Some("  ghp_abc123\n")), Some("ghp_abc123"));
+    }
+
+    #[test]
+    fn aws_keys_debug_redacts_secrets() {
+        let keys = AwsKeys {
+            access_key_id: "AKIATESTNOTREAL".into(),
+            secret_access_key: "test-secret-not-real".into(),
+            session_token: Some("test-session-token-not-real".into()),
+        };
+        let shown = format!("{:?}", keys);
+        assert!(!shown.contains("test-secret-not-real"), "{shown}");
+        assert!(!shown.contains("test-session-token-not-real"), "{shown}");
+    }
+
+    #[test]
+    fn aws_key_service_names_reject_bad_ids() {
+        for bad in ["../x", "", &"a".repeat(65)] {
+            assert!(aws_connection_service(bad).is_err(), "{bad:?}");
+            assert!(get_aws_keys(bad).is_err());
+            assert!(delete_aws_keys(bad).is_err());
+        }
+        assert_eq!(
+            aws_connection_service("0b9e6a2c-1111").unwrap(),
+            "triple-c-aws-connection-0b9e6a2c-1111"
+        );
+    }
+
+    /// There is no mock keyring here, so the "no entry is fine" rule is tested
+    /// as the pure mapping `delete_entry` applies.
+    #[test]
+    fn removing_a_keys_connection_with_no_keyring_entry_succeeds() {
+        assert_eq!(delete_outcome(Err(keyring::Error::NoEntry), "x"), Ok(()));
+        assert_eq!(delete_outcome(Ok(()), "x"), Ok(()));
+        let err = delete_outcome(Err(keyring::Error::NoStorageAccess("denied".into())), "x");
+        assert!(err.is_err());
     }
 }

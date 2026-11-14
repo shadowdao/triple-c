@@ -64,6 +64,11 @@ pub struct ExportedSecrets {
     /// here or an imported account could never fetch.
     #[serde(default)]
     pub marketplace_account_tokens: BTreeMap<String, String>,
+    /// Access keys of `AwsAuth::Keys` host connections, keyed by connection
+    /// id; each value is the `AwsKeys` JSON. Like the tokens above they live
+    /// in the keychain, not in `AppSettings::hosts`.
+    #[serde(default)]
+    pub aws_connection_keys: BTreeMap<String, String>,
 }
 
 impl ExportedSecrets {
@@ -74,6 +79,7 @@ impl ExportedSecrets {
             && blank(&self.gateway_master_key)
             && blank(&self.web_terminal_access_token)
             && self.marketplace_account_tokens.values().all(|v| v.trim().is_empty())
+            && self.aws_connection_keys.values().all(|v| v.trim().is_empty())
     }
 }
 
