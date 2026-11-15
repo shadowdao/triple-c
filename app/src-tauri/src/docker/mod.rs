@@ -2,6 +2,7 @@ pub mod ca_certs;
 pub mod client;
 pub mod events;
 pub mod container;
+pub mod workspace_env;
 pub mod image;
 pub mod exec;
 pub mod gateway;
