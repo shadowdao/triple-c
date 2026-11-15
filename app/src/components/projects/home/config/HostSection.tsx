@@ -58,6 +58,8 @@ export default function HostSection({ project, save, disabled }: Props) {
   const saveAws = (patch: Partial<AwsWorkspaceConfig>) => save({ aws: { ...aws, ...patch } });
 
   const hasResources = !!(aws.task_arn || aws.access_point_id || aws.task_definition_arn);
+  // A removal that kept the saved files keeps their access point stored.
+  const onlyAccessPoint = !!aws.access_point_id && !aws.task_arn && !aws.task_definition_arn;
   // Not `disabled` (which also allows Error): on AWS, Error can mean a live task.
   const stopped = project.status === "stopped";
 
@@ -343,7 +345,9 @@ export default function HostSection({ project, save, disabled }: Props) {
           unavailableReason={
             !stopped
               ? STILL_RUNNING
-              : "Remove the workspace's AWS resources first, so nothing is left running or billed."
+              : onlyAccessPoint
+                ? "The saved files' access point is still on AWS. Remove the AWS resources with \u201cAlso remove the workspace\u2019s file-system access point\u201d first."
+                : "Remove the workspace's AWS resources first, so nothing is left running or billed."
           }
           onClick={() => void save({ host_id: null, aws_placement: null, aws: null })}
         >
@@ -421,7 +425,9 @@ function RemoveAwsResourcesModal({ project, onClose }: { project: Project; onClo
             Also remove the workspace&rsquo;s file-system access point
             <span className="block text-xs text-[var(--text-secondary)]">
               The files stay on your own EFS file system (only your workspace role can read
-              them) until an administrator offboards you.
+              them) until an administrator offboards you. Left unchecked, the access point
+              stays too: the next start here reuses it, and the project can&rsquo;t move to
+              another host until it is removed.
             </span>
           </span>
         </label>

@@ -165,6 +165,21 @@ describe("HostSection", () => {
     await waitFor(() => expect(removeAwsResources).toHaveBeenCalledWith(p.id, true));
   });
 
+  it("keeps a project whose kept files' access point remains on AWS until it is removed", () => {
+    const p = awsProject();
+    p.aws = { ...p.aws!, access_point_id: "fsap-1", task_arn: null, task_definition_arn: null };
+    renderHost(p);
+    const move = screen.getByRole("button", { name: "Run on this machine instead" });
+    expect(move).toHaveAttribute("aria-disabled", "true");
+    expect(move).toHaveAccessibleDescription(/access point is still on AWS/);
+    expect(screen.getByRole("button", { name: "Remove AWS resources…" })).not.toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Remove AWS resources…" }));
+    expect(within(screen.getByRole("dialog")).getByText(/access point\s+stays too/)).toBeInTheDocument();
+  });
+
   it("keeps the AWS resource buttons locked while the project is in Error (its task may live)", () => {
     const p = awsProject({ status: "error" });
     p.aws = { ...p.aws!, task_arn: "arn:task" };

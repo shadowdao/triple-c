@@ -1230,8 +1230,10 @@ fn validate_aws_update(
         })
     {
         return Err(
-            "This project still has AWS resources (a task, its data's access point or task \
-             definitions) where it runs now; remove the workspace's AWS resources first"
+            "This project still has AWS resources (a task, its saved files' access point or task \
+             definitions) where it runs now; remove the workspace's AWS resources first — \
+             including the access point (\"Also remove the workspace's file-system access \
+             point\"), which stays when the saved files are kept"
                 .into(),
         );
     }
@@ -1691,11 +1693,24 @@ pub async fn remove_aws_resources(
     ProjectHost::for_project(&project)
         .remove_aws_resources(&project, &settings, discard_data)
         .await?;
-    state.projects_store.set_aws_runtime(&project_id, None, None, None)?;
+    state
+        .projects_store
+        .set_aws_runtime(&project_id, None, access_point_after_removal(&project, discard_data), None)?;
     state
         .projects_store
         .get(&project_id)
         .ok_or_else(|| format!("Project {} not found", project_id))
+}
+
+/// The access point a removal leaves stored: kept when the saved files were
+/// kept (it is still there, a later start reuses it and a later removal
+/// with `discard_data` deletes it; and while it is stored the project can't
+/// move away from it — [`validate_aws_update`]), gone when they were not.
+fn access_point_after_removal(project: &Project, discard_data: bool) -> Option<String> {
+    if discard_data {
+        return None;
+    }
+    project.aws.as_ref().and_then(|a| a.access_point_id.clone())
 }
 
 fn check_aws_resources_removable(project: &Project) -> Result<(), String> {
@@ -2669,6 +2684,30 @@ mod tests {
         assert!(validate_aws_update(&running, &moved, &hosts).is_err());
         let mut edited = running.clone(); edited.aws.as_mut().unwrap().spot = true;
         assert!(validate_aws_update(&running, &edited, &hosts).is_ok());
+    }
+
+    #[test]
+    fn a_removal_that_keeps_the_saved_files_keeps_their_access_point_and_the_project_in_place() {
+        let hosts = vec![host("h1")];
+        let mut stored = aws_project();
+        stored.aws.as_mut().unwrap().access_point_id = Some("fsap-1".into());
+        assert_eq!(access_point_after_removal(&stored, false), Some("fsap-1".into()));
+        assert_eq!(access_point_after_removal(&stored, true), None);
+        // What the store holds after a keep-the-files removal still blocks a move.
+        let mut after = stored.clone();
+        let a = after.aws.as_mut().unwrap();
+        a.task_arn = None;
+        a.task_definition_arn = None;
+        a.access_point_id = access_point_after_removal(&stored, false);
+        let mut local = after.clone();
+        local.host_id = None;
+        local.aws_placement = None;
+        local.aws = None;
+        let e = validate_aws_update(&after, &local, &hosts).unwrap_err();
+        assert!(e.contains("access point"), "{e}");
+        // After a discarding removal it can move.
+        after.aws.as_mut().unwrap().access_point_id = access_point_after_removal(&stored, true);
+        assert!(validate_aws_update(&after, &local, &hosts).is_ok());
     }
 
     #[test]
