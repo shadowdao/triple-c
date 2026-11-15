@@ -323,6 +323,22 @@ async fn only_a_background_poll_carries_the_background_marker() {
     assert_eq!(seen.exec_bodies[0], seen.exec_bodies[1], "the request is otherwise the same");
 }
 
+#[tokio::test]
+async fn the_file_viewers_poll_is_a_background_request_and_its_open_and_save_are_not() {
+    let (ep, fake) = fake_agent().await;
+    let t = target(&ep);
+    // The 2 s change check, as the viewer runs it.
+    let _ = crate::file_viewer::poll::poll_file(&t, "/workspace/x").await;
+    t.exec_oneshot_streams_background("claude", cmd("sh")).await.unwrap();
+    // What opening or saving goes through: user actions, which count.
+    t.exec_oneshot_streams_as("claude", cmd("sh"), Vec::new()).await.unwrap();
+    let seen = fake.seen.lock().unwrap();
+    assert_eq!(seen.exec_background, [Some("1".to_string()), Some("1".to_string()), None]);
+    let src = |s: &str| s.contains("exec_oneshot_streams_as(");
+    assert!(!src(include_str!("../../file_viewer/poll.rs")), "the poll stays a background request");
+    assert!(src(include_str!("../../file_viewer/resolve.rs")) && src(include_str!("../../file_viewer/write.rs")));
+}
+
 // ── one-shot execs ───────────────────────────────────────────────────────────
 
 #[tokio::test]

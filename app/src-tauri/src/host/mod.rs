@@ -302,6 +302,22 @@ impl ContainerTarget {
         }
     }
 
+    /// [`Self::exec_oneshot_streams_as`] for a background poll (the file
+    /// viewer's change check): on the agent it carries the background marker,
+    /// so it never counts as activity for idle stop. The same call on Docker.
+    pub async fn exec_oneshot_streams_background(
+        &self,
+        user: &str,
+        cmd: Vec<String>,
+    ) -> Result<(String, String, i64), String> {
+        match self {
+            ContainerTarget::Docker { container_id } => {
+                docker::exec::exec_oneshot_streams_as(container_id, user, cmd, Vec::new()).await
+            }
+            ContainerTarget::Agent(ep) => agent::exec_oneshot_streams_background(ep, user, cmd).await,
+        }
+    }
+
     /// Start a command and return without waiting or reading its output.
     /// Returns the exec id.
     pub async fn exec_detached(&self, spec: ExecSpec) -> Result<String, String> {

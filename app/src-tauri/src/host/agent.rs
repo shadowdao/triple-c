@@ -400,6 +400,17 @@ pub async fn exec_oneshot_streams_as(
     Ok((out.stdout(), out.stderr(), out.exit_code))
 }
 
+/// [`exec_oneshot_streams_as`] marked as a background poll (the file
+/// viewer's change check), so it never keeps an idle workspace up.
+pub async fn exec_oneshot_streams_background(
+    ep: &AgentEndpoint,
+    user: &str,
+    cmd: Vec<String>,
+) -> Result<(String, String, i64), String> {
+    let out = exec_oneshot_raw_marked(ep, user, cmd, Vec::new(), MAX_ONESHOT_OUTPUT, true).await?;
+    Ok((out.stdout(), out.stderr(), out.exit_code))
+}
+
 // ── detached execs, status, resize ───────────────────────────────────────────
 
 #[derive(Deserialize)]
