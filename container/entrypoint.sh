@@ -724,8 +724,10 @@ start_clone_repos() {
     mkdir -m 755 "$status_dir" || status_dir=""
     (
         trap '' HUP
+        # `done` however the clone ends (an error, a signal), or the idle
+        # watcher would count it as still running forever.
+        [ -z "$status_dir" ] || trap ': > "$status_dir/done"' EXIT
         clone_repos "$json" /workspace "$status_dir"
-        [ -z "$status_dir" ] || : > "$status_dir/done"
     ) &
 }
 # <<< aws_repos
@@ -1170,7 +1172,9 @@ start_agent
 # with TRIPLEC_WIP_PUSH=1 it pushes every repo's unsaved work to a
 # triple-c/wip/<stamp> branch (as `claude`, bounded at 90 s), unless the app's
 # stop guard recorded `pushed` or `discard` in /run/triple-c/stop-reason
-# (written as root through the agent just before StopTask). ECS gives a task
+# (written as root through the agent just before StopTask), or the idle
+# watcher recorded `idle` (it pushes *before* signalling and only signals once
+# nothing unsaved is left, so an idle stop never loses work). ECS gives a task
 # `stopTimeout` seconds between SIGTERM and SIGKILL — 30 by default, 120 at
 # most on Fargate — so the task definition must raise it for the push to
 # finish. Once only: a second TERM during the push changes nothing.
@@ -1180,9 +1184,13 @@ start_agent
 # auto-stop off. When the workspace is idle it records the reason "idle" and
 # sends TERM to *this* script ($$) — not PID 1, which under ECS's
 # initProcessEnabled is docker-init — so an idle stop and an ECS stop take
-# this same trap and push at most once. Its environment is built from scratch:
-# it needs none of the container's.
+# this same trap and push at most once. An idle stop exits with status 75
+# (triplec_idle_exit; Rust `aws::tasks::IDLE_EXIT_CODE`), so ECS reports it as
+# EssentialContainerExited with that exit code and the app can say "stopped
+# after being idle" rather than "crashed". Its environment is built from
+# scratch: it needs none of the container's but TRIPLEC_WIP_PUSH.
 # >>> aws_stop
+triplec_idle_exit=75
 aws_before_stop() {
     [ "${TRIPLEC_HOST:-}" = aws ] || return 0
     [ -z "${triplec_stopping:-}" ] || return 0
@@ -1190,7 +1198,11 @@ aws_before_stop() {
     local reason=sigterm recorded
     recorded=$(cat /run/triple-c/stop-reason 2>/dev/null)
     case "$recorded" in
-        idle) reason=idle ;;
+        idle)
+            # The watcher already pushed (or found nothing to push).
+            triplec_exit_status=$triplec_idle_exit
+            echo "entrypoint: stopping (idle) — work in progress already handled by the idle watcher"
+            return 0 ;;
         # The app's stop guard already pushed, or the user chose to stop
         # without pushing: honour that instead of pushing again.
         pushed|discard)
@@ -1220,6 +1232,7 @@ start_idle_watch() {
                 TRIPLEC_IDLE_STOP_MINUTES="$minutes" \
                 TRIPLEC_IDLE_SIGNAL_PID="$signal_pid" \
                 TRIPLEC_AGENT_TOKEN_FILE="${TRIPLEC_AGENT_TOKEN_FILE:-/dev/shm/triple-c/agent-token}" \
+                TRIPLEC_WIP_PUSH="${TRIPLEC_WIP_PUSH:-0}" \
                 /usr/local/bin/triple-c-idle-watch
             rc=$?
             # 0: it signalled the stop. 2: misconfigured, and a restart would
@@ -1244,7 +1257,7 @@ keepalive_pid=""
 stop_keepalive() {
     [ "$triplec_aws" = 1 ] && aws_before_stop
     [ -n "$keepalive_pid" ] && kill "$keepalive_pid" 2>/dev/null
-    exit 0
+    exit "${triplec_exit_status:-0}"
 }
 trap stop_keepalive TERM INT HUP
 throttle_fifo=/run/triple-c-keepalive.throttle

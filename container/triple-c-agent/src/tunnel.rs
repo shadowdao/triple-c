@@ -7,14 +7,14 @@ use std::time::Duration;
 
 use axum::extract::rejection::QueryRejection;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Query, State};
+use axum::extract::{Extension, Query, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::{error, AppState, CountGuard, MAX_WS_MESSAGE};
+use crate::{error, AppState, Background, CountGuard, MAX_WS_MESSAGE};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -25,9 +25,11 @@ pub struct TunnelQuery {
 
 pub async fn upgrade(
     State(st): State<Arc<AppState>>,
+    bg: Option<Extension<Background>>,
     q: Result<Query<TunnelQuery>, QueryRejection>,
     ws: WebSocketUpgrade,
 ) -> Response {
+    let bg = bg.map(|Extension(b)| b).unwrap_or_default();
     let port = match q {
         Ok(Query(q)) if q.port != 0 => q.port,
         Ok(_) => return error(StatusCode::BAD_REQUEST, "port must be 1-65535"),
@@ -35,10 +37,10 @@ pub async fn upgrade(
     };
     ws.max_message_size(MAX_WS_MESSAGE)
         .max_frame_size(MAX_WS_MESSAGE)
-        .on_upgrade(move |socket| session(socket, st, port))
+        .on_upgrade(move |socket| session(socket, st, port, bg))
 }
 
-async fn session(mut socket: WebSocket, st: Arc<AppState>, port: u16) {
+async fn session(mut socket: WebSocket, st: Arc<AppState>, port: u16, bg: Background) {
     // Loopback only, by construction: the tunnel reaches in-container
     // listeners, never the network the container can see.
     let tcp = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(("127.0.0.1", port))).await {
@@ -56,7 +58,7 @@ async fn session(mut socket: WebSocket, st: Arc<AppState>, port: u16) {
         tokio::select! {
             r = rd.read(&mut buf) => match r {
                 Ok(n) if n > 0 => {
-                    st.activity.touch();
+                    st.activity.touch_for(bg);
                     if socket.send(Message::Binary(buf[..n].to_vec().into())).await.is_err() {
                         return;
                     }
@@ -68,7 +70,7 @@ async fn session(mut socket: WebSocket, st: Arc<AppState>, port: u16) {
             },
             m = socket.recv() => match m {
                 Some(Ok(Message::Binary(d))) => {
-                    st.activity.touch();
+                    st.activity.touch_for(bg);
                     if wr.write_all(&d).await.is_err() {
                         let _ = socket.send(Message::Close(None)).await;
                         return;

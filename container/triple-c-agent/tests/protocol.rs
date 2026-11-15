@@ -862,6 +862,76 @@ async fn activity_counts_execs_and_tunnels_and_ignores_its_own_probes() {
     }
 }
 
+#[tokio::test]
+async fn background_requests_and_their_sessions_are_not_activity() {
+    let a = start().await;
+    let (_, v0) = a.get("/v1/activity").await;
+    let t0 = v0["last_activity_unix"].as_i64().unwrap();
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+
+    // A one-shot exec marked as background.
+    let r = a
+        .http
+        .post(a.url("/v1/exec"))
+        .bearer_auth(TOKEN)
+        .header("X-Triple-C-Background", "1")
+        .json(&json!({ "cmd": ["echo", "hi"], "user": a.user }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    // A background attach whose process talks.
+    let mut req = format!("ws://{}/v1/attach", a.addr).into_client_request().unwrap();
+    req.headers_mut().insert("Authorization", format!("Bearer {TOKEN}").parse().unwrap());
+    req.headers_mut().insert("X-Triple-C-Background", "1".parse().unwrap());
+    let mut ws = tokio_tungstenite::connect_async(req).await.unwrap().0;
+    let spec = json!({ "cmd": ["sh", "-c", "echo out; cat"], "user": a.user, "attach_stdin": true });
+    ws.send(Message::Text(spec.to_string().into())).await.unwrap();
+    assert_eq!(next_text(&mut ws).await["type"], "started");
+    ws.send(Message::Binary(b"typed\n".to_vec().into())).await.unwrap();
+    let mut acc = Vec::new();
+    read_until(&mut ws, &mut acc, "typed").await;
+
+    let (_, v) = a.get("/v1/activity").await;
+    assert_eq!(v["last_activity_unix"].as_i64().unwrap(), t0, "background requests are not activity: {v}");
+
+    // Any other value of the header is an ordinary request.
+    a.http
+        .get(a.url("/v1/exec/nope"))
+        .bearer_auth(TOKEN)
+        .header("X-Triple-C-Background", "yes")
+        .send()
+        .await
+        .unwrap();
+    let (_, v) = a.get("/v1/activity").await;
+    assert!(v["last_activity_unix"].as_i64().unwrap() > t0, "{v}");
+}
+
+#[tokio::test]
+async fn an_open_but_silent_attach_stops_being_activity() {
+    let a = start().await;
+    let (mut ws, _) = a.attach(json!({ "cmd": ["cat"], "attach_stdin": true })).await;
+    ws.send(Message::Binary(b"x\n".to_vec().into())).await.unwrap();
+    let mut acc = Vec::new();
+    read_until(&mut ws, &mut acc, "x").await;
+    let (_, v) = a.get("/v1/activity").await;
+    let t1 = v["last_activity_unix"].as_i64().unwrap();
+    assert_eq!(v["active_execs"], 1);
+
+    // Still attached, nothing flowing: the timestamp stays put, so the
+    // idle watcher (which no longer looks at the counters) can see it age.
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    let (_, v) = a.get("/v1/activity").await;
+    assert_eq!(v["last_activity_unix"].as_i64().unwrap(), t1, "{v}");
+
+    // Input on the attach is activity again.
+    ws.send(Message::Binary(b"y\n".to_vec().into())).await.unwrap();
+    read_until(&mut ws, &mut acc, "y").await;
+    let (_, v) = a.get("/v1/activity").await;
+    assert!(v["last_activity_unix"].as_i64().unwrap() > t1, "{v}");
+}
+
 // ── connection limits ──────────────────────────────────────────────────────
 
 /// Wait for the server to close `s`: `Ok(elapsed)` on EOF or reset,

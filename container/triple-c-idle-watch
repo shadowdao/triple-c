@@ -1,45 +1,62 @@
 #!/bin/bash
 # triple-c-idle-watch [--check]
 #
-# Idle auto-stop for an AWS workspace (plan ruling P7). Started by
+# Idle auto-stop for an AWS workspace (plan ruling P7, R11). Started by
 # entrypoint.sh, as root, only when TRIPLEC_HOST=aws and
 # TRIPLEC_IDLE_STOP_MINUTES is set. Every interval it asks whether the
 # workspace is idle:
 #
 #   * the agent's /v1/activity (read with the agent's own token file) shows
-#     no authenticated activity for N minutes, no open exec, no open tunnel;
+#     no authenticated activity for N minutes. The agent counts requests and
+#     the bytes of attaches and tunnels, so an open but silent terminal tab
+#     ages like no tab at all, and the app's background polls (the auth
+#     bridge, marked X-Triple-C-Background) never count. The open exec and
+#     tunnel counters are *not* consulted (R11);
 #   * no `claude` process is running;
 #   * no scheduler job is running (`triple-c-scheduler status`, as claude);
 #   * the start's background repository clone has finished (entrypoint.sh,
-#     start_clone_repos: /run/triple-c-clone exists without `done`).
+#     start_clone_repos: /run/triple-c-clone exists without `done`);
+#   * no work would be lost: `triple-c-wip-push --dry-run` (as claude) finds
+#     no dirty repository and no unpushed commit. With the WIP push on
+#     (TRIPLEC_WIP_PUSH=1) such work is pushed here, before the stop, and the
+#     workspace stops only once that push succeeded; a failed push keeps it
+#     running and is retried later (backing off). With it off, unsaved work
+#     simply keeps the workspace up.
 #
 # Anything it cannot read counts as NOT idle: a stop is the one thing here
 # that cannot be undone, so every doubt keeps the workspace running.
 #
 # When idle it records "idle" as the stop reason and sends SIGTERM to the
-# entrypoint (TRIPLEC_IDLE_SIGNAL_PID). The entrypoint's TERM trap does the
-# WIP push (reason read from that file) and stops the keepalive, so a stop
-# from here and a stop from ECS take the same single path — and a SIGTERM from
-# ECS arriving mid-push cannot start a second, concurrent push.
+# entrypoint (TRIPLEC_IDLE_SIGNAL_PID). The entrypoint's TERM trap sees
+# "idle", does not push again (this script already did), stops the keepalive
+# and exits with the idle status (75) so the app can tell an idle stop from a
+# crash. A stop from ECS (SIGTERM, no marker) still pushes in the trap, best
+# effort; a SIGTERM from ECS arriving mid-way cannot start a second push.
 #
 # Why not `kill -TERM 1`: with initProcessEnabled ECS runs the container under
 # docker-init, so PID 1 is the init, not the entrypoint. The init would
 # forward the signal, but signalling the entrypoint directly does not depend on
 # that and also works without an init.
 #
-# --check evaluates once and exits 0 (idle) or 1 (not idle); for tests and
-# for looking at a live task.
+# --check evaluates once and exits 0 (idle and nothing unsaved, or unsaved
+# work the WIP push would take) or 1 (not idle); for tests and for looking at
+# a live task. It never pushes.
 #
-# Configuration (environment; the entrypoint sets the first three, the rest
+# Configuration (environment; the entrypoint sets the first four, the rest
 # exist for tests):
 #   TRIPLEC_IDLE_STOP_MINUTES   N (required, > 0)
 #   TRIPLEC_IDLE_SIGNAL_PID     the entrypoint's PID
 #   TRIPLEC_AGENT_TOKEN_FILE    default /dev/shm/triple-c/agent-token
+#   TRIPLEC_WIP_PUSH            1: push unsaved work before an idle stop
 #   TRIPLEC_AGENT_URL           default http://127.0.0.1:47900
 #   TRIPLEC_IDLE_INTERVAL       seconds between checks, default 60
 #   TRIPLEC_STOP_REASON_FILE    default /run/triple-c/stop-reason
 #   TRIPLEC_SCHEDULER_BIN       default /usr/local/bin/triple-c-scheduler
 #   TRIPLEC_SCHEDULER_USER      default claude; empty runs it as this user
+#                               (also the user the WIP push runs as)
+#   TRIPLEC_WIP_PUSH_BIN        default /usr/local/bin/triple-c-wip-push
+#   TRIPLEC_WIP_TIMEOUT         seconds for the push, default 90
+#   TRIPLEC_WIP_BACKOFF_MAX     longest wait between push retries, default 1800
 #   TRIPLEC_IDLE_PROC_NAME      default claude
 #   TRIPLEC_CLONE_STATUS_DIR    default /run/triple-c-clone
 
@@ -55,26 +72,31 @@ scheduler="${TRIPLEC_SCHEDULER_BIN:-/usr/local/bin/triple-c-scheduler}"
 scheduler_user="${TRIPLEC_SCHEDULER_USER-claude}"
 proc_name="${TRIPLEC_IDLE_PROC_NAME:-claude}"
 clone_dir="${TRIPLEC_CLONE_STATUS_DIR:-/run/triple-c-clone}"
+wip_push="${TRIPLEC_WIP_PUSH:-0}"
+wip_bin="${TRIPLEC_WIP_PUSH_BIN:-/usr/local/bin/triple-c-wip-push}"
+wip_timeout="${TRIPLEC_WIP_TIMEOUT:-90}"
+backoff_max="${TRIPLEC_WIP_BACKOFF_MAX:-1800}"
 
 # >>> is_idle
-# is_idle now last_activity_unix active_execs active_tunnels claude_running jobs_running minutes
+# is_idle now last_activity_unix claude_running jobs_running minutes
 # Pure: exit 0 when idle, 1 otherwise. Every argument must be a plain
 # non-negative integer; anything else (an empty or garbled read) is not idle.
+# Open execs and tunnels are deliberately not an input (R11): their traffic
+# already moves last_activity_unix, and an open but silent one is idle.
 is_idle() {
     local a
-    [ $# -eq 7 ] || return 1
+    [ $# -eq 5 ] || return 1
     for a in "$@"; do
         case "$a" in ''|*[!0-9]*) return 1 ;; esac
     done
-    local now=$1 last=$2 execs=$3 tunnels=$4 claude=$5 jobs=$6 mins=$7
+    local now=$1 last=$2 claude=$3 jobs=$4 mins=$5
     [ "$mins" -gt 0 ] || return 1
-    [ "$execs" -eq 0 ] && [ "$tunnels" -eq 0 ] || return 1
     [ "$claude" -eq 0 ] && [ "$jobs" -eq 0 ] || return 1
     [ $((now - last)) -ge $((mins * 60)) ]
 }
 # <<< is_idle
 
-# Prints "last execs tunnels", or fails.
+# Prints last_activity_unix, or fails.
 read_activity() {
     local token body
     token=$(cat "$token_file" 2>/dev/null) || return 1
@@ -83,19 +105,23 @@ read_activity() {
     # is readable by every user in the container.
     body=$(printf 'header = "Authorization: Bearer %s"\n' "$token" \
         | curl -sf --max-time 5 --config - "$agent_url/v1/activity" 2>/dev/null) || return 1
-    printf '%s' "$body" | jq -r '[.last_activity_unix, .active_execs, .active_tunnels]
-        | map(if type == "number" and . >= 0 and . == floor then tostring else "x" end)
-        | join(" ")' 2>/dev/null
+    printf '%s' "$body" | jq -r '.last_activity_unix
+        | if type == "number" and . >= 0 and . == floor then tostring else "x" end' 2>/dev/null
+}
+
+# Run "$@" as the scheduler user (claude) when we are root, else as is.
+as_user() {
+    if [ -n "$scheduler_user" ] && [ "$(id -u)" = 0 ]; then
+        su -s /bin/bash -c '"$@"' -- "$scheduler_user" _ "$@"
+    else
+        "$@"
+    fi
 }
 
 # 1 when a scheduler job is running *or* the question cannot be answered.
 jobs_running() {
     local out
-    if [ -n "$scheduler_user" ] && [ "$(id -u)" = 0 ]; then
-        out=$(su -s /bin/bash -c '"$1" status' -- "$scheduler_user" _ "$scheduler" 2>/dev/null) || { echo 1; return; }
-    else
-        out=$("$scheduler" status 2>/dev/null) || { echo 1; return; }
-    fi
+    out=$(as_user "$scheduler" status 2>/dev/null) || { echo 1; return; }
     if [ "$out" = "Nothing running." ]; then echo 0; else echo 1; fi
 }
 
@@ -104,14 +130,38 @@ clone_running() {
     [ -d "$clone_dir" ] && [ ! -e "$clone_dir/done" ]
 }
 
-check() {
-    local act last execs tunnels claude jobs
-    act=$(read_activity) || return 1
-    read -r last execs tunnels <<< "$act"
+# The folders with unsaved work (dirty, or commits no remote has), one per
+# line; nothing when there is none. Fails when it cannot tell.
+unsaved_work() {
+    local out
+    out=$(as_user timeout -k 5 60 "$wip_bin" --dry-run 2>/dev/null) || return 1
+    printf '%s\n' "$out" | jq -r 'select(.dirty == true or (.unpushed // 0) > 0) | .folder' 2>/dev/null
+}
+
+# The activity, process, job and clone conditions.
+quiet() {
+    local last claude jobs
+    last=$(read_activity) || return 1
     if pgrep -x "$proc_name" >/dev/null 2>&1; then claude=1; else claude=0; fi
     jobs=$(jobs_running)
     clone_running && jobs=1
-    is_idle "$(date +%s)" "${last:-}" "${execs:-}" "${tunnels:-}" "$claude" "$jobs" "$minutes"
+    is_idle "$(date +%s)" "${last:-}" "$claude" "$jobs" "$minutes"
+}
+
+# Say something once per change of state, not every interval.
+said=""
+say_once() {
+    [ "$1" = "$said" ] && return 0
+    said="$1"
+    echo "triple-c-idle-watch: $1"
+}
+
+# --check: quiet, and no unsaved work unless the WIP push would take it.
+check() {
+    local dirty
+    quiet || return 1
+    dirty=$(unsaved_work) || return 1
+    [ -z "$dirty" ] || [ "$wip_push" = 1 ]
 }
 
 case "$minutes" in
@@ -127,18 +177,44 @@ case "$signal_pid" in
     ''|*[!0-9]*|0|1) echo "triple-c-idle-watch: TRIPLEC_IDLE_SIGNAL_PID must be the entrypoint's PID" >&2; exit 2 ;;
 esac
 
+push_failures=0
+next_push_at=0
 while :; do
     sleep "$interval"
-    if check; then
-        echo "triple-c-idle-watch: idle for ${minutes} minutes — stopping the workspace"
-        mkdir -p "$(dirname "$reason_file")" 2>/dev/null
-        # A pushed/discard marker means the app's stop guard has decided and
-        # its stop is under way: keep that decision rather than overwrite it.
-        case "$(cat "$reason_file" 2>/dev/null)" in
-            pushed|discard) ;;
-            *) printf 'idle\n' > "$reason_file" ;;
-        esac
-        kill -TERM "$signal_pid"
-        exit 0
+    if ! quiet; then
+        said=""
+        continue
     fi
+    if ! dirty=$(unsaved_work); then
+        say_once "idle, but the repositories' state cannot be read — not stopping"
+        continue
+    fi
+    if [ -n "$dirty" ]; then
+        folders=$(printf '%s' "$dirty" | paste -sd, -)
+        if [ "$wip_push" != 1 ]; then
+            say_once "idle, but $folders has unsaved work and the WIP push is off — not stopping"
+            continue
+        fi
+        [ "$(date +%s)" -ge "$next_push_at" ] || continue
+        echo "triple-c-idle-watch: idle — pushing work in progress ($folders) before stopping..."
+        if ! as_user timeout -k 5 "$wip_timeout" "$wip_bin" --reason idle; then
+            push_failures=$((push_failures + 1))
+            wait_s=$((interval << (push_failures < 10 ? push_failures : 10)))
+            [ "$wait_s" -le "$backoff_max" ] || wait_s=$backoff_max
+            next_push_at=$(( $(date +%s) + wait_s ))
+            said=""
+            echo "triple-c-idle-watch: the WIP push failed — staying up; retrying in ${wait_s}s"
+            continue
+        fi
+    fi
+    echo "triple-c-idle-watch: idle for ${minutes} minutes — stopping the workspace"
+    mkdir -p "$(dirname "$reason_file")" 2>/dev/null
+    # A pushed/discard marker means the app's stop guard has decided and
+    # its stop is under way: keep that decision rather than overwrite it.
+    case "$(cat "$reason_file" 2>/dev/null)" in
+        pushed|discard) ;;
+        *) printf 'idle\n' > "$reason_file" ;;
+    esac
+    kill -TERM "$signal_pid"
+    exit 0
 done
