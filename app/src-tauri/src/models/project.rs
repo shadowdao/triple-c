@@ -557,18 +557,20 @@ impl Default for AwsWorkspaceConfig {
     }
 }
 
-/// The valid Fargate memory range (min, max, step) in MiB for a vCPU size.
-fn fargate_memory_range(cpu: u32) -> Option<(u32, u32, u32)> {
-    match cpu {
-        256 => Some((512, 2048, 512)),
-        512 => Some((1024, 4096, 1024)),
-        1024 => Some((2048, 8192, 1024)),
-        2048 => Some((4096, 16384, 1024)),
-        4096 => Some((8192, 30720, 1024)),
-        8192 => Some((16384, 61440, 4096)),
-        16384 => Some((32768, 122880, 8192)),
-        _ => None,
-    }
+/// The valid Fargate memory sizes (MiB) for a CPU size, smallest first.
+/// 256 CPU is the irregular one: 512, 1024 or 2048 only.
+fn fargate_memory_sizes(cpu: u32) -> Option<Vec<u32>> {
+    let (min, max, step) = match cpu {
+        256 => return Some(vec![512, 1024, 2048]),
+        512 => (1024, 4096, 1024),
+        1024 => (2048, 8192, 1024),
+        2048 => (4096, 16384, 1024),
+        4096 => (8192, 30720, 1024),
+        8192 => (16384, 61440, 4096),
+        16384 => (32768, 122880, 8192),
+        _ => return None,
+    };
+    Some((min..=max).step_by(step as usize).collect())
 }
 
 fn validate_repo_url(url: &str) -> Result<(), String> {
@@ -643,17 +645,29 @@ fn validate_repo_folder(folder: &str) -> Result<(), String> {
     }
 }
 
+/// "512, 1024 or 2048 MiB", or "2048 to 8192 MiB in steps of 1024".
+fn describe_sizes(sizes: &[u32]) -> String {
+    let (first, last) = (sizes[0], sizes[sizes.len() - 1]);
+    if sizes.len() <= 3 {
+        let head: Vec<String> = sizes[..sizes.len() - 1].iter().map(u32::to_string).collect();
+        return format!("{} or {} MiB", head.join(", "), last);
+    }
+    format!("{} to {} MiB in steps of {}", first, last, sizes[1] - sizes[0])
+}
+
 pub fn validate_aws_workspace(cfg: &AwsWorkspaceConfig) -> Result<(), String> {
-    let (min, max, step) = fargate_memory_range(cfg.cpu).ok_or_else(|| {
+    let sizes = fargate_memory_sizes(cfg.cpu).ok_or_else(|| {
         format!(
             "{} is not a Fargate CPU size (256, 512, 1024, 2048, 4096, 8192 or 16384)",
             cfg.cpu
         )
     })?;
-    if cfg.memory_mib < min || cfg.memory_mib > max || (cfg.memory_mib - min) % step != 0 {
+    if !sizes.contains(&cfg.memory_mib) {
         return Err(format!(
-            "{} MiB of memory is not valid with {} CPU units: use {} to {} MiB in steps of {}",
-            cfg.memory_mib, cfg.cpu, min, max, step
+            "{} MiB of memory is not valid with {} CPU units: use {}",
+            cfg.memory_mib,
+            cfg.cpu,
+            describe_sizes(&sizes)
         ));
     }
     if !(21..=200).contains(&cfg.ephemeral_gib) {
@@ -1323,12 +1337,27 @@ mod tests {
 
     #[test]
     fn cpu_and_memory_must_be_a_fargate_pair() {
-        for (c, m) in [(256, 512), (256, 2048), (1024, 2048), (1024, 8192), (2048, 4096), (4096, 30720), (8192, 61440), (16384, 32768), (16384, 122880)] {
+        // Shared with the frontend's copy (`lib/awsWorkspace.test.ts`).
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../../src/test/fixtures/fargate-pairs.json")).unwrap();
+        let pairs = |k: &str| -> Vec<(u32, u32)> {
+            fixture[k]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| (p[0].as_u64().unwrap() as u32, p[1].as_u64().unwrap() as u32))
+                .collect()
+        };
+        for (c, m) in pairs("valid") {
             assert!(validate_aws_workspace(&cfg(c, m)).is_ok(), "{c}/{m} should be valid");
         }
-        for (c, m) in [(256, 4096), (1024, 1024), (1024, 9216), (1024, 2500), (300, 1024), (16384, 114688 + 1), (8192, 18432)] {
+        for (c, m) in pairs("invalid") {
             assert!(validate_aws_workspace(&cfg(c, m)).is_err(), "{c}/{m} should be rejected");
         }
+        let e = validate_aws_workspace(&cfg(256, 1536)).unwrap_err();
+        assert!(e.ends_with("use 512, 1024 or 2048 MiB"), "{e}");
+        let e = validate_aws_workspace(&cfg(1024, 2500)).unwrap_err();
+        assert!(e.ends_with("use 2048 to 8192 MiB in steps of 1024"), "{e}");
     }
 
     #[test]

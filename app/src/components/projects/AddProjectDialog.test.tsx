@@ -214,4 +214,23 @@ describe("AddProjectDialog on AWS", () => {
     fireEvent.click(submitButton());
     expect(await screen.findByRole("alert")).toHaveTextContent(/use https:\/\//);
   });
+
+  it("forgets the environment when the region changes until that region's scan is done", async () => {
+    detectAwsEnvironments.mockResolvedValueOnce(scan([environment("dev", "ready", true)]));
+    let finish!: (v: EnvironmentScan) => void;
+    detectAwsEnvironments.mockReturnValueOnce(new Promise((r) => (finish = r)));
+    render(<AddProjectDialog onClose={vi.fn()} />);
+    chooseAws();
+    await waitFor(() => expect(screen.getByLabelText("Environment")).toHaveValue("dev"));
+    fireEvent.change(screen.getByLabelText("Project name"), { target: { value: "api" } });
+    const region = screen.getByLabelText("Region");
+    fireEvent.change(region, { target: { value: "us-east-1" } });
+    fireEvent.blur(region);
+    expect(await screen.findByText(/Looking for environments in us-east-1/)).toBeInTheDocument();
+    fireEvent.click(submitButton());
+    expect(await screen.findByRole("alert")).toHaveTextContent(/Choose an environment/);
+    expect(add).not.toHaveBeenCalled();
+    await act(async () => finish(scan([environment("prod", "ready", true)])));
+    expect(screen.getByLabelText("Environment")).toHaveValue("prod");
+  });
 });

@@ -66,6 +66,8 @@ export default function AddProjectDialog({ onClose }: Props) {
       return;
     }
     let cancelled = false;
+    // An environment chosen in another region is not one in this region.
+    setEnvironment("");
     setScan({ status: "loading" });
     detectAwsEnvironments(connection.id, scanRegion).then(
       (found) => {
@@ -126,7 +128,13 @@ export default function AddProjectDialog({ onClose }: Props) {
       return;
     }
     if (connection) {
-      if (!environment) {
+      // Only an environment from a finished scan of the region shown counts.
+      if (region.trim() !== scanRegion) {
+        setScanRegion(region.trim());
+        setError("Choose an environment in the new region first");
+        return;
+      }
+      if (scan.status !== "done" || !environment) {
         setError("Choose an environment to run the project in");
         return;
       }

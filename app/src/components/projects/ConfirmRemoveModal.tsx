@@ -6,6 +6,8 @@ interface Props {
   projectName: string;
   /** An AWS project: its task, task definitions and secret go instead of Docker state. */
   aws?: boolean;
+  /** AWS: the workspace may have saved files on EFS (offers deleting them). */
+  savedFiles?: boolean;
   onConfirm: (opts: { discardData: boolean }) => void;
   onCancel: () => void;
 }
@@ -13,7 +15,13 @@ interface Props {
 const REMOVE_CLASS =
   "bg-[var(--error-emphasis)] text-white border border-transparent hover:opacity-90";
 
-export default function ConfirmRemoveModal({ projectName, aws = false, onConfirm, onCancel }: Props) {
+export default function ConfirmRemoveModal({
+  projectName,
+  aws = false,
+  savedFiles = false,
+  onConfirm,
+  onCancel,
+}: Props) {
   const [discardData, setDiscardData] = useState(false);
   return (
     <Modal
@@ -25,7 +33,11 @@ export default function ConfirmRemoveModal({ projectName, aws = false, onConfirm
           <Button size="md" variant="ghost" onClick={onCancel}>
             Cancel
           </Button>
-          <Button size="md" onClick={() => onConfirm({ discardData })} className={REMOVE_CLASS}>
+          <Button
+            size="md"
+            onClick={() => onConfirm({ discardData: savedFiles && discardData })}
+            className={REMOVE_CLASS}
+          >
             Remove
           </Button>
         </>
@@ -40,21 +52,23 @@ export default function ConfirmRemoveModal({ projectName, aws = false, onConfirm
             deleted after AWS&rsquo;s 7-day recovery window). Work that was not pushed to a
             remote is lost.
           </p>
-          <label className="mt-3 flex items-start gap-2 text-[13px] text-[var(--text-primary)]">
-            <input
-              type="checkbox"
-              className="mt-0.5"
-              checked={discardData}
-              onChange={(e) => setDiscardData(e.target.checked)}
-            />
-            <span>
-              Also delete the workspace&rsquo;s saved files (EFS)
-              <span className="block text-xs text-[var(--text-secondary)]">
-                The Claude login, history and SSH keys kept between starts. Left in place
-                otherwise.
+          {savedFiles && (
+            <label className="mt-3 flex items-start gap-2 text-[13px] text-[var(--text-primary)]">
+              <input
+                type="checkbox"
+                className="mt-0.5"
+                checked={discardData}
+                onChange={(e) => setDiscardData(e.target.checked)}
+              />
+              <span>
+                Also delete the workspace&rsquo;s saved files (EFS)
+                <span className="block text-xs text-[var(--text-secondary)]">
+                  The Claude login, history and SSH keys kept between starts. Left in place
+                  otherwise.
+                </span>
               </span>
-            </span>
-          </label>
+            </label>
+          )}
         </>
       ) : (
         <>

@@ -11,8 +11,8 @@ import Button from "../../ui/Button";
 import OverflowMenu from "../../ui/OverflowMenu";
 import ConfirmRemoveModal, { ConfirmForgetAwsModal } from "../ConfirmRemoveModal";
 import StopGuardModal from "../StopGuardModal";
-import { isAwsProject } from "../../../lib/awsWorkspace";
-import type { RemoveProjectOptions } from "../../../lib/types";
+import { hasSavedFiles, isAwsProject } from "../../../lib/awsWorkspace";
+import { AWS_CONNECTION_MISSING, type RemoveProjectOptions } from "../../../lib/types";
 import ConfirmResetModal from "../ConfirmResetModal";
 import MigrateContainerModal from "../MigrateContainerModal";
 import OverviewTab from "./OverviewTab";
@@ -148,14 +148,17 @@ export default function ProjectHome({ projectId, active }: Props) {
         }
       }
     } catch (e) {
-      if (aws && !opts.forgetAwsResources && /connection no longer exists/i.test(String(e))) {
-        setForgetAws({ reason: String(e), discardData: !!opts.discardData });
+      const text = String(e);
+      const missing = text.startsWith(AWS_CONNECTION_MISSING);
+      const reason = missing ? text.slice(AWS_CONNECTION_MISSING.length) : text;
+      if (missing && !opts.forgetAwsResources) {
+        setForgetAws({ reason, discardData: !!opts.discardData });
         return;
       }
       useAppState.getState().pushToast({
         kind: "error",
         message: `Could not remove “${project.name}”`,
-        detail: String(e),
+        detail: reason,
       });
     }
   };
@@ -325,6 +328,7 @@ export default function ProjectHome({ projectId, active }: Props) {
         <StopGuardModal
           projectName={project.name}
           work={actions.stopGuard}
+          wipPushOnStop={project.aws?.wip_push_on_stop ?? false}
           onChoose={actions.resolveStopGuard}
         />
       )}
@@ -344,6 +348,7 @@ export default function ProjectHome({ projectId, active }: Props) {
         <ConfirmRemoveModal
           projectName={project.name}
           aws={aws}
+          savedFiles={hasSavedFiles(project)}
           onCancel={() => setConfirmRemove(false)}
           onConfirm={({ discardData }) => {
             setConfirmRemove(false);

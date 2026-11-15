@@ -1494,7 +1494,7 @@ pub async fn stop_project_container(
     wip: Option<WipChoice>,
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     // Stop had **no** exclusion at all, which is the one gap CLAUDE.md's "every
     // command that stops, removes or recreates the container consults
     // `is_migrating`" rule already named and this function did not honour. A
@@ -1508,25 +1508,37 @@ pub async fn stop_project_container(
         .get(&project_id)
         .ok_or_else(|| format!("Project {} not found", project_id))?;
 
+    // The stop guard asked, and meanwhile the workspace stopped by itself
+    // (idle stop, another window): what the user wanted has happened.
+    if project.is_aws() && wip.is_some() && project.status == ProjectStatus::Stopped {
+        return Ok(None);
+    }
+
     state.projects_store.update_status(&project_id, ProjectStatus::Stopping)?;
+
+    // The stop guard's choice, before anything else is torn down: a push that
+    // fails aborts the stop with the project as it was (auth bridge included).
+    let mut note = None;
+    if project.is_aws() {
+        if wip == Some(WipChoice::Push) {
+            emit_progress(&app_handle, &project_id, "Pushing unsaved work...");
+        }
+        let target = ContainerTarget::for_project(&project);
+        note = aws_guard_before_stop(
+            &state.projects_store,
+            &project_id,
+            project.status.clone(),
+            target.as_ref(),
+            wip,
+            super::stop_guard::PUSH_TIMEOUT,
+        )
+        .await?;
+    }
 
     // Drop host listeners first: they only make sense while the container runs.
     state.auth_bridge.stop(&project_id).await;
 
     if project.is_aws() {
-        // The stop guard's choice: a push that fails aborts the stop, and
-        // the project keeps its status (the push output says why).
-        if wip == Some(WipChoice::Push) {
-            emit_progress(&app_handle, &project_id, "Pushing unsaved work...");
-            let target = ContainerTarget::for_project(&project);
-            if let Err(e) =
-                super::stop_guard::before_stop(target.as_ref(), wip, super::stop_guard::PUSH_TIMEOUT).await
-            {
-                log::warn!("Project {}: WIP push before stop failed: {}", project_id, e);
-                let _ = state.projects_store.update_status(&project_id, project.status.clone());
-                return Err(e);
-            }
-        }
         // A failed StopTask leaves a billed task running, so unlike Docker it
         // is not papered over: the project keeps its status and the user
         // sees why (expired SSO, typically), and can retry.
@@ -1560,7 +1572,27 @@ pub async fn stop_project_container(
     }
 
     state.projects_store.update_status(&project_id, ProjectStatus::Stopped)?;
-    Ok(())
+    Ok(note)
+}
+
+/// The AWS stop guard's step before StopTask ([`super::stop_guard::prepare_stop`]).
+/// A failed push puts `previous` back, so the project is as it was.
+async fn aws_guard_before_stop<R: super::stop_guard::WipRunner>(
+    store: &crate::storage::projects_store::ProjectsStore,
+    project_id: &str,
+    previous: ProjectStatus,
+    runner: Option<&R>,
+    wip: Option<WipChoice>,
+    push_timeout: std::time::Duration,
+) -> Result<Option<String>, String> {
+    match super::stop_guard::prepare_stop(runner, wip, push_timeout).await {
+        Ok(note) => Ok(note),
+        Err(e) => {
+            log::warn!("Project {}: WIP push before stop failed: {}", project_id, e);
+            let _ = store.update_status(project_id, previous);
+            Err(e)
+        }
+    }
 }
 
 /// The stop guard's question: what would stopping this AWS workspace lose?
@@ -1735,15 +1767,19 @@ pub async fn rebuild_project_container(
 /// whose container was removed mid-migration reports Stopped.
 /// Removing an AWS project whose connection was deleted can't reach AWS:
 /// refused unless the user confirmed leaving its resources behind.
+/// Stable prefix of that refusal, so the UI can offer the second confirm
+/// without matching prose. Mirrored by `AWS_CONNECTION_MISSING` in `lib/types.ts`.
+pub const AWS_CONNECTION_MISSING: &str = "AWS_CONNECTION_MISSING: ";
+
 fn missing_connection_removal(forget_aws_resources: bool) -> Result<(), String> {
     if forget_aws_resources {
         return Ok(());
     }
-    Err("This project's AWS connection no longer exists, so its task (which may still be \
+    Err(AWS_CONNECTION_MISSING.to_string()
+        + "This project's AWS connection no longer exists, so its task (which may still be \
          running and billed), secret and data can't be removed from here. Add the connection \
          again in Settings → Hosts and remove the project, or confirm removing it while leaving \
-         those resources in AWS."
-        .into())
+         those resources in AWS.")
 }
 
 /// After a failed start: an AWS project whose task ARN is still stored has
@@ -2612,7 +2648,54 @@ mod tests {
     fn removing_without_the_connection_needs_explicit_confirmation() {
         let e = missing_connection_removal(false).unwrap_err();
         assert!(e.contains("still be running") && e.contains("Settings → Hosts"), "{e}");
+        assert!(e.starts_with(AWS_CONNECTION_MISSING));
         assert!(missing_connection_removal(true).is_ok());
+        // The frontend keys its second confirm on the same prefix.
+        let ts = include_str!("../../../src/lib/types.ts");
+        assert!(
+            ts.contains(&format!("export const AWS_CONNECTION_MISSING = {:?};", AWS_CONNECTION_MISSING)),
+            "lib/types.ts must mirror AWS_CONNECTION_MISSING"
+        );
+    }
+
+    fn stop_store(status: ProjectStatus) -> (tempfile::TempDir, crate::storage::projects_store::ProjectsStore, String) {
+        let mut p = aws_project();
+        p.status = status;
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::storage::projects_store::ProjectsStore::over_file_for_test(
+            dir.path().join("projects.json"),
+            vec![p.clone()],
+        );
+        (dir, store, p.id)
+    }
+
+    #[tokio::test]
+    async fn a_failed_push_before_stop_puts_the_status_back_and_records_nothing() {
+        use crate::commands::stop_guard::tests::Fake;
+        let (_d, store, id) = stop_store(ProjectStatus::Running);
+        store.update_status(&id, ProjectStatus::Stopping).unwrap();
+        let fake = Fake::new(Ok(("push to origin failed: denied".into(), 1)));
+        let e = aws_guard_before_stop(&store, &id, ProjectStatus::Running, Some(&fake), Some(WipChoice::Push), std::time::Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(e.contains("denied"), "{e}");
+        assert_eq!(store.get(&id).unwrap().status, ProjectStatus::Running);
+        assert!(fake.markers.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_successful_push_before_stop_records_it_and_leaves_the_stop_going() {
+        use crate::commands::stop_guard::tests::Fake;
+        let (_d, store, id) = stop_store(ProjectStatus::Running);
+        store.update_status(&id, ProjectStatus::Stopping).unwrap();
+        let fake = Fake::new(Ok(("pushed".into(), 0)));
+        let note = aws_guard_before_stop(&store, &id, ProjectStatus::Running, Some(&fake), Some(WipChoice::Push), std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(note, None);
+        assert_eq!(store.get(&id).unwrap().status, ProjectStatus::Stopping, "untouched: the stop goes on");
+        assert_eq!(*fake.markers.lock().unwrap(), vec!["pushed".to_string()]);
+        assert_eq!(fake.calls.lock().unwrap().len(), 1);
     }
 
     #[test]

@@ -9,13 +9,19 @@ import {
   stopGuardNeeded,
 } from "./awsWorkspace";
 import { environment } from "../test/awsFixtures";
+// Shared with the Rust validator (`models/project.rs`).
+import fargatePairs from "../test/fixtures/fargate-pairs.json";
 
 describe("awsWorkspace", () => {
-  it("knows Fargate's valid CPU/memory pairs", () => {
-    expect(memoryOptions(256)).toEqual([512, 1024, 1536, 2048]);
-    expect(memoryError(1024, 4096)).toBeNull();
-    expect(memoryError(256, 4096)).toMatch(/not valid with 256/);
-    expect(memoryError(8192, 17000)).toMatch(/steps of 4096/);
+  it("agrees with the Rust validator on every pair in the shared fixture", () => {
+    for (const [cpu, mem] of fargatePairs.valid) expect(memoryError(cpu, mem), `${cpu}/${mem}`).toBeNull();
+    for (const [cpu, mem] of fargatePairs.invalid) expect(memoryError(cpu, mem), `${cpu}/${mem}`).not.toBeNull();
+  });
+
+  it("words the refusal as Rust does and snaps to a valid size", () => {
+    expect(memoryOptions(256)).toEqual([512, 1024, 2048]);
+    expect(memoryError(256, 1536)).toMatch(/use 512, 1024 or 2048 MiB$/);
+    expect(memoryError(1024, 2500)).toMatch(/use 2048 to 8192 MiB in steps of 1024$/);
     expect(memoryError(300, 1024)).toMatch(/not a Fargate CPU/);
     expect(nearestMemory(256, 4096)).toBe(2048);
     expect(nearestMemory(16384, 4096)).toBe(32768);

@@ -28,9 +28,11 @@ export const updateProject = (project: Project) =>
   invoke<Project>("update_project", { project });
 export const startProjectContainer = (projectId: string) =>
   invoke<Project>("start_project_container", { projectId });
-/** `wip` is the stop guard's choice for an AWS project (a local one ignores it). */
+/** `wip` is the stop guard's choice for an AWS project (a local one ignores it).
+ *  Resolves to a note when the choice could not be recorded in the workspace
+ *  (its own shutdown push may then still run), else null. */
 export const stopProjectContainer = (projectId: string, wip?: WipChoice) =>
-  invoke<void>("stop_project_container", { projectId, wip: wip ?? null });
+  invoke<string | null>("stop_project_container", { projectId, wip: wip ?? null });
 export const checkUnsavedWork = (projectId: string) =>
   invoke<UnsavedWork>("check_unsaved_work", { projectId });
 export const awsTaskLog = (projectId: string, limit: number) =>

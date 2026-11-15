@@ -20,9 +20,20 @@ pub const PUSH_TIMEOUT: Duration = Duration::from_secs(300);
 /// Cap on the push output carried into an error.
 const MAX_OUTPUT: usize = 4000;
 
-/// Runs the WIP script in the workspace: `(combined output, exit code)`.
+/// Where the entrypoint's stop hook looks for the app's decision (Task 7's
+/// file, which the idle watcher also writes `idle` to).
+pub const STOP_REASON_FILE: &str = "/run/triple-c/stop-reason";
+/// Recorded after the guard's push succeeded: the hook does not push again.
+pub const MARKER_PUSHED: &str = "pushed";
+/// Recorded for "Stop without pushing": the hook does not push.
+pub const MARKER_DISCARD: &str = "discard";
+
+/// The workspace, as the stop guard uses it.
 pub trait WipRunner: Sync {
+    /// Run the WIP script as `claude`: `(combined output, exit code)`.
     fn run(&self, args: Vec<String>) -> impl Future<Output = Result<(String, i64), String>> + Send;
+    /// Record `marker` in [`STOP_REASON_FILE`] (as root: the directory is root's).
+    fn write_stop_reason(&self, marker: &str) -> impl Future<Output = Result<(), String>> + Send;
 }
 
 impl WipRunner for ContainerTarget {
@@ -31,6 +42,31 @@ impl WipRunner for ContainerTarget {
         cmd.extend(args);
         self.exec_oneshot_as("claude", cmd, Vec::new()).await
     }
+
+    async fn write_stop_reason(&self, marker: &str) -> Result<(), String> {
+        let (out, code) = self
+            .exec_oneshot_as("root", stop_reason_command(marker), Vec::new())
+            .await?;
+        if code == 0 {
+            Ok(())
+        } else {
+            Err(format!("exit {code}: {}", cap(&out)))
+        }
+    }
+}
+
+/// The root command that records `marker`; the value travels as `$1`, never
+/// inside the script.
+pub fn stop_reason_command(marker: &str) -> Vec<String> {
+    vec![
+        "sh".into(),
+        "-c".into(),
+        format!(
+            "umask 077 && mkdir -p /run/triple-c && chmod 700 /run/triple-c && printf '%s\\n' \"$1\" > {STOP_REASON_FILE}"
+        ),
+        "sh".into(),
+        marker.into(),
+    ]
 }
 
 /// The repository lines of a dry run. Lines that are not JSON objects (a
@@ -45,13 +81,6 @@ pub fn parse_dry_run(output: &str) -> Result<Vec<RepoState>, String> {
                 .map_err(|e| format!("Unexpected output from the WIP check: {e}"))
         })
         .collect()
-}
-
-/// Whether anything in `work` would be lost by a stop (or could not be checked).
-/// The frontend applies the same rule (`stopGuardNeeded`).
-#[cfg(test)]
-pub fn needs_guard(work: &UnsavedWork) -> bool {
-    !work.checked || work.repos.iter().any(|r| r.dirty || r.unpushed > 0)
 }
 
 fn unchecked(reason: String) -> UnsavedWork {
@@ -125,20 +154,61 @@ pub async fn before_stop<R: WipRunner>(
     }
 }
 
+/// The note a stop returns when the hook's own push may still run.
+pub const MARKER_NOT_RECORDED: &str = "Triple-C could not tell the workspace what you chose, so its own \
+     push of work in progress on shutdown may still run (if it is turned on).";
+
+/// Everything the guard does before StopTask: `Push` pushes (a failure is an
+/// `Err` and the stop must not happen), then records `pushed`; `Discard`
+/// records `discard`; no choice does nothing. A marker that can't be
+/// written does not stop the stop: `Ok(Some(note))` says the hook may push.
+pub async fn prepare_stop<R: WipRunner>(
+    runner: Option<&R>,
+    choice: Option<WipChoice>,
+    push_timeout: Duration,
+) -> Result<Option<String>, String> {
+    let marker = match choice {
+        None => return Ok(None),
+        Some(WipChoice::Push) => {
+            before_stop(runner, choice, push_timeout).await?;
+            MARKER_PUSHED
+        }
+        Some(WipChoice::Discard) => MARKER_DISCARD,
+    };
+    let written = match runner {
+        Some(r) => tokio::time::timeout(DRY_RUN_TIMEOUT, r.write_stop_reason(marker))
+            .await
+            .unwrap_or_else(|_| Err("timed out".into())),
+        None => Err("not connected to the workspace".into()),
+    };
+    match written {
+        Ok(()) => Ok(None),
+        Err(e) => {
+            log::warn!("Could not record the stop guard's choice ({marker}): {e}");
+            Ok(Some(MARKER_NOT_RECORDED.to_string()))
+        }
+    }
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    struct Fake {
-        reply: Result<(String, i64), String>,
-        calls: Mutex<Vec<Vec<String>>>,
-        hang: bool,
+    pub(crate) struct Fake {
+        pub reply: Result<(String, i64), String>,
+        pub calls: Mutex<Vec<Vec<String>>>,
+        pub hang: bool,
+        pub markers: Mutex<Vec<String>>,
+        pub marker_fails: bool,
     }
 
     impl Fake {
-        fn new(reply: Result<(String, i64), String>) -> Self {
-            Fake { reply, calls: Mutex::new(Vec::new()), hang: false }
+        pub fn new(reply: Result<(String, i64), String>) -> Self {
+            Fake { reply, calls: Mutex::new(Vec::new()), hang: false, markers: Mutex::new(Vec::new()), marker_fails: false }
+        }
+        fn markers(&self) -> Vec<String> {
+            self.markers.lock().unwrap().clone()
         }
         fn calls(&self) -> Vec<Vec<String>> {
             self.calls.lock().unwrap().clone()
@@ -152,6 +222,13 @@ mod tests {
                 std::future::pending::<()>().await;
             }
             self.reply.clone()
+        }
+        async fn write_stop_reason(&self, marker: &str) -> Result<(), String> {
+            if self.marker_fails {
+                return Err("agent unreachable".into());
+            }
+            self.markers.lock().unwrap().push(marker.to_string());
+            Ok(())
         }
     }
 
@@ -175,7 +252,6 @@ mod tests {
         let w = unsaved_work(Some(&fake), T).await;
         assert!(w.checked && w.error.is_none());
         assert_eq!(w.repos.len(), 1);
-        assert!(!needs_guard(&w));
         assert_eq!(fake.calls(), vec![vec!["--dry-run".to_string()]]);
     }
 
@@ -184,7 +260,6 @@ mod tests {
         let w = unsaved_work::<Fake>(None, T).await;
         assert!(!w.checked);
         assert!(w.error.as_deref().unwrap().contains("not connected"));
-        assert!(needs_guard(&w));
 
         let failing = Fake::new(Err("connection refused".into()));
         let w = unsaved_work(Some(&failing), T).await;
@@ -201,15 +276,6 @@ mod tests {
         fake.hang = true;
         let w = unsaved_work(Some(&fake), Duration::from_secs(1)).await;
         assert!(!w.checked && w.error.unwrap().contains("in time"));
-    }
-
-    #[test]
-    fn dirty_or_unpushed_work_needs_the_guard() {
-        let repo = |dirty, unpushed| RepoState { folder: "x".into(), dirty, unpushed, branch: "b".into() };
-        let w = |r| UnsavedWork { checked: true, repos: vec![r], error: None };
-        assert!(needs_guard(&w(repo(true, 0))));
-        assert!(needs_guard(&w(repo(false, 1))));
-        assert!(!needs_guard(&w(repo(false, 0))));
     }
 
     #[tokio::test]
@@ -245,5 +311,48 @@ mod tests {
         let s = format!("{}END", "x".repeat(10_000));
         let c = cap(&s);
         assert!(c.ends_with("END") && c.len() < 4100);
+    }
+
+    #[tokio::test]
+    async fn a_successful_push_records_pushed_and_stop_without_pushing_records_discard() {
+        let fake = Fake::new(Ok(("pushed".into(), 0)));
+        assert_eq!(prepare_stop(Some(&fake), Some(WipChoice::Push), T).await.unwrap(), None);
+        assert_eq!(fake.markers(), vec![MARKER_PUSHED]);
+
+        let fake = Fake::new(Err("must not run".into()));
+        assert_eq!(prepare_stop(Some(&fake), Some(WipChoice::Discard), T).await.unwrap(), None);
+        assert!(fake.calls().is_empty());
+        assert_eq!(fake.markers(), vec![MARKER_DISCARD]);
+
+        assert_eq!(prepare_stop(Some(&fake), None, T).await.unwrap(), None);
+        assert_eq!(fake.markers().len(), 1, "no choice records nothing");
+    }
+
+    #[tokio::test]
+    async fn a_failed_push_records_nothing() {
+        let fake = Fake::new(Ok(("denied".into(), 1)));
+        assert!(prepare_stop(Some(&fake), Some(WipChoice::Push), T).await.is_err());
+        assert!(fake.markers().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unwritable_marker_still_stops_and_says_the_hook_may_push() {
+        let mut fake = Fake::new(Ok((String::new(), 0)));
+        fake.marker_fails = true;
+        let note = prepare_stop(Some(&fake), Some(WipChoice::Discard), T).await.unwrap();
+        assert!(note.unwrap().contains("may still run"));
+        let note = prepare_stop::<Fake>(None, Some(WipChoice::Discard), T).await.unwrap();
+        assert!(note.is_some());
+    }
+
+    #[test]
+    fn the_marker_is_written_as_an_argument_to_the_file_the_hook_reads() {
+        let cmd = stop_reason_command("pushed");
+        assert_eq!(&cmd[..2], &["sh".to_string(), "-c".to_string()]);
+        assert!(cmd[2].contains("> /run/triple-c/stop-reason") && cmd[2].contains("\"$1\""));
+        assert_eq!(cmd.last().unwrap(), "pushed");
+        // The entrypoint matches exactly these values.
+        let ep = include_str!("../../../../container/entrypoint.sh");
+        assert!(ep.contains("pushed|discard)") && ep.contains(STOP_REASON_FILE));
     }
 }

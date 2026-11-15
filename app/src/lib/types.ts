@@ -122,6 +122,10 @@ export interface RemoveProjectOptions {
   forgetAwsResources?: boolean;
 }
 
+/** Prefix of `remove_project`'s refusal when an AWS project's connection is
+ *  gone (Rust `AWS_CONNECTION_MISSING`; a Rust test pins the two together). */
+export const AWS_CONNECTION_MISSING = "AWS_CONNECTION_MISSING: ";
+
 /** What Stop does with an AWS workspace's unsaved git work (Rust `WipChoice`). */
 export type WipChoice = "push" | "discard";
 

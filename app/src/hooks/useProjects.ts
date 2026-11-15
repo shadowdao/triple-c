@@ -126,9 +126,10 @@ export function useProjects() {
   const stop = useCallback(
     (id: string, wip?: WipChoice) =>
       withOptimisticStatus(id, "stopping", async () => {
-        await commands.stopProjectContainer(id, wip);
+        const note = await commands.stopProjectContainer(id, wip);
         const list = await commands.listProjects();
         setProjects(list);
+        return note;
       }),
     [setProjects, withOptimisticStatus],
   );

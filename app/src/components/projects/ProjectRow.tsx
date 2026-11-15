@@ -162,7 +162,12 @@ export default function ProjectRow({ project }: Props) {
         {terminal.reasonNode}
       </div>
       {stopGuard && (
-        <StopGuardModal projectName={project.name} work={stopGuard} onChoose={resolveStopGuard} />
+        <StopGuardModal
+          projectName={project.name}
+          work={stopGuard}
+          wipPushOnStop={project.aws?.wip_push_on_stop ?? false}
+          onChoose={resolveStopGuard}
+        />
       )}
     </div>
   );

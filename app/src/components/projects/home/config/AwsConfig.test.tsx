@@ -6,7 +6,8 @@ import WorkspaceSection from "./WorkspaceSection";
 import ModelSection from "./ModelSection";
 import HostSection from "./HostSection";
 import { awsProject, localProject } from "../../../../test/awsFixtures";
-import type { AuthBridgeStatus, Project } from "../../../../lib/types";
+import type { AppSettings, AuthBridgeStatus, Project } from "../../../../lib/types";
+import { useAppState } from "../../../../store/appState";
 
 const OFF_BRIDGE: AuthBridgeStatus = { enabled: false, active_ports: [], conflicts: [] };
 const removeAwsResources = vi.fn();
@@ -56,12 +57,45 @@ describe("AWS project config", () => {
     expect(screen.getByText(/mounts no folders/)).toBeInTheDocument();
   });
 
-  it("disables the gateway backend and warns about local model URLs on AWS", () => {
-    render(<ModelSection project={awsProject({ backend: "ollama" })} save={save} disabled={false} />);
-    const gateway = screen.getByRole("option", { name: /OpenAI Compatible/ }) as HTMLOptionElement;
-    expect(gateway.disabled).toBe(true);
-    expect(gateway.textContent).toMatch(/Not available on AWS/);
+  it("allows every custom-endpoint backend on AWS with the reachability warning", () => {
+    render(
+      <ModelSection
+        project={awsProject({
+          backend: "open_ai_compatible",
+          openai_compatible_config: { base_url: "https://llm.example.com", api_key: null, model_id: null, haiku_model_id: null } as never,
+        })}
+        save={save}
+        disabled={false}
+      />,
+    );
+    const oai = screen.getByRole("option", { name: "OpenAI Compatible" }) as HTMLOptionElement;
+    expect(oai.disabled).toBe(false);
     expect(screen.getByText(/must be reachable from the AWS task/)).toBeInTheDocument();
+    expect(screen.queryByText(/can't reach it/)).toBeNull();
+  });
+
+  it("warns when the endpoint is this machine, or the app's own gateway", () => {
+    const { unmount } = render(
+      <ModelSection project={awsProject({ backend: "ollama" })} save={save} disabled={false} />,
+    );
+    // The Ollama default is host.docker.internal.
+    expect(screen.getByText(/host.docker.internal is this machine/)).toBeInTheDocument();
+    unmount();
+    useAppState.setState({
+      appSettings: { gateway: { enabled: true, port: 4000 } } as unknown as AppSettings,
+    });
+    render(
+      <ModelSection
+        project={awsProject({
+          backend: "open_ai_compatible",
+          openai_compatible_config: { base_url: "http://127.0.0.1:4000", api_key: null, model_id: null, haiku_model_id: null } as never,
+        })}
+        save={save}
+        disabled={false}
+      />,
+    );
+    expect(screen.getByText(/Triple-C's own LLM gateway/)).toBeInTheDocument();
+    useAppState.setState({ appSettings: null });
   });
 });
 
@@ -125,8 +159,51 @@ describe("HostSection", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Remove AWS resources…" }));
     const dialog = screen.getByRole("dialog");
+    // Hybrid: the saved files can go too.
     fireEvent.click(within(dialog).getByRole("checkbox"));
     fireEvent.click(within(dialog).getByRole("button", { name: "Remove" }));
     await waitFor(() => expect(removeAwsResources).toHaveBeenCalledWith(p.id, true));
+  });
+
+  it("keeps the AWS resource buttons locked while the project is in Error (its task may live)", () => {
+    const p = awsProject({ status: "error" });
+    p.aws = { ...p.aws!, task_arn: "arn:task" };
+    renderHost(p, false);
+    for (const name of ["Remove AWS resources…", "Run on this machine instead"]) {
+      const b = screen.getByRole("button", { name });
+      expect(b).toHaveAttribute("aria-disabled", "true");
+      expect(b).toHaveAccessibleDescription(/still running/);
+    }
+  });
+
+  it("offers no saved-files choice for an Ephemeral workspace", () => {
+    const p = awsProject();
+    p.aws = { ...p.aws!, storage: "ephemeral", task_definition_arn: "arn:td:1" };
+    renderHost(p);
+    fireEvent.click(screen.getByRole("button", { name: "Remove AWS resources…" }));
+    expect(within(screen.getByRole("dialog")).queryByRole("checkbox")).toBeNull();
+  });
+
+  it("only promises the Spot push when the WIP push is on", () => {
+    const p = awsProject();
+    p.aws = { ...p.aws!, wip_push_on_stop: false };
+    renderHost(p);
+    expect(screen.getByText(/unpushed work is lost/)).toBeInTheDocument();
+    expect(screen.queryByText(/push below still runs/)).toBeNull();
+  });
+
+  it("keeps a repository being typed when the project list refreshes with the same repos", () => {
+    const p = awsProject();
+    const { rerender } = renderHost(p);
+    fireEvent.click(screen.getByRole("button", { name: "+ Add repository" }));
+    fireEvent.change(screen.getByLabelText("Repository 2 URL"), { target: { value: "git@h:o/half" } });
+    // A refresh hands over a new, equal array.
+    const refreshed = { ...p, aws: { ...p.aws!, repos: p.aws!.repos.map((r) => ({ ...r })) } };
+    rerender(<HostSection project={refreshed} save={save} disabled={false} />);
+    expect(screen.getByLabelText("Repository 2 URL")).toHaveValue("git@h:o/half");
+    // A real change replaces the rows.
+    const changed = { ...p, aws: { ...p.aws!, repos: [] } };
+    rerender(<HostSection project={changed} save={save} disabled={false} />);
+    expect(screen.queryByLabelText("Repository 1 URL")).toBeNull();
   });
 });

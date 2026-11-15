@@ -9,6 +9,7 @@ import type {
   OpenAiCompatibleConfig,
   Project,
 } from "../../../../lib/types";
+import { CUSTOM_ENDPOINT_BACKENDS } from "../../../../lib/types";
 import Field, {
   ConfigGroup,
   SwitchRow,
@@ -16,11 +17,12 @@ import Field, {
   selectClass,
 } from "../../../ui/Field";
 import Toggle from "../../../ui/Toggle";
-import { NOT_ON_AWS, isAwsProject } from "../../../../lib/awsWorkspace";
+import { isAwsProject, localEndpointProblem } from "../../../../lib/awsWorkspace";
+import { useAppState } from "../../../../store/appState";
 
 /** P6: an AWS workspace can reach a local model only over the network. */
 const LOCAL_MODEL_ON_AWS =
-  "This project runs on AWS: the URL must be reachable from the AWS task, so host.docker.internal and this machine's LAN addresses will not work.";
+  "This project runs on AWS: the URL must be reachable from the AWS task, so host.docker.internal, localhost and this machine's LAN addresses will not work.";
 
 /** Bedrock fields held in the OS keychain, never serialized back to us. */
 const BEDROCK_SECRET_KEYS = [
@@ -187,6 +189,19 @@ export default function ModelSection({ project, save, disabled }: Props) {
   const useSharedToken = project.use_shared_auth_token !== false;
 
   const aws = isAwsProject(project);
+  const gateway = useAppState((s) => s.appSettings?.gateway ?? null);
+  const savedBaseUrl =
+    project.backend === "ollama"
+      ? (project.ollama_config ?? DEFAULT_OLLAMA_CONFIG).base_url
+      : project.backend === "llama_cpp"
+        ? (project.llamacpp_config ?? DEFAULT_LLAMACPP_CONFIG).base_url
+        : project.backend === "open_ai_compatible"
+          ? (project.openai_compatible_config ?? DEFAULT_OPENAI_COMPATIBLE_CONFIG).base_url
+          : null;
+  const endpointProblem =
+    aws && savedBaseUrl
+      ? localEndpointProblem(savedBaseUrl, gateway?.enabled ? gateway.port : null)
+      : null;
 
   const handleBackendChange = (mode: Backend) => {
     const patch: Partial<Project> = { backend: mode };
@@ -219,24 +234,18 @@ export default function ModelSection({ project, save, disabled }: Props) {
             <option value="bedrock">Bedrock</option>
             <option value="ollama">Ollama</option>
             <option value="llama_cpp">llama.cpp</option>
-            <option value="open_ai_compatible" disabled={aws}>
-              {aws ? `OpenAI Compatible (gateway) — ${NOT_ON_AWS}` : "OpenAI Compatible"}
-            </option>
+            <option value="open_ai_compatible">OpenAI Compatible</option>
           </select>
         )}
       </Field>
-      {aws && project.backend === "open_ai_compatible" && (
-        <p role="note" className="text-xs text-[var(--warning)]">
-          OpenAI Compatible (gateway): {NOT_ON_AWS}. Choose another backend.
-        </p>
-      )}
-      {aws && (project.backend === "ollama" || project.backend === "llama_cpp") && (
-        <p
+      {aws && CUSTOM_ENDPOINT_BACKENDS.includes(project.backend) && (
+        <div
           role="note"
-          className="px-2 py-1.5 text-xs text-[var(--warning)] bg-[var(--warning-muted)] border border-[var(--warning)]/30 rounded-[var(--radius-control)]"
+          className="px-2 py-1.5 space-y-1 text-xs text-[var(--warning)] bg-[var(--warning-muted)] border border-[var(--warning)]/30 rounded-[var(--radius-control)]"
         >
-          {LOCAL_MODEL_ON_AWS}
-        </p>
+          <p>{LOCAL_MODEL_ON_AWS}</p>
+          {endpointProblem && <p>{endpointProblem}</p>}
+        </div>
       )}
 
       {/* Only Anthropic reads CLAUDE_CODE_OAUTH_TOKEN; the other backends

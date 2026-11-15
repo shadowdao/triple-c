@@ -20,31 +20,19 @@ export function isAwsProject(p: Pick<Project, "host_id">): boolean {
 /** Fargate CPU sizes (units of 1/1024 vCPU). */
 export const FARGATE_CPUS = [256, 512, 1024, 2048, 4096, 8192, 16384] as const;
 
-/** Mirrors Rust `fargate_memory_range`: `[min, max, step]` MiB for a CPU size. */
-export function fargateMemoryRange(cpu: number): [number, number, number] | null {
-  switch (cpu) {
-    case 256:
-      return [512, 2048, 512];
-    case 512:
-      return [1024, 4096, 1024];
-    case 1024:
-      return [2048, 8192, 1024];
-    case 2048:
-      return [4096, 16384, 1024];
-    case 4096:
-      return [8192, 30720, 1024];
-    case 8192:
-      return [16384, 61440, 4096];
-    case 16384:
-      return [32768, 122880, 8192];
-    default:
-      return null;
-  }
-}
-
-/** Every memory size valid with `cpu`, smallest first. */
+/** Mirrors Rust `fargate_memory_sizes`: every memory size (MiB) valid with
+ *  `cpu`, smallest first. 256 CPU is irregular: 512, 1024 or 2048 only. */
 export function memoryOptions(cpu: number): number[] {
-  const range = fargateMemoryRange(cpu);
+  if (cpu === 256) return [512, 1024, 2048];
+  const ranges: Record<number, [number, number, number]> = {
+    512: [1024, 4096, 1024],
+    1024: [2048, 8192, 1024],
+    2048: [4096, 16384, 1024],
+    4096: [8192, 30720, 1024],
+    8192: [16384, 61440, 4096],
+    16384: [32768, 122880, 8192],
+  };
+  const range = ranges[cpu];
   if (!range) return [];
   const [min, max, step] = range;
   const out: number[] = [];
@@ -52,13 +40,19 @@ export function memoryOptions(cpu: number): number[] {
   return out;
 }
 
+/** Mirrors Rust `describe_sizes`. */
+function describeSizes(sizes: number[]): string {
+  const last = sizes[sizes.length - 1];
+  if (sizes.length <= 3) return `${sizes.slice(0, -1).join(", ")} or ${last} MiB`;
+  return `${sizes[0]} to ${last} MiB in steps of ${sizes[1] - sizes[0]}`;
+}
+
 /** Null when `memory` MiB is valid with `cpu`; otherwise the reason (as Rust words it). */
 export function memoryError(cpu: number, memory: number): string | null {
-  const range = fargateMemoryRange(cpu);
-  if (!range) return `${cpu} is not a Fargate CPU size`;
-  const [min, max, step] = range;
-  if (!Number.isInteger(memory) || memory < min || memory > max || (memory - min) % step !== 0) {
-    return `${memory} MiB of memory is not valid with ${cpu} CPU units: use ${min} to ${max} MiB in steps of ${step}`;
+  const sizes = memoryOptions(cpu);
+  if (sizes.length === 0) return `${cpu} is not a Fargate CPU size`;
+  if (!sizes.includes(memory)) {
+    return `${memory} MiB of memory is not valid with ${cpu} CPU units: use ${describeSizes(sizes)}`;
   }
   return null;
 }
@@ -122,4 +116,35 @@ export function stopGuardNeeded(work: UnsavedWork): boolean {
 export function environmentSelectable(env: DetectedEnvironment): boolean {
   const ready = env.state.state === "ready" || env.state.state === "update_available";
   return ready && env.onboarding?.state === "joined";
+}
+
+/** Whether an AWS project may have saved files on EFS (Hybrid now, or an
+ *  access point left from when it was). Ephemeral-only projects have none. */
+export function hasSavedFiles(p: Pick<Project, "aws">): boolean {
+  return p.aws?.storage === "hybrid" || !!p.aws?.access_point_id;
+}
+
+/** Hosts that only mean something on this machine or its Docker bridge. */
+const LOCAL_HOSTS = /^(localhost|127(\.\d{1,3}){3}|0\.0\.0\.0|\[?::1\]?|host\.docker\.internal|172\.17\.0\.1)$/i;
+
+/**
+ * Why `url` cannot work from an AWS task, or null: a loopback / Docker-host
+ * address, or the app's own LLM gateway (it runs on this machine).
+ */
+export function localEndpointProblem(url: string, gatewayPort: number | null): string | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(url.trim());
+  } catch {
+    return null;
+  }
+  const host = parsed.hostname;
+  const port = Number(parsed.port || (parsed.protocol === "https:" ? 443 : 80));
+  if (LOCAL_HOSTS.test(host)) {
+    if (gatewayPort !== null && port === gatewayPort) {
+      return "This is Triple-C's own LLM gateway, which runs on this machine; an AWS workspace can't reach it.";
+    }
+    return `${host} is this machine (or its Docker host) — an AWS workspace can't reach it.`;
+  }
+  return null;
 }

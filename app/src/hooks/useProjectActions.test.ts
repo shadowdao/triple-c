@@ -99,6 +99,22 @@ describe("useProjectActions stop guard", () => {
   });
 });
 
+describe("useProjectActions stop notes", () => {
+  it("tells the user when the choice could not be recorded in the workspace", async () => {
+    checkUnsavedWork.mockResolvedValue(dirty);
+    stop.mockResolvedValue("its own push of work in progress on shutdown may still run");
+    const { result } = renderHook(() => useProjectActions(awsProject({ status: "running" })));
+    await act(async () => {
+      await result.current.handleStop();
+    });
+    await act(async () => {
+      await result.current.resolveStopGuard("discard");
+    });
+    expect(stop).toHaveBeenCalledWith("p1", "discard");
+    expect(toasts().at(-1)?.detail).toMatch(/may still run/);
+  });
+});
+
 describe("useProjectActions start", () => {
   it("adds the task's last log lines to an AWS start failure", async () => {
     start.mockRejectedValue("The task stopped: Essential container exited");

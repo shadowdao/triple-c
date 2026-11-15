@@ -108,9 +108,13 @@ export function useProjectActions(project: Project) {
     (choice: WipChoice | null) => {
       setStopGuard(null);
       if (choice === null) return undefined;
-      return run("Stop", () => stop(project.id, choice));
+      return run("Stop", async () => {
+        const note = await stop(project.id, choice);
+        if (note) pushToast({ kind: "info", message: `“${project.name}” stopped`, detail: note });
+        return note;
+      });
     },
-    [run, stop, project.id],
+    [run, stop, project.id, project.name, pushToast],
   );
 
   const handleReset = useCallback(

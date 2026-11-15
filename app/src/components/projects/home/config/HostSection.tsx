@@ -9,6 +9,7 @@ import {
   formatCpu,
   formatMemory,
   memoryError,
+  hasSavedFiles,
   memoryOptions,
   nearestMemory,
 } from "../../../../lib/awsWorkspace";
@@ -26,6 +27,7 @@ interface Props {
 }
 
 const DEFAULT_IDLE_MINUTES = 60;
+const STILL_RUNNING = "The task is still running — stop it first.";
 
 /**
  * Where an AWS project runs and what its Fargate task looks like. Only shown
@@ -56,6 +58,8 @@ export default function HostSection({ project, save, disabled }: Props) {
   const saveAws = (patch: Partial<AwsWorkspaceConfig>) => save({ aws: { ...aws, ...patch } });
 
   const hasResources = !!(aws.task_arn || aws.access_point_id || aws.task_definition_arn);
+  // Not `disabled` (which also allows Error): on AWS, Error can mean a live task.
+  const stopped = project.status === "stopped";
 
   const commitMemory = () => {
     const value = Number(memory);
@@ -236,7 +240,11 @@ export default function HostSection({ project, save, disabled }: Props) {
 
       <SwitchRow
         label="Spot"
-        hint="Runs on spare capacity at up to 70% off. AWS may reclaim it with two minutes' notice; the work-in-progress push below still runs."
+        hint={
+          aws.wip_push_on_stop
+            ? "Runs on spare capacity at up to 70% off. AWS may reclaim it with two minutes' notice; the work-in-progress push below still runs."
+            : "Runs on spare capacity at up to 70% off. AWS may reclaim it with two minutes' notice, and with the work-in-progress push below off, unpushed work is lost."
+        }
         control={
           <Toggle
             label="Spot"
@@ -315,10 +323,10 @@ export default function HostSection({ project, save, disabled }: Props) {
         <Button
           size="md"
           variant="danger"
-          unavailable={disabled || !hasResources}
+          unavailable={!stopped || !hasResources}
           unavailableReason={
-            disabled
-              ? "Stop the project first."
+            !stopped
+              ? STILL_RUNNING
               : "This project has no AWS resources to remove."
           }
           onClick={() => setConfirmRemoveResources(true)}
@@ -327,10 +335,10 @@ export default function HostSection({ project, save, disabled }: Props) {
         </Button>
         <Button
           size="md"
-          unavailable={disabled || hasResources}
+          unavailable={!stopped || hasResources}
           unavailableReason={
-            disabled
-              ? "Stop the project first."
+            !stopped
+              ? STILL_RUNNING
               : "Remove the workspace's AWS resources first, so nothing is left running or billed."
           }
           onClick={() => void save({ host_id: null, aws_placement: null, aws: null })}
@@ -397,15 +405,17 @@ function RemoveAwsResourcesModal({ project, onClose }: { project: Project; onClo
         keeps the project, so it can run somewhere else. Its next start on AWS sets them up
         again.
       </p>
-      <label className="mt-3 flex items-start gap-2 text-[13px] text-[var(--text-primary)]">
-        <input
-          type="checkbox"
-          className="mt-0.5"
-          checked={discardData}
-          onChange={(e) => setDiscardData(e.target.checked)}
-        />
-        <span>Also delete the workspace&rsquo;s saved files (EFS)</span>
-      </label>
+      {hasSavedFiles(project) && (
+        <label className="mt-3 flex items-start gap-2 text-[13px] text-[var(--text-primary)]">
+          <input
+            type="checkbox"
+            className="mt-0.5"
+            checked={discardData}
+            onChange={(e) => setDiscardData(e.target.checked)}
+          />
+          <span>Also delete the workspace&rsquo;s saved files (EFS)</span>
+        </label>
+      )}
       {error && (
         <p
           role="alert"

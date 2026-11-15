@@ -876,6 +876,34 @@ fn aws_stop_runs_the_wip_push_with_the_recorded_reason_once() {
 }
 
 #[test]
+fn aws_stop_skips_its_push_when_the_app_already_pushed_or_the_user_declined() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("calls");
+    let fake = write_script(
+        tmp.path(),
+        "triple-c-wip-push",
+        &format!("#!/bin/bash\necho \"$*\" >> '{}'\n", log.display()),
+    );
+    let reason = tmp.path().join("reason");
+    let blocks = aws_blocks(&["aws_env", "aws_stop"])
+        .replace("/usr/local/bin/triple-c-wip-push", fake.to_str().unwrap())
+        .replace("/run/triple-c/stop-reason", reason.to_str().unwrap());
+    let script = format!("{blocks}\naws_before_stop\n");
+    for marker in ["pushed", "discard"] {
+        fs::write(&reason, format!("{marker}\n")).unwrap();
+        let out = bash(&script, &[], &[("TRIPLEC_HOST", "aws"), ("TRIPLEC_WIP_PUSH", "1")], &[]);
+        assert!(out.status.success(), "{}", text(&out));
+        assert!(!log.exists(), "{marker}: no second push");
+        assert!(text(&out).contains(&format!("already handled by Triple-C ({marker})")), "{}", text(&out));
+    }
+    // Anything else is not a marker the app writes: the push still runs.
+    fs::write(&reason, "something-else\n").unwrap();
+    let out = bash(&script, &[], &[("TRIPLEC_HOST", "aws"), ("TRIPLEC_WIP_PUSH", "1")], &[]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(fs::read_to_string(&log).unwrap(), "--reason sigterm\n");
+}
+
+#[test]
 fn docker_mode_never_reaches_the_aws_blocks() {
     // Every new step sits behind TRIPLEC_HOST=aws; the scripts are only
     // started from those branches.

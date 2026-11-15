@@ -5,13 +5,21 @@ import ConfirmRemoveModal, { ConfirmForgetAwsModal } from "./ConfirmRemoveModal"
 describe("ConfirmRemoveModal", () => {
   it("keeps an AWS workspace's saved files unless asked", () => {
     const onConfirm = vi.fn();
-    render(<ConfirmRemoveModal projectName="api" aws onConfirm={onConfirm} onCancel={vi.fn()} />);
+    render(<ConfirmRemoveModal projectName="api" aws savedFiles onConfirm={onConfirm} onCancel={vi.fn()} />);
     const box = screen.getByRole("checkbox", { name: /saved files \(EFS\)/ });
     expect(box).not.toBeChecked();
     fireEvent.click(screen.getByRole("button", { name: "Remove" }));
     fireEvent.click(box);
     fireEvent.click(screen.getByRole("button", { name: "Remove" }));
     expect(onConfirm.mock.calls).toEqual([[{ discardData: false }], [{ discardData: true }]]);
+  });
+
+  it("offers no EFS choice for an Ephemeral AWS workspace", () => {
+    const onConfirm = vi.fn();
+    render(<ConfirmRemoveModal projectName="api" aws onConfirm={onConfirm} onCancel={vi.fn()} />);
+    expect(screen.queryByRole("checkbox")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+    expect(onConfirm).toHaveBeenCalledWith({ discardData: false });
   });
 
   it("offers no EFS choice for a local project", () => {

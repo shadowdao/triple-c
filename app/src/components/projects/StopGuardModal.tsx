@@ -6,6 +6,8 @@ import Button from "../ui/Button";
 interface Props {
   projectName: string;
   work: UnsavedWork;
+  /** The project's "push work in progress when the workspace stops" setting. */
+  wipPushOnStop?: boolean;
   /** `null` = Cancel. */
   onChoose: (choice: WipChoice | null) => void;
 }
@@ -23,7 +25,7 @@ function describeRepo(dirty: boolean, unpushed: number): string {
  * the default (it has focus); it is not offered when the check could not
  * run, since the push goes the same way the check did.
  */
-export default function StopGuardModal({ projectName, work, onChoose }: Props) {
+export default function StopGuardModal({ projectName, work, wipPushOnStop = false, onChoose }: Props) {
   const pushRef = useRef<HTMLButtonElement>(null);
   const stopRef = useRef<HTMLButtonElement>(null);
   const atRisk = work.repos.filter((r) => r.dirty || r.unpushed > 0);
@@ -45,7 +47,7 @@ export default function StopGuardModal({ projectName, work, onChoose }: Props) {
             variant={work.checked ? "danger" : "primary"}
             onClick={() => onChoose("discard")}
           >
-            Stop anyway
+            {work.checked ? "Stop without pushing" : "Stop anyway"}
           </Button>
           {work.checked && (
             <Button ref={pushRef} size="md" variant="primary" onClick={() => onChoose("push")}>
@@ -74,7 +76,9 @@ export default function StopGuardModal({ projectName, work, onChoose }: Props) {
           <p className="mt-3 text-[13px] text-[var(--text-secondary)]">
             Push to WIP branch saves a snapshot of each repository to a{" "}
             <span className="font-mono">triple-c/wip/…</span> branch on its remote, without
-            touching your branches. If the push fails, the workspace keeps running.
+            touching your branches. If the push fails, the workspace keeps running. Stop
+            without pushing skips that push, including the one the workspace would make as it
+            shuts down.
           </p>
         </>
       ) : (
@@ -94,6 +98,8 @@ export default function StopGuardModal({ projectName, work, onChoose }: Props) {
           )}
           <p className="mt-2 text-[13px] text-[var(--text-secondary)]">
             Uncommitted or unpushed work in the workspace may be lost if you stop it now.
+            {wipPushOnStop &&
+              " The workspace's own push of work in progress still runs as it shuts down, if it can reach the remote."}
           </p>
         </>
       )}

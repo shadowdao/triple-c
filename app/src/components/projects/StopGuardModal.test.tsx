@@ -25,10 +25,10 @@ describe("StopGuardModal", () => {
     expect(onChoose).toHaveBeenCalledWith("push");
   });
 
-  it("offers Stop anyway and Cancel", () => {
+  it("offers Stop without pushing and Cancel", () => {
     const onChoose = vi.fn();
     render(<StopGuardModal projectName="api" work={dirty} onChoose={onChoose} />);
-    fireEvent.click(screen.getByRole("button", { name: "Stop anyway" }));
+    fireEvent.click(screen.getByRole("button", { name: "Stop without pushing" }));
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(onChoose.mock.calls).toEqual([["discard"], [null]]);
   });
@@ -39,10 +39,12 @@ describe("StopGuardModal", () => {
       <StopGuardModal
         projectName="api"
         work={{ checked: false, repos: [], error: "Triple-C is not connected to the workspace" }}
+        wipPushOnStop
         onChoose={onChoose}
       />,
     );
     expect(screen.queryByRole("button", { name: /Push/ })).toBeNull();
+    expect(screen.getByText(/own push of work in progress still runs/)).toBeInTheDocument();
     expect(screen.getByText("Triple-C is not connected to the workspace")).toBeInTheDocument();
     expect(screen.getByText(/could not check/)).toBeInTheDocument();
     const stop = screen.getByRole("button", { name: "Stop anyway" });

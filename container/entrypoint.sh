@@ -1168,7 +1168,9 @@ start_agent
 # ── AWS: WIP push on stop, idle auto-stop ───────────────────────────────────
 # aws_before_stop runs from the TERM trap below, before the keepalive goes:
 # with TRIPLEC_WIP_PUSH=1 it pushes every repo's unsaved work to a
-# triple-c/wip/<stamp> branch (as `claude`, bounded at 90 s). ECS gives a task
+# triple-c/wip/<stamp> branch (as `claude`, bounded at 90 s), unless the app's
+# stop guard recorded `pushed` or `discard` in /run/triple-c/stop-reason
+# (written as root through the agent just before StopTask). ECS gives a task
 # `stopTimeout` seconds between SIGTERM and SIGKILL — 30 by default, 120 at
 # most on Fargate — so the task definition must raise it for the push to
 # finish. Once only: a second TERM during the push changes nothing.
@@ -1185,10 +1187,16 @@ aws_before_stop() {
     [ "${TRIPLEC_HOST:-}" = aws ] || return 0
     [ -z "${triplec_stopping:-}" ] || return 0
     triplec_stopping=1
-    local reason=sigterm
-    if [ "$(cat /run/triple-c/stop-reason 2>/dev/null)" = idle ]; then
-        reason=idle
-    fi
+    local reason=sigterm recorded
+    recorded=$(cat /run/triple-c/stop-reason 2>/dev/null)
+    case "$recorded" in
+        idle) reason=idle ;;
+        # The app's stop guard already pushed, or the user chose to stop
+        # without pushing: honour that instead of pushing again.
+        pushed|discard)
+            echo "entrypoint: stopping — work in progress already handled by Triple-C ($recorded); not pushing"
+            return 0 ;;
+    esac
     if [ "${TRIPLEC_WIP_PUSH:-0}" = 1 ]; then
         echo "entrypoint: stopping ($reason) — pushing work in progress..."
         _triplec_as_user timeout -k 5 90 /usr/local/bin/triple-c-wip-push --reason "$reason" \

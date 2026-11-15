@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { RepoSource } from "../../lib/types";
 import { cleanRepos, repoFolderFromUrl } from "../../lib/awsWorkspace";
 import Button from "../ui/Button";
@@ -70,8 +70,8 @@ export function RepoRows({ rows, onRowsChange, onCommit, disabled = false }: Rep
               aria-label={`Remove repository ${i + 1}`}
               onClick={() => {
                 onRowsChange(rows.filter((_, j) => j !== i));
-                // A removal is a finished edit. The commit is applied after
-                // the rows update renders, so it sees the shorter list.
+                // A removal is a finished edit; `onRowsChange` has already
+                // handed the shorter list over.
                 onCommit?.();
               }}
             >
@@ -98,6 +98,9 @@ function sameRepos(a: RepoSource[], b: RepoSource[]): boolean {
  * The Config tab's save-on-blur repository list. Saves when every row that
  * has anything in it has a URL; the backend's validation message (bad URL,
  * folder used twice…) comes back through the save's toast.
+ *
+ * Rows in progress survive a refresh of the project list: they are replaced
+ * from `repos` only when the stored value actually changed.
  */
 export default function RepoListEditor({
   repos,
@@ -109,25 +112,28 @@ export default function RepoListEditor({
   disabled?: boolean;
 }) {
   const [rows, setRows] = useState<RepoSource[]>(repos);
-  useEffect(() => setRows(repos), [repos]);
+  // The latest rows, so a commit right after an edit (a removal) sees them.
+  const rowsRef = useRef(rows);
+  const storedRef = useRef(repos);
 
-  // A commit bumps this; the effect then runs against the rendered rows.
-  const [pending, setPending] = useState(0);
   useEffect(() => {
-    if (pending === 0) return;
-    const cleaned = cleanRepos(rows);
-    if (cleaned.some((r) => !r.url)) return;
-    if (sameRepos(cleaned, repos)) return;
-    void onSave(cleaned);
-    // Only a commit triggers this; `rows` changing alone does not save.
-  }, [pending]);
+    if (sameRepos(repos, storedRef.current)) return;
+    storedRef.current = repos;
+    rowsRef.current = repos;
+    setRows(repos);
+  }, [repos]);
 
-  return (
-    <RepoRows
-      rows={rows}
-      onRowsChange={setRows}
-      onCommit={() => setPending((n) => n + 1)}
-      disabled={disabled}
-    />
-  );
+  const change = (next: RepoSource[]) => {
+    rowsRef.current = next;
+    setRows(next);
+  };
+
+  const commit = () => {
+    const cleaned = cleanRepos(rowsRef.current);
+    if (cleaned.some((r) => !r.url)) return;
+    if (sameRepos(cleaned, storedRef.current)) return;
+    void onSave(cleaned);
+  };
+
+  return <RepoRows rows={rows} onRowsChange={change} onCommit={commit} disabled={disabled} />;
 }
