@@ -351,6 +351,18 @@
           "markdownDescription": "Enables the acquire_claude_token command without any pre-configured scope."
         },
         {
+          "description": "Enables the add_aws_keys_connection command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-add-aws-keys-connection",
+          "markdownDescription": "Enables the add_aws_keys_connection command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the add_aws_profile_connection command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-add-aws-profile-connection",
+          "markdownDescription": "Enables the add_aws_profile_connection command without any pre-configured scope."
+        },
+        {
           "description": "Enables the add_marketplace command without any pre-configured scope.",
           "type": "string",
           "const": "allow-add-marketplace",
@@ -393,6 +405,24 @@
           "markdownDescription": "Enables the apply_settings_import command without any pre-configured scope."
         },
         {
+          "description": "Enables the aws_connection_identity command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-aws-connection-identity",
+          "markdownDescription": "Enables the aws_connection_identity command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the aws_connection_sso_login command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-aws-connection-sso-login",
+          "markdownDescription": "Enables the aws_connection_sso_login command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the aws_policy_document command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-aws-policy-document",
+          "markdownDescription": "Enables the aws_policy_document command without any pre-configured scope."
+        },
+        {
           "description": "Enables the aws_sso_refresh command without any pre-configured scope.",
           "type": "string",
           "const": "allow-aws-sso-refresh",
@@ -427,6 +457,12 @@
           "type": "string",
           "const": "allow-cancel-marketplace-gh-login",
           "markdownDescription": "Enables the cancel_marketplace_gh_login command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the check_aws_permissions command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-check-aws-permissions",
+          "markdownDescription": "Enables the check_aws_permissions command without any pre-configured scope."
         },
         {
           "description": "Enables the check_browser_view_support command without any pre-configured scope.",
@@ -867,6 +903,12 @@
           "markdownDescription": "Enables the regenerate_web_terminal_token command without any pre-configured scope."
         },
         {
+          "description": "Enables the remove_host_connection command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-remove-host-connection",
+          "markdownDescription": "Enables the remove_host_connection command without any pre-configured scope."
+        },
+        {
           "description": "Enables the remove_marketplace command without any pre-configured scope.",
           "type": "string",
           "const": "allow-remove-marketplace",
@@ -1083,6 +1125,12 @@
           "markdownDescription": "Enables the uninstall_marketplace_item command without any pre-configured scope."
         },
         {
+          "description": "Enables the update_aws_connection command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-update-aws-connection",
+          "markdownDescription": "Enables the update_aws_connection command without any pre-configured scope."
+        },
+        {
           "description": "Enables the update_marketplace command without any pre-configured scope.",
           "type": "string",
           "const": "allow-update-marketplace",
@@ -1161,6 +1209,18 @@
           "markdownDescription": "Denies the acquire_claude_token command without any pre-configured scope."
         },
         {
+          "description": "Denies the add_aws_keys_connection command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-add-aws-keys-connection",
+          "markdownDescription": "Denies the add_aws_keys_connection command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the add_aws_profile_connection command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-add-aws-profile-connection",
+          "markdownDescription": "Denies the add_aws_profile_connection command without any pre-configured scope."
+        },
+        {
           "description": "Denies the add_marketplace command without any pre-configured scope.",
           "type": "string",
           "const": "deny-add-marketplace",
@@ -1203,6 +1263,24 @@
           "markdownDescription": "Denies the apply_settings_import command without any pre-configured scope."
         },
         {
+          "description": "Denies the aws_connection_identity command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-aws-connection-identity",
+          "markdownDescription": "Denies the aws_connection_identity command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the aws_connection_sso_login command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-aws-connection-sso-login",
+          "markdownDescription": "Denies the aws_connection_sso_login command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the aws_policy_document command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-aws-policy-document",
+          "markdownDescription": "Denies the aws_policy_document command without any pre-configured scope."
+        },
+        {
           "description": "Denies the aws_sso_refresh command without any pre-configured scope.",
           "type": "string",
           "const": "deny-aws-sso-refresh",
@@ -1237,6 +1315,12 @@
           "type": "string",
           "const": "deny-cancel-marketplace-gh-login",
           "markdownDescription": "Denies the cancel_marketplace_gh_login command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the check_aws_permissions command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-check-aws-permissions",
+          "markdownDescription": "Denies the check_aws_permissions command without any pre-configured scope."
         },
         {
           "description": "Denies the check_browser_view_support command without any pre-configured scope.",
@@ -1677,6 +1761,12 @@
           "markdownDescription": "Denies the regenerate_web_terminal_token command without any pre-configured scope."
         },
         {
+          "description": "Denies the remove_host_connection command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-remove-host-connection",
+          "markdownDescription": "Denies the remove_host_connection command without any pre-configured scope."
+        },
+        {
           "description": "Denies the remove_marketplace command without any pre-configured scope.",
           "type": "string",
           "const": "deny-remove-marketplace",
@@ -1891,6 +1981,12 @@
           "type": "string",
           "const": "deny-uninstall-marketplace-item",
           "markdownDescription": "Denies the uninstall_marketplace_item command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the update_aws_connection command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-update-aws-connection",
+          "markdownDescription": "Denies the update_aws_connection command without any pre-configured scope."
         },
         {
           "description": "Denies the update_marketplace command without any pre-configured scope.",

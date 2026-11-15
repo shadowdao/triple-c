@@ -489,8 +489,7 @@ pub fn aws_keys_entry_state(connection_id: &str) -> Option<bool> {
     }
 }
 
-/// Missing entry is success. Unused until connection removal lands.
-#[allow(dead_code)]
+/// Missing entry is success.
 pub fn delete_aws_keys(connection_id: &str) -> Result<(), String> {
     delete_entry(&aws_connection_service(connection_id)?, "the AWS access keys")
 }

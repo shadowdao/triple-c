@@ -135,7 +135,6 @@ pub struct SdkPermissionApi {
 }
 
 impl SdkPermissionApi {
-    #[allow(dead_code)] // Called by the Tauri commands (Task 6).
     pub fn new(cfg: &aws_config::SdkConfig) -> Self {
         SdkPermissionApi {
             iam: aws_sdk_iam::Client::new(cfg),
@@ -387,7 +386,6 @@ fn is_credential_error(e: &AwsError) -> bool {
 /// principal. Other failures of individual checks (throttling, network)
 /// make that row `Unverified` with a note, which blocks its tier's claim.
 /// See [`summary`] for the claim rules.
-#[allow(dead_code)] // Called by the Tauri commands (Task 6).
 pub async fn check_permissions<A: PermissionApi>(
     api: &A,
     identity: &CallerIdentity,

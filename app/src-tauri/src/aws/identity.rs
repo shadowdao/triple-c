@@ -17,7 +17,6 @@ pub struct CallerIdentity {
 
 /// `sts:GetCallerIdentity`, which needs no IAM permission: it is the
 /// connection test itself.
-#[allow(dead_code)] // Called by the Tauri commands (Task 6).
 pub async fn caller_identity(cfg: &SdkConfig) -> Result<CallerIdentity, AwsError> {
     const ACTION: &str = "sts:GetCallerIdentity";
     let out = aws_sdk_sts::Client::new(cfg)
@@ -123,7 +122,8 @@ pub async fn resolve_principal(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::aws::{classify_sdk_error, AwsError};
+    use crate::aws::error::classify_sdk_error;
+    use crate::aws::AwsError;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]

@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ProjectPath, ProjectRemovalReport, ProjectResetOutcome, ContainerInfo, AppSettings, SettingsImportPreview, SettingsImportOutcome, UpdateInfo, ImageUpdateInfo, FileEntry, FileContents, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, BrowserPageState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo, UploadOutcome, Note, ViewerFile, ViewerPoll, ViewerSaved, ViewerState, FileDiff, InstallScope, ItemUpdate, Marketplace, MarketplaceAccount, MarketplaceItemRef, MarketplaceSnapshot, ProjectSyncResult, SyncReport } from "./types";
+import type { Project, ProjectPath, ProjectRemovalReport, ProjectResetOutcome, ContainerInfo, AppSettings, SettingsImportPreview, SettingsImportOutcome, UpdateInfo, ImageUpdateInfo, FileEntry, FileContents, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, BrowserPageState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo, UploadOutcome, Note, ViewerFile, ViewerPoll, ViewerSaved, ViewerState, FileDiff, InstallScope, ItemUpdate, Marketplace, MarketplaceAccount, MarketplaceItemRef, MarketplaceSnapshot, ProjectSyncResult, SyncReport, HostConnection, CallerIdentity, PermissionReport, Tier } from "./types";
 
 // Docker
 export const checkDocker = () => invoke<boolean>("check_docker");
@@ -44,6 +44,40 @@ export const detectAwsConfig = () =>
   invoke<string | null>("detect_aws_config");
 export const listAwsProfiles = () =>
   invoke<string[]>("list_aws_profiles");
+
+// AWS host connections. The commands returning `Promise<…>` below reject with an `AwsError`
+// object (not a string); narrow a caught value with `toAwsError` from `./aws-error`.
+export const addAwsProfileConnection = (name: string, profile: string, defaultRegion: string) =>
+  invoke<HostConnection>("add_aws_profile_connection", { name, profile, defaultRegion });
+export const addAwsKeysConnection = (
+  name: string,
+  accessKeyId: string,
+  secretAccessKey: string,
+  sessionToken: string | null,
+  defaultRegion: string,
+) =>
+  invoke<HostConnection>("add_aws_keys_connection", {
+    name,
+    accessKeyId,
+    secretAccessKey,
+    sessionToken,
+    defaultRegion,
+  });
+export const updateAwsConnection = (id: string, name: string, defaultRegion: string) =>
+  invoke<HostConnection>("update_aws_connection", { id, name, defaultRegion });
+/** Rejects with a string. Returns the settings after removal. */
+export const removeHostConnection = (id: string) =>
+  invoke<AppSettings>("remove_host_connection", { id });
+export const awsConnectionIdentity = (id: string) =>
+  invoke<CallerIdentity>("aws_connection_identity", { id });
+/** Profile connections only; rejects with a string. */
+export const awsConnectionSsoLogin = (id: string) =>
+  invoke<void>("aws_connection_sso_login", { id });
+/** `region` omitted: the connection's default region. */
+export const checkAwsPermissions = (id: string, region?: string) =>
+  invoke<PermissionReport>("check_aws_permissions", { id, region: region ?? null });
+export const awsPolicyDocument = (tier: Tier) =>
+  invoke<string>("aws_policy_document", { tier });
 /** Check a corporate CA path and report what would be installed. Never
  *  rejects for a bad path — the reason comes back in `error`. */
 export const inspectCaCertPath = (path: string) =>

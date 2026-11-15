@@ -47,6 +47,12 @@ impl SettingsStore {
         })
     }
 
+    /// A store over an explicit file, for tests (no data-dir lookup).
+    #[cfg(test)]
+    pub(crate) fn at_path(file_path: PathBuf) -> Self {
+        Self { settings: Mutex::new(AppSettings::default()), file_path }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, AppSettings> {
         self.settings.lock().unwrap_or_else(|e| e.into_inner())
     }

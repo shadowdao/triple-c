@@ -20,7 +20,6 @@ pub enum Tier {
 }
 
 /// The policy document an admin attaches for `tier`.
-#[allow(dead_code)] // Only tests read the policy text so far.
 pub fn policy_json(tier: Tier) -> &'static str {
     match tier {
         Tier::EnvironmentAdmin => include_str!("../../../../aws/policies/environment-admin.json"),

@@ -20,7 +20,6 @@ use crate::storage::secure;
 /// The SDK config for `conn` in `region`. Credentials are resolved lazily,
 /// so a missing profile or an expired SSO session surfaces on the first
 /// call and is classified there (`classify_sdk_error`).
-#[allow(dead_code)] // Called by the Tauri commands (Task 6).
 pub async fn sdk_config(conn: &HostConnection, region: &str) -> Result<SdkConfig, AwsError> {
     sdk_config_with(conn, region, None).await
 }
@@ -58,6 +57,12 @@ pub(crate) async fn sdk_config_with(
         }
     };
     Ok(build_sdk_config(region, credentials))
+}
+
+/// The SDK config for keys not yet saved (the add-connection check runs
+/// before anything touches the keychain).
+pub fn sdk_config_for_keys(keys: &secure::AwsKeys, region: &str) -> SdkConfig {
+    build_sdk_config(Region::new(region.to_string()), keys_credentials(keys))
 }
 
 fn keys_credentials(keys: &secure::AwsKeys) -> SharedCredentialsProvider {

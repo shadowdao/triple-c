@@ -1138,3 +1138,49 @@ export interface HostConnection {
   name: string;
   kind: { type: "aws"; auth: AwsAuth; default_region: string };
 }
+
+export type AwsErrorKind = AwsError["kind"];
+
+/** What a failed AWS command rejects with (`aws::AwsError`, tagged on `kind`). */
+export type AwsError =
+  | { kind: "sso_expired"; profile: string }
+  | { kind: "profile_not_found"; profile: string }
+  | { kind: "keys_missing" }
+  | { kind: "invalid_credentials"; message: string }
+  | { kind: "access_denied"; action: string; message: string }
+  | { kind: "other"; message: string };
+
+export interface CallerIdentity {
+  account: string;
+  arn: string;
+  user_id: string;
+}
+
+export type Tier = "environment_admin" | "workspace_user";
+
+export type Verdict = "allowed" | "denied" | "unverified";
+
+export interface ActionResult {
+  action: string;
+  verdict: Verdict;
+  /** Set when the row is unverified because a call failed; blocks the tier's claim. */
+  note: string | null;
+}
+
+export interface TierResult {
+  tier: Tier;
+  results: ActionResult[];
+}
+
+export type PermissionMethod = "simulated" | { probed: { reason: string } };
+
+export type PermissionSummary = "environment_admin" | "workspace_user" | "insufficient";
+
+export interface PermissionReport {
+  identity: CallerIdentity;
+  region: string;
+  method: PermissionMethod;
+  summary: PermissionSummary;
+  /** `[workspace_user, environment_admin]`. */
+  tiers: TierResult[];
+}
