@@ -109,7 +109,7 @@ fn files_script(tmp: &Path) -> String {
 fn aws_files_decode_to_the_host_dirs_mode_600_and_leave_the_environment() {
     let tmp = tempfile::tempdir().unwrap();
     let files = format!(
-        r#"{{"ssh/id_ed25519":"{}","ssh/config":"{}","ca/corp.crt":"{}","ssh/..":"{}","ssh/a/b":"{}","ssh/":"{}","home/x":"{}","ca/bad":"%%%"}}"#,
+        r#"{{"ssh/id_ed25519":"{}","ssh/config":"{}","ca/corp.crt":"{}","ssh/..":"{}","ssh/a/b":"{}","ssh/":"{}","home/x":"{}","ca/bad":"%%%","ssh/{long}":"{}","ssh/\ud800":"{}"}}"#,
         b64("PRIVATE-KEY-BODY"),
         b64("Host *\n"),
         b64("-----BEGIN CERTIFICATE-----"),
@@ -117,6 +117,9 @@ fn aws_files_decode_to_the_host_dirs_mode_600_and_leave_the_environment() {
         b64("x"),
         b64("x"),
         b64("x"),
+        b64("x"),
+        b64("x"),
+        long = "a".repeat(300),
     );
     let repos = r#"[{"url":"https://example.invalid/r.git","branch":null,"folder":"r"}]"#;
     let out = bash(
@@ -150,8 +153,18 @@ fn aws_files_decode_to_the_host_dirs_mode_600_and_leave_the_environment() {
     assert_eq!(names, ["config", "id_ed25519"]);
     assert_eq!(fs::read_dir(&ca).unwrap().count(), 1);
     assert!(!tmp.path().join("a").exists() && !tmp.path().join("x").exists());
-    for bad in ["ssh/..", "ssh/a/b", "\"ssh/\"", "home/x", "ca/bad"] {
-        assert!(log.contains(&format!("refusing")) && log.contains(bad.trim_matches('"')), "{bad}: {log}");
+    let long_key = format!("ssh/{}", "a".repeat(300));
+    for (key, why) in [
+        ("'ssh/..'", "not ssh/<name> or ca/<name>"),
+        ("'ssh/a/b'", "not ssh/<name> or ca/<name>"),
+        ("'ssh/'", "not ssh/<name> or ca/<name>"),
+        ("'home/x'", "not ssh/<name> or ca/<name>"),
+        ("'ca/bad'", "value is not base64"),
+        (&format!("'{long_key}'"), "File name too long"),
+        ("'ssh/\\ud800'", "UnicodeEncodeError"),
+    ] {
+        let line = format!("entrypoint: refusing file entry {key}: {why}");
+        assert!(log.lines().any(|l| l == line), "missing `{line}` in:\n{log}");
     }
 
     // Gone from the environment, and from the agent's snapshot of it.
@@ -260,21 +273,96 @@ fn link_persistent_home_without_the_mount_changes_nothing() {
     assert!(fs::symlink_metadata(home.join(".claude")).unwrap().is_dir());
 }
 
+/// `write_claude_json` with the Hybrid mount at `<tmp>/mnt`, in aws mode or not.
+fn write_claude_json(tmp: &Path, aws: bool) -> Output {
+    let mnt = tmp.join("mnt");
+    let blocks = aws_blocks(&["aws_env", "write_claude_json"])
+        .replace("triplec_home_mnt=/mnt/triple-c-home", &format!("triplec_home_mnt='{}'", mnt.display()));
+    // chown to a user the host may not have is noise here, not the point.
+    let script = format!(
+        "chown() {{ :; }}\n{blocks}\ntriplec_aws={}\nCLAUDE_JSON=\"$1/.claude.json\"\nwrite_claude_json '{{\"a\":1}}'\n",
+        if aws { 1 } else { 0 }
+    );
+    bash(&script, &[&tmp.join("home")], &[], &[])
+}
+
+fn hybrid_dirs(tmp: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let (home, mnt) = (tmp.join("home"), tmp.join("mnt"));
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&mnt).unwrap();
+    (home, mnt)
+}
+
 #[test]
 fn write_claude_json_keeps_a_linked_claude_json_linked() {
     let tmp = tempfile::tempdir().unwrap();
-    let (home, persist) = (tmp.path().join("home"), tmp.path().join("mnt"));
-    fs::create_dir_all(&home).unwrap();
-    fs::create_dir_all(&persist).unwrap();
-    fs::write(persist.join(".claude.json"), "{}").unwrap();
-    std::os::unix::fs::symlink(persist.join(".claude.json"), home.join(".claude.json")).unwrap();
-    let f = block(ENTRYPOINT, "write_claude_json");
-    // chown to a user the host may not have is noise here, not the point.
-    let script = format!("chown() {{ :; }}\n{f}\nCLAUDE_JSON=\"$1/.claude.json\"\nwrite_claude_json '{{\"a\":1}}'\n");
-    let out = bash(&script, &[&home], &[], &[]);
+    let (home, mnt) = hybrid_dirs(tmp.path());
+    fs::write(mnt.join(".claude.json"), "{}").unwrap();
+    std::os::unix::fs::symlink(mnt.join(".claude.json"), home.join(".claude.json")).unwrap();
+    let out = write_claude_json(tmp.path(), true);
     assert!(out.status.success(), "{}", text(&out));
     assert!(fs::symlink_metadata(home.join(".claude.json")).unwrap().file_type().is_symlink());
-    assert_eq!(fs::read_to_string(persist.join(".claude.json")).unwrap().trim(), "{\"a\":1}");
+    assert_eq!(fs::read_to_string(mnt.join(".claude.json")).unwrap().trim(), "{\"a\":1}");
+    assert_eq!(mode(&mnt.join(".claude.json")), 0o600);
+    assert!(!mnt.join(".claude.json.triple-c-tmp").exists());
+}
+
+#[test]
+fn write_claude_json_refuses_a_link_triple_c_did_not_make() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, mnt) = hybrid_dirs(tmp.path());
+    // A link pointing somewhere else entirely.
+    let elsewhere = tmp.path().join("elsewhere");
+    fs::write(&elsewhere, "untouched").unwrap();
+    std::os::unix::fs::symlink(&elsewhere, home.join(".claude.json")).unwrap();
+    let out = write_claude_json(tmp.path(), true);
+    assert!(!out.status.success());
+    assert!(text(&out).contains("did not make"), "{}", text(&out));
+    assert_eq!(fs::read_to_string(&elsewhere).unwrap(), "untouched");
+
+    // The right link, but its target swapped for a link of its own.
+    fs::remove_file(home.join(".claude.json")).unwrap();
+    std::os::unix::fs::symlink(mnt.join(".claude.json"), home.join(".claude.json")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, mnt.join(".claude.json")).unwrap();
+    let out = write_claude_json(tmp.path(), true);
+    assert!(!out.status.success());
+    assert_eq!(fs::read_to_string(&elsewhere).unwrap(), "untouched");
+}
+
+#[test]
+fn write_claude_json_outside_aws_writes_a_plain_file_as_before() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, _mnt) = hybrid_dirs(tmp.path());
+    let out = write_claude_json(tmp.path(), false);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(fs::symlink_metadata(home.join(".claude.json")).unwrap().is_file());
+    assert_eq!(fs::read_to_string(home.join(".claude.json")).unwrap().trim(), "{\"a\":1}");
+}
+
+#[test]
+fn the_hybrid_ssh_dir_is_used_only_through_the_link_triple_c_made() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, mnt) = hybrid_dirs(tmp.path());
+    let check = |home: &Path| {
+        let blocks = aws_blocks(&["aws_env", "aws_home"])
+            .replace("triplec_home_mnt=/mnt/triple-c-home", &format!("triplec_home_mnt='{}'", mnt.display()));
+        bash(&format!("{blocks}\naws_hybrid_ssh_dir \"$1\""), &[home], &[], &[])
+    };
+    fs::create_dir_all(mnt.join(".ssh")).unwrap();
+    std::os::unix::fs::symlink(mnt.join(".ssh"), home.join(".ssh")).unwrap();
+    let out = check(&home);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), mnt.join(".ssh").to_str().unwrap());
+
+    // Persisted .ssh replaced by a link (to /etc, say): refused.
+    fs::remove_dir(mnt.join(".ssh")).unwrap();
+    std::os::unix::fs::symlink(tmp.path(), mnt.join(".ssh")).unwrap();
+    assert!(!check(&home).status.success());
+
+    // ~/.ssh linked anywhere else: refused.
+    fs::remove_file(home.join(".ssh")).unwrap();
+    std::os::unix::fs::symlink(tmp.path(), home.join(".ssh")).unwrap();
+    assert!(!check(&home).status.success());
 }
 
 // --------------------------------------------------------------- clone_repos
@@ -307,11 +395,18 @@ fn clone_repos_clones_skips_existing_and_reports_failures_without_failing() {
             {{"url":"{r}","branch":"dev","folder":"dev-copy"}},
             {{"url":"/nonexistent/nope.git","branch":null,"folder":"existing"}},
             {{"url":"/nonexistent/nope.git","branch":null,"folder":"broken"}},
-            {{"url":"{r}","branch":null,"folder":"../escape"}}]"#,
+            {{"url":"{r}","branch":null,"folder":"../escape"}},
+            {{"url":"{r}","branch":null,"folder":"bad\ud800"}},
+            {{"url":"{r}","branch":null,"folder":".dotted"}}]"#,
         r = remote.display()
     );
-    let script = format!("{}\nclone_repos \"$JSON\" \"$1\"\necho \"rc=$?\"\n", aws_blocks(&["aws_env", "aws_repos"]));
-    let out = bash(&script, &[&ws], &[("JSON", &json)], &[]);
+    let status = tmp.path().join("status");
+    fs::create_dir_all(&status).unwrap();
+    let script = format!(
+        "{}\nclone_repos \"$JSON\" \"$1\" \"$2\"\necho \"rc=$?\"\n",
+        aws_blocks(&["aws_env", "aws_repos"])
+    );
+    let out = bash(&script, &[&ws, &status], &[("JSON", &json)], &[]);
     let log = text(&out);
     assert!(out.status.success(), "{log}");
     assert!(log.contains("rc=0"), "{log}");
@@ -321,7 +416,42 @@ fn clone_repos_clones_skips_existing_and_reports_failures_without_failing() {
     assert!(log.contains("Triple-C: clone of broken failed:"), "{log}");
     assert!(!log.contains("clone of existing failed"), "{log}");
     assert!(log.contains("../escape"), "a bad folder is refused by name: {log}");
+    assert!(log.contains("bad folder 'bad\\ud800'"), "{log}");
     assert!(!tmp.path().join("escape").exists());
+    assert_eq!(fs::read_to_string(ws.join(".dotted/README")).unwrap(), "hello");
+    assert_eq!(
+        fs::read_to_string(status.join("repos")).unwrap(),
+        "main-copy\tcloned\ndev-copy\tcloned\nexisting\texists\nbroken\tfailed\n.dotted\tcloned\n"
+    );
+}
+
+/// A stand-in `ssh` that records how it was called and fails.
+fn fake_ssh(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let log = dir.join("ssh-calls");
+    let ssh = write_script(dir, "fake-ssh", &format!("#!/bin/sh\necho \"$*\" >> '{}'\nexit 255\n", log.display()));
+    (ssh, log)
+}
+
+#[test]
+fn clone_repos_keeps_the_users_ssh_command_and_adds_batch_mode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (ssh, calls) = fake_ssh(tmp.path());
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(home.join(".gitconfig"), format!("[core]\n\tsshCommand = sh {} -o User=me\n", ssh.display())).unwrap();
+    let ws = tmp.path().join("ws");
+    fs::create_dir_all(&ws).unwrap();
+    let json = r#"[{"url":"ssh://git@example.invalid/r.git","branch":null,"folder":"r"}]"#;
+    let script = format!("{}\nclone_repos \"$JSON\" \"$1\"\n", aws_blocks(&["aws_env", "aws_repos"]));
+    let out = bash(
+        &script,
+        &[&ws],
+        &[("JSON", json), ("HOME", home.to_str().unwrap()), ("GIT_CONFIG_NOSYSTEM", "1")],
+        &["GIT_SSH_COMMAND", "GIT_SSH"],
+    );
+    assert!(text(&out).contains("clone of r failed"), "{}", text(&out));
+    let calls = fs::read_to_string(&calls).unwrap();
+    assert!(calls.contains("-o User=me -o BatchMode=yes"), "{calls}");
 }
 
 #[test]
@@ -345,7 +475,10 @@ fn write_script(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
 fn wip_push(ws: &Path, args: &[&str]) -> Output {
     let tmp = ws.parent().unwrap();
     let script = write_script(tmp, "triple-c-wip-push", WIP_PUSH);
-    Command::new(script)
+    // Through bash rather than exec'd: a script written a moment ago can be
+    // ETXTBSY to exec while a parallel test's fork still holds it open.
+    Command::new("bash")
+        .arg(script)
         .args(args)
         .env("TRIPLEC_WORKSPACE_ROOT", ws)
         .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -482,6 +615,65 @@ fn wip_push_fails_when_a_push_fails() {
 }
 
 #[test]
+fn wip_push_covers_dot_folders() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (ws, _repo, remote) = workspace_with_clone(tmp.path());
+    git(&ws, &["clone", "-q", remote.to_str().unwrap(), ".hidden"]);
+    fs::write(ws.join(".hidden/y"), "y").unwrap();
+    let out = wip_push(&ws, &["--dry-run"]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains(r#""folder":".hidden""#), "{}", text(&out));
+    let out = wip_push(&ws, &[]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(wip_refs(&remote).len(), 1);
+}
+
+#[test]
+fn wip_push_keeps_the_repos_ssh_command_and_adds_batch_mode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (ws, repo, _remote) = workspace_with_clone(tmp.path());
+    let (ssh, calls) = fake_ssh(tmp.path());
+    git(&repo, &["config", "core.sshCommand", &format!("sh {} -o User=me", ssh.display())]);
+    git(&repo, &["remote", "set-url", "origin", "ssh://git@example.invalid/r.git"]);
+    fs::write(repo.join("y"), "y").unwrap();
+    let out = wip_push(&ws, &[]);
+    assert!(!out.status.success(), "the fake ssh fails the push");
+    let calls = fs::read_to_string(&calls).unwrap();
+    assert!(calls.contains("-o User=me -o BatchMode=yes"), "{calls}");
+}
+
+#[test]
+fn wip_push_uploads_lfs_objects_before_the_no_verify_push() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (ws, repo, remote) = workspace_with_clone(tmp.path());
+    // A stand-in git-lfs: present, reports one LFS file, records the push.
+    let bin = tmp.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let log = tmp.path().join("lfs-calls");
+    write_script(
+        &bin,
+        "git-lfs",
+        &format!(
+            "#!/bin/sh\ncase \"$1\" in\n  version) echo fake;;\n  ls-files) echo big.bin;;\n  push) echo \"$*\" >> '{}';;\nesac\n",
+            log.display()
+        ),
+    );
+    fs::write(repo.join("y"), "y").unwrap();
+    let script = write_script(tmp.path(), "triple-c-wip-push", WIP_PUSH);
+    let out = Command::new("bash")
+        .arg(script)
+        .env("TRIPLEC_WORKSPACE_ROOT", &ws)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("HOME", tmp.path())
+        .env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    let refs = wip_refs(&remote);
+    let pushed = git(&remote, &["rev-parse", &refs[0]]);
+    assert_eq!(fs::read_to_string(&log).unwrap().trim(), format!("push origin {pushed}"));
+}
+
+#[test]
 fn wip_push_rejects_an_unknown_reason() {
     let tmp = tempfile::tempdir().unwrap();
     let ws = tmp.path().join("workspace");
@@ -538,7 +730,8 @@ impl Watch {
 
     fn cmd(&self, agent_url: &str, signal_pid: u32) -> Command {
         let p = self.tmp.path();
-        let mut c = Command::new(p.join("triple-c-idle-watch"));
+        let mut c = Command::new("bash");
+        c.arg(p.join("triple-c-idle-watch"));
         c.env_clear()
             .env("PATH", std::env::var("PATH").unwrap())
             .env("HOME", p.join("home"))
@@ -587,6 +780,20 @@ s.serve_forever()
     use std::io::BufRead;
     std::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
     (format!("http://127.0.0.1:{}", line.trim()), child)
+}
+
+#[test]
+fn idle_watch_check_counts_an_unfinished_clone_as_busy() {
+    let w = Watch::new();
+    let (url, mut agent) = fake_agent(w.tmp.path(), r#"{"last_activity_unix":1,"active_execs":0,"active_tunnels":0}"#);
+    let clone = w.tmp.path().join("clone");
+    fs::create_dir_all(&clone).unwrap();
+    let busy = w.cmd(&url, 0).env("TRIPLEC_CLONE_STATUS_DIR", &clone).arg("--check").output().unwrap();
+    fs::write(clone.join("done"), "").unwrap();
+    let idle = w.cmd(&url, 0).env("TRIPLEC_CLONE_STATUS_DIR", &clone).arg("--check").output().unwrap();
+    agent.kill().ok();
+    assert_eq!(busy.status.code(), Some(1), "{}", text(&busy));
+    assert_eq!(idle.status.code(), Some(0), "{}", text(&idle));
 }
 
 #[test]
@@ -689,6 +896,7 @@ fn docker_mode_never_reaches_the_aws_blocks() {
         "triple-c-idle-watch",
         "clone_repos",
         "link_persistent_home",
+        "aws_hybrid_ssh_dir",
         "aws_before_stop",
         "start_idle_watch",
     ];
@@ -706,7 +914,18 @@ fn docker_mode_never_reaches_the_aws_blocks() {
             "unguarded call outside the aws blocks: {line}"
         );
     }
-    assert_eq!(seen, 4, "the four call sites: Hybrid link, clone, idle watch, stop");
+    assert_eq!(seen, 5, "the call sites: Hybrid link, Hybrid ~/.ssh, clone, idle watch, stop");
+    // Clones start in the background *after* the agent: the app gives a
+    // starting task's agent only seconds to answer.
+    let pos = |needle: &str| {
+        lines
+            .iter()
+            .position(|l| l.trim_start().starts_with(needle))
+            .unwrap_or_else(|| panic!("{needle}"))
+    };
+    let agent_call = lines.iter().position(|l| l.trim() == "start_agent").expect("start_agent call");
+    assert!(agent_call < pos("start_clone_repos"), "clones must start after the agent");
+    assert!(block(ENTRYPOINT, "aws_repos").contains(") &"), "start_clone_repos backgrounds the clone");
     // And the snapshot-sensitive variables are gone before the agent's
     // environment snapshot is taken.
     assert!(ENTRYPOINT.find("unset TRIPLEC_FILES").unwrap() < ENTRYPOINT.find("# >>> agent_token").unwrap());

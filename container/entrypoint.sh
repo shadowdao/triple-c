@@ -34,6 +34,8 @@
 triplec_aws=0
 triplec_run_as=claude
 triplec_repos_json=
+# Where Hybrid storage mounts the project's EFS access point.
+triplec_home_mnt=/mnt/triple-c-home
 
 # stdin: the TRIPLEC_FILES JSON; $1 the ssh dir, $2 the CA dir. Names are
 # validated (non-empty, no `/`, not `.`/`..`, no NUL) and anything else is
@@ -54,27 +56,21 @@ except ValueError:
 if not isinstance(files, dict):
     say("TRIPLEC_FILES is not a JSON object; no files written")
     sys.exit(1)
-bad = 0
-for key, value in files.items():
+def write(key, value):
     kind, sep, name = key.partition("/")
     if kind not in dirs or not sep or name in ("", ".", "..") or "/" in name or "\0" in name:
-        say("refusing file entry %r: not ssh/<name> or ca/<name>" % key)
-        bad += 1
-        continue
+        return "not ssh/<name> or ca/<name>"
+    name.encode("utf-8")  # a lone surrogate cannot name a file
     try:
         data = base64.b64decode(value, validate=True) if isinstance(value, str) else None
     except (binascii.Error, ValueError):
         data = None
     if data is None:
-        say("refusing file entry %r: value is not base64" % key)
-        bad += 1
-        continue
+        return "value is not base64"
     d = dirs[kind]
     os.makedirs(d, mode=0o700, exist_ok=True)
     if not stat.S_ISDIR(os.lstat(d).st_mode):
-        say("refusing file entry %r: %s is not a directory" % (key, d))
-        bad += 1
-        continue
+        return "%s is not a directory" % d
     os.chmod(d, 0o700)
     if root:
         os.chown(d, 0, 0)
@@ -84,6 +80,16 @@ for key, value in files.items():
         if root:
             os.fchown(f.fileno(), 0, 0)
         f.write(data)
+    return None
+bad = 0
+for key, value in files.items():
+    try:
+        why = write(key, value)
+    except (OSError, UnicodeError, ValueError) as e:
+        why = "%s" % (e.strerror if isinstance(e, OSError) and e.strerror else type(e).__name__)
+    if why:
+        say("refusing file entry %r: %s" % (key, why))
+        bad += 1
 sys.exit(1 if bad else 0)
 ' "$1" "$2"
 }
@@ -220,10 +226,14 @@ find /home/claude \( ! -user claude -o ! -group claude \) -exec chown -h claude:
 # >>> aws_home
 link_persistent_home() {
     local home="$1" persist="$2" owner="$3" name link target
-    if [ ! -d "$persist" ]; then
+    if [ ! -d "$persist" ] || [ -L "$persist" ]; then
         echo "entrypoint: warning — Hybrid storage, but $persist is not mounted; home state will not persist"
         return 0
     fi
+    # The access point already makes its root 1000:1000; said again here so
+    # claude (Claude Code's own atomic saves, write_claude_json) can always
+    # create files beside the persisted ones.
+    [ -z "$owner" ] || chown "$owner" "$persist" 2>/dev/null
     for name in .claude .claude.json .ssh; do
         link="$home/$name"
         target="$persist/$name"
@@ -254,9 +264,21 @@ link_persistent_home() {
     done
     echo "entrypoint: Hybrid storage — ~/.claude, ~/.claude.json and ~/.ssh persist on $persist"
 }
+
+# The real directory behind a Hybrid ~/.ssh link, printed only when the link
+# is exactly the one link_persistent_home makes and neither it nor the mount
+# is itself a symlink. Root chowns and chmods under the result, and the
+# persisted directory is claude-writable, so root must never be pointed
+# anywhere else by it.
+aws_hybrid_ssh_dir() {
+    local home="$1" want="$triplec_home_mnt/.ssh"
+    [ "$(readlink "$home/.ssh")" = "$want" ] || return 1
+    [ ! -L "$triplec_home_mnt" ] && [ ! -L "$want" ] && [ -d "$want" ] || return 1
+    printf '%s' "$want"
+}
 # <<< aws_home
 if [ "$triplec_aws" = 1 ] && [ "${TRIPLEC_STORAGE:-}" = hybrid ]; then
-    link_persistent_home /home/claude /mnt/triple-c-home claude:claude
+    link_persistent_home /home/claude "$triplec_home_mnt" claude:claude
 fi
 
 # ── Corporate CA certificates ───────────────────────────────────────────────
@@ -509,20 +531,29 @@ sync_host_ssh() {
 }
 # <<< sync_host_ssh
 
-if [ -d /tmp/.host-ssh ]; then
-    sync_host_ssh /tmp/.host-ssh /home/claude/.ssh
-    # Trailing slashes: on AWS Hybrid ~/.ssh is a symlink, and without them
-    # `chown -R` and `find` would stop at the link itself.
-    chown -R claude:claude /home/claude/.ssh/
-    chmod 700 /home/claude/.ssh
-    find /home/claude/.ssh/ -type f -name "id_*" ! -name "*.pub" -exec chmod 600 {} \;
-    find /home/claude/.ssh/ -type f -name "*.triple-c-backup" -exec chmod 600 {} \;
-    find /home/claude/.ssh/ -type f -name "*.pub" -exec chmod 644 {} \;
-    if [ -f /home/claude/.ssh/known_hosts ]; then
-        chmod 644 /home/claude/.ssh/known_hosts
+# On AWS Hybrid ~/.ssh is a link into the EFS mount; the root steps below then
+# work on the real directory behind it, and only after aws_hybrid_ssh_dir has
+# confirmed the link is the one Triple-C made. Any other link: nothing is
+# merged. Docker: always /home/claude/.ssh, as before.
+ssh_home_dir=/home/claude/.ssh
+if [ "$triplec_aws" = 1 ] && [ -L "$ssh_home_dir" ]; then
+    ssh_home_dir=$(aws_hybrid_ssh_dir /home/claude) || {
+        echo "entrypoint: warning — ~/.ssh is a symlink Triple-C did not make; host SSH files not merged"
+        ssh_home_dir=""
+    }
+fi
+if [ -n "$ssh_home_dir" ] && [ -d /tmp/.host-ssh ]; then
+    sync_host_ssh /tmp/.host-ssh "$ssh_home_dir"
+    chown -R claude:claude "$ssh_home_dir"
+    chmod 700 "$ssh_home_dir"
+    find "$ssh_home_dir" -type f -name "id_*" ! -name "*.pub" -exec chmod 600 {} \;
+    find "$ssh_home_dir" -type f -name "*.triple-c-backup" -exec chmod 600 {} \;
+    find "$ssh_home_dir" -type f -name "*.pub" -exec chmod 644 {} \;
+    if [ -f "$ssh_home_dir/known_hosts" ]; then
+        chmod 644 "$ssh_home_dir/known_hosts"
     fi
-    if [ -f /home/claude/.ssh/config ]; then
-        chmod 600 /home/claude/.ssh/config
+    if [ -f "$ssh_home_dir/config" ]; then
+        chmod 600 "$ssh_home_dir/config"
     fi
 fi
 
@@ -595,21 +626,30 @@ chown claude:claude /home/claude/.gitconfig 2>/dev/null || true
 
 # ── AWS: clone the project's repositories ───────────────────────────────────
 # An AWS workspace has no project folder to mount; its repositories are cloned
-# into /workspace/<folder> on start. Here, after the credential helper, git
-# identity and ~/.ssh are in place, as `claude`, with prompts off and a
-# per-repo time limit. A folder that is already a repository (Hybrid keeps
-# nothing under /workspace today, but a restarted container would) is left
-# alone. Failures are reported and never stop the start: a workspace with one
-# repo missing is still a workspace.
+# into /workspace/<folder> once the credential helper, git identity and ~/.ssh
+# are in place — as `claude`, with prompts off and a per-repo time limit. A
+# folder that is already a repository is left alone. Failures are reported and
+# never stop the start: a workspace with one repo missing is still a workspace.
+#
+# In the background, started after the agent (start_clone_repos below): the
+# app gives a starting task's agent only seconds to answer, so a clone in the
+# way of the agent would fail every start with a large repository. Terminals
+# work while the repos arrive. Progress, for the app to show later, is in
+# /run/triple-c-clone (world-readable, root-written): `repos` gets one
+# "<folder>\t<cloned|failed|exists>" line per repo, and `done` appears when
+# all are finished. The idle watcher counts an unfinished clone as activity.
 # >>> aws_repos
+# clone_repos json root [status_dir]
 clone_repos() {
-    local json="$1" root="$2" folder url branch dest existed err rc
+    local json="$1" root="$2" status_dir="${3:-}" folder url branch dest existed err rc
     local limit="${triplec_clone_timeout:-600}"
     [ -n "$json" ] || return 0
+    _clone_status() { [ -z "$status_dir" ] || printf '%s\t%s\n' "$1" "$2" >> "$status_dir/repos"; }
     while IFS= read -r -d '' folder && IFS= read -r -d '' url && IFS= read -r -d '' branch; do
         dest="$root/$folder"
         if [ -e "$dest/.git" ]; then
             echo "entrypoint: /workspace/$folder is already a repository; not cloning"
+            _clone_status "$folder" exists
             continue
         fi
         existed=0
@@ -618,17 +658,24 @@ clone_repos() {
         [ -n "$branch" ] && args+=(--branch "$branch")
         args+=(-- "$url" "$dest")
         echo "entrypoint: cloning $folder..."
-        err=$(_triplec_as_user env GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="ssh -o BatchMode=yes" \
-            timeout -k 10 "$limit" git "${args[@]}" 2>&1 </dev/null)
+        # BatchMode is appended to whatever ssh command the user's git config
+        # names (core.sshCommand), read as the user, rather than replacing it.
+        err=$(_triplec_as_user sh -c '
+            limit=$1; shift
+            c=${GIT_SSH_COMMAND:-$(git config --get core.sshCommand)}
+            export GIT_SSH_COMMAND="${c:-ssh} -o BatchMode=yes" GIT_TERMINAL_PROMPT=0
+            exec timeout -k 10 "$limit" git "$@"' _ "$limit" "${args[@]}" 2>&1 </dev/null)
         rc=$?
         if [ "$rc" -eq 0 ]; then
             echo "entrypoint: cloned $folder"
+            _clone_status "$folder" cloned
             continue
         fi
         [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ] && err="timed out after ${limit}s"
         # Don't leave a half-made clone that the next start would skip.
         [ "$existed" = 1 ] || rm -rf "$dest"
         echo "Triple-C: clone of $folder failed: $(printf '%s' "$err" | tail -n 1)"
+        _clone_status "$folder" failed
     done < <(printf '%s' "$json" | python3 -I -c '
 import json, sys
 def say(msg):
@@ -642,14 +689,20 @@ if not isinstance(repos, list):
     say("TRIPLEC_REPOS is not a JSON array; nothing cloned")
     sys.exit(0)
 def text(v):
-    return isinstance(v, str) and "\0" not in v
+    if not isinstance(v, str) or "\0" in v or "\t" in v or "\n" in v:
+        return False
+    try:
+        v.encode("utf-8")
+    except UnicodeError:
+        return False
+    return True
 for i, r in enumerate(repos):
     if not isinstance(r, dict):
         say("skipping repository %d: not an object" % i)
         continue
     url, branch, folder = r.get("url"), r.get("branch"), r.get("folder")
     if not text(folder) or folder in ("", ".", "..") or "/" in folder:
-        say("skipping repository %d: bad folder %r" % (i, folder))
+        say("skipping repository %d: bad folder %a" % (i, folder))
         continue
     if not text(url) or not url:
         say("skipping %s: bad url" % folder)
@@ -659,12 +712,23 @@ for i, r in enumerate(repos):
         continue
     sys.stdout.write("%s\0%s\0%s\0" % (folder, url, branch or ""))
 ')
+    unset -f _clone_status
     return 0
 }
+
+# Runs clone_repos in the background, recording progress in $2.
+start_clone_repos() {
+    local json="$1" status_dir="$2"
+    [ -n "$json" ] || return 0
+    rm -rf "$status_dir"
+    mkdir -m 755 "$status_dir" || status_dir=""
+    (
+        trap '' HUP
+        clone_repos "$json" /workspace "$status_dir"
+        [ -z "$status_dir" ] || : > "$status_dir/done"
+    ) &
+}
 # <<< aws_repos
-if [ "$triplec_aws" = 1 ]; then
-    clone_repos "$triplec_repos_json" /workspace
-fi
 
 # ── Claude instructions ──────────────────────────────────────────────────────
 if [ -n "$CLAUDE_INSTRUCTIONS" ]; then
@@ -826,27 +890,40 @@ fi
 # skips the write that would have repaired it. `triple-c-task-runner` has done
 # it this way all along.
 #
-# A linked ~/.claude.json (AWS Hybrid storage) is written where the link
-# points: renaming over the link itself would swap it for a plain file and the
-# state would quietly stop persisting.
+# On AWS Hybrid storage ~/.claude.json is a link into the EFS mount, and
+# renaming over the link would swap it for a plain file and the state would
+# quietly stop persisting. So the write goes to the link's target — but only
+# when the link is exactly the one link_persistent_home makes and its target
+# is not itself a link, and it is done *as claude*: that directory is
+# claude-writable, so root must not write, rename or chown anything in it.
+# Docker mode never takes that branch.
 # >>> write_claude_json
 write_claude_json() {
-    _wcj_dest="$CLAUDE_JSON"
-    if [ -L "$_wcj_dest" ]; then
-        _wcj_dest=$(readlink -f "$CLAUDE_JSON")
-        [ -n "$_wcj_dest" ] || _wcj_dest="$CLAUDE_JSON"
+    if [ "${triplec_aws:-0}" = 1 ] && [ -L "$CLAUDE_JSON" ]; then
+        _wcj_dest="$triplec_home_mnt/.claude.json"
+        if [ "$(readlink "$CLAUDE_JSON")" != "$_wcj_dest" ] || [ -L "$triplec_home_mnt" ] || [ -L "$_wcj_dest" ]; then
+            echo "entrypoint: warning — $CLAUDE_JSON is a symlink Triple-C did not make; not writing through it"
+            return 1
+        fi
+        if printf '%s\n' "$1" | _triplec_as_user sh -c \
+            'umask 077; cat > "$1.triple-c-tmp" && mv -f "$1.triple-c-tmp" "$1"' _ "$_wcj_dest"; then
+            return 0
+        fi
+        _triplec_as_user rm -f "$_wcj_dest.triple-c-tmp"
+        echo "entrypoint: warning — could not write $CLAUDE_JSON (leaving it as it was)"
+        return 1
     fi
-    _wcj_tmp="${_wcj_dest}.triple-c-tmp"
+    _wcj_tmp="${CLAUDE_JSON}.triple-c-tmp"
     if printf '%s\n' "$1" > "$_wcj_tmp" 2>/dev/null; then
-        mv -f "$_wcj_tmp" "$_wcj_dest" 2>/dev/null || rm -f "$_wcj_tmp"
+        mv -f "$_wcj_tmp" "$CLAUDE_JSON" 2>/dev/null || rm -f "$_wcj_tmp"
     else
         rm -f "$_wcj_tmp"
         echo "entrypoint: warning — could not write $CLAUDE_JSON (leaving it as it was)"
         return 1
     fi
     # By name, after the rename, so these land on the new inode.
-    chown claude:claude "$_wcj_dest"
-    chmod 600 "$_wcj_dest"
+    chown claude:claude "$CLAUDE_JSON"
+    chmod 600 "$CLAUDE_JSON"
 }
 # <<< write_claude_json
 
@@ -1148,6 +1225,10 @@ start_idle_watch() {
 # <<< aws_stop
 if [ "$triplec_aws" = 1 ] && [ -n "${TRIPLEC_IDLE_STOP_MINUTES:-}" ]; then
     start_idle_watch "$TRIPLEC_IDLE_STOP_MINUTES" "$$"
+fi
+# Repos are cloned in the background from here on — see clone_repos.
+if [ "$triplec_aws" = 1 ]; then
+    start_clone_repos "$triplec_repos_json" /run/triple-c-clone
 fi
 
 echo "Triple-C container ready."

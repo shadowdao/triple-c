@@ -9,7 +9,9 @@
 #   * the agent's /v1/activity (read with the agent's own token file) shows
 #     no authenticated activity for N minutes, no open exec, no open tunnel;
 #   * no `claude` process is running;
-#   * no scheduler job is running (`triple-c-scheduler status`, as claude).
+#   * no scheduler job is running (`triple-c-scheduler status`, as claude);
+#   * the start's background repository clone has finished (entrypoint.sh,
+#     start_clone_repos: /run/triple-c-clone exists without `done`).
 #
 # Anything it cannot read counts as NOT idle: a stop is the one thing here
 # that cannot be undone, so every doubt keeps the workspace running.
@@ -39,6 +41,7 @@
 #   TRIPLEC_SCHEDULER_BIN       default /usr/local/bin/triple-c-scheduler
 #   TRIPLEC_SCHEDULER_USER      default claude; empty runs it as this user
 #   TRIPLEC_IDLE_PROC_NAME      default claude
+#   TRIPLEC_CLONE_STATUS_DIR    default /run/triple-c-clone
 
 set -u
 
@@ -51,6 +54,7 @@ reason_file="${TRIPLEC_STOP_REASON_FILE:-/run/triple-c/stop-reason}"
 scheduler="${TRIPLEC_SCHEDULER_BIN:-/usr/local/bin/triple-c-scheduler}"
 scheduler_user="${TRIPLEC_SCHEDULER_USER-claude}"
 proc_name="${TRIPLEC_IDLE_PROC_NAME:-claude}"
+clone_dir="${TRIPLEC_CLONE_STATUS_DIR:-/run/triple-c-clone}"
 
 # >>> is_idle
 # is_idle now last_activity_unix active_execs active_tunnels claude_running jobs_running minutes
@@ -95,12 +99,19 @@ jobs_running() {
     if [ "$out" = "Nothing running." ]; then echo 0; else echo 1; fi
 }
 
+# A clone still under way counts as a running job.
+clone_running() {
+    [ -d "$clone_dir" ] && [ ! -e "$clone_dir/done" ]
+}
+
 check() {
-    local act last execs tunnels claude
+    local act last execs tunnels claude jobs
     act=$(read_activity) || return 1
     read -r last execs tunnels <<< "$act"
     if pgrep -x "$proc_name" >/dev/null 2>&1; then claude=1; else claude=0; fi
-    is_idle "$(date +%s)" "${last:-}" "${execs:-}" "${tunnels:-}" "$claude" "$(jobs_running)" "$minutes"
+    jobs=$(jobs_running)
+    clone_running && jobs=1
+    is_idle "$(date +%s)" "${last:-}" "${execs:-}" "${tunnels:-}" "$claude" "$jobs" "$minutes"
 }
 
 case "$minutes" in

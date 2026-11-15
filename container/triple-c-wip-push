@@ -46,9 +46,8 @@ while [ $# -gt 0 ]; do
 done
 
 export GIT_TERMINAL_PROMPT=0 GIT_OPTIONAL_LOCKS=0
-# BatchMode: an unknown host key or a passphrase prompt fails at once instead
-# of waiting for input nobody will give. Keeps any GIT_SSH_COMMAND the user set.
-export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh} -o BatchMode=yes"
+# Dot-folders too: clone_repos accepts a folder named `.x`.
+shopt -s dotglob nullglob
 
 stamp=$(date -u +%Y%m%d-%H%M%S)
 failed=0
@@ -63,6 +62,8 @@ pick_remote() {
     if [ "$(git remote | wc -l)" -eq 1 ]; then git remote; fi
 }
 
+user_ssh_command="${GIT_SSH_COMMAND:-}"
+
 for dir in "$root"/*/; do
     dir="${dir%/}"
     [ -d "$dir" ] || continue
@@ -74,6 +75,12 @@ for dir in "$root"/*/; do
 
     (
         cd "$dir" || exit 1
+        # BatchMode: an unknown host key or a passphrase prompt fails at once
+        # instead of waiting for input nobody will give. Appended to the ssh
+        # command the user chose (GIT_SSH_COMMAND, else this repo's
+        # core.sshCommand), never instead of it.
+        ssh_cmd="${user_ssh_command:-$(git config --get core.sshCommand)}"
+        export GIT_SSH_COMMAND="${ssh_cmd:-ssh} -o BatchMode=yes"
         head=$(git rev-parse -q --verify HEAD 2>/dev/null)
         branch=$(git symbolic-ref -q --short HEAD 2>/dev/null) || branch=HEAD
 
@@ -134,6 +141,17 @@ for dir in "$root"/*/; do
         fi
 
         ref="refs/heads/triple-c/wip/$stamp"
+        # --no-verify skips every pre-push hook, Git LFS's upload among them.
+        # So when git-lfs is here and the snapshot has LFS files, upload their
+        # objects first — best effort: the push still goes, with a warning.
+        if git lfs version >/dev/null 2>&1 \
+            && [ -n "$(git lfs ls-files --name-only "$commit" 2>/dev/null | head -n 1)" ]; then
+            if lfs_err=$(git lfs push "$remote" "$commit" 2>&1); then
+                echo "triple-c-wip-push: $folder: uploaded LFS objects to $remote"
+            else
+                echo "triple-c-wip-push: $folder: warning — LFS upload failed, large files may be missing on the branch: $(printf '%s' "$lfs_err" | tail -n 1)" >&2
+            fi
+        fi
         if err=$(git push --no-verify -q "$remote" "$commit:$ref" 2>&1); then
             echo "triple-c-wip-push: $folder: pushed to $remote $ref"
         else

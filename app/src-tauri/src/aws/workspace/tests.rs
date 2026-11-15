@@ -210,6 +210,8 @@ fn request_shape_matches_the_global_constraints() {
     assert_eq!(req.task_role_arn(), Some(plan.task_role_arn.as_str()));
     assert_eq!(req.execution_role_arn(), Some(plan.exec_role_arn.as_str()));
     assert_eq!(req.ephemeral_storage().unwrap().size_in_gib(), 21);
+    // Room for the TERM trap's WIP push (90 s) before SIGKILL.
+    assert_eq!(req.container_definitions()[0].stop_timeout(), Some(120));
     let rp = req.runtime_platform().unwrap();
     assert_eq!(rp.cpu_architecture(), Some(&CpuArchitecture::X8664));
     assert_eq!(
@@ -481,6 +483,8 @@ fn payload_keeps_its_own_keys_over_custom_env() {
     let env = pairs(&[
         ("TRIPLEC_AGENT_TOKEN", "forged"),
         ("TRIPLEC_HOST", "local"),
+        ("TRIPLEC_AGENT_ADDR", "0.0.0.0:47900"),
+        ("triplec_other", "x"),
         ("COLORTERM", "16"),
         ("OK", "1"),
     ]);
@@ -491,6 +495,9 @@ fn payload_keeps_its_own_keys_over_custom_env() {
     // The task definition's fixed environment owns these two names.
     assert!(!m.contains_key("TRIPLEC_HOST"));
     assert!(!m.contains_key("COLORTERM"));
+    // The rest of the TRIPLEC_ namespace is the entrypoint's too.
+    assert!(!m.contains_key("TRIPLEC_AGENT_ADDR"));
+    assert!(!m.contains_key("triplec_other"));
     assert_eq!(m["OK"], "1");
 }
 

@@ -75,6 +75,9 @@ const KEY_WIP_PUSH: &str = "TRIPLEC_WIP_PUSH";
 const KEY_IDLE: &str = "TRIPLEC_IDLE_STOP_MINUTES";
 const KEY_STORAGE: &str = "TRIPLEC_STORAGE";
 /// The task definition's whole `environment` (R2): constants, no project data.
+/// Seconds ECS waits after SIGTERM before SIGKILL (Fargate allows 2–120).
+pub const STOP_TIMEOUT_SECS: i32 = 120;
+
 const FIXED_ENVIRONMENT: [(&str, &str); 2] = [("TRIPLEC_HOST", "aws"), ("COLORTERM", "truecolor")];
 
 fn other(message: impl Into<String>) -> AwsError {
@@ -151,7 +154,13 @@ fn payload_map(
                 k.escape_debug()
             ));
         }
-        if own.contains(&k.as_str()) || FIXED_ENVIRONMENT.iter().any(|(f, _)| f == k) {
+        // The whole `TRIPLEC_` namespace is the entrypoint's (the Docker side
+        // reserves it too: `RESERVED_ENV_PREFIXES`), not just the keys this
+        // payload writes — `TRIPLEC_AGENT_ADDR`, say, would rebind the agent.
+        if own.contains(&k.as_str())
+            || FIXED_ENVIRONMENT.iter().any(|(f, _)| f == k)
+            || k.to_ascii_uppercase().starts_with("TRIPLEC_")
+        {
             log::warn!("Ignoring the environment variable {k}: Triple-C sets it on AWS");
             continue;
         }
@@ -326,6 +335,10 @@ fn build_request(plan: &WorkspacePlan) -> RegisterTaskDefinitionInput {
         .name(CONTAINER_NAME)
         .image(&plan.image)
         .essential(true)
+        // SIGTERM → SIGKILL grace. The entrypoint's TERM trap pushes unsaved
+        // work (`triple-c-wip-push`, bounded at 90 s) before it exits; ECS's
+        // default 30 s would kill most pushes part-way. 120 is Fargate's max.
+        .stop_timeout(STOP_TIMEOUT_SECS)
         .set_environment(Some(
             FIXED_ENVIRONMENT
                 .iter()

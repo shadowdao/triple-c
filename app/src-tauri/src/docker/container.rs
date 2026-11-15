@@ -245,7 +245,11 @@ pub(crate) const LABEL_SCRUB: &str = "triple-c.scrub";
 /// cannot travel onto a snapshot. See the `LABEL` block in the Dockerfile.
 pub(crate) const LABEL_BASE: &str = "triple-c.base";
 
-const RESERVED_ENV_PREFIXES: &[&str] = &["ANTHROPIC_", "AWS_", "GIT_", "HOST_", "TRIPLE_C_"];
+/// `TRIPLEC_` is the AWS workspace's own namespace (`TRIPLEC_HOST`,
+/// `TRIPLEC_FILES`, `TRIPLEC_AGENT_TOKEN`, … — see `container/entrypoint.sh`):
+/// a custom var there could switch a local container into AWS mode or forge
+/// the inputs the entrypoint trusts.
+const RESERVED_ENV_PREFIXES: &[&str] = &["ANTHROPIC_", "AWS_", "GIT_", "HOST_", "TRIPLE_C_", "TRIPLEC_"];
 
 /// Exact env var names Triple-C manages itself. Not covered by
 /// [`RESERVED_ENV_PREFIXES`] because they don't share those prefixes.
@@ -4094,6 +4098,22 @@ mod tests {
         // would reinstall a skill for a capability the container no longer has.
         assert_eq!(vpn_env_var(true), "VPN_SUPPORT_ENABLED=1");
         assert_eq!(vpn_env_var(false), "VPN_SUPPORT_ENABLED=0");
+    }
+
+    #[test]
+    fn the_aws_workspace_namespace_is_reserved_from_custom_env() {
+        for key in ["TRIPLEC_HOST", "TRIPLEC_FILES", "TRIPLEC_AGENT_TOKEN", "triplec_repos", "TRIPLEC_ANYTHING"] {
+            assert!(is_reserved_env_key(key), "{key}");
+        }
+        assert_eq!(
+            compute_env_fingerprint(&[EnvVar {
+                key: "TRIPLEC_HOST".to_string(),
+                value: "aws".to_string(),
+            }]),
+            "",
+            "a reserved key never reaches the container"
+        );
+        assert!(!is_reserved_env_key("TRIPLECX"));
     }
 
     #[test]
