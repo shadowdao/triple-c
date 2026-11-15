@@ -2360,12 +2360,17 @@ mod environment {
                 // reported together), so check them all before the result.
                 let removed = host.remove_aws_resources(&current(&store), &settings, true).await;
                 eprintln!("RESULT remove_aws_resources: {:?}", removed.as_ref().map_err(|e| e.chars().take(400).collect::<String>()));
-                let sm = ok(
-                    "describe the project secret",
-                    t.e.secrets.describe_secret().secret_id(project_secret_name(&name, &okey, &id)).send().await,
-                );
-                eprintln!("RESULT project secret after remove: deleted_date {:?}", sm.deleted_date());
-                assert!(sm.deleted_date().is_some(), "the secret is scheduled for deletion");
+                // R10: deleted at once, so the next start can create it again.
+                // The forced delete completes asynchronously; give it a moment.
+                let secret_gone = poll(Duration::from_secs(60), Duration::from_secs(5), || async {
+                    match t.e.secrets.describe_secret().secret_id(project_secret_name(&name, &okey, &id)).send().await {
+                        Err(e) if e.as_service_error().is_some_and(|s| s.is_resource_not_found_exception()) => Some(()),
+                        _ => None,
+                    }
+                })
+                .await;
+                eprintln!("RESULT project secret after remove: gone {secret_gone:?}");
+                assert!(secret_gone.is_some(), "the secret is deleted without a recovery window");
                 let defs = ok(
                     "list the family",
                     ecs_admin.list_task_definitions().family_prefix(&family).send().await,

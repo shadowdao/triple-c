@@ -820,7 +820,7 @@ pub async fn stop_project(project: &Project, settings: &AppSettings) -> Result<(
 // ────────────────────────────────────────────────────────────── remove
 
 /// Stop the task and remove the project's AWS resources (task definition
-/// revisions, the secret with a 7-day window, and with `discard_data` the
+/// revisions, the secret at once, and with `discard_data` the
 /// access point). The tunnel is closed once that succeeded; on failure the
 /// project keeps it.
 pub async fn remove_resources(

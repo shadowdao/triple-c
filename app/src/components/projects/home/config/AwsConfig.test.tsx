@@ -159,7 +159,7 @@ describe("HostSection", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Remove AWS resources…" }));
     const dialog = screen.getByRole("dialog");
-    // Hybrid: the saved files can go too.
+    // Hybrid: the access point can go too (the files stay on the user's EFS).
     fireEvent.click(within(dialog).getByRole("checkbox"));
     fireEvent.click(within(dialog).getByRole("button", { name: "Remove" }));
     await waitFor(() => expect(removeAwsResources).toHaveBeenCalledWith(p.id, true));

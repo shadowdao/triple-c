@@ -401,9 +401,9 @@ function RemoveAwsResourcesModal({ project, onClose }: { project: Project; onClo
     >
       <p className="text-[13px] text-[var(--text-secondary)]">
         Removes <strong className="text-[var(--text-primary)]">{project.name}</strong>&rsquo;s
-        secret from AWS (after a 7-day recovery window) and keeps the project, so it can run
-        somewhere else. Its task definitions stay registered for an administrator to
-        deregister. Its next start on AWS sets everything up again.
+        secret from AWS and keeps the project, so it can run somewhere else. Its task
+        definitions stay registered for an administrator to deregister. Its next start on AWS
+        sets everything up again.
       </p>
       {hasSavedFiles(project) && (
         <label className="mt-3 flex items-start gap-2 text-[13px] text-[var(--text-primary)]">
@@ -413,7 +413,13 @@ function RemoveAwsResourcesModal({ project, onClose }: { project: Project; onClo
             checked={discardData}
             onChange={(e) => setDiscardData(e.target.checked)}
           />
-          <span>Also delete the workspace&rsquo;s saved files (EFS)</span>
+          <span>
+            Also remove the workspace&rsquo;s file-system access point
+            <span className="block text-xs text-[var(--text-secondary)]">
+              The files stay on your own EFS file system (only your workspace role can read
+              them) until an administrator offboards you.
+            </span>
+          </span>
         </label>
       )}
       {error && (

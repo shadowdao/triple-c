@@ -715,7 +715,8 @@ pub async fn remove_project(
 
     // An AWS project's task and resources go first, and a failure keeps the
     // project: its record is the only handle on a billed task and its
-    // secret. Its data (the EFS access point) goes only when asked.
+    // secret. Its EFS access point goes only when asked (the files stay on the
+    // user's own file system until offboarding).
     if let Some(project) = state.projects_store.get(&project_id).filter(|p| p.is_aws()) {
         let settings = state.settings_store.get();
         if let Some(target) = ContainerTarget::for_project(&project) {

@@ -6,7 +6,7 @@ interface Props {
   projectName: string;
   /** An AWS project: its task, task definitions and secret go instead of Docker state. */
   aws?: boolean;
-  /** AWS: the workspace may have saved files on EFS (offers deleting them). */
+  /** AWS: the workspace may have an EFS access point (offers removing it). */
   savedFiles?: boolean;
   onConfirm: (opts: { discardData: boolean }) => void;
   onCancel: () => void;
@@ -48,8 +48,7 @@ export default function ConfirmRemoveModal({
           <p className="text-[13px] text-[var(--text-secondary)]">
             Are you sure you want to remove{" "}
             <strong className="text-[var(--text-primary)]">{projectName}</strong>? This stops its
-            workspace on AWS and removes its secret (deleted after AWS&rsquo;s 7-day recovery
-            window). Its task definitions stay registered (they hold no secrets and cost
+            workspace on AWS and deletes its secret. Its task definitions stay registered (they hold no secrets and cost
             nothing); an administrator can deregister them. Work that was not pushed to a
             remote is lost.
           </p>
@@ -62,10 +61,11 @@ export default function ConfirmRemoveModal({
                 onChange={(e) => setDiscardData(e.target.checked)}
               />
               <span>
-                Also delete the workspace&rsquo;s saved files (EFS)
+                Also remove the workspace&rsquo;s file-system access point
                 <span className="block text-xs text-[var(--text-secondary)]">
-                  The Claude login, history and SSH keys kept between starts. Left in place
-                  otherwise.
+                  The saved files themselves (Claude login, history, SSH keys) stay on your own
+                  EFS file system, readable only by your workspace role, until an administrator
+                  offboards you.
                 </span>
               </span>
             </label>

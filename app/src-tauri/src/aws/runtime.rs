@@ -25,8 +25,6 @@ use super::workspace::WorkspaceApi;
 
 /// The secret key holding the agent token (Task 4's payload).
 pub const AGENT_TOKEN_KEY: &str = "TRIPLEC_AGENT_TOKEN";
-/// Secrets Manager's recovery window when a project is removed.
-pub const SECRET_RECOVERY_DAYS: i64 = 7;
 /// A project secret is at most 64 KiB; anything bigger is not ours.
 const MAX_SECRET_READ: usize = 70_000;
 
@@ -51,8 +49,10 @@ pub trait RuntimeApi: Send + Sync {
         &self,
         id: &str,
     ) -> impl Future<Output = Result<Option<String>, AwsError>> + Send;
-    /// Schedule deletion with a [`SECRET_RECOVERY_DAYS`] window. A secret
-    /// that does not exist is success.
+    /// Delete at once (`ForceDeleteWithoutRecovery`, ruling R10): a secret
+    /// left pending deletion would make the project's next start fail, and
+    /// the app rebuilds it from local data. A secret that does not exist is
+    /// success.
     fn delete_secret(&self, name: &str) -> impl Future<Output = Result<(), AwsError>> + Send;
     /// A missing access point is success.
     fn delete_access_point(&self, id: &str) -> impl Future<Output = Result<(), AwsError>> + Send;
@@ -234,13 +234,15 @@ pub struct RemoveRequest<'a> {
     /// missed it).
     pub stored_task_arn: Option<&'a str>,
     pub stored_access_point_id: Option<&'a str>,
-    /// Delete the EFS access point. Its data stays on the file system until
-    /// an administrator removes it; the path is not reused.
+    /// Delete the EFS access point (ruling R9). The files stay on the
+    /// user's own file system (only their task role can read it) until
+    /// offboarding destroys it; a later start of the same project gets a new
+    /// access point onto the same directory.
     pub discard_data: bool,
 }
 
-/// Stop the project's task, schedule its secret for deletion (7 days) and,
-/// with `discard_data`, delete its access point. Task definition revisions
+/// Stop the project's task, delete its secret (no recovery window, R10) and,
+/// with `discard_data`, delete its access point (not the files, R9). Task definition revisions
 /// are left registered (R8). A task that can't be stopped stops the removal (nothing
 /// billed may be left running); the rest is attempted in full and every
 /// failure reported.
@@ -417,8 +419,7 @@ impl RuntimeApi for SdkRuntimeApi {
             .secrets
             .delete_secret()
             .secret_id(name)
-            .force_delete_without_recovery(false)
-            .recovery_window_in_days(SECRET_RECOVERY_DAYS)
+            .force_delete_without_recovery(true)
             .send()
             .await
         {
@@ -429,7 +430,8 @@ impl RuntimeApi for SdkRuntimeApi {
             {
                 Ok(())
             }
-            // Already scheduled: the goal.
+            // Scheduled by an older version of the app and AWS refused the
+            // forced delete: nothing more this tier may do (no RestoreSecret).
             Err(e)
                 if e.as_service_error().is_some_and(|s| {
                     s.is_invalid_request_exception()

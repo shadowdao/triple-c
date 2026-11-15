@@ -89,6 +89,15 @@ following:
   tagged `CreateAccessPoint` needs is authorized against the **file system**, not the new access
   point (verified live, phase 5), so `TagOwnAccessPointsAtCreate` names `file-system/*` and is
   confined by `elasticfilesystem:CreateAction = CreateAccessPoint`.
+- **What removing a project removes.** Removing a project (or only its AWS resources) stops its
+  task and deletes its secret **at once** (`ForceDeleteWithoutRecovery`, ruling R10: the app
+  rebuilds it from local data, and a secret left pending deletion would make the next start's
+  `CreateSecret` fail). "Also remove the workspace's file-system access point" deletes only the
+  **access point** (ruling R9): the files under it (the Claude login, history, SSH keys) stay on
+  the user's own EFS file system, which only their own task role can read, until the user is
+  offboarded (destroying their onboarding module removes the file system). Starting the same
+  project on AWS again creates a new access point onto the same directory. Task definition
+  revisions stay registered (R8).
 - **Set only the ordinary tag keys.** Every request that tags something may set only
   `triple-c:owner`, `triple-c:project` and `triple-c:environment` (`aws:TagKeys`). This applies to
   `RunTask`, the ECS and EFS tag-on-create calls, `CreateSecret`, and secret `TagResource`. A
@@ -586,5 +595,5 @@ and the secret and removes the ECR policy; then the fixture destroys the modules
 | `~/.claude.json` after Claude Code runs | ✓ still a link (Claude Code started without a login: "Not logged in") |
 | Bubblewrap (P9) | ✗ `bwrap --unshare-user` fails: "No permissions to create new namespace" (kernel 6.1, `max_user_namespaces` 16384, no `CAP_SYS_ADMIN` on Fargate). The sandbox stays off on AWS |
 | A revision per configuration | turning idle stop on adds a secret key, so the next start registers a new revision (by design) |
-| Removal (R8) | ✓ final run: `remove_aws_resources` succeeds; the secret is scheduled for deletion, the access point deleted, the revision left ACTIVE |
+| Removal (R8) | ✓ final run: `remove_aws_resources` succeeds; the secret is scheduled for deletion, the access point deleted, the revision left ACTIVE. Since R10 the secret is deleted without a recovery window (the test now asserts it is gone) |
 | Cleanup | ✓ nothing `triple-c` left in us-west-2; environment KMS keys pending deletion |

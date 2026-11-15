@@ -116,7 +116,8 @@ export interface NewProjectHost {
 }
 
 export interface RemoveProjectOptions {
-  /** AWS: also delete the workspace's saved files (its EFS access point). */
+  /** AWS: also remove the workspace's EFS access point (the files stay on the
+   *  user's own file system until offboarding). */
   discardData?: boolean;
   /** AWS: the connection is gone; remove the project and leave its AWS resources. */
   forgetAwsResources?: boolean;
