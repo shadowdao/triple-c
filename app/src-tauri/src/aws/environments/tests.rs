@@ -826,3 +826,16 @@ fn the_scan_serializes_for_the_frontend() {
     assert_eq!(v["environments"][0]["actions"], json!(["join"]));
     assert_eq!(v["environments"][0]["onboarding"]["state"], "not_joined");
 }
+
+#[test]
+fn only_a_state_that_manages_nothing_is_empty() {
+    // What `tofu destroy` leaves behind (OpenTofu 1.13).
+    let destroyed = r#"{"version":4,"terraform_version":"1.13.9","serial":31,"lineage":"0b6e3a0e-6f0c-4c35-a0f3-1d0f3f6c9a11","outputs":{},"resources":[],"check_results":null}"#;
+    assert!(is_empty_state(destroyed));
+    let live = r#"{"version":4,"serial":3,"outputs":{},"resources":[{"mode":"managed","type":"aws_iam_policy","name":"boundary","instances":[]}]}"#;
+    assert!(!is_empty_state(live));
+    // Unreadable or odd contents are a deployment, not nothing.
+    for odd in ["", "not json", "{}", r#"{"resources":null}"#, r#"{"resources":{}}"#, "[]"] {
+        assert!(!is_empty_state(odd), "{odd:?}");
+    }
+}

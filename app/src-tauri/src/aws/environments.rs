@@ -497,6 +497,19 @@ pub async fn scan<D: DetectApi>(
     region: &str,
     running_locally: RunningLocally<'_>,
 ) -> Result<EnvironmentScan, AwsError> {
+    let bucket = state_bucket_name(&who.account, region);
+    scan_in_bucket(d, who, region, &bucket, running_locally).await
+}
+
+/// [`scan`] against a given state bucket instead of the account's: the live
+/// tests use a throwaway bucket so they never touch a real one.
+pub(crate) async fn scan_in_bucket<D: DetectApi>(
+    d: &D,
+    who: &CallerIdentity,
+    region: &str,
+    bucket: &str,
+    running_locally: RunningLocally<'_>,
+) -> Result<EnvironmentScan, AwsError> {
     let prefix = environment_parameter_name("");
     let records = d
         .environment_records()
@@ -513,10 +526,9 @@ pub async fn scan<D: DetectApi>(
         })
         .collect();
 
-    let bucket = state_bucket_name(&who.account, region);
-    let state_bucket = d.bucket_exists(&bucket).await?;
+    let state_bucket = d.bucket_exists(bucket).await?;
     let objects = match state_bucket {
-        Knowable::Yes => d.state_objects(&bucket).await?,
+        Knowable::Yes => d.state_objects(bucket).await?,
         _ => None,
     };
     let boundary = d.boundary_exists(&who.account).await?;
@@ -559,6 +571,16 @@ pub async fn scan<D: DetectApi>(
         boundary,
         environments,
     })
+}
+
+/// An OpenTofu state that manages nothing (what `tofu destroy` leaves):
+/// valid JSON whose `resources` is an empty list. Anything else, unreadable
+/// contents included, counts as a deployment.
+pub(crate) fn is_empty_state(text: &str) -> bool {
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .and_then(|v| v.get("resources").and_then(Value::as_array).map(Vec::is_empty))
+        .unwrap_or(false)
 }
 
 /// What a failed lookup means.
@@ -693,8 +715,9 @@ impl SdkDetectApi {
         Ok(Some(out))
     }
 
-    /// A lock object's contents; empty when it is too large to read or can't
-    /// be read, `None` when it was released since the listing.
+    /// A small object's contents (a lock, or a state that may be empty);
+    /// empty when it is too large to read or can't be read, `None` when it
+    /// was deleted since the listing.
     async fn lock_contents(
         &self,
         bucket: &str,
@@ -788,6 +811,19 @@ impl DetectApi for SdkDetectApi {
             };
             for (key, age, size) in listed {
                 if key.ends_with("/terraform.tfstate") {
+                    // `tofu destroy` leaves the state object behind, empty.
+                    // An empty state is no deployment: without this an
+                    // environment destroyed from a bundle (or by the app's
+                    // own Destroy) would read as Incomplete for ever, and a
+                    // removed onboarding as Joined. Only a small object can
+                    // be empty, so only those are read.
+                    if (0..=MAX_UNTRUSTED_BYTES as i64).contains(&size) {
+                        match self.lock_contents(bucket, &key, size).await? {
+                            None => continue,
+                            Some(text) if is_empty_state(&text) => continue,
+                            Some(_) => {}
+                        }
+                    }
                     objects.states.push(key);
                 } else if key.ends_with("/terraform.tfstate.tflock") {
                     lock_keys.push((key, age, size));
@@ -926,6 +962,19 @@ pub async fn ensure_state_bucket(
     let region =
         validate_supported_region(region).map_err(|message| AwsError::Other { message })?;
     let bucket = state_bucket_name(account, &region);
+    ensure_named_state_bucket(cfg, account, &region, &bucket).await
+}
+
+/// [`ensure_state_bucket`] for a given bucket name (the live tests' own
+/// throwaway bucket); `region` is already validated.
+pub(crate) async fn ensure_named_state_bucket(
+    cfg: &SdkConfig,
+    account: &str,
+    region: &str,
+    bucket: &str,
+) -> Result<String, AwsError> {
+    let region = region.to_string();
+    let bucket = bucket.to_string();
     let s3 = aws_sdk_s3::Client::new(cfg);
 
     if let Err(e) = s3
