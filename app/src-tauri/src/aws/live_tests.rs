@@ -1550,8 +1550,11 @@ mod environment {
             assert_ok("onboard", &outcome, &denied);
             let found = t.scan(&cfg, &who).await;
             let env = found.environments.iter().find(|x| x.name == name).unwrap();
+            // Joined from the state's onboarding_complete output, not just the role.
             assert_eq!(env.onboarding, Some(OnboardingState::Joined), "{env:#?}");
+            assert_eq!(env.onboarded_users, Some(1), "{env:#?}");
             let (task_role, exec_role) = user_role_names(&name, &okey);
+            eprintln!("onboarded with region-scoped roles {task_role} / {exec_role}");
             for r in [&task_role, &exec_role] {
                 let role = ok("get the onboarded role", t.e.iam.get_role().role_name(r).send().await);
                 let boundary = role
@@ -1596,6 +1599,11 @@ mod environment {
                 )
                 .await;
             assert_ok("destroy the onboarding", &outcome, &denied);
+            // The emptied onboarding state and the deleted roles: not joined.
+            let found = t.scan(&cfg, &who).await;
+            let env = found.environments.iter().find(|x| x.name == name).unwrap();
+            assert_eq!(env.onboarding, Some(OnboardingState::NotJoined), "{env:#?}");
+            assert_eq!(env.onboarded_users, Some(0), "{env:#?}");
             let (_, outcome, denied) = t
                 .run(
                     ModuleKind::Environment,
