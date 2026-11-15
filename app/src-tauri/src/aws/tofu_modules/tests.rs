@@ -164,17 +164,40 @@ fn environment_names_are_validated() {
 }
 
 #[test]
+fn same_user_and_environment_in_two_regions_do_not_collide() {
+    // IAM role names are account-global but environments are regional: the
+    // same user joining "dev" in two regions needs distinct roles (and
+    // distinct onboarding state keys, though the buckets differ anyway).
+    let user = "AROAEXAMPLEID:alice@example.com";
+    let west = owner_key("us-west-2", user);
+    let east = owner_key("us-east-1", user);
+    assert_ne!(west, east);
+    let (wt, we) = user_role_names("dev", &west);
+    let (et, ee) = user_role_names("dev", &east);
+    assert_ne!(wt, et);
+    assert_ne!(we, ee);
+    assert_ne!(
+        state_key(Deployment::User { env: "dev", owner_key: &west }),
+        state_key(Deployment::User { env: "dev", owner_key: &east })
+    );
+}
+
+#[test]
 fn owner_keys_are_stable_and_role_safe() {
-    let a = owner_key("AROAEXAMPLEID:alice@example.com");
+    let a = owner_key("us-west-2", "AROAEXAMPLEID:alice@example.com");
     assert_eq!(a.len(), 12);
     assert!(
         a.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')),
         "{a}"
     );
-    assert_eq!(a, owner_key("AROAEXAMPLEID:alice@example.com"));
-    assert_ne!(a, owner_key("AROAEXAMPLEID:bob@example.com"));
-    // The key is the first 12 hex characters of the SHA-256 of the user ID.
-    assert_eq!(owner_key("AIDAEXAMPLE"), sha256_prefix("AIDAEXAMPLE"));
+    assert_eq!(a, owner_key("us-west-2", "AROAEXAMPLEID:alice@example.com"));
+    assert_ne!(a, owner_key("us-west-2", "AROAEXAMPLEID:bob@example.com"));
+    // The key is the first 12 hex characters of the SHA-256 of
+    // "<region>:<user ID>".
+    assert_eq!(
+        owner_key("eu-west-1", "AIDAEXAMPLE"),
+        sha256_prefix("eu-west-1:AIDAEXAMPLE")
+    );
 
     let env = "abcdefghij0123456789";
     assert_eq!(env.len(), 20);
@@ -257,6 +280,61 @@ fn subnet_availability_zones_are_stable_once_chosen() {
             subnet.labels
         );
     }
+}
+
+#[test]
+fn an_existing_network_is_checked_before_anything_is_built() {
+    // `existing` takes the user's VPC and subnets on trust otherwise: the
+    // module looks the subnets up and refuses ones outside var.vpc_id or in
+    // one availability zone (the onboarding module's own check), before the
+    // security group, the first thing built in that VPC.
+    let body = parsed(ModuleKind::Environment);
+    let lookups: Vec<_> = top_blocks(&body, "data")
+        .filter(|b| label(b, 0) == Some("aws_subnet"))
+        .collect();
+    assert_eq!(lookups.len(), 1, "one aws_subnet lookup");
+    let lookup = lookups[0];
+    assert_eq!(label(lookup, 1), Some("existing"));
+    let count = render(attr(&lookup.body, "count").expect("count"));
+    assert!(count.contains("var.network_mode") && count.contains("\"existing\""), "{count}");
+    assert!(count.contains('2'), "{count}");
+    let id = render(attr(&lookup.body, "id").expect("id"));
+    assert!(id.contains("var.subnet_ids[count.index]"), "{id}");
+
+    let sg = resource(&body, "aws_security_group", "tasks");
+    let lifecycle = top_blocks(&sg.body, "lifecycle").next().expect("lifecycle");
+    let pre = top_blocks(&lifecycle.body, "precondition")
+        .next()
+        .expect("a precondition on the task security group");
+    let cond = render(attr(&pre.body, "condition").expect("condition"));
+    for needle in [
+        "data.aws_subnet.existing",
+        ".vpc_id == var.vpc_id",
+        "availability_zone",
+        "distinct",
+    ] {
+        assert!(cond.contains(needle), "{needle} missing from {cond}");
+    }
+    assert!(attr(&pre.body, "error_message").is_some());
+}
+
+#[test]
+fn the_onboarding_completion_output_waits_for_every_resource() {
+    // Detection reads Joined only from a state holding this output, so it
+    // must depend on every resource the module makes.
+    let body = parsed(ModuleKind::UserOnboard);
+    let out = top_blocks(&body, "output")
+        .find(|b| label(b, 0) == Some("onboarding_complete"))
+        .expect("an onboarding_complete output");
+    assert_eq!(attr(&out.body, "value"), Some(&Expression::Bool(true)));
+    let deps = render(attr(&out.body, "depends_on").expect("depends_on"));
+    let mut n = 0;
+    for r in top_blocks(&body, "resource") {
+        let addr = format!("{}.{}", label(r, 0).unwrap(), label(r, 1).unwrap());
+        assert!(deps.contains(&addr), "onboarding_complete doesn't wait for {addr}: {deps}");
+        n += 1;
+    }
+    assert!(n >= 9, "only {n} resources");
 }
 
 #[test]
@@ -767,7 +845,7 @@ fn every_onboarding_role_carries_the_boundary_and_owner_tag() {
     // module doesn't spell out).
     let roles = resources(&body, "aws_iam_role");
     assert_eq!(roles.len(), 2, "task and exec roles");
-    let key = owner_key("AROAEXAMPLE:alice");
+    let key = owner_key("us-west-2", "AROAEXAMPLE:alice");
     let (task, exec) = user_role_names("dev", &key);
     for (name, want) in [("task", task), ("exec", exec)] {
         let role = resource(&body, "aws_iam_role", name);
@@ -966,7 +1044,7 @@ fn the_environment_security_group_gains_no_ingress() {
     assert_eq!(groups.len(), 1);
     let sg = groups[0];
     assert_eq!(label(sg, 1), Some("efs"));
-    let key = owner_key("AROAEXAMPLE:alice");
+    let key = owner_key("us-west-2", "AROAEXAMPLE:alice");
     let name = expand_locals(&body, &template_text(attr(&sg.body, "name").unwrap()))
         .replace("${var.environment_name}", "dev")
         .replace("${var.owner_key}", &key);
@@ -1151,7 +1229,7 @@ fn onboarding_vars_name_the_owner() {
             "environment_name": "dev",
             "region": "us-west-2",
             "owner_id": owner,
-            "owner_key": owner_key(owner),
+            "owner_key": owner_key("us-west-2", owner),
             "bedrock_on_task_role": false,
         })
     );

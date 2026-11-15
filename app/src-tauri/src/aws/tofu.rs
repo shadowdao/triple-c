@@ -100,6 +100,16 @@ const EXIT_FILE: &str = "apply.exit";
 const LOCK_FILE: &str = "apply.lock";
 /// Held by [`start_detached`] for its check → clear → spawn → wait.
 const START_LOCK_FILE: &str = "start.lock";
+/// What OpenTofu writes into its working directory when it can't save the
+/// state to the backend after a run: the only copy of what it changed.
+const ERRORED_STATE_FILE: &str = "errored.tfstate";
+/// Where a pushed `errored.tfstate` is set aside (kept, not deleted).
+const PUSHED_STATE_FILE: &str = "errored.tfstate.pushed";
+/// The error a run leaving [`ERRORED_STATE_FILE`] ends with; the outcome's
+/// summary and the UI's recovery both name it.
+pub const ERRORED_STATE_MESSAGE: &str = "OpenTofu could not save this deployment's state to the \
+     state bucket and kept it in errored.tfstate in the work folder. Nothing else can run here \
+     until it is pushed back: use Push saved state";
 /// The names (not values) of the variables the app gave the runner, so the
 /// runner can hand `tofu` exactly those (see [`tofu_env`]).
 const ENV_KEYS_VAR: &str = "TRIPLEC_TOFU_ENV_KEYS";
@@ -357,12 +367,36 @@ pub fn materialize(
     }
     let region = validate_supported_region(region).map_err(other)?;
     let key = state_key(deployment);
-    if is_running(&wd) {
-        return Err(other("A deploy is already running for this deployment"));
-    }
 
     let io = |e: io::Error| other(format!("Could not write the work folder: {e}"));
     fs::create_dir_all(&wd.dir).map_err(io)?;
+    // The same lock `start_detached` holds from its check to its spawn: a
+    // second app instance can't rewrite the folder between another's check
+    // and its start.
+    let start_lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(wd.dir.join(START_LOCK_FILE))
+        .map_err(io)?;
+    match start_lock.try_lock() {
+        Ok(()) => {}
+        Err(fs::TryLockError::WouldBlock) => {
+            return Err(other("A deploy is already starting for this deployment"))
+        }
+        Err(fs::TryLockError::Error(e)) => return Err(io(e)),
+    }
+    if is_running(&wd) {
+        return Err(other("A deploy is already running for this deployment"));
+    }
+    if has_errored_state(&wd) {
+        return Err(other(format!(
+            "The last run could not save its state: OpenTofu kept it in {}. Push it back first \
+             with Push saved state (or by hand, from that folder: tofu init \
+             -backend-config=backend.hcl, then tofu state push errored.tfstate)",
+            wd.dir.join(ERRORED_STATE_FILE).display()
+        )));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -384,6 +418,7 @@ pub fn materialize(
     let json = serde_json::to_vec_pretty(vars)
         .map_err(|e| other(format!("Could not encode the module variables: {e}")))?;
     write_private(&wd.dir.join("terraform.tfvars.json"), &json).map_err(io)?;
+    drop(start_lock);
     Ok(wd)
 }
 
@@ -595,6 +630,9 @@ pub fn child_env(
 pub enum TofuOp {
     Apply,
     Destroy,
+    /// `tofu state push errored.tfstate`: the recovery after a run that
+    /// couldn't save its state ([`ERRORED_STATE_MESSAGE`]).
+    PushState,
 }
 
 impl TofuOp {
@@ -602,6 +640,7 @@ impl TofuOp {
         match self {
             TofuOp::Apply => "apply",
             TofuOp::Destroy => "destroy",
+            TofuOp::PushState => "push-state",
         }
     }
 
@@ -609,6 +648,7 @@ impl TofuOp {
         match s {
             "apply" => Some(TofuOp::Apply),
             "destroy" => Some(TofuOp::Destroy),
+            "push-state" => Some(TofuOp::PushState),
             _ => None,
         }
     }
@@ -830,6 +870,20 @@ pub fn has_run(wd: &Workdir) -> bool {
     wd.dir.join(LOG_FILE).exists() || wd.dir.join(EXIT_FILE).exists() || is_running(wd)
 }
 
+/// OpenTofu left `errored.tfstate` here: the state it couldn't save.
+pub fn has_errored_state(wd: &Workdir) -> bool {
+    wd.dir.join(ERRORED_STATE_FILE).is_file()
+}
+
+/// The last run here finished with a non-zero exit code (and none is
+/// running now).
+pub fn last_run_failed(wd: &Workdir) -> bool {
+    !is_running(wd)
+        && fs::read_to_string(wd.dir.join(EXIT_FILE))
+            .ok()
+            .is_some_and(|t| t.trim().parse::<i32>() != Ok(0))
+}
+
 fn read_pid(wd: &Workdir) -> Option<u32> {
     fs::read_to_string(wd.dir.join(PID_FILE))
         .ok()?
@@ -1006,6 +1060,8 @@ pub async fn follow(
     let mut pending: Vec<u8> = Vec::new();
     let mut last_summary: Option<String> = None;
     let mut last_error: Option<String> = None;
+    // The run's own last error, apart from the runner's errored-state line.
+    let mut cause: Option<String> = None;
     loop {
         // Checked before reading: the runner writes the exit code only after
         // tofu has written its last line, so this read sees everything.
@@ -1031,6 +1087,9 @@ pub async fn follow(
             }
             if e.level == "error" {
                 last_error = Some(e.message.clone());
+                if !e.message.contains(ERRORED_STATE_FILE) {
+                    cause = Some(e.message.clone());
+                }
             }
         }
         if !events.is_empty() {
@@ -1044,6 +1103,11 @@ pub async fn follow(
             let ok = exit_code == 0;
             let summary = if ok {
                 last_summary
+            } else if has_errored_state(wd) {
+                Some(match cause.take() {
+                    Some(c) => format!("{ERRORED_STATE_MESSAGE}. The run's error: {c}"),
+                    None => ERRORED_STATE_MESSAGE.to_string(),
+                })
             } else {
                 last_error.or(last_summary)
             };
@@ -1231,9 +1295,34 @@ fn run_steps(dir: &Path, op: TofuOp, tofu: &Path, env: &[(String, String)], log:
         let _ = writeln!(log, "triple-c: cancelled before tofu {}", op.as_arg());
         return 130;
     }
-    let run = [op.as_arg(), "-auto-approve", "-json", "-input=false"];
-    let code = step(tofu, dir, &run, env, log);
+    let run: &[&str] = match op {
+        TofuOp::Apply => &["apply", "-auto-approve", "-json", "-input=false"],
+        TofuOp::Destroy => &["destroy", "-auto-approve", "-json", "-input=false"],
+        // No -force: tofu refuses a state of another lineage or an older
+        // serial, which is exactly what must not be pushed.
+        TofuOp::PushState => &["state", "push", ERRORED_STATE_FILE],
+    };
+    let code = step(tofu, dir, run, env, log);
     let _ = writeln!(log, "triple-c: tofu {} finished (exit {code})", op.as_arg());
+    if op == TofuOp::PushState && code == 0 {
+        // Kept, not deleted: it was the only copy until the push.
+        match fs::rename(dir.join(ERRORED_STATE_FILE), dir.join(PUSHED_STATE_FILE)) {
+            Ok(()) => {
+                let _ = writeln!(log, "triple-c: the saved state was pushed to the state bucket");
+            }
+            Err(e) => {
+                let _ = writeln!(
+                    log,
+                    "Error: the saved state was pushed but errored.tfstate could not be set aside ({e}); remove it by hand"
+                );
+                return 1;
+            }
+        }
+    } else if code != 0 && dir.join(ERRORED_STATE_FILE).is_file() {
+        // A plain `Error:` line is an error event, and the last one is the
+        // outcome's summary.
+        let _ = writeln!(log, "Error: {ERRORED_STATE_MESSAGE}");
+    }
     code
 }
 

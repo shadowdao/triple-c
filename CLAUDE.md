@@ -332,7 +332,8 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   binary), in a throwaway state bucket.
   **Environments are OpenTofu modules** (`aws/terraform/{environment,user-onboard,permissions-boundary}`;
   spec D2–D10). `tofu_modules.rs` embeds them and is the **only** place the shared names are built
-  (environment, `/triple-c/environments/<env>` record, owner key, per-user roles, state bucket
+  (environment, `/triple-c/environments/<env>` record, owner key — `sha256("<region>:<aws:userid>")`,
+  12 hex, regional because role names are account-global — per-user roles, state bucket
   `triple-c-tfstate-<account>-<region>`, state keys); its tests pin the HCL to those names, the
   versions and tags, and `MODULE_CALLS` (every provider call) to the admin policy.
   `tofu.rs` downloads the pinned OpenTofu (SHA-256 checked **before** extraction), writes a work

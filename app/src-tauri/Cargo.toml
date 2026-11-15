@@ -78,15 +78,16 @@ aws-runtime = { version = "1.10.4", default-features = false }
 aws-smithy-async = { version = "1.3.1", default-features = false, features = ["rt-tokio"] }
 aws-sdk-s3 = { version = "1.159.0", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
 
-# Linux only: WebKitGTK refuses getUserMedia until the embedder enables media
-# streams and answers the permission request (see src/linux_media.rs). Same
-# version tauri/wry already resolve, so this adds no second copy.
-# aws/tofu.rs: `setsid` for the detached OpenTofu runner, SIGINT to its
-# process group on Cancel, and a liveness probe for its PID. Already in the
-# tree through tokio and friends.
+# aws/tofu.rs: `setsid` puts the detached OpenTofu runner in its own session,
+# and Cancel sends SIGINT to the runner process alone (never a group), which
+# forwards it to `tofu`. Liveness is the runner's `apply.lock`, not a PID.
+# Already in the tree through tokio and friends.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Linux only: WebKitGTK refuses getUserMedia until the embedder enables media
+# streams and answers the permission request (see src/linux_media.rs). Same
+# version tauri/wry already resolve, so this adds no second copy.
 [target.'cfg(target_os = "linux")'.dependencies]
 webkit2gtk = "2.0.2"
 

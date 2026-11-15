@@ -201,8 +201,15 @@ fn untrusted_environment_records_are_rejected() {
     );
 }
 
-fn nobody_local(_: Deployment) -> bool {
-    false
+fn nobody_local(_: Deployment) -> LocalRun {
+    LocalRun::default()
+}
+
+fn running() -> LocalRun {
+    LocalRun {
+        running: true,
+        ..LocalRun::default()
+    }
 }
 
 fn env_key(env: &str) -> String {
@@ -383,7 +390,13 @@ fn interrupted_deployments_get_the_right_actions() {
 
     // A local process, even under an old lock: Deploying, Follow.
     let objs = objects(&[env_key("c")], &[(env_key("c"), stale)]);
-    let local_c = |d: Deployment| d == Deployment::Environment("c");
+    let local_c = |d: Deployment| {
+        if d == Deployment::Environment("c") {
+            running()
+        } else {
+            LocalRun::default()
+        }
+    };
     let envs = merge(Vec::new(), Some(&objs), &local_c, 1);
     let c = find(&envs, "c");
     let EnvironmentState::Deploying { lock: Some(lock) } = &c.state else {
@@ -447,6 +460,8 @@ struct FakeDetect {
     bucket: Knowable,
     boundary: Knowable,
     roles: HashMap<String, Knowable>,
+    /// State objects' contents, by key.
+    documents: HashMap<String, String>,
     calls: Mutex<Vec<String>>,
 }
 
@@ -458,6 +473,7 @@ impl FakeDetect {
             bucket: Knowable::Yes,
             boundary: Knowable::Yes,
             roles: HashMap::new(),
+            documents: HashMap::new(),
             calls: Mutex::new(Vec::new()),
         }
     }
@@ -500,6 +516,10 @@ impl DetectApi for FakeDetect {
         self.log(format!("role {name}"));
         Ok(self.roles.get(name).cloned().unwrap_or(Knowable::No))
     }
+    async fn state_document(&self, bucket: &str, key: &str) -> Result<Option<String>, AwsError> {
+        self.log(format!("document {bucket} {key}"));
+        Ok(self.documents.get(key).cloned())
+    }
 }
 
 fn who() -> CallerIdentity {
@@ -510,7 +530,7 @@ fn who() -> CallerIdentity {
     }
 }
 
-fn run_scan(d: &FakeDetect, local: &(dyn Fn(Deployment) -> bool + Sync)) -> EnvironmentScan {
+fn run_scan(d: &FakeDetect, local: LocalRuns) -> EnvironmentScan {
     tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap()
@@ -521,12 +541,12 @@ fn run_scan(d: &FakeDetect, local: &(dyn Fn(Deployment) -> bool + Sync)) -> Envi
 fn user_key(env: &str) -> String {
     state_key(Deployment::User {
         env,
-        owner_key: &owner_key(USER_ID),
+        owner_key: &owner_key(REGION, USER_ID),
     })
 }
 
 fn task_role(env: &str) -> String {
-    user_role_names(env, &owner_key(USER_ID)).0
+    user_role_names(env, &owner_key(REGION, USER_ID)).0
 }
 
 #[test]
@@ -554,16 +574,20 @@ fn onboarding_is_found_by_state_then_by_role() {
     });
     d.roles.insert(task_role("byrole"), Knowable::Yes);
     d.roles.insert(task_role("denied"), Knowable::Unknown);
+    d.documents.insert(user_key("bystate"), completed_state());
 
     let scan = run_scan(&d, &nobody_local);
     assert_eq!(scan.owner_id, USER_ID);
-    assert_eq!(scan.owner_key, owner_key(USER_ID));
+    assert_eq!(scan.owner_key, owner_key(REGION, USER_ID));
     let onboarding = |n: &str| find(&scan.environments, n).onboarding.clone();
     assert_eq!(onboarding("bystate"), Some(OnboardingState::Joined));
     assert_eq!(onboarding("byrole"), Some(OnboardingState::Joined));
     assert_eq!(onboarding("denied"), Some(OnboardingState::NotJoined));
     assert_eq!(onboarding("absent"), Some(OnboardingState::NotJoined));
-    assert_eq!(onboarding("joining"), Some(OnboardingState::InProgress));
+    assert!(matches!(
+        onboarding("joining"),
+        Some(OnboardingState::InProgress { lock: Some(_) })
+    ));
 
     // The state key answered for `bystate` and the lock for `joining`, so
     // only the others cost a GetRole.
@@ -588,22 +612,31 @@ fn onboarding_is_found_by_state_then_by_role() {
             3 * 3600,
         )],
     });
-    let ok = owner_key(USER_ID);
+    let ok = owner_key(REGION, USER_ID);
     let local_x = move |dep: Deployment| {
-        dep == Deployment::User {
-            env: "x",
-            owner_key: &ok,
+        if dep
+            == (Deployment::User {
+                env: "x",
+                owner_key: &ok,
+            })
+        {
+            running()
+        } else {
+            LocalRun::default()
         }
     };
     let scan = run_scan(&d, &local_x);
-    assert_eq!(
-        find(&scan.environments, "x").onboarding,
-        Some(OnboardingState::InProgress)
-    );
-    assert_eq!(
-        find(&scan.environments, "y").onboarding,
-        Some(OnboardingState::Incomplete)
-    );
+    let x = find(&scan.environments, "x");
+    assert_eq!(x.onboarding, Some(OnboardingState::InProgress { lock: None }));
+    assert_eq!(x.onboarding_actions, vec![EnvironmentAction::Follow]);
+    let y = find(&scan.environments, "y");
+    let Some(OnboardingState::Incomplete { lock: Some(lock) }) = &y.onboarding else {
+        panic!("{y:#?}");
+    };
+    assert!(!lock.local_process);
+    assert_eq!(y.onboarding_actions, vec![EnvironmentAction::Unlock]);
+    // Join stays: it is the retry.
+    assert!(y.actions.contains(&EnvironmentAction::Join));
 
     // Not joinable, not resolved.
     let mut d = FakeDetect::new();
@@ -861,4 +894,184 @@ fn a_state_that_cannot_be_read_still_counts() {
     assert!(keep_state("k", Ok(Some(r#"{"resources":[{"type":"x"}]}"#.into()))));
     // An S3 error on one object degrades that entry, not the scan.
     assert!(keep_state("k", Err(AwsError::Other { message: "boom".into() })));
+}
+
+fn completed_state() -> String {
+    json!({
+        "version": 4,
+        "resources": [{"type": "aws_iam_role", "name": "task"}],
+        "outputs": {"onboarding_complete": {"value": true, "type": "bool"}},
+    })
+    .to_string()
+}
+
+#[test]
+fn a_failed_onboarding_is_incomplete_not_joined() {
+    // A partial state (the task role made, the file system not): the role
+    // exists, but the state has no completion output.
+    let mut d = FakeDetect::new()
+        .with_record("partial", 1)
+        .with_record("done", 1)
+        .with_record("failedhere", 1)
+        .with_record("errored", 1);
+    let partial = json!({
+        "version": 4,
+        "resources": [{"type": "aws_iam_role", "name": "task"}],
+        "outputs": {"task_role_arn": {"value": "arn:aws:iam::1:role/x", "type": "string"}},
+    })
+    .to_string();
+    d.objects = Some(StateObjects {
+        states: ["partial", "done", "failedhere", "errored"]
+            .iter()
+            .flat_map(|e| [env_key(e), user_key(e)])
+            .collect(),
+        locks: Vec::new(),
+    });
+    d.documents.insert(user_key("partial"), partial);
+    d.documents.insert(user_key("done"), completed_state());
+    d.documents.insert(user_key("failedhere"), completed_state());
+    d.documents.insert(user_key("errored"), completed_state());
+    for e in ["partial", "done", "failedhere", "errored"] {
+        d.roles.insert(task_role(e), Knowable::Yes);
+    }
+    let ok = owner_key(REGION, USER_ID);
+    let local = move |dep: Deployment| match dep {
+        Deployment::User { env: "failedhere", owner_key } if owner_key == ok => LocalRun {
+            failed: true,
+            ..LocalRun::default()
+        },
+        Deployment::User { env: "errored", owner_key } if owner_key == ok => LocalRun {
+            failed: true,
+            errored_state: true,
+            ..LocalRun::default()
+        },
+        _ => LocalRun::default(),
+    };
+    let scan = run_scan(&d, &local);
+    let row = |n: &str| find(&scan.environments, n).clone();
+
+    assert_eq!(row("done").onboarding, Some(OnboardingState::Joined));
+    for name in ["partial", "failedhere", "errored"] {
+        let r = row(name);
+        assert_eq!(
+            r.onboarding,
+            Some(OnboardingState::Incomplete { lock: None }),
+            "{name}"
+        );
+        // Join is kept: an idempotent re-apply finishes it.
+        assert!(r.actions.contains(&EnvironmentAction::Join), "{name}");
+    }
+    assert!(row("partial").onboarding_actions.is_empty());
+    // The saved state has to go back first.
+    assert_eq!(
+        row("errored").onboarding_actions,
+        vec![EnvironmentAction::PushState]
+    );
+    // Neither the local failures nor the lock-free ones cost a GetRole.
+    assert!(!d.calls().iter().any(|c| c.starts_with("role ")), "{:?}", d.calls());
+    assert!(onboarding_complete(&completed_state()));
+    assert!(!onboarding_complete("{}"));
+    assert!(!onboarding_complete(
+        &json!({"outputs": {"onboarding_complete": {"value": "true"}}}).to_string()
+    ));
+}
+
+#[test]
+fn an_errored_environment_state_offers_only_the_push() {
+    let objs = objects(&[env_key("e")], &[]);
+    let errored = |d: Deployment| LocalRun {
+        failed: true,
+        errored_state: d == Deployment::Environment("e"),
+        ..LocalRun::default()
+    };
+    let envs = merge(Vec::new(), Some(&objs), &errored, 1);
+    // State without a record: normally Repair and Destroy.
+    assert_eq!(find(&envs, "e").actions, vec![EnvironmentAction::PushState]);
+}
+
+#[test]
+fn onboarded_users_are_counted_per_environment() {
+    let ok = owner_key(REGION, USER_ID);
+    let objs = objects(
+        &[
+            env_key("a"),
+            env_key("b"),
+            state_key(Deployment::User { env: "a", owner_key: &ok }),
+            state_key(Deployment::User { env: "a", owner_key: "0123456789ab" }),
+            "users/a/x/y/terraform.tfstate".to_string(),
+        ],
+        &[],
+    );
+    let envs = merge(Vec::new(), Some(&objs), &nobody_local, 1);
+    assert_eq!(find(&envs, "a").onboarded_users, Some(2));
+    assert_eq!(find(&envs, "b").onboarded_users, Some(0));
+    let envs = merge(vec![("c".into(), Ok(parsed("c", 1)))], None, &nobody_local, 1);
+    assert_eq!(find(&envs, "c").onboarded_users, None);
+}
+
+#[test]
+fn the_tls_statement_is_added_to_a_bucket_policy_never_replacing_it() {
+    let bucket = state_bucket_name(ACCOUNT, REGION);
+    let ours: Value = serde_json::from_str(&state_bucket_policy(&bucket)).unwrap();
+    let tls = ours["Statement"][0].clone();
+
+    // No policy: ours.
+    let new: Value =
+        serde_json::from_str(&state_bucket_policy_update(None, &bucket).unwrap().unwrap()).unwrap();
+    assert_eq!(new, ours);
+
+    // Ours already there (statement order or key order aside): nothing to put.
+    let same = json!({"Statement": [tls.clone()], "Version": "2012-10-17"}).to_string();
+    assert_eq!(state_bucket_policy_update(Some(&same), &bucket).unwrap(), None);
+
+    // An organisation's statements are kept; ours is added once.
+    let org = json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": "OrgDenyOutsideVpce",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3:*",
+            "Resource": format!("arn:aws:s3:::{bucket}/*"),
+            "Condition": {"StringNotEquals": {"aws:SourceVpce": "vpce-1234"}},
+        }],
+    });
+    let merged: Value = serde_json::from_str(
+        &state_bucket_policy_update(Some(&org.to_string()), &bucket)
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let st = merged["Statement"].as_array().unwrap();
+    assert_eq!(st.len(), 2);
+    assert_eq!(st[0], org["Statement"][0]);
+    assert_eq!(st[1], tls);
+    assert_eq!(merged["Version"], "2012-10-17");
+
+    // A single statement object (not a list) is kept too.
+    let single = json!({"Version": "2012-10-17", "Statement": org["Statement"][0].clone()});
+    let merged: Value = serde_json::from_str(
+        &state_bucket_policy_update(Some(&single.to_string()), &bucket)
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(merged["Statement"].as_array().unwrap().len(), 2);
+
+    // A stale statement under our Sid is replaced, not duplicated.
+    let mut old = tls.clone();
+    old["Resource"] = json!("arn:aws:s3:::elsewhere");
+    let stale = json!({"Version": "2012-10-17", "Statement": [org["Statement"][0].clone(), old]});
+    let merged: Value = serde_json::from_str(
+        &state_bucket_policy_update(Some(&stale.to_string()), &bucket)
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let st = merged["Statement"].as_array().unwrap();
+    assert_eq!(st.len(), 2);
+    assert_eq!(st[1], tls);
+
+    // Something that isn't a policy is never overwritten.
+    assert!(state_bucket_policy_update(Some("not json"), &bucket).is_err());
 }

@@ -103,6 +103,9 @@ export const followAwsDeployment = (connectionId: string, region: string, stateK
   invoke<string>("follow_aws_deployment", { connectionId, region, stateKey });
 export const cancelAwsDeployment = (connectionId: string, region: string, stateKey: string) =>
   invoke<void>("cancel_aws_deployment", { connectionId, region, stateKey });
+/** Push `errored.tfstate` (a failed run's unsaved state) back to the bucket; resolves to an op id like a deploy. */
+export const pushAwsSavedState = (connectionId: string, region: string, stateKey: string) =>
+  invoke<string>("push_aws_saved_state", { connectionId, region, stateKey });
 export const onboardAwsUser = (connectionId: string, region: string, environment: string) =>
   invoke<string>("onboard_aws_user", { connectionId, region, environment });
 export const deployAwsPermissionsBoundary = (connectionId: string, region: string) =>

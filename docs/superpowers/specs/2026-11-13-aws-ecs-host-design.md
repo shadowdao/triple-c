@@ -54,7 +54,7 @@ Phase 4 added these decisions:
   exact commands (`tofu init -backend-config=backend.hcl`, then `tofu apply`; Terraform 1.10+
   works too).
 - **D6. The app destroys only incomplete deployments** (state without an environment record, or
-  a failed apply). A working environment is destroyed by an admin with `tofu destroy` from a
+  a failed apply), and never while any user's onboarding state for the environment remains. A working environment is destroyed by an admin with `tofu destroy` from a
   bundle, which is the irreversible case.
 - **D7. The admin tier spans several policy files** (`environment-admin.json` and
   `environment-admin-network.json`), all required; `aws_policy_document` returns every file of a
@@ -65,13 +65,20 @@ Phase 4 added these decisions:
   only environments that have a record.
 - **D9. One state key per deployment**, in the per-account, per-region bucket
   `triple-c-tfstate-<account>-<region>`: `environments/<env>/terraform.tfstate`,
-  `users/<env>/<ownerkey>/terraform.tfstate`, `boundary/terraform.tfstate`. The lock is the
+  `users/<env>/<ownerkey>/terraform.tfstate`, `boundary/terraform.tfstate`. The owner key is the
+  first 12 hex characters of `sha256("<region>:<aws:userid>")` and also names the user's roles
+  (`triple-c-<env>-<ownerkey>-task|exec`): role names are account-global and environments
+  regional, so the region is part of it (the same user and environment name in two regions must
+  not collide). The lock is the
   matching `.tflock` object (S3-native locking, `use_lockfile = true`); a held lock is a deploy in
   progress, and its `Who`/`Created`/`Operation` are shown.
-- **D10. Applies are detached.** `tofu apply` runs in its own process group, output to
-  `<workdir>/apply.log`, PID in `<workdir>/apply.pid`. Closing the app doesn't interrupt it; on the
-  next run the app sees the live runner or the held lock and reattaches by following the log. It
-  interrupts only when the user presses Cancel, and OpenTofu then stops gracefully and saves state.
+- **D10. Applies are detached.** `tofu apply` runs in its own session, output to
+  `<workdir>/apply.log`, PID in `<workdir>/apply.pid` (liveness is the runner's `apply.lock`). A
+  run that can't save its state leaves `errored.tfstate`; nothing else starts there until it is
+  pushed back (Push saved state: `tofu state push errored.tfstate` through the same runner).
+  Closing the app doesn't interrupt it; on the next run the app sees the live runner or the held
+  lock and reattaches by following the log. It interrupts only when the user presses Cancel (not
+  on Windows yet), and OpenTofu then stops gracefully and saves state.
 
 ### Non-goals (v1)
 

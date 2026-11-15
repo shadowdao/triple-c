@@ -101,10 +101,13 @@ pub fn environment_parameter_name(env: &str) -> String {
     format!("/triple-c/environments/{env}")
 }
 
-/// The first 12 hex characters of `sha256(aws:userid)`. A `UserId` holds a
-/// `:`, which IAM role names reject, so per-user names use this instead.
-pub fn owner_key(user_id: &str) -> String {
-    Sha256::digest(user_id.as_bytes())
+/// The first 12 hex characters of `sha256("<region>:<aws:userid>")`. A
+/// `UserId` holds a `:`, which IAM role names reject, so per-user names use
+/// this instead. The region is part of it because role names are
+/// account-global while environments are regional: the same user in the same
+/// environment name in two regions gets two sets of roles.
+pub fn owner_key(region: &str, user_id: &str) -> String {
+    Sha256::digest(format!("{region}:{user_id}").as_bytes())
         .iter()
         .take(6)
         .map(|b| format!("{b:02x}"))
@@ -230,7 +233,7 @@ pub fn onboarding_vars(env: &str, region: &str, owner_id: &str) -> serde_json::V
         "environment_name": env,
         "region": region,
         "owner_id": owner_id,
-        "owner_key": owner_key(owner_id),
+        "owner_key": owner_key(region, owner_id),
         "bedrock_on_task_role": false,
     })
 }

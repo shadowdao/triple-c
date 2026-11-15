@@ -51,6 +51,8 @@ export function env(over: Partial<DetectedEnvironment> = {}): DetectedEnvironmen
     actions: ["join"],
     info: info(over.name ?? "dev"),
     onboarding: { state: "not_joined" },
+    onboarding_actions: [],
+    onboarded_users: 0,
     ...over,
   };
 }

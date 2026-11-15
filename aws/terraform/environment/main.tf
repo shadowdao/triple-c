@@ -61,6 +61,17 @@ resource "aws_security_group" "tasks" {
     cidr_blocks      = ["0.0.0.0/0"]
     ipv6_cidr_blocks = ["::/0"]
   }
+
+  lifecycle {
+    # Empty lists (a new VPC) pass: only an existing network is looked up.
+    precondition {
+      condition = (
+        alltrue([for s in data.aws_subnet.existing : s.vpc_id == var.vpc_id])
+        && length(distinct([for s in data.aws_subnet.existing : s.availability_zone])) == length(data.aws_subnet.existing)
+      )
+      error_message = "The existing network's two subnets must both be in vpc_id and in different availability zones."
+    }
+  }
 }
 
 resource "aws_kms_key" "this" {

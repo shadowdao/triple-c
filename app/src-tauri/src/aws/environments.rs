@@ -54,6 +54,9 @@ const MAX_LOCKS: usize = 200;
 /// or data source with a pre/postcondition): 453 bytes for two, measured.
 /// The modules have at most a handful, so 2 KiB leaves a wide margin.
 const EMPTY_STATE_MAX_BYTES: i64 = 2048;
+/// The caller's onboarding state is read whole (for its outputs) only up to
+/// this size; one user's module state is a few tens of KiB.
+const MAX_STATE_DOCUMENT_BYTES: usize = 1024 * 1024;
 /// At most this many small state objects are read per scan; the rest count
 /// as deployments.
 const MAX_STATE_PEEKS: usize = 200;
@@ -277,15 +280,25 @@ pub enum EnvironmentAction {
     Destroy,
     Follow,
     Unlock,
+    /// Push the state a failed run on this machine couldn't save
+    /// (`errored.tfstate`) back to the bucket.
+    PushState,
 }
 
+/// The caller's onboarding to one environment.
 #[derive(Serialize, Clone, Debug, PartialEq)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum OnboardingState {
+    /// Their task role exists and, where the bucket is readable, their state
+    /// records a finished apply (its `onboarding_complete` output).
     Joined,
     NotJoined,
-    InProgress,
-    Incomplete,
+    /// A local runner, or a recent lock.
+    InProgress { lock: Option<LockInfo> },
+    /// The last onboarding run didn't finish: a stale lock, a failed run on
+    /// this machine, or a state without the completion output. Join is a
+    /// re-apply and finishes it.
+    Incomplete { lock: Option<LockInfo> },
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq)]
@@ -297,6 +310,12 @@ pub struct DetectedEnvironment {
     pub info: Option<EnvironmentInfo>,
     /// The caller's onboarding; resolved only for joinable environments.
     pub onboarding: Option<OnboardingState>,
+    /// What the caller can do with their own onboarding's run (`Follow`,
+    /// `Unlock`, `PushState`); Join stays in `actions`.
+    pub onboarding_actions: Vec<EnvironmentAction>,
+    /// How many users' onboarding states (`users/<env>/…`, non-empty) the
+    /// bucket holds; `None` when the caller can't list it.
+    pub onboarded_users: Option<u32>,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq)]
@@ -355,9 +374,27 @@ fn environment_of_key(key: &str) -> Option<&str> {
     (validate_environment_name(env).is_ok()).then_some(env)
 }
 
-/// Whether this machine's runner is applying a deployment
-/// (`tofu::is_running(&tofu::workdir_for(..))`).
-pub type RunningLocally<'a> = &'a (dyn Fn(Deployment) -> bool + Sync);
+/// The environment name of a `users/<env>/<key>/terraform.tfstate` key.
+fn user_environment_of_key(key: &str) -> Option<&str> {
+    let mut parts = key.strip_prefix("users/")?.split('/');
+    let (env, _, file, rest) = (parts.next()?, parts.next()?, parts.next()?, parts.next());
+    (file == "terraform.tfstate" && rest.is_none() && validate_environment_name(env).is_ok())
+        .then_some(env)
+}
+
+/// What this machine's work folder says of a deployment's runs.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct LocalRun {
+    /// A runner here is applying it (`tofu::is_running`).
+    pub running: bool,
+    /// The last run here finished with an error (`tofu::last_run_failed`).
+    pub failed: bool,
+    /// OpenTofu left `errored.tfstate` here (`tofu::has_errored_state`).
+    pub errored_state: bool,
+}
+
+/// This machine's runs, per deployment.
+pub type LocalRuns<'a> = &'a (dyn Fn(Deployment) -> LocalRun + Sync);
 
 /// One environment from its record (if any), the bucket listing (if this
 /// caller can read it) and whether a local runner is applying it.
@@ -365,12 +402,13 @@ fn detect_one(
     name: &str,
     record: Option<Result<EnvironmentInfo, String>>,
     objects: Option<&StateObjects>,
-    running_locally: RunningLocally,
+    local_runs: LocalRuns,
     current_version: u32,
 ) -> DetectedEnvironment {
     use EnvironmentAction::*;
     let key = state_key(Deployment::Environment(name));
-    let local = running_locally(Deployment::Environment(name));
+    let run = local_runs(Deployment::Environment(name));
+    let local = run.running;
     let lock = objects
         .and_then(|o| o.lock(&key))
         .map(|(json, age)| lock_info(json, age, local));
@@ -418,6 +456,25 @@ fn detect_one(
         )
     };
 
+    // A saved state must go back before anything else runs here: nothing
+    // that would re-apply or destroy is offered until it has.
+    let actions = if run.errored_state && !local {
+        let mut kept: Vec<_> = actions
+            .into_iter()
+            .filter(|a| !matches!(a, Update | Repair | Destroy))
+            .collect();
+        kept.insert(0, PushState);
+        kept
+    } else {
+        actions
+    };
+    let onboarded_users = objects.map(|o| {
+        o.states
+            .iter()
+            .filter(|k| user_environment_of_key(k) == Some(name))
+            .count() as u32
+    });
+
     DetectedEnvironment {
         name: name.to_string(),
         template_version,
@@ -425,6 +482,8 @@ fn detect_one(
         actions,
         info,
         onboarding: None,
+        onboarding_actions: Vec::new(),
+        onboarded_users,
     }
 }
 
@@ -435,7 +494,7 @@ fn detect_one(
 pub fn merge(
     records: Vec<(String, Result<EnvironmentInfo, String>)>,
     objects: Option<&StateObjects>,
-    running_locally: RunningLocally,
+    local_runs: LocalRuns,
     current_version: u32,
 ) -> Vec<DetectedEnvironment> {
     let mut by_name: BTreeMap<String, Option<Result<EnvironmentInfo, String>>> = BTreeMap::new();
@@ -450,28 +509,50 @@ pub fn merge(
     }
     by_name
         .into_iter()
-        .map(|(name, record)| detect_one(&name, record, objects, running_locally, current_version))
+        .map(|(name, record)| detect_one(&name, record, objects, local_runs, current_version))
         .collect()
 }
 
-/// The caller's onboarding from the bucket alone, or `None` when only
-/// `iam:GetRole` on the task role can tell.
-fn onboarding_from_objects(
+/// Whether an onboarding state records a finished apply: the module's
+/// `onboarding_complete` output, which depends on every resource it makes,
+/// so a run that failed part-way never writes it.
+pub(crate) fn onboarding_complete(state: &str) -> bool {
+    serde_json::from_str::<Value>(state)
+        .ok()
+        .and_then(|v| v.pointer("/outputs/onboarding_complete/value").cloned())
+        == Some(Value::Bool(true))
+}
+
+/// The caller's onboarding as far as the lock, this machine's runs and the
+/// bucket listing tell, and what they may do with its run. `None` (with
+/// the actions) when the state must be read or the role looked up.
+fn onboarding_from_runs(
     objects: Option<&StateObjects>,
     deployment: Deployment,
-    local: bool,
-) -> Option<OnboardingState> {
-    if local {
-        return Some(OnboardingState::InProgress);
-    }
-    let objects = objects?;
+    run: LocalRun,
+) -> (Option<OnboardingState>, Vec<EnvironmentAction>) {
+    use EnvironmentAction::*;
     let key = state_key(deployment);
-    match objects.lock(&key) {
-        Some((_, age)) if age < LIVE_LOCK_SECS => Some(OnboardingState::InProgress),
-        Some(_) => Some(OnboardingState::Incomplete),
-        None if objects.has_state(&key) => Some(OnboardingState::Joined),
-        None => None,
+    let lock = objects
+        .and_then(|o| o.lock(&key))
+        .map(|(json, age)| lock_info(json, age, run.running));
+    let mut actions = Vec::new();
+    if run.running {
+        actions.push(Follow);
+    } else if run.errored_state {
+        actions.push(PushState);
     }
+    let state = if run.running || lock.as_ref().is_some_and(|l| l.age_secs < LIVE_LOCK_SECS) {
+        Some(OnboardingState::InProgress { lock })
+    } else if lock.is_some() {
+        actions.push(Unlock);
+        Some(OnboardingState::Incomplete { lock })
+    } else if run.failed || run.errored_state {
+        Some(OnboardingState::Incomplete { lock: None })
+    } else {
+        None
+    };
+    (state, actions)
 }
 
 /// What detection asks AWS. Each method returns a `Send` future so [`scan`]
@@ -497,6 +578,13 @@ pub trait DetectApi: Send + Sync {
         account: &str,
     ) -> impl Future<Output = Result<Knowable, AwsError>> + Send;
     fn role_exists(&self, name: &str) -> impl Future<Output = Result<Knowable, AwsError>> + Send;
+    /// A state object's contents, capped; `None` when it is missing, can't
+    /// be read or is too large.
+    fn state_document(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> impl Future<Output = Result<Option<String>, AwsError>> + Send;
 }
 
 /// Everything the account holds for this caller in `region`.
@@ -504,10 +592,10 @@ pub async fn scan<D: DetectApi>(
     d: &D,
     who: &CallerIdentity,
     region: &str,
-    running_locally: RunningLocally<'_>,
+    local_runs: LocalRuns<'_>,
 ) -> Result<EnvironmentScan, AwsError> {
     let bucket = state_bucket_name(&who.account, region);
-    scan_in_bucket(d, who, region, &bucket, running_locally).await
+    scan_in_bucket(d, who, region, &bucket, local_runs).await
 }
 
 /// [`scan`] against a given state bucket instead of the account's: the live
@@ -517,7 +605,7 @@ pub(crate) async fn scan_in_bucket<D: DetectApi>(
     who: &CallerIdentity,
     region: &str,
     bucket: &str,
-    running_locally: RunningLocally<'_>,
+    local_runs: LocalRuns<'_>,
 ) -> Result<EnvironmentScan, AwsError> {
     let prefix = environment_parameter_name("");
     let records = d
@@ -545,10 +633,10 @@ pub(crate) async fn scan_in_bucket<D: DetectApi>(
     let mut environments = merge(
         records,
         objects.as_ref(),
-        running_locally,
+        local_runs,
         super::tofu_modules::ENVIRONMENT_MODULE_VERSION,
     );
-    let key = owner_key(&who.user_id);
+    let key = owner_key(region, &who.user_id);
     for env in &mut environments {
         if !env.actions.contains(&EnvironmentAction::Join) {
             continue;
@@ -557,10 +645,24 @@ pub(crate) async fn scan_in_bucket<D: DetectApi>(
             env: &env.name,
             owner_key: &key,
         };
-        let from_objects =
-            onboarding_from_objects(objects.as_ref(), deployment, running_locally(deployment));
-        env.onboarding = Some(match from_objects {
+        let (from_runs, actions) =
+            onboarding_from_runs(objects.as_ref(), deployment, local_runs(deployment));
+        let user_state = state_key(deployment);
+        env.onboarding_actions = actions;
+        env.onboarding = Some(match from_runs {
             Some(state) => state,
+            // A state the app can read must record a finished apply: a
+            // failed onboarding leaves a partial state (and maybe its task
+            // role), which is not Joined.
+            None if objects.as_ref().is_some_and(|o| o.has_state(&user_state)) => {
+                match d.state_document(bucket, &user_state).await? {
+                    Some(text) if onboarding_complete(&text) => OnboardingState::Joined,
+                    _ => OnboardingState::Incomplete { lock: None },
+                }
+            }
+            // Without a state here (a workspace user, who can't list the
+            // bucket, or an onboarding managed elsewhere) the task role is
+            // the only signal.
             None => {
                 let (task_role, _) = user_role_names(&env.name, &key);
                 match d.role_exists(&task_role).await? {
@@ -893,6 +995,46 @@ impl DetectApi for SdkDetectApi {
         let res = self.iam.get_role().role_name(name).send().await;
         knowable("iam:GetRole", res)
     }
+
+    async fn state_document(&self, bucket: &str, key: &str) -> Result<Option<String>, AwsError> {
+        const ACTION: &str = "s3:GetObject";
+        let res = self
+            .s3
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .expected_bucket_owner(&self.account)
+            .send()
+            .await;
+        let obj = match res {
+            Ok(o) => o,
+            Err(e) => {
+                let (code, status) = error_parts(&e);
+                return match lookup_outcome(code.as_deref(), status) {
+                    Lookup::Missing | Lookup::Denied => Ok(None),
+                    Lookup::Error => Err(classify_sdk_error(ACTION, &e)),
+                };
+            }
+        };
+        if obj
+            .content_length()
+            .is_some_and(|n| n < 0 || n as usize > MAX_STATE_DOCUMENT_BYTES)
+        {
+            return Ok(None);
+        }
+        // Capped while reading too: the length header may be absent.
+        let mut body = obj.body;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = body.try_next().await.map_err(|e| AwsError::Other {
+            message: format!("Could not read a state object: {e}"),
+        })? {
+            if bytes.len() + chunk.len() > MAX_STATE_DOCUMENT_BYTES {
+                return Ok(None);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+    }
 }
 
 /// `s3:CreateBucket`'s answer, by error code: `Some(Ok)` for a bucket this
@@ -961,7 +1103,7 @@ fn create_bucket_configuration(region: &str) -> CreateBucketConfiguration {
 }
 
 /// Deny every request to the bucket that doesn't use TLS.
-fn state_bucket_policy(bucket: &str) -> String {
+pub(crate) fn state_bucket_policy(bucket: &str) -> String {
     json!({
         "Version": "2012-10-17",
         "Statement": [{
@@ -977,6 +1119,45 @@ fn state_bucket_policy(bucket: &str) -> String {
         }],
     })
     .to_string()
+}
+
+/// The bucket policy to put, given the bucket's current one: ours when it
+/// has none, `None` when our TLS statement is already in it, and otherwise
+/// the existing policy with our statement added (or a stale statement under
+/// our Sid replaced). An organisation's own statements are never dropped.
+/// Refuses a policy it can't parse rather than overwrite it.
+pub(crate) fn state_bucket_policy_update(
+    existing: Option<&str>,
+    bucket: &str,
+) -> Result<Option<String>, String> {
+    let ours: Value = serde_json::from_str(&state_bucket_policy(bucket)).expect("our policy is JSON");
+    let Some(existing) = existing else {
+        return Ok(Some(ours.to_string()));
+    };
+    let ours = ours["Statement"][0].clone();
+    let sid = ours["Sid"].clone();
+    let mut policy: Value = serde_json::from_str(existing)
+        .ok()
+        .filter(Value::is_object)
+        .ok_or("The state bucket's existing policy can't be read, so it was left as it is")?;
+    let statements = match policy.get("Statement") {
+        Some(Value::Array(a)) => a.clone(),
+        Some(single @ Value::Object(_)) => vec![single.clone()],
+        None => Vec::new(),
+        Some(_) => {
+            return Err("The state bucket's existing policy can't be read, so it was left as it is".into())
+        }
+    };
+    if statements.contains(&ours) {
+        return Ok(None);
+    }
+    let mut kept: Vec<Value> = statements.into_iter().filter(|s| s.get("Sid") != Some(&sid)).collect();
+    kept.push(ours);
+    policy["Statement"] = Value::Array(kept);
+    if policy.get("Version").is_none() {
+        policy["Version"] = json!("2012-10-17");
+    }
+    Ok(Some(policy.to_string()))
 }
 
 /// Create (or adopt) `triple-c-tfstate-<account>-<region>` and configure it:
@@ -1116,13 +1297,30 @@ pub(crate) async fn ensure_named_state_bucket(
         .send()
         .await
         .map_err(|e| classify_sdk_error("s3:PutBucketPublicAccessBlock", &e))?;
-    s3.put_bucket_policy()
+    // Only when the TLS statement is missing, and then added to whatever
+    // policy the bucket has (an organisation may have its own statements).
+    let existing = match s3
+        .get_bucket_policy()
         .bucket(&bucket)
         .expected_bucket_owner(account)
-        .policy(state_bucket_policy(&bucket))
         .send()
         .await
-        .map_err(|e| classify_sdk_error("s3:PutBucketPolicy", &e))?;
+    {
+        Ok(out) => out.policy().map(str::to_string),
+        Err(e) if e.code() == Some("NoSuchBucketPolicy") => None,
+        Err(e) => return Err(classify_sdk_error("s3:GetBucketPolicy", &e)),
+    };
+    if let Some(policy) = state_bucket_policy_update(existing.as_deref(), &bucket)
+        .map_err(|message| AwsError::Other { message })?
+    {
+        s3.put_bucket_policy()
+            .bucket(&bucket)
+            .expected_bucket_owner(account)
+            .policy(policy)
+            .send()
+            .await
+            .map_err(|e| classify_sdk_error("s3:PutBucketPolicy", &e))?;
+    }
     Ok(bucket)
 }
 

@@ -909,6 +909,12 @@
           "markdownDescription": "Enables the pull_stt_image command without any pre-configured scope."
         },
         {
+          "description": "Enables the push_aws_saved_state command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-push-aws-saved-state",
+          "markdownDescription": "Enables the push_aws_saved_state command without any pre-configured scope."
+        },
+        {
           "description": "Enables the read_container_file command without any pre-configured scope.",
           "type": "string",
           "const": "allow-read-container-file",
@@ -1831,6 +1837,12 @@
           "type": "string",
           "const": "deny-pull-stt-image",
           "markdownDescription": "Denies the pull_stt_image command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the push_aws_saved_state command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-push-aws-saved-state",
+          "markdownDescription": "Denies the push_aws_saved_state command without any pre-configured scope."
         },
         {
           "description": "Denies the read_container_file command without any pre-configured scope.",

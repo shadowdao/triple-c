@@ -5,6 +5,7 @@ import {
   detectAwsEnvironments,
   followAwsDeployment,
   onboardAwsUser,
+  pushAwsSavedState,
   repairAwsEnvironment,
   unlockAwsState,
   updateAwsEnvironment,
@@ -15,6 +16,7 @@ import type {
   DetectedEnvironment,
   EnvironmentScan,
   HostConnection,
+  LockInfo,
   ModuleKind,
   NetworkChoice,
   PermissionSummary,
@@ -132,7 +134,14 @@ export default function EnvironmentsPanel({
   const [deployOpen, setDeployOpen] = useState(false);
   const [repairOf, setRepairOf] = useState<string | null>(null);
   const [destroyOf, setDestroyOf] = useState<{ name: string; region: string } | null>(null);
-  const [unlockOf, setUnlockOf] = useState<{ env: DetectedEnvironment; region: string } | null>(null);
+  /** An Unlock waiting for its typed confirmation: an environment's lock or the caller's onboarding's. */
+  const [unlockOf, setUnlockOf] = useState<{
+    name: string;
+    region: string;
+    stateKey: string;
+    lock: LockInfo | null;
+    onboarding: boolean;
+  } | null>(null);
   const [bundle, setBundle] = useState<Bundle | null>(null);
   const [copyNote, setCopyNote] = useState<string | null>(null);
   const request = useRef(0);
@@ -178,17 +187,21 @@ export default function EnvironmentsPanel({
     [start],
   );
 
-  // Reattach to a deploy running on this machine (a re-follow replays its whole log).
+  // Reattach to a deploy (or the caller's onboarding) running on this machine;
+  // a re-follow replays its whole log.
   useEffect(() => {
     if (!scan) return;
-    for (const e of scan.environments) {
-      const key = environmentStateKey(e.name);
+    const reattach = (name: string, key: string, label: string) => {
       const seen = runKey(scan.region, key);
-      if (e.actions.includes("follow") && !runs[seen] && !followed.current.has(seen)) {
+      if (!runs[seen] && !followed.current.has(seen)) {
         followed.current.add(seen);
-        void launch(scan.region, e.name, key, `Deploy of ${e.name}`, () =>
-          followAwsDeployment(connection.id, scan.region, key),
-        );
+        void launch(scan.region, name, key, label, () => followAwsDeployment(connection.id, scan.region, key));
+      }
+    };
+    for (const e of scan.environments) {
+      if (e.actions.includes("follow")) reattach(e.name, environmentStateKey(e.name), `Deploy of ${e.name}`);
+      if (e.onboarding_actions.includes("follow")) {
+        reattach(e.name, onboardingStateKey(e.name, scan.owner_key), `Joining ${e.name}`);
       }
     }
   }, [scan, runs, launch, connection.id]);
@@ -251,7 +264,19 @@ export default function EnvironmentsPanel({
     const status = stateStatus(e.state);
     const lock = stateLock(e.state);
     const has = (a: DetectedEnvironment["actions"][number]) => e.actions.includes(a);
+    const mine = (a: DetectedEnvironment["actions"][number]) => e.onboarding_actions.includes(a);
     const onboarding = e.onboarding?.state;
+    const myKey = onboardingStateKey(e.name, found.owner_key);
+    const myLock =
+      e.onboarding && (e.onboarding.state === "incomplete" || e.onboarding.state === "in_progress")
+        ? e.onboarding.lock
+        : null;
+    // Someone else's run holds the state: a re-apply or destroy would only
+    // fail inside its run, so those wait for Unlock.
+    const lockHeld = !!lock && !lock.local_process;
+    // Join re-applies the onboarding: not under a held lock, nor before a
+    // saved state is pushed back.
+    const joinBlocked = (!!myLock && !myLock.local_process) || mine("push_state");
     const busy = stale || !!pending[rowKey(at, e.name)];
     const rowError = rowErrors[rowKey(at, e.name)];
     const isWaiting = waiting.has(rowKey(at, e.name));
@@ -283,14 +308,100 @@ export default function EnvironmentsPanel({
             {e.state.state === "unreadable_record" && (
               <div className="text-[var(--error)]">The environment's record can't be used: {e.state.reason}</div>
             )}
+            {e.state.state === "externally_managed" && (
+              <div className="text-[var(--text-secondary)]">
+                Its OpenTofu state isn't in this region's Triple-C state bucket (deployed from a bundle with another
+                bucket, or you can't read it), so it can't be updated from here.
+              </div>
+            )}
+            {e.state.state === "incomplete" && (
+              <div className="text-[var(--text-secondary)]">
+                {lockHeld
+                  ? "The last change didn't finish: its run stopped while holding the state lock. Unlock first, then Repair."
+                  : "The last change didn't finish: the deployment has state but no working environment record."}
+              </div>
+            )}
+            {has("push_state") && (
+              <div className="text-[var(--error)]">
+                The last run on this machine couldn't save its state (OpenTofu kept it in errored.tfstate). Push it back
+                before anything else runs here.
+              </div>
+            )}
+            {onboarding === "incomplete" && (
+              <div className="text-[var(--text-secondary)]">
+                {myLock && !myLock.local_process
+                  ? `Your last onboarding didn't finish and still holds its state lock (${lockLine(myLock)}). Unlock it, then Join again to finish.`
+                  : mine("push_state")
+                    ? "Your last onboarding didn't finish and couldn't save its state; push the saved state back, then Join again."
+                    : "Your last onboarding didn't finish; Join again to finish it."}
+              </div>
+            )}
             {!isAdmin && isWaiting && onboarding !== "joined" && (
               <div className="text-[var(--text-secondary)]">Waiting for an admin to onboard you</div>
             )}
           </div>
           <div className="flex gap-1.5 flex-wrap">
             {has("join") && onboarding !== "joined" && onboarding !== "in_progress" && (
-              <Button size="sm" variant="primary" disabled={busy} aria-label={`Join ${e.name}`} onClick={() => join(found, e)}>
+              <Button
+                size="sm"
+                variant="primary"
+                disabled={busy || joinBlocked}
+                aria-label={`Join ${e.name}`}
+                onClick={() => join(found, e)}
+              >
                 {!isAdmin && isWaiting ? "Show onboarding bundle" : "Join"}
+              </Button>
+            )}
+            {mine("follow") && (
+              <Button
+                size="sm"
+                disabled={busy}
+                aria-label={`Follow my onboarding to ${e.name}`}
+                onClick={() =>
+                  void launch(at, e.name, myKey, `Joining ${e.name}`, () => followAwsDeployment(connection.id, at, myKey))
+                }
+              >
+                Follow
+              </Button>
+            )}
+            {mine("push_state") && (
+              <Button
+                size="sm"
+                disabled={busy}
+                aria-label={`Push saved state of my onboarding to ${e.name}`}
+                onClick={() =>
+                  void launch(at, e.name, myKey, `Push of the saved state of joining ${e.name}`, () =>
+                    pushAwsSavedState(connection.id, at, myKey),
+                  )
+                }
+              >
+                Push saved state
+              </Button>
+            )}
+            {mine("unlock") && (
+              <Button
+                size="sm"
+                variant="danger"
+                disabled={busy}
+                aria-label={`Unlock my onboarding to ${e.name}`}
+                onClick={() => setUnlockOf({ name: e.name, region: at, stateKey: myKey, lock: myLock, onboarding: true })}
+              >
+                Unlock onboarding
+              </Button>
+            )}
+            {has("push_state") && (
+              <Button
+                size="sm"
+                disabled={busy}
+                aria-label={`Push saved state of ${e.name}`}
+                onClick={() => {
+                  const key = environmentStateKey(e.name);
+                  void launch(at, e.name, key, `Push of the saved state of ${e.name}`, () =>
+                    pushAwsSavedState(connection.id, at, key),
+                  );
+                }}
+              >
+                Push saved state
               </Button>
             )}
             {has("follow") && (
@@ -323,7 +434,7 @@ export default function EnvironmentsPanel({
             {has("repair") && (
               <Button
                 size="sm"
-                disabled={busy}
+                disabled={busy || lockHeld}
                 aria-label={`Repair ${e.name}`}
                 onClick={() => (e.info ? void repair(at, e.name) : setRepairOf(e.name))}
               >
@@ -331,14 +442,31 @@ export default function EnvironmentsPanel({
               </Button>
             )}
             {has("unlock") && (
-              <Button size="sm" variant="danger" disabled={busy} aria-label={`Unlock ${e.name}`} onClick={() => setUnlockOf({ env: e, region: at })}>
+              <Button
+                size="sm"
+                variant="danger"
+                disabled={busy}
+                aria-label={`Unlock ${e.name}`}
+                onClick={() =>
+                  setUnlockOf({ name: e.name, region: at, stateKey: environmentStateKey(e.name), lock, onboarding: false })
+                }
+              >
                 Unlock
               </Button>
             )}
             {has("destroy") && (
-              <Button size="sm" variant="danger" disabled={busy} aria-label={`Destroy ${e.name}`} onClick={() => setDestroyOf({ name: e.name, region: at })}>
+              <Button
+                size="sm"
+                variant="danger"
+                disabled={busy || lockHeld}
+                aria-label={`Destroy ${e.name}`}
+                onClick={() => setDestroyOf({ name: e.name, region: at })}
+              >
                 Destroy
               </Button>
+            )}
+            {lockHeld && (has("repair") || has("destroy")) && (
+              <span className="self-center text-xs text-[var(--text-secondary)]">Unlock first</span>
             )}
           </div>
         </div>
@@ -466,13 +594,13 @@ export default function EnvironmentsPanel({
       )}
       {unlockOf && (
         <TypedConfirmModal
-          title={`Unlock ${unlockOf.env.name}`}
-          name={unlockOf.env.name}
+          title={unlockOf.onboarding ? `Unlock your onboarding to ${unlockOf.name}` : `Unlock ${unlockOf.name}`}
+          name={unlockOf.name}
           confirmLabel="Unlock"
           onClose={() => setUnlockOf(null)}
           onConfirm={async () => {
             try {
-              await unlockAwsState(connection.id, unlockOf.region, environmentStateKey(unlockOf.env.name));
+              await unlockAwsState(connection.id, unlockOf.region, unlockOf.stateKey);
             } catch (e) {
               return toAwsError(e);
             }
@@ -481,7 +609,7 @@ export default function EnvironmentsPanel({
           }}
         >
           {(() => {
-            const lock = stateLock(unlockOf.env.state);
+            const lock = unlockOf.lock;
             return lock ? (
               <p>
                 Held by <span className="font-mono text-[var(--text-primary)]">{lock.who || "unknown"}</span> since{" "}

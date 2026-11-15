@@ -997,3 +997,127 @@ fn a_started_runner_reports_its_pid() {
 
     assert_eq!(started, Started { pid: Some(31337) });
 }
+
+/// A failed apply whose state OpenTofu could not save leaves
+/// `errored.tfstate`: the runner says so in an error line, the outcome's
+/// summary names it, and nothing new is materialized over it.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_errored_state_is_reported_and_blocks_the_next_launch() {
+    let _turn = runner_turn();
+    let bin = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let bucket = "triple-c-tfstate-123456789012-us-east-1";
+    let wd = materialize(
+        root.path(),
+        ModuleKind::PermissionsBoundary,
+        Deployment::Boundary,
+        bucket,
+        "us-east-1",
+        &boundary_vars("us-east-1"),
+    )
+    .unwrap();
+    // init succeeds; the apply "fails to persist" and leaves errored.tfstate.
+    let tofu = fake_tofu(
+        bin.path(),
+        "[ \"$1\" = init ] && exit 0\necho '{\"version\":4}' > errored.tfstate\nexit 1",
+    );
+    let env = vec![("PATH".to_string(), "/usr/bin:/bin".to_string())];
+
+    assert_eq!(run_runner(&wd.dir, TofuOp::Apply, &tofu, &env), Some(1));
+    assert!(has_errored_state(&wd));
+    assert!(last_run_failed(&wd));
+    let log = std::fs::read_to_string(wd.dir.join("apply.log")).unwrap();
+    assert!(
+        log.lines()
+            .any(|l| l.starts_with("Error:") && l.contains("errored.tfstate")),
+        "{log}"
+    );
+    let outcome = follow(&wd, Duration::from_millis(10), |_| {})
+        .await
+        .unwrap();
+    assert!(!outcome.ok);
+    let summary = outcome.summary.unwrap();
+    assert!(summary.contains("errored.tfstate"), "{summary}");
+    assert!(summary.contains("Push saved state"), "{summary}");
+
+    // Launching anything there now is refused, naming the recovery.
+    let err = materialize(
+        root.path(),
+        ModuleKind::PermissionsBoundary,
+        Deployment::Boundary,
+        bucket,
+        "us-east-1",
+        &boundary_vars("us-east-1"),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("errored.tfstate"), "{err}");
+    assert!(err.contains("tofu state push errored.tfstate"), "{err}");
+
+    // The recovery: push it back through the runner; it is set aside once
+    // pushed, and the folder can be used again.
+    let pushed = fake_tofu(
+        bin.path(),
+        "[ \"$1\" = init ] && exit 0\n[ \"$1 $2 $3\" = 'state push errored.tfstate' ] || exit 9\necho pushed",
+    );
+    assert_eq!(run_runner(&wd.dir, TofuOp::PushState, &pushed, &env), Some(0));
+    assert!(!has_errored_state(&wd));
+    assert!(wd.dir.join("errored.tfstate.pushed").exists());
+    assert!(!last_run_failed(&wd));
+    assert!(materialize(
+        root.path(),
+        ModuleKind::PermissionsBoundary,
+        Deployment::Boundary,
+        bucket,
+        "us-east-1",
+        &boundary_vars("us-east-1"),
+    )
+    .is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_push_keeps_the_saved_state() {
+    let _turn = runner_turn();
+    let bin = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let wd = Workdir {
+        dir: tmp.path().to_path_buf(),
+    };
+    std::fs::write(wd.dir.join("errored.tfstate"), "{}").unwrap();
+    let tofu = fake_tofu(bin.path(), "[ \"$1\" = init ] && exit 0\nexit 1");
+    let env = vec![("PATH".to_string(), "/usr/bin:/bin".to_string())];
+    assert_eq!(run_runner(&wd.dir, TofuOp::PushState, &tofu, &env), Some(1));
+    assert!(has_errored_state(&wd));
+}
+
+/// materialize checks for a running deploy under `start.lock`, so a second
+/// app instance between its check and its start can't interleave.
+#[test]
+fn materialize_waits_its_turn_on_the_start_lock() {
+    let root = tempfile::tempdir().unwrap();
+    let bucket = "triple-c-tfstate-123456789012-us-east-1";
+    let wd = workdir_for(root.path(), Deployment::Boundary, bucket).unwrap();
+    std::fs::create_dir_all(&wd.dir).unwrap();
+    let starting = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(wd.dir.join("start.lock"))
+        .unwrap();
+    starting.try_lock().unwrap();
+    let err = materialize(
+        root.path(),
+        ModuleKind::PermissionsBoundary,
+        Deployment::Boundary,
+        bucket,
+        "us-east-1",
+        &boundary_vars("us-east-1"),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("already"), "{err}");
+    assert!(!wd.dir.join("backend.hcl").exists(), "materialize wrote under another's lock");
+    drop(starting);
+}

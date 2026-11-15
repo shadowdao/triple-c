@@ -1234,13 +1234,15 @@ export type EnvironmentState =
   | { state: "externally_managed" }
   | { state: "unreadable_record"; reason: string };
 
-export type EnvironmentAction = "join" | "update" | "repair" | "destroy" | "follow" | "unlock";
+/** `push_state`: push the state a failed run on this machine couldn't save (`errored.tfstate`) back to the bucket. */
+export type EnvironmentAction = "join" | "update" | "repair" | "destroy" | "follow" | "unlock" | "push_state";
 
+/** `incomplete`: the last onboarding run didn't finish (Join re-applies and finishes it). */
 export type OnboardingState =
   | { state: "joined" }
   | { state: "not_joined" }
-  | { state: "in_progress" }
-  | { state: "incomplete" };
+  | { state: "in_progress"; lock: LockInfo | null }
+  | { state: "incomplete"; lock: LockInfo | null };
 
 export type Knowable = "yes" | "no" | "unknown";
 
@@ -1251,6 +1253,10 @@ export interface DetectedEnvironment {
   actions: EnvironmentAction[];
   info: EnvironmentInfo | null;
   onboarding: OnboardingState | null;
+  /** What the caller can do with their own onboarding's run: `follow`, `unlock`, `push_state`. */
+  onboarding_actions: EnvironmentAction[];
+  /** Users onboarded to it (non-empty `users/<env>/…` states); null when the bucket can't be listed. */
+  onboarded_users: number | null;
 }
 
 export interface EnvironmentScan {

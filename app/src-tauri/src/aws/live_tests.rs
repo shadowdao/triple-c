@@ -1156,8 +1156,12 @@ mod environment {
             let (root, bucket) = (self.root.clone(), self.bucket.clone());
             let running = move |d: Deployment| {
                 tofu::workdir_for(&root, d, &bucket)
-                    .map(|wd| tofu::is_running(&wd))
-                    .unwrap_or(false)
+                    .map(|wd| crate::aws::environments::LocalRun {
+                        running: tofu::is_running(&wd),
+                        failed: tofu::last_run_failed(&wd),
+                        errored_state: tofu::has_errored_state(&wd),
+                    })
+                    .unwrap_or_default()
             };
             scan_in_bucket(&api, who, &self.e.region, &self.bucket, &running)
                 .await
@@ -1533,7 +1537,7 @@ mod environment {
             let found = t.scan(&cfg, &who).await;
             onboard_refusal(&found, &name).expect("join is offered");
             let owner = validate_owner_id(&who.user_id).expect("owner id");
-            let okey = owner_key(&owner);
+            let okey = owner_key(&t.e.region, &owner);
             let (_, outcome, denied) = t
                 .run(
                     ModuleKind::UserOnboard,

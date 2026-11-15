@@ -232,6 +232,12 @@ it is unpacked), and an admin can run the very same files by hand from a bundle.
 | `terraform/environment` | what every user shares: ECS cluster (Fargate, Fargate Spot), the tasks security group (no inbound rules), KMS key and alias, log group `/triple-c/<env>`, the network (`network_mode`: `public`, `private-nat`, `existing`) and, last, the record `/triple-c/environments/<env>` | `environments/<env>/terraform.tfstate` |
 | `terraform/user-onboard` | one user's task and execution roles (with the boundary) and their own EFS file system, its `-efs` security group, two mount targets and a file-system policy that admits only their task role | `users/<env>/<owner key>/terraform.tfstate` |
 
+The **owner key** is the first 12 hex characters of `sha256("<region>:<aws:userid>")`; it names
+the user's roles, `triple-c-<env>-<owner key>-task` and `-exec` (a `UserId` holds a `:`, which
+role names reject). The region is in it because IAM role names are account-wide while
+environments are regional: the same user in an environment of the same name in two regions gets
+two sets of roles. The module checks the key against `region` and `owner_id`.
+
 Every module pins the AWS provider (`hashicorp/aws` 6.73.0, hashes in `.terraform.lock.hcl`),
 sets `region` explicitly, never overrides an endpoint, and tags everything through `default_tags`
 (`triple-c:component`, plus the environment, owner and template version). The onboarding module
@@ -239,30 +245,46 @@ reads the environment only from its record, never from its state.
 
 **The state bucket** is `triple-c-tfstate-<account>-<region>`, one per account and region. The app
 creates it on the first deploy (versioning, SSE-S3, all four public-access blocks, a TLS-only
-bucket policy, tagged `triple-c:component=state`); every call carries `expected_bucket_owner`, so a
+bucket policy, tagged `triple-c:component=state`; the tag goes on the create itself, which the
+admin policy requires). An existing bucket policy is kept: the TLS-only statement is added to it
+when missing, never put over an organisation's own statements. Every call carries `expected_bucket_owner`, so a
 bucket of that name in another account is refused, never used. Locking is S3-native
 (`use_lockfile = true`): a run holds `<state key>.tflock`, and a held lock is what "deploying"
-means to every other copy of the app. The app removes a stale lock (older than two hours, an
-environment's only) with a conditional delete on the lock's ETag, so a lock taken since is never
+means to every other copy of the app. The app removes a stale lock (older than two hours: an
+environment's, or the caller's own onboarding's) with a conditional delete on the lock's ETag, so a lock taken since is never
 removed. `tofu destroy` leaves an *empty* state object behind; detection reads an empty state as
 no deployment at all.
 
 **How the app runs a deployment.** It writes the module into a work folder
 (`<app data>/triple-c/aws/work/<bucket>/<state key>/`) with `backend.hcl` and
 `terraform.tfvars.json`, then starts a detached runner (the app binary re-executed with
-`--tofu-runner`) that runs `tofu init` and `tofu apply` (or `destroy`) in its own process group,
+`--tofu-runner`) that runs `tofu init` and `tofu apply` (or `destroy`) in its own session,
 logging to `apply.log`. Closing the app does not stop it; the next start reattaches by following the
-log. Cancel interrupts OpenTofu, which stops gracefully and saves its state. OpenTofu's environment
+log. Cancel interrupts OpenTofu, which stops gracefully and saves its state. Cancel is not
+available on Windows yet (a run there goes on to the end). If OpenTofu cannot save the state after
+a run it keeps it in `errored.tfstate` in the work folder; the run ends with an error saying so,
+nothing else is started for that deployment until it is pushed back, and **Push saved state** on
+the row runs `tofu state push errored.tfstate` through the same runner (by hand: `tofu init
+-backend-config=backend.hcl`, then `tofu state push errored.tfstate`, from the work folder). OpenTofu's environment
 is built from scratch: no inherited `AWS_*`, `TF_*` or `TOFU_*` variables, the connection's profile
 name or its keys (in the environment only, never in arguments or files), and the app's own CLI
 config, so a `~/.tofurc` cannot redirect provider downloads. The app destroys only an incomplete
-deployment (state without a record, or a failed apply); a working environment is removed by an
-admin with `tofu destroy` from a bundle.
+deployment (state without a record, or a failed apply), and never while any user's onboarding
+state for it remains; a working environment is removed by an admin with `tofu destroy` from a
+bundle.
+
+**Onboarding detection.** A user is *Joined* when their task role exists and, where the bucket is
+readable, their state holds the module's `onboarding_complete` output, which depends on every
+resource the module creates, so a run that failed part-way never writes it. A partial state, a
+failed (or errored) run on this machine, or a stale lock reads as *Incomplete*, and Join (an
+idempotent re-apply) stays offered to finish it; Follow, Unlock and Push saved state work on the
+user's own onboarding as on an environment.
 
 **Admin bundles.** When the signed-in identity cannot deploy (or the admin prefers to), the app
 saves a folder with the module, `backend.hcl`, `terraform.tfvars.json` and a `README.txt` holding
 the exact commands. By hand, with credentials carrying the admin files (OpenTofu or Terraform 1.10
-or later):
+or later); the permissions-boundary bundle instead needs an account administrator **without** the
+admin files attached, since their Deny on the boundary policy applies to anyone holding them:
 
 ```sh
 cd <bundle folder>
@@ -272,7 +294,12 @@ tofu apply      # or: tofu destroy
 
 Remove every user's onboarding before destroying their environment. With Terraform, first run
 `terraform providers lock` for your platforms (the lock file carries OpenTofu's registry hashes).
-The bundle's `README.txt` also shows how to create the state bucket by hand if the app never has.
+The bundle's `README.txt` also shows how to create the state bucket by hand if the app never has,
+exactly as the app configures it: `create-bucket` with the `triple-c:component=state` tag in its
+`--create-bucket-configuration` (the admin policy allows the create only with that tag in the
+request, so a later `put-bucket-tagging` would not do; this needs an AWS CLI v2 whose
+`create-bucket` accepts `Tags`), then versioning, SSE-S3, the public-access block and the TLS-only
+bucket policy.
 
 ## Invariants the modules must keep (phase 4)
 

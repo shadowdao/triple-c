@@ -40,12 +40,12 @@ variable "owner_id" {
 }
 
 variable "owner_key" {
-  description = "The first 12 hex characters of sha256(owner_id); names the user's roles, which reject the ':' in owner_id."
+  description = "The first 12 hex characters of sha256(\"<region>:<owner_id>\"); names the user's roles, which reject the ':' in owner_id. The region is included because role names are account-wide and environments are regional."
   type        = string
 
   validation {
-    condition     = can(regex("^[0-9a-f]{12}$", var.owner_key)) && var.owner_key == substr(sha256(var.owner_id), 0, 12)
-    error_message = "owner_key must be the first 12 hex characters of sha256(owner_id)."
+    condition     = can(regex("^[0-9a-f]{12}$", var.owner_key)) && var.owner_key == substr(sha256("${var.region}:${var.owner_id}"), 0, 12)
+    error_message = "owner_key must be the first 12 hex characters of sha256(\"<region>:<owner_id>\")."
   }
 }
 

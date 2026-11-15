@@ -73,6 +73,7 @@
     "allow-unlock-aws-state",
     "allow-follow-aws-deployment",
     "allow-cancel-aws-deployment",
+    "allow-push-aws-saved-state",
     "allow-onboard-aws-user",
     "allow-deploy-aws-permissions-boundary",
     "allow-save-aws-admin-bundle",

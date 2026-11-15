@@ -43,6 +43,8 @@ fn env(name: &str, state: EnvironmentState, actions: Vec<EnvironmentAction>) -> 
         actions,
         info: None,
         onboarding: None,
+        onboarding_actions: Vec::new(),
+        onboarded_users: Some(0),
     }
 }
 
@@ -51,7 +53,7 @@ fn scan(boundary: Knowable, environments: Vec<DetectedEnvironment>) -> Environme
         region: REGION.into(),
         account: ACCOUNT.into(),
         owner_id: USER_ID.into(),
-        owner_key: owner_key(USER_ID),
+        owner_key: owner_key(REGION, USER_ID),
         state_bucket: Knowable::Yes,
         boundary,
         environments,
@@ -70,7 +72,7 @@ fn lock(age_secs: u64, local_process: bool) -> LockInfo {
 
 #[test]
 fn only_our_state_keys_are_accepted() {
-    let ok = owner_key(USER_ID);
+    let ok = owner_key(REGION, USER_ID);
     let good = [
         (
             "environments/dev/terraform.tfstate".to_string(),
@@ -189,7 +191,7 @@ fn the_vpc_is_read_from_the_state_outputs() {
 #[test]
 fn bundles_contain_the_module_backend_vars_and_readme() {
     let dir = tempfile::tempdir().unwrap();
-    let ok = owner_key(USER_ID);
+    let ok = owner_key(REGION, USER_ID);
     let d = Deployment::User { env: "dev", owner_key: &ok };
     let vars = onboarding_vars("dev", REGION, USER_ID);
     let written = write_bundle(dir.path(), d, ACCOUNT, REGION, &vars).unwrap();
@@ -225,7 +227,29 @@ fn bundles_contain_the_module_backend_vars_and_readme() {
         assert!(readme.contains(needle), "README lacks {needle:?}:\n{readme}");
     }
     // Outside us-east-1 the bucket needs a location constraint.
-    assert!(readme.contains(&format!("LocationConstraint={REGION}")), "{readme}");
+    assert!(readme.contains(&format!("\"LocationConstraint\":\"{REGION}\"")), "{readme}");
+    // The admin policy allows s3:CreateBucket only with the component tag
+    // in the request, so the tag goes on the create itself; and the bucket
+    // is configured as the app configures it, TLS-only policy included.
+    let create = readme
+        .lines()
+        .find(|l| l.contains("aws s3api create-bucket"))
+        .unwrap();
+    assert!(
+        create.contains(r#""Tags":[{"Key":"triple-c:component","Value":"state"}]"#),
+        "{create}"
+    );
+    for needle in [
+        "put-bucket-versioning",
+        "put-bucket-encryption",
+        "put-public-access-block",
+        "put-bucket-policy",
+        "aws:SecureTransport",
+        "DenyInsecureTransport",
+    ] {
+        assert!(readme.contains(needle), "README lacks {needle:?}:\n{readme}");
+    }
+    assert!(!readme.contains("put-bucket-tagging"), "a later tag can't satisfy the create");
 
     // Writing again over our own files is fine...
     write_bundle(dir.path(), d, ACCOUNT, REGION, &vars).unwrap();
@@ -247,6 +271,7 @@ fn a_us_east_1_bundle_creates_its_bucket_without_a_location_constraint() {
     let readme = fs::read_to_string(dir.path().join("README.txt")).unwrap();
     assert!(readme.contains("aws s3api create-bucket"), "{readme}");
     assert!(!readme.contains("LocationConstraint"), "{readme}");
+    assert!(readme.contains(r#""Tags":[{"Key":"triple-c:component","Value":"state"}]"#), "{readme}");
     assert!(readme.contains("tofu destroy"), "{readme}");
     for (name, _) in module_files(ModuleKind::Environment) {
         assert!(dir.path().join(name).is_file(), "{name}");
@@ -316,7 +341,7 @@ fn onboarding_needs_a_joinable_environment_and_the_boundary() {
     let mut ready = env("dev", EnvironmentState::Ready, vec![Join]);
     ready.onboarding = Some(OnboardingState::NotJoined);
     let mut busy = env("busy", EnvironmentState::Ready, vec![Join]);
-    busy.onboarding = Some(OnboardingState::InProgress);
+    busy.onboarding = Some(OnboardingState::InProgress { lock: None });
     let half = env("half", EnvironmentState::Incomplete { lock: None }, vec![Repair, Destroy]);
     let s = scan(Knowable::Yes, vec![ready.clone(), busy, half]);
     assert!(onboard_refusal(&s, "dev").is_ok());
@@ -459,6 +484,51 @@ fn destroy_needs_the_action_no_record_and_no_lock() {
     assert!(destroy_refusal(&s, "ready").is_err());
     assert!(destroy_refusal(&s, "missing").is_err());
     assert_eq!(destroy_refusal(&s, "half").unwrap().name, "half");
+}
+
+#[test]
+fn destroy_is_refused_while_users_are_onboarded() {
+    use EnvironmentAction::*;
+    let mut onboarded = env("half", EnvironmentState::Incomplete { lock: None }, vec![Repair, Destroy]);
+    onboarded.onboarded_users = Some(2);
+    let mut unknown = env("blind", EnvironmentState::Incomplete { lock: None }, vec![Repair, Destroy]);
+    unknown.onboarded_users = None;
+    let s = scan(Knowable::Yes, vec![onboarded, unknown]);
+    let e = destroy_refusal(&s, "half").unwrap_err();
+    assert!(e.contains("remove the onboarded users' stacks first"), "{e}");
+    assert!(e.contains("users/half/"), "{e}");
+    // Without a listing there's no telling, and nothing to destroy from.
+    assert!(destroy_refusal(&s, "blind").unwrap_err().contains("can't list"));
+}
+
+#[test]
+fn only_your_own_stale_onboarding_lock_can_be_removed() {
+    use EnvironmentAction::*;
+    let mut stale = env("dev", EnvironmentState::Ready, vec![Join]);
+    stale.onboarding = Some(OnboardingState::Incomplete { lock: Some(lock(9000, false)) });
+    stale.onboarding_actions = vec![Unlock];
+    let mut live = env("live", EnvironmentState::Ready, vec![Join]);
+    live.onboarding = Some(OnboardingState::InProgress { lock: Some(lock(10, false)) });
+    let mut none = env("none", EnvironmentState::Ready, vec![Join]);
+    none.onboarding = Some(OnboardingState::Incomplete { lock: None });
+    let s = scan(Knowable::Yes, vec![stale, live, none]);
+    let mine = owner_key(REGION, USER_ID);
+    assert!(onboarding_unlock_refusal(&s, "dev", &mine).is_ok());
+    let e = onboarding_unlock_refusal(&s, "dev", "0123456789ab").unwrap_err();
+    assert!(e.contains("your own"), "{e}");
+    assert!(onboarding_unlock_refusal(&s, "live", &mine).is_err());
+    assert!(onboarding_unlock_refusal(&s, "none", &mine).is_err());
+    assert!(onboarding_unlock_refusal(&s, "missing", &mine).is_err());
+}
+
+#[test]
+fn a_boundary_bundle_names_an_administrator_without_the_admin_files() {
+    let dir = tempfile::tempdir().unwrap();
+    write_bundle(dir.path(), Deployment::Boundary, ACCOUNT, REGION, &boundary_vars(REGION)).unwrap();
+    let readme = fs::read_to_string(dir.path().join("README.txt")).unwrap();
+    assert!(readme.contains("account administrator"), "{readme}");
+    assert!(readme.contains("WITHOUT"), "{readme}");
+    assert!(!readme.contains("that carry the Triple-C environment-admin"), "{readme}");
 }
 
 #[test]

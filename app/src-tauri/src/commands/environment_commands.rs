@@ -38,8 +38,9 @@ use aws_sdk_s3::error::ProvideErrorMetadata;
 use tokio::sync::oneshot;
 
 use crate::aws::environments::{
-    ensure_state_bucket, scan, LIVE_LOCK_SECS, DetectedEnvironment, EnvironmentAction, EnvironmentInfo,
-    EnvironmentScan, EnvironmentState, Knowable, OnboardingState, SdkDetectApi,
+    ensure_state_bucket, scan, state_bucket_policy, LIVE_LOCK_SECS, DetectedEnvironment,
+    EnvironmentAction, EnvironmentInfo, EnvironmentScan, EnvironmentState, Knowable, LocalRun,
+    OnboardingState, SdkDetectApi,
 };
 use crate::aws::tofu::{
     self, backend_hcl, StartError, TofuEvent, TofuOp, TofuOutcome, Workdir,
@@ -239,6 +240,7 @@ pub(crate) fn require_action<'a>(
                 EnvironmentAction::Destroy => "Destroy",
                 EnvironmentAction::Follow => "Follow",
                 EnvironmentAction::Unlock => "Unlock",
+                EnvironmentAction::PushState => "Push saved state",
             }
         ))
     }
@@ -256,6 +258,30 @@ pub(crate) fn unlock_refusal(scan: &EnvironmentScan, name: &str) -> Result<(), S
     }
 }
 
+/// Unlock the caller's own onboarding state: only their own owner key, and
+/// only a stale lock no local runner holds (detection offers Unlock on the
+/// onboarding).
+pub(crate) fn onboarding_unlock_refusal(
+    scan: &EnvironmentScan,
+    name: &str,
+    owner_key: &str,
+) -> Result<(), String> {
+    if owner_key != scan.owner_key {
+        return Err("Only your own onboarding's state lock can be removed from the app".into());
+    }
+    let env = find(scan, name).ok_or_else(|| format!("No environment named \"{name}\" was found"))?;
+    match &env.onboarding {
+        Some(OnboardingState::Incomplete { lock: Some(l) })
+            if !l.local_process && env.onboarding_actions.contains(&EnvironmentAction::Unlock) =>
+        {
+            Ok(())
+        }
+        _ => Err(format!(
+            "Your onboarding to \"{name}\" has no stale state lock to remove"
+        )),
+    }
+}
+
 /// Self-onboarding needs the boundary (not known missing), an environment
 /// that can be joined, and no onboarding already running.
 pub(crate) fn onboard_refusal(scan: &EnvironmentScan, name: &str) -> Result<(), String> {
@@ -263,7 +289,7 @@ pub(crate) fn onboard_refusal(scan: &EnvironmentScan, name: &str) -> Result<(), 
         return Err("The account has no Triple-C permissions boundary yet".into());
     }
     let env = require_action(scan, name, EnvironmentAction::Join)?;
-    if env.onboarding == Some(OnboardingState::InProgress) {
+    if matches!(env.onboarding, Some(OnboardingState::InProgress { .. })) {
         return Err(format!(
             "Your onboarding to \"{name}\" is already in progress"
         ));
@@ -313,6 +339,26 @@ pub(crate) fn destroy_refusal<'a>(
     name: &str,
 ) -> Result<&'a DetectedEnvironment, String> {
     let env = require_action(scan, name, EnvironmentAction::Destroy)?;
+    // Each onboarded user's stack holds the environment's security group (a
+    // mount-target group references it) and reads its record: destroying
+    // the environment under them fails part-way and strands their stacks.
+    match env.onboarded_users {
+        Some(0) => {}
+        Some(n) => {
+            return Err(format!(
+                "Environment \"{name}\" still has {n} onboarded user{} (state under \
+                 users/{name}/); remove the onboarded users' stacks first (tofu destroy from each \
+                 user's onboarding bundle)",
+                if n == 1 { "" } else { "s" }
+            ))
+        }
+        None => {
+            return Err(format!(
+                "The state bucket can't list users onboarded to \"{name}\", so it can't be \
+                 destroyed from the app"
+            ))
+        }
+    }
     if env.info.is_some() {
         return Err(format!(
             "Environment \"{name}\" has a valid record, so it may be working; it can't be \
@@ -384,10 +430,29 @@ fn bundle_readme(d: Deployment, account: &str, region: &str, bucket: &str, key: 
                 .to_string()
         }
     };
-    let location = if region == "us-east-1" {
-        String::new()
+    // The admin policy allows s3:CreateBucket only with the component tag in
+    // the request (aws:RequestTag), so it goes on the create; a later
+    // put-bucket-tagging can't satisfy that. us-east-1 refuses a
+    // LocationConstraint.
+    let tags = r#""Tags":[{"Key":"triple-c:component","Value":"state"}]"#;
+    let create_config = if region == "us-east-1" {
+        format!("{{{tags}}}")
     } else {
-        format!(" --create-bucket-configuration LocationConstraint={region}")
+        format!(r#"{{"LocationConstraint":"{region}",{tags}}}"#)
+    };
+    let policy = state_bucket_policy(bucket);
+    let credentials = match d {
+        Deployment::Boundary => format!(
+            "- Credentials of an account administrator for account {account} WITHOUT
+  the Triple-C environment-admin policies attached: those policies deny
+  changing or deleting the boundary policy to anyone holding them, account
+  administrators included. (This bundle needs iam:CreatePolicy and, to
+  remove it, iam:DeletePolicy on triple-c-permissions-boundary.)"
+        ),
+        _ => format!(
+            "- Credentials for account {account} that carry the Triple-C environment-admin
+  policies."
+        ),
     };
     format!(
         "Triple-C admin bundle
@@ -403,8 +468,7 @@ Requirements
 ------------
 - OpenTofu 1.10 or later, or Terraform 1.10 or later. Both are needed for
   S3-native state locking (use_lockfile in backend.hcl).
-- Credentials for account {account} that carry the Triple-C environment-admin
-  policies.
+{credentials}
 - .terraform.lock.hcl pins the AWS provider's hashes for OpenTofu
   (registry.opentofu.org). With Terraform, first run
       terraform providers lock -platform=linux_amd64 -platform=darwin_arm64 -platform=windows_amd64
@@ -415,13 +479,14 @@ Requirements
 -------------------
 The bucket {bucket} must exist first. Either deploy anything from
 Triple-C once with this account and region (the app creates and configures
-it), or create it by hand (POSIX shell syntax):
+it), or create it by hand exactly as the app does (POSIX shell syntax; an
+AWS CLI v2 recent enough that create-bucket accepts Tags, e.g. 2.39):
 
-    aws s3api create-bucket --bucket {bucket} --region {region}{location}
+    aws s3api create-bucket --bucket {bucket} --region {region} --create-bucket-configuration '{create_config}'
     aws s3api put-bucket-versioning --bucket {bucket} --region {region} --expected-bucket-owner {account} --versioning-configuration Status=Enabled
     aws s3api put-bucket-encryption --bucket {bucket} --region {region} --expected-bucket-owner {account} --server-side-encryption-configuration '{{\"Rules\":[{{\"ApplyServerSideEncryptionByDefault\":{{\"SSEAlgorithm\":\"AES256\"}}}}]}}'
     aws s3api put-public-access-block --bucket {bucket} --region {region} --expected-bucket-owner {account} --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
-    aws s3api put-bucket-tagging --bucket {bucket} --region {region} --expected-bucket-owner {account} --tagging 'TagSet=[{{Key=triple-c:component,Value=state}}]'
+    aws s3api put-bucket-policy --bucket {bucket} --region {region} --expected-bucket-owner {account} --policy '{policy}'
 
 2. Deploy
 ---------
@@ -758,8 +823,12 @@ async fn detect(ctx: &Ctx) -> Result<EnvironmentScan, AwsError> {
     let (root, bucket) = (ctx.root.clone(), ctx.bucket());
     let running = move |d: Deployment| {
         tofu::workdir_for(&root, d, &bucket)
-            .map(|wd| tofu::is_running(&wd))
-            .unwrap_or(false)
+            .map(|wd| LocalRun {
+                running: tofu::is_running(&wd),
+                failed: tofu::last_run_failed(&wd),
+                errored_state: tofu::has_errored_state(&wd),
+            })
+            .unwrap_or_default()
     };
     scan(&api, &ctx.who, &ctx.region, &running).await
 }
@@ -833,8 +902,9 @@ fn cancellable(wd: &Workdir) -> bool {
     cfg!(unix) && tofu::runner_pid(wd).is_some()
 }
 
+/// Only the main window shows deploys; no other window gets the events.
 fn emit_progress(app: &AppHandle, p: &DeployProgress) {
-    if let Err(e) = app.emit(PROGRESS_EVENT, p) {
+    if let Err(e) = app.emit_to("main", PROGRESS_EVENT, p) {
         log::warn!("Could not emit deploy progress: {e}");
     }
 }
@@ -882,6 +952,21 @@ fn install_follower(
     Ok((op_id, gate))
 }
 
+/// The runner's whole environment ([`tofu::child_env`]): a keys
+/// connection's keys come from the keychain and go nowhere else.
+fn runner_env(ctx: &Ctx) -> Result<Vec<(String, String)>, AwsError> {
+    let HostKind::Aws { auth, .. } = &ctx.conn.kind;
+    let keys = match auth {
+        AwsAuth::Keys { keyring_ref } => Some(
+            secure::get_aws_keys(keyring_ref)
+                .map_err(other)?
+                .ok_or(AwsError::KeysMissing)?,
+        ),
+        AwsAuth::Profile { .. } => None,
+    };
+    tofu::child_env(&ctx.conn, keys.as_ref(), &ctx.root, std::env::vars())
+}
+
 /// Ensure OpenTofu and the state bucket, write the work folder and start a
 /// detached `init` + `op`. Returns the op id its progress is emitted under
 /// and the gate the command opens just before returning it.
@@ -905,16 +990,7 @@ async fn launch(
     let bucket = ensure_state_bucket(&ctx.cfg, &ctx.who.account, &ctx.region).await?;
     let wd = tofu::materialize(&ctx.root, module_kind(d), d, &bucket, &ctx.region, vars)?;
 
-    let HostKind::Aws { auth, .. } = &ctx.conn.kind;
-    let keys = match auth {
-        AwsAuth::Keys { keyring_ref } => Some(
-            secure::get_aws_keys(keyring_ref)
-                .map_err(other)?
-                .ok_or(AwsError::KeysMissing)?,
-        ),
-        AwsAuth::Profile { .. } => None,
-    };
-    let env = tofu::child_env(&ctx.conn, keys.as_ref(), &ctx.root, std::env::vars())?;
+    let env = runner_env(ctx)?;
 
     let start_wd = wd.clone();
     let started = tokio::task::spawn_blocking(move || {
@@ -1042,9 +1118,9 @@ pub async fn destroy_incomplete_aws_environment(
     opened(launch(app, &ctx, &key, &vars, TofuOp::Destroy).await)
 }
 
-/// Delete an environment's stale `.tflock`. Only an environment's lock,
-/// only when detection offers Unlock and no runner on this machine holds
-/// the deployment. The delete is conditional on the ETag of the lock object
+/// Delete a stale `.tflock`: an environment's, or the caller's own
+/// onboarding's (`users/<env>/<their key>/…`), only when detection offers
+/// Unlock on it and no runner on this machine holds the deployment. The delete is conditional on the ETag of the lock object
 /// as just re-read (and re-checked stale), so a lock taken since is never
 /// removed; there is no unconditional fallback.
 #[tauri::command]
@@ -1055,12 +1131,19 @@ pub async fn unlock_aws_state(
     state: State<'_, AppState>,
 ) -> Result<(), AwsError> {
     let key = parse_state_key(&state_key)?;
-    let DeploymentKey::Environment(name) = &key else {
-        return Err(other("Only an environment's state lock can be removed from the app"));
-    };
+    if key == DeploymentKey::Boundary {
+        return Err(other(
+            "The permissions boundary's state lock can't be removed from the app",
+        ));
+    }
     let ctx = context(&state, &connection_id, &region).await?;
     let found = detect(&ctx).await?;
-    unlock_refusal(&found, name).map_err(other)?;
+    match &key {
+        DeploymentKey::Environment(name) => unlock_refusal(&found, name),
+        DeploymentKey::User { env, owner_key } => onboarding_unlock_refusal(&found, env, owner_key),
+        DeploymentKey::Boundary => unreachable!("refused above"),
+    }
+    .map_err(other)?;
     if tofu::is_running(&ctx.workdir(key.deployment())?) {
         return Err(other("A deploy on this machine holds the lock"));
     }
@@ -1159,6 +1242,50 @@ pub async fn follow_aws_deployment(
     Ok(op_id)
 }
 
+/// Push the state a failed run on this machine couldn't save
+/// (`errored.tfstate`) back to the bucket: `tofu state push errored.tfstate`
+/// through the same detached runner and environment as a deploy, followed
+/// like one. Once pushed the file is set aside and the deployment can be
+/// re-applied (until then [`tofu::materialize`] refuses).
+#[tauri::command]
+pub async fn push_aws_saved_state(
+    connection_id: String,
+    region: String,
+    state_key: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String, AwsError> {
+    let key = parse_state_key(&state_key)?;
+    let ctx = context(&state, &connection_id, &region).await?;
+    opened(launch_push(app, &ctx, &key).await)
+}
+
+async fn launch_push(app: AppHandle, ctx: &Ctx, key: &DeploymentKey) -> Result<(String, Gate), AwsError> {
+    let d = key.deployment();
+    let label = key.label();
+    let wd = ctx.workdir(d)?;
+    if tofu::is_running(&wd) {
+        return Err(start_error(StartError::AlreadyRunning, &label));
+    }
+    if !tofu::has_errored_state(&wd) {
+        return Err(other(format!(
+            "There is no saved state of {label} on this machine to push"
+        )));
+    }
+    let _launching = LaunchGuard::take(&wd.dir, &label)?;
+    let tofu_bin = tofu::ensure_tofu(&ctx.root).await?;
+    let env = runner_env(ctx)?;
+    let start_wd = wd.clone();
+    let started = tokio::task::spawn_blocking(move || {
+        tofu::start_detached(&tofu_bin, &start_wd, TofuOp::PushState, &env)
+    })
+    .await
+    .map_err(|e| other(format!("The push could not be started: {e}")))?
+    .map_err(|e| start_error(e, &label))?;
+    let can_cancel = cfg!(unix) && started.pid.is_some();
+    install_follower(app, wd, state_key(d), &label, can_cancel, true)
+}
+
 /// Cancel: interrupt the runner, which stops OpenTofu gracefully.
 #[tauri::command]
 pub async fn cancel_aws_deployment(
@@ -1189,7 +1316,7 @@ pub async fn onboard_aws_user(
     onboard_refusal(&found, &env).map_err(other)?;
     let vars = onboarding_vars(&env, &ctx.region, &owner);
     let key = DeploymentKey::User {
-        owner_key: owner_key(&owner),
+        owner_key: owner_key(&ctx.region, &owner),
         env,
     };
     opened(launch(app, &ctx, &key, &vars, TofuOp::Apply).await)
@@ -1273,7 +1400,7 @@ pub async fn save_aws_admin_bundle(
             let vars = onboarding_vars(&env, &region_ok, &owner);
             (
                 DeploymentKey::User {
-                    owner_key: owner_key(&owner),
+                    owner_key: owner_key(&region_ok, &owner),
                     env,
                 },
                 vars,

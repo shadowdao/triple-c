@@ -86,7 +86,9 @@ export function stateStatus(s: EnvironmentState): { tone: StatusTone; label: str
     case "incomplete":
       return { tone: "error", label: "Incomplete" };
     case "externally_managed":
-      return { tone: "ok", label: "Available" };
+      // Its state isn't in this region's Triple-C bucket (an admin bundle's
+      // own bucket, by hand, or not readable here), so Update isn't offered.
+      return { tone: "ok", label: "Managed outside this account's Triple-C state" };
     case "unreadable_record":
       return { tone: "error", label: "Unreadable record" };
   }

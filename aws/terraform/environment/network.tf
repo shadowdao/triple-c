@@ -22,6 +22,15 @@ locals {
   )
 }
 
+# An existing network is the user's, taken by id: look the subnets up so the
+# task security group's precondition (main.tf) can refuse subnets outside
+# var.vpc_id or both in one availability zone before anything is built --
+# the same check the onboarding module makes of the record.
+data "aws_subnet" "existing" {
+  count = var.network_mode == "existing" ? 2 : 0
+  id    = var.subnet_ids[count.index]
+}
+
 # The subnets' AZs must not move once chosen: a changed availability_zone
 # replaces the subnet (and the ENIs, NAT gateway, associations and record
 # hanging off it). So the list is not filtered on `state` -- a temporary

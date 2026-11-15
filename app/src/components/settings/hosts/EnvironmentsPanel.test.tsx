@@ -419,4 +419,131 @@ describe("EnvironmentsPanel", () => {
       await screen.findByText("The state bucket name triple-c-tfstate-123456789012-eu-west-1 is already taken by another AWS account."),
     ).toBeInTheDocument();
   });
+  it("explains an environment managed elsewhere and an incomplete one", async () => {
+    backend(() =>
+      scan({
+        environments: [
+          env({ name: "shared", state: { state: "externally_managed" }, actions: ["join"] }),
+          env({ name: "half", state: { state: "incomplete", lock: null }, actions: ["repair", "destroy"], info: null, onboarding: null }),
+        ],
+      }),
+    );
+    render(<EnvironmentsPanel connection={conn} tier="environment_admin" />);
+    await open();
+    const shared = await screen.findByTestId("env-shared");
+    expect(within(shared).getByText("Managed outside this account's Triple-C state")).toBeInTheDocument();
+    expect(within(shared).getByText(/can't be updated from here/)).toBeInTheDocument();
+    const half = screen.getByTestId("env-half");
+    expect(within(half).getByText(/The last change didn't finish/)).toBeInTheDocument();
+  });
+
+  it("disables Repair and Destroy while a lock is held, saying Unlock first", async () => {
+    const lock = { who: "bob@desk", created: "x", operation: "OperationTypeApply", age_secs: 3 * 3600, local_process: false };
+    backend(() =>
+      scan({ environments: [env({ state: { state: "incomplete", lock }, actions: ["repair", "destroy", "unlock"], info: null, onboarding: null })] }),
+    );
+    render(<EnvironmentsPanel connection={conn} tier="environment_admin" />);
+    await open();
+    const row = await screen.findByTestId("env-dev");
+    expect(within(row).getByRole("button", { name: "Repair dev" })).toBeDisabled();
+    expect(within(row).getByRole("button", { name: "Destroy dev" })).toBeDisabled();
+    expect(within(row).getByRole("button", { name: "Unlock dev" })).toBeEnabled();
+    expect(within(row).getByText("Unlock first")).toBeInTheDocument();
+  });
+
+  it("an incomplete onboarding keeps Join and offers its own Unlock", async () => {
+    const lock = { who: "me@old", created: "x", operation: "OperationTypeApply", age_secs: 3 * 3600, local_process: false };
+    backend(
+      () =>
+        scan({
+          environments: [env({ onboarding: { state: "incomplete", lock }, onboarding_actions: ["unlock"] })],
+        }),
+      (cmd) => {
+        if (cmd === "unlock_aws_state") return undefined;
+        throw new Error(`unexpected ${cmd}`);
+      },
+    );
+    render(<EnvironmentsPanel connection={conn} tier="environment_admin" />);
+    await open();
+    const row = await screen.findByTestId("env-dev");
+    expect(within(row).getByText("Onboarding incomplete")).toBeInTheDocument();
+    expect(within(row).getByText(/Your last onboarding didn't finish/)).toBeInTheDocument();
+    expect(within(row).getByRole("button", { name: "Join dev" })).toBeDisabled();
+    fireEvent.click(within(row).getByRole("button", { name: "Unlock my onboarding to dev" }));
+    const dialog = screen.getByRole("dialog", { name: "Unlock your onboarding to dev" });
+    expect(within(dialog).getByText(/me@old/)).toBeInTheDocument();
+    fireEvent.change(within(dialog).getByLabelText(/Type dev to confirm/), { target: { value: "dev" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Unlock" }));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("unlock_aws_state", {
+        connectionId: "h1",
+        region: "eu-west-1",
+        stateKey: "users/dev/abc123abc123/terraform.tfstate",
+      }),
+    );
+  });
+
+  it("pushes a saved state back from the environment and the onboarding rows", async () => {
+    backend(
+      () =>
+        scan({
+          environments: [
+            env({ name: "a", state: { state: "incomplete", lock: null }, actions: ["push_state"], info: null, onboarding: null }),
+            env({ name: "b", onboarding: { state: "incomplete", lock: null }, onboarding_actions: ["push_state"] }),
+          ],
+        }),
+      (cmd) => {
+        if (cmd === "push_aws_saved_state") return "p1";
+        throw new Error(`unexpected ${cmd}`);
+      },
+    );
+    render(<EnvironmentsPanel connection={conn} tier="environment_admin" />);
+    await open();
+    const a = await screen.findByTestId("env-a");
+    expect(within(a).getByText(/couldn't save its state/)).toBeInTheDocument();
+    fireEvent.click(within(a).getByRole("button", { name: "Push saved state of a" }));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("push_aws_saved_state", {
+        connectionId: "h1",
+        region: "eu-west-1",
+        stateKey: "environments/a/terraform.tfstate",
+      }),
+    );
+    const b = screen.getByTestId("env-b");
+    // Join would only be refused until the saved state is back.
+    expect(within(b).getByRole("button", { name: "Join b" })).toBeDisabled();
+    fireEvent.click(within(b).getByRole("button", { name: "Push saved state of my onboarding to b" }));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("push_aws_saved_state", {
+        connectionId: "h1",
+        region: "eu-west-1",
+        stateKey: "users/b/abc123abc123/terraform.tfstate",
+      }),
+    );
+  });
+
+  it("follows an onboarding running on this machine", async () => {
+    backend(
+      () =>
+        scan({
+          environments: [env({ onboarding: { state: "in_progress", lock: null }, onboarding_actions: ["follow"] })],
+        }),
+      async (cmd) => {
+        if (cmd === "follow_aws_deployment") {
+          emit(progress({ op_id: "f2", state_key: "users/dev/abc123abc123/terraform.tfstate", events: [tofuEvent("joining line")] }));
+          return "f2";
+        }
+        throw new Error(`unexpected ${cmd}`);
+      },
+    );
+    render(<EnvironmentsPanel connection={conn} tier="environment_admin" />);
+    await open();
+    expect(await screen.findByText("joining line")).toBeInTheDocument();
+    expect(invoke).toHaveBeenCalledWith("follow_aws_deployment", {
+      connectionId: "h1",
+      region: "eu-west-1",
+      stateKey: "users/dev/abc123abc123/terraform.tfstate",
+    });
+    expect(within(screen.getByTestId("env-dev")).getByRole("button", { name: "Follow my onboarding to dev" })).toBeInTheDocument();
+  });
 });
