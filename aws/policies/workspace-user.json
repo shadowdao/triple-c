@@ -232,7 +232,8 @@
       ],
       "Condition": {
         "StringEquals": {
-          "aws:RequestTag/triple-c:owner": "${aws:userid}"
+          "aws:RequestTag/triple-c:owner": "${aws:userid}",
+          "aws:ResourceTag/triple-c:owner": "${aws:userid}"
         },
         "Null": {
           "aws:ResourceTag/triple-c:component": "false"
@@ -342,17 +343,6 @@
       ],
       "Resource": [
         "arn:aws:ssm:*:*:parameter/triple-c/*"
-      ]
-    },
-    {
-      "Sid": "ReadStacks",
-      "Effect": "Allow",
-      "Action": [
-        "cloudformation:DescribeStacks",
-        "cloudformation:ListStacks"
-      ],
-      "Resource": [
-        "*"
       ]
     },
     {

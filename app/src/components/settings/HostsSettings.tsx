@@ -5,46 +5,28 @@ import {
   addAwsProfileConnection,
   awsConnectionIdentity,
   awsConnectionSsoLogin,
-  awsPolicyDocument,
   checkAwsPermissions,
   listAwsProfiles,
   removeHostConnection,
   updateAwsConnection,
 } from "../../lib/tauri-commands";
-import { toAwsError } from "../../lib/aws-error";
+import { awsErrorMessage, toAwsError } from "../../lib/aws-error";
+import PolicyFiles from "./hosts/PolicyFiles";
+import EnvironmentsPanel from "./hosts/EnvironmentsPanel";
+import { COMMON_REGIONS } from "./hosts/environmentFormat";
 import type {
   AwsError,
   HostConnection,
   PermissionReport,
   PermissionSummary,
-  Tier,
+  PolicyFile,
 } from "../../lib/types";
 import Button from "../ui/Button";
 import SegmentedControl from "../ui/SegmentedControl";
 import Field, { inputClass, selectClass } from "../ui/Field";
 
-const COMMON_REGIONS = [
-  "us-east-1", "us-east-2", "us-west-1", "us-west-2", "ca-central-1",
-  "eu-west-1", "eu-west-2", "eu-west-3", "eu-central-1", "eu-north-1",
-  "ap-southeast-1", "ap-southeast-2", "ap-northeast-1", "ap-northeast-2", "ap-south-1",
-  "sa-east-1",
-];
 
 const OWN_PRINCIPAL_ACTIONS = ["iam:GetRole", "iam:SimulatePrincipalPolicy"];
-
-/** Human-readable copy for a failed AWS command; never raw JSON. */
-export function awsErrorMessage(e: AwsError): string {
-  switch (e.kind) {
-    case "sso_expired":
-      return `Your SSO session for profile ${e.profile} has expired.`;
-    case "profile_not_found":
-      return `Profile ${e.profile} was not found in your AWS config, or has no credentials.`;
-    case "keys_missing":
-      return "The access keys for this connection are missing from the keychain. Remove and re-add the connection.";
-    default:
-      return e.message;
-  }
-}
 
 const SUMMARY_LABEL: Record<PermissionSummary, string> = {
   environment_admin: "Environment admin",
@@ -121,12 +103,12 @@ function PermissionReportView({ report }: { report: PermissionReport }) {
       t.results.some((r) => r.verdict === "denied" && OWN_PRINCIPAL_ACTIONS.includes(r.action)),
     );
 
-  const copy = async (tier: Tier) => {
+  const copy = async (file: PolicyFile) => {
     try {
-      await navigator.clipboard.writeText(await awsPolicyDocument(tier));
-      setCopyNote("Policy copied to clipboard.");
+      await navigator.clipboard.writeText(file.json);
+      setCopyNote(`${file.name} copied to clipboard.`);
     } catch (e) {
-      setCopyNote(`Could not copy the policy: ${awsErrorMessage(toAwsError(e))}`);
+      setCopyNote(`Could not copy ${file.name}: ${awsErrorMessage(toAwsError(e))}`);
     }
   };
 
@@ -181,14 +163,8 @@ function PermissionReportView({ report }: { report: PermissionReport }) {
           </ul>
         </details>
       ))}
-      <div className="flex gap-2 flex-wrap">
-        <Button size="sm" onClick={() => copy("workspace_user")}>
-          Copy workspace-user policy
-        </Button>
-        <Button size="sm" onClick={() => copy("environment_admin")}>
-          Copy admin policy
-        </Button>
-      </div>
+      <PolicyFiles tier="workspace_user" label="Show workspace-user policy" onCopy={copy} />
+      <PolicyFiles tier="environment_admin" label="Show admin policies" onCopy={copy} />
       {copyNote && (
         <p role="status" className="text-xs text-[var(--text-secondary)]">
           {copyNote}
@@ -338,6 +314,7 @@ function ConnectionRow({ host }: { host: HostConnection }) {
       {busy && !editing && !confirmRemove && <p role="status" className="text-xs text-[var(--text-secondary)]">Working…</p>}
       {failure && <ErrorLine failure={failure} onSignIn={signIn} signingIn={signingIn} />}
       {report && <PermissionReportView report={report} />}
+      <EnvironmentsPanel connection={host} tier={report?.summary} />
     </li>
   );
 }
@@ -530,7 +507,7 @@ export default function HostsSettings() {
   return (
     <div className="space-y-3">
       <p className="text-xs text-[var(--text-secondary)] leading-snug">
-        Where project environments run. AWS connections are used to check what your credentials can do.
+        Where project environments run. AWS connections check what your credentials can do, and find, deploy and join environments.
       </p>
       <ul className="space-y-2">
         <li className="border border-[var(--border-color)] rounded-[var(--radius-control)] p-2.5">

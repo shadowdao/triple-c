@@ -74,15 +74,13 @@ pub fn simulation_request(check: &Check, p: &Placeholders, user_id: &str) -> Sim
 pub enum Probe {
     EcsListClusters,
     SsmGetParametersByPath,
-    CfnDescribeStacks,
     SecretsListSecrets,
 }
 
 impl Probe {
-    const ALL: [Probe; 4] = [
+    const ALL: [Probe; 3] = [
         Probe::EcsListClusters,
         Probe::SsmGetParametersByPath,
-        Probe::CfnDescribeStacks,
         Probe::SecretsListSecrets,
     ];
 
@@ -91,7 +89,6 @@ impl Probe {
         match action.split_once(':')?.0 {
             "ecs" => Some(Probe::EcsListClusters),
             "ssm" => Some(Probe::SsmGetParametersByPath),
-            "cloudformation" => Some(Probe::CfnDescribeStacks),
             "secretsmanager" => Some(Probe::SecretsListSecrets),
             _ => None,
         }
@@ -101,7 +98,6 @@ impl Probe {
         match self {
             Probe::EcsListClusters => "ecs:ListClusters",
             Probe::SsmGetParametersByPath => "ssm:GetParametersByPath",
-            Probe::CfnDescribeStacks => "cloudformation:DescribeStacks",
             Probe::SecretsListSecrets => "secretsmanager:ListSecrets",
         }
     }
@@ -130,7 +126,6 @@ pub struct SdkPermissionApi {
     iam: aws_sdk_iam::Client,
     ecs: aws_sdk_ecs::Client,
     ssm: aws_sdk_ssm::Client,
-    cfn: aws_sdk_cloudformation::Client,
     secrets: aws_sdk_secretsmanager::Client,
 }
 
@@ -147,7 +142,6 @@ impl SdkPermissionApi {
             iam: aws_sdk_iam::Client::from_conf(iam),
             ecs: aws_sdk_ecs::Client::new(cfg),
             ssm: aws_sdk_ssm::Client::new(cfg),
-            cfn: aws_sdk_cloudformation::Client::new(cfg),
             secrets: aws_sdk_secretsmanager::Client::new(cfg),
         }
     }
@@ -209,13 +203,6 @@ impl PermissionApi for SdkPermissionApi {
                 .get_parameters_by_path()
                 .path("/triple-c/environments")
                 .max_results(1)
-                .send()
-                .await
-                .map(drop)
-                .map_err(|e| classify(&e)),
-            Probe::CfnDescribeStacks => self
-                .cfn
-                .describe_stacks()
                 .send()
                 .await
                 .map(drop)
@@ -515,7 +502,7 @@ async fn simulate_all<A: PermissionApi>(
     ))
 }
 
-/// Per-tier outcomes from the four probes. `denied` is the action whose
+/// Per-tier outcomes from the three probes. `denied` is the action whose
 /// denial forced probing; the caller's own-principal checks of it are
 /// `Denied`.
 async fn probe_all<A: PermissionApi>(

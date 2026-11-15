@@ -1,0 +1,216 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "CreateTaggedVpcs",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateVpc"
+      ],
+      "Resource": [
+        "arn:aws:ec2:*:*:vpc/*"
+      ],
+      "Condition": {
+        "Null": {
+          "aws:RequestTag/triple-c:component": "false"
+        }
+      }
+    },
+    {
+      "Sid": "CreateTaggedSubnets",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateSubnet"
+      ],
+      "Resource": [
+        "arn:aws:ec2:*:*:subnet/*"
+      ],
+      "Condition": {
+        "Null": {
+          "aws:RequestTag/triple-c:component": "false"
+        }
+      }
+    },
+    {
+      "Sid": "AllocateTaggedAddresses",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:AllocateAddress"
+      ],
+      "Resource": [
+        "arn:aws:ec2:*:*:elastic-ip/*"
+      ],
+      "Condition": {
+        "Null": {
+          "aws:RequestTag/triple-c:component": "false"
+        }
+      }
+    },
+    {
+      "Sid": "CreateOtherTaggedNetwork",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateInternetGateway",
+        "ec2:CreateRouteTable",
+        "ec2:CreateNatGateway",
+        "ec2:CreateSecurityGroup"
+      ],
+      "Resource": [
+        "arn:aws:ec2:*:*:internet-gateway/*",
+        "arn:aws:ec2:*:*:route-table/*",
+        "arn:aws:ec2:*:*:natgateway/*",
+        "arn:aws:ec2:*:*:security-group/*"
+      ],
+      "Condition": {
+        "Null": {
+          "aws:RequestTag/triple-c:component": "false"
+        }
+      }
+    },
+    {
+      "Sid": "CreateOnlyInTripleCParents",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateSubnet",
+        "ec2:CreateRouteTable",
+        "ec2:CreateNatGateway"
+      ],
+      "Resource": [
+        "arn:aws:ec2:*:*:vpc/*",
+        "arn:aws:ec2:*:*:subnet/*",
+        "arn:aws:ec2:*:*:elastic-ip/*"
+      ],
+      "Condition": {
+        "Null": {
+          "aws:ResourceTag/triple-c:component": "false"
+        }
+      }
+    },
+    {
+      "Sid": "CreateSecurityGroupsInAnyVpc",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateSecurityGroup"
+      ],
+      "Resource": [
+        "arn:aws:ec2:*:*:vpc/*"
+      ]
+    },
+    {
+      "Sid": "TagNetworkAtCreate",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateTags"
+      ],
+      "Resource": [
+        "arn:aws:ec2:*:*:vpc/*",
+        "arn:aws:ec2:*:*:subnet/*",
+        "arn:aws:ec2:*:*:internet-gateway/*",
+        "arn:aws:ec2:*:*:route-table/*",
+        "arn:aws:ec2:*:*:elastic-ip/*",
+        "arn:aws:ec2:*:*:natgateway/*",
+        "arn:aws:ec2:*:*:security-group/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "ec2:CreateAction": [
+            "CreateVpc",
+            "CreateSubnet",
+            "CreateInternetGateway",
+            "CreateRouteTable",
+            "AllocateAddress",
+            "CreateNatGateway",
+            "CreateSecurityGroup"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "ManageTripleCNetwork",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DeleteVpc",
+        "ec2:ModifyVpcAttribute",
+        "ec2:DeleteSubnet",
+        "ec2:ModifySubnetAttribute",
+        "ec2:AttachInternetGateway",
+        "ec2:DetachInternetGateway",
+        "ec2:DeleteInternetGateway",
+        "ec2:DeleteRouteTable",
+        "ec2:CreateRoute",
+        "ec2:ReplaceRoute",
+        "ec2:DeleteRoute",
+        "ec2:AssociateRouteTable",
+        "ec2:DisassociateRouteTable",
+        "ec2:ReleaseAddress",
+        "ec2:DeleteNatGateway",
+        "ec2:DeleteSecurityGroup",
+        "ec2:AuthorizeSecurityGroup*",
+        "ec2:RevokeSecurityGroup*",
+        "ec2:UpdateSecurityGroupRuleDescriptions*",
+        "ec2:CreateTags",
+        "ec2:DeleteTags"
+      ],
+      "Resource": [
+        "arn:aws:ec2:*:*:vpc/*",
+        "arn:aws:ec2:*:*:subnet/*",
+        "arn:aws:ec2:*:*:internet-gateway/*",
+        "arn:aws:ec2:*:*:route-table/*",
+        "arn:aws:ec2:*:*:elastic-ip/*",
+        "arn:aws:ec2:*:*:natgateway/*",
+        "arn:aws:ec2:*:*:security-group/*"
+      ],
+      "Condition": {
+        "Null": {
+          "aws:ResourceTag/triple-c:component": "false"
+        }
+      }
+    },
+    {
+      "Sid": "AuthorizeNewSecurityGroupRules",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:AuthorizeSecurityGroup*"
+      ],
+      "Resource": [
+        "arn:aws:ec2:*:*:security-group-rule/*"
+      ]
+    },
+    {
+      "Sid": "MountTargetInterfacesThroughEfs",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateNetworkInterface",
+        "ec2:DeleteNetworkInterface"
+      ],
+      "Resource": [
+        "*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "aws:CalledViaLast": "elasticfilesystem.amazonaws.com"
+        }
+      }
+    },
+    {
+      "Sid": "DisassociateGoneAddresses",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DisassociateAddress"
+      ],
+      "Resource": [
+        "arn:aws:ec2:*:*:${*}/${*}"
+      ]
+    },
+    {
+      "Sid": "DescribeEc2",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:Describe*"
+      ],
+      "Resource": [
+        "*"
+      ]
+    }
+  ]
+}

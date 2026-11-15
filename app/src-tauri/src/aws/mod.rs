@@ -4,13 +4,18 @@
 //!
 
 mod connection;
+pub mod environments;
 mod error;
 mod identity;
 #[cfg(test)]
 mod live_tests;
 pub mod permissions;
 pub mod policies;
+#[cfg(test)]
+mod policy_eval;
+pub mod tofu;
+pub mod tofu_modules;
 
 pub use connection::{sdk_config, sdk_config_for_keys};
-pub use error::AwsError;
+pub use error::{classify_sdk_error, AwsError};
 pub use identity::{caller_identity, CallerIdentity};

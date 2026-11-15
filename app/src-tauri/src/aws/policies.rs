@@ -19,11 +19,26 @@ pub enum Tier {
     WorkspaceUser,
 }
 
-/// The policy document an admin attaches for `tier`.
-pub fn policy_json(tier: Tier) -> &'static str {
+/// The policy documents an admin attaches for `tier`, as (file name under
+/// `aws/policies/`, contents). Every file of a tier is required: the admin
+/// tier is split across files only because a managed policy holds 6,144
+/// characters (D7).
+pub fn policy_files(tier: Tier) -> &'static [(&'static str, &'static str)] {
     match tier {
-        Tier::EnvironmentAdmin => include_str!("../../../../aws/policies/environment-admin.json"),
-        Tier::WorkspaceUser => include_str!("../../../../aws/policies/workspace-user.json"),
+        Tier::EnvironmentAdmin => &[
+            (
+                "environment-admin.json",
+                include_str!("../../../../aws/policies/environment-admin.json"),
+            ),
+            (
+                "environment-admin-network.json",
+                include_str!("../../../../aws/policies/environment-admin-network.json"),
+            ),
+        ],
+        Tier::WorkspaceUser => &[(
+            "workspace-user.json",
+            include_str!("../../../../aws/policies/workspace-user.json"),
+        )],
     }
 }
 
@@ -125,6 +140,27 @@ const COMPONENT_REQUESTED: Context =
     &[("aws:RequestTag/triple-c:component", Literal("environment"))];
 const COMPONENT_RESOURCE_TAG: &str = "aws:ResourceTag/triple-c:component";
 const COMPONENT_TAGGED: Context = &[(COMPONENT_RESOURCE_TAG, Literal("environment"))];
+/// A call EFS makes on the caller's behalf (a mount target's interface).
+const VIA_EFS: Context = &[(
+    "aws:CalledViaLast",
+    Literal("elasticfilesystem.amazonaws.com"),
+)];
+/// Created inside a Triple-C (component-tagged) VPC, subnet or address.
+const REQUESTED_IN_TRIPLE_C_PARENT: Context = &[
+    ("aws:RequestTag/triple-c:component", Literal("environment")),
+    (COMPONENT_RESOURCE_TAG, Literal("environment")),
+];
+/// The state bucket is in the caller's own account.
+const IN_MY_ACCOUNT: Context = &[
+    ("s3:ResourceAccount", Literal("{account}")),
+    ("aws:PrincipalAccount", Literal("{account}")),
+];
+/// The state bucket is created tagged `triple-c:component=state`.
+const STATE_REQUESTED: Context = &[
+    ("aws:RequestTag/triple-c:component", Literal("state")),
+    ("s3:ResourceAccount", Literal("{account}")),
+    ("aws:PrincipalAccount", Literal("{account}")),
+];
 
 const PROBE_CLUSTER: &str = "arn:aws:ecs:{region}:{account}:cluster/triple-c-probe";
 const PROBE_TASK: &str =
@@ -139,7 +175,6 @@ const PROBE_ALIAS: &str = "arn:aws:kms:{region}:{account}:alias/triple-c-probe";
 const PROBE_LOG_GROUP: &str = "arn:aws:logs:{region}:{account}:log-group:/triple-c/probe";
 const PROBE_PARAMETER: &str =
     "arn:aws:ssm:{region}:{account}:parameter/triple-c/environments/probe";
-const PROBE_STACK: &str = "arn:aws:cloudformation:{region}:{account}:stack/triple-c-probe/00000000-0000-0000-0000-000000000000";
 const PROBE_FILE_SYSTEM: &str =
     "arn:aws:elasticfilesystem:{region}:{account}:file-system/fs-00000000";
 const PROBE_ACCESS_POINT: &str =
@@ -148,6 +183,25 @@ const PROBE_SECURITY_GROUP: &str =
     "arn:aws:ec2:{region}:{account}:security-group/sg-00000000000000000";
 const PROBE_VPC: &str = "arn:aws:ec2:{region}:{account}:vpc/vpc-00000000000000000";
 const PROBE_SESSION: &str = "arn:aws:ssm:{region}:{account}:session/probe-0123456789abcdef0";
+const PROBE_SUBNET: &str = "arn:aws:ec2:{region}:{account}:subnet/subnet-00000000000000000";
+const PROBE_INTERNET_GATEWAY: &str =
+    "arn:aws:ec2:{region}:{account}:internet-gateway/igw-00000000000000000";
+const PROBE_ROUTE_TABLE: &str = "arn:aws:ec2:{region}:{account}:route-table/rtb-00000000000000000";
+const PROBE_ELASTIC_IP: &str =
+    "arn:aws:ec2:{region}:{account}:elastic-ip/eipalloc-00000000000000000";
+const PROBE_NAT_GATEWAY: &str = "arn:aws:ec2:{region}:{account}:natgateway/nat-00000000000000000";
+/// What EC2 names when a call's resources no longer exist (an address
+/// association that went with its NAT gateway): a literal `*/*`.
+const PROBE_GONE_ASSOCIATION: &str = "arn:aws:ec2:{region}:{account}:*/*";
+const PROBE_NETWORK_INTERFACE: &str =
+    "arn:aws:ec2:{region}:{account}:network-interface/eni-00000000000000000";
+const PROBE_SECURITY_GROUP_RULE: &str =
+    "arn:aws:ec2:{region}:{account}:security-group-rule/sgr-00000000000000000";
+/// [`super::tofu_modules::state_bucket_name`]'s bucket.
+const PROBE_STATE_BUCKET: &str = "arn:aws:s3:::triple-c-tfstate-{account}-{region}";
+const PROBE_STATE_OBJECT: &str =
+    "arn:aws:s3:::triple-c-tfstate-{account}-{region}/environments/probe/terraform.tfstate";
+const PROBE_BOUNDARY: &str = "arn:aws:iam::{account}:policy/triple-c-permissions-boundary";
 
 const fn write(action: &'static str, resource: &'static str, context: Context) -> Check {
     Check {
@@ -255,13 +309,15 @@ const WORKSPACE_USER_CHECKS: &[Check] = &[
         PROBE_SECRET,
         &[(OWNER_RESOURCE_TAG, OwnerId)],
     ),
-    // Only on the environment's (component-tagged) file system.
+    // Only on the user's own file system: Triple-C's (component-tagged by
+    // their onboarding module) and tagged with their owner ID (D2).
     write(
         "elasticfilesystem:CreateAccessPoint",
         PROBE_FILE_SYSTEM,
         &[
             (OWNER_REQUEST_TAG, OwnerId),
-            (COMPONENT_RESOURCE_TAG, Literal("environment")),
+            (OWNER_RESOURCE_TAG, OwnerId),
+            (COMPONENT_RESOURCE_TAG, Literal("user-onboarding")),
         ],
     ),
     write(
@@ -320,8 +376,6 @@ const WORKSPACE_USER_CHECKS: &[Check] = &[
     read("ecs:DescribeClusters", PROBE_CLUSTER, &[]),
     read("ecs:ListClusters", "*", &[]),
     read("ssm:GetParametersByPath", PROBE_PARAMETER, &[]),
-    read("cloudformation:DescribeStacks", "*", &[]),
-    read("cloudformation:ListStacks", "*", &[]),
     read("secretsmanager:ListSecrets", "*", &[]),
     read("elasticfilesystem:DescribeAccessPoints", "*", &[]),
     read(
@@ -333,10 +387,10 @@ const WORKSPACE_USER_CHECKS: &[Check] = &[
     read("sts:GetCallerIdentity", "*", &[]),
 ];
 
+/// The admin tier's checks, across all its files. `tofu_modules`' tests hold
+/// the per-resource table these are drawn from.
 const ENVIRONMENT_ADMIN_CHECKS: &[Check] = &[
-    write("cloudformation:CreateStack", PROBE_STACK, &[]),
-    write("cloudformation:UpdateStack", PROBE_STACK, &[]),
-    write("cloudformation:DeleteStack", PROBE_STACK, &[]),
+    // Roles: bounded writes, by name.
     write("iam:CreateRole", PROBE_ROLE, WITH_BOUNDARY),
     write("iam:PutRolePolicy", PROBE_ROLE, WITH_BOUNDARY),
     write("iam:DeleteRolePolicy", PROBE_ROLE, WITH_BOUNDARY),
@@ -344,7 +398,14 @@ const ENVIRONMENT_ADMIN_CHECKS: &[Check] = &[
     write("iam:DetachRolePolicy", PROBE_ROLE, WITH_BOUNDARY),
     write("iam:DeleteRole", PROBE_ROLE, &[]),
     write("iam:TagRole", PROBE_ROLE, &[]),
+    write("iam:UntagRole", PROBE_ROLE, &[]),
+    write("iam:UpdateRole", PROBE_ROLE, &[]),
+    write("iam:UpdateRoleDescription", PROBE_ROLE, &[]),
     read("iam:GetRole", PROBE_ROLE, &[]),
+    read("iam:GetRolePolicy", PROBE_ROLE, &[]),
+    read("iam:ListRolePolicies", PROBE_ROLE, &[]),
+    read("iam:ListAttachedRolePolicies", PROBE_ROLE, &[]),
+    read("iam:ListInstanceProfilesForRole", PROBE_ROLE, &[]),
     write(
         "iam:PassRole",
         PROBE_ROLE,
@@ -352,34 +413,137 @@ const ENVIRONMENT_ADMIN_CHECKS: &[Check] = &[
     ),
     read("iam:GetRole", "{principal}", OWN_PRINCIPAL),
     read("iam:SimulatePrincipalPolicy", "{principal}", OWN_PRINCIPAL),
-    write("ecs:CreateCluster", PROBE_CLUSTER, &[]),
+    // Detection reads the boundary policy.
+    read("iam:GetPolicy", PROBE_BOUNDARY, &[]),
+    // ECS, by name.
+    write("ecs:CreateCluster", PROBE_CLUSTER, COMPONENT_REQUESTED),
     write("ecs:DeleteCluster", PROBE_CLUSTER, &[]),
+    write("ecs:UpdateCluster", PROBE_CLUSTER, &[]),
     write("ecs:PutClusterCapacityProviders", PROBE_CLUSTER, &[]),
     write(
-        "ecs:CreateCapacityProvider",
-        "arn:aws:ecs:{region}:{account}:capacity-provider/triple-c-probe",
-        &[],
+        "ecs:TagResource",
+        PROBE_CLUSTER,
+        &[("ecs:CreateAction", Literal("CreateCluster"))],
     ),
-    write(
-        "ecs:DeleteCapacityProvider",
-        "arn:aws:ecs:{region}:{account}:capacity-provider/triple-c-probe",
-        &[],
-    ),
+    write("ecs:UntagResource", PROBE_CLUSTER, &[]),
+    read("ecs:DescribeClusters", PROBE_CLUSTER, &[]),
+    read("ecs:ListTagsForResource", PROBE_CLUSTER, &[]),
     write("ecs:RegisterTaskDefinition", "*", &[]),
     write("ecs:DeregisterTaskDefinition", "*", &[]),
-    // CreateSecurityGroup is authorized against the new group and the VPC.
+    // The network (environment-admin-network.json). Creates carry the
+    // component request tag and are authorized against the new resource and
+    // its parents; tags go on only through the creating call.
+    write("ec2:CreateVpc", PROBE_VPC, COMPONENT_REQUESTED),
+    write("ec2:CreateSubnet", PROBE_SUBNET, COMPONENT_REQUESTED),
+    write("ec2:CreateSubnet", PROBE_VPC, REQUESTED_IN_TRIPLE_C_PARENT),
+    write(
+        "ec2:CreateInternetGateway",
+        PROBE_INTERNET_GATEWAY,
+        COMPONENT_REQUESTED,
+    ),
+    write(
+        "ec2:CreateRouteTable",
+        PROBE_ROUTE_TABLE,
+        COMPONENT_REQUESTED,
+    ),
+    write(
+        "ec2:CreateRouteTable",
+        PROBE_VPC,
+        REQUESTED_IN_TRIPLE_C_PARENT,
+    ),
+    write("ec2:AllocateAddress", PROBE_ELASTIC_IP, COMPONENT_REQUESTED),
+    write(
+        "ec2:CreateNatGateway",
+        PROBE_NAT_GATEWAY,
+        COMPONENT_REQUESTED,
+    ),
+    write(
+        "ec2:CreateNatGateway",
+        PROBE_SUBNET,
+        REQUESTED_IN_TRIPLE_C_PARENT,
+    ),
+    write(
+        "ec2:CreateNatGateway",
+        PROBE_ELASTIC_IP,
+        REQUESTED_IN_TRIPLE_C_PARENT,
+    ),
     write(
         "ec2:CreateSecurityGroup",
         PROBE_SECURITY_GROUP,
         COMPONENT_REQUESTED,
     ),
+    write(
+        "ec2:CreateNatGateway",
+        PROBE_VPC,
+        REQUESTED_IN_TRIPLE_C_PARENT,
+    ),
+    // The one create that may name an untagged (existing-network) VPC.
+    // The VPC side of the request carries no request tag (verified live),
+    // so only the group's side is tag-checked.
     write("ec2:CreateSecurityGroup", PROBE_VPC, &[]),
     write(
         "ec2:CreateTags",
         PROBE_SECURITY_GROUP,
         &[("ec2:CreateAction", Literal("CreateSecurityGroup"))],
     ),
+    write(
+        "ec2:CreateTags",
+        PROBE_VPC,
+        &[("ec2:CreateAction", Literal("CreateVpc"))],
+    ),
+    write(
+        "ec2:CreateTags",
+        PROBE_NAT_GATEWAY,
+        &[("ec2:CreateAction", Literal("CreateNatGateway"))],
+    ),
+    // Changes and deletes need the component tag on the resource.
     write("ec2:CreateTags", PROBE_SECURITY_GROUP, COMPONENT_TAGGED),
+    write("ec2:DeleteTags", PROBE_SUBNET, COMPONENT_TAGGED),
+    write("ec2:ModifyVpcAttribute", PROBE_VPC, COMPONENT_TAGGED),
+    write("ec2:DeleteVpc", PROBE_VPC, COMPONENT_TAGGED),
+    write("ec2:ModifySubnetAttribute", PROBE_SUBNET, COMPONENT_TAGGED),
+    write("ec2:DeleteSubnet", PROBE_SUBNET, COMPONENT_TAGGED),
+    write(
+        "ec2:AttachInternetGateway",
+        PROBE_INTERNET_GATEWAY,
+        COMPONENT_TAGGED,
+    ),
+    write("ec2:AttachInternetGateway", PROBE_VPC, COMPONENT_TAGGED),
+    write(
+        "ec2:DetachInternetGateway",
+        PROBE_INTERNET_GATEWAY,
+        COMPONENT_TAGGED,
+    ),
+    write(
+        "ec2:DeleteInternetGateway",
+        PROBE_INTERNET_GATEWAY,
+        COMPONENT_TAGGED,
+    ),
+    write("ec2:DeleteRouteTable", PROBE_ROUTE_TABLE, COMPONENT_TAGGED),
+    // Routes and associations can't be tagged: their route table (and
+    // subnet) can.
+    write("ec2:CreateRoute", PROBE_ROUTE_TABLE, COMPONENT_TAGGED),
+    write("ec2:ReplaceRoute", PROBE_ROUTE_TABLE, COMPONENT_TAGGED),
+    write("ec2:DeleteRoute", PROBE_ROUTE_TABLE, COMPONENT_TAGGED),
+    write(
+        "ec2:AssociateRouteTable",
+        PROBE_ROUTE_TABLE,
+        COMPONENT_TAGGED,
+    ),
+    write("ec2:AssociateRouteTable", PROBE_SUBNET, COMPONENT_TAGGED),
+    write(
+        "ec2:DisassociateRouteTable",
+        PROBE_ROUTE_TABLE,
+        COMPONENT_TAGGED,
+    ),
+    write("ec2:DisassociateRouteTable", PROBE_SUBNET, COMPONENT_TAGGED),
+    write("ec2:ReleaseAddress", PROBE_ELASTIC_IP, COMPONENT_TAGGED),
+    // Destroying the NAT gateway's address disassociates it first; the NAT
+    // gateway is gone by then, so EC2 authorizes the call against the
+    // literal `*/*` (verified live), which is all the policy allows. That a
+    // live association never matches it is expected, not verified.
+    write("ec2:DisassociateAddress", PROBE_GONE_ASSOCIATION, &[]),
+    write("ec2:DeleteNatGateway", PROBE_NAT_GATEWAY, COMPONENT_TAGGED),
     write(
         "ec2:DeleteSecurityGroup",
         PROBE_SECURITY_GROUP,
@@ -390,14 +554,60 @@ const ENVIRONMENT_ADMIN_CHECKS: &[Check] = &[
         PROBE_SECURITY_GROUP,
         COMPONENT_TAGGED,
     ),
+    // Authorizing also names the new (untagged) rule.
+    write(
+        "ec2:AuthorizeSecurityGroupIngress",
+        PROBE_SECURITY_GROUP_RULE,
+        &[],
+    ),
+    write(
+        "ec2:AuthorizeSecurityGroupEgress",
+        PROBE_SECURITY_GROUP,
+        COMPONENT_TAGGED,
+    ),
+    write(
+        "ec2:AuthorizeSecurityGroupEgress",
+        PROBE_SECURITY_GROUP_RULE,
+        &[],
+    ),
     write(
         "ec2:RevokeSecurityGroupIngress",
         PROBE_SECURITY_GROUP,
         COMPONENT_TAGGED,
     ),
+    // The provider revokes AWS's default egress rule after creating a group.
+    write(
+        "ec2:RevokeSecurityGroupEgress",
+        PROBE_SECURITY_GROUP,
+        COMPONENT_TAGGED,
+    ),
+    write(
+        "ec2:UpdateSecurityGroupRuleDescriptionsIngress",
+        PROBE_SECURITY_GROUP,
+        COMPONENT_TAGGED,
+    ),
+    write(
+        "ec2:UpdateSecurityGroupRuleDescriptionsEgress",
+        PROBE_SECURITY_GROUP,
+        COMPONENT_TAGGED,
+    ),
+    // EFS creates and deletes a mount target's interface with the caller's
+    // EC2 permissions.
+    write(
+        "ec2:CreateNetworkInterface",
+        PROBE_NETWORK_INTERFACE,
+        VIA_EFS,
+    ),
+    write("ec2:CreateNetworkInterface", PROBE_SUBNET, VIA_EFS),
+    write(
+        "ec2:DeleteNetworkInterface",
+        PROBE_NETWORK_INTERFACE,
+        VIA_EFS,
+    ),
     read("ec2:DescribeSecurityGroups", "*", &[]),
-    // CreateFileSystem has no resource type: IAM authorizes it against `*`
-    // (verified live; a `file-system/*` Resource never matches).
+    read("ec2:DescribeVpcs", "*", &[]),
+    // EFS. CreateFileSystem has no resource type: IAM authorizes it against
+    // `*` (verified live; a `file-system/*` Resource never matches).
     write(
         "elasticfilesystem:CreateFileSystem",
         "*",
@@ -417,7 +627,22 @@ const ENVIRONMENT_ADMIN_CHECKS: &[Check] = &[
         COMPONENT_TAGGED,
     ),
     write(
+        "elasticfilesystem:UntagResource",
+        PROBE_FILE_SYSTEM,
+        COMPONENT_TAGGED,
+    ),
+    write(
         "elasticfilesystem:DeleteFileSystem",
+        PROBE_FILE_SYSTEM,
+        COMPONENT_TAGGED,
+    ),
+    write(
+        "elasticfilesystem:UpdateFileSystem",
+        PROBE_FILE_SYSTEM,
+        COMPONENT_TAGGED,
+    ),
+    write(
+        "elasticfilesystem:PutLifecycleConfiguration",
         PROBE_FILE_SYSTEM,
         COMPONENT_TAGGED,
     ),
@@ -432,123 +657,126 @@ const ENVIRONMENT_ADMIN_CHECKS: &[Check] = &[
         COMPONENT_TAGGED,
     ),
     write(
+        "elasticfilesystem:ModifyMountTargetSecurityGroups",
+        PROBE_FILE_SYSTEM,
+        COMPONENT_TAGGED,
+    ),
+    write(
         "elasticfilesystem:PutFileSystemPolicy",
         PROBE_FILE_SYSTEM,
         COMPONENT_TAGGED,
     ),
+    write(
+        "elasticfilesystem:DeleteFileSystemPolicy",
+        PROBE_FILE_SYSTEM,
+        COMPONENT_TAGGED,
+    ),
+    read(
+        "elasticfilesystem:DescribeFileSystems",
+        PROBE_FILE_SYSTEM,
+        &[],
+    ),
+    read(
+        "elasticfilesystem:ListTagsForResource",
+        PROBE_FILE_SYSTEM,
+        &[],
+    ),
+    // KMS.
     write("kms:CreateKey", "*", COMPONENT_REQUESTED),
     write("kms:ScheduleKeyDeletion", PROBE_KEY, COMPONENT_TAGGED),
     write("kms:PutKeyPolicy", PROBE_KEY, COMPONENT_TAGGED),
+    write("kms:EnableKeyRotation", PROBE_KEY, COMPONENT_TAGGED),
+    write("kms:UpdateKeyDescription", PROBE_KEY, COMPONENT_TAGGED),
     write("kms:TagResource", PROBE_KEY, COMPONENT_TAGGED),
+    write("kms:UntagResource", PROBE_KEY, COMPONENT_TAGGED),
     // An alias call is authorized against both the alias and the key.
     write("kms:CreateAlias", PROBE_ALIAS, &[]),
     write("kms:CreateAlias", PROBE_KEY, COMPONENT_TAGGED),
+    write("kms:UpdateAlias", PROBE_ALIAS, &[]),
+    write("kms:UpdateAlias", PROBE_KEY, COMPONENT_TAGGED),
     write("kms:DeleteAlias", PROBE_ALIAS, &[]),
     write("kms:DeleteAlias", PROBE_KEY, COMPONENT_TAGGED),
-    write("logs:CreateLogGroup", PROBE_LOG_GROUP, &[]),
+    read("kms:DescribeKey", PROBE_KEY, &[]),
+    read("kms:GetKeyPolicy", PROBE_KEY, &[]),
+    read("kms:GetKeyRotationStatus", PROBE_KEY, &[]),
+    read("kms:ListResourceTags", PROBE_KEY, &[]),
+    read("kms:ListAliases", "*", &[]),
+    // Logs, SSM, ECR, by name.
+    write("logs:CreateLogGroup", PROBE_LOG_GROUP, COMPONENT_REQUESTED),
+    write("logs:TagResource", PROBE_LOG_GROUP, COMPONENT_REQUESTED),
+    write("logs:UntagResource", PROBE_LOG_GROUP, &[]),
     write("logs:DeleteLogGroup", PROBE_LOG_GROUP, &[]),
     write("logs:PutRetentionPolicy", PROBE_LOG_GROUP, &[]),
+    write("logs:DeleteRetentionPolicy", PROBE_LOG_GROUP, &[]),
+    read("logs:ListTagsForResource", PROBE_LOG_GROUP, &[]),
+    read("logs:DescribeLogGroups", "*", &[]),
+    write("ssm:PutParameter", PROBE_PARAMETER, COMPONENT_REQUESTED),
     write(
-        "ecr:CreateRepository",
-        "arn:aws:ecr:{region}:{account}:repository/triple-c/probe",
-        &[],
+        "ssm:AddTagsToResource",
+        PROBE_PARAMETER,
+        COMPONENT_REQUESTED,
     ),
-    write(
-        "ecr:DeleteRepository",
-        "arn:aws:ecr:{region}:{account}:repository/triple-c/probe",
-        &[],
-    ),
-    write("ecr:CreatePullThroughCacheRule", "*", &[]),
-    write("ssm:PutParameter", PROBE_PARAMETER, &[]),
+    write("ssm:RemoveTagsFromResource", PROBE_PARAMETER, &[]),
     write("ssm:DeleteParameter", PROBE_PARAMETER, &[]),
+    read("ssm:GetParameter", PROBE_PARAMETER, &[]),
+    read("ssm:ListTagsForResource", PROBE_PARAMETER, &[]),
+    read("ssm:DescribeParameters", "*", &[]),
+    read("sts:GetCallerIdentity", "*", &[]),
+    // The state bucket (the app creates it; OpenTofu's S3 backend reads and
+    // writes the state and lock objects).
+    write("s3:CreateBucket", PROBE_STATE_BUCKET, STATE_REQUESTED),
+    // CreateBucket with tags also authorizes s3:TagResource (verified live).
+    write("s3:TagResource", PROBE_STATE_BUCKET, STATE_REQUESTED),
+    write("s3:PutBucketVersioning", PROBE_STATE_BUCKET, IN_MY_ACCOUNT),
+    write(
+        "s3:PutEncryptionConfiguration",
+        PROBE_STATE_BUCKET,
+        IN_MY_ACCOUNT,
+    ),
+    write(
+        "s3:PutBucketPublicAccessBlock",
+        PROBE_STATE_BUCKET,
+        IN_MY_ACCOUNT,
+    ),
+    write("s3:PutBucketTagging", PROBE_STATE_BUCKET, IN_MY_ACCOUNT),
+    write("s3:PutBucketPolicy", PROBE_STATE_BUCKET, IN_MY_ACCOUNT),
+    read("s3:GetBucketVersioning", PROBE_STATE_BUCKET, IN_MY_ACCOUNT),
+    read("s3:ListBucket", PROBE_STATE_BUCKET, IN_MY_ACCOUNT),
+    read("s3:GetObject", PROBE_STATE_OBJECT, IN_MY_ACCOUNT),
+    write("s3:PutObject", PROBE_STATE_OBJECT, IN_MY_ACCOUNT),
+    write("s3:DeleteObject", PROBE_STATE_OBJECT, IN_MY_ACCOUNT),
 ];
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aws::policy_eval::{
+        actions, conditions_hold, effect, evaluate_in, glob, matching, parse, rendered, resources,
+        sid, statements_of, strings, Request, ME, SOMEONE_ELSE,
+    };
     use serde_json::Value;
     use std::collections::BTreeSet;
 
-    const AT: Placeholders = Placeholders {
-        region: "us-west-2",
-        account: "111122223333",
-        principal: "arn:aws:iam::111122223333:role/aws-reserved/sso.amazonaws.com/us-west-2/AWSReservedSSO_Dev_0123456789abcdef",
-    };
-    const ME: &str = "AROAEXAMPLEME:alice@example.com";
-    const SOMEONE_ELSE: &str = "AROAEXAMPLEOTHER:bob@example.com";
-
     const TIERS: [Tier; 2] = [Tier::WorkspaceUser, Tier::EnvironmentAdmin];
 
-    /// IAM wildcard match: `*` is any run of characters (including `:` and
-    /// `/`), `?` is exactly one.
-    fn glob(pattern: &str, text: &str) -> bool {
-        let p: Vec<char> = pattern.chars().collect();
-        let t: Vec<char> = text.chars().collect();
-        let (mut pi, mut ti) = (0, 0);
-        let (mut star, mut mark) = (None, 0);
-        while ti < t.len() {
-            if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
-                pi += 1;
-                ti += 1;
-            } else if pi < p.len() && p[pi] == '*' {
-                star = Some(pi);
-                mark = ti;
-                pi += 1;
-            } else if let Some(s) = star {
-                pi = s + 1;
-                mark += 1;
-                ti = mark;
-            } else {
-                return false;
-            }
-        }
-        while pi < p.len() && p[pi] == '*' {
-            pi += 1;
-        }
-        pi == p.len()
-    }
-
-    #[test]
-    fn glob_behaves_like_iam_wildcards() {
-        assert!(glob("ecs:Describe*", "ecs:DescribeClusters"));
-        assert!(!glob("ecs:Describe*", "ecs:ListClusters"));
-        assert!(glob(
-            "arn:aws:ecs:*:*:task/triple-c-*/*",
-            "arn:aws:ecs:us-west-2:1:task/triple-c-x/abc"
-        ));
-        assert!(!glob(
-            "arn:aws:ecs:*:*:task/triple-c-*/*",
-            "arn:aws:ecs:us-west-2:1:task/other/abc"
-        ));
-        assert!(glob("a?c", "abc"));
-        assert!(!glob("a?c", "ac"));
-    }
-
-    fn parse(name: &str, json: &str) -> Value {
-        serde_json::from_str(json).unwrap_or_else(|e| panic!("{name} is not JSON: {e}"))
-    }
-
-    fn policy(tier: Tier) -> Value {
-        parse(&format!("{tier:?} policy"), policy_json(tier))
+    /// Every file of `tier`, parsed: (file name, document).
+    fn policies(tier: Tier) -> Vec<(&'static str, Value)> {
+        policy_files(tier)
+            .iter()
+            .map(|(name, json)| (*name, parse(name, json)))
+            .collect()
     }
 
     fn boundary() -> Value {
         parse("permissions boundary", permissions_boundary_json())
     }
 
-    fn statements_of(doc: &Value) -> Vec<Value> {
-        doc["Statement"]
-            .as_array()
-            .expect("policy has no Statement array")
-            .clone()
-    }
-
+    /// The statements of every file of `tier`, which IAM evaluates together.
     fn statements(tier: Tier) -> Vec<Value> {
-        statements_of(&policy(tier))
-    }
-
-    fn effect(stmt: &Value) -> &str {
-        stmt["Effect"].as_str().unwrap_or("<no Effect>")
+        policies(tier)
+            .iter()
+            .flat_map(|(_, doc)| statements_of(doc))
+            .collect()
     }
 
     fn allows(tier: Tier) -> Vec<Value> {
@@ -565,183 +793,8 @@ mod tests {
             .collect()
     }
 
-    /// `Action` / `Resource` / condition values: a string or an array of them.
-    fn strings(v: &Value) -> Vec<String> {
-        match v {
-            Value::String(s) => vec![s.clone()],
-            Value::Array(a) => a
-                .iter()
-                .map(|x| x.as_str().expect("expected a string").to_string())
-                .collect(),
-            other => panic!("expected a string or array, got {other}"),
-        }
-    }
-
-    fn actions(stmt: &Value) -> Vec<String> {
-        strings(&stmt["Action"])
-    }
-
-    fn resources(stmt: &Value) -> Vec<String> {
-        strings(&stmt["Resource"])
-    }
-
-    fn sid(stmt: &Value) -> &str {
-        stmt["Sid"].as_str().unwrap_or("<no Sid>")
-    }
-
-    fn rendered(check: &Check) -> String {
-        render(check.resource, &AT)
-    }
-
-    /// The request: who calls, and whose the resource / request tag is.
-    #[derive(Clone, Copy)]
-    struct Request<'a> {
-        check: &'a Check,
-        /// `${aws:userid}` of the caller.
-        caller: &'a str,
-        /// What `OwnerId` context entries carry.
-        owner: &'a str,
-    }
-
-    impl Request<'_> {
-        fn context_value(&self, key: &str) -> Option<String> {
-            self.context_values(key).into_iter().next()
-        }
-
-        /// All values of a (possibly multi-valued) key.
-        fn context_values(&self, key: &str) -> Vec<String> {
-            self.check
-                .context
-                .iter()
-                .filter(|(k, _)| *k == key)
-                .map(|(_, v)| match v {
-                    ContextValue::OwnerId => self.owner.to_string(),
-                    ContextValue::Literal(l) => render(l, &AT),
-                })
-                .collect()
-        }
-
-        /// Resolves `${…}` policy variables the way the simulator does: from
-        /// the request context. An unresolvable variable makes the string
-        /// match nothing (`None`).
-        fn resolve(&self, s: &str) -> Option<String> {
-            let mut out = String::new();
-            let mut rest = s;
-            while let Some(start) = rest.find("${") {
-                out.push_str(&rest[..start]);
-                let end = rest[start..].find('}').expect("unterminated ${") + start;
-                let name = &rest[start + 2..end];
-                let value = if name == "aws:userid" {
-                    Some(self.caller.to_string())
-                } else {
-                    self.context_value(name)
-                };
-                out.push_str(&value?);
-                rest = &rest[end + 1..];
-            }
-            out.push_str(rest);
-            Some(out)
-        }
-    }
-
-    /// Statements that name the action and one of whose resources matches
-    /// the rendered resource.
-    fn matching<'s>(stmts: &'s [Value], req: &Request) -> Vec<&'s Value> {
-        let resource = rendered(req.check);
-        stmts
-            .iter()
-            .filter(|s| actions(s).iter().any(|a| glob(a, req.check.action)))
-            .filter(|s| {
-                resources(s)
-                    .iter()
-                    .filter_map(|r| req.resolve(r))
-                    .any(|r| glob(&r, &resource))
-            })
-            .collect()
-    }
-
-    /// A deliberately small IAM condition evaluator: the operators the
-    /// shipped policies use, and nothing else (an unknown operator fails the
-    /// test rather than being ignored).
-    fn conditions_hold(stmt: &Value, req: &Request) -> bool {
-        let Some(cond) = stmt.get("Condition") else {
-            return true;
-        };
-        let cond = cond.as_object().expect("Condition is an object");
-        cond.iter().all(|(op, entries)| {
-            let entries = entries.as_object().expect("condition block is an object");
-            // ForAllValues: every value of the (multi-valued) key matches
-            // one of the policy's values. Vacuously true when the key is
-            // absent, which is why statements pair it with a required key.
-            if let Some(base) = op.strip_prefix("ForAllValues:") {
-                assert_eq!(
-                    base,
-                    "StringEquals",
-                    "{}: unsupported ForAllValues operator",
-                    sid(stmt)
-                );
-                return entries.iter().all(|(key, want)| {
-                    let allowed: Vec<String> = strings(want)
-                        .iter()
-                        .filter_map(|p| req.resolve(p))
-                        .collect();
-                    req.context_values(key).iter().all(|v| allowed.contains(v))
-                });
-            }
-            if op == "Null" {
-                return entries.iter().all(|(key, want)| {
-                    let absent = req.context_value(key).is_none();
-                    match want.as_str() {
-                        Some("true") => absent,
-                        Some("false") => !absent,
-                        _ => panic!("{}: Null takes \"true\" or \"false\"", sid(stmt)),
-                    }
-                });
-            }
-            let (base, if_exists) = match op.strip_suffix("IfExists") {
-                Some(b) => (b, true),
-                None => (op.as_str(), false),
-            };
-            // A negated operator holds when the key is absent, and
-            // otherwise when no value matches.
-            let (matches, negated): (fn(&str, &str) -> bool, bool) = match base {
-                "StringEquals" => (|p, v| p == v, false),
-                "StringLike" | "ArnLike" => (glob, false),
-                "StringNotEquals" => (|p, v| p == v, true),
-                "StringNotLike" => (glob, true),
-                other => panic!("{}: unsupported condition operator {other}", sid(stmt)),
-            };
-            entries
-                .iter()
-                .all(|(key, want)| match req.context_value(key) {
-                    None => if_exists || negated,
-                    Some(value) => {
-                        let any = strings(want)
-                            .iter()
-                            .filter_map(|p| req.resolve(p))
-                            .any(|p| matches(&p, &value));
-                        any != negated
-                    }
-                })
-        })
-    }
-
     fn evaluate(tier: Tier, req: Request) -> bool {
         evaluate_in(&statements(tier), req)
-    }
-
-    /// Allowed by some Allow and by no Deny among `stmts`.
-    fn evaluate_in(stmts: &[Value], req: Request) -> bool {
-        let applies = |s: &&Value| conditions_hold(s, &req);
-        let allowed = matching(stmts, &req)
-            .into_iter()
-            .filter(|s| effect(s) == "Allow")
-            .any(|s| applies(&s));
-        let denied = matching(stmts, &req)
-            .into_iter()
-            .filter(|s| effect(s) == "Deny")
-            .any(|s| applies(&s));
-        allowed && !denied
     }
 
     fn allowed(tier: Tier, check: &Check, caller: &str, owner: &str) -> bool {
@@ -787,7 +840,9 @@ mod tests {
     #[test]
     fn policies_are_valid_iam_json() {
         for tier in TIERS {
-            validate_document(&format!("{tier:?}"), &policy(tier));
+            for (name, doc) in policies(tier) {
+                validate_document(name, &doc);
+            }
             assert!(!allows(tier).is_empty(), "{tier:?} allows nothing");
         }
         validate_document("permissions boundary", &boundary());
@@ -867,6 +922,11 @@ mod tests {
             "elasticfilesystem:CreateAccessPoint",
             "file-system/",
             OWNER_REQUEST_TAG,
+        ),
+        (
+            "elasticfilesystem:CreateAccessPoint",
+            "file-system/",
+            OWNER_RESOURCE_TAG,
         ),
         (
             "elasticfilesystem:TagResource",
@@ -1127,14 +1187,8 @@ mod tests {
     /// live: "Resource ${aws:PrincipalArn} must be in ARN format or \"*\"").
     #[test]
     fn every_resource_is_an_arn_or_star() {
-        let docs = [
-            ("workspace-user", policy(Tier::WorkspaceUser)),
-            ("environment-admin", policy(Tier::EnvironmentAdmin)),
-            (
-                "permissions-boundary",
-                serde_json::from_str(permissions_boundary_json()).unwrap(),
-            ),
-        ];
+        let mut docs: Vec<(&str, Value)> = TIERS.into_iter().flat_map(policies).collect();
+        docs.push(("permissions-boundary.json", boundary()));
         for (name, doc) in &docs {
             for s in statements_of(doc) {
                 for r in resources(&s) {
@@ -1150,16 +1204,17 @@ mod tests {
 
     /// A customer managed policy may hold 6,144 characters, not counting
     /// whitespace (verified live: the workspace policy is close). An
-    /// environment admin needs both tier policies, which together exceed a
-    /// role's 10,240-character inline budget, so they ship as managed
-    /// policies.
+    /// environment admin needs every file of both tiers, which together
+    /// exceed a role's 10,240-character inline budget, so they ship as
+    /// managed policies, the admin tier in several (D7).
     #[test]
     fn every_policy_fits_a_managed_policy() {
-        for (name, text) in [
-            ("workspace-user", policy_json(Tier::WorkspaceUser)),
-            ("environment-admin", policy_json(Tier::EnvironmentAdmin)),
-            ("permissions-boundary", permissions_boundary_json()),
-        ] {
+        let mut files: Vec<(&str, &str)> = TIERS
+            .into_iter()
+            .flat_map(|t| policy_files(t).iter().copied())
+            .collect();
+        files.push(("permissions-boundary.json", permissions_boundary_json()));
+        for (name, text) in files {
             let size = text.chars().filter(|c| !c.is_whitespace()).count();
             assert!(
                 size <= 6144,
@@ -1522,28 +1577,319 @@ mod tests {
         assert!(allowed(tier, create, ME, ME));
     }
 
+    /// Strict tenancy (D2): each user has their own file system, tagged
+    /// with their owner ID by their onboarding module, and may create access
+    /// points only there.
     #[test]
-    fn access_points_only_on_the_environments_file_system() {
+    fn access_points_only_on_the_users_own_file_system() {
         let c = checks(Tier::WorkspaceUser)
             .iter()
             .find(|c| c.action == "elasticfilesystem:CreateAccessPoint")
             .unwrap();
+        assert!(allowed(Tier::WorkspaceUser, c, ME, ME));
         let foreign_fs = Check {
             context: &[(OWNER_REQUEST_TAG, OwnerId)],
             ..*c
         };
         assert!(!allowed(Tier::WorkspaceUser, &foreign_fs, ME, ME));
+        // Someone else's onboarding file system, with my owner tag requested.
+        let someone_elses_fs = Check {
+            context: &[
+                (OWNER_REQUEST_TAG, OwnerId),
+                (OWNER_RESOURCE_TAG, Literal(SOMEONE_ELSE)),
+                (COMPONENT_RESOURCE_TAG, Literal("user-onboarding")),
+            ],
+            ..*c
+        };
+        assert!(!allowed(Tier::WorkspaceUser, &someone_elses_fs, ME, ME));
+        // An owner-tagged file system that isn't Triple-C's.
+        let not_triple_c = Check {
+            context: &[(OWNER_REQUEST_TAG, OwnerId), (OWNER_RESOURCE_TAG, OwnerId)],
+            ..*c
+        };
+        assert!(!allowed(Tier::WorkspaceUser, &not_triple_c, ME, ME));
     }
 
-    const CFN_WRITES: &[&str] = &[
-        "cloudformation:CreateStack",
-        "cloudformation:UpdateStack",
-        "cloudformation:CreateChangeSet",
-    ];
-    const WITH_SERVICE_ROLE: Context = &[(
-        "cloudformation:RoleArn",
-        Literal("arn:aws:iam::{account}:role/AnyServiceRole"),
-    )];
+    #[test]
+    fn the_admin_tier_spans_its_files() {
+        let names = |t: Tier| policy_files(t).iter().map(|(n, _)| *n).collect::<Vec<_>>();
+        assert_eq!(
+            names(Tier::EnvironmentAdmin),
+            ["environment-admin.json", "environment-admin-network.json"]
+        );
+        assert_eq!(names(Tier::WorkspaceUser), ["workspace-user.json"]);
+    }
+
+    /// D8: CloudFormation leaves the policies, the checks and the probes.
+    #[test]
+    fn no_policy_mentions_cloudformation() {
+        let mut texts: Vec<(&str, &str)> = TIERS
+            .into_iter()
+            .flat_map(|t| policy_files(t).iter().copied())
+            .collect();
+        texts.push(("permissions-boundary.json", permissions_boundary_json()));
+        for (name, text) in texts {
+            assert!(
+                !text.to_ascii_lowercase().contains("cloudformation"),
+                "{name} mentions CloudFormation"
+            );
+        }
+        for tier in TIERS {
+            for c in checks(tier) {
+                assert!(
+                    !c.action.starts_with("cloudformation:")
+                        && !c.resource.contains("cloudformation"),
+                    "{tier:?}: check {} on {}",
+                    c.action,
+                    c.resource
+                );
+            }
+        }
+    }
+
+    /// The network the admin creates is tag-scoped like everything else: an
+    /// untagged VPC, subnet, gateway or route table is someone else's, and
+    /// the only bucket the admin may touch is the state bucket.
+    #[test]
+    fn the_admin_still_cannot_touch_untagged_resources() {
+        let tier = Tier::EnvironmentAdmin;
+        for (action, resource) in [
+            ("ec2:DeleteVpc", PROBE_VPC),
+            ("ec2:ModifyVpcAttribute", PROBE_VPC),
+            ("ec2:DeleteSubnet", PROBE_SUBNET),
+            ("ec2:DeleteInternetGateway", PROBE_INTERNET_GATEWAY),
+            ("ec2:DetachInternetGateway", PROBE_INTERNET_GATEWAY),
+            ("ec2:DeleteRouteTable", PROBE_ROUTE_TABLE),
+            ("ec2:CreateRoute", PROBE_ROUTE_TABLE),
+            ("ec2:DeleteRoute", PROBE_ROUTE_TABLE),
+            ("ec2:AssociateRouteTable", PROBE_ROUTE_TABLE),
+            ("ec2:DeleteNatGateway", PROBE_NAT_GATEWAY),
+            ("ec2:ReleaseAddress", PROBE_ELASTIC_IP),
+            ("ec2:DeleteSecurityGroup", PROBE_SECURITY_GROUP),
+            ("ec2:CreateTags", PROBE_VPC),
+            ("ec2:DeleteTags", PROBE_SUBNET),
+        ] {
+            let tagged = write(action, resource, COMPONENT_TAGGED);
+            assert!(
+                allowed(tier, &tagged, ME, ME),
+                "{action} on a tagged {resource}"
+            );
+            let untagged = write(action, resource, &[]);
+            assert!(
+                !allowed(tier, &untagged, ME, ME),
+                "{action} on an untagged {resource}"
+            );
+        }
+        // Creates need the component request tag.
+        for (action, resource) in [
+            ("ec2:CreateVpc", PROBE_VPC),
+            ("ec2:CreateSubnet", PROBE_SUBNET),
+            ("ec2:CreateInternetGateway", PROBE_INTERNET_GATEWAY),
+            ("ec2:CreateRouteTable", PROBE_ROUTE_TABLE),
+            ("ec2:AllocateAddress", PROBE_ELASTIC_IP),
+            ("ec2:CreateNatGateway", PROBE_NAT_GATEWAY),
+        ] {
+            assert!(
+                allowed(tier, &write(action, resource, COMPONENT_REQUESTED), ME, ME),
+                "{action}"
+            );
+            assert!(
+                !allowed(tier, &write(action, resource, &[]), ME, ME),
+                "untagged {action}"
+            );
+        }
+        // Tags go on at create only through the creating call.
+        let tag_at = |create: &'static str| -> Check {
+            let ctx: Context =
+                Box::leak(vec![("ec2:CreateAction", Literal(create))].into_boxed_slice());
+            write("ec2:CreateTags", PROBE_VPC, ctx)
+        };
+        assert!(allowed(tier, &tag_at("CreateVpc"), ME, ME));
+        assert!(!allowed(tier, &tag_at("RunInstances"), ME, ME));
+        // A mount target's interface is EFS's doing, never a direct call, nor
+        // another service's.
+        for action in ["ec2:CreateNetworkInterface", "ec2:DeleteNetworkInterface"] {
+            assert!(
+                !allowed(tier, &write(action, PROBE_NETWORK_INTERFACE, &[]), ME, ME),
+                "{action}"
+            );
+            let via_lambda: Context = &[("aws:CalledViaLast", Literal("lambda.amazonaws.com"))];
+            assert!(
+                !allowed(
+                    tier,
+                    &write(action, PROBE_NETWORK_INTERFACE, via_lambda),
+                    ME,
+                    ME
+                ),
+                "{action} via another service"
+            );
+        }
+        // Only the state bucket is managed, and only in the caller's account
+        // (the name is predictable, so another account could pre-create it).
+        const OTHER_BUCKET: &str = "arn:aws:s3:::someone-elses-bucket";
+        const OTHER_ACCOUNT: Context = &[
+            ("s3:ResourceAccount", Literal("999999999999")),
+            ("aws:PrincipalAccount", Literal("{account}")),
+        ];
+        const OTHER_ACCOUNT_REQUESTED: Context = &[
+            ("aws:RequestTag/triple-c:component", Literal("state")),
+            ("s3:ResourceAccount", Literal("999999999999")),
+            ("aws:PrincipalAccount", Literal("{account}")),
+        ];
+        // No bucket may be deleted.
+        for bucket in [PROBE_STATE_BUCKET, OTHER_BUCKET] {
+            for context in [&[][..], COMPONENT_TAGGED, IN_MY_ACCOUNT] {
+                assert!(
+                    !allowed(tier, &write("s3:DeleteBucket", bucket, context), ME, ME),
+                    "s3:DeleteBucket on {bucket}"
+                );
+            }
+        }
+        let state_calls = [
+            ("s3:PutBucketPolicy", PROBE_STATE_BUCKET),
+            ("s3:PutBucketVersioning", PROBE_STATE_BUCKET),
+            ("s3:PutEncryptionConfiguration", PROBE_STATE_BUCKET),
+            ("s3:PutBucketPublicAccessBlock", PROBE_STATE_BUCKET),
+            ("s3:PutBucketTagging", PROBE_STATE_BUCKET),
+            ("s3:ListBucket", PROBE_STATE_BUCKET),
+            ("s3:GetObject", PROBE_STATE_OBJECT),
+            ("s3:PutObject", PROBE_STATE_OBJECT),
+            ("s3:DeleteObject", PROBE_STATE_OBJECT),
+        ];
+        for (action, resource) in state_calls {
+            assert!(
+                allowed(tier, &write(action, resource, IN_MY_ACCOUNT), ME, ME),
+                "{action}"
+            );
+            for context in [&[][..], OTHER_ACCOUNT] {
+                assert!(
+                    !allowed(tier, &write(action, resource, context), ME, ME),
+                    "{action} on a state bucket with {context:?}"
+                );
+            }
+            let elsewhere = resource.replace(
+                "triple-c-tfstate-{account}-{region}",
+                "someone-elses-bucket",
+            );
+            let elsewhere: &'static str = Box::leak(elsewhere.into_boxed_str());
+            assert!(
+                !allowed(tier, &write(action, elsewhere, IN_MY_ACCOUNT), ME, ME),
+                "{action} on {elsewhere}"
+            );
+        }
+        for action in ["s3:CreateBucket", "s3:TagResource"] {
+            assert!(
+                allowed(tier, &write(action, PROBE_STATE_BUCKET, STATE_REQUESTED), ME, ME),
+                "{action}"
+            );
+            for (bucket, context) in [
+                (PROBE_STATE_BUCKET, IN_MY_ACCOUNT),
+                (PROBE_STATE_BUCKET, OTHER_ACCOUNT_REQUESTED),
+                (OTHER_BUCKET, STATE_REQUESTED),
+            ] {
+                assert!(
+                    !allowed(tier, &write(action, bucket, context), ME, ME),
+                    "{action} {bucket} with {context:?}"
+                );
+            }
+        }
+    }
+
+    /// Network resources are created only inside the environment's own
+    /// (component-tagged) VPC, subnets and addresses: a tagged subnet,
+    /// route table, gateway or NAT gateway in someone else's VPC would
+    /// re-route it. The one exception is a security group, which an
+    /// `existing`-network environment creates in the user's own VPC.
+    #[test]
+    fn network_creates_need_a_triple_c_parent() {
+        let tier = Tier::EnvironmentAdmin;
+        for (action, parent) in [
+            ("ec2:CreateSubnet", PROBE_VPC),
+            ("ec2:CreateRouteTable", PROBE_VPC),
+            ("ec2:CreateNatGateway", PROBE_VPC),
+            ("ec2:CreateNatGateway", PROBE_SUBNET),
+            ("ec2:CreateNatGateway", PROBE_ELASTIC_IP),
+        ] {
+            assert!(
+                allowed(
+                    tier,
+                    &write(action, parent, REQUESTED_IN_TRIPLE_C_PARENT),
+                    ME,
+                    ME
+                ),
+                "{action} in a Triple-C {parent}"
+            );
+            assert!(
+                !allowed(tier, &write(action, parent, COMPONENT_REQUESTED), ME, ME),
+                "{action} in an untagged {parent}"
+            );
+        }
+        // Attaching a gateway (and routing through it) needs the VPC tagged.
+        for (action, resource) in [
+            ("ec2:AttachInternetGateway", PROBE_VPC),
+            ("ec2:CreateRoute", PROBE_ROUTE_TABLE),
+            ("ec2:AssociateRouteTable", PROBE_ROUTE_TABLE),
+            ("ec2:AssociateRouteTable", PROBE_SUBNET),
+        ] {
+            assert!(
+                !allowed(tier, &write(action, resource, COMPONENT_REQUESTED), ME, ME),
+                "{action} on an untagged {resource}"
+            );
+        }
+        // A group may be created in any VPC (EC2 shows the VPC no request
+        // tag), but the group itself must carry the component tag.
+        assert!(allowed(
+            tier,
+            &write("ec2:CreateSecurityGroup", PROBE_VPC, &[]),
+            ME,
+            ME
+        ));
+        assert!(!allowed(
+            tier,
+            &write("ec2:CreateSecurityGroup", PROBE_SECURITY_GROUP, &[]),
+            ME,
+            ME
+        ));
+        // Only the literal `*/*` of an association that is already gone. That
+        // a live association is authorized against its address and interface
+        // ARNs (so never matches) is expected, NOT live-verified: see "Still
+        // open" in aws/README.md for the probe.
+        assert!(allowed(
+            tier,
+            &write("ec2:DisassociateAddress", PROBE_GONE_ASSOCIATION, &[]),
+            ME,
+            ME
+        ));
+        for resource in [PROBE_ELASTIC_IP, PROBE_NETWORK_INTERFACE] {
+            for context in [&[][..], COMPONENT_TAGGED] {
+                assert!(
+                    !allowed(tier, &write("ec2:DisassociateAddress", resource, context), ME, ME),
+                    "ec2:DisassociateAddress on {resource} with {context:?}"
+                );
+            }
+        }
+        // A VPC's main route table association names no subnet, so swapping
+        // it would re-route a VPC by its route table alone: never allowed.
+        assert!(!allowed(
+            tier,
+            &write(
+                "ec2:ReplaceRouteTableAssociation",
+                PROBE_ROUTE_TABLE,
+                COMPONENT_TAGGED
+            ),
+            ME,
+            ME
+        ));
+        // Triple-C roles are passed only to ECS tasks (Fargate, v1).
+        let pass_to_ec2: Context = &[("iam:PassedToService", Literal("ec2.amazonaws.com"))];
+        assert!(!allowed(
+            tier,
+            &write("iam:PassRole", PROBE_ROLE, pass_to_ec2),
+            ME,
+            ME
+        ));
+    }
+
     const OTHER_BOUNDARY: Context = &[
         (
             "iam:PermissionsBoundary",
@@ -1551,19 +1897,6 @@ mod tests {
         ),
         ("aws:PrincipalAccount", Literal("{account}")),
     ];
-
-    #[test]
-    fn triple_c_stacks_cannot_use_a_service_role() {
-        for action in CFN_WRITES {
-            let with_role = write(action, PROBE_STACK, WITH_SERVICE_ROLE);
-            assert!(
-                !allowed(Tier::EnvironmentAdmin, &with_role, ME, ME),
-                "{action} allowed with a CloudFormation service role"
-            );
-            let plain = write(action, PROBE_STACK, &[]);
-            assert!(allowed(Tier::EnvironmentAdmin, &plain, ME, ME), "{action}");
-        }
-    }
 
     /// True if some Deny statement in `tier` applies to `check`.
     fn explicitly_denied(tier: Tier, check: &Check) -> bool {
@@ -1633,11 +1966,6 @@ mod tests {
                     );
                 }
             }
-        }
-        // A stack deployed with a service role would act outside the
-        // boundary.
-        for action in CFN_WRITES {
-            assert!(denied(&write(action, PROBE_STACK, WITH_SERVICE_ROLE)));
         }
     }
 
@@ -1764,39 +2092,6 @@ mod tests {
                 c.action
             );
         }
-    }
-
-    #[test]
-    fn for_all_values_is_vacuous_on_an_absent_key() {
-        let stmt: Value = serde_json::json!({
-            "Sid": "T", "Effect": "Allow", "Action": "x:Y", "Resource": "*",
-            "Condition": { "ForAllValues:StringEquals": { "aws:TagKeys": ["a", "b"] } }
-        });
-        let check = |context| Check {
-            action: "x:Y",
-            resource: "*",
-            context,
-            write: true,
-        };
-        let holds = |c: &Check| {
-            conditions_hold(
-                &stmt,
-                &Request {
-                    check: c,
-                    caller: ME,
-                    owner: ME,
-                },
-            )
-        };
-        assert!(holds(&check(&[])));
-        assert!(holds(&check(&[
-            ("aws:TagKeys", Literal("a")),
-            ("aws:TagKeys", Literal("b"))
-        ])));
-        assert!(!holds(&check(&[
-            ("aws:TagKeys", Literal("a")),
-            ("aws:TagKeys", Literal("c"))
-        ])));
     }
 
     /// A key whose *key policy* grants account principals through Secrets

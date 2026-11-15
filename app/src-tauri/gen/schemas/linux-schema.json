@@ -447,6 +447,12 @@
           "markdownDescription": "Enables the build_stt_image command without any pre-configured scope."
         },
         {
+          "description": "Enables the cancel_aws_deployment command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-cancel-aws-deployment",
+          "markdownDescription": "Enables the cancel_aws_deployment command without any pre-configured scope."
+        },
+        {
           "description": "Enables the cancel_claude_token command without any pre-configured scope.",
           "type": "string",
           "const": "allow-cancel-claude-token",
@@ -555,10 +561,34 @@
           "markdownDescription": "Enables the delete_note command without any pre-configured scope."
         },
         {
+          "description": "Enables the deploy_aws_environment command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-deploy-aws-environment",
+          "markdownDescription": "Enables the deploy_aws_environment command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the deploy_aws_permissions_boundary command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-deploy-aws-permissions-boundary",
+          "markdownDescription": "Enables the deploy_aws_permissions_boundary command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the destroy_incomplete_aws_environment command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-destroy-incomplete-aws-environment",
+          "markdownDescription": "Enables the destroy_incomplete_aws_environment command without any pre-configured scope."
+        },
+        {
           "description": "Enables the detect_aws_config command without any pre-configured scope.",
           "type": "string",
           "const": "allow-detect-aws-config",
           "markdownDescription": "Enables the detect_aws_config command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the detect_aws_environments command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-detect-aws-environments",
+          "markdownDescription": "Enables the detect_aws_environments command without any pre-configured scope."
         },
         {
           "description": "Enables the detect_host_timezone command without any pre-configured scope.",
@@ -589,6 +619,12 @@
           "type": "string",
           "const": "allow-export-settings",
           "markdownDescription": "Enables the export_settings command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the follow_aws_deployment command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-follow-aws-deployment",
+          "markdownDescription": "Enables the follow_aws_deployment command without any pre-configured scope."
         },
         {
           "description": "Enables the forget_marketplace_installs command without any pre-configured scope.",
@@ -807,6 +843,12 @@
           "markdownDescription": "Enables the migrate_project_to_base command without any pre-configured scope."
         },
         {
+          "description": "Enables the onboard_aws_user command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-onboard-aws-user",
+          "markdownDescription": "Enables the onboard_aws_user command without any pre-configured scope."
+        },
+        {
           "description": "Enables the open_browser_view_popout command without any pre-configured scope.",
           "type": "string",
           "const": "allow-open-browser-view-popout",
@@ -865,6 +907,12 @@
           "type": "string",
           "const": "allow-pull-stt-image",
           "markdownDescription": "Enables the pull_stt_image command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the push_aws_saved_state command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-push-aws-saved-state",
+          "markdownDescription": "Enables the push_aws_saved_state command without any pre-configured scope."
         },
         {
           "description": "Enables the read_container_file command without any pre-configured scope.",
@@ -939,6 +987,12 @@
           "markdownDescription": "Enables the rename_container_path command without any pre-configured scope."
         },
         {
+          "description": "Enables the repair_aws_environment command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-repair-aws-environment",
+          "markdownDescription": "Enables the repair_aws_environment command without any pre-configured scope."
+        },
+        {
           "description": "Enables the rollback_migration command without any pre-configured scope.",
           "type": "string",
           "const": "allow-rollback-migration",
@@ -955,6 +1009,12 @@
           "type": "string",
           "const": "allow-run-scheduled-task-now",
           "markdownDescription": "Enables the run_scheduled_task_now command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the save_aws_admin_bundle command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-save-aws-admin-bundle",
+          "markdownDescription": "Enables the save_aws_admin_bundle command without any pre-configured scope."
         },
         {
           "description": "Enables the save_note command without any pre-configured scope.",
@@ -1125,10 +1185,22 @@
           "markdownDescription": "Enables the uninstall_marketplace_item command without any pre-configured scope."
         },
         {
+          "description": "Enables the unlock_aws_state command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-unlock-aws-state",
+          "markdownDescription": "Enables the unlock_aws_state command without any pre-configured scope."
+        },
+        {
           "description": "Enables the update_aws_connection command without any pre-configured scope.",
           "type": "string",
           "const": "allow-update-aws-connection",
           "markdownDescription": "Enables the update_aws_connection command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the update_aws_environment command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-update-aws-environment",
+          "markdownDescription": "Enables the update_aws_environment command without any pre-configured scope."
         },
         {
           "description": "Enables the update_marketplace command without any pre-configured scope.",
@@ -1305,6 +1377,12 @@
           "markdownDescription": "Denies the build_stt_image command without any pre-configured scope."
         },
         {
+          "description": "Denies the cancel_aws_deployment command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-cancel-aws-deployment",
+          "markdownDescription": "Denies the cancel_aws_deployment command without any pre-configured scope."
+        },
+        {
           "description": "Denies the cancel_claude_token command without any pre-configured scope.",
           "type": "string",
           "const": "deny-cancel-claude-token",
@@ -1413,10 +1491,34 @@
           "markdownDescription": "Denies the delete_note command without any pre-configured scope."
         },
         {
+          "description": "Denies the deploy_aws_environment command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-deploy-aws-environment",
+          "markdownDescription": "Denies the deploy_aws_environment command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the deploy_aws_permissions_boundary command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-deploy-aws-permissions-boundary",
+          "markdownDescription": "Denies the deploy_aws_permissions_boundary command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the destroy_incomplete_aws_environment command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-destroy-incomplete-aws-environment",
+          "markdownDescription": "Denies the destroy_incomplete_aws_environment command without any pre-configured scope."
+        },
+        {
           "description": "Denies the detect_aws_config command without any pre-configured scope.",
           "type": "string",
           "const": "deny-detect-aws-config",
           "markdownDescription": "Denies the detect_aws_config command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the detect_aws_environments command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-detect-aws-environments",
+          "markdownDescription": "Denies the detect_aws_environments command without any pre-configured scope."
         },
         {
           "description": "Denies the detect_host_timezone command without any pre-configured scope.",
@@ -1447,6 +1549,12 @@
           "type": "string",
           "const": "deny-export-settings",
           "markdownDescription": "Denies the export_settings command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the follow_aws_deployment command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-follow-aws-deployment",
+          "markdownDescription": "Denies the follow_aws_deployment command without any pre-configured scope."
         },
         {
           "description": "Denies the forget_marketplace_installs command without any pre-configured scope.",
@@ -1665,6 +1773,12 @@
           "markdownDescription": "Denies the migrate_project_to_base command without any pre-configured scope."
         },
         {
+          "description": "Denies the onboard_aws_user command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-onboard-aws-user",
+          "markdownDescription": "Denies the onboard_aws_user command without any pre-configured scope."
+        },
+        {
           "description": "Denies the open_browser_view_popout command without any pre-configured scope.",
           "type": "string",
           "const": "deny-open-browser-view-popout",
@@ -1723,6 +1837,12 @@
           "type": "string",
           "const": "deny-pull-stt-image",
           "markdownDescription": "Denies the pull_stt_image command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the push_aws_saved_state command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-push-aws-saved-state",
+          "markdownDescription": "Denies the push_aws_saved_state command without any pre-configured scope."
         },
         {
           "description": "Denies the read_container_file command without any pre-configured scope.",
@@ -1797,6 +1917,12 @@
           "markdownDescription": "Denies the rename_container_path command without any pre-configured scope."
         },
         {
+          "description": "Denies the repair_aws_environment command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-repair-aws-environment",
+          "markdownDescription": "Denies the repair_aws_environment command without any pre-configured scope."
+        },
+        {
           "description": "Denies the rollback_migration command without any pre-configured scope.",
           "type": "string",
           "const": "deny-rollback-migration",
@@ -1813,6 +1939,12 @@
           "type": "string",
           "const": "deny-run-scheduled-task-now",
           "markdownDescription": "Denies the run_scheduled_task_now command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the save_aws_admin_bundle command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-save-aws-admin-bundle",
+          "markdownDescription": "Denies the save_aws_admin_bundle command without any pre-configured scope."
         },
         {
           "description": "Denies the save_note command without any pre-configured scope.",
@@ -1983,10 +2115,22 @@
           "markdownDescription": "Denies the uninstall_marketplace_item command without any pre-configured scope."
         },
         {
+          "description": "Denies the unlock_aws_state command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-unlock-aws-state",
+          "markdownDescription": "Denies the unlock_aws_state command without any pre-configured scope."
+        },
+        {
           "description": "Denies the update_aws_connection command without any pre-configured scope.",
           "type": "string",
           "const": "deny-update-aws-connection",
           "markdownDescription": "Denies the update_aws_connection command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the update_aws_environment command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-update-aws-environment",
+          "markdownDescription": "Denies the update_aws_environment command without any pre-configured scope."
         },
         {
           "description": "Denies the update_marketplace command without any pre-configured scope.",

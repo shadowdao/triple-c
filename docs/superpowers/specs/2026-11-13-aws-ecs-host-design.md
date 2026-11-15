@@ -1,7 +1,7 @@
 # Triple-C on AWS (ECS on EC2 / Fargate) — design
 
 Date: 2026-11-13
-Status: **draft for review** (user decisions recorded 2026-11-13). The user set the direction (local or AWS, login like the AWS CLI,
+Status: **draft for review** (user decisions recorded 2026-11-13 and 2026-11-14; phase 4 done). The user set the direction (local or AWS, login like the AWS CLI,
 permission check, hosting options, secrets pushed automatically, shared accounts). Everything else
 here is a proposal.
 
@@ -30,6 +30,55 @@ The AWS flow, in the user's words:
 | Claude Code login | **Unchanged.** Anthropic login (`claude login`, OAuth through the auth bridge, or the shared token) or Bedrock, exactly as for local projects. The AWS host doesn't change how Claude authenticates |
 | Tenancy | **Strict from v1, and the default.** Most people will set this up in their own accounts. Strict costs a single user nothing extra (they onboard themselves automatically), and it means the setup is already safe the day a second person joins |
 | Connection model | **C, hybrid.** A connection is a login (profile or keys) plus a **default region**. Environments are detected per region when needed; each project records `(connection, region, environment)`. See [Connection model](#connection-model) |
+
+### Decisions (user, 2026-11-14): environments are OpenTofu
+
+The user chose **Terraform over CloudFormation**, the **app runs it** itself, with **OpenTofu**
+(MPL-2.0, safe for the app to download and run), and **state in an S3 bucket** in the account.
+Phase 4 added these decisions:
+
+- **D2. Strict tenancy gives each user their own EFS file system**, created by their onboarding
+  module. EFS can't bind an access point to its owner's task role (`ClientMount` sees the access
+  point's ARN, not its tags, and access-point IDs are random), so the file-system policy admits
+  only that user's task role. An empty file system costs nothing. The environment keeps the shared
+  pieces: cluster, security group, KMS key, log group and network.
+- **D3. No ECR in v1.** Tasks pull `ghcr.io/shadowdao/triple-c-sandbox` straight from GHCR (the
+  default when an environment has no ECR mirror).
+- **D4. Network modes** (`network_mode`): `public` (**default**: a new VPC, two public subnets,
+  tasks get a public IP, the security group has no inbound rules, no NAT, $0); `private-nat` (a new
+  VPC with two public and two private subnets and one NAT gateway; the UI says about $33/month);
+  `existing` (the user's `vpc_id`, exactly two `subnet_ids` in different AZs, and
+  `assign_public_ip`).
+- **D5. An admin request is a folder bundle**, written into a folder picked through a Rust-side
+  dialog: the module's files, `backend.hcl`, `terraform.tfvars.json` and a `README.txt` with the
+  exact commands (`tofu init -backend-config=backend.hcl`, then `tofu apply`; Terraform 1.10+
+  works too).
+- **D6. The app destroys only incomplete deployments** (state without an environment record, or
+  a failed apply), and never while any user's onboarding state for the environment remains. A working environment is destroyed by an admin with `tofu destroy` from a
+  bundle, which is the irreversible case.
+- **D7. The admin tier spans several policy files** (`environment-admin.json` and
+  `environment-admin-network.json`), all required; `aws_policy_document` returns every file of a
+  tier.
+- **D8. CloudFormation left the policies**, with its actions, checks and probes. Detection for a
+  workspace user reads only `ssm:GetParameter*` on `/triple-c/*` and `iam:GetRole` on
+  `role/triple-c-*`; the bucket (state objects and locks) is admin-only, so a workspace user sees
+  only environments that have a record.
+- **D9. One state key per deployment**, in the per-account, per-region bucket
+  `triple-c-tfstate-<account>-<region>`: `environments/<env>/terraform.tfstate`,
+  `users/<env>/<ownerkey>/terraform.tfstate`, `boundary/terraform.tfstate`. The owner key is the
+  first 12 hex characters of `sha256("<region>:<aws:userid>")` and also names the user's roles
+  (`triple-c-<env>-<ownerkey>-task|exec`): role names are account-global and environments
+  regional, so the region is part of it (the same user and environment name in two regions must
+  not collide). The lock is the
+  matching `.tflock` object (S3-native locking, `use_lockfile = true`); a held lock is a deploy in
+  progress, and its `Who`/`Created`/`Operation` are shown.
+- **D10. Applies are detached.** `tofu apply` runs in its own session, output to
+  `<workdir>/apply.log`, PID in `<workdir>/apply.pid` (liveness is the runner's `apply.lock`). A
+  run that can't save its state leaves `errored.tfstate`; nothing else starts there until it is
+  pushed back (Push saved state: `tofu state push errored.tfstate` through the same runner).
+  Closing the app doesn't interrupt it; on the next run the app sees the live runner or the held
+  lock and reattaches by following the log. It interrupts only when the user presses Cancel (not
+  on Windows yet), and OpenTofu then stops gracefully and saves state.
 
 ### Non-goals (v1)
 
@@ -83,40 +132,48 @@ users don't need the AWS CLI. Only SSO login needs it, until the device flow lan
 Triple-C looks for existing Triple-C infrastructure in the region in two ways, so it finds an
 environment even if one of them is missing:
 
-- the SSM parameters `/triple-c/environments/*`, written by the environment stack, whose JSON
-  value lists the environment's ARNs and IDs;
-- CloudFormation stacks tagged `triple-c:component=environment`. This catches a stack whose
-  parameter was deleted, or one that is half-deployed (`*_IN_PROGRESS`, `*_FAILED`). Those are
-  shown with their state and a "Repair or delete" action instead of being silently ignored.
+- the SSM parameters `/triple-c/environments/*`, written last by the environment module, whose
+  JSON value (`EnvironmentInfo`, schema 1) lists the environment's ARNs and IDs. The record is
+  untrusted input: every field is validated and the value capped at 4 KiB;
+- the OpenTofu state objects and `.tflock` locks in the state bucket (D9; admins only, D8). This
+  catches a deployment whose record is missing (a failed or interrupted apply) or one in progress.
+  A state without a record, a failed apply or a stale lock (over two hours old) is shown as
+  **Incomplete** with Repair, Unlock or, without a record, Destroy (D6), instead of being silently
+  ignored; a fresh lock is **Deploying** (Follow when it is this machine's run). An empty state
+  (what `tofu destroy` leaves behind) counts as no deployment.
 
-Detection also reads the template version each stack was deployed from, so an environment deployed
-by an older Triple-C shows **"Update available"**.
+The record carries the module version it was deployed from, so an environment deployed by an older
+Triple-C shows **"Update available"**.
 
 What the user sees depends on what was found and what they're allowed to do:
 
-| Found | Can deploy (stack permissions) | Offered |
+| Found | Can deploy (admin tier) | Offered |
 |---|---|---|
 | Nothing | Yes | **Deploy a new environment** (the default path for a personal account) |
-| Nothing | No | Explanation, plus the policy JSON and a pre-filled CloudFormation console link to send to whoever owns the account |
+| Nothing | No | Explanation, plus the policy JSON and an admin bundle (D5) to send to whoever owns the account |
 | One or more | Yes | **Join** `<name>` (default) or **Deploy a new one** (for example a separate region or cost boundary) |
 | One or more | No | **Join** `<name>` |
 
-**Deploy** uses the **CloudFormation template that ships with the app**
-(`aws/triple-c-environment.yaml`). A CloudFormation stack is auditable, an admin can deploy it
-without Triple-C, and deleting the stack removes everything. The app never creates environment
-resources one API call at a time. Deploy progress streams from the stack events into the same
-progress view used for local image pulls.
+**Deploy** applies the **OpenTofu module that ships with the app** (`aws/terraform/environment`)
+with the caller's own credentials. The app downloads a pinned OpenTofu (checked against its SHA-256
+before it is unpacked), creates the state bucket if needed, writes a work folder and starts a
+detached `tofu init` + `tofu apply` (D10); progress streams from OpenTofu's JSON log into the
+deploy view. An admin can apply the same files without Triple-C from a bundle (D5), and
+`tofu destroy` removes everything the module created. The app never creates environment resources
+one API call at a time.
 
-**Joining in strict tenancy** (the default) also needs the user's **onboarding stack**: their own
-task role, EFS access-point policy entry and, if they use EC2, a dedicated capacity provider. The
-app checks whether the caller already has one:
+**Joining in strict tenancy** (the default) also needs the user's **onboarding**
+(`aws/terraform/user-onboard`): their own task and execution roles (with the permissions
+boundary) and their own EFS file system (D2), and later, if they use EC2, a dedicated capacity
+provider. The app checks whether the caller already has one (their state object, or their task
+role):
 
-- **The caller can deploy it** (always true in their own account): Triple-C deploys
-  `triple-c-user-onboard.yaml` for them as part of joining. For the person who just deployed the
+- **The caller can deploy it** (an environment admin; always true in their own account): Triple-C
+  applies the onboarding module for them as part of joining. For the person who just deployed the
   environment, this happens in the same flow, so a single user never sees "onboarding" as a step.
 - **The caller can't**: Triple-C produces an onboarding request for whoever runs the environment —
-  a pre-filled CloudFormation console link plus the exact parameters — and the user's "Join" stays
-  pending until the stack exists. The app re-checks whenever the user opens the dialog.
+  an admin bundle (D5) with the user's `aws:userid` filled in — and the user's "Join" stays
+  pending until their roles exist. The app re-checks whenever the user opens the dialog.
 
 ### 3. Permission check
 
@@ -124,7 +181,7 @@ There are three tiers, and the check reports which one the user is in:
 
 | Tier | Can do |
 |---|---|
-| **Environment admin** | Deploy or update the environment stack, onboard users (strict tenancy) |
+| **Environment admin** | Deploy or update an environment (the OpenTofu modules), onboard users (strict tenancy) |
 | **Workspace user** | Create, start, stop, connect to and delete **their own** workspaces in an existing environment |
 | **Insufficient** | Lists exactly which actions are missing, and offers the IAM policy JSON to send to an admin |
 
@@ -270,7 +327,7 @@ other.
 
 - ECR pull-through cache of `ghcr.io/shadowdao/triple-c-sandbox` (GHCR as an upstream needs a
   GitHub token stored in Secrets Manager), or
-- the environment stack's ECR repo, filled by an admin or CI with `crane copy`.
+- an environment's ECR repo (not in v1, D3), filled by an admin or CI with `crane copy`.
 
 Pulling straight from GHCR over NAT also works, and is the default when the environment has no ECR mirror. Image
 updates use the existing "new image available" flow: the next start uses the new digest.
@@ -283,9 +340,10 @@ updates use the existing "new image available" flow: the next start uses the new
 | **Hybrid** (default) | task storage | EFS | Settings, sessions, memory, history: yes. Working tree: only what's pushed | Fast builds, fast git | Small EFS footprint |
 | **EFS** | EFS | EFS | Everything | git, `node_modules` and builds are noticeably slower over NFS | Grows with repo and dependency size |
 
-- **One EFS file system per environment, one access point per workspace.** Access point root:
+- **One EFS file system per user (D2), one access point per workspace.** The file system comes
+  from the user's onboarding module and its policy admits only their task role. Access point root:
   `/triple-c/<owner>/<project-id>`, with POSIX user and group 1000. The access point is created by
-  the user and tagged with the owner (see policies).
+  the user, on their own file system, and tagged with the owner (see policies).
 - **WIP push is on by default** (`wip_push_on_stop: true`, with a serde default per the
   `default_full_permissions` pattern) and can be turned off per project.
 - **Ephemeral and Hybrid have a stop guard.** Before stopping, the app asks the agent for
@@ -390,7 +448,7 @@ before release.**
 
 | Mode | For | Task role | EC2 options | Isolation |
 |---|---|---|---|---|
-| **Strict** (**default, v1**) | Everyone, from a solo account to a team | **Per-user** task role, created by the user's onboarding stack (self-deployed, or by an admin) | Privileged and Docker allowed **only on a per-user capacity provider** (dedicated EC2 instances, never shared with another owner) | Per-user IAM all the way down. EFS file system policy allows each access point only to its owner's task role |
+| **Strict** (**default, v1**) | Everyone, from a solo account to a team | **Per-user** task role, created by the user's onboarding module (self-deployed, or by an admin) | Privileged and Docker allowed **only on a per-user capacity provider** (dedicated EC2 instances, never shared with another owner) | Per-user IAM all the way down. Each user has their own EFS file system (D2), whose policy admits only that user's task role |
 | **Standard** (opt-in, later) | Large teams that want fewer IAM roles | Shared, minimal (logs, SSM messages) | **Fargate only**, or EC2 with **no** privileged mode, Docker socket or `NET_ADMIN` | Containers are unprivileged and can't mount NFS, can't read secrets, and can't reach each other over the network |
 
 There is no separate "personal" mode. A solo user on strict tenancy is simply the only onboarded
@@ -422,7 +480,7 @@ fails because of a quota, the app says so and doesn't retry.
 | Start time | About 30–90 s (image pull every time; SOCI lazy-loading **to evaluate**) | Fast when the image is cached on a warm instance |
 | Docker access / privileged / VPN | No | Yes, on dedicated capacity |
 | GPU | No | Yes |
-| Ops | None | ASG + capacity provider, defined in the environment stack. The app only picks a capacity provider |
+| Ops | None | ASG + capacity provider, defined in the environment module. The app only picks a capacity provider |
 | Cost when idle | 0 (task stopped) | Instances keep running unless the ASG scales in |
 | Max size | 16 vCPU / 120 GB | Instance type |
 
@@ -560,18 +618,22 @@ Existing `projects.json` files deserialize unchanged (`host_id` missing → Loca
 
 ```
 aws/
-  triple-c-environment.yaml        # CloudFormation: cluster, capacity providers, SG, EFS + policy,
-                                   # KMS key, ECR repo / pull-through rule, log group, exec+task roles,
-                                   # SSM environment parameter. Params: VPC/subnets (or create),
-                                   # tenancy mode, limits, Bedrock-on-task-role.
-  triple-c-user-onboard.yaml       # strict tenancy: per-user task role + capacity provider
+  README.md                        # the policies, the modules, running a bundle by hand, live results
+  terraform/                       # OpenTofu modules (hashicorp/aws pinned, .terraform.lock.hcl)
+    permissions-boundary/          # the account's triple-c-permissions-boundary policy
+    environment/                   # cluster, tasks SG (no ingress), KMS key + alias, log group,
+                                   # network (public | private-nat | existing), SSM record (last)
+    user-onboard/                  # per user: task + exec roles (bounded), own EFS file system,
+                                   # its SG, two mount targets, file-system policy (D2)
   policies/
-    environment-admin.json
     workspace-user.json
-    permissions-boundary.json      # every triple-c-* role carries it (phase 3)
-    task-execution-role.json
-    task-role-standard.json
+    environment-admin.json         # the admin tier, part 1 (D7)
+    environment-admin-network.json # the admin tier, part 2: the network
+    permissions-boundary.json      # every triple-c-* role carries it
 ```
+
+State lives in `triple-c-tfstate-<account>-<region>` (versioned, SSE-S3, public access blocked,
+TLS only, tagged `triple-c:component=state`), one object per deployment (D9).
 
 ## Phases
 
@@ -582,13 +644,15 @@ aws/
 3. **AWS connection + permission check.** Settings UI, SDK wiring, `GetCallerIdentity`, the tiered
    simulation and fallback probes, policy files. **Done 2026-11-14**; the policies were verified
    against real IAM (see "Phase 3: policy verification and rulings").
-4. **Environment + onboarding stacks.** CloudFormation templates for both, detection (SSM
-   parameters + tagged stacks, including half-deployed and outdated ones), join or deploy,
-   self-onboarding or an admin request, **strict tenancy**.
+4. **Environment + onboarding modules.** OpenTofu modules for both and the boundary, run by the
+   app (detached) or by an admin from a bundle; detection (SSM records + state objects and locks,
+   including incomplete, in-progress and outdated ones), join or deploy, self-onboarding or an
+   admin request, **strict tenancy**. **Done 2026-11-14**; deployed, joined, updated and destroyed
+   for real as a role holding only the admin policies (see "Phase 4: live verification").
 5. **Fargate workspaces.** Ephemeral and Hybrid storage, Secrets Manager delivery, git bootstrap,
    start/stop/status, stop guard with WIP push on by default, idle auto-stop, logs.
 6. **EFS mode, Copy-at-connect, setup scripts, cost estimate.**
-7. **ECS on EC2.** Per-user capacity providers in the onboarding stack, privileged/Docker/VPN on
+7. **ECS on EC2.** Per-user capacity providers in the onboarding module, privileged/Docker/VPN on
    dedicated capacity.
 8. **Standard tenancy** (opt-in), only if demand appears.
 
@@ -664,6 +728,29 @@ Left for the phases with real ECS/EFS/EC2 resources: `RunTask`'s `aws:TagKeys` (
 `aws:ecs:*` or propagated tags), `iam:PassRole` with `iam:ResourceTag` on a real run, the owner
 tag on a real task for stop/exec/session, session ownership for an SSO-started session, EFS
 `CreateAction`/`CreateAccessPoint`/`ClientMount`, and `security-group-rule` authorization.
+(Phase 4 has since created security groups and rules for real; see below.)
+
+### Phase 4: live verification (2026-11-14)
+
+`app/src-tauri/src/aws/live_tests.rs` (`environment`) applies the modules for real, in us-west-2,
+as a role holding **only** the admin files: state bucket, a `public` environment through the real
+detached runner, detection, self-onboarding, an update ("No changes"), destroy; and a
+`private-nat` environment. What reality changed (details in `aws/README.md`):
+
+- `s3:CreateBucket` with tags also needs `s3:TagResource`. Its `aws:RequestTag` and
+  `s3:ResourceAccount` conditions are evaluated and pass.
+- `ec2:CreateSecurityGroup` is authorized against the VPC without the request's tags, so the VPC
+  side of the grant is unconditioned (the group still needs the tag).
+- Destroying the NAT gateway's address disassociates it after the association is gone; EC2
+  authorizes that against the literal `*/*`, which is all the policy grants (`${*}/${*}`).
+- `tofu destroy` leaves an empty state object; detection treats it as no deployment (otherwise a
+  destroyed environment read as Incomplete for ever).
+- Confirmed as designed: EFS sets `aws:CalledViaLast` for mount-target interfaces; the EFS
+  file-system policy accepted the just-created task role; conditional `DeleteObject` (`If-Match`)
+  on the versioned bucket returns 412 on a stale ETag.
+
+Still to verify: the `existing` network mode against a user's own VPC, and Fargate tasks in the
+deployed environment (phase 5).
 
 ## Connection model
 
@@ -684,7 +771,7 @@ The options:
 | Several regions or environments, same login | Duplicate connections with the same credentials. Keys are stored twice; SSO shares a token cache, so it's only clutter | One connection | One connection |
 | Permission check | Once per connection, cached | Per environment, run lazily the first time a project uses it | Per environment, run lazily |
 | Detection cost | One region | Every region the user might use (`DescribeRegions` + a scan, slow) or a hand-kept list | Default region straight away; other regions only when the user picks one |
-| Risk of deploying to the wrong place | Low: the place is in the connection's name | Higher: an easy region-picker mistake leaves a stack in a region nobody looks at | Low: default region preselected, others must be chosen deliberately |
+| Risk of deploying to the wrong place | Low: the place is in the connection's name | Higher: an easy region-picker mistake leaves an environment in a region nobody looks at | Low: default region preselected, others must be chosen deliberately |
 | Moving a project to another region or environment | Re-point the project to another connection | Change a field | Change a field |
 | Settings export/import | Each connection is self-contained | Projects reference environments that may not exist on the importing machine | Same as B |
 | Data model / UI | Smallest | Largest (environment picker and per-environment status everywhere) | Medium |

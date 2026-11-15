@@ -312,19 +312,43 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   `identity.rs` is `GetCallerIdentity` and the principal to simulate (an assumed role's ARN is
   recovered with `iam:GetRole`, because SSO roles have an `/aws-reserved/…` path the session ARN
   lacks); `error.rs` classifies SDK errors (SSO expired, access denied naming the action, …);
-  `policies.rs` embeds `aws/policies/*.json` (the two tier policies and the permissions boundary)
-  and the table of checks the simulator is asked; `permissions.rs` runs it
+  `policies.rs` embeds `aws/policies/*.json` (the tier policies — the admin tier spans several
+  files, `policy_files` lists them — and the permissions boundary) and the table of checks the
+  simulator is asked; `permissions.rs` runs it
   (`SimulatePrincipalPolicy`, adaptive retries — it throttles — or read-only probes when the
   caller can't simulate itself; a probed run never claims the admin tier). `policies.rs`'s tests
   are the drift guard: every allowed action has a check, every check is allowed by a small IAM
-  evaluator, owner-scoped checks are denied for someone else, admin destruction is tag-scoped,
-  the boundary fences hold, every Resource is an ARN and every policy fits a 6,144-character
-  managed policy. **Change a policy JSON, its checks and `aws/README.md` together.** The evaluator
+  evaluator (`policy_eval.rs`, test-only; `tofu_modules/tests.rs` also asks it whether the admin
+  tier allows every call `MODULE_CALLS` lists for the Terraform modules), owner-scoped checks are
+  denied for someone else, admin destruction is tag-scoped, the boundary fences hold, every
+  Resource is an ARN and every policy fits a 6,144-character managed policy. **Change a policy
+  JSON, its checks and `aws/README.md` together.** The evaluator
   is not IAM: `live_tests.rs` (ignored; `TRIPLEC_AWS_E2E_PROFILE`, `TRIPLEC_AWS_E2E_REGION`,
   admin credentials for a disposable account; `cargo test aws::live_tests -- --ignored
   --test-threads=1`) runs the check and real calls against throwaway `triple-c-e2e-*` roles,
   secrets and keys, and cleans them up. Re-run it after any policy change; the results are in
-  `aws/README.md` ("Live verification").
+  `aws/README.md` ("Live verification"). Its `environment` tests apply the real modules as a role
+  holding only the admin files (`cargo build` first: the runner they start is the built app
+  binary), in a throwaway state bucket.
+  **Environments are OpenTofu modules** (`aws/terraform/{environment,user-onboard,permissions-boundary}`;
+  spec D2–D10). `tofu_modules.rs` embeds them and is the **only** place the shared names are built
+  (environment, `/triple-c/environments/<env>` record, owner key — `sha256("<region>:<aws:userid>")`,
+  12 hex, regional because role names are account-global — per-user roles, state bucket
+  `triple-c-tfstate-<account>-<region>`, state keys); its tests pin the HCL to those names, the
+  versions and tags, and `MODULE_CALLS` (every provider call) to the admin policy.
+  `tofu.rs` downloads the pinned OpenTofu (SHA-256 checked **before** extraction), writes a work
+  folder (`materialize`), builds tofu's environment from scratch (`child_env`: no inherited
+  `AWS_*`/`TF_*`, keys only in the environment) and runs `init` + `apply|destroy` **detached
+  (D10)**: the app binary re-executed with `--tofu-runner` (`main.rs` checks that first), in its
+  own session, logging to `apply.log`; liveness is the runner's `apply.lock`, never a PID; closing
+  the app never stops a run and the next start re-follows the log. `environments.rs` is detection
+  (records + state objects + locks; records are untrusted and capped; an empty state, which
+  `tofu destroy` leaves behind, is no deployment) and `ensure_state_bucket`;
+  `commands/environment_commands.rs` sequences ensure_tofu → ensure_state_bucket → materialize →
+  start → follow. **D2: strict tenancy gives each user their own EFS file system** (its policy
+  admits only their task role) from their onboarding module; the environment keeps only the shared
+  pieces. The app destroys only incomplete deployments (D6); a working environment is removed with
+  `tofu destroy` from an admin bundle (D5).
 - **`web_terminal/`** — Remote terminal access via axum HTTP+WebSocket server:
   - `server.rs` — Axum server lifecycle (start/stop), serves embedded HTML and handles WS upgrades
   - `ws_handler.rs` — Per-connection WebSocket handler with JSON protocol, session management, cleanup on disconnect

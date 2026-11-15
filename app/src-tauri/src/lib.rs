@@ -211,6 +211,13 @@ where
     }
 }
 
+/// The detached OpenTofu runner (`aws::tofu`): `Some(exit code)` when this
+/// process was started as one, `None` for a normal launch. `main` asks
+/// before anything Tauri or GTK starts, so a runner never opens a window.
+pub fn tofu_runner_main() -> Option<i32> {
+    aws::tofu::runner_main(std::env::args_os())
+}
+
 pub fn run() {
     logging::init();
 
@@ -603,6 +610,18 @@ pub fn run() {
             commands::host_commands::aws_connection_sso_login,
             commands::host_commands::check_aws_permissions,
             commands::host_commands::aws_policy_document,
+            commands::environment_commands::detect_aws_environments,
+            commands::environment_commands::deploy_aws_environment,
+            commands::environment_commands::update_aws_environment,
+            commands::environment_commands::repair_aws_environment,
+            commands::environment_commands::destroy_incomplete_aws_environment,
+            commands::environment_commands::unlock_aws_state,
+            commands::environment_commands::follow_aws_deployment,
+            commands::environment_commands::cancel_aws_deployment,
+            commands::environment_commands::push_aws_saved_state,
+            commands::environment_commands::onboard_aws_user,
+            commands::environment_commands::deploy_aws_permissions_boundary,
+            commands::environment_commands::save_aws_admin_bundle,
             commands::settings_commands::detect_host_timezone,
             // Settings export/import
             commands::settings_export_commands::export_settings,
