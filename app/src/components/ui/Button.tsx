@@ -1,4 +1,4 @@
-import type { ButtonHTMLAttributes, ReactNode } from "react";
+import type { ButtonHTMLAttributes, ReactNode, Ref } from "react";
 import { useUnavailable } from "./unavailable";
 
 export type ButtonVariant = "primary" | "secondary" | "danger" | "ghost";
@@ -19,6 +19,8 @@ interface Props extends ButtonHTMLAttributes<HTMLButtonElement> {
   unavailable?: boolean;
   /** Why the button cannot be used. Required for `unavailable` to say anything. */
   unavailableReason?: string;
+  /** React 19 passes `ref` as a prop; it lands on the `<button>` via `rest`. */
+  ref?: Ref<HTMLButtonElement>;
 }
 
 /**

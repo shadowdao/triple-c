@@ -7,6 +7,7 @@ import Field, { ConfigGroup, inputClass } from "../../../ui/Field";
 import CaCertPathInput from "../../../settings/CaCertPathInput";
 import EnvVarsEditor from "../../EnvVarsEditor";
 import PortMappingsEditor from "../../PortMappingsEditor";
+import { NOT_ON_AWS, isAwsProject } from "../../../../lib/awsWorkspace";
 
 interface Props {
   project: Project;
@@ -161,16 +162,22 @@ export default function AccessSection({
         <span className="block text-[13px] font-medium text-[var(--text-primary)]">
           Port mappings
         </span>
-        <p className="mt-0.5 mb-2 text-xs text-[var(--text-secondary)] leading-snug">
-          Expose container ports on the host so you can reach dev servers running inside
-          the sandbox.
-        </p>
-        <PortMappingsEditor
-          portMappings={project.port_mappings ?? []}
-          disabled={disabled}
-          disabledReason={disabledReason}
-          onSave={(mappings) => save({ port_mappings: mappings })}
-        />
+        {isAwsProject(project) ? (
+          <p className="mt-0.5 text-xs text-[var(--text-disabled)] leading-snug">{NOT_ON_AWS}</p>
+        ) : (
+          <>
+            <p className="mt-0.5 mb-2 text-xs text-[var(--text-secondary)] leading-snug">
+              Expose container ports on the host so you can reach dev servers running inside
+              the sandbox.
+            </p>
+            <PortMappingsEditor
+              portMappings={project.port_mappings ?? []}
+              disabled={disabled}
+              disabledReason={disabledReason}
+              onSave={(mappings) => save({ port_mappings: mappings })}
+            />
+          </>
+        )}
       </div>
     </ConfigGroup>
   );

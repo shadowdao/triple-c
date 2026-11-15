@@ -1,12 +1,16 @@
 import { useCallback, useState } from "react";
 import { save } from "@tauri-apps/plugin-dialog";
-import type { Project } from "../lib/types";
+import type { Project, UnsavedWork, WipChoice } from "../lib/types";
+import { isAwsProject, stopGuardNeeded } from "../lib/awsWorkspace";
 import * as commands from "../lib/tauri-commands";
 import { formatBytes } from "../lib/formatBytes";
 import { describeResetLeftovers, resetLeftoverPronoun } from "../lib/resetOutcome";
 import { useAppState } from "../store/appState";
 import { useProjects } from "./useProjects";
 import { useTerminal } from "./useTerminal";
+
+/** How many task log lines a failed AWS start shows. */
+const TASK_LOG_LINES = 30;
 
 /**
  * Lifecycle + terminal actions for one project, shared by the sidebar row and
@@ -29,13 +33,17 @@ export function useProjectActions(project: Project) {
   );
 
   const run = useCallback(
-    async <T,>(label: string, fn: () => Promise<T>): Promise<T | undefined> => {
+    async <T,>(
+      label: string,
+      fn: () => Promise<T>,
+      explain?: (e: unknown) => Promise<string>,
+    ): Promise<T | undefined> => {
       setBusy(true);
       setContainerProgress(project.id, null);
       try {
         return await fn();
       } catch (e) {
-        fail(`${label} failed for “${project.name}”`, e);
+        fail(`${label} failed for “${project.name}”`, explain ? await explain(e) : e);
         return undefined;
       } finally {
         setContainerProgress(project.id, null);
@@ -45,13 +53,63 @@ export function useProjectActions(project: Project) {
     [fail, project.id, project.name, setContainerProgress],
   );
 
-  const handleStart = useCallback(
-    () => run("Start", () => start(project.id)),
-    [run, start, project.id],
+  const aws = isAwsProject(project);
+
+  /** An AWS start failure gets the task's last log lines, unless the error has them. */
+  const withTaskLog = useCallback(
+    async (e: unknown): Promise<string> => {
+      const text = String(e);
+      if (text.includes("Last log lines")) return text;
+      try {
+        const lines = await commands.awsTaskLog(project.id, TASK_LOG_LINES);
+        if (lines.length > 0) return `${text}\n\nLast log lines:\n${lines.join("\n")}`;
+      } catch {
+        // The log is a courtesy; the start error is what matters.
+      }
+      return text;
+    },
+    [project.id],
   );
 
-  const handleStop = useCallback(
-    () => run("Stop", () => stop(project.id)),
+  const handleStart = useCallback(
+    () => run("Start", () => start(project.id), aws ? withTaskLog : undefined),
+    [run, start, project.id, aws, withTaskLog],
+  );
+
+  /**
+   * The stop guard's question, set while it is asked: an AWS workspace with
+   * work no remote has (or one that could not be checked) is not stopped
+   * until the user picks Push, Stop anyway or Cancel.
+   */
+  const [stopGuard, setStopGuard] = useState<UnsavedWork | null>(null);
+
+  const handleStop = useCallback(async () => {
+    // A force stop of a transition skips the question: there is nothing
+    // reliable to ask yet.
+    if (aws && project.status === "running") {
+      setBusy(true);
+      let work: UnsavedWork;
+      try {
+        work = await commands.checkUnsavedWork(project.id);
+      } catch (e) {
+        work = { checked: false, repos: [], error: String(e) };
+      } finally {
+        setBusy(false);
+      }
+      if (stopGuardNeeded(work)) {
+        setStopGuard(work);
+        return undefined;
+      }
+    }
+    return run("Stop", () => stop(project.id));
+  }, [aws, project.status, project.id, run, stop]);
+
+  const resolveStopGuard = useCallback(
+    (choice: WipChoice | null) => {
+      setStopGuard(null);
+      if (choice === null) return undefined;
+      return run("Stop", () => stop(project.id, choice));
+    },
     [run, stop, project.id],
   );
 
@@ -184,6 +242,8 @@ Reset again, or remove ${resetLeftoverPronoun(outcome)} manually once stopped.`,
     backingUp,
     handleStart,
     handleStop,
+    stopGuard,
+    resolveStopGuard,
     handleReset,
     handleBackup,
     openClaudeTerminal,

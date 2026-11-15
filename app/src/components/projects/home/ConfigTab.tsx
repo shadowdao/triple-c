@@ -6,6 +6,8 @@ import ModelSection from "./config/ModelSection";
 import AccessSection from "./config/AccessSection";
 import RuntimeSection from "./config/RuntimeSection";
 import MarketplaceSection from "./config/MarketplaceSection";
+import HostSection from "./config/HostSection";
+import { isAwsProject } from "../../../lib/awsWorkspace";
 
 interface Props {
   project: Project;
@@ -40,6 +42,9 @@ export default function ConfigTab({ project, save, saveState }: Props) {
       </div>
 
       <WorkspaceSection project={project} save={save} disabled={disabled} />
+      {isAwsProject(project) && (
+        <HostSection project={project} save={save} disabled={disabled} />
+      )}
       <ModelSection project={project} save={save} disabled={disabled} />
       <AccessSection
         project={project}

@@ -16,6 +16,11 @@ import Field, {
   selectClass,
 } from "../../../ui/Field";
 import Toggle from "../../../ui/Toggle";
+import { NOT_ON_AWS, isAwsProject } from "../../../../lib/awsWorkspace";
+
+/** P6: an AWS workspace can reach a local model only over the network. */
+const LOCAL_MODEL_ON_AWS =
+  "This project runs on AWS: the URL must be reachable from the AWS task, so host.docker.internal and this machine's LAN addresses will not work.";
 
 /** Bedrock fields held in the OS keychain, never serialized back to us. */
 const BEDROCK_SECRET_KEYS = [
@@ -181,6 +186,8 @@ export default function ModelSection({ project, save, disabled }: Props) {
   // that predates it, should still pick the shared token up.
   const useSharedToken = project.use_shared_auth_token !== false;
 
+  const aws = isAwsProject(project);
+
   const handleBackendChange = (mode: Backend) => {
     const patch: Partial<Project> = { backend: mode };
     if (mode === "bedrock" && !project.bedrock_config)
@@ -212,10 +219,25 @@ export default function ModelSection({ project, save, disabled }: Props) {
             <option value="bedrock">Bedrock</option>
             <option value="ollama">Ollama</option>
             <option value="llama_cpp">llama.cpp</option>
-            <option value="open_ai_compatible">OpenAI Compatible</option>
+            <option value="open_ai_compatible" disabled={aws}>
+              {aws ? `OpenAI Compatible (gateway) — ${NOT_ON_AWS}` : "OpenAI Compatible"}
+            </option>
           </select>
         )}
       </Field>
+      {aws && project.backend === "open_ai_compatible" && (
+        <p role="note" className="text-xs text-[var(--warning)]">
+          OpenAI Compatible (gateway): {NOT_ON_AWS}. Choose another backend.
+        </p>
+      )}
+      {aws && (project.backend === "ollama" || project.backend === "llama_cpp") && (
+        <p
+          role="note"
+          className="px-2 py-1.5 text-xs text-[var(--warning)] bg-[var(--warning-muted)] border border-[var(--warning)]/30 rounded-[var(--radius-control)]"
+        >
+          {LOCAL_MODEL_ON_AWS}
+        </p>
+      )}
 
       {/* Only Anthropic reads CLAUDE_CODE_OAUTH_TOKEN; the other backends
           authenticate through their own credentials entirely. */}

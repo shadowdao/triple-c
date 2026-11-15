@@ -107,6 +107,40 @@ export interface AwsWorkspaceConfig {
   task_definition_arn: string | null;
 }
 
+/** Where a new project runs: omitted (or all null) = local Docker. An AWS
+ *  project passes all three and no folders. */
+export interface NewProjectHost {
+  hostId: string | null;
+  awsPlacement: AwsPlacement | null;
+  aws: AwsWorkspaceConfig | null;
+}
+
+export interface RemoveProjectOptions {
+  /** AWS: also delete the workspace's saved files (its EFS access point). */
+  discardData?: boolean;
+  /** AWS: the connection is gone; remove the project and leave its AWS resources. */
+  forgetAwsResources?: boolean;
+}
+
+/** What Stop does with an AWS workspace's unsaved git work (Rust `WipChoice`). */
+export type WipChoice = "push" | "discard";
+
+/** One repository line of `triple-c-wip-push --dry-run` (Rust `RepoState`). */
+export interface RepoState {
+  folder: string;
+  dirty: boolean;
+  unpushed: number;
+  branch: string;
+}
+
+/** What `checkUnsavedWork` found (Rust `UnsavedWork`). `checked: false` (with
+ *  `error`) when the workspace could not be asked. */
+export interface UnsavedWork {
+  checked: boolean;
+  repos: RepoState[];
+  error: string | null;
+}
+
 export type ProjectStatus =
   | "stopped"
   | "starting"
