@@ -1,11 +1,14 @@
 //! The IAM policies Triple-C ships for each permission tier
-//! (`aws/policies/*.json` at the repo root), and the table of
-//! representative checks the permission check simulates against them.
+//! (`aws/policies/*.json` at the repo root), the permissions boundary every
+//! Triple-C-created role must carry, and the table of representative checks
+//! the permission check simulates against the tier policies.
 //!
 //! The table and the JSON are kept in lock-step by the tests below: every
-//! action in a policy has a check, every check is allowed by its policy under
-//! a small IAM-style evaluator, and every owner-scoped check is *denied* when
-//! the resource belongs to someone else.
+//! allowed action in a policy has a check, every check is allowed by its
+//! policy under a small IAM-style evaluator, every owner-scoped check is
+//! *denied* when the resource belongs to someone else, and the admin tier can
+//! neither create unbounded roles nor destroy resources that aren't
+//! Triple-C's.
 
 use serde::{Deserialize, Serialize};
 
@@ -24,13 +27,23 @@ pub fn policy_json(tier: Tier) -> &'static str {
     }
 }
 
+/// The managed policy (no path) every role an environment admin creates must
+/// carry as its permissions boundary.
+pub const PERMISSIONS_BOUNDARY_NAME: &str = "triple-c-permissions-boundary";
+
+/// The document for [`PERMISSIONS_BOUNDARY_NAME`]: the most any
+/// Triple-C-created role may ever hold.
+pub fn permissions_boundary_json() -> &'static str {
+    include_str!("../../../../aws/policies/permissions-boundary.json")
+}
+
 /// A context value sent with a simulated request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextValue {
     /// The caller's `aws:userid` (the owner ID every per-user resource is
     /// tagged with).
     OwnerId,
-    /// A fixed value. `{region}` and `{account}` are substituted exactly as in
+    /// A fixed value. Placeholders are substituted exactly as in
     /// [`Check::resource`] — use [`render`].
     Literal(&'static str),
 }
@@ -40,17 +53,31 @@ pub enum ContextValue {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Check {
     pub action: &'static str,
-    /// An ARN template; `{region}` and `{account}` are substituted ([`render`]).
+    /// An ARN template ([`render`]).
     pub resource: &'static str,
     pub context: &'static [(&'static str, ContextValue)],
     pub write: bool,
 }
 
-/// Substitutes `{region}` and `{account}` in a resource or literal template.
-pub fn render(template: &str, region: &str, account: &str) -> String {
+/// What a resource or literal template's placeholders stand for.
+#[derive(Debug, Clone, Copy)]
+pub struct Placeholders<'a> {
+    /// `{region}`
+    pub region: &'a str,
+    /// `{account}`
+    pub account: &'a str,
+    /// `{principal}`: the caller's IAM user or role ARN (the simulation's
+    /// `PolicySourceArn`, which is what `${aws:PrincipalArn}` resolves to).
+    pub principal: &'a str,
+}
+
+/// Substitutes `{region}`, `{account}` and `{principal}` in a resource or
+/// [`ContextValue::Literal`] template.
+pub fn render(template: &str, p: &Placeholders) -> String {
     template
-        .replace("{region}", region)
-        .replace("{account}", account)
+        .replace("{region}", p.region)
+        .replace("{account}", p.account)
+        .replace("{principal}", p.principal)
 }
 
 pub fn checks(tier: Tier) -> &'static [Check] {
@@ -62,10 +89,28 @@ pub fn checks(tier: Tier) -> &'static [Check] {
 
 use ContextValue::{Literal, OwnerId};
 
+type Context = &'static [(&'static str, ContextValue)];
+
 const OWNER_REQUEST_TAG: &str = "aws:RequestTag/triple-c:owner";
 const OWNER_RESOURCE_TAG: &str = "aws:ResourceTag/triple-c:owner";
 /// The tag SSM puts on a session; its value is the starter's `aws:userid`.
 const SESSION_OWNER: &str = "ssm:resourceTag/aws:ssmmessages:session-id";
+
+/// `${aws:PrincipalArn}` in a Resource resolves from this context entry.
+const OWN_PRINCIPAL: Context = &[("aws:PrincipalArn", Literal("{principal}"))];
+/// Role writes name the boundary; `${aws:PrincipalAccount}` resolves from
+/// the second entry.
+const WITH_BOUNDARY: Context = &[
+    (
+        "iam:PermissionsBoundary",
+        Literal("arn:aws:iam::{account}:policy/triple-c-permissions-boundary"),
+    ),
+    ("aws:PrincipalAccount", Literal("{account}")),
+];
+/// Created resources carry `triple-c:component`; destroyed ones must.
+const COMPONENT_REQUESTED: Context =
+    &[("aws:RequestTag/triple-c:component", Literal("environment"))];
+const COMPONENT_TAGGED: Context = &[("aws:ResourceTag/triple-c:component", Literal("environment"))];
 
 const PROBE_CLUSTER: &str = "arn:aws:ecs:{region}:{account}:cluster/triple-c-probe";
 const PROBE_TASK: &str =
@@ -76,18 +121,21 @@ const PROBE_ROLE: &str = "arn:aws:iam::{account}:role/triple-c-probe";
 const PROBE_SECRET: &str =
     "arn:aws:secretsmanager:{region}:{account}:secret:triple-c/probe/probe-AbCdEf";
 const PROBE_KEY: &str = "arn:aws:kms:{region}:{account}:key/00000000-0000-0000-0000-000000000000";
+const PROBE_ALIAS: &str = "arn:aws:kms:{region}:{account}:alias/triple-c-probe";
 const PROBE_LOG_GROUP: &str = "arn:aws:logs:{region}:{account}:log-group:/triple-c/probe";
 const PROBE_PARAMETER: &str =
     "arn:aws:ssm:{region}:{account}:parameter/triple-c/environments/probe";
 const PROBE_STACK: &str = "arn:aws:cloudformation:{region}:{account}:stack/triple-c-probe/00000000-0000-0000-0000-000000000000";
 const PROBE_FILE_SYSTEM: &str =
     "arn:aws:elasticfilesystem:{region}:{account}:file-system/fs-00000000";
+const PROBE_ACCESS_POINT: &str =
+    "arn:aws:elasticfilesystem:{region}:{account}:access-point/fsap-00000000000000000";
+const PROBE_SECURITY_GROUP: &str =
+    "arn:aws:ec2:{region}:{account}:security-group/sg-00000000000000000";
+const PROBE_VPC: &str = "arn:aws:ec2:{region}:{account}:vpc/vpc-00000000000000000";
+const PROBE_SESSION: &str = "arn:aws:ssm:{region}:{account}:session/probe-0123456789abcdef0";
 
-const fn write(
-    action: &'static str,
-    resource: &'static str,
-    context: &'static [(&'static str, ContextValue)],
-) -> Check {
+const fn write(action: &'static str, resource: &'static str, context: Context) -> Check {
     Check {
         action,
         resource,
@@ -96,11 +144,11 @@ const fn write(
     }
 }
 
-const fn read(action: &'static str, resource: &'static str) -> Check {
+const fn read(action: &'static str, resource: &'static str, context: Context) -> Check {
     Check {
         action,
         resource,
-        context: &[],
+        context,
         write: false,
     }
 }
@@ -111,6 +159,8 @@ const WORKSPACE_USER_CHECKS: &[Check] = &[
         PROBE_TASK_DEFINITION,
         &[
             (OWNER_REQUEST_TAG, OwnerId),
+            // The definition names the task role, so it must be the caller's.
+            (OWNER_RESOURCE_TAG, OwnerId),
             ("ecs:cluster", Literal(PROBE_CLUSTER)),
         ],
     ),
@@ -149,12 +199,12 @@ const WORKSPACE_USER_CHECKS: &[Check] = &[
     ),
     write(
         "ssm:TerminateSession",
-        "arn:aws:ssm:{region}:{account}:session/probe-0123456789abcdef0",
+        PROBE_SESSION,
         &[(SESSION_OWNER, OwnerId)],
     ),
     write(
         "ssm:ResumeSession",
-        "arn:aws:ssm:{region}:{account}:session/probe-0123456789abcdef0",
+        PROBE_SESSION,
         &[(SESSION_OWNER, OwnerId)],
     ),
     write(
@@ -179,6 +229,27 @@ const WORKSPACE_USER_CHECKS: &[Check] = &[
         &[(OWNER_RESOURCE_TAG, OwnerId)],
     ),
     write(
+        "elasticfilesystem:CreateAccessPoint",
+        PROBE_FILE_SYSTEM,
+        &[(OWNER_REQUEST_TAG, OwnerId)],
+    ),
+    write(
+        "elasticfilesystem:TagResource",
+        PROBE_ACCESS_POINT,
+        &[
+            (OWNER_REQUEST_TAG, OwnerId),
+            (
+                "elasticfilesystem:CreateAction",
+                Literal("CreateAccessPoint"),
+            ),
+        ],
+    ),
+    write(
+        "elasticfilesystem:DeleteAccessPoint",
+        PROBE_ACCESS_POINT,
+        &[(OWNER_RESOURCE_TAG, OwnerId)],
+    ),
+    write(
         "kms:Encrypt",
         PROBE_KEY,
         &[(
@@ -194,38 +265,43 @@ const WORKSPACE_USER_CHECKS: &[Check] = &[
             Literal("secretsmanager.{region}.amazonaws.com"),
         )],
     ),
-    read("ecs:DescribeClusters", PROBE_CLUSTER),
-    read("ecs:ListClusters", "*"),
-    read("ssm:GetParametersByPath", PROBE_PARAMETER),
-    read("cloudformation:DescribeStacks", "*"),
-    read("cloudformation:ListStacks", "*"),
-    read("secretsmanager:ListSecrets", "*"),
-    read("elasticfilesystem:DescribeAccessPoints", "*"),
+    read("iam:GetRole", "{principal}", OWN_PRINCIPAL),
+    read("iam:SimulatePrincipalPolicy", "{principal}", OWN_PRINCIPAL),
+    read("ecs:DescribeClusters", PROBE_CLUSTER, &[]),
+    read("ecs:ListClusters", "*", &[]),
+    read("ssm:GetParametersByPath", PROBE_PARAMETER, &[]),
+    read("cloudformation:DescribeStacks", "*", &[]),
+    read("cloudformation:ListStacks", "*", &[]),
+    read("secretsmanager:ListSecrets", "*", &[]),
+    read("elasticfilesystem:DescribeAccessPoints", "*", &[]),
     read(
         "logs:GetLogEvents",
         "arn:aws:logs:{region}:{account}:log-group:/triple-c/probe:log-stream:probe",
+        &[],
     ),
-    read("logs:FilterLogEvents", PROBE_LOG_GROUP),
-    read("sts:GetCallerIdentity", "*"),
+    read("logs:FilterLogEvents", PROBE_LOG_GROUP, &[]),
+    read("sts:GetCallerIdentity", "*", &[]),
 ];
 
 const ENVIRONMENT_ADMIN_CHECKS: &[Check] = &[
     write("cloudformation:CreateStack", PROBE_STACK, &[]),
     write("cloudformation:UpdateStack", PROBE_STACK, &[]),
     write("cloudformation:DeleteStack", PROBE_STACK, &[]),
-    write("iam:CreateRole", PROBE_ROLE, &[]),
+    write("iam:CreateRole", PROBE_ROLE, WITH_BOUNDARY),
+    write("iam:PutRolePolicy", PROBE_ROLE, WITH_BOUNDARY),
+    write("iam:DeleteRolePolicy", PROBE_ROLE, WITH_BOUNDARY),
+    write("iam:AttachRolePolicy", PROBE_ROLE, WITH_BOUNDARY),
+    write("iam:DetachRolePolicy", PROBE_ROLE, WITH_BOUNDARY),
     write("iam:DeleteRole", PROBE_ROLE, &[]),
-    write("iam:PutRolePolicy", PROBE_ROLE, &[]),
-    write("iam:DeleteRolePolicy", PROBE_ROLE, &[]),
-    write("iam:AttachRolePolicy", PROBE_ROLE, &[]),
-    write("iam:DetachRolePolicy", PROBE_ROLE, &[]),
     write("iam:TagRole", PROBE_ROLE, &[]),
-    read("iam:GetRole", PROBE_ROLE),
+    read("iam:GetRole", PROBE_ROLE, &[]),
     write(
         "iam:PassRole",
         PROBE_ROLE,
         &[("iam:PassedToService", Literal("ecs-tasks.amazonaws.com"))],
     ),
+    read("iam:GetRole", "{principal}", OWN_PRINCIPAL),
+    read("iam:SimulatePrincipalPolicy", "{principal}", OWN_PRINCIPAL),
     write("ecs:CreateCluster", PROBE_CLUSTER, &[]),
     write("ecs:DeleteCluster", PROBE_CLUSTER, &[]),
     write("ecs:PutClusterCapacityProviders", PROBE_CLUSTER, &[]),
@@ -241,47 +317,82 @@ const ENVIRONMENT_ADMIN_CHECKS: &[Check] = &[
     ),
     write("ecs:RegisterTaskDefinition", "*", &[]),
     write("ecs:DeregisterTaskDefinition", "*", &[]),
-    write("ec2:CreateSecurityGroup", "*", &[]),
-    write("ec2:DeleteSecurityGroup", "*", &[]),
-    write("ec2:AuthorizeSecurityGroupIngress", "*", &[]),
-    write("ec2:RevokeSecurityGroupIngress", "*", &[]),
-    write("ec2:CreateTags", "*", &[]),
-    read("ec2:DescribeSecurityGroups", "*"),
-    write("elasticfilesystem:CreateFileSystem", PROBE_FILE_SYSTEM, &[]),
-    write("elasticfilesystem:DeleteFileSystem", PROBE_FILE_SYSTEM, &[]),
+    // CreateSecurityGroup is authorized against the new group and the VPC.
+    write(
+        "ec2:CreateSecurityGroup",
+        PROBE_SECURITY_GROUP,
+        COMPONENT_REQUESTED,
+    ),
+    write("ec2:CreateSecurityGroup", PROBE_VPC, &[]),
+    write(
+        "ec2:CreateTags",
+        PROBE_SECURITY_GROUP,
+        &[("ec2:CreateAction", Literal("CreateSecurityGroup"))],
+    ),
+    write("ec2:CreateTags", PROBE_SECURITY_GROUP, COMPONENT_TAGGED),
+    write(
+        "ec2:DeleteSecurityGroup",
+        PROBE_SECURITY_GROUP,
+        COMPONENT_TAGGED,
+    ),
+    write(
+        "ec2:AuthorizeSecurityGroupIngress",
+        PROBE_SECURITY_GROUP,
+        COMPONENT_TAGGED,
+    ),
+    write(
+        "ec2:RevokeSecurityGroupIngress",
+        PROBE_SECURITY_GROUP,
+        COMPONENT_TAGGED,
+    ),
+    read("ec2:DescribeSecurityGroups", "*", &[]),
+    write(
+        "elasticfilesystem:CreateFileSystem",
+        PROBE_FILE_SYSTEM,
+        COMPONENT_REQUESTED,
+    ),
+    write(
+        "elasticfilesystem:TagResource",
+        PROBE_FILE_SYSTEM,
+        &[(
+            "elasticfilesystem:CreateAction",
+            Literal("CreateFileSystem"),
+        )],
+    ),
+    write(
+        "elasticfilesystem:TagResource",
+        PROBE_FILE_SYSTEM,
+        COMPONENT_TAGGED,
+    ),
+    write(
+        "elasticfilesystem:DeleteFileSystem",
+        PROBE_FILE_SYSTEM,
+        COMPONENT_TAGGED,
+    ),
     write(
         "elasticfilesystem:CreateMountTarget",
         PROBE_FILE_SYSTEM,
-        &[],
+        COMPONENT_TAGGED,
     ),
     write(
         "elasticfilesystem:DeleteMountTarget",
         PROBE_FILE_SYSTEM,
-        &[],
+        COMPONENT_TAGGED,
     ),
     write(
         "elasticfilesystem:PutFileSystemPolicy",
         PROBE_FILE_SYSTEM,
-        &[],
+        COMPONENT_TAGGED,
     ),
-    write("elasticfilesystem:TagResource", PROBE_FILE_SYSTEM, &[]),
-    write("kms:CreateKey", "*", &[]),
-    write("kms:ScheduleKeyDeletion", PROBE_KEY, &[]),
-    write("kms:PutKeyPolicy", PROBE_KEY, &[]),
-    write("kms:TagResource", PROBE_KEY, &[]),
+    write("kms:CreateKey", "*", COMPONENT_REQUESTED),
+    write("kms:ScheduleKeyDeletion", PROBE_KEY, COMPONENT_TAGGED),
+    write("kms:PutKeyPolicy", PROBE_KEY, COMPONENT_TAGGED),
+    write("kms:TagResource", PROBE_KEY, COMPONENT_TAGGED),
     // An alias call is authorized against both the alias and the key.
-    write(
-        "kms:CreateAlias",
-        "arn:aws:kms:{region}:{account}:alias/triple-c-probe",
-        &[],
-    ),
-    write("kms:CreateAlias", PROBE_KEY, &[]),
-    write(
-        "kms:DeleteAlias",
-        "arn:aws:kms:{region}:{account}:alias/triple-c-probe",
-        &[],
-    ),
-    write("kms:DeleteAlias", PROBE_KEY, &[]),
+    write("kms:CreateAlias", PROBE_ALIAS, &[]),
+    write("kms:CreateAlias", PROBE_KEY, COMPONENT_TAGGED),
+    write("kms:DeleteAlias", PROBE_ALIAS, &[]),
+    write("kms:DeleteAlias", PROBE_KEY, COMPONENT_TAGGED),
     write("logs:CreateLogGroup", PROBE_LOG_GROUP, &[]),
     write("logs:DeleteLogGroup", PROBE_LOG_GROUP, &[]),
     write("logs:PutRetentionPolicy", PROBE_LOG_GROUP, &[]),
@@ -298,7 +409,6 @@ const ENVIRONMENT_ADMIN_CHECKS: &[Check] = &[
     write("ecr:CreatePullThroughCacheRule", "*", &[]),
     write("ssm:PutParameter", PROBE_PARAMETER, &[]),
     write("ssm:DeleteParameter", PROBE_PARAMETER, &[]),
-    read("iam:SimulatePrincipalPolicy", "*"),
 ];
 
 #[cfg(test)]
@@ -307,8 +417,11 @@ mod tests {
     use serde_json::Value;
     use std::collections::BTreeSet;
 
-    const REGION: &str = "us-west-2";
-    const ACCOUNT: &str = "111122223333";
+    const AT: Placeholders = Placeholders {
+        region: "us-west-2",
+        account: "111122223333",
+        principal: "arn:aws:iam::111122223333:role/aws-reserved/sso.amazonaws.com/us-west-2/AWSReservedSSO_Dev_0123456789abcdef",
+    };
     const ME: &str = "AROAEXAMPLEME:alice@example.com";
     const SOMEONE_ELSE: &str = "AROAEXAMPLEOTHER:bob@example.com";
 
@@ -359,16 +472,45 @@ mod tests {
         assert!(!glob("a?c", "ac"));
     }
 
+    fn parse(name: &str, json: &str) -> Value {
+        serde_json::from_str(json).unwrap_or_else(|e| panic!("{name} is not JSON: {e}"))
+    }
+
     fn policy(tier: Tier) -> Value {
-        serde_json::from_str(policy_json(tier))
-            .unwrap_or_else(|e| panic!("{tier:?} policy is not JSON: {e}"))
+        parse(&format!("{tier:?} policy"), policy_json(tier))
+    }
+
+    fn boundary() -> Value {
+        parse("permissions boundary", permissions_boundary_json())
+    }
+
+    fn statements_of(doc: &Value) -> Vec<Value> {
+        doc["Statement"]
+            .as_array()
+            .expect("policy has no Statement array")
+            .clone()
     }
 
     fn statements(tier: Tier) -> Vec<Value> {
-        policy(tier)["Statement"]
-            .as_array()
-            .unwrap_or_else(|| panic!("{tier:?} policy has no Statement array"))
-            .clone()
+        statements_of(&policy(tier))
+    }
+
+    fn effect(stmt: &Value) -> &str {
+        stmt["Effect"].as_str().unwrap_or("<no Effect>")
+    }
+
+    fn allows(tier: Tier) -> Vec<Value> {
+        statements(tier)
+            .into_iter()
+            .filter(|s| effect(s) == "Allow")
+            .collect()
+    }
+
+    fn denies(tier: Tier) -> Vec<Value> {
+        statements(tier)
+            .into_iter()
+            .filter(|s| effect(s) == "Deny")
+            .collect()
     }
 
     /// `Action` / `Resource` / condition values: a string or an array of them.
@@ -396,31 +538,90 @@ mod tests {
     }
 
     fn rendered(check: &Check) -> String {
-        render(check.resource, REGION, ACCOUNT)
+        render(check.resource, &AT)
     }
 
-    /// Statements that name `check`'s action and one of whose resources
-    /// matches `check`'s rendered resource.
-    fn statements_for(tier: Tier, check: &Check) -> Vec<Value> {
-        let resource = rendered(check);
-        statements(tier)
-            .into_iter()
-            .filter(|s| actions(s).iter().any(|a| glob(a, check.action)))
-            .filter(|s| resources(s).iter().any(|r| glob(r, &resource)))
+    /// The request: who calls, and whose the resource / request tag is.
+    #[derive(Clone, Copy)]
+    struct Request<'a> {
+        check: &'a Check,
+        /// `${aws:userid}` of the caller.
+        caller: &'a str,
+        /// What `OwnerId` context entries carry.
+        owner: &'a str,
+    }
+
+    impl Request<'_> {
+        fn context_value(&self, key: &str) -> Option<String> {
+            self.check
+                .context
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| match v {
+                    ContextValue::OwnerId => self.owner.to_string(),
+                    ContextValue::Literal(l) => render(l, &AT),
+                })
+        }
+
+        /// Resolves `${…}` policy variables the way the simulator does: from
+        /// the request context. An unresolvable variable makes the string
+        /// match nothing (`None`).
+        fn resolve(&self, s: &str) -> Option<String> {
+            let mut out = String::new();
+            let mut rest = s;
+            while let Some(start) = rest.find("${") {
+                out.push_str(&rest[..start]);
+                let end = rest[start..].find('}').expect("unterminated ${") + start;
+                let name = &rest[start + 2..end];
+                let value = if name == "aws:userid" {
+                    Some(self.caller.to_string())
+                } else {
+                    self.context_value(name)
+                };
+                out.push_str(&value?);
+                rest = &rest[end + 1..];
+            }
+            out.push_str(rest);
+            Some(out)
+        }
+    }
+
+    /// Statements that name the action and one of whose resources matches
+    /// the rendered resource.
+    fn matching<'s>(stmts: &'s [Value], req: &Request) -> Vec<&'s Value> {
+        let resource = rendered(req.check);
+        stmts
+            .iter()
+            .filter(|s| actions(s).iter().any(|a| glob(a, req.check.action)))
+            .filter(|s| {
+                resources(s)
+                    .iter()
+                    .filter_map(|r| req.resolve(r))
+                    .any(|r| glob(&r, &resource))
+            })
             .collect()
     }
 
-    /// A deliberately small IAM evaluator for Allow statements: the
-    /// operators the shipped policies use, and nothing else (an unknown
-    /// operator fails the test rather than being ignored). `caller` is the
-    /// `${aws:userid}` of the principal; `owner` is what `OwnerId` context
-    /// entries carry (the resource's or request's owner tag).
-    fn conditions_hold(stmt: &Value, check: &Check, caller: &str, owner: &str) -> bool {
+    /// A deliberately small IAM condition evaluator: the operators the
+    /// shipped policies use, and nothing else (an unknown operator fails the
+    /// test rather than being ignored).
+    fn conditions_hold(stmt: &Value, req: &Request) -> bool {
         let Some(cond) = stmt.get("Condition") else {
             return true;
         };
         let cond = cond.as_object().expect("Condition is an object");
         cond.iter().all(|(op, entries)| {
+            let entries = entries.as_object().expect("condition block is an object");
+            if op == "Null" {
+                return entries.iter().all(|(key, want)| {
+                    let absent = req.context_value(key).is_none();
+                    match want.as_str() {
+                        Some("true") => absent,
+                        Some("false") => !absent,
+                        _ => panic!("{}: Null takes \"true\" or \"false\"", sid(stmt)),
+                    }
+                });
+            }
             let (base, if_exists) = match op.strip_suffix("IfExists") {
                 Some(b) => (b, true),
                 None => (op.as_str(), false),
@@ -431,71 +632,88 @@ mod tests {
                 other => panic!("{}: unsupported condition operator {other}", sid(stmt)),
             };
             entries
-                .as_object()
-                .expect("condition block is an object")
                 .iter()
-                .all(|(key, want)| {
-                    let supplied =
-                        check
-                            .context
-                            .iter()
-                            .find(|(k, _)| k == key)
-                            .map(|(_, v)| match v {
-                                ContextValue::OwnerId => owner.to_string(),
-                                ContextValue::Literal(l) => render(l, REGION, ACCOUNT),
-                            });
-                    match supplied {
-                        None => if_exists,
-                        Some(value) => strings(want)
-                            .iter()
-                            .map(|p| p.replace("${aws:userid}", caller))
-                            .any(|p| matches(&p, &value)),
-                    }
+                .all(|(key, want)| match req.context_value(key) {
+                    None => if_exists,
+                    Some(value) => strings(want)
+                        .iter()
+                        .filter_map(|p| req.resolve(p))
+                        .any(|p| matches(&p, &value)),
                 })
         })
     }
 
-    fn allowed(tier: Tier, check: &Check, caller: &str, owner: &str) -> bool {
-        statements_for(tier, check)
-            .iter()
-            .any(|s| conditions_hold(s, check, caller, owner))
+    fn evaluate(tier: Tier, req: Request) -> bool {
+        let stmts = statements(tier);
+        let applies = |s: &&Value| conditions_hold(s, &req);
+        let allowed = matching(&stmts, &req)
+            .into_iter()
+            .filter(|s| effect(s) == "Allow")
+            .any(|s| applies(&s));
+        let denied = matching(&stmts, &req)
+            .into_iter()
+            .filter(|s| effect(s) == "Deny")
+            .any(|s| applies(&s));
+        allowed && !denied
     }
 
-    #[test]
-    fn policies_are_valid_iam_json() {
-        for tier in TIERS {
-            let p = policy(tier);
-            assert_eq!(p["Version"], "2012-10-17", "{tier:?}");
-            let stmts = statements(tier);
-            assert!(!stmts.is_empty(), "{tier:?} has no statements");
-            let mut sids = BTreeSet::new();
-            for s in &stmts {
-                let id = s["Sid"]
-                    .as_str()
-                    .unwrap_or_else(|| panic!("{tier:?}: statement without Sid: {s}"));
+    fn allowed(tier: Tier, check: &Check, caller: &str, owner: &str) -> bool {
+        evaluate(
+            tier,
+            Request {
+                check,
+                caller,
+                owner,
+            },
+        )
+    }
+
+    fn validate_document(name: &str, doc: &Value) {
+        assert_eq!(doc["Version"], "2012-10-17", "{name}");
+        let stmts = statements_of(doc);
+        assert!(!stmts.is_empty(), "{name} has no statements");
+        let mut sids = BTreeSet::new();
+        for s in &stmts {
+            let id = s["Sid"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{name}: statement without Sid: {s}"));
+            assert!(
+                !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric()),
+                "{name}: Sid {id:?} must be non-empty alphanumeric"
+            );
+            assert!(sids.insert(id.to_string()), "{name}: duplicate Sid {id}");
+            assert!(
+                ["Allow", "Deny"].contains(&effect(s)),
+                "{name} {id}: Effect must be Allow or Deny"
+            );
+            assert!(!actions(s).is_empty(), "{name} {id}: no Action");
+            assert!(!resources(s).is_empty(), "{name} {id}: no Resource");
+            for key in s.as_object().unwrap().keys() {
                 assert!(
-                    !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric()),
-                    "{tier:?}: Sid {id:?} must be non-empty alphanumeric"
+                    ["Sid", "Effect", "Action", "Resource", "Condition"].contains(&key.as_str()),
+                    "{name} {id}: unexpected key {key} (NotAction/NotResource are not allowed)"
                 );
-                assert!(sids.insert(id.to_string()), "{tier:?}: duplicate Sid {id}");
-                assert_eq!(s["Effect"], "Allow", "{tier:?} {id}");
-                assert!(!actions(s).is_empty(), "{tier:?} {id}: no Action");
-                assert!(!resources(s).is_empty(), "{tier:?} {id}: no Resource");
-                for key in s.as_object().unwrap().keys() {
-                    assert!(
-                        ["Sid", "Effect", "Action", "Resource", "Condition"].contains(&key.as_str()),
-                        "{tier:?} {id}: unexpected key {key} (NotAction/NotResource are not allowed)"
-                    );
-                }
             }
         }
     }
 
     #[test]
+    fn policies_are_valid_iam_json() {
+        for tier in TIERS {
+            validate_document(&format!("{tier:?}"), &policy(tier));
+            assert!(!allows(tier).is_empty(), "{tier:?} allows nothing");
+        }
+        assert!(
+            denies(Tier::WorkspaceUser).is_empty(),
+            "workspace-user needs no Deny"
+        );
+        validate_document("permissions boundary", &boundary());
+    }
+
+    #[test]
     fn every_policy_action_has_a_check_and_vice_versa() {
         for tier in TIERS {
-            let policy_actions: BTreeSet<String> =
-                statements(tier).iter().flat_map(actions).collect();
+            let policy_actions: BTreeSet<String> = allows(tier).iter().flat_map(actions).collect();
             for a in &policy_actions {
                 assert!(
                     checks(tier).iter().any(|c| glob(a, c.action)),
@@ -520,9 +738,15 @@ mod tests {
     #[test]
     fn every_check_resource_matches_a_statement_resource() {
         for tier in TIERS {
+            let stmts = allows(tier);
             for c in checks(tier) {
+                let req = Request {
+                    check: c,
+                    caller: ME,
+                    owner: ME,
+                };
                 assert!(
-                    !statements_for(tier, c).is_empty(),
+                    !matching(&stmts, &req).is_empty(),
                     "{tier:?}: {} on {} matches no statement resource",
                     c.action,
                     rendered(c)
@@ -539,53 +763,37 @@ mod tests {
     /// The owner-scoped actions, and the condition key each statement must
     /// carry the owner in.
     const OWNER_SCOPED: &[(&str, &str, &str)] = &[
-        (
-            "ecs:RunTask",
-            "task-definition/",
-            "aws:RequestTag/triple-c:owner",
-        ),
-        ("ecs:TagResource", "task/", "aws:RequestTag/triple-c:owner"),
-        ("ecs:StopTask", "task/", "aws:ResourceTag/triple-c:owner"),
-        (
-            "ecs:ExecuteCommand",
-            "task/",
-            "aws:ResourceTag/triple-c:owner",
-        ),
-        (
-            "ssm:StartSession",
-            "task/",
-            "aws:ResourceTag/triple-c:owner",
-        ),
-        (
-            "ssm:TerminateSession",
-            "session/",
-            "ssm:resourceTag/aws:ssmmessages:session-id",
-        ),
-        (
-            "ssm:ResumeSession",
-            "session/",
-            "ssm:resourceTag/aws:ssmmessages:session-id",
-        ),
+        ("ecs:RunTask", "task-definition/", OWNER_REQUEST_TAG),
+        ("ecs:RunTask", "task-definition/", OWNER_RESOURCE_TAG),
+        ("ecs:TagResource", "task/", OWNER_REQUEST_TAG),
+        ("ecs:StopTask", "task/", OWNER_RESOURCE_TAG),
+        ("ecs:ExecuteCommand", "task/", OWNER_RESOURCE_TAG),
+        ("ssm:StartSession", "task/", OWNER_RESOURCE_TAG),
+        ("ssm:TerminateSession", "session/", SESSION_OWNER),
+        ("ssm:ResumeSession", "session/", SESSION_OWNER),
         ("iam:PassRole", "role/", "iam:ResourceTag/triple-c:owner"),
-        (
-            "secretsmanager:CreateSecret",
-            "secret:",
-            "aws:RequestTag/triple-c:owner",
-        ),
-        (
-            "secretsmanager:TagResource",
-            "secret:",
-            "aws:RequestTag/triple-c:owner",
-        ),
+        ("secretsmanager:CreateSecret", "secret:", OWNER_REQUEST_TAG),
+        ("secretsmanager:TagResource", "secret:", OWNER_REQUEST_TAG),
         (
             "secretsmanager:PutSecretValue",
             "secret:",
-            "aws:ResourceTag/triple-c:owner",
+            OWNER_RESOURCE_TAG,
+        ),
+        ("secretsmanager:DeleteSecret", "secret:", OWNER_RESOURCE_TAG),
+        (
+            "elasticfilesystem:CreateAccessPoint",
+            "file-system/",
+            OWNER_REQUEST_TAG,
         ),
         (
-            "secretsmanager:DeleteSecret",
-            "secret:",
-            "aws:ResourceTag/triple-c:owner",
+            "elasticfilesystem:TagResource",
+            "access-point/",
+            OWNER_REQUEST_TAG,
+        ),
+        (
+            "elasticfilesystem:DeleteAccessPoint",
+            "access-point/",
+            OWNER_RESOURCE_TAG,
         ),
     ];
 
@@ -614,9 +822,16 @@ mod tests {
                 check.context
             );
             // ...and that is the key its statement's condition uses.
-            let stmts = statements_for(Tier::WorkspaceUser, check);
+            let stmts = allows(Tier::WorkspaceUser);
+            let req = Request {
+                check,
+                caller: ME,
+                owner: ME,
+            };
+            let found = matching(&stmts, &req);
+            assert!(!found.is_empty(), "{}: no statement", check.action);
             assert!(
-                stmts
+                found
                     .iter()
                     .all(|s| s["Condition"]
                         .as_object()
@@ -635,7 +850,7 @@ mod tests {
             for c in checks(tier) {
                 assert!(
                     allowed(tier, c, ME, ME),
-                    "{tier:?}: {} on {} with {:?} is not allowed by any statement",
+                    "{tier:?}: {} on {} with {:?} is not allowed",
                     c.action,
                     rendered(c),
                     c.context
@@ -645,8 +860,8 @@ mod tests {
     }
 
     /// The spec's most important rule: nobody may stop, exec into, open a
-    /// session to, pass the role of, or touch the secrets of a workspace
-    /// they don't own.
+    /// session to, pass the role of, or touch the secrets or access points
+    /// of a workspace they don't own.
     #[test]
     fn owner_scoped_checks_are_denied_for_someone_elses_resource() {
         for (check, _) in owner_scoped_checks() {
@@ -666,8 +881,6 @@ mod tests {
                 context: &[],
                 ..*check
             };
-            // A secret with no owner tag yet is only tag-on-create, which
-            // still needs the request tag — so every case must be denied.
             assert!(
                 !allowed(Tier::WorkspaceUser, &untagged, ME, ME),
                 "{} is allowed without any owner context",
@@ -677,13 +890,47 @@ mod tests {
     }
 
     #[test]
+    fn run_task_needs_an_owned_task_definition() {
+        let run = checks(Tier::WorkspaceUser)
+            .iter()
+            .find(|c| c.action == "ecs:RunTask")
+            .expect("ecs:RunTask check");
+        let someone_elses_definition = Check {
+            context: &[
+                (OWNER_REQUEST_TAG, OwnerId),
+                (OWNER_RESOURCE_TAG, Literal(SOMEONE_ELSE)),
+                ("ecs:cluster", Literal(PROBE_CLUSTER)),
+            ],
+            ..*run
+        };
+        assert!(!allowed(
+            Tier::WorkspaceUser,
+            &someone_elses_definition,
+            ME,
+            ME
+        ));
+        let other_cluster = Check {
+            context: &[
+                (OWNER_REQUEST_TAG, OwnerId),
+                (OWNER_RESOURCE_TAG, OwnerId),
+                (
+                    "ecs:cluster",
+                    Literal("arn:aws:ecs:{region}:{account}:cluster/production"),
+                ),
+            ],
+            ..*run
+        };
+        assert!(!allowed(Tier::WorkspaceUser, &other_cluster, ME, ME));
+    }
+
+    #[test]
     fn ecs_tag_resource_only_tags_at_run_task() {
         let tag = checks(Tier::WorkspaceUser)
             .iter()
             .find(|c| c.action == "ecs:TagResource")
             .expect("ecs:TagResource check");
         let retag = Check {
-            context: &[("aws:RequestTag/triple-c:owner", ContextValue::OwnerId)],
+            context: &[(OWNER_REQUEST_TAG, OwnerId)],
             ..*tag
         };
         assert!(
@@ -692,8 +939,8 @@ mod tests {
         );
         let other_create = Check {
             context: &[
-                ("aws:RequestTag/triple-c:owner", ContextValue::OwnerId),
-                ("ecs:CreateAction", ContextValue::Literal("CreateService")),
+                (OWNER_REQUEST_TAG, OwnerId),
+                ("ecs:CreateAction", Literal("CreateService")),
             ],
             ..*tag
         };
@@ -708,11 +955,8 @@ mod tests {
             .expect("iam:PassRole check");
         let to_ec2 = Check {
             context: &[
-                ("iam:ResourceTag/triple-c:owner", ContextValue::OwnerId),
-                (
-                    "iam:PassedToService",
-                    ContextValue::Literal("ec2.amazonaws.com"),
-                ),
+                ("iam:ResourceTag/triple-c:owner", OwnerId),
+                ("iam:PassedToService", Literal("ec2.amazonaws.com")),
             ],
             ..*pass
         };
@@ -737,10 +981,7 @@ mod tests {
                 c.action
             );
             let via_s3 = Check {
-                context: &[(
-                    "kms:ViaService",
-                    ContextValue::Literal("s3.{region}.amazonaws.com"),
-                )],
+                context: &[("kms:ViaService", Literal("s3.{region}.amazonaws.com"))],
                 ..*c
             };
             assert!(
@@ -748,6 +989,288 @@ mod tests {
                 "{} allowed via S3",
                 c.action
             );
+        }
+    }
+
+    /// GetRole and SimulatePrincipalPolicy: the caller's own principal only.
+    #[test]
+    fn principal_inspection_is_only_of_the_caller() {
+        for tier in TIERS {
+            for action in ["iam:GetRole", "iam:SimulatePrincipalPolicy"] {
+                let own = checks(tier)
+                    .iter()
+                    .find(|c| c.action == action && c.resource == "{principal}")
+                    .unwrap_or_else(|| panic!("{tier:?}: no own-principal check for {action}"));
+                assert!(allowed(tier, own, ME, ME));
+                let other = Check {
+                    resource: "arn:aws:iam::{account}:role/SomeoneElsesRole",
+                    ..*own
+                };
+                assert!(
+                    !allowed(tier, &other, ME, ME),
+                    "{tier:?}: {action} allowed on another principal"
+                );
+            }
+        }
+    }
+
+    const ROLE_WRITES: &[&str] = &[
+        "iam:CreateRole",
+        "iam:PutRolePolicy",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:DeleteRolePolicy",
+    ];
+    /// Role and policy changes no tier may make at all.
+    const NEVER_ALLOWED: &[&str] = &[
+        "iam:PutRolePermissionsBoundary",
+        "iam:DeleteRolePermissionsBoundary",
+        "iam:UpdateAssumeRolePolicy",
+        "iam:CreatePolicy",
+        "iam:CreatePolicyVersion",
+        "iam:DeletePolicy",
+        "iam:DeletePolicyVersion",
+        "iam:SetDefaultPolicyVersion",
+        "iam:CreateUser",
+        "iam:AttachUserPolicy",
+        "iam:PutUserPolicy",
+    ];
+
+    #[test]
+    fn admin_role_management_requires_the_boundary() {
+        let tier = Tier::EnvironmentAdmin;
+        let boundary_arn =
+            format!("arn:aws:iam::${{aws:PrincipalAccount}}:policy/{PERMISSIONS_BOUNDARY_NAME}");
+        // Every statement granting a role write pins the boundary.
+        for s in allows(tier) {
+            if !actions(&s)
+                .iter()
+                .any(|a| ROLE_WRITES.iter().any(|w| glob(a, w)))
+            {
+                continue;
+            }
+            let pinned = s["Condition"]["StringEquals"]["iam:PermissionsBoundary"].clone();
+            assert_eq!(
+                pinned,
+                Value::String(boundary_arn.clone()),
+                "{}: role writes must require iam:PermissionsBoundary = {boundary_arn}",
+                sid(&s)
+            );
+        }
+        for action in ROLE_WRITES {
+            let c = checks(tier)
+                .iter()
+                .find(|c| c.action == *action)
+                .unwrap_or_else(|| panic!("no check for {action}"));
+            assert!(
+                c.context
+                    .iter()
+                    .any(|(k, _)| *k == "iam:PermissionsBoundary"),
+                "{action} check must send iam:PermissionsBoundary"
+            );
+            for context in [
+                &[][..],
+                &[
+                    (
+                        "iam:PermissionsBoundary",
+                        Literal("arn:aws:iam::{account}:policy/SomethingElse"),
+                    ),
+                    ("aws:PrincipalAccount", Literal("{account}")),
+                ][..],
+                &[
+                    (
+                        "iam:PermissionsBoundary",
+                        Literal("arn:aws:iam::999999999999:policy/triple-c-permissions-boundary"),
+                    ),
+                    ("aws:PrincipalAccount", Literal("{account}")),
+                ][..],
+            ] {
+                let unbounded = Check { context, ..*c };
+                assert!(
+                    !allowed(tier, &unbounded, ME, ME),
+                    "{action} allowed with boundary context {context:?}"
+                );
+            }
+        }
+        // Nothing grants the escape hatches...
+        for t in TIERS {
+            for s in allows(t) {
+                for a in actions(&s) {
+                    for never in NEVER_ALLOWED {
+                        assert!(!glob(&a, never), "{t:?} {}: {a} grants {never}", sid(&s));
+                    }
+                }
+            }
+        }
+        // ...and explicit Denies hold even if another policy grants them.
+        let denied = |action: &'static str, resource: &'static str| {
+            let c = Check {
+                action,
+                resource,
+                context: &[],
+                write: true,
+            };
+            let stmts = denies(tier);
+            let req = Request {
+                check: &c,
+                caller: ME,
+                owner: ME,
+            };
+            matching(&stmts, &req)
+                .iter()
+                .any(|s| conditions_hold(s, &req))
+        };
+        assert!(
+            denied("iam:DeleteRolePermissionsBoundary", PROBE_ROLE),
+            "missing Deny of iam:DeleteRolePermissionsBoundary on triple-c roles"
+        );
+        for action in [
+            "iam:CreatePolicyVersion",
+            "iam:DeletePolicy",
+            "iam:DeletePolicyVersion",
+            "iam:SetDefaultPolicyVersion",
+        ] {
+            assert!(
+                denied(
+                    action,
+                    "arn:aws:iam::{account}:policy/triple-c-permissions-boundary"
+                ),
+                "missing Deny of {action} on the boundary policy"
+            );
+        }
+    }
+
+    #[test]
+    fn destructive_admin_actions_are_tag_scoped() {
+        let tier = Tier::EnvironmentAdmin;
+        const CREATES: &[(&str, &str)] = &[
+            ("kms:CreateKey", "*"),
+            ("ec2:CreateSecurityGroup", PROBE_SECURITY_GROUP),
+            ("elasticfilesystem:CreateFileSystem", PROBE_FILE_SYSTEM),
+        ];
+        const DESTROYS: &[(&str, &str)] = &[
+            ("kms:ScheduleKeyDeletion", PROBE_KEY),
+            ("kms:PutKeyPolicy", PROBE_KEY),
+            ("kms:TagResource", PROBE_KEY),
+            ("kms:CreateAlias", PROBE_KEY),
+            ("kms:DeleteAlias", PROBE_KEY),
+            ("ec2:DeleteSecurityGroup", PROBE_SECURITY_GROUP),
+            ("ec2:AuthorizeSecurityGroupIngress", PROBE_SECURITY_GROUP),
+            ("ec2:RevokeSecurityGroupIngress", PROBE_SECURITY_GROUP),
+            ("ec2:CreateTags", PROBE_SECURITY_GROUP),
+            ("elasticfilesystem:DeleteFileSystem", PROBE_FILE_SYSTEM),
+            ("elasticfilesystem:PutFileSystemPolicy", PROBE_FILE_SYSTEM),
+            ("elasticfilesystem:CreateMountTarget", PROBE_FILE_SYSTEM),
+            ("elasticfilesystem:DeleteMountTarget", PROBE_FILE_SYSTEM),
+            ("elasticfilesystem:TagResource", PROBE_FILE_SYSTEM),
+        ];
+        for (list, context) in [(CREATES, COMPONENT_REQUESTED), (DESTROYS, COMPONENT_TAGGED)] {
+            for (action, resource) in list {
+                let c = checks(tier)
+                    .iter()
+                    .find(|c| c.action == *action && c.resource == *resource)
+                    .unwrap_or_else(|| panic!("no admin check for {action} on {resource}"));
+                if c.context == context {
+                    assert!(allowed(tier, c, ME, ME), "{action} with {context:?}");
+                }
+                // Without the component tag, it's someone else's resource.
+                let untagged = Check { context: &[], ..*c };
+                assert!(
+                    !allowed(tier, &untagged, ME, ME),
+                    "{action} on {resource} is allowed without a triple-c:component tag"
+                );
+            }
+        }
+        // Tagging is allowed on create only through the creating call.
+        for (action, key, wrong) in [
+            ("ec2:CreateTags", "ec2:CreateAction", "RunInstances"),
+            (
+                "elasticfilesystem:TagResource",
+                "elasticfilesystem:CreateAction",
+                "CreateAccessPoint",
+            ),
+        ] {
+            let c = checks(tier)
+                .iter()
+                .find(|c| c.action == action && c.context.iter().any(|(k, _)| *k == key))
+                .unwrap_or_else(|| panic!("no tag-on-create check for {action}"));
+            let ctx: Context = match action {
+                "ec2:CreateTags" => &[("ec2:CreateAction", Literal("RunInstances"))],
+                _ => &[(
+                    "elasticfilesystem:CreateAction",
+                    Literal("CreateAccessPoint"),
+                )],
+            };
+            let other_create = Check { context: ctx, ..*c };
+            assert!(
+                !allowed(tier, &other_create, ME, ME),
+                "{action} allowed with {key} = {wrong}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_boundary_grants_what_tasks_need_and_nothing_iam() {
+        let doc = boundary();
+        let stmts = statements_of(&doc);
+        let granted: Vec<String> = stmts
+            .iter()
+            .filter(|s| effect(s) == "Allow")
+            .flat_map(actions)
+            .collect();
+        for a in &granted {
+            assert!(
+                !a.starts_with("iam:") && a != "*" && !a.ends_with(":*"),
+                "boundary grants {a}"
+            );
+            assert!(!glob(a, "sts:AssumeRole"), "boundary grants {a}");
+        }
+        for need in [
+            "ecr:GetAuthorizationToken",
+            "ecr:BatchGetImage",
+            "ecr:GetDownloadUrlForLayer",
+            "logs:CreateLogStream",
+            "logs:PutLogEvents",
+            "ssmmessages:CreateControlChannel",
+            "ssmmessages:CreateDataChannel",
+            "ssmmessages:OpenControlChannel",
+            "ssmmessages:OpenDataChannel",
+            "secretsmanager:GetSecretValue",
+            "kms:Decrypt",
+            "elasticfilesystem:ClientMount",
+            "elasticfilesystem:ClientWrite",
+            "elasticfilesystem:ClientRootAccess",
+            "sts:GetCallerIdentity",
+            "bedrock:InvokeModel",
+            "bedrock:InvokeModelWithResponseStream",
+        ] {
+            assert!(
+                granted.iter().any(|a| glob(a, need)),
+                "boundary does not grant {need}"
+            );
+        }
+        // Secrets only through Secrets Manager, and only Triple-C's.
+        for s in &stmts {
+            let acts = actions(s);
+            if acts.iter().any(|a| glob(a, "kms:Decrypt")) {
+                assert_eq!(
+                    s["Condition"]["StringLike"]["kms:ViaService"],
+                    "secretsmanager.*.amazonaws.com",
+                    "{}",
+                    sid(s)
+                );
+            }
+            if acts
+                .iter()
+                .any(|a| glob(a, "secretsmanager:GetSecretValue"))
+            {
+                assert_eq!(
+                    resources(s),
+                    vec!["arn:aws:secretsmanager:*:*:secret:triple-c/*".to_string()],
+                    "{}",
+                    sid(s)
+                );
+            }
         }
     }
 
