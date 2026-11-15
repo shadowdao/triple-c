@@ -21,3 +21,19 @@ export function toAwsError(e: unknown): AwsError {
   }
   return { kind: "other", message: typeof e === "string" ? e : e instanceof Error ? e.message : "Unknown error" };
 }
+
+/** Human-readable copy for a failed AWS command; never raw JSON. */
+export function awsErrorMessage(e: AwsError): string {
+  switch (e.kind) {
+    case "sso_expired":
+      return `Your SSO session for profile ${e.profile} has expired.`;
+    case "profile_not_found":
+      return `Profile ${e.profile} was not found in your AWS config, or has no credentials.`;
+    case "keys_missing":
+      return "The access keys for this connection are missing from the keychain. Remove and re-add the connection.";
+    case "state_bucket_taken":
+      return `The state bucket name ${e.bucket} is already taken by another AWS account.`;
+    default:
+      return e.message;
+  }
+}

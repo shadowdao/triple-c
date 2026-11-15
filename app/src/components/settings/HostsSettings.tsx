@@ -5,49 +5,28 @@ import {
   addAwsProfileConnection,
   awsConnectionIdentity,
   awsConnectionSsoLogin,
-  awsPolicyDocument,
   checkAwsPermissions,
   listAwsProfiles,
   removeHostConnection,
   updateAwsConnection,
 } from "../../lib/tauri-commands";
-import { toAwsError } from "../../lib/aws-error";
+import { awsErrorMessage, toAwsError } from "../../lib/aws-error";
+import PolicyFiles from "./hosts/PolicyFiles";
+import EnvironmentsPanel from "./hosts/EnvironmentsPanel";
+import { COMMON_REGIONS } from "./hosts/environmentFormat";
 import type {
   AwsError,
   HostConnection,
   PermissionReport,
   PermissionSummary,
   PolicyFile,
-  Tier,
 } from "../../lib/types";
 import Button from "../ui/Button";
 import SegmentedControl from "../ui/SegmentedControl";
 import Field, { inputClass, selectClass } from "../ui/Field";
 
-const COMMON_REGIONS = [
-  "us-east-1", "us-east-2", "us-west-1", "us-west-2", "ca-central-1",
-  "eu-west-1", "eu-west-2", "eu-west-3", "eu-central-1", "eu-north-1",
-  "ap-southeast-1", "ap-southeast-2", "ap-northeast-1", "ap-northeast-2", "ap-south-1",
-  "sa-east-1",
-];
 
 const OWN_PRINCIPAL_ACTIONS = ["iam:GetRole", "iam:SimulatePrincipalPolicy"];
-
-/** Human-readable copy for a failed AWS command; never raw JSON. */
-export function awsErrorMessage(e: AwsError): string {
-  switch (e.kind) {
-    case "sso_expired":
-      return `Your SSO session for profile ${e.profile} has expired.`;
-    case "profile_not_found":
-      return `Profile ${e.profile} was not found in your AWS config, or has no credentials.`;
-    case "keys_missing":
-      return "The access keys for this connection are missing from the keychain. Remove and re-add the connection.";
-    case "state_bucket_taken":
-      return `The state bucket name ${e.bucket} is already taken by another AWS account.`;
-    default:
-      return e.message;
-  }
-}
 
 const SUMMARY_LABEL: Record<PermissionSummary, string> = {
   environment_admin: "Environment admin",
@@ -92,70 +71,6 @@ function ErrorLine({
           {signingIn ? "Signing in…" : "Sign in"}
         </Button>
       )}
-    </div>
-  );
-}
-
-/** A tier's policy files, loaded on demand: each one shown and copied on its own. */
-function PolicyFiles({
-  tier,
-  label,
-  onCopy,
-}: {
-  tier: Tier;
-  label: string;
-  onCopy: (file: PolicyFile) => void;
-}) {
-  const [files, setFiles] = useState<PolicyFile[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  const load = async () => {
-    setError(null);
-    try {
-      setFiles(await awsPolicyDocument(tier));
-    } catch (e) {
-      setError(`Could not load the policy: ${awsErrorMessage(toAwsError(e))}`);
-    }
-  };
-
-  if (!files) {
-    return (
-      <div className="space-y-1">
-        <Button size="sm" onClick={load}>
-          {label}
-        </Button>
-        {error && (
-          <p role="alert" className="text-xs text-[var(--error)]">
-            {error}
-          </p>
-        )}
-      </div>
-    );
-  }
-  return (
-    <div className="space-y-1 text-xs">
-      <p className="text-[var(--text-secondary)]">
-        {tier === "workspace_user" ? "Workspace user" : "Environment admin"}:{" "}
-        {files.length === 1
-          ? "attach this file as a customer managed policy."
-          : `Attach all ${files.length} files, each as its own customer managed policy.`}
-      </p>
-      {files.map((f) => (
-        <div key={f.name} className="space-y-1">
-          <div className="flex items-center gap-2">
-            <span className="font-mono text-[var(--text-primary)]">{f.name}</span>
-            <Button size="sm" aria-label={`Copy ${f.name}`} onClick={() => onCopy(f)}>
-              Copy
-            </Button>
-          </div>
-          <details>
-            <summary className="cursor-pointer text-[var(--text-secondary)]">Show JSON</summary>
-            <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap break-all text-[var(--text-secondary)]">
-              {f.json}
-            </pre>
-          </details>
-        </div>
-      ))}
     </div>
   );
 }
@@ -399,6 +314,7 @@ function ConnectionRow({ host }: { host: HostConnection }) {
       {busy && !editing && !confirmRemove && <p role="status" className="text-xs text-[var(--text-secondary)]">Working…</p>}
       {failure && <ErrorLine failure={failure} onSignIn={signIn} signingIn={signingIn} />}
       {report && <PermissionReportView report={report} />}
+      <EnvironmentsPanel connection={host} tier={report?.summary} />
     </li>
   );
 }
@@ -591,7 +507,7 @@ export default function HostsSettings() {
   return (
     <div className="space-y-3">
       <p className="text-xs text-[var(--text-secondary)] leading-snug">
-        Where project environments run. AWS connections are used to check what your credentials can do.
+        Where project environments run. AWS connections check what your credentials can do, and find, deploy and join environments.
       </p>
       <ul className="space-y-2">
         <li className="border border-[var(--border-color)] rounded-[var(--radius-control)] p-2.5">
