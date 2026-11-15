@@ -26,6 +26,10 @@ import SegmentedControl from "../ui/SegmentedControl";
 import Field, { inputClass, selectClass } from "../ui/Field";
 
 
+/** AWS throttles the permission simulator; a check retries patiently instead of failing. */
+export const CHECK_IN_PROGRESS =
+  "Checking permissions… AWS limits how fast this can run, so it can take up to a few minutes.";
+
 const OWN_PRINCIPAL_ACTIONS = ["iam:GetRole", "iam:SimulatePrincipalPolicy"];
 
 const SUMMARY_LABEL: Record<PermissionSummary, string> = {
@@ -184,6 +188,7 @@ function ConnectionRow({ host }: { host: HostConnection }) {
   const [region, setRegion] = useState(host.kind.default_region);
   const [confirmRemove, setConfirmRemove] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [checking, setChecking] = useState(false);
   const [signingIn, setSigningIn] = useState(false);
   const [report, setReport] = useState<PermissionReport | null>(null);
   const [failure, setFailure] = useState<Failure | null>(null);
@@ -201,6 +206,7 @@ function ConnectionRow({ host }: { host: HostConnection }) {
 
   const runCheck = async () => {
     setBusy(true);
+    setChecking(true);
     setFailure(null);
     try {
       setReport(await checkAwsPermissions(host.id));
@@ -208,6 +214,7 @@ function ConnectionRow({ host }: { host: HostConnection }) {
       setReport(null);
       setFailure({ error: toAwsError(e), retry: runCheck });
     } finally {
+      setChecking(false);
       setBusy(false);
     }
   };
@@ -311,7 +318,11 @@ function ConnectionRow({ host }: { host: HostConnection }) {
           </Button>
         </div>
       )}
-      {busy && !editing && !confirmRemove && <p role="status" className="text-xs text-[var(--text-secondary)]">Working…</p>}
+      {busy && !editing && !confirmRemove && (
+        <p role="status" className="text-xs text-[var(--text-secondary)]">
+          {checking ? CHECK_IN_PROGRESS : "Working…"}
+        </p>
+      )}
       {failure && <ErrorLine failure={failure} onSignIn={signIn} signingIn={signingIn} />}
       {report && <PermissionReportView report={report} />}
       <EnvironmentsPanel connection={host} tier={report?.summary} />

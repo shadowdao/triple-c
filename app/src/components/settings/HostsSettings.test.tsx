@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import HostsSettings from "./HostsSettings";
+import HostsSettings, { CHECK_IN_PROGRESS } from "./HostsSettings";
 import { useAppState } from "../../store/appState";
 import type { AppSettings, HostConnection, PermissionReport } from "../../lib/types";
 
@@ -138,6 +138,21 @@ describe("HostsSettings", () => {
     );
     expect(screen.getByLabelText("Access key ID")).toHaveValue("");
     expect(screen.getByLabelText("Secret access key")).toHaveValue("");
+  });
+
+  it("tells the user a permission check can take a few minutes while it runs", async () => {
+    let finish: (r: PermissionReport) => void = () => {};
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_aws_profiles") return [];
+      if (cmd === "check_aws_permissions") return new Promise<PermissionReport>((res) => (finish = res));
+      throw new Error(`unexpected ${cmd}`);
+    });
+    render(<HostsSettings />);
+    fireEvent.click(screen.getByRole("button", { name: "Check Prod" }));
+    expect(await screen.findByRole("status")).toHaveTextContent(CHECK_IN_PROGRESS);
+    finish(report({}));
+    expect(await screen.findByText("Insufficient")).toBeInTheDocument();
+    expect(screen.queryByText(CHECK_IN_PROGRESS)).not.toBeInTheDocument();
   });
 
   it("check shows Insufficient with the denied actions and every policy file to copy", async () => {
