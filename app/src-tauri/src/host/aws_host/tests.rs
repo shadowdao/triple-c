@@ -214,12 +214,6 @@ impl RuntimeApi for Fake {
         self.log(format!("ap-state {id}"));
         Ok(Some("available".into()))
     }
-    async fn deregister_task_definition(&self, _arn: &str) -> Result<(), AwsError> {
-        Ok(())
-    }
-    async fn delete_task_definitions(&self, _arns: &[String]) -> Result<(), AwsError> {
-        Ok(())
-    }
     async fn delete_secret(&self, _name: &str) -> Result<(), AwsError> {
         Ok(())
     }

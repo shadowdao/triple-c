@@ -51,14 +51,6 @@ pub trait RuntimeApi: Send + Sync {
         &self,
         id: &str,
     ) -> impl Future<Output = Result<Option<String>, AwsError>> + Send;
-    fn deregister_task_definition(
-        &self,
-        arn: &str,
-    ) -> impl Future<Output = Result<(), AwsError>> + Send;
-    fn delete_task_definitions(
-        &self,
-        arns: &[String],
-    ) -> impl Future<Output = Result<(), AwsError>> + Send;
     /// Schedule deletion with a [`SECRET_RECOVERY_DAYS`] window. A secret
     /// that does not exist is success.
     fn delete_secret(&self, name: &str) -> impl Future<Output = Result<(), AwsError>> + Send;
@@ -247,9 +239,9 @@ pub struct RemoveRequest<'a> {
     pub discard_data: bool,
 }
 
-/// Stop the project's task, retire its task definition revisions, schedule
-/// its secret for deletion (7 days) and, with `discard_data`, delete its
-/// access point. A task that can't be stopped stops the removal (nothing
+/// Stop the project's task, schedule its secret for deletion (7 days) and,
+/// with `discard_data`, delete its access point. Task definition revisions
+/// are left registered (R8). A task that can't be stopped stops the removal (nothing
 /// billed may be left running); the rest is attempted in full and every
 /// failure reported.
 pub async fn remove_workspace_resources<T: TaskApi, W: WorkspaceApi, R: RuntimeApi>(
@@ -276,34 +268,17 @@ pub async fn remove_workspace_resources<T: TaskApi, W: WorkspaceApi, R: RuntimeA
 
     let mut failures: Vec<String> = Vec::new();
 
-    // 2. Task definition revisions the caller registered for this project.
-    let mut retired = Vec::new();
-    match work.task_definition_revisions(&family).await {
-        Ok(revisions) => {
-            for arn in revisions {
-                match work.describe_task_definition(&arn).await {
-                    Ok(Some(d))
-                        if d.owner.as_deref() == Some(req.owner_user_id)
-                            && d.project.as_deref() == Some(req.project_id) =>
-                    {
-                        match rt.deregister_task_definition(&d.arn).await {
-                            Ok(()) => retired.push(d.arn),
-                            Err(e) => failures.push(format!("task definition {}: {e}", d.arn)),
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(e) => failures.push(format!("task definition {arn}: {e}")),
-                }
-            }
-        }
-        Err(e) => failures.push(format!("task definitions: {e}")),
-    }
-    // DeleteTaskDefinitions takes at most 10 at a time.
-    for chunk in retired.chunks(10) {
-        if let Err(e) = rt.delete_task_definitions(chunk).await {
-            failures.push(format!("deleting retired task definitions: {e}"));
-        }
-    }
+    // 2. Task definition revisions are left ACTIVE (ruling R8): ECS
+    // authorizes `DeregisterTaskDefinition` against `*` only, with no tag
+    // condition, so the workspace tier can't retire just its own. They are
+    // inert (no secret values, only the secret's ARN) and free, and
+    // `RunOwnTasks` still requires the owner tag, so nobody else can run
+    // them. An admin can deregister them (`aws/README.md`).
+    log::info!(
+        "Project {}: its task definition revisions ({family}:*) are left registered; an \
+         administrator can deregister them",
+        req.project_id
+    );
 
     // 3. The secret.
     let secret = project_secret_name(req.env, req.owner_key, req.project_id);
@@ -363,7 +338,6 @@ pub struct SdkRuntimeApi {
     iam: aws_sdk_iam::Client,
     secrets: aws_sdk_secretsmanager::Client,
     efs: aws_sdk_efs::Client,
-    ecs: aws_sdk_ecs::Client,
 }
 
 impl SdkRuntimeApi {
@@ -373,7 +347,6 @@ impl SdkRuntimeApi {
             iam: aws_sdk_iam::Client::new(cfg),
             secrets: aws_sdk_secretsmanager::Client::new(cfg),
             efs: aws_sdk_efs::Client::new(cfg),
-            ecs: aws_sdk_ecs::Client::new(cfg),
         }
     }
 }
@@ -435,44 +408,6 @@ impl RuntimeApi for SdkRuntimeApi {
                 Ok(None)
             }
             Err(e) => Err(classify_sdk_error(ACTION, &e)),
-        }
-    }
-
-    async fn deregister_task_definition(&self, arn: &str) -> Result<(), AwsError> {
-        const ACTION: &str = "ecs:DeregisterTaskDefinition";
-        self.ecs
-            .deregister_task_definition()
-            .task_definition(arn)
-            .send()
-            .await
-            .map_err(|e| classify_sdk_error(ACTION, &e))?;
-        Ok(())
-    }
-
-    async fn delete_task_definitions(&self, arns: &[String]) -> Result<(), AwsError> {
-        const ACTION: &str = "ecs:DeleteTaskDefinitions";
-        let out = self
-            .ecs
-            .delete_task_definitions()
-            .set_task_definitions(Some(arns.to_vec()))
-            .send()
-            .await
-            .map_err(|e| classify_sdk_error(ACTION, &e))?;
-        let failed: Vec<String> = out
-            .failures()
-            .iter()
-            .map(|f| {
-                format!(
-                    "{} ({})",
-                    f.arn().unwrap_or("?"),
-                    f.reason().unwrap_or("no reason given")
-                )
-            })
-            .collect();
-        if failed.is_empty() {
-            Ok(())
-        } else {
-            Err(other(format!("{ACTION} failed for {}", failed.join(", "))))
         }
     }
 

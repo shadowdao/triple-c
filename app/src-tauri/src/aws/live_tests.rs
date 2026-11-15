@@ -2269,7 +2269,8 @@ mod environment {
                 eprintln!("RESULT task 2 stop log lines: {tail2:#?}");
                 assert!(log2.iter().any(|l| l.contains("entrypoint: stopping (idle)")), "{log2:#?}");
 
-                // ── remove: the project's resources, data discarded ──
+                // ── remove: the task, the secret and (data discarded) the access
+                // point; the task definition is left (R8) ──
                 store.set_aws_runtime(&id, None, aws2.access_point_id.clone(), aws2.task_definition_arn.clone()).unwrap();
                 // Every step runs even when one fails (the failures are
                 // reported together), so check them all before the result.
@@ -2296,7 +2297,9 @@ mod environment {
                 eprintln!("RESULT access point after remove: {:?}", gone.as_ref().map(|o| o.access_points().len()).map_err(|e| format!("{e:?}").chars().take(120).collect::<String>()));
                 assert!(gone.is_err() || gone.unwrap().access_points().iter().all(|a| a.life_cycle_state() != Some(&aws_sdk_efs::types::LifeCycleState::Available)));
                 removed.expect("remove the project's resources");
-                assert!(defs.task_definition_arns().is_empty(), "active revisions left: {:?}", defs.task_definition_arns());
+                // R8: the revisions stay registered for an admin to clear
+                // (the guard does, as the account admin).
+                assert_eq!(defs.task_definition_arns(), [revision1.clone()], "the project's revision is left ACTIVE");
             };
             let result = std::panic::AssertUnwindSafe(body).catch_unwind().await;
             let guard = std::mem::take(&mut *p5.lock().unwrap());

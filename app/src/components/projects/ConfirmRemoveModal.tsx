@@ -48,8 +48,9 @@ export default function ConfirmRemoveModal({
           <p className="text-[13px] text-[var(--text-secondary)]">
             Are you sure you want to remove{" "}
             <strong className="text-[var(--text-primary)]">{projectName}</strong>? This stops its
-            workspace on AWS and removes its task definitions and its secret (the secret is
-            deleted after AWS&rsquo;s 7-day recovery window). Work that was not pushed to a
+            workspace on AWS and removes its secret (deleted after AWS&rsquo;s 7-day recovery
+            window). Its task definitions stay registered (they hold no secrets and cost
+            nothing); an administrator can deregister them. Work that was not pushed to a
             remote is lost.
           </p>
           {savedFiles && (

@@ -669,8 +669,8 @@ TLS only, tagged `triple-c:component=state`), one object per deployment (D9).
   roles, `RegisterTaskDefinition` on `task-definition/triple-c-*`, `CreateAccessPoint` with request
   tags and `GetSecretValue` on one's own secret work for a role session; another owner's revision
   or secret is denied. `CreateAccessPoint`'s `TagResource` is authorized against the file system
-  (policy fixed). `DeregisterTaskDefinition` supports only `*` with no tag condition, which the
-  workspace tier does not grant: open. SSO sessions themselves were not used.
+  (policy fixed). `DeregisterTaskDefinition` supports only `*` with no tag condition, so (ruling R8)
+  workspace users don't retire task definitions; removal leaves them for an admin. SSO sessions themselves were not used.
 - ~~That `session-manager-plugin` port forwarding to an ECS target is stable for hours-long
   sessions, and how quickly it reconnects.~~ **Measured 2026-11-14** (phase 2b, us-west-2,
   plugin 1.2.896, Fargate 1 vCPU / 2 GB, `host::ssm::live_tests`):

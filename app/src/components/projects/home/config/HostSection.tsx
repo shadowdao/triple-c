@@ -401,9 +401,9 @@ function RemoveAwsResourcesModal({ project, onClose }: { project: Project; onClo
     >
       <p className="text-[13px] text-[var(--text-secondary)]">
         Removes <strong className="text-[var(--text-primary)]">{project.name}</strong>&rsquo;s
-        task definitions and secret from AWS (the secret after a 7-day recovery window) and
-        keeps the project, so it can run somewhere else. Its next start on AWS sets them up
-        again.
+        secret from AWS (after a 7-day recovery window) and keeps the project, so it can run
+        somewhere else. Its task definitions stay registered for an administrator to
+        deregister. Its next start on AWS sets everything up again.
       </p>
       {hasSavedFiles(project) && (
         <label className="mt-3 flex items-start gap-2 text-[13px] text-[var(--text-primary)]">

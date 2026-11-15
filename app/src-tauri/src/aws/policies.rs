@@ -246,8 +246,10 @@ const WORKSPACE_USER_CHECKS: &[Check] = &[
             ("ecs:CreateAction", Literal("RunTask")),
         ],
     ),
-    // `workspace-user-tasks.json`: a user registers, tags and retires their
-    // own task definitions, and reads their own secrets.
+    // `workspace-user-tasks.json`: a user registers and tags their own task
+    // definitions, and reads their own secrets. Retiring them is the admin's
+    // (R8): ECS authorizes `DeregisterTaskDefinition` against `*` only, with
+    // no tag condition, so it can't be confined to a user's own revisions.
     // Residual risk the policy cannot close: the family carries the owner
     // key, which IAM can't condition on, so any user may register a revision
     // into another owner's family. The app's mitigation: it runs only the
@@ -266,16 +268,6 @@ const WORKSPACE_USER_CHECKS: &[Check] = &[
             (OWNER_REQUEST_TAG, OwnerId),
             ("ecs:CreateAction", Literal("RegisterTaskDefinition")),
         ],
-    ),
-    write(
-        "ecs:DeregisterTaskDefinition",
-        PROBE_TASK_DEFINITION,
-        &[(OWNER_RESOURCE_TAG, OwnerId)],
-    ),
-    write(
-        "ecs:DeleteTaskDefinitions",
-        PROBE_TASK_DEFINITION,
-        &[(OWNER_RESOURCE_TAG, OwnerId)],
     ),
     read(
         "secretsmanager:GetSecretValue",
@@ -955,16 +947,6 @@ mod tests {
         ),
         ("ecs:TagResource", "task-definition/", OWNER_REQUEST_TAG),
         (
-            "ecs:DeregisterTaskDefinition",
-            "task-definition/",
-            OWNER_RESOURCE_TAG,
-        ),
-        (
-            "ecs:DeleteTaskDefinitions",
-            "task-definition/",
-            OWNER_RESOURCE_TAG,
-        ),
-        (
             "secretsmanager:GetSecretValue",
             "secret:",
             OWNER_RESOURCE_TAG,
@@ -1220,21 +1202,25 @@ mod tests {
         );
     }
 
+    /// R8: the workspace tier retires no task definition, not even its own
+    /// (`DeregisterTaskDefinition` is authorized against `*` only).
     #[test]
-    fn only_the_owner_retires_a_task_definition() {
+    fn the_workspace_tier_never_retires_a_task_definition() {
+        let register = ws_check("ecs:RegisterTaskDefinition", "task-definition/");
         for action in ["ecs:DeregisterTaskDefinition", "ecs:DeleteTaskDefinitions"] {
-            let c = ws_check(action, "task-definition/");
-            assert!(allowed(Tier::WorkspaceUser, c, ME, ME), "{action}");
-            let theirs = Check {
-                context: &[(OWNER_RESOURCE_TAG, Literal(SOMEONE_ELSE))],
-                ..*c
-            };
-            assert!(!allowed(Tier::WorkspaceUser, &theirs, ME, ME), "{action}");
-            let other_family = Check {
-                resource: "arn:aws:ecs:{region}:{account}:task-definition/production:1",
-                ..*c
-            };
-            assert!(!allowed(Tier::WorkspaceUser, &other_family, ME, ME), "{action}");
+            assert!(
+                !checks(Tier::WorkspaceUser).iter().any(|c| c.action == action),
+                "{action} is checked for the workspace tier"
+            );
+            for resource in ["*", register.resource] {
+                let own = Check {
+                    action,
+                    resource,
+                    context: &[(OWNER_RESOURCE_TAG, OwnerId)],
+                    ..*register
+                };
+                assert!(!allowed(Tier::WorkspaceUser, &own, ME, ME), "{action} on {resource}");
+            }
         }
     }
 

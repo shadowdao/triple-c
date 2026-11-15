@@ -65,14 +65,6 @@ impl RuntimeApi for Fake {
         let mut s = self.ap_states.lock().unwrap();
         Ok(if s.len() > 1 { s.remove(0) } else { s.first().cloned().flatten() })
     }
-    async fn deregister_task_definition(&self, arn: &str) -> Result<(), AwsError> {
-        self.log(format!("deregister {arn}"));
-        Ok(())
-    }
-    async fn delete_task_definitions(&self, arns: &[String]) -> Result<(), AwsError> {
-        self.log(format!("delete-td {}", arns.join(",")));
-        Ok(())
-    }
     async fn delete_secret(&self, name: &str) -> Result<(), AwsError> {
         self.log(format!("delete-secret {name}"));
         if self.fail_secret_delete {
@@ -271,7 +263,7 @@ fn rev(n: u32, owner: &str) -> TaskDefinitionRef {
 }
 
 #[tokio::test]
-async fn removal_stops_the_task_retires_own_revisions_and_schedules_the_secret() {
+async fn removal_stops_the_task_leaves_the_revisions_and_schedules_the_secret() {
     let fake = Fake {
         live_tasks: vec![live("t1")],
         revisions: vec![rev(2, USER), rev(3, "AROAOTHER:mallory"), rev(1, USER)],
@@ -305,12 +297,9 @@ async fn removal_stops_the_task_retires_own_revisions_and_schedules_the_secret()
         vec![
             format!("stop triple-c-dev {} {STOP_REASON}", task_arn("t1")),
             format!("stop triple-c-dev {} {STOP_REASON}", task_arn("t0")),
-            format!("deregister {}", rev(2, USER).arn),
-            format!("deregister {}", rev(1, USER).arn),
-            format!("delete-td {},{}", rev(2, USER).arn, rev(1, USER).arn),
             format!("delete-secret {secret}"),
         ],
-        "another user's revision is left alone and the access point is kept"
+        "no task definition is touched (R8) and the access point is kept"
     );
 
     let keep = Fake { access_points: fake.access_points.clone(), ..Default::default() };

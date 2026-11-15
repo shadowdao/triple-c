@@ -7,7 +7,7 @@ tier the signed-in identity has under **Settings → Hosts → Check**.
 | File | What it is |
 |---|---|
 | `policies/workspace-user.json` | The **workspace user** tier, part 1: create, start, stop, connect to and delete **their own** workspaces in an existing environment |
-| `policies/workspace-user-tasks.json` | The **workspace user** tier, part 2: register, tag and retire **their own** ECS task definitions, and read **their own** secrets (`workspace-user.json` has no room left) |
+| `policies/workspace-user-tasks.json` | The **workspace user** tier, part 2: register and tag **their own** ECS task definitions, and read **their own** secrets (`workspace-user.json` has no room left) |
 | `policies/environment-admin.json` | The **environment admin** tier, part 1: apply and destroy the environment and onboarding modules (`terraform/`) with OpenTofu, and keep their state |
 | `policies/environment-admin-network.json` | The **environment admin** tier, part 2: the network those modules create (VPC, subnets, gateways, routes, security groups) |
 | `policies/permissions-boundary.json` | The **permissions boundary** every Triple-C role must carry. It is never attached to a person |
@@ -32,8 +32,12 @@ following:
   on `triple-c-*` families needs `triple-c:owner = ${aws:userid}` in the request and only the three
   ordinary tag keys. `ecs:TagResource` on a task definition is allowed only at registration
   (`ecs:CreateAction = RegisterTaskDefinition`, same owner and tag-key conditions), so a
-  definition can never be retagged. `ecs:DeregisterTaskDefinition` and `ecs:DeleteTaskDefinitions`
-  need the definition to carry the user's owner ID. A task definition that names a task or
+  definition can never be retagged. Users **cannot retire** task definitions, not even their own
+  (ruling R8): ECS authorizes `ecs:DeregisterTaskDefinition` against `*` only, with no tag
+  condition, so allowing it would let any user deregister any revision in the account. Removing a
+  project leaves its revisions registered (they hold no secret values and cost nothing, and
+  `RunOwnTasks` still needs the owner tag, so nobody else can run them); an admin clears them
+  (see "Clearing workspace task definitions"). A task definition that names a task or
   execution role is also authorized with `iam:PassRole` on it, which `PassOwnTaskRoles` already
   covers (owner-tagged `triple-c-*` roles, to ECS tasks only; a unit test checks both roles).
   `RunOwnTasks` still requires the definition's owner tag, so a user can run only definitions they
@@ -123,6 +127,19 @@ and nothing runs with more than the admin holds. It covers:
   gateway, security groups and their rules (`environment-admin-network.json`);
 - EFS file systems, mount targets and file-system policies, and KMS keys and aliases;
 - `/triple-c/*` log groups and `/triple-c/*` SSM parameters.
+
+**Clearing workspace task definitions.** Removing a project leaves its revisions registered
+(family `triple-c-<env>-<owner key>-<project id, 12 chars>`). The admin tier may deregister any
+revision (`ecs:DeregisterTaskDefinition` on `*`), so an admin clears an environment's with:
+
+```sh
+aws ecs list-task-definitions --family-prefix triple-c-<env>- --query 'taskDefinitionArns[]' --output text \
+  | xargs -n1 aws ecs deregister-task-definition --task-definition >/dev/null
+```
+
+Deregistered revisions become INACTIVE; ECS keeps them until they are deleted with
+`ecs:DeleteTaskDefinitions`, which the admin tier does not grant (an account administrator can).
+A task still running from a revision keeps running.
 
 Not in v1, and so not in the policy: ECR (tasks pull from GHCR), custom ECS capacity providers,
 and passing roles to EC2 (`iam:PassRole` is to `ecs-tasks.amazonaws.com` only). Phase 7's EC2
@@ -525,7 +542,6 @@ asserts that every role the admin creates carries the boundary.
 
 Still open:
 
-- **Deregistering task definitions (phase 5): see below; the workspace tier cannot do it yet.**
 - the `existing` network mode against a user's own VPC, and an onboarding by a workspace user
   from an admin bundle (the same module, applied with admin credentials);
 - `DisassociateGoneAddresses` cannot touch a **live** association. Probe: allocate an untagged
@@ -549,15 +565,15 @@ pulls), so the test puts an inline `triple-c-e2e-ecr-pull` policy on it and remo
 onboarding is destroyed. The test deploys a `public` environment as the environment admin, onboards
 a role that holds **only** the workspace files, and drives `ProjectHost::Aws` as that role through
 a profile connection (`role_arn` + `source_profile`): Hybrid, 1 vCPU / 2 GB, one public repo, idle
-stop 5 minutes. Its guard stops every task, retires the test's revisions, deletes the access points
+stop 5 minutes. Its guard stops every task, retires the test's revisions as the account admin, deletes the access points
 and the secret and removes the ECR policy; then the fixture destroys the modules.
 
 | Point | Result |
 |---|---|
 | `RegisterTaskDefinition` on `task-definition/triple-c-*` | ✓ allowed for the workspace user with the owner request tag and the three keys; the revision carries exactly those tags (`TagResource` with `ecs:CreateAction`) |
 | `RunTask`: owner tag on the revision, `iam:PassRole` by `iam:ResourceTag` | ✓ allowed on the user's revision with their own roles; on a revision tagged with another owner, denied |
-| `DeregisterTaskDefinition` | ✗ **open**: ECS authorizes it against `*` only. `task-definition/triple-c-*`, and `*` with `aws:ResourceTag/triple-c:owner`, are both denied; only an unconditional `*` works (probe). Removing a project therefore fails on its revisions (the secret and the access point are still removed) |
-| `DeleteTaskDefinitions` | ✓ (probe) authorized against the revision's ARN with `aws:ResourceTag`: the owner's tag passes, another owner's is denied |
+| `DeregisterTaskDefinition` | ✗→decided (R8): ECS authorizes it against `*` only. `task-definition/triple-c-*`, and `*` with `aws:ResourceTag/triple-c:owner`, are both denied; only an unconditional `*` works (probe). The workspace tier no longer has it (`RetireOwnTaskDefinitions` dropped); removing a project leaves its revisions registered for an admin to clear |
+| `DeleteTaskDefinitions` | (probe) resource-level: authorized against the revision's ARN with `aws:ResourceTag` (the owner's tag passes, another owner's is denied), but it only deletes INACTIVE revisions, so without deregistration it is useless to a user. Dropped from the workspace tier with it (R8) |
 | `CreateAccessPoint`'s `TagResource` | ✗→fixed: authorized against the **file system**, not the access point (probe: `access-point/*` denied; `file-system/*` allowed; `CreateAction`, `aws:RequestTag` and `aws:TagKeys` all present) |
 | `GetSecretValue` | ✓ own secret (an attach reads the token back); another owner's `triple-c/*` secret denied |
 | EFS access point with the task role (IAM + TLS) | ✓ mounted at `/mnt/triple-c-home` (`127.0.0.1:/ … nfs4`, the TLS tunnel), `claude:claude 700`; `~/.claude`, `~/.claude.json` and `~/.ssh` link into it |

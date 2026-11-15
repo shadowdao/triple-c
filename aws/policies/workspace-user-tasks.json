@@ -47,22 +47,6 @@
       }
     },
     {
-      "Sid": "RetireOwnTaskDefinitions",
-      "Effect": "Allow",
-      "Action": [
-        "ecs:DeregisterTaskDefinition",
-        "ecs:DeleteTaskDefinitions"
-      ],
-      "Resource": [
-        "arn:aws:ecs:*:*:task-definition/triple-c-*"
-      ],
-      "Condition": {
-        "StringEquals": {
-          "aws:ResourceTag/triple-c:owner": "${aws:userid}"
-        }
-      }
-    },
-    {
       "Sid": "ReadOwnSecrets",
       "Effect": "Allow",
       "Action": [
