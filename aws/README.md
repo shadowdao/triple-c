@@ -81,7 +81,10 @@ following:
   their owner ID, and create them only on **their own** file system: one tagged
   `triple-c:component` (their onboarding module tags it `user-onboarding`) *and*
   `triple-c:owner = ${aws:userid}`. Each user has their own file system (strict tenancy), so
-  another user's file system is refused even though it is Triple-C's.
+  another user's file system is refused even though it is Triple-C's. The `TagResource` that a
+  tagged `CreateAccessPoint` needs is authorized against the **file system**, not the new access
+  point (verified live, phase 5), so `TagOwnAccessPointsAtCreate` names `file-system/*` and is
+  confined by `elasticfilesystem:CreateAction = CreateAccessPoint`.
 - **Set only the ordinary tag keys.** Every request that tags something may set only
   `triple-c:owner`, `triple-c:project` and `triple-c:environment` (`aws:TagKeys`). This applies to
   `RunTask`, the ECS and EFS tag-on-create calls, `CreateSecret`, and secret `TagResource`. A

@@ -362,9 +362,11 @@ const WORKSPACE_USER_CHECKS: &[Check] = &[
             (COMPONENT_RESOURCE_TAG, Literal("user-onboarding")),
         ],
     ),
+    // Authorized against the parent file system, not the new access point
+    // (verified live, phase 5).
     write(
         "elasticfilesystem:TagResource",
-        PROBE_ACCESS_POINT,
+        PROBE_FILE_SYSTEM,
         &[
             (OWNER_REQUEST_TAG, OwnerId),
             (
@@ -993,7 +995,7 @@ mod tests {
         ),
         (
             "elasticfilesystem:TagResource",
-            "access-point/",
+            "file-system/",
             OWNER_REQUEST_TAG,
         ),
         (
