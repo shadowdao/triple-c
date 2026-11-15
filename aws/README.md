@@ -563,11 +563,15 @@ Still open:
 TRIPLEC_AWS_E2E_PROFILE=<admin profile> TRIPLEC_AWS_E2E_REGION=us-west-2 scripts/aws-e2e-workspace.sh
 ```
 
-The script builds this checkout's `container/` (`--platform linux/amd64`), creates a throwaway
+The script first unsets every `AWS_*` variable of the caller, so only the named profile's
+credentials are used; `TRIPLEC_AWS_E2E_CREDENTIALS_FILE` / `TRIPLEC_AWS_E2E_CONFIG_FILE` (default:
+the caller's `AWS_SHARED_CREDENTIALS_FILE` / `AWS_CONFIG_FILE`, else `~/.aws`) say where that
+profile lives. It builds this checkout's `container/` (`--platform linux/amd64`), creates a throwaway
 private ECR repository `triple-c-e2e-sandbox`, pushes, runs the test
 (`aws::live_tests::environment::a_fargate_workspace_round_trips`, with `TRIPLEC_E2E_IMAGE` and
-`TRIPLEC_E2E_ECR_REPO`) and deletes the repository in an exit trap; the test's guard deletes it
-as well. The test body runs under a 45-minute timeout, every exec under its own.
+`TRIPLEC_E2E_ECR_REPO`) and deletes the repository in an exit trap — always attempted, a
+`RepositoryNotFoundException` is fine; Ctrl-C exits 130 and a TERM 143 after the same cleanup. The
+test's guard deletes it as well. The test body runs under a 45-minute timeout, every exec under its own.
 **Test only:** the onboarding grants the execution role no ECR permissions (the boundary allows
 pulls), so the test puts an inline `triple-c-e2e-ecr-pull` policy on it and removes it before the
 onboarding is destroyed. The test deploys a `public` environment as the environment admin, onboards
