@@ -1731,6 +1731,24 @@ mod environment {
         /// The user's file system's creation token.
         fs_token: Option<String>,
         secrets: Vec<String>,
+        /// The project whose tunnel to close.
+        project_id: Option<String>,
+        /// `AWS_CONFIG_FILE` before the test pointed it at its own file
+        /// (outer `None`: not changed).
+        config_file_before: Option<Option<std::ffi::OsString>>,
+        /// `TRIPLEC_E2E_ECR_REPO`: the throwaway repository to force-delete.
+        ecr_repo: Option<String>,
+    }
+
+    /// The whole phase-5 body: a hang anywhere becomes a panic the guard
+    /// catches, so nothing billed outlives it.
+    const PHASE5_TIMEOUT: Duration = Duration::from_secs(45 * 60);
+    /// One exec through the agent.
+    const SH_TIMEOUT: Duration = Duration::from_secs(180);
+
+    /// The phase-5 guard's state, even after a panic poisoned the lock.
+    fn p5_lock(m: &std::sync::Mutex<Phase5>) -> std::sync::MutexGuard<'_, Phase5> {
+        m.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     const ECR_POLICY: &str = "triple-c-e2e-ecr-pull";
@@ -1741,6 +1759,14 @@ mod environment {
     /// test-only ECR policy off the execution role, so the modules'
     /// `tofu destroy` can remove the rest. Logs, never fails.
     async fn phase5_cleanup(e: &E2e, p: &Phase5) {
+        if let Some(id) = &p.project_id {
+            crate::host::tunnels::close(id).await;
+        }
+        match &p.config_file_before {
+            Some(Some(v)) => std::env::set_var("AWS_CONFIG_FILE", v),
+            Some(None) => std::env::remove_var("AWS_CONFIG_FILE"),
+            None => {}
+        }
         let ecs = aws_sdk_ecs::Client::new(&e.cfg);
         if let Some(cluster) = &p.cluster {
             let mut arns = Vec::new();
@@ -1840,6 +1866,19 @@ mod environment {
                 }
             }
         }
+            if let Some(repo) = &p.ecr_repo {
+            // No ECR crate in the app: the AWS CLI, as the e2e profile.
+            let out = tokio::process::Command::new("aws")
+                .args(["--profile", &super::var("TRIPLEC_AWS_E2E_PROFILE"), "--region", &e.region])
+                .args(["ecr", "delete-repository", "--repository-name", repo, "--force"])
+                .output()
+                .await;
+            match out {
+                Ok(o) if o.status.success() => eprintln!("cleanup: deleted ECR repository {repo}"),
+                Ok(o) if String::from_utf8_lossy(&o.stderr).contains("RepositoryNotFound") => {}
+                other => eprintln!("cleanup: delete ECR repository {repo}: {other:?}"),
+            }
+        }
     }
 
     /// Poll `f` every `every` until it returns `Some`, or `None` after `within`.
@@ -1862,9 +1901,13 @@ mod environment {
 
     /// `sh -c script` as `user`: (output, exit code).
     async fn sh(t: &crate::host::ContainerTarget, user: &str, script: &str) -> (String, i64) {
-        t.exec_oneshot_as(user, vec!["sh".into(), "-c".into(), script.into()], Vec::new())
-            .await
-            .unwrap_or_else(|err| panic!("exec `{script}`: {err}"))
+        tokio::time::timeout(
+            SH_TIMEOUT,
+            t.exec_oneshot_as(user, vec!["sh".into(), "-c".into(), script.into()], Vec::new()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("exec `{script}` did not finish in {SH_TIMEOUT:?}"))
+        .unwrap_or_else(|err| panic!("exec `{script}`: {err}"))
     }
 
     /// Phase 5: a Fargate workspace's whole life through `ProjectHost::Aws`,
@@ -1887,8 +1930,14 @@ mod environment {
     /// onboarded execution role a **test-only** inline pull policy
     /// (`triple-c-e2e-ecr-pull`; the boundary allows ECR pulls, the
     /// onboarding module grants none) and removes it before the onboarding
-    /// is destroyed. Creating and deleting that repository is the runner's
-    /// job (`aws/README.md`, "Live verification").
+    /// is destroyed. `scripts/aws-e2e-workspace.sh` does it all: builds the
+    /// image, creates the throwaway repository `triple-c-e2e-sandbox`,
+    /// pushes, runs this test with `TRIPLEC_E2E_ECR_REPO` set (this test's
+    /// guard then force-deletes that repository too) and deletes it in a
+    /// trap on exit.
+    ///
+    /// The body runs under a 45-minute timeout and every exec under its own,
+    /// so a hang becomes a panic and the guard still runs.
     ///
     /// The workspace user signs in the way a saved profile connection does:
     /// a profile (`role_arn` + `source_profile` = the e2e profile, session
@@ -1911,9 +1960,12 @@ mod environment {
         use crate::storage::projects_store::ProjectsStore;
 
         let image = super::var("TRIPLEC_E2E_IMAGE");
+        let ecr_repo = std::env::var("TRIPLEC_E2E_ECR_REPO").ok().filter(|r| !r.is_empty());
         env_e2e(|t| async move {
-            let p5 = std::sync::Mutex::new(Phase5::default());
-            let body = async {
+            let p5 = std::sync::Mutex::new(Phase5 { ecr_repo, ..Default::default() });
+            // Boxed: the body's state machine is far larger than a test
+            // thread's 2 MiB stack once it is moved into the timeout.
+            let inner = Box::pin(async {
                 let region = t.e.region.clone();
                 let admin = t.admin().await;
                 let (keys, cfg, who) = t.session(&admin).await;
@@ -1922,8 +1974,12 @@ mod environment {
 
                 // ── the environment, deployed by the environment admin ──
                 let name = format!("e2e{}", &uuid::Uuid::new_v4().simple().to_string()[..6]);
-                p5.lock().unwrap().cluster = Some(environment_cluster_name(&name));
-                p5.lock().unwrap().families.push(format!("triple-c-{name}-"));
+                let (cluster, families) = (environment_cluster_name(&name), format!("triple-c-{name}-"));
+                {
+                    let mut g = p5_lock(&p5);
+                    g.cluster = Some(cluster);
+                    g.families.push(families);
+                }
                 let vars = environment_vars(&name, &region, &NetworkChoice::Public).unwrap();
                 let (_, outcome, denied) = t
                     .run(ModuleKind::Environment, Deployment::Environment(&name), &vars, TofuOp::Apply, t.keys_env(&keys))
@@ -1934,7 +1990,8 @@ mod environment {
                 let user = t.e.tier_role("wsuser", &[Tier::WorkspaceUser]).await;
                 let owner = validate_owner_id(&user.session_user_id()).expect("owner id");
                 let okey = owner_key(&region, &owner);
-                p5.lock().unwrap().fs_token = Some(user_file_system_token(&name, &okey));
+                let fs_token = user_file_system_token(&name, &okey);
+                p5_lock(&p5).fs_token = Some(fs_token.clone());
 
                 // Onboarded by the admin (an onboarding from an admin bundle).
                 let (keys, _, _) = t.session(&admin).await;
@@ -1958,7 +2015,7 @@ mod environment {
                             r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":"ecr:GetAuthorizationToken","Resource":"*"}},{{"Effect":"Allow","Action":["ecr:BatchGetImage","ecr:GetDownloadUrlForLayer","ecr:BatchCheckLayerAvailability"],"Resource":"arn:aws:ecr:{region}:{}:repository/{repo}"}}]}}"#,
                             t.e.account
                         );
-                        p5.lock().unwrap().exec_role = Some(exec_role.clone());
+                        p5_lock(&p5).exec_role = Some(exec_role.clone());
                         ok(
                             "put the test-only ECR policy",
                             t.e.iam.put_role_policy().role_name(&exec_role).policy_name(ECR_POLICY).policy_document(doc).send().await,
@@ -1980,6 +2037,8 @@ mod environment {
                     ),
                 )
                 .unwrap();
+                let before = std::env::var_os("AWS_CONFIG_FILE");
+                p5_lock(&p5).config_file_before = Some(before);
                 std::env::set_var("AWS_CONFIG_FILE", &cfg_file);
                 let conn = HostConnection {
                     id: "e2e-wsuser".into(),
@@ -2019,7 +2078,12 @@ mod environment {
                     ..Default::default()
                 });
                 let id = project.id.clone();
-                p5.lock().unwrap().secrets.push(project_secret_name(&name, &okey, &id));
+                let secret_name = project_secret_name(&name, &okey, &id);
+                {
+                    let mut g = p5_lock(&p5);
+                    g.project_id = Some(id.clone());
+                    g.secrets.push(secret_name);
+                }
                 let store_dir = tempfile::tempdir().unwrap();
                 let store = ProjectsStore::over_file_for_test(store_dir.path().join("projects.json"), vec![project.clone()]);
                 let host = ProjectHost::for_project(&project);
@@ -2156,6 +2220,26 @@ mod environment {
                     ws_secrets.get_secret_value().secret_id(created.arn().unwrap()).send().await,
                 );
                 eprintln!("RESULT GetSecretValue on another owner's secret: denied");
+
+                // A bare TagResource on the user's own file system (no
+                // CreateAction) is refused: tagging is only at creation.
+                let efs_admin = aws_sdk_efs::Client::new(&t.e.cfg);
+                let fs = ok(
+                    "find the user's file system",
+                    efs_admin.describe_file_systems().creation_token(&fs_token).send().await,
+                );
+                let fs_id = fs.file_systems().first().expect("the user's file system").file_system_id().to_string();
+                let ws_efs = aws_sdk_efs::Client::new(&ws_cfg);
+                super::denied(
+                    "bare TagResource on own file system",
+                    ws_efs
+                        .tag_resource()
+                        .resource_id(&fs_id)
+                        .tags(aws_sdk_efs::types::Tag::builder().key("triple-c:owner").value(&owner).build().unwrap())
+                        .send()
+                        .await,
+                );
+                eprintln!("RESULT bare elasticfilesystem:TagResource on the user's own file system {fs_id}: denied");
 
                 // RunTask on a revision the user does not own is denied.
                 let foreign_family = format!("triple-c-{name}-e2e-foreign");
@@ -2300,9 +2384,14 @@ mod environment {
                 // R8: the revisions stay registered for an admin to clear
                 // (the guard does, as the account admin).
                 assert_eq!(defs.task_definition_arns(), [revision1.clone()], "the project's revision is left ACTIVE");
+            });
+            let body = async {
+                if tokio::time::timeout(PHASE5_TIMEOUT, inner).await.is_err() {
+                    panic!("the phase-5 body did not finish in {PHASE5_TIMEOUT:?}");
+                }
             };
             let result = std::panic::AssertUnwindSafe(body).catch_unwind().await;
-            let guard = std::mem::take(&mut *p5.lock().unwrap());
+            let guard = std::mem::take(&mut *p5_lock(&p5));
             phase5_cleanup(&t.e, &guard).await;
             if let Err(panic) = result {
                 std::panic::resume_unwind(panic);

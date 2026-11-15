@@ -134,7 +134,7 @@ revision (`ecs:DeregisterTaskDefinition` on `*`), so an admin clears an environm
 
 ```sh
 aws ecs list-task-definitions --family-prefix triple-c-<env>- --query 'taskDefinitionArns[]' --output text \
-  | xargs -n1 aws ecs deregister-task-definition --task-definition >/dev/null
+  | xargs -r -n1 aws ecs deregister-task-definition --task-definition >/dev/null
 ```
 
 Deregistered revisions become INACTIVE; ECS keeps them until they are deleted with
@@ -551,15 +551,14 @@ Still open:
 ### Phase 5: a Fargate workspace (2026-11-15)
 
 ```sh
-cd app/src-tauri
-cargo build
-TRIPLEC_AWS_E2E_PROFILE=<admin profile> TRIPLEC_AWS_E2E_REGION=us-west-2 \
-TRIPLEC_E2E_IMAGE=<account>.dkr.ecr.<region>.amazonaws.com/triple-c-e2e-sandbox:<tag> \
-  cargo test aws::live_tests::environment::a_fargate_workspace_round_trips -- --ignored --test-threads=1 --nocapture
+TRIPLEC_AWS_E2E_PROFILE=<admin profile> TRIPLEC_AWS_E2E_REGION=us-west-2 scripts/aws-e2e-workspace.sh
 ```
 
-The image is this branch's `container/` (`docker build --platform linux/amd64`), pushed to a
-throwaway private ECR repository `triple-c-e2e-sandbox` that the runner creates and deletes.
+The script builds this checkout's `container/` (`--platform linux/amd64`), creates a throwaway
+private ECR repository `triple-c-e2e-sandbox`, pushes, runs the test
+(`aws::live_tests::environment::a_fargate_workspace_round_trips`, with `TRIPLEC_E2E_IMAGE` and
+`TRIPLEC_E2E_ECR_REPO`) and deletes the repository in an exit trap; the test's guard deletes it
+as well. The test body runs under a 45-minute timeout, every exec under its own.
 **Test only:** the onboarding grants the execution role no ECR permissions (the boundary allows
 pulls), so the test puts an inline `triple-c-e2e-ecr-pull` policy on it and removes it before the
 onboarding is destroyed. The test deploys a `public` environment as the environment admin, onboards
@@ -575,9 +574,10 @@ and the secret and removes the ECR policy; then the fixture destroys the modules
 | `DeregisterTaskDefinition` | ✗→decided (R8): ECS authorizes it against `*` only. `task-definition/triple-c-*`, and `*` with `aws:ResourceTag/triple-c:owner`, are both denied; only an unconditional `*` works (probe). The workspace tier no longer has it (`RetireOwnTaskDefinitions` dropped); removing a project leaves its revisions registered for an admin to clear |
 | `DeleteTaskDefinitions` | (probe) resource-level: authorized against the revision's ARN with `aws:ResourceTag` (the owner's tag passes, another owner's is denied), but it only deletes INACTIVE revisions, so without deregistration it is useless to a user. Dropped from the workspace tier with it (R8) |
 | `CreateAccessPoint`'s `TagResource` | ✗→fixed: authorized against the **file system**, not the access point (probe: `access-point/*` denied; `file-system/*` allowed; `CreateAction`, `aws:RequestTag` and `aws:TagKeys` all present) |
+| Bare `TagResource` on the user's own file system | ✓ denied (no `elasticfilesystem:CreateAction`): `TagOwnAccessPointsAtCreate` tags only at access-point creation |
 | `GetSecretValue` | ✓ own secret (an attach reads the token back); another owner's `triple-c/*` secret denied |
 | EFS access point with the task role (IAM + TLS) | ✓ mounted at `/mnt/triple-c-home` (`127.0.0.1:/ … nfs4`, the TLS tunnel), `claude:claude 700`; `~/.claude`, `~/.claude.json` and `~/.ssh` link into it |
-| Times | first start (register, access point, RunTask, pull of ~1.2 GB, agent, tunnel) 104 s; ECS `HEALTHY` 135 s after the start began; attach to a running task 2 s; StopTask to `STOPPED` 42 s; restart 86–92 s |
+| Times | first start (register, access point, RunTask, pull of ~1.2 GB, agent, tunnel) 94–104 s; ECS `HEALTHY` 135 s after the start began; attach to a running task 2 s; StopTask to `STOPPED` 42 s; restart 86–92 s |
 | Attach | ✓ a second start while running reuses the task (one task in the family, same ARN, no RunTask) |
 | Restart | ✓ new task, same revision; the `~/.claude` marker survived |
 | Repo clone | ✓ the background clone finished (`/run/triple-c-clone/repos`: `Hello-World cloned`) |
@@ -586,4 +586,5 @@ and the secret and removes the ECR policy; then the fixture destroys the modules
 | `~/.claude.json` after Claude Code runs | ✓ still a link (Claude Code started without a login: "Not logged in") |
 | Bubblewrap (P9) | ✗ `bwrap --unshare-user` fails: "No permissions to create new namespace" (kernel 6.1, `max_user_namespaces` 16384, no `CAP_SYS_ADMIN` on Fargate). The sandbox stays off on AWS |
 | A revision per configuration | turning idle stop on adds a secret key, so the next start registers a new revision (by design) |
+| Removal (R8) | ✓ final run: `remove_aws_resources` succeeds; the secret is scheduled for deletion, the access point deleted, the revision left ACTIVE |
 | Cleanup | ✓ nothing `triple-c` left in us-west-2; environment KMS keys pending deletion |
