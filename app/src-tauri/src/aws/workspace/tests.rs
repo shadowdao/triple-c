@@ -468,11 +468,11 @@ fn payload_rejects_bad_file_names() {
 #[test]
 fn payload_rejects_env_names_a_secret_reference_cannot_carry() {
     for bad in ["A:B", "", "1ABC", "A-B", "A B"] {
-        let env = pairs(&[(bad, "v")]);
+        let env = pairs(&[(bad, "SENTINEL-VALUE-7f3a")]);
         let r = project_secret_payload(&env, "t", &[], &[], true, None, StorageMode::Hybrid);
         assert!(r.is_err(), "{bad:?} accepted");
         // The error never echoes a value.
-        assert!(!r.unwrap_err().contains("\"v\""));
+        assert!(!r.unwrap_err().contains("SENTINEL-VALUE-7f3a"));
     }
 }
 
@@ -534,9 +534,6 @@ impl Fake {
         Fake {
             file_system: Some(FileSystemRef {
                 id: "fs-0123abcd".into(),
-                arn: format!(
-                    "arn:aws:elasticfilesystem:{REGION}:{ACCOUNT}:file-system/fs-0123abcd"
-                ),
                 owner: Some(USER.into()),
             }),
             ..Default::default()
@@ -705,9 +702,14 @@ async fn first_start_creates_everything_with_the_three_tags() {
     );
     // No project data outside `secrets`: every payload value is absent from
     // the environment, labels and tags.
+    // (`Debug` redacts `environment`, so its pairs are rendered by hand.)
+    let env_text: Vec<String> = req.container_definitions()[0]
+        .environment()
+        .iter()
+        .map(|kv| format!("{}={}", kv.name().unwrap(), kv.value().unwrap()))
+        .collect();
     let rendered = format!(
-        "{:?}{:?}{:?}",
-        req.container_definitions()[0].environment(),
+        "{env_text:?}{:?}{:?}",
         req.container_definitions()[0].docker_labels(),
         req.tags()
     );
@@ -999,4 +1001,118 @@ async fn revision_lookup_is_bounded() {
         .unwrap();
     assert!(*fake.describes.lock().unwrap() <= MAX_REVISIONS_CHECKED);
     assert_eq!(fake.registered.lock().unwrap().len(), 1);
+}
+
+// ------------------------------------------------------- fix round 1
+
+#[test]
+fn ids_that_sanitise_alike_get_different_names() {
+    let ok = owner_key(REGION, USER);
+    for (a, b) in [("a/b", "a:b"), ("", "_"), ("x y", "x*y")] {
+        assert_ne!(
+            project_secret_name("dev", &ok, a),
+            project_secret_name("dev", &ok, b)
+        );
+        assert_ne!(access_point_root(&ok, a), access_point_root(&ok, b));
+        assert_ne!(log_stream_prefix(&ok, a), log_stream_prefix(&ok, b));
+        assert_ne!(task_family("dev", &ok, a), task_family("dev", &ok, b));
+    }
+    // A sanitised id can't take a clean id's name: clean ids have no `_`.
+    let hashed = project_secret_name("dev", &ok, "a/b");
+    assert!(hashed.rsplit('/').next().unwrap().contains('_'), "{hashed}");
+    // Ids that differ only past 64 characters still differ.
+    let long_a = format!("{}a", "x".repeat(70));
+    let long_b = format!("{}b", "x".repeat(70));
+    assert_ne!(
+        project_secret_name("dev", &ok, &long_a),
+        project_secret_name("dev", &ok, &long_b)
+    );
+    assert!(task_family("dev", &ok, "a/b").len() <= 255);
+    // A UUID passes unchanged.
+    assert!(project_secret_name("dev", &ok, PROJECT_ID).ends_with(PROJECT_ID));
+}
+
+#[test]
+fn the_fingerprint_follows_the_built_request_and_not_its_label() {
+    let plan = sample_plan(StorageMode::Hybrid);
+    let req = task_definition_request(&plan);
+    let label = req.container_definitions()[0]
+        .docker_labels()
+        .unwrap()
+        .get(FINGERPRINT_LABEL)
+        .unwrap()
+        .clone();
+    // The label is the fingerprint of the request itself, label excluded.
+    assert_eq!(request_fingerprint(&req), label);
+    assert_eq!(workspace_fingerprint(&plan), label);
+
+    // Any change the builder could make shows: the health check, a log
+    // option, the (Debug-redacted) environment, a mount.
+    type Edit = Box<dyn Fn(&mut RegisterTaskDefinitionInput)>;
+    let edits: Vec<Edit> = vec![
+        Box::new(|r| {
+            let c = &mut r.container_definitions.as_mut().unwrap()[0];
+            c.health_check.as_mut().unwrap().interval = Some(31);
+        }),
+        Box::new(|r| {
+            let c = &mut r.container_definitions.as_mut().unwrap()[0];
+            let opts = c
+                .log_configuration
+                .as_mut()
+                .unwrap()
+                .options
+                .as_mut()
+                .unwrap();
+            opts.insert("mode".into(), "non-blocking".into());
+        }),
+        Box::new(|r| {
+            let c = &mut r.container_definitions.as_mut().unwrap()[0];
+            c.environment = Some(vec![aws_sdk_ecs::types::KeyValuePair::builder()
+                .name("TRIPLEC_HOST")
+                .value("aws2")
+                .build()]);
+        }),
+        Box::new(|r| {
+            let c = &mut r.container_definitions.as_mut().unwrap()[0];
+            c.mount_points.as_mut().unwrap()[0].read_only = Some(true);
+        }),
+        Box::new(|r| r.cpu = Some("2048".into())),
+    ];
+    for (i, edit) in edits.iter().enumerate() {
+        let mut changed = req.clone();
+        edit(&mut changed);
+        assert_ne!(
+            request_fingerprint(&changed),
+            label,
+            "edit {i} kept the fingerprint"
+        );
+    }
+    // Another label value does not change it.
+    let mut relabelled = req.clone();
+    relabelled.container_definitions.as_mut().unwrap()[0].docker_labels =
+        Some([(FINGERPRINT_LABEL.to_string(), "other".to_string())].into());
+    assert_eq!(request_fingerprint(&relabelled), label);
+}
+
+#[test]
+fn the_fingerprint_is_stable_across_builds() {
+    // Each build makes fresh HashMaps (log options), each with its own
+    // random iteration order.
+    let plan = sample_plan(StorageMode::Hybrid);
+    let first = workspace_fingerprint(&plan);
+    for _ in 0..50 {
+        assert_eq!(workspace_fingerprint(&plan), first);
+    }
+}
+
+#[test]
+fn a_secret_pending_deletion_is_recognised() {
+    assert!(is_pending_deletion(Some(
+        "You can't create this secret because a secret with this name is already scheduled for deletion."
+    )));
+    assert!(!is_pending_deletion(Some("Some other invalid request")));
+    assert!(!is_pending_deletion(None));
+    let msg = pending_deletion_error("triple-c/dev/abc/p").to_string();
+    assert!(msg.contains("scheduled for deletion"), "{msg}");
+    assert!(msg.contains("triple-c/dev/abc/p"), "{msg}");
 }

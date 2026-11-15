@@ -32,6 +32,7 @@ use aws_sdk_ecs::types::{
     MountPoint, NetworkMode, OsFamily, RuntimePlatform, Secret, SortOrder, Tag,
     TaskDefinitionField, TaskDefinitionStatus, Volume,
 };
+use aws_sdk_secretsmanager::error::ProvideErrorMetadata;
 use base64::Engine;
 use rand::RngCore;
 use serde::Serialize;
@@ -63,10 +64,6 @@ pub const MAX_SECRET_BYTES: usize = 65_536;
 /// At most this many of a family's newest revisions are described when
 /// looking for a reusable one; past that a new one is registered.
 pub const MAX_REVISIONS_CHECKED: usize = 10;
-/// Part of the fingerprint. Bump it whenever [`task_definition_request`]
-/// changes what it builds from the same plan, so existing projects pick up
-/// the new shape.
-const TASK_DEFINITION_TEMPLATE: u32 = 1;
 /// The container user (`claude`), owner of the access point's root.
 const WORKSPACE_UID: i64 = 1000;
 
@@ -253,13 +250,47 @@ pub struct WorkspacePlan {
     pub tags: Vec<(String, String)>,
 }
 
-/// sha256 (hex) over the plan and [`TASK_DEFINITION_TEMPLATE`]: the request
-/// is a pure function of both, so this covers everything in it but the label
-/// that carries it. Not project data: the plan holds names and ARNs only.
+/// sha256 (hex) over the task definition `plan` produces, minus the label
+/// that carries the fingerprint. Not project data: the request holds names,
+/// ARNs and constants only.
 pub fn workspace_fingerprint(plan: &WorkspacePlan) -> String {
-    let bytes =
-        serde_json::to_vec(&(TASK_DEFINITION_TEMPLATE, plan)).expect("plain data serialises");
-    Sha256::digest(bytes)
+    request_fingerprint(&build_request(plan))
+}
+
+/// sha256 (hex) over a canonical rendering of `req`: its `Debug` text, with
+/// the parts `Debug` can't render faithfully taken out first and rendered
+/// in order — `environment` and `repository_credentials` (which `Debug`
+/// redacts, so a change to them would otherwise go unseen) and the log
+/// options (a `HashMap`, whose `Debug` order is random). Docker labels are
+/// dropped: the fingerprint label is the only one, and it can't cover
+/// itself. Hashing the built request rather than its inputs means any
+/// change to [`task_definition_request`] registers a new revision on the
+/// next start, with nothing to remember to bump. (An SDK upgrade that
+/// changes `Debug` output does the same, once.)
+fn request_fingerprint(req: &RegisterTaskDefinitionInput) -> String {
+    let mut req = req.clone();
+    let mut taken = Vec::new();
+    for c in req.container_definitions.iter_mut().flatten() {
+        c.docker_labels = None;
+        let env: Vec<(Option<String>, Option<String>)> = c
+            .environment
+            .take()
+            .unwrap_or_default()
+            .iter()
+            .map(|kv| (kv.name().map(String::from), kv.value().map(String::from)))
+            .collect();
+        let credentials = c
+            .repository_credentials
+            .take()
+            .map(|r| r.credentials_parameter);
+        let log_options: Option<BTreeMap<String, String>> = c
+            .log_configuration
+            .as_mut()
+            .and_then(|l| l.options.take())
+            .map(|m| m.into_iter().collect());
+        taken.push(format!("{env:?}|{credentials:?}|{log_options:?}"));
+    }
+    Sha256::digest(format!("{req:?}\n{taken:?}").as_bytes())
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
@@ -274,6 +305,16 @@ fn health_check_command() -> String {
 
 /// The `RegisterTaskDefinition` request for `plan`, fingerprint label included.
 pub fn task_definition_request(plan: &WorkspacePlan) -> RegisterTaskDefinitionInput {
+    let mut req = build_request(plan);
+    let fingerprint = request_fingerprint(&req);
+    for c in req.container_definitions.iter_mut().flatten() {
+        c.docker_labels = Some([(FINGERPRINT_LABEL.to_string(), fingerprint.clone())].into());
+    }
+    req
+}
+
+/// The request without its fingerprint label.
+fn build_request(plan: &WorkspacePlan) -> RegisterTaskDefinitionInput {
     const BUILT: &str = "every required field is set";
     let hybrid = match (&plan.storage, &plan.file_system_id, &plan.access_point_id) {
         (StorageMode::Hybrid, Some(fs), Some(ap)) => Some((fs, ap)),
@@ -326,8 +367,7 @@ pub fn task_definition_request(plan: &WorkspacePlan) -> RegisterTaskDefinitionIn
                 .options("awslogs-stream-prefix", &plan.log_stream_prefix)
                 .build()
                 .expect(BUILT),
-        )
-        .docker_labels(FINGERPRINT_LABEL, workspace_fingerprint(plan));
+        );
     if hybrid.is_some() {
         container = container.mount_points(
             MountPoint::builder()
@@ -395,7 +435,6 @@ pub fn task_definition_request(plan: &WorkspacePlan) -> RegisterTaskDefinitionIn
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileSystemRef {
     pub id: String,
-    pub arn: String,
     /// Its `triple-c:owner` tag.
     pub owner: Option<String>,
 }
@@ -685,6 +724,23 @@ pub async fn prepare_workspace<W: WorkspaceApi>(
 /// Bounds on what one lookup lists.
 const MAX_ACCESS_POINTS: usize = 1000;
 const MAX_LISTED_REVISIONS: i32 = 100;
+/// `ListTaskDefinitions` pages read per lookup; past that, a new revision is
+/// registered (what crowding a family out can cost the caller).
+const MAX_REVISION_PAGES: usize = 20;
+
+/// Secrets Manager's `InvalidRequestException` for a name whose secret is
+/// scheduled for deletion ("... already scheduled for deletion").
+fn is_pending_deletion(message: Option<&str>) -> bool {
+    message.is_some_and(|m| m.contains("scheduled for deletion"))
+}
+
+fn pending_deletion_error(name: &str) -> AwsError {
+    other(format!(
+        "This project's secret ({name}) is scheduled for deletion, so it can't be written. \
+         Restore it in the Secrets Manager console (or wait until it is deleted) and start \
+         the project again."
+    ))
+}
 
 /// The real thing, from a connection's `SdkConfig`.
 pub struct SdkWorkspaceApi {
@@ -726,11 +782,16 @@ impl WorkspaceApi for SdkWorkspaceApi {
             .send()
             .await
             .map_err(|e| classify_sdk_error(ACTION, &e))?;
-        Ok(out.file_systems().first().map(|fs| FileSystemRef {
-            id: fs.file_system_id().to_string(),
-            arn: fs.file_system_arn().unwrap_or_default().to_string(),
-            owner: efs_tag(fs.tags(), TAG_OWNER),
-        }))
+        // One at most (a creation token is unique per account and region);
+        // one still being created or deleted can't be mounted.
+        Ok(out
+            .file_systems()
+            .iter()
+            .find(|fs| *fs.life_cycle_state() == aws_sdk_efs::types::LifeCycleState::Available)
+            .map(|fs| FileSystemRef {
+                id: fs.file_system_id().to_string(),
+                owner: efs_tag(fs.tags(), TAG_OWNER),
+            }))
     }
 
     async fn access_points(&self, fs_id: &str) -> Result<Vec<AccessPointRef>, AwsError> {
@@ -851,9 +912,24 @@ impl WorkspaceApi for SdkWorkspaceApi {
                     .secret_string(json)
                     .send()
                     .await
-                    .map_err(|e| classify_sdk_error(PUT, &e))?
+                    .map_err(|e| match e.as_service_error() {
+                        Some(s)
+                            if s.is_invalid_request_exception()
+                                && is_pending_deletion(s.message()) =>
+                        {
+                            pending_deletion_error(name)
+                        }
+                        _ => classify_sdk_error(PUT, &e),
+                    })?
                     .arn()
                     .map(str::to_string)
+            }
+            Err(e)
+                if e.as_service_error().is_some_and(|s| {
+                    s.is_invalid_request_exception() && is_pending_deletion(s.message())
+                }) =>
+            {
+                return Err(pending_deletion_error(name));
             }
             Err(e) => return Err(classify_sdk_error(CREATE, &e)),
         };
@@ -862,23 +938,35 @@ impl WorkspaceApi for SdkWorkspaceApi {
 
     async fn task_definition_revisions(&self, family: &str) -> Result<Vec<String>, AwsError> {
         const ACTION: &str = "ecs:ListTaskDefinitions";
-        let out = self
-            .ecs
-            .list_task_definitions()
-            .family_prefix(family)
-            .status(TaskDefinitionStatus::Active)
-            .sort(SortOrder::Desc)
-            .max_results(MAX_LISTED_REVISIONS)
-            .send()
-            .await
-            .map_err(|e| classify_sdk_error(ACTION, &e))?;
-        // `familyPrefix` is a prefix: keep exactly this family.
-        Ok(out
-            .task_definition_arns()
-            .iter()
-            .filter(|a| is_revision_arn_of(a, family))
-            .cloned()
-            .collect())
+        // `familyPrefix` is a prefix, and sorted descending a longer family
+        // (`<family>z`, anyone can register one) comes first: page on until
+        // enough of exactly this family is found, or the pages run out.
+        let mut found = Vec::new();
+        let mut token: Option<String> = None;
+        for _ in 0..MAX_REVISION_PAGES {
+            let page = self
+                .ecs
+                .list_task_definitions()
+                .family_prefix(family)
+                .status(TaskDefinitionStatus::Active)
+                .sort(SortOrder::Desc)
+                .max_results(MAX_LISTED_REVISIONS)
+                .set_next_token(token.take())
+                .send()
+                .await
+                .map_err(|e| classify_sdk_error(ACTION, &e))?;
+            found.extend(
+                page.task_definition_arns()
+                    .iter()
+                    .filter(|a| is_revision_arn_of(a, family))
+                    .cloned(),
+            );
+            match page.next_token() {
+                Some(t) if found.len() < MAX_REVISIONS_CHECKED => token = Some(t.to_string()),
+                _ => break,
+            }
+        }
+        Ok(found)
     }
 
     async fn describe_task_definition(
