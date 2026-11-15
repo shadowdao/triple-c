@@ -637,6 +637,9 @@ pub fn record_task(store: &ProjectsStore, project_id: &str, rec: Option<&TaskRec
     let Some(stored) = store.get(project_id).and_then(|p| p.aws) else {
         return;
     };
+    if let Some(r) = rec {
+        remember_task(project_id, &r.task_arn);
+    }
     let res = match rec {
         Some(r) => store.set_aws_runtime(
             project_id,
@@ -654,6 +657,71 @@ pub fn record_task(store: &ProjectsStore, project_id: &str, rec: Option<&TaskRec
     if let Err(e) = res {
         log::warn!("Project {project_id}: could not record its task: {e}");
     }
+}
+
+// ──────────────────────────────────────────────────────────────── logs
+
+/// The last task each project's starts ran or found, kept for this run of
+/// the app: a start that failed and stopped its own task clears the stored
+/// ARN, and its log is what the user then wants to read.
+static LAST_TASK: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+    std::sync::OnceLock::new();
+
+fn last_tasks() -> std::sync::MutexGuard<'static, std::collections::HashMap<String, String>> {
+    LAST_TASK
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+pub fn remember_task(project_id: &str, task_arn: &str) {
+    last_tasks().insert(project_id.to_string(), task_arn.to_string());
+}
+
+pub fn last_task_arn(project_id: &str) -> Option<String> {
+    last_tasks().get(project_id).cloned()
+}
+
+/// The task whose log `aws_task_log` reads: the stored (current) one, else
+/// the tunnel's, else the last one a start of this run ran or found.
+pub fn log_task_arn(project: &Project) -> Option<String> {
+    project
+        .aws
+        .as_ref()
+        .and_then(|a| a.task_arn.clone())
+        .or_else(|| tunnels::runtime(&project.id).map(|r| r.0))
+        .or_else(|| last_task_arn(&project.id))
+}
+
+/// The last `limit` lines of `task_arn`'s log stream, in the environment
+/// record's log group.
+pub async fn task_log_lines<T: TaskApi, R: RuntimeApi>(
+    api: &T,
+    rt: &R,
+    project: &Project,
+    who: &CallerIdentity,
+    region: &str,
+    task_arn: &str,
+    limit: i32,
+) -> Result<Vec<String>, String> {
+    let placement = project.aws_placement.as_ref().ok_or("The project has no AWS placement")?;
+    let env = read_environment(rt, &placement.environment, &who.account, region)
+        .await
+        .map_err(s)?;
+    let prefix = log_stream_prefix(&owner_key(region, &who.user_id), &project.id);
+    api.log_tail(&env.log_group, &task_log_stream(&prefix, task_arn), limit)
+        .await
+        .map_err(s)
+}
+
+/// `aws_task_log`: the current or last task's log; empty with no task.
+pub async fn task_log(project: &Project, settings: &AppSettings, limit: i32) -> Result<Vec<String>, String> {
+    let Some(arn) = log_task_arn(project) else {
+        return Ok(Vec::new());
+    };
+    let (_, region, sdk) = project_sdk(project, settings).await?;
+    let who = caller_identity(&sdk).await.map_err(s)?;
+    task_log_lines(&SdkTaskApi::new(&sdk), &SdkRuntimeApi::new(&sdk), project, &who, &region, &arn, limit).await
 }
 
 // ──────────────────────────────────────────────────────────────── stop

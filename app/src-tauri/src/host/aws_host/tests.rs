@@ -95,6 +95,8 @@ struct Fake {
     stop_fails: bool,
     /// What `on_task` was told, in order.
     recorded: Mutex<Vec<Option<String>>>,
+    /// `group stream limit` of each log read.
+    log_reads: Mutex<Vec<String>>,
 }
 
 impl Fake {
@@ -136,7 +138,8 @@ impl TaskApi for Fake {
         }
         Ok(())
     }
-    async fn log_tail(&self, _g: &str, _s: &str, _l: i32) -> Result<Vec<String>, AwsError> {
+    async fn log_tail(&self, g: &str, st: &str, l: i32) -> Result<Vec<String>, AwsError> {
+        self.log_reads.lock().unwrap().push(format!("{g} {st} {l}"));
         Ok(self.logs.clone())
     }
 }
@@ -697,4 +700,34 @@ async fn a_task_that_could_not_be_stopped_after_a_failed_start_stays_recorded() 
     };
     assert!(start(&fake, &p).await.0.is_err());
     assert_eq!(*fake.recorded.lock().unwrap(), vec![Some(task_arn("new"))]);
+}
+
+#[tokio::test]
+async fn the_task_log_reads_the_tasks_stream_in_the_records_log_group() {
+    let p = aws_project(StorageMode::Hybrid);
+    let fake = Fake { logs: vec!["line 1".into(), "line 2".into()], ..Default::default() };
+    let lines = task_log_lines(&fake, &fake, &p, &who(), REGION, &task_arn("abc"), 20).await.unwrap();
+    assert_eq!(lines, vec!["line 1", "line 2"]);
+    let prefix = log_stream_prefix(&owner_key(REGION, USER), &p.id);
+    assert_eq!(
+        *fake.log_reads.lock().unwrap(),
+        vec![format!("/triple-c/dev {prefix}/workspace/abc 20")]
+    );
+}
+
+#[test]
+fn the_log_task_is_the_stored_one_else_the_last_one_a_start_saw() {
+    let mut p = aws_project(StorageMode::Hybrid);
+    p.id = "log-task-test-project".into();
+    assert_eq!(log_task_arn(&p), None);
+    let (_d, store) = store_with(&p);
+    record_task(
+        &store,
+        &p.id,
+        Some(&TaskRecord { task_arn: "arn:first".into(), access_point_id: None, task_definition_arn: None }),
+    );
+    record_task(&store, &p.id, None);
+    assert_eq!(log_task_arn(&p).as_deref(), Some("arn:first"), "a cleared ARN still has a log");
+    p.aws.as_mut().unwrap().task_arn = Some("arn:current".into());
+    assert_eq!(log_task_arn(&p).as_deref(), Some("arn:current"));
 }

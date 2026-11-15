@@ -681,6 +681,35 @@ pub fn validate_aws_workspace(cfg: &AwsWorkspaceConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// What Stop does with an AWS workspace's unsaved git work (the stop guard).
+/// A local project ignores it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WipChoice {
+    /// Run `triple-c-wip-push --reason stop` first; a failure aborts the stop.
+    Push,
+    /// Stop without pushing from the app.
+    Discard,
+}
+
+/// One repository line of `triple-c-wip-push --dry-run`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RepoState {
+    pub folder: String,
+    pub dirty: bool,
+    pub unpushed: u64,
+    pub branch: String,
+}
+
+/// What `check_unsaved_work` found. `checked: false` (with `error`) when the
+/// workspace could not be asked — the stop guard then cannot offer a push.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct UnsavedWork {
+    pub checked: bool,
+    pub repos: Vec<RepoState>,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum ProjectStatus {

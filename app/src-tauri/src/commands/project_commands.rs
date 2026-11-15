@@ -4,7 +4,10 @@ use crate::commands::aws_commands;
 use crate::docker;
 use crate::host::lifecycle::{DiscardLeftovers, ProjectHost};
 use crate::host::ContainerTarget;
-use crate::models::{Backend, BedrockAuthMethod, Project, ProjectPath, ProjectRemovalReport, ProjectResetOutcome, ProjectStatus};
+use crate::models::{
+    AwsPlacement, AwsWorkspaceConfig, Backend, BedrockAuthMethod, Project, ProjectPath,
+    ProjectRemovalReport, ProjectResetOutcome, ProjectStatus, UnsavedWork, WipChoice,
+};
 use crate::storage::secure;
 use crate::AppState;
 
@@ -633,9 +636,47 @@ pub async fn list_projects(state: State<'_, AppState>) -> Result<Vec<Project>, S
 pub async fn add_project(
     name: String,
     paths: Vec<ProjectPath>,
+    host_id: Option<String>,
+    aws_placement: Option<AwsPlacement>,
+    aws: Option<AwsWorkspaceConfig>,
     state: State<'_, AppState>,
 ) -> Result<Project, String> {
-    // Validate paths
+    let project = new_project(name, paths, host_id, aws_placement, aws, &state.settings_store.get().hosts)?;
+    // Nothing can have been blanked on a project that did not exist a line ago.
+    store_secrets_for_project(&project, &[])?;
+    state.projects_store.add(project)
+}
+
+/// The project `add_project` creates. A local project needs a folder; an
+/// AWS project (all three host fields) clones repositories instead and
+/// takes no folders. The host fields are checked as a save would check them.
+fn new_project(
+    name: String,
+    paths: Vec<ProjectPath>,
+    host_id: Option<String>,
+    aws_placement: Option<AwsPlacement>,
+    aws: Option<AwsWorkspaceConfig>,
+    hosts: &[crate::models::HostConnection],
+) -> Result<Project, String> {
+    let on_host = host_id.is_some() || aws_placement.is_some() || aws.is_some();
+    if on_host {
+        if paths.iter().any(|p| !p.host_path.is_empty() || !p.mount_name.is_empty()) {
+            return Err("A project on AWS clones repositories; it can't mount folders from this machine.".into());
+        }
+        let blank = Project::new(name.clone(), Vec::new());
+        let mut project = Project::new(name, Vec::new());
+        project.host_id = host_id;
+        project.aws_placement = aws_placement;
+        // Runtime handles belong to the start path, never to the caller.
+        project.aws = aws.map(|a| AwsWorkspaceConfig {
+            task_arn: None,
+            access_point_id: None,
+            task_definition_arn: None,
+            ..a
+        });
+        validate_aws_update(&blank, &project, hosts)?;
+        return Ok(project);
+    }
     // A new project needs a folder; the blank row `validate_project_paths`
     // tolerates is the Config tab's placeholder on an *existing* one.
     if paths.is_empty()
@@ -646,10 +687,7 @@ pub async fn add_project(
         return Err("At least one folder path is required.".to_string());
     }
     validate_project_paths(&paths)?;
-    let project = Project::new(name, paths);
-    // Nothing can have been blanked on a project that did not exist a line ago.
-    store_secrets_for_project(&project, &[])?;
-    state.projects_store.add(project)
+    Ok(Project::new(name, paths))
 }
 
 #[tauri::command]
@@ -1453,6 +1491,7 @@ async fn start_project_container_locked(
 #[tauri::command]
 pub async fn stop_project_container(
     project_id: String,
+    wip: Option<WipChoice>,
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
@@ -1475,6 +1514,19 @@ pub async fn stop_project_container(
     state.auth_bridge.stop(&project_id).await;
 
     if project.is_aws() {
+        // The stop guard's choice: a push that fails aborts the stop, and
+        // the project keeps its status (the push output says why).
+        if wip == Some(WipChoice::Push) {
+            emit_progress(&app_handle, &project_id, "Pushing unsaved work...");
+            let target = ContainerTarget::for_project(&project);
+            if let Err(e) =
+                super::stop_guard::before_stop(target.as_ref(), wip, super::stop_guard::PUSH_TIMEOUT).await
+            {
+                log::warn!("Project {}: WIP push before stop failed: {}", project_id, e);
+                let _ = state.projects_store.update_status(&project_id, project.status.clone());
+                return Err(e);
+            }
+        }
         // A failed StopTask leaves a billed task running, so unlike Docker it
         // is not papered over: the project keeps its status and the user
         // sees why (expired SSO, typically), and can retry.
@@ -1508,6 +1560,80 @@ pub async fn stop_project_container(
     }
 
     state.projects_store.update_status(&project_id, ProjectStatus::Stopped)?;
+    Ok(())
+}
+
+/// The stop guard's question: what would stopping this AWS workspace lose?
+/// A local project (or a stopped one) has nothing to check.
+#[tauri::command]
+pub async fn check_unsaved_work(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<UnsavedWork, String> {
+    let project = state
+        .projects_store
+        .get(&project_id)
+        .ok_or_else(|| format!("Project {} not found", project_id))?;
+    if !project.is_aws() || project.status != ProjectStatus::Running {
+        return Ok(UnsavedWork { checked: true, ..Default::default() });
+    }
+    let target = ContainerTarget::for_project(&project);
+    Ok(super::stop_guard::unsaved_work(target.as_ref(), super::stop_guard::DRY_RUN_TIMEOUT).await)
+}
+
+/// The last `limit` (1–200) lines of the AWS project's current or last task's
+/// log. Empty when there is no task to read (or the project is local).
+#[tauri::command]
+pub async fn aws_task_log(
+    project_id: String,
+    limit: u32,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    let project = state
+        .projects_store
+        .get(&project_id)
+        .ok_or_else(|| format!("Project {} not found", project_id))?;
+    if !project.is_aws() {
+        return Ok(Vec::new());
+    }
+    let settings = state.settings_store.get();
+    crate::host::aws_host::task_log(&project, &settings, limit.clamp(1, 200) as i32).await
+}
+
+/// Remove an AWS project's task definitions, secret and (with
+/// `discard_data`) saved files, keeping the project, so it can move to
+/// another host. Stopped projects only.
+#[tauri::command]
+pub async fn remove_aws_resources(
+    project_id: String,
+    discard_data: bool,
+    state: State<'_, AppState>,
+) -> Result<Project, String> {
+    let _guard =
+        crate::project_lock::try_acquire(&project_id, crate::project_lock::ProjectOp::Destroy)?;
+    let project = state
+        .projects_store
+        .get(&project_id)
+        .ok_or_else(|| format!("Project {} not found", project_id))?;
+    check_aws_resources_removable(&project)?;
+    let settings = state.settings_store.get();
+    ProjectHost::for_project(&project)
+        .remove_aws_resources(&project, &settings, discard_data)
+        .await?;
+    state.projects_store.set_aws_runtime(&project_id, None, None, None)?;
+    state
+        .projects_store
+        .get(&project_id)
+        .ok_or_else(|| format!("Project {} not found", project_id))
+}
+
+fn check_aws_resources_removable(project: &Project) -> Result<(), String> {
+    if !project.is_aws() {
+        return Err("This project does not run on AWS".into());
+    }
+    if project.status != ProjectStatus::Stopped {
+        return Err("Stop the project before removing its AWS resources".into());
+    }
     Ok(())
 }
 
@@ -2487,5 +2613,45 @@ mod tests {
         let e = missing_connection_removal(false).unwrap_err();
         assert!(e.contains("still be running") && e.contains("Settings → Hosts"), "{e}");
         assert!(missing_connection_removal(true).is_ok());
+    }
+
+    #[test]
+    fn a_new_aws_project_takes_repos_not_folders_and_no_runtime_handles() {
+        let hosts = vec![host("h1")];
+        let place = || Some(AwsPlacement { region: "us-west-2".into(), environment: "dev".into() });
+        let cfg = AwsWorkspaceConfig {
+            task_arn: Some("arn:forged".into()),
+            access_point_id: Some("fsap-forged".into()),
+            repos: vec![crate::models::RepoSource { url: "https://h/r.git".into(), branch: None, folder: "r".into() }],
+            ..Default::default()
+        };
+        let p = new_project("a".into(), vec![], Some("h1".into()), place(), Some(cfg.clone()), &hosts).unwrap();
+        assert!(p.is_aws() && p.paths.is_empty());
+        let a = p.aws.unwrap();
+        assert_eq!((a.task_arn, a.access_point_id, a.task_definition_arn), (None, None, None));
+        assert_eq!(a.repos.len(), 1);
+        // folders are refused, so are half placements, unknown hosts and invalid configs
+        let folder = vec![ProjectPath { host_path: "/x".into(), mount_name: "x".into() }];
+        assert!(new_project("a".into(), folder, Some("h1".into()), place(), Some(cfg.clone()), &hosts).is_err());
+        assert!(new_project("a".into(), vec![], Some("h1".into()), None, Some(cfg.clone()), &hosts).is_err());
+        assert!(new_project("a".into(), vec![], Some("nope".into()), place(), Some(cfg.clone()), &hosts).is_err());
+        let bad = AwsWorkspaceConfig { cpu: 256, memory_mib: 8192, ..Default::default() };
+        let e = new_project("a".into(), vec![], Some("h1".into()), place(), Some(bad), &hosts).unwrap_err();
+        assert!(e.contains("not valid"), "{e}");
+        // a local project still needs a folder
+        assert!(new_project("a".into(), vec![], None, None, None, &hosts).is_err());
+    }
+
+    #[test]
+    fn aws_resources_are_removable_only_from_a_stopped_aws_project() {
+        let mut p = aws_project();
+        assert!(check_aws_resources_removable(&p).is_ok());
+        p.status = ProjectStatus::Running;
+        assert!(check_aws_resources_removable(&p).unwrap_err().contains("Stop"));
+        p.status = ProjectStatus::Error;
+        assert!(check_aws_resources_removable(&p).is_err());
+        let mut local = aws_project();
+        local.host_id = None;
+        assert!(check_aws_resources_removable(&local).is_err());
     }
 }
