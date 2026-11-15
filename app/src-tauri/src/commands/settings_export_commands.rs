@@ -535,24 +535,15 @@ pub async fn apply_settings_import(
         secure::store_aws_keys,
     ));
 
-    let imported_marketplace = (
-        settings.marketplace_accounts.clone(),
-        settings.marketplaces.clone(),
-        settings.global_marketplace_installs.clone(),
-    );
+    let imported_owned = StoreOwned::of(&settings);
     let saved =
         crate::commands::settings_commands::update_settings(settings, state.clone()).await?;
-    // `update_settings` keeps marketplace state store-owned. An import is the
-    // one caller entitled to replace it wholesale.
-    let saved = {
-        let mut s = saved;
-        (
-            s.marketplace_accounts,
-            s.marketplaces,
-            s.global_marketplace_installs,
-        ) = imported_marketplace;
-        state.settings_store.update(s)?
-    };
+    // `update_settings` keeps marketplace state and host connections
+    // store-owned. An import is the one caller entitled to replace them
+    // wholesale.
+    let saved = state
+        .settings_store
+        .update(imported_owned.applied_to(saved))?;
     // Caches of marketplaces the import dropped are dead weight now, and
     // the pins must match the imported installs.
     use crate::commands::marketplace_commands as mc;
@@ -591,6 +582,34 @@ pub async fn apply_settings_import(
         settings: saved,
         secret_restore_warnings,
     })
+}
+
+/// The settings `update_settings` keeps store-owned (marketplace state and
+/// host connections), which an import re-applies after that call.
+struct StoreOwned {
+    marketplace_accounts: Vec<crate::models::marketplace::MarketplaceAccount>,
+    marketplaces: Vec<crate::models::marketplace::Marketplace>,
+    global_marketplace_installs: Vec<crate::models::marketplace::MarketplaceInstall>,
+    hosts: Vec<crate::models::HostConnection>,
+}
+
+impl StoreOwned {
+    fn of(s: &AppSettings) -> Self {
+        Self {
+            marketplace_accounts: s.marketplace_accounts.clone(),
+            marketplaces: s.marketplaces.clone(),
+            global_marketplace_installs: s.global_marketplace_installs.clone(),
+            hosts: s.hosts.clone(),
+        }
+    }
+
+    fn applied_to(self, mut s: AppSettings) -> AppSettings {
+        s.marketplace_accounts = self.marketplace_accounts;
+        s.marketplaces = self.marketplaces;
+        s.global_marketplace_installs = self.global_marketplace_installs;
+        s.hosts = self.hosts;
+        s
+    }
 }
 
 fn non_blank(value: Option<String>) -> Option<String> {
@@ -1043,5 +1062,29 @@ mod tests {
         // Keys carried for a connection that is not a Keys connection.
         assert!(check(vec![profile_host("p1")], BTreeMap::from([("p1".into(), "{}".into())])).is_err());
         assert!(check(vec![], BTreeMap::from([("ghost".into(), "{}".into())])).is_err());
+    }
+
+    #[test]
+    fn imported_hosts_survive_apply() {
+        use crate::models::{AwsAuth, HostConnection, HostKind};
+        let host = HostConnection {
+            id: "h1".into(),
+            name: "Imported".into(),
+            kind: HostKind::Aws {
+                auth: AwsAuth::Profile { name: "dev".into() },
+                default_region: "us-west-2".into(),
+            },
+        };
+        let stored = AppSettings::default();
+        let mut imported = AppSettings::default();
+        imported.hosts.push(host.clone());
+
+        let owned = StoreOwned::of(&imported);
+        // What `update_settings` does to the incoming settings.
+        let mut after_update = imported.clone();
+        crate::commands::settings_commands::restore_host_fields(&mut after_update, &stored);
+        assert!(after_update.hosts.is_empty(), "update_settings drops hosts");
+
+        assert_eq!(owned.applied_to(after_update).hosts, vec![host]);
     }
 }
