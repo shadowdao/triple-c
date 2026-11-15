@@ -1,0 +1,129 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ManageEnvironmentStacks",
+      "Effect": "Allow",
+      "Action": ["cloudformation:*"],
+      "Resource": ["arn:aws:cloudformation:*:*:stack/triple-c-*/*"]
+    },
+    {
+      "Sid": "ManageTripleCRoles",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole",
+        "iam:DeleteRole",
+        "iam:PutRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:TagRole",
+        "iam:GetRole"
+      ],
+      "Resource": ["arn:aws:iam::*:role/triple-c-*"]
+    },
+    {
+      "Sid": "PassTripleCRoles",
+      "Effect": "Allow",
+      "Action": ["iam:PassRole"],
+      "Resource": ["arn:aws:iam::*:role/triple-c-*"],
+      "Condition": {
+        "StringEquals": {
+          "iam:PassedToService": ["ecs-tasks.amazonaws.com", "ec2.amazonaws.com"]
+        }
+      }
+    },
+    {
+      "Sid": "ManageClusters",
+      "Effect": "Allow",
+      "Action": ["ecs:CreateCluster", "ecs:DeleteCluster", "ecs:PutClusterCapacityProviders"],
+      "Resource": ["arn:aws:ecs:*:*:cluster/triple-c-*"]
+    },
+    {
+      "Sid": "ManageCapacityProviders",
+      "Effect": "Allow",
+      "Action": ["ecs:CreateCapacityProvider", "ecs:DeleteCapacityProvider"],
+      "Resource": ["arn:aws:ecs:*:*:capacity-provider/triple-c-*"]
+    },
+    {
+      "Sid": "ManageTaskDefinitions",
+      "Effect": "Allow",
+      "Action": ["ecs:RegisterTaskDefinition", "ecs:DeregisterTaskDefinition"],
+      "Resource": ["*"]
+    },
+    {
+      "Sid": "ManageSecurityGroups",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateSecurityGroup",
+        "ec2:DeleteSecurityGroup",
+        "ec2:AuthorizeSecurityGroup*",
+        "ec2:RevokeSecurityGroup*",
+        "ec2:CreateTags",
+        "ec2:Describe*"
+      ],
+      "Resource": ["*"]
+    },
+    {
+      "Sid": "ManageFileSystems",
+      "Effect": "Allow",
+      "Action": [
+        "elasticfilesystem:CreateFileSystem",
+        "elasticfilesystem:DeleteFileSystem",
+        "elasticfilesystem:CreateMountTarget",
+        "elasticfilesystem:DeleteMountTarget",
+        "elasticfilesystem:PutFileSystemPolicy",
+        "elasticfilesystem:TagResource"
+      ],
+      "Resource": ["arn:aws:elasticfilesystem:*:*:file-system/*"]
+    },
+    {
+      "Sid": "CreateKeys",
+      "Effect": "Allow",
+      "Action": ["kms:CreateKey"],
+      "Resource": ["*"]
+    },
+    {
+      "Sid": "ManageKeys",
+      "Effect": "Allow",
+      "Action": ["kms:ScheduleKeyDeletion", "kms:PutKeyPolicy", "kms:TagResource"],
+      "Resource": ["arn:aws:kms:*:*:key/*"]
+    },
+    {
+      "Sid": "ManageKeyAliases",
+      "Effect": "Allow",
+      "Action": ["kms:CreateAlias", "kms:DeleteAlias"],
+      "Resource": ["arn:aws:kms:*:*:alias/triple-c-*", "arn:aws:kms:*:*:key/*"]
+    },
+    {
+      "Sid": "ManageLogGroups",
+      "Effect": "Allow",
+      "Action": ["logs:CreateLogGroup", "logs:DeleteLogGroup", "logs:PutRetentionPolicy"],
+      "Resource": ["arn:aws:logs:*:*:log-group:/triple-c/*"]
+    },
+    {
+      "Sid": "ManageRepositories",
+      "Effect": "Allow",
+      "Action": ["ecr:CreateRepository", "ecr:DeleteRepository"],
+      "Resource": ["arn:aws:ecr:*:*:repository/triple-c-*", "arn:aws:ecr:*:*:repository/triple-c/*"]
+    },
+    {
+      "Sid": "CreatePullThroughCacheRules",
+      "Effect": "Allow",
+      "Action": ["ecr:CreatePullThroughCacheRule"],
+      "Resource": ["*"]
+    },
+    {
+      "Sid": "ManageEnvironmentParameters",
+      "Effect": "Allow",
+      "Action": ["ssm:PutParameter", "ssm:DeleteParameter"],
+      "Resource": ["arn:aws:ssm:*:*:parameter/triple-c/*"]
+    },
+    {
+      "Sid": "CheckPermissions",
+      "Effect": "Allow",
+      "Action": ["iam:SimulatePrincipalPolicy"],
+      "Resource": ["*"]
+    }
+  ]
+}

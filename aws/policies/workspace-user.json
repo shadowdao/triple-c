@@ -1,0 +1,151 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "RunOwnTasks",
+      "Effect": "Allow",
+      "Action": ["ecs:RunTask"],
+      "Resource": ["arn:aws:ecs:*:*:task-definition/triple-c-*"],
+      "Condition": {
+        "StringEquals": { "aws:RequestTag/triple-c:owner": "${aws:userid}" },
+        "ArnLike": { "ecs:cluster": "arn:aws:ecs:*:*:cluster/triple-c-*" }
+      }
+    },
+    {
+      "Sid": "TagOwnTasksAtRunTask",
+      "Effect": "Allow",
+      "Action": ["ecs:TagResource"],
+      "Resource": ["arn:aws:ecs:*:*:task/triple-c-*/*"],
+      "Condition": {
+        "StringEquals": {
+          "ecs:CreateAction": "RunTask",
+          "aws:RequestTag/triple-c:owner": "${aws:userid}"
+        }
+      }
+    },
+    {
+      "Sid": "PassOwnTaskRoles",
+      "Effect": "Allow",
+      "Action": ["iam:PassRole"],
+      "Resource": ["arn:aws:iam::*:role/triple-c-*"],
+      "Condition": {
+        "StringEquals": {
+          "iam:ResourceTag/triple-c:owner": "${aws:userid}",
+          "iam:PassedToService": "ecs-tasks.amazonaws.com"
+        }
+      }
+    },
+    {
+      "Sid": "StopAndExecOwnTasks",
+      "Effect": "Allow",
+      "Action": ["ecs:StopTask", "ecs:ExecuteCommand"],
+      "Resource": ["arn:aws:ecs:*:*:task/triple-c-*/*"],
+      "Condition": {
+        "StringEquals": { "aws:ResourceTag/triple-c:owner": "${aws:userid}" }
+      }
+    },
+    {
+      "Sid": "StartSessionsToOwnTasks",
+      "Effect": "Allow",
+      "Action": ["ssm:StartSession"],
+      "Resource": ["arn:aws:ecs:*:*:task/triple-c-*/*"],
+      "Condition": {
+        "StringEquals": { "aws:ResourceTag/triple-c:owner": "${aws:userid}" }
+      }
+    },
+    {
+      "Sid": "UsePortForwardingDocument",
+      "Effect": "Allow",
+      "Action": ["ssm:StartSession"],
+      "Resource": ["arn:aws:ssm:*::document/AWS-StartPortForwardingSession"]
+    },
+    {
+      "Sid": "EndOrResumeOwnSessions",
+      "Effect": "Allow",
+      "Action": ["ssm:TerminateSession", "ssm:ResumeSession"],
+      "Resource": ["arn:aws:ssm:*:*:session/*"],
+      "Condition": {
+        "StringLike": { "ssm:resourceTag/aws:ssmmessages:session-id": "${aws:userid}" }
+      }
+    },
+    {
+      "Sid": "CreateOwnSecrets",
+      "Effect": "Allow",
+      "Action": ["secretsmanager:CreateSecret"],
+      "Resource": ["arn:aws:secretsmanager:*:*:secret:triple-c/*"],
+      "Condition": {
+        "StringEquals": { "aws:RequestTag/triple-c:owner": "${aws:userid}" }
+      }
+    },
+    {
+      "Sid": "TagOwnSecrets",
+      "Effect": "Allow",
+      "Action": ["secretsmanager:TagResource"],
+      "Resource": ["arn:aws:secretsmanager:*:*:secret:triple-c/*"],
+      "Condition": {
+        "StringEquals": { "aws:RequestTag/triple-c:owner": "${aws:userid}" },
+        "StringEqualsIfExists": { "aws:ResourceTag/triple-c:owner": "${aws:userid}" }
+      }
+    },
+    {
+      "Sid": "ManageOwnSecrets",
+      "Effect": "Allow",
+      "Action": ["secretsmanager:PutSecretValue", "secretsmanager:DeleteSecret"],
+      "Resource": ["arn:aws:secretsmanager:*:*:secret:triple-c/*"],
+      "Condition": {
+        "StringEquals": { "aws:ResourceTag/triple-c:owner": "${aws:userid}" }
+      }
+    },
+    {
+      "Sid": "EncryptThroughSecretsManagerOnly",
+      "Effect": "Allow",
+      "Action": ["kms:Encrypt", "kms:GenerateDataKey"],
+      "Resource": ["arn:aws:kms:*:*:key/*"],
+      "Condition": {
+        "StringLike": { "kms:ViaService": "secretsmanager.*.amazonaws.com" }
+      }
+    },
+    {
+      "Sid": "ReadEcs",
+      "Effect": "Allow",
+      "Action": ["ecs:Describe*", "ecs:List*"],
+      "Resource": ["*"]
+    },
+    {
+      "Sid": "ReadEnvironmentParameters",
+      "Effect": "Allow",
+      "Action": ["ssm:GetParameter*"],
+      "Resource": ["arn:aws:ssm:*:*:parameter/triple-c/*"]
+    },
+    {
+      "Sid": "ReadStacks",
+      "Effect": "Allow",
+      "Action": ["cloudformation:DescribeStacks", "cloudformation:ListStacks"],
+      "Resource": ["*"]
+    },
+    {
+      "Sid": "ListSecrets",
+      "Effect": "Allow",
+      "Action": ["secretsmanager:ListSecrets"],
+      "Resource": ["*"]
+    },
+    {
+      "Sid": "ReadFileSystems",
+      "Effect": "Allow",
+      "Action": ["elasticfilesystem:Describe*"],
+      "Resource": ["*"]
+    },
+    {
+      "Sid": "ReadLogs",
+      "Effect": "Allow",
+      "Action": ["logs:GetLogEvents", "logs:FilterLogEvents"],
+      "Resource": ["arn:aws:logs:*:*:log-group:/triple-c/*"]
+    },
+    {
+      "Sid": "WhoAmI",
+      "Effect": "Allow",
+      "Action": ["sts:GetCallerIdentity"],
+      "Resource": ["*"]
+    }
+  ]
+}

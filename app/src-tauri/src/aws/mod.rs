@@ -7,6 +7,7 @@
 mod connection;
 mod error;
 mod identity;
+pub mod policies;
 
 pub use connection::sdk_config;
 pub use error::{classify_sdk_error, AwsError};
