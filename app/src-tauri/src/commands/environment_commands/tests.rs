@@ -498,3 +498,64 @@ fn an_existing_boundary_without_state_here_is_refused() {
     assert!(boundary_refusal(&Knowable::No, Some(false)).is_ok());
     assert!(boundary_refusal(&Knowable::Unknown, Some(false)).is_ok());
 }
+
+#[test]
+fn a_follow_is_refused_while_a_launch_holds_the_folder() {
+    let dir = Path::new("/w/env/dev");
+    let mut slots: Slots<u32> = Slots::default();
+    slots.begin_launch(dir).unwrap();
+    let mut spawned = false;
+    let r = slots.install_follower(dir, "f1", false, || {
+        spawned = true;
+        1
+    });
+    assert_eq!(r.unwrap_err(), SlotBusy::Launching);
+    assert!(!spawned, "nothing is spawned for a refused follow");
+    // The launch's own follower replaces its Launching slot.
+    assert_eq!(slots.install_follower(dir, "l1", true, || 2).unwrap(), None);
+    slots.end_launch(dir); // the guard dropping afterwards
+    assert!(!slots.is_free(dir), "end_launch must not clear a follower");
+}
+
+#[test]
+fn a_launch_is_refused_while_a_follower_or_launch_holds_the_folder() {
+    let dir = Path::new("/w/env/dev");
+    let mut slots: Slots<u32> = Slots::default();
+    slots.install_follower(dir, "f1", false, || 1).unwrap();
+    assert_eq!(slots.begin_launch(dir).unwrap_err(), SlotBusy::Following);
+    slots.finish_follower(dir, "f1");
+    slots.begin_launch(dir).unwrap();
+    assert_eq!(slots.begin_launch(dir).unwrap_err(), SlotBusy::Launching);
+    slots.end_launch(dir);
+    assert!(slots.is_free(dir));
+    // Other folders are independent.
+    slots.begin_launch(dir).unwrap();
+    slots.begin_launch(Path::new("/w/env/prod")).unwrap();
+}
+
+#[test]
+fn a_finishing_follower_only_removes_its_own_slot() {
+    let dir = Path::new("/w/env/dev");
+    let mut slots: Slots<u32> = Slots::default();
+    slots.install_follower(dir, "old", false, || 1).unwrap();
+    // A re-follow replaces it and hands back the old task to abort.
+    assert_eq!(slots.install_follower(dir, "new", false, || 2).unwrap(), Some(1));
+    slots.finish_follower(dir, "old");
+    assert!(!slots.is_free(dir), "the old follower must not remove the new one's slot");
+    slots.finish_follower(dir, "new");
+    assert!(slots.is_free(dir));
+    // Nor a launch's slot.
+    slots.begin_launch(dir).unwrap();
+    slots.finish_follower(dir, "new");
+    assert_eq!(slots.begin_launch(dir).unwrap_err(), SlotBusy::Launching);
+}
+
+#[test]
+fn ending_a_launch_never_clears_a_following_slot() {
+    let dir = Path::new("/w/env/dev");
+    let mut slots: Slots<u32> = Slots::default();
+    slots.install_follower(dir, "f", false, || 1).unwrap();
+    slots.end_launch(dir);
+    assert_eq!(slots.begin_launch(dir).unwrap_err(), SlotBusy::Following);
+    slots.end_launch(Path::new("/w/env/none")); // nothing there: no-op
+}

@@ -573,21 +573,113 @@ pub(crate) async fn follow_and_report(
 // ---------------------------------------------------------------------------
 // Plumbing
 
-/// What this process is doing with a work folder.
-enum Slot {
+/// What this process is doing with a work folder. `T` is the follower
+/// task's handle (generic so the registry is unit-testable).
+pub(crate) enum Slot<T> {
     /// A launch is between its checks and its start; nothing else may
     /// materialize, start or follow the folder.
     Launching,
     /// One task follows the folder's run under `op_id`.
-    Following {
-        op_id: String,
-        task: tauri::async_runtime::JoinHandle<()>,
-    },
+    Following { op_id: String, task: T },
 }
 
-static SLOTS: OnceLock<Mutex<HashMap<PathBuf, Slot>>> = OnceLock::new();
+/// Why a folder's slot refused.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SlotBusy {
+    Launching,
+    Following,
+}
 
-fn slots() -> std::sync::MutexGuard<'static, HashMap<PathBuf, Slot>> {
+impl SlotBusy {
+    fn error(&self, label: &str) -> AwsError {
+        other(match self {
+            SlotBusy::Launching => format!("A deployment is starting for {label}; wait for it"),
+            SlotBusy::Following => format!(
+                "The run for {label} is still being followed; wait for it to finish"
+            ),
+        })
+    }
+}
+
+/// Per work folder: a launch in progress or the one follower. Every
+/// check-and-change happens in one method call, i.e. under one acquisition
+/// of the registry's lock.
+pub(crate) struct Slots<T>(HashMap<PathBuf, Slot<T>>);
+
+impl<T> Default for Slots<T> {
+    fn default() -> Self {
+        Slots(HashMap::new())
+    }
+}
+
+impl<T> Slots<T> {
+    /// Claim `dir` for a launch: refused if anything holds it.
+    pub(crate) fn begin_launch(&mut self, dir: &Path) -> Result<(), SlotBusy> {
+        match self.0.get(dir) {
+            Some(Slot::Launching) => Err(SlotBusy::Launching),
+            Some(Slot::Following { .. }) => Err(SlotBusy::Following),
+            None => {
+                self.0.insert(dir.to_path_buf(), Slot::Launching);
+                Ok(())
+            }
+        }
+    }
+
+    /// A launch is over without a follower: clear `Launching`, never a
+    /// follower's slot.
+    pub(crate) fn end_launch(&mut self, dir: &Path) {
+        if matches!(self.0.get(dir), Some(Slot::Launching)) {
+            self.0.remove(dir);
+        }
+    }
+
+    /// Install a follower made by `spawn`. From a launch (`from_launch`, the
+    /// caller holds `Launching`) it replaces the launch's slot; from a
+    /// follow it is refused while a launch holds the folder, and otherwise
+    /// replaces any earlier follower, whose handle is returned to abort.
+    /// `spawn` runs only once the check has passed, under the same lock.
+    pub(crate) fn install_follower(
+        &mut self,
+        dir: &Path,
+        op_id: &str,
+        from_launch: bool,
+        spawn: impl FnOnce() -> T,
+    ) -> Result<Option<T>, SlotBusy> {
+        if !from_launch && matches!(self.0.get(dir), Some(Slot::Launching)) {
+            return Err(SlotBusy::Launching);
+        }
+        let task = spawn();
+        let old = self.0.insert(
+            dir.to_path_buf(),
+            Slot::Following {
+                op_id: op_id.to_string(),
+                task,
+            },
+        );
+        Ok(match old {
+            Some(Slot::Following { task, .. }) => Some(task),
+            _ => None,
+        })
+    }
+
+    /// A follower ended: remove the slot only if it is still that one's.
+    pub(crate) fn finish_follower(&mut self, dir: &Path, op_id: &str) {
+        if matches!(self.0.get(dir), Some(Slot::Following { op_id: id, .. }) if id == op_id) {
+            self.0.remove(dir);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_free(&self, dir: &Path) -> bool {
+        !self.0.contains_key(dir)
+    }
+}
+
+type FollowerTask = tauri::async_runtime::JoinHandle<()>;
+
+static SLOTS: OnceLock<Mutex<Slots<FollowerTask>>> = OnceLock::new();
+
+fn slots() -> std::sync::MutexGuard<'static, Slots<FollowerTask>> {
     SLOTS
         .get_or_init(Default::default)
         .lock()
@@ -600,28 +692,14 @@ struct LaunchGuard(PathBuf);
 
 impl LaunchGuard {
     fn take(dir: &Path, label: &str) -> Result<LaunchGuard, AwsError> {
-        let mut map = slots();
-        match map.get(dir) {
-            Some(Slot::Launching) => Err(other(format!(
-                "A deployment is starting for {label}; wait for it"
-            ))),
-            Some(Slot::Following { .. }) => Err(other(format!(
-                "The run for {label} is still being followed; wait for it to finish"
-            ))),
-            None => {
-                map.insert(dir.to_path_buf(), Slot::Launching);
-                Ok(LaunchGuard(dir.to_path_buf()))
-            }
-        }
+        slots().begin_launch(dir).map_err(|b| b.error(label))?;
+        Ok(LaunchGuard(dir.to_path_buf()))
     }
 }
 
 impl Drop for LaunchGuard {
     fn drop(&mut self) {
-        let mut map = slots();
-        if matches!(map.get(&self.0), Some(Slot::Launching)) {
-            map.remove(&self.0);
-        }
+        slots().end_launch(&self.0);
     }
 }
 
@@ -736,7 +814,7 @@ async fn boundary_state_exists(ctx: &Ctx) -> Result<Option<bool>, AwsError> {
         Err(e) => match e.raw_response().map(|r| r.status().as_u16()) {
             Some(404) => Ok(Some(false)),
             Some(403) => Ok(None),
-            _ => Err(crate::aws::classify_sdk_error("s3:GetObject", &e)),
+            _ => Err(crate::aws::classify_sdk_error("s3:GetObject (HeadObject)", &e)),
         },
     }
 }
@@ -764,9 +842,17 @@ fn emit_progress(app: &AppHandle, p: &DeployProgress) {
 /// Start the folder's follower under a new op id, replacing (aborting) any
 /// follower this process already has for it, so a re-follow (a reloaded
 /// window) replays the whole log. The follower emits nothing until the
-/// returned [`Gate`] is opened. The caller has checked the folder isn't
-/// launching, or holds its [`LaunchGuard`].
-fn install_follower(app: AppHandle, wd: Workdir, key: String, can_cancel: bool) -> (String, Gate) {
+/// returned [`Gate`] is opened. A follow (`from_launch == false`) is refused
+/// while a launch holds the folder; the check, the spawn and the slot change
+/// happen under one lock acquisition, so no launch can slip in between.
+fn install_follower(
+    app: AppHandle,
+    wd: Workdir,
+    key: String,
+    label: &str,
+    can_cancel: bool,
+    from_launch: bool,
+) -> Result<(String, Gate), AwsError> {
     let op_id = uuid::Uuid::new_v4().to_string();
     let (gate, rx) = Gate::new();
     let base = DeployProgress {
@@ -778,28 +864,22 @@ fn install_follower(app: AppHandle, wd: Workdir, key: String, can_cancel: bool) 
         result: None,
     };
     let dir = wd.dir.clone();
-    let mut map = slots();
-    // Spawned under the lock, so the task's own clean-up (which takes it)
-    // can't run before its slot is in place.
     let id = op_id.clone();
-    let task = tauri::async_runtime::spawn(async move {
-        let dir = wd.dir.clone();
-        follow_and_report(rx, wd, base, FOLLOW_POLL, |p| emit_progress(&app, p)).await;
-        let mut map = slots();
-        if matches!(map.get(&dir), Some(Slot::Following { op_id, .. }) if *op_id == id) {
-            map.remove(&dir);
-        }
-    });
-    if let Some(Slot::Following { task: old, .. }) = map.insert(
-        dir,
-        Slot::Following {
-            op_id: op_id.clone(),
-            task,
-        },
-    ) {
+    // The task's own clean-up takes the same lock, so it can't run before
+    // its slot is in place.
+    let old = slots()
+        .install_follower(&dir, &op_id, from_launch, move || {
+            tauri::async_runtime::spawn(async move {
+                let dir = wd.dir.clone();
+                follow_and_report(rx, wd, base, FOLLOW_POLL, |p| emit_progress(&app, p)).await;
+                slots().finish_follower(&dir, &id);
+            })
+        })
+        .map_err(|b| b.error(label))?;
+    if let Some(old) = old {
         old.abort();
     }
-    (op_id, gate)
+    Ok((op_id, gate))
 }
 
 /// Ensure OpenTofu and the state bucket, write the work folder and start a
@@ -844,7 +924,7 @@ async fn launch(
     .map_err(|e| other(format!("The deploy could not be started: {e}")))?
     .map_err(|e| start_error(e, &label))?;
     let can_cancel = cfg!(unix) && started.pid.is_some();
-    Ok(install_follower(app, wd, state_key(d), can_cancel))
+    install_follower(app, wd, state_key(d), &label, can_cancel, true)
 }
 
 /// Open a launch's gate and hand back its op id: the last thing a command
@@ -998,7 +1078,8 @@ pub async fn unlock_aws_state(
         Err(e) if e.raw_response().map(|r| r.status().as_u16()) == Some(404) => {
             return Err(other("The state lock is already gone; detect again"));
         }
-        Err(e) => return Err(crate::aws::classify_sdk_error("s3:GetObject", &e)),
+        // HeadObject is authorised by s3:GetObject.
+        Err(e) => return Err(crate::aws::classify_sdk_error("s3:GetObject (HeadObject)", &e)),
     };
     let etag = head
         .e_tag()
@@ -1056,17 +1137,10 @@ pub async fn follow_aws_deployment(
             key.label()
         )));
     }
-    if matches!(slots().get(&wd.dir), Some(Slot::Launching)) {
-        return Err(other(format!(
-            "A deployment is starting for {}; wait for it",
-            key.label()
-        )));
-    }
     let can_cancel = tofu::is_running(&wd) && cancellable(&wd);
-    // A launch can't start here between the check and the install: it
-    // needs a runner-free folder or an empty slot, and either way the
-    // follower then follows that run from byte 0.
-    let (op_id, gate) = install_follower(app, wd, state_key, can_cancel);
+    // Refused inside install_follower, under the registry lock, while a
+    // launch holds the folder.
+    let (op_id, gate) = install_follower(app, wd, state_key, &key.label(), can_cancel, false)?;
     gate.open();
     Ok(op_id)
 }
