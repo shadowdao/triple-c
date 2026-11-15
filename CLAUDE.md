@@ -352,7 +352,9 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   (`aws:userid` contains `:`). Workspace users can't deregister or delete task definitions
   (`DeregisterTaskDefinition` is `*`-only in IAM): removal leaves revisions ACTIVE for an admin
   (`aws/README.md`). Stop: the stop guard (`commands/stop_guard.rs`) dry-runs `triple-c-wip-push`
-  through the agent, may push first, then writes `pushed` or `discard` to `/run/triple-c/stop-reason`
+  through the agent, closes the project's terminals and auth bridge (so nothing is written after the
+  push's snapshot), may push first (under an in-container `timeout`, since the agent does not kill an
+  exec the client gave up on), then writes `pushed` or `discard` to `/run/triple-c/stop-reason`
   (root-owned; the entrypoint's TERM hook reads it, and the idle watcher writes `idle`) so the hook
   doesn't push twice; the marker is cleared if StopTask fails. Claude Code's sandbox is forced off in
   the generated settings (bubblewrap can't create namespaces on Fargate, verified live).
@@ -400,10 +402,13 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   marker says the app handled it. The idle watcher runs as root under a supervisor and signals the
   entrypoint's own PID (not PID 1, which is docker-init), so idle and ECS stops share one trap.
   Idle = the agent's `last_activity_unix` older than N minutes (open-but-silent attaches/tunnels
-  don't count; requests with `X-Triple-C-Background: 1`, e.g. the auth bridge's poll, never do),
+  don't count; requests with `X-Triple-C-Background: 1` — the auth bridge's and the file viewer's polls — never do),
   no `claude`, no scheduler job, no running clone, and no unsaved git work: with the WIP push on the
   watcher pushes *before* signalling and stays up if that fails; with it off, dirty repos keep the
-  workspace up. An idle stop exits 75 (`aws::tasks::IDLE_EXIT_CODE`) so the death watch can tell it
+  workspace up; activity during the watcher's push sends it back to watching. A repo the background
+  clone is still writing (`/run/triple-c-clone/repos` last says `cloning`, no `done`) is skipped by
+  `triple-c-wip-push` (dry run: `"cloning": true`). The stop trap is set before any background work
+  starts. An idle stop exits 75 (`aws::tasks::IDLE_EXIT_CODE`) so the death watch can tell it
   from a crash (`classify_stop` → the `ContainerExited` toast).
   **The `TRIPLEC_` env prefix is reserved** on both hosts (`RESERVED_ENV_PREFIXES`; `workspace.rs`
   drops custom variables in it): the entrypoint's settings live there.
