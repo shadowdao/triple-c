@@ -295,7 +295,8 @@ async fn handle_open(
         return Err(format!("Project '{}' is not running", project.name));
     }
 
-    let container = crate::host::ContainerTarget::for_project(&project)
+    let container = crate::host::ContainerTarget::for_project_waiting(&project)
+        .await
         .ok_or_else(|| "Container not running".to_string())?;
 
     let cmd = match session_type {

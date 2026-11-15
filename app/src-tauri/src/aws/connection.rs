@@ -5,6 +5,7 @@ use aws_config::identity::IdentityCache;
 use aws_config::profile::ProfileFileCredentialsProvider;
 use aws_config::provider_config::ProviderConfig;
 use aws_config::retry::RetryConfig;
+use aws_config::timeout::TimeoutConfig;
 use aws_config::{BehaviorVersion, Region, SdkConfig};
 use aws_credential_types::provider::error::CredentialsError;
 use aws_credential_types::provider::{future, ProvideCredentials, SharedCredentialsProvider};
@@ -81,9 +82,9 @@ fn keys_credentials(keys: &secure::AwsKeys) -> SharedCredentialsProvider {
 /// stray endpoint there would send every connection's signed requests (and
 /// the permission check) somewhere other than AWS. Connections talk to the
 /// real regional endpoints; a profile's own `endpoint_url` is ignored too.
-/// The HTTP client, timeouts and stalled-stream protection are each service
-/// client's defaults (the `default-https-client` stack every AWS crate here
-/// is built with).
+/// The HTTP client and stalled-stream protection are each service client's
+/// defaults (the `default-https-client` stack every AWS crate here is built
+/// with). Timeouts are ours: [`OPERATION_TIMEOUT`] / [`ATTEMPT_TIMEOUT`].
 fn build_sdk_config(region: Region, credentials: SharedCredentialsProvider) -> SdkConfig {
     let mut builder = SdkConfig::builder()
         .behavior_version(BehaviorVersion::latest())
@@ -91,11 +92,28 @@ fn build_sdk_config(region: Region, credentials: SharedCredentialsProvider) -> S
         .credentials_provider(credentials)
         .identity_cache(IdentityCache::lazy().build())
         .retry_config(RetryConfig::standard())
+        .timeout_config(timeouts())
         .time_source(SharedTimeSource::default());
     if let Some(sleep) = default_async_sleep() {
         builder = builder.sleep_impl(sleep);
     }
     builder.build()
+}
+
+/// Every call the app makes through the SDK is a control-plane call with a
+/// small answer (ECS, Secrets Manager, EFS, IAM, SSM, CloudWatch Logs, STS,
+/// and S3 reads of state objects capped at 2 KiB); OpenTofu talks to AWS
+/// itself, not through these clients. Without a bound a half-open
+/// connection would hang a start, a stop or the death watch for minutes.
+/// The operation bound covers every retry; the attempt bound is one try.
+pub const OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+pub const ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn timeouts() -> TimeoutConfig {
+    TimeoutConfig::builder()
+        .operation_timeout(OPERATION_TIMEOUT)
+        .operation_attempt_timeout(ATTEMPT_TIMEOUT)
+        .build()
 }
 
 /// Puts the profile's name into the source chain of every credentials error,
@@ -296,5 +314,19 @@ sts =
         let cfg = build_sdk_config(Region::new("us-west-2"), keys_credentials(&keys));
         assert_isolated(&cfg);
         assert!(cfg.credentials_provider().is_some());
+    }
+
+    #[test]
+    fn every_sdk_call_is_bounded() {
+        let keys = crate::storage::secure::AwsKeys {
+            access_key_id: "AKIDTEST".into(),
+            secret_access_key: "s".into(),
+            session_token: None,
+        };
+        let cfg = build_sdk_config(Region::new("us-west-2"), keys_credentials(&keys));
+        let t = cfg.timeout_config().expect("a timeout config");
+        assert_eq!(t.operation_timeout(), Some(OPERATION_TIMEOUT));
+        assert_eq!(t.operation_attempt_timeout(), Some(ATTEMPT_TIMEOUT));
+        assert!(ATTEMPT_TIMEOUT < OPERATION_TIMEOUT);
     }
 }

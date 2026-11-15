@@ -29,6 +29,11 @@ pub enum AwsError {
     StateBucketTaken {
         bucket: String,
     },
+    /// An account limit (Fargate vCPUs, tasks, ...) refused the request.
+    /// Never retried; `message` says what to do.
+    QuotaExceeded {
+        message: String,
+    },
     Other {
         message: String,
     },
@@ -63,7 +68,9 @@ impl std::fmt::Display for AwsError {
                 "The state bucket name \"{bucket}\" is already taken by another AWS account, so \
                  Triple-C can't keep OpenTofu state there"
             ),
-            AwsError::Other { message } => f.write_str(message),
+            AwsError::QuotaExceeded { message } | AwsError::Other { message } => {
+                f.write_str(message)
+            }
         }
     }
 }

@@ -9,7 +9,10 @@ import { useContainerMigration } from "../../../hooks/useContainerMigration";
 import { ProjectStatusIndicator } from "../../ui/StatusIndicator";
 import Button from "../../ui/Button";
 import OverflowMenu from "../../ui/OverflowMenu";
-import ConfirmRemoveModal from "../ConfirmRemoveModal";
+import ConfirmRemoveModal, { ConfirmForgetAwsModal } from "../ConfirmRemoveModal";
+import StopGuardModal from "../StopGuardModal";
+import { hasSavedFiles, isAwsProject } from "../../../lib/awsWorkspace";
+import { AWS_CONNECTION_MISSING, type RemoveProjectOptions } from "../../../lib/types";
 import ConfirmResetModal from "../ConfirmResetModal";
 import MigrateContainerModal from "../MigrateContainerModal";
 import OverviewTab from "./OverviewTab";
@@ -58,6 +61,7 @@ export default function ProjectHome({ projectId, active }: Props) {
     useAppState.getState().clearPendingHomeTab();
   }, [pendingHomeTab, projectId]);
   const [confirmRemove, setConfirmRemove] = useState(false);
+  const [forgetAws, setForgetAws] = useState<{ reason: string; discardData: boolean } | null>(null);
   const [confirmReset, setConfirmReset] = useState(false);
   const [showMigration, setShowMigration] = useState(false);
   const { runningSince, progress } = useAppState(
@@ -99,6 +103,7 @@ export default function ProjectHome({ projectId, active }: Props) {
     );
   }
 
+  const aws = isAwsProject(project);
   const isRunning = project.status === "running";
   const isTransitioning =
     project.status === "starting" || project.status === "stopping";
@@ -119,6 +124,44 @@ export default function ProjectHome({ projectId, active }: Props) {
     !migration.interrupted &&
     migration.probeSettled &&
     !!project.container_id;
+
+  /** Remove the project; an AWS project whose connection is gone asks again. */
+  const removeProject = async (opts: RemoveProjectOptions) => {
+    try {
+      const report = await remove(project.id, opts);
+      if (!projectRemovalIsClean(report)) {
+        const verb = leftoverVerb(report);
+        if (report.retry_scheduled) {
+          useAppState.getState().pushToast({
+            kind: "info",
+            message: `“${project.name}” was removed, but Triple-C could not confirm all its Docker resources were removed`,
+            detail: `Triple-C could not confirm ${describeLeftovers(report)} ${verb} removed. It will check again the next time it starts.`,
+          });
+        } else {
+          // The pending-cleanup record itself failed to save — no
+          // retry will happen, so this must not promise one.
+          useAppState.getState().pushToast({
+            kind: "error",
+            message: `“${project.name}” was removed, but Triple-C could not confirm its Docker resources were removed`,
+            detail: `Triple-C could not confirm ${describeLeftovers(report)} ${verb} removed, and could not record this for a retry. You may need to remove ${leftoverPronoun(report)} manually (\`docker rm\` / \`docker rmi\` / \`docker volume rm\`).`,
+          });
+        }
+      }
+    } catch (e) {
+      const text = String(e);
+      const missing = text.startsWith(AWS_CONNECTION_MISSING);
+      const reason = missing ? text.slice(AWS_CONNECTION_MISSING.length) : text;
+      if (missing && !opts.forgetAwsResources) {
+        setForgetAws({ reason, discardData: !!opts.discardData });
+        return;
+      }
+      useAppState.getState().pushToast({
+        kind: "error",
+        message: `Could not remove “${project.name}”`,
+        detail: reason,
+      });
+    }
+  };
 
   return (
     <div className={`flex flex-col h-full min-h-0 ${active ? "" : "hidden"}`}>
@@ -188,12 +231,13 @@ export default function ProjectHome({ projectId, active }: Props) {
                 {
                   label: "Update container base…",
                   onSelect: () => setShowMigration(true),
-                  disabled: !canMigrate,
+                  // Docker-only: the backend refuses both for an AWS project.
+                  disabled: aws || !canMigrate,
                 },
                 {
                   label: "Reset container…",
                   onSelect: () => setConfirmReset(true),
-                  disabled: !isStopped || actions.busy,
+                  disabled: aws || !isStopped || actions.busy,
                   danger: true,
                 },
                 {
@@ -280,39 +324,35 @@ export default function ProjectHome({ projectId, active }: Props) {
           }}
         />
       )}
+      {actions.stopGuard && (
+        <StopGuardModal
+          projectName={project.name}
+          work={actions.stopGuard}
+          wipPushOnStop={project.aws?.wip_push_on_stop ?? false}
+          onChoose={actions.resolveStopGuard}
+        />
+      )}
+      {forgetAws && (
+        <ConfirmForgetAwsModal
+          projectName={project.name}
+          reason={forgetAws.reason}
+          onCancel={() => setForgetAws(null)}
+          onConfirm={() => {
+            const { discardData } = forgetAws;
+            setForgetAws(null);
+            void removeProject({ discardData, forgetAwsResources: true });
+          }}
+        />
+      )}
       {confirmRemove && (
         <ConfirmRemoveModal
           projectName={project.name}
+          aws={aws}
+          savedFiles={hasSavedFiles(project)}
           onCancel={() => setConfirmRemove(false)}
-          onConfirm={async () => {
+          onConfirm={({ discardData }) => {
             setConfirmRemove(false);
-            try {
-              const report = await remove(project.id);
-              if (!projectRemovalIsClean(report)) {
-                const verb = leftoverVerb(report);
-                if (report.retry_scheduled) {
-                  useAppState.getState().pushToast({
-                    kind: "info",
-                    message: `“${project.name}” was removed, but Triple-C could not confirm all its Docker resources were removed`,
-                    detail: `Triple-C could not confirm ${describeLeftovers(report)} ${verb} removed. It will check again the next time it starts.`,
-                  });
-                } else {
-                  // The pending-cleanup record itself failed to save — no
-                  // retry will happen, so this must not promise one.
-                  useAppState.getState().pushToast({
-                    kind: "error",
-                    message: `“${project.name}” was removed, but Triple-C could not confirm its Docker resources were removed`,
-                    detail: `Triple-C could not confirm ${describeLeftovers(report)} ${verb} removed, and could not record this for a retry. You may need to remove ${leftoverPronoun(report)} manually (\`docker rm\` / \`docker rmi\` / \`docker volume rm\`).`,
-                  });
-                }
-              }
-            } catch (e) {
-              useAppState.getState().pushToast({
-                kind: "error",
-                message: `Could not remove “${project.name}”`,
-                detail: String(e),
-              });
-            }
+            void removeProject({ discardData });
           }}
         />
       )}

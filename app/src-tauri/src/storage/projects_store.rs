@@ -440,6 +440,32 @@ impl ProjectsStore {
         Ok(())
     }
 
+    /// Granular setter for the AWS runtime handles of a project, store-owned
+    /// like `container_id`. Fails if the project is not an AWS project.
+    pub fn set_aws_runtime(
+        &self,
+        project_id: &str,
+        task_arn: Option<String>,
+        access_point_id: Option<String>,
+        task_definition_arn: Option<String>,
+    ) -> Result<(), String> {
+        let mut projects = self.lock();
+        let p = projects
+            .iter_mut()
+            .find(|p| p.id == project_id)
+            .ok_or_else(|| format!("Project {} not found", project_id))?;
+        let aws = p
+            .aws
+            .as_mut()
+            .ok_or_else(|| format!("Project {} is not an AWS project", project_id))?;
+        aws.task_arn = task_arn;
+        aws.access_point_id = access_point_id;
+        aws.task_definition_arn = task_definition_arn;
+        p.updated_at = chrono::Utc::now().to_rfc3339();
+        self.save(&projects)?;
+        Ok(())
+    }
+
     pub fn set_container_id(&self, project_id: &str, container_id: Option<String>) -> Result<(), String> {
         let mut projects = self.lock();
         if let Some(p) = projects.iter_mut().find(|p| p.id == project_id) {
@@ -845,6 +871,35 @@ mod tests {
 
         assert!(store.running_on("aaaa").is_none(), "too short to be an id");
         assert!(sight_and_mark(&store, &full[..12], |_| false).is_some());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn set_aws_runtime_writes_the_handles_and_only_for_aws_projects() {
+        let dir = temp_dir("aws-runtime");
+        let mut aws = Project::new("a".to_string(), Vec::new());
+        aws.host_id = Some("h".into());
+        aws.aws = Some(Default::default());
+        let local = Project::new("l".to_string(), Vec::new());
+        let (aid, lid) = (aws.id.clone(), local.id.clone());
+        let store = store_over(&dir, vec![aws, local]);
+
+        store
+            .set_aws_runtime(&aid, Some("t".into()), Some("ap".into()), Some("td".into()))
+            .unwrap();
+        let a = store.get(&aid).unwrap().aws.unwrap();
+        assert_eq!(
+            (a.task_arn.as_deref(), a.access_point_id.as_deref(), a.task_definition_arn.as_deref()),
+            (Some("t"), Some("ap"), Some("td"))
+        );
+        let on_disk: Vec<Project> =
+            serde_json::from_str(&fs::read_to_string(dir.join("projects.json")).unwrap()).unwrap();
+        assert_eq!(on_disk[0].aws.as_ref().unwrap().task_arn.as_deref(), Some("t"));
+
+        store.set_aws_runtime(&aid, None, None, None).unwrap();
+        assert!(store.get(&aid).unwrap().aws.unwrap().task_arn.is_none());
+        assert!(store.set_aws_runtime(&lid, None, None, None).is_err());
+        assert!(store.set_aws_runtime("nope", None, None, None).is_err());
         fs::remove_dir_all(&dir).ok();
     }
 }

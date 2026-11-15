@@ -51,8 +51,10 @@ pub async fn poll_file(
         "poll".to_string(),
         container_path.to_string(),
     ];
+    // A background poll: an open viewer must not keep an idle AWS workspace
+    // up. Opening and saving a file are the user's own actions and count.
     let (stdout, stderr, code) = container
-        .exec_oneshot_streams_as("claude", cmd, Vec::new())
+        .exec_oneshot_streams_background("claude", cmd)
         .await?;
     if code != 0 && code != 4 {
         return Err(format!(

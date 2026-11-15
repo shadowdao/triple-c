@@ -2,12 +2,15 @@ pub mod ca_certs;
 pub mod client;
 pub mod events;
 pub mod container;
+pub mod workspace_env;
 pub mod image;
 pub mod exec;
 pub mod gateway;
 pub mod legacy_cleanup;
 pub mod migration;
 pub mod stt;
+#[cfg(all(test, unix))]
+mod aws_mode_tests;
 
 /// The container user `claude`'s home directory, as the image creates it.
 pub(crate) const CONTAINER_HOME: &str = "/home/claude";

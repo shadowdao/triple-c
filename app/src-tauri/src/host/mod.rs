@@ -28,12 +28,11 @@
 //! may still do so.
 
 pub mod agent;
+pub mod aws_host;
 pub mod lifecycle;
 pub mod sessions;
-// Nothing in the app opens an SSM tunnel until the AWS host lands (phase 5 of
-// the AWS spec); its tests exercise it meanwhile. Remove this allow then.
-#[allow(dead_code)]
 pub mod ssm;
+pub mod tunnels;
 pub mod watch;
 
 pub use crate::docker::exec::{
@@ -154,9 +153,26 @@ impl ContainerTarget {
         }
     }
 
-    /// The target for a project's container, if it has one yet.
+    /// The target for a project's container, if it has one yet. An AWS
+    /// project's is its registered tunnel's agent endpoint (`tunnels.rs`):
+    /// none while no tunnel is open.
     pub fn for_project(project: &Project) -> Option<Self> {
+        if project.is_aws() {
+            return tunnels::get_endpoint(&project.id).map(ContainerTarget::Agent);
+        }
         project.container_id.as_deref().map(Self::docker)
+    }
+
+    /// [`Self::for_project`], waiting (up to `aws_host::REATTACH_WAIT`) for an
+    /// AWS project whose tunnel is being re-opened in the background after a
+    /// restart. For a Docker project it is `for_project`.
+    pub async fn for_project_waiting(project: &Project) -> Option<Self> {
+        if project.is_aws() {
+            return tunnels::wait_endpoint(&project.id, aws_host::REATTACH_WAIT)
+                .await
+                .map(ContainerTarget::Agent);
+        }
+        Self::for_project(project)
     }
 
     /// The host-specific identifier (a Docker container id today). For logs
@@ -254,6 +270,23 @@ impl ContainerTarget {
         }
     }
 
+    /// [`Self::exec_oneshot_limited`] for a background poll: on the agent it
+    /// carries the background marker, so it never counts as activity for
+    /// idle stop. Docker has no idle stop; the call is the same there.
+    pub async fn exec_oneshot_background(
+        &self,
+        user: &str,
+        cmd: Vec<String>,
+        limit: usize,
+    ) -> Result<(String, i64), String> {
+        match self {
+            ContainerTarget::Docker { container_id } => {
+                docker::exec::exec_oneshot_limited(container_id, user, cmd, limit).await
+            }
+            ContainerTarget::Agent(ep) => agent::exec_oneshot_background(ep, user, cmd, limit).await,
+        }
+    }
+
     /// stdout and stderr kept apart: `(stdout, stderr, exit_code)`.
     pub async fn exec_oneshot_streams_as(
         &self,
@@ -266,6 +299,22 @@ impl ContainerTarget {
                 docker::exec::exec_oneshot_streams_as(container_id, user, cmd, env).await
             }
             ContainerTarget::Agent(ep) => agent::exec_oneshot_streams_as(ep, user, cmd, env).await,
+        }
+    }
+
+    /// [`Self::exec_oneshot_streams_as`] for a background poll (the file
+    /// viewer's change check): on the agent it carries the background marker,
+    /// so it never counts as activity for idle stop. The same call on Docker.
+    pub async fn exec_oneshot_streams_background(
+        &self,
+        user: &str,
+        cmd: Vec<String>,
+    ) -> Result<(String, String, i64), String> {
+        match self {
+            ContainerTarget::Docker { container_id } => {
+                docker::exec::exec_oneshot_streams_as(container_id, user, cmd, Vec::new()).await
+            }
+            ContainerTarget::Agent(ep) => agent::exec_oneshot_streams_background(ep, user, cmd).await,
         }
     }
 

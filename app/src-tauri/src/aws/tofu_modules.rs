@@ -96,6 +96,16 @@ pub fn validate_environment_name(name: &str) -> Result<String, String> {
     }
 }
 
+/// An environment's ECS cluster name (the environment module's).
+pub fn environment_cluster_name(env: &str) -> String {
+    format!("triple-c-{env}")
+}
+
+/// An environment's CloudWatch log group (the environment module's).
+pub fn environment_log_group(env: &str) -> String {
+    format!("/triple-c/{env}")
+}
+
 /// The SSM parameter holding an environment's record.
 pub fn environment_parameter_name(env: &str) -> String {
     format!("/triple-c/environments/{env}")
@@ -120,6 +130,96 @@ pub fn user_role_names(env: &str, owner_key: &str) -> (String, String) {
         format!("triple-c-{env}-{owner_key}-task"),
         format!("triple-c-{env}-{owner_key}-exec"),
     )
+}
+
+/// Whether a project id is used in names as it is: 1 to 64 characters of
+/// `[A-Za-z0-9-]`. Every UUID (how the app makes ids) is.
+fn is_clean_project_id(id: &str) -> bool {
+    (1..=64).contains(&id.len()) && id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
+}
+
+/// 16 hex characters of `sha256(id)`.
+fn project_id_hash(id: &str) -> String {
+    Sha256::digest(id.as_bytes())
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// A project id as a name component, safe in a secret name, an EFS path and
+/// a log stream. A clean id (see [`is_clean_project_id`]) is used as is.
+/// Anything else — only a hand-edited `projects.json` has one — becomes its
+/// first 40 characters with everything outside `[A-Za-z0-9-]` replaced by
+/// `-`, then `_` and a hash of the whole id. Clean ids never contain `_`, so
+/// the two forms can't collide, and ids that sanitise alike (`a/b`, `a:b`)
+/// still differ by the hash.
+fn project_component(project_id: &str) -> String {
+    if is_clean_project_id(project_id) {
+        return project_id.to_string();
+    }
+    let prefix: String = project_id
+        .chars()
+        .take(40)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    format!("{prefix}_{}", project_id_hash(project_id))
+}
+
+/// A project's ECS task definition family:
+/// `triple-c-<env>-<owner_key>-<first 12 of the project id>` (an id that
+/// isn't clean contributes `_` and 11 hex of its hash instead). At most 55
+/// characters of `[A-Za-z0-9_-]`. Other users can register revisions into
+/// any `triple-c-*` family, so a family is never trusted by name alone (see
+/// `aws::workspace`), and two of a user's projects could share 12 leading
+/// characters, so a family's tasks and revisions are told apart by their
+/// `triple-c:project` tag.
+pub fn task_family(env: &str, owner_key: &str, project_id: &str) -> String {
+    let id: String = if is_clean_project_id(project_id) {
+        project_id.chars().take(12).collect()
+    } else {
+        format!("_{}", &project_id_hash(project_id)[..11])
+    };
+    format!("triple-c-{env}-{owner_key}-{id}")
+}
+
+/// The project's Secrets Manager secret (P1): `triple-c/<env>/<owner_key>/<project id>`.
+pub fn project_secret_name(env: &str, owner_key: &str, project_id: &str) -> String {
+    format!(
+        "triple-c/{env}/{owner_key}/{}",
+        project_component(project_id)
+    )
+}
+
+/// The root of the project's EFS access point (P4), at most 90 characters.
+pub fn access_point_root(owner_key: &str, project_id: &str) -> String {
+    format!("/triple-c/{owner_key}/{}", project_component(project_id))
+}
+
+/// The container's `awslogs-stream-prefix`; ECS names the stream
+/// `<prefix>/workspace/<task id>`.
+pub fn log_stream_prefix(owner_key: &str, project_id: &str) -> String {
+    format!("{owner_key}/{}", project_component(project_id))
+}
+
+/// The awslogs stream of a task's `workspace` container:
+/// `<prefix>/<container>/<task-id>`, the task id being the last segment of
+/// its ARN.
+pub fn task_log_stream(stream_prefix: &str, task_arn: &str) -> String {
+    let task_id = task_arn.rsplit('/').next().unwrap_or(task_arn);
+    format!("{stream_prefix}/workspace/{task_id}")
+}
+
+/// The `creation_token` of the user's file system (the onboarding module's
+/// `local.name`).
+pub fn user_file_system_token(env: &str, owner_key: &str) -> String {
+    format!("triple-c-{env}-{owner_key}")
 }
 
 /// The per-account, per-region state bucket.

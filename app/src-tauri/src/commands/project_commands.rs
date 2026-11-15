@@ -4,7 +4,10 @@ use crate::commands::aws_commands;
 use crate::docker;
 use crate::host::lifecycle::{DiscardLeftovers, ProjectHost};
 use crate::host::ContainerTarget;
-use crate::models::{Backend, BedrockAuthMethod, Project, ProjectPath, ProjectRemovalReport, ProjectResetOutcome, ProjectStatus};
+use crate::models::{
+    AwsPlacement, AwsWorkspaceConfig, Backend, BedrockAuthMethod, Project, ProjectPath,
+    ProjectRemovalReport, ProjectResetOutcome, ProjectStatus, UnsavedWork, WipChoice,
+};
 use crate::storage::secure;
 use crate::AppState;
 
@@ -633,9 +636,47 @@ pub async fn list_projects(state: State<'_, AppState>) -> Result<Vec<Project>, S
 pub async fn add_project(
     name: String,
     paths: Vec<ProjectPath>,
+    host_id: Option<String>,
+    aws_placement: Option<AwsPlacement>,
+    aws: Option<AwsWorkspaceConfig>,
     state: State<'_, AppState>,
 ) -> Result<Project, String> {
-    // Validate paths
+    let project = new_project(name, paths, host_id, aws_placement, aws, &state.settings_store.get().hosts)?;
+    // Nothing can have been blanked on a project that did not exist a line ago.
+    store_secrets_for_project(&project, &[])?;
+    state.projects_store.add(project)
+}
+
+/// The project `add_project` creates. A local project needs a folder; an
+/// AWS project (all three host fields) clones repositories instead and
+/// takes no folders. The host fields are checked as a save would check them.
+fn new_project(
+    name: String,
+    paths: Vec<ProjectPath>,
+    host_id: Option<String>,
+    aws_placement: Option<AwsPlacement>,
+    aws: Option<AwsWorkspaceConfig>,
+    hosts: &[crate::models::HostConnection],
+) -> Result<Project, String> {
+    let on_host = host_id.is_some() || aws_placement.is_some() || aws.is_some();
+    if on_host {
+        if paths.iter().any(|p| !p.host_path.is_empty() || !p.mount_name.is_empty()) {
+            return Err("A project on AWS clones repositories; it can't mount folders from this machine.".into());
+        }
+        let blank = Project::new(name.clone(), Vec::new());
+        let mut project = Project::new(name, Vec::new());
+        project.host_id = host_id;
+        project.aws_placement = aws_placement;
+        // Runtime handles belong to the start path, never to the caller.
+        project.aws = aws.map(|a| AwsWorkspaceConfig {
+            task_arn: None,
+            access_point_id: None,
+            task_definition_arn: None,
+            ..a
+        });
+        validate_aws_update(&blank, &project, hosts)?;
+        return Ok(project);
+    }
     // A new project needs a folder; the blank row `validate_project_paths`
     // tolerates is the Config tab's placeholder on an *existing* one.
     if paths.is_empty()
@@ -646,15 +687,14 @@ pub async fn add_project(
         return Err("At least one folder path is required.".to_string());
     }
     validate_project_paths(&paths)?;
-    let project = Project::new(name, paths);
-    // Nothing can have been blanked on a project that did not exist a line ago.
-    store_secrets_for_project(&project, &[])?;
-    state.projects_store.add(project)
+    Ok(Project::new(name, paths))
 }
 
 #[tauri::command]
 pub async fn remove_project(
     project_id: String,
+    discard_data: Option<bool>,
+    forget_aws_resources: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<ProjectRemovalReport, String> {
     // **H-2: the only writer of these three categories that held nothing.**
@@ -672,6 +712,34 @@ pub async fn remove_project(
     // into a toast, so the row stays and the message names what is running.
     let _guard =
         crate::project_lock::try_acquire(&project_id, crate::project_lock::ProjectOp::Destroy)?;
+
+    // An AWS project's task and resources go first, and a failure keeps the
+    // project: its record is the only handle on a billed task and its
+    // secret. Its EFS access point goes only when asked (the files stay on the
+    // user's own file system until offboarding).
+    if let Some(project) = state.projects_store.get(&project_id).filter(|p| p.is_aws()) {
+        let settings = state.settings_store.get();
+        if let Some(target) = ContainerTarget::for_project(&project) {
+            state.exec_manager.close_sessions_for_container(target.id()).await;
+        }
+        let connection_exists = project
+            .host_id
+            .as_deref()
+            .is_some_and(|id| settings.hosts.iter().any(|h| h.id == id));
+        if connection_exists {
+            ProjectHost::for_project(&project)
+                .remove_aws_resources(&project, &settings, discard_data.unwrap_or(false))
+                .await?;
+        } else {
+            missing_connection_removal(forget_aws_resources.unwrap_or(false))?;
+            log::warn!(
+                "Project {}: removed without its AWS connection; its task, secret and data (if \
+                 any) are left in AWS, as the user confirmed",
+                project_id
+            );
+            crate::host::tunnels::close(&project_id).await;
+        }
+    }
 
     // Release any host loopback ports the auth bridge holds for this project
     // before the container (and the project record) go away.
@@ -1054,6 +1122,8 @@ pub async fn update_project(
     // [`crate::models::validate_env_vars_update`].
     crate::models::validate_env_vars_update(&stored.custom_env_vars, &project.custom_env_vars)?;
 
+    validate_aws_update(&stored, &project, &state.settings_store.get().hosts)?;
+
     restore_store_owned_fields(&mut project, &stored);
     project.updated_at = chrono::Utc::now().to_rfc3339();
 
@@ -1115,6 +1185,59 @@ fn restore_store_owned_fields(project: &mut Project, stored: &Project) {
     // Owned by the marketplace commands; a Config-tab save carries a stale copy.
     project.marketplace_installs = stored.marketplace_installs.clone();
     project.marketplace_disabled = stored.marketplace_disabled.clone();
+    // Runtime handles of an AWS task belong to the start/stop path.
+    if let Some(aws) = project.aws.as_mut() {
+        let s = stored.aws.as_ref();
+        aws.task_arn = s.and_then(|a| a.task_arn.clone());
+        aws.access_point_id = s.and_then(|a| a.access_point_id.clone());
+        aws.task_definition_arn = s.and_then(|a| a.task_definition_arn.clone());
+    }
+}
+
+/// Checks an incoming save's host placement against what is stored and the
+/// configured connections.
+fn validate_aws_update(
+    stored: &Project,
+    project: &Project,
+    hosts: &[crate::models::HostConnection],
+) -> Result<(), String> {
+    match (&project.host_id, &project.aws_placement, &project.aws) {
+        (None, None, None) => {}
+        (Some(id), Some(place), Some(cfg)) => {
+            if !hosts.iter().any(|h| &h.id == id) {
+                return Err(format!("Host connection \"{}\" does not exist", id.escape_debug()));
+            }
+            crate::models::validate_region(&place.region)?;
+            crate::aws::tofu_modules::validate_environment_name(&place.environment)?;
+            crate::models::validate_aws_workspace(cfg)?;
+        }
+        _ => {
+            return Err(
+                "A host project needs a host, a placement and a workspace configuration together"
+                    .into(),
+            )
+        }
+    }
+    let moved = stored.host_id != project.host_id || stored.aws_placement != project.aws_placement;
+    if moved && stored.status != ProjectStatus::Stopped {
+        return Err("Stop the project before changing its host or placement".into());
+    }
+    // The task, access point and task definition live in the stored
+    // connection's account and region; moving the project would orphan them.
+    if moved
+        && stored.aws.as_ref().is_some_and(|a| {
+            a.task_arn.is_some() || a.access_point_id.is_some() || a.task_definition_arn.is_some()
+        })
+    {
+        return Err(
+            "This project still has AWS resources (a task, its saved files' access point or task \
+             definitions) where it runs now; remove the workspace's AWS resources first — \
+             including the access point (\"Also remove the workspace's file-system access \
+             point\"), which stays when the saved files are kept"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1282,7 +1405,7 @@ async fn start_project_container_locked(
     let host = ProjectHost::for_project(&project);
     let result: Result<ContainerTarget, String> = async {
         let target = host
-            .ensure_started(&project, &settings, &|msg: &str| {
+            .ensure_started(&project, &settings, &state.projects_store, &|msg: &str| {
                 emit_progress(&app_handle, &project_id, msg)
             })
             .await?;
@@ -1307,10 +1430,24 @@ async fn start_project_container_locked(
         Ok(target)
     }.await;
 
-    // On failure, reset status to Stopped so the project doesn't get stuck.
+    // On failure, reset status to Stopped so the project doesn't get stuck —
+    // unless an AWS task is still running (an attach that failed, or a start
+    // that lost the race): Stopped would hide a billed task, so the project
+    // is left in Error with its task ARN, which Stop and Start both use.
     if let Err(ref e) = result {
         log::error!("Failed to start container for project {}: {}", project_id, e);
-        let _ = state.projects_store.update_status(&project_id, ProjectStatus::Stopped);
+        let task_left = state
+            .projects_store
+            .get(&project_id)
+            .is_some_and(|p| aws_task_left_after_failed_start(&p));
+        let status = if task_left { ProjectStatus::Error } else { ProjectStatus::Stopped };
+        let _ = state.projects_store.update_status(&project_id, status);
+        if task_left {
+            return Err(format!(
+                "{e}\n\nThe workspace's task is still running on AWS. Start again to connect to \
+                 it, or Stop to stop it."
+            ));
+        }
     }
 
     let target = result?;
@@ -1318,6 +1455,21 @@ async fn start_project_container_locked(
 
     // Update project with container info using granular methods (Issue 14: TOCTOU)
     state.projects_store.set_container_id(&project_id, Some(container_id.clone()))?;
+    // AWS: the task's handles, store-owned like the container id. The target
+    // id stored above is the tunnel's endpoint URL, which is what the death
+    // watch reports a stopped task as.
+    if project.is_aws() {
+        if let Some((task_arn, access_point_id, task_definition_arn)) =
+            crate::host::tunnels::runtime(&project_id)
+        {
+            state.projects_store.set_aws_runtime(
+                &project_id,
+                Some(task_arn),
+                access_point_id,
+                Some(task_definition_arn),
+            )?;
+        }
+    }
     state.projects_store.update_status(&project_id, ProjectStatus::Running)?;
 
     // Arm the auth bridge if this project opted in. Purely host-side, so it
@@ -1342,9 +1494,10 @@ async fn start_project_container_locked(
 #[tauri::command]
 pub async fn stop_project_container(
     project_id: String,
+    wip: Option<WipChoice>,
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     // Stop had **no** exclusion at all, which is the one gap CLAUDE.md's "every
     // command that stops, removes or recreates the container consults
     // `is_migrating`" rule already named and this function did not honour. A
@@ -1358,12 +1511,84 @@ pub async fn stop_project_container(
         .get(&project_id)
         .ok_or_else(|| format!("Project {} not found", project_id))?;
 
+    // The stop guard asked, and meanwhile the workspace stopped by itself
+    // (idle stop, another window): what the user wanted has happened.
+    if project.is_aws() && wip.is_some() && project.status == ProjectStatus::Stopped {
+        return Ok(None);
+    }
+
     state.projects_store.update_status(&project_id, ProjectStatus::Stopping)?;
 
-    // Drop host listeners first: they only make sense while the container runs.
-    state.auth_bridge.stop(&project_id).await;
+    // AWS: the terminals and the auth bridge close *before* the stop guard's
+    // push, so nothing written after its snapshot is silently dropped (the
+    // entrypoint's hook skips its own push once `pushed` is recorded). A push
+    // that fails aborts the stop with the status as it was; the auth bridge
+    // is re-armed, and the error says the terminals were closed.
+    let mut note = None;
+    let guard_target = if project.is_aws() { ContainerTarget::for_project(&project) } else { None };
+    if project.is_aws() {
+        let close_first = async {
+            state.auth_bridge.stop(&project_id).await;
+            if let Some(container) = guard_target.as_ref() {
+                state.exec_manager.close_sessions_for_container(container.id()).await;
+            }
+            if wip == Some(WipChoice::Push) {
+                emit_progress(&app_handle, &project_id, "Pushing unsaved work...");
+            }
+        };
+        let guarded = aws_guard_before_stop(
+            &state.projects_store,
+            &project_id,
+            project.status.clone(),
+            guard_target.as_ref(),
+            wip,
+            super::stop_guard::PUSH_TIMEOUT,
+            close_first,
+        )
+        .await;
+        match guarded {
+            Ok(n) => note = n,
+            Err(e) => {
+                if project.auth_bridge_enabled {
+                    if let Some(target) = guard_target.clone() {
+                        state
+                            .auth_bridge
+                            .start(project_id.clone(), target, app_handle.clone(), state.projects_store.clone())
+                            .await;
+                    }
+                }
+                return Err(e);
+            }
+        }
+    } else {
+        // Drop host listeners first: they only make sense while the container runs.
+        state.auth_bridge.stop(&project_id).await;
+    }
 
-    if let Some(container) = ContainerTarget::for_project(&project) {
+    if project.is_aws() {
+        // A failed StopTask leaves a billed task running, so unlike Docker it
+        // is not papered over: the project keeps its status and the user
+        // sees why (expired SSO, typically), and can retry. Its terminals
+        // and auth bridge were closed before the stop guard's step above.
+        emit_progress(&app_handle, &project_id, "Stopping task...");
+        let settings = state.settings_store.get();
+        if let Err(e) = ProjectHost::for_project(&project).stop_project(&project, &settings).await {
+            log::warn!("Stop failed for project {}: {}", project_id, e);
+            // Still running: a later stop must push as configured again.
+            super::stop_guard::forget_choice(guard_target.as_ref(), wip).await;
+            let _ = state.projects_store.update_status(&project_id, project.status.clone());
+            return Err(format!("Could not stop the task: {e}"));
+        }
+        if let Some(a) = project.aws.as_ref() {
+            state.projects_store.set_aws_runtime(
+                &project_id,
+                None,
+                a.access_point_id.clone(),
+                a.task_definition_arn.clone(),
+            )?;
+        }
+        state.projects_store.set_container_id(&project_id, None)?;
+    } else if let Some(container) = ContainerTarget::for_project(&project) {
         // Close exec sessions for this project
         emit_progress(&app_handle, &project_id, "Stopping container...");
         state.exec_manager.close_sessions_for_container(container.id()).await;
@@ -1374,6 +1599,127 @@ pub async fn stop_project_container(
     }
 
     state.projects_store.update_status(&project_id, ProjectStatus::Stopped)?;
+    Ok(note)
+}
+
+/// Appended to a failed stop-guard push: its terminals were closed first.
+const TERMINALS_CLOSED_FOR_PUSH: &str =
+    "Its terminals were closed before the push, so nothing written after it could be lost; \
+     open them again to keep working.";
+
+/// The AWS stop guard's step before StopTask ([`super::stop_guard::prepare_stop`]),
+/// after `close_first` (the project's terminals and auth bridge): whatever
+/// they write after the push's snapshot would otherwise be lost, since the
+/// entrypoint's hook does not push again after `pushed`. A failed push puts
+/// `previous` back, so the project's status is as it was.
+async fn aws_guard_before_stop<R, F>(
+    store: &crate::storage::projects_store::ProjectsStore,
+    project_id: &str,
+    previous: ProjectStatus,
+    runner: Option<&R>,
+    wip: Option<WipChoice>,
+    push_timeout: std::time::Duration,
+    close_first: F,
+) -> Result<Option<String>, String>
+where
+    R: super::stop_guard::WipRunner,
+    F: std::future::Future<Output = ()>,
+{
+    close_first.await;
+    match super::stop_guard::prepare_stop(runner, wip, push_timeout).await {
+        Ok(note) => Ok(note),
+        Err(e) => {
+            log::warn!("Project {}: WIP push before stop failed: {}", project_id, e);
+            let _ = store.update_status(project_id, previous);
+            Err(format!("{e}\n\n{TERMINALS_CLOSED_FOR_PUSH}"))
+        }
+    }
+}
+
+/// The stop guard's question: what would stopping this AWS workspace lose?
+/// A local project (or a stopped one) has nothing to check.
+#[tauri::command]
+pub async fn check_unsaved_work(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<UnsavedWork, String> {
+    let project = state
+        .projects_store
+        .get(&project_id)
+        .ok_or_else(|| format!("Project {} not found", project_id))?;
+    if !project.is_aws() || project.status != ProjectStatus::Running {
+        return Ok(UnsavedWork { checked: true, ..Default::default() });
+    }
+    let target = ContainerTarget::for_project(&project);
+    Ok(super::stop_guard::unsaved_work(target.as_ref(), super::stop_guard::DRY_RUN_TIMEOUT).await)
+}
+
+/// The last `limit` (1–200) lines of the AWS project's current or last task's
+/// log. Empty when there is no task to read (or the project is local).
+#[tauri::command]
+pub async fn aws_task_log(
+    project_id: String,
+    limit: u32,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    let project = state
+        .projects_store
+        .get(&project_id)
+        .ok_or_else(|| format!("Project {} not found", project_id))?;
+    if !project.is_aws() {
+        return Ok(Vec::new());
+    }
+    let settings = state.settings_store.get();
+    crate::host::aws_host::task_log(&project, &settings, limit.clamp(1, 200) as i32).await
+}
+
+/// Remove an AWS project's task definitions, secret and (with
+/// `discard_data`) saved files, keeping the project, so it can move to
+/// another host. Stopped projects only.
+#[tauri::command]
+pub async fn remove_aws_resources(
+    project_id: String,
+    discard_data: bool,
+    state: State<'_, AppState>,
+) -> Result<Project, String> {
+    let _guard =
+        crate::project_lock::try_acquire(&project_id, crate::project_lock::ProjectOp::Destroy)?;
+    let project = state
+        .projects_store
+        .get(&project_id)
+        .ok_or_else(|| format!("Project {} not found", project_id))?;
+    check_aws_resources_removable(&project)?;
+    let settings = state.settings_store.get();
+    ProjectHost::for_project(&project)
+        .remove_aws_resources(&project, &settings, discard_data)
+        .await?;
+    state
+        .projects_store
+        .set_aws_runtime(&project_id, None, access_point_after_removal(&project, discard_data), None)?;
+    state
+        .projects_store
+        .get(&project_id)
+        .ok_or_else(|| format!("Project {} not found", project_id))
+}
+
+/// The access point a removal leaves stored: kept when the saved files were
+/// kept (it is still there, a later start reuses it and a later removal
+/// with `discard_data` deletes it; and while it is stored the project can't
+/// move away from it — [`validate_aws_update`]), gone when they were not.
+fn access_point_after_removal(project: &Project, discard_data: bool) -> Option<String> {
+    if discard_data {
+        return None;
+    }
+    project.aws.as_ref().and_then(|a| a.access_point_id.clone())
+}
+
+fn check_aws_resources_removable(project: &Project) -> Result<(), String> {
+    if !project.is_aws() {
+        return Err("This project does not run on AWS".into());
+    }
+    if project.status != ProjectStatus::Stopped {
+        return Err("Stop the project before removing its AWS resources".into());
+    }
     Ok(())
 }
 
@@ -1397,6 +1743,7 @@ pub async fn rebuild_project_container(
         .projects_store
         .get(&project_id)
         .ok_or_else(|| format!("Project {} not found", project_id))?;
+    refuse_aws(&project, "Reset")?;
 
     // Reset supersedes any migration decision that was still pending: the
     // snapshot image and both volumes are about to go, so a surviving record
@@ -1472,6 +1819,44 @@ pub async fn rebuild_project_container(
 /// [`crate::commands::migration_commands::reconcile_migration`]. The migration
 /// pass runs over *every* project, not just the Running ones, because a project
 /// whose container was removed mid-migration reports Stopped.
+/// Removing an AWS project whose connection was deleted can't reach AWS:
+/// refused unless the user confirmed leaving its resources behind.
+/// Stable prefix of that refusal, so the UI can offer the second confirm
+/// without matching prose. Mirrored by `AWS_CONNECTION_MISSING` in `lib/types.ts`.
+pub const AWS_CONNECTION_MISSING: &str = "AWS_CONNECTION_MISSING: ";
+
+fn missing_connection_removal(forget_aws_resources: bool) -> Result<(), String> {
+    if forget_aws_resources {
+        return Ok(());
+    }
+    Err(AWS_CONNECTION_MISSING.to_string()
+        + "This project's AWS connection no longer exists, so its task (which may still be \
+         running and billed), secret and data can't be removed from here. Add the connection \
+         again in Settings → Hosts and remove the project, or confirm removing it while leaving \
+         those resources in AWS.")
+}
+
+/// After a failed start: an AWS project whose task ARN is still stored has
+/// a task that may still be running (a start stops, and forgets, only a task
+/// it ran itself).
+fn aws_task_left_after_failed_start(project: &Project) -> bool {
+    project.is_aws() && project.aws.as_ref().is_some_and(|a| a.task_arn.is_some())
+}
+
+/// How long reconcile waits on AWS for one project.
+const AWS_RECONCILE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Refuse a Docker-only operation on an AWS project.
+pub(crate) fn refuse_aws(project: &Project, what: &str) -> Result<(), String> {
+    if project.is_aws() {
+        return Err(format!(
+            "{what} is not available for a project that runs on AWS; it applies to local \
+             Docker containers only"
+        ));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn reconcile_project_statuses(
     app_handle: tauri::AppHandle,
@@ -1479,7 +1864,7 @@ pub async fn reconcile_project_statuses(
 ) -> Result<Vec<Project>, String> {
     let projects = state.projects_store.list();
 
-    for project in &projects {
+    for project in projects.iter().filter(|p| !p.is_aws()) {
         crate::commands::migration_commands::reconcile_migration(project, &app_handle).await;
     }
 
@@ -1510,6 +1895,12 @@ pub async fn reconcile_project_statuses(
         // Broadened from `is_migrating` to the whole lock for exactly that
         // reason — the migration was never the only operation with a gap.
         if crate::project_lock::held(&project.id).is_some() {
+            continue;
+        }
+
+        // AWS projects are reconciled by `reconcile_aws_projects`, which the
+        // UI runs at startup whether or not Docker answers.
+        if project.is_aws() {
             continue;
         }
 
@@ -1554,6 +1945,62 @@ pub async fn reconcile_project_statuses(
     Ok(state.projects_store.list())
 }
 
+
+/// How many AWS projects reconcile at once.
+const AWS_RECONCILE_CONCURRENCY: usize = 4;
+
+/// Reconcile every AWS project against ECS (the authority), independently of
+/// Docker: an app started without Docker still learns which tasks run and
+/// re-opens their tunnels. One bounded DescribeTasks per project, a few at a
+/// time; a live task's tunnel is re-opened in the background.
+#[tauri::command]
+pub async fn reconcile_aws_projects(state: State<'_, AppState>) -> Result<Vec<Project>, String> {
+    use futures_util::StreamExt;
+
+    let projects: Vec<Project> = state.projects_store.list().into_iter().filter(|p| p.is_aws()).collect();
+    // A target id left from the last run is a loopback URL whose port a new
+    // tunnel (any project's) may now own; until a re-attach registers, the
+    // project gets an id no tunnel can have (m9).
+    // A stopped mark a past unattached spell left on that id is forgotten
+    // first: reconcile asks ECS now, and a stale mark would make the death
+    // watch report a live, billed task as stopped.
+    for p in &projects {
+        if let Some(id) = crate::host::aws_host::prepare_unattached(p) {
+            let _ = state.projects_store.set_container_id(&p.id, Some(id));
+        }
+    }
+    let settings = state.settings_store.get();
+    let store = state.projects_store.clone();
+    futures_util::stream::iter(projects.into_iter().filter(|p| {
+        matches!(
+            p.status,
+            ProjectStatus::Running | ProjectStatus::Error | ProjectStatus::Starting | ProjectStatus::Stopping
+        ) && crate::project_lock::held(&p.id).is_none()
+    }))
+    .for_each_concurrent(AWS_RECONCILE_CONCURRENCY, |project| {
+        let settings = settings.clone();
+        let store = store.clone();
+        async move {
+            // The store's current copy: the id above may have changed.
+            let project = store.get(&project.id).unwrap_or(project);
+            if tokio::time::timeout(
+                AWS_RECONCILE_TIMEOUT,
+                crate::host::aws_host::reconcile(&project, &settings, store),
+            )
+            .await
+            .is_err()
+            {
+                log::warn!(
+                    "Project {}: AWS did not answer within {}s; status left as is",
+                    project.id,
+                    AWS_RECONCILE_TIMEOUT.as_secs()
+                );
+            }
+        }
+    })
+    .await;
+    Ok(state.projects_store.list())
+}
 
 #[cfg(test)]
 mod tests {
@@ -2160,5 +2607,277 @@ mod tests {
 
         assert_eq!(payload.marketplace_installs, stored.marketplace_installs);
         assert_eq!(payload.marketplace_disabled, stored.marketplace_disabled);
+    }
+
+    #[test]
+    fn a_save_cannot_change_the_aws_runtime_handles() {
+        let (mut stored, mut payload) = stored_and_stale_payload();
+        let mut sc = crate::models::AwsWorkspaceConfig::default();
+        sc.task_arn = Some("arn:task".into());
+        sc.access_point_id = Some("fsap-1".into());
+        sc.task_definition_arn = Some("arn:td".into());
+        stored.aws = Some(sc.clone());
+        let mut pc = crate::models::AwsWorkspaceConfig::default();
+        pc.cpu = 2048;
+        pc.memory_mib = 8192;
+        pc.task_arn = Some("evil".into());
+        pc.access_point_id = None;
+        payload.aws = Some(pc);
+
+        restore_store_owned_fields(&mut payload, &stored);
+
+        let a = payload.aws.unwrap();
+        assert_eq!(a.task_arn, sc.task_arn);
+        assert_eq!(a.access_point_id, sc.access_point_id);
+        assert_eq!(a.task_definition_arn, sc.task_definition_arn);
+        assert_eq!(a.cpu, 2048, "the edit itself goes through");
+    }
+
+    fn host(id: &str) -> crate::models::HostConnection {
+        crate::models::HostConnection {
+            id: id.into(),
+            name: "n".into(),
+            kind: crate::models::HostKind::Aws {
+                auth: crate::models::AwsAuth::Profile { name: "p".into() },
+                default_region: "us-west-2".into(),
+            },
+        }
+    }
+
+    fn aws_project() -> Project {
+        let (mut p, _) = stored_and_stale_payload();
+        p.status = ProjectStatus::Stopped;
+        p.host_id = Some("h1".into());
+        p.aws_placement = Some(crate::models::AwsPlacement { region: "us-west-2".into(), environment: "dev".into() });
+        p.aws = Some(Default::default());
+        p
+    }
+
+    #[test]
+    fn host_update_rules() {
+        let hosts = vec![host("h1")];
+        let local = { let mut p = aws_project(); p.host_id = None; p.aws_placement = None; p.aws = None; p };
+        assert!(validate_aws_update(&local, &local, &hosts).is_ok());
+        let aws = aws_project();
+        assert!(validate_aws_update(&aws, &aws, &hosts).is_ok());
+        // moving a stopped project onto a host is fine
+        assert!(validate_aws_update(&local, &aws, &hosts).is_ok());
+        // unknown connection
+        assert!(validate_aws_update(&local, &aws, &[]).unwrap_err().contains("does not exist"));
+        // partial triple
+        let mut half = aws_project(); half.aws = None;
+        assert!(validate_aws_update(&aws, &half, &hosts).is_err());
+        let mut half = local.clone(); half.aws = Some(Default::default());
+        assert!(validate_aws_update(&local, &half, &hosts).is_err());
+        // bad region / environment / workspace
+        let mut bad = aws_project(); bad.aws_placement.as_mut().unwrap().region = "nope".into();
+        assert!(validate_aws_update(&aws, &bad, &hosts).is_err());
+        let mut bad = aws_project(); bad.aws_placement.as_mut().unwrap().environment = "Bad_Env".into();
+        assert!(validate_aws_update(&aws, &bad, &hosts).is_err());
+        let mut bad = aws_project(); bad.aws.as_mut().unwrap().cpu = 300;
+        assert!(validate_aws_update(&aws, &bad, &hosts).is_err());
+        // host/placement frozen while not stopped; other edits still fine
+        let mut running = aws_project(); running.status = ProjectStatus::Running;
+        let mut moved = running.clone(); moved.aws_placement.as_mut().unwrap().environment = "prod".into();
+        assert!(validate_aws_update(&running, &moved, &hosts).unwrap_err().contains("Stop the project"));
+        let mut moved = running.clone(); moved.host_id = None; moved.aws_placement = None; moved.aws = None;
+        assert!(validate_aws_update(&running, &moved, &hosts).is_err());
+        let mut edited = running.clone(); edited.aws.as_mut().unwrap().spot = true;
+        assert!(validate_aws_update(&running, &edited, &hosts).is_ok());
+    }
+
+    #[test]
+    fn a_removal_that_keeps_the_saved_files_keeps_their_access_point_and_the_project_in_place() {
+        let hosts = vec![host("h1")];
+        let mut stored = aws_project();
+        stored.aws.as_mut().unwrap().access_point_id = Some("fsap-1".into());
+        assert_eq!(access_point_after_removal(&stored, false), Some("fsap-1".into()));
+        assert_eq!(access_point_after_removal(&stored, true), None);
+        // What the store holds after a keep-the-files removal still blocks a move.
+        let mut after = stored.clone();
+        let a = after.aws.as_mut().unwrap();
+        a.task_arn = None;
+        a.task_definition_arn = None;
+        a.access_point_id = access_point_after_removal(&stored, false);
+        let mut local = after.clone();
+        local.host_id = None;
+        local.aws_placement = None;
+        local.aws = None;
+        let e = validate_aws_update(&after, &local, &hosts).unwrap_err();
+        assert!(e.contains("access point"), "{e}");
+        // After a discarding removal it can move.
+        after.aws.as_mut().unwrap().access_point_id = access_point_after_removal(&stored, true);
+        assert!(validate_aws_update(&after, &local, &hosts).is_ok());
+    }
+
+    #[test]
+    fn a_project_with_aws_resources_cannot_be_moved_off_its_host() {
+        let hosts = vec![host("h1"), host("h2")];
+        let mut stored = aws_project();
+        stored.aws.as_mut().unwrap().access_point_id = Some("fsap-1".into());
+        let mut local = stored.clone();
+        local.host_id = None;
+        local.aws_placement = None;
+        local.aws = None;
+        let e = validate_aws_update(&stored, &local, &hosts).unwrap_err();
+        assert!(e.contains("remove the workspace's AWS resources first"), "{e}");
+        let mut other = stored.clone();
+        other.host_id = Some("h2".into());
+        assert!(validate_aws_update(&stored, &other, &hosts).is_err());
+        let mut moved = stored.clone();
+        moved.aws_placement.as_mut().unwrap().environment = "prod".into();
+        assert!(validate_aws_update(&stored, &moved, &hosts).is_err());
+        for set in [
+            |a: &mut crate::models::AwsWorkspaceConfig| a.task_arn = Some("t".into()),
+            |a: &mut crate::models::AwsWorkspaceConfig| a.task_definition_arn = Some("td".into()),
+        ] {
+            let mut st = aws_project();
+            set(st.aws.as_mut().unwrap());
+            assert!(validate_aws_update(&st, &local, &hosts).is_err());
+        }
+        // No handles: free to move. Other edits are fine with handles.
+        assert!(validate_aws_update(&aws_project(), &local, &hosts).is_ok());
+        let mut edited = stored.clone();
+        edited.aws.as_mut().unwrap().cpu = 2048;
+        edited.aws.as_mut().unwrap().memory_mib = 8192;
+        assert!(validate_aws_update(&stored, &edited, &hosts).is_ok());
+    }
+
+    #[test]
+    fn docker_only_operations_refuse_aws_projects() {
+        assert!(refuse_aws(&aws_project(), "Reset").unwrap_err().contains("Reset is not available"));
+        let mut local = aws_project();
+        local.host_id = None;
+        assert!(refuse_aws(&local, "Reset").is_ok());
+    }
+
+    #[test]
+    fn a_failed_start_with_a_task_left_running_is_not_stopped() {
+        let mut p = aws_project();
+        assert!(!aws_task_left_after_failed_start(&p));
+        p.aws.as_mut().unwrap().task_arn = Some("arn:aws:ecs:r:a:task/c/t".into());
+        assert!(aws_task_left_after_failed_start(&p));
+        let mut local = p.clone();
+        local.host_id = None;
+        assert!(!aws_task_left_after_failed_start(&local));
+    }
+
+    #[test]
+    fn removing_without_the_connection_needs_explicit_confirmation() {
+        let e = missing_connection_removal(false).unwrap_err();
+        assert!(e.contains("still be running") && e.contains("Settings → Hosts"), "{e}");
+        assert!(e.starts_with(AWS_CONNECTION_MISSING));
+        assert!(missing_connection_removal(true).is_ok());
+        // The frontend keys its second confirm on the same prefix.
+        let ts = include_str!("../../../src/lib/types.ts");
+        assert!(
+            ts.contains(&format!("export const AWS_CONNECTION_MISSING = {:?};", AWS_CONNECTION_MISSING)),
+            "lib/types.ts must mirror AWS_CONNECTION_MISSING"
+        );
+    }
+
+    fn stop_store(status: ProjectStatus) -> (tempfile::TempDir, crate::storage::projects_store::ProjectsStore, String) {
+        let mut p = aws_project();
+        p.status = status;
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::storage::projects_store::ProjectsStore::over_file_for_test(
+            dir.path().join("projects.json"),
+            vec![p.clone()],
+        );
+        (dir, store, p.id)
+    }
+
+    #[tokio::test]
+    async fn a_failed_push_before_stop_puts_the_status_back_and_records_nothing() {
+        use crate::commands::stop_guard::tests::Fake;
+        let (_d, store, id) = stop_store(ProjectStatus::Running);
+        store.update_status(&id, ProjectStatus::Stopping).unwrap();
+        let fake = Fake::new(Ok(("push to origin failed: denied".into(), 1)));
+        let e = aws_guard_before_stop(&store, &id, ProjectStatus::Running, Some(&fake), Some(WipChoice::Push), std::time::Duration::from_secs(5), async {})
+            .await
+            .unwrap_err();
+        assert!(e.contains("denied"), "{e}");
+        assert!(e.contains("terminals were closed"), "{e}");
+        assert_eq!(store.get(&id).unwrap().status, ProjectStatus::Running);
+        assert!(fake.markers.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_successful_push_before_stop_records_it_and_leaves_the_stop_going() {
+        use crate::commands::stop_guard::tests::Fake;
+        let (_d, store, id) = stop_store(ProjectStatus::Running);
+        store.update_status(&id, ProjectStatus::Stopping).unwrap();
+        let fake = Fake::new(Ok(("pushed".into(), 0)));
+        let note = aws_guard_before_stop(&store, &id, ProjectStatus::Running, Some(&fake), Some(WipChoice::Push), std::time::Duration::from_secs(5), async {})
+            .await
+            .unwrap();
+        assert_eq!(note, None);
+        assert_eq!(store.get(&id).unwrap().status, ProjectStatus::Stopping, "untouched: the stop goes on");
+        assert_eq!(*fake.markers.lock().unwrap(), vec!["pushed".to_string()]);
+        assert_eq!(fake.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_terminals_close_before_the_stop_guard_pushes_or_records_anything() {
+        use crate::commands::stop_guard::tests::Fake;
+        for wip in [Some(WipChoice::Push), Some(WipChoice::Discard), None] {
+            let (_d, store, id) = stop_store(ProjectStatus::Running);
+            let fake = Fake::new(Ok(("pushed".into(), 0)));
+            let seen_at_close = std::sync::Mutex::new(None);
+            aws_guard_before_stop(&store, &id, ProjectStatus::Running, Some(&fake), wip, std::time::Duration::from_secs(5), async {
+                *seen_at_close.lock().unwrap() =
+                    Some((fake.calls.lock().unwrap().len(), fake.markers.lock().unwrap().len()));
+            })
+            .await
+            .unwrap();
+            assert_eq!(*seen_at_close.lock().unwrap(), Some((0, 0)), "{wip:?}: closed first");
+        }
+        // Stop's own code closes them through that step, not after it.
+        let src = include_str!("project_commands.rs");
+        let stop = &src[src.find("pub async fn stop_project_container").unwrap()..];
+        let stop = &stop[..stop.find("\n}\n").unwrap()];
+        let close = stop.find("close_sessions_for_container").unwrap();
+        assert!(close < stop.find("aws_guard_before_stop(").unwrap());
+        assert!(stop.find("auth_bridge.stop").unwrap() < stop.find("aws_guard_before_stop(").unwrap());
+    }
+
+    #[test]
+    fn a_new_aws_project_takes_repos_not_folders_and_no_runtime_handles() {
+        let hosts = vec![host("h1")];
+        let place = || Some(AwsPlacement { region: "us-west-2".into(), environment: "dev".into() });
+        let cfg = AwsWorkspaceConfig {
+            task_arn: Some("arn:forged".into()),
+            access_point_id: Some("fsap-forged".into()),
+            repos: vec![crate::models::RepoSource { url: "https://h/r.git".into(), branch: None, folder: "r".into() }],
+            ..Default::default()
+        };
+        let p = new_project("a".into(), vec![], Some("h1".into()), place(), Some(cfg.clone()), &hosts).unwrap();
+        assert!(p.is_aws() && p.paths.is_empty());
+        let a = p.aws.unwrap();
+        assert_eq!((a.task_arn, a.access_point_id, a.task_definition_arn), (None, None, None));
+        assert_eq!(a.repos.len(), 1);
+        // folders are refused, so are half placements, unknown hosts and invalid configs
+        let folder = vec![ProjectPath { host_path: "/x".into(), mount_name: "x".into() }];
+        assert!(new_project("a".into(), folder, Some("h1".into()), place(), Some(cfg.clone()), &hosts).is_err());
+        assert!(new_project("a".into(), vec![], Some("h1".into()), None, Some(cfg.clone()), &hosts).is_err());
+        assert!(new_project("a".into(), vec![], Some("nope".into()), place(), Some(cfg.clone()), &hosts).is_err());
+        let bad = AwsWorkspaceConfig { cpu: 256, memory_mib: 8192, ..Default::default() };
+        let e = new_project("a".into(), vec![], Some("h1".into()), place(), Some(bad), &hosts).unwrap_err();
+        assert!(e.contains("not valid"), "{e}");
+        // a local project still needs a folder
+        assert!(new_project("a".into(), vec![], None, None, None, &hosts).is_err());
+    }
+
+    #[test]
+    fn aws_resources_are_removable_only_from_a_stopped_aws_project() {
+        let mut p = aws_project();
+        assert!(check_aws_resources_removable(&p).is_ok());
+        p.status = ProjectStatus::Running;
+        assert!(check_aws_resources_removable(&p).unwrap_err().contains("Stop"));
+        p.status = ProjectStatus::Error;
+        assert!(check_aws_resources_removable(&p).is_err());
+        let mut local = aws_project();
+        local.host_id = None;
+        assert!(check_aws_resources_removable(&local).is_err());
     }
 }

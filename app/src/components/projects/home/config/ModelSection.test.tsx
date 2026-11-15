@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import ModelSection, {
+  BEDROCK_PROFILE_ON_AWS,
   DEFAULT_LLAMACPP_CONFIG,
   DEFAULT_OLLAMA_CONFIG,
 } from "./ModelSection";
@@ -213,5 +214,36 @@ describe("ModelSection — background (haiku) model override", () => {
     });
     expect(screen.getByLabelText("Background model")).toHaveValue("small");
     expect(screen.getByText(/background work/i)).toBeInTheDocument();
+  });
+});
+
+describe("ModelSection — Bedrock on AWS", () => {
+  const bedrock = (auth_method: "profile" | "static_credentials" | "bearer_token") => ({
+    backend: "bedrock" as const,
+    bedrock_config: {
+      auth_method,
+      aws_region: "us-east-1",
+      aws_access_key_id: null,
+      aws_secret_access_key: null,
+      aws_session_token: null,
+      aws_profile: "dev",
+      aws_bearer_token: null,
+      model_id: null,
+      service_tier: null,
+      disable_prompt_caching: false,
+    } as unknown as Project["bedrock_config"],
+  });
+
+  it("warns that a named profile can't work in an AWS workspace", () => {
+    renderSection({ ...bedrock("profile"), host_id: "c1" } as Partial<Project>);
+    expect(screen.getByText(BEDROCK_PROFILE_ON_AWS)).toBeInTheDocument();
+  });
+
+  it("says nothing for a local project or another auth method", () => {
+    const { unmount } = renderSection(bedrock("profile"));
+    expect(screen.queryByText(BEDROCK_PROFILE_ON_AWS)).toBeNull();
+    unmount();
+    renderSection({ ...bedrock("static_credentials"), host_id: "c1" } as Partial<Project>);
+    expect(screen.queryByText(BEDROCK_PROFILE_ON_AWS)).toBeNull();
   });
 });

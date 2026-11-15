@@ -164,6 +164,12 @@ fn environment_names_are_validated() {
 }
 
 #[test]
+fn the_environment_cluster_and_log_group_names_match_the_module() {
+    assert_eq!(environment_cluster_name("dev"), "triple-c-dev");
+    assert_eq!(environment_log_group("dev"), "/triple-c/dev");
+}
+
+#[test]
 fn same_user_and_environment_in_two_regions_do_not_collide() {
     // IAM role names are account-global but environments are regional: the
     // same user joining "dev" in two regions needs distinct roles (and

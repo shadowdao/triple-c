@@ -254,7 +254,7 @@
         "elasticfilesystem:TagResource"
       ],
       "Resource": [
-        "arn:aws:elasticfilesystem:*:*:access-point/*"
+        "arn:aws:elasticfilesystem:*:*:file-system/*"
       ],
       "Condition": {
         "StringEquals": {

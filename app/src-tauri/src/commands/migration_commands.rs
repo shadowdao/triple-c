@@ -432,6 +432,11 @@ pub async fn get_container_staleness(
         .projects_store
         .get(&project_id)
         .ok_or_else(|| format!("Project {} not found", project_id))?;
+    // An AWS task has no local container or snapshot to compare: no claim
+    // either way ("unknown"), and nothing is probed.
+    if project.is_aws() {
+        return Ok(ContainerStaleness::default());
+    }
     let settings = state.settings_store.get();
     let base_image = crate::models::container_config::resolve_image_name(
         &settings.image_source,
@@ -708,6 +713,9 @@ pub async fn migrate_project_to_base(
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<MigrationReport, String> {
+    if let Some(p) = state.projects_store.get(&project_id) {
+        crate::commands::project_commands::refuse_aws(&p, "Updating to the current base image")?;
+    }
     let _guard = match ActiveGuard::acquire(&project_id) {
         Ok(guard) => guard,
         Err(busy) => return Ok(MigrationReport::failed_preflight(&busy)),

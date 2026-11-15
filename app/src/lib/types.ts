@@ -68,8 +68,84 @@ export interface Project {
   renamed_session_names: Record<string, string>;
   marketplace_installs: MarketplaceInstall[];
   marketplace_disabled: MarketplaceItemRef[];
+  /** Host connection id this project runs on; null = local Docker. */
+  host_id: string | null;
+  aws_placement: AwsPlacement | null;
+  aws: AwsWorkspaceConfig | null;
   created_at: string;
   updated_at: string;
+}
+
+export interface AwsPlacement {
+  region: string;
+  environment: string;
+}
+
+export type Arch = "x86_64" | "arm64";
+export type StorageMode = "ephemeral" | "hybrid";
+
+export interface RepoSource {
+  url: string;
+  /** null = the remote's default branch. */
+  branch: string | null;
+  folder: string;
+}
+
+export interface AwsWorkspaceConfig {
+  cpu: number;
+  memory_mib: number;
+  arch: Arch;
+  storage: StorageMode;
+  ephemeral_gib: number;
+  spot: boolean;
+  idle_stop_minutes: number | null;
+  repos: RepoSource[];
+  wip_push_on_stop: boolean;
+  /** Store-owned runtime handles; a save cannot change them. */
+  task_arn: string | null;
+  access_point_id: string | null;
+  task_definition_arn: string | null;
+}
+
+/** Where a new project runs: omitted (or all null) = local Docker. An AWS
+ *  project passes all three and no folders. */
+export interface NewProjectHost {
+  hostId: string | null;
+  awsPlacement: AwsPlacement | null;
+  aws: AwsWorkspaceConfig | null;
+}
+
+export interface RemoveProjectOptions {
+  /** AWS: also remove the workspace's EFS access point (the files stay on the
+   *  user's own file system until offboarding). */
+  discardData?: boolean;
+  /** AWS: the connection is gone; remove the project and leave its AWS resources. */
+  forgetAwsResources?: boolean;
+}
+
+/** Prefix of `remove_project`'s refusal when an AWS project's connection is
+ *  gone (Rust `AWS_CONNECTION_MISSING`; a Rust test pins the two together). */
+export const AWS_CONNECTION_MISSING = "AWS_CONNECTION_MISSING: ";
+
+/** What Stop does with an AWS workspace's unsaved git work (Rust `WipChoice`). */
+export type WipChoice = "push" | "discard";
+
+/** One repository line of `triple-c-wip-push --dry-run` (Rust `RepoState`). */
+export interface RepoState {
+  folder: string;
+  dirty: boolean;
+  unpushed: number;
+  branch: string;
+  /** The start's background clone is still writing it: nothing to push. */
+  cloning?: boolean;
+}
+
+/** What `checkUnsavedWork` found (Rust `UnsavedWork`). `checked: false` (with
+ *  `error`) when the workspace could not be asked. */
+export interface UnsavedWork {
+  checked: boolean;
+  repos: RepoState[];
+  error: string | null;
 }
 
 export type ProjectStatus =
@@ -1149,6 +1225,7 @@ export type AwsError =
   | { kind: "invalid_credentials"; message: string }
   | { kind: "access_denied"; action: string; message: string }
   | { kind: "state_bucket_taken"; bucket: string }
+  | { kind: "quota_exceeded"; message: string }
   | { kind: "other"; message: string };
 
 export interface CallerIdentity {

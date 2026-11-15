@@ -194,6 +194,30 @@ impl Activity {
     pub fn touch(&self) {
         self.last_unix.store(now_unix(), Ordering::Relaxed);
     }
+    /// Touch unless the session belongs to a background request.
+    pub fn touch_for(&self, bg: Background) {
+        if !bg.0 {
+            self.touch();
+        }
+    }
+}
+
+/// A request carrying this header with the value `1` is a background poll
+/// (the app's auth bridge reading `/proc/net/tcp` every 2 s): it is served
+/// like any other but never counts as activity, nor does the I/O of an
+/// attach or tunnel it opens. Otherwise such polls would keep an idle
+/// workspace up forever.
+pub const BACKGROUND_HEADER: &str = "x-triple-c-background";
+
+/// Whether the request was marked with [`BACKGROUND_HEADER`]; set by the
+/// auth layer as a request extension for the handlers that keep a session.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Background(pub bool);
+
+impl Background {
+    pub fn of(headers: &axum::http::HeaderMap) -> Background {
+        Background(headers.get(BACKGROUND_HEADER).is_some_and(|v| v.as_bytes() == b"1"))
+    }
 }
 
 /// Increments a counter for as long as it lives, so an exec or tunnel that
@@ -326,7 +350,7 @@ pub async fn serve(listener: tokio::net::TcpListener, config: Config) -> std::io
 /// Bearer-token gate on every request. A failure is `401` with an **empty**
 /// body (spec): nothing about the API is disclosed to a caller without the
 /// token.
-async fn auth(State(st): State<Arc<AppState>>, req: Request, next: Next) -> Response {
+async fn auth(State(st): State<Arc<AppState>>, mut req: Request, next: Next) -> Response {
     let presented = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -336,11 +360,14 @@ async fn auth(State(st): State<Arc<AppState>>, req: Request, next: Next) -> Resp
         return StatusCode::UNAUTHORIZED.into_response();
     }
     // `health` and `activity` are the idle monitor's own probes; counting them
-    // would mean an idle container could never look idle.
+    // would mean an idle container could never look idle. Background polls
+    // (see [`BACKGROUND_HEADER`]) are exempt for the same reason.
+    let bg = Background::of(req.headers());
     let path = req.uri().path();
     if path != "/v1/health" && path != "/v1/activity" {
-        st.activity.touch();
+        st.activity.touch_for(bg);
     }
+    req.extensions_mut().insert(bg);
     next.run(req).await
 }
 

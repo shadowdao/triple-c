@@ -6,15 +6,17 @@ tier the signed-in identity has under **Settings → Hosts → Check**.
 
 | File | What it is |
 |---|---|
-| `policies/workspace-user.json` | The **workspace user** tier: create, start, stop, connect to and delete **their own** workspaces in an existing environment |
+| `policies/workspace-user.json` | The **workspace user** tier, part 1: create, start, stop, connect to and delete **their own** workspaces in an existing environment |
+| `policies/workspace-user-tasks.json` | The **workspace user** tier, part 2: register and tag **their own** ECS task definitions, and read **their own** secrets (`workspace-user.json` has no room left) |
 | `policies/environment-admin.json` | The **environment admin** tier, part 1: apply and destroy the environment and onboarding modules (`terraform/`) with OpenTofu, and keep their state |
 | `policies/environment-admin-network.json` | The **environment admin** tier, part 2: the network those modules create (VPC, subnets, gateways, routes, security groups) |
 | `policies/permissions-boundary.json` | The **permissions boundary** every Triple-C role must carry. It is never attached to a person |
 
-The admin tier is **two** files, because one managed policy holds only 6,144 characters; both are
-required, and the app's **Copy** lists every file of a tier. An environment admin attaches all three
-tier files (the workspace user's and both admin files): the admin files add environment management
-on top of everything a workspace user can do. Explicit Deny statements in any file apply to anyone
+The workspace tier and the admin tier are each **two** files, because one managed policy holds
+only 6,144 characters; both files of a tier are required, and the app's **Copy** lists every
+file of a tier. An environment admin attaches all four tier files (both workspace user files and
+both admin files): the admin files add environment management on top of everything a workspace
+user can do. Explicit Deny statements in any file apply to anyone
 who has it attached.
 
 ## Workspace user
@@ -26,6 +28,33 @@ following:
 - **Run tasks.** The task definition must be a `triple-c-*` one tagged with the user's own owner
   ID, and the cluster must be a `triple-c-*` one. The new task is tagged with the user's owner ID.
   The user can pass only `triple-c-*` roles tagged with their owner ID, and only to ECS tasks.
+- **Register their own task definitions** (`workspace-user-tasks.json`). `ecs:RegisterTaskDefinition`
+  on `triple-c-*` families needs `triple-c:owner = ${aws:userid}` in the request and only the three
+  ordinary tag keys. `ecs:TagResource` on a task definition is allowed only at registration
+  (`ecs:CreateAction = RegisterTaskDefinition`, same owner and tag-key conditions), so a
+  definition can never be retagged. Users **cannot retire** task definitions, not even their own
+  (ruling R8): ECS authorizes `ecs:DeregisterTaskDefinition` against `*` only, with no tag
+  condition, so allowing it would let any user deregister any revision in the account. Removing a
+  project leaves its revisions registered (they hold no secret values and cost nothing, and
+  `RunOwnTasks` still needs the owner tag, so nobody else can run them); an admin clears them
+  (see "Clearing workspace task definitions"). A task definition that names a task or
+  execution role is also authorized with `iam:PassRole` on it, which `PassOwnTaskRoles` already
+  covers (owner-tagged `triple-c-*` roles, to ECS tasks only; a unit test checks both roles).
+  `RunOwnTasks` still requires the definition's owner tag, so a user can run only definitions they
+  registered. The `*` in `task-definition/triple-c-*` matches `family:revision` too.
+  - **Residual risk: polluting another owner's family.** The family name carries the owner key,
+    which IAM cannot condition on, so any workspace user can register a *revision* into another
+    owner's `triple-c-*` family and make it the family's latest. It cannot run or steal anything
+    (`RunOwnTasks` needs the owner tag, and the new revision carries the attacker's), and the
+    policy cannot close this. The app's mitigation: it always runs the exact `family:revision`
+    ARN its own register call returned, and when it looks up an existing revision it accepts
+    only one tagged with the caller's own owner ID, never "latest of the family".
+- **Read their own secrets.** `secretsmanager:GetSecretValue` on `triple-c/*` secrets tagged with
+  their owner ID, so a second machine can read the agent token and attach to a running task
+  (`ReadOwnSecrets`). An explicit Deny (`NeverReadEnvironmentSecrets`) refuses it on any secret
+  tagged `triple-c:component`, even one that also carries their owner tag. (`NeverTouchEnvironmentSecrets`
+  in `workspace-user.json` covers writes; it has no room for another action.) Reading also
+  needs `kms:Decrypt` through Secrets Manager on the environment key, which the first file grants.
 - **Work with their own tasks.** They can stop them, `ecs execute-command` into them, and open an
   SSM session to them. They can end or resume only sessions they started, and open data channels
   (`ssmmessages:OpenDataChannel`) only on those.
@@ -56,7 +85,19 @@ following:
   their owner ID, and create them only on **their own** file system: one tagged
   `triple-c:component` (their onboarding module tags it `user-onboarding`) *and*
   `triple-c:owner = ${aws:userid}`. Each user has their own file system (strict tenancy), so
-  another user's file system is refused even though it is Triple-C's.
+  another user's file system is refused even though it is Triple-C's. The `TagResource` that a
+  tagged `CreateAccessPoint` needs is authorized against the **file system**, not the new access
+  point (verified live, phase 5), so `TagOwnAccessPointsAtCreate` names `file-system/*` and is
+  confined by `elasticfilesystem:CreateAction = CreateAccessPoint`.
+- **What removing a project removes.** Removing a project (or only its AWS resources) stops its
+  task and deletes its secret **at once** (`ForceDeleteWithoutRecovery`, ruling R10: the app
+  rebuilds it from local data, and a secret left pending deletion would make the next start's
+  `CreateSecret` fail). "Also remove the workspace's file-system access point" deletes only the
+  **access point** (ruling R9): the files under it (the Claude login, history, SSH keys) stay on
+  the user's own EFS file system, which only their own task role can read, until the user is
+  offboarded (destroying their onboarding module removes the file system). Starting the same
+  project on AWS again creates a new access point onto the same directory. Task definition
+  revisions stay registered (R8).
 - **Set only the ordinary tag keys.** Every request that tags something may set only
   `triple-c:owner`, `triple-c:project` and `triple-c:environment` (`aws:TagKeys`). This applies to
   `RunTask`, the ECS and EFS tag-on-create calls, `CreateSecret`, and secret `TagResource`. A
@@ -95,6 +136,19 @@ and nothing runs with more than the admin holds. It covers:
   gateway, security groups and their rules (`environment-admin-network.json`);
 - EFS file systems, mount targets and file-system policies, and KMS keys and aliases;
 - `/triple-c/*` log groups and `/triple-c/*` SSM parameters.
+
+**Clearing workspace task definitions.** Removing a project leaves its revisions registered
+(family `triple-c-<env>-<owner key>-<project id, 12 chars>`). The admin tier may deregister any
+revision (`ecs:DeregisterTaskDefinition` on `*`), so an admin clears an environment's with:
+
+```sh
+aws ecs list-task-definitions --family-prefix triple-c-<env>- --query 'taskDefinitionArns[]' --output text \
+  | xargs -r -n1 aws ecs deregister-task-definition --task-definition >/dev/null
+```
+
+Deregistered revisions become INACTIVE; ECS keeps them until they are deleted with
+`ecs:DeleteTaskDefinitions`, which the admin tier does not grant (an account administrator can).
+A task still running from a revision keeps running.
 
 Not in v1, and so not in the policy: ECR (tasks pull from GHCR), custom ECS capacity providers,
 and passing roles to EC2 (`iam:PassRole` is to `ecs-tasks.amazonaws.com` only). Phase 7's EC2
@@ -339,9 +393,10 @@ module creates the same policy, applied by an account administrator; the admin t
 Create each file as a **customer managed policy** and attach it. In the console, go to
 **IAM → Policies → Create policy → JSON**, paste the file, and attach the policy to a user, group
 or role. Inline policies do not fit: a role's inline policies share 10,240 characters and an
-environment admin needs every tier file (about 14,500), and a user's share 2,048. A managed policy
+environment admin needs every tier file (about 16,400), and a user's share 2,048. A managed policy
 may hold 6,144 characters, not counting whitespace. Without whitespace, `workspace-user.json` is
-about 6,040 (roughly 100 characters of headroom), `environment-admin.json` about 5,800 (340)
+about 6,040 (roughly 100 characters of headroom), `workspace-user-tasks.json` about 1,200,
+`environment-admin.json` about 5,800 (340)
 and `environment-admin-network.json` about 3,340; a unit test (`every_policy_fits_a_managed_policy`)
 fails before any file outgrows the limit. A tier that outgrows its files gains another file, which
 the app then lists with the others. For IAM Identity Center, add the files as inline policies on the permission set
@@ -352,8 +407,12 @@ With the CLI:
 ```sh
 aws iam create-policy --policy-name triple-c-workspace-user \
   --policy-document file://policies/workspace-user.json
+aws iam create-policy --policy-name triple-c-workspace-user-tasks \
+  --policy-document file://policies/workspace-user-tasks.json
 aws iam attach-user-policy --user-name <user> \
   --policy-arn arn:aws:iam::<account>:policy/triple-c-workspace-user
+aws iam attach-user-policy --user-name <user> \
+  --policy-arn arn:aws:iam::<account>:policy/triple-c-workspace-user-tasks
 ```
 
 ## Known gaps
@@ -497,3 +556,48 @@ Still open:
 - `DisassociateGoneAddresses` cannot touch a **live** association. Probe: allocate an untagged
   Elastic IP, associate it with a test ENI, and call `ec2:DisassociateAddress` on that association
   as the environment admin; it must be denied (then release both).
+
+### Phase 5: a Fargate workspace (2026-11-15)
+
+```sh
+TRIPLEC_AWS_E2E_PROFILE=<admin profile> TRIPLEC_AWS_E2E_REGION=us-west-2 scripts/aws-e2e-workspace.sh
+```
+
+The script first unsets every `AWS_*` variable of the caller, so only the named profile's
+credentials are used; `TRIPLEC_AWS_E2E_CREDENTIALS_FILE` / `TRIPLEC_AWS_E2E_CONFIG_FILE` (default:
+the caller's `AWS_SHARED_CREDENTIALS_FILE` / `AWS_CONFIG_FILE`, else `~/.aws`) say where that
+profile lives. It builds this checkout's `container/` (`--platform linux/amd64`), creates a throwaway
+private ECR repository `triple-c-e2e-sandbox`, pushes, runs the test
+(`aws::live_tests::environment::a_fargate_workspace_round_trips`, with `TRIPLEC_E2E_IMAGE` and
+`TRIPLEC_E2E_ECR_REPO`) and deletes the repository in an exit trap — always attempted, a
+`RepositoryNotFoundException` is fine; Ctrl-C exits 130 and a TERM 143 after the same cleanup. The
+test's guard deletes it as well. The test body runs under a 45-minute timeout, every exec under its own.
+**Test only:** the onboarding grants the execution role no ECR permissions (the boundary allows
+pulls), so the test puts an inline `triple-c-e2e-ecr-pull` policy on it and removes it before the
+onboarding is destroyed. The test deploys a `public` environment as the environment admin, onboards
+a role that holds **only** the workspace files, and drives `ProjectHost::Aws` as that role through
+a profile connection (`role_arn` + `source_profile`): Hybrid, 1 vCPU / 2 GB, one public repo, idle
+stop 5 minutes. Its guard stops every task, retires the test's revisions as the account admin, deletes the access points
+and the secret and removes the ECR policy; then the fixture destroys the modules.
+
+| Point | Result |
+|---|---|
+| `RegisterTaskDefinition` on `task-definition/triple-c-*` | ✓ allowed for the workspace user with the owner request tag and the three keys; the revision carries exactly those tags (`TagResource` with `ecs:CreateAction`) |
+| `RunTask`: owner tag on the revision, `iam:PassRole` by `iam:ResourceTag` | ✓ allowed on the user's revision with their own roles; on a revision tagged with another owner, denied |
+| `DeregisterTaskDefinition` | ✗→decided (R8): ECS authorizes it against `*` only. `task-definition/triple-c-*`, and `*` with `aws:ResourceTag/triple-c:owner`, are both denied; only an unconditional `*` works (probe). The workspace tier no longer has it (`RetireOwnTaskDefinitions` dropped); removing a project leaves its revisions registered for an admin to clear |
+| `DeleteTaskDefinitions` | (probe) resource-level: authorized against the revision's ARN with `aws:ResourceTag` (the owner's tag passes, another owner's is denied), but it only deletes INACTIVE revisions, so without deregistration it is useless to a user. Dropped from the workspace tier with it (R8) |
+| `CreateAccessPoint`'s `TagResource` | ✗→fixed: authorized against the **file system**, not the access point (probe: `access-point/*` denied; `file-system/*` allowed; `CreateAction`, `aws:RequestTag` and `aws:TagKeys` all present) |
+| Bare `TagResource` on the user's own file system | ✓ denied (no `elasticfilesystem:CreateAction`): `TagOwnAccessPointsAtCreate` tags only at access-point creation |
+| `GetSecretValue` | ✓ own secret (an attach reads the token back); another owner's `triple-c/*` secret denied |
+| EFS access point with the task role (IAM + TLS) | ✓ mounted at `/mnt/triple-c-home` (`127.0.0.1:/ … nfs4`, the TLS tunnel), `claude:claude 700`; `~/.claude`, `~/.claude.json` and `~/.ssh` link into it |
+| Times | first start (register, access point, RunTask, pull of ~1.2 GB, agent, tunnel) 94–104 s; ECS `HEALTHY` 135 s after the start began; attach to a running task 2 s; StopTask to `STOPPED` 42 s; restart 86–92 s |
+| Attach | ✓ a second start while running reuses the task (one task in the family, same ARN, no RunTask) |
+| Restart | ✓ new task, same revision; the `~/.claude` marker survived |
+| Repo clone | ✓ the background clone finished (`/run/triple-c-clone/repos`: `Hello-World cloned`) |
+| Stop guard and WIP push | ✓ `triple-c-wip-push --dry-run` reports the dirty repo; after StopTask the log shows `entrypoint: stopping (sigterm) — pushing work in progress...` and the push failing for lack of GitHub credentials. No push with real credentials was tried |
+| Idle stop (5 min) | ✓ with a terminal held open and the auth bridge's background poll running, the task stopped itself 365 s after the last use (`triple-c-idle-watch: idle for 5 minutes`, `entrypoint: stopping (idle) — work in progress already handled by the idle watcher`); ECS reports `EssentialContainerExited` with exit code 75, which the app classifies as an idle stop (re-run 2026-11-15 after the PR #82 fixes) |
+| `~/.claude.json` after Claude Code runs | ✓ still a link (Claude Code started without a login: "Not logged in") |
+| Bubblewrap (P9) | ✗ `bwrap --unshare-user` fails: "No permissions to create new namespace" (kernel 6.1, `max_user_namespaces` 16384, no `CAP_SYS_ADMIN` on Fargate). The sandbox stays off on AWS |
+| A revision per configuration | turning idle stop on adds a secret key, so the next start registers a new revision (by design) |
+| Removal (R8) | ✓ final run: `remove_aws_resources` succeeds; the secret is scheduled for deletion, the access point deleted, the revision left ACTIVE. Since R10 the secret is deleted without a recovery window (the test now asserts it is gone) |
+| Cleanup | ✓ nothing `triple-c` left in us-west-2; environment KMS keys pending deletion |

@@ -54,6 +54,35 @@ describe("useProjectStatusEvents", () => {
     expect(toasts).toHaveLength(0);
   });
 
+  it("says why an AWS task stopped, and keeps a user's stop quiet", async () => {
+    renderHook(() => useProjectStatusEvents());
+    await vi.waitFor(() => expect(handler).not.toBeNull());
+    const fire = (stop: unknown, reason = "exited") => {
+      useAppState.setState({ toasts: [] });
+      handler!({ payload: { project: project({ status: "stopped" }), reason, stop } });
+      return useAppState.getState().toasts;
+    };
+
+    let t = fire({ kind: "spot", message: "Spot interruption" });
+    expect(t[0].kind).toBe("info");
+    expect(t[0].message).toContain("Spot interruption");
+
+    t = fire({ kind: "idle", message: null });
+    expect(t[0].kind).toBe("info");
+    expect(t[0].message).toContain("idle");
+
+    expect(fire({ kind: "user", message: null })).toHaveLength(0);
+
+    // A task that never started is news even when found at startup.
+    t = fire({ kind: "failed", message: "CannotPullContainerError: denied" }, "found_stopped");
+    expect(t[0].kind).toBe("error");
+    expect(t[0].detail).toContain("CannotPullContainerError");
+
+    t = fire({ kind: "exited", message: "OutOfMemoryError" });
+    expect(t[0].kind).toBe("error");
+    expect(t[0].detail).toContain("OutOfMemoryError");
+  });
+
   it("stops listening on unmount", async () => {
     const { unmount } = renderHook(() => useProjectStatusEvents());
     await vi.waitFor(() => expect(handler).not.toBeNull());

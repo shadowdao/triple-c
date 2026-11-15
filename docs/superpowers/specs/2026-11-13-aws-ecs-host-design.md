@@ -1,7 +1,7 @@
 # Triple-C on AWS (ECS on EC2 / Fargate) — design
 
 Date: 2026-11-13
-Status: **draft for review** (user decisions recorded 2026-11-13 and 2026-11-14; phase 4 done). The user set the direction (local or AWS, login like the AWS CLI,
+Status: **draft for review** (user decisions recorded 2026-11-13 and 2026-11-14; phases 1-5 done). The user set the direction (local or AWS, login like the AWS CLI,
 permission check, hosting options, secrets pushed automatically, shared accounts). Everything else
 here is a proposal.
 
@@ -319,9 +319,8 @@ other.
      unkillable keepalive.
 3. **Fargate restrictions** are handled by the host, not the image: no `privileged`, and no added
    capabilities except `SYS_PTRACE`. So VPN (`NET_ADMIN`) and Docker access are unavailable. The
-   bubblewrap sandbox likely can't create user namespaces on Fargate (**verify**), so the generated
-   Claude Code settings use `enableWeakerNestedSandbox` or turn the sandbox off, with a visible
-   notice.
+   bubblewrap sandbox can't create user namespaces on Fargate (verified, phase 5 P9), so the generated
+   Claude Code settings turn the sandbox off, with a visible notice.
 
 **Getting the image into the account:**
 
@@ -350,7 +349,9 @@ updates use the existing "new image available" flow: the next start uses the new
   `git status --porcelain` and any unpushed commits in each repo. If anything would be lost, it
   offers: **Push to a `triple-c/wip/<date>` branch** (the preselected default), **Stop anyway**, or
   **Cancel**. The same check runs before idle auto-stop. If anything is dirty, idle auto-stop
-  pushes a WIP branch instead of throwing work away.
+  pushes a WIP branch instead of throwing work away, and stops only once that push succeeded (a
+  failed push keeps the workspace up and is retried, backing off). With the WIP push off, unsaved
+  work keeps the workspace up.
 - **Fargate task retirement and Spot interruption** send `SIGTERM` with a short deadline (2 minutes
   for Spot). The entrypoint's `SIGTERM` trap runs the same WIP push, best-effort, when the project
   has it enabled.
@@ -498,9 +499,12 @@ way.
   - user-initiated → Stopped.
 
   EventBridge → SQS for push notifications is a later improvement.
-- **Idle auto-stop** runs **inside** the task: the agent tracks activity (terminal I/O, agent
-  calls, running `claude` processes and scheduler jobs) and stops the task by exiting the
-  entrypoint. It doesn't depend on the app being open. Because a running scheduler job counts as
+- **Idle auto-stop** runs **inside** the task: the agent tracks activity (terminal I/O and agent
+  calls; an open but silent terminal or tunnel is not activity, and the app's background polls
+  are marked `X-Triple-C-Background` and never count — ruling R11), the watcher adds running
+  `claude` processes, scheduler jobs and unsaved git work, and stops the task by exiting the
+  entrypoint with status 75, which the app reads back from `DescribeTasks` to say "stopped after
+  being idle". It doesn't depend on the app being open. Because a running scheduler job counts as
   activity, scheduled tasks keep a workspace alive. The admin's maximum lifetime is a hard cap
   either way.
 - **Health:** the task definition carries an ECS container health check against the agent, run
@@ -542,7 +546,7 @@ way.
 | Marketplace installs | Yes (files copied through the agent) | Yes | Yes |
 | LLM gateway (LiteLLM) | Sidecar container in the task definition | Sidecar | Sidecar |
 | Ollama / llama.cpp on the user's machine | **No**, unless the URL is reachable from AWS | No | No |
-| Claude Code sandbox (bubblewrap) | Weaker nested mode or off (**verify**) | Weaker nested mode | Full |
+| Claude Code sandbox (bubblewrap) | Off (bubblewrap fails on Fargate, P9) | Weaker nested mode | Full |
 | Docker access | No | No | Yes |
 | VPN support | No | No | Yes |
 | Snapshots | Setup script instead | Setup script | Setup script |
@@ -596,23 +600,42 @@ pub aws_placement: Option<AwsPlacement>,   // { region, environment } — set wh
 pub aws: Option<AwsWorkspaceConfig>,
 
 pub struct AwsWorkspaceConfig {
-    pub launch_type: LaunchType,           // Fargate | Ec2 { capacity_provider }
-    pub cpu: u32, pub memory_mib: u32, pub arch: Arch,
-    pub storage: StorageMode,              // Ephemeral | Hybrid | Efs
-    pub ephemeral_gib: u32,
+    pub cpu: u32, pub memory_mib: u32, pub arch: Arch,   // X86_64 | Arm64 (Fargate's valid pairs)
+    pub storage: StorageMode,              // Ephemeral | Hybrid (Efs: phase 6)
+    pub ephemeral_gib: u32,                // 21-200
     pub spot: bool,
     pub idle_stop_minutes: Option<u32>,
-    pub repos: Vec<RepoSource>,            // { url, branch, folder } — parallel to ProjectPath
-    pub secrets_delivery: SecretsDelivery, // SecretsManager | CopyAtConnect
-    pub setup_script: Option<String>,
-    pub wip_push_on_stop: bool,
-    // runtime state (not user-edited)
+    pub repos: Vec<RepoSource>,            // { url, branch: Option, folder } — parallel to ProjectPath
+    pub wip_push_on_stop: bool,            // default true
+    // runtime state (store-owned, not user-edited)
     pub task_arn: Option<String>, pub access_point_id: Option<String>,
+    pub task_definition_arn: Option<String>,   // the exact family:revision last run
 }
+// Not built yet: launch_type (Fargate only; EC2 is phase 7), secrets_delivery (Secrets Manager
+// only; Copy-at-connect is phase 6), setup_script (phase 6).
 ```
 
 Existing `projects.json` files deserialize unchanged (`host_id` missing → Local).
 `Project.container_id` stays Docker-only. AWS uses `aws.task_arn`.
+
+### Phase 5: rulings (2026-11-15)
+
+- **P1** One secret per project (`triple-c/<env>/<owner_key>/<project-id>`) holds everything project-shaped; task definitions carry only constants. Every user has `ecs:Describe*` on `*`, so anything in a task definition is public to the account. `owner_key` replaces `<owner>` (`aws:userid` contains `:`).
+- **P2** The agent token rotates on every start; users may read their own secrets so a second machine can attach to a running task. The task role has no Secrets Manager access.
+- **P3** Workspace users register their own task definitions (`workspace-user-tasks.json`, owner request tag + the three tag keys); family `triple-c-<env>-<owner_key>-<project-id-12>`. Anyone can register into any `triple-c-*` family, so revisions and tasks are trusted by owner tag and run by exact `family:revision` ARN.
+- **P4** Hybrid persists by symlinking `~/.claude`, `~/.claude.json`, `~/.ssh` into the EFS mount (`/mnt/triple-c-home`), not by mounting over `/home/claude`: EFS can't seed from the image, and masking would hide the image's tooling.
+- **P5** AWS runs a registry image only; `LocalBuild` maps to the registry image and `Custom` must name a registry reference.
+- **P6** Left for phase 6+: EFS mode, Copy-at-connect, setup scripts, cost estimate, port mappings, the LLM gateway sidecar, Docker access, VPN, the admin's maximum lifetime. The UI shows them disabled with the reason.
+- **P7** Idle means no authenticated agent activity for N minutes, no `claude` process and no running scheduler job; default off, 5-1440 minutes when on.
+- **P8** Spot uses `FARGATE_SPOT`; stop code `SpotInterruption` shows as Stopped with a Spot reason.
+- **P9** Bubblewrap fails on Fargate (measured live), so the AWS host forces Claude Code's sandbox off in the generated settings, with a notice.
+- **R1** Files travel as one secret key `TRIPLEC_FILES` (JSON of base64), decoded by the entrypoint, then unset.
+- **R2** The task definition's `environment` is exactly `TRIPLEC_HOST=aws` and `COLORTERM=truecolor` (no key list).
+- **R3/R4** The tunnel registry feeds `has_exited` (the exit source takes an injected project-to-task lookup); the sandbox is forced off in settings (P9).
+- **R5** The live test pushes the image to a throwaway private ECR repo and grants the execution role a test-only pull policy, because Fargate can't pull a local image.
+- **R6** Repos clone in the background after the agent starts, so the 30 s health window holds; cost: a terminal may open before a repo exists.
+- **R7** OpenAI Compatible is allowed on AWS with a warning that the URL must be reachable from AWS; only the local LiteLLM sidecar is unavailable.
+- **R8** Removal leaves task-definition revisions ACTIVE for an admin to clear: `ecs:DeregisterTaskDefinition` is only grantable on `*`, so granting it would let any user break others' workspaces. Cost: stale revisions accumulate (free).
 
 ## Shipped AWS artefacts
 
@@ -650,7 +673,9 @@ TLS only, tagged `triple-c:component=state`), one object per deployment (D9).
    admin request, **strict tenancy**. **Done 2026-11-14**; deployed, joined, updated and destroyed
    for real as a role holding only the admin policies (see "Phase 4: live verification").
 5. **Fargate workspaces.** Ephemeral and Hybrid storage, Secrets Manager delivery, git bootstrap,
-   start/stop/status, stop guard with WIP push on by default, idle auto-stop, logs.
+   start/stop/status, stop guard with WIP push on by default, idle auto-stop, logs. **Done 2026-11-15**; verified live on Fargate:
+   cold start about 94-104 s, ECS `HEALTHY` about 135 s, attach to a running task about 2 s, idle
+   stop verified (see "Phase 5: rulings" and `aws/README.md` "Phase 5").
 6. **EFS mode, Copy-at-connect, setup scripts, cost estimate.**
 7. **ECS on EC2.** Per-user capacity providers in the onboarding module, privileged/Docker/VPN on
    dedicated capacity.
@@ -658,11 +683,19 @@ TLS only, tagged `triple-c:component=state`), one object per deployment (D9).
 
 ## To verify before or during implementation
 
-- Whether Fargate allows bubblewrap's unprivileged user namespaces, and what Claude Code's sandbox
-  does there.
+- ~~Whether Fargate allows bubblewrap's unprivileged user namespaces, and what Claude Code's
+  sandbox does there.~~ **Measured 2026-11-15:** it doesn't. `bwrap --unshare-user` fails with "No
+  permissions to create new namespace" (no `CAP_SYS_ADMIN`), so the AWS host keeps Claude Code's
+  sandbox off.
 - ABAC condition keys for each action: ECS `RunTask` tag-on-create, `ExecuteCommand`, and
   `ssm:StartSession` against ECS targets; EFS `CreateAccessPoint` with request tags; Secrets
   Manager name-prefix plus tag conditions with `${aws:userid}` for SSO sessions.
+  **Phase 5 (2026-11-15, `aws/README.md` "Phase 5"):** `RunTask` with the owner's revision and
+  roles, `RegisterTaskDefinition` on `task-definition/triple-c-*`, `CreateAccessPoint` with request
+  tags and `GetSecretValue` on one's own secret work for a role session; another owner's revision
+  or secret is denied. `CreateAccessPoint`'s `TagResource` is authorized against the file system
+  (policy fixed). `DeregisterTaskDefinition` supports only `*` with no tag condition, so (ruling R8)
+  workspace users don't retire task definitions; removal leaves them for an admin. SSO sessions themselves were not used.
 - ~~That `session-manager-plugin` port forwarding to an ECS target is stable for hours-long
   sessions, and how quickly it reconnects.~~ **Measured 2026-11-14** (phase 2b, us-west-2,
   plugin 1.2.896, Fargate 1 vCPU / 2 GB, `host::ssm::live_tests`):
@@ -749,8 +782,8 @@ detached runner, detection, self-onboarding, an update ("No changes"), destroy; 
   file-system policy accepted the just-created task role; conditional `DeleteObject` (`If-Match`)
   on the versioned bucket returns 412 on a stale ETag.
 
-Still to verify: the `existing` network mode against a user's own VPC, and Fargate tasks in the
-deployed environment (phase 5).
+Still to verify: the `existing` network mode against a user's own VPC. Fargate tasks in the
+deployed environment were run in phase 5 (`aws/README.md`).
 
 ## Connection model
 

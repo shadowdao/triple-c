@@ -32,6 +32,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::watch;
 
+use crate::aws::tasks::StopKind;
 use crate::host::watch::ExitSource;
 use crate::host::ContainerTarget;
 use crate::models::{Project, ProjectStatus};
@@ -68,6 +69,32 @@ pub enum ExitReason {
 pub struct ContainerExited<'a> {
     pub project: &'a Project,
     pub reason: ExitReason,
+    /// AWS: why ECS says the task stopped (P8). `None` on Docker, or when
+    /// the watch has no reason on record.
+    pub stop: Option<StopNote>,
+}
+
+/// Why an AWS task stopped, for the UI's toast.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StopNote {
+    /// `spot`, `idle`, `failed` (the project goes to Error), `user` (someone
+    /// stopped it: no toast) or `exited` (on its own).
+    pub kind: &'static str,
+    /// ECS's stopped reason, or a fixed text.
+    pub message: Option<String>,
+}
+
+impl StopNote {
+    pub fn of(kind: &StopKind) -> StopNote {
+        let (kind, message) = match kind {
+            StopKind::Spot => ("spot", Some("Spot interruption".to_string())),
+            StopKind::Idle => ("idle", None),
+            StopKind::FailedToStart(r) => ("failed", Some(r.clone())),
+            StopKind::UserInitiated => ("user", None),
+            StopKind::Exited(r) => ("exited", r.clone()),
+        };
+        StopNote { kind, message }
+    }
 }
 
 fn project_busy(project_id: &str) -> bool {
@@ -143,11 +170,11 @@ async fn unless_cancelled<T>(
 /// (see [`STABLE_AFTER`]).
 async fn watch_once(
     store: &ProjectsStore,
+    source: &ExitSource,
     cancel: &mut watch::Receiver<bool>,
     sweep_reason: ExitReason,
     on_change: &impl Fn(&Project, ExitReason),
 ) -> Option<bool> {
-    let source = ExitSource::Docker;
     if !unless_cancelled(cancel, source.reachable()).await? {
         return Some(false);
     }
@@ -187,6 +214,7 @@ async fn watch_once(
 /// test can drive it without a Tauri app.
 pub(crate) async fn run(
     store: Arc<ProjectsStore>,
+    source: ExitSource,
     mut cancel: watch::Receiver<bool>,
     on_change: impl Fn(&Project, ExitReason),
 ) {
@@ -197,7 +225,7 @@ pub(crate) async fn run(
     let mut sweep_reason = ExitReason::FoundStopped;
     let mut failures: u32 = 0;
     loop {
-        let Some(healthy) = watch_once(&store, &mut cancel, sweep_reason, &on_change).await else {
+        let Some(healthy) = watch_once(&store, &source, &mut cancel, sweep_reason, &on_change).await else {
             return;
         };
         sweep_reason = ExitReason::Exited;
@@ -209,21 +237,59 @@ pub(crate) async fn run(
     }
 }
 
-/// Start the watcher for the life of the app.
+/// Start a watcher on `source` for the life of the app. One per host kind:
+/// Docker's event stream, and (Task 6) the AWS task poll.
 pub fn spawn(
     app: AppHandle,
     store: Arc<ProjectsStore>,
+    source: ExitSource,
     cancel: watch::Receiver<bool>,
 ) -> tauri::async_runtime::JoinHandle<()> {
     tauri::async_runtime::spawn(async move {
-        run(store, cancel, |p, reason| {
+        let store_for_aws = store.clone();
+        run(store, source, cancel, move |p, reason| {
             log::warn!(
                 "Project '{}' ({}): its container stopped without the app asking ({:?}) — marking Stopped",
                 p.name,
                 p.id,
                 reason
             );
-            let _ = app.emit(CONTAINER_EXITED_EVENT, ContainerExited { project: p, reason });
+            // Why ECS stopped it, read before the tunnel (and with it the
+            // registry's record) goes.
+            let kind = p
+                .is_aws()
+                .then(|| p.container_id.as_deref().and_then(crate::host::tunnels::stop_kind))
+                .flatten();
+            let mut shown = p.clone();
+            // A task that never got going is an error, not a stop (P8).
+            if let Some(StopKind::FailedToStart(_)) = kind {
+                if store_for_aws.update_status(&p.id, ProjectStatus::Error).is_ok() {
+                    shown.status = ProjectStatus::Error;
+                }
+            }
+            // An AWS task that stopped: its tunnel leads nowhere now, and its
+            // task ARN is history (the data's access point stays).
+            if p.is_aws() {
+                if let Some(a) = p.aws.as_ref() {
+                    let _ = store_for_aws.set_aws_runtime(
+                        &p.id,
+                        None,
+                        a.access_point_id.clone(),
+                        a.task_definition_arn.clone(),
+                    );
+                }
+                let id = p.id.clone();
+                if let Some(arn) = p.aws.as_ref().and_then(|a| a.task_arn.clone()) {
+                    tauri::async_runtime::spawn(async move {
+                        crate::host::tunnels::close_if_task(&id, &arn).await
+                    });
+                }
+            }
+            if let Some(store_p) = store_for_aws.get(&p.id) {
+                shown = store_p;
+            }
+            let stop = kind.as_ref().map(StopNote::of);
+            let _ = app.emit(CONTAINER_EXITED_EVENT, ContainerExited { project: &shown, reason, stop });
         })
         .await;
     })
@@ -244,13 +310,36 @@ mod tests {
     #[test]
     fn the_event_says_why_so_the_ui_can_tell_news_from_housekeeping() {
         let p = Project::new("demo".to_string(), Vec::new());
-        let v = serde_json::to_value(ContainerExited { project: &p, reason: ExitReason::Exited }).unwrap();
+        let v = serde_json::to_value(ContainerExited { project: &p, reason: ExitReason::Exited, stop: None })
+            .unwrap();
         assert_eq!(v["reason"], "exited");
         assert_eq!(v["project"]["name"], "demo");
-        let v = serde_json::to_value(ContainerExited { project: &p, reason: ExitReason::FoundStopped })
-            .unwrap();
+        assert!(v["stop"].is_null());
+        let v = serde_json::to_value(ContainerExited {
+            project: &p,
+            reason: ExitReason::FoundStopped,
+            stop: Some(StopNote::of(&StopKind::Spot)),
+        })
+        .unwrap();
         assert_eq!(v["reason"], "found_stopped");
+        assert_eq!(v["stop"], serde_json::json!({ "kind": "spot", "message": "Spot interruption" }));
         assert_eq!(CONTAINER_EXITED_EVENT, "project-container-exited");
+    }
+
+    #[test]
+    fn every_stop_kind_has_a_note_for_the_ui() {
+        let cases = [
+            (StopKind::Spot, "spot", Some("Spot interruption")),
+            (StopKind::Idle, "idle", None),
+            (StopKind::FailedToStart("CannotPull".into()), "failed", Some("CannotPull")),
+            (StopKind::UserInitiated, "user", None),
+            (StopKind::Exited(Some("OOM".into())), "exited", Some("OOM")),
+            (StopKind::Exited(None), "exited", None),
+        ];
+        for (k, kind, message) in cases {
+            let n = StopNote::of(&k);
+            assert_eq!((n.kind, n.message.as_deref()), (kind, message), "{k:?}");
+        }
     }
 
     /// The shutdown path: a host call that never answers (a wedged daemon)
@@ -268,6 +357,48 @@ mod tests {
         canceller.await.unwrap();
         // Already cancelled: it does not even start the call.
         assert_eq!(unless_cancelled(&mut rx, async { 1 }).await, None);
+    }
+
+    /// The AWS source drives the same loop: it is "reachable" without a
+    /// ping, polls its lookup every interval, and gives way to cancellation.
+    /// No project is Running, so nothing is confirmed (and nothing reaches
+    /// Docker or AWS).
+    #[tokio::test(start_paused = true)]
+    async fn an_aws_source_polls_its_lookup_until_cancelled() {
+        use crate::host::watch::{AwsTaskLookup, AwsWatch, TaskGroup, WatchedTask};
+        use futures_util::future::BoxFuture;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Lookup(AtomicUsize);
+        impl AwsTaskLookup for Lookup {
+            fn running_tasks(&self) -> Vec<WatchedTask> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Vec::new()
+            }
+            fn stopped<'a>(
+                &'a self,
+                _: &'a TaskGroup,
+                _: &'a [String],
+            ) -> BoxFuture<'a, Result<Vec<String>, String>> {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("triple-c-watch-aws-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(ProjectsStore::over_file_for_test(dir.join("projects.json"), Vec::new()));
+        let lookup = Arc::new(Lookup(AtomicUsize::new(0)));
+        let source = ExitSource::Aws(AwsWatch::every(lookup.clone(), Duration::from_secs(15)));
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let watcher = tokio::spawn(run(store, source, cancel_rx, |_, _| panic!("nothing stopped")));
+        tokio::time::sleep(Duration::from_secs(46)).await;
+        assert_eq!(lookup.0.load(Ordering::SeqCst), 3);
+        let _ = cancel_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(1), watcher)
+            .await
+            .expect("stops at once")
+            .unwrap();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// End to end against a real daemon: a Running project whose container is
@@ -302,7 +433,7 @@ mod tests {
 
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel::<(String, ExitReason)>();
-        let watcher = tokio::spawn(run(store.clone(), cancel_rx, move |p, why| {
+        let watcher = tokio::spawn(run(store.clone(), ExitSource::Docker, cancel_rx, move |p, why| {
             let _ = seen_tx.send((p.id.clone(), why));
         }));
         let first = tokio::time::timeout(Duration::from_secs(10), seen_rx.recv()).await;

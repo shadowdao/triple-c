@@ -3,6 +3,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import type { Project, ProjectPath } from "../../../../lib/types";
 import Button from "../../../ui/Button";
 import Field, { ConfigGroup, inputClass, monoInputClass } from "../../../ui/Field";
+import { isAwsProject } from "../../../../lib/awsWorkspace";
 
 interface Props {
   project: Project;
@@ -73,7 +74,11 @@ export default function WorkspaceSection({ project, save, disabled }: Props) {
   return (
     <ConfigGroup
       title="Workspace"
-      description="What this sandbox is called and which host folders it can see."
+      description={
+        isAwsProject(project)
+          ? "What this sandbox is called."
+          : "What this sandbox is called and which host folders it can see."
+      }
     >
       <Field
         label="Project name"
@@ -101,96 +106,104 @@ export default function WorkspaceSection({ project, save, disabled }: Props) {
         )}
       </Field>
 
-      <div>
-        <span className="block text-[13px] font-medium text-[var(--text-primary)]">
-          Folders
-        </span>
-        <p className="mt-0.5 mb-2 text-xs text-[var(--text-secondary)] leading-snug">
-          Each host folder is mounted at <span className="font-mono">/workspace/&lt;name&gt;</span>{" "}
-          inside the container.
+      {isAwsProject(project) ? (
+        <p className="text-xs text-[var(--text-secondary)] leading-snug">
+          This project runs on AWS, so it mounts no folders from this machine: its
+          repositories are cloned into <span className="font-mono">/workspace</span>. Edit them
+          under Host below.
         </p>
+      ) : (
+        <div>
+          <span className="block text-[13px] font-medium text-[var(--text-primary)]">
+            Folders
+          </span>
+          <p className="mt-0.5 mb-2 text-xs text-[var(--text-secondary)] leading-snug">
+            Each host folder is mounted at <span className="font-mono">/workspace/&lt;name&gt;</span>{" "}
+            inside the container.
+          </p>
 
-        <div className="space-y-3">
-          {paths.map((pp, i) => (
-            <div key={i} className="flex flex-col gap-1.5 sm:flex-row sm:items-center">
-              <input
-                value={pp.host_path}
-                aria-label={`Folder ${i + 1} host path`}
-                onChange={(e) => {
-                  const updated = [...paths];
-                  updated[i] = { ...updated[i], host_path: e.target.value };
-                  setPaths(updated);
-                }}
-                onBlur={() => saveIfComplete()}
-                placeholder="/path/to/folder"
-                disabled={disabled}
-                className={`flex-1 min-w-0 ${inputClass}`}
-              />
-              <div className="flex items-center gap-1.5">
-                <Button
-                  size="md"
-                  disabled={disabled}
-                  onClick={async () => {
-                    const selected = await open({ directory: true, multiple: false });
-                    if (typeof selected === "string") {
-                      const updated = [...paths];
-                      const basename =
-                        selected.replace(/[/\\]$/, "").split(/[/\\]/).pop() || "";
-                      updated[i] = {
-                        host_path: selected,
-                        mount_name: updated[i].mount_name || basename,
-                      };
-                      setPaths(updated);
-                      persist(updated);
-                    }
-                  }}
-                >
-                  Browse
-                </Button>
-                <span className="text-xs text-[var(--text-secondary)] font-mono flex-shrink-0">
-                  /workspace/
-                </span>
+          <div className="space-y-3">
+            {paths.map((pp, i) => (
+              <div key={i} className="flex flex-col gap-1.5 sm:flex-row sm:items-center">
                 <input
-                  value={pp.mount_name}
-                  aria-label={`Folder ${i + 1} mount name`}
+                  value={pp.host_path}
+                  aria-label={`Folder ${i + 1} host path`}
                   onChange={(e) => {
                     const updated = [...paths];
-                    updated[i] = { ...updated[i], mount_name: e.target.value };
+                    updated[i] = { ...updated[i], host_path: e.target.value };
                     setPaths(updated);
                   }}
                   onBlur={() => saveIfComplete()}
-                  placeholder="name"
+                  placeholder="/path/to/folder"
                   disabled={disabled}
-                  className={`w-40 ${monoInputClass}`}
+                  className={`flex-1 min-w-0 ${inputClass}`}
                 />
-                {paths.length > 1 && (
+                <div className="flex items-center gap-1.5">
                   <Button
                     size="md"
-                    variant="danger"
                     disabled={disabled}
-                    aria-label={`Remove folder ${i + 1}`}
-                    onClick={() => {
-                      const updated = paths.filter((_, j) => j !== i);
-                      setPaths(updated);
-                      persist(updated);
+                    onClick={async () => {
+                      const selected = await open({ directory: true, multiple: false });
+                      if (typeof selected === "string") {
+                        const updated = [...paths];
+                        const basename =
+                          selected.replace(/[/\\]$/, "").split(/[/\\]/).pop() || "";
+                        updated[i] = {
+                          host_path: selected,
+                          mount_name: updated[i].mount_name || basename,
+                        };
+                        setPaths(updated);
+                        persist(updated);
+                      }
                     }}
                   >
-                    Remove
+                    Browse
                   </Button>
-                )}
+                  <span className="text-xs text-[var(--text-secondary)] font-mono flex-shrink-0">
+                    /workspace/
+                  </span>
+                  <input
+                    value={pp.mount_name}
+                    aria-label={`Folder ${i + 1} mount name`}
+                    onChange={(e) => {
+                      const updated = [...paths];
+                      updated[i] = { ...updated[i], mount_name: e.target.value };
+                      setPaths(updated);
+                    }}
+                    onBlur={() => saveIfComplete()}
+                    placeholder="name"
+                    disabled={disabled}
+                    className={`w-40 ${monoInputClass}`}
+                  />
+                  {paths.length > 1 && (
+                    <Button
+                      size="md"
+                      variant="danger"
+                      disabled={disabled}
+                      aria-label={`Remove folder ${i + 1}`}
+                      onClick={() => {
+                        const updated = paths.filter((_, j) => j !== i);
+                        setPaths(updated);
+                        persist(updated);
+                      }}
+                    >
+                      Remove
+                    </Button>
+                  )}
+                </div>
               </div>
-            </div>
-          ))}
-        </div>
+            ))}
+          </div>
 
-        <Button
-          className="mt-2"
-          disabled={disabled}
-          onClick={() => setPaths([...paths, { host_path: "", mount_name: "" }])}
-        >
-          + Add folder
-        </Button>
-      </div>
+          <Button
+            className="mt-2"
+            disabled={disabled}
+            onClick={() => setPaths([...paths, { host_path: "", mount_name: "" }])}
+          >
+            + Add folder
+          </Button>
+        </div>
+      )}
     </ConfigGroup>
   );
 }

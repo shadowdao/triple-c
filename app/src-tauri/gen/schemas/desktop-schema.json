@@ -429,6 +429,12 @@
           "markdownDescription": "Enables the aws_sso_refresh command without any pre-configured scope."
         },
         {
+          "description": "Enables the aws_task_log command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-aws-task-log",
+          "markdownDescription": "Enables the aws_task_log command without any pre-configured scope."
+        },
+        {
           "description": "Enables the build_gateway_image command without any pre-configured scope.",
           "type": "string",
           "const": "allow-build-gateway-image",
@@ -505,6 +511,12 @@
           "type": "string",
           "const": "allow-check-image-update",
           "markdownDescription": "Enables the check_image_update command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the check_unsaved_work command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-check-unsaved-work",
+          "markdownDescription": "Enables the check_unsaved_work command without any pre-configured scope."
         },
         {
           "description": "Enables the clear_claude_token command without any pre-configured scope.",
@@ -927,6 +939,12 @@
           "markdownDescription": "Enables the rebuild_project_container command without any pre-configured scope."
         },
         {
+          "description": "Enables the reconcile_aws_projects command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-reconcile-aws-projects",
+          "markdownDescription": "Enables the reconcile_aws_projects command without any pre-configured scope."
+        },
+        {
           "description": "Enables the reconcile_project_statuses command without any pre-configured scope.",
           "type": "string",
           "const": "allow-reconcile-project-statuses",
@@ -949,6 +967,12 @@
           "type": "string",
           "const": "allow-regenerate-web-terminal-token",
           "markdownDescription": "Enables the regenerate_web_terminal_token command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the remove_aws_resources command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-remove-aws-resources",
+          "markdownDescription": "Enables the remove_aws_resources command without any pre-configured scope."
         },
         {
           "description": "Enables the remove_host_connection command without any pre-configured scope.",
@@ -1359,6 +1383,12 @@
           "markdownDescription": "Denies the aws_sso_refresh command without any pre-configured scope."
         },
         {
+          "description": "Denies the aws_task_log command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-aws-task-log",
+          "markdownDescription": "Denies the aws_task_log command without any pre-configured scope."
+        },
+        {
           "description": "Denies the build_gateway_image command without any pre-configured scope.",
           "type": "string",
           "const": "deny-build-gateway-image",
@@ -1435,6 +1465,12 @@
           "type": "string",
           "const": "deny-check-image-update",
           "markdownDescription": "Denies the check_image_update command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the check_unsaved_work command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-check-unsaved-work",
+          "markdownDescription": "Denies the check_unsaved_work command without any pre-configured scope."
         },
         {
           "description": "Denies the clear_claude_token command without any pre-configured scope.",
@@ -1857,6 +1893,12 @@
           "markdownDescription": "Denies the rebuild_project_container command without any pre-configured scope."
         },
         {
+          "description": "Denies the reconcile_aws_projects command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-reconcile-aws-projects",
+          "markdownDescription": "Denies the reconcile_aws_projects command without any pre-configured scope."
+        },
+        {
           "description": "Denies the reconcile_project_statuses command without any pre-configured scope.",
           "type": "string",
           "const": "deny-reconcile-project-statuses",
@@ -1879,6 +1921,12 @@
           "type": "string",
           "const": "deny-regenerate-web-terminal-token",
           "markdownDescription": "Denies the regenerate_web_terminal_token command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the remove_aws_resources command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-remove-aws-resources",
+          "markdownDescription": "Denies the remove_aws_resources command without any pre-configured scope."
         },
         {
           "description": "Denies the remove_host_connection command without any pre-configured scope.",

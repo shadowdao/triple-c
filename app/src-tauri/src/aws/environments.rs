@@ -130,7 +130,12 @@ pub fn parse_environment_record(
         .ok_or_else(|| "template_version is not a version number".to_string())?;
 
     let cluster_arn = str_field(obj, "cluster_arn")?;
-    if cluster_arn != format!("arn:aws:ecs:{region}:{account}:cluster/triple-c-{name}") {
+    if cluster_arn
+        != format!(
+            "arn:aws:ecs:{region}:{account}:cluster/{}",
+            super::tofu_modules::environment_cluster_name(&name)
+        )
+    {
         return Err(
             "cluster_arn is not this environment's cluster in this account and region".into(),
         );
@@ -171,7 +176,7 @@ pub fn parse_environment_record(
         return Err("kms_key_arn is not a KMS key in this account and region".into());
     }
     let log_group = str_field(obj, "log_group")?;
-    if log_group != format!("/triple-c/{name}") {
+    if log_group != super::tofu_modules::environment_log_group(&name) {
         return Err("log_group is not this environment's log group".into());
     }
     let network_mode = str_field(obj, "network_mode")?;
@@ -754,7 +759,7 @@ fn error_parts<E: ProvideErrorMetadata>(
 }
 
 /// Yes / No (missing) / Unknown (denied) from a lookup's result.
-fn knowable<T, E>(
+pub(crate) fn knowable<T, E>(
     action: &str,
     res: Result<T, SdkError<E, HttpResponse>>,
 ) -> Result<Knowable, AwsError>

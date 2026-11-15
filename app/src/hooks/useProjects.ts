@@ -2,7 +2,7 @@ import { useCallback } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { useAppState } from "../store/appState";
 import * as commands from "../lib/tauri-commands";
-import type { ProjectPath, ProjectStatus } from "../lib/types";
+import type { NewProjectHost, ProjectPath, ProjectStatus, RemoveProjectOptions, WipChoice } from "../lib/types";
 
 export function useProjects() {
   const {
@@ -31,8 +31,8 @@ export function useProjects() {
   }, [setProjects]);
 
   const add = useCallback(
-    async (name: string, paths: ProjectPath[]) => {
-      const project = await commands.addProject(name, paths);
+    async (name: string, paths: ProjectPath[], host?: NewProjectHost) => {
+      const project = await commands.addProject(name, paths, host);
       // Refresh from backend to avoid stale closure issues
       const list = await commands.listProjects();
       setProjects(list);
@@ -43,8 +43,8 @@ export function useProjects() {
   );
 
   const remove = useCallback(
-    async (id: string) => {
-      const report = await commands.removeProject(id);
+    async (id: string, opts?: RemoveProjectOptions) => {
+      const report = await commands.removeProject(id, opts);
       removeProjectFromList(id);
       return report;
     },
@@ -124,11 +124,12 @@ export function useProjects() {
   );
 
   const stop = useCallback(
-    (id: string) =>
+    (id: string, wip?: WipChoice) =>
       withOptimisticStatus(id, "stopping", async () => {
-        await commands.stopProjectContainer(id);
+        const note = await commands.stopProjectContainer(id, wip);
         const list = await commands.listProjects();
         setProjects(list);
+        return note;
       }),
     [setProjects, withOptimisticStatus],
   );

@@ -329,6 +329,20 @@ pub fn run() {
             lifecycle_setup.track(container_watch::spawn(
                 app.handle().clone(),
                 projects_store_setup.clone(),
+                crate::host::watch::ExitSource::Docker,
+                lifecycle_setup.cancellation(),
+            ));
+            // The same for AWS projects: a DescribeTasks poll every 15 s over
+            // the tasks of Running AWS projects (none: no AWS calls at all).
+            lifecycle_setup.track(container_watch::spawn(
+                app.handle().clone(),
+                projects_store_setup.clone(),
+                crate::host::watch::ExitSource::Aws(crate::host::watch::AwsWatch::new(
+                    std::sync::Arc::new(crate::host::aws_host::StoreTaskLookup {
+                        projects: projects_store_setup.clone(),
+                        settings: settings_store_setup.clone(),
+                    }),
+                )),
                 lifecycle_setup.cancellation(),
             ));
 
@@ -508,6 +522,9 @@ pub fn run() {
                             exec_manager.close_all_sessions(),
                             auth_bridge.stop_all(),
                             browser_view::manager().stop_all(),
+                            // Each AWS tunnel is a session-manager-plugin
+                            // child that `exit` would not end.
+                            crate::host::tunnels::close_all(),
                         );
                     };
 
@@ -534,8 +551,12 @@ pub fn run() {
             commands::project_commands::update_project,
             commands::project_commands::start_project_container,
             commands::project_commands::stop_project_container,
+            commands::project_commands::check_unsaved_work,
+            commands::project_commands::aws_task_log,
+            commands::project_commands::remove_aws_resources,
             commands::project_commands::rebuild_project_container,
             commands::project_commands::reconcile_project_statuses,
+            commands::project_commands::reconcile_aws_projects,
             // Notes
             commands::notes_commands::list_notes,
             commands::notes_commands::save_note,

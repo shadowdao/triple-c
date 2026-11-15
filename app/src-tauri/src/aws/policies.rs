@@ -35,10 +35,16 @@ pub fn policy_files(tier: Tier) -> &'static [(&'static str, &'static str)] {
                 include_str!("../../../../aws/policies/environment-admin-network.json"),
             ),
         ],
-        Tier::WorkspaceUser => &[(
-            "workspace-user.json",
-            include_str!("../../../../aws/policies/workspace-user.json"),
-        )],
+        Tier::WorkspaceUser => &[
+            (
+                "workspace-user.json",
+                include_str!("../../../../aws/policies/workspace-user.json"),
+            ),
+            (
+                "workspace-user-tasks.json",
+                include_str!("../../../../aws/policies/workspace-user-tasks.json"),
+            ),
+        ],
     }
 }
 
@@ -240,6 +246,34 @@ const WORKSPACE_USER_CHECKS: &[Check] = &[
             ("ecs:CreateAction", Literal("RunTask")),
         ],
     ),
+    // `workspace-user-tasks.json`: a user registers and tags their own task
+    // definitions, and reads their own secrets. Retiring them is the admin's
+    // (R8): ECS authorizes `DeregisterTaskDefinition` against `*` only, with
+    // no tag condition, so it can't be confined to a user's own revisions.
+    // Residual risk the policy cannot close: the family carries the owner
+    // key, which IAM can't condition on, so any user may register a revision
+    // into another owner's family. The app's mitigation: it runs only the
+    // exact `family:revision` ARN its own register call returned, and when it
+    // looks up an existing revision it accepts only one tagged with the
+    // caller's own owner ID (never "latest of the family").
+    write(
+        "ecs:RegisterTaskDefinition",
+        PROBE_TASK_DEFINITION,
+        &[(OWNER_REQUEST_TAG, OwnerId)],
+    ),
+    write(
+        "ecs:TagResource",
+        PROBE_TASK_DEFINITION,
+        &[
+            (OWNER_REQUEST_TAG, OwnerId),
+            ("ecs:CreateAction", Literal("RegisterTaskDefinition")),
+        ],
+    ),
+    read(
+        "secretsmanager:GetSecretValue",
+        PROBE_SECRET,
+        &[(OWNER_RESOURCE_TAG, OwnerId)],
+    ),
     write(
         "iam:PassRole",
         PROBE_ROLE,
@@ -320,9 +354,11 @@ const WORKSPACE_USER_CHECKS: &[Check] = &[
             (COMPONENT_RESOURCE_TAG, Literal("user-onboarding")),
         ],
     ),
+    // Authorized against the parent file system, not the new access point
+    // (verified live, phase 5).
     write(
         "elasticfilesystem:TagResource",
-        PROBE_ACCESS_POINT,
+        PROBE_FILE_SYSTEM,
         &[
             (OWNER_REQUEST_TAG, OwnerId),
             (
@@ -904,6 +940,17 @@ mod tests {
         ("ecs:RunTask", "task-definition/", OWNER_REQUEST_TAG),
         ("ecs:RunTask", "task-definition/", OWNER_RESOURCE_TAG),
         ("ecs:TagResource", "task/", OWNER_REQUEST_TAG),
+        (
+            "ecs:RegisterTaskDefinition",
+            "task-definition/",
+            OWNER_REQUEST_TAG,
+        ),
+        ("ecs:TagResource", "task-definition/", OWNER_REQUEST_TAG),
+        (
+            "secretsmanager:GetSecretValue",
+            "secret:",
+            OWNER_RESOURCE_TAG,
+        ),
         ("ecs:StopTask", "task/", OWNER_RESOURCE_TAG),
         ("ecs:ExecuteCommand", "task/", OWNER_RESOURCE_TAG),
         ("ssm:StartSession", "task/", OWNER_RESOURCE_TAG),
@@ -930,7 +977,7 @@ mod tests {
         ),
         (
             "elasticfilesystem:TagResource",
-            "access-point/",
+            "file-system/",
             OWNER_REQUEST_TAG,
         ),
         (
@@ -1064,6 +1111,170 @@ mod tests {
             ..*run
         };
         assert!(!allowed(Tier::WorkspaceUser, &other_cluster, ME, ME));
+    }
+
+    /// The three tag keys a workspace user may put on anything they create.
+    const OWN_TAG_KEYS: Context = &[
+        ("aws:TagKeys", Literal("triple-c:owner")),
+        ("aws:TagKeys", Literal("triple-c:project")),
+        ("aws:TagKeys", Literal("triple-c:environment")),
+    ];
+
+    fn ws_check(action: &str, resource_part: &str) -> &'static Check {
+        checks(Tier::WorkspaceUser)
+            .iter()
+            .find(|c| c.action == action && c.resource.contains(resource_part))
+            .unwrap_or_else(|| panic!("no workspace-user check for {action} on {resource_part}"))
+    }
+
+    #[test]
+    fn registering_a_task_definition_needs_the_owner_tag_and_only_the_three_keys() {
+        let reg = ws_check("ecs:RegisterTaskDefinition", "task-definition/");
+        const THREE_KEYS: Context = &[
+            (OWNER_REQUEST_TAG, OwnerId),
+            ("aws:TagKeys", Literal("triple-c:owner")),
+            ("aws:TagKeys", Literal("triple-c:project")),
+            ("aws:TagKeys", Literal("triple-c:environment")),
+        ];
+        const FOUR_KEYS: Context = &[
+            (OWNER_REQUEST_TAG, OwnerId),
+            ("aws:TagKeys", Literal("triple-c:owner")),
+            ("aws:TagKeys", Literal("triple-c:project")),
+            ("aws:TagKeys", Literal("triple-c:environment")),
+            ("aws:TagKeys", Literal("extra")),
+        ];
+        let with_keys = |context: Context| Check { context, ..*reg };
+        assert!(allowed(Tier::WorkspaceUser, &with_keys(THREE_KEYS), ME, ME));
+        assert!(
+            !allowed(Tier::WorkspaceUser, &with_keys(FOUR_KEYS), ME, ME),
+            "an extra tag key must be refused"
+        );
+        let no_owner = Check {
+            context: OWN_TAG_KEYS,
+            ..*reg
+        };
+        assert!(
+            !allowed(Tier::WorkspaceUser, &no_owner, ME, ME),
+            "no owner request tag"
+        );
+        let someone_elses = Check {
+            context: &[(OWNER_REQUEST_TAG, Literal(SOMEONE_ELSE))],
+            ..*reg
+        };
+        assert!(!allowed(Tier::WorkspaceUser, &someone_elses, ME, ME));
+        // Only Triple-C's families.
+        let other_family = Check {
+            resource: "arn:aws:ecs:{region}:{account}:task-definition/production:1",
+            ..*reg
+        };
+        assert!(!allowed(Tier::WorkspaceUser, &other_family, ME, ME));
+    }
+
+    #[test]
+    fn task_definitions_are_tagged_only_at_register_and_only_with_the_three_keys() {
+        let tag = ws_check("ecs:TagResource", "task-definition/");
+        assert!(allowed(Tier::WorkspaceUser, tag, ME, ME));
+        let retag = Check {
+            context: &[(OWNER_REQUEST_TAG, OwnerId)],
+            ..*tag
+        };
+        assert!(!allowed(Tier::WorkspaceUser, &retag, ME, ME));
+        let other_create = Check {
+            context: &[
+                (OWNER_REQUEST_TAG, OwnerId),
+                ("ecs:CreateAction", Literal("RunTask")),
+            ],
+            ..*tag
+        };
+        assert!(!allowed(Tier::WorkspaceUser, &other_create, ME, ME));
+        let extra_key = Check {
+            context: &[
+                (OWNER_REQUEST_TAG, OwnerId),
+                ("ecs:CreateAction", Literal("RegisterTaskDefinition")),
+                ("aws:TagKeys", Literal("triple-c:owner")),
+                ("aws:TagKeys", Literal("triple-c:component")),
+            ],
+            ..*tag
+        };
+        assert!(
+            !allowed(Tier::WorkspaceUser, &extra_key, ME, ME),
+            "a task definition must not be tagged triple-c:component"
+        );
+    }
+
+    /// R8: the workspace tier retires no task definition, not even its own
+    /// (`DeregisterTaskDefinition` is authorized against `*` only).
+    #[test]
+    fn the_workspace_tier_never_retires_a_task_definition() {
+        let register = ws_check("ecs:RegisterTaskDefinition", "task-definition/");
+        for action in ["ecs:DeregisterTaskDefinition", "ecs:DeleteTaskDefinitions"] {
+            assert!(
+                !checks(Tier::WorkspaceUser).iter().any(|c| c.action == action),
+                "{action} is checked for the workspace tier"
+            );
+            for resource in ["*", register.resource] {
+                let own = Check {
+                    action,
+                    resource,
+                    context: &[(OWNER_RESOURCE_TAG, OwnerId)],
+                    ..*register
+                };
+                assert!(!allowed(Tier::WorkspaceUser, &own, ME, ME), "{action} on {resource}");
+            }
+        }
+    }
+
+    /// RegisterTaskDefinition with a task or execution role also authorizes
+    /// `iam:PassRole` on each; `PassOwnTaskRoles` (owner-tagged, to ECS
+    /// tasks, `triple-c-*` roles) must cover both and nothing else.
+    #[test]
+    fn register_task_definition_can_pass_the_users_task_and_execution_roles() {
+        let pass = ws_check("iam:PassRole", "role/");
+        for role in [
+            "arn:aws:iam::{account}:role/triple-c-prod-0123456789ab-task",
+            "arn:aws:iam::{account}:role/triple-c-prod-0123456789ab-exec",
+        ] {
+            let c = Check { resource: role, ..*pass };
+            assert!(allowed(Tier::WorkspaceUser, &c, ME, ME), "{role}");
+            assert!(!allowed(Tier::WorkspaceUser, &c, ME, SOMEONE_ELSE), "{role}");
+        }
+    }
+
+    #[test]
+    fn secrets_are_readable_only_by_their_owner_and_never_the_environments() {
+        let get = ws_check("secretsmanager:GetSecretValue", "secret:");
+        assert!(allowed(Tier::WorkspaceUser, get, ME, ME));
+        assert!(!allowed(Tier::WorkspaceUser, get, ME, SOMEONE_ELSE));
+        // Even tagged with the caller's owner ID, a component-tagged secret
+        // (the environment's) is off limits: the Deny holds on its own.
+        let environments = Check {
+            context: &[
+                (OWNER_RESOURCE_TAG, OwnerId),
+                (COMPONENT_RESOURCE_TAG, Literal("environment")),
+            ],
+            ..*get
+        };
+        assert!(!allowed(Tier::WorkspaceUser, &environments, ME, ME));
+        let component_only = Check {
+            context: &[(COMPONENT_RESOURCE_TAG, Literal("environment"))],
+            ..*get
+        };
+        let req = Request {
+            check: &component_only,
+            caller: ME,
+            owner: ME,
+        };
+        let stmts = denies(Tier::WorkspaceUser);
+        assert!(
+            matching(&stmts, &req).iter().any(|s| conditions_hold(s, &req)),
+            "missing a Deny of GetSecretValue on component-tagged secrets"
+        );
+        // Not outside Triple-C's secrets.
+        let other = Check {
+            resource: "arn:aws:secretsmanager:{region}:{account}:secret:prod/db-AbCdEf",
+            ..*get
+        };
+        assert!(!allowed(Tier::WorkspaceUser, &other, ME, ME));
     }
 
     #[test]
@@ -1617,7 +1828,10 @@ mod tests {
             names(Tier::EnvironmentAdmin),
             ["environment-admin.json", "environment-admin-network.json"]
         );
-        assert_eq!(names(Tier::WorkspaceUser), ["workspace-user.json"]);
+        assert_eq!(
+            names(Tier::WorkspaceUser),
+            ["workspace-user.json", "workspace-user-tasks.json"]
+        );
     }
 
     /// D8: CloudFormation leaves the policies, the checks and the probes.

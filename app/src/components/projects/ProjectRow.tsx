@@ -4,6 +4,8 @@ import { useAppState, homeTabKey } from "../../store/appState";
 import { useProjectActions } from "../../hooks/useProjectActions";
 import { ProjectStatusIndicator } from "../ui/StatusIndicator";
 import { useUnavailable } from "../ui/unavailable";
+import { isAwsProject } from "../../lib/awsWorkspace";
+import StopGuardModal from "./StopGuardModal";
 
 interface Props {
   project: Project;
@@ -23,8 +25,13 @@ export default function ProjectRow({ project }: Props) {
       progress: s.containerProgress[project.id],
     })),
   );
-  const { busy, handleStart, handleStop, openClaudeTerminal } =
+  const { busy, handleStart, handleStop, openClaudeTerminal, stopGuard, resolveStopGuard } =
     useProjectActions(project);
+  const aws = isAwsProject(project);
+  // An AWS project mounts nothing; its clones are what /workspace holds.
+  const folders = aws
+    ? (project.aws?.repos ?? []).map((r) => r.folder)
+    : project.paths.map((pp) => pp.mount_name);
 
   const isSelected =
     activeTabKey === homeTabKey(project.id) || selectedProjectId === project.id;
@@ -64,12 +71,17 @@ export default function ProjectRow({ project }: Props) {
           <span className="w-[3.75rem] flex-shrink-0" aria-hidden="true" />
         </div>
         <div className="mt-0.5 ml-4 space-y-0.5 min-w-0">
-          {project.paths.map((pp, i) => (
+          {aws && (
+            <div className="text-xs text-[var(--text-secondary)] truncate">
+              AWS · {project.aws_placement?.environment ?? "?"} ({project.aws_placement?.region ?? "?"})
+            </div>
+          )}
+          {folders.map((folder, i) => (
             <div
               key={i}
               className="text-xs text-[var(--text-secondary)] truncate font-mono"
             >
-              /workspace/{pp.mount_name}
+              /workspace/{folder}
             </div>
           ))}
           <div className="text-xs">
@@ -149,6 +161,14 @@ export default function ProjectRow({ project }: Props) {
         </button>
         {terminal.reasonNode}
       </div>
+      {stopGuard && (
+        <StopGuardModal
+          projectName={project.name}
+          work={stopGuard}
+          wipPushOnStop={project.aws?.wip_push_on_stop ?? false}
+          onChoose={resolveStopGuard}
+        />
+      )}
     </div>
   );
 }

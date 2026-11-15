@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
+use axum::extract::{Extension, State};
 use axum::response::Response;
 use bytes::Bytes;
 use serde::Deserialize;
@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::pty;
 use crate::spawn::{self, ExecSpec, Io, PrepareError};
-use crate::{AppState, CountGuard, MAX_WS_MESSAGE};
+use crate::{AppState, Background, CountGuard, MAX_WS_MESSAGE};
 
 /// How long the client has to send its spec after the upgrade.
 const SPEC_TIMEOUT: Duration = Duration::from_secs(30);
@@ -47,10 +47,15 @@ enum Input {
     Data(Bytes),
 }
 
-pub async fn upgrade(State(st): State<Arc<AppState>>, ws: WebSocketUpgrade) -> Response {
+pub async fn upgrade(
+    State(st): State<Arc<AppState>>,
+    bg: Option<Extension<Background>>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let bg = bg.map(|Extension(b)| b).unwrap_or_default();
     ws.max_message_size(MAX_WS_MESSAGE)
         .max_frame_size(MAX_WS_MESSAGE)
-        .on_upgrade(move |socket| session(socket, st))
+        .on_upgrade(move |socket| session(socket, st, bg))
 }
 
 fn text(v: serde_json::Value) -> Message {
@@ -69,7 +74,7 @@ fn frame(channel: u8, data: &[u8]) -> Message {
     Message::Binary(v.into())
 }
 
-async fn session(mut socket: WebSocket, st: Arc<AppState>) {
+async fn session(mut socket: WebSocket, st: Arc<AppState>, bg: Background) {
     // 1. The spec, as one text frame.
     let first = match tokio::time::timeout(SPEC_TIMEOUT, socket.recv()).await {
         Ok(Some(Ok(Message::Text(t)))) => t,
@@ -166,7 +171,7 @@ async fn session(mut socket: WebSocket, st: Arc<AppState>) {
         tokio::select! {
             ev = ev_rx.recv() => match ev {
                 Some(Event::Out(ch, data)) => {
-                    st.activity.touch();
+                    st.activity.touch_for(bg);
                     if socket.send(frame(ch, &data)).await.is_err() {
                         break;
                     }
@@ -180,7 +185,7 @@ async fn session(mut socket: WebSocket, st: Arc<AppState>) {
             },
             msg = socket.recv() => match msg {
                 Some(Ok(Message::Binary(data))) => {
-                    st.activity.touch();
+                    st.activity.touch_for(bg);
                     if req.attach_stdin {
                         if let Some(tx) = &in_tx {
                             let _ = tx.send(Input::Data(data));

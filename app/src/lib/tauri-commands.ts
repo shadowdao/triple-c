@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ProjectPath, ProjectRemovalReport, ProjectResetOutcome, ContainerInfo, AppSettings, SettingsImportPreview, SettingsImportOutcome, UpdateInfo, ImageUpdateInfo, FileEntry, FileContents, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, BrowserPageState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo, UploadOutcome, Note, ViewerFile, ViewerPoll, ViewerSaved, ViewerState, FileDiff, InstallScope, ItemUpdate, Marketplace, MarketplaceAccount, MarketplaceItemRef, MarketplaceSnapshot, ProjectSyncResult, SyncReport, HostConnection, CallerIdentity, PermissionReport, PolicyFile, Tier, EnvironmentScan, NetworkChoice, ModuleKind } from "./types";
+import type { Project, ProjectPath, NewProjectHost, RemoveProjectOptions, WipChoice, UnsavedWork, ProjectRemovalReport, ProjectResetOutcome, ContainerInfo, AppSettings, SettingsImportPreview, SettingsImportOutcome, UpdateInfo, ImageUpdateInfo, FileEntry, FileContents, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, BrowserPageState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo, UploadOutcome, Note, ViewerFile, ViewerPoll, ViewerSaved, ViewerState, FileDiff, InstallScope, ItemUpdate, Marketplace, MarketplaceAccount, MarketplaceItemRef, MarketplaceSnapshot, ProjectSyncResult, SyncReport, HostConnection, CallerIdentity, PermissionReport, PolicyFile, Tier, EnvironmentScan, NetworkChoice, ModuleKind } from "./types";
 
 // Docker
 export const checkDocker = () => invoke<boolean>("check_docker");
@@ -10,20 +10,41 @@ export const getContainerInfo = (projectId: string) =>
 
 // Projects
 export const listProjects = () => invoke<Project[]>("list_projects");
-export const addProject = (name: string, paths: ProjectPath[]) =>
-  invoke<Project>("add_project", { name, paths });
-export const removeProject = (projectId: string) =>
-  invoke<ProjectRemovalReport>("remove_project", { projectId });
+export const addProject = (name: string, paths: ProjectPath[], host?: NewProjectHost) =>
+  invoke<Project>("add_project", {
+    name,
+    paths,
+    hostId: host?.hostId ?? null,
+    awsPlacement: host?.awsPlacement ?? null,
+    aws: host?.aws ?? null,
+  });
+export const removeProject = (projectId: string, opts: RemoveProjectOptions = {}) =>
+  invoke<ProjectRemovalReport>("remove_project", {
+    projectId,
+    discardData: opts.discardData ?? null,
+    forgetAwsResources: opts.forgetAwsResources ?? null,
+  });
 export const updateProject = (project: Project) =>
   invoke<Project>("update_project", { project });
 export const startProjectContainer = (projectId: string) =>
   invoke<Project>("start_project_container", { projectId });
-export const stopProjectContainer = (projectId: string) =>
-  invoke<void>("stop_project_container", { projectId });
+/** `wip` is the stop guard's choice for an AWS project (a local one ignores it).
+ *  Resolves to a note when the choice could not be recorded in the workspace
+ *  (its own shutdown push may then still run), else null. */
+export const stopProjectContainer = (projectId: string, wip?: WipChoice) =>
+  invoke<string | null>("stop_project_container", { projectId, wip: wip ?? null });
+export const checkUnsavedWork = (projectId: string) =>
+  invoke<UnsavedWork>("check_unsaved_work", { projectId });
+export const awsTaskLog = (projectId: string, limit: number) =>
+  invoke<string[]>("aws_task_log", { projectId, limit });
+export const removeAwsResources = (projectId: string, discardData: boolean) =>
+  invoke<Project>("remove_aws_resources", { projectId, discardData });
 export const rebuildProjectContainer = (projectId: string) =>
   invoke<ProjectResetOutcome>("rebuild_project_container", { projectId });
 export const reconcileProjectStatuses = () =>
   invoke<Project[]>("reconcile_project_statuses");
+/** AWS projects against ECS; run at startup whether or not Docker answers. */
+export const reconcileAwsProjects = () => invoke<Project[]>("reconcile_aws_projects");
 
 // Notes — per-project, host-side, readable with the container stopped.
 export const listNotes = (projectId: string) =>

@@ -37,6 +37,11 @@ has a quirk the app relies on, the agent reproduces it, and this document names 
 
 - **Every request** needs `Authorization: Bearer <token>`. A missing or wrong token gets `401`
   with an empty body. The comparison is constant-time.
+- **Background requests** carry `X-Triple-C-Background: 1` (exactly `1`; any other value is an
+  ordinary request). They are served like any other, but neither the request nor the bytes of an
+  attach or tunnel it opens count as activity (see `GET /v1/activity`). The app sends it on polls
+  no person is behind — today the auth bridge's `/proc/net/tcp` read every 2 s
+  (`ContainerTarget::exec_oneshot_background`).
 - **Errors** are `4xx`/`5xx` with body `{"error": "<message>"}`, Content-Type `application/json`.
 - **JSON** is UTF-8. Raw bytes inside JSON are standard base64 with padding.
 - **Users** are names resolved through `/etc/passwd` and `/etc/group` in the container. An exec
@@ -121,14 +126,19 @@ When either side ends, the other is closed.
 
 ### `GET /v1/activity`
 `200 {"last_activity_unix": <int>, "active_execs": <int>, "active_tunnels": <int>}`.
-"Activity" means any request other than `health` and `activity`, or any byte through an attach or
-tunnel. This is used by idle auto-stop later.
+"Activity" means any request other than `health`, `activity` and background requests, or any byte
+(either direction) through an attach or tunnel that was not opened by a background request.
+`last_activity_unix` is the input to AWS idle auto-stop (`container/triple-c-idle-watch`), which
+does **not** consult the two counters: an attach or tunnel that is open but silent ages like no
+session at all, so an open terminal tab doesn't keep a workspace up by itself (ruling R11). The
+counters stay for diagnostics.
 
 ## Client mapping (`host::ContainerTarget::Agent`)
 
 | ContainerTarget | Agent call |
 |---|---|
 | `exec_oneshot*` (all variants) | `POST /v1/exec`, with `limit` = the variant's limit (`MAX_ONESHOT_OUTPUT` or explicit) |
+| `exec_oneshot_background` | `POST /v1/exec` with `X-Triple-C-Background: 1` (Docker: same as `exec_oneshot_limited`) |
 | `exec_detached` | `POST /v1/exec/detached` |
 | `attach` / `attach_exec` | `GET /v1/attach`; `input` is an `AsyncWrite` whose shutdown sends `close_stdin` |
 | `wait_exec_exit` | poll `GET /v1/exec/{id}` (same budget as the Docker version: 200 × 25 ms, shared constants in `docker/exec.rs`) |

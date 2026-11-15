@@ -135,8 +135,13 @@ impl SdkPermissionApi {
         // hundred simulations) failed a third of its rows with "Rate
         // exceeded" under standard retries (verified live). Adaptive retry
         // backs off client-side once throttled, with room to retry.
+        //
+        // The connection's 30 s operation limit counts the retries' backoff
+        // too, which would cut those ten attempts to about six; the check
+        // gets its own, longer limit, and the UI says it can take a while.
         let iam = aws_sdk_iam::config::Builder::from(cfg)
             .retry_config(aws_config::retry::RetryConfig::adaptive().with_max_attempts(10))
+            .timeout_config(iam_check_timeouts())
             .build();
         SdkPermissionApi {
             iam: aws_sdk_iam::Client::from_conf(iam),
@@ -145,6 +150,17 @@ impl SdkPermissionApi {
             secrets: aws_sdk_secretsmanager::Client::new(cfg),
         }
     }
+}
+
+/// The whole of one simulation, retries and backoff included. Ten adaptive
+/// attempts with backoff capped at 20 s fit in two minutes.
+pub const IAM_CHECK_OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+fn iam_check_timeouts() -> aws_config::timeout::TimeoutConfig {
+    aws_config::timeout::TimeoutConfig::builder()
+        .operation_timeout(IAM_CHECK_OPERATION_TIMEOUT)
+        .operation_attempt_timeout(super::connection::ATTEMPT_TIMEOUT)
+        .build()
 }
 
 impl PermissionApi for SdkPermissionApi {

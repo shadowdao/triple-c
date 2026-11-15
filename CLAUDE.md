@@ -292,6 +292,14 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   when it drops, so an `AgentEndpoint` stays valid. The `StartSession` token goes to the plugin
   through its environment, never argv, and the plugin's environment is stripped of every
   inherited `AWS_*` variable before the session's own credentials are added.
+  `aws_host.rs` is `ProjectHost::Aws` (an ECS Fargate task per project; a running task is
+  attached to with the token read back from its secret, never rotated; a task a failed start ran
+  is stopped again) and `tunnels.rs` the registry of open tunnels by project — an AWS project's
+  `ContainerTarget::for_project` is its tunnel's endpoint, its stored `container_id` is that
+  endpoint's URL, and the AWS death watch confirms exits through the registry. Shutdown closes
+  every tunnel (`for_project` is `None` while none is open; `for_project_waiting` covers the
+  background re-attach after an app restart). AWS SDK calls stay in `aws/` (`runtime.rs`,
+  `tasks.rs`, `workspace.rs`).
   `agent.rs` reuses `docker/exec.rs`'s `OneshotOutput`, host-file reader and uid probe so the two
   variants cannot drift; an `Agent` target's token never appears in `Debug` or error text.
   **Container-interior code must go through `ContainerTarget`, never `docker::exec`, bollard or
@@ -312,7 +320,7 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   `identity.rs` is `GetCallerIdentity` and the principal to simulate (an assumed role's ARN is
   recovered with `iam:GetRole`, because SSO roles have an `/aws-reserved/…` path the session ARN
   lacks); `error.rs` classifies SDK errors (SSO expired, access denied naming the action, …);
-  `policies.rs` embeds `aws/policies/*.json` (the tier policies — the admin tier spans several
+  `policies.rs` embeds `aws/policies/*.json` (the tier policies — both tiers span several
   files, `policy_files` lists them — and the permissions boundary) and the table of checks the
   simulator is asked; `permissions.rs` runs it
   (`SimulatePrincipalPolicy`, adaptive retries — it throttles — or read-only probes when the
@@ -330,6 +338,26 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   `aws/README.md` ("Live verification"). Its `environment` tests apply the real modules as a role
   holding only the admin files (`cargo build` first: the runner they start is the built app
   binary), in a throwaway state bucket.
+  **A Fargate workspace's resources** (`workspace.rs`, `tasks.rs`, `runtime.rs`). **No project
+  data in a task definition (P1):** every workspace user has `ecs:Describe*` on `*`, so
+  `environment`, tags, labels and `overrides` are public to the account. The task definition carries
+  `TRIPLEC_HOST=aws`, `COLORTERM`, the three ownership tags, a fingerprint docker label (a hash,
+  `FINGERPRINT_LABEL`) and `valueFrom` references into the project's **one secret**
+  (`triple-c/<env>/<owner_key>/<project-id>`, JSON, 64 KB cap: files, repos, instructions, settings,
+  custom env, the agent token). The token rotates each start; a running task is attached to by reading
+  it back (the task role has no Secrets Manager access). **Anyone may register a revision into any
+  `triple-c-*` family** (IAM can't scope it), so a revision or task is reused only when it carries the
+  caller's own owner tag + this project's tag (+ the fingerprint), and `RunTask` always names the exact
+  `family:revision` ARN, never "latest". Names come only from `tofu_modules.rs`, built from `owner_key`
+  (`aws:userid` contains `:`). Workspace users can't deregister or delete task definitions
+  (`DeregisterTaskDefinition` is `*`-only in IAM): removal leaves revisions ACTIVE for an admin
+  (`aws/README.md`). Stop: the stop guard (`commands/stop_guard.rs`) dry-runs `triple-c-wip-push`
+  through the agent, closes the project's terminals and auth bridge (so nothing is written after the
+  push's snapshot), may push first (under an in-container `timeout`, since the agent does not kill an
+  exec the client gave up on), then writes `pushed` or `discard` to `/run/triple-c/stop-reason`
+  (root-owned; the entrypoint's TERM hook reads it, and the idle watcher writes `idle`) so the hook
+  doesn't push twice; the marker is cleared if StopTask fails. Claude Code's sandbox is forced off in
+  the generated settings (bubblewrap can't create namespaces on Fargate, verified live).
   **Environments are OpenTofu modules** (`aws/terraform/{environment,user-onboard,permissions-boundary}`;
   spec D2–D10). `tofu_modules.rs` embeds them and is the **only** place the shared names are built
   (environment, `/triple-c/environments/<env>` record, owner key — `sha256("<region>:<aws:userid>")`,
@@ -361,6 +389,29 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
 - **`Dockerfile`** — Ubuntu 24.04 base with Claude Code, Node.js 22, Python 3.12, Rust, Docker CLI, git, gh, AWS CLI v2, ripgrep, pnpm, uv, ruff pre-installed, plus the shared
   libraries a browser links against (see below) and the VPN tooling the `vpn_support_enabled`
   toggle grants capability for (`iproute2`, `wireguard-tools`, `iptables`)
+- **`TRIPLEC_HOST=aws` mode** (`entrypoint.sh`, the `aws_*` blocks; inert without it). There are no
+  bind mounts: `TRIPLEC_FILES` (JSON of base64 files) is decoded into `/tmp/.host-ssh` / `/tmp/.host-ca`
+  so the SSH merge and CA install run unchanged, and `TRIPLEC_REPOS` is kept in an unexported shell
+  variable; **both are unset before the agent-token block snapshots the environment** (that snapshot is
+  every terminal's env and the files hold private keys). Repos clone in the background after the agent
+  starts (terminals are usable before they arrive). Hybrid storage mounts EFS at `/mnt/triple-c-home`
+  and symlinks `~/.claude`, `~/.claude.json`, `~/.ssh` into it (mounting over `/home/claude` would hide
+  the image's tooling); root never follows those links outside the mount (`aws_hybrid_ssh_dir`). On
+  TERM the hook pushes unsaved work to a `triple-c/wip/<stamp>` branch via a temporary index (the
+  user's index is untouched; needs the task definition's `stopTimeout` raised, 120 s) unless the stop
+  marker says the app handled it. The idle watcher runs as root under a supervisor and signals the
+  entrypoint's own PID (not PID 1, which is docker-init), so idle and ECS stops share one trap.
+  Idle = the agent's `last_activity_unix` older than N minutes (open-but-silent attaches/tunnels
+  don't count; requests with `X-Triple-C-Background: 1` — the auth bridge's and the file viewer's polls — never do),
+  no `claude`, no scheduler job, no running clone, and no unsaved git work: with the WIP push on the
+  watcher pushes *before* signalling and stays up if that fails; with it off, dirty repos keep the
+  workspace up; activity during the watcher's push sends it back to watching. A repo the background
+  clone is still writing (`/run/triple-c-clone/repos` last says `cloning`, no `done`) is skipped by
+  `triple-c-wip-push` (dry run: `"cloning": true`). The stop trap is set before any background work
+  starts. An idle stop exits 75 (`aws::tasks::IDLE_EXIT_CODE`) so the death watch can tell it
+  from a crash (`classify_stop` → the `ContainerExited` toast).
+  **The `TRIPLEC_` env prefix is reserved** on both hosts (`RESERVED_ENV_PREFIXES`; `workspace.rs`
+  drops custom variables in it): the entrypoint's settings live there.
 - **Browser runtime libraries are baked in; browser *binaries* are not.** A layer runs
   `npx --yes playwright@latest install-deps chromium` as root, so Playwright names its own
   dependencies and the list cannot rot against Ubuntu 24.04's `t64` renames or a new Chromium

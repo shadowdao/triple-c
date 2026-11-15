@@ -115,6 +115,10 @@ impl EcsTask {
     /// ARN), and check it can take a session now: the task is running and
     /// its ECS Exec agent is up. Fargate starts that agent a few seconds after
     /// the container, so "not ready yet" is a normal answer just after start.
+    ///
+    /// The AWS host builds its target from `aws::tasks::wait_ready`'s answer
+    /// instead (`aws_host::ecs_task`); this stays for the live tests.
+    #[allow(dead_code)]
     pub async fn resolve(
         ecs: &aws_sdk_ecs::Client,
         cluster: &str,
@@ -175,6 +179,7 @@ impl EcsTask {
 
 /// The part of an ARN after the last `marker` (`.../cluster/name` → `name`),
 /// or the whole string when it is not an ARN.
+#[allow(dead_code)] // `EcsTask::resolve`
 fn last_arn_segment<'a>(s: &'a str, marker: &str) -> &'a str {
     if !s.starts_with("arn:") {
         return s;
@@ -606,6 +611,7 @@ pub enum TunnelState {
 pub struct PortForward {
     local_port: u16,
     state: watch::Receiver<TunnelState>,
+    #[allow(dead_code)] // `plugin_pid()`, for diagnostics and the tests
     plugin_pid: watch::Receiver<Option<u32>>,
     supervisor: Option<tokio::task::JoinHandle<()>>,
     _cancel: DropGuard,
@@ -678,6 +684,7 @@ impl PortForward {
         }
     }
 
+    #[allow(dead_code)] // diagnostics and the tests (Task 8 may show the state)
     pub fn local_port(&self) -> u16 {
         self.local_port
     }
@@ -688,11 +695,13 @@ impl PortForward {
         AgentEndpoint::loopback(self.local_port, token)
     }
 
+    #[allow(dead_code)] // diagnostics and the tests (Task 8 may show the state)
     pub fn state(&self) -> watch::Receiver<TunnelState> {
         self.state.clone()
     }
 
     /// The running plugin's process id, if one is running.
+    #[allow(dead_code)] // diagnostics and the tests (Task 8 may show the state)
     pub fn plugin_pid(&self) -> Option<u32> {
         *self.plugin_pid.borrow()
     }

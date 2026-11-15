@@ -628,3 +628,13 @@ fn no_probe_is_cloudformation() {
     }
     assert_eq!(Probe::for_action("cloudformation:DescribeStacks"), None);
 }
+
+#[test]
+fn the_iam_check_gets_room_for_its_throttled_retries() {
+    let t = iam_check_timeouts();
+    assert_eq!(t.operation_timeout(), Some(IAM_CHECK_OPERATION_TIMEOUT));
+    assert!(IAM_CHECK_OPERATION_TIMEOUT > crate::aws::connection::OPERATION_TIMEOUT);
+    // Ten adaptive attempts, backoff capped at 20 s, fit inside it.
+    assert!(IAM_CHECK_OPERATION_TIMEOUT >= std::time::Duration::from_secs(9 * 20 / 2 + 20));
+    assert_eq!(t.operation_attempt_timeout(), Some(crate::aws::connection::ATTEMPT_TIMEOUT));
+}

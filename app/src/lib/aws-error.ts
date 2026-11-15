@@ -8,6 +8,7 @@ const KINDS: Record<AwsError["kind"], true> = {
   invalid_credentials: true,
   access_denied: true,
   state_bucket_taken: true,
+  quota_exceeded: true,
   other: true,
 };
 

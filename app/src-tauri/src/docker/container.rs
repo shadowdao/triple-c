@@ -9,6 +9,7 @@ use sha2::{Sha256, Digest};
 
 use super::ca_certs;
 use super::client::get_docker;
+use super::workspace_env::{workspace_env, WorkspaceEnvInputs};
 use crate::models::AppSettings;
 use crate::models::{Backend, BedrockAuthMethod, ClaudeCodeSettings, ContainerInfo, EnvVar, GlobalAwsSettings, GlobalLlamaCppSettings, GlobalOllamaSettings, GlobalOpenAiCompatibleSettings, PortMapping, Project, ProjectPath};
 
@@ -139,7 +140,7 @@ The user can click a file path in this terminal to open it in a viewer (while a 
 /// instructions, appending port mapping docs, and appending scheduler docs.
 /// Used by both create_container() and container_needs_recreation() to ensure
 /// the same value is produced in both paths.
-fn build_claude_instructions(
+pub(super) fn build_claude_instructions(
     global_instructions: Option<&str>,
     project_instructions: Option<&str>,
     port_mappings: &[PortMapping],
@@ -244,7 +245,11 @@ pub(crate) const LABEL_SCRUB: &str = "triple-c.scrub";
 /// cannot travel onto a snapshot. See the `LABEL` block in the Dockerfile.
 pub(crate) const LABEL_BASE: &str = "triple-c.base";
 
-const RESERVED_ENV_PREFIXES: &[&str] = &["ANTHROPIC_", "AWS_", "GIT_", "HOST_", "TRIPLE_C_"];
+/// `TRIPLEC_` is the AWS workspace's own namespace (`TRIPLEC_HOST`,
+/// `TRIPLEC_FILES`, `TRIPLEC_AGENT_TOKEN`, … — see `container/entrypoint.sh`):
+/// a custom var there could switch a local container into AWS mode or forge
+/// the inputs the entrypoint trusts.
+const RESERVED_ENV_PREFIXES: &[&str] = &["ANTHROPIC_", "AWS_", "GIT_", "HOST_", "TRIPLE_C_", "TRIPLEC_"];
 
 /// Exact env var names Triple-C manages itself. Not covered by
 /// [`RESERVED_ENV_PREFIXES`] because they don't share those prefixes.
@@ -356,7 +361,7 @@ fn model_alias_fingerprint_part(
 }
 
 /// Whether `key` is an env var name Triple-C reserves for itself.
-fn is_reserved_env_key(key: &str) -> bool {
+pub(super) fn is_reserved_env_key(key: &str) -> bool {
     let upper = key.to_uppercase();
     RESERVED_ENV_PREFIXES.iter().any(|p| upper.starts_with(p))
         || RESERVED_ENV_EXACT.iter().any(|e| upper == *e)
@@ -375,7 +380,7 @@ fn is_reserved_env_key(key: &str) -> bool {
 ///
 /// Empty stays empty rather than becoming the hash of the empty string: an empty
 /// label is how every other `triple-c.*` key says "nothing configured".
-fn compute_env_fingerprint(custom_env_vars: &[EnvVar]) -> String {
+pub(super) fn compute_env_fingerprint(custom_env_vars: &[EnvVar]) -> String {
     let mut parts: Vec<String> = Vec::new();
     for env_var in custom_env_vars {
         let key = env_var.key.trim();
@@ -401,7 +406,7 @@ fn compute_env_fingerprint(custom_env_vars: &[EnvVar]) -> String {
 ///
 /// The returned token is never logged and never leaves this module except as
 /// the env var value handed to Docker.
-fn shared_claude_auth(project: &Project) -> Option<(String, String)> {
+pub(super) fn shared_claude_auth(project: &Project) -> Option<(String, String)> {
     if project.backend != Backend::Anthropic || !project.use_shared_auth_token {
         return None;
     }
@@ -432,7 +437,7 @@ fn claude_token_label(project: &Project) -> String {
 
 /// Merge global and per-project custom environment variables.
 /// Per-project variables override global variables with the same key.
-fn merge_custom_env_vars(global: &[EnvVar], project: &[EnvVar]) -> Vec<EnvVar> {
+pub(super) fn merge_custom_env_vars(global: &[EnvVar], project: &[EnvVar]) -> Vec<EnvVar> {
     let mut merged: std::collections::HashMap<String, EnvVar> = std::collections::HashMap::new();
     for ev in global {
         let key = ev.key.trim().to_string();
@@ -494,7 +499,7 @@ fn sha256_hex(input: &str) -> String {
 
 /// Resolve a per-project string value with a global fallback. Returns `None`
 /// when both are blank, otherwise the per-project value if set, else the global.
-fn resolve_with_global<'a>(per_project: Option<&'a str>, global: Option<&'a str>) -> Option<&'a str> {
+pub(super) fn resolve_with_global<'a>(per_project: Option<&'a str>, global: Option<&'a str>) -> Option<&'a str> {
     let project_val = per_project.map(str::trim).filter(|s| !s.is_empty());
     if project_val.is_some() {
         return project_val;
@@ -659,7 +664,7 @@ fn compute_ports_fingerprint(port_mappings: &[PortMapping]) -> String {
 /// to the global set and never turn a globally-enabled setting off. `None` at
 /// project level means "inherit", which is now a state the project can
 /// actually be in rather than the only state an off switch could produce.
-fn merge_claude_code_settings(
+pub(super) fn merge_claude_code_settings(
     global: Option<&ClaudeCodeSettings>,
     project: Option<&ClaudeCodeSettings>,
 ) -> Option<ClaudeCodeSettings> {
@@ -759,7 +764,7 @@ fn compute_claude_code_settings_fingerprint(
 ///
 /// The other two are documented as "set to `1` to …" with no meaning attached
 /// to `0`, so `0` is unambiguously neutral and is stated outright.
-fn claude_code_env_vars(settings: Option<&ClaudeCodeSettings>) -> Vec<String> {
+pub(super) fn claude_code_env_vars(settings: Option<&ClaudeCodeSettings>) -> Vec<String> {
     let owned;
     let s = match settings {
         Some(s) => s,
@@ -822,7 +827,7 @@ fn claude_code_env_vars(settings: Option<&ClaudeCodeSettings>) -> Vec<String> {
 ///
 /// Returns a `String` rather than an `Option<String>`: there is no longer any
 /// input for which this produces nothing to say.
-fn build_claude_code_settings_json(
+pub(super) fn build_claude_code_settings_json(
     settings: Option<&ClaudeCodeSettings>,
     sandbox_enabled: bool,
 ) -> String {
@@ -1080,7 +1085,7 @@ type VpnHostConfigParts = (
 /// `MISSION_CONTROL_ENABLED` twenty lines above shows the failure this avoids —
 /// it is pushed only when true, so a snapshot's baked `=1` survives the toggle
 /// going off.
-fn vpn_env_var(enabled: bool) -> String {
+pub(super) fn vpn_env_var(enabled: bool) -> String {
     format!("VPN_SUPPORT_ENABLED={}", u8::from(enabled))
 }
 
@@ -1266,212 +1271,24 @@ pub async fn create_container(
         log::debug!("Skipping HOST_UID/HOST_GID on Windows — Docker Desktop's Linux VM handles user mapping");
     }
 
-    if let Some(ref token) = project.git_token {
-        env_vars.push(format!("GIT_TOKEN={}", token));
-    }
-    // Per-project git user overrides global defaults
-    let effective_git_name = project.git_user_name.as_deref().or(default_git_user_name);
-    let effective_git_email = project.git_user_email.as_deref().or(default_git_user_email);
-    if let Some(name) = effective_git_name {
-        env_vars.push(format!("GIT_USER_NAME={}", name));
-    }
-    if let Some(email) = effective_git_email {
-        env_vars.push(format!("GIT_USER_EMAIL={}", email));
-    }
-
-    // Bedrock configuration
-    if project.backend == Backend::Bedrock {
-        if let Some(ref bedrock) = project.bedrock_config {
-            env_vars.push("CLAUDE_CODE_USE_BEDROCK=1".to_string());
-
-            // AWS region: per-project overrides global
-            let region = if !bedrock.aws_region.is_empty() {
-                Some(bedrock.aws_region.clone())
-            } else {
-                global_aws.aws_region.clone()
-            };
-            if let Some(ref r) = region {
-                env_vars.push(format!("AWS_REGION={}", r));
-            }
-
-            match bedrock.auth_method {
-                BedrockAuthMethod::StaticCredentials => {
-                    // Static/session credentials are NOT injected as env vars.
-                    // They are written to ~/.aws/credentials by
-                    // sync_bedrock_credentials() on every container
-                    // start, so rotated/updated keys are picked up without a
-                    // full container recreation (and never get baked into the
-                    // snapshot image). The empty values set by the
-                    // MANAGED_AUTH_KEYS neutralization pass below are ignored by
-                    // the AWS SDK, which falls through to the credentials file.
-                }
-                BedrockAuthMethod::Profile => {
-                    // Per-project profile overrides global
-                    let profile = bedrock.aws_profile.as_ref()
-                        .or(global_aws.aws_profile.as_ref());
-                    if let Some(p) = profile {
-                        env_vars.push(format!("AWS_PROFILE={}", p));
-                    }
-                    env_vars.push("AWS_SSO_AUTH_REFRESH_CMD=triple-c-sso-refresh".to_string());
-                }
-                BedrockAuthMethod::BearerToken => {
-                    if let Some(ref token) = bedrock.aws_bearer_token {
-                        env_vars.push(format!("AWS_BEARER_TOKEN_BEDROCK={}", token));
-                    }
-                }
-            }
-
-            if let Some(model) = resolve_with_global(
-                bedrock.model_id.as_deref(),
-                global_aws.default_model_id.as_deref(),
-            ) {
-                env_vars.push(format!("ANTHROPIC_MODEL={}", model));
-            }
-
-            if bedrock.disable_prompt_caching {
-                env_vars.push("DISABLE_PROMPT_CACHING=1".to_string());
-            }
-
-            if let Some(ref tier) = bedrock.service_tier {
-                let trimmed = tier.trim();
-                if !trimmed.is_empty() {
-                    env_vars.push(format!("ANTHROPIC_BEDROCK_SERVICE_TIER={}", trimmed));
-                }
-            }
-        }
-    }
-
-    // ── Custom-endpoint backends ─────────────────────────────────────────────
-    // Ollama, llama.cpp and the OpenAI-Compatible gateway all point Claude Code
-    // at a non-Anthropic server via ANTHROPIC_BASE_URL. Each resolves its model
-    // id here; the model-alias vars are emitted once below, from
-    // `alias_model` / `alias_haiku`, so the three backends cannot drift apart.
-    let mut alias_model: Option<String> = None;
-    let mut alias_haiku: Option<String> = None;
-
-    // Ollama configuration
-    if project.backend == Backend::Ollama {
-        if let Some(ref ollama) = project.ollama_config {
-            if let Some(url) = resolve_with_global(
-                Some(&ollama.base_url),
-                global_ollama.base_url.as_deref(),
-            ) {
-                env_vars.push(format!("ANTHROPIC_BASE_URL={}", url));
-            }
-            env_vars.push("ANTHROPIC_AUTH_TOKEN=ollama".to_string());
-            if let Some(model) = resolve_with_global(
-                ollama.model_id.as_deref(),
-                global_ollama.default_model_id.as_deref(),
-            ) {
-                env_vars.push(format!("ANTHROPIC_MODEL={}", model));
-                alias_model = Some(model.to_string());
-            }
-            alias_haiku = resolve_with_global(
-                ollama.haiku_model_id.as_deref(),
-                global_ollama.default_haiku_model_id.as_deref(),
-            )
-            .map(str::to_string);
-        }
-    }
-
-    // llama.cpp (llama-server) configuration
-    if project.backend == Backend::LlamaCpp {
-        if let Some(ref cfg) = project.llamacpp_config {
-            if let Some(url) = resolve_with_global(
-                Some(&cfg.base_url),
-                global_llamacpp.base_url.as_deref(),
-            ) {
-                env_vars.push(format!("ANTHROPIC_BASE_URL={}", url));
-            }
-            // llama-server only enforces an Authorization header when it was
-            // started with `--api-key` (default: none), so the value here is
-            // ignored in the common case. Claude Code still refuses to run
-            // against a custom base URL with no credential at all, so a
-            // placeholder is always sent — same trick as the Ollama branch
-            // above, which sends the literal "ollama".
-            env_vars.push("ANTHROPIC_AUTH_TOKEN=llama.cpp".to_string());
-            if let Some(model) = resolve_with_global(
-                cfg.model_id.as_deref(),
-                global_llamacpp.default_model_id.as_deref(),
-            ) {
-                env_vars.push(format!("ANTHROPIC_MODEL={}", model));
-                alias_model = Some(model.to_string());
-            }
-            alias_haiku = resolve_with_global(
-                cfg.haiku_model_id.as_deref(),
-                global_llamacpp.default_haiku_model_id.as_deref(),
-            )
-            .map(str::to_string);
-        }
-    }
-
-    // OpenAI Compatible configuration
-    if project.backend == Backend::OpenAiCompatible {
-        if let Some(ref config) = project.openai_compatible_config {
-            if let Some(url) = resolve_with_global(
-                Some(&config.base_url),
-                global_openai_compatible.base_url.as_deref(),
-            ) {
-                env_vars.push(format!("ANTHROPIC_BASE_URL={}", url));
-            }
-            if let Some(ref key) = config.api_key {
-                env_vars.push(format!("ANTHROPIC_AUTH_TOKEN={}", key));
-            }
-            if let Some(model) = resolve_with_global(
-                config.model_id.as_deref(),
-                global_openai_compatible.default_model_id.as_deref(),
-            ) {
-                env_vars.push(format!("ANTHROPIC_MODEL={}", model));
-                alias_model = Some(model.to_string());
-            }
-            alias_haiku = resolve_with_global(
-                config.haiku_model_id.as_deref(),
-                global_openai_compatible.default_haiku_model_id.as_deref(),
-            )
-            .map(str::to_string);
-        }
-    }
-
-    // Model aliases — the fix for background Claude Code calls against a local
-    // server. Only for backends that talk to a custom endpoint: Anthropic and
-    // Bedrock reach servers that really do host the Anthropic model ids, so
-    // they keep Claude Code's own defaults. Anything not emitted here is
-    // blanked by the MANAGED_AUTH_KEYS pass below, so switching *away* from a
-    // custom endpoint clears the aliases out of the snapshot image too.
-    if project.backend.uses_custom_endpoint() {
-        for (key, value) in
-            compute_model_aliases(alias_model.as_deref(), alias_haiku.as_deref())
-        {
-            env_vars.push(format!("{}={}", key, value));
-        }
-    }
-
     // Shared Claude Code OAuth token (Anthropic backend only, opt-out per
-    // project). Injected *before* the neutralization pass below so that pass
-    // sees it as already-set; when it is absent the pass actively blanks the
-    // variable instead of leaving a stale one baked into the snapshot image.
+    // project). Read here — it lives in the keychain — and handed to
+    // `workspace_env`, which injects it before the neutralization pass.
     let shared_claude = shared_claude_auth(project);
-    if let Some((ref token, _)) = shared_claude {
-        env_vars.push(format!("{}={}", CLAUDE_OAUTH_TOKEN_ENV, token));
+    if shared_claude.is_some() {
         log::info!(
             "Injecting the shared Claude authentication token into the container for project {}",
             project.id
         );
     }
 
-    // ── Corporate CA certificates ───────────────────────────────────────────
-    // Resolved here (rather than down with the mounts) so the env vars land
-    // *before* the neutralization pass below and are seen as already-set.
+    // Corporate CA certificates, resolved here (not in `workspace_env`) because
+    // the mount below needs the same resolution.
     //
     // A bad path is a hard error, not a warning: behind a TLS-terminating
     // proxy a container without the CA fails every HTTPS call — npm, pip, git,
     // and Claude Code's own API requests — each in its own confusing way. One
     // message naming the path is far kinder.
-    //
-    // The values are set here rather than exported by the entrypoint because a
-    // terminal session is a `docker exec`, which sees the container's
-    // configured env and nothing the entrypoint exported. Same lesson as
-    // `$BROWSER` and the URL relay shim.
     let effective_ca_path =
         resolve_with_global(project.ca_cert_path.as_deref(), default_ca_cert_path);
     let resolved_ca = ca_certs::resolve(effective_ca_path)?;
@@ -1483,110 +1300,40 @@ pub async fn create_container(
             project.id
         );
     }
-    for (key, value) in ca_certs::ca_env_vars(resolved_ca.as_ref()) {
-        env_vars.push(format!("{}={}", key, value));
-    }
 
-    // ── Neutralize stale backend auth env vars ──────────────────────────────
-    // When a project switches backends (e.g. Bedrock → Anthropic) the container
-    // is recreated *from a snapshot image* committed off the previous container,
-    // and `docker commit` copies that container's full ENV into the image. So
-    // any auth var set under the old backend (e.g. CLAUDE_CODE_USE_BEDROCK=1,
-    // AWS_PROFILE, a model alias) survives in the image ENV and stays active
-    // unless we explicitly override it at create time.
-    //
-    // This pass is about *staleness*, not secrecy. It fixes the container it is
-    // building and does nothing to the image, so it is not — and never was —
-    // a defence against a credential baked into a snapshot. That is
-    // `commit_container_snapshot`'s job, via SECRET_ENV_KEYS.
-    // Create-time env takes precedence over image ENV, so we set every managed
-    // auth key the *current* backend did NOT set to an empty value, clearing the
-    // stale baked-in one.
-    const MANAGED_AUTH_KEYS: &[&str] = &[
-        "CLAUDE_CODE_USE_BEDROCK",
-        "AWS_REGION",
-        "AWS_ACCESS_KEY_ID",
-        "AWS_SECRET_ACCESS_KEY",
-        "AWS_SESSION_TOKEN",
-        "AWS_PROFILE",
-        "AWS_BEARER_TOKEN_BEDROCK",
-        "AWS_SSO_AUTH_REFRESH_CMD",
-        "ANTHROPIC_BASE_URL",
-        "ANTHROPIC_AUTH_TOKEN",
-        "ANTHROPIC_MODEL",
-        "DISABLE_PROMPT_CACHING",
-        "ANTHROPIC_BEDROCK_SERVICE_TIER",
-        // Switching from a custom-endpoint backend to Anthropic or Bedrock must
-        // *clear* the aliases, not merely stop setting them: a stale
-        // ANTHROPIC_DEFAULT_HAIKU_MODEL baked into the snapshot image would
-        // keep pointing background calls at a model id the new backend has
-        // never heard of.
-        ANTHROPIC_DEFAULT_OPUS_MODEL,
-        ANTHROPIC_DEFAULT_SONNET_MODEL,
-        ANTHROPIC_DEFAULT_HAIKU_MODEL,
-        ANTHROPIC_DEFAULT_FABLE_MODEL,
-        // Revoking the shared token, opting a project out, or switching away
-        // from the Anthropic backend must *clear* this, not merely stop setting
-        // it — otherwise the value committed into the snapshot image keeps
-        // authenticating the container with a credential the user removed.
-        CLAUDE_OAUTH_TOKEN_ENV,
-    ];
-    // Same reasoning for the CA vars — `ca_env_vars` already emits them empty
-    // when no CA is configured, so this list is belt-and-braces for a snapshot
-    // committed by a build that predates the feature.
-    let managed_keys: Vec<&str> = MANAGED_AUTH_KEYS
-        .iter()
-        .copied()
-        .chain(ca_certs::CA_ENV_KEYS.iter().copied())
-        .collect();
-    let already_set: std::collections::HashSet<String> = env_vars
-        .iter()
-        .filter_map(|e| e.split('=').next().map(|k| k.to_string()))
-        .collect();
-    for key in &managed_keys {
-        if !already_set.contains(*key) {
-            env_vars.push(format!("{}=", key));
-        }
-    }
+    // Everything project-shaped (backend auth, CA vars, custom env, instructions,
+    // Claude Code settings, ...) comes from the one host-neutral builder, so the
+    // AWS host can put the same pairs in its secret.
+    env_vars.extend(
+        workspace_env(
+            project,
+            &WorkspaceEnvInputs {
+                global_aws,
+                global_ollama,
+                global_llamacpp,
+                global_openai_compatible,
+                global_claude_instructions,
+                global_custom_env_vars,
+                timezone,
+                global_claude_code_settings,
+                default_git_user_name,
+                default_git_user_email,
+                resolved_ca: resolved_ca.as_ref(),
+                shared_claude_token: shared_claude.as_ref().map(|(token, _)| token.as_str()),
+            },
+        )
+        .into_iter()
+        .map(|(key, value)| format!("{}={}", key, value)),
+    );
 
-    // Custom environment variables (global + per-project, project overrides global for same key)
-    let merged_env = merge_custom_env_vars(global_custom_env_vars, &project.custom_env_vars);
-    for env_var in &merged_env {
-        let key = env_var.key.trim();
-        if key.is_empty() {
-            continue;
-        }
-        if is_reserved_env_key(key) {
-            log::warn!("Skipping reserved env var: {}", key);
-            continue;
-        }
-        env_vars.push(format!("{}={}", key, env_var.value));
-    }
-    let custom_env_fingerprint = compute_env_fingerprint(&merged_env);
-    env_vars.push(format!("TRIPLE_C_CUSTOM_ENV={}", custom_env_fingerprint));
-
-    // Container timezone
-    if let Some(tz) = timezone {
-        if !tz.is_empty() {
-            env_vars.push(format!("TZ={}", tz));
-        }
-    }
-
-    // Mission Control env var
-    if project.mission_control_enabled {
-        env_vars.push("MISSION_CONTROL_ENABLED=1".to_string());
-    }
-
-    env_vars.push(vpn_env_var(project.vpn_support_enabled));
-
-    // Permission mode — read by triple-c-task-runner for scheduled (headless)
-    // Claude Code runs. Interactive terminals get the flags directly instead.
-    env_vars.push(format!(
-        "TRIPLE_C_PERMISSION_MODE={}",
-        project.effective_permission_mode().as_env_value()
+    // The labels below fingerprint the inputs that went into the env; derive
+    // them with the same helpers `workspace_env` used, so both always agree.
+    let effective_git_name = project.git_user_name.as_deref().or(default_git_user_name);
+    let effective_git_email = project.git_user_email.as_deref().or(default_git_user_email);
+    let custom_env_fingerprint = compute_env_fingerprint(&merge_custom_env_vars(
+        global_custom_env_vars,
+        &project.custom_env_vars,
     ));
-
-    // Claude instructions (global + per-project, plus port mapping info + scheduler docs)
     let combined_instructions = build_claude_instructions(
         global_claude_instructions,
         project.claude_instructions.as_deref(),
@@ -1594,34 +1341,10 @@ pub async fn create_container(
         project.mission_control_enabled,
         project.sandbox_mode_enabled,
     );
-
-    if let Some(ref instructions) = combined_instructions {
-        env_vars.push(format!("CLAUDE_INSTRUCTIONS={}", instructions));
-    }
-
-    // Claude Code settings (global + per-project merged)
     let merged_cc_settings = merge_claude_code_settings(
         global_claude_code_settings,
         project.claude_code_settings.as_ref(),
     );
-    // Env-var-based settings, read directly by Claude Code. Extracted and unit
-    // tested for the `vpn_host_config` reason: a container is created once, by
-    // a very long function, and a variable emitted with the wrong value here is
-    // invisible until someone wonders why a switch does nothing.
-    env_vars.extend(claude_code_env_vars(merged_cc_settings.as_ref()));
-
-    // settings.json-based settings (applied by the entrypoint). Always emitted,
-    // even with no `ClaudeCodeSettings` struct present: the payload asserts the
-    // *whole* managed key set, so "no settings" still has to be stated over a
-    // settings.json left behind on the config volume by a previous config.
-    // Split so the payload is safe under an older entrypoint that has never
-    // heard of the null-means-delete convention — see
-    // `split_claude_code_settings_payload`.
-    let (cc_settings_set, cc_settings_clear) = split_claude_code_settings_payload(
-        &build_claude_code_settings_json(merged_cc_settings.as_ref(), project.sandbox_mode_enabled),
-    );
-    env_vars.push(format!("CLAUDE_CODE_SETTINGS_JSON={}", cc_settings_set));
-    env_vars.push(format!("CLAUDE_CODE_SETTINGS_CLEAR={}", cc_settings_clear));
 
     let mut mounts: Vec<Mount> = Vec::new();
 
@@ -4375,6 +4098,22 @@ mod tests {
         // would reinstall a skill for a capability the container no longer has.
         assert_eq!(vpn_env_var(true), "VPN_SUPPORT_ENABLED=1");
         assert_eq!(vpn_env_var(false), "VPN_SUPPORT_ENABLED=0");
+    }
+
+    #[test]
+    fn the_aws_workspace_namespace_is_reserved_from_custom_env() {
+        for key in ["TRIPLEC_HOST", "TRIPLEC_FILES", "TRIPLEC_AGENT_TOKEN", "triplec_repos", "TRIPLEC_ANYTHING"] {
+            assert!(is_reserved_env_key(key), "{key}");
+        }
+        assert_eq!(
+            compute_env_fingerprint(&[EnvVar {
+                key: "TRIPLEC_HOST".to_string(),
+                value: "aws".to_string(),
+            }]),
+            "",
+            "a reserved key never reaches the container"
+        );
+        assert!(!is_reserved_env_key("TRIPLECX"));
     }
 
     #[test]
