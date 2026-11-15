@@ -21,6 +21,7 @@ import WebTerminalSettings from "./WebTerminalSettings";
 import SttSettings from "./SttSettings";
 import SharedAuthSettings from "./SharedAuthSettings";
 import MarketplaceSettings from "./MarketplaceSettings";
+import HostsSettings from "./HostsSettings";
 import CertificateSettings from "./CertificateSettings";
 import ExportSettingsModal from "./ExportSettingsModal";
 import ImportSettingsModal from "./ImportSettingsModal";
@@ -186,6 +187,10 @@ export default function SettingsPanel() {
         <OpenAiCompatibleSettings />
         <div className="pt-3 border-t border-[var(--border-color)]" />
         <GatewaySettings />
+      </AccordionSection>
+
+      <AccordionSection id="hosts" title="Hosts" defaultOpen={false}>
+        <HostsSettings />
       </AccordionSection>
 
       <AccordionSection id="container" title="Container" defaultOpen={false}>
