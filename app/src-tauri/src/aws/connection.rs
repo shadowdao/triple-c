@@ -20,6 +20,7 @@ use crate::storage::secure;
 /// The SDK config for `conn` in `region`. Credentials are resolved lazily,
 /// so a missing profile or an expired SSO session surfaces on the first
 /// call and is classified there (`classify_sdk_error`).
+#[allow(dead_code)] // Called by the Tauri commands (Task 6).
 pub async fn sdk_config(conn: &HostConnection, region: &str) -> Result<SdkConfig, AwsError> {
     sdk_config_with(conn, region, None).await
 }

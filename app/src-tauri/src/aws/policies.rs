@@ -20,6 +20,7 @@ pub enum Tier {
 }
 
 /// The policy document an admin attaches for `tier`.
+#[allow(dead_code)] // Only tests read the policy text so far.
 pub fn policy_json(tier: Tier) -> &'static str {
     match tier {
         Tier::EnvironmentAdmin => include_str!("../../../../aws/policies/environment-admin.json"),
@@ -29,10 +30,12 @@ pub fn policy_json(tier: Tier) -> &'static str {
 
 /// The managed policy (no path) every role an environment admin creates must
 /// carry as its permissions boundary.
+#[allow(dead_code)] // Only tests read the policy text so far.
 pub const PERMISSIONS_BOUNDARY_NAME: &str = "triple-c-permissions-boundary";
 
 /// The document for [`PERMISSIONS_BOUNDARY_NAME`]: the most any
 /// Triple-C-created role may ever hold.
+#[allow(dead_code)] // Only tests read the policy text so far.
 pub fn permissions_boundary_json() -> &'static str {
     include_str!("../../../../aws/policies/permissions-boundary.json")
 }
