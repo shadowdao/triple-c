@@ -755,6 +755,26 @@ async fn reconcile_falls_back_to_a_newer_live_task_when_the_stored_one_stopped()
 }
 
 #[tokio::test]
+async fn reconcile_forgets_a_stale_stop_on_the_unattached_id_before_reusing_it() {
+    use crate::host::tunnels;
+    let mut p = aws_project(StorageMode::Ephemeral);
+    p.status = ProjectStatus::Running;
+    p.aws.as_mut().unwrap().task_arn = Some(task_arn("u2"));
+    let placeholder = tunnels::unattached_id(&p.id);
+    // A past unattached spell's task was seen stopped under this id.
+    tunnels::mark_stopped(&placeholder, StopKind::Spot);
+    p.container_id = Some("http://127.0.0.1:61400/".into());
+    assert_eq!(prepare_unattached(&p), Some(placeholder.clone()));
+    assert!(!tunnels::is_stopped(&placeholder), "the live task must not read as stopped");
+    // Already on the placeholder: nothing to store, the mark still goes.
+    p.container_id = Some(placeholder.clone());
+    tunnels::mark_stopped(&placeholder, StopKind::Spot);
+    assert_eq!(prepare_unattached(&p), None);
+    assert!(!tunnels::is_stopped(&placeholder));
+    assert_eq!(prepare_unattached(&Project::new("l".into(), Vec::new())), None);
+}
+
+#[tokio::test]
 async fn an_unattached_aws_project_gets_a_target_id_no_tunnel_can_have() {
     // m9: the last run's loopback port may belong to another project's
     // tunnel now.

@@ -89,6 +89,21 @@ fn notify() {
     changed().send_modify(|n| *n = n.wrapping_add(1));
 }
 
+/// The target id an AWS project has while no tunnel is registered for it
+/// (see `aws_host::unattached_container_id`): never a loopback URL, so a
+/// port a new tunnel reuses can't be confused with it.
+pub fn unattached_id(project_id: &str) -> String {
+    format!("http://unattached.invalid/{project_id}/")
+}
+
+/// Forget that the watch saw the task behind `target_id` stopped. For a
+/// project's [`unattached_id`], which (unlike an endpoint) is reused by
+/// every later unattached spell of the same project: a stale entry would
+/// make a later live task read as stopped.
+pub fn forget_stopped(target_id: &str) {
+    lock().stopped.remove(target_id);
+}
+
 /// Register `tunnel` for `project_id`, returning the one it replaces (the
 /// caller closes it).
 pub fn register(project_id: &str, tunnel: LiveTunnel) -> Option<LiveTunnel> {
@@ -96,6 +111,7 @@ pub fn register(project_id: &str, tunnel: LiveTunnel) -> Option<LiveTunnel> {
         let mut r = lock();
         *r.generation.entry(project_id.to_string()).or_default() += 1;
         r.stopped.remove(tunnel.endpoint.base_url.as_str());
+        r.stopped.remove(&unattached_id(project_id));
         r.pending.remove(project_id);
         r.live.insert(project_id.to_string(), tunnel)
     };
@@ -165,6 +181,7 @@ pub fn register_if_current(
             return Err(Box::new(tunnel));
         }
         r.stopped.remove(tunnel.endpoint.base_url.as_str());
+        r.stopped.remove(&unattached_id(project_id));
         r.pending.remove(project_id);
         r.live.insert(project_id.to_string(), tunnel)
     };
@@ -356,6 +373,28 @@ pub(crate) mod tests {
         old.forward.close().await;
         close(&p).await;
         assert_eq!(closes.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_registering_tunnel_clears_a_stop_seen_under_the_projects_unattached_id() {
+        let p = pid("unattached-stale");
+        let placeholder = unattached_id(&p);
+        mark_stopped(&placeholder, StopKind::Spot);
+        let closes = Arc::new(AtomicUsize::new(0));
+        register(&p, fake_tunnel(61301, closes.clone()));
+        assert!(!is_stopped(&placeholder), "a later unattached spell must not read as stopped");
+        close(&p).await;
+
+        // A re-attach registering clears it too; and it can be forgotten directly.
+        let q = pid("unattached-stale-reattach");
+        mark_stopped(&unattached_id(&q), StopKind::Spot);
+        let g = begin_reattach(&q);
+        assert!(register_if_current(&q, g, fake_tunnel(61302, closes.clone())).is_ok());
+        assert!(!is_stopped(&unattached_id(&q)));
+        close(&q).await;
+        mark_stopped(&unattached_id(&q), StopKind::Idle);
+        forget_stopped(&unattached_id(&q));
+        assert!(!is_stopped(&unattached_id(&q)));
     }
 
     #[tokio::test]

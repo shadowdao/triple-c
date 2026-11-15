@@ -928,8 +928,21 @@ pub fn unattached_container_id(p: &Project) -> Option<String> {
     if tunnels::get_endpoint(&p.id).is_some_and(|ep| ep.base_url.as_str() == stored) {
         return None;
     }
-    let placeholder = format!("http://unattached.invalid/{}/", p.id);
+    let placeholder = tunnels::unattached_id(&p.id);
     (stored != placeholder).then_some(placeholder)
+}
+
+/// Before reconcile asks ECS about `p`: a project with no registered tunnel
+/// is (or is about to be) known by its [`tunnels::unattached_id`], which a
+/// past unattached spell may have left marked stopped. Reconcile is the
+/// authority about the task now, so that mark goes; the watch re-marks it if
+/// the task really is stopped. Returns the placeholder to store, if any.
+pub fn prepare_unattached(p: &Project) -> Option<String> {
+    if !p.is_aws() || tunnels::get_endpoint(&p.id).is_some() {
+        return None;
+    }
+    tunnels::forget_stopped(&tunnels::unattached_id(&p.id));
+    unattached_container_id(p)
 }
 
 /// Reconcile one AWS project the store has as Running (or Starting/

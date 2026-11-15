@@ -1946,8 +1946,11 @@ pub async fn reconcile_aws_projects(state: State<'_, AppState>) -> Result<Vec<Pr
     // A target id left from the last run is a loopback URL whose port a new
     // tunnel (any project's) may now own; until a re-attach registers, the
     // project gets an id no tunnel can have (m9).
+    // A stopped mark a past unattached spell left on that id is forgotten
+    // first: reconcile asks ECS now, and a stale mark would make the death
+    // watch report a live, billed task as stopped.
     for p in &projects {
-        if let Some(id) = crate::host::aws_host::unattached_container_id(p) {
+        if let Some(id) = crate::host::aws_host::prepare_unattached(p) {
             let _ = state.projects_store.set_container_id(&p.id, Some(id));
         }
     }
