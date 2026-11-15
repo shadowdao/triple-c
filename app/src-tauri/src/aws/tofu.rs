@@ -706,7 +706,10 @@ pub fn start_detached(
 /// After the runner takes its lock, how long to wait for its PID file.
 const PID_GRACE: Duration = Duration::from_secs(2);
 
-fn start_detached_with(
+/// [`start_detached`] with the runner program and start timeout given: the
+/// unit tests pass a fake runner, the live tests the built app binary (the
+/// test harness is not the app, so it can't re-execute itself as one).
+pub(crate) fn start_detached_with(
     program: &Path,
     timeout: Duration,
     tofu: &Path,

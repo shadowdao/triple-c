@@ -289,6 +289,11 @@ impl E2e {
     /// An SDK config for a session of `role`, once IAM lets it be assumed
     /// and its policies have propagated.
     async fn assume(&self, role: &Role) -> SdkConfig {
+        sdk_config_for_keys(&self.assume_keys(role).await, &self.region)
+    }
+
+    /// A session of `role` as keys (see [`E2e::assume`]).
+    async fn assume_keys(&self, role: &Role) -> AwsKeys {
         let mut last = None;
         for _ in 0..20 {
             match self
@@ -309,7 +314,7 @@ impl E2e {
                     // New sessions see a just-attached policy after a few
                     // seconds; denials in that window would be noise.
                     tokio::time::sleep(Duration::from_secs(10)).await;
-                    return sdk_config_for_keys(&keys, &self.region);
+                    return keys;
                 }
                 Err(e) => {
                     last = Some(classify_sdk_error("sts:AssumeRole", &e).to_string());
@@ -956,4 +961,706 @@ async fn the_admin_tier_creates_only_bounded_roles_and_tagged_keys() {
         );
     })
     .await;
+}
+
+/// Phase 4: OpenTofu environments, deployed for real by a role that holds
+/// only the environment-admin policies.
+///
+/// ```sh
+/// cd app/src-tauri
+/// cargo build   # the runner is the app binary re-executed (see below)
+/// TRIPLEC_AWS_E2E_PROFILE=… TRIPLEC_AWS_E2E_REGION=us-west-2 \
+///   cargo test aws::live_tests::environment -- --ignored --test-threads=1
+/// ```
+///
+/// What runs the way the app runs it: `ensure_tofu` (the pinned download),
+/// `ensure_state_bucket`'s configuration, `materialize`, `child_env` (a keys
+/// connection for the environment admin, a profile connection for the
+/// account admin), the detached runner — the **built app binary**
+/// (`target/debug/triple-c`, or `TRIPLEC_E2E_APP_BIN`) re-executed with
+/// `--tofu-runner`, because the test harness is not the app and can't
+/// re-execute itself as one — `follow`, `scan`, the refusal checks the
+/// commands make, and the conditional lock delete. What doesn't: the Tauri
+/// commands themselves (they need an `AppHandle` and saved settings), so the
+/// slot/follower bookkeeping and the event stream are not exercised here.
+///
+/// Extra variables:
+/// - `TRIPLEC_E2E_BUCKET_SUFFIX`: the state bucket is
+///   `triple-c-tfstate-<account>-<region>-<suffix>` (default: random), so the
+///   account's real one is never touched;
+/// - `TRIPLEC_E2E_TOFU_ROOT`: where OpenTofu, the provider cache and the work
+///   folders go (default: `<tmp>/triple-c-e2e-tofu`, kept between runs).
+mod environment {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use aws_config::SdkConfig;
+
+    use super::{e2e, ok, E2e, Role};
+    use crate::aws::environments::{
+        ensure_named_state_bucket, is_empty_state, scan_in_bucket, EnvironmentAction, EnvironmentState, Knowable,
+        OnboardingState, SdkDetectApi,
+    };
+    use crate::aws::policies::{policy_files, Tier, PERMISSIONS_BOUNDARY_NAME};
+    use crate::aws::tofu::{
+        self, child_env, ensure_tofu, follow, materialize, start_detached_with, TofuOp,
+        TofuOutcome, Workdir,
+    };
+    use crate::aws::tofu_modules::{
+        boundary_vars, environment_vars, onboarding_vars, owner_key, state_bucket_name, state_key,
+        user_role_names, Deployment, ModuleKind, NetworkChoice,
+    };
+    use crate::aws::{caller_identity, sdk_config_for_keys, CallerIdentity};
+    use crate::commands::environment_commands::{
+        delete_lock_if_unchanged, deploy_refusal, network_from_record, onboard_refusal,
+        validate_owner_id, LOCK_CHANGED,
+    };
+    use crate::models::host_connection::{AwsAuth, HostConnection, HostKind};
+    use crate::storage::secure::AwsKeys;
+
+    /// The environment admin: a role holding the admin tier's policy files
+    /// as managed policies, and nothing else.
+    struct Admin {
+        role: Role,
+    }
+
+    struct Env {
+        e: Arc<E2e>,
+        root: PathBuf,
+        tofu: PathBuf,
+        app_bin: PathBuf,
+        bucket: String,
+        /// Deployments applied (work folder, still to destroy), newest last.
+        applied: std::sync::Mutex<Vec<(Workdir, bool)>>,
+        /// The test created the boundary (through its module).
+        boundary_created: std::sync::Mutex<bool>,
+        bucket_created: std::sync::Mutex<bool>,
+    }
+
+    fn app_bin() -> PathBuf {
+        if let Ok(p) = std::env::var("TRIPLEC_E2E_APP_BIN") {
+            return PathBuf::from(p);
+        }
+        // target/debug/deps/<test binary> -> target/debug/triple-c
+        let exe = std::env::current_exe().expect("current exe");
+        let dir = exe.parent().and_then(|d| d.parent()).expect("target dir");
+        dir.join(format!("triple-c{}", std::env::consts::EXE_SUFFIX))
+    }
+
+    fn keys_connection(region: &str) -> HostConnection {
+        HostConnection {
+            id: "e2e-envadmin".into(),
+            name: "e2e-envadmin".into(),
+            kind: HostKind::Aws {
+                auth: AwsAuth::Keys {
+                    keyring_ref: "unused".into(),
+                },
+                default_region: region.to_string(),
+            },
+        }
+    }
+
+    fn profile_connection(region: &str) -> HostConnection {
+        HostConnection {
+            id: "e2e".into(),
+            name: "e2e".into(),
+            kind: HostKind::Aws {
+                auth: AwsAuth::Profile {
+                    name: super::var("TRIPLEC_AWS_E2E_PROFILE"),
+                },
+                default_region: region.to_string(),
+            },
+        }
+    }
+
+    /// `not authorized to perform: <action>` (and the KMS/S3 phrasings) in a
+    /// log message.
+    fn denied_actions(message: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for marker in ["not authorized to perform: ", "is not authorized to perform "] {
+            let mut rest = message;
+            while let Some(i) = rest.find(marker) {
+                rest = &rest[i + marker.len()..];
+                let action: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == ':' || *c == '*')
+                    .collect();
+                if !action.is_empty() && !out.contains(&action) {
+                    out.push(action);
+                }
+            }
+        }
+        if out.is_empty()
+            && (message.contains("AccessDenied") || message.contains("UnauthorizedOperation"))
+        {
+            out.push("(unnamed: see the message above)".into());
+        }
+        out
+    }
+
+    impl Env {
+        async fn new(e: Arc<E2e>) -> Arc<Env> {
+            let root = std::env::var("TRIPLEC_E2E_TOFU_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| std::env::temp_dir().join("triple-c-e2e-tofu"));
+            std::fs::create_dir_all(&root).unwrap();
+            let app_bin = app_bin();
+            assert!(
+                app_bin.is_file(),
+                "{} is missing: run `cargo build` first (the runner is the app binary)",
+                app_bin.display()
+            );
+            let tofu = ensure_tofu(&root).await.expect("ensure_tofu");
+            let suffix = std::env::var("TRIPLEC_E2E_BUCKET_SUFFIX").unwrap_or_else(|_| {
+                format!("e2e{}", &uuid::Uuid::new_v4().simple().to_string()[..8])
+            });
+            let bucket = format!("{}-{suffix}", state_bucket_name(&e.account, &e.region));
+            assert!(bucket.len() <= 63, "{bucket} is too long for a bucket name");
+            Arc::new(Env {
+                e,
+                root,
+                tofu,
+                app_bin,
+                bucket,
+                applied: Default::default(),
+                boundary_created: Default::default(),
+                bucket_created: Default::default(),
+            })
+        }
+
+        /// The environment admin role (no boundary on the role itself: the
+        /// boundary allows only what tasks do, so an admin under it could
+        /// administer nothing).
+        async fn admin(&self) -> Admin {
+            let role = self.e.role("envadmin", None, &[]).await;
+            for (i, (file, json)) in policy_files(Tier::EnvironmentAdmin).iter().enumerate() {
+                let arn = self.e.managed_policy(&format!("envadmin{i}"), json).await;
+                eprintln!("envadmin: {file} -> {arn}");
+                self.e.attach(&role, &arn).await;
+            }
+            Admin { role }
+        }
+
+        /// A fresh session of the admin role (role chaining caps one at an
+        /// hour, so each phase takes its own).
+        async fn session(&self, admin: &Admin) -> (AwsKeys, SdkConfig, CallerIdentity) {
+            let keys = self.e.assume_keys(&admin.role).await;
+            let cfg = sdk_config_for_keys(&keys, &self.e.region);
+            let who = caller_identity(&cfg).await.expect("envadmin identity");
+            (keys, cfg, who)
+        }
+
+        async fn scan(&self, cfg: &SdkConfig, who: &CallerIdentity) -> crate::aws::environments::EnvironmentScan {
+            let api = SdkDetectApi::new(cfg, &who.account);
+            let (root, bucket) = (self.root.clone(), self.bucket.clone());
+            let running = move |d: Deployment| {
+                tofu::workdir_for(&root, d, &bucket)
+                    .map(|wd| tofu::is_running(&wd))
+                    .unwrap_or(false)
+            };
+            scan_in_bucket(&api, who, &self.e.region, &self.bucket, &running)
+                .await
+                .expect("scan")
+        }
+
+        /// Write the module and run `op` through the detached runner, printing
+        /// the log and every denied action.
+        async fn run(
+            &self,
+            kind: ModuleKind,
+            d: Deployment<'_>,
+            vars: &serde_json::Value,
+            op: TofuOp,
+            env: Vec<(String, String)>,
+        ) -> (Workdir, TofuOutcome, Vec<String>) {
+            let wd = materialize(&self.root, kind, d, &self.bucket, &self.e.region, vars)
+                .expect("materialize");
+            if op == TofuOp::Apply {
+                let mut applied = self.applied.lock().unwrap();
+                if !applied.iter().any(|(w, _)| *w == wd) {
+                    applied.push((wd.clone(), true));
+                }
+            }
+            let label = state_key(d);
+            eprintln!("=== tofu {op:?} {label} ({})", wd.dir.display());
+            let (bin, tofu_bin, start_wd) = (self.app_bin.clone(), self.tofu.clone(), wd.clone());
+            let started = tokio::task::spawn_blocking(move || {
+                start_detached_with(&bin, Duration::from_secs(30), &tofu_bin, &start_wd, op, &env)
+            })
+            .await
+            .unwrap()
+            .unwrap_or_else(|e| panic!("start {label}: {e}"));
+            assert!(started.pid.is_some(), "the runner wrote no PID");
+            let mut denied = Vec::new();
+            let outcome = follow(&wd, Duration::from_millis(500), |events| {
+                for ev in events {
+                    let resource = ev.resource.as_deref().unwrap_or("");
+                    let short: String = ev.message.chars().take(300).collect();
+                    eprintln!("  [{}] {} {} {}", ev.level, ev.kind, resource, short);
+                    if ev.level == "error" {
+                        eprintln!("  ERROR DETAIL: {}", ev.message);
+                        for a in denied_actions(&ev.message) {
+                            eprintln!("  DENIED: {a} ({resource})");
+                            if !denied.contains(&a) {
+                                denied.push(a);
+                            }
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("follow");
+            eprintln!("=== {label}: {outcome:?}");
+            if op == TofuOp::Destroy && outcome.ok {
+                for (w, pending) in self.applied.lock().unwrap().iter_mut() {
+                    if *w == wd {
+                        *pending = false;
+                    }
+                }
+            }
+            (wd, outcome, denied)
+        }
+
+        fn keys_env(&self, keys: &AwsKeys) -> Vec<(String, String)> {
+            child_env(
+                &keys_connection(&self.e.region),
+                Some(keys),
+                &self.root,
+                std::env::vars(),
+            )
+            .expect("child env")
+        }
+
+        fn admin_env(&self) -> Vec<(String, String)> {
+            child_env(&profile_connection(&self.e.region), None, &self.root, std::env::vars())
+                .expect("child env")
+        }
+
+        async fn ensure_bucket(&self, cfg: &SdkConfig, who: &CallerIdentity) {
+            *self.bucket_created.lock().unwrap() = true;
+            let b = ensure_named_state_bucket(cfg, &who.account, &self.e.region, &self.bucket)
+                .await
+                .unwrap_or_else(|e| panic!("ensure_state_bucket as the environment admin: {e}"));
+            assert_eq!(b, self.bucket);
+        }
+
+        /// The boundary, through its module as the account admin, if the
+        /// account has none.
+        async fn ensure_boundary(&self) {
+            let arn = format!(
+                "arn:aws:iam::{}:policy/{PERMISSIONS_BOUNDARY_NAME}",
+                self.e.account
+            );
+            if self.e.iam.get_policy().policy_arn(&arn).send().await.is_ok() {
+                eprintln!("the account already has the boundary; using it");
+                return;
+            }
+            *self.boundary_created.lock().unwrap() = true;
+            let (_, outcome, denied) = self
+                .run(
+                    ModuleKind::PermissionsBoundary,
+                    Deployment::Boundary,
+                    &boundary_vars(&self.e.region),
+                    TofuOp::Apply,
+                    self.admin_env(),
+                )
+                .await;
+            assert!(outcome.ok, "boundary apply: {outcome:?} denied {denied:?}");
+        }
+
+        /// As the account admin: destroy whatever is still applied (newest
+        /// first), the bucket with every version, and the boundary if this
+        /// test made it. Logs rather than fails, so one error strands nothing
+        /// else.
+        async fn cleanup(&self) {
+            let pending: Vec<Workdir> = self
+                .applied
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .filter(|(_, p)| *p)
+                .map(|(w, _)| w.clone())
+                .collect();
+            for wd in pending {
+                eprintln!("cleanup: destroying {} as the account admin", wd.dir.display());
+                let env = self.admin_env();
+                let (bin, tofu_bin, w) = (self.app_bin.clone(), self.tofu.clone(), wd.clone());
+                let started = tokio::task::spawn_blocking(move || {
+                    start_detached_with(&bin, Duration::from_secs(30), &tofu_bin, &w, TofuOp::Destroy, &env)
+                })
+                .await;
+                match started {
+                    Ok(Ok(_)) => {
+                        let outcome = follow(&wd, Duration::from_millis(500), |events| {
+                            for ev in events.iter().filter(|e| e.level == "error") {
+                                eprintln!("  cleanup error: {}", ev.message);
+                            }
+                        })
+                        .await;
+                        eprintln!("cleanup: destroy {}: {outcome:?}", wd.dir.display());
+                    }
+                    other => eprintln!("cleanup: could not start destroy: {other:?}"),
+                }
+            }
+            if *self.boundary_created.lock().unwrap() {
+                let arn = format!(
+                    "arn:aws:iam::{}:policy/{PERMISSIONS_BOUNDARY_NAME}",
+                    self.e.account
+                );
+                if self.e.iam.get_policy().policy_arn(&arn).send().await.is_ok() {
+                    eprintln!("cleanup: deleting the boundary directly");
+                    if let Ok(out) = self.e.iam.list_entities_for_policy().policy_arn(&arn).send().await {
+                        for r in out.policy_roles() {
+                            if let Some(name) = r.role_name() {
+                                let _ = self
+                                    .e
+                                    .iam
+                                    .delete_role_permissions_boundary()
+                                    .role_name(name)
+                                    .send()
+                                    .await;
+                            }
+                        }
+                    }
+                    if let Err(e) = self.e.iam.delete_policy().policy_arn(&arn).send().await {
+                        eprintln!("cleanup: boundary: {e:?}");
+                    }
+                }
+            }
+            if *self.bucket_created.lock().unwrap() {
+                self.delete_bucket().await;
+            }
+        }
+
+        async fn delete_bucket(&self) {
+            let s3 = aws_sdk_s3::Client::new(&self.e.cfg);
+            loop {
+                let page = match s3.list_object_versions().bucket(&self.bucket).send().await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        use aws_sdk_s3::error::ProvideErrorMetadata;
+                        if e.code() != Some("NoSuchBucket") {
+                            eprintln!("cleanup: list versions of {}: {e:?}", self.bucket);
+                        }
+                        return;
+                    }
+                };
+                let mut ids = Vec::new();
+                for v in page.versions() {
+                    ids.push((v.key().unwrap_or_default().to_string(), v.version_id().map(str::to_string)));
+                }
+                for m in page.delete_markers() {
+                    ids.push((m.key().unwrap_or_default().to_string(), m.version_id().map(str::to_string)));
+                }
+                if ids.is_empty() {
+                    break;
+                }
+                for (key, version) in ids {
+                    if let Err(e) = s3
+                        .delete_object()
+                        .bucket(&self.bucket)
+                        .key(&key)
+                        .set_version_id(version)
+                        .send()
+                        .await
+                    {
+                        eprintln!("cleanup: delete {key}: {e:?}");
+                        return;
+                    }
+                }
+            }
+            match s3.delete_bucket().bucket(&self.bucket).send().await {
+                Ok(_) => eprintln!("cleanup: deleted bucket {}", self.bucket),
+                Err(e) => eprintln!("cleanup: delete bucket {}: {e:?}", self.bucket),
+            }
+        }
+    }
+
+    /// `e2e` plus the environment fixture's own cleanup, which runs first
+    /// (it needs the account admin, and the roles it destroys hold the
+    /// boundary).
+    async fn env_e2e<F, Fut>(body: F)
+    where
+        F: FnOnce(Arc<Env>) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        use futures_util::FutureExt;
+        e2e(|e| async move {
+            let env = Env::new(e).await;
+            let result = std::panic::AssertUnwindSafe(body(env.clone()))
+                .catch_unwind()
+                .await;
+            env.cleanup().await;
+            if let Err(panic) = result {
+                std::panic::resume_unwind(panic);
+            }
+        })
+        .await;
+    }
+
+    fn assert_ok(what: &str, outcome: &TofuOutcome, denied: &[String]) {
+        assert!(
+            outcome.ok,
+            "{what} failed: {:?}; denied actions: {denied:?}",
+            outcome.summary
+        );
+        assert!(denied.is_empty(), "{what} reported denied actions: {denied:?}");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn an_environment_admin_can_deploy_join_update_and_remove_an_environment() {
+        env_e2e(|t| async move {
+            let admin = t.admin().await;
+            let (keys, cfg, who) = t.session(&admin).await;
+            assert!(who.arn.contains(":assumed-role/"), "{}", who.arn);
+
+            // The state bucket, created and configured by the environment
+            // admin (s3:CreateBucket with the request tag, in-account).
+            t.ensure_bucket(&cfg, &who).await;
+            // Idempotent.
+            t.ensure_bucket(&cfg, &who).await;
+
+            t.ensure_boundary().await;
+
+            let name = format!("e2e{}", &uuid::Uuid::new_v4().simple().to_string()[..6]);
+            let found = t.scan(&cfg, &who).await;
+            assert_eq!(found.state_bucket, Knowable::Yes);
+            assert_eq!(found.boundary, Knowable::Yes);
+            deploy_refusal(&found, &name).expect("deploy is offered");
+
+            // Deploy, public network, as the environment admin only.
+            let vars = environment_vars(&name, &t.e.region, &NetworkChoice::Public).unwrap();
+            let (_, outcome, denied) = t
+                .run(
+                    ModuleKind::Environment,
+                    Deployment::Environment(&name),
+                    &vars,
+                    TofuOp::Apply,
+                    t.keys_env(&keys),
+                )
+                .await;
+            assert_ok("deploy", &outcome, &denied);
+
+            // Detected Ready with a valid record, joinable, not joined yet.
+            let found = t.scan(&cfg, &who).await;
+            let env = found
+                .environments
+                .iter()
+                .find(|x| x.name == name)
+                .unwrap_or_else(|| panic!("{name} not detected: {found:#?}"));
+            assert_eq!(env.state, EnvironmentState::Ready, "{env:#?}");
+            let info = env.info.clone().expect("a valid record");
+            assert_eq!(info.network_mode, "public");
+            assert!(info.assign_public_ip);
+            assert_eq!(info.subnet_ids.len(), 2);
+            assert!(env.actions.contains(&EnvironmentAction::Join), "{env:#?}");
+            assert_eq!(env.onboarding, Some(OnboardingState::NotJoined));
+
+            // A stale lock's conditional delete: a mismatched ETag is refused
+            // (412), the current one removes it.
+            {
+                let s3 = aws_sdk_s3::Client::new(&cfg);
+                let lock_key = format!("{}.tflock", state_key(Deployment::Environment(&name)));
+                let put = ok(
+                    "put a fake lock",
+                    s3.put_object()
+                        .bucket(&t.bucket)
+                        .key(&lock_key)
+                        .body(r#"{"ID":"e2e","Operation":"OperationTypeApply","Who":"e2e@test","Created":"2026-01-01T00:00:00Z"}"#.as_bytes().to_vec().into())
+                        .expected_bucket_owner(&who.account)
+                        .send()
+                        .await,
+                );
+                let etag = put.e_tag().expect("etag").to_string();
+                let head = ok(
+                    "head the lock",
+                    s3.head_object().bucket(&t.bucket).key(&lock_key).send().await,
+                );
+                assert_eq!(head.e_tag(), Some(etag.as_str()));
+                let found = t.scan(&cfg, &who).await;
+                let env = found.environments.iter().find(|x| x.name == name).unwrap();
+                assert!(
+                    matches!(&env.state, EnvironmentState::Deploying { lock: Some(l) } if l.who == "e2e@test"),
+                    "a fresh foreign lock reads as Deploying: {env:#?}"
+                );
+                let wrong = delete_lock_if_unchanged(
+                    &s3,
+                    &t.bucket,
+                    &who.account,
+                    &lock_key,
+                    "\"00000000000000000000000000000000\"",
+                )
+                .await
+                .expect_err("a mismatched ETag must not delete the lock");
+                assert!(wrong.to_string().contains(LOCK_CHANGED), "{wrong}");
+                ok(
+                    "the lock survives a mismatched delete",
+                    s3.head_object().bucket(&t.bucket).key(&lock_key).send().await,
+                );
+                delete_lock_if_unchanged(&s3, &t.bucket, &who.account, &lock_key, &etag)
+                    .await
+                    .unwrap_or_else(|e| panic!("conditional delete with the current ETag: {e}"));
+                let gone = s3.head_object().bucket(&t.bucket).key(&lock_key).send().await;
+                assert!(gone.is_err(), "the lock is still there after the delete");
+                eprintln!("conditional unlock: 412 on a mismatched ETag, deleted with the current one");
+            }
+
+            // Self-onboarding as the environment admin.
+            let (keys, cfg, who) = t.session(&admin).await;
+            let found = t.scan(&cfg, &who).await;
+            onboard_refusal(&found, &name).expect("join is offered");
+            let owner = validate_owner_id(&who.user_id).expect("owner id");
+            let okey = owner_key(&owner);
+            let (_, outcome, denied) = t
+                .run(
+                    ModuleKind::UserOnboard,
+                    Deployment::User { env: &name, owner_key: &okey },
+                    &onboarding_vars(&name, &t.e.region, &owner),
+                    TofuOp::Apply,
+                    t.keys_env(&keys),
+                )
+                .await;
+            assert_ok("onboard", &outcome, &denied);
+            let found = t.scan(&cfg, &who).await;
+            let env = found.environments.iter().find(|x| x.name == name).unwrap();
+            assert_eq!(env.onboarding, Some(OnboardingState::Joined), "{env:#?}");
+            let (task_role, exec_role) = user_role_names(&name, &okey);
+            for r in [&task_role, &exec_role] {
+                let role = ok("get the onboarded role", t.e.iam.get_role().role_name(r).send().await);
+                let boundary = role
+                    .role()
+                    .and_then(|r| r.permissions_boundary())
+                    .and_then(|b| b.permissions_boundary_arn())
+                    .unwrap_or_default()
+                    .to_string();
+                assert!(boundary.ends_with(&format!(":policy/{PERMISSIONS_BOUNDARY_NAME}")), "{r}: {boundary}");
+            }
+
+            // Update: the recorded network, the same module version: nothing
+            // to change.
+            let network = network_from_record(&info, None).expect("network from record");
+            let vars = environment_vars(&name, &t.e.region, &network).unwrap();
+            let (_, outcome, denied) = t
+                .run(
+                    ModuleKind::Environment,
+                    Deployment::Environment(&name),
+                    &vars,
+                    TofuOp::Apply,
+                    t.keys_env(&keys),
+                )
+                .await;
+            assert_ok("update", &outcome, &denied);
+            let summary = outcome.summary.clone().unwrap_or_default();
+            assert!(
+                summary.contains("0 added, 0 changed, 0 destroyed"),
+                "the update changed something: {summary}"
+            );
+
+            // Remove: the onboarding, then the environment (an admin's
+            // `tofu destroy` from a bundle; the same module and state).
+            let (keys, _, _) = t.session(&admin).await;
+            let (_, outcome, denied) = t
+                .run(
+                    ModuleKind::UserOnboard,
+                    Deployment::User { env: &name, owner_key: &okey },
+                    &onboarding_vars(&name, &t.e.region, &owner),
+                    TofuOp::Destroy,
+                    t.keys_env(&keys),
+                )
+                .await;
+            assert_ok("destroy the onboarding", &outcome, &denied);
+            let (_, outcome, denied) = t
+                .run(
+                    ModuleKind::Environment,
+                    Deployment::Environment(&name),
+                    &vars,
+                    TofuOp::Destroy,
+                    t.keys_env(&keys),
+                )
+                .await;
+            assert_ok("destroy the environment", &outcome, &denied);
+
+            // `tofu destroy` leaves an empty state object, which detection
+            // must read as no deployment at all.
+            let state = ok(
+                "read the destroyed state",
+                aws_sdk_s3::Client::new(&cfg)
+                    .get_object()
+                    .bucket(&t.bucket)
+                    .key(state_key(Deployment::Environment(&name)))
+                    .send()
+                    .await,
+            );
+            let bytes = state.body.collect().await.unwrap().into_bytes();
+            assert!(
+                is_empty_state(&String::from_utf8_lossy(&bytes)),
+                "the destroyed state is not empty: {}",
+                String::from_utf8_lossy(&bytes)
+            );
+            let found = t.scan(&cfg, &who).await;
+            assert!(
+                found.environments.iter().all(|x| x.name != name),
+                "{name} still detected after destroy: {found:#?}"
+            );
+
+            // The boundary, by its module, if this test made it.
+            if *t.boundary_created.lock().unwrap() {
+                let (_, outcome, denied) = t
+                    .run(
+                        ModuleKind::PermissionsBoundary,
+                        Deployment::Boundary,
+                        &boundary_vars(&t.e.region),
+                        TofuOp::Destroy,
+                        t.admin_env(),
+                    )
+                    .await;
+                assert_ok("destroy the boundary", &outcome, &denied);
+            }
+        })
+        .await;
+    }
+
+    /// About $0.05: one NAT gateway and its address for a few minutes.
+    #[tokio::test]
+    #[ignore]
+    async fn the_private_nat_mode_deploys() {
+        env_e2e(|t| async move {
+            let admin = t.admin().await;
+            let (keys, cfg, who) = t.session(&admin).await;
+            t.ensure_bucket(&cfg, &who).await;
+            let name = format!("e2e{}", &uuid::Uuid::new_v4().simple().to_string()[..6]);
+            let vars = environment_vars(&name, &t.e.region, &NetworkChoice::PrivateNat).unwrap();
+            let (_, outcome, denied) = t
+                .run(
+                    ModuleKind::Environment,
+                    Deployment::Environment(&name),
+                    &vars,
+                    TofuOp::Apply,
+                    t.keys_env(&keys),
+                )
+                .await;
+            assert_ok("deploy private-nat", &outcome, &denied);
+            let found = t.scan(&cfg, &who).await;
+            let env = found.environments.iter().find(|x| x.name == name).unwrap();
+            assert_eq!(env.state, EnvironmentState::Ready, "{env:#?}");
+            let info = env.info.as_ref().unwrap();
+            assert_eq!(info.network_mode, "private-nat");
+            assert!(!info.assign_public_ip);
+            let (keys, _, _) = t.session(&admin).await;
+            let (_, outcome, denied) = t
+                .run(
+                    ModuleKind::Environment,
+                    Deployment::Environment(&name),
+                    &vars,
+                    TofuOp::Destroy,
+                    t.keys_env(&keys),
+                )
+                .await;
+            assert_ok("destroy private-nat", &outcome, &denied);
+        })
+        .await;
+    }
 }

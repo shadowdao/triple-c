@@ -327,7 +327,27 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   admin credentials for a disposable account; `cargo test aws::live_tests -- --ignored
   --test-threads=1`) runs the check and real calls against throwaway `triple-c-e2e-*` roles,
   secrets and keys, and cleans them up. Re-run it after any policy change; the results are in
-  `aws/README.md` ("Live verification").
+  `aws/README.md` ("Live verification"). Its `environment` tests apply the real modules as a role
+  holding only the admin files (`cargo build` first: the runner they start is the built app
+  binary), in a throwaway state bucket.
+  **Environments are OpenTofu modules** (`aws/terraform/{environment,user-onboard,permissions-boundary}`;
+  spec D2–D10). `tofu_modules.rs` embeds them and is the **only** place the shared names are built
+  (environment, `/triple-c/environments/<env>` record, owner key, per-user roles, state bucket
+  `triple-c-tfstate-<account>-<region>`, state keys); its tests pin the HCL to those names, the
+  versions and tags, and `MODULE_CALLS` (every provider call) to the admin policy.
+  `tofu.rs` downloads the pinned OpenTofu (SHA-256 checked **before** extraction), writes a work
+  folder (`materialize`), builds tofu's environment from scratch (`child_env`: no inherited
+  `AWS_*`/`TF_*`, keys only in the environment) and runs `init` + `apply|destroy` **detached
+  (D10)**: the app binary re-executed with `--tofu-runner` (`main.rs` checks that first), in its
+  own session, logging to `apply.log`; liveness is the runner's `apply.lock`, never a PID; closing
+  the app never stops a run and the next start re-follows the log. `environments.rs` is detection
+  (records + state objects + locks; records are untrusted and capped; an empty state, which
+  `tofu destroy` leaves behind, is no deployment) and `ensure_state_bucket`;
+  `commands/environment_commands.rs` sequences ensure_tofu → ensure_state_bucket → materialize →
+  start → follow. **D2: strict tenancy gives each user their own EFS file system** (its policy
+  admits only their task role) from their onboarding module; the environment keeps only the shared
+  pieces. The app destroys only incomplete deployments (D6); a working environment is removed with
+  `tofu destroy` from an admin bundle (D5).
 - **`web_terminal/`** — Remote terminal access via axum HTTP+WebSocket server:
   - `server.rs` — Axum server lifecycle (start/stop), serves embedded HTML and handles WS upgrades
   - `ws_handler.rs` — Per-connection WebSocket handler with JSON protocol, session management, cleanup on disconnect

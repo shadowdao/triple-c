@@ -1095,24 +1095,38 @@ pub async fn unlock_aws_state(
         .map(|t| now.saturating_sub(t.secs()).max(0) as u64)
         .ok_or_else(|| other("The state lock's age is unknown, so it can't be removed safely"))?;
     stale_lock_refusal(age).map_err(other)?;
+    delete_lock_if_unchanged(&s3, &ctx.bucket(), &ctx.who.account, &lock_key, &etag).await?;
+    log::info!("Removed the stale state lock {lock_key}");
+    Ok(())
+}
+
+/// The lock was replaced since it was read: its ETag no longer matches.
+pub(crate) const LOCK_CHANGED: &str = "The state lock changed since it was checked; detect again";
+
+/// Delete `lock_key` only if its ETag is still `etag` (S3 conditional
+/// delete, `If-Match`); [`LOCK_CHANGED`] when it is not.
+pub(crate) async fn delete_lock_if_unchanged(
+    s3: &aws_sdk_s3::Client,
+    bucket: &str,
+    account: &str,
+    lock_key: &str,
+    etag: &str,
+) -> Result<(), AwsError> {
     if let Err(e) = s3
         .delete_object()
-        .bucket(ctx.bucket())
-        .key(&lock_key)
-        .if_match(&etag)
-        .expected_bucket_owner(&ctx.who.account)
+        .bucket(bucket)
+        .key(lock_key)
+        .if_match(etag)
+        .expected_bucket_owner(account)
         .send()
         .await
     {
         let status = e.raw_response().map(|r| r.status().as_u16());
         if is_precondition_failed(e.code(), status) {
-            return Err(other(
-                "The state lock changed since it was checked; detect again",
-            ));
+            return Err(other(LOCK_CHANGED));
         }
         return Err(crate::aws::classify_sdk_error("s3:DeleteObject", &e));
     }
-    log::info!("Removed the stale state lock {lock_key}");
     Ok(())
 }
 
