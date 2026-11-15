@@ -18,11 +18,13 @@ use crate::docker;
 use crate::models::{AppSettings, Project};
 use crate::models::container_config;
 
-/// The host a project runs on. One variant today; an AWS variant will carry
-/// the connection, region and environment (see the spec's data model).
+/// The host a project runs on: the local Docker daemon, or an ECS Fargate
+/// task in an AWS environment (`aws_host.rs`; the connection, region and
+/// environment come from the project).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectHost {
     Docker,
+    Aws,
 }
 
 /// An agent target is a way *into* a container, not a handle on its
@@ -41,8 +43,12 @@ pub struct DiscardLeftovers {
 }
 
 impl ProjectHost {
-    pub fn for_project(_project: &Project) -> Self {
-        ProjectHost::Docker
+    pub fn for_project(project: &Project) -> Self {
+        if project.is_aws() {
+            ProjectHost::Aws
+        } else {
+            ProjectHost::Docker
+        }
     }
 
     /// Make sure the project's container exists, matches the project's
@@ -60,6 +66,7 @@ impl ProjectHost {
             ProjectHost::Docker => docker_ensure_started(project, settings, progress)
                 .await
                 .map(ContainerTarget::docker),
+            ProjectHost::Aws => super::aws_host::ensure_started(project, settings, progress).await,
         }
     }
 
@@ -72,24 +79,66 @@ impl ProjectHost {
             ProjectHost::Docker => Ok(docker::find_existing_container(project)
                 .await?
                 .map(ContainerTarget::docker)),
+            // The tunnel registry: an AWS project's target exists while its
+            // tunnel is open.
+            ProjectHost::Aws => Ok(ContainerTarget::for_project(project)),
         }
     }
 
+    /// Stop the container behind `target`. For an agent target that is the
+    /// ECS task behind a registered tunnel (`StopTask`, reason "Stopped from
+    /// Triple-C"), and the tunnel is closed.
     pub async fn stop(&self, target: &ContainerTarget) -> Result<(), String> {
         match target {
             ContainerTarget::Docker { container_id } => docker::stop_container(container_id).await,
-            ContainerTarget::Agent(_) => Err(AGENT_LIFECYCLE.replace("{op}", "Stopping")),
+            ContainerTarget::Agent(ep) => super::aws_host::stop_endpoint(ep)
+                .await
+                .unwrap_or_else(|| Err(AGENT_LIFECYCLE.replace("{op}", "Stopping"))),
+        }
+    }
+
+    /// Stop a project's container whether or not the app holds a target for
+    /// it. Docker: the stored container. AWS: the tunnel's task, else the
+    /// stored task ARN, else the project's live task — a project whose
+    /// tunnel could not be re-opened must still be stoppable.
+    pub async fn stop_project(&self, project: &Project, settings: &AppSettings) -> Result<(), String> {
+        match self {
+            ProjectHost::Docker => match ContainerTarget::for_project(project) {
+                Some(t) => self.stop(&t).await,
+                None => Ok(()),
+            },
+            ProjectHost::Aws => super::aws_host::stop_project(project, settings).await,
         }
     }
 
     /// Stop (errors ignored — a stopped container is the goal) and remove.
+    /// An agent target is stopped; its resources go with
+    /// [`Self::remove_aws_resources`].
     pub async fn remove(&self, target: &ContainerTarget) -> Result<(), String> {
         match target {
             ContainerTarget::Docker { container_id } => {
                 let _ = docker::stop_container(container_id).await;
                 docker::remove_container(container_id).await
             }
-            ContainerTarget::Agent(_) => Err(AGENT_LIFECYCLE.replace("{op}", "Removing")),
+            ContainerTarget::Agent(ep) => super::aws_host::stop_endpoint(ep)
+                .await
+                .unwrap_or_else(|| Err(AGENT_LIFECYCLE.replace("{op}", "Removing"))),
+        }
+    }
+
+    /// AWS: stop the task and remove the project's resources — task
+    /// definition revisions, the secret (7-day recovery window) and, only
+    /// with `discard_data`, the EFS access point. Docker: nothing (its state
+    /// goes with [`Self::discard_project_state`]).
+    pub async fn remove_aws_resources(
+        &self,
+        project: &Project,
+        settings: &AppSettings,
+        discard_data: bool,
+    ) -> Result<(), String> {
+        match self {
+            ProjectHost::Docker => Ok(()),
+            ProjectHost::Aws => super::aws_host::remove_resources(project, settings, discard_data).await,
         }
     }
 
@@ -107,6 +156,8 @@ impl ProjectHost {
                 left.volumes = docker::remove_project_volumes(project).await;
                 left
             }
+            // Removed by `remove_aws_resources`, which needs the settings.
+            ProjectHost::Aws => DiscardLeftovers::default(),
         }
     }
 
@@ -118,6 +169,7 @@ impl ProjectHost {
                 docker::remove_legacy_mcp_containers(&project.id).await;
                 docker::remove_legacy_project_network(&project.id).await;
             }
+            ProjectHost::Aws => {}
         }
     }
 }

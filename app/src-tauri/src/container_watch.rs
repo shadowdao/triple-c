@@ -219,13 +219,28 @@ pub fn spawn(
     cancel: watch::Receiver<bool>,
 ) -> tauri::async_runtime::JoinHandle<()> {
     tauri::async_runtime::spawn(async move {
-        run(store, source, cancel, |p, reason| {
+        let store_for_aws = store.clone();
+        run(store, source, cancel, move |p, reason| {
             log::warn!(
                 "Project '{}' ({}): its container stopped without the app asking ({:?}) — marking Stopped",
                 p.name,
                 p.id,
                 reason
             );
+            // An AWS task that stopped: its tunnel leads nowhere now, and its
+            // task ARN is history (the data's access point stays).
+            if p.is_aws() {
+                if let Some(a) = p.aws.as_ref() {
+                    let _ = store_for_aws.set_aws_runtime(
+                        &p.id,
+                        None,
+                        a.access_point_id.clone(),
+                        a.task_definition_arn.clone(),
+                    );
+                }
+                let id = p.id.clone();
+                tauri::async_runtime::spawn(async move { crate::host::tunnels::close(&id).await });
+            }
             let _ = app.emit(CONTAINER_EXITED_EVENT, ContainerExited { project: p, reason });
         })
         .await;

@@ -34,6 +34,11 @@ pub async fn get_container_info(
         .projects_store
         .get(&project_id)
         .ok_or_else(|| format!("Project {} not found", project_id))?;
+    // An AWS project has no Docker container (its own name could match a
+    // stale one from before it moved to AWS).
+    if project.is_aws() {
+        return Ok(None);
+    }
     docker::get_container_info(&project).await
 }
 

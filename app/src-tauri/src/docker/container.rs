@@ -402,7 +402,7 @@ pub(super) fn compute_env_fingerprint(custom_env_vars: &[EnvVar]) -> String {
 ///
 /// The returned token is never logged and never leaves this module except as
 /// the env var value handed to Docker.
-fn shared_claude_auth(project: &Project) -> Option<(String, String)> {
+pub(super) fn shared_claude_auth(project: &Project) -> Option<(String, String)> {
     if project.backend != Backend::Anthropic || !project.use_shared_auth_token {
         return None;
     }

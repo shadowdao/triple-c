@@ -292,6 +292,12 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   when it drops, so an `AgentEndpoint` stays valid. The `StartSession` token goes to the plugin
   through its environment, never argv, and the plugin's environment is stripped of every
   inherited `AWS_*` variable before the session's own credentials are added.
+  `aws_host.rs` is `ProjectHost::Aws` (an ECS Fargate task per project; a running task is
+  attached to with the token read back from its secret, never rotated; a task a failed start ran
+  is stopped again) and `tunnels.rs` the registry of open tunnels by project — an AWS project's
+  `ContainerTarget::for_project` is its tunnel's endpoint, its stored `container_id` is that
+  endpoint's URL, and the AWS death watch confirms exits through the registry. Shutdown closes
+  every tunnel. AWS SDK calls stay in `aws/` (`runtime.rs`, `tasks.rs`, `workspace.rs`).
   `agent.rs` reuses `docker/exec.rs`'s `OneshotOutput`, host-file reader and uid probe so the two
   variants cannot drift; an `Agent` target's token never appears in `Debug` or error text.
   **Container-interior code must go through `ContainerTarget`, never `docker::exec`, bollard or

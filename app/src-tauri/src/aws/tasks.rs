@@ -337,6 +337,7 @@ pub fn quota_or(e: AwsError) -> AwsError {
     }
 }
 
+#[allow(dead_code)] // for the UI's start errors (Task 8)
 pub fn is_quota_error(e: &AwsError) -> bool {
     matches!(e, AwsError::QuotaExceeded { .. })
 }
@@ -480,6 +481,7 @@ async fn stopped_error<A: TaskApi>(api: &A, logs: &TaskLogs, t: &TaskInfo) -> Aw
 // ----------------------------------------------------------- stop / watch
 
 /// Why a task stopped, as the app reports it (spec, "Lifecycle and status").
+#[allow(dead_code)] // the stop reasons the UI shows (Task 8)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StopKind {
     /// Exited on its own (the essential container ended, idle stop, or AWS
@@ -493,6 +495,7 @@ pub enum StopKind {
     UserInitiated,
 }
 
+#[allow(dead_code)] // Task 8
 pub fn classify_stop(info: &TaskInfo) -> StopKind {
     match info.stop_code.as_deref() {
         Some("SpotInterruption") => StopKind::Spot,

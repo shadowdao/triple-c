@@ -332,6 +332,19 @@ pub fn run() {
                 crate::host::watch::ExitSource::Docker,
                 lifecycle_setup.cancellation(),
             ));
+            // The same for AWS projects: a DescribeTasks poll every 15 s over
+            // the tasks of Running AWS projects (none: no AWS calls at all).
+            lifecycle_setup.track(container_watch::spawn(
+                app.handle().clone(),
+                projects_store_setup.clone(),
+                crate::host::watch::ExitSource::Aws(crate::host::watch::AwsWatch::new(
+                    std::sync::Arc::new(crate::host::aws_host::StoreTaskLookup {
+                        projects: projects_store_setup.clone(),
+                        settings: settings_store_setup.clone(),
+                    }),
+                )),
+                lifecycle_setup.cancellation(),
+            ));
 
             // Marketplaces: refresh each once at startup, in the background.
             // Failures are logged, not toasted — the Marketplace tab shows them.
@@ -509,6 +522,9 @@ pub fn run() {
                             exec_manager.close_all_sessions(),
                             auth_bridge.stop_all(),
                             browser_view::manager().stop_all(),
+                            // Each AWS tunnel is a session-manager-plugin
+                            // child that `exit` would not end.
+                            crate::host::tunnels::close_all(),
                         );
                     };
 

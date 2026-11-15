@@ -655,6 +655,7 @@ pub async fn add_project(
 #[tauri::command]
 pub async fn remove_project(
     project_id: String,
+    discard_data: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<ProjectRemovalReport, String> {
     // **H-2: the only writer of these three categories that held nothing.**
@@ -672,6 +673,32 @@ pub async fn remove_project(
     // into a toast, so the row stays and the message names what is running.
     let _guard =
         crate::project_lock::try_acquire(&project_id, crate::project_lock::ProjectOp::Destroy)?;
+
+    // An AWS project's task and resources go first, and a failure keeps the
+    // project: its record is the only handle on a billed task and its
+    // secret. Its data (the EFS access point) goes only when asked.
+    if let Some(project) = state.projects_store.get(&project_id).filter(|p| p.is_aws()) {
+        let settings = state.settings_store.get();
+        if let Some(target) = ContainerTarget::for_project(&project) {
+            state.exec_manager.close_sessions_for_container(target.id()).await;
+        }
+        let connection_exists = project
+            .host_id
+            .as_deref()
+            .is_some_and(|id| settings.hosts.iter().any(|h| h.id == id));
+        if connection_exists {
+            ProjectHost::for_project(&project)
+                .remove_aws_resources(&project, &settings, discard_data.unwrap_or(false))
+                .await?;
+        } else {
+            log::warn!(
+                "Project {}: its AWS connection no longer exists, so its AWS resources can't be \
+                 removed from here",
+                project_id
+            );
+            crate::host::tunnels::close(&project_id).await;
+        }
+    }
 
     // Release any host loopback ports the auth bridge holds for this project
     // before the container (and the project record) go away.
@@ -1150,10 +1177,22 @@ fn validate_aws_update(
             )
         }
     }
-    if (stored.host_id != project.host_id || stored.aws_placement != project.aws_placement)
-        && stored.status != ProjectStatus::Stopped
-    {
+    let moved = stored.host_id != project.host_id || stored.aws_placement != project.aws_placement;
+    if moved && stored.status != ProjectStatus::Stopped {
         return Err("Stop the project before changing its host or placement".into());
+    }
+    // The task, access point and task definition live in the stored
+    // connection's account and region; moving the project would orphan them.
+    if moved
+        && stored.aws.as_ref().is_some_and(|a| {
+            a.task_arn.is_some() || a.access_point_id.is_some() || a.task_definition_arn.is_some()
+        })
+    {
+        return Err(
+            "This project still has AWS resources (a task, its data's access point or task \
+             definitions) where it runs now; remove the workspace's AWS resources first"
+                .into(),
+        );
     }
     Ok(())
 }
@@ -1359,6 +1398,21 @@ async fn start_project_container_locked(
 
     // Update project with container info using granular methods (Issue 14: TOCTOU)
     state.projects_store.set_container_id(&project_id, Some(container_id.clone()))?;
+    // AWS: the task's handles, store-owned like the container id. The target
+    // id stored above is the tunnel's endpoint URL, which is what the death
+    // watch reports a stopped task as.
+    if project.is_aws() {
+        if let Some((task_arn, access_point_id, task_definition_arn)) =
+            crate::host::tunnels::runtime(&project_id)
+        {
+            state.projects_store.set_aws_runtime(
+                &project_id,
+                Some(task_arn),
+                access_point_id,
+                Some(task_definition_arn),
+            )?;
+        }
+    }
     state.projects_store.update_status(&project_id, ProjectStatus::Running)?;
 
     // Arm the auth bridge if this project opted in. Purely host-side, so it
@@ -1404,7 +1458,30 @@ pub async fn stop_project_container(
     // Drop host listeners first: they only make sense while the container runs.
     state.auth_bridge.stop(&project_id).await;
 
-    if let Some(container) = ContainerTarget::for_project(&project) {
+    if project.is_aws() {
+        // A failed StopTask leaves a billed task running, so unlike Docker it
+        // is not papered over: the project keeps its status and the user
+        // sees why (expired SSO, typically), and can retry.
+        emit_progress(&app_handle, &project_id, "Stopping task...");
+        if let Some(container) = ContainerTarget::for_project(&project) {
+            state.exec_manager.close_sessions_for_container(container.id()).await;
+        }
+        let settings = state.settings_store.get();
+        if let Err(e) = ProjectHost::for_project(&project).stop_project(&project, &settings).await {
+            log::warn!("Stop failed for project {}: {}", project_id, e);
+            let _ = state.projects_store.update_status(&project_id, project.status.clone());
+            return Err(format!("Could not stop the task: {e}"));
+        }
+        if let Some(a) = project.aws.as_ref() {
+            state.projects_store.set_aws_runtime(
+                &project_id,
+                None,
+                a.access_point_id.clone(),
+                a.task_definition_arn.clone(),
+            )?;
+        }
+        state.projects_store.set_container_id(&project_id, None)?;
+    } else if let Some(container) = ContainerTarget::for_project(&project) {
         // Close exec sessions for this project
         emit_progress(&app_handle, &project_id, "Stopping container...");
         state.exec_manager.close_sessions_for_container(container.id()).await;
@@ -1438,6 +1515,7 @@ pub async fn rebuild_project_container(
         .projects_store
         .get(&project_id)
         .ok_or_else(|| format!("Project {} not found", project_id))?;
+    refuse_aws(&project, "Reset")?;
 
     // Reset supersedes any migration decision that was still pending: the
     // snapshot image and both volumes are about to go, so a surviving record
@@ -1513,6 +1591,20 @@ pub async fn rebuild_project_container(
 /// [`crate::commands::migration_commands::reconcile_migration`]. The migration
 /// pass runs over *every* project, not just the Running ones, because a project
 /// whose container was removed mid-migration reports Stopped.
+/// How long reconcile waits on AWS for one project.
+const AWS_RECONCILE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Refuse a Docker-only operation on an AWS project.
+pub(crate) fn refuse_aws(project: &Project, what: &str) -> Result<(), String> {
+    if project.is_aws() {
+        return Err(format!(
+            "{what} is not available for a project that runs on AWS; it applies to local \
+             Docker containers only"
+        ));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn reconcile_project_statuses(
     app_handle: tauri::AppHandle,
@@ -1520,7 +1612,7 @@ pub async fn reconcile_project_statuses(
 ) -> Result<Vec<Project>, String> {
     let projects = state.projects_store.list();
 
-    for project in &projects {
+    for project in projects.iter().filter(|p| !p.is_aws()) {
         crate::commands::migration_commands::reconcile_migration(project, &app_handle).await;
     }
 
@@ -1551,6 +1643,28 @@ pub async fn reconcile_project_statuses(
         // Broadened from `is_migrating` to the whole lock for exactly that
         // reason — the migration was never the only operation with a gap.
         if crate::project_lock::held(&project.id).is_some() {
+            continue;
+        }
+
+        // AWS: ECS is the authority. One DescribeTasks per project, bounded
+        // so a slow or unreachable AWS can't hold the app's start; a live
+        // task's tunnel is re-opened in the background.
+        if project.is_aws() {
+            let settings = state.settings_store.get();
+            let store = state.projects_store.clone();
+            if tokio::time::timeout(
+                AWS_RECONCILE_TIMEOUT,
+                crate::host::aws_host::reconcile(project, &settings, store),
+            )
+            .await
+            .is_err()
+            {
+                log::warn!(
+                    "Project {}: AWS did not answer within {}s; status left as is",
+                    project.id,
+                    AWS_RECONCILE_TIMEOUT.as_secs()
+                );
+            }
             continue;
         }
 
@@ -2278,5 +2392,46 @@ mod tests {
         assert!(validate_aws_update(&running, &moved, &hosts).is_err());
         let mut edited = running.clone(); edited.aws.as_mut().unwrap().spot = true;
         assert!(validate_aws_update(&running, &edited, &hosts).is_ok());
+    }
+
+    #[test]
+    fn a_project_with_aws_resources_cannot_be_moved_off_its_host() {
+        let hosts = vec![host("h1"), host("h2")];
+        let mut stored = aws_project();
+        stored.aws.as_mut().unwrap().access_point_id = Some("fsap-1".into());
+        let mut local = stored.clone();
+        local.host_id = None;
+        local.aws_placement = None;
+        local.aws = None;
+        let e = validate_aws_update(&stored, &local, &hosts).unwrap_err();
+        assert!(e.contains("remove the workspace's AWS resources first"), "{e}");
+        let mut other = stored.clone();
+        other.host_id = Some("h2".into());
+        assert!(validate_aws_update(&stored, &other, &hosts).is_err());
+        let mut moved = stored.clone();
+        moved.aws_placement.as_mut().unwrap().environment = "prod".into();
+        assert!(validate_aws_update(&stored, &moved, &hosts).is_err());
+        for set in [
+            |a: &mut crate::models::AwsWorkspaceConfig| a.task_arn = Some("t".into()),
+            |a: &mut crate::models::AwsWorkspaceConfig| a.task_definition_arn = Some("td".into()),
+        ] {
+            let mut st = aws_project();
+            set(st.aws.as_mut().unwrap());
+            assert!(validate_aws_update(&st, &local, &hosts).is_err());
+        }
+        // No handles: free to move. Other edits are fine with handles.
+        assert!(validate_aws_update(&aws_project(), &local, &hosts).is_ok());
+        let mut edited = stored.clone();
+        edited.aws.as_mut().unwrap().cpu = 2048;
+        edited.aws.as_mut().unwrap().memory_mib = 8192;
+        assert!(validate_aws_update(&stored, &edited, &hosts).is_ok());
+    }
+
+    #[test]
+    fn docker_only_operations_refuse_aws_projects() {
+        assert!(refuse_aws(&aws_project(), "Reset").unwrap_err().contains("Reset is not available"));
+        let mut local = aws_project();
+        local.host_id = None;
+        assert!(refuse_aws(&local, "Reset").is_ok());
     }
 }

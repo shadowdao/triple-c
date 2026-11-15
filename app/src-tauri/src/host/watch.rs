@@ -27,8 +27,6 @@ pub const AWS_POLL_INTERVAL: Duration = Duration::from_secs(15);
 #[derive(Clone)]
 pub enum ExitSource {
     Docker,
-    // Constructed by the AWS host (phase 5, Task 6); until then only by tests.
-    #[allow(dead_code)]
     Aws(AwsWatch),
 }
 
@@ -80,7 +78,6 @@ pub struct AwsWatch {
     interval: Duration,
 }
 
-#[allow(dead_code)] // Task 6
 impl AwsWatch {
     pub fn new(lookup: Arc<dyn AwsTaskLookup>) -> Self {
         Self::every(lookup, AWS_POLL_INTERVAL)
@@ -180,9 +177,10 @@ impl ContainerTarget {
             ContainerTarget::Docker { container_id } => docker::events::has_exited(container_id).await,
             // The agent can only say "I answer" or "I don't"; silence is not a
             // positive exit (an SSM blip looks the same). Only the host that
-            // runs the container can confirm a death — an AWS host answers
-            // from ECS — so through the agent alone this never confirms one.
-            ContainerTarget::Agent(_) => false,
+            // runs the container can confirm a death: the AWS watch records
+            // the targets whose task ECS reports STOPPED in the tunnel
+            // registry (R3), and nothing else ever confirms one.
+            ContainerTarget::Agent(ep) => super::tunnels::is_stopped(ep.base_url.as_str()),
         }
     }
 }

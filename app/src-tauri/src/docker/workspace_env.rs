@@ -419,6 +419,39 @@ pub(crate) fn workspace_env(
     env
 }
 
+
+/// [`workspace_env`] with its inputs resolved from `settings` exactly as
+/// `create_container` resolves them (the CA from disk, the shared Claude
+/// token from the keychain), for a host that does not create a Docker
+/// container. Also returns the resolved CA, whose files the caller ships.
+pub(crate) fn workspace_env_from_settings(
+    project: &Project,
+    settings: &crate::models::AppSettings,
+) -> Result<crate::host::aws_host::AwsEnv, String> {
+    let shared_claude = super::container::shared_claude_auth(project);
+    let effective_ca_path =
+        resolve_with_global(project.ca_cert_path.as_deref(), settings.ca_cert_path.as_deref());
+    let resolved_ca = ca_certs::resolve(effective_ca_path)?;
+    let pairs = workspace_env(
+        project,
+        &WorkspaceEnvInputs {
+            global_aws: &settings.global_aws,
+            global_ollama: &settings.global_ollama,
+            global_llamacpp: &settings.global_llamacpp,
+            global_openai_compatible: &settings.global_openai_compatible,
+            global_claude_instructions: settings.global_claude_instructions.as_deref(),
+            global_custom_env_vars: &settings.global_custom_env_vars,
+            timezone: settings.timezone.as_deref(),
+            global_claude_code_settings: settings.global_claude_code_settings.as_ref(),
+            default_git_user_name: settings.default_git_user_name.as_deref(),
+            default_git_user_email: settings.default_git_user_email.as_deref(),
+            resolved_ca: resolved_ca.as_ref(),
+            shared_claude_token: shared_claude.as_ref().map(|(token, _)| token.as_str()),
+        },
+    );
+    Ok((pairs, resolved_ca))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::ca_certs::ResolvedCa;

@@ -204,6 +204,7 @@ fn serialize_payload(m: &BTreeMap<String, String>) -> Result<String, String> {
 /// `TRIPLEC_REPOS`, `TRIPLEC_WIP_PUSH` = `1`/`0`, `TRIPLEC_IDLE_STOP_MINUTES`
 /// when on, `TRIPLEC_STORAGE` = `ephemeral`/`hybrid`), keys sorted. Fails
 /// when it would exceed 65,536 bytes.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn project_secret_payload(
     env_pairs: &[(String, String)],
     agent_token: &str,

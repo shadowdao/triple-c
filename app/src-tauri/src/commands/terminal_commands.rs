@@ -160,7 +160,9 @@ pub async fn open_terminal_session(
         .get(&project_id)
         .ok_or_else(|| format!("Project {} not found", project_id))?;
 
-    let target = ContainerTarget::for_project(&project)
+    // Waits while an AWS project's tunnel is being re-opened after a restart.
+    let target = ContainerTarget::for_project_waiting(&project)
+        .await
         .ok_or_else(|| "Container not running".to_string())?;
 
     if let Some(id) = resume_session_id.as_deref() {
