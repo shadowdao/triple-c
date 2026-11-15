@@ -228,4 +228,96 @@ describe("HostsSettings", () => {
     await waitFor(() => expect(screen.queryByText("Prod")).toBeNull());
     expect(invoke).toHaveBeenCalledWith("remove_host_connection", { id: "h1" });
   });
+
+  it("never renders a no-op Sign in when the add itself rejects with sso_expired", async () => {
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_aws_profiles") return ["dev"];
+      if (cmd === "add_aws_profile_connection") throw { kind: "sso_expired", profile: "dev" };
+      throw new Error(`unexpected ${cmd}`);
+    });
+    render(<HostsSettings />);
+    await screen.findByRole("option", { name: "dev" });
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Dev" } });
+    fireEvent.change(screen.getByLabelText("Profile"), { target: { value: "dev" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add connection" }));
+    expect(await screen.findByText("Your SSO session for profile dev has expired.")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Sign in" })).toBeNull();
+    expect(screen.getByText("aws sso login --profile dev")).toBeInTheDocument();
+  });
+
+  it("never re-runs the add when the settings refresh fails after a successful add", async () => {
+    let settingsCalls = 0;
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_aws_profiles") return ["dev"];
+      if (cmd === "add_aws_profile_connection") return conn;
+      if (cmd === "get_settings") {
+        if (settingsCalls++ === 0) throw "boom";
+        return { hosts: [conn] };
+      }
+      if (cmd === "aws_connection_identity") return identity;
+      throw new Error(`unexpected ${cmd}`);
+    });
+    render(<HostsSettings />);
+    await screen.findByRole("option", { name: "dev" });
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Dev" } });
+    fireEvent.change(screen.getByLabelText("Profile"), { target: { value: "dev" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add connection" }));
+    expect(await screen.findByText(/could not be refreshed/)).toBeInTheDocument();
+    expect(invoke.mock.calls.filter((c) => c[0] === "add_aws_profile_connection")).toHaveLength(1);
+  });
+
+  it("shows a message when the profile list cannot be read", async () => {
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_aws_profiles") throw "no config";
+      throw new Error(`unexpected ${cmd}`);
+    });
+    render(<HostsSettings />);
+    expect(await screen.findByText(/Couldn't read your AWS profiles: no config/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("radio", { name: "Access keys" }));
+    expect(screen.getByLabelText("Access key ID")).toBeInTheDocument();
+  });
+
+  it("shows a message when copying the policy fails", async () => {
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_aws_profiles") return [];
+      if (cmd === "check_aws_permissions") return report({});
+      if (cmd === "aws_policy_document") return "{}";
+      throw new Error(`unexpected ${cmd}`);
+    });
+    Object.assign(navigator, { clipboard: { writeText: vi.fn().mockRejectedValue(new Error("denied")) } });
+    render(<HostsSettings />);
+    fireEvent.click(screen.getByRole("button", { name: "Check Prod" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Copy admin policy" }));
+    expect(await screen.findByText(/Could not copy the policy: denied/)).toBeInTheDocument();
+  });
+
+  it.each([
+    [{ kind: "profile_not_found", profile: "ghost" }, "Profile ghost was not found in your AWS config, or has no credentials."],
+    [
+      { kind: "keys_missing" },
+      "The access keys for this connection are missing from the keychain. Remove and re-add the connection.",
+    ],
+  ])("a failed Check shows its error: %j", async (err, text) => {
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_aws_profiles") return [];
+      if (cmd === "check_aws_permissions") throw err;
+      throw new Error(`unexpected ${cmd}`);
+    });
+    render(<HostsSettings />);
+    fireEvent.click(screen.getByRole("button", { name: "Check Prod" }));
+    expect(await screen.findByText(text)).toBeInTheDocument();
+    expect(screen.queryByTestId("permission-report")).toBeNull();
+  });
+
+  it("moves focus to Confirm when removing, and back to Remove on cancel", async () => {
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_aws_profiles") return [];
+      throw new Error(`unexpected ${cmd}`);
+    });
+    render(<HostsSettings />);
+    fireEvent.click(screen.getByRole("button", { name: "Remove Prod" }));
+    expect(screen.getByRole("button", { name: "Confirm remove Prod" })).toHaveFocus();
+    fireEvent.click(within(screen.getByTestId("host-h1")).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Remove Prod" })).toHaveFocus());
+  });
 });

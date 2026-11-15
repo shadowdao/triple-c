@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useSettings } from "../../hooks/useSettings";
 import {
   addAwsKeysConnection,
@@ -72,13 +72,19 @@ function ErrorLine({
   signingIn,
 }: {
   failure: Failure;
-  onSignIn: () => void;
+  /** Absent when there is no saved connection to sign in with. */
+  onSignIn?: () => void;
   signingIn: boolean;
 }) {
   return (
     <div role="alert" className="text-xs text-[var(--error)] leading-snug flex items-center gap-2 flex-wrap">
       <span>{awsErrorMessage(failure.error)}</span>
-      {failure.error.kind === "sso_expired" && (
+      {failure.error.kind === "sso_expired" && !onSignIn && (
+        <span>
+          Sign in with <code>aws sso login --profile {failure.error.profile}</code> and try again.
+        </span>
+      )}
+      {failure.error.kind === "sso_expired" && onSignIn && (
         <Button size="sm" variant="secondary" onClick={onSignIn} disabled={signingIn}>
           {signingIn ? "Signing in…" : "Sign in"}
         </Button>
@@ -188,6 +194,16 @@ function ConnectionRow({ host }: { host: HostConnection }) {
   const [report, setReport] = useState<PermissionReport | null>(null);
   const [failure, setFailure] = useState<Failure | null>(null);
   const auth = host.kind.auth;
+  const rowRef = useRef<HTMLLIElement>(null);
+  const focusIn = (key: string) =>
+    rowRef.current?.querySelector<HTMLElement>(`[data-focus="${key}"]`)?.focus();
+  useEffect(() => {
+    if (confirmRemove) focusIn("confirm-remove");
+  }, [confirmRemove]);
+  const cancelRemove = () => {
+    setConfirmRemove(false);
+    requestAnimationFrame(() => focusIn("remove"));
+  };
 
   const runCheck = async () => {
     setBusy(true);
@@ -244,6 +260,7 @@ function ConnectionRow({ host }: { host: HostConnection }) {
 
   return (
     <li
+      ref={rowRef}
       data-testid={`host-${host.id}`}
       className="border border-[var(--border-color)] rounded-[var(--radius-control)] p-2.5 space-y-1.5"
     >
@@ -282,7 +299,7 @@ function ConnectionRow({ host }: { host: HostConnection }) {
               Edit
             </Button>
             {!confirmRemove && (
-              <Button size="sm" variant="danger" onClick={() => setConfirmRemove(true)} aria-label={`Remove ${host.name}`}>
+              <Button data-focus="remove" size="sm" variant="danger" onClick={() => setConfirmRemove(true)} aria-label={`Remove ${host.name}`}>
                 Remove
               </Button>
             )}
@@ -292,10 +309,10 @@ function ConnectionRow({ host }: { host: HostConnection }) {
       {confirmRemove && (
         <div role="alertdialog" aria-label={`Remove ${host.name}?`} className="flex items-center gap-2 flex-wrap text-xs">
           <span>Remove {host.name}? Its stored credentials are deleted.</span>
-          <Button size="sm" variant="danger" onClick={remove} disabled={busy} aria-label={`Confirm remove ${host.name}`}>
+          <Button data-focus="confirm-remove" size="sm" variant="danger" onClick={remove} disabled={busy} aria-label={`Confirm remove ${host.name}`}>
             Confirm remove
           </Button>
-          <Button size="sm" onClick={() => setConfirmRemove(false)}>
+          <Button size="sm" onClick={cancelRemove}>
             Cancel
           </Button>
         </div>
@@ -321,6 +338,7 @@ function AddConnectionForm() {
   const [signingIn, setSigningIn] = useState(false);
   const [signedInAs, setSignedInAs] = useState<string | null>(null);
   const [failure, setFailure] = useState<Failure | null>(null);
+  const [profilesError, setProfilesError] = useState<string | null>(null);
   const [pendingId, setPendingId] = useState<string | null>(null);
 
   useEffect(() => {
@@ -329,8 +347,11 @@ function AddConnectionForm() {
       .then((p) => {
         if (!cancelled) setProfiles(p);
       })
-      .catch(() => {
-        if (!cancelled) setProfiles([]);
+      .catch((e) => {
+        if (!cancelled) {
+          setProfiles([]);
+          setProfilesError(awsErrorMessage(toAwsError(e)));
+        }
       });
     return () => {
       cancelled = true;
@@ -353,6 +374,19 @@ function AddConnectionForm() {
     }
   };
 
+  /** Everything after a successful add. Retrying never re-runs the add. */
+  const afterAdd = async (id: string) => {
+    const refreshed = await loadSettings();
+    if (!refreshed) {
+      setFailure({
+        error: { kind: "other", message: "The connection was added, but the settings list could not be refreshed." },
+        retry: () => afterAdd(id),
+      });
+      return;
+    }
+    await verify(id);
+  };
+
   const submit = async () => {
     setBusy(true);
     setFailure(null);
@@ -370,8 +404,7 @@ function AddConnectionForm() {
       }
       setName("");
       setPendingId(added.id);
-      await loadSettings();
-      await verify(added.id);
+      await afterAdd(added.id);
     } catch (e) {
       setFailure({ error: toAwsError(e), retry: submit });
     } finally {
@@ -416,7 +449,10 @@ function AddConnectionForm() {
         ]}
       />
       {auth === "profile" ? (
-        <Field label="Profile">
+        <Field
+          label="Profile"
+          hint={profilesError ? `Couldn't read your AWS profiles: ${profilesError}` : undefined}
+        >
           {(id) => (
             <select id={id} className={`${selectClass} w-full`} value={profile} onChange={(e) => setProfile(e.target.value)}>
               <option value="">Select a profile…</option>
@@ -463,7 +499,9 @@ function AddConnectionForm() {
           Signed in as {signedInAs}
         </p>
       )}
-      {failure && <ErrorLine failure={failure} onSignIn={signIn} signingIn={signingIn} />}
+      {failure && (
+        <ErrorLine failure={failure} onSignIn={pendingId ? signIn : undefined} signingIn={signingIn} />
+      )}
     </form>
   );
 }
