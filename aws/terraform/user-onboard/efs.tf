@@ -18,13 +18,15 @@ resource "aws_efs_file_system" "this" {
 }
 
 # Admits NFS from the environment's task group, which itself gains nothing.
+# EC2 descriptions allow only a-zA-Z0-9, spaces and ._-:/()#,@[]+=&;{}!$*
+# (no apostrophes); the provider does not check, CreateSecurityGroup does.
 resource "aws_security_group" "efs" {
   name        = "${local.name}-efs"
-  description = "Triple-C ${var.environment_name}: NFS to one user's file system"
+  description = "Triple-C ${var.environment_name}: NFS to the file system of ${var.owner_key}"
   vpc_id      = data.aws_subnet.task[0].vpc_id
 
   ingress {
-    description     = "NFS from the environment's tasks"
+    description     = "NFS from the environment task group"
     from_port       = 2049
     to_port         = 2049
     protocol        = "tcp"
@@ -78,6 +80,20 @@ resource "aws_efs_file_system_policy" "this" {
         ]
         Resource  = aws_efs_file_system.this.arn
         Condition = { Null = { "elasticfilesystem:AccessPointArn" = "true" } }
+      },
+      {
+        # Same-account access needs an identity OR a resource policy, so the
+        # Allow below is not enough by itself: refuse every other principal.
+        Sid       = "DenyAllButOwnersTaskRole"
+        Effect    = "Deny"
+        Principal = { AWS = "*" }
+        Action = [
+          "elasticfilesystem:ClientMount",
+          "elasticfilesystem:ClientWrite",
+          "elasticfilesystem:ClientRootAccess",
+        ]
+        Resource  = aws_efs_file_system.this.arn
+        Condition = { ArnNotEquals = { "aws:PrincipalArn" = aws_iam_role.task.arn } }
       },
       {
         Sid       = "OwnersTaskRoleOnly"

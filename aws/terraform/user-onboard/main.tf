@@ -42,6 +42,8 @@ data "aws_ssm_parameter" "environment" {
   name            = "/triple-c/environments/${var.environment_name}"
   with_decryption = false
 
+  # The record is untrusted input that feeds IAM policies and the network:
+  # every field this module uses is format-checked before anything is built.
   lifecycle {
     postcondition {
       condition = try(
@@ -52,6 +54,20 @@ data "aws_ssm_parameter" "environment" {
         false
       )
       error_message = "The environment record is missing or not a schema-1 strict-tenancy record with two subnets; deploy (or update) the environment first."
+    }
+
+    postcondition {
+      condition = try(
+        can(regex(
+          "^arn:aws[a-z-]*:kms:${var.region}:${data.aws_caller_identity.current.account_id}:key/[0-9a-f-]+$",
+          jsondecode(self.insecure_value).kms_key_arn
+        ))
+        && jsondecode(self.insecure_value).log_group == "/triple-c/${var.environment_name}"
+        && can(regex("^sg-[0-9a-f]{8,17}$", jsondecode(self.insecure_value).security_group_id))
+        && alltrue([for s in jsondecode(self.insecure_value).subnet_ids : can(regex("^subnet-[0-9a-f]{8,17}$", s))]),
+        false
+      )
+      error_message = "The environment record has a malformed kms_key_arn (not a key in this region and account), log_group (not /triple-c/<environment>), security_group_id or subnet id."
     }
   }
 }

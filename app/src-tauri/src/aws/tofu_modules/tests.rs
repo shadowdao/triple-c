@@ -912,7 +912,28 @@ fn the_users_file_system_admits_only_their_task_role_through_an_access_point() {
     );
     assert_eq!(allows[0]["Resource"], fs_arn);
     assert!(allows[0].get("Condition").is_none() || allows[0]["Condition"].is_null());
-    assert_eq!(stmts.len(), 3, "{stmts:?}");
+    let deny_others = stmts
+        .iter()
+        .find(|s| s["Sid"] == "DenyAllButOwnersTaskRole")
+        .expect("a deny for every principal but the task role");
+    assert_eq!(
+        deny_others,
+        &json!({
+            "Sid": "DenyAllButOwnersTaskRole",
+            "Effect": "Deny",
+            "Principal": { "AWS": "*" },
+            "Action": [
+                "elasticfilesystem:ClientMount",
+                "elasticfilesystem:ClientWrite",
+                "elasticfilesystem:ClientRootAccess",
+            ],
+            "Resource": fs_arn,
+            "Condition": {
+                "ArnNotEquals": { "aws:PrincipalArn": "${aws_iam_role.task.arn}" }
+            },
+        })
+    );
+    assert_eq!(stmts.len(), 4, "{stmts:?}");
 
     // The task role may mount this file system and no other.
     let efs: Vec<_> = role_policies(&body, "task")
@@ -990,8 +1011,8 @@ fn the_environment_security_group_gains_no_ingress() {
     assert_eq!(text.matches("local.env.security_group_id").count(), 1);
     assert_eq!(
         text.matches("security_group_id").count(),
-        2,
-        "the rule and the efs group output"
+        4,
+        "the rule, the record check and its message, and the efs group output"
     );
 }
 
@@ -1202,4 +1223,108 @@ fn boundary_vars_carry_the_shipped_boundary() {
         object_get(tags, "triple-c:component"),
         Some(&Expression::String("boundary".into()))
     );
+}
+
+/// EC2 accepts only these characters in a security group's or rule's
+/// description; the provider checks only the length, so a stray apostrophe
+/// passes `tofu validate` and fails `CreateSecurityGroup`.
+fn is_ec2_description(text: &str) -> bool {
+    text.chars()
+        .all(|c| c.is_ascii_alphanumeric() || " ._-:/()#,@[]+=&;{}!$*".contains(c))
+}
+
+#[test]
+fn security_group_descriptions_use_only_ec2_characters() {
+    assert!(is_ec2_description(
+        "Triple-C ${var.environment_name}: NFS (tcp)"
+    ));
+    assert!(!is_ec2_description("the environment's tasks"));
+
+    for kind in [ModuleKind::Environment, ModuleKind::UserOnboard] {
+        let body = parsed(kind);
+        let mut seen = 0;
+        for ty in [
+            "aws_security_group",
+            "aws_security_group_rule",
+            "aws_vpc_security_group_ingress_rule",
+            "aws_vpc_security_group_egress_rule",
+        ] {
+            for res in resources(&body, ty) {
+                let mut bodies = vec![&res.body];
+                bodies.extend(
+                    res.body
+                        .blocks()
+                        .filter(|b| matches!(b.identifier.as_str(), "ingress" | "egress"))
+                        .map(|b| &b.body),
+                );
+                for b in bodies {
+                    if let Some(d) = attr(b, "description") {
+                        let text = template_text(d);
+                        assert!(
+                            is_ec2_description(&text),
+                            "{kind:?} {:?}: description {text:?} has characters EC2 rejects",
+                            res.labels
+                        );
+                        seen += 1;
+                    }
+                }
+            }
+        }
+        assert!(seen >= 2, "{kind:?}: only {seen} descriptions checked");
+    }
+}
+
+#[test]
+fn the_record_is_format_checked_before_use() {
+    let body = parsed(ModuleKind::UserOnboard);
+    let param = top_blocks(&body, "data")
+        .find(|b| label(b, 0) == Some("aws_ssm_parameter"))
+        .unwrap();
+    let lifecycle = top_blocks(&param.body, "lifecycle")
+        .next()
+        .expect("lifecycle");
+    let conditions: String = top_blocks(&lifecycle.body, "postcondition")
+        .map(|p| render(attr(&p.body, "condition").expect("condition")))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for needle in [
+        "jsondecode(self.insecure_value).schema == 1",
+        "jsondecode(self.insecure_value).name == var.environment_name",
+        "jsondecode(self.insecure_value).tenancy == \"strict\"",
+        "length(jsondecode(self.insecure_value).subnet_ids) == 2",
+        "\"^arn:aws[a-z-]*:kms:${var.region}:${data.aws_caller_identity.current.account_id}:key/[0-9a-f-]+$\"",
+        "jsondecode(self.insecure_value).kms_key_arn",
+        "jsondecode(self.insecure_value).log_group == \"/triple-c/${var.environment_name}\"",
+        "\"^sg-[0-9a-f]{8,17}$\"",
+        "jsondecode(self.insecure_value).security_group_id",
+        "\"^subnet-[0-9a-f]{8,17}$\"",
+        // Every subnet, not just the first.
+        "alltrue([for s in jsondecode(self.insecure_value).subnet_ids",
+    ] {
+        assert!(
+            conditions.contains(needle),
+            "the record postconditions do not check {needle}:\n{conditions}"
+        );
+    }
+
+    // Every record field the module reads is one the postconditions check.
+    let text = tf_text(ModuleKind::UserOnboard);
+    let mut used = BTreeSet::new();
+    for (i, _) in text.match_indices("local.env.") {
+        let rest = &text[i + "local.env.".len()..];
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        used.insert(rest[..end].to_string());
+    }
+    assert!(
+        used.contains("kms_key_arn") && used.contains("subnet_ids"),
+        "{used:?}"
+    );
+    for field in &used {
+        assert!(
+            conditions.contains(&format!("jsondecode(self.insecure_value).{field}")),
+            "local.env.{field} is used but never checked"
+        );
+    }
 }
