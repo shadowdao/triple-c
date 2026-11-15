@@ -280,7 +280,7 @@ pub(crate) mod tests {
                    {\"folder\":\"web\",\"dirty\":false,\"unpushed\":2,\"branch\":\"HEAD\"}\n";
         let repos = parse_dry_run(out).unwrap();
         assert_eq!(repos.len(), 2);
-        assert_eq!(repos[0], RepoState { folder: "api".into(), dirty: true, unpushed: 0, branch: "main".into() });
+        assert_eq!(repos[0], RepoState { folder: "api".into(), dirty: true, unpushed: 0, branch: "main".into(), cloning: false });
         assert_eq!(repos[1].unpushed, 2);
         assert!(parse_dry_run("{\"folder\":1}").is_err());
         assert!(parse_dry_run("").unwrap().is_empty());

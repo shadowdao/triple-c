@@ -635,9 +635,12 @@ chown claude:claude /home/claude/.gitconfig 2>/dev/null || true
 # app gives a starting task's agent only seconds to answer, so a clone in the
 # way of the agent would fail every start with a large repository. Terminals
 # work while the repos arrive. Progress, for the app to show later, is in
-# /run/triple-c-clone (world-readable, root-written): `repos` gets one
-# "<folder>\t<cloned|failed|exists>" line per repo, and `done` appears when
-# all are finished. The idle watcher counts an unfinished clone as activity.
+# /run/triple-c-clone (world-readable, root-written): `repos` gets a
+# "<folder>\tcloning" line as a clone begins and a
+# "<folder>\t<cloned|failed|exists>" line when it ends (the last line for a
+# folder is its state), and `done` appears when all are finished. The idle
+# watcher counts an unfinished clone as activity; triple-c-wip-push skips a
+# folder still `cloning`.
 # >>> aws_repos
 # clone_repos json root [status_dir]
 clone_repos() {
@@ -658,6 +661,7 @@ clone_repos() {
         [ -n "$branch" ] && args+=(--branch "$branch")
         args+=(-- "$url" "$dest")
         echo "entrypoint: cloning $folder..."
+        _clone_status "$folder" cloning
         # BatchMode is appended to whatever ssh command the user's git config
         # names (core.sshCommand), read as the user, rather than replacing it.
         err=$(_triplec_as_user sh -c '
@@ -1244,6 +1248,17 @@ start_idle_watch() {
     ) &
 }
 # <<< aws_stop
+# The stop trap goes in before any background work starts (the idle watcher
+# can signal this script; a clone is work a stop must account for), so a TERM
+# from here on always runs aws_before_stop. Defined after aws_stop, which
+# holds the function it calls.
+keepalive_pid=""
+stop_keepalive() {
+    [ "$triplec_aws" = 1 ] && aws_before_stop
+    [ -n "$keepalive_pid" ] && kill "$keepalive_pid" 2>/dev/null
+    exit "${triplec_exit_status:-0}"
+}
+trap stop_keepalive TERM INT HUP
 if [ "$triplec_aws" = 1 ] && [ -n "${TRIPLEC_IDLE_STOP_MINUTES:-}" ]; then
     start_idle_watch "$TRIPLEC_IDLE_STOP_MINUTES" "$$"
 fi
@@ -1253,13 +1268,6 @@ if [ "$triplec_aws" = 1 ]; then
 fi
 
 echo "Triple-C container ready."
-keepalive_pid=""
-stop_keepalive() {
-    [ "$triplec_aws" = 1 ] && aws_before_stop
-    [ -n "$keepalive_pid" ] && kill "$keepalive_pid" 2>/dev/null
-    exit "${triplec_exit_status:-0}"
-}
-trap stop_keepalive TERM INT HUP
 throttle_fifo=/run/triple-c-keepalive.throttle
 rm -f "$throttle_fifo"
 mkfifo -m 600 "$throttle_fifo" 2>/dev/null && exec 3<>"$throttle_fifo"

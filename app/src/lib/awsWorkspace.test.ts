@@ -48,6 +48,8 @@ describe("awsWorkspace", () => {
     expect(stopGuardNeeded({ checked: true, repos: [{ ...repo, dirty: true }], error: null })).toBe(true);
     expect(stopGuardNeeded({ checked: true, repos: [{ ...repo, unpushed: 1 }], error: null })).toBe(true);
     expect(stopGuardNeeded({ checked: false, repos: [], error: "x" })).toBe(true);
+    // A repository still cloning has nothing to push.
+    expect(stopGuardNeeded({ checked: true, repos: [{ ...repo, cloning: true }], error: null })).toBe(false);
   });
 
   it("selects only ready environments the user joined", () => {

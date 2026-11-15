@@ -22,14 +22,22 @@
 #   {"folder":…, "dirty":bool, "unpushed":n, "branch":…}
 # and changes nothing.
 #
+# A repository the start's background clone is still writing (the entrypoint's
+# /run/triple-c-clone: its `repos` file's last line for the folder says
+# `cloning` and `done` is absent) is skipped: a half-made checkout is not the
+# user's work. The dry run reports it as
+#   {"folder":…, "dirty":false, "unpushed":0, "branch":"", "cloning":true}
+#
 # Exit 0 when every needed push succeeded (or nothing needed pushing), 1 when
 # any failed, 2 on bad usage.
 #
-# TRIPLEC_WORKSPACE_ROOT overrides /workspace (tests).
+# TRIPLEC_WORKSPACE_ROOT overrides /workspace, TRIPLEC_CLONE_STATUS_DIR
+# /run/triple-c-clone (tests).
 
 set -u
 
 root="${TRIPLEC_WORKSPACE_ROOT:-/workspace}"
+clone_dir="${TRIPLEC_CLONE_STATUS_DIR:-/run/triple-c-clone}"
 dry_run=0
 reason=stop
 
@@ -62,6 +70,14 @@ pick_remote() {
     if [ "$(git remote | wc -l)" -eq 1 ]; then git remote; fi
 }
 
+# Whether the background clone is still writing folder $1: the clone is not
+# `done` and the last state it recorded for the folder is `cloning`.
+still_cloning() {
+    [ -d "$clone_dir" ] && [ ! -e "$clone_dir/done" ] || return 1
+    # ENVIRON, not -v: -v would read backslashes in a folder name as escapes.
+    [ "$(F="$1" awk -F '\t' '$1 == ENVIRON["F"] { s = $2 } END { print s }' "$clone_dir/repos" 2>/dev/null)" = cloning ]
+}
+
 user_ssh_command="${GIT_SSH_COMMAND:-}"
 
 for dir in "$root"/*/; do
@@ -72,6 +88,16 @@ for dir in "$root"/*/; do
     top=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || continue
     [ "$top" = "$(cd "$dir" && pwd -P)" ] || continue
     folder=$(basename "$dir")
+
+    if still_cloning "$folder"; then
+        if [ "$dry_run" = 1 ]; then
+            jq -cn --arg folder "$folder" \
+                '{folder: $folder, dirty: false, unpushed: 0, branch: "", cloning: true}'
+        else
+            echo "triple-c-wip-push: $folder: still cloning — nothing to push"
+        fi
+        continue
+    fi
 
     (
         cd "$dir" || exit 1

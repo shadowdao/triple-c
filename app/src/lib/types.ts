@@ -136,6 +136,8 @@ export interface RepoState {
   dirty: boolean;
   unpushed: number;
   branch: string;
+  /** The start's background clone is still writing it: nothing to push. */
+  cloning?: boolean;
 }
 
 /** What `checkUnsavedWork` found (Rust `UnsavedWork`). `checked: false` (with

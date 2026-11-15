@@ -31,7 +31,8 @@ function describeRepo(dirty: boolean, unpushed: number): string {
 export default function StopGuardModal({ projectName, work, wipPushOnStop = false, onChoose }: Props) {
   const pushRef = useRef<HTMLButtonElement>(null);
   const stopRef = useRef<HTMLButtonElement>(null);
-  const atRisk = work.repos.filter((r) => r.dirty || r.unpushed > 0);
+  const atRisk = work.repos.filter((r) => !r.cloning && (r.dirty || r.unpushed > 0));
+  const cloning = work.repos.filter((r) => r.cloning);
 
   return (
     <Modal
@@ -72,6 +73,14 @@ export default function StopGuardModal({ projectName, work, wipPushOnStop = fals
                 <span className="font-mono">/workspace/{r.folder}</span>{" "}
                 <span className="text-[var(--text-secondary)]">
                   ({r.branch}): {describeRepo(r.dirty, r.unpushed)}
+                </span>
+              </li>
+            ))}
+            {cloning.map((r) => (
+              <li key={r.folder} className="text-[13px] text-[var(--text-primary)]">
+                <span className="font-mono">/workspace/{r.folder}</span>{" "}
+                <span className="text-[var(--text-secondary)]">
+                  still cloning — nothing to push
                 </span>
               </li>
             ))}

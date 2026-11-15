@@ -421,7 +421,8 @@ fn clone_repos_clones_skips_existing_and_reports_failures_without_failing() {
     assert_eq!(fs::read_to_string(ws.join(".dotted/README")).unwrap(), "hello");
     assert_eq!(
         fs::read_to_string(status.join("repos")).unwrap(),
-        "main-copy\tcloned\ndev-copy\tcloned\nexisting\texists\nbroken\tfailed\n.dotted\tcloned\n"
+        "main-copy\tcloning\nmain-copy\tcloned\ndev-copy\tcloning\ndev-copy\tcloned\n\
+         existing\texists\nbroken\tcloning\nbroken\tfailed\n.dotted\tcloning\n.dotted\tcloned\n"
     );
 }
 
@@ -474,6 +475,11 @@ fn write_script(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
 
 fn wip_push(ws: &Path, args: &[&str]) -> Output {
     let tmp = ws.parent().unwrap();
+    wip_push_with_clone_dir(ws, args, &tmp.join("no-clone-status"))
+}
+
+fn wip_push_with_clone_dir(ws: &Path, args: &[&str], clone_dir: &Path) -> Output {
+    let tmp = ws.parent().unwrap();
     let script = write_script(tmp, "triple-c-wip-push", WIP_PUSH);
     // Through bash rather than exec'd: a script written a moment ago can be
     // ETXTBSY to exec while a parallel test's fork still holds it open.
@@ -481,6 +487,7 @@ fn wip_push(ws: &Path, args: &[&str]) -> Output {
         .arg(script)
         .args(args)
         .env("TRIPLEC_WORKSPACE_ROOT", ws)
+        .env("TRIPLEC_CLONE_STATUS_DIR", clone_dir)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("HOME", tmp)
         .output()
@@ -671,6 +678,44 @@ fn wip_push_uploads_lfs_objects_before_the_no_verify_push() {
     let refs = wip_refs(&remote);
     let pushed = git(&remote, &["rev-parse", &refs[0]]);
     assert_eq!(fs::read_to_string(&log).unwrap().trim(), format!("push origin {pushed}"));
+}
+
+#[test]
+fn wip_push_skips_a_repo_the_background_clone_is_still_writing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (ws, repo, remote) = workspace_with_clone(tmp.path());
+    // `half` is mid-clone: a checkout in progress reads as a dirty tree.
+    git(&ws, &["clone", "-q", remote.to_str().unwrap(), "half"]);
+    fs::remove_file(ws.join("half/README")).unwrap();
+    fs::write(repo.join("y"), "y").unwrap();
+    let clone = tmp.path().join("clone");
+    fs::create_dir_all(&clone).unwrap();
+    fs::write(clone.join("repos"), "proj\tcloning\nproj\tcloned\nhalf\tcloning\n").unwrap();
+
+    let out = wip_push_with_clone_dir(&ws, &["--dry-run"], &clone);
+    assert!(out.status.success(), "{}", text(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<serde_json::Value> = stdout.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let by = |f: &str| lines.iter().find(|v| v["folder"] == f).unwrap().clone();
+    assert_eq!(
+        by("half"),
+        serde_json::json!({"folder": "half", "dirty": false, "unpushed": 0, "branch": "", "cloning": true})
+    );
+    assert_eq!(by("proj")["dirty"], true, "a finished clone is checked as usual");
+    // The Rust side parses that line.
+    let parsed = crate::commands::stop_guard::parse_dry_run(&stdout).unwrap();
+    assert!(parsed.iter().any(|r| r.folder == "half" && r.cloning));
+
+    let out = wip_push_with_clone_dir(&ws, &[], &clone);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("half: still cloning"), "{}", text(&out));
+    assert_eq!(wip_refs(&remote).len(), 1, "only proj was pushed");
+
+    // Once the clone is done, the folder is an ordinary repository again.
+    fs::write(clone.join("done"), "").unwrap();
+    let out = wip_push_with_clone_dir(&ws, &["--dry-run"], &clone);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains(r#"{"folder":"half","dirty":true"#), "{stdout}");
 }
 
 #[test]
@@ -978,6 +1023,45 @@ fn idle_watch_pushes_before_an_idle_stop_and_stays_up_while_the_push_fails() {
 }
 
 #[test]
+fn idle_watch_goes_back_to_watching_when_someone_comes_back_during_the_push() {
+    let w = Watch::new();
+    w.dirty();
+    let d = w.tmp.path();
+    // The push starts a process the watcher counts as `claude` (a renamed
+    // `sleep`, so `pgrep -x` matches it), as a user returning mid-push would.
+    let busy_name = format!("tcbusy{}", std::process::id() % 100_000);
+    let sleep = Command::new("sh").arg("-c").arg("command -v sleep").output().unwrap();
+    let sleep = String::from_utf8_lossy(&sleep.stdout).trim().to_string();
+    fs::copy(&sleep, d.join(&busy_name)).unwrap();
+    fs::set_permissions(d.join(&busy_name), fs::Permissions::from_mode(0o755)).unwrap();
+    write_script(
+        d,
+        "triple-c-wip-push",
+        &format!(
+            "#!/bin/bash\nif [ \"$1\" = --dry-run ]; then cat '{p}/dry'; exit 0; fi\n\
+             echo \"$*\" >> '{p}/pushes'\n'{p}/{busy_name}' 30 </dev/null >/dev/null 2>&1 &\n\
+             echo $! > '{p}/busy.pid'\nexit 0\n",
+            p = d.display()
+        ),
+    );
+    let (url, mut agent) = fake_agent(d, OLD_ACTIVITY);
+    let mut target = fake_entrypoint(d);
+    let mut cmd = w.cmd(&url, target.id());
+    cmd.env("TRIPLEC_WIP_PUSH", "1").env("TRIPLEC_IDLE_PROC_NAME", &busy_name);
+    let ran = run_watch_for(cmd, 5);
+    if let Ok(pid) = fs::read_to_string(d.join("busy.pid")) {
+        let _ = Command::new("kill").arg(pid.trim()).status();
+    }
+    target.kill().ok();
+    target.wait().ok();
+    agent.kill().ok();
+    assert!(ran.is_none(), "it must not stop: {:?}", ran.map(|o| text(&o)));
+    assert_eq!(w.pushes(), "--reason idle\n", "it pushed once, then saw the activity");
+    assert!(!d.join("got").exists(), "no TERM");
+    assert!(!d.join("reason").exists(), "no idle marker");
+}
+
+#[test]
 fn idle_watch_keeps_a_stop_guard_marker_already_recorded() {
     for marker in ["pushed", "discard"] {
         let w = Watch::new();
@@ -1138,6 +1222,12 @@ fn docker_mode_never_reaches_the_aws_blocks() {
     };
     let agent_call = lines.iter().position(|l| l.trim() == "start_agent").expect("start_agent call");
     assert!(agent_call < pos("start_clone_repos"), "clones must start after the agent");
+    // The stop trap is in place before any AWS background work starts, so a
+    // TERM in between still runs aws_before_stop.
+    let trap = pos("trap stop_keepalive TERM INT HUP");
+    assert!(trap < pos("start_clone_repos"), "the trap must precede the clone");
+    assert!(trap < pos("start_idle_watch"), "the trap must precede the idle watcher");
+    assert!(pos("stop_keepalive()") < trap);
     assert!(block(ENTRYPOINT, "aws_repos").contains(") &"), "start_clone_repos backgrounds the clone");
     // And the snapshot-sensitive variables are gone before the agent's
     // environment snapshot is taken.

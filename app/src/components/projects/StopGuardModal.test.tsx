@@ -25,6 +25,17 @@ describe("StopGuardModal", () => {
     expect(onChoose).toHaveBeenCalledWith("push");
   });
 
+  it("lists a repository still cloning as having nothing to push", () => {
+    const work: UnsavedWork = {
+      ...dirty,
+      repos: [...dirty.repos, { folder: "big", branch: "", dirty: false, unpushed: 0, cloning: true }],
+    };
+    render(<StopGuardModal projectName="api" work={work} onChoose={vi.fn()} />);
+    expect(screen.getByText("/workspace/big")).toBeInTheDocument();
+    expect(screen.getByText("still cloning — nothing to push")).toBeInTheDocument();
+    expect(screen.getByText("/workspace/api")).toBeInTheDocument();
+  });
+
   it("offers Stop without pushing and Cancel", () => {
     const onChoose = vi.fn();
     render(<StopGuardModal projectName="api" work={dirty} onChoose={onChoose} />);

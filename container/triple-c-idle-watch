@@ -19,9 +19,10 @@
 #   * no work would be lost: `triple-c-wip-push --dry-run` (as claude) finds
 #     no dirty repository and no unpushed commit. With the WIP push on
 #     (TRIPLEC_WIP_PUSH=1) such work is pushed here, before the stop, and the
-#     workspace stops only once that push succeeded; a failed push keeps it
-#     running and is retried later (backing off). With it off, unsaved work
-#     simply keeps the workspace up.
+#     workspace stops only once that push succeeded and the workspace is
+#     still quiet afterwards (activity during the push sends it back to
+#     watching); a failed push keeps it running and is retried later (backing
+#     off). With it off, unsaved work simply keeps the workspace up.
 #
 # Anything it cannot read counts as NOT idle: a stop is the one thing here
 # that cannot be undone, so every doubt keeps the workspace running.
@@ -204,6 +205,14 @@ while :; do
             next_push_at=$(( $(date +%s) + wait_s ))
             said=""
             echo "triple-c-idle-watch: the WIP push failed — staying up; retrying in ${wait_s}s"
+            continue
+        fi
+        # The push took a while: someone may have come back meanwhile (a
+        # terminal, a `claude`, a scheduler job). Their new work would be
+        # lost, since the stop hook does not push again after an idle push.
+        if ! quiet; then
+            echo "triple-c-idle-watch: activity during the WIP push — not stopping"
+            said=""
             continue
         fi
     fi

@@ -727,6 +727,9 @@ pub struct RepoState {
     pub dirty: bool,
     pub unpushed: u64,
     pub branch: String,
+    /// The start's background clone is still writing it: nothing to push.
+    #[serde(default)]
+    pub cloning: bool,
 }
 
 /// What `check_unsaved_work` found. `checked: false` (with `error`) when the

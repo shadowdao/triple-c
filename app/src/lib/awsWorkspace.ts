@@ -109,7 +109,7 @@ export function cleanRepos(rows: RepoSource[]): RepoSource[] {
 
 /** Whether Stop must ask first (the one place this rule lives). */
 export function stopGuardNeeded(work: UnsavedWork): boolean {
-  return !work.checked || work.repos.some((r) => r.dirty || r.unpushed > 0);
+  return !work.checked || work.repos.some((r) => !r.cloning && (r.dirty || r.unpushed > 0));
 }
 
 /** An environment a project can be placed in: ready (or merely behind) and joined. */
