@@ -76,6 +76,18 @@ describe("useProjectActions stop guard", () => {
     expect(stop).not.toHaveBeenCalled();
   });
 
+  it("stops an unchecked workspace without sending a choice", async () => {
+    checkUnsavedWork.mockResolvedValue({ checked: false, repos: [], error: "dry run timed out" });
+    const { result } = renderHook(() => useProjectActions(awsProject({ status: "running" })));
+    await act(async () => {
+      await result.current.handleStop();
+    });
+    await act(async () => {
+      await result.current.resolveStopGuard("unguarded");
+    });
+    expect(stop).toHaveBeenCalledWith("p1", undefined);
+  });
+
   it("toasts a failed push or StopTask and leaves the project as it was", async () => {
     checkUnsavedWork.mockResolvedValue(dirty);
     stop.mockRejectedValue("Pushing unsaved work failed (exit 1), so the workspace was not stopped:\npush denied");

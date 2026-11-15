@@ -105,11 +105,13 @@ export function useProjectActions(project: Project) {
   }, [aws, project.status, project.id, run, stop]);
 
   const resolveStopGuard = useCallback(
-    (choice: WipChoice | null) => {
+    (choice: WipChoice | "unguarded" | null) => {
       setStopGuard(null);
       if (choice === null) return undefined;
       return run("Stop", async () => {
-        const note = await stop(project.id, choice);
+        // "unguarded": no choice is sent, so nothing is recorded in the
+        // workspace and its own shutdown push runs as configured.
+        const note = await stop(project.id, choice === "unguarded" ? undefined : choice);
         if (note) pushToast({ kind: "info", message: `“${project.name}” stopped`, detail: note });
         return note;
       });

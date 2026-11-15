@@ -842,6 +842,25 @@ fn idle_watch_signals_the_entrypoint_with_reason_idle() {
     assert_eq!(fs::read_to_string(w.tmp.path().join("reason")).unwrap().trim(), "idle");
 }
 
+#[test]
+fn idle_watch_keeps_a_stop_guard_marker_already_recorded() {
+    for marker in ["pushed", "discard"] {
+        let w = Watch::new();
+        fs::write(w.tmp.path().join("reason"), format!("{marker}\n")).unwrap();
+        let (url, mut agent) = fake_agent(w.tmp.path(), r#"{"last_activity_unix":1,"active_execs":0,"active_tunnels":0}"#);
+        let mut target = Command::new("bash")
+            .arg("-c")
+            .arg("trap 'exit 0' TERM; while :; do sleep 0.1; done")
+            .spawn()
+            .unwrap();
+        let out = w.cmd(&url, target.id()).output().unwrap();
+        target.wait().unwrap();
+        agent.kill().ok();
+        assert!(out.status.success(), "{}", text(&out));
+        assert_eq!(fs::read_to_string(w.tmp.path().join("reason")).unwrap().trim(), marker);
+    }
+}
+
 // ------------------------------------------------------- stop (SIGTERM) path
 
 #[test]

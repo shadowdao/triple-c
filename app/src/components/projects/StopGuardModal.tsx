@@ -3,13 +3,16 @@ import type { UnsavedWork, WipChoice } from "../../lib/types";
 import Modal from "../ui/Modal";
 import Button from "../ui/Button";
 
+export type StopGuardChoice = WipChoice | "unguarded" | null;
+
 interface Props {
   projectName: string;
   work: UnsavedWork;
   /** The project's "push work in progress when the workspace stops" setting. */
   wipPushOnStop?: boolean;
-  /** `null` = Cancel. */
-  onChoose: (choice: WipChoice | null) => void;
+  /** `null` = Cancel. `"unguarded"` = stop without recording any choice
+   *  (the unchecked case: the workspace's own shutdown push still runs). */
+  onChoose: (choice: StopGuardChoice) => void;
 }
 
 function describeRepo(dirty: boolean, unpushed: number): string {
@@ -45,7 +48,7 @@ export default function StopGuardModal({ projectName, work, wipPushOnStop = fals
             ref={stopRef}
             size="md"
             variant={work.checked ? "danger" : "primary"}
-            onClick={() => onChoose("discard")}
+            onClick={() => onChoose(work.checked ? "discard" : "unguarded")}
           >
             {work.checked ? "Stop without pushing" : "Stop anyway"}
           </Button>

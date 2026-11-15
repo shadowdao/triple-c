@@ -34,6 +34,8 @@ pub trait WipRunner: Sync {
     fn run(&self, args: Vec<String>) -> impl Future<Output = Result<(String, i64), String>> + Send;
     /// Record `marker` in [`STOP_REASON_FILE`] (as root: the directory is root's).
     fn write_stop_reason(&self, marker: &str) -> impl Future<Output = Result<(), String>> + Send;
+    /// Remove [`STOP_REASON_FILE`] (as root), so the hook pushes as configured again.
+    fn clear_stop_reason(&self) -> impl Future<Output = Result<(), String>> + Send;
 }
 
 impl WipRunner for ContainerTarget {
@@ -52,6 +54,40 @@ impl WipRunner for ContainerTarget {
         } else {
             Err(format!("exit {code}: {}", cap(&out)))
         }
+    }
+
+    async fn clear_stop_reason(&self) -> Result<(), String> {
+        let (out, code) = self
+            .exec_oneshot_as("root", clear_stop_reason_command(), Vec::new())
+            .await?;
+        if code == 0 {
+            Ok(())
+        } else {
+            Err(format!("exit {code}: {}", cap(&out)))
+        }
+    }
+}
+
+/// The root command that forgets a recorded marker (a fixed argv).
+pub fn clear_stop_reason_command() -> Vec<String> {
+    vec!["rm".into(), "-f".into(), STOP_REASON_FILE.into()]
+}
+
+/// After StopTask failed: the workspace keeps running, so a marker this stop
+/// recorded must not suppress the push of a later stop (Spot, ECS, idle) the
+/// user never chose for. Best effort; logged.
+pub async fn forget_choice<R: WipRunner>(runner: Option<&R>, choice: Option<WipChoice>) {
+    if choice.is_none() {
+        return;
+    }
+    let Some(r) = runner else {
+        log::warn!("Stop failed and the workspace is unreachable; its stop marker may remain");
+        return;
+    };
+    match tokio::time::timeout(DRY_RUN_TIMEOUT, r.clear_stop_reason()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => log::warn!("Could not remove the stop marker after a failed stop: {e}"),
+        Err(_) => log::warn!("Removing the stop marker after a failed stop timed out"),
     }
 }
 
@@ -230,6 +266,10 @@ pub(crate) mod tests {
             self.markers.lock().unwrap().push(marker.to_string());
             Ok(())
         }
+        async fn clear_stop_reason(&self) -> Result<(), String> {
+            self.markers.lock().unwrap().push("<cleared>".to_string());
+            Ok(())
+        }
     }
 
     const T: Duration = Duration::from_secs(5);
@@ -354,5 +394,19 @@ pub(crate) mod tests {
         // The entrypoint matches exactly these values.
         let ep = include_str!("../../../../container/entrypoint.sh");
         assert!(ep.contains("pushed|discard)") && ep.contains(STOP_REASON_FILE));
+    }
+
+    #[tokio::test]
+    async fn a_failed_stop_forgets_the_recorded_choice() {
+        let fake = Fake::new(Ok((String::new(), 0)));
+        prepare_stop(Some(&fake), Some(WipChoice::Discard), T).await.unwrap();
+        forget_choice(Some(&fake), Some(WipChoice::Discard)).await;
+        assert_eq!(fake.markers(), vec![MARKER_DISCARD, "<cleared>"]);
+        // An unguarded stop recorded nothing, so there is nothing to forget.
+        let fake = Fake::new(Ok((String::new(), 0)));
+        forget_choice(Some(&fake), None).await;
+        assert!(fake.markers().is_empty());
+        forget_choice::<Fake>(None, Some(WipChoice::Push)).await;
+        assert_eq!(clear_stop_reason_command(), vec!["rm", "-f", "/run/triple-c/stop-reason"]);
     }
 }

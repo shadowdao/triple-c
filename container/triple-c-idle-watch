@@ -132,7 +132,12 @@ while :; do
     if check; then
         echo "triple-c-idle-watch: idle for ${minutes} minutes — stopping the workspace"
         mkdir -p "$(dirname "$reason_file")" 2>/dev/null
-        printf 'idle\n' > "$reason_file"
+        # A pushed/discard marker means the app's stop guard has decided and
+        # its stop is under way: keep that decision rather than overwrite it.
+        case "$(cat "$reason_file" 2>/dev/null)" in
+            pushed|discard) ;;
+            *) printf 'idle\n' > "$reason_file" ;;
+        esac
         kill -TERM "$signal_pid"
         exit 0
     fi

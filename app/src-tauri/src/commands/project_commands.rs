@@ -1519,16 +1519,16 @@ pub async fn stop_project_container(
     // The stop guard's choice, before anything else is torn down: a push that
     // fails aborts the stop with the project as it was (auth bridge included).
     let mut note = None;
+    let guard_target = if project.is_aws() { ContainerTarget::for_project(&project) } else { None };
     if project.is_aws() {
         if wip == Some(WipChoice::Push) {
             emit_progress(&app_handle, &project_id, "Pushing unsaved work...");
         }
-        let target = ContainerTarget::for_project(&project);
         note = aws_guard_before_stop(
             &state.projects_store,
             &project_id,
             project.status.clone(),
-            target.as_ref(),
+            guard_target.as_ref(),
             wip,
             super::stop_guard::PUSH_TIMEOUT,
         )
@@ -1549,6 +1549,8 @@ pub async fn stop_project_container(
         let settings = state.settings_store.get();
         if let Err(e) = ProjectHost::for_project(&project).stop_project(&project, &settings).await {
             log::warn!("Stop failed for project {}: {}", project_id, e);
+            // Still running: a later stop must push as configured again.
+            super::stop_guard::forget_choice(guard_target.as_ref(), wip).await;
             let _ = state.projects_store.update_status(&project_id, project.status.clone());
             return Err(format!("Could not stop the task: {e}"));
         }

@@ -49,5 +49,8 @@ describe("StopGuardModal", () => {
     expect(screen.getByText(/could not check/)).toBeInTheDocument();
     const stop = screen.getByRole("button", { name: "Stop anyway" });
     await waitFor(() => expect(stop).toHaveFocus());
+    // Nothing is recorded: the shutdown push the copy promises still runs.
+    fireEvent.click(stop);
+    expect(onChoose).toHaveBeenCalledWith("unguarded");
   });
 });

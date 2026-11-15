@@ -367,7 +367,7 @@ function RemoveAwsResourcesModal({ project, onClose }: { project: Project; onClo
     setRunning(true);
     setError(null);
     try {
-      const updated = await commands.removeAwsResources(project.id, discardData);
+      const updated = await commands.removeAwsResources(project.id, hasSavedFiles(project) && discardData);
       useAppState.getState().updateProjectInList(updated);
       onClose();
     } catch (e) {
