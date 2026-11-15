@@ -15,6 +15,9 @@ pub mod policies;
 mod policy_eval;
 pub mod tofu;
 pub mod tofu_modules;
+// Used by the AWS host (phase 5, Task 6); until then only by its tests.
+#[allow(dead_code)]
+pub mod workspace;
 
 pub use connection::{sdk_config, sdk_config_for_keys};
 pub use error::{classify_sdk_error, AwsError};

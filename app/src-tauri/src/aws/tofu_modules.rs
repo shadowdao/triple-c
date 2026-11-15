@@ -122,6 +122,64 @@ pub fn user_role_names(env: &str, owner_key: &str) -> (String, String) {
     )
 }
 
+/// A project id as a name component: `[A-Za-z0-9_-]` only (anything else
+/// becomes `-`), at most 64 characters, never empty. Project ids are UUIDs,
+/// which pass unchanged; this only keeps a hand-edited `projects.json` from
+/// putting `/`, `..` or `:` into a secret name or an EFS path.
+fn project_component(project_id: &str) -> String {
+    let s: String = project_id
+        .chars()
+        .take(64)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if s.is_empty() {
+        "_".to_string()
+    } else {
+        s
+    }
+}
+
+/// A project's ECS task definition family:
+/// `triple-c-<env>-<owner_key>-<first 12 of the project id>`. At most 55
+/// characters of `[A-Za-z0-9_-]`. Other users can register revisions into
+/// any `triple-c-*` family, so a family is never trusted by name alone (see
+/// `aws::workspace`).
+pub fn task_family(env: &str, owner_key: &str, project_id: &str) -> String {
+    let id: String = project_component(project_id).chars().take(12).collect();
+    format!("triple-c-{env}-{owner_key}-{id}")
+}
+
+/// The project's Secrets Manager secret (P1): `triple-c/<env>/<owner_key>/<project id>`.
+pub fn project_secret_name(env: &str, owner_key: &str, project_id: &str) -> String {
+    format!(
+        "triple-c/{env}/{owner_key}/{}",
+        project_component(project_id)
+    )
+}
+
+/// The root of the project's EFS access point (P4), at most 90 characters.
+pub fn access_point_root(owner_key: &str, project_id: &str) -> String {
+    format!("/triple-c/{owner_key}/{}", project_component(project_id))
+}
+
+/// The container's `awslogs-stream-prefix`; ECS names the stream
+/// `<prefix>/workspace/<task id>`.
+pub fn log_stream_prefix(owner_key: &str, project_id: &str) -> String {
+    format!("{owner_key}/{}", project_component(project_id))
+}
+
+/// The `creation_token` of the user's file system (the onboarding module's
+/// `local.name`).
+pub fn user_file_system_token(env: &str, owner_key: &str) -> String {
+    format!("triple-c-{env}-{owner_key}")
+}
+
 /// The per-account, per-region state bucket.
 pub fn state_bucket_name(account: &str, region: &str) -> String {
     format!("triple-c-tfstate-{account}-{region}")
