@@ -595,7 +595,7 @@ and the secret and removes the ECR policy; then the fixture destroys the modules
 | Restart | ✓ new task, same revision; the `~/.claude` marker survived |
 | Repo clone | ✓ the background clone finished (`/run/triple-c-clone/repos`: `Hello-World cloned`) |
 | Stop guard and WIP push | ✓ `triple-c-wip-push --dry-run` reports the dirty repo; after StopTask the log shows `entrypoint: stopping (sigterm) — pushing work in progress...` and the push failing for lack of GitHub credentials. No push with real credentials was tried |
-| Idle stop (5 min) | ✓ the task stopped itself 365 s after the last use (`triple-c-idle-watch: idle for 5 minutes`, `entrypoint: stopping (idle)`); ECS stop code `EssentialContainerExited` |
+| Idle stop (5 min) | ✓ the task stopped itself 365 s after the last use (`triple-c-idle-watch: idle for 5 minutes`, `entrypoint: stopping (idle)`); ECS stop code `EssentialContainerExited`. Since the final fixes (R11) the idle stop exits 75 so the app shows it as an idle stop, open-but-silent terminals and the auth bridge's poll no longer count, and unsaved work blocks or is pushed first; the extended live test (attach held open, background poll) is written but **not yet re-run** (the test credentials had expired) |
 | `~/.claude.json` after Claude Code runs | ✓ still a link (Claude Code started without a login: "Not logged in") |
 | Bubblewrap (P9) | ✗ `bwrap --unshare-user` fails: "No permissions to create new namespace" (kernel 6.1, `max_user_namespaces` 16384, no `CAP_SYS_ADMIN` on Fargate). The sandbox stays off on AWS |
 | A revision per configuration | turning idle stop on adds a secret key, so the next start registers a new revision (by design) |
