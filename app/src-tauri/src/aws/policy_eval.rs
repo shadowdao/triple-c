@@ -16,15 +16,21 @@ pub(crate) const AT: Placeholders = Placeholders {
 pub(crate) const ME: &str = "AROAEXAMPLEME:alice@example.com";
 pub(crate) const SOMEONE_ELSE: &str = "AROAEXAMPLEOTHER:bob@example.com";
 
+/// What [`Request::resolve`] turns IAM's `${*}` into: a literal `*` in a
+/// pattern, which [`glob`] matches only against a `*`.
+const LITERAL_STAR: char = '\u{e000}';
+
 /// IAM wildcard match: `*` is any run of characters (including `:` and
-/// `/`), `?` is exactly one.
+/// `/`), `?` is exactly one; [`LITERAL_STAR`] is a plain `*`.
 pub(crate) fn glob(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
     let (mut pi, mut ti) = (0, 0);
     let (mut star, mut mark) = (None, 0);
     while ti < t.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+        if pi < p.len()
+            && (p[pi] == '?' || p[pi] == t[ti] || (p[pi] == LITERAL_STAR && t[ti] == '*'))
+        {
             pi += 1;
             ti += 1;
         } else if pi < p.len() && p[pi] == '*' {
@@ -126,7 +132,9 @@ impl Request<'_> {
             out.push_str(&rest[..start]);
             let end = rest[start..].find('}').expect("unterminated ${") + start;
             let name = &rest[start + 2..end];
-            let value = if name == "aws:userid" {
+            let value = if name == "*" {
+                Some(LITERAL_STAR.to_string())
+            } else if name == "aws:userid" {
                 Some(self.caller.to_string())
             } else {
                 self.context_value(name)
@@ -254,6 +262,10 @@ mod tests {
         ));
         assert!(glob("a?c", "abc"));
         assert!(!glob("a?c", "ac"));
+        // `${*}` (resolved to LITERAL_STAR) matches only a real `*`.
+        let literal = format!("arn:aws:ec2:*:*:{LITERAL_STAR}/{LITERAL_STAR}");
+        assert!(glob(&literal, "arn:aws:ec2:us-west-2:1:*/*"));
+        assert!(!glob(&literal, "arn:aws:ec2:us-west-2:1:elastic-ip/eipalloc-1"));
     }
 
     #[test]

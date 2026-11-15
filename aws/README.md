@@ -104,15 +104,16 @@ capacity adds them back.
 
 `app/src-tauri/src/aws/tofu_modules/tests.rs` (`MODULE_CALLS`) maps every resource type, data
 source and the S3 backend the modules use to the IAM actions the AWS provider calls to create,
-read, tag, update and delete it, and a test evaluates each against the admin files. It is the
-**hypothesis**; a live apply and destroy is the proof, and any action that shows missing is added
-to the table, the policy, the check table in `policies.rs` and this list together.
+read, tag, update and delete it, and a test evaluates each against the admin files. A live apply
+and destroy of every module as a role holding only the admin files (see "Live verification") is
+the proof; an action it shows missing is added to the table, the policy, the check table in
+`policies.rs` and this list together.
 
 | Resource | Actions (authorized against) |
 |---|---|
 | `aws_ecs_cluster` | `ecs:CreateCluster`, `TagResource` (at create), `DescribeClusters`, `ListTagsForResource`, `UpdateCluster`, `UntagResource`, `DeleteCluster` (cluster `triple-c-*`) |
 | `aws_ecs_cluster_capacity_providers` | `ecs:PutClusterCapacityProviders`, `DescribeClusters` (the cluster; untaggable) |
-| `aws_security_group` | `ec2:CreateSecurityGroup` (group and VPC, request tag), `CreateTags` (at create), `RevokeSecurityGroupEgress` (AWS's default rule), `Authorize`/`RevokeSecurityGroupIngress`/`Egress` and `UpdateSecurityGroupRuleDescriptions*` (tagged group; new rules: `security-group-rule/*`), `CreateTags`/`DeleteTags`, `DeleteSecurityGroup` (tagged), `Describe*` |
+| `aws_security_group` | `ec2:CreateSecurityGroup` (group: request tag; VPC: any, since EC2 shows the VPC no request tag), `CreateTags` (at create), `RevokeSecurityGroupEgress` (AWS's default rule), `Authorize`/`RevokeSecurityGroupIngress`/`Egress` and `UpdateSecurityGroupRuleDescriptions*` (tagged group; new rules: `security-group-rule/*`), `CreateTags`/`DeleteTags`, `DeleteSecurityGroup` (tagged), `Describe*` |
 | `aws_kms_key` | `kms:CreateKey` (request tag), `TagResource`, `DescribeKey`, `GetKeyPolicy`, `GetKeyRotationStatus`, `ListResourceTags`, `EnableKeyRotation`, `PutKeyPolicy`, `UpdateKeyDescription`, `UntagResource`, `ScheduleKeyDeletion` (tagged key) |
 | `aws_kms_alias` | `kms:CreateAlias`/`UpdateAlias`/`DeleteAlias` (alias `triple-c-*` and the tagged key; untaggable), `ListAliases` |
 | `aws_cloudwatch_log_group` | `logs:CreateLogGroup`, `TagResource`, `PutRetentionPolicy`, `ListTagsForResource`, `UntagResource`, `DeleteRetentionPolicy`, `DeleteLogGroup` (`/triple-c/*`), `DescribeLogGroups` (`*`) |
@@ -123,18 +124,18 @@ to the table, the policy, the check table in `policies.rs` and this list togethe
 | `aws_route_table` | `ec2:CreateRouteTable` (table: request tag; VPC: tagged), `CreateTags` (at create), `DeleteRouteTable` (tagged), `Describe*` |
 | `aws_route` | `ec2:CreateRoute`, `ReplaceRoute`, `DeleteRoute` (the tagged route table; untaggable) |
 | `aws_route_table_association` | `ec2:AssociateRouteTable`, `DisassociateRouteTable` (the tagged route table and subnet; untaggable). Never `ReplaceRouteTableAssociation`: it names no subnet when it swaps a VPC's main route table, so it could re-route a VPC that isn't Triple-C's; the modules never change an association's table |
-| `aws_eip` | `ec2:AllocateAddress` (request tag), `CreateTags` (at create), `ReleaseAddress` (tagged), `Describe*` |
+| `aws_eip` | `ec2:AllocateAddress` (request tag), `CreateTags` (at create), `ReleaseAddress` (tagged), `DisassociateAddress` (only the literal `*/*` EC2 names once the NAT gateway holding the association is gone), `Describe*` |
 | `aws_nat_gateway` | `ec2:CreateNatGateway` (gateway: request tag; its subnet, address and VPC: tagged), `CreateTags` (at create), `DeleteNatGateway` (tagged), `Describe*` |
 | `aws_efs_file_system` | `elasticfilesystem:CreateFileSystem` (`*`, request tag), `TagResource` (at create), `UpdateFileSystem`, `PutLifecycleConfiguration`, `TagResource`/`UntagResource`, `DeleteFileSystem` (tagged), `Describe*`, `ListTagsForResource` |
-| `aws_efs_mount_target` | `elasticfilesystem:CreateMountTarget`, `ModifyMountTargetSecurityGroups`, `DeleteMountTarget` (the tagged file system; untaggable), and the interface EFS makes with the caller's permissions: `ec2:CreateNetworkInterface`, `ec2:DeleteNetworkInterface` (only with `aws:CalledViaLast = elasticfilesystem.amazonaws.com`; in the environment's subnets, which in `existing` mode are the user's own) |
+| `aws_efs_mount_target` | `elasticfilesystem:CreateMountTarget`, `ModifyMountTargetSecurityGroups`, `DeleteMountTarget` (the tagged file system; untaggable), and the interface EFS makes with the caller's permissions: `ec2:CreateNetworkInterface`, `ec2:DeleteNetworkInterface` (only with `aws:CalledViaLast = elasticfilesystem.amazonaws.com`, verified live; in the environment's subnets, which in `existing` mode are the user's own) |
 | `aws_efs_file_system_policy` | `elasticfilesystem:PutFileSystemPolicy`, `DeleteFileSystemPolicy` (the tagged file system; untaggable), `DescribeFileSystemPolicy` |
 | `aws_iam_role` | `iam:CreateRole` (with the boundary), `TagRole`, `UntagRole`, `GetRole`, `ListRolePolicies`, `ListAttachedRolePolicies`, `ListInstanceProfilesForRole`, `UpdateRole`, `UpdateRoleDescription`, `DeleteRole` (`triple-c-*`) |
 | `aws_iam_role_policy` | `iam:PutRolePolicy`, `DeleteRolePolicy` (with the boundary), `GetRolePolicy` (the role; untaggable) |
 | data sources | `sts:GetCallerIdentity`, `ec2:DescribeAvailabilityZones`, `ec2:DescribeSubnets`, `ssm:GetParameter` |
 | S3 backend | `s3:ListBucket` (the state bucket), `GetObject`/`PutObject`/`DeleteObject` (`triple-c-tfstate-*/*`, the `.tflock` objects included), in the caller's own account |
 
-The app also creates the state bucket: `s3:CreateBucket` with a `triple-c:component` request tag,
-then `PutBucketVersioning`, `PutEncryptionConfiguration`, `PutBucketPublicAccessBlock`,
+The app also creates the state bucket: `s3:CreateBucket` with a `triple-c:component` request tag
+(and `s3:TagResource`, which a create with tags also needs, under the same conditions), then `PutBucketVersioning`, `PutEncryptionConfiguration`, `PutBucketPublicAccessBlock`,
 `PutBucketTagging`, `PutBucketPolicy`, `GetBucket*` and `ListBucket`, all on
 `triple-c-tfstate-*` only. No bucket can be deleted.
 
@@ -194,20 +195,82 @@ account-wide:
   `triple-c:component` request tag.
 - `ec2:CreateSecurityGroup` in **any** VPC, as long as the new group is tagged: an
   `existing`-network environment creates its tasks group and each user's `-efs` group in the
-  user's own, untagged VPC. It is the only create that may name an untagged parent.
+  user's own, untagged VPC. It is the only create that may name an untagged parent. The VPC side
+  of the grant has no condition at all: EC2 does not show the VPC the request's tags (a request-tag
+  condition there denied every create, verified live), so the group's own side carries the tag
+  rule.
+- `ec2:DisassociateAddress` on `arn:aws:ec2:*:*:${*}/${*}`, i.e. the literal resource `*/*` and
+  nothing else (`${*}` is IAM's escaped `*`). Destroying the NAT gateway's address disassociates
+  it first; by then the NAT gateway and its association are gone and EC2 authorizes the call
+  against `*/*` (verified live: denied without this, then `InvalidAssociationID.NotFound`, which
+  the provider ignores). A live association names its address and interface, so no real address
+  can be disassociated through this statement.
 - `ec2:AuthorizeSecurityGroupIngress`/`Egress` on `security-group-rule/*`: authorizing names the
   new, untagged rule as well as the group, and the group must still be tagged.
 - `ec2:CreateNetworkInterface` and `ec2:DeleteNetworkInterface` on `*`, but only when EFS makes
   the call for the admin (`aws:CalledViaLast = elasticfilesystem.amazonaws.com`): EFS creates and
   deletes a mount target's interface with the caller's EC2 permissions, in any subnet (an
-  `existing` environment's are untagged). **Unverified:** whether EFS sets `aws:CalledVia` for
-  these calls is for Task 8's live run to show; if it does not, this statement needs another
-  condition.
+  `existing` environment's are untagged). Verified live: EFS sets `aws:CalledViaLast` for both,
+  and mount targets are created and deleted under this statement alone.
 - Reads on `*`: `ec2:Describe*`, `elasticfilesystem:Describe*`, the KMS key reads and
   `ListAliases`, `logs:DescribeLogGroups` and `ssm:DescribeParameters`.
 - `s3:PutBucketPolicy` on the state bucket (only a bucket in the admin's own account, enforced by
   `s3:ResourceAccount`): an admin could open that bucket to other accounts. The state holds no
   secrets (the modules create none), but it maps the account's Triple-C resources.
+
+## Environments (OpenTofu)
+
+An environment is deployed with [OpenTofu](https://opentofu.org) from the modules in `terraform/`.
+The app runs them itself (it downloads OpenTofu 1.13.9, verified against a pinned SHA-256 before
+it is unpacked), and an admin can run the very same files by hand from a bundle.
+
+| Module | Creates | State key |
+|---|---|---|
+| `terraform/permissions-boundary` | the account's `triple-c-permissions-boundary` policy (an account administrator applies it; the admin tier cannot) | `boundary/terraform.tfstate` |
+| `terraform/environment` | what every user shares: ECS cluster (Fargate, Fargate Spot), the tasks security group (no inbound rules), KMS key and alias, log group `/triple-c/<env>`, the network (`network_mode`: `public`, `private-nat`, `existing`) and, last, the record `/triple-c/environments/<env>` | `environments/<env>/terraform.tfstate` |
+| `terraform/user-onboard` | one user's task and execution roles (with the boundary) and their own EFS file system, its `-efs` security group, two mount targets and a file-system policy that admits only their task role | `users/<env>/<owner key>/terraform.tfstate` |
+
+Every module pins the AWS provider (`hashicorp/aws` 6.73.0, hashes in `.terraform.lock.hcl`),
+sets `region` explicitly, never overrides an endpoint, and tags everything through `default_tags`
+(`triple-c:component`, plus the environment, owner and template version). The onboarding module
+reads the environment only from its record, never from its state.
+
+**The state bucket** is `triple-c-tfstate-<account>-<region>`, one per account and region. The app
+creates it on the first deploy (versioning, SSE-S3, all four public-access blocks, a TLS-only
+bucket policy, tagged `triple-c:component=state`); every call carries `expected_bucket_owner`, so a
+bucket of that name in another account is refused, never used. Locking is S3-native
+(`use_lockfile = true`): a run holds `<state key>.tflock`, and a held lock is what "deploying"
+means to every other copy of the app. The app removes a stale lock (older than two hours, an
+environment's only) with a conditional delete on the lock's ETag, so a lock taken since is never
+removed. `tofu destroy` leaves an *empty* state object behind; detection reads an empty state as
+no deployment at all.
+
+**How the app runs a deployment.** It writes the module into a work folder
+(`<app data>/triple-c/aws/work/<bucket>/<state key>/`) with `backend.hcl` and
+`terraform.tfvars.json`, then starts a detached runner (the app binary re-executed with
+`--tofu-runner`) that runs `tofu init` and `tofu apply` (or `destroy`) in its own process group,
+logging to `apply.log`. Closing the app does not stop it; the next start reattaches by following the
+log. Cancel interrupts OpenTofu, which stops gracefully and saves its state. OpenTofu's environment
+is built from scratch: no inherited `AWS_*`, `TF_*` or `TOFU_*` variables, the connection's profile
+name or its keys (in the environment only, never in arguments or files), and the app's own CLI
+config, so a `~/.tofurc` cannot redirect provider downloads. The app destroys only an incomplete
+deployment (state without a record, or a failed apply); a working environment is removed by an
+admin with `tofu destroy` from a bundle.
+
+**Admin bundles.** When the signed-in identity cannot deploy (or the admin prefers to), the app
+saves a folder with the module, `backend.hcl`, `terraform.tfvars.json` and a `README.txt` holding
+the exact commands. By hand, with credentials carrying the admin files (OpenTofu or Terraform 1.10
+or later):
+
+```sh
+cd <bundle folder>
+tofu init -backend-config=backend.hcl
+tofu apply      # or: tofu destroy
+```
+
+Remove every user's onboarding before destroying their environment. With Terraform, first run
+`terraform providers lock` for your platforms (the lock file carries OpenTofu's registry hashes).
+The bundle's `README.txt` also shows how to create the state bucket by hand if the app never has.
 
 ## Invariants the modules must keep (phase 4)
 
@@ -249,8 +312,8 @@ Create each file as a **customer managed policy** and attach it. In the console,
 or role. Inline policies do not fit: a role's inline policies share 10,240 characters and an
 environment admin needs every tier file (about 14,500), and a user's share 2,048. A managed policy
 may hold 6,144 characters, not counting whitespace. Without whitespace, `workspace-user.json` is
-about 6,040 (roughly 100 characters of headroom), `environment-admin.json` about 5,790 (350)
-and `environment-admin-network.json` about 3,280; a unit test (`every_policy_fits_a_managed_policy`)
+about 6,040 (roughly 100 characters of headroom), `environment-admin.json` about 5,800 (340)
+and `environment-admin-network.json` about 3,340; a unit test (`every_policy_fits_a_managed_policy`)
 fails before any file outgrows the limit. A tier that outgrows its files gains another file, which
 the app then lists with the others. For IAM Identity Center, add the files as inline policies on the permission set
 (the "up to 32,768 characters" limit is unverified) or reference the managed policies.
@@ -271,14 +334,15 @@ aws iam attach-user-policy --user-name <user> \
 - **Per-user execution roles.** A workspace user can pass only roles tagged with their own owner
   ID, so each user's onboarding module creates their execution role as well as their task role
   (done: `terraform/user-onboard/iam.tf`).
-- **The admin's deploy permissions are a hypothesis until a live apply.** The module table above
-  is derived from the provider's behaviour and the Service Authorization Reference, not yet from a
-  real `tofu apply`/`destroy`. In particular unverified: whether tag-on-create needs
-  `logs:TagResource` / `ssm:AddTagsToResource` / `ecs:TagResource` as listed, whether EFS's
-  interface calls carry `aws:CalledViaLast = elasticfilesystem.amazonaws.com`, whether
-  `s3:ResourceAccount` is evaluated for `s3:CreateBucket`, and whether `s3:CreateBucket` honours
-  `aws:RequestTag`. A trust-policy change on a role (`iam:UpdateAssumeRolePolicy`) is never
-  allowed, so a module version that changes a role's trust must replace the role.
+- **The admin's deploy permissions are verified for `public` and `private-nat`, not `existing`.**
+  A live apply, update and destroy of every module as a role holding only the admin files passed
+  (see "Live verification"). The `existing` network mode (a user's own, untagged VPC and subnets)
+  was not deployed live; its extra grants (`CreateSecurityGroup` in any VPC, mount-target
+  interfaces in untagged subnets) are the same statements the other modes exercised. Which
+  tag-on-create actions are strictly *needed* was not tested one by one: the listed ones are
+  sufficient, and only `s3:TagResource` turned out missing. A trust-policy change on a role
+  (`iam:UpdateAssumeRolePolicy`) is never allowed, so a module version that changes a role's trust
+  must replace the role.
 - **Admin access to user data.** The admin can retag `triple-c-*` roles (`iam:TagRole`). The
   boundary also allows every `triple-c/*` secret and every Triple-C file system. As a result,
   isolating users *from the admin* depends on the onboarding module's per-user policies, not on
@@ -351,6 +415,45 @@ Still open for the phases that create the resources: `RunTask`'s tag keys and `i
 `iam:ResourceTag` on a real run, the owner tag on a real task for `StopTask`/`ExecuteCommand`/
 `StartSession`, session ownership for an SSO-started session, and the EFS and security-group-rule
 points above. The simulator does not apply session policies, so the first real create is the final
-check. The phase-4 additions (the network, the state bucket, the module table above, the
-owner-scoped `CreateAccessPoint`) are verified by Task 8's live apply and destroy; until then they
-are unit-tested only.
+check. The phase-4 additions (the network, the state bucket, the module table above) are
+verified below; the owner-scoped `CreateAccessPoint` waits for phase 6's access points.
+
+### Phase 4: the modules, applied for real (2026-11-14)
+
+```sh
+cd app/src-tauri
+cargo build    # the runner is the app binary, re-executed with --tofu-runner
+TRIPLEC_AWS_E2E_PROFILE=<admin profile of a disposable account> TRIPLEC_AWS_E2E_REGION=us-west-2 \
+  cargo test aws::live_tests::environment -- --ignored --test-threads=1
+```
+
+`an_environment_admin_can_deploy_join_update_and_remove_an_environment` creates a role holding
+**only** the admin files (as `triple-c-e2e-<id>-envadmin*` managed policies) and does everything as
+a session of it, passing its keys to OpenTofu as a keys connection does: `ensure_state_bucket` on a
+throwaway `triple-c-tfstate-<account>-<region>-<suffix>` bucket (`TRIPLEC_E2E_BUCKET_SUFFIX`, random
+by default), deploy a `public` environment through the real detached runner, `scan` (Ready, a valid
+record, joinable), self-onboard (Joined, both roles carry the boundary), update (no changes),
+destroy the onboarding, then the environment. If the account has no boundary, the account admin
+applies the boundary module first and destroys it at the end. `the_private_nat_mode_deploys` does
+the same for `private-nat` (about $0.05: one NAT gateway for a few minutes). A guard destroys
+whatever is still applied, as the account admin, and deletes the bucket with every version, on
+failure too; every denied action is printed by name. The test drives the same functions as the
+commands (`ensure_tofu`, `materialize`, `child_env`, the runner, `follow`, `scan`, the refusal
+checks, the conditional lock delete); the Tauri commands' own bookkeeping (launch slots, the
+progress events) is not exercised.
+
+| Point | Result |
+|---|---|
+| `s3:CreateBucket` with a request tag and `s3:ResourceAccount` | ✓ both conditions are evaluated and pass for the admin's own account. ✗→fixed: a create with tags also authorizes **`s3:TagResource`**, which the policy lacked (added to `CreateTheStateBucket`, same conditions) |
+| `ec2:CreateSecurityGroup` in a VPC | ✗→fixed: denied on the VPC resource, which EC2 does not show the request's tags, so `CreateSecurityGroupsInAnyVpc` lost its request-tag condition. The group itself still needs the tag |
+| Tag-on-create (ECS, KMS, Logs, SSM, EFS, EC2, IAM) | ✓ every create passed with the listed actions; none was missing. Not tested one by one whether each is strictly needed |
+| EFS mount-target interfaces | ✓ EFS sets `aws:CalledViaLast = elasticfilesystem.amazonaws.com`: both mount targets were created and deleted with `MountTargetInterfacesThroughEfs` as the only grant of `ec2:CreateNetworkInterface`/`DeleteNetworkInterface`. Ruling R9's fallback was not needed |
+| EFS file-system policy naming a just-created role | ✓ no invalid-principal error in any onboarding apply (two applies, each created in 4 s, right after the role; whether the provider retried internally is not visible without its debug log); no module change. If it ever fails, applying the onboarding again completes it |
+| NAT address on destroy | ✗→fixed: the provider disassociates the address before releasing it, after the NAT gateway (and the association) are gone, and EC2 authorizes that call against the literal `*/*`. `DisassociateGoneAddresses` allows exactly `arn:aws:ec2:*:*:${*}/${*}`; CloudTrail shows the retried call reaching `InvalidAssociationID.NotFound` |
+| Conditional unlock | ✓ on the versioned state bucket, `DeleteObject` with `If-Match` and a mismatched ETag gets 412 (the app's "lock changed" answer) and leaves the lock; with the current ETag it deletes it. A fresh foreign lock scans as Deploying with its `Who` |
+| Update | ✓ re-applying with the network read back from the record: "0 added, 0 changed, 0 destroyed" |
+| After `tofu destroy` | ✗→fixed (app): the state object stays, empty, so a destroyed environment kept scanning as Incomplete (and a removed onboarding as Joined). Detection now reads a small state object and treats one with no resources as absent |
+| Cleanup | ✓ nothing `triple-c` left in us-west-2 (roles, policies, log groups, clusters, VPCs, subnets, gateways, NAT gateways, addresses, security groups, file systems, parameters, aliases, buckets); five environment KMS keys pending deletion (7 days); the boundary, which the account did not have, deleted again |
+
+Not deployed live: the `existing` network mode, and an onboarding by a workspace user from an
+admin bundle (the same module, applied with admin credentials).

@@ -1374,6 +1374,7 @@ const EIP: &str = "arn:aws:ec2:{region}:{account}:elastic-ip/eipalloc-0000000000
 const NAT: &str = "arn:aws:ec2:{region}:{account}:natgateway/nat-00000000000000000";
 const SG: &str = "arn:aws:ec2:{region}:{account}:security-group/sg-00000000000000000";
 const SG_RULE: &str = "arn:aws:ec2:{region}:{account}:security-group-rule/sgr-00000000000000000";
+const GONE_ASSOCIATION: &str = "arn:aws:ec2:{region}:{account}:*/*";
 const ENI: &str = "arn:aws:ec2:{region}:{account}:network-interface/eni-00000000000000000";
 const FS: &str = "arn:aws:elasticfilesystem:{region}:{account}:file-system/fs-00000000";
 const TASK_ROLE: &str = "arn:aws:iam::{account}:role/triple-c-probe-0123456789ab-task";
@@ -1480,8 +1481,9 @@ const MODULE_CALLS: &[(&str, &[Check])] = &[
         &[
             call("ec2:CreateSecurityGroup", SG, ENV_CREATE),
             // The one create that may name an untagged VPC: an
-            // `existing`-network environment's is the user's own.
-            call("ec2:CreateSecurityGroup", VPC, ENV_CREATE),
+            // `existing`-network environment's is the user's own. EC2 shows
+            // the VPC no request tag (verified live).
+            call("ec2:CreateSecurityGroup", VPC, NONE),
             call("ec2:CreateTags", SG, created_by!("CreateSecurityGroup")),
             call("ec2:DescribeSecurityGroups", "*", NONE),
             call("ec2:DescribeSecurityGroupRules", "*", NONE),
@@ -1654,6 +1656,10 @@ const MODULE_CALLS: &[(&str, &[Check])] = &[
             call("ec2:DescribeAddresses", "*", NONE),
             call("ec2:DescribeAddressesAttribute", "*", NONE),
             call("ec2:CreateTags", EIP, ENV_TAGGED),
+            // Delete disassociates first. The NAT gateway that held the
+            // association is gone by then, so EC2 authorizes it against a
+            // literal `*/*` (verified live).
+            call("ec2:DisassociateAddress", GONE_ASSOCIATION, NONE),
             call("ec2:ReleaseAddress", EIP, ENV_TAGGED),
         ],
     ),
@@ -1973,6 +1979,7 @@ fn every_onboarding_role_stays_inside_the_boundary() {
 const APP_ONLY_WRITES: &[&str] = &[
     // The state bucket's setup (the backend only reads and writes objects).
     "s3:CreateBucket",
+    "s3:TagResource",
     "s3:PutBucketVersioning",
     "s3:PutEncryptionConfiguration",
     "s3:PutBucketPublicAccessBlock",

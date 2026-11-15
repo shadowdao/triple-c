@@ -190,6 +190,9 @@ const PROBE_ROUTE_TABLE: &str = "arn:aws:ec2:{region}:{account}:route-table/rtb-
 const PROBE_ELASTIC_IP: &str =
     "arn:aws:ec2:{region}:{account}:elastic-ip/eipalloc-00000000000000000";
 const PROBE_NAT_GATEWAY: &str = "arn:aws:ec2:{region}:{account}:natgateway/nat-00000000000000000";
+/// What EC2 names when a call's resources no longer exist (an address
+/// association that went with its NAT gateway): a literal `*/*`.
+const PROBE_GONE_ASSOCIATION: &str = "arn:aws:ec2:{region}:{account}:*/*";
 const PROBE_NETWORK_INTERFACE: &str =
     "arn:aws:ec2:{region}:{account}:network-interface/eni-00000000000000000";
 const PROBE_SECURITY_GROUP_RULE: &str =
@@ -475,7 +478,9 @@ const ENVIRONMENT_ADMIN_CHECKS: &[Check] = &[
         REQUESTED_IN_TRIPLE_C_PARENT,
     ),
     // The one create that may name an untagged (existing-network) VPC.
-    write("ec2:CreateSecurityGroup", PROBE_VPC, COMPONENT_REQUESTED),
+    // The VPC side of the request carries no request tag (verified live),
+    // so only the group's side is tag-checked.
+    write("ec2:CreateSecurityGroup", PROBE_VPC, &[]),
     write(
         "ec2:CreateTags",
         PROBE_SECURITY_GROUP,
@@ -533,6 +538,10 @@ const ENVIRONMENT_ADMIN_CHECKS: &[Check] = &[
     ),
     write("ec2:DisassociateRouteTable", PROBE_SUBNET, COMPONENT_TAGGED),
     write("ec2:ReleaseAddress", PROBE_ELASTIC_IP, COMPONENT_TAGGED),
+    // Destroying the NAT gateway's address disassociates it first; the NAT
+    // gateway is gone by then, so EC2 authorizes the call against the
+    // literal `*/*` (verified live), which is all the policy allows.
+    write("ec2:DisassociateAddress", PROBE_GONE_ASSOCIATION, &[]),
     write("ec2:DeleteNatGateway", PROBE_NAT_GATEWAY, COMPONENT_TAGGED),
     write(
         "ec2:DeleteSecurityGroup",
@@ -715,6 +724,8 @@ const ENVIRONMENT_ADMIN_CHECKS: &[Check] = &[
     // The state bucket (the app creates it; OpenTofu's S3 backend reads and
     // writes the state and lock objects).
     write("s3:CreateBucket", PROBE_STATE_BUCKET, STATE_REQUESTED),
+    // CreateBucket with tags also authorizes s3:TagResource (verified live).
+    write("s3:TagResource", PROBE_STATE_BUCKET, STATE_REQUESTED),
     write("s3:PutBucketVersioning", PROBE_STATE_BUCKET, IN_MY_ACCOUNT),
     write(
         "s3:PutEncryptionConfiguration",
@@ -1765,21 +1776,21 @@ mod tests {
                 "{action} on {elsewhere}"
             );
         }
-        assert!(allowed(
-            tier,
-            &write("s3:CreateBucket", PROBE_STATE_BUCKET, STATE_REQUESTED),
-            ME,
-            ME
-        ));
-        for (bucket, context) in [
-            (PROBE_STATE_BUCKET, IN_MY_ACCOUNT),
-            (PROBE_STATE_BUCKET, OTHER_ACCOUNT_REQUESTED),
-            (OTHER_BUCKET, STATE_REQUESTED),
-        ] {
+        for action in ["s3:CreateBucket", "s3:TagResource"] {
             assert!(
-                !allowed(tier, &write("s3:CreateBucket", bucket, context), ME, ME),
-                "s3:CreateBucket {bucket} with {context:?}"
+                allowed(tier, &write(action, PROBE_STATE_BUCKET, STATE_REQUESTED), ME, ME),
+                "{action}"
             );
+            for (bucket, context) in [
+                (PROBE_STATE_BUCKET, IN_MY_ACCOUNT),
+                (PROBE_STATE_BUCKET, OTHER_ACCOUNT_REQUESTED),
+                (OTHER_BUCKET, STATE_REQUESTED),
+            ] {
+                assert!(
+                    !allowed(tier, &write(action, bucket, context), ME, ME),
+                    "{action} {bucket} with {context:?}"
+                );
+            }
         }
     }
 
@@ -1824,18 +1835,36 @@ mod tests {
                 "{action} on an untagged {resource}"
             );
         }
+        // A group may be created in any VPC (EC2 shows the VPC no request
+        // tag), but the group itself must carry the component tag.
         assert!(allowed(
-            tier,
-            &write("ec2:CreateSecurityGroup", PROBE_VPC, COMPONENT_REQUESTED),
-            ME,
-            ME
-        ));
-        assert!(!allowed(
             tier,
             &write("ec2:CreateSecurityGroup", PROBE_VPC, &[]),
             ME,
             ME
         ));
+        assert!(!allowed(
+            tier,
+            &write("ec2:CreateSecurityGroup", PROBE_SECURITY_GROUP, &[]),
+            ME,
+            ME
+        ));
+        // Only the literal `*/*` of an association that is already gone: a
+        // live address, Triple-C's or anyone's, is never disassociated.
+        assert!(allowed(
+            tier,
+            &write("ec2:DisassociateAddress", PROBE_GONE_ASSOCIATION, &[]),
+            ME,
+            ME
+        ));
+        for resource in [PROBE_ELASTIC_IP, PROBE_NETWORK_INTERFACE] {
+            for context in [&[][..], COMPONENT_TAGGED] {
+                assert!(
+                    !allowed(tier, &write("ec2:DisassociateAddress", resource, context), ME, ME),
+                    "ec2:DisassociateAddress on {resource} with {context:?}"
+                );
+            }
+        }
         // A VPC's main route table association names no subnet, so swapping
         // it would re-route a VPC by its route table alone: never allowed.
         assert!(!allowed(

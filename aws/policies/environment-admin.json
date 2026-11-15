@@ -302,7 +302,8 @@
       "Sid": "CreateTheStateBucket",
       "Effect": "Allow",
       "Action": [
-        "s3:CreateBucket"
+        "s3:CreateBucket",
+        "s3:TagResource"
       ],
       "Resource": [
         "arn:aws:s3:::triple-c-tfstate-*"

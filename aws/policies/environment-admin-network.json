@@ -94,12 +94,7 @@
       ],
       "Resource": [
         "arn:aws:ec2:*:*:vpc/*"
-      ],
-      "Condition": {
-        "Null": {
-          "aws:RequestTag/triple-c:component": "false"
-        }
-      }
+      ]
     },
     {
       "Sid": "TagNetworkAtCreate",
@@ -196,6 +191,16 @@
           "aws:CalledViaLast": "elasticfilesystem.amazonaws.com"
         }
       }
+    },
+    {
+      "Sid": "DisassociateGoneAddresses",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DisassociateAddress"
+      ],
+      "Resource": [
+        "arn:aws:ec2:*:*:${*}/${*}"
+      ]
     },
     {
       "Sid": "DescribeEc2",
