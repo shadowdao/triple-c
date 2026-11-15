@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ProjectPath, ProjectRemovalReport, ProjectResetOutcome, ContainerInfo, AppSettings, SettingsImportPreview, SettingsImportOutcome, UpdateInfo, ImageUpdateInfo, FileEntry, FileContents, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, BrowserPageState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo, UploadOutcome, Note, ViewerFile, ViewerPoll, ViewerSaved, ViewerState, FileDiff, InstallScope, ItemUpdate, Marketplace, MarketplaceAccount, MarketplaceItemRef, MarketplaceSnapshot, ProjectSyncResult, SyncReport, HostConnection, CallerIdentity, PermissionReport, PolicyFile, Tier } from "./types";
+import type { Project, ProjectPath, ProjectRemovalReport, ProjectResetOutcome, ContainerInfo, AppSettings, SettingsImportPreview, SettingsImportOutcome, UpdateInfo, ImageUpdateInfo, FileEntry, FileContents, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, BrowserPageState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo, UploadOutcome, Note, ViewerFile, ViewerPoll, ViewerSaved, ViewerState, FileDiff, InstallScope, ItemUpdate, Marketplace, MarketplaceAccount, MarketplaceItemRef, MarketplaceSnapshot, ProjectSyncResult, SyncReport, HostConnection, CallerIdentity, PermissionReport, PolicyFile, Tier, EnvironmentScan, NetworkChoice, ModuleKind } from "./types";
 
 // Docker
 export const checkDocker = () => invoke<boolean>("check_docker");
@@ -79,6 +79,45 @@ export const checkAwsPermissions = (id: string, region?: string) =>
 /** Every policy file `tier` needs, in order: attach all of them. */
 export const awsPolicyDocument = (tier: Tier) =>
   invoke<PolicyFile[]>("aws_policy_document", { tier });
+
+// AWS environments (OpenTofu). Reject with an `AwsError`. Starting commands resolve to an op id;
+// progress arrives on the `AWS_DEPLOY_PROGRESS_EVENT` event (`DeployProgress`, in ./types) under that op id.
+export const detectAwsEnvironments = (connectionId: string, region: string) =>
+  invoke<EnvironmentScan>("detect_aws_environments", { connectionId, region });
+export const deployAwsEnvironment = (connectionId: string, region: string, name: string, network: NetworkChoice) =>
+  invoke<string>("deploy_aws_environment", { connectionId, region, name, network });
+export const updateAwsEnvironment = (connectionId: string, region: string, name: string) =>
+  invoke<string>("update_aws_environment", { connectionId, region, name });
+/** `network` is required only when the environment has no record. */
+export const repairAwsEnvironment = (connectionId: string, region: string, name: string, network?: NetworkChoice) =>
+  invoke<string>("repair_aws_environment", { connectionId, region, name, network: network ?? null });
+export const destroyIncompleteAwsEnvironment = (connectionId: string, region: string, name: string) =>
+  invoke<string>("destroy_incomplete_aws_environment", { connectionId, region, name });
+export const unlockAwsState = (connectionId: string, region: string, stateKey: string) =>
+  invoke<void>("unlock_aws_state", { connectionId, region, stateKey });
+export const followAwsDeployment = (connectionId: string, region: string, stateKey: string) =>
+  invoke<string>("follow_aws_deployment", { connectionId, region, stateKey });
+export const cancelAwsDeployment = (connectionId: string, region: string, stateKey: string) =>
+  invoke<void>("cancel_aws_deployment", { connectionId, region, stateKey });
+export const onboardAwsUser = (connectionId: string, region: string, environment: string) =>
+  invoke<string>("onboard_aws_user", { connectionId, region, environment });
+export const deployAwsPermissionsBoundary = (connectionId: string, region: string) =>
+  invoke<string>("deploy_aws_permissions_boundary", { connectionId, region });
+/** Opens a folder picker in Rust; resolves to the folder written, or null if dismissed. */
+export const saveAwsAdminBundle = (
+  connectionId: string,
+  region: string,
+  kind: ModuleKind,
+  options: { environment?: string; ownerId?: string; network?: NetworkChoice } = {},
+) =>
+  invoke<string | null>("save_aws_admin_bundle", {
+    connectionId,
+    region,
+    kind,
+    environment: options.environment ?? null,
+    ownerId: options.ownerId ?? null,
+    network: options.network ?? null,
+  });
 /** Check a corporate CA path and report what would be installed. Never
  *  rejects for a bad path — the reason comes back in `error`. */
 export const inspectCaCertPath = (path: string) =>

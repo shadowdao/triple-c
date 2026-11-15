@@ -1,0 +1,359 @@
+use std::fs;
+
+use serde_json::json;
+
+use super::*;
+use crate::aws::environments::{
+    EnvironmentState, Knowable, LockInfo, OnboardingState,
+};
+use crate::aws::tofu_modules::{
+    environment_vars, module_files, onboarding_vars, owner_key, state_key, ModuleKind,
+};
+
+const ACCOUNT: &str = "123456789012";
+const REGION: &str = "eu-west-1";
+const USER_ID: &str = "AROAEXAMPLEID12345678:alice";
+
+fn info(name: &str, mode: &str, assign_public_ip: bool) -> EnvironmentInfo {
+    EnvironmentInfo {
+        schema: 1,
+        name: name.into(),
+        template_version: 1,
+        cluster_arn: format!("arn:aws:ecs:{REGION}:{ACCOUNT}:cluster/triple-c-{name}"),
+        security_group_id: "sg-0123456789abcdef0".into(),
+        subnet_ids: vec![
+            "subnet-0123456789abcdef0".into(),
+            "subnet-0fedcba9876543210".into(),
+        ],
+        assign_public_ip,
+        kms_key_arn: format!("arn:aws:kms:{REGION}:{ACCOUNT}:key/1234abcd-12ab"),
+        log_group: format!("/triple-c/{name}"),
+        network_mode: mode.into(),
+        tenancy: "strict".into(),
+    }
+}
+
+fn env(name: &str, state: EnvironmentState, actions: Vec<EnvironmentAction>) -> DetectedEnvironment {
+    DetectedEnvironment {
+        name: name.into(),
+        template_version: None,
+        state,
+        actions,
+        info: None,
+        onboarding: None,
+    }
+}
+
+fn scan(boundary: Knowable, environments: Vec<DetectedEnvironment>) -> EnvironmentScan {
+    EnvironmentScan {
+        region: REGION.into(),
+        account: ACCOUNT.into(),
+        owner_id: USER_ID.into(),
+        owner_key: owner_key(USER_ID),
+        state_bucket: Knowable::Yes,
+        boundary,
+        environments,
+    }
+}
+
+fn lock(age_secs: u64, local_process: bool) -> LockInfo {
+    LockInfo {
+        who: "someone@host".into(),
+        created: String::new(),
+        operation: "OperationTypeApply".into(),
+        age_secs,
+        local_process,
+    }
+}
+
+#[test]
+fn only_our_state_keys_are_accepted() {
+    let ok = owner_key(USER_ID);
+    let good = [
+        (
+            "environments/dev/terraform.tfstate".to_string(),
+            DeploymentKey::Environment("dev".into()),
+        ),
+        (
+            format!("users/dev/{ok}/terraform.tfstate"),
+            DeploymentKey::User { env: "dev".into(), owner_key: ok.clone() },
+        ),
+        ("boundary/terraform.tfstate".to_string(), DeploymentKey::Boundary),
+    ];
+    for (key, want) in good {
+        let parsed = parse_state_key(&key).unwrap();
+        assert_eq!(parsed, want);
+        assert_eq!(state_key(parsed.deployment()), key, "round trip");
+    }
+    let bad = [
+        "",
+        "environments/dev/terraform.tfstate.tflock",
+        "environments/Dev/terraform.tfstate",
+        "environments/dev-/terraform.tfstate",
+        "environments/../terraform.tfstate",
+        "environments/dev/../../boundary/terraform.tfstate",
+        "/environments/dev/terraform.tfstate",
+        "environments//terraform.tfstate",
+        "environments/dev/x/terraform.tfstate",
+        "environments/dev/terraform.tfstate/",
+        "users/dev/terraform.tfstate",
+        "users/dev/ABCDEF012345/terraform.tfstate",
+        "users/dev/abcdef01234/terraform.tfstate",
+        "users/dev/abcdef0123456/terraform.tfstate",
+        "users/dev/abcdef01234g/terraform.tfstate",
+        "boundary/x/terraform.tfstate",
+        "boundary/terraform.tfstate ",
+        "something/else",
+        "environments\\dev\\terraform.tfstate",
+    ];
+    for key in bad {
+        assert!(parse_state_key(key).is_err(), "{key:?} must be refused");
+    }
+}
+
+#[test]
+fn deploy_refuses_an_existing_name_and_a_missing_boundary() {
+    use EnvironmentAction::*;
+    let existing = vec![
+        env("dev", EnvironmentState::Ready, vec![Join]),
+        env("half", EnvironmentState::Incomplete { lock: None }, vec![Repair, Destroy]),
+    ];
+    let s = scan(Knowable::Yes, existing.clone());
+    assert!(deploy_refusal(&s, "prod").is_ok());
+    let e = deploy_refusal(&s, "dev").unwrap_err();
+    assert!(e.contains("already exists"), "{e}");
+    assert!(deploy_refusal(&s, "half").is_err(), "state without a record is taken too");
+    assert!(deploy_refusal(&s, "Not Valid").is_err());
+
+    let no_boundary = scan(Knowable::No, existing.clone());
+    let e = deploy_refusal(&no_boundary, "prod").unwrap_err();
+    assert!(e.contains("permissions boundary"), "{e}");
+    // A caller who can't tell is let through (the apply itself would fail).
+    assert!(deploy_refusal(&scan(Knowable::Unknown, existing), "prod").is_ok());
+}
+
+#[test]
+fn update_reuses_the_recorded_network() {
+    assert_eq!(
+        network_from_record(&info("dev", "public", true), None).unwrap(),
+        NetworkChoice::Public
+    );
+    assert_eq!(
+        network_from_record(&info("dev", "private-nat", false), None).unwrap(),
+        NetworkChoice::PrivateNat
+    );
+    let existing = info("dev", "existing", false);
+    assert_eq!(
+        network_from_record(&existing, Some("vpc-0123456789abcdef0")).unwrap(),
+        NetworkChoice::Existing {
+            vpc_id: "vpc-0123456789abcdef0".into(),
+            subnet_ids: existing.subnet_ids.clone(),
+            assign_public_ip: false,
+        }
+    );
+    // The VPC isn't in the record: without it from the state, refuse rather
+    // than guess.
+    assert!(network_from_record(&existing, None).is_err());
+    assert!(network_from_record(&existing, Some("not-a-vpc")).is_err());
+    assert!(network_from_record(&info("dev", "carrier-pigeon", false), None).is_err());
+    // And it round-trips into the module's variables unchanged.
+    let vars = environment_vars(
+        "dev",
+        REGION,
+        &network_from_record(&existing, Some("vpc-0123456789abcdef0")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(vars["network_mode"], "existing");
+    assert_eq!(vars["subnet_ids"], json!(existing.subnet_ids));
+}
+
+#[test]
+fn the_vpc_is_read_from_the_state_outputs() {
+    let state = json!({
+        "version": 4,
+        "outputs": { "vpc_id": { "value": "vpc-0123456789abcdef0", "type": "string" } },
+    })
+    .to_string();
+    assert_eq!(
+        vpc_id_from_state(state.as_bytes()).as_deref(),
+        Some("vpc-0123456789abcdef0")
+    );
+    assert_eq!(vpc_id_from_state(b"{}"), None);
+    assert_eq!(vpc_id_from_state(b"not json"), None);
+    let hostile = json!({"outputs": {"vpc_id": {"value": "vpc-1\"; rm -rf /"}}}).to_string();
+    assert_eq!(vpc_id_from_state(hostile.as_bytes()), None);
+}
+
+#[test]
+fn bundles_contain_the_module_backend_vars_and_readme() {
+    let dir = tempfile::tempdir().unwrap();
+    let ok = owner_key(USER_ID);
+    let d = Deployment::User { env: "dev", owner_key: &ok };
+    let vars = onboarding_vars("dev", REGION, USER_ID);
+    let written = write_bundle(dir.path(), d, ACCOUNT, REGION, &vars).unwrap();
+
+    for (name, text) in module_files(ModuleKind::UserOnboard) {
+        assert_eq!(&fs::read_to_string(dir.path().join(name)).unwrap(), text);
+        assert!(written.contains(&name.to_string()));
+    }
+    let bucket = format!("triple-c-tfstate-{ACCOUNT}-{REGION}");
+    let key = state_key(d);
+    let backend = fs::read_to_string(dir.path().join("backend.hcl")).unwrap();
+    assert!(backend.contains(&format!("bucket = \"{bucket}\"")), "{backend}");
+    assert!(backend.contains(&format!("key = \"{key}\"")), "{backend}");
+    assert!(backend.contains("use_lockfile = true"), "{backend}");
+    let tfvars: Value =
+        serde_json::from_str(&fs::read_to_string(dir.path().join("terraform.tfvars.json")).unwrap())
+            .unwrap();
+    assert_eq!(tfvars, vars);
+
+    let readme = fs::read_to_string(dir.path().join("README.txt")).unwrap();
+    for needle in [
+        bucket.as_str(),
+        key.as_str(),
+        ACCOUNT,
+        REGION,
+        "tofu init -backend-config=backend.hcl",
+        "tofu apply",
+        "terraform providers lock",
+        "registry.opentofu.org",
+        "1.10",
+        "aws s3api create-bucket",
+    ] {
+        assert!(readme.contains(needle), "README lacks {needle:?}:\n{readme}");
+    }
+    // Outside us-east-1 the bucket needs a location constraint.
+    assert!(readme.contains(&format!("LocationConstraint={REGION}")), "{readme}");
+
+    // Writing again over our own files is fine...
+    write_bundle(dir.path(), d, ACCOUNT, REGION, &vars).unwrap();
+    // ...but an unrelated file (or folder) means the wrong folder.
+    fs::write(dir.path().join("notes.txt"), "mine").unwrap();
+    let e = write_bundle(dir.path(), d, ACCOUNT, REGION, &vars).unwrap_err();
+    assert!(e.contains("notes.txt"), "{e}");
+    assert_eq!(fs::read_to_string(dir.path().join("notes.txt")).unwrap(), "mine");
+    fs::remove_file(dir.path().join("notes.txt")).unwrap();
+    fs::create_dir(dir.path().join(".terraform")).unwrap();
+    assert!(write_bundle(dir.path(), d, ACCOUNT, REGION, &vars).is_err());
+}
+
+#[test]
+fn a_us_east_1_bundle_creates_its_bucket_without_a_location_constraint() {
+    let dir = tempfile::tempdir().unwrap();
+    let vars = environment_vars("dev", "us-east-1", &NetworkChoice::Public).unwrap();
+    write_bundle(dir.path(), Deployment::Environment("dev"), ACCOUNT, "us-east-1", &vars).unwrap();
+    let readme = fs::read_to_string(dir.path().join("README.txt")).unwrap();
+    assert!(readme.contains("aws s3api create-bucket"), "{readme}");
+    assert!(!readme.contains("LocationConstraint"), "{readme}");
+    assert!(readme.contains("tofu destroy"), "{readme}");
+    for (name, _) in module_files(ModuleKind::Environment) {
+        assert!(dir.path().join(name).is_file(), "{name}");
+    }
+}
+
+#[test]
+fn owner_ids_must_look_like_an_aws_user_id() {
+    for ok in ["AIDAEXAMPLEUSERID1234", "AROAEXAMPLEID12345678:alice", "AROA1234567890ABCDEF:a.b@c_d-e+f=g,h"] {
+        assert_eq!(validate_owner_id(ok).unwrap(), ok);
+    }
+    for bad in [
+        "",
+        "123456789012",
+        "aidaexampleuserid1234",
+        "AROAEXAMPLEID12345678:",
+        "AROAEXAMPLEID12345678:a b",
+        "AROAEXAMPLEID12345678:a:b",
+        "AROAEXAMPLEID12345678:\"",
+        &format!("AROAEXAMPLEID12345678:{}", "a".repeat(65)),
+        &"A".repeat(129),
+    ] {
+        assert!(validate_owner_id(bad).is_err(), "{bad:?}");
+    }
+}
+
+#[test]
+fn server_side_rechecks_follow_the_detected_actions() {
+    use EnvironmentAction::*;
+    let s = scan(
+        Knowable::Yes,
+        vec![
+            env("broken", EnvironmentState::Incomplete { lock: None }, vec![Repair, Destroy]),
+            env(
+                "working",
+                EnvironmentState::Incomplete { lock: Some(lock(9000, false)) },
+                vec![Repair, Unlock],
+            ),
+            env("ready", EnvironmentState::Ready, vec![Join]),
+            env("busy", EnvironmentState::Deploying { lock: Some(lock(10, true)) }, vec![Follow]),
+        ],
+    );
+    assert!(require_action(&s, "broken", Destroy).is_ok());
+    assert!(require_action(&s, "working", Destroy).is_err(), "never destroy a working env (D6)");
+    assert!(require_action(&s, "ready", Destroy).is_err());
+    assert!(require_action(&s, "missing", Destroy).is_err());
+    assert!(require_action(&s, "working", Repair).is_ok());
+    assert!(require_action(&s, "ready", Update).is_err());
+
+    assert!(unlock_refusal(&s, "working").is_ok());
+    assert!(unlock_refusal(&s, "broken").is_err(), "no lock to remove");
+    assert!(unlock_refusal(&s, "busy").is_err(), "a local runner holds it");
+    let local_stale = scan(
+        Knowable::Yes,
+        vec![env(
+            "x",
+            EnvironmentState::Incomplete { lock: Some(lock(9000, true)) },
+            vec![Unlock],
+        )],
+    );
+    assert!(unlock_refusal(&local_stale, "x").is_err());
+}
+
+#[test]
+fn onboarding_needs_a_joinable_environment_and_the_boundary() {
+    use EnvironmentAction::*;
+    let mut ready = env("dev", EnvironmentState::Ready, vec![Join]);
+    ready.onboarding = Some(OnboardingState::NotJoined);
+    let mut busy = env("busy", EnvironmentState::Ready, vec![Join]);
+    busy.onboarding = Some(OnboardingState::InProgress);
+    let half = env("half", EnvironmentState::Incomplete { lock: None }, vec![Repair, Destroy]);
+    let s = scan(Knowable::Yes, vec![ready.clone(), busy, half]);
+    assert!(onboard_refusal(&s, "dev").is_ok());
+    assert!(onboard_refusal(&s, "busy").is_err());
+    assert!(onboard_refusal(&s, "half").is_err());
+    assert!(onboard_refusal(&s, "nope").is_err());
+    assert!(onboard_refusal(&scan(Knowable::No, vec![ready]), "dev").is_err());
+}
+
+#[test]
+fn progress_events_have_the_documented_shape() {
+    let p = DeployProgress {
+        op_id: "op".into(),
+        state_key: "boundary/terraform.tfstate".into(),
+        events: vec![],
+        done: false,
+        cancellable: true,
+        result: None,
+    };
+    let v = serde_json::to_value(&p).unwrap();
+    assert_eq!(
+        v,
+        json!({"op_id": "op", "state_key": "boundary/terraform.tfstate", "events": [], "done": false, "cancellable": true})
+    );
+    let done = DeployProgress {
+        done: true,
+        result: Some(TofuOutcome { ok: false, exit_code: 1, summary: Some("boom".into()) }),
+        ..p
+    };
+    let v = serde_json::to_value(&done).unwrap();
+    assert_eq!(v["result"], json!({"ok": false, "exit_code": 1, "summary": "boom"}));
+}
+
+#[test]
+fn an_already_running_start_names_the_deployment_and_suggests_follow() {
+    let e = start_error(StartError::AlreadyRunning, "environment \"dev\"");
+    let msg = e.to_string();
+    assert!(msg.contains("already running for environment \"dev\""), "{msg}");
+    assert!(msg.contains("Follow"), "{msg}");
+    let inner = AwsError::KeysMissing;
+    assert_eq!(start_error(StartError::Failed(inner.clone()), "x"), inner);
+}

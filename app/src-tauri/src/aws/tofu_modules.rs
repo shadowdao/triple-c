@@ -15,17 +15,14 @@ use crate::models::host_connection::validate_supported_region;
 
 /// `locals.template_version` (and the `triple-c:template-version` default
 /// tag) of `aws/terraform/environment`.
-#[allow(dead_code)] // used by phase-4 commands
 pub const ENVIRONMENT_MODULE_VERSION: u32 = 1;
 /// The same for the user-onboarding module.
-#[allow(dead_code)] // used by phase-4 commands
+#[allow(dead_code)] // the onboarding module's version; checked against its HCL by a test
 pub const ONBOARD_MODULE_VERSION: u32 = 1;
 /// The permissions boundary every module-created role carries (no path).
 /// Equal to [`super::policies::PERMISSIONS_BOUNDARY_NAME`]; a test checks it.
-#[allow(dead_code)] // used by phase-4 commands
 pub const BOUNDARY_POLICY_NAME: &str = "triple-c-permissions-boundary";
 
-#[allow(dead_code)] // used by phase-4 commands
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ModuleKind {
@@ -69,7 +66,6 @@ const PERMISSIONS_BOUNDARY_FILES: &[(&str, &str)] = module!("permissions-boundar
 
 /// The module's files as (file name relative to the module directory,
 /// contents), lock file included, for writing into a work or bundle folder.
-#[allow(dead_code)] // used by phase-4 commands
 pub fn module_files(kind: ModuleKind) -> &'static [(&'static str, &'static str)] {
     match kind {
         ModuleKind::Environment => ENVIRONMENT_FILES,
@@ -80,7 +76,6 @@ pub fn module_files(kind: ModuleKind) -> &'static [(&'static str, &'static str)]
 
 /// `^[a-z][a-z0-9-]{0,19}$`, not ending in `-`, with no `--` — the same rule
 /// as the module's `environment_name` validation.
-#[allow(dead_code)] // used by phase-4 commands
 pub fn validate_environment_name(name: &str) -> Result<String, String> {
     let b = name.as_bytes();
     let ok = !b.is_empty()
@@ -102,14 +97,12 @@ pub fn validate_environment_name(name: &str) -> Result<String, String> {
 }
 
 /// The SSM parameter holding an environment's record.
-#[allow(dead_code)] // used by phase-4 commands
 pub fn environment_parameter_name(env: &str) -> String {
     format!("/triple-c/environments/{env}")
 }
 
 /// The first 12 hex characters of `sha256(aws:userid)`. A `UserId` holds a
 /// `:`, which IAM role names reject, so per-user names use this instead.
-#[allow(dead_code)] // used by phase-4 commands
 pub fn owner_key(user_id: &str) -> String {
     Sha256::digest(user_id.as_bytes())
         .iter()
@@ -119,7 +112,6 @@ pub fn owner_key(user_id: &str) -> String {
 }
 
 /// A user's (task role, execution role) names. At most 47 characters.
-#[allow(dead_code)] // used by phase-4 commands
 pub fn user_role_names(env: &str, owner_key: &str) -> (String, String) {
     (
         format!("triple-c-{env}-{owner_key}-task"),
@@ -128,13 +120,11 @@ pub fn user_role_names(env: &str, owner_key: &str) -> (String, String) {
 }
 
 /// The per-account, per-region state bucket.
-#[allow(dead_code)] // used by phase-4 commands
 pub fn state_bucket_name(account: &str, region: &str) -> String {
     format!("triple-c-tfstate-{account}-{region}")
 }
 
 /// One deployment, i.e. one state object in the bucket (D9).
-#[allow(dead_code)] // used by phase-4 commands
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Deployment<'a> {
     /// The environment module for this environment name.
@@ -147,7 +137,6 @@ pub enum Deployment<'a> {
 
 /// A deployment's state object in [`state_bucket_name`] (D9); the lock is the
 /// same key plus `.tflock`.
-#[allow(dead_code)] // used by phase-4 commands
 pub fn state_key(d: Deployment) -> String {
     match d {
         Deployment::Environment(env) => format!("environments/{env}/terraform.tfstate"),
@@ -159,7 +148,6 @@ pub fn state_key(d: Deployment) -> String {
 }
 
 /// How an environment's tasks reach the network (D4).
-#[allow(dead_code)] // used by phase-4 commands
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "mode", rename_all = "kebab-case")]
 pub enum NetworkChoice {
@@ -185,7 +173,6 @@ fn is_aws_id(id: &str, prefix: &str) -> bool {
 
 /// The environment module's `terraform.tfvars.json`. Applies the same rules
 /// as the module's variable validations, so a bad value fails here first.
-#[allow(dead_code)] // used by phase-4 commands
 pub fn environment_vars(
     env: &str,
     region: &str,
@@ -238,7 +225,6 @@ pub fn environment_vars(
 /// The onboarding module's `terraform.tfvars.json` for the user whose
 /// `aws:userid` is `owner_id`. Bedrock stays on the workspace user's own
 /// credentials unless a later setting opts the task role in.
-#[allow(dead_code)] // used by phase-4 commands
 pub fn onboarding_vars(env: &str, region: &str, owner_id: &str) -> serde_json::Value {
     json!({
         "environment_name": env,
@@ -251,7 +237,6 @@ pub fn onboarding_vars(env: &str, region: &str, owner_id: &str) -> serde_json::V
 
 /// The boundary module's `terraform.tfvars.json`: the shipped boundary
 /// document itself, so the module holds no second copy.
-#[allow(dead_code)] // used by phase-4 commands
 pub fn boundary_vars(region: &str) -> serde_json::Value {
     json!({
         "region": region,

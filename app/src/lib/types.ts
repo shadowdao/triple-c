@@ -1191,3 +1191,107 @@ export interface PermissionReport {
   /** `[workspace_user, environment_admin]`. */
   tiers: TierResult[];
 }
+
+// ── AWS environments (phase 4; `aws::environments`, `commands::environment_commands`) ──
+
+/** How an environment's tasks reach the network (D4). `public` is the default and costs $0. */
+export type NetworkChoice =
+  | { mode: "public" }
+  | { mode: "private-nat" }
+  | { mode: "existing"; vpc_id: string; subnet_ids: string[]; assign_public_ip: boolean };
+
+export type ModuleKind = "environment" | "user_onboard" | "permissions_boundary";
+
+/** An environment's validated SSM record (schema 1). */
+export interface EnvironmentInfo {
+  schema: number;
+  name: string;
+  template_version: number;
+  cluster_arn: string;
+  security_group_id: string;
+  subnet_ids: string[];
+  assign_public_ip: boolean;
+  kms_key_arn: string;
+  log_group: string;
+  network_mode: "public" | "private-nat" | "existing";
+  tenancy: string;
+}
+
+/** A held state lock. `who`/`created`/`operation` are sanitized untrusted text. */
+export interface LockInfo {
+  who: string;
+  created: string;
+  operation: string;
+  age_secs: number;
+  local_process: boolean;
+}
+
+export type EnvironmentState =
+  | { state: "ready" }
+  | { state: "deploying"; lock: LockInfo | null }
+  | { state: "update_available" }
+  | { state: "incomplete"; lock: LockInfo | null }
+  | { state: "externally_managed" }
+  | { state: "unreadable_record"; reason: string };
+
+export type EnvironmentAction = "join" | "update" | "repair" | "destroy" | "follow" | "unlock";
+
+export type OnboardingState =
+  | { state: "joined" }
+  | { state: "not_joined" }
+  | { state: "in_progress" }
+  | { state: "incomplete" };
+
+export type Knowable = "yes" | "no" | "unknown";
+
+export interface DetectedEnvironment {
+  name: string;
+  template_version: number | null;
+  state: EnvironmentState;
+  actions: EnvironmentAction[];
+  info: EnvironmentInfo | null;
+  onboarding: OnboardingState | null;
+}
+
+export interface EnvironmentScan {
+  region: string;
+  account: string;
+  /** The caller's `aws:userid`. */
+  owner_id: string;
+  owner_key: string;
+  state_bucket: Knowable;
+  boundary: Knowable;
+  environments: DetectedEnvironment[];
+}
+
+/** One line of an OpenTofu run's log. */
+export interface TofuEvent {
+  ts: string;
+  level: string;
+  /** The `-json` message `type`, or `"log"` for plain text. */
+  kind: string;
+  resource: string | null;
+  action: string | null;
+  message: string;
+}
+
+export interface TofuOutcome {
+  ok: boolean;
+  exit_code: number;
+  summary: string | null;
+}
+
+/** The Tauri event a deploy's progress is emitted on (`environment_commands::PROGRESS_EVENT`). */
+export const AWS_DEPLOY_PROGRESS_EVENT = "aws-deploy-progress";
+
+/** Payload of the `aws-deploy-progress` event. `result` is set only when `done`. */
+export interface DeployProgress {
+  op_id: string;
+  /** `environments/<env>/terraform.tfstate`, `users/<env>/<ownerkey>/terraform.tfstate` or `boundary/terraform.tfstate`. */
+  state_key: string;
+  events: TofuEvent[];
+  done: boolean;
+  /** False when Cancel can't reach the run (its PID is unknown, or Windows). */
+  cancellable: boolean;
+  result?: TofuOutcome;
+}

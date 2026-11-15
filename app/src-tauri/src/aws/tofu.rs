@@ -219,7 +219,6 @@ pub fn verify_and_extract(
 /// A binary already there is reused only if it still hashes to what was
 /// recorded when it was extracted from a verified archive. Also prepares
 /// the plugin cache and CLI config [`child_env`] points at.
-#[allow(dead_code)] // used by phase-4 commands
 pub async fn ensure_tofu(root: &Path) -> Result<PathBuf, AwsError> {
     let (file, sha) = release_asset(std::env::consts::OS, std::env::consts::ARCH)
         .ok_or_else(|| other("OpenTofu isn't available for this platform"))?;
@@ -323,7 +322,6 @@ fn safe_segment(s: &str) -> bool {
 /// The work folder of one deployment, `<root>/work/<bucket>/<state key
 /// without .tfstate>/`, without creating or writing anything: what
 /// [`materialize`] writes into and what [`is_running`] asks about.
-#[allow(dead_code)] // used by phase-4 commands
 pub fn workdir_for(root: &Path, deployment: Deployment, bucket: &str) -> Result<Workdir, AwsError> {
     if !safe_segment(bucket) {
         return Err(other("Invalid state bucket name"));
@@ -345,7 +343,6 @@ pub fn workdir_for(root: &Path, deployment: Deployment, bucket: &str) -> Result<
 /// `terraform.tfvars.json` (0600 on Unix). Refuses while a run is in progress there. `.tf` files and the lock
 /// file left by an older module version are removed first, so a file a later
 /// version dropped can't linger and still be loaded.
-#[allow(dead_code)] // used by phase-4 commands
 pub fn materialize(
     root: &Path,
     kind: ModuleKind,
@@ -383,14 +380,20 @@ pub fn materialize(
     for (name, text) in module_files(kind) {
         fs::write(wd.dir.join(name), text).map_err(io)?;
     }
-    let backend = format!(
-        "bucket = \"{bucket}\"\nkey = \"{key}\"\nregion = \"{region}\"\nencrypt = true\nuse_lockfile = true\n"
-    );
-    fs::write(wd.dir.join("backend.hcl"), backend).map_err(io)?;
+    fs::write(wd.dir.join("backend.hcl"), backend_hcl(bucket, &key, &region)).map_err(io)?;
     let json = serde_json::to_vec_pretty(vars)
         .map_err(|e| other(format!("Could not encode the module variables: {e}")))?;
     write_private(&wd.dir.join("terraform.tfvars.json"), &json).map_err(io)?;
     Ok(wd)
+}
+
+/// `backend.hcl` for a state object: the work folder's and an admin
+/// bundle's (D5) are the same text. The values are names the app built
+/// (bucket, state key, validated region), never user text.
+pub fn backend_hcl(bucket: &str, key: &str, region: &str) -> String {
+    format!(
+        "bucket = \"{bucket}\"\nkey = \"{key}\"\nregion = \"{region}\"\nencrypt = true\nuse_lockfile = true\n"
+    )
 }
 
 /// Replace `path` with a file only its owner can read (Unix). The old file
@@ -533,7 +536,6 @@ fn expand_home(value: &str, parent: &[(String, String)]) -> String {
 ///   `TF_INPUT=0`, `CHECKPOINT_DISABLE=1`.
 ///
 /// `root` is the one [`ensure_tofu`] prepared.
-#[allow(dead_code)] // used by phase-4 commands
 pub fn child_env(
     conn: &HostConnection,
     keys: Option<&AwsKeys>,
@@ -690,7 +692,6 @@ pub struct Started {
 /// `apply.exit` within [`RUNNER_START_TIMEOUT`] is killed, and this fails.
 /// Blocks for that wait (normally milliseconds); call it from a blocking
 /// task.
-#[allow(dead_code)] // used by phase-4 commands
 pub fn start_detached(
     tofu: &Path,
     wd: &Workdir,
@@ -814,6 +815,18 @@ fn start_detached_with(
     Ok(Started { pid })
 }
 
+/// The runner's PID from `apply.pid`, if readable. Cancel needs it (and
+/// Unix); without it a run is followable but not cancellable.
+pub fn runner_pid(wd: &Workdir) -> Option<u32> {
+    read_pid(wd)
+}
+
+/// Whether this folder has a run to follow: one in progress, or a finished
+/// one whose log is still there.
+pub fn has_run(wd: &Workdir) -> bool {
+    wd.dir.join(LOG_FILE).exists() || wd.dir.join(EXIT_FILE).exists() || is_running(wd)
+}
+
 fn read_pid(wd: &Workdir) -> Option<u32> {
     fs::read_to_string(wd.dir.join(PID_FILE))
         .ok()?
@@ -851,7 +864,6 @@ pub fn is_running(wd: &Workdir) -> bool {
 /// it is running, which stops gracefully and saves state, and still writes
 /// `apply.exit`. Only signals while the runner holds its lock, so a stale
 /// PID never reaches another process.
-#[allow(dead_code)] // used by phase-4 commands
 pub fn interrupt(wd: &Workdir) -> Result<(), AwsError> {
     if !is_running(wd) {
         return Err(other("No deploy is running for this deployment"));
@@ -980,7 +992,6 @@ fn read_new(path: &Path, offset: u64) -> io::Result<Vec<u8>> {
 /// `on_events` exactly once, until `apply.exit` appears. Reattaching after a
 /// restart is the same call. If the runner dies without an exit code (killed,
 /// power loss) the outcome is a failure rather than waiting forever.
-#[allow(dead_code)] // used by phase-4 commands
 pub async fn follow(
     wd: &Workdir,
     poll: Duration,

@@ -17,5 +17,5 @@ pub mod tofu;
 pub mod tofu_modules;
 
 pub use connection::{sdk_config, sdk_config_for_keys};
-pub use error::AwsError;
+pub use error::{classify_sdk_error, AwsError};
 pub use identity::{caller_identity, CallerIdentity};

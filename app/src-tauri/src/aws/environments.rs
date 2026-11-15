@@ -50,7 +50,6 @@ const MAX_OBJECTS_PER_PREFIX: usize = 5000;
 const MAX_LOCKS: usize = 200;
 
 /// An environment's record, schema 1 (`aws/terraform/environment/main.tf`).
-#[allow(dead_code)] // used by phase-4 commands
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
 pub struct EnvironmentInfo {
     pub schema: u32,
@@ -89,7 +88,6 @@ fn is_hex_id(s: &str, prefix: &str) -> bool {
 /// Every field is checked against what the module writes, and every ARN
 /// must be in `account` and `region`. The error names the field, never its
 /// value.
-#[allow(dead_code)] // used by phase-4 commands
 pub fn parse_environment_record(
     path_name: &str,
     value: &str,
@@ -188,7 +186,6 @@ pub fn parse_environment_record(
 }
 
 /// A held state lock, as shown to the user.
-#[allow(dead_code)] // used by phase-4 commands
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct LockInfo {
     pub who: String,
@@ -223,7 +220,6 @@ fn sanitize_lock_string(s: &str) -> String {
 /// A lock from its object's contents (S3-native locking's JSON: `ID`,
 /// `Operation`, `Info`, `Who`, `Version`, `Created`, `Path`). Contents that
 /// are too large or not JSON still mean a held lock, with nothing to show.
-#[allow(dead_code)] // used by phase-4 commands
 pub fn lock_info(json: &str, age_secs: u64, local_process: bool) -> LockInfo {
     let parsed = (json.len() <= MAX_UNTRUSTED_BYTES)
         .then(|| serde_json::from_str::<Value>(json).ok())
@@ -245,7 +241,6 @@ pub fn lock_info(json: &str, age_secs: u64, local_process: bool) -> LockInfo {
     }
 }
 
-#[allow(dead_code)] // used by phase-4 commands
 #[derive(Serialize, Clone, Debug, PartialEq)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum EnvironmentState {
@@ -264,7 +259,6 @@ pub enum EnvironmentState {
     UnreadableRecord { reason: String },
 }
 
-#[allow(dead_code)] // used by phase-4 commands
 #[derive(Serialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum EnvironmentAction {
@@ -276,7 +270,6 @@ pub enum EnvironmentAction {
     Unlock,
 }
 
-#[allow(dead_code)] // used by phase-4 commands
 #[derive(Serialize, Clone, Debug, PartialEq)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum OnboardingState {
@@ -286,7 +279,6 @@ pub enum OnboardingState {
     Incomplete,
 }
 
-#[allow(dead_code)] // used by phase-4 commands
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct DetectedEnvironment {
     pub name: String,
@@ -298,7 +290,6 @@ pub struct DetectedEnvironment {
     pub onboarding: Option<OnboardingState>,
 }
 
-#[allow(dead_code)] // used by phase-4 commands
 #[derive(Serialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum Knowable {
@@ -308,7 +299,6 @@ pub enum Knowable {
     Unknown,
 }
 
-#[allow(dead_code)] // used by phase-4 commands
 #[derive(Serialize, Clone, Debug)]
 pub struct EnvironmentScan {
     pub region: String,
@@ -323,7 +313,6 @@ pub struct EnvironmentScan {
 
 /// The state bucket's listing under `environments/`, `users/` and
 /// `boundary/`.
-#[allow(dead_code)] // used by phase-4 commands
 #[derive(Debug, Default)]
 pub struct StateObjects {
     /// State object keys.
@@ -434,7 +423,6 @@ fn detect_one(
 /// environments, sorted by name. `objects` is `None` when the caller can't
 /// read the bucket (or there is none). Onboarding is left unresolved
 /// ([`scan`] does that).
-#[allow(dead_code)] // used by phase-4 commands
 pub fn merge(
     records: Vec<(String, Result<EnvironmentInfo, String>)>,
     objects: Option<&StateObjects>,
@@ -481,7 +469,6 @@ fn onboarding_from_objects(
 /// is `Send` (a Tauri command needs that) for any implementation; an impl
 /// may still write them as `async fn`. Access denied is an answer
 /// (`Unknown` / `None`), not an error.
-#[allow(dead_code)] // used by phase-4 commands
 pub trait DetectApi: Send + Sync {
     /// (parameter name, value) under `/triple-c/environments/`.
     fn environment_records(
@@ -504,7 +491,6 @@ pub trait DetectApi: Send + Sync {
 }
 
 /// Everything the account holds for this caller in `region`.
-#[allow(dead_code)] // used by phase-4 commands
 pub async fn scan<D: DetectApi>(
     d: &D,
     who: &CallerIdentity,
@@ -635,7 +621,6 @@ where
 }
 
 /// The real thing, from a connection's `SdkConfig`.
-#[allow(dead_code)] // used by phase-4 commands
 pub struct SdkDetectApi {
     ssm: aws_sdk_ssm::Client,
     s3: aws_sdk_s3::Client,
@@ -645,7 +630,6 @@ pub struct SdkDetectApi {
 }
 
 impl SdkDetectApi {
-    #[allow(dead_code)] // used by phase-4 commands
     pub fn new(cfg: &SdkConfig, account: &str) -> Self {
         SdkDetectApi {
             ssm: aws_sdk_ssm::Client::new(cfg),
@@ -934,7 +918,6 @@ fn state_bucket_policy(bucket: &str) -> String {
 /// a TLS-only policy. Idempotent. Every call after the create carries
 /// `expected_bucket_owner`, so a bucket of another account's is never
 /// configured or trusted.
-#[allow(dead_code)] // used by phase-4 commands
 pub async fn ensure_state_bucket(
     cfg: &SdkConfig,
     account: &str,

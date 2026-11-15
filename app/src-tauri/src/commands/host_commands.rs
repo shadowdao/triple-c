@@ -118,7 +118,7 @@ async fn real_identity(c: Credentials) -> Result<CallerIdentity, AwsError> {
     caller_identity(&cfg).await
 }
 
-fn aws_conn(id: &str, settings: &AppSettings) -> Result<HostConnection, String> {
+pub(crate) fn aws_conn(id: &str, settings: &AppSettings) -> Result<HostConnection, String> {
     check_id(id)?;
     let conn = settings
         .hosts
