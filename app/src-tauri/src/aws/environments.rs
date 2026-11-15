@@ -754,7 +754,7 @@ fn error_parts<E: ProvideErrorMetadata>(
 }
 
 /// Yes / No (missing) / Unknown (denied) from a lookup's result.
-fn knowable<T, E>(
+pub(crate) fn knowable<T, E>(
     action: &str,
     res: Result<T, SdkError<E, HttpResponse>>,
 ) -> Result<Knowable, AwsError>
