@@ -9,7 +9,7 @@ use crate::aws::permissions::{check_permissions, PermissionReport, SdkPermission
 use crate::aws::policies::{policy_json, Tier};
 use crate::aws::{caller_identity, sdk_config, sdk_config_for_keys, AwsError, CallerIdentity};
 use crate::models::{
-    validate_connection_name, validate_profile_name, validate_region, AppSettings, AwsAuth,
+    validate_connection_name, validate_profile_name, validate_supported_region, AppSettings, AwsAuth,
     HostConnection, HostKind,
 };
 use crate::storage::secure::{self, AwsKeys};
@@ -66,16 +66,45 @@ where
     if let Some(k) = &keys {
         store_keys(&conn.id, k).map_err(other)?;
     }
-    // Read after the keychain step to keep the read-modify-write window short.
-    let mut all = settings.get();
-    all.hosts.push(conn.clone());
-    if let Err(e) = settings.update(all) {
+    if let Err(e) = settings.modify(|all| {
+        all.hosts.push(conn.clone());
+        Ok(())
+    }) {
         if keys.is_some() {
             let _ = delete_keys(&conn.id);
         }
         return Err(other(e));
     }
     Ok(conn)
+}
+
+/// Removes the stored connection with this id, however malformed its other
+/// fields are (a broken entry must stay removable). Its keychain entry is
+/// deleted only for a `Keys` connection whose `keyring_ref` is its own valid id.
+pub(crate) fn remove_connection_with(
+    id: &str,
+    delete_keys: impl Fn(&str) -> Result<(), String>,
+    settings: &SettingsStore,
+) -> Result<AppSettings, String> {
+    check_id(id)?;
+    let existing = settings
+        .get()
+        .hosts
+        .into_iter()
+        .find(|h| h.id == id)
+        .ok_or_else(|| "Connection not found".to_string())?;
+    let HostKind::Aws { auth, .. } = &existing.kind;
+    if let AwsAuth::Keys { keyring_ref } = auth {
+        if keyring_ref == id && secure::is_valid_connection_id(keyring_ref) {
+            delete_keys(keyring_ref)?;
+        }
+    }
+    settings
+        .modify(|s| {
+            s.hosts.retain(|h| h.id != id);
+            Ok(())
+        })
+        .map(|(saved, ())| saved)
 }
 
 async fn real_identity(c: Credentials) -> Result<CallerIdentity, AwsError> {
@@ -100,7 +129,7 @@ fn aws_conn(id: &str, settings: &AppSettings) -> Result<HostConnection, String> 
     // Defense in depth: stored values are re-checked before they reach the
     // keychain, the SDK or a subprocess.
     let HostKind::Aws { auth, default_region } = &conn.kind;
-    validate_region(default_region)?;
+    validate_supported_region(default_region)?;
     match auth {
         AwsAuth::Profile { name } => {
             validate_profile_name(name)?;
@@ -116,7 +145,7 @@ fn aws_conn(id: &str, settings: &AppSettings) -> Result<HostConnection, String> 
 fn validated(name: &str, region: &str) -> Result<(String, String), AwsError> {
     Ok((
         validate_connection_name(name).map_err(other)?,
-        validate_region(region).map_err(other)?,
+        validate_supported_region(region).map_err(other)?,
     ))
 }
 
@@ -187,14 +216,17 @@ pub async fn update_aws_connection(
     state: State<'_, AppState>,
 ) -> Result<HostConnection, AwsError> {
     let (name, region) = validated(&name, &default_region)?;
-    let mut settings = state.settings_store.get();
-    aws_conn(&id, &settings).map_err(other)?;
-    let conn = settings.hosts.iter_mut().find(|h| h.id == id).expect("checked above");
-    conn.name = name;
-    let HostKind::Aws { default_region, .. } = &mut conn.kind;
-    *default_region = region;
-    let updated = conn.clone();
-    state.settings_store.update(settings).map_err(other)?;
+    let (_, updated) = state
+        .settings_store
+        .modify(|settings| {
+            aws_conn(&id, settings)?;
+            let conn = settings.hosts.iter_mut().find(|h| h.id == id).expect("checked above");
+            conn.name = name;
+            let HostKind::Aws { default_region, .. } = &mut conn.kind;
+            *default_region = region;
+            Ok(conn.clone())
+        })
+        .map_err(other)?;
     Ok(updated)
 }
 
@@ -203,14 +235,7 @@ pub async fn remove_host_connection(
     id: String,
     state: State<'_, AppState>,
 ) -> Result<AppSettings, String> {
-    let conn = aws_conn(&id, &state.settings_store.get())?;
-    let HostKind::Aws { auth, .. } = &conn.kind;
-    if let AwsAuth::Keys { keyring_ref } = auth {
-        secure::delete_aws_keys(keyring_ref)?;
-    }
-    let mut settings = state.settings_store.get();
-    settings.hosts.retain(|h| h.id != id);
-    state.settings_store.update(settings)
+    remove_connection_with(&id, secure::delete_aws_keys, &state.settings_store)
 }
 
 #[tauri::command]
@@ -247,7 +272,7 @@ pub async fn check_aws_permissions(
     let conn = aws_conn(&id, &state.settings_store.get()).map_err(other)?;
     let HostKind::Aws { default_region, .. } = &conn.kind;
     let region = match region {
-        Some(r) => validate_region(&r).map_err(other)?,
+        Some(r) => validate_supported_region(&r).map_err(other)?,
         None => default_region.clone(),
     };
     let cfg = sdk_config(&conn, &region).await?;
@@ -449,5 +474,52 @@ mod tests {
         assert!(aws_conn("c1", &with("dev", "us-west-2")).is_ok());
         assert!(aws_conn("c1", &with("dev", "not a region")).is_err());
         assert!(aws_conn("c1", &with("a b", "us-west-2")).is_err());
+    }
+
+    #[test]
+    fn a_connection_with_an_invalid_stored_region_can_still_be_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = store_in(&dir);
+        let mut c = keys_conn();
+        c.kind = HostKind::Aws {
+            auth: AwsAuth::Keys { keyring_ref: "c2".into() },
+            default_region: "not a region".into(),
+        };
+        settings.update(AppSettings { hosts: vec![c, profile_conn()], ..AppSettings::default() }).unwrap();
+        let deleted = RefCell::new(Vec::<String>::new());
+        let after = remove_connection_with(
+            "c2",
+            |id| { deleted.borrow_mut().push(id.to_string()); Ok(()) },
+            &settings,
+        )
+        .unwrap();
+        assert_eq!(after.hosts, vec![profile_conn()]);
+        assert_eq!(settings.get().hosts, vec![profile_conn()]);
+        assert_eq!(*deleted.borrow(), vec!["c2".to_string()]);
+    }
+
+    #[test]
+    fn removal_leaves_the_keychain_alone_when_keyring_ref_is_not_the_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = store_in(&dir);
+        let mut c = keys_conn();
+        c.kind = HostKind::Aws {
+            auth: AwsAuth::Keys { keyring_ref: "someone-else".into() },
+            default_region: "us-west-2".into(),
+        };
+        settings.update(AppSettings { hosts: vec![c], ..AppSettings::default() }).unwrap();
+        remove_connection_with("c2", |_| panic!("must not touch the keychain"), &settings).unwrap();
+        assert!(settings.get().hosts.is_empty());
+        assert!(remove_connection_with("c2", |_| Ok(()), &settings).is_err());
+        assert!(remove_connection_with("bad id!", |_| Ok(()), &settings).is_err());
+    }
+
+    #[test]
+    fn china_and_govcloud_regions_are_refused_for_connections() {
+        for r in ["cn-north-1", "us-gov-west-1"] {
+            let e = validated("Prod", r).unwrap_err();
+            assert!(matches!(&e, AwsError::Other { message } if message == "China and GovCloud regions aren't supported yet."), "{e:?}");
+        }
+        assert!(validated("Prod", "eu-west-1").is_ok());
     }
 }

@@ -160,6 +160,26 @@ describe("HostsSettings", () => {
     expect(screen.getByRole("button", { name: "Copy admin policy" })).toBeInTheDocument();
   });
 
+  it("shows a neutral Incomplete badge when the only blockers are failed checks", async () => {
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_aws_profiles") return [];
+      if (cmd === "check_aws_permissions")
+        return report({
+          tiers: [
+            { tier: "workspace_user", results: [{ action: "ecs:RunTask", verdict: "unverified", note: "throttled" }] },
+            { tier: "environment_admin", results: [] },
+          ],
+        });
+      throw new Error(`unexpected ${cmd}`);
+    });
+    render(<HostsSettings />);
+    fireEvent.click(screen.getByRole("button", { name: "Check Prod" }));
+    const badge = await screen.findByText("Incomplete — check again");
+    expect(badge.className).not.toContain("--error");
+    expect(screen.queryByText("Insufficient")).not.toBeInTheDocument();
+    expect(screen.getByText(/Some checks couldn't complete/)).toBeInTheDocument();
+  });
+
   it("explains denied own-principal checks as the first thing to ask an admin for", async () => {
     invoke.mockImplementation(async (cmd: string) => {
       if (cmd === "list_aws_profiles") return [];
@@ -192,7 +212,7 @@ describe("HostsSettings", () => {
     render(<HostsSettings />);
     fireEvent.click(screen.getByRole("button", { name: "Check Prod" }));
     expect(await screen.findByText(/Throttling/)).toBeInTheDocument();
-    expect(screen.getByText(/Check again/)).toBeInTheDocument();
+    expect(screen.getAllByText(/Check again/).length).toBeGreaterThan(0);
   });
 
   it("a probed check says writes are unverified", async () => {

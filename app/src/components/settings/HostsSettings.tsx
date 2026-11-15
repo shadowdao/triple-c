@@ -96,10 +96,22 @@ function ErrorLine({
 function PermissionReportView({ report }: { report: PermissionReport }) {
   const [copyNote, setCopyNote] = useState<string | null>(null);
   const probed = typeof report.method === "object";
-  const badge =
-    report.summary === "workspace_user" && probed
+  // Insufficient only because checks couldn't complete (no denied row in the
+  // workspace tier, only rows with a note): don't claim the permissions are missing.
+  const workspaceTier = report.tiers.find((t) => t.tier === "workspace_user");
+  const incomplete =
+    report.summary === "insufficient" &&
+    !!workspaceTier &&
+    !workspaceTier.results.some((r) => r.verdict === "denied") &&
+    workspaceTier.results.some((r) => r.note);
+  const badge = incomplete
+    ? "Incomplete — check again"
+    : report.summary === "workspace_user" && probed
       ? "Workspace user (unverified)"
       : SUMMARY_LABEL[report.summary];
+  const badgeStyle = incomplete
+    ? "text-[var(--text-secondary)] border-[var(--border-color)]"
+    : SUMMARY_STYLE[report.summary];
   const flagged = report.tiers
     .map((t) => ({ ...t, results: t.results.filter((r) => r.verdict !== "allowed") }))
     .filter((t) => t.results.length > 0);
@@ -122,7 +134,7 @@ function PermissionReportView({ report }: { report: PermissionReport }) {
     <div className="space-y-2 pt-2" data-testid="permission-report">
       <div className="flex items-center gap-2 flex-wrap">
         <span
-          className={`px-2 py-0.5 text-xs font-medium rounded-full border ${SUMMARY_STYLE[report.summary]}`}
+          className={`px-2 py-0.5 text-xs font-medium rounded-full border ${badgeStyle}`}
         >
           {badge}
         </span>
@@ -130,6 +142,12 @@ function PermissionReportView({ report }: { report: PermissionReport }) {
           {report.identity.arn} · {report.region}
         </span>
       </div>
+      {incomplete && (
+        <p className="text-xs text-[var(--text-secondary)] leading-snug">
+          Some checks couldn't complete (for example because AWS throttled the requests), so the
+          permissions couldn't be fully assessed. Check again in a moment.
+        </p>
+      )}
       {typeof report.method === "object" && (
         <p className="text-xs text-[var(--text-secondary)] leading-snug">
           {`Simulation not permitted (${report.method.probed.reason}). Read access was probed; write actions are unverified and will be confirmed on first use.`}

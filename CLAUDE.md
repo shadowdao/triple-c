@@ -814,6 +814,12 @@ a project's Docker volumes are deliberately out of scope — this is not a proje
   inside a generic "settings replaced" summary. Read this as the standing example of the class of
   thing to keep checking for in this feature, not a one-off fixed bug — any other field that looks
   like config but is actually a live credential would have the same problem.
+- **AWS connection keys travel in `ExportedSecrets::aws_connection_keys`** (keyed by connection id),
+  exported and restored like the marketplace tokens. `hosts` are **store-owned**: `update_settings`
+  restores them via `restore_host_fields`, and `apply_settings_import` re-applies them through
+  `StoreOwned`. `validate_imported_hosts` runs before any keychain write. The import preview
+  discloses AWS connections, key counts, overwrites (naming the local connection), failed key
+  checks and removals.
 - **Marketplace account tokens travel in `ExportedSecrets`, not in `AppSettings`.** `Token` and
   `GhContainer` accounts' tokens live in the keychain (`triple-c-marketplace-account-<id>`), so
   they follow the same "carve out of the keychain, restore before the settings replace, only

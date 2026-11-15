@@ -25,15 +25,24 @@ pub enum AwsAuth {
     Keys { keyring_ref: String },
 }
 
-/// Trimmed, 1..=64 characters, no control characters.
+/// Unicode format characters (category Cf): invisible, but able to reorder or
+/// hide text (bidi overrides, zero-width spaces). `char::is_control` is Cc only.
+fn is_format_char(c: char) -> bool {
+    matches!(c as u32,
+        0x00AD | 0x0600..=0x0605 | 0x061C | 0x06DD | 0x070F | 0x180E
+        | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x206F
+        | 0xFEFF | 0xFFF9..=0xFFFB | 0xE0001 | 0xE0020..=0xE007F)
+}
+
+/// Trimmed, 1..=64 characters, no control or invisible format characters.
 pub fn validate_connection_name(name: &str) -> Result<String, String> {
     let name = name.trim();
     let len = name.chars().count();
     if len == 0 || len > 64 {
         return Err("Connection name must be 1 to 64 characters".into());
     }
-    if name.chars().any(char::is_control) {
-        return Err("Connection name must not contain control characters".into());
+    if name.chars().any(|c| c.is_control() || is_format_char(c)) {
+        return Err("Connection name must not contain control or invisible formatting characters".into());
     }
     Ok(name.to_string())
 }
@@ -66,6 +75,21 @@ pub fn validate_region(region: &str) -> Result<String, String> {
     } else {
         Err(format!("\"{}\" is not a valid AWS region", region.escape_debug()))
     }
+}
+
+/// A region Triple-C's policies and checks can work with. Every policy and check
+/// template hard-codes the `aws` partition (`arn:aws:`), so China, GovCloud and
+/// the isolated partitions would always check as Insufficient. `validate_region`
+/// stays general (it only checks the shape); connection add/update/import use this.
+pub fn validate_supported_region(region: &str) -> Result<String, String> {
+    let region = validate_region(region)?;
+    if ["cn-", "us-gov-", "us-iso-", "us-isob-", "eu-isoe-", "us-isof-"]
+        .iter()
+        .any(|p| region.starts_with(p))
+    {
+        return Err("China and GovCloud regions aren't supported yet.".into());
+    }
+    Ok(region)
 }
 
 /// Non-empty, at most 128 characters of `[A-Za-z0-9_.@+=,-]`.
@@ -116,6 +140,16 @@ mod tests {
         for ok in ["us-west-2", "eu-central-1", "cn-north-1", "us-gov-west-1"] {
             assert_eq!(validate_region(ok).unwrap(), ok);
         }
+        for ok in ["us-west-2", "eu-central-1", "ap-southeast-4"] {
+            assert_eq!(validate_supported_region(ok).unwrap(), ok);
+        }
+        for other in ["cn-north-1", "cn-northwest-1", "us-gov-west-1", "us-gov-east-1"] {
+            assert_eq!(
+                validate_supported_region(other).unwrap_err(),
+                "China and GovCloud regions aren't supported yet."
+            );
+        }
+        assert!(validate_supported_region("nope").unwrap_err().contains("not a valid"));
         for bad in ["", "US-WEST-2", "us-west", "us-west-2; rm"] {
             assert!(validate_region(bad).is_err(), "{bad:?}");
         }
@@ -138,6 +172,10 @@ mod tests {
         assert_eq!(validate_connection_name("  Prod  ").unwrap(), "Prod");
         assert!(validate_connection_name("   ").is_err());
         assert!(validate_connection_name("a\tb").is_err());
+        for c in ['\u{202E}', '\u{200B}', '\u{2066}', '\u{2069}', '\u{FEFF}'] {
+            assert!(validate_connection_name(&format!("ab{c}cd")).is_err(), "{c:?}");
+        }
+        assert!(validate_connection_name("Prod é 日本").is_ok());
         assert!(validate_connection_name(&"a".repeat(65)).is_err());
     }
 }

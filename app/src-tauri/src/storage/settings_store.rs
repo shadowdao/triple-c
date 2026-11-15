@@ -80,4 +80,72 @@ impl SettingsStore {
         *settings = new_settings.clone();
         Ok(new_settings)
     }
+
+    /// Read-modify-save under the store's lock, so concurrent callers cannot
+    /// lose each other's updates. `f` edits a copy; if it fails, or the save
+    /// fails, memory and disk are unchanged. Returns the saved settings and
+    /// whatever `f` returned.
+    pub fn modify<R, F>(&self, f: F) -> Result<(AppSettings, R), String>
+    where
+        F: FnOnce(&mut AppSettings) -> Result<R, String>,
+    {
+        let mut settings = self.lock();
+        let mut copy = settings.clone();
+        let out = f(&mut copy)?;
+        self.save(&copy)?;
+        *settings = copy.clone();
+        Ok((copy, out))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn modify_saves_and_returns_the_closure_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SettingsStore::at_path(dir.path().join("settings.json"));
+        let (saved, n) = store
+            .modify(|s| {
+                s.hosts.clear();
+                Ok(7)
+            })
+            .unwrap();
+        assert_eq!(n, 7);
+        assert_eq!(
+            serde_json::to_value(&saved).unwrap(),
+            serde_json::to_value(store.get()).unwrap()
+        );
+        assert!(dir.path().join("settings.json").exists());
+    }
+
+    #[test]
+    fn modify_does_not_change_memory_when_save_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SettingsStore::at_path(dir.path().join("missing/settings.json"));
+        let before = serde_json::to_value(store.get()).unwrap();
+        let err = store.modify(|s| {
+            s.hosts.push(crate::models::HostConnection {
+                id: "x".into(),
+                name: "x".into(),
+                kind: crate::models::HostKind::Aws {
+                    auth: crate::models::AwsAuth::Profile { name: "p".into() },
+                    default_region: "us-west-2".into(),
+                },
+            });
+            Ok(())
+        });
+        assert!(err.is_err());
+        assert_eq!(serde_json::to_value(store.get()).unwrap(), before);
+    }
+
+    #[test]
+    fn modify_does_not_save_when_the_closure_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SettingsStore::at_path(dir.path().join("settings.json"));
+        let err = store.modify(|_| -> Result<(), String> { Err("no".into()) }).unwrap_err();
+        assert_eq!(err, "no");
+        assert!(!dir.path().join("settings.json").exists());
+    }
 }

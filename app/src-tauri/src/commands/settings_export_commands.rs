@@ -247,7 +247,7 @@ fn validate_imported_hosts(
     keys: &BTreeMap<String, String>,
 ) -> Result<(), String> {
     use crate::models::host_connection::{
-        validate_connection_name, validate_profile_name, validate_region,
+        validate_connection_name, validate_profile_name, validate_supported_region,
     };
     let wrap = |e: String| format!("The file's host connections were refused: {e}");
 
@@ -261,7 +261,7 @@ fn validate_imported_hosts(
         }
         h.name = validate_connection_name(&h.name).map_err(wrap)?;
         let HostKind::Aws { auth, default_region } = &h.kind;
-        validate_region(default_region).map_err(wrap)?;
+        validate_supported_region(default_region).map_err(wrap)?;
         match auth {
             AwsAuth::Profile { name } => {
                 validate_profile_name(name).map_err(wrap)?;
@@ -1042,6 +1042,14 @@ mod tests {
             default_region: "nowhere".into(),
         };
         assert!(check(vec![bad_region], none.clone()).is_err());
+
+        let mut cn = profile_host("p1");
+        cn.kind = HostKind::Aws {
+            auth: AwsAuth::Profile { name: "default".into() },
+            default_region: "cn-north-1".into(),
+        };
+        let err = check(vec![cn], none.clone()).unwrap_err();
+        assert!(err.contains("China and GovCloud regions aren't supported yet."), "{err}");
 
         let mut bad_profile = profile_host("p1");
         bad_profile.kind = HostKind::Aws {

@@ -96,8 +96,9 @@ the role carries the `triple-c-permissions-boundary` managed policy as its permi
   - ECS Exec channels;
   - reading `triple-c/*` secrets;
   - decrypting only through Secrets Manager, and only with environment (component-tagged) keys;
-  - mounting and writing only environment (component-tagged) file systems, with no root access,
-    because access points fix the POSIX user;
+  - mounting and writing only environment (component-tagged) file systems; whether that excludes
+    root access depends on access points fixing the POSIX user and root directory, which is only
+    true once phase 6 enforces them (see "Enforced access-point roots" under Phase 6 gaps);
   - `sts:GetCallerIdentity`;
   - invoking Bedrock models.
 - The boundary grants nothing in IAM.
@@ -172,10 +173,11 @@ Create each file as a **customer managed policy** and attach it. In the console,
 **IAM → Policies → Create policy → JSON**, paste the file, and attach the policy to a user, group
 or role. Inline policies do not fit: a role's inline policies share 10,240 characters and an
 environment admin needs both tiers (about 11,500), and a user's share 2,048. A managed policy may
-hold 6,144 characters, not counting whitespace; the workspace policy is about 6,110, and a unit
-test (`every_policy_fits_a_managed_policy`) fails before it outgrows that. For IAM Identity
-Center, add the files as inline policies on the permission set (up to 32,768 characters) or
-reference the managed policies.
+hold 6,144 characters, not counting whitespace; the workspace policy is about 6,110 (roughly 30
+characters of headroom, so phase 4 must split `workspace-user.json` into two policies before
+adding anything to it), and a unit test (`every_policy_fits_a_managed_policy`) fails before it
+outgrows that. For IAM Identity Center, add the files as inline policies on the permission set
+(the "up to 32,768 characters" limit is unverified) or reference the managed policies.
 
 With the CLI:
 
@@ -207,6 +209,13 @@ aws iam attach-user-policy --user-name <user> \
 - **The workspace tier's secret Deny also applies to admins.** If the environment stack ever
   manages component-tagged secrets through the admin's credentials, that Deny will block
   `PutSecretValue`/`DeleteSecret` for them.
+
+**Phase 5**
+
+- **No secrets in task definitions or `RunTask` overrides.** Nothing sensitive (the agent token,
+  git credentials) may travel in task-definition environment variables or in `RunTask`
+  `containerOverrides`: every workspace user can read them through `ecs:Describe*` on `*`. Use
+  Secrets Manager (`triple-c/*`) references instead.
 
 **Phase 6**
 
