@@ -28,7 +28,8 @@ use super::watch::{AwsTaskLookup, TaskGroup, WatchedTask};
 use super::ContainerTarget;
 use crate::aws::environments::EnvironmentInfo;
 use crate::aws::runtime::{
-    check_onboarded, cluster_arn_of_task, cluster_of_task, read_agent_token, read_environment,
+    check_onboarded, cluster_arn_of_task, cluster_of_task, ensure_agent_token, read_agent_token,
+    read_environment,
     remove_workspace_resources, wait_access_point, PollTiming, RemoveRequest, RuntimeApi,
     SdkRuntimeApi,
 };
@@ -36,7 +37,9 @@ use crate::aws::tasks::{
     find_or_run, find_project_task, stopped_among, task_log_stream, wait_ready, SdkTaskApi,
     TaskApi, TaskInfo, TaskLogs, WaitTiming, LOG_TAIL_LINES, STOP_REASON,
 };
-use crate::aws::tofu_modules::{log_stream_prefix, owner_key, task_family};
+use crate::aws::tofu_modules::{
+    environment_cluster_name, log_stream_prefix, owner_key, task_family,
+};
 use crate::aws::workspace::{prepare_workspace, SdkWorkspaceApi, WorkspaceApi};
 use crate::aws::{caller_identity, sdk_config, CallerIdentity};
 use crate::docker::ca_certs::{container_cert_name, ResolvedCa};
@@ -57,7 +60,13 @@ pub const PROGRESS_CONNECTING: &str = "Connecting…";
 /// A concurrent start won the RunTask race: the secret now holds a token
 /// that task never saw.
 pub const START_RACE: &str =
-    "Another start of this workspace is in progress; try again in a minute";
+    "Another start of this workspace is in progress; try again in a minute (once it is up, \
+     Start connects to it)";
+
+/// The agent refused the token from the secret (a start elsewhere rotated
+/// it, and the repair did not happen).
+pub const TOKEN_MISMATCH: &str =
+    "The workspace's access token no longer matches; stop and start the workspace";
 
 /// Per-file cap on what is shipped in the project secret (R1).
 pub const MAX_FILE_BYTES: u64 = 64 * 1024;
@@ -132,18 +141,22 @@ pub fn aws_env(project: &Project, settings: &AppSettings) -> Result<AwsEnv, Stri
     crate::docker::workspace_env::workspace_env_from_settings(&p, settings)
 }
 
-/// One file read for the secret, refusing anything over [`MAX_FILE_BYTES`].
+/// One file read for the secret, refusing anything over [`MAX_FILE_BYTES`]
+/// (enforced on the bytes read, not on a size the file could change after).
 fn read_capped(path: &Path, shown: &str) -> Result<Vec<u8>, String> {
-    let len = std::fs::metadata(path)
-        .map_err(|e| format!("Could not read {shown}: {e}"))?
-        .len();
-    if len > MAX_FILE_BYTES {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|e| format!("Could not read {shown}: {e}"))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("Could not read {shown}: {e}"))?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
         return Err(format!(
-            "{shown} is {len} bytes; files sent to an AWS workspace are limited to {} KiB each",
+            "{shown} is larger than {} KiB, the limit for each file sent to an AWS workspace",
             MAX_FILE_BYTES / 1024
         ));
     }
-    std::fs::read(path).map_err(|e| format!("Could not read {shown}: {e}"))
+    Ok(bytes)
 }
 
 /// The regular files directly in `dir`: subdirectories skipped, and a
@@ -154,13 +167,19 @@ fn files_in(dir: &Path) -> Result<Vec<(String, PathBuf)>, String> {
     let mut out = Vec::new();
     let entries =
         std::fs::read_dir(&root).map_err(|e| format!("Could not read {}: {e}", dir.display()))?;
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Could not read {}: {e}", dir.display()))?;
         let path = entry.path();
-        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-            log::warn!("Skipping {} (not a UTF-8 name)", path.display());
-            continue;
-        };
-        let Ok(ft) = entry.file_type() else { continue };
+        let name = entry.file_name().to_str().map(str::to_string).ok_or_else(|| {
+            format!(
+                "{} has a name that is not UTF-8, so it can't be sent to an AWS workspace; \
+                 rename or move it",
+                path.display()
+            )
+        })?;
+        let ft = entry
+            .file_type()
+            .map_err(|e| format!("Could not read {}: {e}", path.display()))?;
         let real = if ft.is_file() {
             path.clone()
         } else if ft.is_symlink() {
@@ -266,6 +285,15 @@ pub fn ecs_task(task: &TaskInfo) -> Result<EcsTask, String> {
     Ok(EcsTask { cluster: cluster.to_string(), task_id, runtime_id })
 }
 
+/// What the user is told when the agent answers with an error status.
+fn refusal_message(e: &str) -> String {
+    if e.contains("(401)") {
+        TOKEN_MISMATCH.into()
+    } else {
+        format!("The workspace's agent refused the connection: {e}")
+    }
+}
+
 /// Wait for the agent behind `ep` to answer. A refusal (wrong token) is
 /// final; silence is retried until [`HEALTH_TIMEOUT`].
 async fn wait_healthy(ep: &AgentEndpoint) -> Result<(), String> {
@@ -274,7 +302,7 @@ async fn wait_healthy(ep: &AgentEndpoint) -> Result<(), String> {
         match agent::is_running(ep).await {
             Ok(true) => return Ok(()),
             Ok(false) => {}
-            Err(e) => return Err(format!("The workspace's agent refused the connection: {e}")),
+            Err(e) => return Err(refusal_message(&e)),
         }
         if tokio::time::Instant::now() + HEALTH_INTERVAL > deadline {
             return Err(
@@ -315,6 +343,20 @@ pub struct StartInputs<'a> {
     pub image: &'a str,
     pub wait: WaitTiming,
     pub access_point_wait: PollTiming,
+    /// Called as soon as the project has a task (found, or RunTask
+    /// returned) so the store holds its ARN before the long wait — a crash
+    /// then still leaves the task findable — and with `None` when a task
+    /// this start ran was stopped again.
+    pub on_task: &'a (dyn Fn(Option<&TaskRecord>) + Send + Sync),
+}
+
+/// A project's task handles, for the store's `set_aws_runtime`. `None`
+/// fields keep what the store has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRecord {
+    pub task_arn: String,
+    pub access_point_id: Option<String>,
+    pub task_definition_arn: Option<String>,
 }
 
 /// A connected task.
@@ -383,6 +425,11 @@ pub async fn start_core<T: TaskApi, W: WorkspaceApi, R: RuntimeApi, C: Connector
     let (task, token, access_point_id, created) = if let Some(task) = existing {
         // Attach: never rotate a running task's token (P2).
         log::info!("Project {}: attaching to its running task {}", project.id, task.arn);
+        (inp.on_task)(Some(&TaskRecord {
+            task_arn: task.arn.clone(),
+            access_point_id: None,
+            task_definition_arn: Some(task.task_definition_arn.clone()),
+        }));
         let token = read_agent_token(rt, &env.name, &ok, &project.id).await.map_err(s)?;
         progress(PROGRESS_WAITING);
         let task = match wait_ready(tasks, &env.cluster_arn, &task.arn, &logs, inp.wait, |_| {}).await {
@@ -418,15 +465,28 @@ pub async fn start_core<T: TaskApi, W: WorkspaceApi, R: RuntimeApi, C: Connector
         .await
         .map_err(s)?;
         if start.reused {
+            // The winner repairs the token this start just rotated
+            // (`ensure_agent_token`); nothing to undo here.
+            (inp.on_task)(Some(&TaskRecord {
+                task_arn: start.task.arn.clone(),
+                access_point_id: prepared.access_point_id.clone(),
+                task_definition_arn: Some(start.task.task_definition_arn.clone()),
+            }));
             return Err(START_RACE.into());
         }
-        progress(PROGRESS_WAITING);
         let arn = start.task.arn.clone();
+        (inp.on_task)(Some(&TaskRecord {
+            task_arn: arn.clone(),
+            access_point_id: prepared.access_point_id.clone(),
+            task_definition_arn: Some(prepared.task_definition_arn.clone()),
+        }));
+        progress(PROGRESS_WAITING);
         let task = match wait_ready(tasks, &env.cluster_arn, &arn, &logs, inp.wait, |_| {}).await {
             Ok(t) => t,
             Err(e) => {
                 let msg = with_log_tail(tasks, &logs, &arn, e.to_string()).await;
                 stop_created(tasks, &env.cluster_arn, &arn).await;
+                (inp.on_task)(None);
                 return Err(msg);
             }
         };
@@ -435,17 +495,36 @@ pub async fn start_core<T: TaskApi, W: WorkspaceApi, R: RuntimeApi, C: Connector
 
     progress(PROGRESS_CONNECTING);
     match connector.connect(&task, &token).await {
-        Ok((forward, endpoint)) => Ok(Started {
-            env,
-            task,
-            forward,
-            endpoint,
-            access_point_id,
-            created,
-        }),
+        Ok((forward, endpoint)) => {
+            if created {
+                // A start that lost the RunTask race rotated the secret's
+                // token after this one wrote it; put ours back so the next
+                // attach (another machine, a restart) reads the right one.
+                match ensure_agent_token(work, rt, &env, &inp.who.user_id, &ok, &project.id, &token).await {
+                    Ok(true) => log::warn!(
+                        "Project {}: the secret's agent token had been rotated by another start; restored",
+                        project.id
+                    ),
+                    Ok(false) => {}
+                    Err(e) => log::warn!(
+                        "Project {}: could not check the secret's agent token ({e}); a later attach may be refused",
+                        project.id
+                    ),
+                }
+            }
+            Ok(Started {
+                env,
+                task,
+                forward,
+                endpoint,
+                access_point_id,
+                created,
+            })
+        }
         Err(e) => {
             if created {
                 stop_created(tasks, &env.cluster_arn, &task.arn).await;
+                (inp.on_task)(None);
             }
             Err(e)
         }
@@ -469,8 +548,15 @@ async fn project_sdk(project: &Project, settings: &AppSettings) -> Result<(Strin
 pub async fn ensure_started(
     project: &Project,
     settings: &AppSettings,
+    store: &ProjectsStore,
     progress: &(dyn Fn(&str) + Send + Sync),
 ) -> Result<ContainerTarget, String> {
+    // A background re-attach (after a restart) is opening the tunnel: wait
+    // for it rather than racing it with a second one.
+    if tunnels::is_pending(&project.id) {
+        progress(PROGRESS_CONNECTING);
+        tunnels::wait_endpoint(&project.id, REATTACH_WAIT).await;
+    }
     // Already connected and answering: nothing to do.
     if let Some(ep) = tunnels::get_endpoint(&project.id) {
         if matches!(agent::is_running(&ep).await, Ok(true)) {
@@ -490,6 +576,7 @@ pub async fn ensure_started(
 
     let (connection_id, region, sdk) = project_sdk(project, settings).await?;
     let who = caller_identity(&sdk).await.map_err(s)?;
+    let on_task = |rec: Option<&TaskRecord>| record_task(store, &project.id, rec);
     let started = start_core(
         &SdkTaskApi::new(&sdk),
         &SdkWorkspaceApi::new(&sdk),
@@ -503,6 +590,7 @@ pub async fn ensure_started(
             image: &image,
             wait: WaitTiming::default(),
             access_point_wait: PollTiming::default(),
+            on_task: &on_task,
         },
         progress,
     )
@@ -539,6 +627,31 @@ pub async fn ensure_started(
     Ok(ContainerTarget::Agent(endpoint))
 }
 
+/// Write a start's task handles to the store as soon as they exist
+/// ([`StartInputs::on_task`]); `None` clears the task ARN.
+pub fn record_task(store: &ProjectsStore, project_id: &str, rec: Option<&TaskRecord>) {
+    let Some(stored) = store.get(project_id).and_then(|p| p.aws) else {
+        return;
+    };
+    let res = match rec {
+        Some(r) => store.set_aws_runtime(
+            project_id,
+            Some(r.task_arn.clone()),
+            r.access_point_id.clone().or(stored.access_point_id),
+            r.task_definition_arn.clone().or(stored.task_definition_arn),
+        ),
+        None => store.set_aws_runtime(
+            project_id,
+            None,
+            stored.access_point_id,
+            stored.task_definition_arn,
+        ),
+    };
+    if let Err(e) = res {
+        log::warn!("Project {project_id}: could not record its task: {e}");
+    }
+}
+
 // ──────────────────────────────────────────────────────────────── stop
 
 /// StopTask the task in `task_arn`'s cluster.
@@ -563,6 +676,49 @@ pub async fn stop_endpoint(ep: &AgentEndpoint) -> Option<Result<(), String>> {
     Some(res)
 }
 
+/// Where to look for a project's live task when no ARN is stored (a crash
+/// before the store write, or a store from an older build).
+pub struct FindTask {
+    pub cluster: String,
+    pub family: String,
+    pub owner_user_id: String,
+    pub project_id: String,
+}
+
+impl FindTask {
+    fn new(project: &Project, region: &str, owner_user_id: &str) -> Self {
+        let env = project
+            .aws_placement
+            .as_ref()
+            .map(|p| p.environment.clone())
+            .unwrap_or_default();
+        let ok = owner_key(region, owner_user_id);
+        FindTask {
+            cluster: environment_cluster_name(&env),
+            family: task_family(&env, &ok, &project.id),
+            owner_user_id: owner_user_id.to_string(),
+            project_id: project.id.clone(),
+        }
+    }
+}
+
+/// The project's task ARN: the stored one, else its live task's.
+async fn task_arn_or_find<T: TaskApi>(
+    api: &T,
+    stored: Option<&str>,
+    find: &FindTask,
+) -> Result<Option<String>, String> {
+    if let Some(a) = stored {
+        return Ok(Some(a.to_string()));
+    }
+    Ok(
+        find_project_task(api, &find.cluster, &find.family, &find.owner_user_id, &find.project_id)
+            .await
+            .map_err(s)?
+            .map(|t| t.arn),
+    )
+}
+
 /// Stop an AWS project's task: through its tunnel when there is one, else
 /// the stored task ARN, else whatever live task the project has (a crash
 /// between RunTask and the store write). Closes the tunnel.
@@ -578,13 +734,8 @@ pub async fn stop_project(project: &Project, settings: &AppSettings) -> Result<(
     let arn = match stored {
         Some(a) => Some(a),
         None => {
-            let env = project.aws_placement.as_ref().map(|p| p.environment.clone()).unwrap_or_default();
             let who = caller_identity(&sdk).await.map_err(s)?;
-            let ok = owner_key(&region, &who.user_id);
-            find_project_task(&api, &format!("triple-c-{env}"), &task_family(&env, &ok, &project.id), &who.user_id, &project.id)
-                .await
-                .map_err(s)?
-                .map(|t| t.arn)
+            task_arn_or_find(&api, None, &FindTask::new(project, &region, &who.user_id)).await?
         }
     };
     if let Some(arn) = arn {
@@ -598,13 +749,13 @@ pub async fn stop_project(project: &Project, settings: &AppSettings) -> Result<(
 
 /// Stop the task and remove the project's AWS resources (task definition
 /// revisions, the secret with a 7-day window, and with `discard_data` the
-/// access point).
+/// access point). The tunnel is closed once that succeeded; on failure the
+/// project keeps it.
 pub async fn remove_resources(
     project: &Project,
     settings: &AppSettings,
     discard_data: bool,
 ) -> Result<(), String> {
-    tunnels::close(&project.id).await;
     let (_, region, sdk) = project_sdk(project, settings).await?;
     let who = caller_identity(&sdk).await.map_err(s)?;
     let ok = owner_key(&region, &who.user_id);
@@ -626,7 +777,9 @@ pub async fn remove_resources(
         },
     )
     .await
-    .map_err(s)
+    .map_err(s)?;
+    tunnels::close(&project.id).await;
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────── reconcile
@@ -640,15 +793,20 @@ pub enum Reconciled {
     Gone,
 }
 
-/// Ask ECS about a project's stored task. No stored task is `Gone`.
-pub async fn reconcile_task<T: TaskApi>(api: &T, task_arn: Option<&str>) -> Result<Reconciled, String> {
-    let Some(arn) = task_arn else {
+/// Ask ECS about a project's task: the stored ARN, else (none stored) its
+/// live task found by family and tags.
+pub async fn reconcile_task<T: TaskApi>(
+    api: &T,
+    task_arn: Option<&str>,
+    find: &FindTask,
+) -> Result<Reconciled, String> {
+    let Some(arn) = task_arn_or_find(api, task_arn, find).await? else {
         return Ok(Reconciled::Gone);
     };
-    let Some(cluster) = cluster_of_task(arn) else {
+    let Some(cluster) = cluster_of_task(&arn) else {
         return Ok(Reconciled::Gone);
     };
-    let found = api.describe(cluster, &[arn.to_string()]).await.map_err(s)?;
+    let found = api.describe(cluster, std::slice::from_ref(&arn)).await.map_err(s)?;
     Ok(match found.into_iter().find(|t| t.arn == arn) {
         Some(t)
             if t.desired_status == "RUNNING"
@@ -662,23 +820,34 @@ pub async fn reconcile_task<T: TaskApi>(api: &T, task_arn: Option<&str>) -> Resu
 
 /// Reconcile one AWS project the store has as Running (or Starting/
 /// Stopping/Error left by a crash): a gone task makes it Stopped (its task
-/// ARN cleared); a live one keeps it Running. An ECS that can't be asked
-/// changes nothing — marking Stopped would hide a billed task.
+/// ARN cleared); a live one keeps it Running and its ARN stored. An ECS
+/// that can't be asked changes nothing — marking Stopped would hide a
+/// billed task.
 pub async fn reconcile_project<T: TaskApi>(
     api: &T,
     store: &ProjectsStore,
     project: &Project,
+    find: &FindTask,
 ) -> Result<Reconciled, String> {
     let arn = project.aws.as_ref().and_then(|a| a.task_arn.clone());
-    let r = reconcile_task(api, arn.as_deref()).await?;
+    let r = reconcile_task(api, arn.as_deref(), find).await?;
     match &r {
         Reconciled::Gone => {
             store.update_status(&project.id, ProjectStatus::Stopped)?;
-            if let Some(a) = project.aws.as_ref() {
-                store.set_aws_runtime(&project.id, None, a.access_point_id.clone(), a.task_definition_arn.clone())?;
-            }
+            record_task(store, &project.id, None);
         }
-        Reconciled::Live(_) => {
+        Reconciled::Live(t) => {
+            if arn.as_deref() != Some(t.arn.as_str()) {
+                record_task(
+                    store,
+                    &project.id,
+                    Some(&TaskRecord {
+                        task_arn: t.arn.clone(),
+                        access_point_id: None,
+                        task_definition_arn: Some(t.task_definition_arn.clone()),
+                    }),
+                );
+            }
             if project.status != ProjectStatus::Running {
                 store.update_status(&project.id, ProjectStatus::Running)?;
             }
@@ -698,13 +867,22 @@ pub async fn reconcile(project: &Project, settings: &AppSettings, store: Arc<Pro
             return;
         }
     };
+    let who = match caller_identity(&sdk).await {
+        Ok(w) => w,
+        Err(e) => {
+            log::warn!("Project {}: could not reach AWS to reconcile ({e}); status left as is", project.id);
+            return;
+        }
+    };
     let api = SdkTaskApi::new(&sdk);
-    match reconcile_project(&api, &store, project).await {
+    let find = FindTask::new(project, &region, &who.user_id);
+    match reconcile_project(&api, &store, project, &find).await {
         Ok(Reconciled::Live(task)) => {
-            tunnels::set_pending(&project.id, true);
+            let generation = tunnels::begin_reattach(&project.id);
             let project = project.clone();
             tauri::async_runtime::spawn(async move {
-                if let Err(e) = reattach(&project, *task, connection_id, region, sdk, &store).await {
+                let ctx = Reattach { generation, connection_id, region, sdk, who };
+                if let Err(e) = reattach(&project, *task, ctx, &store).await {
                     log::warn!("Project {}: could not re-open the tunnel to its task: {e}", project.id);
                     tunnels::set_pending(&project.id, false);
                 }
@@ -717,43 +895,73 @@ pub async fn reconcile(project: &Project, settings: &AppSettings, store: Arc<Pro
     }
 }
 
+struct Reattach {
+    generation: u64,
+    connection_id: String,
+    region: String,
+    sdk: SdkConfig,
+    who: CallerIdentity,
+}
+
+/// Whether a re-attach may still register: the project exists, is Running
+/// and still has this task. A Stop or Remove meanwhile also bumps the
+/// registry's generation, which `register_if_current` checks.
+pub fn reattach_still_wanted(store: &ProjectsStore, project_id: &str, task_arn: &str) -> bool {
+    store.get(project_id).is_some_and(|p| {
+        p.status == ProjectStatus::Running
+            && p.aws.as_ref().and_then(|a| a.task_arn.as_deref()) == Some(task_arn)
+    })
+}
+
 /// Re-open the tunnel to a live task found at startup.
 async fn reattach(
     project: &Project,
     task: TaskInfo,
-    connection_id: String,
-    region: String,
-    sdk: SdkConfig,
+    ctx: Reattach,
     store: &ProjectsStore,
 ) -> Result<(), String> {
-    let env = project.aws_placement.as_ref().map(|p| p.environment.clone()).unwrap_or_default();
-    let who = caller_identity(&sdk).await.map_err(s)?;
-    let ok = owner_key(&region, &who.user_id);
-    let rt = SdkRuntimeApi::new(&sdk);
-    let api = SdkTaskApi::new(&sdk);
-    let token = read_agent_token(&rt, &env, &ok, &project.id).await.map_err(s)?;
-    let cluster_arn = cluster_arn_of_task(&task.arn).ok_or("bad task ARN")?;
-    let logs = TaskLogs { group: format!("/triple-c/{env}"), stream_prefix: log_stream_prefix(&ok, &project.id) };
-    let task = wait_ready(&api, &cluster_arn, &task.arn, &logs, WaitTiming::default(), |_| {})
+    let placement = project.aws_placement.as_ref().ok_or("no placement")?;
+    let ok = owner_key(&ctx.region, &ctx.who.user_id);
+    let rt = SdkRuntimeApi::new(&ctx.sdk);
+    let api = SdkTaskApi::new(&ctx.sdk);
+    let env = read_environment(&rt, &placement.environment, &ctx.who.account, &ctx.region)
         .await
         .map_err(s)?;
-    let (forward, endpoint) = SsmConnector { sdk: sdk.clone() }.connect(&task, &token).await?;
-    if let Some(old) = tunnels::register(
-        &project.id,
-        LiveTunnel {
-            task: ecs_task(&task)?,
-            task_arn: task.arn.clone(),
-            cluster_arn,
-            connection_id,
-            region,
-            sdk,
-            forward,
-            endpoint: endpoint.clone(),
-            access_point_id: project.aws.as_ref().and_then(|a| a.access_point_id.clone()),
-            task_definition_arn: task.task_definition_arn.clone(),
-        },
-    ) {
-        old.forward.close().await;
+    let token = read_agent_token(&rt, &env.name, &ok, &project.id).await.map_err(s)?;
+    let logs = TaskLogs { group: env.log_group.clone(), stream_prefix: log_stream_prefix(&ok, &project.id) };
+    let task = wait_ready(&api, &env.cluster_arn, &task.arn, &logs, WaitTiming::default(), |_| {})
+        .await
+        .map_err(s)?;
+    let (forward, endpoint) = SsmConnector { sdk: ctx.sdk.clone() }.connect(&task, &token).await?;
+    let tunnel = LiveTunnel {
+        task: ecs_task(&task)?,
+        task_arn: task.arn.clone(),
+        cluster_arn: env.cluster_arn.clone(),
+        connection_id: ctx.connection_id,
+        region: ctx.region,
+        sdk: ctx.sdk,
+        forward,
+        endpoint: endpoint.clone(),
+        access_point_id: project.aws.as_ref().and_then(|a| a.access_point_id.clone()),
+        task_definition_arn: task.task_definition_arn.clone(),
+    };
+    if !reattach_still_wanted(store, &project.id, &task.arn) {
+        tunnel.forward.close().await;
+        tunnels::set_pending(&project.id, false);
+        log::info!("Project {}: stopped or removed while re-attaching; tunnel closed", project.id);
+        return Ok(());
+    }
+    match tunnels::register_if_current(&project.id, ctx.generation, tunnel) {
+        Ok(old) => {
+            if let Some(old) = old {
+                old.forward.close().await;
+            }
+        }
+        Err(tunnel) => {
+            tunnel.forward.close().await;
+            log::info!("Project {}: stopped or removed while re-attaching; tunnel closed", project.id);
+            return Ok(());
+        }
     }
     // The local port is new, so the stored target id is too.
     store.set_container_id(&project.id, Some(endpoint.base_url.to_string()))?;

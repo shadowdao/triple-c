@@ -17,6 +17,7 @@ use super::ContainerTarget;
 use crate::docker;
 use crate::models::{AppSettings, Project};
 use crate::models::container_config;
+use crate::storage::projects_store::ProjectsStore;
 
 /// The host a project runs on: the local Docker daemon, or an ECS Fargate
 /// task in an AWS environment (`aws_host.rs`; the connection, region and
@@ -56,17 +57,20 @@ impl ProjectHost {
     ///
     /// `progress` receives the same human-readable steps the start view has
     /// always shown. Failure leaves the caller to reset the project status.
+    /// `store`: the AWS host records a task's ARN in it as soon as the task
+    /// exists, so a crash during the long wait leaves it findable.
     pub async fn ensure_started(
         &self,
         project: &Project,
         settings: &AppSettings,
+        store: &ProjectsStore,
         progress: &(dyn Fn(&str) + Send + Sync),
     ) -> Result<ContainerTarget, String> {
         match self {
             ProjectHost::Docker => docker_ensure_started(project, settings, progress)
                 .await
                 .map(ContainerTarget::docker),
-            ProjectHost::Aws => super::aws_host::ensure_started(project, settings, progress).await,
+            ProjectHost::Aws => super::aws_host::ensure_started(project, settings, store, progress).await,
         }
     }
 
@@ -329,6 +333,8 @@ mod tests {
     async fn a_project_container_round_trips_through_the_host() {
         let project = Project::new("lifecycle-live-test".to_string(), Vec::new());
         let settings = AppSettings::default();
+        let store_dir = tempfile::tempdir().expect("temp dir");
+        let store = ProjectsStore::over_file_for_test(store_dir.path().join("projects.json"), Vec::new());
         let host = ProjectHost::for_project(&project);
         let steps = std::sync::Mutex::new(Vec::<String>::new());
         let progress = |m: &str| steps.lock().unwrap().push(m.to_string());
@@ -341,7 +347,7 @@ mod tests {
         let outcome = async {
             check(host.find_current(&project).await?.is_none(), "no container before the first start")?;
 
-            let first = host.ensure_started(&project, &settings, &progress).await?;
+            let first = host.ensure_started(&project, &settings, &store, &progress).await?;
             check(first.is_running().await?, "running after start")?;
             let (out, code) = first
                 .exec_oneshot_env_status(vec!["id".into(), "-un".into()], vec![])
@@ -353,7 +359,7 @@ mod tests {
             check(first.has_exited().await, "exited after stop")?;
 
             // Same config, so the existing container is started, not recreated.
-            let second = host.ensure_started(&project, &settings, &progress).await?;
+            let second = host.ensure_started(&project, &settings, &store, &progress).await?;
             check(second == first, "restart reuses the container")?;
             check(second.is_running().await?, "running after restart")?;
 

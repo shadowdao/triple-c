@@ -239,7 +239,11 @@ pub fn spawn(
                     );
                 }
                 let id = p.id.clone();
-                tauri::async_runtime::spawn(async move { crate::host::tunnels::close(&id).await });
+                if let Some(arn) = p.aws.as_ref().and_then(|a| a.task_arn.clone()) {
+                    tauri::async_runtime::spawn(async move {
+                        crate::host::tunnels::close_if_task(&id, &arn).await
+                    });
+                }
             }
             let _ = app.emit(CONTAINER_EXITED_EVENT, ContainerExited { project: p, reason });
         })

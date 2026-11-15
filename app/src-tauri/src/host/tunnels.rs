@@ -62,6 +62,9 @@ struct Registry {
     stopped: HashSet<String>,
     /// Projects whose tunnel is being re-opened in the background.
     pending: HashSet<String>,
+    /// Bumped by every [`close`] (a stop or remove): a background re-attach
+    /// that began under an older generation must not register.
+    generation: HashMap<String, u64>,
 }
 
 fn registry() -> &'static Mutex<Registry> {
@@ -132,11 +135,55 @@ pub(crate) fn owner_of(ep: &AgentEndpoint) -> Option<(String, SdkConfig)> {
         .map(|(id, t)| (id.clone(), t.sdk.clone()))
 }
 
-/// Take the project's tunnel out and close it.
+/// A background re-attach of `project_id` begins: marks it pending and
+/// returns the generation [`register_if_current`] must still see.
+pub fn begin_reattach(project_id: &str) -> u64 {
+    let g = {
+        let mut r = lock();
+        r.pending.insert(project_id.to_string());
+        *r.generation.entry(project_id.to_string()).or_default()
+    };
+    notify();
+    g
+}
+
+/// [`register`], unless the project was closed (stopped, removed) since
+/// `generation` was taken: then the tunnel is handed back for the caller to
+/// close, and nothing is registered.
+pub fn register_if_current(
+    project_id: &str,
+    generation: u64,
+    tunnel: LiveTunnel,
+) -> Result<Option<LiveTunnel>, Box<LiveTunnel>> {
+    let old = {
+        let mut r = lock();
+        if r.generation.get(project_id).copied().unwrap_or_default() != generation {
+            return Err(Box::new(tunnel));
+        }
+        r.stopped.remove(tunnel.endpoint.base_url.as_str());
+        r.pending.remove(project_id);
+        r.live.insert(project_id.to_string(), tunnel)
+    };
+    notify();
+    Ok(old)
+}
+
+/// [`close`], but only when the registered tunnel leads to `task_arn` (a
+/// death report about an older task must not close a newer one's tunnel).
+pub async fn close_if_task(project_id: &str, task_arn: &str) {
+    let matches = lock().live.get(project_id).is_some_and(|t| t.task_arn == task_arn);
+    if matches {
+        close(project_id).await;
+    }
+}
+
+/// Take the project's tunnel out and close it, and invalidate a background
+/// re-attach in flight.
 pub async fn close(project_id: &str) {
     let taken = {
         let mut r = lock();
         r.pending.remove(project_id);
+        *r.generation.entry(project_id.to_string()).or_default() += 1;
         let t = r.live.remove(project_id);
         if let Some(ref t) = t {
             r.stopped.remove(t.endpoint.base_url.as_str());
@@ -155,6 +202,9 @@ pub async fn close_all() {
         let mut r = lock();
         r.pending.clear();
         r.stopped.clear();
+        for g in r.generation.values_mut() {
+            *g += 1;
+        }
         r.live.drain().map(|(_, t)| t).collect()
     };
     notify();
@@ -277,6 +327,37 @@ pub(crate) mod tests {
         old.forward.close().await;
         close(&p).await;
         assert_eq!(closes.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_reattach_that_began_before_a_stop_does_not_register() {
+        let closes = Arc::new(AtomicUsize::new(0));
+        let p = pid("gen");
+        let g = begin_reattach(&p);
+        assert!(is_pending(&p));
+        close(&p).await; // the user stopped the project meanwhile
+        let back = register_if_current(&p, g, fake_tunnel(61005, closes.clone()));
+        let t = back.err().expect("handed back, not registered");
+        assert!(get_endpoint(&p).is_none() && !is_pending(&p));
+        t.forward.close().await;
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+
+        let g = begin_reattach(&p);
+        assert!(register_if_current(&p, g, fake_tunnel(61006, closes.clone())).is_ok());
+        assert!(get_endpoint(&p).is_some());
+        close(&p).await;
+    }
+
+    #[tokio::test]
+    async fn a_death_report_closes_only_the_tunnel_of_the_task_that_died() {
+        let closes = Arc::new(AtomicUsize::new(0));
+        let p = pid("died");
+        register(&p, fake_tunnel(61007, closes.clone()));
+        close_if_task(&p, "arn:aws:ecs:eu-west-1:111122223333:task/triple-c-dev/older").await;
+        assert!(get_endpoint(&p).is_some(), "a newer task's tunnel stays");
+        close_if_task(&p, "arn:aws:ecs:eu-west-1:111122223333:task/triple-c-dev/t61007").await;
+        assert!(get_endpoint(&p).is_none());
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

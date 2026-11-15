@@ -89,6 +89,10 @@ struct Fake {
     connect_fails: bool,
     connect_tokens: Mutex<Vec<String>>,
     secret_json: Mutex<Option<String>>,
+    /// A losing start rotates the secret's token while this one connects.
+    rotated_by_loser: bool,
+    /// What `on_task` was told, in order.
+    recorded: Mutex<Vec<Option<String>>>,
 }
 
 impl Fake {
@@ -191,7 +195,12 @@ impl RuntimeApi for Fake {
     }
     async fn secret_string(&self, _name: &str) -> Result<String, AwsError> {
         self.log("get-secret");
-        Ok(r#"{"TRIPLEC_AGENT_TOKEN":"token-of-the-running-task"}"#.into())
+        Ok(self
+            .secret_json
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| r#"{"TRIPLEC_AGENT_TOKEN":"token-of-the-running-task"}"#.into()))
     }
     async fn access_point_state(&self, id: &str) -> Result<Option<String>, AwsError> {
         self.log(format!("ap-state {id}"));
@@ -219,6 +228,12 @@ impl Connector for Fake {
     ) -> Result<(Box<dyn TunnelHandle>, AgentEndpoint), String> {
         self.log("connect");
         self.connect_tokens.lock().unwrap().push(token.into());
+        if self.rotated_by_loser {
+            let mut j = self.secret_json.lock().unwrap();
+            let mut v: serde_json::Value = serde_json::from_str(j.as_deref().unwrap()).unwrap();
+            v["TRIPLEC_AGENT_TOKEN"] = "the-losers-token".into();
+            *j = Some(v.to_string());
+        }
         if self.connect_fails {
             return Err("session-manager-plugin was not found".into());
         }
@@ -229,8 +244,13 @@ impl Connector for Fake {
     }
 }
 
-fn inputs<'a>(p: &'a Project, who: &'a CallerIdentity) -> StartInputs<'a> {
+fn inputs<'a>(
+    p: &'a Project,
+    who: &'a CallerIdentity,
+    on_task: &'a (dyn Fn(Option<&TaskRecord>) + Send + Sync),
+) -> StartInputs<'a> {
     StartInputs {
+        on_task,
         project: p,
         who,
         env_pairs: &[],
@@ -251,7 +271,10 @@ async fn start(fake: &Fake, p: &Project) -> (Result<Started, String>, Vec<String
     let w = who();
     let steps = Mutex::new(Vec::new());
     let progress = |m: &str| steps.lock().unwrap().push(m.to_string());
-    let r = start_core(fake, fake, fake, fake, &inputs(p, &w), &progress).await;
+    let on_task = |r: Option<&TaskRecord>| {
+        fake.recorded.lock().unwrap().push(r.map(|r| r.task_arn.clone()));
+    };
+    let r = start_core(fake, fake, fake, fake, &inputs(p, &w, &on_task), &progress).await;
     (r, steps.into_inner().unwrap())
 }
 
@@ -268,11 +291,12 @@ async fn a_first_start_prepares_runs_waits_and_connects_in_that_order() {
         fake.calls(),
         vec![
             "record dev", "role", "list", "create-ap", "put-secret", "register",
-            "ap-state fsap-new", "list", "run", "connect"
+            "ap-state fsap-new", "list", "run", "connect", "get-secret"
         ],
         "look for a live task before rotating the token; the access point is available before RunTask"
     );
     assert_eq!(steps, vec![PROGRESS_READING, PROGRESS_PREPARING, PROGRESS_STARTING, PROGRESS_WAITING, PROGRESS_CONNECTING]);
+    assert_eq!(*fake.recorded.lock().unwrap(), vec![Some(task_arn("new"))], "recorded before the wait");
     // The connector got the token the secret was just written with.
     let secret: serde_json::Value =
         serde_json::from_str(fake.secret_json.lock().unwrap().as_deref().unwrap()).unwrap();
@@ -312,6 +336,7 @@ async fn losing_the_run_race_is_a_clear_error_and_nothing_is_stopped() {
     .with_task(other);
     let (r, _) = start(&fake, &p).await;
     assert_eq!(r.err().as_deref(), Some(START_RACE));
+    assert_eq!(*fake.recorded.lock().unwrap(), vec![Some(task_arn("other"))], "the live task is recorded");
     assert!(!fake.called("run") && !fake.called("stop") && !fake.called("connect"));
 }
 
@@ -341,6 +366,11 @@ async fn a_task_that_never_gets_ready_is_stopped_and_its_log_shown() {
     let e = r.err().unwrap();
     assert!(e.contains("did not become ready") && e.contains("pulling image"), "{e}");
     assert!(fake.calls().contains(&format!("stop {} {STOP_REASON}", task_arn("slow"))));
+    assert_eq!(
+        *fake.recorded.lock().unwrap(),
+        vec![Some(task_arn("slow")), None],
+        "the ARN is stored before the wait, and forgotten once the task is stopped"
+    );
 }
 
 #[tokio::test]
@@ -365,6 +395,11 @@ async fn a_tunnel_failure_stops_a_task_this_start_ran_but_never_an_attached_one(
     let (r, _) = start(&attached, &p).await;
     assert!(r.is_err());
     assert!(!attached.called("stop"));
+    assert_eq!(
+        *attached.recorded.lock().unwrap(),
+        vec![Some(task_arn("live"))],
+        "an attached task stays recorded: it is still running"
+    );
 }
 
 #[tokio::test]
@@ -380,8 +415,7 @@ async fn a_user_who_has_not_joined_is_told_before_anything_is_written() {
 
 #[test]
 fn aws_runs_registry_images_only() {
-    let mut s = AppSettings::default();
-    s.image_source = ImageSource::LocalBuild;
+    let mut s = AppSettings { image_source: ImageSource::LocalBuild, ..Default::default() };
     assert_eq!(aws_image(&s).unwrap(), REGISTRY_IMAGE);
     s.image_source = ImageSource::Registry;
     assert_eq!(aws_image(&s).unwrap(), REGISTRY_IMAGE);
@@ -478,6 +512,10 @@ async fn an_aws_projects_target_is_its_registered_tunnel() {
     assert_eq!(ProjectHost::for_project(&local), ProjectHost::Docker);
 }
 
+fn find(p: &Project) -> FindTask {
+    FindTask::new(p, REGION, USER)
+}
+
 fn store_with(p: &Project) -> (tempfile::TempDir, ProjectsStore) {
     let dir = tempfile::tempdir().unwrap();
     let store = ProjectsStore::over_file_for_test(dir.path().join("projects.json"), vec![p.clone()]);
@@ -496,7 +534,7 @@ async fn reconcile_marks_a_project_whose_task_stopped_as_stopped() {
     }
     let fake = Fake::default().with_task(task(&p, "gone", "STOPPED", false));
     let (_d, store) = store_with(&p);
-    assert_eq!(reconcile_project(&fake, &store, &p).await.unwrap(), Reconciled::Gone);
+    assert_eq!(reconcile_project(&fake, &store, &p, &find(&p)).await.unwrap(), Reconciled::Gone);
     let after = store.get(&p.id).unwrap();
     assert_eq!(after.status, ProjectStatus::Stopped);
     let a = after.aws.unwrap();
@@ -506,7 +544,7 @@ async fn reconcile_marks_a_project_whose_task_stopped_as_stopped() {
     // ECS has forgotten it: also gone.
     let forgotten = Fake::default();
     let (_d, store) = store_with(&p);
-    assert_eq!(reconcile_project(&forgotten, &store, &p).await.unwrap(), Reconciled::Gone);
+    assert_eq!(reconcile_project(&forgotten, &store, &p, &find(&p)).await.unwrap(), Reconciled::Gone);
     assert_eq!(store.get(&p.id).unwrap().status, ProjectStatus::Stopped);
 }
 
@@ -517,7 +555,7 @@ async fn reconcile_keeps_a_project_with_a_live_task_running() {
     p.aws.as_mut().unwrap().task_arn = Some(task_arn("up"));
     let fake = Fake::default().with_task(task(&p, "up", "RUNNING", true));
     let (_d, store) = store_with(&p);
-    assert!(matches!(reconcile_project(&fake, &store, &p).await.unwrap(), Reconciled::Live(_)));
+    assert!(matches!(reconcile_project(&fake, &store, &p, &find(&p)).await.unwrap(), Reconciled::Live(_)));
     assert_eq!(store.get(&p.id).unwrap().status, ProjectStatus::Running);
 }
 
@@ -540,4 +578,96 @@ async fn the_watch_reports_a_running_aws_project_as_its_stored_target_and_confir
     assert!(watched_task(&stopped).is_none(), "a Stopped project is not polled again");
     let local = Project::new("l".into(), Vec::new());
     assert!(watched_task(&local).is_none());
+}
+
+#[tokio::test]
+async fn the_winner_of_a_start_race_puts_its_token_back_in_the_secret() {
+    let p = aws_project(StorageMode::Ephemeral);
+    let fake = Fake {
+        run: Some(task(&p, "new", "RUNNING", true)),
+        rotated_by_loser: true,
+        ..Default::default()
+    };
+    let (r, _) = start(&fake, &p).await;
+    r.unwrap();
+    let ours = fake.connect_tokens.lock().unwrap()[0].clone();
+    let calls = fake.calls();
+    assert_eq!(&calls[calls.len() - 3..], ["connect", "get-secret", "put-secret"]);
+    let v: serde_json::Value =
+        serde_json::from_str(fake.secret_json.lock().unwrap().as_deref().unwrap()).unwrap();
+    assert_eq!(v["TRIPLEC_AGENT_TOKEN"], ours.as_str());
+    assert!(v.get("TRIPLEC_FILES").is_some(), "the rest of the payload is kept");
+}
+
+#[tokio::test]
+async fn an_unchanged_secret_is_not_rewritten_after_a_start() {
+    let p = aws_project(StorageMode::Ephemeral);
+    let fake = Fake { run: Some(task(&p, "new", "RUNNING", true)), ..Default::default() };
+    start(&fake, &p).await.0.unwrap();
+    assert_eq!(fake.calls().iter().filter(|c| *c == "put-secret").count(), 1);
+}
+
+#[test]
+fn a_refused_token_says_to_restart_the_workspace() {
+    assert_eq!(
+        refusal_message("Agent health check failed: the agent rejected the credentials (401)"),
+        TOKEN_MISMATCH
+    );
+    assert!(refusal_message("Agent health check failed: agent returned HTTP 500").contains("500"));
+}
+
+#[tokio::test]
+async fn reconcile_finds_a_task_whose_arn_was_never_stored() {
+    // The app quit during "Waiting for the task" in a build that stored the
+    // ARN only at the end: the task is found by family and tags.
+    let mut p = aws_project(StorageMode::Ephemeral);
+    p.status = ProjectStatus::Running;
+    let live = task(&p, "orphan", "RUNNING", true);
+    let fake = Fake { listed: Mutex::new(vec![vec![live.arn.clone()]]), ..Default::default() }
+        .with_task(live);
+    let (_d, store) = store_with(&p);
+    assert!(matches!(
+        reconcile_project(&fake, &store, &p, &find(&p)).await.unwrap(),
+        Reconciled::Live(_)
+    ));
+    let after = store.get(&p.id).unwrap();
+    assert_eq!(after.status, ProjectStatus::Running);
+    assert_eq!(after.aws.unwrap().task_arn, Some(task_arn("orphan")), "now stored");
+
+    let nothing = Fake::default();
+    let (_d, store) = store_with(&p);
+    assert_eq!(reconcile_project(&nothing, &store, &p, &find(&p)).await.unwrap(), Reconciled::Gone);
+    assert_eq!(store.get(&p.id).unwrap().status, ProjectStatus::Stopped);
+}
+
+#[test]
+fn a_reattach_registers_only_while_the_project_still_runs_that_task() {
+    let mut p = aws_project(StorageMode::Ephemeral);
+    p.status = ProjectStatus::Running;
+    p.aws.as_mut().unwrap().task_arn = Some(task_arn("t"));
+    let (_d, store) = store_with(&p);
+    assert!(reattach_still_wanted(&store, &p.id, &task_arn("t")));
+    assert!(!reattach_still_wanted(&store, &p.id, &task_arn("other")));
+    store.update_status(&p.id, ProjectStatus::Stopping).unwrap();
+    assert!(!reattach_still_wanted(&store, &p.id, &task_arn("t")));
+    store.remove(&p.id).unwrap();
+    assert!(!reattach_still_wanted(&store, &p.id, &task_arn("t")));
+}
+
+#[test]
+fn a_start_records_its_task_and_keeps_the_stored_handles_it_does_not_know() {
+    let mut p = aws_project(StorageMode::Hybrid);
+    p.aws.as_mut().unwrap().access_point_id = Some("fsap-old".into());
+    let (_d, store) = store_with(&p);
+    record_task(
+        &store,
+        &p.id,
+        Some(&TaskRecord { task_arn: "arn:t".into(), access_point_id: None, task_definition_arn: Some("arn:td:2".into()) }),
+    );
+    let a = store.get(&p.id).unwrap().aws.unwrap();
+    assert_eq!((a.task_arn.as_deref(), a.access_point_id.as_deref(), a.task_definition_arn.as_deref()),
+        (Some("arn:t"), Some("fsap-old"), Some("arn:td:2")));
+    record_task(&store, &p.id, None);
+    let a = store.get(&p.id).unwrap().aws.unwrap();
+    assert_eq!((a.task_arn, a.access_point_id.as_deref()), (None, Some("fsap-old")));
 }

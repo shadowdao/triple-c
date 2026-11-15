@@ -656,6 +656,7 @@ pub async fn add_project(
 pub async fn remove_project(
     project_id: String,
     discard_data: Option<bool>,
+    forget_aws_resources: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<ProjectRemovalReport, String> {
     // **H-2: the only writer of these three categories that held nothing.**
@@ -691,9 +692,10 @@ pub async fn remove_project(
                 .remove_aws_resources(&project, &settings, discard_data.unwrap_or(false))
                 .await?;
         } else {
+            missing_connection_removal(forget_aws_resources.unwrap_or(false))?;
             log::warn!(
-                "Project {}: its AWS connection no longer exists, so its AWS resources can't be \
-                 removed from here",
+                "Project {}: removed without its AWS connection; its task, secret and data (if \
+                 any) are left in AWS, as the user confirmed",
                 project_id
             );
             crate::host::tunnels::close(&project_id).await;
@@ -1362,7 +1364,7 @@ async fn start_project_container_locked(
     let host = ProjectHost::for_project(&project);
     let result: Result<ContainerTarget, String> = async {
         let target = host
-            .ensure_started(&project, &settings, &|msg: &str| {
+            .ensure_started(&project, &settings, &state.projects_store, &|msg: &str| {
                 emit_progress(&app_handle, &project_id, msg)
             })
             .await?;
@@ -1387,10 +1389,24 @@ async fn start_project_container_locked(
         Ok(target)
     }.await;
 
-    // On failure, reset status to Stopped so the project doesn't get stuck.
+    // On failure, reset status to Stopped so the project doesn't get stuck —
+    // unless an AWS task is still running (an attach that failed, or a start
+    // that lost the race): Stopped would hide a billed task, so the project
+    // is left in Error with its task ARN, which Stop and Start both use.
     if let Err(ref e) = result {
         log::error!("Failed to start container for project {}: {}", project_id, e);
-        let _ = state.projects_store.update_status(&project_id, ProjectStatus::Stopped);
+        let task_left = state
+            .projects_store
+            .get(&project_id)
+            .is_some_and(|p| aws_task_left_after_failed_start(&p));
+        let status = if task_left { ProjectStatus::Error } else { ProjectStatus::Stopped };
+        let _ = state.projects_store.update_status(&project_id, status);
+        if task_left {
+            return Err(format!(
+                "{e}\n\nThe workspace's task is still running on AWS. Start again to connect to \
+                 it, or Stop to stop it."
+            ));
+        }
     }
 
     let target = result?;
@@ -1591,6 +1607,26 @@ pub async fn rebuild_project_container(
 /// [`crate::commands::migration_commands::reconcile_migration`]. The migration
 /// pass runs over *every* project, not just the Running ones, because a project
 /// whose container was removed mid-migration reports Stopped.
+/// Removing an AWS project whose connection was deleted can't reach AWS:
+/// refused unless the user confirmed leaving its resources behind.
+fn missing_connection_removal(forget_aws_resources: bool) -> Result<(), String> {
+    if forget_aws_resources {
+        return Ok(());
+    }
+    Err("This project's AWS connection no longer exists, so its task (which may still be \
+         running and billed), secret and data can't be removed from here. Add the connection \
+         again in Settings → Hosts and remove the project, or confirm removing it while leaving \
+         those resources in AWS."
+        .into())
+}
+
+/// After a failed start: an AWS project whose task ARN is still stored has
+/// a task that may still be running (a start stops, and forgets, only a task
+/// it ran itself).
+fn aws_task_left_after_failed_start(project: &Project) -> bool {
+    project.is_aws() && project.aws.as_ref().is_some_and(|a| a.task_arn.is_some())
+}
+
 /// How long reconcile waits on AWS for one project.
 const AWS_RECONCILE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
@@ -2433,5 +2469,23 @@ mod tests {
         let mut local = aws_project();
         local.host_id = None;
         assert!(refuse_aws(&local, "Reset").is_ok());
+    }
+
+    #[test]
+    fn a_failed_start_with_a_task_left_running_is_not_stopped() {
+        let mut p = aws_project();
+        assert!(!aws_task_left_after_failed_start(&p));
+        p.aws.as_mut().unwrap().task_arn = Some("arn:aws:ecs:r:a:task/c/t".into());
+        assert!(aws_task_left_after_failed_start(&p));
+        let mut local = p.clone();
+        local.host_id = None;
+        assert!(!aws_task_left_after_failed_start(&local));
+    }
+
+    #[test]
+    fn removing_without_the_connection_needs_explicit_confirmation() {
+        let e = missing_connection_removal(false).unwrap_err();
+        assert!(e.contains("still be running") && e.contains("Settings → Hosts"), "{e}");
+        assert!(missing_connection_removal(true).is_ok());
     }
 }

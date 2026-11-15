@@ -18,7 +18,7 @@ use super::environments::{knowable, parse_environment_record, EnvironmentInfo, K
 use super::error::{classify_sdk_error, AwsError};
 use super::tasks::{find_project_task, TaskApi, STOP_REASON};
 use super::tofu_modules::{
-    access_point_root, environment_parameter_name, project_secret_name, task_family,
+    access_point_root, environment_cluster_name, environment_parameter_name, project_secret_name, task_family,
     user_file_system_token, user_role_names,
 };
 use super::workspace::WorkspaceApi;
@@ -134,6 +134,34 @@ pub async fn read_agent_token<R: RuntimeApi>(
     agent_token_from_secret(&json).map_err(other)
 }
 
+/// After a start this call ran is up and its agent answered with `ours`:
+/// make sure the secret still holds `ours`. A start that lost the RunTask
+/// race (another machine, the same moment) rotated the token in the secret
+/// before it found this task, and every later attach would read a token the
+/// task never saw. Returns whether the secret had to be put back.
+pub async fn ensure_agent_token<W: WorkspaceApi, R: RuntimeApi>(
+    work: &W,
+    rt: &R,
+    env: &EnvironmentInfo,
+    owner_user_id: &str,
+    owner_key: &str,
+    project_id: &str,
+    ours: &str,
+) -> Result<bool, AwsError> {
+    let name = project_secret_name(&env.name, owner_key, project_id);
+    let json = rt.secret_string(&name).await?;
+    if agent_token_from_secret(&json).ok().as_deref() == Some(ours) {
+        return Ok(false);
+    }
+    let mut v: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&json)
+        .map_err(|_| other("The project secret is not a JSON object"))?;
+    v.insert(AGENT_TOKEN_KEY.to_string(), serde_json::Value::String(ours.to_string()));
+    let repaired = serde_json::to_string(&v).map_err(|e| other(e.to_string()))?;
+    let tags = super::workspace::workspace_tags(owner_user_id, project_id, &env.name);
+    work.put_project_secret(&name, &env.kms_key_arn, &repaired, &tags).await?;
+    Ok(true)
+}
+
 /// How long a fresh access point may take to become `available`.
 #[derive(Debug, Clone, Copy)]
 pub struct PollTiming {
@@ -230,7 +258,7 @@ pub async fn remove_workspace_resources<T: TaskApi, W: WorkspaceApi, R: RuntimeA
     rt: &R,
     req: &RemoveRequest<'_>,
 ) -> Result<(), AwsError> {
-    let cluster = format!("triple-c-{}", req.env);
+    let cluster = environment_cluster_name(req.env);
     let family = task_family(req.env, req.owner_key, req.project_id);
 
     // 1. The task.

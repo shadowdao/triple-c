@@ -96,6 +96,16 @@ pub fn validate_environment_name(name: &str) -> Result<String, String> {
     }
 }
 
+/// An environment's ECS cluster name (the environment module's).
+pub fn environment_cluster_name(env: &str) -> String {
+    format!("triple-c-{env}")
+}
+
+/// An environment's CloudWatch log group (the environment module's).
+pub fn environment_log_group(env: &str) -> String {
+    format!("/triple-c/{env}")
+}
+
 /// The SSM parameter holding an environment's record.
 pub fn environment_parameter_name(env: &str) -> String {
     format!("/triple-c/environments/{env}")
