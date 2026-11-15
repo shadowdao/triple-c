@@ -1,0 +1,128 @@
+#!/bin/bash
+# triple-c-idle-watch [--check]
+#
+# Idle auto-stop for an AWS workspace (plan ruling P7). Started by
+# entrypoint.sh, as root, only when TRIPLEC_HOST=aws and
+# TRIPLEC_IDLE_STOP_MINUTES is set. Every interval it asks whether the
+# workspace is idle:
+#
+#   * the agent's /v1/activity (read with the agent's own token file) shows
+#     no authenticated activity for N minutes, no open exec, no open tunnel;
+#   * no `claude` process is running;
+#   * no scheduler job is running (`triple-c-scheduler status`, as claude).
+#
+# Anything it cannot read counts as NOT idle: a stop is the one thing here
+# that cannot be undone, so every doubt keeps the workspace running.
+#
+# When idle it records "idle" as the stop reason and sends SIGTERM to the
+# entrypoint (TRIPLEC_IDLE_SIGNAL_PID). The entrypoint's TERM trap does the
+# WIP push (reason read from that file) and stops the keepalive, so a stop
+# from here and a stop from ECS take the same single path — and a SIGTERM from
+# ECS arriving mid-push cannot start a second, concurrent push.
+#
+# Why not `kill -TERM 1`: with initProcessEnabled ECS runs the container under
+# docker-init, so PID 1 is the init, not the entrypoint. The init would
+# forward the signal, but signalling the entrypoint directly does not depend on
+# that and also works without an init.
+#
+# --check evaluates once and exits 0 (idle) or 1 (not idle); for tests and
+# for looking at a live task.
+#
+# Configuration (environment; the entrypoint sets the first three, the rest
+# exist for tests):
+#   TRIPLEC_IDLE_STOP_MINUTES   N (required, > 0)
+#   TRIPLEC_IDLE_SIGNAL_PID     the entrypoint's PID
+#   TRIPLEC_AGENT_TOKEN_FILE    default /dev/shm/triple-c/agent-token
+#   TRIPLEC_AGENT_URL           default http://127.0.0.1:47900
+#   TRIPLEC_IDLE_INTERVAL       seconds between checks, default 60
+#   TRIPLEC_STOP_REASON_FILE    default /run/triple-c/stop-reason
+#   TRIPLEC_SCHEDULER_BIN       default /usr/local/bin/triple-c-scheduler
+#   TRIPLEC_SCHEDULER_USER      default claude; empty runs it as this user
+#   TRIPLEC_IDLE_PROC_NAME      default claude
+
+set -u
+
+minutes="${TRIPLEC_IDLE_STOP_MINUTES:-}"
+signal_pid="${TRIPLEC_IDLE_SIGNAL_PID:-}"
+token_file="${TRIPLEC_AGENT_TOKEN_FILE:-/dev/shm/triple-c/agent-token}"
+agent_url="${TRIPLEC_AGENT_URL:-http://127.0.0.1:47900}"
+interval="${TRIPLEC_IDLE_INTERVAL:-60}"
+reason_file="${TRIPLEC_STOP_REASON_FILE:-/run/triple-c/stop-reason}"
+scheduler="${TRIPLEC_SCHEDULER_BIN:-/usr/local/bin/triple-c-scheduler}"
+scheduler_user="${TRIPLEC_SCHEDULER_USER-claude}"
+proc_name="${TRIPLEC_IDLE_PROC_NAME:-claude}"
+
+# >>> is_idle
+# is_idle now last_activity_unix active_execs active_tunnels claude_running jobs_running minutes
+# Pure: exit 0 when idle, 1 otherwise. Every argument must be a plain
+# non-negative integer; anything else (an empty or garbled read) is not idle.
+is_idle() {
+    local a
+    [ $# -eq 7 ] || return 1
+    for a in "$@"; do
+        case "$a" in ''|*[!0-9]*) return 1 ;; esac
+    done
+    local now=$1 last=$2 execs=$3 tunnels=$4 claude=$5 jobs=$6 mins=$7
+    [ "$mins" -gt 0 ] || return 1
+    [ "$execs" -eq 0 ] && [ "$tunnels" -eq 0 ] || return 1
+    [ "$claude" -eq 0 ] && [ "$jobs" -eq 0 ] || return 1
+    [ $((now - last)) -ge $((mins * 60)) ]
+}
+# <<< is_idle
+
+# Prints "last execs tunnels", or fails.
+read_activity() {
+    local token body
+    token=$(cat "$token_file" 2>/dev/null) || return 1
+    [ -n "$token" ] || return 1
+    # The token goes in through a config on stdin, never argv: /proc/<pid>/cmdline
+    # is readable by every user in the container.
+    body=$(printf 'header = "Authorization: Bearer %s"\n' "$token" \
+        | curl -sf --max-time 5 --config - "$agent_url/v1/activity" 2>/dev/null) || return 1
+    printf '%s' "$body" | jq -r '[.last_activity_unix, .active_execs, .active_tunnels]
+        | map(if type == "number" and . >= 0 and . == floor then tostring else "x" end)
+        | join(" ")' 2>/dev/null
+}
+
+# 1 when a scheduler job is running *or* the question cannot be answered.
+jobs_running() {
+    local out
+    if [ -n "$scheduler_user" ] && [ "$(id -u)" = 0 ]; then
+        out=$(su -s /bin/bash -c '"$1" status' -- "$scheduler_user" _ "$scheduler" 2>/dev/null) || { echo 1; return; }
+    else
+        out=$("$scheduler" status 2>/dev/null) || { echo 1; return; }
+    fi
+    if [ "$out" = "Nothing running." ]; then echo 0; else echo 1; fi
+}
+
+check() {
+    local act last execs tunnels claude
+    act=$(read_activity) || return 1
+    read -r last execs tunnels <<< "$act"
+    if pgrep -x "$proc_name" >/dev/null 2>&1; then claude=1; else claude=0; fi
+    is_idle "$(date +%s)" "${last:-}" "${execs:-}" "${tunnels:-}" "$claude" "$(jobs_running)" "$minutes"
+}
+
+case "$minutes" in
+    ''|*[!0-9]*|0) echo "triple-c-idle-watch: TRIPLEC_IDLE_STOP_MINUTES must be a positive integer" >&2; exit 2 ;;
+esac
+
+if [ "${1:-}" = "--check" ]; then
+    check
+    exit $?
+fi
+
+case "$signal_pid" in
+    ''|*[!0-9]*|0|1) echo "triple-c-idle-watch: TRIPLEC_IDLE_SIGNAL_PID must be the entrypoint's PID" >&2; exit 2 ;;
+esac
+
+while :; do
+    sleep "$interval"
+    if check; then
+        echo "triple-c-idle-watch: idle for ${minutes} minutes — stopping the workspace"
+        mkdir -p "$(dirname "$reason_file")" 2>/dev/null
+        printf 'idle\n' > "$reason_file"
+        kill -TERM "$signal_pid"
+        exit 0
+    fi
+done

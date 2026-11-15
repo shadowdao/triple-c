@@ -488,6 +488,11 @@ COPY triple-c-playwright-heal /usr/local/bin/triple-c-playwright-heal
 RUN chmod +x /usr/local/bin/triple-c-playwright-heal
 COPY triple-c-task-runner /usr/local/bin/triple-c-task-runner
 RUN chmod +x /usr/local/bin/triple-c-task-runner
+# AWS workspaces only (entrypoint.sh, TRIPLEC_HOST=aws): the WIP push run on
+# stop and the idle auto-stop watcher. Inert in a Docker container.
+COPY triple-c-wip-push /usr/local/bin/triple-c-wip-push
+COPY triple-c-idle-watch /usr/local/bin/triple-c-idle-watch
+RUN chmod +x /usr/local/bin/triple-c-wip-push /usr/local/bin/triple-c-idle-watch
 # Root-owned in /usr/local/bin: entrypoint.sh starts it as root (only when a
 # token is configured), and it rides the snapshot and migration like the other
 # shims here.

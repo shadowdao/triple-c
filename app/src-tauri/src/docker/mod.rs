@@ -9,6 +9,8 @@ pub mod gateway;
 pub mod legacy_cleanup;
 pub mod migration;
 pub mod stt;
+#[cfg(all(test, unix))]
+mod aws_mode_tests;
 
 /// The container user `claude`'s home directory, as the image creates it.
 pub(crate) const CONTAINER_HOME: &str = "/home/claude";

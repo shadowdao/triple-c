@@ -1,0 +1,146 @@
+#!/bin/bash
+# triple-c-wip-push [--dry-run] [--reason idle|stop|sigterm]
+#
+# Save unpushed work before an AWS workspace stops. For every git repository
+# directly under /workspace whose working tree is dirty or which holds commits
+# no remote has, push a snapshot of the *whole* working tree (tracked changes,
+# staged or not, and untracked files .gitignore does not exclude) to
+# refs/heads/triple-c/wip/<UTC yyyymmdd-HHMMSS> on the repo's remote.
+#
+# It never touches the user's index, HEAD, branches or working tree: the
+# snapshot is built in a temporary index (GIT_INDEX_FILE) seeded from a copy of
+# the real one, written with write-tree and committed with commit-tree on top of
+# HEAD. Only new objects land in .git/objects (unreferenced locally; gc takes
+# them). Status reads run with GIT_OPTIONAL_LOCKS=0 so even the index's stat
+# cache is left alone.
+#
+# Run as `claude` (the entrypoint uses su), so pushes use the user's own
+# credential helper and ~/.ssh. Prompts are off: on a stopping task there is
+# nobody to answer one.
+#
+# --dry-run prints one JSON line per repo
+#   {"folder":…, "dirty":bool, "unpushed":n, "branch":…}
+# and changes nothing.
+#
+# Exit 0 when every needed push succeeded (or nothing needed pushing), 1 when
+# any failed, 2 on bad usage.
+#
+# TRIPLEC_WORKSPACE_ROOT overrides /workspace (tests).
+
+set -u
+
+root="${TRIPLEC_WORKSPACE_ROOT:-/workspace}"
+dry_run=0
+reason=stop
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --dry-run) dry_run=1; shift ;;
+        --reason)
+            case "${2:-}" in
+                idle|stop|sigterm) reason="$2"; shift 2 ;;
+                *) echo "triple-c-wip-push: --reason must be idle, stop or sigterm" >&2; exit 2 ;;
+            esac ;;
+        *) echo "usage: triple-c-wip-push [--dry-run] [--reason idle|stop|sigterm]" >&2; exit 2 ;;
+    esac
+done
+
+export GIT_TERMINAL_PROMPT=0 GIT_OPTIONAL_LOCKS=0
+# BatchMode: an unknown host key or a passphrase prompt fails at once instead
+# of waiting for input nobody will give. Keeps any GIT_SSH_COMMAND the user set.
+export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh} -o BatchMode=yes"
+
+stamp=$(date -u +%Y%m%d-%H%M%S)
+failed=0
+
+# The remote to push to: the branch's upstream remote, else origin, else the
+# only remote. Empty when there is none.
+pick_remote() {
+    local r
+    r=$(git config --get "branch.$1.remote" 2>/dev/null)
+    if [ -n "$r" ] && [ "$r" != "." ]; then printf '%s' "$r"; return; fi
+    if git remote | grep -qx origin; then printf origin; return; fi
+    if [ "$(git remote | wc -l)" -eq 1 ]; then git remote; fi
+}
+
+for dir in "$root"/*/; do
+    dir="${dir%/}"
+    [ -d "$dir" ] || continue
+    # A repository rooted exactly here. A symlinked folder resolves elsewhere
+    # and is skipped: it is not the workspace's own.
+    top=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || continue
+    [ "$top" = "$(cd "$dir" && pwd -P)" ] || continue
+    folder=$(basename "$dir")
+
+    (
+        cd "$dir" || exit 1
+        head=$(git rev-parse -q --verify HEAD 2>/dev/null)
+        branch=$(git symbolic-ref -q --short HEAD 2>/dev/null) || branch=HEAD
+
+        dirty=false
+        [ -n "$(git status --porcelain 2>/dev/null | head -1)" ] && dirty=true
+
+        # Commits no remote has: past the upstream when there is one, past
+        # every remote-tracking ref otherwise.
+        unpushed=0
+        if [ -n "$head" ]; then
+            if git rev-parse -q --verify '@{u}' >/dev/null 2>&1; then
+                unpushed=$(git rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)
+            else
+                unpushed=$(git rev-list --count HEAD --not --remotes 2>/dev/null || echo 0)
+            fi
+        fi
+
+        if [ "$dry_run" = 1 ]; then
+            jq -cn --arg folder "$folder" --argjson dirty "$dirty" \
+                --argjson unpushed "$unpushed" --arg branch "$branch" \
+                '{folder: $folder, dirty: $dirty, unpushed: $unpushed, branch: $branch}'
+            exit 0
+        fi
+
+        [ "$dirty" = true ] || [ "$unpushed" -gt 0 ] || exit 0
+
+        remote=$(pick_remote "$branch")
+        if [ -z "$remote" ]; then
+            echo "triple-c-wip-push: $folder: unsaved work but no remote to push it to" >&2
+            exit 1
+        fi
+
+        commit="$head"
+        if [ "$dirty" = true ]; then
+            tmp_index=$(mktemp) || exit 1
+            trap 'rm -f "$tmp_index"' EXIT
+            real_index=$(git rev-parse --git-path index)
+            # Seed from the real index (read only) so unchanged files keep
+            # their stat data and `add -A` hashes only what changed.
+            if [ -f "$real_index" ]; then
+                cp "$real_index" "$tmp_index" || exit 1
+            else
+                rm -f "$tmp_index"
+            fi
+            export GIT_INDEX_FILE="$tmp_index"
+            # The user may have no identity configured; a WIP commit still needs one.
+            git config user.name >/dev/null 2>&1 || export GIT_AUTHOR_NAME=Triple-C GIT_COMMITTER_NAME=Triple-C
+            git config user.email >/dev/null 2>&1 || export GIT_AUTHOR_EMAIL=triple-c@localhost GIT_COMMITTER_EMAIL=triple-c@localhost
+            git add -A . >/dev/null 2>&1 || { echo "triple-c-wip-push: $folder: could not stage the working tree" >&2; exit 1; }
+            tree=$(git write-tree) || exit 1
+            msg="Triple-C WIP ($reason) of $branch at $stamp UTC"
+            if [ -n "$head" ]; then
+                commit=$(git commit-tree "$tree" -p "$head" -m "$msg") || exit 1
+            else
+                commit=$(git commit-tree "$tree" -m "$msg") || exit 1
+            fi
+            unset GIT_INDEX_FILE
+        fi
+
+        ref="refs/heads/triple-c/wip/$stamp"
+        if err=$(git push --no-verify -q "$remote" "$commit:$ref" 2>&1); then
+            echo "triple-c-wip-push: $folder: pushed to $remote $ref"
+        else
+            echo "triple-c-wip-push: $folder: push to $remote failed: $(printf '%s' "$err" | tail -n 1)" >&2
+            exit 1
+        fi
+    ) || failed=1
+done
+
+exit "$failed"
