@@ -130,6 +130,15 @@ fn untrusted_environment_records_are_rejected() {
             "subnet_ids",
         ),
         (
+            "the same subnet twice",
+            with(
+                "dev",
+                "subnet_ids",
+                json!(["subnet-0123abcd", "subnet-0123abcd"]),
+            ),
+            "two different subnets",
+        ),
+        (
             "uppercase subnet hex",
             with(
                 "dev",
@@ -308,17 +317,58 @@ fn interrupted_deployments_get_the_right_actions() {
         ]
     );
 
-    // A stale lock on an environment that has a record is still Incomplete.
+    // A stale lock on a working environment (valid record and our state):
+    // Incomplete, but never Destroy (D6) — an interrupted Update or plan.
     let envs = merge(
         vec![("a".into(), Ok(parsed("a", 1)))],
         Some(&objs),
         &nobody_local,
         1,
     );
+    let a = find(&envs, "a");
     assert!(matches!(
-        find(&envs, "a").state,
+        a.state,
         EnvironmentState::Incomplete { lock: Some(_) }
     ));
+    assert_eq!(
+        a.actions,
+        vec![EnvironmentAction::Repair, EnvironmentAction::Unlock]
+    );
+
+    // A stale lock with an unreadable record keeps Destroy: there is no
+    // valid record, so nothing says the environment works.
+    let envs = merge(
+        vec![("a".into(), Err("tenancy is not strict".into()))],
+        Some(&objs),
+        &nobody_local,
+        1,
+    );
+    assert_eq!(
+        find(&envs, "a").actions,
+        vec![
+            EnvironmentAction::Repair,
+            EnvironmentAction::Destroy,
+            EnvironmentAction::Unlock
+        ]
+    );
+
+    // A stale lock with a record but no state of ours (a first apply that
+    // died before writing state) keeps Destroy too.
+    let no_state = objects(&[], &[(env_key("a"), stale)]);
+    let envs = merge(
+        vec![("a".into(), Ok(parsed("a", 1)))],
+        Some(&no_state),
+        &nobody_local,
+        1,
+    );
+    assert_eq!(
+        find(&envs, "a").actions,
+        vec![
+            EnvironmentAction::Repair,
+            EnvironmentAction::Destroy,
+            EnvironmentAction::Unlock
+        ]
+    );
 
     // A fresh lock (a first apply: no state object yet): Deploying, nothing
     // to do but wait.
@@ -620,6 +670,19 @@ fn denied_lookups_are_unknown_not_missing() {
         Lookup::Missing
     );
     assert_eq!(lookup_outcome(Some("Throttling"), Some(400)), Lookup::Error);
+    // A 403 that is a credential failure is an error, never Unknown.
+    for code in [
+        "InvalidClientTokenId",
+        "SignatureDoesNotMatch",
+        "InvalidAccessKeyId",
+        "ExpiredToken",
+    ] {
+        assert_eq!(
+            lookup_outcome(Some(code), Some(403)),
+            Lookup::Error,
+            "{code}"
+        );
+    }
     assert_eq!(lookup_outcome(None, None), Lookup::Error);
 }
 
@@ -660,6 +723,68 @@ fn only_buckets_owned_by_you_count_as_created() {
     // Anything else is classified as an ordinary SDK error.
     assert_eq!(create_bucket_outcome(Some("AccessDenied"), &bucket), None);
     assert_eq!(create_bucket_outcome(None, &bucket), None);
+}
+
+#[test]
+fn a_bucket_of_another_account_after_create_is_taken() {
+    let bucket = state_bucket_name(ACCOUNT, REGION);
+    assert_eq!(
+        head_after_create_error(Some(403), &bucket),
+        Some(AwsError::StateBucketTaken {
+            bucket: bucket.clone()
+        })
+    );
+    assert_eq!(head_after_create_error(Some(500), &bucket), None);
+    assert_eq!(head_after_create_error(None, &bucket), None);
+}
+
+#[test]
+fn only_a_missing_component_tag_is_put_and_other_tags_are_kept() {
+    let t = |k: &str, v: &str| (k.to_string(), v.to_string());
+    assert_eq!(
+        tags_with_state(&[t("team", "infra"), t("triple-c:component", "state")]),
+        None
+    );
+    assert_eq!(
+        tags_with_state(&[]),
+        Some(vec![t("triple-c:component", "state")])
+    );
+    assert_eq!(
+        tags_with_state(&[t("team", "infra"), t("cost", "42")]),
+        Some(vec![
+            t("team", "infra"),
+            t("cost", "42"),
+            t("triple-c:component", "state")
+        ])
+    );
+    // A different component value is replaced, not duplicated.
+    assert_eq!(
+        tags_with_state(&[t("triple-c:component", "other"), t("team", "infra")]),
+        Some(vec![t("team", "infra"), t("triple-c:component", "state")])
+    );
+}
+
+#[test]
+fn hostile_state_keys_name_no_environment() {
+    for key in [
+        "environments/a/b/terraform.tfstate",
+        "environments/Bad/terraform.tfstate",
+        "environments/a/terraform.tfstate.tflock.x",
+        "other/a/terraform.tfstate",
+        "environments//terraform.tfstate",
+        "environments/../terraform.tfstate",
+        "environments/a/terraform.tfstate.tflock.tflock",
+    ] {
+        assert_eq!(environment_of_key(key), None, "{key}");
+    }
+    assert_eq!(
+        environment_of_key("environments/dev/terraform.tfstate"),
+        Some("dev")
+    );
+    assert_eq!(
+        environment_of_key("environments/dev/terraform.tfstate.tflock"),
+        Some("dev")
+    );
 }
 
 #[test]

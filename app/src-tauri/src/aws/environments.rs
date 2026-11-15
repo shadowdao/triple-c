@@ -142,6 +142,9 @@ pub fn parse_environment_record(
                 .collect::<Option<Vec<_>>>()
         })
         .ok_or_else(|| "subnet_ids is not exactly 2 subnet ids".to_string())?;
+    if subnet_ids[0] == subnet_ids[1] {
+        return Err("subnet_ids must be two different subnets".into());
+    }
     let assign_public_ip = field(obj, "assign_public_ip")?
         .as_bool()
         .ok_or_else(|| "assign_public_ip is not true or false".to_string())?;
@@ -386,11 +389,16 @@ fn detect_one(
     } else if lock.as_ref().is_some_and(|l| l.age_secs < LIVE_LOCK_SECS) {
         (EnvironmentState::Deploying { lock }, vec![])
     } else if lock.is_some() {
-        // Stale, and not ours (a local runner was handled above).
-        (
-            EnvironmentState::Incomplete { lock },
-            vec![Repair, Destroy, Unlock],
-        )
+        // Stale, and not ours (a local runner was handled above). A valid
+        // record with our state is a working environment whose last run
+        // (an Update, a plan) died: never Destroy it from the app (D6).
+        let working = info.is_some() && has_state;
+        let actions = if working {
+            vec![Repair, Unlock]
+        } else {
+            vec![Repair, Destroy, Unlock]
+        };
+        (EnvironmentState::Incomplete { lock }, actions)
     } else if let Some(reason) = reason {
         // A re-apply rewrites the record, so Repair is offered when the
         // state is ours. Never Destroy: the environment may be working (D6).
@@ -586,8 +594,10 @@ fn lookup_outcome(code: Option<&str>, status: Option<u16>) -> Lookup {
         (Some(c), _) if MISSING.contains(&c) => Lookup::Missing,
         (Some(c), _) if DENIED.contains(&c) => Lookup::Denied,
         (None, Some(404)) => Lookup::Missing,
+        // A 403 with no body (HeadBucket). With a code that isn't access
+        // denied (InvalidAccessKeyId, SignatureDoesNotMatch, ExpiredToken,
+        // ...) it is an error the caller must see.
         (None, Some(403)) => Lookup::Denied,
-        (_, Some(403)) => Lookup::Denied,
         _ => Lookup::Error,
     }
 }
@@ -850,6 +860,36 @@ fn create_bucket_outcome(code: Option<&str>, bucket: &str) -> Option<Result<(), 
 
 const STATE_TAG: (&str, &str) = ("triple-c:component", "state");
 
+/// HeadBucket with `expected_bucket_owner` right after our own CreateBucket
+/// succeeded (or said BucketAlreadyOwnedByYou): a 403 means the bucket of
+/// that name is another account's (the credentials just worked), so it is
+/// [`AwsError::StateBucketTaken`].
+fn head_after_create_error(status: Option<u16>, bucket: &str) -> Option<AwsError> {
+    (status == Some(403)).then(|| AwsError::StateBucketTaken {
+        bucket: bucket.to_string(),
+    })
+}
+
+/// The bucket's tag set with ours added, keeping every other tag, or `None`
+/// when `triple-c:component=state` is already there (nothing to put). A
+/// different `triple-c:component` value is replaced: no resource overrides
+/// the component tag.
+fn tags_with_state(existing: &[(String, String)]) -> Option<Vec<(String, String)>> {
+    if existing
+        .iter()
+        .any(|(k, v)| k == STATE_TAG.0 && v == STATE_TAG.1)
+    {
+        return None;
+    }
+    let mut tags: Vec<(String, String)> = existing
+        .iter()
+        .filter(|(k, _)| k != STATE_TAG.0)
+        .cloned()
+        .collect();
+    tags.push((STATE_TAG.0.to_string(), STATE_TAG.1.to_string()));
+    Some(tags)
+}
+
 fn state_tag() -> Tag {
     Tag::builder()
         .key(STATE_TAG.0)
@@ -920,25 +960,54 @@ pub async fn ensure_state_bucket(
     }
     // us-east-1 answers a create of a bucket this account owns with success,
     // not BucketAlreadyOwnedByYou: confirm ownership before configuring.
-    s3.head_bucket()
+    if let Err(e) = s3
+        .head_bucket()
         .bucket(&bucket)
         .expected_bucket_owner(account)
         .send()
         .await
-        .map_err(|e| classify_sdk_error("s3:ListBucket", &e))?;
+    {
+        let (_, status) = error_parts(&e);
+        return Err(head_after_create_error(status, &bucket)
+            .unwrap_or_else(|| classify_sdk_error("s3:ListBucket", &e)));
+    }
 
-    s3.put_bucket_tagging()
+    let existing = match s3
+        .get_bucket_tagging()
         .bucket(&bucket)
         .expected_bucket_owner(account)
-        .tagging(
-            Tagging::builder()
-                .tag_set(state_tag())
-                .build()
-                .expect("tag set is set"),
-        )
         .send()
         .await
-        .map_err(|e| classify_sdk_error("s3:PutBucketTagging", &e))?;
+    {
+        Ok(out) => out
+            .tag_set()
+            .iter()
+            .map(|t| (t.key().to_string(), t.value().to_string()))
+            .collect(),
+        Err(e) if e.code() == Some("NoSuchTagSet") => Vec::new(),
+        Err(e) => return Err(classify_sdk_error("s3:GetBucketTagging", &e)),
+    };
+    if let Some(tags) = tags_with_state(&existing) {
+        let tag_set = tags
+            .into_iter()
+            .map(|(k, v)| Tag::builder().key(k).value(v).build())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| AwsError::Other {
+                message: format!("Could not build the state bucket's tags: {e}"),
+            })?;
+        s3.put_bucket_tagging()
+            .bucket(&bucket)
+            .expected_bucket_owner(account)
+            .tagging(
+                Tagging::builder()
+                    .set_tag_set(Some(tag_set))
+                    .build()
+                    .expect("tag set is set"),
+            )
+            .send()
+            .await
+            .map_err(|e| classify_sdk_error("s3:PutBucketTagging", &e))?;
+    }
     s3.put_bucket_versioning()
         .bucket(&bucket)
         .expected_bucket_owner(account)
