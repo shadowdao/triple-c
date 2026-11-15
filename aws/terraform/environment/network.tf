@@ -22,9 +22,13 @@ locals {
   )
 }
 
+# The subnets' AZs must not move once chosen: a changed availability_zone
+# replaces the subnet (and the ENIs, NAT gateway, associations and record
+# hanging off it). So the list is not filtered on `state` -- a temporary
+# impairment would reorder it -- only on opt-in status, which a region's
+# default AZs never change; and each subnet ignores later AZ changes.
 data "aws_availability_zones" "available" {
   count = local.create_vpc ? 1 : 0
-  state = "available"
 
   filter {
     name   = "opt-in-status"
@@ -55,6 +59,10 @@ resource "aws_subnet" "public" {
   availability_zone = data.aws_availability_zones.available[0].names[count.index]
 
   tags = { Name = "${local.name}-public-${count.index}" }
+
+  lifecycle {
+    ignore_changes = [availability_zone]
+  }
 }
 
 resource "aws_route_table" "public" {
@@ -101,6 +109,10 @@ resource "aws_subnet" "private" {
   availability_zone = data.aws_availability_zones.available[0].names[count.index]
 
   tags = { Name = "${local.name}-private-${count.index}" }
+
+  lifecycle {
+    ignore_changes = [availability_zone]
+  }
 }
 
 resource "aws_route_table" "private" {

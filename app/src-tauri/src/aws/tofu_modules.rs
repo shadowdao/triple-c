@@ -116,23 +116,28 @@ pub fn state_bucket_name(account: &str, region: &str) -> String {
     format!("triple-c-tfstate-{account}-{region}")
 }
 
+/// One deployment, i.e. one state object in the bucket (D9).
+#[allow(dead_code)] // used by phase-4 commands
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Deployment<'a> {
+    /// The environment module for this environment name.
+    Environment(&'a str),
+    /// A user's onboarding module in an environment.
+    User { env: &'a str, owner_key: &'a str },
+    /// The account's permissions-boundary module.
+    Boundary,
+}
+
 /// A deployment's state object in [`state_bucket_name`] (D9); the lock is the
 /// same key plus `.tflock`.
-///
-/// Panics if `kind` needs a part that is `None` (the environment for
-/// `Environment` and `UserOnboard`, the owner key for `UserOnboard`): that is
-/// a programming error, not input.
 #[allow(dead_code)] // used by phase-4 commands
-pub fn state_key(kind: ModuleKind, env: Option<&str>, owner_key: Option<&str>) -> String {
-    let env = || env.expect("state_key: this module kind needs an environment");
-    match kind {
-        ModuleKind::Environment => format!("environments/{}/terraform.tfstate", env()),
-        ModuleKind::UserOnboard => format!(
-            "users/{}/{}/terraform.tfstate",
-            env(),
-            owner_key.expect("state_key: a user deployment needs an owner key")
-        ),
-        ModuleKind::PermissionsBoundary => "boundary/terraform.tfstate".to_string(),
+pub fn state_key(d: Deployment) -> String {
+    match d {
+        Deployment::Environment(env) => format!("environments/{env}/terraform.tfstate"),
+        Deployment::User { env, owner_key } => {
+            format!("users/{env}/{owner_key}/terraform.tfstate")
+        }
+        Deployment::Boundary => "boundary/terraform.tfstate".to_string(),
     }
 }
 

@@ -214,17 +214,49 @@ fn state_bucket_and_keys_follow_d9() {
     assert!(longest.len() <= 63, "{longest}");
 
     assert_eq!(
-        state_key(ModuleKind::Environment, Some("dev"), None),
+        state_key(Deployment::Environment("dev")),
         "environments/dev/terraform.tfstate"
     );
     assert_eq!(
-        state_key(ModuleKind::UserOnboard, Some("dev"), Some("0123456789ab")),
+        state_key(Deployment::User {
+            env: "dev",
+            owner_key: "0123456789ab"
+        }),
         "users/dev/0123456789ab/terraform.tfstate"
     );
     assert_eq!(
-        state_key(ModuleKind::PermissionsBoundary, None, None),
+        state_key(Deployment::Boundary),
         "boundary/terraform.tfstate"
     );
+}
+
+#[test]
+fn subnet_availability_zones_are_stable_once_chosen() {
+    let body = parsed(ModuleKind::Environment);
+    // Not filtered on `state`: an impaired AZ must not reorder the list.
+    let azs: Vec<_> = top_blocks(&body, "data")
+        .filter(|b| label(b, 0) == Some("aws_availability_zones"))
+        .collect();
+    assert_eq!(azs.len(), 1);
+    assert!(
+        attr(&azs[0].body, "state").is_none(),
+        "aws_availability_zones must not filter on state"
+    );
+    // And each subnet ignores later AZ changes, so a moved list never
+    // replaces a subnet.
+    let subnets = resources(&body, "aws_subnet");
+    assert_eq!(subnets.len(), 2, "public and private subnets");
+    for subnet in subnets {
+        let lifecycle = top_blocks(&subnet.body, "lifecycle")
+            .next()
+            .unwrap_or_else(|| panic!("{:?} has no lifecycle block", subnet.labels));
+        let ignored = attr(&lifecycle.body, "ignore_changes").expect("ignore_changes");
+        assert!(
+            render(ignored).contains("availability_zone"),
+            "{:?} does not ignore availability_zone changes",
+            subnet.labels
+        );
+    }
 }
 
 #[test]
