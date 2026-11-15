@@ -26,12 +26,23 @@ following:
 - **Work with their own tasks.** They can stop them, `ecs execute-command` into them, and open an
   SSM session to them. They can end or resume only sessions they started.
 - **Manage their own secrets.** They can create, update and delete `triple-c/*` secrets tagged with
-  their owner ID, and use KMS only through Secrets Manager.
+  their owner ID.
+  - A secret must be encrypted with an **environment KMS key**, meaning one tagged
+    `triple-c:component`. `CreateSecret` must name the key by its full ARN in `KmsKeyId`, and the
+    user can use KMS (`Encrypt`/`GenerateDataKey`) only through Secrets Manager and only with
+    environment keys.
+  - A secret on the default `aws/secretsmanager` key is refused. That key can't carry the tag, so
+    the workspace's own task role, which is limited by the boundary, couldn't decrypt it.
   - A secret tagged `triple-c:component` belongs to the environment. A workspace user can never
     tag, untag, overwrite or delete one; an explicit Deny enforces this.
 - **Manage their own access points.** They can create and delete EFS access points tagged with
   their owner ID, and only on the environment's file system, which is the one tagged
   `triple-c:component`.
+- **Set only the ordinary tag keys.** Every request that tags something may set only
+  `triple-c:owner`, `triple-c:project` and `triple-c:environment` (`aws:TagKeys`). This applies to
+  `RunTask`, the ECS and EFS tag-on-create calls, `CreateSecret`, and secret `TagResource`. A
+  workspace user can never set `triple-c:component`, which marks environment resources and which
+  the Denies and phase-4 detection trust.
 - **Inspect their own principal.** They can read it (`iam:GetRole`) and simulate it
   (`iam:SimulatePrincipalPolicy`). The app's permission check uses both.
 - **Read environment information.** This covers ECS, CloudFormation stacks, the `/triple-c/*` SSM
@@ -109,6 +120,8 @@ detection should flag any environment that breaks them.
    neither an owner tag nor a component tag could be claimed by any workspace user.
 4. **Every environment KMS key and EFS file system carries `triple-c:component`.** The boundary
    and the admin tier both rely on this tag.
+5. **User secrets use the environment key.** The app must pass the environment KMS key's ARN as
+   `KmsKeyId` when it creates a secret. The policy refuses any other choice.
 
 ## One-time setup: the boundary policy
 
@@ -190,6 +203,20 @@ a real account:
   also authorized against `security-group-rule` resources.
 - **Secrets tagging.** Check that `CreateSecret` with tags authorizes `secretsmanager:TagResource`,
   and that the `StringEqualsIfExists` and `Null` resource-tag conditions pass at create time.
+- **Secret keys.**
+  - Check that `secretsmanager:KmsKeyId` carries the value exactly as the request gave it, so that
+    `ArnLike arn:aws:kms:*:*:key/*` works.
+  - Check that Secrets Manager calls `GenerateDataKey`/`Encrypt` as the caller, so the KMS
+    statement's `aws:ResourceTag/triple-c:component` rule is what enforces the environment key.
+  - Check that `PutSecretValue` on such a secret passes.
+- **Tag keys.** Check that `aws:TagKeys` is populated for `RunTask`, for `CreateSecret` and secret
+  `TagResource`, for `CreateAccessPoint`, and for the ECS and EFS tag-on-create `TagResource`
+  calls. Check also whether ECS-managed (`aws:ecs:*`) or propagated task-definition tags appear in
+  `RunTask`'s `aws:TagKeys` and would break the key allow-list.
+- **Resource tags the boundary and access points rely on.** Check `aws:ResourceTag` on:
+  - `elasticfilesystem:ClientMount`/`ClientWrite` (the file system's tags, at mount);
+  - `elasticfilesystem:CreateAccessPoint`, which is authorized against the file system;
+  - `kms:Decrypt` through Secrets Manager (the key's tags).
 - **CloudFormation service roles.** Check that `cloudformation:RoleArn` is present in the request
   context when `RoleARN` is given.
 - **Task definition scoping.** Check whether `ecs:DeregisterTaskDefinition` and

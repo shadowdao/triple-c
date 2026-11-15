@@ -55,6 +55,8 @@ pub struct Check {
     pub action: &'static str,
     /// An ARN template ([`render`]).
     pub resource: &'static str,
+    /// Context entries. A key that appears more than once is a multi-valued
+    /// key (e.g. `aws:TagKeys`) and is sent as one `StringList` entry.
     pub context: &'static [(&'static str, ContextValue)],
     pub write: bool,
 }
@@ -208,10 +210,15 @@ const WORKSPACE_USER_CHECKS: &[Check] = &[
         PROBE_SESSION,
         &[(SESSION_OWNER, OwnerId)],
     ),
+    // Encrypted with an environment key, never the default
+    // `aws/secretsmanager` key (which can't carry `triple-c:component`).
     write(
         "secretsmanager:CreateSecret",
         PROBE_SECRET,
-        &[(OWNER_REQUEST_TAG, OwnerId)],
+        &[
+            (OWNER_REQUEST_TAG, OwnerId),
+            ("secretsmanager:KmsKeyId", Literal(PROBE_KEY)),
+        ],
     ),
     // Tag-on-create: the secret has no tags yet, so only the request tag.
     write(
@@ -257,18 +264,24 @@ const WORKSPACE_USER_CHECKS: &[Check] = &[
     write(
         "kms:Encrypt",
         PROBE_KEY,
-        &[(
-            "kms:ViaService",
-            Literal("secretsmanager.{region}.amazonaws.com"),
-        )],
+        &[
+            (
+                "kms:ViaService",
+                Literal("secretsmanager.{region}.amazonaws.com"),
+            ),
+            (COMPONENT_RESOURCE_TAG, Literal("environment")),
+        ],
     ),
     write(
         "kms:GenerateDataKey",
         PROBE_KEY,
-        &[(
-            "kms:ViaService",
-            Literal("secretsmanager.{region}.amazonaws.com"),
-        )],
+        &[
+            (
+                "kms:ViaService",
+                Literal("secretsmanager.{region}.amazonaws.com"),
+            ),
+            (COMPONENT_RESOURCE_TAG, Literal("environment")),
+        ],
     ),
     read("iam:GetRole", "{principal}", OWN_PRINCIPAL),
     read("iam:SimulatePrincipalPolicy", "{principal}", OWN_PRINCIPAL),
@@ -558,14 +571,20 @@ mod tests {
 
     impl Request<'_> {
         fn context_value(&self, key: &str) -> Option<String> {
+            self.context_values(key).into_iter().next()
+        }
+
+        /// All values of a (possibly multi-valued) key.
+        fn context_values(&self, key: &str) -> Vec<String> {
             self.check
                 .context
                 .iter()
-                .find(|(k, _)| *k == key)
+                .filter(|(k, _)| *k == key)
                 .map(|(_, v)| match v {
                     ContextValue::OwnerId => self.owner.to_string(),
                     ContextValue::Literal(l) => render(l, &AT),
                 })
+                .collect()
         }
 
         /// Resolves `${…}` policy variables the way the simulator does: from
@@ -617,6 +636,24 @@ mod tests {
         let cond = cond.as_object().expect("Condition is an object");
         cond.iter().all(|(op, entries)| {
             let entries = entries.as_object().expect("condition block is an object");
+            // ForAllValues: every value of the (multi-valued) key matches
+            // one of the policy's values. Vacuously true when the key is
+            // absent, which is why statements pair it with a required key.
+            if let Some(base) = op.strip_prefix("ForAllValues:") {
+                assert_eq!(
+                    base,
+                    "StringEquals",
+                    "{}: unsupported ForAllValues operator",
+                    sid(stmt)
+                );
+                return entries.iter().all(|(key, want)| {
+                    let allowed: Vec<String> = strings(want)
+                        .iter()
+                        .filter_map(|p| req.resolve(p))
+                        .collect();
+                    req.context_values(key).iter().all(|v| allowed.contains(v))
+                });
+            }
             if op == "Null" {
                 return entries.iter().all(|(key, want)| {
                     let absent = req.context_value(key).is_none();
@@ -1497,5 +1534,163 @@ mod tests {
         for action in CFN_WRITES {
             assert!(denied(&write(action, PROBE_STACK, WITH_SERVICE_ROLE)));
         }
+    }
+
+    const ALLOWED_TAG_KEYS: [&str; 3] =
+        ["triple-c:owner", "triple-c:project", "triple-c:environment"];
+
+    /// A check like `c` whose request also carries these tag keys.
+    fn with_tag_keys(c: &Check, keys: &[&'static str]) -> Check {
+        let mut context: Vec<(&'static str, ContextValue)> = c.context.to_vec();
+        context.extend(keys.iter().map(|k| ("aws:TagKeys", Literal(k))));
+        Check {
+            context: Box::leak(context.into_boxed_slice()),
+            ..*c
+        }
+    }
+
+    /// The workspace checks that set tags: those carrying the owner request tag.
+    fn tagging_checks() -> Vec<&'static Check> {
+        let found: Vec<_> = checks(Tier::WorkspaceUser)
+            .iter()
+            .filter(|c| c.context.contains(&(OWNER_REQUEST_TAG, OwnerId)))
+            .collect();
+        assert!(
+            found.len() >= 6,
+            "expected the six tagging checks, got {found:?}"
+        );
+        found
+    }
+
+    /// Every workspace statement that lets a user set the owner tag also
+    /// limits which tag keys they may set.
+    #[test]
+    fn workspace_tagging_statements_restrict_tag_keys() {
+        for s in allows(Tier::WorkspaceUser) {
+            let sets_owner = s["Condition"]
+                .as_object()
+                .is_some_and(|ops| ops.values().any(|e| e.get(OWNER_REQUEST_TAG).is_some()));
+            if !sets_owner {
+                continue;
+            }
+            let mut got = strings(&s["Condition"]["ForAllValues:StringEquals"]["aws:TagKeys"]);
+            got.sort();
+            let mut want: Vec<String> = ALLOWED_TAG_KEYS.iter().map(|k| k.to_string()).collect();
+            want.sort();
+            assert_eq!(got, want, "{}: aws:TagKeys", sid(&s));
+        }
+    }
+
+    /// `triple-c:component` marks environment resources, which detection
+    /// and the Denies trust; a workspace user must never be able to set it.
+    #[test]
+    fn workspace_users_cannot_set_the_component_tag() {
+        let tier = Tier::WorkspaceUser;
+        for c in tagging_checks() {
+            let spoofed = with_tag_keys(c, &["triple-c:owner", "triple-c:component"]);
+            assert!(
+                !allowed(tier, &spoofed, ME, ME),
+                "{} on {} allowed with a triple-c:component tag",
+                c.action,
+                c.resource
+            );
+            let ordinary = with_tag_keys(c, &["triple-c:owner", "triple-c:project"]);
+            assert!(
+                allowed(tier, &ordinary, ME, ME),
+                "{} with owner and project tags",
+                c.action
+            );
+            // The key restriction is not what grants: without the owner
+            // request tag, allowed keys alone are still denied.
+            let ownerless = Check {
+                context: Box::leak(
+                    ordinary
+                        .context
+                        .iter()
+                        .filter(|(k, _)| *k != OWNER_REQUEST_TAG)
+                        .copied()
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                ),
+                ..ordinary
+            };
+            assert!(
+                !allowed(tier, &ownerless, ME, ME),
+                "{} allowed without the owner request tag",
+                c.action
+            );
+        }
+    }
+
+    #[test]
+    fn user_secrets_use_an_environment_key() {
+        let tier = Tier::WorkspaceUser;
+        let create = checks(tier)
+            .iter()
+            .find(|c| c.action == "secretsmanager:CreateSecret")
+            .unwrap();
+        for context in [
+            &[(OWNER_REQUEST_TAG, OwnerId)][..],
+            &[
+                (OWNER_REQUEST_TAG, OwnerId),
+                (
+                    "secretsmanager:KmsKeyId",
+                    Literal("alias/aws/secretsmanager"),
+                ),
+            ][..],
+        ] {
+            let c = Check { context, ..*create };
+            assert!(
+                !allowed(tier, &c, ME, ME),
+                "CreateSecret allowed with {context:?}"
+            );
+        }
+        for c in checks(tier).iter().filter(|c| c.action.starts_with("kms:")) {
+            let untagged_key = Check {
+                context: &[(
+                    "kms:ViaService",
+                    Literal("secretsmanager.{region}.amazonaws.com"),
+                )],
+                ..*c
+            };
+            assert!(
+                !allowed(tier, &untagged_key, ME, ME),
+                "{} allowed on a key without triple-c:component",
+                c.action
+            );
+        }
+    }
+
+    #[test]
+    fn for_all_values_is_vacuous_on_an_absent_key() {
+        let stmt: Value = serde_json::json!({
+            "Sid": "T", "Effect": "Allow", "Action": "x:Y", "Resource": "*",
+            "Condition": { "ForAllValues:StringEquals": { "aws:TagKeys": ["a", "b"] } }
+        });
+        let check = |context| Check {
+            action: "x:Y",
+            resource: "*",
+            context,
+            write: true,
+        };
+        let holds = |c: &Check| {
+            conditions_hold(
+                &stmt,
+                &Request {
+                    check: c,
+                    caller: ME,
+                    owner: ME,
+                },
+            )
+        };
+        assert!(holds(&check(&[])));
+        assert!(holds(&check(&[
+            ("aws:TagKeys", Literal("a")),
+            ("aws:TagKeys", Literal("b"))
+        ])));
+        assert!(!holds(&check(&[
+            ("aws:TagKeys", Literal("a")),
+            ("aws:TagKeys", Literal("c"))
+        ])));
     }
 }

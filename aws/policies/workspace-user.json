@@ -17,6 +17,13 @@
         },
         "ArnLike": {
           "ecs:cluster": "arn:aws:ecs:*:*:cluster/triple-c-*"
+        },
+        "ForAllValues:StringEquals": {
+          "aws:TagKeys": [
+            "triple-c:owner",
+            "triple-c:project",
+            "triple-c:environment"
+          ]
         }
       }
     },
@@ -33,6 +40,13 @@
         "StringEquals": {
           "ecs:CreateAction": "RunTask",
           "aws:RequestTag/triple-c:owner": "${aws:userid}"
+        },
+        "ForAllValues:StringEquals": {
+          "aws:TagKeys": [
+            "triple-c:owner",
+            "triple-c:project",
+            "triple-c:environment"
+          ]
         }
       }
     },
@@ -121,6 +135,16 @@
       "Condition": {
         "StringEquals": {
           "aws:RequestTag/triple-c:owner": "${aws:userid}"
+        },
+        "ForAllValues:StringEquals": {
+          "aws:TagKeys": [
+            "triple-c:owner",
+            "triple-c:project",
+            "triple-c:environment"
+          ]
+        },
+        "ArnLike": {
+          "secretsmanager:KmsKeyId": "arn:aws:kms:*:*:key/*"
         }
       }
     },
@@ -142,6 +166,13 @@
         },
         "Null": {
           "aws:ResourceTag/triple-c:component": "true"
+        },
+        "ForAllValues:StringEquals": {
+          "aws:TagKeys": [
+            "triple-c:owner",
+            "triple-c:project",
+            "triple-c:environment"
+          ]
         }
       }
     },
@@ -194,6 +225,13 @@
         },
         "Null": {
           "aws:ResourceTag/triple-c:component": "false"
+        },
+        "ForAllValues:StringEquals": {
+          "aws:TagKeys": [
+            "triple-c:owner",
+            "triple-c:project",
+            "triple-c:environment"
+          ]
         }
       }
     },
@@ -210,6 +248,13 @@
         "StringEquals": {
           "elasticfilesystem:CreateAction": "CreateAccessPoint",
           "aws:RequestTag/triple-c:owner": "${aws:userid}"
+        },
+        "ForAllValues:StringEquals": {
+          "aws:TagKeys": [
+            "triple-c:owner",
+            "triple-c:project",
+            "triple-c:environment"
+          ]
         }
       }
     },
@@ -229,7 +274,7 @@
       }
     },
     {
-      "Sid": "EncryptThroughSecretsManagerOnly",
+      "Sid": "EncryptThroughSecretsManagerWithEnvironmentKeysOnly",
       "Effect": "Allow",
       "Action": [
         "kms:Encrypt",
@@ -241,6 +286,9 @@
       "Condition": {
         "StringLike": {
           "kms:ViaService": "secretsmanager.*.amazonaws.com"
+        },
+        "Null": {
+          "aws:ResourceTag/triple-c:component": "false"
         }
       }
     },
