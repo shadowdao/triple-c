@@ -384,9 +384,9 @@ module creates the same policy, applied by an account administrator; the admin t
 Create each file as a **customer managed policy** and attach it. In the console, go to
 **IAM → Policies → Create policy → JSON**, paste the file, and attach the policy to a user, group
 or role. Inline policies do not fit: a role's inline policies share 10,240 characters and an
-environment admin needs every tier file (about 16,600), and a user's share 2,048. A managed policy
+environment admin needs every tier file (about 16,400), and a user's share 2,048. A managed policy
 may hold 6,144 characters, not counting whitespace. Without whitespace, `workspace-user.json` is
-about 6,040 (roughly 100 characters of headroom), `workspace-user-tasks.json` about 1,460,
+about 6,040 (roughly 100 characters of headroom), `workspace-user-tasks.json` about 1,200,
 `environment-admin.json` about 5,800 (340)
 and `environment-admin-network.json` about 3,340; a unit test (`every_policy_fits_a_managed_policy`)
 fails before any file outgrows the limit. A tier that outgrows its files gains another file, which
