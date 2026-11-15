@@ -384,9 +384,15 @@ async fn with_log_tail<T: TaskApi>(api: &T, logs: &TaskLogs, arn: &str, err: Str
 }
 
 /// Stop a task this start ran, best-effort, so nothing billed is orphaned.
-async fn stop_created<T: TaskApi>(api: &T, cluster: &str, arn: &str) {
-    if let Err(e) = api.stop_task(cluster, arn, STOP_REASON).await {
-        log::warn!("Could not stop task {arn} after a failed start: {e}");
+/// `true` when StopTask succeeded; otherwise the task may still run and its
+/// ARN must stay recorded.
+async fn stop_created<T: TaskApi>(api: &T, cluster: &str, arn: &str) -> bool {
+    match api.stop_task(cluster, arn, STOP_REASON).await {
+        Ok(()) => true,
+        Err(e) => {
+            log::warn!("Could not stop task {arn} after a failed start: {e}");
+            false
+        }
     }
 }
 
@@ -485,8 +491,9 @@ pub async fn start_core<T: TaskApi, W: WorkspaceApi, R: RuntimeApi, C: Connector
             Ok(t) => t,
             Err(e) => {
                 let msg = with_log_tail(tasks, &logs, &arn, e.to_string()).await;
-                stop_created(tasks, &env.cluster_arn, &arn).await;
-                (inp.on_task)(None);
+                if stop_created(tasks, &env.cluster_arn, &arn).await {
+                    (inp.on_task)(None);
+                }
                 return Err(msg);
             }
         };
@@ -522,8 +529,7 @@ pub async fn start_core<T: TaskApi, W: WorkspaceApi, R: RuntimeApi, C: Connector
             })
         }
         Err(e) => {
-            if created {
-                stop_created(tasks, &env.cluster_arn, &task.arn).await;
+            if created && stop_created(tasks, &env.cluster_arn, &task.arn).await {
                 (inp.on_task)(None);
             }
             Err(e)
@@ -551,12 +557,10 @@ pub async fn ensure_started(
     store: &ProjectsStore,
     progress: &(dyn Fn(&str) + Send + Sync),
 ) -> Result<ContainerTarget, String> {
-    // A background re-attach (after a restart) is opening the tunnel: wait
-    // for it rather than racing it with a second one.
-    if tunnels::is_pending(&project.id) {
-        progress(PROGRESS_CONNECTING);
-        tunnels::wait_endpoint(&project.id, REATTACH_WAIT).await;
-    }
+    // A background re-attach (after a restart) may be opening a tunnel:
+    // cancel it, this start attaches itself. Its tunnel, if it gets one, is
+    // refused by the registry and closed.
+    tunnels::cancel_reattach(&project.id);
     // Already connected and answering: nothing to do.
     if let Some(ep) = tunnels::get_endpoint(&project.id) {
         if matches!(agent::is_running(&ep).await, Ok(true)) {
@@ -884,7 +888,7 @@ pub async fn reconcile(project: &Project, settings: &AppSettings, store: Arc<Pro
                 let ctx = Reattach { generation, connection_id, region, sdk, who };
                 if let Err(e) = reattach(&project, *task, ctx, &store).await {
                     log::warn!("Project {}: could not re-open the tunnel to its task: {e}", project.id);
-                    tunnels::set_pending(&project.id, false);
+                    tunnels::end_reattach(&project.id, generation);
                 }
             });
         }
@@ -947,7 +951,7 @@ async fn reattach(
     };
     if !reattach_still_wanted(store, &project.id, &task.arn) {
         tunnel.forward.close().await;
-        tunnels::set_pending(&project.id, false);
+        tunnels::end_reattach(&project.id, ctx.generation);
         log::info!("Project {}: stopped or removed while re-attaching; tunnel closed", project.id);
         return Ok(());
     }

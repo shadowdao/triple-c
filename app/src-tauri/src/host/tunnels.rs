@@ -62,8 +62,9 @@ struct Registry {
     stopped: HashSet<String>,
     /// Projects whose tunnel is being re-opened in the background.
     pending: HashSet<String>,
-    /// Bumped by every [`close`] (a stop or remove): a background re-attach
-    /// that began under an older generation must not register.
+    /// Bumped by every [`close`] (a stop or remove), every [`register`] (a
+    /// start's own tunnel) and [`cancel_reattach`]: a background re-attach
+    /// that began under an older generation must never register.
     generation: HashMap<String, u64>,
 }
 
@@ -91,6 +92,7 @@ fn notify() {
 pub fn register(project_id: &str, tunnel: LiveTunnel) -> Option<LiveTunnel> {
     let old = {
         let mut r = lock();
+        *r.generation.entry(project_id.to_string()).or_default() += 1;
         r.stopped.remove(tunnel.endpoint.base_url.as_str());
         r.pending.remove(project_id);
         r.live.insert(project_id.to_string(), tunnel)
@@ -171,25 +173,57 @@ pub fn register_if_current(
 /// [`close`], but only when the registered tunnel leads to `task_arn` (a
 /// death report about an older task must not close a newer one's tunnel).
 pub async fn close_if_task(project_id: &str, task_arn: &str) {
-    let matches = lock().live.get(project_id).is_some_and(|t| t.task_arn == task_arn);
-    if matches {
-        close(project_id).await;
+    let taken = {
+        let mut r = lock();
+        if !r.live.get(project_id).is_some_and(|t| t.task_arn == task_arn) {
+            return;
+        }
+        take(&mut r, project_id)
+    };
+    notify();
+    if let Some(t) = taken {
+        t.forward.close().await;
     }
+}
+
+/// Under the lock: invalidate a re-attach in flight and take the tunnel out.
+fn take(r: &mut Registry, project_id: &str) -> Option<LiveTunnel> {
+    r.pending.remove(project_id);
+    *r.generation.entry(project_id.to_string()).or_default() += 1;
+    let t = r.live.remove(project_id);
+    if let Some(ref t) = t {
+        r.stopped.remove(t.endpoint.base_url.as_str());
+    }
+    t
+}
+
+/// A start is about to attach itself: any background re-attach in flight
+/// is cancelled (it will hand its tunnel back and close it).
+pub fn cancel_reattach(project_id: &str) {
+    {
+        let mut r = lock();
+        r.pending.remove(project_id);
+        *r.generation.entry(project_id.to_string()).or_default() += 1;
+    }
+    notify();
+}
+
+/// A background re-attach that began at `generation` gave up: clear the
+/// pending flag, unless something newer has taken over since.
+pub fn end_reattach(project_id: &str, generation: u64) {
+    {
+        let mut r = lock();
+        if r.generation.get(project_id).copied().unwrap_or_default() == generation {
+            r.pending.remove(project_id);
+        }
+    }
+    notify();
 }
 
 /// Take the project's tunnel out and close it, and invalidate a background
 /// re-attach in flight.
 pub async fn close(project_id: &str) {
-    let taken = {
-        let mut r = lock();
-        r.pending.remove(project_id);
-        *r.generation.entry(project_id.to_string()).or_default() += 1;
-        let t = r.live.remove(project_id);
-        if let Some(ref t) = t {
-            r.stopped.remove(t.endpoint.base_url.as_str());
-        }
-        t
-    };
+    let taken = take(&mut lock(), project_id);
     notify();
     if let Some(t) = taken {
         t.forward.close().await;
@@ -219,19 +253,6 @@ pub fn mark_stopped(target_id: &str) {
 /// Whether the AWS watch has confirmed the task behind `target_id` stopped.
 pub fn is_stopped(target_id: &str) -> bool {
     lock().stopped.contains(target_id)
-}
-
-/// A background re-attach for this project has begun / ended without a tunnel.
-pub fn set_pending(project_id: &str, pending: bool) {
-    {
-        let mut r = lock();
-        if pending {
-            r.pending.insert(project_id.to_string());
-        } else {
-            r.pending.remove(project_id);
-        }
-    }
-    notify();
 }
 
 pub fn is_pending(project_id: &str) -> bool {
@@ -349,6 +370,36 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn a_starts_tunnel_survives_a_reattach_that_finishes_after_it() {
+        let closes = Arc::new(AtomicUsize::new(0));
+        // Start cancels the pending re-attach, then registers its own.
+        let p = pid("start-wins");
+        let g = begin_reattach(&p);
+        cancel_reattach(&p);
+        assert!(!is_pending(&p));
+        register(&p, fake_tunnel(61010, closes.clone()));
+        let late = register_if_current(&p, g, fake_tunnel(61011, closes.clone()));
+        late.err().expect("the late re-attach is refused").forward.close().await;
+        assert_eq!(get_endpoint(&p).unwrap().base_url.port(), Some(61010), "Start's tunnel stays");
+        assert_eq!(closes.load(Ordering::SeqCst), 1, "only the late tunnel was closed");
+        // A stale end of that re-attach does not clear a newer one's pending flag.
+        let g2 = begin_reattach(&p);
+        end_reattach(&p, g);
+        assert!(is_pending(&p));
+        end_reattach(&p, g2);
+        assert!(!is_pending(&p));
+        close(&p).await;
+
+        // Even without a cancel, a plain register makes an older re-attach stale.
+        let p = pid("register-bumps");
+        let g = begin_reattach(&p);
+        register(&p, fake_tunnel(61012, closes.clone()));
+        assert!(register_if_current(&p, g, fake_tunnel(61013, closes.clone())).is_err());
+        assert_eq!(get_endpoint(&p).unwrap().base_url.port(), Some(61012));
+        close(&p).await;
+    }
+
+    #[tokio::test]
     async fn a_death_report_closes_only_the_tunnel_of_the_task_that_died() {
         let closes = Arc::new(AtomicUsize::new(0));
         let p = pid("died");
@@ -364,7 +415,7 @@ pub(crate) mod tests {
     async fn waiting_for_an_endpoint_ends_when_it_is_registered_or_the_reattach_gives_up() {
         let p = pid("wait");
         assert!(wait_endpoint(&p, Duration::from_secs(5)).await.is_none(), "nothing pending");
-        set_pending(&p, true);
+        begin_reattach(&p);
         let p2 = p.clone();
         let waiter = tokio::spawn(async move { wait_endpoint(&p2, Duration::from_secs(5)).await });
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -372,11 +423,11 @@ pub(crate) mod tests {
         assert_eq!(waiter.await.unwrap().unwrap().base_url.port(), Some(61004));
         close(&p).await;
 
-        set_pending(&p, true);
+        let g = begin_reattach(&p);
         let p2 = p.clone();
         let waiter = tokio::spawn(async move { wait_endpoint(&p2, Duration::from_secs(5)).await });
         tokio::time::sleep(Duration::from_millis(20)).await;
-        set_pending(&p, false);
+        end_reattach(&p, g);
         assert!(waiter.await.unwrap().is_none());
     }
 }

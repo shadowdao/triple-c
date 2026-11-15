@@ -91,6 +91,8 @@ struct Fake {
     secret_json: Mutex<Option<String>>,
     /// A losing start rotates the secret's token while this one connects.
     rotated_by_loser: bool,
+    /// StopTask is refused (expired credentials, say).
+    stop_fails: bool,
     /// What `on_task` was told, in order.
     recorded: Mutex<Vec<Option<String>>>,
 }
@@ -129,6 +131,9 @@ impl TaskApi for Fake {
     }
     async fn stop_task(&self, _c: &str, arn: &str, reason: &str) -> Result<(), AwsError> {
         self.log(format!("stop {arn} {reason}"));
+        if self.stop_fails {
+            return Err(AwsError::Other { message: "ExpiredToken".into() });
+        }
         Ok(())
     }
     async fn log_tail(&self, _g: &str, _s: &str, _l: i32) -> Result<Vec<String>, AwsError> {
@@ -670,4 +675,26 @@ fn a_start_records_its_task_and_keeps_the_stored_handles_it_does_not_know() {
     record_task(&store, &p.id, None);
     let a = store.get(&p.id).unwrap().aws.unwrap();
     assert_eq!((a.task_arn, a.access_point_id.as_deref()), (None, Some("fsap-old")));
+}
+
+#[tokio::test]
+async fn a_task_that_could_not_be_stopped_after_a_failed_start_stays_recorded() {
+    let p = aws_project(StorageMode::Ephemeral);
+    let fake = Fake {
+        run: Some(task(&p, "slow", "PENDING", false)),
+        stop_fails: true,
+        ..Default::default()
+    };
+    assert!(start(&fake, &p).await.0.is_err());
+    assert!(fake.called("stop"));
+    assert_eq!(*fake.recorded.lock().unwrap(), vec![Some(task_arn("slow"))], "still findable");
+
+    let fake = Fake {
+        run: Some(task(&p, "new", "RUNNING", true)),
+        connect_fails: true,
+        stop_fails: true,
+        ..Default::default()
+    };
+    assert!(start(&fake, &p).await.0.is_err());
+    assert_eq!(*fake.recorded.lock().unwrap(), vec![Some(task_arn("new"))]);
 }
