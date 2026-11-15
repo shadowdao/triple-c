@@ -4,6 +4,7 @@
 //!
 
 mod connection;
+pub mod environments;
 mod error;
 mod identity;
 #[cfg(test)]

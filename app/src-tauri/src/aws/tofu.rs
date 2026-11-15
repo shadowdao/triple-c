@@ -320,9 +320,29 @@ fn safe_segment(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
+/// The work folder of one deployment, `<root>/work/<bucket>/<state key
+/// without .tfstate>/`, without creating or writing anything: what
+/// [`materialize`] writes into and what [`is_running`] asks about.
+#[allow(dead_code)] // used by phase-4 commands
+pub fn workdir_for(root: &Path, deployment: Deployment, bucket: &str) -> Result<Workdir, AwsError> {
+    if !safe_segment(bucket) {
+        return Err(other("Invalid state bucket name"));
+    }
+    let key = state_key(deployment);
+    let stem = key
+        .strip_suffix(".tfstate")
+        .ok_or_else(|| other("Invalid state key"))?;
+    if !stem.split('/').all(safe_segment) {
+        return Err(other("Invalid deployment name"));
+    }
+    let mut dir = root.join("work").join(bucket);
+    dir.extend(stem.split('/'));
+    Ok(Workdir { dir })
+}
+
 /// Write `kind`'s module into `<root>/work/<bucket>/<state key without
-/// .tfstate>/` with `backend.hcl` and `terraform.tfvars.json` (0600 on
-/// Unix). Refuses while a run is in progress there. `.tf` files and the lock
+/// .tfstate>/` ([`workdir_for`]) with `backend.hcl` and
+/// `terraform.tfvars.json` (0600 on Unix). Refuses while a run is in progress there. `.tf` files and the lock
 /// file left by an older module version are removed first, so a file a later
 /// version dropped can't linger and still be loaded.
 #[allow(dead_code)] // used by phase-4 commands
@@ -334,23 +354,12 @@ pub fn materialize(
     region: &str,
     vars: &Value,
 ) -> Result<Workdir, AwsError> {
-    if !safe_segment(bucket) {
-        return Err(other("Invalid state bucket name"));
-    }
+    let wd = workdir_for(root, deployment, bucket)?;
     if region.trim() != region {
         return Err(other("Invalid region"));
     }
     let region = validate_supported_region(region).map_err(other)?;
     let key = state_key(deployment);
-    let stem = key
-        .strip_suffix(".tfstate")
-        .ok_or_else(|| other("Invalid state key"))?;
-    if !stem.split('/').all(safe_segment) {
-        return Err(other("Invalid deployment name"));
-    }
-    let mut dir = root.join("work").join(bucket);
-    dir.extend(stem.split('/'));
-    let wd = Workdir { dir };
     if is_running(&wd) {
         return Err(other("A deploy is already running for this deployment"));
     }

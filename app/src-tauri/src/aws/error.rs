@@ -24,6 +24,11 @@ pub enum AwsError {
         action: String,
         message: String,
     },
+    /// `s3:CreateBucket` said `BucketAlreadyExists`: the state bucket's
+    /// name belongs to another AWS account. Never treated as success.
+    StateBucketTaken {
+        bucket: String,
+    },
     Other {
         message: String,
     },
@@ -53,6 +58,11 @@ impl std::fmt::Display for AwsError {
             AwsError::AccessDenied { action, message } => {
                 write!(f, "Access denied for {action}: {message}")
             }
+            AwsError::StateBucketTaken { bucket } => write!(
+                f,
+                "The state bucket name \"{bucket}\" is already taken by another AWS account, so \
+                 Triple-C can't keep OpenTofu state there"
+            ),
             AwsError::Other { message } => f.write_str(message),
         }
     }

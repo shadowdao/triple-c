@@ -406,6 +406,42 @@ fn materialize_refuses_names_that_leave_the_work_folder() {
     .is_err());
 }
 
+#[test]
+fn workdir_for_names_the_materialized_folder_without_writing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bucket = "triple-c-tfstate-123456789012-us-east-1";
+    let user = Deployment::User {
+        env: "dev",
+        owner_key: "0123456789ab",
+    };
+
+    let wd = workdir_for(tmp.path(), user, bucket).unwrap();
+    assert_eq!(
+        wd.dir,
+        tmp.path()
+            .join(format!("work/{bucket}/users/dev/0123456789ab/terraform"))
+    );
+    assert!(
+        !tmp.path().join("work").exists(),
+        "workdir_for wrote something"
+    );
+    assert!(!is_running(&wd));
+
+    let made = materialize(
+        tmp.path(),
+        ModuleKind::UserOnboard,
+        user,
+        bucket,
+        "us-east-1",
+        &serde_json::json!({}),
+    )
+    .unwrap();
+    assert_eq!(made, wd);
+
+    assert!(workdir_for(tmp.path(), Deployment::Environment(".."), bucket).is_err());
+    assert!(workdir_for(tmp.path(), Deployment::Boundary, "../x").is_err());
+}
+
 fn append(path: &std::path::Path, lines: &[String]) {
     let mut f = std::fs::OpenOptions::new()
         .create(true)

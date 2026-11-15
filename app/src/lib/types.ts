@@ -1148,6 +1148,7 @@ export type AwsError =
   | { kind: "keys_missing" }
   | { kind: "invalid_credentials"; message: string }
   | { kind: "access_denied"; action: string; message: string }
+  | { kind: "state_bucket_taken"; bucket: string }
   | { kind: "other"; message: string };
 
 export interface CallerIdentity {

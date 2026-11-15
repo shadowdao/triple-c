@@ -42,6 +42,8 @@ export function awsErrorMessage(e: AwsError): string {
       return `Profile ${e.profile} was not found in your AWS config, or has no credentials.`;
     case "keys_missing":
       return "The access keys for this connection are missing from the keychain. Remove and re-add the connection.";
+    case "state_bucket_taken":
+      return `The state bucket name ${e.bucket} is already taken by another AWS account.`;
     default:
       return e.message;
   }
