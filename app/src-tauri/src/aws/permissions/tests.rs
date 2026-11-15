@@ -37,7 +37,13 @@ struct FakeApi {
     allow: HashSet<&'static str>,
     simulate_denied: bool,
     get_role_denied: bool,
+    /// Returned by `resolve_principal` (after `get_role_denied`).
+    resolve_error: Option<AwsError>,
+    /// Returned by `simulate` for the named action.
+    simulate_errors: Vec<(&'static str, AwsError)>,
     probes_ok: HashSet<Probe>,
+    /// Returned by every probe not in `probes_ok` (default: AccessDenied).
+    probe_error: Option<AwsError>,
     simulated: Mutex<Vec<Simulated>>,
     probed: Mutex<Vec<Probe>>,
 }
@@ -52,7 +58,10 @@ impl FakeApi {
             allow,
             simulate_denied: false,
             get_role_denied: false,
+            resolve_error: None,
+            simulate_errors: Vec::new(),
             probes_ok: ALL_PROBES.into_iter().collect(),
+            probe_error: None,
             simulated: Mutex::new(Vec::new()),
             probed: Mutex::new(Vec::new()),
         }
@@ -70,6 +79,9 @@ impl PermissionApi for FakeApi {
                 action: "iam:GetRole".into(),
                 message: "not authorized to perform: iam:GetRole".into(),
             });
+        }
+        if let Some(e) = &self.resolve_error {
+            return Err(e.clone());
         }
         Ok(match principal {
             PrincipalArn::Exact(arn) => arn,
@@ -90,6 +102,13 @@ impl PermissionApi for FakeApi {
                 message: "not authorized to perform: iam:SimulatePrincipalPolicy".into(),
             });
         }
+        if let Some((_, e)) = self
+            .simulate_errors
+            .iter()
+            .find(|(a, _)| *a == request.action)
+        {
+            return Err(e.clone());
+        }
         Ok(self.allow.contains(request.action.as_str()))
     }
 
@@ -97,6 +116,8 @@ impl PermissionApi for FakeApi {
         self.probed.lock().unwrap().push(probe);
         if self.probes_ok.contains(&probe) {
             Ok(())
+        } else if let Some(e) = &self.probe_error {
+            Err(e.clone())
         } else {
             Err(AwsError::AccessDenied {
                 action: format!("{probe:?}"),
@@ -106,11 +127,29 @@ impl PermissionApi for FakeApi {
     }
 }
 
-fn run(api: &FakeApi) -> PermissionReport {
+fn try_run(api: &FakeApi, id: &CallerIdentity) -> Result<PermissionReport, AwsError> {
     tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap()
-        .block_on(check_permissions(api, &identity(), "eu-west-1"))
+        .block_on(check_permissions(api, id, "eu-west-1"))
+}
+
+fn run(api: &FakeApi) -> PermissionReport {
+    try_run(api, &identity()).unwrap()
+}
+
+fn row<'a>(report: &'a PermissionReport, t: Tier, action: &str) -> &'a ActionResult {
+    tier(report, t)
+        .results
+        .iter()
+        .find(|r| r.action == action)
+        .unwrap_or_else(|| panic!("{action} not in {t:?}"))
+}
+
+fn throttled() -> AwsError {
+    AwsError::Other {
+        message: "Rate exceeded (Throttling)".into(),
+    }
 }
 
 fn tier(report: &PermissionReport, t: Tier) -> &TierResult {
@@ -199,15 +238,20 @@ fn an_action_checked_twice_is_one_row_and_denied_if_either_is() {
         .filter(|r| r.action == "ssm:StartSession")
         .count();
     assert_eq!(rows, 1);
+    let failed = || Outcome::Failed("Throttling".into());
     assert_eq!(
-        aggregate(&[Verdict::Allowed, Verdict::Denied, Verdict::Unverified]),
-        Verdict::Denied
+        aggregate(&[Outcome::Allowed, Outcome::Denied, failed()]),
+        (Verdict::Denied, None)
     );
     assert_eq!(
-        aggregate(&[Verdict::Allowed, Verdict::Unverified]),
-        Verdict::Unverified
+        aggregate(&[Outcome::Allowed, Outcome::Unverified, failed()]),
+        (Verdict::Unverified, Some("Throttling".into()))
     );
-    assert_eq!(aggregate(&[Verdict::Allowed]), Verdict::Allowed);
+    assert_eq!(
+        aggregate(&[Outcome::Allowed, Outcome::Unverified]),
+        (Verdict::Unverified, None)
+    );
+    assert_eq!(aggregate(&[Outcome::Allowed]), (Verdict::Allowed, None));
 }
 
 fn context_value<'a>(s: &'a Simulated, key: &str) -> Option<&'a ContextEntry> {
@@ -380,8 +424,15 @@ fn a_denied_simulation_falls_back_to_probes_and_marks_writes_unverified() {
         verdict(&report, ws, "sts:GetCallerIdentity"),
         Verdict::Unverified
     );
-    // Nothing denied: unverified doesn't block the summary.
-    assert_eq!(report.summary, Summary::EnvironmentAdmin);
+    // The fallback itself is evidence: the caller may not simulate itself,
+    // which both tiers need.
+    for t in [ws, Tier::EnvironmentAdmin] {
+        assert_eq!(
+            verdict(&report, t, "iam:SimulatePrincipalPolicy"),
+            Verdict::Denied
+        );
+    }
+    assert_eq!(report.summary, Summary::Insufficient);
 }
 
 #[test]
@@ -395,6 +446,12 @@ fn a_denied_get_role_falls_back_to_probes() {
     }
     assert!(api.simulated().is_empty());
     assert_eq!(api.probed.lock().unwrap().len(), 4);
+    // Denied on the caller's own role: direct evidence.
+    assert_eq!(
+        verdict(&report, Tier::WorkspaceUser, "iam:GetRole"),
+        Verdict::Denied
+    );
+    assert_eq!(report.summary, Summary::Insufficient);
 }
 
 #[test]
@@ -402,15 +459,111 @@ fn an_unsimulatable_principal_falls_back_to_probes() {
     let api = FakeApi::allowing(&[Tier::WorkspaceUser]);
     let mut id = identity();
     id.arn = "arn:aws:iam::111122223333:root".into();
-    let report = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap()
-        .block_on(check_permissions(&api, &id, "eu-west-1"));
+    let report = try_run(&api, &id).unwrap();
     match &report.method {
         Method::Probed { reason } => assert!(reason.contains("simulation"), "{reason}"),
         m => panic!("expected Probed, got {m:?}"),
     }
     assert!(api.simulated().is_empty());
+}
+
+/// R15: the admin tier is nearly all writes, so a probed run can't vouch
+/// for it — every probe passing still caps at WorkspaceUser.
+#[test]
+fn a_probed_run_never_claims_environment_admin() {
+    let api = FakeApi::allowing(&[Tier::WorkspaceUser, Tier::EnvironmentAdmin]);
+    let mut id = identity();
+    id.arn = "arn:aws:iam::111122223333:root".into();
+    let report = try_run(&api, &id).unwrap();
+    assert!(matches!(report.method, Method::Probed { .. }));
+    assert!(tier(&report, Tier::EnvironmentAdmin)
+        .results
+        .iter()
+        .all(|r| r.verdict != Verdict::Denied));
+    assert_eq!(report.summary, Summary::WorkspaceUser);
+}
+
+#[test]
+fn throttled_simulations_block_the_tier_and_carry_notes() {
+    let mut api = FakeApi::allowing(&[Tier::WorkspaceUser, Tier::EnvironmentAdmin]);
+    api.simulate_errors = vec![("cloudformation:CreateStack", throttled())];
+    let report = run(&api);
+    assert_eq!(report.method, Method::Simulated);
+    let r = row(
+        &report,
+        Tier::EnvironmentAdmin,
+        "cloudformation:CreateStack",
+    );
+    assert_eq!(r.verdict, Verdict::Unverified);
+    assert!(r.note.as_deref().unwrap().contains("Throttling"), "{r:?}");
+    // Allowed rows carry no note.
+    assert_eq!(row(&report, Tier::WorkspaceUser, "ecs:RunTask").note, None);
+    assert_eq!(report.summary, Summary::WorkspaceUser);
+
+    // In the workspace tier, it blocks everything.
+    let mut api = FakeApi::allowing(&[Tier::WorkspaceUser, Tier::EnvironmentAdmin]);
+    api.simulate_errors = vec![("ecs:RunTask", throttled())];
+    let report = run(&api);
+    assert_eq!(report.summary, Summary::Insufficient);
+    assert!(row(&report, Tier::WorkspaceUser, "ecs:RunTask")
+        .note
+        .is_some());
+}
+
+#[test]
+fn a_throttled_first_simulation_is_a_note_not_a_fallback() {
+    let mut api = FakeApi::allowing(&[Tier::WorkspaceUser, Tier::EnvironmentAdmin]);
+    let first = checks(Tier::WorkspaceUser)[0].action;
+    api.simulate_errors = vec![(first, throttled())];
+    let report = run(&api);
+    assert_eq!(report.method, Method::Simulated);
+    assert!(row(&report, Tier::WorkspaceUser, first).note.is_some());
+    assert_eq!(report.summary, Summary::Insufficient);
+}
+
+#[test]
+fn an_expired_sso_session_mid_check_is_an_error() {
+    let mut api = FakeApi::allowing(&[Tier::WorkspaceUser, Tier::EnvironmentAdmin]);
+    let sso = AwsError::SsoExpired {
+        profile: "dev".into(),
+    };
+    api.simulate_errors = vec![("logs:FilterLogEvents", sso.clone())];
+    assert_eq!(try_run(&api, &identity()).unwrap_err(), sso);
+}
+
+#[test]
+fn credential_errors_anywhere_are_errors() {
+    let bad = AwsError::InvalidCredentials {
+        message: "ExpiredToken".into(),
+    };
+    // From resolving the principal.
+    let mut api = FakeApi::allowing(&[Tier::WorkspaceUser]);
+    api.resolve_error = Some(bad.clone());
+    assert_eq!(try_run(&api, &identity()).unwrap_err(), bad);
+    // From the first simulation.
+    let mut api = FakeApi::allowing(&[Tier::WorkspaceUser]);
+    api.simulate_errors = vec![(checks(Tier::WorkspaceUser)[0].action, bad.clone())];
+    assert_eq!(try_run(&api, &identity()).unwrap_err(), bad);
+    // From a probe.
+    let mut api = FakeApi::allowing(&[Tier::WorkspaceUser]);
+    api.get_role_denied = true;
+    api.probes_ok.remove(&Probe::CfnDescribeStacks);
+    api.probe_error = Some(AwsError::KeysMissing);
+    assert_eq!(
+        try_run(&api, &identity()).unwrap_err(),
+        AwsError::KeysMissing
+    );
+}
+
+#[test]
+fn a_transport_error_resolving_the_principal_is_an_error() {
+    let mut api = FakeApi::allowing(&[Tier::WorkspaceUser]);
+    let net = AwsError::Other {
+        message: "dispatch failure: connection refused".into(),
+    };
+    api.resolve_error = Some(net.clone());
+    assert_eq!(try_run(&api, &identity()).unwrap_err(), net);
+    assert!(api.probed.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -433,31 +586,21 @@ fn a_failed_probe_marks_its_reads_denied() {
 }
 
 #[test]
-fn a_probe_failing_for_another_reason_leaves_its_reads_unverified() {
-    struct Flaky(FakeApi);
-    impl PermissionApi for Flaky {
-        async fn resolve_principal(&self, p: PrincipalArn) -> Result<String, AwsError> {
-            self.0.resolve_principal(p).await
-        }
-        async fn simulate(&self, r: &SimulationRequest) -> Result<bool, AwsError> {
-            self.0.simulate(r).await
-        }
-        async fn probe(&self, _: Probe) -> Result<(), AwsError> {
-            Err(AwsError::Other {
-                message: "connection reset".into(),
-            })
-        }
-    }
-    let mut inner = FakeApi::allowing(&[Tier::WorkspaceUser]);
-    inner.simulate_denied = true;
-    let report = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap()
-        .block_on(check_permissions(&Flaky(inner), &identity(), "eu-west-1"));
-    assert_eq!(
-        verdict(&report, Tier::WorkspaceUser, "ecs:ListClusters"),
-        Verdict::Unverified
-    );
+fn a_probe_failing_for_another_reason_leaves_its_reads_unverified_and_blocks() {
+    let mut api = FakeApi::allowing(&[Tier::WorkspaceUser]);
+    let mut id = identity();
+    id.arn = "arn:aws:iam::111122223333:root".into();
+    api.probes_ok.remove(&Probe::EcsListClusters);
+    api.probe_error = Some(AwsError::Other {
+        message: "connection reset".into(),
+    });
+    let report = try_run(&api, &id).unwrap();
+    let r = row(&report, Tier::WorkspaceUser, "ecs:ListClusters");
+    assert_eq!(r.verdict, Verdict::Unverified);
+    assert!(r.note.as_deref().unwrap().contains("connection reset"));
+    // Design-level unverified rows carry no note.
+    assert_eq!(row(&report, Tier::WorkspaceUser, "ecs:RunTask").note, None);
+    assert_eq!(report.summary, Summary::Insufficient);
 }
 
 #[test]
@@ -465,8 +608,12 @@ fn the_report_serializes_for_the_ui() {
     let mut api = FakeApi::allowing(&[Tier::WorkspaceUser]);
     api.get_role_denied = true;
     let v = serde_json::to_value(run(&api)).unwrap();
-    // Probed, every probe passes: nothing is denied.
-    assert_eq!(v["summary"], "environment_admin");
+    // Probed because iam:GetRole is denied, which the workspace tier needs.
+    assert_eq!(v["summary"], "insufficient");
+    assert!(v["tiers"][0]["results"][0]
+        .as_object()
+        .unwrap()
+        .contains_key("note"));
     assert_eq!(v["tiers"][0]["tier"], "workspace_user");
     assert!(v["method"]["probed"]["reason"].is_string(), "{v}");
     assert!(["allowed", "denied", "unverified"]
