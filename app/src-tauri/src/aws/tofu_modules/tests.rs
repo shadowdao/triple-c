@@ -1340,7 +1340,9 @@ fn the_record_is_format_checked_before_use() {
 // it shows missing is added here, to the policy, to the check table
 // (`policies.rs`) and to `aws/README.md` together.
 
-use crate::aws::policies::{permissions_boundary_json, policy_files, Check, ContextValue, Tier};
+use crate::aws::policies::{
+    checks, permissions_boundary_json, policy_files, Check, ContextValue, Tier,
+};
 use crate::aws::policy_eval as eval;
 
 type Context = &'static [(&'static str, ContextValue)];
@@ -1404,8 +1406,17 @@ const BOUNDED: Context = &[
     ),
     ("aws:PrincipalAccount", Literal("{account}")),
 ];
+/// Created inside an environment-module VPC, subnet or address: the new
+/// resource carries the request tag, its parent the component tag.
+const ENV_CREATE_IN_ENV: Context = &[
+    (REQUEST_COMPONENT, Literal("environment")),
+    (RESOURCE_COMPONENT, Literal("environment")),
+];
 /// A call EFS makes on the caller's behalf (a mount target's interface).
-const VIA_SERVICE: Context = &[("aws:ViaAWSService", Literal("true"))];
+const VIA_SERVICE: Context = &[(
+    "aws:CalledViaLast",
+    Literal("elasticfilesystem.amazonaws.com"),
+)];
 const NONE: Context = &[];
 
 macro_rules! created_by {
@@ -1414,18 +1425,24 @@ macro_rules! created_by {
     };
 }
 
+/// The state bucket is in the caller's own account.
+const IN_ACCOUNT: Context = &[
+    ("s3:ResourceAccount", Literal("{account}")),
+    ("aws:PrincipalAccount", Literal("{account}")),
+];
+
 /// The S3 backend's calls on one deployment's state and lock objects.
 const BACKEND: &[Check] = &[
-    call("s3:ListBucket", STATE_BUCKET, NONE),
-    call("s3:GetObject", ENV_STATE, NONE),
-    call("s3:PutObject", ENV_STATE, NONE),
-    call("s3:GetObject", ENV_LOCK, NONE),
-    call("s3:PutObject", ENV_LOCK, NONE),
-    call("s3:DeleteObject", ENV_LOCK, NONE),
-    call("s3:GetObject", USER_STATE, NONE),
-    call("s3:PutObject", USER_STATE, NONE),
-    call("s3:PutObject", USER_LOCK, NONE),
-    call("s3:DeleteObject", USER_LOCK, NONE),
+    call("s3:ListBucket", STATE_BUCKET, IN_ACCOUNT),
+    call("s3:GetObject", ENV_STATE, IN_ACCOUNT),
+    call("s3:PutObject", ENV_STATE, IN_ACCOUNT),
+    call("s3:GetObject", ENV_LOCK, IN_ACCOUNT),
+    call("s3:PutObject", ENV_LOCK, IN_ACCOUNT),
+    call("s3:DeleteObject", ENV_LOCK, IN_ACCOUNT),
+    call("s3:GetObject", USER_STATE, IN_ACCOUNT),
+    call("s3:PutObject", USER_STATE, IN_ACCOUNT),
+    call("s3:PutObject", USER_LOCK, IN_ACCOUNT),
+    call("s3:DeleteObject", USER_LOCK, IN_ACCOUNT),
 ];
 
 const MODULE_CALLS: &[(&str, &[Check])] = &[
@@ -1462,6 +1479,8 @@ const MODULE_CALLS: &[(&str, &[Check])] = &[
         "aws_security_group",
         &[
             call("ec2:CreateSecurityGroup", SG, ENV_CREATE),
+            // The one create that may name an untagged VPC: an
+            // `existing`-network environment's is the user's own.
             call("ec2:CreateSecurityGroup", VPC, ENV_CREATE),
             call("ec2:CreateTags", SG, created_by!("CreateSecurityGroup")),
             call("ec2:DescribeSecurityGroups", "*", NONE),
@@ -1582,7 +1601,7 @@ const MODULE_CALLS: &[(&str, &[Check])] = &[
         "aws_subnet",
         &[
             call("ec2:CreateSubnet", SUBNET, ENV_CREATE),
-            call("ec2:CreateSubnet", VPC, ENV_CREATE),
+            call("ec2:CreateSubnet", VPC, ENV_CREATE_IN_ENV),
             call("ec2:CreateTags", SUBNET, created_by!("CreateSubnet")),
             call("ec2:DescribeSubnets", "*", NONE),
             call("ec2:ModifySubnetAttribute", SUBNET, ENV_TAGGED),
@@ -1596,7 +1615,7 @@ const MODULE_CALLS: &[(&str, &[Check])] = &[
         "aws_route_table",
         &[
             call("ec2:CreateRouteTable", RTB, ENV_CREATE),
-            call("ec2:CreateRouteTable", VPC, ENV_CREATE),
+            call("ec2:CreateRouteTable", VPC, ENV_CREATE_IN_ENV),
             call("ec2:CreateTags", RTB, created_by!("CreateRouteTable")),
             call("ec2:DescribeRouteTables", "*", NONE),
             call("ec2:CreateTags", RTB, ENV_TAGGED),
@@ -1615,13 +1634,14 @@ const MODULE_CALLS: &[(&str, &[Check])] = &[
     ),
     (
         // Untaggable: authorized against the route table and the subnet.
+        // Replacing an association is never allowed (it could swap a VPC's
+        // main route table), so a changed route_table_id fails rather than
+        // re-associating; the modules never change it.
         "aws_route_table_association",
         &[
             call("ec2:AssociateRouteTable", RTB, ENV_TAGGED),
             call("ec2:AssociateRouteTable", SUBNET, ENV_TAGGED),
             call("ec2:DescribeRouteTables", "*", NONE),
-            call("ec2:ReplaceRouteTableAssociation", RTB, ENV_TAGGED),
-            call("ec2:ReplaceRouteTableAssociation", SUBNET, ENV_TAGGED),
             call("ec2:DisassociateRouteTable", RTB, ENV_TAGGED),
             call("ec2:DisassociateRouteTable", SUBNET, ENV_TAGGED),
         ],
@@ -1642,9 +1662,9 @@ const MODULE_CALLS: &[(&str, &[Check])] = &[
         "aws_nat_gateway",
         &[
             call("ec2:CreateNatGateway", NAT, ENV_CREATE),
-            call("ec2:CreateNatGateway", SUBNET, ENV_CREATE),
-            call("ec2:CreateNatGateway", EIP, ENV_CREATE),
-            call("ec2:CreateNatGateway", VPC, ENV_CREATE),
+            call("ec2:CreateNatGateway", SUBNET, ENV_CREATE_IN_ENV),
+            call("ec2:CreateNatGateway", EIP, ENV_CREATE_IN_ENV),
+            call("ec2:CreateNatGateway", VPC, ENV_CREATE_IN_ENV),
             call("ec2:CreateTags", NAT, created_by!("CreateNatGateway")),
             call("ec2:DescribeNatGateways", "*", NONE),
             call("ec2:CreateTags", NAT, ENV_TAGGED),
@@ -1947,4 +1967,66 @@ fn every_onboarding_role_stays_inside_the_boundary() {
         }
     }
     assert!(seen >= 15, "only {seen} role grants checked");
+}
+
+/// Admin write checks for calls the app makes itself, not the modules.
+const APP_ONLY_WRITES: &[&str] = &[
+    // The state bucket's setup (the backend only reads and writes objects).
+    "s3:CreateBucket",
+    "s3:PutBucketVersioning",
+    "s3:PutEncryptionConfiguration",
+    "s3:PutBucketPublicAccessBlock",
+    "s3:PutBucketTagging",
+    "s3:PutBucketPolicy",
+    // Workspaces (phase 5): task definitions and the roles they name.
+    "ecs:RegisterTaskDefinition",
+    "ecs:DeregisterTaskDefinition",
+    "iam:PassRole",
+    "iam:AttachRolePolicy",
+    "iam:DetachRolePolicy",
+    // The permission check itself.
+    "iam:SimulatePrincipalPolicy",
+];
+
+fn is_write(action: &str) -> bool {
+    let verb = action.split(':').nth(1).unwrap();
+    !["Describe", "List", "Get"]
+        .iter()
+        .any(|p| verb.starts_with(p))
+}
+
+/// The module table and the check table can't drift: every write a module
+/// makes is something the permission check asks about, and every admin write
+/// check is a module's call or one of the app's own.
+#[test]
+fn every_module_write_has_an_admin_check_and_vice_versa() {
+    let checked: BTreeSet<&str> = checks(Tier::EnvironmentAdmin)
+        .iter()
+        .map(|c| c.action)
+        .filter(|a| is_write(a))
+        .collect();
+    let module: BTreeSet<&str> = MODULE_CALLS
+        .iter()
+        .flat_map(|(_, calls)| calls.iter().map(|c| c.action))
+        .filter(|a| is_write(a))
+        .collect();
+    let unchecked: Vec<_> = module.difference(&checked).collect();
+    assert!(
+        unchecked.is_empty(),
+        "module writes without an admin check: {unchecked:?}"
+    );
+    let app_only: BTreeSet<&str> = APP_ONLY_WRITES.iter().copied().collect();
+    let stray: Vec<_> = checked
+        .iter()
+        .filter(|a| !module.contains(*a) && !app_only.contains(*a))
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "admin write checks no module or app call needs: {stray:?}"
+    );
+    let stale: Vec<_> = app_only
+        .iter()
+        .filter(|a| module.contains(*a) || !checked.contains(*a))
+        .collect();
+    assert!(stale.is_empty(), "APP_ONLY_WRITES is stale: {stale:?}");
 }

@@ -201,8 +201,6 @@ pub(crate) fn conditions_hold(stmt: &Value, req: &Request) -> bool {
         // otherwise when no value matches.
         let (matches, negated): (fn(&str, &str) -> bool, bool) = match base {
             "StringEquals" => (|p, v| p == v, false),
-            // A boolean key's value is the string "true" or "false".
-            "Bool" => (|p, v| p == v, false),
             "StringLike" | "ArnLike" => (glob, false),
             "StringNotEquals" => (|p, v| p == v, true),
             "StringNotLike" => (glob, true),
@@ -289,32 +287,5 @@ mod tests {
             ("aws:TagKeys", Literal("a")),
             ("aws:TagKeys", Literal("c"))
         ])));
-    }
-
-    #[test]
-    fn bool_compares_the_values_string() {
-        let stmt: Value = serde_json::json!({
-            "Sid": "T", "Effect": "Allow", "Action": "x:Y", "Resource": "*",
-            "Condition": { "Bool": { "aws:ViaAWSService": "true" } }
-        });
-        let holds = |context| {
-            let c = Check {
-                action: "x:Y",
-                resource: "*",
-                context,
-                write: true,
-            };
-            conditions_hold(
-                &stmt,
-                &Request {
-                    check: &c,
-                    caller: ME,
-                    owner: ME,
-                },
-            )
-        };
-        assert!(holds(&[("aws:ViaAWSService", Literal("true"))]));
-        assert!(!holds(&[("aws:ViaAWSService", Literal("false"))]));
-        assert!(!holds(&[]));
     }
 }

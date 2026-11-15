@@ -140,10 +140,27 @@ const COMPONENT_REQUESTED: Context =
     &[("aws:RequestTag/triple-c:component", Literal("environment"))];
 const COMPONENT_RESOURCE_TAG: &str = "aws:ResourceTag/triple-c:component";
 const COMPONENT_TAGGED: Context = &[(COMPONENT_RESOURCE_TAG, Literal("environment"))];
-/// A call a service makes on the caller's behalf.
-const VIA_AWS_SERVICE: Context = &[("aws:ViaAWSService", Literal("true"))];
+/// A call EFS makes on the caller's behalf (a mount target's interface).
+const VIA_EFS: Context = &[(
+    "aws:CalledViaLast",
+    Literal("elasticfilesystem.amazonaws.com"),
+)];
+/// Created inside a Triple-C (component-tagged) VPC, subnet or address.
+const REQUESTED_IN_TRIPLE_C_PARENT: Context = &[
+    ("aws:RequestTag/triple-c:component", Literal("environment")),
+    (COMPONENT_RESOURCE_TAG, Literal("environment")),
+];
+/// The state bucket is in the caller's own account.
+const IN_MY_ACCOUNT: Context = &[
+    ("s3:ResourceAccount", Literal("{account}")),
+    ("aws:PrincipalAccount", Literal("{account}")),
+];
 /// The state bucket is created tagged `triple-c:component=state`.
-const STATE_REQUESTED: Context = &[("aws:RequestTag/triple-c:component", Literal("state"))];
+const STATE_REQUESTED: Context = &[
+    ("aws:RequestTag/triple-c:component", Literal("state")),
+    ("s3:ResourceAccount", Literal("{account}")),
+    ("aws:PrincipalAccount", Literal("{account}")),
+];
 
 const PROBE_CLUSTER: &str = "arn:aws:ecs:{region}:{account}:cluster/triple-c-probe";
 const PROBE_TASK: &str =
@@ -408,16 +425,6 @@ const ENVIRONMENT_ADMIN_CHECKS: &[Check] = &[
     write("ecs:UntagResource", PROBE_CLUSTER, &[]),
     read("ecs:DescribeClusters", PROBE_CLUSTER, &[]),
     read("ecs:ListTagsForResource", PROBE_CLUSTER, &[]),
-    write(
-        "ecs:CreateCapacityProvider",
-        "arn:aws:ecs:{region}:{account}:capacity-provider/triple-c-probe",
-        &[],
-    ),
-    write(
-        "ecs:DeleteCapacityProvider",
-        "arn:aws:ecs:{region}:{account}:capacity-provider/triple-c-probe",
-        &[],
-    ),
     write("ecs:RegisterTaskDefinition", "*", &[]),
     write("ecs:DeregisterTaskDefinition", "*", &[]),
     // The network (environment-admin-network.json). Creates carry the
@@ -425,7 +432,7 @@ const ENVIRONMENT_ADMIN_CHECKS: &[Check] = &[
     // its parents; tags go on only through the creating call.
     write("ec2:CreateVpc", PROBE_VPC, COMPONENT_REQUESTED),
     write("ec2:CreateSubnet", PROBE_SUBNET, COMPONENT_REQUESTED),
-    write("ec2:CreateSubnet", PROBE_VPC, COMPONENT_REQUESTED),
+    write("ec2:CreateSubnet", PROBE_VPC, REQUESTED_IN_TRIPLE_C_PARENT),
     write(
         "ec2:CreateInternetGateway",
         PROBE_INTERNET_GATEWAY,
@@ -436,24 +443,38 @@ const ENVIRONMENT_ADMIN_CHECKS: &[Check] = &[
         PROBE_ROUTE_TABLE,
         COMPONENT_REQUESTED,
     ),
-    write("ec2:CreateRouteTable", PROBE_VPC, COMPONENT_REQUESTED),
+    write(
+        "ec2:CreateRouteTable",
+        PROBE_VPC,
+        REQUESTED_IN_TRIPLE_C_PARENT,
+    ),
     write("ec2:AllocateAddress", PROBE_ELASTIC_IP, COMPONENT_REQUESTED),
     write(
         "ec2:CreateNatGateway",
         PROBE_NAT_GATEWAY,
         COMPONENT_REQUESTED,
     ),
-    write("ec2:CreateNatGateway", PROBE_SUBNET, COMPONENT_REQUESTED),
+    write(
+        "ec2:CreateNatGateway",
+        PROBE_SUBNET,
+        REQUESTED_IN_TRIPLE_C_PARENT,
+    ),
     write(
         "ec2:CreateNatGateway",
         PROBE_ELASTIC_IP,
-        COMPONENT_REQUESTED,
+        REQUESTED_IN_TRIPLE_C_PARENT,
     ),
     write(
         "ec2:CreateSecurityGroup",
         PROBE_SECURITY_GROUP,
         COMPONENT_REQUESTED,
     ),
+    write(
+        "ec2:CreateNatGateway",
+        PROBE_VPC,
+        REQUESTED_IN_TRIPLE_C_PARENT,
+    ),
+    // The one create that may name an untagged (existing-network) VPC.
     write("ec2:CreateSecurityGroup", PROBE_VPC, COMPONENT_REQUESTED),
     write(
         "ec2:CreateTags",
@@ -506,11 +527,6 @@ const ENVIRONMENT_ADMIN_CHECKS: &[Check] = &[
     ),
     write("ec2:AssociateRouteTable", PROBE_SUBNET, COMPONENT_TAGGED),
     write(
-        "ec2:ReplaceRouteTableAssociation",
-        PROBE_ROUTE_TABLE,
-        COMPONENT_TAGGED,
-    ),
-    write(
         "ec2:DisassociateRouteTable",
         PROBE_ROUTE_TABLE,
         COMPONENT_TAGGED,
@@ -560,18 +576,23 @@ const ENVIRONMENT_ADMIN_CHECKS: &[Check] = &[
         PROBE_SECURITY_GROUP,
         COMPONENT_TAGGED,
     ),
+    write(
+        "ec2:UpdateSecurityGroupRuleDescriptionsEgress",
+        PROBE_SECURITY_GROUP,
+        COMPONENT_TAGGED,
+    ),
     // EFS creates and deletes a mount target's interface with the caller's
     // EC2 permissions.
     write(
         "ec2:CreateNetworkInterface",
         PROBE_NETWORK_INTERFACE,
-        VIA_AWS_SERVICE,
+        VIA_EFS,
     ),
-    write("ec2:CreateNetworkInterface", PROBE_SUBNET, VIA_AWS_SERVICE),
+    write("ec2:CreateNetworkInterface", PROBE_SUBNET, VIA_EFS),
     write(
         "ec2:DeleteNetworkInterface",
         PROBE_NETWORK_INTERFACE,
-        VIA_AWS_SERVICE,
+        VIA_EFS,
     ),
     read("ec2:DescribeSecurityGroups", "*", &[]),
     read("ec2:DescribeVpcs", "*", &[]),
@@ -679,17 +700,6 @@ const ENVIRONMENT_ADMIN_CHECKS: &[Check] = &[
     write("logs:DeleteRetentionPolicy", PROBE_LOG_GROUP, &[]),
     read("logs:ListTagsForResource", PROBE_LOG_GROUP, &[]),
     read("logs:DescribeLogGroups", "*", &[]),
-    write(
-        "ecr:CreateRepository",
-        "arn:aws:ecr:{region}:{account}:repository/triple-c/probe",
-        &[],
-    ),
-    write(
-        "ecr:DeleteRepository",
-        "arn:aws:ecr:{region}:{account}:repository/triple-c/probe",
-        &[],
-    ),
-    write("ecr:CreatePullThroughCacheRule", "*", &[]),
     write("ssm:PutParameter", PROBE_PARAMETER, COMPONENT_REQUESTED),
     write(
         "ssm:AddTagsToResource",
@@ -705,16 +715,24 @@ const ENVIRONMENT_ADMIN_CHECKS: &[Check] = &[
     // The state bucket (the app creates it; OpenTofu's S3 backend reads and
     // writes the state and lock objects).
     write("s3:CreateBucket", PROBE_STATE_BUCKET, STATE_REQUESTED),
-    write("s3:PutBucketVersioning", PROBE_STATE_BUCKET, &[]),
-    write("s3:PutEncryptionConfiguration", PROBE_STATE_BUCKET, &[]),
-    write("s3:PutBucketPublicAccessBlock", PROBE_STATE_BUCKET, &[]),
-    write("s3:PutBucketTagging", PROBE_STATE_BUCKET, &[]),
-    write("s3:PutBucketPolicy", PROBE_STATE_BUCKET, &[]),
-    read("s3:GetBucketVersioning", PROBE_STATE_BUCKET, &[]),
-    read("s3:ListBucket", PROBE_STATE_BUCKET, &[]),
-    read("s3:GetObject", PROBE_STATE_OBJECT, &[]),
-    write("s3:PutObject", PROBE_STATE_OBJECT, &[]),
-    write("s3:DeleteObject", PROBE_STATE_OBJECT, &[]),
+    write("s3:PutBucketVersioning", PROBE_STATE_BUCKET, IN_MY_ACCOUNT),
+    write(
+        "s3:PutEncryptionConfiguration",
+        PROBE_STATE_BUCKET,
+        IN_MY_ACCOUNT,
+    ),
+    write(
+        "s3:PutBucketPublicAccessBlock",
+        PROBE_STATE_BUCKET,
+        IN_MY_ACCOUNT,
+    ),
+    write("s3:PutBucketTagging", PROBE_STATE_BUCKET, IN_MY_ACCOUNT),
+    write("s3:PutBucketPolicy", PROBE_STATE_BUCKET, IN_MY_ACCOUNT),
+    read("s3:GetBucketVersioning", PROBE_STATE_BUCKET, IN_MY_ACCOUNT),
+    read("s3:ListBucket", PROBE_STATE_BUCKET, IN_MY_ACCOUNT),
+    read("s3:GetObject", PROBE_STATE_OBJECT, IN_MY_ACCOUNT),
+    write("s3:PutObject", PROBE_STATE_OBJECT, IN_MY_ACCOUNT),
+    write("s3:DeleteObject", PROBE_STATE_OBJECT, IN_MY_ACCOUNT),
 ];
 
 #[cfg(test)]
@@ -1676,45 +1694,76 @@ mod tests {
         };
         assert!(allowed(tier, &tag_at("CreateVpc"), ME, ME));
         assert!(!allowed(tier, &tag_at("RunInstances"), ME, ME));
-        // A mount target's interface is EFS's doing, never a direct call.
+        // A mount target's interface is EFS's doing, never a direct call, nor
+        // another service's.
         for action in ["ec2:CreateNetworkInterface", "ec2:DeleteNetworkInterface"] {
             assert!(
                 !allowed(tier, &write(action, PROBE_NETWORK_INTERFACE, &[]), ME, ME),
                 "{action}"
             );
+            let via_lambda: Context = &[("aws:CalledViaLast", Literal("lambda.amazonaws.com"))];
+            assert!(
+                !allowed(
+                    tier,
+                    &write(action, PROBE_NETWORK_INTERFACE, via_lambda),
+                    ME,
+                    ME
+                ),
+                "{action} via another service"
+            );
         }
-        // No bucket may be deleted, and only the state bucket is managed.
+        // Only the state bucket is managed, and only in the caller's account
+        // (the name is predictable, so another account could pre-create it).
         const OTHER_BUCKET: &str = "arn:aws:s3:::someone-elses-bucket";
+        const OTHER_ACCOUNT: Context = &[
+            ("s3:ResourceAccount", Literal("999999999999")),
+            ("aws:PrincipalAccount", Literal("{account}")),
+        ];
+        const OTHER_ACCOUNT_REQUESTED: Context = &[
+            ("aws:RequestTag/triple-c:component", Literal("state")),
+            ("s3:ResourceAccount", Literal("999999999999")),
+            ("aws:PrincipalAccount", Literal("{account}")),
+        ];
+        // No bucket may be deleted.
         for bucket in [PROBE_STATE_BUCKET, OTHER_BUCKET] {
-            for context in [&[][..], COMPONENT_TAGGED] {
+            for context in [&[][..], COMPONENT_TAGGED, IN_MY_ACCOUNT] {
                 assert!(
                     !allowed(tier, &write("s3:DeleteBucket", bucket, context), ME, ME),
                     "s3:DeleteBucket on {bucket}"
                 );
             }
         }
-        for action in [
-            "s3:PutBucketPolicy",
-            "s3:PutBucketVersioning",
-            "s3:PutEncryptionConfiguration",
-            "s3:PutBucketPublicAccessBlock",
-            "s3:PutBucketTagging",
-        ] {
+        let state_calls = [
+            ("s3:PutBucketPolicy", PROBE_STATE_BUCKET),
+            ("s3:PutBucketVersioning", PROBE_STATE_BUCKET),
+            ("s3:PutEncryptionConfiguration", PROBE_STATE_BUCKET),
+            ("s3:PutBucketPublicAccessBlock", PROBE_STATE_BUCKET),
+            ("s3:PutBucketTagging", PROBE_STATE_BUCKET),
+            ("s3:ListBucket", PROBE_STATE_BUCKET),
+            ("s3:GetObject", PROBE_STATE_OBJECT),
+            ("s3:PutObject", PROBE_STATE_OBJECT),
+            ("s3:DeleteObject", PROBE_STATE_OBJECT),
+        ];
+        for (action, resource) in state_calls {
             assert!(
-                allowed(tier, &write(action, PROBE_STATE_BUCKET, &[]), ME, ME),
+                allowed(tier, &write(action, resource, IN_MY_ACCOUNT), ME, ME),
                 "{action}"
             );
-            assert!(
-                !allowed(tier, &write(action, OTHER_BUCKET, &[]), ME, ME),
-                "{action}"
+            for context in [&[][..], OTHER_ACCOUNT] {
+                assert!(
+                    !allowed(tier, &write(action, resource, context), ME, ME),
+                    "{action} on a state bucket with {context:?}"
+                );
+            }
+            let elsewhere = resource.replace(
+                "triple-c-tfstate-{account}-{region}",
+                "someone-elses-bucket",
             );
-        }
-        for action in ["s3:PutObject", "s3:DeleteObject", "s3:GetObject"] {
-            let check = Check {
-                write: action != "s3:GetObject",
-                ..write(action, "arn:aws:s3:::someone-elses-bucket/key", &[])
-            };
-            assert!(!allowed(tier, &check, ME, ME), "{action}");
+            let elsewhere: &'static str = Box::leak(elsewhere.into_boxed_str());
+            assert!(
+                !allowed(tier, &write(action, elsewhere, IN_MY_ACCOUNT), ME, ME),
+                "{action} on {elsewhere}"
+            );
         }
         assert!(allowed(
             tier,
@@ -1722,15 +1771,88 @@ mod tests {
             ME,
             ME
         ));
-        assert!(!allowed(
+        for (bucket, context) in [
+            (PROBE_STATE_BUCKET, IN_MY_ACCOUNT),
+            (PROBE_STATE_BUCKET, OTHER_ACCOUNT_REQUESTED),
+            (OTHER_BUCKET, STATE_REQUESTED),
+        ] {
+            assert!(
+                !allowed(tier, &write("s3:CreateBucket", bucket, context), ME, ME),
+                "s3:CreateBucket {bucket} with {context:?}"
+            );
+        }
+    }
+
+    /// Network resources are created only inside the environment's own
+    /// (component-tagged) VPC, subnets and addresses: a tagged subnet,
+    /// route table, gateway or NAT gateway in someone else's VPC would
+    /// re-route it. The one exception is a security group, which an
+    /// `existing`-network environment creates in the user's own VPC.
+    #[test]
+    fn network_creates_need_a_triple_c_parent() {
+        let tier = Tier::EnvironmentAdmin;
+        for (action, parent) in [
+            ("ec2:CreateSubnet", PROBE_VPC),
+            ("ec2:CreateRouteTable", PROBE_VPC),
+            ("ec2:CreateNatGateway", PROBE_VPC),
+            ("ec2:CreateNatGateway", PROBE_SUBNET),
+            ("ec2:CreateNatGateway", PROBE_ELASTIC_IP),
+        ] {
+            assert!(
+                allowed(
+                    tier,
+                    &write(action, parent, REQUESTED_IN_TRIPLE_C_PARENT),
+                    ME,
+                    ME
+                ),
+                "{action} in a Triple-C {parent}"
+            );
+            assert!(
+                !allowed(tier, &write(action, parent, COMPONENT_REQUESTED), ME, ME),
+                "{action} in an untagged {parent}"
+            );
+        }
+        // Attaching a gateway (and routing through it) needs the VPC tagged.
+        for (action, resource) in [
+            ("ec2:AttachInternetGateway", PROBE_VPC),
+            ("ec2:CreateRoute", PROBE_ROUTE_TABLE),
+            ("ec2:AssociateRouteTable", PROBE_ROUTE_TABLE),
+            ("ec2:AssociateRouteTable", PROBE_SUBNET),
+        ] {
+            assert!(
+                !allowed(tier, &write(action, resource, COMPONENT_REQUESTED), ME, ME),
+                "{action} on an untagged {resource}"
+            );
+        }
+        assert!(allowed(
             tier,
-            &write("s3:CreateBucket", PROBE_STATE_BUCKET, &[]),
+            &write("ec2:CreateSecurityGroup", PROBE_VPC, COMPONENT_REQUESTED),
             ME,
             ME
         ));
         assert!(!allowed(
             tier,
-            &write("s3:CreateBucket", OTHER_BUCKET, STATE_REQUESTED),
+            &write("ec2:CreateSecurityGroup", PROBE_VPC, &[]),
+            ME,
+            ME
+        ));
+        // A VPC's main route table association names no subnet, so swapping
+        // it would re-route a VPC by its route table alone: never allowed.
+        assert!(!allowed(
+            tier,
+            &write(
+                "ec2:ReplaceRouteTableAssociation",
+                PROBE_ROUTE_TABLE,
+                COMPONENT_TAGGED
+            ),
+            ME,
+            ME
+        ));
+        // Triple-C roles are passed only to ECS tasks (Fargate, v1).
+        let pass_to_ec2: Context = &[("iam:PassedToService", Literal("ec2.amazonaws.com"))];
+        assert!(!allowed(
+            tier,
+            &write("iam:PassRole", PROBE_ROLE, pass_to_ec2),
             ME,
             ME
         ));

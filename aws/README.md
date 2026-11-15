@@ -90,12 +90,15 @@ and nothing runs with more than the admin holds. It covers:
 - the per-account state bucket `triple-c-tfstate-<account>-<region>` (created by the app, tagged
   `triple-c:component=state`, then read and written by OpenTofu's S3 backend, lock files included);
 - `triple-c-*` IAM roles, and reading the `triple-c-permissions-boundary` policy;
-- ECS clusters (and capacity providers and task definitions);
+- ECS clusters (Fargate and Fargate Spot only) and task definitions;
 - the network: VPCs, subnets, an internet gateway, route tables and routes, an Elastic IP and NAT
   gateway, security groups and their rules (`environment-admin-network.json`);
 - EFS file systems, mount targets and file-system policies, and KMS keys and aliases;
-- `/triple-c/*` log groups and `/triple-c/*` SSM parameters;
-- ECR repositories and pull-through cache rules.
+- `/triple-c/*` log groups and `/triple-c/*` SSM parameters.
+
+Not in v1, and so not in the policy: ECR (tasks pull from GHCR), custom ECS capacity providers,
+and passing roles to EC2 (`iam:PassRole` is to `ecs-tasks.amazonaws.com` only). Phase 7's EC2
+capacity adds them back.
 
 ### What each module resource needs
 
@@ -116,24 +119,31 @@ to the table, the policy, the check table in `policies.rs` and this list togethe
 | `aws_ssm_parameter` | `ssm:PutParameter`, `AddTagsToResource`, `GetParameter`, `ListTagsForResource`, `RemoveTagsFromResource`, `DeleteParameter` (`/triple-c/*`), `DescribeParameters` (`*`) |
 | `aws_vpc` | `ec2:CreateVpc` (request tag), `CreateTags` (at create), `ModifyVpcAttribute` (DNS hostnames), `CreateTags`/`DeleteTags`, `DeleteVpc` (tagged), `Describe*` |
 | `aws_internet_gateway` | `ec2:CreateInternetGateway`, `CreateTags` (at create), `Attach`/`DetachInternetGateway` (tagged gateway and VPC), `DeleteInternetGateway`, `Describe*` |
-| `aws_subnet` | `ec2:CreateSubnet` (subnet and VPC, request tag), `CreateTags` (at create), `ModifySubnetAttribute`, `DeleteSubnet` (tagged), `Describe*` |
-| `aws_route_table` | `ec2:CreateRouteTable` (table and VPC, request tag), `CreateTags` (at create), `DeleteRouteTable` (tagged), `Describe*` |
+| `aws_subnet` | `ec2:CreateSubnet` (subnet: request tag; VPC: tagged), `CreateTags` (at create), `ModifySubnetAttribute`, `DeleteSubnet` (tagged), `Describe*` |
+| `aws_route_table` | `ec2:CreateRouteTable` (table: request tag; VPC: tagged), `CreateTags` (at create), `DeleteRouteTable` (tagged), `Describe*` |
 | `aws_route` | `ec2:CreateRoute`, `ReplaceRoute`, `DeleteRoute` (the tagged route table; untaggable) |
-| `aws_route_table_association` | `ec2:AssociateRouteTable`, `ReplaceRouteTableAssociation`, `DisassociateRouteTable` (the tagged route table and subnet; untaggable) |
+| `aws_route_table_association` | `ec2:AssociateRouteTable`, `DisassociateRouteTable` (the tagged route table and subnet; untaggable). Never `ReplaceRouteTableAssociation`: it names no subnet when it swaps a VPC's main route table, so it could re-route a VPC that isn't Triple-C's; the modules never change an association's table |
 | `aws_eip` | `ec2:AllocateAddress` (request tag), `CreateTags` (at create), `ReleaseAddress` (tagged), `Describe*` |
-| `aws_nat_gateway` | `ec2:CreateNatGateway` (gateway, subnet, address and VPC, request tag), `CreateTags` (at create), `DeleteNatGateway` (tagged), `Describe*` |
+| `aws_nat_gateway` | `ec2:CreateNatGateway` (gateway: request tag; its subnet, address and VPC: tagged), `CreateTags` (at create), `DeleteNatGateway` (tagged), `Describe*` |
 | `aws_efs_file_system` | `elasticfilesystem:CreateFileSystem` (`*`, request tag), `TagResource` (at create), `UpdateFileSystem`, `PutLifecycleConfiguration`, `TagResource`/`UntagResource`, `DeleteFileSystem` (tagged), `Describe*`, `ListTagsForResource` |
-| `aws_efs_mount_target` | `elasticfilesystem:CreateMountTarget`, `ModifyMountTargetSecurityGroups`, `DeleteMountTarget` (the tagged file system; untaggable), and the interface EFS makes with the caller's permissions: `ec2:CreateNetworkInterface`, `ec2:DeleteNetworkInterface` (only with `aws:ViaAWSService`) |
+| `aws_efs_mount_target` | `elasticfilesystem:CreateMountTarget`, `ModifyMountTargetSecurityGroups`, `DeleteMountTarget` (the tagged file system; untaggable), and the interface EFS makes with the caller's permissions: `ec2:CreateNetworkInterface`, `ec2:DeleteNetworkInterface` (only with `aws:CalledViaLast = elasticfilesystem.amazonaws.com`; in the environment's subnets, which in `existing` mode are the user's own) |
 | `aws_efs_file_system_policy` | `elasticfilesystem:PutFileSystemPolicy`, `DeleteFileSystemPolicy` (the tagged file system; untaggable), `DescribeFileSystemPolicy` |
 | `aws_iam_role` | `iam:CreateRole` (with the boundary), `TagRole`, `UntagRole`, `GetRole`, `ListRolePolicies`, `ListAttachedRolePolicies`, `ListInstanceProfilesForRole`, `UpdateRole`, `UpdateRoleDescription`, `DeleteRole` (`triple-c-*`) |
 | `aws_iam_role_policy` | `iam:PutRolePolicy`, `DeleteRolePolicy` (with the boundary), `GetRolePolicy` (the role; untaggable) |
 | data sources | `sts:GetCallerIdentity`, `ec2:DescribeAvailabilityZones`, `ec2:DescribeSubnets`, `ssm:GetParameter` |
-| S3 backend | `s3:ListBucket` (the state bucket), `GetObject`/`PutObject`/`DeleteObject` (`triple-c-tfstate-*/*`, the `.tflock` objects included) |
+| S3 backend | `s3:ListBucket` (the state bucket), `GetObject`/`PutObject`/`DeleteObject` (`triple-c-tfstate-*/*`, the `.tflock` objects included), in the caller's own account |
 
 The app also creates the state bucket: `s3:CreateBucket` with a `triple-c:component` request tag,
 then `PutBucketVersioning`, `PutEncryptionConfiguration`, `PutBucketPublicAccessBlock`,
 `PutBucketTagging`, `PutBucketPolicy`, `GetBucket*` and `ListBucket`, all on
 `triple-c-tfstate-*` only. No bucket can be deleted.
+
+Every state-bucket statement also requires `s3:ResourceAccount = ${aws:PrincipalAccount}`: the
+bucket name is predictable, so another account could create `triple-c-tfstate-<your account>-…`
+first and collect (or feed) your state. With the condition, the admin's calls on a bucket owned by
+any other account are denied, so the app fails rather than writes state there. (The Service
+Authorization Reference lists `s3:ResourceAccount` for `CreateBucket` as well as the bucket and
+object actions; Task 8's live run confirms it.)
 
 It is fenced in the following ways.
 
@@ -163,7 +173,10 @@ administrator.
 **Destruction is tag-scoped.** VPCs, subnets, internet gateways, route tables, Elastic IPs, NAT
 gateways, security groups, EFS file systems and KMS keys can be created only with a
 `triple-c:component` tag (the modules' `default_tags` put it on every create request). They can be
-changed or deleted only if they carry that tag. Tagging is allowed only as part of the creating
+changed or deleted only if they carry that tag. Subnets, route tables and NAT gateways can be
+created only *inside* a Triple-C (tagged) VPC, subnet and address, and an internet gateway
+attached, a route added or a route table associated only on tagged ones, so the admin cannot
+re-route a VPC that isn't Triple-C's. Tagging is allowed only as part of the creating
 call (`ec2:CreateAction`, `elasticfilesystem:CreateAction`), or on a resource that is already
 Triple-C's. Resources that cannot carry a tag are authorized through one that does: routes and
 route-table associations through the route table (and subnet), mount targets and the file-system
@@ -177,23 +190,24 @@ account-wide:
 - `ecs:RegisterTaskDefinition` and `ecs:DeregisterTaskDefinition` on `*`. The admin can deregister
   *any* task definition revision in the account. `DeregisterTaskDefinition` has no resource type
   (IAM authorizes it against `*`), so it cannot be narrowed.
-- `ecr:CreatePullThroughCacheRule` on `*`, which also has no resource type. The admin can add
-  pull-through cache rules for any prefix. This cannot delete or overwrite anything.
 - `elasticfilesystem:CreateFileSystem` on `*` (no resource type), still only with a
   `triple-c:component` request tag.
-- Security groups, subnets, route tables and NAT gateways can be created in **any** VPC or subnet,
-  as long as the new resource is tagged: the request tag, not the parent's tag, is what the create
-  statement checks (an `existing`-network environment's VPC is the user's own and untagged).
+- `ec2:CreateSecurityGroup` in **any** VPC, as long as the new group is tagged: an
+  `existing`-network environment creates its tasks group and each user's `-efs` group in the
+  user's own, untagged VPC. It is the only create that may name an untagged parent.
 - `ec2:AuthorizeSecurityGroupIngress`/`Egress` on `security-group-rule/*`: authorizing names the
   new, untagged rule as well as the group, and the group must still be tagged.
-- `ec2:CreateNetworkInterface` and `ec2:DeleteNetworkInterface` on `*`, but only when an AWS
-  service makes the call for the admin (`aws:ViaAWSService`): EFS creates and deletes a mount
-  target's interface with the caller's EC2 permissions.
+- `ec2:CreateNetworkInterface` and `ec2:DeleteNetworkInterface` on `*`, but only when EFS makes
+  the call for the admin (`aws:CalledViaLast = elasticfilesystem.amazonaws.com`): EFS creates and
+  deletes a mount target's interface with the caller's EC2 permissions, in any subnet (an
+  `existing` environment's are untagged). **Unverified:** whether EFS sets `aws:CalledVia` for
+  these calls is for Task 8's live run to show; if it does not, this statement needs another
+  condition.
 - Reads on `*`: `ec2:Describe*`, `elasticfilesystem:Describe*`, the KMS key reads and
   `ListAliases`, `logs:DescribeLogGroups` and `ssm:DescribeParameters`.
-- `s3:PutBucketPolicy` on the state bucket: an admin could open their own account's state bucket to
-  others. The state holds no secrets (the modules create none), but it maps the account's
-  Triple-C resources.
+- `s3:PutBucketPolicy` on the state bucket (only a bucket in the admin's own account, enforced by
+  `s3:ResourceAccount`): an admin could open that bucket to other accounts. The state holds no
+  secrets (the modules create none), but it maps the account's Triple-C resources.
 
 ## Invariants the modules must keep (phase 4)
 
@@ -235,8 +249,8 @@ Create each file as a **customer managed policy** and attach it. In the console,
 or role. Inline policies do not fit: a role's inline policies share 10,240 characters and an
 environment admin needs every tier file (about 14,500), and a user's share 2,048. A managed policy
 may hold 6,144 characters, not counting whitespace. Without whitespace, `workspace-user.json` is
-about 6,040 (roughly 100 characters of headroom), `environment-admin.json` about 6,080 (60) and
-`environment-admin-network.json` about 2,370; a unit test (`every_policy_fits_a_managed_policy`)
+about 6,040 (roughly 100 characters of headroom), `environment-admin.json` about 5,790 (350)
+and `environment-admin-network.json` about 3,280; a unit test (`every_policy_fits_a_managed_policy`)
 fails before any file outgrows the limit. A tier that outgrows its files gains another file, which
 the app then lists with the others. For IAM Identity Center, add the files as inline policies on the permission set
 (the "up to 32,768 characters" limit is unverified) or reference the managed policies.
@@ -261,7 +275,8 @@ aws iam attach-user-policy --user-name <user> \
   is derived from the provider's behaviour and the Service Authorization Reference, not yet from a
   real `tofu apply`/`destroy`. In particular unverified: whether tag-on-create needs
   `logs:TagResource` / `ssm:AddTagsToResource` / `ecs:TagResource` as listed, whether EFS's
-  interface calls carry `aws:ViaAWSService`, and whether `s3:CreateBucket` honours
+  interface calls carry `aws:CalledViaLast = elasticfilesystem.amazonaws.com`, whether
+  `s3:ResourceAccount` is evaluated for `s3:CreateBucket`, and whether `s3:CreateBucket` honours
   `aws:RequestTag`. A trust-policy change on a role (`iam:UpdateAssumeRolePolicy`) is never
   allowed, so a module version that changes a role's trust must replace the role.
 - **Admin access to user data.** The admin can retag `triple-c-*` roles (`iam:TagRole`). The
@@ -338,5 +353,4 @@ Still open for the phases that create the resources: `RunTask`'s tag keys and `i
 points above. The simulator does not apply session policies, so the first real create is the final
 check. The phase-4 additions (the network, the state bucket, the module table above, the
 owner-scoped `CreateAccessPoint`) are verified by Task 8's live apply and destroy; until then they
-are unit-tested only. (Checked with the simulator: a `Bool` condition matches a context entry sent
-as a string, which is how the permission check sends `aws:ViaAWSService`.)
+are unit-tested only.

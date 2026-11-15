@@ -50,10 +50,7 @@
       ],
       "Condition": {
         "StringEquals": {
-          "iam:PassedToService": [
-            "ecs-tasks.amazonaws.com",
-            "ec2.amazonaws.com"
-          ]
+          "iam:PassedToService": "ecs-tasks.amazonaws.com"
         }
       }
     },
@@ -134,17 +131,6 @@
       ],
       "Resource": [
         "arn:aws:ecs:*:*:cluster/triple-c-*"
-      ]
-    },
-    {
-      "Sid": "ManageCapacityProviders",
-      "Effect": "Allow",
-      "Action": [
-        "ecs:CreateCapacityProvider",
-        "ecs:DeleteCapacityProvider"
-      ],
-      "Resource": [
-        "arn:aws:ecs:*:*:capacity-provider/triple-c-*"
       ]
     },
     {
@@ -279,28 +265,6 @@
       ]
     },
     {
-      "Sid": "ManageRepositories",
-      "Effect": "Allow",
-      "Action": [
-        "ecr:CreateRepository",
-        "ecr:DeleteRepository"
-      ],
-      "Resource": [
-        "arn:aws:ecr:*:*:repository/triple-c-*",
-        "arn:aws:ecr:*:*:repository/triple-c/*"
-      ]
-    },
-    {
-      "Sid": "CreatePullThroughCacheRules",
-      "Effect": "Allow",
-      "Action": [
-        "ecr:CreatePullThroughCacheRule"
-      ],
-      "Resource": [
-        "*"
-      ]
-    },
-    {
       "Sid": "ManageEnvironmentParameters",
       "Effect": "Allow",
       "Action": [
@@ -346,6 +310,9 @@
       "Condition": {
         "Null": {
           "aws:RequestTag/triple-c:component": "false"
+        },
+        "StringEquals": {
+          "s3:ResourceAccount": "${aws:PrincipalAccount}"
         }
       }
     },
@@ -363,7 +330,12 @@
       ],
       "Resource": [
         "arn:aws:s3:::triple-c-tfstate-*"
-      ]
+      ],
+      "Condition": {
+        "StringEquals": {
+          "s3:ResourceAccount": "${aws:PrincipalAccount}"
+        }
+      }
     },
     {
       "Sid": "ReadAndWriteState",
@@ -375,7 +347,12 @@
       ],
       "Resource": [
         "arn:aws:s3:::triple-c-tfstate-*/*"
-      ]
+      ],
+      "Condition": {
+        "StringEquals": {
+          "s3:ResourceAccount": "${aws:PrincipalAccount}"
+        }
+      }
     }
   ]
 }
