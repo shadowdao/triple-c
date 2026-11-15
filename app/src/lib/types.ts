@@ -68,8 +68,43 @@ export interface Project {
   renamed_session_names: Record<string, string>;
   marketplace_installs: MarketplaceInstall[];
   marketplace_disabled: MarketplaceItemRef[];
+  /** Host connection id this project runs on; null = local Docker. */
+  host_id: string | null;
+  aws_placement: AwsPlacement | null;
+  aws: AwsWorkspaceConfig | null;
   created_at: string;
   updated_at: string;
+}
+
+export interface AwsPlacement {
+  region: string;
+  environment: string;
+}
+
+export type Arch = "x86_64" | "arm64";
+export type StorageMode = "ephemeral" | "hybrid";
+
+export interface RepoSource {
+  url: string;
+  /** null = the remote's default branch. */
+  branch: string | null;
+  folder: string;
+}
+
+export interface AwsWorkspaceConfig {
+  cpu: number;
+  memory_mib: number;
+  arch: Arch;
+  storage: StorageMode;
+  ephemeral_gib: number;
+  spot: boolean;
+  idle_stop_minutes: number | null;
+  repos: RepoSource[];
+  wip_push_on_stop: boolean;
+  /** Store-owned runtime handles; a save cannot change them. */
+  task_arn: string | null;
+  access_point_id: string | null;
+  task_definition_arn: string | null;
 }
 
 export type ProjectStatus =

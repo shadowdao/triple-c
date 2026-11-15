@@ -452,8 +452,233 @@ pub struct Project {
     /// Global marketplace installs this project opts out of.
     #[serde(default)]
     pub marketplace_disabled: Vec<super::marketplace::MarketplaceItemRef>,
+    /// The host connection this project runs on. `None` is the local Docker
+    /// host; `Some(id)` names an entry of `AppSettings.hosts`.
+    #[serde(default)]
+    pub host_id: Option<String>,
+    /// Region and environment of an AWS-hosted project. Set together with
+    /// `host_id` and `aws`, or not at all.
+    #[serde(default)]
+    pub aws_placement: Option<AwsPlacement>,
+    #[serde(default)]
+    pub aws: Option<AwsWorkspaceConfig>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AwsPlacement {
+    pub region: String,
+    pub environment: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Arch {
+    #[default]
+    X86_64,
+    Arm64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageMode {
+    Ephemeral,
+    #[default]
+    Hybrid,
+}
+
+/// One git repository cloned into the workspace. `branch: None` means the
+/// remote's default branch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RepoSource {
+    pub url: String,
+    #[serde(default)]
+    pub branch: Option<String>,
+    pub folder: String,
+}
+
+fn default_aws_cpu() -> u32 {
+    1024
+}
+fn default_aws_memory_mib() -> u32 {
+    4096
+}
+fn default_aws_ephemeral_gib() -> u32 {
+    21
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AwsWorkspaceConfig {
+    #[serde(default = "default_aws_cpu")]
+    pub cpu: u32,
+    #[serde(default = "default_aws_memory_mib")]
+    pub memory_mib: u32,
+    #[serde(default)]
+    pub arch: Arch,
+    #[serde(default)]
+    pub storage: StorageMode,
+    #[serde(default = "default_aws_ephemeral_gib")]
+    pub ephemeral_gib: u32,
+    #[serde(default)]
+    pub spot: bool,
+    #[serde(default)]
+    pub idle_stop_minutes: Option<u32>,
+    #[serde(default)]
+    pub repos: Vec<RepoSource>,
+    /// Push uncommitted work to a WIP branch when the task stops. Defaults on.
+    #[serde(default = "default_full_permissions")]
+    pub wip_push_on_stop: bool,
+    /// Store-owned runtime state: see `ProjectsStore::set_aws_runtime`.
+    #[serde(default)]
+    pub task_arn: Option<String>,
+    #[serde(default)]
+    pub access_point_id: Option<String>,
+    #[serde(default)]
+    pub task_definition_arn: Option<String>,
+}
+
+impl Default for AwsWorkspaceConfig {
+    fn default() -> Self {
+        Self {
+            cpu: default_aws_cpu(),
+            memory_mib: default_aws_memory_mib(),
+            arch: Arch::default(),
+            storage: StorageMode::default(),
+            ephemeral_gib: default_aws_ephemeral_gib(),
+            spot: false,
+            idle_stop_minutes: None,
+            repos: Vec::new(),
+            wip_push_on_stop: true,
+            task_arn: None,
+            access_point_id: None,
+            task_definition_arn: None,
+        }
+    }
+}
+
+/// The valid Fargate memory range (min, max, step) in MiB for a vCPU size.
+fn fargate_memory_range(cpu: u32) -> Option<(u32, u32, u32)> {
+    match cpu {
+        256 => Some((512, 2048, 512)),
+        512 => Some((1024, 4096, 1024)),
+        1024 => Some((2048, 8192, 1024)),
+        2048 => Some((4096, 16384, 1024)),
+        4096 => Some((8192, 30720, 1024)),
+        8192 => Some((16384, 61440, 4096)),
+        16384 => Some((32768, 122880, 8192)),
+        _ => None,
+    }
+}
+
+fn validate_repo_url(url: &str) -> Result<(), String> {
+    let bad = |m: &str| Err(format!("Repository URL \"{}\": {}", url.escape_debug(), m));
+    if url.is_empty() || url.len() > 2048 {
+        return bad("must be 1 to 2048 characters");
+    }
+    if url.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return bad("must not contain whitespace or control characters");
+    }
+    if url.starts_with('-') {
+        return bad("must not start with '-'");
+    }
+    let ok = if let Some(rest) = url.strip_prefix("https://") {
+        !rest.is_empty()
+    } else if let Some(rest) = url.strip_prefix("ssh://") {
+        !rest.is_empty()
+    } else if let Some((host, path)) = url.split_once(':') {
+        // scp-like `git@host:path`
+        !host.is_empty() && !host.contains('/') && !path.is_empty() && host.contains('@')
+    } else {
+        false
+    };
+    if ok {
+        Ok(())
+    } else {
+        bad("use https://..., ssh://... or git@host:path")
+    }
+}
+
+/// `git check-ref-format --branch` rules.
+fn validate_branch(branch: &str) -> Result<(), String> {
+    let bad = |m: &str| Err(format!("Branch \"{}\": {}", branch.escape_debug(), m));
+    if branch.is_empty() || branch.len() > 255 {
+        return bad("must be 1 to 255 characters");
+    }
+    if branch.starts_with('-') || branch.starts_with('/') || branch.ends_with('/') {
+        return bad("must not start with '-' or start/end with '/'");
+    }
+    if branch == "@" || branch.ends_with('.') || branch.contains("..") || branch.contains("@{") || branch.contains("//") {
+        return bad("is not a valid branch name");
+    }
+    if branch
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace() || "~^:?*[\\".contains(c))
+    {
+        return bad("contains a character git does not allow");
+    }
+    for comp in branch.split('/') {
+        if comp.starts_with('.') || comp.ends_with(".lock") {
+            return bad("components must not start with '.' or end with '.lock'");
+        }
+    }
+    Ok(())
+}
+
+fn validate_repo_folder(folder: &str) -> Result<(), String> {
+    let ok = !folder.is_empty()
+        && folder.len() <= 64
+        && folder != "."
+        && folder != ".."
+        && folder
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "Repository folder \"{}\" must be 1 to 64 characters of letters, digits, '.', '_' or '-', and not '.' or '..'",
+            folder.escape_debug()
+        ))
+    }
+}
+
+pub fn validate_aws_workspace(cfg: &AwsWorkspaceConfig) -> Result<(), String> {
+    let (min, max, step) = fargate_memory_range(cfg.cpu).ok_or_else(|| {
+        format!(
+            "{} is not a Fargate CPU size (256, 512, 1024, 2048, 4096, 8192 or 16384)",
+            cfg.cpu
+        )
+    })?;
+    if cfg.memory_mib < min || cfg.memory_mib > max || (cfg.memory_mib - min) % step != 0 {
+        return Err(format!(
+            "{} MiB of memory is not valid with {} CPU units: use {} to {} MiB in steps of {}",
+            cfg.memory_mib, cfg.cpu, min, max, step
+        ));
+    }
+    if !(21..=200).contains(&cfg.ephemeral_gib) {
+        return Err("Ephemeral storage must be 21 to 200 GiB".into());
+    }
+    if let Some(m) = cfg.idle_stop_minutes {
+        if !(5..=1440).contains(&m) {
+            return Err("Idle stop must be 5 to 1440 minutes".into());
+        }
+    }
+    if cfg.repos.len() > 20 {
+        return Err("At most 20 repositories are allowed".into());
+    }
+    let mut seen = std::collections::HashSet::new();
+    for r in &cfg.repos {
+        validate_repo_url(&r.url)?;
+        if let Some(b) = &r.branch {
+            validate_branch(b)?;
+        }
+        validate_repo_folder(&r.folder)?;
+        if !seen.insert(r.folder.as_str()) {
+            return Err(format!("Repository folder \"{}\" is used twice", r.folder));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -701,6 +926,9 @@ impl Project {
             renamed_session_names: HashMap::new(),
             marketplace_installs: Vec::new(),
             marketplace_disabled: Vec::new(),
+            host_id: None,
+            aws_placement: None,
+            aws: None,
             created_at: now.clone(),
             updated_at: now,
         }
@@ -715,6 +943,11 @@ impl Project {
         } else {
             PermissionMode::Default
         })
+    }
+
+    /// Whether this project runs on an AWS host rather than local Docker.
+    pub fn is_aws(&self) -> bool {
+        self.host_id.is_some()
     }
 
     pub fn container_name(&self) -> String {
@@ -1010,5 +1243,125 @@ mod tests {
         );
         assert!(!obj.contains_key("auth_bridge_enabled"));
         assert!(!obj.contains_key("browser_view_enabled"));
+    }
+
+    // ── AWS host ────────────────────────────────────────────────────────────
+
+    fn cfg(cpu: u32, mem: u32) -> AwsWorkspaceConfig {
+        AwsWorkspaceConfig { cpu, memory_mib: mem, ..Default::default() }
+    }
+
+    fn repo(url: &str, branch: Option<&str>, folder: &str) -> RepoSource {
+        RepoSource { url: url.into(), branch: branch.map(String::from), folder: folder.into() }
+    }
+
+    #[test]
+    fn an_old_project_without_host_fields_loads_as_local() {
+        let p = Project::new("demo".to_string(), Vec::new());
+        let mut v = serde_json::to_value(&p).unwrap();
+        let o = v.as_object_mut().unwrap();
+        o.remove("host_id");
+        o.remove("aws_placement");
+        o.remove("aws");
+        let loaded: Project = serde_json::from_value(v).unwrap();
+        assert_eq!(loaded.host_id, None);
+        assert!(loaded.aws.is_none() && loaded.aws_placement.is_none());
+        assert!(!loaded.is_aws());
+    }
+
+    #[test]
+    fn an_empty_aws_object_gets_the_defaults() {
+        let c: AwsWorkspaceConfig = serde_json::from_str("{}").unwrap();
+        assert!(c.wip_push_on_stop);
+        assert_eq!((c.cpu, c.memory_mib, c.ephemeral_gib), (1024, 4096, 21));
+        assert_eq!(c.arch, Arch::X86_64);
+        assert_eq!(c.storage, StorageMode::Hybrid);
+        assert!(!c.spot && c.idle_stop_minutes.is_none() && c.repos.is_empty());
+        assert!(validate_aws_workspace(&c).is_ok());
+        let off: AwsWorkspaceConfig = serde_json::from_str(r#"{"wip_push_on_stop":false}"#).unwrap();
+        assert!(!off.wip_push_on_stop);
+    }
+
+    #[test]
+    fn enums_serialize_snake_case_and_is_aws_follows_host_id() {
+        assert_eq!(serde_json::to_string(&Arch::Arm64).unwrap(), "\"arm64\"");
+        assert_eq!(serde_json::to_string(&Arch::X86_64).unwrap(), "\"x86_64\"");
+        assert_eq!(serde_json::to_string(&StorageMode::Hybrid).unwrap(), "\"hybrid\"");
+        let mut p = Project::new("d".into(), Vec::new());
+        p.host_id = Some("h1".into());
+        assert!(p.is_aws());
+    }
+
+    #[test]
+    fn cpu_and_memory_must_be_a_fargate_pair() {
+        for (c, m) in [(256, 512), (256, 2048), (1024, 2048), (1024, 8192), (2048, 4096), (4096, 30720), (8192, 61440), (16384, 32768), (16384, 122880)] {
+            assert!(validate_aws_workspace(&cfg(c, m)).is_ok(), "{c}/{m} should be valid");
+        }
+        for (c, m) in [(256, 4096), (1024, 1024), (1024, 9216), (1024, 2500), (300, 1024), (16384, 114688 + 1), (8192, 18432)] {
+            assert!(validate_aws_workspace(&cfg(c, m)).is_err(), "{c}/{m} should be rejected");
+        }
+    }
+
+    #[test]
+    fn ephemeral_storage_is_21_to_200() {
+        for (g, ok) in [(20, false), (21, true), (200, true), (201, false)] {
+            let c = AwsWorkspaceConfig { ephemeral_gib: g, ..Default::default() };
+            assert_eq!(validate_aws_workspace(&c).is_ok(), ok, "{g}");
+        }
+    }
+
+    #[test]
+    fn idle_stop_is_5_to_1440_or_off() {
+        for (m, ok) in [(None, true), (Some(4), false), (Some(5), true), (Some(1440), true), (Some(1441), false)] {
+            let c = AwsWorkspaceConfig { idle_stop_minutes: m, ..Default::default() };
+            assert_eq!(validate_aws_workspace(&c).is_ok(), ok, "{m:?}");
+        }
+    }
+
+    fn with_repos(repos: Vec<RepoSource>) -> AwsWorkspaceConfig {
+        AwsWorkspaceConfig { repos, ..Default::default() }
+    }
+
+    #[test]
+    fn repo_folders_follow_the_charset_and_are_unique() {
+        let ok = |f: &str| validate_aws_workspace(&with_repos(vec![repo("https://h/r.git", None, f)])).is_ok();
+        assert!(ok("my-repo_1.x"));
+        assert!(ok(&"a".repeat(64)));
+        for bad in ["", ".", "..", "a/b", "a b", "ü", &"a".repeat(65)] {
+            assert!(!ok(bad), "{bad:?}");
+        }
+        let dup = with_repos(vec![repo("https://h/a", None, "x"), repo("https://h/b", None, "x")]);
+        assert!(validate_aws_workspace(&dup).unwrap_err().contains("twice"));
+        let two = with_repos(vec![repo("https://h/a", None, "x"), repo("https://h/b", None, "y")]);
+        assert!(validate_aws_workspace(&two).is_ok());
+    }
+
+    #[test]
+    fn repo_urls_are_https_scp_or_ssh() {
+        let ok = |u: &str| validate_aws_workspace(&with_repos(vec![repo(u, None, "x")])).is_ok();
+        for good in ["https://github.com/o/r.git", "git@github.com:o/r.git", "ssh://git@h/o/r.git"] {
+            assert!(ok(good), "{good}");
+        }
+        for bad in ["", "http://h/r", "file:///etc", "/local/path", "--upload-pack=x", "github.com:o/r", "https://h/r x", "ext::sh -c id", "https://"] {
+            assert!(!ok(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn branches_follow_check_ref_format() {
+        let ok = |b: Option<&str>| validate_aws_workspace(&with_repos(vec![repo("https://h/r", b, "x")])).is_ok();
+        for good in [None, Some("main"), Some("feat/aws-1"), Some("v1.2.3"), Some("a@b")] {
+            assert!(ok(good), "{good:?}");
+        }
+        for bad in ["", "-x", "a..b", "a b", "a~1", "a^", "a:b", "a?", "a*", "a[", "a\\b", "a.lock", "x/.hidden", "a/", "/a", "a//b", "a@{1}", "@", "a."] {
+            assert!(!ok(Some(bad)), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn at_most_20_repos() {
+        let mk = |n: usize| with_repos((0..n).map(|i| repo("https://h/r", None, &format!("r{i}"))).collect());
+        assert!(validate_aws_workspace(&mk(20)).is_ok());
+        assert!(validate_aws_workspace(&mk(21)).is_err());
     }
 }

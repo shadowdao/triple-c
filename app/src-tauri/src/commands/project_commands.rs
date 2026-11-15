@@ -1054,6 +1054,8 @@ pub async fn update_project(
     // [`crate::models::validate_env_vars_update`].
     crate::models::validate_env_vars_update(&stored.custom_env_vars, &project.custom_env_vars)?;
 
+    validate_aws_update(&stored, &project, &state.settings_store.get().hosts)?;
+
     restore_store_owned_fields(&mut project, &stored);
     project.updated_at = chrono::Utc::now().to_rfc3339();
 
@@ -1115,6 +1117,45 @@ fn restore_store_owned_fields(project: &mut Project, stored: &Project) {
     // Owned by the marketplace commands; a Config-tab save carries a stale copy.
     project.marketplace_installs = stored.marketplace_installs.clone();
     project.marketplace_disabled = stored.marketplace_disabled.clone();
+    // Runtime handles of an AWS task belong to the start/stop path.
+    if let Some(aws) = project.aws.as_mut() {
+        let s = stored.aws.as_ref();
+        aws.task_arn = s.and_then(|a| a.task_arn.clone());
+        aws.access_point_id = s.and_then(|a| a.access_point_id.clone());
+        aws.task_definition_arn = s.and_then(|a| a.task_definition_arn.clone());
+    }
+}
+
+/// Checks an incoming save's host placement against what is stored and the
+/// configured connections.
+fn validate_aws_update(
+    stored: &Project,
+    project: &Project,
+    hosts: &[crate::models::HostConnection],
+) -> Result<(), String> {
+    match (&project.host_id, &project.aws_placement, &project.aws) {
+        (None, None, None) => {}
+        (Some(id), Some(place), Some(cfg)) => {
+            if !hosts.iter().any(|h| &h.id == id) {
+                return Err(format!("Host connection \"{}\" does not exist", id.escape_debug()));
+            }
+            crate::models::validate_region(&place.region)?;
+            crate::aws::tofu_modules::validate_environment_name(&place.environment)?;
+            crate::models::validate_aws_workspace(cfg)?;
+        }
+        _ => {
+            return Err(
+                "A host project needs a host, a placement and a workspace configuration together"
+                    .into(),
+            )
+        }
+    }
+    if (stored.host_id != project.host_id || stored.aws_placement != project.aws_placement)
+        && stored.status != ProjectStatus::Stopped
+    {
+        return Err("Stop the project before changing its host or placement".into());
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -2160,5 +2201,82 @@ mod tests {
 
         assert_eq!(payload.marketplace_installs, stored.marketplace_installs);
         assert_eq!(payload.marketplace_disabled, stored.marketplace_disabled);
+    }
+
+    #[test]
+    fn a_save_cannot_change_the_aws_runtime_handles() {
+        let (mut stored, mut payload) = stored_and_stale_payload();
+        let mut sc = crate::models::AwsWorkspaceConfig::default();
+        sc.task_arn = Some("arn:task".into());
+        sc.access_point_id = Some("fsap-1".into());
+        sc.task_definition_arn = Some("arn:td".into());
+        stored.aws = Some(sc.clone());
+        let mut pc = crate::models::AwsWorkspaceConfig::default();
+        pc.cpu = 2048;
+        pc.memory_mib = 8192;
+        pc.task_arn = Some("evil".into());
+        pc.access_point_id = None;
+        payload.aws = Some(pc);
+
+        restore_store_owned_fields(&mut payload, &stored);
+
+        let a = payload.aws.unwrap();
+        assert_eq!(a.task_arn, sc.task_arn);
+        assert_eq!(a.access_point_id, sc.access_point_id);
+        assert_eq!(a.task_definition_arn, sc.task_definition_arn);
+        assert_eq!(a.cpu, 2048, "the edit itself goes through");
+    }
+
+    fn host(id: &str) -> crate::models::HostConnection {
+        crate::models::HostConnection {
+            id: id.into(),
+            name: "n".into(),
+            kind: crate::models::HostKind::Aws {
+                auth: crate::models::AwsAuth::Profile { name: "p".into() },
+                default_region: "us-west-2".into(),
+            },
+        }
+    }
+
+    fn aws_project() -> Project {
+        let (mut p, _) = stored_and_stale_payload();
+        p.status = ProjectStatus::Stopped;
+        p.host_id = Some("h1".into());
+        p.aws_placement = Some(crate::models::AwsPlacement { region: "us-west-2".into(), environment: "dev".into() });
+        p.aws = Some(Default::default());
+        p
+    }
+
+    #[test]
+    fn host_update_rules() {
+        let hosts = vec![host("h1")];
+        let local = { let mut p = aws_project(); p.host_id = None; p.aws_placement = None; p.aws = None; p };
+        assert!(validate_aws_update(&local, &local, &hosts).is_ok());
+        let aws = aws_project();
+        assert!(validate_aws_update(&aws, &aws, &hosts).is_ok());
+        // moving a stopped project onto a host is fine
+        assert!(validate_aws_update(&local, &aws, &hosts).is_ok());
+        // unknown connection
+        assert!(validate_aws_update(&local, &aws, &[]).unwrap_err().contains("does not exist"));
+        // partial triple
+        let mut half = aws_project(); half.aws = None;
+        assert!(validate_aws_update(&aws, &half, &hosts).is_err());
+        let mut half = local.clone(); half.aws = Some(Default::default());
+        assert!(validate_aws_update(&local, &half, &hosts).is_err());
+        // bad region / environment / workspace
+        let mut bad = aws_project(); bad.aws_placement.as_mut().unwrap().region = "nope".into();
+        assert!(validate_aws_update(&aws, &bad, &hosts).is_err());
+        let mut bad = aws_project(); bad.aws_placement.as_mut().unwrap().environment = "Bad_Env".into();
+        assert!(validate_aws_update(&aws, &bad, &hosts).is_err());
+        let mut bad = aws_project(); bad.aws.as_mut().unwrap().cpu = 300;
+        assert!(validate_aws_update(&aws, &bad, &hosts).is_err());
+        // host/placement frozen while not stopped; other edits still fine
+        let mut running = aws_project(); running.status = ProjectStatus::Running;
+        let mut moved = running.clone(); moved.aws_placement.as_mut().unwrap().environment = "prod".into();
+        assert!(validate_aws_update(&running, &moved, &hosts).unwrap_err().contains("Stop the project"));
+        let mut moved = running.clone(); moved.host_id = None; moved.aws_placement = None; moved.aws = None;
+        assert!(validate_aws_update(&running, &moved, &hosts).is_err());
+        let mut edited = running.clone(); edited.aws.as_mut().unwrap().spot = true;
+        assert!(validate_aws_update(&running, &edited, &hosts).is_ok());
     }
 }
