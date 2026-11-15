@@ -4,8 +4,12 @@
     {
       "Sid": "EcrAuthorization",
       "Effect": "Allow",
-      "Action": ["ecr:GetAuthorizationToken"],
-      "Resource": ["*"]
+      "Action": [
+        "ecr:GetAuthorizationToken"
+      ],
+      "Resource": [
+        "*"
+      ]
     },
     {
       "Sid": "PullTripleCImages",
@@ -17,13 +21,21 @@
         "ecr:BatchImportUpstreamImage",
         "ecr:CreateRepository"
       ],
-      "Resource": ["arn:aws:ecr:*:*:repository/triple-c-*", "arn:aws:ecr:*:*:repository/triple-c/*"]
+      "Resource": [
+        "arn:aws:ecr:*:*:repository/triple-c-*",
+        "arn:aws:ecr:*:*:repository/triple-c/*"
+      ]
     },
     {
       "Sid": "WriteTripleCLogs",
       "Effect": "Allow",
-      "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
-      "Resource": ["arn:aws:logs:*:*:log-group:/triple-c/*"]
+      "Action": [
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": [
+        "arn:aws:logs:*:*:log-group:/triple-c/*"
+      ]
     },
     {
       "Sid": "EcsExecChannels",
@@ -34,43 +46,71 @@
         "ssmmessages:OpenControlChannel",
         "ssmmessages:OpenDataChannel"
       ],
-      "Resource": ["*"]
+      "Resource": [
+        "*"
+      ]
     },
     {
       "Sid": "ReadTripleCSecrets",
       "Effect": "Allow",
-      "Action": ["secretsmanager:GetSecretValue"],
-      "Resource": ["arn:aws:secretsmanager:*:*:secret:triple-c/*"]
+      "Action": [
+        "secretsmanager:GetSecretValue"
+      ],
+      "Resource": [
+        "arn:aws:secretsmanager:*:*:secret:triple-c/*"
+      ]
     },
     {
       "Sid": "DecryptThroughSecretsManagerOnly",
       "Effect": "Allow",
-      "Action": ["kms:Decrypt"],
-      "Resource": ["arn:aws:kms:*:*:key/*"],
+      "Action": [
+        "kms:Decrypt"
+      ],
+      "Resource": [
+        "arn:aws:kms:*:*:key/*"
+      ],
       "Condition": {
-        "StringLike": { "kms:ViaService": "secretsmanager.*.amazonaws.com" }
+        "StringLike": {
+          "kms:ViaService": "secretsmanager.*.amazonaws.com"
+        },
+        "Null": {
+          "aws:ResourceTag/triple-c:component": "false"
+        }
       }
     },
     {
-      "Sid": "MountFileSystems",
+      "Sid": "MountEnvironmentFileSystems",
       "Effect": "Allow",
       "Action": [
         "elasticfilesystem:ClientMount",
-        "elasticfilesystem:ClientWrite",
-        "elasticfilesystem:ClientRootAccess"
+        "elasticfilesystem:ClientWrite"
       ],
-      "Resource": ["arn:aws:elasticfilesystem:*:*:file-system/*"]
+      "Resource": [
+        "arn:aws:elasticfilesystem:*:*:file-system/*"
+      ],
+      "Condition": {
+        "Null": {
+          "aws:ResourceTag/triple-c:component": "false"
+        }
+      }
     },
     {
       "Sid": "WhoAmI",
       "Effect": "Allow",
-      "Action": ["sts:GetCallerIdentity"],
-      "Resource": ["*"]
+      "Action": [
+        "sts:GetCallerIdentity"
+      ],
+      "Resource": [
+        "*"
+      ]
     },
     {
       "Sid": "InvokeBedrockModels",
       "Effect": "Allow",
-      "Action": ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
+      "Action": [
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream"
+      ],
       "Resource": [
         "arn:aws:bedrock:*::foundation-model/*",
         "arn:aws:bedrock:*:*:inference-profile/*",

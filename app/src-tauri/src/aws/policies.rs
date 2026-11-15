@@ -110,7 +110,8 @@ const WITH_BOUNDARY: Context = &[
 /// Created resources carry `triple-c:component`; destroyed ones must.
 const COMPONENT_REQUESTED: Context =
     &[("aws:RequestTag/triple-c:component", Literal("environment"))];
-const COMPONENT_TAGGED: Context = &[("aws:ResourceTag/triple-c:component", Literal("environment"))];
+const COMPONENT_RESOURCE_TAG: &str = "aws:ResourceTag/triple-c:component";
+const COMPONENT_TAGGED: Context = &[(COMPONENT_RESOURCE_TAG, Literal("environment"))];
 
 const PROBE_CLUSTER: &str = "arn:aws:ecs:{region}:{account}:cluster/triple-c-probe";
 const PROBE_TASK: &str =
@@ -228,10 +229,14 @@ const WORKSPACE_USER_CHECKS: &[Check] = &[
         PROBE_SECRET,
         &[(OWNER_RESOURCE_TAG, OwnerId)],
     ),
+    // Only on the environment's (component-tagged) file system.
     write(
         "elasticfilesystem:CreateAccessPoint",
         PROBE_FILE_SYSTEM,
-        &[(OWNER_REQUEST_TAG, OwnerId)],
+        &[
+            (OWNER_REQUEST_TAG, OwnerId),
+            (COMPONENT_RESOURCE_TAG, Literal("environment")),
+        ],
     ),
     write(
         "elasticfilesystem:TagResource",
@@ -626,31 +631,42 @@ mod tests {
                 Some(b) => (b, true),
                 None => (op.as_str(), false),
             };
-            let matches: fn(&str, &str) -> bool = match base {
-                "StringEquals" => |p, v| p == v,
-                "StringLike" | "ArnLike" => glob,
+            // A negated operator holds when the key is absent, and
+            // otherwise when no value matches.
+            let (matches, negated): (fn(&str, &str) -> bool, bool) = match base {
+                "StringEquals" => (|p, v| p == v, false),
+                "StringLike" | "ArnLike" => (glob, false),
+                "StringNotEquals" => (|p, v| p == v, true),
+                "StringNotLike" => (glob, true),
                 other => panic!("{}: unsupported condition operator {other}", sid(stmt)),
             };
             entries
                 .iter()
                 .all(|(key, want)| match req.context_value(key) {
-                    None => if_exists,
-                    Some(value) => strings(want)
-                        .iter()
-                        .filter_map(|p| req.resolve(p))
-                        .any(|p| matches(&p, &value)),
+                    None => if_exists || negated,
+                    Some(value) => {
+                        let any = strings(want)
+                            .iter()
+                            .filter_map(|p| req.resolve(p))
+                            .any(|p| matches(&p, &value));
+                        any != negated
+                    }
                 })
         })
     }
 
     fn evaluate(tier: Tier, req: Request) -> bool {
-        let stmts = statements(tier);
+        evaluate_in(&statements(tier), req)
+    }
+
+    /// Allowed by some Allow and by no Deny among `stmts`.
+    fn evaluate_in(stmts: &[Value], req: Request) -> bool {
         let applies = |s: &&Value| conditions_hold(s, &req);
-        let allowed = matching(&stmts, &req)
+        let allowed = matching(stmts, &req)
             .into_iter()
             .filter(|s| effect(s) == "Allow")
             .any(|s| applies(&s));
-        let denied = matching(&stmts, &req)
+        let denied = matching(stmts, &req)
             .into_iter()
             .filter(|s| effect(s) == "Deny")
             .any(|s| applies(&s));
@@ -703,10 +719,6 @@ mod tests {
             validate_document(&format!("{tier:?}"), &policy(tier));
             assert!(!allows(tier).is_empty(), "{tier:?} allows nothing");
         }
-        assert!(
-            denies(Tier::WorkspaceUser).is_empty(),
-            "workspace-user needs no Deny"
-        );
         validate_document("permissions boundary", &boundary());
     }
 
@@ -1239,7 +1251,6 @@ mod tests {
             "kms:Decrypt",
             "elasticfilesystem:ClientMount",
             "elasticfilesystem:ClientWrite",
-            "elasticfilesystem:ClientRootAccess",
             "sts:GetCallerIdentity",
             "bedrock:InvokeModel",
             "bedrock:InvokeModelWithResponseStream",
@@ -1249,7 +1260,15 @@ mod tests {
                 "boundary does not grant {need}"
             );
         }
-        // Secrets only through Secrets Manager, and only Triple-C's.
+        // Access points fix the POSIX user; nothing needs root on EFS.
+        assert!(
+            !granted
+                .iter()
+                .any(|a| glob(a, "elasticfilesystem:ClientRootAccess")),
+            "boundary grants elasticfilesystem:ClientRootAccess"
+        );
+        // Secrets only through Secrets Manager, and only Triple-C's; keys
+        // and file systems only the environment's (component-tagged).
         for s in &stmts {
             let acts = actions(s);
             if acts.iter().any(|a| glob(a, "kms:Decrypt")) {
@@ -1257,6 +1276,17 @@ mod tests {
                     s["Condition"]["StringLike"]["kms:ViaService"],
                     "secretsmanager.*.amazonaws.com",
                     "{}",
+                    sid(s)
+                );
+            }
+            if acts
+                .iter()
+                .any(|a| glob(a, "kms:Decrypt") || glob("elasticfilesystem:Client*", a))
+            {
+                assert_eq!(
+                    s["Condition"]["Null"][COMPONENT_RESOURCE_TAG],
+                    "false",
+                    "{}: must require the triple-c:component resource tag",
                     sid(s)
                 );
             }
@@ -1283,6 +1313,189 @@ mod tests {
                 let read = READ_PREFIXES.iter().any(|p| verb.starts_with(p));
                 assert_eq!(c.write, !read, "{tier:?}: {} write flag", c.action);
             }
+        }
+    }
+
+    /// A secret owned by the environment (component-tagged) or by another
+    /// user can't be claimed, overwritten or deleted by a workspace user.
+    #[test]
+    fn workspace_users_cannot_claim_secrets_they_dont_own() {
+        let tier = Tier::WorkspaceUser;
+        const ENVIRONMENT_SECRET: Context = &[
+            (OWNER_REQUEST_TAG, OwnerId),
+            (OWNER_RESOURCE_TAG, OwnerId),
+            (COMPONENT_RESOURCE_TAG, Literal("environment")),
+        ];
+        const ENVIRONMENT_SECRET_UNOWNED: Context = &[
+            (OWNER_REQUEST_TAG, OwnerId),
+            (COMPONENT_RESOURCE_TAG, Literal("environment")),
+        ];
+        for action in [
+            "secretsmanager:TagResource",
+            "secretsmanager:UntagResource",
+            "secretsmanager:PutSecretValue",
+            "secretsmanager:DeleteSecret",
+        ] {
+            for context in [ENVIRONMENT_SECRET, ENVIRONMENT_SECRET_UNOWNED] {
+                let c = write(action, PROBE_SECRET, context);
+                assert!(
+                    !allowed(tier, &c, ME, ME),
+                    "{action} allowed on a component-tagged secret with {context:?}"
+                );
+            }
+        }
+        // The Allow alone already refuses to let a component-tagged secret
+        // be claimed; the Deny is defense in depth.
+        let claim = write(
+            "secretsmanager:TagResource",
+            PROBE_SECRET,
+            ENVIRONMENT_SECRET_UNOWNED,
+        );
+        assert!(
+            !evaluate_in(
+                &allows(tier),
+                Request {
+                    check: &claim,
+                    caller: ME,
+                    owner: ME
+                }
+            ),
+            "TagOwnSecrets alone allows claiming an environment secret"
+        );
+        // Retagging another user's secret to yourself.
+        let steal = write(
+            "secretsmanager:TagResource",
+            PROBE_SECRET,
+            &[
+                (OWNER_REQUEST_TAG, OwnerId),
+                (OWNER_RESOURCE_TAG, Literal(SOMEONE_ELSE)),
+            ],
+        );
+        assert!(!allowed(tier, &steal, ME, ME));
+        // Tag-on-create (no resource tags yet) still works.
+        let create = checks(tier)
+            .iter()
+            .find(|c| c.action == "secretsmanager:TagResource")
+            .unwrap();
+        assert!(allowed(tier, create, ME, ME));
+    }
+
+    #[test]
+    fn access_points_only_on_the_environments_file_system() {
+        let c = checks(Tier::WorkspaceUser)
+            .iter()
+            .find(|c| c.action == "elasticfilesystem:CreateAccessPoint")
+            .unwrap();
+        let foreign_fs = Check {
+            context: &[(OWNER_REQUEST_TAG, OwnerId)],
+            ..*c
+        };
+        assert!(!allowed(Tier::WorkspaceUser, &foreign_fs, ME, ME));
+    }
+
+    const CFN_WRITES: &[&str] = &[
+        "cloudformation:CreateStack",
+        "cloudformation:UpdateStack",
+        "cloudformation:CreateChangeSet",
+    ];
+    const WITH_SERVICE_ROLE: Context = &[(
+        "cloudformation:RoleArn",
+        Literal("arn:aws:iam::{account}:role/AnyServiceRole"),
+    )];
+    const OTHER_BOUNDARY: Context = &[
+        (
+            "iam:PermissionsBoundary",
+            Literal("arn:aws:iam::{account}:policy/SomethingElse"),
+        ),
+        ("aws:PrincipalAccount", Literal("{account}")),
+    ];
+
+    #[test]
+    fn triple_c_stacks_cannot_use_a_service_role() {
+        for action in CFN_WRITES {
+            let with_role = write(action, PROBE_STACK, WITH_SERVICE_ROLE);
+            assert!(
+                !allowed(Tier::EnvironmentAdmin, &with_role, ME, ME),
+                "{action} allowed with a CloudFormation service role"
+            );
+            let plain = write(action, PROBE_STACK, &[]);
+            assert!(allowed(Tier::EnvironmentAdmin, &plain, ME, ME), "{action}");
+        }
+    }
+
+    /// True if some Deny statement in `tier` applies to `check`.
+    fn explicitly_denied(tier: Tier, check: &Check) -> bool {
+        let stmts = denies(tier);
+        let req = Request {
+            check,
+            caller: ME,
+            owner: ME,
+        };
+        matching(&stmts, &req)
+            .iter()
+            .any(|s| conditions_hold(s, &req))
+    }
+
+    #[test]
+    fn a_triple_c_role_boundary_can_only_be_set_to_the_triple_c_boundary() {
+        let put = |context| write("iam:PutRolePermissionsBoundary", PROBE_ROLE, context);
+        assert!(explicitly_denied(
+            Tier::EnvironmentAdmin,
+            &put(OTHER_BOUNDARY)
+        ));
+        assert!(explicitly_denied(Tier::EnvironmentAdmin, &put(&[])));
+        assert!(!explicitly_denied(
+            Tier::EnvironmentAdmin,
+            &put(WITH_BOUNDARY)
+        ));
+    }
+
+    /// Admins attach both tiers; together they must still never yield a
+    /// `triple-c-*` role without the boundary.
+    #[test]
+    fn both_tiers_together_cannot_obtain_an_unbounded_role() {
+        let mut both = statements(Tier::WorkspaceUser);
+        both.extend(statements(Tier::EnvironmentAdmin));
+        let denied = |c: &Check| {
+            !evaluate_in(
+                &both,
+                Request {
+                    check: c,
+                    caller: ME,
+                    owner: ME,
+                },
+            )
+        };
+        for action in ROLE_WRITES {
+            for context in [&[][..], OTHER_BOUNDARY] {
+                assert!(
+                    denied(&write(action, PROBE_ROLE, context)),
+                    "{action} with {context:?}"
+                );
+            }
+            assert!(
+                !denied(&write(action, PROBE_ROLE, WITH_BOUNDARY)),
+                "{action}"
+            );
+        }
+        for action in NEVER_ALLOWED {
+            for resource in [
+                PROBE_ROLE,
+                "arn:aws:iam::{account}:policy/triple-c-permissions-boundary",
+                "*",
+            ] {
+                for context in [&[][..], WITH_BOUNDARY, OTHER_BOUNDARY] {
+                    assert!(
+                        denied(&write(action, resource, context)),
+                        "{action} on {resource} with {context:?}"
+                    );
+                }
+            }
+        }
+        // A stack deployed with a service role would act outside the
+        // boundary.
+        for action in CFN_WRITES {
+            assert!(denied(&write(action, PROBE_STACK, WITH_SERVICE_ROLE)));
         }
     }
 }

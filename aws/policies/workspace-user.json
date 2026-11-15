@@ -139,6 +139,9 @@
         },
         "StringEqualsIfExists": {
           "aws:ResourceTag/triple-c:owner": "${aws:userid}"
+        },
+        "Null": {
+          "aws:ResourceTag/triple-c:component": "true"
         }
       }
     },
@@ -159,6 +162,24 @@
       }
     },
     {
+      "Sid": "NeverTouchEnvironmentSecrets",
+      "Effect": "Deny",
+      "Action": [
+        "secretsmanager:TagResource",
+        "secretsmanager:UntagResource",
+        "secretsmanager:PutSecretValue",
+        "secretsmanager:DeleteSecret"
+      ],
+      "Resource": [
+        "arn:aws:secretsmanager:*:*:secret:triple-c/*"
+      ],
+      "Condition": {
+        "Null": {
+          "aws:ResourceTag/triple-c:component": "false"
+        }
+      }
+    },
+    {
       "Sid": "CreateOwnAccessPoints",
       "Effect": "Allow",
       "Action": [
@@ -170,6 +191,9 @@
       "Condition": {
         "StringEquals": {
           "aws:RequestTag/triple-c:owner": "${aws:userid}"
+        },
+        "Null": {
+          "aws:ResourceTag/triple-c:component": "false"
         }
       }
     },
