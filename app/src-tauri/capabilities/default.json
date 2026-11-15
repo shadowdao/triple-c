@@ -23,6 +23,7 @@
     "allow-remove-aws-resources",
     "allow-rebuild-project-container",
     "allow-reconcile-project-statuses",
+    "allow-reconcile-aws-projects",
     "allow-list-notes",
     "allow-save-note",
     "allow-delete-note",

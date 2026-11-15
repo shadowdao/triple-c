@@ -727,3 +727,51 @@ fn the_log_task_is_the_stored_one_else_the_last_one_a_start_saw() {
     p.aws.as_mut().unwrap().task_arn = Some("arn:current".into());
     assert_eq!(log_task_arn(&p).as_deref(), Some("arn:current"));
 }
+
+#[tokio::test]
+async fn reconcile_falls_back_to_a_newer_live_task_when_the_stored_one_stopped() {
+    // m3: another machine restarted the project; the stored ARN is history.
+    let mut p = aws_project(StorageMode::Ephemeral);
+    p.status = ProjectStatus::Running;
+    p.aws.as_mut().unwrap().task_arn = Some(task_arn("old"));
+    let newer = task(&p, "newer", "RUNNING", true);
+    let fake = Fake { listed: Mutex::new(vec![vec![newer.arn.clone()]]), ..Default::default() }
+        .with_task(task(&p, "old", "STOPPED", false))
+        .with_task(newer);
+    let (_d, store) = store_with(&p);
+    assert!(matches!(
+        reconcile_project(&fake, &store, &p, &find(&p)).await.unwrap(),
+        Reconciled::Live(t) if t.arn == task_arn("newer")
+    ));
+    let after = store.get(&p.id).unwrap();
+    assert_eq!(after.status, ProjectStatus::Running);
+    assert_eq!(after.aws.unwrap().task_arn, Some(task_arn("newer")));
+
+    // ECS forgot the stored one and nothing else runs: Gone, after looking.
+    let fake = Fake::default();
+    let (_d, store) = store_with(&p);
+    assert_eq!(reconcile_project(&fake, &store, &p, &find(&p)).await.unwrap(), Reconciled::Gone);
+    assert!(fake.called("list"), "it looked for another task first");
+}
+
+#[tokio::test]
+async fn an_unattached_aws_project_gets_a_target_id_no_tunnel_can_have() {
+    // m9: the last run's loopback port may belong to another project's
+    // tunnel now.
+    let mut p = aws_project(StorageMode::Ephemeral);
+    p.status = ProjectStatus::Running;
+    p.container_id = Some("http://127.0.0.1:61400/".into());
+    p.aws.as_mut().unwrap().task_arn = Some(task_arn("u1"));
+    let id = unattached_container_id(&p).expect("replaced");
+    assert_eq!(id, format!("http://unattached.invalid/{}/", p.id));
+    p.container_id = Some(id.clone());
+    assert_eq!(unattached_container_id(&p), None, "idempotent");
+    // The watch still reports it, by that id, and a registered tunnel on the
+    // old port can't be confused with it.
+    let w = watched_task(&p).expect("still watched");
+    assert_eq!(w.target.id(), id);
+    p.container_id = None;
+    assert_eq!(unattached_container_id(&p), None, "nothing stored, nothing to replace");
+    let local = Project::new("l".into(), Vec::new());
+    assert_eq!(unattached_container_id(&local), None);
+}

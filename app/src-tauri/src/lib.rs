@@ -556,6 +556,7 @@ pub fn run() {
             commands::project_commands::remove_aws_resources,
             commands::project_commands::rebuild_project_container,
             commands::project_commands::reconcile_project_statuses,
+            commands::project_commands::reconcile_aws_projects,
             // Notes
             commands::notes_commands::list_notes,
             commands::notes_commands::save_note,

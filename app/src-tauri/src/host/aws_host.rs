@@ -888,19 +888,48 @@ pub async fn reconcile_task<T: TaskApi>(
     let Some(arn) = task_arn_or_find(api, task_arn, find).await? else {
         return Ok(Reconciled::Gone);
     };
-    let Some(cluster) = cluster_of_task(&arn) else {
-        return Ok(Reconciled::Gone);
-    };
-    let found = api.describe(cluster, std::slice::from_ref(&arn)).await.map_err(s)?;
-    Ok(match found.into_iter().find(|t| t.arn == arn) {
-        Some(t)
-            if t.desired_status == "RUNNING"
-                && matches!(t.last_status.as_str(), "PROVISIONING" | "PENDING" | "ACTIVATING" | "RUNNING") =>
-        {
-            Reconciled::Live(Box::new(t))
+    if let Some(cluster) = cluster_of_task(&arn) {
+        let found = api.describe(cluster, std::slice::from_ref(&arn)).await.map_err(s)?;
+        if let Some(t) = found.into_iter().find(|t| t.arn == arn).filter(is_live) {
+            return Ok(Reconciled::Live(Box::new(t)));
         }
-        _ => Reconciled::Gone,
-    })
+    }
+    // The stored task is gone or stopping. Another start (another machine,
+    // or a crash before the store write) may have left the project a newer
+    // one: look before calling it Gone (m3).
+    if task_arn.is_some() {
+        if let Some(t) =
+            find_project_task(api, &find.cluster, &find.family, &find.owner_user_id, &find.project_id)
+                .await
+                .map_err(s)?
+                .filter(|t| t.arn != arn && is_live(t))
+        {
+            return Ok(Reconciled::Live(Box::new(t)));
+        }
+    }
+    Ok(Reconciled::Gone)
+}
+
+fn is_live(t: &TaskInfo) -> bool {
+    t.desired_status == "RUNNING"
+        && matches!(t.last_status.as_str(), "PROVISIONING" | "PENDING" | "ACTIVATING" | "RUNNING")
+}
+
+/// The target id an AWS project gets while it has no registered tunnel, or
+/// `None` when its stored one is fine (a registered tunnel's, already this
+/// placeholder, or none). Never a loopback URL, so a port a new tunnel
+/// reuses can't make the death watch match the wrong project (m9). A valid
+/// agent URL, so the watch can still report the project by it.
+pub fn unattached_container_id(p: &Project) -> Option<String> {
+    if !p.is_aws() {
+        return None;
+    }
+    let stored = p.container_id.as_deref()?;
+    if tunnels::get_endpoint(&p.id).is_some_and(|ep| ep.base_url.as_str() == stored) {
+        return None;
+    }
+    let placeholder = format!("http://unattached.invalid/{}/", p.id);
+    (stored != placeholder).then_some(placeholder)
 }
 
 /// Reconcile one AWS project the store has as Running (or Starting/

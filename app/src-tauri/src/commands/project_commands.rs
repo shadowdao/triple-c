@@ -1847,25 +1847,9 @@ pub async fn reconcile_project_statuses(
             continue;
         }
 
-        // AWS: ECS is the authority. One DescribeTasks per project, bounded
-        // so a slow or unreachable AWS can't hold the app's start; a live
-        // task's tunnel is re-opened in the background.
+        // AWS projects are reconciled by `reconcile_aws_projects`, which the
+        // UI runs at startup whether or not Docker answers.
         if project.is_aws() {
-            let settings = state.settings_store.get();
-            let store = state.projects_store.clone();
-            if tokio::time::timeout(
-                AWS_RECONCILE_TIMEOUT,
-                crate::host::aws_host::reconcile(project, &settings, store),
-            )
-            .await
-            .is_err()
-            {
-                log::warn!(
-                    "Project {}: AWS did not answer within {}s; status left as is",
-                    project.id,
-                    AWS_RECONCILE_TIMEOUT.as_secs()
-                );
-            }
             continue;
         }
 
@@ -1910,6 +1894,59 @@ pub async fn reconcile_project_statuses(
     Ok(state.projects_store.list())
 }
 
+
+/// How many AWS projects reconcile at once.
+const AWS_RECONCILE_CONCURRENCY: usize = 4;
+
+/// Reconcile every AWS project against ECS (the authority), independently of
+/// Docker: an app started without Docker still learns which tasks run and
+/// re-opens their tunnels. One bounded DescribeTasks per project, a few at a
+/// time; a live task's tunnel is re-opened in the background.
+#[tauri::command]
+pub async fn reconcile_aws_projects(state: State<'_, AppState>) -> Result<Vec<Project>, String> {
+    use futures_util::StreamExt;
+
+    let projects: Vec<Project> = state.projects_store.list().into_iter().filter(|p| p.is_aws()).collect();
+    // A target id left from the last run is a loopback URL whose port a new
+    // tunnel (any project's) may now own; until a re-attach registers, the
+    // project gets an id no tunnel can have (m9).
+    for p in &projects {
+        if let Some(id) = crate::host::aws_host::unattached_container_id(p) {
+            let _ = state.projects_store.set_container_id(&p.id, Some(id));
+        }
+    }
+    let settings = state.settings_store.get();
+    let store = state.projects_store.clone();
+    futures_util::stream::iter(projects.into_iter().filter(|p| {
+        matches!(
+            p.status,
+            ProjectStatus::Running | ProjectStatus::Error | ProjectStatus::Starting | ProjectStatus::Stopping
+        ) && crate::project_lock::held(&p.id).is_none()
+    }))
+    .for_each_concurrent(AWS_RECONCILE_CONCURRENCY, |project| {
+        let settings = settings.clone();
+        let store = store.clone();
+        async move {
+            // The store's current copy: the id above may have changed.
+            let project = store.get(&project.id).unwrap_or(project);
+            if tokio::time::timeout(
+                AWS_RECONCILE_TIMEOUT,
+                crate::host::aws_host::reconcile(&project, &settings, store),
+            )
+            .await
+            .is_err()
+            {
+                log::warn!(
+                    "Project {}: AWS did not answer within {}s; status left as is",
+                    project.id,
+                    AWS_RECONCILE_TIMEOUT.as_secs()
+                );
+            }
+        }
+    })
+    .await;
+    Ok(state.projects_store.list())
+}
 
 #[cfg(test)]
 mod tests {

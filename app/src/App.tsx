@@ -25,7 +25,7 @@ import { useMarketplaceSyncToasts } from "./hooks/useMarketplace";
 import { useProjectStatusEvents } from "./hooks/useProjectStatusEvents";
 import MarketplaceView from "./components/marketplace/MarketplaceView";
 import { useAppState, isHomeTab, tabKeyId, homeTabKey, MARKETPLACE_TAB_KEY } from "./store/appState";
-import { reconcileProjectStatuses } from "./lib/tauri-commands";
+import { reconcileAwsProjects, reconcileProjectStatuses } from "./lib/tauri-commands";
 
 export default function App() {
   const { checkDocker, checkImage, startDockerPolling } = useDocker();
@@ -81,6 +81,11 @@ export default function App() {
   // Initialize on mount
   useEffect(() => {
     loadSettings();
+    // AWS projects don't need Docker: ECS says which tasks run, and their
+    // tunnels re-open in the background.
+    reconcileAwsProjects()
+      .then(setProjects)
+      .catch((e) => console.error("Failed to reconcile AWS projects:", e));
     let stopPolling: (() => void) | undefined;
     checkDocker().then((available) => {
       if (available) {

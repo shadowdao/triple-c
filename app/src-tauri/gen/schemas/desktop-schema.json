@@ -939,6 +939,12 @@
           "markdownDescription": "Enables the rebuild_project_container command without any pre-configured scope."
         },
         {
+          "description": "Enables the reconcile_aws_projects command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-reconcile-aws-projects",
+          "markdownDescription": "Enables the reconcile_aws_projects command without any pre-configured scope."
+        },
+        {
           "description": "Enables the reconcile_project_statuses command without any pre-configured scope.",
           "type": "string",
           "const": "allow-reconcile-project-statuses",
@@ -1885,6 +1891,12 @@
           "type": "string",
           "const": "deny-rebuild-project-container",
           "markdownDescription": "Denies the rebuild_project_container command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the reconcile_aws_projects command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-reconcile-aws-projects",
+          "markdownDescription": "Denies the reconcile_aws_projects command without any pre-configured scope."
         },
         {
           "description": "Denies the reconcile_project_statuses command without any pre-configured scope.",

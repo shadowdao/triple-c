@@ -43,6 +43,8 @@ export const rebuildProjectContainer = (projectId: string) =>
   invoke<ProjectResetOutcome>("rebuild_project_container", { projectId });
 export const reconcileProjectStatuses = () =>
   invoke<Project[]>("reconcile_project_statuses");
+/** AWS projects against ECS; run at startup whether or not Docker answers. */
+export const reconcileAwsProjects = () => invoke<Project[]>("reconcile_aws_projects");
 
 // Notes — per-project, host-side, readable with the container stopped.
 export const listNotes = (projectId: string) =>
