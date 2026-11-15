@@ -525,21 +525,49 @@ asserts that every role the admin creates carries the boundary.
 
 Still open:
 
-- **`ecs:RegisterTaskDefinition` and resource-level permissions (phase 5, unverified).** The
-  statements in `workspace-user-tasks.json` scope the action to `task-definition/triple-c-*`, but
-  whether ECS authorizes a register call against that ARN (the family is known, the revision is
-  not yet) or only against `*` has not been checked on real IAM; the unit tests' evaluator only
-  proves the JSON means what it says. The `aws:RequestTag` and `aws:TagKeys` conditions are
-  documented for the action either way. Probe, as a role holding the workspace files: register a
-  `triple-c-e2e-*` definition tagged with the owner and the two other keys. If it is denied
-  while the policy simulator allows it, change `Resource` of `RegisterOwnTaskDefinitions` to
-  `"*"` (the request-tag conditions still confine it; the family name is then unenforced) and
-  record that here. Also confirm `ecs:TagResource` with `ecs:CreateAction = RegisterTaskDefinition`
-  tags at registration, that `DeregisterTaskDefinition`/`DeleteTaskDefinitions` honour
-  `aws:ResourceTag`, and that a user can read their own secret only (`live_tests.rs` checks the
-  secret read);
+- **Deregistering task definitions (phase 5): see below; the workspace tier cannot do it yet.**
 - the `existing` network mode against a user's own VPC, and an onboarding by a workspace user
   from an admin bundle (the same module, applied with admin credentials);
 - `DisassociateGoneAddresses` cannot touch a **live** association. Probe: allocate an untagged
   Elastic IP, associate it with a test ENI, and call `ec2:DisassociateAddress` on that association
   as the environment admin; it must be denied (then release both).
+
+### Phase 5: a Fargate workspace (2026-11-15)
+
+```sh
+cd app/src-tauri
+cargo build
+TRIPLEC_AWS_E2E_PROFILE=<admin profile> TRIPLEC_AWS_E2E_REGION=us-west-2 \
+TRIPLEC_E2E_IMAGE=<account>.dkr.ecr.<region>.amazonaws.com/triple-c-e2e-sandbox:<tag> \
+  cargo test aws::live_tests::environment::a_fargate_workspace_round_trips -- --ignored --test-threads=1 --nocapture
+```
+
+The image is this branch's `container/` (`docker build --platform linux/amd64`), pushed to a
+throwaway private ECR repository `triple-c-e2e-sandbox` that the runner creates and deletes.
+**Test only:** the onboarding grants the execution role no ECR permissions (the boundary allows
+pulls), so the test puts an inline `triple-c-e2e-ecr-pull` policy on it and removes it before the
+onboarding is destroyed. The test deploys a `public` environment as the environment admin, onboards
+a role that holds **only** the workspace files, and drives `ProjectHost::Aws` as that role through
+a profile connection (`role_arn` + `source_profile`): Hybrid, 1 vCPU / 2 GB, one public repo, idle
+stop 5 minutes. Its guard stops every task, retires the test's revisions, deletes the access points
+and the secret and removes the ECR policy; then the fixture destroys the modules.
+
+| Point | Result |
+|---|---|
+| `RegisterTaskDefinition` on `task-definition/triple-c-*` | ✓ allowed for the workspace user with the owner request tag and the three keys; the revision carries exactly those tags (`TagResource` with `ecs:CreateAction`) |
+| `RunTask`: owner tag on the revision, `iam:PassRole` by `iam:ResourceTag` | ✓ allowed on the user's revision with their own roles; on a revision tagged with another owner, denied |
+| `DeregisterTaskDefinition` | ✗ **open**: ECS authorizes it against `*` only. `task-definition/triple-c-*`, and `*` with `aws:ResourceTag/triple-c:owner`, are both denied; only an unconditional `*` works (probe). Removing a project therefore fails on its revisions (the secret and the access point are still removed) |
+| `DeleteTaskDefinitions` | ✓ (probe) authorized against the revision's ARN with `aws:ResourceTag`: the owner's tag passes, another owner's is denied |
+| `CreateAccessPoint`'s `TagResource` | ✗→fixed: authorized against the **file system**, not the access point (probe: `access-point/*` denied; `file-system/*` allowed; `CreateAction`, `aws:RequestTag` and `aws:TagKeys` all present) |
+| `GetSecretValue` | ✓ own secret (an attach reads the token back); another owner's `triple-c/*` secret denied |
+| EFS access point with the task role (IAM + TLS) | ✓ mounted at `/mnt/triple-c-home` (`127.0.0.1:/ … nfs4`, the TLS tunnel), `claude:claude 700`; `~/.claude`, `~/.claude.json` and `~/.ssh` link into it |
+| Times | first start (register, access point, RunTask, pull of ~1.2 GB, agent, tunnel) 104 s; ECS `HEALTHY` 135 s after the start began; attach to a running task 2 s; StopTask to `STOPPED` 42 s; restart 86–92 s |
+| Attach | ✓ a second start while running reuses the task (one task in the family, same ARN, no RunTask) |
+| Restart | ✓ new task, same revision; the `~/.claude` marker survived |
+| Repo clone | ✓ the background clone finished (`/run/triple-c-clone/repos`: `Hello-World cloned`) |
+| Stop guard and WIP push | ✓ `triple-c-wip-push --dry-run` reports the dirty repo; after StopTask the log shows `entrypoint: stopping (sigterm) — pushing work in progress...` and the push failing for lack of GitHub credentials. No push with real credentials was tried |
+| Idle stop (5 min) | ✓ the task stopped itself 365 s after the last use (`triple-c-idle-watch: idle for 5 minutes`, `entrypoint: stopping (idle)`); ECS stop code `EssentialContainerExited` |
+| `~/.claude.json` after Claude Code runs | ✓ still a link (Claude Code started without a login: "Not logged in") |
+| Bubblewrap (P9) | ✗ `bwrap --unshare-user` fails: "No permissions to create new namespace" (kernel 6.1, `max_user_namespaces` 16384, no `CAP_SYS_ADMIN` on Fargate). The sandbox stays off on AWS |
+| A revision per configuration | turning idle stop on adds a secret key, so the next start registers a new revision (by design) |
+| Cleanup | ✓ nothing `triple-c` left in us-west-2; environment KMS keys pending deletion |

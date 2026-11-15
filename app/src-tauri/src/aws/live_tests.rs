@@ -1017,7 +1017,8 @@ mod environment {
 
     use aws_config::SdkConfig;
 
-    use super::{e2e, ok, E2e, Role};
+    use super::{classify_sdk_error, e2e, ok, E2e, Role};
+    use futures_util::FutureExt;
     use crate::aws::environments::{
         ensure_named_state_bucket, is_empty_state, scan_in_bucket, EnvironmentAction, EnvironmentState, Knowable,
         OnboardingState, SdkDetectApi,
@@ -1715,4 +1716,596 @@ mod environment {
         })
         .await;
     }
+
+    // ─────────────────────────────────────────────── phase 5: a workspace
+
+    /// What the phase-5 test made outside the modules, for its own guard
+    /// (which runs before the environment fixture's destroy).
+    #[derive(Default)]
+    struct Phase5 {
+        /// The onboarded execution role holding the test-only ECR policy.
+        exec_role: Option<String>,
+        cluster: Option<String>,
+        /// Task definition family prefixes to retire (`triple-c-<env>-`).
+        families: Vec<String>,
+        /// The user's file system's creation token.
+        fs_token: Option<String>,
+        secrets: Vec<String>,
+    }
+
+    const ECR_POLICY: &str = "triple-c-e2e-ecr-pull";
+
+    /// As the account admin: stop every task in the cluster and wait for
+    /// them, retire the test's task definitions, delete the user's access
+    /// points and the project secret (no recovery window), and take the
+    /// test-only ECR policy off the execution role, so the modules'
+    /// `tofu destroy` can remove the rest. Logs, never fails.
+    async fn phase5_cleanup(e: &E2e, p: &Phase5) {
+        let ecs = aws_sdk_ecs::Client::new(&e.cfg);
+        if let Some(cluster) = &p.cluster {
+            let mut arns = Vec::new();
+            for status in [aws_sdk_ecs::types::DesiredStatus::Running, aws_sdk_ecs::types::DesiredStatus::Pending] {
+                if let Ok(out) = ecs.list_tasks().cluster(cluster).desired_status(status).send().await {
+                    arns.extend(out.task_arns().iter().cloned());
+                }
+            }
+            for arn in &arns {
+                eprintln!("cleanup: stopping task {arn}");
+                if let Err(err) = ecs.stop_task().cluster(cluster).task(arn).reason("triple-c-e2e cleanup").send().await {
+                    eprintln!("cleanup: stop {arn}: {err:?}");
+                }
+            }
+            // Until none is left running (a stop takes up to stopTimeout).
+            for _ in 0..40 {
+                let mut live = 0;
+                if !arns.is_empty() {
+                    if let Ok(out) = ecs.describe_tasks().cluster(cluster).set_tasks(Some(arns.clone())).send().await {
+                        live = out.tasks().iter().filter(|t| t.last_status() != Some("STOPPED")).count();
+                    }
+                }
+                if live == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+        }
+        for prefix in &p.families {
+            let mut defs = Vec::new();
+            for status in [aws_sdk_ecs::types::TaskDefinitionStatus::Active, aws_sdk_ecs::types::TaskDefinitionStatus::Inactive] {
+                let mut next = None;
+                loop {
+                    let Ok(out) = ecs
+                        .list_task_definitions()
+                        .family_prefix(prefix)
+                        .status(status.clone())
+                        .set_next_token(next.take())
+                        .send()
+                        .await
+                    else {
+                        break;
+                    };
+                    defs.extend(out.task_definition_arns().iter().cloned());
+                    next = out.next_token().map(str::to_string);
+                    if next.is_none() {
+                        break;
+                    }
+                }
+            }
+            for arn in &defs {
+                let _ = ecs.deregister_task_definition().task_definition(arn).send().await;
+            }
+            for chunk in defs.chunks(10) {
+                if let Err(err) = ecs.delete_task_definitions().set_task_definitions(Some(chunk.to_vec())).send().await {
+                    eprintln!("cleanup: delete task definitions: {err:?}");
+                }
+            }
+            if !defs.is_empty() {
+                eprintln!("cleanup: retired {} task definition revision(s) of {prefix}*", defs.len());
+            }
+        }
+        if let Some(token) = &p.fs_token {
+            let efs = aws_sdk_efs::Client::new(&e.cfg);
+            if let Ok(out) = efs.describe_file_systems().creation_token(token).send().await {
+                for fs in out.file_systems() {
+                    if let Ok(aps) = efs.describe_access_points().file_system_id(fs.file_system_id()).send().await {
+                        for ap in aps.access_points() {
+                            let id = ap.access_point_id().unwrap_or_default();
+                            eprintln!("cleanup: deleting access point {id}");
+                            if let Err(err) = efs.delete_access_point().access_point_id(id).send().await {
+                                eprintln!("cleanup: delete access point {id}: {err:?}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for name in &p.secrets {
+            match e.secrets.delete_secret().secret_id(name).force_delete_without_recovery(true).send().await {
+                Ok(_) => eprintln!("cleanup: deleted secret {name} (no recovery window)"),
+                Err(err) => {
+                    let err = classify_sdk_error("secretsmanager:DeleteSecret", &err);
+                    if !err.to_string().contains("ResourceNotFound") {
+                        eprintln!("cleanup: delete secret {name}: {err}");
+                    }
+                }
+            }
+        }
+        if let Some(role) = &p.exec_role {
+            match e.iam.delete_role_policy().role_name(role).policy_name(ECR_POLICY).send().await {
+                Ok(_) => eprintln!("cleanup: removed {ECR_POLICY} from {role}"),
+                Err(err) => {
+                    if !format!("{err:?}").contains("NoSuchEntity") {
+                        eprintln!("cleanup: remove {ECR_POLICY} from {role}: {err:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Poll `f` every `every` until it returns `Some`, or `None` after `within`.
+    async fn poll<T, F, Fut>(within: Duration, every: Duration, mut f: F) -> Option<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Option<T>>,
+    {
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            if let Some(v) = f().await {
+                return Some(v);
+            }
+            if std::time::Instant::now() + every > deadline {
+                return None;
+            }
+            tokio::time::sleep(every).await;
+        }
+    }
+
+    /// `sh -c script` as `user`: (output, exit code).
+    async fn sh(t: &crate::host::ContainerTarget, user: &str, script: &str) -> (String, i64) {
+        t.exec_oneshot_as(user, vec!["sh".into(), "-c".into(), script.into()], Vec::new())
+            .await
+            .unwrap_or_else(|err| panic!("exec `{script}`: {err}"))
+    }
+
+    /// Phase 5: a Fargate workspace's whole life through `ProjectHost::Aws`,
+    /// as a role holding **only** the workspace-user files, in an
+    /// environment the environment admin deployed and onboarded it to.
+    ///
+    /// ```sh
+    /// cd app/src-tauri
+    /// cargo build
+    /// TRIPLEC_AWS_E2E_PROFILE=… TRIPLEC_AWS_E2E_REGION=us-west-2 \
+    /// TRIPLEC_E2E_IMAGE=<account>.dkr.ecr.<region>.amazonaws.com/triple-c-e2e-sandbox:<tag> \
+    ///   cargo test aws::live_tests::environment::a_fargate_workspace_round_trips \
+    ///   -- --ignored --test-threads=1 --nocapture
+    /// ```
+    ///
+    /// `TRIPLEC_E2E_IMAGE` is the image the project names as its Custom
+    /// image: one built from this branch (`docker build --platform
+    /// linux/amd64 ./container`) and pushed to a registry Fargate can pull.
+    /// For a private ECR repository in the test account, the test gives the
+    /// onboarded execution role a **test-only** inline pull policy
+    /// (`triple-c-e2e-ecr-pull`; the boundary allows ECR pulls, the
+    /// onboarding module grants none) and removes it before the onboarding
+    /// is destroyed. Creating and deleting that repository is the runner's
+    /// job (`aws/README.md`, "Live verification").
+    ///
+    /// The workspace user signs in the way a saved profile connection does:
+    /// a profile (`role_arn` + `source_profile` = the e2e profile, session
+    /// name `triple-c-e2e`) in a config file this test writes and points
+    /// `AWS_CONFIG_FILE` at. About 30 Fargate task-minutes at 1 vCPU / 2 GB.
+    #[tokio::test]
+    #[ignore]
+    async fn a_fargate_workspace_round_trips() {
+        use crate::aws::runtime::SdkRuntimeApi;
+        use crate::aws::tasks::{run_task_request, task_log_stream, SdkTaskApi, TaskApi};
+        use crate::aws::tofu_modules::{
+            environment_cluster_name, log_stream_prefix, project_secret_name, task_family,
+            user_file_system_token,
+        };
+        use crate::aws::workspace::workspace_tags;
+        use crate::host::{lifecycle::ProjectHost, tunnels};
+        use crate::models::app_settings::ImageSource;
+        use crate::models::project::{AwsPlacement, AwsWorkspaceConfig, RepoSource, StorageMode};
+        use crate::models::{AppSettings, Project};
+        use crate::storage::projects_store::ProjectsStore;
+
+        let image = super::var("TRIPLEC_E2E_IMAGE");
+        env_e2e(|t| async move {
+            let p5 = std::sync::Mutex::new(Phase5::default());
+            let body = async {
+                let region = t.e.region.clone();
+                let admin = t.admin().await;
+                let (keys, cfg, who) = t.session(&admin).await;
+                t.ensure_bucket(&cfg, &who).await;
+                t.ensure_boundary().await;
+
+                // ── the environment, deployed by the environment admin ──
+                let name = format!("e2e{}", &uuid::Uuid::new_v4().simple().to_string()[..6]);
+                p5.lock().unwrap().cluster = Some(environment_cluster_name(&name));
+                p5.lock().unwrap().families.push(format!("triple-c-{name}-"));
+                let vars = environment_vars(&name, &region, &NetworkChoice::Public).unwrap();
+                let (_, outcome, denied) = t
+                    .run(ModuleKind::Environment, Deployment::Environment(&name), &vars, TofuOp::Apply, t.keys_env(&keys))
+                    .await;
+                assert_ok("deploy", &outcome, &denied);
+
+                // ── the workspace user: only the workspace files ──
+                let user = t.e.tier_role("wsuser", &[Tier::WorkspaceUser]).await;
+                let owner = validate_owner_id(&user.session_user_id()).expect("owner id");
+                let okey = owner_key(&region, &owner);
+                p5.lock().unwrap().fs_token = Some(user_file_system_token(&name, &okey));
+
+                // Onboarded by the admin (an onboarding from an admin bundle).
+                let (keys, _, _) = t.session(&admin).await;
+                let (_, outcome, denied) = t
+                    .run(
+                        ModuleKind::UserOnboard,
+                        Deployment::User { env: &name, owner_key: &okey },
+                        &onboarding_vars(&name, &region, &owner),
+                        TofuOp::Apply,
+                        t.keys_env(&keys),
+                    )
+                    .await;
+                assert_ok("onboard the workspace user", &outcome, &denied);
+                let (_, exec_role) = user_role_names(&name, &okey);
+
+                // Test-only: pull from the throwaway private ECR repository.
+                if let Some((registry, rest)) = image.split_once('/') {
+                    if registry.contains(".dkr.ecr.") {
+                        let repo = rest.split([':', '@']).next().unwrap();
+                        let doc = format!(
+                            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":"ecr:GetAuthorizationToken","Resource":"*"}},{{"Effect":"Allow","Action":["ecr:BatchGetImage","ecr:GetDownloadUrlForLayer","ecr:BatchCheckLayerAvailability"],"Resource":"arn:aws:ecr:{region}:{}:repository/{repo}"}}]}}"#,
+                            t.e.account
+                        );
+                        p5.lock().unwrap().exec_role = Some(exec_role.clone());
+                        ok(
+                            "put the test-only ECR policy",
+                            t.e.iam.put_role_policy().role_name(&exec_role).policy_name(ECR_POLICY).policy_document(doc).send().await,
+                        );
+                        eprintln!("test-only: {ECR_POLICY} on {exec_role} for {repo}");
+                    }
+                }
+
+                // The workspace user's profile connection.
+                let profile = format!("{}-wsuser", t.e.prefix);
+                let cfg_file = t.root.join(format!("{}-config", t.e.prefix));
+                std::fs::write(
+                    &cfg_file,
+                    format!(
+                        "[profile {profile}]\nrole_arn = {}\nsource_profile = {}\nrole_session_name = {}\n",
+                        user.arn,
+                        super::var("TRIPLEC_AWS_E2E_PROFILE"),
+                        super::SESSION
+                    ),
+                )
+                .unwrap();
+                std::env::set_var("AWS_CONFIG_FILE", &cfg_file);
+                let conn = HostConnection {
+                    id: "e2e-wsuser".into(),
+                    name: "e2e-wsuser".into(),
+                    kind: HostKind::Aws {
+                        auth: AwsAuth::Profile { name: profile.clone() },
+                        default_region: region.clone(),
+                    },
+                };
+                let ws_cfg = crate::aws::sdk_config(&conn, &region).await.expect("workspace user config");
+                let ws = caller_identity(&ws_cfg).await.expect("workspace user identity");
+                assert_eq!(ws.user_id, owner, "the profile session is the onboarded owner");
+                eprintln!("workspace user: {}", ws.arn);
+
+                let mut settings = AppSettings::default();
+                settings.hosts = vec![conn];
+                settings.image_source = ImageSource::Custom;
+                settings.custom_image_name = Some(image.clone());
+
+                let mut project = Project::new("e2e-fargate".into(), Vec::new());
+                project.host_id = Some("e2e-wsuser".into());
+                project.aws_placement = Some(AwsPlacement { region: region.clone(), environment: name.clone() });
+                project.aws = Some(AwsWorkspaceConfig {
+                    cpu: 1024,
+                    memory_mib: 2048,
+                    storage: StorageMode::Hybrid,
+                    repos: vec![RepoSource {
+                        url: "https://github.com/octocat/Hello-World.git".into(),
+                        branch: None,
+                        folder: "Hello-World".into(),
+                    }],
+                    wip_push_on_stop: true,
+                    // On from the first start: turning it on later adds a
+                    // secret key, so the next start registers a new revision.
+                    // The test's own execs keep task 1 busy until its stop.
+                    idle_stop_minutes: Some(5),
+                    ..Default::default()
+                });
+                let id = project.id.clone();
+                p5.lock().unwrap().secrets.push(project_secret_name(&name, &okey, &id));
+                let store_dir = tempfile::tempdir().unwrap();
+                let store = ProjectsStore::over_file_for_test(store_dir.path().join("projects.json"), vec![project.clone()]);
+                let host = ProjectHost::for_project(&project);
+                assert_eq!(host, ProjectHost::Aws);
+                let progress = |m: &str| eprintln!("  progress: {m}");
+                let api = SdkTaskApi::new(&ws_cfg);
+                let env = crate::aws::runtime::read_environment(&SdkRuntimeApi::new(&ws_cfg), &name, &ws.account, &region)
+                    .await
+                    .expect("the environment record, as the workspace user");
+                let family = task_family(&name, &okey, &id);
+                let stream_prefix = log_stream_prefix(&okey, &id);
+                let current = |store: &ProjectsStore| store.get(&id).unwrap();
+
+                // ── start 1 ──
+                let t0 = std::time::Instant::now();
+                let target = host.ensure_started(&current(&store), &settings, &store, &progress).await.expect("start 1");
+                let first_start = t0.elapsed();
+                let p = current(&store);
+                let aws = p.aws.clone().unwrap();
+                let task1 = aws.task_arn.clone().expect("the task ARN is stored");
+                let revision1 = aws.task_definition_arn.clone().expect("the task definition is stored");
+                eprintln!("RESULT start 1 (cold: register, access point, RunTask, pull, agent, tunnel): {first_start:?}; task {task1}; {revision1}");
+                assert!(revision1.contains(&format!(":task-definition/{family}:")), "{revision1}");
+                assert!(aws.access_point_id.is_some(), "Hybrid has an access point");
+
+                // ECS's own health check (startPeriod 120 s, interval 30 s).
+                let health = poll(Duration::from_secs(300), Duration::from_secs(10), || async {
+                    let d = api.describe(&env.cluster_arn, std::slice::from_ref(&task1)).await.ok()?;
+                    let h = d.first()?.health.clone();
+                    (h.as_deref() == Some("HEALTHY")).then_some(())
+                })
+                .await;
+                eprintln!("RESULT ECS health HEALTHY after {:?} from RunTask's start ({health:?})", t0.elapsed());
+                assert!(health.is_some(), "the task never became HEALTHY");
+
+                // Resource-level checks, as the account admin: the revision and
+                // the task carry exactly the three tags.
+                let ecs_admin = aws_sdk_ecs::Client::new(&t.e.cfg);
+                let td = ok(
+                    "describe the revision",
+                    ecs_admin.describe_task_definition().task_definition(&revision1).include(aws_sdk_ecs::types::TaskDefinitionField::Tags).send().await,
+                );
+                let mut tags: Vec<(String, String)> = td
+                    .tags()
+                    .iter()
+                    .map(|t| (t.key().unwrap_or_default().to_string(), t.value().unwrap_or_default().to_string()))
+                    .collect();
+                tags.sort();
+                let mut want = workspace_tags(&owner, &id, &name);
+                want.sort();
+                assert_eq!(tags, want, "RegisterTaskDefinition tagged at registration");
+                eprintln!("RESULT RegisterTaskDefinition as the workspace user on task-definition/triple-c-*: allowed, tagged {tags:?}");
+                eprintln!("RESULT RunTask (owner-tagged revision, iam:PassRole by tag on the user's own roles): allowed");
+
+                // ── through the agent ──
+                let (out, code) = sh(&target, "claude", "echo hello-from-fargate").await;
+                assert_eq!((out.trim(), code), ("hello-from-fargate", 0));
+                let (id_out, _) = sh(&target, "claude", "id").await;
+                eprintln!("RESULT id: {}", id_out.trim());
+                assert!(id_out.contains("uid=1000(claude)"), "{id_out}");
+
+                let cloned = poll(Duration::from_secs(300), Duration::from_secs(5), || async {
+                    let (out, code) = sh(&target, "root", "test -f /run/triple-c-clone/done && cat /run/triple-c-clone/repos").await;
+                    (code == 0).then_some(out)
+                })
+                .await
+                .expect("the background clone never finished");
+                eprintln!("RESULT clone status: {}", cloned.trim());
+                let (head, code) = sh(&target, "claude", "git -C /workspace/Hello-World log -1 --format=%H").await;
+                assert_eq!(code, 0, "{head}");
+                eprintln!("RESULT cloned Hello-World at {}", head.trim());
+
+                let (links, _) = sh(
+                    &target,
+                    "claude",
+                    "for f in ~/.claude ~/.claude.json ~/.ssh; do printf '%s -> %s\n' \"$f\" \"$(readlink \"$f\")\"; done; \
+                     grep ' /mnt/triple-c-home ' /proc/mounts; stat -c '%U:%G %a' /mnt/triple-c-home",
+                )
+                .await;
+                eprintln!("RESULT Hybrid home:\n{}", links.trim());
+                assert!(links.contains(".claude -> /mnt/triple-c-home/"), "{links}");
+                let marker = uuid::Uuid::new_v4().to_string();
+                let (_, code) = sh(&target, "claude", &format!("printf %s {marker} > ~/.claude/marker")).await;
+                assert_eq!(code, 0);
+
+                // Claude Code's own writes to ~/.claude.json (no login: it
+                // still starts, and fails at the API call).
+                let (claude, _) = sh(
+                    &target,
+                    "claude",
+                    "cd /workspace && timeout 90 claude -p 'say ok' </dev/null 2>&1 | tail -3; \
+                     test -L ~/.claude.json && echo STILL-A-LINK || echo REPLACED; ls -la ~/.claude.json",
+                )
+                .await;
+                eprintln!("RESULT claude run:\n{}", claude.trim());
+
+                // P9: bubblewrap's unprivileged user namespace on Fargate.
+                let (bwrap, code) = sh(
+                    &target,
+                    "claude",
+                    "bwrap --ro-bind / / --unshare-user true 2>&1; echo \"unshare-user rc=$?\"; \
+                     bwrap --ro-bind / / --dev /dev --proc /proc --unshare-all --die-with-parent true 2>&1; echo \"unshare-all rc=$?\"; \
+                     cat /proc/sys/user/max_user_namespaces 2>&1; cat /proc/sys/kernel/unprivileged_userns_clone 2>&1; uname -r",
+                )
+                .await;
+                eprintln!("RESULT P9 bwrap (exit {code}):\n{}", bwrap.trim());
+
+                // The stop guard's dry run through the agent, on a dirty repo.
+                let (_, code) = sh(&target, "claude", "echo e2e >> /workspace/Hello-World/README && touch /workspace/Hello-World/e2e-new").await;
+                assert_eq!(code, 0);
+                let (raw, code) = sh(&target, "claude", "/usr/local/bin/triple-c-wip-push --dry-run").await;
+                eprintln!("RESULT triple-c-wip-push --dry-run (exit {code}): {}", raw.trim());
+                let unsaved = crate::commands::stop_guard::unsaved_work(Some(&target), crate::commands::stop_guard::DRY_RUN_TIMEOUT).await;
+                eprintln!("RESULT stop guard check: {unsaved:?}");
+                assert!(unsaved.checked, "{unsaved:?}");
+                assert!(unsaved.repos.iter().any(|r| r.folder == "Hello-World" && r.dirty), "{unsaved:?}");
+
+                // GetSecretValue: another owner's triple-c/* secret is denied.
+                let foreign_secret = format!("triple-c/{}/someone-else", t.e.prefix);
+                let created = ok(
+                    "admin creates another owner's secret",
+                    t.e.secrets
+                        .create_secret()
+                        .name(&foreign_secret)
+                        .secret_string("e2e")
+                        .tags(super::sm_tag("triple-c:owner", "AROAEXAMPLEOTHER:bob"))
+                        .send()
+                        .await,
+                );
+                t.e.record_secret(created.arn().unwrap());
+                let ws_secrets = aws_sdk_secretsmanager::Client::new(&ws_cfg);
+                super::denied(
+                    "GetSecretValue on another owner's secret",
+                    ws_secrets.get_secret_value().secret_id(created.arn().unwrap()).send().await,
+                );
+                eprintln!("RESULT GetSecretValue on another owner's secret: denied");
+
+                // RunTask on a revision the user does not own is denied.
+                let foreign_family = format!("triple-c-{name}-e2e-foreign");
+                let reg = ok(
+                    "admin registers a foreign revision",
+                    ecs_admin
+                        .register_task_definition()
+                        .family(&foreign_family)
+                        .requires_compatibilities(aws_sdk_ecs::types::Compatibility::Fargate)
+                        .network_mode(aws_sdk_ecs::types::NetworkMode::Awsvpc)
+                        .cpu("256")
+                        .memory("512")
+                        .container_definitions(
+                            aws_sdk_ecs::types::ContainerDefinition::builder()
+                                .name("x")
+                                .image("public.ecr.aws/docker/library/alpine:3")
+                                .essential(true)
+                                .build(),
+                        )
+                        .tags(aws_sdk_ecs::types::Tag::builder().key("triple-c:owner").value("AROAEXAMPLEOTHER:bob").build())
+                        .send()
+                        .await,
+                );
+                let foreign_arn = reg.task_definition().unwrap().task_definition_arn().unwrap().to_string();
+                let r = api.run_task(run_task_request(&env, &foreign_arn, false, &workspace_tags(&owner, &id, &name))).await;
+                match r {
+                    Err(crate::aws::error::AwsError::AccessDenied { .. }) => {
+                        eprintln!("RESULT RunTask on another owner's revision: denied")
+                    }
+                    other => panic!("RunTask on another owner's revision: expected AccessDenied, got {other:?}"),
+                }
+
+                // A second start while running: an attach, no second RunTask.
+                // With the tunnel up it is reused outright; with it closed the
+                // start finds the live task and reads the token back (own
+                // GetSecretValue).
+                let again = host.ensure_started(&current(&store), &settings, &store, &progress).await.expect("start while running (tunnel up)");
+                assert_eq!(again.id(), target.id());
+                tunnels::close(&id).await;
+                let t1 = std::time::Instant::now();
+                let attached = host.ensure_started(&current(&store), &settings, &store, &progress).await.expect("attach");
+                eprintln!("RESULT attach to the running task (find, GetSecretValue own secret, tunnel): {:?}", t1.elapsed());
+                assert_eq!(current(&store).aws.unwrap().task_arn.as_deref(), Some(task1.as_str()));
+                let live = api.list_project_tasks(&env.cluster_arn, &family).await.unwrap();
+                assert_eq!(live, vec![task1.clone()], "exactly one task: no second RunTask");
+                let (out, _) = sh(&attached, "claude", "cat ~/.claude/marker").await;
+                assert_eq!(out.trim(), marker);
+
+                // ── stop 1: StopTask → SIGTERM → the entrypoint's WIP push ──
+                let t2 = std::time::Instant::now();
+                host.stop_project(&current(&store), &settings).await.expect("stop 1");
+                let stopped = poll(Duration::from_secs(240), Duration::from_secs(5), || async {
+                    let d = api.describe(&env.cluster_arn, std::slice::from_ref(&task1)).await.ok()?;
+                    let t = d.into_iter().next()?;
+                    (t.last_status == "STOPPED").then_some(t)
+                })
+                .await
+                .expect("task 1 never stopped");
+                eprintln!("RESULT stop 1: STOPPED after {:?}; code {:?}, reason {:?}", t2.elapsed(), stopped.stop_code, stopped.stopped_reason);
+                tokio::time::sleep(Duration::from_secs(15)).await;
+                let log1 = api.log_tail(&env.log_group, &task_log_stream(&stream_prefix, &task1), 60).await.unwrap();
+                let tail1: Vec<&String> = log1.iter().filter(|l| l.contains("entrypoint: stopping") || l.contains("wip") || l.contains("WIP")).collect();
+                eprintln!("RESULT task 1 stop log lines: {tail1:#?}");
+                assert!(log1.iter().any(|l| l.contains("entrypoint: stopping (sigterm) — pushing work in progress")), "{log1:#?}");
+                store.set_aws_runtime(&id, None, current(&store).aws.unwrap().access_point_id, Some(revision1.clone())).unwrap();
+
+                // ── start 2, unchanged; idle stop is at its minimum ──
+                let t3 = std::time::Instant::now();
+                let target2 = host.ensure_started(&current(&store), &settings, &store, &progress).await.expect("start 2");
+                let aws2 = current(&store).aws.unwrap();
+                let task2 = aws2.task_arn.clone().unwrap();
+                eprintln!("RESULT start 2 (same revision): {:?}; task {task2}", t3.elapsed());
+                assert_ne!(task2, task1, "a new task");
+                assert_eq!(aws2.task_definition_arn.as_deref(), Some(revision1.as_str()), "same family revision");
+                let (out, _) = sh(&target2, "claude", "cat ~/.claude/marker; test -L ~/.claude.json && echo STILL-A-LINK").await;
+                eprintln!("RESULT after restart: {}", out.trim());
+                assert!(out.contains(&marker), "the ~/.claude marker persisted: {out}");
+                poll(Duration::from_secs(300), Duration::from_secs(5), || async {
+                    let (_, code) = sh(&target2, "root", "test -f /run/triple-c-clone/done").await;
+                    (code == 0).then_some(())
+                })
+                .await
+                .expect("clone 2 never finished");
+                let (check, _) = sh(&target2, "root", "TRIPLEC_IDLE_STOP_MINUTES=5 /usr/local/bin/triple-c-idle-watch --check; echo idle-check=$?").await;
+                eprintln!("RESULT idle --check right after use: {}", check.trim());
+
+                // Leave it alone: close the tunnel and watch ECS.
+                tunnels::close(&id).await;
+                let idle_from = std::time::Instant::now();
+                let stopped2 = poll(Duration::from_secs(15 * 60), Duration::from_secs(20), || async {
+                    let d = api.describe(&env.cluster_arn, std::slice::from_ref(&task2)).await.ok()?;
+                    let t = d.into_iter().next()?;
+                    (t.desired_status == "STOPPED" || t.last_status == "STOPPED").then_some(t)
+                })
+                .await
+                .expect("the idle task did not stop by itself within 15 minutes");
+                eprintln!(
+                    "RESULT idle stop: desired STOPPED {:?} after the last use; code {:?}, reason {:?}",
+                    idle_from.elapsed(),
+                    stopped2.stop_code,
+                    stopped2.stopped_reason
+                );
+                poll(Duration::from_secs(240), Duration::from_secs(10), || async {
+                    let d = api.describe(&env.cluster_arn, std::slice::from_ref(&task2)).await.ok()?;
+                    (d.first()?.last_status == "STOPPED").then_some(())
+                })
+                .await;
+                tokio::time::sleep(Duration::from_secs(15)).await;
+                let log2 = api.log_tail(&env.log_group, &task_log_stream(&stream_prefix, &task2), 60).await.unwrap();
+                let tail2: Vec<&String> = log2.iter().filter(|l| l.contains("stopping") || l.contains("idle")).collect();
+                eprintln!("RESULT task 2 stop log lines: {tail2:#?}");
+                assert!(log2.iter().any(|l| l.contains("entrypoint: stopping (idle)")), "{log2:#?}");
+
+                // ── remove: the project's resources, data discarded ──
+                store.set_aws_runtime(&id, None, aws2.access_point_id.clone(), aws2.task_definition_arn.clone()).unwrap();
+                // Every step runs even when one fails (the failures are
+                // reported together), so check them all before the result.
+                let removed = host.remove_aws_resources(&current(&store), &settings, true).await;
+                eprintln!("RESULT remove_aws_resources: {:?}", removed.as_ref().map_err(|e| e.chars().take(400).collect::<String>()));
+                let sm = ok(
+                    "describe the project secret",
+                    t.e.secrets.describe_secret().secret_id(project_secret_name(&name, &okey, &id)).send().await,
+                );
+                eprintln!("RESULT project secret after remove: deleted_date {:?}", sm.deleted_date());
+                assert!(sm.deleted_date().is_some(), "the secret is scheduled for deletion");
+                let defs = ok(
+                    "list the family",
+                    ecs_admin.list_task_definitions().family_prefix(&family).send().await,
+                );
+                eprintln!("RESULT active revisions after remove: {:?}", defs.task_definition_arns());
+                let td = ecs_admin.describe_task_definition().task_definition(&revision1).send().await;
+                eprintln!(
+                    "RESULT revision after remove: {:?}",
+                    td.map(|o| o.task_definition().and_then(|d| d.status().cloned())).map_err(|e| format!("{e:?}").chars().take(200).collect::<String>())
+                );
+                let efs = aws_sdk_efs::Client::new(&t.e.cfg);
+                let gone = efs.describe_access_points().access_point_id(aws2.access_point_id.clone().unwrap()).send().await;
+                eprintln!("RESULT access point after remove: {:?}", gone.as_ref().map(|o| o.access_points().len()).map_err(|e| format!("{e:?}").chars().take(120).collect::<String>()));
+                assert!(gone.is_err() || gone.unwrap().access_points().iter().all(|a| a.life_cycle_state() != Some(&aws_sdk_efs::types::LifeCycleState::Available)));
+                removed.expect("remove the project's resources");
+                assert!(defs.task_definition_arns().is_empty(), "active revisions left: {:?}", defs.task_definition_arns());
+            };
+            let result = std::panic::AssertUnwindSafe(body).catch_unwind().await;
+            let guard = std::mem::take(&mut *p5.lock().unwrap());
+            phase5_cleanup(&t.e, &guard).await;
+            if let Err(panic) = result {
+                std::panic::resume_unwind(panic);
+            }
+        })
+        .await;
+    }
 }
+

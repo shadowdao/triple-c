@@ -658,11 +658,19 @@ TLS only, tagged `triple-c:component=state`), one object per deployment (D9).
 
 ## To verify before or during implementation
 
-- Whether Fargate allows bubblewrap's unprivileged user namespaces, and what Claude Code's sandbox
-  does there.
+- ~~Whether Fargate allows bubblewrap's unprivileged user namespaces, and what Claude Code's
+  sandbox does there.~~ **Measured 2026-11-15:** it doesn't. `bwrap --unshare-user` fails with "No
+  permissions to create new namespace" (no `CAP_SYS_ADMIN`), so the AWS host keeps Claude Code's
+  sandbox off.
 - ABAC condition keys for each action: ECS `RunTask` tag-on-create, `ExecuteCommand`, and
   `ssm:StartSession` against ECS targets; EFS `CreateAccessPoint` with request tags; Secrets
   Manager name-prefix plus tag conditions with `${aws:userid}` for SSO sessions.
+  **Phase 5 (2026-11-15, `aws/README.md` "Phase 5"):** `RunTask` with the owner's revision and
+  roles, `RegisterTaskDefinition` on `task-definition/triple-c-*`, `CreateAccessPoint` with request
+  tags and `GetSecretValue` on one's own secret work for a role session; another owner's revision
+  or secret is denied. `CreateAccessPoint`'s `TagResource` is authorized against the file system
+  (policy fixed). `DeregisterTaskDefinition` supports only `*` with no tag condition, which the
+  workspace tier does not grant: open. SSO sessions themselves were not used.
 - ~~That `session-manager-plugin` port forwarding to an ECS target is stable for hours-long
   sessions, and how quickly it reconnects.~~ **Measured 2026-11-14** (phase 2b, us-west-2,
   plugin 1.2.896, Fargate 1 vCPU / 2 GB, `host::ssm::live_tests`):
@@ -749,8 +757,8 @@ detached runner, detection, self-onboarding, an update ("No changes"), destroy; 
   file-system policy accepted the just-created task role; conditional `DeleteObject` (`If-Match`)
   on the versioned bucket returns 412 on a stale ETag.
 
-Still to verify: the `existing` network mode against a user's own VPC, and Fargate tasks in the
-deployed environment (phase 5).
+Still to verify: the `existing` network mode against a user's own VPC. Fargate tasks in the
+deployed environment were run in phase 5 (`aws/README.md`).
 
 ## Connection model
 
