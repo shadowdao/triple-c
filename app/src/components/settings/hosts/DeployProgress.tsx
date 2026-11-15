@@ -28,13 +28,18 @@ export interface DeployRun {
 
 type Subscription = { unlisten: (() => void) | null };
 
+/** Runs are tracked per region and state key: the same key exists in every region. */
+export const runKey = (region: string, stateKey: string) => `${region}:${stateKey}`;
+
 /**
- * Runs keyed by state key. `start` subscribes to `aws-deploy-progress` before
+ * Runs keyed by `runKey(region, stateKey)`. `start` subscribes to `aws-deploy-progress` before
  * invoking, keeps every event for the state key it started until the op id
  * is known (the backend may emit just before the invoke resolves), then keeps
  * only that op's events. Resolves to the command's error, or null once started.
  */
-export function useDeployRuns(onDone?: (run: { stateKey: string; result: TofuOutcome | null }) => void) {
+export function useDeployRuns(
+  onDone?: (run: { stateKey: string; region: string; result: TofuOutcome | null }) => void,
+) {
   const [runs, setRuns] = useState<Record<string, DeployRun>>({});
   const subs = useRef(new Map<string, Subscription>());
   const mounted = useRef(true);
@@ -53,25 +58,26 @@ export function useDeployRuns(onDone?: (run: { stateKey: string; result: TofuOut
 
   const start = useCallback(
     async (stateKey: string, region: string, label: string, run: () => Promise<string>): Promise<AwsError | null> => {
-      subs.current.get(stateKey)?.unlisten?.();
+      const k = runKey(region, stateKey);
+      subs.current.get(k)?.unlisten?.();
       const sub: Subscription = { unlisten: null };
-      subs.current.set(stateKey, sub);
-      const current = () => mounted.current && subs.current.get(stateKey) === sub;
+      subs.current.set(k, sub);
+      const current = () => mounted.current && subs.current.get(k) === sub;
       const stop = () => {
         sub.unlisten?.();
         sub.unlisten = null;
-        if (subs.current.get(stateKey) === sub) subs.current.delete(stateKey);
+        if (subs.current.get(k) === sub) subs.current.delete(k);
       };
 
       let opId: string | null = null;
       const early: ProgressPayload[] = [];
       const apply = (p: ProgressPayload) => {
         setRuns((prev) => {
-          const r = prev[stateKey];
+          const r = prev[k];
           if (!r || r.opId !== p.op_id || r.done) return prev;
           return {
             ...prev,
-            [stateKey]: {
+            [k]: {
               ...r,
               events: p.events.length ? [...r.events, ...p.events] : r.events,
               done: p.done,
@@ -82,13 +88,13 @@ export function useDeployRuns(onDone?: (run: { stateKey: string; result: TofuOut
         });
         if (p.done) {
           stop();
-          onDoneRef.current?.({ stateKey, result: p.result ?? null });
+          onDoneRef.current?.({ stateKey, region, result: p.result ?? null });
         }
       };
 
       setRuns((prev) => ({
         ...prev,
-        [stateKey]: { stateKey, region, label, opId: null, events: [], done: false, cancellable: false, result: null },
+        [k]: { stateKey, region, label, opId: null, events: [], done: false, cancellable: false, result: null },
       }));
 
       const unlisten = await listen<ProgressPayload>(AWS_DEPLOY_PROGRESS_EVENT, ({ payload }) => {
@@ -108,7 +114,7 @@ export function useDeployRuns(onDone?: (run: { stateKey: string; result: TofuOut
         stop();
         if (mounted.current) {
           setRuns((prev) => {
-            const { [stateKey]: _gone, ...rest } = prev;
+            const { [k]: _gone, ...rest } = prev;
             return rest;
           });
         }
@@ -116,17 +122,18 @@ export function useDeployRuns(onDone?: (run: { stateKey: string; result: TofuOut
       }
       if (!current()) return null;
       const id = opId;
-      setRuns((prev) => (prev[stateKey] ? { ...prev, [stateKey]: { ...prev[stateKey], opId: id } } : prev));
+      setRuns((prev) => (prev[k] ? { ...prev, [k]: { ...prev[k], opId: id } } : prev));
       for (const p of early.splice(0)) if (p.op_id === id) apply(p);
       return null;
     },
     [],
   );
 
-  const dismiss = useCallback((stateKey: string) => {
+  /** `key` is a `runKey`. */
+  const dismiss = useCallback((key: string) => {
     setRuns((prev) => {
-      if (!prev[stateKey]?.done) return prev;
-      const { [stateKey]: _gone, ...rest } = prev;
+      if (!prev[key]?.done) return prev;
+      const { [key]: _gone, ...rest } = prev;
       return rest;
     });
   }, []);

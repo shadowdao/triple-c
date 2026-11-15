@@ -29,6 +29,7 @@ export default function AdminBundleModal({
   ownerId,
   network,
   reason,
+  onSaved,
   onClose,
 }: {
   connectionId: string;
@@ -40,6 +41,8 @@ export default function AdminBundleModal({
   network?: NetworkChoice;
   /** Why the bundle is needed (e.g. the refusal that led here). */
   reason?: string;
+  /** Called with the folder once a bundle was actually written. */
+  onSaved?: (folder: string) => void;
   onClose: () => void;
 }) {
   const askEnvironment = kind === "environment" && !environment;
@@ -63,7 +66,10 @@ export default function AdminBundleModal({
         ownerId,
         network: picked && "network" in picked ? picked.network : network,
       });
-      if (folder) setSaved(folder);
+      if (folder) {
+        setSaved(folder);
+        onSaved?.(folder);
+      }
     } catch (e) {
       setError(toAwsError(e));
     } finally {

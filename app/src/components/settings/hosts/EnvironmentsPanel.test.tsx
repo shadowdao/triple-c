@@ -131,6 +131,7 @@ describe("EnvironmentsPanel", () => {
 
     fireEvent.click(within(row).getByRole("button", { name: "Destroy dev" }));
     const dialog = screen.getByRole("dialog", { name: "Destroy dev" });
+    expect(within(dialog).getByText(/deployment is incomplete \(no valid environment record\)/)).toBeInTheDocument();
     const confirm = within(dialog).getByRole("button", { name: "Destroy" });
     expect(confirm).toBeDisabled();
     fireEvent.change(within(dialog).getByLabelText(/Type dev to confirm/), { target: { value: "de" } });
@@ -248,7 +249,10 @@ describe("EnvironmentsPanel", () => {
     await open();
     fireEvent.click(await screen.findByRole("button", { name: "Join dev" }));
     const dialog = screen.getByRole("dialog");
+    // Opening the bundle is not a request yet.
+    expect(screen.queryByText("Waiting for an admin to onboard you")).toBeNull();
     fireEvent.click(within(dialog).getByRole("button", { name: "Save bundle to folder…" }));
+    expect(await within(dialog).findByText("/home/me/onboard-dev")).toBeInTheDocument();
     await waitFor(() =>
       expect(invoke).toHaveBeenCalledWith("save_aws_admin_bundle", {
         connectionId: "h1",
@@ -314,6 +318,95 @@ describe("EnvironmentsPanel", () => {
     emit(progress({ op_id: "u1", events: [], done: true, cancellable: false, result: { ok: false, exit_code: 1, summary: "Apply failed" } }));
     expect(await screen.findByText(/Failed \(exit 1\): Apply failed/)).toBeInTheDocument();
     expect(screen.getByText((_, el) => el?.textContent === long && el.tagName === "PRE")).toBeInTheDocument();
+  });
+
+  it("a workspace user who closes the bundle without saving is not waiting", async () => {
+    backend(() => scan({ environments: [env()] }));
+    render(<EnvironmentsPanel connection={conn} tier="workspace_user" />);
+    await open();
+    fireEvent.click(await screen.findByRole("button", { name: "Join dev" }));
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Close" }));
+    expect(screen.queryByText("Waiting for an admin to onboard you")).toBeNull();
+    expect(within(screen.getByTestId("env-dev")).getByRole("button", { name: "Join dev" })).toHaveTextContent("Join");
+  });
+
+  it("never offers Destroy on a ready environment", async () => {
+    backend(() => scan({ environments: [env({ actions: ["join", "update"] })] }));
+    render(<EnvironmentsPanel connection={conn} tier="environment_admin" />);
+    await open();
+    const row = await screen.findByTestId("env-dev");
+    expect(within(row).getByText("Ready")).toBeInTheDocument();
+    expect(within(row).queryByRole("button", { name: "Destroy dev" })).toBeNull();
+    expect(within(row).queryByRole("button", { name: "Unlock dev" })).toBeNull();
+  });
+
+  it("after a region change, the old region's rows can't be acted on, and actions use the new region", async () => {
+    let resolveUs: (s: EnvironmentScan) => void = () => {};
+    invoke.mockImplementation(async (cmd: string, args: { region?: string }) => {
+      if (cmd === "detect_aws_environments") {
+        if (args.region === "us-east-1") return new Promise<EnvironmentScan>((r) => (resolveUs = r));
+        return scan({ environments: [env({ state: { state: "incomplete", lock: null }, actions: ["repair", "destroy"], info: null, onboarding: null })] });
+      }
+      if (cmd === "update_aws_environment") return "u1";
+      throw new Error(`unexpected ${cmd}`);
+    });
+    render(<EnvironmentsPanel connection={conn} tier="environment_admin" />);
+    await open();
+    expect(await screen.findByRole("button", { name: "Destroy dev" })).toBeEnabled();
+    fireEvent.change(screen.getByLabelText("Region"), { target: { value: "us-east-1" } });
+    // Before the new scan answers, nothing from eu-west-1 can be clicked.
+    expect(screen.queryByTestId("env-dev")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Destroy dev" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Deploy a new environment" })).toBeNull();
+    await act(async () =>
+      resolveUs(scan({ region: "us-east-1", environments: [env({ state: { state: "update_available" }, actions: ["update"], onboarding: { state: "joined" } })] })),
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "Update dev" }));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("update_aws_environment", { connectionId: "h1", region: "us-east-1", name: "dev" }),
+    );
+    expect(await screen.findByText("Running")).toBeInTheDocument();
+  });
+
+  it("disables row actions while detection is in flight", async () => {
+    let calls = 0;
+    let release: () => void = () => {};
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd !== "detect_aws_environments") throw new Error(`unexpected ${cmd}`);
+      calls += 1;
+      const found = scan({ environments: [env({ actions: ["join", "update"], onboarding: { state: "joined" } })] });
+      if (calls === 1) return found;
+      return new Promise<EnvironmentScan>((r) => (release = () => r(found)));
+    });
+    render(<EnvironmentsPanel connection={conn} tier="environment_admin" />);
+    await open();
+    expect(await screen.findByRole("button", { name: "Update dev" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "Detect again" }));
+    expect(screen.getByRole("button", { name: "Update dev" })).toBeDisabled();
+    await act(async () => release());
+    expect(screen.getByRole("button", { name: "Update dev" })).toBeEnabled();
+  });
+
+  it("a done that arrives before the invoke resolves is shown and re-detects", async () => {
+    backend(
+      () => scan({ environments: [env({ state: { state: "update_available" }, actions: ["update"], onboarding: { state: "joined" } })] }),
+      async (cmd) => {
+        if (cmd === "update_aws_environment") {
+          emit(progress({ op_id: "u1", events: [tofuEvent("Refreshing state")] }));
+          emit(progress({ op_id: "u1", events: [], done: true, cancellable: false, result: { ok: true, exit_code: 0, summary: "No changes." } }));
+          return "u1";
+        }
+        throw new Error(`unexpected ${cmd}`);
+      },
+    );
+    render(<EnvironmentsPanel connection={conn} tier="environment_admin" />);
+    await open();
+    fireEvent.click(await screen.findByRole("button", { name: "Update dev" }));
+    expect(await screen.findByText(/Finished: No changes\./)).toBeInTheDocument();
+    expect(screen.getByText("Refreshing state")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Cancel deployment" })).toBeNull();
+    await waitFor(() => expect(detectCalls()).toBe(2));
+    expect(handlers.size).toBe(0);
   });
 
   it("routes a detection failure through the AWS error copy", async () => {

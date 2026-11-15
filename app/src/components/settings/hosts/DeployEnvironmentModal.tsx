@@ -6,7 +6,7 @@ import Button from "../../ui/Button";
 import Field, { inputClass } from "../../ui/Field";
 import Modal from "../../ui/Modal";
 import AdminBundleModal from "./AdminBundleModal";
-import DeployProgress, { useDeployRuns } from "./DeployProgress";
+import DeployProgress, { runKey, useDeployRuns } from "./DeployProgress";
 import NetworkFields from "./NetworkFields";
 import {
   BOUNDARY_STATE_KEY,
@@ -51,7 +51,8 @@ export default function DeployEnvironmentModal({
     if (result?.ok) setBoundaryDone(true);
     onDetect();
   });
-  const boundaryRun = boundary.runs[BOUNDARY_STATE_KEY];
+  const boundaryRun = boundary.runs[runKey(region, BOUNDARY_STATE_KEY)];
+  const boundaryFailed = boundaryRun?.done && boundaryRun.result && !boundaryRun.result.ok ? boundaryRun.result : null;
 
   if (bundle) {
     return (
@@ -137,6 +138,24 @@ export default function DeployEnvironmentModal({
             </p>
           )}
           {boundaryRun && <DeployProgress run={boundaryRun} connectionId={connectionId} />}
+          {boundaryFailed && (
+            <div className="space-y-1.5">
+              <p>
+                Creating the boundary failed. If it was refused, an account administrator can create it from a
+                bundle.
+              </p>
+              <Button
+                size="md"
+                onClick={() =>
+                  setBundle({
+                    reason: boundaryFailed.summary ?? `OpenTofu exited with code ${boundaryFailed.exit_code}`,
+                  })
+                }
+              >
+                Get the boundary bundle for an administrator
+              </Button>
+            </div>
+          )}
         </div>
       ) : (
         <div className="space-y-4">
