@@ -28,6 +28,9 @@ dirs = "6"
 log = "0.4"
 fern = { version = "0.7", features = ["date-based"] }
 tar = "0.4"
+# Unpacks the pinned OpenTofu release archive (aws/tofu.rs); every platform's
+# archive is a .tar.gz. The version already in the tree.
+flate2 = "1"
 include_dir = "0.7"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }
 iana-time-zone = "0.1"
@@ -77,6 +80,12 @@ aws-smithy-async = { version = "1.3.1", default-features = false, features = ["r
 # Linux only: WebKitGTK refuses getUserMedia until the embedder enables media
 # streams and answers the permission request (see src/linux_media.rs). Same
 # version tauri/wry already resolve, so this adds no second copy.
+# aws/tofu.rs: `setsid` for the detached OpenTofu runner, SIGINT to its
+# process group on Cancel, and a liveness probe for its PID. Already in the
+# tree through tokio and friends.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 webkit2gtk = "2.0.2"
 

@@ -211,6 +211,13 @@ where
     }
 }
 
+/// The detached OpenTofu runner (`aws::tofu`): `Some(exit code)` when this
+/// process was started as one, `None` for a normal launch. `main` asks
+/// before anything Tauri or GTK starts, so a runner never opens a window.
+pub fn tofu_runner_main() -> Option<i32> {
+    aws::tofu::runner_main(std::env::args_os())
+}
+
 pub fn run() {
     logging::init();
 

@@ -144,6 +144,12 @@ mod tests {
 }
 
 fn main() {
+    // A detached OpenTofu apply re-executes this binary with `--tofu-runner`
+    // (aws/tofu.rs). It must not get anywhere near Tauri, GTK or a window.
+    if let Some(code) = triple_c_lib::tofu_runner_main() {
+        std::process::exit(code);
+    }
+
     // Before *any* `std::env::set_var` — `url_open` hands a child process the
     // environment this app was started with, and the workaround below is one
     // of the things that must not leak into it (see triple-c#34). Anything
