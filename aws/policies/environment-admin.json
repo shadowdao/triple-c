@@ -123,7 +123,8 @@
         "iam:SimulatePrincipalPolicy"
       ],
       "Resource": [
-        "arn:aws:iam::*:role/*",
+        "arn:aws:iam::*:role/aws-reserved/sso.amazonaws.com/*",
+        "arn:aws:iam::*:role/triple-c-*",
         "arn:aws:iam::*:user/${aws:username}",
         "arn:aws:iam::*:user/*/${aws:username}"
       ]

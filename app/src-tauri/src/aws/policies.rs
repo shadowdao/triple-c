@@ -108,7 +108,8 @@ const SESSION_OWNER: &str = "ssm:resourceTag/aws:ssmmessages:session-id";
 /// IAM refuses `${aws:PrincipalArn}` as a Resource (verified live), so a
 /// user's own ARN is `user/${aws:username}` (or `user/*/${aws:username}`
 /// with a path), resolved from this entry. A role cannot be named that way
-/// (there is no role-name variable); the policies allow `role/*`.
+/// (there is no role-name variable); the policies allow SSO permission-set
+/// roles and `triple-c-*` roles (R18). Other roles fall back to probes.
 const OWN_PRINCIPAL: Context = &[("aws:username", Literal("{principal_name}"))];
 /// Role writes name the boundary; `${aws:PrincipalAccount}` resolves from
 /// the second entry.
@@ -1076,9 +1077,10 @@ mod tests {
 
     /// GetRole and SimulatePrincipalPolicy: an IAM user only on itself. IAM
     /// has no role-name variable and refuses `${aws:PrincipalArn}` as a
-    /// Resource (verified live), so a role caller may inspect any role.
+    /// Resource (verified live), so roles are limited by path and name
+    /// instead (R18): SSO permission-set roles and `triple-c-*` roles only.
     #[test]
-    fn principal_inspection_is_of_the_caller_or_of_roles() {
+    fn principal_inspection_is_of_the_caller_sso_roles_or_triple_c_roles() {
         for tier in TIERS {
             for action in ["iam:GetRole", "iam:SimulatePrincipalPolicy"] {
                 let own = checks(tier)
@@ -1095,7 +1097,8 @@ mod tests {
                 for mine in [
                     "arn:aws:iam::{account}:user/alice",
                     "arn:aws:iam::{account}:user/team/alice",
-                    "arn:aws:iam::{account}:role/SomeoneElsesRole",
+                    "arn:aws:iam::{account}:role/aws-reserved/sso.amazonaws.com/us-west-2/AWSReservedSSO_Dev_0123",
+                    "arn:aws:iam::{account}:role/triple-c-task-alice",
                 ] {
                     assert!(
                         allowed(tier, &at(mine), ME, ME),
@@ -1103,6 +1106,9 @@ mod tests {
                     );
                 }
                 for theirs in [
+                    "arn:aws:iam::{account}:role/SomeoneElsesRole",
+                    "arn:aws:iam::{account}:role/ops/deployer",
+                    "arn:aws:iam::{account}:role/aws-service-role/ecs.amazonaws.com/AWSServiceRoleForECS",
                     "arn:aws:iam::{account}:user/bob",
                     "arn:aws:iam::{account}:user/team/xalice",
                     "arn:aws:iam::{account}:group/alice",

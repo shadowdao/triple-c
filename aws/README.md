@@ -57,12 +57,20 @@ following:
   `RunTask`, the ECS and EFS tag-on-create calls, `CreateSecret`, and secret `TagResource`. A
   workspace user can never set `triple-c:component`, which marks environment resources and which
   the Denies and phase-4 detection trust.
-- **Inspect principals.** `iam:GetRole` and `iam:SimulatePrincipalPolicy`, which the app's
-  permission check uses on the caller's own principal. An IAM user may inspect only itself
-  (`user/${aws:username}`, with or without a path). A role session may inspect **any role** in the
-  account: IAM refuses `${aws:PrincipalArn}` as a Resource and has no role-name variable, so the
-  caller's own role cannot be named. This exposes role metadata and simulated permissions, never
-  another user's resources.
+- **Inspect their own principal, as far as IAM can say so.** `iam:GetRole` and
+  `iam:SimulatePrincipalPolicy`, which the app's permission check uses on the caller's own
+  principal. An IAM user may inspect only itself (`user/${aws:username}`, with or without a path).
+  "My own role" cannot be written: IAM refuses `${aws:PrincipalArn}` as a Resource (verified live,
+  "must be in ARN format or \"*\"") and has no role-name variable. So the `InspectOwnPrincipal`
+  statement names the roles people actually sign in with:
+  - `role/aws-reserved/sso.amazonaws.com/*`, the IAM Identity Center permission-set roles;
+  - `role/triple-c-*`.
+
+  A caller on any other role cannot read or simulate its role, so the permission check falls back
+  to probes and reports **Insufficient**, naming `iam:GetRole`. If your users sign in through other
+  roles, add those roles' ARNs or path prefixes (for example `arn:aws:iam::*:role/engineers/*`)
+  to `InspectOwnPrincipal` in both tier policies. Everything matched there can be read and
+  simulated by every holder of the policy, so keep it to the sign-in roles.
 - **Read environment information.** This covers ECS, CloudFormation stacks, the `/triple-c/*` SSM
   parameters, the secret list, EFS, and the `/triple-c/*` log groups. Listing is not a secret; the
   app filters by owner for display.
@@ -164,7 +172,7 @@ Create each file as a **customer managed policy** and attach it. In the console,
 **IAM → Policies → Create policy → JSON**, paste the file, and attach the policy to a user, group
 or role. Inline policies do not fit: a role's inline policies share 10,240 characters and an
 environment admin needs both tiers (about 11,500), and a user's share 2,048. A managed policy may
-hold 6,144 characters, not counting whitespace; the workspace policy is about 6,050, and a unit
+hold 6,144 characters, not counting whitespace; the workspace policy is about 6,110, and a unit
 test (`every_policy_fits_a_managed_policy`) fails before it outgrows that. For IAM Identity
 Center, add the files as inline policies on the permission set (up to 32,768 characters) or
 reference the managed policies.
@@ -231,7 +239,7 @@ ends (keys are scheduled for deletion, 7 days). One test creates the real
 
 | Point | Result |
 |---|---|
-| `${aws:PrincipalArn}` as a Resource | ✗→fixed. IAM refuses it ("must be in ARN format or \"*\""), so neither tier policy could be attached at all. Now `role/*` and `user/${aws:username}`, `user/*/${aws:username}` (see Inspect principals) |
+| `${aws:PrincipalArn}` as a Resource | ✗→fixed. IAM refuses it ("must be in ARN format or \"*\""), so neither tier policy could be attached at all. Now SSO permission-set roles, `triple-c-*` roles and `user/${aws:username}`, `user/*/${aws:username}` (see the workspace user's own principal) |
 | SSO role path | ✓ `iam:GetRole` returns `role/aws-reserved/sso.amazonaws.com/<region>/AWSReservedSSO_…`, and the check simulates that ARN. The SSO admin session checks as Environment admin, Simulated |
 | `${aws:PrincipalAccount}` in `iam:PermissionsBoundary` | ✓ `CreateRole` with `triple-c-permissions-boundary` succeeds as the admin tier; without a boundary, or with another one, it is denied |
 | Boundary fences | ✓ removing, replacing or editing the boundary is an explicit deny |

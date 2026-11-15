@@ -647,13 +647,15 @@ Rulings made while writing the tier policies, which phase 4 must build on:
 `app/src-tauri/src/aws/live_tests.rs` repeats them. What reality changed:
 
 - IAM refuses `${aws:PrincipalArn}` as a Resource, so self-inspection is `user/${aws:username}`
-  for IAM users and **any role** for role sessions (no role-name variable exists).
+  for IAM users and, for role sessions (no role-name variable exists), SSO permission-set roles
+  and `triple-c-*` roles only (ruling R18). Callers on other roles are probed and reported
+  Insufficient; an admin can add their roles to `InspectOwnPrincipal`.
 - `ecs:ExecuteCommand` is also authorized against the cluster; the owner rule stays on the task.
 - Secrets Manager needs `kms:Decrypt` as well as `GenerateDataKey` on a customer key.
 - `elasticfilesystem:CreateFileSystem` has no resource type (`Resource: "*"`).
 - The session client needs `ssmmessages:OpenDataChannel` on its own session (AWS docs).
 - The tier policies must be managed policies (both together exceed a role's inline budget); the
-  workspace policy is close to the 6,144-character limit, and a unit test guards it.
+  workspace policy is close to the 6,144-character limit (about 6,110), and a unit test guards it.
 - `SimulatePrincipalPolicy` throttles within one check; the app retries adaptively.
 - The `aws/secretsmanager` Deny is load-bearing, but not for the reason first given: a bounded task
   role *can* decrypt such a secret, because that key's policy grants the caller directly.
