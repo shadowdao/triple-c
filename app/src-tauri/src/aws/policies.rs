@@ -248,6 +248,12 @@ const WORKSPACE_USER_CHECKS: &[Check] = &[
     ),
     // `workspace-user-tasks.json`: a user registers, tags and retires their
     // own task definitions, and reads their own secrets.
+    // Residual risk the policy cannot close: the family carries the owner
+    // key, which IAM can't condition on, so any user may register a revision
+    // into another owner's family. The app's mitigation: it runs only the
+    // exact `family:revision` ARN its own register call returned, and when it
+    // looks up an existing revision it accepts only one tagged with the
+    // caller's own owner ID (never "latest of the family").
     write(
         "ecs:RegisterTaskDefinition",
         PROBE_TASK_DEFINITION,
@@ -1140,27 +1146,23 @@ mod tests {
     #[test]
     fn registering_a_task_definition_needs_the_owner_tag_and_only_the_three_keys() {
         let reg = ws_check("ecs:RegisterTaskDefinition", "task-definition/");
-        let with_keys = |extra: Option<&'static str>| -> Check {
-            let ctx: Context = match extra {
-                None => &[
-                    (OWNER_REQUEST_TAG, OwnerId),
-                    ("aws:TagKeys", Literal("triple-c:owner")),
-                    ("aws:TagKeys", Literal("triple-c:project")),
-                    ("aws:TagKeys", Literal("triple-c:environment")),
-                ],
-                Some(_) => &[
-                    (OWNER_REQUEST_TAG, OwnerId),
-                    ("aws:TagKeys", Literal("triple-c:owner")),
-                    ("aws:TagKeys", Literal("triple-c:project")),
-                    ("aws:TagKeys", Literal("triple-c:environment")),
-                    ("aws:TagKeys", Literal("extra")),
-                ],
-            };
-            Check { context: ctx, ..*reg }
-        };
-        assert!(allowed(Tier::WorkspaceUser, &with_keys(None), ME, ME));
+        const THREE_KEYS: Context = &[
+            (OWNER_REQUEST_TAG, OwnerId),
+            ("aws:TagKeys", Literal("triple-c:owner")),
+            ("aws:TagKeys", Literal("triple-c:project")),
+            ("aws:TagKeys", Literal("triple-c:environment")),
+        ];
+        const FOUR_KEYS: Context = &[
+            (OWNER_REQUEST_TAG, OwnerId),
+            ("aws:TagKeys", Literal("triple-c:owner")),
+            ("aws:TagKeys", Literal("triple-c:project")),
+            ("aws:TagKeys", Literal("triple-c:environment")),
+            ("aws:TagKeys", Literal("extra")),
+        ];
+        let with_keys = |context: Context| Check { context, ..*reg };
+        assert!(allowed(Tier::WorkspaceUser, &with_keys(THREE_KEYS), ME, ME));
         assert!(
-            !allowed(Tier::WorkspaceUser, &with_keys(Some("extra")), ME, ME),
+            !allowed(Tier::WorkspaceUser, &with_keys(FOUR_KEYS), ME, ME),
             "an extra tag key must be refused"
         );
         let no_owner = Check {

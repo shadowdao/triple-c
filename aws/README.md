@@ -12,10 +12,11 @@ tier the signed-in identity has under **Settings → Hosts → Check**.
 | `policies/environment-admin-network.json` | The **environment admin** tier, part 2: the network those modules create (VPC, subnets, gateways, routes, security groups) |
 | `policies/permissions-boundary.json` | The **permissions boundary** every Triple-C role must carry. It is never attached to a person |
 
-The workspace tier and the admin tier are each **two** files, because one managed policy holds only
-6,144 characters; both files of a tier are required, and the app's **Copy** lists every file of a
-tier. An environment admin attaches all four tier files (both workspace user files and both admin
-files): the admin files add environment management on top of everything a workspace user can do. Explicit Deny statements in any file apply to anyone
+The workspace tier and the admin tier are each **two** files, because one managed policy holds
+only 6,144 characters; both files of a tier are required, and the app's **Copy** lists every
+file of a tier. An environment admin attaches all four tier files (both workspace user files and
+both admin files): the admin files add environment management on top of everything a workspace
+user can do. Explicit Deny statements in any file apply to anyone
 who has it attached.
 
 ## Workspace user
@@ -36,8 +37,14 @@ following:
   execution role is also authorized with `iam:PassRole` on it, which `PassOwnTaskRoles` already
   covers (owner-tagged `triple-c-*` roles, to ECS tasks only; a unit test checks both roles).
   `RunOwnTasks` still requires the definition's owner tag, so a user can run only definitions they
-  registered. The statements use the revision-free and revision forms alike: the `*` in
-  `task-definition/triple-c-*` matches `family:revision`.
+  registered. The `*` in `task-definition/triple-c-*` matches `family:revision` too.
+  - **Residual risk: polluting another owner's family.** The family name carries the owner key,
+    which IAM cannot condition on, so any workspace user can register a *revision* into another
+    owner's `triple-c-*` family and make it the family's latest. It cannot run or steal anything
+    (`RunOwnTasks` needs the owner tag, and the new revision carries the attacker's), and the
+    policy cannot close this. The app's mitigation: it always runs the exact `family:revision`
+    ARN its own register call returned, and when it looks up an existing revision it accepts
+    only one tagged with the caller's own owner ID, never "latest of the family".
 - **Read their own secrets.** `secretsmanager:GetSecretValue` on `triple-c/*` secrets tagged with
   their owner ID, so a second machine can read the agent token and attach to a running task
   (`ReadOwnSecrets`). An explicit Deny (`NeverReadEnvironmentSecrets`) refuses it on any secret
@@ -357,7 +364,7 @@ module creates the same policy, applied by an account administrator; the admin t
 Create each file as a **customer managed policy** and attach it. In the console, go to
 **IAM → Policies → Create policy → JSON**, paste the file, and attach the policy to a user, group
 or role. Inline policies do not fit: a role's inline policies share 10,240 characters and an
-environment admin needs every tier file (about 14,500), and a user's share 2,048. A managed policy
+environment admin needs every tier file (about 16,600), and a user's share 2,048. A managed policy
 may hold 6,144 characters, not counting whitespace. Without whitespace, `workspace-user.json` is
 about 6,040 (roughly 100 characters of headroom), `workspace-user-tasks.json` about 1,460,
 `environment-admin.json` about 5,800 (340)
