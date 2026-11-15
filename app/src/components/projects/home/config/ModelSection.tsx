@@ -24,6 +24,9 @@ import { useAppState } from "../../../../store/appState";
 const LOCAL_MODEL_ON_AWS =
   "This project runs on AWS: the URL must be reachable from the AWS task, so host.docker.internal, localhost and this machine's LAN addresses will not work.";
 
+export const BEDROCK_PROFILE_ON_AWS =
+  "This project runs on AWS: a named profile is read from ~/.aws on this machine, which the AWS workspace does not have, and an SSO login cannot be refreshed there. Use static keys or a bearer token instead.";
+
 /** Bedrock fields held in the OS keychain, never serialized back to us. */
 const BEDROCK_SECRET_KEYS = [
   "aws_access_key_id",
@@ -357,6 +360,15 @@ export default function ModelSection({ project, save, disabled }: Props) {
                 )}
               </Field>
             </>
+          )}
+
+          {bedrock.auth_method === "profile" && aws && (
+            <p
+              role="note"
+              className="px-2 py-1.5 text-xs text-[var(--warning)] bg-[var(--warning-muted)] border border-[var(--warning)]/30 rounded-[var(--radius-control)]"
+            >
+              {BEDROCK_PROFILE_ON_AWS}
+            </p>
           )}
 
           {bedrock.auth_method === "profile" && (
