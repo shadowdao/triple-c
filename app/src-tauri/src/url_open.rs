@@ -187,11 +187,10 @@ fn strip_appdir_entries(value: &str, appdir: &str) -> Option<String> {
 /// from the process, so the rules can be tested without a global mutex around
 /// the environment. Returns changes sorted by variable name so assertions are
 /// deterministic.
-// Only the Linux spawn path reads these; the macOS/Windows path delegates to
-// the opener plugin. Kept unconditional (rather than `#[cfg(linux)]`) so the
-// tests and the documentation stay in one piece on every platform.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn sanitize_child_env(
+///
+/// Also used by the OpenTofu runner (`aws::tofu::tofu_env`), which undoes an
+/// AppImage launcher's changes before starting `tofu`.
+pub(crate) fn sanitize_child_env(
     current: &BTreeMap<String, String>,
     pristine: &BTreeMap<String, String>,
     appdir: Option<&str>,

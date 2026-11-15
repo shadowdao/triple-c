@@ -9,20 +9,25 @@
 //! `tofu init` then `tofu apply|destroy`, appending both to `apply.log`, and
 //! writes the exit code to `apply.exit` — always, even when init fails or
 //! `tofu` cannot be started. No shell is involved anywhere. On Unix the
-//! runner is its own session (`setsid`), so its process group is the
-//! Cancel target; on Windows it is `DETACHED_PROCESS |
-//! CREATE_NEW_PROCESS_GROUP`.
+//! runner is its own session (`setsid`); on Windows it is
+//! `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`.
+//!
+//! **Liveness** is the runner's exclusive lock on `apply.lock`, held for its
+//! whole life, never "the PID in `apply.pid` exists" (PIDs are reused).
+//! **Cancel** is SIGINT to the runner alone, which forwards it to `tofu`.
 //!
 //! **Credentials** reach `tofu` only through the environment the runner is
 //! started with ([`child_env`]), never argv, files or the log. The runner
 //! itself writes only its own status lines to the log, never its
 //! environment.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -91,6 +96,11 @@ const TOFU_BIN_ENV: &str = "TRIPLEC_TOFU_BIN";
 const LOG_FILE: &str = "apply.log";
 const PID_FILE: &str = "apply.pid";
 const EXIT_FILE: &str = "apply.exit";
+/// Held (exclusive advisory lock) by the runner for its whole life.
+const LOCK_FILE: &str = "apply.lock";
+/// The names (not values) of the variables the app gave the runner, so the
+/// runner can hand `tofu` exactly those (see [`tofu_env`]).
+const ENV_KEYS_VAR: &str = "TRIPLEC_TOFU_ENV_KEYS";
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -205,11 +215,14 @@ pub fn verify_and_extract(
 
 /// `<root>/tofu/<ver>/tofu[.exe]`, downloaded and verified on first use.
 /// A binary already there is reused only if it still hashes to what was
-/// recorded when it was extracted from a verified archive.
+/// recorded when it was extracted from a verified archive. Also prepares
+/// the plugin cache and CLI config [`child_env`] points at.
 #[allow(dead_code)] // used by phase-4 commands
 pub async fn ensure_tofu(root: &Path) -> Result<PathBuf, AwsError> {
     let (file, sha) = release_asset(std::env::consts::OS, std::env::consts::ARCH)
         .ok_or_else(|| other("OpenTofu isn't available for this platform"))?;
+    prepare_support_files(root)
+        .map_err(|e| other(format!("Could not prepare the OpenTofu folder: {e}")))?;
     let dir = root.join("tofu").join(TOFU_VERSION);
     fs::create_dir_all(&dir)
         .map_err(|e| other(format!("Could not create {}: {e}", dir.display())))?;
@@ -392,22 +405,30 @@ fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// "everything minus AWS_/TF_/TOFU_": anything else the app was started with
 /// (`LD_PRELOAD`, tokens, the AppImage's library paths) has no business in
 /// an apply.
-/// - `PATH`: `credential_process`/SSO helpers and the AppImage runtime's
-///   `fusermount`.
+/// - `PATH` (and Windows' `PATHEXT`, `ComSpec`): `credential_process`/SSO
+///   helpers, and the AppImage runtime's `fusermount`.
 /// - `HOME` / `USERPROFILE`: where the AWS provider finds `~/.aws` (config,
 ///   credentials, SSO cache) for a profile connection.
 /// - `TMPDIR` / `TMP` / `TEMP`: scratch space for tofu and its provider.
-/// - `SystemRoot`: Go's networking and crypto fail on Windows without it.
-/// - The proxy variables and `SSL_CERT_FILE` / `SSL_CERT_DIR`: a corporate
-///   network needs them for the provider download and every AWS call.
+/// - `SystemRoot`, `windir`, `APPDATA`, `LOCALAPPDATA`: Go's networking and
+///   crypto fail on Windows without `SystemRoot`; the others are where
+///   Windows programs (credential helpers included) find their own state.
+/// - The proxy variables, `SSL_CERT_FILE` / `SSL_CERT_DIR` and
+///   `AWS_CA_BUNDLE`: a corporate network needs them for the provider
+///   download and every AWS call. `AWS_CA_BUNDLE` only adds trusted CAs.
 const INHERITED: &[&str] = &[
     "PATH",
+    "PATHEXT",
+    "ComSpec",
     "HOME",
     "USERPROFILE",
     "TMPDIR",
     "TMP",
     "TEMP",
     "SystemRoot",
+    "windir",
+    "APPDATA",
+    "LOCALAPPDATA",
     "HTTPS_PROXY",
     "HTTP_PROXY",
     "NO_PROXY",
@@ -416,57 +437,145 @@ const INHERITED: &[&str] = &[
     "no_proxy",
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
+    "AWS_CA_BUNDLE",
 ];
 
-fn inherited(name: &str) -> bool {
-    INHERITED.iter().any(|a| {
-        if cfg!(windows) {
-            a.eq_ignore_ascii_case(name)
-        } else {
-            *a == name
-        }
-    })
+/// For a profile connection: the profile files the app's own SDK config
+/// reads. `aws/connection.rs` uses the SDK's default file resolution, which
+/// honours these two variables in the app's environment, so tofu is given
+/// the same values and both read the same files.
+const PROFILE_FILE_VARS: &[&str] = &["AWS_CONFIG_FILE", "AWS_SHARED_CREDENTIALS_FILE"];
+
+fn name_is(a: &str, name: &str) -> bool {
+    if cfg!(windows) {
+        a.eq_ignore_ascii_case(name)
+    } else {
+        a == name
+    }
 }
 
-/// The complete environment for the runner and the `tofu` it starts: the
-/// [`INHERITED`] variables from `parent` (the real caller passes
-/// `std::env::vars()`), the connection's own credentials — `AWS_PROFILE` for
-/// a profile, the three key variables for a keys connection — and the
-/// app's `TF_*` / `CHECKPOINT_*` settings. Nothing else AWS-, TF- or
-/// TOFU-shaped. A profile uses the default `~/.aws` paths, as
-/// `aws/connection.rs` does.
+/// `<root>/tofu/plugin-cache`: `TF_PLUGIN_CACHE_DIR`, shared by every
+/// deployment.
+pub fn plugin_cache_dir(root: &Path) -> PathBuf {
+    root.join("tofu").join("plugin-cache")
+}
+
+/// `<root>/tofu/tofurc`: `TF_CLI_CONFIG_FILE`. The user's own `~/.tofurc`
+/// (or `terraform.rc`) could carry `dev_overrides`, which bypass the lock
+/// file's provider hashes, or a mirror; this one says only "install
+/// providers directly from their registry". No secrets.
+fn cli_config_path(root: &Path) -> PathBuf {
+    root.join("tofu").join("tofurc")
+}
+
+const CLI_CONFIG: &str = "provider_installation {\n  direct {}\n}\n";
+
+/// `<root>/tofu/no-aws-config`, which never exists: a keys connection's
+/// `AWS_CONFIG_FILE` and `AWS_SHARED_CREDENTIALS_FILE`, so the user's
+/// `[default]` profile (region, endpoints, credential settings) can't mix
+/// into a connection that has its own keys.
+fn no_aws_files_path(root: &Path) -> PathBuf {
+    root.join("tofu").join("no-aws-config")
+}
+
+/// Create the plugin cache and the CLI config, and make sure the "no AWS
+/// config" path really doesn't exist. Run by [`ensure_tofu`] on every call.
+fn prepare_support_files(root: &Path) -> io::Result<()> {
+    fs::create_dir_all(plugin_cache_dir(root))?;
+    fs::write(cli_config_path(root), CLI_CONFIG)?;
+    let absent = no_aws_files_path(root);
+    match fs::symlink_metadata(&absent) {
+        Ok(m) if m.is_dir() => fs::remove_dir_all(&absent)?,
+        Ok(_) => fs::remove_file(&absent)?,
+        Err(_) => {}
+    }
+    Ok(())
+}
+
+/// The Rust SDK expands a leading `~` in the profile-file variables; the Go
+/// SDK reads them literally. Expand it here so both see the same file.
+fn expand_home(value: &str, parent: &[(String, String)]) -> String {
+    let rest = value
+        .strip_prefix("~/")
+        .or_else(|| value.strip_prefix("~\\"));
+    let home = parent
+        .iter()
+        .find(|(k, _)| name_is("HOME", k))
+        .or_else(|| parent.iter().find(|(k, _)| name_is("USERPROFILE", k)));
+    match (rest, home) {
+        (Some(rest), Some((_, home))) => Path::new(home).join(rest).to_string_lossy().into_owned(),
+        _ => value.to_string(),
+    }
+}
+
+/// The complete environment for the runner and the `tofu` it starts. From
+/// `parent` (the real caller passes `std::env::vars()`) only the
+/// [`INHERITED`] variables, plus a profile connection's [`PROFILE_FILE_VARS`]
+/// so tofu reads the files the app does. Then:
+/// - the connection's credentials: `AWS_PROFILE` for a profile, the key
+///   variables for a keys connection (whose `keys` must be given), with the
+///   AWS config and credentials files pointed at a path that doesn't exist;
+/// - `AWS_IGNORE_CONFIGURED_ENDPOINT_URLS=true`, so an `endpoint_url` in the
+///   user's AWS config can't redirect signed calls (the Go SDK v2 that tofu's
+///   S3 backend and the AWS provider use honours it);
+/// - `TF_CLI_CONFIG_FILE`, `TF_PLUGIN_CACHE_DIR`, `TF_IN_AUTOMATION=1`,
+///   `TF_INPUT=0`, `CHECKPOINT_DISABLE=1`.
+///
+/// `root` is the one [`ensure_tofu`] prepared.
 #[allow(dead_code)] // used by phase-4 commands
 pub fn child_env(
     conn: &HostConnection,
     keys: Option<&AwsKeys>,
-    plugin_cache: &Path,
+    root: &Path,
     parent: impl IntoIterator<Item = (String, String)>,
-) -> Vec<(String, String)> {
-    let mut env: Vec<(String, String)> = parent.into_iter().filter(|(k, _)| inherited(k)).collect();
+) -> Result<Vec<(String, String)>, AwsError> {
+    let parent: Vec<(String, String)> = parent.into_iter().collect();
+    let mut env: Vec<(String, String)> = parent
+        .iter()
+        .filter(|(k, _)| INHERITED.iter().any(|a| name_is(a, k)))
+        .cloned()
+        .collect();
     let HostKind::Aws { auth, .. } = &conn.kind;
     match auth {
-        AwsAuth::Profile { name } => env.push(("AWS_PROFILE".into(), name.clone())),
-        AwsAuth::Keys { .. } => {
-            if let Some(keys) = keys {
-                env.push(("AWS_ACCESS_KEY_ID".into(), keys.access_key_id.clone()));
-                env.push((
-                    "AWS_SECRET_ACCESS_KEY".into(),
-                    keys.secret_access_key.clone(),
-                ));
-                if let Some(token) = &keys.session_token {
-                    env.push(("AWS_SESSION_TOKEN".into(), token.clone()));
+        AwsAuth::Profile { name } => {
+            env.push(("AWS_PROFILE".into(), name.clone()));
+            for var in PROFILE_FILE_VARS {
+                if let Some((_, v)) = parent
+                    .iter()
+                    .find(|(k, v)| name_is(var, k) && !v.is_empty())
+                {
+                    env.push((var.to_string(), expand_home(v, &parent)));
                 }
             }
         }
+        AwsAuth::Keys { .. } => {
+            let keys = keys.ok_or(AwsError::KeysMissing)?;
+            env.push(("AWS_ACCESS_KEY_ID".into(), keys.access_key_id.clone()));
+            env.push((
+                "AWS_SECRET_ACCESS_KEY".into(),
+                keys.secret_access_key.clone(),
+            ));
+            if let Some(token) = &keys.session_token {
+                env.push(("AWS_SESSION_TOKEN".into(), token.clone()));
+            }
+            let absent = no_aws_files_path(root).to_string_lossy().into_owned();
+            env.push(("AWS_CONFIG_FILE".into(), absent.clone()));
+            env.push(("AWS_SHARED_CREDENTIALS_FILE".into(), absent));
+        }
     }
+    env.push(("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS".into(), "true".into()));
+    env.push((
+        "TF_CLI_CONFIG_FILE".into(),
+        cli_config_path(root).to_string_lossy().into_owned(),
+    ));
     env.push((
         "TF_PLUGIN_CACHE_DIR".into(),
-        plugin_cache.to_string_lossy().into_owned(),
+        plugin_cache_dir(root).to_string_lossy().into_owned(),
     ));
     env.push(("TF_IN_AUTOMATION".into(), "1".into()));
     env.push(("TF_INPUT".into(), "0".into()));
     env.push(("CHECKPOINT_DISABLE".into(), "1".into()));
-    env
+    Ok(env)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -513,10 +622,21 @@ fn remove_if_present(path: &Path) -> io::Result<()> {
     }
 }
 
+/// How long [`start_detached`] waits for the runner to take its lock. An
+/// AppImage has to mount itself first, which is the slow case.
+const RUNNER_START_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Start `tofu init` then `apply|destroy` in a detached runner and return
-/// its PID (also written to `apply.pid`). The previous run's log and exit
-/// code are cleared first. `env` is the runner's entire environment
-/// ([`child_env`]); credentials go nowhere else.
+/// the runner's PID. The previous run's log, PID and exit code are cleared
+/// first. `env` is the runner's entire environment ([`child_env`]);
+/// credentials go nowhere else.
+///
+/// Returns only once the runner holds `apply.lock` and has written
+/// `apply.pid` (or has already finished), so the run is followable and
+/// cancellable the moment this returns. If it does neither within
+/// [`RUNNER_START_TIMEOUT`] the spawned process is killed and this fails:
+/// nothing is left running that the app can't see. Blocks for that wait
+/// (normally milliseconds); call it from a blocking task.
 #[allow(dead_code)] // used by phase-4 commands
 pub fn start_detached(
     tofu: &Path,
@@ -531,6 +651,7 @@ pub fn start_detached(
     for f in [LOG_FILE, EXIT_FILE, PID_FILE] {
         remove_if_present(&wd.dir.join(f)).map_err(io)?;
     }
+    let names: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
     let mut cmd = Command::new(runner_program().map_err(io)?);
     cmd.arg(RUNNER_FLAG)
         .arg(&wd.dir)
@@ -538,6 +659,7 @@ pub fn start_detached(
         .env_clear()
         .envs(env.iter().map(|(k, v)| (k, v)))
         .env(TOFU_BIN_ENV, tofu)
+        .env(ENV_KEYS_VAR, names.join(","))
         .current_dir(&wd.dir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -563,11 +685,35 @@ pub fn start_detached(
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
     let mut child = cmd.spawn().map_err(io)?;
-    let pid = child.id();
-    let tmp = wd.dir.join(format!("{PID_FILE}.tmp"));
-    fs::write(&tmp, pid.to_string())
-        .and_then(|_| fs::rename(&tmp, wd.dir.join(PID_FILE)))
-        .map_err(io)?;
+
+    let deadline = std::time::Instant::now() + RUNNER_START_TIMEOUT;
+    let pid = loop {
+        if lock_held(wd) {
+            if let Some(pid) = read_pid(wd) {
+                break pid;
+            }
+        }
+        if wd.dir.join(EXIT_FILE).exists() {
+            break read_pid(wd).unwrap_or_else(|| child.id());
+        }
+        // An AppImage's launcher may exit 0 once it has handed over; only a
+        // failure with nothing to show for it is final.
+        if let Ok(Some(status)) = child.try_wait() {
+            if !status.success() && !lock_held(wd) && !wd.dir.join(EXIT_FILE).exists() {
+                return Err(other(format!(
+                    "The deploy runner failed to start ({status})"
+                )));
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(other(
+                "The deploy runner did not start in time; it was stopped",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
     // Reap it if it finishes while the app is still open (no zombie).
     std::thread::spawn(move || {
         let _ = child.wait();
@@ -584,39 +730,34 @@ fn read_pid(wd: &Workdir) -> Option<u32> {
         .filter(|p| *p > 0)
 }
 
-#[cfg(unix)]
-fn pid_alive(pid: u32) -> bool {
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
+/// Whether some process holds `apply.lock`. The runner takes it before it
+/// writes `apply.pid` and keeps it until it exits (the OS drops it however
+/// the runner dies), so this — not "the PID in `apply.pid` exists", which a
+/// reused PID would satisfy — is what "the runner is alive" means. A
+/// separate file from `apply.pid` because a Windows lock also blocks reads.
+fn lock_held(wd: &Workdir) -> bool {
+    let Ok(file) = File::open(wd.dir.join(LOCK_FILE)) else {
         return false;
     };
-    // SAFETY: signal 0 only checks that the process exists.
-    let r = unsafe { libc::kill(pid, 0) };
-    r == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    match file.try_lock() {
+        Ok(()) => false, // released again when `file` drops
+        Err(fs::TryLockError::WouldBlock) => true,
+        Err(fs::TryLockError::Error(_)) => false,
+    }
 }
 
-#[cfg(windows)]
-fn pid_alive(pid: u32) -> bool {
-    use std::os::windows::process::CommandExt;
-    // No Win32 bindings in the tree; tasklist is always present.
-    Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")))
-        .unwrap_or(false)
-}
-
-/// A run is in progress: `apply.pid` names a live process and `apply.exit`
-/// doesn't exist yet. (A PID reused after a reboot can read as live; the
-/// state lock is the other half of "a deploy is in progress".)
+/// A run is in progress: its runner holds `apply.lock` and `apply.exit`
+/// doesn't exist yet.
 pub fn is_running(wd: &Workdir) -> bool {
-    !wd.dir.join(EXIT_FILE).exists() && read_pid(wd).is_some_and(pid_alive)
+    !wd.dir.join(EXIT_FILE).exists() && lock_held(wd)
 }
 
-/// Cancel: SIGINT to the runner's process group, so `tofu` stops gracefully
-/// and saves state. The runner survives it and still writes `apply.exit`.
+/// Cancel: SIGINT to the runner *process* (never a process group: inside an
+/// AppImage the group also holds the runtime's FUSE server, which would
+/// unmount the runner's own binary). The runner forwards it to the `tofu`
+/// it is running, which stops gracefully and saves state, and still writes
+/// `apply.exit`. Only signals while the runner holds its lock, so a stale
+/// PID never reaches another process.
 #[allow(dead_code)] // used by phase-4 commands
 pub fn interrupt(wd: &Workdir) -> Result<(), AwsError> {
     if !is_running(wd) {
@@ -625,10 +766,9 @@ pub fn interrupt(wd: &Workdir) -> Result<(), AwsError> {
     #[cfg(unix)]
     {
         let pid = read_pid(wd).ok_or_else(|| other("No deploy is running"))?;
-        let pgid = libc::pid_t::try_from(pid).map_err(|_| other("Invalid runner PID"))?;
-        // SAFETY: plain kill(2) on the runner's own process group (setsid
-        // made its PID the group id).
-        if unsafe { libc::kill(-pgid, libc::SIGINT) } != 0 {
+        let pid = libc::pid_t::try_from(pid).map_err(|_| other("Invalid runner PID"))?;
+        // SAFETY: plain kill(2) on the lock-holding runner.
+        if unsafe { libc::kill(pid, libc::SIGINT) } != 0 {
             return Err(other(format!(
                 "Could not interrupt the deploy: {}",
                 io::Error::last_os_error()
@@ -675,9 +815,16 @@ pub fn parse_log_line(line: &str) -> Option<TofuEvent> {
     if line.trim().is_empty() {
         return None;
     }
+    // Plain text is the runner's own lines or a crash; an `Error:` there is
+    // still the run's error.
     let plain = || TofuEvent {
         ts: String::new(),
-        level: "info".into(),
+        level: if line.trim_start().starts_with("Error:") {
+            "error"
+        } else {
+            "info"
+        }
+        .into(),
         kind: "log".into(),
         resource: None,
         action: None,
@@ -756,8 +903,7 @@ pub async fn follow(
         // Checked before reading: the runner writes the exit code only after
         // tofu has written its last line, so this read sees everything.
         let finished = exit.exists();
-        let runner_gone =
-            !finished && read_pid(wd).is_some_and(|p| !pid_alive(p)) && !exit.exists();
+        let runner_gone = !finished && !lock_held(wd) && !exit.exists();
         let new = read_new(&log, offset)
             .map_err(|e| other(format!("Could not read the deploy log: {e}")))?;
         offset += new.len() as u64;
@@ -817,6 +963,10 @@ pub async fn follow(
 // ---------------------------------------------------------------------------
 // The runner (the app binary re-executed with `--tofu-runner`).
 
+/// Exit status of a runner that found another runner already holding the
+/// folder's lock. It writes nothing: the folder belongs to that run.
+const RUNNER_BUSY: i32 = 75;
+
 /// `main.rs` calls this first. `None` unless the arguments are
 /// `--tofu-runner <workdir> <apply|destroy>`; otherwise the runner's exit
 /// code, for the process to exit with.
@@ -835,56 +985,151 @@ pub fn runner_main(args: impl IntoIterator<Item = OsString>) -> Option<i32> {
     if !dir.is_dir() {
         return Some(2);
     }
+    // An empty path fails to spawn, which is logged and recorded (127).
+    let tofu = std::env::var_os(TOFU_BIN_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    let own: BTreeMap<String, String> = std::env::vars().collect();
+    let env = tofu_env(&own);
+    Some(run_runner(&dir, op, &tofu, &env).unwrap_or(RUNNER_BUSY))
+}
+
+/// The environment `tofu` gets: exactly the variables the app put in
+/// [`child_env`] (their names arrive in [`ENV_KEYS_VAR`]), with whatever an
+/// AppImage launcher did to them undone — its `AppRun` prepends the bundle's
+/// directories to `PATH` and adds `LD_LIBRARY_PATH`, `PYTHONPATH`, GTK and
+/// other variables before the runner's `main` runs. Names the app didn't
+/// pass are dropped; `PATH` is restored from the launcher's saved original
+/// or stripped of `$APPDIR` entries ([`crate::url_open`]'s rules).
+fn tofu_env(own: &BTreeMap<String, String>) -> Vec<(String, String)> {
+    let Some(names) = own.get(ENV_KEYS_VAR) else {
+        return Vec::new();
+    };
+    let changes =
+        crate::url_open::sanitize_child_env(own, own, own.get("APPDIR").map(String::as_str));
+    let mut seen = std::collections::BTreeSet::new();
+    let mut env = Vec::new();
+    for name in names
+        .split(',')
+        .filter(|n| !n.is_empty() && *n != ENV_KEYS_VAR && *n != TOFU_BIN_ENV)
+    {
+        if !seen.insert(name) {
+            continue;
+        }
+        let value = match changes.iter().find(|(k, _)| k == name) {
+            Some((_, changed)) => changed.clone(),
+            None => own.get(name).cloned(),
+        };
+        if let Some(value) = value {
+            env.push((name.to_string(), value));
+        }
+    }
+    env
+}
+
+/// The `tofu` process the runner is waiting on (0: none), for the SIGINT
+/// handler to forward Cancel to.
+static CHILD_PID: AtomicI32 = AtomicI32::new(0);
+/// Cancel arrived; nothing further is started.
+static CANCELLED: AtomicBool = AtomicBool::new(false);
+
+/// Forwards SIGINT to the running `tofu` (atomics and kill(2) are
+/// async-signal-safe). The runner itself carries on so it can record the
+/// exit code. A handler, not SIG_IGN, which `tofu` would inherit.
+#[cfg(unix)]
+extern "C" fn forward_sigint(_: libc::c_int) {
+    CANCELLED.store(true, Ordering::SeqCst);
+    let pid = CHILD_PID.load(Ordering::SeqCst);
+    if pid > 0 {
+        // SAFETY: kill(2) is async-signal-safe; pid > 0 never names a group.
+        unsafe {
+            libc::kill(pid, libc::SIGINT);
+        }
+    }
+}
+
+/// Take the folder's lock (a few tries: a liveness probe may hold it for a
+/// moment), write `apply.pid`, run the steps, write `apply.exit`. `None` if
+/// another runner holds the lock.
+fn run_runner(dir: &Path, op: TofuOp, tofu: &Path, env: &[(String, String)]) -> Option<i32> {
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(LOCK_FILE))
+        .ok()?;
+    let mut locked = false;
+    for _ in 0..50 {
+        if lock.try_lock().is_ok() {
+            locked = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if !locked {
+        return None;
+    }
+    let tmp = dir.join(format!("{PID_FILE}.tmp"));
+    let pid_written = fs::write(&tmp, std::process::id().to_string())
+        .and_then(|_| fs::rename(&tmp, dir.join(PID_FILE)));
+
+    CHILD_PID.store(0, Ordering::SeqCst);
+    CANCELLED.store(false, Ordering::SeqCst);
+    #[cfg(unix)]
+    // SAFETY: installs an async-signal-safe handler.
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            forward_sigint as extern "C" fn(libc::c_int) as libc::sighandler_t,
+        );
+    }
+
     let code = match OpenOptions::new()
         .create(true)
         .append(true)
         .open(dir.join(LOG_FILE))
     {
-        Ok(mut log) => run_steps(&dir, op, &mut log),
+        Ok(mut log) => {
+            if let Err(e) = &pid_written {
+                let _ = writeln!(
+                    log,
+                    "triple-c: could not record the runner's PID ({e}); Cancel won't reach it"
+                );
+            }
+            run_steps(dir, op, tofu, env, &mut log)
+        }
         Err(_) => 1,
     };
-    write_exit(&dir, code);
+    write_exit(dir, code);
+    drop(lock);
     Some(code)
 }
 
-#[cfg(unix)]
-extern "C" fn ignore_signal(_: libc::c_int) {}
-
-fn run_steps(dir: &Path, op: TofuOp, log: &mut File) -> i32 {
-    let Some(tofu) = std::env::var_os(TOFU_BIN_ENV) else {
-        let _ = writeln!(log, "triple-c: no OpenTofu binary was given to the runner");
-        return 1;
-    };
-    // Cancel signals the whole group. The runner must outlive it to record
-    // the exit code, so it catches SIGINT with a handler that does nothing.
-    // A handler, not SIG_IGN: an ignored disposition would be inherited
-    // through exec, and tofu would ignore the Cancel too.
-    #[cfg(unix)]
-    // SAFETY: installs an empty, async-signal-safe handler.
-    unsafe {
-        libc::signal(
-            libc::SIGINT,
-            ignore_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
-        );
-    }
+fn run_steps(dir: &Path, op: TofuOp, tofu: &Path, env: &[(String, String)], log: &mut File) -> i32 {
+    // `-json` on init too, so its errors (a missing bucket, access denied)
+    // arrive as diagnostics and become the outcome's summary.
     let init = [
         "init",
         "-input=false",
-        "-no-color",
+        "-json",
         "-backend-config=backend.hcl",
     ];
-    let code = step(Path::new(&tofu), dir, &init, log);
+    let code = step(tofu, dir, &init, env, log);
     if code != 0 {
         let _ = writeln!(log, "triple-c: tofu init failed (exit {code})");
         return code;
     }
+    if CANCELLED.load(Ordering::SeqCst) {
+        let _ = writeln!(log, "triple-c: cancelled before tofu {}", op.as_arg());
+        return 130;
+    }
     let run = [op.as_arg(), "-auto-approve", "-json", "-input=false"];
-    let code = step(Path::new(&tofu), dir, &run, log);
+    let code = step(tofu, dir, &run, env, log);
     let _ = writeln!(log, "triple-c: tofu {} finished (exit {code})", op.as_arg());
     code
 }
 
-fn step(tofu: &Path, dir: &Path, args: &[&str], log: &mut File) -> i32 {
+fn step(tofu: &Path, dir: &Path, args: &[&str], env: &[(String, String)], log: &mut File) -> i32 {
     let _ = writeln!(log, "triple-c: running tofu {}", args[0]);
     let (Ok(out), Ok(err)) = (log.try_clone(), log.try_clone()) else {
         return 1;
@@ -892,7 +1137,8 @@ fn step(tofu: &Path, dir: &Path, args: &[&str], log: &mut File) -> i32 {
     let mut cmd = Command::new(tofu);
     cmd.args(args)
         .current_dir(dir)
-        .env_remove(TOFU_BIN_ENV)
+        .env_clear()
+        .envs(env.iter().map(|(k, v)| (k, v)))
         .stdin(Stdio::null())
         .stdout(out)
         .stderr(err);
@@ -901,11 +1147,31 @@ fn step(tofu: &Path, dir: &Path, args: &[&str], log: &mut File) -> i32 {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    match cmd.status() {
-        Ok(status) => exit_code(status),
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
         Err(e) => {
             let _ = writeln!(log, "triple-c: could not start OpenTofu: {e}");
-            127
+            return 127;
+        }
+    };
+    CHILD_PID.store(i32::try_from(child.id()).unwrap_or(0), Ordering::SeqCst);
+    // A Cancel that landed between spawn and the store above.
+    #[cfg(unix)]
+    if CANCELLED.load(Ordering::SeqCst) {
+        if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+            // SAFETY: kill(2) on our own child.
+            unsafe {
+                libc::kill(pid, libc::SIGINT);
+            }
+        }
+    }
+    let status = child.wait();
+    CHILD_PID.store(0, Ordering::SeqCst);
+    match status {
+        Ok(status) => exit_code(status),
+        Err(e) => {
+            let _ = writeln!(log, "triple-c: lost track of OpenTofu: {e}");
+            1
         }
     }
 }
