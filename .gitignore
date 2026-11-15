@@ -20,3 +20,10 @@ screenshot_for_fix/
 
 # Windows CI code signing (scripts/windows-signing-setup.ps1)
 .code-signing/
+
+# OpenTofu working state (aws/terraform/*): providers, local state, locks.
+# The modules' .terraform.lock.hcl files are committed.
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.tfstate.lock.info

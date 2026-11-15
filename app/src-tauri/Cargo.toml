@@ -89,6 +89,8 @@ tempfile = "3"
 # Only `aws::live_tests` (ignored): it creates a throwaway environment key to
 # check that Secrets Manager and the permissions boundary see its tags.
 aws-sdk-kms = { version = "1.131.0", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
+# Only `aws::tofu_modules` tests: they parse the shipped OpenTofu modules.
+hcl-rs = "0.20"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
