@@ -1517,36 +1517,58 @@ pub async fn stop_project_container(
 
     state.projects_store.update_status(&project_id, ProjectStatus::Stopping)?;
 
-    // The stop guard's choice, before anything else is torn down: a push that
-    // fails aborts the stop with the project as it was (auth bridge included).
+    // AWS: the terminals and the auth bridge close *before* the stop guard's
+    // push, so nothing written after its snapshot is silently dropped (the
+    // entrypoint's hook skips its own push once `pushed` is recorded). A push
+    // that fails aborts the stop with the status as it was; the auth bridge
+    // is re-armed, and the error says the terminals were closed.
     let mut note = None;
     let guard_target = if project.is_aws() { ContainerTarget::for_project(&project) } else { None };
     if project.is_aws() {
-        if wip == Some(WipChoice::Push) {
-            emit_progress(&app_handle, &project_id, "Pushing unsaved work...");
-        }
-        note = aws_guard_before_stop(
+        let close_first = async {
+            state.auth_bridge.stop(&project_id).await;
+            if let Some(container) = guard_target.as_ref() {
+                state.exec_manager.close_sessions_for_container(container.id()).await;
+            }
+            if wip == Some(WipChoice::Push) {
+                emit_progress(&app_handle, &project_id, "Pushing unsaved work...");
+            }
+        };
+        let guarded = aws_guard_before_stop(
             &state.projects_store,
             &project_id,
             project.status.clone(),
             guard_target.as_ref(),
             wip,
             super::stop_guard::PUSH_TIMEOUT,
+            close_first,
         )
-        .await?;
+        .await;
+        match guarded {
+            Ok(n) => note = n,
+            Err(e) => {
+                if project.auth_bridge_enabled {
+                    if let Some(target) = guard_target.clone() {
+                        state
+                            .auth_bridge
+                            .start(project_id.clone(), target, app_handle.clone(), state.projects_store.clone())
+                            .await;
+                    }
+                }
+                return Err(e);
+            }
+        }
+    } else {
+        // Drop host listeners first: they only make sense while the container runs.
+        state.auth_bridge.stop(&project_id).await;
     }
-
-    // Drop host listeners first: they only make sense while the container runs.
-    state.auth_bridge.stop(&project_id).await;
 
     if project.is_aws() {
         // A failed StopTask leaves a billed task running, so unlike Docker it
         // is not papered over: the project keeps its status and the user
-        // sees why (expired SSO, typically), and can retry.
+        // sees why (expired SSO, typically), and can retry. Its terminals
+        // and auth bridge were closed before the stop guard's step above.
         emit_progress(&app_handle, &project_id, "Stopping task...");
-        if let Some(container) = ContainerTarget::for_project(&project) {
-            state.exec_manager.close_sessions_for_container(container.id()).await;
-        }
         let settings = state.settings_store.get();
         if let Err(e) = ProjectHost::for_project(&project).stop_project(&project, &settings).await {
             log::warn!("Stop failed for project {}: {}", project_id, e);
@@ -1578,22 +1600,36 @@ pub async fn stop_project_container(
     Ok(note)
 }
 
-/// The AWS stop guard's step before StopTask ([`super::stop_guard::prepare_stop`]).
-/// A failed push puts `previous` back, so the project is as it was.
-async fn aws_guard_before_stop<R: super::stop_guard::WipRunner>(
+/// Appended to a failed stop-guard push: its terminals were closed first.
+const TERMINALS_CLOSED_FOR_PUSH: &str =
+    "Its terminals were closed before the push, so nothing written after it could be lost; \
+     open them again to keep working.";
+
+/// The AWS stop guard's step before StopTask ([`super::stop_guard::prepare_stop`]),
+/// after `close_first` (the project's terminals and auth bridge): whatever
+/// they write after the push's snapshot would otherwise be lost, since the
+/// entrypoint's hook does not push again after `pushed`. A failed push puts
+/// `previous` back, so the project's status is as it was.
+async fn aws_guard_before_stop<R, F>(
     store: &crate::storage::projects_store::ProjectsStore,
     project_id: &str,
     previous: ProjectStatus,
     runner: Option<&R>,
     wip: Option<WipChoice>,
     push_timeout: std::time::Duration,
-) -> Result<Option<String>, String> {
+    close_first: F,
+) -> Result<Option<String>, String>
+where
+    R: super::stop_guard::WipRunner,
+    F: std::future::Future<Output = ()>,
+{
+    close_first.await;
     match super::stop_guard::prepare_stop(runner, wip, push_timeout).await {
         Ok(note) => Ok(note),
         Err(e) => {
             log::warn!("Project {}: WIP push before stop failed: {}", project_id, e);
             let _ = store.update_status(project_id, previous);
-            Err(e)
+            Err(format!("{e}\n\n{TERMINALS_CLOSED_FOR_PUSH}"))
         }
     }
 }
@@ -2715,10 +2751,11 @@ mod tests {
         let (_d, store, id) = stop_store(ProjectStatus::Running);
         store.update_status(&id, ProjectStatus::Stopping).unwrap();
         let fake = Fake::new(Ok(("push to origin failed: denied".into(), 1)));
-        let e = aws_guard_before_stop(&store, &id, ProjectStatus::Running, Some(&fake), Some(WipChoice::Push), std::time::Duration::from_secs(5))
+        let e = aws_guard_before_stop(&store, &id, ProjectStatus::Running, Some(&fake), Some(WipChoice::Push), std::time::Duration::from_secs(5), async {})
             .await
             .unwrap_err();
         assert!(e.contains("denied"), "{e}");
+        assert!(e.contains("terminals were closed"), "{e}");
         assert_eq!(store.get(&id).unwrap().status, ProjectStatus::Running);
         assert!(fake.markers.lock().unwrap().is_empty());
     }
@@ -2729,13 +2766,37 @@ mod tests {
         let (_d, store, id) = stop_store(ProjectStatus::Running);
         store.update_status(&id, ProjectStatus::Stopping).unwrap();
         let fake = Fake::new(Ok(("pushed".into(), 0)));
-        let note = aws_guard_before_stop(&store, &id, ProjectStatus::Running, Some(&fake), Some(WipChoice::Push), std::time::Duration::from_secs(5))
+        let note = aws_guard_before_stop(&store, &id, ProjectStatus::Running, Some(&fake), Some(WipChoice::Push), std::time::Duration::from_secs(5), async {})
             .await
             .unwrap();
         assert_eq!(note, None);
         assert_eq!(store.get(&id).unwrap().status, ProjectStatus::Stopping, "untouched: the stop goes on");
         assert_eq!(*fake.markers.lock().unwrap(), vec!["pushed".to_string()]);
         assert_eq!(fake.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_terminals_close_before_the_stop_guard_pushes_or_records_anything() {
+        use crate::commands::stop_guard::tests::Fake;
+        for wip in [Some(WipChoice::Push), Some(WipChoice::Discard), None] {
+            let (_d, store, id) = stop_store(ProjectStatus::Running);
+            let fake = Fake::new(Ok(("pushed".into(), 0)));
+            let seen_at_close = std::sync::Mutex::new(None);
+            aws_guard_before_stop(&store, &id, ProjectStatus::Running, Some(&fake), wip, std::time::Duration::from_secs(5), async {
+                *seen_at_close.lock().unwrap() =
+                    Some((fake.calls.lock().unwrap().len(), fake.markers.lock().unwrap().len()));
+            })
+            .await
+            .unwrap();
+            assert_eq!(*seen_at_close.lock().unwrap(), Some((0, 0)), "{wip:?}: closed first");
+        }
+        // Stop's own code closes them through that step, not after it.
+        let src = include_str!("project_commands.rs");
+        let stop = &src[src.find("pub async fn stop_project_container").unwrap()..];
+        let stop = &stop[..stop.find("\n}\n").unwrap()];
+        let close = stop.find("close_sessions_for_container").unwrap();
+        assert!(close < stop.find("aws_guard_before_stop(").unwrap());
+        assert!(stop.find("auth_bridge.stop").unwrap() < stop.find("aws_guard_before_stop(").unwrap());
     }
 
     #[test]

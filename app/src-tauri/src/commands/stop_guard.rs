@@ -19,6 +19,10 @@ pub const DRY_RUN_TIMEOUT: Duration = Duration::from_secs(30);
 pub const PUSH_TIMEOUT: Duration = Duration::from_secs(300);
 /// Cap on the push output carried into an error.
 const MAX_OUTPUT: usize = 4000;
+/// How much sooner than the client's timeout the in-container `timeout`
+/// ends the script (its TERM, then 5 s to the KILL): an exec the client gives
+/// up on is not killed by the agent, so the container bounds it itself.
+const IN_CONTAINER_MARGIN: Duration = Duration::from_secs(10);
 
 /// Where the entrypoint's stop hook looks for the app's decision (Task 7's
 /// file, which the idle watcher also writes `idle` to).
@@ -30,8 +34,13 @@ pub const MARKER_DISCARD: &str = "discard";
 
 /// The workspace, as the stop guard uses it.
 pub trait WipRunner: Sync {
-    /// Run the WIP script as `claude`: `(combined output, exit code)`.
-    fn run(&self, args: Vec<String>) -> impl Future<Output = Result<(String, i64), String>> + Send;
+    /// Run the WIP script as `claude`: `(combined output, exit code)`. The
+    /// caller waits at most `limit`; the run must not outlive it.
+    fn run(
+        &self,
+        args: Vec<String>,
+        limit: Duration,
+    ) -> impl Future<Output = Result<(String, i64), String>> + Send;
     /// Record `marker` in [`STOP_REASON_FILE`] (as root: the directory is root's).
     fn write_stop_reason(&self, marker: &str) -> impl Future<Output = Result<(), String>> + Send;
     /// Remove [`STOP_REASON_FILE`] (as root), so the hook pushes as configured again.
@@ -39,10 +48,8 @@ pub trait WipRunner: Sync {
 }
 
 impl WipRunner for ContainerTarget {
-    async fn run(&self, args: Vec<String>) -> Result<(String, i64), String> {
-        let mut cmd = vec![WIP_PUSH.to_string()];
-        cmd.extend(args);
-        self.exec_oneshot_as("claude", cmd, Vec::new()).await
+    async fn run(&self, args: Vec<String>, limit: Duration) -> Result<(String, i64), String> {
+        self.exec_oneshot_as("claude", wip_command(args, limit), Vec::new()).await
     }
 
     async fn write_stop_reason(&self, marker: &str) -> Result<(), String> {
@@ -66,6 +73,22 @@ impl WipRunner for ContainerTarget {
             Err(format!("exit {code}: {}", cap(&out)))
         }
     }
+}
+
+/// The script's argv under coreutils `timeout`, ending it
+/// [`IN_CONTAINER_MARGIN`] before the client's `limit` (KILL 5 s after the
+/// TERM), so a push the app gave up on is not left running in the workspace.
+pub fn wip_command(args: Vec<String>, limit: Duration) -> Vec<String> {
+    let secs = limit.saturating_sub(IN_CONTAINER_MARGIN).as_secs().max(1);
+    let mut cmd = vec![
+        "/usr/bin/timeout".to_string(),
+        "-k".to_string(),
+        "5".to_string(),
+        secs.to_string(),
+        WIP_PUSH.to_string(),
+    ];
+    cmd.extend(args);
+    cmd
 }
 
 /// The root command that forgets a recorded marker (a fixed argv).
@@ -132,7 +155,7 @@ pub async fn unsaved_work<R: WipRunner>(runner: Option<&R>, timeout: Duration) -
                 .into(),
         );
     };
-    let res = tokio::time::timeout(timeout, runner.run(vec!["--dry-run".into()])).await;
+    let res = tokio::time::timeout(timeout, runner.run(vec!["--dry-run".into()], timeout)).await;
     match res {
         Err(_) => unchecked("The workspace did not answer the check for unsaved work in time.".into()),
         Ok(Err(e)) => unchecked(format!("The workspace could not be asked about unsaved work: {e}")),
@@ -175,7 +198,8 @@ pub async fn before_stop<R: WipRunner>(
          workspace was not stopped."
             .to_string()
     })?;
-    let res = tokio::time::timeout(timeout, runner.run(vec!["--reason".into(), "stop".into()])).await;
+    let res =
+        tokio::time::timeout(timeout, runner.run(vec!["--reason".into(), "stop".into()], timeout)).await;
     match res {
         Err(_) => Err("Pushing unsaved work did not finish in time. The workspace was not stopped.".into()),
         Ok(Err(e)) => Err(format!("Could not push unsaved work: {e}. The workspace was not stopped.")),
@@ -252,7 +276,7 @@ pub(crate) mod tests {
     }
 
     impl WipRunner for Fake {
-        async fn run(&self, args: Vec<String>) -> Result<(String, i64), String> {
+        async fn run(&self, args: Vec<String>, _limit: Duration) -> Result<(String, i64), String> {
             self.calls.lock().unwrap().push(args);
             if self.hang {
                 std::future::pending::<()>().await;
@@ -344,6 +368,28 @@ pub(crate) mod tests {
         before_stop(Some(&fake), None, T).await.unwrap();
         before_stop::<Fake>(None, None, T).await.unwrap();
         assert!(fake.calls().is_empty());
+    }
+
+    #[test]
+    fn the_script_is_bounded_inside_the_workspace_before_the_client_gives_up() {
+        let cmd = wip_command(vec!["--reason".into(), "stop".into()], PUSH_TIMEOUT);
+        assert_eq!(cmd, vec!["/usr/bin/timeout", "-k", "5", "290", WIP_PUSH, "--reason", "stop"]);
+        let secs: u64 = cmd[3].parse().unwrap();
+        assert!(secs + 5 < PUSH_TIMEOUT.as_secs(), "TERM and KILL land before the client's timeout");
+        let dry = wip_command(vec!["--dry-run".into()], DRY_RUN_TIMEOUT);
+        assert_eq!(&dry[3..], &["20", WIP_PUSH, "--dry-run"]);
+        assert_eq!(wip_command(Vec::new(), Duration::from_secs(3))[3], "1", "never 0 (no limit)");
+        // The image has coreutils' timeout where the argv says.
+        let df = include_str!("../../../../container/Dockerfile");
+        assert!(df.contains("ubuntu:24.04") || df.contains("ubuntu:noble"), "coreutils at /usr/bin");
+    }
+
+    #[test]
+    fn a_cloning_repo_parses_with_its_flag_and_older_lines_without_it() {
+        let out = "{\"folder\":\"half\",\"dirty\":false,\"unpushed\":0,\"branch\":\"\",\"cloning\":true}\n\
+                   {\"folder\":\"a\",\"dirty\":true,\"unpushed\":0,\"branch\":\"main\"}";
+        let repos = parse_dry_run(out).unwrap();
+        assert!(repos[0].cloning && !repos[1].cloning);
     }
 
     #[test]
