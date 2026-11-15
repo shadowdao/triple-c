@@ -2326,8 +2326,29 @@ mod environment {
                 let (check, _) = sh(&target2, "root", "TRIPLEC_IDLE_STOP_MINUTES=5 /usr/local/bin/triple-c-idle-watch --check; echo idle-check=$?").await;
                 eprintln!("RESULT idle --check right after use: {}", check.trim());
 
-                // Leave it alone: close the tunnel and watch ECS.
-                tunnels::close(&id).await;
+                // Leave it alone, the way a user does (R11): a terminal tab stays
+                // open but silent (an attach held through the tunnel), and the
+                // auth bridge's background poll keeps running every 2 s. Neither
+                // may keep the workspace up.
+                let held = target2
+                    .attach(crate::host::ExecSpec::new(vec!["cat".into()]).tty(true))
+                    .await
+                    .expect("hold a terminal open");
+                let poller = {
+                    let t = target2.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            let _ = t
+                                .exec_oneshot_background(
+                                    "claude",
+                                    vec!["/usr/bin/cat".into(), "/proc/net/tcp".into()],
+                                    crate::host::PROC_NET_OUTPUT_LIMIT,
+                                )
+                                .await;
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                        }
+                    })
+                };
                 let idle_from = std::time::Instant::now();
                 let stopped2 = poll(Duration::from_secs(15 * 60), Duration::from_secs(20), || async {
                     let d = api.describe(&env.cluster_arn, std::slice::from_ref(&task2)).await.ok()?;
@@ -2335,18 +2356,30 @@ mod environment {
                     (t.desired_status == "STOPPED" || t.last_status == "STOPPED").then_some(t)
                 })
                 .await
-                .expect("the idle task did not stop by itself within 15 minutes");
+                .expect("the idle task did not stop by itself within 15 minutes (open tab + background poll)");
+                poller.abort();
+                drop(held);
+                tunnels::close(&id).await;
                 eprintln!(
                     "RESULT idle stop: desired STOPPED {:?} after the last use; code {:?}, reason {:?}",
                     idle_from.elapsed(),
                     stopped2.stop_code,
                     stopped2.stopped_reason
                 );
-                poll(Duration::from_secs(240), Duration::from_secs(10), || async {
+                let final2 = poll(Duration::from_secs(240), Duration::from_secs(10), || async {
                     let d = api.describe(&env.cluster_arn, std::slice::from_ref(&task2)).await.ok()?;
-                    (d.first()?.last_status == "STOPPED").then_some(())
+                    let t = d.into_iter().next()?;
+                    (t.last_status == "STOPPED").then_some(t)
                 })
-                .await;
+                .await
+                .expect("task 2 never reached STOPPED");
+                eprintln!(
+                    "RESULT idle stop as ECS reports it: code {:?}, exit {:?}, kind {:?}",
+                    final2.stop_code,
+                    final2.exit_code,
+                    crate::aws::tasks::classify_stop(&final2)
+                );
+                assert_eq!(crate::aws::tasks::classify_stop(&final2), crate::aws::tasks::StopKind::Idle);
                 tokio::time::sleep(Duration::from_secs(15)).await;
                 let log2 = api.log_tail(&env.log_group, &task_log_stream(&stream_prefix, &task2), 60).await.unwrap();
                 let tail2: Vec<&String> = log2.iter().filter(|l| l.contains("stopping") || l.contains("idle")).collect();
