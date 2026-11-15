@@ -143,11 +143,11 @@ async fn unless_cancelled<T>(
 /// (see [`STABLE_AFTER`]).
 async fn watch_once(
     store: &ProjectsStore,
+    source: &ExitSource,
     cancel: &mut watch::Receiver<bool>,
     sweep_reason: ExitReason,
     on_change: &impl Fn(&Project, ExitReason),
 ) -> Option<bool> {
-    let source = ExitSource::Docker;
     if !unless_cancelled(cancel, source.reachable()).await? {
         return Some(false);
     }
@@ -187,6 +187,7 @@ async fn watch_once(
 /// test can drive it without a Tauri app.
 pub(crate) async fn run(
     store: Arc<ProjectsStore>,
+    source: ExitSource,
     mut cancel: watch::Receiver<bool>,
     on_change: impl Fn(&Project, ExitReason),
 ) {
@@ -197,7 +198,7 @@ pub(crate) async fn run(
     let mut sweep_reason = ExitReason::FoundStopped;
     let mut failures: u32 = 0;
     loop {
-        let Some(healthy) = watch_once(&store, &mut cancel, sweep_reason, &on_change).await else {
+        let Some(healthy) = watch_once(&store, &source, &mut cancel, sweep_reason, &on_change).await else {
             return;
         };
         sweep_reason = ExitReason::Exited;
@@ -209,14 +210,16 @@ pub(crate) async fn run(
     }
 }
 
-/// Start the watcher for the life of the app.
+/// Start a watcher on `source` for the life of the app. One per host kind:
+/// Docker's event stream, and (Task 6) the AWS task poll.
 pub fn spawn(
     app: AppHandle,
     store: Arc<ProjectsStore>,
+    source: ExitSource,
     cancel: watch::Receiver<bool>,
 ) -> tauri::async_runtime::JoinHandle<()> {
     tauri::async_runtime::spawn(async move {
-        run(store, cancel, |p, reason| {
+        run(store, source, cancel, |p, reason| {
             log::warn!(
                 "Project '{}' ({}): its container stopped without the app asking ({:?}) — marking Stopped",
                 p.name,
@@ -270,6 +273,48 @@ mod tests {
         assert_eq!(unless_cancelled(&mut rx, async { 1 }).await, None);
     }
 
+    /// The AWS source drives the same loop: it is "reachable" without a
+    /// ping, polls its lookup every interval, and gives way to cancellation.
+    /// No project is Running, so nothing is confirmed (and nothing reaches
+    /// Docker or AWS).
+    #[tokio::test(start_paused = true)]
+    async fn an_aws_source_polls_its_lookup_until_cancelled() {
+        use crate::host::watch::{AwsTaskLookup, AwsWatch, TaskGroup, WatchedTask};
+        use futures_util::future::BoxFuture;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Lookup(AtomicUsize);
+        impl AwsTaskLookup for Lookup {
+            fn running_tasks(&self) -> Vec<WatchedTask> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Vec::new()
+            }
+            fn stopped<'a>(
+                &'a self,
+                _: &'a TaskGroup,
+                _: &'a [String],
+            ) -> BoxFuture<'a, Result<Vec<String>, String>> {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("triple-c-watch-aws-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(ProjectsStore::over_file_for_test(dir.join("projects.json"), Vec::new()));
+        let lookup = Arc::new(Lookup(AtomicUsize::new(0)));
+        let source = ExitSource::Aws(AwsWatch::every(lookup.clone(), Duration::from_secs(15)));
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let watcher = tokio::spawn(run(store, source, cancel_rx, |_, _| panic!("nothing stopped")));
+        tokio::time::sleep(Duration::from_secs(46)).await;
+        assert_eq!(lookup.0.load(Ordering::SeqCst), 3);
+        let _ = cancel_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(1), watcher)
+            .await
+            .expect("stops at once")
+            .unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// End to end against a real daemon: a Running project whose container is
     /// killed from outside the app is flipped to Stopped and reported as a live
     /// exit; one found already stopped on the first look is reported as such;
@@ -302,7 +347,7 @@ mod tests {
 
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel::<(String, ExitReason)>();
-        let watcher = tokio::spawn(run(store.clone(), cancel_rx, move |p, why| {
+        let watcher = tokio::spawn(run(store.clone(), ExitSource::Docker, cancel_rx, move |p, why| {
             let _ = seen_tx.send((p.id.clone(), why));
         }));
         let first = tokio::time::timeout(Duration::from_secs(10), seen_rx.recv()).await;

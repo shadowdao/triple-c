@@ -329,6 +329,7 @@ pub fn run() {
             lifecycle_setup.track(container_watch::spawn(
                 app.handle().clone(),
                 projects_store_setup.clone(),
+                crate::host::watch::ExitSource::Docker,
                 lifecycle_setup.cancellation(),
             ));
 

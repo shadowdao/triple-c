@@ -198,6 +198,14 @@ pub fn log_stream_prefix(owner_key: &str, project_id: &str) -> String {
     format!("{owner_key}/{}", project_component(project_id))
 }
 
+/// The awslogs stream of a task's `workspace` container:
+/// `<prefix>/<container>/<task-id>`, the task id being the last segment of
+/// its ARN.
+pub fn task_log_stream(stream_prefix: &str, task_arn: &str) -> String {
+    let task_id = task_arn.rsplit('/').next().unwrap_or(task_arn);
+    format!("{stream_prefix}/workspace/{task_id}")
+}
+
 /// The `creation_token` of the user's file system (the onboarding module's
 /// `local.name`).
 pub fn user_file_system_token(env: &str, owner_key: &str) -> String {
