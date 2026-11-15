@@ -32,6 +32,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::watch;
 
+use crate::aws::tasks::StopKind;
 use crate::host::watch::ExitSource;
 use crate::host::ContainerTarget;
 use crate::models::{Project, ProjectStatus};
@@ -68,6 +69,32 @@ pub enum ExitReason {
 pub struct ContainerExited<'a> {
     pub project: &'a Project,
     pub reason: ExitReason,
+    /// AWS: why ECS says the task stopped (P8). `None` on Docker, or when
+    /// the watch has no reason on record.
+    pub stop: Option<StopNote>,
+}
+
+/// Why an AWS task stopped, for the UI's toast.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StopNote {
+    /// `spot`, `idle`, `failed` (the project goes to Error), `user` (someone
+    /// stopped it: no toast) or `exited` (on its own).
+    pub kind: &'static str,
+    /// ECS's stopped reason, or a fixed text.
+    pub message: Option<String>,
+}
+
+impl StopNote {
+    pub fn of(kind: &StopKind) -> StopNote {
+        let (kind, message) = match kind {
+            StopKind::Spot => ("spot", Some("Spot interruption".to_string())),
+            StopKind::Idle => ("idle", None),
+            StopKind::FailedToStart(r) => ("failed", Some(r.clone())),
+            StopKind::UserInitiated => ("user", None),
+            StopKind::Exited(r) => ("exited", r.clone()),
+        };
+        StopNote { kind, message }
+    }
 }
 
 fn project_busy(project_id: &str) -> bool {
@@ -227,6 +254,19 @@ pub fn spawn(
                 p.id,
                 reason
             );
+            // Why ECS stopped it, read before the tunnel (and with it the
+            // registry's record) goes.
+            let kind = p
+                .is_aws()
+                .then(|| p.container_id.as_deref().and_then(crate::host::tunnels::stop_kind))
+                .flatten();
+            let mut shown = p.clone();
+            // A task that never got going is an error, not a stop (P8).
+            if let Some(StopKind::FailedToStart(_)) = kind {
+                if store_for_aws.update_status(&p.id, ProjectStatus::Error).is_ok() {
+                    shown.status = ProjectStatus::Error;
+                }
+            }
             // An AWS task that stopped: its tunnel leads nowhere now, and its
             // task ARN is history (the data's access point stays).
             if p.is_aws() {
@@ -245,7 +285,11 @@ pub fn spawn(
                     });
                 }
             }
-            let _ = app.emit(CONTAINER_EXITED_EVENT, ContainerExited { project: p, reason });
+            if let Some(store_p) = store_for_aws.get(&p.id) {
+                shown = store_p;
+            }
+            let stop = kind.as_ref().map(StopNote::of);
+            let _ = app.emit(CONTAINER_EXITED_EVENT, ContainerExited { project: &shown, reason, stop });
         })
         .await;
     })
@@ -266,13 +310,36 @@ mod tests {
     #[test]
     fn the_event_says_why_so_the_ui_can_tell_news_from_housekeeping() {
         let p = Project::new("demo".to_string(), Vec::new());
-        let v = serde_json::to_value(ContainerExited { project: &p, reason: ExitReason::Exited }).unwrap();
+        let v = serde_json::to_value(ContainerExited { project: &p, reason: ExitReason::Exited, stop: None })
+            .unwrap();
         assert_eq!(v["reason"], "exited");
         assert_eq!(v["project"]["name"], "demo");
-        let v = serde_json::to_value(ContainerExited { project: &p, reason: ExitReason::FoundStopped })
-            .unwrap();
+        assert!(v["stop"].is_null());
+        let v = serde_json::to_value(ContainerExited {
+            project: &p,
+            reason: ExitReason::FoundStopped,
+            stop: Some(StopNote::of(&StopKind::Spot)),
+        })
+        .unwrap();
         assert_eq!(v["reason"], "found_stopped");
+        assert_eq!(v["stop"], serde_json::json!({ "kind": "spot", "message": "Spot interruption" }));
         assert_eq!(CONTAINER_EXITED_EVENT, "project-container-exited");
+    }
+
+    #[test]
+    fn every_stop_kind_has_a_note_for_the_ui() {
+        let cases = [
+            (StopKind::Spot, "spot", Some("Spot interruption")),
+            (StopKind::Idle, "idle", None),
+            (StopKind::FailedToStart("CannotPull".into()), "failed", Some("CannotPull")),
+            (StopKind::UserInitiated, "user", None),
+            (StopKind::Exited(Some("OOM".into())), "exited", Some("OOM")),
+            (StopKind::Exited(None), "exited", None),
+        ];
+        for (k, kind, message) in cases {
+            let n = StopNote::of(&k);
+            assert_eq!((n.kind, n.message.as_deref()), (kind, message), "{k:?}");
+        }
     }
 
     /// The shutdown path: a host call that never answers (a wedged daemon)

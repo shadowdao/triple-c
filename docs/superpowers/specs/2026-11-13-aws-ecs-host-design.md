@@ -349,7 +349,9 @@ updates use the existing "new image available" flow: the next start uses the new
   `git status --porcelain` and any unpushed commits in each repo. If anything would be lost, it
   offers: **Push to a `triple-c/wip/<date>` branch** (the preselected default), **Stop anyway**, or
   **Cancel**. The same check runs before idle auto-stop. If anything is dirty, idle auto-stop
-  pushes a WIP branch instead of throwing work away.
+  pushes a WIP branch instead of throwing work away, and stops only once that push succeeded (a
+  failed push keeps the workspace up and is retried, backing off). With the WIP push off, unsaved
+  work keeps the workspace up.
 - **Fargate task retirement and Spot interruption** send `SIGTERM` with a short deadline (2 minutes
   for Spot). The entrypoint's `SIGTERM` trap runs the same WIP push, best-effort, when the project
   has it enabled.
@@ -497,9 +499,12 @@ way.
   - user-initiated → Stopped.
 
   EventBridge → SQS for push notifications is a later improvement.
-- **Idle auto-stop** runs **inside** the task: the agent tracks activity (terminal I/O, agent
-  calls, running `claude` processes and scheduler jobs) and stops the task by exiting the
-  entrypoint. It doesn't depend on the app being open. Because a running scheduler job counts as
+- **Idle auto-stop** runs **inside** the task: the agent tracks activity (terminal I/O and agent
+  calls; an open but silent terminal or tunnel is not activity, and the app's background polls
+  are marked `X-Triple-C-Background` and never count — ruling R11), the watcher adds running
+  `claude` processes, scheduler jobs and unsaved git work, and stops the task by exiting the
+  entrypoint with status 75, which the app reads back from `DescribeTasks` to say "stopped after
+  being idle". It doesn't depend on the app being open. Because a running scheduler job counts as
   activity, scheduled tasks keep a workspace alive. The admin's maximum lifetime is a hard cap
   either way.
 - **Health:** the task definition carries an ECS container health check against the agent, run

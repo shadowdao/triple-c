@@ -698,20 +698,20 @@ fn is_idle(args: &[&str]) -> bool {
 
 #[test]
 fn is_idle_needs_every_condition() {
-    // now last execs tunnels claude_running jobs_running minutes
-    assert!(is_idle(&["10000", "9400", "0", "0", "0", "0", "10"]), "exactly N minutes");
-    assert!(is_idle(&["10000", "1000", "0", "0", "0", "0", "10"]));
-    assert!(!is_idle(&["10000", "9401", "0", "0", "0", "0", "10"]), "one second short");
-    assert!(!is_idle(&["10000", "1000", "1", "0", "0", "0", "10"]), "an exec is open");
-    assert!(!is_idle(&["10000", "1000", "0", "2", "0", "0", "10"]), "a tunnel is open");
-    assert!(!is_idle(&["10000", "1000", "0", "0", "1", "0", "10"]), "claude is running");
-    assert!(!is_idle(&["10000", "1000", "0", "0", "0", "1", "10"]), "a scheduler job runs");
+    // now, last activity, claude running, jobs running, minutes.
+    assert!(is_idle(&["10000", "9400", "0", "0", "10"]), "exactly N minutes");
+    assert!(is_idle(&["10000", "1000", "0", "0", "10"]));
+    assert!(!is_idle(&["10000", "9401", "0", "0", "10"]), "one second short");
+    assert!(!is_idle(&["10000", "1000", "1", "0", "10"]), "claude is running");
+    assert!(!is_idle(&["10000", "1000", "0", "1", "10"]), "a scheduler job runs");
     // Anything unreadable is "not idle".
-    assert!(!is_idle(&["10000", "", "0", "0", "0", "0", "10"]));
-    assert!(!is_idle(&["10000", "x", "0", "0", "0", "0", "10"]));
-    assert!(!is_idle(&["10000", "1000", "", "0", "0", "0", "10"]));
-    assert!(!is_idle(&["10000", "1000", "0", "0", "0", "0", "0"]), "0 minutes is off");
-    assert!(!is_idle(&["10000", "1000", "0", "0", "0", "0", ""]));
+    assert!(!is_idle(&["10000", "", "0", "0", "10"]));
+    assert!(!is_idle(&["10000", "x", "0", "0", "10"]));
+    assert!(!is_idle(&["10000", "1000", "", "0", "10"]));
+    assert!(!is_idle(&["10000", "1000", "0", "0", "0"]), "0 minutes is off");
+    assert!(!is_idle(&["10000", "1000", "0", "0", ""]));
+    // The old arity (with exec/tunnel counters) is refused, not misread.
+    assert!(!is_idle(&["10000", "1000", "0", "0", "0", "0", "10"]));
 }
 
 struct Watch {
@@ -723,6 +723,18 @@ impl Watch {
         let tmp = tempfile::tempdir().unwrap();
         write_script(tmp.path(), "triple-c-idle-watch", IDLE_WATCH);
         write_script(tmp.path(), "triple-c-scheduler", SCHEDULER);
+        // A stand-in WIP push: `--dry-run` prints the file `dry` (nothing:
+        // clean repos), a push records its arguments in `pushes` and exits
+        // with the number in `push_rc` (0 when absent).
+        let d = tmp.path().display();
+        write_script(
+            tmp.path(),
+            "triple-c-wip-push",
+            &format!(
+                "#!/bin/bash\nif [ \"$1\" = --dry-run ]; then cat '{d}/dry' 2>/dev/null; exit 0; fi\n\
+                 echo \"$*\" >> '{d}/pushes'\nexit \"$(cat '{d}/push_rc' 2>/dev/null || echo 0)\"\n"
+            ),
+        );
         fs::write(tmp.path().join("token"), "test-token-not-real").unwrap();
         fs::create_dir_all(tmp.path().join("home")).unwrap();
         Watch { tmp }
@@ -743,10 +755,56 @@ impl Watch {
             .env("TRIPLEC_STOP_REASON_FILE", p.join("reason"))
             .env("TRIPLEC_SCHEDULER_BIN", p.join("triple-c-scheduler"))
             .env("TRIPLEC_SCHEDULER_USER", "")
+            .env("TRIPLEC_WIP_PUSH_BIN", p.join("triple-c-wip-push"))
             // The test host may well be running a `claude` of its own.
             .env("TRIPLEC_IDLE_PROC_NAME", "triple-c-no-such-process");
         c
     }
+
+    fn dirty(&self) {
+        fs::write(
+            self.tmp.path().join("dry"),
+            "{\"folder\":\"api\",\"dirty\":true,\"unpushed\":0,\"branch\":\"main\"}\n\
+             {\"folder\":\"web\",\"dirty\":false,\"unpushed\":0,\"branch\":\"main\"}\n",
+        )
+        .unwrap();
+    }
+
+    fn pushes(&self) -> String {
+        fs::read_to_string(self.tmp.path().join("pushes")).unwrap_or_default()
+    }
+}
+
+/// Stands in for the entrypoint: records the TERM it gets in `got`.
+fn fake_entrypoint(dir: &Path) -> std::process::Child {
+    Command::new("bash")
+        .arg("-c")
+        .arg("trap 'echo term > \"$1\"; exit 0' TERM; while :; do sleep 0.1; done")
+        .arg("t")
+        .arg(dir.join("got"))
+        .spawn()
+        .unwrap()
+}
+
+/// Run the watcher loop for at most `secs`; `None` when it was still running
+/// (it had not signalled) and was killed. Never hangs a test run.
+fn run_watch_for(mut cmd: Command, secs: u64) -> Option<Output> {
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    while std::time::Instant::now() < deadline {
+        if child.try_wait().unwrap().is_some() {
+            return Some(child.wait_with_output().unwrap());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    child.kill().ok();
+    let out = child.wait_with_output().unwrap();
+    eprintln!("watcher (killed): {}", text(&out));
+    None
 }
 
 /// A one-shot fake agent: answers `/v1/activity` with `body` when the bearer
@@ -782,10 +840,12 @@ s.serve_forever()
     (format!("http://127.0.0.1:{}", line.trim()), child)
 }
 
+const OLD_ACTIVITY: &str = r#"{"last_activity_unix":1,"active_execs":0,"active_tunnels":0}"#;
+
 #[test]
 fn idle_watch_check_counts_an_unfinished_clone_as_busy() {
     let w = Watch::new();
-    let (url, mut agent) = fake_agent(w.tmp.path(), r#"{"last_activity_unix":1,"active_execs":0,"active_tunnels":0}"#);
+    let (url, mut agent) = fake_agent(w.tmp.path(), OLD_ACTIVITY);
     let clone = w.tmp.path().join("clone");
     fs::create_dir_all(&clone).unwrap();
     let busy = w.cmd(&url, 0).env("TRIPLEC_CLONE_STATUS_DIR", &clone).arg("--check").output().unwrap();
@@ -806,38 +866,113 @@ fn idle_watch_check_treats_an_unreachable_agent_as_busy() {
 #[test]
 fn idle_watch_check_reads_activity_with_the_token() {
     let w = Watch::new();
-    let (url, mut agent) = fake_agent(w.tmp.path(), r#"{"last_activity_unix":1,"active_execs":0,"active_tunnels":0}"#);
+    let (url, mut agent) = fake_agent(w.tmp.path(), OLD_ACTIVITY);
     let idle = w.cmd(&url, 0).arg("--check").output().unwrap();
-    let (busy_url, mut busy_agent) =
-        fake_agent(w.tmp.path(), r#"{"last_activity_unix":1,"active_execs":1,"active_tunnels":0}"#);
+    let recent = format!(
+        r#"{{"last_activity_unix":{},"active_execs":0,"active_tunnels":0}}"#,
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+    );
+    let (busy_url, mut busy_agent) = fake_agent(w.tmp.path(), &recent);
     let busy = w.cmd(&busy_url, 0).arg("--check").output().unwrap();
     fs::write(w.tmp.path().join("token"), "wrong").unwrap();
     let unauth = w.cmd(&url, 0).arg("--check").output().unwrap();
     agent.kill().ok();
     busy_agent.kill().ok();
     assert_eq!(idle.status.code(), Some(0), "{}", text(&idle));
-    assert_eq!(busy.status.code(), Some(1), "{}", text(&busy));
+    assert_eq!(busy.status.code(), Some(1), "recent activity: {}", text(&busy));
     assert_eq!(unauth.status.code(), Some(1), "a 401 is not idle: {}", text(&unauth));
+}
+
+#[test]
+fn idle_watch_ignores_open_but_silent_execs_and_tunnels() {
+    // R11: an open terminal tab (an attach) or a tunnel no longer keeps the
+    // workspace up; only their traffic moves the clock.
+    let w = Watch::new();
+    let (url, mut agent) =
+        fake_agent(w.tmp.path(), r#"{"last_activity_unix":1,"active_execs":3,"active_tunnels":2}"#);
+    let out = w.cmd(&url, 0).arg("--check").output().unwrap();
+    agent.kill().ok();
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+}
+
+#[test]
+fn idle_watch_check_with_unsaved_work_depends_on_the_wip_push() {
+    let w = Watch::new();
+    w.dirty();
+    let (url, mut agent) = fake_agent(w.tmp.path(), OLD_ACTIVITY);
+    let off = w.cmd(&url, 0).env("TRIPLEC_WIP_PUSH", "0").arg("--check").output().unwrap();
+    let on = w.cmd(&url, 0).env("TRIPLEC_WIP_PUSH", "1").arg("--check").output().unwrap();
+    // A dry run that fails is a doubt: not idle.
+    write_script(w.tmp.path(), "triple-c-wip-push", "#!/bin/bash\nexit 1\n");
+    let unknown = w.cmd(&url, 0).env("TRIPLEC_WIP_PUSH", "1").arg("--check").output().unwrap();
+    agent.kill().ok();
+    assert_eq!(off.status.code(), Some(1), "unsaved work, WIP push off: {}", text(&off));
+    assert_eq!(on.status.code(), Some(0), "the WIP push would take it: {}", text(&on));
+    assert_eq!(unknown.status.code(), Some(1), "{}", text(&unknown));
+    assert_eq!(w.pushes(), "", "--check never pushes");
 }
 
 #[test]
 fn idle_watch_signals_the_entrypoint_with_reason_idle() {
     let w = Watch::new();
-    let (url, mut agent) = fake_agent(w.tmp.path(), r#"{"last_activity_unix":1,"active_execs":0,"active_tunnels":0}"#);
-    // Stands in for the entrypoint: records the TERM it gets.
-    let target = Command::new("bash")
-        .arg("-c")
-        .arg("trap 'echo term > \"$1\"; exit 0' TERM; while :; do sleep 0.1; done")
-        .arg("t")
-        .arg(w.tmp.path().join("got"))
-        .spawn()
-        .unwrap();
-    let mut target = target;
-    let out = w.cmd(&url, target.id()).output().unwrap();
+    let (url, mut agent) = fake_agent(w.tmp.path(), OLD_ACTIVITY);
+    let mut target = fake_entrypoint(w.tmp.path());
+    let out = run_watch_for(w.cmd(&url, target.id()), 20).expect("it signals");
     let status = target.wait().unwrap();
     agent.kill().ok();
     assert!(out.status.success(), "{}", text(&out));
     assert!(status.success());
+    assert_eq!(fs::read_to_string(w.tmp.path().join("got")).unwrap().trim(), "term");
+    assert_eq!(fs::read_to_string(w.tmp.path().join("reason")).unwrap().trim(), "idle");
+    assert_eq!(w.pushes(), "", "nothing unsaved, nothing pushed");
+}
+
+#[test]
+fn idle_watch_with_unsaved_work_and_the_wip_push_off_stays_up() {
+    let w = Watch::new();
+    w.dirty();
+    let (url, mut agent) = fake_agent(w.tmp.path(), OLD_ACTIVITY);
+    let mut target = fake_entrypoint(w.tmp.path());
+    let mut cmd = w.cmd(&url, target.id());
+    cmd.env("TRIPLEC_WIP_PUSH", "0");
+    let ran = run_watch_for(cmd, 4);
+    target.kill().ok();
+    target.wait().ok();
+    agent.kill().ok();
+    assert!(ran.is_none(), "it must not stop: {:?}", ran.map(|o| text(&o)));
+    assert!(!w.tmp.path().join("got").exists(), "no TERM");
+    assert!(!w.tmp.path().join("reason").exists(), "no marker");
+    assert_eq!(w.pushes(), "");
+}
+
+#[test]
+fn idle_watch_pushes_before_an_idle_stop_and_stays_up_while_the_push_fails() {
+    // The push fails: the workspace stays up and retries, backing off.
+    let w = Watch::new();
+    w.dirty();
+    fs::write(w.tmp.path().join("push_rc"), "1").unwrap();
+    let (url, mut agent) = fake_agent(w.tmp.path(), OLD_ACTIVITY);
+    let mut target = fake_entrypoint(w.tmp.path());
+    let mut cmd = w.cmd(&url, target.id());
+    cmd.env("TRIPLEC_WIP_PUSH", "1").env("TRIPLEC_WIP_BACKOFF_MAX", "2");
+    let ran = run_watch_for(cmd, 6);
+    assert!(ran.is_none(), "a failed push must not stop the workspace");
+    assert!(!w.tmp.path().join("got").exists(), "no TERM");
+    assert!(!w.tmp.path().join("reason").exists(), "no marker");
+    let tries = w.pushes().lines().count();
+    assert!((1..=3).contains(&tries), "retried with a back-off, not every second: {tries}");
+    assert!(w.pushes().lines().all(|l| l == "--reason idle"), "{}", w.pushes());
+
+    // Now the push works: it pushes once, then signals with the idle marker.
+    fs::write(w.tmp.path().join("push_rc"), "0").unwrap();
+    fs::remove_file(w.tmp.path().join("pushes")).unwrap();
+    let mut cmd = w.cmd(&url, target.id());
+    cmd.env("TRIPLEC_WIP_PUSH", "1");
+    let out = run_watch_for(cmd, 20).expect("it stops once the push succeeded");
+    target.wait().unwrap();
+    agent.kill().ok();
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(w.pushes(), "--reason idle\n");
     assert_eq!(fs::read_to_string(w.tmp.path().join("got")).unwrap().trim(), "term");
     assert_eq!(fs::read_to_string(w.tmp.path().join("reason")).unwrap().trim(), "idle");
 }
@@ -847,13 +982,13 @@ fn idle_watch_keeps_a_stop_guard_marker_already_recorded() {
     for marker in ["pushed", "discard"] {
         let w = Watch::new();
         fs::write(w.tmp.path().join("reason"), format!("{marker}\n")).unwrap();
-        let (url, mut agent) = fake_agent(w.tmp.path(), r#"{"last_activity_unix":1,"active_execs":0,"active_tunnels":0}"#);
+        let (url, mut agent) = fake_agent(w.tmp.path(), OLD_ACTIVITY);
         let mut target = Command::new("bash")
             .arg("-c")
             .arg("trap 'exit 0' TERM; while :; do sleep 0.1; done")
             .spawn()
             .unwrap();
-        let out = w.cmd(&url, target.id()).output().unwrap();
+        let out = run_watch_for(w.cmd(&url, target.id()), 20).expect("it signals");
         target.wait().unwrap();
         agent.kill().ok();
         assert!(out.status.success(), "{}", text(&out));
@@ -864,7 +999,7 @@ fn idle_watch_keeps_a_stop_guard_marker_already_recorded() {
 // ------------------------------------------------------- stop (SIGTERM) path
 
 #[test]
-fn aws_stop_runs_the_wip_push_with_the_recorded_reason_once() {
+fn aws_stop_pushes_on_sigterm_once_and_leaves_an_idle_stop_to_the_watcher() {
     let tmp = tempfile::tempdir().unwrap();
     let log = tmp.path().join("calls");
     let fake = write_script(
@@ -882,13 +1017,18 @@ fn aws_stop_runs_the_wip_push_with_the_recorded_reason_once() {
     assert!(out.status.success(), "{}", text(&out));
     assert_eq!(fs::read_to_string(&log).unwrap(), "--reason sigterm\n");
 
+    // An idle stop: the watcher already pushed, so the trap does not, and it
+    // exits with the idle status the app reads from ECS.
     fs::remove_file(&log).unwrap();
     fs::write(&reason, "idle\n").unwrap();
-    let out = bash(&script, &[], &[("TRIPLEC_HOST", "aws"), ("TRIPLEC_WIP_PUSH", "1")], &[]);
+    let idle_script = format!("{blocks}\naws_before_stop\necho \"status=${{triplec_exit_status:-0}}\"\n");
+    let out = bash(&idle_script, &[], &[("TRIPLEC_HOST", "aws"), ("TRIPLEC_WIP_PUSH", "1")], &[]);
     assert!(out.status.success(), "{}", text(&out));
-    assert_eq!(fs::read_to_string(&log).unwrap(), "--reason idle\n");
+    assert!(!log.exists(), "no second push after the watcher's");
+    assert!(text(&out).contains("entrypoint: stopping (idle)"), "{}", text(&out));
+    assert!(text(&out).contains("status=75"), "{}", text(&out));
+    fs::remove_file(&reason).unwrap();
 
-    fs::remove_file(&log).unwrap();
     let out = bash(&script, &[], &[("TRIPLEC_HOST", "aws"), ("TRIPLEC_WIP_PUSH", "0")], &[]);
     assert!(out.status.success(), "{}", text(&out));
     assert!(!log.exists(), "WIP push off");
@@ -920,6 +1060,32 @@ fn aws_stop_skips_its_push_when_the_app_already_pushed_or_the_user_declined() {
     let out = bash(&script, &[], &[("TRIPLEC_HOST", "aws"), ("TRIPLEC_WIP_PUSH", "1")], &[]);
     assert!(out.status.success(), "{}", text(&out));
     assert_eq!(fs::read_to_string(&log).unwrap(), "--reason sigterm\n");
+}
+
+#[test]
+fn the_idle_exit_status_is_the_one_the_app_reads() {
+    assert!(
+        block(ENTRYPOINT, "aws_stop")
+            .contains(&format!("triplec_idle_exit={}\n", crate::aws::tasks::IDLE_EXIT_CODE)),
+        "entrypoint.sh and aws::tasks::IDLE_EXIT_CODE disagree"
+    );
+    assert!(ENTRYPOINT.contains("exit \"${triplec_exit_status:-0}\""), "stop_keepalive exits with it");
+    // The watcher gets the WIP setting through its scrubbed environment.
+    assert!(block(ENTRYPOINT, "aws_stop").contains("TRIPLEC_WIP_PUSH=\"${TRIPLEC_WIP_PUSH:-0}\""));
+}
+
+#[test]
+fn start_clone_repos_marks_done_however_the_clone_ends() {
+    let tmp = tempfile::tempdir().unwrap();
+    let status = tmp.path().join("status");
+    // clone_repos replaced by one that fails half-way.
+    let script = format!(
+        "{}\nclone_repos() {{ exit 3; }}\nstart_clone_repos '[x]' \"$1\"\nwait\n",
+        aws_blocks(&["aws_env", "aws_repos"])
+    );
+    let out = bash(&script, &[&status], &[], &[]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(status.join("done").exists(), "a failed clone still ends: {}", text(&out));
 }
 
 #[test]

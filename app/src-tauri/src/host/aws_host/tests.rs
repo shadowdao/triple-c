@@ -57,6 +57,7 @@ fn task(p: &Project, id: &str, last: &str, ready: bool) -> TaskInfo {
         task_definition_arn: format!("arn:aws:ecs:{REGION}:{ACCOUNT}:task-definition/{}:1", family(p)),
         runtime_id: ready.then(|| "rt-1".into()),
         exec_agent_running: ready,
+        exit_code: None,
         owner: Some(USER.into()),
         project: Some(p.id.clone()),
     }
@@ -572,8 +573,9 @@ async fn the_watch_reports_a_running_aws_project_as_its_stored_target_and_confir
     assert_eq!(w.group.cluster_arn, cluster_arn());
     assert_eq!(w.group.connection_id, "c1");
     assert!(!w.target.has_exited().await, "nothing recorded yet");
-    record_stopped(std::slice::from_ref(&p), &[task_arn("w1")]);
+    record_stopped(std::slice::from_ref(&p), &[(task_arn("w1"), StopKind::Idle)]);
     assert!(w.target.has_exited().await);
+    assert_eq!(crate::host::tunnels::stop_kind(w.target.id()), Some(StopKind::Idle));
 
     let mut stopped = p.clone();
     stopped.status = ProjectStatus::Stopped;

@@ -64,6 +64,8 @@ pub struct TaskInfo {
     pub runtime_id: Option<String>,
     /// The `workspace` container's ExecuteCommandAgent is RUNNING.
     pub exec_agent_running: bool,
+    /// The `workspace` container's exit code, once it has one.
+    pub exit_code: Option<i32>,
     /// Its `triple-c:owner` / `triple-c:project` tags (DescribeTasks with
     /// TAGS; RunTask's answer carries the tags it was given).
     pub owner: Option<String>,
@@ -116,6 +118,7 @@ pub(crate) fn task_info(t: &Task) -> TaskInfo {
                     && a.last_status() == Some("RUNNING")
             })
         }),
+        exit_code: workspace.and_then(|c| c.exit_code()),
         owner: tag_value(t.tags(), TAG_OWNER),
         project: tag_value(t.tags(), TAG_PROJECT),
     }
@@ -337,11 +340,6 @@ pub fn quota_or(e: AwsError) -> AwsError {
     }
 }
 
-#[allow(dead_code)] // for the UI's start errors (Task 8)
-pub fn is_quota_error(e: &AwsError) -> bool {
-    matches!(e, AwsError::QuotaExceeded { .. })
-}
-
 /// RunTask's answer: its one task, or an error from its `failures`
 /// (`(reason, detail)`), a quota one when they say so.
 pub fn run_task_outcome(
@@ -480,13 +478,19 @@ async fn stopped_error<A: TaskApi>(api: &A, logs: &TaskLogs, t: &TaskInfo) -> Aw
 
 // ----------------------------------------------------------- stop / watch
 
+/// The entrypoint's exit status after an idle stop (`container/entrypoint.sh`,
+/// `stop_keepalive`). A stop from ECS (SIGTERM) exits 0; this one is distinct
+/// so an idle stop (`EssentialContainerExited`) is not mistaken for a crash.
+pub const IDLE_EXIT_CODE: i32 = 75;
+
 /// Why a task stopped, as the app reports it (spec, "Lifecycle and status").
-#[allow(dead_code)] // the stop reasons the UI shows (Task 8)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StopKind {
-    /// Exited on its own (the essential container ended, idle stop, or AWS
-    /// retired it).
-    Exited,
+    /// Exited on its own (the essential container ended, or AWS retired it),
+    /// with ECS's stopped reason when it gave one.
+    Exited(Option<String>),
+    /// The workspace's own idle stop ([`IDLE_EXIT_CODE`]).
+    Idle,
     /// A Fargate Spot interruption (P8).
     Spot,
     /// Never got going: the project goes to Error with this reason.
@@ -495,7 +499,6 @@ pub enum StopKind {
     UserInitiated,
 }
 
-#[allow(dead_code)] // Task 8
 pub fn classify_stop(info: &TaskInfo) -> StopKind {
     match info.stop_code.as_deref() {
         Some("SpotInterruption") => StopKind::Spot,
@@ -506,25 +509,28 @@ pub fn classify_stop(info: &TaskInfo) -> StopKind {
                 .unwrap_or_else(|| "The task failed to start".into()),
         ),
         Some("UserInitiated") => StopKind::UserInitiated,
-        _ => StopKind::Exited,
+        Some("EssentialContainerExited") if info.exit_code == Some(IDLE_EXIT_CODE) => StopKind::Idle,
+        _ => StopKind::Exited(info.stopped_reason.clone().filter(|r| !r.trim().is_empty())),
     }
 }
 
 /// Of `arns`, the ones that are STOPPED or that ECS no longer knows (it
-/// forgets stopped tasks after about an hour). A task merely being stopped
-/// is not yet reported. For the AWS death watch.
+/// forgets stopped tasks after about an hour), each with why it stopped (a
+/// forgotten task: [`StopKind::Exited`] without a reason). A task merely
+/// being stopped is not yet reported. For the AWS death watch.
 pub async fn stopped_among<A: TaskApi>(
     api: &A,
     cluster: &str,
     arns: &[String],
-) -> Result<Vec<String>, AwsError> {
+) -> Result<Vec<(String, StopKind)>, AwsError> {
     let mut stopped = Vec::new();
     for chunk in arns.chunks(DESCRIBE_BATCH) {
         let known = api.describe(cluster, chunk).await?;
         for arn in chunk {
             match known.iter().find(|t| &t.arn == arn) {
                 Some(t) if t.last_status != "STOPPED" => {}
-                _ => stopped.push(arn.clone()),
+                Some(t) => stopped.push((arn.clone(), classify_stop(t))),
+                None => stopped.push((arn.clone(), StopKind::Exited(None))),
             }
         }
     }

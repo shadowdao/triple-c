@@ -35,7 +35,7 @@ use crate::aws::runtime::{
 };
 use crate::aws::tasks::{
     find_or_run, find_project_task, stopped_among, task_log_stream, wait_ready, SdkTaskApi,
-    TaskApi, TaskInfo, TaskLogs, WaitTiming, LOG_TAIL_LINES, STOP_REASON,
+    StopKind, TaskApi, TaskInfo, TaskLogs, WaitTiming, LOG_TAIL_LINES, STOP_REASON,
 };
 use crate::aws::tofu_modules::{
     environment_cluster_name, log_stream_prefix, owner_key, task_family,
@@ -75,6 +75,11 @@ const HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
 const HEALTH_INTERVAL: Duration = Duration::from_secs(1);
 /// How long a terminal waits for a background re-attach.
 pub const REATTACH_WAIT: Duration = Duration::from_secs(90);
+/// The most one AWS death-watch poll of a group may take.
+const WATCH_CALL_TIMEOUT: Duration = Duration::from_secs(60);
+/// The most a StopTask (credentials included) may take before the stop is
+/// reported as failed; the SDK's own bound is per call.
+const STOP_TIMEOUT: Duration = Duration::from_secs(45);
 
 fn s<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
@@ -730,7 +735,18 @@ pub async fn task_log(project: &Project, settings: &AppSettings, limit: i32) -> 
 pub async fn stop_task_arn<T: TaskApi>(api: &T, task_arn: &str) -> Result<(), String> {
     let cluster = cluster_of_task(task_arn)
         .ok_or_else(|| format!("{task_arn} is not a task ARN with a cluster"))?;
-    api.stop_task(cluster, task_arn, STOP_REASON).await.map_err(s)
+    bounded_stop(api.stop_task(cluster, task_arn, STOP_REASON)).await
+}
+
+/// A StopTask, bounded by [`STOP_TIMEOUT`]: a stop that cannot reach AWS
+/// fails (and the project keeps its task ARN) instead of hanging the UI.
+async fn bounded_stop(
+    call: impl std::future::Future<Output = Result<(), crate::aws::AwsError>>,
+) -> Result<(), String> {
+    tokio::time::timeout(STOP_TIMEOUT, call)
+        .await
+        .map_err(|_| format!("StopTask did not answer within {STOP_TIMEOUT:?}; try again"))?
+        .map_err(s)
 }
 
 /// `ProjectHost::stop` for an agent target: the task behind a registered
@@ -738,10 +754,7 @@ pub async fn stop_task_arn<T: TaskApi>(api: &T, task_arn: &str) -> Result<(), St
 pub async fn stop_endpoint(ep: &AgentEndpoint) -> Option<Result<(), String>> {
     let (_connection, _region, cluster, arn) = tunnels::task_of(ep)?;
     let (project_id, sdk) = tunnels::owner_of(ep)?;
-    let res = SdkTaskApi::new(&sdk)
-        .stop_task(&cluster, &arn, STOP_REASON)
-        .await
-        .map_err(s);
+    let res = bounded_stop(SdkTaskApi::new(&sdk).stop_task(&cluster, &arn, STOP_REASON)).await;
     if res.is_ok() {
         tunnels::close(&project_id).await;
     }
@@ -1089,22 +1102,29 @@ impl AwsTaskLookup for StoreTaskLookup {
         Box::pin(async move {
             let settings = self.settings.get();
             let conn = crate::commands::host_commands::aws_conn(&group.connection_id, &settings)?;
-            let sdk = sdk_config(&conn, &group.region).await.map_err(s)?;
-            let stopped = stopped_among(&SdkTaskApi::new(&sdk), &group.cluster_arn, arns)
-                .await
-                .map_err(s)?;
+            // The SDK bounds each call; this bounds the whole poll of a group
+            // (credentials included, which an SSO refresh can stall), so one
+            // stuck group never stalls the watch of every other.
+            let stopped = tokio::time::timeout(WATCH_CALL_TIMEOUT, async {
+                let sdk = sdk_config(&conn, &group.region).await.map_err(s)?;
+                stopped_among(&SdkTaskApi::new(&sdk), &group.cluster_arn, arns)
+                    .await
+                    .map_err(s)
+            })
+            .await
+            .map_err(|_| format!("ECS did not answer within {WATCH_CALL_TIMEOUT:?}"))??;
             record_stopped(&self.projects.list(), &stopped);
-            Ok(stopped)
+            Ok(stopped.into_iter().map(|(arn, _)| arn).collect())
         })
     }
 }
 
-/// Tell the registry which targets' tasks ECS reports stopped, so
-/// `has_exited` confirms them (R3).
-pub fn record_stopped(projects: &[Project], stopped: &[String]) {
+/// Tell the registry which targets' tasks ECS reports stopped, and why, so
+/// `has_exited` confirms them (R3) and the death report can say why (P8).
+pub fn record_stopped(projects: &[Project], stopped: &[(String, StopKind)]) {
     for w in projects.iter().filter_map(watched_task) {
-        if stopped.contains(&w.task_arn) {
-            tunnels::mark_stopped(w.target.id());
+        if let Some((_, why)) = stopped.iter().find(|(arn, _)| *arn == w.task_arn) {
+            tunnels::mark_stopped(w.target.id(), why.clone());
         }
     }
 }

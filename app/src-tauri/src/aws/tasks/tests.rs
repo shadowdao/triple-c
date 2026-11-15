@@ -44,6 +44,10 @@ fn env_info() -> EnvironmentInfo {
     }
 }
 
+fn is_quota_error(e: &AwsError) -> bool {
+    matches!(e, AwsError::QuotaExceeded { .. })
+}
+
 fn info(id: &str, last: &str) -> TaskInfo {
     TaskInfo {
         arn: task_arn(id),
@@ -60,6 +64,7 @@ fn info(id: &str, last: &str) -> TaskInfo {
         task_definition_arn: td_arn(3),
         runtime_id: None,
         exec_agent_running: false,
+        exit_code: None,
         owner: Some(USER.into()),
         project: Some(PROJECT_ID.into()),
     }
@@ -620,8 +625,14 @@ async fn stopped_among_reports_stopped_and_vanished_tasks_only() {
         task_arn("gone"),
     ];
     let mut got = stopped_among(&api, &cluster(), &arns).await.unwrap();
-    got.sort();
-    assert_eq!(got, [task_arn("down"), task_arn("gone")]);
+    got.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        got,
+        [
+            (task_arn("down"), StopKind::Exited(None)),
+            (task_arn("gone"), StopKind::Exited(None)),
+        ]
+    );
 }
 
 // ------------------------------------------------------------ classify
@@ -634,9 +645,17 @@ fn classify_stop_follows_the_spec_table() {
         ..info("t", "STOPPED")
     };
     assert_eq!(
-        classify_stop(&with(Some("EssentialContainerExited"), None)),
-        StopKind::Exited
+        classify_stop(&with(Some("EssentialContainerExited"), Some("Essential container in task exited"))),
+        StopKind::Exited(Some("Essential container in task exited".into()))
     );
+    // The entrypoint's idle stop exits with its own status.
+    let idle = TaskInfo { exit_code: Some(IDLE_EXIT_CODE), ..with(Some("EssentialContainerExited"), None) };
+    assert_eq!(classify_stop(&idle), StopKind::Idle);
+    let crashed = TaskInfo { exit_code: Some(137), ..with(Some("EssentialContainerExited"), None) };
+    assert_eq!(classify_stop(&crashed), StopKind::Exited(None));
+    // Only with that stop code: a user stop of a task that exits 75 is a user stop.
+    let user = TaskInfo { exit_code: Some(IDLE_EXIT_CODE), ..with(Some("UserInitiated"), None) };
+    assert_eq!(classify_stop(&user), StopKind::UserInitiated);
     assert_eq!(
         classify_stop(&with(Some("SpotInterruption"), None)),
         StopKind::Spot
@@ -658,13 +677,13 @@ fn classify_stop_follows_the_spec_table() {
     );
     assert_eq!(
         classify_stop(&with(Some("TerminationNotice"), None)),
-        StopKind::Exited
+        StopKind::Exited(None)
     );
     assert_eq!(
         classify_stop(&with(Some("ServiceSchedulerInitiated"), None)),
-        StopKind::Exited
+        StopKind::Exited(None)
     );
-    assert_eq!(classify_stop(&with(None, None)), StopKind::Exited);
+    assert_eq!(classify_stop(&with(None, Some("  "))), StopKind::Exited(None));
 }
 
 // ------------------------------------------------------------ SDK mapping
@@ -683,12 +702,14 @@ fn task_info_reads_the_workspace_container_and_its_exec_agent() {
             Container::builder()
                 .name("sidecar")
                 .runtime_id("wrong")
+                .exit_code(1)
                 .build(),
         )
         .containers(
             Container::builder()
                 .name("workspace")
                 .runtime_id("rt-1")
+                .exit_code(75)
                 .managed_agents(
                     ManagedAgent::builder()
                         .name(ManagedAgentName::ExecuteCommandAgent)
@@ -711,11 +732,13 @@ fn task_info_reads_the_workspace_container_and_its_exec_agent() {
     assert_eq!(i.stop_code.as_deref(), Some("SpotInterruption"));
     assert_eq!(i.runtime_id.as_deref(), Some("rt-1"));
     assert!(i.exec_agent_running);
+    assert_eq!(i.exit_code, Some(75), "the workspace container's, not the sidecar's");
     assert_eq!(i.owner.as_deref(), Some(USER));
     assert_eq!(i.project.as_deref(), Some(PROJECT_ID));
 
     let bare = task_info(&Task::builder().task_arn("x").last_status("PENDING").build());
     assert!(!bare.exec_agent_running);
     assert_eq!(bare.runtime_id, None);
+    assert_eq!(bare.exit_code, None);
     assert_eq!(bare.owner, None);
 }

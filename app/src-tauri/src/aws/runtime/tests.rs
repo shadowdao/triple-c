@@ -247,6 +247,7 @@ fn live(id: &str) -> TaskInfo {
         ),
         runtime_id: None,
         exec_agent_running: false,
+        exit_code: None,
         owner: Some(USER.into()),
         project: Some(PROJECT.into()),
     }

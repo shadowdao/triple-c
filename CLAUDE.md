@@ -399,6 +399,12 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   user's index is untouched; needs the task definition's `stopTimeout` raised, 120 s) unless the stop
   marker says the app handled it. The idle watcher runs as root under a supervisor and signals the
   entrypoint's own PID (not PID 1, which is docker-init), so idle and ECS stops share one trap.
+  Idle = the agent's `last_activity_unix` older than N minutes (open-but-silent attaches/tunnels
+  don't count; requests with `X-Triple-C-Background: 1`, e.g. the auth bridge's poll, never do),
+  no `claude`, no scheduler job, no running clone, and no unsaved git work: with the WIP push on the
+  watcher pushes *before* signalling and stays up if that fails; with it off, dirty repos keep the
+  workspace up. An idle stop exits 75 (`aws::tasks::IDLE_EXIT_CODE`) so the death watch can tell it
+  from a crash (`classify_stop` → the `ContainerExited` toast).
   **The `TRIPLEC_` env prefix is reserved** on both hosts (`RESERVED_ENV_PREFIXES`; `workspace.rs`
   drops custom variables in it): the entrypoint's settings live there.
 - **Browser runtime libraries are baked in; browser *binaries* are not.** A layer runs

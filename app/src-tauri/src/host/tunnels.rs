@@ -20,6 +20,7 @@ use futures_util::future::BoxFuture;
 use tokio::sync::watch;
 
 use super::agent::AgentEndpoint;
+use crate::aws::tasks::StopKind;
 use super::ssm::{EcsTask, PortForward};
 
 /// Something that owns a tunnel's resources: the real [`PortForward`], or a
@@ -58,8 +59,9 @@ pub type TaskOf = (String, String, String, String);
 #[derive(Default)]
 struct Registry {
     live: HashMap<String, LiveTunnel>,
-    /// Target ids (endpoint base URLs) whose task the AWS watch saw STOPPED.
-    stopped: HashSet<String>,
+    /// Target ids (endpoint base URLs) whose task the AWS watch saw STOPPED,
+    /// and why.
+    stopped: HashMap<String, StopKind>,
     /// Projects whose tunnel is being re-opened in the background.
     pending: HashSet<String>,
     /// Bumped by every [`close`] (a stop or remove), every [`register`] (a
@@ -245,14 +247,19 @@ pub async fn close_all() {
     futures_util::future::join_all(all.into_iter().map(|t| t.forward.close())).await;
 }
 
-/// The AWS watch saw the task behind target `target_id` STOPPED.
-pub fn mark_stopped(target_id: &str) {
-    lock().stopped.insert(target_id.to_string());
+/// The AWS watch saw the task behind target `target_id` STOPPED, for `why`.
+pub fn mark_stopped(target_id: &str, why: StopKind) {
+    lock().stopped.insert(target_id.to_string(), why);
 }
 
 /// Whether the AWS watch has confirmed the task behind `target_id` stopped.
 pub fn is_stopped(target_id: &str) -> bool {
-    lock().stopped.contains(target_id)
+    lock().stopped.contains_key(target_id)
+}
+
+/// Why the task behind `target_id` stopped, once the watch has seen it.
+pub fn stop_kind(target_id: &str) -> Option<StopKind> {
+    lock().stopped.get(target_id).cloned()
 }
 
 pub fn is_pending(project_id: &str) -> bool {
@@ -341,7 +348,8 @@ pub(crate) mod tests {
         let p = pid("rereg");
         register(&p, fake_tunnel(61002, closes.clone()));
         let id = AgentEndpoint::loopback(61003, "tok").base_url.to_string();
-        mark_stopped(&id);
+        mark_stopped(&id, StopKind::Spot);
+        assert_eq!(stop_kind(&id), Some(StopKind::Spot));
         let old = register(&p, fake_tunnel(61003, closes.clone())).unwrap();
         assert_eq!(old.endpoint.base_url.port(), Some(61002));
         assert!(!is_stopped(&id), "a new task on a reused port is not stopped");
