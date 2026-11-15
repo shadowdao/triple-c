@@ -2,16 +2,6 @@
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "ManageEnvironmentStacks",
-      "Effect": "Allow",
-      "Action": [
-        "cloudformation:*"
-      ],
-      "Resource": [
-        "arn:aws:cloudformation:*:*:stack/triple-c-*/*"
-      ]
-    },
-    {
       "Sid": "ManageBoundedTripleCRoles",
       "Effect": "Allow",
       "Action": [
@@ -31,12 +21,19 @@
       }
     },
     {
-      "Sid": "TagReadAndDeleteTripleCRoles",
+      "Sid": "ManageAndReadTripleCRoles",
       "Effect": "Allow",
       "Action": [
         "iam:DeleteRole",
         "iam:TagRole",
-        "iam:GetRole"
+        "iam:UntagRole",
+        "iam:UpdateRole",
+        "iam:UpdateRoleDescription",
+        "iam:GetRole",
+        "iam:GetRolePolicy",
+        "iam:ListRolePolicies",
+        "iam:ListAttachedRolePolicies",
+        "iam:ListInstanceProfilesForRole"
       ],
       "Resource": [
         "arn:aws:iam::*:role/triple-c-*"
@@ -99,23 +96,6 @@
       }
     },
     {
-      "Sid": "NoServiceRoleForTripleCStacks",
-      "Effect": "Deny",
-      "Action": [
-        "cloudformation:CreateStack",
-        "cloudformation:UpdateStack",
-        "cloudformation:CreateChangeSet"
-      ],
-      "Resource": [
-        "arn:aws:cloudformation:*:*:stack/triple-c-*/*"
-      ],
-      "Condition": {
-        "Null": {
-          "cloudformation:RoleArn": "false"
-        }
-      }
-    },
-    {
       "Sid": "InspectOwnPrincipal",
       "Effect": "Allow",
       "Action": [
@@ -130,12 +110,27 @@
       ]
     },
     {
+      "Sid": "ReadTheBoundary",
+      "Effect": "Allow",
+      "Action": [
+        "iam:GetPolicy"
+      ],
+      "Resource": [
+        "arn:aws:iam::*:policy/triple-c-permissions-boundary"
+      ]
+    },
+    {
       "Sid": "ManageClusters",
       "Effect": "Allow",
       "Action": [
         "ecs:CreateCluster",
         "ecs:DeleteCluster",
-        "ecs:PutClusterCapacityProviders"
+        "ecs:UpdateCluster",
+        "ecs:PutClusterCapacityProviders",
+        "ecs:DescribeClusters",
+        "ecs:TagResource",
+        "ecs:UntagResource",
+        "ecs:ListTagsForResource"
       ],
       "Resource": [
         "arn:aws:ecs:*:*:cluster/triple-c-*"
@@ -158,74 +153,6 @@
       "Action": [
         "ecs:RegisterTaskDefinition",
         "ecs:DeregisterTaskDefinition"
-      ],
-      "Resource": [
-        "*"
-      ]
-    },
-    {
-      "Sid": "CreateTaggedSecurityGroups",
-      "Effect": "Allow",
-      "Action": [
-        "ec2:CreateSecurityGroup"
-      ],
-      "Resource": [
-        "arn:aws:ec2:*:*:security-group/*"
-      ],
-      "Condition": {
-        "Null": {
-          "aws:RequestTag/triple-c:component": "false"
-        }
-      }
-    },
-    {
-      "Sid": "CreateSecurityGroupsInVpcs",
-      "Effect": "Allow",
-      "Action": [
-        "ec2:CreateSecurityGroup"
-      ],
-      "Resource": [
-        "arn:aws:ec2:*:*:vpc/*"
-      ]
-    },
-    {
-      "Sid": "TagSecurityGroupsAtCreate",
-      "Effect": "Allow",
-      "Action": [
-        "ec2:CreateTags"
-      ],
-      "Resource": [
-        "arn:aws:ec2:*:*:security-group/*"
-      ],
-      "Condition": {
-        "StringEquals": {
-          "ec2:CreateAction": "CreateSecurityGroup"
-        }
-      }
-    },
-    {
-      "Sid": "ManageTripleCSecurityGroups",
-      "Effect": "Allow",
-      "Action": [
-        "ec2:DeleteSecurityGroup",
-        "ec2:AuthorizeSecurityGroup*",
-        "ec2:RevokeSecurityGroup*",
-        "ec2:CreateTags"
-      ],
-      "Resource": [
-        "arn:aws:ec2:*:*:security-group/*"
-      ],
-      "Condition": {
-        "Null": {
-          "aws:ResourceTag/triple-c:component": "false"
-        }
-      }
-    },
-    {
-      "Sid": "DescribeEc2",
-      "Effect": "Allow",
-      "Action": [
-        "ec2:Describe*"
       ],
       "Resource": [
         "*"
@@ -266,10 +193,15 @@
       "Effect": "Allow",
       "Action": [
         "elasticfilesystem:DeleteFileSystem",
+        "elasticfilesystem:UpdateFileSystem",
+        "elasticfilesystem:PutLifecycleConfiguration",
         "elasticfilesystem:CreateMountTarget",
         "elasticfilesystem:DeleteMountTarget",
+        "elasticfilesystem:ModifyMountTargetSecurityGroups",
         "elasticfilesystem:PutFileSystemPolicy",
-        "elasticfilesystem:TagResource"
+        "elasticfilesystem:DeleteFileSystemPolicy",
+        "elasticfilesystem:TagResource",
+        "elasticfilesystem:UntagResource"
       ],
       "Resource": [
         "arn:aws:elasticfilesystem:*:*:file-system/*"
@@ -301,8 +233,12 @@
       "Action": [
         "kms:ScheduleKeyDeletion",
         "kms:PutKeyPolicy",
+        "kms:EnableKeyRotation",
+        "kms:UpdateKeyDescription",
         "kms:TagResource",
+        "kms:UntagResource",
         "kms:CreateAlias",
+        "kms:UpdateAlias",
         "kms:DeleteAlias"
       ],
       "Resource": [
@@ -319,6 +255,7 @@
       "Effect": "Allow",
       "Action": [
         "kms:CreateAlias",
+        "kms:UpdateAlias",
         "kms:DeleteAlias"
       ],
       "Resource": [
@@ -331,7 +268,11 @@
       "Action": [
         "logs:CreateLogGroup",
         "logs:DeleteLogGroup",
-        "logs:PutRetentionPolicy"
+        "logs:PutRetentionPolicy",
+        "logs:DeleteRetentionPolicy",
+        "logs:TagResource",
+        "logs:UntagResource",
+        "logs:ListTagsForResource"
       ],
       "Resource": [
         "arn:aws:logs:*:*:log-group:/triple-c/*"
@@ -364,10 +305,76 @@
       "Effect": "Allow",
       "Action": [
         "ssm:PutParameter",
-        "ssm:DeleteParameter"
+        "ssm:DeleteParameter",
+        "ssm:GetParameter*",
+        "ssm:AddTagsToResource",
+        "ssm:RemoveTagsFromResource",
+        "ssm:ListTagsForResource"
       ],
       "Resource": [
         "arn:aws:ssm:*:*:parameter/triple-c/*"
+      ]
+    },
+    {
+      "Sid": "ReadWhatTheModulesRefresh",
+      "Effect": "Allow",
+      "Action": [
+        "kms:DescribeKey",
+        "kms:GetKeyPolicy",
+        "kms:GetKeyRotationStatus",
+        "kms:ListResourceTags",
+        "kms:ListAliases",
+        "logs:DescribeLogGroups",
+        "ssm:DescribeParameters",
+        "elasticfilesystem:Describe*",
+        "elasticfilesystem:ListTagsForResource",
+        "sts:GetCallerIdentity"
+      ],
+      "Resource": [
+        "*"
+      ]
+    },
+    {
+      "Sid": "CreateTheStateBucket",
+      "Effect": "Allow",
+      "Action": [
+        "s3:CreateBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::triple-c-tfstate-*"
+      ],
+      "Condition": {
+        "Null": {
+          "aws:RequestTag/triple-c:component": "false"
+        }
+      }
+    },
+    {
+      "Sid": "ManageTheStateBucket",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutBucketVersioning",
+        "s3:PutEncryptionConfiguration",
+        "s3:PutBucketPublicAccessBlock",
+        "s3:PutBucketTagging",
+        "s3:PutBucketPolicy",
+        "s3:GetBucket*",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::triple-c-tfstate-*"
+      ]
+    },
+    {
+      "Sid": "ReadAndWriteState",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::triple-c-tfstate-*/*"
       ]
     }
   ]

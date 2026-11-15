@@ -17,10 +17,9 @@ fn identity() -> CallerIdentity {
     }
 }
 
-const ALL_PROBES: [Probe; 4] = [
+const ALL_PROBES: [Probe; 3] = [
     Probe::EcsListClusters,
     Probe::SsmGetParametersByPath,
-    Probe::CfnDescribeStacks,
     Probe::SecretsListSecrets,
 ];
 
@@ -214,15 +213,11 @@ fn a_missing_action_reports_insufficient_and_names_it() {
 #[test]
 fn an_admin_gap_still_reports_workspace_user() {
     let mut api = FakeApi::allowing(&[Tier::WorkspaceUser, Tier::EnvironmentAdmin]);
-    api.allow.remove("cloudformation:CreateStack");
+    api.allow.remove("ec2:CreateVpc");
     let report = run(&api);
     assert_eq!(report.summary, Summary::WorkspaceUser);
     assert_eq!(
-        verdict(
-            &report,
-            Tier::EnvironmentAdmin,
-            "cloudformation:CreateStack"
-        ),
+        verdict(&report, Tier::EnvironmentAdmin, "ec2:CreateVpc"),
         Verdict::Denied
     );
 }
@@ -408,10 +403,6 @@ fn a_denied_simulation_falls_back_to_probes_and_marks_writes_unverified() {
         Verdict::Allowed
     );
     assert_eq!(
-        verdict(&report, ws, "cloudformation:DescribeStacks"),
-        Verdict::Allowed
-    );
-    assert_eq!(
         verdict(&report, ws, "secretsmanager:ListSecrets"),
         Verdict::Allowed
     );
@@ -446,7 +437,7 @@ fn a_denied_get_role_falls_back_to_probes() {
         m => panic!("expected Probed, got {m:?}"),
     }
     assert!(api.simulated().is_empty());
-    assert_eq!(api.probed.lock().unwrap().len(), 4);
+    assert_eq!(api.probed.lock().unwrap().len(), ALL_PROBES.len());
     // Denied on the caller's own role: direct evidence.
     assert_eq!(
         verdict(&report, Tier::WorkspaceUser, "iam:GetRole"),
@@ -487,14 +478,10 @@ fn a_probed_run_never_claims_environment_admin() {
 #[test]
 fn throttled_simulations_block_the_tier_and_carry_notes() {
     let mut api = FakeApi::allowing(&[Tier::WorkspaceUser, Tier::EnvironmentAdmin]);
-    api.simulate_errors = vec![("cloudformation:CreateStack", throttled())];
+    api.simulate_errors = vec![("ec2:CreateVpc", throttled())];
     let report = run(&api);
     assert_eq!(report.method, Method::Simulated);
-    let r = row(
-        &report,
-        Tier::EnvironmentAdmin,
-        "cloudformation:CreateStack",
-    );
+    let r = row(&report, Tier::EnvironmentAdmin, "ec2:CreateVpc");
     assert_eq!(r.verdict, Verdict::Unverified);
     assert!(r.note.as_deref().unwrap().contains("Throttling"), "{r:?}");
     // Allowed rows carry no note.
@@ -548,7 +535,7 @@ fn credential_errors_anywhere_are_errors() {
     // From a probe.
     let mut api = FakeApi::allowing(&[Tier::WorkspaceUser]);
     api.get_role_denied = true;
-    api.probes_ok.remove(&Probe::CfnDescribeStacks);
+    api.probes_ok.remove(&Probe::SecretsListSecrets);
     api.probe_error = Some(AwsError::KeysMissing);
     assert_eq!(
         try_run(&api, &identity()).unwrap_err(),
@@ -629,4 +616,15 @@ fn check_permissions_is_send() {
         assert_send(check_permissions(api, id, "r"));
     }
     let _ = with::<SdkPermissionApi>;
+}
+
+/// D8: CloudFormation left the policies, so nothing probes it either.
+#[test]
+fn no_probe_is_cloudformation() {
+    assert_eq!(Probe::ALL, ALL_PROBES);
+    for p in Probe::ALL {
+        assert!(!p.action().starts_with("cloudformation:"), "{p:?}");
+        assert_eq!(Probe::for_action(p.action()), Some(p));
+    }
+    assert_eq!(Probe::for_action("cloudformation:DescribeStacks"), None);
 }

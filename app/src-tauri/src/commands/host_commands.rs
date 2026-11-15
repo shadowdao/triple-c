@@ -6,7 +6,7 @@ use std::future::Future;
 use tauri::State;
 
 use crate::aws::permissions::{check_permissions, PermissionReport, SdkPermissionApi};
-use crate::aws::policies::{policy_json, Tier};
+use crate::aws::policies::{policy_files, Tier};
 use crate::aws::{caller_identity, sdk_config, sdk_config_for_keys, AwsError, CallerIdentity};
 use crate::models::{
     validate_connection_name, validate_profile_name, validate_supported_region, AppSettings, AwsAuth,
@@ -281,9 +281,24 @@ pub async fn check_aws_permissions(
     check_permissions(&api, &identity, &region).await
 }
 
+/// One policy file of a tier: its file name under `aws/policies/` and its
+/// JSON, verbatim.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct PolicyFile {
+    pub name: String,
+    pub json: String,
+}
+
+/// Every policy file `tier` needs, in order; all of them are required (D7).
 #[tauri::command]
-pub fn aws_policy_document(tier: Tier) -> String {
-    policy_json(tier).to_string()
+pub fn aws_policy_document(tier: Tier) -> Vec<PolicyFile> {
+    policy_files(tier)
+        .iter()
+        .map(|(name, json)| PolicyFile {
+            name: name.to_string(),
+            json: json.to_string(),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -521,5 +536,22 @@ mod tests {
             assert!(matches!(&e, AwsError::Other { message } if message == "China and GovCloud regions aren't supported yet."), "{e:?}");
         }
         assert!(validated("Prod", "eu-west-1").is_ok());
+    }
+
+    #[test]
+    fn the_policy_document_is_every_file_of_the_tier() {
+        let admin = aws_policy_document(Tier::EnvironmentAdmin);
+        let names: Vec<&str> = admin.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["environment-admin.json", "environment-admin-network.json"]);
+        for f in &admin {
+            serde_json::from_str::<serde_json::Value>(&f.json).expect("policy JSON");
+        }
+        let ws = aws_policy_document(Tier::WorkspaceUser);
+        assert_eq!(ws.len(), 1);
+        assert_eq!(ws[0].name, "workspace-user.json");
+        assert_eq!(
+            serde_json::to_value(&ws[0]).unwrap()["name"],
+            "workspace-user.json"
+        );
     }
 }

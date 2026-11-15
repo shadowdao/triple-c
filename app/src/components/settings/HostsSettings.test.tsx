@@ -140,11 +140,18 @@ describe("HostsSettings", () => {
     expect(screen.getByLabelText("Secret access key")).toHaveValue("");
   });
 
-  it("check shows Insufficient with the denied actions and the copy-policy buttons", async () => {
-    invoke.mockImplementation(async (cmd: string) => {
+  it("check shows Insufficient with the denied actions and every policy file to copy", async () => {
+    const adminFiles = [
+      { name: "environment-admin.json", json: '{"Statement":"admin"}' },
+      { name: "environment-admin-network.json", json: '{"Statement":"network"}' },
+    ];
+    invoke.mockImplementation(async (cmd: string, args?: { tier: string }) => {
       if (cmd === "list_aws_profiles") return [];
       if (cmd === "check_aws_permissions") return report({});
-      if (cmd === "aws_policy_document") return '{"Version":"2012-10-17"}';
+      if (cmd === "aws_policy_document")
+        return args?.tier === "environment_admin"
+          ? adminFiles
+          : [{ name: "workspace-user.json", json: '{"Version":"2012-10-17"}' }];
       throw new Error(`unexpected ${cmd}`);
     });
     const writeText = vi.fn().mockResolvedValue(undefined);
@@ -154,10 +161,22 @@ describe("HostsSettings", () => {
     expect(await screen.findByText("Insufficient")).toBeInTheDocument();
     expect(screen.getByText("ecs:RunTask")).toBeInTheDocument();
     expect(screen.getByText(/SCPs or session policies/)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Copy workspace-user policy" }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Show workspace-user policy" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Copy workspace-user.json" }));
     await waitFor(() => expect(writeText).toHaveBeenCalledWith('{"Version":"2012-10-17"}'));
     expect(invoke).toHaveBeenCalledWith("aws_policy_document", { tier: "workspace_user" });
-    expect(screen.getByRole("button", { name: "Copy admin policy" })).toBeInTheDocument();
+    expect(screen.getByText("workspace-user.json copied to clipboard.")).toBeInTheDocument();
+
+    // The admin tier is every one of its files, each shown and copied on its own.
+    fireEvent.click(screen.getByRole("button", { name: "Show admin policies" }));
+    expect(await screen.findByText(/Attach all 2 files/)).toBeInTheDocument();
+    for (const f of adminFiles) {
+      expect(screen.getByText(f.json)).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: `Copy ${f.name}` }));
+      await waitFor(() => expect(writeText).toHaveBeenCalledWith(f.json));
+    }
+    expect(invoke).toHaveBeenCalledWith("aws_policy_document", { tier: "environment_admin" });
   });
 
   it("shows a neutral Incomplete badge when the only blockers are failed checks", async () => {
@@ -301,14 +320,27 @@ describe("HostsSettings", () => {
     invoke.mockImplementation(async (cmd: string) => {
       if (cmd === "list_aws_profiles") return [];
       if (cmd === "check_aws_permissions") return report({});
-      if (cmd === "aws_policy_document") return "{}";
+      if (cmd === "aws_policy_document") return [{ name: "environment-admin.json", json: "{}" }];
       throw new Error(`unexpected ${cmd}`);
     });
     Object.assign(navigator, { clipboard: { writeText: vi.fn().mockRejectedValue(new Error("denied")) } });
     render(<HostsSettings />);
     fireEvent.click(screen.getByRole("button", { name: "Check Prod" }));
-    fireEvent.click(await screen.findByRole("button", { name: "Copy admin policy" }));
-    expect(await screen.findByText(/Could not copy the policy: denied/)).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("button", { name: "Show admin policies" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Copy environment-admin.json" }));
+    expect(await screen.findByText(/Could not copy environment-admin.json: denied/)).toBeInTheDocument();
+  });
+
+  it("shows a message when the policy files can't be loaded", async () => {
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_aws_profiles") return [];
+      if (cmd === "check_aws_permissions") return report({});
+      throw new Error("boom");
+    });
+    render(<HostsSettings />);
+    fireEvent.click(screen.getByRole("button", { name: "Check Prod" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Show admin policies" }));
+    expect(await screen.findByText(/Could not load the policy: boom/)).toBeInTheDocument();
   });
 
   it.each([

@@ -64,7 +64,6 @@ aws-sdk-ssm = { version = "1.137.0", default-features = false, features = ["defa
 aws-sdk-ecs = { version = "1.159.0", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
 aws-sdk-sts = { version = "1.126.0", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
 aws-sdk-iam = { version = "1.136.0", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
-aws-sdk-cloudformation = { version = "1.139.0", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
 aws-sdk-secretsmanager = { version = "1.128.0", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
 # Named by src/aws/connection.rs: the credentials-provider trait (its profile
 # wrapper) and the profile-file set (aws-config's alias for it is deprecated).

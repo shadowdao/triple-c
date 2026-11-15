@@ -1158,6 +1158,12 @@ export interface CallerIdentity {
 
 export type Tier = "environment_admin" | "workspace_user";
 
+/** One policy file of a tier (`aws/policies/<name>`); a tier needs all of its files. */
+export interface PolicyFile {
+  name: string;
+  json: string;
+}
+
 export type Verdict = "allowed" | "denied" | "unverified";
 
 export interface ActionResult {

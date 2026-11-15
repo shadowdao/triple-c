@@ -39,7 +39,7 @@ use super::permissions::{
     SdkPermissionApi, Summary, Verdict,
 };
 use super::policies::{
-    checks, permissions_boundary_json, policy_json, Placeholders, Tier, PERMISSIONS_BOUNDARY_NAME,
+    checks, permissions_boundary_json, policy_files, Placeholders, Tier, PERMISSIONS_BOUNDARY_NAME,
 };
 use super::{caller_identity, sdk_config, sdk_config_for_keys, CallerIdentity};
 use crate::models::host_connection::{AwsAuth, HostConnection, HostKind};
@@ -276,10 +276,12 @@ impl E2e {
                 Tier::WorkspaceUser => "workspace",
                 Tier::EnvironmentAdmin => "admin",
             };
-            let arn = self
-                .managed_policy(&format!("{suffix}-{name}"), policy_json(tier))
-                .await;
-            self.attach(&role, &arn).await;
+            for (i, (_, json)) in policy_files(tier).iter().enumerate() {
+                let arn = self
+                    .managed_policy(&format!("{suffix}-{name}{i}"), json)
+                    .await;
+                self.attach(&role, &arn).await;
+            }
         }
         role
     }
@@ -555,7 +557,7 @@ async fn a_role_with_no_policy_checks_as_insufficient_and_lists_every_action() {
 async fn a_role_without_simulate_permission_falls_back_to_probes() {
     e2e(|e| async move {
         let mut doc: serde_json::Value =
-            serde_json::from_str(policy_json(Tier::WorkspaceUser)).unwrap();
+            serde_json::from_str(policy_files(Tier::WorkspaceUser)[0].1).unwrap();
         doc["Statement"]
             .as_array_mut()
             .unwrap()
@@ -578,7 +580,6 @@ async fn a_role_without_simulate_permission_falls_back_to_probes() {
         for probed in [
             "ecs:ListClusters",
             "ssm:GetParametersByPath",
-            "cloudformation:DescribeStacks",
             "secretsmanager:ListSecrets",
         ] {
             assert_eq!(verdict(probed), Verdict::Allowed, "{probed}");

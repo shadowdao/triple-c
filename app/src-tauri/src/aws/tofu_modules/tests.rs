@@ -1328,3 +1328,623 @@ fn the_record_is_format_checked_before_use() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// What the admin tier must allow for the modules to apply.
+//
+// MODULE_CALLS maps every Terraform resource type (and data source, and the
+// S3 backend) the environment and onboarding modules use to the IAM actions
+// the AWS provider calls to create, read (refresh), tag, update and delete
+// it, each with the resource it is authorized against and the context IAM
+// sees. It is the hypothesis: Task 8's live run is the proof, and an action
+// it shows missing is added here, to the policy, to the check table
+// (`policies.rs`) and to `aws/README.md` together.
+
+use crate::aws::policies::{permissions_boundary_json, policy_files, Check, ContextValue, Tier};
+use crate::aws::policy_eval as eval;
+
+type Context = &'static [(&'static str, ContextValue)];
+
+const fn call(action: &'static str, resource: &'static str, context: Context) -> Check {
+    Check {
+        action,
+        resource,
+        context,
+        write: true,
+    }
+}
+
+// The resources the modules create for environment `probe` and the user
+// whose owner key is `0123456789ab`, named as Task 1 names them (pinned to
+// the naming functions by `the_module_call_table_uses_the_shared_names`).
+const ENV: &str = "probe";
+const OWNER_KEY: &str = "0123456789ab";
+const CLUSTER: &str = "arn:aws:ecs:{region}:{account}:cluster/triple-c-probe";
+const KEY: &str = "arn:aws:kms:{region}:{account}:key/00000000-0000-0000-0000-000000000000";
+const ALIAS: &str = "arn:aws:kms:{region}:{account}:alias/triple-c-probe";
+const LOG_GROUP: &str = "arn:aws:logs:{region}:{account}:log-group:/triple-c/probe";
+const PARAMETER: &str = "arn:aws:ssm:{region}:{account}:parameter/triple-c/environments/probe";
+const VPC: &str = "arn:aws:ec2:{region}:{account}:vpc/vpc-00000000000000000";
+const SUBNET: &str = "arn:aws:ec2:{region}:{account}:subnet/subnet-00000000000000000";
+const IGW: &str = "arn:aws:ec2:{region}:{account}:internet-gateway/igw-00000000000000000";
+const RTB: &str = "arn:aws:ec2:{region}:{account}:route-table/rtb-00000000000000000";
+const EIP: &str = "arn:aws:ec2:{region}:{account}:elastic-ip/eipalloc-00000000000000000";
+const NAT: &str = "arn:aws:ec2:{region}:{account}:natgateway/nat-00000000000000000";
+const SG: &str = "arn:aws:ec2:{region}:{account}:security-group/sg-00000000000000000";
+const SG_RULE: &str = "arn:aws:ec2:{region}:{account}:security-group-rule/sgr-00000000000000000";
+const ENI: &str = "arn:aws:ec2:{region}:{account}:network-interface/eni-00000000000000000";
+const FS: &str = "arn:aws:elasticfilesystem:{region}:{account}:file-system/fs-00000000";
+const TASK_ROLE: &str = "arn:aws:iam::{account}:role/triple-c-probe-0123456789ab-task";
+const EXEC_ROLE: &str = "arn:aws:iam::{account}:role/triple-c-probe-0123456789ab-exec";
+const STATE_BUCKET: &str = "arn:aws:s3:::triple-c-tfstate-{account}-{region}";
+const ENV_STATE: &str =
+    "arn:aws:s3:::triple-c-tfstate-{account}-{region}/environments/probe/terraform.tfstate";
+const ENV_LOCK: &str =
+    "arn:aws:s3:::triple-c-tfstate-{account}-{region}/environments/probe/terraform.tfstate.tflock";
+const USER_STATE: &str =
+    "arn:aws:s3:::triple-c-tfstate-{account}-{region}/users/probe/0123456789ab/terraform.tfstate";
+const USER_LOCK: &str = "arn:aws:s3:::triple-c-tfstate-{account}-{region}/users/probe/0123456789ab/terraform.tfstate.tflock";
+
+use ContextValue::Literal;
+
+const REQUEST_COMPONENT: &str = "aws:RequestTag/triple-c:component";
+const RESOURCE_COMPONENT: &str = "aws:ResourceTag/triple-c:component";
+/// Created by the environment module: default_tags put the component tag on
+/// the create request.
+const ENV_CREATE: Context = &[(REQUEST_COMPONENT, Literal("environment"))];
+/// An environment-module resource after creation.
+const ENV_TAGGED: Context = &[(RESOURCE_COMPONENT, Literal("environment"))];
+const USER_CREATE: Context = &[(REQUEST_COMPONENT, Literal("user-onboarding"))];
+const USER_TAGGED: Context = &[(RESOURCE_COMPONENT, Literal("user-onboarding"))];
+/// Role writes name the boundary the module sets.
+const BOUNDED: Context = &[
+    (
+        "iam:PermissionsBoundary",
+        Literal("arn:aws:iam::{account}:policy/triple-c-permissions-boundary"),
+    ),
+    ("aws:PrincipalAccount", Literal("{account}")),
+];
+/// A call EFS makes on the caller's behalf (a mount target's interface).
+const VIA_SERVICE: Context = &[("aws:ViaAWSService", Literal("true"))];
+const NONE: Context = &[];
+
+macro_rules! created_by {
+    ($action:literal) => {
+        &[("ec2:CreateAction", Literal($action))]
+    };
+}
+
+/// The S3 backend's calls on one deployment's state and lock objects.
+const BACKEND: &[Check] = &[
+    call("s3:ListBucket", STATE_BUCKET, NONE),
+    call("s3:GetObject", ENV_STATE, NONE),
+    call("s3:PutObject", ENV_STATE, NONE),
+    call("s3:GetObject", ENV_LOCK, NONE),
+    call("s3:PutObject", ENV_LOCK, NONE),
+    call("s3:DeleteObject", ENV_LOCK, NONE),
+    call("s3:GetObject", USER_STATE, NONE),
+    call("s3:PutObject", USER_STATE, NONE),
+    call("s3:PutObject", USER_LOCK, NONE),
+    call("s3:DeleteObject", USER_LOCK, NONE),
+];
+
+const MODULE_CALLS: &[(&str, &[Check])] = &[
+    (
+        "aws_ecs_cluster",
+        &[
+            call("ecs:CreateCluster", CLUSTER, ENV_CREATE),
+            call(
+                "ecs:TagResource",
+                CLUSTER,
+                &[("ecs:CreateAction", Literal("CreateCluster"))],
+            ),
+            call("ecs:DescribeClusters", CLUSTER, NONE),
+            call("ecs:ListTagsForResource", CLUSTER, NONE),
+            call("ecs:UpdateCluster", CLUSTER, ENV_TAGGED),
+            call("ecs:TagResource", CLUSTER, ENV_TAGGED),
+            call("ecs:UntagResource", CLUSTER, ENV_TAGGED),
+            call("ecs:DeleteCluster", CLUSTER, ENV_TAGGED),
+        ],
+    ),
+    (
+        // Untaggable: authorized against the (named) cluster.
+        "aws_ecs_cluster_capacity_providers",
+        &[
+            call("ecs:PutClusterCapacityProviders", CLUSTER, ENV_TAGGED),
+            call("ecs:DescribeClusters", CLUSTER, NONE),
+        ],
+    ),
+    (
+        // Both modules' groups. The provider revokes AWS's default egress
+        // rule after creating (both groups declare their own egress), and
+        // authorizes rules one call per direction, against the group and the
+        // new (untagged) rule.
+        "aws_security_group",
+        &[
+            call("ec2:CreateSecurityGroup", SG, ENV_CREATE),
+            call("ec2:CreateSecurityGroup", VPC, ENV_CREATE),
+            call("ec2:CreateTags", SG, created_by!("CreateSecurityGroup")),
+            call("ec2:DescribeSecurityGroups", "*", NONE),
+            call("ec2:DescribeSecurityGroupRules", "*", NONE),
+            call("ec2:RevokeSecurityGroupEgress", SG, USER_TAGGED),
+            call("ec2:RevokeSecurityGroupEgress", SG, ENV_TAGGED),
+            call("ec2:AuthorizeSecurityGroupEgress", SG, ENV_TAGGED),
+            call("ec2:AuthorizeSecurityGroupEgress", SG_RULE, NONE),
+            call("ec2:AuthorizeSecurityGroupIngress", SG, USER_TAGGED),
+            call("ec2:AuthorizeSecurityGroupIngress", SG_RULE, NONE),
+            call("ec2:RevokeSecurityGroupIngress", SG, ENV_TAGGED),
+            call(
+                "ec2:UpdateSecurityGroupRuleDescriptionsIngress",
+                SG,
+                USER_TAGGED,
+            ),
+            call(
+                "ec2:UpdateSecurityGroupRuleDescriptionsEgress",
+                SG,
+                ENV_TAGGED,
+            ),
+            call("ec2:CreateTags", SG, ENV_TAGGED),
+            call("ec2:DeleteTags", SG, ENV_TAGGED),
+            call("ec2:DescribeNetworkInterfaces", "*", NONE),
+            call("ec2:DeleteSecurityGroup", SG, ENV_TAGGED),
+            call("ec2:DeleteSecurityGroup", SG, USER_TAGGED),
+        ],
+    ),
+    (
+        // Tag-on-create authorizes kms:TagResource against the new key with
+        // its request tags (verified live in phase 3).
+        "aws_kms_key",
+        &[
+            call("kms:CreateKey", "*", ENV_CREATE),
+            call("kms:TagResource", KEY, ENV_TAGGED),
+            call("kms:DescribeKey", KEY, NONE),
+            call("kms:GetKeyPolicy", KEY, NONE),
+            call("kms:GetKeyRotationStatus", KEY, NONE),
+            call("kms:ListResourceTags", KEY, NONE),
+            call("kms:EnableKeyRotation", KEY, ENV_TAGGED),
+            call("kms:PutKeyPolicy", KEY, ENV_TAGGED),
+            call("kms:UpdateKeyDescription", KEY, ENV_TAGGED),
+            call("kms:UntagResource", KEY, ENV_TAGGED),
+            call("kms:ScheduleKeyDeletion", KEY, ENV_TAGGED),
+        ],
+    ),
+    (
+        // Untaggable: authorized against the alias (by name) and the key.
+        "aws_kms_alias",
+        &[
+            call("kms:CreateAlias", ALIAS, NONE),
+            call("kms:CreateAlias", KEY, ENV_TAGGED),
+            call("kms:ListAliases", "*", NONE),
+            call("kms:UpdateAlias", ALIAS, NONE),
+            call("kms:UpdateAlias", KEY, ENV_TAGGED),
+            call("kms:DeleteAlias", ALIAS, NONE),
+            call("kms:DeleteAlias", KEY, ENV_TAGGED),
+        ],
+    ),
+    (
+        "aws_cloudwatch_log_group",
+        &[
+            call("logs:CreateLogGroup", LOG_GROUP, ENV_CREATE),
+            call("logs:TagResource", LOG_GROUP, ENV_CREATE),
+            call("logs:PutRetentionPolicy", LOG_GROUP, NONE),
+            call("logs:DescribeLogGroups", "*", NONE),
+            call("logs:ListTagsForResource", LOG_GROUP, NONE),
+            call("logs:UntagResource", LOG_GROUP, NONE),
+            call("logs:DeleteRetentionPolicy", LOG_GROUP, NONE),
+            call("logs:DeleteLogGroup", LOG_GROUP, NONE),
+        ],
+    ),
+    (
+        "aws_ssm_parameter",
+        &[
+            call("ssm:PutParameter", PARAMETER, ENV_CREATE),
+            call("ssm:AddTagsToResource", PARAMETER, ENV_CREATE),
+            call("ssm:GetParameter", PARAMETER, NONE),
+            call("ssm:DescribeParameters", "*", NONE),
+            call("ssm:ListTagsForResource", PARAMETER, NONE),
+            call("ssm:RemoveTagsFromResource", PARAMETER, NONE),
+            call("ssm:DeleteParameter", PARAMETER, NONE),
+        ],
+    ),
+    (
+        // enable_dns_hostnames is set after CreateVpc; reads include the
+        // default ACL, route table and security group.
+        "aws_vpc",
+        &[
+            call("ec2:CreateVpc", VPC, ENV_CREATE),
+            call("ec2:CreateTags", VPC, created_by!("CreateVpc")),
+            call("ec2:DescribeVpcs", "*", NONE),
+            call("ec2:DescribeVpcAttribute", "*", NONE),
+            call("ec2:DescribeNetworkAcls", "*", NONE),
+            call("ec2:DescribeRouteTables", "*", NONE),
+            call("ec2:ModifyVpcAttribute", VPC, ENV_TAGGED),
+            call("ec2:CreateTags", VPC, ENV_TAGGED),
+            call("ec2:DeleteTags", VPC, ENV_TAGGED),
+            call("ec2:DeleteVpc", VPC, ENV_TAGGED),
+        ],
+    ),
+    (
+        "aws_internet_gateway",
+        &[
+            call("ec2:CreateInternetGateway", IGW, ENV_CREATE),
+            call("ec2:CreateTags", IGW, created_by!("CreateInternetGateway")),
+            call("ec2:AttachInternetGateway", IGW, ENV_TAGGED),
+            call("ec2:AttachInternetGateway", VPC, ENV_TAGGED),
+            call("ec2:DescribeInternetGateways", "*", NONE),
+            call("ec2:CreateTags", IGW, ENV_TAGGED),
+            call("ec2:DetachInternetGateway", IGW, ENV_TAGGED),
+            call("ec2:DetachInternetGateway", VPC, ENV_TAGGED),
+            call("ec2:DeleteInternetGateway", IGW, ENV_TAGGED),
+        ],
+    ),
+    (
+        // Deleting waits for the subnet's interfaces to go.
+        "aws_subnet",
+        &[
+            call("ec2:CreateSubnet", SUBNET, ENV_CREATE),
+            call("ec2:CreateSubnet", VPC, ENV_CREATE),
+            call("ec2:CreateTags", SUBNET, created_by!("CreateSubnet")),
+            call("ec2:DescribeSubnets", "*", NONE),
+            call("ec2:ModifySubnetAttribute", SUBNET, ENV_TAGGED),
+            call("ec2:CreateTags", SUBNET, ENV_TAGGED),
+            call("ec2:DeleteTags", SUBNET, ENV_TAGGED),
+            call("ec2:DescribeNetworkInterfaces", "*", NONE),
+            call("ec2:DeleteSubnet", SUBNET, ENV_TAGGED),
+        ],
+    ),
+    (
+        "aws_route_table",
+        &[
+            call("ec2:CreateRouteTable", RTB, ENV_CREATE),
+            call("ec2:CreateRouteTable", VPC, ENV_CREATE),
+            call("ec2:CreateTags", RTB, created_by!("CreateRouteTable")),
+            call("ec2:DescribeRouteTables", "*", NONE),
+            call("ec2:CreateTags", RTB, ENV_TAGGED),
+            call("ec2:DeleteRouteTable", RTB, ENV_TAGGED),
+        ],
+    ),
+    (
+        // Untaggable: authorized against the route table.
+        "aws_route",
+        &[
+            call("ec2:CreateRoute", RTB, ENV_TAGGED),
+            call("ec2:DescribeRouteTables", "*", NONE),
+            call("ec2:ReplaceRoute", RTB, ENV_TAGGED),
+            call("ec2:DeleteRoute", RTB, ENV_TAGGED),
+        ],
+    ),
+    (
+        // Untaggable: authorized against the route table and the subnet.
+        "aws_route_table_association",
+        &[
+            call("ec2:AssociateRouteTable", RTB, ENV_TAGGED),
+            call("ec2:AssociateRouteTable", SUBNET, ENV_TAGGED),
+            call("ec2:DescribeRouteTables", "*", NONE),
+            call("ec2:ReplaceRouteTableAssociation", RTB, ENV_TAGGED),
+            call("ec2:ReplaceRouteTableAssociation", SUBNET, ENV_TAGGED),
+            call("ec2:DisassociateRouteTable", RTB, ENV_TAGGED),
+            call("ec2:DisassociateRouteTable", SUBNET, ENV_TAGGED),
+        ],
+    ),
+    (
+        "aws_eip",
+        &[
+            call("ec2:AllocateAddress", EIP, ENV_CREATE),
+            call("ec2:CreateTags", EIP, created_by!("AllocateAddress")),
+            call("ec2:DescribeAddresses", "*", NONE),
+            call("ec2:DescribeAddressesAttribute", "*", NONE),
+            call("ec2:CreateTags", EIP, ENV_TAGGED),
+            call("ec2:ReleaseAddress", EIP, ENV_TAGGED),
+        ],
+    ),
+    (
+        // Authorized against the gateway, its subnet, its address and the VPC.
+        "aws_nat_gateway",
+        &[
+            call("ec2:CreateNatGateway", NAT, ENV_CREATE),
+            call("ec2:CreateNatGateway", SUBNET, ENV_CREATE),
+            call("ec2:CreateNatGateway", EIP, ENV_CREATE),
+            call("ec2:CreateNatGateway", VPC, ENV_CREATE),
+            call("ec2:CreateTags", NAT, created_by!("CreateNatGateway")),
+            call("ec2:DescribeNatGateways", "*", NONE),
+            call("ec2:CreateTags", NAT, ENV_TAGGED),
+            call("ec2:DeleteNatGateway", NAT, ENV_TAGGED),
+        ],
+    ),
+    (
+        "aws_efs_file_system",
+        &[
+            call("elasticfilesystem:CreateFileSystem", "*", USER_CREATE),
+            call(
+                "elasticfilesystem:TagResource",
+                FS,
+                &[(
+                    "elasticfilesystem:CreateAction",
+                    Literal("CreateFileSystem"),
+                )],
+            ),
+            call("elasticfilesystem:DescribeFileSystems", FS, NONE),
+            call("elasticfilesystem:DescribeLifecycleConfiguration", FS, NONE),
+            call("elasticfilesystem:ListTagsForResource", FS, NONE),
+            call("elasticfilesystem:UpdateFileSystem", FS, USER_TAGGED),
+            call(
+                "elasticfilesystem:PutLifecycleConfiguration",
+                FS,
+                USER_TAGGED,
+            ),
+            call("elasticfilesystem:TagResource", FS, USER_TAGGED),
+            call("elasticfilesystem:UntagResource", FS, USER_TAGGED),
+            call("elasticfilesystem:DeleteFileSystem", FS, USER_TAGGED),
+        ],
+    ),
+    (
+        // Untaggable here (the module sets no tags on it). EFS creates and
+        // deletes the mount target's interface with the caller's EC2
+        // permissions (CreateMountTarget / DeleteMountTarget API reference).
+        "aws_efs_mount_target",
+        &[
+            call("elasticfilesystem:CreateMountTarget", FS, USER_TAGGED),
+            call("ec2:DescribeSubnets", "*", NONE),
+            call("ec2:DescribeNetworkInterfaces", "*", NONE),
+            call("ec2:CreateNetworkInterface", ENI, VIA_SERVICE),
+            call("ec2:CreateNetworkInterface", SUBNET, VIA_SERVICE),
+            call("ec2:CreateNetworkInterface", SG, VIA_SERVICE),
+            call("elasticfilesystem:DescribeMountTargets", FS, NONE),
+            call(
+                "elasticfilesystem:DescribeMountTargetSecurityGroups",
+                FS,
+                NONE,
+            ),
+            call(
+                "elasticfilesystem:ModifyMountTargetSecurityGroups",
+                FS,
+                USER_TAGGED,
+            ),
+            call("elasticfilesystem:DeleteMountTarget", FS, USER_TAGGED),
+            call("ec2:DeleteNetworkInterface", ENI, VIA_SERVICE),
+        ],
+    ),
+    (
+        // Untaggable: authorized against the file system.
+        "aws_efs_file_system_policy",
+        &[
+            call("elasticfilesystem:PutFileSystemPolicy", FS, USER_TAGGED),
+            call("elasticfilesystem:DescribeFileSystemPolicy", FS, NONE),
+            call("elasticfilesystem:DeleteFileSystemPolicy", FS, USER_TAGGED),
+        ],
+    ),
+    (
+        // Deleting a role first lists (and removes) its instance profiles
+        // and inline policies.
+        "aws_iam_role",
+        &[
+            call("iam:CreateRole", TASK_ROLE, BOUNDED),
+            call("iam:CreateRole", EXEC_ROLE, BOUNDED),
+            call("iam:TagRole", TASK_ROLE, NONE),
+            call("iam:GetRole", TASK_ROLE, NONE),
+            call("iam:ListRolePolicies", TASK_ROLE, NONE),
+            call("iam:ListAttachedRolePolicies", TASK_ROLE, NONE),
+            call("iam:ListInstanceProfilesForRole", TASK_ROLE, NONE),
+            call("iam:UpdateRole", TASK_ROLE, NONE),
+            call("iam:UpdateRoleDescription", TASK_ROLE, NONE),
+            call("iam:UntagRole", TASK_ROLE, NONE),
+            call("iam:DeleteRole", EXEC_ROLE, NONE),
+        ],
+    ),
+    (
+        // Untaggable: authorized against the role.
+        "aws_iam_role_policy",
+        &[
+            call("iam:PutRolePolicy", TASK_ROLE, BOUNDED),
+            call("iam:GetRolePolicy", TASK_ROLE, NONE),
+            call("iam:DeleteRolePolicy", EXEC_ROLE, BOUNDED),
+        ],
+    ),
+    (
+        "data.aws_caller_identity",
+        &[call("sts:GetCallerIdentity", "*", NONE)],
+    ),
+    ("data.aws_partition", &[]),
+    (
+        "data.aws_availability_zones",
+        &[call("ec2:DescribeAvailabilityZones", "*", NONE)],
+    ),
+    (
+        "data.aws_ssm_parameter",
+        &[call("ssm:GetParameter", PARAMETER, NONE)],
+    ),
+    ("data.aws_subnet", &[call("ec2:DescribeSubnets", "*", NONE)]),
+    ("backend.s3", BACKEND),
+];
+
+/// `resource.<type>` and `data.<type>` of the environment and onboarding
+/// modules, and `backend.s3`.
+fn module_types() -> BTreeSet<String> {
+    let mut types = BTreeSet::new();
+    for kind in [ModuleKind::Environment, ModuleKind::UserOnboard] {
+        let body = parsed(kind);
+        for b in top_blocks(&body, "resource") {
+            types.insert(label(b, 0).unwrap().to_string());
+        }
+        for b in top_blocks(&body, "data") {
+            types.insert(format!("data.{}", label(b, 0).unwrap()));
+        }
+        for t in top_blocks(&body, "terraform") {
+            for backend in top_blocks(&t.body, "backend") {
+                types.insert(format!("backend.{}", label(backend, 0).unwrap()));
+            }
+        }
+    }
+    types
+}
+
+#[test]
+fn the_module_call_table_covers_every_type_the_modules_use() {
+    let table: BTreeSet<String> = MODULE_CALLS.iter().map(|(t, _)| t.to_string()).collect();
+    assert_eq!(
+        table.len(),
+        MODULE_CALLS.len(),
+        "a type appears twice in MODULE_CALLS"
+    );
+    assert_eq!(module_types(), table);
+}
+
+#[test]
+fn the_module_call_table_uses_the_shared_names() {
+    let (task, exec) = user_role_names(ENV, OWNER_KEY);
+    assert!(TASK_ROLE.ends_with(&format!("role/{task}")));
+    assert!(EXEC_ROLE.ends_with(&format!("role/{exec}")));
+    assert!(PARAMETER.ends_with(&format!("parameter{}", environment_parameter_name(ENV))));
+    assert!(LOG_GROUP.ends_with(&format!("log-group:/triple-c/{ENV}")));
+    assert!(CLUSTER.ends_with(&format!("cluster/triple-c-{ENV}")));
+    assert!(ALIAS.ends_with(&format!("alias/triple-c-{ENV}")));
+    let bucket = state_bucket_name("{account}", "{region}");
+    assert_eq!(STATE_BUCKET, format!("arn:aws:s3:::{bucket}"));
+    let env_key = state_key(Deployment::Environment(ENV));
+    let user_key = state_key(Deployment::User {
+        env: ENV,
+        owner_key: OWNER_KEY,
+    });
+    assert_eq!(ENV_STATE, format!("{STATE_BUCKET}/{env_key}"));
+    assert_eq!(ENV_LOCK, format!("{STATE_BUCKET}/{env_key}.tflock"));
+    assert_eq!(USER_STATE, format!("{STATE_BUCKET}/{user_key}"));
+    assert_eq!(USER_LOCK, format!("{STATE_BUCKET}/{user_key}.tflock"));
+}
+
+fn tier_statements(tiers: &[Tier]) -> Vec<serde_json::Value> {
+    tiers
+        .iter()
+        .flat_map(|t| policy_files(*t).iter())
+        .flat_map(|(name, json)| eval::statements_of(&eval::parse(name, json)))
+        .collect()
+}
+
+fn allowed_by(stmts: &[serde_json::Value], check: &Check) -> bool {
+    eval::evaluate_in(
+        stmts,
+        eval::Request {
+            check,
+            caller: eval::ME,
+            owner: eval::ME,
+        },
+    )
+}
+
+/// Every call of every module resource is allowed by the admin tier's
+/// files alone, and still allowed with the workspace tier (whose Denies an
+/// admin also carries) attached as well.
+#[test]
+fn the_admin_tier_can_apply_every_module_resource() {
+    let admin = tier_statements(&[Tier::EnvironmentAdmin]);
+    let both = tier_statements(&[Tier::EnvironmentAdmin, Tier::WorkspaceUser]);
+    let mut missing = Vec::new();
+    for (ty, calls) in MODULE_CALLS {
+        for c in *calls {
+            for (which, stmts) in [("admin", &admin), ("admin + workspace", &both)] {
+                if !allowed_by(stmts, c) {
+                    missing.push(format!(
+                        "{ty}: {} on {} with {:?} ({which})",
+                        c.action,
+                        eval::rendered(c),
+                        c.context
+                    ));
+                }
+            }
+        }
+    }
+    assert!(missing.is_empty(), "not allowed:\n{}", missing.join("\n"));
+}
+
+/// The sample values the onboarding module's role policies are rendered
+/// with: (template text, value).
+const ONBOARD_SAMPLES: &[(&str, &str)] = &[
+    ("${local.partition}", "aws"),
+    ("${data.aws_partition.current.partition}", "aws"),
+    ("${local.account}", "111122223333"),
+    (
+        "${data.aws_caller_identity.current.account_id}",
+        "111122223333",
+    ),
+    ("${var.region}", "us-west-2"),
+    ("${var.owner_id}", "AROAEXAMPLEME:alice@example.com"),
+    ("${local.env.log_group}", "/triple-c/probe"),
+    (
+        "${local.env.kms_key_arn}",
+        "arn:aws:kms:us-west-2:111122223333:key/00000000-0000-0000-0000-000000000000",
+    ),
+    (
+        "${aws_efs_file_system.this.arn}",
+        "arn:aws:elasticfilesystem:us-west-2:111122223333:file-system/fs-00000000",
+    ),
+];
+
+fn leak(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
+}
+
+/// Every action a per-user role's policies grant, on every resource they
+/// name, is within the permissions boundary: the boundary, not the module,
+/// is the ceiling, so a module change can't widen a role past it unseen.
+/// Each request carries what the role's own statement requires (its
+/// `StringEquals` conditions) and the component tag every Triple-C key and
+/// file system has.
+#[test]
+fn every_onboarding_role_stays_inside_the_boundary() {
+    let body = parsed(ModuleKind::UserOnboard);
+    let boundary = eval::statements_of(&eval::parse(
+        "permissions-boundary.json",
+        permissions_boundary_json(),
+    ));
+    let render_sample = |text: &str| {
+        let mut out = expand_locals(&body, text);
+        for (from, to) in ONBOARD_SAMPLES {
+            out = out.replace(from, to);
+        }
+        assert!(!out.contains("${"), "unrendered {out}");
+        out
+    };
+    let mut seen = 0;
+    for policy in resources(&body, "aws_iam_role_policy") {
+        for stmt in statements(&jsonencoded(policy, "policy")) {
+            assert_eq!(stmt["Effect"], "Allow", "{:?}", policy.labels);
+            for key in stmt.as_object().unwrap().keys() {
+                assert!(
+                    ["Sid", "Effect", "Action", "Resource", "Condition"].contains(&key.as_str()),
+                    "{:?}: {key}",
+                    policy.labels
+                );
+            }
+            let mut context: Vec<(&'static str, ContextValue)> =
+                vec![(RESOURCE_COMPONENT, Literal("user-onboarding"))];
+            if let Some(cond) = stmt.get("Condition") {
+                for (op, entries) in cond.as_object().unwrap() {
+                    assert_eq!(op, "StringEquals", "{:?}: unexpected {op}", policy.labels);
+                    for (k, v) in entries.as_object().unwrap() {
+                        context.push((
+                            leak(k.clone()),
+                            Literal(leak(render_sample(v.as_str().unwrap()))),
+                        ));
+                    }
+                }
+            }
+            let context: Context = Box::leak(context.into_boxed_slice());
+            for action in actions(&stmt) {
+                for resource in eval::strings(&stmt["Resource"]) {
+                    let check = call(
+                        leak(action.clone()),
+                        leak(render_sample(&resource)),
+                        context,
+                    );
+                    assert!(
+                        allowed_by(&boundary, &check),
+                        "{:?}: {action} on {} with {context:?} is outside the boundary",
+                        policy.labels,
+                        check.resource
+                    );
+                    seen += 1;
+                }
+            }
+        }
+    }
+    assert!(seen >= 15, "only {seen} role grants checked");
+}
