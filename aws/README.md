@@ -6,15 +6,16 @@ tier the signed-in identity has under **Settings → Hosts → Check**.
 
 | File | What it is |
 |---|---|
-| `policies/workspace-user.json` | The **workspace user** tier: create, start, stop, connect to and delete **their own** workspaces in an existing environment |
+| `policies/workspace-user.json` | The **workspace user** tier, part 1: create, start, stop, connect to and delete **their own** workspaces in an existing environment |
+| `policies/workspace-user-tasks.json` | The **workspace user** tier, part 2: register, tag and retire **their own** ECS task definitions, and read **their own** secrets (`workspace-user.json` has no room left) |
 | `policies/environment-admin.json` | The **environment admin** tier, part 1: apply and destroy the environment and onboarding modules (`terraform/`) with OpenTofu, and keep their state |
 | `policies/environment-admin-network.json` | The **environment admin** tier, part 2: the network those modules create (VPC, subnets, gateways, routes, security groups) |
 | `policies/permissions-boundary.json` | The **permissions boundary** every Triple-C role must carry. It is never attached to a person |
 
-The admin tier is **two** files, because one managed policy holds only 6,144 characters; both are
-required, and the app's **Copy** lists every file of a tier. An environment admin attaches all three
-tier files (the workspace user's and both admin files): the admin files add environment management
-on top of everything a workspace user can do. Explicit Deny statements in any file apply to anyone
+The workspace tier and the admin tier are each **two** files, because one managed policy holds only
+6,144 characters; both files of a tier are required, and the app's **Copy** lists every file of a
+tier. An environment admin attaches all four tier files (both workspace user files and both admin
+files): the admin files add environment management on top of everything a workspace user can do. Explicit Deny statements in any file apply to anyone
 who has it attached.
 
 ## Workspace user
@@ -26,6 +27,23 @@ following:
 - **Run tasks.** The task definition must be a `triple-c-*` one tagged with the user's own owner
   ID, and the cluster must be a `triple-c-*` one. The new task is tagged with the user's owner ID.
   The user can pass only `triple-c-*` roles tagged with their owner ID, and only to ECS tasks.
+- **Register their own task definitions** (`workspace-user-tasks.json`). `ecs:RegisterTaskDefinition`
+  on `triple-c-*` families needs `triple-c:owner = ${aws:userid}` in the request and only the three
+  ordinary tag keys. `ecs:TagResource` on a task definition is allowed only at registration
+  (`ecs:CreateAction = RegisterTaskDefinition`, same owner and tag-key conditions), so a
+  definition can never be retagged. `ecs:DeregisterTaskDefinition` and `ecs:DeleteTaskDefinitions`
+  need the definition to carry the user's owner ID. A task definition that names a task or
+  execution role is also authorized with `iam:PassRole` on it, which `PassOwnTaskRoles` already
+  covers (owner-tagged `triple-c-*` roles, to ECS tasks only; a unit test checks both roles).
+  `RunOwnTasks` still requires the definition's owner tag, so a user can run only definitions they
+  registered. The statements use the revision-free and revision forms alike: the `*` in
+  `task-definition/triple-c-*` matches `family:revision`.
+- **Read their own secrets.** `secretsmanager:GetSecretValue` on `triple-c/*` secrets tagged with
+  their owner ID, so a second machine can read the agent token and attach to a running task
+  (`ReadOwnSecrets`). An explicit Deny (`NeverReadEnvironmentSecrets`) refuses it on any secret
+  tagged `triple-c:component`, even one that also carries their owner tag. (`NeverTouchEnvironmentSecrets`
+  in `workspace-user.json` covers writes; it has no room for another action.) Reading also
+  needs `kms:Decrypt` through Secrets Manager on the environment key, which the first file grants.
 - **Work with their own tasks.** They can stop them, `ecs execute-command` into them, and open an
   SSM session to them. They can end or resume only sessions they started, and open data channels
   (`ssmmessages:OpenDataChannel`) only on those.
@@ -341,7 +359,8 @@ Create each file as a **customer managed policy** and attach it. In the console,
 or role. Inline policies do not fit: a role's inline policies share 10,240 characters and an
 environment admin needs every tier file (about 14,500), and a user's share 2,048. A managed policy
 may hold 6,144 characters, not counting whitespace. Without whitespace, `workspace-user.json` is
-about 6,040 (roughly 100 characters of headroom), `environment-admin.json` about 5,800 (340)
+about 6,040 (roughly 100 characters of headroom), `workspace-user-tasks.json` about 1,460,
+`environment-admin.json` about 5,800 (340)
 and `environment-admin-network.json` about 3,340; a unit test (`every_policy_fits_a_managed_policy`)
 fails before any file outgrows the limit. A tier that outgrows its files gains another file, which
 the app then lists with the others. For IAM Identity Center, add the files as inline policies on the permission set
@@ -352,8 +371,12 @@ With the CLI:
 ```sh
 aws iam create-policy --policy-name triple-c-workspace-user \
   --policy-document file://policies/workspace-user.json
+aws iam create-policy --policy-name triple-c-workspace-user-tasks \
+  --policy-document file://policies/workspace-user-tasks.json
 aws iam attach-user-policy --user-name <user> \
   --policy-arn arn:aws:iam::<account>:policy/triple-c-workspace-user
+aws iam attach-user-policy --user-name <user> \
+  --policy-arn arn:aws:iam::<account>:policy/triple-c-workspace-user-tasks
 ```
 
 ## Known gaps
@@ -492,6 +515,19 @@ asserts that every role the admin creates carries the boundary.
 
 Still open:
 
+- **`ecs:RegisterTaskDefinition` and resource-level permissions (phase 5, unverified).** The
+  statements in `workspace-user-tasks.json` scope the action to `task-definition/triple-c-*`, but
+  whether ECS authorizes a register call against that ARN (the family is known, the revision is
+  not yet) or only against `*` has not been checked on real IAM; the unit tests' evaluator only
+  proves the JSON means what it says. The `aws:RequestTag` and `aws:TagKeys` conditions are
+  documented for the action either way. Probe, as a role holding the workspace files: register a
+  `triple-c-e2e-*` definition tagged with the owner and the two other keys. If it is denied
+  while the policy simulator allows it, change `Resource` of `RegisterOwnTaskDefinitions` to
+  `"*"` (the request-tag conditions still confine it; the family name is then unenforced) and
+  record that here. Also confirm `ecs:TagResource` with `ecs:CreateAction = RegisterTaskDefinition`
+  tags at registration, that `DeregisterTaskDefinition`/`DeleteTaskDefinitions` honour
+  `aws:ResourceTag`, and that a user can read their own secret only (`live_tests.rs` checks the
+  secret read);
 - the `existing` network mode against a user's own VPC, and an onboarding by a workspace user
   from an admin bundle (the same module, applied with admin credentials);
 - `DisassociateGoneAddresses` cannot touch a **live** association. Probe: allocate an untagged

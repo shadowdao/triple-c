@@ -561,6 +561,7 @@ async fn a_role_with_no_policy_checks_as_insufficient_and_lists_every_action() {
 #[ignore]
 async fn a_role_without_simulate_permission_falls_back_to_probes() {
     e2e(|e| async move {
+        // `InspectOwnPrincipal` lives in the first file.
         let mut doc: serde_json::Value =
             serde_json::from_str(policy_files(Tier::WorkspaceUser)[0].1).unwrap();
         doc["Statement"]
@@ -570,6 +571,11 @@ async fn a_role_without_simulate_permission_falls_back_to_probes() {
         let role = e.role("nosim", None, &[]).await;
         let arn = e.managed_policy("nosim", &doc.to_string()).await;
         e.attach(&role, &arn).await;
+        // The tasks file is attached whole.
+        let tasks = e
+            .managed_policy("nosim-tasks", policy_files(Tier::WorkspaceUser)[1].1)
+            .await;
+        e.attach(&role, &tasks).await;
         let cfg = e.assume(&role).await;
         let me = caller_identity(&cfg).await.expect("identity");
         assert_eq!(me.user_id, role.session_user_id());
@@ -789,6 +795,20 @@ async fn secrets_use_the_environment_key_and_only_their_owner_can_change_them() 
             "put own",
             as_user.put_secret_value().secret_id(&own).secret_string("v2").send().await,
         );
+
+        // `workspace-user-tasks.json`: the owner reads their own secret, never
+        // the environment's or someone else's.
+        let read = ok(
+            "get own",
+            as_user.get_secret_value().secret_id(&own).send().await,
+        );
+        assert_eq!(read.secret_string(), Some("v2"));
+        for (what, arn) in [("environment", &environment), ("someone else's", &someone_elses)] {
+            denied(
+                &format!("get {what}"),
+                as_user.get_secret_value().secret_id(arn).send().await,
+            );
+        }
 
         // Any other key is refused.
         for (i, (what, k)) in [("no KmsKeyId", None), ("aws/secretsmanager", Some(aws_managed.as_str()))]

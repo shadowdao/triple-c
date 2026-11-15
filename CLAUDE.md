@@ -312,7 +312,7 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   `identity.rs` is `GetCallerIdentity` and the principal to simulate (an assumed role's ARN is
   recovered with `iam:GetRole`, because SSO roles have an `/aws-reserved/…` path the session ARN
   lacks); `error.rs` classifies SDK errors (SSO expired, access denied naming the action, …);
-  `policies.rs` embeds `aws/policies/*.json` (the tier policies — the admin tier spans several
+  `policies.rs` embeds `aws/policies/*.json` (the tier policies — both tiers span several
   files, `policy_files` lists them — and the permissions boundary) and the table of checks the
   simulator is asked; `permissions.rs` runs it
   (`SimulatePrincipalPolicy`, adaptive retries — it throttles — or read-only probes when the

@@ -547,8 +547,11 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&f.json).expect("policy JSON");
         }
         let ws = aws_policy_document(Tier::WorkspaceUser);
-        assert_eq!(ws.len(), 1);
-        assert_eq!(ws[0].name, "workspace-user.json");
+        let names: Vec<&str> = ws.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["workspace-user.json", "workspace-user-tasks.json"]);
+        for f in &ws {
+            serde_json::from_str::<serde_json::Value>(&f.json).expect("policy JSON");
+        }
         assert_eq!(
             serde_json::to_value(&ws[0]).unwrap()["name"],
             "workspace-user.json"
