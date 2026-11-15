@@ -52,7 +52,8 @@ pub async fn run_sso_login(profile: &str) -> Result<(), String> {
     log::info!("Running host-side AWS SSO login for profile '{}'", profile);
 
     let status = tokio::process::Command::new("aws")
-        .args(["sso", "login", "--profile", profile])
+        // One argv element, so a name starting with `-` is never an option.
+        .args(["sso", "login", &format!("--profile={profile}")])
         .status()
         .await
         .map_err(|e| format!("Failed to run aws sso login: {}", e))?;

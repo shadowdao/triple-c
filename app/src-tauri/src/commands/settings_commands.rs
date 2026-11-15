@@ -78,6 +78,13 @@ pub(crate) fn restore_marketplace_fields(incoming: &mut AppSettings, stored: &Ap
     incoming.global_marketplace_installs = stored.global_marketplace_installs.clone();
 }
 
+/// Host connections change only through `host_commands` (which validates
+/// them and owns their keychain entries) and settings import, never through
+/// a settings save the frontend posts back.
+pub(crate) fn restore_host_fields(incoming: &mut AppSettings, stored: &AppSettings) {
+    incoming.hosts = stored.hosts.clone();
+}
+
 #[tauri::command]
 pub async fn update_settings(
     mut settings: AppSettings,
@@ -87,6 +94,7 @@ pub async fn update_settings(
 
     validate_settings_update(&before, &settings)?;
     restore_marketplace_fields(&mut settings, &before);
+    restore_host_fields(&mut settings, &before);
 
     let saved = state.settings_store.update(settings)?;
 
@@ -465,5 +473,28 @@ mod tests {
             !incoming.auto_check_updates,
             "the edit the save was for still applies"
         );
+    }
+
+    #[test]
+    fn update_settings_cannot_change_hosts() {
+        use crate::models::{AwsAuth, HostConnection, HostKind};
+        let conn = |id: &str, region: &str| HostConnection {
+            id: id.into(),
+            name: "Prod".into(),
+            kind: HostKind::Aws {
+                auth: AwsAuth::Profile { name: "dev".into() },
+                default_region: region.into(),
+            },
+        };
+        let mut stored = AppSettings::default();
+        stored.hosts.push(conn("c1", "us-west-2"));
+        let mut incoming = AppSettings::default();
+        incoming.hosts = vec![conn("c1", "not a region"), conn("evil", "us-east-1")];
+        incoming.auto_check_updates = false;
+
+        restore_host_fields(&mut incoming, &stored);
+
+        assert_eq!(incoming.hosts, stored.hosts);
+        assert!(!incoming.auto_check_updates);
     }
 }

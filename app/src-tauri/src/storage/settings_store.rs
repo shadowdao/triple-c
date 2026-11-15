@@ -75,8 +75,9 @@ impl SettingsStore {
 
     pub fn update(&self, new_settings: AppSettings) -> Result<AppSettings, String> {
         let mut settings = self.lock();
+        // Save first: a failed save must not leave the unsaved copy in memory.
+        self.save(&new_settings)?;
         *settings = new_settings.clone();
-        self.save(&settings)?;
         Ok(new_settings)
     }
 }

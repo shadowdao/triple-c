@@ -63,11 +63,12 @@ where
         Err(e) => return Err(e),
     }
 
-    let mut all = settings.get();
-    all.hosts.push(conn.clone());
     if let Some(k) = &keys {
         store_keys(&conn.id, k).map_err(other)?;
     }
+    // Read after the keychain step to keep the read-modify-write window short.
+    let mut all = settings.get();
+    all.hosts.push(conn.clone());
     if let Err(e) = settings.update(all) {
         if keys.is_some() {
             let _ = delete_keys(&conn.id);
@@ -90,12 +91,26 @@ async fn real_identity(c: Credentials) -> Result<CallerIdentity, AwsError> {
 
 fn aws_conn(id: &str, settings: &AppSettings) -> Result<HostConnection, String> {
     check_id(id)?;
-    settings
+    let conn = settings
         .hosts
         .iter()
         .find(|h| h.id == id)
         .cloned()
-        .ok_or_else(|| "Connection not found".to_string())
+        .ok_or_else(|| "Connection not found".to_string())?;
+    // Defense in depth: stored values are re-checked before they reach the
+    // keychain, the SDK or a subprocess.
+    let HostKind::Aws { auth, default_region } = &conn.kind;
+    validate_region(default_region)?;
+    match auth {
+        AwsAuth::Profile { name } => {
+            validate_profile_name(name)?;
+        }
+        AwsAuth::Keys { keyring_ref } if keyring_ref != id => {
+            return Err("Connection's keychain reference does not match its id".to_string());
+        }
+        AwsAuth::Keys { .. } => {}
+    }
+    Ok(conn)
 }
 
 fn validated(name: &str, region: &str) -> Result<(String, String), AwsError> {
@@ -188,12 +203,12 @@ pub async fn remove_host_connection(
     id: String,
     state: State<'_, AppState>,
 ) -> Result<AppSettings, String> {
-    let mut settings = state.settings_store.get();
-    let conn = aws_conn(&id, &settings)?;
+    let conn = aws_conn(&id, &state.settings_store.get())?;
     let HostKind::Aws { auth, .. } = &conn.kind;
     if let AwsAuth::Keys { keyring_ref } = auth {
         secure::delete_aws_keys(keyring_ref)?;
     }
+    let mut settings = state.settings_store.get();
     settings.hosts.retain(|h| h.id != id);
     state.settings_store.update(settings)
 }
@@ -219,8 +234,8 @@ pub async fn aws_connection_sso_login(
     let AwsAuth::Profile { name } = auth else {
         return Err("Only profile connections use SSO".to_string());
     };
-    validate_profile_name(name)?;
-    super::aws_commands::run_sso_login(name).await
+    let name = validate_profile_name(name)?;
+    super::aws_commands::run_sso_login(&name).await
 }
 
 #[tauri::command]
@@ -363,5 +378,76 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, AwsError::Other { .. }));
         assert_eq!(*calls.borrow(), vec!["store c2".to_string(), "delete c2".to_string()]);
+        assert!(settings.get().hosts.is_empty(), "no unsaved connection in memory");
+    }
+
+    #[tokio::test]
+    async fn a_non_sso_identity_error_on_a_profile_saves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = store_in(&dir);
+        let err = add_connection_with(
+            profile_conn(),
+            None,
+            |_| async { Err(AwsError::ProfileNotFound { profile: "dev".into() }) },
+            |_, _| Ok(()),
+            |_| Ok(()),
+            &settings,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AwsError::ProfileNotFound { .. }));
+        assert!(settings.get().hosts.is_empty());
+        assert!(!dir.path().join("settings.json").exists());
+    }
+
+    #[tokio::test]
+    async fn a_failing_store_keys_saves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = store_in(&dir);
+        let deletes = RefCell::new(0);
+        let err = add_connection_with(
+            keys_conn(),
+            Some(keys()),
+            |_| async { Ok(ident()) },
+            |_, _| Err("keychain locked".to_string()),
+            |_| { *deletes.borrow_mut() += 1; Ok(()) },
+            &settings,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AwsError::Other { .. }));
+        assert!(settings.get().hosts.is_empty());
+        assert!(!dir.path().join("settings.json").exists());
+    }
+
+    #[test]
+    fn a_keys_connection_whose_keyring_ref_differs_from_its_id_is_refused() {
+        let mut s = AppSettings::default();
+        let mut c = keys_conn();
+        c.kind = HostKind::Aws {
+            auth: AwsAuth::Keys { keyring_ref: "other".into() },
+            default_region: "us-west-2".into(),
+        };
+        s.hosts.push(c);
+        assert!(aws_conn("c2", &s).is_err());
+        s.hosts = vec![keys_conn()];
+        assert!(aws_conn("c2", &s).is_ok());
+    }
+
+    #[test]
+    fn stored_regions_and_profiles_are_revalidated() {
+        let with = |profile: &str, region: &str| {
+            let mut c = profile_conn();
+            c.kind = HostKind::Aws {
+                auth: AwsAuth::Profile { name: profile.into() },
+                default_region: region.into(),
+            };
+            let mut s = AppSettings::default();
+            s.hosts.push(c);
+            s
+        };
+        assert!(aws_conn("c1", &with("dev", "us-west-2")).is_ok());
+        assert!(aws_conn("c1", &with("dev", "not a region")).is_err());
+        assert!(aws_conn("c1", &with("a b", "us-west-2")).is_err());
     }
 }
