@@ -361,9 +361,21 @@ fn the_security_group_has_no_ingress() {
     );
 }
 
+const ALL_MODULES: [ModuleKind; 3] = [
+    ModuleKind::Environment,
+    ModuleKind::UserOnboard,
+    ModuleKind::PermissionsBoundary,
+];
+
 #[test]
 fn no_provider_endpoint_overrides() {
-    let body = parsed(ModuleKind::Environment);
+    for kind in ALL_MODULES {
+        no_provider_endpoint_overrides_in(kind);
+    }
+}
+
+fn no_provider_endpoint_overrides_in(kind: ModuleKind) {
+    let body = parsed(kind);
     let provider = aws_provider(&body);
     assert_eq!(
         render(attr(&provider.body, "region").unwrap()),
@@ -371,7 +383,8 @@ fn no_provider_endpoint_overrides() {
     );
     assert!(attr(&provider.body, "endpoints").is_none());
     assert!(top_blocks(&provider.body, "endpoints").next().is_none());
-    let text = tf_text(ModuleKind::Environment);
+    // A role's `assume_role_policy` is not a provider `assume_role`.
+    let text = tf_text(kind).replace("assume_role_policy", "");
     for needle in [
         "endpoints",
         "endpoint_url",
@@ -413,10 +426,10 @@ fn no_provider_endpoint_overrides() {
     );
 
     // The lock file ships with the module and pins the same version.
-    let lock = module_files(ModuleKind::Environment)
+    let lock = module_files(kind)
         .iter()
         .find(|(name, _)| *name == ".terraform.lock.hcl")
-        .expect("lock file shipped")
+        .unwrap_or_else(|| panic!("{kind:?}: lock file shipped"))
         .1;
     assert!(lock.contains("registry.opentofu.org/hashicorp/aws"));
     assert!(
@@ -468,19 +481,27 @@ fn every_variable_is_validated() {
 
 #[test]
 fn module_files_ship_the_lock_file() {
-    let names: Vec<_> = module_files(ModuleKind::Environment)
-        .iter()
-        .map(|(n, _)| *n)
-        .collect();
-    for want in [
-        "versions.tf",
-        "variables.tf",
-        "main.tf",
-        "network.tf",
-        "outputs.tf",
-        ".terraform.lock.hcl",
+    for (kind, extra) in [
+        (ModuleKind::Environment, &["network.tf"][..]),
+        (ModuleKind::UserOnboard, &["iam.tf", "efs.tf"][..]),
+        (ModuleKind::PermissionsBoundary, &[][..]),
     ] {
-        assert!(names.contains(&want), "{want} missing from {names:?}");
+        let names: Vec<_> = module_files(kind).iter().map(|(n, _)| *n).collect();
+        for want in [
+            "versions.tf",
+            "variables.tf",
+            "main.tf",
+            "outputs.tf",
+            ".terraform.lock.hcl",
+        ]
+        .iter()
+        .chain(extra)
+        {
+            assert!(
+                names.contains(want),
+                "{kind:?}: {want} missing from {names:?}"
+            );
+        }
     }
 }
 
@@ -562,4 +583,623 @@ fn environment_vars_cover_every_network_mode() {
     assert!(matches!(parsed, NetworkChoice::Existing { .. }));
     let parsed: NetworkChoice = serde_json::from_value(json!({ "mode": "private-nat" })).unwrap();
     assert_eq!(parsed, NetworkChoice::PrivateNat);
+}
+
+// ---------------------------------------------------------------------------
+// The onboarding and permissions-boundary modules.
+// ---------------------------------------------------------------------------
+
+const ONBOARD_VARIABLES: [&str; 5] = [
+    "environment_name",
+    "region",
+    "owner_id",
+    "owner_key",
+    "bedrock_on_task_role",
+];
+
+/// The boundary ARN every module-created role carries, as the module writes it.
+const BOUNDARY_ARN_TEMPLATE: &str = "arn:${data.aws_partition.current.partition}:iam::\
+     ${data.aws_caller_identity.current.account_id}:policy/triple-c-permissions-boundary";
+
+/// The template text of a string expression: a literal, or a quoted
+/// template with its `${...}` interpolations kept verbatim.
+fn template_text(expr: &Expression) -> String {
+    match expr {
+        Expression::String(s) => s.clone(),
+        Expression::TemplateExpr(t) => t.to_string(),
+        other => format!("${{{}}}", render(other)),
+    }
+}
+
+/// `local.<name>`'s expression, from the module's (single) definition.
+fn local_def<'a>(body: &'a Body, name: &str) -> &'a Expression {
+    let defs: Vec<_> = top_blocks(body, "locals")
+        .filter_map(|b| attr(&b.body, name))
+        .collect();
+    assert_eq!(defs.len(), 1, "local.{name} defined once");
+    defs[0]
+}
+
+/// Template text with every whole `${local.x}` replaced by the local's own
+/// text, repeatedly, so the result names only variables, data sources and
+/// traversals into other locals (`${local.env.log_group}` stays as written).
+fn expand_locals(body: &Body, text: &str) -> String {
+    let mut out = text.to_string();
+    let mut from = 0;
+    for _ in 0..32 {
+        let Some(found) = out[from..].find("${local.") else {
+            return out;
+        };
+        let start = from + found;
+        let name_start = start + "${local.".len();
+        let name_len = out[name_start..]
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(out.len() - name_start);
+        let name_end = name_start + name_len;
+        if !out[name_end..].starts_with('}') {
+            from = name_end;
+            continue;
+        }
+        let replacement = match local_def(body, &out[name_start..name_end]) {
+            e @ (Expression::String(_) | Expression::TemplateExpr(_)) => template_text(e),
+            other => format!("${{{}}}", render(other)),
+        };
+        out = format!("{}{}{}", &out[..start], replacement, &out[name_end + 1..]);
+        from = start;
+    }
+    panic!("locals nest too deeply in {text}")
+}
+
+/// An HCL value as JSON, keeping interpolations as template text
+/// (`aws_iam_role.task.arn` becomes `"${aws_iam_role.task.arn}"`), so a
+/// `jsonencode({...})` policy can be inspected like the JSON it produces.
+fn to_json(expr: &Expression) -> serde_json::Value {
+    use serde_json::Value;
+    match expr {
+        Expression::Null => Value::Null,
+        Expression::Bool(b) => Value::Bool(*b),
+        Expression::Number(n) => serde_json::to_value(n).unwrap(),
+        Expression::Array(items) => Value::Array(items.iter().map(to_json).collect()),
+        Expression::Object(obj) => {
+            Value::Object(obj.iter().map(|(k, v)| (key_name(k), to_json(v))).collect())
+        }
+        other => Value::String(template_text(other)),
+    }
+}
+
+/// The `jsonencode(...)` argument of `attr_name`, as JSON.
+fn jsonencoded(block: &Block, attr_name: &str) -> serde_json::Value {
+    let expr = attr(&block.body, attr_name)
+        .unwrap_or_else(|| panic!("{:?} has no {attr_name}", block.labels));
+    let Expression::FuncCall(call) = expr else {
+        panic!("{:?}.{attr_name} is not jsonencode(...)", block.labels)
+    };
+    assert_eq!(call.name.name.as_str(), "jsonencode");
+    to_json(&call.args[0])
+}
+
+fn statements(policy: &serde_json::Value) -> Vec<serde_json::Value> {
+    assert_eq!(policy["Version"], "2012-10-17");
+    policy["Statement"]
+        .as_array()
+        .expect("Statement list")
+        .clone()
+}
+
+/// A statement's actions (a string or a list).
+fn actions(stmt: &serde_json::Value) -> BTreeSet<String> {
+    match &stmt["Action"] {
+        serde_json::Value::String(a) => BTreeSet::from([a.clone()]),
+        serde_json::Value::Array(a) => a.iter().map(|v| v.as_str().unwrap().to_string()).collect(),
+        other => panic!("bad Action {other}"),
+    }
+}
+
+fn resource(body: &Body, ty: &str, name: &str) -> Block {
+    resources(body, ty)
+        .into_iter()
+        .find(|b| label(b, 1) == Some(name))
+        .unwrap_or_else(|| panic!("{ty}.{name} missing"))
+        .clone()
+}
+
+/// The inline policies attached to `aws_iam_role.<role>`, by resource name.
+fn role_policies(body: &Body, role: &str) -> Vec<Block> {
+    resources(body, "aws_iam_role_policy")
+        .into_iter()
+        .filter(|b| render(attr(&b.body, "role").unwrap()) == format!("aws_iam_role.{role}.id"))
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn every_onboarding_role_carries_the_boundary_and_owner_tag() {
+    let body = parsed(ModuleKind::UserOnboard);
+
+    // Owner, environment, component and version come from the provider's
+    // default_tags, so every role (and everything else) carries them.
+    let tags = default_tags(&body);
+    assert_eq!(
+        object_keys(tags),
+        BTreeSet::from([
+            "triple-c:component".to_string(),
+            "triple-c:environment".to_string(),
+            "triple-c:owner".to_string(),
+            "triple-c:template-version".to_string(),
+        ])
+    );
+    assert_eq!(
+        object_get(tags, "triple-c:component"),
+        Some(&Expression::String("user-onboarding".into()))
+    );
+    assert_eq!(
+        render(object_get(tags, "triple-c:owner").unwrap()),
+        "var.owner_id"
+    );
+    assert_eq!(
+        render(object_get(tags, "triple-c:environment").unwrap()),
+        "var.environment_name"
+    );
+    assert_eq!(
+        tf_text(ModuleKind::UserOnboard)
+            .matches("triple-c:component")
+            .count(),
+        1
+    );
+    for block in all_blocks(&body) {
+        if block.identifier.as_str() == "default_tags" {
+            continue;
+        }
+        for key in ["tags", "tags_all"] {
+            if let Some(t) = attr(&block.body, key) {
+                let keys = object_keys(t);
+                assert!(
+                    keys.iter().all(|k| !k.starts_with("triple-c:")),
+                    "{:?} sets triple-c tags {keys:?}",
+                    block.labels
+                );
+            }
+        }
+    }
+
+    // Exactly the two per-user roles, named as the app names them, each
+    // bounded; their permissions are inline only (nothing attached that the
+    // module doesn't spell out).
+    let roles = resources(&body, "aws_iam_role");
+    assert_eq!(roles.len(), 2, "task and exec roles");
+    let key = owner_key("AROAEXAMPLE:alice");
+    let (task, exec) = user_role_names("dev", &key);
+    for (name, want) in [("task", task), ("exec", exec)] {
+        let role = resource(&body, "aws_iam_role", name);
+        let named = expand_locals(&body, &template_text(attr(&role.body, "name").unwrap()))
+            .replace("${var.environment_name}", "dev")
+            .replace("${var.owner_key}", &key);
+        assert_eq!(named, want);
+        let boundary = attr(&role.body, "permissions_boundary")
+            .unwrap_or_else(|| panic!("{name} role has no permissions_boundary"));
+        assert_eq!(
+            expand_locals(&body, &template_text(boundary)),
+            BOUNDARY_ARN_TEMPLATE
+        );
+        assert!(attr(&role.body, "managed_policy_arns").is_none());
+        assert!(top_blocks(&role.body, "inline_policy").next().is_none());
+    }
+    for ty in [
+        "aws_iam_role_policy_attachment",
+        "aws_iam_role_policy_attachments_exclusive",
+        "aws_iam_policy_attachment",
+        "aws_iam_policy",
+        "aws_iam_user",
+        "aws_iam_instance_profile",
+    ] {
+        assert!(resources(&body, ty).is_empty(), "{ty} present");
+    }
+
+    // The onboarding module's version agrees with the app's.
+    let version = local_def(&body, "template_version");
+    assert_eq!(version, &Expression::Number(ONBOARD_MODULE_VERSION.into()));
+    assert!(
+        render(object_get(tags, "triple-c:template-version").unwrap())
+            .contains("local.template_version")
+    );
+}
+
+#[test]
+fn role_trust_is_ecs_tasks_in_this_account_only() {
+    let body = parsed(ModuleKind::UserOnboard);
+    for role in resources(&body, "aws_iam_role") {
+        let trust = jsonencoded(role, "assume_role_policy");
+        assert_eq!(
+            statements(&trust),
+            vec![json!({
+                "Effect": "Allow",
+                "Principal": { "Service": "ecs-tasks.amazonaws.com" },
+                "Action": "sts:AssumeRole",
+                "Condition": {
+                    "StringEquals": {
+                        "aws:SourceAccount": "${data.aws_caller_identity.current.account_id}"
+                    }
+                }
+            })],
+            "{:?}",
+            role.labels
+        );
+    }
+}
+
+#[test]
+fn the_users_file_system_admits_only_their_task_role_through_an_access_point() {
+    let body = parsed(ModuleKind::UserOnboard);
+
+    let systems = resources(&body, "aws_efs_file_system");
+    assert_eq!(systems.len(), 1);
+    let fs = systems[0];
+    assert_eq!(label(fs, 1), Some("this"));
+    assert_eq!(attr(&fs.body, "encrypted"), Some(&Expression::Bool(true)));
+    assert_eq!(
+        attr(&fs.body, "performance_mode"),
+        Some(&Expression::String("generalPurpose".into()))
+    );
+    assert_eq!(
+        attr(&fs.body, "throughput_mode"),
+        Some(&Expression::String("elastic".into()))
+    );
+
+    // One mount target in each of the environment's two subnets.
+    let targets = resources(&body, "aws_efs_mount_target");
+    assert_eq!(targets.len(), 1);
+    let mt = targets[0];
+    assert_eq!(attr(&mt.body, "count"), Some(&Expression::Number(2.into())));
+    assert_eq!(
+        render(attr(&mt.body, "file_system_id").unwrap()),
+        "aws_efs_file_system.this.id"
+    );
+    assert_eq!(
+        render(attr(&mt.body, "subnet_id").unwrap()),
+        "local.env.subnet_ids[count.index]"
+    );
+    assert_eq!(
+        to_json(attr(&mt.body, "security_groups").unwrap()),
+        json!(["${aws_security_group.efs.id}"])
+    );
+
+    // The file system policy.
+    let policies = resources(&body, "aws_efs_file_system_policy");
+    assert_eq!(policies.len(), 1);
+    assert_eq!(
+        render(attr(&policies[0].body, "file_system_id").unwrap()),
+        "aws_efs_file_system.this.id"
+    );
+    let stmts = statements(&jsonencoded(policies[0], "policy"));
+    let fs_arn = "${aws_efs_file_system.this.arn}";
+    let deny_insecure = stmts
+        .iter()
+        .find(|s| s["Condition"]["Bool"]["aws:SecureTransport"] == "false")
+        .expect("a SecureTransport deny");
+    assert_eq!(deny_insecure["Effect"], "Deny");
+    assert_eq!(deny_insecure["Principal"], json!({ "AWS": "*" }));
+    assert_eq!(deny_insecure["Action"], "*");
+    assert_eq!(deny_insecure["Resource"], fs_arn);
+
+    let deny_direct = stmts
+        .iter()
+        .find(|s| s["Condition"]["Null"]["elasticfilesystem:AccessPointArn"] == "true")
+        .expect("a deny without an access point");
+    assert_eq!(deny_direct["Effect"], "Deny");
+    assert_eq!(deny_direct["Principal"], json!({ "AWS": "*" }));
+    assert!(
+        actions(deny_direct).is_superset(&BTreeSet::from([
+            "elasticfilesystem:ClientMount".to_string(),
+            "elasticfilesystem:ClientWrite".to_string(),
+            "elasticfilesystem:ClientRootAccess".to_string(),
+        ])),
+        "{deny_direct}"
+    );
+    assert_eq!(deny_direct["Resource"], fs_arn);
+
+    let allows: Vec<_> = stmts.iter().filter(|s| s["Effect"] == "Allow").collect();
+    assert_eq!(allows.len(), 1, "one Allow: {stmts:?}");
+    assert_eq!(
+        allows[0]["Principal"],
+        json!({ "AWS": "${aws_iam_role.task.arn}" })
+    );
+    assert_eq!(
+        actions(allows[0]),
+        BTreeSet::from([
+            "elasticfilesystem:ClientMount".to_string(),
+            "elasticfilesystem:ClientWrite".to_string(),
+        ])
+    );
+    assert_eq!(allows[0]["Resource"], fs_arn);
+    assert!(allows[0].get("Condition").is_none() || allows[0]["Condition"].is_null());
+    assert_eq!(stmts.len(), 3, "{stmts:?}");
+
+    // The task role may mount this file system and no other.
+    let efs: Vec<_> = role_policies(&body, "task")
+        .iter()
+        .flat_map(|p| statements(&jsonencoded(p, "policy")))
+        .filter(|s| {
+            actions(s)
+                .iter()
+                .any(|a| a.starts_with("elasticfilesystem:"))
+        })
+        .collect();
+    assert_eq!(efs.len(), 1);
+    assert_eq!(efs[0]["Resource"], fs_arn);
+}
+
+#[test]
+fn the_environment_security_group_gains_no_ingress() {
+    let body = parsed(ModuleKind::UserOnboard);
+    for ty in [
+        "aws_vpc_security_group_ingress_rule",
+        "aws_vpc_security_group_egress_rule",
+        "aws_security_group_rule",
+        "aws_network_interface_sg_attachment",
+    ] {
+        assert!(resources(&body, ty).is_empty(), "{ty} present");
+    }
+
+    // The module's only security group is the user's mount-target group.
+    let groups = resources(&body, "aws_security_group");
+    assert_eq!(groups.len(), 1);
+    let sg = groups[0];
+    assert_eq!(label(sg, 1), Some("efs"));
+    let key = owner_key("AROAEXAMPLE:alice");
+    let name = expand_locals(&body, &template_text(attr(&sg.body, "name").unwrap()))
+        .replace("${var.environment_name}", "dev")
+        .replace("${var.owner_key}", &key);
+    assert_eq!(name, format!("triple-c-dev-{key}-efs"));
+
+    // Its single ingress rule: NFS from the environment's task group, taken
+    // from the record. There is no other ingress anywhere in the module.
+    let ingress: Vec<_> = all_blocks(&body)
+        .into_iter()
+        .filter(|b| b.identifier.as_str() == "ingress")
+        .collect();
+    assert_eq!(ingress.len(), 1, "exactly one ingress rule");
+    assert_eq!(top_blocks(&sg.body, "ingress").count(), 1);
+    let rule = &ingress[0].body;
+    assert_eq!(
+        attr(rule, "from_port"),
+        Some(&Expression::Number(2049.into()))
+    );
+    assert_eq!(
+        attr(rule, "to_port"),
+        Some(&Expression::Number(2049.into()))
+    );
+    assert_eq!(
+        attr(rule, "protocol"),
+        Some(&Expression::String("tcp".into()))
+    );
+    assert_eq!(
+        to_json(attr(rule, "security_groups").unwrap()),
+        json!(["${local.env.security_group_id}"])
+    );
+    for open in ["cidr_blocks", "ipv6_cidr_blocks", "prefix_list_ids", "self"] {
+        assert!(attr(rule, open).is_none(), "the NFS rule sets {open}");
+    }
+
+    // Mount targets never initiate connections (and groups are stateful), so
+    // the group has no egress; `egress = []` removes any added out of band.
+    assert_eq!(attr(&sg.body, "egress"), Some(&Expression::Array(vec![])));
+    assert!(top_blocks(&sg.body, "egress").next().is_none());
+
+    // The environment's group is referenced only as that rule's source.
+    let text = tf_text(ModuleKind::UserOnboard);
+    assert_eq!(text.matches("local.env.security_group_id").count(), 1);
+    assert_eq!(
+        text.matches("security_group_id").count(),
+        2,
+        "the rule and the efs group output"
+    );
+}
+
+#[test]
+fn exec_role_reads_only_its_owners_secrets() {
+    let body = parsed(ModuleKind::UserOnboard);
+    let account = "${data.aws_caller_identity.current.account_id}";
+    let partition = "${data.aws_partition.current.partition}";
+    let expand = |v: &serde_json::Value| expand_locals(&body, v.as_str().unwrap());
+
+    let policies = role_policies(&body, "exec");
+    assert_eq!(policies.len(), 1, "one exec policy");
+    let stmts = statements(&jsonencoded(&policies[0], "policy"));
+    let all: BTreeSet<String> = stmts.iter().flat_map(actions).collect();
+    assert_eq!(
+        all,
+        BTreeSet::from([
+            "secretsmanager:GetSecretValue".to_string(),
+            "kms:Decrypt".to_string(),
+            "logs:CreateLogStream".to_string(),
+            "logs:PutLogEvents".to_string(),
+        ])
+    );
+    assert!(stmts.iter().all(|s| s["Effect"] == "Allow"));
+
+    let secrets = stmts
+        .iter()
+        .find(|s| actions(s).contains("secretsmanager:GetSecretValue"))
+        .unwrap();
+    assert_eq!(actions(secrets).len(), 1);
+    assert_eq!(
+        expand(&secrets["Resource"]),
+        format!("arn:{partition}:secretsmanager:${{var.region}}:{account}:secret:triple-c/*")
+    );
+    assert_eq!(
+        secrets["Condition"],
+        json!({ "StringEquals": { "aws:ResourceTag/triple-c:owner": "${var.owner_id}" } })
+    );
+
+    let decrypt = stmts
+        .iter()
+        .find(|s| actions(s).contains("kms:Decrypt"))
+        .unwrap();
+    assert_eq!(actions(decrypt).len(), 1);
+    assert_eq!(decrypt["Resource"], "${local.env.kms_key_arn}");
+    assert_eq!(
+        decrypt["Condition"],
+        json!({ "StringEquals": { "kms:ViaService": "secretsmanager.${var.region}.amazonaws.com" } })
+    );
+
+    // Logs: the environment's log group only, for both roles.
+    let log_group = format!(
+        "arn:{partition}:logs:${{var.region}}:{account}:log-group:${{local.env.log_group}}:*"
+    );
+    for role in ["exec", "task"] {
+        let logs: Vec<_> = role_policies(&body, role)
+            .iter()
+            .flat_map(|p| statements(&jsonencoded(p, "policy")))
+            .filter(|s| actions(s).iter().any(|a| a.starts_with("logs:")))
+            .collect();
+        assert_eq!(logs.len(), 1, "{role}");
+        assert_eq!(
+            actions(&logs[0]),
+            BTreeSet::from([
+                "logs:CreateLogStream".to_string(),
+                "logs:PutLogEvents".to_string()
+            ])
+        );
+        assert_eq!(expand(&logs[0]["Resource"]), log_group, "{role}");
+    }
+
+    // The task role: exec channels, logs and its file system; Bedrock only
+    // through a separate policy that exists when bedrock_on_task_role is set.
+    let task = role_policies(&body, "task");
+    assert_eq!(task.len(), 2, "task policy + optional bedrock policy");
+    let mut always = BTreeSet::new();
+    for p in &task {
+        let acts: BTreeSet<String> = statements(&jsonencoded(p, "policy"))
+            .iter()
+            .flat_map(actions)
+            .collect();
+        if acts.iter().any(|a| a.starts_with("bedrock:")) {
+            assert_eq!(
+                render(attr(&p.body, "count").expect("bedrock policy is counted")),
+                "var.bedrock_on_task_role ? 1 : 0"
+            );
+            assert!(
+                acts.iter().all(|a| a.starts_with("bedrock:Invoke")),
+                "{acts:?}"
+            );
+        } else {
+            assert!(attr(&p.body, "count").is_none());
+            always.extend(acts);
+        }
+    }
+    assert_eq!(
+        always,
+        BTreeSet::from([
+            "ssmmessages:CreateControlChannel".to_string(),
+            "ssmmessages:CreateDataChannel".to_string(),
+            "ssmmessages:OpenControlChannel".to_string(),
+            "ssmmessages:OpenDataChannel".to_string(),
+            "logs:CreateLogStream".to_string(),
+            "logs:PutLogEvents".to_string(),
+            "elasticfilesystem:ClientMount".to_string(),
+            "elasticfilesystem:ClientWrite".to_string(),
+        ])
+    );
+}
+
+#[test]
+fn onboarding_reads_the_environment_only_from_its_record() {
+    let body = parsed(ModuleKind::UserOnboard);
+    let params: Vec<_> = top_blocks(&body, "data")
+        .filter(|b| label(b, 0) == Some("aws_ssm_parameter"))
+        .collect();
+    assert_eq!(params.len(), 1);
+    assert_eq!(
+        render(attr(&params[0].body, "name").unwrap()),
+        "\"/triple-c/environments/${var.environment_name}\""
+    );
+    assert!(render(local_def(&body, "env")).starts_with("jsondecode(data.aws_ssm_parameter."));
+    // No remote state, no other reads of the environment's deployment.
+    let text = tf_text(ModuleKind::UserOnboard);
+    assert!(!text.contains("terraform_remote_state"));
+    assert!(resources(&body, "aws_ssm_parameter").is_empty());
+}
+
+#[test]
+fn onboarding_vars_name_the_owner() {
+    let owner = "AROAEXAMPLEID:alice@example.com";
+    let vars = onboarding_vars("dev", "us-west-2", owner);
+    assert_eq!(
+        vars,
+        json!({
+            "environment_name": "dev",
+            "region": "us-west-2",
+            "owner_id": owner,
+            "owner_key": owner_key(owner),
+            "bedrock_on_task_role": false,
+        })
+    );
+    let body = parsed(ModuleKind::UserOnboard);
+    let declared: BTreeSet<_> = top_blocks(&body, "variable")
+        .filter_map(|b| label(b, 0))
+        .collect();
+    assert_eq!(declared, ONBOARD_VARIABLES.iter().copied().collect());
+    for v in top_blocks(&body, "variable") {
+        if label(v, 0) != Some("bedrock_on_task_role") {
+            assert!(
+                top_blocks(&v.body, "validation").next().is_some(),
+                "variable {:?} has no validation",
+                label(v, 0)
+            );
+        }
+    }
+}
+
+#[test]
+fn boundary_vars_carry_the_shipped_boundary() {
+    let vars = boundary_vars("us-west-2");
+    assert_eq!(
+        vars,
+        json!({
+            "region": "us-west-2",
+            "policy_json": include_str!("../../../../../aws/policies/permissions-boundary.json"),
+        })
+    );
+    assert_eq!(
+        vars["policy_json"],
+        crate::aws::policies::permissions_boundary_json()
+    );
+
+    let body = parsed(ModuleKind::PermissionsBoundary);
+    let declared: BTreeSet<_> = top_blocks(&body, "variable")
+        .filter_map(|b| label(b, 0))
+        .collect();
+    assert_eq!(declared, BTreeSet::from(["region", "policy_json"]));
+
+    // One policy, no path, whose document is exactly what the app passes.
+    let policies = resources(&body, "aws_iam_policy");
+    assert_eq!(policies.len(), 1);
+    let policy = policies[0];
+    assert_eq!(
+        attr(&policy.body, "name"),
+        Some(&Expression::String(BOUNDARY_POLICY_NAME.into()))
+    );
+    assert!(
+        attr(&policy.body, "path").is_none()
+            || attr(&policy.body, "path") == Some(&Expression::String("/".into()))
+    );
+    assert_eq!(
+        render(attr(&policy.body, "policy").unwrap()),
+        "var.policy_json"
+    );
+    let resource_count = top_blocks(&body, "resource").count();
+    assert_eq!(
+        resource_count, 1,
+        "the boundary module creates only the policy"
+    );
+
+    let tags = default_tags(&body);
+    assert_eq!(
+        object_keys(tags),
+        BTreeSet::from(["triple-c:component".to_string()])
+    );
+    assert_eq!(
+        object_get(tags, "triple-c:component"),
+        Some(&Expression::String("boundary".into()))
+    );
 }

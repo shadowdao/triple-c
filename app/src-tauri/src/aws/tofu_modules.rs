@@ -49,15 +49,32 @@ const ENVIRONMENT_FILES: &[(&str, &str)] = module!("environment":
     ".terraform.lock.hcl",
 );
 
+const USER_ONBOARD_FILES: &[(&str, &str)] = module!("user-onboard":
+    "versions.tf",
+    "variables.tf",
+    "main.tf",
+    "iam.tf",
+    "efs.tf",
+    "outputs.tf",
+    ".terraform.lock.hcl",
+);
+
+const PERMISSIONS_BOUNDARY_FILES: &[(&str, &str)] = module!("permissions-boundary":
+    "versions.tf",
+    "variables.tf",
+    "main.tf",
+    "outputs.tf",
+    ".terraform.lock.hcl",
+);
+
 /// The module's files as (file name relative to the module directory,
 /// contents), lock file included, for writing into a work or bundle folder.
-/// The onboarding and boundary modules arrive in later phase-4 tasks; until
-/// then they have no files.
 #[allow(dead_code)] // used by phase-4 commands
 pub fn module_files(kind: ModuleKind) -> &'static [(&'static str, &'static str)] {
     match kind {
         ModuleKind::Environment => ENVIRONMENT_FILES,
-        ModuleKind::UserOnboard | ModuleKind::PermissionsBoundary => &[],
+        ModuleKind::UserOnboard => USER_ONBOARD_FILES,
+        ModuleKind::PermissionsBoundary => PERMISSIONS_BOUNDARY_FILES,
     }
 }
 
@@ -216,6 +233,30 @@ pub fn environment_vars(
         "subnet_ids": subnet_ids,
         "assign_public_ip": assign_public_ip,
     }))
+}
+
+/// The onboarding module's `terraform.tfvars.json` for the user whose
+/// `aws:userid` is `owner_id`. Bedrock stays on the workspace user's own
+/// credentials unless a later setting opts the task role in.
+#[allow(dead_code)] // used by phase-4 commands
+pub fn onboarding_vars(env: &str, region: &str, owner_id: &str) -> serde_json::Value {
+    json!({
+        "environment_name": env,
+        "region": region,
+        "owner_id": owner_id,
+        "owner_key": owner_key(owner_id),
+        "bedrock_on_task_role": false,
+    })
+}
+
+/// The boundary module's `terraform.tfvars.json`: the shipped boundary
+/// document itself, so the module holds no second copy.
+#[allow(dead_code)] // used by phase-4 commands
+pub fn boundary_vars(region: &str) -> serde_json::Value {
+    json!({
+        "region": region,
+        "policy_json": super::policies::permissions_boundary_json(),
+    })
 }
 
 #[cfg(test)]
