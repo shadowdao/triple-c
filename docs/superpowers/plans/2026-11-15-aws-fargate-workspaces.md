@@ -30,7 +30,7 @@
 - No project data in a task definition's `environment`, tags or `overrides` (P1). Secrets only by `valueFrom` ARN.
 - Container name `workspace`; agent port `host::ssm::AGENT_PORT` (47900); task runs with `enableExecuteCommand: true`, `initProcessEnabled: true`, cap add `SYS_PTRACE` only.
 - Health check exactly as the spec: `curl -sf --max-time 3 -H "Authorization: Bearer $(cat /dev/shm/triple-c/agent-token)" http://127.0.0.1:47900/v1/health`, interval 30, retries 3, startPeriod 120.
-- Fargate CPU/memory pairs are AWS's valid table (256: 512–2048; 512: 1024–4096; 1024: 2048–8192; 2048: 4096–16384 in 1024 steps; 4096: 8192–30720 in 1024 steps; 8192: 16384–61440 in 4096 steps; 16384: 32768–122880 in 8192 steps). Ephemeral 21–200 GiB.
+- Fargate CPU/memory pairs are AWS's valid table (256: 512, 1024 or 2048; 512: 1024–4096; 1024: 2048–8192; 2048: 4096–16384 in 1024 steps; 4096: 8192–30720 in 1024 steps; 8192: 16384–61440 in 4096 steps; 16384: 32768–122880 in 8192 steps). Ephemeral 21–200 GiB.
 - Boundary tests in `host/mod.rs` still pass: no bollard or Docker lifecycle outside `host/`/`docker/`.
 - **Change a policy JSON, its checks and `aws/README.md` together**; every policy ≤ 6,144 characters; re-run the live tests after a policy change.
 - New Tauri commands: `#[tauri::command]` + `generate_handler!` + `allow-*` in `capabilities/default.json`.
