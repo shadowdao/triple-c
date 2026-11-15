@@ -173,10 +173,7 @@ pub(crate) mod ops {
     /// directories, so an id from outside (an import) must be the shape the
     /// commands mint: a UUID-like `[A-Za-z0-9-]{1,64}`.
     pub fn validate_id(id: &str) -> Result<(), String> {
-        let ok = !id.is_empty()
-            && id.len() <= 64
-            && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
-        if ok {
+        if crate::storage::secure::is_valid_connection_id(id) {
             Ok(())
         } else {
             Err("An account or marketplace id is malformed.".to_string())

@@ -300,6 +300,7 @@ export interface AppSettings {
   terminal_gpu_rendering: boolean | null;
   marketplace_accounts: MarketplaceAccount[];
   marketplaces: Marketplace[];
+  hosts: HostConnection[];
   global_marketplace_installs: MarketplaceInstall[];
 }
 
@@ -424,6 +425,34 @@ export interface SettingsImportPreview {
   global_plugin_install_count: number;
   /** Marketplace account tokens the import restores to the keychain. */
   marketplace_account_token_count: number;
+  /** AWS connections the import brings (names cleaned; no key values). */
+  aws_connections: AwsConnectionPreview[];
+  /** AWS access-key entries the import restores to the keychain. */
+  aws_connection_key_count: number;
+  /** Local AWS connections the import drops (it replaces the whole list). */
+  removed_aws_connections: AwsConnectionSummary[];
+}
+
+export interface AwsConnectionSummary {
+  name: string;
+  auth: "profile" | "keys";
+  profile_name: string | null;
+  default_region: string;
+}
+
+export interface AwsConnectionPreview {
+  name: string;
+  auth: "profile" | "keys";
+  profile_name: string | null;
+  default_region: string;
+  /** A connection with this id exists here with different content. */
+  overwrites_existing: boolean;
+  /** The import carries keys for an id that already has keys stored here. */
+  overwrites_keys: boolean;
+  /** The keychain could not be asked whether keys are already stored. */
+  keys_check_failed: boolean;
+  /** The local connection with this id, when the import replaces it. */
+  local: AwsConnectionSummary | null;
 }
 
 /** What `apply_settings_import` returns: the settings that were actually
@@ -1098,4 +1127,60 @@ export interface ViewerPoll {
   exists: boolean;
   hash: string | null;
   size: number | null;
+}
+
+export type AwsAuth =
+  | { method: "profile"; name: string }
+  | { method: "keys"; keyring_ref: string };
+
+export interface HostConnection {
+  id: string;
+  name: string;
+  kind: { type: "aws"; auth: AwsAuth; default_region: string };
+}
+
+export type AwsErrorKind = AwsError["kind"];
+
+/** What a failed AWS command rejects with (`aws::AwsError`, tagged on `kind`). */
+export type AwsError =
+  | { kind: "sso_expired"; profile: string }
+  | { kind: "profile_not_found"; profile: string }
+  | { kind: "keys_missing" }
+  | { kind: "invalid_credentials"; message: string }
+  | { kind: "access_denied"; action: string; message: string }
+  | { kind: "other"; message: string };
+
+export interface CallerIdentity {
+  account: string;
+  arn: string;
+  user_id: string;
+}
+
+export type Tier = "environment_admin" | "workspace_user";
+
+export type Verdict = "allowed" | "denied" | "unverified";
+
+export interface ActionResult {
+  action: string;
+  verdict: Verdict;
+  /** Set when the row is unverified because a call failed; blocks the tier's claim. */
+  note: string | null;
+}
+
+export interface TierResult {
+  tier: Tier;
+  results: ActionResult[];
+}
+
+export type PermissionMethod = "simulated" | { probed: { reason: string } };
+
+export type PermissionSummary = "environment_admin" | "workspace_user" | "insufficient";
+
+export interface PermissionReport {
+  identity: CallerIdentity;
+  region: string;
+  method: PermissionMethod;
+  summary: PermissionSummary;
+  /** `[workspace_user, environment_admin]`. */
+  tiers: TierResult[];
 }

@@ -62,6 +62,18 @@ gix = { version = "0.88", default-features = false, features = ["blocking-networ
 aws-config = { version = "1.13.2", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso", "behavior-version-latest"] }
 aws-sdk-ssm = { version = "1.137.0", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
 aws-sdk-ecs = { version = "1.159.0", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
+aws-sdk-sts = { version = "1.126.0", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
+aws-sdk-iam = { version = "1.136.0", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
+aws-sdk-cloudformation = { version = "1.139.0", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
+aws-sdk-secretsmanager = { version = "1.128.0", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
+# Named by src/aws/connection.rs: the credentials-provider trait (its profile
+# wrapper) and the profile-file set (aws-config's alias for it is deprecated).
+# Both are the versions aws-config already resolves.
+aws-credential-types = { version = "1.3.1", default-features = false }
+aws-runtime = { version = "1.10.4", default-features = false }
+# The default sleep and time source for the hand-built SdkConfig (no env/profile
+# loading); the version and feature already in the tree.
+aws-smithy-async = { version = "1.3.1", default-features = false, features = ["rt-tokio"] }
 
 # Linux only: WebKitGTK refuses getUserMedia until the embedder enables media
 # streams and answers the permission request (see src/linux_media.rs). Same
@@ -74,6 +86,9 @@ webkit2gtk = "2.0.2"
 # their backoff schedule under a paused clock instead of in real seconds.
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
+# Only `aws::live_tests` (ignored): it creates a throwaway environment key to
+# check that Secrets Manager and the permissions boundary see its tags.
+aws-sdk-kms = { version = "1.131.0", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

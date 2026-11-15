@@ -6,6 +6,7 @@ pub mod file_commands;
 pub mod file_viewer_commands;
 pub mod gateway_commands;
 pub mod help_commands;
+pub mod host_commands;
 pub mod inspect_commands;
 pub mod install_helper_commands;
 pub mod marketplace_commands;

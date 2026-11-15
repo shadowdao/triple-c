@@ -1,4 +1,5 @@
 mod auth_bridge;
+mod aws;
 mod browser_view;
 #[cfg(test)]
 mod command_census;
@@ -593,6 +594,15 @@ pub fn run() {
             commands::settings_commands::detect_aws_config,
             commands::settings_commands::inspect_ca_cert_path,
             commands::settings_commands::list_aws_profiles,
+            // AWS host connections
+            commands::host_commands::add_aws_profile_connection,
+            commands::host_commands::add_aws_keys_connection,
+            commands::host_commands::update_aws_connection,
+            commands::host_commands::remove_host_connection,
+            commands::host_commands::aws_connection_identity,
+            commands::host_commands::aws_connection_sso_login,
+            commands::host_commands::check_aws_permissions,
+            commands::host_commands::aws_policy_document,
             commands::settings_commands::detect_host_timezone,
             // Settings export/import
             commands::settings_export_commands::export_settings,

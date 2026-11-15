@@ -1,4 +1,4 @@
-import type { SettingsImportPreview } from "./types";
+import type { AwsConnectionSummary, SettingsImportPreview } from "./types";
 
 /** Named things a `SettingsImportPreview` says an import will change, for
  *  `ImportSettingsModal`'s confirmation list. Does not include anything
@@ -34,6 +34,14 @@ export function describeImport(preview: SettingsImportPreview): string[] {
   if (preview.marketplace_account_token_count > 0) {
     const n = preview.marketplace_account_token_count;
     items.push(`${n} marketplace account token${n === 1 ? "" : "s"}`);
+  }
+  for (const c of preview.aws_connections) {
+    const auth = c.auth === "keys" ? "access keys" : `profile ${c.profile_name ?? ""}`.trim();
+    items.push(`AWS connection "${c.name}" (${auth}, ${c.default_region})`);
+  }
+  if (preview.aws_connection_key_count > 0) {
+    const n = preview.aws_connection_key_count;
+    items.push(`${n} AWS access key set${n === 1 ? "" : "s"}`);
   }
   return items;
 }
@@ -82,10 +90,38 @@ export function describeImportWarnings(preview: SettingsImportPreview): string[]
       `Installs ${n} marketplace plugin${n === 1 ? "" : "s"} for all projects. Plugins can bring their own hooks, MCP servers and commands into every project container, and these skip the confirmation that lists what a plugin brings before a Marketplace tab install.`,
     );
   }
+  for (const c of preview.aws_connections) {
+    const localDesc = c.local ? describeAws(c.local) : null;
+    if (c.overwrites_existing && c.local) {
+      warnings.push(`Replaces your connection ${localDesc} with "${c.name}" (${c.auth === "keys" ? "access keys" : "profile " + (c.profile_name ?? "")}, ${c.default_region}).`);
+    }
+    if (c.overwrites_keys) {
+      warnings.push(
+        c.local
+          ? `Overwrites the AWS access keys stored for your connection ${localDesc} (imported as "${c.name}").`
+          : `Overwrites AWS access keys already stored for the imported connection "${c.name}".`,
+      );
+    }
+    if (c.keys_check_failed) {
+      warnings.push(
+        `Could not check whether keys are stored for "${c.name}"${c.local ? ` (your connection ${localDesc})` : ""}; importing may overwrite them.`,
+      );
+    }
+  }
+  for (const r of preview.removed_aws_connections) {
+    warnings.push(
+      `Removes your AWS connection ${describeAws(r)}, which is not in the file. Any access keys stored for it stay in your keychain.`,
+    );
+  }
   if (preview.image_source === "custom") {
     warnings.push(
       `Runs every project container from a custom Docker image: ${preview.custom_image_name ?? "(no image name set)"}.`,
     );
   }
   return warnings;
+}
+
+function describeAws(c: AwsConnectionSummary): string {
+  const auth = c.auth === "keys" ? "access keys" : `profile ${c.profile_name ?? ""}`.trim();
+  return `"${c.name}" (${auth}, ${c.default_region})`;
 }
