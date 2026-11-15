@@ -1284,7 +1284,7 @@ export interface TofuOutcome {
 /** The Tauri event a deploy's progress is emitted on (`environment_commands::PROGRESS_EVENT`). */
 export const AWS_DEPLOY_PROGRESS_EVENT = "aws-deploy-progress";
 
-/** Payload of the `aws-deploy-progress` event. `result` is set only when `done`. */
+/** Payload of the `aws-deploy-progress` event. Subscribe before invoking the command; match on `op_id` (or `state_key`). `result` is set only when `done`. */
 export interface DeployProgress {
   op_id: string;
   /** `environments/<env>/terraform.tfstate`, `users/<env>/<ownerkey>/terraform.tfstate` or `boundary/terraform.tfstate`. */

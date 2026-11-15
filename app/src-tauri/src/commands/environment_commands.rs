@@ -8,9 +8,12 @@
 //! offered.
 //!
 //! Applies are detached (D10). Each started or followed run gets one task
-//! here that follows its log and emits [`PROGRESS_EVENT`] batches, then a
-//! final `done` with the result. A deployment is followed by at most one task
-//! per process ([`FOLLOWERS`]).
+//! here that follows its log from byte 0 and emits [`PROGRESS_EVENT`]
+//! batches, then a final `done` with the result. The task emits nothing
+//! until the command is about to return its op id ([`Gate`]), so a listener
+//! registered before the invoke sees everything. Per work folder this
+//! process keeps one [`Slot`]: a launch in progress (which refuses a second
+//! launch or a follow) or the one follower (a re-follow replaces it).
 //!
 //! Credentials: a keys connection's keys are read from the keychain here
 //! and go only into [`tofu::child_env`]; they are never logged, written or
@@ -31,8 +34,11 @@ use serde::Serialize;
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, State};
 
+use aws_sdk_s3::error::ProvideErrorMetadata;
+use tokio::sync::oneshot;
+
 use crate::aws::environments::{
-    ensure_state_bucket, scan, DetectedEnvironment, EnvironmentAction, EnvironmentInfo,
+    ensure_state_bucket, scan, LIVE_LOCK_SECS, DetectedEnvironment, EnvironmentAction, EnvironmentInfo,
     EnvironmentScan, EnvironmentState, Knowable, OnboardingState, SdkDetectApi,
 };
 use crate::aws::tofu::{
@@ -55,7 +61,7 @@ const FOLLOW_POLL: Duration = Duration::from_millis(500);
 /// whole log at once).
 const MAX_EVENTS_PER_BATCH: usize = 200;
 /// A state object read back for its outputs larger than this is refused.
-const MAX_STATE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_STATE_BYTES: usize = 1024 * 1024;
 
 fn other(message: impl Into<String>) -> AwsError {
     AwsError::Other {
@@ -275,6 +281,81 @@ pub(crate) fn start_error(e: StartError, label: &str) -> AwsError {
     }
 }
 
+/// A held state lock on the environment, if detection saw one.
+fn held_lock(env: &DetectedEnvironment) -> bool {
+    match &env.state {
+        EnvironmentState::Deploying { .. } => true,
+        EnvironmentState::Incomplete { lock } => lock.is_some(),
+        _ => false,
+    }
+}
+
+/// Update and Repair: the action is offered and no lock is held. A re-apply
+/// under a held lock would only fail inside the detached run.
+pub(crate) fn reapply_refusal<'a>(
+    scan: &'a EnvironmentScan,
+    name: &str,
+    action: EnvironmentAction,
+) -> Result<&'a DetectedEnvironment, String> {
+    let env = require_action(scan, name, action)?;
+    if held_lock(env) {
+        return Err(format!(
+            "Environment \"{name}\"'s state is locked by an interrupted run; Unlock it first"
+        ));
+    }
+    Ok(env)
+}
+
+/// Destroy from the app (D6, R12): offered by detection, no valid record
+/// (a working environment is an admin's `tofu destroy`), and no held lock.
+pub(crate) fn destroy_refusal<'a>(
+    scan: &'a EnvironmentScan,
+    name: &str,
+) -> Result<&'a DetectedEnvironment, String> {
+    let env = require_action(scan, name, EnvironmentAction::Destroy)?;
+    if env.info.is_some() {
+        return Err(format!(
+            "Environment \"{name}\" has a valid record, so it may be working; it can't be \
+             destroyed from the app (an admin destroys it from a bundle)"
+        ));
+    }
+    if held_lock(env) {
+        return Err(format!(
+            "Environment \"{name}\"'s state is locked by an interrupted run; Unlock it first"
+        ));
+    }
+    Ok(env)
+}
+
+/// The lock object about to be deleted must still be stale, by its own
+/// `LastModified` read just now.
+pub(crate) fn stale_lock_refusal(age_secs: u64) -> Result<(), String> {
+    if age_secs < LIVE_LOCK_SECS {
+        Err("The state lock is recent, so a deploy may be running; detect again".into())
+    } else {
+        Ok(())
+    }
+}
+
+/// S3's answer to a conditional delete whose ETag no longer matches.
+pub(crate) fn is_precondition_failed(code: Option<&str>, status: Option<u16>) -> bool {
+    code == Some("PreconditionFailed") || status == Some(412)
+}
+
+/// The boundary policy is account-wide; its state is per region. A boundary
+/// that exists without state in this region's bucket was deployed from
+/// another region or by hand, and an apply here would fail on the name.
+/// `has_state` is `None` when the caller can't tell.
+pub(crate) fn boundary_refusal(boundary: &Knowable, has_state: Option<bool>) -> Result<(), String> {
+    if *boundary == Knowable::Yes && has_state == Some(false) {
+        Err("The permissions boundary already exists in this account (deployed from another \
+             region or by hand), so it can't be deployed from here"
+            .into())
+    } else {
+        Ok(())
+    }
+}
+
 fn module_kind(d: Deployment) -> ModuleKind {
     match d {
         Deployment::Environment(_) => ModuleKind::Environment,
@@ -437,17 +518,111 @@ pub struct DeployProgress {
     pub result: Option<TofuOutcome>,
 }
 
+/// Holds a follower's first emit back until the command that started it is
+/// about to return its op id, so no event (a finished run's whole replay
+/// and its `done` included) can arrive before the caller knows the op id.
+/// Opening it, or dropping it, releases the follower.
+pub(crate) struct Gate(oneshot::Sender<()>);
+
+impl Gate {
+    pub(crate) fn new() -> (Gate, oneshot::Receiver<()>) {
+        let (tx, rx) = oneshot::channel();
+        (Gate(tx), rx)
+    }
+
+    /// Call immediately before the command's final `Ok(op_id)`.
+    pub(crate) fn open(self) {
+        let _ = self.0.send(());
+    }
+}
+
+/// A follower: wait for the gate, follow the log from byte 0 emitting
+/// batches of at most [`MAX_EVENTS_PER_BATCH`], then emit `done` with the
+/// result (a follow error is a failed result).
+pub(crate) async fn follow_and_report(
+    gate: oneshot::Receiver<()>,
+    wd: Workdir,
+    base: DeployProgress,
+    poll: Duration,
+    mut emit: impl FnMut(&DeployProgress),
+) {
+    // A dropped gate means the command returned without opening it.
+    let _ = gate.await;
+    let outcome = tofu::follow(&wd, poll, |events| {
+        for chunk in events.chunks(MAX_EVENTS_PER_BATCH) {
+            emit(&DeployProgress {
+                events: chunk.to_vec(),
+                ..base.clone()
+            });
+        }
+    })
+    .await
+    .unwrap_or_else(|e| TofuOutcome {
+        ok: false,
+        exit_code: -1,
+        summary: Some(e.to_string()),
+    });
+    emit(&DeployProgress {
+        done: true,
+        cancellable: false,
+        result: Some(outcome),
+        ..base
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Plumbing
 
-/// Work folders being followed by this process, with their op id.
-static FOLLOWERS: OnceLock<Mutex<HashMap<PathBuf, String>>> = OnceLock::new();
+/// What this process is doing with a work folder.
+enum Slot {
+    /// A launch is between its checks and its start; nothing else may
+    /// materialize, start or follow the folder.
+    Launching,
+    /// One task follows the folder's run under `op_id`.
+    Following {
+        op_id: String,
+        task: tauri::async_runtime::JoinHandle<()>,
+    },
+}
 
-fn followers() -> std::sync::MutexGuard<'static, HashMap<PathBuf, String>> {
-    FOLLOWERS
+static SLOTS: OnceLock<Mutex<HashMap<PathBuf, Slot>>> = OnceLock::new();
+
+fn slots() -> std::sync::MutexGuard<'static, HashMap<PathBuf, Slot>> {
+    SLOTS
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|p| p.into_inner())
+}
+
+/// The folder's `Launching` slot, released on every exit path unless a
+/// follower has replaced it.
+struct LaunchGuard(PathBuf);
+
+impl LaunchGuard {
+    fn take(dir: &Path, label: &str) -> Result<LaunchGuard, AwsError> {
+        let mut map = slots();
+        match map.get(dir) {
+            Some(Slot::Launching) => Err(other(format!(
+                "A deployment is starting for {label}; wait for it"
+            ))),
+            Some(Slot::Following { .. }) => Err(other(format!(
+                "The run for {label} is still being followed; wait for it to finish"
+            ))),
+            None => {
+                map.insert(dir.to_path_buf(), Slot::Launching);
+                Ok(LaunchGuard(dir.to_path_buf()))
+            }
+        }
+    }
+}
+
+impl Drop for LaunchGuard {
+    fn drop(&mut self) {
+        let mut map = slots();
+        if matches!(map.get(&self.0), Some(Slot::Launching)) {
+            map.remove(&self.0);
+        }
+    }
 }
 
 /// `<data dir>/triple-c/aws/`: OpenTofu, its plugin cache and the work
@@ -523,19 +698,47 @@ async fn recorded_vpc_id(ctx: &Ctx, env: &str) -> Result<Option<String>, AwsErro
         .send()
         .await
         .map_err(|e| crate::aws::classify_sdk_error("s3:GetObject", &e))?;
+    let too_large = || other("The environment's state is implausibly large");
     if obj
         .content_length()
         .is_some_and(|n| n < 0 || n as usize > MAX_STATE_BYTES)
     {
-        return Err(other("The environment's state is implausibly large"));
+        return Err(too_large());
     }
-    let bytes = obj
-        .body
-        .collect()
+    // Capped while reading too: the length header may be absent.
+    let mut body = obj.body;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = body
+        .try_next()
         .await
         .map_err(|e| other(format!("Could not read the environment's state: {e}")))?
-        .into_bytes();
+    {
+        if bytes.len() + chunk.len() > MAX_STATE_BYTES {
+            return Err(too_large());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
     Ok(vpc_id_from_state(&bytes))
+}
+
+/// Whether this region's bucket holds the boundary's state; `None` when
+/// the caller may not look.
+async fn boundary_state_exists(ctx: &Ctx) -> Result<Option<bool>, AwsError> {
+    let res = aws_sdk_s3::Client::new(&ctx.cfg)
+        .head_object()
+        .bucket(ctx.bucket())
+        .key(state_key(Deployment::Boundary))
+        .expected_bucket_owner(&ctx.who.account)
+        .send()
+        .await;
+    match res {
+        Ok(_) => Ok(Some(true)),
+        Err(e) => match e.raw_response().map(|r| r.status().as_u16()) {
+            Some(404) => Ok(Some(false)),
+            Some(403) => Ok(None),
+            _ => Err(crate::aws::classify_sdk_error("s3:GetObject", &e)),
+        },
+    }
 }
 
 /// The network to re-apply an environment with: the recorded one.
@@ -558,79 +761,65 @@ fn emit_progress(app: &AppHandle, p: &DeployProgress) {
     }
 }
 
-/// Follow `wd` in a task of its own, unless this process already does; the
-/// op id of whichever task follows it.
-fn spawn_follower(app: AppHandle, wd: Workdir, key: String, can_cancel: bool) -> String {
-    let op_id = {
-        let mut map = followers();
-        if let Some(existing) = map.get(&wd.dir) {
-            return existing.clone();
-        }
-        let op_id = uuid::Uuid::new_v4().to_string();
-        map.insert(wd.dir.clone(), op_id.clone());
-        op_id
+/// Start the folder's follower under a new op id, replacing (aborting) any
+/// follower this process already has for it, so a re-follow (a reloaded
+/// window) replays the whole log. The follower emits nothing until the
+/// returned [`Gate`] is opened. The caller has checked the folder isn't
+/// launching, or holds its [`LaunchGuard`].
+fn install_follower(app: AppHandle, wd: Workdir, key: String, can_cancel: bool) -> (String, Gate) {
+    let op_id = uuid::Uuid::new_v4().to_string();
+    let (gate, rx) = Gate::new();
+    let base = DeployProgress {
+        op_id: op_id.clone(),
+        state_key: key,
+        events: Vec::new(),
+        done: false,
+        cancellable: can_cancel,
+        result: None,
     };
+    let dir = wd.dir.clone();
+    let mut map = slots();
+    // Spawned under the lock, so the task's own clean-up (which takes it)
+    // can't run before its slot is in place.
     let id = op_id.clone();
-    tauri::async_runtime::spawn(async move {
-        let base = DeployProgress {
-            op_id: id,
-            state_key: key,
-            events: Vec::new(),
-            done: false,
-            cancellable: can_cancel,
-            result: None,
-        };
-        let outcome = tofu::follow(&wd, FOLLOW_POLL, |events| {
-            for chunk in events.chunks(MAX_EVENTS_PER_BATCH) {
-                emit_progress(
-                    &app,
-                    &DeployProgress {
-                        events: chunk.to_vec(),
-                        ..base.clone()
-                    },
-                );
-            }
-        })
-        .await
-        .unwrap_or_else(|e| TofuOutcome {
-            ok: false,
-            exit_code: -1,
-            summary: Some(e.to_string()),
-        });
-        followers().remove(&wd.dir);
-        emit_progress(
-            &app,
-            &DeployProgress {
-                done: true,
-                cancellable: false,
-                result: Some(outcome),
-                ..base
-            },
-        );
+    let task = tauri::async_runtime::spawn(async move {
+        let dir = wd.dir.clone();
+        follow_and_report(rx, wd, base, FOLLOW_POLL, |p| emit_progress(&app, p)).await;
+        let mut map = slots();
+        if matches!(map.get(&dir), Some(Slot::Following { op_id, .. }) if *op_id == id) {
+            map.remove(&dir);
+        }
     });
-    op_id
+    if let Some(Slot::Following { task: old, .. }) = map.insert(
+        dir,
+        Slot::Following {
+            op_id: op_id.clone(),
+            task,
+        },
+    ) {
+        old.abort();
+    }
+    (op_id, gate)
 }
 
 /// Ensure OpenTofu and the state bucket, write the work folder and start a
-/// detached `init` + `op`; returns the op id its progress is emitted under.
+/// detached `init` + `op`. Returns the op id its progress is emitted under
+/// and the gate the command opens just before returning it.
 async fn launch(
     app: AppHandle,
     ctx: &Ctx,
     key: &DeploymentKey,
     vars: &Value,
     op: TofuOp,
-) -> Result<String, AwsError> {
+) -> Result<(String, Gate), AwsError> {
     let d = key.deployment();
     let label = key.label();
     let wd = ctx.workdir(d)?;
     if tofu::is_running(&wd) {
         return Err(start_error(StartError::AlreadyRunning, &label));
     }
-    if followers().contains_key(&wd.dir) {
-        return Err(other(format!(
-            "The previous run for {label} is still finishing; try again in a moment"
-        )));
-    }
+    // Held until a follower replaces it, or released on any error below.
+    let _launching = LaunchGuard::take(&wd.dir, &label)?;
     let tofu_bin = tofu::ensure_tofu(&ctx.root).await?;
     // StateBucketTaken is passed on as it is.
     let bucket = ensure_state_bucket(&ctx.cfg, &ctx.who.account, &ctx.region).await?;
@@ -646,7 +835,6 @@ async fn launch(
         AwsAuth::Profile { .. } => None,
     };
     let env = tofu::child_env(&ctx.conn, keys.as_ref(), &ctx.root, std::env::vars())?;
-    drop(keys);
 
     let start_wd = wd.clone();
     let started = tokio::task::spawn_blocking(move || {
@@ -656,7 +844,15 @@ async fn launch(
     .map_err(|e| other(format!("The deploy could not be started: {e}")))?
     .map_err(|e| start_error(e, &label))?;
     let can_cancel = cfg!(unix) && started.pid.is_some();
-    Ok(spawn_follower(app, wd, state_key(d), can_cancel))
+    Ok(install_follower(app, wd, state_key(d), can_cancel))
+}
+
+/// Open a launch's gate and hand back its op id: the last thing a command
+/// does, so its events follow the op id to the caller.
+fn opened(launched: Result<(String, Gate), AwsError>) -> Result<String, AwsError> {
+    let (op_id, gate) = launched?;
+    gate.open();
+    Ok(op_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -690,7 +886,7 @@ pub async fn deploy_aws_environment(
     deploy_refusal(&found, &name).map_err(other)?;
     let vars = environment_vars(&name, &ctx.region, &network).map_err(other)?;
     let key = DeploymentKey::Environment(name);
-    launch(app, &ctx, &key, &vars, TofuOp::Apply).await
+    opened(launch(app, &ctx, &key, &vars, TofuOp::Apply).await)
 }
 
 /// Re-apply an environment at the app's module version, with the network
@@ -705,7 +901,7 @@ pub async fn update_aws_environment(
 ) -> Result<String, AwsError> {
     let ctx = context(&state, &connection_id, &region).await?;
     let found = detect(&ctx).await?;
-    let env = require_action(&found, &name, EnvironmentAction::Update).map_err(other)?;
+    let env = reapply_refusal(&found, &name, EnvironmentAction::Update).map_err(other)?;
     let info = env
         .info
         .as_ref()
@@ -713,7 +909,7 @@ pub async fn update_aws_environment(
     let network = recorded_network(&ctx, info).await?;
     let vars = environment_vars(&env.name, &ctx.region, &network).map_err(other)?;
     let key = DeploymentKey::Environment(env.name.clone());
-    launch(app, &ctx, &key, &vars, TofuOp::Apply).await
+    opened(launch(app, &ctx, &key, &vars, TofuOp::Apply).await)
 }
 
 /// Re-apply an Incomplete environment. With a valid record its network is
@@ -730,7 +926,7 @@ pub async fn repair_aws_environment(
 ) -> Result<String, AwsError> {
     let ctx = context(&state, &connection_id, &region).await?;
     let found = detect(&ctx).await?;
-    let env = require_action(&found, &name, EnvironmentAction::Repair).map_err(other)?;
+    let env = reapply_refusal(&found, &name, EnvironmentAction::Repair).map_err(other)?;
     let network = match (&env.info, network) {
         (Some(info), _) => recorded_network(&ctx, info).await?,
         (None, Some(n)) => n,
@@ -742,12 +938,12 @@ pub async fn repair_aws_environment(
     };
     let vars = environment_vars(&env.name, &ctx.region, &network).map_err(other)?;
     let key = DeploymentKey::Environment(env.name.clone());
-    launch(app, &ctx, &key, &vars, TofuOp::Apply).await
+    opened(launch(app, &ctx, &key, &vars, TofuOp::Apply).await)
 }
 
 /// Destroy an incomplete deployment: only when detection offers Destroy,
-/// i.e. there is no valid record (D6). A working environment is destroyed
-/// by an admin from a bundle.
+/// there is no valid record (D6) and no lock is held ([`destroy_refusal`]).
+/// A working environment is destroyed by an admin from a bundle.
 #[tauri::command]
 pub async fn destroy_incomplete_aws_environment(
     connection_id: String,
@@ -758,20 +954,19 @@ pub async fn destroy_incomplete_aws_environment(
 ) -> Result<String, AwsError> {
     let ctx = context(&state, &connection_id, &region).await?;
     let found = detect(&ctx).await?;
-    let env = require_action(&found, &name, EnvironmentAction::Destroy).map_err(other)?;
-    if env.info.is_some() {
-        return Err(other("A working environment can't be destroyed from the app"));
-    }
+    let env = destroy_refusal(&found, &name).map_err(other)?;
     // A destroy plans the removal of everything in state whatever the
     // network variables say; they only have to be valid.
     let vars = environment_vars(&env.name, &ctx.region, &NetworkChoice::Public).map_err(other)?;
     let key = DeploymentKey::Environment(env.name.clone());
-    launch(app, &ctx, &key, &vars, TofuOp::Destroy).await
+    opened(launch(app, &ctx, &key, &vars, TofuOp::Destroy).await)
 }
 
 /// Delete an environment's stale `.tflock`. Only an environment's lock,
-/// only when detection offers Unlock, the lock is stale and no runner on
-/// this machine holds the deployment.
+/// only when detection offers Unlock and no runner on this machine holds
+/// the deployment. The delete is conditional on the ETag of the lock object
+/// as just re-read (and re-checked stale), so a lock taken since is never
+/// removed; there is no unconditional fallback.
 #[tauri::command]
 pub async fn unlock_aws_state(
     connection_id: String,
@@ -790,21 +985,60 @@ pub async fn unlock_aws_state(
         return Err(other("A deploy on this machine holds the lock"));
     }
     let lock_key = format!("{state_key}.tflock");
-    aws_sdk_s3::Client::new(&ctx.cfg)
-        .delete_object()
+    let s3 = aws_sdk_s3::Client::new(&ctx.cfg);
+    let head = match s3
+        .head_object()
         .bucket(ctx.bucket())
         .key(&lock_key)
         .expected_bucket_owner(&ctx.who.account)
         .send()
         .await
-        .map_err(|e| crate::aws::classify_sdk_error("s3:DeleteObject", &e))?;
+    {
+        Ok(h) => h,
+        Err(e) if e.raw_response().map(|r| r.status().as_u16()) == Some(404) => {
+            return Err(other("The state lock is already gone; detect again"));
+        }
+        Err(e) => return Err(crate::aws::classify_sdk_error("s3:GetObject", &e)),
+    };
+    let etag = head
+        .e_tag()
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| other("The state lock has no ETag, so it can't be removed safely"))?
+        .to_string();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let age = head
+        .last_modified()
+        .map(|t| now.saturating_sub(t.secs()).max(0) as u64)
+        .ok_or_else(|| other("The state lock's age is unknown, so it can't be removed safely"))?;
+    stale_lock_refusal(age).map_err(other)?;
+    if let Err(e) = s3
+        .delete_object()
+        .bucket(ctx.bucket())
+        .key(&lock_key)
+        .if_match(&etag)
+        .expected_bucket_owner(&ctx.who.account)
+        .send()
+        .await
+    {
+        let status = e.raw_response().map(|r| r.status().as_u16());
+        if is_precondition_failed(e.code(), status) {
+            return Err(other(
+                "The state lock changed since it was checked; detect again",
+            ));
+        }
+        return Err(crate::aws::classify_sdk_error("s3:DeleteObject", &e));
+    }
     log::info!("Removed the stale state lock {lock_key}");
     Ok(())
 }
 
 /// Reattach to a run on this machine (in progress, or finished with its
-/// log still there): replays its log as progress. Returns the op id; a run
-/// already followed keeps its follower and op id.
+/// log still there): replays its whole log as progress under a new op id.
+/// A follower this process already had for it is replaced, so a reloaded
+/// window gets the full history. Refused while a launch is starting there.
 #[tauri::command]
 pub async fn follow_aws_deployment(
     connection_id: String,
@@ -822,8 +1056,19 @@ pub async fn follow_aws_deployment(
             key.label()
         )));
     }
+    if matches!(slots().get(&wd.dir), Some(Slot::Launching)) {
+        return Err(other(format!(
+            "A deployment is starting for {}; wait for it",
+            key.label()
+        )));
+    }
     let can_cancel = tofu::is_running(&wd) && cancellable(&wd);
-    Ok(spawn_follower(app, wd, state_key, can_cancel))
+    // A launch can't start here between the check and the install: it
+    // needs a runner-free folder or an empty slot, and either way the
+    // follower then follows that run from byte 0.
+    let (op_id, gate) = install_follower(app, wd, state_key, can_cancel);
+    gate.open();
+    Ok(op_id)
 }
 
 /// Cancel: interrupt the runner, which stops OpenTofu gracefully.
@@ -859,10 +1104,11 @@ pub async fn onboard_aws_user(
         owner_key: owner_key(&owner),
         env,
     };
-    launch(app, &ctx, &key, &vars, TofuOp::Apply).await
+    opened(launch(app, &ctx, &key, &vars, TofuOp::Apply).await)
 }
 
-/// Deploy (or re-apply) the account's permissions boundary.
+/// Deploy (or re-apply) the account's permissions boundary. Refused when
+/// the boundary exists but this region's bucket has no state for it.
 #[tauri::command]
 pub async fn deploy_aws_permissions_boundary(
     connection_id: String,
@@ -871,8 +1117,15 @@ pub async fn deploy_aws_permissions_boundary(
     state: State<'_, AppState>,
 ) -> Result<String, AwsError> {
     let ctx = context(&state, &connection_id, &region).await?;
+    let found = detect(&ctx).await?;
+    let has_state = match found.state_bucket {
+        Knowable::Yes => boundary_state_exists(&ctx).await?,
+        Knowable::No => Some(false),
+        Knowable::Unknown => None,
+    };
+    boundary_refusal(&found.boundary, has_state).map_err(other)?;
     let vars = boundary_vars(&ctx.region);
-    launch(app, &ctx, &DeploymentKey::Boundary, &vars, TofuOp::Apply).await
+    opened(launch(app, &ctx, &DeploymentKey::Boundary, &vars, TofuOp::Apply).await)
 }
 
 /// Ask for a folder from Rust (see `file_commands::pick_save_path`).

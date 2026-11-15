@@ -80,8 +80,12 @@ export const checkAwsPermissions = (id: string, region?: string) =>
 export const awsPolicyDocument = (tier: Tier) =>
   invoke<PolicyFile[]>("aws_policy_document", { tier });
 
-// AWS environments (OpenTofu). Reject with an `AwsError`. Starting commands resolve to an op id;
-// progress arrives on the `AWS_DEPLOY_PROGRESS_EVENT` event (`DeployProgress`, in ./types) under that op id.
+// AWS environments (OpenTofu). Reject with an `AwsError`. Starting commands (and follow) resolve
+// to an op id; progress arrives on the `AWS_DEPLOY_PROGRESS_EVENT` event (`DeployProgress`, in
+// ./types). Contract: subscribe to aws-deploy-progress BEFORE invoking; events carry `op_id` and
+// `state_key`. The backend holds a run's first event until the command is about to return, so a
+// listener registered before the invoke sees the whole run, `done` included. A re-follow (e.g.
+// after a reload) replays the whole log under a new op id.
 export const detectAwsEnvironments = (connectionId: string, region: string) =>
   invoke<EnvironmentScan>("detect_aws_environments", { connectionId, region });
 export const deployAwsEnvironment = (connectionId: string, region: string, name: string, network: NetworkChoice) =>

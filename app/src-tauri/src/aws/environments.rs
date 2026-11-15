@@ -41,7 +41,7 @@ const MAX_UNTRUSTED_BYTES: usize = 4096;
 const MAX_LOCK_STRING_CHARS: usize = 128;
 /// A lock younger than this is a deploy in progress somewhere else; an older
 /// one is an apply that died holding it.
-const LIVE_LOCK_SECS: u64 = 2 * 3600;
+pub const LIVE_LOCK_SECS: u64 = 2 * 3600;
 const RECORD_SCHEMA: u64 = 1;
 /// Bounds on what one scan lists, so a bucket or parameter path full of
 /// junk can't make it unbounded.

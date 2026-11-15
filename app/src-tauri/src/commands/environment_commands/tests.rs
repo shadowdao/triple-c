@@ -1,8 +1,10 @@
 use std::fs;
+use std::time::Duration;
 
 use serde_json::json;
 
 use super::*;
+use crate::aws::tofu::Workdir;
 use crate::aws::environments::{
     EnvironmentState, Knowable, LockInfo, OnboardingState,
 };
@@ -356,4 +358,143 @@ fn an_already_running_start_names_the_deployment_and_suggests_follow() {
     assert!(msg.contains("Follow"), "{msg}");
     let inner = AwsError::KeysMissing;
     assert_eq!(start_error(StartError::Failed(inner.clone()), "x"), inner);
+}
+
+#[tokio::test]
+async fn a_follower_emits_nothing_until_its_gate_opens() {
+    use std::sync::{Arc, Mutex};
+    // A finished run: the whole replay and `done` are available at once,
+    // the case where events could otherwise beat the op id to the caller.
+    let dir = tempfile::tempdir().unwrap();
+    let lines: String = (0..450).map(|i| format!("line {i}\n")).collect();
+    fs::write(dir.path().join("apply.log"), lines).unwrap();
+    fs::write(dir.path().join("apply.exit"), "0\n").unwrap();
+    let wd = Workdir { dir: dir.path().to_path_buf() };
+    let base = DeployProgress {
+        op_id: "op-1".into(),
+        state_key: "boundary/terraform.tfstate".into(),
+        events: vec![],
+        done: false,
+        cancellable: true,
+        result: None,
+    };
+    let seen: Arc<Mutex<Vec<DeployProgress>>> = Arc::default();
+    let sink = seen.clone();
+    let (gate, rx) = Gate::new();
+    let task = tokio::spawn(follow_and_report(
+        rx,
+        wd,
+        base,
+        Duration::from_millis(10),
+        move |p| sink.lock().unwrap().push(p.clone()),
+    ));
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(seen.lock().unwrap().is_empty(), "emitted before the gate opened");
+
+    gate.open();
+    task.await.unwrap();
+    let seen = seen.lock().unwrap();
+    let batches: Vec<usize> = seen.iter().filter(|p| !p.done).map(|p| p.events.len()).collect();
+    assert_eq!(batches, vec![200, 200, 50], "the whole log, in capped batches");
+    assert!(seen.iter().all(|p| p.op_id == "op-1" && p.state_key == "boundary/terraform.tfstate"));
+    let last = seen.last().unwrap();
+    assert!(last.done && !last.cancellable);
+    assert_eq!(last.result, Some(TofuOutcome { ok: true, exit_code: 0, summary: None }));
+    assert_eq!(seen.iter().filter(|p| p.done).count(), 1);
+}
+
+#[tokio::test]
+async fn a_dropped_gate_still_releases_the_follower() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("apply.log"), "x\n").unwrap();
+    fs::write(dir.path().join("apply.exit"), "1\n").unwrap();
+    let (gate, rx) = Gate::new();
+    drop(gate);
+    let mut n = 0;
+    follow_and_report(
+        rx,
+        Workdir { dir: dir.path().to_path_buf() },
+        DeployProgress {
+            op_id: "o".into(),
+            state_key: "k".into(),
+            events: vec![],
+            done: false,
+            cancellable: false,
+            result: None,
+        },
+        Duration::from_millis(10),
+        |_| n += 1,
+    )
+    .await;
+    assert_eq!(n, 2);
+}
+
+#[test]
+fn destroy_needs_the_action_no_record_and_no_lock() {
+    use EnvironmentAction::*;
+    let mut stale_with_record = env(
+        "rec",
+        EnvironmentState::Incomplete { lock: Some(lock(9000, false)) },
+        vec![Repair, Destroy, Unlock],
+    );
+    // Stale lock + record + no state: detection offers Destroy; the guard
+    // must still refuse (the record says it may be working).
+    stale_with_record.info = Some(info("rec", "public", true));
+    let mut record_unlocked = env("rec2", EnvironmentState::Incomplete { lock: None }, vec![Destroy]);
+    record_unlocked.info = Some(info("rec2", "public", true));
+    let s = scan(
+        Knowable::Yes,
+        vec![
+            stale_with_record,
+            record_unlocked,
+            env("locked", EnvironmentState::Incomplete { lock: Some(lock(9000, false)) }, vec![Repair, Destroy, Unlock]),
+            env("half", EnvironmentState::Incomplete { lock: None }, vec![Repair, Destroy]),
+            env("ready", EnvironmentState::Ready, vec![Join]),
+        ],
+    );
+    let e = destroy_refusal(&s, "rec").unwrap_err();
+    assert!(e.contains("valid record"), "{e}");
+    assert!(destroy_refusal(&s, "rec2").unwrap_err().contains("valid record"));
+    assert!(destroy_refusal(&s, "locked").unwrap_err().contains("Unlock it first"));
+    assert!(destroy_refusal(&s, "ready").is_err());
+    assert!(destroy_refusal(&s, "missing").is_err());
+    assert_eq!(destroy_refusal(&s, "half").unwrap().name, "half");
+}
+
+#[test]
+fn repair_and_update_are_refused_under_a_held_lock() {
+    use EnvironmentAction::*;
+    let s = scan(
+        Knowable::Yes,
+        vec![
+            env("locked", EnvironmentState::Incomplete { lock: Some(lock(9000, false)) }, vec![Repair, Unlock]),
+            env("free", EnvironmentState::Incomplete { lock: None }, vec![Repair]),
+            env("old", EnvironmentState::UpdateAvailable, vec![Join, Update]),
+        ],
+    );
+    let e = reapply_refusal(&s, "locked", Repair).unwrap_err();
+    assert!(e.contains("Unlock it first"), "{e}");
+    assert!(reapply_refusal(&s, "free", Repair).is_ok());
+    assert!(reapply_refusal(&s, "old", Update).is_ok());
+    assert!(reapply_refusal(&s, "free", Update).is_err());
+}
+
+#[test]
+fn unlock_deletes_only_a_still_stale_lock_and_reads_412_as_changed() {
+    assert!(stale_lock_refusal(0).is_err());
+    assert!(stale_lock_refusal(LIVE_LOCK_SECS - 1).is_err());
+    assert!(stale_lock_refusal(LIVE_LOCK_SECS).is_ok());
+    assert!(is_precondition_failed(Some("PreconditionFailed"), Some(412)));
+    assert!(is_precondition_failed(None, Some(412)));
+    assert!(!is_precondition_failed(Some("AccessDenied"), Some(403)));
+    assert!(!is_precondition_failed(None, Some(404)));
+}
+
+#[test]
+fn an_existing_boundary_without_state_here_is_refused() {
+    assert!(boundary_refusal(&Knowable::Yes, Some(false)).unwrap_err().contains("already exists"));
+    assert!(boundary_refusal(&Knowable::Yes, Some(true)).is_ok(), "re-apply our own");
+    assert!(boundary_refusal(&Knowable::Yes, None).is_ok(), "can't tell");
+    assert!(boundary_refusal(&Knowable::No, Some(false)).is_ok());
+    assert!(boundary_refusal(&Knowable::Unknown, Some(false)).is_ok());
 }
