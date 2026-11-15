@@ -203,8 +203,10 @@ account-wide:
   nothing else (`${*}` is IAM's escaped `*`). Destroying the NAT gateway's address disassociates
   it first; by then the NAT gateway and its association are gone and EC2 authorizes the call
   against `*/*` (verified live: denied without this, then `InvalidAssociationID.NotFound`, which
-  the provider ignores). A live association names its address and interface, so no real address
-  can be disassociated through this statement.
+  the provider ignores). **Expected, not live-verified:** a live association should be
+  authorized against its address and interface ARNs, which `${*}/${*}` does not match, so no real
+  address should be disassociable through this statement. Only the gone-association case was
+  observed; the probe that would settle it is listed under "Still open" below.
 - `ec2:AuthorizeSecurityGroupIngress`/`Egress` on `security-group-rule/*`: authorizing names the
   new, untagged rule as well as the group, and the group must still be tagged.
 - `ec2:CreateNetworkInterface` and `ec2:DeleteNetworkInterface` on `*`, but only when EFS makes
@@ -436,8 +438,9 @@ record, joinable), self-onboard (Joined, both roles carry the boundary), update 
 destroy the onboarding, then the environment. If the account has no boundary, the account admin
 applies the boundary module first and destroys it at the end. `the_private_nat_mode_deploys` does
 the same for `private-nat` (about $0.05: one NAT gateway for a few minutes). A guard destroys
-whatever is still applied, as the account admin, and deletes the bucket with every version, on
-failure too; every denied action is printed by name. The test drives the same functions as the
+whatever is still applied, as the account admin (the boundary only through its module's state, so
+a boundary the run did not create is never touched), and deletes the bucket with every version if
+the run created it, on failure too; every denied action is printed by name. The test drives the same functions as the
 commands (`ensure_tofu`, `materialize`, `child_env`, the runner, `follow`, `scan`, the refusal
 checks, the conditional lock delete); the Tauri commands' own bookkeeping (launch slots, the
 progress events) is not exercised.
@@ -452,8 +455,18 @@ progress events) is not exercised.
 | NAT address on destroy | ✗→fixed: the provider disassociates the address before releasing it, after the NAT gateway (and the association) are gone, and EC2 authorizes that call against the literal `*/*`. `DisassociateGoneAddresses` allows exactly `arn:aws:ec2:*:*:${*}/${*}`; CloudTrail shows the retried call reaching `InvalidAssociationID.NotFound` |
 | Conditional unlock | ✓ on the versioned state bucket, `DeleteObject` with `If-Match` and a mismatched ETag gets 412 (the app's "lock changed" answer) and leaves the lock; with the current ETag it deletes it. A fresh foreign lock scans as Deploying with its `Who` |
 | Update | ✓ re-applying with the network read back from the record: "0 added, 0 changed, 0 destroyed" |
-| After `tofu destroy` | ✗→fixed (app): the state object stays, empty, so a destroyed environment kept scanning as Incomplete (and a removed onboarding as Joined). Detection now reads a small state object and treats one with no resources as absent |
+| After `tofu destroy` | ✗→fixed (app): the state object stays, empty, so a destroyed environment kept scanning as Incomplete (and a removed onboarding as Joined). Detection now reads small state objects (up to 2 KiB, at most 200 per scan) and treats one with no resources as absent; a read that fails counts as a deployment |
 | Cleanup | ✓ nothing `triple-c` left in us-west-2 (roles, policies, log groups, clusters, VPCs, subnets, gateways, NAT gateways, addresses, security groups, file systems, parameters, aliases, buckets); five environment KMS keys pending deletion (7 days); the boundary, which the account did not have, deleted again |
 
-Not deployed live: the `existing` network mode, and an onboarding by a workspace user from an
-admin bundle (the same module, applied with admin credentials).
+The environment-admin role in these tests carries **no permissions boundary**, deliberately: the
+boundary is the ceiling for the task and execution roles the modules create, not for admins (it
+allows only what a task does, so an admin under it could administer nothing). The test instead
+asserts that every role the admin creates carries the boundary.
+
+Still open:
+
+- the `existing` network mode against a user's own VPC, and an onboarding by a workspace user
+  from an admin bundle (the same module, applied with admin credentials);
+- `DisassociateGoneAddresses` cannot touch a **live** association. Probe: allocate an untagged
+  Elastic IP, associate it with a test ENI, and call `ec2:DisassociateAddress` on that association
+  as the environment admin; it must be denied (then release both).

@@ -333,9 +333,10 @@ updates use the existing "new image available" flow: the next start uses the new
 | **Hybrid** (default) | task storage | EFS | Settings, sessions, memory, history: yes. Working tree: only what's pushed | Fast builds, fast git | Small EFS footprint |
 | **EFS** | EFS | EFS | Everything | git, `node_modules` and builds are noticeably slower over NFS | Grows with repo and dependency size |
 
-- **One EFS file system per environment, one access point per workspace.** Access point root:
+- **One EFS file system per user (D2), one access point per workspace.** The file system comes
+  from the user's onboarding module and its policy admits only their task role. Access point root:
   `/triple-c/<owner>/<project-id>`, with POSIX user and group 1000. The access point is created by
-  the user and tagged with the owner (see policies).
+  the user, on their own file system, and tagged with the owner (see policies).
 - **WIP push is on by default** (`wip_push_on_stop: true`, with a serde default per the
   `default_full_permissions` pattern) and can be turned off per project.
 - **Ephemeral and Hybrid have a stop guard.** Before stopping, the app asks the agent for
@@ -440,7 +441,7 @@ before release.**
 
 | Mode | For | Task role | EC2 options | Isolation |
 |---|---|---|---|---|
-| **Strict** (**default, v1**) | Everyone, from a solo account to a team | **Per-user** task role, created by the user's onboarding module (self-deployed, or by an admin) | Privileged and Docker allowed **only on a per-user capacity provider** (dedicated EC2 instances, never shared with another owner) | Per-user IAM all the way down. EFS file system policy allows each access point only to its owner's task role |
+| **Strict** (**default, v1**) | Everyone, from a solo account to a team | **Per-user** task role, created by the user's onboarding module (self-deployed, or by an admin) | Privileged and Docker allowed **only on a per-user capacity provider** (dedicated EC2 instances, never shared with another owner) | Per-user IAM all the way down. Each user has their own EFS file system (D2), whose policy admits only that user's task role |
 | **Standard** (opt-in, later) | Large teams that want fewer IAM roles | Shared, minimal (logs, SSM messages) | **Fargate only**, or EC2 with **no** privileged mode, Docker socket or `NET_ADMIN` | Containers are unprivileged and can't mount NFS, can't read secrets, and can't reach each other over the network |
 
 There is no separate "personal" mode. A solo user on strict tenancy is simply the only onboarded

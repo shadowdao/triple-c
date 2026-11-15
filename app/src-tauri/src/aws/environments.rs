@@ -48,6 +48,15 @@ const RECORD_SCHEMA: u64 = 1;
 const MAX_RECORDS: usize = 500;
 const MAX_OBJECTS_PER_PREFIX: usize = 5000;
 const MAX_LOCKS: usize = 200;
+/// A state object larger than this is not read to see whether it is empty.
+/// What `tofu destroy` leaves is about 180 bytes plus about 110 per
+/// checkable object (OpenTofu 1.13 keeps `check_results` for each resource
+/// or data source with a pre/postcondition): 453 bytes for two, measured.
+/// The modules have at most a handful, so 2 KiB leaves a wide margin.
+const EMPTY_STATE_MAX_BYTES: i64 = 2048;
+/// At most this many small state objects are read per scan; the rest count
+/// as deployments.
+const MAX_STATE_PEEKS: usize = 200;
 
 /// An environment's record, schema 1 (`aws/terraform/environment/main.tf`).
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
@@ -583,6 +592,27 @@ pub(crate) fn is_empty_state(text: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether a state object of `size` bytes is read to see if it is empty:
+/// only a small one, and only the first [`MAX_STATE_PEEKS`] per scan.
+fn may_be_empty_state(size: i64, peeks_so_far: usize) -> bool {
+    (0..=EMPTY_STATE_MAX_BYTES).contains(&size) && peeks_so_far < MAX_STATE_PEEKS
+}
+
+/// Whether a read state object still counts as a deployment. Fails closed:
+/// only a state read in full and found empty is dropped (or one deleted
+/// since the listing); unreadable, denied or failed reads keep it, and one
+/// failed read never fails the whole scan.
+fn keep_state(key: &str, read: Result<Option<String>, AwsError>) -> bool {
+    match read {
+        Ok(None) => false,
+        Ok(Some(text)) => !is_empty_state(&text),
+        Err(e) => {
+            log::warn!("Could not read the state object {key} ({e}); counting it as a deployment");
+            true
+        }
+    }
+}
+
 /// What a failed lookup means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Lookup {
@@ -805,6 +835,7 @@ impl DetectApi for SdkDetectApi {
     async fn state_objects(&self, bucket: &str) -> Result<Option<StateObjects>, AwsError> {
         let mut objects = StateObjects::default();
         let mut lock_keys = Vec::new();
+        let mut peeks = 0usize;
         for prefix in ["environments/", "users/", "boundary/"] {
             let Some(listed) = self.list(bucket, prefix).await? else {
                 return Ok(None);
@@ -817,11 +848,10 @@ impl DetectApi for SdkDetectApi {
                     // own Destroy) would read as Incomplete for ever, and a
                     // removed onboarding as Joined. Only a small object can
                     // be empty, so only those are read.
-                    if (0..=MAX_UNTRUSTED_BYTES as i64).contains(&size) {
-                        match self.lock_contents(bucket, &key, size).await? {
-                            None => continue,
-                            Some(text) if is_empty_state(&text) => continue,
-                            Some(_) => {}
+                    if may_be_empty_state(size, peeks) {
+                        peeks += 1;
+                        if !keep_state(&key, self.lock_contents(bucket, &key, size).await) {
+                            continue;
                         }
                     }
                     objects.states.push(key);

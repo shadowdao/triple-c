@@ -839,3 +839,26 @@ fn only_a_state_that_manages_nothing_is_empty() {
         assert!(!is_empty_state(odd), "{odd:?}");
     }
 }
+
+#[test]
+fn only_small_states_are_read_and_only_up_to_the_cap() {
+    assert!(may_be_empty_state(0, 0));
+    assert!(may_be_empty_state(453, 0));
+    assert!(may_be_empty_state(EMPTY_STATE_MAX_BYTES, MAX_STATE_PEEKS - 1));
+    assert!(!may_be_empty_state(EMPTY_STATE_MAX_BYTES + 1, 0));
+    assert!(!may_be_empty_state(-1, 0));
+    assert!(!may_be_empty_state(100, MAX_STATE_PEEKS));
+}
+
+#[test]
+fn a_state_that_cannot_be_read_still_counts() {
+    let empty = r#"{"version":4,"outputs":{},"resources":[],"check_results":[{"object_kind":"resource","config_addr":"terraform_data.b","status":"unknown","objects":null}]}"#;
+    assert!(!keep_state("k", Ok(Some(empty.into()))));
+    // Deleted since the listing.
+    assert!(!keep_state("k", Ok(None)));
+    // Denied reads arrive as Some("") from lock_contents.
+    assert!(keep_state("k", Ok(Some(String::new()))));
+    assert!(keep_state("k", Ok(Some(r#"{"resources":[{"type":"x"}]}"#.into()))));
+    // An S3 error on one object degrades that entry, not the scan.
+    assert!(keep_state("k", Err(AwsError::Other { message: "boom".into() })));
+}

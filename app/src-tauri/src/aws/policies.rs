@@ -540,7 +540,8 @@ const ENVIRONMENT_ADMIN_CHECKS: &[Check] = &[
     write("ec2:ReleaseAddress", PROBE_ELASTIC_IP, COMPONENT_TAGGED),
     // Destroying the NAT gateway's address disassociates it first; the NAT
     // gateway is gone by then, so EC2 authorizes the call against the
-    // literal `*/*` (verified live), which is all the policy allows.
+    // literal `*/*` (verified live), which is all the policy allows. That a
+    // live association never matches it is expected, not verified.
     write("ec2:DisassociateAddress", PROBE_GONE_ASSOCIATION, &[]),
     write("ec2:DeleteNatGateway", PROBE_NAT_GATEWAY, COMPONENT_TAGGED),
     write(
@@ -1849,8 +1850,10 @@ mod tests {
             ME,
             ME
         ));
-        // Only the literal `*/*` of an association that is already gone: a
-        // live address, Triple-C's or anyone's, is never disassociated.
+        // Only the literal `*/*` of an association that is already gone. That
+        // a live association is authorized against its address and interface
+        // ARNs (so never matches) is expected, NOT live-verified: see "Still
+        // open" in aws/README.md for the probe.
         assert!(allowed(
             tier,
             &write("ec2:DisassociateAddress", PROBE_GONE_ASSOCIATION, &[]),

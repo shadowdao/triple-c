@@ -1237,8 +1237,29 @@ mod environment {
                 .expect("child env")
         }
 
+        /// `ensure_state_bucket` as the environment admin. The bucket is
+        /// marked for deletion only if this call is what creates it: a bucket
+        /// that already exists (a fixed `TRIPLEC_E2E_BUCKET_SUFFIX`) is never
+        /// deleted by the cleanup.
         async fn ensure_bucket(&self, cfg: &SdkConfig, who: &CallerIdentity) {
-            *self.bucket_created.lock().unwrap() = true;
+            use aws_sdk_s3::error::ProvideErrorMetadata;
+            let head = aws_sdk_s3::Client::new(&self.e.cfg)
+                .head_bucket()
+                .bucket(&self.bucket)
+                .send()
+                .await;
+            match head {
+                Ok(_) => eprintln!("{} already exists; the cleanup leaves it", self.bucket),
+                Err(e)
+                    if e.raw_response().map(|r| r.status().as_u16()) == Some(404)
+                        || e.code() == Some("NotFound") =>
+                {
+                    // Set before the create, so a create that half-succeeds
+                    // is still cleaned up.
+                    *self.bucket_created.lock().unwrap() = true;
+                }
+                Err(e) => panic!("HeadBucket {}: {e:?}", self.bucket),
+            }
             let b = ensure_named_state_bucket(cfg, &who.account, &self.e.region, &self.bucket)
                 .await
                 .unwrap_or_else(|e| panic!("ensure_state_bucket as the environment admin: {e}"));
@@ -1252,10 +1273,19 @@ mod environment {
                 "arn:aws:iam::{}:policy/{PERMISSIONS_BOUNDARY_NAME}",
                 self.e.account
             );
-            if self.e.iam.get_policy().policy_arn(&arn).send().await.is_ok() {
-                eprintln!("the account already has the boundary; using it");
-                return;
+            match self.e.iam.get_policy().policy_arn(&arn).send().await {
+                Ok(_) => {
+                    eprintln!("the account already has the boundary; using it");
+                    return;
+                }
+                Err(e) if e.as_service_error().is_some_and(|s| s.is_no_such_entity_exception()) => {}
+                // Anything else is not "absent": never take ownership of a
+                // boundary this run can't see.
+                Err(e) => panic!("iam:GetPolicy on the boundary: {e:?}"),
             }
+            // Ownership is the module's state: the cleanup removes the
+            // boundary only with `tofu destroy` of that state, so a failed
+            // apply (EntityAlreadyExists in a race) destroys nothing.
             *self.boundary_created.lock().unwrap() = true;
             let (_, outcome, denied) = self
                 .run(
@@ -1270,9 +1300,9 @@ mod environment {
         }
 
         /// As the account admin: destroy whatever is still applied (newest
-        /// first), the bucket with every version, and the boundary if this
-        /// test made it. Logs rather than fails, so one error strands nothing
-        /// else.
+        /// first; the boundary only through its own module's state), then the
+        /// bucket with every version if this run created it. Logs rather than
+        /// fails, so one error strands nothing else.
         async fn cleanup(&self) {
             let pending: Vec<Workdir> = self
                 .applied
@@ -1304,29 +1334,19 @@ mod environment {
                     other => eprintln!("cleanup: could not start destroy: {other:?}"),
                 }
             }
+            // No direct delete: the boundary module's `tofu destroy` above is
+            // the only thing that removes it, because its state proves this
+            // run created it. If that failed, say so loudly.
             if *self.boundary_created.lock().unwrap() {
                 let arn = format!(
                     "arn:aws:iam::{}:policy/{PERMISSIONS_BOUNDARY_NAME}",
                     self.e.account
                 );
                 if self.e.iam.get_policy().policy_arn(&arn).send().await.is_ok() {
-                    eprintln!("cleanup: deleting the boundary directly");
-                    if let Ok(out) = self.e.iam.list_entities_for_policy().policy_arn(&arn).send().await {
-                        for r in out.policy_roles() {
-                            if let Some(name) = r.role_name() {
-                                let _ = self
-                                    .e
-                                    .iam
-                                    .delete_role_permissions_boundary()
-                                    .role_name(name)
-                                    .send()
-                                    .await;
-                            }
-                        }
-                    }
-                    if let Err(e) = self.e.iam.delete_policy().policy_arn(&arn).send().await {
-                        eprintln!("cleanup: boundary: {e:?}");
-                    }
+                    eprintln!(
+                        "cleanup: WARNING: {arn} still exists after its module's destroy; \
+                         remove it by hand if this run created it"
+                    );
                 }
             }
             if *self.bucket_created.lock().unwrap() {
