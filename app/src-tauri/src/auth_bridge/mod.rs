@@ -326,7 +326,8 @@ async fn poll_loop(
         // bridge or stopping the container doesn't wait out an in-flight poll.
         let discovery = tokio::select! {
             _ = cancel.changed() => break,
-            res = container.exec_oneshot_limited("claude", cmd, PROC_NET_OUTPUT_LIMIT) => {
+            // Background: on AWS this poll must not keep an idle workspace up.
+            res = container.exec_oneshot_background("claude", cmd, PROC_NET_OUTPUT_LIMIT) => {
                 res.map(|(out, _)| out)
             }
         };

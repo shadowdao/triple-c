@@ -278,19 +278,34 @@ async fn exec_oneshot_raw(
     env: Vec<String>,
     limit: usize,
 ) -> Result<OneshotOutput, String> {
+    exec_oneshot_raw_marked(ep, user, cmd, env, limit, false).await
+}
+
+/// The agent's background marker (protocol spec, "Activity"): a request that
+/// carries it never counts as activity for idle stop.
+pub const BACKGROUND_HEADER: &str = "X-Triple-C-Background";
+
+async fn exec_oneshot_raw_marked(
+    ep: &AgentEndpoint,
+    user: &str,
+    cmd: Vec<String>,
+    env: Vec<String>,
+    limit: usize,
+    background: bool,
+) -> Result<OneshotOutput, String> {
     const CONTEXT: &str = "Failed to start exec";
     let spec = ExecSpec::new(cmd).user(user).working_dir(None).env(env).tty(false);
     let mut body = spec_json(&spec);
     body.insert("limit".into(), serde_json::json!(limit));
 
-    let resp = send(
-        CONTEXT,
-        http()
-            .post(ep.url("v1/exec"))
-            .header(reqwest::header::AUTHORIZATION, ep.auth())
-            .json(&body),
-    )
-    .await?;
+    let mut req = http()
+        .post(ep.url("v1/exec"))
+        .header(reqwest::header::AUTHORIZATION, ep.auth())
+        .json(&body);
+    if background {
+        req = req.header(BACKGROUND_HEADER, "1");
+    }
+    let resp = send(CONTEXT, req).await?;
 
     let status = resp.status();
     if status == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
@@ -349,6 +364,18 @@ pub async fn exec_oneshot_limited(
     limit: usize,
 ) -> Result<(String, i64), String> {
     let out = exec_oneshot_raw(ep, user, cmd, env, limit).await?;
+    Ok((out.text(), out.exit_code))
+}
+
+/// [`exec_oneshot_limited`] marked as a background poll, so it never keeps
+/// an idle workspace up (the auth bridge's `/proc/net` reads).
+pub async fn exec_oneshot_background(
+    ep: &AgentEndpoint,
+    user: &str,
+    cmd: Vec<String>,
+    limit: usize,
+) -> Result<(String, i64), String> {
+    let out = exec_oneshot_raw_marked(ep, user, cmd, Vec::new(), limit, true).await?;
     Ok((out.text(), out.exit_code))
 }
 

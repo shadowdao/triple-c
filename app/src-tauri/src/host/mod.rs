@@ -270,6 +270,23 @@ impl ContainerTarget {
         }
     }
 
+    /// [`Self::exec_oneshot_limited`] for a background poll: on the agent it
+    /// carries the background marker, so it never counts as activity for
+    /// idle stop. Docker has no idle stop; the call is the same there.
+    pub async fn exec_oneshot_background(
+        &self,
+        user: &str,
+        cmd: Vec<String>,
+        limit: usize,
+    ) -> Result<(String, i64), String> {
+        match self {
+            ContainerTarget::Docker { container_id } => {
+                docker::exec::exec_oneshot_limited(container_id, user, cmd, limit).await
+            }
+            ContainerTarget::Agent(ep) => agent::exec_oneshot_background(ep, user, cmd, limit).await,
+        }
+    }
+
     /// stdout and stderr kept apart: `(stdout, stderr, exit_code)`.
     pub async fn exec_oneshot_streams_as(
         &self,

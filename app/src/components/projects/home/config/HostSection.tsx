@@ -257,7 +257,11 @@ export default function HostSection({ project, save, disabled }: Props) {
 
       <SwitchRow
         label="Stop when idle"
-        hint="Stops the workspace after this many minutes with no terminal activity, no running Claude and no scheduled job."
+        hint={
+          aws.wip_push_on_stop
+            ? "Stops the workspace after this many minutes without terminal input or output, Claude running or a scheduled job. Unsaved git work is pushed first; if that push fails, it stays up."
+            : "Stops the workspace after this many minutes without terminal input or output, Claude running or a scheduled job. With the work-in-progress push off, unsaved git work keeps it running."
+        }
         control={
           <Toggle
             label="Stop when idle"

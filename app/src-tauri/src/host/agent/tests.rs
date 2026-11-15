@@ -22,6 +22,8 @@ const TOKEN: &str = "fake-agent-token-for-unit-tests-only-0000";
 struct Seen {
     auth: Vec<String>,
     exec_bodies: Vec<Value>,
+    /// The background marker of each `/v1/exec`, if any.
+    exec_background: Vec<Option<String>>,
     detached_bodies: Vec<Value>,
     status_polls: u32,
     resizes: Vec<(String, Value)>,
@@ -62,7 +64,13 @@ async fn exec(State(f): St, h: HeaderMap, Json(body): Json<Value>) -> Response {
     if !f.authed(&h) {
         return unauthorized();
     }
-    f.seen.lock().unwrap().exec_bodies.push(body.clone());
+    {
+        let mut seen = f.seen.lock().unwrap();
+        seen.exec_bodies.push(body.clone());
+        seen.exec_background.push(
+            h.get("x-triple-c-background").and_then(|v| v.to_str().ok()).map(str::to_string),
+        );
+    }
     match body["cmd"][0].as_str().unwrap_or("") {
         "sh" => Json(json!({"chunks": [{"s": "out", "d": b64(b"1000\n1001\n")}], "exit_code": 0}))
             .into_response(),
@@ -302,6 +310,17 @@ async fn other_errors_carry_the_agents_message_and_no_token() {
     let (ep, _) = fake_agent().await;
     let e = target(&ep).exec_oneshot(cmd("fail")).await.unwrap_err();
     assert_eq!(e, "Failed to start exec: boom");
+}
+
+#[tokio::test]
+async fn only_a_background_poll_carries_the_background_marker() {
+    let (ep, fake) = fake_agent().await;
+    let t = target(&ep);
+    t.exec_oneshot_limited("claude", cmd("sh"), 1000).await.unwrap();
+    t.exec_oneshot_background("claude", cmd("sh"), 1000).await.unwrap();
+    let seen = fake.seen.lock().unwrap();
+    assert_eq!(seen.exec_background, [None, Some("1".to_string())]);
+    assert_eq!(seen.exec_bodies[0], seen.exec_bodies[1], "the request is otherwise the same");
 }
 
 // ── one-shot execs ───────────────────────────────────────────────────────────
