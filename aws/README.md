@@ -31,8 +31,11 @@ following:
     `triple-c:component`. `CreateSecret` must name the key by its full ARN in `KmsKeyId`, and the
     user can use KMS (`Encrypt`/`GenerateDataKey`) only through Secrets Manager and only with
     environment keys.
-  - A secret on the default `aws/secretsmanager` key is refused. That key can't carry the tag, so
-    the workspace's own task role, which is limited by the boundary, couldn't decrypt it.
+  - A secret on any other key is refused by an **explicit Deny**: `kms:Encrypt` and
+    `kms:GenerateDataKey*` through Secrets Manager on a key without `triple-c:component`. The Deny
+    is needed because the AWS-managed `aws/secretsmanager` key, or any customer key whose key
+    policy grants account principals directly, needs no identity-policy Allow. A secret on such a
+    key would be unreadable by the workspace's own task role, which is limited by the boundary.
   - A secret tagged `triple-c:component` belongs to the environment. A workspace user can never
     tag, untag, overwrite or delete one; an explicit Deny enforces this.
 - **Manage their own access points.** They can create and delete EFS access points tagged with
@@ -121,7 +124,8 @@ detection should flag any environment that breaks them.
 4. **Every environment KMS key and EFS file system carries `triple-c:component`.** The boundary
    and the admin tier both rely on this tag.
 5. **User secrets use the environment key.** The app must pass the environment KMS key's ARN as
-   `KmsKeyId` when it creates a secret. The policy refuses any other choice.
+   `KmsKeyId` when it creates a secret. The workspace policy explicitly denies Secrets Manager
+   encryption with any key that lacks `triple-c:component`, including `aws/secretsmanager`.
 
 ## One-time setup: the boundary policy
 
@@ -209,6 +213,9 @@ a real account:
   - Check that Secrets Manager calls `GenerateDataKey`/`Encrypt` as the caller, so the KMS
     statement's `aws:ResourceTag/triple-c:component` rule is what enforces the environment key.
   - Check that `PutSecretValue` on such a secret passes.
+  - Check that a `CreateSecret` naming the AWS-managed `aws/secretsmanager` key's ARN is denied.
+    KMS should leave `aws:ResourceTag/triple-c:component` absent for that key, so the
+    `NeverEncryptSecretsWithOtherKeys` Deny fires even though the key policy allows the call.
 - **Tag keys.** Check that `aws:TagKeys` is populated for `RunTask`, for `CreateSecret` and secret
   `TagResource`, for `CreateAccessPoint`, and for the ECS and EFS tag-on-create `TagResource`
   calls. Check also whether ECS-managed (`aws:ecs:*`) or propagated task-definition tags appear in

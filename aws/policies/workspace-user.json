@@ -293,6 +293,25 @@
       }
     },
     {
+      "Sid": "NeverEncryptSecretsWithOtherKeys",
+      "Effect": "Deny",
+      "Action": [
+        "kms:Encrypt",
+        "kms:GenerateDataKey*"
+      ],
+      "Resource": [
+        "arn:aws:kms:*:*:key/*"
+      ],
+      "Condition": {
+        "StringLike": {
+          "kms:ViaService": "secretsmanager.*.amazonaws.com"
+        },
+        "Null": {
+          "aws:ResourceTag/triple-c:component": "true"
+        }
+      }
+    },
+    {
       "Sid": "ReadEcs",
       "Effect": "Allow",
       "Action": [

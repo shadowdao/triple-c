@@ -56,7 +56,9 @@ pub struct Check {
     /// An ARN template ([`render`]).
     pub resource: &'static str,
     /// Context entries. A key that appears more than once is a multi-valued
-    /// key (e.g. `aws:TagKeys`) and is sent as one `StringList` entry.
+    /// key (e.g. `aws:TagKeys`): whoever builds the simulation request must
+    /// send all its values as one `StringList` context entry (not enforced
+    /// here; the permission check's simulation builder owns it).
     pub context: &'static [(&'static str, ContextValue)],
     pub write: bool,
 }
@@ -1692,5 +1694,46 @@ mod tests {
             ("aws:TagKeys", Literal("a")),
             ("aws:TagKeys", Literal("c"))
         ])));
+    }
+
+    /// A key whose *key policy* grants account principals through Secrets
+    /// Manager (the AWS-managed `aws/secretsmanager` key, or any such customer
+    /// key) needs no identity-policy Allow, so only an explicit Deny keeps a
+    /// workspace user's secrets on environment keys.
+    #[test]
+    fn untagged_keys_are_explicitly_denied_through_secrets_manager() {
+        let tier = Tier::WorkspaceUser;
+        const VIA_SECRETS_MANAGER: Context = &[(
+            "kms:ViaService",
+            Literal("secretsmanager.{region}.amazonaws.com"),
+        )];
+        const VIA_SECRETS_MANAGER_ENVIRONMENT_KEY: Context = &[
+            (
+                "kms:ViaService",
+                Literal("secretsmanager.{region}.amazonaws.com"),
+            ),
+            (COMPONENT_RESOURCE_TAG, Literal("environment")),
+        ];
+        for action in [
+            "kms:Encrypt",
+            "kms:GenerateDataKey",
+            "kms:GenerateDataKeyWithoutPlaintext",
+        ] {
+            assert!(
+                explicitly_denied(tier, &write(action, PROBE_KEY, VIA_SECRETS_MANAGER)),
+                "{action} on an untagged key via Secrets Manager is not explicitly denied"
+            );
+            assert!(
+                !explicitly_denied(
+                    tier,
+                    &write(action, PROBE_KEY, VIA_SECRETS_MANAGER_ENVIRONMENT_KEY)
+                ),
+                "{action} on an environment key must not be denied"
+            );
+        }
+        // The checks themselves (environment key) stay allowed.
+        for c in checks(tier).iter().filter(|c| c.action.starts_with("kms:")) {
+            assert!(allowed(tier, c, ME, ME), "{}", c.action);
+        }
     }
 }
