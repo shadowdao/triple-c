@@ -83,6 +83,16 @@
       }
     },
     {
+      "Sid": "ExecOnTripleCClusters",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:ExecuteCommand"
+      ],
+      "Resource": [
+        "arn:aws:ecs:*:*:cluster/triple-c-*"
+      ]
+    },
+    {
       "Sid": "StartSessionsToOwnTasks",
       "Effect": "Allow",
       "Action": [
@@ -108,11 +118,12 @@
       ]
     },
     {
-      "Sid": "EndOrResumeOwnSessions",
+      "Sid": "UseEndOrResumeOwnSessions",
       "Effect": "Allow",
       "Action": [
         "ssm:TerminateSession",
-        "ssm:ResumeSession"
+        "ssm:ResumeSession",
+        "ssmmessages:OpenDataChannel"
       ],
       "Resource": [
         "arn:aws:ssm:*:*:session/*"
@@ -278,7 +289,8 @@
       "Effect": "Allow",
       "Action": [
         "kms:Encrypt",
-        "kms:GenerateDataKey"
+        "kms:GenerateDataKey",
+        "kms:Decrypt"
       ],
       "Resource": [
         "arn:aws:kms:*:*:key/*"
@@ -382,7 +394,9 @@
         "iam:SimulatePrincipalPolicy"
       ],
       "Resource": [
-        "${aws:PrincipalArn}"
+        "arn:aws:iam::*:role/*",
+        "arn:aws:iam::*:user/${aws:username}",
+        "arn:aws:iam::*:user/*/${aws:username}"
       ]
     },
     {

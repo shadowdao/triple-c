@@ -137,8 +137,11 @@ How the check works:
    probes (`ecs:DescribeClusters`, `ssm:GetParameter`, `secretsmanager:ListSecrets` filtered by
    tag, `elasticfilesystem:DescribeAccessPoints`). Write actions are then marked **"unverified —
    will be confirmed on first use"**, not "OK".
-3. Be honest about the gaps: the simulation does not apply SCPs, permission boundaries or session
-   policies. The first real create is the final check, and its error must name the denied action.
+3. Be honest about the gaps: the simulation does not apply SCPs or session policies (it does
+   apply the principal's own permissions boundary — verified 2026-11-14). The first real create is
+   the final check, and its error must name the denied action.
+4. A probed run never claims more than **Workspace user**: probes see reads, and the admin tier is
+   nearly all writes.
 
 The exact policies for each tier ship as files with the app (`aws/policies/*.json`). Settings
 links to them so an admin can grant them without reading this doc.
@@ -395,8 +398,8 @@ user, and the account is already safe to share.
 
 Strict tenancy's per-user `iam:PassRole` is scoped by a tag on the role
 (`iam:ResourceTag/triple-c:owner = ${aws:userid}`), not by role name, because `aws:userid`
-contains a `:`, which role names don't allow. **Verify** that `iam:PassRole` evaluates
-`iam:ResourceTag` as expected before release.
+contains a `:`, which role names don't allow. That `iam:PassRole` evaluates `iam:ResourceTag` this
+way is verified in the simulator (phase 3); confirm it on the first real `RunTask` (phase 5).
 
 Why EC2 privileged mode needs dedicated capacity: a privileged container, or one with the Docker
 socket, has root on its EC2 host, and so access to every other tenant's task on that host
@@ -565,6 +568,7 @@ aws/
   policies/
     environment-admin.json
     workspace-user.json
+    permissions-boundary.json      # every triple-c-* role carries it (phase 3)
     task-execution-role.json
     task-role-standard.json
 ```
@@ -576,7 +580,8 @@ aws/
 2. **Agent.** `triple-c-agent` in the image. Optionally use it locally too behind a flag, to
    harden it before AWS depends on it.
 3. **AWS connection + permission check.** Settings UI, SDK wiring, `GetCallerIdentity`, the tiered
-   simulation and fallback probes, policy files.
+   simulation and fallback probes, policy files. **Done 2026-11-14**; the policies were verified
+   against real IAM (see "Phase 3: policy verification and rulings").
 4. **Environment + onboarding stacks.** CloudFormation templates for both, detection (SSM
    parameters + tagged stacks, including half-deployed and outdated ones), join or deploy,
    self-onboarding or an admin request, **strict tenancy**.
@@ -620,6 +625,43 @@ aws/
   SOCI was not tried.
 - That GHCR pull-through cache works for the public image.
 - That the `SIGTERM` deadline on Fargate retirement and Spot leaves enough time for a WIP push.
+
+### Phase 3: policy verification and rulings (2026-11-14)
+
+Rulings made while writing the tier policies, which phase 4 must build on:
+
+- **Environment admins are fenced by a permissions boundary.** They create or change `triple-c-*`
+  roles only with the `triple-c-permissions-boundary` managed policy as the boundary, and cannot
+  remove, replace or edit it. An account administrator creates the boundary policy once.
+- **Destructive admin actions are tag-scoped.** Security groups, EFS file systems and KMS keys are
+  created only with `triple-c:component`, and changed or deleted only if they carry it.
+- **A probed permission check caps at Workspace user** (above).
+- **Strict tenancy needs per-user execution roles**, not only task roles: a workspace user can pass
+  only roles tagged with their own owner ID.
+- **Environment-level secrets carry `triple-c:component`**; workspace users can never write,
+  delete or retag those, and an untagged `triple-c/*` secret could be claimed by any of them.
+- **User secrets use the environment KMS key, named by ARN** in `KmsKeyId`; any other key,
+  including `aws/secretsmanager`, is explicitly denied.
+
+`aws/README.md` ("Live verification") has the per-statement results, and
+`app/src-tauri/src/aws/live_tests.rs` repeats them. What reality changed:
+
+- IAM refuses `${aws:PrincipalArn}` as a Resource, so self-inspection is `user/${aws:username}`
+  for IAM users and **any role** for role sessions (no role-name variable exists).
+- `ecs:ExecuteCommand` is also authorized against the cluster; the owner rule stays on the task.
+- Secrets Manager needs `kms:Decrypt` as well as `GenerateDataKey` on a customer key.
+- `elasticfilesystem:CreateFileSystem` has no resource type (`Resource: "*"`).
+- The session client needs `ssmmessages:OpenDataChannel` on its own session (AWS docs).
+- The tier policies must be managed policies (both together exceed a role's inline budget); the
+  workspace policy is close to the 6,144-character limit, and a unit test guards it.
+- `SimulatePrincipalPolicy` throttles within one check; the app retries adaptively.
+- The `aws/secretsmanager` Deny is load-bearing, but not for the reason first given: a bounded task
+  role *can* decrypt such a secret, because that key's policy grants the caller directly.
+
+Left for the phases with real ECS/EFS/EC2 resources: `RunTask`'s `aws:TagKeys` (and any
+`aws:ecs:*` or propagated tags), `iam:PassRole` with `iam:ResourceTag` on a real run, the owner
+tag on a real task for stop/exec/session, session ownership for an SSO-started session, EFS
+`CreateAction`/`CreateAccessPoint`/`ClientMount`, and `security-group-rule` authorization.
 
 ## Connection model
 

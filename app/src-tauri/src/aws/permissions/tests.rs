@@ -293,9 +293,10 @@ fn the_principal_placeholder_is_the_resolved_role() {
         .iter()
         .find(|s| s.action == "iam:GetRole" && s.resource == ROLE_ARN)
         .expect("iam:GetRole on the caller's own role");
+    // The policies name a user's own ARN by `${aws:username}`.
     assert_eq!(
-        context_value(get_role, "aws:PrincipalArn").unwrap().values,
-        [ROLE_ARN]
+        context_value(get_role, "aws:username").unwrap().values,
+        [ROLE_ARN.rsplit('/').next().unwrap()]
     );
 }
 

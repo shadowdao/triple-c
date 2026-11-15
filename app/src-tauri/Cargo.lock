@@ -442,6 +442,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-kms"
+version = "1.131.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c6309b510ca62e64bafb147a08413d81665fdcaa2b607423d348c576b5d4a89"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "aws-types",
+ "fastrand",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-secretsmanager"
 version = "1.128.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7219,6 +7242,7 @@ dependencies = [
  "aws-sdk-cloudformation",
  "aws-sdk-ecs",
  "aws-sdk-iam",
+ "aws-sdk-kms",
  "aws-sdk-secretsmanager",
  "aws-sdk-ssm",
  "aws-sdk-sts",

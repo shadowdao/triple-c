@@ -13,7 +13,7 @@ use super::identity::{self, principal_for_simulation, CallerIdentity, PrincipalA
 use super::policies::{checks, render, Check, ContextValue, Placeholders, Tier};
 
 /// How many simulations are in flight at once.
-const CONCURRENCY: usize = 4;
+const CONCURRENCY: usize = 2;
 
 /// One `SimulatePrincipalPolicy` request, fully rendered.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,8 +136,15 @@ pub struct SdkPermissionApi {
 
 impl SdkPermissionApi {
     pub fn new(cfg: &aws_config::SdkConfig) -> Self {
+        // IAM throttles SimulatePrincipalPolicy hard: a full check (about a
+        // hundred simulations) failed a third of its rows with "Rate
+        // exceeded" under standard retries (verified live). Adaptive retry
+        // backs off client-side once throttled, with room to retry.
+        let iam = aws_sdk_iam::config::Builder::from(cfg)
+            .retry_config(aws_config::retry::RetryConfig::adaptive().with_max_attempts(10))
+            .build();
         SdkPermissionApi {
-            iam: aws_sdk_iam::Client::new(cfg),
+            iam: aws_sdk_iam::Client::from_conf(iam),
             ecs: aws_sdk_ecs::Client::new(cfg),
             ssm: aws_sdk_ssm::Client::new(cfg),
             cfn: aws_sdk_cloudformation::Client::new(cfg),

@@ -153,7 +153,7 @@ describe("HostsSettings", () => {
     fireEvent.click(screen.getByRole("button", { name: "Check Prod" }));
     expect(await screen.findByText("Insufficient")).toBeInTheDocument();
     expect(screen.getByText("ecs:RunTask")).toBeInTheDocument();
-    expect(screen.getByText(/SCPs, permission boundaries/)).toBeInTheDocument();
+    expect(screen.getByText(/SCPs or session policies/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Copy workspace-user policy" }));
     await waitFor(() => expect(writeText).toHaveBeenCalledWith('{"Version":"2012-10-17"}'));
     expect(invoke).toHaveBeenCalledWith("aws_policy_document", { tier: "workspace_user" });

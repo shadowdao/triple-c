@@ -177,7 +177,7 @@ function PermissionReportView({ report }: { report: PermissionReport }) {
         </p>
       )}
       <p className="text-xs text-[var(--text-secondary)] leading-snug">
-        The simulation doesn't account for SCPs, permission boundaries or session policies.
+        The simulation doesn't account for SCPs or session policies.
       </p>
     </div>
   );

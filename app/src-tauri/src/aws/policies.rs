@@ -73,16 +73,19 @@ pub struct Placeholders<'a> {
     /// `{account}`
     pub account: &'a str,
     /// `{principal}`: the caller's IAM user or role ARN (the simulation's
-    /// `PolicySourceArn`, which is what `${aws:PrincipalArn}` resolves to).
+    /// `PolicySourceArn`). `{principal_name}` is its last path segment: the
+    /// user or role name.
     pub principal: &'a str,
 }
 
-/// Substitutes `{region}`, `{account}` and `{principal}` in a resource or
-/// [`ContextValue::Literal`] template.
+/// Substitutes `{region}`, `{account}`, `{principal}` and
+/// `{principal_name}` in a resource or [`ContextValue::Literal`] template.
 pub fn render(template: &str, p: &Placeholders) -> String {
+    let name = p.principal.rsplit('/').next().unwrap_or(p.principal);
     template
         .replace("{region}", p.region)
         .replace("{account}", p.account)
+        .replace("{principal_name}", name)
         .replace("{principal}", p.principal)
 }
 
@@ -102,8 +105,11 @@ const OWNER_RESOURCE_TAG: &str = "aws:ResourceTag/triple-c:owner";
 /// The tag SSM puts on a session; its value is the starter's `aws:userid`.
 const SESSION_OWNER: &str = "ssm:resourceTag/aws:ssmmessages:session-id";
 
-/// `${aws:PrincipalArn}` in a Resource resolves from this context entry.
-const OWN_PRINCIPAL: Context = &[("aws:PrincipalArn", Literal("{principal}"))];
+/// IAM refuses `${aws:PrincipalArn}` as a Resource (verified live), so a
+/// user's own ARN is `user/${aws:username}` (or `user/*/${aws:username}`
+/// with a path), resolved from this entry. A role cannot be named that way
+/// (there is no role-name variable); the policies allow `role/*`.
+const OWN_PRINCIPAL: Context = &[("aws:username", Literal("{principal_name}"))];
 /// Role writes name the boundary; `${aws:PrincipalAccount}` resolves from
 /// the second entry.
 const WITH_BOUNDARY: Context = &[
@@ -193,6 +199,8 @@ const WORKSPACE_USER_CHECKS: &[Check] = &[
         PROBE_TASK,
         &[(OWNER_RESOURCE_TAG, OwnerId)],
     ),
+    // ExecuteCommand is authorized against the cluster too (verified live).
+    write("ecs:ExecuteCommand", PROBE_CLUSTER, &[]),
     write(
         "ssm:StartSession",
         PROBE_TASK,
@@ -211,6 +219,12 @@ const WORKSPACE_USER_CHECKS: &[Check] = &[
     ),
     write(
         "ssm:ResumeSession",
+        PROBE_SESSION,
+        &[(SESSION_OWNER, OwnerId)],
+    ),
+    // The session client opens its data channel on the session.
+    write(
+        "ssmmessages:OpenDataChannel",
         PROBE_SESSION,
         &[(SESSION_OWNER, OwnerId)],
     ),
@@ -278,6 +292,19 @@ const WORKSPACE_USER_CHECKS: &[Check] = &[
     ),
     write(
         "kms:GenerateDataKey",
+        PROBE_KEY,
+        &[
+            (
+                "kms:ViaService",
+                Literal("secretsmanager.{region}.amazonaws.com"),
+            ),
+            (COMPONENT_RESOURCE_TAG, Literal("environment")),
+        ],
+    ),
+    // CreateSecret and PutSecretValue on a customer key also need Decrypt
+    // (verified live: without it, "Access to KMS is not allowed").
+    write(
+        "kms:Decrypt",
         PROBE_KEY,
         &[
             (
@@ -368,9 +395,11 @@ const ENVIRONMENT_ADMIN_CHECKS: &[Check] = &[
         COMPONENT_TAGGED,
     ),
     read("ec2:DescribeSecurityGroups", "*", &[]),
+    // CreateFileSystem has no resource type: IAM authorizes it against `*`
+    // (verified live; a `file-system/*` Resource never matches).
     write(
         "elasticfilesystem:CreateFileSystem",
-        PROBE_FILE_SYSTEM,
+        "*",
         COMPONENT_REQUESTED,
     ),
     write(
@@ -1045,9 +1074,11 @@ mod tests {
         }
     }
 
-    /// GetRole and SimulatePrincipalPolicy: the caller's own principal only.
+    /// GetRole and SimulatePrincipalPolicy: an IAM user only on itself. IAM
+    /// has no role-name variable and refuses `${aws:PrincipalArn}` as a
+    /// Resource (verified live), so a role caller may inspect any role.
     #[test]
-    fn principal_inspection_is_only_of_the_caller() {
+    fn principal_inspection_is_of_the_caller_or_of_roles() {
         for tier in TIERS {
             for action in ["iam:GetRole", "iam:SimulatePrincipalPolicy"] {
                 let own = checks(tier)
@@ -1055,15 +1086,79 @@ mod tests {
                     .find(|c| c.action == action && c.resource == "{principal}")
                     .unwrap_or_else(|| panic!("{tier:?}: no own-principal check for {action}"));
                 assert!(allowed(tier, own, ME, ME));
-                let other = Check {
-                    resource: "arn:aws:iam::{account}:role/SomeoneElsesRole",
+                let as_alice: Context = &[("aws:username", Literal("alice"))];
+                let at = |resource: &'static str| Check {
+                    resource,
+                    context: as_alice,
                     ..*own
                 };
-                assert!(
-                    !allowed(tier, &other, ME, ME),
-                    "{tier:?}: {action} allowed on another principal"
-                );
+                for mine in [
+                    "arn:aws:iam::{account}:user/alice",
+                    "arn:aws:iam::{account}:user/team/alice",
+                    "arn:aws:iam::{account}:role/SomeoneElsesRole",
+                ] {
+                    assert!(
+                        allowed(tier, &at(mine), ME, ME),
+                        "{tier:?}: {action} on {mine}"
+                    );
+                }
+                for theirs in [
+                    "arn:aws:iam::{account}:user/bob",
+                    "arn:aws:iam::{account}:user/team/xalice",
+                    "arn:aws:iam::{account}:group/alice",
+                ] {
+                    assert!(
+                        !allowed(tier, &at(theirs), ME, ME),
+                        "{tier:?}: {action} allowed on {theirs}"
+                    );
+                }
             }
+        }
+    }
+
+    /// IAM rejects a Resource that is not `*` or an ARN, even one that is a
+    /// policy variable resolving to an ARN (`${aws:PrincipalArn}`, verified
+    /// live: "Resource ${aws:PrincipalArn} must be in ARN format or \"*\"").
+    #[test]
+    fn every_resource_is_an_arn_or_star() {
+        let docs = [
+            ("workspace-user", policy(Tier::WorkspaceUser)),
+            ("environment-admin", policy(Tier::EnvironmentAdmin)),
+            (
+                "permissions-boundary",
+                serde_json::from_str(permissions_boundary_json()).unwrap(),
+            ),
+        ];
+        for (name, doc) in &docs {
+            for s in statements_of(doc) {
+                for r in resources(&s) {
+                    assert!(
+                        r == "*" || r.starts_with("arn:"),
+                        "{name} {}: Resource {r} is not an ARN",
+                        sid(&s)
+                    );
+                }
+            }
+        }
+    }
+
+    /// A customer managed policy may hold 6,144 characters, not counting
+    /// whitespace (verified live: the workspace policy is close). An
+    /// environment admin needs both tier policies, which together exceed a
+    /// role's 10,240-character inline budget, so they ship as managed
+    /// policies.
+    #[test]
+    fn every_policy_fits_a_managed_policy() {
+        for (name, text) in [
+            ("workspace-user", policy_json(Tier::WorkspaceUser)),
+            ("environment-admin", policy_json(Tier::EnvironmentAdmin)),
+            ("permissions-boundary", permissions_boundary_json()),
+        ] {
+            let size = text.chars().filter(|c| !c.is_whitespace()).count();
+            assert!(
+                size <= 6144,
+                "{name} is {size} characters without whitespace (max 6144)"
+            );
         }
     }
 
@@ -1199,7 +1294,7 @@ mod tests {
         const CREATES: &[(&str, &str)] = &[
             ("kms:CreateKey", "*"),
             ("ec2:CreateSecurityGroup", PROBE_SECURITY_GROUP),
-            ("elasticfilesystem:CreateFileSystem", PROBE_FILE_SYSTEM),
+            ("elasticfilesystem:CreateFileSystem", "*"),
         ];
         const DESTROYS: &[(&str, &str)] = &[
             ("kms:ScheduleKeyDeletion", PROBE_KEY),

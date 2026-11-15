@@ -6,6 +6,8 @@
 mod connection;
 mod error;
 mod identity;
+#[cfg(test)]
+mod live_tests;
 pub mod permissions;
 pub mod policies;
 

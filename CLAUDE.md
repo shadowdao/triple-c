@@ -304,6 +304,27 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   `docker/`; get a target from `ContainerTarget::for_project`, `ProjectHost`, or a session
   (`ExecSessionManager::get_target`). Base-image migration is the one Docker-only exception
   (`DOCKER_ONLY`); shrink it, never grow it.
+- **`aws/`** — AWS connections (Settings → Hosts) and the permission check. `connection.rs`
+  builds a saved `HostConnection`'s `SdkConfig` **by hand, never with
+  `aws_config::defaults().load()`**: a profile is read through `ProfileFileCredentialsProvider`
+  for credentials only, so the app's own `AWS_*` variables, `AWS_ENDPOINT_URL*` and a profile's
+  endpoint/service settings can't redirect or re-credential a connection's signed requests.
+  `identity.rs` is `GetCallerIdentity` and the principal to simulate (an assumed role's ARN is
+  recovered with `iam:GetRole`, because SSO roles have an `/aws-reserved/…` path the session ARN
+  lacks); `error.rs` classifies SDK errors (SSO expired, access denied naming the action, …);
+  `policies.rs` embeds `aws/policies/*.json` (the two tier policies and the permissions boundary)
+  and the table of checks the simulator is asked; `permissions.rs` runs it
+  (`SimulatePrincipalPolicy`, adaptive retries — it throttles — or read-only probes when the
+  caller can't simulate itself; a probed run never claims the admin tier). `policies.rs`'s tests
+  are the drift guard: every allowed action has a check, every check is allowed by a small IAM
+  evaluator, owner-scoped checks are denied for someone else, admin destruction is tag-scoped,
+  the boundary fences hold, every Resource is an ARN and every policy fits a 6,144-character
+  managed policy. **Change a policy JSON, its checks and `aws/README.md` together.** The evaluator
+  is not IAM: `live_tests.rs` (ignored; `TRIPLEC_AWS_E2E_PROFILE`, `TRIPLEC_AWS_E2E_REGION`,
+  admin credentials for a disposable account; `cargo test aws::live_tests -- --ignored
+  --test-threads=1`) runs the check and real calls against throwaway `triple-c-e2e-*` roles,
+  secrets and keys, and cleans them up. Re-run it after any policy change; the results are in
+  `aws/README.md` ("Live verification").
 - **`web_terminal/`** — Remote terminal access via axum HTTP+WebSocket server:
   - `server.rs` — Axum server lifecycle (start/stop), serves embedded HTML and handles WS upgrades
   - `ws_handler.rs` — Per-connection WebSocket handler with JSON protocol, session management, cleanup on disconnect

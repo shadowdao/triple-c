@@ -24,18 +24,29 @@ following:
   ID, and the cluster must be a `triple-c-*` one. The new task is tagged with the user's owner ID.
   The user can pass only `triple-c-*` roles tagged with their owner ID, and only to ECS tasks.
 - **Work with their own tasks.** They can stop them, `ecs execute-command` into them, and open an
-  SSM session to them. They can end or resume only sessions they started.
+  SSM session to them. They can end or resume only sessions they started, and open data channels
+  (`ssmmessages:OpenDataChannel`) only on those.
+  - `ecs:ExecuteCommand` is authorized against the **cluster** as well as the task, so the policy
+    also allows it on `triple-c-*` clusters with no condition. The owner rule is on the task, and
+    both must pass.
 - **Manage their own secrets.** They can create, update and delete `triple-c/*` secrets tagged with
   their owner ID.
   - A secret must be encrypted with an **environment KMS key**, meaning one tagged
-    `triple-c:component`. `CreateSecret` must name the key by its full ARN in `KmsKeyId`, and the
-    user can use KMS (`Encrypt`/`GenerateDataKey`) only through Secrets Manager and only with
-    environment keys.
+    `triple-c:component`. `CreateSecret` must name the key by its full ARN in `KmsKeyId` (a key
+    ID, an alias or no key at all is refused), and the user can use KMS
+    (`Encrypt`/`GenerateDataKey`/`Decrypt`) only through Secrets Manager and only with environment
+    keys. Secrets Manager needs `kms:Decrypt` as well as `GenerateDataKey` to create or update a
+    secret on a customer key.
   - A secret on any other key is refused by an **explicit Deny**: `kms:Encrypt` and
     `kms:GenerateDataKey*` through Secrets Manager on a key without `triple-c:component`. The Deny
     is needed because the AWS-managed `aws/secretsmanager` key, or any customer key whose key
-    policy grants account principals directly, needs no identity-policy Allow. A secret on such a
-    key would be unreadable by the workspace's own task role, which is limited by the boundary.
+    policy grants account principals directly, needs no identity-policy Allow; without the Deny
+    such a `CreateSecret` succeeds. Keeping every user secret on the environment key keeps it
+    under the key policy the environment stack controls. (The permissions boundary does *not*
+    stop a task role decrypting an `aws/secretsmanager` secret: that key's policy grants the
+    caller directly.)
+  - Every `TagResource` on a secret must carry `triple-c:owner = ${aws:userid}` in the request,
+    even when it only adds `triple-c:project`.
   - A secret tagged `triple-c:component` belongs to the environment. A workspace user can never
     tag, untag, overwrite or delete one; an explicit Deny enforces this.
 - **Manage their own access points.** They can create and delete EFS access points tagged with
@@ -46,8 +57,12 @@ following:
   `RunTask`, the ECS and EFS tag-on-create calls, `CreateSecret`, and secret `TagResource`. A
   workspace user can never set `triple-c:component`, which marks environment resources and which
   the Denies and phase-4 detection trust.
-- **Inspect their own principal.** They can read it (`iam:GetRole`) and simulate it
-  (`iam:SimulatePrincipalPolicy`). The app's permission check uses both.
+- **Inspect principals.** `iam:GetRole` and `iam:SimulatePrincipalPolicy`, which the app's
+  permission check uses on the caller's own principal. An IAM user may inspect only itself
+  (`user/${aws:username}`, with or without a path). A role session may inspect **any role** in the
+  account: IAM refuses `${aws:PrincipalArn}` as a Resource and has no role-name variable, so the
+  caller's own role cannot be named. This exposes role metadata and simulated permissions, never
+  another user's resources.
 - **Read environment information.** This covers ECS, CloudFormation stacks, the `/triple-c/*` SSM
   parameters, the secret list, EFS, and the `/triple-c/*` log groups. Listing is not a secret; the
   app filters by owner for display.
@@ -98,10 +113,12 @@ Triple-C's.
 account-wide:
 
 - `ecs:RegisterTaskDefinition` and `ecs:DeregisterTaskDefinition` on `*`. The admin can deregister
-  *any* task definition revision in the account. Narrowing this to `task-definition/triple-c-*`
-  depends on resource-level support, which is to be verified live.
-- `ecr:CreatePullThroughCacheRule` on `*`. The admin can add pull-through cache rules for any
-  prefix. This cannot delete or overwrite anything.
+  *any* task definition revision in the account. `DeregisterTaskDefinition` has no resource type
+  (IAM authorizes it against `*`), so it cannot be narrowed.
+- `ecr:CreatePullThroughCacheRule` on `*`, which also has no resource type. The admin can add
+  pull-through cache rules for any prefix. This cannot delete or overwrite anything.
+- `elasticfilesystem:CreateFileSystem` on `*` (no resource type), still only with a
+  `triple-c:component` request tag.
 - `ec2:CreateSecurityGroup` in any VPC (the new group itself must be tagged), and `ec2:Describe*`.
 - `cloudformation:*` on `triple-c-*` stacks. Whatever a template creates is limited by the actions
   above, because CloudFormation runs with the caller's own permissions (see the invariants below).
@@ -143,9 +160,14 @@ this step; one option is to list it with the environment stack's prerequisites.
 
 ## Attaching the tier policies
 
-In the console, go to **IAM → Policies → Create policy → JSON**, paste the file, and attach the
-policy to a user, group or role. For IAM Identity Center, add it as an inline policy on the
-permission set.
+Create each file as a **customer managed policy** and attach it. In the console, go to
+**IAM → Policies → Create policy → JSON**, paste the file, and attach the policy to a user, group
+or role. Inline policies do not fit: a role's inline policies share 10,240 characters and an
+environment admin needs both tiers (about 11,500), and a user's share 2,048. A managed policy may
+hold 6,144 characters, not counting whitespace; the workspace policy is about 6,050, and a unit
+test (`every_policy_fits_a_managed_policy`) fails before it outgrows that. For IAM Identity
+Center, add the files as inline policies on the permission set (up to 32,768 characters) or
+reference the managed policies.
 
 With the CLI:
 
@@ -186,48 +208,54 @@ aws iam attach-user-policy --user-name <user> \
   point to its owner's task role, or access points created by the onboarding stack rather than by
   the user.
 
-## To verify live (Task 8)
+## Live verification (2026-11-14)
 
-The unit tests use a small IAM-style evaluator. These points need the real IAM policy simulator or
-a real account:
+Every point the unit tests' small evaluator could not settle was checked against real IAM in a
+disposable account (us-west-2): with the policy simulator, with calls made as throwaway roles that
+hold the policies, and with deny probes (a call made as a role with no permissions names the
+resource it was authorized against, and creates nothing). The repeatable part is
+`app/src-tauri/src/aws/live_tests.rs`:
 
-- **KMS key tags.** Does `CreateKey` with tags authorize `kms:TagResource` against the new,
-  untagged key? If so, the tag rule on `kms:TagResource` denies it. Do **not** fix that by removing
-  the condition from `TagResource`.
-- **Principal variables.** Check how `${aws:PrincipalAccount}` and `${aws:PrincipalArn}` resolve.
-  For an SSO session, does the role ARN include the `/aws-reserved/sso.amazonaws.com/<region>/`
-  path? Does the simulator substitute them in `Resource`?
-- **ECS Exec on the cluster.** `ecs:ExecuteCommand` may also be authorized on the cluster ARN.
-- **ECS tag keys.** On ECS resources, check `aws:ResourceTag` against `ecs:ResourceTag`.
-- **SSM sessions.** Check `ssm:StartSession` on an ECS task with `aws:ResourceTag`.
-- **Session ownership for SSO callers.** Check the
-  `ssm:resourceTag/aws:ssmmessages:session-id` condition when the caller signed in through SSO.
-- **EC2 and EFS tagging.** Check the `ec2:CreateAction` and `elasticfilesystem:CreateAction`
-  tag-on-create keys. Check whether `ec2:AuthorizeSecurityGroup*` and `RevokeSecurityGroup*` are
-  also authorized against `security-group-rule` resources.
-- **Secrets tagging.** Check that `CreateSecret` with tags authorizes `secretsmanager:TagResource`,
-  and that the `StringEqualsIfExists` and `Null` resource-tag conditions pass at create time.
-- **Secret keys.**
-  - Check that `secretsmanager:KmsKeyId` carries the value exactly as the request gave it, so that
-    `ArnLike arn:aws:kms:*:*:key/*` works.
-  - Check that Secrets Manager calls `GenerateDataKey`/`Encrypt` as the caller, so the KMS
-    statement's `aws:ResourceTag/triple-c:component` rule is what enforces the environment key.
-  - Check that `PutSecretValue` on such a secret passes.
-  - Check that a `CreateSecret` naming the AWS-managed `aws/secretsmanager` key's ARN is denied.
-    KMS should leave `aws:ResourceTag/triple-c:component` absent for that key, so the
-    `NeverEncryptSecretsWithOtherKeys` Deny fires even though the key policy allows the call.
-- **Tag keys.** Check that `aws:TagKeys` is populated for `RunTask`, for `CreateSecret` and secret
-  `TagResource`, for `CreateAccessPoint`, and for the ECS and EFS tag-on-create `TagResource`
-  calls. Check also whether ECS-managed (`aws:ecs:*`) or propagated task-definition tags appear in
-  `RunTask`'s `aws:TagKeys` and would break the key allow-list.
-- **Resource tags the boundary and access points rely on.** Check `aws:ResourceTag` on:
-  - `elasticfilesystem:ClientMount`/`ClientWrite` (the file system's tags, at mount);
-  - `elasticfilesystem:CreateAccessPoint`, which is authorized against the file system;
-  - `kms:Decrypt` through Secrets Manager (the key's tags).
-- **CloudFormation service roles.** Check that `cloudformation:RoleArn` is present in the request
-  context when `RoleARN` is given.
-- **Task definition scoping.** Check whether `ecs:DeregisterTaskDefinition` and
-  `ecr:CreatePullThroughCacheRule` support resource-level scoping, so they can be narrowed.
+```sh
+cd app/src-tauri
+TRIPLEC_AWS_E2E_PROFILE=<admin profile of a disposable account> TRIPLEC_AWS_E2E_REGION=us-west-2 \
+  cargo test aws::live_tests -- --ignored --test-threads=1
+```
 
-The simulator does not apply SCPs, permission boundaries or session policies, so the first real
-create is the final check.
+It creates `triple-c-e2e-<id>-*` roles and policies, `triple-c/triple-c-e2e-<id>/*` secrets and
+`triple-c-e2e-<id>` KMS keys, all tagged `triple-c-test=phase3`, and deletes them when each test
+ends (keys are scheduled for deletion, 7 days). One test creates the real
+`triple-c-permissions-boundary` policy if the account has none, and deletes it again.
+
+✓ verified as written · ✗→fixed: the policy changed · — could not verify, and why.
+
+| Point | Result |
+|---|---|
+| `${aws:PrincipalArn}` as a Resource | ✗→fixed. IAM refuses it ("must be in ARN format or \"*\""), so neither tier policy could be attached at all. Now `role/*` and `user/${aws:username}`, `user/*/${aws:username}` (see Inspect principals) |
+| SSO role path | ✓ `iam:GetRole` returns `role/aws-reserved/sso.amazonaws.com/<region>/AWSReservedSSO_…`, and the check simulates that ARN. The SSO admin session checks as Environment admin, Simulated |
+| `${aws:PrincipalAccount}` in `iam:PermissionsBoundary` | ✓ `CreateRole` with `triple-c-permissions-boundary` succeeds as the admin tier; without a boundary, or with another one, it is denied |
+| Boundary fences | ✓ removing, replacing or editing the boundary is an explicit deny |
+| Simulator and context | ✓ the simulator substitutes `${aws:userid}` and `${aws:username}` from context entries. It **does** apply the simulated principal's own permissions boundary (verified); it does not apply session policies. SCPs: not verifiable here |
+| Simulator rate limit | ✗→fixed (app). `SimulatePrincipalPolicy` throttles ("Rate exceeded") within a full check; the check now uses adaptive retries and two requests at a time |
+| KMS `CreateKey` with tags | ✓ allowed: tag-on-create passes the tag rule on `kms:TagResource`. Untagged `CreateKey`, and `CreateAlias`/`TagResource`/`ScheduleKeyDeletion` on an untagged key, are denied |
+| ECS Exec on the cluster | ✗→fixed. `ecs:ExecuteCommand` is authorized against the cluster, then the task. Added `ExecOnTripleCClusters`; with only the cluster allowed, the call is denied on the task, so the owner rule still decides |
+| ECS tag keys | ✓ (service reference) `aws:ResourceTag` is supported on tasks, clusters and task definitions. Live: — needs phase 4/5 ECS resources |
+| SSM `StartSession` to a task | ✓ authorized against `arn:aws:ecs:<region>:<account>:task/<cluster>/<task-id>`, which `task/triple-c-*/*` matches. The tag condition on a real task: — needs phase 5 |
+| SSO session ownership | ✓ (AWS docs) the `aws:ssmmessages:session-id` tag is the starter's `aws:userid` for users and role sessions alike. Live: — needs a session. Added `ssmmessages:OpenDataChannel` on own sessions, which AWS's current examples require |
+| EC2 tag-on-create | ✓ `CreateSecurityGroup` (DryRun) is allowed with a `triple-c:component` tag and denied without one or with only other tags. `security-group-rule` resources on `AuthorizeSecurityGroup*`: — needs a security group |
+| EFS | ✗→fixed: `CreateFileSystem` has no resource type, so `Resource` is now `*`. ✓ a tagged `CreateFileSystem`/`CreateAccessPoint` authorizes `elasticfilesystem:TagResource` first. `elasticfilesystem:CreateAction`, `CreateAccessPoint` against the file system's tags, `ClientMount`/`ClientWrite`: — need phase 6 file systems |
+| Secrets tag-on-create | ✓ `CreateSecret` with tags authorizes `secretsmanager:TagResource` separately (refused without `TagOwnSecrets`), and that statement's `StringEqualsIfExists`/`Null` conditions pass at create |
+| `secretsmanager:KmsKeyId` | ✓ carries the request's value: a key ARN passes, a bare key ID, an alias or no key is refused |
+| Secrets Manager's KMS calls | ✓ made as the caller with `kms:ViaService`. ✗→fixed: `CreateSecret`/`PutSecretValue` on a customer key also need `kms:Decrypt`, which the policy lacked ("Access to KMS is not allowed"). `PutSecretValue` on an own secret now passes |
+| `aws/secretsmanager` key | ✓ denied, and the Deny is what denies it: the same policy without `NeverEncryptSecretsWithOtherKeys` creates the secret |
+| Secret ownership | ✓ another owner's or a component-tagged secret cannot be written, deleted or claimed; `triple-c:component` cannot be set. An untagged `triple-c/*` secret *can* be claimed (invariant 3) |
+| `aws:TagKeys` | ✓ for `CreateSecret` and secret `TagResource`. `RunTask` (including `aws:ecs:*` and propagated tags), `CreateAccessPoint`, ECS/EFS tag-on-create: — need phase 4/5/6 resources |
+| Boundary and key tags | ✓ a role under the boundary decrypts through Secrets Manager with a component-tagged key and is refused with an untagged customer key, so KMS supplies the key's `aws:ResourceTag` |
+| `cloudformation:RoleArn` | ✓ present when `RoleARN` is given; the Deny fires. The admin tier cannot pass any role to CloudFormation anyway (`PassRole` is only to ECS tasks and EC2) |
+| Task definition / pull-through scoping | ✓ both authorize against `*`; they cannot be narrowed |
+
+Still open for the phases that create the resources: `RunTask`'s tag keys and `iam:PassRole`'s
+`iam:ResourceTag` on a real run, the owner tag on a real task for `StopTask`/`ExecuteCommand`/
+`StartSession`, session ownership for an SSO-started session, and the EFS and security-group-rule
+points above. The simulator does not apply session policies, so the first real create is the final
+check.
