@@ -98,6 +98,8 @@ const PID_FILE: &str = "apply.pid";
 const EXIT_FILE: &str = "apply.exit";
 /// Held (exclusive advisory lock) by the runner for its whole life.
 const LOCK_FILE: &str = "apply.lock";
+/// Held by [`start_detached`] for its check → clear → spawn → wait.
+const START_LOCK_FILE: &str = "start.lock";
 /// The names (not values) of the variables the app gave the runner, so the
 /// runner can hand `tofu` exactly those (see [`tofu_env`]).
 const ENV_KEYS_VAR: &str = "TRIPLEC_TOFU_ENV_KEYS";
@@ -626,33 +628,105 @@ fn remove_if_present(path: &Path) -> io::Result<()> {
 /// AppImage has to mount itself first, which is the slow case.
 const RUNNER_START_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Start `tofu init` then `apply|destroy` in a detached runner and return
-/// the runner's PID. The previous run's log, PID and exit code are cleared
-/// first. `env` is the runner's entire environment ([`child_env`]);
-/// credentials go nowhere else.
+/// Why [`start_detached`] did not start a run.
+#[derive(Debug)]
+pub enum StartError {
+    /// A runner holds this deployment's lock, or another start for it is
+    /// under way. Nothing in the folder was touched.
+    AlreadyRunning,
+    Failed(AwsError),
+}
+
+impl std::fmt::Display for StartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StartError::AlreadyRunning => {
+                write!(f, "A deploy is already running for this deployment")
+            }
+            StartError::Failed(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl From<StartError> for AwsError {
+    fn from(e: StartError) -> Self {
+        match e {
+            StartError::AlreadyRunning => other(StartError::AlreadyRunning.to_string()),
+            StartError::Failed(e) => e,
+        }
+    }
+}
+
+/// A started run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Started {
+    /// The runner's PID. `None` when the runner is running (it holds the
+    /// lock) but its PID couldn't be read: the run is followable, but Cancel
+    /// is unavailable.
+    pub pid: Option<u32>,
+}
+
+/// Start `tofu init` then `apply|destroy` in a detached runner. The previous
+/// run's log, PID and exit code are cleared first. `env` is the runner's
+/// entire environment ([`child_env`]); credentials go nowhere else.
 ///
-/// Returns only once the runner holds `apply.lock` and has written
-/// `apply.pid` (or has already finished), so the run is followable and
-/// cancellable the moment this returns. If it does neither within
-/// [`RUNNER_START_TIMEOUT`] the spawned process is killed and this fails:
-/// nothing is left running that the app can't see. Blocks for that wait
-/// (normally milliseconds); call it from a blocking task.
+/// The whole check → clear → spawn → wait sequence holds an exclusive lock
+/// on `start.lock`, so two starts on one deployment can't interleave; the
+/// loser, like a start while a runner holds `apply.lock`, gets
+/// [`StartError::AlreadyRunning`] without touching anything.
+///
+/// Returns once the runner holds `apply.lock` (or has already finished), so
+/// the run is followable the moment this returns. A runner that has taken
+/// the lock is never killed. Only one that neither took the lock nor wrote
+/// `apply.exit` within [`RUNNER_START_TIMEOUT`] is killed, and this fails.
+/// Blocks for that wait (normally milliseconds); call it from a blocking
+/// task.
 #[allow(dead_code)] // used by phase-4 commands
 pub fn start_detached(
     tofu: &Path,
     wd: &Workdir,
     op: TofuOp,
     env: &[(String, String)],
-) -> Result<u32, AwsError> {
-    if is_running(wd) {
-        return Err(other("A deploy is already running for this deployment"));
+) -> Result<Started, StartError> {
+    let program = runner_program()
+        .map_err(|e| StartError::Failed(other(format!("Could not start the deploy: {e}"))))?;
+    start_detached_with(&program, RUNNER_START_TIMEOUT, tofu, wd, op, env)
+}
+
+/// After the runner takes its lock, how long to wait for its PID file.
+const PID_GRACE: Duration = Duration::from_secs(2);
+
+fn start_detached_with(
+    program: &Path,
+    timeout: Duration,
+    tofu: &Path,
+    wd: &Workdir,
+    op: TofuOp,
+    env: &[(String, String)],
+) -> Result<Started, StartError> {
+    let failed =
+        |e: io::Error| StartError::Failed(other(format!("Could not start the deploy: {e}")));
+    let start_lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(wd.dir.join(START_LOCK_FILE))
+        .map_err(failed)?;
+    match start_lock.try_lock() {
+        Ok(()) => {}
+        Err(fs::TryLockError::WouldBlock) => return Err(StartError::AlreadyRunning),
+        Err(fs::TryLockError::Error(e)) => return Err(failed(e)),
     }
-    let io = |e: io::Error| other(format!("Could not start the deploy: {e}"));
+    // Held, not merely "exit not written yet": a runner that is finishing
+    // still owns the folder until it lets go.
+    if lock_held(wd) {
+        return Err(StartError::AlreadyRunning);
+    }
     for f in [LOG_FILE, EXIT_FILE, PID_FILE] {
-        remove_if_present(&wd.dir.join(f)).map_err(io)?;
+        remove_if_present(&wd.dir.join(f)).map_err(failed)?;
     }
     let names: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
-    let mut cmd = Command::new(runner_program().map_err(io)?);
+    let mut cmd = Command::new(program);
     cmd.arg(RUNNER_FLAG)
         .arg(&wd.dir)
         .arg(op.as_arg())
@@ -684,33 +758,42 @@ pub fn start_detached(
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
-    let mut child = cmd.spawn().map_err(io)?;
+    let mut child = cmd.spawn().map_err(failed)?;
+    let exited = || wd.dir.join(EXIT_FILE).exists();
 
-    let deadline = std::time::Instant::now() + RUNNER_START_TIMEOUT;
-    let pid = loop {
-        if lock_held(wd) {
-            if let Some(pid) = read_pid(wd) {
-                break pid;
-            }
-        }
-        if wd.dir.join(EXIT_FILE).exists() {
-            break read_pid(wd).unwrap_or_else(|| child.id());
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if lock_held(wd) || exited() {
+            break;
         }
         // An AppImage's launcher may exit 0 once it has handed over; only a
         // failure with nothing to show for it is final.
         if let Ok(Some(status)) = child.try_wait() {
-            if !status.success() && !lock_held(wd) && !wd.dir.join(EXIT_FILE).exists() {
-                return Err(other(format!(
+            if !status.success() && !lock_held(wd) && !exited() {
+                return Err(StartError::Failed(other(format!(
                     "The deploy runner failed to start ({status})"
-                )));
+                ))));
             }
         }
         if std::time::Instant::now() >= deadline {
+            // Never took the lock and never finished: nothing of a run has
+            // begun, so stopping it orphans nothing.
             let _ = child.kill();
             let _ = child.wait();
-            return Err(other(
+            return Err(StartError::Failed(other(
                 "The deploy runner did not start in time; it was stopped",
-            ));
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // The runner owns the run from here; it is not killed whatever happens.
+    let grace = std::time::Instant::now() + PID_GRACE;
+    let pid = loop {
+        if let Some(pid) = read_pid(wd) {
+            break Some(pid);
+        }
+        if exited() || std::time::Instant::now() >= grace {
+            break None;
         }
         std::thread::sleep(Duration::from_millis(20));
     };
@@ -718,7 +801,8 @@ pub fn start_detached(
     std::thread::spawn(move || {
         let _ = child.wait();
     });
-    Ok(pid)
+    drop(start_lock);
+    Ok(Started { pid })
 }
 
 fn read_pid(wd: &Workdir) -> Option<u32> {
@@ -1069,10 +1153,6 @@ fn run_runner(dir: &Path, op: TofuOp, tofu: &Path, env: &[(String, String)]) -> 
     if !locked {
         return None;
     }
-    let tmp = dir.join(format!("{PID_FILE}.tmp"));
-    let pid_written = fs::write(&tmp, std::process::id().to_string())
-        .and_then(|_| fs::rename(&tmp, dir.join(PID_FILE)));
-
     CHILD_PID.store(0, Ordering::SeqCst);
     CANCELLED.store(false, Ordering::SeqCst);
     #[cfg(unix)]
@@ -1083,6 +1163,11 @@ fn run_runner(dir: &Path, op: TofuOp, tofu: &Path, env: &[(String, String)]) -> 
             forward_sigint as extern "C" fn(libc::c_int) as libc::sighandler_t,
         );
     }
+    // Only now that Cancel is forwarded rather than fatal does the PID (the
+    // Cancel target) appear.
+    let tmp = dir.join(format!("{PID_FILE}.tmp"));
+    let pid_written = fs::write(&tmp, std::process::id().to_string())
+        .and_then(|_| fs::rename(&tmp, dir.join(PID_FILE)));
 
     let code = match OpenOptions::new()
         .create(true)

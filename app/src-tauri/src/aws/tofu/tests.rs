@@ -788,3 +788,176 @@ async fn smoke_the_downloaded_tofu_validates_the_boundary_module() {
         assert!(out.status.success(), "tofu {args:?} failed");
     }
 }
+
+#[test]
+fn a_second_start_while_the_runner_holds_the_lock_touches_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wd = Workdir {
+        dir: tmp.path().to_path_buf(),
+    };
+    let lock = hold_lock(&wd);
+    std::fs::write(wd.dir.join("apply.pid"), "4242").unwrap();
+    std::fs::write(wd.dir.join("apply.log"), "first run\n").unwrap();
+
+    let result = start_detached(
+        std::path::Path::new("/nonexistent/tofu"),
+        &wd,
+        TofuOp::Destroy,
+        &[],
+    );
+
+    assert!(
+        matches!(result, Err(StartError::AlreadyRunning)),
+        "{result:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wd.dir.join("apply.pid")).unwrap(),
+        "4242"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wd.dir.join("apply.log")).unwrap(),
+        "first run\n"
+    );
+    drop(lock);
+}
+
+#[test]
+fn a_start_already_under_way_makes_a_second_one_fail_fast() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wd = Workdir {
+        dir: tmp.path().to_path_buf(),
+    };
+    let starting = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(wd.dir.join("start.lock"))
+        .unwrap();
+    starting.try_lock().unwrap();
+    std::fs::write(wd.dir.join("apply.pid"), "4242").unwrap();
+
+    let result = start_detached(
+        std::path::Path::new("/nonexistent/tofu"),
+        &wd,
+        TofuOp::Apply,
+        &[],
+    );
+
+    assert!(
+        matches!(result, Err(StartError::AlreadyRunning)),
+        "{result:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wd.dir.join("apply.pid")).unwrap(),
+        "4242"
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn fake_runner(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    // Invoked as: <program> --tofu-runner <workdir> <op>
+    let path = dir.join("fake-runner");
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// A runner that took the lock but never wrote its PID is running a deploy:
+/// the start returns (Cancel unavailable) and does not kill it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_runner_holding_the_lock_without_a_pid_is_never_killed() {
+    if !std::path::Path::new("/usr/bin/flock").exists() {
+        eprintln!("skipped: no flock(1)");
+        return;
+    }
+    let bin = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let wd = Workdir {
+        dir: tmp.path().to_path_buf(),
+    };
+    let program = fake_runner(bin.path(), "exec /usr/bin/flock \"$2/apply.lock\" sleep 6");
+    let env = vec![("PATH".to_string(), "/usr/bin:/bin".to_string())];
+
+    let started = start_detached_with(
+        &program,
+        Duration::from_secs(10),
+        std::path::Path::new("/unused"),
+        &wd,
+        TofuOp::Apply,
+        &env,
+    )
+    .unwrap();
+
+    assert_eq!(started, Started { pid: None });
+    assert!(is_running(&wd), "the runner must still be alive");
+    // And the start lock was released for the next start, which is refused
+    // because a runner holds the deployment.
+    let again = start_detached(std::path::Path::new("/unused"), &wd, TofuOp::Apply, &[]);
+    assert!(
+        matches!(again, Err(StartError::AlreadyRunning)),
+        "{again:?}"
+    );
+}
+
+/// Only a runner that never took the lock and never finished is stopped.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_runner_that_never_takes_the_lock_is_stopped_and_reported() {
+    let bin = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let wd = Workdir {
+        dir: tmp.path().to_path_buf(),
+    };
+    let program = fake_runner(bin.path(), "exec sleep 30");
+    let env = vec![("PATH".to_string(), "/usr/bin:/bin".to_string())];
+
+    let started = std::time::Instant::now();
+    let result = start_detached_with(
+        &program,
+        Duration::from_millis(300),
+        std::path::Path::new("/unused"),
+        &wd,
+        TofuOp::Apply,
+        &env,
+    );
+
+    assert!(
+        matches!(&result, Err(StartError::Failed(e)) if e.to_string().contains("did not start in time")),
+        "{result:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+/// A runner that takes the lock and writes its PID is reported with it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_started_runner_reports_its_pid() {
+    if !std::path::Path::new("/usr/bin/flock").exists() {
+        eprintln!("skipped: no flock(1)");
+        return;
+    }
+    let bin = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let wd = Workdir {
+        dir: tmp.path().to_path_buf(),
+    };
+    let program = fake_runner(
+        bin.path(),
+        "exec /usr/bin/flock \"$2/apply.lock\" sh -c 'echo 31337 > \"$0/apply.pid\"; sleep 3' \"$2\"",
+    );
+    let env = vec![("PATH".to_string(), "/usr/bin:/bin".to_string())];
+
+    let started = start_detached_with(
+        &program,
+        Duration::from_secs(10),
+        std::path::Path::new("/unused"),
+        &wd,
+        TofuOp::Apply,
+        &env,
+    )
+    .unwrap();
+
+    assert_eq!(started, Started { pid: Some(31337) });
+}
