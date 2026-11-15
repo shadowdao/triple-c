@@ -585,6 +585,15 @@ fn validate_repo_url(url: &str) -> Result<(), String> {
         return bad("must not start with '-'");
     }
     let ok = if let Some(rest) = url.strip_prefix("https://") {
+        // Credentials in the URL would sit in the project secret and in
+        // `.git/config` in the clear, and leak into every clone's remote.
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        if authority.contains('@') {
+            return bad(
+                "must not carry credentials (user:password@ or token@); put the token in the \
+                 project's Git HTTPS token setting (Access) instead",
+            );
+        }
         !rest.is_empty()
     } else if let Some(rest) = url.strip_prefix("ssh://") {
         !rest.is_empty()
@@ -609,6 +618,11 @@ fn validate_branch(branch: &str) -> Result<(), String> {
     }
     if branch.starts_with('-') || branch.starts_with('/') || branch.ends_with('/') {
         return bad("must not start with '-' or start/end with '/'");
+    }
+    // `HEAD` passes check-ref-format but `git clone --branch HEAD` fails
+    // (and a branch named HEAD is refused by `git branch`).
+    if branch == "HEAD" {
+        return bad("HEAD is not a branch; leave the branch empty for the default branch");
     }
     if branch == "@" || branch.ends_with('.') || branch.contains("..") || branch.contains("@{") || branch.contains("//") {
         return bad("is not a valid branch name");
@@ -1406,12 +1420,29 @@ mod tests {
     }
 
     #[test]
+    fn an_https_url_with_credentials_is_refused_pointing_at_the_token_setting() {
+        let check = |u: &str| validate_aws_workspace(&with_repos(vec![repo(u, None, "x")]));
+        for bad in [
+            "https://user:pass@github.com/o/r.git",
+            "https://ghp_abc@github.com/o/r.git",
+            "https://oauth2:tok@gitlab.com/o/r",
+        ] {
+            let e = check(bad).unwrap_err();
+            assert!(e.contains("Git HTTPS token"), "{e}");
+        }
+        // An @ in the path is not userinfo; ssh and scp forms keep their user.
+        for good in ["https://h/o/r@v2.git", "ssh://git@h/o/r.git", "git@github.com:o/r.git"] {
+            assert!(check(good).is_ok(), "{good}");
+        }
+    }
+
+    #[test]
     fn branches_follow_check_ref_format() {
         let ok = |b: Option<&str>| validate_aws_workspace(&with_repos(vec![repo("https://h/r", b, "x")])).is_ok();
         for good in [None, Some("main"), Some("feat/aws-1"), Some("v1.2.3"), Some("a@b")] {
             assert!(ok(good), "{good:?}");
         }
-        for bad in ["", "-x", "a..b", "a b", "a~1", "a^", "a:b", "a?", "a*", "a[", "a\\b", "a.lock", "x/.hidden", "a/", "/a", "a//b", "a@{1}", "@", "a."] {
+        for bad in ["", "-x", "a..b", "a b", "a~1", "a^", "a:b", "a?", "a*", "a[", "a\\b", "a.lock", "x/.hidden", "a/", "/a", "a//b", "a@{1}", "@", "a.", "HEAD"] {
             assert!(!ok(Some(bad)), "{bad:?}");
         }
     }

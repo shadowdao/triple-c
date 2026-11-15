@@ -74,10 +74,10 @@ const KEY_REPOS: &str = "TRIPLEC_REPOS";
 const KEY_WIP_PUSH: &str = "TRIPLEC_WIP_PUSH";
 const KEY_IDLE: &str = "TRIPLEC_IDLE_STOP_MINUTES";
 const KEY_STORAGE: &str = "TRIPLEC_STORAGE";
-/// The task definition's whole `environment` (R2): constants, no project data.
 /// Seconds ECS waits after SIGTERM before SIGKILL (Fargate allows 2–120).
 pub const STOP_TIMEOUT_SECS: i32 = 120;
 
+/// The task definition's whole `environment` (R2): constants, no project data.
 const FIXED_ENVIRONMENT: [(&str, &str); 2] = [("TRIPLEC_HOST", "aws"), ("COLORTERM", "truecolor")];
 
 fn other(message: impl Into<String>) -> AwsError {
