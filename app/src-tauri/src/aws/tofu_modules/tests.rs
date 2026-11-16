@@ -1892,7 +1892,7 @@ const MODULE_CALLS: &[(&str, &[Check])] = &[
     ("backend.s3", BACKEND),
 ];
 
-// Phase 7 (per-user EC2 capacity, E1–E5, E11): the calls the onboarding
+// Phase 7 (per-user EC2 capacity, E1–E5, E11; fix round 1): the calls the onboarding
 // module's EC2 resources will make, written down with the policy (Task 2)
 // before the resources exist. Task 3 moves each entry into MODULE_CALLS
 // under its type (merging with the existing `aws_ecs_cluster`,
@@ -1925,12 +1925,46 @@ const FROM_TEMPLATE: Context = &[(
     "ec2:LaunchTemplate",
     Literal("arn:aws:ec2:{region}:{account}:launch-template/lt-00000000000000000"),
 )];
+const LT_ARN: ContextValue =
+    Literal("arn:aws:ec2:{region}:{account}:launch-template/lt-00000000000000000");
+/// The template's tag specifications tag the instance and its volume.
+const TAGGED_INSTANCE: Context = &[
+    (REQUEST_COMPONENT, Literal("user-onboarding")),
+    ("ec2:LaunchTemplate", LT_ARN),
+    ("ec2:InstanceType", Literal("m7i.large")),
+];
+const TAGGED_VOLUME: Context = &[
+    (REQUEST_COMPONENT, Literal("user-onboarding")),
+    ("ec2:LaunchTemplate", LT_ARN),
+];
+/// The environment's tasks group, named in the template.
+const TEMPLATE_GROUP: Context = &[
+    ("ec2:LaunchTemplate", LT_ARN),
+    ("ec2:IsLaunchTemplateResource", Literal("true")),
+    (RESOURCE_COMPONENT, Literal("environment")),
+];
 const AMAZON_IMAGE: Context = &[
     ("ec2:Owner", Literal("amazon")),
+    ("ec2:LaunchTemplate", LT_ARN),
+    ("ec2:IsLaunchTemplateResource", Literal("true")),
+];
+/// The group pins the template to a version (`latest_version`, never
+/// `$Latest`/`$Default`) and has no load balancer.
+const GROUP_CREATE: Context = &[
+    (REQUEST_COMPONENT, Literal("user-onboarding")),
     (
-        "ec2:LaunchTemplate",
-        Literal("arn:aws:ec2:{region}:{account}:launch-template/lt-00000000000000000"),
+        "autoscaling:LaunchTemplateVersionSpecified",
+        Literal("true"),
     ),
+    ("autoscaling:InstanceTypes", Literal("m7i.large")),
+];
+const GROUP_UPDATE: Context = &[
+    (RESOURCE_COMPONENT, Literal("user-onboarding")),
+    (
+        "autoscaling:LaunchTemplateVersionSpecified",
+        Literal("true"),
+    ),
+    ("autoscaling:InstanceTypes", Literal("m7i.large")),
 ];
 const TO_EC2: Context = &[("iam:PassedToService", Literal("ec2.amazonaws.com"))];
 
@@ -2003,7 +2037,6 @@ const EC2_COMPUTE_CALLS: &[(&str, &[Check])] = &[
                 LAUNCH_TEMPLATE,
                 USER_TAGGED,
             ),
-            call("ec2:ModifyLaunchTemplate", LAUNCH_TEMPLATE, USER_TAGGED),
             call("ec2:CreateTags", LAUNCH_TEMPLATE, USER_TAGGED),
             call("ec2:DeleteTags", LAUNCH_TEMPLATE, USER_TAGGED),
             call("ec2:DeleteLaunchTemplate", LAUNCH_TEMPLATE, USER_TAGGED),
@@ -2021,12 +2054,7 @@ const EC2_COMPUTE_CALLS: &[(&str, &[Check])] = &[
             call(
                 "autoscaling:CreateAutoScalingGroup",
                 AUTO_SCALING_GROUP,
-                USER_CREATE,
-            ),
-            call(
-                "autoscaling:CreateOrUpdateTags",
-                AUTO_SCALING_GROUP,
-                USER_CREATE,
+                GROUP_CREATE,
             ),
             call(
                 "iam:CreateServiceLinkedRole",
@@ -2034,11 +2062,11 @@ const EC2_COMPUTE_CALLS: &[(&str, &[Check])] = &[
                 &[("iam:AWSServiceName", Literal("autoscaling.amazonaws.com"))],
             ),
             call("ec2:RunInstances", LAUNCH_TEMPLATE, USER_TAGGED),
-            call("ec2:RunInstances", INSTANCE, FROM_TEMPLATE),
-            call("ec2:RunInstances", VOLUME, FROM_TEMPLATE),
+            call("ec2:RunInstances", INSTANCE, TAGGED_INSTANCE),
+            call("ec2:RunInstances", VOLUME, TAGGED_VOLUME),
             call("ec2:RunInstances", ENI, FROM_TEMPLATE),
             call("ec2:RunInstances", SUBNET, FROM_TEMPLATE),
-            call("ec2:RunInstances", SG, FROM_TEMPLATE),
+            call("ec2:RunInstances", SG, TEMPLATE_GROUP),
             call("ec2:RunInstances", IMAGE, AMAZON_IMAGE),
             call("ec2:CreateTags", INSTANCE, created_by!("RunInstances")),
             call("ec2:CreateTags", VOLUME, created_by!("RunInstances")),
@@ -2046,6 +2074,12 @@ const EC2_COMPUTE_CALLS: &[(&str, &[Check])] = &[
             call("iam:PassRole", INSTANCE_ROLE, TO_EC2),
             call("autoscaling:DescribeAutoScalingGroups", "*", NONE),
             call("autoscaling:DescribeScalingActivities", "*", NONE),
+            call(
+                "autoscaling:UpdateAutoScalingGroup",
+                AUTO_SCALING_GROUP,
+                GROUP_UPDATE,
+            ),
+            // The drain before destroy leaves the template alone.
             call(
                 "autoscaling:UpdateAutoScalingGroup",
                 AUTO_SCALING_GROUP,
@@ -2073,6 +2107,9 @@ const EC2_COMPUTE_CALLS: &[(&str, &[Check])] = &[
         "aws_iam_role (instance)",
         &[
             call("iam:CreateRole", INSTANCE_ROLE, BOUNDED),
+            // `triple-c:cluster = <the user's cluster>`: the boundary keeps
+            // the ECS agent on that cluster.
+            call("iam:TagRole", INSTANCE_ROLE, NONE),
             call("iam:PutRolePolicy", INSTANCE_ROLE, BOUNDED),
             call("iam:GetRole", INSTANCE_ROLE, NONE),
             call("iam:ListInstanceProfilesForRole", INSTANCE_ROLE, NONE),

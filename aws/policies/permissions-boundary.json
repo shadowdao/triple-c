@@ -118,7 +118,7 @@
       ]
     },
     {
-      "Sid": "EcsAgentOnTripleCClusters",
+      "Sid": "EcsAgentOnItsOwnCluster",
       "Effect": "Allow",
       "Action": [
         "ecs:RegisterContainerInstance",
@@ -129,9 +129,14 @@
         "ecs:UpdateContainerInstancesState"
       ],
       "Resource": [
-        "arn:aws:ecs:*:*:cluster/triple-c-*",
-        "arn:aws:ecs:*:*:container-instance/triple-c-*/*"
-      ]
+        "arn:aws:ecs:*:*:cluster/${aws:PrincipalTag/triple-c:cluster}",
+        "arn:aws:ecs:*:*:container-instance/${aws:PrincipalTag/triple-c:cluster}/*"
+      ],
+      "Condition": {
+        "StringLike": {
+          "aws:PrincipalTag/triple-c:cluster": "triple-c-*"
+        }
+      }
     },
     {
       "Sid": "EcsAgentTagsItsInstance",
@@ -140,26 +145,22 @@
         "ecs:TagResource"
       ],
       "Resource": [
-        "arn:aws:ecs:*:*:container-instance/triple-c-*/*"
+        "arn:aws:ecs:*:*:container-instance/${aws:PrincipalTag/triple-c:cluster}/*"
       ],
       "Condition": {
         "StringEquals": {
           "ecs:CreateAction": "RegisterContainerInstance"
+        },
+        "StringLike": {
+          "aws:PrincipalTag/triple-c:cluster": "triple-c-*"
         }
       }
     },
     {
-      "Sid": "InstanceAgents",
+      "Sid": "EcsAgentDiscovery",
       "Effect": "Allow",
       "Action": [
-        "ecs:DiscoverPollEndpoint",
-        "ssm:UpdateInstanceInformation",
-        "ec2messages:AcknowledgeMessage",
-        "ec2messages:DeleteMessage",
-        "ec2messages:FailMessage",
-        "ec2messages:GetEndpoint",
-        "ec2messages:GetMessages",
-        "ec2messages:SendReply"
+        "ecs:DiscoverPollEndpoint"
       ],
       "Resource": [
         "*"

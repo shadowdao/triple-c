@@ -58,7 +58,6 @@
       "Effect": "Allow",
       "Action": [
         "ec2:CreateLaunchTemplateVersion",
-        "ec2:ModifyLaunchTemplate",
         "ec2:DeleteLaunchTemplate",
         "ec2:CreateTags",
         "ec2:DeleteTags",
@@ -74,21 +73,92 @@
       }
     },
     {
-      "Sid": "LaunchOnlyFromLaunchTemplates",
+      "Sid": "LaunchSupportedInstances",
       "Effect": "Allow",
       "Action": [
         "ec2:RunInstances"
       ],
       "Resource": [
         "arn:aws:ec2:*:*:instance/*",
-        "arn:aws:ec2:*:*:volume/*",
+        "arn:aws:ec2:*:*:volume/*"
+      ],
+      "Condition": {
+        "Null": {
+          "aws:RequestTag/triple-c:component": "false"
+        },
+        "ArnLike": {
+          "ec2:LaunchTemplate": "arn:aws:ec2:*:*:launch-template/*"
+        },
+        "StringEqualsIfExists": {
+          "ec2:InstanceType": [
+            "m7i.large",
+            "m7i.xlarge",
+            "m7i.2xlarge",
+            "m7i.4xlarge",
+            "m7g.large",
+            "m7g.xlarge",
+            "m7g.2xlarge",
+            "m7g.4xlarge",
+            "c7i.large",
+            "c7i.xlarge",
+            "c7i.2xlarge",
+            "c7i.4xlarge",
+            "c7g.large",
+            "c7g.xlarge",
+            "c7g.2xlarge",
+            "c7g.4xlarge",
+            "r7i.large",
+            "r7i.xlarge",
+            "r7i.2xlarge",
+            "r7i.4xlarge",
+            "r7g.large",
+            "r7g.xlarge",
+            "r7g.2xlarge",
+            "r7g.4xlarge",
+            "t3.large",
+            "t3.xlarge",
+            "t3.2xlarge",
+            "t4g.large",
+            "t4g.xlarge",
+            "t4g.2xlarge"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "LaunchIntoSubnets",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:RunInstances"
+      ],
+      "Resource": [
         "arn:aws:ec2:*:*:network-interface/*",
-        "arn:aws:ec2:*:*:subnet/*",
+        "arn:aws:ec2:*:*:subnet/*"
+      ],
+      "Condition": {
+        "ArnLike": {
+          "ec2:LaunchTemplate": "arn:aws:ec2:*:*:launch-template/*"
+        }
+      }
+    },
+    {
+      "Sid": "LaunchWithTripleCGroups",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:RunInstances"
+      ],
+      "Resource": [
         "arn:aws:ec2:*:*:security-group/*"
       ],
       "Condition": {
         "ArnLike": {
           "ec2:LaunchTemplate": "arn:aws:ec2:*:*:launch-template/*"
+        },
+        "Bool": {
+          "ec2:IsLaunchTemplateResource": "true"
+        },
+        "Null": {
+          "aws:ResourceTag/triple-c:component": "false"
         }
       }
     },
@@ -107,22 +177,117 @@
         },
         "ArnLike": {
           "ec2:LaunchTemplate": "arn:aws:ec2:*:*:launch-template/*"
+        },
+        "Bool": {
+          "ec2:IsLaunchTemplateResource": "true"
         }
       }
     },
     {
-      "Sid": "CreateTaggedAutoScalingGroups",
+      "Sid": "CreatePinnedGroups",
       "Effect": "Allow",
       "Action": [
-        "autoscaling:CreateAutoScalingGroup",
-        "autoscaling:CreateOrUpdateTags"
+        "autoscaling:CreateAutoScalingGroup"
       ],
       "Resource": [
         "arn:aws:autoscaling:*:*:autoScalingGroup:*:autoScalingGroupName/triple-c-*"
       ],
       "Condition": {
         "Null": {
-          "aws:RequestTag/triple-c:component": "false"
+          "aws:RequestTag/triple-c:component": "false",
+          "autoscaling:TargetGroupARNs": "true",
+          "autoscaling:LoadBalancerNames": "true"
+        },
+        "Bool": {
+          "autoscaling:LaunchTemplateVersionSpecified": "true"
+        },
+        "ForAllValues:StringEquals": {
+          "autoscaling:InstanceTypes": [
+            "m7i.large",
+            "m7i.xlarge",
+            "m7i.2xlarge",
+            "m7i.4xlarge",
+            "m7g.large",
+            "m7g.xlarge",
+            "m7g.2xlarge",
+            "m7g.4xlarge",
+            "c7i.large",
+            "c7i.xlarge",
+            "c7i.2xlarge",
+            "c7i.4xlarge",
+            "c7g.large",
+            "c7g.xlarge",
+            "c7g.2xlarge",
+            "c7g.4xlarge",
+            "r7i.large",
+            "r7i.xlarge",
+            "r7i.2xlarge",
+            "r7i.4xlarge",
+            "r7g.large",
+            "r7g.xlarge",
+            "r7g.2xlarge",
+            "r7g.4xlarge",
+            "t3.large",
+            "t3.xlarge",
+            "t3.2xlarge",
+            "t4g.large",
+            "t4g.xlarge",
+            "t4g.2xlarge"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "UpdatePinnedGroups",
+      "Effect": "Allow",
+      "Action": [
+        "autoscaling:UpdateAutoScalingGroup"
+      ],
+      "Resource": [
+        "arn:aws:autoscaling:*:*:autoScalingGroup:*:autoScalingGroupName/triple-c-*"
+      ],
+      "Condition": {
+        "Null": {
+          "aws:ResourceTag/triple-c:component": "false",
+          "autoscaling:TargetGroupARNs": "true",
+          "autoscaling:LoadBalancerNames": "true"
+        },
+        "BoolIfExists": {
+          "autoscaling:LaunchTemplateVersionSpecified": "true"
+        },
+        "ForAllValues:StringEquals": {
+          "autoscaling:InstanceTypes": [
+            "m7i.large",
+            "m7i.xlarge",
+            "m7i.2xlarge",
+            "m7i.4xlarge",
+            "m7g.large",
+            "m7g.xlarge",
+            "m7g.2xlarge",
+            "m7g.4xlarge",
+            "c7i.large",
+            "c7i.xlarge",
+            "c7i.2xlarge",
+            "c7i.4xlarge",
+            "c7g.large",
+            "c7g.xlarge",
+            "c7g.2xlarge",
+            "c7g.4xlarge",
+            "r7i.large",
+            "r7i.xlarge",
+            "r7i.2xlarge",
+            "r7i.4xlarge",
+            "r7g.large",
+            "r7g.xlarge",
+            "r7g.2xlarge",
+            "r7g.4xlarge",
+            "t3.large",
+            "t3.xlarge",
+            "t3.2xlarge",
+            "t4g.large",
+            "t4g.xlarge",
+            "t4g.2xlarge"
+          ]
         }
       }
     },
@@ -130,7 +295,6 @@
       "Sid": "ManageTripleCAutoScalingGroups",
       "Effect": "Allow",
       "Action": [
-        "autoscaling:UpdateAutoScalingGroup",
         "autoscaling:SetInstanceProtection",
         "autoscaling:CreateOrUpdateTags",
         "autoscaling:DeleteTags",

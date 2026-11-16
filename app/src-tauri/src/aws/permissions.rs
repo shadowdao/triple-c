@@ -37,7 +37,19 @@ impl ContextEntry {
     pub fn is_list(&self) -> bool {
         self.values.len() > 1
     }
+
+    /// Keys IAM types as Boolean (a `Bool` condition does not match a
+    /// String-typed simulation value).
+    pub fn is_boolean(&self) -> bool {
+        BOOLEAN_KEYS.contains(&self.key.as_str())
+    }
 }
+
+/// The Boolean condition keys the checks send.
+const BOOLEAN_KEYS: &[&str] = &[
+    "autoscaling:LaunchTemplateVersionSpecified",
+    "ec2:IsLaunchTemplateResource",
+];
 
 /// Builds the simulation for `check`: the resource and every literal context
 /// value rendered with `p`, `OwnerId` as `user_id`, and `aws:userid` =
@@ -175,7 +187,9 @@ impl PermissionApi for SdkPermissionApi {
             SdkEntry::builder()
                 .context_key_name(&e.key)
                 .set_context_key_values(Some(e.values.clone()))
-                .context_key_type(if e.is_list() {
+                .context_key_type(if e.is_boolean() {
+                    ContextKeyTypeEnum::Boolean
+                } else if e.is_list() {
                     ContextKeyTypeEnum::StringList
                 } else {
                     ContextKeyTypeEnum::String

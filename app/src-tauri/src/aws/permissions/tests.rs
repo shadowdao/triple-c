@@ -344,6 +344,29 @@ fn a_repeated_context_key_is_one_string_list_entry() {
     );
     assert!(req.context[0].is_list());
     assert!(!req.context[1].is_list());
+    assert!(!req.context[1].is_boolean());
+}
+
+/// Every Boolean-typed key a check sends is one `is_boolean` knows, so the
+/// simulator gets it as Boolean (a `Bool` condition never matches a String).
+#[test]
+fn boolean_context_keys_are_sent_as_booleans() {
+    let mut seen = 0;
+    for tier in [Tier::WorkspaceUser, Tier::EnvironmentAdmin] {
+        for c in checks(tier) {
+            for (key, value) in c.context {
+                if matches!(value, ContextValue::Literal("true" | "false")) {
+                    let e = ContextEntry {
+                        key: key.to_string(),
+                        values: vec!["true".into()],
+                    };
+                    assert!(e.is_boolean(), "{key} is sent as a String");
+                    seen += 1;
+                }
+            }
+        }
+    }
+    assert!(seen >= 2, "only {seen} Boolean keys");
 }
 
 #[test]

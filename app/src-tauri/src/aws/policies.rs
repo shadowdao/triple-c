@@ -242,13 +242,57 @@ const FROM_LAUNCH_TEMPLATE: Context = &[(
     "ec2:LaunchTemplate",
     Literal("arn:aws:ec2:{region}:{account}:launch-template/lt-00000000000000000"),
 )];
-/// ...and the image is Amazon's.
+const PROBE_LAUNCH_TEMPLATE_ARN: ContextValue =
+    Literal("arn:aws:ec2:{region}:{account}:launch-template/lt-00000000000000000");
+/// The instance and its volume carry the component tag, and the instance
+/// is of a supported type.
+const INSTANCE_LAUNCH: Context = &[
+    (
+        "aws:RequestTag/triple-c:component",
+        Literal("user-onboarding"),
+    ),
+    ("ec2:LaunchTemplate", PROBE_LAUNCH_TEMPLATE_ARN),
+    ("ec2:InstanceType", Literal("m7i.large")),
+];
+const VOLUME_LAUNCH: Context = &[
+    (
+        "aws:RequestTag/triple-c:component",
+        Literal("user-onboarding"),
+    ),
+    ("ec2:LaunchTemplate", PROBE_LAUNCH_TEMPLATE_ARN),
+];
+/// The environment's (component-tagged) tasks group, named by the template.
+const SECURITY_GROUP_LAUNCH: Context = &[
+    ("ec2:LaunchTemplate", PROBE_LAUNCH_TEMPLATE_ARN),
+    ("ec2:IsLaunchTemplateResource", Literal("true")),
+    (COMPONENT_RESOURCE_TAG, Literal("environment")),
+];
+/// Amazon's image, named by the template.
 const AMAZON_IMAGE_FROM_LAUNCH_TEMPLATE: Context = &[
     ("ec2:Owner", Literal("amazon")),
+    ("ec2:LaunchTemplate", PROBE_LAUNCH_TEMPLATE_ARN),
+    ("ec2:IsLaunchTemplateResource", Literal("true")),
+];
+/// A group created with the component tag, its template pinned to a
+/// version, of a supported type, with no load balancer.
+const GROUP_CREATE: Context = &[
     (
-        "ec2:LaunchTemplate",
-        Literal("arn:aws:ec2:{region}:{account}:launch-template/lt-00000000000000000"),
+        "aws:RequestTag/triple-c:component",
+        Literal("user-onboarding"),
     ),
+    (
+        "autoscaling:LaunchTemplateVersionSpecified",
+        Literal("true"),
+    ),
+    ("autoscaling:InstanceTypes", Literal("m7i.large")),
+];
+const GROUP_UPDATE: Context = &[
+    (COMPONENT_RESOURCE_TAG, Literal("user-onboarding")),
+    (
+        "autoscaling:LaunchTemplateVersionSpecified",
+        Literal("true"),
+    ),
+    ("autoscaling:InstanceTypes", Literal("m7i.large")),
 ];
 const PASSED_TO_EC2: Context = &[("iam:PassedToService", Literal("ec2.amazonaws.com"))];
 
@@ -868,11 +912,6 @@ const ENVIRONMENT_ADMIN_CHECKS: &[Check] = &[
         COMPONENT_TAGGED,
     ),
     write(
-        "ec2:ModifyLaunchTemplate",
-        PROBE_LAUNCH_TEMPLATE,
-        COMPONENT_TAGGED,
-    ),
-    write(
         "ec2:DeleteLaunchTemplate",
         PROBE_LAUNCH_TEMPLATE,
         COMPONENT_TAGGED,
@@ -883,8 +922,8 @@ const ENVIRONMENT_ADMIN_CHECKS: &[Check] = &[
     // its template: RunInstances, only from a Triple-C launch template and
     // only Amazon's images, and the tags the launch puts on.
     write("ec2:RunInstances", PROBE_LAUNCH_TEMPLATE, COMPONENT_TAGGED),
-    write("ec2:RunInstances", PROBE_INSTANCE, FROM_LAUNCH_TEMPLATE),
-    write("ec2:RunInstances", PROBE_VOLUME, FROM_LAUNCH_TEMPLATE),
+    write("ec2:RunInstances", PROBE_INSTANCE, INSTANCE_LAUNCH),
+    write("ec2:RunInstances", PROBE_VOLUME, VOLUME_LAUNCH),
     write(
         "ec2:RunInstances",
         PROBE_NETWORK_INTERFACE,
@@ -894,7 +933,7 @@ const ENVIRONMENT_ADMIN_CHECKS: &[Check] = &[
     write(
         "ec2:RunInstances",
         PROBE_SECURITY_GROUP,
-        FROM_LAUNCH_TEMPLATE,
+        SECURITY_GROUP_LAUNCH,
     ),
     write(
         "ec2:RunInstances",
@@ -916,17 +955,13 @@ const ENVIRONMENT_ADMIN_CHECKS: &[Check] = &[
         PROBE_NETWORK_INTERFACE,
         &[("ec2:CreateAction", Literal("RunInstances"))],
     ),
-    // Auto Scaling groups: `triple-c-*`, created with the component tag,
-    // changed and deleted only when they carry it.
+    // Auto Scaling groups: `triple-c-*`, created with the component tag
+    // (and pinned to a template version, of a supported type, with no load
+    // balancer), changed, tagged and deleted only when they carry it.
     write(
         "autoscaling:CreateAutoScalingGroup",
         PROBE_AUTO_SCALING_GROUP,
-        COMPONENT_REQUESTED,
-    ),
-    write(
-        "autoscaling:CreateOrUpdateTags",
-        PROBE_AUTO_SCALING_GROUP,
-        COMPONENT_REQUESTED,
+        GROUP_CREATE,
     ),
     write(
         "autoscaling:CreateOrUpdateTags",
@@ -936,7 +971,7 @@ const ENVIRONMENT_ADMIN_CHECKS: &[Check] = &[
     write(
         "autoscaling:UpdateAutoScalingGroup",
         PROBE_AUTO_SCALING_GROUP,
-        COMPONENT_TAGGED,
+        GROUP_UPDATE,
     ),
     write(
         "autoscaling:SetInstanceProtection",
@@ -1912,9 +1947,6 @@ mod tests {
             "ecs:SubmitAttachmentStateChanges",
             "ecs:UpdateContainerInstancesState",
             "ecs:TagResource",
-            // Session Manager on the instance.
-            "ssm:UpdateInstanceInformation",
-            "ec2messages:GetMessages",
         ] {
             assert!(
                 granted.iter().any(|a| glob(a, need)),
@@ -1965,11 +1997,19 @@ mod tests {
         }
     }
 
-    /// The instance role's ECS agent (E4) reaches only Triple-C clusters and
-    /// their container instances, and tags only the instance it registers.
+    /// The instance role's ECS agent (E4) reaches only its own cluster —
+    /// the one its role's `triple-c:cluster` tag names, which must be a
+    /// `triple-c-*` cluster — and that cluster's container instances, and
+    /// tags only the instance it registers. A user who is root on their own
+    /// instance (Docker access) holds that role's credentials, so another
+    /// user's cluster must be out of its reach: otherwise it could register
+    /// into it and have the other user's tasks placed on its instance.
     #[test]
-    fn the_boundary_keeps_the_ecs_agent_on_triple_c_clusters() {
+    fn the_boundary_keeps_the_ecs_agent_on_its_own_cluster() {
         let stmts = statements_of(&boundary());
+        const TAG: &str = "aws:PrincipalTag/triple-c:cluster";
+        const MINE: Context = &[(TAG, Literal("triple-c-probe-0123456789ab"))];
+        const PROD: Context = &[(TAG, Literal("prod"))];
         let within = |action: &'static str, resource: &'static str, context: Context| {
             evaluate_in(
                 &stmts,
@@ -1980,41 +2020,81 @@ mod tests {
                 },
             )
         };
+        const CLUSTER: &str = "arn:aws:ecs:{region}:{account}:cluster/triple-c-probe-0123456789ab";
         const INSTANCE: &str = "arn:aws:ecs:{region}:{account}:container-instance/\
              triple-c-probe-0123456789ab/0123456789abcdef0123456789abcdef";
-        const OTHER_CLUSTER: &str = "arn:aws:ecs:{region}:{account}:cluster/prod";
-        const OTHER_INSTANCE: &str = "arn:aws:ecs:{region}:{account}:container-instance/\
+        const OTHER_USERS_CLUSTER: &str =
+            "arn:aws:ecs:{region}:{account}:cluster/triple-c-probe-ba9876543210";
+        const OTHER_USERS_INSTANCE: &str = "arn:aws:ecs:{region}:{account}:container-instance/\
+             triple-c-probe-ba9876543210/0123456789abcdef0123456789abcdef";
+        const PROD_CLUSTER: &str = "arn:aws:ecs:{region}:{account}:cluster/prod";
+        const PROD_INSTANCE: &str = "arn:aws:ecs:{region}:{account}:container-instance/\
              prod/0123456789abcdef0123456789abcdef";
-        const AT_REGISTER: Context = &[("ecs:CreateAction", Literal("RegisterContainerInstance"))];
-        for action in [
-            "ecs:RegisterContainerInstance",
-            "ecs:DeregisterContainerInstance",
-            "ecs:SubmitTaskStateChange",
+        let at_register = |tag: Context| -> Context {
+            let mut v = tag.to_vec();
+            v.push(("ecs:CreateAction", Literal("RegisterContainerInstance")));
+            Box::leak(v.into_boxed_slice())
+        };
+        for (action, own, other, prod) in [
+            (
+                "ecs:RegisterContainerInstance",
+                CLUSTER,
+                OTHER_USERS_CLUSTER,
+                PROD_CLUSTER,
+            ),
+            (
+                "ecs:DeregisterContainerInstance",
+                CLUSTER,
+                OTHER_USERS_CLUSTER,
+                PROD_CLUSTER,
+            ),
+            (
+                "ecs:SubmitTaskStateChange",
+                CLUSTER,
+                OTHER_USERS_CLUSTER,
+                PROD_CLUSTER,
+            ),
+            ("ecs:Poll", INSTANCE, OTHER_USERS_INSTANCE, PROD_INSTANCE),
+            (
+                "ecs:StartTelemetrySession",
+                INSTANCE,
+                OTHER_USERS_INSTANCE,
+                PROD_INSTANCE,
+            ),
+            (
+                "ecs:UpdateContainerInstancesState",
+                INSTANCE,
+                OTHER_USERS_INSTANCE,
+                PROD_INSTANCE,
+            ),
         ] {
-            assert!(within(action, PROBE_CLUSTER, &[]), "{action}");
-            assert!(!within(action, OTHER_CLUSTER, &[]), "{action} elsewhere");
+            assert!(within(action, own, MINE), "{action}");
+            assert!(
+                !within(action, other, MINE),
+                "{action} on another user's cluster"
+            );
+            assert!(!within(action, own, &[]), "{action} without the role tag");
+            // A role tagged with a non-Triple-C cluster gets nothing.
+            assert!(
+                !within(action, prod, PROD),
+                "{action} on a non-Triple-C cluster"
+            );
         }
-        for action in [
-            "ecs:Poll",
-            "ecs:StartTelemetrySession",
-            "ecs:UpdateContainerInstancesState",
-        ] {
-            assert!(within(action, INSTANCE, &[]), "{action}");
-            assert!(!within(action, OTHER_INSTANCE, &[]), "{action} elsewhere");
-        }
-        assert!(within("ecs:TagResource", INSTANCE, AT_REGISTER));
-        assert!(!within("ecs:TagResource", OTHER_INSTANCE, AT_REGISTER));
+        assert!(within("ecs:TagResource", INSTANCE, at_register(MINE)));
         for (resource, context) in [
-            (INSTANCE, &[][..]),
-            (PROBE_CLUSTER, AT_REGISTER),
-            (PROBE_TASK, &[][..]),
+            (OTHER_USERS_INSTANCE, at_register(MINE)),
+            (PROD_INSTANCE, at_register(PROD)),
+            (INSTANCE, MINE),
+            (CLUSTER, at_register(MINE)),
+            (PROBE_TASK, at_register(MINE)),
         ] {
             assert!(
                 !within("ecs:TagResource", resource, context),
                 "ecs:TagResource on {resource} with {context:?}"
             );
         }
-        // The agent never runs, stops or changes tasks or clusters itself.
+        // The agent never runs, stops or changes tasks or clusters itself,
+        // and has no Session Manager channel of its own.
         for action in [
             "ecs:RunTask",
             "ecs:StartTask",
@@ -2023,8 +2103,11 @@ mod tests {
             "ecs:DeleteCluster",
             "ecs:ExecuteCommand",
         ] {
-            assert!(!within(action, PROBE_CLUSTER, &[]), "{action}");
-            assert!(!within(action, PROBE_TASK, &[]), "{action}");
+            assert!(!within(action, CLUSTER, MINE), "{action}");
+            assert!(!within(action, PROBE_TASK, MINE), "{action}");
+        }
+        for action in ["ssm:UpdateInstanceInformation", "ec2messages:GetMessages"] {
+            assert!(!within(action, "*", MINE), "{action}");
         }
     }
 
@@ -2457,27 +2540,63 @@ mod tests {
     #[test]
     fn per_user_compute_is_tag_and_name_scoped() {
         let tier = Tier::EnvironmentAdmin;
-        for (action, resource) in [
-            ("ec2:CreateLaunchTemplate", PROBE_LAUNCH_TEMPLATE),
-            (
+        assert!(allowed(
+            tier,
+            &write(
+                "ec2:CreateLaunchTemplate",
+                PROBE_LAUNCH_TEMPLATE,
+                COMPONENT_REQUESTED
+            ),
+            ME,
+            ME
+        ));
+        assert!(!allowed(
+            tier,
+            &write("ec2:CreateLaunchTemplate", PROBE_LAUNCH_TEMPLATE, &[]),
+            ME,
+            ME
+        ));
+        let untagged_group = without(&GROUP_CREATE, "aws:RequestTag/triple-c:component");
+        assert!(!allowed(
+            tier,
+            &write(
                 "autoscaling:CreateAutoScalingGroup",
                 PROBE_AUTO_SCALING_GROUP,
+                untagged_group
             ),
+            ME,
+            ME
+        ));
+        // Tags go on a group only once it is Triple-C's: no request-tag-only
+        // tagging of an existing (untagged) `triple-c-*` group.
+        assert!(!allowed(
+            tier,
+            &write(
+                "autoscaling:CreateOrUpdateTags",
+                PROBE_AUTO_SCALING_GROUP,
+                COMPONENT_REQUESTED
+            ),
+            ME,
+            ME
+        ));
+        // The default version never moves: a group on `$Default` would
+        // launch whatever it points at.
+        for action in [
+            "ec2:ModifyLaunchTemplate",
+            "ec2:DeleteLaunchTemplateVersions",
         ] {
-            assert!(allowed(
-                tier,
-                &write(action, resource, COMPONENT_REQUESTED),
-                ME,
-                ME
-            ));
             assert!(
-                !allowed(tier, &write(action, resource, &[]), ME, ME),
-                "untagged {action}"
+                !allowed(
+                    tier,
+                    &write(action, PROBE_LAUNCH_TEMPLATE, COMPONENT_TAGGED),
+                    ME,
+                    ME
+                ),
+                "{action}"
             );
         }
         for (action, resource) in [
             ("ec2:CreateLaunchTemplateVersion", PROBE_LAUNCH_TEMPLATE),
-            ("ec2:ModifyLaunchTemplate", PROBE_LAUNCH_TEMPLATE),
             ("ec2:DeleteLaunchTemplate", PROBE_LAUNCH_TEMPLATE),
             ("ec2:CreateTags", PROBE_LAUNCH_TEMPLATE),
             ("ec2:DeleteTags", PROBE_LAUNCH_TEMPLATE),
@@ -2567,19 +2686,238 @@ mod tests {
         ));
     }
 
+    /// `context` without `key`.
+    fn without(context: Context, key: &str) -> Context {
+        Box::leak(
+            context
+                .iter()
+                .filter(|(k, _)| *k != key)
+                .copied()
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        )
+    }
+
+    /// `context` with `key` set to `value` (replacing any value it had).
+    fn with(context: Context, key: &'static str, value: &'static str) -> Context {
+        let mut v = without(context, key).to_vec();
+        v.push((key, Literal(value)));
+        Box::leak(v.into_boxed_slice())
+    }
+
+    /// The instance types a list in the compute file allows, for each list.
+    fn policy_instance_type_lists() -> Vec<BTreeSet<String>> {
+        let mut lists = Vec::new();
+        for s in allows(Tier::EnvironmentAdmin) {
+            if let Some(ops) = s["Condition"].as_object() {
+                for entries in ops.values() {
+                    for key in ["ec2:InstanceType", "autoscaling:InstanceTypes"] {
+                        if let Some(v) = entries.get(key) {
+                            lists.push(strings(v).into_iter().collect());
+                        }
+                    }
+                }
+            }
+        }
+        lists
+    }
+
+    /// The policy allows exactly the instance types the app knows how to
+    /// size (`ec2_instance_spec`): no GPU, no metal, nothing above 4xlarge.
+    #[test]
+    fn supported_instance_types_are_the_apps_table() {
+        let mut known = BTreeSet::new();
+        for family in [
+            "m7i", "m7g", "c7i", "c7g", "r7i", "r7g", "t3", "t4g", "m7a", "p5", "g6",
+        ] {
+            for size in [
+                "medium",
+                "large",
+                "xlarge",
+                "2xlarge",
+                "4xlarge",
+                "8xlarge",
+                "48xlarge",
+                "metal-24xl",
+            ] {
+                let t = format!("{family}.{size}");
+                if crate::models::project::ec2_instance_spec(&t).is_some() {
+                    known.insert(t);
+                }
+            }
+        }
+        assert_eq!(known.len(), 30);
+        let lists = policy_instance_type_lists();
+        assert_eq!(lists.len(), 3, "RunInstances, group create, group update");
+        for list in lists {
+            assert_eq!(list, known);
+        }
+    }
+
+    /// Creating or updating a group: pinned to a template version (a group
+    /// on `$Latest`/`$Default` would launch any later version, whose
+    /// instance profile was never checked), no load balancers, supported
+    /// types only.
+    #[test]
+    fn groups_are_pinned_supported_and_unbalanced() {
+        let tier = Tier::EnvironmentAdmin;
+        for (action, ok) in [
+            ("autoscaling:CreateAutoScalingGroup", GROUP_CREATE),
+            ("autoscaling:UpdateAutoScalingGroup", GROUP_UPDATE),
+        ] {
+            let attempt = |context| {
+                allowed(
+                    tier,
+                    &write(action, PROBE_AUTO_SCALING_GROUP, context),
+                    ME,
+                    ME,
+                )
+            };
+            assert!(attempt(ok), "{action}");
+            let version = "autoscaling:LaunchTemplateVersionSpecified";
+            assert!(!attempt(with(ok, version, "false")), "{action} on $Latest");
+            assert!(
+                !attempt(with(
+                    ok,
+                    "autoscaling:TargetGroupARNs",
+                    "arn:aws:elasticloadbalancing:x"
+                )),
+                "{action} with a target group"
+            );
+            assert!(
+                !attempt(with(ok, "autoscaling:LoadBalancerNames", "web")),
+                "{action} with a load balancer"
+            );
+            for t in ["p5.48xlarge", "m7i.8xlarge", "m7i.metal-24xl", "g6.xlarge"] {
+                assert!(
+                    !attempt(with(ok, "autoscaling:InstanceTypes", t)),
+                    "{action} with {t}"
+                );
+            }
+        }
+        // Creating always names the template version; an update may leave
+        // the template alone (a size change, the drain before destroy).
+        assert!(!allowed(
+            tier,
+            &write(
+                "autoscaling:CreateAutoScalingGroup",
+                PROBE_AUTO_SCALING_GROUP,
+                without(GROUP_CREATE, "autoscaling:LaunchTemplateVersionSpecified")
+            ),
+            ME,
+            ME
+        ));
+        assert!(allowed(
+            tier,
+            &write(
+                "autoscaling:UpdateAutoScalingGroup",
+                PROBE_AUTO_SCALING_GROUP,
+                COMPONENT_TAGGED
+            ),
+            ME,
+            ME
+        ));
+    }
+
     /// RunInstances (which creating an Auto Scaling group checks the caller
-    /// for) works only from a Triple-C launch template, with Amazon's
-    /// images: never a bare launch, nor someone else's template or image.
+    /// for) works only from a Triple-C launch template: the instance and
+    /// its volume tagged and of a supported type, the environment's own
+    /// security group and Amazon's image, both named by the template. Never
+    /// a bare launch, nor someone else's template, group or image.
     #[test]
     fn instances_launch_only_from_triple_c_launch_templates() {
         let tier = Tier::EnvironmentAdmin;
-        for resource in [
-            PROBE_INSTANCE,
-            PROBE_VOLUME,
-            PROBE_NETWORK_INTERFACE,
-            PROBE_SUBNET,
-            PROBE_SECURITY_GROUP,
+        for (resource, ok) in [
+            (PROBE_INSTANCE, INSTANCE_LAUNCH),
+            (PROBE_VOLUME, VOLUME_LAUNCH),
+            (PROBE_INSTANCE, without(INSTANCE_LAUNCH, "ec2:InstanceType")),
         ] {
+            assert!(allowed(
+                tier,
+                &write("ec2:RunInstances", resource, ok),
+                ME,
+                ME
+            ));
+            assert!(
+                !allowed(
+                    tier,
+                    &write(
+                        "ec2:RunInstances",
+                        resource,
+                        without(ok, "aws:RequestTag/triple-c:component")
+                    ),
+                    ME,
+                    ME
+                ),
+                "untagged {resource}"
+            );
+        }
+        for t in [
+            "p5.48xlarge",
+            "m7i.8xlarge",
+            "m7i.metal-24xl",
+            "inf2.xlarge",
+        ] {
+            assert!(
+                !allowed(
+                    tier,
+                    &write(
+                        "ec2:RunInstances",
+                        PROBE_INSTANCE,
+                        with(INSTANCE_LAUNCH, "ec2:InstanceType", t)
+                    ),
+                    ME,
+                    ME
+                ),
+                "{t}"
+            );
+        }
+        for (resource, ok) in [
+            (PROBE_SECURITY_GROUP, SECURITY_GROUP_LAUNCH),
+            (PROBE_IMAGE, AMAZON_IMAGE_FROM_LAUNCH_TEMPLATE),
+        ] {
+            assert!(allowed(
+                tier,
+                &write("ec2:RunInstances", resource, ok),
+                ME,
+                ME
+            ));
+            // A request override (not the template's) is refused.
+            assert!(!allowed(
+                tier,
+                &write(
+                    "ec2:RunInstances",
+                    resource,
+                    with(ok, "ec2:IsLaunchTemplateResource", "false")
+                ),
+                ME,
+                ME
+            ));
+            assert!(!allowed(
+                tier,
+                &write(
+                    "ec2:RunInstances",
+                    resource,
+                    without(ok, "ec2:IsLaunchTemplateResource")
+                ),
+                ME,
+                ME
+            ));
+        }
+        assert!(
+            !allowed(
+                tier,
+                &write(
+                    "ec2:RunInstances",
+                    PROBE_SECURITY_GROUP,
+                    without(SECURITY_GROUP_LAUNCH, COMPONENT_RESOURCE_TAG)
+                ),
+                ME,
+                ME
+            ),
+            "someone else's security group"
+        );
+        for resource in [PROBE_NETWORK_INTERFACE, PROBE_SUBNET] {
             assert!(allowed(
                 tier,
                 &write("ec2:RunInstances", resource, FROM_LAUNCH_TEMPLATE),
