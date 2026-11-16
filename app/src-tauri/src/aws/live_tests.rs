@@ -1592,7 +1592,7 @@ mod environment {
                 .run(
                     ModuleKind::UserOnboard,
                     Deployment::User { env: &name, owner_key: &okey },
-                    &onboarding_vars(&name, &t.e.region, &owner),
+                    &onboarding_vars(&name, &t.e.region, &owner, None).unwrap(),
                     TofuOp::Apply,
                     t.keys_env(&keys),
                 )
@@ -1643,7 +1643,7 @@ mod environment {
                 .run(
                     ModuleKind::UserOnboard,
                     Deployment::User { env: &name, owner_key: &okey },
-                    &onboarding_vars(&name, &t.e.region, &owner),
+                    &onboarding_vars(&name, &t.e.region, &owner, None).unwrap(),
                     TofuOp::Destroy,
                     t.keys_env(&keys),
                 )
@@ -2003,7 +2003,7 @@ mod environment {
             .run(
                 ModuleKind::UserOnboard,
                 Deployment::User { env: &name, owner_key: &okey },
-                &onboarding_vars(&name, &region, &owner),
+                &onboarding_vars(&name, &region, &owner, None).unwrap(),
                 TofuOp::Apply,
                 t.keys_env(&keys),
             )

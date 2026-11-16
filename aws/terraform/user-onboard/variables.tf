@@ -54,3 +54,58 @@ variable "bedrock_on_task_role" {
   type        = bool
   default     = false
 }
+
+# Optional per-user EC2 capacity (phase 7). Empty = none: the module then
+# makes nothing for EC2 and the user's projects run on Fargate only.
+variable "ec2_instance_type" {
+  description = "The instance type of the user's own EC2 capacity (e.g. m7i.large or m7g.large), or empty for none. Only the types the app can size are accepted."
+  type        = string
+  default     = ""
+
+  # The app's table (`ec2_instance_spec`) and the admin policy's lists.
+  validation {
+    condition = var.ec2_instance_type == "" || contains([
+      "m7i.large", "m7i.xlarge", "m7i.2xlarge", "m7i.4xlarge",
+      "m7g.large", "m7g.xlarge", "m7g.2xlarge", "m7g.4xlarge",
+      "c7i.large", "c7i.xlarge", "c7i.2xlarge", "c7i.4xlarge",
+      "c7g.large", "c7g.xlarge", "c7g.2xlarge", "c7g.4xlarge",
+      "r7i.large", "r7i.xlarge", "r7i.2xlarge", "r7i.4xlarge",
+      "r7g.large", "r7g.xlarge", "r7g.2xlarge", "r7g.4xlarge",
+      "t3.large", "t3.xlarge", "t3.2xlarge",
+      "t4g.large", "t4g.xlarge", "t4g.2xlarge",
+    ], var.ec2_instance_type)
+    error_message = "ec2_instance_type must be empty or one of the m7i, m7g, c7i, c7g, r7i, r7g (large to 4xlarge), t3 or t4g (large to 2xlarge) types."
+  }
+}
+
+variable "ec2_max_instances" {
+  description = "How many of the user's instances may run at once (1 to 4); each holds one workspace as expected use."
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.ec2_max_instances >= 1 && var.ec2_max_instances <= 4 && floor(var.ec2_max_instances) == var.ec2_max_instances
+    error_message = "ec2_max_instances must be a whole number from 1 to 4."
+  }
+}
+
+variable "ec2_user_tag" {
+  description = "The value of the triple-c-user principal tag the user signs in with; names their EC2 cluster (triple-c-<environment>--u-<tag>). Required with ec2_instance_type."
+  type        = string
+  default     = ""
+
+  validation {
+    condition = var.ec2_user_tag == "" || (
+      can(regex("^[A-Za-z0-9-]{1,32}$", var.ec2_user_tag))
+      && !startswith(var.ec2_user_tag, "-")
+      && !endswith(var.ec2_user_tag, "-")
+      && !strcontains(var.ec2_user_tag, "--")
+    )
+    error_message = "ec2_user_tag must be 1 to 32 letters, digits and single hyphens, not starting or ending with a hyphen."
+  }
+
+  validation {
+    condition     = var.ec2_instance_type == "" || var.ec2_user_tag != ""
+    error_message = "ec2_user_tag (the user's triple-c-user principal tag) is required when ec2_instance_type is set."
+  }
+}

@@ -16,9 +16,11 @@ use crate::models::host_connection::validate_supported_region;
 /// `locals.template_version` (and the `triple-c:template-version` default
 /// tag) of `aws/terraform/environment`.
 pub const ENVIRONMENT_MODULE_VERSION: u32 = 2;
-/// The same for the user-onboarding module.
+/// The same for the user-onboarding module. 2: optional per-user EC2
+/// capacity (phase 7); an onboarding without it plans as version 1 did,
+/// apart from this tag.
 #[allow(dead_code)] // the onboarding module's version; checked against its HCL by a test
-pub const ONBOARD_MODULE_VERSION: u32 = 1;
+pub const ONBOARD_MODULE_VERSION: u32 = 2;
 /// The same for the permissions-boundary module. 2: the instance role's ECS
 /// agent and Session Manager actions (phase 7, E4); an account admin
 /// re-applies the boundary once.
@@ -57,6 +59,7 @@ const USER_ONBOARD_FILES: &[(&str, &str)] = module!("user-onboard":
     "main.tf",
     "iam.tf",
     "efs.tf",
+    "ec2.tf",
     "outputs.tf",
     ".terraform.lock.hcl",
 );
@@ -148,7 +151,6 @@ pub const EC2_USER_TAG_KEY: &str = "triple-c-user";
 /// `[A-Za-z0-9-]`, not starting or ending with a hyphen and without `--`
 /// (the separator in [`user_ec2_stem`], which environment names can't hold
 /// either, so a per-user name can be read back only one way).
-#[allow(dead_code)] // the onboarding module (Task 3) uses it
 pub fn validate_ec2_user_tag(tag: &str) -> Result<String, String> {
     let ok = (1..=32).contains(&tag.len())
         && tag.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
@@ -171,7 +173,7 @@ pub fn validate_ec2_user_tag(tag: &str) -> Result<String, String> {
 /// characters). Environment names and user tags never contain `--`, so the
 /// workspace policy's `cluster/triple-c-*--u-*` matches exactly the
 /// per-user clusters, and `triple-c-*--u-<tag>` exactly that user's.
-#[allow(dead_code)] // the onboarding module (Task 3) uses it
+#[allow(dead_code)] // the onboarding module builds it; the app's EC2 runs (Task 5) will
 pub fn user_ec2_stem(env: &str, user_tag: &str) -> String {
     format!("triple-c-{env}--u-{user_tag}")
 }
@@ -180,9 +182,46 @@ pub fn user_ec2_stem(env: &str, user_tag: &str) -> String {
 /// not the user tag, because role names are account-global and at most 64
 /// characters (this is at most 51). The admin's PassRole to EC2 names
 /// `role/triple-c-*-instance`.
-#[allow(dead_code)] // the onboarding module (Task 3) uses it
+#[allow(dead_code)] // the onboarding module builds it; pinned by tests
 pub fn user_instance_role_name(env: &str, owner_key: &str) -> String {
     format!("triple-c-{env}-{owner_key}-instance")
+}
+
+/// The SSM parameter holding a user's EC2 record (E11), written by their
+/// onboarding module only while it has EC2 capacity: a String of JSON with
+/// exactly [`USER_RECORD_FIELDS`]. Workspace users can read it
+/// (`parameter/triple-c/*`) though not the state bucket; it lives outside
+/// `/triple-c/environments/`, which environment detection lists.
+#[allow(dead_code)] // the app reads it from Task 4 on
+pub fn user_record_parameter_name(env: &str, owner_key: &str) -> String {
+    format!("/triple-c/users/{env}/{owner_key}")
+}
+
+/// The fields of a user's EC2 record, schema 1: `instance_type`,
+/// `cluster_arn` (the user's cluster, [`user_ec2_stem`]),
+/// `capacity_provider` (its one provider, the same name) and `user_tag`
+/// (the `triple-c-user` value the cluster is named after).
+#[allow(dead_code)] // the app reads it from Task 4 on
+pub const USER_RECORD_FIELDS: [&str; 5] = [
+    "schema",
+    "instance_type",
+    "cluster_arn",
+    "capacity_provider",
+    "user_tag",
+];
+
+/// The most instances a user's EC2 capacity may run at once.
+pub const EC2_MAX_INSTANCES: u32 = 4;
+
+/// A user's optional EC2 capacity, as the onboarding module takes it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Ec2Compute {
+    /// One of the types `ec2_instance_spec` knows.
+    pub instance_type: String,
+    /// 1 to [`EC2_MAX_INSTANCES`].
+    pub max_instances: u32,
+    /// The user's `triple-c-user` principal tag value.
+    pub user_tag: String,
 }
 
 /// Whether a project id is used in names as it is: 1 to 64 characters of
@@ -400,16 +439,46 @@ pub fn environment_vars(
 }
 
 /// The onboarding module's `terraform.tfvars.json` for the user whose
-/// `aws:userid` is `owner_id`. Bedrock stays on the workspace user's own
-/// credentials unless a later setting opts the task role in.
-pub fn onboarding_vars(env: &str, region: &str, owner_id: &str) -> serde_json::Value {
-    json!({
+/// `aws:userid` is `owner_id`, with their EC2 capacity or none (empty
+/// `ec2_instance_type`: the module makes nothing for EC2). Applies the same
+/// rules as the module's EC2 variable validations. Bedrock stays on the
+/// workspace user's own credentials unless a later setting opts the task
+/// role in.
+pub fn onboarding_vars(
+    env: &str,
+    region: &str,
+    owner_id: &str,
+    ec2: Option<&Ec2Compute>,
+) -> Result<serde_json::Value, String> {
+    let (instance_type, max_instances, user_tag) = match ec2 {
+        None => (String::new(), 1, String::new()),
+        Some(c) => {
+            if crate::models::project::ec2_instance_spec(&c.instance_type).is_none() {
+                return Err(format!(
+                    "\"{}\" is not an instance type Triple-C supports (m7i, m7g, c7i, c7g, r7i, \
+                     r7g from large to 4xlarge; t3, t4g from large to 2xlarge)",
+                    c.instance_type.escape_debug()
+                ));
+            }
+            if !(1..=EC2_MAX_INSTANCES).contains(&c.max_instances) {
+                return Err(format!(
+                    "The number of instances must be from 1 to {EC2_MAX_INSTANCES}"
+                ));
+            }
+            let tag = validate_ec2_user_tag(&c.user_tag)?;
+            (c.instance_type.clone(), c.max_instances, tag)
+        }
+    };
+    Ok(json!({
         "environment_name": env,
         "region": region,
         "owner_id": owner_id,
         "owner_key": owner_key(region, owner_id),
         "bedrock_on_task_role": false,
-    })
+        "ec2_instance_type": instance_type,
+        "ec2_max_instances": max_instances,
+        "ec2_user_tag": user_tag,
+    }))
 }
 
 /// The boundary module's `terraform.tfvars.json`: the shipped boundary

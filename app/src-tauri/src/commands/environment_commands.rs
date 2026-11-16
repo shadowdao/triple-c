@@ -1331,7 +1331,7 @@ pub async fn onboard_aws_user(
     let owner = validate_owner_id(&ctx.who.user_id).map_err(other)?;
     let found = detect(&ctx).await?;
     onboard_refusal(&found, &env).map_err(other)?;
-    let vars = onboarding_vars(&env, &ctx.region, &owner);
+    let vars = onboarding_vars(&env, &ctx.region, &owner, None).map_err(other)?;
     let key = DeploymentKey::User {
         owner_key: owner_key(&ctx.region, &owner),
         env,
@@ -1420,7 +1420,7 @@ pub async fn save_aws_admin_bundle(
                 .map(str::trim)
                 .ok_or_else(|| other("The user's owner id (aws:userid) is required"))
                 .and_then(|o| validate_owner_id(o).map_err(other))?;
-            let vars = onboarding_vars(&env, &region_ok, &owner);
+            let vars = onboarding_vars(&env, &region_ok, &owner, None).map_err(other)?;
             (
                 DeploymentKey::User {
                     owner_key: owner_key(&region_ok, &owner),

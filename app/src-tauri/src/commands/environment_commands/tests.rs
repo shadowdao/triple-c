@@ -195,7 +195,7 @@ fn bundles_contain_the_module_backend_vars_and_readme() {
     let dir = tempfile::tempdir().unwrap();
     let ok = owner_key(REGION, USER_ID);
     let d = Deployment::User { env: "dev", owner_key: &ok };
-    let vars = onboarding_vars("dev", REGION, USER_ID);
+    let vars = onboarding_vars("dev", REGION, USER_ID, None).unwrap();
     let written = write_bundle(dir.path(), d, ACCOUNT, REGION, &vars).unwrap();
 
     for (name, text) in module_files(ModuleKind::UserOnboard) {

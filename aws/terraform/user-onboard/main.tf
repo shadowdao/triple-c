@@ -1,10 +1,11 @@
 # One user's place in an environment: their task and execution roles and
-# their own EFS file system (D2, strict tenancy). The environment itself is
-# read only from its record, never from its state.
+# their own EFS file system (D2, strict tenancy), and optionally their own
+# EC2 capacity (ec2.tf, phase 7). The environment itself is read only from
+# its record, never from its state.
 
 locals {
   # ONBOARD_MODULE_VERSION in app/src-tauri/src/aws/tofu_modules.rs.
-  template_version = 1
+  template_version = 2
   name             = "triple-c-${var.environment_name}-${var.owner_key}"
 
   partition = data.aws_partition.current.partition
@@ -64,10 +65,11 @@ data "aws_ssm_parameter" "environment" {
         ))
         && jsondecode(self.insecure_value).log_group == "/triple-c/${var.environment_name}"
         && can(regex("^sg-[0-9a-f]{8,17}$", jsondecode(self.insecure_value).security_group_id))
-        && alltrue([for s in jsondecode(self.insecure_value).subnet_ids : can(regex("^subnet-[0-9a-f]{8,17}$", s))]),
+        && alltrue([for s in jsondecode(self.insecure_value).subnet_ids : can(regex("^subnet-[0-9a-f]{8,17}$", s))])
+        && (jsondecode(self.insecure_value).assign_public_ip == true || jsondecode(self.insecure_value).assign_public_ip == false),
         false
       )
-      error_message = "The environment record has a malformed kms_key_arn (not a key in this region and account), log_group (not /triple-c/<environment>), security_group_id or subnet id."
+      error_message = "The environment record has a malformed kms_key_arn (not a key in this region and account), log_group (not /triple-c/<environment>), security_group_id, subnet id or assign_public_ip."
     }
   }
 }
