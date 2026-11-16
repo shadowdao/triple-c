@@ -55,4 +55,21 @@ describe("useWorkspaceWarnings", () => {
     expect(toasts).toHaveLength(2);
     expect(toasts[1].detail).toContain("already in use");
   });
+
+  it("keeps a copy-at-connect warning beside the start's own warning", async () => {
+    renderHook(() => useWorkspaceWarnings());
+    await vi.waitFor(() => expect(handler).not.toBeNull());
+    handler!({ payload: { project_id: "p1", message: "started", detail: "clone failed" } });
+    handler!({
+      payload: {
+        project_id: "p1",
+        message: "“demo”: the credentials could not be copied into the workspace",
+        detail: "upload failed",
+        topic: "connect",
+      },
+    });
+    const { toasts } = useAppState.getState();
+    expect(toasts).toHaveLength(2);
+    expect(toasts.map((t) => t.detail)).toEqual(["clone failed", "upload failed"]);
+  });
 });

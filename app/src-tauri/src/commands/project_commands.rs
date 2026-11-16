@@ -1583,16 +1583,19 @@ fn emit_workspace_warning(app_handle: &tauri::AppHandle, project_id: &str, name:
 }
 
 /// Copy-at-connect's warning (Q2): the credentials could not be copied into
-/// a connected workspace. Same `workspace-warning` event as the follower's.
+/// a connected workspace. Same `workspace-warning` event as the follower's,
+/// with its own `topic` so neither replaces the other's toast.
 fn emit_connect_warning(app_handle: &tauri::AppHandle, project_id: &str, name: &str, detail: &str) {
-    let _ = app_handle.emit(
-        "workspace-warning",
-        serde_json::json!({
-            "project_id": project_id,
-            "message": format!("“{name}”: the credentials could not be copied into the workspace"),
-            "detail": detail,
-        }),
-    );
+    let _ = app_handle.emit("workspace-warning", connect_warning_payload(project_id, name, detail));
+}
+
+fn connect_warning_payload(project_id: &str, name: &str, detail: &str) -> serde_json::Value {
+    serde_json::json!({
+        "project_id": project_id,
+        "message": format!("“{name}”: the credentials could not be copied into the workspace"),
+        "detail": detail,
+        "topic": "connect",
+    })
 }
 
 /// Port mappings that could not be forwarded to a connected AWS workspace
@@ -2199,6 +2202,15 @@ pub async fn reconcile_aws_projects(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_connect_warning_has_its_own_toast_topic() {
+        let v = super::connect_warning_payload("p1", "demo", "upload failed");
+        assert_eq!(v["topic"], "connect");
+        assert_eq!(v["project_id"], "p1");
+        assert_eq!(v["detail"], "upload failed");
+        assert!(v["message"].as_str().unwrap().contains("demo"));
+    }
+
     use super::*;
 
     // ── Pending-cleanup aging ────────────────────────────────────────────

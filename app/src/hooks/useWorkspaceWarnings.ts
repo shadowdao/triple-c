@@ -10,7 +10,7 @@ export interface WorkspaceWarningEvent {
   message: string;
   detail: string;
   /** Set when the warning is about something else than the start's own
-   *  follow (`"ports"`): keeps it from replacing that toast. */
+   *  follow (`"ports"`, `"connect"`): keeps it from replacing that toast. */
   topic?: string;
 }
 
