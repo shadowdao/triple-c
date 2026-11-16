@@ -1477,7 +1477,7 @@ mod environment {
             deploy_refusal(&found, &name).expect("deploy is offered");
 
             // Deploy, public network, as the environment admin only.
-            let vars = environment_vars(&name, &t.e.region, &NetworkChoice::Public).unwrap();
+            let vars = environment_vars(&name, &t.e.region, &NetworkChoice::Public, 0).unwrap();
             let (_, outcome, denied) = t
                 .run(
                     ModuleKind::Environment,
@@ -1590,7 +1590,7 @@ mod environment {
             // Update: the recorded network, the same module version: nothing
             // to change.
             let network = network_from_record(&info, None).expect("network from record");
-            let vars = environment_vars(&name, &t.e.region, &network).unwrap();
+            let vars = environment_vars(&name, &t.e.region, &network, 0).unwrap();
             let (_, outcome, denied) = t
                 .run(
                     ModuleKind::Environment,
@@ -1685,7 +1685,7 @@ mod environment {
             let (keys, cfg, who) = t.session(&admin).await;
             t.ensure_bucket(&cfg, &who).await;
             let name = format!("e2e{}", &uuid::Uuid::new_v4().simple().to_string()[..6]);
-            let vars = environment_vars(&name, &t.e.region, &NetworkChoice::PrivateNat).unwrap();
+            let vars = environment_vars(&name, &t.e.region, &NetworkChoice::PrivateNat, 0).unwrap();
             let (_, outcome, denied) = t
                 .run(
                     ModuleKind::Environment,
@@ -1980,7 +1980,7 @@ mod environment {
                     g.cluster = Some(cluster);
                     g.families.push(families);
                 }
-                let vars = environment_vars(&name, &region, &NetworkChoice::Public).unwrap();
+                let vars = environment_vars(&name, &region, &NetworkChoice::Public, 0).unwrap();
                 let (_, outcome, denied) = t
                     .run(ModuleKind::Environment, Deployment::Environment(&name), &vars, TofuOp::Apply, t.keys_env(&keys))
                     .await;

@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import EnvironmentsPanel from "./EnvironmentsPanel";
 import type { DeployProgress, EnvironmentScan } from "../../../lib/types";
-import { conn, env, progress, scan, tofuEvent } from "./testkit";
+import { conn, env, info, progress, scan, tofuEvent } from "./testkit";
 
 const invoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
@@ -301,6 +301,29 @@ describe("EnvironmentsPanel", () => {
     );
   });
 
+  it("Update pre-fills the environment's recorded cap and sends what is shown", async () => {
+    backend(
+      () => scan({ environments: [env({ state: { state: "update_available" }, actions: ["join", "update"], info: { ...info("dev"), max_workspace_hours: 24 }, onboarding: { state: "joined" } })] }),
+      async (cmd) => {
+        if (cmd === "update_aws_environment") return "u1";
+        throw new Error(`unexpected ${cmd}`);
+      },
+    );
+    render(<EnvironmentsPanel connection={conn} tier="environment_admin" />);
+    await open();
+    fireEvent.click(await screen.findByRole("button", { name: "Update dev" }));
+    const dialog = screen.getByRole("dialog", { name: "Update dev" });
+    const cap = within(dialog).getByLabelText("Maximum workspace lifetime (hours, 0 = none)");
+    expect(cap).toHaveValue("24");
+    fireEvent.change(cap, { target: { value: "200" } });
+    expect(within(dialog).getByRole("button", { name: "Update" })).toBeDisabled();
+    fireEvent.change(cap, { target: { value: "24" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Update" }));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("update_aws_environment", { connectionId: "h1", region: "eu-west-1", name: "dev", maxWorkspaceHours: 24 }),
+    );
+  });
+
   it("shows a failed run's errors in full", async () => {
     backend(
       () => scan({ environments: [env({ state: { state: "update_available" }, actions: ["join", "update"], onboarding: { state: "joined" } })] }),
@@ -312,7 +335,8 @@ describe("EnvironmentsPanel", () => {
     render(<EnvironmentsPanel connection={conn} tier="environment_admin" />);
     await open();
     fireEvent.click(await screen.findByRole("button", { name: "Update dev" }));
-    await waitFor(() => expect(invoke).toHaveBeenCalledWith("update_aws_environment", { connectionId: "h1", region: "eu-west-1", name: "dev" }));
+    fireEvent.click(within(screen.getByRole("dialog", { name: "Update dev" })).getByRole("button", { name: "Update" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("update_aws_environment", { connectionId: "h1", region: "eu-west-1", name: "dev", maxWorkspaceHours: 0 }));
     const long = "Error: creating IAM Role (triple-c-dev-task): AccessDenied: User is not authorized to perform iam:CreateRole\n  with aws_iam_role.task";
     emit(progress({ op_id: "u1", events: [tofuEvent(long, { level: "error", kind: "diagnostic" })] }));
     emit(progress({ op_id: "u1", events: [], done: true, cancellable: false, result: { ok: false, exit_code: 1, summary: "Apply failed" } }));
@@ -362,8 +386,9 @@ describe("EnvironmentsPanel", () => {
       resolveUs(scan({ region: "us-east-1", environments: [env({ state: { state: "update_available" }, actions: ["update"], onboarding: { state: "joined" } })] })),
     );
     fireEvent.click(await screen.findByRole("button", { name: "Update dev" }));
+    fireEvent.click(within(screen.getByRole("dialog", { name: "Update dev" })).getByRole("button", { name: "Update" }));
     await waitFor(() =>
-      expect(invoke).toHaveBeenCalledWith("update_aws_environment", { connectionId: "h1", region: "us-east-1", name: "dev" }),
+      expect(invoke).toHaveBeenCalledWith("update_aws_environment", { connectionId: "h1", region: "us-east-1", name: "dev", maxWorkspaceHours: 0 }),
     );
     expect(await screen.findByText("Running")).toBeInTheDocument();
   });
@@ -402,6 +427,7 @@ describe("EnvironmentsPanel", () => {
     render(<EnvironmentsPanel connection={conn} tier="environment_admin" />);
     await open();
     fireEvent.click(await screen.findByRole("button", { name: "Update dev" }));
+    fireEvent.click(within(screen.getByRole("dialog", { name: "Update dev" })).getByRole("button", { name: "Update" }));
     expect(await screen.findByText(/Finished: No changes\./)).toBeInTheDocument();
     expect(screen.getByText("Refreshing state")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Cancel deployment" })).toBeNull();

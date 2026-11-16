@@ -179,7 +179,7 @@ pub(crate) fn network_from_record(
                 assign_public_ip: info.assign_public_ip,
             };
             // The same checks as the apply's variables.
-            environment_vars(&info.name, "us-east-1", &choice)?;
+            environment_vars(&info.name, "us-east-1", &choice, 0)?;
             Ok(choice)
         }
         _ => Err("The environment record names an unknown network mode".into()),
@@ -1034,13 +1034,20 @@ pub async fn deploy_aws_environment(
     region: String,
     name: String,
     network: NetworkChoice,
+    max_workspace_hours: Option<u32>,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<String, AwsError> {
     let ctx = context(&state, &connection_id, &region).await?;
     let found = detect(&ctx).await?;
     deploy_refusal(&found, &name).map_err(other)?;
-    let vars = environment_vars(&name, &ctx.region, &network).map_err(other)?;
+    let vars = environment_vars(
+        &name,
+        &ctx.region,
+        &network,
+        max_workspace_hours.unwrap_or(0),
+    )
+    .map_err(other)?;
     let key = DeploymentKey::Environment(name);
     opened(launch(app, &ctx, &key, &vars, TofuOp::Apply).await)
 }
@@ -1052,6 +1059,7 @@ pub async fn update_aws_environment(
     connection_id: String,
     region: String,
     name: String,
+    max_workspace_hours: Option<u32>,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<String, AwsError> {
@@ -1063,7 +1071,9 @@ pub async fn update_aws_environment(
         .as_ref()
         .ok_or_else(|| other("The environment has no readable record"))?;
     let network = recorded_network(&ctx, info).await?;
-    let vars = environment_vars(&env.name, &ctx.region, &network).map_err(other)?;
+    // The recorded cap stays unless the caller changes it.
+    let hours = max_workspace_hours.unwrap_or(info.max_workspace_hours);
+    let vars = environment_vars(&env.name, &ctx.region, &network, hours).map_err(other)?;
     let key = DeploymentKey::Environment(env.name.clone());
     opened(launch(app, &ctx, &key, &vars, TofuOp::Apply).await)
 }
@@ -1077,6 +1087,7 @@ pub async fn repair_aws_environment(
     region: String,
     name: String,
     network: Option<NetworkChoice>,
+    max_workspace_hours: Option<u32>,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<String, AwsError> {
@@ -1092,7 +1103,11 @@ pub async fn repair_aws_environment(
             ))
         }
     };
-    let vars = environment_vars(&env.name, &ctx.region, &network).map_err(other)?;
+    // A valid record's cap stays unless the caller changes it.
+    let hours = max_workspace_hours
+        .or(env.info.as_ref().map(|i| i.max_workspace_hours))
+        .unwrap_or(0);
+    let vars = environment_vars(&env.name, &ctx.region, &network, hours).map_err(other)?;
     let key = DeploymentKey::Environment(env.name.clone());
     opened(launch(app, &ctx, &key, &vars, TofuOp::Apply).await)
 }
@@ -1113,7 +1128,8 @@ pub async fn destroy_incomplete_aws_environment(
     let env = destroy_refusal(&found, &name).map_err(other)?;
     // A destroy plans the removal of everything in state whatever the
     // network variables say; they only have to be valid.
-    let vars = environment_vars(&env.name, &ctx.region, &NetworkChoice::Public).map_err(other)?;
+    let vars =
+        environment_vars(&env.name, &ctx.region, &NetworkChoice::Public, 0).map_err(other)?;
     let key = DeploymentKey::Environment(env.name.clone());
     opened(launch(app, &ctx, &key, &vars, TofuOp::Destroy).await)
 }
@@ -1372,6 +1388,7 @@ pub async fn save_aws_admin_bundle(
     environment: Option<String>,
     owner_id: Option<String>,
     network: Option<NetworkChoice>,
+    max_workspace_hours: Option<u32>,
     window: tauri::Window,
     state: State<'_, AppState>,
 ) -> Result<Option<String>, AwsError> {
@@ -1386,8 +1403,13 @@ pub async fn save_aws_admin_bundle(
     let (key, vars) = match kind {
         ModuleKind::Environment => {
             let env = need_env()?;
-            let vars = environment_vars(&env, &region_ok, &network.unwrap_or(NetworkChoice::Public))
-                .map_err(other)?;
+            let vars = environment_vars(
+                &env,
+                &region_ok,
+                &network.unwrap_or(NetworkChoice::Public),
+                max_workspace_hours.unwrap_or(0),
+            )
+            .map_err(other)?;
             (DeploymentKey::Environment(env), vars)
         }
         ModuleKind::UserOnboard => {

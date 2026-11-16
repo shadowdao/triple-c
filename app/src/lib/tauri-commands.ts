@@ -109,13 +109,35 @@ export const awsPolicyDocument = (tier: Tier) =>
 // after a reload) replays the whole log under a new op id.
 export const detectAwsEnvironments = (connectionId: string, region: string) =>
   invoke<EnvironmentScan>("detect_aws_environments", { connectionId, region });
-export const deployAwsEnvironment = (connectionId: string, region: string, name: string, network: NetworkChoice) =>
-  invoke<string>("deploy_aws_environment", { connectionId, region, name, network });
-export const updateAwsEnvironment = (connectionId: string, region: string, name: string) =>
-  invoke<string>("update_aws_environment", { connectionId, region, name });
-/** `network` is required only when the environment has no record. */
-export const repairAwsEnvironment = (connectionId: string, region: string, name: string, network?: NetworkChoice) =>
-  invoke<string>("repair_aws_environment", { connectionId, region, name, network: network ?? null });
+export const deployAwsEnvironment = (
+  connectionId: string,
+  region: string,
+  name: string,
+  network: NetworkChoice,
+  maxWorkspaceHours = 0,
+) => invoke<string>("deploy_aws_environment", { connectionId, region, name, network, maxWorkspaceHours });
+/** Omit `maxWorkspaceHours` to keep the environment's recorded cap. */
+export const updateAwsEnvironment = (connectionId: string, region: string, name: string, maxWorkspaceHours?: number) =>
+  invoke<string>(
+    "update_aws_environment",
+    maxWorkspaceHours === undefined
+      ? { connectionId, region, name }
+      : { connectionId, region, name, maxWorkspaceHours },
+  );
+/** `network` is required only when the environment has no record; a record's cap is kept unless `maxWorkspaceHours` is given. */
+export const repairAwsEnvironment = (
+  connectionId: string,
+  region: string,
+  name: string,
+  network?: NetworkChoice,
+  maxWorkspaceHours?: number,
+) =>
+  invoke<string>(
+    "repair_aws_environment",
+    maxWorkspaceHours === undefined
+      ? { connectionId, region, name, network: network ?? null }
+      : { connectionId, region, name, network: network ?? null, maxWorkspaceHours },
+  );
 export const destroyIncompleteAwsEnvironment = (connectionId: string, region: string, name: string) =>
   invoke<string>("destroy_incomplete_aws_environment", { connectionId, region, name });
 export const unlockAwsState = (connectionId: string, region: string, stateKey: string) =>
@@ -136,7 +158,7 @@ export const saveAwsAdminBundle = (
   connectionId: string,
   region: string,
   kind: ModuleKind,
-  options: { environment?: string; ownerId?: string; network?: NetworkChoice } = {},
+  options: { environment?: string; ownerId?: string; network?: NetworkChoice; maxWorkspaceHours?: number } = {},
 ) =>
   invoke<string | null>("save_aws_admin_bundle", {
     connectionId,
@@ -145,6 +167,7 @@ export const saveAwsAdminBundle = (
     environment: options.environment ?? null,
     ownerId: options.ownerId ?? null,
     network: options.network ?? null,
+    ...(options.maxWorkspaceHours === undefined ? {} : { maxWorkspaceHours: options.maxWorkspaceHours }),
   });
 /** Check a corporate CA path and report what would be installed. Never
  *  rejects for a bad path — the reason comes back in `error`. */

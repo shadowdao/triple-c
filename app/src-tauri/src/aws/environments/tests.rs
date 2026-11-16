@@ -45,6 +45,22 @@ fn without(name: &str, field: &str) -> String {
 }
 
 #[test]
+fn the_lifetime_cap_is_read_when_present() {
+    for hours in [0, 8, 168] {
+        let rec = with("dev", "max_workspace_hours", json!(hours));
+        let info = parse_environment_record("dev", &rec, ACCOUNT, REGION).unwrap();
+        assert_eq!(info.max_workspace_hours, hours);
+    }
+}
+
+#[test]
+fn a_version_1_record_reads_as_update_available() {
+    use crate::aws::tofu_modules::ENVIRONMENT_MODULE_VERSION;
+    let v1 = parsed("dev", 1);
+    assert!(v1.template_version < ENVIRONMENT_MODULE_VERSION);
+}
+
+#[test]
 fn untrusted_environment_records_are_rejected() {
     let valid = parsed("dev", 1);
     assert_eq!(valid.name, "dev");
@@ -52,6 +68,7 @@ fn untrusted_environment_records_are_rejected() {
     assert_eq!(valid.subnet_ids.len(), 2);
     assert!(valid.assign_public_ip);
     assert_eq!(valid.tenancy, "strict");
+    assert_eq!(valid.max_workspace_hours, 0, "a v1 record has no cap");
 
     let other_account = "999999999999";
     let secret = "s3cr3t-value-never-echoed";
@@ -181,6 +198,21 @@ fn untrusted_environment_records_are_rejected() {
             "template_version not a number",
             with("dev", "template_version", json!(secret)),
             "template_version",
+        ),
+        (
+            "cap above a week",
+            with("dev", "max_workspace_hours", json!(169)),
+            "max_workspace_hours",
+        ),
+        (
+            "cap not a number",
+            with("dev", "max_workspace_hours", json!(secret)),
+            "max_workspace_hours",
+        ),
+        (
+            "negative cap",
+            with("dev", "max_workspace_hours", json!(-1)),
+            "max_workspace_hours",
         ),
     ];
     for (what, value, field) in cases {

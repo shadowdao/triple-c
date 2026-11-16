@@ -5,6 +5,7 @@ import type { AwsError, ModuleKind, NetworkChoice } from "../../../lib/types";
 import Button from "../../ui/Button";
 import Field, { inputClass } from "../../ui/Field";
 import Modal from "../../ui/Modal";
+import LifetimeCapField, { parseCapHours } from "./LifetimeCapField";
 import NetworkFields from "./NetworkFields";
 import { DEFAULT_NETWORK, environmentNameError, networkFromDraft, type NetworkDraft } from "./environmentFormat";
 
@@ -48,6 +49,7 @@ export default function AdminBundleModal({
   const askEnvironment = kind === "environment" && !environment;
   const [name, setName] = useState("main");
   const [draft, setDraft] = useState<NetworkDraft>(DEFAULT_NETWORK);
+  const [capText, setCapText] = useState("0");
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState<string | null>(null);
   const [error, setError] = useState<AwsError | null>(null);
@@ -55,7 +57,8 @@ export default function AdminBundleModal({
 
   const nameError = askEnvironment ? environmentNameError(name) : null;
   const picked = askEnvironment ? networkFromDraft(draft) : null;
-  const ready = !nameError && (!picked || "network" in picked);
+  const capHours = parseCapHours(capText);
+  const ready = !nameError && (!picked || "network" in picked) && (!askEnvironment || capHours !== null);
 
   const save = async () => {
     setSaving(true);
@@ -65,6 +68,7 @@ export default function AdminBundleModal({
         environment: askEnvironment ? name : environment,
         ownerId,
         network: picked && "network" in picked ? picked.network : network,
+        ...(askEnvironment && capHours !== null ? { maxWorkspaceHours: capHours } : {}),
       });
       if (folder) {
         setSaved(folder);
@@ -127,6 +131,7 @@ export default function AdminBundleModal({
               {(id) => <input id={id} className={inputClass} value={name} onChange={(e) => setName(e.target.value)} />}
             </Field>
             <NetworkFields value={draft} onChange={setDraft} error={picked && "error" in picked ? picked.error : null} />
+            <LifetimeCapField value={capText} onChange={setCapText} />
           </div>
         )}
         <Button size="md" variant="primary" onClick={save} disabled={saving || !ready}>

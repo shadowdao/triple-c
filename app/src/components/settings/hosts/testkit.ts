@@ -40,6 +40,7 @@ export function info(name = "dev"): EnvironmentInfo {
     log_group: `/triple-c/${name}`,
     network_mode: "public",
     tenancy: "strict",
+    max_workspace_hours: 0,
   };
 }
 

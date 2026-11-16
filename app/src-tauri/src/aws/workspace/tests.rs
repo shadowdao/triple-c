@@ -45,6 +45,7 @@ fn env_info() -> EnvironmentInfo {
         log_group: "/triple-c/dev".into(),
         network_mode: "public".into(),
         tenancy: "strict".into(),
+        max_workspace_hours: 0,
     }
 }
 

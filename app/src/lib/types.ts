@@ -1299,6 +1299,8 @@ export interface EnvironmentInfo {
   log_group: string;
   network_mode: "public" | "private-nat" | "existing";
   tenancy: string;
+  /** Advisory workspace lifetime cap in hours; 0 = none (absent in v1 records). */
+  max_workspace_hours: number;
 }
 
 /** A held state lock. `who`/`created`/`operation` are sanitized untrusted text. */

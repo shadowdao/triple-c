@@ -15,7 +15,7 @@ use crate::models::host_connection::validate_supported_region;
 
 /// `locals.template_version` (and the `triple-c:template-version` default
 /// tag) of `aws/terraform/environment`.
-pub const ENVIRONMENT_MODULE_VERSION: u32 = 1;
+pub const ENVIRONMENT_MODULE_VERSION: u32 = 2;
 /// The same for the user-onboarding module.
 #[allow(dead_code)] // the onboarding module's version; checked against its HCL by a test
 pub const ONBOARD_MODULE_VERSION: u32 = 1;
@@ -274,14 +274,23 @@ fn is_aws_id(id: &str, prefix: &str) -> bool {
     })
 }
 
+/// The longest lifetime cap an environment can carry, in hours (a week).
+pub const MAX_WORKSPACE_HOURS: u32 = 168;
+
 /// The environment module's `terraform.tfvars.json`. Applies the same rules
 /// as the module's variable validations, so a bad value fails here first.
 pub fn environment_vars(
     env: &str,
     region: &str,
     network: &NetworkChoice,
+    max_workspace_hours: u32,
 ) -> Result<serde_json::Value, String> {
     let env = validate_environment_name(env)?;
+    if max_workspace_hours > MAX_WORKSPACE_HOURS {
+        return Err(format!(
+            "The maximum workspace lifetime is at most {MAX_WORKSPACE_HOURS} hours (0 = no cap)"
+        ));
+    }
     let region = validate_supported_region(region)?;
     let (mode, vpc_id, subnet_ids, assign_public_ip) = match network {
         NetworkChoice::Public => ("public", String::new(), Vec::new(), false),
@@ -322,6 +331,7 @@ pub fn environment_vars(
         "vpc_id": vpc_id,
         "subnet_ids": subnet_ids,
         "assign_public_ip": assign_public_ip,
+        "max_workspace_hours": max_workspace_hours,
     }))
 }
 

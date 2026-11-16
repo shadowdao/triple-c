@@ -283,7 +283,7 @@ it is unpacked), and an admin can run the very same files by hand from a bundle.
 | Module | Creates | State key |
 |---|---|---|
 | `terraform/permissions-boundary` | the account's `triple-c-permissions-boundary` policy (an account administrator applies it; the admin tier cannot) | `boundary/terraform.tfstate` |
-| `terraform/environment` | what every user shares: ECS cluster (Fargate, Fargate Spot), the tasks security group (no inbound rules), KMS key and alias, log group `/triple-c/<env>`, the network (`network_mode`: `public`, `private-nat`, `existing`) and, last, the record `/triple-c/environments/<env>` | `environments/<env>/terraform.tfstate` |
+| `terraform/environment` | what every user shares: ECS cluster (Fargate, Fargate Spot), the tasks security group (no inbound rules), KMS key and alias, log group `/triple-c/<env>`, the network (`network_mode`: `public`, `private-nat`, `existing`) and, last, the record `/triple-c/environments/<env>` (which carries the advisory `max_workspace_hours` lifetime cap, 0 = none, at most 168) | `environments/<env>/terraform.tfstate` |
 | `terraform/user-onboard` | one user's task and execution roles (with the boundary) and their own EFS file system, its `-efs` security group, two mount targets and a file-system policy that admits only their task role | `users/<env>/<owner key>/terraform.tfstate` |
 
 The **owner key** is the first 12 hex characters of `sha256("<region>:<aws:userid>")`; it names
@@ -540,7 +540,7 @@ progress events) is not exercised.
 | EFS file-system policy naming a just-created role | ✓ no invalid-principal error in any onboarding apply (two applies, each created in 4 s, right after the role; whether the provider retried internally is not visible without its debug log); no module change. If it ever fails, applying the onboarding again completes it |
 | NAT address on destroy | ✗→fixed: the provider disassociates the address before releasing it, after the NAT gateway (and the association) are gone, and EC2 authorizes that call against the literal `*/*`. `DisassociateGoneAddresses` allows exactly `arn:aws:ec2:*:*:${*}/${*}`; CloudTrail shows the retried call reaching `InvalidAssociationID.NotFound` |
 | Conditional unlock | ✓ on the versioned state bucket, `DeleteObject` with `If-Match` and a mismatched ETag gets 412 (the app's "lock changed" answer) and leaves the lock; with the current ETag it deletes it. A fresh foreign lock scans as Deploying with its `Who` |
-| Update | ✓ re-applying with the network read back from the record: "0 added, 0 changed, 0 destroyed" |
+| Update | ✓ re-applying with the network and lifetime cap read back from the record: "0 added, 0 changed, 0 destroyed" |
 | After `tofu destroy` | ✗→fixed (app): the state object stays, empty, so a destroyed environment kept scanning as Incomplete (and a removed onboarding as Joined). Detection now reads small state objects (up to 2 KiB, at most 200 per scan) and treats one with no resources as absent; a read that fails counts as a deployment |
 | Cleanup | ✓ nothing `triple-c` left in us-west-2 (roles, policies, log groups, clusters, VPCs, subnets, gateways, NAT gateways, addresses, security groups, file systems, parameters, aliases, buckets); five environment KMS keys pending deletion (7 days); the boundary, which the account did not have, deleted again |
 
