@@ -182,6 +182,10 @@ pub async fn open_terminal_session(
         ),
     };
 
+    // AWS copy-at-connect: the credentials go into this terminal's own
+    // environment (never the agent's). Empty for everything else.
+    let env = crate::host::aws_host::terminal_env(&project, &state.settings_store.get());
+
     let output_event = format!("terminal-output-{}", session_id);
     let exit_event = format!("terminal-exit-{}", session_id);
     let app_handle_output = app_handle.clone();
@@ -193,6 +197,7 @@ pub async fn open_terminal_session(
             &target,
             &session_id,
             cmd,
+            env,
             move |data| {
                 let _ = app_handle_output.emit(&output_event, data);
             },

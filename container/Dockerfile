@@ -475,6 +475,11 @@ COPY skills /opt/triple-c-skills
 # without a script, which is a legitimate thing for a skill to do.
 RUN find /opt/triple-c-skills -name '*.sh' -exec chmod +x {} +
 
+# The entrypoint's shared functions (CA install, SSH merge, git credential
+# helper, clone), sourced by it and by triple-c-apply-connect. Root-owned and
+# not writable by the user: both run as root.
+COPY entrypoint-lib.sh /usr/local/lib/triple-c/entrypoint-lib.sh
+RUN chmod 755 /usr/local/lib/triple-c && chmod 644 /usr/local/lib/triple-c/entrypoint-lib.sh
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 COPY triple-c-scheduler /usr/local/bin/triple-c-scheduler
@@ -489,13 +494,15 @@ RUN chmod +x /usr/local/bin/triple-c-playwright-heal
 COPY triple-c-task-runner /usr/local/bin/triple-c-task-runner
 RUN chmod +x /usr/local/bin/triple-c-task-runner
 # AWS workspaces only (entrypoint.sh, TRIPLEC_HOST=aws): the WIP push run on
-# stop, the idle auto-stop / lifetime-cap watcher and the start-up status
-# (clone + setup script) the app polls. Inert in a Docker container.
+# stop, the idle auto-stop / lifetime-cap watcher, the start-up status
+# (clone + setup script) the app polls and the copy-at-connect apply the app
+# runs (as root) after each connect. Inert in a Docker container.
 COPY triple-c-wip-push /usr/local/bin/triple-c-wip-push
 COPY triple-c-idle-watch /usr/local/bin/triple-c-idle-watch
 COPY triple-c-workspace-status /usr/local/bin/triple-c-workspace-status
+COPY triple-c-apply-connect /usr/local/bin/triple-c-apply-connect
 RUN chmod 755 /usr/local/bin/triple-c-wip-push /usr/local/bin/triple-c-idle-watch \
-    /usr/local/bin/triple-c-workspace-status
+    /usr/local/bin/triple-c-workspace-status /usr/local/bin/triple-c-apply-connect
 # Root-owned in /usr/local/bin: entrypoint.sh starts it as root (only when a
 # token is configured), and it rides the snapshot and migration like the other
 # shims here.

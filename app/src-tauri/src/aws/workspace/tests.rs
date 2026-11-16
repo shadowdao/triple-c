@@ -675,7 +675,7 @@ fn payload_carries_setup_script_and_lifetime_when_set() {
         true,
         None,
         StorageMode::Hybrid,
-        PayloadExtras { setup_script: Some("apt-get install -y jq\n"), max_workspace_hours: 8 },
+        PayloadExtras { setup_script: Some("apt-get install -y jq\n"), max_workspace_hours: 8, ..Default::default() },
     )
     .unwrap();
     let m = payload_map(&json);
@@ -694,7 +694,7 @@ fn payload_omits_setup_script_and_lifetime_when_unset() {
             true,
             None,
             StorageMode::Hybrid,
-            PayloadExtras { setup_script: script, max_workspace_hours: 0 },
+            PayloadExtras { setup_script: script, ..Default::default() },
         )
         .unwrap();
         let m = payload_map(&json);
@@ -735,7 +735,7 @@ fn payload_size_error_names_the_setup_script_when_it_is_the_large_part() {
         true,
         None,
         StorageMode::Hybrid,
-        PayloadExtras { setup_script: Some(&script), max_workspace_hours: 0 },
+        PayloadExtras { setup_script: Some(&script), ..Default::default() },
     )
     .unwrap_err();
     assert!(err.contains("65,536"), "{err}");
@@ -913,7 +913,7 @@ async fn prepare(
     p: &Project,
     env: &[(String, String)],
 ) -> Result<PreparedWorkspace, AwsError> {
-    prepare_workspace(fake, &who(), &env_info(), p, env, &[], IMAGE).await
+    prepare_workspace(fake, &who(), &env_info(), p, env, &[], &[], IMAGE).await
 }
 
 #[tokio::test]
@@ -923,7 +923,7 @@ async fn prepare_puts_the_setup_script_and_the_environments_cap_in_the_secret() 
     p.aws.as_mut().unwrap().setup_script = Some("sudo apt-get install -y jq".into());
     let mut env = env_info();
     env.max_workspace_hours = 12;
-    prepare_workspace(&fake, &who(), &env, &p, &[], &[], IMAGE).await.unwrap();
+    prepare_workspace(&fake, &who(), &env, &p, &[], &[], &[], IMAGE).await.unwrap();
     let m = payload_map(&fake.secrets.lock().unwrap()[0].2);
     assert_eq!(m["TRIPLEC_SETUP_SCRIPT"], "sudo apt-get install -y jq");
     assert_eq!(m["TRIPLEC_MAX_LIFETIME_MINUTES"], "720");
@@ -1345,6 +1345,7 @@ async fn files_travel_in_the_secret_only() {
         &project(StorageMode::Hybrid),
         &[],
         &files,
+        &[],
         IMAGE,
     )
     .await
@@ -1488,3 +1489,109 @@ fn a_secret_pending_deletion_is_recognised() {
     assert!(msg.contains("triple-c/dev/abc/p"), "{msg}");
 }
 
+
+// ------------------------------------------------- copy-at-connect (Q2)
+
+#[test]
+fn a_copy_at_connect_payload_keeps_settings_and_the_token_but_no_credentials() {
+    let env = pairs(&[
+        ("ANTHROPIC_API_KEY", "sk-ant"),
+        ("GIT_TOKEN", "ghp_secret"),
+        ("AWS_SECRET_ACCESS_KEY", "aws-secret"),
+        ("MY_CUSTOM", "custom-value"),
+        ("ANTHROPIC_MODEL", "opus"),
+        ("CLAUDE_INSTRUCTIONS", "be nice"),
+        ("GIT_USER_NAME", "Dev"),
+    ]);
+    let files = vec![
+        ("ssh/id_ed25519".to_string(), b"PRIVATE KEY".to_vec()),
+        ("ca/corp.pem".to_string(), b"PEM".to_vec()),
+    ];
+    let repos = project(StorageMode::Hybrid).aws.unwrap().repos;
+    let custom = vec!["MY_CUSTOM".to_string()];
+    let json = project_secret_payload_with(
+        &env,
+        "tok",
+        &files,
+        &repos,
+        true,
+        Some(30),
+        StorageMode::Hybrid,
+        PayloadExtras {
+            setup_script: Some("make"),
+            connect_only: Some(&custom),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for value in ["sk-ant", "ghp_secret", "aws-secret", "custom-value", "PRIVATE KEY", "UFJJVkFURSBLRVk="] {
+        assert!(!json.contains(value), "{value} must not be stored: {json}");
+    }
+    let m = payload_map(&json);
+    assert!(!m.contains_key("TRIPLEC_FILES"));
+    for key in crate::docker::container::SECRET_ENV_KEYS.iter().chain(["MY_CUSTOM"].iter()) {
+        assert!(!m.contains_key(*key), "{key}");
+    }
+    assert_eq!(m["TRIPLEC_CREDENTIALS"], "connect");
+    // Settings and the agent token stay.
+    assert_eq!(m["TRIPLEC_AGENT_TOKEN"], "tok");
+    assert_eq!(m["ANTHROPIC_MODEL"], "opus");
+    assert_eq!(m["CLAUDE_INSTRUCTIONS"], "be nice");
+    assert_eq!(m["GIT_USER_NAME"], "Dev");
+    assert_eq!(m["TRIPLEC_SETUP_SCRIPT"], "make");
+    assert_eq!(m["TRIPLEC_IDLE_STOP_MINUTES"], "30");
+    assert!(m["TRIPLEC_REPOS"].contains("\"folder\""));
+
+    // Secrets Manager delivery: all of it, and no TRIPLEC_CREDENTIALS.
+    let m = payload_map(
+        &project_secret_payload_with(
+            &env,
+            "tok",
+            &files,
+            &repos,
+            true,
+            Some(30),
+            StorageMode::Hybrid,
+            PayloadExtras::default(),
+        )
+        .unwrap(),
+    );
+    assert_eq!(m["GIT_TOKEN"], "ghp_secret");
+    assert_eq!(m["MY_CUSTOM"], "custom-value");
+    assert!(m["TRIPLEC_FILES"].contains("ssh/id_ed25519"));
+    assert!(!m.contains_key("TRIPLEC_CREDENTIALS"));
+}
+
+#[test]
+fn credential_pairs_are_the_managed_keys_and_every_custom_variable() {
+    let env = pairs(&[
+        ("ANTHROPIC_API_KEY", "sk"),
+        ("TZ", "UTC"),
+        ("MY_CUSTOM", "v"),
+        ("GIT_TOKEN", ""),
+        ("CLAUDE_CODE_OAUTH_TOKEN", "o"),
+    ]);
+    let got = credential_pairs(&env, &["MY_CUSTOM".to_string()]);
+    assert_eq!(
+        got,
+        pairs(&[("ANTHROPIC_API_KEY", "sk"), ("MY_CUSTOM", "v"), ("GIT_TOKEN", ""), ("CLAUDE_CODE_OAUTH_TOKEN", "o")])
+    );
+    assert!(!is_credential_key("TZ", &[]));
+}
+
+#[tokio::test]
+async fn prepare_leaves_the_credentials_out_of_a_copy_at_connect_secret() {
+    let fake = Fake::onboarded();
+    let mut p = project(StorageMode::Hybrid);
+    p.aws.as_mut().unwrap().secrets_delivery = crate::models::project::SecretsDelivery::CopyAtConnect;
+    let files = vec![("ssh/id_ed25519".to_string(), b"PRIVATE KEY".to_vec())];
+    let env = pairs(&[("GIT_TOKEN", "ghp_secret"), ("MINE", "x"), ("TZ", "UTC")]);
+    prepare_workspace(&fake, &who(), &env_info(), &p, &env, &files, &["MINE".to_string()], IMAGE)
+        .await
+        .unwrap();
+    let m = payload_map(&fake.secrets.lock().unwrap()[0].2);
+    assert!(!m.contains_key("GIT_TOKEN") && !m.contains_key("MINE") && !m.contains_key("TRIPLEC_FILES"));
+    assert_eq!(m["TZ"], "UTC");
+    assert_eq!(m["TRIPLEC_CREDENTIALS"], "connect");
+    assert!(m.contains_key("TRIPLEC_AGENT_TOKEN"));
+}

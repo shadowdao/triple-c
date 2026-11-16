@@ -1491,6 +1491,15 @@ async fn start_project_container_locked(
             .await;
     }
 
+    // AWS, copy-at-connect (Q2): every connect copies the credentials in,
+    // in the background (the clone waits for them); a failure is a warning.
+    if project.is_aws() {
+        let (handle, id, name) = (app_handle.clone(), project_id.clone(), project.name.clone());
+        crate::host::aws_host::spawn_connect_push(&project, &settings, move |detail| {
+            emit_connect_warning(&handle, &id, &name, &detail)
+        });
+    }
+
     // AWS: the start is done (Running, lock released when this returns);
     // the background clone and setup script are followed by a background
     // task that only reports a failure (ruling R5). Never for Docker.
@@ -1516,6 +1525,19 @@ fn emit_workspace_warning(app_handle: &tauri::AppHandle, project_id: &str, name:
         serde_json::json!({
             "project_id": project_id,
             "message": format!("“{name}” started, but not everything went well"),
+            "detail": detail,
+        }),
+    );
+}
+
+/// Copy-at-connect's warning (Q2): the credentials could not be copied into
+/// a connected workspace. Same `workspace-warning` event as the follower's.
+fn emit_connect_warning(app_handle: &tauri::AppHandle, project_id: &str, name: &str, detail: &str) {
+    let _ = app_handle.emit(
+        "workspace-warning",
+        serde_json::json!({
+            "project_id": project_id,
+            "message": format!("“{name}”: the credentials could not be copied into the workspace"),
             "detail": detail,
         }),
     );
@@ -2027,7 +2049,10 @@ pub(crate) fn needs_aws_reconcile(p: &Project) -> bool {
 /// re-opens their tunnels. One bounded DescribeTasks per project, a few at a
 /// time; a live task's tunnel is re-opened in the background.
 #[tauri::command]
-pub async fn reconcile_aws_projects(state: State<'_, AppState>) -> Result<Vec<Project>, String> {
+pub async fn reconcile_aws_projects(
+    app_handle: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Vec<Project>, String> {
     use futures_util::StreamExt;
 
     let projects: Vec<Project> = state.projects_store.list().into_iter().filter(|p| p.is_aws()).collect();
@@ -2050,12 +2075,16 @@ pub async fn reconcile_aws_projects(state: State<'_, AppState>) -> Result<Vec<Pr
     .for_each_concurrent(AWS_RECONCILE_CONCURRENCY, |project| {
         let settings = settings.clone();
         let store = store.clone();
+        let handle = app_handle.clone();
         async move {
             // The store's current copy: the id above may have changed.
             let project = store.get(&project.id).unwrap_or(project);
+            let (id, name) = (project.id.clone(), project.name.clone());
+            let on_connect_warning =
+                move |detail: String| emit_connect_warning(&handle, &id, &name, &detail);
             if tokio::time::timeout(
                 AWS_RECONCILE_TIMEOUT,
-                crate::host::aws_host::reconcile(&project, &settings, store),
+                crate::host::aws_host::reconcile(&project, &settings, store, on_connect_warning),
             )
             .await
             .is_err()
@@ -3015,6 +3044,23 @@ mod tests {
         assert!(!start.contains("follow_workspace_status"), "no follow inside the start");
         // Docker: `spawn_follow` itself also refuses a local project
         // (`status::tests::a_local_project_has_no_workspace_status_and_no_follower`).
+    }
+
+    #[test]
+    fn every_connect_of_a_copy_at_connect_project_copies_the_credentials_in() {
+        // Q2: a start (new task or attach) and the background re-attach at
+        // app start both push; a failure is a `workspace-warning`.
+        let src = include_str!("project_commands.rs");
+        let start = fn_body(src, "start_project_container_locked");
+        let running = start.find("update_status(&project_id, ProjectStatus::Running)").unwrap();
+        let push = start.find("aws_host::spawn_connect_push(").expect("the start pushes");
+        assert!(push > running, "only once the workspace is connected and Running");
+        let guard = start[..push].rfind("if project.is_aws() {").expect("AWS-only");
+        assert!(start[guard..push].lines().count() <= 4);
+        assert!(start[push..].starts_with("aws_host::spawn_connect_push(&project, &settings, move |detail| {\n            emit_connect_warning("));
+        let reconcile = fn_body(src, "reconcile_aws_projects");
+        assert!(reconcile.contains("emit_connect_warning(&handle, &id, &name, &detail)"));
+        assert!(reconcile.contains("aws_host::reconcile(&project, &settings, store, on_connect_warning)"));
     }
 
     #[test]

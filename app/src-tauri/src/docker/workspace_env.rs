@@ -420,6 +420,20 @@ pub(crate) fn workspace_env(
 }
 
 
+/// The names of the custom variables [`workspace_env`] emits for `project`
+/// (global + per-project, trimmed, reserved names skipped): the ones
+/// copy-at-connect treats as credentials.
+pub(crate) fn custom_env_keys(project: &Project, global_custom_env_vars: &[EnvVar]) -> Vec<String> {
+    let mut keys: Vec<String> = merge_custom_env_vars(global_custom_env_vars, &project.custom_env_vars)
+        .iter()
+        .map(|e| e.key.trim().to_string())
+        .filter(|k| !k.is_empty() && !is_reserved_env_key(k))
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
 /// [`workspace_env`] with its inputs resolved from `settings` exactly as
 /// `create_container` resolves them (the CA from disk, the shared Claude
 /// token from the keychain), for a host that does not create a Docker

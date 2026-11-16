@@ -1,0 +1,206 @@
+#!/bin/bash
+# triple-c-apply-connect — the workspace half of copy-at-connect (AWS only;
+# phase 6, ruling Q2).
+#
+# A project whose credentials are "copied when you connect" keeps them out of
+# its Secrets Manager secret: no TRIPLEC_FILES, no API keys, no GIT_TOKEN, no
+# custom variables. Instead, after every connect (a start, an attach, the
+# background re-attach when the app starts) the app, through the agent and as
+# root:
+#   1. runs `triple-c-apply-connect --prepare` (fresh, empty, root-only
+#      staging dirs on the /dev/shm tmpfs — never the disk);
+#   2. uploads the SSH files to /dev/shm/triple-c/connect/ssh/, the CA files to
+#      /dev/shm/triple-c/connect/ca/ (each root 0600) and the credential
+#      environment to /dev/shm/triple-c/connect.env (root 0600, one
+#      `KEY=<base64 of the value>` line per variable);
+#   3. runs `triple-c-apply-connect`, which
+#        - installs the CA (install_corporate_ca, as root: its source and the
+#          system store are root-only paths),
+#        - merges the SSH files into ~/.ssh (merge_host_ssh, **as the user**:
+#          by now the user has been able to plant links in ~/.ssh, so root
+#          does not walk it; Hybrid/EFS's ~/.ssh link is checked the same way
+#          the entrypoint checks it),
+#        - writes the git credential helper when there is a GIT_TOKEN
+#          (install_git_credentials, as the user, the token on stdin),
+#        - leaves /run/triple-c/connected, which the waiting background clone
+#          of a fresh workspace starts on (start_clone_repos), and
+#        - re-clones, in the background and as the user with GIT_TOKEN in that
+#          clone's environment only, the repositories whose clone failed.
+# The same functions the entrypoint runs, from entrypoint-lib.sh. The values
+# are read into this script's own memory and never written anywhere else:
+# connect.env is never sourced into, or exported to, anything but the clone,
+# and the agent's environment (every terminal's) is untouched — the app adds
+# the credential variables to the terminals it opens itself. Nothing here
+# prints a value. Idempotent: run it again and it converges on the same state.
+# Re-cloning does not re-run the setup script.
+set -u
+
+# Fixed paths, never from the environment: this runs as root. (The tests
+# substitute these lines.)
+lib=/usr/local/lib/triple-c/entrypoint-lib.sh
+shm=/dev/shm/triple-c
+stage=/dev/shm/triple-c/connect
+env_file=/dev/shm/triple-c/connect.env
+clone_status=/run/triple-c-clone
+workspace=/workspace
+# How long a retry waits for a clone that started without credentials.
+retry_wait=2400
+# The background re-clone's output goes to the container's log.
+log_to=/proc/1/fd/1
+# Where the SSH files are handed to the user (sticky, world-writable).
+ssh_tmp_dir=/tmp
+
+say() { echo "triple-c-apply-connect: $*"; }
+
+if ! . "$lib"; then
+    say "$lib is missing; nothing applied"
+    exit 1
+fi
+triplec_aws=1
+
+prepare() {
+    umask 077
+    if [ ! -d "$shm" ] || [ -L "$shm" ]; then
+        say "$shm is missing (the workspace has no agent token?); nothing prepared"
+        exit 1
+    fi
+    rm -rf "$stage" "$env_file"
+    mkdir -m 700 "$stage" "$stage/ssh" "$stage/ca" || exit 1
+}
+
+# GIT_TOKEN, decoded from connect.env into this shell only.
+connect_git_token=
+read_git_token() {
+    local key value
+    [ -f "$env_file" ] || return 0
+    while IFS='=' read -r key value; do
+        [ "$key" = GIT_TOKEN ] || continue
+        connect_git_token=$(printf '%s' "$value" | base64 -d 2>/dev/null) || connect_git_token=
+    done < "$env_file"
+}
+
+# The staged SSH files merged as the user: copied to a fresh root-made dir
+# (mktemp in the sticky /tmp, never $TMPDIR: 0700, a new name nobody could
+# have planted), handed to the user, merged by them, removed.
+merge_ssh_as_user() {
+    local tmp rc=0
+    tmp=$(mktemp -d "${ssh_tmp_dir}/triple-c-connect.XXXXXXXX") \
+        || { say "warning — no temporary directory; SSH files not merged"; return 0; }
+    if cp -R "$stage/ssh" "$tmp/ssh"; then
+        if [ -n "${triplec_run_as:-}" ] && [ "$(id -u)" = 0 ]; then
+            chown -R "$triplec_run_as:" "$tmp"
+        fi
+        _triplec_as_user bash -c '. "$1" && triplec_aws=1 && merge_host_ssh "$2"' _ "$lib" "$tmp/ssh" || rc=$?
+        [ "$rc" = 0 ] || say "warning — the SSH merge failed ($rc)"
+    else
+        say "warning — could not stage the SSH files; not merged"
+    fi
+    rm -rf "$tmp"
+}
+
+# Folders whose last recorded clone state is `failed`.
+failed_folders() {
+    [ -f "$clone_status/repos" ] || return 0
+    awk -F'\t' '{ s[$1] = $2 } END { for (f in s) if (s[f] == "failed") print f }' "$clone_status/repos" | sort
+}
+
+# repos.json narrowed to the folders given as arguments.
+repos_for() {
+    python3 -I -c '
+import json, sys
+want = set(sys.argv[1:])
+try:
+    repos = json.load(sys.stdin)
+except ValueError:
+    repos = []
+print(json.dumps([r for r in repos if isinstance(r, dict) and r.get("folder") in want] if isinstance(repos, list) else []))
+' "$@" < "$triplec_run_dir/repos.json"
+}
+
+# $1: `now` (the clone is done and `done` was just removed) or `after-done`
+# (a clone that started without credentials is still running: wait for it).
+start_retry() {
+    local mode="$1" out="$log_to"
+    [ -w "$out" ] || out=/dev/null
+    (
+        trap '' HUP
+        exec 8>"$shm/clone-retry.lock" && flock 8
+        if [ "$mode" = after-done ]; then
+            waited=0
+            while [ ! -e "$clone_status/done" ]; do
+                [ "$waited" -lt "$retry_wait" ] || exit 0
+                sleep 2
+                waited=$((waited + 2))
+            done
+            mapfile -t folders < <(failed_folders)
+            [ "${#folders[@]}" -gt 0 ] || exit 0
+            rm -f "$clone_status/done"
+        else
+            mapfile -t folders < <(failed_folders)
+        fi
+        # From here the clone is running again; `done` however it ends.
+        trap ': > "$clone_status/done"' EXIT
+        rm -f "$clone_status/no-credentials"
+        [ "${#folders[@]}" -gt 0 ] || exit 0
+        echo "triple-c-apply-connect: cloning again with the project's credentials: ${folders[*]}"
+        json=$(repos_for "${folders[@]}")
+        if [ -n "$connect_git_token" ]; then
+            export GIT_TOKEN="$connect_git_token"
+        fi
+        clone_repos "$json" "$workspace" "$clone_status"
+    ) >>"$out" 2>&1 </dev/null &
+}
+
+# Only clones that failed, and only once whatever clone is running is done.
+retry_failed_clones() {
+    [ -d "$clone_status" ] && [ -s "$triplec_run_dir/repos.json" ] || return 0
+    if [ -e "$clone_status/done" ]; then
+        [ -n "$(failed_folders)" ] || return 0
+        # Before returning, so a status read never sees the old failure as
+        # final: the clone is running again from now.
+        rm -f "$clone_status/done"
+        start_retry now
+    elif [ -e "$clone_status/no-credentials" ]; then
+        start_retry after-done
+    fi
+    # Otherwise the first clone is still waiting for this connect (it starts
+    # now, with the credentials) or already cloning with them.
+}
+
+apply() {
+    umask 077
+    if [ ! -d "$stage" ] || [ -L "$stage" ]; then
+        say "$stage is missing; run --prepare and upload first"
+        exit 1
+    fi
+    exec 9>"$shm/apply-connect.lock" && flock -w 120 9 \
+        || say "warning — another apply is still running; going ahead"
+    # Empty staging dirs: nothing of that kind is configured.
+    rmdir "$stage/ca" "$stage/ssh" 2>/dev/null
+
+    CA_SRC="$stage/ca"
+    install_corporate_ca
+
+    if [ -d "$stage/ssh" ]; then
+        merge_ssh_as_user
+    fi
+
+    read_git_token
+    if [ -n "$connect_git_token" ]; then
+        printf '%s' "$connect_git_token" \
+            | _triplec_as_user bash -c '. "$1" && install_git_credentials "$(cat)"' _ "$lib" \
+            || say "warning — could not write the git credential helper"
+    fi
+
+    if mkdir -p "$triplec_run_dir" && : > "$triplec_run_dir/connected"; then :; else
+        say "warning — could not record the connect in $triplec_run_dir"
+    fi
+    retry_failed_clones
+    say "credentials applied"
+}
+
+case "${1:-}" in
+    --prepare) prepare ;;
+    '') apply ;;
+    *) say "usage: triple-c-apply-connect [--prepare]"; exit 2 ;;
+esac

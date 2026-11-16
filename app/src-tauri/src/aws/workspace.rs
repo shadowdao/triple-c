@@ -47,7 +47,7 @@ use super::tofu_modules::{
     user_file_system_token, user_role_names, workspace_access_point_root,
 };
 use crate::host::ssm::AGENT_PORT;
-use crate::models::project::{validate_aws_workspace, Arch, RepoSource, StorageMode};
+use crate::models::project::{validate_aws_workspace, Arch, RepoSource, SecretsDelivery, StorageMode};
 use crate::models::Project;
 
 pub const TAG_OWNER: &str = "triple-c:owner";
@@ -80,6 +80,9 @@ const KEY_IDLE: &str = "TRIPLEC_IDLE_STOP_MINUTES";
 const KEY_STORAGE: &str = "TRIPLEC_STORAGE";
 const KEY_SETUP_SCRIPT: &str = "TRIPLEC_SETUP_SCRIPT";
 const KEY_MAX_LIFETIME: &str = "TRIPLEC_MAX_LIFETIME_MINUTES";
+/// `connect` when the credentials are copied in at connect (Q2) and so are
+/// not in the secret; absent otherwise.
+const KEY_CREDENTIALS: &str = "TRIPLEC_CREDENTIALS";
 /// Seconds ECS waits after SIGTERM before SIGKILL (Fargate allows 2–120).
 pub const STOP_TIMEOUT_SECS: i32 = 120;
 
@@ -119,8 +122,9 @@ fn is_env_name(key: &str) -> bool {
 }
 
 /// `ssh/<file>` or `ca/<file>`, the file name non-empty, without `/`, and
-/// not `.` or `..` (R1: the entrypoint writes it under `/tmp/.host-*/`).
-fn validate_file_key(key: &str) -> Result<(), String> {
+/// not `.` or `..` (R1: the entrypoint writes it under `/tmp/.host-*/`;
+/// copy-at-connect uploads it under `/dev/shm/triple-c/connect/*/`).
+pub(crate) fn validate_file_key(key: &str) -> Result<(), String> {
     let file = key
         .strip_prefix("ssh/")
         .or_else(|| key.strip_prefix("ca/"))
@@ -142,6 +146,29 @@ pub struct PayloadExtras<'a> {
     pub setup_script: Option<&'a str>,
     /// The environment's cap (`max_workspace_hours`), in hours; 0 = none.
     pub max_workspace_hours: u32,
+    /// Copy-at-connect (Q2): the names of the project's custom environment
+    /// variables. With it, the credentials ([`is_credential_key`]) and
+    /// `TRIPLEC_FILES` stay out of the secret and `TRIPLEC_CREDENTIALS` is
+    /// `connect`; the app copies them in after each connect instead.
+    /// `None`: everything is in the secret (Secrets Manager delivery).
+    pub connect_only: Option<&'a [String]>,
+}
+
+/// A credential, for copy-at-connect: an API key or token Triple-C manages
+/// (`SECRET_ENV_KEYS`, `GIT_TOKEN` included) or any custom variable — a
+/// custom value may be a key, and nothing tells which.
+pub fn is_credential_key(key: &str, custom_keys: &[String]) -> bool {
+    crate::docker::container::SECRET_ENV_KEYS.contains(&key) || custom_keys.iter().any(|c| c == key)
+}
+
+/// The credential pairs of `env_pairs` ([`is_credential_key`]), in order:
+/// what copy-at-connect copies in and adds to the terminals' environment.
+pub fn credential_pairs(env_pairs: &[(String, String)], custom_keys: &[String]) -> Vec<(String, String)> {
+    env_pairs
+        .iter()
+        .filter(|(k, _)| is_credential_key(k, custom_keys))
+        .cloned()
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -164,6 +191,7 @@ fn payload_map(
         KEY_STORAGE,
         KEY_SETUP_SCRIPT,
         KEY_MAX_LIFETIME,
+        KEY_CREDENTIALS,
     ];
     let mut m = BTreeMap::new();
     for (k, v) in env_pairs {
@@ -184,6 +212,10 @@ fn payload_map(
             log::warn!("Ignoring the environment variable {k}: Triple-C sets it on AWS");
             continue;
         }
+        // Copy-at-connect: copied in after each connect, never stored.
+        if extras.connect_only.is_some_and(|custom| is_credential_key(k, custom)) {
+            continue;
+        }
         m.insert(k.clone(), v.clone());
     }
     let b64 = base64::engine::general_purpose::STANDARD;
@@ -193,7 +225,18 @@ fn payload_map(
         file_map.insert(k.clone(), b64.encode(bytes));
     }
     m.insert(KEY_AGENT_TOKEN.into(), agent_token.into());
-    m.insert(KEY_FILES.into(), json(&file_map));
+    // The agent token stays either way: it is how the app reaches the task.
+    if extras.connect_only.is_some() {
+        // The SSH keys and CA files arrive with the connect too.
+        m.insert(KEY_CREDENTIALS.into(), "connect".into());
+    } else {
+        m.insert(KEY_FILES.into(), json(&file_map));
+    }
+    // Ruling R1 (Task 8): the LLM gateway sidecar starts before any connect,
+    // so its `TRIPLEC_GATEWAY_*` keys are added as payload keys here and stay
+    // in the secret even under copy-at-connect (the UI says so). They are
+    // payload keys, not env pairs, so the credential filter above never
+    // touches them.
     m.insert(KEY_REPOS.into(), json(&repos));
     m.insert(KEY_WIP_PUSH.into(), if wip { "1" } else { "0" }.into());
     if let Some(minutes) = idle {
@@ -279,8 +322,10 @@ fn serialize_payload(m: &BTreeMap<String, String>) -> Result<String, String> {
     Ok(json)
 }
 
-/// The project secret's JSON (P1, R1): every env pair, then the payload's own
-/// keys (`TRIPLEC_AGENT_TOKEN`, `TRIPLEC_FILES` = `{"ssh/<f>"|"ca/<f>": base64}`,
+/// The project secret's JSON (P1, R1): every env pair (under copy-at-connect,
+/// every one but the credentials), then the payload's own keys
+/// (`TRIPLEC_AGENT_TOKEN`, `TRIPLEC_FILES` = `{"ssh/<f>"|"ca/<f>": base64}`
+/// — or, under copy-at-connect, `TRIPLEC_CREDENTIALS` = `connect` instead —
 /// `TRIPLEC_REPOS`, `TRIPLEC_WIP_PUSH` = `1`/`0`, `TRIPLEC_IDLE_STOP_MINUTES`
 /// when on, `TRIPLEC_STORAGE` = `ephemeral`/`hybrid`/`efs`,
 /// `TRIPLEC_SETUP_SCRIPT` when set, `TRIPLEC_MAX_LIFETIME_MINUTES` when the
@@ -701,6 +746,7 @@ pub struct PreparedWorkspace {
 /// Make the project's secret, access points (Hybrid, EFS) and task definition
 /// ready. Everything that can be checked locally — placement, sizes, the
 /// payload's size and names — is checked before the first write.
+#[allow(clippy::too_many_arguments)]
 pub async fn prepare_workspace<W: WorkspaceApi>(
     api: &W,
     who: &CallerIdentity,
@@ -708,6 +754,7 @@ pub async fn prepare_workspace<W: WorkspaceApi>(
     project: &Project,
     env_pairs: &[(String, String)],
     files: &[(String, Vec<u8>)],
+    custom_env_keys: &[String],
     image: &str,
 ) -> Result<PreparedWorkspace, AwsError> {
     let (Some(placement), Some(cfg)) = (project.aws_placement.as_ref(), project.aws.as_ref())
@@ -751,6 +798,8 @@ pub async fn prepare_workspace<W: WorkspaceApi>(
         PayloadExtras {
             setup_script: cfg.setup_script.as_deref(),
             max_workspace_hours: env.max_workspace_hours,
+            connect_only: (cfg.secrets_delivery == SecretsDelivery::CopyAtConnect)
+                .then_some(custom_env_keys),
         },
     )
     .map_err(other)?;

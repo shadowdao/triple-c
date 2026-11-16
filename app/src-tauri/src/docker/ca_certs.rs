@@ -108,7 +108,8 @@ fn sha256_hex(input: &str) -> String {
 /// loops that walk the store, and leading dots are stripped so a hidden file
 /// does not stay hidden.
 ///
-/// `entrypoint.sh` reimplements exactly this in a few lines of shell (it has to
+/// `entrypoint-lib.sh` (`ca_normalise_name`, sourced by `entrypoint.sh`)
+/// reimplements exactly this in a few lines of shell (it has to
 /// rename the files inside the container); the two must agree, which is what
 /// the unit tests below pin down.
 pub fn container_cert_name(file_name: &str) -> String {

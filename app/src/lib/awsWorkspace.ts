@@ -139,6 +139,18 @@ export function hasWorkspaceFiles(p: Pick<Project, "aws">): boolean {
 /** Shown with EFS storage selected. */
 export const EFS_HINT = "Everything in /workspace survives a stop; git and builds are slower over NFS";
 
+/** Copy-at-connect (phase 6 Q2): what it means, in HostSection. */
+export const COPY_AT_CONNECT_HINT =
+  "API keys, the Git token, custom environment variables and the SSH and CA files are not stored in AWS: Triple-C copies them into the running workspace each time it connects.";
+export const COPY_AT_CONNECT_WARNINGS = [
+  "Private repositories clone after you connect.",
+  "Scheduled jobs can't use these credentials while the app is closed.",
+];
+export const COPY_AT_CONNECT_GATEWAY_NOTE =
+  "The LLM gateway's keys are still stored in AWS: the gateway starts before Triple-C connects.";
+export const SECRETS_MANAGER_HINT =
+  "API keys, the Git token, custom environment variables and the SSH and CA files are kept in the project's Secrets Manager secret, so the workspace has them from the moment it starts.";
+
 /** Hosts that only mean something on this machine or its Docker bridge. */
 const LOCAL_HOSTS = /^(localhost|127(\.\d{1,3}){3}|0\.0\.0\.0|\[?::1\]?|host\.docker\.internal|172\.17\.0\.1)$/i;
 

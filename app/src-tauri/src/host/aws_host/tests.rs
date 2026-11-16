@@ -258,6 +258,7 @@ fn inputs<'a>(
         who,
         env_pairs: &[],
         files: &[],
+        custom_env_keys: &[],
         image: REGISTRY_IMAGE,
         wait: WaitTiming {
             interval: Duration::from_millis(1),
@@ -922,5 +923,174 @@ fn a_stopped_aws_project_is_reconciled_only_when_it_still_has_a_task_arn() {
         p.status = s;
         p.aws.as_mut().unwrap().task_arn = None;
         assert!(needs_aws_reconcile(&p));
+    }
+}
+
+// ──────────────────────────────────────────── copy-at-connect (Q2)
+
+mod copy_at_connect {
+    use super::*;
+    use crate::host::aws_host::connect::*;
+    use crate::models::project::SecretsDelivery;
+    use crate::models::EnvVar;
+
+    fn connect_project(delivery: SecretsDelivery) -> Project {
+        let mut p = aws_project(StorageMode::Hybrid);
+        p.aws.as_mut().unwrap().secrets_delivery = delivery;
+        p
+    }
+
+    /// `(dir, name, data, mode)`.
+    type Upload = (String, String, Vec<u8>, u32);
+
+    #[derive(Default)]
+    struct FakeTarget {
+        calls: Mutex<Vec<String>>,
+        uploads: Mutex<Vec<Upload>>,
+        apply_result: Mutex<Option<(String, i64)>>,
+    }
+
+    impl ConnectTarget for FakeTarget {
+        async fn exec_root(&self, cmd: Vec<String>) -> Result<(String, i64), String> {
+            self.calls.lock().unwrap().push(format!("exec {}", cmd.join(" ")));
+            if cmd.len() == 1 {
+                if let Some(r) = self.apply_result.lock().unwrap().clone() {
+                    return Ok(r);
+                }
+            }
+            Ok(("triple-c-apply-connect: credentials applied\n".into(), 0))
+        }
+        async fn upload_root(&self, dir: &str, name: &str, data: &[u8], mode: u32) -> Result<(), String> {
+            self.calls.lock().unwrap().push(format!("upload {dir}/{name}"));
+            self.uploads.lock().unwrap().push((dir.into(), name.into(), data.to_vec(), mode));
+            Ok(())
+        }
+    }
+
+    fn bundle() -> ConnectBundle {
+        ConnectBundle {
+            files: vec![
+                ("ssh/id_ed25519".into(), b"PRIVATE".to_vec()),
+                ("ca/corp.crt".into(), b"PEM".to_vec()),
+            ],
+            env: vec![
+                ("GIT_TOKEN".into(), "ghp_x".into()),
+                ("MULTI".into(), "a=b\nc".into()),
+            ],
+        }
+    }
+
+    #[tokio::test]
+    async fn a_push_prepares_uploads_root_only_then_applies() {
+        let t = FakeTarget::default();
+        push_connect_bundle(&t, &bundle()).await.unwrap();
+        assert_eq!(
+            *t.calls.lock().unwrap(),
+            vec![
+                "exec /usr/local/bin/triple-c-apply-connect --prepare",
+                "upload /dev/shm/triple-c/connect/ssh/id_ed25519",
+                "upload /dev/shm/triple-c/connect/ca/corp.crt",
+                "upload /dev/shm/triple-c/connect.env",
+                "exec /usr/local/bin/triple-c-apply-connect",
+            ]
+        );
+        let uploads = t.uploads.lock().unwrap();
+        assert!(uploads.iter().all(|u| u.3 == 0o600), "every staged file is 0600");
+        assert_eq!(uploads[0].2, b"PRIVATE");
+        // KEY=<base64> lines: a newline or `=` in a value reads back whole.
+        assert_eq!(
+            String::from_utf8(uploads[2].2.clone()).unwrap(),
+            "GIT_TOKEN=Z2hwX3g=\nMULTI=YT1iCmM=\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_apply_reports_its_output_and_an_old_image_says_so() {
+        let t = FakeTarget::default();
+        *t.apply_result.lock().unwrap() = Some(("line\ntriple-c-apply-connect: /x is missing\n".into(), 1));
+        let e = push_connect_bundle(&t, &bundle()).await.unwrap_err();
+        assert!(e.contains("failed (1)") && e.contains("/x is missing"), "{e}");
+        assert!(!e.contains("ghp_x"));
+
+        let t = FakeTarget::default();
+        *t.apply_result.lock().unwrap() = Some(("not found".into(), 127));
+        let e = push_connect_bundle(&t, &bundle()).await.unwrap_err();
+        assert!(e.contains("predates copying credentials"), "{e}");
+
+        // A bad file key is refused before anything is uploaded under it.
+        let t = FakeTarget::default();
+        let bad = ConnectBundle { files: vec![("ssh/../x".into(), vec![])], env: vec![] };
+        assert!(push_connect_bundle(&t, &bad).await.is_err());
+        assert!(t.uploads.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_bundle_never_shows_its_values() {
+        let shown = format!("{:?}", bundle());
+        assert!(shown.contains("GIT_TOKEN") && shown.contains("ssh/id_ed25519"), "{shown}");
+        assert!(!shown.contains("ghp_x") && !shown.contains("PRIVATE"), "{shown}");
+    }
+
+    #[test]
+    fn the_bundle_is_the_ssh_and_ca_files_and_the_credential_variables() {
+        let base = tempfile::tempdir().unwrap();
+        let ssh = base.path().join("ssh");
+        std::fs::create_dir(&ssh).unwrap();
+        std::fs::write(ssh.join("id_ed25519"), b"KEY").unwrap();
+        let mut p = connect_project(SecretsDelivery::CopyAtConnect);
+        p.ssh_key_path = Some(ssh.to_str().unwrap().into());
+        p.git_token = Some("ghp_tok".into());
+        p.custom_env_vars = vec![EnvVar { key: "MY_KEY".into(), value: "v1".into() }];
+        let settings = AppSettings {
+            global_custom_env_vars: vec![EnvVar { key: "GLOBAL_KEY".into(), value: "g".into() }],
+            ..Default::default()
+        };
+        let b = connect_credentials(&p, &settings).unwrap();
+        assert_eq!(b.files, vec![("ssh/id_ed25519".to_string(), b"KEY".to_vec())]);
+        let env: HashMap<_, _> = b.env.iter().cloned().collect();
+        assert_eq!(env["GIT_TOKEN"], "ghp_tok");
+        assert_eq!(env["MY_KEY"], "v1");
+        assert_eq!(env["GLOBAL_KEY"], "g");
+        assert!(!env.contains_key("TZ") && !env.contains_key("CLAUDE_CODE_SETTINGS_JSON"));
+        assert!(b.env.iter().all(|(k, _)| crate::aws::workspace::is_credential_key(
+            k,
+            &["MY_KEY".to_string(), "GLOBAL_KEY".to_string()]
+        )));
+    }
+
+    #[test]
+    fn a_copy_at_connect_terminal_carries_the_credentials_and_a_secrets_manager_one_does_not() {
+        let creds = || Ok(bundle());
+        let p = connect_project(SecretsDelivery::CopyAtConnect);
+        let spec = crate::host::sessions::session_spec(
+            vec!["bash".into(), "-l".into()],
+            true,
+            terminal_env_with(&p, creds),
+        );
+        assert_eq!(spec.env, vec!["GIT_TOKEN=ghp_x".to_string(), "MULTI=a=b\nc".to_string()]);
+        assert!(spec.tty && spec.user == "claude");
+        assert_eq!(spec.working_dir.as_deref(), Some("/workspace"));
+
+        let p = connect_project(SecretsDelivery::SecretsManager);
+        let env = terminal_env_with(&p, || panic!("not gathered for Secrets Manager"));
+        assert!(crate::host::sessions::session_spec(vec!["bash".into()], true, env).env.is_empty());
+
+        // A local project never; a failure opens the terminal without them.
+        let mut local = connect_project(SecretsDelivery::CopyAtConnect);
+        local.host_id = None;
+        assert!(terminal_env_with(&local, || panic!("local")).is_empty());
+        let p = connect_project(SecretsDelivery::CopyAtConnect);
+        assert!(terminal_env_with(&p, || Err("no CA file".into())).is_empty());
+    }
+
+    #[test]
+    fn only_a_connected_copy_at_connect_project_gets_a_push() {
+        let p = connect_project(SecretsDelivery::SecretsManager);
+        assert!(!copies_at_connect(&p));
+        assert!(!spawn_connect_push(&p, &AppSettings::default(), |_| panic!("no push")));
+        let p = connect_project(SecretsDelivery::CopyAtConnect);
+        assert!(copies_at_connect(&p));
+        // No tunnel registered for it: nothing to push to.
+        assert!(!spawn_connect_push(&p, &AppSettings::default(), |_| panic!("no tunnel")));
     }
 }

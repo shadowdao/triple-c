@@ -3,6 +3,10 @@ import type { AwsWorkspaceConfig, HostConnection, Project, RepoSource } from "..
 import * as commands from "../../../../lib/tauri-commands";
 import { useAppState } from "../../../../store/appState";
 import {
+  COPY_AT_CONNECT_GATEWAY_NOTE,
+  COPY_AT_CONNECT_HINT,
+  COPY_AT_CONNECT_WARNINGS,
+  SECRETS_MANAGER_HINT,
   EFS_HINT,
   EPHEMERAL_WARNING,
   FARGATE_CPUS,
@@ -338,6 +342,39 @@ export default function HostSection({ project, save, disabled }: Props) {
           />
         }
       />
+
+      <div>
+        <span className="block text-[13px] font-medium text-[var(--text-primary)] mb-1">
+          Credentials
+        </span>
+        <SegmentedControl
+          label="Credentials"
+          value={aws.secrets_delivery}
+          disabled={disabled}
+          onChange={(secrets_delivery) => void saveAws({ secrets_delivery })}
+          segments={[
+            { value: "secrets_manager", label: "Stored in AWS (Secrets Manager)" },
+            { value: "copy_at_connect", label: "Copied when you connect" },
+          ]}
+        />
+        {aws.secrets_delivery === "copy_at_connect" ? (
+          <>
+            <p className="mt-1 text-xs text-[var(--text-secondary)]">{COPY_AT_CONNECT_HINT}</p>
+            <ul
+              role="note"
+              aria-label="Copied when you connect"
+              className="mt-2 px-2 py-1.5 text-xs text-[var(--warning)] bg-[var(--warning-muted)] border border-[var(--warning)]/30 rounded-[var(--radius-control)] list-disc list-inside"
+            >
+              {COPY_AT_CONNECT_WARNINGS.map((w) => (
+                <li key={w}>{w}</li>
+              ))}
+              {aws.gateway_sidecar && <li>{COPY_AT_CONNECT_GATEWAY_NOTE}</li>}
+            </ul>
+          </>
+        ) : (
+          <p className="mt-1 text-xs text-[var(--text-secondary)]">{SECRETS_MANAGER_HINT}</p>
+        )}
+      </div>
 
       <div className="pt-2 border-t border-[var(--border-color)]">
         <span className="block text-[13px] font-medium text-[var(--text-primary)]">

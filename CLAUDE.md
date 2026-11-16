@@ -445,6 +445,19 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   `triple-c-wip-push` (dry run: `"cloning": true`). The stop trap is set before any background work
   starts. An idle stop exits 75 (`aws::tasks::IDLE_EXIT_CODE`) so the death watch can tell it
   from a crash (`classify_stop` → the `ContainerExited` toast).
+  **Copy-at-connect** (`secrets_delivery: copy_at_connect`, Q2): the secret keeps settings, repos and
+  the agent token but no `TRIPLEC_FILES` and no credential pairs (`SECRET_ENV_KEYS` + every custom
+  variable; `TRIPLEC_CREDENTIALS=connect` instead — the gateway sidecar's `TRIPLEC_GATEWAY_*` keys
+  stay, R1). After every connect (start, attach, background re-attach) `aws_host::connect`
+  uploads the files and `connect.env` (`KEY=<base64>` lines) as root into `/dev/shm/triple-c`
+  (root 0700 tmpfs) and runs `triple-c-apply-connect`: CA install as root, SSH merge and git
+  credential helper **as `claude`** (root never walks a live `~/.ssh`), `/run/triple-c/connected`,
+  then a background re-clone of `failed` repos only (GIT_TOKEN in that clone's env only). The
+  first clone waits up to 5 min for `connected` (`aws_wait_connect`). Terminals the app opens add
+  the pairs to their own `ExecSpec.env` (`aws_host::terminal_env`); nothing reaches the agent's
+  snapshot, so cron/scheduled jobs never get them. A failed push is a `workspace-warning`.
+  The functions both scripts use live in `container/entrypoint-lib.sh`
+  (`/usr/local/lib/triple-c/`), sourced by the entrypoint first; it only defines things.
   **The `TRIPLEC_` env prefix is reserved** on both hosts (`RESERVED_ENV_PREFIXES`; `workspace.rs`
   drops custom variables in it): the entrypoint's settings live there.
 - **Browser runtime libraries are baked in; browser *binaries* are not.** A layer runs
@@ -466,7 +479,7 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
     approach converges on the worst state: a 400 MB browser present with its libraries gone.
   - The layer sits immediately after Node (npx is its only prerequisite) and well above the shim
     `COPY`s, so editing a shim does not re-run a multi-hundred-megabyte apt install.
-- **`entrypoint.sh`** — UID/GID remapping to match host user, SSH key setup (`sync_host_ssh` *merges* the host dir into `~/.ssh`; never wipe it — container-made keys live there on the home volume), git config, docker socket permissions, Claude Code settings.json injection, then stays resident **as root** waiting on a root-owned
+- **`entrypoint.sh`** (+ `entrypoint-lib.sh`, the CA/SSH/git-credential/clone functions it sources) — UID/GID remapping to match host user, SSH key setup (`sync_host_ssh` *merges* the host dir into `~/.ssh`; never wipe it — container-made keys live there on the home volume), git config, docker socket permissions, Claude Code settings.json injection, then stays resident **as root** waiting on a root-owned
   `triple-c-keepalive` sleep (respawned if killed; SIGTERM trap so `docker stop` is immediate).
   **Never hand the container's lifetime to a process the `claude` user owns** — it used to end in
   `exec su … claude -c "exec sleep infinity"`, and any `pkill sleep` / `kill -9 -1` a Claude

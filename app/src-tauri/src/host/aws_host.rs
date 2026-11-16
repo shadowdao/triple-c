@@ -81,7 +81,9 @@ const WATCH_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// reported as failed; the SDK's own bound is per call.
 const STOP_TIMEOUT: Duration = Duration::from_secs(45);
 
+pub mod connect;
 pub mod status;
+pub use connect::{spawn_connect_push, terminal_env};
 pub use status::{spawn_follow, workspace_status, WorkspaceStatus};
 
 fn s<E: std::fmt::Display>(e: E) -> String {
@@ -348,6 +350,8 @@ pub struct StartInputs<'a> {
     pub who: &'a CallerIdentity,
     pub env_pairs: &'a [(String, String)],
     pub files: &'a [(String, Vec<u8>)],
+    /// The custom variables' names: credentials under copy-at-connect.
+    pub custom_env_keys: &'a [String],
     pub image: &'a str,
     pub wait: WaitTiming,
     pub access_point_wait: PollTiming,
@@ -465,6 +469,7 @@ pub async fn start_core<T: TaskApi, W: WorkspaceApi, R: RuntimeApi, C: Connector
             project,
             inp.env_pairs,
             inp.files,
+            inp.custom_env_keys,
             inp.image,
         )
         .await
@@ -603,6 +608,8 @@ pub async fn ensure_started(
         .as_deref()
         .or(settings.default_ssh_key_path.as_deref());
     let files = workspace_files(ssh, ca.as_ref())?;
+    let custom_env_keys =
+        crate::docker::workspace_env::custom_env_keys(project, &settings.global_custom_env_vars);
 
     let (connection_id, region, sdk) = project_sdk(project, settings).await?;
     let who = caller_identity(&sdk).await.map_err(s)?;
@@ -617,6 +624,7 @@ pub async fn ensure_started(
             who: &who,
             env_pairs: &env_pairs,
             files: &files,
+            custom_env_keys: &custom_env_keys,
             image: &image,
             wait: WaitTiming::default(),
             access_point_wait: PollTiming::default(),
@@ -1018,8 +1026,15 @@ pub async fn reconcile_project<T: TaskApi>(
 
 /// `reconcile_project_statuses` for an AWS project: decide, and when the
 /// task is live re-open its tunnel in the background (terminals wait for
-/// it through [`tunnels::wait_endpoint`]). Never blocks on the tunnel.
-pub async fn reconcile(project: &Project, settings: &AppSettings, store: Arc<ProjectsStore>) {
+/// it through [`tunnels::wait_endpoint`]), then — copy-at-connect — copy the
+/// credentials in, calling `on_connect_warning` if that fails. Never blocks
+/// on the tunnel.
+pub async fn reconcile(
+    project: &Project,
+    settings: &AppSettings,
+    store: Arc<ProjectsStore>,
+    on_connect_warning: impl FnOnce(String) + Send + 'static,
+) {
     let (connection_id, region, sdk) = match project_sdk(project, settings).await {
         Ok(v) => v,
         Err(e) => {
@@ -1039,12 +1054,24 @@ pub async fn reconcile(project: &Project, settings: &AppSettings, store: Arc<Pro
     match reconcile_project(&api, &store, project, &find).await {
         Ok(Reconciled::Live(task)) => {
             let generation = tunnels::begin_reattach(&project.id);
-            let project = project.clone();
+            let (project, settings) = (project.clone(), settings.clone());
             tauri::async_runtime::spawn(async move {
                 let ctx = Reattach { generation, connection_id, region, sdk, who };
-                if let Err(e) = reattach(&project, *task, ctx, &store).await {
-                    log::warn!("Project {}: could not re-open the tunnel to its task: {e}", project.id);
-                    tunnels::end_reattach(&project.id, generation);
+                match reattach(&project, *task, ctx, &store).await {
+                    // Re-attached: a connect like any other (Q2).
+                    Ok(true) => {
+                        if let Err(e) = connect::apply_connect(&project, &settings).await {
+                            log::warn!("Project {}: could not copy the credentials in: {e}", project.id);
+                            if tunnels::get_endpoint(&project.id).is_some() {
+                                on_connect_warning(e);
+                            }
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        log::warn!("Project {}: could not re-open the tunnel to its task: {e}", project.id);
+                        tunnels::end_reattach(&project.id, generation);
+                    }
                 }
             });
         }
@@ -1073,13 +1100,14 @@ pub fn reattach_still_wanted(store: &ProjectsStore, project_id: &str, task_arn: 
     })
 }
 
-/// Re-open the tunnel to a live task found at startup.
+/// Re-open the tunnel to a live task found at startup. `Ok(true)` once it
+/// is registered; `Ok(false)` when it was no longer wanted.
 async fn reattach(
     project: &Project,
     task: TaskInfo,
     ctx: Reattach,
     store: &ProjectsStore,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let placement = project.aws_placement.as_ref().ok_or("no placement")?;
     let ok = owner_key(&ctx.region, &ctx.who.user_id);
     let rt = SdkRuntimeApi::new(&ctx.sdk);
@@ -1114,7 +1142,7 @@ async fn reattach(
         tunnel.forward.close().await;
         tunnels::end_reattach(&project.id, ctx.generation);
         log::info!("Project {}: stopped or removed while re-attaching; tunnel closed", project.id);
-        return Ok(());
+        return Ok(false);
     }
     match tunnels::register_if_current(&project.id, ctx.generation, tunnel) {
         Ok(old) => {
@@ -1125,13 +1153,13 @@ async fn reattach(
         Err(tunnel) => {
             tunnel.forward.close().await;
             log::info!("Project {}: stopped or removed while re-attaching; tunnel closed", project.id);
-            return Ok(());
+            return Ok(false);
         }
     }
     // The local port is new, so the stored target id is too.
     store.set_container_id(&project.id, Some(endpoint.base_url.to_string()))?;
     log::info!("Project {}: tunnel to task {} re-opened", project.id, task.arn);
-    Ok(())
+    Ok(true)
 }
 
 // ─────────────────────────────────────────────────────────────── watch

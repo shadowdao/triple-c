@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
+import { cleanup, render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import RuntimeSection from "./RuntimeSection";
 import AccessSection from "./AccessSection";
 import WorkspaceSection from "./WorkspaceSection";
@@ -148,6 +148,36 @@ describe("HostSection", () => {
     expect(
       screen.getByText("Everything in /workspace survives a stop; git and builds are slower over NFS"),
     ).toBeInTheDocument();
+  });
+
+  it("chooses where the credentials live and warns what copy-at-connect means", async () => {
+    const p = awsProject();
+    renderHost(p);
+    expect(screen.getByRole("radio", { name: "Stored in AWS (Secrets Manager)" })).toBeChecked();
+    expect(screen.getByText(/kept in the project's Secrets Manager secret/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("radio", { name: "Copied when you connect" }));
+    await waitFor(() => expect(save).toHaveBeenCalled());
+    expect(save.mock.calls[0][0].aws.secrets_delivery).toBe("copy_at_connect");
+    cleanup();
+
+    p.aws = { ...p.aws!, secrets_delivery: "copy_at_connect", gateway_sidecar: false };
+    renderHost(p);
+    const note = screen.getByRole("note", { name: "Copied when you connect" });
+    expect(note).toHaveTextContent("Private repositories clone after you connect.");
+    expect(note).toHaveTextContent("Scheduled jobs can't use these credentials while the app is closed.");
+    expect(note).not.toHaveTextContent(/gateway/);
+    cleanup();
+
+    p.aws = { ...p.aws!, gateway_sidecar: true };
+    renderHost(p);
+    expect(screen.getByRole("note", { name: "Copied when you connect" })).toHaveTextContent(
+      "The LLM gateway's keys are still stored in AWS",
+    );
+  });
+
+  it("does not let the credentials setting change while the workspace runs", () => {
+    renderHost(awsProject(), true);
+    expect(screen.getByRole("radio", { name: "Copied when you connect" })).toBeDisabled();
   });
 
   it("says /workspace files stay on their access point after switching away from EFS", () => {
