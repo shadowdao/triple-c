@@ -13,6 +13,7 @@ const ENTRYPOINT: &str = include_str!("../../../../container/entrypoint.sh");
 const WIP_PUSH: &str = include_str!("../../../../container/triple-c-wip-push");
 const IDLE_WATCH: &str = include_str!("../../../../container/triple-c-idle-watch");
 const SCHEDULER: &str = include_str!("../../../../container/triple-c-scheduler");
+const WORKSPACE_STATUS: &str = include_str!("../../../../container/triple-c-workspace-status");
 
 fn block<'a>(text: &'a str, name: &str) -> &'a str {
     let start = text
@@ -101,7 +102,8 @@ fn files_script(tmp: &Path) -> String {
         "{blocks}\n{agent}\n\
          env -0 > \"$1/env\"\n\
          printf '%s\\0' \"${{agent_env[@]}}\" > \"$1/agent_env\"\n\
-         printf '%s' \"${{triplec_repos_json:-}}\" > \"$1/repos\"\n"
+         printf '%s' \"${{triplec_repos_json:-}}\" > \"$1/repos\"\n\
+         printf '%s' \"${{triplec_setup_script:-}}\" > \"$1/setup\"\n"
     )
 }
 
@@ -129,6 +131,7 @@ fn aws_files_decode_to_the_host_dirs_mode_600_and_leave_the_environment() {
             ("TRIPLEC_HOST", "aws"),
             ("TRIPLEC_FILES", &files),
             ("TRIPLEC_REPOS", repos),
+            ("TRIPLEC_SETUP_SCRIPT", "echo SETUP-BODY"),
             ("TRIPLEC_AGENT_TOKEN", "test-token-not-real"),
         ],
         &[],
@@ -178,6 +181,10 @@ fn aws_files_decode_to_the_host_dirs_mode_600_and_leave_the_environment() {
     assert!(!agent_env.contains(&b64("PRIVATE-KEY-BODY")));
     // The repo list survives as an unexported shell variable for clone_repos.
     assert_eq!(fs::read_to_string(tmp.path().join("repos")).unwrap(), repos);
+    // So does the setup script, for aws_prepare_run to write to its file.
+    assert!(!env.contains("TRIPLEC_SETUP_SCRIPT=") && !env.contains("SETUP-BODY"), "{env}");
+    assert!(!agent_env.contains("TRIPLEC_SETUP_SCRIPT") && !agent_env.contains("SETUP-BODY"));
+    assert_eq!(fs::read_to_string(tmp.path().join("setup")).unwrap(), "echo SETUP-BODY");
 }
 
 #[test]
@@ -610,6 +617,8 @@ fn wip_push_with_clone_dir(ws: &Path, args: &[&str], clone_dir: &Path) -> Output
         .args(args)
         .env("TRIPLEC_WORKSPACE_ROOT", ws)
         .env("TRIPLEC_CLONE_STATUS_DIR", clone_dir)
+        .env("TRIPLEC_RUN_ID_FILE", tmp.join("no-run-id"))
+        .env("TRIPLEC_WIP_LAST_DIR", tmp.join("no-wip-last"))
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("HOME", tmp)
         .output()
@@ -1204,7 +1213,7 @@ fn idle_watch_goes_back_to_watching_when_someone_comes_back_during_the_push() {
 
 #[test]
 fn idle_watch_keeps_a_stop_guard_marker_already_recorded() {
-    for marker in ["pushed", "discard"] {
+    for marker in ["pushed", "discard", "lifetime"] {
         let w = Watch::new();
         fs::write(w.tmp.path().join("reason"), format!("{marker}\n")).unwrap();
         let (url, mut agent) = fake_agent(w.tmp.path(), OLD_ACTIVITY);
@@ -1252,6 +1261,14 @@ fn aws_stop_pushes_on_sigterm_once_and_leaves_an_idle_stop_to_the_watcher() {
     assert!(!log.exists(), "no second push after the watcher's");
     assert!(text(&out).contains("entrypoint: stopping (idle)"), "{}", text(&out));
     assert!(text(&out).contains("status=75"), "{}", text(&out));
+
+    // A lifetime-cap stop: the watcher already tried its push; exit 76.
+    fs::write(&reason, "lifetime\n").unwrap();
+    let out = bash(&idle_script, &[], &[("TRIPLEC_HOST", "aws"), ("TRIPLEC_WIP_PUSH", "1")], &[]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(!log.exists(), "no second push after the watcher's");
+    assert!(text(&out).contains("entrypoint: stopping (lifetime)"), "{}", text(&out));
+    assert!(text(&out).contains("status=76"), "{}", text(&out));
     fs::remove_file(&reason).unwrap();
 
     let out = bash(&script, &[], &[("TRIPLEC_HOST", "aws"), ("TRIPLEC_WIP_PUSH", "0")], &[]);
@@ -1294,9 +1311,17 @@ fn the_idle_exit_status_is_the_one_the_app_reads() {
             .contains(&format!("triplec_idle_exit={}\n", crate::aws::tasks::IDLE_EXIT_CODE)),
         "entrypoint.sh and aws::tasks::IDLE_EXIT_CODE disagree"
     );
+    assert!(
+        block(ENTRYPOINT, "aws_stop")
+            .contains(&format!("triplec_lifetime_exit={}\n", crate::aws::tasks::LIFETIME_EXIT_CODE)),
+        "entrypoint.sh and aws::tasks::LIFETIME_EXIT_CODE disagree"
+    );
     assert!(ENTRYPOINT.contains("exit \"${triplec_exit_status:-0}\""), "stop_keepalive exits with it");
     // The watcher gets the WIP setting through its scrubbed environment.
     assert!(block(ENTRYPOINT, "aws_stop").contains("TRIPLEC_WIP_PUSH=\"${TRIPLEC_WIP_PUSH:-0}\""));
+    assert!(block(ENTRYPOINT, "aws_stop")
+        .contains("TRIPLEC_MAX_LIFETIME_MINUTES=\"${TRIPLEC_MAX_LIFETIME_MINUTES:-}\""));
+    assert!(IDLE_WATCH.contains("printf 'lifetime\\n' > \"$reason_file\""));
 }
 
 #[test]
@@ -1306,7 +1331,7 @@ fn start_clone_repos_marks_done_however_the_clone_ends() {
     // clone_repos replaced by one that fails half-way.
     let script = format!(
         "{}\nclone_repos() {{ exit 3; }}\nstart_clone_repos '[x]' \"$1\"\nwait\n",
-        aws_blocks(&["aws_env", "aws_repos"])
+        aws_run_blocks(tmp.path(), &["aws_env", "aws_run", "aws_repos"])
     );
     let out = bash(&script, &[&status], &[], &[]);
     assert!(out.status.success(), "{}", text(&out));
@@ -1317,13 +1342,13 @@ fn start_clone_repos_marks_done_however_the_clone_ends() {
 fn docker_mode_never_reaches_the_aws_blocks() {
     // Every new step sits behind TRIPLEC_HOST=aws; the scripts are only
     // started from those branches.
-    for name in ["aws_env", "aws_home", "aws_repos", "aws_stop"] {
+    for name in ["aws_env", "aws_run", "aws_home", "aws_repos", "aws_stop"] {
         let b = block(ENTRYPOINT, name);
         assert!(b.contains("aws"), "{name}");
     }
     let outside: String = {
         let mut s = ENTRYPOINT.to_string();
-        for name in ["aws_env", "aws_home", "aws_repos", "aws_stop"] {
+        for name in ["aws_env", "aws_run", "aws_home", "aws_repos", "aws_stop"] {
             s = s.replace(block(ENTRYPOINT, name), "");
         }
         s
@@ -1338,6 +1363,9 @@ fn docker_mode_never_reaches_the_aws_blocks() {
         "aws_before_stop",
         "start_idle_watch",
         "aws_efs_workspace_check",
+        "aws_prepare_run",
+        "aws_run_setup",
+        "triple-c-workspace-status",
     ];
     let guarded = |s: &str| s.contains("\"$triplec_aws\" = 1");
     let mut seen = 0;
@@ -1354,8 +1382,9 @@ fn docker_mode_never_reaches_the_aws_blocks() {
         );
     }
     assert_eq!(
-        seen, 6,
-        "the call sites: Hybrid/EFS link, EFS /workspace check, Hybrid ~/.ssh, clone, idle watch, stop"
+        seen, 7,
+        "the call sites: run record + setup file, Hybrid/EFS link, EFS /workspace check, Hybrid ~/.ssh, \
+         clone (+ setup), idle watch, stop"
     );
     // Clones start in the background *after* the agent: the app gives a
     // starting task's agent only seconds to answer.
@@ -1378,4 +1407,453 @@ fn docker_mode_never_reaches_the_aws_blocks() {
     // environment snapshot is taken.
     assert!(ENTRYPOINT.find("unset TRIPLEC_FILES").unwrap() < ENTRYPOINT.find("# >>> agent_token").unwrap());
     assert!(ENTRYPOINT.find("unset TRIPLEC_REPOS").unwrap() < ENTRYPOINT.find("# >>> agent_token").unwrap());
+    assert!(
+        ENTRYPOINT.find("unset TRIPLEC_SETUP_SCRIPT").unwrap() < ENTRYPOINT.find("# >>> agent_token").unwrap()
+    );
+    // The setup runs in the clone's background chain, never in the agent's way.
+    assert!(block(ENTRYPOINT, "aws_repos").contains("aws_run_setup"));
+}
+
+// ------------------------------------------- run record and setup script
+
+/// The named blocks with the run and setup dirs moved into `tmp` (`run`,
+/// `setup`) and the container user switched off.
+fn aws_run_blocks(tmp: &Path, names: &[&str]) -> String {
+    aws_blocks(names)
+        .replace(
+            "triplec_run_dir=/run/triple-c\n",
+            &format!("triplec_run_dir='{}'\n", tmp.join("run").display()),
+        )
+        .replace(
+            "triplec_setup_dir=/run/triple-c-setup\n",
+            &format!("triplec_setup_dir='{}'\n", tmp.join("setup").display()),
+        )
+}
+
+/// A one-shot fake ECS task metadata endpoint answering `/task` with `body`.
+fn fake_metadata(body: &str) -> (String, std::process::Child) {
+    let server = r#"
+import http.server, sys, socketserver
+body = sys.argv[1].encode()
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200 if self.path == "/v4/x/task" else 404)
+        self.end_headers()
+        if self.path == "/v4/x/task": self.wfile.write(body)
+    def log_message(self, *a): pass
+s = socketserver.TCPServer(("127.0.0.1", 0), H)
+print(s.server_address[1], flush=True)
+s.serve_forever()
+"#;
+    let mut child = Command::new("python3")
+        .arg("-I")
+        .arg("-c")
+        .arg(server)
+        .arg(body)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    use std::io::BufRead;
+    std::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
+    (format!("http://127.0.0.1:{}/v4/x", line.trim()), child)
+}
+
+fn is_run_id(s: &str, suffix: &str) -> bool {
+    let b = s.as_bytes();
+    s.len() == 16 + suffix.len()
+        && b[8] == b'-'
+        && b[15] == b'-'
+        && s[..8].chars().chain(s[9..15].chars()).all(|c| c.is_ascii_digit())
+        && &s[16..] == suffix
+}
+
+#[test]
+fn aws_prepare_run_records_the_run_and_writes_the_setup_script() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = format!(
+        "{}\ntriplec_setup_script=\"$SETUP\"\naws_prepare_run\n",
+        aws_run_blocks(tmp.path(), &["aws_env", "aws_run"])
+    );
+    let before = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let out = bash(&script, &[], &[("SETUP", "echo hi\n")], &["ECS_CONTAINER_METADATA_URI_V4", "TRIPLEC_HOST"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let run = tmp.path().join("run");
+    let setup = tmp.path().join("setup");
+    let id = fs::read_to_string(run.join("run-id")).unwrap();
+    assert!(is_run_id(id.trim_end(), "local"), "{id:?}");
+    let epoch: u64 = fs::read_to_string(run.join("start-epoch")).unwrap().trim().parse().unwrap();
+    assert!(epoch >= before && epoch <= before + 5);
+    assert_eq!(mode(&run), 0o711, "claude may read the run id, not list the dir");
+    assert_eq!(mode(&run.join("run-id")), 0o644);
+    assert_eq!(mode(&run.join("wip-last")), 0o700);
+    assert_eq!(mode(&setup), 0o755);
+    assert_eq!(fs::read_to_string(setup.join("script")).unwrap(), "echo hi\n");
+    assert_eq!(mode(&setup.join("script")), 0o644);
+    assert_eq!(fs::read_to_string(setup.join("status")).unwrap(), "running\n");
+    assert_eq!(fs::read_to_string(setup.join("log")).unwrap(), "");
+
+    // No script: nothing for the setup to run, no status (state `none`).
+    let out = bash(&script, &[], &[("SETUP", "")], &["ECS_CONTAINER_METADATA_URI_V4"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(setup.is_dir() && !setup.join("script").exists() && !setup.join("status").exists());
+
+    // On ECS the run id carries the task id's first 8 characters.
+    let (url, mut meta) = fake_metadata(
+        r#"{"TaskARN":"arn:aws:ecs:eu-west-1:123456789012:task/triple-c/0123abcd4567ef890123abcd4567ef89"}"#,
+    );
+    let out = bash(&script, &[], &[("SETUP", ""), ("ECS_CONTAINER_METADATA_URI_V4", &url)], &[]);
+    meta.kill().ok();
+    assert!(out.status.success(), "{}", text(&out));
+    let id = fs::read_to_string(run.join("run-id")).unwrap();
+    assert!(is_run_id(id.trim_end(), "0123abcd"), "{id:?}");
+    // An answer that is not a task id, or none at all, falls back to `local`.
+    let (bad_url, mut bad_meta) = fake_metadata(r#"{"TaskARN":"arn:aws:ecs:x:1:task/c/a-b"}"#);
+    for uri in [bad_url.as_str(), "http://127.0.0.1:9/v4"] {
+        let out = bash(&script, &[], &[("SETUP", ""), ("ECS_CONTAINER_METADATA_URI_V4", uri)], &[]);
+        assert!(out.status.success(), "{}", text(&out));
+        let id = fs::read_to_string(run.join("run-id")).unwrap();
+        assert!(is_run_id(id.trim_end(), "local"), "{uri}: {id:?}");
+    }
+    bad_meta.kill().ok();
+}
+
+/// Runs `start_clone_repos` with `setup_script` (and a clone that takes a
+/// moment), as the entrypoint would; `_triplec_as_user` records its argv.
+fn run_setup(tmp: &Path, setup_script: &str, timeout: &str) -> Output {
+    let blocks = aws_run_blocks(tmp, &["aws_env", "aws_run", "aws_repos"])
+        .replace("triplec_setup_timeout=1800\n", &format!("triplec_setup_timeout={timeout}\n"));
+    let script = format!(
+        "{blocks}\n\
+         _triplec_as_user() {{ printf '%s\\n' \"$*\" >> \"$CALLS\"; \"$@\"; }}\n\
+         clone_repos() {{ sleep 1; echo cloned > \"$3/marker\"; }}\n\
+         triplec_setup_script=\"$SETUP\"\n\
+         aws_prepare_run\n\
+         start_clone_repos '[]' \"$STATUS\"\n\
+         wait\n"
+    );
+    bash(
+        &script,
+        &[],
+        &[
+            ("SETUP", setup_script),
+            ("CALLS", tmp.join("calls").to_str().unwrap()),
+            ("STATUS", tmp.join("clone").to_str().unwrap()),
+        ],
+        &["ECS_CONTAINER_METADATA_URI_V4"],
+    )
+}
+
+#[test]
+fn the_setup_script_runs_after_the_clone_as_the_user_with_no_stdin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let clone = tmp.path().join("clone");
+    let body = format!(
+        "echo started\nreadlink /proc/self/fd/0\n\
+         if [ -e '{c}/done' ] && [ -e '{c}/marker' ]; then echo clone-was-done; fi\n",
+        c = clone.display()
+    );
+    let out = run_setup(tmp.path(), &body, "1800");
+    assert!(out.status.success(), "{}", text(&out));
+    let setup = tmp.path().join("setup");
+    let log = fs::read_to_string(setup.join("log")).unwrap();
+    assert_eq!(log, "started\n/dev/null\nclone-was-done\n");
+    assert_eq!(fs::read_to_string(setup.join("status")).unwrap(), "ok\n");
+    let calls = fs::read_to_string(tmp.path().join("calls")).unwrap();
+    assert_eq!(
+        calls,
+        format!("timeout -k 10 1800 bash -e {}/script\n", setup.display()),
+        "as the user, bounded, under bash -e"
+    );
+    assert!(text(&out).contains("entrypoint: setup script ok"), "{}", text(&out));
+}
+
+#[test]
+fn the_setup_script_fails_under_bash_e_and_a_hang_is_killed_as_failed_124() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = run_setup(tmp.path(), "echo one\nfalse\necho never\n", "1800");
+    assert!(out.status.success(), "a failed setup never fails the start: {}", text(&out));
+    let setup = tmp.path().join("setup");
+    assert_eq!(fs::read_to_string(setup.join("status")).unwrap(), "failed 1\n");
+    assert_eq!(fs::read_to_string(setup.join("log")).unwrap(), "one\n");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let started = std::time::Instant::now();
+    let out = run_setup(tmp.path(), "echo waiting\nsleep 60\n", "1");
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(started.elapsed() < std::time::Duration::from_secs(20), "the hang was killed");
+    let setup = tmp.path().join("setup");
+    assert_eq!(fs::read_to_string(setup.join("status")).unwrap(), "failed 124\n");
+}
+
+#[test]
+fn no_setup_script_means_no_setup_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = run_setup(tmp.path(), "", "1800");
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(!tmp.path().join("calls").exists(), "nothing ran as the user");
+    assert!(!tmp.path().join("setup/status").exists());
+    // The clone status is still made, and ends `done`, with no repos at all.
+    assert!(tmp.path().join("clone/done").exists());
+}
+
+#[test]
+fn idle_watch_check_counts_a_running_setup_as_busy() {
+    let w = Watch::new();
+    let (url, mut agent) = fake_agent(w.tmp.path(), OLD_ACTIVITY);
+    let setup = w.tmp.path().join("setup");
+    fs::create_dir_all(&setup).unwrap();
+    fs::write(setup.join("status"), "running\n").unwrap();
+    let check = || w.cmd(&url, 0).env("TRIPLEC_SETUP_STATUS_DIR", &setup).arg("--check").output().unwrap();
+    let busy = check();
+    fs::write(setup.join("status"), "failed 124\n").unwrap();
+    let failed = check();
+    fs::write(setup.join("status"), "ok\n").unwrap();
+    let ok = check();
+    agent.kill().ok();
+    assert_eq!(busy.status.code(), Some(1), "{}", text(&busy));
+    assert_eq!(failed.status.code(), Some(0), "{}", text(&failed));
+    assert_eq!(ok.status.code(), Some(0), "{}", text(&ok));
+}
+
+// ----------------------------------------------------------- lifetime cap
+
+impl Watch {
+    /// A watcher for the lifetime cap alone (no idle stop), its run started
+    /// `age_secs` ago.
+    fn lifetime_cmd(&self, signal_pid: u32, minutes: &str, age_secs: u64) -> Command {
+        let p = self.tmp.path();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        fs::write(p.join("start-epoch"), format!("{}\n", now - age_secs)).unwrap();
+        // An agent that never answers: the idle check alone would never stop it.
+        let mut c = self.cmd("http://127.0.0.1:9", signal_pid);
+        c.env_remove("TRIPLEC_IDLE_STOP_MINUTES")
+            .env("TRIPLEC_MAX_LIFETIME_MINUTES", minutes)
+            .env("TRIPLEC_START_EPOCH_FILE", p.join("start-epoch"));
+        c
+    }
+}
+
+#[test]
+fn lifetime_cap_pushes_then_stops_with_its_marker_even_when_the_push_fails() {
+    let w = Watch::new();
+    w.dirty();
+    fs::write(w.tmp.path().join("push_rc"), "1").unwrap();
+    let mut target = fake_entrypoint(w.tmp.path());
+    let mut cmd = w.lifetime_cmd(target.id(), "1", 61);
+    cmd.env("TRIPLEC_WIP_PUSH", "1");
+    let out = run_watch_for(cmd, 20).expect("it stops at the cap");
+    target.wait().unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(w.pushes(), "--reason lifetime\n", "one push, best effort");
+    assert!(text(&out).contains("stopping anyway"), "{}", text(&out));
+    assert_eq!(fs::read_to_string(w.tmp.path().join("got")).unwrap().trim(), "term");
+    assert_eq!(fs::read_to_string(w.tmp.path().join("reason")).unwrap().trim(), "lifetime");
+}
+
+#[test]
+fn lifetime_cap_with_the_wip_push_off_stops_without_pushing() {
+    let w = Watch::new();
+    w.dirty();
+    let mut target = fake_entrypoint(w.tmp.path());
+    let mut cmd = w.lifetime_cmd(target.id(), "1", 120);
+    cmd.env("TRIPLEC_WIP_PUSH", "0");
+    let out = run_watch_for(cmd, 20).expect("it stops at the cap");
+    target.wait().unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(w.pushes(), "");
+    assert_eq!(fs::read_to_string(w.tmp.path().join("reason")).unwrap().trim(), "lifetime");
+}
+
+#[test]
+fn lifetime_cap_not_reached_keeps_the_workspace_up() {
+    let w = Watch::new();
+    let mut target = fake_entrypoint(w.tmp.path());
+    let ran = run_watch_for(w.lifetime_cmd(target.id(), "60", 30), 3);
+    target.kill().ok();
+    target.wait().ok();
+    assert!(ran.is_none(), "{:?}", ran.map(|o| text(&o)));
+    assert!(!w.tmp.path().join("got").exists());
+    // Neither an idle stop nor a cap: nothing to watch, refused.
+    let none = w.cmd("http://127.0.0.1:9", target.id()).env_remove("TRIPLEC_IDLE_STOP_MINUTES").output().unwrap();
+    assert_eq!(none.status.code(), Some(2), "{}", text(&none));
+    let zero = w.lifetime_cmd(target.id(), "0", 30).output().unwrap();
+    assert_eq!(zero.status.code(), Some(2), "0 is no cap: {}", text(&zero));
+}
+
+#[test]
+fn lifetime_cap_leaves_a_stop_guard_decision_alone() {
+    for marker in ["pushed", "discard"] {
+        let w = Watch::new();
+        w.dirty();
+        fs::write(w.tmp.path().join("reason"), format!("{marker}\n")).unwrap();
+        let mut target = fake_entrypoint(w.tmp.path());
+        let mut cmd = w.lifetime_cmd(target.id(), "1", 120);
+        cmd.env("TRIPLEC_WIP_PUSH", "1");
+        let out = run_watch_for(cmd, 20).expect("it signals");
+        target.wait().unwrap();
+        assert!(out.status.success(), "{}", text(&out));
+        assert_eq!(w.pushes(), "", "{marker}: the app already decided");
+        assert_eq!(fs::read_to_string(w.tmp.path().join("reason")).unwrap().trim(), marker);
+    }
+}
+
+// ------------------------------------------------------- WIP branch per run
+
+fn wip_push_in_run(ws: &Path, run_id: Option<&str>) -> Output {
+    let tmp = ws.parent().unwrap();
+    let run = tmp.join("run");
+    fs::create_dir_all(run.join("wip-last")).unwrap();
+    match run_id {
+        Some(id) => fs::write(run.join("run-id"), format!("{id}\n")).unwrap(),
+        None => {
+            let _ = fs::remove_file(run.join("run-id"));
+        }
+    }
+    let script = write_script(tmp, "triple-c-wip-push", WIP_PUSH);
+    Command::new("bash")
+        .arg(script)
+        .args(["--reason", "lifetime"])
+        .env("TRIPLEC_WORKSPACE_ROOT", ws)
+        .env("TRIPLEC_CLONE_STATUS_DIR", tmp.join("no-clone-status"))
+        .env("TRIPLEC_RUN_ID_FILE", run.join("run-id"))
+        .env("TRIPLEC_WIP_LAST_DIR", run.join("wip-last"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("HOME", tmp)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn wip_pushes_in_one_run_update_one_branch_and_skip_an_unchanged_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (ws, repo, remote) = workspace_with_clone(tmp.path());
+    let run_id = "20261115-093000-0123abcd";
+    fs::write(repo.join("a.txt"), "one").unwrap();
+    let out = wip_push_in_run(&ws, Some(run_id));
+    assert!(out.status.success(), "{}", text(&out));
+    let branch = format!("refs/heads/triple-c/wip/{run_id}");
+    assert_eq!(wip_refs(&remote), [branch.clone()]);
+    let first = git(&remote, &["rev-parse", &branch]);
+    assert_eq!(git(&remote, &["show", &format!("{branch}:a.txt")]), "one");
+    let last = tmp.path().join("run/wip-last/proj");
+    assert_eq!(
+        fs::read_to_string(&last).unwrap(),
+        format!("{} origin\n", git(&remote, &["rev-parse", &format!("{branch}^{{tree}}")]))
+    );
+
+    // Nothing changed: skipped, the branch stays where it was.
+    let out = wip_push_in_run(&ws, Some(run_id));
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("unchanged since the last push"), "{}", text(&out));
+    assert_eq!(git(&remote, &["rev-parse", &branch]), first);
+
+    // A change: the same branch moves (forced — the WIP commit is not a
+    // descendant of the last one), still one branch for the run.
+    fs::write(repo.join("a.txt"), "two").unwrap();
+    let out = wip_push_in_run(&ws, Some(run_id));
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(wip_refs(&remote), [branch.clone()]);
+    assert_ne!(git(&remote, &["rev-parse", &branch]), first);
+    assert_eq!(git(&remote, &["show", &format!("{branch}:a.txt")]), "two");
+    assert_eq!(git(&remote, &["log", "-1", "--format=%s", &branch]).contains("(lifetime)"), true);
+
+    // A failed push records nothing, so the next one tries again.
+    fs::write(repo.join("a.txt"), "three").unwrap();
+    let before = fs::read_to_string(&last).unwrap();
+    let saved = tmp.path().join("origin.git.away");
+    fs::rename(&remote, &saved).unwrap();
+    let out = wip_push_in_run(&ws, Some(run_id));
+    assert!(!out.status.success(), "{}", text(&out));
+    assert_eq!(fs::read_to_string(&last).unwrap(), before);
+    fs::rename(&saved, &remote).unwrap();
+    let out = wip_push_in_run(&ws, Some(run_id));
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(git(&remote, &["show", &format!("{branch}:a.txt")]), "three");
+}
+
+#[test]
+fn wip_push_without_a_usable_run_id_keeps_the_per_push_stamp() {
+    for run_id in [None, Some("../../evil"), Some("not a run id")] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (ws, repo, remote) = workspace_with_clone(tmp.path());
+        fs::write(repo.join("a.txt"), "one").unwrap();
+        let out = wip_push_in_run(&ws, run_id);
+        assert!(out.status.success(), "{}", text(&out));
+        let refs = wip_refs(&remote);
+        assert_eq!(refs.len(), 1, "{refs:?}");
+        let name = refs[0].trim_start_matches("refs/heads/triple-c/wip/");
+        assert!(name.len() == 15 && name.as_bytes()[8] == b'-', "{run_id:?}: {name}");
+    }
+}
+
+// ------------------------------------------------------- workspace status
+
+fn workspace_status(clone: &Path, setup: &Path) -> serde_json::Value {
+    let tmp = clone.parent().unwrap();
+    let script = write_script(tmp, "triple-c-workspace-status", WORKSPACE_STATUS);
+    let out = Command::new("python3")
+        .arg("-I")
+        .arg(script)
+        .env("TRIPLEC_CLONE_STATUS_DIR", clone)
+        .env("TRIPLEC_SETUP_STATUS_DIR", setup)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(stdout.lines().count(), 1, "one JSON object on one line: {stdout}");
+    serde_json::from_str(&stdout).unwrap()
+}
+
+#[test]
+fn workspace_status_reports_clone_and_setup_and_survives_missing_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let clone = tmp.path().join("clone");
+    let setup = tmp.path().join("setup");
+    // Nothing yet: the clone has not started, no setup.
+    assert_eq!(
+        workspace_status(&clone, &setup),
+        serde_json::json!({"clone": {"done": false, "repos": []},
+                           "setup": {"state": "none", "code": null, "tail": []}})
+    );
+
+    fs::create_dir_all(&clone).unwrap();
+    fs::write(clone.join("repos"), "api\tcloning\napi\tcloned\nweb\tcloning\n").unwrap();
+    fs::create_dir_all(&setup).unwrap();
+    fs::write(setup.join("status"), "running\n").unwrap();
+    let v = workspace_status(&clone, &setup);
+    assert_eq!(
+        v["clone"],
+        serde_json::json!({"done": false, "repos": [
+            {"folder": "api", "state": "cloned"}, {"folder": "web", "state": "cloning"}]})
+    );
+    assert_eq!(v["setup"], serde_json::json!({"state": "running", "code": null, "tail": []}));
+
+    fs::write(clone.join("repos"), "api\tcloning\napi\tcloned\nweb\tcloning\nweb\tfailed\n").unwrap();
+    fs::write(clone.join("done"), "").unwrap();
+    let lines: String = (1..=25).map(|i| format!("line {i}\n")).collect();
+    fs::write(setup.join("log"), format!("{lines}partial \u{e9}\u{ff}")).unwrap();
+    fs::write(setup.join("status"), "ok\n").unwrap();
+    let v = workspace_status(&clone, &setup);
+    assert_eq!(v["clone"]["done"], true);
+    assert_eq!(v["clone"]["repos"][1], serde_json::json!({"folder": "web", "state": "failed"}));
+    assert_eq!(v["setup"]["state"], "ok");
+    assert_eq!(v["setup"]["code"], 0);
+    let tail: Vec<String> =
+        v["setup"]["tail"].as_array().unwrap().iter().map(|l| l.as_str().unwrap().to_string()).collect();
+    assert_eq!(tail.len(), 20);
+    assert_eq!(tail[0], "line 7");
+    assert!(tail[19].starts_with("partial \u{e9}"), "{:?}", tail[19]);
+
+    fs::write(setup.join("status"), "failed 124\n").unwrap();
+    let v = workspace_status(&clone, &setup);
+    assert_eq!((v["setup"]["state"].as_str(), v["setup"]["code"].as_i64()), (Some("failed"), Some(124)));
+    // Garbled status: a failure with no code, never a crash.
+    fs::write(setup.join("status"), "what\n").unwrap();
+    let v = workspace_status(&clone, &setup);
+    assert_eq!(v["setup"], serde_json::json!({"state": "failed", "code": null, "tail": v["setup"]["tail"]}));
+    // An unreadable log is an empty tail.
+    fs::remove_file(setup.join("log")).unwrap();
+    fs::create_dir(setup.join("log")).unwrap();
+    assert_eq!(workspace_status(&clone, &setup)["setup"]["tail"], serde_json::json!([]));
 }

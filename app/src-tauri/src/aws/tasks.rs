@@ -483,6 +483,11 @@ async fn stopped_error<A: TaskApi>(api: &A, logs: &TaskLogs, t: &TaskInfo) -> Aw
 /// so an idle stop (`EssentialContainerExited`) is not mistaken for a crash.
 pub const IDLE_EXIT_CODE: i32 = 75;
 
+/// The entrypoint's exit status after the environment's lifetime cap stopped
+/// the workspace (`TRIPLEC_MAX_LIFETIME_MINUTES`, enforced by the in-container
+/// idle watcher — advisory, see the phase 6 constraints, Q8).
+pub const LIFETIME_EXIT_CODE: i32 = 76;
+
 /// Why a task stopped, as the app reports it (spec, "Lifecycle and status").
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StopKind {
@@ -491,6 +496,8 @@ pub enum StopKind {
     Exited(Option<String>),
     /// The workspace's own idle stop ([`IDLE_EXIT_CODE`]).
     Idle,
+    /// The environment's maximum workspace lifetime ([`LIFETIME_EXIT_CODE`]).
+    LifetimeCap,
     /// A Fargate Spot interruption (P8).
     Spot,
     /// Never got going: the project goes to Error with this reason.
@@ -510,6 +517,9 @@ pub fn classify_stop(info: &TaskInfo) -> StopKind {
         ),
         Some("UserInitiated") => StopKind::UserInitiated,
         Some("EssentialContainerExited") if info.exit_code == Some(IDLE_EXIT_CODE) => StopKind::Idle,
+        Some("EssentialContainerExited") if info.exit_code == Some(LIFETIME_EXIT_CODE) => {
+            StopKind::LifetimeCap
+        }
         _ => StopKind::Exited(info.stopped_reason.clone().filter(|r| !r.trim().is_empty())),
     }
 }

@@ -19,6 +19,7 @@ const TRIPLE_C_OPEN: &str = include_str!("../../../../container/triple-c-open");
 const PLAYWRIGHT_HEAL: &str = include_str!("../../../../container/triple-c-playwright-heal");
 const WIP_PUSH: &str = include_str!("../../../../container/triple-c-wip-push");
 const IDLE_WATCH: &str = include_str!("../../../../container/triple-c-idle-watch");
+const WORKSPACE_STATUS: &str = include_str!("../../../../container/triple-c-workspace-status");
 
 static MISSION_CONTROL_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/../../container/mission-control");
 static SKILLS_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/../../container/skills");
@@ -249,6 +250,12 @@ fn create_build_context() -> Result<Vec<u8>, std::io::Error> {
         append_file_to_archive(&mut archive, "triple-c-playwright-heal", PLAYWRIGHT_HEAL.as_bytes(), 0o755)?;
         append_file_to_archive(&mut archive, "triple-c-wip-push", WIP_PUSH.as_bytes(), 0o755)?;
         append_file_to_archive(&mut archive, "triple-c-idle-watch", IDLE_WATCH.as_bytes(), 0o755)?;
+        append_file_to_archive(
+            &mut archive,
+            "triple-c-workspace-status",
+            WORKSPACE_STATUS.as_bytes(),
+            0o755,
+        )?;
 
         append_embedded_dir(&mut archive, &MISSION_CONTROL_DIR, "mission-control")?;
         append_embedded_dir(&mut archive, &SKILLS_DIR, "skills")?;

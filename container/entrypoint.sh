@@ -22,11 +22,14 @@
 #                   Docker bind mounts use, so the SSH merge and the CA install
 #                   below run unchanged;
 #   TRIPLEC_REPOS   [{"url","branch"|null,"folder"}] — cloned by clone_repos
-#                   once git credentials and ~/.ssh are in place.
-# Both are unset here, *before* the agent-token block below snapshots the
+#                   once git credentials and ~/.ssh are in place;
+#   TRIPLEC_SETUP_SCRIPT  the project's setup script (≤ 32 KiB), written to
+#                   /run/triple-c-setup/script by aws_prepare_run and run as
+#                   `claude` after the clone (aws_run_setup).
+# All three are unset here, *before* the agent-token block below snapshots the
 # environment for the agent: that snapshot is every terminal's environment on
-# AWS, and the files hold private keys. The repo list is kept only as an
-# unexported shell variable, which no child process inherits.
+# AWS, and the files hold private keys. The repo list and the setup script are
+# kept only as unexported shell variables, which no child process inherits.
 #
 # Nothing in this block (or any other aws block) runs without TRIPLEC_HOST=aws;
 # a Docker container sees the same script it always did.
@@ -34,6 +37,7 @@
 triplec_aws=0
 triplec_run_as=claude
 triplec_repos_json=
+triplec_setup_script=
 # Where Hybrid storage mounts the project's EFS access point.
 triplec_home_mnt=/mnt/triple-c-home
 
@@ -112,8 +116,105 @@ if [ "${TRIPLEC_HOST:-}" = aws ]; then
     fi
     triplec_repos_json="${TRIPLEC_REPOS:-}"
     unset TRIPLEC_REPOS
+    triplec_setup_script="${TRIPLEC_SETUP_SCRIPT:-}"
+    unset TRIPLEC_SETUP_SCRIPT
 fi
 # <<< aws_env
+
+# ── AWS: this run's record, and the setup script's files ───────────────────
+# aws_prepare_run, as root at the very start of an AWS task:
+#   /run/triple-c            root, 0711 — users may open a file they know the
+#                            name of, never list it (the stop marker in it is
+#                            0600; the stop guard and the idle watcher keep the
+#                            mode);
+#   /run/triple-c/run-id     `<UTC yyyymmdd-HHMMSS>-<task id, first 8>` (task id
+#                            from the ECS task metadata, else `local`), 0644 —
+#                            triple-c-wip-push names this run's one WIP branch
+#                            after it (triple-c/wip/<run-id>);
+#   /run/triple-c/start-epoch  the start in Unix seconds, for the idle watcher's
+#                            lifetime cap (TRIPLEC_MAX_LIFETIME_MINUTES);
+#   /run/triple-c/wip-last   0700, owned by `claude`: triple-c-wip-push (run as
+#                            claude) records there the tree it last pushed per
+#                            folder and skips an unchanged one. Root makes it
+#                            and never looks inside;
+#   /run/triple-c-setup      root, 0755: `script` (0644) when the project has a
+#                            setup script, `log` (0644; root opens it and hands
+#                            the script the descriptor, so the user never needs
+#                            write access to anything here and root never opens
+#                            a path the user controls) and `status` — `running`
+#                            from now until the script ends (waiting for the
+#                            clone included), then `ok` or `failed <code>`. No
+#                            status file: no setup script.
+# aws_run_setup runs the script as `claude`, `bash -e`, stdin /dev/null, cwd
+# /workspace, under `timeout -k 10 1800`, chained after the background clone
+# (start_clone_repos) so the agent's start is never held up. A failure is
+# recorded, never fatal. triple-c-workspace-status reads all of this back.
+# >>> aws_run
+triplec_run_dir=/run/triple-c
+triplec_setup_dir=/run/triple-c-setup
+triplec_setup_timeout=1800
+
+# The first 8 characters of this task's id, from the ECS task metadata
+# endpoint ECS sets for every container; `local` without one or on any doubt.
+aws_task_id8() {
+    local uri="${ECS_CONTAINER_METADATA_URI_V4:-}" arn id
+    if [ -n "$uri" ]; then
+        arn=$(curl -sf --max-time 3 "$uri/task" 2>/dev/null | jq -r '.TaskARN // empty' 2>/dev/null)
+        id=${arn##*/}
+        case "$id" in
+            ''|*[!A-Za-z0-9]*) ;;
+            *) [ "${#id}" -ge 8 ] && { printf '%s\n' "${id:0:8}"; return; } ;;
+        esac
+    fi
+    echo local
+}
+
+aws_prepare_run() {
+    local now root=0
+    [ "$(id -u)" = 0 ] && root=1
+    now=$(date +%s)
+    if mkdir -p "$triplec_run_dir"; then
+        [ "$root" = 1 ] && chown root:root "$triplec_run_dir"
+        chmod 711 "$triplec_run_dir"
+        printf '%s-%s\n' "$(date -u -d "@$now" +%Y%m%d-%H%M%S)" "$(aws_task_id8)" > "$triplec_run_dir/run-id"
+        chmod 644 "$triplec_run_dir/run-id"
+        printf '%s\n' "$now" > "$triplec_run_dir/start-epoch"
+        rm -rf "$triplec_run_dir/wip-last"
+        if mkdir -m 700 "$triplec_run_dir/wip-last" && [ -n "${triplec_run_as:-}" ]; then
+            chown "$triplec_run_as:" "$triplec_run_dir/wip-last"
+        fi
+    else
+        echo "entrypoint: warning — could not create $triplec_run_dir"
+    fi
+    rm -rf "$triplec_setup_dir"
+    mkdir -m 755 "$triplec_setup_dir" || { echo "entrypoint: warning — could not create $triplec_setup_dir; no setup"; return 0; }
+    [ "$root" = 1 ] && chown root:root "$triplec_setup_dir"
+    [ -n "$triplec_setup_script" ] || return 0
+    printf '%s' "$triplec_setup_script" > "$triplec_setup_dir/script"
+    chmod 644 "$triplec_setup_dir/script"
+    : > "$triplec_setup_dir/log"
+    chmod 644 "$triplec_setup_dir/log"
+    printf 'running\n' > "$triplec_setup_dir/status"
+    triplec_setup_script=
+}
+
+# Runs the setup script, if there is one (see above). Never fails.
+aws_run_setup() {
+    local dir="$triplec_setup_dir" rc state
+    [ -f "$dir/script" ] || return 0
+    echo "entrypoint: running the setup script..."
+    (
+        cd /workspace 2>/dev/null || cd /
+        _triplec_as_user timeout -k 10 "$triplec_setup_timeout" bash -e "$dir/script"
+    ) </dev/null >>"$dir/log" 2>&1
+    rc=$?
+    if [ "$rc" -eq 0 ]; then state=ok; else state="failed $rc"; fi
+    printf '%s\n' "$state" > "$dir/status.tmp" && mv -f "$dir/status.tmp" "$dir/status"
+    echo "entrypoint: setup script $state"
+    return 0
+}
+# <<< aws_run
+if [ "$triplec_aws" = 1 ]; then aws_prepare_run; fi
 
 # ── triple-c-agent token: off the environment before anything else runs ───
 # The agent (started at the very end, see start_agent) authenticates every
@@ -769,18 +870,22 @@ for i, r in enumerate(repos):
     return 0
 }
 
-# Runs clone_repos in the background, recording progress in $2.
+# Runs clone_repos in the background, recording progress in $2, then the
+# setup script (aws_run, which must see the repositories). The status dir is
+# made even with no repositories, so `done` always ends up there.
 start_clone_repos() {
     local json="$1" status_dir="$2"
-    [ -n "$json" ] || return 0
     rm -rf "$status_dir"
     mkdir -m 755 "$status_dir" || status_dir=""
     (
         trap '' HUP
-        # `done` however the clone ends (an error, a signal), or the idle
-        # watcher would count it as still running forever.
-        [ -z "$status_dir" ] || trap ': > "$status_dir/done"' EXIT
-        clone_repos "$json" /workspace "$status_dir"
+        (
+            # `done` however the clone ends (an error, a signal), or the idle
+            # watcher would count it as still running forever.
+            [ -z "$status_dir" ] || trap ': > "$status_dir/done"' EXIT
+            clone_repos "$json" /workspace "$status_dir"
+        )
+        aws_run_setup
     ) &
 }
 # <<< aws_repos
@@ -1220,19 +1325,21 @@ start_agent() {
 # <<< start_agent
 start_agent
 
-# ── AWS: WIP push on stop, idle auto-stop ───────────────────────────────────
+# ── AWS: WIP push on stop, idle auto-stop, lifetime cap ─────────────────────
 # aws_before_stop runs from the TERM trap below, before the keepalive goes:
-# with TRIPLEC_WIP_PUSH=1 it pushes every repo's unsaved work to a
-# triple-c/wip/<stamp> branch (as `claude`, bounded at 90 s), unless the app's
+# with TRIPLEC_WIP_PUSH=1 it pushes every repo's unsaved work to the run's
+# triple-c/wip/<run-id> branch (as `claude`, bounded at 90 s), unless the app's
 # stop guard recorded `pushed` or `discard` in /run/triple-c/stop-reason
 # (written as root through the agent just before StopTask), or the idle
 # watcher recorded `idle` (it pushes *before* signalling and only signals once
-# nothing unsaved is left, so an idle stop never loses work). ECS gives a task
+# nothing unsaved is left, so an idle stop never loses work) or `lifetime`
+# (it tried its push, best effort, before signalling). ECS gives a task
 # `stopTimeout` seconds between SIGTERM and SIGKILL — 30 by default, 120 at
 # most on Fargate — so the task definition must raise it for the push to
 # finish. Once only: a second TERM during the push changes nothing.
 #
-# The idle watcher (TRIPLEC_IDLE_STOP_MINUTES set) runs as root under a
+# The idle watcher (TRIPLEC_IDLE_STOP_MINUTES and/or a non-zero
+# TRIPLEC_MAX_LIFETIME_MINUTES set) runs as root under a
 # supervisor loop like the agent's, so a claude-user `pkill` cannot switch
 # auto-stop off. When the workspace is idle it records the reason "idle" and
 # sends TERM to *this* script ($$) — not PID 1, which under ECS's
@@ -1240,10 +1347,14 @@ start_agent
 # this same trap and push at most once. An idle stop exits with status 75
 # (triplec_idle_exit; Rust `aws::tasks::IDLE_EXIT_CODE`), so ECS reports it as
 # EssentialContainerExited with that exit code and the app can say "stopped
-# after being idle" rather than "crashed". Its environment is built from
-# scratch: it needs none of the container's but TRIPLEC_WIP_PUSH.
+# after being idle" rather than "crashed". A lifetime-cap stop (the run's
+# start-epoch plus TRIPLEC_MAX_LIFETIME_MINUTES reached; advisory — a user
+# with sudo can switch it off) exits 76 (triplec_lifetime_exit; Rust
+# `aws::tasks::LIFETIME_EXIT_CODE`). Its environment is built from scratch: it
+# needs none of the container's but TRIPLEC_WIP_PUSH and the lifetime cap.
 # >>> aws_stop
 triplec_idle_exit=75
+triplec_lifetime_exit=76
 aws_before_stop() {
     [ "${TRIPLEC_HOST:-}" = aws ] || return 0
     [ -z "${triplec_stopping:-}" ] || return 0
@@ -1255,6 +1366,11 @@ aws_before_stop() {
             # The watcher already pushed (or found nothing to push).
             triplec_exit_status=$triplec_idle_exit
             echo "entrypoint: stopping (idle) — work in progress already handled by the idle watcher"
+            return 0 ;;
+        lifetime)
+            # The watcher tried its push (best effort) before signalling.
+            triplec_exit_status=$triplec_lifetime_exit
+            echo "entrypoint: stopping (lifetime) — the environment's maximum workspace lifetime was reached; work in progress already handled by the idle watcher"
             return 0 ;;
         # The app's stop guard already pushed, or the user chose to stop
         # without pushing: honour that instead of pushing again.
@@ -1272,9 +1388,9 @@ aws_before_stop() {
 
 start_idle_watch() {
     local minutes="$1" signal_pid="$2"
-    mkdir -p /run/triple-c && chmod 700 /run/triple-c
+    mkdir -p /run/triple-c && chmod 711 /run/triple-c
     rm -f /run/triple-c/stop-reason
-    if [ -z "${TRIPLEC_AGENT_TOKEN_FILE:-}" ]; then
+    if [ -n "$minutes" ] && [ -z "${TRIPLEC_AGENT_TOKEN_FILE:-}" ]; then
         echo "triple-c-idle-watch: no agent token, so no activity to read — idle stop will never fire" >&2
     fi
     (
@@ -1286,6 +1402,7 @@ start_idle_watch() {
                 TRIPLEC_IDLE_SIGNAL_PID="$signal_pid" \
                 TRIPLEC_AGENT_TOKEN_FILE="${TRIPLEC_AGENT_TOKEN_FILE:-/dev/shm/triple-c/agent-token}" \
                 TRIPLEC_WIP_PUSH="${TRIPLEC_WIP_PUSH:-0}" \
+                TRIPLEC_MAX_LIFETIME_MINUTES="${TRIPLEC_MAX_LIFETIME_MINUTES:-}" \
                 /usr/local/bin/triple-c-idle-watch
             rc=$?
             # 0: it signalled the stop. 2: misconfigured, and a restart would
@@ -1308,10 +1425,11 @@ stop_keepalive() {
     exit "${triplec_exit_status:-0}"
 }
 trap stop_keepalive TERM INT HUP
-if [ "$triplec_aws" = 1 ] && [ -n "${TRIPLEC_IDLE_STOP_MINUTES:-}" ]; then
-    start_idle_watch "$TRIPLEC_IDLE_STOP_MINUTES" "$$"
+if [ "$triplec_aws" = 1 ] && { [ -n "${TRIPLEC_IDLE_STOP_MINUTES:-}" ] || [ "${TRIPLEC_MAX_LIFETIME_MINUTES:-0}" != 0 ]; }; then
+    start_idle_watch "${TRIPLEC_IDLE_STOP_MINUTES:-}" "$$"
 fi
-# Repos are cloned in the background from here on — see clone_repos.
+# Repos are cloned in the background from here on — see clone_repos — and the
+# setup script runs after them (aws_run_setup).
 if [ "$triplec_aws" = 1 ]; then
     start_clone_repos "$triplec_repos_json" /run/triple-c-clone
 fi

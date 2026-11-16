@@ -355,7 +355,7 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   through the agent, closes the project's terminals and auth bridge (so nothing is written after the
   push's snapshot), may push first (under an in-container `timeout`, since the agent does not kill an
   exec the client gave up on), then writes `pushed` or `discard` to `/run/triple-c/stop-reason`
-  (root-owned; the entrypoint's TERM hook reads it, and the idle watcher writes `idle`) so the hook
+  (root-owned; the entrypoint's TERM hook reads it, and the idle watcher writes `idle` or `lifetime`) so the hook
   doesn't push twice; the marker is cleared if StopTask fails. Claude Code's sandbox is forced off in
   the generated settings (bubblewrap can't create namespaces on Fargate, verified live).
   **Environments are OpenTofu modules** (`aws/terraform/{environment,user-onboard,permissions-boundary}`;
@@ -405,13 +405,26 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   start, and `triple-c-wip-push` skips scratch.
   Switching EFS → Hybrid/Ephemeral keeps `workspace_access_point_id` (store-owned) until "Remove AWS
   resources" with discard deletes both access points. On
-  TERM the hook pushes unsaved work to a `triple-c/wip/<stamp>` branch via a temporary index (the
-  user's index is untouched; needs the task definition's `stopTimeout` raised, 120 s) unless the stop
-  marker says the app handled it. The idle watcher runs as root under a supervisor and signals the
+  TERM the hook pushes unsaved work to the run's `triple-c/wip/<run-id>` branch via a temporary index
+  (the user's index is untouched; needs the task definition's `stopTimeout` raised, 120 s) unless the
+  stop marker says the app handled it. **One WIP branch per task run:** `aws_prepare_run` writes
+  `/run/triple-c/run-id` (`<UTC stamp>-<task id 8 | local>`, task id from ECS task metadata) and
+  `start-epoch` at the very start; `/run/triple-c` is root 0711 (the stop guard keeps that mode — at
+  0700 `claude` could not read the run id). Later pushes force (`+`) only that branch, and a tree equal
+  to `/run/triple-c/wip-last/<folder>` (claude-owned dir, written after a successful push) is skipped;
+  no usable run id (Docker) keeps the per-push stamp. **Setup script** (`TRIPLEC_SETUP_SCRIPT`, unset
+  before the snapshot like `TRIPLEC_FILES`): written to `/run/triple-c-setup/script` (root 0755 dir;
+  root opens `log` and hands the descriptor over, so claude writes nothing there), run as `claude`,
+  `bash -e`, stdin `/dev/null`, `timeout -k 10 1800`, chained after the background clone's `done` in
+  the same background subshell; `status` is `running` from the start until `ok` / `failed <code>`.
+  `triple-c-workspace-status` (python, no secrets) prints `{clone:{done,repos},setup:{state,code,tail}}`.
+  **Lifetime cap** (`TRIPLEC_MAX_LIFETIME_MINUTES`, advisory — sudo can kill it): the idle watcher
+  (started when idle stop *or* the cap is set) pushes best effort, records `lifetime` and TERMs; the
+  hook exits 76 (`aws::tasks::LIFETIME_EXIT_CODE` → `StopKind::LifetimeCap` → `lifetime` toast). The idle watcher runs as root under a supervisor and signals the
   entrypoint's own PID (not PID 1, which is docker-init), so idle and ECS stops share one trap.
   Idle = the agent's `last_activity_unix` older than N minutes (open-but-silent attaches/tunnels
   don't count; requests with `X-Triple-C-Background: 1` — the auth bridge's and the file viewer's polls — never do),
-  no `claude`, no scheduler job, no running clone, and no unsaved git work: with the WIP push on the
+  no `claude`, no scheduler job, no running clone or setup script, and no unsaved git work: with the WIP push on the
   watcher pushes *before* signalling and stays up if that fails; with it off, dirty repos keep the
   workspace up; activity during the watcher's push sends it back to watching. A repo the background
   clone is still writing (`/run/triple-c-clone/repos` last says `cloning`, no `done`) is skipped by
