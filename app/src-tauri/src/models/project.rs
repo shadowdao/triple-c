@@ -801,13 +801,23 @@ pub enum Fit {
     UnknownType,
 }
 
+/// Memory (MiB) an instance of `memory_mib` nominal memory keeps from tasks
+/// in [`fits_instance`]: a tenth of it (what ECS doesn't register, with
+/// room to spare), and never less than [`EC2_RESERVED_MEMORY_MIB`].
+pub fn ec2_memory_reserve_mib(memory_mib: u32) -> u32 {
+    (memory_mib / 10).max(EC2_RESERVED_MEMORY_MIB)
+}
+
 /// Check an EC2 config's reservations against `instance_type`, less the agent
 /// and OS reserve. A Fargate config always fits (no instance involved).
 ///
-/// Nominal sizes only: ECS registers less memory than the instance's nominal
-/// (the ECS-optimized AMI reserves some, e.g. ~7.5 GiB on an 8 GiB type), so a
-/// later task should leave headroom or use the container instance's
-/// registered memory.
+/// Nominal sizes only, so memory keeps a margin: ECS registers less memory
+/// than the instance's nominal (the ECS-optimized AMI and kernel keep some —
+/// about 7.5 GiB of an 8 GiB type is registered), and a task asking for more
+/// than the registered amount stays PROVISIONING with nothing able to place
+/// it. The registered figure can't be read before an instance exists (scale
+/// to zero), so the reserve is [`ec2_memory_reserve_mib`]: 10 % of the
+/// nominal memory, at least [`EC2_RESERVED_MEMORY_MIB`].
 pub fn fits_instance(cfg: &AwsWorkspaceConfig, instance_type: &str) -> Fit {
     if cfg.launch_type != LaunchType::Ec2 {
         return Fit::Ok;
@@ -816,7 +826,7 @@ pub fn fits_instance(cfg: &AwsWorkspaceConfig, instance_type: &str) -> Fit {
         return Fit::UnknownType;
     };
     let available_cpu = cpu - EC2_RESERVED_CPU_UNITS;
-    let available_memory_mib = mem - EC2_RESERVED_MEMORY_MIB;
+    let available_memory_mib = mem - ec2_memory_reserve_mib(mem);
     if cfg.cpu > available_cpu || cfg.memory_mib > available_memory_mib {
         Fit::TooBig { available_cpu, available_memory_mib }
     } else {
@@ -1659,13 +1669,18 @@ mod tests {
 
     #[test]
     fn fit_checks_reserve_for_the_agent() {
-        // m7i.large: 2048 / 8192 less 128 / 256.
-        assert_eq!(fits_instance(&ec2(1920, 7936), "m7i.large"), Fit::Ok);
+        // m7i.large: 2048 / 8192 less 128 CPU units and 10 % of the memory
+        // (819 MiB: ECS registers less than the nominal 8 GiB).
+        assert_eq!(fits_instance(&ec2(1920, 7373), "m7i.large"), Fit::Ok);
         assert_eq!(
             fits_instance(&ec2(1921, 4096), "m7i.large"),
-            Fit::TooBig { available_cpu: 1920, available_memory_mib: 7936 }
+            Fit::TooBig { available_cpu: 1920, available_memory_mib: 7373 }
         );
-        assert!(matches!(fits_instance(&ec2(1024, 7937), "m7i.large"), Fit::TooBig { .. }));
+        assert!(matches!(fits_instance(&ec2(1024, 7374), "m7i.large"), Fit::TooBig { .. }));
+        // The reserve is never under the agent's 256 MiB, and grows with
+        // the instance (r7i.4xlarge: 128 GiB nominal).
+        assert_eq!(ec2_memory_reserve_mib(2048), 256);
+        assert_eq!(ec2_memory_reserve_mib(131072), 13107);
         assert_eq!(fits_instance(&ec2(1024, 2048), "z9.huge"), Fit::UnknownType);
         // Fargate configs have no instance to fit.
         assert_eq!(fits_instance(&cfg(16384, 122880), "m7i.large"), Fit::Ok);

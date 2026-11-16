@@ -173,9 +173,16 @@ pub fn validate_ec2_user_tag(tag: &str) -> Result<String, String> {
 /// characters). Environment names and user tags never contain `--`, so the
 /// workspace policy's `cluster/triple-c-*--u-*` matches exactly the
 /// per-user clusters, and `triple-c-*--u-<tag>` exactly that user's.
-#[allow(dead_code)] // the onboarding module builds it; the app's EC2 runs (Task 5) will
 pub fn user_ec2_stem(env: &str, user_tag: &str) -> String {
     format!("triple-c-{env}--u-{user_tag}")
+}
+
+/// Whether `cluster` (a cluster *name*) is one of `env`'s per-user EC2
+/// clusters ([`user_ec2_stem`] of a valid tag).
+pub fn is_user_ec2_cluster(env: &str, cluster: &str) -> bool {
+    cluster
+        .strip_prefix(&format!("{}--u-", environment_cluster_name(env)))
+        .is_some_and(|tag| validate_ec2_user_tag(tag).is_ok())
 }
 
 /// A user's EC2 instance role (and instance profile): named by owner key,

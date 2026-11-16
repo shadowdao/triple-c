@@ -1225,6 +1225,10 @@ fn validate_gateway_sidecar_update(
     let Some(problem) = crate::aws::workspace::gateway_sidecar_problem(project, gateway) else {
         return Ok(());
     };
+    // Not on EC2 at all (bridge networking): refused whatever was stored.
+    if problem == crate::aws::workspace::EC2_NO_SIDECAR {
+        return Err(problem);
+    }
     let was_on = stored.aws.as_ref().is_some_and(|a| a.gateway_sidecar);
     if was_on && project.backend == crate::models::project::Backend::OpenAiCompatible {
         return Ok(());
@@ -2903,6 +2907,15 @@ mod tests {
         assert!(validate_gateway_sidecar_update(&on, &on, &half).is_ok());
         // Off: nothing to check.
         assert!(validate_gateway_sidecar_update(&off, &off, &half).is_ok());
+
+        // EC2 (bridge networking): refused even when it was already on.
+        let mut ec2 = on.clone();
+        ec2.aws.as_mut().unwrap().launch_type = crate::models::LaunchType::Ec2;
+        let e = validate_gateway_sidecar_update(&on, &ec2, &with_models).unwrap_err();
+        assert_eq!(e, crate::aws::workspace::EC2_NO_SIDECAR);
+        assert!(validate_gateway_sidecar_update(&ec2, &ec2, &with_models).is_err());
+        ec2.aws.as_mut().unwrap().gateway_sidecar = false;
+        assert!(validate_gateway_sidecar_update(&on, &ec2, &with_models).is_ok());
     }
 
     #[test]

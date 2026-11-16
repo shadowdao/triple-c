@@ -14,12 +14,15 @@ use std::time::Duration;
 use aws_config::SdkConfig;
 use aws_sdk_secretsmanager::error::ProvideErrorMetadata;
 
-use super::environments::{knowable, parse_environment_record, EnvironmentInfo, Knowable};
+use super::environments::{
+    get_parameter, knowable, parse_environment_record, user_record_from, EnvironmentInfo, Knowable,
+    Param, UserRecord,
+};
 use super::error::{classify_sdk_error, AwsError};
 use super::tasks::{find_project_task, TaskApi, STOP_REASON};
 use super::tofu_modules::{
     access_point_root, workspace_access_point_root, environment_cluster_name, environment_parameter_name, project_secret_name, task_family,
-    user_file_system_token, user_role_names,
+    is_user_ec2_cluster, user_file_system_token, user_record_parameter_name, user_role_names,
 };
 use super::workspace::WorkspaceApi;
 
@@ -40,6 +43,13 @@ pub trait RuntimeApi: Send + Sync {
         &self,
         env: &str,
     ) -> impl Future<Output = Result<Option<String>, AwsError>> + Send;
+    /// `ssm:GetParameter` of the caller's EC2 record in `env`
+    /// (`user_record_parameter_name`).
+    fn user_record(
+        &self,
+        env: &str,
+        owner_key: &str,
+    ) -> impl Future<Output = Result<Param, AwsError>> + Send;
     /// `iam:GetRole`.
     fn role_exists(&self, name: &str) -> impl Future<Output = Result<Knowable, AwsError>> + Send;
     /// `secretsmanager:GetSecretValue`'s `SecretString`.
@@ -78,6 +88,28 @@ pub async fn read_environment<R: RuntimeApi>(
             "The record of environment \"{env}\" in {region} is not usable: {e}"
         ))
     })
+}
+
+/// The caller's EC2 record in `env`, validated (untrusted: `parse_user_record`).
+/// Absent = no EC2 capacity for NEW runs; a task already running on the
+/// user's cluster may outlive the record (teardown removes it first).
+pub async fn read_user_record<R: RuntimeApi>(
+    rt: &R,
+    env: &str,
+    owner_key: &str,
+    account: &str,
+    region: &str,
+) -> Result<UserRecord, AwsError> {
+    Ok(user_record_from(rt.user_record(env, owner_key).await?, env, account, region))
+}
+
+/// The per-user EC2 cluster (ARN) a stored task ARN names, when it is one of
+/// `env`'s: where a project that ran on EC2 is still looked for after its
+/// user record is gone.
+pub fn ec2_cluster_of_task(env: &str, task_arn: &str) -> Option<String> {
+    cluster_of_task(task_arn)
+        .filter(|c| is_user_ec2_cluster(env, c))
+        .and_then(|_| cluster_arn_of_task(task_arn))
 }
 
 /// Whether the caller's task role exists in the environment: the onboarding
@@ -237,6 +269,9 @@ pub struct RemoveRequest<'a> {
     /// The EFS-mode `/workspace` access point the store has (kept after a
     /// switch to Hybrid or Ephemeral, Q1).
     pub stored_workspace_access_point_id: Option<&'a str>,
+    /// The user's EC2 cluster (their record's), looked in too: a project
+    /// may have run there.
+    pub ec2_cluster: Option<&'a str>,
     /// Delete the EFS access points, home and `/workspace` (ruling R9). The
     /// files stay on the user's own file system (only their task role can
     /// read it) until offboarding destroys it; a later start of the same
@@ -258,17 +293,39 @@ pub async fn remove_workspace_resources<T: TaskApi, W: WorkspaceApi, R: RuntimeA
     let cluster = environment_cluster_name(req.env);
     let family = task_family(req.env, req.owner_key, req.project_id);
 
-    // 1. The task.
-    let live =
-        find_project_task(tasks, &cluster, &family, req.owner_user_id, req.project_id).await?;
-    let mut to_stop: Vec<String> = live.into_iter().map(|t| t.arn).collect();
-    if let Some(arn) = req.stored_task_arn {
-        if cluster_of_task(arn) == Some(cluster.as_str()) && !to_stop.iter().any(|a| a == arn) {
-            to_stop.push(arn.to_string());
+    // 1. The task: in the environment's cluster, the user's EC2 cluster (the
+    // record's, and the stored task's when that is a per-user cluster of
+    // this environment — the record may be gone).
+    let mut clusters = vec![cluster.clone()];
+    for c in [
+        req.ec2_cluster.map(str::to_string),
+        req.stored_task_arn.and_then(|a| ec2_cluster_of_task(req.env, a)),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !clusters.contains(&c) {
+            clusters.push(c);
         }
     }
-    for arn in &to_stop {
-        tasks.stop_task(&cluster, arn, STOP_REASON).await?;
+    let mut to_stop: Vec<(String, String)> = Vec::new();
+    for c in &clusters {
+        if let Some(t) =
+            find_project_task(tasks, c, &family, req.owner_user_id, req.project_id).await?
+        {
+            to_stop.push((c.clone(), t.arn));
+        }
+    }
+    if let Some(arn) = req.stored_task_arn {
+        let ours = cluster_of_task(arn) == Some(cluster.as_str())
+            || ec2_cluster_of_task(req.env, arn).is_some();
+        if ours && !to_stop.iter().any(|(_, a)| a == arn) {
+            let c = cluster_of_task(arn).map_or_else(|| cluster.clone(), str::to_string);
+            to_stop.push((c, arn.to_string()));
+        }
+    }
+    for (c, arn) in &to_stop {
+        tasks.stop_task(c, arn, STOP_REASON).await?;
     }
 
     let mut failures: Vec<String> = Vec::new();
@@ -383,6 +440,10 @@ impl RuntimeApi for SdkRuntimeApi {
             }
             Err(e) => Err(classify_sdk_error(ACTION, &e)),
         }
+    }
+
+    async fn user_record(&self, env: &str, owner_key: &str) -> Result<Param, AwsError> {
+        get_parameter(&self.ssm, &user_record_parameter_name(env, owner_key)).await
     }
 
     async fn role_exists(&self, name: &str) -> Result<Knowable, AwsError> {

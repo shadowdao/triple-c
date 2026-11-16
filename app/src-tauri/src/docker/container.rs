@@ -1112,6 +1112,37 @@ fn vpn_host_config(enabled: bool) -> VpnHostConfigParts {
     )
 }
 
+/// What a VPN client needs, as plain data, for hosts that aren't Docker (an
+/// AWS EC2 task definition): the capabilities, the devices as
+/// `(host path, container path, cgroup permissions)`, and the sysctls,
+/// sorted. Derived from [`vpn_host_config`] so the two can't drift.
+pub(crate) struct VpnRequirements {
+    pub capabilities: Vec<String>,
+    pub devices: Vec<(String, String, String)>,
+    pub sysctls: Vec<(String, String)>,
+}
+
+pub(crate) fn vpn_requirements() -> VpnRequirements {
+    let (caps, devices, sysctls) = vpn_host_config(true);
+    let mut sysctls: Vec<(String, String)> = sysctls.unwrap_or_default().into_iter().collect();
+    sysctls.sort();
+    VpnRequirements {
+        capabilities: caps.unwrap_or_default(),
+        devices: devices
+            .unwrap_or_default()
+            .into_iter()
+            .map(|d| {
+                (
+                    d.path_on_host.unwrap_or_default(),
+                    d.path_in_container.unwrap_or_default(),
+                    d.cgroup_permissions.unwrap_or_default(),
+                )
+            })
+            .collect(),
+        sysctls,
+    }
+}
+
 /// Turn the daemon's device-passthrough failure into an explanation.
 ///
 /// **This fires on `start`, not `create`.** Verified against Docker 29.7:

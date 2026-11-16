@@ -938,7 +938,7 @@ pub async fn ec2_name_holders<A: OnboardApi>(
 }
 
 /// `ssm:GetParameter` as a [`Param`].
-async fn get_parameter(ssm: &aws_sdk_ssm::Client, name: &str) -> Result<Param, AwsError> {
+pub(crate) async fn get_parameter(ssm: &aws_sdk_ssm::Client, name: &str) -> Result<Param, AwsError> {
     let res = ssm
         .get_parameter()
         .name(name)

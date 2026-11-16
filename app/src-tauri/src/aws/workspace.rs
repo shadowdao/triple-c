@@ -27,10 +27,11 @@ use std::future::Future;
 use aws_config::SdkConfig;
 use aws_sdk_ecs::operation::register_task_definition::RegisterTaskDefinitionInput;
 use aws_sdk_ecs::types::{
-    Compatibility, ContainerDefinition, CpuArchitecture, EfsAuthorizationConfig,
-    EfsAuthorizationConfigIam, EfsTransitEncryption, EfsVolumeConfiguration, EphemeralStorage,
-    HealthCheck, KernelCapabilities, KeyValuePair, LinuxParameters, LogConfiguration, LogDriver,
-    MountPoint, NetworkMode, OsFamily, RuntimePlatform, Secret, SortOrder, Tag,
+    Compatibility, ContainerDefinition, CpuArchitecture, Device, DeviceCgroupPermission,
+    EfsAuthorizationConfig, EfsAuthorizationConfigIam, EfsTransitEncryption,
+    EfsVolumeConfiguration, EphemeralStorage, HealthCheck, HostVolumeProperties,
+    KernelCapabilities, KeyValuePair, LinuxParameters, LogConfiguration, LogDriver, MountPoint,
+    NetworkMode, OsFamily, RuntimePlatform, Secret, SortOrder, SystemControl, Tag,
     TaskDefinitionField, TaskDefinitionStatus, Volume,
 };
 use aws_sdk_secretsmanager::error::ProvideErrorMetadata;
@@ -39,7 +40,7 @@ use rand::RngCore;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use super::environments::EnvironmentInfo;
+use super::environments::{EnvironmentInfo, UserCompute};
 use super::error::{classify_sdk_error, AwsError};
 use super::identity::CallerIdentity;
 use super::tofu_modules::{
@@ -47,7 +48,10 @@ use super::tofu_modules::{
     user_file_system_token, user_role_names, workspace_access_point_root,
 };
 use crate::host::ssm::AGENT_PORT;
-use crate::models::project::{validate_aws_workspace, Arch, RepoSource, SecretsDelivery, StorageMode};
+use crate::models::project::{
+    fits_instance, validate_aws_workspace, Arch, Fit, LaunchType, RepoSource,
+    SecretsDelivery, StorageMode,
+};
 use crate::models::Project;
 
 pub const TAG_OWNER: &str = "triple-c:owner";
@@ -102,6 +106,11 @@ pub const GATEWAY_MEMORY_RESERVATION_MIB: i32 = 512;
 pub const MAX_GATEWAY_CONFIG_BYTES: usize = 8_192;
 /// Seconds ECS waits after SIGTERM before SIGKILL (Fargate allows 2–120).
 pub const STOP_TIMEOUT_SECS: i32 = 120;
+
+/// The instance's Docker socket, mounted at the same path in an EC2 task
+/// with Docker access (E6).
+pub const DOCKER_SOCKET_PATH: &str = "/var/run/docker.sock";
+const DOCKER_SOCKET_VOLUME: &str = "docker-socket";
 
 /// The task definition's whole `environment` (R2): constants, no project data.
 const FIXED_ENVIRONMENT: [(&str, &str); 2] = [("TRIPLEC_HOST", "aws"), ("COLORTERM", "truecolor")];
@@ -205,6 +214,12 @@ pub fn gateway_sidecar_problem(
     if !project.aws.as_ref().is_some_and(|a| a.gateway_sidecar) {
         return None;
     }
+    if project.aws.as_ref().is_some_and(|a| a.launch_type == LaunchType::Ec2) {
+        // EC2 tasks use `bridge` networking (ruling R2): the containers of a
+        // task don't share a loopback, and the sidecar must never listen
+        // beyond it. Not offered on EC2 yet.
+        return Some(EC2_NO_SIDECAR.into());
+    }
     if project.backend != crate::models::project::Backend::OpenAiCompatible {
         return Some(
             "The LLM gateway sidecar needs the OpenAI Compatible backend: choose it in the \
@@ -221,6 +236,10 @@ pub fn gateway_sidecar_problem(
     }
     None
 }
+
+/// Why an EC2 project can't run the gateway sidecar (yet).
+pub const EC2_NO_SIDECAR: &str = "The LLM gateway sidecar is not available on EC2 yet: turn it \
+     off, or run the project on Fargate";
 
 /// `workspace_env`'s fingerprint of the custom variables' values.
 const CUSTOM_ENV_FINGERPRINT: &str = "TRIPLE_C_CUSTOM_ENV";
@@ -473,6 +492,21 @@ pub struct WorkspacePlan {
     /// The gateway sidecar's image (Q7) when the project runs it; `None`
     /// leaves the request exactly as it was before the sidecar existed.
     pub gateway_image: Option<String>,
+    /// Run on the user's own EC2 instances (phase 7) rather than Fargate;
+    /// `None` leaves the request exactly as it was before EC2 existed.
+    pub ec2: Option<Ec2Plan>,
+}
+
+/// What an EC2 task definition adds (E6, E7). `cpu`/`memory` are the task's
+/// reservations on the instance; arch and ephemeral storage don't apply (the
+/// instance decides both).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Ec2Plan {
+    /// Mount the instance's Docker socket (`allow_docker_access`, E6).
+    pub docker_socket: bool,
+    /// What a VPN client needs (`vpn_support_enabled`, E7): `NET_ADMIN`,
+    /// `/dev/net/tun`, `net.ipv4.conf.all.src_valid_mark=1`.
+    pub vpn: bool,
 }
 
 /// sha256 (hex) over the task definition `plan` produces, minus the label
@@ -583,12 +617,7 @@ fn build_request(plan: &WorkspacePlan) -> RegisterTaskDefinitionInput {
                 .build()
                 .expect(BUILT),
         )
-        .linux_parameters(
-            LinuxParameters::builder()
-                .init_process_enabled(true)
-                .capabilities(KernelCapabilities::builder().add("SYS_PTRACE").build())
-                .build(),
-        )
+        .linux_parameters(linux_parameters(plan.ec2))
         .log_configuration(
             LogConfiguration::builder()
                 .log_driver(LogDriver::Awslogs)
@@ -616,29 +645,64 @@ fn build_request(plan: &WorkspacePlan) -> RegisterTaskDefinitionInput {
                 .build(),
         );
     }
+    let docker_socket = plan.ec2.is_some_and(|e| e.docker_socket);
+    if docker_socket {
+        container = container.mount_points(
+            MountPoint::builder()
+                .source_volume(DOCKER_SOCKET_VOLUME)
+                .container_path(DOCKER_SOCKET_PATH)
+                .read_only(false)
+                .build(),
+        );
+    }
+    if plan.ec2.is_some_and(|e| e.vpn) {
+        // Namespaced `net.*` sysctls are allowed in `bridge` mode: each
+        // container has its own network namespace, so this sets the
+        // workspace's, never the instance's (ECS warns only for `host`, and
+        // for several containers of one `awsvpc` task).
+        for (key, value) in crate::docker::container::vpn_requirements().sysctls {
+            container = container
+                .system_controls(SystemControl::builder().namespace(key).value(value).build());
+        }
+    }
 
     let mut req = RegisterTaskDefinitionInput::builder()
         .family(&plan.family)
         .task_role_arn(&plan.task_role_arn)
-        .execution_role_arn(&plan.exec_role_arn)
-        .network_mode(NetworkMode::Awsvpc)
-        .requires_compatibilities(Compatibility::Fargate)
-        .cpu(plan.cpu.to_string())
-        .memory(plan.memory.to_string())
-        .runtime_platform(
-            RuntimePlatform::builder()
-                .cpu_architecture(match plan.arch {
-                    Arch::X86_64 => CpuArchitecture::X8664,
-                    Arch::Arm64 => CpuArchitecture::Arm64,
-                })
-                .operating_system_family(OsFamily::Linux)
-                .build(),
-        )
-        .ephemeral_storage(
-            EphemeralStorage::builder()
-                .size_in_gib(plan.ephemeral_gib as i32)
-                .build(),
-        )
+        .execution_role_arn(&plan.exec_role_arn);
+    req = match plan.ec2 {
+        // Fargate: exactly the request from before EC2 existed (pinned).
+        None => req
+            .network_mode(NetworkMode::Awsvpc)
+            .requires_compatibilities(Compatibility::Fargate)
+            .cpu(plan.cpu.to_string())
+            .memory(plan.memory.to_string())
+            .runtime_platform(
+                RuntimePlatform::builder()
+                    .cpu_architecture(match plan.arch {
+                        Arch::X86_64 => CpuArchitecture::X8664,
+                        Arch::Arm64 => CpuArchitecture::Arm64,
+                    })
+                    .operating_system_family(OsFamily::Linux)
+                    .build(),
+            )
+            .ephemeral_storage(
+                EphemeralStorage::builder()
+                    .size_in_gib(plan.ephemeral_gib as i32)
+                    .build(),
+            ),
+        // EC2 (ruling R2: `bridge`, the instance is the user's alone). No
+        // runtime platform — the instance's architecture decides and the
+        // image is multi-arch — and no ephemeral storage (the instance's
+        // disk). Task-level cpu/memory are the reservations `fits_instance`
+        // checked against the user's instance type.
+        Some(_) => req
+            .network_mode(NetworkMode::Bridge)
+            .requires_compatibilities(Compatibility::Ec2)
+            .cpu(plan.cpu.to_string())
+            .memory(plan.memory.to_string()),
+    };
+    let mut req = req
         .container_definitions(container.build())
         .set_tags(Some(
             plan.tags
@@ -655,7 +719,43 @@ fn build_request(plan: &WorkspacePlan) -> RegisterTaskDefinitionInput {
     {
         req = req.volumes(efs_volume(name, fs, ap));
     }
+    if docker_socket {
+        req = req.volumes(
+            Volume::builder()
+                .name(DOCKER_SOCKET_VOLUME)
+                .host(HostVolumeProperties::builder().source_path(DOCKER_SOCKET_PATH).build())
+                .build(),
+        );
+    }
     req.build().expect(BUILT)
+}
+
+/// The workspace container's Linux parameters: docker-init and `SYS_PTRACE`
+/// always; on EC2 with VPN support, [`vpn_requirements`]' capability and
+/// device too (Fargate allows neither).
+///
+/// [`vpn_requirements`]: crate::docker::container::vpn_requirements
+fn linux_parameters(ec2: Option<Ec2Plan>) -> LinuxParameters {
+    let mut caps = KernelCapabilities::builder().add("SYS_PTRACE");
+    let mut lp = LinuxParameters::builder().init_process_enabled(true);
+    if ec2.is_some_and(|e| e.vpn) {
+        let vpn = crate::docker::container::vpn_requirements();
+        for cap in vpn.capabilities {
+            caps = caps.add(cap);
+        }
+        for (host, container, perms) in vpn.devices {
+            let mut device = Device::builder().host_path(host).container_path(container);
+            for p in perms.chars() {
+                device = device.permissions(match p {
+                    'r' => DeviceCgroupPermission::Read,
+                    'w' => DeviceCgroupPermission::Write,
+                    _ => DeviceCgroupPermission::Mknod,
+                });
+            }
+            lp = lp.devices(device.build().expect("every required field is set"));
+        }
+    }
+    lp.capabilities(caps.build()).build()
 }
 
 /// `secrets` entries for `keys`, each by `valueFrom: <arn>:<KEY>::`.
@@ -902,9 +1002,58 @@ pub struct PreparedWorkspace {
     pub secret_arn: String,
 }
 
+/// Why an EC2 project can't start on `compute` (the user's record, `None`
+/// when they have none), or what its task definition adds. A Fargate project
+/// gets `Ok(None)` whatever `compute` is.
+pub fn ec2_plan(
+    project: &Project,
+    env: &str,
+    compute: Option<&UserCompute>,
+) -> Result<Option<Ec2Plan>, String> {
+    let Some(cfg) = project.aws.as_ref().filter(|c| c.launch_type == LaunchType::Ec2) else {
+        return Ok(None);
+    };
+    if cfg.gateway_sidecar {
+        return Err(EC2_NO_SIDECAR.into());
+    }
+    let compute = compute.ok_or_else(|| no_ec2_capacity(env))?;
+    match fits_instance(cfg, &compute.instance_type) {
+        Fit::Ok => {}
+        Fit::TooBig { available_cpu, available_memory_mib } => {
+            return Err(format!(
+                "This project reserves {} CPU units and {} MiB of memory, more than your EC2 \
+                 instance type {} has for a workspace ({available_cpu} CPU units, \
+                 {available_memory_mib} MiB). Lower the reservations in the project's Host \
+                 settings, or ask an admin for a larger instance type.",
+                cfg.cpu, cfg.memory_mib, compute.instance_type
+            ))
+        }
+        // The record is validated against the same table, so this is a
+        // newer app's type: let ECS decide.
+        Fit::UnknownType => log::warn!(
+            "Project {}: instance type {} is not in the app's table; its fit is unchecked",
+            project.id,
+            compute.instance_type
+        ),
+    }
+    Ok(Some(Ec2Plan {
+        docker_socket: project.allow_docker_access,
+        vpn: project.vpn_support_enabled,
+    }))
+}
+
+/// The user has no EC2 record in `env` (none was added, or it was removed).
+pub fn no_ec2_capacity(env: &str) -> String {
+    format!(
+        "You have no EC2 capacity in {env}; ask an admin to add it to your onboarding (or run \
+         the project on Fargate)."
+    )
+}
+
 /// Make the project's secret, access points (Hybrid, EFS) and task definition
 /// ready. Everything that can be checked locally — placement, sizes, the
-/// payload's size and names — is checked before the first write.
+/// payload's size and names, an EC2 project's fit on `compute` — is checked
+/// before the first write.
 #[allow(clippy::too_many_arguments)]
 pub async fn prepare_workspace<W: WorkspaceApi>(
     api: &W,
@@ -916,6 +1065,7 @@ pub async fn prepare_workspace<W: WorkspaceApi>(
     custom_env_keys: &[String],
     image: &str,
     gateway: Option<GatewayPayload<'_>>,
+    compute: Option<&UserCompute>,
 ) -> Result<PreparedWorkspace, AwsError> {
     let (Some(placement), Some(cfg)) = (project.aws_placement.as_ref(), project.aws.as_ref())
     else {
@@ -940,6 +1090,7 @@ pub async fn prepare_workspace<W: WorkspaceApi>(
         )));
     }
     validate_aws_workspace(cfg).map_err(other)?;
+    let ec2 = ec2_plan(project, &env.name, compute).map_err(other)?;
     if image.trim().is_empty() {
         return Err(other("No container image is set for AWS"));
     }
@@ -1100,6 +1251,7 @@ pub async fn prepare_workspace<W: WorkspaceApi>(
         workspace_access_point_id: workspace_access_point_id.clone(),
         tags,
         gateway_image: gateway.map(|_| crate::docker::gateway::registry_image_ref()),
+        ec2,
     };
     let fingerprint = workspace_fingerprint(&plan);
     let task_definition_arn =

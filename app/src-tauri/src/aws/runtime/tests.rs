@@ -36,6 +36,8 @@ struct Fake {
     revisions: Vec<TaskDefinitionRef>,
     access_points: Vec<AccessPointRef>,
     fail_secret_delete: bool,
+    /// The clusters ListTasks was asked about, by name.
+    lists: Mutex<Vec<String>>,
 }
 
 impl Fake {
@@ -51,6 +53,10 @@ impl RuntimeApi for Fake {
     async fn environment_record(&self, env: &str) -> Result<Option<String>, AwsError> {
         self.log(format!("record {env}"));
         Ok(self.record.clone())
+    }
+    async fn user_record(&self, env: &str, owner_key: &str) -> Result<crate::aws::environments::Param, AwsError> {
+        self.log(format!("user-record {env} {owner_key}"));
+        Ok(crate::aws::environments::Param::Missing)
     }
     async fn role_exists(&self, name: &str) -> Result<Knowable, AwsError> {
         self.log(format!("role {name}"));
@@ -85,8 +91,16 @@ impl TaskApi for Fake {
     async fn describe(&self, _c: &str, arns: &[String]) -> Result<Vec<TaskInfo>, AwsError> {
         Ok(self.live_tasks.iter().filter(|t| arns.contains(&t.arn)).cloned().collect())
     }
-    async fn list_project_tasks(&self, _c: &str, _f: &str) -> Result<Vec<String>, AwsError> {
-        Ok(self.live_tasks.iter().map(|t| t.arn.clone()).collect())
+    async fn list_project_tasks(&self, c: &str, _f: &str) -> Result<Vec<String>, AwsError> {
+        // By cluster name or ARN, like ECS.
+        let name = c.rsplit_once(":cluster/").map_or(c, |(_, n)| n);
+        self.lists.lock().unwrap().push(name.to_string());
+        Ok(self
+            .live_tasks
+            .iter()
+            .filter(|t| cluster_of_task(&t.arn) == Some(name))
+            .map(|t| t.arn.clone())
+            .collect())
     }
     async fn stop_task(&self, cluster: &str, arn: &str, reason: &str) -> Result<(), AwsError> {
         self.log(format!("stop {cluster} {arn} {reason}"));
@@ -262,6 +276,7 @@ fn live(id: &str) -> TaskInfo {
             family()
         ),
         runtime_id: None,
+        container_instance_arn: None,
         exec_agent_running: false,
         exit_code: None,
         owner: Some(USER.into()),
@@ -305,6 +320,7 @@ async fn removal_stops_the_task_leaves_the_revisions_and_schedules_the_secret() 
         stored_task_arn: Some(&t0),
         stored_access_point_id: Some("fsap-stored"),
         stored_workspace_access_point_id: None,
+        ec2_cluster: None,
         discard_data: false,
     };
     remove_workspace_resources(&fake, &fake, &fake, &r).await.unwrap();
@@ -341,6 +357,7 @@ async fn a_failed_step_is_reported_but_the_rest_still_runs() {
         stored_task_arn: None,
         stored_access_point_id: Some("fsap-1"),
         stored_workspace_access_point_id: None,
+        ec2_cluster: None,
         discard_data: true,
     };
     let e = remove_workspace_resources(&fake, &fake, &fake, &r).await.unwrap_err();
@@ -381,6 +398,7 @@ async fn removal_with_discard_deletes_both_access_points_and_without_keeps_both(
         stored_access_point_id: Some("fsap-home"),
         // Kept in the store after switching EFS -> Hybrid.
         stored_workspace_access_point_id: Some("fsap-ws-stored"),
+        ec2_cluster: None,
         discard_data: false,
     };
     let keep = Fake { access_points: points.clone(), ..Default::default() };
@@ -401,4 +419,122 @@ async fn removal_with_discard_deletes_both_access_points_and_without_keeps_both(
         .collect();
     deleted.sort();
     assert_eq!(deleted, vec!["fsap-home", "fsap-ws", "fsap-ws-stored"]);
+}
+
+// ------------------------------------------------------------- EC2 (phase 7)
+
+fn ec2_task_arn(id: &str) -> String {
+    format!("arn:aws:ecs:{REGION}:{ACCOUNT}:task/triple-c-dev--u-alice/{id}")
+}
+
+#[test]
+fn a_stored_task_on_a_per_user_cluster_names_that_cluster() {
+    assert_eq!(
+        ec2_cluster_of_task("dev", &ec2_task_arn("t")).as_deref(),
+        Some(format!("arn:aws:ecs:{REGION}:{ACCOUNT}:cluster/triple-c-dev--u-alice").as_str())
+    );
+    // The environment's own cluster, another environment's per-user
+    // cluster and anything else are not.
+    assert_eq!(ec2_cluster_of_task("dev", &task_arn("t")), None);
+    assert_eq!(ec2_cluster_of_task("prod", &ec2_task_arn("t")), None);
+    let odd = format!("arn:aws:ecs:{REGION}:{ACCOUNT}:task/triple-c-dev--u-a--b/t");
+    assert_eq!(ec2_cluster_of_task("dev", &odd), None);
+    assert_eq!(ec2_cluster_of_task("dev", "not-an-arn"), None);
+}
+
+#[tokio::test]
+async fn the_user_record_is_read_and_validated() {
+    struct Rec(Param);
+    impl Rec {
+        async fn read(&self) -> UserRecord {
+            let fake = RecFake(self.0.clone(), Mutex::new(Vec::new()));
+            let r = read_user_record(&fake, "dev", &ok(), ACCOUNT, REGION).await.unwrap();
+            assert_eq!(*fake.1.lock().unwrap(), vec![format!("dev {}", ok())]);
+            r
+        }
+    }
+    let valid = serde_json::json!({
+        "schema": 1, "instance_type": "m7i.large", "max_instances": 2, "user_tag": "alice",
+        "cluster_arn": format!("arn:aws:ecs:{REGION}:{ACCOUNT}:cluster/triple-c-dev--u-alice"),
+        "capacity_provider": "triple-c-dev--u-alice",
+    })
+    .to_string();
+    let UserRecord::Valid(c) = Rec(Param::Value(valid)).read().await else { panic!() };
+    assert_eq!((c.instance_type.as_str(), c.max_instances), ("m7i.large", 2));
+    assert_eq!(Rec(Param::Missing).read().await, UserRecord::Absent);
+    assert!(matches!(Rec(Param::Denied).read().await, UserRecord::Unusable(_)));
+    assert!(matches!(Rec(Param::Value("{}".into())).read().await, UserRecord::Unusable(_)));
+}
+
+/// Only `user_record` is asked of it.
+struct RecFake(Param, Mutex<Vec<String>>);
+
+impl RuntimeApi for RecFake {
+    async fn environment_record(&self, _env: &str) -> Result<Option<String>, AwsError> {
+        unreachable!()
+    }
+    async fn user_record(&self, env: &str, owner_key: &str) -> Result<Param, AwsError> {
+        self.1.lock().unwrap().push(format!("{env} {owner_key}"));
+        Ok(self.0.clone())
+    }
+    async fn role_exists(&self, _name: &str) -> Result<Knowable, AwsError> {
+        unreachable!()
+    }
+    async fn secret_string(&self, _name: &str) -> Result<String, AwsError> {
+        unreachable!()
+    }
+    async fn access_point_state(&self, _id: &str) -> Result<Option<String>, AwsError> {
+        unreachable!()
+    }
+    async fn delete_secret(&self, _name: &str) -> Result<(), AwsError> {
+        unreachable!()
+    }
+    async fn delete_access_point(&self, _id: &str) -> Result<(), AwsError> {
+        unreachable!()
+    }
+}
+
+#[tokio::test]
+async fn removal_finds_and_stops_a_task_on_the_users_ec2_cluster() {
+    let key = ok();
+    let user_cluster = format!("arn:aws:ecs:{REGION}:{ACCOUNT}:cluster/triple-c-dev--u-alice");
+    let base = RemoveRequest {
+        env: "dev",
+        region: REGION,
+        owner_user_id: USER,
+        owner_key: &key,
+        project_id: PROJECT,
+        stored_task_arn: None,
+        stored_access_point_id: None,
+        stored_workspace_access_point_id: None,
+        ec2_cluster: Some(&user_cluster),
+        discard_data: false,
+    };
+    // Found through the record's cluster.
+    let mut t = live("e1");
+    t.arn = ec2_task_arn("e1");
+    let fake = Fake { live_tasks: vec![t.clone()], ..Default::default() };
+    remove_workspace_resources(&fake, &fake, &fake, &base).await.unwrap();
+    assert_eq!(*fake.lists.lock().unwrap(), ["triple-c-dev", "triple-c-dev--u-alice"]);
+    let calls = fake.calls();
+    assert!(
+        calls.contains(&format!("stop {user_cluster} {} {STOP_REASON}", ec2_task_arn("e1"))),
+        "{calls:?}"
+    );
+
+    // The record is gone: the stored ARN still leads to its cluster.
+    let stored = ec2_task_arn("e1");
+    let fake = Fake { live_tasks: vec![t], ..Default::default() };
+    let r = RemoveRequest { ec2_cluster: None, stored_task_arn: Some(&stored), ..base };
+    remove_workspace_resources(&fake, &fake, &fake, &r).await.unwrap();
+    let stops: Vec<String> = fake.calls().into_iter().filter(|c| c.starts_with("stop")).collect();
+    assert_eq!(stops.len(), 1, "{stops:?}");
+    assert!(stops[0].contains(&ec2_task_arn("e1")), "{stops:?}");
+
+    // A stored ARN on someone else's kind of cluster is not stopped.
+    let foreign = format!("arn:aws:ecs:{REGION}:{ACCOUNT}:task/other-cluster/x");
+    let fake = Fake::default();
+    let r = RemoveRequest { ec2_cluster: None, stored_task_arn: Some(&foreign), ..base };
+    remove_workspace_resources(&fake, &fake, &fake, &r).await.unwrap();
+    assert!(!fake.calls().iter().any(|c| c.starts_with("stop")));
 }
