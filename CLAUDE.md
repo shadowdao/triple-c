@@ -284,7 +284,7 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
     users have migrated.
 - **`host/`** — Where a project's container runs, and the only way into it. `ContainerTarget`
   (`Docker`, and `Agent` — reached through the in-container `triple-c-agent` by `agent.rs`, per
-  `docs/superpowers/specs/2026-11-13-triple-c-agent-protocol.md`; AWS planned —
+  `docs/superpowers/specs/2026-11-13-triple-c-agent-protocol.md`; AWS host design —
   `docs/superpowers/specs/2026-11-13-aws-ecs-host-design.md`)
   wraps execs, file transfer and `is_running`; `sessions.rs` holds `ExecSessionManager`.
   `ssm.rs` is the AWS transport to an `Agent` target: one SSM port-forward per task, run through
@@ -484,10 +484,10 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   the pairs to their own `ExecSpec.env` (`aws_host::terminal_env`, pairs only — no file read);
   nothing reaches the agent's snapshot, so cron/scheduled jobs and the setup script never get them.
   A failed push is a `workspace-warning`. Hybrid/EFS do **not** link `~/.ssh` to EFS under
-  copy-at-connect (R6: keys vanish with the task). A secret that still holds credentials when a
-  copy-at-connect start finds on CreateSecret's ResourceExists (`holds_credentials`; a new
-  project's secret is never read first) is force-deleted and created again (R7:
-  `PutSecretValue` would keep them as AWSPREVIOUS); `TRIPLE_C_CUSTOM_ENV` is left out too.
+  copy-at-connect (R6: keys vanish with the task). When a copy-at-connect start finds the secret
+  already there (CreateSecret's ResourceExists; a new project's secret is never read first) and it
+  `holds_credentials`, it is force-deleted and created again (R7: `PutSecretValue` would keep the
+  old values as AWSPREVIOUS); `TRIPLE_C_CUSTOM_ENV` is left out too.
   The re-clone closes the apply lock's fd (a later connect never waits for it); `--prepare` takes it.
   The functions both scripts use live in `container/entrypoint-lib.sh`
   (`/usr/local/lib/triple-c/`), sourced by the entrypoint first; it only defines things.

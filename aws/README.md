@@ -292,6 +292,15 @@ it is unpacked), and an admin can run the very same files by hand from a bundle.
 | `terraform/environment` | what every user shares: ECS cluster (Fargate, Fargate Spot), the tasks security group (no inbound rules), KMS key and alias, log group `/triple-c/<env>`, the network (`network_mode`: `public`, `private-nat`, `existing`) and, last, the record `/triple-c/environments/<env>` (which carries the advisory `max_workspace_hours` lifetime cap, 0 = none, at most 168) | `environments/<env>/terraform.tfstate` |
 | `terraform/user-onboard` | one user's task and execution roles (with the boundary) and their own EFS file system, its `-efs` security group, two mount targets and a file-system policy that admits only their task role | `users/<env>/<owner key>/terraform.tfstate` |
 
+**Workspace lifetime cap (advisory).** `max_workspace_hours` (module variable, 0 to 168, default 0 =
+no cap) is stored in the environment record and passed to every workspace as
+`TRIPLEC_MAX_LIFETIME_MINUTES`; the workspace's idle watcher then pushes work in progress (best
+effort, 90 s) and stops the task, which ECS reports as exit code 76. It is **not a security
+control**: a workspace user has sudo inside their own task and can switch the watcher off. To
+enforce a limit, stop old tasks from outside (for example a scheduled Lambda; not built). Changing
+the cap is a module update (template version 2), so environments deployed before it show "Update
+available" in the app.
+
 The **owner key** is the first 12 hex characters of `sha256("<region>:<aws:userid>")`; it names
 the user's roles, `triple-c-<env>-<owner key>-task` and `-exec` (a `UserId` holds a `:`, which
 role names reject). The region is in it because IAM role names are account-wide while
@@ -401,9 +410,9 @@ Create each file as a **customer managed policy** and attach it. In the console,
 or role. Inline policies do not fit: a role's inline policies share 10,240 characters and an
 environment admin needs every tier file (about 16,400), and a user's share 2,048. A managed policy
 may hold 6,144 characters, not counting whitespace. Without whitespace, `workspace-user.json` is
-about 6,040 (roughly 100 characters of headroom), `workspace-user-tasks.json` about 1,290,
-`environment-admin.json` about 5,800 (340)
-and `environment-admin-network.json` about 3,340; a unit test (`every_policy_fits_a_managed_policy`)
+6,036 (108 characters of headroom), `workspace-user-tasks.json` 1,293 (including `ReadFargatePrices`),
+`environment-admin.json` 5,805 (339)
+and `environment-admin-network.json` 3,340 (measured 2026-11-16); a unit test (`every_policy_fits_a_managed_policy`)
 fails before any file outgrows the limit. A tier that outgrows its files gains another file, which
 the app then lists with the others. For IAM Identity Center, add the files as inline policies on the permission set
 (the "up to 32,768 characters" limit is unverified) or reference the managed policies.

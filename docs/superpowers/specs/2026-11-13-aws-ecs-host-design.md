@@ -215,189 +215,22 @@ links to them so an admin can grant them without reading this doc.
 | Fargate Spot | off / on | Cheaper. Can be interrupted with 2 minutes' warning |
 | Idle auto-stop | off / N hours with no terminal or agent activity | The admin can set a maximum |
 | Repos | git URL + branch + folder name, one per `ProjectPath` | Replaces host paths on AWS |
-| Secrets delivery | **Secrets Manager** (default), **Copy at connect** | See [Secrets and uploads](#secrets-and-uploads) |
+| Secrets delivery | **Secrets Manager** (default), **Copy at connect** (built in phase 6)
 
-### 5. Start, connect, stop
-
-- **Start** calls `ecs:RunTask` (a standalone task, not a service), tags the task with the owner,
-  and polls `DescribeTasks` until the task is `RUNNING` and Triple-C's in-container agent (see
-  [Connectivity](#connectivity)) reports ready. Progress appears in the sidebar the same way as for
-  local projects.
-- **Connect**: terminals, file viewer, browser view, auth bridge and port mappings all work through
-  the agent tunnel.
-- **Closing the app does not stop the task.** That is the point of this feature: the scheduler,
-  long agent runs and so on keep going. Reopening the app reconnects to the running tasks.
-- **Stop** first checks for unsaved work (see [Storage](#storage)), then calls `ecs:StopTask`.
-- **Delete** removes the task definition revisions, the secrets, and (after confirmation) the
-  workspace's EFS data.
-
-## Architecture
-
-### Host abstraction
-
-The app currently talks to Docker directly: `bollard` via `docker/client.rs`, about 38 exec call
-sites across terminals, file viewer, auth bridge, browser view, migration and marketplace,
-`container_watch.rs` on the Docker event stream, and `commit_container_snapshot`. Introduce a
-`ProjectHost` trait in `app/src-tauri/src/host/` with two implementations:
-
-```rust
-#[async_trait]
-trait ProjectHost {
-    async fn start(&self, p: &Project) -> Result<HostHandle>;
-    async fn stop(&self, h: &HostHandle) -> Result<()>;
-    async fn status(&self, h: &HostHandle) -> Result<HostStatus>;
-    async fn exec(&self, h: &HostHandle, cmd: ExecSpec) -> Result<ExecStream>;     // pty or piped
-    async fn read_file(&self, h: &HostHandle, path: &str) -> Result<Bytes>;
-    async fn write_file(&self, h: &HostHandle, path: &str, data: Bytes) -> Result<()>;
-    async fn tunnel(&self, h: &HostHandle, port: u16) -> Result<DuplexStream>;      // auth bridge, browser view, ports
-    fn events(&self) -> BoxStream<HostEvent>;                                         // replaces container_watch's die events
-    fn capabilities(&self) -> HostCaps;                                               // see compatibility matrix
-}
-```
-
-- `DockerHost` wraps today's code, with no behaviour change.
-- `AwsHost` implements the trait with the ECS/EC2/EFS/Secrets Manager SDK calls plus the agent.
-- **Phase 1 is a pure refactor**: every exec, file and tunnel call site moves onto the trait, with
-  local only. The AWS work then goes behind a stable interface.
-
-`HostCaps` drives the UI. Options a host can't support (VPN, Docker access, snapshots…) are shown
-disabled with the reason, instead of failing at start.
-
-### Connectivity
-
-ECS Exec (SSM Session Manager) gives a shell in a Fargate task with no inbound ports, no public IP
-and no SSH. Fargate injects the SSM agent, so the image doesn't need it. Two problems with using it
-directly:
-
-- Each `execute-command` opens a new SSM session, which takes about 1 second. That is fine for a
-  terminal, but too slow for the file viewer's polling, the auth bridge's `/proc/net` polling and
-  per-connection tunnels.
-- The session protocol is a custom websocket framing that the Rust SDK doesn't implement.
-
-**Design:** a small **in-container agent**, `triple-c-agent`, a static musl Rust binary added to
-the image.
-
-- It listens on `127.0.0.1:<port>` inside the task.
-- It multiplexes, over one authenticated connection: pty exec, piped exec, file
-  read/write/stat/list/watch, TCP tunnels to in-container loopback ports, and liveness/activity
-  for idle auto-stop.
-- The app reaches it through **one SSM port-forwarding session** (`AWS-StartPortForwardingSession`,
-  target `ecs:<cluster>_<taskId>_<runtimeId>`), opened when the project connects and reopened if
-  it drops.
-- Authentication uses a random per-task token, delivered as a secret at task start. The SSM
-  session's IAM checks (`ssm:StartSession` and `ecs:ExecuteCommand`, both scoped by the owner tag)
-  are the outer gate; the token is defence in depth.
-- v1 runs AWS's `session-manager-plugin` as a child process for the port-forward (it is
-  Apache-2.0, so Triple-C can bundle it). A native Rust client for the SSM protocol could replace
-  it later.
-
-This one channel replaces every `docker exec … socat` tunnel (auth bridge, browser view, port
-mappings) and every exec call. The web terminal and audio bridge work unchanged, because they sit
-on top of the terminal and exec layer.
-
-Network: tasks run in **private subnets** under a security group with **no inbound rules at all**.
-Outbound access goes through a NAT gateway, or VPC endpoints in restricted environments (ECR, S3,
-Logs, SSM, Secrets Manager, EFS, Bedrock). Two tasks in the same environment cannot reach each
-other.
-
-### Image
-
-**Same image, same Dockerfile.** No AWS-specific image. Changes:
-
-1. Add `triple-c-agent` to the image.
-2. The entrypoint gets an `aws` mode (`TRIPLEC_HOST=aws`) that runs before the existing steps:
-   - **Write secrets to files**: each `TRIPLEC_FILE_<name>` env var injected from Secrets Manager
-     is written to the path the entrypoint **already reads** (`/tmp/.host-ssh/…`,
-     `/tmp/.host-ca/…`, `/tmp/.host-aws/…`). After that, `sync_host_ssh`,
-     `install_corporate_ca` and the AWS config merge run unchanged.
-   - **Clone repos**: clone each repo into `/workspace/<folder>` if it isn't already there
-     (it's already there on EFS after a restart). Git credentials come from the injected git token
-     or SSH key.
-   - **Skip** the UID/GID remap (there are no bind mounts; `claude` stays UID 1000, which the EFS
-     access point matches) and the Docker-socket group setup (no socket).
-   - Start `triple-c-agent` as root, outside the `claude` user's reach, and keep the existing
-     unkillable keepalive.
-3. **Fargate restrictions** are handled by the host, not the image: no `privileged`, and no added
-   capabilities except `SYS_PTRACE`. So VPN (`NET_ADMIN`) and Docker access are unavailable. The
-   bubblewrap sandbox can't create user namespaces on Fargate (verified, phase 5 P9), so the generated
-   Claude Code settings turn the sandbox off, with a visible notice.
-
-**Getting the image into the account:**
-
-- ECR pull-through cache of `ghcr.io/shadowdao/triple-c-sandbox` (GHCR as an upstream needs a
-  GitHub token stored in Secrets Manager), or
-- an environment's ECR repo (not in v1, D3), filled by an admin or CI with `crane copy`.
-
-Pulling straight from GHCR over NAT also works, and is the default when the environment has no ECR mirror. Image
-updates use the existing "new image available" flow: the next start uses the new digest.
-
-### Storage
-
-| Mode | `/workspace` (repos) | `/home/claude` + `.claude` | Survives stop | Speed | Cost |
-|---|---|---|---|---|---|
-| **Ephemeral** | task storage | task storage | **No** | Fast | Included (beyond 20 GiB is billed) |
-| **Hybrid** (default) | task storage | EFS | Settings, sessions, memory, history: yes. Working tree: only what's pushed | Fast builds, fast git | Small EFS footprint |
-| **EFS** | EFS | EFS | Everything | git, `node_modules` and builds are noticeably slower over NFS | Grows with repo and dependency size |
-
-- **One EFS file system per user (D2), one access point per workspace.** The file system comes
-  from the user's onboarding module and its policy admits only their task role. Access point root:
-  `/triple-c/<owner>/<project-id>`, with POSIX user and group 1000. The access point is created by
-  the user, on their own file system, and tagged with the owner (see policies).
-- **WIP push is on by default** (`wip_push_on_stop: true`, with a serde default per the
-  `default_full_permissions` pattern) and can be turned off per project.
-- **Ephemeral and Hybrid have a stop guard.** Before stopping, the app asks the agent for
-  `git status --porcelain` and any unpushed commits in each repo. If anything would be lost, it
-  offers: **Push to a `triple-c/wip/<date>` branch** (the preselected default), **Stop anyway**, or
-  **Cancel**. The same check runs before idle auto-stop. If anything is dirty, idle auto-stop
-  pushes a WIP branch instead of throwing work away, and stops only once that push succeeded (a
-  failed push keeps the workspace up and is retried, backing off). With the WIP push off, unsaved
-  work keeps the workspace up.
-- **Fargate task retirement and Spot interruption** send `SIGTERM` with a short deadline (2 minutes
-  for Spot). The entrypoint's `SIGTERM` trap runs the same WIP push, best-effort, when the project
-  has it enabled.
-
-#### Snapshots
-
-`docker commit` doesn't exist on ECS. On AWS:
-
-- Anything installed outside `/home/claude` (apt packages, for example) is **lost on restart**.
-- A per-project **setup script** (stored with the project, run by the entrypoint on every start)
-  replaces snapshotting for the AWS host. Its output streams to the start-progress view.
-- Later, the app could build a per-workspace image from base image + setup script with CodeBuild
-  and push it to ECR. Out of scope for v1.
-
-### Secrets and uploads
-
-Things that are host files or keyring values today: SSH key (`ssh_key_path`), CA cert
-(`ca_cert_path`), git token, AWS config for Bedrock, `CLAUDE_CODE_OAUTH_TOKEN` / API keys, custom
-env vars marked secret, the agent token.
-
-**Secrets Manager (default)**
-
-- When the user picks an SSH key or cert for an AWS project, the app reads it on the host and
-  creates or updates a secret named `triple-c/<env>/<owner>/<project-id>/<name>`. The secret is
-  encrypted with the environment's KMS key and tagged `triple-c:owner`, `triple-c:project`,
-  `triple-c:environment`.
-- The task definition references the secrets in `containerDefinitions[].secrets`, so **the ECS
-  task execution role** fetches them at start and injects them as env vars. The entrypoint writes
-  them to files as described above.
-- **The container's own task role has no Secrets Manager permission.** Code running inside a task
-  cannot read another workspace's secrets, even though tasks share a task role in standard
-  tenancy.
-- Updating a key in the app updates the secret. The next start picks it up, and a running task
-  gets a "restart to apply" prompt.
-- Secrets Manager's 64 KB per-secret limit covers keys and cert bundles. Anything bigger is
-  rejected with a clear message.
-
-**Copy at connect**
-
-- Nothing is stored in AWS. When the app connects, it pushes the files into the running container
-  through the agent, the same way Triple-C's file upload works today, writing to tmpfs paths that
-  the entrypoint re-syncs from.
-- The task can't start a fresh clone of a **private** repo until the app connects, so the clone is
-  deferred until the first connect. Scheduled jobs can't use the credentials while the app is
-  closed, unless the files were persisted to EFS (an extra opt-in, warned about).
-- For users or orgs that don't want keys in AWS at all.
+- With `secrets_delivery: CopyAtConnect` the project secret still carries settings, repos, the
+  agent token and the gateway sidecar's keys (R1), but no `TRIPLEC_FILES` and no credential
+  variable (`TRIPLEC_CREDENTIALS=connect` marks it). After every connect (start, attach,
+  background re-attach) the app uploads the files and an env file as root into a per-connect
+  directory on tmpfs under `/dev/shm/triple-c/connect/` through the agent, and runs
+  `triple-c-apply-connect`: CA install, SSH merge and git credential helper (the entrypoint's own
+  functions, shared through `entrypoint-lib.sh`), then retries repos whose clone failed.
+- Credentials never enter the agent's environment snapshot, so cron and scheduled jobs never get
+  them, and neither does the setup script. Terminals the app opens add them to their own env.
+  The first clone of a private repo waits up to 5 minutes for the first connect.
+- `~/.ssh` is not linked to EFS under this mode (R6), and a secret that held credentials is
+  recreated when the user switches to it (R7).
+- The "persist to EFS" opt-in this section once described was **not built**; the UI says
+  scheduled jobs don't get credentials while the app is closed.
 
 **Claude Code login works the same as locally (decided).** The project's LLM backend setting
 doesn't change on the AWS host:
@@ -601,18 +434,22 @@ pub aws: Option<AwsWorkspaceConfig>,
 
 pub struct AwsWorkspaceConfig {
     pub cpu: u32, pub memory_mib: u32, pub arch: Arch,   // X86_64 | Arm64 (Fargate's valid pairs)
-    pub storage: StorageMode,              // Ephemeral | Hybrid (Efs: phase 6)
+    pub storage: StorageMode,              // Ephemeral | Hybrid (default) | Efs (Hybrid + /workspace on EFS)
     pub ephemeral_gib: u32,                // 21-200
     pub spot: bool,
     pub idle_stop_minutes: Option<u32>,
     pub repos: Vec<RepoSource>,            // { url, branch: Option, folder } — parallel to ProjectPath
     pub wip_push_on_stop: bool,            // default true
+    pub secrets_delivery: SecretsDelivery, // SecretsManager (default) | CopyAtConnect
+    pub setup_script: Option<String>,      // <= 32 KiB, runs as claude after the clone
+    pub gateway_sidecar: bool,             // LiteLLM as a second container
     // runtime state (store-owned, not user-edited)
     pub task_arn: Option<String>, pub access_point_id: Option<String>,
     pub task_definition_arn: Option<String>,   // the exact family:revision last run
+    pub workspace_access_point_id: Option<String>, // the EFS-mode /workspace access point
 }
-// Not built yet: launch_type (Fargate only; EC2 is phase 7), secrets_delivery (Secrets Manager
-// only; Copy-at-connect is phase 6), setup_script (phase 6).
+// EnvironmentInfo (the SSM record, parsed): max_workspace_hours: u32 (0 = no cap).
+// Not built: launch_type (Fargate only; EC2 is phase 7).
 ```
 
 Existing `projects.json` files deserialize unchanged (`host_id` missing → Local).
@@ -625,7 +462,7 @@ Existing `projects.json` files deserialize unchanged (`host_id` missing → Loca
 - **P3** Workspace users register their own task definitions (`workspace-user-tasks.json`, owner request tag + the three tag keys); family `triple-c-<env>-<owner_key>-<project-id-12>`. Anyone can register into any `triple-c-*` family, so revisions and tasks are trusted by owner tag and run by exact `family:revision` ARN.
 - **P4** Hybrid persists by symlinking `~/.claude`, `~/.claude.json`, `~/.ssh` into the EFS mount (`/mnt/triple-c-home`), not by mounting over `/home/claude`: EFS can't seed from the image, and masking would hide the image's tooling.
 - **P5** AWS runs a registry image only; `LocalBuild` maps to the registry image and `Custom` must name a registry reference.
-- **P6** Left for phase 6+: EFS mode, Copy-at-connect, setup scripts, cost estimate, port mappings, the LLM gateway sidecar, Docker access, VPN, the admin's maximum lifetime. The UI shows them disabled with the reason.
+- **P6** Left for phase 6+: EFS mode, Copy-at-connect, setup scripts, cost estimate, port mappings, the LLM gateway sidecar, Docker access, VPN, the admin's maximum lifetime (all but Docker access and VPN were built in phase 6). The UI shows them disabled with the reason.
 - **P7** Idle means no authenticated agent activity for N minutes, no `claude` process and no running scheduler job; default off, 5-1440 minutes when on.
 - **P8** Spot uses `FARGATE_SPOT`; stop code `SpotInterruption` shows as Stopped with a Spot reason.
 - **P9** Bubblewrap fails on Fargate (measured live), so the AWS host forces Claude Code's sandbox off in the generated settings, with a notice.
@@ -636,6 +473,31 @@ Existing `projects.json` files deserialize unchanged (`host_id` missing → Loca
 - **R6** Repos clone in the background after the agent starts, so the 30 s health window holds; cost: a terminal may open before a repo exists.
 - **R7** OpenAI Compatible is allowed on AWS with a warning that the URL must be reachable from AWS; only the local LiteLLM sidecar is unavailable.
 - **R8** Removal leaves task-definition revisions ACTIVE for an admin to clear: `ecs:DeregisterTaskDefinition` is only grantable on `*`, so granting it would let any user break others' workspaces. Cost: stale revisions accumulate (free).
+
+### Phase 6: rulings (2026-11-15/16)
+
+Plan decisions:
+
+- **Q1** EFS mode adds a second access point mounted at `/workspace` (root `/triple-c-workspaces/<owner_key>/<project>`, 1000:1000, 0700, on the user's own file system): the home access point's root would otherwise contain it. EFS = Hybrid + `/workspace`; leaving EFS keeps the access point until "Remove AWS resources".
+- **Q2** Copy-at-connect keeps settings in the secret and moves credentials (files and every credential variable) to a push after each connect, as above. Why: "nothing stored in AWS" has to hold for keys and tokens.
+- **Q3** The setup script is AWS-only, runs as `claude` after the clone with a 30-minute timeout, and reports `running | ok | failed <code>`; the idle stop treats it like a running clone.
+- **Q4** The start reports clone and setup progress from one agent-side status read (`triple-c-workspace-status`); a failed clone or setup is a warning, never a failed start. (Amended by R5.)
+- **Q5** The cost estimate comes from the Pricing API (`pricing:GetProducts`, `*`-only in IAM), cached a day per region; spot is shown as on-demand with a note; EFS is not estimated; any failure reads "Estimate unavailable".
+- **Q6** Port mappings reuse the auth bridge's socat-over-attach tunnel: loopback bind only, TCP only, opened after connect. They reach the container's loopback, so the agent port and (with the sidecar) 4000 are refused.
+- **Q7** The LLM gateway is an opt-in `essential: false` sidecar on 127.0.0.1:4000 using the pinned LiteLLM image; its config and keys arrive as `TRIPLEC_GATEWAY_*` payload keys with keys by `os.environ/` reference. Needs the OpenAI-compatible backend and at least 1 vCPU / 2 GiB.
+- **Q8** The lifetime cap is an environment setting (`max_workspace_hours`, module v2) enforced inside the workspace by the idle watcher: advisory, since the user has sudo in their task. Exit status 76 identifies it. Server-side enforcement is a follow-up.
+- **Q9** One WIP branch per task run, updated in place, so repeated stops don't pile up branches; unchanged trees are skipped.
+
+Execution rulings:
+
+- **R1** Gateway keys stay in the secret even under copy-at-connect: the sidecar starts before any connect. Cost: a provider key in AWS for those users; the UI says so.
+- **R2** If the AWS credentials expired before the live run, finish the docs and review and leave the live run for the user. (They were renewed; the live run happened.)
+- **R3** Clones go to a scratch folder and are renamed into place atomically; nothing at a final path is ever deleted. Why: on EFS the folder outlives the task and may hold work.
+- **R4** The WIP branch is per run and per folder (`triple-c/wip/<run-id>-<folder>`): repos sharing a remote would otherwise overwrite each other's branch.
+- **R5** The start ends at "Connecting"; clone and setup are followed by a cancellable background follower, and reconcile also covers Stopped projects holding a task ARN. Why: a start holding the project lock for up to 35 minutes blocks Stop.
+- **R6** Copy-at-connect projects don't link `~/.ssh` to EFS, so keys vanish with the task. Cost: SSH keys made inside the container don't persist.
+- **R7** Switching to copy-at-connect recreates the project secret (force delete, then create), because a new secret version would keep the old credentials as AWSPREVIOUS. Cost: a short delay on the first start after the switch.
+- **R8** The sidecar's master key is random per start, so the local Docker gateway's keychain key never goes to AWS.
 
 ## Shipped AWS artefacts
 
@@ -677,14 +539,11 @@ TLS only, tagged `triple-c:component=state`), one object per deployment (D9).
    cold start about 94-104 s, ECS `HEALTHY` about 135 s, attach to a running task about 2 s, idle
    stop verified (see "Phase 5: rulings" and `aws/README.md` "Phase 5").
 6. **EFS mode, Copy-at-connect, setup scripts, cost estimate.** Also port mappings, the LLM
-   gateway sidecar and the environment's (advisory) workspace lifetime cap. **Verified live
-   2026-11-16** in one workspace (`aws/README.md` "Phase 6: one workspace with every option"):
-   EFS `/workspace` survives a stop, the setup script runs and reports `ok`, copy-at-connect
-   leaves no credential in the secret and installs the CA, a mapped port answers through the
-   tunnel, the sidecar answers on 127.0.0.1:4000 and neither key reaches the logs, the cap reaches
-   the task as `TRIPLEC_MAX_LIFETIME_MINUTES`, and one cost estimate is fetched. Not exercised
-   live: the cap firing (unit-tested), a v1 → v2 environment update, a private clone retried
-   after connect.
+   gateway sidecar and the environment's (advisory) workspace lifetime cap. **Done 2026-11-16**
+   (rulings: "Phase 6: rulings"). Verified live in one workspace (Task 10; `aws/README.md`
+   "Phase 6: one workspace with every option"): EFS persistence, the setup script, port mapping,
+   the sidecar, copy-at-connect and the cost estimate. Not exercised live: the lifetime cap firing
+   (unit-tested), a v1 → v2 environment update, a private clone retried after connect.
 7. **ECS on EC2.** Per-user capacity providers in the onboarding module, privileged/Docker/VPN on
    dedicated capacity.
 8. **Standard tenancy** (opt-in), only if demand appears.
