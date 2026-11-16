@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { AwsWorkspaceConfig, HostConnection, Project, RepoSource } from "../../../../lib/types";
 import * as commands from "../../../../lib/tauri-commands";
+import { environmentMaxHours } from "../../../../lib/environmentMaxHours";
 import { useAppState } from "../../../../store/appState";
 import {
   COPY_AT_CONNECT_GATEWAY_NOTE,
@@ -80,13 +81,13 @@ export default function HostSection({ project, save, disabled }: Props) {
   const environment = project.aws_placement?.environment;
   useEffect(() => {
     setMaxHours(null);
-    if (!project.host_id || !environment) return;
+    if (!project.host_id || !region || !environment) return;
     let cancelled = false;
-    // Best effort: an unreadable record just shows no cap line.
-    Promise.resolve()
-      .then(() => commands.awsEnvironmentMaxHours(project.id))
+    // Best effort: an unreadable record just shows no cap line. Cached per
+    // environment, so re-opening this section doesn't ask AWS again.
+    environmentMaxHours(project.id, project.host_id, region, environment)
       .then((h) => {
-        if (!cancelled) setMaxHours(h ?? null);
+        if (!cancelled) setMaxHours(h);
       })
       .catch(() => {});
     return () => {
@@ -94,7 +95,35 @@ export default function HostSection({ project, save, disabled }: Props) {
     };
   }, [project.id, project.host_id, region, environment]);
 
-  const saveAws = (patch: Partial<AwsWorkspaceConfig>) => save({ aws: { ...aws, ...patch } });
+  // The config the next save starts from: the stored one plus every patch
+  // saved since. A blur's save followed at once by a toggle's (before the
+  // store has the first back) must not spread the render-time `aws` and
+  // revert the first. Re-based on the prop when it changes with no save in
+  // flight.
+  const latest = useRef({ base: project.aws, value: aws, inFlight: 0 });
+  if (latest.current.base !== project.aws && latest.current.inFlight === 0) {
+    latest.current = { base: project.aws, value: aws, inFlight: 0 };
+  }
+  const saveAws = async (patch: Partial<AwsWorkspaceConfig>) => {
+    const l = latest.current;
+    const next = { ...l.value, ...patch };
+    l.value = next;
+    l.inFlight += 1;
+    // A refused save is not the config any more: start again from the store.
+    const refused = () => {
+      if (l.value === next) l.value = l.base ?? defaultAwsWorkspace();
+    };
+    try {
+      const ok = await save({ aws: next });
+      if (!ok) refused();
+      return ok;
+    } catch (e) {
+      refused();
+      throw e;
+    } finally {
+      l.inFlight -= 1;
+    }
+  };
 
   const hasResources = !!(
     aws.task_arn ||

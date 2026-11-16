@@ -8,6 +8,7 @@ import HostSection from "./HostSection";
 import { awsProject, localProject } from "../../../../test/awsFixtures";
 import type { AppSettings, AuthBridgeStatus, Project } from "../../../../lib/types";
 import { useAppState } from "../../../../store/appState";
+import { clearEnvironmentMaxHoursCache } from "../../../../lib/environmentMaxHours";
 
 const OFF_BRIDGE: AuthBridgeStatus = { enabled: false, active_ports: [], conflicts: [] };
 const removeAwsResources = vi.fn();
@@ -27,7 +28,10 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn(async () => null) }));
 
 const save = vi.fn().mockResolvedValue(true);
 
-beforeEach(() => vi.clearAllMocks());
+beforeEach(() => {
+  vi.clearAllMocks();
+  clearEnvironmentMaxHoursCache();
+});
 
 function toggle(name: string) {
   return screen.getByRole("switch", { name });
@@ -376,6 +380,32 @@ describe("HostSection", () => {
     expect(save.mock.calls[1][0].aws.setup_script).toBeNull();
   });
 
+  it("a toggle right after the setup script's blur keeps the script", async () => {
+    // The store has not caught up with the first save when the second comes.
+    const p = awsProject();
+    renderHost(p);
+    const box = screen.getByLabelText("Setup script");
+    fireEvent.change(box, { target: { value: "make deps\n" } });
+    fireEvent.blur(box);
+    fireEvent.click(toggle("Spot"));
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(2));
+    expect(save.mock.calls[0][0].aws.setup_script).toBe("make deps\n");
+    expect(save.mock.calls[1][0].aws).toMatchObject({ setup_script: "make deps\n", spot: true });
+  });
+
+  it("starts again from the stored config after a refused save", async () => {
+    save.mockResolvedValueOnce(false);
+    renderHost();
+    const box = screen.getByLabelText("Setup script");
+    fireEvent.change(box, { target: { value: "make deps\n" } });
+    fireEvent.blur(box);
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(1));
+    await act(async () => {});
+    fireEvent.click(toggle("Spot"));
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(2));
+    expect(save.mock.calls[1][0].aws).toMatchObject({ setup_script: null, spot: true });
+  });
+
   it("refuses a setup script over 32 KiB with the backend's message", () => {
     renderHost();
     const box = screen.getByLabelText("Setup script");
@@ -413,6 +443,7 @@ describe("HostSection", () => {
     cleanup();
 
     for (const none of [0, null]) {
+      clearEnvironmentMaxHoursCache();
       awsEnvironmentMaxHours.mockResolvedValueOnce(none);
       renderHost();
       await waitFor(() => expect(awsEnvironmentMaxHours).toHaveBeenCalled());
@@ -420,6 +451,23 @@ describe("HostSection", () => {
       expect(screen.queryByText(/stops workspaces after/)).toBeNull();
       cleanup();
     }
+  });
+
+  it("reads the lifetime cap once per environment across re-mounts", async () => {
+    awsEnvironmentMaxHours.mockResolvedValue(24);
+    renderHost();
+    await screen.findByText(/stops workspaces after 24 h/);
+    cleanup();
+    renderHost();
+    // Shown from the cache, without asking AWS again.
+    await screen.findByText(/stops workspaces after 24 h/);
+    expect(awsEnvironmentMaxHours).toHaveBeenCalledTimes(1);
+    cleanup();
+
+    // Another environment is its own read.
+    renderHost(awsProject({ aws_placement: { region: "eu-west-1", environment: "prod" } }));
+    await waitFor(() => expect(awsEnvironmentMaxHours).toHaveBeenCalledTimes(2));
+    awsEnvironmentMaxHours.mockReset();
   });
 
   it("does not let the credentials setting change while the workspace runs", () => {
