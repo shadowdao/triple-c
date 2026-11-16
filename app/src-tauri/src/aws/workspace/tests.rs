@@ -800,6 +800,8 @@ struct Fake {
     secret_reads: Mutex<usize>,
     /// Puts that fail as "scheduled for deletion" before one succeeds.
     pending_puts: Mutex<usize>,
+    /// Reads that fail as "marked for deletion" before one succeeds.
+    pending_reads: Mutex<usize>,
     /// Calls `create_project_secret` got.
     creates: Mutex<usize>,
 }
@@ -847,8 +849,15 @@ impl WorkspaceApi for Fake {
         c.push((fs_id.into(), root.into(), tags.to_vec()));
         Ok(format!("fsap-new{}", c.len()))
     }
-    async fn project_secret_value(&self, _name: &str) -> Result<Option<String>, AwsError> {
+    async fn project_secret_value(&self, name: &str) -> Result<Option<String>, AwsError> {
         *self.secret_reads.lock().unwrap() += 1;
+        {
+            let mut pending = self.pending_reads.lock().unwrap();
+            if *pending > 0 {
+                *pending -= 1;
+                return Err(pending_deletion_error(name));
+            }
+        }
         Ok(self.existing_secret.lock().unwrap().clone())
     }
     async fn delete_project_secret(&self, name: &str) -> Result<(), AwsError> {
@@ -1749,6 +1758,34 @@ async fn the_start_after_a_timed_out_replace_retries_the_create() {
         .to_string();
     assert!(e.contains("Start the project again in a minute"), "{e}");
     assert!(!e.contains("Restore"), "{e}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_copy_at_connect_read_of_a_secret_being_deleted_is_retried() {
+    // CreateSecret said it exists, then the read meets a deletion AWS is
+    // still finishing (another start replacing it): retried like the writes.
+    let env = pairs(&[("TZ", "UTC")]);
+    let fake = Fake::onboarded();
+    *fake.existing_secret.lock().unwrap() = Some(
+        r#"{"TRIPLEC_AGENT_TOKEN":"t","TRIPLEC_CREDENTIALS":"connect","TZ":"UTC","TRIPLEC_REPOS":"[]"}"#.into(),
+    );
+    *fake.pending_reads.lock().unwrap() = 3;
+    prepare_workspace(&fake, &who(), &env_info(), &copy_at_connect_project(), &env, &[], &[], IMAGE, None)
+        .await
+        .unwrap();
+    assert_eq!(*fake.secret_reads.lock().unwrap(), 4);
+    assert_eq!(fake.secrets.lock().unwrap().len(), 1);
+
+    // Still being deleted past the limit: try again in a minute.
+    let fake = Fake::onboarded();
+    *fake.existing_secret.lock().unwrap() = Some(r#"{"TZ":"UTC"}"#.into());
+    *fake.pending_reads.lock().unwrap() = 1000;
+    let e = prepare_workspace(&fake, &who(), &env_info(), &copy_at_connect_project(), &env, &[], &[], IMAGE, None)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("Start the project again in a minute"), "{e}");
+    assert!(fake.secrets.lock().unwrap().is_empty());
 }
 
 #[test]

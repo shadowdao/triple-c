@@ -1048,24 +1048,31 @@ pub async fn prepare_workspace<W: WorkspaceApi>(
         {
             Some(arn) => arn,
             None => {
-            let old = api.project_secret_value(&secret_name).await?;
-            if old.as_deref().is_some_and(|o| holds_credentials(o, &payload, custom)) {
-                log::info!(
-                    "Project {}: its secret still held credentials; replacing it so no version keeps them",
-                    project.id
-                );
-                replace_project_secret(
-                    api,
-                    &secret_name,
-                    &env.kms_key_arn,
-                    &json,
-                    &tags,
-                    RECREATE_TIMING,
-                )
-                .await?
-            } else {
-                put_secret_retrying(api, &secret_name, &env.kms_key_arn, &json, &tags).await?
-            }
+                // The secret existed at the create but may be marked for
+                // deletion by now (another start replacing it): wait that out
+                // like the writes do. Once it is gone the read says `None`
+                // and the put below makes it again.
+                let old = retry_while_pending_deletion(&secret_name, RECREATE_TIMING, || {
+                    api.project_secret_value(&secret_name)
+                })
+                .await?;
+                if old.as_deref().is_some_and(|o| holds_credentials(o, &payload, custom)) {
+                    log::info!(
+                        "Project {}: its secret still held credentials; replacing it so no version keeps them",
+                        project.id
+                    );
+                    replace_project_secret(
+                        api,
+                        &secret_name,
+                        &env.kms_key_arn,
+                        &json,
+                        &tags,
+                        RECREATE_TIMING,
+                    )
+                    .await?
+                } else {
+                    put_secret_retrying(api, &secret_name, &env.kms_key_arn, &json, &tags).await?
+                }
             }
         },
         None => put_secret_retrying(api, &secret_name, &env.kms_key_arn, &json, &tags).await?,
