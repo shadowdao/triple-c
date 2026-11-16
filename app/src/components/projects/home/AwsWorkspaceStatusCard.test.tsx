@@ -113,4 +113,39 @@ describe("AwsWorkspaceStatusCard", () => {
     expect(awsWorkspaceStatus).toHaveBeenCalledTimes(2);
     state.mockRestore();
   });
+
+  it("never runs two polls at once when the window is hidden and shown mid-read", async () => {
+    let resolve: (s: WorkspaceStatus) => void = () => {};
+    awsWorkspaceStatus.mockImplementation(() => new Promise((r) => (resolve = r)));
+    render(<AwsWorkspaceStatusCard project={project()} />);
+    await flush();
+    expect(awsWorkspaceStatus).toHaveBeenCalledTimes(1);
+    // Hidden and shown again while the first read is still out.
+    const state = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+    await act(async () => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    state.mockReturnValue("visible");
+    await act(async () => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    await flush();
+    expect(awsWorkspaceStatus).toHaveBeenCalledTimes(1);
+    // The read ends: one chain goes on, one read per interval.
+    await act(async () => resolve(CLONING));
+    await flush();
+    await act(async () => {
+      vi.advanceTimersByTime(STATUS_POLL_MS);
+    });
+    await flush();
+    expect(awsWorkspaceStatus).toHaveBeenCalledTimes(2);
+    await act(async () => resolve(CLONING));
+    await flush();
+    await act(async () => {
+      vi.advanceTimersByTime(STATUS_POLL_MS);
+    });
+    await flush();
+    expect(awsWorkspaceStatus).toHaveBeenCalledTimes(3);
+    state.mockRestore();
+  });
 });

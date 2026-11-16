@@ -29,20 +29,26 @@ export default function AwsWorkspaceStatusCard({ project }: { project: Project }
     if (!running) return;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
+    // A read in progress: hiding and showing the window during it must not
+    // start a second poll chain beside this one.
+    let inFlight = false;
     const visible = () => document.visibilityState !== "hidden";
     const poll = async () => {
       timer = null;
       if (!visible()) return; // resumed by visibilitychange
+      inFlight = true;
       try {
         const s = await awsWorkspaceStatus(project.id);
         if (!cancelled) setStatus(s);
       } catch {
         // A failed read keeps the last status; the next poll tries again.
+      } finally {
+        inFlight = false;
       }
       if (!cancelled) timer = setTimeout(poll, STATUS_POLL_MS);
     };
     const onVisibility = () => {
-      if (visible() && timer === null && !cancelled) void poll();
+      if (visible() && timer === null && !inFlight && !cancelled) void poll();
     };
     void poll();
     document.addEventListener("visibilitychange", onVisibility);
