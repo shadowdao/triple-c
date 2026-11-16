@@ -1308,11 +1308,29 @@ fn boundary_vars_carry_the_shipped_boundary() {
     let tags = default_tags(&body);
     assert_eq!(
         object_keys(tags),
-        BTreeSet::from(["triple-c:component".to_string()])
+        BTreeSet::from([
+            "triple-c:component".to_string(),
+            "triple-c:template-version".to_string()
+        ])
     );
     assert_eq!(
         object_get(tags, "triple-c:component"),
         Some(&Expression::String("boundary".into()))
+    );
+}
+
+#[test]
+fn the_boundary_module_version_is_pinned() {
+    assert_eq!(BOUNDARY_MODULE_VERSION, 2);
+    let body = parsed(ModuleKind::PermissionsBoundary);
+    let version = local_def(&body, "template_version");
+    assert_eq!(version, &Expression::Number(BOUNDARY_MODULE_VERSION.into()));
+    let tag = object_get(default_tags(&body), "triple-c:template-version")
+        .expect("template-version default tag");
+    assert!(
+        render(tag).contains("local.template_version"),
+        "template-version tag is {}",
+        render(tag)
     );
 }
 
@@ -1874,6 +1892,230 @@ const MODULE_CALLS: &[(&str, &[Check])] = &[
     ("backend.s3", BACKEND),
 ];
 
+// Phase 7 (per-user EC2 capacity, E1–E5, E11): the calls the onboarding
+// module's EC2 resources will make, written down with the policy (Task 2)
+// before the resources exist. Task 3 moves each entry into MODULE_CALLS
+// under its type (merging with the existing `aws_ecs_cluster`,
+// `aws_ecs_cluster_capacity_providers`, `aws_iam_role`, `aws_ssm_parameter`
+// and `data.aws_ssm_parameter` entries) and deletes this table. Names are
+// the user's (`triple-c-<env>-<owner key>[-instance]`).
+const USER_CLUSTER: &str = "arn:aws:ecs:{region}:{account}:cluster/triple-c-probe-0123456789ab";
+const CAPACITY_PROVIDER: &str =
+    "arn:aws:ecs:{region}:{account}:capacity-provider/triple-c-probe-0123456789ab";
+const LAUNCH_TEMPLATE: &str = "arn:aws:ec2:{region}:{account}:launch-template/lt-00000000000000000";
+const AUTO_SCALING_GROUP: &str = "arn:aws:autoscaling:{region}:{account}:autoScalingGroup:\
+     00000000-0000-0000-0000-000000000000:autoScalingGroupName/triple-c-probe-0123456789ab";
+const INSTANCE: &str = "arn:aws:ec2:{region}:{account}:instance/i-00000000000000000";
+const VOLUME: &str = "arn:aws:ec2:{region}:{account}:volume/vol-00000000000000000";
+const IMAGE: &str = "arn:aws:ec2:{region}::image/ami-00000000000000000";
+const INSTANCE_ROLE: &str = "arn:aws:iam::{account}:role/triple-c-probe-0123456789ab-instance";
+const INSTANCE_PROFILE: &str =
+    "arn:aws:iam::{account}:instance-profile/triple-c-probe-0123456789ab-instance";
+const AUTO_SCALING_SERVICE_ROLE: &str = "arn:aws:iam::{account}:role/aws-service-role/\
+     autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling";
+const ECS_SERVICE_ROLE: &str =
+    "arn:aws:iam::{account}:role/aws-service-role/ecs.amazonaws.com/AWSServiceRoleForECS";
+const AMI_PARAMETER: &str = "arn:aws:ssm:{region}::parameter/aws/service/ecs/optimized-ami/\
+     amazon-linux-2023/recommended/image_id";
+const USER_RECORD: &str =
+    "arn:aws:ssm:{region}:{account}:parameter/triple-c/users/probe/0123456789ab";
+/// A launch from the user's launch template (what creating the group
+/// checks the caller for).
+const FROM_TEMPLATE: Context = &[(
+    "ec2:LaunchTemplate",
+    Literal("arn:aws:ec2:{region}:{account}:launch-template/lt-00000000000000000"),
+)];
+const AMAZON_IMAGE: Context = &[
+    ("ec2:Owner", Literal("amazon")),
+    (
+        "ec2:LaunchTemplate",
+        Literal("arn:aws:ec2:{region}:{account}:launch-template/lt-00000000000000000"),
+    ),
+];
+const TO_EC2: Context = &[("iam:PassedToService", Literal("ec2.amazonaws.com"))];
+
+const EC2_COMPUTE_CALLS: &[(&str, &[Check])] = &[
+    (
+        "aws_ecs_cluster (user)",
+        &[
+            call("ecs:CreateCluster", USER_CLUSTER, USER_CREATE),
+            call(
+                "ecs:TagResource",
+                USER_CLUSTER,
+                &[("ecs:CreateAction", Literal("CreateCluster"))],
+            ),
+            call("ecs:DescribeClusters", USER_CLUSTER, NONE),
+            call("ecs:ListTagsForResource", USER_CLUSTER, NONE),
+            call("ecs:UpdateCluster", USER_CLUSTER, USER_TAGGED),
+            call("ecs:DeleteCluster", USER_CLUSTER, USER_TAGGED),
+        ],
+    ),
+    (
+        // Hypothesis: authorized against the cluster and the provider.
+        "aws_ecs_cluster_capacity_providers (user)",
+        &[
+            call("ecs:PutClusterCapacityProviders", USER_CLUSTER, USER_TAGGED),
+            call(
+                "ecs:PutClusterCapacityProviders",
+                CAPACITY_PROVIDER,
+                USER_TAGGED,
+            ),
+            call("ecs:DescribeClusters", USER_CLUSTER, NONE),
+        ],
+    ),
+    (
+        // Managed scaling runs as ECS's service-linked role, created on
+        // first use if the account has none.
+        "aws_ecs_capacity_provider",
+        &[
+            call("ecs:CreateCapacityProvider", CAPACITY_PROVIDER, USER_CREATE),
+            call(
+                "ecs:TagResource",
+                CAPACITY_PROVIDER,
+                &[("ecs:CreateAction", Literal("CreateCapacityProvider"))],
+            ),
+            call("ecs:DescribeCapacityProviders", "*", NONE),
+            call("ecs:ListTagsForResource", CAPACITY_PROVIDER, NONE),
+            call("ecs:UpdateCapacityProvider", CAPACITY_PROVIDER, USER_TAGGED),
+            call("ecs:TagResource", CAPACITY_PROVIDER, USER_TAGGED),
+            call("ecs:UntagResource", CAPACITY_PROVIDER, USER_TAGGED),
+            call("ecs:DeleteCapacityProvider", CAPACITY_PROVIDER, USER_TAGGED),
+            call(
+                "iam:CreateServiceLinkedRole",
+                ECS_SERVICE_ROLE,
+                &[("iam:AWSServiceName", Literal("ecs.amazonaws.com"))],
+            ),
+        ],
+    ),
+    (
+        "aws_launch_template",
+        &[
+            call("ec2:CreateLaunchTemplate", LAUNCH_TEMPLATE, USER_CREATE),
+            call(
+                "ec2:CreateTags",
+                LAUNCH_TEMPLATE,
+                created_by!("CreateLaunchTemplate"),
+            ),
+            call("ec2:DescribeLaunchTemplates", "*", NONE),
+            call("ec2:DescribeLaunchTemplateVersions", "*", NONE),
+            call(
+                "ec2:CreateLaunchTemplateVersion",
+                LAUNCH_TEMPLATE,
+                USER_TAGGED,
+            ),
+            call("ec2:ModifyLaunchTemplate", LAUNCH_TEMPLATE, USER_TAGGED),
+            call("ec2:CreateTags", LAUNCH_TEMPLATE, USER_TAGGED),
+            call("ec2:DeleteTags", LAUNCH_TEMPLATE, USER_TAGGED),
+            call("ec2:DeleteLaunchTemplate", LAUNCH_TEMPLATE, USER_TAGGED),
+        ],
+    ),
+    (
+        // Creating the group checks that the caller could launch its
+        // template (RunInstances with what the template names, the tags the
+        // launch puts on, the instance role passed to EC2). The group's own
+        // launches run as Auto Scaling's service-linked role. ASG tags are
+        // not the provider's default_tags: the module sets them per group.
+        // SetInstanceProtection: hypothesis, for draining before destroy.
+        "aws_autoscaling_group",
+        &[
+            call(
+                "autoscaling:CreateAutoScalingGroup",
+                AUTO_SCALING_GROUP,
+                USER_CREATE,
+            ),
+            call(
+                "autoscaling:CreateOrUpdateTags",
+                AUTO_SCALING_GROUP,
+                USER_CREATE,
+            ),
+            call(
+                "iam:CreateServiceLinkedRole",
+                AUTO_SCALING_SERVICE_ROLE,
+                &[("iam:AWSServiceName", Literal("autoscaling.amazonaws.com"))],
+            ),
+            call("ec2:RunInstances", LAUNCH_TEMPLATE, USER_TAGGED),
+            call("ec2:RunInstances", INSTANCE, FROM_TEMPLATE),
+            call("ec2:RunInstances", VOLUME, FROM_TEMPLATE),
+            call("ec2:RunInstances", ENI, FROM_TEMPLATE),
+            call("ec2:RunInstances", SUBNET, FROM_TEMPLATE),
+            call("ec2:RunInstances", SG, FROM_TEMPLATE),
+            call("ec2:RunInstances", IMAGE, AMAZON_IMAGE),
+            call("ec2:CreateTags", INSTANCE, created_by!("RunInstances")),
+            call("ec2:CreateTags", VOLUME, created_by!("RunInstances")),
+            call("ec2:CreateTags", ENI, created_by!("RunInstances")),
+            call("iam:PassRole", INSTANCE_ROLE, TO_EC2),
+            call("autoscaling:DescribeAutoScalingGroups", "*", NONE),
+            call("autoscaling:DescribeScalingActivities", "*", NONE),
+            call(
+                "autoscaling:UpdateAutoScalingGroup",
+                AUTO_SCALING_GROUP,
+                USER_TAGGED,
+            ),
+            call(
+                "autoscaling:SetInstanceProtection",
+                AUTO_SCALING_GROUP,
+                USER_TAGGED,
+            ),
+            call(
+                "autoscaling:CreateOrUpdateTags",
+                AUTO_SCALING_GROUP,
+                USER_TAGGED,
+            ),
+            call("autoscaling:DeleteTags", AUTO_SCALING_GROUP, USER_TAGGED),
+            call(
+                "autoscaling:DeleteAutoScalingGroup",
+                AUTO_SCALING_GROUP,
+                USER_TAGGED,
+            ),
+        ],
+    ),
+    (
+        "aws_iam_role (instance)",
+        &[
+            call("iam:CreateRole", INSTANCE_ROLE, BOUNDED),
+            call("iam:PutRolePolicy", INSTANCE_ROLE, BOUNDED),
+            call("iam:GetRole", INSTANCE_ROLE, NONE),
+            call("iam:ListInstanceProfilesForRole", INSTANCE_ROLE, NONE),
+            call("iam:DeleteRolePolicy", INSTANCE_ROLE, BOUNDED),
+            call("iam:DeleteRole", INSTANCE_ROLE, NONE),
+        ],
+    ),
+    (
+        // Hypothesis: adding the role needs it passable to EC2.
+        "aws_iam_instance_profile",
+        &[
+            call("iam:CreateInstanceProfile", INSTANCE_PROFILE, NONE),
+            call("iam:TagInstanceProfile", INSTANCE_PROFILE, NONE),
+            call("iam:AddRoleToInstanceProfile", INSTANCE_PROFILE, NONE),
+            call("iam:PassRole", INSTANCE_ROLE, TO_EC2),
+            call("iam:GetInstanceProfile", INSTANCE_PROFILE, NONE),
+            call("iam:ListInstanceProfileTags", INSTANCE_PROFILE, NONE),
+            call("iam:UntagInstanceProfile", INSTANCE_PROFILE, NONE),
+            call("iam:RemoveRoleFromInstanceProfile", INSTANCE_PROFILE, NONE),
+            call("iam:DeleteInstanceProfile", INSTANCE_PROFILE, NONE),
+        ],
+    ),
+    (
+        "data.aws_ssm_parameter (AMI)",
+        &[call("ssm:GetParameter", AMI_PARAMETER, NONE)],
+    ),
+    (
+        "aws_ssm_parameter (user record)",
+        &[
+            call("ssm:PutParameter", USER_RECORD, USER_CREATE),
+            call("ssm:AddTagsToResource", USER_RECORD, USER_CREATE),
+            call("ssm:GetParameter", USER_RECORD, NONE),
+            call("ssm:ListTagsForResource", USER_RECORD, NONE),
+            call("ssm:DeleteParameter", USER_RECORD, NONE),
+        ],
+    ),
+];
+
+/// MODULE_CALLS and the phase-7 calls Task 3's resources will make.
+fn all_module_calls() -> impl Iterator<Item = &'static (&'static str, &'static [Check])> {
+    MODULE_CALLS.iter().chain(EC2_COMPUTE_CALLS.iter())
+}
+
 /// `resource.<type>` and `data.<type>` of the environment and onboarding
 /// modules, and `backend.s3`.
 fn module_types() -> BTreeSet<String> {
@@ -1955,7 +2197,7 @@ fn the_admin_tier_can_apply_every_module_resource() {
     let admin = tier_statements(&[Tier::EnvironmentAdmin]);
     let both = tier_statements(&[Tier::EnvironmentAdmin, Tier::WorkspaceUser]);
     let mut missing = Vec::new();
-    for (ty, calls) in MODULE_CALLS {
+    for (ty, calls) in all_module_calls() {
         for c in *calls {
             for (which, stmts) in [("admin", &admin), ("admin + workspace", &both)] {
                 if !allowed_by(stmts, c) {
@@ -2076,10 +2318,10 @@ const APP_ONLY_WRITES: &[&str] = &[
     "s3:PutBucketPublicAccessBlock",
     "s3:PutBucketTagging",
     "s3:PutBucketPolicy",
-    // Workspaces (phase 5): task definitions and the roles they name.
+    // Workspaces (phase 5): task definitions and the roles they name
+    // (`iam:PassRole` is a module call too since phase 7: the instance role).
     "ecs:RegisterTaskDefinition",
     "ecs:DeregisterTaskDefinition",
-    "iam:PassRole",
     "iam:AttachRolePolicy",
     "iam:DetachRolePolicy",
     // The permission check itself.
@@ -2103,8 +2345,7 @@ fn every_module_write_has_an_admin_check_and_vice_versa() {
         .map(|c| c.action)
         .filter(|a| is_write(a))
         .collect();
-    let module: BTreeSet<&str> = MODULE_CALLS
-        .iter()
+    let module: BTreeSet<&str> = all_module_calls()
         .flat_map(|(_, calls)| calls.iter().map(|c| c.action))
         .filter(|a| is_write(a))
         .collect();

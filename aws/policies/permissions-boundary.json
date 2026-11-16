@@ -116,6 +116,54 @@
         "arn:aws:bedrock:*:*:inference-profile/*",
         "arn:aws:bedrock:*:*:application-inference-profile/*"
       ]
+    },
+    {
+      "Sid": "EcsAgentOnTripleCClusters",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:RegisterContainerInstance",
+        "ecs:DeregisterContainerInstance",
+        "ecs:Poll",
+        "ecs:StartTelemetrySession",
+        "ecs:Submit*",
+        "ecs:UpdateContainerInstancesState"
+      ],
+      "Resource": [
+        "arn:aws:ecs:*:*:cluster/triple-c-*",
+        "arn:aws:ecs:*:*:container-instance/triple-c-*/*"
+      ]
+    },
+    {
+      "Sid": "EcsAgentTagsItsInstance",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:TagResource"
+      ],
+      "Resource": [
+        "arn:aws:ecs:*:*:container-instance/triple-c-*/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "ecs:CreateAction": "RegisterContainerInstance"
+        }
+      }
+    },
+    {
+      "Sid": "InstanceAgents",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:DiscoverPollEndpoint",
+        "ssm:UpdateInstanceInformation",
+        "ec2messages:AcknowledgeMessage",
+        "ec2messages:DeleteMessage",
+        "ec2messages:FailMessage",
+        "ec2messages:GetEndpoint",
+        "ec2messages:GetMessages",
+        "ec2messages:SendReply"
+      ],
+      "Resource": [
+        "*"
+      ]
     }
   ]
 }

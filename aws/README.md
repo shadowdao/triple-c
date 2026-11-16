@@ -10,13 +10,14 @@ tier the signed-in identity has under **Settings → Hosts → Check**.
 | `policies/workspace-user-tasks.json` | The **workspace user** tier, part 2: register and tag **their own** ECS task definitions, read **their own** secrets, and read Fargate prices for the cost estimate (`workspace-user.json` has no room left) |
 | `policies/environment-admin.json` | The **environment admin** tier, part 1: apply and destroy the environment and onboarding modules (`terraform/`) with OpenTofu, and keep their state |
 | `policies/environment-admin-network.json` | The **environment admin** tier, part 2: the network those modules create (VPC, subnets, gateways, routes, security groups) |
+| `policies/environment-admin-compute.json` | The **environment admin** tier, part 3: per-user EC2 capacity the onboarding module creates (phase 7): capacity providers, launch templates, Auto Scaling groups, instance profiles, the instance role passed to EC2 |
 | `policies/permissions-boundary.json` | The **permissions boundary** every Triple-C role must carry. It is never attached to a person |
 
-The workspace tier and the admin tier are each **two** files, because one managed policy holds
-only 6,144 characters; both files of a tier are required, and the app's **Copy** lists every
-file of a tier. An environment admin attaches all four tier files (both workspace user files and
-both admin files): the admin files add environment management on top of everything a workspace
-user can do. Explicit Deny statements in any file apply to anyone
+The workspace tier is **two** files and the admin tier **three**, because one managed policy
+holds only 6,144 characters; every file of a tier is required, and the app's **Copy** lists every
+file of a tier. An environment admin attaches all five tier files (both workspace user files and
+the three admin files): the admin files add environment management on top of everything a
+workspace user can do. Explicit Deny statements in any file apply to anyone
 who has it attached.
 
 ## Workspace user
@@ -137,11 +138,18 @@ and nothing runs with more than the admin holds. It covers:
 - the per-account state bucket `triple-c-tfstate-<account>-<region>` (created by the app, tagged
   `triple-c:component=state`, then read and written by OpenTofu's S3 backend, lock files included);
 - `triple-c-*` IAM roles, and reading the `triple-c-permissions-boundary` policy;
-- ECS clusters (Fargate and Fargate Spot only) and task definitions;
+- ECS clusters (the environment's: Fargate and Fargate Spot; a user's: their own EC2 capacity
+  provider) and task definitions;
 - the network: VPCs, subnets, an internet gateway, route tables and routes, an Elastic IP and NAT
   gateway, security groups and their rules (`environment-admin-network.json`);
 - EFS file systems, mount targets and file-system policies, and KMS keys and aliases;
-- `/triple-c/*` log groups and `/triple-c/*` SSM parameters.
+- `/triple-c/*` log groups and `/triple-c/*` SSM parameters (including each user's compute record
+  `/triple-c/users/<env>/<owner key>`);
+- per-user EC2 capacity (`environment-admin-compute.json`, phase 7): the user's own
+  `triple-c-<env>-<owner key>` cluster and capacity provider, a component-tagged launch template
+  and `triple-c-*` Auto Scaling group, the `triple-c-*` instance profile, passing
+  `triple-c-*-instance` roles to EC2, reading the ECS-optimized AMI's public SSM parameter, and
+  the Auto Scaling and ECS service-linked roles.
 
 **Clearing workspace task definitions.** Removing a project leaves its revisions registered
 (family `triple-c-<env>-<owner key>-<project id, 12 chars>`). The admin tier may deregister any
@@ -156,9 +164,9 @@ Deregistered revisions become INACTIVE; ECS keeps them until they are deleted wi
 `ecs:DeleteTaskDefinitions`, which the admin tier does not grant (an account administrator can).
 A task still running from a revision keeps running.
 
-Not in v1, and so not in the policy: ECR (tasks pull from GHCR), custom ECS capacity providers,
-and passing roles to EC2 (`iam:PassRole` is to `ecs-tasks.amazonaws.com` only). Phase 7's EC2
-capacity adds them back.
+Not in the policy: ECR (tasks pull from GHCR). Phase 7's EC2 capacity added custom ECS capacity
+providers and passing roles to EC2, the latter only for `triple-c-*-instance` roles (task and
+execution roles still go to `ecs-tasks.amazonaws.com` only).
 
 ### What each module resource needs
 
@@ -192,6 +200,16 @@ the proof; an action it shows missing is added to the table, the policy, the che
 | `aws_iam_role` | `iam:CreateRole` (with the boundary), `TagRole`, `UntagRole`, `GetRole`, `ListRolePolicies`, `ListAttachedRolePolicies`, `ListInstanceProfilesForRole`, `UpdateRole`, `UpdateRoleDescription`, `DeleteRole` (`triple-c-*`) |
 | `aws_iam_role_policy` | `iam:PutRolePolicy`, `DeleteRolePolicy` (with the boundary), `GetRolePolicy` (the role; untaggable) |
 | data sources | `sts:GetCallerIdentity`, `ec2:DescribeAvailabilityZones`, `ec2:DescribeSubnets`, `ssm:GetParameter` |
+| *Phase 7, per-user EC2 (onboarding module, expected; `EC2_COMPUTE_CALLS` until the resources exist)* | |
+| `aws_ecs_cluster` (the user's) | as the environment's cluster, on `cluster/triple-c-<env>-<owner key>` |
+| `aws_ecs_capacity_provider` | `ecs:CreateCapacityProvider`, `TagResource` (at create), `ListTagsForResource`, `UpdateCapacityProvider`, `UntagResource`, `DeleteCapacityProvider` (`capacity-provider/triple-c-*`), `DescribeCapacityProviders` (`*`); `iam:CreateServiceLinkedRole` for `ecs.amazonaws.com` (managed scaling runs as ECS's service-linked role) |
+| `aws_ecs_cluster_capacity_providers` (the user's) | `ecs:PutClusterCapacityProviders` (the cluster and, expected, the capacity provider) |
+| `aws_launch_template` | `ec2:CreateLaunchTemplate` (request tag), `CreateTags` (at create), `CreateLaunchTemplateVersion`, `ModifyLaunchTemplate`, `CreateTags`/`DeleteTags`, `DeleteLaunchTemplate` (tagged), `Describe*` |
+| `aws_autoscaling_group` | `autoscaling:CreateAutoScalingGroup`, `CreateOrUpdateTags` (`triple-c-*`, request tag), `UpdateAutoScalingGroup`, `SetInstanceProtection`, `CreateOrUpdateTags`/`DeleteTags`, `DeleteAutoScalingGroup` (tagged), `Describe*` (`*`); `iam:CreateServiceLinkedRole` for `autoscaling.amazonaws.com`. Creating a group checks that the caller could launch its template: `ec2:RunInstances` on the tagged launch template, on instance, volume, network interface, subnet and security group only with `ec2:LaunchTemplate` set, and on images only Amazon's (`ec2:Owner = amazon`); `ec2:CreateTags` at `RunInstances`; `iam:PassRole` of the instance role to `ec2.amazonaws.com`. ASG tags are **not** the provider's `default_tags`: the module must set the component tag on the group itself |
+| `aws_iam_role` (instance), `aws_iam_role_policy` | as the other per-user roles (bounded), on `triple-c-<env>-<owner key>-instance` |
+| `aws_iam_instance_profile` | `iam:CreateInstanceProfile`, `TagInstanceProfile`, `AddRoleToInstanceProfile` (expected to need `iam:PassRole` of the role too), `GetInstanceProfile`, `ListInstanceProfileTags`, `UntagInstanceProfile`, `RemoveRoleFromInstanceProfile`, `DeleteInstanceProfile` (`instance-profile/triple-c-*`) |
+| `data.aws_ssm_parameter` (AMI) | `ssm:GetParameter`/`GetParameters` on the public `parameter/aws/service/ecs/optimized-ami/*` |
+| `aws_ssm_parameter` (user record) | as the environment record, on `/triple-c/users/<env>/<owner key>` |
 | S3 backend | `s3:ListBucket` (the state bucket), `GetObject`/`PutObject`/`DeleteObject` (`triple-c-tfstate-*/*`, the `.tflock` objects included), in the caller's own account |
 
 The app also creates the state bucket: `s3:CreateBucket` with a `triple-c:component` request tag
@@ -221,7 +239,14 @@ the role carries the `triple-c-permissions-boundary` managed policy as its permi
     (tagged `user-onboarding` by their onboarding module); the file system's own policy admits
     only its owner's task role, through an access point;
   - `sts:GetCallerIdentity`;
-  - invoking Bedrock models.
+  - invoking Bedrock models;
+  - for a user's EC2 instance role (phase 7, E4): the ECS agent's calls
+    (`RegisterContainerInstance`, `DeregisterContainerInstance`, `Poll`, `StartTelemetrySession`,
+    `Submit*`, `UpdateContainerInstancesState`) only on `triple-c-*` clusters and their container
+    instances, `ecs:TagResource` only on such a container instance as it registers
+    (`ecs:CreateAction = RegisterContainerInstance`), `ecs:DiscoverPollEndpoint`, and Session
+    Manager on the instance (`ssm:UpdateInstanceInformation`, the six `ec2messages:` actions) for an
+    admin's troubleshooting. ECS Exec into an EC2 task uses the task role, as on Fargate.
 - The boundary grants nothing in IAM.
 - Explicit Deny statements stop the admin from:
   - removing the boundary from a `triple-c-*` role;
@@ -239,11 +264,15 @@ created only *inside* a Triple-C (tagged) VPC, subnet and address, and an intern
 attached, a route added or a route table associated only on tagged ones, so the admin cannot
 re-route a VPC that isn't Triple-C's. Tagging is allowed only as part of the creating
 call (`ec2:CreateAction`, `elasticfilesystem:CreateAction`), or on a resource that is already
-Triple-C's. Resources that cannot carry a tag are authorized through one that does: routes and
+Triple-C's. Launch templates (phase 7) are created only with the component tag and changed,
+launched from or deleted only when they carry it; Auto Scaling groups must be named `triple-c-*`
+and also carry it (request tag to create, resource tag to change, protect or delete). Resources
+that cannot carry a tag are authorized through one that does: routes and
 route-table associations through the route table (and subnet), mount targets and the file-system
 policy through the file system, KMS aliases through the key, role policies through the
-(boundary-carrying) role. Clusters, log groups, parameters, roles and the state bucket are scoped
-by name (`triple-c-*`, `/triple-c/*`, `triple-c-tfstate-*`).
+(boundary-carrying) role. Clusters, capacity providers, log groups, parameters, roles, instance
+profiles and the state bucket are scoped by name (`triple-c-*`, `/triple-c/*`,
+`triple-c-tfstate-*`).
 
 **What is not scoped.** The scoping above does not cover every action. These actions apply
 account-wide:
@@ -276,6 +305,16 @@ account-wide:
   and mount targets are created and deleted under this statement alone.
 - Reads on `*`: `ec2:Describe*`, `elasticfilesystem:Describe*`, the KMS key reads and
   `ListAliases`, `logs:DescribeLogGroups` and `ssm:DescribeParameters`.
+- `ec2:RunInstances` on instances, volumes, network interfaces, subnets and security groups
+  anywhere, as long as the launch comes from a launch template (`ec2:LaunchTemplate`), whose own
+  side must be a component-tagged template, and with Amazon's images only. The subnets and groups
+  are not tag-checked because an `existing`-network environment's are the user's own. The admin
+  never calls `RunInstances` itself: creating an Auto Scaling group checks that the caller could,
+  and the group's launches run as Auto Scaling's service-linked role.
+- `iam:CreateServiceLinkedRole`, only for `autoscaling.amazonaws.com` and `ecs.amazonaws.com`
+  (AWS fixes those roles' policies).
+- Reads on `*`: `autoscaling:Describe*`, `ecs:DescribeCapacityProviders`; and the public
+  ECS-optimized AMI parameters.
 - `s3:PutBucketPolicy` on the state bucket (only a bucket in the admin's own account, enforced by
   `s3:ResourceAccount`): an admin could open that bucket to other accounts. The state holds no
   secrets (the modules create none), but it maps the account's Triple-C resources.
@@ -398,6 +437,13 @@ aws iam create-policy --policy-name triple-c-permissions-boundary \
   --policy-document file://policies/permissions-boundary.json
 ```
 
+**Phase 7 changed the boundary** (version 2: the instance role's ECS agent and Session Manager
+actions). An account administrator re-applies it once (the boundary module from the app, or
+`aws iam create-policy-version --policy-arn arn:aws:iam::<account>:policy/triple-c-permissions-boundary
+--policy-document file://policies/permissions-boundary.json --set-as-default`) before anyone
+onboards with EC2 capacity; Fargate users are unaffected. The module tags the policy
+`triple-c:template-version = 2`.
+
 Create the policy **without a path**. The admin policy expects exactly
 `arn:aws:iam::<account>:policy/triple-c-permissions-boundary`. The `terraform/permissions-boundary`
 module creates the same policy, applied by an account administrator; the admin tier can read it
@@ -408,11 +454,11 @@ module creates the same policy, applied by an account administrator; the admin t
 Create each file as a **customer managed policy** and attach it. In the console, go to
 **IAM → Policies → Create policy → JSON**, paste the file, and attach the policy to a user, group
 or role. Inline policies do not fit: a role's inline policies share 10,240 characters and an
-environment admin needs every tier file (about 16,400), and a user's share 2,048. A managed policy
+environment admin needs every tier file (about 20,200), and a user's share 2,048. A managed policy
 may hold 6,144 characters, not counting whitespace. Measured 2026-11-16 without whitespace, `workspace-user.json` is
 6,036 (108 characters of headroom), `workspace-user-tasks.json` 1,293 (including `ReadFargatePrices`),
-`environment-admin.json` 5,805 (339)
-and `environment-admin-network.json` 3,340; a unit test (`every_policy_fits_a_managed_policy`)
+`environment-admin.json` 5,805 (339), `environment-admin-network.json` 3,340,
+`environment-admin-compute.json` 3,705 and `permissions-boundary.json` 2,625; a unit test (`every_policy_fits_a_managed_policy`)
 fails before any file outgrows the limit. A tier that outgrows its files gains another file, which
 the app then lists with the others. For IAM Identity Center, add the files as inline policies on the permission set
 (the "up to 32,768 characters" limit is unverified) or reference the managed policies.
@@ -460,6 +506,31 @@ aws iam attach-user-policy --user-name <user> \
   git credentials) may travel in task-definition environment variables or in `RunTask`
   `containerOverrides`: every workspace user can read them through `ecs:Describe*` on `*`. Use
   Secrets Manager (`triple-c/*`) references instead.
+
+**Phase 7 (per-user EC2 capacity): still open until the live run (Task 7)**
+
+The unit tests' evaluator is not IAM; these points of the compute file and the boundary are
+expected, not verified:
+
+- **Creating an Auto Scaling group checks the caller's launch permissions.** Expected: a dry run
+  of `ec2:RunInstances` from the launch template as the admin, with `ec2:LaunchTemplate` set on
+  every resource, the template's own tags visible, `ec2:Owner = amazon` on the image, and
+  `iam:PassRole` of the instance role to `ec2.amazonaws.com`. If the dry run omits
+  `ec2:LaunchTemplate` on some resource, the group's create is denied and that statement needs
+  another condition.
+- **`iam:AddRoleToInstanceProfile`** is expected to need `iam:PassRole` of the role; which
+  `iam:PassedToService` IAM sends then (if any) is unknown, and only `ec2.amazonaws.com` is allowed.
+- **`ecs:PutClusterCapacityProviders`** may be authorized against the capacity provider as well as
+  the cluster (both are allowed); **`ecs:CreateCapacityProvider`** may check the caller's
+  `autoscaling:Describe*` on the group (allowed) or create ECS's service-linked role (allowed).
+- **Service-linked roles.** The Auto Scaling and ECS roles exist in most accounts already;
+  creating them is allowed only for those two services. Whether creating a group in an account
+  without one creates it as the caller (needing this grant) is not verified.
+- **The instance role's agent calls** (`ecs:Poll`, `StartTelemetrySession`,
+  `UpdateContainerInstancesState`) are expected to be authorized against
+  `container-instance/<cluster>/<id>` and the rest against the cluster; the boundary allows both.
+- **The public AMI parameter's ARN** has no account (`arn:aws:ssm:<region>::parameter/aws/…`);
+  `arn:aws:ssm:*::parameter/aws/service/ecs/optimized-ami/*` is expected to match it.
 
 **Phase 6**
 

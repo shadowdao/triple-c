@@ -604,7 +604,14 @@ mod tests {
     fn the_policy_document_is_every_file_of_the_tier() {
         let admin = aws_policy_document(Tier::EnvironmentAdmin);
         let names: Vec<&str> = admin.iter().map(|f| f.name.as_str()).collect();
-        assert_eq!(names, ["environment-admin.json", "environment-admin-network.json"]);
+        assert_eq!(
+            names,
+            [
+                "environment-admin.json",
+                "environment-admin-network.json",
+                "environment-admin-compute.json"
+            ]
+        );
         for f in &admin {
             serde_json::from_str::<serde_json::Value>(&f.json).expect("policy JSON");
         }

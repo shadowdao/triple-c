@@ -19,6 +19,11 @@ pub const ENVIRONMENT_MODULE_VERSION: u32 = 2;
 /// The same for the user-onboarding module.
 #[allow(dead_code)] // the onboarding module's version; checked against its HCL by a test
 pub const ONBOARD_MODULE_VERSION: u32 = 1;
+/// The same for the permissions-boundary module. 2: the instance role's ECS
+/// agent and Session Manager actions (phase 7, E4); an account admin
+/// re-applies the boundary once.
+#[allow(dead_code)] // checked against its HCL by a test; nothing reads the tag yet
+pub const BOUNDARY_MODULE_VERSION: u32 = 2;
 /// The permissions boundary every module-created role carries (no path).
 /// Equal to [`super::policies::PERMISSIONS_BOUNDARY_NAME`]; a test checks it.
 pub const BOUNDARY_POLICY_NAME: &str = "triple-c-permissions-boundary";

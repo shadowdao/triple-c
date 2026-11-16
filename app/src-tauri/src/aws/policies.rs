@@ -34,6 +34,10 @@ pub fn policy_files(tier: Tier) -> &'static [(&'static str, &'static str)] {
                 "environment-admin-network.json",
                 include_str!("../../../../aws/policies/environment-admin-network.json"),
             ),
+            (
+                "environment-admin-compute.json",
+                include_str!("../../../../aws/policies/environment-admin-compute.json"),
+            ),
         ],
         Tier::WorkspaceUser => &[
             (
@@ -208,6 +212,45 @@ const PROBE_STATE_BUCKET: &str = "arn:aws:s3:::triple-c-tfstate-{account}-{regio
 const PROBE_STATE_OBJECT: &str =
     "arn:aws:s3:::triple-c-tfstate-{account}-{region}/environments/probe/terraform.tfstate";
 const PROBE_BOUNDARY: &str = "arn:aws:iam::{account}:policy/triple-c-permissions-boundary";
+// Per-user EC2 capacity (phase 7, `environment-admin-compute.json`).
+const PROBE_CAPACITY_PROVIDER: &str =
+    "arn:aws:ecs:{region}:{account}:capacity-provider/triple-c-probe";
+const PROBE_LAUNCH_TEMPLATE: &str =
+    "arn:aws:ec2:{region}:{account}:launch-template/lt-00000000000000000";
+const PROBE_INSTANCE: &str = "arn:aws:ec2:{region}:{account}:instance/i-00000000000000000";
+const PROBE_VOLUME: &str = "arn:aws:ec2:{region}:{account}:volume/vol-00000000000000000";
+/// Public images have no account in their ARN.
+const PROBE_IMAGE: &str = "arn:aws:ec2:{region}::image/ami-00000000000000000";
+const PROBE_AUTO_SCALING_GROUP: &str = "arn:aws:autoscaling:{region}:{account}:autoScalingGroup:\
+     00000000-0000-0000-0000-000000000000:autoScalingGroupName/triple-c-probe";
+const PROBE_INSTANCE_PROFILE: &str = "arn:aws:iam::{account}:instance-profile/triple-c-probe";
+/// An instance role is `triple-c-<env>-<owner key>-instance`.
+const PROBE_INSTANCE_ROLE: &str = "arn:aws:iam::{account}:role/triple-c-probe-instance";
+const PROBE_AUTO_SCALING_SERVICE_ROLE: &str = "arn:aws:iam::{account}:role/aws-service-role/\
+     autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling";
+const PROBE_ECS_SERVICE_ROLE: &str =
+    "arn:aws:iam::{account}:role/aws-service-role/ecs.amazonaws.com/AWSServiceRoleForECS";
+/// The public parameter the onboarding module resolves the ECS-optimized
+/// AMI from (no account in its ARN).
+const PROBE_AMI_PARAMETER: &str = "arn:aws:ssm:{region}::parameter/aws/service/ecs/\
+     optimized-ami/amazon-linux-2023/recommended/image_id";
+/// A user's compute record (`/triple-c/users/<env>/<owner key>`, E11).
+const PROBE_USER_RECORD: &str =
+    "arn:aws:ssm:{region}:{account}:parameter/triple-c/users/probe/0123456789ab";
+/// RunInstances names the launch template the instance comes from.
+const FROM_LAUNCH_TEMPLATE: Context = &[(
+    "ec2:LaunchTemplate",
+    Literal("arn:aws:ec2:{region}:{account}:launch-template/lt-00000000000000000"),
+)];
+/// ...and the image is Amazon's.
+const AMAZON_IMAGE_FROM_LAUNCH_TEMPLATE: Context = &[
+    ("ec2:Owner", Literal("amazon")),
+    (
+        "ec2:LaunchTemplate",
+        Literal("arn:aws:ec2:{region}:{account}:launch-template/lt-00000000000000000"),
+    ),
+];
+const PASSED_TO_EC2: Context = &[("iam:PassedToService", Literal("ec2.amazonaws.com"))];
 
 const fn write(action: &'static str, resource: &'static str, context: Context) -> Check {
     Check {
@@ -784,6 +827,173 @@ const ENVIRONMENT_ADMIN_CHECKS: &[Check] = &[
     read("s3:GetObject", PROBE_STATE_OBJECT, IN_MY_ACCOUNT),
     write("s3:PutObject", PROBE_STATE_OBJECT, IN_MY_ACCOUNT),
     write("s3:DeleteObject", PROBE_STATE_OBJECT, IN_MY_ACCOUNT),
+    // Per-user EC2 capacity (environment-admin-compute.json, phase 7): the
+    // user's cluster is a `triple-c-*` cluster (above); its capacity
+    // provider is scoped by name, like the cluster.
+    write(
+        "ecs:CreateCapacityProvider",
+        PROBE_CAPACITY_PROVIDER,
+        COMPONENT_REQUESTED,
+    ),
+    write(
+        "ecs:TagResource",
+        PROBE_CAPACITY_PROVIDER,
+        &[("ecs:CreateAction", Literal("CreateCapacityProvider"))],
+    ),
+    write("ecs:UpdateCapacityProvider", PROBE_CAPACITY_PROVIDER, &[]),
+    write("ecs:DeleteCapacityProvider", PROBE_CAPACITY_PROVIDER, &[]),
+    write(
+        "ecs:PutClusterCapacityProviders",
+        PROBE_CAPACITY_PROVIDER,
+        &[],
+    ),
+    write("ecs:UntagResource", PROBE_CAPACITY_PROVIDER, &[]),
+    read("ecs:ListTagsForResource", PROBE_CAPACITY_PROVIDER, &[]),
+    read("ecs:DescribeCapacityProviders", "*", &[]),
+    // Launch templates: created with the component tag, changed, used and
+    // deleted only when they carry it.
+    write(
+        "ec2:CreateLaunchTemplate",
+        PROBE_LAUNCH_TEMPLATE,
+        COMPONENT_REQUESTED,
+    ),
+    write(
+        "ec2:CreateTags",
+        PROBE_LAUNCH_TEMPLATE,
+        &[("ec2:CreateAction", Literal("CreateLaunchTemplate"))],
+    ),
+    write(
+        "ec2:CreateLaunchTemplateVersion",
+        PROBE_LAUNCH_TEMPLATE,
+        COMPONENT_TAGGED,
+    ),
+    write(
+        "ec2:ModifyLaunchTemplate",
+        PROBE_LAUNCH_TEMPLATE,
+        COMPONENT_TAGGED,
+    ),
+    write(
+        "ec2:DeleteLaunchTemplate",
+        PROBE_LAUNCH_TEMPLATE,
+        COMPONENT_TAGGED,
+    ),
+    write("ec2:CreateTags", PROBE_LAUNCH_TEMPLATE, COMPONENT_TAGGED),
+    write("ec2:DeleteTags", PROBE_LAUNCH_TEMPLATE, COMPONENT_TAGGED),
+    // Creating an Auto Scaling group checks that the caller could launch
+    // its template: RunInstances, only from a Triple-C launch template and
+    // only Amazon's images, and the tags the launch puts on.
+    write("ec2:RunInstances", PROBE_LAUNCH_TEMPLATE, COMPONENT_TAGGED),
+    write("ec2:RunInstances", PROBE_INSTANCE, FROM_LAUNCH_TEMPLATE),
+    write("ec2:RunInstances", PROBE_VOLUME, FROM_LAUNCH_TEMPLATE),
+    write(
+        "ec2:RunInstances",
+        PROBE_NETWORK_INTERFACE,
+        FROM_LAUNCH_TEMPLATE,
+    ),
+    write("ec2:RunInstances", PROBE_SUBNET, FROM_LAUNCH_TEMPLATE),
+    write(
+        "ec2:RunInstances",
+        PROBE_SECURITY_GROUP,
+        FROM_LAUNCH_TEMPLATE,
+    ),
+    write(
+        "ec2:RunInstances",
+        PROBE_IMAGE,
+        AMAZON_IMAGE_FROM_LAUNCH_TEMPLATE,
+    ),
+    write(
+        "ec2:CreateTags",
+        PROBE_INSTANCE,
+        &[("ec2:CreateAction", Literal("RunInstances"))],
+    ),
+    write(
+        "ec2:CreateTags",
+        PROBE_VOLUME,
+        &[("ec2:CreateAction", Literal("RunInstances"))],
+    ),
+    write(
+        "ec2:CreateTags",
+        PROBE_NETWORK_INTERFACE,
+        &[("ec2:CreateAction", Literal("RunInstances"))],
+    ),
+    // Auto Scaling groups: `triple-c-*`, created with the component tag,
+    // changed and deleted only when they carry it.
+    write(
+        "autoscaling:CreateAutoScalingGroup",
+        PROBE_AUTO_SCALING_GROUP,
+        COMPONENT_REQUESTED,
+    ),
+    write(
+        "autoscaling:CreateOrUpdateTags",
+        PROBE_AUTO_SCALING_GROUP,
+        COMPONENT_REQUESTED,
+    ),
+    write(
+        "autoscaling:CreateOrUpdateTags",
+        PROBE_AUTO_SCALING_GROUP,
+        COMPONENT_TAGGED,
+    ),
+    write(
+        "autoscaling:UpdateAutoScalingGroup",
+        PROBE_AUTO_SCALING_GROUP,
+        COMPONENT_TAGGED,
+    ),
+    write(
+        "autoscaling:SetInstanceProtection",
+        PROBE_AUTO_SCALING_GROUP,
+        COMPONENT_TAGGED,
+    ),
+    write(
+        "autoscaling:DeleteTags",
+        PROBE_AUTO_SCALING_GROUP,
+        COMPONENT_TAGGED,
+    ),
+    write(
+        "autoscaling:DeleteAutoScalingGroup",
+        PROBE_AUTO_SCALING_GROUP,
+        COMPONENT_TAGGED,
+    ),
+    read("autoscaling:DescribeAutoScalingGroups", "*", &[]),
+    read("autoscaling:DescribeScalingActivities", "*", &[]),
+    // The service-linked roles Auto Scaling and ECS (managed scaling) use,
+    // created on first use; AWS fixes their policies.
+    write(
+        "iam:CreateServiceLinkedRole",
+        PROBE_AUTO_SCALING_SERVICE_ROLE,
+        &[("iam:AWSServiceName", Literal("autoscaling.amazonaws.com"))],
+    ),
+    write(
+        "iam:CreateServiceLinkedRole",
+        PROBE_ECS_SERVICE_ROLE,
+        &[("iam:AWSServiceName", Literal("ecs.amazonaws.com"))],
+    ),
+    // The instance role (a bounded `triple-c-*` role, above) and its
+    // instance profile, scoped by name.
+    write("iam:CreateInstanceProfile", PROBE_INSTANCE_PROFILE, &[]),
+    write("iam:TagInstanceProfile", PROBE_INSTANCE_PROFILE, &[]),
+    write("iam:UntagInstanceProfile", PROBE_INSTANCE_PROFILE, &[]),
+    write("iam:AddRoleToInstanceProfile", PROBE_INSTANCE_PROFILE, &[]),
+    write(
+        "iam:RemoveRoleFromInstanceProfile",
+        PROBE_INSTANCE_PROFILE,
+        &[],
+    ),
+    write("iam:DeleteInstanceProfile", PROBE_INSTANCE_PROFILE, &[]),
+    read("iam:GetInstanceProfile", PROBE_INSTANCE_PROFILE, &[]),
+    read("iam:ListInstanceProfileTags", PROBE_INSTANCE_PROFILE, &[]),
+    write("iam:PassRole", PROBE_INSTANCE_ROLE, PASSED_TO_EC2),
+    // The ECS-optimized AMI's public parameter, and the user's compute
+    // record (`/triple-c/*`, above).
+    read("ssm:GetParameter", PROBE_AMI_PARAMETER, &[]),
+    read("ssm:GetParameters", PROBE_AMI_PARAMETER, &[]),
+    write("ssm:PutParameter", PROBE_USER_RECORD, COMPONENT_REQUESTED),
+    write(
+        "ssm:AddTagsToResource",
+        PROBE_USER_RECORD,
+        COMPONENT_REQUESTED,
+    ),
+    write("ssm:DeleteParameter", PROBE_USER_RECORD, &[]),
+    read("ssm:GetParameter", PROBE_USER_RECORD, &[]),
 ];
 
 #[cfg(test)]
@@ -1691,6 +1901,20 @@ mod tests {
             "sts:GetCallerIdentity",
             "bedrock:InvokeModel",
             "bedrock:InvokeModelWithResponseStream",
+            // The ECS agent on a user's instance (E4).
+            "ecs:RegisterContainerInstance",
+            "ecs:DeregisterContainerInstance",
+            "ecs:DiscoverPollEndpoint",
+            "ecs:Poll",
+            "ecs:StartTelemetrySession",
+            "ecs:SubmitTaskStateChange",
+            "ecs:SubmitContainerStateChange",
+            "ecs:SubmitAttachmentStateChanges",
+            "ecs:UpdateContainerInstancesState",
+            "ecs:TagResource",
+            // Session Manager on the instance.
+            "ssm:UpdateInstanceInformation",
+            "ec2messages:GetMessages",
         ] {
             assert!(
                 granted.iter().any(|a| glob(a, need)),
@@ -1738,6 +1962,69 @@ mod tests {
                     sid(s)
                 );
             }
+        }
+    }
+
+    /// The instance role's ECS agent (E4) reaches only Triple-C clusters and
+    /// their container instances, and tags only the instance it registers.
+    #[test]
+    fn the_boundary_keeps_the_ecs_agent_on_triple_c_clusters() {
+        let stmts = statements_of(&boundary());
+        let within = |action: &'static str, resource: &'static str, context: Context| {
+            evaluate_in(
+                &stmts,
+                Request {
+                    check: &write(action, resource, context),
+                    caller: ME,
+                    owner: ME,
+                },
+            )
+        };
+        const INSTANCE: &str = "arn:aws:ecs:{region}:{account}:container-instance/\
+             triple-c-probe-0123456789ab/0123456789abcdef0123456789abcdef";
+        const OTHER_CLUSTER: &str = "arn:aws:ecs:{region}:{account}:cluster/prod";
+        const OTHER_INSTANCE: &str = "arn:aws:ecs:{region}:{account}:container-instance/\
+             prod/0123456789abcdef0123456789abcdef";
+        const AT_REGISTER: Context = &[("ecs:CreateAction", Literal("RegisterContainerInstance"))];
+        for action in [
+            "ecs:RegisterContainerInstance",
+            "ecs:DeregisterContainerInstance",
+            "ecs:SubmitTaskStateChange",
+        ] {
+            assert!(within(action, PROBE_CLUSTER, &[]), "{action}");
+            assert!(!within(action, OTHER_CLUSTER, &[]), "{action} elsewhere");
+        }
+        for action in [
+            "ecs:Poll",
+            "ecs:StartTelemetrySession",
+            "ecs:UpdateContainerInstancesState",
+        ] {
+            assert!(within(action, INSTANCE, &[]), "{action}");
+            assert!(!within(action, OTHER_INSTANCE, &[]), "{action} elsewhere");
+        }
+        assert!(within("ecs:TagResource", INSTANCE, AT_REGISTER));
+        assert!(!within("ecs:TagResource", OTHER_INSTANCE, AT_REGISTER));
+        for (resource, context) in [
+            (INSTANCE, &[][..]),
+            (PROBE_CLUSTER, AT_REGISTER),
+            (PROBE_TASK, &[][..]),
+        ] {
+            assert!(
+                !within("ecs:TagResource", resource, context),
+                "ecs:TagResource on {resource} with {context:?}"
+            );
+        }
+        // The agent never runs, stops or changes tasks or clusters itself.
+        for action in [
+            "ecs:RunTask",
+            "ecs:StartTask",
+            "ecs:StopTask",
+            "ecs:CreateCluster",
+            "ecs:DeleteCluster",
+            "ecs:ExecuteCommand",
+        ] {
+            assert!(!within(action, PROBE_CLUSTER, &[]), "{action}");
+            assert!(!within(action, PROBE_TASK, &[]), "{action}");
         }
     }
 
@@ -1855,7 +2142,11 @@ mod tests {
         let names = |t: Tier| policy_files(t).iter().map(|(n, _)| *n).collect::<Vec<_>>();
         assert_eq!(
             names(Tier::EnvironmentAdmin),
-            ["environment-admin.json", "environment-admin-network.json"]
+            [
+                "environment-admin.json",
+                "environment-admin-network.json",
+                "environment-admin-compute.json"
+            ]
         );
         assert_eq!(
             names(Tier::WorkspaceUser),
@@ -2123,14 +2414,297 @@ mod tests {
             ME,
             ME
         ));
-        // Triple-C roles are passed only to ECS tasks (Fargate, v1).
-        let pass_to_ec2: Context = &[("iam:PassedToService", Literal("ec2.amazonaws.com"))];
+        // Only an instance role is passed to EC2 (phase 7); task and
+        // execution roles go to ECS tasks only.
         assert!(!allowed(
             tier,
-            &write("iam:PassRole", PROBE_ROLE, pass_to_ec2),
+            &write("iam:PassRole", PROBE_ROLE, PASSED_TO_EC2),
             ME,
             ME
         ));
+    }
+
+    /// The new compute checks of the admin tier.
+    fn compute_checks() -> Vec<&'static Check> {
+        let compute = parse(
+            "environment-admin-compute.json",
+            policy_files(Tier::EnvironmentAdmin)
+                .iter()
+                .find(|(n, _)| *n == "environment-admin-compute.json")
+                .expect("the compute file")
+                .1,
+        );
+        let stmts = statements_of(&compute);
+        let found: Vec<_> = checks(Tier::EnvironmentAdmin)
+            .iter()
+            .filter(|c| {
+                let req = Request {
+                    check: c,
+                    caller: ME,
+                    owner: ME,
+                };
+                !matching(&stmts, &req).is_empty()
+            })
+            .collect();
+        assert!(found.len() >= 30, "only {} compute checks", found.len());
+        found
+    }
+
+    /// Per-user EC2 capacity (E5): what the admin creates carries the
+    /// component tag, and what it changes, uses or deletes must carry it;
+    /// another (untagged, or not `triple-c-*`) launch template, Auto Scaling
+    /// group, capacity provider or instance profile is out of reach.
+    #[test]
+    fn per_user_compute_is_tag_and_name_scoped() {
+        let tier = Tier::EnvironmentAdmin;
+        for (action, resource) in [
+            ("ec2:CreateLaunchTemplate", PROBE_LAUNCH_TEMPLATE),
+            (
+                "autoscaling:CreateAutoScalingGroup",
+                PROBE_AUTO_SCALING_GROUP,
+            ),
+        ] {
+            assert!(allowed(
+                tier,
+                &write(action, resource, COMPONENT_REQUESTED),
+                ME,
+                ME
+            ));
+            assert!(
+                !allowed(tier, &write(action, resource, &[]), ME, ME),
+                "untagged {action}"
+            );
+        }
+        for (action, resource) in [
+            ("ec2:CreateLaunchTemplateVersion", PROBE_LAUNCH_TEMPLATE),
+            ("ec2:ModifyLaunchTemplate", PROBE_LAUNCH_TEMPLATE),
+            ("ec2:DeleteLaunchTemplate", PROBE_LAUNCH_TEMPLATE),
+            ("ec2:CreateTags", PROBE_LAUNCH_TEMPLATE),
+            ("ec2:DeleteTags", PROBE_LAUNCH_TEMPLATE),
+            ("ec2:RunInstances", PROBE_LAUNCH_TEMPLATE),
+            (
+                "autoscaling:UpdateAutoScalingGroup",
+                PROBE_AUTO_SCALING_GROUP,
+            ),
+            (
+                "autoscaling:SetInstanceProtection",
+                PROBE_AUTO_SCALING_GROUP,
+            ),
+            ("autoscaling:CreateOrUpdateTags", PROBE_AUTO_SCALING_GROUP),
+            ("autoscaling:DeleteTags", PROBE_AUTO_SCALING_GROUP),
+            (
+                "autoscaling:DeleteAutoScalingGroup",
+                PROBE_AUTO_SCALING_GROUP,
+            ),
+        ] {
+            assert!(
+                allowed(tier, &write(action, resource, COMPONENT_TAGGED), ME, ME),
+                "{action} on a tagged {resource}"
+            );
+            assert!(
+                !allowed(tier, &write(action, resource, &[]), ME, ME),
+                "{action} on an untagged {resource}"
+            );
+        }
+        // Named resources: someone else's names are out of reach, tagged or not.
+        let others = [
+            (
+                "autoscaling:DeleteAutoScalingGroup",
+                "arn:aws:autoscaling:{region}:{account}:autoScalingGroup:\
+                 00000000-0000-0000-0000-000000000000:autoScalingGroupName/prod-web",
+            ),
+            (
+                "ecs:DeleteCapacityProvider",
+                "arn:aws:ecs:{region}:{account}:capacity-provider/prod-web",
+            ),
+            (
+                "ecs:UpdateCapacityProvider",
+                "arn:aws:ecs:{region}:{account}:capacity-provider/prod-web",
+            ),
+            (
+                "ecs:PutClusterCapacityProviders",
+                "arn:aws:ecs:{region}:{account}:cluster/prod",
+            ),
+            (
+                "iam:DeleteInstanceProfile",
+                "arn:aws:iam::{account}:instance-profile/prod-web",
+            ),
+            (
+                "iam:AddRoleToInstanceProfile",
+                "arn:aws:iam::{account}:instance-profile/prod-web",
+            ),
+            (
+                "iam:RemoveRoleFromInstanceProfile",
+                "arn:aws:iam::{account}:instance-profile/prod-web",
+            ),
+        ];
+        for (action, resource) in others {
+            for context in [&[][..], COMPONENT_TAGGED] {
+                assert!(
+                    !allowed(tier, &write(action, resource, context), ME, ME),
+                    "{action} on {resource}"
+                );
+            }
+        }
+        // Tags go on at create only through the creating call.
+        for resource in [PROBE_LAUNCH_TEMPLATE, PROBE_INSTANCE, PROBE_VOLUME] {
+            let other: Context = &[("ec2:CreateAction", Literal("CreateVolume"))];
+            assert!(
+                !allowed(tier, &write("ec2:CreateTags", resource, other), ME, ME),
+                "CreateTags on {resource} through CreateVolume"
+            );
+        }
+        // The user's record lives under /triple-c/; nothing else's does.
+        assert!(!allowed(
+            tier,
+            &write(
+                "ssm:DeleteParameter",
+                "arn:aws:ssm:{region}:{account}:parameter/prod/users/x",
+                &[]
+            ),
+            ME,
+            ME
+        ));
+    }
+
+    /// RunInstances (which creating an Auto Scaling group checks the caller
+    /// for) works only from a Triple-C launch template, with Amazon's
+    /// images: never a bare launch, nor someone else's template or image.
+    #[test]
+    fn instances_launch_only_from_triple_c_launch_templates() {
+        let tier = Tier::EnvironmentAdmin;
+        for resource in [
+            PROBE_INSTANCE,
+            PROBE_VOLUME,
+            PROBE_NETWORK_INTERFACE,
+            PROBE_SUBNET,
+            PROBE_SECURITY_GROUP,
+        ] {
+            assert!(allowed(
+                tier,
+                &write("ec2:RunInstances", resource, FROM_LAUNCH_TEMPLATE),
+                ME,
+                ME
+            ));
+            for context in [&[][..], COMPONENT_REQUESTED, COMPONENT_TAGGED] {
+                assert!(
+                    !allowed(tier, &write("ec2:RunInstances", resource, context), ME, ME),
+                    "RunInstances on {resource} without a launch template ({context:?})"
+                );
+            }
+        }
+        assert!(!allowed(
+            tier,
+            &write("ec2:RunInstances", PROBE_LAUNCH_TEMPLATE, &[]),
+            ME,
+            ME
+        ));
+        let someone_elses_image: Context = &[
+            ("ec2:Owner", Literal("999999999999")),
+            (
+                "ec2:LaunchTemplate",
+                Literal("arn:aws:ec2:{region}:{account}:launch-template/lt-00000000000000000"),
+            ),
+        ];
+        for context in [&[][..], FROM_LAUNCH_TEMPLATE, someone_elses_image] {
+            assert!(
+                !allowed(
+                    tier,
+                    &write("ec2:RunInstances", PROBE_IMAGE, context),
+                    ME,
+                    ME
+                ),
+                "RunInstances with an image and {context:?}"
+            );
+        }
+        // Other resource types a launch could name (a key pair, an
+        // instance-store snapshot, ...) are not granted at all.
+        for resource in [
+            "arn:aws:ec2:{region}:{account}:key-pair/k",
+            "arn:aws:ec2:{region}::snapshot/snap-00000000000000000",
+        ] {
+            assert!(!allowed(
+                tier,
+                &write("ec2:RunInstances", resource, FROM_LAUNCH_TEMPLATE),
+                ME,
+                ME
+            ));
+        }
+    }
+
+    /// Roles go to EC2 only as an instance role (`triple-c-*-instance`),
+    /// and never anything else's; service-linked roles only for Auto
+    /// Scaling and ECS.
+    #[test]
+    fn instance_roles_are_the_only_roles_passed_to_ec2() {
+        let tier = Tier::EnvironmentAdmin;
+        assert!(allowed(
+            tier,
+            &write("iam:PassRole", PROBE_INSTANCE_ROLE, PASSED_TO_EC2),
+            ME,
+            ME
+        ));
+        for role in [
+            PROBE_ROLE,
+            "arn:aws:iam::{account}:role/triple-c-probe-0123456789ab-task",
+            "arn:aws:iam::{account}:role/admin-instance",
+            "arn:aws:iam::{account}:role/OrganizationAccountAccessRole",
+        ] {
+            assert!(
+                !allowed(tier, &write("iam:PassRole", role, PASSED_TO_EC2), ME, ME),
+                "{role} passed to EC2"
+            );
+        }
+        for service in ["lambda.amazonaws.com", "ecs-tasks.amazonaws.com"] {
+            let ctx: Context =
+                Box::leak(vec![("iam:PassedToService", Literal(service))].into_boxed_slice());
+            let instance_to_other = write("iam:PassRole", PROBE_INSTANCE_ROLE, ctx);
+            // An instance role is still a `triple-c-*` role, which the
+            // phase-5 statement lets the admin pass to ECS tasks; nothing
+            // else.
+            assert_eq!(
+                allowed(tier, &instance_to_other, ME, ME),
+                service == "ecs-tasks.amazonaws.com",
+                "{service}"
+            );
+        }
+        // (A service's role ARN follows from its name, so one statement
+        // covers both services.)
+        for (role, service) in [
+            (
+                "arn:aws:iam::{account}:role/aws-service-role/\
+                 elasticbeanstalk.amazonaws.com/AWSServiceRoleForElasticBeanstalk",
+                "elasticbeanstalk.amazonaws.com",
+            ),
+            (PROBE_ROLE, "autoscaling.amazonaws.com"),
+        ] {
+            let ctx: Context =
+                Box::leak(vec![("iam:AWSServiceName", Literal(service))].into_boxed_slice());
+            assert!(
+                !allowed(
+                    tier,
+                    &write("iam:CreateServiceLinkedRole", role, ctx),
+                    ME,
+                    ME
+                ),
+                "service-linked {role} for {service}"
+            );
+        }
+    }
+
+    /// A workspace user changes none of the compute (they may read, as
+    /// they read all of ECS): their EC2 capacity is the admin's onboarding
+    /// module's to create.
+    #[test]
+    fn the_workspace_tier_cannot_manage_compute() {
+        for c in compute_checks().into_iter().filter(|c| c.write) {
+            assert!(
+                !allowed(Tier::WorkspaceUser, c, ME, ME),
+                "workspace user: {} on {}",
+                c.action,
+                rendered(c)
+            );
+        }
     }
 
     const OTHER_BOUNDARY: Context = &[
