@@ -2441,6 +2441,55 @@ fn apply_connect_installs_the_ca_merges_ssh_writes_git_credentials_and_retries_o
 }
 
 #[test]
+fn a_connect_that_takes_over_from_a_waiting_retry_does_not_lose_done() {
+    // Connect 1 arrives while a clone that started without credentials is
+    // still running: its retry waits for `done`. The clone finishes and
+    // connect 2 arrives before the waiter's next look: connect 2 removes
+    // `done` and retries at once. The waiter used to hold the retry lock
+    // while it waited, so connect 2's retry queued behind it and the waiter
+    // never saw `done` again (stalled for the whole retry_wait).
+    let tmp = tempfile::tempdir().unwrap();
+    let c = Connect::new(tmp.path());
+    // A long poll, so connect 2 lands in the gap deterministically.
+    let script = fs::read_to_string(&c.script).unwrap().replace("                sleep 2\n", "                sleep 6\n");
+    fs::write(&c.script, script).unwrap();
+    let remote = bare_remote(tmp.path(), "remote");
+    fs::write(c.p("run/repos.json"), format!(r#"[{{"url":"{}","branch":null,"folder":"bad"}}]"#, remote.display())).unwrap();
+    fs::write(c.p("clone/repos"), "bad\tcloning\nbad\tfailed\n").unwrap();
+    fs::write(c.p("clone/no-credentials"), "").unwrap();
+    let env = format!("GIT_TOKEN={}\n", b64("ghp_fake-fixture"));
+
+    let out = c.connect(&[], &env);
+    assert!(out.status.success(), "{}", text(&out));
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    // The first clone ends; connect 2 comes before the waiter looks again.
+    fs::write(c.p("clone/done"), "").unwrap();
+    let started = std::time::Instant::now();
+    let out = c.connect(&[], &env);
+    assert!(out.status.success(), "{}", text(&out));
+
+    // Connect 2's retry runs straight away and writes `done`.
+    while !c.p("clone/done").exists() {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "`done` was lost: {}",
+            fs::read_to_string(c.p("log")).unwrap()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    // The waiter wakes, sees another retry took over, and clones nothing.
+    std::thread::sleep(std::time::Duration::from_secs(7));
+    assert!(c.p("clone/done").exists());
+    assert_eq!(
+        fs::read_to_string(c.p("clone/repos")).unwrap(),
+        "bad\tcloning\nbad\tfailed\nbad\tcloning\nbad\tcloned\n",
+        "{}",
+        fs::read_to_string(c.p("log")).unwrap()
+    );
+    assert!(!c.p("clone/no-credentials").exists());
+}
+
+#[test]
 fn a_failed_ca_move_keeps_the_ca_installed_before() {
     let tmp = tempfile::tempdir().unwrap();
     let c = Connect::new(tmp.path());

@@ -155,18 +155,28 @@ start_retry() {
         # the clone), and a later connect must not wait for it.
         exec 9>&-
         trap '' HUP
-        exec 8>"$shm/clone-retry.lock" && flock 8
         if [ "$mode" = after-done ]; then
+            # Waits *without* the retry lock: a later connect that sees
+            # `done` first removes it and queues a `now` retry behind that
+            # lock, so a waiter holding it would never see `done` again.
+            # Any retry removes `no-credentials`; once it is gone someone
+            # else is cloning with credentials and this waiter has no job.
             waited=0
             while [ ! -e "$clone_status/done" ]; do
+                [ -e "$clone_status/no-credentials" ] || exit 0
                 [ "$waited" -lt "$retry_wait" ] || exit 0
                 sleep 2
                 waited=$((waited + 2))
             done
+            exec 8>"$shm/clone-retry.lock" && flock 8
+            # Checked again under the lock: a `now` retry may have taken
+            # over (removed `done`) or already run (removed `no-credentials`).
+            [ -e "$clone_status/done" ] && [ -e "$clone_status/no-credentials" ] || exit 0
             mapfile -t folders < <(failed_folders)
             [ "${#folders[@]}" -gt 0 ] || exit 0
             rm -f "$clone_status/done"
         else
+            exec 8>"$shm/clone-retry.lock" && flock 8
             mapfile -t folders < <(failed_folders)
         fi
         # From here the clone is running again; `done` however it ends.
