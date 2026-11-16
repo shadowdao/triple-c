@@ -5,6 +5,7 @@ import { useAppState } from "../../../../store/appState";
 import {
   COPY_AT_CONNECT_GATEWAY_NOTE,
   COPY_AT_CONNECT_HINT,
+  COPY_AT_CONNECT_SSH_NOTE,
   COPY_AT_CONNECT_WARNINGS,
   SECRETS_MANAGER_HINT,
   EFS_HINT,
@@ -225,12 +226,14 @@ export default function HostSection({ project, save, disabled }: Props) {
           </p>
         ) : aws.storage === "efs" ? (
           <p className="mt-1 text-xs text-[var(--text-secondary)]">
-            <span>{EFS_HINT}</span>. The Claude login, history and SSH keys are kept on EFS too.
+            <span>{EFS_HINT}</span>. The Claude login and history
+            {aws.secrets_delivery === "copy_at_connect" ? "" : ", and SSH keys,"} are kept on EFS too.
           </p>
         ) : (
           <p className="mt-1 text-xs text-[var(--text-secondary)]">
-            The Claude login, history and SSH keys are kept on EFS between starts; everything
-            else, repositories included, starts fresh.
+            {aws.secrets_delivery === "copy_at_connect"
+              ? "The Claude login and history are kept on EFS between starts; everything else, repositories and SSH keys included, starts fresh."
+              : "The Claude login, history and SSH keys are kept on EFS between starts; everything else, repositories included, starts fresh."}
           </p>
         )}
         {keptWorkspaceFiles && (
@@ -368,6 +371,7 @@ export default function HostSection({ project, save, disabled }: Props) {
               {COPY_AT_CONNECT_WARNINGS.map((w) => (
                 <li key={w}>{w}</li>
               ))}
+              {aws.storage !== "ephemeral" && <li>{COPY_AT_CONNECT_SSH_NOTE}</li>}
               {aws.gateway_sidecar && <li>{COPY_AT_CONNECT_GATEWAY_NOTE}</li>}
             </ul>
           </>

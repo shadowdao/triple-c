@@ -144,8 +144,11 @@ export const COPY_AT_CONNECT_HINT =
   "API keys, the Git token, custom environment variables and the SSH and CA files are not stored in AWS: Triple-C copies them into the running workspace each time it connects.";
 export const COPY_AT_CONNECT_WARNINGS = [
   "Private repositories clone after you connect.",
-  "Scheduled jobs can't use these credentials while the app is closed.",
+  "Scheduled jobs and the setup script never get the API keys or custom variables; Git and SSH work once the app has connected.",
 ];
+/** Hybrid/EFS under copy-at-connect (ruling R6): ~/.ssh stays off EFS. */
+export const COPY_AT_CONNECT_SSH_NOTE =
+  "~/.ssh is not kept on EFS: SSH keys copied in, or made in the workspace, are gone when it stops. Keys an earlier start left in /mnt/triple-c-home/.ssh stay there until you remove them.";
 export const COPY_AT_CONNECT_GATEWAY_NOTE =
   "The LLM gateway's keys are still stored in AWS: the gateway starts before Triple-C connects.";
 export const SECRETS_MANAGER_HINT =

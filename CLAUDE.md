@@ -454,8 +454,13 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   credential helper **as `claude`** (root never walks a live `~/.ssh`), `/run/triple-c/connected`,
   then a background re-clone of `failed` repos only (GIT_TOKEN in that clone's env only). The
   first clone waits up to 5 min for `connected` (`aws_wait_connect`). Terminals the app opens add
-  the pairs to their own `ExecSpec.env` (`aws_host::terminal_env`); nothing reaches the agent's
-  snapshot, so cron/scheduled jobs never get them. A failed push is a `workspace-warning`.
+  the pairs to their own `ExecSpec.env` (`aws_host::terminal_env`, pairs only — no file read);
+  nothing reaches the agent's snapshot, so cron/scheduled jobs and the setup script never get them.
+  A failed push is a `workspace-warning`. Hybrid/EFS do **not** link `~/.ssh` to EFS under
+  copy-at-connect (R6: keys vanish with the task). A secret that still holds credentials when a
+  copy-at-connect start writes it (`holds_credentials`) is force-deleted and created again (R7:
+  `PutSecretValue` would keep them as AWSPREVIOUS); `TRIPLE_C_CUSTOM_ENV` is left out too.
+  The re-clone closes the apply lock's fd (a later connect never waits for it); `--prepare` takes it.
   The functions both scripts use live in `container/entrypoint-lib.sh`
   (`/usr/local/lib/triple-c/`), sourced by the entrypoint first; it only defines things.
   **The `TRIPLEC_` env prefix is reserved** on both hosts (`RESERVED_ENV_PREFIXES`; `workspace.rs`

@@ -2401,3 +2401,63 @@ fn apply_connect_retries_a_clone_that_started_without_credentials_once_it_is_don
     assert!(c.p("ws/late/README").exists());
     assert!(!c.p("clone/no-credentials").exists());
 }
+
+#[test]
+fn a_running_re_clone_never_holds_the_apply_lock_and_prepare_waits_for_an_apply() {
+    let tmp = tempfile::tempdir().unwrap();
+    let c = Connect::new(tmp.path());
+    // A re-clone that takes a while.
+    let mut lib = fs::read_to_string(c.p("lib.sh")).unwrap();
+    lib.push_str("\nclone_repos() { sleep 6; }\n");
+    fs::write(c.p("lib.sh"), lib).unwrap();
+    assert!(c.run(&["--prepare"]).status.success());
+    fs::write(c.p("run/repos.json"), r#"[{"url":"x","branch":null,"folder":"bad"}]"#).unwrap();
+    fs::write(c.p("clone/repos"), "bad\tcloning\nbad\tfailed\n").unwrap();
+    fs::write(c.p("clone/done"), "").unwrap();
+    assert!(c.run(&[]).status.success());
+    assert!(!c.p("clone/done").exists(), "the re-clone is running");
+    // The next connect goes straight through.
+    let started = std::time::Instant::now();
+    assert!(c.run(&["--prepare"]).status.success());
+    let out = c.run(&[]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(!text(&out).contains("another apply"), "{}", text(&out));
+    assert!(started.elapsed() < std::time::Duration::from_secs(4), "{:?}", started.elapsed());
+    c.wait_done();
+
+    // An apply in progress (the lock held) holds a prepare back.
+    let lock = c.p("shm/apply-connect.lock");
+    let mut holder = Command::new("flock").arg(&lock).args(["sleep", "2"]).spawn().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    fs::write(c.p("shm/connect/marker"), "").ok();
+    let started = std::time::Instant::now();
+    assert!(c.run(&["--prepare"]).status.success());
+    assert!(started.elapsed() >= std::time::Duration::from_millis(1200), "{:?}", started.elapsed());
+    holder.wait().unwrap();
+}
+
+#[test]
+fn under_copy_at_connect_hybrid_keeps_ssh_off_efs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, mnt) = hybrid_dirs(tmp.path());
+    fs::create_dir_all(home.join(".ssh")).unwrap();
+    fs::create_dir_all(home.join(".claude")).unwrap();
+    let src = tmp.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("id_ed25519"), "KEY").unwrap();
+    let script = format!(
+        "{}\ntriplec_aws=1\ntriplec_connect=1\nlink_persistent_home \"$1\" \"$2\" \"\"\nmerge_host_ssh \"$3\"\n",
+        aws_blocks(&["aws_home", "sync_host_ssh", "merge_host_ssh"])
+            .replace("/home/claude", home.to_str().unwrap())
+            .replace("triplec_home_mnt=/mnt/triple-c-home", &format!("triplec_home_mnt='{}'", mnt.display()))
+            .replace("chown -R claude:claude", ": chown")
+    );
+    let out = bash(&script, &[&home, &mnt, &src], &[], &[]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("~/.ssh does not"), "{}", text(&out));
+    assert!(fs::symlink_metadata(home.join(".claude")).unwrap().file_type().is_symlink());
+    let ssh = fs::symlink_metadata(home.join(".ssh")).unwrap();
+    assert!(ssh.is_dir() && !ssh.file_type().is_symlink(), "~/.ssh is a local directory");
+    assert_eq!(fs::read_to_string(home.join(".ssh/id_ed25519")).unwrap(), "KEY");
+    assert!(!mnt.join(".ssh").exists(), "nothing written to EFS");
+}

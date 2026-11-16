@@ -164,8 +164,18 @@ describe("HostSection", () => {
     renderHost(p);
     const note = screen.getByRole("note", { name: "Copied when you connect" });
     expect(note).toHaveTextContent("Private repositories clone after you connect.");
-    expect(note).toHaveTextContent("Scheduled jobs can't use these credentials while the app is closed.");
+    expect(note).toHaveTextContent(
+      "Scheduled jobs and the setup script never get the API keys or custom variables; Git and SSH work once the app has connected.",
+    );
+    expect(note).toHaveTextContent("~/.ssh is not kept on EFS");
+    expect(note).toHaveTextContent("/mnt/triple-c-home/.ssh stay there until you remove them");
     expect(note).not.toHaveTextContent(/gateway/);
+    expect(screen.getByText(/repositories and SSH keys included, starts fresh/)).toBeInTheDocument();
+    cleanup();
+
+    // Ephemeral: nothing is kept anyway, so no SSH note.
+    renderHost({ ...p, aws: { ...p.aws!, storage: "ephemeral" } });
+    expect(screen.getByRole("note", { name: "Copied when you connect" })).not.toHaveTextContent("~/.ssh");
     cleanup();
 
     p.aws = { ...p.aws!, gateway_sidecar: true };

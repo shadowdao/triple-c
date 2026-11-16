@@ -58,12 +58,20 @@ if ! . "$lib"; then
 fi
 triplec_aws=1
 
+# The apply lock, also taken by --prepare so a prepare never empties the
+# staging dir under a running apply.
+take_lock() {
+    exec 9>"$shm/apply-connect.lock" && flock -w 120 9 \
+        || say "warning — another apply is still running; going ahead"
+}
+
 prepare() {
     umask 077
     if [ ! -d "$shm" ] || [ -L "$shm" ]; then
         say "$shm is missing (the workspace has no agent token?); nothing prepared"
         exit 1
     fi
+    take_lock
     rm -rf "$stage" "$env_file"
     mkdir -m 700 "$stage" "$stage/ssh" "$stage/ca" || exit 1
 }
@@ -123,6 +131,9 @@ start_retry() {
     local mode="$1" out="$log_to"
     [ -w "$out" ] || out=/dev/null
     (
+        # Not the apply lock: this outlives the apply (up to retry_wait plus
+        # the clone), and a later connect must not wait for it.
+        exec 9>&-
         trap '' HUP
         exec 8>"$shm/clone-retry.lock" && flock 8
         if [ "$mode" = after-done ]; then
@@ -144,6 +155,10 @@ start_retry() {
         [ "${#folders[@]}" -gt 0 ] || exit 0
         echo "triple-c-apply-connect: cloning again with the project's credentials: ${folders[*]}"
         json=$(repos_for "${folders[@]}")
+        # Authentication goes through ~/.git-credentials (written by the
+        # apply above), not this variable. GIT_TOKEN is exported only for
+        # whatever in the clone reads it directly (a user's credential
+        # helper or hook), and only into this clone, never the agent's env.
         if [ -n "$connect_git_token" ]; then
             export GIT_TOKEN="$connect_git_token"
         fi
@@ -173,8 +188,7 @@ apply() {
         say "$stage is missing; run --prepare and upload first"
         exit 1
     fi
-    exec 9>"$shm/apply-connect.lock" && flock -w 120 9 \
-        || say "warning — another apply is still running; going ahead"
+    take_lock
     # Empty staging dirs: nothing of that kind is configured.
     rmdir "$stage/ca" "$stage/ssh" 2>/dev/null
 

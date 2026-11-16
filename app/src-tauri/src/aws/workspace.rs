@@ -154,6 +154,9 @@ pub struct PayloadExtras<'a> {
     pub connect_only: Option<&'a [String]>,
 }
 
+/// `workspace_env`'s fingerprint of the custom variables' values.
+const CUSTOM_ENV_FINGERPRINT: &str = "TRIPLE_C_CUSTOM_ENV";
+
 /// A credential, for copy-at-connect: an API key or token Triple-C manages
 /// (`SECRET_ENV_KEYS`, `GIT_TOKEN` included) or any custom variable — a
 /// custom value may be a key, and nothing tells which.
@@ -212,8 +215,14 @@ fn payload_map(
             log::warn!("Ignoring the environment variable {k}: Triple-C sets it on AWS");
             continue;
         }
-        // Copy-at-connect: copied in after each connect, never stored.
-        if extras.connect_only.is_some_and(|custom| is_credential_key(k, custom)) {
+        // Copy-at-connect: copied in after each connect, never stored. The
+        // custom variables' fingerprint goes too: an unsalted hash of their
+        // values would let a low-entropy one be guessed offline (and nothing
+        // on AWS reads it; Docker uses it to notice a change).
+        if extras
+            .connect_only
+            .is_some_and(|custom| is_credential_key(k, custom) || k == CUSTOM_ENV_FINGERPRINT)
+        {
             continue;
         }
         m.insert(k.clone(), v.clone());
@@ -277,7 +286,7 @@ fn describe_payload_key(key: &str) -> String {
         KEY_REPOS => "the repository list".into(),
         "CLAUDE_INSTRUCTIONS" => "the instructions".into(),
         "CLAUDE_CODE_SETTINGS_JSON" => "the Claude Code settings".into(),
-        "TRIPLE_C_CUSTOM_ENV" => "the custom environment variables".into(),
+        CUSTOM_ENV_FINGERPRINT => "the custom environment variables".into(),
         k if k.starts_with("TRIPLEC_GATEWAY_") => "the LLM gateway configuration".into(),
         k => format!("the environment variable {k}"),
     }
@@ -641,6 +650,14 @@ pub trait WorkspaceApi: Send + Sync {
         root: &str,
         tags: &[(String, String)],
     ) -> impl Future<Output = Result<String, AwsError>> + Send;
+    /// The secret's current `SecretString`; `None` when there is no secret.
+    fn project_secret_value(
+        &self,
+        name: &str,
+    ) -> impl Future<Output = Result<Option<String>, AwsError>> + Send;
+    /// Delete the secret now, every version with it
+    /// (`ForceDeleteWithoutRecovery`); no secret is not an error.
+    fn delete_project_secret(&self, name: &str) -> impl Future<Output = Result<(), AwsError>> + Send;
     /// Create the secret (encrypted with `kms_key_arn`, tagged), or put a new
     /// value into it when it exists. Returns its ARN.
     fn put_project_secret(
@@ -846,9 +863,33 @@ pub async fn prepare_workspace<W: WorkspaceApi>(
     };
 
     let secret_name = project_secret_name(&env.name, &ok, &project.id);
-    let secret_arn = api
-        .put_project_secret(&secret_name, &env.kms_key_arn, &json, &tags)
-        .await?;
+    let secret_arn = match extras_custom(cfg, custom_env_keys) {
+        // Copy-at-connect over a secret that still holds credentials (it was
+        // Secrets Manager before, or a custom variable has gone): a new value
+        // would leave them in the secret's version history (AWSPREVIOUS), so
+        // the secret is deleted outright and made again (ruling R7).
+        Some(custom) => {
+            let old = api.project_secret_value(&secret_name).await?;
+            if old.as_deref().is_some_and(|o| holds_credentials(o, &payload, custom)) {
+                log::info!(
+                    "Project {}: its secret still held credentials; replacing it so no version keeps them",
+                    project.id
+                );
+                replace_project_secret(
+                    api,
+                    &secret_name,
+                    &env.kms_key_arn,
+                    &json,
+                    &tags,
+                    RECREATE_TIMING,
+                )
+                .await?
+            } else {
+                api.put_project_secret(&secret_name, &env.kms_key_arn, &json, &tags).await?
+            }
+        }
+        None => api.put_project_secret(&secret_name, &env.kms_key_arn, &json, &tags).await?,
+    };
 
     let (task_role, exec_role) = user_role_names(&env.name, &ok);
     let role_arn = |name: &str| format!("arn:{partition}:iam::{}:role/{name}", who.account);
@@ -913,6 +954,75 @@ const MAX_REVISION_PAGES: usize = 20;
 
 /// Secrets Manager's `InvalidRequestException` for a name whose secret is
 /// scheduled for deletion ("... already scheduled for deletion").
+/// Copy-at-connect's custom variable names, or `None` for Secrets Manager.
+fn extras_custom<'a>(
+    cfg: &crate::models::project::AwsWorkspaceConfig,
+    custom_env_keys: &'a [String],
+) -> Option<&'a [String]> {
+    (cfg.secrets_delivery == SecretsDelivery::CopyAtConnect).then_some(custom_env_keys)
+}
+
+/// Whether a secret's current value `old` holds anything copy-at-connect
+/// keeps out: the files, the custom variables' fingerprint, a credential
+/// key, or an environment variable the new payload no longer has (a custom
+/// variable since removed). `TRIPLEC_*` keys are the payload's own. A value
+/// that is not a JSON object counts as holding them.
+pub fn holds_credentials(old: &str, new: &BTreeMap<String, String>, custom: &[String]) -> bool {
+    let Ok(old) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(old) else {
+        return true;
+    };
+    old.keys().any(|k| {
+        k == KEY_FILES
+            || k == CUSTOM_ENV_FINGERPRINT
+            || is_credential_key(k, custom)
+            || (!k.starts_with("TRIPLEC_") && !new.contains_key(k))
+    })
+}
+
+/// How long a replaced secret's name may stay taken by its deletion.
+#[derive(Debug, Clone, Copy)]
+pub struct RecreateTiming {
+    pub interval: std::time::Duration,
+    pub limit: std::time::Duration,
+}
+
+const RECREATE_TIMING: RecreateTiming = RecreateTiming {
+    interval: std::time::Duration::from_secs(2),
+    limit: std::time::Duration::from_secs(30),
+};
+
+fn is_pending_deletion_error(e: &AwsError) -> bool {
+    matches!(e, AwsError::Other { message } if message.contains("is scheduled for deletion"))
+}
+
+/// Delete the secret with every version, then create it with `json`,
+/// retrying while AWS finishes the (asynchronous) delete.
+pub async fn replace_project_secret<W: WorkspaceApi>(
+    api: &W,
+    name: &str,
+    kms_key_arn: &str,
+    json: &str,
+    tags: &[(String, String)],
+    timing: RecreateTiming,
+) -> Result<String, AwsError> {
+    api.delete_project_secret(name).await?;
+    let deadline = tokio::time::Instant::now() + timing.limit;
+    loop {
+        match api.put_project_secret(name, kms_key_arn, json, tags).await {
+            Err(e) if is_pending_deletion_error(&e) => {
+                if tokio::time::Instant::now() + timing.interval > deadline {
+                    return Err(other(format!(
+                        "The project's secret ({name}) was deleted to remove the credentials it                          held, but AWS has not finished deleting it after {} s. Start the project                          again in a minute.",
+                        timing.limit.as_secs()
+                    )));
+                }
+                tokio::time::sleep(timing.interval).await;
+            }
+            r => return r,
+        }
+    }
+}
+
 fn is_pending_deletion(message: Option<&str>) -> bool {
     message.is_some_and(|m| m.contains("scheduled for deletion"))
 }
@@ -1055,6 +1165,41 @@ impl WorkspaceApi for SdkWorkspaceApi {
         out.access_point_id()
             .map(str::to_string)
             .ok_or_else(|| other(format!("{ACTION} returned no AccessPointId")))
+    }
+
+    async fn project_secret_value(&self, name: &str) -> Result<Option<String>, AwsError> {
+        const ACTION: &str = "secretsmanager:GetSecretValue";
+        match self.secrets.get_secret_value().secret_id(name).send().await {
+            Ok(out) => Ok(out.secret_string().map(str::to_string)),
+            Err(e)
+                if e.as_service_error()
+                    .is_some_and(|s| s.is_resource_not_found_exception()) =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(classify_sdk_error(ACTION, &e)),
+        }
+    }
+
+    async fn delete_project_secret(&self, name: &str) -> Result<(), AwsError> {
+        const ACTION: &str = "secretsmanager:DeleteSecret";
+        match self
+            .secrets
+            .delete_secret()
+            .secret_id(name)
+            .force_delete_without_recovery(true)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e)
+                if e.as_service_error()
+                    .is_some_and(|s| s.is_resource_not_found_exception()) =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(classify_sdk_error(ACTION, &e)),
+        }
     }
 
     async fn put_project_secret(

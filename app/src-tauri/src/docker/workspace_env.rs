@@ -442,11 +442,25 @@ pub(crate) fn workspace_env_from_settings(
     project: &Project,
     settings: &crate::models::AppSettings,
 ) -> Result<crate::host::aws_host::AwsEnv, String> {
-    let shared_claude = super::container::shared_claude_auth(project);
     let effective_ca_path =
         resolve_with_global(project.ca_cert_path.as_deref(), settings.ca_cert_path.as_deref());
     let resolved_ca = ca_certs::resolve(effective_ca_path)?;
-    let pairs = workspace_env(
+    let pairs = workspace_env_with_ca(project, settings, resolved_ca.as_ref());
+    Ok((pairs, resolved_ca))
+}
+
+/// [`workspace_env`] resolved from `settings` like
+/// [`workspace_env_from_settings`] but with the CA given (`None`: no CA
+/// variables) — so nothing is read from disk. The keychain is (the shared
+/// Claude token). Copy-at-connect's terminal environment uses it: the
+/// credential pairs never depend on the CA.
+pub(crate) fn workspace_env_with_ca(
+    project: &Project,
+    settings: &crate::models::AppSettings,
+    resolved_ca: Option<&ResolvedCa>,
+) -> Vec<(String, String)> {
+    let shared_claude = super::container::shared_claude_auth(project);
+    workspace_env(
         project,
         &WorkspaceEnvInputs {
             global_aws: &settings.global_aws,
@@ -459,11 +473,10 @@ pub(crate) fn workspace_env_from_settings(
             global_claude_code_settings: settings.global_claude_code_settings.as_ref(),
             default_git_user_name: settings.default_git_user_name.as_deref(),
             default_git_user_email: settings.default_git_user_email.as_deref(),
-            resolved_ca: resolved_ca.as_ref(),
+            resolved_ca,
             shared_claude_token: shared_claude.as_ref().map(|(token, _)| token.as_str()),
         },
-    );
-    Ok((pairs, resolved_ca))
+    )
 }
 
 #[cfg(test)]

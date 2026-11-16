@@ -791,6 +791,14 @@ struct Fake {
     revisions: Mutex<Vec<TaskDefinitionRef>>,
     registered: Mutex<Vec<RegisterTaskDefinitionInput>>,
     describes: Mutex<usize>,
+    /// The secret's value before this start (`project_secret_value`).
+    existing_secret: Mutex<Option<String>>,
+    /// Names force-deleted.
+    deleted_secrets: Mutex<Vec<String>>,
+    /// Calls `project_secret_value` got.
+    secret_reads: Mutex<usize>,
+    /// Puts that fail as "scheduled for deletion" before one succeeds.
+    pending_puts: Mutex<usize>,
 }
 
 impl Fake {
@@ -836,6 +844,14 @@ impl WorkspaceApi for Fake {
         c.push((fs_id.into(), root.into(), tags.to_vec()));
         Ok(format!("fsap-new{}", c.len()))
     }
+    async fn project_secret_value(&self, _name: &str) -> Result<Option<String>, AwsError> {
+        *self.secret_reads.lock().unwrap() += 1;
+        Ok(self.existing_secret.lock().unwrap().clone())
+    }
+    async fn delete_project_secret(&self, name: &str) -> Result<(), AwsError> {
+        self.deleted_secrets.lock().unwrap().push(name.into());
+        Ok(())
+    }
     async fn put_project_secret(
         &self,
         name: &str,
@@ -843,6 +859,15 @@ impl WorkspaceApi for Fake {
         json: &str,
         tags: &[(String, String)],
     ) -> Result<String, AwsError> {
+        {
+            let mut pending = self.pending_puts.lock().unwrap();
+            if *pending > 0 {
+                *pending -= 1;
+                return Err(AwsError::Other {
+                    message: format!("This project's secret ({name}) is scheduled for deletion, so it can't be written."),
+                });
+            }
+        }
         self.secrets.lock().unwrap().push((
             name.into(),
             kms_key_arn.into(),
@@ -1594,4 +1619,102 @@ async fn prepare_leaves_the_credentials_out_of_a_copy_at_connect_secret() {
     assert_eq!(m["TZ"], "UTC");
     assert_eq!(m["TRIPLEC_CREDENTIALS"], "connect");
     assert!(m.contains_key("TRIPLEC_AGENT_TOKEN"));
+}
+
+fn copy_at_connect_project() -> Project {
+    let mut p = project(StorageMode::Hybrid);
+    p.aws.as_mut().unwrap().secrets_delivery = crate::models::project::SecretsDelivery::CopyAtConnect;
+    p
+}
+
+#[tokio::test]
+async fn switching_to_copy_at_connect_replaces_a_secret_that_held_credentials() {
+    // The secret from a Secrets Manager period: replaced, not overwritten.
+    let fake = Fake::onboarded();
+    *fake.existing_secret.lock().unwrap() =
+        Some(r#"{"GIT_TOKEN":"ghp_old","TRIPLEC_AGENT_TOKEN":"t","TZ":"UTC"}"#.into());
+    *fake.pending_puts.lock().unwrap() = 2; // AWS still finishing the delete
+    let env = pairs(&[("GIT_TOKEN", "ghp_new"), ("TZ", "UTC")]);
+    prepare_workspace(&fake, &who(), &env_info(), &copy_at_connect_project(), &env, &[], &[], IMAGE)
+        .await
+        .unwrap();
+    assert_eq!(fake.deleted_secrets.lock().unwrap().len(), 1);
+    let m = payload_map(&fake.secrets.lock().unwrap()[0].2);
+    assert!(!m.contains_key("GIT_TOKEN"));
+
+    // Already clean: a plain put, nothing deleted.
+    let fake = Fake::onboarded();
+    *fake.existing_secret.lock().unwrap() = Some(
+        r#"{"TRIPLEC_AGENT_TOKEN":"t","TRIPLEC_CREDENTIALS":"connect","TZ":"UTC","TRIPLEC_REPOS":"[]"}"#.into(),
+    );
+    prepare_workspace(&fake, &who(), &env_info(), &copy_at_connect_project(), &env, &[], &[], IMAGE)
+        .await
+        .unwrap();
+    assert!(fake.deleted_secrets.lock().unwrap().is_empty());
+    assert_eq!(fake.secrets.lock().unwrap().len(), 1);
+
+    // No secret yet: created, nothing deleted.
+    let fake = Fake::onboarded();
+    prepare_workspace(&fake, &who(), &env_info(), &copy_at_connect_project(), &env, &[], &[], IMAGE)
+        .await
+        .unwrap();
+    assert!(fake.deleted_secrets.lock().unwrap().is_empty());
+
+    // Secrets Manager never reads or deletes.
+    let fake = Fake::onboarded();
+    *fake.existing_secret.lock().unwrap() = Some(r#"{"GIT_TOKEN":"x"}"#.into());
+    prepare(&fake, &project(StorageMode::Hybrid), &env).await.unwrap();
+    assert_eq!(*fake.secret_reads.lock().unwrap(), 0);
+    assert!(fake.deleted_secrets.lock().unwrap().is_empty());
+}
+
+#[test]
+fn what_counts_as_credentials_left_in_a_secret() {
+    let new: BTreeMap<String, String> =
+        [("TZ", "UTC"), ("TRIPLEC_AGENT_TOKEN", "t")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    let custom = vec!["MINE".to_string()];
+    let holds = |old: &str| holds_credentials(old, &new, &custom);
+    assert!(holds(r#"{"TRIPLEC_FILES":"{}"}"#));
+    assert!(holds(r#"{"TRIPLE_C_CUSTOM_ENV":"abc"}"#));
+    assert!(holds(r#"{"ANTHROPIC_API_KEY":""}"#));
+    assert!(holds(r#"{"MINE":"v"}"#));
+    assert!(holds(r#"{"GONE_CUSTOM":"v","TZ":"UTC"}"#), "a variable the payload no longer has");
+    assert!(holds("not json"));
+    assert!(!holds(r#"{"TZ":"UTC","TRIPLEC_AGENT_TOKEN":"old","TRIPLEC_SETUP_SCRIPT":"x"}"#));
+}
+
+#[tokio::test]
+async fn a_replaced_secret_that_aws_has_not_finished_deleting_is_a_clear_error() {
+    let fake = Fake::onboarded();
+    *fake.pending_puts.lock().unwrap() = 100;
+    let timing = RecreateTiming {
+        interval: std::time::Duration::from_millis(1),
+        limit: std::time::Duration::from_millis(20),
+    };
+    let e = replace_project_secret(&fake, "n", "k", "{}", &[], timing).await.unwrap_err();
+    assert!(e.to_string().contains("has not finished deleting it"), "{e}");
+    assert_eq!(fake.deleted_secrets.lock().unwrap().as_slice(), ["n"]);
+}
+
+#[test]
+fn a_copy_at_connect_payload_drops_the_custom_variables_fingerprint() {
+    let env = pairs(&[("TRIPLE_C_CUSTOM_ENV", "63ce86"), ("TZ", "UTC")]);
+    let custom: Vec<String> = Vec::new();
+    let with = |connect_only| {
+        payload_map(
+            &project_secret_payload_with(
+                &env,
+                "tok",
+                &[],
+                &[],
+                true,
+                None,
+                StorageMode::Hybrid,
+                PayloadExtras { connect_only, ..Default::default() },
+            )
+            .unwrap(),
+        )
+    };
+    assert!(!with(Some(&custom)).contains_key("TRIPLE_C_CUSTOM_ENV"));
+    assert_eq!(with(None)["TRIPLE_C_CUSTOM_ENV"], "63ce86");
 }

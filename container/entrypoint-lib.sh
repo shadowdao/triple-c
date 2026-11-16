@@ -49,7 +49,12 @@ _triplec_as_user() {
 # so host keys land on EFS, and before anything writes ~/.claude.
 # >>> aws_home
 link_persistent_home() {
-    local home="$1" persist="$2" owner="$3" name link target
+    local home="$1" persist="$2" owner="$3" name link target names=".claude .claude.json .ssh"
+    # Copy-at-connect (ruling R6): ~/.ssh stays in the task's own storage,
+    # so the keys copied in at connect vanish with the task and never reach
+    # EFS. (Keys made in the workspace then don't persist either; a .ssh
+    # already on EFS from an earlier Secrets Manager period is left alone.)
+    [ "${triplec_connect:-0}" = 1 ] && names=".claude .claude.json"
     if [ ! -d "$persist" ] || [ -L "$persist" ]; then
         echo "entrypoint: warning — Hybrid storage, but $persist is not mounted; home state will not persist"
         return 0
@@ -58,7 +63,7 @@ link_persistent_home() {
     # claude (Claude Code's own atomic saves, write_claude_json) can always
     # create files beside the persisted ones.
     [ -z "$owner" ] || chown "$owner" "$persist" 2>/dev/null
-    for name in .claude .claude.json .ssh; do
+    for name in $names; do
         link="$home/$name"
         target="$persist/$name"
         if [ -L "$link" ] && [ "$(readlink "$link")" = "$target" ]; then
@@ -86,7 +91,11 @@ link_persistent_home() {
         ln -s "$target" "$link" || echo "entrypoint: warning — could not link ~/$name to $target"
         [ -z "$owner" ] || chown -h "$owner" "$link" 2>/dev/null
     done
-    echo "entrypoint: Hybrid storage — ~/.claude, ~/.claude.json and ~/.ssh persist on $persist"
+    if [ "${triplec_connect:-0}" = 1 ]; then
+        echo "entrypoint: Hybrid storage — ~/.claude and ~/.claude.json persist on $persist; ~/.ssh does not (credentials are copied in at connect)"
+    else
+        echo "entrypoint: Hybrid storage — ~/.claude, ~/.claude.json and ~/.ssh persist on $persist"
+    fi
 }
 
 # The real directory behind a Hybrid ~/.ssh link, printed only when the link

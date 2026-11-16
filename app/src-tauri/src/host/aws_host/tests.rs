@@ -161,6 +161,12 @@ impl WorkspaceApi for Fake {
         self.log("create-ap");
         Ok(if root.starts_with("/triple-c-workspaces/") { "fsap-ws" } else { "fsap-new" }.into())
     }
+    async fn project_secret_value(&self, _name: &str) -> Result<Option<String>, AwsError> {
+        Ok(None)
+    }
+    async fn delete_project_secret(&self, _name: &str) -> Result<(), AwsError> {
+        Ok(())
+    }
     async fn put_project_secret(
         &self,
         _name: &str,
@@ -970,12 +976,12 @@ mod copy_at_connect {
     fn bundle() -> ConnectBundle {
         ConnectBundle {
             files: vec![
-                ("ssh/id_ed25519".into(), b"PRIVATE".to_vec()),
-                ("ca/corp.crt".into(), b"PEM".to_vec()),
+                ("ssh/id_ed25519".into(), b"PRIVATE".to_vec().into()),
+                ("ca/corp.crt".into(), b"PEM".to_vec().into()),
             ],
             env: vec![
-                ("GIT_TOKEN".into(), "ghp_x".into()),
-                ("MULTI".into(), "a=b\nc".into()),
+                ("GIT_TOKEN".into(), String::from("ghp_x").into()),
+                ("MULTI".into(), String::from("a=b\nc").into()),
             ],
         }
     }
@@ -1019,7 +1025,7 @@ mod copy_at_connect {
 
         // A bad file key is refused before anything is uploaded under it.
         let t = FakeTarget::default();
-        let bad = ConnectBundle { files: vec![("ssh/../x".into(), vec![])], env: vec![] };
+        let bad = ConnectBundle { files: vec![("ssh/../x".into(), Vec::new().into())], env: vec![] };
         assert!(push_connect_bundle(&t, &bad).await.is_err());
         assert!(t.uploads.lock().unwrap().is_empty());
     }
@@ -1046,8 +1052,9 @@ mod copy_at_connect {
             ..Default::default()
         };
         let b = connect_credentials(&p, &settings).unwrap();
-        assert_eq!(b.files, vec![("ssh/id_ed25519".to_string(), b"KEY".to_vec())]);
-        let env: HashMap<_, _> = b.env.iter().cloned().collect();
+        assert_eq!(b.files.len(), 1);
+        assert_eq!((b.files[0].0.as_str(), b.files[0].1.as_slice()), ("ssh/id_ed25519", &b"KEY"[..]));
+        let env: HashMap<String, String> = b.env.iter().map(|(k, v)| (k.clone(), v.to_string())).collect();
         assert_eq!(env["GIT_TOKEN"], "ghp_tok");
         assert_eq!(env["MY_KEY"], "v1");
         assert_eq!(env["GLOBAL_KEY"], "g");
@@ -1059,8 +1066,21 @@ mod copy_at_connect {
     }
 
     #[test]
+    fn a_terminal_gets_the_api_keys_even_when_a_file_is_unreadable() {
+        let mut p = connect_project(SecretsDelivery::CopyAtConnect);
+        p.ssh_key_path = Some("/nonexistent/ssh-dir".into());
+        p.ca_cert_path = Some("/nonexistent/ca.pem".into());
+        p.git_token = Some("ghp_tok".into());
+        let settings = AppSettings::default();
+        assert!(connect_credentials(&p, &settings).is_err(), "the push needs the files");
+        let env: HashMap<String, String> =
+            connect_env(&p, &settings).into_iter().map(|(k, v)| (k, v.to_string())).collect();
+        assert_eq!(env["GIT_TOKEN"], "ghp_tok");
+    }
+
+    #[test]
     fn a_copy_at_connect_terminal_carries_the_credentials_and_a_secrets_manager_one_does_not() {
-        let creds = || Ok(bundle());
+        let creds = || Ok(bundle().env);
         let p = connect_project(SecretsDelivery::CopyAtConnect);
         let spec = crate::host::sessions::session_spec(
             vec!["bash".into(), "-l".into()],
