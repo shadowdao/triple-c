@@ -562,7 +562,7 @@ aws_wait_connect() {
     local status_dir="$1" waited=0
     while [ ! -e "$triplec_run_dir/connected" ]; do
         if [ "$waited" -ge "$triplec_connect_wait" ]; then
-            echo "entrypoint: Triple-C has not connected within ${triplec_connect_wait}s — cloning without the project's credentials (the next connect retries what fails)"
+            echo "entrypoint: Triple-C has not connected within ${triplec_connect_wait}s — going ahead without the project's credentials (the next connect retries a clone that fails)"
             [ -z "$status_dir" ] || : > "$status_dir/no-credentials"
             return 0
         fi
@@ -574,7 +574,8 @@ aws_wait_connect() {
 # Runs clone_repos in the background, recording progress in $2, then the
 # setup script (aws_run, which must see the repositories). The status dir is
 # made even with no repositories, so `done` always ends up there. Under
-# copy-at-connect the clone first waits for the credentials (above).
+# copy-at-connect the clone first waits for the credentials (above) when there
+# are repositories or a setup script.
 start_clone_repos() {
     local json="$1" status_dir="$2"
     rm -rf "$status_dir"
@@ -590,8 +591,15 @@ start_clone_repos() {
             # `done` however the clone ends (an error, a signal), or the idle
             # watcher would count it as still running forever.
             [ -z "$status_dir" ] || trap ': > "$status_dir/done"' EXIT
-            # (Nothing to wait for without repositories.)
-            case "$json" in ''|'[]') ;; *) [ "${triplec_connect:-0}" = 1 ] && aws_wait_connect "$status_dir" ;; esac
+            # Wait when something needs the credentials: a repository to
+            # clone, or a setup script (it runs right after this and needs the
+            # CA, SSH keys and Git credentials the connect installs).
+            local needs_connect=0
+            case "$json" in ''|'[]') ;; *) needs_connect=1 ;; esac
+            [ -f "${triplec_setup_dir:-/nonexistent}/script" ] && needs_connect=1
+            if [ "${triplec_connect:-0}" = 1 ] && [ "$needs_connect" = 1 ]; then
+                aws_wait_connect "$status_dir"
+            fi
             clone_repos "$json" /workspace "$status_dir"
         )
         aws_run_setup

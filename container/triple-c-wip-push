@@ -90,11 +90,15 @@ else
     force=
 fi
 
-# The WIP ref for folder $1: <base>-<sanitised folder>, or <base>-<hash>.
+# The WIP ref for folder $1: <base>-<folder>; <base>-<sanitised folder>-<hash>
+# when the name had to change; or <base>-<hash> when no ref can carry it.
 wip_ref() {
     local safe r
     safe=$(printf '%s' "$1" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_' | cut -c 1-64)
     r="$ref_base-$safe"
+    # Sanitising (or the cut) changed the name: add a hash of the raw name,
+    # so `a b` and `a_b` never share a branch.
+    [ "$safe" = "$1" ] || r="$r-$(printf '%s' "$1" | sha256sum | cut -c 1-8)"
     if [ -z "$safe" ] || ! git check-ref-format "$r"; then
         r="$ref_base-$(printf '%s' "$1" | sha256sum | cut -c 1-12)"
     fi

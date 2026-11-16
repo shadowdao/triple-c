@@ -202,6 +202,34 @@ retry_failed_clones() {
     # now, with the credentials) or already cloning with them.
 }
 
+# Puts this connect's CA files ($1) at $ca_dir, or removes $ca_dir when the
+# connect brought none. The new files go to a temporary name first and are
+# swapped in, so a failed move leaves the CA installed before still there.
+replace_ca_dir() {
+    local src="$1" new="$ca_dir.new" old="$ca_dir.old"
+    if [ ! -d "$src" ]; then
+        rm -rf "$ca_dir"
+        return 0
+    fi
+    rm -rf "$new" "$old"
+    if ! mv -T "$src" "$new"; then
+        say "warning — could not move the CA files into place; keeping the ones from before"
+        return 0
+    fi
+    if [ -e "$ca_dir" ] && ! mv -T "$ca_dir" "$old"; then
+        say "warning — could not replace the CA files; keeping the ones from before"
+        rm -rf "$new"
+        return 0
+    fi
+    if ! mv -T "$new" "$ca_dir"; then
+        say "warning — could not move the CA files into place; keeping the ones from before"
+        [ ! -e "$old" ] || mv -T "$old" "$ca_dir"
+        rm -rf "$new"
+        return 0
+    fi
+    rm -rf "$old"
+}
+
 apply() {
     local nonce="$1"
     umask 077
@@ -218,10 +246,7 @@ apply() {
     # Empty staging dirs: nothing of that kind is configured.
     rmdir "$dir/ca" "$dir/ssh" 2>/dev/null
 
-    rm -rf "$ca_dir"
-    if [ -d "$dir/ca" ]; then
-        mv "$dir/ca" "$ca_dir" || say "warning — could not move the CA files into place"
-    fi
+    replace_ca_dir "$dir/ca"
     CA_SRC="$ca_dir"
     install_corporate_ca
 

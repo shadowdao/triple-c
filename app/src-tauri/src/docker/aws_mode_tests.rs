@@ -1968,7 +1968,8 @@ fn each_folder_in_a_run_has_its_own_wip_branch_even_on_one_remote() {
     let out = wip_push_in_run(&ws, Some(run_id));
     assert!(out.status.success(), "{}", text(&out));
     let api_ref = format!("refs/heads/triple-c/wip/{run_id}-proj");
-    let web_ref = format!("refs/heads/triple-c/wip/{run_id}-we_b_x");
+    // Sanitised, so with the first 8 hex of sha256("we b@x").
+    let web_ref = format!("refs/heads/triple-c/wip/{run_id}-we_b_x-7d2e374f");
     let mut refs = wip_refs(&remote);
     refs.sort();
     assert_eq!(refs, [api_ref.clone(), web_ref.clone()]);
@@ -2002,6 +2003,31 @@ fn a_folder_name_no_ref_can_carry_falls_back_to_a_hash() {
     assert_eq!(refs.len(), 1, "{refs:?}");
     let suffix = refs[0].strip_prefix(&format!("refs/heads/triple-c/wip/{run_id}-")).unwrap();
     assert!(suffix.len() == 12 && suffix.chars().all(|c| c.is_ascii_hexdigit()), "{suffix}");
+}
+
+#[test]
+fn folders_that_sanitise_to_the_same_name_get_different_wip_branches() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (ws, _, remote) = workspace_with_clone(tmp.path());
+    for folder in ["a b", "a_b"] {
+        git(&ws, &["clone", "-q", remote.to_str().unwrap(), folder]);
+        let repo = ws.join(folder);
+        git(&repo, &["config", "user.name", "Dev"]);
+        git(&repo, &["config", "user.email", "dev@example.invalid"]);
+        fs::write(repo.join("x"), folder).unwrap();
+    }
+    let run_id = "20261115-093000-local";
+    let out = wip_push_in_run(&ws, Some(run_id));
+    assert!(out.status.success(), "{}", text(&out));
+    let mut refs = wip_refs(&remote);
+    refs.sort();
+    let base = format!("refs/heads/triple-c/wip/{run_id}-");
+    // Exact names keep their folder; the changed one gets a hash of the raw name.
+    assert!(refs.iter().any(|r| *r == format!("{base}a_b")), "{refs:?}");
+    let spaced: Vec<_> = refs.iter().filter_map(|r| r.strip_prefix(&format!("{base}a_b-"))).collect();
+    assert_eq!(spaced.len(), 1, "{refs:?}");
+    assert!(spaced[0].len() == 8 && spaced[0].chars().all(|c| c.is_ascii_hexdigit()), "{refs:?}");
+    assert_eq!(refs.len(), 2, "{refs:?}");
 }
 
 // ------------------------------------------------- copy-at-connect (phase 6 Q2)
@@ -2190,7 +2216,51 @@ fn under_copy_at_connect_the_clone_waits_for_the_connect_then_goes_ahead_without
     assert!(status.join("marker").exists() && status.join("done").exists());
     assert!(status.join("no-credentials").exists());
     assert!(took >= std::time::Duration::from_secs(2), "{took:?}");
-    assert!(text(&out).contains("cloning without the project's credentials"), "{}", text(&out));
+    assert!(text(&out).contains("going ahead without the project's credentials"), "{}", text(&out));
+}
+
+/// Copy-at-connect with no repositories: `start_clone_repos` with a setup
+/// script (or none), the connect arriving after a second; the stubbed setup
+/// records whether the connect had happened when it ran.
+fn connect_setup(tmp: &Path, setup_script: &str) -> (Output, std::time::Duration) {
+    let script = format!(
+        "{}
+triplec_connect=1
+         triplec_setup_script=\"$SETUP\"
+         aws_prepare_run
+         aws_run_setup() {{ if [ -e \"$triplec_run_dir/connected\" ]; then echo after > \"$OUT/setup-ran\"; else echo before > \"$OUT/setup-ran\"; fi; }}
+         ( sleep 1; : > \"$triplec_run_dir/connected\" ) &
+         start_clone_repos '[]' \"$1/status\"
+wait
+",
+        aws_run_blocks(tmp, &["aws_env", "aws_run", "aws_repos"])
+            .replace("triplec_connect_wait=300\n", "triplec_connect_wait=10\n")
+    );
+    let started = std::time::Instant::now();
+    let out = bash(
+        &script,
+        &[tmp],
+        &[("SETUP", setup_script), ("OUT", tmp.to_str().unwrap())],
+        &["ECS_CONTAINER_METADATA_URI_V4"],
+    );
+    (out, started.elapsed())
+}
+
+#[test]
+fn under_copy_at_connect_a_setup_script_waits_for_the_connect_even_with_no_repos() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (out, took) = connect_setup(tmp.path(), "echo hi\n");
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(fs::read_to_string(tmp.path().join("setup-ran")).unwrap(), "after\n", "{}", text(&out));
+    assert!(took >= std::time::Duration::from_secs(1), "{took:?}");
+    assert!(!tmp.path().join("status/no-credentials").exists());
+
+    // No repositories and no setup script: nothing waits for the connect.
+    let tmp = tempfile::tempdir().unwrap();
+    let (out, took) = connect_setup(tmp.path(), "");
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(tmp.path().join("status/done").exists());
+    assert!(took < std::time::Duration::from_secs(3), "{took:?}");
 }
 
 /// A workspace for `triple-c-apply-connect`: its script and library with every
@@ -2368,6 +2438,43 @@ fn apply_connect_installs_the_ca_merges_ssh_writes_git_credentials_and_retries_o
     assert_eq!(fs::read_to_string(c.p("home/.git-credentials")).unwrap(), cred);
     assert_eq!(fs::read_to_string(c.p("home/.ssh/id_ed25519")).unwrap(), "KEY");
     assert_eq!(fs::read_to_string(c.p("update-calls")).unwrap(), "ran\n", "the CA stamp skips a reinstall");
+}
+
+#[test]
+fn a_failed_ca_move_keeps_the_ca_installed_before() {
+    let tmp = tempfile::tempdir().unwrap();
+    let c = Connect::new(tmp.path());
+    let out = c.connect(&[("ca/corp.pem", PEM)], "");
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(fs::read_to_string(c.p("shm/connect-ca/corp.pem")).unwrap(), PEM);
+
+    // Every move of a staged `ca` dir fails: the old files stay in place and
+    // stay installed.
+    let pem2 = "-----BEGIN CERTIFICATE-----\nMIIC\n-----END CERTIFICATE-----\n";
+    write_script(
+        &c.p("bin"),
+        "mv",
+        "#!/bin/sh\nfor a; do case \"$a\" in */ca) exit 1 ;; esac; done\nexec /usr/bin/mv \"$@\"\n",
+    );
+    let out = c.connect(&[("ca/corp.pem", pem2)], "");
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("keeping the ones from before"), "{}", text(&out));
+    assert_eq!(fs::read_to_string(c.p("shm/connect-ca/corp.pem")).unwrap(), PEM);
+    assert_eq!(fs::read_to_string(c.p("store/triple-c-corp.crt")).unwrap(), PEM);
+
+    // With the moves working again the new files are swapped in, nothing left over.
+    fs::remove_file(c.p("bin/mv")).unwrap();
+    let out = c.connect(&[("ca/corp.pem", pem2)], "");
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(fs::read_to_string(c.p("shm/connect-ca/corp.pem")).unwrap(), pem2);
+    assert_eq!(fs::read_to_string(c.p("store/triple-c-corp.crt")).unwrap(), pem2);
+    assert!(!c.p("shm/connect-ca.new").exists() && !c.p("shm/connect-ca.old").exists());
+
+    // A connect with no CA removes it.
+    let out = c.connect(&[], "");
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(!c.p("shm/connect-ca").exists());
+    assert!(!c.p("store/triple-c-corp.crt").exists());
 }
 
 #[test]

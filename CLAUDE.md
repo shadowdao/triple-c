@@ -437,7 +437,8 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   **One WIP branch per task run and folder:** `aws_prepare_run` (right after the agent-token block)
   writes `/run/triple-c/run-id` (`<UTC stamp>-<task id 8 | local>`, task id from ECS task metadata)
   and `start-epoch`; `/run/triple-c` is root 0711 (the stop guard keeps that mode — at 0700 `claude`
-  could not read the run id). The folder is sanitised to `[A-Za-z0-9._-]` and the ref checked with
+  could not read the run id). The folder is sanitised to `[A-Za-z0-9._-]` (a name that changed gets
+  `-<8 hex of sha256(raw name)>`, so `a b` and `a_b` never share a ref) and the ref checked with
   `git check-ref-format`; later pushes force (`+`) only that run's own branch, and a tree equal to
   `/run/triple-c/wip-last/<folder>` (claude-owned dir, written after a successful push) is skipped.
   No usable run id (Docker) keeps a per-push `<stamp>-<folder>`, never forced.
