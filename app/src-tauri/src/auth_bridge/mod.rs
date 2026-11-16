@@ -583,7 +583,7 @@ async fn reconcile(
             );
             continue;
         }
-        match PortForward::bind(container.clone(), port, family).await {
+        match PortForward::bind(container.clone(), port, port, family).await {
             Ok(forward) => {
                 if st.conflicts.remove(&port).is_some() {
                     log::info!("Auth bridge: host port {} became available", port);

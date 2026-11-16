@@ -7,7 +7,7 @@ import Field, { ConfigGroup, inputClass } from "../../../ui/Field";
 import CaCertPathInput from "../../../settings/CaCertPathInput";
 import EnvVarsEditor from "../../EnvVarsEditor";
 import PortMappingsEditor from "../../PortMappingsEditor";
-import { NOT_ON_AWS, isAwsProject } from "../../../../lib/awsWorkspace";
+import { AWS_PORTS_LOCALHOST_ONLY, isAwsProject } from "../../../../lib/awsWorkspace";
 
 interface Props {
   project: Project;
@@ -163,21 +163,23 @@ export default function AccessSection({
           Port mappings
         </span>
         {isAwsProject(project) ? (
-          <p className="mt-0.5 text-xs text-[var(--text-disabled)] leading-snug">{NOT_ON_AWS}</p>
+          <p className="mt-0.5 mb-2 text-xs text-[var(--text-secondary)] leading-snug">
+            Forward workspace ports to this machine while it is connected. TCP only.{" "}
+            {AWS_PORTS_LOCALHOST_ONLY}.
+          </p>
         ) : (
-          <>
-            <p className="mt-0.5 mb-2 text-xs text-[var(--text-secondary)] leading-snug">
-              Expose container ports on the host so you can reach dev servers running inside
-              the sandbox.
-            </p>
-            <PortMappingsEditor
-              portMappings={project.port_mappings ?? []}
-              disabled={disabled}
-              disabledReason={disabledReason}
-              onSave={(mappings) => save({ port_mappings: mappings })}
-            />
-          </>
+          <p className="mt-0.5 mb-2 text-xs text-[var(--text-secondary)] leading-snug">
+            Expose container ports on the host so you can reach dev servers running inside
+            the sandbox.
+          </p>
         )}
+        <PortMappingsEditor
+          portMappings={project.port_mappings ?? []}
+          disabled={disabled}
+          disabledReason={disabledReason}
+          tcpOnly={isAwsProject(project)}
+          onSave={(mappings) => save({ port_mappings: mappings })}
+        />
       </div>
     </ConfigGroup>
   );

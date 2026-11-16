@@ -300,6 +300,12 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   every tunnel (`for_project` is `None` while none is open; `for_project_waiting` covers the
   background re-attach after an app restart). AWS SDK calls stay in `aws/` (`runtime.rs`,
   `tasks.rs`, `workspace.rs`).
+  `port_forwards.rs` is an AWS project's port mappings: TCP only (validated on save, with the
+  browser-view ranges and the agent port refused), each a **loopback-only** auth-bridge
+  `PortForward::bind_mapping` (no first-byte gate, unlike the bridge) over socat-over-attach.
+  One set per project, opened after every connect (start, re-attach) and on a save while
+  connected; closed by every `tunnels::close*` path. A failing mapping is a `workspace-warning`
+  (`topic: "ports"`), the rest still open; an idle listener makes no agent request.
   `agent.rs` reuses `docker/exec.rs`'s `OneshotOutput`, host-file reader and uid probe so the two
   variants cannot drift; an `Agent` target's token never appears in `Debug` or error text.
   **Container-interior code must go through `ContainerTarget`, never `docker::exec`, bollard or

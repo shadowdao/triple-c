@@ -1061,6 +1061,7 @@ fn pending_cleanup_is_stale(recorded_at: &str, now: chrono::DateTime<chrono::Utc
 #[tauri::command]
 pub async fn update_project(
     project: serde_json::Value,
+    app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Project, String> {
     // Taken as raw JSON, then deserialised, for one reason: a secret field that
@@ -1144,9 +1145,19 @@ pub async fn update_project(
     // lock against the record as it is *now*, so a marketplace install, a
     // status change or a container id landing since `stored` was read is kept
     // rather than written over.
-    state
+    let mappings_changed = stored.port_mappings != project.port_mappings;
+    let saved = state
         .projects_store
-        .update_restoring(project, restore_store_owned_fields)
+        .update_restoring(project, restore_store_owned_fields)?;
+
+    // AWS (Q6): a connected workspace's forwards follow the saved mappings
+    // now — there is no container to recreate. Nothing when not connected.
+    if saved.is_aws() && mappings_changed {
+        if let Some(detail) = crate::host::port_forwards::open_for_project(&saved).await {
+            emit_ports_warning(&app_handle, &saved.id, &saved.name, &detail);
+        }
+    }
+    Ok(saved)
 }
 
 /// Restore onto `project` the fields whose value belongs to the store rather
@@ -1211,6 +1222,8 @@ fn validate_aws_update(
             crate::models::validate_region(&place.region)?;
             crate::aws::tofu_modules::validate_environment_name(&place.environment)?;
             crate::models::validate_aws_workspace(cfg)?;
+            // Q6: forwarded over loopback, TCP only, never a reserved port.
+            crate::host::port_forwards::validate_aws_port_mappings(&project.port_mappings)?;
         }
         _ => {
             return Err(
@@ -1491,6 +1504,14 @@ async fn start_project_container_locked(
             .await;
     }
 
+    // AWS (Q6): the project's port mappings become loopback forwards into
+    // the workspace; a mapping that can't open is a warning, the rest work.
+    if project.is_aws() {
+        if let Some(detail) = crate::host::port_forwards::open_for_project(&project).await {
+            emit_ports_warning(&app_handle, &project_id, &project.name, &detail);
+        }
+    }
+
     // AWS, copy-at-connect (Q2): every connect copies the credentials in,
     // in the background (the clone waits for them); a failure is a warning.
     if project.is_aws() {
@@ -1539,6 +1560,21 @@ fn emit_connect_warning(app_handle: &tauri::AppHandle, project_id: &str, name: &
             "project_id": project_id,
             "message": format!("“{name}”: the credentials could not be copied into the workspace"),
             "detail": detail,
+        }),
+    );
+}
+
+/// Port mappings that could not be forwarded to a connected AWS workspace
+/// (Q6): a busy host port, a host port mapped twice. Same `workspace-warning`
+/// event, with its own `topic` so it does not replace the other warnings.
+fn emit_ports_warning(app_handle: &tauri::AppHandle, project_id: &str, name: &str, detail: &str) {
+    let _ = app_handle.emit(
+        "workspace-warning",
+        serde_json::json!({
+            "project_id": project_id,
+            "message": format!("“{name}”: some port mappings could not be opened"),
+            "detail": detail,
+            "topic": "ports",
         }),
     );
 }
@@ -2080,11 +2116,22 @@ pub async fn reconcile_aws_projects(
             // The store's current copy: the id above may have changed.
             let project = store.get(&project.id).unwrap_or(project);
             let (id, name) = (project.id.clone(), project.name.clone());
+            let ports_handle = handle.clone();
+            let (ports_id, ports_name) = (id.clone(), name.clone());
+            let on_ports_warning = move |detail: String| {
+                emit_ports_warning(&ports_handle, &ports_id, &ports_name, &detail)
+            };
             let on_connect_warning =
                 move |detail: String| emit_connect_warning(&handle, &id, &name, &detail);
             if tokio::time::timeout(
                 AWS_RECONCILE_TIMEOUT,
-                crate::host::aws_host::reconcile(&project, &settings, store, on_connect_warning),
+                crate::host::aws_host::reconcile(
+                    &project,
+                    &settings,
+                    store,
+                    on_connect_warning,
+                    on_ports_warning,
+                ),
             )
             .await
             .is_err()
@@ -3060,7 +3107,55 @@ mod tests {
         assert!(start[push..].starts_with("aws_host::spawn_connect_push(&project, &settings, move |detail| {\n            emit_connect_warning("));
         let reconcile = fn_body(src, "reconcile_aws_projects");
         assert!(reconcile.contains("emit_connect_warning(&handle, &id, &name, &detail)"));
-        assert!(reconcile.contains("aws_host::reconcile(&project, &settings, store, on_connect_warning)"));
+        assert!(reconcile.contains("aws_host::reconcile(\n                    &project,\n                    &settings,\n                    store,\n                    on_connect_warning,"));
+    }
+
+    #[test]
+    fn an_aws_project_refuses_udp_and_reserved_mappings_and_a_local_one_does_not() {
+        let hosts = vec![host("h1")];
+        let udp = crate::models::PortMapping {
+            host_port: 5353,
+            container_port: 5353,
+            protocol: "udp".into(),
+        };
+        let mut aws = aws_project();
+        aws.port_mappings = vec![udp.clone()];
+        let e = validate_aws_update(&aws, &aws, &hosts).unwrap_err();
+        assert!(e.contains("only TCP"), "{e}");
+        aws.port_mappings[0].container_port = crate::host::ssm::AGENT_PORT;
+        aws.port_mappings[0].protocol = "tcp".into();
+        assert!(validate_aws_update(&aws, &aws, &hosts).is_err());
+        aws.port_mappings[0].container_port = 3000;
+        assert!(validate_aws_update(&aws, &aws, &hosts).is_ok());
+
+        // Docker publishes UDP itself: a local project is not checked.
+        let (mut local, _) = stored_and_stale_payload();
+        local.port_mappings = vec![udp];
+        assert!(validate_aws_update(&local, &local, &hosts).is_ok());
+    }
+
+    #[test]
+    fn every_connect_of_an_aws_project_opens_its_port_mappings() {
+        // Q6: the start (after Running), the background re-attach, and a save
+        // of the mappings while connected; a failure is a `workspace-warning`.
+        let src = include_str!("project_commands.rs");
+        let start = fn_body(src, "start_project_container_locked");
+        let running = start.find("update_status(&project_id, ProjectStatus::Running)").unwrap();
+        let open = start.find("port_forwards::open_for_project(&project)").expect("the start opens them");
+        assert!(open > running);
+        let guard = start[..open].rfind("if project.is_aws() {").expect("AWS-only");
+        assert!(start[guard..open].lines().count() <= 2);
+        assert!(start[open..].lines().nth(1).unwrap().contains("emit_ports_warning("));
+        let update = fn_body(src, "update_project");
+        assert!(update.contains("port_forwards::open_for_project(&saved)"));
+        let reconcile = fn_body(src, "reconcile_aws_projects");
+        assert!(reconcile.contains("on_ports_warning,"));
+        assert!(reconcile.contains("emit_ports_warning(&ports_handle, &ports_id, &ports_name, &detail)"));
+        let aws_host = include_str!("../host/aws_host.rs");
+        let reattached = aws_host.find("Ok(true) => {").unwrap();
+        let opened = aws_host.find("port_forwards::open_for_project(&project)").unwrap();
+        let pushed = aws_host[reattached..].find("connect::apply_connect(").unwrap() + reattached;
+        assert!(reattached < opened && opened < pushed);
     }
 
     #[test]

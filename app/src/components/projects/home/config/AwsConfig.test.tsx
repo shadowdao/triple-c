@@ -40,6 +40,14 @@ describe("AWS project config", () => {
     expect(screen.getByText(/Off on AWS for now/)).toBeInTheDocument();
   });
 
+  it("still offers UDP mappings for a local project", () => {
+    const project = localProject();
+    project.port_mappings = [{ host_port: 5353, container_port: 5353, protocol: "udp" }];
+    render(<AccessSection project={project} save={save} disabled={false} />);
+    expect(within(screen.getByLabelText("Protocol 1")).getByText("UDP")).toBeInTheDocument();
+    expect(screen.queryByText(/Reachable only from this machine/)).toBeNull();
+  });
+
   it("leaves those options alone for a local project", () => {
     render(<RuntimeSection project={localProject()} save={save} disabled={false} />);
     expect(toggle("VPN support")).not.toBeDisabled();
@@ -47,10 +55,16 @@ describe("AWS project config", () => {
     expect(screen.queryByText("Not available on AWS (Fargate)")).toBeNull();
   });
 
-  it("replaces port mappings and folders on AWS", () => {
-    render(<AccessSection project={awsProject()} save={save} disabled={false} />);
-    expect(screen.getByText("Not available on AWS (Fargate)")).toBeInTheDocument();
+  it("offers TCP port mappings on AWS, localhost only, and replaces folders", () => {
+    const project = awsProject();
+    project.port_mappings = [{ host_port: 3000, container_port: 3000, protocol: "tcp" }];
+    render(<AccessSection project={project} save={save} disabled={false} />);
+    expect(screen.getByText(/Reachable only from this machine \(localhost\)/)).toBeInTheDocument();
     expect(screen.queryByText(/Expose container ports/)).toBeNull();
+    const protocol = screen.getByLabelText("Protocol 1");
+    expect(within(protocol).queryByText("UDP")).toBeNull();
+    expect(within(protocol).getByText("TCP")).toBeInTheDocument();
+    cleanup();
 
     render(<WorkspaceSection project={awsProject()} save={save} disabled={false} />);
     expect(screen.queryByText("Folders")).toBeNull();

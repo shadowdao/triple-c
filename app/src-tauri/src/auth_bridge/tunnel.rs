@@ -119,7 +119,11 @@ impl Drop for AbortOnDrop {
 /// also awaiting the aborted task, which guarantees the socket is closed before
 /// the caller proceeds (important when a port is rebound right after).
 pub struct PortForward {
+    /// The host loopback port.
     pub port: u16,
+    /// The container loopback port it reaches. The auth bridge mirrors a
+    /// port onto the same number; a project's port mapping may not.
+    pub container_port: u16,
     pub family: PortFamily,
     pub bridged_at: String,
     /// Why `[::1]` could not be taken alongside `127.0.0.1`, if it could not.
@@ -141,15 +145,40 @@ impl Drop for PortForward {
 }
 
 impl PortForward {
-    /// Bind `port` on the host loopback and start proxying into `container`.
+    /// Bind `host_port` on the host loopback and start proxying into
+    /// `container_port` on the container's loopback — the auth bridge's
+    /// forward, gated (see [`Gate::SignInCallback`]).
     ///
     /// The bind happens before the task is spawned, so an already-taken port is
     /// reported to the caller as an error rather than disappearing into a
     /// background task.
     pub async fn bind(
         container: ContainerTarget,
-        port: u16,
+        host_port: u16,
+        container_port: u16,
         family: PortFamily,
+    ) -> Result<Self, std::io::Error> {
+        Self::bind_with(container, host_port, container_port, family, Gate::SignInCallback).await
+    }
+
+    /// As [`bind`](Self::bind), for a project's port mapping on a host with
+    /// no Docker port publishing (AWS): every connection is carried as is
+    /// (see [`Gate::None`]).
+    pub async fn bind_mapping(
+        container: ContainerTarget,
+        host_port: u16,
+        container_port: u16,
+        family: PortFamily,
+    ) -> Result<Self, std::io::Error> {
+        Self::bind_with(container, host_port, container_port, family, Gate::None).await
+    }
+
+    async fn bind_with(
+        container: ContainerTarget,
+        port: u16,
+        container_port: u16,
+        family: PortFamily,
+        gate: Gate,
     ) -> Result<Self, std::io::Error> {
         // SECURITY BOUNDARY: the host side binds loopback ONLY — 127.0.0.1 and
         // ::1, never 0.0.0.0 / ::. Everything reachable through this socket is
@@ -193,11 +222,12 @@ impl PortForward {
                 }
             };
 
-        let target = family.socat_target(port);
-        let task = tokio::spawn(accept_loop(container, port, target, v4, v6));
+        let target = family.socat_target(container_port);
+        let task = tokio::spawn(accept_loop(container, port, target, v4, v6, gate));
 
         Ok(Self {
             port,
+            container_port,
             family,
             bridged_at: chrono::Utc::now().to_rfc3339(),
             ipv6_warning,
@@ -214,6 +244,20 @@ impl PortForward {
     }
 }
 
+/// What an accepted connection must show before it is carried in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    /// The auth bridge: a client must speak within [`FIRST_BYTE_TIMEOUT`],
+    /// and a cross-site sub-resource request is refused
+    /// ([`web_request_verdict`]).
+    SignInCallback,
+    /// A port mapping the user configured: carried as is, like Docker's own
+    /// port publishing (which has no gate either) — a server-speaks-first
+    /// protocol such as MySQL or SMTP must work, so nothing waits for the
+    /// client's first byte.
+    None,
+}
+
 /// Accept on both loopback listeners until aborted. Dropping this future drops
 /// the listeners (freeing the port) and the `JoinSet` (aborting live tunnels).
 async fn accept_loop(
@@ -222,6 +266,7 @@ async fn accept_loop(
     target: String,
     v4: TcpListener,
     v6: Option<TcpListener>,
+    gate: Gate,
 ) {
     let mut conns: JoinSet<()> = JoinSet::new();
 
@@ -255,12 +300,21 @@ async fn accept_loop(
                 }
                 log::debug!("Auth bridge: connection from {} to bridged port {}", peer, port);
                 let _ = stream.set_nodelay(true);
-                conns.spawn(tunnel_connection(
-                    container.clone(),
-                    target.clone(),
-                    stream,
-                    port,
-                ));
+                match gate {
+                    Gate::SignInCallback => conns.spawn(tunnel_connection(
+                        container.clone(),
+                        target.clone(),
+                        stream,
+                        port,
+                    )),
+                    Gate::None => conns.spawn(tunnel_connection_with_prelude(
+                        container.clone(),
+                        target.clone(),
+                        stream,
+                        port,
+                        Vec::new(),
+                    )),
+                };
             }
             Err(e) => {
                 log::warn!("Auth bridge: accept failed on port {}: {} — stopping listener", port, e);

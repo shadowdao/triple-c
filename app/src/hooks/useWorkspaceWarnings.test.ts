@@ -38,4 +38,21 @@ describe("useWorkspaceWarnings", () => {
     expect(toasts[0].message).toContain("demo");
     expect(toasts[0].detail).toContain("E: oops");
   });
+
+  it("keeps a port-mapping warning beside the start's own warning", async () => {
+    renderHook(() => useWorkspaceWarnings());
+    await vi.waitFor(() => expect(handler).not.toBeNull());
+    handler!({ payload: { project_id: "p1", message: "started", detail: "clone failed" } });
+    handler!({
+      payload: {
+        project_id: "p1",
+        message: "“demo”: some port mappings could not be opened",
+        detail: "3000 → 3000: host port 3000 is already in use on this machine",
+        topic: "ports",
+      },
+    });
+    const { toasts } = useAppState.getState();
+    expect(toasts).toHaveLength(2);
+    expect(toasts[1].detail).toContain("already in use");
+  });
 });

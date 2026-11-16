@@ -1027,13 +1027,15 @@ pub async fn reconcile_project<T: TaskApi>(
 /// `reconcile_project_statuses` for an AWS project: decide, and when the
 /// task is live re-open its tunnel in the background (terminals wait for
 /// it through [`tunnels::wait_endpoint`]), then — copy-at-connect — copy the
-/// credentials in, calling `on_connect_warning` if that fails. Never blocks
-/// on the tunnel.
+/// credentials in, calling `on_connect_warning` if that fails — after
+/// opening its port mappings (`on_ports_warning` for any that fail). Never
+/// blocks on the tunnel.
 pub async fn reconcile(
     project: &Project,
     settings: &AppSettings,
     store: Arc<ProjectsStore>,
     on_connect_warning: impl FnOnce(String) + Send + 'static,
+    on_ports_warning: impl FnOnce(String) + Send + 'static,
 ) {
     let (connection_id, region, sdk) = match project_sdk(project, settings).await {
         Ok(v) => v,
@@ -1060,6 +1062,11 @@ pub async fn reconcile(
                 match reattach(&project, *task, ctx, &store).await {
                     // Re-attached: a connect like any other (Q2).
                     Ok(true) => {
+                        // Q6: the port mappings' forwards, before the
+                        // (slower) credential copy.
+                        if let Some(detail) = super::port_forwards::open_for_project(&project).await {
+                            on_ports_warning(detail);
+                        }
                         if let Err(e) = connect::apply_connect(&project, &settings).await {
                             log::warn!("Project {}: could not copy the credentials in: {e}", project.id);
                             if tunnels::get_endpoint(&project.id).is_some() {

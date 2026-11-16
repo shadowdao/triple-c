@@ -8,6 +8,8 @@ import type {
 
 /** Why a Local-only option is off on an AWS project (P6). */
 export const NOT_ON_AWS = "Not available on AWS (Fargate)";
+/** Q6: an AWS project's port mappings bind loopback only (Docker's bind 0.0.0.0). */
+export const AWS_PORTS_LOCALHOST_ONLY = "Reachable only from this machine (localhost)";
 /** R4: the AWS host forces Claude Code's sandbox off until it is verified on Fargate. */
 export const SANDBOX_OFF_ON_AWS = "Off on AWS for now";
 export const EPHEMERAL_WARNING =

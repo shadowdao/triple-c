@@ -214,6 +214,8 @@ pub async fn close_if_task(project_id: &str, task_arn: &str) {
         take(&mut r, project_id)
     };
     notify();
+    // The project's port mappings lead into that task: they go with it.
+    super::port_forwards::close(project_id).await;
     if let Some(t) = taken {
         t.forward.close().await;
     }
@@ -305,11 +307,12 @@ pub fn end_reattach(project_id: &str, generation: u64) {
     notify();
 }
 
-/// Take the project's tunnel out and close it, and invalidate a background
-/// re-attach in flight.
+/// Take the project's tunnel out and close it (and its port mappings'
+/// forwards), and invalidate a background re-attach in flight.
 pub async fn close(project_id: &str) {
     let taken = take(&mut lock(), project_id);
     notify();
+    super::port_forwards::close(project_id).await;
     if let Some(t) = taken {
         t.forward.close().await;
     }
@@ -330,6 +333,7 @@ pub async fn close_all() {
         r.live.drain().map(|(_, t)| t).collect()
     };
     notify();
+    super::port_forwards::close_all().await;
     futures_util::future::join_all(all.into_iter().map(|t| t.forward.close())).await;
 }
 

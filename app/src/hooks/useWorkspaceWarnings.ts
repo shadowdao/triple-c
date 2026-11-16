@@ -9,6 +9,9 @@ export interface WorkspaceWarningEvent {
   project_id: string;
   message: string;
   detail: string;
+  /** Set when the warning is about something else than the start's own
+   *  follow (`"ports"`): keeps it from replacing that toast. */
+  topic?: string;
 }
 
 /**
@@ -22,12 +25,14 @@ export function useWorkspaceWarnings() {
     let cancelled = false;
     let unlisten: UnlistenFn | null = null;
     listen<WorkspaceWarningEvent>("workspace-warning", (event) => {
-      const { project_id, message, detail } = event.payload;
+      const { project_id, message, detail, topic } = event.payload;
       useAppState.getState().pushToast({
         kind: "warning",
         message,
         detail,
-        dedupeKey: `workspace-warning-${project_id}`,
+        dedupeKey: topic
+          ? `workspace-warning-${project_id}-${topic}`
+          : `workspace-warning-${project_id}`,
       });
     })
       .then((fn) => {

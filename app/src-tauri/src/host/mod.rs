@@ -32,6 +32,7 @@ pub mod aws_host;
 pub mod lifecycle;
 pub mod sessions;
 pub mod ssm;
+pub mod port_forwards;
 pub mod tunnels;
 pub mod watch;
 
