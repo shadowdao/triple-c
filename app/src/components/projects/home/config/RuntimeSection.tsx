@@ -21,6 +21,8 @@ export default function RuntimeSection({
   disabledReason,
 }: Props) {
   const aws = isAwsProject(project);
+  // Docker access and VPN need the user's own EC2 instance (not Fargate).
+  const noPrivileged = aws && project.aws?.launch_type !== "ec2";
   return (
     <>
       <ConfigGroup
@@ -54,15 +56,15 @@ export default function RuntimeSection({
         <SwitchRow
           label="Allow container spawning"
           hint={
-            aws
+            noPrivileged
               ? NOT_ON_AWS
               : "Mounts the Docker socket so Claude can build and run Docker containers from inside the sandbox."
           }
           control={
             <Toggle
               label="Allow container spawning"
-              checked={aws ? false : project.allow_docker_access}
-              disabled={disabled || aws}
+              checked={noPrivileged ? false : project.allow_docker_access}
+              disabled={disabled || noPrivileged}
               onChange={(v) => save({ allow_docker_access: v })}
             />
           }
@@ -70,12 +72,12 @@ export default function RuntimeSection({
 
         <SwitchRow
           label="VPN support"
-          hint={aws ? NOT_ON_AWS : "Grants NET_ADMIN and the /dev/net/tun device so a VPN client (PIA, WireGuard, OpenVPN) can build a tunnel inside the container. Without it a client installs and runs but its connection hangs until it times out. Anything in the container can then reconfigure the container's own network stack; the host's is untouched. Changing this recreates the container on its next start — the home and .claude volumes are preserved."}
+          hint={noPrivileged ? NOT_ON_AWS : "Grants NET_ADMIN and the /dev/net/tun device so a VPN client (PIA, WireGuard, OpenVPN) can build a tunnel inside the container. Without it a client installs and runs but its connection hangs until it times out. Anything in the container can then reconfigure the container's own network stack; the host's is untouched. Changing this recreates the container on its next start — the home and .claude volumes are preserved."}
           control={
             <Toggle
               label="VPN support"
-              checked={aws ? false : project.vpn_support_enabled}
-              disabled={disabled || aws}
+              checked={noPrivileged ? false : project.vpn_support_enabled}
+              disabled={disabled || noPrivileged}
               onChange={(v) => save({ vpn_support_enabled: v })}
             />
           }

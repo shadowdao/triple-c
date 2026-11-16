@@ -77,6 +77,7 @@ export function formatMemory(mib: number): string {
 /** Mirrors Rust `AwsWorkspaceConfig::default()`. */
 export function defaultAwsWorkspace(): AwsWorkspaceConfig {
   return {
+    launch_type: "fargate",
     cpu: 1024,
     memory_mib: 4096,
     arch: "x86_64",

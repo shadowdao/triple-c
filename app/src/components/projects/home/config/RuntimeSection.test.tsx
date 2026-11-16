@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import RuntimeSection from "./RuntimeSection";
 import type { AuthBridgeStatus, Project } from "../../../../lib/types";
+import { awsProject } from "../../../../test/awsFixtures";
 
 // The auth-bridge row owns its own IPC — see `AuthBridgeRow.tsx` for why it
 // does not go through `save`.
@@ -179,5 +180,20 @@ describe("RuntimeSection — auth bridge toggle", () => {
     // And never through the generic project save, which would drop it on the
     // floor while the container runs.
     expect(save).not.toHaveBeenCalled();
+  });
+});
+
+describe("RuntimeSection — Docker and VPN on AWS follow the launch type", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("are off and disabled on Fargate, switchable on EC2", () => {
+    const fargate = awsProject();
+    const { unmount } = renderSection(fargate);
+    expect(screen.getByRole("switch", { name: VPN })).toBeDisabled();
+    expect(screen.getByRole("switch", { name: "Allow container spawning" })).toBeDisabled();
+    unmount();
+    renderSection({ ...fargate, aws: { ...fargate.aws!, launch_type: "ec2" } });
+    expect(screen.getByRole("switch", { name: VPN })).toBeEnabled();
+    expect(screen.getByRole("switch", { name: "Allow container spawning" })).toBeEnabled();
   });
 });

@@ -1248,6 +1248,18 @@ fn validate_aws_update(
             crate::models::validate_region(&place.region)?;
             crate::aws::tofu_modules::validate_environment_name(&place.environment)?;
             crate::models::validate_aws_workspace(cfg)?;
+            // Docker access and VPN need the user's own instance (E6, E7);
+            // Fargate refuses them. Grandfather a value the stored project
+            // already had on AWS so an old row can still be saved.
+            if cfg.launch_type != crate::models::LaunchType::Ec2 {
+                let was_aws = stored.aws.is_some();
+                if project.allow_docker_access && !(was_aws && stored.allow_docker_access) {
+                    return Err("Docker access on AWS needs the EC2 launch type".into());
+                }
+                if project.vpn_support_enabled && !(was_aws && stored.vpn_support_enabled) {
+                    return Err("VPN support on AWS needs the EC2 launch type".into());
+                }
+            }
             // Q6: forwarded over loopback, TCP only, never a reserved port
             // (rows the save adds or edits; everything when newly on AWS).
             crate::host::port_forwards::validate_aws_port_mappings_update(
@@ -2894,6 +2906,26 @@ mod tests {
         assert!(validate_gateway_sidecar_update(&on, &on, &half).is_ok());
         // Off: nothing to check.
         assert!(validate_gateway_sidecar_update(&off, &off, &half).is_ok());
+    }
+
+    #[test]
+    fn docker_and_vpn_on_aws_need_the_ec2_launch_type() {
+        use crate::models::LaunchType;
+        let hosts = vec![host("h1")];
+        let stored = aws_project();
+        for (docker, vpn) in [(true, false), (false, true)] {
+            let mut p = stored.clone();
+            p.allow_docker_access = docker;
+            p.vpn_support_enabled = vpn;
+            assert!(validate_aws_update(&stored, &p, &hosts).is_err());
+            // A value the AWS project already had is grandfathered.
+            let mut old = stored.clone();
+            old.allow_docker_access = docker;
+            old.vpn_support_enabled = vpn;
+            assert!(validate_aws_update(&old, &old, &hosts).is_ok());
+            p.aws.as_mut().unwrap().launch_type = LaunchType::Ec2;
+            assert!(validate_aws_update(&stored, &p, &hosts).is_ok());
+        }
     }
 
     #[test]

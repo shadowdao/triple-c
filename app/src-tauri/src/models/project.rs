@@ -521,8 +521,20 @@ fn default_aws_ephemeral_gib() -> u32 {
     21
 }
 
+/// Where an AWS workspace's task runs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchType {
+    #[default]
+    Fargate,
+    Ec2,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AwsWorkspaceConfig {
+    /// Fargate (default; absent in old JSON) or the user's own EC2 instances.
+    #[serde(default)]
+    pub launch_type: LaunchType,
     #[serde(default = "default_aws_cpu")]
     pub cpu: u32,
     #[serde(default = "default_aws_memory_mib")]
@@ -568,6 +580,7 @@ pub const MAX_SETUP_SCRIPT_BYTES: usize = 32_768;
 impl Default for AwsWorkspaceConfig {
     fn default() -> Self {
         Self {
+            launch_type: LaunchType::default(),
             cpu: default_aws_cpu(),
             memory_mib: default_aws_memory_mib(),
             arch: Arch::default(),
@@ -700,23 +713,101 @@ fn describe_sizes(sizes: &[u32]) -> String {
     format!("{} to {} MiB in steps of {}", first, last, sizes[1] - sizes[0])
 }
 
-pub fn validate_aws_workspace(cfg: &AwsWorkspaceConfig) -> Result<(), String> {
-    let sizes = fargate_memory_sizes(cfg.cpu).ok_or_else(|| {
-        format!(
-            "{} is not a Fargate CPU size (256, 512, 1024, 2048, 4096, 8192 or 16384)",
-            cfg.cpu
-        )
-    })?;
-    if !sizes.contains(&cfg.memory_mib) {
-        return Err(format!(
-            "{} MiB of memory is not valid with {} CPU units: use {}",
-            cfg.memory_mib,
-            cfg.cpu,
-            describe_sizes(&sizes)
-        ));
+/// CPU units and memory (MiB) held back on an EC2 instance for the ECS agent
+/// and the OS.
+pub const EC2_RESERVED_CPU_UNITS: u32 = 128;
+pub const EC2_RESERVED_MEMORY_MIB: u32 = 256;
+
+/// `(vcpu * 1024, memory MiB)` of a common EC2 instance type, or None when the
+/// type is not in the built-in table (m7i, m7g, c7i, c7g, r7i, r7g, t3, t4g).
+pub fn ec2_instance_spec(instance_type: &str) -> Option<(u32, u32)> {
+    let (family, size) = instance_type.split_once('.')?;
+    let vcpu: u32 = match size {
+        "large" => 2,
+        "xlarge" => 4,
+        "2xlarge" => 8,
+        "4xlarge" => 16,
+        _ => return None,
+    };
+    // GiB per vCPU: general purpose 4, compute 2, memory 8.
+    let gib_per_vcpu: u32 = match family {
+        "m7i" | "m7g" => 4,
+        "c7i" | "c7g" => 2,
+        "r7i" | "r7g" => 8,
+        "t3" | "t4g" => {
+            // Burstable: 2 vCPU with 8 GiB (large), then no 4xlarge exists.
+            return match size {
+                "large" => Some((2048, 8192)),
+                "xlarge" => Some((4096, 16384)),
+                "2xlarge" => Some((8192, 32768)),
+                _ => None,
+            };
+        }
+        _ => return None,
+    };
+    Some((vcpu * 1024, vcpu * gib_per_vcpu * 1024))
+}
+
+/// Whether an EC2 workspace's reservations fit an instance type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Fit {
+    Ok,
+    /// The reservations exceed what the instance leaves for tasks.
+    TooBig { available_cpu: u32, available_memory_mib: u32 },
+    /// The type is not in the table: the caller shows a "must fit" warning.
+    UnknownType,
+}
+
+/// Check an EC2 config's reservations against `instance_type`, less the agent
+/// and OS reserve. A Fargate config always fits (no instance involved).
+pub fn fits_instance(cfg: &AwsWorkspaceConfig, instance_type: &str) -> Fit {
+    if cfg.launch_type != LaunchType::Ec2 {
+        return Fit::Ok;
     }
-    if !(21..=200).contains(&cfg.ephemeral_gib) {
-        return Err("Ephemeral storage must be 21 to 200 GiB".into());
+    let Some((cpu, mem)) = ec2_instance_spec(instance_type) else {
+        return Fit::UnknownType;
+    };
+    let available_cpu = cpu - EC2_RESERVED_CPU_UNITS;
+    let available_memory_mib = mem - EC2_RESERVED_MEMORY_MIB;
+    if cfg.cpu > available_cpu || cfg.memory_mib > available_memory_mib {
+        Fit::TooBig { available_cpu, available_memory_mib }
+    } else {
+        Fit::Ok
+    }
+}
+
+pub fn validate_aws_workspace(cfg: &AwsWorkspaceConfig) -> Result<(), String> {
+    match cfg.launch_type {
+        LaunchType::Fargate => {
+            let sizes = fargate_memory_sizes(cfg.cpu).ok_or_else(|| {
+                format!(
+                    "{} is not a Fargate CPU size (256, 512, 1024, 2048, 4096, 8192 or 16384)",
+                    cfg.cpu
+                )
+            })?;
+            if !sizes.contains(&cfg.memory_mib) {
+                return Err(format!(
+                    "{} MiB of memory is not valid with {} CPU units: use {}",
+                    cfg.memory_mib,
+                    cfg.cpu,
+                    describe_sizes(&sizes)
+                ));
+            }
+            if !(21..=200).contains(&cfg.ephemeral_gib) {
+                return Err("Ephemeral storage must be 21 to 200 GiB".into());
+            }
+        }
+        LaunchType::Ec2 => {
+            // Reservations on the user's instance; the instance type is not on
+            // the project, so `fits_instance` does the fit check later.
+            if cfg.cpu == 0 || cfg.memory_mib == 0 {
+                return Err("An EC2 workspace needs a positive CPU and memory reservation".into());
+            }
+            if cfg.spot {
+                return Err("Spot is not available on EC2 yet".into());
+            }
+        }
     }
     if let Some(m) = cfg.idle_stop_minutes {
         if !(5..=1440).contains(&m) {
@@ -1434,6 +1525,63 @@ mod tests {
         let mut p = Project::new("d".into(), Vec::new());
         p.host_id = Some("h1".into());
         assert!(p.is_aws());
+    }
+
+    fn ec2(cpu: u32, mem: u32) -> AwsWorkspaceConfig {
+        AwsWorkspaceConfig { launch_type: LaunchType::Ec2, cpu, memory_mib: mem, ..Default::default() }
+    }
+
+    #[test]
+    fn old_json_is_fargate_and_ec2_round_trips() {
+        let c: AwsWorkspaceConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(c.launch_type, LaunchType::Fargate);
+        let e: AwsWorkspaceConfig = serde_json::from_str(r#"{"launch_type":"ec2"}"#).unwrap();
+        assert_eq!(e.launch_type, LaunchType::Ec2);
+        assert!(serde_json::to_string(&e).unwrap().contains(r#""launch_type":"ec2""#));
+    }
+
+    #[test]
+    fn ec2_validation_shape() {
+        // Reservations need not be a Fargate pair.
+        assert!(validate_aws_workspace(&ec2(1500, 3000)).is_ok());
+        assert!(validate_aws_workspace(&ec2(0, 3000)).is_err());
+        assert!(validate_aws_workspace(&ec2(1024, 0)).is_err());
+        let mut s = ec2(1024, 2048);
+        s.spot = true;
+        assert!(validate_aws_workspace(&s).unwrap_err().contains("Spot"));
+        // Ephemeral size is ignored on EC2.
+        let mut e = ec2(1024, 2048);
+        e.ephemeral_gib = 5;
+        assert!(validate_aws_workspace(&e).is_ok());
+        // Fargate still rejects the non-pair.
+        assert!(validate_aws_workspace(&cfg(1500, 3000)).is_err());
+    }
+
+    #[test]
+    fn instance_table_values() {
+        assert_eq!(ec2_instance_spec("m7i.large"), Some((2048, 8192)));
+        assert_eq!(ec2_instance_spec("m7g.4xlarge"), Some((16384, 65536)));
+        assert_eq!(ec2_instance_spec("c7i.xlarge"), Some((4096, 8192)));
+        assert_eq!(ec2_instance_spec("r7g.2xlarge"), Some((8192, 65536)));
+        assert_eq!(ec2_instance_spec("t3.large"), Some((2048, 8192)));
+        assert_eq!(ec2_instance_spec("t4g.2xlarge"), Some((8192, 32768)));
+        assert_eq!(ec2_instance_spec("t3.4xlarge"), None);
+        assert_eq!(ec2_instance_spec("p5.48xlarge"), None);
+        assert_eq!(ec2_instance_spec("m7i"), None);
+    }
+
+    #[test]
+    fn fit_checks_reserve_for_the_agent() {
+        // m7i.large: 2048 / 8192 less 128 / 256.
+        assert_eq!(fits_instance(&ec2(1920, 7936), "m7i.large"), Fit::Ok);
+        assert_eq!(
+            fits_instance(&ec2(1921, 4096), "m7i.large"),
+            Fit::TooBig { available_cpu: 1920, available_memory_mib: 7936 }
+        );
+        assert!(matches!(fits_instance(&ec2(1024, 7937), "m7i.large"), Fit::TooBig { .. }));
+        assert_eq!(fits_instance(&ec2(1024, 2048), "z9.huge"), Fit::UnknownType);
+        // Fargate configs have no instance to fit.
+        assert_eq!(fits_instance(&cfg(16384, 122880), "m7i.large"), Fit::Ok);
     }
 
     #[test]

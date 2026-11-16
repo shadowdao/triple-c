@@ -92,7 +92,11 @@ export interface RepoSource {
   folder: string;
 }
 
+export type LaunchType = "fargate" | "ec2";
+
 export interface AwsWorkspaceConfig {
+  /** Absent in old data = fargate. */
+  launch_type: LaunchType;
   cpu: number;
   memory_mib: number;
   arch: Arch;
