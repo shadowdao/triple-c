@@ -1064,7 +1064,7 @@ pub async fn reconcile(
                     Ok(true) => {
                         // Q6: the port mappings' forwards, before the
                         // (slower) credential copy.
-                        if let Some(detail) = super::port_forwards::open_for_project(&project).await {
+                        if let Some(detail) = super::port_forwards::open_for_project(&store, &project.id).await {
                             on_ports_warning(detail);
                         }
                         if let Err(e) = connect::apply_connect(&project, &settings).await {

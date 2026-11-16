@@ -205,8 +205,8 @@ impl PortForward {
                     // bridge reports itself healthy — a silent failure with no
                     // thread back to this line.
                     log::warn!(
-                        "Auth bridge: bound 127.0.0.1:{} but not [::1]:{} ({}) — continuing with IPv4 only; \
-                         a client that resolves localhost to ::1 without falling back will not reach it",
+                        "{}: bound 127.0.0.1:{} but not [::1]:{} ({}) — continuing with IPv4 only; \
+                         a client that resolves localhost to ::1 without falling back will not reach it", gate.label(),
                         port,
                         port,
                         e
@@ -258,6 +258,16 @@ enum Gate {
     None,
 }
 
+impl Gate {
+    /// The log prefix of a forward of this kind.
+    fn label(self) -> &'static str {
+        match self {
+            Gate::SignInCallback => "Auth bridge",
+            Gate::None => "Port mapping",
+        }
+    }
+}
+
 /// Accept on both loopback listeners until aborted. Dropping this future drops
 /// the listeners (freeing the port) and the `JoinSet` (aborting live tunnels).
 async fn accept_loop(
@@ -290,15 +300,15 @@ async fn accept_loop(
                     // client side is whatever can dial loopback, so a queue is
                     // just a slower way to run out of execs.
                     log::warn!(
-                        "Auth bridge: refusing connection from {} to bridged port {} — \
-                         {} concurrent connections already open on it",
+                        "{}: refusing connection from {} to bridged port {} — \
+                         {} concurrent connections already open on it", gate.label(),
                         peer,
                         port,
                         MAX_CONNECTIONS
                     );
                     continue;
                 }
-                log::debug!("Auth bridge: connection from {} to bridged port {}", peer, port);
+                log::debug!("{}: connection from {} to bridged port {}", gate.label(), peer, port);
                 let _ = stream.set_nodelay(true);
                 match gate {
                     Gate::SignInCallback => conns.spawn(tunnel_connection(
@@ -307,7 +317,8 @@ async fn accept_loop(
                         stream,
                         port,
                     )),
-                    Gate::None => conns.spawn(tunnel_connection_with_prelude(
+                    Gate::None => conns.spawn(tunnel_labelled(
+                        gate.label(),
                         container.clone(),
                         target.clone(),
                         stream,
@@ -317,7 +328,7 @@ async fn accept_loop(
                 };
             }
             Err(e) => {
-                log::warn!("Auth bridge: accept failed on port {}: {} — stopping listener", port, e);
+                log::warn!("{}: accept failed on port {}: {} — stopping listener", gate.label(), port, e);
                 return;
             }
         }
@@ -575,6 +586,18 @@ pub async fn tunnel_connection_with_prelude(
     port: u16,
     prelude: Vec<u8>,
 ) {
+    tunnel_labelled("Auth bridge", container, target, stream, port, prelude).await
+}
+
+/// [`tunnel_connection_with_prelude`], logging under `label`.
+async fn tunnel_labelled(
+    label: &'static str,
+    container: ContainerTarget,
+    target: String,
+    stream: TcpStream,
+    port: u16,
+    prelude: Vec<u8>,
+) {
     let cmd = vec!["socat".to_string(), "-".to_string(), target.clone()];
 
     let AttachedExec {
@@ -585,7 +608,7 @@ pub async fn tunnel_connection_with_prelude(
         Ok(e) => e,
         Err(e) => {
             log::warn!(
-                "Auth bridge: failed to open tunnel exec for port {} ({}): {}",
+                "{}: failed to open tunnel exec for port {} ({}): {}", label,
                 port,
                 target,
                 e
@@ -633,7 +656,7 @@ pub async fn tunnel_connection_with_prelude(
         Ok(chunk) => chunk,
         Err(_) => {
             log::debug!(
-                "Auth bridge: bridged port {} idle for {}s — closing the tunnel",
+                "{}: bridged port {} idle for {}s — closing the tunnel", label,
                 port,
                 IDLE_TIMEOUT.as_secs()
             );
@@ -651,14 +674,14 @@ pub async fn tunnel_connection_with_prelude(
             }
             Ok(ExecChunk::StdErr(message)) => {
                 log::debug!(
-                    "Auth bridge: socat stderr for port {}: {}",
+                    "{}: socat stderr for port {}: {}", label,
                     port,
                     String::from_utf8_lossy(&message).trim()
                 );
             }
             Ok(_) => {}
             Err(e) => {
-                log::debug!("Auth bridge: tunnel stream error on port {}: {}", port, e);
+                log::debug!("{}: tunnel stream error on port {}: {}", label, port, e);
                 break;
             }
         }

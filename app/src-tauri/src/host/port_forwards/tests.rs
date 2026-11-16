@@ -3,6 +3,7 @@
 //! asked to run is recorded, never run.
 
 use super::*;
+use crate::storage::projects_store::ProjectsStore;
 use crate::host::agent::AgentEndpoint;
 use crate::host::tunnels;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
@@ -243,14 +244,139 @@ async fn a_task_death_closes_the_mappings_but_a_stale_report_does_not() {
 
 #[test]
 fn an_aws_project_saves_only_tcp_unreserved_unique_mappings() {
-    assert!(validate_aws_port_mappings(&[tcp(3000, 3000), tcp(8081, 8080), tcp(0, 0), tcp(5000, 0)]).is_ok());
+    let v = |m: &[PortMapping]| validate_aws_port_mappings(m, false);
+    assert!(v(&[tcp(3000, 3000), tcp(8081, 8080), tcp(0, 0), tcp(5000, 0), tcp(4001, 4000)]).is_ok());
     let udp = PortMapping { host_port: 5353, container_port: 5353, protocol: "udp".into() };
-    let e = validate_aws_port_mappings(&[udp]).unwrap_err();
+    let e = v(&[udp]).unwrap_err();
     assert!(e.contains("only TCP") && e.contains("UDP"), "{e}");
-    assert!(validate_aws_port_mappings(&[tcp(3000, 3000), tcp(3000, 4000)]).unwrap_err().contains("mapped twice"));
-    assert!(validate_aws_port_mappings(&[tcp(4000, 39321)]).is_err());
-    assert!(validate_aws_port_mappings(&[tcp(4000, 47900)]).is_err());
-    assert!(validate_aws_port_mappings(&[tcp(47820, 4000)]).is_err());
+    assert!(v(&[tcp(3000, 3000), tcp(3000, 4000)]).unwrap_err().contains("mapped twice"));
+    assert!(v(&[tcp(4000, 39321)]).is_err());
+    assert!(v(&[tcp(4000, 47900)]).is_err());
+    assert!(v(&[tcp(47820, 4000)]).is_err());
+}
+
+#[test]
+fn the_gateway_sidecars_port_is_refused_while_the_project_runs_it() {
+    // A mapping reaches the workspace's *loopback*, where the sidecar holds
+    // the provider key behind 127.0.0.1:4000.
+    let m = [tcp(4001, GATEWAY_SIDECAR_PORT)];
+    assert!(validate_aws_port_mappings(&m, false).is_ok());
+    let e = validate_aws_port_mappings(&m, true).unwrap_err();
+    assert!(e.contains("gateway sidecar"), "{e}");
+    // Turning the sidecar on re-checks rows that were already stored.
+    assert!(validate_aws_port_mappings_update(Some((&m, false)), &m, true).is_err());
+    assert!(validate_aws_port_mappings_update(Some((&m, false)), &m, false).is_ok());
+}
+
+#[test]
+fn a_stored_row_that_would_be_refused_does_not_block_other_saves() {
+    let udp = PortMapping { host_port: 5353, container_port: 5353, protocol: "udp".into() };
+    let stored = vec![udp.clone(), tcp(3000, 3000)];
+    // Unchanged, plus a new valid row: fine.
+    let saved = vec![udp.clone(), tcp(3000, 3000), tcp(8080, 8080)];
+    assert!(validate_aws_port_mappings_update(Some((&stored, false)), &saved, false).is_ok());
+    // A new UDP row, or an edit to one, is refused.
+    let edited = PortMapping { host_port: 5354, ..udp.clone() };
+    let e = validate_aws_port_mappings_update(Some((&stored, false)), &[edited, tcp(3000, 3000)], false);
+    assert!(e.unwrap_err().contains("only TCP"));
+    // A new row taking a stored row's host port is refused.
+    let dup = vec![udp.clone(), tcp(3000, 3000), tcp(3000, 4000)];
+    assert!(validate_aws_port_mappings_update(Some((&stored, false)), &dup, false)
+        .unwrap_err()
+        .contains("mapped twice"));
+    // Newly on AWS: everything is checked.
+    assert!(validate_aws_port_mappings_update(None, &stored, false).is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn overlapping_opens_converge_on_the_last_stored_set_without_false_errors() {
+    // The editor saves on every blur; each save opens. Each open re-reads
+    // the stored mappings under the project's lock, so overlapping opens
+    // neither fight over a host port nor leave an older save's set behind.
+    let p = pid("concurrent");
+    let (target, _, _) = connected_agent(&p).await;
+    let (a, b, c) = (free_port(), free_port(), free_port());
+    let sets = [
+        vec![tcp(a, 8080), tcp(b, 8081)],
+        vec![tcp(b, 8081), tcp(c, 8082)],
+        vec![tcp(a, 8085), tcp(c, 8082)],
+        vec![tcp(b, 8090), tcp(c, 8082)],
+    ];
+    let stored = Arc::new(std::sync::Mutex::new(sets[0].clone()));
+    let go = Arc::new(tokio::sync::Barrier::new(8));
+    let mut opens = Vec::new();
+    for i in 0..8 {
+        let (p2, t2, s2, go2) = (p.clone(), target.clone(), stored.clone(), go.clone());
+        let mine = sets[i % sets.len()].clone();
+        opens.push(tokio::spawn(async move {
+            go2.wait().await;
+            open_latest(&p2, &t2, move || {
+                let mut s = s2.lock().unwrap();
+                *s = mine; // this save lands, then its open reads the store
+                Some((s.clone(), false))
+            })
+            .await
+        }));
+    }
+    for o in opens {
+        let results = o.await.unwrap();
+        assert!(results.iter().all(|r| r.error.is_none()), "{results:?}");
+    }
+    let last = stored.lock().unwrap().clone();
+    let mut want: Vec<u16> = last.iter().map(|m| m.host_port).collect();
+    want.sort_unstable();
+    assert_eq!(open_ports(&p), want, "the registry holds the last stored set");
+    tunnels::close(&p).await;
+}
+
+#[tokio::test]
+async fn a_save_keeps_unchanged_forwards_and_their_live_connections() {
+    let p = pid("diff");
+    let (target, fake, _) = connected_agent(&p).await;
+    let (a, b) = (free_port(), free_port());
+    open_for(&p, &target, &[tcp(a, 8080)]).await;
+    let mut client = TcpStream::connect(("127.0.0.1", a)).await.unwrap();
+    client.write_all(b"one").await.unwrap();
+    let mut buf = [0u8; 3];
+    client.read_exact(&mut buf).await.unwrap();
+
+    let r = open_for(&p, &target, &[tcp(a, 8080), tcp(b, 8081)]).await;
+    assert!(r.iter().all(|r| r.error.is_none()), "{r:?}");
+    // The same connection still carries bytes: its forward was kept.
+    client.write_all(b"two").await.unwrap();
+    client.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"two");
+    assert_eq!(fake.cmds.lock().unwrap().len(), 1, "no new attach for the kept connection");
+
+    // A changed container port rebinds the same host port.
+    let r = open_for(&p, &target, &[tcp(a, 9090)]).await;
+    assert!(r[0].error.is_none(), "{:?}", r[0].error);
+    assert_eq!(round_trip(a, b"x").await, b"x");
+    assert_eq!(fake.cmds.lock().unwrap().last().unwrap()[2], "TCP:127.0.0.1:9090");
+    assert!(port_is_free(b));
+    tunnels::close(&p).await;
+}
+
+#[tokio::test]
+async fn a_stored_project_is_read_when_the_open_runs() {
+    let p = pid("store");
+    let dir = tempfile::tempdir().unwrap();
+    let mut project = crate::models::Project::new("x".into(), vec![]);
+    project.id = p.clone();
+    project.host_id = Some("h1".into());
+    project.aws_placement =
+        Some(crate::models::AwsPlacement { region: "us-west-2".into(), environment: "dev".into() });
+    project.aws = Some(Default::default());
+    let (port, busy) = (free_port(), std::net::TcpListener::bind("127.0.0.1:0").unwrap());
+    let busy_port = busy.local_addr().unwrap().port();
+    project.port_mappings = vec![tcp(port, 8080), tcp(busy_port, 8081)];
+    let store = ProjectsStore::over_file_for_test(dir.path().join("projects.json"), vec![project]);
+    assert_eq!(open_for_project(&store, &p).await, None, "not connected: nothing, no warning");
+    let (_target, _, _) = connected_agent(&p).await;
+    let warning = open_for_project(&store, &p).await.expect("the busy port is reported");
+    assert!(warning.contains(&busy_port.to_string()) && warning.contains("already in use"), "{warning}");
+    assert_eq!(open_ports(&p), vec![port]);
+    tunnels::close(&p).await;
 }
 
 #[tokio::test]

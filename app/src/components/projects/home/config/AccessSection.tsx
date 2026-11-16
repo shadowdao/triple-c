@@ -164,8 +164,9 @@ export default function AccessSection({
         </span>
         {isAwsProject(project) ? (
           <p className="mt-0.5 mb-2 text-xs text-[var(--text-secondary)] leading-snug">
-            Forward workspace ports to this machine while it is connected. TCP only.{" "}
-            {AWS_PORTS_LOCALHOST_ONLY}.
+            Forward workspace ports to this machine while it is connected. TCP only. A
+            connection carrying traffic counts as activity, so it keeps the workspace from its
+            idle stop. {AWS_PORTS_LOCALHOST_ONLY}.
           </p>
         ) : (
           <p className="mt-0.5 mb-2 text-xs text-[var(--text-secondary)] leading-snug">

@@ -300,12 +300,17 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   every tunnel (`for_project` is `None` while none is open; `for_project_waiting` covers the
   background re-attach after an app restart). AWS SDK calls stay in `aws/` (`runtime.rs`,
   `tasks.rs`, `workspace.rs`).
-  `port_forwards.rs` is an AWS project's port mappings: TCP only (validated on save, with the
-  browser-view ranges and the agent port refused), each a **loopback-only** auth-bridge
-  `PortForward::bind_mapping` (no first-byte gate, unlike the bridge) over socat-over-attach.
-  One set per project, opened after every connect (start, re-attach) and on a save while
-  connected; closed by every `tunnels::close*` path. A failing mapping is a `workspace-warning`
-  (`topic: "ports"`), the rest still open; an idle listener makes no agent request.
+  `port_forwards.rs` is an AWS project's port mappings: each TCP mapping is a **loopback-only**
+  auth-bridge `PortForward::bind_mapping` over socat-over-attach. Two deliberate differences from
+  Docker: it reaches the workspace's **loopback** (Docker publishes to eth0), so the agent port,
+  the browser-view ranges and — with `gateway_sidecar` on — the sidecar's 4000 are refused; and it
+  has **no gate** (no first-byte wait, no cross-site check, unlike the bridge). Validated on save
+  (rows the save adds/edits; everything when newly on AWS or the sidecar is switched); a stored row
+  that would be refused is skipped with a warning at connect. Opens are serialised per project and
+  re-read the stored mappings under that lock; unchanged forwards are kept with their connections.
+  Opened after every connect and on a save while connected; closed by every `tunnels::close*`
+  path. A failing mapping is a `workspace-warning` (`topic: "ports"`). An idle listener makes no
+  agent request; a connection carrying traffic is activity (keeps the workspace from idling).
   `agent.rs` reuses `docker/exec.rs`'s `OneshotOutput`, host-file reader and uid probe so the two
   variants cannot drift; an `Agent` target's token never appears in `Debug` or error text.
   **Container-interior code must go through `ContainerTarget`, never `docker::exec`, bollard or
