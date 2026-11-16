@@ -1659,6 +1659,29 @@ pub async fn aws_environment_max_hours(
     Ok(crate::host::aws_host::environment_max_hours(&project, &settings).await)
 }
 
+/// The caller's EC2 capacity in an AWS project's environment, for Host
+/// settings' launch-type control and reservation limits (phase 7). Never an
+/// error: a local project or a failed read is `unknown`.
+#[tauri::command]
+pub async fn aws_ec2_capacity(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<crate::host::aws_host::Ec2Capacity, String> {
+    let Some(project) = state.projects_store.get(&project_id).filter(|p| p.is_aws()) else {
+        return Ok(crate::host::aws_host::Ec2Capacity::Unknown);
+    };
+    let settings = state.settings_store.get();
+    Ok(crate::host::aws_host::ec2_capacity(&project, &settings).await)
+}
+
+/// Why `config`'s CPU/memory reservations don't fit `instance_type`, or
+/// null (`models::project::ec2_fit_problem`: the start's own rule, so Host
+/// settings never disagree with it).
+#[tauri::command]
+pub fn ec2_fit_problem(config: AwsWorkspaceConfig, instance_type: String) -> Option<String> {
+    crate::models::project::ec2_fit_problem(&config, &instance_type)
+}
+
 #[tauri::command]
 pub async fn stop_project_container(
     project_id: String,

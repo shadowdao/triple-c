@@ -5,7 +5,12 @@ import PermissionModeControl, { permissionModePatch } from "../../PermissionMode
 import ClaudeInstructionsEditor from "../../ClaudeInstructionsEditor";
 import ClaudeCodeSettingsEditor from "../../ClaudeCodeSettingsEditor";
 import AuthBridgeRow from "./AuthBridgeRow";
-import { NOT_ON_AWS, SANDBOX_OFF_ON_AWS, isAwsProject } from "../../../../lib/awsWorkspace";
+import {
+  EC2_DOCKER_ACCESS_NOTE,
+  NOT_ON_AWS,
+  SANDBOX_OFF_ON_AWS,
+  isAwsProject,
+} from "../../../../lib/awsWorkspace";
 
 interface Props {
   project: Project;
@@ -22,7 +27,11 @@ export default function RuntimeSection({
 }: Props) {
   const aws = isAwsProject(project);
   // Docker access and VPN need the user's own EC2 instance (not Fargate).
-  const noPrivileged = aws && project.aws?.launch_type !== "ec2";
+  const ec2 = aws && project.aws?.launch_type === "ec2";
+  const noPrivileged = aws && !ec2;
+  // Fargate can't run Claude Code's sandbox (P9); the user's own EC2
+  // instance can (E8), so it follows the project there.
+  const sandboxOff = aws && !ec2;
   return (
     <>
       <ConfigGroup
@@ -39,15 +48,15 @@ export default function RuntimeSection({
         <SwitchRow
           label="Sandbox mode"
           hint={
-            aws
+            sandboxOff
               ? `${SANDBOX_OFF_ON_AWS}: Claude Code's bash sandbox has not been verified on Fargate yet, so an AWS workspace runs with it off whatever this says.`
               : "Claude Code's bash sandbox (bubblewrap filesystem and network isolation). Triple-C is the source of truth: toggling this overrides any manual /sandbox configuration in the container's settings.json on next start."
           }
           control={
             <Toggle
               label="Sandbox mode"
-              checked={aws ? false : project.sandbox_mode_enabled}
-              disabled={disabled || aws}
+              checked={sandboxOff ? false : project.sandbox_mode_enabled}
+              disabled={disabled || sandboxOff}
               onChange={(v) => save({ sandbox_mode_enabled: v })}
             />
           }
@@ -58,7 +67,9 @@ export default function RuntimeSection({
           hint={
             noPrivileged
               ? NOT_ON_AWS
-              : "Mounts the Docker socket so Claude can build and run Docker containers from inside the sandbox."
+              : ec2
+                ? `Mounts the Docker socket so Claude can build and run Docker containers from inside the workspace. ${EC2_DOCKER_ACCESS_NOTE}`
+                : "Mounts the Docker socket so Claude can build and run Docker containers from inside the sandbox."
           }
           control={
             <Toggle

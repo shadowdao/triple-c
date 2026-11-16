@@ -1510,3 +1510,51 @@ async fn stopping_an_ec2_task_by_its_arn_uses_its_cluster() {
     stop_task_arn(&fake, &ec2_task_arn("e7")).await.unwrap();
     assert_eq!(*fake.stop_clusters.lock().unwrap(), [USER_CLUSTER]);
 }
+
+/// E7: the entrypoint installs the VPN skill from `VPN_SUPPORT_ENABLED`, as
+/// on Docker; an EC2 project with VPN support gets `1`, Fargate `0`.
+#[test]
+fn vpn_support_reaches_an_ec2_workspace_as_on_docker() {
+    let vpn = |p: &Project| {
+        let (pairs, _) = aws_env(p, &AppSettings::default()).unwrap();
+        pairs.into_iter().find(|(k, _)| k == "VPN_SUPPORT_ENABLED").map(|(_, v)| v)
+    };
+    let mut p = ec2_project();
+    p.vpn_support_enabled = true;
+    assert_eq!(vpn(&p).as_deref(), Some("1"));
+    p.vpn_support_enabled = false;
+    assert_eq!(vpn(&p).as_deref(), Some("0"));
+    assert_eq!(vpn(&aws_project(StorageMode::Ephemeral)).as_deref(), Some("0"));
+}
+
+/// Host settings' view of the user's EC2 capacity: the record's compute with
+/// the fit limits, none, unusable (with the reason) or unknown.
+#[test]
+fn ec2_capacity_reads_as_host_settings_need_it() {
+    use crate::aws::environments::{UserCompute, UserRecord};
+    let compute = UserCompute {
+        instance_type: "m7i.large".into(),
+        max_instances: 1,
+        user_tag: "alice".into(),
+        cluster_arn: "arn:aws:ecs:us-west-2:123456789012:cluster/triple-c-dev--u-alice".into(),
+        capacity_provider: "triple-c-dev--u-alice".into(),
+    };
+    let c = ec2_capacity_from(Some(UserRecord::Valid(compute.clone())));
+    assert_eq!(
+        c,
+        Ec2Capacity::Ec2 { compute: compute.clone(), available_cpu: Some(1920), available_memory_mib: Some(7373) }
+    );
+    let v = serde_json::to_value(&c).unwrap();
+    assert_eq!(v["state"], "ec2");
+    assert_eq!(v["compute"]["instance_type"], "m7i.large");
+    assert_eq!(v["available_memory_mib"], 7373);
+    let unknown_type = UserCompute { instance_type: "x9.huge".into(), ..compute };
+    assert!(matches!(
+        ec2_capacity_from(Some(UserRecord::Valid(unknown_type))),
+        Ec2Capacity::Ec2 { available_cpu: None, available_memory_mib: None, .. }
+    ));
+    assert_eq!(serde_json::to_value(ec2_capacity_from(Some(UserRecord::Absent))).unwrap()["state"], "none");
+    let v = serde_json::to_value(ec2_capacity_from(Some(UserRecord::Unusable("schema is not 1".into())))).unwrap();
+    assert_eq!(v, serde_json::json!({ "state": "unusable", "reason": "schema is not 1" }));
+    assert_eq!(serde_json::to_value(ec2_capacity_from(None)).unwrap(), serde_json::json!({ "state": "unknown" }));
+}

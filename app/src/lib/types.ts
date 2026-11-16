@@ -1280,6 +1280,9 @@ export interface HourlyEstimate {
   note_spot: boolean;
   /** Hybrid or EFS storage: EFS is billed per GB-month, not in this figure. */
   efs_billed_separately: boolean;
+  /** EC2 (E10): the user's instance's on-demand price, whatever the project
+   *  reserves of it; instances scale to zero when no workspace is running. */
+  ec2_instance: boolean;
 }
 
 export type Verdict = "allowed" | "denied" | "unverified";
@@ -1384,6 +1387,20 @@ export interface Ec2Compute {
 
 /** An onboarding's EC2 choice (`environment_commands::Ec2Choice`). */
 export type Ec2Choice = { kind: "none" } | ({ kind: "ec2" } & Ec2Compute);
+
+/** `host::aws_host::Ec2Capacity`: the user's EC2 capacity in an AWS project's
+ *  environment, for Host settings (phase 7). `available_*` are what the
+ *  instance leaves for one workspace (null for a type the app doesn't know). */
+export type Ec2Capacity =
+  | {
+      state: "ec2";
+      compute: UserCompute;
+      available_cpu: number | null;
+      available_memory_mib: number | null;
+    }
+  | { state: "none" }
+  | { state: "unusable"; reason: string }
+  | { state: "unknown" };
 
 /** One row of the app's built-in instance table (`models::project::Ec2InstanceType`). */
 export interface Ec2InstanceType {

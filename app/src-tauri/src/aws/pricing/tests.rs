@@ -173,6 +173,7 @@ fn the_filters_name_the_region_on_demand_and_fargate() {
 struct FakeApi {
     pages: Mutex<Vec<Result<Page, String>>>,
     calls: AtomicUsize,
+    queries: Mutex<Vec<Query>>,
     hang: bool,
 }
 
@@ -181,6 +182,7 @@ impl FakeApi {
         Self {
             pages: Mutex::new(pages),
             calls: AtomicUsize::new(0),
+            queries: Mutex::new(Vec::new()),
             hang: false,
         }
     }
@@ -205,8 +207,12 @@ impl FakeApi {
 }
 
 impl PricingApi for FakeApi {
-    async fn get_products(&self, region: &str, _token: Option<String>) -> Result<Page, String> {
-        assert_eq!(region, "us-west-2");
+    async fn get_products(&self, query: &Query, _token: Option<String>) -> Result<Page, String> {
+        assert!(
+            query.filters.contains(&("TERM_MATCH", "regionCode", "us-west-2".to_string())),
+            "{query:?}"
+        );
+        self.queries.lock().unwrap().push(query.clone());
         self.calls.fetch_add(1, Ordering::SeqCst);
         if self.hang {
             std::future::pending::<()>().await;
@@ -415,4 +421,194 @@ async fn no_client_counts_as_a_failure_and_is_not_asked_again_for_a_while() {
     let later = T0 + RETRY_AFTER_FAILURE.as_secs();
     assert_eq!(c.rates(Some(&api), "us-west-2", at(later)).await, Some(RATES));
     assert_eq!(api.calls(), 1);
+}
+
+// ---- EC2 (phase 7 E10) ----
+
+/// Real `AmazonEC2` `GetProducts` answers for us-west-2 with [`EC2_FILTERS`]
+/// (recorded 2026-11-16): one row each for m7i.large and m7g.large.
+const EC2_FIXTURE: &str = include_str!("fixtures/ec2-get-products-us-west-2.json");
+const M7I_LARGE: f64 = 0.1008;
+const M7G_LARGE: f64 = 0.0816;
+
+fn ec2_items() -> Vec<String> {
+    let v: Value = serde_json::from_str(EC2_FIXTURE).unwrap();
+    v["PriceList"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap().to_string())
+        .collect()
+}
+
+fn ec2_cfg(cpu: u32, memory_mib: u32, storage: StorageMode) -> AwsWorkspaceConfig {
+    AwsWorkspaceConfig {
+        launch_type: crate::models::project::LaunchType::Ec2,
+        cpu,
+        memory_mib,
+        storage,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn the_recorded_ec2_price_list_gives_each_instance_types_hourly_price() {
+    let items = ec2_items();
+    assert_eq!(parse_ec2_price("us-west-2", "m7i.large", &items), Some(M7I_LARGE));
+    assert_eq!(parse_ec2_price("us-west-2", "m7g.large", &items), Some(M7G_LARGE));
+    // Not a type in the list, or another region: nothing.
+    assert_eq!(parse_ec2_price("us-west-2", "c7i.large", &items), None);
+    assert_eq!(parse_ec2_price("eu-west-1", "m7i.large", &items), None);
+}
+
+#[test]
+fn an_ec2_row_for_other_software_tenancy_or_capacity_never_counts() {
+    let row = ec2_items().into_iter().find(|s| s.contains("m7i.large")).unwrap();
+    for (from, to) in [
+        ("\"tenancy\":\"Shared\"", "\"tenancy\":\"Dedicated\""),
+        ("\"preInstalledSw\":\"NA\"", "\"preInstalledSw\":\"SQL Web\""),
+        ("\"capacitystatus\":\"Used\"", "\"capacitystatus\":\"UnusedCapacityReservation\""),
+        ("\"operatingSystem\":\"Linux\"", "\"operatingSystem\":\"Windows\""),
+        ("\"licenseModel\":\"No License required\"", "\"licenseModel\":\"Bring your own license\""),
+    ] {
+        assert!(row.contains(from), "{from}");
+        let other = row.replace(from, to);
+        assert_eq!(parse_ec2_price("us-west-2", "m7i.large", &[other]), None, "{to}");
+    }
+    // A zero price (what an unused reservation row says) is not a price.
+    let zero = row.replace("0.1008000000", "0.0000000000");
+    assert_eq!(parse_ec2_price("us-west-2", "m7i.large", &[zero]), None);
+    assert_eq!(parse_ec2_price("us-west-2", "m7i.large", &["garbage".into()]), None);
+}
+
+#[test]
+fn the_ec2_filters_name_linux_shared_tenancy_on_demand_for_the_type() {
+    assert_eq!(EC2_SERVICE_CODE, "AmazonEC2");
+    let q = ec2_query("us-west-2", "m7i.large");
+    assert_eq!(q.service_code, "AmazonEC2");
+    let f = |field: &'static str, value: &str| ("TERM_MATCH", field, value.to_string());
+    assert_eq!(
+        q.filters,
+        vec![
+            f("regionCode", "us-west-2"),
+            f("instanceType", "m7i.large"),
+            f("operatingSystem", "Linux"),
+            f("tenancy", "Shared"),
+            f("preInstalledSw", "NA"),
+            f("capacitystatus", "Used"),
+            f("licenseModel", "No License required"),
+        ]
+    );
+    // The Fargate query is unchanged.
+    let fq = fargate_query("us-west-2");
+    assert_eq!(fq.service_code, "AmazonECS");
+    assert_eq!(
+        fq.filters,
+        vec![
+            ("TERM_MATCH", "regionCode", "us-west-2".to_string()),
+            ("TERM_MATCH", "termType", "OnDemand".to_string()),
+            ("CONTAINS", "usagetype", "Fargate".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn an_ec2_estimate_is_the_instances_price_whatever_the_reservations() {
+    let small = estimate_ec2(&ec2_cfg(512, 1024, StorageMode::Ephemeral), M7I_LARGE);
+    let big = estimate_ec2(&ec2_cfg(1920, 7373, StorageMode::Ephemeral), M7I_LARGE);
+    assert!(close(small.usd_per_hour, 0.1008) && close(big.usd_per_hour, 0.1008));
+    assert!(small.ec2_instance && !small.note_spot && !small.efs_billed_separately);
+    // Ephemeral size and Spot don't apply on EC2; EFS is still billed apart.
+    let mut c = ec2_cfg(1024, 4096, StorageMode::Hybrid);
+    c.ephemeral_gib = 200;
+    c.spot = true;
+    let e = estimate_ec2(&c, M7G_LARGE);
+    assert!(close(e.usd_per_hour, 0.0816));
+    assert!(e.efs_billed_separately && !e.note_spot && e.ec2_instance);
+    // Fargate estimates say they are not an instance's.
+    assert!(!estimate(&cfg(1024, 4096, 21), &X86).ec2_instance);
+}
+
+fn ec2_api() -> FakeApi {
+    FakeApi::answering(vec![Ok(Page {
+        items: ec2_items(),
+        next_token: None,
+    })])
+}
+
+#[tokio::test]
+async fn an_ec2_price_is_fetched_once_and_cached_per_region_and_type() {
+    let (_d, c) = cache();
+    let api = ec2_api();
+    let price = c.ec2_price_with::<FakeApi, _>(async { Some(&api) }, "us-west-2", "m7i.large", at(T0)).await;
+    assert_eq!(price, Some(M7I_LARGE));
+    assert_eq!(api.calls(), 1);
+    assert_eq!(api.queries.lock().unwrap()[0], ec2_query("us-west-2", "m7i.large"));
+    assert!(c.dir().join("us-west-2--ec2-m7i.large.json").is_file());
+    assert_eq!(c.read_ec2("us-west-2", "m7i.large", at(T0 + DAY - 1)), Some((M7I_LARGE, true)));
+    assert_eq!(c.read_ec2("us-west-2", "m7i.large", at(T0 + DAY)), Some((M7I_LARGE, false)));
+    // Fresh: no call. Another type, or the region's Fargate rates, are not it.
+    let again = c
+        .ec2_price_with::<FakeApi, FakeApi>(async { panic!("no client for a fresh cache") }, "us-west-2", "m7i.large", at(T0 + 60))
+        .await;
+    assert_eq!(again, Some(M7I_LARGE));
+    assert_eq!(c.read_ec2("us-west-2", "m7g.large", at(T0)), None);
+    assert_eq!(c.read("us-west-2", at(T0)), None);
+    // A file renamed to another type's name is no cache.
+    std::fs::copy(
+        c.dir().join("us-west-2--ec2-m7i.large.json"),
+        c.dir().join("us-west-2--ec2-m7g.large.json"),
+    )
+    .unwrap();
+    assert_eq!(c.read_ec2("us-west-2", "m7g.large", at(T0)), None);
+}
+
+#[tokio::test]
+async fn an_ec2_price_backs_off_after_a_failure_and_falls_back_to_the_stale_cache() {
+    let (_d, c) = cache();
+    let denied = FakeApi::denied();
+    assert_eq!(c.ec2_price_with::<FakeApi, _>(async { Some(&denied) }, "us-west-2", "m7i.large", at(T0)).await, None);
+    assert_eq!(c.ec2_price_with::<FakeApi, _>(async { Some(&denied) }, "us-west-2", "m7i.large", at(T0 + 60)).await, None);
+    assert_eq!(denied.calls(), 1, "a recent failure is not retried");
+    // The failure is per type: another type is still asked.
+    let other = FakeApi::denied();
+    let _ = c.ec2_price_with::<FakeApi, _>(async { Some(&other) }, "us-west-2", "m7g.large", at(T0 + 60)).await;
+    assert_eq!(other.calls(), 1);
+    // A stale price answers when the refresh fails.
+    c.write_ec2("us-west-2", "c7i.large", 0.0893, at(T0)).unwrap();
+    let r = c.ec2_price_with::<FakeApi, _>(async { Some(&denied) }, "us-west-2", "c7i.large", at(T0 + 2 * DAY)).await;
+    assert_eq!(r, Some(0.0893));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_hanging_ec2_price_times_out_to_none() {
+    let (_d, c) = cache();
+    let api = FakeApi::hanging();
+    let started = tokio::time::Instant::now();
+    assert_eq!(c.ec2_price_with::<FakeApi, _>(async { Some(&api) }, "us-west-2", "m7i.large", at(T0)).await, None);
+    assert_eq!(started.elapsed(), FETCH_TIMEOUT);
+}
+
+#[tokio::test]
+async fn an_instance_type_that_could_name_another_file_is_never_used() {
+    let (_d, c) = cache();
+    for bad in ["../x", "m7i.large/..", "M7I.large", "m7i", "", "m7i.large.json", "m7i .large"] {
+        let r = c
+            .ec2_price_with::<FakeApi, FakeApi>(async { panic!("no client for {bad:?}") }, "us-west-2", bad, at(T0))
+            .await;
+        assert_eq!(r, None, "{bad}");
+        assert_eq!(c.read_ec2("us-west-2", bad, at(T0)), None);
+        assert!(c.write_ec2("us-west-2", bad, 1.0, at(T0)).is_err(), "{bad}");
+        assert!(fetch_ec2_price(&ec2_api(), "us-west-2", bad).await.is_err());
+    }
+    assert_eq!(fetch_ec2_price(&ec2_api(), "us-west-2", "m7g.large").await, Ok(M7G_LARGE));
+}
+
+#[test]
+fn a_fargate_cache_file_written_before_ec2_prices_still_reads() {
+    let (_d, c) = cache();
+    std::fs::create_dir_all(c.dir()).unwrap();
+    let old = serde_json::json!({ "region": "us-west-2", "fetched_at": T0, "rates": RATES });
+    std::fs::write(c.dir().join("us-west-2.json"), old.to_string()).unwrap();
+    assert_eq!(c.read("us-west-2", at(T0)), Some((RATES, true)));
 }

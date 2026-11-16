@@ -199,6 +199,7 @@ export function gatewaySidecarProblem(
   project: Pick<Project, "backend" | "aws">,
   gateway: Pick<GatewaySettings, "models"> | null,
 ): string | null {
+  if (project.aws?.launch_type === "ec2") return EC2_NO_SIDECAR;
   if (project.backend !== "open_ai_compatible") {
     return "The LLM gateway sidecar needs the OpenAI Compatible backend.";
   }
@@ -240,14 +241,56 @@ export function localEndpointProblem(url: string, gatewayPort: number | null): s
   return null;
 }
 
-/** The save patch for switching an AWS project's launch type. Docker access and
- *  VPN need EC2 (Rust refuses them on Fargate), so switching to Fargate turns
- *  them off in the same save. Task 6's launch-type control must use this. */
-export function launchTypePatch(project: Project, launch_type: LaunchType): Partial<Project> {
-  const patch: Partial<Project> = { aws: { ...project.aws!, launch_type } };
-  if (launch_type !== "ec2") {
+/** What an EC2 instance leaves for a workspace's reservations (Rust `ec2_available`). */
+export interface Ec2Limits {
+  cpu: number;
+  memory_mib: number;
+}
+
+/** The largest Fargate CPU size at most `cpu` (the smallest when below them all). */
+function fargateCpuAtMost(cpu: number): number {
+  return [...FARGATE_CPUS].reverse().find((c) => c <= cpu) ?? FARGATE_CPUS[0];
+}
+
+/**
+ * The save patch for switching an AWS project's launch type — the one place
+ * the switch is made. Each side keeps only what Rust accepts there:
+ * - to Fargate: Docker access and VPN off (they need EC2), and the
+ *   reservations snapped to a Fargate CPU/memory pair;
+ * - to EC2: the gateway sidecar and Spot off (neither is available on EC2),
+ *   and the reservations lowered to what the instance leaves (`limits`, when
+ *   known).
+ */
+export function launchTypePatch(
+  project: Project,
+  launch_type: LaunchType,
+  limits: Ec2Limits | null = null,
+): Partial<Project> {
+  const aws: AwsWorkspaceConfig = { ...project.aws!, launch_type };
+  const patch: Partial<Project> = { aws };
+  if (launch_type === "ec2") {
+    aws.gateway_sidecar = false;
+    aws.spot = false;
+    if (limits) {
+      aws.cpu = Math.min(aws.cpu, limits.cpu);
+      aws.memory_mib = Math.min(aws.memory_mib, limits.memory_mib);
+    }
+  } else {
     patch.allow_docker_access = false;
     patch.vpn_support_enabled = false;
+    aws.cpu = fargateCpuAtMost(aws.cpu);
+    if (memoryError(aws.cpu, aws.memory_mib)) aws.memory_mib = nearestMemory(aws.cpu, aws.memory_mib);
   }
   return patch;
 }
+
+/** Mirrors Rust `aws::workspace::EC2_NO_SIDECAR`. */
+export const EC2_NO_SIDECAR =
+  "The LLM gateway sidecar is not available on EC2 yet: turn it off, or run the project on Fargate";
+
+/** Host settings' notes for an EC2 project (phase 7). */
+export const EC2_SCALE_TO_ZERO_NOTE =
+  "Your instances scale to zero when no workspace is running, so the first start after idle boots an instance — about 3 minutes.";
+export const EC2_DOCKER_ACCESS_NOTE =
+  "Docker access mounts your instance's Docker socket: that is root on your own instance, which nobody else's workspace runs on.";
+export const EC2_NO_CAPACITY = "Ask an admin to add EC2 capacity to your onboarding";

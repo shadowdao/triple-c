@@ -11,6 +11,7 @@ import {
   updateAwsEnvironment,
 } from "../../../lib/tauri-commands";
 import { awsErrorMessage, toAwsError } from "../../../lib/aws-error";
+import { clearEc2CapacityCache } from "../../../lib/ec2Capacity";
 import type {
   AwsError,
   DetectedEnvironment,
@@ -172,6 +173,9 @@ export default function EnvironmentsPanel({
     setDetectError(null);
     try {
       const found = await detectAwsEnvironments(connection.id, region);
+      // A scan reads every user record afresh (a join may have changed the
+      // EC2 capacity): Host settings ask again too.
+      clearEc2CapacityCache();
       if (id === request.current) setScan(found);
     } catch (e) {
       if (id === request.current) {

@@ -790,6 +790,60 @@ pub async fn environment_max_hours(project: &Project, settings: &AppSettings) ->
     Some(info.max_workspace_hours)
 }
 
+/// What Host settings know of the user's EC2 capacity in an AWS project's
+/// environment (phase 7): the launch-type control offers EC2 only with
+/// `Ec2`, and sizes the reservations against `available_*`
+/// ([`ec2_available`]; `None` for a type the app's table doesn't know).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Ec2Capacity {
+    Ec2 {
+        compute: crate::aws::environments::UserCompute,
+        available_cpu: Option<u32>,
+        available_memory_mib: Option<u32>,
+    },
+    /// No user record: no EC2 capacity in this environment.
+    None,
+    /// A record that can't be used (the reason names a field, never a value).
+    Unusable { reason: String },
+    /// It couldn't be read (offline, no connection, slow, a local project).
+    Unknown,
+}
+
+/// [`Ec2Capacity`] from a read of the user record (`None`: no read).
+pub fn ec2_capacity_from(read: Option<UserRecord>) -> Ec2Capacity {
+    match read {
+        Some(UserRecord::Valid(compute)) => {
+            let available = crate::models::project::ec2_available(&compute.instance_type);
+            Ec2Capacity::Ec2 {
+                available_cpu: available.map(|a| a.0),
+                available_memory_mib: available.map(|a| a.1),
+                compute,
+            }
+        }
+        Some(UserRecord::Absent) => Ec2Capacity::None,
+        Some(UserRecord::Unusable(reason)) => Ec2Capacity::Unusable { reason },
+        None => Ec2Capacity::Unknown,
+    }
+}
+
+/// The caller's EC2 capacity in `project`'s environment, from their user
+/// record. Never an error: anything that stops the read (10 s bound) is
+/// [`Ec2Capacity::Unknown`].
+pub async fn ec2_capacity(project: &Project, settings: &AppSettings) -> Ec2Capacity {
+    let read = async {
+        let placement = project.aws_placement.as_ref()?;
+        let (_, region, sdk) = project_sdk(project, settings).await.ok()?;
+        let who = caller_identity(&sdk).await.ok()?;
+        let ok = owner_key(&region, &who.user_id);
+        read_user_record(&SdkRuntimeApi::new(&sdk), &placement.environment, &ok, &who.account, &region)
+            .await
+            .map_err(|e| log::info!("Project {}: could not read the EC2 record ({e})", project.id))
+            .ok()
+    };
+    ec2_capacity_from(tokio::time::timeout(std::time::Duration::from_secs(10), read).await.ok().flatten())
+}
+
 /// `ProjectHost::Aws::ensure_started`.
 pub async fn ensure_started(
     project: &Project,

@@ -9,11 +9,16 @@ import { awsProject, localProject } from "../../../../test/awsFixtures";
 import type { AppSettings, AuthBridgeStatus, Project } from "../../../../lib/types";
 import { useAppState } from "../../../../store/appState";
 import { clearEnvironmentMaxHoursCache } from "../../../../lib/environmentMaxHours";
+import { clearEc2CapacityCache } from "../../../../lib/ec2Capacity";
+import type { Ec2Capacity } from "../../../../lib/types";
 
 const OFF_BRIDGE: AuthBridgeStatus = { enabled: false, active_ports: [], conflicts: [] };
 const removeAwsResources = vi.fn();
 const awsCostEstimate = vi.fn(async (..._args: unknown[]) => null as unknown);
 const awsEnvironmentMaxHours = vi.fn(async (_id: string) => 0 as number | null);
+const NO_EC2: Ec2Capacity = { state: "none" };
+const awsEc2Capacity = vi.fn(async (_id: string): Promise<Ec2Capacity> => NO_EC2);
+const ec2FitProblem = vi.fn(async (..._args: unknown[]) => null as string | null);
 
 vi.mock("../../../../lib/tauri-commands", () => ({
   getAuthBridgeStatus: vi.fn(async () => OFF_BRIDGE),
@@ -22,6 +27,8 @@ vi.mock("../../../../lib/tauri-commands", () => ({
   removeAwsResources: (id: string, discard: boolean) => removeAwsResources(id, discard),
   awsCostEstimate: (...args: unknown[]) => awsCostEstimate(...args),
   awsEnvironmentMaxHours: (id: string) => awsEnvironmentMaxHours(id),
+  awsEc2Capacity: (id: string) => awsEc2Capacity(id),
+  ec2FitProblem: (...args: unknown[]) => ec2FitProblem(...args),
 }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}) }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn(async () => null) }));
@@ -31,6 +38,8 @@ const save = vi.fn().mockResolvedValue(true);
 beforeEach(() => {
   vi.clearAllMocks();
   clearEnvironmentMaxHoursCache();
+  clearEc2CapacityCache();
+  awsEc2Capacity.mockImplementation(async () => NO_EC2);
 });
 
 function toggle(name: string) {
@@ -244,7 +253,7 @@ describe("HostSection", () => {
     await waitFor(() =>
       expect(within(card).getByText(/≈ \$0\.050\/hour \(on-demand; Spot is usually up to 70% cheaper\)/)).toBeInTheDocument(),
     );
-    expect(awsCostEstimate).toHaveBeenCalledWith("c1", "eu-west-1", p.aws);
+    expect(awsCostEstimate).toHaveBeenCalledWith("c1", "eu-west-1", p.aws, null);
     expect(within(card).getByText(/EFS storage is billed separately/)).toBeInTheDocument();
     useAppState.setState({ appSettings: null });
   });
@@ -595,3 +604,167 @@ describe("HostSection", () => {
     expect(screen.queryByLabelText("Repository 1 URL")).toBeNull();
   });
 });
+
+// ---- phase 7: EC2 projects ----
+
+const M7I: Ec2Capacity = {
+  state: "ec2",
+  compute: {
+    instance_type: "m7i.large",
+    max_instances: 1,
+    user_tag: "alice",
+    cluster_arn: "arn:aws:ecs:eu-west-1:123456789012:cluster/triple-c-dev--u-alice",
+    capacity_provider: "triple-c-dev--u-alice",
+  },
+  available_cpu: 1920,
+  available_memory_mib: 7373,
+};
+
+const ec2Project = (over: Partial<Project> = {}): Project => {
+  const p = awsProject(over);
+  return { ...p, aws: { ...p.aws!, launch_type: "ec2", cpu: 1024, memory_mib: 4096 } };
+};
+
+describe("HostSection — launch type (EC2)", () => {
+  const renderHost = (p: Project = awsProject(), disabled = false) =>
+    render(<HostSection project={p} save={save} disabled={disabled} />);
+  const ec2Segment = () => screen.getByRole("radio", { name: /^EC2/ });
+
+  it("offers EC2 with the user's instance type when their onboarding has EC2 capacity", async () => {
+    awsEc2Capacity.mockImplementation(async () => M7I);
+    renderHost();
+    await waitFor(() => expect(ec2Segment()).toHaveTextContent("EC2 (your instance: m7i.large)"));
+    expect(ec2Segment()).toBeEnabled();
+    expect(screen.queryByText(/Ask an admin/)).toBeNull();
+  });
+
+  it("disables EC2 with the reason when the user has no EC2 capacity, or it can't be read", async () => {
+    renderHost();
+    await waitFor(() =>
+      expect(screen.getByText(/Ask an admin to add EC2 capacity to your onboarding/)).toBeInTheDocument(),
+    );
+    expect(ec2Segment()).toBeDisabled();
+    expect(screen.getByRole("radio", { name: "Fargate" })).toBeEnabled();
+    cleanup();
+
+    clearEc2CapacityCache();
+    awsEc2Capacity.mockImplementation(async () => ({ state: "unusable", reason: "schema is not 1" }));
+    renderHost();
+    await waitFor(() => expect(screen.getByText(/can't be used \(schema is not 1\)/)).toBeInTheDocument());
+    expect(ec2Segment()).toBeDisabled();
+    cleanup();
+
+    clearEc2CapacityCache();
+    awsEc2Capacity.mockImplementation(async () => ({ state: "unknown" }));
+    renderHost();
+    await waitFor(() => expect(screen.getByText(/Could not read your EC2 capacity/)).toBeInTheDocument());
+    expect(ec2Segment()).toBeDisabled();
+  });
+
+  it("switches to EC2 through launchTypePatch: sidecar and Spot off, sizes fitted", async () => {
+    awsEc2Capacity.mockImplementation(async () => M7I);
+    const p = awsProject();
+    p.aws = { ...p.aws!, cpu: 4096, memory_mib: 16384, spot: true, gateway_sidecar: true };
+    renderHost(p);
+    await waitFor(() => expect(ec2Segment()).toBeEnabled());
+    fireEvent.click(ec2Segment());
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(1));
+    expect(save.mock.calls[0][0].aws).toMatchObject({
+      launch_type: "ec2",
+      gateway_sidecar: false,
+      spot: false,
+      cpu: 1920,
+      memory_mib: 7373,
+    });
+    expect(save.mock.calls[0][0].allow_docker_access).toBeUndefined();
+  });
+
+  it("switches back to Fargate turning Docker access and VPN off, with a Fargate size", async () => {
+    awsEc2Capacity.mockImplementation(async () => M7I);
+    const p = ec2Project({ allow_docker_access: true, vpn_support_enabled: true });
+    p.aws = { ...p.aws!, cpu: 1920, memory_mib: 7373 };
+    renderHost(p);
+    fireEvent.click(screen.getByRole("radio", { name: "Fargate" }));
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(1));
+    const patch = save.mock.calls[0][0];
+    expect(patch).toMatchObject({ allow_docker_access: false, vpn_support_enabled: false });
+    expect(patch.aws).toMatchObject({ launch_type: "fargate", cpu: 1024, memory_mib: 7168 });
+  });
+
+  it("an EC2 project keeps its launch type selectable back to Fargate even without capacity, and says why it can't start", async () => {
+    renderHost(ec2Project());
+    await waitFor(() => expect(screen.getByText(/can't start on EC2 now/)).toBeInTheDocument());
+    expect(ec2Segment()).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByRole("radio", { name: "Fargate" })).toBeEnabled();
+  });
+
+  it("on EC2: reservation inputs with the instance's limits, no ephemeral size, Spot or architecture, and the notes", async () => {
+    awsEc2Capacity.mockImplementation(async () => M7I);
+    renderHost(ec2Project());
+    await waitFor(() => expect(screen.getByText(/Up to 1920 on your m7i.large/)).toBeInTheDocument());
+    expect(screen.getByText(/Up to 7373 MiB on your m7i.large/)).toBeInTheDocument();
+    expect(screen.getByLabelText("CPU reservation (units)")).toHaveValue("1024");
+    expect(screen.getByLabelText("Memory reservation (MiB)")).toHaveValue("4096");
+    expect(screen.queryByLabelText("Ephemeral storage (GiB)")).toBeNull();
+    expect(screen.queryByRole("switch", { name: "Spot" })).toBeNull();
+    expect(screen.queryByRole("radiogroup", { name: "Architecture" })).toBeNull();
+    const notes = screen.getByRole("note", { name: "On EC2" });
+    expect(notes).toHaveTextContent(/first start after idle boots an instance — about 3 minutes/);
+    expect(notes).toHaveTextContent(/root on your own instance/);
+    expect(notes).toHaveTextContent(/gateway sidecar is not available on EC2/);
+    // Fargate shows none of this.
+    cleanup();
+    renderHost(awsProject());
+    expect(screen.queryByRole("note", { name: "On EC2" })).toBeNull();
+    expect(screen.getByLabelText("Ephemeral storage (GiB)")).toBeInTheDocument();
+    expect(screen.getByRole("switch", { name: "Spot" })).toBeInTheDocument();
+  });
+
+  it("checks the reservations with the backend's fit rule before saving", async () => {
+    awsEc2Capacity.mockImplementation(async () => M7I);
+    ec2FitProblem.mockResolvedValueOnce("This project reserves 1024 CPU units and 8000 MiB of memory, more than …");
+    renderHost(ec2Project());
+    await waitFor(() => expect(screen.getByText(/Up to 1920/)).toBeInTheDocument());
+    const mem = screen.getByLabelText("Memory reservation (MiB)");
+    fireEvent.change(mem, { target: { value: "8000" } });
+    fireEvent.blur(mem);
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(/more than/));
+    expect(ec2FitProblem).toHaveBeenCalledWith(expect.objectContaining({ cpu: 1024, memory_mib: 8000 }), "m7i.large");
+    expect(save).not.toHaveBeenCalled();
+
+    fireEvent.change(mem, { target: { value: "6000" } });
+    fireEvent.blur(mem);
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(1));
+    expect(save.mock.calls[0][0].aws).toMatchObject({ cpu: 1024, memory_mib: 6000 });
+
+    const cpu = screen.getByLabelText("CPU reservation (units)");
+    fireEvent.change(cpu, { target: { value: "0" } });
+    fireEvent.blur(cpu);
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(/positive whole numbers/));
+  });
+
+  it("prices an EC2 project as the user's instance type", async () => {
+    awsEc2Capacity.mockImplementation(async () => M7I);
+    useAppState.setState({
+      appSettings: { hosts: [{ id: "c1", name: "lab" }] } as unknown as AppSettings,
+    });
+    const p = ec2Project();
+    renderHost(p);
+    await waitFor(() => expect(awsCostEstimate).toHaveBeenCalledWith("c1", "eu-west-1", p.aws, "m7i.large"));
+    expect(screen.getByText(/price in this region of your EC2 instance \(m7i.large\)/)).toBeInTheDocument();
+    useAppState.setState({ appSettings: null });
+  });
+});
+
+describe("RuntimeSection on EC2", () => {
+  it("enables Docker access, VPN and the sandbox, and says Docker access is root on the instance", () => {
+    render(<RuntimeSection project={ec2Project({ sandbox_mode_enabled: true })} save={save} disabled={false} />);
+    for (const name of ["Allow container spawning", "VPN support", "Sandbox mode"]) {
+      expect(toggle(name)).toBeEnabled();
+    }
+    expect(toggle("Sandbox mode")).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByText(/root on your own instance/)).toBeInTheDocument();
+    expect(screen.queryByText(/Off on AWS for now/)).toBeNull();
+  });
+});
+

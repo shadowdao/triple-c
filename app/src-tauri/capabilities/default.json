@@ -22,6 +22,8 @@
     "allow-aws-task-log",
     "allow-aws-workspace-status",
     "allow-aws-environment-max-hours",
+    "allow-aws-ec2-capacity",
+    "allow-ec2-fit-problem",
     "allow-remove-aws-resources",
     "allow-rebuild-project-container",
     "allow-reconcile-project-statuses",

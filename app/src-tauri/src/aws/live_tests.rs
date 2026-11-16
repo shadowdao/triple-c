@@ -642,6 +642,12 @@ async fn a_workspace_role_reads_fargate_prices_and_a_bare_role_cannot() {
         eprintln!("{}: x86 {x86:?}, ARM {arm:?}", e.region);
         assert!(x86.vcpu_hour > 0.0 && x86.gb_hour > 0.0 && x86.storage_gb_hour > 0.0);
         assert!(arm.vcpu_hour < x86.vcpu_hour, "ARM is cheaper per vCPU");
+        // E10: an EC2 instance type's on-demand price, with the same rights.
+        let m7i = super::pricing::fetch_ec2_price(&SdkPricingApi::new(&cfg), &e.region, "m7i.large")
+            .await
+            .expect("workspace role reads EC2 prices");
+        eprintln!("{}: m7i.large {m7i}/hour", e.region);
+        assert!(m7i > 0.0 && m7i < 1.0, "{m7i}");
 
         let bare = e.role("noprice", None, &[]).await;
         let cfg = sdk_config_for_keys(&e.assume_keys(&bare).await, PRICING_REGION);

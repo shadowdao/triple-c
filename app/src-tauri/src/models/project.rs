@@ -822,15 +822,36 @@ pub fn fits_instance(cfg: &AwsWorkspaceConfig, instance_type: &str) -> Fit {
     if cfg.launch_type != LaunchType::Ec2 {
         return Fit::Ok;
     }
-    let Some((cpu, mem)) = ec2_instance_spec(instance_type) else {
+    let Some((available_cpu, available_memory_mib)) = ec2_available(instance_type) else {
         return Fit::UnknownType;
     };
-    let available_cpu = cpu - EC2_RESERVED_CPU_UNITS;
-    let available_memory_mib = mem - ec2_memory_reserve_mib(mem);
     if cfg.cpu > available_cpu || cfg.memory_mib > available_memory_mib {
         Fit::TooBig { available_cpu, available_memory_mib }
     } else {
         Fit::Ok
+    }
+}
+
+/// What `instance_type` leaves for one workspace's reservations, as
+/// `(CPU units, MiB)`: [`fits_instance`]'s limits (the agent's CPU and the
+/// memory margin taken off). `None` for a type not in the table.
+pub fn ec2_available(instance_type: &str) -> Option<(u32, u32)> {
+    let (cpu, mem) = ec2_instance_spec(instance_type)?;
+    Some((cpu - EC2_RESERVED_CPU_UNITS, mem - ec2_memory_reserve_mib(mem)))
+}
+
+/// Why `cfg`'s reservations don't fit `instance_type`, or `None` when they
+/// do (or the type is unknown, or `cfg` is Fargate). The one wording of the
+/// fit rule: the start's refusal and Host settings both use it.
+pub fn ec2_fit_problem(cfg: &AwsWorkspaceConfig, instance_type: &str) -> Option<String> {
+    match fits_instance(cfg, instance_type) {
+        Fit::TooBig { available_cpu, available_memory_mib } => Some(format!(
+            "This project reserves {} CPU units and {} MiB of memory, more than your EC2 \
+             instance type {instance_type} has for a workspace ({available_cpu} CPU units, \
+             {available_memory_mib} MiB).",
+            cfg.cpu, cfg.memory_mib
+        )),
+        Fit::Ok | Fit::UnknownType => None,
     }
 }
 
@@ -1684,6 +1705,24 @@ mod tests {
         assert_eq!(fits_instance(&ec2(1024, 2048), "z9.huge"), Fit::UnknownType);
         // Fargate configs have no instance to fit.
         assert_eq!(fits_instance(&cfg(16384, 122880), "m7i.large"), Fit::Ok);
+    }
+
+    #[test]
+    fn the_fit_problem_words_the_fit_rule_once() {
+        assert_eq!(ec2_available("m7i.large"), Some((1920, 7373)));
+        assert_eq!(ec2_available("t4g.large"), Some((1920, 7373)));
+        assert_eq!(ec2_available("z9.huge"), None);
+        assert_eq!(ec2_fit_problem(&ec2(1920, 7373), "m7i.large"), None);
+        assert_eq!(
+            ec2_fit_problem(&ec2(1024, 7374), "m7i.large").as_deref(),
+            Some(
+                "This project reserves 1024 CPU units and 7374 MiB of memory, more than your EC2 \
+                 instance type m7i.large has for a workspace (1920 CPU units, 7373 MiB)."
+            )
+        );
+        // Unknown types and Fargate configs: no problem to report here.
+        assert_eq!(ec2_fit_problem(&ec2(99999, 99999), "z9.huge"), None);
+        assert_eq!(ec2_fit_problem(&cfg(16384, 122880), "m7i.large"), None);
     }
 
     #[test]

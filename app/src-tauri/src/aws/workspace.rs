@@ -49,7 +49,7 @@ use super::tofu_modules::{
 };
 use crate::host::ssm::AGENT_PORT;
 use crate::models::project::{
-    fits_instance, validate_aws_workspace, Arch, Fit, LaunchType, RepoSource,
+    ec2_fit_problem, fits_instance, validate_aws_workspace, Arch, Fit, LaunchType, RepoSource,
     SecretsDelivery, StorageMode,
 };
 use crate::models::Project;
@@ -1019,14 +1019,12 @@ pub fn ec2_plan(
     let compute = compute.ok_or_else(|| no_ec2_capacity(env))?;
     match fits_instance(cfg, &compute.instance_type) {
         Fit::Ok => {}
-        Fit::TooBig { available_cpu, available_memory_mib } => {
+        Fit::TooBig { .. } => {
+            let problem = ec2_fit_problem(cfg, &compute.instance_type).unwrap_or_default();
             return Err(format!(
-                "This project reserves {} CPU units and {} MiB of memory, more than your EC2 \
-                 instance type {} has for a workspace ({available_cpu} CPU units, \
-                 {available_memory_mib} MiB). Lower the reservations in the project's Host \
-                 settings, or ask an admin for a larger instance type.",
-                cfg.cpu, cfg.memory_mib, compute.instance_type
-            ))
+                "{problem} Lower the reservations in the project's Host settings, or ask an \
+                 admin for a larger instance type."
+            ));
         }
         // The record is validated against the same table, so this is a
         // newer app's type: let ECS decide.

@@ -423,6 +423,12 @@
           "markdownDescription": "Enables the aws_cost_estimate command without any pre-configured scope."
         },
         {
+          "description": "Enables the aws_ec2_capacity command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-aws-ec2-capacity",
+          "markdownDescription": "Enables the aws_ec2_capacity command without any pre-configured scope."
+        },
+        {
           "description": "Enables the aws_environment_max_hours command without any pre-configured scope.",
           "type": "string",
           "const": "allow-aws-environment-max-hours",
@@ -643,6 +649,12 @@
           "type": "string",
           "const": "allow-download-container-file",
           "markdownDescription": "Enables the download_container_file command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the ec2_fit_problem command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-ec2-fit-problem",
+          "markdownDescription": "Enables the ec2_fit_problem command without any pre-configured scope."
         },
         {
           "description": "Enables the export_settings command without any pre-configured scope.",
@@ -1401,6 +1413,12 @@
           "markdownDescription": "Denies the aws_cost_estimate command without any pre-configured scope."
         },
         {
+          "description": "Denies the aws_ec2_capacity command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-aws-ec2-capacity",
+          "markdownDescription": "Denies the aws_ec2_capacity command without any pre-configured scope."
+        },
+        {
           "description": "Denies the aws_environment_max_hours command without any pre-configured scope.",
           "type": "string",
           "const": "deny-aws-environment-max-hours",
@@ -1621,6 +1639,12 @@
           "type": "string",
           "const": "deny-download-container-file",
           "markdownDescription": "Denies the download_container_file command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the ec2_fit_problem command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-ec2-fit-problem",
+          "markdownDescription": "Denies the ec2_fit_problem command without any pre-configured scope."
         },
         {
           "description": "Denies the export_settings command without any pre-configured scope.",

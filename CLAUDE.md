@@ -384,6 +384,9 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   `FILTERS`) → per-region x86/ARM rates cached at `<data_dir>/triple-c/aws-pricing/<region>.json` for
   24 h; `aws_cost_estimate(connection_id, region, config)` never errors — denied/offline/slow (8 s) is
   `None` ("Estimate unavailable"), a failed region isn't re-asked for 5 min, a stale cache still answers.
+  EC2 projects (E10) pass `instance_type` (the user's, from `aws_ec2_capacity`): the `AmazonEC2`
+  on-demand Linux/shared-tenancy hourly price (`EC2_FILTERS`), cached as `<region>--ec2-<type>.json`
+  with the same rules — the instance's price, not the reservations.
   **Environments are OpenTofu modules** (`aws/terraform/{environment,user-onboard,permissions-boundary}`;
   spec D2–D10). `tofu_modules.rs` embeds them and is the **only** place the shared names are built
   (environment, `/triple-c/environments/<env>` record, owner key — `sha256("<region>:<aws:userid>")`,

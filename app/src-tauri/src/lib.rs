@@ -555,6 +555,8 @@ pub fn run() {
             commands::project_commands::aws_task_log,
             commands::project_commands::aws_workspace_status,
             commands::project_commands::aws_environment_max_hours,
+            commands::project_commands::aws_ec2_capacity,
+            commands::project_commands::ec2_fit_problem,
             commands::project_commands::remove_aws_resources,
             commands::project_commands::rebuild_project_container,
             commands::project_commands::reconcile_project_statuses,
