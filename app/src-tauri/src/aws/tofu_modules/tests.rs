@@ -2128,3 +2128,28 @@ fn every_module_write_has_an_admin_check_and_vice_versa() {
         .collect();
     assert!(stale.is_empty(), "APP_ONLY_WRITES is stale: {stale:?}");
 }
+
+#[test]
+fn the_lifetime_cap_maximum_is_the_same_in_rust_typescript_and_hcl() {
+    let max = MAX_WORKSPACE_HOURS.to_string();
+    let vars = module_files(ModuleKind::Environment)
+        .iter()
+        .find(|(f, _)| *f == "variables.tf")
+        .unwrap()
+        .1;
+    let block = &vars[vars.find("variable \"max_workspace_hours\"").expect("the variable")..];
+    let block = &block[..block.find("\n}\n").unwrap()];
+    assert!(
+        block.contains(&format!("var.max_workspace_hours <= {max}")),
+        "the HCL validation's maximum: {block}"
+    );
+    assert!(block.contains(&format!("from 0 to {max}")), "{block}");
+    let ts = include_str!("../../../../src/components/settings/hosts/LifetimeCapField.tsx");
+    assert!(
+        ts.contains(&format!("export const MAX_WORKSPACE_HOURS = {max};")),
+        "LifetimeCapField.tsx's MAX_WORKSPACE_HOURS"
+    );
+    // And the record parser's message.
+    let envs = include_str!("../environments.rs");
+    assert!(envs.contains(&format!("from 0 to {max}")));
+}

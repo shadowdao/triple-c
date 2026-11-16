@@ -178,7 +178,8 @@ pub(crate) fn network_from_record(
                 subnet_ids: info.subnet_ids.clone(),
                 assign_public_ip: info.assign_public_ip,
             };
-            // The same checks as the apply's variables.
+            // The same checks as the apply's variables. Only the network is
+            // checked here, so the lifetime cap is a valid placeholder (0).
             environment_vars(&info.name, "us-east-1", &choice, 0)?;
             Ok(choice)
         }
