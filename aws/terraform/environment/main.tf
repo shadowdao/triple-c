@@ -3,7 +3,7 @@
 
 locals {
   # ENVIRONMENT_MODULE_VERSION in app/src-tauri/src/aws/tofu_modules.rs.
-  template_version = 1
+  template_version = 2
   name             = "triple-c-${var.environment_name}"
 }
 
@@ -110,17 +110,18 @@ resource "aws_ssm_parameter" "environment" {
   type = "String"
   tier = "Standard"
   value = jsonencode({
-    schema            = 1
-    name              = var.environment_name
-    template_version  = local.template_version
-    cluster_arn       = aws_ecs_cluster.this.arn
-    security_group_id = aws_security_group.tasks.id
-    subnet_ids        = local.task_subnet_ids
-    assign_public_ip  = local.assign_public_ip
-    kms_key_arn       = aws_kms_key.this.arn
-    log_group         = aws_cloudwatch_log_group.this.name
-    network_mode      = var.network_mode
-    tenancy           = "strict"
+    schema              = 1
+    name                = var.environment_name
+    template_version    = local.template_version
+    cluster_arn         = aws_ecs_cluster.this.arn
+    security_group_id   = aws_security_group.tasks.id
+    subnet_ids          = local.task_subnet_ids
+    assign_public_ip    = local.assign_public_ip
+    kms_key_arn         = aws_kms_key.this.arn
+    log_group           = aws_cloudwatch_log_group.this.name
+    network_mode        = var.network_mode
+    tenancy             = "strict"
+    max_workspace_hours = var.max_workspace_hours
   })
 
   depends_on = [

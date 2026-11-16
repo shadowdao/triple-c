@@ -82,7 +82,8 @@ export interface AwsPlacement {
 }
 
 export type Arch = "x86_64" | "arm64";
-export type StorageMode = "ephemeral" | "hybrid";
+export type StorageMode = "ephemeral" | "hybrid" | "efs";
+export type SecretsDelivery = "secrets_manager" | "copy_at_connect";
 
 export interface RepoSource {
   url: string;
@@ -101,10 +102,16 @@ export interface AwsWorkspaceConfig {
   idle_stop_minutes: number | null;
   repos: RepoSource[];
   wip_push_on_stop: boolean;
+  secrets_delivery: SecretsDelivery;
+  /** Run as `claude` after the clone; null = none. At most 32768 bytes. */
+  setup_script: string | null;
+  /** Run the LLM gateway as a sidecar (needs 1 vCPU and 2 GiB). */
+  gateway_sidecar: boolean;
   /** Store-owned runtime handles; a save cannot change them. */
   task_arn: string | null;
   access_point_id: string | null;
   task_definition_arn: string | null;
+  workspace_access_point_id: string | null;
 }
 
 /** Where a new project runs: omitted (or all null) = local Docker. An AWS
@@ -146,6 +153,25 @@ export interface UnsavedWork {
   checked: boolean;
   repos: RepoState[];
   error: string | null;
+}
+
+/** An AWS workspace's background clone and setup script (Rust
+ *  `host::aws_host::WorkspaceStatus`, the shape `triple-c-workspace-status`
+ *  prints). */
+export interface WorkspaceStatus {
+  clone: {
+    /** Every repo has been tried. */
+    done: boolean;
+    /** The repos tried so far; `state` is cloning, cloned, failed or exists. */
+    repos: { folder: string; state: string }[];
+  };
+  setup: {
+    state: "none" | "running" | "ok" | "failed";
+    /** 0 when ok; the exit code when failed, if known. */
+    code: number | null;
+    /** The setup log's last lines. */
+    tail: string[];
+  };
 }
 
 export type ProjectStatus =
@@ -1242,6 +1268,16 @@ export interface PolicyFile {
   json: string;
 }
 
+/** `aws::pricing::HourlyEstimate`: the on-demand price of an AWS project's
+ *  Fargate task per hour while it runs (a gateway sidecar adds nothing). */
+export interface HourlyEstimate {
+  usd_per_hour: number;
+  /** Spot is on: the Price List has no Spot rates, so say it is usually cheaper. */
+  note_spot: boolean;
+  /** Hybrid or EFS storage: EFS is billed per GB-month, not in this figure. */
+  efs_billed_separately: boolean;
+}
+
 export type Verdict = "allowed" | "denied" | "unverified";
 
 export interface ActionResult {
@@ -1292,6 +1328,8 @@ export interface EnvironmentInfo {
   log_group: string;
   network_mode: "public" | "private-nat" | "existing";
   tenancy: string;
+  /** Advisory workspace lifetime cap in hours; 0 = none (absent in v1 records). */
+  max_workspace_hours: number;
 }
 
 /** A held state lock. `who`/`created`/`operation` are sanitized untrusted text. */

@@ -15,7 +15,8 @@
 #   * no `claude` process is running;
 #   * no scheduler job is running (`triple-c-scheduler status`, as claude);
 #   * the start's background repository clone has finished (entrypoint.sh,
-#     start_clone_repos: /run/triple-c-clone exists without `done`);
+#     start_clone_repos: /run/triple-c-clone exists without `done`), and so
+#     has the setup script (/run/triple-c-setup/status says `running`);
 #   * no work would be lost: `triple-c-wip-push --dry-run` (as claude) finds
 #     no dirty repository and no unpushed commit. With the WIP push on
 #     (TRIPLEC_WIP_PUSH=1) such work is pushed here, before the stop, and the
@@ -39,13 +40,26 @@
 # forward the signal, but signalling the entrypoint directly does not depend on
 # that and also works without an init.
 #
+# Lifetime cap (phase 6, Q8; TRIPLEC_MAX_LIFETIME_MINUTES, 0 or empty = none):
+# once the run's start (the entrypoint's /run/triple-c/start-epoch) is that
+# many minutes ago, whatever the activity, it pushes work in progress first
+# when the WIP push is on (best effort, bounded by TRIPLEC_WIP_TIMEOUT) and
+# then records "lifetime" and sends SIGTERM even if that push failed; the
+# entrypoint exits 76. A `pushed`/`discard` marker (the app is stopping it
+# already) is kept, with no push of its own. The cap is advisory: a workspace
+# user has sudo and could stop this watcher.
+#
+# Either the idle stop or the lifetime cap must be configured; the watcher
+# runs when at least one is.
+#
 # --check evaluates once and exits 0 (idle and nothing unsaved, or unsaved
 # work the WIP push would take) or 1 (not idle); for tests and for looking at
 # a live task. It never pushes.
 #
 # Configuration (environment; the entrypoint sets the first four, the rest
 # exist for tests):
-#   TRIPLEC_IDLE_STOP_MINUTES   N (required, > 0)
+#   TRIPLEC_IDLE_STOP_MINUTES   N (> 0; empty: no idle stop)
+#   TRIPLEC_MAX_LIFETIME_MINUTES  the lifetime cap (empty or 0: none)
 #   TRIPLEC_IDLE_SIGNAL_PID     the entrypoint's PID
 #   TRIPLEC_AGENT_TOKEN_FILE    default /dev/shm/triple-c/agent-token
 #   TRIPLEC_WIP_PUSH            1: push unsaved work before an idle stop
@@ -60,6 +74,8 @@
 #   TRIPLEC_WIP_BACKOFF_MAX     longest wait between push retries, default 1800
 #   TRIPLEC_IDLE_PROC_NAME      default claude
 #   TRIPLEC_CLONE_STATUS_DIR    default /run/triple-c-clone
+#   TRIPLEC_SETUP_STATUS_DIR    default /run/triple-c-setup
+#   TRIPLEC_START_EPOCH_FILE    default /run/triple-c/start-epoch
 
 set -u
 
@@ -77,6 +93,9 @@ wip_push="${TRIPLEC_WIP_PUSH:-0}"
 wip_bin="${TRIPLEC_WIP_PUSH_BIN:-/usr/local/bin/triple-c-wip-push}"
 wip_timeout="${TRIPLEC_WIP_TIMEOUT:-90}"
 backoff_max="${TRIPLEC_WIP_BACKOFF_MAX:-1800}"
+setup_dir="${TRIPLEC_SETUP_STATUS_DIR:-/run/triple-c-setup}"
+lifetime="${TRIPLEC_MAX_LIFETIME_MINUTES:-}"
+start_file="${TRIPLEC_START_EPOCH_FILE:-/run/triple-c/start-epoch}"
 
 # >>> is_idle
 # is_idle now last_activity_unix claude_running jobs_running minutes
@@ -131,6 +150,11 @@ clone_running() {
     [ -d "$clone_dir" ] && [ ! -e "$clone_dir/done" ]
 }
 
+# So does the setup script (entrypoint.sh, aws_run_setup).
+setup_running() {
+    [ "$(head -n 1 "$setup_dir/status" 2>/dev/null)" = running ]
+}
+
 # The folders with unsaved work (dirty, or commits no remote has), one per
 # line; nothing when there is none. Fails when it cannot tell.
 unsaved_work() {
@@ -146,6 +170,7 @@ quiet() {
     if pgrep -x "$proc_name" >/dev/null 2>&1; then claude=1; else claude=0; fi
     jobs=$(jobs_running)
     clone_running && jobs=1
+    setup_running && jobs=1
     is_idle "$(date +%s)" "${last:-}" "$claude" "$jobs" "$minutes"
 }
 
@@ -166,22 +191,73 @@ check() {
 }
 
 case "$minutes" in
-    ''|*[!0-9]*|0) echo "triple-c-idle-watch: TRIPLEC_IDLE_STOP_MINUTES must be a positive integer" >&2; exit 2 ;;
+    '') ;;
+    *[!0-9]*) echo "triple-c-idle-watch: TRIPLEC_IDLE_STOP_MINUTES must be a positive integer" >&2; exit 2 ;;
+    *) minutes=$((10#$minutes))
+       [ "$minutes" -gt 0 ] || { echo "triple-c-idle-watch: TRIPLEC_IDLE_STOP_MINUTES must be a positive integer" >&2; exit 2; } ;;
+esac
+case "$lifetime" in
+    '') ;;
+    *[!0-9]*) echo "triple-c-idle-watch: TRIPLEC_MAX_LIFETIME_MINUTES must be a whole number of minutes" >&2; exit 2 ;;
+    # Decimal even with leading zeros (`08` is 8); 0, 00, … mean no cap.
+    *) lifetime=$((10#$lifetime)); [ "$lifetime" -gt 0 ] || lifetime="" ;;
 esac
 
 if [ "${1:-}" = "--check" ]; then
+    [ -n "$minutes" ] || { echo "triple-c-idle-watch: --check needs TRIPLEC_IDLE_STOP_MINUTES" >&2; exit 2; }
     check
     exit $?
+fi
+
+if [ -z "$minutes" ] && [ -z "$lifetime" ]; then
+    echo "triple-c-idle-watch: neither TRIPLEC_IDLE_STOP_MINUTES nor TRIPLEC_MAX_LIFETIME_MINUTES is set — nothing to watch" >&2
+    exit 2
 fi
 
 case "$signal_pid" in
     ''|*[!0-9]*|0|1) echo "triple-c-idle-watch: TRIPLEC_IDLE_SIGNAL_PID must be the entrypoint's PID" >&2; exit 2 ;;
 esac
 
+# The run's start, for the lifetime cap. The entrypoint wrote it before
+# starting this watcher; should it be unreadable the cap counts from now
+# (later rather than never).
+started_at=$(head -n 1 "$start_file" 2>/dev/null)
+case "$started_at" in
+    ''|*[!0-9]*)
+        [ -z "$lifetime" ] || echo "triple-c-idle-watch: no start time in $start_file — the lifetime cap counts from now" >&2
+        started_at=$(date +%s) ;;
+esac
+
+lifetime_reached() {
+    [ -n "$lifetime" ] && [ $(( $(date +%s) - started_at )) -ge $((lifetime * 60)) ]
+}
+
+# The cap is reached: push (best effort) unless the app has decided already,
+# record "lifetime", signal the entrypoint and end.
+lifetime_stop() {
+    echo "triple-c-idle-watch: the environment's maximum workspace lifetime (${lifetime} minutes) was reached — stopping the workspace"
+    mkdir -p "$(dirname "$reason_file")" 2>/dev/null
+    case "$(cat "$reason_file" 2>/dev/null)" in
+        pushed|discard)
+            echo "triple-c-idle-watch: Triple-C is already stopping it — keeping its decision" ;;
+        *)
+            if [ "$wip_push" = 1 ]; then
+                echo "triple-c-idle-watch: pushing work in progress before the stop..."
+                as_user timeout -k 5 "$wip_timeout" "$wip_bin" --reason lifetime \
+                    || echo "triple-c-idle-watch: the WIP push failed — stopping anyway (the lifetime cap is reached)"
+            fi
+            printf 'lifetime\n' > "$reason_file" ;;
+    esac
+    kill -TERM "$signal_pid"
+    exit 0
+}
+
 push_failures=0
 next_push_at=0
 while :; do
     sleep "$interval"
+    lifetime_reached && lifetime_stop
+    [ -n "$minutes" ] || continue
     if ! quiet; then
         said=""
         continue
@@ -220,8 +296,9 @@ while :; do
     mkdir -p "$(dirname "$reason_file")" 2>/dev/null
     # A pushed/discard marker means the app's stop guard has decided and
     # its stop is under way: keep that decision rather than overwrite it.
+    # (Nor a lifetime stop's marker, should one be there.)
     case "$(cat "$reason_file" 2>/dev/null)" in
-        pushed|discard) ;;
+        pushed|discard|lifetime) ;;
         *) printf 'idle\n' > "$reason_file" ;;
     esac
     kill -TERM "$signal_pid"

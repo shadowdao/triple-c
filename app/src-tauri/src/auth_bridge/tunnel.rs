@@ -119,7 +119,11 @@ impl Drop for AbortOnDrop {
 /// also awaiting the aborted task, which guarantees the socket is closed before
 /// the caller proceeds (important when a port is rebound right after).
 pub struct PortForward {
+    /// The host loopback port.
     pub port: u16,
+    /// The container loopback port it reaches. The auth bridge mirrors a
+    /// port onto the same number; a project's port mapping may not.
+    pub container_port: u16,
     pub family: PortFamily,
     pub bridged_at: String,
     /// Why `[::1]` could not be taken alongside `127.0.0.1`, if it could not.
@@ -141,15 +145,40 @@ impl Drop for PortForward {
 }
 
 impl PortForward {
-    /// Bind `port` on the host loopback and start proxying into `container`.
+    /// Bind `host_port` on the host loopback and start proxying into
+    /// `container_port` on the container's loopback — the auth bridge's
+    /// forward, gated (see [`Gate::SignInCallback`]).
     ///
     /// The bind happens before the task is spawned, so an already-taken port is
     /// reported to the caller as an error rather than disappearing into a
     /// background task.
     pub async fn bind(
         container: ContainerTarget,
-        port: u16,
+        host_port: u16,
+        container_port: u16,
         family: PortFamily,
+    ) -> Result<Self, std::io::Error> {
+        Self::bind_with(container, host_port, container_port, family, Gate::SignInCallback).await
+    }
+
+    /// As [`bind`](Self::bind), for a project's port mapping on a host with
+    /// no Docker port publishing (AWS): every connection is carried as is
+    /// (see [`Gate::None`]).
+    pub async fn bind_mapping(
+        container: ContainerTarget,
+        host_port: u16,
+        container_port: u16,
+        family: PortFamily,
+    ) -> Result<Self, std::io::Error> {
+        Self::bind_with(container, host_port, container_port, family, Gate::None).await
+    }
+
+    async fn bind_with(
+        container: ContainerTarget,
+        port: u16,
+        container_port: u16,
+        family: PortFamily,
+        gate: Gate,
     ) -> Result<Self, std::io::Error> {
         // SECURITY BOUNDARY: the host side binds loopback ONLY — 127.0.0.1 and
         // ::1, never 0.0.0.0 / ::. Everything reachable through this socket is
@@ -176,8 +205,8 @@ impl PortForward {
                     // bridge reports itself healthy — a silent failure with no
                     // thread back to this line.
                     log::warn!(
-                        "Auth bridge: bound 127.0.0.1:{} but not [::1]:{} ({}) — continuing with IPv4 only; \
-                         a client that resolves localhost to ::1 without falling back will not reach it",
+                        "{}: bound 127.0.0.1:{} but not [::1]:{} ({}) — continuing with IPv4 only; \
+                         a client that resolves localhost to ::1 without falling back will not reach it", gate.label(),
                         port,
                         port,
                         e
@@ -193,11 +222,12 @@ impl PortForward {
                 }
             };
 
-        let target = family.socat_target(port);
-        let task = tokio::spawn(accept_loop(container, port, target, v4, v6));
+        let target = family.socat_target(container_port);
+        let task = tokio::spawn(accept_loop(container, port, target, v4, v6, gate));
 
         Ok(Self {
             port,
+            container_port,
             family,
             bridged_at: chrono::Utc::now().to_rfc3339(),
             ipv6_warning,
@@ -214,6 +244,30 @@ impl PortForward {
     }
 }
 
+/// What an accepted connection must show before it is carried in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    /// The auth bridge: a client must speak within [`FIRST_BYTE_TIMEOUT`],
+    /// and a cross-site sub-resource request is refused
+    /// ([`web_request_verdict`]).
+    SignInCallback,
+    /// A port mapping the user configured: carried as is, like Docker's own
+    /// port publishing (which has no gate either) — a server-speaks-first
+    /// protocol such as MySQL or SMTP must work, so nothing waits for the
+    /// client's first byte.
+    None,
+}
+
+impl Gate {
+    /// The log prefix of a forward of this kind.
+    fn label(self) -> &'static str {
+        match self {
+            Gate::SignInCallback => "Auth bridge",
+            Gate::None => "Port mapping",
+        }
+    }
+}
+
 /// Accept on both loopback listeners until aborted. Dropping this future drops
 /// the listeners (freeing the port) and the `JoinSet` (aborting live tunnels).
 async fn accept_loop(
@@ -222,6 +276,7 @@ async fn accept_loop(
     target: String,
     v4: TcpListener,
     v6: Option<TcpListener>,
+    gate: Gate,
 ) {
     let mut conns: JoinSet<()> = JoinSet::new();
 
@@ -245,25 +300,35 @@ async fn accept_loop(
                     // client side is whatever can dial loopback, so a queue is
                     // just a slower way to run out of execs.
                     log::warn!(
-                        "Auth bridge: refusing connection from {} to bridged port {} — \
-                         {} concurrent connections already open on it",
+                        "{}: refusing connection from {} to bridged port {} — \
+                         {} concurrent connections already open on it", gate.label(),
                         peer,
                         port,
                         MAX_CONNECTIONS
                     );
                     continue;
                 }
-                log::debug!("Auth bridge: connection from {} to bridged port {}", peer, port);
+                log::debug!("{}: connection from {} to bridged port {}", gate.label(), peer, port);
                 let _ = stream.set_nodelay(true);
-                conns.spawn(tunnel_connection(
-                    container.clone(),
-                    target.clone(),
-                    stream,
-                    port,
-                ));
+                match gate {
+                    Gate::SignInCallback => conns.spawn(tunnel_connection(
+                        container.clone(),
+                        target.clone(),
+                        stream,
+                        port,
+                    )),
+                    Gate::None => conns.spawn(tunnel_labelled(
+                        gate.label(),
+                        container.clone(),
+                        target.clone(),
+                        stream,
+                        port,
+                        Vec::new(),
+                    )),
+                };
             }
             Err(e) => {
-                log::warn!("Auth bridge: accept failed on port {}: {} — stopping listener", port, e);
+                log::warn!("{}: accept failed on port {}: {} — stopping listener", gate.label(), port, e);
                 return;
             }
         }
@@ -521,6 +586,18 @@ pub async fn tunnel_connection_with_prelude(
     port: u16,
     prelude: Vec<u8>,
 ) {
+    tunnel_labelled("Auth bridge", container, target, stream, port, prelude).await
+}
+
+/// [`tunnel_connection_with_prelude`], logging under `label`.
+async fn tunnel_labelled(
+    label: &'static str,
+    container: ContainerTarget,
+    target: String,
+    stream: TcpStream,
+    port: u16,
+    prelude: Vec<u8>,
+) {
     let cmd = vec!["socat".to_string(), "-".to_string(), target.clone()];
 
     let AttachedExec {
@@ -531,7 +608,7 @@ pub async fn tunnel_connection_with_prelude(
         Ok(e) => e,
         Err(e) => {
             log::warn!(
-                "Auth bridge: failed to open tunnel exec for port {} ({}): {}",
+                "{}: failed to open tunnel exec for port {} ({}): {}", label,
                 port,
                 target,
                 e
@@ -579,7 +656,7 @@ pub async fn tunnel_connection_with_prelude(
         Ok(chunk) => chunk,
         Err(_) => {
             log::debug!(
-                "Auth bridge: bridged port {} idle for {}s — closing the tunnel",
+                "{}: bridged port {} idle for {}s — closing the tunnel", label,
                 port,
                 IDLE_TIMEOUT.as_secs()
             );
@@ -597,14 +674,14 @@ pub async fn tunnel_connection_with_prelude(
             }
             Ok(ExecChunk::StdErr(message)) => {
                 log::debug!(
-                    "Auth bridge: socat stderr for port {}: {}",
+                    "{}: socat stderr for port {}: {}", label,
                     port,
                     String::from_utf8_lossy(&message).trim()
                 );
             }
             Ok(_) => {}
             Err(e) => {
-                log::debug!("Auth bridge: tunnel stream error on port {}: {}", port, e);
+                log::debug!("{}: tunnel stream error on port {}: {}", label, port, e);
                 break;
             }
         }

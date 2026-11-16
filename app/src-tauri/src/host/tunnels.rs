@@ -18,6 +18,7 @@ use std::time::Duration;
 use aws_config::SdkConfig;
 use futures_util::future::BoxFuture;
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 use super::agent::AgentEndpoint;
 use crate::aws::tasks::StopKind;
@@ -51,6 +52,11 @@ pub struct LiveTunnel {
     /// Runtime handles for the store (`set_aws_runtime`).
     pub access_point_id: Option<String>,
     pub task_definition_arn: String,
+    /// EFS storage's `/workspace` access point.
+    pub workspace_access_point_id: Option<String>,
+    /// The start that opened this tunnel ran the task (rather than
+    /// attaching to one already running, or re-attaching after a restart).
+    pub created: bool,
 }
 
 /// Where an endpoint's task is: `(connection, region, cluster, task ARN)`.
@@ -68,6 +74,12 @@ struct Registry {
     /// start's own tunnel) and [`cancel_reattach`]: a background re-attach
     /// that began under an older generation must never register.
     generation: HashMap<String, u64>,
+    /// The background clone/setup follower per project (`aws_host::status`),
+    /// with the id [`begin_follow`] gave it. Cancelled by a new follower,
+    /// [`cancel_follow`] (Stop, Remove), and whenever the tunnel is taken
+    /// out or every tunnel closed.
+    followers: HashMap<String, (u64, CancellationToken)>,
+    next_follower: u64,
 }
 
 fn registry() -> &'static Mutex<Registry> {
@@ -123,13 +135,15 @@ pub fn get_endpoint(project_id: &str) -> Option<AgentEndpoint> {
     lock().live.get(project_id).map(|t| t.endpoint.clone())
 }
 
-/// `(task ARN, access point id, task definition ARN)` of the project's tunnel.
-pub fn runtime(project_id: &str) -> Option<(String, Option<String>, String)> {
+/// `(task ARN, access point id, task definition ARN, workspace access point
+/// id)` of the project's tunnel.
+pub fn runtime(project_id: &str) -> Option<(String, Option<String>, String, Option<String>)> {
     lock().live.get(project_id).map(|t| {
         (
             t.task_arn.clone(),
             t.access_point_id.clone(),
             t.task_definition_arn.clone(),
+            t.workspace_access_point_id.clone(),
         )
     })
 }
@@ -200,13 +214,67 @@ pub async fn close_if_task(project_id: &str, task_arn: &str) {
         take(&mut r, project_id)
     };
     notify();
+    // The project's port mappings lead into that task: they go with it.
+    super::port_forwards::close(project_id).await;
     if let Some(t) = taken {
         t.forward.close().await;
     }
 }
 
+/// Whether the project's registered tunnel came from a start that ran its
+/// task (see [`LiveTunnel::created`]).
+pub fn ran_task(project_id: &str) -> bool {
+    lock().live.get(project_id).is_some_and(|t| t.created)
+}
+
+/// A later start found the tunnel already up: it ran no task itself.
+pub fn mark_attached(project_id: &str) {
+    if let Some(t) = lock().live.get_mut(project_id) {
+        t.created = false;
+    }
+}
+
+/// Register a background follower for `project_id`, cancelling the one
+/// before it. Returns its id (for [`end_follow`]) and its token.
+pub fn begin_follow(project_id: &str) -> (u64, CancellationToken) {
+    let mut r = lock();
+    r.next_follower += 1;
+    let id = r.next_follower;
+    let token = CancellationToken::new();
+    if let Some((_, old)) = r.followers.insert(project_id.to_string(), (id, token.clone())) {
+        old.cancel();
+    }
+    (id, token)
+}
+
+/// A follower finished: forget it, unless a newer one has replaced it.
+pub fn end_follow(project_id: &str, id: u64) {
+    let mut r = lock();
+    if r.followers.get(project_id).is_some_and(|(i, _)| *i == id) {
+        r.followers.remove(project_id);
+    }
+}
+
+/// End the project's follower, if one runs (Stop, Remove).
+pub fn cancel_follow(project_id: &str) {
+    cancel_follow_locked(&mut lock(), project_id);
+}
+
+fn cancel_follow_locked(r: &mut Registry, project_id: &str) {
+    if let Some((_, t)) = r.followers.remove(project_id) {
+        t.cancel();
+    }
+}
+
+/// Whether a follower runs for the project.
+#[cfg(test)]
+pub fn is_following(project_id: &str) -> bool {
+    lock().followers.contains_key(project_id)
+}
+
 /// Under the lock: invalidate a re-attach in flight and take the tunnel out.
 fn take(r: &mut Registry, project_id: &str) -> Option<LiveTunnel> {
+    cancel_follow_locked(r, project_id);
     r.pending.remove(project_id);
     *r.generation.entry(project_id.to_string()).or_default() += 1;
     let t = r.live.remove(project_id);
@@ -239,11 +307,12 @@ pub fn end_reattach(project_id: &str, generation: u64) {
     notify();
 }
 
-/// Take the project's tunnel out and close it, and invalidate a background
-/// re-attach in flight.
+/// Take the project's tunnel out and close it (and its port mappings'
+/// forwards), and invalidate a background re-attach in flight.
 pub async fn close(project_id: &str) {
     let taken = take(&mut lock(), project_id);
     notify();
+    super::port_forwards::close(project_id).await;
     if let Some(t) = taken {
         t.forward.close().await;
     }
@@ -255,12 +324,16 @@ pub async fn close_all() {
         let mut r = lock();
         r.pending.clear();
         r.stopped.clear();
+        for (_, (_, t)) in r.followers.drain() {
+            t.cancel();
+        }
         for g in r.generation.values_mut() {
             *g += 1;
         }
         r.live.drain().map(|(_, t)| t).collect()
     };
     notify();
+    super::port_forwards::close_all().await;
     futures_util::future::join_all(all.into_iter().map(|t| t.forward.close())).await;
 }
 
@@ -334,6 +407,8 @@ pub(crate) mod tests {
             endpoint: AgentEndpoint::loopback(port, "tok"),
             access_point_id: Some("fsap-1".into()),
             task_definition_arn: "arn:td:1".into(),
+            workspace_access_point_id: None,
+            created: true,
         }
     }
 
@@ -357,6 +432,21 @@ pub(crate) mod tests {
         close(&p).await;
         assert_eq!(closes.load(Ordering::SeqCst), 1);
         assert!(get_endpoint(&p).is_none() && task_of(&ep).is_none());
+    }
+
+    #[tokio::test]
+    async fn closing_the_tunnel_ends_its_follower_and_an_attach_clears_created() {
+        let closes = Arc::new(AtomicUsize::new(0));
+        let p = pid("follow");
+        register(&p, fake_tunnel(61009, closes.clone()));
+        assert!(ran_task(&p));
+        mark_attached(&p);
+        assert!(!ran_task(&p));
+        let (_, token) = begin_follow(&p);
+        assert!(is_following(&p) && !token.is_cancelled());
+        close(&p).await;
+        assert!(token.is_cancelled());
+        assert!(!is_following(&p));
     }
 
     #[tokio::test]

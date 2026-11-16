@@ -417,6 +417,18 @@
           "markdownDescription": "Enables the aws_connection_sso_login command without any pre-configured scope."
         },
         {
+          "description": "Enables the aws_cost_estimate command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-aws-cost-estimate",
+          "markdownDescription": "Enables the aws_cost_estimate command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the aws_environment_max_hours command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-aws-environment-max-hours",
+          "markdownDescription": "Enables the aws_environment_max_hours command without any pre-configured scope."
+        },
+        {
           "description": "Enables the aws_policy_document command without any pre-configured scope.",
           "type": "string",
           "const": "allow-aws-policy-document",
@@ -433,6 +445,12 @@
           "type": "string",
           "const": "allow-aws-task-log",
           "markdownDescription": "Enables the aws_task_log command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the aws_workspace_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-aws-workspace-status",
+          "markdownDescription": "Enables the aws_workspace_status command without any pre-configured scope."
         },
         {
           "description": "Enables the build_gateway_image command without any pre-configured scope.",
@@ -1371,6 +1389,18 @@
           "markdownDescription": "Denies the aws_connection_sso_login command without any pre-configured scope."
         },
         {
+          "description": "Denies the aws_cost_estimate command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-aws-cost-estimate",
+          "markdownDescription": "Denies the aws_cost_estimate command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the aws_environment_max_hours command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-aws-environment-max-hours",
+          "markdownDescription": "Denies the aws_environment_max_hours command without any pre-configured scope."
+        },
+        {
           "description": "Denies the aws_policy_document command without any pre-configured scope.",
           "type": "string",
           "const": "deny-aws-policy-document",
@@ -1387,6 +1417,12 @@
           "type": "string",
           "const": "deny-aws-task-log",
           "markdownDescription": "Denies the aws_task_log command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the aws_workspace_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-aws-workspace-status",
+          "markdownDescription": "Denies the aws_workspace_status command without any pre-configured scope."
         },
         {
           "description": "Denies the build_gateway_image command without any pre-configured scope.",

@@ -15,7 +15,7 @@ use crate::models::host_connection::validate_supported_region;
 
 /// `locals.template_version` (and the `triple-c:template-version` default
 /// tag) of `aws/terraform/environment`.
-pub const ENVIRONMENT_MODULE_VERSION: u32 = 1;
+pub const ENVIRONMENT_MODULE_VERSION: u32 = 2;
 /// The same for the user-onboarding module.
 #[allow(dead_code)] // the onboarding module's version; checked against its HCL by a test
 pub const ONBOARD_MODULE_VERSION: u32 = 1;
@@ -202,6 +202,17 @@ pub fn access_point_root(owner_key: &str, project_id: &str) -> String {
     format!("/triple-c/{owner_key}/{}", project_component(project_id))
 }
 
+/// The root of the project's EFS-mode `/workspace` access point (Q1):
+/// `/triple-c-workspaces/<owner_key>/<project>`, a sibling tree of the home
+/// roots (under [`access_point_root`] it would sit inside the home access
+/// point). At most 100 characters.
+pub fn workspace_access_point_root(owner_key: &str, project_id: &str) -> String {
+    format!(
+        "/triple-c-workspaces/{owner_key}/{}",
+        project_component(project_id)
+    )
+}
+
 /// The container's `awslogs-stream-prefix`; ECS names the stream
 /// `<prefix>/workspace/<task id>`.
 pub fn log_stream_prefix(owner_key: &str, project_id: &str) -> String {
@@ -274,14 +285,23 @@ fn is_aws_id(id: &str, prefix: &str) -> bool {
     })
 }
 
+/// The longest lifetime cap an environment can carry, in hours (a week).
+pub const MAX_WORKSPACE_HOURS: u32 = 168;
+
 /// The environment module's `terraform.tfvars.json`. Applies the same rules
 /// as the module's variable validations, so a bad value fails here first.
 pub fn environment_vars(
     env: &str,
     region: &str,
     network: &NetworkChoice,
+    max_workspace_hours: u32,
 ) -> Result<serde_json::Value, String> {
     let env = validate_environment_name(env)?;
+    if max_workspace_hours > MAX_WORKSPACE_HOURS {
+        return Err(format!(
+            "The maximum workspace lifetime is at most {MAX_WORKSPACE_HOURS} hours (0 = no cap)"
+        ));
+    }
     let region = validate_supported_region(region)?;
     let (mode, vpc_id, subnet_ids, assign_public_ip) = match network {
         NetworkChoice::Public => ("public", String::new(), Vec::new(), false),
@@ -322,6 +342,7 @@ pub fn environment_vars(
         "vpc_id": vpc_id,
         "subnet_ids": subnet_ids,
         "assign_public_ip": assign_public_ip,
+        "max_workspace_hours": max_workspace_hours,
     }))
 }
 

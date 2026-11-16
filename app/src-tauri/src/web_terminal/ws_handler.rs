@@ -304,6 +304,10 @@ async fn handle_open(
         _ => build_terminal_cmd(&project, &state.settings_store),
     };
 
+    // AWS copy-at-connect: the credentials go into this terminal's own
+    // environment (never the agent's). Empty for everything else.
+    let env = crate::host::aws_host::terminal_env(&project, &state.settings_store.get()).await;
+
     let session_id = uuid::Uuid::new_v4().to_string();
     let project_name = project.name.clone();
 
@@ -332,6 +336,7 @@ async fn handle_open(
             &container,
             &session_id,
             cmd,
+            env,
             on_output,
             on_exit,
         )

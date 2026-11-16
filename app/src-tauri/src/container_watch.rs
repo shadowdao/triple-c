@@ -77,7 +77,7 @@ pub struct ContainerExited<'a> {
 /// Why an AWS task stopped, for the UI's toast.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StopNote {
-    /// `spot`, `idle`, `failed` (the project goes to Error), `user` (someone
+    /// `spot`, `idle`, `lifetime`, `failed` (the project goes to Error), `user` (someone
     /// stopped it: no toast) or `exited` (on its own).
     pub kind: &'static str,
     /// ECS's stopped reason, or a fixed text.
@@ -89,6 +89,7 @@ impl StopNote {
         let (kind, message) = match kind {
             StopKind::Spot => ("spot", Some("Spot interruption".to_string())),
             StopKind::Idle => ("idle", None),
+            StopKind::LifetimeCap => ("lifetime", None),
             StopKind::FailedToStart(r) => ("failed", Some(r.clone())),
             StopKind::UserInitiated => ("user", None),
             StopKind::Exited(r) => ("exited", r.clone()),
@@ -276,6 +277,7 @@ pub fn spawn(
                         None,
                         a.access_point_id.clone(),
                         a.task_definition_arn.clone(),
+                        a.workspace_access_point_id.clone(),
                     );
                 }
                 let id = p.id.clone();
@@ -331,6 +333,7 @@ mod tests {
         let cases = [
             (StopKind::Spot, "spot", Some("Spot interruption")),
             (StopKind::Idle, "idle", None),
+            (StopKind::LifetimeCap, "lifetime", None),
             (StopKind::FailedToStart("CannotPull".into()), "failed", Some("CannotPull")),
             (StopKind::UserInitiated, "user", None),
             (StopKind::Exited(Some("OOM".into())), "exited", Some("OOM")),

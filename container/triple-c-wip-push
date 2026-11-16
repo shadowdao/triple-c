@@ -1,11 +1,27 @@
 #!/bin/bash
-# triple-c-wip-push [--dry-run] [--reason idle|stop|sigterm]
+# triple-c-wip-push [--dry-run] [--reason idle|stop|sigterm|lifetime]
 #
 # Save unpushed work before an AWS workspace stops. For every git repository
 # directly under /workspace whose working tree is dirty or which holds commits
 # no remote has, push a snapshot of the *whole* working tree (tracked changes,
 # staged or not, and untracked files .gitignore does not exclude) to
-# refs/heads/triple-c/wip/<UTC yyyymmdd-HHMMSS> on the repo's remote.
+# refs/heads/triple-c/wip/<run-id>-<folder> on the repo's remote.
+#
+# One branch per task run and folder (phase 6, Q9; ruling R4 — two folders
+# can share a remote, so the folder is part of the name): <run-id> is the
+# entrypoint's /run/triple-c/run-id, `<UTC yyyymmdd-HHMMSS>-<task id, first 8
+# | local>`; <folder> is the folder name with everything outside
+# [A-Za-z0-9._-] made `_`, cut to 64 characters, or — when the ref still is
+# not valid (`git check-ref-format`: `..`, a `.lock` end, …) — the first 12
+# hex digits of the folder name's SHA-256.
+# Later pushes in the same run move that branch (a forced push — the branch is
+# Triple-C's alone, and each WIP commit sits on the user's HEAD, not on the
+# last WIP commit), and a push whose tree equals the one last pushed for that
+# folder in this run is skipped: the tree is recorded after each successful
+# push in /run/triple-c/wip-last/<folder> (made for `claude` by the
+# entrypoint). Without a usable run id (Docker, or a run that recorded none)
+# every push gets its own refs/heads/triple-c/wip/<UTC yyyymmdd-HHMMSS>-<folder>,
+# never forced.
 #
 # It never touches the user's index, HEAD, branches or working tree: the
 # snapshot is built in a temporary index (GIT_INDEX_FILE) seeded from a copy of
@@ -32,12 +48,15 @@
 # any failed, 2 on bad usage.
 #
 # TRIPLEC_WORKSPACE_ROOT overrides /workspace, TRIPLEC_CLONE_STATUS_DIR
-# /run/triple-c-clone (tests).
+# /run/triple-c-clone, TRIPLEC_RUN_ID_FILE /run/triple-c/run-id and
+# TRIPLEC_WIP_LAST_DIR /run/triple-c/wip-last (tests).
 
 set -u
 
 root="${TRIPLEC_WORKSPACE_ROOT:-/workspace}"
 clone_dir="${TRIPLEC_CLONE_STATUS_DIR:-/run/triple-c-clone}"
+run_id_file="${TRIPLEC_RUN_ID_FILE:-/run/triple-c/run-id}"
+last_dir="${TRIPLEC_WIP_LAST_DIR:-/run/triple-c/wip-last}"
 dry_run=0
 reason=stop
 
@@ -46,10 +65,10 @@ while [ $# -gt 0 ]; do
         --dry-run) dry_run=1; shift ;;
         --reason)
             case "${2:-}" in
-                idle|stop|sigterm) reason="$2"; shift 2 ;;
-                *) echo "triple-c-wip-push: --reason must be idle, stop or sigterm" >&2; exit 2 ;;
+                idle|stop|sigterm|lifetime) reason="$2"; shift 2 ;;
+                *) echo "triple-c-wip-push: --reason must be idle, stop, sigterm or lifetime" >&2; exit 2 ;;
             esac ;;
-        *) echo "usage: triple-c-wip-push [--dry-run] [--reason idle|stop|sigterm]" >&2; exit 2 ;;
+        *) echo "usage: triple-c-wip-push [--dry-run] [--reason idle|stop|sigterm|lifetime]" >&2; exit 2 ;;
     esac
 done
 
@@ -59,6 +78,32 @@ shopt -s dotglob nullglob
 
 stamp=$(date -u +%Y%m%d-%H%M%S)
 failed=0
+
+# This run's id, when the entrypoint recorded a well-formed one; the per-push
+# stamp otherwise. Only our own per-run branches are ever force-pushed.
+run_id=$(head -n 1 "$run_id_file" 2>/dev/null)
+if [[ "$run_id" =~ ^[0-9]{8}-[0-9]{6}-[A-Za-z0-9]{1,32}$ ]]; then
+    ref_base="refs/heads/triple-c/wip/$run_id"
+    force=+
+else
+    ref_base="refs/heads/triple-c/wip/$stamp"
+    force=
+fi
+
+# The WIP ref for folder $1: <base>-<folder>; <base>-<sanitised folder>-<hash>
+# when the name had to change; or <base>-<hash> when no ref can carry it.
+wip_ref() {
+    local safe r
+    safe=$(printf '%s' "$1" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_' | cut -c 1-64)
+    r="$ref_base-$safe"
+    # Sanitising (or the cut) changed the name: add a hash of the raw name,
+    # so `a b` and `a_b` never share a branch.
+    [ "$safe" = "$1" ] || r="$r-$(printf '%s' "$1" | sha256sum | cut -c 1-8)"
+    if [ -z "$safe" ] || ! git check-ref-format "$r"; then
+        r="$ref_base-$(printf '%s' "$1" | sha256sum | cut -c 1-12)"
+    fi
+    printf '%s' "$r"
+}
 
 # The remote to push to: the branch's upstream remote, else origin, else the
 # only remote. Empty when there is none.
@@ -83,6 +128,8 @@ user_ssh_command="${GIT_SSH_COMMAND:-}"
 for dir in "$root"/*/; do
     dir="${dir%/}"
     [ -d "$dir" ] || continue
+    # clone_repos' scratch (entrypoint.sh): half-made clones, never the user's.
+    [ "$(basename "$dir")" = .triple-c-clone ] && continue
     # A repository rooted exactly here. A symlinked folder resolves elsewhere
     # and is skipped: it is not the workspace's own.
     top=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || continue
@@ -140,6 +187,7 @@ for dir in "$root"/*/; do
         fi
 
         commit="$head"
+        tree=""
         if [ "$dirty" = true ]; then
             tmp_index=$(mktemp) || exit 1
             trap 'rm -f "$tmp_index"' EXIT
@@ -157,16 +205,29 @@ for dir in "$root"/*/; do
             git config user.email >/dev/null 2>&1 || export GIT_AUTHOR_EMAIL=triple-c@localhost GIT_COMMITTER_EMAIL=triple-c@localhost
             git add -A . >/dev/null 2>&1 || { echo "triple-c-wip-push: $folder: could not stage the working tree" >&2; exit 1; }
             tree=$(git write-tree) || exit 1
+            unset GIT_INDEX_FILE
+        else
+            tree=$(git rev-parse -q --verify "$head^{tree}") || exit 1
+        fi
+
+        # Pushed already in this run, unchanged since: nothing new to save.
+        last_file="$last_dir/$folder"
+        if [ -n "$tree" ] && [ -f "$last_file" ] \
+            && [ "$(head -n 1 "$last_file" 2>/dev/null)" = "$tree $remote" ]; then
+            echo "triple-c-wip-push: $folder: unchanged since the last push of this run — skipped"
+            exit 0
+        fi
+
+        ref=$(wip_ref "$folder")
+        if [ "$dirty" = true ]; then
             msg="Triple-C WIP ($reason) of $branch at $stamp UTC"
             if [ -n "$head" ]; then
                 commit=$(git commit-tree "$tree" -p "$head" -m "$msg") || exit 1
             else
                 commit=$(git commit-tree "$tree" -m "$msg") || exit 1
             fi
-            unset GIT_INDEX_FILE
         fi
 
-        ref="refs/heads/triple-c/wip/$stamp"
         # --no-verify skips every pre-push hook, Git LFS's upload among them.
         # So when git-lfs is here and the snapshot has LFS files, upload their
         # objects first — best effort: the push still goes, with a warning.
@@ -178,8 +239,16 @@ for dir in "$root"/*/; do
                 echo "triple-c-wip-push: $folder: warning — LFS upload failed, large files may be missing on the branch: $(printf '%s' "$lfs_err" | tail -n 1)" >&2
             fi
         fi
-        if err=$(git push --no-verify -q "$remote" "$commit:$ref" 2>&1); then
+        if err=$(git push --no-verify -q "$remote" "$force$commit:$ref" 2>&1); then
             echo "triple-c-wip-push: $folder: pushed to $remote $ref"
+            # Remember what this run pushed (best effort: without it the next
+            # push just pushes again). Only where the entrypoint made the dir.
+            if [ -d "$last_dir" ] && [ -w "$last_dir" ]; then
+                tmp_last=$(mktemp "$last_dir/.tmp.XXXXXX" 2>/dev/null) \
+                    && printf '%s %s\n' "$tree" "$remote" > "$tmp_last" \
+                    && mv -f "$tmp_last" "$last_file" \
+                    || rm -f "${tmp_last:-}"
+            fi
         else
             echo "triple-c-wip-push: $folder: push to $remote failed: $(printf '%s' "$err" | tail -n 1)" >&2
             exit 1

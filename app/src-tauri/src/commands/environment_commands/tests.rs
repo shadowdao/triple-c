@@ -32,6 +32,7 @@ fn info(name: &str, mode: &str, assign_public_ip: bool) -> EnvironmentInfo {
         log_group: format!("/triple-c/{name}"),
         network_mode: mode.into(),
         tenancy: "strict".into(),
+        max_workspace_hours: 0,
     }
 }
 
@@ -165,6 +166,7 @@ fn update_reuses_the_recorded_network() {
         "dev",
         REGION,
         &network_from_record(&existing, Some("vpc-0123456789abcdef0")).unwrap(),
+        0,
     )
     .unwrap();
     assert_eq!(vars["network_mode"], "existing");
@@ -266,7 +268,7 @@ fn bundles_contain_the_module_backend_vars_and_readme() {
 #[test]
 fn a_us_east_1_bundle_creates_its_bucket_without_a_location_constraint() {
     let dir = tempfile::tempdir().unwrap();
-    let vars = environment_vars("dev", "us-east-1", &NetworkChoice::Public).unwrap();
+    let vars = environment_vars("dev", "us-east-1", &NetworkChoice::Public, 0).unwrap();
     write_bundle(dir.path(), Deployment::Environment("dev"), ACCOUNT, "us-east-1", &vars).unwrap();
     let readme = fs::read_to_string(dir.path().join("README.txt")).unwrap();
     assert!(readme.contains("aws s3api create-bucket"), "{readme}");

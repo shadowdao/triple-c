@@ -1,0 +1,84 @@
+#!/usr/bin/python3 -I
+# triple-c-workspace-status
+#
+# An AWS workspace's start-up progress as one JSON object on one line, for the
+# app's start command and Project Home (phase 6, Q4):
+#
+#   {"clone": {"done": bool, "repos": [{"folder": str, "state": str}, ...]},
+#    "setup": {"state": "none"|"running"|"ok"|"failed",
+#              "code": int|null, "tail": [the setup log's last 20 lines]}}
+#
+# Read from what entrypoint.sh writes (root-owned, world-readable, so this
+# works as `claude` and as root):
+#   /run/triple-c-clone   `repos` ("<folder>\t<state>" lines; a folder's last
+#                         line is its state: cloning, cloned, failed, exists)
+#                         and `done`. No directory yet: the clone has not
+#                         started (done: false).
+#   /run/triple-c-setup   `status` (`running`, `ok`, `failed <code>`; absent:
+#                         no setup script) and `log`.
+# A missing or unreadable file is reported as its empty state, never an
+# error; a status line it does not know is a failure without a code. Nothing
+# else is read: no environment, no secrets — the tail is the setup script's
+# own output and nothing more.
+#
+# TRIPLEC_CLONE_STATUS_DIR and TRIPLEC_SETUP_STATUS_DIR override the two
+# directories (tests).
+
+import json
+import os
+import sys
+
+TAIL_LINES = 20
+# Enough for 20 long lines; the log can be large and only its end matters.
+TAIL_BYTES = 64 * 1024
+MAX_LINE = 1000
+
+clone_dir = os.environ.get("TRIPLEC_CLONE_STATUS_DIR") or "/run/triple-c-clone"
+setup_dir = os.environ.get("TRIPLEC_SETUP_STATUS_DIR") or "/run/triple-c-setup"
+
+
+def read_text(path, limit=None):
+    """The file's text (its last `limit` bytes when given), or None."""
+    try:
+        with open(path, "rb") as f:
+            if limit is not None:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - limit))
+            data = f.read() if limit is not None else f.read(1024 * 1024)
+    except (OSError, ValueError):
+        return None
+    return data.decode("utf-8", errors="replace")
+
+
+def clone_status():
+    done = os.path.exists(os.path.join(clone_dir, "done"))
+    states = {}
+    for line in (read_text(os.path.join(clone_dir, "repos")) or "").splitlines():
+        folder, sep, state = line.partition("\t")
+        if sep and folder:
+            states[folder] = state  # dicts keep first-seen order
+    return {"done": done, "repos": [{"folder": f, "state": s} for f, s in states.items()]}
+
+
+def setup_status():
+    raw = read_text(os.path.join(setup_dir, "status"))
+    if raw is None:
+        state, code = "none", None
+    else:
+        word, _, rest = raw.strip().partition(" ")
+        if word == "running" and not rest:
+            state, code = "running", None
+        elif word == "ok" and not rest:
+            state, code = "ok", 0
+        else:
+            state = "failed"
+            code = int(rest) if word == "failed" and rest.strip().isdigit() else None
+    log = read_text(os.path.join(setup_dir, "log"), TAIL_BYTES) or ""
+    tail = [l[:MAX_LINE] for l in log.splitlines()[-TAIL_LINES:]]
+    return {"state": state, "code": code, "tail": tail}
+
+
+json.dump({"clone": clone_status(), "setup": setup_status()}, sys.stdout, ensure_ascii=False,
+          separators=(",", ":"))
+sys.stdout.write("\n")

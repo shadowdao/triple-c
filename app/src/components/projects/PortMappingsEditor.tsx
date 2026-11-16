@@ -7,6 +7,8 @@ interface Props {
   portMappings: PortMapping[];
   disabled: boolean;
   disabledReason?: string;
+  /** AWS: only TCP is forwarded (UDP is refused on save). */
+  tcpOnly?: boolean;
   onSave: (mappings: PortMapping[]) => Promise<unknown>;
 }
 
@@ -14,6 +16,7 @@ export default function PortMappingsEditor({
   portMappings: initial,
   disabled,
   disabledReason,
+  tcpOnly = false,
   onSave,
 }: Props) {
   const [mappings, setMappings] = useState<PortMapping[]>(initial);
@@ -93,7 +96,7 @@ export default function PortMappingsEditor({
             className={`w-[22%] ${selectClass}`}
           >
             <option value="tcp">TCP</option>
-            <option value="udp">UDP</option>
+            {(!tcpOnly || pm.protocol === "udp") && <option value="udp">UDP</option>}
           </select>
           <Button
             variant="danger"

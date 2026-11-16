@@ -2,15 +2,18 @@
 //! sign-in and the permission check.
 
 use std::future::Future;
+use std::sync::OnceLock;
+use std::time::SystemTime;
 
 use tauri::State;
 
 use crate::aws::permissions::{check_permissions, PermissionReport, SdkPermissionApi};
 use crate::aws::policies::{policy_files, Tier};
+use crate::aws::pricing::{self, HourlyEstimate, RatesCache, SdkPricingApi};
 use crate::aws::{caller_identity, sdk_config, sdk_config_for_keys, AwsError, CallerIdentity};
 use crate::models::{
     validate_connection_name, validate_profile_name, validate_supported_region, AppSettings, AwsAuth,
-    HostConnection, HostKind,
+    AwsWorkspaceConfig, HostConnection, HostKind,
 };
 use crate::storage::secure::{self, AwsKeys};
 use crate::storage::settings_store::SettingsStore;
@@ -301,6 +304,65 @@ pub fn aws_policy_document(tier: Tier) -> Vec<PolicyFile> {
         .collect()
 }
 
+/// The cost estimate's rate cache, `<data dir>/triple-c/aws-pricing/`, shared
+/// by every call (it also remembers recent failures). `None` without a data
+/// folder.
+fn pricing_cache() -> Option<&'static RatesCache> {
+    static CACHE: OnceLock<Option<RatesCache>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| pricing::default_cache_dir().map(RatesCache::new))
+        .as_ref()
+}
+
+/// The estimated on-demand hourly cost of `config` as a Fargate task in
+/// `region` (Q5). It takes the config rather than a project id because
+/// Project Home's Host settings ask while the user edits, and the Overview
+/// asks for the saved one; `connection_id` is the project's connection, whose
+/// credentials sign the Price List call (made in us-east-1). **Never an
+/// error:** a bad region, a missing connection, a denied or slow call (8 s
+/// bound) or an unreadable price list is `None`, shown as "Estimate
+/// unavailable". Rates are cached a day per region.
+#[tauri::command]
+pub async fn aws_cost_estimate(
+    connection_id: String,
+    region: String,
+    config: AwsWorkspaceConfig,
+    state: State<'_, AppState>,
+) -> Result<Option<HourlyEstimate>, String> {
+    let Some(cache) = pricing_cache() else {
+        return Ok(None);
+    };
+    let settings = state.settings_store.get();
+    Ok(cost_estimate(cache, &connection_id, &region, &config, &settings, SystemTime::now()).await)
+}
+
+async fn cost_estimate(
+    cache: &RatesCache,
+    connection_id: &str,
+    region: &str,
+    config: &AwsWorkspaceConfig,
+    settings: &AppSettings,
+    now: SystemTime,
+) -> Option<HourlyEstimate> {
+    let region = validate_supported_region(region).ok()?;
+    let rates = match cache.read(&region, now) {
+        Some((rates, true)) => Some(rates),
+        _ => {
+            // Only now touch the connection (a keys connection reads the
+            // keychain); without one, a stale cache still answers.
+            // Built inside the fetch's 8 s bound: reading a profile's
+            // credentials can hang as well (an SSO or process provider).
+            let api = async {
+                let conn = aws_conn(connection_id, settings).ok()?;
+                let cfg = sdk_config(&conn, pricing::PRICING_REGION).await.ok()?;
+                Some(SdkPricingApi::new(&cfg))
+            };
+            cache.rates_with::<SdkPricingApi, _>(api, &region, now).await
+        }
+    }?;
+    Some(pricing::estimate(config, &rates.for_arch(config.arch)?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,5 +618,60 @@ mod tests {
             serde_json::to_value(&ws[0]).unwrap()["name"],
             "workspace-user.json"
         );
+    }
+
+    fn sample_rates() -> pricing::RegionRates {
+        let x86 = pricing::FargateRates {
+            vcpu_hour: 0.04,
+            gb_hour: 0.004,
+            storage_gb_hour: 0.0001,
+        };
+        pricing::RegionRates {
+            x86_64: Some(x86),
+            arm64: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_cost_estimate_answers_from_a_fresh_cache_without_a_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = RatesCache::new(dir.path().to_path_buf());
+        let now = SystemTime::now();
+        cache.write("us-west-2", &sample_rates(), now).unwrap();
+        let settings = AppSettings::default();
+        let config = AwsWorkspaceConfig {
+            cpu: 1024,
+            memory_mib: 2048,
+            ephemeral_gib: 20,
+            spot: true,
+            ..Default::default()
+        };
+        let e = cost_estimate(&cache, "gone", "us-west-2", &config, &settings, now)
+            .await
+            .expect("estimate");
+        assert!((e.usd_per_hour - (0.04 + 2.0 * 0.004)).abs() < 1e-9);
+        assert!(e.note_spot && e.efs_billed_separately);
+        // An architecture the price list lacked has no estimate.
+        let arm = AwsWorkspaceConfig {
+            arch: crate::models::Arch::Arm64,
+            ..config.clone()
+        };
+        assert_eq!(cost_estimate(&cache, "gone", "us-west-2", &arm, &settings, now).await, None);
+    }
+
+    #[tokio::test]
+    async fn the_cost_estimate_is_none_never_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = RatesCache::new(dir.path().to_path_buf());
+        let settings = AppSettings::default();
+        let config = AwsWorkspaceConfig::default();
+        let now = SystemTime::now();
+        // No cache and no such connection.
+        assert_eq!(cost_estimate(&cache, "gone", "us-west-2", &config, &settings, now).await, None);
+        // A region that isn't one (it would name the cache file).
+        cache.write("us-west-2", &sample_rates(), now).unwrap();
+        for bad in ["../us-west-2", "", "us-west-2/x"] {
+            assert_eq!(cost_estimate(&cache, "gone", bad, &config, &settings, now).await, None);
+        }
     }
 }

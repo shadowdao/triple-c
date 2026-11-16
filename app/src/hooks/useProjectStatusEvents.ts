@@ -19,7 +19,7 @@ export interface ContainerExitedEvent {
 /** `container_watch.rs`'s `StopNote`. */
 export interface StopNote {
   /** `user`: someone stopped it (console, CLI, another machine) — no toast. */
-  kind: "spot" | "idle" | "failed" | "user" | "exited";
+  kind: "spot" | "idle" | "lifetime" | "failed" | "user" | "exited";
   message: string | null;
 }
 
@@ -51,6 +51,14 @@ export function exitToast(
         kind: "info",
         message: `“${name}” stopped after being idle`,
         detail: "Its AWS workspace stopped itself to save cost. Start the project again to continue.",
+      };
+    case "lifetime":
+      return {
+        kind: "info",
+        message: `“${name}” stopped: the environment's maximum workspace lifetime was reached`,
+        detail:
+          "Its AWS environment caps how long a workspace runs. With the WIP push on, unsaved work " +
+          "was pushed (best effort) to a triple-c/wip/ branch. Start the project again to continue.",
       };
     default:
       return {

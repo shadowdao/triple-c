@@ -55,7 +55,7 @@ describe("DeployEnvironmentModal", () => {
     fireEvent.click(screen.getByRole("radio", { name: "Public" }));
     expect(screen.getByLabelText("Name")).toHaveValue("main");
     fireEvent.click(screen.getByRole("button", { name: "Deploy" }));
-    expect(props.onDeploy).toHaveBeenCalledWith("main", { mode: "public" });
+    expect(props.onDeploy).toHaveBeenCalledWith("main", { mode: "public" }, 0);
     await waitFor(() => expect(props.onClose).toHaveBeenCalled());
   });
 
@@ -71,7 +71,7 @@ describe("DeployEnvironmentModal", () => {
     fireEvent.change(screen.getByLabelText("Name"), { target: { value: "team-2" } });
     expect(deploy).toBeEnabled();
     fireEvent.click(deploy);
-    expect(props.onDeploy).toHaveBeenCalledWith("team-2", { mode: "public" });
+    expect(props.onDeploy).toHaveBeenCalledWith("team-2", { mode: "public" }, 0);
     await waitFor(() => expect(props.onClose).toHaveBeenCalled());
   });
 
@@ -92,7 +92,24 @@ describe("DeployEnvironmentModal", () => {
       vpc_id: "vpc-0123abcd",
       subnet_ids: ["subnet-0123abcd", "subnet-4567abcd"],
       assign_public_ip: true,
-    });
+    }, 0);
+    await waitFor(() => expect(props.onClose).toHaveBeenCalled());
+  });
+
+  it("carries the maximum workspace lifetime and refuses more than a week", async () => {
+    const props = renderModal();
+    const cap = screen.getByLabelText("Maximum workspace lifetime (hours, 0 = none)");
+    expect(cap).toHaveValue("0");
+    const deploy = screen.getByRole("button", { name: "Deploy" });
+    for (const bad of ["169", "-1", "1.5", "", "abc"]) {
+      fireEvent.change(cap, { target: { value: bad } });
+      expect(deploy).toBeDisabled();
+    }
+    fireEvent.change(cap, { target: { value: "168" } });
+    expect(deploy).toBeEnabled();
+    fireEvent.change(cap, { target: { value: "12" } });
+    fireEvent.click(deploy);
+    expect(props.onDeploy).toHaveBeenCalledWith("main", { mode: "public" }, 12);
     await waitFor(() => expect(props.onClose).toHaveBeenCalled());
   });
 
@@ -177,7 +194,7 @@ describe("DeployEnvironmentModal", () => {
     expect(screen.getByText(/different network than the one it was deployed with replaces/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("radio", { name: "Private + NAT" }));
     fireEvent.click(screen.getByRole("button", { name: "Repair" }));
-    expect(props.onDeploy).toHaveBeenCalledWith("dev", { mode: "private-nat" });
+    expect(props.onDeploy).toHaveBeenCalledWith("dev", { mode: "private-nat" }, 0);
     await waitFor(() => expect(props.onClose).toHaveBeenCalled());
   });
 });

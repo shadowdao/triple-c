@@ -7,6 +7,7 @@ import Field, { inputClass } from "../../ui/Field";
 import Modal from "../../ui/Modal";
 import AdminBundleModal from "./AdminBundleModal";
 import DeployProgress, { runKey, useDeployRuns } from "./DeployProgress";
+import LifetimeCapField, { parseCapHours } from "./LifetimeCapField";
 import NetworkFields from "./NetworkFields";
 import {
   BOUNDARY_STATE_KEY,
@@ -37,11 +38,12 @@ export default function DeployEnvironmentModal({
   repair?: string;
   onClose: () => void;
   /** Starts the run; resolves to the command's error, or null once started. */
-  onDeploy: (name: string, network: NetworkChoice) => Promise<AwsError | null>;
+  onDeploy: (name: string, network: NetworkChoice, maxWorkspaceHours: number) => Promise<AwsError | null>;
   onDetect: () => void;
 }) {
   const [name, setName] = useState("main");
   const [draft, setDraft] = useState<NetworkDraft>(DEFAULT_NETWORK);
+  const [capText, setCapText] = useState("0");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<AwsError | null>(null);
   const [boundaryDone, setBoundaryDone] = useState(false);
@@ -73,7 +75,8 @@ export default function DeployEnvironmentModal({
     : environmentNameError(name) ??
       (scan.environments.some((e) => e.name === name) ? `An environment named ${name} already exists here.` : null);
   const picked = networkFromDraft(draft);
-  const ready = !nameError && "network" in picked && !submitting;
+  const capHours = parseCapHours(capText);
+  const ready = !nameError && "network" in picked && capHours !== null && !submitting;
 
   const createBoundary = async () => {
     setBoundaryError(null);
@@ -85,10 +88,10 @@ export default function DeployEnvironmentModal({
   };
 
   const submit = async () => {
-    if (!("network" in picked)) return;
+    if (!("network" in picked) || capHours === null) return;
     setSubmitting(true);
     setError(null);
-    const err = await onDeploy(target, picked.network);
+    const err = await onDeploy(target, picked.network, capHours);
     setSubmitting(false);
     if (err) setError(err);
     else onClose();
@@ -171,6 +174,7 @@ export default function DeployEnvironmentModal({
             </Field>
           )}
           <NetworkFields value={draft} onChange={setDraft} error={"error" in picked ? picked.error : null} />
+          <LifetimeCapField value={capText} onChange={setCapText} />
           <p className="text-xs text-[var(--text-secondary)] leading-snug">
             First deploy downloads OpenTofu (~30 MB) and the AWS provider (~150 MB).
           </p>

@@ -41,6 +41,7 @@ fn env_info() -> EnvironmentInfo {
         log_group: "/triple-c/dev".into(),
         network_mode: "public".into(),
         tenancy: "strict".into(),
+        max_workspace_hours: 0,
     }
 }
 
@@ -651,6 +652,11 @@ fn classify_stop_follows_the_spec_table() {
     // The entrypoint's idle stop exits with its own status.
     let idle = TaskInfo { exit_code: Some(IDLE_EXIT_CODE), ..with(Some("EssentialContainerExited"), None) };
     assert_eq!(classify_stop(&idle), StopKind::Idle);
+    // So does its lifetime-cap stop.
+    let capped = TaskInfo { exit_code: Some(LIFETIME_EXIT_CODE), ..with(Some("EssentialContainerExited"), None) };
+    assert_eq!(classify_stop(&capped), StopKind::LifetimeCap);
+    let user_capped = TaskInfo { exit_code: Some(LIFETIME_EXIT_CODE), ..with(Some("UserInitiated"), None) };
+    assert_eq!(classify_stop(&user_capped), StopKind::UserInitiated);
     let crashed = TaskInfo { exit_code: Some(137), ..with(Some("EssentialContainerExited"), None) };
     assert_eq!(classify_stop(&crashed), StopKind::Exited(None));
     // Only with that stop code: a user stop of a task that exits 75 is a user stop.

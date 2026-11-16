@@ -5,7 +5,7 @@ use aws_sdk_ecs::operation::run_task::RunTaskInput;
 
 use super::*;
 use crate::aws::tasks::TaskInfo;
-use crate::aws::tofu_modules::owner_key;
+use crate::aws::tofu_modules::{owner_key, workspace_access_point_root};
 use crate::aws::workspace::{AccessPointRef, FileSystemRef, TaskDefinitionRef};
 
 const REGION: &str = "eu-west-1";
@@ -110,6 +110,22 @@ impl WorkspaceApi for Fake {
         _root: &str,
         _tags: &[(String, String)],
     ) -> Result<String, AwsError> {
+        unreachable!()
+    }
+    async fn project_secret_value(&self, _n: &str) -> Result<Option<String>, AwsError> {
+        unreachable!()
+    }
+    async fn create_project_secret(
+        &self,
+        n: &str,
+        k: &str,
+        j: &str,
+        t: &[(String, String)],
+    ) -> Result<Option<String>, AwsError> {
+        let _ = (n, k, j, t);
+        unreachable!()
+    }
+    async fn delete_project_secret(&self, _n: &str) -> Result<(), AwsError> {
         unreachable!()
     }
     async fn put_project_secret(
@@ -288,6 +304,7 @@ async fn removal_stops_the_task_leaves_the_revisions_and_schedules_the_secret() 
         project_id: PROJECT,
         stored_task_arn: Some(&t0),
         stored_access_point_id: Some("fsap-stored"),
+        stored_workspace_access_point_id: None,
         discard_data: false,
     };
     remove_workspace_resources(&fake, &fake, &fake, &r).await.unwrap();
@@ -323,9 +340,65 @@ async fn a_failed_step_is_reported_but_the_rest_still_runs() {
         project_id: PROJECT,
         stored_task_arn: None,
         stored_access_point_id: Some("fsap-1"),
+        stored_workspace_access_point_id: None,
         discard_data: true,
     };
     let e = remove_workspace_resources(&fake, &fake, &fake, &r).await.unwrap_err();
     assert!(e.to_string().contains("secret"), "{e}");
     assert!(fake.calls().contains(&"delete-ap fsap-1".to_string()));
+}
+
+#[tokio::test]
+async fn removal_with_discard_deletes_both_access_points_and_without_keeps_both() {
+    let ap = |id: &str, root: String| AccessPointRef {
+        id: id.into(),
+        file_system_id: "fs-1".into(),
+        root_path: Some(root),
+        owner: Some(USER.into()),
+        project: Some(PROJECT.into()),
+        state: Some("available".into()),
+    };
+    let points = vec![
+        ap("fsap-home", access_point_root(&ok(), PROJECT)),
+        ap("fsap-ws", workspace_access_point_root(&ok(), PROJECT)),
+        AccessPointRef {
+            owner: Some("AROAOTHER:mallory".into()),
+            ..ap("fsap-foreign", workspace_access_point_root(&ok(), PROJECT))
+        },
+        AccessPointRef {
+            project: Some("another".into()),
+            ..ap("fsap-other-project", workspace_access_point_root(&ok(), PROJECT))
+        },
+    ];
+    let key = ok();
+    let mut r = RemoveRequest {
+        env: "dev",
+        region: REGION,
+        owner_user_id: USER,
+        owner_key: &key,
+        project_id: PROJECT,
+        stored_task_arn: None,
+        stored_access_point_id: Some("fsap-home"),
+        // Kept in the store after switching EFS -> Hybrid.
+        stored_workspace_access_point_id: Some("fsap-ws-stored"),
+        discard_data: false,
+    };
+    let keep = Fake { access_points: points.clone(), ..Default::default() };
+    remove_workspace_resources(&keep, &keep, &keep, &r).await.unwrap();
+    assert!(
+        keep.calls().iter().all(|c| !c.starts_with("delete-ap")),
+        "{:?}",
+        keep.calls()
+    );
+
+    r.discard_data = true;
+    let discard = Fake { access_points: points, ..Default::default() };
+    remove_workspace_resources(&discard, &discard, &discard, &r).await.unwrap();
+    let mut deleted: Vec<String> = discard
+        .calls()
+        .into_iter()
+        .filter_map(|c| c.strip_prefix("delete-ap ").map(String::from))
+        .collect();
+    deleted.sort();
+    assert_eq!(deleted, vec!["fsap-home", "fsap-ws", "fsap-ws-stored"]);
 }

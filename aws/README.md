@@ -7,7 +7,7 @@ tier the signed-in identity has under **Settings → Hosts → Check**.
 | File | What it is |
 |---|---|
 | `policies/workspace-user.json` | The **workspace user** tier, part 1: create, start, stop, connect to and delete **their own** workspaces in an existing environment |
-| `policies/workspace-user-tasks.json` | The **workspace user** tier, part 2: register and tag **their own** ECS task definitions, and read **their own** secrets (`workspace-user.json` has no room left) |
+| `policies/workspace-user-tasks.json` | The **workspace user** tier, part 2: register and tag **their own** ECS task definitions, read **their own** secrets, and read Fargate prices for the cost estimate (`workspace-user.json` has no room left) |
 | `policies/environment-admin.json` | The **environment admin** tier, part 1: apply and destroy the environment and onboarding modules (`terraform/`) with OpenTofu, and keep their state |
 | `policies/environment-admin-network.json` | The **environment admin** tier, part 2: the network those modules create (VPC, subnets, gateways, routes, security groups) |
 | `policies/permissions-boundary.json` | The **permissions boundary** every Triple-C role must carry. It is never attached to a person |
@@ -117,6 +117,12 @@ following:
   roles, add those roles' ARNs or path prefixes (for example `arn:aws:iam::*:role/engineers/*`)
   to `InspectOwnPrincipal` in both tier policies. Everything matched there can be read and
   simulated by every holder of the policy, so keep it to the sign-in roles.
+- **Read Fargate prices** (`workspace-user-tasks.json`, `ReadFargatePrices`). `pricing:GetProducts`
+  on `*`: the Price List API has no resource types or condition keys, and prices are public. The
+  app asks it (in us-east-1, service `AmazonECS`) for the workspace region's on-demand Fargate
+  vCPU, memory and ephemeral-storage rates, caches them for a day and shows an estimated hourly
+  cost in the project's Host settings and Overview. Without this permission the estimate reads
+  "Estimate unavailable"; nothing else depends on it.
 - **Read environment information.** This covers ECS, the `/triple-c/*` SSM parameters (the
   environment records), the secret list, EFS, and the `/triple-c/*` log groups. Listing is not a
   secret; the app filters by owner for display. A workspace user sees only environments that have
@@ -283,8 +289,17 @@ it is unpacked), and an admin can run the very same files by hand from a bundle.
 | Module | Creates | State key |
 |---|---|---|
 | `terraform/permissions-boundary` | the account's `triple-c-permissions-boundary` policy (an account administrator applies it; the admin tier cannot) | `boundary/terraform.tfstate` |
-| `terraform/environment` | what every user shares: ECS cluster (Fargate, Fargate Spot), the tasks security group (no inbound rules), KMS key and alias, log group `/triple-c/<env>`, the network (`network_mode`: `public`, `private-nat`, `existing`) and, last, the record `/triple-c/environments/<env>` | `environments/<env>/terraform.tfstate` |
+| `terraform/environment` | what every user shares: ECS cluster (Fargate, Fargate Spot), the tasks security group (no inbound rules), KMS key and alias, log group `/triple-c/<env>`, the network (`network_mode`: `public`, `private-nat`, `existing`) and, last, the record `/triple-c/environments/<env>` (which carries the advisory `max_workspace_hours` lifetime cap, 0 = none, at most 168) | `environments/<env>/terraform.tfstate` |
 | `terraform/user-onboard` | one user's task and execution roles (with the boundary) and their own EFS file system, its `-efs` security group, two mount targets and a file-system policy that admits only their task role | `users/<env>/<owner key>/terraform.tfstate` |
+
+**Workspace lifetime cap (advisory).** `max_workspace_hours` (module variable, 0 to 168, default 0 =
+no cap) is stored in the environment record and passed to every workspace as
+`TRIPLEC_MAX_LIFETIME_MINUTES`; the workspace's idle watcher then pushes work in progress (best
+effort, 90 s) and stops the task, which ECS reports as exit code 76. It is **not a security
+control**: a workspace user has sudo inside their own task and can switch the watcher off. To
+enforce a limit, stop old tasks from outside (for example a scheduled Lambda; not built). Changing
+the cap is a module update (template version 2), so environments deployed before it show "Update
+available" in the app.
 
 The **owner key** is the first 12 hex characters of `sha256("<region>:<aws:userid>")`; it names
 the user's roles, `triple-c-<env>-<owner key>-task` and `-exec` (a `UserId` holds a `:`, which
@@ -394,10 +409,10 @@ Create each file as a **customer managed policy** and attach it. In the console,
 **IAM → Policies → Create policy → JSON**, paste the file, and attach the policy to a user, group
 or role. Inline policies do not fit: a role's inline policies share 10,240 characters and an
 environment admin needs every tier file (about 16,400), and a user's share 2,048. A managed policy
-may hold 6,144 characters, not counting whitespace. Without whitespace, `workspace-user.json` is
-about 6,040 (roughly 100 characters of headroom), `workspace-user-tasks.json` about 1,200,
-`environment-admin.json` about 5,800 (340)
-and `environment-admin-network.json` about 3,340; a unit test (`every_policy_fits_a_managed_policy`)
+may hold 6,144 characters, not counting whitespace. Measured 2026-11-16 without whitespace, `workspace-user.json` is
+6,036 (108 characters of headroom), `workspace-user-tasks.json` 1,293 (including `ReadFargatePrices`),
+`environment-admin.json` 5,805 (339)
+and `environment-admin-network.json` 3,340; a unit test (`every_policy_fits_a_managed_policy`)
 fails before any file outgrows the limit. A tier that outgrows its files gains another file, which
 the app then lists with the others. For IAM Identity Center, add the files as inline policies on the permission set
 (the "up to 32,768 characters" limit is unverified) or reference the managed policies.
@@ -540,7 +555,7 @@ progress events) is not exercised.
 | EFS file-system policy naming a just-created role | ✓ no invalid-principal error in any onboarding apply (two applies, each created in 4 s, right after the role; whether the provider retried internally is not visible without its debug log); no module change. If it ever fails, applying the onboarding again completes it |
 | NAT address on destroy | ✗→fixed: the provider disassociates the address before releasing it, after the NAT gateway (and the association) are gone, and EC2 authorizes that call against the literal `*/*`. `DisassociateGoneAddresses` allows exactly `arn:aws:ec2:*:*:${*}/${*}`; CloudTrail shows the retried call reaching `InvalidAssociationID.NotFound` |
 | Conditional unlock | ✓ on the versioned state bucket, `DeleteObject` with `If-Match` and a mismatched ETag gets 412 (the app's "lock changed" answer) and leaves the lock; with the current ETag it deletes it. A fresh foreign lock scans as Deploying with its `Who` |
-| Update | ✓ re-applying with the network read back from the record: "0 added, 0 changed, 0 destroyed" |
+| Update | ✓ re-applying with the network and lifetime cap read back from the record: "0 added, 0 changed, 0 destroyed" |
 | After `tofu destroy` | ✗→fixed (app): the state object stays, empty, so a destroyed environment kept scanning as Incomplete (and a removed onboarding as Joined). Detection now reads small state objects (up to 2 KiB, at most 200 per scan) and treats one with no resources as absent; a read that fails counts as a deployment |
 | Cleanup | ✓ nothing `triple-c` left in us-west-2 (roles, policies, log groups, clusters, VPCs, subnets, gateways, NAT gateways, addresses, security groups, file systems, parameters, aliases, buckets); five environment KMS keys pending deletion (7 days); the boundary, which the account did not have, deleted again |
 
@@ -601,3 +616,47 @@ and the secret and removes the ECR policy; then the fixture destroys the modules
 | A revision per configuration | turning idle stop on adds a secret key, so the next start registers a new revision (by design) |
 | Removal (R8) | ✓ final run: `remove_aws_resources` succeeds; the secret is scheduled for deletion, the access point deleted, the revision left ACTIVE. Since R10 the secret is deleted without a recovery window (the test now asserts it is gone) |
 | Cleanup | ✓ nothing `triple-c` left in us-west-2; environment KMS keys pending deletion |
+
+### Phase 6: the cost estimate's price reads (2026-11-16)
+
+`cargo test aws::live_tests::a_ -- --ignored --test-threads=1` (the four permission-check tests
+plus `a_workspace_role_reads_fargate_prices_and_a_bare_role_cannot`), us-west-2, all passed.
+
+| Point | Result |
+|---|---|
+| `pricing:GetProducts` on `*` (`ReadFargatePrices`) | ✓ a role holding only the workspace files reads us-west-2's rates from the us-east-1 endpoint (`AmazonECS`; `TERM_MATCH regionCode`, `TERM_MATCH termType=OnDemand`, `CONTAINS usagetype=Fargate`: eight rows, one page). x86 $0.04048/vCPU-h, $0.004445/GB-h; ARM $0.03238, $0.00356; ephemeral storage $0.000111/GB-h |
+| Without the permission | ✓ a role with no policy is denied (`AccessDeniedException` naming `pricing:GetProducts`); the app shows "Estimate unavailable" |
+| The permission check | ✓ the simulator allows the new check for the workspace tier and denies it for a role with no policy |
+
+### Phase 6: one workspace with every option (2026-11-16)
+
+```sh
+TRIPLEC_E2E_TEST=aws::live_tests::environment::a_phase6_workspace_round_trips \
+TRIPLEC_AWS_E2E_PROFILE=<admin profile> TRIPLEC_AWS_E2E_REGION=us-west-2 scripts/aws-e2e-workspace.sh
+```
+
+Same fixture as phase 5 (`deploy_for_workspace_user`: environment admin deploys, a role holding
+only the workspace files is onboarded and drives the app as a profile connection), with the
+environment's `max_workspace_hours = 1`. One project, two task starts, 1 vCPU / 2 GiB x86: EFS
+storage, one public repo, a setup script, copy-at-connect (a CA file, a git token and a custom
+variable — all dummies), a port mapping 127.0.0.1:<free port> → 8099, the gateway sidecar
+(OpenAI-compatible backend, one gateway model, a dummy provider key handed in instead of the
+keychain via `aws_host::ensure_started_with`), idle stop off, WIP push off. Passed in 600 s,
+spend under $0.05.
+
+| Point | Result |
+|---|---|
+| Environment module v2 + cap | ✓ the record reads `template_version 2`, `max_workspace_hours 1` (as the workspace user); the secret has `TRIPLEC_MAX_LIFETIME_MINUTES=60`, PID 1's environment has it (root exec, that one line grepped), one `triple-c-idle-watch` runs with idle stop off |
+| v1 → v2 Update | not exercised: the fixture applies only the embedded modules (unit-tested: an old record shows "Update available") |
+| Lifetime cap firing | not exercised live (60 minutes; Task 4's unit tests) |
+| Times | cold start (two access points, register, RunTask, pull of both images, agent, tunnel) 115 s; restart 112 s; copy-at-connect push 3 s; gateway `/health/liveliness` 200 at 126 s after the start began |
+| EFS `/workspace` | ✓ `127.0.0.1:/ /workspace nfs4` (TLS tunnel); Hello-World cloned onto it; a marker written in task 1 was there in task 2; the clone reported `exists` the second time; both access point ids kept in the store across the restart |
+| Hybrid links under EFS | ✓ `~/.claude` and `~/.claude.json` → `/mnt/triple-c-home/…`; `~/.ssh` is a local directory (R6, copy-at-connect) |
+| Setup script | ✓ `sudo apt-get install -y jq` (already in the image: "jq is already the newest version"), `jq --version`, marker on `/workspace`; `aws_workspace_status`'s read (`triple-c-workspace-status` through the tunnel) settled with clone `cloned` + setup `ok` (code 0, log tail); same again on the restart |
+| Copy-at-connect | ✓ secret keys listed (values never printed): no `TRIPLEC_FILES`, `GIT_TOKEN`, custom variable or `TRIPLE_C_CUSTOM_ENV`, `TRIPLEC_CREDENTIALS` present; neither dummy value anywhere in the secret; after the push `/usr/local/share/ca-certificates/triple-c-e2e-ca.crt` (`subject=CN = triple-c-e2e-ca`) and a git credential helper are set |
+| Port mapping | ✓ `python3 -m http.server 8099 --bind 127.0.0.1` (detached exec); `port_forwards::open_for` → `GET /` on the host's loopback port: `HTTP/1.0 200 OK` |
+| Gateway sidecar | ✓ from the workspace: `/health/liveliness` 200; `/v1/models` with the master key 200 listing `e2e-model`, without it 401; claude's login shell has `ANTHROPIC_BASE_URL=http://127.0.0.1:4000` and a token; the sidecar's `TRIPLEC_GATEWAY_*` stay in the secret (R1); a new master key each start |
+| Keys in the logs | ✓ after a failed `/v1/chat/completions` (dummy key → OpenAI 401) and the successful calls: the provider key, the master key, the git token and the custom value are in **0** lines of the gateway stream (`<prefix>/gateway/<task-id>`, 107 lines) and of the workspace stream. LiteLLM logs the exception and traceback, not request headers; the provider's own error text (also in the HTTP response) carries the key **masked** by OpenAI (`sk-e2e-p…1249`: first 8 and last 4 characters) |
+| Cost estimate | ✓ `fetch_rates` as the workspace user + `estimate`: $0.0495/hour for 1 vCPU / 2 GiB / 21 GiB x86, `efs_billed_separately` |
+| Removal with discard | ✓ `remove_aws_resources(…, true)` Ok; both access points gone; the secret deleted |
+| Cleanup | ✓ nothing `triple-c` left in us-west-2 (the run's environment KMS key pending deletion). The guard's task-definition retirement had never matched anything (ECS's `familyPrefix` is a whole family name); fixed, and 13 revisions earlier runs had left ACTIVE were deregistered and deleted |

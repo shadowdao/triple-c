@@ -17,7 +17,14 @@ import Field, {
   selectClass,
 } from "../../../ui/Field";
 import Toggle from "../../../ui/Toggle";
-import { isAwsProject, localEndpointProblem } from "../../../../lib/awsWorkspace";
+import {
+  GATEWAY_SIDECAR_HINT,
+  GATEWAY_SIDECAR_LABEL,
+  GATEWAY_SIDECAR_ON_NOTE,
+  gatewaySidecarProblem,
+  isAwsProject,
+  localEndpointProblem,
+} from "../../../../lib/awsWorkspace";
 import { useAppState } from "../../../../store/appState";
 
 /** P6: an AWS workspace can reach a local model only over the network. */
@@ -201,6 +208,10 @@ export default function ModelSection({ project, save, disabled }: Props) {
         : project.backend === "open_ai_compatible"
           ? (project.openai_compatible_config ?? DEFAULT_OPENAI_COMPATIBLE_CONFIG).base_url
           : null;
+  // Q7: with the sidecar, Claude Code talks to the gateway in the task, so
+  // the typed base URL is not used on AWS and its warning would mislead.
+  const sidecarOn = aws && project.aws?.gateway_sidecar === true;
+  const sidecarProblem = aws ? gatewaySidecarProblem(project, gateway) : null;
   const endpointProblem =
     aws && savedBaseUrl
       ? localEndpointProblem(savedBaseUrl, gateway?.enabled ? gateway.port : null)
@@ -208,6 +219,9 @@ export default function ModelSection({ project, save, disabled }: Props) {
 
   const handleBackendChange = (mode: Backend) => {
     const patch: Partial<Project> = { backend: mode };
+    // The sidecar needs this backend: leaving it turns the sidecar off.
+    if (sidecarOn && mode !== "open_ai_compatible" && project.aws)
+      patch.aws = { ...project.aws, gateway_sidecar: false };
     if (mode === "bedrock" && !project.bedrock_config)
       patch.bedrock_config = DEFAULT_BEDROCK_CONFIG;
     if (mode === "ollama" && !project.ollama_config)
@@ -241,13 +255,42 @@ export default function ModelSection({ project, save, disabled }: Props) {
           </select>
         )}
       </Field>
-      {aws && CUSTOM_ENDPOINT_BACKENDS.includes(project.backend) && (
+      {aws && CUSTOM_ENDPOINT_BACKENDS.includes(project.backend) && !sidecarOn && (
         <div
           role="note"
           className="px-2 py-1.5 space-y-1 text-xs text-[var(--warning)] bg-[var(--warning-muted)] border border-[var(--warning)]/30 rounded-[var(--radius-control)]"
         >
           <p>{LOCAL_MODEL_ON_AWS}</p>
           {endpointProblem && <p>{endpointProblem}</p>}
+        </div>
+      )}
+      {aws && project.backend === "open_ai_compatible" && project.aws && (
+        <div className="space-y-2">
+          <SwitchRow
+            label={GATEWAY_SIDECAR_LABEL}
+            hint={GATEWAY_SIDECAR_HINT}
+            control={
+              <Toggle
+                label={GATEWAY_SIDECAR_LABEL}
+                checked={sidecarOn}
+                onChange={(value) =>
+                  save({ aws: { ...project.aws!, gateway_sidecar: value } })
+                }
+                // Turning it off is always allowed; on only when it can run.
+                disabled={disabled || (!sidecarOn && sidecarProblem !== null)}
+              />
+            }
+          />
+          {sidecarProblem && (
+            <p role="alert" className="text-xs text-[var(--warning)]">
+              {sidecarProblem}
+            </p>
+          )}
+          {sidecarOn && (
+            <p role="note" aria-label="LLM gateway sidecar" className="text-xs text-[var(--text-secondary)]">
+              {GATEWAY_SIDECAR_ON_NOTE}
+            </p>
+          )}
         </div>
       )}
 

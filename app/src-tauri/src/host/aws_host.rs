@@ -40,7 +40,10 @@ use crate::aws::tasks::{
 use crate::aws::tofu_modules::{
     environment_cluster_name, log_stream_prefix, owner_key, task_family,
 };
-use crate::aws::workspace::{prepare_workspace, SdkWorkspaceApi, WorkspaceApi};
+use crate::aws::workspace::{
+    gateway_sidecar_problem, new_agent_token, prepare_workspace, GatewayPayload, SdkWorkspaceApi,
+    WorkspaceApi,
+};
 use crate::aws::{caller_identity, sdk_config, CallerIdentity};
 use crate::docker::ca_certs::{container_cert_name, ResolvedCa};
 use crate::models::app_settings::ImageSource;
@@ -80,6 +83,11 @@ const WATCH_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// The most a StopTask (credentials included) may take before the stop is
 /// reported as failed; the SDK's own bound is per call.
 const STOP_TIMEOUT: Duration = Duration::from_secs(45);
+
+pub mod connect;
+pub mod status;
+pub use connect::{spawn_connect_push, terminal_env};
+pub use status::{spawn_follow, workspace_status, WorkspaceStatus};
 
 fn s<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
@@ -144,6 +152,55 @@ pub fn aws_env(project: &Project, settings: &AppSettings) -> Result<AwsEnv, Stri
         p.sandbox_mode_enabled = false;
     }
     crate::docker::workspace_env::workspace_env_from_settings(&p, settings)
+}
+
+/// The gateway sidecar's payload (Q7), owned: its key-free config, the
+/// provider key and a fresh master key.
+pub struct SidecarSecrets {
+    config: String,
+    api_key: zeroize::Zeroizing<String>,
+    master_key: zeroize::Zeroizing<String>,
+}
+
+impl SidecarSecrets {
+    pub fn payload(&self) -> GatewayPayload<'_> {
+        GatewayPayload {
+            config: &self.config,
+            api_key: &self.api_key,
+            master_key: &self.master_key,
+        }
+    }
+}
+
+/// What the gateway sidecar needs for this start, or `None` when the project
+/// doesn't run it. Refuses a project the sidecar can't serve
+/// ([`gateway_sidecar_problem`]) and a missing provider key (`read_api_key`:
+/// the keychain's, Settings → Model Gateway). The master key is new every
+/// task start — only this task's sidecar and workspace know it — so the
+/// Docker gateway's own master key never leaves this machine.
+pub fn gateway_sidecar(
+    project: &Project,
+    settings: &AppSettings,
+    read_api_key: impl FnOnce() -> Result<Option<String>, String>,
+) -> Result<Option<SidecarSecrets>, String> {
+    if !project.aws.as_ref().is_some_and(|a| a.gateway_sidecar) {
+        return Ok(None);
+    }
+    if let Some(problem) = gateway_sidecar_problem(project, &settings.gateway) {
+        return Err(problem);
+    }
+    let api_key = read_api_key()?
+        .filter(|k| !k.trim().is_empty())
+        .ok_or_else(|| {
+            "The LLM gateway sidecar needs the provider API key: set it in Settings → Model \
+             Gateway"
+                .to_string()
+        })?;
+    Ok(Some(SidecarSecrets {
+        config: crate::docker::gateway::sidecar_config(&settings.gateway),
+        api_key: zeroize::Zeroizing::new(api_key),
+        master_key: zeroize::Zeroizing::new(new_agent_token()),
+    }))
 }
 
 /// One file read for the secret, refusing anything over [`MAX_FILE_BYTES`]
@@ -345,7 +402,13 @@ pub struct StartInputs<'a> {
     pub who: &'a CallerIdentity,
     pub env_pairs: &'a [(String, String)],
     pub files: &'a [(String, Vec<u8>)],
+    /// The custom variables' names: credentials under copy-at-connect.
+    pub custom_env_keys: &'a [String],
     pub image: &'a str,
+    /// The gateway sidecar's payload, when the project runs it
+    /// ([`gateway_sidecar`]). Called only when the start prepares a new task:
+    /// attaching to a running one never needs the provider key or models.
+    pub gateway: &'a (dyn Fn() -> Result<Option<SidecarSecrets>, String> + Send + Sync),
     pub wait: WaitTiming,
     pub access_point_wait: PollTiming,
     /// Called as soon as the project has a task (found, or RunTask
@@ -362,6 +425,8 @@ pub struct TaskRecord {
     pub task_arn: String,
     pub access_point_id: Option<String>,
     pub task_definition_arn: Option<String>,
+    /// EFS storage's `/workspace` access point.
+    pub workspace_access_point_id: Option<String>,
 }
 
 /// A connected task.
@@ -373,6 +438,8 @@ pub struct Started {
     /// The access point the task mounts (Hybrid). `None` when an existing
     /// task was attached to: the store's value stands.
     pub access_point_id: Option<String>,
+    /// The `/workspace` access point (EFS), like `access_point_id`.
+    pub workspace_access_point_id: Option<String>,
     /// This start ran the task (rather than attaching to a running one).
     pub created: bool,
 }
@@ -433,13 +500,14 @@ pub async fn start_core<T: TaskApi, W: WorkspaceApi, R: RuntimeApi, C: Connector
         .await
         .map_err(s)?;
 
-    let (task, token, access_point_id, created) = if let Some(task) = existing {
+    let (task, token, access_point_id, workspace_access_point_id, created) = if let Some(task) = existing {
         // Attach: never rotate a running task's token (P2).
         log::info!("Project {}: attaching to its running task {}", project.id, task.arn);
         (inp.on_task)(Some(&TaskRecord {
             task_arn: task.arn.clone(),
             access_point_id: None,
             task_definition_arn: Some(task.task_definition_arn.clone()),
+            workspace_access_point_id: None,
         }));
         let token = read_agent_token(rt, &env.name, &ok, &project.id).await.map_err(s)?;
         progress(PROGRESS_WAITING);
@@ -447,9 +515,10 @@ pub async fn start_core<T: TaskApi, W: WorkspaceApi, R: RuntimeApi, C: Connector
             Ok(t) => t,
             Err(e) => return Err(with_log_tail(tasks, &logs, &task.arn, e.to_string()).await),
         };
-        (task, token, None, false)
+        (task, token, None, None, false)
     } else {
         progress(PROGRESS_PREPARING);
+        let sidecar = (inp.gateway)()?;
         let prepared = prepare_workspace(
             work,
             inp.who,
@@ -457,11 +526,16 @@ pub async fn start_core<T: TaskApi, W: WorkspaceApi, R: RuntimeApi, C: Connector
             project,
             inp.env_pairs,
             inp.files,
+            inp.custom_env_keys,
             inp.image,
+            sidecar.as_ref().map(SidecarSecrets::payload),
         )
         .await
         .map_err(s)?;
-        if let Some(ap) = &prepared.access_point_id {
+        for ap in [&prepared.access_point_id, &prepared.workspace_access_point_id]
+            .into_iter()
+            .flatten()
+        {
             wait_access_point(rt, ap, inp.access_point_wait).await.map_err(s)?;
         }
         progress(PROGRESS_STARTING);
@@ -482,6 +556,7 @@ pub async fn start_core<T: TaskApi, W: WorkspaceApi, R: RuntimeApi, C: Connector
                 task_arn: start.task.arn.clone(),
                 access_point_id: prepared.access_point_id.clone(),
                 task_definition_arn: Some(start.task.task_definition_arn.clone()),
+                workspace_access_point_id: prepared.workspace_access_point_id.clone(),
             }));
             return Err(START_RACE.into());
         }
@@ -490,6 +565,7 @@ pub async fn start_core<T: TaskApi, W: WorkspaceApi, R: RuntimeApi, C: Connector
             task_arn: arn.clone(),
             access_point_id: prepared.access_point_id.clone(),
             task_definition_arn: Some(prepared.task_definition_arn.clone()),
+            workspace_access_point_id: prepared.workspace_access_point_id.clone(),
         }));
         progress(PROGRESS_WAITING);
         let task = match wait_ready(tasks, &env.cluster_arn, &arn, &logs, inp.wait, |_| {}).await {
@@ -502,7 +578,13 @@ pub async fn start_core<T: TaskApi, W: WorkspaceApi, R: RuntimeApi, C: Connector
                 return Err(msg);
             }
         };
-        (task, prepared.agent_token, prepared.access_point_id, true)
+        (
+            task,
+            prepared.agent_token,
+            prepared.access_point_id,
+            prepared.workspace_access_point_id,
+            true,
+        )
     };
 
     progress(PROGRESS_CONNECTING);
@@ -530,6 +612,7 @@ pub async fn start_core<T: TaskApi, W: WorkspaceApi, R: RuntimeApi, C: Connector
                 forward,
                 endpoint,
                 access_point_id,
+                workspace_access_point_id,
                 created,
             })
         }
@@ -555,12 +638,47 @@ async fn project_sdk(project: &Project, settings: &AppSettings) -> Result<(Strin
     Ok((host_id.to_string(), region, sdk))
 }
 
+/// The lifetime cap, in hours (0 = none), of the environment `project` runs
+/// in, from its record (Q8: Host settings show it). `None` when it can't be
+/// read — offline, denied, slow, or the environment is gone.
+pub async fn environment_max_hours(project: &Project, settings: &AppSettings) -> Option<u32> {
+    let placement = project.aws_placement.as_ref()?;
+    let read = async {
+        let (_, region, sdk) = project_sdk(project, settings).await.ok()?;
+        let who = caller_identity(&sdk).await.ok()?;
+        read_environment(&SdkRuntimeApi::new(&sdk), &placement.environment, &who.account, &region)
+            .await
+            .ok()
+    };
+    let info = tokio::time::timeout(std::time::Duration::from_secs(10), read).await.ok()??;
+    Some(info.max_workspace_hours)
+}
+
 /// `ProjectHost::Aws::ensure_started`.
 pub async fn ensure_started(
     project: &Project,
     settings: &AppSettings,
     store: &ProjectsStore,
     progress: &(dyn Fn(&str) + Send + Sync),
+) -> Result<ContainerTarget, String> {
+    ensure_started_with(
+        project,
+        settings,
+        store,
+        progress,
+        crate::storage::secure::get_gateway_api_key,
+    )
+    .await
+}
+
+/// [`ensure_started`] with the gateway sidecar's provider key read by
+/// `read_gateway_key` instead of the keychain (the live tests have none).
+pub async fn ensure_started_with(
+    project: &Project,
+    settings: &AppSettings,
+    store: &ProjectsStore,
+    progress: &(dyn Fn(&str) + Send + Sync),
+    read_gateway_key: impl FnOnce() -> Result<Option<String>, String> + Send,
 ) -> Result<ContainerTarget, String> {
     // A background re-attach (after a restart) may be opening a tunnel:
     // cancel it, this start attaches itself. Its tunnel, if it gets one, is
@@ -569,6 +687,7 @@ pub async fn ensure_started(
     // Already connected and answering: nothing to do.
     if let Some(ep) = tunnels::get_endpoint(&project.id) {
         if matches!(agent::is_running(&ep).await, Ok(true)) {
+            tunnels::mark_attached(&project.id);
             return Ok(ContainerTarget::Agent(ep));
         }
         tunnels::close(&project.id).await;
@@ -582,6 +701,17 @@ pub async fn ensure_started(
         .as_deref()
         .or(settings.default_ssh_key_path.as_deref());
     let files = workspace_files(ssh, ca.as_ref())?;
+    let custom_env_keys =
+        crate::docker::workspace_env::custom_env_keys(project, &settings.global_custom_env_vars);
+    // Read lazily: only a start that prepares a new task needs it (an attach
+    // must work with the provider key gone from the keychain).
+    let read_gateway_key = std::sync::Mutex::new(Some(read_gateway_key));
+    let sidecar = || {
+        gateway_sidecar(project, settings, || match read_gateway_key.lock().unwrap().take() {
+            Some(read) => read(),
+            None => Ok(None),
+        })
+    };
 
     let (connection_id, region, sdk) = project_sdk(project, settings).await?;
     let who = caller_identity(&sdk).await.map_err(s)?;
@@ -596,7 +726,9 @@ pub async fn ensure_started(
             who: &who,
             env_pairs: &env_pairs,
             files: &files,
+            custom_env_keys: &custom_env_keys,
             image: &image,
+            gateway: &sidecar,
             wait: WaitTiming::default(),
             access_point_wait: PollTiming::default(),
             on_task: &on_task,
@@ -615,6 +747,9 @@ pub async fn ensure_started(
     let access_point_id = started
         .access_point_id
         .or_else(|| project.aws.as_ref().and_then(|a| a.access_point_id.clone()));
+    let workspace_access_point_id = started
+        .workspace_access_point_id
+        .or_else(|| project.aws.as_ref().and_then(|a| a.workspace_access_point_id.clone()));
     let ecs = ecs_task(&started.task)?;
     if let Some(old) = tunnels::register(
         &project.id,
@@ -628,7 +763,9 @@ pub async fn ensure_started(
             forward: started.forward,
             endpoint: endpoint.clone(),
             access_point_id,
+            workspace_access_point_id,
             task_definition_arn: started.task.task_definition_arn.clone(),
+            created: started.created,
         },
     ) {
         old.forward.close().await;
@@ -651,12 +788,14 @@ pub fn record_task(store: &ProjectsStore, project_id: &str, rec: Option<&TaskRec
             Some(r.task_arn.clone()),
             r.access_point_id.clone().or(stored.access_point_id),
             r.task_definition_arn.clone().or(stored.task_definition_arn),
+            r.workspace_access_point_id.clone().or(stored.workspace_access_point_id),
         ),
         None => store.set_aws_runtime(
             project_id,
             None,
             stored.access_point_id,
             stored.task_definition_arn,
+            stored.workspace_access_point_id,
         ),
     };
     if let Err(e) = res {
@@ -808,6 +947,7 @@ async fn task_arn_or_find<T: TaskApi>(
 /// the stored task ARN, else whatever live task the project has (a crash
 /// between RunTask and the store write). Closes the tunnel.
 pub async fn stop_project(project: &Project, settings: &AppSettings) -> Result<(), String> {
+    tunnels::cancel_follow(&project.id);
     if let Some(ep) = tunnels::get_endpoint(&project.id) {
         if let Some(res) = stop_endpoint(&ep).await {
             return res;
@@ -841,6 +981,7 @@ pub async fn remove_resources(
     settings: &AppSettings,
     discard_data: bool,
 ) -> Result<(), String> {
+    tunnels::cancel_follow(&project.id);
     let (_, region, sdk) = project_sdk(project, settings).await?;
     let who = caller_identity(&sdk).await.map_err(s)?;
     let ok = owner_key(&region, &who.user_id);
@@ -858,6 +999,8 @@ pub async fn remove_resources(
             project_id: &project.id,
             stored_task_arn: aws.and_then(|a| a.task_arn.as_deref()),
             stored_access_point_id: aws.and_then(|a| a.access_point_id.as_deref()),
+            stored_workspace_access_point_id: aws
+                .and_then(|a| a.workspace_access_point_id.as_deref()),
             discard_data,
         },
     )
@@ -972,6 +1115,7 @@ pub async fn reconcile_project<T: TaskApi>(
                         task_arn: t.arn.clone(),
                         access_point_id: None,
                         task_definition_arn: Some(t.task_definition_arn.clone()),
+                        workspace_access_point_id: None,
                     }),
                 );
             }
@@ -985,8 +1129,17 @@ pub async fn reconcile_project<T: TaskApi>(
 
 /// `reconcile_project_statuses` for an AWS project: decide, and when the
 /// task is live re-open its tunnel in the background (terminals wait for
-/// it through [`tunnels::wait_endpoint`]). Never blocks on the tunnel.
-pub async fn reconcile(project: &Project, settings: &AppSettings, store: Arc<ProjectsStore>) {
+/// it through [`tunnels::wait_endpoint`]), then — copy-at-connect — copy the
+/// credentials in, calling `on_connect_warning` if that fails — after
+/// opening its port mappings (`on_ports_warning` for any that fail). Never
+/// blocks on the tunnel.
+pub async fn reconcile(
+    project: &Project,
+    settings: &AppSettings,
+    store: Arc<ProjectsStore>,
+    on_connect_warning: impl FnOnce(String) + Send + 'static,
+    on_ports_warning: impl FnOnce(String) + Send + 'static,
+) {
     let (connection_id, region, sdk) = match project_sdk(project, settings).await {
         Ok(v) => v,
         Err(e) => {
@@ -1006,12 +1159,29 @@ pub async fn reconcile(project: &Project, settings: &AppSettings, store: Arc<Pro
     match reconcile_project(&api, &store, project, &find).await {
         Ok(Reconciled::Live(task)) => {
             let generation = tunnels::begin_reattach(&project.id);
-            let project = project.clone();
+            let (project, settings) = (project.clone(), settings.clone());
             tauri::async_runtime::spawn(async move {
                 let ctx = Reattach { generation, connection_id, region, sdk, who };
-                if let Err(e) = reattach(&project, *task, ctx, &store).await {
-                    log::warn!("Project {}: could not re-open the tunnel to its task: {e}", project.id);
-                    tunnels::end_reattach(&project.id, generation);
+                match reattach(&project, *task, ctx, &store).await {
+                    // Re-attached: a connect like any other (Q2).
+                    Ok(true) => {
+                        // Q6: the port mappings' forwards, before the
+                        // (slower) credential copy.
+                        if let Some(detail) = super::port_forwards::open_for_project(&store, &project.id).await {
+                            on_ports_warning(detail);
+                        }
+                        if let Err(e) = connect::apply_connect(&project, &settings).await {
+                            log::warn!("Project {}: could not copy the credentials in: {e}", project.id);
+                            if tunnels::get_endpoint(&project.id).is_some() {
+                                on_connect_warning(e);
+                            }
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        log::warn!("Project {}: could not re-open the tunnel to its task: {e}", project.id);
+                        tunnels::end_reattach(&project.id, generation);
+                    }
                 }
             });
         }
@@ -1040,13 +1210,14 @@ pub fn reattach_still_wanted(store: &ProjectsStore, project_id: &str, task_arn: 
     })
 }
 
-/// Re-open the tunnel to a live task found at startup.
+/// Re-open the tunnel to a live task found at startup. `Ok(true)` once it
+/// is registered; `Ok(false)` when it was no longer wanted.
 async fn reattach(
     project: &Project,
     task: TaskInfo,
     ctx: Reattach,
     store: &ProjectsStore,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let placement = project.aws_placement.as_ref().ok_or("no placement")?;
     let ok = owner_key(&ctx.region, &ctx.who.user_id);
     let rt = SdkRuntimeApi::new(&ctx.sdk);
@@ -1070,13 +1241,18 @@ async fn reattach(
         forward,
         endpoint: endpoint.clone(),
         access_point_id: project.aws.as_ref().and_then(|a| a.access_point_id.clone()),
+        workspace_access_point_id: project
+            .aws
+            .as_ref()
+            .and_then(|a| a.workspace_access_point_id.clone()),
         task_definition_arn: task.task_definition_arn.clone(),
+        created: false,
     };
     if !reattach_still_wanted(store, &project.id, &task.arn) {
         tunnel.forward.close().await;
         tunnels::end_reattach(&project.id, ctx.generation);
         log::info!("Project {}: stopped or removed while re-attaching; tunnel closed", project.id);
-        return Ok(());
+        return Ok(false);
     }
     match tunnels::register_if_current(&project.id, ctx.generation, tunnel) {
         Ok(old) => {
@@ -1087,13 +1263,13 @@ async fn reattach(
         Err(tunnel) => {
             tunnel.forward.close().await;
             log::info!("Project {}: stopped or removed while re-attaching; tunnel closed", project.id);
-            return Ok(());
+            return Ok(false);
         }
     }
     // The local port is new, so the stored target id is too.
     store.set_container_id(&project.id, Some(endpoint.base_url.to_string()))?;
     log::info!("Project {}: tunnel to task {} re-opened", project.id, task.arn);
-    Ok(())
+    Ok(true)
 }
 
 // ─────────────────────────────────────────────────────────────── watch

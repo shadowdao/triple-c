@@ -9,7 +9,13 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, Mutex};
 
-use super::{AttachedExec, ContainerTarget};
+use super::{AttachedExec, ContainerTarget, ExecSpec};
+
+/// A session's exec: as `claude` in `/workspace` (what `attach_exec` runs),
+/// with `env` added. Values in `env` are never logged.
+pub fn session_spec(cmd: Vec<String>, tty: bool, env: Vec<String>) -> ExecSpec {
+    ExecSpec::new(cmd).tty(tty).env(env)
+}
 
 pub struct ExecSession {
     pub exec_id: String,
@@ -46,18 +52,22 @@ impl ExecSessionManager {
         }
     }
 
+    /// A terminal: a tty exec of `cmd` with `env` added to the container's
+    /// environment (an AWS copy-at-connect project's credentials,
+    /// `aws_host::terminal_env`; empty otherwise).
     pub async fn create_session<F>(
         &self,
         target: &ContainerTarget,
         session_id: &str,
         cmd: Vec<String>,
+        env: Vec<String>,
         on_output: F,
         on_exit: Box<dyn FnOnce() + Send>,
     ) -> Result<(), String>
     where
         F: Fn(Vec<u8>) + Send + 'static,
     {
-        self.create_session_with_tty(target, session_id, cmd, true, on_output, on_exit)
+        self.create_session_spec(target, session_id, session_spec(cmd, true, env), on_output, on_exit)
             .await
     }
 
@@ -73,11 +83,26 @@ impl ExecSessionManager {
     where
         F: Fn(Vec<u8>) + Send + 'static,
     {
+        self.create_session_spec(target, session_id, session_spec(cmd, tty, Vec::new()), on_output, on_exit)
+            .await
+    }
+
+    async fn create_session_spec<F>(
+        &self,
+        target: &ContainerTarget,
+        session_id: &str,
+        spec: ExecSpec,
+        on_output: F,
+        on_exit: Box<dyn FnOnce() + Send>,
+    ) -> Result<(), String>
+    where
+        F: Fn(Vec<u8>) + Send + 'static,
+    {
         let AttachedExec {
             exec_id,
             mut output,
             mut input,
-        } = target.attach_exec(cmd, tty).await?;
+        } = target.attach(spec).await?;
 
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);

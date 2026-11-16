@@ -71,6 +71,10 @@ describe("useProjectStatusEvents", () => {
     expect(t[0].kind).toBe("info");
     expect(t[0].message).toContain("idle");
 
+    t = fire({ kind: "lifetime", message: null });
+    expect(t[0].kind).toBe("info");
+    expect(t[0].message).toContain("maximum workspace lifetime was reached");
+
     expect(fire({ kind: "user", message: null })).toHaveLength(0);
 
     // A task that never started is news even when found at startup.

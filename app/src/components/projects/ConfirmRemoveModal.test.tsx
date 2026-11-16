@@ -14,6 +14,14 @@ describe("ConfirmRemoveModal", () => {
     expect(onConfirm.mock.calls).toEqual([[{ discardData: false }], [{ discardData: true }]]);
   });
 
+  it("says both access points go when the workspace kept /workspace on EFS", () => {
+    render(
+      <ConfirmRemoveModal projectName="api" aws savedFiles workspaceFiles onConfirm={vi.fn()} onCancel={vi.fn()} />,
+    );
+    expect(screen.getByRole("checkbox", { name: /file-system access points/ })).toBeInTheDocument();
+    expect(screen.getByText(/\/workspace/)).toBeInTheDocument();
+  });
+
   it("offers no access-point choice for an Ephemeral AWS workspace", () => {
     const onConfirm = vi.fn();
     render(<ConfirmRemoveModal projectName="api" aws onConfirm={onConfirm} onCancel={vi.fn()} />);

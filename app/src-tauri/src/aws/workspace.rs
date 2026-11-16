@@ -1,5 +1,6 @@
 //! A project's AWS resources, made ready before its task runs: the project
-//! secret, the EFS access point (Hybrid storage) and the task definition.
+//! secret, the EFS access points (Hybrid: home; EFS: home and `/workspace`)
+//! and the task definition.
 //!
 //! **Everything project-shaped goes in the secret (P1).** Every workspace user
 //! has `ecs:Describe*` on `*`, so a task definition's `environment`, tags and
@@ -43,10 +44,10 @@ use super::error::{classify_sdk_error, AwsError};
 use super::identity::CallerIdentity;
 use super::tofu_modules::{
     access_point_root, log_stream_prefix, owner_key, project_secret_name, task_family,
-    user_file_system_token, user_role_names,
+    user_file_system_token, user_role_names, workspace_access_point_root,
 };
 use crate::host::ssm::AGENT_PORT;
-use crate::models::project::{validate_aws_workspace, Arch, RepoSource, StorageMode};
+use crate::models::project::{validate_aws_workspace, Arch, RepoSource, SecretsDelivery, StorageMode};
 use crate::models::Project;
 
 pub const TAG_OWNER: &str = "triple-c:owner";
@@ -59,6 +60,9 @@ pub const CONTAINER_NAME: &str = "workspace";
 /// Where a Hybrid project's access point is mounted (P4).
 pub const HOME_MOUNT_PATH: &str = "/mnt/triple-c-home";
 const HOME_VOLUME: &str = "home";
+/// Where an EFS-mode project's second access point is mounted (Q1).
+pub const WORKSPACE_MOUNT_PATH: &str = "/workspace";
+const WORKSPACE_VOLUME: &str = "workspace";
 /// Secrets Manager's `SecretString` limit.
 pub const MAX_SECRET_BYTES: usize = 65_536;
 /// At most this many of a family's newest revisions are described when
@@ -74,6 +78,28 @@ const KEY_REPOS: &str = "TRIPLEC_REPOS";
 const KEY_WIP_PUSH: &str = "TRIPLEC_WIP_PUSH";
 const KEY_IDLE: &str = "TRIPLEC_IDLE_STOP_MINUTES";
 const KEY_STORAGE: &str = "TRIPLEC_STORAGE";
+const KEY_SETUP_SCRIPT: &str = "TRIPLEC_SETUP_SCRIPT";
+const KEY_MAX_LIFETIME: &str = "TRIPLEC_MAX_LIFETIME_MINUTES";
+/// `connect` when the credentials are copied in at connect (Q2) and so are
+/// not in the secret; absent otherwise.
+const KEY_CREDENTIALS: &str = "TRIPLEC_CREDENTIALS";
+/// The gateway sidecar's three keys (Q7): its LiteLLM config (key-free,
+/// `os.environ/…` references) and the two keys it references. Only the
+/// `gateway` container gets them; under copy-at-connect they stay in the
+/// secret all the same (R1: the sidecar starts before any connect).
+const KEY_GATEWAY_CONFIG: &str = "TRIPLEC_GATEWAY_CONFIG";
+const KEY_GATEWAY_API_KEY: &str = crate::docker::gateway::SIDECAR_API_KEY_ENV;
+const KEY_GATEWAY_MASTER_KEY: &str = crate::docker::gateway::SIDECAR_MASTER_KEY_ENV;
+const GATEWAY_KEYS: [&str; 3] = [KEY_GATEWAY_API_KEY, KEY_GATEWAY_CONFIG, KEY_GATEWAY_MASTER_KEY];
+/// The sidecar container's name.
+pub const GATEWAY_CONTAINER_NAME: &str = "gateway";
+/// Where the workspace reaches the sidecar: the task's shared loopback
+/// (awsvpc), LiteLLM bound to 127.0.0.1 only.
+pub const GATEWAY_SIDECAR_URL: &str = "http://127.0.0.1:4000";
+/// The sidecar's soft memory limit (MiB).
+pub const GATEWAY_MEMORY_RESERVATION_MIB: i32 = 512;
+/// Largest sidecar config, in bytes (the constraints' budget).
+pub const MAX_GATEWAY_CONFIG_BYTES: usize = 8_192;
 /// Seconds ECS waits after SIGTERM before SIGKILL (Fargate allows 2–120).
 pub const STOP_TIMEOUT_SECS: i32 = 120;
 
@@ -113,8 +139,9 @@ fn is_env_name(key: &str) -> bool {
 }
 
 /// `ssh/<file>` or `ca/<file>`, the file name non-empty, without `/`, and
-/// not `.` or `..` (R1: the entrypoint writes it under `/tmp/.host-*/`).
-fn validate_file_key(key: &str) -> Result<(), String> {
+/// not `.` or `..` (R1: the entrypoint writes it under `/tmp/.host-*/`;
+/// copy-at-connect uploads it under `/dev/shm/triple-c/connect/*/`).
+pub(crate) fn validate_file_key(key: &str) -> Result<(), String> {
     let file = key
         .strip_prefix("ssh/")
         .or_else(|| key.strip_prefix("ca/"))
@@ -128,6 +155,94 @@ fn validate_file_key(key: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Payload keys that come from the project's AWS settings and its
+/// environment rather than from the env pairs (phase 6).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PayloadExtras<'a> {
+    /// `AwsWorkspaceConfig::setup_script`; blank is the same as none.
+    pub setup_script: Option<&'a str>,
+    /// The environment's cap (`max_workspace_hours`), in hours; 0 = none.
+    pub max_workspace_hours: u32,
+    /// Copy-at-connect (Q2): the names of the project's custom environment
+    /// variables. With it, the credentials ([`is_credential_key`]) and
+    /// `TRIPLEC_FILES` stay out of the secret and `TRIPLEC_CREDENTIALS` is
+    /// `connect`; the app copies them in after each connect instead.
+    /// `None`: everything is in the secret (Secrets Manager delivery).
+    pub connect_only: Option<&'a [String]>,
+    /// The LLM gateway sidecar (Q7), when the project runs it.
+    pub gateway: Option<GatewayPayload<'a>>,
+}
+
+/// What the gateway sidecar's payload keys carry. The workspace's
+/// `ANTHROPIC_AUTH_TOKEN` is `master_key` too.
+#[derive(Clone, Copy)]
+pub struct GatewayPayload<'a> {
+    /// `docker::gateway::sidecar_config`: no key in it.
+    pub config: &'a str,
+    /// The provider key (Settings → Model Gateway).
+    pub api_key: &'a str,
+    /// The sidecar's own LiteLLM master key.
+    pub master_key: &'a str,
+}
+
+/// Keys never appear.
+impl std::fmt::Debug for GatewayPayload<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GatewayPayload")
+            .field("config_bytes", &self.config.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Why `project` can't run the gateway sidecar with `gateway` (Settings →
+/// Model Gateway), or `None` when it can or doesn't ask to. It needs the
+/// OpenAI-compatible backend (Claude Code then talks to the sidecar) and at
+/// least one complete model row.
+pub fn gateway_sidecar_problem(
+    project: &Project,
+    gateway: &crate::models::gateway_settings::GatewaySettings,
+) -> Option<String> {
+    if !project.aws.as_ref().is_some_and(|a| a.gateway_sidecar) {
+        return None;
+    }
+    if project.backend != crate::models::project::Backend::OpenAiCompatible {
+        return Some(
+            "The LLM gateway sidecar needs the OpenAI Compatible backend: choose it in the \
+             project's Model section, or turn the sidecar off"
+                .into(),
+        );
+    }
+    if gateway.valid_models().is_empty() {
+        return Some(
+            "The LLM gateway sidecar has no models to serve: add at least one in Settings → \
+             Model Gateway (a name and a provider model id)"
+                .into(),
+        );
+    }
+    None
+}
+
+/// `workspace_env`'s fingerprint of the custom variables' values.
+const CUSTOM_ENV_FINGERPRINT: &str = "TRIPLE_C_CUSTOM_ENV";
+
+/// A credential, for copy-at-connect: an API key or token Triple-C manages
+/// (`SECRET_ENV_KEYS`, `GIT_TOKEN` included) or any custom variable — a
+/// custom value may be a key, and nothing tells which.
+pub fn is_credential_key(key: &str, custom_keys: &[String]) -> bool {
+    crate::docker::container::SECRET_ENV_KEYS.contains(&key) || custom_keys.iter().any(|c| c == key)
+}
+
+/// The credential pairs of `env_pairs` ([`is_credential_key`]), in order:
+/// what copy-at-connect copies in and adds to the terminals' environment.
+pub fn credential_pairs(env_pairs: &[(String, String)], custom_keys: &[String]) -> Vec<(String, String)> {
+    env_pairs
+        .iter()
+        .filter(|(k, _)| is_credential_key(k, custom_keys))
+        .cloned()
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn payload_map(
     env_pairs: &[(String, String)],
     agent_token: &str,
@@ -136,6 +251,7 @@ fn payload_map(
     wip: bool,
     idle: Option<u32>,
     storage: StorageMode,
+    extras: PayloadExtras<'_>,
 ) -> Result<BTreeMap<String, String>, String> {
     let own = [
         KEY_AGENT_TOKEN,
@@ -144,6 +260,12 @@ fn payload_map(
         KEY_WIP_PUSH,
         KEY_IDLE,
         KEY_STORAGE,
+        KEY_SETUP_SCRIPT,
+        KEY_MAX_LIFETIME,
+        KEY_CREDENTIALS,
+        KEY_GATEWAY_CONFIG,
+        KEY_GATEWAY_API_KEY,
+        KEY_GATEWAY_MASTER_KEY,
     ];
     let mut m = BTreeMap::new();
     for (k, v) in env_pairs {
@@ -164,6 +286,16 @@ fn payload_map(
             log::warn!("Ignoring the environment variable {k}: Triple-C sets it on AWS");
             continue;
         }
+        // Copy-at-connect: copied in after each connect, never stored. The
+        // custom variables' fingerprint goes too: an unsalted hash of their
+        // values would let a low-entropy one be guessed offline (and nothing
+        // on AWS reads it; Docker uses it to notice a change).
+        if extras
+            .connect_only
+            .is_some_and(|custom| is_credential_key(k, custom) || k == CUSTOM_ENV_FINGERPRINT)
+        {
+            continue;
+        }
         m.insert(k.clone(), v.clone());
     }
     let b64 = base64::engine::general_purpose::STANDARD;
@@ -173,7 +305,28 @@ fn payload_map(
         file_map.insert(k.clone(), b64.encode(bytes));
     }
     m.insert(KEY_AGENT_TOKEN.into(), agent_token.into());
-    m.insert(KEY_FILES.into(), json(&file_map));
+    // The agent token stays either way: it is how the app reaches the task.
+    if extras.connect_only.is_some() {
+        // The SSH keys and CA files arrive with the connect too.
+        m.insert(KEY_CREDENTIALS.into(), "connect".into());
+    } else {
+        m.insert(KEY_FILES.into(), json(&file_map));
+    }
+    // Ruling R1 (Task 8): the LLM gateway sidecar starts before any connect,
+    // so its `TRIPLEC_GATEWAY_*` keys are added as payload keys here and stay
+    // in the secret even under copy-at-connect (the UI says so). They are
+    // payload keys, not env pairs, so the credential filter above never
+    // touches them. The workspace's Claude Code talks to the sidecar: its
+    // base URL and token (the sidecar's master key) replace whatever the
+    // OpenAI-compatible settings say, and the token stays in the secret like
+    // the gateway's keys — scheduled jobs run before any connect too.
+    if let Some(g) = extras.gateway {
+        m.insert("ANTHROPIC_BASE_URL".into(), GATEWAY_SIDECAR_URL.into());
+        m.insert("ANTHROPIC_AUTH_TOKEN".into(), g.master_key.into());
+        m.insert(KEY_GATEWAY_CONFIG.into(), g.config.into());
+        m.insert(KEY_GATEWAY_API_KEY.into(), g.api_key.into());
+        m.insert(KEY_GATEWAY_MASTER_KEY.into(), g.master_key.into());
+    }
     m.insert(KEY_REPOS.into(), json(&repos));
     m.insert(KEY_WIP_PUSH.into(), if wip { "1" } else { "0" }.into());
     if let Some(minutes) = idle {
@@ -184,9 +337,19 @@ fn payload_map(
         match storage {
             StorageMode::Ephemeral => "ephemeral",
             StorageMode::Hybrid => "hybrid",
+            StorageMode::Efs => "efs",
         }
         .into(),
     );
+    if let Some(script) = extras.setup_script.filter(|s| !s.trim().is_empty()) {
+        m.insert(KEY_SETUP_SCRIPT.into(), script.into());
+    }
+    if extras.max_workspace_hours > 0 {
+        m.insert(
+            KEY_MAX_LIFETIME.into(),
+            (u64::from(extras.max_workspace_hours) * 60).to_string(),
+        );
+    }
     Ok(m)
 }
 
@@ -195,26 +358,71 @@ fn json<T: Serialize + ?Sized>(v: &T) -> String {
     serde_json::to_string(v).expect("plain data serialises")
 }
 
+/// What a payload key is, in the size error's words. Custom variables are
+/// named (names are not secret; values never appear).
+fn describe_payload_key(key: &str) -> String {
+    match key {
+        KEY_SETUP_SCRIPT => "the setup script".into(),
+        KEY_FILES => "the SSH and CA files".into(),
+        KEY_REPOS => "the repository list".into(),
+        "CLAUDE_INSTRUCTIONS" => "the instructions".into(),
+        "CLAUDE_CODE_SETTINGS_JSON" => "the Claude Code settings".into(),
+        CUSTOM_ENV_FINGERPRINT => "the custom environment variables".into(),
+        k if k.starts_with("TRIPLEC_GATEWAY_") => "the LLM gateway configuration".into(),
+        k => format!("the environment variable {k}"),
+    }
+}
+
+/// `n` bytes in KiB, rounded up (so a part is never shown as 0 KiB).
+fn kib(n: usize) -> usize {
+    n.div_ceil(1024)
+}
+
 fn serialize_payload(m: &BTreeMap<String, String>) -> Result<String, String> {
     let json = serde_json::to_string(m).expect("a string map serialises");
     if json.len() > MAX_SECRET_BYTES {
+        // Name what is large: the parts add up (setup script ≤ 32 KiB,
+        // gateway config, instructions, files…), so the total alone does not
+        // say what to shorten. A part's size is its serialised value.
+        let mut parts: Vec<(usize, &str)> = m
+            .iter()
+            .map(|(k, v)| (serde_json::to_string(v).map_or(v.len(), |j| j.len()), k.as_str()))
+            .collect();
+        parts.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
+        let largest: Vec<String> = parts
+            .iter()
+            .take(3)
+            .filter(|(n, _)| *n >= 1024)
+            .map(|(n, k)| format!("{} ({} KiB)", describe_payload_key(k), kib(*n)))
+            .collect();
+        let detail = if largest.is_empty() {
+            String::new()
+        } else {
+            format!(" The largest parts: {}.", largest.join(", "))
+        };
         return Err(format!(
-            "The project's settings for AWS come to {} bytes, more than the 65,536 a Secrets \
-             Manager secret holds. Shorten the instructions, Claude Code settings or custom \
-             environment variables, or remove files from the SSH folder.",
+            "The project's settings for AWS come to {} KiB ({} bytes), more than the 64 KiB \
+             (65,536 bytes) a Secrets Manager secret holds.{detail} Shorten the setup script, \
+             instructions, Claude Code settings or custom environment variables, or remove \
+             files from the SSH folder.",
+            kib(json.len()),
             json.len()
         ));
     }
     Ok(json)
 }
 
-/// The project secret's JSON (P1, R1): every env pair, then the payload's own
-/// keys (`TRIPLEC_AGENT_TOKEN`, `TRIPLEC_FILES` = `{"ssh/<f>"|"ca/<f>": base64}`,
+/// The project secret's JSON (P1, R1): every env pair (under copy-at-connect,
+/// every one but the credentials), then the payload's own keys
+/// (`TRIPLEC_AGENT_TOKEN`, `TRIPLEC_FILES` = `{"ssh/<f>"|"ca/<f>": base64}`
+/// — or, under copy-at-connect, `TRIPLEC_CREDENTIALS` = `connect` instead —
 /// `TRIPLEC_REPOS`, `TRIPLEC_WIP_PUSH` = `1`/`0`, `TRIPLEC_IDLE_STOP_MINUTES`
-/// when on, `TRIPLEC_STORAGE` = `ephemeral`/`hybrid`), keys sorted. Fails
-/// when it would exceed 65,536 bytes.
+/// when on, `TRIPLEC_STORAGE` = `ephemeral`/`hybrid`/`efs`,
+/// `TRIPLEC_SETUP_SCRIPT` when set, `TRIPLEC_MAX_LIFETIME_MINUTES` when the
+/// environment caps it), keys sorted. Fails when it would exceed 65,536 bytes.
 #[cfg_attr(not(test), allow(dead_code))]
-pub fn project_secret_payload(
+#[allow(clippy::too_many_arguments)]
+pub fn project_secret_payload_with(
     env_pairs: &[(String, String)],
     agent_token: &str,
     files: &[(String, Vec<u8>)],
@@ -222,6 +430,7 @@ pub fn project_secret_payload(
     wip: bool,
     idle: Option<u32>,
     storage: StorageMode,
+    extras: PayloadExtras<'_>,
 ) -> Result<String, String> {
     serialize_payload(&payload_map(
         env_pairs,
@@ -231,6 +440,7 @@ pub fn project_secret_payload(
         wip,
         idle,
         storage,
+        extras,
     )?)
 }
 
@@ -254,10 +464,15 @@ pub struct WorkspacePlan {
     pub secret_arn: String,
     /// Sorted (the payload's key order).
     pub secret_keys: Vec<String>,
-    /// Both set for Hybrid, both `None` for Ephemeral.
+    /// Both set for Hybrid and EFS, both `None` for Ephemeral.
     pub file_system_id: Option<String>,
     pub access_point_id: Option<String>,
+    /// The `/workspace` access point; used only when `storage` is EFS.
+    pub workspace_access_point_id: Option<String>,
     pub tags: Vec<(String, String)>,
+    /// The gateway sidecar's image (Q7) when the project runs it; `None`
+    /// leaves the request exactly as it was before the sidecar existed.
+    pub gateway_image: Option<String>,
 }
 
 /// sha256 (hex) over the task definition `plan` produces, minus the label
@@ -327,7 +542,14 @@ pub fn task_definition_request(plan: &WorkspacePlan) -> RegisterTaskDefinitionIn
 fn build_request(plan: &WorkspacePlan) -> RegisterTaskDefinitionInput {
     const BUILT: &str = "every required field is set";
     let hybrid = match (&plan.storage, &plan.file_system_id, &plan.access_point_id) {
-        (StorageMode::Hybrid, Some(fs), Some(ap)) => Some((fs, ap)),
+        (StorageMode::Hybrid | StorageMode::Efs, Some(fs), Some(ap)) => Some((fs, ap)),
+        _ => None,
+    };
+    // EFS = Hybrid + `/workspace` on its own access point. Hybrid and
+    // Ephemeral requests are exactly what they were before EFS mode (a
+    // test pins their fingerprints).
+    let workspace = match (&plan.storage, hybrid, &plan.workspace_access_point_id) {
+        (StorageMode::Efs, Some((fs, _)), Some(ap)) => Some((fs, ap)),
         _ => None,
     };
 
@@ -345,18 +567,12 @@ fn build_request(plan: &WorkspacePlan) -> RegisterTaskDefinitionInput {
                 .map(|(k, v)| KeyValuePair::builder().name(*k).value(*v).build())
                 .collect(),
         ))
-        .set_secrets(Some(
-            plan.secret_keys
-                .iter()
-                .map(|k| {
-                    Secret::builder()
-                        .name(k)
-                        .value_from(format!("{}:{k}::", plan.secret_arn))
-                        .build()
-                        .expect(BUILT)
-                })
-                .collect(),
-        ))
+        // Everything but the sidecar's keys: the workspace has no use for the
+        // provider key (its token, the master key, is ANTHROPIC_AUTH_TOKEN).
+        .set_secrets(Some(secrets(
+            plan,
+            plan.secret_keys.iter().filter(|k| !GATEWAY_KEYS.contains(&k.as_str())),
+        )))
         .health_check(
             HealthCheck::builder()
                 .command("CMD-SHELL")
@@ -391,6 +607,15 @@ fn build_request(plan: &WorkspacePlan) -> RegisterTaskDefinitionInput {
                 .build(),
         );
     }
+    if workspace.is_some() {
+        container = container.mount_points(
+            MountPoint::builder()
+                .source_volume(WORKSPACE_VOLUME)
+                .container_path(WORKSPACE_MOUNT_PATH)
+                .read_only(false)
+                .build(),
+        );
+    }
 
     let mut req = RegisterTaskDefinitionInput::builder()
         .family(&plan.family)
@@ -421,27 +646,88 @@ fn build_request(plan: &WorkspacePlan) -> RegisterTaskDefinitionInput {
                 .map(|(k, v)| Tag::builder().key(k).value(v).build())
                 .collect(),
         ));
-    if let Some((fs, ap)) = hybrid {
-        req = req.volumes(
-            Volume::builder()
-                .name(HOME_VOLUME)
-                .efs_volume_configuration(
-                    EfsVolumeConfiguration::builder()
-                        .file_system_id(fs)
-                        .transit_encryption(EfsTransitEncryption::Enabled)
-                        .authorization_config(
-                            EfsAuthorizationConfig::builder()
-                                .access_point_id(ap)
-                                .iam(EfsAuthorizationConfigIam::Enabled)
-                                .build(),
-                        )
-                        .build()
-                        .expect(BUILT),
-                )
-                .build(),
-        );
+    if let Some(image) = &plan.gateway_image {
+        req = req.container_definitions(gateway_container(plan, image));
+    }
+    for (name, (fs, ap)) in [(HOME_VOLUME, hybrid), (WORKSPACE_VOLUME, workspace)]
+        .into_iter()
+        .filter_map(|(n, v)| v.map(|v| (n, v)))
+    {
+        req = req.volumes(efs_volume(name, fs, ap));
     }
     req.build().expect(BUILT)
+}
+
+/// `secrets` entries for `keys`, each by `valueFrom: <arn>:<KEY>::`.
+fn secrets<'k>(plan: &WorkspacePlan, keys: impl Iterator<Item = &'k String>) -> Vec<Secret> {
+    keys.map(|k| {
+        Secret::builder()
+            .name(k)
+            .value_from(format!("{}:{k}::", plan.secret_arn))
+            .build()
+            .expect("every required field is set")
+    })
+    .collect()
+}
+
+/// The sidecar's shell command: write the config to a root-only file, then
+/// replace the shell with LiteLLM on the task's loopback only. The pinned
+/// image's ENTRYPOINT (`docker/prod_entrypoint.sh`) only `exec`s `litellm`
+/// with its arguments, so the entry point is replaced by its `/bin/sh`
+/// (busybox; `printf` is a builtin, `litellm` is on PATH — checked against
+/// the pinned digest). The config variable is unset before LiteLLM starts;
+/// the two key variables stay, since the config references them.
+pub const GATEWAY_COMMAND: &str = "umask 077 && printf '%s' \"$TRIPLEC_GATEWAY_CONFIG\" > \
+     /tmp/litellm.yaml && unset TRIPLEC_GATEWAY_CONFIG && exec litellm --config \
+     /tmp/litellm.yaml --host 127.0.0.1 --port 4000";
+
+/// The non-essential `gateway` container (Q7): the pinned LiteLLM image,
+/// exactly the three gateway keys as secrets and no `environment` (P1), the
+/// same log group (its streams are `<prefix>/gateway/<task-id>`, apart from
+/// the workspace's), 512 MiB reserved. Nothing waits on it: the workspace
+/// starts, and stays up, whether or not the gateway does.
+fn gateway_container(plan: &WorkspacePlan, image: &str) -> ContainerDefinition {
+    const BUILT: &str = "every required field is set";
+    let keys: Vec<String> = GATEWAY_KEYS.iter().map(|k| k.to_string()).collect();
+    ContainerDefinition::builder()
+        .name(GATEWAY_CONTAINER_NAME)
+        .image(image)
+        .essential(false)
+        .memory_reservation(GATEWAY_MEMORY_RESERVATION_MIB)
+        .entry_point("/bin/sh")
+        .entry_point("-c")
+        .command(GATEWAY_COMMAND)
+        .set_secrets(Some(secrets(plan, keys.iter())))
+        .log_configuration(
+            LogConfiguration::builder()
+                .log_driver(LogDriver::Awslogs)
+                .options("awslogs-group", &plan.log_group)
+                .options("awslogs-region", &plan.region)
+                .options("awslogs-stream-prefix", &plan.log_stream_prefix)
+                .build()
+                .expect(BUILT),
+        )
+        .build()
+}
+
+/// An EFS volume through an access point, IAM-authorised, TLS in transit.
+fn efs_volume(name: &str, fs: &str, ap: &str) -> Volume {
+    Volume::builder()
+        .name(name)
+        .efs_volume_configuration(
+            EfsVolumeConfiguration::builder()
+                .file_system_id(fs)
+                .transit_encryption(EfsTransitEncryption::Enabled)
+                .authorization_config(
+                    EfsAuthorizationConfig::builder()
+                        .access_point_id(ap)
+                        .iam(EfsAuthorizationConfigIam::Enabled)
+                        .build(),
+                )
+                .build()
+                .expect("every required field is set"),
+        )
+        .build()
 }
 
 // ---------------------------------------------------------------------- API
@@ -497,6 +783,23 @@ pub trait WorkspaceApi: Send + Sync {
         root: &str,
         tags: &[(String, String)],
     ) -> impl Future<Output = Result<String, AwsError>> + Send;
+    /// Create the secret with `json` (encrypted with `kms_key_arn`, tagged).
+    /// `Some(arn)` when created, `None` when it already exists.
+    fn create_project_secret(
+        &self,
+        name: &str,
+        kms_key_arn: &str,
+        json: &str,
+        tags: &[(String, String)],
+    ) -> impl Future<Output = Result<Option<String>, AwsError>> + Send;
+    /// The secret's current `SecretString`; `None` when there is no secret.
+    fn project_secret_value(
+        &self,
+        name: &str,
+    ) -> impl Future<Output = Result<Option<String>, AwsError>> + Send;
+    /// Delete the secret now, every version with it
+    /// (`ForceDeleteWithoutRecovery`); no secret is not an error.
+    fn delete_project_secret(&self, name: &str) -> impl Future<Output = Result<(), AwsError>> + Send;
     /// Create the secret (encrypted with `kms_key_arn`, tagged), or put a new
     /// value into it when it exists. Returns its ARN.
     fn put_project_secret(
@@ -592,14 +895,17 @@ pub struct PreparedWorkspace {
     /// Exact `family:revision`.
     pub task_definition_arn: String,
     pub access_point_id: Option<String>,
+    /// EFS storage's `/workspace` access point.
+    pub workspace_access_point_id: Option<String>,
     /// This start's token, already in the secret.
     pub agent_token: String,
     pub secret_arn: String,
 }
 
-/// Make the project's secret, access point (Hybrid) and task definition
+/// Make the project's secret, access points (Hybrid, EFS) and task definition
 /// ready. Everything that can be checked locally — placement, sizes, the
 /// payload's size and names — is checked before the first write.
+#[allow(clippy::too_many_arguments)]
 pub async fn prepare_workspace<W: WorkspaceApi>(
     api: &W,
     who: &CallerIdentity,
@@ -607,7 +913,9 @@ pub async fn prepare_workspace<W: WorkspaceApi>(
     project: &Project,
     env_pairs: &[(String, String)],
     files: &[(String, Vec<u8>)],
+    custom_env_keys: &[String],
     image: &str,
+    gateway: Option<GatewayPayload<'_>>,
 ) -> Result<PreparedWorkspace, AwsError> {
     let (Some(placement), Some(cfg)) = (project.aws_placement.as_ref(), project.aws.as_ref())
     else {
@@ -635,6 +943,30 @@ pub async fn prepare_workspace<W: WorkspaceApi>(
     if image.trim().is_empty() {
         return Err(other("No container image is set for AWS"));
     }
+    // The sidecar runs when the project asks for it, and only then.
+    let gateway = match (cfg.gateway_sidecar, gateway) {
+        (false, _) => None,
+        (true, None) => {
+            return Err(other("The LLM gateway sidecar's configuration was not prepared"))
+        }
+        (true, Some(g)) => {
+            if g.config.len() > MAX_GATEWAY_CONFIG_BYTES {
+                return Err(other(format!(
+                    "The LLM gateway configuration is {} bytes; the sidecar's limit is {} \
+                     (fewer models in Settings → Model Gateway)",
+                    g.config.len(),
+                    MAX_GATEWAY_CONFIG_BYTES
+                )));
+            }
+            if g.api_key.trim().is_empty() || g.master_key.trim().is_empty() {
+                return Err(other(
+                    "The LLM gateway sidecar needs the provider API key: set it in Settings → \
+                     Model Gateway",
+                ));
+            }
+            Some(g)
+        }
+    };
 
     let ok = owner_key(region, &who.user_id);
     let tags = workspace_tags(&who.user_id, &project.id, &env.name);
@@ -647,14 +979,22 @@ pub async fn prepare_workspace<W: WorkspaceApi>(
         cfg.wip_push_on_stop,
         cfg.idle_stop_minutes,
         cfg.storage,
+        PayloadExtras {
+            setup_script: cfg.setup_script.as_deref(),
+            max_workspace_hours: env.max_workspace_hours,
+            connect_only: (cfg.secrets_delivery == SecretsDelivery::CopyAtConnect)
+                .then_some(custom_env_keys),
+            gateway,
+        },
     )
     .map_err(other)?;
     let json = serialize_payload(&payload).map_err(other)?;
 
-    // Hybrid: the user's own file system, from their onboarding.
-    let (file_system_id, access_point_id) = match cfg.storage {
-        StorageMode::Ephemeral => (None, None),
-        StorageMode::Hybrid => {
+    // Hybrid and EFS: the user's own file system, from their onboarding.
+    let (file_system_id, access_point_id, workspace_access_point_id) = match cfg.storage {
+        StorageMode::Ephemeral => (None, None, None),
+        StorageMode::Hybrid | StorageMode::Efs => {
+            let mode = if cfg.storage == StorageMode::Efs { "EFS" } else { "Hybrid" };
             let token = user_file_system_token(&env.name, &ok);
             let fs = api
                 .find_file_system(&token)
@@ -662,26 +1002,81 @@ pub async fn prepare_workspace<W: WorkspaceApi>(
                 .filter(|fs| fs.owner.as_deref() == Some(who.user_id.as_str()))
                 .ok_or_else(|| {
                     other(format!(
-                        "Your file system in environment \"{}\" was not found. Hybrid storage \
+                        "Your file system in environment \"{}\" was not found. {mode} storage \
                          needs it: ask an administrator to onboard you there, or use \
                          Ephemeral storage.",
                         env.name
                     ))
                 })?;
-            let root = access_point_root(&ok, &project.id);
             let points = api.access_points(&fs.id).await?;
-            let ap = match pick_access_point(&points, &fs.id, &root, &who.user_id, &project.id) {
-                Some(a) => a.id.clone(),
-                None => api.create_access_point(&fs.id, &root, &tags).await?,
+            let ensure = |root: String| {
+                let found = pick_access_point(&points, &fs.id, &root, &who.user_id, &project.id)
+                    .map(|a| a.id.clone());
+                let (fs_id, tags) = (&fs.id, &tags);
+                async move {
+                    match found {
+                        Some(id) => Ok(id),
+                        None => api.create_access_point(fs_id, &root, tags).await,
+                    }
+                }
             };
-            (Some(fs.id), Some(ap))
+            let ap = ensure(access_point_root(&ok, &project.id)).await?;
+            let workspace_ap = if cfg.storage == StorageMode::Efs {
+                Some(ensure(workspace_access_point_root(&ok, &project.id)).await?)
+            } else {
+                None
+            };
+            (Some(fs.id), Some(ap), workspace_ap)
         }
     };
 
     let secret_name = project_secret_name(&env.name, &ok, &project.id);
-    let secret_arn = api
-        .put_project_secret(&secret_name, &env.kms_key_arn, &json, &tags)
-        .await?;
+    let secret_arn = match extras_custom(cfg, custom_env_keys) {
+        // Copy-at-connect over a secret that still holds credentials (it was
+        // Secrets Manager before, or a custom variable has gone): a new value
+        // would leave them in the secret's version history (AWSPREVIOUS), so
+        // the secret is deleted outright and made again (ruling R7).
+        //
+        // Created first, as for Secrets Manager: a new project has no secret,
+        // and reading one that doesn't exist may be refused outright (the
+        // read is allowed only on secrets carrying the caller's owner tag).
+        // Only an existing secret is read.
+        Some(custom) => match retry_while_pending_deletion(&secret_name, RECREATE_TIMING, || {
+            api.create_project_secret(&secret_name, &env.kms_key_arn, &json, &tags)
+        })
+        .await?
+        {
+            Some(arn) => arn,
+            None => {
+                // The secret existed at the create but may be marked for
+                // deletion by now (another start replacing it): wait that out
+                // like the writes do. Once it is gone the read says `None`
+                // and the put below makes it again.
+                let old = retry_while_pending_deletion(&secret_name, RECREATE_TIMING, || {
+                    api.project_secret_value(&secret_name)
+                })
+                .await?;
+                if old.as_deref().is_some_and(|o| holds_credentials(o, &payload, custom)) {
+                    log::info!(
+                        "Project {}: its secret still held credentials; replacing it so no version keeps them",
+                        project.id
+                    );
+                    replace_project_secret(
+                        api,
+                        &secret_name,
+                        &env.kms_key_arn,
+                        &json,
+                        &tags,
+                        RECREATE_TIMING,
+                    )
+                    .await?
+                } else {
+                    put_secret_retrying(api, &secret_name, &env.kms_key_arn, &json, &tags).await?
+                }
+            }
+        },
+        None => put_secret_retrying(api, &secret_name, &env.kms_key_arn, &json, &tags).await?,
+    };
 
     let (task_role, exec_role) = user_role_names(&env.name, &ok);
     let role_arn = |name: &str| format!("arn:{partition}:iam::{}:role/{name}", who.account);
@@ -702,7 +1097,9 @@ pub async fn prepare_workspace<W: WorkspaceApi>(
         secret_keys: payload.keys().cloned().collect(),
         file_system_id,
         access_point_id: access_point_id.clone(),
+        workspace_access_point_id: workspace_access_point_id.clone(),
         tags,
+        gateway_image: gateway.map(|_| crate::docker::gateway::registry_image_ref()),
     };
     let fingerprint = workspace_fingerprint(&plan);
     let task_definition_arn =
@@ -728,6 +1125,7 @@ pub async fn prepare_workspace<W: WorkspaceApi>(
         family: plan.family,
         task_definition_arn,
         access_point_id,
+        workspace_access_point_id,
         agent_token,
         secret_arn,
     })
@@ -742,17 +1140,132 @@ const MAX_LISTED_REVISIONS: i32 = 100;
 /// registered (what crowding a family out can cost the caller).
 const MAX_REVISION_PAGES: usize = 20;
 
+/// Copy-at-connect's custom variable names, or `None` for Secrets Manager.
+fn extras_custom<'a>(
+    cfg: &crate::models::project::AwsWorkspaceConfig,
+    custom_env_keys: &'a [String],
+) -> Option<&'a [String]> {
+    (cfg.secrets_delivery == SecretsDelivery::CopyAtConnect).then_some(custom_env_keys)
+}
+
+/// Whether a secret's current value `old` holds anything copy-at-connect
+/// keeps out: the files, the custom variables' fingerprint, a credential
+/// key, or an environment variable the new payload no longer has (a custom
+/// variable since removed). `TRIPLEC_*` keys are the payload's own. A value
+/// that is not a JSON object counts as holding them.
+pub fn holds_credentials(old: &str, new: &BTreeMap<String, String>, custom: &[String]) -> bool {
+    let Ok(old) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(old) else {
+        return true;
+    };
+    // The gateway sidecar's token is its own random master key (R1 keeps it
+    // in the secret), not a credential of the user's.
+    let sidecar_token = |k: &str| {
+        k == "ANTHROPIC_AUTH_TOKEN"
+            && old.get(k).is_some_and(|v| Some(v) == old.get(KEY_GATEWAY_MASTER_KEY))
+    };
+    old.keys().any(|k| {
+        k == KEY_FILES
+            || k == CUSTOM_ENV_FINGERPRINT
+            || (is_credential_key(k, custom) && !sidecar_token(k))
+            || (!k.starts_with("TRIPLEC_") && !new.contains_key(k))
+            // The provider key, once the sidecar is off.
+            || (k == KEY_GATEWAY_API_KEY && !new.contains_key(k))
+    })
+}
+
+/// How long a replaced secret's name may stay taken by its deletion.
+#[derive(Debug, Clone, Copy)]
+pub struct RecreateTiming {
+    pub interval: std::time::Duration,
+    pub limit: std::time::Duration,
+}
+
+const RECREATE_TIMING: RecreateTiming = RecreateTiming {
+    interval: std::time::Duration::from_secs(2),
+    limit: std::time::Duration::from_secs(30),
+};
+
+fn is_pending_deletion_error(e: &AwsError) -> bool {
+    matches!(e, AwsError::Other { message } if message.contains(PENDING_DELETION))
+}
+
+/// Run a secret write, retrying while the name is still taken by a deletion
+/// AWS has not finished — a replace that timed out deleted the secret without
+/// making it again, so the next start lands here. Past `timing.limit`, says
+/// to try again in a minute.
+async fn retry_while_pending_deletion<T, F, Fut>(
+    name: &str,
+    timing: RecreateTiming,
+    mut write: F,
+) -> Result<T, AwsError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, AwsError>>,
+{
+    let deadline = tokio::time::Instant::now() + timing.limit;
+    loop {
+        match write().await {
+            Err(e) if is_pending_deletion_error(&e) => {
+                if tokio::time::Instant::now() + timing.interval > deadline {
+                    return Err(other(format!(
+                        "AWS has not finished deleting this project's previous secret ({name}) \
+                         after {} s, so it can't be written yet. Start the project again in a \
+                         minute.",
+                        timing.limit.as_secs()
+                    )));
+                }
+                tokio::time::sleep(timing.interval).await;
+            }
+            r => return r,
+        }
+    }
+}
+
+async fn put_secret_retrying<W: WorkspaceApi>(
+    api: &W,
+    name: &str,
+    kms_key_arn: &str,
+    json: &str,
+    tags: &[(String, String)],
+) -> Result<String, AwsError> {
+    retry_while_pending_deletion(name, RECREATE_TIMING, || {
+        api.put_project_secret(name, kms_key_arn, json, tags)
+    })
+    .await
+}
+
+/// Delete the secret with every version, then create it with `json`,
+/// retrying while AWS finishes the (asynchronous) delete.
+pub async fn replace_project_secret<W: WorkspaceApi>(
+    api: &W,
+    name: &str,
+    kms_key_arn: &str,
+    json: &str,
+    tags: &[(String, String)],
+    timing: RecreateTiming,
+) -> Result<String, AwsError> {
+    api.delete_project_secret(name).await?;
+    retry_while_pending_deletion(name, timing, || api.put_project_secret(name, kms_key_arn, json, tags))
+        .await
+}
+
 /// Secrets Manager's `InvalidRequestException` for a name whose secret is
 /// scheduled for deletion ("... already scheduled for deletion").
 fn is_pending_deletion(message: Option<&str>) -> bool {
-    message.is_some_and(|m| m.contains("scheduled for deletion"))
+    // CreateSecret/PutSecretValue say "scheduled", GetSecretValue "marked".
+    message.is_some_and(|m| m.contains("scheduled for deletion") || m.contains("marked for deletion"))
 }
 
+/// What [`pending_deletion_error`] says; [`is_pending_deletion_error`] looks for it.
+const PENDING_DELETION: &str = "is still being deleted";
+
+/// The name is taken by a deletion. Every deletion Triple-C makes is forced
+/// (no recovery window) and finishes within a minute or so, so the advice is
+/// to wait — never to restore the secret.
 fn pending_deletion_error(name: &str) -> AwsError {
     other(format!(
-        "This project's secret ({name}) is scheduled for deletion, so it can't be written. \
-         Restore it in the Secrets Manager console (or wait until it is deleted) and start \
-         the project again."
+        "This project's secret ({name}) {PENDING_DELETION}, so it can't be written yet. Start \
+         the project again in a minute."
     ))
 }
 
@@ -888,16 +1401,57 @@ impl WorkspaceApi for SdkWorkspaceApi {
             .ok_or_else(|| other(format!("{ACTION} returned no AccessPointId")))
     }
 
-    async fn put_project_secret(
+    async fn project_secret_value(&self, name: &str) -> Result<Option<String>, AwsError> {
+        const ACTION: &str = "secretsmanager:GetSecretValue";
+        match self.secrets.get_secret_value().secret_id(name).send().await {
+            Ok(out) => Ok(out.secret_string().map(str::to_string)),
+            Err(e)
+                if e.as_service_error()
+                    .is_some_and(|s| s.is_resource_not_found_exception()) =>
+            {
+                Ok(None)
+            }
+            Err(e)
+                if e.as_service_error().is_some_and(|s| {
+                    s.is_invalid_request_exception() && is_pending_deletion(s.message())
+                }) =>
+            {
+                Err(pending_deletion_error(name))
+            }
+            Err(e) => Err(classify_sdk_error(ACTION, &e)),
+        }
+    }
+
+    async fn delete_project_secret(&self, name: &str) -> Result<(), AwsError> {
+        const ACTION: &str = "secretsmanager:DeleteSecret";
+        match self
+            .secrets
+            .delete_secret()
+            .secret_id(name)
+            .force_delete_without_recovery(true)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e)
+                if e.as_service_error()
+                    .is_some_and(|s| s.is_resource_not_found_exception()) =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(classify_sdk_error(ACTION, &e)),
+        }
+    }
+
+    async fn create_project_secret(
         &self,
         name: &str,
         kms_key_arn: &str,
         json: &str,
         tags: &[(String, String)],
-    ) -> Result<String, AwsError> {
+    ) -> Result<Option<String>, AwsError> {
         use aws_sdk_secretsmanager::types::Tag as SmTag;
         const CREATE: &str = "secretsmanager:CreateSecret";
-        const PUT: &str = "secretsmanager:PutSecretValue";
         let created = self
             .secrets
             .create_secret()
@@ -911,43 +1465,57 @@ impl WorkspaceApi for SdkWorkspaceApi {
             ))
             .send()
             .await;
-        let arn = match created {
-            Ok(out) => out.arn().map(str::to_string),
+        match created {
+            Ok(out) => out
+                .arn()
+                .map(|a| Some(a.to_string()))
+                .ok_or_else(|| other(format!("{CREATE} returned no ARN"))),
             Err(e)
                 if e.as_service_error()
                     .is_some_and(|s| s.is_resource_exists_exception()) =>
             {
-                // Only a secret tagged with the caller as owner accepts this
-                // (the policy), so another user's same-named secret fails
-                // here rather than receiving the payload.
-                self.secrets
-                    .put_secret_value()
-                    .secret_id(name)
-                    .secret_string(json)
-                    .send()
-                    .await
-                    .map_err(|e| match e.as_service_error() {
-                        Some(s)
-                            if s.is_invalid_request_exception()
-                                && is_pending_deletion(s.message()) =>
-                        {
-                            pending_deletion_error(name)
-                        }
-                        _ => classify_sdk_error(PUT, &e),
-                    })?
-                    .arn()
-                    .map(str::to_string)
+                Ok(None)
             }
             Err(e)
                 if e.as_service_error().is_some_and(|s| {
                     s.is_invalid_request_exception() && is_pending_deletion(s.message())
                 }) =>
             {
-                return Err(pending_deletion_error(name));
+                Err(pending_deletion_error(name))
             }
-            Err(e) => return Err(classify_sdk_error(CREATE, &e)),
-        };
-        arn.ok_or_else(|| other(format!("{CREATE} returned no ARN")))
+            Err(e) => Err(classify_sdk_error(CREATE, &e)),
+        }
+    }
+
+    async fn put_project_secret(
+        &self,
+        name: &str,
+        kms_key_arn: &str,
+        json: &str,
+        tags: &[(String, String)],
+    ) -> Result<String, AwsError> {
+        const PUT: &str = "secretsmanager:PutSecretValue";
+        if let Some(arn) = self.create_project_secret(name, kms_key_arn, json, tags).await? {
+            return Ok(arn);
+        }
+        // Only a secret tagged with the caller as owner accepts this (the
+        // policy), so another user's same-named secret fails here rather
+        // than receiving the payload.
+        self.secrets
+            .put_secret_value()
+            .secret_id(name)
+            .secret_string(json)
+            .send()
+            .await
+            .map_err(|e| match e.as_service_error() {
+                Some(s) if s.is_invalid_request_exception() && is_pending_deletion(s.message()) => {
+                    pending_deletion_error(name)
+                }
+                _ => classify_sdk_error(PUT, &e),
+            })?
+            .arn()
+            .map(str::to_string)
+            .ok_or_else(|| other(format!("{PUT} returned no ARN")))
     }
 
     async fn task_definition_revisions(&self, family: &str) -> Result<Vec<String>, AwsError> {

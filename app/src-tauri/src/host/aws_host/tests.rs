@@ -155,11 +155,26 @@ impl WorkspaceApi for Fake {
     async fn create_access_point(
         &self,
         _fs: &str,
-        _root: &str,
+        root: &str,
         _tags: &[(String, String)],
     ) -> Result<String, AwsError> {
         self.log("create-ap");
-        Ok("fsap-new".into())
+        Ok(if root.starts_with("/triple-c-workspaces/") { "fsap-ws" } else { "fsap-new" }.into())
+    }
+    async fn project_secret_value(&self, _name: &str) -> Result<Option<String>, AwsError> {
+        Ok(None)
+    }
+    async fn create_project_secret(
+        &self,
+        n: &str,
+        k: &str,
+        j: &str,
+        t: &[(String, String)],
+    ) -> Result<Option<String>, AwsError> {
+        self.put_project_secret(n, k, j, t).await.map(Some)
+    }
+    async fn delete_project_secret(&self, _name: &str) -> Result<(), AwsError> {
+        Ok(())
     }
     async fn put_project_secret(
         &self,
@@ -247,6 +262,10 @@ impl Connector for Fake {
     }
 }
 
+fn no_gateway() -> Result<Option<SidecarSecrets>, String> {
+    Ok(None)
+}
+
 fn inputs<'a>(
     p: &'a Project,
     who: &'a CallerIdentity,
@@ -258,7 +277,9 @@ fn inputs<'a>(
         who,
         env_pairs: &[],
         files: &[],
+        custom_env_keys: &[],
         image: REGISTRY_IMAGE,
+        gateway: &no_gateway,
         wait: WaitTiming {
             interval: Duration::from_millis(1),
             timeout: Duration::from_millis(30),
@@ -310,6 +331,76 @@ async fn a_first_start_prepares_runs_waits_and_connects_in_that_order() {
 }
 
 #[tokio::test]
+async fn an_efs_start_waits_for_both_access_points_and_records_them() {
+    let p = aws_project(StorageMode::Efs);
+    let fake = Fake { run: Some(task(&p, "new", "RUNNING", true)), ..Default::default() };
+    let w = who();
+    let records = Mutex::new(Vec::new());
+    let on_task = |r: Option<&TaskRecord>| records.lock().unwrap().push(r.cloned());
+    let started = start_core(&fake, &fake, &fake, &fake, &inputs(&p, &w, &on_task), &|_| {})
+        .await
+        .unwrap();
+    assert_eq!(started.access_point_id.as_deref(), Some("fsap-new"));
+    assert_eq!(started.workspace_access_point_id.as_deref(), Some("fsap-ws"));
+    let calls = fake.calls();
+    let pos = |c: &str| calls.iter().position(|x| x == c).unwrap_or_else(|| panic!("{c}: {calls:?}"));
+    assert!(pos("ap-state fsap-new") < pos("run"), "{calls:?}");
+    assert!(pos("ap-state fsap-ws") < pos("run"), "{calls:?}");
+    let recs = records.into_inner().unwrap();
+    let rec = recs[0].as_ref().unwrap();
+    assert_eq!(rec.access_point_id.as_deref(), Some("fsap-new"));
+    assert_eq!(rec.workspace_access_point_id.as_deref(), Some("fsap-ws"));
+
+    // Hybrid waits for one and records none for /workspace.
+    let p = aws_project(StorageMode::Hybrid);
+    let fake = Fake { run: Some(task(&p, "new", "RUNNING", true)), ..Default::default() };
+    let records = Mutex::new(Vec::new());
+    let on_task = |r: Option<&TaskRecord>| records.lock().unwrap().push(r.cloned());
+    let started = start_core(&fake, &fake, &fake, &fake, &inputs(&p, &w, &on_task), &|_| {})
+        .await
+        .unwrap();
+    assert_eq!(started.workspace_access_point_id, None);
+    assert!(!fake.called("ap-state fsap-ws"));
+    assert_eq!(records.into_inner().unwrap()[0].as_ref().unwrap().workspace_access_point_id, None);
+}
+
+#[test]
+fn switching_efs_to_hybrid_keeps_the_stored_workspace_access_point() {
+    let mut p = aws_project(StorageMode::Hybrid);
+    p.aws.as_mut().unwrap().workspace_access_point_id = Some("fsap-ws".into());
+    let (_d, store) = store_with(&p);
+    // A Hybrid start knows no /workspace access point: the stored one stays.
+    record_task(
+        &store,
+        &p.id,
+        Some(&TaskRecord {
+            task_arn: "arn:t".into(),
+            access_point_id: Some("fsap-home".into()),
+            task_definition_arn: None,
+            workspace_access_point_id: None,
+        }),
+    );
+    let a = store.get(&p.id).unwrap().aws.unwrap();
+    assert_eq!(a.workspace_access_point_id.as_deref(), Some("fsap-ws"));
+    record_task(&store, &p.id, None);
+    let a = store.get(&p.id).unwrap().aws.unwrap();
+    assert_eq!(a.workspace_access_point_id.as_deref(), Some("fsap-ws"));
+    // An EFS start records its own.
+    record_task(
+        &store,
+        &p.id,
+        Some(&TaskRecord {
+            task_arn: "arn:t2".into(),
+            access_point_id: None,
+            task_definition_arn: None,
+            workspace_access_point_id: Some("fsap-ws2".into()),
+        }),
+    );
+    let a = store.get(&p.id).unwrap().aws.unwrap();
+    assert_eq!(a.workspace_access_point_id.as_deref(), Some("fsap-ws2"));
+}
+
+#[tokio::test]
 async fn a_running_task_is_attached_with_its_own_token_and_nothing_is_rewritten() {
     let p = aws_project(StorageMode::Hybrid);
     let live = task(&p, "live", "RUNNING", true);
@@ -325,6 +416,35 @@ async fn a_running_task_is_attached_with_its_own_token_and_nothing_is_rewritten(
     assert_eq!(fake.calls(), vec!["record dev", "role", "list", "get-secret", "connect"]);
     assert_eq!(fake.connect_tokens.lock().unwrap()[0], "token-of-the-running-task");
     assert_eq!(steps, vec![PROGRESS_READING, PROGRESS_WAITING, PROGRESS_CONNECTING]);
+}
+
+/// A gateway payload that cannot be built: the provider key is gone.
+fn missing_gateway_key() -> Result<Option<SidecarSecrets>, String> {
+    Err("The LLM gateway sidecar needs the provider API key".into())
+}
+
+#[tokio::test]
+async fn attaching_to_a_running_task_never_builds_the_gateway_payload() {
+    let mut p = aws_project(StorageMode::Hybrid);
+    p.aws.as_mut().unwrap().gateway_sidecar = true;
+    let live = task(&p, "live", "RUNNING", true);
+    let fake = Fake {
+        listed: Mutex::new(vec![vec![live.arn.clone()]]),
+        ..Default::default()
+    }
+    .with_task(live);
+    let w = who();
+    let on_task = |_: Option<&TaskRecord>| {};
+    let inp = StartInputs { gateway: &missing_gateway_key, ..inputs(&p, &w, &on_task) };
+    let started = start_core(&fake, &fake, &fake, &fake, &inp, &|_| {}).await.unwrap();
+    assert!(!started.created);
+
+    // A start that prepares a new task does need it, and fails before RunTask.
+    let fake = Fake::default();
+    let inp = StartInputs { gateway: &missing_gateway_key, ..inputs(&p, &w, &on_task) };
+    let e = start_core(&fake, &fake, &fake, &fake, &inp, &|_| {}).await.err().unwrap();
+    assert!(e.contains("provider API key"), "{e}");
+    assert!(!fake.called("run"));
 }
 
 #[tokio::test]
@@ -666,7 +786,12 @@ fn a_start_records_its_task_and_keeps_the_stored_handles_it_does_not_know() {
     record_task(
         &store,
         &p.id,
-        Some(&TaskRecord { task_arn: "arn:t".into(), access_point_id: None, task_definition_arn: Some("arn:td:2".into()) }),
+        Some(&TaskRecord {
+            task_arn: "arn:t".into(),
+            access_point_id: None,
+            task_definition_arn: Some("arn:td:2".into()),
+            workspace_access_point_id: None,
+        }),
     );
     let a = store.get(&p.id).unwrap().aws.unwrap();
     assert_eq!((a.task_arn.as_deref(), a.access_point_id.as_deref(), a.task_definition_arn.as_deref()),
@@ -720,7 +845,12 @@ fn the_log_task_is_the_stored_one_else_the_last_one_a_start_saw() {
     record_task(
         &store,
         &p.id,
-        Some(&TaskRecord { task_arn: "arn:first".into(), access_point_id: None, task_definition_arn: None }),
+        Some(&TaskRecord {
+            task_arn: "arn:first".into(),
+            access_point_id: None,
+            task_definition_arn: None,
+            workspace_access_point_id: None,
+        }),
     );
     record_task(&store, &p.id, None);
     assert_eq!(log_task_arn(&p).as_deref(), Some("arn:first"), "a cleared ARN still has a log");
@@ -795,3 +925,319 @@ async fn an_unattached_aws_project_gets_a_target_id_no_tunnel_can_have() {
     let local = Project::new("l".into(), Vec::new());
     assert_eq!(unattached_container_id(&local), None);
 }
+
+#[tokio::test]
+async fn a_persisted_starting_aws_project_with_a_task_arn_is_reconciled_against_ecs_on_load() {
+    use crate::commands::project_commands::needs_aws_reconcile;
+    use crate::storage::projects_store::settle_stale_statuses;
+
+    // The app quit mid-start: Starting, the task's ARN already recorded.
+    let mut p = aws_project(StorageMode::Hybrid);
+    p.status = ProjectStatus::Starting;
+    p.aws.as_mut().unwrap().task_arn = Some(task_arn("mid"));
+    let mut docker = Project::new("local".into(), vec![]);
+    docker.status = ProjectStatus::Starting;
+
+    let mut loaded = vec![p.clone(), docker];
+    assert!(settle_stale_statuses(&mut loaded));
+    // Not Stopped (that would hide a billed task): Error, ARN kept.
+    assert_eq!(loaded[0].status, ProjectStatus::Error);
+    assert_eq!(loaded[0].aws.as_ref().unwrap().task_arn, Some(task_arn("mid")));
+    assert_eq!(loaded[1].status, ProjectStatus::Stopped, "Docker is unchanged");
+    assert!(needs_aws_reconcile(&loaded[0]));
+
+    // ECS says it runs: Running.
+    let p = loaded[0].clone();
+    let fake = Fake::default().with_task(task(&p, "mid", "RUNNING", true));
+    let (_d, store) = store_with(&p);
+    assert!(matches!(reconcile_project(&fake, &store, &p, &find(&p)).await.unwrap(), Reconciled::Live(_)));
+    assert_eq!(store.get(&p.id).unwrap().status, ProjectStatus::Running);
+    // ECS says it is gone: Stopped, ARN cleared.
+    let (_d, store) = store_with(&p);
+    assert_eq!(reconcile_project(&Fake::default(), &store, &p, &find(&p)).await.unwrap(), Reconciled::Gone);
+    let after = store.get(&p.id).unwrap();
+    assert_eq!(after.status, ProjectStatus::Stopped);
+    assert_eq!(after.aws.unwrap().task_arn, None);
+}
+
+#[test]
+fn a_stopped_aws_project_is_reconciled_only_when_it_still_has_a_task_arn() {
+    use crate::commands::project_commands::needs_aws_reconcile;
+    let mut p = aws_project(StorageMode::Hybrid);
+    p.status = ProjectStatus::Stopped;
+    assert!(!needs_aws_reconcile(&p), "a clean stop clears the ARN");
+    p.aws.as_mut().unwrap().task_arn = Some(task_arn("left"));
+    assert!(needs_aws_reconcile(&p));
+    for s in [ProjectStatus::Running, ProjectStatus::Error, ProjectStatus::Starting, ProjectStatus::Stopping] {
+        p.status = s;
+        p.aws.as_mut().unwrap().task_arn = None;
+        assert!(needs_aws_reconcile(&p));
+    }
+}
+
+// ──────────────────────────────────────────── copy-at-connect (Q2)
+
+mod copy_at_connect {
+    use super::*;
+    use crate::host::aws_host::connect::*;
+    use crate::models::project::SecretsDelivery;
+    use crate::models::EnvVar;
+
+    fn connect_project(delivery: SecretsDelivery) -> Project {
+        let mut p = aws_project(StorageMode::Hybrid);
+        p.aws.as_mut().unwrap().secrets_delivery = delivery;
+        p
+    }
+
+    /// `(dir, name, data, mode)`.
+    type Upload = (String, String, Vec<u8>, u32);
+
+    #[derive(Default)]
+    struct FakeTarget {
+        calls: Mutex<Vec<String>>,
+        uploads: Mutex<Vec<Upload>>,
+        apply_result: Mutex<Option<(String, i64)>>,
+    }
+
+    impl ConnectTarget for FakeTarget {
+        async fn exec_root(&self, cmd: Vec<String>) -> Result<(String, i64), String> {
+            self.calls.lock().unwrap().push(format!("exec {}", cmd.join(" ")));
+            if cmd.get(1).map(String::as_str) == Some("--prepare") {
+                return Ok(("0123456789abcdef\n".into(), 0));
+            }
+            if let Some(r) = self.apply_result.lock().unwrap().clone() {
+                return Ok(r);
+            }
+            Ok(("triple-c-apply-connect: credentials applied\n".into(), 0))
+        }
+        async fn upload_root(&self, dir: &str, name: &str, data: &[u8], mode: u32) -> Result<(), String> {
+            self.calls.lock().unwrap().push(format!("upload {dir}/{name}"));
+            self.uploads.lock().unwrap().push((dir.into(), name.into(), data.to_vec(), mode));
+            Ok(())
+        }
+    }
+
+    fn bundle() -> ConnectBundle {
+        ConnectBundle {
+            files: vec![
+                ("ssh/id_ed25519".into(), b"PRIVATE".to_vec().into()),
+                ("ca/corp.crt".into(), b"PEM".to_vec().into()),
+            ],
+            env: vec![
+                ("GIT_TOKEN".into(), String::from("ghp_x").into()),
+                ("MULTI".into(), String::from("a=b\nc").into()),
+            ],
+        }
+    }
+
+    #[tokio::test]
+    async fn a_push_prepares_uploads_root_only_then_applies() {
+        let t = FakeTarget::default();
+        push_connect_bundle(&t, &bundle()).await.unwrap();
+        assert_eq!(
+            *t.calls.lock().unwrap(),
+            vec![
+                "exec /usr/local/bin/triple-c-apply-connect --prepare",
+                "upload /dev/shm/triple-c/connect/0123456789abcdef/ssh/id_ed25519",
+                "upload /dev/shm/triple-c/connect/0123456789abcdef/ca/corp.crt",
+                "upload /dev/shm/triple-c/connect/0123456789abcdef/connect.env",
+                "exec /usr/local/bin/triple-c-apply-connect 0123456789abcdef",
+            ]
+        );
+        let uploads = t.uploads.lock().unwrap();
+        assert!(uploads.iter().all(|u| u.3 == 0o600), "every staged file is 0600");
+        assert_eq!(uploads[0].2, b"PRIVATE");
+        // KEY=<base64> lines: a newline or `=` in a value reads back whole.
+        assert_eq!(
+            String::from_utf8(uploads[2].2.clone()).unwrap(),
+            "GIT_TOKEN=Z2hwX3g=\nMULTI=YT1iCmM=\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_apply_reports_its_output_and_an_old_image_says_so() {
+        let t = FakeTarget::default();
+        *t.apply_result.lock().unwrap() = Some(("line\ntriple-c-apply-connect: /x is missing\n".into(), 1));
+        let e = push_connect_bundle(&t, &bundle()).await.unwrap_err();
+        assert!(e.contains("failed (1)") && e.contains("/x is missing"), "{e}");
+        assert!(!e.contains("ghp_x"));
+
+        let t = FakeTarget::default();
+        *t.apply_result.lock().unwrap() = Some(("not found".into(), 127));
+        let e = push_connect_bundle(&t, &bundle()).await.unwrap_err();
+        assert!(e.contains("predates copying credentials"), "{e}");
+
+        // A bad file key is refused before anything is uploaded under it.
+        let t = FakeTarget::default();
+        let bad = ConnectBundle { files: vec![("ssh/../x".into(), Vec::new().into())], env: vec![] };
+        assert!(push_connect_bundle(&t, &bad).await.is_err());
+        assert!(t.uploads.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn only_a_well_formed_connect_id_is_used_as_a_path() {
+        assert_eq!(parse_nonce("noise\n0123456789abcdef\n").unwrap(), "0123456789abcdef");
+        for bad in ["", "../../etc/passwd", "0123456789ABCDEF", "0123456789abcde", "0123456789abcdef0"] {
+            assert!(parse_nonce(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_bundle_never_shows_its_values() {
+        let shown = format!("{:?}", bundle());
+        assert!(shown.contains("GIT_TOKEN") && shown.contains("ssh/id_ed25519"), "{shown}");
+        assert!(!shown.contains("ghp_x") && !shown.contains("PRIVATE"), "{shown}");
+    }
+
+    #[test]
+    fn the_bundle_is_the_ssh_and_ca_files_and_the_credential_variables() {
+        let base = tempfile::tempdir().unwrap();
+        let ssh = base.path().join("ssh");
+        std::fs::create_dir(&ssh).unwrap();
+        std::fs::write(ssh.join("id_ed25519"), b"KEY").unwrap();
+        let mut p = connect_project(SecretsDelivery::CopyAtConnect);
+        p.ssh_key_path = Some(ssh.to_str().unwrap().into());
+        p.git_token = Some("ghp_tok".into());
+        p.custom_env_vars = vec![EnvVar { key: "MY_KEY".into(), value: "v1".into() }];
+        let settings = AppSettings {
+            global_custom_env_vars: vec![EnvVar { key: "GLOBAL_KEY".into(), value: "g".into() }],
+            ..Default::default()
+        };
+        let b = connect_credentials(&p, &settings).unwrap();
+        assert_eq!(b.files.len(), 1);
+        assert_eq!((b.files[0].0.as_str(), b.files[0].1.as_slice()), ("ssh/id_ed25519", &b"KEY"[..]));
+        let env: HashMap<String, String> = b.env.iter().map(|(k, v)| (k.clone(), v.to_string())).collect();
+        assert_eq!(env["GIT_TOKEN"], "ghp_tok");
+        assert_eq!(env["MY_KEY"], "v1");
+        assert_eq!(env["GLOBAL_KEY"], "g");
+        assert!(!env.contains_key("TZ") && !env.contains_key("CLAUDE_CODE_SETTINGS_JSON"));
+        assert!(b.env.iter().all(|(k, _)| crate::aws::workspace::is_credential_key(
+            k,
+            &["MY_KEY".to_string(), "GLOBAL_KEY".to_string()]
+        )));
+    }
+
+    #[test]
+    fn a_terminal_gets_the_api_keys_even_when_a_file_is_unreadable() {
+        let mut p = connect_project(SecretsDelivery::CopyAtConnect);
+        p.ssh_key_path = Some("/nonexistent/ssh-dir".into());
+        p.ca_cert_path = Some("/nonexistent/ca.pem".into());
+        p.git_token = Some("ghp_tok".into());
+        let settings = AppSettings::default();
+        assert!(connect_credentials(&p, &settings).is_err(), "the push needs the files");
+        let env: HashMap<String, String> =
+            connect_env(&p, &settings).into_iter().map(|(k, v)| (k, v.to_string())).collect();
+        assert_eq!(env["GIT_TOKEN"], "ghp_tok");
+    }
+
+    #[test]
+    fn a_copy_at_connect_terminal_carries_the_credentials_and_a_secrets_manager_one_does_not() {
+        let creds = || Ok(bundle().env);
+        let p = connect_project(SecretsDelivery::CopyAtConnect);
+        let spec = crate::host::sessions::session_spec(
+            vec!["bash".into(), "-l".into()],
+            true,
+            terminal_env_with(&p, creds),
+        );
+        assert_eq!(spec.env, vec!["GIT_TOKEN=ghp_x".to_string(), "MULTI=a=b\nc".to_string()]);
+        assert!(spec.tty && spec.user == "claude");
+        assert_eq!(spec.working_dir.as_deref(), Some("/workspace"));
+
+        let p = connect_project(SecretsDelivery::SecretsManager);
+        let env = terminal_env_with(&p, || panic!("not gathered for Secrets Manager"));
+        assert!(crate::host::sessions::session_spec(vec!["bash".into()], true, env).env.is_empty());
+
+        // A local project never; a failure opens the terminal without them.
+        let mut local = connect_project(SecretsDelivery::CopyAtConnect);
+        local.host_id = None;
+        assert!(terminal_env_with(&local, || panic!("local")).is_empty());
+        let p = connect_project(SecretsDelivery::CopyAtConnect);
+        assert!(terminal_env_with(&p, || Err("no CA file".into())).is_empty());
+    }
+
+    #[test]
+    fn only_a_connected_copy_at_connect_project_gets_a_push() {
+        let p = connect_project(SecretsDelivery::SecretsManager);
+        assert!(!copies_at_connect(&p));
+        assert!(!spawn_connect_push(&p, &AppSettings::default(), |_| panic!("no push")));
+        let p = connect_project(SecretsDelivery::CopyAtConnect);
+        assert!(copies_at_connect(&p));
+        // No tunnel registered for it: nothing to push to.
+        assert!(!spawn_connect_push(&p, &AppSettings::default(), |_| panic!("no tunnel")));
+    }
+    #[test]
+    fn a_sidecar_terminal_keeps_the_tasks_own_token() {
+        use crate::models::project::{Backend, OpenAiCompatibleConfig};
+        let mut p = connect_project(SecretsDelivery::CopyAtConnect);
+        p.backend = Backend::OpenAiCompatible;
+        p.openai_compatible_config = Some(OpenAiCompatibleConfig {
+            base_url: "http://host.docker.internal:4000".into(),
+            api_key: Some("sk-local".into()),
+            model_id: Some("gpt".into()),
+            haiku_model_id: None,
+        });
+        p.git_token = Some("ghp_tok".into());
+        let settings = AppSettings::default();
+        let keys = |p: &Project| -> Vec<String> {
+            connect_env(p, &settings).into_iter().map(|(k, _)| k).collect()
+        };
+        assert!(keys(&p).contains(&"ANTHROPIC_AUTH_TOKEN".to_string()));
+        p.aws.as_mut().unwrap().gateway_sidecar = true;
+        let with_sidecar = keys(&p);
+        assert!(!with_sidecar.contains(&"ANTHROPIC_AUTH_TOKEN".to_string()), "{with_sidecar:?}");
+        assert!(with_sidecar.contains(&"GIT_TOKEN".to_string()));
+    }
+}
+
+// ──────────────────────────────────────────── gateway sidecar (Q7)
+
+mod gateway_sidecar_inputs {
+    use super::*;
+    use crate::models::gateway_settings::GatewayModel;
+    use crate::models::project::Backend;
+
+    fn sidecar(on: bool) -> (Project, AppSettings) {
+        let mut p = aws_project(StorageMode::Ephemeral);
+        p.backend = Backend::OpenAiCompatible;
+        p.aws.as_mut().unwrap().gateway_sidecar = on;
+        let mut s = AppSettings::default();
+        s.gateway.models = vec![GatewayModel { name: "gpt".into(), model_id: "gpt-5".into() }];
+        (p, s)
+    }
+
+    #[test]
+    fn off_reads_no_key() {
+        let (p, s) = sidecar(false);
+        assert!(gateway_sidecar(&p, &s, || panic!("no keychain read")).unwrap().is_none());
+    }
+
+    #[test]
+    fn on_renders_a_key_free_config_and_a_fresh_master_key_each_start() {
+        let (p, s) = sidecar(true);
+        let a = gateway_sidecar(&p, &s, || Ok(Some("sk-provider".into()))).unwrap().unwrap();
+        let b = gateway_sidecar(&p, &s, || Ok(Some("sk-provider".into()))).unwrap().unwrap();
+        let (pa, pb) = (a.payload(), b.payload());
+        assert_eq!(pa.api_key, "sk-provider");
+        assert!(!pa.config.contains("sk-provider") && !pa.config.contains(pa.master_key));
+        assert!(pa.config.contains("os.environ/TRIPLEC_GATEWAY_API_KEY"));
+        assert!(pa.config.contains("model: \"openai/gpt-5\""));
+        assert_eq!(pa.master_key.len(), 64);
+        assert_ne!(pa.master_key, pb.master_key);
+    }
+
+    #[test]
+    fn on_refuses_a_missing_key_backend_or_model() {
+        let (p, s) = sidecar(true);
+        for key in [None, Some("  ".to_string())] {
+            let e = gateway_sidecar(&p, &s, || Ok(key.clone())).err().unwrap();
+            assert!(e.contains("provider API key"), "{e}");
+        }
+        let mut wrong = p.clone();
+        wrong.backend = Backend::Anthropic;
+        assert!(gateway_sidecar(&wrong, &s, || Ok(Some("k".into()))).err().unwrap().contains("OpenAI Compatible"));
+        let mut empty = s.clone();
+        empty.gateway.models.clear();
+        assert!(gateway_sidecar(&p, &empty, || Ok(Some("k".into()))).err().unwrap().contains("Model Gateway"));
+    }
+}
+

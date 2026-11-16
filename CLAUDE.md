@@ -284,7 +284,7 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
     users have migrated.
 - **`host/`** — Where a project's container runs, and the only way into it. `ContainerTarget`
   (`Docker`, and `Agent` — reached through the in-container `triple-c-agent` by `agent.rs`, per
-  `docs/superpowers/specs/2026-11-13-triple-c-agent-protocol.md`; AWS planned —
+  `docs/superpowers/specs/2026-11-13-triple-c-agent-protocol.md`; AWS host, designed in
   `docs/superpowers/specs/2026-11-13-aws-ecs-host-design.md`)
   wraps execs, file transfer and `is_running`; `sessions.rs` holds `ExecSessionManager`.
   `ssm.rs` is the AWS transport to an `Agent` target: one SSM port-forward per task, run through
@@ -300,6 +300,17 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   every tunnel (`for_project` is `None` while none is open; `for_project_waiting` covers the
   background re-attach after an app restart). AWS SDK calls stay in `aws/` (`runtime.rs`,
   `tasks.rs`, `workspace.rs`).
+  `port_forwards.rs` is an AWS project's port mappings: each TCP mapping is a **loopback-only**
+  auth-bridge `PortForward::bind_mapping` over socat-over-attach. Two deliberate differences from
+  Docker: it reaches the workspace's **loopback** (Docker publishes to eth0), so the agent port,
+  the browser-view ranges and — with `gateway_sidecar` on — the sidecar's 4000 are refused; and it
+  has **no gate** (no first-byte wait, no cross-site check, unlike the bridge). Validated on save
+  (rows the save adds/edits; everything when newly on AWS or the sidecar is switched); a stored row
+  that would be refused is skipped with a warning at connect. Opens are serialised per project and
+  re-read the stored mappings under that lock; unchanged forwards are kept with their connections.
+  Opened after every connect and on a save while connected; closed by every `tunnels::close*`
+  path. A failing mapping is a `workspace-warning` (`topic: "ports"`). An idle listener makes no
+  agent request; a connection carrying traffic is activity (keeps the workspace from idling).
   `agent.rs` reuses `docker/exec.rs`'s `OneshotOutput`, host-file reader and uid probe so the two
   variants cannot drift; an `Agent` target's token never appears in `Debug` or error text.
   **Container-interior code must go through `ContainerTarget`, never `docker::exec`, bollard or
@@ -355,9 +366,24 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   through the agent, closes the project's terminals and auth bridge (so nothing is written after the
   push's snapshot), may push first (under an in-container `timeout`, since the agent does not kill an
   exec the client gave up on), then writes `pushed` or `discard` to `/run/triple-c/stop-reason`
-  (root-owned; the entrypoint's TERM hook reads it, and the idle watcher writes `idle`) so the hook
+  (root-owned; the entrypoint's TERM hook reads it, and the idle watcher writes `idle` or `lifetime`) so the hook
   doesn't push twice; the marker is cleared if StopTask fails. Claude Code's sandbox is forced off in
   the generated settings (bubblewrap can't create namespaces on Fargate, verified live).
+  **LLM gateway sidecar** (`gateway_sidecar`, Q7): a second, `essential: false` container `gateway`
+  (`docker::gateway::registry_image_ref`, digest-pinned, amd64+arm64; `memoryReservation` 512; no
+  `environment`, no `dependsOn`) whose `secrets` are exactly `TRIPLEC_GATEWAY_{CONFIG,API_KEY,MASTER_KEY}`
+  — the workspace container gets every key but those. The config is `sidecar_config` (Docker's
+  `render_config` with `os.environ/…` key references, so it holds no key); `/bin/sh -c` writes it to a
+  0600 `/tmp/litellm.yaml` and `exec`s LiteLLM on **127.0.0.1:4000** only (the image's own entrypoint
+  can't write a file). The master key is **random per task start** (the Docker gateway's never leaves
+  the machine); the payload overrides `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN` with the sidecar's,
+  and under copy-at-connect that token stays in the secret too (R1; terminals don't override it).
+  Log streams: `<prefix>/gateway/<task-id>` (the tail reads `workspace` only). Needs the
+  OpenAI-compatible backend, a gateway model and ≥ 1 vCPU / 2 GiB; off = the request is unchanged.
+  **Cost estimate** (`pricing.rs`, Q5): `pricing:GetProducts` (us-east-1, `AmazonECS`, filters in
+  `FILTERS`) → per-region x86/ARM rates cached at `<data_dir>/triple-c/aws-pricing/<region>.json` for
+  24 h; `aws_cost_estimate(connection_id, region, config)` never errors — denied/offline/slow (8 s) is
+  `None` ("Estimate unavailable"), a failed region isn't re-asked for 5 min, a stale cache still answers.
   **Environments are OpenTofu modules** (`aws/terraform/{environment,user-onboard,permissions-boundary}`;
   spec D2–D10). `tofu_modules.rs` embeds them and is the **only** place the shared names are built
   (environment, `/triple-c/environments/<env>` record, owner key — `sha256("<region>:<aws:userid>")`,
@@ -396,20 +422,89 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   every terminal's env and the files hold private keys). Repos clone in the background after the agent
   starts (terminals are usable before they arrive). Hybrid storage mounts EFS at `/mnt/triple-c-home`
   and symlinks `~/.claude`, `~/.claude.json`, `~/.ssh` into it (mounting over `/home/claude` would hide
-  the image's tooling); root never follows those links outside the mount (`aws_hybrid_ssh_dir`). On
-  TERM the hook pushes unsaved work to a `triple-c/wip/<stamp>` branch via a temporary index (the
-  user's index is untouched; needs the task definition's `stopTimeout` raised, 120 s) unless the stop
-  marker says the app handled it. The idle watcher runs as root under a supervisor and signals the
+  the image's tooling); root never follows those links outside the mount (`aws_hybrid_ssh_dir`). EFS storage
+  is Hybrid plus a second access point (root `/triple-c-workspaces/<owner_key>/<project>`, a sibling of
+  the home roots) mounted straight at `/workspace`; the entrypoint links home state the same way
+  (`aws_storage_links_home`) and never creates or chowns `/workspace`. Because `/workspace` then
+  outlives the task, `clone_repos` clones into `/workspace/.triple-c-clone/<folder>` and renames
+  into place only on success; it never deletes anything at a final path, empties scratch at each
+  start, and `triple-c-wip-push` skips scratch.
+  Switching EFS → Hybrid/Ephemeral keeps `workspace_access_point_id` (store-owned) until "Remove AWS
+  resources" with discard deletes both access points. On
+  TERM the hook pushes unsaved work to the run's `triple-c/wip/<run-id>-<folder>` branch via a
+  temporary index (the user's index is untouched; needs the task definition's `stopTimeout` raised,
+  120 s) unless the stop marker says the app handled it.
+  **One WIP branch per task run and folder:** `aws_prepare_run` (right after the agent-token block)
+  writes `/run/triple-c/run-id` (`<UTC stamp>-<task id 8 | local>`, task id from ECS task metadata)
+  and `start-epoch`; `/run/triple-c` is root 0711 (the stop guard keeps that mode — at 0700 `claude`
+  could not read the run id). The folder is sanitised to `[A-Za-z0-9._-]` (a name that changed gets
+  `-<8 hex of sha256(raw name)>`, so `a b` and `a_b` never share a ref) and the ref checked with
+  `git check-ref-format`; later pushes force (`+`) only that run's own branch, and a tree equal to
+  `/run/triple-c/wip-last/<folder>` (claude-owned dir, written after a successful push) is skipped.
+  No usable run id (Docker) keeps a per-push `<stamp>-<folder>`, never forced.
+  **Setup script** (`TRIPLEC_SETUP_SCRIPT`, unset before the snapshot like `TRIPLEC_FILES`): written
+  to `/run/triple-c-setup/script` (root 0755 dir; root opens `log` and hands the descriptor over, so
+  claude writes nothing there), run as `claude`, `bash -e`, stdin `/dev/null`,
+  `timeout -k 10 1800`, chained after the background clone's `done` in the same background
+  subshell; `status` is `running` from the start until `ok` / `failed <code>` (a chain that dies
+  early writes `failed`, so the idle stop is never blocked). `triple-c-workspace-status` (python,
+  no secrets) prints `{clone:{done,repos},setup:{state,code,tail}}`. Edited in HostSection's
+  "Setup script" textarea (saved on blur, blank → `null`; the 32 KiB UTF-8 limit is checked in TS
+  with Rust's own message, `setupScriptProblem`).
+  **The start does not wait for them** (it ends after "Connecting…": Running, lock released);
+  `aws_host::spawn_follow` follows in a background task (`host/aws_host/status.rs`: background exec
+  every 2 s, at most 35 min, holds no project lock; ended by `tunnels::cancel_follow` on Stop/Remove
+  and by any tunnel close or app exit). Its only output is a `workspace-warning` event (warning
+  toast) for a failure it saw happen or one on a task this start ran; progress shows in Project
+  Home's Overview card, which polls `aws_workspace_status` every 5 s while Running and visible.
+  At load, a Starting/Stopping AWS project becomes Error (not Stopped — a crash mid-start may have
+  left a billed task), and `reconcile_aws_projects` also checks a Stopped one still holding a task ARN.
+  **Lifetime cap** (`TRIPLEC_MAX_LIFETIME_MINUTES`, advisory — sudo can kill it): the idle watcher
+  (started when idle stop *or* a non-zero cap is set) pushes best effort, records `lifetime` and
+  sends TERM; the hook exits 76 (`aws::tasks::LIFETIME_EXIT_CODE` → `StopKind::LifetimeCap` →
+  `lifetime` toast). HostSection shows a non-zero cap ("stops workspaces after N h (advisory)") from
+  `aws_environment_max_hours` (reads the environment record; `None` when it can't, never an error).
+  The idle watcher runs as root under a supervisor and signals the
   entrypoint's own PID (not PID 1, which is docker-init), so idle and ECS stops share one trap.
   Idle = the agent's `last_activity_unix` older than N minutes (open-but-silent attaches/tunnels
   don't count; requests with `X-Triple-C-Background: 1` — the auth bridge's and the file viewer's polls — never do),
-  no `claude`, no scheduler job, no running clone, and no unsaved git work: with the WIP push on the
+  no `claude`, no scheduler job, no running clone or setup script, and no unsaved git work: with the WIP push on the
   watcher pushes *before* signalling and stays up if that fails; with it off, dirty repos keep the
   workspace up; activity during the watcher's push sends it back to watching. A repo the background
   clone is still writing (`/run/triple-c-clone/repos` last says `cloning`, no `done`) is skipped by
   `triple-c-wip-push` (dry run: `"cloning": true`). The stop trap is set before any background work
   starts. An idle stop exits 75 (`aws::tasks::IDLE_EXIT_CODE`) so the death watch can tell it
   from a crash (`classify_stop` → the `ContainerExited` toast).
+  **Copy-at-connect** (`secrets_delivery: copy_at_connect`, Q2): the secret keeps settings, repos and
+  the agent token but no `TRIPLEC_FILES` and no credential pairs (`SECRET_ENV_KEYS` + every custom
+  variable; `TRIPLEC_CREDENTIALS=connect` instead — the gateway sidecar's `TRIPLEC_GATEWAY_*` keys
+  stay, R1). After every connect (start, attach, background re-attach) `aws_host::connect`
+  uploads the files and `connect.env` (`KEY=<base64>` lines) as root into this connect's own
+  `/dev/shm/triple-c/connect/<nonce>/` (root 0700 tmpfs; `--prepare` prints the nonce, so two
+  connects at once never mix) and runs `triple-c-apply-connect <nonce>`: CA install as root, SSH merge and git
+  credential helper **as `claude`** (root never walks a live `~/.ssh`), `/run/triple-c/connected`,
+  then a background re-clone of `failed` repos only (GIT_TOKEN in that clone's env only). The
+  first clone waits up to 5 min for `connected` (`aws_wait_connect`) — when there are repos **or a
+  setup script** (the script runs after the clone and needs the CA, SSH and Git credentials). The
+  CA files are swapped in (`connect-ca.new` → `connect-ca`, old removed last), so a failed move
+  keeps the CA installed before. Terminals the app opens add
+  the pairs to their own `ExecSpec.env` (`aws_host::terminal_env`, pairs only — no file read);
+  nothing reaches the agent's snapshot, so cron/scheduled jobs and the setup script never get them.
+  A failed push is a `workspace-warning`. Hybrid/EFS do **not** link `~/.ssh` to EFS under
+  copy-at-connect (R6: keys vanish with the task). When a copy-at-connect start finds the secret
+  already there (CreateSecret's ResourceExists; a new project's secret is never read first) and it
+  `holds_credentials`, it is force-deleted and created again (R7: `PutSecretValue` would keep the
+  old values as AWSPREVIOUS); `TRIPLE_C_CUSTOM_ENV` is left out too. A replace whose re-create
+  times out (AWS still finishing the forced delete) leaves no secret; every secret write retries
+  while the name is pending deletion (≤ 30 s), then says to start again in a minute.
+  **Copy-at-connect limits** (also listed in HostSection's notes): there is no corporate CA until
+  the first connect (Claude Code's self-update may fail behind a TLS-inspecting proxy until then);
+  SSH keys, a Git token or variables removed from the project stay in the running task until it
+  stops (a connect only adds/overwrites them; a removed CA does go at the next connect); the setup script is not re-run
+  after a later connect's re-clone of a failed repo.
+  The re-clone closes the apply lock's fd (a later connect never waits for it); `--prepare` takes it.
+  The functions both scripts use live in `container/entrypoint-lib.sh`
+  (`/usr/local/lib/triple-c/`), sourced by the entrypoint first; it only defines things.
   **The `TRIPLEC_` env prefix is reserved** on both hosts (`RESERVED_ENV_PREFIXES`; `workspace.rs`
   drops custom variables in it): the entrypoint's settings live there.
 - **Browser runtime libraries are baked in; browser *binaries* are not.** A layer runs
@@ -431,7 +526,7 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
     approach converges on the worst state: a 400 MB browser present with its libraries gone.
   - The layer sits immediately after Node (npx is its only prerequisite) and well above the shim
     `COPY`s, so editing a shim does not re-run a multi-hundred-megabyte apt install.
-- **`entrypoint.sh`** — UID/GID remapping to match host user, SSH key setup (`sync_host_ssh` *merges* the host dir into `~/.ssh`; never wipe it — container-made keys live there on the home volume), git config, docker socket permissions, Claude Code settings.json injection, then stays resident **as root** waiting on a root-owned
+- **`entrypoint.sh`** (+ `entrypoint-lib.sh`, the CA/SSH/git-credential/clone functions it sources) — UID/GID remapping to match host user, SSH key setup (`sync_host_ssh` *merges* the host dir into `~/.ssh`; never wipe it — container-made keys live there on the home volume), git config, docker socket permissions, Claude Code settings.json injection, then stays resident **as root** waiting on a root-owned
   `triple-c-keepalive` sleep (respawned if killed; SIGTERM trap so `docker stop` is immediate).
   **Never hand the container's lifetime to a process the `claude` user owns** — it used to end in
   `exec su … claude -c "exec sleep infinity"`, and any `pkill sleep` / `kill -9 -1` a Claude

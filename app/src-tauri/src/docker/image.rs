@@ -10,6 +10,10 @@ use crate::models::container_config;
 
 const DOCKERFILE: &str = include_str!("../../../../container/Dockerfile");
 const ENTRYPOINT: &str = include_str!("../../../../container/entrypoint.sh");
+/// Sourced by the entrypoint and by `triple-c-apply-connect`; holds the
+/// `sync_host_ssh` block the tests below run.
+const ENTRYPOINT_LIB: &str = include_str!("../../../../container/entrypoint-lib.sh");
+const APPLY_CONNECT: &str = include_str!("../../../../container/triple-c-apply-connect");
 const SCHEDULER: &str = include_str!("../../../../container/triple-c-scheduler");
 const TASK_RUNNER: &str = include_str!("../../../../container/triple-c-task-runner");
 const OSC52_CLIPBOARD: &str = include_str!("../../../../container/osc52-clipboard");
@@ -19,6 +23,7 @@ const TRIPLE_C_OPEN: &str = include_str!("../../../../container/triple-c-open");
 const PLAYWRIGHT_HEAL: &str = include_str!("../../../../container/triple-c-playwright-heal");
 const WIP_PUSH: &str = include_str!("../../../../container/triple-c-wip-push");
 const IDLE_WATCH: &str = include_str!("../../../../container/triple-c-idle-watch");
+const WORKSPACE_STATUS: &str = include_str!("../../../../container/triple-c-workspace-status");
 
 static MISSION_CONTROL_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/../../container/mission-control");
 static SKILLS_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/../../container/skills");
@@ -240,6 +245,8 @@ fn create_build_context() -> Result<Vec<u8>, std::io::Error> {
 
         append_file_to_archive(&mut archive, "Dockerfile", DOCKERFILE.as_bytes(), 0o644)?;
         append_file_to_archive(&mut archive, "entrypoint.sh", ENTRYPOINT.as_bytes(), 0o755)?;
+        append_file_to_archive(&mut archive, "entrypoint-lib.sh", ENTRYPOINT_LIB.as_bytes(), 0o644)?;
+        append_file_to_archive(&mut archive, "triple-c-apply-connect", APPLY_CONNECT.as_bytes(), 0o755)?;
         append_file_to_archive(&mut archive, "triple-c-scheduler", SCHEDULER.as_bytes(), 0o755)?;
         append_file_to_archive(&mut archive, "triple-c-task-runner", TASK_RUNNER.as_bytes(), 0o755)?;
         append_file_to_archive(&mut archive, "osc52-clipboard", OSC52_CLIPBOARD.as_bytes(), 0o755)?;
@@ -249,6 +256,12 @@ fn create_build_context() -> Result<Vec<u8>, std::io::Error> {
         append_file_to_archive(&mut archive, "triple-c-playwright-heal", PLAYWRIGHT_HEAL.as_bytes(), 0o755)?;
         append_file_to_archive(&mut archive, "triple-c-wip-push", WIP_PUSH.as_bytes(), 0o755)?;
         append_file_to_archive(&mut archive, "triple-c-idle-watch", IDLE_WATCH.as_bytes(), 0o755)?;
+        append_file_to_archive(
+            &mut archive,
+            "triple-c-workspace-status",
+            WORKSPACE_STATUS.as_bytes(),
+            0o755,
+        )?;
 
         append_embedded_dir(&mut archive, &MISSION_CONTROL_DIR, "mission-control")?;
         append_embedded_dir(&mut archive, &SKILLS_DIR, "skills")?;
@@ -305,17 +318,18 @@ mod build_context_tests {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::ENTRYPOINT;
+    use super::ENTRYPOINT_LIB;
     use std::fs;
     use std::path::Path;
     use std::process::Command;
 
-    /// The `sync_host_ssh` function from `entrypoint.sh`, cut out between its
-    /// markers so it can be run against temp dirs instead of the real ~/.ssh.
+    /// The `sync_host_ssh` function from `entrypoint-lib.sh` (which
+    /// `entrypoint.sh` sources), cut out between its markers so it can be run
+    /// against temp dirs instead of the real ~/.ssh.
     fn sync_fn() -> &'static str {
-        let start = ENTRYPOINT.find("# >>> sync_host_ssh").expect("start marker");
-        let end = ENTRYPOINT.find("# <<< sync_host_ssh").expect("end marker");
-        &ENTRYPOINT[start..end]
+        let start = ENTRYPOINT_LIB.find("# >>> sync_host_ssh").expect("start marker");
+        let end = ENTRYPOINT_LIB.find("# <<< sync_host_ssh").expect("end marker");
+        &ENTRYPOINT_LIB[start..end]
     }
 
     fn sync(src: &Path, dest: &Path) -> String {

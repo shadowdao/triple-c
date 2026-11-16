@@ -94,3 +94,14 @@ variable "log_retention_days" {
     error_message = "log_retention_days must be a CloudWatch Logs retention value (1, 3, 5, 7, 14, 30, 60, 90, ...)."
   }
 }
+
+variable "max_workspace_hours" {
+  description = "Advisory cap on how long one workspace task may run, in hours (0 = no cap, at most 168). The app reads it from the environment record and enforces it inside the workspace."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.max_workspace_hours == floor(var.max_workspace_hours) && var.max_workspace_hours >= 0 && var.max_workspace_hours <= 168
+    error_message = "max_workspace_hours must be a whole number from 0 to 168."
+  }
+}

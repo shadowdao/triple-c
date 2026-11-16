@@ -10,9 +10,23 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 const ENTRYPOINT: &str = include_str!("../../../../container/entrypoint.sh");
+/// The functions `entrypoint.sh` and `triple-c-apply-connect` both source.
+const LIB: &str = include_str!("../../../../container/entrypoint-lib.sh");
+const APPLY_CONNECT: &str = include_str!("../../../../container/triple-c-apply-connect");
 const WIP_PUSH: &str = include_str!("../../../../container/triple-c-wip-push");
 const IDLE_WATCH: &str = include_str!("../../../../container/triple-c-idle-watch");
 const SCHEDULER: &str = include_str!("../../../../container/triple-c-scheduler");
+const WORKSPACE_STATUS: &str = include_str!("../../../../container/triple-c-workspace-status");
+
+/// A marked block of `entrypoint.sh` or, failing that, of the library it
+/// sources.
+fn eblock(name: &str) -> &'static str {
+    if ENTRYPOINT.contains(&format!("# >>> {name}\n")) {
+        block(ENTRYPOINT, name)
+    } else {
+        block(LIB, name)
+    }
+}
 
 fn block<'a>(text: &'a str, name: &str) -> &'a str {
     let start = text
@@ -24,12 +38,13 @@ fn block<'a>(text: &'a str, name: &str) -> &'a str {
     &text[start..end]
 }
 
-/// The aws blocks with the container user switched off: no `su claude`, no
-/// chown to a user the test host may not have.
+/// The aws blocks (after the library's shared settings, `aws_lib`, which the
+/// entrypoint sources first) with the container user switched off: no
+/// `su claude`, no chown to a user the test host may not have.
 fn aws_blocks(names: &[&str]) -> String {
-    names
-        .iter()
-        .map(|n| block(ENTRYPOINT, n).replace("triplec_run_as=claude", "triplec_run_as="))
+    std::iter::once("aws_lib")
+        .chain(names.iter().copied())
+        .map(|n| eblock(n).replace("triplec_run_as=claude", "triplec_run_as="))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -101,7 +116,8 @@ fn files_script(tmp: &Path) -> String {
         "{blocks}\n{agent}\n\
          env -0 > \"$1/env\"\n\
          printf '%s\\0' \"${{agent_env[@]}}\" > \"$1/agent_env\"\n\
-         printf '%s' \"${{triplec_repos_json:-}}\" > \"$1/repos\"\n"
+         printf '%s' \"${{triplec_repos_json:-}}\" > \"$1/repos\"\n\
+         printf '%s' \"${{triplec_setup_script:-}}\" > \"$1/setup\"\n"
     )
 }
 
@@ -129,6 +145,7 @@ fn aws_files_decode_to_the_host_dirs_mode_600_and_leave_the_environment() {
             ("TRIPLEC_HOST", "aws"),
             ("TRIPLEC_FILES", &files),
             ("TRIPLEC_REPOS", repos),
+            ("TRIPLEC_SETUP_SCRIPT", "echo SETUP-BODY"),
             ("TRIPLEC_AGENT_TOKEN", "test-token-not-real"),
         ],
         &[],
@@ -178,6 +195,10 @@ fn aws_files_decode_to_the_host_dirs_mode_600_and_leave_the_environment() {
     assert!(!agent_env.contains(&b64("PRIVATE-KEY-BODY")));
     // The repo list survives as an unexported shell variable for clone_repos.
     assert_eq!(fs::read_to_string(tmp.path().join("repos")).unwrap(), repos);
+    // So does the setup script, for aws_prepare_run to write to its file.
+    assert!(!env.contains("TRIPLEC_SETUP_SCRIPT=") && !env.contains("SETUP-BODY"), "{env}");
+    assert!(!agent_env.contains("TRIPLEC_SETUP_SCRIPT") && !agent_env.contains("SETUP-BODY"));
+    assert_eq!(fs::read_to_string(tmp.path().join("setup")).unwrap(), "echo SETUP-BODY");
 }
 
 #[test]
@@ -271,6 +292,42 @@ fn link_persistent_home_without_the_mount_changes_nothing() {
     assert!(out.status.success());
     assert!(text(&out).contains("not mounted"), "{}", text(&out));
     assert!(fs::symlink_metadata(home.join(".claude")).unwrap().is_dir());
+}
+
+#[test]
+fn efs_storage_links_home_state_like_hybrid() {
+    let script = format!(
+        "{}\nfor m in hybrid efs ephemeral '' HYBRID efsx; do aws_storage_links_home \"$m\" && echo \"$m:yes\" || echo \"$m:no\"; done\n",
+        aws_blocks(&["aws_env", "aws_home"])
+    );
+    let out = bash(&script, &[], &[], &[]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "hybrid:yes\nefs:yes\nephemeral:no\n:no\nHYBRID:no\nefsx:no\n"
+    );
+    // The call site asks it, rather than testing for `hybrid` alone (an EFS
+    // task would otherwise get no home links at all).
+    let call = ENTRYPOINT
+        .lines()
+        .position(|l| l.trim_start().starts_with("link_persistent_home /home/claude"))
+        .unwrap();
+    let above = ENTRYPOINT.lines().nth(call - 1).unwrap();
+    assert_eq!(
+        above.trim(),
+        "if [ \"$triplec_aws\" = 1 ] && aws_storage_links_home \"${TRIPLEC_STORAGE:-}\"; then"
+    );
+}
+
+#[test]
+fn efs_workspace_check_warns_only_when_workspace_is_not_mounted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = format!("{}\naws_efs_workspace_check \"$1\"; echo \"rc=$?\"\n", aws_blocks(&["aws_env", "aws_home"]));
+    let out = bash(&script, &[tmp.path()], &[], &[]);
+    assert!(text(&out).contains("is not mounted"), "{}", text(&out));
+    assert!(text(&out).contains("rc=0"), "{}", text(&out));
+    let out = bash(&script, &[Path::new("/proc")], &[], &[]);
+    assert!(!text(&out).contains("warning"), "{}", text(&out));
+    assert!(text(&out).contains("rc=0"), "{}", text(&out));
 }
 
 /// `write_claude_json` with the Hybrid mount at `<tmp>/mnt`, in aws mode or not.
@@ -426,6 +483,92 @@ fn clone_repos_clones_skips_existing_and_reports_failures_without_failing() {
     );
 }
 
+/// clone_repos over `ws` (persistent, as with EFS storage), its status in `status`.
+fn clone_into(ws: &Path, status: &Path, json: &str) -> (String, String) {
+    fs::create_dir_all(status).unwrap();
+    let script = format!("{}\nclone_repos \"$JSON\" \"$1\" \"$2\"\n", aws_blocks(&["aws_env", "aws_repos"]));
+    let out = bash(&script, &[ws, status], &[("JSON", json)], &[]);
+    assert!(out.status.success(), "{}", text(&out));
+    (text(&out), fs::read_to_string(status.join("repos")).unwrap_or_default())
+}
+
+fn repos_json(remote: &Path, folders: &[&str]) -> String {
+    let items: Vec<String> = folders
+        .iter()
+        .map(|f| format!(r#"{{"url":"{}","branch":null,"folder":"{f}"}}"#, remote.display()))
+        .collect();
+    format!("[{}]", items.join(","))
+}
+
+#[test]
+fn clone_repos_clones_through_scratch_and_redoes_a_clone_a_killed_task_left_there() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("workspace");
+    fs::create_dir_all(&ws).unwrap();
+    let remote = bare_remote(tmp.path(), "proj");
+    let json = repos_json(&remote, &["a"]);
+    // The last task was killed mid-clone: only scratch holds it.
+    let scratch = ws.join(".triple-c-clone");
+    fs::create_dir_all(scratch.join("a/.git")).unwrap();
+    fs::write(scratch.join("a/half"), "x").unwrap();
+    let (_, status) = clone_into(&ws, &tmp.path().join("s1"), &json);
+    assert_eq!(status, "a\tcloning\na\tcloned\n");
+    assert_eq!(fs::read_to_string(ws.join("a/README")).unwrap(), "hello");
+    assert!(!ws.join("a/half").exists());
+    // Nothing is left in scratch after a successful run.
+    assert_eq!(fs::read_dir(&scratch).map(|d| d.count()).unwrap_or(0), 0);
+}
+
+#[test]
+fn clone_repos_never_deletes_a_folder_at_its_final_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("workspace");
+    fs::create_dir_all(&ws).unwrap();
+    let remote = bare_remote(tmp.path(), "proj");
+    // A repository already in place, the user's work in it, and a stale
+    // scratch copy of the same name.
+    git(&ws, &["clone", "-q", remote.to_str().unwrap(), "a"]);
+    fs::write(ws.join("a/mine"), "work").unwrap();
+    fs::create_dir_all(ws.join(".triple-c-clone/a/.git")).unwrap();
+    // A folder the user made that is not a repository, and a clone that
+    // fails into it.
+    fs::create_dir_all(ws.join("notes")).unwrap();
+    fs::write(ws.join("notes/todo"), "keep").unwrap();
+    // An empty folder is cloned into, as `git clone` would.
+    fs::create_dir_all(ws.join("empty")).unwrap();
+    let json = format!(
+        r#"[{{"url":"{r}","branch":null,"folder":"a"}},
+            {{"url":"{r}","branch":null,"folder":"empty"}},
+            {{"url":"{r}","branch":null,"folder":"notes"}},
+            {{"url":"/nonexistent/nope.git","branch":null,"folder":"gone"}}]"#,
+        r = remote.display()
+    );
+    for run in 0..3 {
+        let (log, status) = clone_into(&ws, &tmp.path().join(format!("s{run}")), &json);
+        assert!(status.starts_with("a\texists\n"), "{status}");
+        assert!(status.contains("notes\tfailed\n"), "{status}: {log}");
+        assert!(status.contains("gone\tfailed\n"), "{status}");
+        assert_eq!(fs::read_to_string(ws.join("a/mine")).unwrap(), "work", "run {run}");
+        assert_eq!(fs::read_to_string(ws.join("notes/todo")).unwrap(), "keep", "run {run}");
+        assert!(!ws.join("notes/.git").exists());
+        assert!(!ws.join("gone").exists(), "a failed clone writes nothing at its final path");
+        assert_eq!(fs::read_to_string(ws.join("empty/README")).unwrap(), "hello");
+        let want = if run == 0 { "empty\tcloning\nempty\tcloned\n" } else { "empty\texists\n" };
+        assert!(status.contains(want), "{status}");
+    }
+}
+
+#[test]
+fn clone_repos_refuses_the_scratch_folder_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("workspace");
+    fs::create_dir_all(&ws).unwrap();
+    let remote = bare_remote(tmp.path(), "proj");
+    let (log, status) = clone_into(&ws, &tmp.path().join("s"), &repos_json(&remote, &[".triple-c-clone"]));
+    assert!(log.contains("bad folder '.triple-c-clone'"), "{log}");
+    assert_eq!(status, "");
+}
+
 /// A stand-in `ssh` that records how it was called and fails.
 fn fake_ssh(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
     let log = dir.join("ssh-calls");
@@ -488,6 +631,8 @@ fn wip_push_with_clone_dir(ws: &Path, args: &[&str], clone_dir: &Path) -> Output
         .args(args)
         .env("TRIPLEC_WORKSPACE_ROOT", ws)
         .env("TRIPLEC_CLONE_STATUS_DIR", clone_dir)
+        .env("TRIPLEC_RUN_ID_FILE", tmp.join("no-run-id"))
+        .env("TRIPLEC_WIP_LAST_DIR", tmp.join("no-wip-last"))
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("HOME", tmp)
         .output()
@@ -536,7 +681,10 @@ fn wip_push_pushes_the_whole_tree_and_leaves_the_repo_as_it_was() {
     assert_eq!(refs.len(), 1, "{refs:?}");
     let name = refs[0].trim_start_matches("refs/heads/triple-c/wip/");
     assert!(
-        name.len() == 15 && name.as_bytes()[8] == b'-' && name.chars().filter(|c| c.is_ascii_digit()).count() == 14,
+        name.len() == 20
+            && name.as_bytes()[8] == b'-'
+            && name[..15].chars().filter(|c| c.is_ascii_digit()).count() == 14
+            && name.ends_with("-proj"),
         "{name}"
     );
     let r = &refs[0];
@@ -632,6 +780,25 @@ fn wip_push_covers_dot_folders() {
     let out = wip_push(&ws, &[]);
     assert!(out.status.success(), "{}", text(&out));
     assert_eq!(wip_refs(&remote).len(), 1);
+}
+
+#[test]
+fn wip_push_ignores_the_clone_scratch_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (ws, _repo, remote) = workspace_with_clone(tmp.path());
+    // A dirty clone left in scratch (and scratch itself made a repository):
+    // neither is the workspace's own.
+    let scratch = ws.join(".triple-c-clone");
+    fs::create_dir_all(&scratch).unwrap();
+    git(&scratch, &["clone", "-q", remote.to_str().unwrap(), "half"]);
+    fs::write(scratch.join("half/y"), "y").unwrap();
+    git(&scratch, &["init", "-q"]);
+    let out = wip_push(&ws, &["--dry-run"]);
+    let dry = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(!dry.contains("triple-c-clone") && !dry.contains("half"), "{dry}");
+    let out = wip_push(&ws, &[]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(wip_refs(&remote).is_empty());
 }
 
 #[test]
@@ -1063,7 +1230,7 @@ fn idle_watch_goes_back_to_watching_when_someone_comes_back_during_the_push() {
 
 #[test]
 fn idle_watch_keeps_a_stop_guard_marker_already_recorded() {
-    for marker in ["pushed", "discard"] {
+    for marker in ["pushed", "discard", "lifetime"] {
         let w = Watch::new();
         fs::write(w.tmp.path().join("reason"), format!("{marker}\n")).unwrap();
         let (url, mut agent) = fake_agent(w.tmp.path(), OLD_ACTIVITY);
@@ -1111,6 +1278,14 @@ fn aws_stop_pushes_on_sigterm_once_and_leaves_an_idle_stop_to_the_watcher() {
     assert!(!log.exists(), "no second push after the watcher's");
     assert!(text(&out).contains("entrypoint: stopping (idle)"), "{}", text(&out));
     assert!(text(&out).contains("status=75"), "{}", text(&out));
+
+    // A lifetime-cap stop: the watcher already tried its push; exit 76.
+    fs::write(&reason, "lifetime\n").unwrap();
+    let out = bash(&idle_script, &[], &[("TRIPLEC_HOST", "aws"), ("TRIPLEC_WIP_PUSH", "1")], &[]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(!log.exists(), "no second push after the watcher's");
+    assert!(text(&out).contains("entrypoint: stopping (lifetime)"), "{}", text(&out));
+    assert!(text(&out).contains("status=76"), "{}", text(&out));
     fs::remove_file(&reason).unwrap();
 
     let out = bash(&script, &[], &[("TRIPLEC_HOST", "aws"), ("TRIPLEC_WIP_PUSH", "0")], &[]);
@@ -1153,9 +1328,17 @@ fn the_idle_exit_status_is_the_one_the_app_reads() {
             .contains(&format!("triplec_idle_exit={}\n", crate::aws::tasks::IDLE_EXIT_CODE)),
         "entrypoint.sh and aws::tasks::IDLE_EXIT_CODE disagree"
     );
+    assert!(
+        block(ENTRYPOINT, "aws_stop")
+            .contains(&format!("triplec_lifetime_exit={}\n", crate::aws::tasks::LIFETIME_EXIT_CODE)),
+        "entrypoint.sh and aws::tasks::LIFETIME_EXIT_CODE disagree"
+    );
     assert!(ENTRYPOINT.contains("exit \"${triplec_exit_status:-0}\""), "stop_keepalive exits with it");
     // The watcher gets the WIP setting through its scrubbed environment.
     assert!(block(ENTRYPOINT, "aws_stop").contains("TRIPLEC_WIP_PUSH=\"${TRIPLEC_WIP_PUSH:-0}\""));
+    assert!(block(ENTRYPOINT, "aws_stop")
+        .contains("TRIPLEC_MAX_LIFETIME_MINUTES=\"${TRIPLEC_MAX_LIFETIME_MINUTES:-}\""));
+    assert!(IDLE_WATCH.contains("printf 'lifetime\\n' > \"$reason_file\""));
 }
 
 #[test]
@@ -1165,7 +1348,7 @@ fn start_clone_repos_marks_done_however_the_clone_ends() {
     // clone_repos replaced by one that fails half-way.
     let script = format!(
         "{}\nclone_repos() {{ exit 3; }}\nstart_clone_repos '[x]' \"$1\"\nwait\n",
-        aws_blocks(&["aws_env", "aws_repos"])
+        aws_run_blocks(tmp.path(), &["aws_env", "aws_run", "aws_repos"])
     );
     let out = bash(&script, &[&status], &[], &[]);
     assert!(out.status.success(), "{}", text(&out));
@@ -1176,18 +1359,22 @@ fn start_clone_repos_marks_done_however_the_clone_ends() {
 fn docker_mode_never_reaches_the_aws_blocks() {
     // Every new step sits behind TRIPLEC_HOST=aws; the scripts are only
     // started from those branches.
-    for name in ["aws_env", "aws_home", "aws_repos", "aws_stop"] {
-        let b = block(ENTRYPOINT, name);
+    for name in ["aws_env", "aws_run", "aws_home", "aws_repos", "aws_stop"] {
+        let b = eblock(name);
         assert!(b.contains("aws"), "{name}");
     }
-    let outside: String = {
-        let mut s = ENTRYPOINT.to_string();
-        for name in ["aws_env", "aws_home", "aws_repos", "aws_stop"] {
-            s = s.replace(block(ENTRYPOINT, name), "");
+    let outside = |text: &str, names: &[&str]| {
+        let mut s = text.to_string();
+        for name in names {
+            s = s.replace(block(text, name), "");
         }
         s
     };
-    let lines: Vec<&str> = outside.lines().collect();
+    let outside_ep = outside(ENTRYPOINT, &["aws_env", "aws_run", "aws_stop"]);
+    // The library is sourced by Docker containers too: outside its aws
+    // blocks, every aws step is guarded the same way.
+    let outside_lib = outside(LIB, &["aws_lib", "aws_home", "aws_repos"]);
+    let lines: Vec<&str> = outside_ep.lines().chain(outside_lib.lines()).collect();
     let calls = [
         "triple-c-wip-push",
         "triple-c-idle-watch",
@@ -1196,6 +1383,12 @@ fn docker_mode_never_reaches_the_aws_blocks() {
         "aws_hybrid_ssh_dir",
         "aws_before_stop",
         "start_idle_watch",
+        "aws_efs_workspace_check",
+        "aws_prepare_run",
+        "aws_run_setup",
+        "triple-c-workspace-status",
+        "triple-c-apply-connect",
+        "aws_wait_connect",
     ];
     let guarded = |s: &str| s.contains("\"$triplec_aws\" = 1");
     let mut seen = 0;
@@ -1211,7 +1404,11 @@ fn docker_mode_never_reaches_the_aws_blocks() {
             "unguarded call outside the aws blocks: {line}"
         );
     }
-    assert_eq!(seen, 5, "the call sites: Hybrid link, Hybrid ~/.ssh, clone, idle watch, stop");
+    assert_eq!(
+        seen, 7,
+        "the call sites: run record + setup file, Hybrid/EFS link, EFS /workspace check, Hybrid ~/.ssh \
+         (in merge_host_ssh), clone (+ setup), idle watch, stop"
+    );
     // Clones start in the background *after* the agent: the app gives a
     // starting task's agent only seconds to answer.
     let pos = |needle: &str| {
@@ -1228,9 +1425,1244 @@ fn docker_mode_never_reaches_the_aws_blocks() {
     assert!(trap < pos("start_clone_repos"), "the trap must precede the clone");
     assert!(trap < pos("start_idle_watch"), "the trap must precede the idle watcher");
     assert!(pos("stop_keepalive()") < trap);
-    assert!(block(ENTRYPOINT, "aws_repos").contains(") &"), "start_clone_repos backgrounds the clone");
+    assert!(eblock("aws_repos").contains(") &"), "start_clone_repos backgrounds the clone");
     // And the snapshot-sensitive variables are gone before the agent's
     // environment snapshot is taken.
     assert!(ENTRYPOINT.find("unset TRIPLEC_FILES").unwrap() < ENTRYPOINT.find("# >>> agent_token").unwrap());
     assert!(ENTRYPOINT.find("unset TRIPLEC_REPOS").unwrap() < ENTRYPOINT.find("# >>> agent_token").unwrap());
+    assert!(
+        ENTRYPOINT.find("unset TRIPLEC_SETUP_SCRIPT").unwrap() < ENTRYPOINT.find("# >>> agent_token").unwrap()
+    );
+    // The run record is made after the agent-token block (its children must
+    // not inherit TRIPLEC_AGENT_TOKEN) and before anything that can push.
+    let prepare = ENTRYPOINT.find("then aws_prepare_run; fi").expect("aws_prepare_run call");
+    assert!(prepare > ENTRYPOINT.find("# <<< agent_token").unwrap());
+    assert!(prepare < ENTRYPOINT.find("trap stop_keepalive TERM INT HUP").unwrap());
+    assert!(prepare < ENTRYPOINT.find("\nstart_agent\n").unwrap());
+    // The setup runs in the clone's background chain, never in the agent's way.
+    assert!(eblock("aws_repos").contains("aws_run_setup"));
+}
+
+// ------------------------------------------- run record and setup script
+
+/// The named blocks with the run and setup dirs moved into `tmp` (`run`,
+/// `setup`) and the container user switched off.
+fn aws_run_blocks(tmp: &Path, names: &[&str]) -> String {
+    aws_blocks(names)
+        .replace(
+            "triplec_run_dir=/run/triple-c\n",
+            &format!("triplec_run_dir='{}'\n", tmp.join("run").display()),
+        )
+        .replace(
+            "triplec_setup_dir=/run/triple-c-setup\n",
+            &format!("triplec_setup_dir='{}'\n", tmp.join("setup").display()),
+        )
+}
+
+/// A one-shot fake ECS task metadata endpoint answering `/task` with `body`.
+fn fake_metadata(body: &str) -> (String, std::process::Child) {
+    let server = r#"
+import http.server, sys, socketserver
+body = sys.argv[1].encode()
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200 if self.path == "/v4/x/task" else 404)
+        self.end_headers()
+        if self.path == "/v4/x/task": self.wfile.write(body)
+    def log_message(self, *a): pass
+s = socketserver.TCPServer(("127.0.0.1", 0), H)
+print(s.server_address[1], flush=True)
+s.serve_forever()
+"#;
+    let mut child = Command::new("python3")
+        .arg("-I")
+        .arg("-c")
+        .arg(server)
+        .arg(body)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    use std::io::BufRead;
+    std::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
+    (format!("http://127.0.0.1:{}/v4/x", line.trim()), child)
+}
+
+fn is_run_id(s: &str, suffix: &str) -> bool {
+    let b = s.as_bytes();
+    s.len() == 16 + suffix.len()
+        && b[8] == b'-'
+        && b[15] == b'-'
+        && s[..8].chars().chain(s[9..15].chars()).all(|c| c.is_ascii_digit())
+        && &s[16..] == suffix
+}
+
+#[test]
+fn aws_prepare_run_records_the_run_and_writes_the_setup_script() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = format!(
+        "{}\ntriplec_setup_script=\"$SETUP\"\naws_prepare_run\n",
+        aws_run_blocks(tmp.path(), &["aws_env", "aws_run"])
+    );
+    let before = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let out = bash(&script, &[], &[("SETUP", "echo hi\n")], &["ECS_CONTAINER_METADATA_URI_V4", "TRIPLEC_HOST"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let run = tmp.path().join("run");
+    let setup = tmp.path().join("setup");
+    let id = fs::read_to_string(run.join("run-id")).unwrap();
+    assert!(is_run_id(id.trim_end(), "local"), "{id:?}");
+    let epoch: u64 = fs::read_to_string(run.join("start-epoch")).unwrap().trim().parse().unwrap();
+    assert!(epoch >= before && epoch <= before + 5);
+    assert_eq!(mode(&run), 0o711, "claude may read the run id, not list the dir");
+    assert_eq!(mode(&run.join("run-id")), 0o644);
+    assert_eq!(mode(&run.join("wip-last")), 0o700);
+    assert_eq!(mode(&setup), 0o755);
+    assert_eq!(fs::read_to_string(setup.join("script")).unwrap(), "echo hi\n");
+    assert_eq!(mode(&setup.join("script")), 0o644);
+    assert_eq!(fs::read_to_string(setup.join("status")).unwrap(), "running\n");
+    assert_eq!(fs::read_to_string(setup.join("log")).unwrap(), "");
+
+    // No script: nothing for the setup to run, no status (state `none`).
+    let out = bash(&script, &[], &[("SETUP", "")], &["ECS_CONTAINER_METADATA_URI_V4"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(setup.is_dir() && !setup.join("script").exists() && !setup.join("status").exists());
+
+    // On ECS the run id carries the task id's first 8 characters.
+    let (url, mut meta) = fake_metadata(
+        r#"{"TaskARN":"arn:aws:ecs:eu-west-1:123456789012:task/triple-c/0123abcd4567ef890123abcd4567ef89"}"#,
+    );
+    let out = bash(&script, &[], &[("SETUP", ""), ("ECS_CONTAINER_METADATA_URI_V4", &url)], &[]);
+    meta.kill().ok();
+    assert!(out.status.success(), "{}", text(&out));
+    let id = fs::read_to_string(run.join("run-id")).unwrap();
+    assert!(is_run_id(id.trim_end(), "0123abcd"), "{id:?}");
+    // An answer that is not a task id, or none at all, falls back to `local`.
+    let (bad_url, mut bad_meta) = fake_metadata(r#"{"TaskARN":"arn:aws:ecs:x:1:task/c/a-b"}"#);
+    for uri in [bad_url.as_str(), "http://127.0.0.1:9/v4"] {
+        let out = bash(&script, &[], &[("SETUP", ""), ("ECS_CONTAINER_METADATA_URI_V4", uri)], &[]);
+        assert!(out.status.success(), "{}", text(&out));
+        let id = fs::read_to_string(run.join("run-id")).unwrap();
+        assert!(is_run_id(id.trim_end(), "local"), "{uri}: {id:?}");
+    }
+    bad_meta.kill().ok();
+}
+
+/// Runs `start_clone_repos` with `setup_script` (and a clone that takes a
+/// moment), as the entrypoint would; `_triplec_as_user` records its argv.
+fn run_setup(tmp: &Path, setup_script: &str, timeout: &str) -> Output {
+    let blocks = aws_run_blocks(tmp, &["aws_env", "aws_run", "aws_repos"])
+        .replace("triplec_setup_timeout=1800\n", &format!("triplec_setup_timeout={timeout}\n"));
+    let script = format!(
+        "{blocks}\n\
+         _triplec_as_user() {{ printf '%s\\n' \"$*\" >> \"$CALLS\"; \"$@\"; }}\n\
+         clone_repos() {{ sleep 1; echo cloned > \"$3/marker\"; }}\n\
+         triplec_setup_script=\"$SETUP\"\n\
+         aws_prepare_run\n\
+         start_clone_repos '[]' \"$STATUS\"\n\
+         wait\n"
+    );
+    bash(
+        &script,
+        &[],
+        &[
+            ("SETUP", setup_script),
+            ("CALLS", tmp.join("calls").to_str().unwrap()),
+            ("STATUS", tmp.join("clone").to_str().unwrap()),
+        ],
+        &["ECS_CONTAINER_METADATA_URI_V4"],
+    )
+}
+
+#[test]
+fn the_setup_script_runs_after_the_clone_as_the_user_with_no_stdin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let clone = tmp.path().join("clone");
+    let body = format!(
+        "echo started\nreadlink /proc/self/fd/0\n\
+         if [ -e '{c}/done' ] && [ -e '{c}/marker' ]; then echo clone-was-done; fi\n",
+        c = clone.display()
+    );
+    let out = run_setup(tmp.path(), &body, "1800");
+    assert!(out.status.success(), "{}", text(&out));
+    let setup = tmp.path().join("setup");
+    let log = fs::read_to_string(setup.join("log")).unwrap();
+    assert_eq!(log, "started\n/dev/null\nclone-was-done\n");
+    assert_eq!(fs::read_to_string(setup.join("status")).unwrap(), "ok\n");
+    let calls = fs::read_to_string(tmp.path().join("calls")).unwrap();
+    assert_eq!(
+        calls,
+        format!("timeout -k 10 1800 bash -e {}/script\n", setup.display()),
+        "as the user, bounded, under bash -e"
+    );
+    assert!(text(&out).contains("entrypoint: setup script ok"), "{}", text(&out));
+}
+
+#[test]
+fn the_setup_script_fails_under_bash_e_and_a_hang_is_killed_as_failed_124() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = run_setup(tmp.path(), "echo one\nfalse\necho never\n", "1800");
+    assert!(out.status.success(), "a failed setup never fails the start: {}", text(&out));
+    let setup = tmp.path().join("setup");
+    assert_eq!(fs::read_to_string(setup.join("status")).unwrap(), "failed 1\n");
+    assert_eq!(fs::read_to_string(setup.join("log")).unwrap(), "one\n");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let started = std::time::Instant::now();
+    let out = run_setup(tmp.path(), "echo waiting\nsleep 60\n", "1");
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(started.elapsed() < std::time::Duration::from_secs(20), "the hang was killed");
+    let setup = tmp.path().join("setup");
+    assert_eq!(fs::read_to_string(setup.join("status")).unwrap(), "failed 124\n");
+}
+
+#[test]
+fn no_setup_script_means_no_setup_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = run_setup(tmp.path(), "", "1800");
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(!tmp.path().join("calls").exists(), "nothing ran as the user");
+    assert!(!tmp.path().join("setup/status").exists());
+    // The clone status is still made, and ends `done`, with no repos at all.
+    assert!(tmp.path().join("clone/done").exists());
+}
+
+#[test]
+fn idle_watch_check_counts_a_running_setup_as_busy() {
+    let w = Watch::new();
+    let (url, mut agent) = fake_agent(w.tmp.path(), OLD_ACTIVITY);
+    let setup = w.tmp.path().join("setup");
+    fs::create_dir_all(&setup).unwrap();
+    fs::write(setup.join("status"), "running\n").unwrap();
+    let check = || w.cmd(&url, 0).env("TRIPLEC_SETUP_STATUS_DIR", &setup).arg("--check").output().unwrap();
+    let busy = check();
+    fs::write(setup.join("status"), "failed 124\n").unwrap();
+    let failed = check();
+    fs::write(setup.join("status"), "ok\n").unwrap();
+    let ok = check();
+    agent.kill().ok();
+    assert_eq!(busy.status.code(), Some(1), "{}", text(&busy));
+    assert_eq!(failed.status.code(), Some(0), "{}", text(&failed));
+    assert_eq!(ok.status.code(), Some(0), "{}", text(&ok));
+}
+
+// ----------------------------------------------------------- lifetime cap
+
+impl Watch {
+    /// A watcher for the lifetime cap alone (no idle stop), its run started
+    /// `age_secs` ago.
+    fn lifetime_cmd(&self, signal_pid: u32, minutes: &str, age_secs: u64) -> Command {
+        let p = self.tmp.path();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        fs::write(p.join("start-epoch"), format!("{}\n", now - age_secs)).unwrap();
+        // An agent that never answers: the idle check alone would never stop it.
+        let mut c = self.cmd("http://127.0.0.1:9", signal_pid);
+        c.env_remove("TRIPLEC_IDLE_STOP_MINUTES")
+            .env("TRIPLEC_MAX_LIFETIME_MINUTES", minutes)
+            .env("TRIPLEC_START_EPOCH_FILE", p.join("start-epoch"));
+        c
+    }
+}
+
+#[test]
+fn lifetime_cap_pushes_then_stops_with_its_marker_even_when_the_push_fails() {
+    let w = Watch::new();
+    w.dirty();
+    fs::write(w.tmp.path().join("push_rc"), "1").unwrap();
+    let mut target = fake_entrypoint(w.tmp.path());
+    let mut cmd = w.lifetime_cmd(target.id(), "1", 61);
+    cmd.env("TRIPLEC_WIP_PUSH", "1");
+    let out = run_watch_for(cmd, 20).expect("it stops at the cap");
+    target.wait().unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(w.pushes(), "--reason lifetime\n", "one push, best effort");
+    assert!(text(&out).contains("stopping anyway"), "{}", text(&out));
+    assert_eq!(fs::read_to_string(w.tmp.path().join("got")).unwrap().trim(), "term");
+    assert_eq!(fs::read_to_string(w.tmp.path().join("reason")).unwrap().trim(), "lifetime");
+}
+
+#[test]
+fn lifetime_cap_with_the_wip_push_off_stops_without_pushing() {
+    let w = Watch::new();
+    w.dirty();
+    let mut target = fake_entrypoint(w.tmp.path());
+    let mut cmd = w.lifetime_cmd(target.id(), "1", 120);
+    cmd.env("TRIPLEC_WIP_PUSH", "0");
+    let out = run_watch_for(cmd, 20).expect("it stops at the cap");
+    target.wait().unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(w.pushes(), "");
+    assert_eq!(fs::read_to_string(w.tmp.path().join("reason")).unwrap().trim(), "lifetime");
+}
+
+#[test]
+fn lifetime_cap_not_reached_keeps_the_workspace_up() {
+    let w = Watch::new();
+    let mut target = fake_entrypoint(w.tmp.path());
+    let ran = run_watch_for(w.lifetime_cmd(target.id(), "60", 30), 3);
+    target.kill().ok();
+    target.wait().ok();
+    assert!(ran.is_none(), "{:?}", ran.map(|o| text(&o)));
+    assert!(!w.tmp.path().join("got").exists());
+    // Neither an idle stop nor a cap: nothing to watch, refused.
+    let none = w.cmd("http://127.0.0.1:9", target.id()).env_remove("TRIPLEC_IDLE_STOP_MINUTES").output().unwrap();
+    assert_eq!(none.status.code(), Some(2), "{}", text(&none));
+    let zero = w.lifetime_cmd(target.id(), "0", 30).output().unwrap();
+    assert_eq!(zero.status.code(), Some(2), "0 is no cap: {}", text(&zero));
+    let zeros = w.lifetime_cmd(target.id(), "00", 30).output().unwrap();
+    assert_eq!(zeros.status.code(), Some(2), "00 is no cap either: {}", text(&zeros));
+}
+
+#[test]
+fn lifetime_cap_leaves_a_stop_guard_decision_alone() {
+    for marker in ["pushed", "discard"] {
+        let w = Watch::new();
+        w.dirty();
+        fs::write(w.tmp.path().join("reason"), format!("{marker}\n")).unwrap();
+        let mut target = fake_entrypoint(w.tmp.path());
+        let mut cmd = w.lifetime_cmd(target.id(), "1", 120);
+        cmd.env("TRIPLEC_WIP_PUSH", "1");
+        let out = run_watch_for(cmd, 20).expect("it signals");
+        target.wait().unwrap();
+        assert!(out.status.success(), "{}", text(&out));
+        assert_eq!(w.pushes(), "", "{marker}: the app already decided");
+        assert_eq!(fs::read_to_string(w.tmp.path().join("reason")).unwrap().trim(), marker);
+    }
+}
+
+// ------------------------------------------------------- WIP branch per run
+
+fn wip_push_in_run(ws: &Path, run_id: Option<&str>) -> Output {
+    let tmp = ws.parent().unwrap();
+    let run = tmp.join("run");
+    fs::create_dir_all(run.join("wip-last")).unwrap();
+    match run_id {
+        Some(id) => fs::write(run.join("run-id"), format!("{id}\n")).unwrap(),
+        None => {
+            let _ = fs::remove_file(run.join("run-id"));
+        }
+    }
+    let script = write_script(tmp, "triple-c-wip-push", WIP_PUSH);
+    Command::new("bash")
+        .arg(script)
+        .args(["--reason", "lifetime"])
+        .env("TRIPLEC_WORKSPACE_ROOT", ws)
+        .env("TRIPLEC_CLONE_STATUS_DIR", tmp.join("no-clone-status"))
+        .env("TRIPLEC_RUN_ID_FILE", run.join("run-id"))
+        .env("TRIPLEC_WIP_LAST_DIR", run.join("wip-last"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("HOME", tmp)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn wip_pushes_in_one_run_update_one_branch_and_skip_an_unchanged_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (ws, repo, remote) = workspace_with_clone(tmp.path());
+    let run_id = "20261115-093000-0123abcd";
+    fs::write(repo.join("a.txt"), "one").unwrap();
+    let out = wip_push_in_run(&ws, Some(run_id));
+    assert!(out.status.success(), "{}", text(&out));
+    let branch = format!("refs/heads/triple-c/wip/{run_id}-proj");
+    assert_eq!(wip_refs(&remote), [branch.clone()]);
+    let first = git(&remote, &["rev-parse", &branch]);
+    assert_eq!(git(&remote, &["show", &format!("{branch}:a.txt")]), "one");
+    let last = tmp.path().join("run/wip-last/proj");
+    assert_eq!(
+        fs::read_to_string(&last).unwrap(),
+        format!("{} origin\n", git(&remote, &["rev-parse", &format!("{branch}^{{tree}}")]))
+    );
+
+    // Nothing changed: skipped, the branch stays where it was.
+    let out = wip_push_in_run(&ws, Some(run_id));
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("unchanged since the last push"), "{}", text(&out));
+    assert_eq!(git(&remote, &["rev-parse", &branch]), first);
+
+    // A change: the same branch moves (forced — the WIP commit is not a
+    // descendant of the last one), still one branch for the run.
+    fs::write(repo.join("a.txt"), "two").unwrap();
+    let out = wip_push_in_run(&ws, Some(run_id));
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(wip_refs(&remote), [branch.clone()]);
+    assert_ne!(git(&remote, &["rev-parse", &branch]), first);
+    assert_eq!(git(&remote, &["show", &format!("{branch}:a.txt")]), "two");
+    assert_eq!(git(&remote, &["log", "-1", "--format=%s", &branch]).contains("(lifetime)"), true);
+
+    // A failed push records nothing, so the next one tries again.
+    fs::write(repo.join("a.txt"), "three").unwrap();
+    let before = fs::read_to_string(&last).unwrap();
+    let saved = tmp.path().join("origin.git.away");
+    fs::rename(&remote, &saved).unwrap();
+    let out = wip_push_in_run(&ws, Some(run_id));
+    assert!(!out.status.success(), "{}", text(&out));
+    assert_eq!(fs::read_to_string(&last).unwrap(), before);
+    fs::rename(&saved, &remote).unwrap();
+    let out = wip_push_in_run(&ws, Some(run_id));
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(git(&remote, &["show", &format!("{branch}:a.txt")]), "three");
+}
+
+#[test]
+fn wip_push_without_a_usable_run_id_keeps_the_per_push_stamp() {
+    for run_id in [None, Some("../../evil"), Some("not a run id")] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (ws, repo, remote) = workspace_with_clone(tmp.path());
+        fs::write(repo.join("a.txt"), "one").unwrap();
+        let out = wip_push_in_run(&ws, run_id);
+        assert!(out.status.success(), "{}", text(&out));
+        let refs = wip_refs(&remote);
+        assert_eq!(refs.len(), 1, "{refs:?}");
+        let name = refs[0].trim_start_matches("refs/heads/triple-c/wip/");
+        assert!(name.len() == 20 && name.as_bytes()[8] == b'-' && name.ends_with("-proj"), "{run_id:?}: {name}");
+    }
+}
+
+// ------------------------------------------------------- workspace status
+
+fn workspace_status(clone: &Path, setup: &Path) -> serde_json::Value {
+    let tmp = clone.parent().unwrap();
+    let script = write_script(tmp, "triple-c-workspace-status", WORKSPACE_STATUS);
+    let out = Command::new("python3")
+        .arg("-I")
+        .arg(script)
+        .env("TRIPLEC_CLONE_STATUS_DIR", clone)
+        .env("TRIPLEC_SETUP_STATUS_DIR", setup)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(stdout.lines().count(), 1, "one JSON object on one line: {stdout}");
+    serde_json::from_str(&stdout).unwrap()
+}
+
+#[test]
+fn workspace_status_reports_clone_and_setup_and_survives_missing_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let clone = tmp.path().join("clone");
+    let setup = tmp.path().join("setup");
+    // Nothing yet: the clone has not started, no setup.
+    assert_eq!(
+        workspace_status(&clone, &setup),
+        serde_json::json!({"clone": {"done": false, "repos": []},
+                           "setup": {"state": "none", "code": null, "tail": []}})
+    );
+
+    fs::create_dir_all(&clone).unwrap();
+    fs::write(clone.join("repos"), "api\tcloning\napi\tcloned\nweb\tcloning\n").unwrap();
+    fs::create_dir_all(&setup).unwrap();
+    fs::write(setup.join("status"), "running\n").unwrap();
+    let v = workspace_status(&clone, &setup);
+    assert_eq!(
+        v["clone"],
+        serde_json::json!({"done": false, "repos": [
+            {"folder": "api", "state": "cloned"}, {"folder": "web", "state": "cloning"}]})
+    );
+    assert_eq!(v["setup"], serde_json::json!({"state": "running", "code": null, "tail": []}));
+
+    fs::write(clone.join("repos"), "api\tcloning\napi\tcloned\nweb\tcloning\nweb\tfailed\n").unwrap();
+    fs::write(clone.join("done"), "").unwrap();
+    let lines: String = (1..=25).map(|i| format!("line {i}\n")).collect();
+    fs::write(setup.join("log"), format!("{lines}partial \u{e9}\u{ff}")).unwrap();
+    fs::write(setup.join("status"), "ok\n").unwrap();
+    let v = workspace_status(&clone, &setup);
+    assert_eq!(v["clone"]["done"], true);
+    assert_eq!(v["clone"]["repos"][1], serde_json::json!({"folder": "web", "state": "failed"}));
+    assert_eq!(v["setup"]["state"], "ok");
+    assert_eq!(v["setup"]["code"], 0);
+    let tail: Vec<String> =
+        v["setup"]["tail"].as_array().unwrap().iter().map(|l| l.as_str().unwrap().to_string()).collect();
+    assert_eq!(tail.len(), 20);
+    assert_eq!(tail[0], "line 7");
+    assert!(tail[19].starts_with("partial \u{e9}"), "{:?}", tail[19]);
+
+    fs::write(setup.join("status"), "failed 124\n").unwrap();
+    let v = workspace_status(&clone, &setup);
+    assert_eq!((v["setup"]["state"].as_str(), v["setup"]["code"].as_i64()), (Some("failed"), Some(124)));
+    // Garbled status: a failure with no code, never a crash.
+    fs::write(setup.join("status"), "what\n").unwrap();
+    let v = workspace_status(&clone, &setup);
+    assert_eq!(v["setup"], serde_json::json!({"state": "failed", "code": null, "tail": v["setup"]["tail"]}));
+    // An unreadable log is an empty tail.
+    fs::remove_file(setup.join("log")).unwrap();
+    fs::create_dir(setup.join("log")).unwrap();
+    assert_eq!(workspace_status(&clone, &setup)["setup"]["tail"], serde_json::json!([]));
+}
+
+#[test]
+fn lifetime_cap_reads_leading_zeros_as_decimal() {
+    // `08` is 8 minutes, not a bad octal number.
+    let w = Watch::new();
+    let mut target = fake_entrypoint(w.tmp.path());
+    let out = run_watch_for(w.lifetime_cmd(target.id(), "08", 8 * 60 + 1), 20).expect("it stops at 8 minutes");
+    target.wait().unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(fs::read_to_string(w.tmp.path().join("reason")).unwrap().trim(), "lifetime");
+    let w = Watch::new();
+    let mut target = fake_entrypoint(w.tmp.path());
+    let ran = run_watch_for(w.lifetime_cmd(target.id(), "08", 7 * 60), 3);
+    target.kill().ok();
+    target.wait().ok();
+    assert!(ran.is_none(), "7 of 8 minutes: {:?}", ran.map(|o| text(&o)));
+}
+
+#[test]
+fn a_setup_chain_that_dies_early_records_failed_so_the_idle_stop_is_not_blocked() {
+    // The chain ends abnormally while the status still says `running`.
+    let tmp = tempfile::tempdir().unwrap();
+    let blocks = aws_run_blocks(tmp.path(), &["aws_env", "aws_run", "aws_repos"]);
+    let script = format!(
+        "{blocks}\n\
+         aws_run_setup() {{ exit 9; }}\n\
+         triplec_setup_script='echo hi'\n\
+         aws_prepare_run\n\
+         start_clone_repos '[]' \"$STATUS\"\n\
+         wait\n"
+    );
+    let out = bash(&script, &[], &[("STATUS", tmp.path().join("clone").to_str().unwrap())], &[]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(fs::read_to_string(tmp.path().join("setup/status")).unwrap(), "failed\n");
+
+    // Killed (TERM) while the clone is still running: `done` and `failed`.
+    let tmp = tempfile::tempdir().unwrap();
+    let blocks = aws_run_blocks(tmp.path(), &["aws_env", "aws_run", "aws_repos"]);
+    let pid = tmp.path().join("inner.pid");
+    let script = format!(
+        "{blocks}\n\
+         clone_repos() {{ sleep 30 >/dev/null 2>&1 & s=$!; echo \"$BASHPID $s\" > '{p}'; wait $s; }}\n\
+         triplec_setup_script='echo hi'\n\
+         aws_prepare_run\n\
+         start_clone_repos '[]' \"$STATUS\"\n\
+         chain=$!\n\
+         while [ ! -s '{p}' ]; do sleep 0.1; done\n\
+         kill -TERM \"$chain\" $(cat '{p}')\n\
+         wait\n",
+        p = pid.display()
+    );
+    let started = std::time::Instant::now();
+    let out = bash(&script, &[], &[("STATUS", tmp.path().join("clone").to_str().unwrap())], &[]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    assert!(tmp.path().join("clone/done").exists());
+    assert_eq!(fs::read_to_string(tmp.path().join("setup/status")).unwrap(), "failed\n");
+    // A finished setup's status is left alone by the trap.
+    let tmp = tempfile::tempdir().unwrap();
+    let out = run_setup(tmp.path(), "true\n", "1800");
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(fs::read_to_string(tmp.path().join("setup/status")).unwrap(), "ok\n");
+}
+
+#[test]
+fn each_folder_in_a_run_has_its_own_wip_branch_even_on_one_remote() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (ws, api, remote) = workspace_with_clone(tmp.path());
+    // A second clone of the same bare remote, under a folder name git refs
+    // cannot carry as is.
+    git(&ws, &["clone", "-q", remote.to_str().unwrap(), "we b@x"]);
+    let web = ws.join("we b@x");
+    git(&web, &["config", "user.name", "Dev"]);
+    git(&web, &["config", "user.email", "dev@example.invalid"]);
+    let run_id = "20261115-093000-0123abcd";
+    fs::write(api.join("a.txt"), "api-1").unwrap();
+    fs::write(web.join("a.txt"), "web-1").unwrap();
+    let out = wip_push_in_run(&ws, Some(run_id));
+    assert!(out.status.success(), "{}", text(&out));
+    let api_ref = format!("refs/heads/triple-c/wip/{run_id}-proj");
+    // Sanitised, so with the first 8 hex of sha256("we b@x").
+    let web_ref = format!("refs/heads/triple-c/wip/{run_id}-we_b_x-7d2e374f");
+    let mut refs = wip_refs(&remote);
+    refs.sort();
+    assert_eq!(refs, [api_ref.clone(), web_ref.clone()]);
+    assert_eq!(git(&remote, &["show", &format!("{api_ref}:a.txt")]), "api-1");
+    assert_eq!(git(&remote, &["show", &format!("{web_ref}:a.txt")]), "web-1");
+    let web_first = git(&remote, &["rev-parse", &web_ref]);
+
+    // A second push changes only api: its branch moves, web's is skipped.
+    fs::write(api.join("a.txt"), "api-2").unwrap();
+    let out = wip_push_in_run(&ws, Some(run_id));
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("we b@x: unchanged since the last push"), "{}", text(&out));
+    assert_eq!(git(&remote, &["show", &format!("{api_ref}:a.txt")]), "api-2");
+    assert_eq!(git(&remote, &["rev-parse", &web_ref]), web_first);
+    assert_eq!(wip_refs(&remote).len(), 2);
+}
+
+#[test]
+fn a_folder_name_no_ref_can_carry_falls_back_to_a_hash() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (ws, _, remote) = workspace_with_clone(tmp.path());
+    git(&ws, &["clone", "-q", remote.to_str().unwrap(), "a..b.lock"]);
+    let repo = ws.join("a..b.lock");
+    git(&repo, &["config", "user.name", "Dev"]);
+    git(&repo, &["config", "user.email", "dev@example.invalid"]);
+    fs::write(repo.join("x"), "x").unwrap();
+    let run_id = "20261115-093000-local";
+    let out = wip_push_in_run(&ws, Some(run_id));
+    assert!(out.status.success(), "{}", text(&out));
+    let refs = wip_refs(&remote);
+    assert_eq!(refs.len(), 1, "{refs:?}");
+    let suffix = refs[0].strip_prefix(&format!("refs/heads/triple-c/wip/{run_id}-")).unwrap();
+    assert!(suffix.len() == 12 && suffix.chars().all(|c| c.is_ascii_hexdigit()), "{suffix}");
+}
+
+#[test]
+fn folders_that_sanitise_to_the_same_name_get_different_wip_branches() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (ws, _, remote) = workspace_with_clone(tmp.path());
+    for folder in ["a b", "a_b"] {
+        git(&ws, &["clone", "-q", remote.to_str().unwrap(), folder]);
+        let repo = ws.join(folder);
+        git(&repo, &["config", "user.name", "Dev"]);
+        git(&repo, &["config", "user.email", "dev@example.invalid"]);
+        fs::write(repo.join("x"), folder).unwrap();
+    }
+    let run_id = "20261115-093000-local";
+    let out = wip_push_in_run(&ws, Some(run_id));
+    assert!(out.status.success(), "{}", text(&out));
+    let mut refs = wip_refs(&remote);
+    refs.sort();
+    let base = format!("refs/heads/triple-c/wip/{run_id}-");
+    // Exact names keep their folder; the changed one gets a hash of the raw name.
+    assert!(refs.iter().any(|r| *r == format!("{base}a_b")), "{refs:?}");
+    let spaced: Vec<_> = refs.iter().filter_map(|r| r.strip_prefix(&format!("{base}a_b-"))).collect();
+    assert_eq!(spaced.len(), 1, "{refs:?}");
+    assert!(spaced[0].len() == 8 && spaced[0].chars().all(|c| c.is_ascii_hexdigit()), "{refs:?}");
+    assert_eq!(refs.len(), 2, "{refs:?}");
+}
+
+// ------------------------------------------------- copy-at-connect (phase 6 Q2)
+
+#[test]
+fn sourcing_the_library_only_defines_functions() {
+    // Docker parity: the entrypoint sources it first thing, so it must run
+    // nothing — no output, no files, no environment changes.
+    let tmp = tempfile::tempdir().unwrap();
+    let lib = tmp.path().join("lib.sh");
+    fs::write(&lib, LIB).unwrap();
+    let out = Command::new("env")
+        .args(["-i", "PATH=/usr/bin:/bin", "bash", "-c"])
+        .arg(". \"$1\" && env && echo --- && declare -F | awk '{print $3}'")
+        .arg("t")
+        .arg(&lib)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(out.stderr.is_empty(), "{}", text(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let (env, funcs) = stdout.split_once("---\n").unwrap();
+    assert!(!env.contains("triplec_") && !env.contains("CA_"), "nothing exported: {env}");
+    for f in [
+        "_triplec_as_user",
+        "link_persistent_home",
+        "aws_hybrid_ssh_dir",
+        "install_corporate_ca",
+        "sync_host_ssh",
+        "merge_host_ssh",
+        "install_git_credentials",
+        "clone_repos",
+        "aws_wait_connect",
+        "start_clone_repos",
+    ] {
+        assert!(funcs.lines().any(|l| l == f), "{f} missing: {funcs}");
+    }
+    assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 1, "sourcing made no files");
+}
+
+#[test]
+fn the_entrypoint_sources_the_library_first_and_calls_the_moved_steps_in_order() {
+    let path = "/usr/local/lib/triple-c/entrypoint-lib.sh";
+    let source = ENTRYPOINT.find(&format!(". {path}")).expect("sources the library");
+    assert!(source < ENTRYPOINT.find("# >>> aws_env").unwrap(), "before any block uses it");
+    let docker = include_str!("../../../../container/Dockerfile");
+    assert!(docker.contains(&format!("COPY entrypoint-lib.sh {path}")));
+    assert!(docker.contains("COPY triple-c-apply-connect /usr/local/bin/triple-c-apply-connect"));
+    assert!(APPLY_CONNECT.contains(&format!("lib={path}\n")));
+    // The steps run where the inline code ran: CA, then the SSH merge, then
+    // the git credential helper, all before the clone starts.
+    let at = |needle: &str| {
+        ENTRYPOINT
+            .lines()
+            .position(|l| l.trim_start() == needle)
+            .unwrap_or_else(|| panic!("{needle}"))
+    };
+    let ca = at("install_corporate_ca");
+    let ssh = at("merge_host_ssh /tmp/.host-ssh");
+    let git = at("install_git_credentials \"$GIT_TOKEN\"");
+    assert!(at("link_persistent_home /home/claude \"$triplec_home_mnt\" claude:claude") < ca);
+    assert!(ca < ssh && ssh < git && git < at("start_clone_repos \"$triplec_repos_json\" /run/triple-c-clone"));
+    // Each block lives in exactly one file.
+    for name in ["aws_lib", "aws_home", "ca_install", "sync_host_ssh", "merge_host_ssh", "git_credentials", "aws_repos"] {
+        assert!(LIB.contains(&format!("# >>> {name}\n")), "{name}");
+        assert!(!ENTRYPOINT.contains(&format!("# >>> {name}\n")), "{name}");
+    }
+}
+
+#[test]
+fn the_git_credential_helper_is_written_as_before() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let script = format!(
+        "{}\ninstall_git_credentials \"$TOKEN\"\n",
+        aws_blocks(&["git_credentials"])
+            .replace("/home/claude", home.to_str().unwrap())
+            .replace("chown claude:claude", ": chown")
+    );
+    let out = bash(&script, &[], &[("TOKEN", "tok-123")], &[]);
+    assert!(out.status.success(), "{}", text(&out));
+    let cred = home.join(".git-credentials");
+    assert_eq!(
+        fs::read_to_string(&cred).unwrap(),
+        "https://oauth2:tok-123@github.com\nhttps://oauth2:tok-123@gitlab.com\nhttps://oauth2:tok-123@bitbucket.org\n"
+    );
+    assert_eq!(mode(&cred), 0o600);
+    let helper = Command::new("git")
+        .args(["config", "--file"])
+        .arg(home.join(".gitconfig"))
+        .args(["--get", "credential.helper"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&helper.stdout).trim(),
+        format!("store --file={}", cred.display())
+    );
+}
+
+#[test]
+fn merge_host_ssh_merges_and_fixes_modes_and_refuses_a_foreign_link_on_aws() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, mnt) = hybrid_dirs(tmp.path());
+    let src = tmp.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("id_ed25519"), "KEY").unwrap();
+    fs::write(src.join("id_ed25519.pub"), "PUB").unwrap();
+    fs::write(src.join("config"), "Host *\n").unwrap();
+    let run = |aws: &str| {
+        let script = format!(
+            "{}\ntriplec_aws={aws}\nmerge_host_ssh \"$1\"\n",
+            aws_blocks(&["aws_home", "sync_host_ssh", "merge_host_ssh"])
+                .replace("/home/claude", home.to_str().unwrap())
+                .replace("triplec_home_mnt=/mnt/triple-c-home", &format!("triplec_home_mnt='{}'", mnt.display()))
+                .replace("chown -R claude:claude", ": chown")
+        );
+        bash(&script, &[&src], &[], &[])
+    };
+    // Docker (and AWS without a link): ~/.ssh itself.
+    let out = run("0");
+    assert!(out.status.success(), "{}", text(&out));
+    let ssh = home.join(".ssh");
+    assert_eq!(fs::read_to_string(ssh.join("id_ed25519")).unwrap(), "KEY");
+    assert_eq!(mode(&ssh), 0o700);
+    assert_eq!(mode(&ssh.join("id_ed25519")), 0o600);
+    assert_eq!(mode(&ssh.join("id_ed25519.pub")), 0o644);
+    assert_eq!(mode(&ssh.join("config")), 0o600);
+
+    // AWS Hybrid: through the link Triple-C made, into the mount.
+    fs::remove_dir_all(&ssh).unwrap();
+    fs::create_dir_all(mnt.join(".ssh")).unwrap();
+    std::os::unix::fs::symlink(mnt.join(".ssh"), &ssh).unwrap();
+    let out = run("1");
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(fs::read_to_string(mnt.join(".ssh/id_ed25519")).unwrap(), "KEY");
+
+    // Any other link: nothing merged.
+    let elsewhere = tmp.path().join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    fs::remove_file(&ssh).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &ssh).unwrap();
+    let out = run("1");
+    assert!(text(&out).contains("symlink Triple-C did not make"), "{}", text(&out));
+    assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
+}
+
+/// `start_clone_repos` under copy-at-connect, with `clone_repos` stubbed to
+/// record when it ran.
+fn connect_clone(tmp: &Path, marker: bool) -> (Output, std::time::Duration) {
+    let run = tmp.join("run");
+    fs::create_dir_all(&run).unwrap();
+    if marker {
+        fs::write(run.join("connected"), "").unwrap();
+    }
+    let script = format!(
+        "{}\ntriplec_connect=1\n\
+         clone_repos() {{ echo cloned > \"$3/marker\"; }}\n\
+         aws_run_setup() {{ :; }}\n\
+         start_clone_repos '[{{\"url\":\"u\",\"branch\":null,\"folder\":\"f\"}}]' \"$1\"\nwait\n",
+        aws_run_blocks(tmp, &["aws_env", "aws_run", "aws_repos"])
+            .replace("triplec_connect_wait=300\n", "triplec_connect_wait=2\n")
+    );
+    let started = std::time::Instant::now();
+    let out = bash(&script, &[&tmp.join("status")], &[], &[]);
+    (out, started.elapsed())
+}
+
+#[test]
+fn under_copy_at_connect_the_clone_waits_for_the_connect_then_goes_ahead_without() {
+    // Connected already: clones at once, with nothing to retry later.
+    let tmp = tempfile::tempdir().unwrap();
+    let (out, took) = connect_clone(tmp.path(), true);
+    assert!(out.status.success(), "{}", text(&out));
+    let status = tmp.path().join("status");
+    assert!(status.join("marker").exists() && status.join("done").exists());
+    assert!(!status.join("no-credentials").exists());
+    assert!(took < std::time::Duration::from_secs(2), "{took:?}");
+
+    // Never connected: waits out the limit, clones anyway, says so.
+    let tmp = tempfile::tempdir().unwrap();
+    let (out, took) = connect_clone(tmp.path(), false);
+    assert!(out.status.success(), "{}", text(&out));
+    let status = tmp.path().join("status");
+    assert!(status.join("marker").exists() && status.join("done").exists());
+    assert!(status.join("no-credentials").exists());
+    assert!(took >= std::time::Duration::from_secs(2), "{took:?}");
+    assert!(text(&out).contains("going ahead without the project's credentials"), "{}", text(&out));
+}
+
+/// Copy-at-connect with no repositories: `start_clone_repos` with a setup
+/// script (or none), the connect arriving after a second; the stubbed setup
+/// records whether the connect had happened when it ran.
+fn connect_setup(tmp: &Path, setup_script: &str) -> (Output, std::time::Duration) {
+    let script = format!(
+        "{}
+triplec_connect=1
+         triplec_setup_script=\"$SETUP\"
+         aws_prepare_run
+         aws_run_setup() {{ if [ -e \"$triplec_run_dir/connected\" ]; then echo after > \"$OUT/setup-ran\"; else echo before > \"$OUT/setup-ran\"; fi; }}
+         ( sleep 1; : > \"$triplec_run_dir/connected\" ) &
+         start_clone_repos '[]' \"$1/status\"
+wait
+",
+        aws_run_blocks(tmp, &["aws_env", "aws_run", "aws_repos"])
+            .replace("triplec_connect_wait=300\n", "triplec_connect_wait=10\n")
+    );
+    let started = std::time::Instant::now();
+    let out = bash(
+        &script,
+        &[tmp],
+        &[("SETUP", setup_script), ("OUT", tmp.to_str().unwrap())],
+        &["ECS_CONTAINER_METADATA_URI_V4"],
+    );
+    (out, started.elapsed())
+}
+
+#[test]
+fn under_copy_at_connect_a_setup_script_waits_for_the_connect_even_with_no_repos() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (out, took) = connect_setup(tmp.path(), "echo hi\n");
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(fs::read_to_string(tmp.path().join("setup-ran")).unwrap(), "after\n", "{}", text(&out));
+    assert!(took >= std::time::Duration::from_secs(1), "{took:?}");
+    assert!(!tmp.path().join("status/no-credentials").exists());
+
+    // No repositories and no setup script: nothing waits for the connect.
+    let tmp = tempfile::tempdir().unwrap();
+    let (out, took) = connect_setup(tmp.path(), "");
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(tmp.path().join("status/done").exists());
+    assert!(took < std::time::Duration::from_secs(3), "{took:?}");
+}
+
+/// A workspace for `triple-c-apply-connect`: its script and library with every
+/// path moved into `tmp`, the user switched off, `update-ca-certificates`
+/// faked and certutil skipped.
+struct Connect {
+    root: std::path::PathBuf,
+    script: std::path::PathBuf,
+    path_env: String,
+}
+
+impl Connect {
+    fn new(tmp: &Path) -> Self {
+        let p = |s: &str| tmp.join(s);
+        for d in ["shm", "run", "home", "ws", "clone", "store", "bin", "lib"] {
+            fs::create_dir_all(p(d)).unwrap();
+        }
+        let lib = LIB
+            .replace("triplec_run_as=claude", "triplec_run_as=")
+            .replace("triplec_run_dir=/run/triple-c\n", &format!("triplec_run_dir='{}'\n", p("run").display()))
+            .replace("\"/usr/local/share/ca-certificates\"", &format!("'{}'", p("store").display()))
+            .replace("\"/var/lib/triple-c/ca.stamp\"", &format!("'{}'", p("lib/ca.stamp").display()))
+            .replace("\"/etc/ssl/certs/ca-certificates.crt\"", &format!("'{}'", p("lib/bundle").display()))
+            .replace("if ! command -v certutil >/dev/null 2>&1; then", "if true; then")
+            .replace("/home/claude", p("home").to_str().unwrap())
+            .replace("chown -R claude:claude", ": chown")
+            .replace("chown claude:claude", ": chown");
+        fs::write(p("lib.sh"), lib).unwrap();
+        fs::write(p("log"), "").unwrap();
+        // The system bundle update-ca-certificates would have made.
+        fs::write(p("lib/bundle"), PEM).unwrap();
+        let script = APPLY_CONNECT
+            .replace("lib=/usr/local/lib/triple-c/entrypoint-lib.sh\n", &format!("lib='{}'\n", p("lib.sh").display()))
+            .replace("shm=/dev/shm/triple-c\n", &format!("shm='{}'\n", p("shm").display()))
+            .replace("stage=/dev/shm/triple-c/connect\n", &format!("stage='{}'\n", p("shm/connect").display()))
+            .replace("ca_dir=/dev/shm/triple-c/connect-ca\n", &format!("ca_dir='{}'\n", p("shm/connect-ca").display()))
+            .replace("clone_status=/run/triple-c-clone\n", &format!("clone_status='{}'\n", p("clone").display()))
+            .replace("workspace=/workspace\n", &format!("workspace='{}'\n", p("ws").display()))
+            .replace("retry_wait=2400\n", "retry_wait=20\n")
+            .replace("log_to=/proc/1/fd/1\n", &format!("log_to='{}'\n", p("log").display()))
+            .replace("ssh_tmp_dir=/tmp\n", &format!("ssh_tmp_dir='{}'\n", tmp.display()));
+        let script_path = write_script(tmp, "apply-connect", &script);
+        write_script(&p("bin"), "update-ca-certificates", "#!/bin/sh\necho ran >> \"$(dirname \"$0\")/../update-calls\"\n");
+        let path_env = format!("{}:{}", p("bin").display(), std::env::var("PATH").unwrap_or_default());
+        Connect { root: tmp.to_path_buf(), script: script_path, path_env }
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        Command::new("bash")
+            .arg(&self.script)
+            .args(args)
+            .env("PATH", &self.path_env)
+            .env_remove("GIT_TOKEN")
+            .output()
+            .unwrap()
+    }
+
+    fn p(&self, s: &str) -> std::path::PathBuf {
+        self.root.join(s)
+    }
+
+    /// `--prepare`: this connect's nonce (its dir is `shm/connect/<nonce>`).
+    fn prepare(&self) -> String {
+        let out = self.run(&["--prepare"]);
+        assert!(out.status.success(), "{}", text(&out));
+        let nonce = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert!(nonce.len() == 16 && nonce.chars().all(|c| c.is_ascii_hexdigit()), "{nonce:?}");
+        nonce
+    }
+
+    /// What the app uploads for one connect: `files` (`ssh/x`, `ca/y`) and
+    /// `connect.env`.
+    fn stage(&self, nonce: &str, files: &[(&str, &str)], env: &str) {
+        for (k, v) in files {
+            fs::write(self.p(&format!("shm/connect/{nonce}/{k}")), v).unwrap();
+        }
+        fs::write(self.p(&format!("shm/connect/{nonce}/connect.env")), env).unwrap();
+    }
+
+    /// A whole connect: prepare, stage, apply.
+    fn connect(&self, files: &[(&str, &str)], env: &str) -> Output {
+        let nonce = self.prepare();
+        self.stage(&nonce, files, env);
+        self.run(&[&nonce])
+    }
+
+    /// Waits for the background re-clone to finish (`done` back).
+    fn wait_done(&self) {
+        for _ in 0..200 {
+            if self.p("clone/done").exists() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        panic!("the re-clone never finished: {}", fs::read_to_string(self.p("log")).unwrap());
+    }
+}
+
+const PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
+
+#[test]
+fn apply_connect_installs_the_ca_merges_ssh_writes_git_credentials_and_retries_only_failed_clones() {
+    let tmp = tempfile::tempdir().unwrap();
+    let c = Connect::new(tmp.path());
+    let remote = bare_remote(tmp.path(), "remote");
+
+    // A connect's own staging dir; one an abandoned connect left long ago is
+    // cleared, a recent one (a connect in flight) is not.
+    fs::create_dir_all(c.p("shm/connect/0000000000000old")).unwrap();
+    fs::create_dir_all(c.p("shm/connect/00000000000recent")).unwrap();
+    assert!(Command::new("touch").args(["-d", "1 hour ago"]).arg(c.p("shm/connect/0000000000000old")).status().unwrap().success());
+    let nonce = c.prepare();
+    for d in ["shm/connect".to_string(), format!("shm/connect/{nonce}"), format!("shm/connect/{nonce}/ssh"), format!("shm/connect/{nonce}/ca")] {
+        assert_eq!(mode(&c.p(&d)), 0o700, "{d}");
+    }
+    assert!(!c.p("shm/connect/0000000000000old").exists());
+    assert!(c.p("shm/connect/00000000000recent").exists());
+
+    // What the app uploads.
+    let token = "ghp_secret-value";
+    let env = format!("ANTHROPIC_API_KEY={}\nGIT_TOKEN={}\n", b64("sk-other"), b64(token));
+    c.stage(&nonce, &[("ssh/id_ed25519", "KEY"), ("ca/corp.pem", PEM)], &env);
+    // The first clone is done: `ok` cloned, `bad` failed (no credentials then).
+    git(tmp.path(), &["clone", "-q", remote.to_str().unwrap(), c.p("ws/ok").to_str().unwrap()]);
+    fs::write(c.p("clone/repos"), "ok\tcloning\nok\tcloned\nbad\tcloning\nbad\tfailed\n").unwrap();
+    fs::write(c.p("clone/done"), "").unwrap();
+    fs::write(
+        c.p("run/repos.json"),
+        format!(
+            r#"[{{"url":"{r}","branch":null,"folder":"ok"}},{{"url":"{r}","branch":"dev","folder":"bad"}}]"#,
+            r = remote.display()
+        ),
+    )
+    .unwrap();
+
+    let out = c.run(&[&nonce]);
+    let log = text(&out);
+    assert!(out.status.success(), "{log}");
+    assert!(log.contains("credentials applied"), "{log}");
+    assert!(!c.p(&format!("shm/connect/{nonce}")).exists(), "the apply removes its staging");
+    assert!(!log.contains(token) && !log.contains("sk-other"), "no value is printed: {log}");
+
+    // CA, as the entrypoint installs it.
+    assert_eq!(fs::read_to_string(c.p("store/triple-c-corp.crt")).unwrap(), PEM);
+    assert_eq!(fs::read_to_string(c.p("update-calls")).unwrap(), "ran\n");
+    // SSH merged into ~/.ssh.
+    assert_eq!(fs::read_to_string(c.p("home/.ssh/id_ed25519")).unwrap(), "KEY");
+    assert_eq!(mode(&c.p("home/.ssh/id_ed25519")), 0o600);
+    // The git credential helper.
+    let cred = fs::read_to_string(c.p("home/.git-credentials")).unwrap();
+    assert!(cred.contains(&format!("https://oauth2:{token}@github.com")), "{cred}");
+    // The marker the waiting clone starts on.
+    assert!(c.p("run/connected").exists());
+
+    // Only `bad` is cloned again, in the background.
+    c.wait_done();
+    let repos = fs::read_to_string(c.p("clone/repos")).unwrap();
+    assert_eq!(
+        repos,
+        "ok\tcloning\nok\tcloned\nbad\tcloning\nbad\tfailed\nbad\tcloning\nbad\tcloned\n",
+        "{}",
+        fs::read_to_string(c.p("log")).unwrap()
+    );
+    assert_eq!(git(&c.p("ws/bad"), &["rev-parse", "--abbrev-ref", "HEAD"]), "dev");
+    let clone_log = fs::read_to_string(c.p("log")).unwrap();
+    assert!(clone_log.contains("cloning again with the project's credentials: bad"), "{clone_log}");
+    assert!(!clone_log.contains(token), "{clone_log}");
+
+    // A new connect with the same credentials: nothing failed, nothing
+    // re-cloned, same state, the CA not reinstalled.
+    let out = c.connect(&[("ssh/id_ed25519", "KEY"), ("ca/corp.pem", PEM)], &env);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(fs::read_to_string(c.p("clone/repos")).unwrap(), repos);
+    assert!(c.p("clone/done").exists());
+    assert_eq!(fs::read_to_string(c.p("home/.git-credentials")).unwrap(), cred);
+    assert_eq!(fs::read_to_string(c.p("home/.ssh/id_ed25519")).unwrap(), "KEY");
+    assert_eq!(fs::read_to_string(c.p("update-calls")).unwrap(), "ran\n", "the CA stamp skips a reinstall");
+}
+
+#[test]
+fn a_connect_that_takes_over_from_a_waiting_retry_does_not_lose_done() {
+    // Connect 1 arrives while a clone that started without credentials is
+    // still running: its retry waits for `done`. The clone finishes and
+    // connect 2 arrives before the waiter's next look: connect 2 removes
+    // `done` and retries at once. The waiter used to hold the retry lock
+    // while it waited, so connect 2's retry queued behind it and the waiter
+    // never saw `done` again (stalled for the whole retry_wait).
+    let tmp = tempfile::tempdir().unwrap();
+    let c = Connect::new(tmp.path());
+    // A long poll, so connect 2 lands in the gap deterministically.
+    let script = fs::read_to_string(&c.script).unwrap().replace("                sleep 2\n", "                sleep 6\n");
+    fs::write(&c.script, script).unwrap();
+    let remote = bare_remote(tmp.path(), "remote");
+    fs::write(c.p("run/repos.json"), format!(r#"[{{"url":"{}","branch":null,"folder":"bad"}}]"#, remote.display())).unwrap();
+    fs::write(c.p("clone/repos"), "bad\tcloning\nbad\tfailed\n").unwrap();
+    fs::write(c.p("clone/no-credentials"), "").unwrap();
+    let env = format!("GIT_TOKEN={}\n", b64("ghp_fake-fixture"));
+
+    let out = c.connect(&[], &env);
+    assert!(out.status.success(), "{}", text(&out));
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    // The first clone ends; connect 2 comes before the waiter looks again.
+    fs::write(c.p("clone/done"), "").unwrap();
+    let started = std::time::Instant::now();
+    let out = c.connect(&[], &env);
+    assert!(out.status.success(), "{}", text(&out));
+
+    // Connect 2's retry runs straight away and writes `done`.
+    while !c.p("clone/done").exists() {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "`done` was lost: {}",
+            fs::read_to_string(c.p("log")).unwrap()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    // The waiter wakes, sees another retry took over, and clones nothing.
+    std::thread::sleep(std::time::Duration::from_secs(7));
+    assert!(c.p("clone/done").exists());
+    assert_eq!(
+        fs::read_to_string(c.p("clone/repos")).unwrap(),
+        "bad\tcloning\nbad\tfailed\nbad\tcloning\nbad\tcloned\n",
+        "{}",
+        fs::read_to_string(c.p("log")).unwrap()
+    );
+    assert!(!c.p("clone/no-credentials").exists());
+}
+
+#[test]
+fn a_failed_ca_move_keeps_the_ca_installed_before() {
+    let tmp = tempfile::tempdir().unwrap();
+    let c = Connect::new(tmp.path());
+    let out = c.connect(&[("ca/corp.pem", PEM)], "");
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(fs::read_to_string(c.p("shm/connect-ca/corp.pem")).unwrap(), PEM);
+
+    // Every move of a staged `ca` dir fails: the old files stay in place and
+    // stay installed.
+    let pem2 = "-----BEGIN CERTIFICATE-----\nMIIC\n-----END CERTIFICATE-----\n";
+    write_script(
+        &c.p("bin"),
+        "mv",
+        "#!/bin/sh\nfor a; do case \"$a\" in */ca) exit 1 ;; esac; done\nexec /usr/bin/mv \"$@\"\n",
+    );
+    let out = c.connect(&[("ca/corp.pem", pem2)], "");
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("keeping the ones from before"), "{}", text(&out));
+    assert_eq!(fs::read_to_string(c.p("shm/connect-ca/corp.pem")).unwrap(), PEM);
+    assert_eq!(fs::read_to_string(c.p("store/triple-c-corp.crt")).unwrap(), PEM);
+
+    // With the moves working again the new files are swapped in, nothing left over.
+    fs::remove_file(c.p("bin/mv")).unwrap();
+    let out = c.connect(&[("ca/corp.pem", pem2)], "");
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(fs::read_to_string(c.p("shm/connect-ca/corp.pem")).unwrap(), pem2);
+    assert_eq!(fs::read_to_string(c.p("store/triple-c-corp.crt")).unwrap(), pem2);
+    assert!(!c.p("shm/connect-ca.new").exists() && !c.p("shm/connect-ca.old").exists());
+
+    // A connect with no CA removes it.
+    let out = c.connect(&[], "");
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(!c.p("shm/connect-ca").exists());
+    assert!(!c.p("store/triple-c-corp.crt").exists());
+}
+
+#[test]
+fn apply_connect_with_nothing_configured_changes_nothing_and_leaves_a_waiting_clone_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let c = Connect::new(tmp.path());
+    let nonce = c.prepare();
+    // The first clone is still waiting for this connect: no `done`, no
+    // `no-credentials`.
+    fs::write(c.p("run/repos.json"), "[]").unwrap();
+    let out = c.run(&[&nonce]);
+    let log = text(&out);
+    assert!(out.status.success(), "{log}");
+    assert!(!log.contains("warning"), "{log}");
+    assert!(!c.p("home/.ssh").exists() && !c.p("home/.git-credentials").exists());
+    assert!(!c.p("update-calls").exists());
+    assert!(c.p("run/connected").exists());
+    assert!(!c.p("clone/done").exists(), "nothing retried");
+    assert_eq!(fs::read_to_string(c.p("log")).unwrap(), "");
+}
+
+#[test]
+fn apply_connect_retries_a_clone_that_started_without_credentials_once_it_is_done() {
+    let tmp = tempfile::tempdir().unwrap();
+    let c = Connect::new(tmp.path());
+    let remote = bare_remote(tmp.path(), "remote");
+    let nonce = c.prepare();
+    fs::write(
+        c.p("run/repos.json"),
+        format!(r#"[{{"url":"{}","branch":null,"folder":"late"}}]"#, remote.display()),
+    )
+    .unwrap();
+    // Still cloning without credentials (the wait timed out).
+    fs::write(c.p("clone/no-credentials"), "").unwrap();
+    fs::write(c.p("clone/repos"), "late\tcloning\n").unwrap();
+    let out = c.run(&[&nonce]);
+    assert!(out.status.success(), "{}", text(&out));
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(!c.p("ws/late").exists(), "nothing until the running clone is done");
+    // That clone ends, failed.
+    fs::write(c.p("clone/repos"), "late\tcloning\nlate\tfailed\n").unwrap();
+    fs::write(c.p("clone/done"), "").unwrap();
+    for _ in 0..200 {
+        if fs::read_to_string(c.p("clone/repos")).unwrap().ends_with("late\tcloned\n") && c.p("clone/done").exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        fs::read_to_string(c.p("clone/repos")).unwrap().ends_with("late\tcloning\nlate\tcloned\n"),
+        "{}",
+        fs::read_to_string(c.p("log")).unwrap()
+    );
+    assert!(c.p("ws/late/README").exists());
+    assert!(!c.p("clone/no-credentials").exists());
+}
+
+#[test]
+fn a_running_re_clone_never_holds_the_apply_lock_and_prepare_waits_for_an_apply() {
+    let tmp = tempfile::tempdir().unwrap();
+    let c = Connect::new(tmp.path());
+    // A re-clone that takes a while.
+    let mut lib = fs::read_to_string(c.p("lib.sh")).unwrap();
+    lib.push_str("\nclone_repos() { sleep 6; }\n");
+    fs::write(c.p("lib.sh"), lib).unwrap();
+    let nonce = c.prepare();
+    fs::write(c.p("run/repos.json"), r#"[{"url":"x","branch":null,"folder":"bad"}]"#).unwrap();
+    fs::write(c.p("clone/repos"), "bad\tcloning\nbad\tfailed\n").unwrap();
+    fs::write(c.p("clone/done"), "").unwrap();
+    assert!(c.run(&[&nonce]).status.success());
+    assert!(!c.p("clone/done").exists(), "the re-clone is running");
+    // The next connect goes straight through.
+    let started = std::time::Instant::now();
+    let out = c.connect(&[], "");
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(!text(&out).contains("another apply"), "{}", text(&out));
+    assert!(started.elapsed() < std::time::Duration::from_secs(4), "{:?}", started.elapsed());
+    c.wait_done();
+
+    // An apply in progress (the lock held) holds a prepare back.
+    let lock = c.p("shm/apply-connect.lock");
+    let mut holder = Command::new("flock").arg(&lock).args(["sleep", "2"]).spawn().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let started = std::time::Instant::now();
+    assert!(c.run(&["--prepare"]).status.success());
+    assert!(started.elapsed() >= std::time::Duration::from_millis(1200), "{:?}", started.elapsed());
+    holder.wait().unwrap();
+}
+
+#[test]
+fn under_copy_at_connect_hybrid_keeps_ssh_off_efs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, mnt) = hybrid_dirs(tmp.path());
+    fs::create_dir_all(home.join(".ssh")).unwrap();
+    fs::create_dir_all(home.join(".claude")).unwrap();
+    let src = tmp.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("id_ed25519"), "KEY").unwrap();
+    let script = format!(
+        "{}\ntriplec_aws=1\ntriplec_connect=1\nlink_persistent_home \"$1\" \"$2\" \"\"\nmerge_host_ssh \"$3\"\n",
+        aws_blocks(&["aws_home", "sync_host_ssh", "merge_host_ssh"])
+            .replace("/home/claude", home.to_str().unwrap())
+            .replace("triplec_home_mnt=/mnt/triple-c-home", &format!("triplec_home_mnt='{}'", mnt.display()))
+            .replace("chown -R claude:claude", ": chown")
+    );
+    let out = bash(&script, &[&home, &mnt, &src], &[], &[]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("~/.ssh does not"), "{}", text(&out));
+    assert!(fs::symlink_metadata(home.join(".claude")).unwrap().file_type().is_symlink());
+    let ssh = fs::symlink_metadata(home.join(".ssh")).unwrap();
+    assert!(ssh.is_dir() && !ssh.file_type().is_symlink(), "~/.ssh is a local directory");
+    assert_eq!(fs::read_to_string(home.join(".ssh/id_ed25519")).unwrap(), "KEY");
+    assert!(!mnt.join(".ssh").exists(), "nothing written to EFS");
+}
+
+#[test]
+fn two_connects_at_once_never_mix_their_files() {
+    // Two machines connecting at the same moment: both prepare, then both
+    // upload, then both apply. Each applies its own set; the later wins.
+    let tmp = tempfile::tempdir().unwrap();
+    let c = Connect::new(tmp.path());
+    let a = c.prepare();
+    let b = c.prepare();
+    assert_ne!(a, b);
+    c.stage(&a, &[("ssh/id_a", "A"), ("ssh/config", "Host a\n")], &format!("GIT_TOKEN={}\n", b64("tok-a")));
+    c.stage(&b, &[("ssh/id_b", "B"), ("ssh/config", "Host b\n")], &format!("GIT_TOKEN={}\n", b64("tok-b")));
+    for n in [&a, &b] {
+        let out = c.run(&[n]);
+        assert!(out.status.success(), "{}", text(&out));
+    }
+    assert_eq!(fs::read_to_string(c.p("home/.ssh/config")).unwrap(), "Host b\n");
+    let cred = fs::read_to_string(c.p("home/.git-credentials")).unwrap_or_else(|e| panic!("{e}: {:?}", fs::read_dir(c.p("home")).unwrap().map(|e| e.unwrap().file_name()).collect::<Vec<_>>()));
+    assert!(cred.contains("tok-b"), "{cred}");
+    // B's set as a whole: A's key, merged first, is dropped again by the
+    // merge's own bookkeeping (B no longer provides it).
+    assert_eq!(fs::read_to_string(c.p("home/.ssh/id_b")).unwrap(), "B");
+    assert!(!c.p("home/.ssh/id_a").exists());
+    assert_eq!(fs::read_dir(c.p("shm/connect")).unwrap().count(), 0, "both staging dirs gone");
+    // A nonce that is not one, or not prepared, is refused.
+    assert_eq!(c.run(&["../../etc"]).status.code(), Some(2));
+    assert_eq!(c.run(&[&a]).status.code(), Some(1));
 }

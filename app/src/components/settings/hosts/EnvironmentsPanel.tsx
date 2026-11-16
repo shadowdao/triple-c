@@ -27,6 +27,7 @@ import Field, { inputClass, selectClass } from "../../ui/Field";
 import Modal from "../../ui/Modal";
 import StatusIndicator from "../../ui/StatusIndicator";
 import AdminBundleModal from "./AdminBundleModal";
+import UpdateEnvironmentModal from "./UpdateEnvironmentModal";
 import DeployEnvironmentModal from "./DeployEnvironmentModal";
 import DeployProgress, { runKey, useDeployRuns, type DeployRun } from "./DeployProgress";
 import PolicyFiles from "./PolicyFiles";
@@ -133,6 +134,7 @@ export default function EnvironmentsPanel({
   const [waiting, setWaiting] = useState<Set<string>>(new Set());
   const [deployOpen, setDeployOpen] = useState(false);
   const [repairOf, setRepairOf] = useState<string | null>(null);
+  const [updateOf, setUpdateOf] = useState<{ name: string; region: string; hours: number } | null>(null);
   const [destroyOf, setDestroyOf] = useState<{ name: string; region: string } | null>(null);
   /** An Unlock waiting for its typed confirmation: an environment's lock or the caller's onboarding's. */
   const [unlockOf, setUnlockOf] = useState<{
@@ -225,13 +227,18 @@ export default function EnvironmentsPanel({
   const current = scan && scan.region === region ? scan : null;
   const stale = detecting || !current;
 
-  const deploy = (runRegion: string, name: string, network: NetworkChoice) =>
+  const deploy = (runRegion: string, name: string, network: NetworkChoice, hours: number) =>
     launch(runRegion, name, environmentStateKey(name), `Deploy of ${name}`, () =>
-      deployAwsEnvironment(connection.id, runRegion, name, network),
+      deployAwsEnvironment(connection.id, runRegion, name, network, hours),
     );
-  const repair = (runRegion: string, name: string, network?: NetworkChoice) =>
+  // Without `hours`, the environment's recorded cap is kept.
+  const repair = (runRegion: string, name: string, network?: NetworkChoice, hours?: number) =>
     launch(runRegion, name, environmentStateKey(name), `Repair of ${name}`, () =>
-      repairAwsEnvironment(connection.id, runRegion, name, network),
+      repairAwsEnvironment(connection.id, runRegion, name, network, hours),
+    );
+  const update = (runRegion: string, name: string, hours: number) =>
+    launch(runRegion, name, environmentStateKey(name), `Update of ${name}`, () =>
+      updateAwsEnvironment(connection.id, runRegion, name, hours),
     );
 
   const join = (found: EnvironmentScan, e: DetectedEnvironment) => {
@@ -422,11 +429,7 @@ export default function EnvironmentsPanel({
                 size="sm"
                 disabled={busy}
                 aria-label={`Update ${e.name}`}
-                onClick={() =>
-                  void launch(at, e.name, environmentStateKey(e.name), `Update of ${e.name}`, () =>
-                    updateAwsEnvironment(connection.id, at, e.name),
-                  )
-                }
+                onClick={() => setUpdateOf({ name: e.name, region: at, hours: e.info?.max_workspace_hours ?? 0 })}
               >
                 Update
               </Button>
@@ -568,10 +571,19 @@ export default function EnvironmentsPanel({
             setDeployOpen(false);
             setRepairOf(null);
           }}
-          onDeploy={(name, network) =>
-            repairOf ? repair(current.region, name, network) : deploy(current.region, name, network)
+          onDeploy={(name, network, hours) =>
+            repairOf ? repair(current.region, name, network, hours) : deploy(current.region, name, network, hours)
           }
           onDetect={() => void detect()}
+        />
+      )}
+      {updateOf && (
+        <UpdateEnvironmentModal
+          name={updateOf.name}
+          region={updateOf.region}
+          currentHours={updateOf.hours}
+          onClose={() => setUpdateOf(null)}
+          onUpdate={(hours) => update(updateOf.region, updateOf.name, hours)}
         />
       )}
       {destroyOf && (

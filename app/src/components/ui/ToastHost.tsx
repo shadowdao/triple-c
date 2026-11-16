@@ -9,6 +9,12 @@ const TONE: Record<Toast["kind"], { border: string; bg: string; fg: string; glyp
     fg: "var(--error)",
     glyph: "▲",
   },
+  warning: {
+    border: "var(--warning)",
+    bg: "var(--warning-muted)",
+    fg: "var(--warning)",
+    glyph: "▲",
+  },
   success: {
     border: "var(--success)",
     bg: "var(--success-muted)",
@@ -27,9 +33,9 @@ function ToastCard({ toast, onDismiss }: { toast: Toast; onDismiss: () => void }
   const [expanded, setExpanded] = useState(false);
   const tone = TONE[toast.kind];
 
-  // Errors stay until dismissed; transient confirmations time out.
+  // Errors and warnings stay until dismissed; transient confirmations time out.
   useEffect(() => {
-    if (toast.kind === "error") return;
+    if (toast.kind === "error" || toast.kind === "warning") return;
     const timer = setTimeout(onDismiss, 6000);
     return () => clearTimeout(timer);
   }, [toast.kind, onDismiss]);

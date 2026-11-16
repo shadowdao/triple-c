@@ -23,6 +23,7 @@ import { useContainerProgress } from "./hooks/useContainerProgress";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useMarketplaceSyncToasts } from "./hooks/useMarketplace";
 import { useProjectStatusEvents } from "./hooks/useProjectStatusEvents";
+import { useWorkspaceWarnings } from "./hooks/useWorkspaceWarnings";
 import MarketplaceView from "./components/marketplace/MarketplaceView";
 import { useAppState, isHomeTab, tabKeyId, homeTabKey, MARKETPLACE_TAB_KEY } from "./store/appState";
 import { reconcileAwsProjects, reconcileProjectStatuses } from "./lib/tauri-commands";
@@ -77,6 +78,7 @@ export default function App() {
   useKeyboardShortcuts();
   useMarketplaceSyncToasts();
   useProjectStatusEvents();
+  useWorkspaceWarnings();
 
   // Initialize on mount
   useEffect(() => {

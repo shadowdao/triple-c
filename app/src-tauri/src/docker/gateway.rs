@@ -58,8 +58,28 @@ const GATEWAY_LITELLM_VERSION: &str = "v1.106.6";
 const GATEWAY_REGISTRY_DIGEST: &str =
     "sha256:37e2dafb088a7723beb998590682957386dfc83ffea1848486f8e0e5cfac0b06";
 
-fn registry_image_ref() -> String {
+/// The digest-pinned registry image. The AWS gateway sidecar runs it too
+/// (`aws::workspace`); the index covers linux/amd64 and linux/arm64.
+pub(crate) fn registry_image_ref() -> String {
     format!("{}@{}", GATEWAY_REGISTRY_REPO, GATEWAY_REGISTRY_DIGEST)
+}
+
+/// The environment variables the AWS gateway sidecar gets its two keys in
+/// (from the project secret). [`sidecar_config`] names them with LiteLLM's
+/// `os.environ/<NAME>` references, so the config itself holds no key.
+pub(crate) const SIDECAR_API_KEY_ENV: &str = "TRIPLEC_GATEWAY_API_KEY";
+pub(crate) const SIDECAR_MASTER_KEY_ENV: &str = "TRIPLEC_GATEWAY_MASTER_KEY";
+
+/// The LiteLLM config for the AWS gateway sidecar: [`render_config`]'s, with
+/// the provider key and master key as `os.environ/…` references (LiteLLM
+/// resolves both: `litellm_params.api_key` and `general_settings.master_key`).
+/// Holds no secret, so it can be sized and shown in errors.
+pub(crate) fn sidecar_config(settings: &GatewaySettings) -> String {
+    render_config(
+        settings,
+        &format!("os.environ/{SIDECAR_API_KEY_ENV}"),
+        &format!("os.environ/{SIDECAR_MASTER_KEY_ENV}"),
+    )
 }
 
 /// Local builds are tagged with the pin plus a hash of the embedded build
@@ -1173,6 +1193,22 @@ mod tests {
         // Blank is treated as unset rather than emitted as an empty URL.
         s.api_base = Some("   ".to_string());
         assert!(!render_config(&s, "k", "m").contains("api_base"));
+    }
+
+    #[test]
+    fn sidecar_config_references_the_keys_and_holds_none() {
+        let yaml = sidecar_config(&settings());
+        assert!(yaml.contains("api_key: \"os.environ/TRIPLEC_GATEWAY_API_KEY\""));
+        assert!(yaml.contains("master_key: \"os.environ/TRIPLEC_GATEWAY_MASTER_KEY\""));
+        // Otherwise exactly what Docker's gateway gets.
+        assert_eq!(
+            yaml,
+            render_config(
+                &settings(),
+                "os.environ/TRIPLEC_GATEWAY_API_KEY",
+                "os.environ/TRIPLEC_GATEWAY_MASTER_KEY"
+            )
+        );
     }
 
     #[test]

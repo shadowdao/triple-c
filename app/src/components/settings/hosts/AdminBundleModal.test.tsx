@@ -57,7 +57,18 @@ describe("AdminBundleModal", () => {
         environment: "team",
         ownerId: null,
         network: { mode: "private-nat" },
+        maxWorkspaceHours: 0,
       }),
+    );
+  });
+
+  it("an environment bundle carries the lifetime cap", async () => {
+    invoke.mockResolvedValue("/tmp/env");
+    render(<AdminBundleModal connectionId="h1" region="eu-west-1" kind="environment" onClose={vi.fn()} />);
+    fireEvent.change(screen.getByLabelText("Maximum workspace lifetime (hours, 0 = none)"), { target: { value: "24" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save bundle to folder…" }));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("save_aws_admin_bundle", expect.objectContaining({ maxWorkspaceHours: 24 })),
     );
   });
 

@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ProjectPath, NewProjectHost, RemoveProjectOptions, WipChoice, UnsavedWork, ProjectRemovalReport, ProjectResetOutcome, ContainerInfo, AppSettings, SettingsImportPreview, SettingsImportOutcome, UpdateInfo, ImageUpdateInfo, FileEntry, FileContents, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, BrowserPageState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo, UploadOutcome, Note, ViewerFile, ViewerPoll, ViewerSaved, ViewerState, FileDiff, InstallScope, ItemUpdate, Marketplace, MarketplaceAccount, MarketplaceItemRef, MarketplaceSnapshot, ProjectSyncResult, SyncReport, HostConnection, CallerIdentity, PermissionReport, PolicyFile, Tier, EnvironmentScan, NetworkChoice, ModuleKind } from "./types";
+import type { Project, ProjectPath, NewProjectHost, RemoveProjectOptions, WipChoice, UnsavedWork, WorkspaceStatus, ProjectRemovalReport, ProjectResetOutcome, ContainerInfo, AppSettings, SettingsImportPreview, SettingsImportOutcome, UpdateInfo, ImageUpdateInfo, FileEntry, FileContents, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, BrowserPageState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo, UploadOutcome, Note, ViewerFile, ViewerPoll, ViewerSaved, ViewerState, FileDiff, InstallScope, ItemUpdate, Marketplace, MarketplaceAccount, MarketplaceItemRef, MarketplaceSnapshot, ProjectSyncResult, SyncReport, HostConnection, CallerIdentity, PermissionReport, PolicyFile, HourlyEstimate, AwsWorkspaceConfig, Tier, EnvironmentScan, NetworkChoice, ModuleKind } from "./types";
 
 // Docker
 export const checkDocker = () => invoke<boolean>("check_docker");
@@ -37,6 +37,15 @@ export const checkUnsavedWork = (projectId: string) =>
   invoke<UnsavedWork>("check_unsaved_work", { projectId });
 export const awsTaskLog = (projectId: string, limit: number) =>
   invoke<string[]>("aws_task_log", { projectId, limit });
+/** An AWS workspace's clone/setup status; null for a local project, no
+ *  tunnel, or an image without the reader. A background read (never keeps an
+ *  idle workspace up). */
+export const awsWorkspaceStatus = (projectId: string) =>
+  invoke<WorkspaceStatus | null>("aws_workspace_status", { projectId });
+/** The project's environment's advisory lifetime cap in hours (0 = none);
+ *  null when it can't be read. Never rejects for a missing project. */
+export const awsEnvironmentMaxHours = (projectId: string) =>
+  invoke<number | null>("aws_environment_max_hours", { projectId });
 export const removeAwsResources = (projectId: string, discardData: boolean) =>
   invoke<Project>("remove_aws_resources", { projectId, discardData });
 export const rebuildProjectContainer = (projectId: string) =>
@@ -100,6 +109,11 @@ export const checkAwsPermissions = (id: string, region?: string) =>
 /** Every policy file `tier` needs, in order: attach all of them. */
 export const awsPolicyDocument = (tier: Tier) =>
   invoke<PolicyFile[]>("aws_policy_document", { tier });
+/** The estimated hourly cost of `config` on Fargate in `region`, signed with the project's
+ *  connection. Never rejects for AWS reasons: `null` means "Estimate unavailable" (denied, offline,
+ *  no connection). Rates are cached a day on disk. */
+export const awsCostEstimate = (connectionId: string, region: string, config: AwsWorkspaceConfig) =>
+  invoke<HourlyEstimate | null>("aws_cost_estimate", { connectionId, region, config });
 
 // AWS environments (OpenTofu). Reject with an `AwsError`. Starting commands (and follow) resolve
 // to an op id; progress arrives on the `AWS_DEPLOY_PROGRESS_EVENT` event (`DeployProgress`, in
@@ -109,13 +123,35 @@ export const awsPolicyDocument = (tier: Tier) =>
 // after a reload) replays the whole log under a new op id.
 export const detectAwsEnvironments = (connectionId: string, region: string) =>
   invoke<EnvironmentScan>("detect_aws_environments", { connectionId, region });
-export const deployAwsEnvironment = (connectionId: string, region: string, name: string, network: NetworkChoice) =>
-  invoke<string>("deploy_aws_environment", { connectionId, region, name, network });
-export const updateAwsEnvironment = (connectionId: string, region: string, name: string) =>
-  invoke<string>("update_aws_environment", { connectionId, region, name });
-/** `network` is required only when the environment has no record. */
-export const repairAwsEnvironment = (connectionId: string, region: string, name: string, network?: NetworkChoice) =>
-  invoke<string>("repair_aws_environment", { connectionId, region, name, network: network ?? null });
+export const deployAwsEnvironment = (
+  connectionId: string,
+  region: string,
+  name: string,
+  network: NetworkChoice,
+  maxWorkspaceHours = 0,
+) => invoke<string>("deploy_aws_environment", { connectionId, region, name, network, maxWorkspaceHours });
+/** Omit `maxWorkspaceHours` to keep the environment's recorded cap. */
+export const updateAwsEnvironment = (connectionId: string, region: string, name: string, maxWorkspaceHours?: number) =>
+  invoke<string>(
+    "update_aws_environment",
+    maxWorkspaceHours === undefined
+      ? { connectionId, region, name }
+      : { connectionId, region, name, maxWorkspaceHours },
+  );
+/** `network` is required only when the environment has no record; a record's cap is kept unless `maxWorkspaceHours` is given. */
+export const repairAwsEnvironment = (
+  connectionId: string,
+  region: string,
+  name: string,
+  network?: NetworkChoice,
+  maxWorkspaceHours?: number,
+) =>
+  invoke<string>(
+    "repair_aws_environment",
+    maxWorkspaceHours === undefined
+      ? { connectionId, region, name, network: network ?? null }
+      : { connectionId, region, name, network: network ?? null, maxWorkspaceHours },
+  );
 export const destroyIncompleteAwsEnvironment = (connectionId: string, region: string, name: string) =>
   invoke<string>("destroy_incomplete_aws_environment", { connectionId, region, name });
 export const unlockAwsState = (connectionId: string, region: string, stateKey: string) =>
@@ -136,7 +172,7 @@ export const saveAwsAdminBundle = (
   connectionId: string,
   region: string,
   kind: ModuleKind,
-  options: { environment?: string; ownerId?: string; network?: NetworkChoice } = {},
+  options: { environment?: string; ownerId?: string; network?: NetworkChoice; maxWorkspaceHours?: number } = {},
 ) =>
   invoke<string | null>("save_aws_admin_bundle", {
     connectionId,
@@ -145,6 +181,7 @@ export const saveAwsAdminBundle = (
     environment: options.environment ?? null,
     ownerId: options.ownerId ?? null,
     network: options.network ?? null,
+    ...(options.maxWorkspaceHours === undefined ? {} : { maxWorkspaceHours: options.maxWorkspaceHours }),
   });
 /** Check a corporate CA path and report what would be installed. Never
  *  rejects for a bad path — the reason comes back in `error`. */

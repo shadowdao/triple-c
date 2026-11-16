@@ -215,7 +215,7 @@ links to them so an admin can grant them without reading this doc.
 | Fargate Spot | off / on | Cheaper. Can be interrupted with 2 minutes' warning |
 | Idle auto-stop | off / N hours with no terminal or agent activity | The admin can set a maximum |
 | Repos | git URL + branch + folder name, one per `ProjectPath` | Replaces host paths on AWS |
-| Secrets delivery | **Secrets Manager** (default), **Copy at connect** | See [Secrets and uploads](#secrets-and-uploads) |
+| Secrets delivery | **Secrets Manager** (default), **Copy at connect** (built in phase 6) | See [Secrets and uploads](#secrets-and-uploads) |
 
 ### 5. Start, connect, stop
 
@@ -343,6 +343,10 @@ updates use the existing "new image available" flow: the next start uses the new
   from the user's onboarding module and its policy admits only their task role. Access point root:
   `/triple-c/<owner>/<project-id>`, with POSIX user and group 1000. The access point is created by
   the user, on their own file system, and tagged with the owner (see policies).
+- **EFS mode (built in phase 6)** is Hybrid plus a **second access point** mounted at `/workspace`
+  (root `/triple-c-workspaces/<owner_key>/<project>`, a sibling of the home roots, because a
+  `/workspace` directory under the home root would nest inside it). Leaving EFS mode keeps that
+  access point and its files until "Remove AWS resources".
 - **WIP push is on by default** (`wip_push_on_stop: true`, with a serde default per the
   `default_full_permissions` pattern) and can be turned off per project.
 - **Ephemeral and Hybrid have a stop guard.** Before stopping, the app asks the agent for
@@ -361,8 +365,9 @@ updates use the existing "new image available" flow: the next start uses the new
 `docker commit` doesn't exist on ECS. On AWS:
 
 - Anything installed outside `/home/claude` (apt packages, for example) is **lost on restart**.
-- A per-project **setup script** (stored with the project, run by the entrypoint on every start)
-  replaces snapshotting for the AWS host. Its output streams to the start-progress view.
+- A per-project **setup script** (stored with the project, run by the entrypoint on every start;
+  built in phase 6) replaces snapshotting for the AWS host. Its status and log tail show in
+  Project Home's Overview card.
 - Later, the app could build a per-workspace image from base image + setup script with CodeBuild
   and push it to ECR. Out of scope for v1.
 
@@ -389,15 +394,22 @@ env vars marked secret, the agent token.
 - Secrets Manager's 64 KB per-secret limit covers keys and cert bundles. Anything bigger is
   rejected with a clear message.
 
-**Copy at connect**
+**Copy at connect** (built in phase 6)
 
-- Nothing is stored in AWS. When the app connects, it pushes the files into the running container
-  through the agent, the same way Triple-C's file upload works today, writing to tmpfs paths that
-  the entrypoint re-syncs from.
-- The task can't start a fresh clone of a **private** repo until the app connects, so the clone is
-  deferred until the first connect. Scheduled jobs can't use the credentials while the app is
-  closed, unless the files were persisted to EFS (an extra opt-in, warned about).
-- For users or orgs that don't want keys in AWS at all.
+- With `secrets_delivery: CopyAtConnect` the project secret still carries settings, repos, the
+  agent token and the gateway sidecar's keys (R1), but no `TRIPLEC_FILES` and no credential
+  variable (`TRIPLEC_CREDENTIALS=connect` marks it). After every connect (start, attach,
+  background re-attach) the app uploads the files and an env file as root into a per-connect
+  directory on tmpfs under `/dev/shm/triple-c/connect/` through the agent, and runs
+  `triple-c-apply-connect`: CA install, SSH merge and git credential helper (the entrypoint's own
+  functions, shared through `entrypoint-lib.sh`), then retries repos whose clone failed.
+- Credentials never enter the agent's environment snapshot, so cron and scheduled jobs never get
+  them, and neither does the setup script. Terminals the app opens add them to their own env.
+  The first clone of a private repo waits up to 5 minutes for the first connect.
+- `~/.ssh` is not linked to EFS under this mode (R6), and a secret that held credentials is
+  recreated when the user switches to it (R7).
+- The "persist to EFS" opt-in this section once described was **not built**; the UI says
+  scheduled jobs don't get credentials while the app is closed.
 
 **Claude Code login works the same as locally (decided).** The project's LLM backend setting
 doesn't change on the AWS host:
@@ -601,18 +613,22 @@ pub aws: Option<AwsWorkspaceConfig>,
 
 pub struct AwsWorkspaceConfig {
     pub cpu: u32, pub memory_mib: u32, pub arch: Arch,   // X86_64 | Arm64 (Fargate's valid pairs)
-    pub storage: StorageMode,              // Ephemeral | Hybrid (Efs: phase 6)
+    pub storage: StorageMode,              // Ephemeral | Hybrid (default) | Efs (Hybrid + /workspace on EFS)
     pub ephemeral_gib: u32,                // 21-200
     pub spot: bool,
     pub idle_stop_minutes: Option<u32>,
     pub repos: Vec<RepoSource>,            // { url, branch: Option, folder } — parallel to ProjectPath
     pub wip_push_on_stop: bool,            // default true
+    pub secrets_delivery: SecretsDelivery, // SecretsManager (default) | CopyAtConnect
+    pub setup_script: Option<String>,      // <= 32 KiB, runs as claude after the clone
+    pub gateway_sidecar: bool,             // LiteLLM as a second container
     // runtime state (store-owned, not user-edited)
     pub task_arn: Option<String>, pub access_point_id: Option<String>,
     pub task_definition_arn: Option<String>,   // the exact family:revision last run
+    pub workspace_access_point_id: Option<String>, // the EFS-mode /workspace access point
 }
-// Not built yet: launch_type (Fargate only; EC2 is phase 7), secrets_delivery (Secrets Manager
-// only; Copy-at-connect is phase 6), setup_script (phase 6).
+// EnvironmentInfo (the SSM record, parsed): max_workspace_hours: u32 (0 = no cap).
+// Not built: launch_type (Fargate only; EC2 is phase 7).
 ```
 
 Existing `projects.json` files deserialize unchanged (`host_id` missing → Local).
@@ -625,7 +641,7 @@ Existing `projects.json` files deserialize unchanged (`host_id` missing → Loca
 - **P3** Workspace users register their own task definitions (`workspace-user-tasks.json`, owner request tag + the three tag keys); family `triple-c-<env>-<owner_key>-<project-id-12>`. Anyone can register into any `triple-c-*` family, so revisions and tasks are trusted by owner tag and run by exact `family:revision` ARN.
 - **P4** Hybrid persists by symlinking `~/.claude`, `~/.claude.json`, `~/.ssh` into the EFS mount (`/mnt/triple-c-home`), not by mounting over `/home/claude`: EFS can't seed from the image, and masking would hide the image's tooling.
 - **P5** AWS runs a registry image only; `LocalBuild` maps to the registry image and `Custom` must name a registry reference.
-- **P6** Left for phase 6+: EFS mode, Copy-at-connect, setup scripts, cost estimate, port mappings, the LLM gateway sidecar, Docker access, VPN, the admin's maximum lifetime. The UI shows them disabled with the reason.
+- **P6** Left for phase 6+: EFS mode, Copy-at-connect, setup scripts, cost estimate, port mappings, the LLM gateway sidecar, Docker access, VPN, the admin's maximum lifetime (all but Docker access and VPN were built in phase 6). The UI shows them disabled with the reason.
 - **P7** Idle means no authenticated agent activity for N minutes, no `claude` process and no running scheduler job; default off, 5-1440 minutes when on.
 - **P8** Spot uses `FARGATE_SPOT`; stop code `SpotInterruption` shows as Stopped with a Spot reason.
 - **P9** Bubblewrap fails on Fargate (measured live), so the AWS host forces Claude Code's sandbox off in the generated settings, with a notice.
@@ -636,6 +652,31 @@ Existing `projects.json` files deserialize unchanged (`host_id` missing → Loca
 - **R6** Repos clone in the background after the agent starts, so the 30 s health window holds; cost: a terminal may open before a repo exists.
 - **R7** OpenAI Compatible is allowed on AWS with a warning that the URL must be reachable from AWS; only the local LiteLLM sidecar is unavailable.
 - **R8** Removal leaves task-definition revisions ACTIVE for an admin to clear: `ecs:DeregisterTaskDefinition` is only grantable on `*`, so granting it would let any user break others' workspaces. Cost: stale revisions accumulate (free).
+
+### Phase 6: rulings (2026-11-15/16)
+
+Plan decisions:
+
+- **Q1** EFS mode adds a second access point mounted at `/workspace` (root `/triple-c-workspaces/<owner_key>/<project>`, 1000:1000, 0700, on the user's own file system): the home access point's root would otherwise contain it. EFS = Hybrid + `/workspace`; leaving EFS keeps the access point until "Remove AWS resources".
+- **Q2** Copy-at-connect keeps settings in the secret and moves credentials (files and every credential variable) to a push after each connect, as above. Why: "nothing stored in AWS" has to hold for keys and tokens.
+- **Q3** The setup script is AWS-only, runs as `claude` after the clone with a 30-minute timeout, and reports `running | ok | failed <code>`; the idle stop treats it like a running clone.
+- **Q4** The start reports clone and setup progress from one agent-side status read (`triple-c-workspace-status`); a failed clone or setup is a warning, never a failed start. (Amended by R5.)
+- **Q5** The cost estimate comes from the Pricing API (`pricing:GetProducts`, `*`-only in IAM), cached a day per region; spot is shown as on-demand with a note; EFS is not estimated; any failure reads "Estimate unavailable".
+- **Q6** Port mappings reuse the auth bridge's socat-over-attach tunnel: loopback bind only, TCP only, opened after connect. They reach the container's loopback, so the agent port and (with the sidecar) 4000 are refused.
+- **Q7** The LLM gateway is an opt-in `essential: false` sidecar on 127.0.0.1:4000 using the pinned LiteLLM image; its config and keys arrive as `TRIPLEC_GATEWAY_*` payload keys with keys by `os.environ/` reference. Needs the OpenAI-compatible backend and at least 1 vCPU / 2 GiB.
+- **Q8** The lifetime cap is an environment setting (`max_workspace_hours`, module v2) enforced inside the workspace by the idle watcher: advisory, since the user has sudo in their task. Exit status 76 identifies it. Server-side enforcement is a follow-up.
+- **Q9** One WIP branch per task run, updated in place, so repeated stops don't pile up branches; unchanged trees are skipped.
+
+Execution rulings:
+
+- **R1** Gateway keys stay in the secret even under copy-at-connect: the sidecar starts before any connect. Cost: a provider key in AWS for those users; the UI says so.
+- **R2** If the AWS credentials expired before the live run, finish the docs and review and leave the live run for the user. (They were renewed; the live run happened.)
+- **R3** Clones go to a scratch folder and are renamed into place atomically; nothing at a final path is ever deleted. Why: on EFS the folder outlives the task and may hold work.
+- **R4** The WIP branch is per run and per folder (`triple-c/wip/<run-id>-<folder>`): repos sharing a remote would otherwise overwrite each other's branch.
+- **R5** The start ends at "Connecting"; clone and setup are followed by a cancellable background follower, and reconcile also covers Stopped projects holding a task ARN. Why: a start holding the project lock for up to 35 minutes blocks Stop.
+- **R6** Copy-at-connect projects don't link `~/.ssh` to EFS, so keys vanish with the task. Cost: SSH keys made inside the container don't persist.
+- **R7** Switching to copy-at-connect recreates the project secret (force delete, then create), because a new secret version would keep the old credentials as AWSPREVIOUS. Cost: a short delay on the first start after the switch.
+- **R8** The sidecar's master key is random per start, so the local Docker gateway's keychain key never goes to AWS.
 
 ## Shipped AWS artefacts
 
@@ -676,7 +717,12 @@ TLS only, tagged `triple-c:component=state`), one object per deployment (D9).
    start/stop/status, stop guard with WIP push on by default, idle auto-stop, logs. **Done 2026-11-15**; verified live on Fargate:
    cold start about 94-104 s, ECS `HEALTHY` about 135 s, attach to a running task about 2 s, idle
    stop verified (see "Phase 5: rulings" and `aws/README.md` "Phase 5").
-6. **EFS mode, Copy-at-connect, setup scripts, cost estimate.**
+6. **EFS mode, Copy-at-connect, setup scripts, cost estimate.** Also port mappings, the LLM
+   gateway sidecar and the environment's (advisory) workspace lifetime cap. **Done 2026-11-16**
+   (rulings: "Phase 6: rulings"). Verified live in one workspace (Task 10; `aws/README.md`
+   "Phase 6: one workspace with every option"): EFS persistence, the setup script, port mapping,
+   the sidecar, copy-at-connect and the cost estimate. Not exercised live: the lifetime cap firing
+   (unit-tested), a v1 → v2 environment update, a private clone retried after connect.
 7. **ECS on EC2.** Per-user capacity providers in the onboarding module, privileged/Docker/VPN on
    dedicated capacity.
 8. **Standard tenancy** (opt-in), only if demand appears.
@@ -720,6 +766,12 @@ TLS only, tagged `triple-c:component=state`), one object per deployment (D9).
   whole tree up, also costing about 2 GB of ephemeral storage. It now chowns only what isn't
   already `claude`'s, and the agent answers 83 s after `RunTask`, 4 s after the container starts.
   SOCI was not tried.
+- ~~Whether the gateway sidecar logs the provider or master key.~~ **Measured 2026-11-16:** neither
+  appears in the gateway or workspace log streams after a failed and a successful call; LiteLLM
+  logs the provider's error text, in which OpenAI masks the key (first 8 + last 4 characters).
+- ~~That a cold start with EFS `/workspace` and the sidecar stays close to phase 5's.~~
+  **Measured 2026-11-16:** 115 s (two access points, two images); restart 112 s; sidecar healthy
+  126 s after the start began.
 - That GHCR pull-through cache works for the public image.
 - That the `SIGTERM` deadline on Fargate retirement and Spot leaves enough time for a WIP push.
 

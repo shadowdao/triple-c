@@ -489,6 +489,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-pricing"
+version = "1.125.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4bb09af014cbcee1ad1753d54d70c4afd7565dfd7ca4d84d8b702292462fe80f"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-s3"
 version = "1.159.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7446,6 +7471,7 @@ dependencies = [
  "aws-sdk-efs",
  "aws-sdk-iam",
  "aws-sdk-kms",
+ "aws-sdk-pricing",
  "aws-sdk-s3",
  "aws-sdk-secretsmanager",
  "aws-sdk-ssm",

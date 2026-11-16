@@ -75,6 +75,10 @@ pub struct EnvironmentInfo {
     pub log_group: String,
     pub network_mode: String,
     pub tenancy: String,
+    /// Advisory lifetime cap for workspaces, in hours; 0 = none. Absent in
+    /// records written by module version 1.
+    #[serde(default)]
+    pub max_workspace_hours: u32,
 }
 
 fn field<'a>(obj: &'a Map<String, Value>, name: &str) -> Result<&'a Value, String> {
@@ -187,6 +191,15 @@ pub fn parse_environment_record(
         return Err("tenancy is not strict".into());
     }
 
+    let max_workspace_hours = match obj.get("max_workspace_hours") {
+        None => 0,
+        Some(v) => v
+            .as_u64()
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|v| *v <= super::tofu_modules::MAX_WORKSPACE_HOURS)
+            .ok_or_else(|| "max_workspace_hours is not a number from 0 to 168".to_string())?,
+    };
+
     Ok(EnvironmentInfo {
         schema: RECORD_SCHEMA as u32,
         name: name.clone(),
@@ -199,6 +212,7 @@ pub fn parse_environment_record(
         log_group: log_group.to_string(),
         network_mode: network_mode.to_string(),
         tenancy: "strict".to_string(),
+        max_workspace_hours,
     })
 }
 

@@ -7,7 +7,7 @@ use serde_json::json;
 use super::*;
 use crate::aws::policies::PERMISSIONS_BOUNDARY_NAME;
 
-const RECORD_FIELDS: [&str; 11] = [
+const RECORD_FIELDS: [&str; 12] = [
     "schema",
     "name",
     "template_version",
@@ -19,9 +19,10 @@ const RECORD_FIELDS: [&str; 11] = [
     "log_group",
     "network_mode",
     "tenancy",
+    "max_workspace_hours",
 ];
 
-const VARIABLES: [&str; 7] = [
+const VARIABLES: [&str; 8] = [
     "environment_name",
     "region",
     "network_mode",
@@ -29,6 +30,7 @@ const VARIABLES: [&str; 7] = [
     "subnet_ids",
     "assign_public_ip",
     "log_retention_days",
+    "max_workspace_hours",
 ];
 
 /// Every `.tf` file of `kind`, parsed and merged into one body.
@@ -345,7 +347,7 @@ fn the_onboarding_completion_output_waits_for_every_resource() {
 
 #[test]
 fn the_module_versions_agree() {
-    assert_eq!(ENVIRONMENT_MODULE_VERSION, 1);
+    assert_eq!(ENVIRONMENT_MODULE_VERSION, 2);
     assert_eq!(ONBOARD_MODULE_VERSION, 1);
     let body = parsed(ModuleKind::Environment);
     let locals: Vec<_> = top_blocks(&body, "locals")
@@ -591,7 +593,7 @@ fn module_files_ship_the_lock_file() {
 
 #[test]
 fn environment_vars_cover_every_network_mode() {
-    let vars = environment_vars("dev", "us-west-2", &NetworkChoice::Public).unwrap();
+    let vars = environment_vars("dev", "us-west-2", &NetworkChoice::Public, 0).unwrap();
     assert_eq!(
         vars,
         json!({
@@ -601,9 +603,11 @@ fn environment_vars_cover_every_network_mode() {
             "vpc_id": "",
             "subnet_ids": [],
             "assign_public_ip": false,
+            "max_workspace_hours": 0,
         })
     );
-    let vars = environment_vars("dev", "us-west-2", &NetworkChoice::PrivateNat).unwrap();
+    let vars = environment_vars("dev", "us-west-2", &NetworkChoice::PrivateNat, 8).unwrap();
+    assert_eq!(vars["max_workspace_hours"], 8);
     assert_eq!(vars["network_mode"], "private-nat");
     assert_eq!(vars["subnet_ids"], json!([]));
 
@@ -613,7 +617,8 @@ fn environment_vars_cover_every_network_mode() {
         assign_public_ip: true,
     };
     let two = ["subnet-0123456789abcdef0", "subnet-89abcdef"];
-    let vars = environment_vars("dev", "eu-central-1", &existing("vpc-0a1b2c3d", &two)).unwrap();
+    let vars =
+        environment_vars("dev", "eu-central-1", &existing("vpc-0a1b2c3d", &two), 168).unwrap();
     assert_eq!(
         vars,
         json!({
@@ -623,6 +628,7 @@ fn environment_vars_cover_every_network_mode() {
             "vpc_id": "vpc-0a1b2c3d",
             "subnet_ids": two,
             "assign_public_ip": true,
+            "max_workspace_hours": 168,
         })
     );
     // Every variable the app sets is one the module declares.
@@ -648,13 +654,14 @@ fn environment_vars_cover_every_network_mode() {
         existing("vpc-0a1b2c3d", &["subnet-0123456789abcdef0", "sg-89abcdef"]),
     ] {
         assert!(
-            environment_vars("dev", "us-west-2", &bad).is_err(),
+            environment_vars("dev", "us-west-2", &bad, 0).is_err(),
             "{bad:?} accepted"
         );
     }
-    assert!(environment_vars("Dev", "us-west-2", &NetworkChoice::Public).is_err());
-    assert!(environment_vars("dev", "us-west-2;", &NetworkChoice::Public).is_err());
-    assert!(environment_vars("dev", "cn-north-1", &NetworkChoice::Public).is_err());
+    assert!(environment_vars("Dev", "us-west-2", &NetworkChoice::Public, 0).is_err());
+    assert!(environment_vars("dev", "us-west-2;", &NetworkChoice::Public, 0).is_err());
+    assert!(environment_vars("dev", "cn-north-1", &NetworkChoice::Public, 0).is_err());
+    assert!(environment_vars("dev", "us-west-2", &NetworkChoice::Public, 169).is_err());
 
     // The command layer receives the choice as tagged JSON.
     let parsed: NetworkChoice = serde_json::from_value(json!({
@@ -2120,4 +2127,29 @@ fn every_module_write_has_an_admin_check_and_vice_versa() {
         .filter(|a| module.contains(*a) || !checked.contains(*a))
         .collect();
     assert!(stale.is_empty(), "APP_ONLY_WRITES is stale: {stale:?}");
+}
+
+#[test]
+fn the_lifetime_cap_maximum_is_the_same_in_rust_typescript_and_hcl() {
+    let max = MAX_WORKSPACE_HOURS.to_string();
+    let vars = module_files(ModuleKind::Environment)
+        .iter()
+        .find(|(f, _)| *f == "variables.tf")
+        .unwrap()
+        .1;
+    let block = &vars[vars.find("variable \"max_workspace_hours\"").expect("the variable")..];
+    let block = &block[..block.find("\n}\n").unwrap()];
+    assert!(
+        block.contains(&format!("var.max_workspace_hours <= {max}")),
+        "the HCL validation's maximum: {block}"
+    );
+    assert!(block.contains(&format!("from 0 to {max}")), "{block}");
+    let ts = include_str!("../../../../src/components/settings/hosts/LifetimeCapField.tsx");
+    assert!(
+        ts.contains(&format!("export const MAX_WORKSPACE_HOURS = {max};")),
+        "LifetimeCapField.tsx's MAX_WORKSPACE_HOURS"
+    );
+    // And the record parser's message.
+    let envs = include_str!("../environments.rs");
+    assert!(envs.contains(&format!("from 0 to {max}")));
 }

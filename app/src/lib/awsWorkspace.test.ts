@@ -1,7 +1,11 @@
 import { describe, it, expect } from "vitest";
 import {
   cleanRepos,
+  defaultAwsWorkspace,
+  hasSavedFiles,
+  hasWorkspaceFiles,
   environmentSelectable,
+  gatewaySidecarProblem,
   memoryError,
   memoryOptions,
   nearestMemory,
@@ -57,5 +61,47 @@ describe("awsWorkspace", () => {
     expect(environmentSelectable(environment("a", "update_available", true))).toBe(true);
     expect(environmentSelectable(environment("a", "ready", false))).toBe(false);
     expect(environmentSelectable(environment("a", "deploying", true))).toBe(false);
+  });
+});
+
+describe("phase 6 settings", () => {
+  it("defaults mirror Rust", () => {
+    const d = defaultAwsWorkspace();
+    expect([d.secrets_delivery, d.setup_script, d.gateway_sidecar, d.workspace_access_point_id]).toEqual([
+      "secrets_manager",
+      null,
+      false,
+      null,
+    ]);
+  });
+  it("EFS mode and a leftover workspace access point count as saved files", () => {
+    const aws = defaultAwsWorkspace();
+    expect(hasSavedFiles({ aws: { ...aws, storage: "efs" } })).toBe(true);
+    expect(hasSavedFiles({ aws: { ...aws, storage: "ephemeral", workspace_access_point_id: "fsap-w" } })).toBe(true);
+    expect(hasSavedFiles({ aws: { ...aws, storage: "ephemeral" } })).toBe(false);
+  });
+
+  it("knows when /workspace files may be on EFS", () => {
+    const aws = defaultAwsWorkspace();
+    expect(hasWorkspaceFiles({ aws: { ...aws, storage: "efs" } })).toBe(true);
+    expect(hasWorkspaceFiles({ aws: { ...aws, storage: "hybrid", workspace_access_point_id: "fsap-w" } })).toBe(true);
+    expect(hasWorkspaceFiles({ aws: { ...aws, storage: "hybrid" } })).toBe(false);
+    expect(hasWorkspaceFiles({ aws: null })).toBe(false);
+  });
+});
+
+describe("gatewaySidecarProblem", () => {
+  const models = { models: [{ name: "gpt", model_id: "gpt-5" }] };
+  const aws = defaultAwsWorkspace();
+  it("needs the OpenAI-compatible backend, a complete model and 1 vCPU / 2 GiB", () => {
+    expect(gatewaySidecarProblem({ backend: "open_ai_compatible", aws }, models)).toBeNull();
+    expect(gatewaySidecarProblem({ backend: "anthropic", aws }, models)).toMatch(/OpenAI Compatible/);
+    expect(gatewaySidecarProblem({ backend: "open_ai_compatible", aws }, null)).toMatch(/Model Gateway/);
+    expect(
+      gatewaySidecarProblem({ backend: "open_ai_compatible", aws }, { models: [{ name: "gpt", model_id: " " }] }),
+    ).toMatch(/Model Gateway/);
+    expect(
+      gatewaySidecarProblem({ backend: "open_ai_compatible", aws: { ...aws, cpu: 512, memory_mib: 2048 } }, models),
+    ).toMatch(/1 vCPU and 2 GiB/);
   });
 });

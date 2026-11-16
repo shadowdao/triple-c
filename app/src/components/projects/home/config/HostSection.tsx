@@ -1,8 +1,20 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { AwsWorkspaceConfig, HostConnection, Project, RepoSource } from "../../../../lib/types";
 import * as commands from "../../../../lib/tauri-commands";
+import { environmentMaxHours } from "../../../../lib/environmentMaxHours";
 import { useAppState } from "../../../../store/appState";
 import {
+  COPY_AT_CONNECT_GATEWAY_NOTE,
+  GATEWAY_SIDECAR_MIN_CPU,
+  COPY_AT_CONNECT_HINT,
+  COPY_AT_CONNECT_SSH_NOTE,
+  COPY_AT_CONNECT_WARNINGS,
+  SECRETS_MANAGER_HINT,
+  SETUP_SCRIPT_COPY_AT_CONNECT_NOTE,
+  SETUP_SCRIPT_HINT,
+  MAX_SETUP_SCRIPT_BYTES,
+  setupScriptProblem,
+  EFS_HINT,
   EPHEMERAL_WARNING,
   FARGATE_CPUS,
   defaultAwsWorkspace,
@@ -10,6 +22,7 @@ import {
   formatMemory,
   memoryError,
   hasSavedFiles,
+  hasWorkspaceFiles,
   memoryOptions,
   nearestMemory,
 } from "../../../../lib/awsWorkspace";
@@ -17,8 +30,9 @@ import Button from "../../../ui/Button";
 import Modal from "../../../ui/Modal";
 import Toggle from "../../../ui/Toggle";
 import SegmentedControl from "../../../ui/SegmentedControl";
-import Field, { ConfigGroup, SwitchRow, inputClass, selectClass } from "../../../ui/Field";
+import Field, { ConfigGroup, SwitchRow, inputClass, monoInputClass, selectClass } from "../../../ui/Field";
 import RepoListEditor from "../../RepoListEditor";
+import AwsCostEstimate from "../AwsCostEstimate";
 
 interface Props {
   project: Project;
@@ -48,6 +62,10 @@ export default function HostSection({ project, save, disabled }: Props) {
   const [idle, setIdle] = useState(String(aws.idle_stop_minutes ?? DEFAULT_IDLE_MINUTES));
   const [idleProblem, setIdleProblem] = useState<string | null>(null);
   const [confirmRemoveResources, setConfirmRemoveResources] = useState(false);
+  const [setupScript, setSetupScript] = useState(aws.setup_script ?? "");
+  const [setupProblem, setSetupProblem] = useState<string | null>(null);
+  // The environment's advisory lifetime cap (Q8), from its record.
+  const [maxHours, setMaxHours] = useState<number | null>(null);
 
   useEffect(() => {
     setMemory(String(aws.memory_mib));
@@ -55,11 +73,71 @@ export default function HostSection({ project, save, disabled }: Props) {
     setIdle(String(aws.idle_stop_minutes ?? DEFAULT_IDLE_MINUTES));
   }, [aws.memory_mib, aws.ephemeral_gib, aws.idle_stop_minutes]);
 
-  const saveAws = (patch: Partial<AwsWorkspaceConfig>) => save({ aws: { ...aws, ...patch } });
+  useEffect(() => {
+    setSetupScript(aws.setup_script ?? "");
+  }, [aws.setup_script]);
 
-  const hasResources = !!(aws.task_arn || aws.access_point_id || aws.task_definition_arn);
-  // A removal that kept the saved files keeps their access point stored.
-  const onlyAccessPoint = !!aws.access_point_id && !aws.task_arn && !aws.task_definition_arn;
+  const region = project.aws_placement?.region;
+  const environment = project.aws_placement?.environment;
+  useEffect(() => {
+    setMaxHours(null);
+    if (!project.host_id || !region || !environment) return;
+    let cancelled = false;
+    // Best effort: an unreadable record just shows no cap line. Cached per
+    // environment, so re-opening this section doesn't ask AWS again.
+    environmentMaxHours(project.id, project.host_id, region, environment)
+      .then((h) => {
+        if (!cancelled) setMaxHours(h);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [project.id, project.host_id, region, environment]);
+
+  // The config the next save starts from: the stored one plus every patch
+  // saved since. A blur's save followed at once by a toggle's (before the
+  // store has the first back) must not spread the render-time `aws` and
+  // revert the first. Re-based on the prop when it changes with no save in
+  // flight.
+  const latest = useRef({ base: project.aws, value: aws, inFlight: 0 });
+  if (latest.current.base !== project.aws && latest.current.inFlight === 0) {
+    latest.current = { base: project.aws, value: aws, inFlight: 0 };
+  }
+  const saveAws = async (patch: Partial<AwsWorkspaceConfig>) => {
+    const l = latest.current;
+    const next = { ...l.value, ...patch };
+    l.value = next;
+    l.inFlight += 1;
+    // A refused save is not the config any more: start again from the store.
+    const refused = () => {
+      if (l.value === next) l.value = l.base ?? defaultAwsWorkspace();
+    };
+    try {
+      const ok = await save({ aws: next });
+      if (!ok) refused();
+      return ok;
+    } catch (e) {
+      refused();
+      throw e;
+    } finally {
+      l.inFlight -= 1;
+    }
+  };
+
+  const hasResources = !!(
+    aws.task_arn ||
+    aws.access_point_id ||
+    aws.workspace_access_point_id ||
+    aws.task_definition_arn
+  );
+  // A removal that kept the saved files keeps their access points stored.
+  const onlyAccessPoint =
+    !!(aws.access_point_id || aws.workspace_access_point_id) &&
+    !aws.task_arn &&
+    !aws.task_definition_arn;
+  // Switched away from EFS: its /workspace files are still on their access point.
+  const keptWorkspaceFiles = aws.storage !== "efs" && !!aws.workspace_access_point_id;
   // Not `disabled` (which also allows Error): on AWS, Error can mean a live task.
   const stopped = project.status === "stopped";
 
@@ -77,6 +155,16 @@ export default function HostSection({ project, save, disabled }: Props) {
     setEphemeralProblem(ok ? null : "Ephemeral storage must be 21 to 200 GiB");
     if (ok && value !== aws.ephemeral_gib) void saveAws({ ephemeral_gib: value });
   };
+
+  const commitSetupScript = () => {
+    const problem = setupScriptProblem(setupScript);
+    setSetupProblem(problem);
+    if (problem) return;
+    const value = setupScript.trim() === "" ? null : setupScript;
+    if (value !== (aws.setup_script ?? null)) void saveAws({ setup_script: value });
+  };
+
+  const setupBytes = new TextEncoder().encode(setupScript).length;
 
   const commitIdle = () => {
     const value = Number(idle);
@@ -106,6 +194,11 @@ export default function HostSection({ project, save, disabled }: Props) {
           {project.aws_placement?.environment}
         </dd>
       </dl>
+      {maxHours !== null && maxHours > 0 && (
+        <p className="text-xs text-[var(--text-secondary)]">
+          This environment stops workspaces after {maxHours} h (advisory).
+        </p>
+      )}
 
       <div className="flex flex-wrap gap-4">
         <Field label="CPU">
@@ -124,7 +217,10 @@ export default function HostSection({ project, save, disabled }: Props) {
                 void saveAws({ cpu, memory_mib });
               }}
             >
-              {FARGATE_CPUS.map((c) => (
+              {FARGATE_CPUS.filter(
+                // The gateway sidecar needs 1 vCPU / 2 GiB (Rust validates it too).
+                (c) => !aws.gateway_sidecar || c >= GATEWAY_SIDECAR_MIN_CPU,
+              ).map((c) => (
                 <option key={c} value={c}>
                   {formatCpu(c)}
                 </option>
@@ -196,11 +292,9 @@ export default function HostSection({ project, save, disabled }: Props) {
             segments={[
               { value: "ephemeral", label: "Ephemeral", caution: true },
               { value: "hybrid", label: "Hybrid" },
+              { value: "efs", label: "EFS" },
             ]}
           />
-          <span className="text-xs text-[var(--text-disabled)]">
-            EFS (everything persists) — coming later
-          </span>
         </div>
         {aws.storage === "ephemeral" ? (
           <p
@@ -209,17 +303,38 @@ export default function HostSection({ project, save, disabled }: Props) {
           >
             {EPHEMERAL_WARNING} Push your work to a remote before stopping.
           </p>
+        ) : aws.storage === "efs" ? (
+          <p className="mt-1 text-xs text-[var(--text-secondary)]">
+            <span>{EFS_HINT}</span>. The Claude login and history
+            {aws.secrets_delivery === "copy_at_connect" ? "" : ", and SSH keys,"} are kept on EFS too.
+          </p>
         ) : (
           <p className="mt-1 text-xs text-[var(--text-secondary)]">
-            The Claude login, history and SSH keys are kept on EFS between starts; everything
-            else, repositories included, starts fresh.
+            {aws.secrets_delivery === "copy_at_connect"
+              ? "The Claude login and history are kept on EFS between starts; everything else, repositories and SSH keys included, starts fresh."
+              : "The Claude login, history and SSH keys are kept on EFS between starts; everything else, repositories included, starts fresh."}
+          </p>
+        )}
+        {keptWorkspaceFiles && (
+          <p
+            role="note"
+            aria-label="EFS files kept"
+            className="mt-2 px-2 py-1.5 text-xs text-[var(--text-secondary)] bg-[var(--bg-secondary)] border border-[var(--border-color)] rounded-[var(--radius-control)]"
+          >
+            The /workspace files from when this project used EFS storage stay on their access
+            point until &ldquo;Remove AWS resources&rdquo; removes it (with the access points
+            option checked). Switching back to EFS picks them up again.
           </p>
         )}
       </div>
 
       <Field
         label="Ephemeral storage (GiB)"
-        hint="The task's local disk: 21 to 200 GiB. Repositories and builds live here."
+        hint={
+          aws.storage === "efs"
+            ? "The task's local disk: 21 to 200 GiB. With EFS storage, /workspace is on EFS instead."
+            : "The task's local disk: 21 to 200 GiB. Repositories and builds live here."
+        }
       >
         {(id) => (
           <input
@@ -256,6 +371,19 @@ export default function HostSection({ project, save, disabled }: Props) {
           />
         }
       />
+
+      <section aria-label="Estimated cost">
+        <h3 className="text-[13px] font-medium text-[var(--text-primary)]">Estimated cost</h3>
+        <p className="mt-0.5 mb-1 text-xs text-[var(--text-secondary)] leading-snug">
+          The on-demand Fargate price in this region for the CPU, memory, architecture and disk
+          above.
+        </p>
+        <AwsCostEstimate
+          connectionId={connection ? connection.id : null}
+          region={project.aws_placement?.region}
+          config={aws}
+        />
+      </section>
 
       <SwitchRow
         label="Stop when idle"
@@ -310,6 +438,40 @@ export default function HostSection({ project, save, disabled }: Props) {
         }
       />
 
+      <div>
+        <span className="block text-[13px] font-medium text-[var(--text-primary)] mb-1">
+          Credentials
+        </span>
+        <SegmentedControl
+          label="Credentials"
+          value={aws.secrets_delivery}
+          disabled={disabled}
+          onChange={(secrets_delivery) => void saveAws({ secrets_delivery })}
+          segments={[
+            { value: "secrets_manager", label: "Stored in AWS (Secrets Manager)" },
+            { value: "copy_at_connect", label: "Copied when you connect" },
+          ]}
+        />
+        {aws.secrets_delivery === "copy_at_connect" ? (
+          <>
+            <p className="mt-1 text-xs text-[var(--text-secondary)]">{COPY_AT_CONNECT_HINT}</p>
+            <ul
+              role="note"
+              aria-label="Copied when you connect"
+              className="mt-2 px-2 py-1.5 text-xs text-[var(--warning)] bg-[var(--warning-muted)] border border-[var(--warning)]/30 rounded-[var(--radius-control)] list-disc list-inside"
+            >
+              {COPY_AT_CONNECT_WARNINGS.map((w) => (
+                <li key={w}>{w}</li>
+              ))}
+              {aws.storage !== "ephemeral" && <li>{COPY_AT_CONNECT_SSH_NOTE}</li>}
+              {aws.gateway_sidecar && <li>{COPY_AT_CONNECT_GATEWAY_NOTE}</li>}
+            </ul>
+          </>
+        ) : (
+          <p className="mt-1 text-xs text-[var(--text-secondary)]">{SECRETS_MANAGER_HINT}</p>
+        )}
+      </div>
+
       <div className="pt-2 border-t border-[var(--border-color)]">
         <span className="block text-[13px] font-medium text-[var(--text-primary)]">
           Repositories
@@ -323,6 +485,48 @@ export default function HostSection({ project, save, disabled }: Props) {
           disabled={disabled}
           onSave={(repos: RepoSource[]) => saveAws({ repos })}
         />
+      </div>
+
+      <div className="pt-2 border-t border-[var(--border-color)]">
+        <Field
+          label="Setup script"
+          hint={
+            <>
+              {SETUP_SCRIPT_HINT}
+              {aws.secrets_delivery === "copy_at_connect" && <> {SETUP_SCRIPT_COPY_AT_CONNECT_NOTE}</>}
+            </>
+          }
+        >
+          {(id) => (
+            <>
+              <textarea
+                id={id}
+                value={setupScript}
+                disabled={disabled}
+                rows={8}
+                spellCheck={false}
+                placeholder={"sudo apt-get update\nsudo apt-get install -y jq"}
+                aria-invalid={setupProblem ? true : undefined}
+                aria-describedby={`${id}-size`}
+                onChange={(e) => setSetupScript(e.target.value)}
+                onBlur={commitSetupScript}
+                className={`${monoInputClass} min-h-[8rem] resize-y`}
+              />
+              <p
+                id={`${id}-size`}
+                className={`mt-1 text-xs ${setupBytes > MAX_SETUP_SCRIPT_BYTES ? "text-[var(--error)]" : "text-[var(--text-secondary)]"}`}
+              >
+                {setupBytes.toLocaleString("en-US")} of {MAX_SETUP_SCRIPT_BYTES.toLocaleString("en-US")} bytes
+                (32 KiB, UTF-8)
+              </p>
+            </>
+          )}
+        </Field>
+        {setupProblem && (
+          <p role="alert" className="mt-1 text-xs text-[var(--error)]">
+            {setupProblem}
+          </p>
+        )}
       </div>
 
       <div className="pt-2 border-t border-[var(--border-color)] flex flex-wrap items-center gap-2">
@@ -346,7 +550,7 @@ export default function HostSection({ project, save, disabled }: Props) {
             !stopped
               ? STILL_RUNNING
               : onlyAccessPoint
-                ? "The saved files' access point is still on AWS. Remove the AWS resources with \u201cAlso remove the workspace\u2019s file-system access point\u201d first."
+                ? "The saved files' access point is still on AWS. Remove the AWS resources with \u201cAlso remove the workspace\u2019s file-system access points\u201d first."
                 : "Remove the workspace's AWS resources first, so nothing is left running or billed."
           }
           onClick={() => void save({ host_id: null, aws_placement: null, aws: null })}
@@ -422,8 +626,11 @@ function RemoveAwsResourcesModal({ project, onClose }: { project: Project; onClo
             onChange={(e) => setDiscardData(e.target.checked)}
           />
           <span>
-            Also remove the workspace&rsquo;s file-system access point
+            Also remove the workspace&rsquo;s file-system access points
             <span className="block text-xs text-[var(--text-secondary)]">
+              {hasWorkspaceFiles(project)
+                ? "Both go: the one for the saved home files and the one for /workspace. "
+                : ""}
               The files stay on your own EFS file system (only your workspace role can read
               them) until an administrator offboards you. Left unchecked, the access point
               stays too: the next start here reuses it, and the project can&rsquo;t move to

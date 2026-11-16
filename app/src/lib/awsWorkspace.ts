@@ -1,6 +1,7 @@
 import type {
   AwsWorkspaceConfig,
   DetectedEnvironment,
+  GatewaySettings,
   Project,
   RepoSource,
   UnsavedWork,
@@ -8,6 +9,8 @@ import type {
 
 /** Why a Local-only option is off on an AWS project (P6). */
 export const NOT_ON_AWS = "Not available on AWS (Fargate)";
+/** Q6: an AWS project's port mappings bind loopback only (Docker's bind 0.0.0.0). */
+export const AWS_PORTS_LOCALHOST_ONLY = "Reachable only from this machine (localhost)";
 /** R4: the AWS host forces Claude Code's sandbox off until it is verified on Fargate. */
 export const SANDBOX_OFF_ON_AWS = "Off on AWS for now";
 export const EPHEMERAL_WARNING =
@@ -83,9 +86,13 @@ export function defaultAwsWorkspace(): AwsWorkspaceConfig {
     idle_stop_minutes: null,
     repos: [],
     wip_push_on_stop: true,
+    secrets_delivery: "secrets_manager",
+    setup_script: null,
+    gateway_sidecar: false,
     task_arn: null,
     access_point_id: null,
     task_definition_arn: null,
+    workspace_access_point_id: null,
   };
 }
 
@@ -121,8 +128,90 @@ export function environmentSelectable(env: DetectedEnvironment): boolean {
 /** Whether an AWS project may have saved files on EFS (Hybrid now, or an
  *  access point left from when it was). Ephemeral-only projects have none. */
 export function hasSavedFiles(p: Pick<Project, "aws">): boolean {
-  return p.aws?.storage === "hybrid" || !!p.aws?.access_point_id;
+  const a = p.aws;
+  return a?.storage === "hybrid" || a?.storage === "efs" || !!a?.access_point_id || !!a?.workspace_access_point_id;
 }
+
+/** Whether an AWS project may have `/workspace` files on EFS (EFS storage now,
+ *  or its access point left from when it was). */
+export function hasWorkspaceFiles(p: Pick<Project, "aws">): boolean {
+  const a = p.aws;
+  return a?.storage === "efs" || !!a?.workspace_access_point_id;
+}
+
+/** Shown with EFS storage selected. */
+export const EFS_HINT = "Everything in /workspace survives a stop; git and builds are slower over NFS";
+
+/** Copy-at-connect (phase 6 Q2): what it means, in HostSection. */
+export const COPY_AT_CONNECT_HINT =
+  "API keys, the Git token, custom environment variables and the SSH and CA files are not stored in AWS: Triple-C copies them into the running workspace each time it connects.";
+export const COPY_AT_CONNECT_WARNINGS = [
+  "Private repositories clone, and the setup script runs, after you connect (or after 5 minutes without).",
+  "Scheduled jobs and the setup script never get the API keys or custom variables; Git and SSH work once the app has connected.",
+  "Until the first connect the workspace has no corporate CA: behind a TLS-inspecting proxy, Claude Code's self-update may fail until then.",
+  "SSH keys, a Git token or variables you remove from the project stay in a running workspace until it stops.",
+  "The setup script is not run again when a later connect re-clones a repository that failed.",
+];
+/** Mirrors Rust `MAX_SETUP_SCRIPT_BYTES` (UTF-8 bytes). */
+export const MAX_SETUP_SCRIPT_BYTES = 32_768;
+
+/** Why `script` can't be saved, or null. Mirrors (and words like) Rust
+ *  `validate_aws_workspace`'s setup-script checks. */
+export function setupScriptProblem(script: string): string | null {
+  const bytes = new TextEncoder().encode(script).length;
+  if (bytes > MAX_SETUP_SCRIPT_BYTES) {
+    return `The setup script is ${bytes} bytes; the limit is ${MAX_SETUP_SCRIPT_BYTES}`;
+  }
+  if (script.includes("\0")) return "The setup script must not contain NUL characters";
+  return null;
+}
+
+/** What the setup script is, under its editor (phase 6 Q3). */
+export const SETUP_SCRIPT_HINT =
+  "Runs on every start, as claude, with bash -e in /workspace once the repositories are cloned. It is stopped after 30 minutes, and its output shows in the Overview's start-up card. claude can use sudo (apt-get install …).";
+export const SETUP_SCRIPT_COPY_AT_CONNECT_NOTE =
+  "With credentials copied when you connect, the setup script waits for the app's first connect (at most 5 minutes) and never gets the API keys or custom variables.";
+
+/** Hybrid/EFS under copy-at-connect (ruling R6): ~/.ssh stays off EFS. */
+export const COPY_AT_CONNECT_SSH_NOTE =
+  "~/.ssh is not kept on EFS: SSH keys copied in, or made in the workspace, are gone when it stops. Keys an earlier start left in /mnt/triple-c-home/.ssh stay there until you remove them.";
+export const COPY_AT_CONNECT_GATEWAY_NOTE =
+  "The LLM gateway's keys are still stored in AWS: the gateway starts before Triple-C connects. So is Claude Code's token for it (ANTHROPIC_AUTH_TOKEN), which scheduled jobs need.";
+
+/** The LLM gateway sidecar (phase 6 Q7), in ModelSection. */
+export const GATEWAY_SIDECAR_LABEL = "Run Triple-C's LLM gateway in the workspace";
+export const GATEWAY_SIDECAR_HINT =
+  "Runs the gateway from Settings → Model Gateway (same models, provider and API key) next to the workspace, on its own localhost:4000. Claude Code uses it instead of the base URL and API key below; set the model to one of the gateway's model names.";
+export const GATEWAY_SIDECAR_ON_NOTE =
+  "Claude Code talks to the gateway in the workspace (http://127.0.0.1:4000) with a key made for each start. The provider API key is stored in the project's AWS secret, whichever way credentials are delivered.";
+/** Mirrors Rust `validate_aws_workspace`'s sidecar minimum. */
+export const GATEWAY_SIDECAR_MIN_CPU = 1024;
+export const GATEWAY_SIDECAR_MIN_MEMORY_MIB = 2048;
+
+/**
+ * Why `project` can't turn the gateway sidecar on, or null. Mirrors Rust
+ * `gateway_sidecar_problem` (OpenAI-compatible backend, a complete gateway
+ * model) plus the 1 vCPU / 2 GiB minimum.
+ */
+export function gatewaySidecarProblem(
+  project: Pick<Project, "backend" | "aws">,
+  gateway: Pick<GatewaySettings, "models"> | null,
+): string | null {
+  if (project.backend !== "open_ai_compatible") {
+    return "The LLM gateway sidecar needs the OpenAI Compatible backend.";
+  }
+  const models = (gateway?.models ?? []).filter((m) => m.name.trim() && m.model_id.trim());
+  if (models.length === 0) {
+    return "Add at least one model in Settings → Model Gateway first (a name and a provider model id).";
+  }
+  const aws = project.aws;
+  if (aws && (aws.cpu < GATEWAY_SIDECAR_MIN_CPU || aws.memory_mib < GATEWAY_SIDECAR_MIN_MEMORY_MIB)) {
+    return "The LLM gateway sidecar needs at least 1 vCPU and 2 GiB: raise them in the Host section.";
+  }
+  return null;
+}
+export const SECRETS_MANAGER_HINT =
+  "API keys, the Git token, custom environment variables and the SSH and CA files are kept in the project's Secrets Manager secret, so the workspace has them from the moment it starts.";
 
 /** Hosts that only mean something on this machine or its Docker bridge. */
 const LOCAL_HOSTS = /^(localhost|127(\.\d{1,3}){3}|0\.0\.0\.0|\[?::1\]?|host\.docker\.internal|172\.17\.0\.1)$/i;

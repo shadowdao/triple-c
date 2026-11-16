@@ -115,13 +115,15 @@ pub async fn forget_choice<R: WipRunner>(runner: Option<&R>, choice: Option<WipC
 }
 
 /// The root command that records `marker`; the value travels as `$1`, never
-/// inside the script.
+/// inside the script. The directory stays 0711 (the entrypoint's mode): the
+/// `claude` user reads the run id and its WIP record in it by name (the
+/// marker itself is 0600).
 pub fn stop_reason_command(marker: &str) -> Vec<String> {
     vec![
         "sh".into(),
         "-c".into(),
         format!(
-            "umask 077 && mkdir -p /run/triple-c && chmod 700 /run/triple-c && printf '%s\\n' \"$1\" > {STOP_REASON_FILE}"
+            "umask 077 && mkdir -p /run/triple-c && chmod 711 /run/triple-c && printf '%s\\n' \"$1\" > {STOP_REASON_FILE}"
         ),
         "sh".into(),
         marker.into(),
