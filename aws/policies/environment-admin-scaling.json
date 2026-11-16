@@ -14,8 +14,7 @@
         "Null": {
           "aws:RequestTag/triple-c:component": "false",
           "autoscaling:TargetGroupARNs": "true",
-          "autoscaling:LoadBalancerNames": "true",
-          "autoscaling:InstanceTypes": "false"
+          "autoscaling:LoadBalancerNames": "true"
         },
         "Bool": {
           "autoscaling:LaunchTemplateVersionSpecified": "true"

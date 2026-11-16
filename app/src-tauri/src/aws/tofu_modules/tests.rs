@@ -1789,7 +1789,6 @@ const GROUP_CREATE: Context = &[
         "autoscaling:LaunchTemplateVersionSpecified",
         Literal("true"),
     ),
-    ("autoscaling:InstanceTypes", Literal("m7i.large")),
 ];
 const GROUP_UPDATE: Context = &[
     (RESOURCE_COMPONENT, Literal("user-onboarding")),

@@ -288,7 +288,6 @@ const GROUP_CREATE: Context = &[
         "autoscaling:LaunchTemplateVersionSpecified",
         Literal("true"),
     ),
-    ("autoscaling:InstanceTypes", Literal("m7i.large")),
 ];
 const GROUP_UPDATE: Context = &[
     (COMPONENT_RESOURCE_TAG, Literal("user-onboarding")),
@@ -2816,15 +2815,17 @@ mod tests {
                 );
             }
         }
-        // Creating always names the template version and its types; an
-        // update may leave the template alone (a size change, the drain
-        // before destroy).
-        assert!(!allowed(
+        // Creating always names the template version; an update may leave
+        // the template alone (a size change, the drain before destroy).
+        // A template-only create sends no `autoscaling:InstanceTypes`
+        // (verified live, phase 7): it must pass, and the type is held by
+        // the caller's own `ec2:RunInstances` launch check instead.
+        assert!(allowed(
             tier,
             &write(
                 "autoscaling:CreateAutoScalingGroup",
                 PROBE_AUTO_SCALING_GROUP,
-                without(GROUP_CREATE, "autoscaling:InstanceTypes")
+                GROUP_CREATE
             ),
             ME,
             ME
