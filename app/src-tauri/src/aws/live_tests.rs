@@ -2304,7 +2304,7 @@ mod environment {
                 let tail1: Vec<&String> = log1.iter().filter(|l| l.contains("entrypoint: stopping") || l.contains("wip") || l.contains("WIP")).collect();
                 eprintln!("RESULT task 1 stop log lines: {tail1:#?}");
                 assert!(log1.iter().any(|l| l.contains("entrypoint: stopping (sigterm) — pushing work in progress")), "{log1:#?}");
-                store.set_aws_runtime(&id, None, current(&store).aws.unwrap().access_point_id, Some(revision1.clone())).unwrap();
+                store.set_aws_runtime(&id, None, current(&store).aws.unwrap().access_point_id, Some(revision1.clone()), None).unwrap();
 
                 // ── start 2, unchanged; idle stop is at its minimum ──
                 let t3 = std::time::Instant::now();
@@ -2388,7 +2388,7 @@ mod environment {
 
                 // ── remove: the task, the secret and (data discarded) the access
                 // point; the task definition is left (R8) ──
-                store.set_aws_runtime(&id, None, aws2.access_point_id.clone(), aws2.task_definition_arn.clone()).unwrap();
+                store.set_aws_runtime(&id, None, aws2.access_point_id.clone(), aws2.task_definition_arn.clone(), aws2.workspace_access_point_id.clone()).unwrap();
                 // Every step runs even when one fails (the failures are
                 // reported together), so check them all before the result.
                 let removed = host.remove_aws_resources(&current(&store), &settings, true).await;

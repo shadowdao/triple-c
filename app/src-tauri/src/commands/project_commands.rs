@@ -1191,6 +1191,7 @@ fn restore_store_owned_fields(project: &mut Project, stored: &Project) {
         aws.task_arn = s.and_then(|a| a.task_arn.clone());
         aws.access_point_id = s.and_then(|a| a.access_point_id.clone());
         aws.task_definition_arn = s.and_then(|a| a.task_definition_arn.clone());
+        aws.workspace_access_point_id = s.and_then(|a| a.workspace_access_point_id.clone());
     }
 }
 
@@ -1226,7 +1227,10 @@ fn validate_aws_update(
     // connection's account and region; moving the project would orphan them.
     if moved
         && stored.aws.as_ref().is_some_and(|a| {
-            a.task_arn.is_some() || a.access_point_id.is_some() || a.task_definition_arn.is_some()
+            a.task_arn.is_some()
+                || a.access_point_id.is_some()
+                || a.workspace_access_point_id.is_some()
+                || a.task_definition_arn.is_some()
         })
     {
         return Err(
@@ -1467,6 +1471,7 @@ async fn start_project_container_locked(
                 Some(task_arn),
                 access_point_id,
                 Some(task_definition_arn),
+                project.aws.as_ref().and_then(|a| a.workspace_access_point_id.clone()), // Task 3: from the start
             )?;
         }
     }
@@ -1585,6 +1590,7 @@ pub async fn stop_project_container(
                 None,
                 a.access_point_id.clone(),
                 a.task_definition_arn.clone(),
+                a.workspace_access_point_id.clone(),
             )?;
         }
         state.projects_store.set_container_id(&project_id, None)?;
@@ -1695,7 +1701,7 @@ pub async fn remove_aws_resources(
         .await?;
     state
         .projects_store
-        .set_aws_runtime(&project_id, None, access_point_after_removal(&project, discard_data), None)?;
+        .set_aws_runtime(&project_id, None, access_point_after_removal(&project, discard_data), None, None)?;
     state
         .projects_store
         .get(&project_id)
@@ -2616,12 +2622,14 @@ mod tests {
         sc.task_arn = Some("arn:task".into());
         sc.access_point_id = Some("fsap-1".into());
         sc.task_definition_arn = Some("arn:td".into());
+        sc.workspace_access_point_id = Some("fsap-w".into());
         stored.aws = Some(sc.clone());
         let mut pc = crate::models::AwsWorkspaceConfig::default();
         pc.cpu = 2048;
         pc.memory_mib = 8192;
         pc.task_arn = Some("evil".into());
         pc.access_point_id = None;
+        pc.workspace_access_point_id = None;
         payload.aws = Some(pc);
 
         restore_store_owned_fields(&mut payload, &stored);
@@ -2630,6 +2638,7 @@ mod tests {
         assert_eq!(a.task_arn, sc.task_arn);
         assert_eq!(a.access_point_id, sc.access_point_id);
         assert_eq!(a.task_definition_arn, sc.task_definition_arn);
+        assert_eq!(a.workspace_access_point_id, Some("fsap-w".into()));
         assert_eq!(a.cpu, 2048, "the edit itself goes through");
     }
 
@@ -2651,6 +2660,18 @@ mod tests {
         p.aws_placement = Some(crate::models::AwsPlacement { region: "us-west-2".into(), environment: "dev".into() });
         p.aws = Some(Default::default());
         p
+    }
+
+    #[test]
+    fn a_stored_workspace_access_point_blocks_moving_the_host() {
+        let hosts = vec![host("h1"), host("h2")];
+        let mut stored = aws_project();
+        stored.aws.as_mut().unwrap().workspace_access_point_id = Some("fsap-w".into());
+        let mut moved = stored.clone();
+        moved.host_id = Some("h2".into());
+        assert!(validate_aws_update(&stored, &moved, &hosts).unwrap_err().contains("AWS resources"));
+        stored.aws.as_mut().unwrap().workspace_access_point_id = None;
+        assert!(validate_aws_update(&stored, &moved, &hosts).is_ok());
     }
 
     #[test]

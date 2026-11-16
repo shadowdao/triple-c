@@ -184,6 +184,7 @@ fn payload_map(
         match storage {
             StorageMode::Ephemeral => "ephemeral",
             StorageMode::Hybrid => "hybrid",
+            StorageMode::Efs => "efs", // Task 3
         }
         .into(),
     );
@@ -327,7 +328,7 @@ pub fn task_definition_request(plan: &WorkspacePlan) -> RegisterTaskDefinitionIn
 fn build_request(plan: &WorkspacePlan) -> RegisterTaskDefinitionInput {
     const BUILT: &str = "every required field is set";
     let hybrid = match (&plan.storage, &plan.file_system_id, &plan.access_point_id) {
-        (StorageMode::Hybrid, Some(fs), Some(ap)) => Some((fs, ap)),
+        (StorageMode::Hybrid | StorageMode::Efs, Some(fs), Some(ap)) => Some((fs, ap)), // Task 3: Efs adds /workspace
         _ => None,
     };
 
@@ -654,7 +655,7 @@ pub async fn prepare_workspace<W: WorkspaceApi>(
     // Hybrid: the user's own file system, from their onboarding.
     let (file_system_id, access_point_id) = match cfg.storage {
         StorageMode::Ephemeral => (None, None),
-        StorageMode::Hybrid => {
+        StorageMode::Hybrid | StorageMode::Efs => { // Task 3: Efs adds the workspace access point
             let token = user_file_system_token(&env.name, &ok);
             let fs = api
                 .find_file_system(&token)

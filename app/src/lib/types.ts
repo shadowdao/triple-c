@@ -82,7 +82,8 @@ export interface AwsPlacement {
 }
 
 export type Arch = "x86_64" | "arm64";
-export type StorageMode = "ephemeral" | "hybrid";
+export type StorageMode = "ephemeral" | "hybrid" | "efs";
+export type SecretsDelivery = "secrets_manager" | "copy_at_connect";
 
 export interface RepoSource {
   url: string;
@@ -101,10 +102,16 @@ export interface AwsWorkspaceConfig {
   idle_stop_minutes: number | null;
   repos: RepoSource[];
   wip_push_on_stop: boolean;
+  secrets_delivery: SecretsDelivery;
+  /** Run as `claude` after the clone; null = none. At most 32768 bytes. */
+  setup_script: string | null;
+  /** Run the LLM gateway as a sidecar (needs 1 vCPU and 2 GiB). */
+  gateway_sidecar: boolean;
   /** Store-owned runtime handles; a save cannot change them. */
   task_arn: string | null;
   access_point_id: string | null;
   task_definition_arn: string | null;
+  workspace_access_point_id: string | null;
 }
 
 /** Where a new project runs: omitted (or all null) = local Docker. An AWS

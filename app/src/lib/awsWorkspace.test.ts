@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import {
   cleanRepos,
+  defaultAwsWorkspace,
+  hasSavedFiles,
   environmentSelectable,
   memoryError,
   memoryOptions,
@@ -57,5 +59,23 @@ describe("awsWorkspace", () => {
     expect(environmentSelectable(environment("a", "update_available", true))).toBe(true);
     expect(environmentSelectable(environment("a", "ready", false))).toBe(false);
     expect(environmentSelectable(environment("a", "deploying", true))).toBe(false);
+  });
+});
+
+describe("phase 6 settings", () => {
+  it("defaults mirror Rust", () => {
+    const d = defaultAwsWorkspace();
+    expect([d.secrets_delivery, d.setup_script, d.gateway_sidecar, d.workspace_access_point_id]).toEqual([
+      "secrets_manager",
+      null,
+      false,
+      null,
+    ]);
+  });
+  it("EFS mode and a leftover workspace access point count as saved files", () => {
+    const aws = defaultAwsWorkspace();
+    expect(hasSavedFiles({ aws: { ...aws, storage: "efs" } })).toBe(true);
+    expect(hasSavedFiles({ aws: { ...aws, storage: "ephemeral", workspace_access_point_id: "fsap-w" } })).toBe(true);
+    expect(hasSavedFiles({ aws: { ...aws, storage: "ephemeral" } })).toBe(false);
   });
 });

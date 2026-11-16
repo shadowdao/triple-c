@@ -486,6 +486,19 @@ pub enum StorageMode {
     Ephemeral,
     #[default]
     Hybrid,
+    /// Hybrid plus `/workspace` on EFS (a second access point).
+    Efs,
+}
+
+/// How an AWS project's credentials and files reach the workspace.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretsDelivery {
+    /// In the project's Secrets Manager secret.
+    #[default]
+    SecretsManager,
+    /// Kept out of the secret; the app copies them in after each connect.
+    CopyAtConnect,
 }
 
 /// One git repository cloned into the workspace. `branch: None` means the
@@ -536,7 +549,21 @@ pub struct AwsWorkspaceConfig {
     pub access_point_id: Option<String>,
     #[serde(default)]
     pub task_definition_arn: Option<String>,
+    /// Store-owned like `access_point_id`: the EFS-mode `/workspace` access point.
+    #[serde(default)]
+    pub workspace_access_point_id: Option<String>,
+    #[serde(default)]
+    pub secrets_delivery: SecretsDelivery,
+    /// Run after the clone, as `claude` (AWS only).
+    #[serde(default)]
+    pub setup_script: Option<String>,
+    /// Run the LiteLLM gateway as a sidecar container.
+    #[serde(default)]
+    pub gateway_sidecar: bool,
 }
+
+/// Largest setup script, in bytes.
+pub const MAX_SETUP_SCRIPT_BYTES: usize = 32_768;
 
 impl Default for AwsWorkspaceConfig {
     fn default() -> Self {
@@ -553,6 +580,10 @@ impl Default for AwsWorkspaceConfig {
             task_arn: None,
             access_point_id: None,
             task_definition_arn: None,
+            workspace_access_point_id: None,
+            secrets_delivery: SecretsDelivery::default(),
+            setup_script: None,
+            gateway_sidecar: false,
         }
     }
 }
@@ -705,6 +736,21 @@ pub fn validate_aws_workspace(cfg: &AwsWorkspaceConfig) -> Result<(), String> {
         if !seen.insert(r.folder.as_str()) {
             return Err(format!("Repository folder \"{}\" is used twice", r.folder));
         }
+    }
+    if let Some(script) = &cfg.setup_script {
+        if script.len() > MAX_SETUP_SCRIPT_BYTES {
+            return Err(format!(
+                "The setup script is {} bytes; the limit is {}",
+                script.len(),
+                MAX_SETUP_SCRIPT_BYTES
+            ));
+        }
+        if script.contains('\0') {
+            return Err("The setup script must not contain NUL characters".into());
+        }
+    }
+    if cfg.gateway_sidecar && (cfg.cpu < 1024 || cfg.memory_mib < 2048) {
+        return Err("The LLM gateway sidecar needs at least 1 vCPU (1024) and 2 GiB (2048 MiB)".into());
     }
     Ok(())
 }
@@ -1340,6 +1386,44 @@ mod tests {
         assert!(validate_aws_workspace(&c).is_ok());
         let off: AwsWorkspaceConfig = serde_json::from_str(r#"{"wip_push_on_stop":false}"#).unwrap();
         assert!(!off.wip_push_on_stop);
+    }
+
+    #[test]
+    fn phase6_fields_default_for_old_json_and_efs_round_trips() {
+        let c: AwsWorkspaceConfig = serde_json::from_str(r#"{"storage":"hybrid","cpu":512}"#).unwrap();
+        assert_eq!(c.secrets_delivery, SecretsDelivery::SecretsManager);
+        assert!(!c.gateway_sidecar && c.setup_script.is_none() && c.workspace_access_point_id.is_none());
+        let e: AwsWorkspaceConfig = serde_json::from_str(r#"{"storage":"efs","secrets_delivery":"copy_at_connect"}"#).unwrap();
+        assert_eq!(e.storage, StorageMode::Efs);
+        assert_eq!(e.secrets_delivery, SecretsDelivery::CopyAtConnect);
+        assert_eq!(serde_json::to_string(&StorageMode::Efs).unwrap(), "\"efs\"");
+        assert_eq!(serde_json::to_string(&SecretsDelivery::CopyAtConnect).unwrap(), "\"copy_at_connect\"");
+        let back: AwsWorkspaceConfig = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
+        assert_eq!(back, e);
+    }
+
+    #[test]
+    fn setup_script_limits() {
+        let mut c = AwsWorkspaceConfig::default();
+        c.setup_script = Some("a".repeat(MAX_SETUP_SCRIPT_BYTES));
+        assert!(validate_aws_workspace(&c).is_ok());
+        c.setup_script = Some("a".repeat(MAX_SETUP_SCRIPT_BYTES + 1));
+        assert!(validate_aws_workspace(&c).unwrap_err().contains("limit"));
+        c.setup_script = Some("echo\0hi".into());
+        assert!(validate_aws_workspace(&c).unwrap_err().contains("NUL"));
+    }
+
+    #[test]
+    fn gateway_sidecar_needs_one_vcpu_and_two_gib() {
+        let mut c = cfg(512, 2048);
+        c.gateway_sidecar = true;
+        assert!(validate_aws_workspace(&c).is_err());
+        c = cfg(1024, 2048);
+        c.gateway_sidecar = true;
+        assert!(validate_aws_workspace(&c).is_ok());
+        c = cfg(256, 2048);
+        c.gateway_sidecar = true;
+        assert!(validate_aws_workspace(&c).is_err());
     }
 
     #[test]

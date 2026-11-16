@@ -276,6 +276,7 @@ pub fn spawn(
                         None,
                         a.access_point_id.clone(),
                         a.task_definition_arn.clone(),
+                        a.workspace_access_point_id.clone(),
                     );
                 }
                 let id = p.id.clone();

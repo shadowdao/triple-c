@@ -651,12 +651,14 @@ pub fn record_task(store: &ProjectsStore, project_id: &str, rec: Option<&TaskRec
             Some(r.task_arn.clone()),
             r.access_point_id.clone().or(stored.access_point_id),
             r.task_definition_arn.clone().or(stored.task_definition_arn),
+            stored.workspace_access_point_id, // Task 3: from the record
         ),
         None => store.set_aws_runtime(
             project_id,
             None,
             stored.access_point_id,
             stored.task_definition_arn,
+            stored.workspace_access_point_id,
         ),
     };
     if let Err(e) = res {

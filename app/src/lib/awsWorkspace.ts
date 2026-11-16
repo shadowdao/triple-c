@@ -83,9 +83,13 @@ export function defaultAwsWorkspace(): AwsWorkspaceConfig {
     idle_stop_minutes: null,
     repos: [],
     wip_push_on_stop: true,
+    secrets_delivery: "secrets_manager",
+    setup_script: null,
+    gateway_sidecar: false,
     task_arn: null,
     access_point_id: null,
     task_definition_arn: null,
+    workspace_access_point_id: null,
   };
 }
 
@@ -121,7 +125,8 @@ export function environmentSelectable(env: DetectedEnvironment): boolean {
 /** Whether an AWS project may have saved files on EFS (Hybrid now, or an
  *  access point left from when it was). Ephemeral-only projects have none. */
 export function hasSavedFiles(p: Pick<Project, "aws">): boolean {
-  return p.aws?.storage === "hybrid" || !!p.aws?.access_point_id;
+  const a = p.aws;
+  return a?.storage === "hybrid" || a?.storage === "efs" || !!a?.access_point_id || !!a?.workspace_access_point_id;
 }
 
 /** Hosts that only mean something on this machine or its Docker bridge. */

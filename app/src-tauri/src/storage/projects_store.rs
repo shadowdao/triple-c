@@ -448,6 +448,7 @@ impl ProjectsStore {
         task_arn: Option<String>,
         access_point_id: Option<String>,
         task_definition_arn: Option<String>,
+        workspace_access_point_id: Option<String>,
     ) -> Result<(), String> {
         let mut projects = self.lock();
         let p = projects
@@ -461,6 +462,7 @@ impl ProjectsStore {
         aws.task_arn = task_arn;
         aws.access_point_id = access_point_id;
         aws.task_definition_arn = task_definition_arn;
+        aws.workspace_access_point_id = workspace_access_point_id;
         p.updated_at = chrono::Utc::now().to_rfc3339();
         self.save(&projects)?;
         Ok(())
@@ -885,7 +887,7 @@ mod tests {
         let store = store_over(&dir, vec![aws, local]);
 
         store
-            .set_aws_runtime(&aid, Some("t".into()), Some("ap".into()), Some("td".into()))
+            .set_aws_runtime(&aid, Some("t".into()), Some("ap".into()), Some("td".into()), Some("wap".into()))
             .unwrap();
         let a = store.get(&aid).unwrap().aws.unwrap();
         assert_eq!(
@@ -896,10 +898,10 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(dir.join("projects.json")).unwrap()).unwrap();
         assert_eq!(on_disk[0].aws.as_ref().unwrap().task_arn.as_deref(), Some("t"));
 
-        store.set_aws_runtime(&aid, None, None, None).unwrap();
+        store.set_aws_runtime(&aid, None, None, None, None).unwrap();
         assert!(store.get(&aid).unwrap().aws.unwrap().task_arn.is_none());
-        assert!(store.set_aws_runtime(&lid, None, None, None).is_err());
-        assert!(store.set_aws_runtime("nope", None, None, None).is_err());
+        assert!(store.set_aws_runtime(&lid, None, None, None, None).is_err());
+        assert!(store.set_aws_runtime("nope", None, None, None, None).is_err());
         fs::remove_dir_all(&dir).ok();
     }
 }
