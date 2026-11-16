@@ -462,48 +462,90 @@ fn clone_repos_clones_skips_existing_and_reports_failures_without_failing() {
     );
 }
 
+/// clone_repos over `ws` (persistent, as with EFS storage), its status in `status`.
+fn clone_into(ws: &Path, status: &Path, json: &str) -> (String, String) {
+    fs::create_dir_all(status).unwrap();
+    let script = format!("{}\nclone_repos \"$JSON\" \"$1\" \"$2\"\n", aws_blocks(&["aws_env", "aws_repos"]));
+    let out = bash(&script, &[ws, status], &[("JSON", json)], &[]);
+    assert!(out.status.success(), "{}", text(&out));
+    (text(&out), fs::read_to_string(status.join("repos")).unwrap_or_default())
+}
+
+fn repos_json(remote: &Path, folders: &[&str]) -> String {
+    let items: Vec<String> = folders
+        .iter()
+        .map(|f| format!(r#"{{"url":"{}","branch":null,"folder":"{f}"}}"#, remote.display()))
+        .collect();
+    format!("[{}]", items.join(","))
+}
+
 #[test]
-fn clone_repos_on_a_persistent_workspace_skips_on_restart_and_redoes_a_clone_cut_short() {
-    // EFS storage: /workspace outlives the task, so the next start sees
-    // what the last one left.
+fn clone_repos_clones_through_scratch_and_redoes_a_clone_a_killed_task_left_there() {
     let tmp = tempfile::tempdir().unwrap();
     let ws = tmp.path().join("workspace");
     fs::create_dir_all(&ws).unwrap();
     let remote = bare_remote(tmp.path(), "proj");
+    let json = repos_json(&remote, &["a"]);
+    // The last task was killed mid-clone: only scratch holds it.
+    let scratch = ws.join(".triple-c-clone");
+    fs::create_dir_all(scratch.join("a/.git")).unwrap();
+    fs::write(scratch.join("a/half"), "x").unwrap();
+    let (_, status) = clone_into(&ws, &tmp.path().join("s1"), &json);
+    assert_eq!(status, "a\tcloning\na\tcloned\n");
+    assert_eq!(fs::read_to_string(ws.join("a/README")).unwrap(), "hello");
+    assert!(!ws.join("a/half").exists());
+    // Nothing is left in scratch after a successful run.
+    assert_eq!(fs::read_dir(&scratch).map(|d| d.count()).unwrap_or(0), 0);
+}
+
+#[test]
+fn clone_repos_never_deletes_a_folder_at_its_final_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("workspace");
+    fs::create_dir_all(&ws).unwrap();
+    let remote = bare_remote(tmp.path(), "proj");
+    // A repository already in place, the user's work in it, and a stale
+    // scratch copy of the same name.
+    git(&ws, &["clone", "-q", remote.to_str().unwrap(), "a"]);
+    fs::write(ws.join("a/mine"), "work").unwrap();
+    fs::create_dir_all(ws.join(".triple-c-clone/a/.git")).unwrap();
+    // A folder the user made that is not a repository, and a clone that
+    // fails into it.
+    fs::create_dir_all(ws.join("notes")).unwrap();
+    fs::write(ws.join("notes/todo"), "keep").unwrap();
+    // An empty folder is cloned into, as `git clone` would.
+    fs::create_dir_all(ws.join("empty")).unwrap();
     let json = format!(
-        r#"[{{"url":"{r}","branch":null,"folder":"a"}},{{"url":"{r}","branch":null,"folder":"b"}}]"#,
+        r#"[{{"url":"{r}","branch":null,"folder":"a"}},
+            {{"url":"{r}","branch":null,"folder":"empty"}},
+            {{"url":"{r}","branch":null,"folder":"notes"}},
+            {{"url":"/nonexistent/nope.git","branch":null,"folder":"gone"}}]"#,
         r = remote.display()
     );
-    let script = format!("{}\nclone_repos \"$JSON\" \"$1\" \"$2\"\n", aws_blocks(&["aws_env", "aws_repos"]));
-    let run = |status: &Path| {
-        fs::create_dir_all(status).unwrap();
-        let out = bash(&script, &[&ws, status], &[("JSON", &json)], &[]);
-        assert!(out.status.success(), "{}", text(&out));
-        (text(&out), fs::read_to_string(status.join("repos")).unwrap())
-    };
-    let (_, first) = run(&tmp.path().join("s1"));
-    assert_eq!(first, "a\tcloning\na\tcloned\nb\tcloning\nb\tcloned\n");
-    // A finished clone carries no in-progress mark.
-    for f in ["a", "b"] {
-        let o = Command::new("git")
-            .args(["config", "--file"])
-            .arg(ws.join(f).join(".git/config"))
-            .args(["--get", "triplec.cloning"])
-            .output()
-            .unwrap();
-        assert!(!o.status.success(), "{f} still marked");
+    for run in 0..3 {
+        let (log, status) = clone_into(&ws, &tmp.path().join(format!("s{run}")), &json);
+        assert!(status.starts_with("a\texists\n"), "{status}");
+        assert!(status.contains("notes\tfailed\n"), "{status}: {log}");
+        assert!(status.contains("gone\tfailed\n"), "{status}");
+        assert_eq!(fs::read_to_string(ws.join("a/mine")).unwrap(), "work", "run {run}");
+        assert_eq!(fs::read_to_string(ws.join("notes/todo")).unwrap(), "keep", "run {run}");
+        assert!(!ws.join("notes/.git").exists());
+        assert!(!ws.join("gone").exists(), "a failed clone writes nothing at its final path");
+        assert_eq!(fs::read_to_string(ws.join("empty/README")).unwrap(), "hello");
+        let want = if run == 0 { "empty\tcloning\nempty\tcloned\n" } else { "empty\texists\n" };
+        assert!(status.contains(want), "{status}");
     }
+}
 
-    // The user's work in a, and b as a clone the last task was killed in
-    // the middle of (its mark still set, its checkout missing).
-    fs::write(ws.join("a/mine"), "work").unwrap();
-    git(&ws.join("b"), &["config", "triplec.cloning", "1"]);
-    fs::remove_file(ws.join("b/README")).unwrap();
-    let (log, second) = run(&tmp.path().join("s2"));
-    assert_eq!(second, "a\texists\nb\tcloning\nb\tcloned\n", "{log}");
-    assert!(log.contains("cut short"), "{log}");
-    assert_eq!(fs::read_to_string(ws.join("a/mine")).unwrap(), "work", "never touched");
-    assert_eq!(fs::read_to_string(ws.join("b/README")).unwrap(), "hello");
+#[test]
+fn clone_repos_refuses_the_scratch_folder_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("workspace");
+    fs::create_dir_all(&ws).unwrap();
+    let remote = bare_remote(tmp.path(), "proj");
+    let (log, status) = clone_into(&ws, &tmp.path().join("s"), &repos_json(&remote, &[".triple-c-clone"]));
+    assert!(log.contains("bad folder '.triple-c-clone'"), "{log}");
+    assert_eq!(status, "");
 }
 
 /// A stand-in `ssh` that records how it was called and fails.
@@ -712,6 +754,25 @@ fn wip_push_covers_dot_folders() {
     let out = wip_push(&ws, &[]);
     assert!(out.status.success(), "{}", text(&out));
     assert_eq!(wip_refs(&remote).len(), 1);
+}
+
+#[test]
+fn wip_push_ignores_the_clone_scratch_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (ws, _repo, remote) = workspace_with_clone(tmp.path());
+    // A dirty clone left in scratch (and scratch itself made a repository):
+    // neither is the workspace's own.
+    let scratch = ws.join(".triple-c-clone");
+    fs::create_dir_all(&scratch).unwrap();
+    git(&scratch, &["clone", "-q", remote.to_str().unwrap(), "half"]);
+    fs::write(scratch.join("half/y"), "y").unwrap();
+    git(&scratch, &["init", "-q"]);
+    let out = wip_push(&ws, &["--dry-run"]);
+    let dry = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(!dry.contains("triple-c-clone") && !dry.contains("half"), "{dry}");
+    let out = wip_push(&ws, &[]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(wip_refs(&remote).is_empty());
 }
 
 #[test]

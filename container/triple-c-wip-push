@@ -83,6 +83,8 @@ user_ssh_command="${GIT_SSH_COMMAND:-}"
 for dir in "$root"/*/; do
     dir="${dir%/}"
     [ -d "$dir" ] || continue
+    # clone_repos' scratch (entrypoint.sh): half-made clones, never the user's.
+    [ "$(basename "$dir")" = .triple-c-clone ] && continue
     # A repository rooted exactly here. A symlinked folder resolves elsewhere
     # and is skipped: it is not the workspace's own.
     top=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || continue

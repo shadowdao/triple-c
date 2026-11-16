@@ -664,36 +664,47 @@ chown claude:claude /home/claude/.gitconfig 2>/dev/null || true
 # folder is its state), and `done` appears when all are finished. The idle
 # watcher counts an unfinished clone as activity; triple-c-wip-push skips a
 # folder still `cloning`.
-# With EFS storage /workspace outlives the task, so a repository already there
-# is skipped on every later start. A clone is marked in progress in its own
-# .git/config (`git clone -c triplec.cloning=1`, written before the fetch) and
-# unmarked once it succeeds; a repository still marked was cut short (the task
-# was killed mid-clone) and is removed and cloned again. A repository the user
-# made never carries the mark. Every look at or removal of it runs as the user:
-# the tree is theirs.
+# A clone is made in a scratch folder on the same file system,
+# /workspace/.triple-c-clone/<folder>, and renamed into /workspace/<folder>
+# (atomic) only once it has succeeded. So nothing appears at a final path until
+# it is a whole repository, and the clone code never deletes anything at a
+# final path — not on failure, not on a later start. With EFS storage
+# /workspace outlives the task: whatever is at a final path is kept (a
+# repository is skipped as `exists`), and a clone a killed task left in scratch
+# is thrown away at the next start (scratch is never the user's). Scratch is
+# made, emptied and renamed from as the user; root never walks their tree.
+# triple-c-wip-push skips the scratch folder.
 # >>> aws_repos
 # clone_repos json root [status_dir]
 clone_repos() {
-    local json="$1" root="$2" status_dir="${3:-}" folder url branch dest existed err rc
+    local json="$1" root="$2" status_dir="${3:-}" folder url branch dest tmp err rc
     local limit="${triplec_clone_timeout:-600}"
+    local scratch="$root/.triple-c-clone"
     [ -n "$json" ] || return 0
     _clone_status() { [ -z "$status_dir" ] || printf '%s\t%s\n' "$1" "$2" >> "$status_dir/repos"; }
+    # Whatever a killed clone left behind.
+    _triplec_as_user rm -rf -- "$scratch"
+    _triplec_as_user mkdir -m 700 -- "$scratch" \
+        || echo "entrypoint: warning — could not create $scratch; clones will fail"
     while IFS= read -r -d '' folder && IFS= read -r -d '' url && IFS= read -r -d '' branch; do
         dest="$root/$folder"
-        if [ -e "$dest/.git" ] && [ "$(_triplec_as_user git config --file "$dest/.git/config" --get triplec.cloning 2>/dev/null)" = 1 ]; then
-            echo "entrypoint: the last clone of $folder was cut short; cloning it again"
-            _triplec_as_user rm -rf -- "$dest"
-        fi
+        tmp="$scratch/$folder"
         if [ -e "$dest/.git" ]; then
             echo "entrypoint: /workspace/$folder is already a repository; not cloning"
             _clone_status "$folder" exists
             continue
         fi
-        existed=0
-        [ -e "$dest" ] && existed=1
-        local args=(clone --quiet -c triplec.cloning=1)
+        # An empty directory may be cloned over (the rename replaces it, as
+        # `git clone` into it did); anything else at the final path is kept.
+        if { [ -e "$dest" ] || [ -L "$dest" ]; } \
+            && [ -z "$(_triplec_as_user find "$dest" -maxdepth 0 -type d -empty 2>/dev/null)" ]; then
+            echo "Triple-C: clone of $folder failed: /workspace/$folder already exists and is not a repository"
+            _clone_status "$folder" failed
+            continue
+        fi
+        local args=(clone --quiet)
         [ -n "$branch" ] && args+=(--branch "$branch")
-        args+=(-- "$url" "$dest")
+        args+=(-- "$url" "$tmp")
         echo "entrypoint: cloning $folder..."
         _clone_status "$folder" cloning
         # BatchMode is appended to whatever ssh command the user's git config
@@ -705,15 +716,17 @@ clone_repos() {
             exec timeout -k 10 "$limit" git "$@"' _ "$limit" "${args[@]}" 2>&1 </dev/null)
         rc=$?
         if [ "$rc" -eq 0 ]; then
-            _triplec_as_user git config --file "$dest/.git/config" --unset triplec.cloning \
-                || echo "entrypoint: warning — could not unmark $folder's clone; the next start will clone it again"
-            echo "entrypoint: cloned $folder"
-            _clone_status "$folder" cloned
-            continue
+            # -T: never into a folder made at the final path meanwhile; a
+            # rename onto anything but an empty directory fails.
+            if err=$(_triplec_as_user mv -T -- "$tmp" "$dest" 2>&1); then
+                echo "entrypoint: cloned $folder"
+                _clone_status "$folder" cloned
+                continue
+            fi
+        else
+            [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ] && err="timed out after ${limit}s"
         fi
-        [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ] && err="timed out after ${limit}s"
-        # Don't leave a half-made clone that the next start would skip.
-        [ "$existed" = 1 ] || rm -rf "$dest"
+        _triplec_as_user rm -rf -- "$tmp"
         echo "Triple-C: clone of $folder failed: $(printf '%s' "$err" | tail -n 1)"
         _clone_status "$folder" failed
     done < <(printf '%s' "$json" | python3 -I -c '
@@ -741,7 +754,7 @@ for i, r in enumerate(repos):
         say("skipping repository %d: not an object" % i)
         continue
     url, branch, folder = r.get("url"), r.get("branch"), r.get("folder")
-    if not text(folder) or folder in ("", ".", "..") or "/" in folder:
+    if not text(folder) or folder in ("", ".", "..", ".triple-c-clone") or "/" in folder:
         say("skipping repository %d: bad folder %a" % (i, folder))
         continue
     if not text(url) or not url:

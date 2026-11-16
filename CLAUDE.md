@@ -400,8 +400,9 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   is Hybrid plus a second access point (root `/triple-c-workspaces/<owner_key>/<project>`, a sibling of
   the home roots) mounted straight at `/workspace`; the entrypoint links home state the same way
   (`aws_storage_links_home`) and never creates or chowns `/workspace`. Because `/workspace` then
-  outlives the task, `clone_repos` marks a clone in progress in its own `.git/config`
-  (`triplec.cloning`) and redoes one a killed task left marked; a repo without the mark is skipped.
+  outlives the task, `clone_repos` clones into `/workspace/.triple-c-clone/<folder>` and renames
+  into place only on success; it never deletes anything at a final path, empties scratch at each
+  start, and `triple-c-wip-push` skips scratch.
   Switching EFS → Hybrid/Ephemeral keeps `workspace_access_point_id` (store-owned) until "Remove AWS
   resources" with discard deletes both access points. On
   TERM the hook pushes unsaved work to a `triple-c/wip/<stamp>` branch via a temporary index (the
