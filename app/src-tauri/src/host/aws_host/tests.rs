@@ -262,6 +262,10 @@ impl Connector for Fake {
     }
 }
 
+fn no_gateway() -> Result<Option<SidecarSecrets>, String> {
+    Ok(None)
+}
+
 fn inputs<'a>(
     p: &'a Project,
     who: &'a CallerIdentity,
@@ -275,7 +279,7 @@ fn inputs<'a>(
         files: &[],
         custom_env_keys: &[],
         image: REGISTRY_IMAGE,
-        gateway: None,
+        gateway: &no_gateway,
         wait: WaitTiming {
             interval: Duration::from_millis(1),
             timeout: Duration::from_millis(30),
@@ -412,6 +416,35 @@ async fn a_running_task_is_attached_with_its_own_token_and_nothing_is_rewritten(
     assert_eq!(fake.calls(), vec!["record dev", "role", "list", "get-secret", "connect"]);
     assert_eq!(fake.connect_tokens.lock().unwrap()[0], "token-of-the-running-task");
     assert_eq!(steps, vec![PROGRESS_READING, PROGRESS_WAITING, PROGRESS_CONNECTING]);
+}
+
+/// A gateway payload that cannot be built: the provider key is gone.
+fn missing_gateway_key() -> Result<Option<SidecarSecrets>, String> {
+    Err("The LLM gateway sidecar needs the provider API key".into())
+}
+
+#[tokio::test]
+async fn attaching_to_a_running_task_never_builds_the_gateway_payload() {
+    let mut p = aws_project(StorageMode::Hybrid);
+    p.aws.as_mut().unwrap().gateway_sidecar = true;
+    let live = task(&p, "live", "RUNNING", true);
+    let fake = Fake {
+        listed: Mutex::new(vec![vec![live.arn.clone()]]),
+        ..Default::default()
+    }
+    .with_task(live);
+    let w = who();
+    let on_task = |_: Option<&TaskRecord>| {};
+    let inp = StartInputs { gateway: &missing_gateway_key, ..inputs(&p, &w, &on_task) };
+    let started = start_core(&fake, &fake, &fake, &fake, &inp, &|_| {}).await.unwrap();
+    assert!(!started.created);
+
+    // A start that prepares a new task does need it, and fails before RunTask.
+    let fake = Fake::default();
+    let inp = StartInputs { gateway: &missing_gateway_key, ..inputs(&p, &w, &on_task) };
+    let e = start_core(&fake, &fake, &fake, &fake, &inp, &|_| {}).await.err().unwrap();
+    assert!(e.contains("provider API key"), "{e}");
+    assert!(!fake.called("run"));
 }
 
 #[tokio::test]

@@ -406,8 +406,9 @@ pub struct StartInputs<'a> {
     pub custom_env_keys: &'a [String],
     pub image: &'a str,
     /// The gateway sidecar's payload, when the project runs it
-    /// ([`gateway_sidecar`]).
-    pub gateway: Option<GatewayPayload<'a>>,
+    /// ([`gateway_sidecar`]). Called only when the start prepares a new task:
+    /// attaching to a running one never needs the provider key or models.
+    pub gateway: &'a (dyn Fn() -> Result<Option<SidecarSecrets>, String> + Send + Sync),
     pub wait: WaitTiming,
     pub access_point_wait: PollTiming,
     /// Called as soon as the project has a task (found, or RunTask
@@ -517,6 +518,7 @@ pub async fn start_core<T: TaskApi, W: WorkspaceApi, R: RuntimeApi, C: Connector
         (task, token, None, None, false)
     } else {
         progress(PROGRESS_PREPARING);
+        let sidecar = (inp.gateway)()?;
         let prepared = prepare_workspace(
             work,
             inp.who,
@@ -526,7 +528,7 @@ pub async fn start_core<T: TaskApi, W: WorkspaceApi, R: RuntimeApi, C: Connector
             inp.files,
             inp.custom_env_keys,
             inp.image,
-            inp.gateway,
+            sidecar.as_ref().map(SidecarSecrets::payload),
         )
         .await
         .map_err(s)?;
@@ -660,7 +662,7 @@ pub async fn ensure_started_with(
     settings: &AppSettings,
     store: &ProjectsStore,
     progress: &(dyn Fn(&str) + Send + Sync),
-    read_gateway_key: impl FnOnce() -> Result<Option<String>, String>,
+    read_gateway_key: impl FnOnce() -> Result<Option<String>, String> + Send,
 ) -> Result<ContainerTarget, String> {
     // A background re-attach (after a restart) may be opening a tunnel:
     // cancel it, this start attaches itself. Its tunnel, if it gets one, is
@@ -685,7 +687,15 @@ pub async fn ensure_started_with(
     let files = workspace_files(ssh, ca.as_ref())?;
     let custom_env_keys =
         crate::docker::workspace_env::custom_env_keys(project, &settings.global_custom_env_vars);
-    let sidecar = gateway_sidecar(project, settings, read_gateway_key)?;
+    // Read lazily: only a start that prepares a new task needs it (an attach
+    // must work with the provider key gone from the keychain).
+    let read_gateway_key = std::sync::Mutex::new(Some(read_gateway_key));
+    let sidecar = || {
+        gateway_sidecar(project, settings, || match read_gateway_key.lock().unwrap().take() {
+            Some(read) => read(),
+            None => Ok(None),
+        })
+    };
 
     let (connection_id, region, sdk) = project_sdk(project, settings).await?;
     let who = caller_identity(&sdk).await.map_err(s)?;
@@ -702,7 +712,7 @@ pub async fn ensure_started_with(
             files: &files,
             custom_env_keys: &custom_env_keys,
             image: &image,
-            gateway: sidecar.as_ref().map(SidecarSecrets::payload),
+            gateway: &sidecar,
             wait: WaitTiming::default(),
             access_point_wait: PollTiming::default(),
             on_task: &on_task,
