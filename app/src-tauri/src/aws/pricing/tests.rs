@@ -371,3 +371,27 @@ async fn a_hanging_api_times_out_to_none() {
     assert_eq!(started.elapsed(), FETCH_TIMEOUT);
     assert_eq!(api.calls(), 1);
 }
+
+#[tokio::test(start_paused = true)]
+async fn building_the_client_counts_against_the_same_timeout() {
+    let (_d, c) = cache();
+    c.write("us-west-2", &RATES, at(T0)).unwrap();
+    let started = tokio::time::Instant::now();
+    // The client never gets built (credentials that hang): stale answers at
+    // the fetch's own bound, not later.
+    let r = c
+        .rates_with::<FakeApi, FakeApi>(std::future::pending(), "us-west-2", at(T0 + 2 * DAY))
+        .await;
+    assert_eq!(r, Some(RATES));
+    assert_eq!(started.elapsed(), FETCH_TIMEOUT);
+
+    // A fresh cache never builds a client at all.
+    let fresh = c
+        .rates_with::<FakeApi, FakeApi>(
+            async { panic!("no client is built for a fresh cache") },
+            "us-west-2",
+            at(T0 + 60),
+        )
+        .await;
+    assert_eq!(fresh, Some(RATES));
+}

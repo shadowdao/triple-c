@@ -350,14 +350,14 @@ async fn cost_estimate(
         _ => {
             // Only now touch the connection (a keys connection reads the
             // keychain); without one, a stale cache still answers.
-            let api = match aws_conn(connection_id, settings) {
-                Ok(conn) => sdk_config(&conn, pricing::PRICING_REGION)
-                    .await
-                    .ok()
-                    .map(|cfg| SdkPricingApi::new(&cfg)),
-                Err(_) => None,
+            // Built inside the fetch's 8 s bound: reading a profile's
+            // credentials can hang as well (an SSO or process provider).
+            let api = async {
+                let conn = aws_conn(connection_id, settings).ok()?;
+                let cfg = sdk_config(&conn, pricing::PRICING_REGION).await.ok()?;
+                Some(SdkPricingApi::new(&cfg))
             };
-            cache.rates(api.as_ref(), &region, now).await
+            cache.rates_with::<SdkPricingApi, _>(api, &region, now).await
         }
     }?;
     Some(pricing::estimate(config, &rates.for_arch(config.arch)?))

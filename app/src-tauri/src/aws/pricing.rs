@@ -348,19 +348,34 @@ impl RatesCache {
         region: &str,
         now: SystemTime,
     ) -> Option<RegionRates> {
+        self.rates_with::<A, _>(async { api }, region, now).await
+    }
+
+    /// [`Self::rates`] with the client built by `api`, which is awaited only
+    /// when the cache can't answer, and within the same [`FETCH_TIMEOUT`] as
+    /// the fetch (building one reads credentials, which can hang too).
+    pub async fn rates_with<A: PricingApi, B: std::borrow::Borrow<A>>(
+        &self,
+        api: impl Future<Output = Option<B>>,
+        region: &str,
+        now: SystemTime,
+    ) -> Option<RegionRates> {
         let cached = self.read(region, now);
         if let Some((rates, true)) = cached {
             return Some(rates);
         }
         let stale = cached.map(|(rates, _)| rates);
-        let Some(api) = api else {
-            return stale;
-        };
         if self.recently_failed(region, now) {
             return stale;
         }
-        let fetched = match tokio::time::timeout(FETCH_TIMEOUT, fetch_rates(api, region)).await {
-            Ok(r) => r,
+        let fetch = async {
+            let api = api.await?;
+            Some(fetch_rates(api.borrow(), region).await)
+        };
+        let fetched = match tokio::time::timeout(FETCH_TIMEOUT, fetch).await {
+            Ok(Some(r)) => r,
+            // No client could be built: the stale cache answers.
+            Ok(None) => return stale,
             Err(_) => Err(format!("timed out after {}s", FETCH_TIMEOUT.as_secs())),
         };
         match fetched {
