@@ -146,9 +146,32 @@ export const EFS_HINT = "Everything in /workspace survives a stop; git and build
 export const COPY_AT_CONNECT_HINT =
   "API keys, the Git token, custom environment variables and the SSH and CA files are not stored in AWS: Triple-C copies them into the running workspace each time it connects.";
 export const COPY_AT_CONNECT_WARNINGS = [
-  "Private repositories clone after you connect.",
+  "Private repositories clone, and the setup script runs, after you connect (or after 5 minutes without).",
   "Scheduled jobs and the setup script never get the API keys or custom variables; Git and SSH work once the app has connected.",
+  "Until the first connect the workspace has no corporate CA: behind a TLS-inspecting proxy, Claude Code's self-update may fail until then.",
+  "SSH keys, a Git token or variables you remove from the project stay in a running workspace until it stops.",
+  "The setup script is not run again when a later connect re-clones a repository that failed.",
 ];
+/** Mirrors Rust `MAX_SETUP_SCRIPT_BYTES` (UTF-8 bytes). */
+export const MAX_SETUP_SCRIPT_BYTES = 32_768;
+
+/** Why `script` can't be saved, or null. Mirrors (and words like) Rust
+ *  `validate_aws_workspace`'s setup-script checks. */
+export function setupScriptProblem(script: string): string | null {
+  const bytes = new TextEncoder().encode(script).length;
+  if (bytes > MAX_SETUP_SCRIPT_BYTES) {
+    return `The setup script is ${bytes} bytes; the limit is ${MAX_SETUP_SCRIPT_BYTES}`;
+  }
+  if (script.includes("\0")) return "The setup script must not contain NUL characters";
+  return null;
+}
+
+/** What the setup script is, under its editor (phase 6 Q3). */
+export const SETUP_SCRIPT_HINT =
+  "Runs on every start, as claude, with bash -e in /workspace once the repositories are cloned. It is stopped after 30 minutes, and its output shows in the Overview's start-up card. claude can use sudo (apt-get install …).";
+export const SETUP_SCRIPT_COPY_AT_CONNECT_NOTE =
+  "With credentials copied when you connect, the setup script waits for the app's first connect (at most 5 minutes) and never gets the API keys or custom variables.";
+
 /** Hybrid/EFS under copy-at-connect (ruling R6): ~/.ssh stays off EFS. */
 export const COPY_AT_CONNECT_SSH_NOTE =
   "~/.ssh is not kept on EFS: SSH keys copied in, or made in the workspace, are gone when it stops. Keys an earlier start left in /mnt/triple-c-home/.ssh stay there until you remove them.";

@@ -9,6 +9,10 @@ import {
   COPY_AT_CONNECT_SSH_NOTE,
   COPY_AT_CONNECT_WARNINGS,
   SECRETS_MANAGER_HINT,
+  SETUP_SCRIPT_COPY_AT_CONNECT_NOTE,
+  SETUP_SCRIPT_HINT,
+  MAX_SETUP_SCRIPT_BYTES,
+  setupScriptProblem,
   EFS_HINT,
   EPHEMERAL_WARNING,
   FARGATE_CPUS,
@@ -25,7 +29,7 @@ import Button from "../../../ui/Button";
 import Modal from "../../../ui/Modal";
 import Toggle from "../../../ui/Toggle";
 import SegmentedControl from "../../../ui/SegmentedControl";
-import Field, { ConfigGroup, SwitchRow, inputClass, selectClass } from "../../../ui/Field";
+import Field, { ConfigGroup, SwitchRow, inputClass, monoInputClass, selectClass } from "../../../ui/Field";
 import RepoListEditor from "../../RepoListEditor";
 import AwsCostEstimate from "../AwsCostEstimate";
 
@@ -57,12 +61,38 @@ export default function HostSection({ project, save, disabled }: Props) {
   const [idle, setIdle] = useState(String(aws.idle_stop_minutes ?? DEFAULT_IDLE_MINUTES));
   const [idleProblem, setIdleProblem] = useState<string | null>(null);
   const [confirmRemoveResources, setConfirmRemoveResources] = useState(false);
+  const [setupScript, setSetupScript] = useState(aws.setup_script ?? "");
+  const [setupProblem, setSetupProblem] = useState<string | null>(null);
+  // The environment's advisory lifetime cap (Q8), from its record.
+  const [maxHours, setMaxHours] = useState<number | null>(null);
 
   useEffect(() => {
     setMemory(String(aws.memory_mib));
     setEphemeral(String(aws.ephemeral_gib));
     setIdle(String(aws.idle_stop_minutes ?? DEFAULT_IDLE_MINUTES));
   }, [aws.memory_mib, aws.ephemeral_gib, aws.idle_stop_minutes]);
+
+  useEffect(() => {
+    setSetupScript(aws.setup_script ?? "");
+  }, [aws.setup_script]);
+
+  const region = project.aws_placement?.region;
+  const environment = project.aws_placement?.environment;
+  useEffect(() => {
+    setMaxHours(null);
+    if (!project.host_id || !environment) return;
+    let cancelled = false;
+    // Best effort: an unreadable record just shows no cap line.
+    Promise.resolve()
+      .then(() => commands.awsEnvironmentMaxHours(project.id))
+      .then((h) => {
+        if (!cancelled) setMaxHours(h ?? null);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [project.id, project.host_id, region, environment]);
 
   const saveAws = (patch: Partial<AwsWorkspaceConfig>) => save({ aws: { ...aws, ...patch } });
 
@@ -97,6 +127,16 @@ export default function HostSection({ project, save, disabled }: Props) {
     if (ok && value !== aws.ephemeral_gib) void saveAws({ ephemeral_gib: value });
   };
 
+  const commitSetupScript = () => {
+    const problem = setupScriptProblem(setupScript);
+    setSetupProblem(problem);
+    if (problem) return;
+    const value = setupScript.trim() === "" ? null : setupScript;
+    if (value !== (aws.setup_script ?? null)) void saveAws({ setup_script: value });
+  };
+
+  const setupBytes = new TextEncoder().encode(setupScript).length;
+
   const commitIdle = () => {
     const value = Number(idle);
     const ok = Number.isInteger(value) && value >= 5 && value <= 1440;
@@ -125,6 +165,11 @@ export default function HostSection({ project, save, disabled }: Props) {
           {project.aws_placement?.environment}
         </dd>
       </dl>
+      {maxHours !== null && maxHours > 0 && (
+        <p className="text-xs text-[var(--text-secondary)]">
+          This environment stops workspaces after {maxHours} h (advisory).
+        </p>
+      )}
 
       <div className="flex flex-wrap gap-4">
         <Field label="CPU">
@@ -411,6 +456,48 @@ export default function HostSection({ project, save, disabled }: Props) {
           disabled={disabled}
           onSave={(repos: RepoSource[]) => saveAws({ repos })}
         />
+      </div>
+
+      <div className="pt-2 border-t border-[var(--border-color)]">
+        <Field
+          label="Setup script"
+          hint={
+            <>
+              {SETUP_SCRIPT_HINT}
+              {aws.secrets_delivery === "copy_at_connect" && <> {SETUP_SCRIPT_COPY_AT_CONNECT_NOTE}</>}
+            </>
+          }
+        >
+          {(id) => (
+            <>
+              <textarea
+                id={id}
+                value={setupScript}
+                disabled={disabled}
+                rows={8}
+                spellCheck={false}
+                placeholder={"sudo apt-get update\nsudo apt-get install -y jq"}
+                aria-invalid={setupProblem ? true : undefined}
+                aria-describedby={`${id}-size`}
+                onChange={(e) => setSetupScript(e.target.value)}
+                onBlur={commitSetupScript}
+                className={`${monoInputClass} min-h-[8rem] resize-y`}
+              />
+              <p
+                id={`${id}-size`}
+                className={`mt-1 text-xs ${setupBytes > MAX_SETUP_SCRIPT_BYTES ? "text-[var(--error)]" : "text-[var(--text-secondary)]"}`}
+              >
+                {setupBytes.toLocaleString("en-US")} of {MAX_SETUP_SCRIPT_BYTES.toLocaleString("en-US")} bytes
+                (32 KiB, UTF-8)
+              </p>
+            </>
+          )}
+        </Field>
+        {setupProblem && (
+          <p role="alert" className="mt-1 text-xs text-[var(--error)]">
+            {setupProblem}
+          </p>
+        )}
       </div>
 
       <div className="pt-2 border-t border-[var(--border-color)] flex flex-wrap items-center gap-2">

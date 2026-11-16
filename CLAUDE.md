@@ -448,7 +448,9 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   `timeout -k 10 1800`, chained after the background clone's `done` in the same background
   subshell; `status` is `running` from the start until `ok` / `failed <code>` (a chain that dies
   early writes `failed`, so the idle stop is never blocked). `triple-c-workspace-status` (python,
-  no secrets) prints `{clone:{done,repos},setup:{state,code,tail}}`.
+  no secrets) prints `{clone:{done,repos},setup:{state,code,tail}}`. Edited in HostSection's
+  "Setup script" textarea (saved on blur, blank → `null`; the 32 KiB UTF-8 limit is checked in TS
+  with Rust's own message, `setupScriptProblem`).
   **The start does not wait for them** (it ends after "Connecting…": Running, lock released);
   `aws_host::spawn_follow` follows in a background task (`host/aws_host/status.rs`: background exec
   every 2 s, at most 35 min, holds no project lock; ended by `tunnels::cancel_follow` on Stop/Remove
@@ -460,7 +462,8 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   **Lifetime cap** (`TRIPLEC_MAX_LIFETIME_MINUTES`, advisory — sudo can kill it): the idle watcher
   (started when idle stop *or* a non-zero cap is set) pushes best effort, records `lifetime` and
   sends TERM; the hook exits 76 (`aws::tasks::LIFETIME_EXIT_CODE` → `StopKind::LifetimeCap` →
-  `lifetime` toast).
+  `lifetime` toast). HostSection shows a non-zero cap ("stops workspaces after N h (advisory)") from
+  `aws_environment_max_hours` (reads the environment record; `None` when it can't, never an error).
   The idle watcher runs as root under a supervisor and signals the
   entrypoint's own PID (not PID 1, which is docker-init), so idle and ECS stops share one trap.
   Idle = the agent's `last_activity_unix` older than N minutes (open-but-silent attaches/tunnels
@@ -481,14 +484,24 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   connects at once never mix) and runs `triple-c-apply-connect <nonce>`: CA install as root, SSH merge and git
   credential helper **as `claude`** (root never walks a live `~/.ssh`), `/run/triple-c/connected`,
   then a background re-clone of `failed` repos only (GIT_TOKEN in that clone's env only). The
-  first clone waits up to 5 min for `connected` (`aws_wait_connect`). Terminals the app opens add
+  first clone waits up to 5 min for `connected` (`aws_wait_connect`) — when there are repos **or a
+  setup script** (the script runs after the clone and needs the CA, SSH and Git credentials). The
+  CA files are swapped in (`connect-ca.new` → `connect-ca`, old removed last), so a failed move
+  keeps the CA installed before. Terminals the app opens add
   the pairs to their own `ExecSpec.env` (`aws_host::terminal_env`, pairs only — no file read);
   nothing reaches the agent's snapshot, so cron/scheduled jobs and the setup script never get them.
   A failed push is a `workspace-warning`. Hybrid/EFS do **not** link `~/.ssh` to EFS under
   copy-at-connect (R6: keys vanish with the task). When a copy-at-connect start finds the secret
   already there (CreateSecret's ResourceExists; a new project's secret is never read first) and it
   `holds_credentials`, it is force-deleted and created again (R7: `PutSecretValue` would keep the
-  old values as AWSPREVIOUS); `TRIPLE_C_CUSTOM_ENV` is left out too.
+  old values as AWSPREVIOUS); `TRIPLE_C_CUSTOM_ENV` is left out too. A replace whose re-create
+  times out (AWS still finishing the forced delete) leaves no secret; every secret write retries
+  while the name is pending deletion (≤ 30 s), then says to start again in a minute.
+  **Copy-at-connect limits** (also listed in HostSection's notes): there is no corporate CA until
+  the first connect (Claude Code's self-update may fail behind a TLS-inspecting proxy until then);
+  SSH keys, a Git token or variables removed from the project stay in the running task until it
+  stops (a connect only adds/overwrites them; a removed CA does go at the next connect); the setup script is not re-run
+  after a later connect's re-clone of a failed repo.
   The re-clone closes the apply lock's fd (a later connect never waits for it); `--prepare` takes it.
   The functions both scripts use live in `container/entrypoint-lib.sh`
   (`/usr/local/lib/triple-c/`), sourced by the entrypoint first; it only defines things.

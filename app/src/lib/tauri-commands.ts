@@ -42,6 +42,10 @@ export const awsTaskLog = (projectId: string, limit: number) =>
  *  idle workspace up). */
 export const awsWorkspaceStatus = (projectId: string) =>
   invoke<WorkspaceStatus | null>("aws_workspace_status", { projectId });
+/** The project's environment's advisory lifetime cap in hours (0 = none);
+ *  null when it can't be read. Never rejects for a missing project. */
+export const awsEnvironmentMaxHours = (projectId: string) =>
+  invoke<number | null>("aws_environment_max_hours", { projectId });
 export const removeAwsResources = (projectId: string, discardData: boolean) =>
   invoke<Project>("remove_aws_resources", { projectId, discardData });
 export const rebuildProjectContainer = (projectId: string) =>

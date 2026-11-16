@@ -638,6 +638,22 @@ async fn project_sdk(project: &Project, settings: &AppSettings) -> Result<(Strin
     Ok((host_id.to_string(), region, sdk))
 }
 
+/// The lifetime cap, in hours (0 = none), of the environment `project` runs
+/// in, from its record (Q8: Host settings show it). `None` when it can't be
+/// read — offline, denied, slow, or the environment is gone.
+pub async fn environment_max_hours(project: &Project, settings: &AppSettings) -> Option<u32> {
+    let placement = project.aws_placement.as_ref()?;
+    let read = async {
+        let (_, region, sdk) = project_sdk(project, settings).await.ok()?;
+        let who = caller_identity(&sdk).await.ok()?;
+        read_environment(&SdkRuntimeApi::new(&sdk), &placement.environment, &who.account, &region)
+            .await
+            .ok()
+    };
+    let info = tokio::time::timeout(std::time::Duration::from_secs(10), read).await.ok()??;
+    Some(info.max_workspace_hours)
+}
+
 /// `ProjectHost::Aws::ensure_started`.
 pub async fn ensure_started(
     project: &Project,

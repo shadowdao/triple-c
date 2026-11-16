@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { cleanup, render, screen, fireEvent, waitFor, within } from "@testing-library/react";
+import { act, cleanup, render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import RuntimeSection from "./RuntimeSection";
 import AccessSection from "./AccessSection";
 import WorkspaceSection from "./WorkspaceSection";
@@ -12,6 +12,7 @@ import { useAppState } from "../../../../store/appState";
 const OFF_BRIDGE: AuthBridgeStatus = { enabled: false, active_ports: [], conflicts: [] };
 const removeAwsResources = vi.fn();
 const awsCostEstimate = vi.fn(async (..._args: unknown[]) => null as unknown);
+const awsEnvironmentMaxHours = vi.fn(async (_id: string) => 0 as number | null);
 
 vi.mock("../../../../lib/tauri-commands", () => ({
   getAuthBridgeStatus: vi.fn(async () => OFF_BRIDGE),
@@ -19,6 +20,7 @@ vi.mock("../../../../lib/tauri-commands", () => ({
   inspectCaCertPath: vi.fn(async () => null),
   removeAwsResources: (id: string, discard: boolean) => removeAwsResources(id, discard),
   awsCostEstimate: (...args: unknown[]) => awsCostEstimate(...args),
+  awsEnvironmentMaxHours: (id: string) => awsEnvironmentMaxHours(id),
 }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}) }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn(async () => null) }));
@@ -323,7 +325,12 @@ describe("HostSection", () => {
     p.aws = { ...p.aws!, secrets_delivery: "copy_at_connect", gateway_sidecar: false };
     renderHost(p);
     const note = screen.getByRole("note", { name: "Copied when you connect" });
-    expect(note).toHaveTextContent("Private repositories clone after you connect.");
+    expect(note).toHaveTextContent(
+      "Private repositories clone, and the setup script runs, after you connect (or after 5 minutes without).",
+    );
+    expect(note).toHaveTextContent(/Claude Code's self-update may fail until then/);
+    expect(note).toHaveTextContent("SSH keys, a Git token or variables you remove from the project stay in a running workspace until it stops.");
+    expect(note).toHaveTextContent(/not run again when a later connect re-clones/);
     expect(note).toHaveTextContent(
       "Scheduled jobs and the setup script never get the API keys or custom variables; Git and SSH work once the app has connected.",
     );
@@ -343,6 +350,76 @@ describe("HostSection", () => {
     expect(screen.getByRole("note", { name: "Copied when you connect" })).toHaveTextContent(
       "The LLM gateway's keys are still stored in AWS",
     );
+  });
+
+  it("saves the setup script on blur, and a blank one as none", async () => {
+    renderHost();
+    const box = screen.getByLabelText("Setup script");
+    expect(box.tagName).toBe("TEXTAREA");
+    expect(box.className).toContain("font-mono");
+    expect(box.className).not.toContain("focus:outline-none");
+    fireEvent.change(box, { target: { value: "sudo apt-get install -y jq\n" } });
+    expect(screen.getByText(/27 of 32,768 bytes/)).toBeInTheDocument();
+    fireEvent.blur(box);
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(1));
+    expect(save.mock.calls[0][0].aws.setup_script).toBe("sudo apt-get install -y jq\n");
+    cleanup();
+
+    const p = awsProject();
+    p.aws = { ...p.aws!, setup_script: "echo hi" };
+    renderHost(p);
+    const again = screen.getByLabelText("Setup script");
+    expect(again).toHaveValue("echo hi");
+    fireEvent.change(again, { target: { value: "  \n" } });
+    fireEvent.blur(again);
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(2));
+    expect(save.mock.calls[1][0].aws.setup_script).toBeNull();
+  });
+
+  it("refuses a setup script over 32 KiB with the backend's message", () => {
+    renderHost();
+    const box = screen.getByLabelText("Setup script");
+    // 16,385 two-byte characters: 32,770 UTF-8 bytes.
+    fireEvent.change(box, { target: { value: "é".repeat(16_385) } });
+    fireEvent.blur(box);
+    expect(screen.getByRole("alert")).toHaveTextContent("The setup script is 32770 bytes; the limit is 32768");
+    expect(box).toHaveAttribute("aria-invalid", "true");
+    expect(save).not.toHaveBeenCalled();
+  });
+
+  it("says when and how the setup script runs", () => {
+    renderHost();
+    expect(screen.getByText(/Runs on every start, as claude, with bash -e/)).toBeInTheDocument();
+    expect(screen.getByText(/once the repositories are cloned/)).toBeInTheDocument();
+    expect(screen.getByText(/stopped after 30 minutes, and its output shows in the Overview/)).toBeInTheDocument();
+    expect(screen.queryByText(/never gets the API keys or custom variables/)).toBeNull();
+    cleanup();
+
+    const p = awsProject();
+    p.aws = { ...p.aws!, secrets_delivery: "copy_at_connect" };
+    renderHost(p);
+    expect(
+      screen.getByText(/the setup script waits for the app's first connect \(at most 5 minutes\) and never gets the API keys or custom variables/),
+    ).toBeInTheDocument();
+  });
+
+  it("shows the environment's lifetime cap when it has one", async () => {
+    awsEnvironmentMaxHours.mockResolvedValueOnce(24);
+    renderHost();
+    expect(
+      await screen.findByText("This environment stops workspaces after 24 h (advisory)."),
+    ).toBeInTheDocument();
+    expect(awsEnvironmentMaxHours).toHaveBeenCalledWith(awsProject().id);
+    cleanup();
+
+    for (const none of [0, null]) {
+      awsEnvironmentMaxHours.mockResolvedValueOnce(none);
+      renderHost();
+      await waitFor(() => expect(awsEnvironmentMaxHours).toHaveBeenCalled());
+      await act(async () => {});
+      expect(screen.queryByText(/stops workspaces after/)).toBeNull();
+      cleanup();
+    }
   });
 
   it("does not let the credentials setting change while the workspace runs", () => {

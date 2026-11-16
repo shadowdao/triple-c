@@ -1625,6 +1625,24 @@ pub async fn aws_workspace_status(
     crate::host::aws_host::workspace_status(&project).await
 }
 
+/// The lifetime cap (hours; 0 = none) of an AWS project's environment, read
+/// from its record, for Host settings. `None` for a local project or when the
+/// record can't be read; never an error.
+#[tauri::command]
+pub async fn aws_environment_max_hours(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<Option<u32>, String> {
+    let Some(project) = state.projects_store.get(&project_id) else {
+        return Ok(None);
+    };
+    if !project.is_aws() {
+        return Ok(None);
+    }
+    let settings = state.settings_store.get();
+    Ok(crate::host::aws_host::environment_max_hours(&project, &settings).await)
+}
+
 #[tauri::command]
 pub async fn stop_project_container(
     project_id: String,
