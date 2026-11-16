@@ -374,8 +374,14 @@ impl RatesCache {
         };
         let fetched = match tokio::time::timeout(FETCH_TIMEOUT, fetch).await {
             Ok(Some(r)) => r,
-            // No client could be built: the stale cache answers.
-            Ok(None) => return stale,
+            // No client could be built: a failure like any other (building
+            // one reads credentials, which can be slow), and the stale cache
+            // answers.
+            Ok(None) => {
+                log::info!("No Fargate rates for {region}: no Pricing client could be built");
+                self.note_failure(region, now, true);
+                return stale;
+            }
             Err(_) => Err(format!("timed out after {}s", FETCH_TIMEOUT.as_secs())),
         };
         match fetched {

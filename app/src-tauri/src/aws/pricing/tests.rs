@@ -395,3 +395,24 @@ async fn building_the_client_counts_against_the_same_timeout() {
         .await;
     assert_eq!(fresh, Some(RATES));
 }
+
+#[tokio::test]
+async fn no_client_counts_as_a_failure_and_is_not_asked_again_for_a_while() {
+    let (_d, c) = cache();
+    let none = || async { None::<FakeApi> };
+    assert_eq!(c.rates_with::<FakeApi, FakeApi>(none(), "us-west-2", at(T0)).await, None);
+    // Within the back-off the client is not even built.
+    let r = c
+        .rates_with::<FakeApi, FakeApi>(
+            async { panic!("no client is built within the back-off") },
+            "us-west-2",
+            at(T0 + 60),
+        )
+        .await;
+    assert_eq!(r, None);
+    // After it, a working client is asked and clears the failure.
+    let api = FakeApi::fixture();
+    let later = T0 + RETRY_AFTER_FAILURE.as_secs();
+    assert_eq!(c.rates(Some(&api), "us-west-2", at(later)).await, Some(RATES));
+    assert_eq!(api.calls(), 1);
+}
