@@ -650,6 +650,15 @@ pub trait WorkspaceApi: Send + Sync {
         root: &str,
         tags: &[(String, String)],
     ) -> impl Future<Output = Result<String, AwsError>> + Send;
+    /// Create the secret with `json` (encrypted with `kms_key_arn`, tagged).
+    /// `Some(arn)` when created, `None` when it already exists.
+    fn create_project_secret(
+        &self,
+        name: &str,
+        kms_key_arn: &str,
+        json: &str,
+        tags: &[(String, String)],
+    ) -> impl Future<Output = Result<Option<String>, AwsError>> + Send;
     /// The secret's current `SecretString`; `None` when there is no secret.
     fn project_secret_value(
         &self,
@@ -868,7 +877,17 @@ pub async fn prepare_workspace<W: WorkspaceApi>(
         // Secrets Manager before, or a custom variable has gone): a new value
         // would leave them in the secret's version history (AWSPREVIOUS), so
         // the secret is deleted outright and made again (ruling R7).
-        Some(custom) => {
+        //
+        // Created first, as for Secrets Manager: a new project has no secret,
+        // and reading one that doesn't exist may be refused outright (the
+        // read is allowed only on secrets carrying the caller's owner tag).
+        // Only an existing secret is read.
+        Some(custom) => match api
+            .create_project_secret(&secret_name, &env.kms_key_arn, &json, &tags)
+            .await?
+        {
+            Some(arn) => arn,
+            None => {
             let old = api.project_secret_value(&secret_name).await?;
             if old.as_deref().is_some_and(|o| holds_credentials(o, &payload, custom)) {
                 log::info!(
@@ -887,7 +906,8 @@ pub async fn prepare_workspace<W: WorkspaceApi>(
             } else {
                 api.put_project_secret(&secret_name, &env.kms_key_arn, &json, &tags).await?
             }
-        }
+            }
+        },
         None => api.put_project_secret(&secret_name, &env.kms_key_arn, &json, &tags).await?,
     };
 
@@ -952,8 +972,6 @@ const MAX_LISTED_REVISIONS: i32 = 100;
 /// registered (what crowding a family out can cost the caller).
 const MAX_REVISION_PAGES: usize = 20;
 
-/// Secrets Manager's `InvalidRequestException` for a name whose secret is
-/// scheduled for deletion ("... already scheduled for deletion").
 /// Copy-at-connect's custom variable names, or `None` for Secrets Manager.
 fn extras_custom<'a>(
     cfg: &crate::models::project::AwsWorkspaceConfig,
@@ -1012,7 +1030,9 @@ pub async fn replace_project_secret<W: WorkspaceApi>(
             Err(e) if is_pending_deletion_error(&e) => {
                 if tokio::time::Instant::now() + timing.interval > deadline {
                     return Err(other(format!(
-                        "The project's secret ({name}) was deleted to remove the credentials it                          held, but AWS has not finished deleting it after {} s. Start the project                          again in a minute.",
+                        "The project's secret ({name}) was deleted to remove the credentials it \
+                         held, but AWS has not finished deleting it after {} s. Start the project \
+                         again in a minute.",
                         timing.limit.as_secs()
                     )));
                 }
@@ -1023,8 +1043,11 @@ pub async fn replace_project_secret<W: WorkspaceApi>(
     }
 }
 
+/// Secrets Manager's `InvalidRequestException` for a name whose secret is
+/// scheduled for deletion ("... already scheduled for deletion").
 fn is_pending_deletion(message: Option<&str>) -> bool {
-    message.is_some_and(|m| m.contains("scheduled for deletion"))
+    // CreateSecret/PutSecretValue say "scheduled", GetSecretValue "marked".
+    message.is_some_and(|m| m.contains("scheduled for deletion") || m.contains("marked for deletion"))
 }
 
 fn pending_deletion_error(name: &str) -> AwsError {
@@ -1177,6 +1200,13 @@ impl WorkspaceApi for SdkWorkspaceApi {
             {
                 Ok(None)
             }
+            Err(e)
+                if e.as_service_error().is_some_and(|s| {
+                    s.is_invalid_request_exception() && is_pending_deletion(s.message())
+                }) =>
+            {
+                Err(pending_deletion_error(name))
+            }
             Err(e) => Err(classify_sdk_error(ACTION, &e)),
         }
     }
@@ -1202,16 +1232,15 @@ impl WorkspaceApi for SdkWorkspaceApi {
         }
     }
 
-    async fn put_project_secret(
+    async fn create_project_secret(
         &self,
         name: &str,
         kms_key_arn: &str,
         json: &str,
         tags: &[(String, String)],
-    ) -> Result<String, AwsError> {
+    ) -> Result<Option<String>, AwsError> {
         use aws_sdk_secretsmanager::types::Tag as SmTag;
         const CREATE: &str = "secretsmanager:CreateSecret";
-        const PUT: &str = "secretsmanager:PutSecretValue";
         let created = self
             .secrets
             .create_secret()
@@ -1225,43 +1254,57 @@ impl WorkspaceApi for SdkWorkspaceApi {
             ))
             .send()
             .await;
-        let arn = match created {
-            Ok(out) => out.arn().map(str::to_string),
+        match created {
+            Ok(out) => out
+                .arn()
+                .map(|a| Some(a.to_string()))
+                .ok_or_else(|| other(format!("{CREATE} returned no ARN"))),
             Err(e)
                 if e.as_service_error()
                     .is_some_and(|s| s.is_resource_exists_exception()) =>
             {
-                // Only a secret tagged with the caller as owner accepts this
-                // (the policy), so another user's same-named secret fails
-                // here rather than receiving the payload.
-                self.secrets
-                    .put_secret_value()
-                    .secret_id(name)
-                    .secret_string(json)
-                    .send()
-                    .await
-                    .map_err(|e| match e.as_service_error() {
-                        Some(s)
-                            if s.is_invalid_request_exception()
-                                && is_pending_deletion(s.message()) =>
-                        {
-                            pending_deletion_error(name)
-                        }
-                        _ => classify_sdk_error(PUT, &e),
-                    })?
-                    .arn()
-                    .map(str::to_string)
+                Ok(None)
             }
             Err(e)
                 if e.as_service_error().is_some_and(|s| {
                     s.is_invalid_request_exception() && is_pending_deletion(s.message())
                 }) =>
             {
-                return Err(pending_deletion_error(name));
+                Err(pending_deletion_error(name))
             }
-            Err(e) => return Err(classify_sdk_error(CREATE, &e)),
-        };
-        arn.ok_or_else(|| other(format!("{CREATE} returned no ARN")))
+            Err(e) => Err(classify_sdk_error(CREATE, &e)),
+        }
+    }
+
+    async fn put_project_secret(
+        &self,
+        name: &str,
+        kms_key_arn: &str,
+        json: &str,
+        tags: &[(String, String)],
+    ) -> Result<String, AwsError> {
+        const PUT: &str = "secretsmanager:PutSecretValue";
+        if let Some(arn) = self.create_project_secret(name, kms_key_arn, json, tags).await? {
+            return Ok(arn);
+        }
+        // Only a secret tagged with the caller as owner accepts this (the
+        // policy), so another user's same-named secret fails here rather
+        // than receiving the payload.
+        self.secrets
+            .put_secret_value()
+            .secret_id(name)
+            .secret_string(json)
+            .send()
+            .await
+            .map_err(|e| match e.as_service_error() {
+                Some(s) if s.is_invalid_request_exception() && is_pending_deletion(s.message()) => {
+                    pending_deletion_error(name)
+                }
+                _ => classify_sdk_error(PUT, &e),
+            })?
+            .arn()
+            .map(str::to_string)
+            .ok_or_else(|| other(format!("{PUT} returned no ARN")))
     }
 
     async fn task_definition_revisions(&self, family: &str) -> Result<Vec<String>, AwsError> {

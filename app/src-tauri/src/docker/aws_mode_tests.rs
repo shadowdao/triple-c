@@ -2226,7 +2226,7 @@ impl Connect {
             .replace("lib=/usr/local/lib/triple-c/entrypoint-lib.sh\n", &format!("lib='{}'\n", p("lib.sh").display()))
             .replace("shm=/dev/shm/triple-c\n", &format!("shm='{}'\n", p("shm").display()))
             .replace("stage=/dev/shm/triple-c/connect\n", &format!("stage='{}'\n", p("shm/connect").display()))
-            .replace("env_file=/dev/shm/triple-c/connect.env\n", &format!("env_file='{}'\n", p("shm/connect.env").display()))
+            .replace("ca_dir=/dev/shm/triple-c/connect-ca\n", &format!("ca_dir='{}'\n", p("shm/connect-ca").display()))
             .replace("clone_status=/run/triple-c-clone\n", &format!("clone_status='{}'\n", p("clone").display()))
             .replace("workspace=/workspace\n", &format!("workspace='{}'\n", p("ws").display()))
             .replace("retry_wait=2400\n", "retry_wait=20\n")
@@ -2252,6 +2252,31 @@ impl Connect {
         self.root.join(s)
     }
 
+    /// `--prepare`: this connect's nonce (its dir is `shm/connect/<nonce>`).
+    fn prepare(&self) -> String {
+        let out = self.run(&["--prepare"]);
+        assert!(out.status.success(), "{}", text(&out));
+        let nonce = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert!(nonce.len() == 16 && nonce.chars().all(|c| c.is_ascii_hexdigit()), "{nonce:?}");
+        nonce
+    }
+
+    /// What the app uploads for one connect: `files` (`ssh/x`, `ca/y`) and
+    /// `connect.env`.
+    fn stage(&self, nonce: &str, files: &[(&str, &str)], env: &str) {
+        for (k, v) in files {
+            fs::write(self.p(&format!("shm/connect/{nonce}/{k}")), v).unwrap();
+        }
+        fs::write(self.p(&format!("shm/connect/{nonce}/connect.env")), env).unwrap();
+    }
+
+    /// A whole connect: prepare, stage, apply.
+    fn connect(&self, files: &[(&str, &str)], env: &str) -> Output {
+        let nonce = self.prepare();
+        self.stage(&nonce, files, env);
+        self.run(&[&nonce])
+    }
+
     /// Waits for the background re-clone to finish (`done` back).
     fn wait_done(&self) {
         for _ in 0..200 {
@@ -2272,26 +2297,22 @@ fn apply_connect_installs_the_ca_merges_ssh_writes_git_credentials_and_retries_o
     let c = Connect::new(tmp.path());
     let remote = bare_remote(tmp.path(), "remote");
 
-    // A stale staging dir and env file from an earlier connect are replaced.
-    fs::create_dir_all(c.p("shm/connect/ssh")).unwrap();
-    fs::write(c.p("shm/connect/ssh/old"), "old").unwrap();
-    fs::write(c.p("shm/connect.env"), "OLD=x\n").unwrap();
-    let out = c.run(&["--prepare"]);
-    assert!(out.status.success(), "{}", text(&out));
-    for d in ["shm/connect", "shm/connect/ssh", "shm/connect/ca"] {
-        assert_eq!(mode(&c.p(d)), 0o700, "{d}");
+    // A connect's own staging dir; one an abandoned connect left long ago is
+    // cleared, a recent one (a connect in flight) is not.
+    fs::create_dir_all(c.p("shm/connect/0000000000000old")).unwrap();
+    fs::create_dir_all(c.p("shm/connect/00000000000recent")).unwrap();
+    assert!(Command::new("touch").args(["-d", "1 hour ago"]).arg(c.p("shm/connect/0000000000000old")).status().unwrap().success());
+    let nonce = c.prepare();
+    for d in ["shm/connect".to_string(), format!("shm/connect/{nonce}"), format!("shm/connect/{nonce}/ssh"), format!("shm/connect/{nonce}/ca")] {
+        assert_eq!(mode(&c.p(&d)), 0o700, "{d}");
     }
-    assert!(!c.p("shm/connect/ssh/old").exists() && !c.p("shm/connect.env").exists());
+    assert!(!c.p("shm/connect/0000000000000old").exists());
+    assert!(c.p("shm/connect/00000000000recent").exists());
 
     // What the app uploads.
-    fs::write(c.p("shm/connect/ssh/id_ed25519"), "KEY").unwrap();
-    fs::write(c.p("shm/connect/ca/corp.pem"), PEM).unwrap();
     let token = "ghp_secret-value";
-    fs::write(
-        c.p("shm/connect.env"),
-        format!("ANTHROPIC_API_KEY={}\nGIT_TOKEN={}\n", b64("sk-other"), b64(token)),
-    )
-    .unwrap();
+    let env = format!("ANTHROPIC_API_KEY={}\nGIT_TOKEN={}\n", b64("sk-other"), b64(token));
+    c.stage(&nonce, &[("ssh/id_ed25519", "KEY"), ("ca/corp.pem", PEM)], &env);
     // The first clone is done: `ok` cloned, `bad` failed (no credentials then).
     git(tmp.path(), &["clone", "-q", remote.to_str().unwrap(), c.p("ws/ok").to_str().unwrap()]);
     fs::write(c.p("clone/repos"), "ok\tcloning\nok\tcloned\nbad\tcloning\nbad\tfailed\n").unwrap();
@@ -2305,10 +2326,11 @@ fn apply_connect_installs_the_ca_merges_ssh_writes_git_credentials_and_retries_o
     )
     .unwrap();
 
-    let out = c.run(&[]);
+    let out = c.run(&[&nonce]);
     let log = text(&out);
     assert!(out.status.success(), "{log}");
     assert!(log.contains("credentials applied"), "{log}");
+    assert!(!c.p(&format!("shm/connect/{nonce}")).exists(), "the apply removes its staging");
     assert!(!log.contains(token) && !log.contains("sk-other"), "no value is printed: {log}");
 
     // CA, as the entrypoint installs it.
@@ -2337,8 +2359,9 @@ fn apply_connect_installs_the_ca_merges_ssh_writes_git_credentials_and_retries_o
     assert!(clone_log.contains("cloning again with the project's credentials: bad"), "{clone_log}");
     assert!(!clone_log.contains(token), "{clone_log}");
 
-    // Idempotent: again, nothing failed, nothing re-cloned, same state.
-    let out = c.run(&[]);
+    // A new connect with the same credentials: nothing failed, nothing
+    // re-cloned, same state, the CA not reinstalled.
+    let out = c.connect(&[("ssh/id_ed25519", "KEY"), ("ca/corp.pem", PEM)], &env);
     assert!(out.status.success(), "{}", text(&out));
     assert_eq!(fs::read_to_string(c.p("clone/repos")).unwrap(), repos);
     assert!(c.p("clone/done").exists());
@@ -2351,11 +2374,11 @@ fn apply_connect_installs_the_ca_merges_ssh_writes_git_credentials_and_retries_o
 fn apply_connect_with_nothing_configured_changes_nothing_and_leaves_a_waiting_clone_alone() {
     let tmp = tempfile::tempdir().unwrap();
     let c = Connect::new(tmp.path());
-    assert!(c.run(&["--prepare"]).status.success());
+    let nonce = c.prepare();
     // The first clone is still waiting for this connect: no `done`, no
     // `no-credentials`.
     fs::write(c.p("run/repos.json"), "[]").unwrap();
-    let out = c.run(&[]);
+    let out = c.run(&[&nonce]);
     let log = text(&out);
     assert!(out.status.success(), "{log}");
     assert!(!log.contains("warning"), "{log}");
@@ -2371,7 +2394,7 @@ fn apply_connect_retries_a_clone_that_started_without_credentials_once_it_is_don
     let tmp = tempfile::tempdir().unwrap();
     let c = Connect::new(tmp.path());
     let remote = bare_remote(tmp.path(), "remote");
-    assert!(c.run(&["--prepare"]).status.success());
+    let nonce = c.prepare();
     fs::write(
         c.p("run/repos.json"),
         format!(r#"[{{"url":"{}","branch":null,"folder":"late"}}]"#, remote.display()),
@@ -2380,7 +2403,7 @@ fn apply_connect_retries_a_clone_that_started_without_credentials_once_it_is_don
     // Still cloning without credentials (the wait timed out).
     fs::write(c.p("clone/no-credentials"), "").unwrap();
     fs::write(c.p("clone/repos"), "late\tcloning\n").unwrap();
-    let out = c.run(&[]);
+    let out = c.run(&[&nonce]);
     assert!(out.status.success(), "{}", text(&out));
     std::thread::sleep(std::time::Duration::from_millis(500));
     assert!(!c.p("ws/late").exists(), "nothing until the running clone is done");
@@ -2410,16 +2433,15 @@ fn a_running_re_clone_never_holds_the_apply_lock_and_prepare_waits_for_an_apply(
     let mut lib = fs::read_to_string(c.p("lib.sh")).unwrap();
     lib.push_str("\nclone_repos() { sleep 6; }\n");
     fs::write(c.p("lib.sh"), lib).unwrap();
-    assert!(c.run(&["--prepare"]).status.success());
+    let nonce = c.prepare();
     fs::write(c.p("run/repos.json"), r#"[{"url":"x","branch":null,"folder":"bad"}]"#).unwrap();
     fs::write(c.p("clone/repos"), "bad\tcloning\nbad\tfailed\n").unwrap();
     fs::write(c.p("clone/done"), "").unwrap();
-    assert!(c.run(&[]).status.success());
+    assert!(c.run(&[&nonce]).status.success());
     assert!(!c.p("clone/done").exists(), "the re-clone is running");
     // The next connect goes straight through.
     let started = std::time::Instant::now();
-    assert!(c.run(&["--prepare"]).status.success());
-    let out = c.run(&[]);
+    let out = c.connect(&[], "");
     assert!(out.status.success(), "{}", text(&out));
     assert!(!text(&out).contains("another apply"), "{}", text(&out));
     assert!(started.elapsed() < std::time::Duration::from_secs(4), "{:?}", started.elapsed());
@@ -2429,7 +2451,6 @@ fn a_running_re_clone_never_holds_the_apply_lock_and_prepare_waits_for_an_apply(
     let lock = c.p("shm/apply-connect.lock");
     let mut holder = Command::new("flock").arg(&lock).args(["sleep", "2"]).spawn().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(300));
-    fs::write(c.p("shm/connect/marker"), "").ok();
     let started = std::time::Instant::now();
     assert!(c.run(&["--prepare"]).status.success());
     assert!(started.elapsed() >= std::time::Duration::from_millis(1200), "{:?}", started.elapsed());
@@ -2460,4 +2481,32 @@ fn under_copy_at_connect_hybrid_keeps_ssh_off_efs() {
     assert!(ssh.is_dir() && !ssh.file_type().is_symlink(), "~/.ssh is a local directory");
     assert_eq!(fs::read_to_string(home.join(".ssh/id_ed25519")).unwrap(), "KEY");
     assert!(!mnt.join(".ssh").exists(), "nothing written to EFS");
+}
+
+#[test]
+fn two_connects_at_once_never_mix_their_files() {
+    // Two machines connecting at the same moment: both prepare, then both
+    // upload, then both apply. Each applies its own set; the later wins.
+    let tmp = tempfile::tempdir().unwrap();
+    let c = Connect::new(tmp.path());
+    let a = c.prepare();
+    let b = c.prepare();
+    assert_ne!(a, b);
+    c.stage(&a, &[("ssh/id_a", "A"), ("ssh/config", "Host a\n")], &format!("GIT_TOKEN={}\n", b64("tok-a")));
+    c.stage(&b, &[("ssh/id_b", "B"), ("ssh/config", "Host b\n")], &format!("GIT_TOKEN={}\n", b64("tok-b")));
+    for n in [&a, &b] {
+        let out = c.run(&[n]);
+        assert!(out.status.success(), "{}", text(&out));
+    }
+    assert_eq!(fs::read_to_string(c.p("home/.ssh/config")).unwrap(), "Host b\n");
+    let cred = fs::read_to_string(c.p("home/.git-credentials")).unwrap_or_else(|e| panic!("{e}: {:?}", fs::read_dir(c.p("home")).unwrap().map(|e| e.unwrap().file_name()).collect::<Vec<_>>()));
+    assert!(cred.contains("tok-b"), "{cred}");
+    // B's set as a whole: A's key, merged first, is dropped again by the
+    // merge's own bookkeeping (B no longer provides it).
+    assert_eq!(fs::read_to_string(c.p("home/.ssh/id_b")).unwrap(), "B");
+    assert!(!c.p("home/.ssh/id_a").exists());
+    assert_eq!(fs::read_dir(c.p("shm/connect")).unwrap().count(), 0, "both staging dirs gone");
+    // A nonce that is not one, or not prepared, is refused.
+    assert_eq!(c.run(&["../../etc"]).status.code(), Some(2));
+    assert_eq!(c.run(&[&a]).status.code(), Some(1));
 }

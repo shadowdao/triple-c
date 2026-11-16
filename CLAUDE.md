@@ -449,8 +449,9 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   the agent token but no `TRIPLEC_FILES` and no credential pairs (`SECRET_ENV_KEYS` + every custom
   variable; `TRIPLEC_CREDENTIALS=connect` instead — the gateway sidecar's `TRIPLEC_GATEWAY_*` keys
   stay, R1). After every connect (start, attach, background re-attach) `aws_host::connect`
-  uploads the files and `connect.env` (`KEY=<base64>` lines) as root into `/dev/shm/triple-c`
-  (root 0700 tmpfs) and runs `triple-c-apply-connect`: CA install as root, SSH merge and git
+  uploads the files and `connect.env` (`KEY=<base64>` lines) as root into this connect's own
+  `/dev/shm/triple-c/connect/<nonce>/` (root 0700 tmpfs; `--prepare` prints the nonce, so two
+  connects at once never mix) and runs `triple-c-apply-connect <nonce>`: CA install as root, SSH merge and git
   credential helper **as `claude`** (root never walks a live `~/.ssh`), `/run/triple-c/connected`,
   then a background re-clone of `failed` repos only (GIT_TOKEN in that clone's env only). The
   first clone waits up to 5 min for `connected` (`aws_wait_connect`). Terminals the app opens add
@@ -458,7 +459,8 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   nothing reaches the agent's snapshot, so cron/scheduled jobs and the setup script never get them.
   A failed push is a `workspace-warning`. Hybrid/EFS do **not** link `~/.ssh` to EFS under
   copy-at-connect (R6: keys vanish with the task). A secret that still holds credentials when a
-  copy-at-connect start writes it (`holds_credentials`) is force-deleted and created again (R7:
+  copy-at-connect start finds on CreateSecret's ResourceExists (`holds_credentials`; a new
+  project's secret is never read first) is force-deleted and created again (R7:
   `PutSecretValue` would keep them as AWSPREVIOUS); `TRIPLE_C_CUSTOM_ENV` is left out too.
   The re-clone closes the apply lock's fd (a later connect never waits for it); `--prepare` takes it.
   The functions both scripts use live in `container/entrypoint-lib.sh`

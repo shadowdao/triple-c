@@ -115,6 +115,16 @@ impl WorkspaceApi for Fake {
     async fn project_secret_value(&self, _n: &str) -> Result<Option<String>, AwsError> {
         unreachable!()
     }
+    async fn create_project_secret(
+        &self,
+        n: &str,
+        k: &str,
+        j: &str,
+        t: &[(String, String)],
+    ) -> Result<Option<String>, AwsError> {
+        let _ = (n, k, j, t);
+        unreachable!()
+    }
     async fn delete_project_secret(&self, _n: &str) -> Result<(), AwsError> {
         unreachable!()
     }

@@ -164,6 +164,15 @@ impl WorkspaceApi for Fake {
     async fn project_secret_value(&self, _name: &str) -> Result<Option<String>, AwsError> {
         Ok(None)
     }
+    async fn create_project_secret(
+        &self,
+        n: &str,
+        k: &str,
+        j: &str,
+        t: &[(String, String)],
+    ) -> Result<Option<String>, AwsError> {
+        self.put_project_secret(n, k, j, t).await.map(Some)
+    }
     async fn delete_project_secret(&self, _name: &str) -> Result<(), AwsError> {
         Ok(())
     }
@@ -959,10 +968,11 @@ mod copy_at_connect {
     impl ConnectTarget for FakeTarget {
         async fn exec_root(&self, cmd: Vec<String>) -> Result<(String, i64), String> {
             self.calls.lock().unwrap().push(format!("exec {}", cmd.join(" ")));
-            if cmd.len() == 1 {
-                if let Some(r) = self.apply_result.lock().unwrap().clone() {
-                    return Ok(r);
-                }
+            if cmd.get(1).map(String::as_str) == Some("--prepare") {
+                return Ok(("0123456789abcdef\n".into(), 0));
+            }
+            if let Some(r) = self.apply_result.lock().unwrap().clone() {
+                return Ok(r);
             }
             Ok(("triple-c-apply-connect: credentials applied\n".into(), 0))
         }
@@ -994,10 +1004,10 @@ mod copy_at_connect {
             *t.calls.lock().unwrap(),
             vec![
                 "exec /usr/local/bin/triple-c-apply-connect --prepare",
-                "upload /dev/shm/triple-c/connect/ssh/id_ed25519",
-                "upload /dev/shm/triple-c/connect/ca/corp.crt",
-                "upload /dev/shm/triple-c/connect.env",
-                "exec /usr/local/bin/triple-c-apply-connect",
+                "upload /dev/shm/triple-c/connect/0123456789abcdef/ssh/id_ed25519",
+                "upload /dev/shm/triple-c/connect/0123456789abcdef/ca/corp.crt",
+                "upload /dev/shm/triple-c/connect/0123456789abcdef/connect.env",
+                "exec /usr/local/bin/triple-c-apply-connect 0123456789abcdef",
             ]
         );
         let uploads = t.uploads.lock().unwrap();
@@ -1028,6 +1038,14 @@ mod copy_at_connect {
         let bad = ConnectBundle { files: vec![("ssh/../x".into(), Vec::new().into())], env: vec![] };
         assert!(push_connect_bundle(&t, &bad).await.is_err());
         assert!(t.uploads.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn only_a_well_formed_connect_id_is_used_as_a_path() {
+        assert_eq!(parse_nonce("noise\n0123456789abcdef\n").unwrap(), "0123456789abcdef");
+        for bad in ["", "../../etc/passwd", "0123456789ABCDEF", "0123456789abcde", "0123456789abcdef0"] {
+            assert!(parse_nonce(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

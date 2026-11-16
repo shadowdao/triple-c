@@ -799,6 +799,8 @@ struct Fake {
     secret_reads: Mutex<usize>,
     /// Puts that fail as "scheduled for deletion" before one succeeds.
     pending_puts: Mutex<usize>,
+    /// Calls `create_project_secret` got.
+    creates: Mutex<usize>,
 }
 
 impl Fake {
@@ -850,7 +852,21 @@ impl WorkspaceApi for Fake {
     }
     async fn delete_project_secret(&self, name: &str) -> Result<(), AwsError> {
         self.deleted_secrets.lock().unwrap().push(name.into());
+        *self.existing_secret.lock().unwrap() = None;
         Ok(())
+    }
+    async fn create_project_secret(
+        &self,
+        name: &str,
+        kms_key_arn: &str,
+        json: &str,
+        tags: &[(String, String)],
+    ) -> Result<Option<String>, AwsError> {
+        *self.creates.lock().unwrap() += 1;
+        if self.existing_secret.lock().unwrap().is_some() {
+            return Ok(None);
+        }
+        self.put_project_secret(name, kms_key_arn, json, tags).await.map(Some)
     }
     async fn put_project_secret(
         &self,
@@ -1638,6 +1654,7 @@ async fn switching_to_copy_at_connect_replaces_a_secret_that_held_credentials() 
     prepare_workspace(&fake, &who(), &env_info(), &copy_at_connect_project(), &env, &[], &[], IMAGE)
         .await
         .unwrap();
+    assert_eq!(*fake.secret_reads.lock().unwrap(), 1, "read only once it exists");
     assert_eq!(fake.deleted_secrets.lock().unwrap().len(), 1);
     let m = payload_map(&fake.secrets.lock().unwrap()[0].2);
     assert!(!m.contains_key("GIT_TOKEN"));
@@ -1653,12 +1670,16 @@ async fn switching_to_copy_at_connect_replaces_a_secret_that_held_credentials() 
     assert!(fake.deleted_secrets.lock().unwrap().is_empty());
     assert_eq!(fake.secrets.lock().unwrap().len(), 1);
 
-    // No secret yet: created, nothing deleted.
+    // No secret yet (a first start): created, never read — a read of a
+    // secret that doesn't exist may be refused — nothing deleted.
     let fake = Fake::onboarded();
     prepare_workspace(&fake, &who(), &env_info(), &copy_at_connect_project(), &env, &[], &[], IMAGE)
         .await
         .unwrap();
+    assert_eq!(*fake.creates.lock().unwrap(), 1);
+    assert_eq!(*fake.secret_reads.lock().unwrap(), 0);
     assert!(fake.deleted_secrets.lock().unwrap().is_empty());
+    assert!(!payload_map(&fake.secrets.lock().unwrap()[0].2).contains_key("GIT_TOKEN"));
 
     // Secrets Manager never reads or deletes.
     let fake = Fake::onboarded();

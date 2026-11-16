@@ -8,8 +8,9 @@
 //! [`workspace_files`](super::workspace_files) the secret would carry) and
 //! the credential environment pairs (`SECRET_ENV_KEYS` and every custom
 //! variable, `aws::workspace::credential_pairs`). [`push_connect_bundle`]
-//! uploads them through the agent, as root, into root-only staging on the
-//! task's `/dev/shm` tmpfs and runs `triple-c-apply-connect` (container), which
+//! uploads them through the agent, as root, into this connect's own root-only
+//! staging dir on the task's `/dev/shm` tmpfs and runs `triple-c-apply-connect
+//! <nonce>` (container), which
 //! installs the CA, merges the SSH files, writes the git credential helper
 //! and re-clones what failed. The terminals the app opens get the pairs in
 //! their own `ExecSpec.env` ([`terminal_env`]); nothing puts them into the
@@ -28,9 +29,8 @@ use crate::models::{AppSettings, Project};
 
 /// The in-container half (container/triple-c-apply-connect).
 pub const APPLY_CONNECT: &str = "/usr/local/bin/triple-c-apply-connect";
-/// Root 0700 on the tmpfs (made by the entrypoint for the agent token).
-pub const CONNECT_SHM: &str = "/dev/shm/triple-c";
-/// Staging for the files: `ssh/` and `ca/` under it.
+/// Staging (root 0700, on the tmpfs the entrypoint made for the agent
+/// token): each connect gets `<nonce>/` with `ssh/`, `ca/` and `connect.env`.
 pub const CONNECT_STAGE: &str = "/dev/shm/triple-c/connect";
 pub const CONNECT_ENV_FILE: &str = "connect.env";
 /// Every staged file is root 0600.
@@ -174,21 +174,34 @@ async fn run_apply<T: ConnectTarget>(t: &T, args: &[&str]) -> Result<String, Str
     }
 }
 
-/// Upload `bundle` and apply it (see the module docs): `--prepare`, the
-/// files and `connect.env` (root 0600), then the apply.
+/// `--prepare`'s answer: this connect's nonce, 16 hex digits on the last line.
+pub(crate) fn parse_nonce(out: &str) -> Result<String, String> {
+    let last = out.lines().rev().map(str::trim).find(|l| !l.is_empty()).unwrap_or_default();
+    if last.len() == 16 && last.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        Ok(last.to_string())
+    } else {
+        Err(format!("triple-c-apply-connect --prepare gave no connect id:\n{}", tail(out)))
+    }
+}
+
+/// Upload `bundle` and apply it (see the module docs): `--prepare` (which
+/// names this connect's own staging dir), the files and `connect.env` (root
+/// 0600) into that dir, then the apply of exactly that dir — so two
+/// connects at once (two machines) never mix their files.
 pub async fn push_connect_bundle<T: ConnectTarget>(t: &T, bundle: &ConnectBundle) -> Result<(), String> {
-    run_apply(t, &["--prepare"]).await?;
+    let nonce = parse_nonce(&run_apply(t, &["--prepare"]).await?)?;
+    let dir = format!("{CONNECT_STAGE}/{nonce}");
     for (key, data) in &bundle.files {
         validate_file_key(key)?;
         let (kind, name) = key.split_once('/').expect("validated");
-        t.upload_root(&format!("{CONNECT_STAGE}/{kind}"), name, data, STAGED_MODE)
+        t.upload_root(&format!("{dir}/{kind}"), name, data, STAGED_MODE)
             .await
             .map_err(|e| format!("Could not copy {key} into the workspace: {e}"))?;
     }
-    t.upload_root(CONNECT_SHM, CONNECT_ENV_FILE, &connect_env_file(&bundle.env), STAGED_MODE)
+    t.upload_root(&dir, CONNECT_ENV_FILE, &connect_env_file(&bundle.env), STAGED_MODE)
         .await
         .map_err(|e| format!("Could not copy the credential variables into the workspace: {e}"))?;
-    let out = run_apply(t, &[]).await?;
+    let out = run_apply(t, &[&nonce]).await?;
     for line in out.lines().filter(|l| l.contains("warning")) {
         log::warn!("{line}");
     }

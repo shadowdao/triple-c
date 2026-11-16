@@ -7,13 +7,14 @@
 # custom variables. Instead, after every connect (a start, an attach, the
 # background re-attach when the app starts) the app, through the agent and as
 # root:
-#   1. runs `triple-c-apply-connect --prepare` (fresh, empty, root-only
-#      staging dirs on the /dev/shm tmpfs — never the disk);
-#   2. uploads the SSH files to /dev/shm/triple-c/connect/ssh/, the CA files to
-#      /dev/shm/triple-c/connect/ca/ (each root 0600) and the credential
-#      environment to /dev/shm/triple-c/connect.env (root 0600, one
-#      `KEY=<base64 of the value>` line per variable);
-#   3. runs `triple-c-apply-connect`, which
+#   1. runs `triple-c-apply-connect --prepare`, which makes this connect's
+#      own root-only staging dir on the /dev/shm tmpfs (never the disk),
+#      /dev/shm/triple-c/connect/<nonce>/{ssh,ca}, and prints <nonce>
+#      (16 hex digits);
+#   2. uploads the SSH files to <nonce>/ssh/, the CA files to <nonce>/ca/ and
+#      the credential environment to <nonce>/connect.env (each root 0600;
+#      connect.env holds one `KEY=<base64 of the value>` line per variable);
+#   3. runs `triple-c-apply-connect <nonce>`, which, under the apply lock,
 #        - installs the CA (install_corporate_ca, as root: its source and the
 #          system store are root-only paths),
 #        - merges the SSH files into ~/.ssh (merge_host_ssh, **as the user**:
@@ -31,7 +32,12 @@
 # connect.env is never sourced into, or exported to, anything but the clone,
 # and the agent's environment (every terminal's) is untouched — the app adds
 # the credential variables to the terminals it opens itself. Nothing here
-# prints a value. Idempotent: run it again and it converges on the same state.
+# prints a value. Each connect stages and applies its own set, so two connects
+# at once (two machines, a start racing a re-attach) never mix their files:
+# their applies run one after the other, the later one's set wins. The apply
+# removes its staging dir; the CA files move to /dev/shm/triple-c/connect-ca
+# (a fixed path, so an unchanged CA is not reinstalled). Idempotent: a new
+# connect with the same credentials converges on the same state.
 # Re-cloning does not re-run the setup script.
 set -u
 
@@ -40,7 +46,7 @@ set -u
 lib=/usr/local/lib/triple-c/entrypoint-lib.sh
 shm=/dev/shm/triple-c
 stage=/dev/shm/triple-c/connect
-env_file=/dev/shm/triple-c/connect.env
+ca_dir=/dev/shm/triple-c/connect-ca
 clone_status=/run/triple-c-clone
 workspace=/workspace
 # How long a retry waits for a clone that started without credentials.
@@ -58,33 +64,47 @@ if ! . "$lib"; then
 fi
 triplec_aws=1
 
-# The apply lock, also taken by --prepare so a prepare never empties the
-# staging dir under a running apply.
+# The apply lock: applies run one at a time; --prepare takes it too, so its
+# clean-up of stale staging dirs never races an apply.
 take_lock() {
     exec 9>"$shm/apply-connect.lock" && flock -w 120 9 \
         || say "warning — another apply is still running; going ahead"
 }
 
 prepare() {
+    local nonce
     umask 077
     if [ ! -d "$shm" ] || [ -L "$shm" ]; then
         say "$shm is missing (the workspace has no agent token?); nothing prepared"
         exit 1
     fi
     take_lock
-    rm -rf "$stage" "$env_file"
-    mkdir -m 700 "$stage" "$stage/ssh" "$stage/ca" || exit 1
+    if [ -L "$stage" ] || { [ -e "$stage" ] && [ ! -d "$stage" ]; }; then rm -f "$stage"; fi
+    mkdir -p -m 700 "$stage" && chmod 700 "$stage" || exit 1
+    # What a connect that never applied (the app gone mid-push) left.
+    find "$stage" -mindepth 1 -maxdepth 1 -mmin +10 -exec rm -rf {} + 2>/dev/null
+    nonce=$(od -An -tx1 -N8 /dev/urandom | tr -d ' \n')
+    case "$nonce" in [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;; *) say "no random nonce"; exit 1 ;; esac
+    mkdir -m 700 "$stage/$nonce" "$stage/$nonce/ssh" "$stage/$nonce/ca" || exit 1
+    printf '%s\n' "$nonce"
 }
+
+# This connect's staging dir (set by apply).
+dir=
 
 # GIT_TOKEN, decoded from connect.env into this shell only.
 connect_git_token=
 read_git_token() {
-    local key value
-    [ -f "$env_file" ] || return 0
-    while IFS='=' read -r key value; do
+    local line key value
+    [ -f "$dir/connect.env" ] || return 0
+    # Split by hand at the first `=`: `read` with IFS='=' would drop a
+    # trailing `=`, which is base64 padding here.
+    while IFS= read -r line; do
+        key=${line%%=*}
+        value=${line#*=}
         [ "$key" = GIT_TOKEN ] || continue
         connect_git_token=$(printf '%s' "$value" | base64 -d 2>/dev/null) || connect_git_token=
-    done < "$env_file"
+    done < "$dir/connect.env"
 }
 
 # The staged SSH files merged as the user: copied to a fresh root-made dir
@@ -94,7 +114,7 @@ merge_ssh_as_user() {
     local tmp rc=0
     tmp=$(mktemp -d "${ssh_tmp_dir}/triple-c-connect.XXXXXXXX") \
         || { say "warning — no temporary directory; SSH files not merged"; return 0; }
-    if cp -R "$stage/ssh" "$tmp/ssh"; then
+    if cp -R "$dir/ssh" "$tmp/ssh"; then
         if [ -n "${triplec_run_as:-}" ] && [ "$(id -u)" = 0 ]; then
             chown -R "$triplec_run_as:" "$tmp"
         fi
@@ -183,19 +203,29 @@ retry_failed_clones() {
 }
 
 apply() {
+    local nonce="$1"
     umask 077
-    if [ ! -d "$stage" ] || [ -L "$stage" ]; then
-        say "$stage is missing; run --prepare and upload first"
+    case "$nonce" in
+        *[!0-9a-f]*|'') say "not a connect nonce: $nonce"; exit 2 ;;
+    esac
+    [ "${#nonce}" = 16 ] || { say "not a connect nonce: $nonce"; exit 2; }
+    dir="$stage/$nonce"
+    if [ ! -d "$dir" ] || [ -L "$dir" ] || [ -L "$stage" ]; then
+        say "$dir is missing; run --prepare and upload first"
         exit 1
     fi
     take_lock
     # Empty staging dirs: nothing of that kind is configured.
-    rmdir "$stage/ca" "$stage/ssh" 2>/dev/null
+    rmdir "$dir/ca" "$dir/ssh" 2>/dev/null
 
-    CA_SRC="$stage/ca"
+    rm -rf "$ca_dir"
+    if [ -d "$dir/ca" ]; then
+        mv "$dir/ca" "$ca_dir" || say "warning — could not move the CA files into place"
+    fi
+    CA_SRC="$ca_dir"
     install_corporate_ca
 
-    if [ -d "$stage/ssh" ]; then
+    if [ -d "$dir/ssh" ]; then
         merge_ssh_as_user
     fi
 
@@ -210,11 +240,12 @@ apply() {
         say "warning — could not record the connect in $triplec_run_dir"
     fi
     retry_failed_clones
+    rm -rf "$dir"
     say "credentials applied"
 }
 
 case "${1:-}" in
     --prepare) prepare ;;
-    '') apply ;;
-    *) say "usage: triple-c-apply-connect [--prepare]"; exit 2 ;;
+    ''|-*) say "usage: triple-c-apply-connect --prepare | <nonce>"; exit 2 ;;
+    *) apply "$1" ;;
 esac
