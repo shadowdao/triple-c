@@ -2,6 +2,7 @@ import type {
   AwsWorkspaceConfig,
   DetectedEnvironment,
   GatewaySettings,
+  LaunchType,
   Project,
   RepoSource,
   UnsavedWork,
@@ -237,4 +238,16 @@ export function localEndpointProblem(url: string, gatewayPort: number | null): s
     return `${host} is this machine (or its Docker host) — an AWS workspace can't reach it.`;
   }
   return null;
+}
+
+/** The save patch for switching an AWS project's launch type. Docker access and
+ *  VPN need EC2 (Rust refuses them on Fargate), so switching to Fargate turns
+ *  them off in the same save. Task 6's launch-type control must use this. */
+export function launchTypePatch(project: Project, launch_type: LaunchType): Partial<Project> {
+  const patch: Partial<Project> = { aws: { ...project.aws!, launch_type } };
+  if (launch_type !== "ec2") {
+    patch.allow_docker_access = false;
+    patch.vpn_support_enabled = false;
+  }
+  return patch;
 }

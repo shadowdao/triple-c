@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import RuntimeSection from "./RuntimeSection";
 import type { AuthBridgeStatus, Project } from "../../../../lib/types";
+import { launchTypePatch } from "../../../../lib/awsWorkspace";
 import { awsProject } from "../../../../test/awsFixtures";
 
 // The auth-bridge row owns its own IPC — see `AuthBridgeRow.tsx` for why it
@@ -195,5 +196,24 @@ describe("RuntimeSection — Docker and VPN on AWS follow the launch type", () =
     renderSection({ ...fargate, aws: { ...fargate.aws!, launch_type: "ec2" } });
     expect(screen.getByRole("switch", { name: VPN })).toBeEnabled();
     expect(screen.getByRole("switch", { name: "Allow container spawning" })).toBeEnabled();
+  });
+
+  it("saves the flags when toggled on EC2", () => {
+    const p = awsProject({ vpn_support_enabled: false, allow_docker_access: false });
+    renderSection({ ...p, aws: { ...p.aws!, launch_type: "ec2" } });
+    fireEvent.click(screen.getByRole("switch", { name: VPN }));
+    expect(save).toHaveBeenCalledWith({ vpn_support_enabled: true });
+    fireEvent.click(screen.getByRole("switch", { name: "Allow container spawning" }));
+    expect(save).toHaveBeenCalledWith({ allow_docker_access: true });
+  });
+
+  it("launchTypePatch clears Docker and VPN when switching to Fargate", () => {
+    const p = awsProject({ allow_docker_access: true, vpn_support_enabled: true });
+    const toFargate = launchTypePatch(p, "fargate");
+    expect(toFargate).toMatchObject({ allow_docker_access: false, vpn_support_enabled: false });
+    expect(toFargate.aws?.launch_type).toBe("fargate");
+    const toEc2 = launchTypePatch(p, "ec2");
+    expect(toEc2.allow_docker_access).toBeUndefined();
+    expect(toEc2.aws?.launch_type).toBe("ec2");
   });
 });

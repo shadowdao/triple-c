@@ -1248,16 +1248,13 @@ fn validate_aws_update(
             crate::models::validate_region(&place.region)?;
             crate::aws::tofu_modules::validate_environment_name(&place.environment)?;
             crate::models::validate_aws_workspace(cfg)?;
-            // Docker access and VPN need the user's own instance (E6, E7);
-            // Fargate refuses them. Grandfather a value the stored project
-            // already had on AWS so an old row can still be saved.
+            // Docker access and VPN need the user's own instance (E6, E7).
             if cfg.launch_type != crate::models::LaunchType::Ec2 {
-                let was_aws = stored.aws.is_some();
-                if project.allow_docker_access && !(was_aws && stored.allow_docker_access) {
-                    return Err("Docker access on AWS needs the EC2 launch type".into());
+                if project.allow_docker_access {
+                    return Err("Docker access on AWS needs the EC2 launch type; turn it off first".into());
                 }
-                if project.vpn_support_enabled && !(was_aws && stored.vpn_support_enabled) {
-                    return Err("VPN support on AWS needs the EC2 launch type".into());
+                if project.vpn_support_enabled {
+                    return Err("VPN support on AWS needs the EC2 launch type; turn it off first".into());
                 }
             }
             // Q6: forwarded over loopback, TCP only, never a reserved port
@@ -2918,13 +2915,21 @@ mod tests {
             p.allow_docker_access = docker;
             p.vpn_support_enabled = vpn;
             assert!(validate_aws_update(&stored, &p, &hosts).is_err());
-            // A value the AWS project already had is grandfathered.
-            let mut old = stored.clone();
-            old.allow_docker_access = docker;
-            old.vpn_support_enabled = vpn;
-            assert!(validate_aws_update(&old, &old, &hosts).is_ok());
-            p.aws.as_mut().unwrap().launch_type = LaunchType::Ec2;
-            assert!(validate_aws_update(&stored, &p, &hosts).is_ok());
+            // Already stored that way on Fargate: still refused (no grandfathering).
+            assert!(validate_aws_update(&p, &p, &hosts).is_err());
+            // Ec2 -> Fargate with the flags still on: refused.
+            let mut ec2 = p.clone();
+            ec2.aws.as_mut().unwrap().launch_type = LaunchType::Ec2;
+            assert!(validate_aws_update(&ec2, &ec2, &hosts).is_ok());
+            assert!(validate_aws_update(&ec2, &p, &hosts).is_err());
+            // Local -> AWS(Fargate) with the flags on: refused.
+            let mut local = stored.clone();
+            local.host_id = None;
+            local.aws_placement = None;
+            local.aws = None;
+            local.allow_docker_access = docker;
+            local.vpn_support_enabled = vpn;
+            assert!(validate_aws_update(&local, &p, &hosts).is_err());
         }
     }
 

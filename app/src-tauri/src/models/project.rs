@@ -735,7 +735,8 @@ pub fn ec2_instance_spec(instance_type: &str) -> Option<(u32, u32)> {
         "c7i" | "c7g" => 2,
         "r7i" | "r7g" => 8,
         "t3" | "t4g" => {
-            // Burstable: 2 vCPU with 8 GiB (large), then no 4xlarge exists.
+            // Burstable families: memory is 4 GiB per vCPU at xlarge and above,
+            // 8 GiB at large; AWS offers no 4xlarge in these families.
             return match size {
                 "large" => Some((2048, 8192)),
                 "xlarge" => Some((4096, 16384)),
@@ -761,6 +762,11 @@ pub enum Fit {
 
 /// Check an EC2 config's reservations against `instance_type`, less the agent
 /// and OS reserve. A Fargate config always fits (no instance involved).
+///
+/// Nominal sizes only: ECS registers less memory than the instance's nominal
+/// (the ECS-optimized AMI reserves some, e.g. ~7.5 GiB on an 8 GiB type), so a
+/// later task should leave headroom or use the container instance's
+/// registered memory.
 pub fn fits_instance(cfg: &AwsWorkspaceConfig, instance_type: &str) -> Fit {
     if cfg.launch_type != LaunchType::Ec2 {
         return Fit::Ok;
