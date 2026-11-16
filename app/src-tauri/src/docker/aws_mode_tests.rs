@@ -667,7 +667,10 @@ fn wip_push_pushes_the_whole_tree_and_leaves_the_repo_as_it_was() {
     assert_eq!(refs.len(), 1, "{refs:?}");
     let name = refs[0].trim_start_matches("refs/heads/triple-c/wip/");
     assert!(
-        name.len() == 15 && name.as_bytes()[8] == b'-' && name.chars().filter(|c| c.is_ascii_digit()).count() == 14,
+        name.len() == 20
+            && name.as_bytes()[8] == b'-'
+            && name[..15].chars().filter(|c| c.is_ascii_digit()).count() == 14
+            && name.ends_with("-proj"),
         "{name}"
     );
     let r = &refs[0];
@@ -1410,6 +1413,12 @@ fn docker_mode_never_reaches_the_aws_blocks() {
     assert!(
         ENTRYPOINT.find("unset TRIPLEC_SETUP_SCRIPT").unwrap() < ENTRYPOINT.find("# >>> agent_token").unwrap()
     );
+    // The run record is made after the agent-token block (its children must
+    // not inherit TRIPLEC_AGENT_TOKEN) and before anything that can push.
+    let prepare = ENTRYPOINT.find("then aws_prepare_run; fi").expect("aws_prepare_run call");
+    assert!(prepare > ENTRYPOINT.find("# <<< agent_token").unwrap());
+    assert!(prepare < ENTRYPOINT.find("trap stop_keepalive TERM INT HUP").unwrap());
+    assert!(prepare < ENTRYPOINT.find("\nstart_agent\n").unwrap());
     // The setup runs in the clone's background chain, never in the agent's way.
     assert!(block(ENTRYPOINT, "aws_repos").contains("aws_run_setup"));
 }
@@ -1679,6 +1688,8 @@ fn lifetime_cap_not_reached_keeps_the_workspace_up() {
     assert_eq!(none.status.code(), Some(2), "{}", text(&none));
     let zero = w.lifetime_cmd(target.id(), "0", 30).output().unwrap();
     assert_eq!(zero.status.code(), Some(2), "0 is no cap: {}", text(&zero));
+    let zeros = w.lifetime_cmd(target.id(), "00", 30).output().unwrap();
+    assert_eq!(zeros.status.code(), Some(2), "00 is no cap either: {}", text(&zeros));
 }
 
 #[test]
@@ -1732,7 +1743,7 @@ fn wip_pushes_in_one_run_update_one_branch_and_skip_an_unchanged_tree() {
     fs::write(repo.join("a.txt"), "one").unwrap();
     let out = wip_push_in_run(&ws, Some(run_id));
     assert!(out.status.success(), "{}", text(&out));
-    let branch = format!("refs/heads/triple-c/wip/{run_id}");
+    let branch = format!("refs/heads/triple-c/wip/{run_id}-proj");
     assert_eq!(wip_refs(&remote), [branch.clone()]);
     let first = git(&remote, &["rev-parse", &branch]);
     assert_eq!(git(&remote, &["show", &format!("{branch}:a.txt")]), "one");
@@ -1783,7 +1794,7 @@ fn wip_push_without_a_usable_run_id_keeps_the_per_push_stamp() {
         let refs = wip_refs(&remote);
         assert_eq!(refs.len(), 1, "{refs:?}");
         let name = refs[0].trim_start_matches("refs/heads/triple-c/wip/");
-        assert!(name.len() == 15 && name.as_bytes()[8] == b'-', "{run_id:?}: {name}");
+        assert!(name.len() == 20 && name.as_bytes()[8] == b'-' && name.ends_with("-proj"), "{run_id:?}: {name}");
     }
 }
 
@@ -1856,4 +1867,119 @@ fn workspace_status_reports_clone_and_setup_and_survives_missing_files() {
     fs::remove_file(setup.join("log")).unwrap();
     fs::create_dir(setup.join("log")).unwrap();
     assert_eq!(workspace_status(&clone, &setup)["setup"]["tail"], serde_json::json!([]));
+}
+
+#[test]
+fn lifetime_cap_reads_leading_zeros_as_decimal() {
+    // `08` is 8 minutes, not a bad octal number.
+    let w = Watch::new();
+    let mut target = fake_entrypoint(w.tmp.path());
+    let out = run_watch_for(w.lifetime_cmd(target.id(), "08", 8 * 60 + 1), 20).expect("it stops at 8 minutes");
+    target.wait().unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(fs::read_to_string(w.tmp.path().join("reason")).unwrap().trim(), "lifetime");
+    let w = Watch::new();
+    let mut target = fake_entrypoint(w.tmp.path());
+    let ran = run_watch_for(w.lifetime_cmd(target.id(), "08", 7 * 60), 3);
+    target.kill().ok();
+    target.wait().ok();
+    assert!(ran.is_none(), "7 of 8 minutes: {:?}", ran.map(|o| text(&o)));
+}
+
+#[test]
+fn a_setup_chain_that_dies_early_records_failed_so_the_idle_stop_is_not_blocked() {
+    // The chain ends abnormally while the status still says `running`.
+    let tmp = tempfile::tempdir().unwrap();
+    let blocks = aws_run_blocks(tmp.path(), &["aws_env", "aws_run", "aws_repos"]);
+    let script = format!(
+        "{blocks}\n\
+         aws_run_setup() {{ exit 9; }}\n\
+         triplec_setup_script='echo hi'\n\
+         aws_prepare_run\n\
+         start_clone_repos '[]' \"$STATUS\"\n\
+         wait\n"
+    );
+    let out = bash(&script, &[], &[("STATUS", tmp.path().join("clone").to_str().unwrap())], &[]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(fs::read_to_string(tmp.path().join("setup/status")).unwrap(), "failed\n");
+
+    // Killed (TERM) while the clone is still running: `done` and `failed`.
+    let tmp = tempfile::tempdir().unwrap();
+    let blocks = aws_run_blocks(tmp.path(), &["aws_env", "aws_run", "aws_repos"]);
+    let pid = tmp.path().join("inner.pid");
+    let script = format!(
+        "{blocks}\n\
+         clone_repos() {{ sleep 30 >/dev/null 2>&1 & s=$!; echo \"$BASHPID $s\" > '{p}'; wait $s; }}\n\
+         triplec_setup_script='echo hi'\n\
+         aws_prepare_run\n\
+         start_clone_repos '[]' \"$STATUS\"\n\
+         chain=$!\n\
+         while [ ! -s '{p}' ]; do sleep 0.1; done\n\
+         kill -TERM \"$chain\" $(cat '{p}')\n\
+         wait\n",
+        p = pid.display()
+    );
+    let started = std::time::Instant::now();
+    let out = bash(&script, &[], &[("STATUS", tmp.path().join("clone").to_str().unwrap())], &[]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    assert!(tmp.path().join("clone/done").exists());
+    assert_eq!(fs::read_to_string(tmp.path().join("setup/status")).unwrap(), "failed\n");
+    // A finished setup's status is left alone by the trap.
+    let tmp = tempfile::tempdir().unwrap();
+    let out = run_setup(tmp.path(), "true\n", "1800");
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(fs::read_to_string(tmp.path().join("setup/status")).unwrap(), "ok\n");
+}
+
+#[test]
+fn each_folder_in_a_run_has_its_own_wip_branch_even_on_one_remote() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (ws, api, remote) = workspace_with_clone(tmp.path());
+    // A second clone of the same bare remote, under a folder name git refs
+    // cannot carry as is.
+    git(&ws, &["clone", "-q", remote.to_str().unwrap(), "we b@x"]);
+    let web = ws.join("we b@x");
+    git(&web, &["config", "user.name", "Dev"]);
+    git(&web, &["config", "user.email", "dev@example.invalid"]);
+    let run_id = "20261115-093000-0123abcd";
+    fs::write(api.join("a.txt"), "api-1").unwrap();
+    fs::write(web.join("a.txt"), "web-1").unwrap();
+    let out = wip_push_in_run(&ws, Some(run_id));
+    assert!(out.status.success(), "{}", text(&out));
+    let api_ref = format!("refs/heads/triple-c/wip/{run_id}-proj");
+    let web_ref = format!("refs/heads/triple-c/wip/{run_id}-we_b_x");
+    let mut refs = wip_refs(&remote);
+    refs.sort();
+    assert_eq!(refs, [api_ref.clone(), web_ref.clone()]);
+    assert_eq!(git(&remote, &["show", &format!("{api_ref}:a.txt")]), "api-1");
+    assert_eq!(git(&remote, &["show", &format!("{web_ref}:a.txt")]), "web-1");
+    let web_first = git(&remote, &["rev-parse", &web_ref]);
+
+    // A second push changes only api: its branch moves, web's is skipped.
+    fs::write(api.join("a.txt"), "api-2").unwrap();
+    let out = wip_push_in_run(&ws, Some(run_id));
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("we b@x: unchanged since the last push"), "{}", text(&out));
+    assert_eq!(git(&remote, &["show", &format!("{api_ref}:a.txt")]), "api-2");
+    assert_eq!(git(&remote, &["rev-parse", &web_ref]), web_first);
+    assert_eq!(wip_refs(&remote).len(), 2);
+}
+
+#[test]
+fn a_folder_name_no_ref_can_carry_falls_back_to_a_hash() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (ws, _, remote) = workspace_with_clone(tmp.path());
+    git(&ws, &["clone", "-q", remote.to_str().unwrap(), "a..b.lock"]);
+    let repo = ws.join("a..b.lock");
+    git(&repo, &["config", "user.name", "Dev"]);
+    git(&repo, &["config", "user.email", "dev@example.invalid"]);
+    fs::write(repo.join("x"), "x").unwrap();
+    let run_id = "20261115-093000-local";
+    let out = wip_push_in_run(&ws, Some(run_id));
+    assert!(out.status.success(), "{}", text(&out));
+    let refs = wip_refs(&remote);
+    assert_eq!(refs.len(), 1, "{refs:?}");
+    let suffix = refs[0].strip_prefix(&format!("refs/heads/triple-c/wip/{run_id}-")).unwrap();
+    assert!(suffix.len() == 12 && suffix.chars().all(|c| c.is_ascii_hexdigit()), "{suffix}");
 }

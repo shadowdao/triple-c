@@ -122,15 +122,16 @@ fi
 # <<< aws_env
 
 # ── AWS: this run's record, and the setup script's files ───────────────────
-# aws_prepare_run, as root at the very start of an AWS task:
+# aws_prepare_run, as root at the start of an AWS task (just after the
+# agent-token block):
 #   /run/triple-c            root, 0711 — users may open a file they know the
 #                            name of, never list it (the stop marker in it is
 #                            0600; the stop guard and the idle watcher keep the
 #                            mode);
 #   /run/triple-c/run-id     `<UTC yyyymmdd-HHMMSS>-<task id, first 8>` (task id
 #                            from the ECS task metadata, else `local`), 0644 —
-#                            triple-c-wip-push names this run's one WIP branch
-#                            after it (triple-c/wip/<run-id>);
+#                            triple-c-wip-push names this run's WIP branches
+#                            after it (triple-c/wip/<run-id>-<folder>);
 #   /run/triple-c/start-epoch  the start in Unix seconds, for the idle watcher's
 #                            lifetime cap (TRIPLEC_MAX_LIFETIME_MINUTES);
 #   /run/triple-c/wip-last   0700, owned by `claude`: triple-c-wip-push (run as
@@ -198,6 +199,13 @@ aws_prepare_run() {
     triplec_setup_script=
 }
 
+# The setup chain ended without a verdict: record a failure (no code).
+aws_setup_abandoned() {
+    [ "$(head -n 1 "$triplec_setup_dir/status" 2>/dev/null)" = running ] || return 0
+    printf 'failed\n' > "$triplec_setup_dir/status.tmp" && mv -f "$triplec_setup_dir/status.tmp" "$triplec_setup_dir/status"
+    echo "entrypoint: the setup script did not finish — recorded as failed"
+}
+
 # Runs the setup script, if there is one (see above). Never fails.
 aws_run_setup() {
     local dir="$triplec_setup_dir" rc state
@@ -214,7 +222,6 @@ aws_run_setup() {
     return 0
 }
 # <<< aws_run
-if [ "$triplec_aws" = 1 ]; then aws_prepare_run; fi
 
 # ── triple-c-agent token: off the environment before anything else runs ───
 # The agent (started at the very end, see start_agent) authenticates every
@@ -259,6 +266,9 @@ if [ -n "${TRIPLEC_AGENT_TOKEN_FILE:-}" ]; then
     mapfile -d '' agent_env < <(env -u PWD -u OLDPWD -u SHLVL -u _ -0)
 fi
 # <<< agent_token
+# After the token block, so nothing aws_prepare_run starts (the metadata curl)
+# inherits TRIPLEC_AGENT_TOKEN; before anything that can push.
+if [ "$triplec_aws" = 1 ]; then aws_prepare_run; fi
 
 # ── UID/GID remapping ──────────────────────────────────────────────────────
 # Match the container's claude user to the host user's UID/GID so that
@@ -879,6 +889,11 @@ start_clone_repos() {
     mkdir -m 755 "$status_dir" || status_dir=""
     (
         trap '' HUP
+        # Should this chain end early (an error, a signal) with the setup
+        # still marked `running`, say `failed`: the idle watcher counts a
+        # running setup as busy and would otherwise never stop the workspace.
+        trap 'aws_setup_abandoned' EXIT
+        trap 'exit 143' TERM
         (
             # `done` however the clone ends (an error, a signal), or the idle
             # watcher would count it as still running forever.
@@ -1425,7 +1440,7 @@ stop_keepalive() {
     exit "${triplec_exit_status:-0}"
 }
 trap stop_keepalive TERM INT HUP
-if [ "$triplec_aws" = 1 ] && { [ -n "${TRIPLEC_IDLE_STOP_MINUTES:-}" ] || [ "${TRIPLEC_MAX_LIFETIME_MINUTES:-0}" != 0 ]; }; then
+if [ "$triplec_aws" = 1 ] && { [ -n "${TRIPLEC_IDLE_STOP_MINUTES:-}" ] || [ -n "${TRIPLEC_MAX_LIFETIME_MINUTES//0/}" ]; }; then
     start_idle_watch "${TRIPLEC_IDLE_STOP_MINUTES:-}" "$$"
 fi
 # Repos are cloned in the background from here on — see clone_repos — and the

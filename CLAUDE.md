@@ -405,22 +405,28 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   start, and `triple-c-wip-push` skips scratch.
   Switching EFS → Hybrid/Ephemeral keeps `workspace_access_point_id` (store-owned) until "Remove AWS
   resources" with discard deletes both access points. On
-  TERM the hook pushes unsaved work to the run's `triple-c/wip/<run-id>` branch via a temporary index
-  (the user's index is untouched; needs the task definition's `stopTimeout` raised, 120 s) unless the
-  stop marker says the app handled it. **One WIP branch per task run:** `aws_prepare_run` writes
-  `/run/triple-c/run-id` (`<UTC stamp>-<task id 8 | local>`, task id from ECS task metadata) and
-  `start-epoch` at the very start; `/run/triple-c` is root 0711 (the stop guard keeps that mode — at
-  0700 `claude` could not read the run id). Later pushes force (`+`) only that branch, and a tree equal
-  to `/run/triple-c/wip-last/<folder>` (claude-owned dir, written after a successful push) is skipped;
-  no usable run id (Docker) keeps the per-push stamp. **Setup script** (`TRIPLEC_SETUP_SCRIPT`, unset
-  before the snapshot like `TRIPLEC_FILES`): written to `/run/triple-c-setup/script` (root 0755 dir;
-  root opens `log` and hands the descriptor over, so claude writes nothing there), run as `claude`,
-  `bash -e`, stdin `/dev/null`, `timeout -k 10 1800`, chained after the background clone's `done` in
-  the same background subshell; `status` is `running` from the start until `ok` / `failed <code>`.
-  `triple-c-workspace-status` (python, no secrets) prints `{clone:{done,repos},setup:{state,code,tail}}`.
+  TERM the hook pushes unsaved work to the run's `triple-c/wip/<run-id>-<folder>` branch via a
+  temporary index (the user's index is untouched; needs the task definition's `stopTimeout` raised,
+  120 s) unless the stop marker says the app handled it.
+  **One WIP branch per task run and folder:** `aws_prepare_run` (right after the agent-token block)
+  writes `/run/triple-c/run-id` (`<UTC stamp>-<task id 8 | local>`, task id from ECS task metadata)
+  and `start-epoch`; `/run/triple-c` is root 0711 (the stop guard keeps that mode — at 0700 `claude`
+  could not read the run id). The folder is sanitised to `[A-Za-z0-9._-]` and the ref checked with
+  `git check-ref-format`; later pushes force (`+`) only that run's own branch, and a tree equal to
+  `/run/triple-c/wip-last/<folder>` (claude-owned dir, written after a successful push) is skipped.
+  No usable run id (Docker) keeps a per-push `<stamp>-<folder>`, never forced.
+  **Setup script** (`TRIPLEC_SETUP_SCRIPT`, unset before the snapshot like `TRIPLEC_FILES`): written
+  to `/run/triple-c-setup/script` (root 0755 dir; root opens `log` and hands the descriptor over, so
+  claude writes nothing there), run as `claude`, `bash -e`, stdin `/dev/null`,
+  `timeout -k 10 1800`, chained after the background clone's `done` in the same background
+  subshell; `status` is `running` from the start until `ok` / `failed <code>` (a chain that dies
+  early writes `failed`, so the idle stop is never blocked). `triple-c-workspace-status` (python,
+  no secrets) prints `{clone:{done,repos},setup:{state,code,tail}}`.
   **Lifetime cap** (`TRIPLEC_MAX_LIFETIME_MINUTES`, advisory — sudo can kill it): the idle watcher
-  (started when idle stop *or* the cap is set) pushes best effort, records `lifetime` and TERMs; the
-  hook exits 76 (`aws::tasks::LIFETIME_EXIT_CODE` → `StopKind::LifetimeCap` → `lifetime` toast). The idle watcher runs as root under a supervisor and signals the
+  (started when idle stop *or* a non-zero cap is set) pushes best effort, records `lifetime` and
+  sends TERM; the hook exits 76 (`aws::tasks::LIFETIME_EXIT_CODE` → `StopKind::LifetimeCap` →
+  `lifetime` toast).
+  The idle watcher runs as root under a supervisor and signals the
   entrypoint's own PID (not PID 1, which is docker-init), so idle and ECS stops share one trap.
   Idle = the agent's `last_activity_unix` older than N minutes (open-but-silent attaches/tunnels
   don't count; requests with `X-Triple-C-Background: 1` — the auth bridge's and the file viewer's polls — never do),

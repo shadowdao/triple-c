@@ -192,11 +192,15 @@ check() {
 
 case "$minutes" in
     '') ;;
-    *[!0-9]*|0) echo "triple-c-idle-watch: TRIPLEC_IDLE_STOP_MINUTES must be a positive integer" >&2; exit 2 ;;
+    *[!0-9]*) echo "triple-c-idle-watch: TRIPLEC_IDLE_STOP_MINUTES must be a positive integer" >&2; exit 2 ;;
+    *) minutes=$((10#$minutes))
+       [ "$minutes" -gt 0 ] || { echo "triple-c-idle-watch: TRIPLEC_IDLE_STOP_MINUTES must be a positive integer" >&2; exit 2; } ;;
 esac
 case "$lifetime" in
-    ''|0) lifetime="" ;;
+    '') ;;
     *[!0-9]*) echo "triple-c-idle-watch: TRIPLEC_MAX_LIFETIME_MINUTES must be a whole number of minutes" >&2; exit 2 ;;
+    # Decimal even with leading zeros (`08` is 8); 0, 00, … mean no cap.
+    *) lifetime=$((10#$lifetime)); [ "$lifetime" -gt 0 ] || lifetime="" ;;
 esac
 
 if [ "${1:-}" = "--check" ]; then

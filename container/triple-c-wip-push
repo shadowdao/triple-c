@@ -5,18 +5,23 @@
 # directly under /workspace whose working tree is dirty or which holds commits
 # no remote has, push a snapshot of the *whole* working tree (tracked changes,
 # staged or not, and untracked files .gitignore does not exclude) to
-# refs/heads/triple-c/wip/<run-id> on the repo's remote.
+# refs/heads/triple-c/wip/<run-id>-<folder> on the repo's remote.
 #
-# One branch per task run (phase 6, Q9): <run-id> is the entrypoint's
-# /run/triple-c/run-id, `<UTC yyyymmdd-HHMMSS>-<task id, first 8 | local>`.
+# One branch per task run and folder (phase 6, Q9; ruling R4 — two folders
+# can share a remote, so the folder is part of the name): <run-id> is the
+# entrypoint's /run/triple-c/run-id, `<UTC yyyymmdd-HHMMSS>-<task id, first 8
+# | local>`; <folder> is the folder name with everything outside
+# [A-Za-z0-9._-] made `_`, cut to 64 characters, or — when the ref still is
+# not valid (`git check-ref-format`: `..`, a `.lock` end, …) — the first 12
+# hex digits of the folder name's SHA-256.
 # Later pushes in the same run move that branch (a forced push — the branch is
 # Triple-C's alone, and each WIP commit sits on the user's HEAD, not on the
 # last WIP commit), and a push whose tree equals the one last pushed for that
 # folder in this run is skipped: the tree is recorded after each successful
 # push in /run/triple-c/wip-last/<folder> (made for `claude` by the
 # entrypoint). Without a usable run id (Docker, or a run that recorded none)
-# every push gets its own refs/heads/triple-c/wip/<UTC yyyymmdd-HHMMSS>, never
-# forced.
+# every push gets its own refs/heads/triple-c/wip/<UTC yyyymmdd-HHMMSS>-<folder>,
+# never forced.
 #
 # It never touches the user's index, HEAD, branches or working tree: the
 # snapshot is built in a temporary index (GIT_INDEX_FILE) seeded from a copy of
@@ -74,16 +79,27 @@ shopt -s dotglob nullglob
 stamp=$(date -u +%Y%m%d-%H%M%S)
 failed=0
 
-# This run's branch, when the entrypoint recorded a well-formed run id; the
-# per-push stamp otherwise. Only our own per-run branch is ever force-pushed.
+# This run's id, when the entrypoint recorded a well-formed one; the per-push
+# stamp otherwise. Only our own per-run branches are ever force-pushed.
 run_id=$(head -n 1 "$run_id_file" 2>/dev/null)
 if [[ "$run_id" =~ ^[0-9]{8}-[0-9]{6}-[A-Za-z0-9]{1,32}$ ]]; then
-    ref="refs/heads/triple-c/wip/$run_id"
+    ref_base="refs/heads/triple-c/wip/$run_id"
     force=+
 else
-    ref="refs/heads/triple-c/wip/$stamp"
+    ref_base="refs/heads/triple-c/wip/$stamp"
     force=
 fi
+
+# The WIP ref for folder $1: <base>-<sanitised folder>, or <base>-<hash>.
+wip_ref() {
+    local safe r
+    safe=$(printf '%s' "$1" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_' | cut -c 1-64)
+    r="$ref_base-$safe"
+    if [ -z "$safe" ] || ! git check-ref-format "$r"; then
+        r="$ref_base-$(printf '%s' "$1" | sha256sum | cut -c 1-12)"
+    fi
+    printf '%s' "$r"
+}
 
 # The remote to push to: the branch's upstream remote, else origin, else the
 # only remote. Empty when there is none.
@@ -198,6 +214,7 @@ for dir in "$root"/*/; do
             exit 0
         fi
 
+        ref=$(wip_ref "$folder")
         if [ "$dirty" = true ]; then
             msg="Triple-C WIP ($reason) of $branch at $stamp UTC"
             if [ -n "$head" ]; then
