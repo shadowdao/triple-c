@@ -159,7 +159,8 @@ resource "aws_launch_template" "ec2" {
   # The environment's tasks group (outbound only), named in the template so
   # the admin policy sees it as a launch-template resource. A public IP only
   # where the environment's tasks get one: in a public-subnet environment
-  # the agent reaches ECS through the internet gateway.
+  # the agent, and bridge-network tasks through the instance, reach out
+  # through the internet gateway.
   network_interfaces {
     device_index                = 0
     security_groups             = [local.env.security_group_id]
@@ -167,8 +168,9 @@ resource "aws_launch_template" "ec2" {
     delete_on_termination       = true
   }
 
-  # IMDSv2 only, one hop: the agent (host network) reaches it, bridge
-  # containers don't, and awsvpc tasks are blocked by the agent below.
+  # IMDSv2 only, one hop: the agent (host network) reaches it, while
+  # bridge-network containers are one hop further and their token request
+  # never comes back, so they can't take the instance role's credentials.
   metadata_options {
     http_endpoint               = "enabled"
     http_tokens                 = "required"
@@ -191,7 +193,7 @@ resource "aws_launch_template" "ec2" {
     #!/bin/bash
     cat >>/etc/ecs/ecs.config <<'EOF'
     ECS_CLUSTER=${aws_ecs_cluster.ec2[0].name}
-    ECS_AWSVPC_BLOCK_IMDS=true
+    ECS_ENABLE_TASK_IAM_ROLE=true
     EOF
   EOT
   )

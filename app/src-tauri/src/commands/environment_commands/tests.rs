@@ -253,6 +253,38 @@ fn bundles_contain_the_module_backend_vars_and_readme() {
     }
     assert!(!readme.contains("put-bucket-tagging"), "a later tag can't satisfy the create");
 
+    // The EC2 name-collision check (the app does it too, Task 4): the
+    // exact per-user names, and this user's record to compare against.
+    let record = format!("/triple-c/users/dev/{ok}");
+    for needle in [
+        "BEFORE tofu apply",
+        &format!("aws ecs describe-clusters --region {REGION} --clusters triple-c-dev--u-<tag>"),
+        &format!(
+            "aws autoscaling describe-auto-scaling-groups --region {REGION} \
+             --auto-scaling-group-names triple-c-dev--u-<tag>"
+        ),
+        &format!("aws ssm get-parameter --region {REGION} --name {record}"),
+        "cluster/triple-c-dev--u-<tag>",
+    ] {
+        assert!(readme.contains(needle), "README lacks {needle:?}:\n{readme}");
+    }
+    // With a tag in the variables, the commands name it.
+    let mut tagged = vars.clone();
+    tagged["ec2_instance_type"] = "m7i.large".into();
+    tagged["ec2_user_tag"] = "alice".into();
+    let other = tempfile::tempdir().unwrap();
+    write_bundle(other.path(), d, ACCOUNT, REGION, &tagged).unwrap();
+    let readme_tagged = fs::read_to_string(other.path().join("README.txt")).unwrap();
+    assert!(readme_tagged.contains("--clusters triple-c-dev--u-alice "), "{readme_tagged}");
+    assert!(readme_tagged.contains("--auto-scaling-group-names triple-c-dev--u-alice "));
+    assert!(!readme_tagged.contains("<tag>"));
+    // Not in the other bundles.
+    let env_dir = tempfile::tempdir().unwrap();
+    let env_vars = environment_vars("dev", REGION, &NetworkChoice::Public, 0).unwrap();
+    write_bundle(env_dir.path(), Deployment::Environment("dev"), ACCOUNT, REGION, &env_vars).unwrap();
+    let env_readme = fs::read_to_string(env_dir.path().join("README.txt")).unwrap();
+    assert!(!env_readme.contains("EC2 capacity"), "{env_readme}");
+
     // Writing again over our own files is fine...
     write_bundle(dir.path(), d, ACCOUNT, REGION, &vars).unwrap();
     // ...but an unrelated file (or folder) means the wrong folder.

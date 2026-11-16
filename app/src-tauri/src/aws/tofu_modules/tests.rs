@@ -242,14 +242,8 @@ fn same_user_and_environment_in_two_regions_do_not_collide() {
     assert_ne!(wt, et);
     assert_ne!(we, ee);
     assert_ne!(
-        state_key(Deployment::User {
-            env: "dev",
-            owner_key: &west
-        }),
-        state_key(Deployment::User {
-            env: "dev",
-            owner_key: &east
-        })
+        state_key(Deployment::User { env: "dev", owner_key: &west }),
+        state_key(Deployment::User { env: "dev", owner_key: &east })
     );
 }
 
@@ -367,10 +361,7 @@ fn an_existing_network_is_checked_before_anything_is_built() {
     let lookup = lookups[0];
     assert_eq!(label(lookup, 1), Some("existing"));
     let count = render(attr(&lookup.body, "count").expect("count"));
-    assert!(
-        count.contains("var.network_mode") && count.contains("\"existing\""),
-        "{count}"
-    );
+    assert!(count.contains("var.network_mode") && count.contains("\"existing\""), "{count}");
     assert!(count.contains('2'), "{count}");
     let id = render(attr(&lookup.body, "id").expect("id"));
     assert!(id.contains("var.subnet_ids[count.index]"), "{id}");
@@ -405,10 +396,7 @@ fn the_onboarding_completion_output_waits_for_every_resource() {
     let mut n = 0;
     for r in top_blocks(&body, "resource") {
         let addr = format!("{}.{}", label(r, 0).unwrap(), label(r, 1).unwrap());
-        assert!(
-            deps.contains(&addr),
-            "onboarding_complete doesn't wait for {addr}: {deps}"
-        );
+        assert!(deps.contains(&addr), "onboarding_complete doesn't wait for {addr}: {deps}");
         n += 1;
     }
     assert!(n >= 9, "only {n} resources");
@@ -2604,9 +2592,7 @@ fn the_lifetime_cap_maximum_is_the_same_in_rust_typescript_and_hcl() {
         .find(|(f, _)| *f == "variables.tf")
         .unwrap()
         .1;
-    let block = &vars[vars
-        .find("variable \"max_workspace_hours\"")
-        .expect("the variable")..];
+    let block = &vars[vars.find("variable \"max_workspace_hours\"").expect("the variable")..];
     let block = &block[..block.find("\n}\n").unwrap()];
     assert!(
         block.contains(&format!("var.max_workspace_hours <= {max}")),
@@ -2895,7 +2881,7 @@ fn the_ami_is_the_ecs_optimized_one_for_the_architecture() {
 /// The launch template: the variable's type, IMDSv2 at one hop, an
 /// encrypted 50 GiB gp3 root volume, the environment's tasks group named in
 /// the template, the instance profile, the agent pointed at the user's
-/// cluster with task IMDS blocked, and the default tags on what a launch
+/// cluster with task roles for bridge tasks, and the default tags on what a launch
 /// creates. Never a default-version change (no `ModifyLaunchTemplate`).
 #[test]
 fn the_launch_template_is_pinned() {
@@ -2979,17 +2965,18 @@ fn the_launch_template_is_pinned() {
         "#!/bin/bash",
         ">>/etc/ecs/ecs.config",
         "ECS_CLUSTER=${aws_ecs_cluster.ec2[0].name}\n",
-        "ECS_AWSVPC_BLOCK_IMDS=true\n",
+        // Bridge tasks (R2) get task-role credentials from the agent's
+        // endpoint; IMDS stays out of their reach at hop limit 1.
+        "ECS_ENABLE_TASK_IAM_ROLE=true\n",
     ] {
         assert!(
             user_data.contains(needle),
             "{needle:?} missing from {user_data}"
         );
     }
-    assert!(
-        !user_data.contains("ECS_ENABLE_TASK_ENI"),
-        "no trunking (E3)"
-    );
+    // Bridge networking: no task ENIs, and no awsvpc-only settings.
+    assert!(!user_data.contains("ECS_ENABLE_TASK_ENI"), "{user_data}");
+    assert!(!user_data.contains("AWSVPC"), "{user_data}");
 
     let specs: BTreeSet<String> = top_blocks(b, "tag_specifications")
         .map(|t| {

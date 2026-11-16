@@ -47,7 +47,8 @@ use crate::aws::tofu::{
 };
 use crate::aws::tofu_modules::{
     boundary_vars, environment_vars, module_files, onboarding_vars, owner_key, state_bucket_name,
-    state_key, validate_environment_name, Deployment, ModuleKind, NetworkChoice,
+    state_key, user_ec2_stem, user_record_parameter_name, validate_ec2_user_tag,
+    validate_environment_name, Deployment, ModuleKind, NetworkChoice,
 };
 use crate::aws::{caller_identity, sdk_config, AwsError, CallerIdentity};
 use crate::models::{validate_supported_region, AwsAuth, HostConnection, HostKind};
@@ -415,7 +416,43 @@ const README: &str = "README.txt";
 const BACKEND: &str = "backend.hcl";
 const TFVARS: &str = "terraform.tfvars.json";
 
-fn bundle_readme(d: Deployment, account: &str, region: &str, bucket: &str, key: &str) -> String {
+/// The onboarding bundle's EC2 step: before applying with EC2 capacity, the
+/// admin checks that the per-user names are free or already this user's
+/// (the module can't: a name taken by someone else's onboarding would be
+/// adopted by neither, and a collision only fails at create). `user_tag` is
+/// the bundle's `ec2_user_tag` when set and valid; otherwise the commands
+/// show `<tag>` for the admin to fill in.
+fn ec2_collision_step(env: &str, owner_key: &str, region: &str, user_tag: Option<&str>) -> String {
+    let stem = user_ec2_stem(env, user_tag.unwrap_or("<tag>"));
+    let record = user_record_parameter_name(env, owner_key);
+    format!(
+        "
+EC2 capacity (only if ec2_instance_type is set)
+------------------------------------------------
+ec2_user_tag must be the value of the user's triple-c-user principal tag.
+BEFORE tofu apply, check that the per-user EC2 names are not already in use
+by another onboarding. Run:
+
+    aws ecs describe-clusters --region {region} --clusters {stem} --query 'clusters[?status==`ACTIVE`].clusterName' --output text
+    aws autoscaling describe-auto-scaling-groups --region {region} --auto-scaling-group-names {stem} --query 'AutoScalingGroups[].AutoScalingGroupName' --output text
+    aws ssm get-parameter --region {region} --name {record} --query Parameter.Value --output text
+
+If either of the first two prints {stem}, apply ONLY if the third (this
+user's record) succeeds and its cluster_arn ends in cluster/{stem};
+otherwise the name belongs to someone else's onboarding: stop and choose
+the correct ec2_user_tag. (The app runs the same check before applying.)
+"
+    )
+}
+
+fn bundle_readme(
+    d: Deployment,
+    account: &str,
+    region: &str,
+    bucket: &str,
+    key: &str,
+    vars: &Value,
+) -> String {
     let what = match d {
         Deployment::Environment(env) => format!(
             "the Triple-C environment \"{env}\" (ECS cluster, security group, KMS key, log \
@@ -442,6 +479,15 @@ fn bundle_readme(d: Deployment, account: &str, region: &str, bucket: &str, key: 
         format!(r#"{{"LocationConstraint":"{region}",{tags}}}"#)
     };
     let policy = state_bucket_policy(bucket);
+    let ec2_step = match d {
+        Deployment::User { env, owner_key } => {
+            let tag = vars["ec2_user_tag"]
+                .as_str()
+                .filter(|t| validate_ec2_user_tag(t).is_ok());
+            ec2_collision_step(env, owner_key, region, tag)
+        }
+        _ => String::new(),
+    };
     let credentials = match d {
         Deployment::Boundary => format!(
             "- Credentials of an account administrator for account {account} WITHOUT
@@ -498,7 +544,7 @@ From this folder:
 
 (With Terraform: terraform init -backend-config=backend.hcl, then
 terraform apply.)
-
+{ec2_step}
 3. Remove
 ---------
 From this folder, after tofu init:
@@ -529,7 +575,7 @@ fn bundle_files(
     let json = serde_json::to_string_pretty(vars)
         .map_err(|e| format!("Could not encode the module variables: {e}"))?;
     files.push((TFVARS.into(), json + "\n"));
-    files.push((README.into(), bundle_readme(d, account, &region, &bucket, &key)));
+    files.push((README.into(), bundle_readme(d, account, &region, &bucket, &key, vars)));
     Ok(files)
 }
 
