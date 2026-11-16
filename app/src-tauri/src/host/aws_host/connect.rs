@@ -96,8 +96,13 @@ pub fn connect_env(project: &Project, settings: &AppSettings) -> Vec<(String, Se
     let pairs = crate::docker::workspace_env::workspace_env_with_ca(project, settings, None);
     let custom =
         crate::docker::workspace_env::custom_env_keys(project, &settings.global_custom_env_vars);
+    // With the gateway sidecar, the task's own ANTHROPIC_AUTH_TOKEN (the
+    // sidecar's master key, kept in the secret) is the right one; the
+    // OpenAI-compatible key would override it with one the sidecar refuses.
+    let sidecar = project.aws.as_ref().is_some_and(|a| a.gateway_sidecar);
     credential_pairs(&pairs, &custom)
         .into_iter()
+        .filter(|(k, _)| !(sidecar && k == "ANTHROPIC_AUTH_TOKEN"))
         .map(|(k, v)| (k, Zeroizing::new(v)))
         .collect()
 }

@@ -40,7 +40,10 @@ use crate::aws::tasks::{
 use crate::aws::tofu_modules::{
     environment_cluster_name, log_stream_prefix, owner_key, task_family,
 };
-use crate::aws::workspace::{prepare_workspace, SdkWorkspaceApi, WorkspaceApi};
+use crate::aws::workspace::{
+    gateway_sidecar_problem, new_agent_token, prepare_workspace, GatewayPayload, SdkWorkspaceApi,
+    WorkspaceApi,
+};
 use crate::aws::{caller_identity, sdk_config, CallerIdentity};
 use crate::docker::ca_certs::{container_cert_name, ResolvedCa};
 use crate::models::app_settings::ImageSource;
@@ -149,6 +152,55 @@ pub fn aws_env(project: &Project, settings: &AppSettings) -> Result<AwsEnv, Stri
         p.sandbox_mode_enabled = false;
     }
     crate::docker::workspace_env::workspace_env_from_settings(&p, settings)
+}
+
+/// The gateway sidecar's payload (Q7), owned: its key-free config, the
+/// provider key and a fresh master key.
+pub struct SidecarSecrets {
+    config: String,
+    api_key: zeroize::Zeroizing<String>,
+    master_key: zeroize::Zeroizing<String>,
+}
+
+impl SidecarSecrets {
+    pub fn payload(&self) -> GatewayPayload<'_> {
+        GatewayPayload {
+            config: &self.config,
+            api_key: &self.api_key,
+            master_key: &self.master_key,
+        }
+    }
+}
+
+/// What the gateway sidecar needs for this start, or `None` when the project
+/// doesn't run it. Refuses a project the sidecar can't serve
+/// ([`gateway_sidecar_problem`]) and a missing provider key (`read_api_key`:
+/// the keychain's, Settings → Model Gateway). The master key is new every
+/// task start — only this task's sidecar and workspace know it — so the
+/// Docker gateway's own master key never leaves this machine.
+pub fn gateway_sidecar(
+    project: &Project,
+    settings: &AppSettings,
+    read_api_key: impl FnOnce() -> Result<Option<String>, String>,
+) -> Result<Option<SidecarSecrets>, String> {
+    if !project.aws.as_ref().is_some_and(|a| a.gateway_sidecar) {
+        return Ok(None);
+    }
+    if let Some(problem) = gateway_sidecar_problem(project, &settings.gateway) {
+        return Err(problem);
+    }
+    let api_key = read_api_key()?
+        .filter(|k| !k.trim().is_empty())
+        .ok_or_else(|| {
+            "The LLM gateway sidecar needs the provider API key: set it in Settings → Model \
+             Gateway"
+                .to_string()
+        })?;
+    Ok(Some(SidecarSecrets {
+        config: crate::docker::gateway::sidecar_config(&settings.gateway),
+        api_key: zeroize::Zeroizing::new(api_key),
+        master_key: zeroize::Zeroizing::new(new_agent_token()),
+    }))
 }
 
 /// One file read for the secret, refusing anything over [`MAX_FILE_BYTES`]
@@ -353,6 +405,9 @@ pub struct StartInputs<'a> {
     /// The custom variables' names: credentials under copy-at-connect.
     pub custom_env_keys: &'a [String],
     pub image: &'a str,
+    /// The gateway sidecar's payload, when the project runs it
+    /// ([`gateway_sidecar`]).
+    pub gateway: Option<GatewayPayload<'a>>,
     pub wait: WaitTiming,
     pub access_point_wait: PollTiming,
     /// Called as soon as the project has a task (found, or RunTask
@@ -471,6 +526,7 @@ pub async fn start_core<T: TaskApi, W: WorkspaceApi, R: RuntimeApi, C: Connector
             inp.files,
             inp.custom_env_keys,
             inp.image,
+            inp.gateway,
         )
         .await
         .map_err(s)?;
@@ -610,6 +666,7 @@ pub async fn ensure_started(
     let files = workspace_files(ssh, ca.as_ref())?;
     let custom_env_keys =
         crate::docker::workspace_env::custom_env_keys(project, &settings.global_custom_env_vars);
+    let sidecar = gateway_sidecar(project, settings, crate::storage::secure::get_gateway_api_key)?;
 
     let (connection_id, region, sdk) = project_sdk(project, settings).await?;
     let who = caller_identity(&sdk).await.map_err(s)?;
@@ -626,6 +683,7 @@ pub async fn ensure_started(
             files: &files,
             custom_env_keys: &custom_env_keys,
             image: &image,
+            gateway: sidecar.as_ref().map(SidecarSecrets::payload),
             wait: WaitTiming::default(),
             access_point_wait: PollTiming::default(),
             on_task: &on_task,

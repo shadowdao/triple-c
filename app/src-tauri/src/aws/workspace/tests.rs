@@ -101,6 +101,7 @@ fn sample_plan(storage: StorageMode) -> WorkspacePlan {
         workspace_access_point_id: (storage == StorageMode::Efs)
             .then(|| "fsap-4567efab".to_string()),
         tags: workspace_tags(USER, PROJECT_ID, "dev"),
+        gateway_image: None,
     }
 }
 
@@ -954,7 +955,7 @@ async fn prepare(
     p: &Project,
     env: &[(String, String)],
 ) -> Result<PreparedWorkspace, AwsError> {
-    prepare_workspace(fake, &who(), &env_info(), p, env, &[], &[], IMAGE).await
+    prepare_workspace(fake, &who(), &env_info(), p, env, &[], &[], IMAGE, None).await
 }
 
 #[tokio::test]
@@ -964,7 +965,7 @@ async fn prepare_puts_the_setup_script_and_the_environments_cap_in_the_secret() 
     p.aws.as_mut().unwrap().setup_script = Some("sudo apt-get install -y jq".into());
     let mut env = env_info();
     env.max_workspace_hours = 12;
-    prepare_workspace(&fake, &who(), &env, &p, &[], &[], &[], IMAGE).await.unwrap();
+    prepare_workspace(&fake, &who(), &env, &p, &[], &[], &[], IMAGE, None).await.unwrap();
     let m = payload_map(&fake.secrets.lock().unwrap()[0].2);
     assert_eq!(m["TRIPLEC_SETUP_SCRIPT"], "sudo apt-get install -y jq");
     assert_eq!(m["TRIPLEC_MAX_LIFETIME_MINUTES"], "720");
@@ -1388,6 +1389,7 @@ async fn files_travel_in_the_secret_only() {
         &files,
         &[],
         IMAGE,
+        None,
     )
     .await
     .unwrap();
@@ -1627,7 +1629,7 @@ async fn prepare_leaves_the_credentials_out_of_a_copy_at_connect_secret() {
     p.aws.as_mut().unwrap().secrets_delivery = crate::models::project::SecretsDelivery::CopyAtConnect;
     let files = vec![("ssh/id_ed25519".to_string(), b"PRIVATE KEY".to_vec())];
     let env = pairs(&[("GIT_TOKEN", "ghp_secret"), ("MINE", "x"), ("TZ", "UTC")]);
-    prepare_workspace(&fake, &who(), &env_info(), &p, &env, &files, &["MINE".to_string()], IMAGE)
+    prepare_workspace(&fake, &who(), &env_info(), &p, &env, &files, &["MINE".to_string()], IMAGE, None)
         .await
         .unwrap();
     let m = payload_map(&fake.secrets.lock().unwrap()[0].2);
@@ -1651,7 +1653,7 @@ async fn switching_to_copy_at_connect_replaces_a_secret_that_held_credentials() 
         Some(r#"{"GIT_TOKEN":"ghp_old","TRIPLEC_AGENT_TOKEN":"t","TZ":"UTC"}"#.into());
     *fake.pending_puts.lock().unwrap() = 2; // AWS still finishing the delete
     let env = pairs(&[("GIT_TOKEN", "ghp_new"), ("TZ", "UTC")]);
-    prepare_workspace(&fake, &who(), &env_info(), &copy_at_connect_project(), &env, &[], &[], IMAGE)
+    prepare_workspace(&fake, &who(), &env_info(), &copy_at_connect_project(), &env, &[], &[], IMAGE, None)
         .await
         .unwrap();
     assert_eq!(*fake.secret_reads.lock().unwrap(), 1, "read only once it exists");
@@ -1664,7 +1666,7 @@ async fn switching_to_copy_at_connect_replaces_a_secret_that_held_credentials() 
     *fake.existing_secret.lock().unwrap() = Some(
         r#"{"TRIPLEC_AGENT_TOKEN":"t","TRIPLEC_CREDENTIALS":"connect","TZ":"UTC","TRIPLEC_REPOS":"[]"}"#.into(),
     );
-    prepare_workspace(&fake, &who(), &env_info(), &copy_at_connect_project(), &env, &[], &[], IMAGE)
+    prepare_workspace(&fake, &who(), &env_info(), &copy_at_connect_project(), &env, &[], &[], IMAGE, None)
         .await
         .unwrap();
     assert!(fake.deleted_secrets.lock().unwrap().is_empty());
@@ -1673,7 +1675,7 @@ async fn switching_to_copy_at_connect_replaces_a_secret_that_held_credentials() 
     // No secret yet (a first start): created, never read — a read of a
     // secret that doesn't exist may be refused — nothing deleted.
     let fake = Fake::onboarded();
-    prepare_workspace(&fake, &who(), &env_info(), &copy_at_connect_project(), &env, &[], &[], IMAGE)
+    prepare_workspace(&fake, &who(), &env_info(), &copy_at_connect_project(), &env, &[], &[], IMAGE, None)
         .await
         .unwrap();
     assert_eq!(*fake.creates.lock().unwrap(), 1);
@@ -1738,4 +1740,278 @@ fn a_copy_at_connect_payload_drops_the_custom_variables_fingerprint() {
     };
     assert!(!with(Some(&custom)).contains_key("TRIPLE_C_CUSTOM_ENV"));
     assert_eq!(with(None)["TRIPLE_C_CUSTOM_ENV"], "63ce86");
+}
+
+// ------------------------------------------------------- gateway sidecar (Q7)
+
+const GW_CONFIG: &str = "model_list: []\ngeneral_settings:\n  master_key: \"os.environ/TRIPLEC_GATEWAY_MASTER_KEY\"\n";
+
+fn gw() -> GatewayPayload<'static> {
+    GatewayPayload { config: GW_CONFIG, api_key: "sk-provider", master_key: "mk-sidecar" }
+}
+
+fn sidecar_plan(storage: StorageMode) -> WorkspacePlan {
+    let mut p = sample_plan(storage);
+    p.secret_keys = vec![
+        "ANTHROPIC_AUTH_TOKEN".into(),
+        "ANTHROPIC_BASE_URL".into(),
+        "GIT_TOKEN".into(),
+        "TRIPLEC_AGENT_TOKEN".into(),
+        "TRIPLEC_GATEWAY_API_KEY".into(),
+        "TRIPLEC_GATEWAY_CONFIG".into(),
+        "TRIPLEC_GATEWAY_MASTER_KEY".into(),
+    ];
+    p.gateway_image = Some(crate::docker::gateway::registry_image_ref());
+    p
+}
+
+fn secret_names(c: &aws_sdk_ecs::types::ContainerDefinition) -> Vec<String> {
+    c.secrets().iter().map(|s| s.name().to_string()).collect()
+}
+
+#[test]
+fn a_sidecar_request_has_a_non_essential_gateway_with_only_its_three_keys() {
+    let plan = sidecar_plan(StorageMode::Hybrid);
+    let req = task_definition_request(&plan);
+    let defs = req.container_definitions();
+    assert_eq!(defs.len(), 2);
+    let (ws, gw) = (&defs[0], &defs[1]);
+    assert_eq!(ws.name(), Some("workspace"));
+    assert_eq!(ws.essential(), Some(true));
+    // The workspace gets everything but the sidecar's keys.
+    assert_eq!(
+        secret_names(ws),
+        ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "GIT_TOKEN", "TRIPLEC_AGENT_TOKEN"]
+    );
+
+    assert_eq!(gw.name(), Some("gateway"));
+    assert_eq!(gw.essential(), Some(false));
+    assert_eq!(
+        gw.image(),
+        Some("ghcr.io/berriai/litellm@sha256:37e2dafb088a7723beb998590682957386dfc83ffea1848486f8e0e5cfac0b06")
+    );
+    assert_eq!(gw.memory_reservation(), Some(512));
+    assert_eq!(
+        secret_names(gw),
+        ["TRIPLEC_GATEWAY_API_KEY", "TRIPLEC_GATEWAY_CONFIG", "TRIPLEC_GATEWAY_MASTER_KEY"]
+    );
+    for s in gw.secrets() {
+        assert_eq!(s.value_from(), format!("{SECRET_ARN}:{}::", s.name()));
+    }
+    // P1: no project data in the definition — no environment at all.
+    assert!(gw.environment().is_empty());
+    // Nothing waits on the gateway and it waits on nothing.
+    assert!(gw.depends_on().is_empty() && ws.depends_on().is_empty());
+    assert!(gw.health_check().is_none());
+    // The command: config to a root-only file, LiteLLM on loopback 4000.
+    assert_eq!(gw.entry_point(), ["/bin/sh", "-c"]);
+    assert_eq!(gw.command(), [GATEWAY_COMMAND]);
+    assert!(GATEWAY_COMMAND.contains("--host 127.0.0.1 --port 4000"));
+    assert!(GATEWAY_COMMAND.contains("> /tmp/litellm.yaml"));
+    assert!(GATEWAY_COMMAND.contains("--config /tmp/litellm.yaml"));
+    assert!(!GATEWAY_COMMAND.contains("0.0.0.0"));
+    assert_eq!(
+        GATEWAY_SIDECAR_URL,
+        format!("http://127.0.0.1:{}", crate::host::port_forwards::GATEWAY_SIDECAR_PORT)
+    );
+    // Same log group and prefix: awslogs names its streams
+    // `<prefix>/gateway/<task-id>`, apart from the workspace's.
+    let opts = gw.log_configuration().unwrap().options().unwrap();
+    assert_eq!(opts["awslogs-group"], plan.log_group);
+    assert_eq!(opts["awslogs-region"], plan.region);
+    assert_eq!(opts["awslogs-stream-prefix"], plan.log_stream_prefix);
+    // The fingerprint label rides on the workspace container, where
+    // `describe_task_definition` reads it.
+    assert!(ws.docker_labels().unwrap().contains_key(FINGERPRINT_LABEL));
+}
+
+#[test]
+fn the_sidecar_changes_the_fingerprint_and_off_leaves_requests_as_they_were() {
+    for storage in [StorageMode::Ephemeral, StorageMode::Hybrid, StorageMode::Efs] {
+        let off = sample_plan(storage);
+        assert_eq!(task_definition_request(&off).container_definitions().len(), 1);
+        let mut on = off.clone();
+        on.gateway_image = Some("img@sha256:x".into());
+        assert_ne!(workspace_fingerprint(&on), workspace_fingerprint(&off));
+        let mut other = on.clone();
+        other.gateway_image = Some("img@sha256:y".into());
+        assert_ne!(workspace_fingerprint(&on), workspace_fingerprint(&other));
+    }
+    // (The pinned Hybrid/Ephemeral values are in
+    // `hybrid_and_ephemeral_requests_are_unchanged_by_efs_mode`.)
+}
+
+#[test]
+fn a_sidecar_payload_points_claude_code_at_it_and_carries_its_keys() {
+    let env = pairs(&[
+        ("ANTHROPIC_BASE_URL", "http://host.docker.internal:4000"),
+        ("ANTHROPIC_AUTH_TOKEN", "sk-local"),
+        ("ANTHROPIC_MODEL", "gpt-5"),
+        ("GIT_TOKEN", "ghp"),
+    ]);
+    let repos = project(StorageMode::Hybrid).aws.unwrap().repos;
+    for connect in [false, true] {
+        let custom: Vec<String> = Vec::new();
+        let m = payload_map(
+            &project_secret_payload_with(
+                &env,
+                "tok",
+                &[],
+                &repos,
+                true,
+                None,
+                StorageMode::Hybrid,
+                PayloadExtras {
+                    connect_only: connect.then_some(&custom[..]),
+                    gateway: Some(gw()),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        assert_eq!(m["ANTHROPIC_BASE_URL"], "http://127.0.0.1:4000");
+        // R1: the sidecar's token and keys stay, copy-at-connect or not.
+        assert_eq!(m["ANTHROPIC_AUTH_TOKEN"], "mk-sidecar", "connect={connect}");
+        assert_eq!(m["TRIPLEC_GATEWAY_MASTER_KEY"], "mk-sidecar");
+        assert_eq!(m["TRIPLEC_GATEWAY_API_KEY"], "sk-provider");
+        assert_eq!(m["TRIPLEC_GATEWAY_CONFIG"], GW_CONFIG);
+        assert_eq!(m["ANTHROPIC_MODEL"], "gpt-5");
+        // Other credentials still follow the delivery.
+        assert_eq!(m.contains_key("GIT_TOKEN"), !connect);
+    }
+    // Off: the env pairs as they are, no gateway key.
+    let m = payload_map(
+        &project_secret_payload_with(&env, "tok", &[], &repos, true, None, StorageMode::Hybrid, PayloadExtras::default())
+            .unwrap(),
+    );
+    assert_eq!(m["ANTHROPIC_BASE_URL"], "http://host.docker.internal:4000");
+    assert_eq!(m["ANTHROPIC_AUTH_TOKEN"], "sk-local");
+    assert!(!m.keys().any(|k| k.starts_with("TRIPLEC_GATEWAY_")));
+}
+
+#[test]
+fn custom_env_cannot_forge_the_gateway_keys() {
+    let env = pairs(&[("TRIPLEC_GATEWAY_CONFIG", "evil"), ("TRIPLEC_GATEWAY_MASTER_KEY", "x")]);
+    let m = payload_map(
+        &project_secret_payload_with(&env, "t", &[], &[], true, None, StorageMode::Ephemeral, PayloadExtras::default())
+            .unwrap(),
+    );
+    assert!(!m.keys().any(|k| k.starts_with("TRIPLEC_GATEWAY_")));
+}
+
+#[test]
+fn a_gateway_payloads_debug_shows_no_key() {
+    let shown = format!("{:?}", PayloadExtras { gateway: Some(gw()), ..Default::default() });
+    assert!(!shown.contains("sk-provider") && !shown.contains("mk-sidecar"), "{shown}");
+}
+
+fn sidecar_project() -> Project {
+    let mut p = project(StorageMode::Ephemeral);
+    p.backend = crate::models::project::Backend::OpenAiCompatible;
+    p.aws.as_mut().unwrap().gateway_sidecar = true;
+    p
+}
+
+#[tokio::test]
+async fn prepare_registers_the_sidecar_only_when_the_project_runs_it() {
+    let fake = Fake::onboarded();
+    let p = sidecar_project();
+    prepare_workspace(&fake, &who(), &env_info(), &p, &[], &[], &[], IMAGE, Some(gw()))
+        .await
+        .unwrap();
+    assert_eq!(fake.registered.lock().unwrap()[0].container_definitions().len(), 2);
+    let m = payload_map(&fake.secrets.lock().unwrap()[0].2);
+    assert_eq!(m["TRIPLEC_GATEWAY_API_KEY"], "sk-provider");
+
+    // Toggle off: a payload handed in anyway is ignored.
+    let fake = Fake::onboarded();
+    prepare_workspace(&fake, &who(), &env_info(), &project(StorageMode::Ephemeral), &[], &[], &[], IMAGE, Some(gw()))
+        .await
+        .unwrap();
+    assert_eq!(fake.registered.lock().unwrap()[0].container_definitions().len(), 1);
+    let m = payload_map(&fake.secrets.lock().unwrap()[0].2);
+    assert!(!m.keys().any(|k| k.starts_with("TRIPLEC_GATEWAY_")));
+}
+
+#[tokio::test]
+async fn prepare_refuses_a_sidecar_without_its_payload_or_with_an_oversized_config() {
+    let fake = Fake::onboarded();
+    let p = sidecar_project();
+    let e = prepare_workspace(&fake, &who(), &env_info(), &p, &[], &[], &[], IMAGE, None)
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("gateway"), "{e}");
+    let big = "x".repeat(MAX_GATEWAY_CONFIG_BYTES + 1);
+    let e = prepare_workspace(
+        &fake,
+        &who(),
+        &env_info(),
+        &p,
+        &[],
+        &[],
+        &[],
+        IMAGE,
+        Some(GatewayPayload { config: &big, ..gw() }),
+    )
+    .await
+    .unwrap_err();
+    assert!(e.to_string().contains("gateway configuration"), "{e}");
+    let e = prepare_workspace(
+        &fake,
+        &who(),
+        &env_info(),
+        &p,
+        &[],
+        &[],
+        &[],
+        IMAGE,
+        Some(GatewayPayload { api_key: " ", ..gw() }),
+    )
+    .await
+    .unwrap_err();
+    assert!(e.to_string().contains("API key"), "{e}");
+    assert_eq!(fake.writes(), 0);
+}
+
+#[test]
+fn the_sidecar_needs_the_openai_backend_and_a_gateway_model() {
+    use crate::models::gateway_settings::{GatewayModel, GatewaySettings};
+    let models = GatewaySettings {
+        models: vec![GatewayModel { name: "gpt".into(), model_id: "gpt-5".into() }],
+        ..Default::default()
+    };
+    let p = sidecar_project();
+    assert_eq!(gateway_sidecar_problem(&p, &models), None);
+    assert!(gateway_sidecar_problem(&p, &GatewaySettings::default())
+        .unwrap()
+        .contains("Settings → Model Gateway"));
+    let mut anthropic = p.clone();
+    anthropic.backend = crate::models::project::Backend::Anthropic;
+    assert!(gateway_sidecar_problem(&anthropic, &models).unwrap().contains("OpenAI Compatible"));
+    // Off: nothing to say, whatever the backend.
+    anthropic.aws.as_mut().unwrap().gateway_sidecar = false;
+    assert_eq!(gateway_sidecar_problem(&anthropic, &GatewaySettings::default()), None);
+}
+
+#[test]
+fn the_sidecars_token_is_not_a_leftover_credential_but_a_dropped_provider_key_is() {
+    let new: BTreeMap<String, String> = [
+        ("ANTHROPIC_AUTH_TOKEN", "mk-new"),
+        ("TRIPLEC_GATEWAY_MASTER_KEY", "mk-new"),
+        ("TRIPLEC_GATEWAY_API_KEY", "sk"),
+        ("TRIPLEC_AGENT_TOKEN", "t"),
+    ]
+    .iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    let holds = |old: &str, new: &BTreeMap<String, String>| holds_credentials(old, new, &[]);
+    // Last start's sidecar key (a different random one): not a credential.
+    let sidecar_old = r#"{"ANTHROPIC_AUTH_TOKEN":"mk-old","TRIPLEC_GATEWAY_MASTER_KEY":"mk-old","TRIPLEC_GATEWAY_API_KEY":"sk","TRIPLEC_AGENT_TOKEN":"t"}"#;
+    assert!(!holds(sidecar_old, &new));
+    // A user's own token from a Secrets Manager period is.
+    assert!(holds(r#"{"ANTHROPIC_AUTH_TOKEN":"sk-user","TRIPLEC_AGENT_TOKEN":"t"}"#, &new));
+    // Sidecar turned off: the provider key left in the secret counts.
+    let off: BTreeMap<String, String> =
+        [("TRIPLEC_AGENT_TOKEN", "t")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    assert!(holds(sidecar_old, &off));
 }

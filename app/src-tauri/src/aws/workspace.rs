@@ -83,6 +83,23 @@ const KEY_MAX_LIFETIME: &str = "TRIPLEC_MAX_LIFETIME_MINUTES";
 /// `connect` when the credentials are copied in at connect (Q2) and so are
 /// not in the secret; absent otherwise.
 const KEY_CREDENTIALS: &str = "TRIPLEC_CREDENTIALS";
+/// The gateway sidecar's three keys (Q7): its LiteLLM config (key-free,
+/// `os.environ/…` references) and the two keys it references. Only the
+/// `gateway` container gets them; under copy-at-connect they stay in the
+/// secret all the same (R1: the sidecar starts before any connect).
+const KEY_GATEWAY_CONFIG: &str = "TRIPLEC_GATEWAY_CONFIG";
+const KEY_GATEWAY_API_KEY: &str = crate::docker::gateway::SIDECAR_API_KEY_ENV;
+const KEY_GATEWAY_MASTER_KEY: &str = crate::docker::gateway::SIDECAR_MASTER_KEY_ENV;
+const GATEWAY_KEYS: [&str; 3] = [KEY_GATEWAY_API_KEY, KEY_GATEWAY_CONFIG, KEY_GATEWAY_MASTER_KEY];
+/// The sidecar container's name.
+pub const GATEWAY_CONTAINER_NAME: &str = "gateway";
+/// Where the workspace reaches the sidecar: the task's shared loopback
+/// (awsvpc), LiteLLM bound to 127.0.0.1 only.
+pub const GATEWAY_SIDECAR_URL: &str = "http://127.0.0.1:4000";
+/// The sidecar's soft memory limit (MiB).
+pub const GATEWAY_MEMORY_RESERVATION_MIB: i32 = 512;
+/// Largest sidecar config, in bytes (the constraints' budget).
+pub const MAX_GATEWAY_CONFIG_BYTES: usize = 8_192;
 /// Seconds ECS waits after SIGTERM before SIGKILL (Fargate allows 2–120).
 pub const STOP_TIMEOUT_SECS: i32 = 120;
 
@@ -152,6 +169,57 @@ pub struct PayloadExtras<'a> {
     /// `connect`; the app copies them in after each connect instead.
     /// `None`: everything is in the secret (Secrets Manager delivery).
     pub connect_only: Option<&'a [String]>,
+    /// The LLM gateway sidecar (Q7), when the project runs it.
+    pub gateway: Option<GatewayPayload<'a>>,
+}
+
+/// What the gateway sidecar's payload keys carry. The workspace's
+/// `ANTHROPIC_AUTH_TOKEN` is `master_key` too.
+#[derive(Clone, Copy)]
+pub struct GatewayPayload<'a> {
+    /// `docker::gateway::sidecar_config`: no key in it.
+    pub config: &'a str,
+    /// The provider key (Settings → Model Gateway).
+    pub api_key: &'a str,
+    /// The sidecar's own LiteLLM master key.
+    pub master_key: &'a str,
+}
+
+/// Keys never appear.
+impl std::fmt::Debug for GatewayPayload<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GatewayPayload")
+            .field("config_bytes", &self.config.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Why `project` can't run the gateway sidecar with `gateway` (Settings →
+/// Model Gateway), or `None` when it can or doesn't ask to. It needs the
+/// OpenAI-compatible backend (Claude Code then talks to the sidecar) and at
+/// least one complete model row.
+pub fn gateway_sidecar_problem(
+    project: &Project,
+    gateway: &crate::models::gateway_settings::GatewaySettings,
+) -> Option<String> {
+    if !project.aws.as_ref().is_some_and(|a| a.gateway_sidecar) {
+        return None;
+    }
+    if project.backend != crate::models::project::Backend::OpenAiCompatible {
+        return Some(
+            "The LLM gateway sidecar needs the OpenAI Compatible backend: choose it in the \
+             project's Model section, or turn the sidecar off"
+                .into(),
+        );
+    }
+    if gateway.valid_models().is_empty() {
+        return Some(
+            "The LLM gateway sidecar has no models to serve: add at least one in Settings → \
+             Model Gateway (a name and a provider model id)"
+                .into(),
+        );
+    }
+    None
 }
 
 /// `workspace_env`'s fingerprint of the custom variables' values.
@@ -195,6 +263,9 @@ fn payload_map(
         KEY_SETUP_SCRIPT,
         KEY_MAX_LIFETIME,
         KEY_CREDENTIALS,
+        KEY_GATEWAY_CONFIG,
+        KEY_GATEWAY_API_KEY,
+        KEY_GATEWAY_MASTER_KEY,
     ];
     let mut m = BTreeMap::new();
     for (k, v) in env_pairs {
@@ -245,7 +316,17 @@ fn payload_map(
     // so its `TRIPLEC_GATEWAY_*` keys are added as payload keys here and stay
     // in the secret even under copy-at-connect (the UI says so). They are
     // payload keys, not env pairs, so the credential filter above never
-    // touches them.
+    // touches them. The workspace's Claude Code talks to the sidecar: its
+    // base URL and token (the sidecar's master key) replace whatever the
+    // OpenAI-compatible settings say, and the token stays in the secret like
+    // the gateway's keys — scheduled jobs run before any connect too.
+    if let Some(g) = extras.gateway {
+        m.insert("ANTHROPIC_BASE_URL".into(), GATEWAY_SIDECAR_URL.into());
+        m.insert("ANTHROPIC_AUTH_TOKEN".into(), g.master_key.into());
+        m.insert(KEY_GATEWAY_CONFIG.into(), g.config.into());
+        m.insert(KEY_GATEWAY_API_KEY.into(), g.api_key.into());
+        m.insert(KEY_GATEWAY_MASTER_KEY.into(), g.master_key.into());
+    }
     m.insert(KEY_REPOS.into(), json(&repos));
     m.insert(KEY_WIP_PUSH.into(), if wip { "1" } else { "0" }.into());
     if let Some(minutes) = idle {
@@ -389,6 +470,9 @@ pub struct WorkspacePlan {
     /// The `/workspace` access point; used only when `storage` is EFS.
     pub workspace_access_point_id: Option<String>,
     pub tags: Vec<(String, String)>,
+    /// The gateway sidecar's image (Q7) when the project runs it; `None`
+    /// leaves the request exactly as it was before the sidecar existed.
+    pub gateway_image: Option<String>,
 }
 
 /// sha256 (hex) over the task definition `plan` produces, minus the label
@@ -483,18 +567,12 @@ fn build_request(plan: &WorkspacePlan) -> RegisterTaskDefinitionInput {
                 .map(|(k, v)| KeyValuePair::builder().name(*k).value(*v).build())
                 .collect(),
         ))
-        .set_secrets(Some(
-            plan.secret_keys
-                .iter()
-                .map(|k| {
-                    Secret::builder()
-                        .name(k)
-                        .value_from(format!("{}:{k}::", plan.secret_arn))
-                        .build()
-                        .expect(BUILT)
-                })
-                .collect(),
-        ))
+        // Everything but the sidecar's keys: the workspace has no use for the
+        // provider key (its token, the master key, is ANTHROPIC_AUTH_TOKEN).
+        .set_secrets(Some(secrets(
+            plan,
+            plan.secret_keys.iter().filter(|k| !GATEWAY_KEYS.contains(&k.as_str())),
+        )))
         .health_check(
             HealthCheck::builder()
                 .command("CMD-SHELL")
@@ -568,6 +646,9 @@ fn build_request(plan: &WorkspacePlan) -> RegisterTaskDefinitionInput {
                 .map(|(k, v)| Tag::builder().key(k).value(v).build())
                 .collect(),
         ));
+    if let Some(image) = &plan.gateway_image {
+        req = req.container_definitions(gateway_container(plan, image));
+    }
     for (name, (fs, ap)) in [(HOME_VOLUME, hybrid), (WORKSPACE_VOLUME, workspace)]
         .into_iter()
         .filter_map(|(n, v)| v.map(|v| (n, v)))
@@ -575,6 +656,58 @@ fn build_request(plan: &WorkspacePlan) -> RegisterTaskDefinitionInput {
         req = req.volumes(efs_volume(name, fs, ap));
     }
     req.build().expect(BUILT)
+}
+
+/// `secrets` entries for `keys`, each by `valueFrom: <arn>:<KEY>::`.
+fn secrets<'k>(plan: &WorkspacePlan, keys: impl Iterator<Item = &'k String>) -> Vec<Secret> {
+    keys.map(|k| {
+        Secret::builder()
+            .name(k)
+            .value_from(format!("{}:{k}::", plan.secret_arn))
+            .build()
+            .expect("every required field is set")
+    })
+    .collect()
+}
+
+/// The sidecar's shell command: write the config to a root-only file, then
+/// replace the shell with LiteLLM on the task's loopback only. The pinned
+/// image's ENTRYPOINT (`docker/prod_entrypoint.sh`) only `exec`s `litellm`
+/// with its arguments, so the entry point is replaced by its `/bin/sh`
+/// (busybox; `printf` is a builtin, `litellm` is on PATH — checked against
+/// the pinned digest). The config variable is unset before LiteLLM starts;
+/// the two key variables stay, since the config references them.
+pub const GATEWAY_COMMAND: &str = "umask 077 && printf '%s' \"$TRIPLEC_GATEWAY_CONFIG\" > \
+     /tmp/litellm.yaml && unset TRIPLEC_GATEWAY_CONFIG && exec litellm --config \
+     /tmp/litellm.yaml --host 127.0.0.1 --port 4000";
+
+/// The non-essential `gateway` container (Q7): the pinned LiteLLM image,
+/// exactly the three gateway keys as secrets and no `environment` (P1), the
+/// same log group (its streams are `<prefix>/gateway/<task-id>`, apart from
+/// the workspace's), 512 MiB reserved. Nothing waits on it: the workspace
+/// starts, and stays up, whether or not the gateway does.
+fn gateway_container(plan: &WorkspacePlan, image: &str) -> ContainerDefinition {
+    const BUILT: &str = "every required field is set";
+    let keys: Vec<String> = GATEWAY_KEYS.iter().map(|k| k.to_string()).collect();
+    ContainerDefinition::builder()
+        .name(GATEWAY_CONTAINER_NAME)
+        .image(image)
+        .essential(false)
+        .memory_reservation(GATEWAY_MEMORY_RESERVATION_MIB)
+        .entry_point("/bin/sh")
+        .entry_point("-c")
+        .command(GATEWAY_COMMAND)
+        .set_secrets(Some(secrets(plan, keys.iter())))
+        .log_configuration(
+            LogConfiguration::builder()
+                .log_driver(LogDriver::Awslogs)
+                .options("awslogs-group", &plan.log_group)
+                .options("awslogs-region", &plan.region)
+                .options("awslogs-stream-prefix", &plan.log_stream_prefix)
+                .build()
+                .expect(BUILT),
+        )
+        .build()
 }
 
 /// An EFS volume through an access point, IAM-authorised, TLS in transit.
@@ -782,6 +915,7 @@ pub async fn prepare_workspace<W: WorkspaceApi>(
     files: &[(String, Vec<u8>)],
     custom_env_keys: &[String],
     image: &str,
+    gateway: Option<GatewayPayload<'_>>,
 ) -> Result<PreparedWorkspace, AwsError> {
     let (Some(placement), Some(cfg)) = (project.aws_placement.as_ref(), project.aws.as_ref())
     else {
@@ -809,6 +943,30 @@ pub async fn prepare_workspace<W: WorkspaceApi>(
     if image.trim().is_empty() {
         return Err(other("No container image is set for AWS"));
     }
+    // The sidecar runs when the project asks for it, and only then.
+    let gateway = match (cfg.gateway_sidecar, gateway) {
+        (false, _) => None,
+        (true, None) => {
+            return Err(other("The LLM gateway sidecar's configuration was not prepared"))
+        }
+        (true, Some(g)) => {
+            if g.config.len() > MAX_GATEWAY_CONFIG_BYTES {
+                return Err(other(format!(
+                    "The LLM gateway configuration is {} bytes; the sidecar's limit is {} \
+                     (fewer models in Settings → Model Gateway)",
+                    g.config.len(),
+                    MAX_GATEWAY_CONFIG_BYTES
+                )));
+            }
+            if g.api_key.trim().is_empty() || g.master_key.trim().is_empty() {
+                return Err(other(
+                    "The LLM gateway sidecar needs the provider API key: set it in Settings → \
+                     Model Gateway",
+                ));
+            }
+            Some(g)
+        }
+    };
 
     let ok = owner_key(region, &who.user_id);
     let tags = workspace_tags(&who.user_id, &project.id, &env.name);
@@ -826,6 +984,7 @@ pub async fn prepare_workspace<W: WorkspaceApi>(
             max_workspace_hours: env.max_workspace_hours,
             connect_only: (cfg.secrets_delivery == SecretsDelivery::CopyAtConnect)
                 .then_some(custom_env_keys),
+            gateway,
         },
     )
     .map_err(other)?;
@@ -932,6 +1091,7 @@ pub async fn prepare_workspace<W: WorkspaceApi>(
         access_point_id: access_point_id.clone(),
         workspace_access_point_id: workspace_access_point_id.clone(),
         tags,
+        gateway_image: gateway.map(|_| crate::docker::gateway::registry_image_ref()),
     };
     let fingerprint = workspace_fingerprint(&plan);
     let task_definition_arn =
@@ -989,11 +1149,19 @@ pub fn holds_credentials(old: &str, new: &BTreeMap<String, String>, custom: &[St
     let Ok(old) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(old) else {
         return true;
     };
+    // The gateway sidecar's token is its own random master key (R1 keeps it
+    // in the secret), not a credential of the user's.
+    let sidecar_token = |k: &str| {
+        k == "ANTHROPIC_AUTH_TOKEN"
+            && old.get(k).is_some_and(|v| Some(v) == old.get(KEY_GATEWAY_MASTER_KEY))
+    };
     old.keys().any(|k| {
         k == KEY_FILES
             || k == CUSTOM_ENV_FINGERPRINT
-            || is_credential_key(k, custom)
+            || (is_credential_key(k, custom) && !sidecar_token(k))
             || (!k.starts_with("TRIPLEC_") && !new.contains_key(k))
+            // The provider key, once the sidecar is off.
+            || (k == KEY_GATEWAY_API_KEY && !new.contains_key(k))
     })
 }
 

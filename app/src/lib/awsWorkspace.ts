@@ -1,6 +1,7 @@
 import type {
   AwsWorkspaceConfig,
   DetectedEnvironment,
+  GatewaySettings,
   Project,
   RepoSource,
   UnsavedWork,
@@ -152,7 +153,40 @@ export const COPY_AT_CONNECT_WARNINGS = [
 export const COPY_AT_CONNECT_SSH_NOTE =
   "~/.ssh is not kept on EFS: SSH keys copied in, or made in the workspace, are gone when it stops. Keys an earlier start left in /mnt/triple-c-home/.ssh stay there until you remove them.";
 export const COPY_AT_CONNECT_GATEWAY_NOTE =
-  "The LLM gateway's keys are still stored in AWS: the gateway starts before Triple-C connects.";
+  "The LLM gateway's keys are still stored in AWS: the gateway starts before Triple-C connects. So is Claude Code's token for it (ANTHROPIC_AUTH_TOKEN), which scheduled jobs need.";
+
+/** The LLM gateway sidecar (phase 6 Q7), in ModelSection. */
+export const GATEWAY_SIDECAR_LABEL = "Run Triple-C's LLM gateway in the workspace";
+export const GATEWAY_SIDECAR_HINT =
+  "Runs the gateway from Settings → Model Gateway (same models, provider and API key) next to the workspace, on its own localhost:4000. Claude Code uses it instead of the base URL and API key below; set the model to one of the gateway's model names.";
+export const GATEWAY_SIDECAR_ON_NOTE =
+  "Claude Code talks to the gateway in the workspace (http://127.0.0.1:4000) with a key made for each start. The provider API key is stored in the project's AWS secret, whichever way credentials are delivered.";
+/** Mirrors Rust `validate_aws_workspace`'s sidecar minimum. */
+export const GATEWAY_SIDECAR_MIN_CPU = 1024;
+export const GATEWAY_SIDECAR_MIN_MEMORY_MIB = 2048;
+
+/**
+ * Why `project` can't turn the gateway sidecar on, or null. Mirrors Rust
+ * `gateway_sidecar_problem` (OpenAI-compatible backend, a complete gateway
+ * model) plus the 1 vCPU / 2 GiB minimum.
+ */
+export function gatewaySidecarProblem(
+  project: Pick<Project, "backend" | "aws">,
+  gateway: Pick<GatewaySettings, "models"> | null,
+): string | null {
+  if (project.backend !== "open_ai_compatible") {
+    return "The LLM gateway sidecar needs the OpenAI Compatible backend.";
+  }
+  const models = (gateway?.models ?? []).filter((m) => m.name.trim() && m.model_id.trim());
+  if (models.length === 0) {
+    return "Add at least one model in Settings → Model Gateway first (a name and a provider model id).";
+  }
+  const aws = project.aws;
+  if (aws && (aws.cpu < GATEWAY_SIDECAR_MIN_CPU || aws.memory_mib < GATEWAY_SIDECAR_MIN_MEMORY_MIB)) {
+    return "The LLM gateway sidecar needs at least 1 vCPU and 2 GiB: raise them in the Host section.";
+  }
+  return null;
+}
 export const SECRETS_MANAGER_HINT =
   "API keys, the Git token, custom environment variables and the SSH and CA files are kept in the project's Secrets Manager secret, so the workspace has them from the moment it starts.";
 

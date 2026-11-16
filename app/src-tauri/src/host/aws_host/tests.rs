@@ -275,6 +275,7 @@ fn inputs<'a>(
         files: &[],
         custom_env_keys: &[],
         image: REGISTRY_IMAGE,
+        gateway: None,
         wait: WaitTiming {
             interval: Duration::from_millis(1),
             timeout: Duration::from_millis(30),
@@ -1131,4 +1132,79 @@ mod copy_at_connect {
         // No tunnel registered for it: nothing to push to.
         assert!(!spawn_connect_push(&p, &AppSettings::default(), |_| panic!("no tunnel")));
     }
+    #[test]
+    fn a_sidecar_terminal_keeps_the_tasks_own_token() {
+        use crate::models::project::{Backend, OpenAiCompatibleConfig};
+        let mut p = connect_project(SecretsDelivery::CopyAtConnect);
+        p.backend = Backend::OpenAiCompatible;
+        p.openai_compatible_config = Some(OpenAiCompatibleConfig {
+            base_url: "http://host.docker.internal:4000".into(),
+            api_key: Some("sk-local".into()),
+            model_id: Some("gpt".into()),
+            haiku_model_id: None,
+        });
+        p.git_token = Some("ghp_tok".into());
+        let settings = AppSettings::default();
+        let keys = |p: &Project| -> Vec<String> {
+            connect_env(p, &settings).into_iter().map(|(k, _)| k).collect()
+        };
+        assert!(keys(&p).contains(&"ANTHROPIC_AUTH_TOKEN".to_string()));
+        p.aws.as_mut().unwrap().gateway_sidecar = true;
+        let with_sidecar = keys(&p);
+        assert!(!with_sidecar.contains(&"ANTHROPIC_AUTH_TOKEN".to_string()), "{with_sidecar:?}");
+        assert!(with_sidecar.contains(&"GIT_TOKEN".to_string()));
+    }
 }
+
+// ──────────────────────────────────────────── gateway sidecar (Q7)
+
+mod gateway_sidecar_inputs {
+    use super::*;
+    use crate::models::gateway_settings::GatewayModel;
+    use crate::models::project::Backend;
+
+    fn sidecar(on: bool) -> (Project, AppSettings) {
+        let mut p = aws_project(StorageMode::Ephemeral);
+        p.backend = Backend::OpenAiCompatible;
+        p.aws.as_mut().unwrap().gateway_sidecar = on;
+        let mut s = AppSettings::default();
+        s.gateway.models = vec![GatewayModel { name: "gpt".into(), model_id: "gpt-5".into() }];
+        (p, s)
+    }
+
+    #[test]
+    fn off_reads_no_key() {
+        let (p, s) = sidecar(false);
+        assert!(gateway_sidecar(&p, &s, || panic!("no keychain read")).unwrap().is_none());
+    }
+
+    #[test]
+    fn on_renders_a_key_free_config_and_a_fresh_master_key_each_start() {
+        let (p, s) = sidecar(true);
+        let a = gateway_sidecar(&p, &s, || Ok(Some("sk-provider".into()))).unwrap().unwrap();
+        let b = gateway_sidecar(&p, &s, || Ok(Some("sk-provider".into()))).unwrap().unwrap();
+        let (pa, pb) = (a.payload(), b.payload());
+        assert_eq!(pa.api_key, "sk-provider");
+        assert!(!pa.config.contains("sk-provider") && !pa.config.contains(pa.master_key));
+        assert!(pa.config.contains("os.environ/TRIPLEC_GATEWAY_API_KEY"));
+        assert!(pa.config.contains("model: \"openai/gpt-5\""));
+        assert_eq!(pa.master_key.len(), 64);
+        assert_ne!(pa.master_key, pb.master_key);
+    }
+
+    #[test]
+    fn on_refuses_a_missing_key_backend_or_model() {
+        let (p, s) = sidecar(true);
+        for key in [None, Some("  ".to_string())] {
+            let e = gateway_sidecar(&p, &s, || Ok(key.clone())).err().unwrap();
+            assert!(e.contains("provider API key"), "{e}");
+        }
+        let mut wrong = p.clone();
+        wrong.backend = Backend::Anthropic;
+        assert!(gateway_sidecar(&wrong, &s, || Ok(Some("k".into()))).err().unwrap().contains("OpenAI Compatible"));
+        let mut empty = s.clone();
+        empty.gateway.models.clear();
+        assert!(gateway_sidecar(&p, &empty, || Ok(Some("k".into()))).err().unwrap().contains("Model Gateway"));
+    }
+}
+

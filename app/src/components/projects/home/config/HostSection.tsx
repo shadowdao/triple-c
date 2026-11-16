@@ -4,6 +4,7 @@ import * as commands from "../../../../lib/tauri-commands";
 import { useAppState } from "../../../../store/appState";
 import {
   COPY_AT_CONNECT_GATEWAY_NOTE,
+  GATEWAY_SIDECAR_MIN_CPU,
   COPY_AT_CONNECT_HINT,
   COPY_AT_CONNECT_SSH_NOTE,
   COPY_AT_CONNECT_WARNINGS,
@@ -141,7 +142,10 @@ export default function HostSection({ project, save, disabled }: Props) {
                 void saveAws({ cpu, memory_mib });
               }}
             >
-              {FARGATE_CPUS.map((c) => (
+              {FARGATE_CPUS.filter(
+                // The gateway sidecar needs 1 vCPU / 2 GiB (Rust validates it too).
+                (c) => !aws.gateway_sidecar || c >= GATEWAY_SIDECAR_MIN_CPU,
+              ).map((c) => (
                 <option key={c} value={c}>
                   {formatCpu(c)}
                 </option>

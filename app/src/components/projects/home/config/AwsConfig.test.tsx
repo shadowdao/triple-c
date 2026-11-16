@@ -113,9 +113,124 @@ describe("AWS project config", () => {
   });
 });
 
+describe("LLM gateway sidecar (ModelSection)", () => {
+  const SIDECAR = "Run Triple-C's LLM gateway in the workspace";
+  const withModels = (models: { name: string; model_id: string }[]) =>
+    useAppState.setState({
+      appSettings: { gateway: { enabled: false, port: 4000, models } } as unknown as AppSettings,
+    });
+  const oai = (over: Partial<Project> = {}) =>
+    awsProject({
+      backend: "open_ai_compatible",
+      openai_compatible_config: {
+        base_url: "http://host.docker.internal:4000",
+        api_key: null,
+        model_id: "gpt",
+        haiku_model_id: null,
+      } as never,
+      ...over,
+    });
+  const renderModel = (p: Project) =>
+    render(<ModelSection project={p} save={save} disabled={false} />);
+
+  it("is offered only for an AWS project on the OpenAI-compatible backend", () => {
+    withModels([{ name: "gpt", model_id: "gpt-5" }]);
+    renderModel(awsProject({ backend: "ollama" }));
+    expect(screen.queryByRole("switch", { name: SIDECAR })).toBeNull();
+    cleanup();
+    render(
+      <ModelSection
+        project={localProjectOai()}
+        save={save}
+        disabled={false}
+      />,
+    );
+    expect(screen.queryByRole("switch", { name: SIDECAR })).toBeNull();
+    useAppState.setState({ appSettings: null });
+  });
+
+  it("turns on when Settings has a gateway model, and says why not otherwise", async () => {
+    withModels([{ name: " ", model_id: "gpt-5" }]);
+    renderModel(oai());
+    expect(toggle(SIDECAR)).toBeDisabled();
+    expect(screen.getByRole("alert")).toHaveTextContent("Settings → Model Gateway");
+    cleanup();
+
+    withModels([{ name: "gpt", model_id: "gpt-5" }]);
+    renderModel(oai());
+    expect(toggle(SIDECAR)).not.toBeDisabled();
+    fireEvent.click(toggle(SIDECAR));
+    await waitFor(() => expect(save).toHaveBeenCalled());
+    expect(save.mock.calls[0][0].aws.gateway_sidecar).toBe(true);
+    useAppState.setState({ appSettings: null });
+  });
+
+  it("needs 1 vCPU and 2 GiB", () => {
+    withModels([{ name: "gpt", model_id: "gpt-5" }]);
+    const p = oai();
+    p.aws = { ...p.aws!, cpu: 512, memory_mib: 1024 };
+    renderModel(p);
+    expect(toggle(SIDECAR)).toBeDisabled();
+    expect(screen.getByRole("alert")).toHaveTextContent("1 vCPU and 2 GiB");
+    useAppState.setState({ appSettings: null });
+  });
+
+  it("when on, replaces the local-endpoint warning and can always be turned off", async () => {
+    withModels([]);
+    const p = oai();
+    p.aws = { ...p.aws!, gateway_sidecar: true };
+    renderModel(p);
+    expect(screen.queryByText(/host.docker.internal is this machine/)).toBeNull();
+    expect(screen.getByRole("note", { name: "LLM gateway sidecar" })).toHaveTextContent(
+      "http://127.0.0.1:4000",
+    );
+    expect(toggle(SIDECAR)).toHaveAttribute("aria-checked", "true");
+    expect(toggle(SIDECAR)).not.toBeDisabled();
+    fireEvent.click(toggle(SIDECAR));
+    await waitFor(() => expect(save).toHaveBeenCalled());
+    expect(save.mock.calls[0][0].aws.gateway_sidecar).toBe(false);
+    useAppState.setState({ appSettings: null });
+  });
+
+  it("is turned off with the backend it needs", async () => {
+    withModels([{ name: "gpt", model_id: "gpt-5" }]);
+    const p = oai();
+    p.aws = { ...p.aws!, gateway_sidecar: true };
+    renderModel(p);
+    fireEvent.change(screen.getByLabelText("Backend"), { target: { value: "anthropic" } });
+    await waitFor(() => expect(save).toHaveBeenCalled());
+    expect(save.mock.calls[0][0]).toMatchObject({ backend: "anthropic", aws: { gateway_sidecar: false } });
+    useAppState.setState({ appSettings: null });
+  });
+});
+
+function localProjectOai(): Project {
+  return localProject({
+    backend: "open_ai_compatible",
+    openai_compatible_config: {
+      base_url: "http://host.docker.internal:4000",
+      api_key: null,
+      model_id: null,
+      haiku_model_id: null,
+    } as never,
+  });
+}
+
 describe("HostSection", () => {
   const renderHost = (p: Project = awsProject(), disabled = false) =>
     render(<HostSection project={p} save={save} disabled={disabled} />);
+
+  it("offers no CPU below 1 vCPU while the gateway sidecar is on", () => {
+    const p = awsProject();
+    p.aws = { ...p.aws!, gateway_sidecar: true };
+    renderHost(p);
+    const cpus = within(screen.getByLabelText("CPU"))
+      .getAllByRole("option")
+      .map((o) => (o as HTMLOptionElement).value);
+    expect(cpus).not.toContain("256");
+    expect(cpus).not.toContain("512");
+    expect(cpus).toContain("1024");
+  });
 
   it("saves a CPU change with a memory size valid for it", async () => {
     renderHost(); // 1024 CPU / 4096 MiB

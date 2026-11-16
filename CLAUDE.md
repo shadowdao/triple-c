@@ -369,6 +369,17 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   (root-owned; the entrypoint's TERM hook reads it, and the idle watcher writes `idle` or `lifetime`) so the hook
   doesn't push twice; the marker is cleared if StopTask fails. Claude Code's sandbox is forced off in
   the generated settings (bubblewrap can't create namespaces on Fargate, verified live).
+  **LLM gateway sidecar** (`gateway_sidecar`, Q7): a second, `essential: false` container `gateway`
+  (`docker::gateway::registry_image_ref`, digest-pinned, amd64+arm64; `memoryReservation` 512; no
+  `environment`, no `dependsOn`) whose `secrets` are exactly `TRIPLEC_GATEWAY_{CONFIG,API_KEY,MASTER_KEY}`
+  — the workspace container gets every key but those. The config is `sidecar_config` (Docker's
+  `render_config` with `os.environ/…` key references, so it holds no key); `/bin/sh -c` writes it to a
+  0600 `/tmp/litellm.yaml` and `exec`s LiteLLM on **127.0.0.1:4000** only (the image's own entrypoint
+  can't write a file). The master key is **random per task start** (the Docker gateway's never leaves
+  the machine); the payload overrides `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN` with the sidecar's,
+  and under copy-at-connect that token stays in the secret too (R1; terminals don't override it).
+  Log streams: `<prefix>/gateway/<task-id>` (the tail reads `workspace` only). Needs the
+  OpenAI-compatible backend, a gateway model and ≥ 1 vCPU / 2 GiB; off = the request is unchanged.
   **Environments are OpenTofu modules** (`aws/terraform/{environment,user-onboard,permissions-boundary}`;
   spec D2–D10). `tofu_modules.rs` embeds them and is the **only** place the shared names are built
   (environment, `/triple-c/environments/<env>` record, owner key — `sha256("<region>:<aws:userid>")`,

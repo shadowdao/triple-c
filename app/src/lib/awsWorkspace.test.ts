@@ -5,6 +5,7 @@ import {
   hasSavedFiles,
   hasWorkspaceFiles,
   environmentSelectable,
+  gatewaySidecarProblem,
   memoryError,
   memoryOptions,
   nearestMemory,
@@ -86,5 +87,21 @@ describe("phase 6 settings", () => {
     expect(hasWorkspaceFiles({ aws: { ...aws, storage: "hybrid", workspace_access_point_id: "fsap-w" } })).toBe(true);
     expect(hasWorkspaceFiles({ aws: { ...aws, storage: "hybrid" } })).toBe(false);
     expect(hasWorkspaceFiles({ aws: null })).toBe(false);
+  });
+});
+
+describe("gatewaySidecarProblem", () => {
+  const models = { models: [{ name: "gpt", model_id: "gpt-5" }] };
+  const aws = defaultAwsWorkspace();
+  it("needs the OpenAI-compatible backend, a complete model and 1 vCPU / 2 GiB", () => {
+    expect(gatewaySidecarProblem({ backend: "open_ai_compatible", aws }, models)).toBeNull();
+    expect(gatewaySidecarProblem({ backend: "anthropic", aws }, models)).toMatch(/OpenAI Compatible/);
+    expect(gatewaySidecarProblem({ backend: "open_ai_compatible", aws }, null)).toMatch(/Model Gateway/);
+    expect(
+      gatewaySidecarProblem({ backend: "open_ai_compatible", aws }, { models: [{ name: "gpt", model_id: " " }] }),
+    ).toMatch(/Model Gateway/);
+    expect(
+      gatewaySidecarProblem({ backend: "open_ai_compatible", aws: { ...aws, cpu: 512, memory_mib: 2048 } }, models),
+    ).toMatch(/1 vCPU and 2 GiB/);
   });
 });

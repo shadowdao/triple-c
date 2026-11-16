@@ -641,7 +641,9 @@ pub async fn add_project(
     aws: Option<AwsWorkspaceConfig>,
     state: State<'_, AppState>,
 ) -> Result<Project, String> {
-    let project = new_project(name, paths, host_id, aws_placement, aws, &state.settings_store.get().hosts)?;
+    let settings = state.settings_store.get();
+    let project = new_project(name, paths, host_id, aws_placement, aws, &settings.hosts)?;
+    validate_gateway_sidecar_update(&Project::new(String::new(), Vec::new()), &project, &settings.gateway)?;
     // Nothing can have been blanked on a project that did not exist a line ago.
     store_secrets_for_project(&project, &[])?;
     state.projects_store.add(project)
@@ -1123,7 +1125,11 @@ pub async fn update_project(
     // [`crate::models::validate_env_vars_update`].
     crate::models::validate_env_vars_update(&stored.custom_env_vars, &project.custom_env_vars)?;
 
-    validate_aws_update(&stored, &project, &state.settings_store.get().hosts)?;
+    {
+        let settings = state.settings_store.get();
+        validate_aws_update(&stored, &project, &settings.hosts)?;
+        validate_gateway_sidecar_update(&stored, &project, &settings.gateway)?;
+    }
 
     restore_store_owned_fields(&mut project, &stored);
     project.updated_at = chrono::Utc::now().to_rfc3339();
@@ -1204,6 +1210,26 @@ fn restore_store_owned_fields(project: &mut Project, stored: &Project) {
         aws.task_definition_arn = s.and_then(|a| a.task_definition_arn.clone());
         aws.workspace_access_point_id = s.and_then(|a| a.workspace_access_point_id.clone());
     }
+}
+
+/// The LLM gateway sidecar (Q7) needs the OpenAI-compatible backend and a
+/// model in Settings → Model Gateway. A save is refused when the sidecar is
+/// on without that backend, or is being turned on with no gateway model; a
+/// project that already runs it still saves after the models were removed
+/// from Settings (its start says what is missing).
+fn validate_gateway_sidecar_update(
+    stored: &Project,
+    project: &Project,
+    gateway: &crate::models::gateway_settings::GatewaySettings,
+) -> Result<(), String> {
+    let Some(problem) = crate::aws::workspace::gateway_sidecar_problem(project, gateway) else {
+        return Ok(());
+    };
+    let was_on = stored.aws.as_ref().is_some_and(|a| a.gateway_sidecar);
+    if was_on && project.backend == crate::models::project::Backend::OpenAiCompatible {
+        return Ok(());
+    }
+    Err(problem)
 }
 
 /// Checks an incoming save's host placement against what is stored and the
@@ -2805,6 +2831,39 @@ mod tests {
         p.aws_placement = Some(crate::models::AwsPlacement { region: "us-west-2".into(), environment: "dev".into() });
         p.aws = Some(Default::default());
         p
+    }
+
+    #[test]
+    fn the_gateway_sidecar_needs_the_openai_backend_and_a_gateway_model() {
+        use crate::models::gateway_settings::{GatewayModel, GatewaySettings};
+        use crate::models::project::Backend;
+        let with_models = GatewaySettings {
+            models: vec![GatewayModel { name: "gpt".into(), model_id: "gpt-5".into() }],
+            ..Default::default()
+        };
+        let half = GatewaySettings {
+            models: vec![GatewayModel { name: "gpt".into(), model_id: " ".into() }],
+            ..Default::default()
+        };
+        let off = aws_project();
+        let mut on = off.clone();
+        on.aws.as_mut().unwrap().gateway_sidecar = true;
+
+        // Wrong backend: always refused.
+        on.backend = Backend::Anthropic;
+        let e = validate_gateway_sidecar_update(&off, &on, &with_models).unwrap_err();
+        assert!(e.contains("OpenAI Compatible"), "{e}");
+        assert!(validate_gateway_sidecar_update(&on, &on, &with_models).is_err());
+
+        // Turning it on without a complete gateway model row: refused.
+        on.backend = Backend::OpenAiCompatible;
+        let e = validate_gateway_sidecar_update(&off, &on, &half).unwrap_err();
+        assert!(e.contains("Model Gateway"), "{e}");
+        assert!(validate_gateway_sidecar_update(&off, &on, &with_models).is_ok());
+        // Already on: an unrelated save still goes through.
+        assert!(validate_gateway_sidecar_update(&on, &on, &half).is_ok());
+        // Off: nothing to check.
+        assert!(validate_gateway_sidecar_update(&off, &off, &half).is_ok());
     }
 
     #[test]
