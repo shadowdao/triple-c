@@ -880,9 +880,7 @@ impl WorkspaceApi for Fake {
             let mut pending = self.pending_puts.lock().unwrap();
             if *pending > 0 {
                 *pending -= 1;
-                return Err(AwsError::Other {
-                    message: format!("This project's secret ({name}) is scheduled for deletion, so it can't be written."),
-                });
+                return Err(pending_deletion_error(name));
             }
         }
         self.secrets.lock().unwrap().push((
@@ -1528,7 +1526,9 @@ fn a_secret_pending_deletion_is_recognised() {
     assert!(!is_pending_deletion(Some("Some other invalid request")));
     assert!(!is_pending_deletion(None));
     let msg = pending_deletion_error("triple-c/dev/abc/p").to_string();
-    assert!(msg.contains("scheduled for deletion"), "{msg}");
+    assert!(msg.contains("still being deleted") && msg.contains("again in a minute"), "{msg}");
+    assert!(!msg.contains("Restore"), "{msg}");
+    assert!(is_pending_deletion_error(&pending_deletion_error("n")));
     assert!(msg.contains("triple-c/dev/abc/p"), "{msg}");
 }
 
@@ -1715,8 +1715,40 @@ async fn a_replaced_secret_that_aws_has_not_finished_deleting_is_a_clear_error()
         limit: std::time::Duration::from_millis(20),
     };
     let e = replace_project_secret(&fake, "n", "k", "{}", &[], timing).await.unwrap_err();
-    assert!(e.to_string().contains("has not finished deleting it"), "{e}");
+    assert!(e.to_string().contains("has not finished deleting"), "{e}");
+    assert!(e.to_string().contains("Start the project again in a minute"), "{e}");
+    assert!(!e.to_string().contains("Restore"), "{e}");
     assert_eq!(fake.deleted_secrets.lock().unwrap().as_slice(), ["n"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_start_after_a_timed_out_replace_retries_the_create() {
+    // The replace deleted the secret but timed out before making it again:
+    // the next start's create meets the deletion AWS is still finishing.
+    let env = pairs(&[("TZ", "UTC")]);
+    let fake = Fake::onboarded();
+    *fake.pending_puts.lock().unwrap() = 3;
+    prepare_workspace(&fake, &who(), &env_info(), &copy_at_connect_project(), &env, &[], &[], IMAGE, None)
+        .await
+        .unwrap();
+    assert_eq!(fake.secrets.lock().unwrap().len(), 1, "made once the name is free");
+    assert!(fake.deleted_secrets.lock().unwrap().is_empty());
+
+    // Secrets Manager delivery retries the same way.
+    let fake = Fake::onboarded();
+    *fake.pending_puts.lock().unwrap() = 3;
+    prepare(&fake, &project(StorageMode::Hybrid), &env).await.unwrap();
+    assert_eq!(fake.secrets.lock().unwrap().len(), 1);
+
+    // Still taken past the limit: try again in a minute, never "restore".
+    let fake = Fake::onboarded();
+    *fake.pending_puts.lock().unwrap() = 1000;
+    let e = prepare_workspace(&fake, &who(), &env_info(), &copy_at_connect_project(), &env, &[], &[], IMAGE, None)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("Start the project again in a minute"), "{e}");
+    assert!(!e.contains("Restore"), "{e}");
 }
 
 #[test]
