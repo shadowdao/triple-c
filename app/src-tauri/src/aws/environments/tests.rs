@@ -551,9 +551,9 @@ impl DetectApi for FakeDetect {
         self.log(format!("role {name}"));
         Ok(self.roles.get(name).cloned().unwrap_or(Knowable::No))
     }
-    async fn parameter(&self, name: &str) -> Result<Option<String>, AwsError> {
+    async fn parameter(&self, name: &str) -> Result<Param, AwsError> {
         self.log(format!("parameter {name}"));
-        Ok(self.parameters.get(name).cloned())
+        Ok(self.parameters.get(name).cloned().map_or(Param::Missing, Param::Value))
     }
     async fn state_document(&self, bucket: &str, key: &str) -> Result<Option<String>, AwsError> {
         self.log(format!("document {bucket} {key}"));
@@ -1262,4 +1262,23 @@ fn onboarding_carries_the_users_compute_from_their_record() {
         serde_json::to_value(OnboardingState::Joined { ec2: None }).unwrap(),
         json!({"state": "joined", "ec2": null})
     );
+}
+
+#[test]
+fn a_user_record_read_is_absent_valid_or_unusable() {
+    let ok = user_record("dev", "alice").to_string();
+    assert_eq!(user_record_from(Param::Missing, "dev", ACCOUNT, REGION), UserRecord::Absent);
+    assert!(matches!(
+        user_record_from(Param::Value(ok), "dev", ACCOUNT, REGION),
+        UserRecord::Valid(_)
+    ));
+    // Denied or invalid: there may be capacity, so it is not "absent".
+    assert!(matches!(
+        user_record_from(Param::Denied, "dev", ACCOUNT, REGION),
+        UserRecord::Unusable(_)
+    ));
+    assert!(matches!(
+        user_record_from(Param::Value("{}".into()), "dev", ACCOUNT, REGION),
+        UserRecord::Unusable(_)
+    ));
 }

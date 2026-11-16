@@ -683,12 +683,8 @@ pub trait DetectApi: Send + Sync {
         account: &str,
     ) -> impl Future<Output = Result<Knowable, AwsError>> + Send;
     fn role_exists(&self, name: &str) -> impl Future<Output = Result<Knowable, AwsError>> + Send;
-    /// An SSM String parameter's value; `None` when it is missing or this
-    /// caller can't read it.
-    fn parameter(
-        &self,
-        name: &str,
-    ) -> impl Future<Output = Result<Option<String>, AwsError>> + Send;
+    /// An SSM String parameter (a user record).
+    fn parameter(&self, name: &str) -> impl Future<Output = Result<Param, AwsError>> + Send;
     /// A state object's contents, capped; `None` when it is missing, can't
     /// be read or is too large.
     fn state_document(
@@ -809,8 +805,46 @@ pub(crate) async fn scan_in_bucket<D: DetectApi>(
     })
 }
 
+/// An SSM parameter read: its value, missing, or this caller can't read it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Param {
+    Value(String),
+    Missing,
+    Denied,
+}
+
+/// A user record as read: none, valid, or present but unusable (unreadable
+/// or failing validation; the reason names a field, never a value).
+#[derive(Clone, Debug, PartialEq)]
+pub enum UserRecord {
+    Absent,
+    Valid(UserCompute),
+    Unusable(String),
+}
+
+impl UserRecord {
+    pub fn valid(&self) -> Option<&UserCompute> {
+        match self {
+            UserRecord::Valid(c) => Some(c),
+            _ => None,
+        }
+    }
+}
+
+/// [`UserRecord`] from a read of `user_record_parameter_name(env, …)`.
+pub fn user_record_from(read: Param, env: &str, account: &str, region: &str) -> UserRecord {
+    match read {
+        Param::Missing => UserRecord::Absent,
+        Param::Denied => UserRecord::Unusable("it can't be read with these credentials".into()),
+        Param::Value(text) => match parse_user_record(env, &text, account, region) {
+            Ok(c) => UserRecord::Valid(c),
+            Err(reason) => UserRecord::Unusable(reason),
+        },
+    }
+}
+
 /// The caller's EC2 capacity in `env` from their user record; `None` when
-/// there is no record or it doesn't validate (logged, never echoed).
+/// there is no usable record (an unusable one is logged, never echoed).
 pub(crate) async fn user_compute<D: DetectApi>(
     d: &D,
     env: &str,
@@ -818,44 +852,185 @@ pub(crate) async fn user_compute<D: DetectApi>(
     account: &str,
     region: &str,
 ) -> Result<Option<UserCompute>, AwsError> {
-    let Some(text) = d.parameter(&user_record_parameter_name(env, owner_key)).await? else {
-        return Ok(None);
-    };
-    match parse_user_record(env, &text, account, region) {
-        Ok(c) => Ok(Some(c)),
-        Err(reason) => {
+    let read = d.parameter(&user_record_parameter_name(env, owner_key)).await?;
+    match user_record_from(read, env, account, region) {
+        UserRecord::Valid(c) => Ok(Some(c)),
+        UserRecord::Absent => Ok(None),
+        UserRecord::Unusable(reason) => {
             log::warn!("Ignoring the EC2 user record for environment {env}: {reason}");
             Ok(None)
         }
     }
 }
 
-/// Whether a per-user EC2 name (`tofu_modules::user_ec2_stem`) is in use:
-/// (an ACTIVE ECS cluster of that name, an Auto Scaling group of that name).
-/// Needs `ecs:DescribeClusters` and `autoscaling:DescribeAutoScalingGroups`
-/// (the environment-admin tier has both; workspace users lack the second).
-pub async fn ec2_names_in_use(cfg: &SdkConfig, stem: &str) -> Result<(bool, bool), AwsError> {
-    let clusters = aws_sdk_ecs::Client::new(cfg)
-        .describe_clusters()
-        .clusters(stem)
-        .send()
-        .await
-        .map_err(|e| classify_sdk_error("ecs:DescribeClusters", &e))?;
-    let cluster = clusters
-        .clusters()
+/// Who holds a per-user EC2 name (`tofu_modules::user_ec2_stem`): an ECS
+/// cluster or Auto Scaling group of that name and its `triple-c:owner` tag.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NameHolder {
+    /// "ECS cluster" or "Auto Scaling group".
+    pub kind: &'static str,
+    pub owner: Option<String>,
+}
+
+/// An ECS cluster or Auto Scaling group found by name: its status (clusters
+/// only) and tags.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct NamedResource {
+    pub status: Option<String>,
+    pub tags: Vec<(String, String)>,
+}
+
+/// What an onboarding apply asks AWS before it starts (R3): the caller's
+/// user record and whether the per-user EC2 names are taken. The cluster
+/// read needs `ecs:DescribeClusters` (tags included); the group read
+/// `autoscaling:DescribeAutoScalingGroups`, which only the environment-admin
+/// tier has.
+pub trait OnboardApi: Send + Sync {
+    fn parameter(&self, name: &str) -> impl Future<Output = Result<Param, AwsError>> + Send;
+    fn cluster(
+        &self,
+        name: &str,
+    ) -> impl Future<Output = Result<Option<NamedResource>, AwsError>> + Send;
+    fn group(
+        &self,
+        name: &str,
+    ) -> impl Future<Output = Result<Option<NamedResource>, AwsError>> + Send;
+}
+
+const OWNER_TAG: &str = "triple-c:owner";
+
+fn owner_of(r: &NamedResource) -> Option<String> {
+    r.tags
         .iter()
-        .any(|c| c.cluster_name() == Some(stem) && c.status() == Some("ACTIVE"));
-    let groups = aws_sdk_autoscaling::Client::new(cfg)
-        .describe_auto_scaling_groups()
-        .auto_scaling_group_names(stem)
+        .find(|(k, _)| k == OWNER_TAG)
+        .map(|(_, v)| v.clone())
+}
+
+/// The cluster holding `stem`, if any. Every status but INACTIVE (a deleted
+/// cluster) holds the name: PROVISIONING, DEPROVISIONING and FAILED too.
+pub async fn cluster_holder<A: OnboardApi>(
+    api: &A,
+    stem: &str,
+) -> Result<Option<NameHolder>, AwsError> {
+    Ok(api
+        .cluster(stem)
+        .await?
+        .filter(|c| c.status.as_deref() != Some("INACTIVE"))
+        .map(|c| NameHolder {
+            kind: "ECS cluster",
+            owner: owner_of(&c),
+        }))
+}
+
+/// Everything holding `stem`: its cluster and its Auto Scaling group.
+pub async fn ec2_name_holders<A: OnboardApi>(
+    api: &A,
+    stem: &str,
+) -> Result<Vec<NameHolder>, AwsError> {
+    let mut out: Vec<NameHolder> = cluster_holder(api, stem).await?.into_iter().collect();
+    if let Some(g) = api.group(stem).await? {
+        out.push(NameHolder {
+            kind: "Auto Scaling group",
+            owner: owner_of(&g),
+        });
+    }
+    Ok(out)
+}
+
+/// `ssm:GetParameter` as a [`Param`].
+async fn get_parameter(ssm: &aws_sdk_ssm::Client, name: &str) -> Result<Param, AwsError> {
+    let res = ssm
+        .get_parameter()
+        .name(name)
+        .with_decryption(false)
         .send()
-        .await
-        .map_err(|e| classify_sdk_error("autoscaling:DescribeAutoScalingGroups", &e))?;
-    let group = groups
-        .auto_scaling_groups()
-        .iter()
-        .any(|g| g.auto_scaling_group_name() == Some(stem));
-    Ok((cluster, group))
+        .await;
+    match res {
+        Ok(out) => Ok(out
+            .parameter()
+            .and_then(|p| p.value())
+            .map_or(Param::Missing, |v| Param::Value(v.to_string()))),
+        Err(e) if e.as_service_error().is_some_and(|s| s.is_parameter_not_found()) => {
+            Ok(Param::Missing)
+        }
+        Err(e) => {
+            let (code, status) = error_parts(&e);
+            match lookup_outcome(code.as_deref(), status) {
+                Lookup::Missing => Ok(Param::Missing),
+                Lookup::Denied => Ok(Param::Denied),
+                Lookup::Error => Err(classify_sdk_error("ssm:GetParameter", &e)),
+            }
+        }
+    }
+}
+
+/// The real [`OnboardApi`], from a connection's `SdkConfig`.
+pub struct SdkOnboardApi {
+    ssm: aws_sdk_ssm::Client,
+    ecs: aws_sdk_ecs::Client,
+    autoscaling: aws_sdk_autoscaling::Client,
+}
+
+impl SdkOnboardApi {
+    pub fn new(cfg: &SdkConfig) -> Self {
+        SdkOnboardApi {
+            ssm: aws_sdk_ssm::Client::new(cfg),
+            ecs: aws_sdk_ecs::Client::new(cfg),
+            autoscaling: aws_sdk_autoscaling::Client::new(cfg),
+        }
+    }
+}
+
+impl OnboardApi for SdkOnboardApi {
+    async fn parameter(&self, name: &str) -> Result<Param, AwsError> {
+        get_parameter(&self.ssm, name).await
+    }
+
+    async fn cluster(&self, name: &str) -> Result<Option<NamedResource>, AwsError> {
+        // A missing name is a `failures` entry, not an error.
+        let out = self
+            .ecs
+            .describe_clusters()
+            .clusters(name)
+            .include(aws_sdk_ecs::types::ClusterField::Tags)
+            .send()
+            .await
+            .map_err(|e| classify_sdk_error("ecs:DescribeClusters", &e))?;
+        Ok(out
+            .clusters()
+            .iter()
+            .find(|c| c.cluster_name() == Some(name))
+            .map(|c| NamedResource {
+                status: c.status().map(str::to_string),
+                tags: c
+                    .tags()
+                    .iter()
+                    .filter_map(|t| Some((t.key()?.to_string(), t.value()?.to_string())))
+                    .collect(),
+            }))
+    }
+
+    async fn group(&self, name: &str) -> Result<Option<NamedResource>, AwsError> {
+        let out = self
+            .autoscaling
+            .describe_auto_scaling_groups()
+            .auto_scaling_group_names(name)
+            .send()
+            .await
+            .map_err(|e| classify_sdk_error("autoscaling:DescribeAutoScalingGroups", &e))?;
+        Ok(out
+            .auto_scaling_groups()
+            .iter()
+            .find(|g| g.auto_scaling_group_name() == Some(name))
+            .map(|g| NamedResource {
+                status: None,
+                tags: g
+                    .tags()
+                    .iter()
+                    .filter_map(|t| Some((t.key()?.to_string(), t.value()?.to_string())))
+                    .collect(),
+            }))
+    }
 }
 
 /// An OpenTofu state that manages nothing (what `tofu destroy` leaves):
@@ -1170,25 +1345,8 @@ impl DetectApi for SdkDetectApi {
         knowable("iam:GetRole", res)
     }
 
-    async fn parameter(&self, name: &str) -> Result<Option<String>, AwsError> {
-        let res = self
-            .ssm
-            .get_parameter()
-            .name(name)
-            .with_decryption(false)
-            .send()
-            .await;
-        match res {
-            Ok(out) => Ok(out.parameter().and_then(|p| p.value()).map(str::to_string)),
-            Err(e) if e.as_service_error().is_some_and(|s| s.is_parameter_not_found()) => Ok(None),
-            Err(e) => {
-                let (code, status) = error_parts(&e);
-                match lookup_outcome(code.as_deref(), status) {
-                    Lookup::Missing | Lookup::Denied => Ok(None),
-                    Lookup::Error => Err(classify_sdk_error("ssm:GetParameter", &e)),
-                }
-            }
-        }
+    async fn parameter(&self, name: &str) -> Result<Param, AwsError> {
+        get_parameter(&self.ssm, name).await
     }
 
     async fn state_document(&self, bucket: &str, key: &str) -> Result<Option<String>, AwsError> {

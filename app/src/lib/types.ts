@@ -1393,6 +1393,13 @@ export interface Ec2InstanceType {
   memory_mib: number;
 }
 
+/** `environment_commands::SavedBundle`. */
+export interface SavedBundle {
+  folder: string;
+  /** An onboarding bundle's EC2 name looks taken (a warning; the README has the admin check). */
+  warning: string | null;
+}
+
 export interface Ec2InstanceTable {
   default_type: string;
   types: Ec2InstanceType[];

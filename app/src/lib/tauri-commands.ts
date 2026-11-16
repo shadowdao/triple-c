@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ProjectPath, NewProjectHost, RemoveProjectOptions, WipChoice, UnsavedWork, WorkspaceStatus, ProjectRemovalReport, ProjectResetOutcome, ContainerInfo, AppSettings, SettingsImportPreview, SettingsImportOutcome, UpdateInfo, ImageUpdateInfo, FileEntry, FileContents, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, BrowserPageState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo, UploadOutcome, Note, ViewerFile, ViewerPoll, ViewerSaved, ViewerState, FileDiff, InstallScope, ItemUpdate, Marketplace, MarketplaceAccount, MarketplaceItemRef, MarketplaceSnapshot, ProjectSyncResult, SyncReport, HostConnection, CallerIdentity, PermissionReport, PolicyFile, HourlyEstimate, AwsWorkspaceConfig, Tier, EnvironmentScan, NetworkChoice, ModuleKind, Ec2Choice, Ec2Compute, Ec2InstanceTable } from "./types";
+import type { Project, ProjectPath, NewProjectHost, RemoveProjectOptions, WipChoice, UnsavedWork, WorkspaceStatus, ProjectRemovalReport, ProjectResetOutcome, ContainerInfo, AppSettings, SettingsImportPreview, SettingsImportOutcome, UpdateInfo, ImageUpdateInfo, FileEntry, FileContents, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, BrowserPageState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo, UploadOutcome, Note, ViewerFile, ViewerPoll, ViewerSaved, ViewerState, FileDiff, InstallScope, ItemUpdate, Marketplace, MarketplaceAccount, MarketplaceItemRef, MarketplaceSnapshot, ProjectSyncResult, SyncReport, HostConnection, CallerIdentity, PermissionReport, PolicyFile, HourlyEstimate, AwsWorkspaceConfig, Tier, EnvironmentScan, NetworkChoice, ModuleKind, Ec2Choice, Ec2Compute, Ec2InstanceTable, SavedBundle } from "./types";
 
 // Docker
 export const checkDocker = () => invoke<boolean>("check_docker");
@@ -172,7 +172,7 @@ export const onboardAwsUser = (connectionId: string, region: string, environment
 export const listEc2InstanceTypes = () => invoke<Ec2InstanceTable>("list_ec2_instance_types");
 export const deployAwsPermissionsBoundary = (connectionId: string, region: string) =>
   invoke<string>("deploy_aws_permissions_boundary", { connectionId, region });
-/** Opens a folder picker in Rust; resolves to the folder written, or null if dismissed. */
+/** Opens a folder picker in Rust; resolves to the folder written (and, for an onboarding with EC2, a warning when its cluster name looks taken), or null if dismissed. */
 export const saveAwsAdminBundle = (
   connectionId: string,
   region: string,
@@ -186,7 +186,7 @@ export const saveAwsAdminBundle = (
     ec2?: Ec2Compute | null;
   } = {},
 ) =>
-  invoke<string | null>("save_aws_admin_bundle", {
+  invoke<SavedBundle | null>("save_aws_admin_bundle", {
     connectionId,
     region,
     kind,

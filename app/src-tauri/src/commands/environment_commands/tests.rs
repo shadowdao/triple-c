@@ -6,7 +6,7 @@ use serde_json::json;
 use super::*;
 use crate::aws::tofu::Workdir;
 use crate::aws::environments::{
-    EnvironmentState, Knowable, LockInfo, OnboardingState, UserCompute,
+    EnvironmentState, Knowable, LockInfo, NamedResource, OnboardingState, Param, UserCompute,
 };
 use crate::aws::tofu_modules::{
     environment_vars, module_files, onboarding_vars, owner_key, state_key, ModuleKind,
@@ -265,6 +265,9 @@ fn bundles_contain_the_module_backend_vars_and_readme() {
         ),
         &format!("aws ssm get-parameter --region {REGION} --name {record}"),
         "cluster/triple-c-dev--u-<tag>",
+        "--include TAGS",
+        "triple-c:owner",
+        &format!("owner_id ({USER_ID})"),
     ] {
         assert!(readme.contains(needle), "README lacks {needle:?}:\n{readme}");
     }
@@ -681,17 +684,17 @@ fn recorded(env: &str, tag: &str, max: u32) -> UserCompute {
 
 #[test]
 fn a_reapply_keeps_the_recorded_compute_unless_changed() {
-    let rec = recorded("dev", "alice", 3);
+    let rec = UserRecord::Valid(recorded("dev", "alice", 3));
     let kept = Ec2Compute {
         instance_type: "m7g.xlarge".into(),
         max_instances: 3,
         user_tag: "alice".into(),
     };
     // Omitted: keep what the record says (or none without one).
-    assert_eq!(resolve_ec2(None, Some(&rec)), Some(kept.clone()));
-    assert_eq!(resolve_ec2(None, None), None);
+    assert_eq!(resolve_ec2(None, &rec), Ok(Some(kept.clone())));
+    assert_eq!(resolve_ec2(None, &UserRecord::Absent), Ok(None));
     // Explicitly none: the re-apply removes it.
-    assert_eq!(resolve_ec2(Some(Ec2Choice::None), Some(&rec)), None);
+    assert_eq!(resolve_ec2(Some(Ec2Choice::None), &rec), Ok(None));
     // A new choice wins.
     let new = Ec2Compute {
         instance_type: "m7i.large".into(),
@@ -699,17 +702,21 @@ fn a_reapply_keeps_the_recorded_compute_unless_changed() {
         user_tag: "alice".into(),
     };
     assert_eq!(
-        resolve_ec2(Some(Ec2Choice::Ec2(new.clone())), Some(&rec)),
-        Some(new.clone())
+        resolve_ec2(Some(Ec2Choice::Ec2(new.clone())), &rec),
+        Ok(Some(new.clone()))
     );
+    // A record that exists but can't be used is never read as "none" (that
+    // would tear the capacity down); an explicit choice still goes.
+    let bad = UserRecord::Unusable("schema is not 1".into());
+    let e = resolve_ec2(None, &bad).unwrap_err();
+    assert!(e.contains("schema is not 1") && e.contains("explicitly"), "{e}");
+    assert_eq!(resolve_ec2(Some(Ec2Choice::None), &bad), Ok(None));
+    assert_eq!(resolve_ec2(Some(Ec2Choice::Ec2(new.clone())), &bad), Ok(Some(new.clone())));
     // The kept values reach the module's variables unchanged.
-    let vars = onboarding_vars("dev", REGION, USER_ID, resolve_ec2(None, Some(&rec)).as_ref()).unwrap();
+    let vars = onboarding_vars("dev", REGION, USER_ID, resolve_ec2(None, &rec).unwrap().as_ref()).unwrap();
     assert_eq!(vars["ec2_instance_type"], "m7g.xlarge");
     assert_eq!(vars["ec2_max_instances"], 3);
     assert_eq!(vars["ec2_user_tag"], "alice");
-    let vars = onboarding_vars("dev", REGION, USER_ID, Some(&new)).unwrap();
-    assert_eq!(vars["ec2_instance_type"], "m7i.large");
-    assert_eq!(vars["ec2_max_instances"], 1);
 
     // The UI's JSON for each choice.
     let none: Ec2Choice = serde_json::from_value(json!({"kind": "none"})).unwrap();
@@ -721,27 +728,251 @@ fn a_reapply_keeps_the_recorded_compute_unless_changed() {
     assert_eq!(ec2, Ec2Choice::Ec2(new));
 }
 
-#[test]
-fn ec2_names_in_use_by_another_onboarding_are_refused() {
-    let stem = "triple-c-dev--u-alice";
-    // Free names: fine, with or without a record.
-    assert!(ec2_collision_refusal(stem, false, false, None).is_ok());
-    assert!(ec2_collision_refusal(stem, false, false, Some(&recorded("dev", "bob", 1))).is_ok());
-    // Taken, and this owner's record names that cluster: their own re-apply.
-    let mine = recorded("dev", "alice", 2);
-    for (cluster, group) in [(true, false), (false, true), (true, true)] {
-        assert!(ec2_collision_refusal(stem, cluster, group, Some(&mine)).is_ok());
-        // Taken with no record, or a record naming another cluster.
-        for other in [None, Some(recorded("dev", "bob", 1))] {
-            let e = ec2_collision_refusal(stem, cluster, group, other.as_ref()).unwrap_err();
-            assert!(e.contains(stem), "{e}");
-            assert!(e.contains("triple-c-user"), "{e}");
-        }
+fn held(kind: &'static str, owner: Option<&str>) -> NameHolder {
+    NameHolder {
+        kind,
+        owner: owner.map(String::from),
     }
+}
+
+#[test]
+fn ec2_names_held_by_another_owner_are_refused() {
+    let stem = "triple-c-dev--u-alice";
+    let me = USER_ID;
+    // Free names: fine, with or without a record.
+    assert!(ec2_collision_refusal(stem, &[], me, None).is_ok());
+    assert!(ec2_collision_refusal(stem, &[], me, Some(&recorded("dev", "bob", 1))).is_ok());
+    let cluster = |o| held("ECS cluster", o);
+    let group = |o| held("Auto Scaling group", o);
+    // Tagged as mine: a half-built capacity (no record yet) is re-applied.
+    assert!(ec2_collision_refusal(stem, &[cluster(Some(me)), group(Some(me))], me, None).is_ok());
+    // Another owner's, or untagged: refused, naming the resource.
+    let e = ec2_collision_refusal(stem, &[cluster(Some("AROAOTHER:bob"))], me, None).unwrap_err();
+    assert!(e.contains("ECS cluster") && e.contains(stem) && e.contains("another onboarding"), "{e}");
+    assert!(e.contains("triple-c-user"), "{e}");
+    let e = ec2_collision_refusal(stem, &[cluster(Some(me)), group(None)], me, None).unwrap_err();
+    assert!(e.contains("Auto Scaling group") && e.contains("isn't tagged"), "{e}");
+    // The record naming the cluster is the fallback for an untagged or
+    // differently tagged one.
+    let mine = recorded("dev", "alice", 2);
+    assert!(ec2_collision_refusal(stem, &[cluster(None), group(Some("x"))], me, Some(&mine)).is_ok());
+    // A record naming another cluster doesn't help.
+    assert!(ec2_collision_refusal(stem, &[cluster(None)], me, Some(&recorded("dev", "bob", 1))).is_err());
     // A cluster that merely ends in the same text is not the same cluster.
     let mut lookalike = recorded("dev", "alice", 1);
     lookalike.cluster_arn = format!("arn:aws:ecs:{REGION}:{ACCOUNT}:cluster/x{stem}");
-    assert!(ec2_collision_refusal(stem, true, false, Some(&lookalike)).is_err());
+    assert!(ec2_collision_refusal(stem, &[cluster(None)], me, Some(&lookalike)).is_err());
+}
+
+/// An `OnboardApi` answering from fixed data, recording what it was asked.
+#[derive(Default)]
+struct FakeOnboard {
+    record: Option<String>,
+    record_denied: bool,
+    cluster: Option<NamedResource>,
+    group: Option<NamedResource>,
+    group_denied: bool,
+    calls: std::sync::Mutex<Vec<String>>,
+}
+
+impl FakeOnboard {
+    fn calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl OnboardApi for FakeOnboard {
+    async fn parameter(&self, name: &str) -> Result<Param, AwsError> {
+        self.calls.lock().unwrap().push(format!("parameter {name}"));
+        Ok(match (&self.record, self.record_denied) {
+            (_, true) => Param::Denied,
+            (Some(v), _) => Param::Value(v.clone()),
+            (None, _) => Param::Missing,
+        })
+    }
+    async fn cluster(&self, name: &str) -> Result<Option<NamedResource>, AwsError> {
+        self.calls.lock().unwrap().push(format!("cluster {name}"));
+        Ok(self.cluster.clone())
+    }
+    async fn group(&self, name: &str) -> Result<Option<NamedResource>, AwsError> {
+        self.calls.lock().unwrap().push(format!("group {name}"));
+        if self.group_denied {
+            return Err(AwsError::AccessDenied {
+                action: "autoscaling:DescribeAutoScalingGroups".into(),
+                message: "denied".into(),
+            });
+        }
+        Ok(self.group.clone())
+    }
+}
+
+fn named(status: Option<&str>, owner: Option<&str>) -> NamedResource {
+    NamedResource {
+        status: status.map(String::from),
+        tags: owner
+            .map(|o| vec![("triple-c:owner".to_string(), o.to_string())])
+            .unwrap_or_default(),
+    }
+}
+
+fn record_json(env: &str, tag: &str) -> String {
+    let r = recorded(env, tag, 2);
+    json!({
+        "schema": 1, "instance_type": r.instance_type, "cluster_arn": r.cluster_arn,
+        "capacity_provider": r.capacity_provider, "user_tag": r.user_tag, "max_instances": 2,
+    })
+    .to_string()
+}
+
+fn prepare(api: &FakeOnboard, choice: Option<Ec2Choice>) -> Result<Value, AwsError> {
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(prepare_onboarding(api, "dev", REGION, ACCOUNT, USER_ID, choice))
+}
+
+fn alice() -> Option<Ec2Choice> {
+    Some(Ec2Choice::Ec2(Ec2Compute {
+        instance_type: "m7i.large".into(),
+        max_instances: 1,
+        user_tag: "alice".into(),
+    }))
+}
+
+#[test]
+fn onboarding_checks_the_ec2_names_before_it_applies() {
+    let stem = "triple-c-dev--u-alice";
+    // Fargate only: no name lookups at all.
+    let api = FakeOnboard::default();
+    let vars = prepare(&api, Some(Ec2Choice::None)).unwrap();
+    assert_eq!(vars["ec2_instance_type"], "");
+    assert!(api.calls().iter().all(|c| c.starts_with("parameter ")), "{:?}", api.calls());
+
+    // Free names: the vars come back.
+    let api = FakeOnboard::default();
+    let vars = prepare(&api, alice()).unwrap();
+    assert_eq!(vars["ec2_user_tag"], "alice");
+    assert!(api.calls().contains(&format!("cluster {stem}")));
+    assert!(api.calls().contains(&format!("group {stem}")));
+
+    // Another owner's cluster: refused, so nothing is launched.
+    let api = FakeOnboard {
+        cluster: Some(named(Some("ACTIVE"), Some("AROAOTHER:bob"))),
+        ..Default::default()
+    };
+    let e = prepare(&api, alice()).unwrap_err();
+    assert!(format!("{e:?}").contains("another onboarding"), "{e:?}");
+
+    // My own half-built cluster and group (a failed apply, no record yet).
+    let api = FakeOnboard {
+        cluster: Some(named(Some("PROVISIONING"), Some(USER_ID))),
+        group: Some(named(None, Some(USER_ID))),
+        ..Default::default()
+    };
+    assert!(prepare(&api, alice()).is_ok());
+
+    // Untagged: refused unless my record names it.
+    let untagged = || FakeOnboard {
+        cluster: Some(named(Some("ACTIVE"), None)),
+        ..Default::default()
+    };
+    assert!(prepare(&untagged(), alice()).is_err());
+    let api = FakeOnboard {
+        record: Some(record_json("dev", "alice")),
+        ..untagged()
+    };
+    assert!(prepare(&api, alice()).is_ok());
+
+    // A deleted (INACTIVE) cluster doesn't hold the name; every other
+    // status does.
+    let api = FakeOnboard {
+        cluster: Some(named(Some("INACTIVE"), None)),
+        ..Default::default()
+    };
+    assert!(prepare(&api, alice()).is_ok());
+    for status in ["ACTIVE", "PROVISIONING", "DEPROVISIONING", "FAILED"] {
+        let api = FakeOnboard {
+            cluster: Some(named(Some(status), Some("AROAOTHER:bob"))),
+            ..Default::default()
+        };
+        assert!(prepare(&api, alice()).is_err(), "{status}");
+    }
+
+    // An Auto Scaling group alone is enough to refuse.
+    let api = FakeOnboard {
+        group: Some(named(None, Some("AROAOTHER:bob"))),
+        ..Default::default()
+    };
+    assert!(prepare(&api, alice()).is_err());
+
+    // A denied group lookup is an error, never "free".
+    let api = FakeOnboard {
+        group_denied: true,
+        ..Default::default()
+    };
+    assert!(prepare(&api, alice()).is_err());
+}
+
+#[test]
+fn capacity_kept_from_the_record_is_checked_too() {
+    let stem = "triple-c-dev--u-alice";
+    // Omitted choice + a record: the record's capacity, and its names are
+    // checked (here another owner's group appeared under it).
+    let api = FakeOnboard {
+        record: Some(record_json("dev", "alice")),
+        cluster: Some(named(Some("ACTIVE"), Some(USER_ID))),
+        group: Some(named(None, Some(USER_ID))),
+        ..Default::default()
+    };
+    let vars = prepare(&api, None).unwrap();
+    assert_eq!(vars["ec2_instance_type"], "m7g.xlarge");
+    assert_eq!(vars["ec2_max_instances"], 2);
+    assert!(api.calls().contains(&format!("group {stem}")));
+
+    // A record that can't be used (unreadable or invalid) and no choice:
+    // refused before any name lookup or launch.
+    for api in [
+        FakeOnboard {
+            record_denied: true,
+            ..Default::default()
+        },
+        FakeOnboard {
+            record: Some("{\"schema\": 9}".into()),
+            ..Default::default()
+        },
+    ] {
+        let e = prepare(&api, None).unwrap_err();
+        assert!(format!("{e:?}").contains("explicitly"), "{e:?}");
+        assert!(api.calls().iter().all(|c| c.starts_with("parameter ")));
+    }
+}
+
+#[test]
+fn a_bundle_warns_when_its_cluster_name_looks_taken() {
+    let run = |api: &FakeOnboard| {
+        let c = Ec2Compute {
+            instance_type: "m7i.large".into(),
+            max_instances: 1,
+            user_tag: "alice".into(),
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(bundle_ec2_warning(api, "dev", REGION, ACCOUNT, USER_ID, &c))
+    };
+    assert_eq!(run(&FakeOnboard::default()), None);
+    let api = FakeOnboard {
+        cluster: Some(named(Some("ACTIVE"), Some("AROAOTHER:bob"))),
+        ..Default::default()
+    };
+    assert!(run(&api).unwrap().contains("another onboarding"));
+    // Only the cluster half: a workspace user can't read Auto Scaling.
+    assert!(!api.calls().iter().any(|c| c.starts_with("group ")));
+    let api = FakeOnboard {
+        cluster: Some(named(Some("ACTIVE"), Some(USER_ID))),
+        ..Default::default()
+    };
+    assert_eq!(run(&api), None);
 }
 
 #[test]

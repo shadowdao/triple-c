@@ -251,7 +251,7 @@ describe("EnvironmentsPanel", () => {
     backend(
       () => scan({ environments: [env()] }),
       (cmd) => {
-        if (cmd === "save_aws_admin_bundle") return "/home/me/onboard-dev";
+        if (cmd === "save_aws_admin_bundle") return { folder: "/home/me/onboard-dev", warning: null };
         throw new Error(`unexpected ${cmd}`);
       },
     );
@@ -362,12 +362,30 @@ describe("EnvironmentsPanel", () => {
     );
   });
 
+  it("finishing an incomplete onboarding starts from its record and says when it removes EC2", async () => {
+    backend(
+      () => scan({ environments: [env({ onboarding: { state: "incomplete", lock: null, ec2: compute() } })] }),
+      (cmd) => {
+        if (cmd === "list_ec2_instance_types") return instanceTable;
+        throw new Error(`unexpected ${cmd}`);
+      },
+    );
+    render(<EnvironmentsPanel connection={conn} tier="environment_admin" />);
+    await open();
+    fireEvent.click(await screen.findByRole("button", { name: "Join dev" }));
+    const dialog = screen.getByRole("dialog", { name: "Join dev" });
+    expect((within(dialog).getByLabelText("Your triple-c-user value") as HTMLInputElement).value).toBe("alice");
+    expect(within(dialog).queryByText(/This removes your EC2 capacity/)).toBeNull();
+    fireEvent.click(within(dialog).getByRole("radio", { name: "None (Fargate only)" }));
+    expect(within(dialog).getByText("This removes your EC2 capacity (m7g.xlarge) in dev.")).toBeInTheDocument();
+  });
+
   it("a joined workspace user's capacity change is a bundle starting from their record", async () => {
     backend(
       () => scan({ environments: [env({ onboarding: { state: "joined", ec2: compute({ max_instances: 1 }) } })] }),
       (cmd) => {
         if (cmd === "list_ec2_instance_types") return instanceTable;
-        if (cmd === "save_aws_admin_bundle") return "/home/me/onboard-dev";
+        if (cmd === "save_aws_admin_bundle") return { folder: "/home/me/onboard-dev", warning: null };
         throw new Error(`unexpected ${cmd}`);
       },
     );

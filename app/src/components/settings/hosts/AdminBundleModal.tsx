@@ -65,6 +65,7 @@ export default function AdminBundleModal({
   const [ec2Draft, setEc2Draft] = useState<Ec2Draft>(() => ec2DraftFrom(recordedEc2));
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState<string | null>(null);
+  const [warning, setWarning] = useState<string | null>(null);
   const [error, setError] = useState<AwsError | null>(null);
   const [copyNote, setCopyNote] = useState<string | null>(null);
 
@@ -83,16 +84,17 @@ export default function AdminBundleModal({
     setSaving(true);
     setError(null);
     try {
-      const folder = await saveAwsAdminBundle(connectionId, region, kind, {
+      const result = await saveAwsAdminBundle(connectionId, region, kind, {
         environment: askEnvironment ? name : environment,
         ownerId,
         network: picked && "network" in picked ? picked.network : network,
         ...(askEnvironment && capHours !== null ? { maxWorkspaceHours: capHours } : {}),
         ...(ec2 && "compute" in ec2 ? { ec2: ec2.compute } : {}),
       });
-      if (folder) {
-        setSaved(folder);
-        onSaved?.(folder);
+      if (result) {
+        setSaved(result.folder);
+        setWarning(result.warning);
+        onSaved?.(result.folder);
       }
     } catch (e) {
       setError(toAwsError(e));
@@ -166,6 +168,11 @@ export default function AdminBundleModal({
         )}
         {saved && (
           <div className="space-y-1.5">
+            {warning && (
+              <p role="alert" className="text-[var(--warning)]">
+                {warning}
+              </p>
+            )}
             <p>
               Saved to <code className="font-mono text-[var(--text-primary)] break-all">{saved}</code>
             </p>

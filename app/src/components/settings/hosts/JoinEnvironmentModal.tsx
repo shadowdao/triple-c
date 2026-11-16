@@ -65,10 +65,15 @@ export default function JoinEnvironmentModal({
     >
       <div className="space-y-3 text-xs text-[var(--text-secondary)] leading-snug">
         {!reapply && <p>Joining creates your own task role and file system in {environment}.</p>}
-        {reapply && recorded && (
+        {recorded && (
           <p>Stop your EC2 workspaces before removing EC2 capacity or changing your triple-c-user value: that change can't finish while one runs.</p>
         )}
         <Ec2CapacityFields value={draft} onChange={setDraft} />
+        {recorded && !draft.enabled && (
+          <p role="alert" className="text-[var(--warning)]">
+            This removes your EC2 capacity ({recorded.instance_type}) in {environment}.
+          </p>
+        )}
         {error && (
           <p role="alert" className="text-[var(--error)]">
             {awsErrorMessage(error)}

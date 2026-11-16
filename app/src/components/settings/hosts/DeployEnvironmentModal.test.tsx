@@ -144,7 +144,7 @@ describe("DeployEnvironmentModal", () => {
   it("offers the boundary bundle when the boundary run fails, with its summary as the reason", async () => {
     invoke.mockImplementation(async (cmd: string) => {
       if (cmd === "deploy_aws_permissions_boundary") return "b1";
-      if (cmd === "save_aws_admin_bundle") return "/tmp/b";
+      if (cmd === "save_aws_admin_bundle") return { folder: "/tmp/b", warning: null };
       throw new Error(`unexpected ${cmd}`);
     });
     const props = renderModal({ scan: scan({ boundary: "no" }) });
@@ -166,7 +166,7 @@ describe("DeployEnvironmentModal", () => {
   it("opens the boundary bundle when the boundary command itself is denied", async () => {
     invoke.mockImplementation(async (cmd: string) => {
       if (cmd === "deploy_aws_permissions_boundary") throw { kind: "access_denied", action: "iam:CreatePolicy", message: "denied iam:CreatePolicy" };
-      if (cmd === "save_aws_admin_bundle") return "/tmp/b";
+      if (cmd === "save_aws_admin_bundle") return { folder: "/tmp/b", warning: null };
       throw new Error(`unexpected ${cmd}`);
     });
     renderModal({ scan: scan({ boundary: "no" }) });

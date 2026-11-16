@@ -13,7 +13,7 @@ describe("AdminBundleModal", () => {
 
   it("saves the bundle and shows the folder and the two commands, with Copy", async () => {
     invoke.mockImplementation(async (cmd: string) =>
-      cmd === "list_ec2_instance_types" ? instanceTable : "/home/me/triple-c-onboard-dev",
+      cmd === "list_ec2_instance_types" ? instanceTable : { folder: "/home/me/triple-c-onboard-dev", warning: null },
     );
     const writeText = vi.fn().mockResolvedValue(undefined);
     Object.assign(navigator, { clipboard: { writeText } });
@@ -42,7 +42,7 @@ describe("AdminBundleModal", () => {
 
   it("an onboarding bundle carries the chosen EC2 capacity", async () => {
     invoke.mockImplementation(async (cmd: string) =>
-      cmd === "list_ec2_instance_types" ? instanceTable : "/tmp/onboard",
+      cmd === "list_ec2_instance_types" ? instanceTable : { folder: "/tmp/onboard", warning: "An ECS cluster named triple-c-dev--u-bob already belongs to another onboarding." },
     );
     render(
       <AdminBundleModal connectionId="h1" region="eu-west-1" kind="user_onboard" environment="dev" ownerId="AIDAEXAMPLE" onClose={vi.fn()} />,
@@ -66,6 +66,40 @@ describe("AdminBundleModal", () => {
         ec2: { instance_type: "m7i.large", max_instances: 4, user_tag: "bob" },
       }),
     );
+    // The app's partial check of the name (cluster only) warns, never refuses.
+    expect(await screen.findByText(/already belongs to another onboarding/)).toBeInTheDocument();
+    expect(screen.getByText("/tmp/onboard")).toBeInTheDocument();
+  });
+
+  it("keeps the recorded instance type, read-only, when the list can't load", async () => {
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_ec2_instance_types") throw new Error("boom");
+      return null;
+    });
+    render(
+      <AdminBundleModal
+        connectionId="h1"
+        region="eu-west-1"
+        kind="user_onboard"
+        environment="dev"
+        ownerId="AIDAEXAMPLE"
+        recordedEc2={{
+          instance_type: "r7g.2xlarge",
+          max_instances: 2,
+          user_tag: "alice",
+          cluster_arn: "arn:aws:ecs:eu-west-1:123456789012:cluster/triple-c-dev--u-alice",
+          capacity_provider: "triple-c-dev--u-alice",
+        }}
+        onClose={vi.fn()}
+      />,
+    );
+    expect(await screen.findByText(/Could not load the instance types/)).toBeInTheDocument();
+    const type = screen.getByLabelText("Instance type") as HTMLSelectElement;
+    expect(type).toBeDisabled();
+    expect(type.value).toBe("r7g.2xlarge");
+    expect(screen.getByText(/keeping r7g.2xlarge/)).toBeInTheDocument();
+    // The kept values can still be saved.
+    expect(screen.getByRole("button", { name: "Save bundle to folder…" })).toBeEnabled();
   });
 
   it("an environment bundle has no EC2 capacity", () => {
@@ -83,7 +117,7 @@ describe("AdminBundleModal", () => {
   });
 
   it("an environment bundle asks for the name and network", async () => {
-    invoke.mockResolvedValue("/tmp/env");
+    invoke.mockResolvedValue({ folder: "/tmp/env", warning: null });
     render(<AdminBundleModal connectionId="h1" region="eu-west-1" kind="environment" onClose={vi.fn()} />);
     fireEvent.change(screen.getByLabelText("Name"), { target: { value: "team" } });
     fireEvent.click(screen.getByRole("radio", { name: "Private + NAT" }));
@@ -102,7 +136,7 @@ describe("AdminBundleModal", () => {
   });
 
   it("an environment bundle carries the lifetime cap", async () => {
-    invoke.mockResolvedValue("/tmp/env");
+    invoke.mockResolvedValue({ folder: "/tmp/env", warning: null });
     render(<AdminBundleModal connectionId="h1" region="eu-west-1" kind="environment" onClose={vi.fn()} />);
     fireEvent.change(screen.getByLabelText("Maximum workspace lifetime (hours, 0 = none)"), { target: { value: "24" } });
     fireEvent.click(screen.getByRole("button", { name: "Save bundle to folder…" }));

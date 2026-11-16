@@ -95,7 +95,8 @@ export default function Ec2CapacityFields({
           </Field>
           {loadError && (
             <p role="alert" className="text-xs text-[var(--error)]">
-              Could not load the instance types.
+              Could not load the instance types
+              {value.instanceType ? `; keeping ${value.instanceType}.` : "; detect again to choose one."}
             </p>
           )}
           <Field label="Maximum instances" hint="How many of your EC2 workspaces can run at once (one per instance).">

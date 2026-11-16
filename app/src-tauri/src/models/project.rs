@@ -1616,6 +1616,20 @@ mod tests {
                 t.instance_type
             );
         }
+        // And the other way: every type the spec table sizes is listed (a
+        // family added to one but not the other fails here).
+        let families = [
+            "m7i", "m7g", "m7a", "m6i", "c7i", "c7g", "c7a", "r7i", "r7g", "r7a", "t3", "t3a",
+            "t4g", "p5", "g6",
+        ];
+        for family in families {
+            for size in ["medium", "large", "xlarge", "2xlarge", "4xlarge", "8xlarge", "metal"] {
+                let t = format!("{family}.{size}");
+                if ec2_instance_spec(&t).is_some() {
+                    assert!(list.iter().any(|row| row.instance_type == t), "{t} missing");
+                }
+            }
+        }
         let arch = |name: &str| list.iter().find(|t| t.instance_type == name).unwrap().arch;
         assert_eq!(arch("m7i.large"), Arch::X86_64);
         assert_eq!(arch("t3.xlarge"), Arch::X86_64);
