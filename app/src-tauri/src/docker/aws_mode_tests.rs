@@ -273,6 +273,42 @@ fn link_persistent_home_without_the_mount_changes_nothing() {
     assert!(fs::symlink_metadata(home.join(".claude")).unwrap().is_dir());
 }
 
+#[test]
+fn efs_storage_links_home_state_like_hybrid() {
+    let script = format!(
+        "{}\nfor m in hybrid efs ephemeral '' HYBRID efsx; do aws_storage_links_home \"$m\" && echo \"$m:yes\" || echo \"$m:no\"; done\n",
+        aws_blocks(&["aws_env", "aws_home"])
+    );
+    let out = bash(&script, &[], &[], &[]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "hybrid:yes\nefs:yes\nephemeral:no\n:no\nHYBRID:no\nefsx:no\n"
+    );
+    // The call site asks it, rather than testing for `hybrid` alone (an EFS
+    // task would otherwise get no home links at all).
+    let call = ENTRYPOINT
+        .lines()
+        .position(|l| l.trim_start().starts_with("link_persistent_home /home/claude"))
+        .unwrap();
+    let above = ENTRYPOINT.lines().nth(call - 1).unwrap();
+    assert_eq!(
+        above.trim(),
+        "if [ \"$triplec_aws\" = 1 ] && aws_storage_links_home \"${TRIPLEC_STORAGE:-}\"; then"
+    );
+}
+
+#[test]
+fn efs_workspace_check_warns_only_when_workspace_is_not_mounted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = format!("{}\naws_efs_workspace_check \"$1\"; echo \"rc=$?\"\n", aws_blocks(&["aws_env", "aws_home"]));
+    let out = bash(&script, &[tmp.path()], &[], &[]);
+    assert!(text(&out).contains("is not mounted"), "{}", text(&out));
+    assert!(text(&out).contains("rc=0"), "{}", text(&out));
+    let out = bash(&script, &[Path::new("/proc")], &[], &[]);
+    assert!(!text(&out).contains("warning"), "{}", text(&out));
+    assert!(text(&out).contains("rc=0"), "{}", text(&out));
+}
+
 /// `write_claude_json` with the Hybrid mount at `<tmp>/mnt`, in aws mode or not.
 fn write_claude_json(tmp: &Path, aws: bool) -> Output {
     let mnt = tmp.join("mnt");
@@ -424,6 +460,50 @@ fn clone_repos_clones_skips_existing_and_reports_failures_without_failing() {
         "main-copy\tcloning\nmain-copy\tcloned\ndev-copy\tcloning\ndev-copy\tcloned\n\
          existing\texists\nbroken\tcloning\nbroken\tfailed\n.dotted\tcloning\n.dotted\tcloned\n"
     );
+}
+
+#[test]
+fn clone_repos_on_a_persistent_workspace_skips_on_restart_and_redoes_a_clone_cut_short() {
+    // EFS storage: /workspace outlives the task, so the next start sees
+    // what the last one left.
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("workspace");
+    fs::create_dir_all(&ws).unwrap();
+    let remote = bare_remote(tmp.path(), "proj");
+    let json = format!(
+        r#"[{{"url":"{r}","branch":null,"folder":"a"}},{{"url":"{r}","branch":null,"folder":"b"}}]"#,
+        r = remote.display()
+    );
+    let script = format!("{}\nclone_repos \"$JSON\" \"$1\" \"$2\"\n", aws_blocks(&["aws_env", "aws_repos"]));
+    let run = |status: &Path| {
+        fs::create_dir_all(status).unwrap();
+        let out = bash(&script, &[&ws, status], &[("JSON", &json)], &[]);
+        assert!(out.status.success(), "{}", text(&out));
+        (text(&out), fs::read_to_string(status.join("repos")).unwrap())
+    };
+    let (_, first) = run(&tmp.path().join("s1"));
+    assert_eq!(first, "a\tcloning\na\tcloned\nb\tcloning\nb\tcloned\n");
+    // A finished clone carries no in-progress mark.
+    for f in ["a", "b"] {
+        let o = Command::new("git")
+            .args(["config", "--file"])
+            .arg(ws.join(f).join(".git/config"))
+            .args(["--get", "triplec.cloning"])
+            .output()
+            .unwrap();
+        assert!(!o.status.success(), "{f} still marked");
+    }
+
+    // The user's work in a, and b as a clone the last task was killed in
+    // the middle of (its mark still set, its checkout missing).
+    fs::write(ws.join("a/mine"), "work").unwrap();
+    git(&ws.join("b"), &["config", "triplec.cloning", "1"]);
+    fs::remove_file(ws.join("b/README")).unwrap();
+    let (log, second) = run(&tmp.path().join("s2"));
+    assert_eq!(second, "a\texists\nb\tcloning\nb\tcloned\n", "{log}");
+    assert!(log.contains("cut short"), "{log}");
+    assert_eq!(fs::read_to_string(ws.join("a/mine")).unwrap(), "work", "never touched");
+    assert_eq!(fs::read_to_string(ws.join("b/README")).unwrap(), "hello");
 }
 
 /// A stand-in `ssh` that records how it was called and fails.
@@ -1196,6 +1276,7 @@ fn docker_mode_never_reaches_the_aws_blocks() {
         "aws_hybrid_ssh_dir",
         "aws_before_stop",
         "start_idle_watch",
+        "aws_efs_workspace_check",
     ];
     let guarded = |s: &str| s.contains("\"$triplec_aws\" = 1");
     let mut seen = 0;
@@ -1211,7 +1292,10 @@ fn docker_mode_never_reaches_the_aws_blocks() {
             "unguarded call outside the aws blocks: {line}"
         );
     }
-    assert_eq!(seen, 5, "the call sites: Hybrid link, Hybrid ~/.ssh, clone, idle watch, stop");
+    assert_eq!(
+        seen, 6,
+        "the call sites: Hybrid/EFS link, EFS /workspace check, Hybrid ~/.ssh, clone, idle watch, stop"
+    );
     // Clones start in the background *after* the agent: the app gives a
     // starting task's agent only seconds to answer.
     let pos = |needle: &str| {

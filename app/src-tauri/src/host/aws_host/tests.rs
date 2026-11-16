@@ -155,11 +155,11 @@ impl WorkspaceApi for Fake {
     async fn create_access_point(
         &self,
         _fs: &str,
-        _root: &str,
+        root: &str,
         _tags: &[(String, String)],
     ) -> Result<String, AwsError> {
         self.log("create-ap");
-        Ok("fsap-new".into())
+        Ok(if root.starts_with("/triple-c-workspaces/") { "fsap-ws" } else { "fsap-new" }.into())
     }
     async fn put_project_secret(
         &self,
@@ -307,6 +307,76 @@ async fn a_first_start_prepares_runs_waits_and_connects_in_that_order() {
         fake.connect_tokens.lock().unwrap()[0],
         secret["TRIPLEC_AGENT_TOKEN"].as_str().unwrap()
     );
+}
+
+#[tokio::test]
+async fn an_efs_start_waits_for_both_access_points_and_records_them() {
+    let p = aws_project(StorageMode::Efs);
+    let fake = Fake { run: Some(task(&p, "new", "RUNNING", true)), ..Default::default() };
+    let w = who();
+    let records = Mutex::new(Vec::new());
+    let on_task = |r: Option<&TaskRecord>| records.lock().unwrap().push(r.cloned());
+    let started = start_core(&fake, &fake, &fake, &fake, &inputs(&p, &w, &on_task), &|_| {})
+        .await
+        .unwrap();
+    assert_eq!(started.access_point_id.as_deref(), Some("fsap-new"));
+    assert_eq!(started.workspace_access_point_id.as_deref(), Some("fsap-ws"));
+    let calls = fake.calls();
+    let pos = |c: &str| calls.iter().position(|x| x == c).unwrap_or_else(|| panic!("{c}: {calls:?}"));
+    assert!(pos("ap-state fsap-new") < pos("run"), "{calls:?}");
+    assert!(pos("ap-state fsap-ws") < pos("run"), "{calls:?}");
+    let recs = records.into_inner().unwrap();
+    let rec = recs[0].as_ref().unwrap();
+    assert_eq!(rec.access_point_id.as_deref(), Some("fsap-new"));
+    assert_eq!(rec.workspace_access_point_id.as_deref(), Some("fsap-ws"));
+
+    // Hybrid waits for one and records none for /workspace.
+    let p = aws_project(StorageMode::Hybrid);
+    let fake = Fake { run: Some(task(&p, "new", "RUNNING", true)), ..Default::default() };
+    let records = Mutex::new(Vec::new());
+    let on_task = |r: Option<&TaskRecord>| records.lock().unwrap().push(r.cloned());
+    let started = start_core(&fake, &fake, &fake, &fake, &inputs(&p, &w, &on_task), &|_| {})
+        .await
+        .unwrap();
+    assert_eq!(started.workspace_access_point_id, None);
+    assert!(!fake.called("ap-state fsap-ws"));
+    assert_eq!(records.into_inner().unwrap()[0].as_ref().unwrap().workspace_access_point_id, None);
+}
+
+#[test]
+fn switching_efs_to_hybrid_keeps_the_stored_workspace_access_point() {
+    let mut p = aws_project(StorageMode::Hybrid);
+    p.aws.as_mut().unwrap().workspace_access_point_id = Some("fsap-ws".into());
+    let (_d, store) = store_with(&p);
+    // A Hybrid start knows no /workspace access point: the stored one stays.
+    record_task(
+        &store,
+        &p.id,
+        Some(&TaskRecord {
+            task_arn: "arn:t".into(),
+            access_point_id: Some("fsap-home".into()),
+            task_definition_arn: None,
+            workspace_access_point_id: None,
+        }),
+    );
+    let a = store.get(&p.id).unwrap().aws.unwrap();
+    assert_eq!(a.workspace_access_point_id.as_deref(), Some("fsap-ws"));
+    record_task(&store, &p.id, None);
+    let a = store.get(&p.id).unwrap().aws.unwrap();
+    assert_eq!(a.workspace_access_point_id.as_deref(), Some("fsap-ws"));
+    // An EFS start records its own.
+    record_task(
+        &store,
+        &p.id,
+        Some(&TaskRecord {
+            task_arn: "arn:t2".into(),
+            access_point_id: None,
+            task_definition_arn: None,
+            workspace_access_point_id: Some("fsap-ws2".into()),
+        }),
+    );
+    let a = store.get(&p.id).unwrap().aws.unwrap();
+    assert_eq!(a.workspace_access_point_id.as_deref(), Some("fsap-ws2"));
 }
 
 #[tokio::test]
@@ -666,7 +736,12 @@ fn a_start_records_its_task_and_keeps_the_stored_handles_it_does_not_know() {
     record_task(
         &store,
         &p.id,
-        Some(&TaskRecord { task_arn: "arn:t".into(), access_point_id: None, task_definition_arn: Some("arn:td:2".into()) }),
+        Some(&TaskRecord {
+            task_arn: "arn:t".into(),
+            access_point_id: None,
+            task_definition_arn: Some("arn:td:2".into()),
+            workspace_access_point_id: None,
+        }),
     );
     let a = store.get(&p.id).unwrap().aws.unwrap();
     assert_eq!((a.task_arn.as_deref(), a.access_point_id.as_deref(), a.task_definition_arn.as_deref()),
@@ -720,7 +795,12 @@ fn the_log_task_is_the_stored_one_else_the_last_one_a_start_saw() {
     record_task(
         &store,
         &p.id,
-        Some(&TaskRecord { task_arn: "arn:first".into(), access_point_id: None, task_definition_arn: None }),
+        Some(&TaskRecord {
+            task_arn: "arn:first".into(),
+            access_point_id: None,
+            task_definition_arn: None,
+            workspace_access_point_id: None,
+        }),
     );
     record_task(&store, &p.id, None);
     assert_eq!(log_task_arn(&p).as_deref(), Some("arn:first"), "a cleared ARN still has a log");

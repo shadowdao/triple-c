@@ -3,6 +3,7 @@ import type { AwsWorkspaceConfig, HostConnection, Project, RepoSource } from "..
 import * as commands from "../../../../lib/tauri-commands";
 import { useAppState } from "../../../../store/appState";
 import {
+  EFS_HINT,
   EPHEMERAL_WARNING,
   FARGATE_CPUS,
   defaultAwsWorkspace,
@@ -10,6 +11,7 @@ import {
   formatMemory,
   memoryError,
   hasSavedFiles,
+  hasWorkspaceFiles,
   memoryOptions,
   nearestMemory,
 } from "../../../../lib/awsWorkspace";
@@ -57,9 +59,19 @@ export default function HostSection({ project, save, disabled }: Props) {
 
   const saveAws = (patch: Partial<AwsWorkspaceConfig>) => save({ aws: { ...aws, ...patch } });
 
-  const hasResources = !!(aws.task_arn || aws.access_point_id || aws.task_definition_arn);
-  // A removal that kept the saved files keeps their access point stored.
-  const onlyAccessPoint = !!aws.access_point_id && !aws.task_arn && !aws.task_definition_arn;
+  const hasResources = !!(
+    aws.task_arn ||
+    aws.access_point_id ||
+    aws.workspace_access_point_id ||
+    aws.task_definition_arn
+  );
+  // A removal that kept the saved files keeps their access points stored.
+  const onlyAccessPoint =
+    !!(aws.access_point_id || aws.workspace_access_point_id) &&
+    !aws.task_arn &&
+    !aws.task_definition_arn;
+  // Switched away from EFS: its /workspace files are still on their access point.
+  const keptWorkspaceFiles = aws.storage !== "efs" && !!aws.workspace_access_point_id;
   // Not `disabled` (which also allows Error): on AWS, Error can mean a live task.
   const stopped = project.status === "stopped";
 
@@ -196,11 +208,9 @@ export default function HostSection({ project, save, disabled }: Props) {
             segments={[
               { value: "ephemeral", label: "Ephemeral", caution: true },
               { value: "hybrid", label: "Hybrid" },
+              { value: "efs", label: "EFS" },
             ]}
           />
-          <span className="text-xs text-[var(--text-disabled)]">
-            EFS (everything persists) — coming later
-          </span>
         </div>
         {aws.storage === "ephemeral" ? (
           <p
@@ -209,17 +219,36 @@ export default function HostSection({ project, save, disabled }: Props) {
           >
             {EPHEMERAL_WARNING} Push your work to a remote before stopping.
           </p>
+        ) : aws.storage === "efs" ? (
+          <p className="mt-1 text-xs text-[var(--text-secondary)]">
+            <span>{EFS_HINT}</span>. The Claude login, history and SSH keys are kept on EFS too.
+          </p>
         ) : (
           <p className="mt-1 text-xs text-[var(--text-secondary)]">
             The Claude login, history and SSH keys are kept on EFS between starts; everything
             else, repositories included, starts fresh.
           </p>
         )}
+        {keptWorkspaceFiles && (
+          <p
+            role="note"
+            aria-label="EFS files kept"
+            className="mt-2 px-2 py-1.5 text-xs text-[var(--text-secondary)] bg-[var(--bg-secondary)] border border-[var(--border-color)] rounded-[var(--radius-control)]"
+          >
+            The /workspace files from when this project used EFS storage stay on their access
+            point until &ldquo;Remove AWS resources&rdquo; removes it (with the access points
+            option checked). Switching back to EFS picks them up again.
+          </p>
+        )}
       </div>
 
       <Field
         label="Ephemeral storage (GiB)"
-        hint="The task's local disk: 21 to 200 GiB. Repositories and builds live here."
+        hint={
+          aws.storage === "efs"
+            ? "The task's local disk: 21 to 200 GiB. With EFS storage, /workspace is on EFS instead."
+            : "The task's local disk: 21 to 200 GiB. Repositories and builds live here."
+        }
       >
         {(id) => (
           <input
@@ -346,7 +375,7 @@ export default function HostSection({ project, save, disabled }: Props) {
             !stopped
               ? STILL_RUNNING
               : onlyAccessPoint
-                ? "The saved files' access point is still on AWS. Remove the AWS resources with \u201cAlso remove the workspace\u2019s file-system access point\u201d first."
+                ? "The saved files' access point is still on AWS. Remove the AWS resources with \u201cAlso remove the workspace\u2019s file-system access points\u201d first."
                 : "Remove the workspace's AWS resources first, so nothing is left running or billed."
           }
           onClick={() => void save({ host_id: null, aws_placement: null, aws: null })}
@@ -422,8 +451,11 @@ function RemoveAwsResourcesModal({ project, onClose }: { project: Project; onClo
             onChange={(e) => setDiscardData(e.target.checked)}
           />
           <span>
-            Also remove the workspace&rsquo;s file-system access point
+            Also remove the workspace&rsquo;s file-system access points
             <span className="block text-xs text-[var(--text-secondary)]">
+              {hasWorkspaceFiles(project)
+                ? "Both go: the one for the saved home files and the one for /workspace. "
+                : ""}
               The files stay on your own EFS file system (only your workspace role can read
               them) until an administrator offboards you. Left unchecked, the access point
               stays too: the next start here reuses it, and the project can&rsquo;t move to

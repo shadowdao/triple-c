@@ -715,7 +715,7 @@ pub async fn remove_project(
 
     // An AWS project's task and resources go first, and a failure keeps the
     // project: its record is the only handle on a billed task and its
-    // secret. Its EFS access point goes only when asked (the files stay on the
+    // secret. Its EFS access points go only when asked (the files stay on the
     // user's own file system until offboarding).
     if let Some(project) = state.projects_store.get(&project_id).filter(|p| p.is_aws()) {
         let settings = state.settings_store.get();
@@ -1463,7 +1463,7 @@ async fn start_project_container_locked(
     // id stored above is the tunnel's endpoint URL, which is what the death
     // watch reports a stopped task as.
     if project.is_aws() {
-        if let Some((task_arn, access_point_id, task_definition_arn)) =
+        if let Some((task_arn, access_point_id, task_definition_arn, workspace_access_point_id)) =
             crate::host::tunnels::runtime(&project_id)
         {
             state.projects_store.set_aws_runtime(
@@ -1471,7 +1471,7 @@ async fn start_project_container_locked(
                 Some(task_arn),
                 access_point_id,
                 Some(task_definition_arn),
-                project.aws.as_ref().and_then(|a| a.workspace_access_point_id.clone()), // Task 3: from the start
+                workspace_access_point_id,
             )?;
         }
     }
@@ -1699,24 +1699,37 @@ pub async fn remove_aws_resources(
     ProjectHost::for_project(&project)
         .remove_aws_resources(&project, &settings, discard_data)
         .await?;
-    state
-        .projects_store
-        .set_aws_runtime(&project_id, None, access_point_after_removal(&project, discard_data), None, None)?;
+    let (access_point_id, workspace_access_point_id) =
+        access_points_after_removal(&project, discard_data);
+    state.projects_store.set_aws_runtime(
+        &project_id,
+        None,
+        access_point_id,
+        None,
+        workspace_access_point_id,
+    )?;
     state
         .projects_store
         .get(&project_id)
         .ok_or_else(|| format!("Project {} not found", project_id))
 }
 
-/// The access point a removal leaves stored: kept when the saved files were
-/// kept (it is still there, a later start reuses it and a later removal
-/// with `discard_data` deletes it; and while it is stored the project can't
-/// move away from it — [`validate_aws_update`]), gone when they were not.
-fn access_point_after_removal(project: &Project, discard_data: bool) -> Option<String> {
-    if discard_data {
-        return None;
+/// The access points (home, EFS `/workspace`) a removal leaves stored: kept
+/// when the saved files were kept (they are still there, a later start
+/// reuses them and a later removal with `discard_data` deletes them; and
+/// while one is stored the project can't move away from it —
+/// [`validate_aws_update`]), gone when they were not.
+fn access_points_after_removal(
+    project: &Project,
+    discard_data: bool,
+) -> (Option<String>, Option<String>) {
+    match project.aws.as_ref() {
+        Some(a) if !discard_data => (
+            a.access_point_id.clone(),
+            a.workspace_access_point_id.clone(),
+        ),
+        _ => (None, None),
     }
-    project.aws.as_ref().and_then(|a| a.access_point_id.clone())
 }
 
 fn check_aws_resources_removable(project: &Project) -> Result<(), String> {
@@ -2712,14 +2725,14 @@ mod tests {
         let hosts = vec![host("h1")];
         let mut stored = aws_project();
         stored.aws.as_mut().unwrap().access_point_id = Some("fsap-1".into());
-        assert_eq!(access_point_after_removal(&stored, false), Some("fsap-1".into()));
-        assert_eq!(access_point_after_removal(&stored, true), None);
+        assert_eq!(access_points_after_removal(&stored, false), (Some("fsap-1".into()), None));
+        assert_eq!(access_points_after_removal(&stored, true), (None, None));
         // What the store holds after a keep-the-files removal still blocks a move.
         let mut after = stored.clone();
         let a = after.aws.as_mut().unwrap();
         a.task_arn = None;
         a.task_definition_arn = None;
-        a.access_point_id = access_point_after_removal(&stored, false);
+        a.access_point_id = access_points_after_removal(&stored, false).0;
         let mut local = after.clone();
         local.host_id = None;
         local.aws_placement = None;
@@ -2727,8 +2740,31 @@ mod tests {
         let e = validate_aws_update(&after, &local, &hosts).unwrap_err();
         assert!(e.contains("access point"), "{e}");
         // After a discarding removal it can move.
-        after.aws.as_mut().unwrap().access_point_id = access_point_after_removal(&stored, true);
+        after.aws.as_mut().unwrap().access_point_id = access_points_after_removal(&stored, true).0;
         assert!(validate_aws_update(&after, &local, &hosts).is_ok());
+    }
+
+    #[test]
+    fn a_removal_keeps_or_drops_both_access_points_together() {
+        let hosts = vec![host("h1")];
+        // EFS switched to Hybrid: the /workspace access point is still stored.
+        let mut stored = aws_project();
+        let a = stored.aws.as_mut().unwrap();
+        a.access_point_id = Some("fsap-1".into());
+        a.workspace_access_point_id = Some("fsap-w".into());
+        assert_eq!(
+            access_points_after_removal(&stored, false),
+            (Some("fsap-1".into()), Some("fsap-w".into()))
+        );
+        assert_eq!(access_points_after_removal(&stored, true), (None, None));
+        // Kept: the stored /workspace access point alone still blocks a move.
+        let mut after = stored.clone();
+        after.aws.as_mut().unwrap().access_point_id = None;
+        let mut local = after.clone();
+        local.host_id = None;
+        local.aws_placement = None;
+        local.aws = None;
+        assert!(validate_aws_update(&after, &local, &hosts).is_err());
     }
 
     #[test]

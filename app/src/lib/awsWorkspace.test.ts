@@ -3,6 +3,7 @@ import {
   cleanRepos,
   defaultAwsWorkspace,
   hasSavedFiles,
+  hasWorkspaceFiles,
   environmentSelectable,
   memoryError,
   memoryOptions,
@@ -77,5 +78,13 @@ describe("phase 6 settings", () => {
     expect(hasSavedFiles({ aws: { ...aws, storage: "efs" } })).toBe(true);
     expect(hasSavedFiles({ aws: { ...aws, storage: "ephemeral", workspace_access_point_id: "fsap-w" } })).toBe(true);
     expect(hasSavedFiles({ aws: { ...aws, storage: "ephemeral" } })).toBe(false);
+  });
+
+  it("knows when /workspace files may be on EFS", () => {
+    const aws = defaultAwsWorkspace();
+    expect(hasWorkspaceFiles({ aws: { ...aws, storage: "efs" } })).toBe(true);
+    expect(hasWorkspaceFiles({ aws: { ...aws, storage: "hybrid", workspace_access_point_id: "fsap-w" } })).toBe(true);
+    expect(hasWorkspaceFiles({ aws: { ...aws, storage: "hybrid" } })).toBe(false);
+    expect(hasWorkspaceFiles({ aws: null })).toBe(false);
   });
 });

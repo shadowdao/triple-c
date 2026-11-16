@@ -213,7 +213,9 @@ remap_uid_gid() {
 # ~/.claude volume.
 find /home/claude \( ! -user claude -o ! -group claude \) -exec chown -h claude:claude {} +
 
-# ── AWS Hybrid storage: persisted home state (plan ruling P4) ───────────────
+# ── AWS Hybrid/EFS storage: persisted home state (plan ruling P4) ───────────
+# EFS storage is Hybrid plus /workspace on a second access point (mounted by
+# the task definition straight at /workspace), so it gets the same home links.
 # A Hybrid workspace mounts its EFS access point (POSIX 1000:1000) at
 # /mnt/triple-c-home. Mounting it over /home/claude would hide the image's
 # Claude Code, cargo and uv — EFS has no Docker-volume "copy the image's
@@ -276,9 +278,30 @@ aws_hybrid_ssh_dir() {
     [ ! -L "$triplec_home_mnt" ] && [ ! -L "$want" ] && [ -d "$want" ] || return 1
     printf '%s' "$want"
 }
+
+# Whether storage mode $1 persists home state (Hybrid, and EFS = Hybrid +
+# /workspace on EFS).
+aws_storage_links_home() {
+    case "$1" in
+        hybrid|efs) return 0 ;;
+    esac
+    return 1
+}
+
+# EFS storage: /workspace is the access point itself (uid/gid 1000 enforced,
+# root acts as 1000 there). Nothing here creates or chowns it; only says so
+# when it is missing, since the files would then not survive a stop.
+aws_efs_workspace_check() {
+    mountpoint -q "$1" 2>/dev/null \
+        || echo "entrypoint: warning — EFS storage, but $1 is not mounted; its files will not persist"
+    return 0
+}
 # <<< aws_home
-if [ "$triplec_aws" = 1 ] && [ "${TRIPLEC_STORAGE:-}" = hybrid ]; then
+if [ "$triplec_aws" = 1 ] && aws_storage_links_home "${TRIPLEC_STORAGE:-}"; then
     link_persistent_home /home/claude "$triplec_home_mnt" claude:claude
+fi
+if [ "$triplec_aws" = 1 ] && [ "${TRIPLEC_STORAGE:-}" = efs ]; then
+    aws_efs_workspace_check /workspace
 fi
 
 # ── Corporate CA certificates ───────────────────────────────────────────────
@@ -641,6 +664,13 @@ chown claude:claude /home/claude/.gitconfig 2>/dev/null || true
 # folder is its state), and `done` appears when all are finished. The idle
 # watcher counts an unfinished clone as activity; triple-c-wip-push skips a
 # folder still `cloning`.
+# With EFS storage /workspace outlives the task, so a repository already there
+# is skipped on every later start. A clone is marked in progress in its own
+# .git/config (`git clone -c triplec.cloning=1`, written before the fetch) and
+# unmarked once it succeeds; a repository still marked was cut short (the task
+# was killed mid-clone) and is removed and cloned again. A repository the user
+# made never carries the mark. Every look at or removal of it runs as the user:
+# the tree is theirs.
 # >>> aws_repos
 # clone_repos json root [status_dir]
 clone_repos() {
@@ -650,6 +680,10 @@ clone_repos() {
     _clone_status() { [ -z "$status_dir" ] || printf '%s\t%s\n' "$1" "$2" >> "$status_dir/repos"; }
     while IFS= read -r -d '' folder && IFS= read -r -d '' url && IFS= read -r -d '' branch; do
         dest="$root/$folder"
+        if [ -e "$dest/.git" ] && [ "$(_triplec_as_user git config --file "$dest/.git/config" --get triplec.cloning 2>/dev/null)" = 1 ]; then
+            echo "entrypoint: the last clone of $folder was cut short; cloning it again"
+            _triplec_as_user rm -rf -- "$dest"
+        fi
         if [ -e "$dest/.git" ]; then
             echo "entrypoint: /workspace/$folder is already a repository; not cloning"
             _clone_status "$folder" exists
@@ -657,7 +691,7 @@ clone_repos() {
         fi
         existed=0
         [ -e "$dest" ] && existed=1
-        local args=(clone --quiet)
+        local args=(clone --quiet -c triplec.cloning=1)
         [ -n "$branch" ] && args+=(--branch "$branch")
         args+=(-- "$url" "$dest")
         echo "entrypoint: cloning $folder..."
@@ -671,6 +705,8 @@ clone_repos() {
             exec timeout -k 10 "$limit" git "$@"' _ "$limit" "${args[@]}" 2>&1 </dev/null)
         rc=$?
         if [ "$rc" -eq 0 ]; then
+            _triplec_as_user git config --file "$dest/.git/config" --unset triplec.cloning \
+                || echo "entrypoint: warning — could not unmark $folder's clone; the next start will clone it again"
             echo "entrypoint: cloned $folder"
             _clone_status "$folder" cloned
             continue

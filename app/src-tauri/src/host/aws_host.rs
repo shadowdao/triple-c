@@ -362,6 +362,8 @@ pub struct TaskRecord {
     pub task_arn: String,
     pub access_point_id: Option<String>,
     pub task_definition_arn: Option<String>,
+    /// EFS storage's `/workspace` access point.
+    pub workspace_access_point_id: Option<String>,
 }
 
 /// A connected task.
@@ -373,6 +375,8 @@ pub struct Started {
     /// The access point the task mounts (Hybrid). `None` when an existing
     /// task was attached to: the store's value stands.
     pub access_point_id: Option<String>,
+    /// The `/workspace` access point (EFS), like `access_point_id`.
+    pub workspace_access_point_id: Option<String>,
     /// This start ran the task (rather than attaching to a running one).
     pub created: bool,
 }
@@ -433,13 +437,14 @@ pub async fn start_core<T: TaskApi, W: WorkspaceApi, R: RuntimeApi, C: Connector
         .await
         .map_err(s)?;
 
-    let (task, token, access_point_id, created) = if let Some(task) = existing {
+    let (task, token, access_point_id, workspace_access_point_id, created) = if let Some(task) = existing {
         // Attach: never rotate a running task's token (P2).
         log::info!("Project {}: attaching to its running task {}", project.id, task.arn);
         (inp.on_task)(Some(&TaskRecord {
             task_arn: task.arn.clone(),
             access_point_id: None,
             task_definition_arn: Some(task.task_definition_arn.clone()),
+            workspace_access_point_id: None,
         }));
         let token = read_agent_token(rt, &env.name, &ok, &project.id).await.map_err(s)?;
         progress(PROGRESS_WAITING);
@@ -447,7 +452,7 @@ pub async fn start_core<T: TaskApi, W: WorkspaceApi, R: RuntimeApi, C: Connector
             Ok(t) => t,
             Err(e) => return Err(with_log_tail(tasks, &logs, &task.arn, e.to_string()).await),
         };
-        (task, token, None, false)
+        (task, token, None, None, false)
     } else {
         progress(PROGRESS_PREPARING);
         let prepared = prepare_workspace(
@@ -461,7 +466,10 @@ pub async fn start_core<T: TaskApi, W: WorkspaceApi, R: RuntimeApi, C: Connector
         )
         .await
         .map_err(s)?;
-        if let Some(ap) = &prepared.access_point_id {
+        for ap in [&prepared.access_point_id, &prepared.workspace_access_point_id]
+            .into_iter()
+            .flatten()
+        {
             wait_access_point(rt, ap, inp.access_point_wait).await.map_err(s)?;
         }
         progress(PROGRESS_STARTING);
@@ -482,6 +490,7 @@ pub async fn start_core<T: TaskApi, W: WorkspaceApi, R: RuntimeApi, C: Connector
                 task_arn: start.task.arn.clone(),
                 access_point_id: prepared.access_point_id.clone(),
                 task_definition_arn: Some(start.task.task_definition_arn.clone()),
+                workspace_access_point_id: prepared.workspace_access_point_id.clone(),
             }));
             return Err(START_RACE.into());
         }
@@ -490,6 +499,7 @@ pub async fn start_core<T: TaskApi, W: WorkspaceApi, R: RuntimeApi, C: Connector
             task_arn: arn.clone(),
             access_point_id: prepared.access_point_id.clone(),
             task_definition_arn: Some(prepared.task_definition_arn.clone()),
+            workspace_access_point_id: prepared.workspace_access_point_id.clone(),
         }));
         progress(PROGRESS_WAITING);
         let task = match wait_ready(tasks, &env.cluster_arn, &arn, &logs, inp.wait, |_| {}).await {
@@ -502,7 +512,13 @@ pub async fn start_core<T: TaskApi, W: WorkspaceApi, R: RuntimeApi, C: Connector
                 return Err(msg);
             }
         };
-        (task, prepared.agent_token, prepared.access_point_id, true)
+        (
+            task,
+            prepared.agent_token,
+            prepared.access_point_id,
+            prepared.workspace_access_point_id,
+            true,
+        )
     };
 
     progress(PROGRESS_CONNECTING);
@@ -530,6 +546,7 @@ pub async fn start_core<T: TaskApi, W: WorkspaceApi, R: RuntimeApi, C: Connector
                 forward,
                 endpoint,
                 access_point_id,
+                workspace_access_point_id,
                 created,
             })
         }
@@ -615,6 +632,9 @@ pub async fn ensure_started(
     let access_point_id = started
         .access_point_id
         .or_else(|| project.aws.as_ref().and_then(|a| a.access_point_id.clone()));
+    let workspace_access_point_id = started
+        .workspace_access_point_id
+        .or_else(|| project.aws.as_ref().and_then(|a| a.workspace_access_point_id.clone()));
     let ecs = ecs_task(&started.task)?;
     if let Some(old) = tunnels::register(
         &project.id,
@@ -628,6 +648,7 @@ pub async fn ensure_started(
             forward: started.forward,
             endpoint: endpoint.clone(),
             access_point_id,
+            workspace_access_point_id,
             task_definition_arn: started.task.task_definition_arn.clone(),
         },
     ) {
@@ -651,7 +672,7 @@ pub fn record_task(store: &ProjectsStore, project_id: &str, rec: Option<&TaskRec
             Some(r.task_arn.clone()),
             r.access_point_id.clone().or(stored.access_point_id),
             r.task_definition_arn.clone().or(stored.task_definition_arn),
-            stored.workspace_access_point_id, // Task 3: from the record
+            r.workspace_access_point_id.clone().or(stored.workspace_access_point_id),
         ),
         None => store.set_aws_runtime(
             project_id,
@@ -860,6 +881,8 @@ pub async fn remove_resources(
             project_id: &project.id,
             stored_task_arn: aws.and_then(|a| a.task_arn.as_deref()),
             stored_access_point_id: aws.and_then(|a| a.access_point_id.as_deref()),
+            stored_workspace_access_point_id: aws
+                .and_then(|a| a.workspace_access_point_id.as_deref()),
             discard_data,
         },
     )
@@ -974,6 +997,7 @@ pub async fn reconcile_project<T: TaskApi>(
                         task_arn: t.arn.clone(),
                         access_point_id: None,
                         task_definition_arn: Some(t.task_definition_arn.clone()),
+                        workspace_access_point_id: None,
                     }),
                 );
             }
@@ -1072,6 +1096,10 @@ async fn reattach(
         forward,
         endpoint: endpoint.clone(),
         access_point_id: project.aws.as_ref().and_then(|a| a.access_point_id.clone()),
+        workspace_access_point_id: project
+            .aws
+            .as_ref()
+            .and_then(|a| a.workspace_access_point_id.clone()),
         task_definition_arn: task.task_definition_arn.clone(),
     };
     if !reattach_still_wanted(store, &project.id, &task.arn) {

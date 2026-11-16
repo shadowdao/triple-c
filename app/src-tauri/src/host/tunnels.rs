@@ -51,6 +51,8 @@ pub struct LiveTunnel {
     /// Runtime handles for the store (`set_aws_runtime`).
     pub access_point_id: Option<String>,
     pub task_definition_arn: String,
+    /// EFS storage's `/workspace` access point.
+    pub workspace_access_point_id: Option<String>,
 }
 
 /// Where an endpoint's task is: `(connection, region, cluster, task ARN)`.
@@ -123,13 +125,15 @@ pub fn get_endpoint(project_id: &str) -> Option<AgentEndpoint> {
     lock().live.get(project_id).map(|t| t.endpoint.clone())
 }
 
-/// `(task ARN, access point id, task definition ARN)` of the project's tunnel.
-pub fn runtime(project_id: &str) -> Option<(String, Option<String>, String)> {
+/// `(task ARN, access point id, task definition ARN, workspace access point
+/// id)` of the project's tunnel.
+pub fn runtime(project_id: &str) -> Option<(String, Option<String>, String, Option<String>)> {
     lock().live.get(project_id).map(|t| {
         (
             t.task_arn.clone(),
             t.access_point_id.clone(),
             t.task_definition_arn.clone(),
+            t.workspace_access_point_id.clone(),
         )
     })
 }
@@ -334,6 +338,7 @@ pub(crate) mod tests {
             endpoint: AgentEndpoint::loopback(port, "tok"),
             access_point_id: Some("fsap-1".into()),
             task_definition_arn: "arn:td:1".into(),
+            workspace_access_point_id: None,
         }
     }
 

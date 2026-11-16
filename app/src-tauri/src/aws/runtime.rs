@@ -18,7 +18,7 @@ use super::environments::{knowable, parse_environment_record, EnvironmentInfo, K
 use super::error::{classify_sdk_error, AwsError};
 use super::tasks::{find_project_task, TaskApi, STOP_REASON};
 use super::tofu_modules::{
-    access_point_root, environment_cluster_name, environment_parameter_name, project_secret_name, task_family,
+    access_point_root, workspace_access_point_root, environment_cluster_name, environment_parameter_name, project_secret_name, task_family,
     user_file_system_token, user_role_names,
 };
 use super::workspace::WorkspaceApi;
@@ -234,15 +234,18 @@ pub struct RemoveRequest<'a> {
     /// missed it).
     pub stored_task_arn: Option<&'a str>,
     pub stored_access_point_id: Option<&'a str>,
-    /// Delete the EFS access point (ruling R9). The files stay on the
-    /// user's own file system (only their task role can read it) until
-    /// offboarding destroys it; a later start of the same project gets a new
-    /// access point onto the same directory.
+    /// The EFS-mode `/workspace` access point the store has (kept after a
+    /// switch to Hybrid or Ephemeral, Q1).
+    pub stored_workspace_access_point_id: Option<&'a str>,
+    /// Delete the EFS access points, home and `/workspace` (ruling R9). The
+    /// files stay on the user's own file system (only their task role can
+    /// read it) until offboarding destroys it; a later start of the same
+    /// project gets new access points onto the same directories.
     pub discard_data: bool,
 }
 
 /// Stop the project's task, delete its secret (no recovery window, R10) and,
-/// with `discard_data`, delete its access point (not the files, R9). Task definition revisions
+/// with `discard_data`, delete its access points (not the files, R9). Task definition revisions
 /// are left registered (R8). A task that can't be stopped stops the removal (nothing
 /// billed may be left running); the rest is attempted in full and every
 /// failure reported.
@@ -288,20 +291,27 @@ pub async fn remove_workspace_resources<T: TaskApi, W: WorkspaceApi, R: RuntimeA
         failures.push(format!("secret {secret}: {e}"));
     }
 
-    // 4. The access point, only when asked.
+    // 4. The access points (home, and EFS mode's `/workspace`), only when asked.
     if req.discard_data {
-        let mut ids: Vec<String> = req.stored_access_point_id.map(String::from).into_iter().collect();
+        let mut ids: Vec<String> = [req.stored_access_point_id, req.stored_workspace_access_point_id]
+            .into_iter()
+            .flatten()
+            .map(String::from)
+            .collect();
         let token = user_file_system_token(req.env, req.owner_key);
         match work.find_file_system(&token).await {
             Ok(Some(fs)) if fs.owner.as_deref() == Some(req.owner_user_id) => {
-                let root = access_point_root(req.owner_key, req.project_id);
+                let roots = [
+                    access_point_root(req.owner_key, req.project_id),
+                    workspace_access_point_root(req.owner_key, req.project_id),
+                ];
                 match work.access_points(&fs.id).await {
                     Ok(points) => ids.extend(
                         points
                             .into_iter()
                             .filter(|a| {
                                 a.file_system_id == fs.id
-                                    && a.root_path.as_deref() == Some(root.as_str())
+                                    && a.root_path.as_ref().is_some_and(|r| roots.contains(r))
                                     && a.owner.as_deref() == Some(req.owner_user_id)
                                     && a.project.as_deref() == Some(req.project_id)
                             })

@@ -202,6 +202,17 @@ pub fn access_point_root(owner_key: &str, project_id: &str) -> String {
     format!("/triple-c/{owner_key}/{}", project_component(project_id))
 }
 
+/// The root of the project's EFS-mode `/workspace` access point (Q1):
+/// `/triple-c-workspaces/<owner_key>/<project>`, a sibling tree of the home
+/// roots (under [`access_point_root`] it would sit inside the home access
+/// point). At most 100 characters.
+pub fn workspace_access_point_root(owner_key: &str, project_id: &str) -> String {
+    format!(
+        "/triple-c-workspaces/{owner_key}/{}",
+        project_component(project_id)
+    )
+}
+
 /// The container's `awslogs-stream-prefix`; ECS names the stream
 /// `<prefix>/workspace/<task id>`.
 pub fn log_stream_prefix(owner_key: &str, project_id: &str) -> String {

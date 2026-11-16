@@ -129,6 +129,16 @@ export function hasSavedFiles(p: Pick<Project, "aws">): boolean {
   return a?.storage === "hybrid" || a?.storage === "efs" || !!a?.access_point_id || !!a?.workspace_access_point_id;
 }
 
+/** Whether an AWS project may have `/workspace` files on EFS (EFS storage now,
+ *  or its access point left from when it was). */
+export function hasWorkspaceFiles(p: Pick<Project, "aws">): boolean {
+  const a = p.aws;
+  return a?.storage === "efs" || !!a?.workspace_access_point_id;
+}
+
+/** Shown with EFS storage selected. */
+export const EFS_HINT = "Everything in /workspace survives a stop; git and builds are slower over NFS";
+
 /** Hosts that only mean something on this machine or its Docker bridge. */
 const LOCAL_HOSTS = /^(localhost|127(\.\d{1,3}){3}|0\.0\.0\.0|\[?::1\]?|host\.docker\.internal|172\.17\.0\.1)$/i;
 

@@ -11,7 +11,7 @@ import Button from "../../ui/Button";
 import OverflowMenu from "../../ui/OverflowMenu";
 import ConfirmRemoveModal, { ConfirmForgetAwsModal } from "../ConfirmRemoveModal";
 import StopGuardModal from "../StopGuardModal";
-import { hasSavedFiles, isAwsProject } from "../../../lib/awsWorkspace";
+import { hasSavedFiles, hasWorkspaceFiles, isAwsProject } from "../../../lib/awsWorkspace";
 import { AWS_CONNECTION_MISSING, type RemoveProjectOptions } from "../../../lib/types";
 import ConfirmResetModal from "../ConfirmResetModal";
 import MigrateContainerModal from "../MigrateContainerModal";
@@ -349,6 +349,7 @@ export default function ProjectHome({ projectId, active }: Props) {
           projectName={project.name}
           aws={aws}
           savedFiles={hasSavedFiles(project)}
+          workspaceFiles={hasWorkspaceFiles(project)}
           onCancel={() => setConfirmRemove(false)}
           onConfirm={({ discardData }) => {
             setConfirmRemove(false);

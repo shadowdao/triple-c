@@ -396,7 +396,14 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   every terminal's env and the files hold private keys). Repos clone in the background after the agent
   starts (terminals are usable before they arrive). Hybrid storage mounts EFS at `/mnt/triple-c-home`
   and symlinks `~/.claude`, `~/.claude.json`, `~/.ssh` into it (mounting over `/home/claude` would hide
-  the image's tooling); root never follows those links outside the mount (`aws_hybrid_ssh_dir`). On
+  the image's tooling); root never follows those links outside the mount (`aws_hybrid_ssh_dir`). EFS storage
+  is Hybrid plus a second access point (root `/triple-c-workspaces/<owner_key>/<project>`, a sibling of
+  the home roots) mounted straight at `/workspace`; the entrypoint links home state the same way
+  (`aws_storage_links_home`) and never creates or chowns `/workspace`. Because `/workspace` then
+  outlives the task, `clone_repos` marks a clone in progress in its own `.git/config`
+  (`triplec.cloning`) and redoes one a killed task left marked; a repo without the mark is skipped.
+  Switching EFS → Hybrid/Ephemeral keeps `workspace_access_point_id` (store-owned) until "Remove AWS
+  resources" with discard deletes both access points. On
   TERM the hook pushes unsaved work to a `triple-c/wip/<stamp>` branch via a temporary index (the
   user's index is untouched; needs the task definition's `stopTimeout` raised, 120 s) unless the stop
   marker says the app handled it. The idle watcher runs as root under a supervisor and signals the

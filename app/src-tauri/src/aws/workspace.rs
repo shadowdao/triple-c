@@ -1,5 +1,6 @@
 //! A project's AWS resources, made ready before its task runs: the project
-//! secret, the EFS access point (Hybrid storage) and the task definition.
+//! secret, the EFS access points (Hybrid: home; EFS: home and `/workspace`)
+//! and the task definition.
 //!
 //! **Everything project-shaped goes in the secret (P1).** Every workspace user
 //! has `ecs:Describe*` on `*`, so a task definition's `environment`, tags and
@@ -43,7 +44,7 @@ use super::error::{classify_sdk_error, AwsError};
 use super::identity::CallerIdentity;
 use super::tofu_modules::{
     access_point_root, log_stream_prefix, owner_key, project_secret_name, task_family,
-    user_file_system_token, user_role_names,
+    user_file_system_token, user_role_names, workspace_access_point_root,
 };
 use crate::host::ssm::AGENT_PORT;
 use crate::models::project::{validate_aws_workspace, Arch, RepoSource, StorageMode};
@@ -59,6 +60,9 @@ pub const CONTAINER_NAME: &str = "workspace";
 /// Where a Hybrid project's access point is mounted (P4).
 pub const HOME_MOUNT_PATH: &str = "/mnt/triple-c-home";
 const HOME_VOLUME: &str = "home";
+/// Where an EFS-mode project's second access point is mounted (Q1).
+pub const WORKSPACE_MOUNT_PATH: &str = "/workspace";
+const WORKSPACE_VOLUME: &str = "workspace";
 /// Secrets Manager's `SecretString` limit.
 pub const MAX_SECRET_BYTES: usize = 65_536;
 /// At most this many of a family's newest revisions are described when
@@ -184,7 +188,7 @@ fn payload_map(
         match storage {
             StorageMode::Ephemeral => "ephemeral",
             StorageMode::Hybrid => "hybrid",
-            StorageMode::Efs => "efs", // Task 3
+            StorageMode::Efs => "efs",
         }
         .into(),
     );
@@ -212,7 +216,7 @@ fn serialize_payload(m: &BTreeMap<String, String>) -> Result<String, String> {
 /// The project secret's JSON (P1, R1): every env pair, then the payload's own
 /// keys (`TRIPLEC_AGENT_TOKEN`, `TRIPLEC_FILES` = `{"ssh/<f>"|"ca/<f>": base64}`,
 /// `TRIPLEC_REPOS`, `TRIPLEC_WIP_PUSH` = `1`/`0`, `TRIPLEC_IDLE_STOP_MINUTES`
-/// when on, `TRIPLEC_STORAGE` = `ephemeral`/`hybrid`), keys sorted. Fails
+/// when on, `TRIPLEC_STORAGE` = `ephemeral`/`hybrid`/`efs`), keys sorted. Fails
 /// when it would exceed 65,536 bytes.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn project_secret_payload(
@@ -255,9 +259,11 @@ pub struct WorkspacePlan {
     pub secret_arn: String,
     /// Sorted (the payload's key order).
     pub secret_keys: Vec<String>,
-    /// Both set for Hybrid, both `None` for Ephemeral.
+    /// Both set for Hybrid and EFS, both `None` for Ephemeral.
     pub file_system_id: Option<String>,
     pub access_point_id: Option<String>,
+    /// The `/workspace` access point; used only when `storage` is EFS.
+    pub workspace_access_point_id: Option<String>,
     pub tags: Vec<(String, String)>,
 }
 
@@ -328,7 +334,14 @@ pub fn task_definition_request(plan: &WorkspacePlan) -> RegisterTaskDefinitionIn
 fn build_request(plan: &WorkspacePlan) -> RegisterTaskDefinitionInput {
     const BUILT: &str = "every required field is set";
     let hybrid = match (&plan.storage, &plan.file_system_id, &plan.access_point_id) {
-        (StorageMode::Hybrid | StorageMode::Efs, Some(fs), Some(ap)) => Some((fs, ap)), // Task 3: Efs adds /workspace
+        (StorageMode::Hybrid | StorageMode::Efs, Some(fs), Some(ap)) => Some((fs, ap)),
+        _ => None,
+    };
+    // EFS = Hybrid + `/workspace` on its own access point. Hybrid and
+    // Ephemeral requests are exactly what they were before EFS mode (a
+    // test pins their fingerprints).
+    let workspace = match (&plan.storage, hybrid, &plan.workspace_access_point_id) {
+        (StorageMode::Efs, Some((fs, _)), Some(ap)) => Some((fs, ap)),
         _ => None,
     };
 
@@ -392,6 +405,15 @@ fn build_request(plan: &WorkspacePlan) -> RegisterTaskDefinitionInput {
                 .build(),
         );
     }
+    if workspace.is_some() {
+        container = container.mount_points(
+            MountPoint::builder()
+                .source_volume(WORKSPACE_VOLUME)
+                .container_path(WORKSPACE_MOUNT_PATH)
+                .read_only(false)
+                .build(),
+        );
+    }
 
     let mut req = RegisterTaskDefinitionInput::builder()
         .family(&plan.family)
@@ -422,27 +444,33 @@ fn build_request(plan: &WorkspacePlan) -> RegisterTaskDefinitionInput {
                 .map(|(k, v)| Tag::builder().key(k).value(v).build())
                 .collect(),
         ));
-    if let Some((fs, ap)) = hybrid {
-        req = req.volumes(
-            Volume::builder()
-                .name(HOME_VOLUME)
-                .efs_volume_configuration(
-                    EfsVolumeConfiguration::builder()
-                        .file_system_id(fs)
-                        .transit_encryption(EfsTransitEncryption::Enabled)
-                        .authorization_config(
-                            EfsAuthorizationConfig::builder()
-                                .access_point_id(ap)
-                                .iam(EfsAuthorizationConfigIam::Enabled)
-                                .build(),
-                        )
-                        .build()
-                        .expect(BUILT),
-                )
-                .build(),
-        );
+    for (name, (fs, ap)) in [(HOME_VOLUME, hybrid), (WORKSPACE_VOLUME, workspace)]
+        .into_iter()
+        .filter_map(|(n, v)| v.map(|v| (n, v)))
+    {
+        req = req.volumes(efs_volume(name, fs, ap));
     }
     req.build().expect(BUILT)
+}
+
+/// An EFS volume through an access point, IAM-authorised, TLS in transit.
+fn efs_volume(name: &str, fs: &str, ap: &str) -> Volume {
+    Volume::builder()
+        .name(name)
+        .efs_volume_configuration(
+            EfsVolumeConfiguration::builder()
+                .file_system_id(fs)
+                .transit_encryption(EfsTransitEncryption::Enabled)
+                .authorization_config(
+                    EfsAuthorizationConfig::builder()
+                        .access_point_id(ap)
+                        .iam(EfsAuthorizationConfigIam::Enabled)
+                        .build(),
+                )
+                .build()
+                .expect("every required field is set"),
+        )
+        .build()
 }
 
 // ---------------------------------------------------------------------- API
@@ -593,12 +621,14 @@ pub struct PreparedWorkspace {
     /// Exact `family:revision`.
     pub task_definition_arn: String,
     pub access_point_id: Option<String>,
+    /// EFS storage's `/workspace` access point.
+    pub workspace_access_point_id: Option<String>,
     /// This start's token, already in the secret.
     pub agent_token: String,
     pub secret_arn: String,
 }
 
-/// Make the project's secret, access point (Hybrid) and task definition
+/// Make the project's secret, access points (Hybrid, EFS) and task definition
 /// ready. Everything that can be checked locally — placement, sizes, the
 /// payload's size and names — is checked before the first write.
 pub async fn prepare_workspace<W: WorkspaceApi>(
@@ -652,10 +682,11 @@ pub async fn prepare_workspace<W: WorkspaceApi>(
     .map_err(other)?;
     let json = serialize_payload(&payload).map_err(other)?;
 
-    // Hybrid: the user's own file system, from their onboarding.
-    let (file_system_id, access_point_id) = match cfg.storage {
-        StorageMode::Ephemeral => (None, None),
-        StorageMode::Hybrid | StorageMode::Efs => { // Task 3: Efs adds the workspace access point
+    // Hybrid and EFS: the user's own file system, from their onboarding.
+    let (file_system_id, access_point_id, workspace_access_point_id) = match cfg.storage {
+        StorageMode::Ephemeral => (None, None, None),
+        StorageMode::Hybrid | StorageMode::Efs => {
+            let mode = if cfg.storage == StorageMode::Efs { "EFS" } else { "Hybrid" };
             let token = user_file_system_token(&env.name, &ok);
             let fs = api
                 .find_file_system(&token)
@@ -663,19 +694,31 @@ pub async fn prepare_workspace<W: WorkspaceApi>(
                 .filter(|fs| fs.owner.as_deref() == Some(who.user_id.as_str()))
                 .ok_or_else(|| {
                     other(format!(
-                        "Your file system in environment \"{}\" was not found. Hybrid storage \
+                        "Your file system in environment \"{}\" was not found. {mode} storage \
                          needs it: ask an administrator to onboard you there, or use \
                          Ephemeral storage.",
                         env.name
                     ))
                 })?;
-            let root = access_point_root(&ok, &project.id);
             let points = api.access_points(&fs.id).await?;
-            let ap = match pick_access_point(&points, &fs.id, &root, &who.user_id, &project.id) {
-                Some(a) => a.id.clone(),
-                None => api.create_access_point(&fs.id, &root, &tags).await?,
+            let ensure = |root: String| {
+                let found = pick_access_point(&points, &fs.id, &root, &who.user_id, &project.id)
+                    .map(|a| a.id.clone());
+                let (fs_id, tags) = (&fs.id, &tags);
+                async move {
+                    match found {
+                        Some(id) => Ok(id),
+                        None => api.create_access_point(fs_id, &root, tags).await,
+                    }
+                }
             };
-            (Some(fs.id), Some(ap))
+            let ap = ensure(access_point_root(&ok, &project.id)).await?;
+            let workspace_ap = if cfg.storage == StorageMode::Efs {
+                Some(ensure(workspace_access_point_root(&ok, &project.id)).await?)
+            } else {
+                None
+            };
+            (Some(fs.id), Some(ap), workspace_ap)
         }
     };
 
@@ -703,6 +746,7 @@ pub async fn prepare_workspace<W: WorkspaceApi>(
         secret_keys: payload.keys().cloned().collect(),
         file_system_id,
         access_point_id: access_point_id.clone(),
+        workspace_access_point_id: workspace_access_point_id.clone(),
         tags,
     };
     let fingerprint = workspace_fingerprint(&plan);
@@ -729,6 +773,7 @@ pub async fn prepare_workspace<W: WorkspaceApi>(
         family: plan.family,
         task_definition_arn,
         access_point_id,
+        workspace_access_point_id,
         agent_token,
         secret_arn,
     })

@@ -131,7 +131,55 @@ describe("HostSection", () => {
     p.aws = { ...p.aws!, storage: "ephemeral" };
     renderHost(p);
     expect(screen.getByText(/Claude login and history are lost when the workspace stops/)).toBeInTheDocument();
-    expect(screen.getByText(/EFS .* coming later/)).toBeInTheDocument();
+    expect(screen.queryByText(/coming later/)).toBeNull();
+  });
+
+  it("offers EFS storage with what it costs", async () => {
+    const p = awsProject();
+    renderHost(p);
+    const efs = screen.getByRole("radio", { name: "EFS" });
+    expect(efs).not.toBeDisabled();
+    fireEvent.click(efs);
+    await waitFor(() => expect(save).toHaveBeenCalled());
+    expect(save.mock.calls[0][0].aws.storage).toBe("efs");
+
+    p.aws = { ...p.aws!, storage: "efs" };
+    renderHost(p);
+    expect(
+      screen.getByText("Everything in /workspace survives a stop; git and builds are slower over NFS"),
+    ).toBeInTheDocument();
+  });
+
+  it("says /workspace files stay on their access point after switching away from EFS", () => {
+    const p = awsProject();
+    p.aws = {
+      ...p.aws!,
+      storage: "hybrid",
+      workspace_access_point_id: "fsap-w",
+      task_arn: null,
+      task_definition_arn: null,
+      access_point_id: null,
+    };
+    renderHost(p);
+    expect(screen.getByRole("note", { name: "EFS files kept" })).toHaveTextContent(
+      /\/workspace files .* stay on their access point until .*Remove AWS resources/,
+    );
+    // It is an AWS resource: removable, and it keeps the project in place.
+    expect(screen.getByRole("button", { name: "Run on this machine instead" })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Remove AWS resources…" }));
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByRole("checkbox", { name: /access points/ })).toBeInTheDocument();
+    expect(dialog).toHaveTextContent(/\/workspace/);
+  });
+
+  it("does not show the kept-files note on EFS or without a workspace access point", () => {
+    const p = awsProject();
+    p.aws = { ...p.aws!, storage: "efs", workspace_access_point_id: "fsap-w" };
+    renderHost(p);
+    expect(screen.queryByRole("note", { name: "EFS files kept" })).toBeNull();
   });
 
   it("saves repository edits on blur", async () => {

@@ -132,7 +132,7 @@ impl ProjectHost {
 
     /// AWS: stop the task and remove the project's resources — task
     /// definition revisions, the secret (deleted at once) and, only
-    /// with `discard_data`, the EFS access point (not its files). Docker: nothing (its state
+    /// with `discard_data`, the EFS access points, home and EFS-mode `/workspace` (not their files). Docker: nothing (its state
     /// goes with [`Self::discard_project_state`]).
     pub async fn remove_aws_resources(
         &self,

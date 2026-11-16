@@ -8,6 +8,8 @@ interface Props {
   aws?: boolean;
   /** AWS: the workspace may have an EFS access point (offers removing it). */
   savedFiles?: boolean;
+  /** AWS: `/workspace` may be on EFS too (EFS storage, now or before). */
+  workspaceFiles?: boolean;
   onConfirm: (opts: { discardData: boolean }) => void;
   onCancel: () => void;
 }
@@ -19,6 +21,7 @@ export default function ConfirmRemoveModal({
   projectName,
   aws = false,
   savedFiles = false,
+  workspaceFiles = false,
   onConfirm,
   onCancel,
 }: Props) {
@@ -61,11 +64,12 @@ export default function ConfirmRemoveModal({
                 onChange={(e) => setDiscardData(e.target.checked)}
               />
               <span>
-                Also remove the workspace&rsquo;s file-system access point
+                Also remove the workspace&rsquo;s file-system access points
                 <span className="block text-xs text-[var(--text-secondary)]">
-                  The saved files themselves (Claude login, history, SSH keys) stay on your own
-                  EFS file system, readable only by your workspace role, until an administrator
-                  offboards you.
+                  The saved files themselves (Claude login, history, SSH keys
+                  {workspaceFiles ? ", and the /workspace files" : ""}) stay on your own EFS file
+                  system, readable only by your workspace role, until an administrator offboards
+                  you.
                 </span>
               </span>
             </label>
