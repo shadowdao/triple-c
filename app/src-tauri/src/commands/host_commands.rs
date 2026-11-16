@@ -609,7 +609,8 @@ mod tests {
             [
                 "environment-admin.json",
                 "environment-admin-network.json",
-                "environment-admin-compute.json"
+                "environment-admin-compute.json",
+                "environment-admin-scaling.json"
             ]
         );
         for f in &admin {

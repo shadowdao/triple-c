@@ -38,6 +38,10 @@ pub fn policy_files(tier: Tier) -> &'static [(&'static str, &'static str)] {
                 "environment-admin-compute.json",
                 include_str!("../../../../aws/policies/environment-admin-compute.json"),
             ),
+            (
+                "environment-admin-scaling.json",
+                include_str!("../../../../aws/policies/environment-admin-scaling.json"),
+            ),
         ],
         Tier::WorkspaceUser => &[
             (
@@ -214,7 +218,7 @@ const PROBE_STATE_OBJECT: &str =
 const PROBE_BOUNDARY: &str = "arn:aws:iam::{account}:policy/triple-c-permissions-boundary";
 // Per-user EC2 capacity (phase 7, `environment-admin-compute.json`).
 const PROBE_CAPACITY_PROVIDER: &str =
-    "arn:aws:ecs:{region}:{account}:capacity-provider/triple-c-probe";
+    "arn:aws:ecs:{region}:{account}:capacity-provider/triple-c-probe--u-alice";
 const PROBE_LAUNCH_TEMPLATE: &str =
     "arn:aws:ec2:{region}:{account}:launch-template/lt-00000000000000000";
 const PROBE_INSTANCE: &str = "arn:aws:ec2:{region}:{account}:instance/i-00000000000000000";
@@ -222,7 +226,7 @@ const PROBE_VOLUME: &str = "arn:aws:ec2:{region}:{account}:volume/vol-0000000000
 /// Public images have no account in their ARN.
 const PROBE_IMAGE: &str = "arn:aws:ec2:{region}::image/ami-00000000000000000";
 const PROBE_AUTO_SCALING_GROUP: &str = "arn:aws:autoscaling:{region}:{account}:autoScalingGroup:\
-     00000000-0000-0000-0000-000000000000:autoScalingGroupName/triple-c-probe";
+     00000000-0000-0000-0000-000000000000:autoScalingGroupName/triple-c-probe--u-alice";
 const PROBE_INSTANCE_PROFILE: &str = "arn:aws:iam::{account}:instance-profile/triple-c-probe";
 /// An instance role is `triple-c-<env>-<owner key>-instance`.
 const PROBE_INSTANCE_ROLE: &str = "arn:aws:iam::{account}:role/triple-c-probe-instance";
@@ -2008,8 +2012,10 @@ mod tests {
     fn the_boundary_keeps_the_ecs_agent_on_its_own_cluster() {
         let stmts = statements_of(&boundary());
         const TAG: &str = "aws:PrincipalTag/triple-c:cluster";
-        const MINE: Context = &[(TAG, Literal("triple-c-probe-0123456789ab"))];
+        const MINE: Context = &[(TAG, Literal("triple-c-probe--u-alice"))];
         const PROD: Context = &[(TAG, Literal("prod"))];
+        // The environment's (shared) cluster is not an instance role's either.
+        const SHARED: Context = &[(TAG, Literal("triple-c-probe"))];
         let within = |action: &'static str, resource: &'static str, context: Context| {
             evaluate_in(
                 &stmts,
@@ -2020,13 +2026,13 @@ mod tests {
                 },
             )
         };
-        const CLUSTER: &str = "arn:aws:ecs:{region}:{account}:cluster/triple-c-probe-0123456789ab";
+        const CLUSTER: &str = "arn:aws:ecs:{region}:{account}:cluster/triple-c-probe--u-alice";
         const INSTANCE: &str = "arn:aws:ecs:{region}:{account}:container-instance/\
-             triple-c-probe-0123456789ab/0123456789abcdef0123456789abcdef";
+             triple-c-probe--u-alice/0123456789abcdef0123456789abcdef";
         const OTHER_USERS_CLUSTER: &str =
-            "arn:aws:ecs:{region}:{account}:cluster/triple-c-probe-ba9876543210";
+            "arn:aws:ecs:{region}:{account}:cluster/triple-c-probe--u-bob";
         const OTHER_USERS_INSTANCE: &str = "arn:aws:ecs:{region}:{account}:container-instance/\
-             triple-c-probe-ba9876543210/0123456789abcdef0123456789abcdef";
+             triple-c-probe--u-bob/0123456789abcdef0123456789abcdef";
         const PROD_CLUSTER: &str = "arn:aws:ecs:{region}:{account}:cluster/prod";
         const PROD_INSTANCE: &str = "arn:aws:ecs:{region}:{account}:container-instance/\
              prod/0123456789abcdef0123456789abcdef";
@@ -2078,6 +2084,14 @@ mod tests {
             assert!(
                 !within(action, prod, PROD),
                 "{action} on a non-Triple-C cluster"
+            );
+            let shared: &'static str = Box::leak(
+                own.replace("triple-c-probe--u-alice", "triple-c-probe")
+                    .into_boxed_str(),
+            );
+            assert!(
+                !within(action, shared, SHARED),
+                "{action} on the shared cluster"
             );
         }
         assert!(within("ecs:TagResource", INSTANCE, at_register(MINE)));
@@ -2228,7 +2242,8 @@ mod tests {
             [
                 "environment-admin.json",
                 "environment-admin-network.json",
-                "environment-admin-compute.json"
+                "environment-admin-compute.json",
+                "environment-admin-scaling.json"
             ]
         );
         assert_eq!(
@@ -2509,15 +2524,18 @@ mod tests {
 
     /// The new compute checks of the admin tier.
     fn compute_checks() -> Vec<&'static Check> {
-        let compute = parse(
-            "environment-admin-compute.json",
-            policy_files(Tier::EnvironmentAdmin)
-                .iter()
-                .find(|(n, _)| *n == "environment-admin-compute.json")
-                .expect("the compute file")
-                .1,
-        );
-        let stmts = statements_of(&compute);
+        let stmts: Vec<Value> = policy_files(Tier::EnvironmentAdmin)
+            .iter()
+            .filter(|(n, _)| {
+                [
+                    "environment-admin-compute.json",
+                    "environment-admin-scaling.json",
+                ]
+                .contains(n)
+            })
+            .flat_map(|(n, json)| statements_of(&parse(n, json)))
+            .collect();
+        assert!(stmts.len() >= 10);
         let found: Vec<_> = checks(Tier::EnvironmentAdmin)
             .iter()
             .filter(|c| {
@@ -2710,7 +2728,10 @@ mod tests {
         let mut lists = Vec::new();
         for s in allows(Tier::EnvironmentAdmin) {
             if let Some(ops) = s["Condition"].as_object() {
-                for entries in ops.values() {
+                for (op, entries) in ops {
+                    if op == "Null" {
+                        continue;
+                    }
                     for key in ["ec2:InstanceType", "autoscaling:InstanceTypes"] {
                         if let Some(v) = entries.get(key) {
                             lists.push(strings(v).into_iter().collect());
@@ -2795,8 +2816,19 @@ mod tests {
                 );
             }
         }
-        // Creating always names the template version; an update may leave
-        // the template alone (a size change, the drain before destroy).
+        // Creating always names the template version and its types; an
+        // update may leave the template alone (a size change, the drain
+        // before destroy).
+        assert!(!allowed(
+            tier,
+            &write(
+                "autoscaling:CreateAutoScalingGroup",
+                PROBE_AUTO_SCALING_GROUP,
+                without(GROUP_CREATE, "autoscaling:InstanceTypes")
+            ),
+            ME,
+            ME
+        ));
         assert!(!allowed(
             tier,
             &write(
@@ -2830,7 +2862,6 @@ mod tests {
         for (resource, ok) in [
             (PROBE_INSTANCE, INSTANCE_LAUNCH),
             (PROBE_VOLUME, VOLUME_LAUNCH),
-            (PROBE_INSTANCE, without(INSTANCE_LAUNCH, "ec2:InstanceType")),
         ] {
             assert!(allowed(
                 tier,
@@ -2852,6 +2883,17 @@ mod tests {
                 "untagged {resource}"
             );
         }
+        // An instance whose type IAM doesn't see is refused too.
+        assert!(!allowed(
+            tier,
+            &write(
+                "ec2:RunInstances",
+                PROBE_INSTANCE,
+                without(INSTANCE_LAUNCH, "ec2:InstanceType")
+            ),
+            ME,
+            ME
+        ));
         for t in [
             "p5.48xlarge",
             "m7i.8xlarge",
@@ -3027,6 +3069,73 @@ mod tests {
                 ),
                 "service-linked {role} for {service}"
             );
+        }
+    }
+
+    /// Per-user EC2 clusters (`triple-c-<env>--u-<user tag>`, amended E1): a
+    /// caller runs tasks only on the one named after their own
+    /// `triple-c-user` principal tag, never without the tag, and the
+    /// environment's (Fargate) cluster is unaffected.
+    #[test]
+    fn workspace_users_run_only_on_their_own_ec2_cluster() {
+        let run = ws_check("ecs:RunTask", "task-definition/");
+        // (allowed, explicitly denied) for RunTask, then StartTask (never
+        // granted; only the Deny matters for it).
+        let attempt = |cluster: &'static str, tag: Option<&'static str>| {
+            let mut context: Vec<(&'static str, ContextValue)> = run
+                .context
+                .iter()
+                .filter(|(k, _)| *k != "ecs:cluster")
+                .copied()
+                .collect();
+            context.push(("ecs:cluster", Literal(cluster)));
+            if let Some(t) = tag {
+                context.push(("aws:PrincipalTag/triple-c-user", Literal(t)));
+            }
+            let context: Context = Box::leak(context.into_boxed_slice());
+            ["ecs:RunTask", "ecs:StartTask"].map(|action| {
+                let c = Check {
+                    action,
+                    context,
+                    ..*run
+                };
+                (
+                    allowed(Tier::WorkspaceUser, &c, ME, ME),
+                    explicitly_denied(Tier::WorkspaceUser, &c),
+                )
+            })
+        };
+        const ALICE: &str = "arn:aws:ecs:{region}:{account}:cluster/triple-c-dev--u-alice";
+        const BOB: &str = "arn:aws:ecs:{region}:{account}:cluster/triple-c-dev--u-bob";
+        const SHARED: &str = "arn:aws:ecs:{region}:{account}:cluster/triple-c-dev";
+        const U_ENV: &str = "arn:aws:ecs:{region}:{account}:cluster/triple-c-my-u-env";
+        let [(run_ok, run_denied), (_, start_denied)] = attempt(ALICE, Some("alice"));
+        assert!(
+            run_ok && !run_denied && !start_denied,
+            "alice on her own cluster"
+        );
+        for (cluster, tag) in [
+            (BOB, Some("alice")),
+            (ALICE, None),
+            (BOB, None),
+            (ALICE, Some("bob")),
+            (ALICE, Some("alic")),
+            (ALICE, Some("")),
+        ] {
+            let [(run_ok, run_denied), (_, start_denied)] = attempt(cluster, tag);
+            assert!(
+                !run_ok && run_denied && start_denied,
+                "{cluster} with {tag:?}"
+            );
+        }
+        for cluster in [SHARED, U_ENV] {
+            for tag in [None, Some("alice")] {
+                let [(run_ok, run_denied), (_, start_denied)] = attempt(cluster, tag);
+                assert!(
+                    run_ok && !run_denied && !start_denied,
+                    "{cluster} with {tag:?}"
+                );
+            }
         }
     }
 

@@ -166,6 +166,63 @@ fn environment_names_are_validated() {
 }
 
 #[test]
+fn ec2_user_tags_are_validated() {
+    for ok in ["alice", "Bob-2", "a", "x".repeat(32).as_str(), "a-b-c"] {
+        assert_eq!(validate_ec2_user_tag(ok), Ok(ok.to_string()), "{ok}");
+    }
+    for bad in [
+        "",
+        "-a",
+        "a-",
+        "a--b",
+        "a_b",
+        "a.b",
+        "a b",
+        "ä",
+        &"x".repeat(33),
+        "a/b",
+        "a*",
+    ] {
+        assert!(validate_ec2_user_tag(bad).is_err(), "{bad:?} accepted");
+    }
+}
+
+#[test]
+fn per_user_ec2_names_are_unambiguous_and_fit() {
+    assert_eq!(user_ec2_stem("dev", "alice"), "triple-c-dev--u-alice");
+    assert_eq!(
+        user_instance_role_name("dev", "0123456789ab"),
+        "triple-c-dev-0123456789ab-instance"
+    );
+    // The longest names fit: ECS 255, launch templates 128, Auto Scaling
+    // groups 255; roles and instance profiles 64.
+    let env = "a".repeat(20);
+    validate_environment_name(&env).unwrap();
+    let tag = "t".repeat(32);
+    assert!(user_ec2_stem(&env, &tag).len() <= 65);
+    assert!(user_instance_role_name(&env, "0123456789ab").len() <= 64);
+    // An environment cluster is never a per-user one, and one user's
+    // pattern never matches another's cluster: neither half holds `--`.
+    use crate::aws::policy_eval::glob;
+    for env in ["dev", "my-u-env", "u-x", "a-u"] {
+        validate_environment_name(env).unwrap();
+        assert!(
+            !glob("triple-c-*--u-*", &environment_cluster_name(env)),
+            "{env}"
+        );
+        assert!(glob("triple-c-*--u-*", &user_ec2_stem(env, "alice")));
+        assert!(glob("triple-c-*--u-alice", &user_ec2_stem(env, "alice")));
+        for other in ["bob", "bob-alice", "u-alice", "alicex", "xalice"] {
+            validate_ec2_user_tag(other).unwrap();
+            assert!(
+                !glob("triple-c-*--u-alice", &user_ec2_stem(env, other)),
+                "{env}/{other}"
+            );
+        }
+    }
+}
+
+#[test]
 fn the_environment_cluster_and_log_group_names_match_the_module() {
     assert_eq!(environment_cluster_name("dev"), "triple-c-dev");
     assert_eq!(environment_log_group("dev"), "/triple-c/dev");
@@ -1899,12 +1956,12 @@ const MODULE_CALLS: &[(&str, &[Check])] = &[
 // `aws_ecs_cluster_capacity_providers`, `aws_iam_role`, `aws_ssm_parameter`
 // and `data.aws_ssm_parameter` entries) and deletes this table. Names are
 // the user's (`triple-c-<env>-<owner key>[-instance]`).
-const USER_CLUSTER: &str = "arn:aws:ecs:{region}:{account}:cluster/triple-c-probe-0123456789ab";
+const USER_CLUSTER: &str = "arn:aws:ecs:{region}:{account}:cluster/triple-c-probe--u-alice";
 const CAPACITY_PROVIDER: &str =
-    "arn:aws:ecs:{region}:{account}:capacity-provider/triple-c-probe-0123456789ab";
+    "arn:aws:ecs:{region}:{account}:capacity-provider/triple-c-probe--u-alice";
 const LAUNCH_TEMPLATE: &str = "arn:aws:ec2:{region}:{account}:launch-template/lt-00000000000000000";
 const AUTO_SCALING_GROUP: &str = "arn:aws:autoscaling:{region}:{account}:autoScalingGroup:\
-     00000000-0000-0000-0000-000000000000:autoScalingGroupName/triple-c-probe-0123456789ab";
+     00000000-0000-0000-0000-000000000000:autoScalingGroupName/triple-c-probe--u-alice";
 const INSTANCE: &str = "arn:aws:ec2:{region}:{account}:instance/i-00000000000000000";
 const VOLUME: &str = "arn:aws:ec2:{region}:{account}:volume/vol-00000000000000000";
 const IMAGE: &str = "arn:aws:ec2:{region}::image/ami-00000000000000000";
@@ -2183,6 +2240,17 @@ fn the_module_call_table_covers_every_type_the_modules_use() {
         "a type appears twice in MODULE_CALLS"
     );
     assert_eq!(module_types(), table);
+}
+
+#[test]
+fn the_ec2_call_table_uses_the_shared_names() {
+    let stem = user_ec2_stem(ENV, "alice");
+    assert!(USER_CLUSTER.ends_with(&format!("cluster/{stem}")));
+    assert!(CAPACITY_PROVIDER.ends_with(&format!("capacity-provider/{stem}")));
+    assert!(AUTO_SCALING_GROUP.ends_with(&format!("autoScalingGroupName/{stem}")));
+    let role = user_instance_role_name(ENV, OWNER_KEY);
+    assert!(INSTANCE_ROLE.ends_with(&format!("role/{role}")));
+    assert!(INSTANCE_PROFILE.ends_with(&format!("instance-profile/{role}")));
 }
 
 #[test]

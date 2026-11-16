@@ -134,7 +134,7 @@
       ],
       "Condition": {
         "StringLike": {
-          "aws:PrincipalTag/triple-c:cluster": "triple-c-*"
+          "aws:PrincipalTag/triple-c:cluster": "triple-c-*--u-*"
         }
       }
     },
@@ -152,7 +152,7 @@
           "ecs:CreateAction": "RegisterContainerInstance"
         },
         "StringLike": {
-          "aws:PrincipalTag/triple-c:cluster": "triple-c-*"
+          "aws:PrincipalTag/triple-c:cluster": "triple-c-*--u-*"
         }
       }
     },

@@ -14,7 +14,7 @@
         "ecs:ListTagsForResource"
       ],
       "Resource": [
-        "arn:aws:ecs:*:*:capacity-provider/triple-c-*"
+        "arn:aws:ecs:*:*:capacity-provider/triple-c-*--u-*"
       ]
     },
     {
@@ -79,8 +79,7 @@
         "ec2:RunInstances"
       ],
       "Resource": [
-        "arn:aws:ec2:*:*:instance/*",
-        "arn:aws:ec2:*:*:volume/*"
+        "arn:aws:ec2:*:*:instance/*"
       ],
       "Condition": {
         "Null": {
@@ -89,7 +88,7 @@
         "ArnLike": {
           "ec2:LaunchTemplate": "arn:aws:ec2:*:*:launch-template/*"
         },
-        "StringEqualsIfExists": {
+        "StringEquals": {
           "ec2:InstanceType": [
             "m7i.large",
             "m7i.xlarge",
@@ -122,6 +121,24 @@
             "t4g.xlarge",
             "t4g.2xlarge"
           ]
+        }
+      }
+    },
+    {
+      "Sid": "LaunchTaggedVolumes",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:RunInstances"
+      ],
+      "Resource": [
+        "arn:aws:ec2:*:*:volume/*"
+      ],
+      "Condition": {
+        "Null": {
+          "aws:RequestTag/triple-c:component": "false"
+        },
+        "ArnLike": {
+          "ec2:LaunchTemplate": "arn:aws:ec2:*:*:launch-template/*"
         }
       }
     },
@@ -184,168 +201,6 @@
       }
     },
     {
-      "Sid": "CreatePinnedGroups",
-      "Effect": "Allow",
-      "Action": [
-        "autoscaling:CreateAutoScalingGroup"
-      ],
-      "Resource": [
-        "arn:aws:autoscaling:*:*:autoScalingGroup:*:autoScalingGroupName/triple-c-*"
-      ],
-      "Condition": {
-        "Null": {
-          "aws:RequestTag/triple-c:component": "false",
-          "autoscaling:TargetGroupARNs": "true",
-          "autoscaling:LoadBalancerNames": "true"
-        },
-        "Bool": {
-          "autoscaling:LaunchTemplateVersionSpecified": "true"
-        },
-        "ForAllValues:StringEquals": {
-          "autoscaling:InstanceTypes": [
-            "m7i.large",
-            "m7i.xlarge",
-            "m7i.2xlarge",
-            "m7i.4xlarge",
-            "m7g.large",
-            "m7g.xlarge",
-            "m7g.2xlarge",
-            "m7g.4xlarge",
-            "c7i.large",
-            "c7i.xlarge",
-            "c7i.2xlarge",
-            "c7i.4xlarge",
-            "c7g.large",
-            "c7g.xlarge",
-            "c7g.2xlarge",
-            "c7g.4xlarge",
-            "r7i.large",
-            "r7i.xlarge",
-            "r7i.2xlarge",
-            "r7i.4xlarge",
-            "r7g.large",
-            "r7g.xlarge",
-            "r7g.2xlarge",
-            "r7g.4xlarge",
-            "t3.large",
-            "t3.xlarge",
-            "t3.2xlarge",
-            "t4g.large",
-            "t4g.xlarge",
-            "t4g.2xlarge"
-          ]
-        }
-      }
-    },
-    {
-      "Sid": "UpdatePinnedGroups",
-      "Effect": "Allow",
-      "Action": [
-        "autoscaling:UpdateAutoScalingGroup"
-      ],
-      "Resource": [
-        "arn:aws:autoscaling:*:*:autoScalingGroup:*:autoScalingGroupName/triple-c-*"
-      ],
-      "Condition": {
-        "Null": {
-          "aws:ResourceTag/triple-c:component": "false",
-          "autoscaling:TargetGroupARNs": "true",
-          "autoscaling:LoadBalancerNames": "true"
-        },
-        "BoolIfExists": {
-          "autoscaling:LaunchTemplateVersionSpecified": "true"
-        },
-        "ForAllValues:StringEquals": {
-          "autoscaling:InstanceTypes": [
-            "m7i.large",
-            "m7i.xlarge",
-            "m7i.2xlarge",
-            "m7i.4xlarge",
-            "m7g.large",
-            "m7g.xlarge",
-            "m7g.2xlarge",
-            "m7g.4xlarge",
-            "c7i.large",
-            "c7i.xlarge",
-            "c7i.2xlarge",
-            "c7i.4xlarge",
-            "c7g.large",
-            "c7g.xlarge",
-            "c7g.2xlarge",
-            "c7g.4xlarge",
-            "r7i.large",
-            "r7i.xlarge",
-            "r7i.2xlarge",
-            "r7i.4xlarge",
-            "r7g.large",
-            "r7g.xlarge",
-            "r7g.2xlarge",
-            "r7g.4xlarge",
-            "t3.large",
-            "t3.xlarge",
-            "t3.2xlarge",
-            "t4g.large",
-            "t4g.xlarge",
-            "t4g.2xlarge"
-          ]
-        }
-      }
-    },
-    {
-      "Sid": "ManageTripleCAutoScalingGroups",
-      "Effect": "Allow",
-      "Action": [
-        "autoscaling:SetInstanceProtection",
-        "autoscaling:CreateOrUpdateTags",
-        "autoscaling:DeleteTags",
-        "autoscaling:DeleteAutoScalingGroup"
-      ],
-      "Resource": [
-        "arn:aws:autoscaling:*:*:autoScalingGroup:*:autoScalingGroupName/triple-c-*"
-      ],
-      "Condition": {
-        "Null": {
-          "aws:ResourceTag/triple-c:component": "false"
-        }
-      }
-    },
-    {
-      "Sid": "CreateComputeServiceLinkedRoles",
-      "Effect": "Allow",
-      "Action": [
-        "iam:CreateServiceLinkedRole"
-      ],
-      "Resource": [
-        "arn:aws:iam::*:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling*",
-        "arn:aws:iam::*:role/aws-service-role/ecs.amazonaws.com/AWSServiceRoleForECS*"
-      ],
-      "Condition": {
-        "StringEquals": {
-          "iam:AWSServiceName": [
-            "autoscaling.amazonaws.com",
-            "ecs.amazonaws.com"
-          ]
-        }
-      }
-    },
-    {
-      "Sid": "ManageTripleCInstanceProfiles",
-      "Effect": "Allow",
-      "Action": [
-        "iam:CreateInstanceProfile",
-        "iam:DeleteInstanceProfile",
-        "iam:GetInstanceProfile",
-        "iam:AddRoleToInstanceProfile",
-        "iam:RemoveRoleFromInstanceProfile",
-        "iam:TagInstanceProfile",
-        "iam:UntagInstanceProfile",
-        "iam:ListInstanceProfileTags"
-      ],
-      "Resource": [
-        "arn:aws:iam::*:instance-profile/triple-c-*"
-      ]
-    },
-    {
       "Sid": "PassInstanceRolesToEc2",
       "Effect": "Allow",
       "Action": [
@@ -369,17 +224,6 @@
       ],
       "Resource": [
         "arn:aws:ssm:*::parameter/aws/service/ecs/optimized-ami/*"
-      ]
-    },
-    {
-      "Sid": "ReadCompute",
-      "Effect": "Allow",
-      "Action": [
-        "ecs:DescribeCapacityProviders",
-        "autoscaling:Describe*"
-      ],
-      "Resource": [
-        "*"
       ]
     }
   ]

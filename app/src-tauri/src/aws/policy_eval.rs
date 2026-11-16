@@ -212,7 +212,7 @@ pub(crate) fn conditions_hold(stmt: &Value, req: &Request) -> bool {
             "StringEquals" | "Bool" => (|p, v| p == v, false),
             "StringLike" | "ArnLike" => (glob, false),
             "StringNotEquals" => (|p, v| p == v, true),
-            "StringNotLike" => (glob, true),
+            "StringNotLike" | "ArnNotLike" => (glob, true),
             other => panic!("{}: unsupported condition operator {other}", sid(stmt)),
         };
         entries
