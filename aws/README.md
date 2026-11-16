@@ -618,3 +618,36 @@ plus `a_workspace_role_reads_fargate_prices_and_a_bare_role_cannot`), us-west-2,
 | `pricing:GetProducts` on `*` (`ReadFargatePrices`) | ✓ a role holding only the workspace files reads us-west-2's rates from the us-east-1 endpoint (`AmazonECS`; `TERM_MATCH regionCode`, `TERM_MATCH termType=OnDemand`, `CONTAINS usagetype=Fargate`: eight rows, one page). x86 $0.04048/vCPU-h, $0.004445/GB-h; ARM $0.03238, $0.00356; ephemeral storage $0.000111/GB-h |
 | Without the permission | ✓ a role with no policy is denied (`AccessDeniedException` naming `pricing:GetProducts`); the app shows "Estimate unavailable" |
 | The permission check | ✓ the simulator allows the new check for the workspace tier and denies it for a role with no policy |
+
+### Phase 6: one workspace with every option (2026-11-16)
+
+```sh
+TRIPLEC_E2E_TEST=aws::live_tests::environment::a_phase6_workspace_round_trips \
+TRIPLEC_AWS_E2E_PROFILE=<admin profile> TRIPLEC_AWS_E2E_REGION=us-west-2 scripts/aws-e2e-workspace.sh
+```
+
+Same fixture as phase 5 (`deploy_for_workspace_user`: environment admin deploys, a role holding
+only the workspace files is onboarded and drives the app as a profile connection), with the
+environment's `max_workspace_hours = 1`. One project, two task starts, 1 vCPU / 2 GiB x86: EFS
+storage, one public repo, a setup script, copy-at-connect (a CA file, a git token and a custom
+variable — all dummies), a port mapping 127.0.0.1:<free port> → 8099, the gateway sidecar
+(OpenAI-compatible backend, one gateway model, a dummy provider key handed in instead of the
+keychain via `aws_host::ensure_started_with`), idle stop off, WIP push off. Passed in 600 s,
+spend under $0.05.
+
+| Point | Result |
+|---|---|
+| Environment module v2 + cap | ✓ the record reads `template_version 2`, `max_workspace_hours 1` (as the workspace user); the secret has `TRIPLEC_MAX_LIFETIME_MINUTES=60`, PID 1's environment has it (root exec, that one line grepped), one `triple-c-idle-watch` runs with idle stop off |
+| v1 → v2 Update | not exercised: the fixture applies only the embedded modules (unit-tested: an old record shows "Update available") |
+| Lifetime cap firing | not exercised live (60 minutes; Task 4's unit tests) |
+| Times | cold start (two access points, register, RunTask, pull of both images, agent, tunnel) 115 s; restart 112 s; copy-at-connect push 3 s; gateway `/health/liveliness` 200 at 126 s after the start began |
+| EFS `/workspace` | ✓ `127.0.0.1:/ /workspace nfs4` (TLS tunnel); Hello-World cloned onto it; a marker written in task 1 was there in task 2; the clone reported `exists` the second time; both access point ids kept in the store across the restart |
+| Hybrid links under EFS | ✓ `~/.claude` and `~/.claude.json` → `/mnt/triple-c-home/…`; `~/.ssh` is a local directory (R6, copy-at-connect) |
+| Setup script | ✓ `sudo apt-get install -y jq` (already in the image: "jq is already the newest version"), `jq --version`, marker on `/workspace`; `aws_workspace_status`'s read (`triple-c-workspace-status` through the tunnel) settled with clone `cloned` + setup `ok` (code 0, log tail); same again on the restart |
+| Copy-at-connect | ✓ secret keys listed (values never printed): no `TRIPLEC_FILES`, `GIT_TOKEN`, custom variable or `TRIPLE_C_CUSTOM_ENV`, `TRIPLEC_CREDENTIALS` present; neither dummy value anywhere in the secret; after the push `/usr/local/share/ca-certificates/triple-c-e2e-ca.crt` (`subject=CN = triple-c-e2e-ca`) and a git credential helper are set |
+| Port mapping | ✓ `python3 -m http.server 8099 --bind 127.0.0.1` (detached exec); `port_forwards::open_for` → `GET /` on the host's loopback port: `HTTP/1.0 200 OK` |
+| Gateway sidecar | ✓ from the workspace: `/health/liveliness` 200; `/v1/models` with the master key 200 listing `e2e-model`, without it 401; claude's login shell has `ANTHROPIC_BASE_URL=http://127.0.0.1:4000` and a token; the sidecar's `TRIPLEC_GATEWAY_*` stay in the secret (R1); a new master key each start |
+| Keys in the logs | ✓ after a failed `/v1/chat/completions` (dummy key → OpenAI 401) and the successful calls: the provider key, the master key, the git token and the custom value are in **0** lines of the gateway stream (`<prefix>/gateway/<task-id>`, 107 lines) and of the workspace stream. LiteLLM logs the exception and traceback, not request headers; the provider's own error text (also in the HTTP response) carries the key **masked** by OpenAI (`sk-e2e-p…1249`: first 8 and last 4 characters) |
+| Cost estimate | ✓ `fetch_rates` as the workspace user + `estimate`: $0.0495/hour for 1 vCPU / 2 GiB / 21 GiB x86, `efs_billed_separately` |
+| Removal with discard | ✓ `remove_aws_resources(…, true)` Ok; both access points gone; the secret deleted |
+| Cleanup | ✓ nothing `triple-c` left in us-west-2 (the run's environment KMS key pending deletion). The guard's task-definition retirement had never matched anything (ECS's `familyPrefix` is a whole family name); fixed, and 13 revisions earlier runs had left ACTIVE were deregistered and deleted |

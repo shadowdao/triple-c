@@ -676,7 +676,15 @@ TLS only, tagged `triple-c:component=state`), one object per deployment (D9).
    start/stop/status, stop guard with WIP push on by default, idle auto-stop, logs. **Done 2026-11-15**; verified live on Fargate:
    cold start about 94-104 s, ECS `HEALTHY` about 135 s, attach to a running task about 2 s, idle
    stop verified (see "Phase 5: rulings" and `aws/README.md` "Phase 5").
-6. **EFS mode, Copy-at-connect, setup scripts, cost estimate.**
+6. **EFS mode, Copy-at-connect, setup scripts, cost estimate.** Also port mappings, the LLM
+   gateway sidecar and the environment's (advisory) workspace lifetime cap. **Verified live
+   2026-11-16** in one workspace (`aws/README.md` "Phase 6: one workspace with every option"):
+   EFS `/workspace` survives a stop, the setup script runs and reports `ok`, copy-at-connect
+   leaves no credential in the secret and installs the CA, a mapped port answers through the
+   tunnel, the sidecar answers on 127.0.0.1:4000 and neither key reaches the logs, the cap reaches
+   the task as `TRIPLEC_MAX_LIFETIME_MINUTES`, and one cost estimate is fetched. Not exercised
+   live: the cap firing (unit-tested), a v1 → v2 environment update, a private clone retried
+   after connect.
 7. **ECS on EC2.** Per-user capacity providers in the onboarding module, privileged/Docker/VPN on
    dedicated capacity.
 8. **Standard tenancy** (opt-in), only if demand appears.
@@ -720,6 +728,12 @@ TLS only, tagged `triple-c:component=state`), one object per deployment (D9).
   whole tree up, also costing about 2 GB of ephemeral storage. It now chowns only what isn't
   already `claude`'s, and the agent answers 83 s after `RunTask`, 4 s after the container starts.
   SOCI was not tried.
+- ~~Whether the gateway sidecar logs the provider or master key.~~ **Measured 2026-11-16:** neither
+  appears in the gateway or workspace log streams after a failed and a successful call; LiteLLM
+  logs the provider's error text, in which OpenAI masks the key (first 8 + last 4 characters).
+- ~~That a cold start with EFS `/workspace` and the sidecar stays close to phase 5's.~~
+  **Measured 2026-11-16:** 115 s (two access points, two images); restart 112 s; sidecar healthy
+  126 s after the start began.
 - That GHCR pull-through cache works for the public image.
 - That the `SIGTERM` deadline on Fargate retirement and Spot leaves enough time for a WIP push.
 

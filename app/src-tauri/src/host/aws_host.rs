@@ -643,6 +643,25 @@ pub async fn ensure_started(
     store: &ProjectsStore,
     progress: &(dyn Fn(&str) + Send + Sync),
 ) -> Result<ContainerTarget, String> {
+    ensure_started_with(
+        project,
+        settings,
+        store,
+        progress,
+        crate::storage::secure::get_gateway_api_key,
+    )
+    .await
+}
+
+/// [`ensure_started`] with the gateway sidecar's provider key read by
+/// `read_gateway_key` instead of the keychain (the live tests have none).
+pub async fn ensure_started_with(
+    project: &Project,
+    settings: &AppSettings,
+    store: &ProjectsStore,
+    progress: &(dyn Fn(&str) + Send + Sync),
+    read_gateway_key: impl FnOnce() -> Result<Option<String>, String>,
+) -> Result<ContainerTarget, String> {
     // A background re-attach (after a restart) may be opening a tunnel:
     // cancel it, this start attaches itself. Its tunnel, if it gets one, is
     // refused by the registry and closed.
@@ -666,7 +685,7 @@ pub async fn ensure_started(
     let files = workspace_files(ssh, ca.as_ref())?;
     let custom_env_keys =
         crate::docker::workspace_env::custom_env_keys(project, &settings.global_custom_env_vars);
-    let sidecar = gateway_sidecar(project, settings, crate::storage::secure::get_gateway_api_key)?;
+    let sidecar = gateway_sidecar(project, settings, read_gateway_key)?;
 
     let (connection_id, region, sdk) = project_sdk(project, settings).await?;
     let who = caller_identity(&sdk).await.map_err(s)?;

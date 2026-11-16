@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Run the phase-5 live test (`a_fargate_workspace_round_trips`) end to end:
+# Run the phase-5 live test (`a_fargate_workspace_round_trips`; another with
+# TRIPLEC_E2E_TEST=<test path>, e.g. the phase-6
+# `aws::live_tests::environment::a_phase6_workspace_round_trips`) end to end:
 # build the sandbox image from this checkout, push it to a throwaway private
 # ECR repository, run the test, and delete the repository again — on success,
 # failure or Ctrl-C (trap). The test deletes the repository in its own guard
@@ -82,5 +84,5 @@ mkdir -p ../dist
 cargo build --locked
 # A stack overflow aborts without running any guard: give the test thread room.
 RUST_MIN_STACK=16777216 TRIPLEC_E2E_IMAGE="$image" TRIPLEC_E2E_ECR_REPO="$repo" \
-    cargo test --locked aws::live_tests::environment::a_fargate_workspace_round_trips \
+    cargo test --locked "${TRIPLEC_E2E_TEST:-aws::live_tests::environment::a_fargate_workspace_round_trips}" \
     -- --ignored --test-threads=1 --nocapture
