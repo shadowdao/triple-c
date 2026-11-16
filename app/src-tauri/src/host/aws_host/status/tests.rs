@@ -220,8 +220,11 @@ async fn stop_ends_a_follow_in_progress_without_a_warning() {
     let task = tokio::spawn(async move {
         let warned = std::sync::Arc::new(Mutex::new(false));
         let w = warned.clone();
-        run_follow(&Hang, id, 1, true, FollowTiming::default(), move |_| *w.lock().unwrap() = true)
-            .await;
+        let follower = tunnels::begin_follow(id);
+        run_follow(&Hang, id, follower, 1, true, FollowTiming::default(), move |_| {
+            *w.lock().unwrap() = true
+        })
+        .await;
         let v = *warned.lock().unwrap();
         v
     });
@@ -241,7 +244,8 @@ async fn stop_ends_a_follow_in_progress_without_a_warning() {
 #[tokio::test(start_paused = true)]
 async fn a_new_follow_replaces_the_old_one() {
     let id = "follow-replace-test";
-    let first = tokio::spawn(run_follow(&Hang, id, 1, true, FollowTiming::default(), |_| {}));
+    let follower = tunnels::begin_follow(id);
+    let first = tokio::spawn(run_follow(&Hang, id, follower, 1, true, FollowTiming::default(), |_| {}));
     tokio::time::sleep(FOLLOW_INTERVAL).await;
     let (_, second) = tunnels::begin_follow(id);
     tokio::time::timeout(std::time::Duration::from_secs(1), first).await.unwrap().unwrap();
@@ -250,6 +254,27 @@ async fn a_new_follow_replaces_the_old_one() {
     assert!(!second.is_cancelled());
     tunnels::cancel_follow(id);
     assert!(second.is_cancelled());
+}
+
+#[tokio::test(start_paused = true)]
+async fn followers_registered_in_start_order_win_in_that_order_however_they_are_scheduled() {
+    // A quick Stop→Start: the old start's follower is registered first, the
+    // new one second, but the new one's task happens to run first.
+    let id = "follow-order-test";
+    let old = tunnels::begin_follow(id);
+    let new = tunnels::begin_follow(id);
+    let new_token = new.1.clone();
+    let new_task = tokio::spawn(run_follow(&Hang, id, new, 1, true, FollowTiming::default(), |_| {}));
+    tokio::time::sleep(FOLLOW_INTERVAL).await;
+    let old_task = tokio::spawn(run_follow(&Hang, id, old, 1, true, FollowTiming::default(), |_| {}));
+    // The old one was cancelled at registration: it ends at once and leaves
+    // the new one registered and running.
+    tokio::time::timeout(std::time::Duration::from_secs(1), old_task).await.unwrap().unwrap();
+    assert!(tunnels::is_following(id));
+    assert!(!new_token.is_cancelled());
+    assert!(!new_task.is_finished());
+    tunnels::cancel_follow(id);
+    tokio::time::timeout(std::time::Duration::from_secs(1), new_task).await.unwrap().unwrap();
 }
 
 #[test]

@@ -405,17 +405,21 @@ pub fn follow_warning(end: &FollowEnd, limit: Duration, created: bool) -> Option
     }
 }
 
-/// The follow of one project's workspace, registered with the tunnel
-/// registry for cancellation. `on_warning` gets the warning, if any.
+/// The follow of one project's workspace. `follower` is its registration
+/// with the tunnel registry (`tunnels::begin_follow`), made by the caller
+/// before the follow is spawned so registrations keep the order of the starts
+/// (a quick Stop→Start can't leave the old follower registered last).
+/// `on_warning` gets the warning, if any.
 pub async fn run_follow<S: StatusSource>(
     src: &S,
     project_id: &str,
+    follower: (u64, CancellationToken),
     total_repos: usize,
     created: bool,
     timing: FollowTiming,
     on_warning: impl FnOnce(String),
 ) {
-    let (id, cancel) = tunnels::begin_follow(project_id);
+    let (id, cancel) = follower;
     let log_line = |m: &str| log::debug!("Project {project_id}: {m}");
     let end = follow_workspace_status(src, total_repos, timing, &cancel, &log_line).await;
     tunnels::end_follow(project_id, id);
@@ -437,9 +441,12 @@ pub fn spawn_follow(
     let project_id = project.id.clone();
     let total = project.aws.as_ref().map_or(0, |a| a.repos.len());
     let created = tunnels::ran_task(&project_id);
+    // Registered now, not in the spawned task: see `run_follow`.
+    let follower = tunnels::begin_follow(&project_id);
     tauri::async_runtime::spawn(async move {
         let src = TunnelStatusSource { project_id: &project_id };
-        run_follow(&src, &project_id, total, created, FollowTiming::default(), on_warning).await;
+        run_follow(&src, &project_id, follower, total, created, FollowTiming::default(), on_warning)
+            .await;
     });
     true
 }
