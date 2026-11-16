@@ -82,7 +82,7 @@ const WATCH_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 const STOP_TIMEOUT: Duration = Duration::from_secs(45);
 
 pub mod status;
-pub use status::{follow_start, workspace_status, WorkspaceStatus};
+pub use status::{spawn_follow, workspace_status, WorkspaceStatus};
 
 fn s<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
@@ -589,6 +589,7 @@ pub async fn ensure_started(
     // Already connected and answering: nothing to do.
     if let Some(ep) = tunnels::get_endpoint(&project.id) {
         if matches!(agent::is_running(&ep).await, Ok(true)) {
+            tunnels::mark_attached(&project.id);
             return Ok(ContainerTarget::Agent(ep));
         }
         tunnels::close(&project.id).await;
@@ -653,6 +654,7 @@ pub async fn ensure_started(
             access_point_id,
             workspace_access_point_id,
             task_definition_arn: started.task.task_definition_arn.clone(),
+            created: started.created,
         },
     ) {
         old.forward.close().await;
@@ -834,6 +836,7 @@ async fn task_arn_or_find<T: TaskApi>(
 /// the stored task ARN, else whatever live task the project has (a crash
 /// between RunTask and the store write). Closes the tunnel.
 pub async fn stop_project(project: &Project, settings: &AppSettings) -> Result<(), String> {
+    tunnels::cancel_follow(&project.id);
     if let Some(ep) = tunnels::get_endpoint(&project.id) {
         if let Some(res) = stop_endpoint(&ep).await {
             return res;
@@ -867,6 +870,7 @@ pub async fn remove_resources(
     settings: &AppSettings,
     discard_data: bool,
 ) -> Result<(), String> {
+    tunnels::cancel_follow(&project.id);
     let (_, region, sdk) = project_sdk(project, settings).await?;
     let who = caller_identity(&sdk).await.map_err(s)?;
     let ok = owner_key(&region, &who.user_id);
@@ -1104,6 +1108,7 @@ async fn reattach(
             .as_ref()
             .and_then(|a| a.workspace_access_point_id.clone()),
         task_definition_arn: task.task_definition_arn.clone(),
+        created: false,
     };
     if !reattach_still_wanted(store, &project.id, &task.arn) {
         tunnel.forward.close().await;

@@ -13,9 +13,10 @@ const REPO_STATE: Record<string, string> = {
 };
 
 /**
- * An AWS workspace's background clone and setup script (phase 6, Q4): the
- * same status the start followed, re-read every 5 s while the project is
- * Running and the window is visible. Each read is a background exec, so the
+ * An AWS workspace's background clone and setup script (phase 6, Q4/R5):
+ * the start ends at "Connecting…" and this card is where their progress
+ * shows, re-read every 5 s while the project is Running and the window is
+ * visible. Each read is a background exec, so the
  * card never keeps an idle workspace up. Renders nothing for a local project,
  * a workspace that cannot be asked, or one with no repos and no setup script.
  */

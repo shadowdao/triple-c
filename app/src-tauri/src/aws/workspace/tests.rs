@@ -469,7 +469,7 @@ fn payload_holds_all_project_data_with_sorted_keys() {
         ("ca/corp.pem".to_string(), b"PEM".to_vec()),
     ];
     let repos = project(StorageMode::Hybrid).aws.unwrap().repos;
-    let json = project_secret_payload(
+    let json = project_secret_payload_with(
         &env,
         "tok",
         &files,
@@ -477,6 +477,7 @@ fn payload_holds_all_project_data_with_sorted_keys() {
         true,
         Some(30),
         StorageMode::Hybrid,
+        PayloadExtras::default(),
     )
     .unwrap();
     let m = payload_map(&json);
@@ -525,7 +526,16 @@ fn payload_holds_all_project_data_with_sorted_keys() {
 #[test]
 fn payload_off_values() {
     let json =
-        project_secret_payload(&[], "t", &[], &[], false, None, StorageMode::Ephemeral).unwrap();
+        project_secret_payload_with(
+            &[],
+            "t",
+            &[],
+            &[],
+            false,
+            None,
+            StorageMode::Ephemeral,
+            PayloadExtras::default(),
+        ).unwrap();
     let m = payload_map(&json);
     assert_eq!(m["TRIPLEC_WIP_PUSH"], "0");
     assert_eq!(m["TRIPLEC_STORAGE"], "ephemeral");
@@ -538,8 +548,26 @@ fn payload_off_values() {
 fn payload_is_independent_of_env_pair_order() {
     let a = pairs(&[("B", "2"), ("A", "1"), ("C", "3")]);
     let b = pairs(&[("C", "3"), ("A", "1"), ("B", "2")]);
-    let pa = project_secret_payload(&a, "t", &[], &[], true, None, StorageMode::Hybrid).unwrap();
-    let pb = project_secret_payload(&b, "t", &[], &[], true, None, StorageMode::Hybrid).unwrap();
+    let pa = project_secret_payload_with(
+        &a,
+        "t",
+        &[],
+        &[],
+        true,
+        None,
+        StorageMode::Hybrid,
+        PayloadExtras::default(),
+    ).unwrap();
+    let pb = project_secret_payload_with(
+        &b,
+        "t",
+        &[],
+        &[],
+        true,
+        None,
+        StorageMode::Hybrid,
+        PayloadExtras::default(),
+    ).unwrap();
     assert_eq!(pa, pb);
 }
 
@@ -549,7 +577,16 @@ fn payload_rejects_bad_file_names() {
         "ssh/", "ssh/.", "ssh/..", "ssh/a/b", "other/x", "x", "ca/../k", "ssh/a:b",
     ] {
         let files = vec![(name.to_string(), b"x".to_vec())];
-        let r = project_secret_payload(&[], "t", &files, &[], true, None, StorageMode::Hybrid);
+        let r = project_secret_payload_with(
+            &[],
+            "t",
+            &files,
+            &[],
+            true,
+            None,
+            StorageMode::Hybrid,
+            PayloadExtras::default(),
+        );
         if name == "ssh/a:b" {
             // A colon is a fine file name; only the secret's *keys* are restricted.
             assert!(r.is_ok());
@@ -563,7 +600,16 @@ fn payload_rejects_bad_file_names() {
 fn payload_rejects_env_names_a_secret_reference_cannot_carry() {
     for bad in ["A:B", "", "1ABC", "A-B", "A B"] {
         let env = pairs(&[(bad, "SENTINEL-VALUE-7f3a")]);
-        let r = project_secret_payload(&env, "t", &[], &[], true, None, StorageMode::Hybrid);
+        let r = project_secret_payload_with(
+            &env,
+            "t",
+            &[],
+            &[],
+            true,
+            None,
+            StorageMode::Hybrid,
+            PayloadExtras::default(),
+        );
         assert!(r.is_err(), "{bad:?} accepted");
         // The error never echoes a value.
         assert!(!r.unwrap_err().contains("SENTINEL-VALUE-7f3a"));
@@ -581,7 +627,16 @@ fn payload_keeps_its_own_keys_over_custom_env() {
         ("OK", "1"),
     ]);
     let m = payload_map(
-        &project_secret_payload(&env, "real", &[], &[], true, None, StorageMode::Hybrid).unwrap(),
+        &project_secret_payload_with(
+            &env,
+            "real",
+            &[],
+            &[],
+            true,
+            None,
+            StorageMode::Hybrid,
+            PayloadExtras::default(),
+        ).unwrap(),
     );
     assert_eq!(m["TRIPLEC_AGENT_TOKEN"], "real");
     // The task definition's fixed environment owns these two names.
@@ -597,7 +652,16 @@ fn payload_keeps_its_own_keys_over_custom_env() {
 fn payload_over_64_kib_fails() {
     let env = pairs(&[("BIG", &"x".repeat(65_536))]);
     let err =
-        project_secret_payload(&env, "t", &[], &[], true, None, StorageMode::Hybrid).unwrap_err();
+        project_secret_payload_with(
+            &env,
+            "t",
+            &[],
+            &[],
+            true,
+            None,
+            StorageMode::Hybrid,
+            PayloadExtras::default(),
+        ).unwrap_err();
     assert!(err.contains("65,536"), "{err}");
 }
 
@@ -643,7 +707,16 @@ fn payload_omits_setup_script_and_lifetime_when_unset() {
 fn payload_setup_script_and_lifetime_cannot_be_forged_by_custom_env() {
     let env = pairs(&[("TRIPLEC_SETUP_SCRIPT", "rm -rf /"), ("TRIPLEC_MAX_LIFETIME_MINUTES", "1")]);
     let m = payload_map(
-        &project_secret_payload(&env, "t", &[], &[], true, None, StorageMode::Hybrid).unwrap(),
+        &project_secret_payload_with(
+            &env,
+            "t",
+            &[],
+            &[],
+            true,
+            None,
+            StorageMode::Hybrid,
+            PayloadExtras::default(),
+        ).unwrap(),
     );
     assert!(!m.contains_key("TRIPLEC_SETUP_SCRIPT"));
     assert!(!m.contains_key("TRIPLEC_MAX_LIFETIME_MINUTES"));
@@ -679,7 +752,16 @@ fn payload_size_error_names_the_setup_script_when_it_is_the_large_part() {
 fn payload_size_error_names_a_large_custom_variable_by_name_only() {
     let env = pairs(&[("BIG_BLOB", &"SENTINEL".repeat(9000))]);
     let err =
-        project_secret_payload(&env, "t", &[], &[], true, None, StorageMode::Hybrid).unwrap_err();
+        project_secret_payload_with(
+            &env,
+            "t",
+            &[],
+            &[],
+            true,
+            None,
+            StorageMode::Hybrid,
+            PayloadExtras::default(),
+        ).unwrap_err();
     assert!(err.contains("the environment variable BIG_BLOB (71 KiB)"), "{err}");
     assert!(!err.contains("SENTINEL"), "{err}");
 }

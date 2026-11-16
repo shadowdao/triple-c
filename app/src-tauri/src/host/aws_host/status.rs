@@ -3,18 +3,25 @@
 //!
 //! The entrypoint clones in the background and then runs the setup script;
 //! `triple-c-workspace-status` (container) prints both as one JSON line,
-//! mirrored by [`WorkspaceStatus`]. The start reads it through the agent every
-//! [`FOLLOW_INTERVAL`] as a **background** exec (never activity for idle
-//! stop), emits a progress line only when it changes, and stops when the
-//! clone is done and no setup is running, after [`FOLLOW_LIMIT`], or quietly
-//! when the agent is gone (tunnel dropped, old image without the script).
-//! A failed clone or setup does not fail the start: [`follow_warning`] is
-//! what the user is told instead.
+//! mirrored by [`WorkspaceStatus`].
+//!
+//! **The start does not wait for them** (ruling R5, amending Q4): it ends
+//! after "Connecting…" as in phase 5 — project Running, project lock
+//! released, terminals and Stop usable. [`spawn_follow`] then follows in the
+//! background: a read through the agent every [`FOLLOW_INTERVAL`] as a
+//! **background** exec (never activity for idle stop), a log line only when
+//! it changes, until the clone is done and no setup runs, [`FOLLOW_LIMIT`]
+//! passes, the agent is gone (tunnel dropped, task died, image without the
+//! script) or its token is cancelled (`tunnels::cancel_follow` on Stop and
+//! Remove; any tunnel close; app exit). Its only output is the final warning
+//! ([`follow_warning`]); Project Home's Overview card polls the status itself
+//! while the project is Running, so progress shows there.
 
 use std::future::Future;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 use super::super::{tunnels, ContainerTarget};
 use crate::models::Project;
@@ -281,16 +288,37 @@ impl Default for FollowTiming {
 /// How a follow ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FollowEnd {
-    Settled(WorkspaceStatus),
+    Settled {
+        status: WorkspaceStatus,
+        /// The very first read was already settled: nothing happened in
+        /// this follow (an attach to a workspace that finished long ago).
+        first_read: bool,
+    },
     /// [`FollowTiming::limit`] passed; the last status read, if any.
     TimedOut(Option<WorkspaceStatus>),
-    /// The agent went away or kept failing; nothing to say.
+    /// The agent went away, kept failing, or the follow was cancelled:
+    /// nothing to say.
     Lost,
 }
 
-/// Follow `src` until it settles, the limit passes or it is lost, calling
-/// `progress` with each new progress line and each new setup log line.
+/// Follow `src` until it settles, the limit passes, it is lost or `cancel`
+/// fires, calling `progress` with each new progress line and each new setup
+/// log line.
 pub async fn follow_workspace_status<S: StatusSource>(
+    src: &S,
+    total_repos: usize,
+    timing: FollowTiming,
+    cancel: &CancellationToken,
+    progress: &(dyn Fn(&str) + Send + Sync),
+) -> FollowEnd {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => FollowEnd::Lost,
+        end = follow_inner(src, total_repos, timing, progress) => end,
+    }
+}
+
+async fn follow_inner<S: StatusSource>(
     src: &S,
     total_repos: usize,
     timing: FollowTiming,
@@ -301,12 +329,14 @@ pub async fn follow_workspace_status<S: StatusSource>(
     let mut last_log: Option<String> = None;
     let mut last_status: Option<WorkspaceStatus> = None;
     let mut failures = 0u32;
+    let mut reads = 0u32;
     loop {
         match src.read().await {
             StatusRead::Status(s) => {
                 failures = 0;
+                reads += 1;
                 if s.settled() {
-                    return FollowEnd::Settled(s);
+                    return FollowEnd::Settled { status: s, first_read: reads == 1 };
                 }
                 if let Some(line) = s.progress_line(total_repos) {
                     if last_line.as_deref() != Some(line.as_str()) {
@@ -341,11 +371,20 @@ pub async fn follow_workspace_status<S: StatusSource>(
     }
 }
 
-/// What the user is told after a follow; `None` when all went well (or the
-/// follow was lost — Project Home still shows the status on demand).
-pub fn follow_warning(end: &FollowEnd, limit: Duration) -> Option<String> {
+/// What the user is told after a follow; `None` when all went well, the
+/// follow was lost, or the workspace had settled before this start —
+/// a failure is reported only when this follow saw it happen, or the
+/// task is one this start ran (`created`). Project Home still shows an old
+/// failure on demand.
+pub fn follow_warning(end: &FollowEnd, limit: Duration, created: bool) -> Option<String> {
     match end {
-        FollowEnd::Settled(s) => s.problems(),
+        FollowEnd::Settled { status, first_read } => {
+            if *first_read && !created {
+                None
+            } else {
+                status.problems()
+            }
+        }
         FollowEnd::TimedOut(s) => {
             let what = match s {
                 Some(s) if !s.clone.done => "still cloning its repos",
@@ -366,25 +405,43 @@ pub fn follow_warning(end: &FollowEnd, limit: Duration) -> Option<String> {
     }
 }
 
-/// The start's follow of a just-connected AWS project; the warning to show,
-/// if any. A local project returns `None` at once.
-pub async fn follow_start(
-    project: &Project,
-    progress: &(dyn Fn(&str) + Send + Sync),
-) -> Option<String> {
-    if !project.is_aws() {
-        return None;
+/// The follow of one project's workspace, registered with the tunnel
+/// registry for cancellation. `on_warning` gets the warning, if any.
+pub async fn run_follow<S: StatusSource>(
+    src: &S,
+    project_id: &str,
+    total_repos: usize,
+    created: bool,
+    timing: FollowTiming,
+    on_warning: impl FnOnce(String),
+) {
+    let (id, cancel) = tunnels::begin_follow(project_id);
+    let log_line = |m: &str| log::debug!("Project {project_id}: {m}");
+    let end = follow_workspace_status(src, total_repos, timing, &cancel, &log_line).await;
+    tunnels::end_follow(project_id, id);
+    if let Some(w) = follow_warning(&end, timing.limit, created) {
+        on_warning(w);
     }
+}
+
+/// After a successful start of an AWS project: follow its clone and setup
+/// script in the background (see the module docs). `false` (nothing
+/// spawned) for a local project or one with no tunnel.
+pub fn spawn_follow(
+    project: &Project,
+    on_warning: impl FnOnce(String) + Send + 'static,
+) -> bool {
+    if !project.is_aws() || tunnels::get_endpoint(&project.id).is_none() {
+        return false;
+    }
+    let project_id = project.id.clone();
     let total = project.aws.as_ref().map_or(0, |a| a.repos.len());
-    let timing = FollowTiming::default();
-    let end = follow_workspace_status(
-        &TunnelStatusSource { project_id: &project.id },
-        total,
-        timing,
-        progress,
-    )
-    .await;
-    follow_warning(&end, timing.limit)
+    let created = tunnels::ran_task(&project_id);
+    tauri::async_runtime::spawn(async move {
+        let src = TunnelStatusSource { project_id: &project_id };
+        run_follow(&src, &project_id, total, created, FollowTiming::default(), on_warning).await;
+    });
+    true
 }
 
 #[cfg(test)]

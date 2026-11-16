@@ -286,29 +286,6 @@ fn serialize_payload(m: &BTreeMap<String, String>) -> Result<String, String> {
 /// `TRIPLEC_SETUP_SCRIPT` when set, `TRIPLEC_MAX_LIFETIME_MINUTES` when the
 /// environment caps it), keys sorted. Fails when it would exceed 65,536 bytes.
 #[cfg_attr(not(test), allow(dead_code))]
-pub fn project_secret_payload(
-    env_pairs: &[(String, String)],
-    agent_token: &str,
-    files: &[(String, Vec<u8>)],
-    repos: &[RepoSource],
-    wip: bool,
-    idle: Option<u32>,
-    storage: StorageMode,
-) -> Result<String, String> {
-    project_secret_payload_with(
-        env_pairs,
-        agent_token,
-        files,
-        repos,
-        wip,
-        idle,
-        storage,
-        PayloadExtras::default(),
-    )
-}
-
-/// [`project_secret_payload`] with the phase 6 keys.
-#[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 pub fn project_secret_payload_with(
     env_pairs: &[(String, String)],

@@ -93,6 +93,46 @@ fn record_corrupt_load(file_path: &Path, now: &chrono::DateTime<chrono::Utc>) {
     }
 }
 
+/// The load's rewrite of stale transient statuses; `true` when it changed
+/// any.
+pub(crate) fn settle_stale_statuses(projects: &mut [Project]) -> bool {
+    // Reconcile stale transient statuses: on a cold app start no Docker
+    // operations can be in flight, so Starting/Stopping are always stale.
+    // Running/Error are left as-is and reconciled against Docker later
+    // via the reconcile_project_statuses command.
+    //
+    // An AWS project goes to **Error**, not Stopped: an app that quit
+    // mid-start (or mid-stop) may have left a billed task running, with
+    // or without its ARN recorded yet. Error is what a failed start that
+    // left a task already uses; `reconcile_aws_projects` then asks ECS
+    // (by ARN, else by the project's tags) and settles it Running or
+    // Stopped. Stopped would hide the live task.
+    let mut changed = false;
+    for p in projects.iter_mut() {
+        match p.status {
+            crate::models::ProjectStatus::Starting | crate::models::ProjectStatus::Stopping => {
+                let to = if p.is_aws() {
+                    crate::models::ProjectStatus::Error
+                } else {
+                    crate::models::ProjectStatus::Stopped
+                };
+                log::warn!(
+                    "Reconciling stale '{}' status for project '{}' ({}) → {:?}",
+                    serde_json::to_string(&p.status).unwrap_or_default().trim_matches('"'),
+                    p.name,
+                    p.id,
+                    to
+                );
+                p.status = to;
+                p.updated_at = chrono::Utc::now().to_rfc3339();
+                changed = true;
+            }
+            _ => {}
+        }
+    }
+    changed
+}
+
 pub struct ProjectsStore {
     projects: Mutex<Vec<Project>>,
     file_path: PathBuf,
@@ -155,28 +195,8 @@ impl ProjectsStore {
             (Vec::new(), false)
         };
 
-        // Reconcile stale transient statuses: on a cold app start no Docker
-        // operations can be in flight, so Starting/Stopping are always stale.
-        // Running/Error are left as-is and reconciled against Docker later
-        // via the reconcile_project_statuses command.
         let mut projects = projects;
-        let mut needs_save = needs_save;
-        for p in projects.iter_mut() {
-            match p.status {
-                crate::models::ProjectStatus::Starting | crate::models::ProjectStatus::Stopping => {
-                    log::warn!(
-                        "Reconciling stale '{}' status for project '{}' ({}) → Stopped",
-                        serde_json::to_string(&p.status).unwrap_or_default().trim_matches('"'),
-                        p.name,
-                        p.id
-                    );
-                    p.status = crate::models::ProjectStatus::Stopped;
-                    p.updated_at = chrono::Utc::now().to_rfc3339();
-                    needs_save = true;
-                }
-                _ => {}
-            }
-        }
+        let needs_save = settle_stale_statuses(&mut projects) || needs_save;
 
         let store = Self {
             projects: Mutex::new(projects),

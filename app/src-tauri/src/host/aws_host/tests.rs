@@ -875,3 +875,52 @@ async fn an_unattached_aws_project_gets_a_target_id_no_tunnel_can_have() {
     let local = Project::new("l".into(), Vec::new());
     assert_eq!(unattached_container_id(&local), None);
 }
+
+#[tokio::test]
+async fn a_persisted_starting_aws_project_with_a_task_arn_is_reconciled_against_ecs_on_load() {
+    use crate::commands::project_commands::needs_aws_reconcile;
+    use crate::storage::projects_store::settle_stale_statuses;
+
+    // The app quit mid-start: Starting, the task's ARN already recorded.
+    let mut p = aws_project(StorageMode::Hybrid);
+    p.status = ProjectStatus::Starting;
+    p.aws.as_mut().unwrap().task_arn = Some(task_arn("mid"));
+    let mut docker = Project::new("local".into(), vec![]);
+    docker.status = ProjectStatus::Starting;
+
+    let mut loaded = vec![p.clone(), docker];
+    assert!(settle_stale_statuses(&mut loaded));
+    // Not Stopped (that would hide a billed task): Error, ARN kept.
+    assert_eq!(loaded[0].status, ProjectStatus::Error);
+    assert_eq!(loaded[0].aws.as_ref().unwrap().task_arn, Some(task_arn("mid")));
+    assert_eq!(loaded[1].status, ProjectStatus::Stopped, "Docker is unchanged");
+    assert!(needs_aws_reconcile(&loaded[0]));
+
+    // ECS says it runs: Running.
+    let p = loaded[0].clone();
+    let fake = Fake::default().with_task(task(&p, "mid", "RUNNING", true));
+    let (_d, store) = store_with(&p);
+    assert!(matches!(reconcile_project(&fake, &store, &p, &find(&p)).await.unwrap(), Reconciled::Live(_)));
+    assert_eq!(store.get(&p.id).unwrap().status, ProjectStatus::Running);
+    // ECS says it is gone: Stopped, ARN cleared.
+    let (_d, store) = store_with(&p);
+    assert_eq!(reconcile_project(&Fake::default(), &store, &p, &find(&p)).await.unwrap(), Reconciled::Gone);
+    let after = store.get(&p.id).unwrap();
+    assert_eq!(after.status, ProjectStatus::Stopped);
+    assert_eq!(after.aws.unwrap().task_arn, None);
+}
+
+#[test]
+fn a_stopped_aws_project_is_reconciled_only_when_it_still_has_a_task_arn() {
+    use crate::commands::project_commands::needs_aws_reconcile;
+    let mut p = aws_project(StorageMode::Hybrid);
+    p.status = ProjectStatus::Stopped;
+    assert!(!needs_aws_reconcile(&p), "a clean stop clears the ARN");
+    p.aws.as_mut().unwrap().task_arn = Some(task_arn("left"));
+    assert!(needs_aws_reconcile(&p));
+    for s in [ProjectStatus::Running, ProjectStatus::Error, ProjectStatus::Starting, ProjectStatus::Stopping] {
+        p.status = s;
+        p.aws.as_mut().unwrap().task_arn = None;
+        assert!(needs_aws_reconcile(&p));
+    }
+}

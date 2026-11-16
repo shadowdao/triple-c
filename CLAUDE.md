@@ -422,10 +422,14 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   subshell; `status` is `running` from the start until `ok` / `failed <code>` (a chain that dies
   early writes `failed`, so the idle stop is never blocked). `triple-c-workspace-status` (python,
   no secrets) prints `{clone:{done,repos},setup:{state,code,tail}}`.
-  The start command follows it after "Connecting…" (`host/aws_host/status.rs`: background exec
-  every 2 s, a progress line only on change, at most 35 min, quiet stop when the tunnel goes);
-  a failed clone/setup never fails the start — it arrives as the `workspace-warning` event (warning
-  toast), and Project Home's Overview polls `aws_workspace_status` every 5 s while visible.
+  **The start does not wait for them** (it ends after "Connecting…": Running, lock released);
+  `aws_host::spawn_follow` follows in a background task (`host/aws_host/status.rs`: background exec
+  every 2 s, at most 35 min, holds no project lock; ended by `tunnels::cancel_follow` on Stop/Remove
+  and by any tunnel close or app exit). Its only output is a `workspace-warning` event (warning
+  toast) for a failure it saw happen or one on a task this start ran; progress shows in Project
+  Home's Overview card, which polls `aws_workspace_status` every 5 s while Running and visible.
+  At load, a Starting/Stopping AWS project becomes Error (not Stopped — a crash mid-start may have
+  left a billed task), and `reconcile_aws_projects` also checks a Stopped one still holding a task ARN.
   **Lifetime cap** (`TRIPLEC_MAX_LIFETIME_MINUTES`, advisory — sudo can kill it): the idle watcher
   (started when idle stop *or* a non-zero cap is set) pushes best effort, records `lifetime` and
   sends TERM; the hook exits 76 (`aws::tasks::LIFETIME_EXIT_CODE` → `StopKind::LifetimeCap` →

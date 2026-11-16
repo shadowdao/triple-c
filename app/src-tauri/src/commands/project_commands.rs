@@ -1407,9 +1407,6 @@ async fn start_project_container_locked(
 
     // Wrap container operations so that any failure resets status to Stopped.
     let host = ProjectHost::for_project(&project);
-    // An AWS start's clone/setup problems: the start still succeeds, and this
-    // goes to the user as a `workspace-warning` event once it is Running.
-    let mut workspace_warning: Option<String> = None;
     let result: Result<ContainerTarget, String> = async {
         let target = host
             .ensure_started(&project, &settings, &state.projects_store, &|msg: &str| {
@@ -1433,14 +1430,6 @@ async fn start_project_container_locked(
             project.clone(),
             target.clone(),
         );
-
-        // AWS: follow the background clone and setup script until they are
-        // done (or 35 minutes pass), as progress lines (phase 6, Q4). A
-        // local project returns at once.
-        workspace_warning = crate::host::aws_host::follow_start(&project, &|msg: &str| {
-            emit_progress(&app_handle, &project_id, msg)
-        })
-        .await;
 
         Ok(target)
     }.await;
@@ -1502,8 +1491,14 @@ async fn start_project_container_locked(
             .await;
     }
 
-    if let Some(detail) = workspace_warning {
-        emit_workspace_warning(&app_handle, &project_id, &project.name, &detail);
+    // AWS: the start is done (Running, lock released when this returns);
+    // the background clone and setup script are followed by a background
+    // task that only reports a failure (ruling R5). Never for Docker.
+    if project.is_aws() {
+        let (handle, id, name) = (app_handle.clone(), project_id.clone(), project.name.clone());
+        crate::host::aws_host::spawn_follow(&project, move |detail| {
+            emit_workspace_warning(&handle, &id, &name, &detail)
+        });
     }
 
     project.container_id = Some(container_id);
@@ -1511,11 +1506,10 @@ async fn start_project_container_locked(
     Ok(project)
 }
 
-/// The start's warning channel (phase 6, Q4): the start command returns the
-/// stored `Project`, which has no place for a one-off warning, so a started
-/// workspace whose clone or setup script failed is reported as a
-/// `workspace-warning` event `{project_id, message, detail}`; the frontend
-/// shows it as a warning toast.
+/// The follower's warning channel (phase 6, Q4/R5): a started workspace
+/// whose clone or setup script failed (or still ran after 35 minutes) is
+/// reported as a `workspace-warning` event `{project_id, message, detail}`;
+/// the frontend shows it as a warning toast.
 fn emit_workspace_warning(app_handle: &tauri::AppHandle, project_id: &str, name: &str, detail: &str) {
     let _ = app_handle.emit(
         "workspace-warning",
@@ -1569,6 +1563,9 @@ pub async fn stop_project_container(
     }
 
     state.projects_store.update_status(&project_id, ProjectStatus::Stopping)?;
+    // AWS: the background clone/setup follower ends now (it holds no lock;
+    // closing the tunnel would end it too).
+    crate::host::tunnels::cancel_follow(&project_id);
 
     // AWS: the terminals and the auth bridge close *before* the stop guard's
     // push, so nothing written after its snapshot is silently dropped (the
@@ -2014,6 +2011,17 @@ pub async fn reconcile_project_statuses(
 /// How many AWS projects reconcile at once.
 const AWS_RECONCILE_CONCURRENCY: usize = 4;
 
+/// Whether an AWS project's status must be checked against ECS at startup:
+/// anything but a clean Stopped — and a Stopped one that still has a task
+/// ARN (Stop clears it, so the stored ARN means a start or stop never
+/// finished and a billed task may be running).
+pub(crate) fn needs_aws_reconcile(p: &Project) -> bool {
+    match p.status {
+        ProjectStatus::Running | ProjectStatus::Error | ProjectStatus::Starting | ProjectStatus::Stopping => true,
+        ProjectStatus::Stopped => p.aws.as_ref().is_some_and(|a| a.task_arn.is_some()),
+    }
+}
+
 /// Reconcile every AWS project against ECS (the authority), independently of
 /// Docker: an app started without Docker still learns which tasks run and
 /// re-opens their tunnels. One bounded DescribeTasks per project, a few at a
@@ -2037,10 +2045,7 @@ pub async fn reconcile_aws_projects(state: State<'_, AppState>) -> Result<Vec<Pr
     let settings = state.settings_store.get();
     let store = state.projects_store.clone();
     futures_util::stream::iter(projects.into_iter().filter(|p| {
-        matches!(
-            p.status,
-            ProjectStatus::Running | ProjectStatus::Error | ProjectStatus::Starting | ProjectStatus::Stopping
-        ) && crate::project_lock::held(&p.id).is_none()
+        needs_aws_reconcile(p) && crate::project_lock::held(&p.id).is_none()
     }))
     .for_each_concurrent(AWS_RECONCILE_CONCURRENCY, |project| {
         let settings = settings.clone();
@@ -2983,4 +2988,44 @@ mod tests {
         local.host_id = None;
         assert!(check_aws_resources_removable(&local).is_err());
     }
+
+    /// The text of `fn name` in this file, up to the next top-level item.
+    fn fn_body<'a>(src: &'a str, name: &str) -> &'a str {
+        let start = src.find(&format!("fn {name}(")).unwrap_or_else(|| panic!("{name} missing"));
+        let rest = &src[start..];
+        let end = rest.find("\n}\n").unwrap();
+        &rest[..end]
+    }
+
+    #[test]
+    fn the_workspace_follower_is_spawned_after_the_start_succeeds_and_only_for_aws() {
+        // Ruling R5: the start ends after "Connecting…" (Running, lock
+        // released when the command returns); the clone/setup follow runs
+        // in the background and never inside the start.
+        let src = include_str!("project_commands.rs");
+        let start = fn_body(src, "start_project_container_locked");
+        let running = start
+            .find("update_status(&project_id, ProjectStatus::Running)")
+            .expect("the start sets Running");
+        let spawn = start.find("aws_host::spawn_follow(").expect("the start spawns the follower");
+        assert!(spawn > running, "the follower is spawned only after the project is Running");
+        assert_eq!(start.matches("spawn_follow(").count(), 1);
+        let guard = start[..spawn].rfind("if project.is_aws() {").expect("AWS-only");
+        assert!(start[guard..spawn].lines().count() <= 4, "the spawn sits right in the AWS guard");
+        assert!(!start.contains("follow_workspace_status"), "no follow inside the start");
+        // Docker: `spawn_follow` itself also refuses a local project
+        // (`status::tests::a_local_project_has_no_workspace_status_and_no_follower`).
+    }
+
+    #[test]
+    fn stop_ends_the_follower_before_it_stops_the_task() {
+        let src = include_str!("project_commands.rs");
+        let stop = fn_body(src, "stop_project_container");
+        let cancel = stop.find("tunnels::cancel_follow(&project_id)").expect("stop cancels the follower");
+        let task = stop.find(".stop_project(&project, &settings)").expect("stop stops the task");
+        assert!(cancel < task);
+        // Stop's own claim never waits on the follower: it holds none
+        // (`status::tests::the_follower_takes_no_project_lock`).
+    }
+
 }
