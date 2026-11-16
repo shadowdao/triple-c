@@ -7,7 +7,7 @@ tier the signed-in identity has under **Settings → Hosts → Check**.
 | File | What it is |
 |---|---|
 | `policies/workspace-user.json` | The **workspace user** tier, part 1: create, start, stop, connect to and delete **their own** workspaces in an existing environment |
-| `policies/workspace-user-tasks.json` | The **workspace user** tier, part 2: register and tag **their own** ECS task definitions, and read **their own** secrets (`workspace-user.json` has no room left) |
+| `policies/workspace-user-tasks.json` | The **workspace user** tier, part 2: register and tag **their own** ECS task definitions, read **their own** secrets, and read Fargate prices for the cost estimate (`workspace-user.json` has no room left) |
 | `policies/environment-admin.json` | The **environment admin** tier, part 1: apply and destroy the environment and onboarding modules (`terraform/`) with OpenTofu, and keep their state |
 | `policies/environment-admin-network.json` | The **environment admin** tier, part 2: the network those modules create (VPC, subnets, gateways, routes, security groups) |
 | `policies/permissions-boundary.json` | The **permissions boundary** every Triple-C role must carry. It is never attached to a person |
@@ -117,6 +117,12 @@ following:
   roles, add those roles' ARNs or path prefixes (for example `arn:aws:iam::*:role/engineers/*`)
   to `InspectOwnPrincipal` in both tier policies. Everything matched there can be read and
   simulated by every holder of the policy, so keep it to the sign-in roles.
+- **Read Fargate prices** (`workspace-user-tasks.json`, `ReadFargatePrices`). `pricing:GetProducts`
+  on `*`: the Price List API has no resource types or condition keys, and prices are public. The
+  app asks it (in us-east-1, service `AmazonECS`) for the workspace region's on-demand Fargate
+  vCPU, memory and ephemeral-storage rates, caches them for a day and shows an estimated hourly
+  cost in the project's Host settings and Overview. Without this permission the estimate reads
+  "Estimate unavailable"; nothing else depends on it.
 - **Read environment information.** This covers ECS, the `/triple-c/*` SSM parameters (the
   environment records), the secret list, EFS, and the `/triple-c/*` log groups. Listing is not a
   secret; the app filters by owner for display. A workspace user sees only environments that have
@@ -395,7 +401,7 @@ Create each file as a **customer managed policy** and attach it. In the console,
 or role. Inline policies do not fit: a role's inline policies share 10,240 characters and an
 environment admin needs every tier file (about 16,400), and a user's share 2,048. A managed policy
 may hold 6,144 characters, not counting whitespace. Without whitespace, `workspace-user.json` is
-about 6,040 (roughly 100 characters of headroom), `workspace-user-tasks.json` about 1,200,
+about 6,040 (roughly 100 characters of headroom), `workspace-user-tasks.json` about 1,290,
 `environment-admin.json` about 5,800 (340)
 and `environment-admin-network.json` about 3,340; a unit test (`every_policy_fits_a_managed_policy`)
 fails before any file outgrows the limit. A tier that outgrows its files gains another file, which
@@ -601,3 +607,14 @@ and the secret and removes the ECR policy; then the fixture destroys the modules
 | A revision per configuration | turning idle stop on adds a secret key, so the next start registers a new revision (by design) |
 | Removal (R8) | ✓ final run: `remove_aws_resources` succeeds; the secret is scheduled for deletion, the access point deleted, the revision left ACTIVE. Since R10 the secret is deleted without a recovery window (the test now asserts it is gone) |
 | Cleanup | ✓ nothing `triple-c` left in us-west-2; environment KMS keys pending deletion |
+
+### Phase 6: the cost estimate's price reads (2026-11-16)
+
+`cargo test aws::live_tests::a_ -- --ignored --test-threads=1` (the four permission-check tests
+plus `a_workspace_role_reads_fargate_prices_and_a_bare_role_cannot`), us-west-2, all passed.
+
+| Point | Result |
+|---|---|
+| `pricing:GetProducts` on `*` (`ReadFargatePrices`) | ✓ a role holding only the workspace files reads us-west-2's rates from the us-east-1 endpoint (`AmazonECS`; `TERM_MATCH regionCode`, `TERM_MATCH termType=OnDemand`, `CONTAINS usagetype=Fargate`: eight rows, one page). x86 $0.04048/vCPU-h, $0.004445/GB-h; ARM $0.03238, $0.00356; ephemeral storage $0.000111/GB-h |
+| Without the permission | ✓ a role with no policy is denied (`AccessDeniedException` naming `pricing:GetProducts`); the app shows "Estimate unavailable" |
+| The permission check | ✓ the simulator allows the new check for the workspace tier and denies it for a role with no policy |

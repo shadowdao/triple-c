@@ -632,6 +632,7 @@ pub fn run() {
             commands::host_commands::aws_connection_sso_login,
             commands::host_commands::check_aws_permissions,
             commands::host_commands::aws_policy_document,
+            commands::host_commands::aws_cost_estimate,
             commands::environment_commands::detect_aws_environments,
             commands::environment_commands::deploy_aws_environment,
             commands::environment_commands::update_aws_environment,

@@ -11,12 +11,14 @@ import { useAppState } from "../../../../store/appState";
 
 const OFF_BRIDGE: AuthBridgeStatus = { enabled: false, active_ports: [], conflicts: [] };
 const removeAwsResources = vi.fn();
+const awsCostEstimate = vi.fn(async (..._args: unknown[]) => null as unknown);
 
 vi.mock("../../../../lib/tauri-commands", () => ({
   getAuthBridgeStatus: vi.fn(async () => OFF_BRIDGE),
   setAuthBridgeEnabled: vi.fn(),
   inspectCaCertPath: vi.fn(async () => null),
   removeAwsResources: (id: string, discard: boolean) => removeAwsResources(id, discard),
+  awsCostEstimate: (...args: unknown[]) => awsCostEstimate(...args),
 }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}) }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn(async () => null) }));
@@ -219,6 +221,35 @@ function localProjectOai(): Project {
 describe("HostSection", () => {
   const renderHost = (p: Project = awsProject(), disabled = false) =>
     render(<HostSection project={p} save={save} disabled={disabled} />);
+
+  it("shows the estimated hourly cost for the project's connection and region", async () => {
+    awsCostEstimate.mockResolvedValueOnce({
+      usd_per_hour: 0.05,
+      note_spot: true,
+      efs_billed_separately: true,
+    });
+    useAppState.setState({
+      appSettings: { hosts: [{ id: "c1", name: "lab" }] } as unknown as AppSettings,
+    });
+    const p = awsProject();
+    p.aws = { ...p.aws!, spot: true };
+    renderHost(p);
+    const card = screen.getByRole("region", { name: "Estimated cost" });
+    await waitFor(() =>
+      expect(within(card).getByText(/≈ \$0\.050\/hour \(on-demand; Spot is usually up to 70% cheaper\)/)).toBeInTheDocument(),
+    );
+    expect(awsCostEstimate).toHaveBeenCalledWith("c1", "eu-west-1", p.aws);
+    expect(within(card).getByText(/EFS storage is billed separately/)).toBeInTheDocument();
+    useAppState.setState({ appSettings: null });
+  });
+
+  it("says the estimate is unavailable when the connection is gone", async () => {
+    useAppState.setState({ appSettings: null });
+    renderHost();
+    const card = screen.getByRole("region", { name: "Estimated cost" });
+    await waitFor(() => expect(within(card).getByText("Estimate unavailable")).toBeInTheDocument());
+    expect(awsCostEstimate).not.toHaveBeenCalled();
+  });
 
   it("offers no CPU below 1 vCPU while the gateway sidecar is on", () => {
     const p = awsProject();

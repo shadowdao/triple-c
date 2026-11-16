@@ -417,6 +417,12 @@
           "markdownDescription": "Enables the aws_connection_sso_login command without any pre-configured scope."
         },
         {
+          "description": "Enables the aws_cost_estimate command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-aws-cost-estimate",
+          "markdownDescription": "Enables the aws_cost_estimate command without any pre-configured scope."
+        },
+        {
           "description": "Enables the aws_policy_document command without any pre-configured scope.",
           "type": "string",
           "const": "allow-aws-policy-document",
@@ -1375,6 +1381,12 @@
           "type": "string",
           "const": "deny-aws-connection-sso-login",
           "markdownDescription": "Denies the aws_connection_sso_login command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the aws_cost_estimate command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-aws-cost-estimate",
+          "markdownDescription": "Denies the aws_cost_estimate command without any pre-configured scope."
         },
         {
           "description": "Denies the aws_policy_document command without any pre-configured scope.",

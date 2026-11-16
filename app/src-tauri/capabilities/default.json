@@ -70,6 +70,7 @@
     "allow-aws-connection-sso-login",
     "allow-check-aws-permissions",
     "allow-aws-policy-document",
+    "allow-aws-cost-estimate",
     "allow-detect-aws-environments",
     "allow-deploy-aws-environment",
     "allow-update-aws-environment",

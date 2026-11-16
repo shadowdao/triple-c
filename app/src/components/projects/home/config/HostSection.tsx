@@ -27,6 +27,7 @@ import Toggle from "../../../ui/Toggle";
 import SegmentedControl from "../../../ui/SegmentedControl";
 import Field, { ConfigGroup, SwitchRow, inputClass, selectClass } from "../../../ui/Field";
 import RepoListEditor from "../../RepoListEditor";
+import AwsCostEstimate from "../AwsCostEstimate";
 
 interface Props {
   project: Project;
@@ -296,6 +297,19 @@ export default function HostSection({ project, save, disabled }: Props) {
           />
         }
       />
+
+      <section aria-label="Estimated cost">
+        <h3 className="text-[13px] font-medium text-[var(--text-primary)]">Estimated cost</h3>
+        <p className="mt-0.5 mb-1 text-xs text-[var(--text-secondary)] leading-snug">
+          The on-demand Fargate price in this region for the CPU, memory, architecture and disk
+          above.
+        </p>
+        <AwsCostEstimate
+          connectionId={connection ? connection.id : null}
+          region={project.aws_placement?.region}
+          config={aws}
+        />
+      </section>
 
       <SwitchRow
         label="Stop when idle"

@@ -1268,6 +1268,16 @@ export interface PolicyFile {
   json: string;
 }
 
+/** `aws::pricing::HourlyEstimate`: the on-demand price of an AWS project's
+ *  Fargate task per hour while it runs (a gateway sidecar adds nothing). */
+export interface HourlyEstimate {
+  usd_per_hour: number;
+  /** Spot is on: the Price List has no Spot rates, so say it is usually cheaper. */
+  note_spot: boolean;
+  /** Hybrid or EFS storage: EFS is billed per GB-month, not in this figure. */
+  efs_billed_separately: boolean;
+}
+
 export type Verdict = "allowed" | "denied" | "unverified";
 
 export interface ActionResult {

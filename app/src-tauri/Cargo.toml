@@ -70,6 +70,8 @@ aws-sdk-iam = { version = "1.136.0", default-features = false, features = ["defa
 aws-sdk-secretsmanager = { version = "1.128.0", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
 aws-sdk-efs = { version = "1.125.0", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
 aws-sdk-cloudwatchlogs = { version = "1.165.0", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
+# aws/pricing.rs: the Fargate rates behind the hourly cost estimate (Q5).
+aws-sdk-pricing = { version = "1.125.0", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
 # Named by src/aws/connection.rs: the credentials-provider trait (its profile
 # wrapper) and the profile-file set (aws-config's alias for it is deprecated).
 # Both are the versions aws-config already resolves.

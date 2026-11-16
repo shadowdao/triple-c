@@ -624,6 +624,35 @@ async fn an_assumed_workspace_role_checks_itself_by_simulation() {
     .await;
 }
 
+/// The cost estimate's call (Q5), made for real: a session holding only the
+/// workspace files reads the region's Fargate rates from us-east-1 (the
+/// parser must find both architectures), and one holding nothing is denied.
+#[tokio::test]
+#[ignore]
+async fn a_workspace_role_reads_fargate_prices_and_a_bare_role_cannot() {
+    use super::pricing::{fetch_rates, SdkPricingApi, PRICING_REGION};
+    e2e(|e| async move {
+        let ws = e.tier_role("price", &[Tier::WorkspaceUser]).await;
+        let cfg = sdk_config_for_keys(&e.assume_keys(&ws).await, PRICING_REGION);
+        let rates = fetch_rates(&SdkPricingApi::new(&cfg), &e.region)
+            .await
+            .expect("workspace role reads prices");
+        let x86 = rates.x86_64.expect("x86 rates");
+        let arm = rates.arm64.expect("ARM rates");
+        eprintln!("{}: x86 {x86:?}, ARM {arm:?}", e.region);
+        assert!(x86.vcpu_hour > 0.0 && x86.gb_hour > 0.0 && x86.storage_gb_hour > 0.0);
+        assert!(arm.vcpu_hour < x86.vcpu_hour, "ARM is cheaper per vCPU");
+
+        let bare = e.role("noprice", None, &[]).await;
+        let cfg = sdk_config_for_keys(&e.assume_keys(&bare).await, PRICING_REGION);
+        let err = fetch_rates(&SdkPricingApi::new(&cfg), &e.region)
+            .await
+            .expect_err("a role without pricing:GetProducts");
+        assert!(err.contains("pricing:GetProducts"), "{err}");
+    })
+    .await;
+}
+
 /// The e2e profile itself (an account administrator): every check allowed.
 /// For an SSO profile this resolves the `/aws-reserved/sso.amazonaws.com/`
 /// role path through `iam:GetRole`.

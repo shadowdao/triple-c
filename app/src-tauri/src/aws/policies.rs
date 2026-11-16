@@ -421,6 +421,9 @@ const WORKSPACE_USER_CHECKS: &[Check] = &[
     ),
     read("logs:FilterLogEvents", PROBE_LOG_GROUP, &[]),
     read("sts:GetCallerIdentity", "*", &[]),
+    // `workspace-user-tasks.json`: the hourly cost estimate (Q5). The Price
+    // List API has no resource-level permissions, and prices are public.
+    read("pricing:GetProducts", "*", &[]),
 ];
 
 /// The admin tier's checks, across all its files. `tofu_modules`' tests hold
@@ -1221,6 +1224,32 @@ mod tests {
                 };
                 assert!(!allowed(Tier::WorkspaceUser, &own, ME, ME), "{action} on {resource}");
             }
+        }
+    }
+
+    /// The cost estimate's one call (Q5), in the second workspace file: only
+    /// `pricing:GetProducts`, on `*` (the API has no resource types), with no
+    /// other Pricing action riding along.
+    #[test]
+    fn the_workspace_tier_reads_prices_and_nothing_else_of_pricing() {
+        let (_, doc) = policies(Tier::WorkspaceUser)
+            .into_iter()
+            .find(|(name, _)| *name == "workspace-user-tasks.json")
+            .unwrap();
+        let pricing: Vec<Value> = statements_of(&doc)
+            .into_iter()
+            .filter(|s| actions(s).iter().any(|a| a.starts_with("pricing:")))
+            .collect();
+        assert_eq!(pricing.len(), 1);
+        assert_eq!(actions(&pricing[0]), ["pricing:GetProducts"]);
+        assert_eq!(resources(&pricing[0]), ["*"]);
+        assert!(pricing[0].get("Condition").is_none());
+        let c = ws_check("pricing:GetProducts", "*");
+        assert!(!c.write);
+        assert!(allowed(Tier::WorkspaceUser, c, ME, SOMEONE_ELSE));
+        for action in ["pricing:DescribeServices", "pricing:GetPriceListFileUrl"] {
+            let other = Check { action, ..*c };
+            assert!(!allowed(Tier::WorkspaceUser, &other, ME, ME), "{action}");
         }
     }
 

@@ -11,6 +11,7 @@ mod identity;
 mod live_tests;
 pub mod permissions;
 pub mod policies;
+pub mod pricing;
 #[cfg(test)]
 mod policy_eval;
 pub mod runtime;

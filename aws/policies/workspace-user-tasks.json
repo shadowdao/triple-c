@@ -62,6 +62,16 @@
       }
     },
     {
+      "Sid": "ReadFargatePrices",
+      "Effect": "Allow",
+      "Action": [
+        "pricing:GetProducts"
+      ],
+      "Resource": [
+        "*"
+      ]
+    },
+    {
       "Sid": "NeverReadEnvironmentSecrets",
       "Effect": "Deny",
       "Action": [

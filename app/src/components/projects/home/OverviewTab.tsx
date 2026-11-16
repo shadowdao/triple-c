@@ -13,6 +13,7 @@ import PermissionModeControl, {
 import CapabilityTiles from "./CapabilityTiles";
 import ContainerMigrationBanner from "./ContainerMigrationBanner";
 import AwsWorkspaceStatusCard from "./AwsWorkspaceStatusCard";
+import AwsCostEstimate from "./AwsCostEstimate";
 import { isAwsProject } from "../../../lib/awsWorkspace";
 import type { ContainerMigration } from "../../../hooks/useContainerMigration";
 import SaveIndicator from "../../ui/SaveIndicator";
@@ -137,6 +138,23 @@ export default function OverviewTab({
       {/* AWS: the background clone and setup script (still cloning, setup
           failed, …). Polls only while Running and visible. */}
       {isAwsProject(project) && <AwsWorkspaceStatusCard project={project} />}
+
+      {/* AWS, while running: what the task costs per hour (Q5). */}
+      {isAwsProject(project) && project.status === "running" && project.aws && (
+        <section
+          aria-label="Estimated cost"
+          className="p-3 border rounded-[var(--radius-panel)] bg-[var(--bg-secondary)] border-[var(--border-color)] space-y-1"
+        >
+          <h2 className="text-[11px] font-semibold uppercase tracking-wide text-[var(--text-secondary)]">
+            Estimated cost
+          </h2>
+          <AwsCostEstimate
+            connectionId={project.host_id}
+            region={project.aws_placement?.region}
+            config={project.aws}
+          />
+        </section>
+      )}
 
       {/* A container missing socat and bwrap is a capability statement, so the
           out-of-date warning sits directly above the capability inventory. */}

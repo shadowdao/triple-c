@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ProjectPath, NewProjectHost, RemoveProjectOptions, WipChoice, UnsavedWork, WorkspaceStatus, ProjectRemovalReport, ProjectResetOutcome, ContainerInfo, AppSettings, SettingsImportPreview, SettingsImportOutcome, UpdateInfo, ImageUpdateInfo, FileEntry, FileContents, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, BrowserPageState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo, UploadOutcome, Note, ViewerFile, ViewerPoll, ViewerSaved, ViewerState, FileDiff, InstallScope, ItemUpdate, Marketplace, MarketplaceAccount, MarketplaceItemRef, MarketplaceSnapshot, ProjectSyncResult, SyncReport, HostConnection, CallerIdentity, PermissionReport, PolicyFile, Tier, EnvironmentScan, NetworkChoice, ModuleKind } from "./types";
+import type { Project, ProjectPath, NewProjectHost, RemoveProjectOptions, WipChoice, UnsavedWork, WorkspaceStatus, ProjectRemovalReport, ProjectResetOutcome, ContainerInfo, AppSettings, SettingsImportPreview, SettingsImportOutcome, UpdateInfo, ImageUpdateInfo, FileEntry, FileContents, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, BrowserPageState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo, UploadOutcome, Note, ViewerFile, ViewerPoll, ViewerSaved, ViewerState, FileDiff, InstallScope, ItemUpdate, Marketplace, MarketplaceAccount, MarketplaceItemRef, MarketplaceSnapshot, ProjectSyncResult, SyncReport, HostConnection, CallerIdentity, PermissionReport, PolicyFile, HourlyEstimate, AwsWorkspaceConfig, Tier, EnvironmentScan, NetworkChoice, ModuleKind } from "./types";
 
 // Docker
 export const checkDocker = () => invoke<boolean>("check_docker");
@@ -105,6 +105,11 @@ export const checkAwsPermissions = (id: string, region?: string) =>
 /** Every policy file `tier` needs, in order: attach all of them. */
 export const awsPolicyDocument = (tier: Tier) =>
   invoke<PolicyFile[]>("aws_policy_document", { tier });
+/** The estimated hourly cost of `config` on Fargate in `region`, signed with the project's
+ *  connection. Never rejects for AWS reasons: `null` means "Estimate unavailable" (denied, offline,
+ *  no connection). Rates are cached a day on disk. */
+export const awsCostEstimate = (connectionId: string, region: string, config: AwsWorkspaceConfig) =>
+  invoke<HourlyEstimate | null>("aws_cost_estimate", { connectionId, region, config });
 
 // AWS environments (OpenTofu). Reject with an `AwsError`. Starting commands (and follow) resolve
 // to an op id; progress arrives on the `AWS_DEPLOY_PROGRESS_EVENT` event (`DeployProgress`, in
