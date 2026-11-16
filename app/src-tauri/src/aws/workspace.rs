@@ -78,6 +78,8 @@ const KEY_REPOS: &str = "TRIPLEC_REPOS";
 const KEY_WIP_PUSH: &str = "TRIPLEC_WIP_PUSH";
 const KEY_IDLE: &str = "TRIPLEC_IDLE_STOP_MINUTES";
 const KEY_STORAGE: &str = "TRIPLEC_STORAGE";
+const KEY_SETUP_SCRIPT: &str = "TRIPLEC_SETUP_SCRIPT";
+const KEY_MAX_LIFETIME: &str = "TRIPLEC_MAX_LIFETIME_MINUTES";
 /// Seconds ECS waits after SIGTERM before SIGKILL (Fargate allows 2–120).
 pub const STOP_TIMEOUT_SECS: i32 = 120;
 
@@ -132,6 +134,17 @@ fn validate_file_key(key: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Payload keys that come from the project's AWS settings and its
+/// environment rather than from the env pairs (phase 6).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PayloadExtras<'a> {
+    /// `AwsWorkspaceConfig::setup_script`; blank is the same as none.
+    pub setup_script: Option<&'a str>,
+    /// The environment's cap (`max_workspace_hours`), in hours; 0 = none.
+    pub max_workspace_hours: u32,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn payload_map(
     env_pairs: &[(String, String)],
     agent_token: &str,
@@ -140,6 +153,7 @@ fn payload_map(
     wip: bool,
     idle: Option<u32>,
     storage: StorageMode,
+    extras: PayloadExtras<'_>,
 ) -> Result<BTreeMap<String, String>, String> {
     let own = [
         KEY_AGENT_TOKEN,
@@ -148,6 +162,8 @@ fn payload_map(
         KEY_WIP_PUSH,
         KEY_IDLE,
         KEY_STORAGE,
+        KEY_SETUP_SCRIPT,
+        KEY_MAX_LIFETIME,
     ];
     let mut m = BTreeMap::new();
     for (k, v) in env_pairs {
@@ -192,6 +208,15 @@ fn payload_map(
         }
         .into(),
     );
+    if let Some(script) = extras.setup_script.filter(|s| !s.trim().is_empty()) {
+        m.insert(KEY_SETUP_SCRIPT.into(), script.into());
+    }
+    if extras.max_workspace_hours > 0 {
+        m.insert(
+            KEY_MAX_LIFETIME.into(),
+            (u64::from(extras.max_workspace_hours) * 60).to_string(),
+        );
+    }
     Ok(m)
 }
 
@@ -200,13 +225,54 @@ fn json<T: Serialize + ?Sized>(v: &T) -> String {
     serde_json::to_string(v).expect("plain data serialises")
 }
 
+/// What a payload key is, in the size error's words. Custom variables are
+/// named (names are not secret; values never appear).
+fn describe_payload_key(key: &str) -> String {
+    match key {
+        KEY_SETUP_SCRIPT => "the setup script".into(),
+        KEY_FILES => "the SSH and CA files".into(),
+        KEY_REPOS => "the repository list".into(),
+        "CLAUDE_INSTRUCTIONS" => "the instructions".into(),
+        "CLAUDE_CODE_SETTINGS_JSON" => "the Claude Code settings".into(),
+        "TRIPLE_C_CUSTOM_ENV" => "the custom environment variables".into(),
+        k if k.starts_with("TRIPLEC_GATEWAY_") => "the LLM gateway configuration".into(),
+        k => format!("the environment variable {k}"),
+    }
+}
+
+/// `n` bytes in KiB, rounded up (so a part is never shown as 0 KiB).
+fn kib(n: usize) -> usize {
+    n.div_ceil(1024)
+}
+
 fn serialize_payload(m: &BTreeMap<String, String>) -> Result<String, String> {
     let json = serde_json::to_string(m).expect("a string map serialises");
     if json.len() > MAX_SECRET_BYTES {
+        // Name what is large: the parts add up (setup script ≤ 32 KiB,
+        // gateway config, instructions, files…), so the total alone does not
+        // say what to shorten. A part's size is its serialised value.
+        let mut parts: Vec<(usize, &str)> = m
+            .iter()
+            .map(|(k, v)| (serde_json::to_string(v).map_or(v.len(), |j| j.len()), k.as_str()))
+            .collect();
+        parts.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
+        let largest: Vec<String> = parts
+            .iter()
+            .take(3)
+            .filter(|(n, _)| *n >= 1024)
+            .map(|(n, k)| format!("{} ({} KiB)", describe_payload_key(k), kib(*n)))
+            .collect();
+        let detail = if largest.is_empty() {
+            String::new()
+        } else {
+            format!(" The largest parts: {}.", largest.join(", "))
+        };
         return Err(format!(
-            "The project's settings for AWS come to {} bytes, more than the 65,536 a Secrets \
-             Manager secret holds. Shorten the instructions, Claude Code settings or custom \
-             environment variables, or remove files from the SSH folder.",
+            "The project's settings for AWS come to {} KiB ({} bytes), more than the 64 KiB \
+             (65,536 bytes) a Secrets Manager secret holds.{detail} Shorten the setup script, \
+             instructions, Claude Code settings or custom environment variables, or remove \
+             files from the SSH folder.",
+            kib(json.len()),
             json.len()
         ));
     }
@@ -216,8 +282,9 @@ fn serialize_payload(m: &BTreeMap<String, String>) -> Result<String, String> {
 /// The project secret's JSON (P1, R1): every env pair, then the payload's own
 /// keys (`TRIPLEC_AGENT_TOKEN`, `TRIPLEC_FILES` = `{"ssh/<f>"|"ca/<f>": base64}`,
 /// `TRIPLEC_REPOS`, `TRIPLEC_WIP_PUSH` = `1`/`0`, `TRIPLEC_IDLE_STOP_MINUTES`
-/// when on, `TRIPLEC_STORAGE` = `ephemeral`/`hybrid`/`efs`), keys sorted. Fails
-/// when it would exceed 65,536 bytes.
+/// when on, `TRIPLEC_STORAGE` = `ephemeral`/`hybrid`/`efs`,
+/// `TRIPLEC_SETUP_SCRIPT` when set, `TRIPLEC_MAX_LIFETIME_MINUTES` when the
+/// environment caps it), keys sorted. Fails when it would exceed 65,536 bytes.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn project_secret_payload(
     env_pairs: &[(String, String)],
@@ -228,6 +295,31 @@ pub fn project_secret_payload(
     idle: Option<u32>,
     storage: StorageMode,
 ) -> Result<String, String> {
+    project_secret_payload_with(
+        env_pairs,
+        agent_token,
+        files,
+        repos,
+        wip,
+        idle,
+        storage,
+        PayloadExtras::default(),
+    )
+}
+
+/// [`project_secret_payload`] with the phase 6 keys.
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+pub fn project_secret_payload_with(
+    env_pairs: &[(String, String)],
+    agent_token: &str,
+    files: &[(String, Vec<u8>)],
+    repos: &[RepoSource],
+    wip: bool,
+    idle: Option<u32>,
+    storage: StorageMode,
+    extras: PayloadExtras<'_>,
+) -> Result<String, String> {
     serialize_payload(&payload_map(
         env_pairs,
         agent_token,
@@ -236,6 +328,7 @@ pub fn project_secret_payload(
         wip,
         idle,
         storage,
+        extras,
     )?)
 }
 
@@ -678,6 +771,10 @@ pub async fn prepare_workspace<W: WorkspaceApi>(
         cfg.wip_push_on_stop,
         cfg.idle_stop_minutes,
         cfg.storage,
+        PayloadExtras {
+            setup_script: cfg.setup_script.as_deref(),
+            max_workspace_hours: env.max_workspace_hours,
+        },
     )
     .map_err(other)?;
     let json = serialize_payload(&payload).map_err(other)?;

@@ -1407,6 +1407,9 @@ async fn start_project_container_locked(
 
     // Wrap container operations so that any failure resets status to Stopped.
     let host = ProjectHost::for_project(&project);
+    // An AWS start's clone/setup problems: the start still succeeds, and this
+    // goes to the user as a `workspace-warning` event once it is Running.
+    let mut workspace_warning: Option<String> = None;
     let result: Result<ContainerTarget, String> = async {
         let target = host
             .ensure_started(&project, &settings, &state.projects_store, &|msg: &str| {
@@ -1430,6 +1433,14 @@ async fn start_project_container_locked(
             project.clone(),
             target.clone(),
         );
+
+        // AWS: follow the background clone and setup script until they are
+        // done (or 35 minutes pass), as progress lines (phase 6, Q4). A
+        // local project returns at once.
+        workspace_warning = crate::host::aws_host::follow_start(&project, &|msg: &str| {
+            emit_progress(&app_handle, &project_id, msg)
+        })
+        .await;
 
         Ok(target)
     }.await;
@@ -1491,9 +1502,44 @@ async fn start_project_container_locked(
             .await;
     }
 
+    if let Some(detail) = workspace_warning {
+        emit_workspace_warning(&app_handle, &project_id, &project.name, &detail);
+    }
+
     project.container_id = Some(container_id);
     project.status = ProjectStatus::Running;
     Ok(project)
+}
+
+/// The start's warning channel (phase 6, Q4): the start command returns the
+/// stored `Project`, which has no place for a one-off warning, so a started
+/// workspace whose clone or setup script failed is reported as a
+/// `workspace-warning` event `{project_id, message, detail}`; the frontend
+/// shows it as a warning toast.
+fn emit_workspace_warning(app_handle: &tauri::AppHandle, project_id: &str, name: &str, detail: &str) {
+    let _ = app_handle.emit(
+        "workspace-warning",
+        serde_json::json!({
+            "project_id": project_id,
+            "message": format!("“{name}” started, but not everything went well"),
+            "detail": detail,
+        }),
+    );
+}
+
+/// An AWS workspace's clone and setup-script status for Project Home
+/// (background exec: never activity for idle stop). `None` for a local
+/// project, a workspace with no tunnel, or an image without the reader.
+#[tauri::command]
+pub async fn aws_workspace_status(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<Option<crate::host::aws_host::WorkspaceStatus>, String> {
+    let project = state
+        .projects_store
+        .get(&project_id)
+        .ok_or_else(|| format!("Project {} not found", project_id))?;
+    crate::host::aws_host::workspace_status(&project).await
 }
 
 #[tauri::command]

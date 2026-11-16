@@ -98,7 +98,7 @@ function activation(activeTabKey: string | null) {
   };
 }
 
-export type ToastKind = "error" | "success" | "info";
+export type ToastKind = "error" | "warning" | "success" | "info";
 
 export interface Toast {
   id: string;

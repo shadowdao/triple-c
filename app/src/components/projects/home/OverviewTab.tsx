@@ -12,6 +12,8 @@ import PermissionModeControl, {
 } from "../PermissionModeControl";
 import CapabilityTiles from "./CapabilityTiles";
 import ContainerMigrationBanner from "./ContainerMigrationBanner";
+import AwsWorkspaceStatusCard from "./AwsWorkspaceStatusCard";
+import { isAwsProject } from "../../../lib/awsWorkspace";
 import type { ContainerMigration } from "../../../hooks/useContainerMigration";
 import SaveIndicator from "../../ui/SaveIndicator";
 import Button from "../../ui/Button";
@@ -131,6 +133,10 @@ export default function OverviewTab({
           </button>
         </div>
       </section>
+
+      {/* AWS: the background clone and setup script (still cloning, setup
+          failed, …). Polls only while Running and visible. */}
+      {isAwsProject(project) && <AwsWorkspaceStatusCard project={project} />}
 
       {/* A container missing socat and bwrap is a capability statement, so the
           out-of-date warning sits directly above the capability inventory. */}

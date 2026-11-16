@@ -81,6 +81,9 @@ const WATCH_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// reported as failed; the SDK's own bound is per call.
 const STOP_TIMEOUT: Duration = Duration::from_secs(45);
 
+pub mod status;
+pub use status::{follow_start, workspace_status, WorkspaceStatus};
+
 fn s<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
 }

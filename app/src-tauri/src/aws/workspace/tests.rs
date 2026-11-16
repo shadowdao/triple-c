@@ -602,6 +602,89 @@ fn payload_over_64_kib_fails() {
 }
 
 #[test]
+fn payload_carries_setup_script_and_lifetime_when_set() {
+    let json = project_secret_payload_with(
+        &[],
+        "t",
+        &[],
+        &[],
+        true,
+        None,
+        StorageMode::Hybrid,
+        PayloadExtras { setup_script: Some("apt-get install -y jq\n"), max_workspace_hours: 8 },
+    )
+    .unwrap();
+    let m = payload_map(&json);
+    assert_eq!(m["TRIPLEC_SETUP_SCRIPT"], "apt-get install -y jq\n");
+    assert_eq!(m["TRIPLEC_MAX_LIFETIME_MINUTES"], "480");
+}
+
+#[test]
+fn payload_omits_setup_script_and_lifetime_when_unset() {
+    for script in [None, Some(""), Some("  \n\t")] {
+        let json = project_secret_payload_with(
+            &[],
+            "t",
+            &[],
+            &[],
+            true,
+            None,
+            StorageMode::Hybrid,
+            PayloadExtras { setup_script: script, max_workspace_hours: 0 },
+        )
+        .unwrap();
+        let m = payload_map(&json);
+        assert!(!m.contains_key("TRIPLEC_SETUP_SCRIPT"), "{script:?}");
+        assert!(!m.contains_key("TRIPLEC_MAX_LIFETIME_MINUTES"));
+    }
+}
+
+#[test]
+fn payload_setup_script_and_lifetime_cannot_be_forged_by_custom_env() {
+    let env = pairs(&[("TRIPLEC_SETUP_SCRIPT", "rm -rf /"), ("TRIPLEC_MAX_LIFETIME_MINUTES", "1")]);
+    let m = payload_map(
+        &project_secret_payload(&env, "t", &[], &[], true, None, StorageMode::Hybrid).unwrap(),
+    );
+    assert!(!m.contains_key("TRIPLEC_SETUP_SCRIPT"));
+    assert!(!m.contains_key("TRIPLEC_MAX_LIFETIME_MINUTES"));
+}
+
+#[test]
+fn payload_size_error_names_the_setup_script_when_it_is_the_large_part() {
+    let env = pairs(&[("CLAUDE_INSTRUCTIONS", &"i".repeat(20 * 1024)), ("SMALL", "x")]);
+    let script = "s".repeat(31 * 1024);
+    let files = vec![("ssh/id_rsa".to_string(), vec![b'k'; 12 * 1024])];
+    let err = project_secret_payload_with(
+        &env,
+        "t",
+        &files,
+        &[],
+        true,
+        None,
+        StorageMode::Hybrid,
+        PayloadExtras { setup_script: Some(&script), max_workspace_hours: 0 },
+    )
+    .unwrap_err();
+    assert!(err.contains("65,536"), "{err}");
+    // Largest first: the script, then the instructions, then the files.
+    let at = |needle: &str| err.find(needle).unwrap_or_else(|| panic!("{needle} missing: {err}"));
+    assert!(at("the setup script (32 KiB)") < at("the instructions (21 KiB)"), "{err}");
+    assert!(at("the instructions") < at("the SSH and CA files (17 KiB)"), "{err}");
+    assert!(!err.contains("SMALL"), "{err}");
+    // Values never appear.
+    assert!(!err.contains("sss"), "{err}");
+}
+
+#[test]
+fn payload_size_error_names_a_large_custom_variable_by_name_only() {
+    let env = pairs(&[("BIG_BLOB", &"SENTINEL".repeat(9000))]);
+    let err =
+        project_secret_payload(&env, "t", &[], &[], true, None, StorageMode::Hybrid).unwrap_err();
+    assert!(err.contains("the environment variable BIG_BLOB (71 KiB)"), "{err}");
+    assert!(!err.contains("SENTINEL"), "{err}");
+}
+
+#[test]
 fn agent_tokens_are_64_url_safe_characters_and_fresh() {
     let a = new_agent_token();
     let b = new_agent_token();
@@ -749,6 +832,26 @@ async fn prepare(
     env: &[(String, String)],
 ) -> Result<PreparedWorkspace, AwsError> {
     prepare_workspace(fake, &who(), &env_info(), p, env, &[], IMAGE).await
+}
+
+#[tokio::test]
+async fn prepare_puts_the_setup_script_and_the_environments_cap_in_the_secret() {
+    let fake = Fake::onboarded();
+    let mut p = project(StorageMode::Ephemeral);
+    p.aws.as_mut().unwrap().setup_script = Some("sudo apt-get install -y jq".into());
+    let mut env = env_info();
+    env.max_workspace_hours = 12;
+    prepare_workspace(&fake, &who(), &env, &p, &[], &[], IMAGE).await.unwrap();
+    let m = payload_map(&fake.secrets.lock().unwrap()[0].2);
+    assert_eq!(m["TRIPLEC_SETUP_SCRIPT"], "sudo apt-get install -y jq");
+    assert_eq!(m["TRIPLEC_MAX_LIFETIME_MINUTES"], "720");
+
+    // No script, no cap: neither key.
+    let fake = Fake::onboarded();
+    prepare(&fake, &project(StorageMode::Ephemeral), &[]).await.unwrap();
+    let m = payload_map(&fake.secrets.lock().unwrap()[0].2);
+    assert!(!m.contains_key("TRIPLEC_SETUP_SCRIPT"));
+    assert!(!m.contains_key("TRIPLEC_MAX_LIFETIME_MINUTES"));
 }
 
 #[tokio::test]

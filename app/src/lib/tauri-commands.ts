@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ProjectPath, NewProjectHost, RemoveProjectOptions, WipChoice, UnsavedWork, ProjectRemovalReport, ProjectResetOutcome, ContainerInfo, AppSettings, SettingsImportPreview, SettingsImportOutcome, UpdateInfo, ImageUpdateInfo, FileEntry, FileContents, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, BrowserPageState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo, UploadOutcome, Note, ViewerFile, ViewerPoll, ViewerSaved, ViewerState, FileDiff, InstallScope, ItemUpdate, Marketplace, MarketplaceAccount, MarketplaceItemRef, MarketplaceSnapshot, ProjectSyncResult, SyncReport, HostConnection, CallerIdentity, PermissionReport, PolicyFile, Tier, EnvironmentScan, NetworkChoice, ModuleKind } from "./types";
+import type { Project, ProjectPath, NewProjectHost, RemoveProjectOptions, WipChoice, UnsavedWork, WorkspaceStatus, ProjectRemovalReport, ProjectResetOutcome, ContainerInfo, AppSettings, SettingsImportPreview, SettingsImportOutcome, UpdateInfo, ImageUpdateInfo, FileEntry, FileContents, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, BrowserPageState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo, UploadOutcome, Note, ViewerFile, ViewerPoll, ViewerSaved, ViewerState, FileDiff, InstallScope, ItemUpdate, Marketplace, MarketplaceAccount, MarketplaceItemRef, MarketplaceSnapshot, ProjectSyncResult, SyncReport, HostConnection, CallerIdentity, PermissionReport, PolicyFile, Tier, EnvironmentScan, NetworkChoice, ModuleKind } from "./types";
 
 // Docker
 export const checkDocker = () => invoke<boolean>("check_docker");
@@ -37,6 +37,11 @@ export const checkUnsavedWork = (projectId: string) =>
   invoke<UnsavedWork>("check_unsaved_work", { projectId });
 export const awsTaskLog = (projectId: string, limit: number) =>
   invoke<string[]>("aws_task_log", { projectId, limit });
+/** An AWS workspace's clone/setup status; null for a local project, no
+ *  tunnel, or an image without the reader. A background read (never keeps an
+ *  idle workspace up). */
+export const awsWorkspaceStatus = (projectId: string) =>
+  invoke<WorkspaceStatus | null>("aws_workspace_status", { projectId });
 export const removeAwsResources = (projectId: string, discardData: boolean) =>
   invoke<Project>("remove_aws_resources", { projectId, discardData });
 export const rebuildProjectContainer = (projectId: string) =>

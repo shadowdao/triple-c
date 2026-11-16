@@ -20,6 +20,7 @@
     "allow-stop-project-container",
     "allow-check-unsaved-work",
     "allow-aws-task-log",
+    "allow-aws-workspace-status",
     "allow-remove-aws-resources",
     "allow-rebuild-project-container",
     "allow-reconcile-project-statuses",

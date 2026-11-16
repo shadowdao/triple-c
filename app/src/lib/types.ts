@@ -155,6 +155,25 @@ export interface UnsavedWork {
   error: string | null;
 }
 
+/** An AWS workspace's background clone and setup script (Rust
+ *  `host::aws_host::WorkspaceStatus`, the shape `triple-c-workspace-status`
+ *  prints). */
+export interface WorkspaceStatus {
+  clone: {
+    /** Every repo has been tried. */
+    done: boolean;
+    /** The repos tried so far; `state` is cloning, cloned, failed or exists. */
+    repos: { folder: string; state: string }[];
+  };
+  setup: {
+    state: "none" | "running" | "ok" | "failed";
+    /** 0 when ok; the exit code when failed, if known. */
+    code: number | null;
+    /** The setup log's last lines. */
+    tail: string[];
+  };
+}
+
 export type ProjectStatus =
   | "stopped"
   | "starting"
