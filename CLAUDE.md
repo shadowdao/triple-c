@@ -284,7 +284,7 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
     users have migrated.
 - **`host/`** — Where a project's container runs, and the only way into it. `ContainerTarget`
   (`Docker`, and `Agent` — reached through the in-container `triple-c-agent` by `agent.rs`, per
-  `docs/superpowers/specs/2026-11-13-triple-c-agent-protocol.md`; AWS host design —
+  `docs/superpowers/specs/2026-11-13-triple-c-agent-protocol.md`; AWS host, designed in
   `docs/superpowers/specs/2026-11-13-aws-ecs-host-design.md`)
   wraps execs, file transfer and `is_running`; `sessions.rs` holds `ExecSessionManager`.
   `ssm.rs` is the AWS transport to an `Agent` target: one SSM port-forward per task, run through

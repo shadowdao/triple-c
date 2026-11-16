@@ -409,10 +409,10 @@ Create each file as a **customer managed policy** and attach it. In the console,
 **IAM → Policies → Create policy → JSON**, paste the file, and attach the policy to a user, group
 or role. Inline policies do not fit: a role's inline policies share 10,240 characters and an
 environment admin needs every tier file (about 16,400), and a user's share 2,048. A managed policy
-may hold 6,144 characters, not counting whitespace. Without whitespace, `workspace-user.json` is
+may hold 6,144 characters, not counting whitespace. Measured 2026-11-16 without whitespace, `workspace-user.json` is
 6,036 (108 characters of headroom), `workspace-user-tasks.json` 1,293 (including `ReadFargatePrices`),
 `environment-admin.json` 5,805 (339)
-and `environment-admin-network.json` 3,340 (measured 2026-11-16); a unit test (`every_policy_fits_a_managed_policy`)
+and `environment-admin-network.json` 3,340; a unit test (`every_policy_fits_a_managed_policy`)
 fails before any file outgrows the limit. A tier that outgrows its files gains another file, which
 the app then lists with the others. For IAM Identity Center, add the files as inline policies on the permission set
 (the "up to 32,768 characters" limit is unverified) or reference the managed policies.
