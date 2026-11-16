@@ -14,6 +14,7 @@ import { awsErrorMessage, toAwsError } from "../../../lib/aws-error";
 import type {
   AwsError,
   DetectedEnvironment,
+  Ec2Choice,
   EnvironmentScan,
   HostConnection,
   LockInfo,
@@ -21,6 +22,7 @@ import type {
   NetworkChoice,
   PermissionSummary,
   PolicyFile,
+  UserCompute,
 } from "../../../lib/types";
 import Button from "../../ui/Button";
 import Field, { inputClass, selectClass } from "../../ui/Field";
@@ -29,10 +31,12 @@ import StatusIndicator from "../../ui/StatusIndicator";
 import AdminBundleModal from "./AdminBundleModal";
 import UpdateEnvironmentModal from "./UpdateEnvironmentModal";
 import DeployEnvironmentModal from "./DeployEnvironmentModal";
+import JoinEnvironmentModal from "./JoinEnvironmentModal";
 import DeployProgress, { runKey, useDeployRuns, type DeployRun } from "./DeployProgress";
 import PolicyFiles from "./PolicyFiles";
 import {
   COMMON_REGIONS,
+  computeLine,
   environmentStateKey,
   formatAge,
   lockLine,
@@ -101,7 +105,19 @@ function TypedConfirmModal({
   );
 }
 
-type Bundle = { kind: ModuleKind; region: string; environment?: string; ownerId?: string };
+type Bundle = {
+  kind: ModuleKind;
+  region: string;
+  environment?: string;
+  ownerId?: string;
+  recordedEc2?: UserCompute | null;
+};
+/** A self-onboarding (or its re-apply) waiting for its EC2 choice. */
+type JoinOf = { region: string; name: string; stateKey: string; recorded: UserCompute | null; reapply: boolean };
+
+/** The caller's recorded EC2 capacity in `e`, if any. */
+const recordedEc2 = (e: DetectedEnvironment): UserCompute | null =>
+  e.onboarding && (e.onboarding.state === "joined" || e.onboarding.state === "incomplete") ? e.onboarding.ec2 : null;
 /** A row-level key: the same environment name can exist in every region. */
 const rowKey = (region: string, name: string) => `${region}:${name}`;
 
@@ -145,6 +161,7 @@ export default function EnvironmentsPanel({
     onboarding: boolean;
   } | null>(null);
   const [bundle, setBundle] = useState<Bundle | null>(null);
+  const [joinOf, setJoinOf] = useState<JoinOf | null>(null);
   const [copyNote, setCopyNote] = useState<string | null>(null);
   const request = useRef(0);
   const followed = useRef(new Set<string>());
@@ -241,15 +258,30 @@ export default function EnvironmentsPanel({
       updateAwsEnvironment(connection.id, runRegion, name, hours),
     );
 
+  // Join (or, once joined, a change of EC2 capacity): admins choose the
+  // capacity and apply it themselves; others get a bundle for an admin.
   const join = (found: EnvironmentScan, e: DetectedEnvironment) => {
+    const recorded = recordedEc2(e);
     if (isAdmin) {
-      void launch(found.region, e.name, onboardingStateKey(e.name, found.owner_key), `Joining ${e.name}`, () =>
-        onboardAwsUser(connection.id, found.region, e.name),
-      );
+      setJoinOf({
+        region: found.region,
+        name: e.name,
+        stateKey: onboardingStateKey(e.name, found.owner_key),
+        recorded,
+        reapply: e.onboarding?.state === "joined",
+      });
     } else {
-      setBundle({ kind: "user_onboard", region: found.region, environment: e.name, ownerId: found.owner_id });
+      setBundle({
+        kind: "user_onboard",
+        region: found.region,
+        environment: e.name,
+        ownerId: found.owner_id,
+        recordedEc2: recorded,
+      });
     }
   };
+  const runJoin = (j: JoinOf, ec2: Ec2Choice) =>
+    launch(j.region, j.name, j.stateKey, `Joining ${j.name}`, () => onboardAwsUser(connection.id, j.region, j.name, ec2));
 
   const rowRuns = (name: string) =>
     Object.values(runs).filter((r) => r.region === current?.region && runEnvironment(r.stateKey) === name);
@@ -343,6 +375,14 @@ export default function EnvironmentsPanel({
                     : "Your last onboarding didn't finish; Join again to finish it."}
               </div>
             )}
+            {(onboarding === "joined" || recordedEc2(e)) && (
+              <div className="text-[var(--text-secondary)]" data-testid={`compute-${e.name}`}>
+                EC2 capacity: {(() => {
+                  const c = recordedEc2(e);
+                  return c ? computeLine(c) : "none (Fargate only)";
+                })()}
+              </div>
+            )}
             {!isAdmin && isWaiting && onboarding !== "joined" && (
               <div className="text-[var(--text-secondary)]">Waiting for an admin to onboard you</div>
             )}
@@ -357,6 +397,16 @@ export default function EnvironmentsPanel({
                 onClick={() => join(found, e)}
               >
                 {!isAdmin && isWaiting ? "Show onboarding bundle" : "Join"}
+              </Button>
+            )}
+            {has("join") && onboarding === "joined" && (
+              <Button
+                size="sm"
+                disabled={busy || joinBlocked}
+                aria-label={`EC2 capacity in ${e.name}`}
+                onClick={() => join(found, e)}
+              >
+                {isAdmin ? "Change EC2 capacity" : "EC2 capacity bundle"}
               </Button>
             )}
             {mine("follow") && (
@@ -636,6 +686,16 @@ export default function EnvironmentsPanel({
           </p>
         </TypedConfirmModal>
       )}
+      {joinOf && (
+        <JoinEnvironmentModal
+          environment={joinOf.name}
+          region={joinOf.region}
+          recorded={joinOf.recorded}
+          reapply={joinOf.reapply}
+          onJoin={(ec2) => runJoin(joinOf, ec2)}
+          onClose={() => setJoinOf(null)}
+        />
+      )}
       {bundle && (
         <AdminBundleModal
           connectionId={connection.id}
@@ -643,6 +703,7 @@ export default function EnvironmentsPanel({
           kind={bundle.kind}
           environment={bundle.environment}
           ownerId={bundle.ownerId}
+          recordedEc2={bundle.recordedEc2}
           onSaved={() => {
             if (bundle.kind === "user_onboard" && bundle.environment) {
               const rk = rowKey(bundle.region, bundle.environment);

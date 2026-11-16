@@ -200,14 +200,17 @@ pub fn user_record_parameter_name(env: &str, owner_key: &str) -> String {
 /// The fields of a user's EC2 record, schema 1: `instance_type`,
 /// `cluster_arn` (the user's cluster, [`user_ec2_stem`]),
 /// `capacity_provider` (its one provider, the same name) and `user_tag`
-/// (the `triple-c-user` value the cluster is named after).
-#[allow(dead_code)] // the app reads it from Task 4 on
-pub const USER_RECORD_FIELDS: [&str; 5] = [
+/// (the `triple-c-user` value the cluster is named after) and
+/// `max_instances` (the group's maximum), so a re-apply can keep them.
+/// `environments::parse_user_record` reads them; a test pins the HCL to it.
+#[allow(dead_code)]
+pub const USER_RECORD_FIELDS: [&str; 6] = [
     "schema",
     "instance_type",
     "cluster_arn",
     "capacity_provider",
     "user_tag",
+    "max_instances",
 ];
 
 /// The most instances a user's EC2 capacity may run at once.

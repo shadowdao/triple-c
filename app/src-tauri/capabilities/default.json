@@ -82,6 +82,7 @@
     "allow-cancel-aws-deployment",
     "allow-push-aws-saved-state",
     "allow-onboard-aws-user",
+    "allow-list-ec2-instance-types",
     "allow-deploy-aws-permissions-boundary",
     "allow-save-aws-admin-bundle",
     "allow-detect-host-timezone",

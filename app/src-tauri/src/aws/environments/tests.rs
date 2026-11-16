@@ -494,6 +494,8 @@ struct FakeDetect {
     roles: HashMap<String, Knowable>,
     /// State objects' contents, by key.
     documents: HashMap<String, String>,
+    /// SSM parameters (user records), by name.
+    parameters: HashMap<String, String>,
     calls: Mutex<Vec<String>>,
 }
 
@@ -506,6 +508,7 @@ impl FakeDetect {
             boundary: Knowable::Yes,
             roles: HashMap::new(),
             documents: HashMap::new(),
+            parameters: HashMap::new(),
             calls: Mutex::new(Vec::new()),
         }
     }
@@ -547,6 +550,10 @@ impl DetectApi for FakeDetect {
     async fn role_exists(&self, name: &str) -> Result<Knowable, AwsError> {
         self.log(format!("role {name}"));
         Ok(self.roles.get(name).cloned().unwrap_or(Knowable::No))
+    }
+    async fn parameter(&self, name: &str) -> Result<Option<String>, AwsError> {
+        self.log(format!("parameter {name}"));
+        Ok(self.parameters.get(name).cloned())
     }
     async fn state_document(&self, bucket: &str, key: &str) -> Result<Option<String>, AwsError> {
         self.log(format!("document {bucket} {key}"));
@@ -612,8 +619,8 @@ fn onboarding_is_found_by_state_then_by_role() {
     assert_eq!(scan.owner_id, USER_ID);
     assert_eq!(scan.owner_key, owner_key(REGION, USER_ID));
     let onboarding = |n: &str| find(&scan.environments, n).onboarding.clone();
-    assert_eq!(onboarding("bystate"), Some(OnboardingState::Joined));
-    assert_eq!(onboarding("byrole"), Some(OnboardingState::Joined));
+    assert_eq!(onboarding("bystate"), Some(OnboardingState::Joined { ec2: None }));
+    assert_eq!(onboarding("byrole"), Some(OnboardingState::Joined { ec2: None }));
     assert_eq!(onboarding("denied"), Some(OnboardingState::NotJoined));
     assert_eq!(onboarding("absent"), Some(OnboardingState::NotJoined));
     assert!(matches!(
@@ -662,7 +669,7 @@ fn onboarding_is_found_by_state_then_by_role() {
     assert_eq!(x.onboarding, Some(OnboardingState::InProgress { lock: None }));
     assert_eq!(x.onboarding_actions, vec![EnvironmentAction::Follow]);
     let y = find(&scan.environments, "y");
-    let Some(OnboardingState::Incomplete { lock: Some(lock) }) = &y.onboarding else {
+    let Some(OnboardingState::Incomplete { lock: Some(lock), ec2: None }) = &y.onboarding else {
         panic!("{y:#?}");
     };
     assert!(!lock.local_process);
@@ -982,12 +989,12 @@ fn a_failed_onboarding_is_incomplete_not_joined() {
     let scan = run_scan(&d, &local);
     let row = |n: &str| find(&scan.environments, n).clone();
 
-    assert_eq!(row("done").onboarding, Some(OnboardingState::Joined));
+    assert_eq!(row("done").onboarding, Some(OnboardingState::Joined { ec2: None }));
     for name in ["partial", "failedhere", "errored"] {
         let r = row(name);
         assert_eq!(
             r.onboarding,
-            Some(OnboardingState::Incomplete { lock: None }),
+            Some(OnboardingState::Incomplete { lock: None, ec2: None }),
             "{name}"
         );
         // Join is kept: an idempotent re-apply finishes it.
@@ -1106,4 +1113,153 @@ fn the_tls_statement_is_added_to_a_bucket_policy_never_replacing_it() {
 
     // Something that isn't a policy is never overwritten.
     assert!(state_bucket_policy_update(Some("not json"), &bucket).is_err());
+}
+
+fn user_record(env: &str, tag: &str) -> Value {
+    let stem = crate::aws::tofu_modules::user_ec2_stem(env, tag);
+    json!({
+        "schema": 1,
+        "instance_type": "m7g.large",
+        "cluster_arn": format!("arn:aws:ecs:{REGION}:{ACCOUNT}:cluster/{stem}"),
+        "capacity_provider": stem,
+        "user_tag": tag,
+        "max_instances": 3,
+    })
+}
+
+#[test]
+fn a_user_record_reads_as_the_users_compute() {
+    let rec = user_record("dev", "alice");
+    let c = parse_user_record("dev", &rec.to_string(), ACCOUNT, REGION).unwrap();
+    assert_eq!(
+        c,
+        UserCompute {
+            instance_type: "m7g.large".into(),
+            max_instances: 3,
+            user_tag: "alice".into(),
+            cluster_arn: format!("arn:aws:ecs:{REGION}:{ACCOUNT}:cluster/triple-c-dev--u-alice"),
+            capacity_provider: "triple-c-dev--u-alice".into(),
+        }
+    );
+    // A record written before max_instances existed: the module's default.
+    let mut old = rec.clone();
+    old.as_object_mut().unwrap().remove("max_instances");
+    let c = parse_user_record("dev", &old.to_string(), ACCOUNT, REGION).unwrap();
+    assert_eq!(c.max_instances, 1);
+}
+
+#[test]
+fn a_user_record_is_untrusted() {
+    let bad = |field: &str, value: Value, why: &str| {
+        let mut rec = user_record("dev", "alice");
+        rec[field] = value;
+        let err = parse_user_record("dev", &rec.to_string(), ACCOUNT, REGION).unwrap_err();
+        assert!(err.contains(why), "{field}: {err}");
+        assert!(!err.contains("evil"), "{err}");
+    };
+    bad("schema", json!(2), "schema");
+    bad("instance_type", json!("p5.48xlarge"), "instance_type");
+    bad("instance_type", json!(7), "instance_type");
+    bad("max_instances", json!(0), "max_instances");
+    bad("max_instances", json!(5), "max_instances");
+    bad("max_instances", json!("2"), "max_instances");
+    bad("user_tag", json!("evil--tag"), "user_tag");
+    // Another user's cluster, or one in another account or region.
+    bad(
+        "cluster_arn",
+        json!(format!("arn:aws:ecs:{REGION}:{ACCOUNT}:cluster/triple-c-dev--u-bob")),
+        "cluster_arn",
+    );
+    bad(
+        "cluster_arn",
+        json!(format!("arn:aws:ecs:us-east-1:{ACCOUNT}:cluster/triple-c-dev--u-alice")),
+        "cluster_arn",
+    );
+    bad(
+        "cluster_arn",
+        json!(format!("arn:aws:ecs:{REGION}:999999999999:cluster/triple-c-dev--u-alice")),
+        "cluster_arn",
+    );
+    bad("capacity_provider", json!("evil"), "capacity_provider");
+    // Another environment's record.
+    let rec = user_record("prod", "alice").to_string();
+    assert!(parse_user_record("dev", &rec, ACCOUNT, REGION).is_err());
+    for text in ["", "not json", "[]", &"x".repeat(5000)] {
+        assert!(parse_user_record("dev", text, ACCOUNT, REGION).is_err());
+    }
+}
+
+fn compute_of(s: &OnboardingState) -> Option<&UserCompute> {
+    match s {
+        OnboardingState::Joined { ec2 } | OnboardingState::Incomplete { ec2, .. } => ec2.as_ref(),
+        _ => None,
+    }
+}
+
+#[test]
+fn onboarding_carries_the_users_compute_from_their_record() {
+    use crate::aws::tofu_modules::user_record_parameter_name;
+    let ok = owner_key(REGION, USER_ID);
+    let mut d = FakeDetect::new()
+        .with_record("joined", 1)
+        .with_record("fargate", 1)
+        .with_record("broken", 1)
+        .with_record("partial", 1)
+        .with_record("absent", 1);
+    d.roles.insert(task_role("joined"), Knowable::Yes);
+    d.roles.insert(task_role("fargate"), Knowable::Yes);
+    d.roles.insert(task_role("broken"), Knowable::Yes);
+    d.objects = Some(StateObjects {
+        states: vec![
+            env_key("joined"),
+            env_key("fargate"),
+            env_key("broken"),
+            env_key("partial"),
+            env_key("absent"),
+            user_key("partial"),
+        ],
+        locks: vec![],
+    });
+    d.documents.insert(user_key("partial"), "{\"resources\":[{}]}".into());
+    for env in ["joined", "partial", "absent"] {
+        d.parameters.insert(
+            user_record_parameter_name(env, &ok),
+            user_record(env, "alice").to_string(),
+        );
+    }
+    d.parameters.insert(
+        user_record_parameter_name("broken", &ok),
+        user_record("other", "alice").to_string(),
+    );
+    // `joined`'s state is not readable here: found by role.
+    d.objects.as_mut().unwrap().states.retain(|k| *k != user_key("joined"));
+
+    let scan = run_scan(&d, &nobody_local);
+    let onboarding = |n: &str| find(&scan.environments, n).onboarding.clone().unwrap();
+    let joined = onboarding("joined");
+    let compute = compute_of(&joined).expect("joined has compute");
+    assert_eq!(compute.instance_type, "m7g.large");
+    assert_eq!(compute.max_instances, 3);
+    assert_eq!(compute.user_tag, "alice");
+    assert_eq!(onboarding("fargate"), OnboardingState::Joined { ec2: None });
+    // A record that doesn't validate is no compute.
+    assert_eq!(onboarding("broken"), OnboardingState::Joined { ec2: None });
+    // An incomplete onboarding keeps what its record still says.
+    let partial = onboarding("partial");
+    assert!(matches!(partial, OnboardingState::Incomplete { .. }), "{partial:?}");
+    assert_eq!(compute_of(&partial).map(|c| c.max_instances), Some(3));
+    // Not joined: the record isn't even read.
+    assert_eq!(onboarding("absent"), OnboardingState::NotJoined);
+    assert!(!d
+        .calls()
+        .contains(&format!("parameter {}", user_record_parameter_name("absent", &ok))));
+
+    // Serialized for the UI: the state tag plus `ec2`.
+    let v = serde_json::to_value(&joined).unwrap();
+    assert_eq!(v["state"], "joined");
+    assert_eq!(v["ec2"]["capacity_provider"], "triple-c-joined--u-alice");
+    assert_eq!(
+        serde_json::to_value(OnboardingState::Joined { ec2: None }).unwrap(),
+        json!({"state": "joined", "ec2": null})
+    );
 }

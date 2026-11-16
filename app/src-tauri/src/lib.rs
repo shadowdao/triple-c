@@ -644,6 +644,7 @@ pub fn run() {
             commands::environment_commands::cancel_aws_deployment,
             commands::environment_commands::push_aws_saved_state,
             commands::environment_commands::onboard_aws_user,
+            commands::environment_commands::list_ec2_instance_types,
             commands::environment_commands::deploy_aws_permissions_boundary,
             commands::environment_commands::save_aws_admin_bundle,
             commands::settings_commands::detect_host_timezone,

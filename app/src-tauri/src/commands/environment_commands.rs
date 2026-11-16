@@ -30,7 +30,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use aws_config::SdkConfig;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, State};
 
@@ -38,9 +38,9 @@ use aws_sdk_s3::error::ProvideErrorMetadata;
 use tokio::sync::oneshot;
 
 use crate::aws::environments::{
-    ensure_state_bucket, scan, state_bucket_policy, LIVE_LOCK_SECS, DetectedEnvironment,
-    EnvironmentAction, EnvironmentInfo, EnvironmentScan, EnvironmentState, Knowable, LocalRun,
-    OnboardingState, SdkDetectApi,
+    ec2_names_in_use, ensure_state_bucket, scan, state_bucket_policy, user_compute,
+    LIVE_LOCK_SECS, DetectedEnvironment, EnvironmentAction, EnvironmentInfo, EnvironmentScan,
+    EnvironmentState, Knowable, LocalRun, OnboardingState, SdkDetectApi, UserCompute,
 };
 use crate::aws::tofu::{
     self, backend_hcl, StartError, TofuEvent, TofuOp, TofuOutcome, Workdir,
@@ -48,8 +48,9 @@ use crate::aws::tofu::{
 use crate::aws::tofu_modules::{
     boundary_vars, environment_vars, module_files, onboarding_vars, owner_key, state_bucket_name,
     state_key, user_ec2_stem, user_record_parameter_name, validate_ec2_user_tag,
-    validate_environment_name, Deployment, ModuleKind, NetworkChoice,
+    validate_environment_name, Deployment, Ec2Compute, ModuleKind, NetworkChoice,
 };
+use crate::models::project::{ec2_instance_types, Ec2InstanceType, DEFAULT_EC2_INSTANCE_TYPE};
 use crate::aws::{caller_identity, sdk_config, AwsError, CallerIdentity};
 use crate::models::{validate_supported_region, AwsAuth, HostConnection, HostKind};
 use crate::storage::secure;
@@ -273,7 +274,7 @@ pub(crate) fn onboarding_unlock_refusal(
     }
     let env = find(scan, name).ok_or_else(|| format!("No environment named \"{name}\" was found"))?;
     match &env.onboarding {
-        Some(OnboardingState::Incomplete { lock: Some(l) })
+        Some(OnboardingState::Incomplete { lock: Some(l), .. })
             if !l.local_process && env.onboarding_actions.contains(&EnvironmentAction::Unlock) =>
         {
             Ok(())
@@ -300,6 +301,62 @@ pub(crate) fn onboard_refusal(scan: &EnvironmentScan, name: &str) -> Result<(), 
 }
 
 /// `AlreadyRunning` is told apart before it becomes an `AwsError`.
+/// The EC2 capacity an onboarding asks for: none (Fargate only), or EC2
+/// with these values. A command given no choice keeps what the user's
+/// record holds ([`resolve_ec2`]).
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Ec2Choice {
+    None,
+    Ec2(Ec2Compute),
+}
+
+/// What an onboarding apply uses: the explicit choice, or with none given
+/// the recorded capacity (a re-apply keeps it unless changed).
+pub(crate) fn resolve_ec2(
+    choice: Option<Ec2Choice>,
+    recorded: Option<&UserCompute>,
+) -> Option<Ec2Compute> {
+    match choice {
+        Some(Ec2Choice::None) => None,
+        Some(Ec2Choice::Ec2(c)) => Some(c),
+        None => recorded.map(|r| Ec2Compute {
+            instance_type: r.instance_type.clone(),
+            max_instances: r.max_instances,
+            user_tag: r.user_tag.clone(),
+        }),
+    }
+}
+
+/// R3: an onboarding apply with EC2 capacity would adopt (or fail on) a
+/// per-user cluster or Auto Scaling group named `stem` that already
+/// exists, so it is allowed only when this owner's own record names that
+/// cluster (a re-apply of their capacity).
+pub(crate) fn ec2_collision_refusal(
+    stem: &str,
+    cluster_in_use: bool,
+    group_in_use: bool,
+    recorded: Option<&UserCompute>,
+) -> Result<(), String> {
+    if !cluster_in_use && !group_in_use {
+        return Ok(());
+    }
+    let suffix = format!(":cluster/{stem}");
+    if recorded.is_some_and(|r| r.cluster_arn.ends_with(&suffix)) {
+        return Ok(());
+    }
+    let what = match (cluster_in_use, group_in_use) {
+        (true, true) => "An ECS cluster and an Auto Scaling group named {stem} already belong",
+        (true, false) => "An ECS cluster named {stem} already belongs",
+        _ => "An Auto Scaling group named {stem} already belongs",
+    }
+    .replace("{stem}", stem);
+    Err(format!(
+        "{what} to another onboarding. The triple-c-user value is \
+         probably wrong: use the value an admin set as your triple-c-user sign-in tag"
+    ))
+}
+
 pub(crate) fn start_error(e: StartError, label: &str) -> AwsError {
     match e {
         StartError::AlreadyRunning => other(format!(
@@ -426,8 +483,7 @@ fn ec2_collision_step(env: &str, owner_key: &str, region: &str, user_tag: Option
     let stem = user_ec2_stem(env, user_tag.unwrap_or("<tag>"));
     let record = user_record_parameter_name(env, owner_key);
     format!(
-        "
-EC2 capacity (only if ec2_instance_type is set)
+        "EC2 capacity (only if ec2_instance_type is set)
 ------------------------------------------------
 ec2_user_tag must be the value of the user's triple-c-user principal tag.
 BEFORE tofu apply, check that the per-user EC2 names are not already in use
@@ -441,6 +497,7 @@ If either of the first two prints {stem}, apply ONLY if the third (this
 user's record) succeeds and its cluster_arn ends in cluster/{stem};
 otherwise the name belongs to someone else's onboarding: stop and choose
 the correct ec2_user_tag. (The app runs the same check before applying.)
+
 "
     )
 }
@@ -535,7 +592,7 @@ AWS CLI v2 recent enough that create-bucket accepts Tags, e.g. 2.39):
     aws s3api put-public-access-block --bucket {bucket} --region {region} --expected-bucket-owner {account} --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
     aws s3api put-bucket-policy --bucket {bucket} --region {region} --expected-bucket-owner {account} --policy '{policy}'
 
-2. Deploy
+{ec2_step}2. Deploy
 ---------
 From this folder:
 
@@ -544,7 +601,7 @@ From this folder:
 
 (With Terraform: terraform init -backend-config=backend.hcl, then
 terraform apply.)
-{ec2_step}
+
 3. Remove
 ---------
 From this folder, after tofu init:
@@ -1363,12 +1420,15 @@ pub async fn cancel_aws_deployment(
 }
 
 /// Onboard the caller to `environment`, as the owner their own
-/// `aws:userid` names.
+/// `aws:userid` names, with the EC2 capacity `ec2` asks for (omitted: keep
+/// what their user record holds, none without one). With EC2 capacity the
+/// per-user names must be free or already theirs (R3).
 #[tauri::command]
 pub async fn onboard_aws_user(
     connection_id: String,
     region: String,
     environment: String,
+    ec2: Option<Ec2Choice>,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<String, AwsError> {
@@ -1377,12 +1437,40 @@ pub async fn onboard_aws_user(
     let owner = validate_owner_id(&ctx.who.user_id).map_err(other)?;
     let found = detect(&ctx).await?;
     onboard_refusal(&found, &env).map_err(other)?;
-    let vars = onboarding_vars(&env, &ctx.region, &owner, None).map_err(other)?;
+    let okey = owner_key(&ctx.region, &owner);
+    let api = SdkDetectApi::new(&ctx.cfg, &ctx.who.account);
+    let recorded = user_compute(&api, &env, &okey, &ctx.who.account, &ctx.region).await?;
+    let compute = resolve_ec2(ec2, recorded.as_ref());
+    let vars = onboarding_vars(&env, &ctx.region, &owner, compute.as_ref()).map_err(other)?;
+    if let Some(c) = &compute {
+        // R3: before any apply with EC2 capacity. The caller's own
+        // triple-c-user tag can't be read (session tags aren't visible to
+        // GetCallerIdentity); a wrong value fails later as access denied.
+        let stem = user_ec2_stem(&env, &c.user_tag);
+        let (cluster, group) = ec2_names_in_use(&ctx.cfg, &stem).await?;
+        ec2_collision_refusal(&stem, cluster, group, recorded.as_ref()).map_err(other)?;
+    }
     let key = DeploymentKey::User {
-        owner_key: owner_key(&ctx.region, &owner),
+        owner_key: okey,
         env,
     };
     opened(launch(app, &ctx, &key, &vars, TofuOp::Apply).await)
+}
+
+/// The EC2 instance types onboarding offers (the app's built-in table) and
+/// the one it offers first.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct Ec2InstanceTable {
+    pub default_type: &'static str,
+    pub types: Vec<Ec2InstanceType>,
+}
+
+#[tauri::command]
+pub fn list_ec2_instance_types() -> Ec2InstanceTable {
+    Ec2InstanceTable {
+        default_type: DEFAULT_EC2_INSTANCE_TYPE,
+        types: ec2_instance_types(),
+    }
 }
 
 /// Deploy (or re-apply) the account's permissions boundary. Refused when
@@ -1424,8 +1512,10 @@ async fn pick_folder(window: &tauri::Window) -> Option<PathBuf> {
 /// Write an admin bundle (D5) for `kind` into a folder the user picks:
 /// `environment` names the environment (environment and onboarding),
 /// `owner_id` the user to onboard (an `aws:userid`), `network` an
-/// environment's network (public when omitted). `None` when the dialog was
-/// dismissed; otherwise the folder written.
+/// environment's network (public when omitted), `ec2` an onboarding's EC2
+/// capacity (none when omitted; the bundle's README has the admin check
+/// its names first). `None` when the dialog was dismissed; otherwise the
+/// folder written.
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn save_aws_admin_bundle(
@@ -1436,6 +1526,7 @@ pub async fn save_aws_admin_bundle(
     owner_id: Option<String>,
     network: Option<NetworkChoice>,
     max_workspace_hours: Option<u32>,
+    ec2: Option<Ec2Compute>,
     window: tauri::Window,
     state: State<'_, AppState>,
 ) -> Result<Option<String>, AwsError> {
@@ -1466,7 +1557,7 @@ pub async fn save_aws_admin_bundle(
                 .map(str::trim)
                 .ok_or_else(|| other("The user's owner id (aws:userid) is required"))
                 .and_then(|o| validate_owner_id(o).map_err(other))?;
-            let vars = onboarding_vars(&env, &region_ok, &owner, None).map_err(other)?;
+            let vars = onboarding_vars(&env, &region_ok, &owner, ec2.as_ref()).map_err(other)?;
             (
                 DeploymentKey::User {
                     owner_key: owner_key(&region_ok, &owner),

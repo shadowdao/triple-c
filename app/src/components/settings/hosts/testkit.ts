@@ -2,10 +2,12 @@
 import type {
   DeployProgress,
   DetectedEnvironment,
+  Ec2InstanceTable,
   EnvironmentInfo,
   EnvironmentScan,
   HostConnection,
   TofuEvent,
+  UserCompute,
 } from "../../../lib/types";
 
 export const conn: HostConnection = {
@@ -64,4 +66,27 @@ export function tofuEvent(message: string, over: Partial<TofuEvent> = {}): TofuE
 
 export function progress(over: Partial<DeployProgress>): DeployProgress {
   return { op_id: "op1", state_key: "environments/dev/terraform.tfstate", events: [], done: false, cancellable: true, ...over };
+}
+
+/** A slice of `list_ec2_instance_types`'s answer: x86 and ARM rows. */
+export const instanceTable: Ec2InstanceTable = {
+  default_type: "m7i.large",
+  types: [
+    { instance_type: "m7i.large", arch: "x86_64", vcpu: 2, memory_mib: 8192 },
+    { instance_type: "m7i.xlarge", arch: "x86_64", vcpu: 4, memory_mib: 16384 },
+    { instance_type: "m7g.large", arch: "arm64", vcpu: 2, memory_mib: 8192 },
+    { instance_type: "m7g.xlarge", arch: "arm64", vcpu: 4, memory_mib: 16384 },
+  ],
+};
+
+export function compute(over: Partial<UserCompute> = {}): UserCompute {
+  const tag = over.user_tag ?? "alice";
+  return {
+    instance_type: "m7g.xlarge",
+    max_instances: 3,
+    user_tag: tag,
+    cluster_arn: `arn:aws:ecs:eu-west-1:123456789012:cluster/triple-c-dev--u-${tag}`,
+    capacity_provider: `triple-c-dev--u-${tag}`,
+    ...over,
+  };
 }

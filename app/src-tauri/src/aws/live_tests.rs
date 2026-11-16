@@ -1601,7 +1601,7 @@ mod environment {
             let found = t.scan(&cfg, &who).await;
             let env = found.environments.iter().find(|x| x.name == name).unwrap();
             // Joined from the state's onboarding_complete output, not just the role.
-            assert_eq!(env.onboarding, Some(OnboardingState::Joined), "{env:#?}");
+            assert_eq!(env.onboarding, Some(OnboardingState::Joined { ec2: None }), "{env:#?}");
             assert_eq!(env.onboarded_users, Some(1), "{env:#?}");
             let (task_role, exec_role) = user_role_names(&name, &okey);
             eprintln!("onboarded with region-scoped roles {task_role} / {exec_role}");

@@ -1,13 +1,22 @@
 import { useState } from "react";
 import { saveAwsAdminBundle } from "../../../lib/tauri-commands";
 import { awsErrorMessage, toAwsError } from "../../../lib/aws-error";
-import type { AwsError, ModuleKind, NetworkChoice } from "../../../lib/types";
+import type { AwsError, ModuleKind, NetworkChoice, UserCompute } from "../../../lib/types";
 import Button from "../../ui/Button";
 import Field, { inputClass } from "../../ui/Field";
 import Modal from "../../ui/Modal";
 import LifetimeCapField, { parseCapHours } from "./LifetimeCapField";
+import Ec2CapacityFields from "./Ec2CapacityFields";
 import NetworkFields from "./NetworkFields";
-import { DEFAULT_NETWORK, environmentNameError, networkFromDraft, type NetworkDraft } from "./environmentFormat";
+import {
+  DEFAULT_NETWORK,
+  ec2DraftFrom,
+  ec2FromDraft,
+  environmentNameError,
+  networkFromDraft,
+  type Ec2Draft,
+  type NetworkDraft,
+} from "./environmentFormat";
 
 const COMMANDS = "tofu init -backend-config=backend.hcl\ntofu apply";
 
@@ -29,6 +38,7 @@ export default function AdminBundleModal({
   environment,
   ownerId,
   network,
+  recordedEc2,
   reason,
   onSaved,
   onClose,
@@ -40,6 +50,8 @@ export default function AdminBundleModal({
   environment?: string;
   ownerId?: string;
   network?: NetworkChoice;
+  /** An onboarding bundle's starting EC2 capacity: the user's recorded one, if any. */
+  recordedEc2?: UserCompute | null;
   /** Why the bundle is needed (e.g. the refusal that led here). */
   reason?: string;
   /** Called with the folder once a bundle was actually written. */
@@ -50,6 +62,7 @@ export default function AdminBundleModal({
   const [name, setName] = useState("main");
   const [draft, setDraft] = useState<NetworkDraft>(DEFAULT_NETWORK);
   const [capText, setCapText] = useState("0");
+  const [ec2Draft, setEc2Draft] = useState<Ec2Draft>(() => ec2DraftFrom(recordedEc2));
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState<string | null>(null);
   const [error, setError] = useState<AwsError | null>(null);
@@ -58,7 +71,13 @@ export default function AdminBundleModal({
   const nameError = askEnvironment ? environmentNameError(name) : null;
   const picked = askEnvironment ? networkFromDraft(draft) : null;
   const capHours = parseCapHours(capText);
-  const ready = !nameError && (!picked || "network" in picked) && (!askEnvironment || capHours !== null);
+  const onboarding = kind === "user_onboard";
+  const ec2 = onboarding ? ec2FromDraft(ec2Draft) : null;
+  const ready =
+    !nameError &&
+    (!picked || "network" in picked) &&
+    (!askEnvironment || capHours !== null) &&
+    (!ec2 || "compute" in ec2);
 
   const save = async () => {
     setSaving(true);
@@ -69,6 +88,7 @@ export default function AdminBundleModal({
         ownerId,
         network: picked && "network" in picked ? picked.network : network,
         ...(askEnvironment && capHours !== null ? { maxWorkspaceHours: capHours } : {}),
+        ...(ec2 && "compute" in ec2 ? { ec2: ec2.compute } : {}),
       });
       if (folder) {
         setSaved(folder);
@@ -116,6 +136,7 @@ export default function AdminBundleModal({
           <p>
             Joining {environment} needs your own task role and file system, which an environment admin creates
             by applying this bundle. Send them the folder; once it's applied, Detect again shows you as joined.
+            With EC2 capacity, its README has the admin first check that your EC2 names aren't already taken.
           </p>
         )}
         {kind === "permissions_boundary" && (
@@ -125,6 +146,7 @@ export default function AdminBundleModal({
           </p>
         )}
         <p>The bundle works with OpenTofu or Terraform 1.10 and later. Its README lists every step.</p>
+        {onboarding && <Ec2CapacityFields value={ec2Draft} onChange={setEc2Draft} />}
         {askEnvironment && (
           <div className="space-y-3">
             <Field label="Name" hint={nameError ?? undefined}>

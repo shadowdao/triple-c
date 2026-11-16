@@ -718,6 +718,47 @@ fn describe_sizes(sizes: &[u32]) -> String {
 pub const EC2_RESERVED_CPU_UNITS: u32 = 128;
 pub const EC2_RESERVED_MEMORY_MIB: u32 = 256;
 
+/// The instance families the built-in table knows, in the order the app
+/// lists them; a family ending in `g` is Graviton (ARM).
+const EC2_FAMILIES: [&str; 8] = ["m7i", "c7i", "r7i", "t3", "m7g", "c7g", "r7g", "t4g"];
+const EC2_SIZES: [&str; 4] = ["large", "xlarge", "2xlarge", "4xlarge"];
+
+/// The instance type onboarding offers first (x86; `m7g.large` is its ARM
+/// counterpart).
+pub const DEFAULT_EC2_INSTANCE_TYPE: &str = "m7i.large";
+
+/// One row of the built-in instance table, for the onboarding UI.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Ec2InstanceType {
+    pub instance_type: String,
+    pub arch: Arch,
+    pub vcpu: u32,
+    pub memory_mib: u32,
+}
+
+/// Every type [`ec2_instance_spec`] knows (x86 families first), so the UI's
+/// list and the app's validation share one table.
+pub fn ec2_instance_types() -> Vec<Ec2InstanceType> {
+    EC2_FAMILIES
+        .iter()
+        .flat_map(|family| EC2_SIZES.iter().map(move |size| format!("{family}.{size}")))
+        .filter_map(|instance_type| {
+            let (cpu, memory_mib) = ec2_instance_spec(&instance_type)?;
+            let arch = if instance_type.split('.').next()?.ends_with('g') {
+                Arch::Arm64
+            } else {
+                Arch::X86_64
+            };
+            Some(Ec2InstanceType {
+                instance_type,
+                arch,
+                vcpu: cpu / 1024,
+                memory_mib,
+            })
+        })
+        .collect()
+}
+
 /// `(vcpu * 1024, memory MiB)` of a common EC2 instance type, or None when the
 /// type is not in the built-in table (m7i, m7g, c7i, c7g, r7i, r7g, t3, t4g).
 pub fn ec2_instance_spec(instance_type: &str) -> Option<(u32, u32)> {
@@ -1561,6 +1602,32 @@ mod tests {
         assert!(validate_aws_workspace(&e).is_ok());
         // Fargate still rejects the non-pair.
         assert!(validate_aws_workspace(&cfg(1500, 3000)).is_err());
+    }
+
+    #[test]
+    fn the_instance_type_list_is_the_table() {
+        let list = ec2_instance_types();
+        assert_eq!(list.len(), 30);
+        for t in &list {
+            assert_eq!(
+                ec2_instance_spec(&t.instance_type),
+                Some((t.vcpu * 1024, t.memory_mib)),
+                "{}",
+                t.instance_type
+            );
+        }
+        let arch = |name: &str| list.iter().find(|t| t.instance_type == name).unwrap().arch;
+        assert_eq!(arch("m7i.large"), Arch::X86_64);
+        assert_eq!(arch("t3.xlarge"), Arch::X86_64);
+        assert_eq!(arch("m7g.large"), Arch::Arm64);
+        assert_eq!(arch("t4g.2xlarge"), Arch::Arm64);
+        assert!(list.iter().any(|t| t.instance_type == DEFAULT_EC2_INSTANCE_TYPE));
+        assert_eq!(arch(DEFAULT_EC2_INSTANCE_TYPE), Arch::X86_64);
+        let first = &list[0];
+        assert_eq!(
+            serde_json::to_value(first).unwrap(),
+            serde_json::json!({"instance_type": "m7i.large", "arch": "x86_64", "vcpu": 2, "memory_mib": 8192})
+        );
     }
 
     #[test]

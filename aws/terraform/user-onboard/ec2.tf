@@ -310,6 +310,7 @@ resource "aws_ssm_parameter" "user" {
     cluster_arn       = aws_ecs_cluster.ec2[0].arn
     capacity_provider = aws_ecs_capacity_provider.ec2[0].name
     user_tag          = var.ec2_user_tag
+    max_instances     = var.ec2_max_instances
   })
 
   depends_on = [aws_ecs_cluster_capacity_providers.ec2]

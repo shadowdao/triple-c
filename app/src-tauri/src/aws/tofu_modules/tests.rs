@@ -3230,6 +3230,7 @@ fn the_user_record_has_exactly_the_schema_fields() {
         "${aws_ecs_capacity_provider.ec2[0].name}"
     );
     assert_eq!(value["user_tag"], "${var.ec2_user_tag}");
+    assert_eq!(value["max_instances"], "${var.ec2_max_instances}");
     assert_eq!(
         flat(attr(&param.body, "depends_on").unwrap()),
         "[aws_ecs_cluster_capacity_providers.ec2]"

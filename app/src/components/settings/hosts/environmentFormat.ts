@@ -1,6 +1,6 @@
 // Pure helpers shared by the environments UI. The name and id rules mirror
 // `aws/tofu_modules.rs`; the server re-validates everything.
-import type { EnvironmentState, LockInfo, NetworkChoice } from "../../../lib/types";
+import type { Ec2Compute, EnvironmentState, LockInfo, NetworkChoice, UserCompute } from "../../../lib/types";
 import type { StatusTone } from "../../ui/StatusIndicator";
 
 export const COMMON_REGIONS = [
@@ -96,4 +96,48 @@ export function stateStatus(s: EnvironmentState): { tone: StatusTone; label: str
 
 export function stateLock(s: EnvironmentState): LockInfo | null {
   return s.state === "deploying" || s.state === "incomplete" ? s.lock : null;
+}
+
+/** The most instances a user's EC2 capacity may run at once (`EC2_MAX_INSTANCES`). */
+export const EC2_MAX_INSTANCES = 4;
+
+/** The EC2 capacity picker's fields. An empty `instanceType` means the table's default. */
+export interface Ec2Draft {
+  enabled: boolean;
+  instanceType: string;
+  maxInstances: number;
+  userTag: string;
+}
+
+/** The picker's start: the recorded capacity (a re-apply keeps it), or none. */
+export function ec2DraftFrom(recorded: UserCompute | null | undefined): Ec2Draft {
+  return recorded
+    ? { enabled: true, instanceType: recorded.instance_type, maxInstances: recorded.max_instances, userTag: recorded.user_tag }
+    : { enabled: false, instanceType: "", maxInstances: 1, userTag: "" };
+}
+
+/** `validate_ec2_user_tag`: null when valid, else why not. */
+export function userTagError(tag: string): string | null {
+  if (!tag) return "Enter your triple-c-user value.";
+  const ok = /^[A-Za-z0-9-]{1,32}$/.test(tag) && !tag.startsWith("-") && !tag.endsWith("-") && !tag.includes("--");
+  return ok ? null : "Use 1 to 32 letters, digits and single hyphens, not starting or ending with a hyphen.";
+}
+
+/** The capacity a draft asks for (null = none), or why it can't be used yet. */
+export function ec2FromDraft(d: Ec2Draft): { compute: Ec2Compute | null } | { error: string } {
+  if (!d.enabled) return { compute: null };
+  if (!d.instanceType) return { error: "Choose an instance type." };
+  if (!Number.isInteger(d.maxInstances) || d.maxInstances < 1 || d.maxInstances > EC2_MAX_INSTANCES) {
+    return { error: `Choose 1 to ${EC2_MAX_INSTANCES} instances.` };
+  }
+  const tag = d.userTag.trim();
+  const tagError = userTagError(tag);
+  if (tagError) return { error: tagError };
+  return { compute: { instance_type: d.instanceType, max_instances: d.maxInstances, user_tag: tag } };
+}
+
+/** "m7g.large, up to 3 instances (triple-c-user alice)". */
+export function computeLine(c: UserCompute): string {
+  const n = c.max_instances === 1 ? "1 instance" : `up to ${c.max_instances} instances`;
+  return `${c.instance_type}, ${n} (triple-c-user ${c.user_tag})`;
 }

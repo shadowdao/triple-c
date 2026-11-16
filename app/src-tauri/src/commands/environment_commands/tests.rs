@@ -6,7 +6,7 @@ use serde_json::json;
 use super::*;
 use crate::aws::tofu::Workdir;
 use crate::aws::environments::{
-    EnvironmentState, Knowable, LockInfo, OnboardingState,
+    EnvironmentState, Knowable, LockInfo, OnboardingState, UserCompute,
 };
 use crate::aws::tofu_modules::{
     environment_vars, module_files, onboarding_vars, owner_key, state_key, ModuleKind,
@@ -278,6 +278,10 @@ fn bundles_contain_the_module_backend_vars_and_readme() {
     assert!(readme_tagged.contains("--clusters triple-c-dev--u-alice "), "{readme_tagged}");
     assert!(readme_tagged.contains("--auto-scaling-group-names triple-c-dev--u-alice "));
     assert!(!readme_tagged.contains("<tag>"));
+    // The check comes before the apply it guards.
+    let check = readme.find("BEFORE tofu apply").unwrap();
+    let apply = readme.find("    tofu apply").unwrap();
+    assert!(check < apply, "{readme}");
     // Not in the other bundles.
     let env_dir = tempfile::tempdir().unwrap();
     let env_vars = environment_vars("dev", REGION, &NetworkChoice::Public, 0).unwrap();
@@ -539,12 +543,12 @@ fn destroy_is_refused_while_users_are_onboarded() {
 fn only_your_own_stale_onboarding_lock_can_be_removed() {
     use EnvironmentAction::*;
     let mut stale = env("dev", EnvironmentState::Ready, vec![Join]);
-    stale.onboarding = Some(OnboardingState::Incomplete { lock: Some(lock(9000, false)) });
+    stale.onboarding = Some(OnboardingState::Incomplete { lock: Some(lock(9000, false)), ec2: None });
     stale.onboarding_actions = vec![Unlock];
     let mut live = env("live", EnvironmentState::Ready, vec![Join]);
     live.onboarding = Some(OnboardingState::InProgress { lock: Some(lock(10, false)) });
     let mut none = env("none", EnvironmentState::Ready, vec![Join]);
-    none.onboarding = Some(OnboardingState::Incomplete { lock: None });
+    none.onboarding = Some(OnboardingState::Incomplete { lock: None, ec2: None });
     let s = scan(Knowable::Yes, vec![stale, live, none]);
     let mine = owner_key(REGION, USER_ID);
     assert!(onboarding_unlock_refusal(&s, "dev", &mine).is_ok());
@@ -662,4 +666,89 @@ fn ending_a_launch_never_clears_a_following_slot() {
     slots.end_launch(dir);
     assert_eq!(slots.begin_launch(dir).unwrap_err(), SlotBusy::Following);
     slots.end_launch(Path::new("/w/env/none")); // nothing there: no-op
+}
+
+fn recorded(env: &str, tag: &str, max: u32) -> UserCompute {
+    let stem = crate::aws::tofu_modules::user_ec2_stem(env, tag);
+    UserCompute {
+        instance_type: "m7g.xlarge".into(),
+        max_instances: max,
+        user_tag: tag.into(),
+        cluster_arn: format!("arn:aws:ecs:{REGION}:{ACCOUNT}:cluster/{stem}"),
+        capacity_provider: stem,
+    }
+}
+
+#[test]
+fn a_reapply_keeps_the_recorded_compute_unless_changed() {
+    let rec = recorded("dev", "alice", 3);
+    let kept = Ec2Compute {
+        instance_type: "m7g.xlarge".into(),
+        max_instances: 3,
+        user_tag: "alice".into(),
+    };
+    // Omitted: keep what the record says (or none without one).
+    assert_eq!(resolve_ec2(None, Some(&rec)), Some(kept.clone()));
+    assert_eq!(resolve_ec2(None, None), None);
+    // Explicitly none: the re-apply removes it.
+    assert_eq!(resolve_ec2(Some(Ec2Choice::None), Some(&rec)), None);
+    // A new choice wins.
+    let new = Ec2Compute {
+        instance_type: "m7i.large".into(),
+        max_instances: 1,
+        user_tag: "alice".into(),
+    };
+    assert_eq!(
+        resolve_ec2(Some(Ec2Choice::Ec2(new.clone())), Some(&rec)),
+        Some(new.clone())
+    );
+    // The kept values reach the module's variables unchanged.
+    let vars = onboarding_vars("dev", REGION, USER_ID, resolve_ec2(None, Some(&rec)).as_ref()).unwrap();
+    assert_eq!(vars["ec2_instance_type"], "m7g.xlarge");
+    assert_eq!(vars["ec2_max_instances"], 3);
+    assert_eq!(vars["ec2_user_tag"], "alice");
+    let vars = onboarding_vars("dev", REGION, USER_ID, Some(&new)).unwrap();
+    assert_eq!(vars["ec2_instance_type"], "m7i.large");
+    assert_eq!(vars["ec2_max_instances"], 1);
+
+    // The UI's JSON for each choice.
+    let none: Ec2Choice = serde_json::from_value(json!({"kind": "none"})).unwrap();
+    assert_eq!(none, Ec2Choice::None);
+    let ec2: Ec2Choice = serde_json::from_value(json!({
+        "kind": "ec2", "instance_type": "m7i.large", "max_instances": 1, "user_tag": "alice"
+    }))
+    .unwrap();
+    assert_eq!(ec2, Ec2Choice::Ec2(new));
+}
+
+#[test]
+fn ec2_names_in_use_by_another_onboarding_are_refused() {
+    let stem = "triple-c-dev--u-alice";
+    // Free names: fine, with or without a record.
+    assert!(ec2_collision_refusal(stem, false, false, None).is_ok());
+    assert!(ec2_collision_refusal(stem, false, false, Some(&recorded("dev", "bob", 1))).is_ok());
+    // Taken, and this owner's record names that cluster: their own re-apply.
+    let mine = recorded("dev", "alice", 2);
+    for (cluster, group) in [(true, false), (false, true), (true, true)] {
+        assert!(ec2_collision_refusal(stem, cluster, group, Some(&mine)).is_ok());
+        // Taken with no record, or a record naming another cluster.
+        for other in [None, Some(recorded("dev", "bob", 1))] {
+            let e = ec2_collision_refusal(stem, cluster, group, other.as_ref()).unwrap_err();
+            assert!(e.contains(stem), "{e}");
+            assert!(e.contains("triple-c-user"), "{e}");
+        }
+    }
+    // A cluster that merely ends in the same text is not the same cluster.
+    let mut lookalike = recorded("dev", "alice", 1);
+    lookalike.cluster_arn = format!("arn:aws:ecs:{REGION}:{ACCOUNT}:cluster/x{stem}");
+    assert!(ec2_collision_refusal(stem, true, false, Some(&lookalike)).is_err());
+}
+
+#[test]
+fn the_ui_gets_the_apps_instance_table() {
+    let table = list_ec2_instance_types();
+    assert_eq!(table.types, crate::models::project::ec2_instance_types());
+    assert_eq!(table.types.len(), 30);
+    assert_eq!(table.default_type, "m7i.large");
+    assert!(table.types.iter().any(|t| t.instance_type == table.default_type));
 }
