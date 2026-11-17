@@ -326,7 +326,8 @@ RUN npx --yes playwright@latest --version \
 # `tmux` rides this layer, the last apt layer and the cheapest to change: it
 # keeps AWS workspaces' terminals alive while the app is closed (one tmux
 # server per tab, app/src-tauri/src/host/persistent.rs, config
-# /etc/triple-c/tmux.conf below). Unused on Docker projects. ~1.2 MB.
+# /etc/triple-c/tmux.conf below). Unused on Docker projects. +3 packages
+# (tmux, libevent-core, libutempter0), ~1.5 MB installed.
 ARG APT_REFRESH=
 RUN echo "apt refresh: ${APT_REFRESH:-unset}" \
     && for i in 1 2 3 4 5; do \

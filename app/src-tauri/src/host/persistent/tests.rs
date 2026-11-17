@@ -153,7 +153,7 @@ fn the_image_ships_the_config_and_tmux() {
         "set -g destroy-unattached off",
         "set -g window-size latest",
         "set -g default-terminal \"tmux-256color\"",
-        "set -as terminal-overrides \",xterm*:smcup@:rmcup@:indn@\"",
+        r#"set -as terminal-overrides ",xterm*:smcup@:rmcup@:indn@:clear=\\E[H""#,
     ] {
         assert!(conf.lines().any(|l| l == line), "missing: {line}");
     }
