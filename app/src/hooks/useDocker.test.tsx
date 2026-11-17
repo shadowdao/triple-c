@@ -2,11 +2,11 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { act, renderHook } from "@testing-library/react";
 import { useDocker } from "./useDocker";
 
-const checkDocker = vi.fn();
+const getDockerStatus = vi.fn();
 const checkImageExists = vi.fn();
 
 vi.mock("../lib/tauri-commands", () => ({
-  checkDocker: () => checkDocker(),
+  getDockerStatus: () => getDockerStatus(),
   checkImageExists: () => checkImageExists(),
   buildImage: vi.fn(),
   pullImage: vi.fn(),
@@ -15,6 +15,8 @@ vi.mock("../lib/tauri-commands", () => ({
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => vi.fn()) }));
 
 const setDockerAvailable = vi.fn();
+const setDockerStatus = vi.fn();
+const status = (state: string) => ({ state, endpoint: "unix:///var/run/docker.sock", detail: null, os: "linux" });
 const setImageExists = vi.fn();
 
 vi.mock("../store/appState", () => ({
@@ -22,6 +24,8 @@ vi.mock("../store/appState", () => ({
     selector({
       dockerAvailable: false,
       setDockerAvailable,
+      dockerStatus: null,
+      setDockerStatus,
       imageExists: false,
       setImageExists,
     }),
@@ -49,7 +53,7 @@ describe("useDocker.startDockerPolling", () => {
   });
 
   it("runs onAvailable once, after Docker is marked available and the image re-checked", async () => {
-    checkDocker.mockResolvedValueOnce(false).mockResolvedValue(true);
+    getDockerStatus.mockResolvedValueOnce(status("not_running")).mockResolvedValue(status("running"));
     const onAvailable = vi.fn();
 
     const { result } = renderHook(() => useDocker());
@@ -59,9 +63,11 @@ describe("useDocker.startDockerPolling", () => {
 
     await tick();
     expect(onAvailable).not.toHaveBeenCalled();
+    // The not-running state is published so the dialog can show it live.
+    expect(setDockerStatus).toHaveBeenLastCalledWith(status("not_running"));
 
     await tick();
-    expect(setDockerAvailable).toHaveBeenCalledWith(true);
+    expect(setDockerStatus).toHaveBeenLastCalledWith(status("running"));
     expect(setImageExists).toHaveBeenCalledWith(true);
     expect(onAvailable).toHaveBeenCalledTimes(1);
 
@@ -71,7 +77,7 @@ describe("useDocker.startDockerPolling", () => {
   });
 
   it("still works without a callback and can be cancelled by its cleanup", async () => {
-    checkDocker.mockResolvedValue(true);
+    getDockerStatus.mockResolvedValue(status("running"));
 
     const { result } = renderHook(() => useDocker());
     let stop: () => void = () => {};
@@ -81,7 +87,7 @@ describe("useDocker.startDockerPolling", () => {
     act(() => stop());
 
     await tick();
-    expect(checkDocker).not.toHaveBeenCalled();
-    expect(setDockerAvailable).not.toHaveBeenCalled();
+    expect(getDockerStatus).not.toHaveBeenCalled();
+    expect(setDockerStatus).not.toHaveBeenCalled();
   });
 });

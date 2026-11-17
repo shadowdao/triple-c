@@ -7,12 +7,16 @@ import * as commands from "../lib/tauri-commands";
 export function useDocker() {
   const {
     dockerAvailable,
+    dockerStatus,
+    setDockerStatus,
     setDockerAvailable,
     imageExists,
     setImageExists,
   } = useAppState(
     useShallow(s => ({
       dockerAvailable: s.dockerAvailable,
+      dockerStatus: s.dockerStatus,
+      setDockerStatus: s.setDockerStatus,
       setDockerAvailable: s.setDockerAvailable,
       imageExists: s.imageExists,
       setImageExists: s.setImageExists,
@@ -21,14 +25,14 @@ export function useDocker() {
 
   const checkDocker = useCallback(async () => {
     try {
-      const available = await commands.checkDocker();
-      setDockerAvailable(available);
-      return available;
+      const status = await commands.getDockerStatus();
+      setDockerStatus(status);
+      return status.state === "running";
     } catch {
       setDockerAvailable(false);
       return false;
     }
-  }, [setDockerAvailable]);
+  }, [setDockerStatus, setDockerAvailable]);
 
   const checkImage = useCallback(async () => {
     try {
@@ -62,7 +66,9 @@ export function useDocker() {
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   /**
-   * Poll until Docker appears, then stop.
+   * Poll until Docker appears, then stop. Every tick stores the latest
+   * `dockerStatus`, so the Docker dialog follows "not running" → "no
+   * permission" → running live and closes itself.
    *
    * `onAvailable` runs exactly once, after `dockerAvailable` is set and the
    * image has been re-checked. It exists because a session that started before
@@ -75,11 +81,11 @@ export function useDocker() {
 
     const interval = setInterval(async () => {
       try {
-        const available = await commands.checkDocker();
-        if (available) {
+        const status = await commands.getDockerStatus();
+        if (status.state === "running") {
           clearInterval(interval);
           pollingRef.current = null;
-          setDockerAvailable(true);
+          setDockerStatus(status);
           // Also check image once Docker is available
           try {
             const exists = await commands.checkImageExists();
@@ -92,6 +98,8 @@ export function useDocker() {
           } catch (e) {
             console.error("Docker-available callback failed:", e);
           }
+        } else {
+          setDockerStatus(status);
         }
       } catch {
         // Still not available, keep polling
@@ -103,7 +111,7 @@ export function useDocker() {
       clearInterval(interval);
       pollingRef.current = null;
     };
-  }, [setDockerAvailable, setImageExists]);
+  }, [setDockerStatus, setImageExists]);
 
   const pullImage = useCallback(
     async (imageName: string, onProgress?: (msg: string) => void) => {
@@ -125,6 +133,7 @@ export function useDocker() {
 
   return {
     dockerAvailable,
+    dockerStatus,
     imageExists,
     checkDocker,
     checkImage,

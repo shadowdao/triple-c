@@ -702,6 +702,17 @@ export interface FileContents {
   size: number;
 }
 
+/** Mirrors `docker::status::DockerStatus` (src-tauri/src/docker/status.rs). */
+export type DockerState = "running" | "not_running" | "no_permission" | "not_installed";
+
+export interface DockerStatus {
+  state: DockerState;
+  /** The endpoint that was tried: `DOCKER_HOST` when set, else the default socket/pipe. */
+  endpoint: string;
+  detail: string | null;
+  os: "linux" | "macos" | "windows" | "unknown";
+}
+
 export interface InstallOptions {
   os: "linux" | "macos" | "windows" | "unknown";
   product_name: string;

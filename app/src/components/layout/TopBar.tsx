@@ -1,3 +1,4 @@
+import { dockerFailLabel } from "../../lib/dockerStatus";
 import { useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import MainTabs from "./MainTabs";
@@ -9,9 +10,10 @@ import HelpDialog from "./HelpDialog";
 import StatusIndicator, { type StatusTone } from "../ui/StatusIndicator";
 
 export default function TopBar() {
-  const { dockerAvailable, imageExists, updateInfo, imageUpdateInfo, appVersion, setUpdateInfo, setImageUpdateInfo } = useAppState(
+  const { dockerAvailable, dockerStatus, imageExists, updateInfo, imageUpdateInfo, appVersion, setUpdateInfo, setImageUpdateInfo } = useAppState(
     useShallow(s => ({
       dockerAvailable: s.dockerAvailable,
+      dockerStatus: s.dockerStatus,
       imageExists: s.imageExists,
       updateInfo: s.updateInfo,
       imageUpdateInfo: s.imageUpdateInfo,
@@ -76,7 +78,7 @@ export default function TopBar() {
           <HealthDot
             state={dockerAvailable}
             okLabel="Docker"
-            failLabel="Docker unavailable"
+            failLabel={dockerFailLabel(dockerStatus)}
             pendingLabel="Docker — checking"
           />
           <HealthDot

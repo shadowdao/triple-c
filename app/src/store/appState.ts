@@ -3,6 +3,7 @@ import type {
   Project,
   TerminalSession,
   AppSettings,
+  DockerStatus,
   UpdateInfo,
   ImageUpdateInfo,
   Note,
@@ -243,6 +244,10 @@ interface AppState {
   setNotesDockWidth: (width: number) => void;
   dockerAvailable: boolean | null;
   setDockerAvailable: (available: boolean | null) => void;
+  /** Why Docker is (un)available; `null` until the first check. */
+  dockerStatus: DockerStatus | null;
+  /** Sets `dockerStatus` and derives `dockerAvailable` from it. */
+  setDockerStatus: (status: DockerStatus) => void;
   imageExists: boolean | null;
   setImageExists: (exists: boolean | null) => void;
   // App settings
@@ -569,6 +574,9 @@ export const useAppState = create<AppState>((set) => ({
   },
   dockerAvailable: null,
   setDockerAvailable: (available) => set({ dockerAvailable: available }),
+  dockerStatus: null,
+  setDockerStatus: (status) =>
+    set({ dockerStatus: status, dockerAvailable: status.state === "running" }),
   imageExists: null,
   setImageExists: (exists) => set({ imageExists: exists }),
   // App settings

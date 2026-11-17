@@ -9,6 +9,7 @@
     "dialog:allow-open",
     "dialog:allow-save",
     "allow-check-docker",
+    "allow-check-docker-status",
     "allow-check-image-exists",
     "allow-build-image",
     "allow-get-container-info",
