@@ -15,7 +15,7 @@ cd app
 npm ci                    # Install dependencies (required first time)
 npx tauri dev             # Launch app in dev mode with hot reload (Vite on port 1420)
 npx tauri build           # Production build (outputs to src-tauri/target/release/bundle/);
-                          # run ../scripts/fetch-ssm-plugin.sh first (bundled AWS plugin, see Packaging)
+                          # run ../scripts/build-ssm-plugin.sh first (bundled AWS plugin, see Packaging)
 npm run build             # Frontend-only build (tsc + vite)
 npm run test              # Run Vitest once
 npm run test:watch        # Run Vitest in watch mode
@@ -1237,45 +1237,57 @@ install directory on Windows (`session-manager-plugin.exe`), and `target/<profil
 `current_exe()`)** → `PATH` → AWS's install locations → the install hint; the order is
 unit-tested (`host/ssm/tests.rs`, `plugin_resolution`).
 
-- **The binaries are never committed** (`app/src-tauri/binaries/` is ignored).
-  `scripts/fetch-ssm-plugin.sh <triple>…` (Linux/macOS) and `scripts/fetch-ssm-plugin.ps1`
-  (Windows) download a **pinned** version from AWS's S3 path, check a **pinned SHA-256 of the
-  artifact before extracting anything**, then AWS's GPG signature on the Linux `.deb` (`gpgv`
-  against `scripts/aws-ssm-plugin-signer.asc`, fingerprint pinned in the script; AWS publishes no
-  `.sig` for the macOS/Windows zips) or AWS's Authenticode signature on Windows, then a pinned
-  SHA-256 of the extracted binary. Any miss fails the build. Every build job in both workflows
-  runs it before `tauri build`. macOS builds `universal-apple-darwin`, which needs **three**
-  files: each thin slice (tauri-build checks the arch it is compiling) and the `lipo`'d universal
-  one (the bundler), whose slices the script checks are byte-identical to the pinned thin ones.
-  Bumping the version means new hashes in both scripts and the version line in
-  `THIRD_PARTY_NOTICES` (the scripts refuse to run when they disagree).
+- **We build it from source; we never ship AWS's binaries.** AWS distributes its prebuilt plugin
+  as "AWS Content" under the AWS Customer Agreement; the source (github.com/aws/session-manager-plugin)
+  is Apache-2.0. `scripts/build-ssm-plugin.sh <triple>…` (Linux/macOS; any triple, it
+  cross-compiles) and `scripts/build-ssm-plugin.ps1` (the Windows runner, which has no bash) take
+  the tag's **commit** as GitHub's archive (pinned SHA-256, checked before extraction) and a
+  **pinned Go** from go.dev (go.dev's published SHA-256), and run the repo's own build — GOPATH
+  mode over its vendored deps, `-ldflags "-s -w"`, `sessionmanagerplugin-main` — with `VERSION`
+  stamped to the tag (the repo's file says `1.3.0.0`; AWS's pipeline stamps the real one, so
+  `--version` would otherwise lie), plus `-trimpath`, no VCS stamp, empty build id, `CGO_ENABLED=0`
+  and a scrubbed Go environment. **The output must equal a pinned SHA-256 per target**: Go builds
+  are reproducible across hosts, so every runner must produce the exact bytes recorded in the
+  scripts (verified locally: Linux-hosted builds of every target, repeated in fresh directories,
+  and the `.ps1` flow, are identical). A mismatch fails the build and means the source, toolchain
+  or flags changed — never "update the hash" without knowing which.
+- **Each platform job builds its own targets** before `tauri build` (Linux: `x86_64-unknown-linux-gnu`;
+  macOS: `universal-apple-darwin`, i.e. both thin slices — tauri-build checks the arch it compiles —
+  plus the `lipo`'d universal file the bundler wants, whose slices must thin back out byte-identical
+  to the pins; Windows: the `.ps1`). Not one Linux job feeding the others: workflow artifacts do
+  not work on this Gitea (see `build-app-preview.yml`'s header), and with reproducible output and
+  pinned hashes nothing is gained by building once.
+- **Bumping** the plugin or Go: new pins in **both** scripts, rebuild every target, record the new
+  output hashes, and update `app/src-tauri/THIRD_PARTY_NOTICES` (the scripts refuse to run unless
+  its `Version:`/`Commit:` lines match) including its dependency licences.
 - **Debug builds get a placeholder; release builds refuse one.** tauri-build fails *any* build
   whose externalBin file is missing, `cargo test` included. `build.rs` (`ensure_ssm_sidecar`)
   writes a marked placeholder (`src/sidecar_placeholder.rs`) for a missing file when
-  `PROFILE=debug`, so `cargo test`/`cargo check`/`tauri dev` and CI's `test` job never need
-  AWS's S3, and `find_plugin()` skips it (falling back to an installed plugin). With
-  `PROFILE=release` a missing file **or** a placeholder stops the build. So `cargo build
-  --release` locally needs the fetch script first. `finalize-appimage.sh` additionally asserts the
-  shipped `usr/bin/session-manager-plugin` is an ELF that runs `--version`.
-- **Windows: the plugin ships under AWS's signature, deliberately not re-signed.** It is
-  Authenticode-signed and timestamped by Amazon Web Services, Inc.; Tauri skips a sidecar that
-  `signtool verify /pa` accepts, so the sign command never sees it, and re-signing would cost a
-  metered signature to put our name on AWS's binary. `windows-sign.ps1` **refuses** (exits 1) if
-  it is ever presented — that means AWS's signature failed to verify, and the allowlist would
-  otherwise skip it and ship it unsigned. `windows-verify-signatures.ps1` requires the copy inside
-  the MSI (and the file NSIS packed) to be valid, timestamped and signed by AWS.
-- **macOS: not code-signed by us**, because the app is not (no `APPLE_*`/`signingIdentity` in
-  the workflows); the plugin keeps AWS's Developer ID signature on both slices. If macOS signing
-  is ever configured, Tauri signs externalBin with the app's identity, inside-out, as it should.
-- **Licence:** the plugin's source is Apache-2.0; its LICENSE, NOTICE and AWS's `THIRD-PARTY`
-  statement are reproduced in `app/src-tauri/THIRD_PARTY_NOTICES`, bundled as a resource
-  (`usr/lib/Triple-C/` in the AppImage — asserted by `finalize-appimage.sh`). Note AWS's
-  `THIRD-PARTY` file calls the binary "AWS Content" under the AWS Customer Agreement.
+  `PROFILE=debug`, so `cargo test`/`cargo check`/`tauri dev` and CI's `test` job need neither Go
+  nor the network, and `find_plugin()` skips it (falling back to an installed plugin). With
+  `PROFILE=release` a missing file **or** a placeholder stops the build, so a local `cargo build
+  --release` needs the build script first. `finalize-appimage.sh` asserts the shipped
+  `usr/bin/session-manager-plugin` is an ELF that runs `--version`.
+- **Windows: our build is unsigned, so the release signs it with our certificate.** Tauri runs
+  `signtool verify /pa` on each sidecar and hands the unsigned one to the sign command, in place
+  under `app\src-tauri\binaries` before any bundle (both MSI and NSIS pack that file);
+  `windows-sign.ps1`'s allowlist includes it (one more metered signature per release: 6).
+  `windows-verify-signatures.ps1` requires exactly one `session-manager-plugin.exe` in the MSI and
+  the file NSIS packed to be validly signed, timestamped, **by the same certificate as the
+  installer**, and the signing log to show it. Previews ship it unsigned, like the app.
+- **macOS: signed exactly like the app.** The app is not code-signed (no `APPLE_*`/`signingIdentity`
+  in the workflows); Go's linker ad-hoc signs the arm64 slice (needed to run on Apple Silicon). If
+  signing is ever configured, Tauri signs externalBin with the app's identity, inside-out.
+- **Licence:** `app/src-tauri/THIRD_PARTY_NOTICES` (bundled as a resource; `usr/lib/Triple-C/` in
+  the AppImage, asserted by `finalize-appimage.sh`) carries the plugin's Apache-2.0 LICENSE and
+  NOTICE, the commit we build, the repo's own `THIRD-PARTY` file verbatim, the licence of every
+  vendored module linked in (`go list -deps` for linux/darwin/windows) and Go's own. Note that the
+  repo's `THIRD-PARTY` file opens with the same "AWS Content" sentence as the binary packages.
 
 ### Windows code signing
 
 Windows **releases** (`build-app.yml`) are signed with **Azure Artifact Signing**: the app binary,
-the MSI, the NSIS installer and its uninstaller. Three scripts do it, and "Verify signatures"
+the bundled `session-manager-plugin`, the MSI, the NSIS installer and its uninstaller. Three scripts do it, and "Verify signatures"
 fails the job if any of them is unsigned or untimestamped, so an unsigned installer cannot ship
 quietly. **PR previews are deliberately not signed**, and `build-app-preview.yml` must not
 reference the signing secrets. Two reasons: signing is metered (about 1000 signatures a month,
@@ -1293,13 +1305,13 @@ without releasing (see Releases above).
 - `scripts/windows-sign.ps1` is the sign command: `signtool sign /dlib` with SHA-256 and the
   Microsoft timestamp server, retried. Credentials never reach a command line — the dlib reads
   `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET` from the environment.
-  **It signs only an allowlist of what ships**: 5 signatures per release (the app binary twice,
+  **It signs only an allowlist of what ships**: 6 signatures per release (the app binary twice,
   because Tauri re-patches it between the MSI and NSIS bundles; the MSI; the NSIS installer;
-  and its uninstaller). Tauri also presents build-time tools, the WiX extension DLLs and NSIS
+  its uninstaller; and the `session-manager-plugin` sidecar we build from source). Tauri also presents build-time tools, the WiX extension DLLs and NSIS
   plugins, and signing those would more than double the metered count for no user-visible
   benefit. If the app ever ships resource DLLs or sidecars, extend the
-  allowlist, or they will go out unsigned. (The one sidecar so far, `session-manager-plugin`, is
-  AWS-signed and refused rather than re-signed; see the section above.) Tauri reports a failed sign command only as
+  allowlist, or they will go out unsigned (as `session-manager-plugin`'s entry does; see the
+  section above). Tauri reports a failed sign command only as
   "failed to run powershell", so the script keeps a transcript (`.code-signing/sign-output.log`,
   `signtool /debug` included), and the job prints it on failure.
 - `scripts/windows-verify-signatures.ps1` checks `signtool verify /pa` plus a timestamp on the

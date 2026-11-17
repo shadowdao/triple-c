@@ -15,9 +15,9 @@
 # the NSIS installer cannot be unpacked that way, so for it the signing log
 # must show the app binary and the uninstaller were signed.
 #
-# The bundled AWS session-manager-plugin is checked too - present in the MSI,
-# and in both installers signed, timestamped and signed by AWS, because it is
-# shipped under AWS's signature rather than re-signed by us.
+# The bundled session-manager-plugin (built from source, signed by us) is
+# checked too: present in the MSI, and in both installers validly signed,
+# timestamped, and by the same certificate as the installer itself.
 
 param([Parameter(Mandatory = $true, ValueFromRemainingArguments = $true)][string[]]$Patterns)
 
@@ -51,17 +51,18 @@ function Test-Signature([IO.FileInfo]$File, [string]$Label) {
     return $false
 }
 
-# The bundled AWS session-manager-plugin sidecar is deliberately left under
-# AWS's own signature (see fetch-ssm-plugin.ps1), so beyond being valid and
-# timestamped it must be AWS's, not ours.
+# The session-manager-plugin sidecar is built from AWS's source
+# (build-ssm-plugin.ps1), so it is unsigned until windows-sign.ps1 signs it. It
+# must carry OUR signature: valid, timestamped, and from the same certificate
+# as the installer that ships it.
 $sidecarName = 'session-manager-plugin.exe'
 $sidecarSource = Join-Path (Split-Path -Parent $PSScriptRoot) 'app\src-tauri\binaries\session-manager-plugin-x86_64-pc-windows-msvc.exe'
-function Test-AwsSigner([IO.FileInfo]$File, [string]$Label) {
+function Test-OurSigner([IO.FileInfo]$File, [string]$Label, [IO.FileInfo]$Installer) {
     if (-not (Test-Signature $File $Label)) { return $false }
-    $subject = (Get-AuthenticodeSignature -FilePath $File.FullName).SignerCertificate.Subject
-    # .NET quotes a DN value holding a comma: O="Amazon Web Services, Inc.".
-    if ($subject -match '(^|,\s*)O="?Amazon Web Services, Inc\."?(,|$)') { return $true }
-    Write-Host "FAIL $Label - signed by '$subject', expected Amazon Web Services, Inc."
+    $ours = (Get-AuthenticodeSignature -FilePath $Installer.FullName).SignerCertificate
+    $theirs = (Get-AuthenticodeSignature -FilePath $File.FullName).SignerCertificate
+    if ($ours -and $theirs -and $ours.Thumbprint -eq $theirs.Thumbprint) { return $true }
+    Write-Host "FAIL $Label - signed by '$($theirs.Subject)', not the certificate that signed $($Installer.Name)"
     return $false
 }
 
@@ -74,7 +75,7 @@ $failed = @()
 $nsisBuilt = $false
 foreach ($file in $files) {
     if (-not (Test-Signature $file $file.Name)) { $failed += $file.Name }
-    if ($file.FullName -match '\\bundle\\nsis\\') { $nsisBuilt = $true }
+    if ($file.FullName -match '\\bundle\\nsis\\') { $nsisBuilt = $true; $nsisInstaller = $file }
 
     if ($file.Extension -eq '.msi') {
         $extract = Join-Path ([IO.Path]::GetTempPath()) ('msi-verify-' + [guid]::NewGuid().ToString('N'))
@@ -92,13 +93,13 @@ foreach ($file in $files) {
         foreach ($f in $inner) {
             if (-not (Test-Signature $f "$($file.Name) > $($f.Name)")) { $failed += "$($file.Name) > $($f.Name)" }
         }
-        # The bundled AWS plugin must be in there, and still under AWS's signature.
+        # The bundled plugin must be in there, under our signature.
         if ($proc.ExitCode -eq 0) {
             $plugin = @($inner | Where-Object { $_.Name -eq $sidecarName })
             if ($plugin.Count -ne 1) {
                 Write-Host "FAIL $($file.Name) - carries $($plugin.Count) $sidecarName, expected 1"
                 $failed += "$($file.Name) > $sidecarName (missing)"
-            } elseif (-not (Test-AwsSigner $plugin[0] "$($file.Name) > $sidecarName")) {
+            } elseif (-not (Test-OurSigner $plugin[0] "$($file.Name) > $sidecarName" $file)) {
                 $failed += "$($file.Name) > $sidecarName (signer)"
             }
         }
@@ -120,13 +121,17 @@ if ($nsisBuilt) {
     } else {
         Write-Host "OK   app binary - signed before packaging ($($appSigned.Count)x)"
     }
-    # makensis packs the sidecar straight from app\src-tauri\binaries, so the
-    # file it read is the one to check.
+    # makensis packs the sidecar straight from app\src-tauri\binaries, where
+    # Tauri had it signed in place before any bundle: so that file, and a
+    # logged signature for it, are what NSIS shipped.
     if (-not (Test-Path -LiteralPath $sidecarSource)) {
         Write-Host "FAIL $sidecarName - $sidecarSource is missing"
         $failed += "NSIS > $sidecarName (missing)"
-    } elseif (-not (Test-AwsSigner (Get-Item -LiteralPath $sidecarSource) "NSIS > $sidecarName (as packed)")) {
+    } elseif (-not (Test-OurSigner (Get-Item -LiteralPath $sidecarSource) "NSIS > $sidecarName (as packed)" $nsisInstaller)) {
         $failed += "NSIS > $sidecarName (signer)"
+    } elseif (-not @($log | Where-Object { $_ -match '\\binaries\\session-manager-plugin-[^\\]+\.exe$' }).Count) {
+        Write-Host "FAIL $sidecarName - no signature was logged for it"
+        $failed += "NSIS > $sidecarName (not logged)"
     }
     $tmp = $env:TRIPLE_C_SIGN_TMP
     $uninstaller = @()

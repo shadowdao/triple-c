@@ -317,8 +317,8 @@ if [ "$pw_removed" = true ]; then
 fi
 [ -x "$out/usr/bin/triple-c" ] || fail "no executable usr/bin/triple-c."
 
-# The bundled AWS Session Manager plugin (bundle.externalBin, fetched by
-# fetch-ssm-plugin.sh) is what AWS workspaces connect through. Tauri copies it
+# The bundled AWS Session Manager plugin (bundle.externalBin, built from
+# source by build-ssm-plugin.sh) is what AWS workspaces connect through. Tauri copies it
 # beside the app binary with the target triple stripped, which is where
 # `host::ssm::find_plugin` looks. It must be the real plugin: an ELF, not the
 # placeholder a debug build writes (build.rs refuses that for release, and this

@@ -28,6 +28,6 @@ screenshot_for_fix/
 *.tfstate.*
 .terraform.tfstate.lock.info
 
-# The bundled AWS session-manager-plugin sidecar (scripts/fetch-ssm-plugin.*) and the
+# The bundled AWS session-manager-plugin sidecar (scripts/build-ssm-plugin.*, built from source) and the
 # debug-build placeholder build.rs writes there. Never committed.
 app/src-tauri/binaries/

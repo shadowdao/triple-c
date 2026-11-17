@@ -336,7 +336,7 @@ jobs:
       # `--locked`: test against the committed Cargo.lock, never a re-resolved
       # one, for the same reason the frontend uses `npm ci`. No plugin fetch
       # here: a debug build gets a placeholder for the session-manager-plugin
-      # sidecar from build.rs, so tests never depend on AWS's S3.
+      # sidecar from build.rs, so tests never build Go or download anything.
       - name: Backend tests (cargo test)
         working-directory: ./app/src-tauri
         run: |
@@ -418,9 +418,6 @@ jobs:
             curl \
             wget \
             file \
-            gnupg \
-            gpgv \
-            unzip \
             xdg-utils
 
       - name: Install Rust stable
@@ -474,11 +471,12 @@ jobs:
           npx tauri --version || npm install @tauri-apps/cli
 
       # The AWS Session Manager plugin, bundled as a sidecar (bundle.externalBin)
-      # so AWS workspaces work without the user installing it. Pinned version,
-      # SHA-256 and AWS's GPG signature checked; fails the job on any mismatch.
-      # A release build refuses to start without it (build.rs).
-      - name: Fetch the AWS Session Manager plugin
-        run: bash scripts/fetch-ssm-plugin.sh x86_64-unknown-linux-gnu
+      # so AWS workspaces work without the user installing it. Built here from
+      # AWS's Apache-2.0 source (pinned commit + archive SHA-256) with a pinned,
+      # hash-checked Go; the output must match a pinned SHA-256 (reproducible
+      # build). A release build refuses to start without it (build.rs).
+      - name: Build the AWS Session Manager plugin
+        run: bash scripts/build-ssm-plugin.sh x86_64-unknown-linux-gnu
 
       - name: Build Tauri app
         working-directory: ./app
@@ -609,14 +607,14 @@ jobs:
           export PATH="$HOME/.cargo/bin:$PATH"
           npx tauri --version || npm install @tauri-apps/cli
 
-      # The AWS Session Manager plugin sidecar (bundle.externalBin): both thin
-      # slices (tauri-build checks each arch it compiles) and the lipo'd
-      # universal one the bundler copies into Contents/MacOS. Pinned version and
-      # SHA-256s; fails the job on any mismatch. Not re-signed here: the app is
-      # not code-signed on macOS, so the plugin keeps AWS's Developer ID
-      # signature (with APPLE_* signing configured, Tauri would sign it too).
-      - name: Fetch the AWS Session Manager plugin
-        run: bash scripts/fetch-ssm-plugin.sh universal-apple-darwin
+      # The AWS Session Manager plugin sidecar (bundle.externalBin), built from
+      # source (see build-ssm-plugin.sh): both thin slices (tauri-build checks
+      # each arch it compiles) and the lipo'd universal one the bundler copies
+      # into Contents/MacOS. Each must match its pinned SHA-256. Signed exactly
+      # like the app: Go ad-hoc signs the arm64 slice, and with APPLE_* signing
+      # configured Tauri would sign the sidecar with the app's identity.
+      - name: Build the AWS Session Manager plugin
+        run: bash scripts/build-ssm-plugin.sh universal-apple-darwin
 
       - name: Build Tauri app (universal)
         working-directory: ./app
@@ -750,12 +748,12 @@ jobs:
           set "PATH=%USERPROFILE%\.cargo\bin;C:\Program Files\nodejs;%PATH%"
           npm run build
 
-      # The AWS Session Manager plugin sidecar (bundle.externalBin). Pinned
-      # version and SHA-256s, and AWS's Authenticode signature required; fails
-      # the job on any mismatch. It ships under AWS's signature, not ours (see
-      # the script and windows-sign.ps1).
-      - name: Fetch the AWS Session Manager plugin
-        run: powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts\fetch-ssm-plugin.ps1
+      # The AWS Session Manager plugin sidecar (bundle.externalBin), built from
+      # source (see build-ssm-plugin.ps1); must match its pinned SHA-256. It
+      # comes out unsigned, so it ships unsigned in previews, like the
+      # app (releases sign it: see build-app.yml).
+      - name: Build the AWS Session Manager plugin
+        run: powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts\build-ssm-plugin.ps1
 
       - name: Build Tauri app
         working-directory: ./app

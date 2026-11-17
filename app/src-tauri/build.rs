@@ -212,13 +212,13 @@ fn check_tauri_config() {
 
 /// `bundle.externalBin` names `binaries/session-manager-plugin`, and tauri-build stops on a
 /// missing `binaries/session-manager-plugin-<target-triple>[.exe]` for every build, tests
-/// included. The real one comes from `scripts/fetch-ssm-plugin.sh` (`.ps1` on Windows), which
-/// CI runs before `tauri build`.
+/// included. The real one is built from AWS's source by `scripts/build-ssm-plugin.sh` (`.ps1` on
+/// Windows), which CI runs before `tauri build`.
 ///
 /// - **Release profile:** the real plugin is required. A missing file or a placeholder stops
 ///   the build here, so a placeholder can never ship.
 /// - **Debug profile** (`cargo test`, `cargo check`, `tauri dev`): a missing file is replaced
-///   by a placeholder (`src/sidecar_placeholder.rs`) so no test run needs AWS's S3. The app's
+///   by a placeholder (`src/sidecar_placeholder.rs`) so no test run needs Go or the network. The app's
 ///   `find_plugin` skips a placeholder and falls back to an installed plugin.
 fn ensure_ssm_sidecar() {
     let target = std::env::var("TARGET").expect("cargo sets TARGET");
@@ -227,10 +227,10 @@ fn ensure_ssm_sidecar() {
     println!("cargo:rerun-if-changed={}", path.display());
     let release = std::env::var("PROFILE").as_deref() == Ok("release");
     let head = std::fs::read(&path).ok().map(|b| sidecar_placeholder::is_placeholder(&b));
-    let fetch = if target.contains("windows") {
-        "scripts\\fetch-ssm-plugin.ps1"
+    let build = if target.contains("windows") {
+        "scripts\\build-ssm-plugin.ps1"
     } else {
-        "scripts/fetch-ssm-plugin.sh"
+        "scripts/build-ssm-plugin.sh"
     };
     match (head, release) {
         (Some(false), _) => {}
@@ -241,7 +241,7 @@ fn ensure_ssm_sidecar() {
                 path.display(),
                 if state.is_some() { "a debug-build placeholder" } else { "missing" }
             )],
-            &format!("Run {fetch} {target} from the repository root first."),
+            &format!("Run {build} {target} from the repository root first."),
         ),
         (None, false) => {
             std::fs::create_dir_all("binaries").expect("create src-tauri/binaries");
@@ -249,7 +249,7 @@ fn ensure_ssm_sidecar() {
                 .unwrap_or_else(|e| panic!("cannot write {}: {e}", path.display()));
             println!(
                 "cargo:warning=no {} - wrote a placeholder (debug only; AWS workspaces use an \
-                 installed plugin). Run {fetch} to bundle the real one.",
+                 installed plugin). Run {build} to build the real one.",
                 path.display()
             );
         }
