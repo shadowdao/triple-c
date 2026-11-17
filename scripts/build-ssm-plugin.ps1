@@ -52,7 +52,10 @@ if ((Test-Path -LiteralPath $dest) -and ((Get-Sha256 $dest) -eq $BinarySha)) {
     exit 0
 }
 
-$work = Join-Path ([IO.Path]::GetTempPath()) ('ssm-plugin-' + [guid]::NewGuid().ToString('N'))
+# A short work root, not %TEMP% (on the runner that is deep under
+# systemprofile): the longest extracted path is ~200 characters, and MAX_PATH
+# is 260 for Windows PowerShell 5.1, tar.exe and the Go build alike.
+$work = Join-Path "$env:SystemDrive\" ('ssm-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
 New-Item -ItemType Directory -Path $work | Out-Null
 $ProgressPreference = 'SilentlyContinue'
 try {
@@ -71,7 +74,10 @@ try {
     if ($actual -ne $SourceSha) { throw "SHA-256 mismatch for the plugin source: got $actual, pinned $SourceSha" }
     $srcDir = Join-Path $work 'src'
     New-Item -ItemType Directory -Path $srcDir | Out-Null
-    & tar.exe -xzf $srcTgz -C $srcDir
+    # Only what the build reads, as build-ssm-plugin.sh does: the vendored SDK's
+    # Java codegen/ tree reaches 258 characters inside the archive, past
+    # MAX_PATH, and its snapshot/ files are test data.
+    & tar.exe --exclude='*/codegen/*' --exclude='*/snapshot/*' -xzf $srcTgz -C $srcDir
     if ($LASTEXITCODE -ne 0) { throw "tar.exe could not extract the source ($LASTEXITCODE)" }
     $goSpace = Join-Path $srcDir "session-manager-plugin-$PluginCommit"
     if (-not (Test-Path -LiteralPath (Join-Path $goSpace 'src\sessionmanagerplugin-main'))) {
@@ -120,5 +126,9 @@ try {
     Move-Item -LiteralPath $out -Destination $dest -Force
     Write-Host "session-manager-plugin-$Triple.exe: session-manager-plugin $PluginVersion (unsigned; signed by the release build)"
 } finally {
-    Remove-Item -Recurse -Force -LiteralPath $work -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+    # PS 5.1's Remove-Item can give up on read-only files and deep trees;
+    # rd /s /q is the fallback.
+    if (Test-Path -LiteralPath $work) { cmd /c rd /s /q "`"$work`"" | Out-Null }
+    if (Test-Path -LiteralPath $work) { Write-Warning "could not remove $work" }
 }

@@ -32,7 +32,12 @@
 # Trust and reproducibility - the build fails on any miss:
 #   1. The source is AWS's tag 1.2.896.0, pinned by COMMIT, downloaded as
 #      GitHub's archive of that commit and checked against a pinned SHA-256
-#      and the commit id git embeds in the archive, BEFORE extraction.
+#      BEFORE extraction (the SHA-256 is the check; the archive's top
+#      directory, which names the commit, must also be there). Only what the
+#      build reads is extracted: the vendored SDK's Java `codegen/` tree and its
+#      test `snapshot/` files are skipped, which also keeps every path under
+#      Windows' MAX_PATH (the .ps1 extracts the same way, so both build the
+#      same tree).
 #   2. The Go toolchain is a pinned release from go.dev, checked against the
 #      SHA-256 go.dev publishes (https://go.dev/dl/?mode=json), before use.
 #   3. The build is AWS's own (its makefile: GOPATH mode over the vendored
@@ -133,7 +138,7 @@ prepare() {
   [ "$(sha256 "$src_tgz")" = "$SOURCE_SHA256" ] \
     || die "SHA-256 mismatch for the plugin source: got $(sha256 "$src_tgz"), pinned $SOURCE_SHA256"
   mkdir -p "$work/src"
-  tar -xzf "$src_tgz" -C "$work/src"
+  tar --exclude='*/codegen/*' --exclude='*/snapshot/*' -xzf "$src_tgz" -C "$work/src"
   GO_SPACE="$work/src/session-manager-plugin-${PLUGIN_COMMIT}"
   [ -d "$GO_SPACE/src/sessionmanagerplugin-main" ] || die "the source archive is not the pinned commit's tree"
 

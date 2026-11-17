@@ -1241,7 +1241,10 @@ unit-tested (`host/ssm/tests.rs`, `plugin_resolution`).
   as "AWS Content" under the AWS Customer Agreement; the source (github.com/aws/session-manager-plugin)
   is Apache-2.0. `scripts/build-ssm-plugin.sh <triple>…` (Linux/macOS; any triple, it
   cross-compiles) and `scripts/build-ssm-plugin.ps1` (the Windows runner, which has no bash) take
-  the tag's **commit** as GitHub's archive (pinned SHA-256, checked before extraction) and a
+  the tag's **commit** as GitHub's archive (pinned SHA-256, checked before extraction; the
+  vendored SDK's Java `codegen/` and test `snapshot/` trees are not extracted — they reach 258
+  characters, past Windows' MAX_PATH, so the `.ps1` also works under a short `C:\ssm-<8hex>` root)
+  and a
   **pinned Go** from go.dev (go.dev's published SHA-256), and run the repo's own build — GOPATH
   mode over its vendored deps, `-ldflags "-s -w"`, `sessionmanagerplugin-main` — with `VERSION`
   stamped to the tag (the repo's file says `1.3.0.0`; AWS's pipeline stamps the real one, so
@@ -1266,15 +1269,21 @@ unit-tested (`host/ssm/tests.rs`, `plugin_resolution`).
   `PROFILE=debug`, so `cargo test`/`cargo check`/`tauri dev` and CI's `test` job need neither Go
   nor the network, and `find_plugin()` skips it (falling back to an installed plugin). With
   `PROFILE=release` a missing file **or** a placeholder stops the build, so a local `cargo build
-  --release` needs the build script first. `finalize-appimage.sh` asserts the shipped
+  --release` needs the build script first. **build.rs rejects only a missing file or the
+  placeholder, not a stale or wrong binary**: re-run `scripts/build-ssm-plugin.sh` before every
+  local release build (it is a no-op when the file already matches the pin, and rebuilds it
+  otherwise — e.g. after a pin bump, or after a Windows release build signed it in place). `finalize-appimage.sh` asserts the shipped
   `usr/bin/session-manager-plugin` is an ELF that runs `--version`.
 - **Windows: our build is unsigned, so the release signs it with our certificate.** Tauri runs
   `signtool verify /pa` on each sidecar and hands the unsigned one to the sign command, in place
   under `app\src-tauri\binaries` before any bundle (both MSI and NSIS pack that file);
   `windows-sign.ps1`'s allowlist includes it (one more metered signature per release: 6).
   `windows-verify-signatures.ps1` requires exactly one `session-manager-plugin.exe` in the MSI and
-  the file NSIS packed to be validly signed, timestamped, **by the same certificate as the
-  installer**, and the signing log to show it. Previews ship it unsigned, like the app.
+  the file NSIS packed to be validly signed, timestamped, **by the same signing identity
+  (subject + issuer) as the installer** — not the thumbprint: Artifact Signing certificates are
+  short-lived and rotate — and the signing log to show it. The MSI must also carry
+  `THIRD_PARTY_NOTICES`; on macOS a workflow step checks the `.app` holds the two-slice plugin in
+  `Contents/MacOS` and the notices in `Contents/Resources`. Previews ship it unsigned, like the app.
 - **macOS: signed exactly like the app.** The app is not code-signed (no `APPLE_*`/`signingIdentity`
   in the workflows); Go's linker ad-hoc signs the arm64 slice (needed to run on Apple Silicon). If
   signing is ever configured, Tauri signs externalBin with the app's identity, inside-out.

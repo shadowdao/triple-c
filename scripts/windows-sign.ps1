@@ -51,7 +51,7 @@ try {
     # build from AWS's source (scripts/build-ssm-plugin.ps1) and so ship unsigned
     # unless signed here. Tauri presents a sidecar to the sign command, in place
     # under app\src-tauri\binaries, only when `signtool verify /pa` rejects it.
-    $ships = ($full -match '\\binaries\\session-manager-plugin-[^\\]+\.exe$') -or
+    $ships = ($full -match '\\src-tauri\\binaries\\session-manager-plugin-x86_64-pc-windows-msvc\.exe$') -or
              ($full -match '\\target\\release\\[^\\]+\.exe$') -or
              ($full -match '\\target\\release\\bundle\\(msi|nsis)\\[^\\]+\.(msi|exe)$') -or
              $full.StartsWith($env:TRIPLE_C_SIGN_TMP.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)

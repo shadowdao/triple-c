@@ -17,7 +17,7 @@
 #
 # The bundled session-manager-plugin (built from source, signed by us) is
 # checked too: present in the MSI, and in both installers validly signed,
-# timestamped, and by the same certificate as the installer itself.
+# timestamped, and by the same signing identity as the installer itself.
 
 param([Parameter(Mandatory = $true, ValueFromRemainingArguments = $true)][string[]]$Patterns)
 
@@ -53,16 +53,19 @@ function Test-Signature([IO.FileInfo]$File, [string]$Label) {
 
 # The session-manager-plugin sidecar is built from AWS's source
 # (build-ssm-plugin.ps1), so it is unsigned until windows-sign.ps1 signs it. It
-# must carry OUR signature: valid, timestamped, and from the same certificate
-# as the installer that ships it.
+# must carry OUR signature: valid, timestamped, and from the same signing
+# identity (subject and issuer) as the installer that ships it.
 $sidecarName = 'session-manager-plugin.exe'
 $sidecarSource = Join-Path (Split-Path -Parent $PSScriptRoot) 'app\src-tauri\binaries\session-manager-plugin-x86_64-pc-windows-msvc.exe'
 function Test-OurSigner([IO.FileInfo]$File, [string]$Label, [IO.FileInfo]$Installer) {
     if (-not (Test-Signature $File $Label)) { return $false }
     $ours = (Get-AuthenticodeSignature -FilePath $Installer.FullName).SignerCertificate
     $theirs = (Get-AuthenticodeSignature -FilePath $File.FullName).SignerCertificate
-    if ($ours -and $theirs -and $ours.Thumbprint -eq $theirs.Thumbprint) { return $true }
-    Write-Host "FAIL $Label - signed by '$($theirs.Subject)', not the certificate that signed $($Installer.Name)"
+    # Subject + Issuer, not the thumbprint: Azure Artifact Signing issues a
+    # fresh short-lived certificate (daily), so the plugin and the installer
+    # can legitimately carry different thumbprints within one build.
+    if ($ours -and $theirs -and $ours.Subject -eq $theirs.Subject -and $ours.Issuer -eq $theirs.Issuer) { return $true }
+    Write-Host "FAIL $Label - signed by '$($theirs.Subject)' (issuer '$($theirs.Issuer)'), not the identity that signed $($Installer.Name)"
     return $false
 }
 
@@ -92,6 +95,11 @@ foreach ($file in $files) {
         }
         foreach ($f in $inner) {
             if (-not (Test-Signature $f "$($file.Name) > $($f.Name)")) { $failed += "$($file.Name) > $($f.Name)" }
+        }
+        # Its licence notices travel with it (bundle.resources).
+        if ($proc.ExitCode -eq 0 -and -not @(Get-ChildItem -Path $extract -Recurse -File -Filter 'THIRD_PARTY_NOTICES').Count) {
+            Write-Host "FAIL $($file.Name) - carries no THIRD_PARTY_NOTICES"
+            $failed += "$($file.Name) > THIRD_PARTY_NOTICES (missing)"
         }
         # The bundled plugin must be in there, under our signature.
         if ($proc.ExitCode -eq 0) {
@@ -129,7 +137,7 @@ if ($nsisBuilt) {
         $failed += "NSIS > $sidecarName (missing)"
     } elseif (-not (Test-OurSigner (Get-Item -LiteralPath $sidecarSource) "NSIS > $sidecarName (as packed)" $nsisInstaller)) {
         $failed += "NSIS > $sidecarName (signer)"
-    } elseif (-not @($log | Where-Object { $_ -match '\\binaries\\session-manager-plugin-[^\\]+\.exe$' }).Count) {
+    } elseif (-not @($log | Where-Object { $_ -match '\\src-tauri\\binaries\\session-manager-plugin-x86_64-pc-windows-msvc\.exe$' }).Count) {
         Write-Host "FAIL $sidecarName - no signature was logged for it"
         $failed += "NSIS > $sidecarName (not logged)"
     }
