@@ -37,6 +37,36 @@ The same value goes into the user's onboarding (`ec2_user_tag`), which names the
 A user without the tag can't run anything on a per-user EC2 cluster (Fargate is unaffected), and
 a user whose tag differs from their onboarding's can't run on the cluster it created.
 
+**Setting up EC2 capacity (admin, once per user).** Phase 7 is opt-in per onboarding. In order:
+
+1. Re-apply the **boundary** (version 2; see "One-time setup: the boundary policy"). Without it
+   the instance role's ECS agent calls are denied and no instance registers.
+2. Attach all four admin files to whoever onboards (`environment-admin-compute.json` and
+   `-scaling.json` are the phase 7 ones; measured sizes under "Attaching the tier policies").
+3. Give the user the `triple-c-user` principal tag (above). Before an admin-bundle apply, check
+   that **no cluster or Auto Scaling group named `triple-c-<env>--u-<tag>` exists**: the app's own
+   pre-apply check refuses a name that belongs to another onboarding (by the resources'
+   `triple-c:owner` tag, with the user record as fallback). A bundle run by hand has no such check
+   in the module (it would take over a cluster of that name), so the bundle's `README.txt` has an
+   "EC2 capacity" step with the three commands; run them right before `tofu apply`.
+4. Onboard with `ec2_instance_type` (supported types below), `ec2_max_instances` (1 to 4) and
+   `ec2_user_tag` (the same value as the tag). Idle capacity scales to zero (min 0), so the
+   first start after about 17 minutes of idleness takes 3.5 to 4 minutes.
+
+**Caveats of `triple-c-user`.** It is the isolation boundary between EC2 users, so treat it as one.
+
+- **Session tags override role tags.** If a role's trust policy lets the caller pass session tags
+  (`sts:TagSession`), the caller can set `triple-c-user` to another user's value and run tasks on
+  that user's cluster. Trust policies of roles that carry the tag must not allow `sts:TagSession`
+  (or must restrict it with `aws:TagKeys` so `triple-c-user` can't be passed).
+- **The identity-source attribute must not be user-editable.** For IAM Identity Center the
+  attribute behind `triple-c-user` must be one only an admin can change (not a self-service
+  profile field); otherwise a user can claim another's value. Likewise no workspace user may be
+  able to `iam:TagUser`/`iam:TagRole` the tagged principal.
+- **A role shared by several people is one EC2 identity.** The tag belongs to the role, so
+  everyone who assumes it has the same cluster and can use each other's instance (and, with
+  Docker access, its root). Give each person their own tagged role or permission set.
+
 Every per-user resource is tagged `triple-c:owner = ${aws:userid}`. That value is the `UserId`
 printed by `aws sts get-caller-identity`. The policy uses this tag so that a user can only do the
 following:
@@ -374,7 +404,7 @@ it is unpacked), and an admin can run the very same files by hand from a bundle.
 |---|---|---|
 | `terraform/permissions-boundary` | the account's `triple-c-permissions-boundary` policy (an account administrator applies it; the admin tier cannot) | `boundary/terraform.tfstate` |
 | `terraform/environment` | what every user shares: ECS cluster (Fargate, Fargate Spot), the tasks security group (no inbound rules), KMS key and alias, log group `/triple-c/<env>`, the network (`network_mode`: `public`, `private-nat`, `existing`) and, last, the record `/triple-c/environments/<env>` (which carries the advisory `max_workspace_hours` lifetime cap, 0 = none, at most 168) | `environments/<env>/terraform.tfstate` |
-| `terraform/user-onboard` | one user's task and execution roles (with the boundary) and their own EFS file system, its `-efs` security group, two mount targets and a file-system policy that admits only their task role | `users/<env>/<owner key>/terraform.tfstate` |
+| `terraform/user-onboard` | one user's task and execution roles (with the boundary) and their own EFS file system, its `-efs` security group, two mount targets and a file-system policy that admits only their task role. With `ec2_instance_type` set (phase 7) also their own EC2 capacity: cluster `triple-c-<env>--u-<user tag>`, one capacity provider, an Auto Scaling group (min 0), a launch template, the instance role and profile, and the record `/triple-c/users/<env>/<owner key>` | `users/<env>/<owner key>/terraform.tfstate` |
 
 **Workspace lifetime cap (advisory).** `max_workspace_hours` (module variable, 0 to 168, default 0 =
 no cap) is stored in the environment record and passed to every workspace as
@@ -499,13 +529,12 @@ module creates the same policy, applied by an account administrator; the admin t
 Create each file as a **customer managed policy** and attach it. In the console, go to
 **IAM → Policies → Create policy → JSON**, paste the file, and attach the policy to a user, group
 or role. Inline policies do not fit: a role's inline policies share 10,240 characters and an
-environment admin needs every tier file (about 23,300), and a user's share 2,048. A managed policy
+environment admin needs every tier file (23,304 characters in all), and a user's share 2,048. A managed policy
 may hold 6,144 characters, not counting whitespace. Measured 2026-11-16 without whitespace, `workspace-user.json` is
 6,036 (108 characters of headroom), `workspace-user-tasks.json` 1,827 (including `ReadFargatePrices` and the EC2 cluster Denies),
 `environment-admin.json` 5,805 (339), `environment-admin-network.json` 3,340,
-`environment-admin-compute.json` 3,326, `environment-admin-scaling.json` 3,006 and
-`permissions-boundary.json` 2,661 (`workspace-user-tasks.json` is 1,827 with the per-user cluster
-Denies); a unit test (`every_policy_fits_a_managed_policy`)
+`environment-admin-compute.json` 3,326, `environment-admin-scaling.json` 2,970 and
+`permissions-boundary.json` 2,661; a unit test (`every_policy_fits_a_managed_policy`)
 fails before any file outgrows the limit. A tier that outgrows its files gains another file, which
 the app then lists with the others. For IAM Identity Center, add the files as inline policies on the permission set
 (the "up to 32,768 characters" limit is unverified) or reference the managed policies.
@@ -556,8 +585,10 @@ aws iam attach-user-policy --user-name <user> \
 
 **Phase 7 (per-user EC2 capacity): the live run's answers (Task 7, 2026-11-16)**
 
-The unit tests' evaluator is not IAM. What the live run (see "Phase 7: ECS on EC2" below) settled,
-and what is still open:
+The unit tests' evaluator is not IAM. What the live run (see "Phase 7: ECS on EC2" below) settled.
+Still open for phase 7: an Identity Center attribute as the `triple-c-user` source and a user
+without the tag (only a role tag was used live), and creating the Auto Scaling and ECS
+service-linked roles as the admin (the test account had both). Everything else below is ✓:
 
 - ✓ **Creating an Auto Scaling group checks the caller's launch permissions.** The onboarding's
   group create as the environment admin (only the four admin files) passed with no denial. A group

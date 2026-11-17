@@ -492,13 +492,14 @@ fails because of a quota, the app says so and doesn't retry.
 |---|---|---|
 | Start time | About 30–90 s (image pull every time; SOCI lazy-loading **to evaluate**) | Fast when the image is cached on a warm instance |
 | Docker access / privileged / VPN | No | Yes, on dedicated capacity |
-| GPU | No | Yes |
-| Ops | None | ASG + capacity provider, defined in the environment module. The app only picks a capacity provider |
-| Cost when idle | 0 (task stopped) | Instances keep running unless the ASG scales in |
+| GPU | No | Not in phase 7 (no GPU, accelerator or metal types) |
+| Ops | None | A per-user cluster, capacity provider, ASG and launch template, created by the user's onboarding module (phase 7). The app only picks the launch type |
+| Cost when idle | 0 (task stopped) | The ASG has min 0 and managed scaling removes the instance about 17 minutes after the last task stops; a start after that is cold (3.5-4 min) |
 | Max size | 16 vCPU / 120 GB | Instance type |
 
-ECS on EC2 uses `awsvpc` network mode too, so security groups and the no-inbound rule work the same
-way.
+ECS on EC2 uses `bridge` network mode (phase 7, R2), not `awsvpc`: the instance is the user's alone,
+so per-task ENIs buy nothing. The task egresses through the instance (the environment's tasks
+security group, which has no inbound rules, is on the instance), and the no-inbound rule holds.
 
 ### Lifecycle and status
 
@@ -556,11 +557,11 @@ way.
 | Speech-to-text | Yes (local STT, audio over the agent) | Yes | Yes |
 | Scheduler, Mission Control | Yes, and they keep running with the app closed | Yes | Yes |
 | Marketplace installs | Yes (files copied through the agent) | Yes | Yes |
-| LLM gateway (LiteLLM) | Sidecar container in the task definition | Sidecar | Sidecar |
+| LLM gateway (LiteLLM) | Sidecar container in the task definition | Sidecar | **No** (refused: bridge containers share no loopback) |
 | Ollama / llama.cpp on the user's machine | **No**, unless the URL is reachable from AWS | No | No |
-| Claude Code sandbox (bubblewrap) | Off (bubblewrap fails on Fargate, P9) | Weaker nested mode | Full |
-| Docker access | No | No | Yes |
-| VPN support | No | No | Yes |
+| Claude Code sandbox (bubblewrap) | Off (bubblewrap fails on Fargate, P9) | Weaker nested mode | **Off** (bubblewrap fails under Docker's seccomp profile on EC2 too, measured) |
+| Docker access | No | No | Yes (the instance's own socket; root on the user's instance) |
+| VPN support | No | No | Yes (`NET_ADMIN`, `/dev/net/tun`, `src_valid_mark`; WireGuard device created live) |
 | Snapshots | Setup script instead | Setup script | Setup script |
 
 ## Fit with existing conventions (CLAUDE.md)
@@ -611,7 +612,10 @@ pub host_id: Option<String>,               // None = Local (all existing project
 pub aws_placement: Option<AwsPlacement>,   // { region, environment } — set when host_id is an AWS connection
 pub aws: Option<AwsWorkspaceConfig>,
 
+pub enum LaunchType { Fargate /* default */, Ec2 }   // serde snake_case; absent in old JSON = Fargate
+
 pub struct AwsWorkspaceConfig {
+    pub launch_type: LaunchType,           // Ec2 = the user's own instance (see user record below)
     pub cpu: u32, pub memory_mib: u32, pub arch: Arch,   // X86_64 | Arm64 (Fargate's valid pairs)
     pub storage: StorageMode,              // Ephemeral | Hybrid (default) | Efs (Hybrid + /workspace on EFS)
     pub ephemeral_gib: u32,                // 21-200
@@ -628,7 +632,12 @@ pub struct AwsWorkspaceConfig {
     pub workspace_access_point_id: Option<String>, // the EFS-mode /workspace access point
 }
 // EnvironmentInfo (the SSM record, parsed): max_workspace_hours: u32 (0 = no cap).
-// Not built: launch_type (Fargate only; EC2 is phase 7).
+// UserCompute (the user's EC2 record, SSM `/triple-c/users/<env>/<owner_key>`, written by their
+// onboarding module only while it has EC2 capacity; workspace users can read it): schema,
+// instance_type, cluster_arn (`triple-c-<env>--u-<tag>`), capacity_provider (same name),
+// user_tag, max_instances. Absent = no EC2 capacity. On EC2, cpu/memory are reservations that
+// must fit the instance type (10% memory margin; ECS registers less than nominal); no ephemeral
+// size, no spot, no gateway sidecar. Switching the launch type back to Fargate clears Docker/VPN (R1).
 ```
 
 Existing `projects.json` files deserialize unchanged (`host_id` missing → Local).
@@ -678,6 +687,99 @@ Execution rulings:
 - **R7** Switching to copy-at-connect recreates the project secret (force delete, then create), because a new secret version would keep the old credentials as AWSPREVIOUS. Cost: a short delay on the first start after the switch.
 - **R8** The sidecar's master key is random per start, so the local Docker gateway's keychain key never goes to AWS.
 
+### Phase 7: rulings (2026-11-16)
+
+**Done 2026-11-16.** Verified live (`aws/README.md` "Phase 7: ECS on EC2"): cold start about
+3.5-4 minutes including the instance launch, a warm start 20-30 s, scale to zero about 17 minutes
+after the last task stops, Docker access and VPN work, IMDS is blocked for the container, another
+user's cluster is refused (RunTask denied), and the sandbox stays off on EC2 too.
+
+User decisions:
+
+- **Idle capacity scales to zero.** The group has min 0 and managed scaling removes the instance
+  when no task needs it; the next start waits for an instance (boot, ECS registration, image pull).
+- **The instance type is chosen at onboarding** (`ec2_instance_type`, default `m7i.large` for x86 or
+  `m7g.large` for ARM, from a built-in table of supported families); a project only chooses
+  Fargate or EC2. Compute is opt-in per onboarding (`ec2_instance_type` empty = none).
+- **No GPU** (and no accelerator or metal types).
+- **Isolation by the `triple-c-user` principal tag.** An admin gives each EC2 user a tag value
+  (an Identity Center attribute for access control, or a tag on the IAM user or role); the user's
+  cluster is named after it, and the workspace policy denies `RunTask`/`StartTask` on every
+  per-user cluster except `cluster/triple-c-*--u-${aws:PrincipalTag/triple-c-user}`, and on all of
+  them when the tag is missing. Users without the tag can't use EC2. This amended E1.
+
+Plan decisions, as built (E1-E11):
+
+- **E1** A **per-user cluster**, not a capacity provider on the environment cluster:
+  `PutClusterCapacityProviders` replaces a cluster's whole list, so two modules writing the shared
+  cluster would undo each other. The cluster is `triple-c-<env>--u-<tag>` (environment names and
+  tags never hold `--`, so the pattern matches exactly the per-user clusters) with exactly one
+  capacity provider; the Auto Scaling group and launch template share the name.
+- **E2** Opt-in per onboarding: `ec2_instance_type`, `ec2_max_instances` (1-4), `ec2_user_tag`.
+  `ONBOARD_MODULE_VERSION` 1 -> 2; existing users keep working on Fargate.
+- **E3** The ECS-optimized AL2023 AMI (public SSM parameter, by architecture), IMDSv2 required,
+  **hop limit 1 and bridge networking (R2) instead of awsvpc**, gp3 50 GiB encrypted root, the
+  environment's subnets and tasks security group, no ENI trunking.
+- **E4** The instance role `triple-c-<env>-<owner_key>-instance` (named by owner key: role names
+  are account-global) carries only the ECS agent's calls, which the **boundary scopes to the
+  cluster named by the role's `triple-c:cluster` tag** (`aws:PrincipalTag/triple-c:cluster`; the tag
+  must match `triple-c-*--u-*`, never the shared cluster). **The SSM core is dropped**: nobody gets
+  host sessions, and ECS Exec uses the task role. The boundary changed (version 2); an account
+  administrator re-applies it once.
+- **E5** The admin tier grows to **four files**: `environment-admin-compute.json` (capacity
+  providers, launch templates, `RunInstances` rules, the instance role's PassRole to EC2, the AMI
+  parameter) and `environment-admin-scaling.json` (Auto Scaling groups, instance profiles, the
+  service-linked roles). Every launch template and group is **pinned to a numeric template
+  version** and checked on create: `$Latest`/`$Default` would let a template edited after the check
+  carry any instance type or role (a PassRole bypass), so they are denied. A capacity provider over
+  someone else's group is refused (ECS checks `CreateOrUpdateTags` on the group).
+- **E6** Docker access on EC2 is the instance's own socket (host volume), the entrypoint's
+  docker-socket group step running in aws mode. That is root on the user's own instance, and the
+  UI says so.
+- **E7** VPN on EC2 is `NET_ADMIN`, the `/dev/net/tun` device and `src_valid_mark=1`, as locally.
+- **E8** **The sandbox is off on EC2 as on Fargate.** Bubblewrap fails ("No permissions to create
+  new namespace") because Docker's default seccomp profile refuses `unshare` without
+  `CAP_SYS_ADMIN`, although the kernel allows user namespaces; the toggle is locked off for every
+  AWS project.
+- **E9** EC2 CPU/memory are reservations that must fit the instance type (ECS registers less
+  memory than nominal, so a 10% margin), no ephemeral size, no Spot.
+- **E10** The cost estimate is the instance type's on-demand hourly price while it runs.
+- **E11** **The user record** `/triple-c/users/<env>/<owner_key>` (schema, instance_type,
+  cluster_arn, capacity_provider, user_tag, max_instances) is written by the onboarding module only
+  while it has EC2 capacity. Workspace users may read it (they can't read the state bucket), and it
+  lives outside `/triple-c/environments/` so environment detection doesn't list it.
+
+Execution rulings:
+
+- **R1** A Fargate AWS project can't keep Docker access or VPN: no grandfathering. Switching the
+  launch type to Fargate clears both flags (the user re-enables them after switching back).
+- **R2** EC2 tasks use **bridge** networking. The instance is single-tenant, so per-task ENIs buy
+  nothing, awsvpc tasks on EC2 get no public IP (no internet in public-mode environments without
+  a NAT), and bridge keeps IMDS out of reach through the hop limit. Cost: the ECS agent's
+  introspection port (`172.17.0.1:51678`: cluster, tasks, no credentials) is reachable from the
+  container; accepted, since the instance runs only its user's tasks.
+- **R3/R4** A pre-apply **collision check**: onboarding refuses a `triple-c-<env>--u-<tag>` cluster
+  or group that belongs to someone else, because the module would adopt it (R3). Ownership is the
+  resources' `triple-c:owner` tag, with the user record as fallback; only other-owned or
+  unowned names are refused, so an onboarding's own half-built cluster doesn't block its re-apply
+  (R4, amending R3). Admin bundles carry the same check as commands in their `README.txt`.
+- **The gateway sidecar is refused on EC2.** In bridge mode a task's containers don't share a
+  loopback, so the sidecar on 127.0.0.1:4000 wouldn't be reachable; a host port would expose it on
+  the instance's network. Saves and starts of an EC2 project with it are refused.
+- **The cold-start rerun.** ECS turns `enableExecuteCommand` **off** for a RunTask that has to
+  wait for an instance (measured in CloudTrail: true in the request, false in the answer, and the
+  task keeps it off), so the agent tunnel can't open. On a cold start the first task only brings
+  the instance up; once it is placed on an instance and desired RUNNING, the app stops it, waits
+  for STOPPED and runs the task again, requiring exec on (else it stops that task and fails with
+  `EXEC_OFF`). A live task found with exec off is stopped and replaced. Cost: about 30-60 s on a
+  cold start.
+- **Race rules for the rerun.** Both launches go through `find_or_run`, so a concurrent start's
+  live task is never doubled (`START_RACE`, with one RunTask only). A first task that stops by
+  itself ends the start with its stop reason, with no second RunTask. A task still waiting for an
+  instance with exec off is another start's (`INSTANCE_RACE`) while it is younger than the
+  instance wait plus 2 minutes; an older one is an orphan and is replaced. A first task stopped
+  with `REPLACED_REASON` says another start replaced it. A stop gets its own 3-minute wait.
+
 ## Shipped AWS artefacts
 
 ```
@@ -723,8 +825,13 @@ TLS only, tagged `triple-c:component=state`), one object per deployment (D9).
    "Phase 6: one workspace with every option"): EFS persistence, the setup script, port mapping,
    the sidecar, copy-at-connect and the cost estimate. Not exercised live: the lifetime cap firing
    (unit-tested), a v1 → v2 environment update, a private clone retried after connect.
-7. **ECS on EC2.** Per-user capacity providers in the onboarding module, privileged/Docker/VPN on
-   dedicated capacity.
+7. **ECS on EC2.** Per-user capacity (cluster, capacity provider, Auto Scaling group at min 0,
+   launch template) in the onboarding module, Docker and VPN on that dedicated capacity.
+   **Done 2026-11-16** (rulings: "Phase 7: rulings"). Verified live (`aws/README.md` "Phase 7:
+   ECS on EC2"): cold start about 3.5-4 min including the instance launch, warm 20-30 s, scale to
+   zero about 17 min after the last task, Docker and VPN work, IMDS blocked, cross-user RunTask
+   denied, sandbox off on EC2 too. Not exercised live: an Identity Center attribute as the
+   `triple-c-user` source, an untagged user, creating the service-linked roles.
 8. **Standard tenancy** (opt-in), only if demand appears.
 
 ## To verify before or during implementation
