@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ProjectPath, NewProjectHost, RemoveProjectOptions, WipChoice, UnsavedWork, WorkspaceStatus, ProjectRemovalReport, ProjectResetOutcome, ContainerInfo, AppSettings, SettingsImportPreview, SettingsImportOutcome, UpdateInfo, ImageUpdateInfo, FileEntry, FileContents, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, DockerStatus, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, BrowserPageState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo, UploadOutcome, Note, ViewerFile, ViewerPoll, ViewerSaved, ViewerState, FileDiff, InstallScope, ItemUpdate, Marketplace, MarketplaceAccount, MarketplaceItemRef, MarketplaceSnapshot, ProjectSyncResult, SyncReport, HostConnection, CallerIdentity, PermissionReport, PolicyFile, HourlyEstimate, AwsWorkspaceConfig, Tier, EnvironmentScan, NetworkChoice, ModuleKind, Ec2Choice, Ec2Compute, Ec2InstanceTable, Ec2Capacity, SavedBundle } from "./types";
+import type { Project, ProjectPath, NewProjectHost, RemoveProjectOptions, WipChoice, UnsavedWork, WorkspaceStatus, ProjectRemovalReport, ProjectResetOutcome, ContainerInfo, AppSettings, SettingsImportPreview, SettingsImportOutcome, UpdateInfo, ImageUpdateInfo, FileEntry, FileContents, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, DockerStatus, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, BrowserPageState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo, UploadOutcome, Note, ViewerFile, ViewerPoll, ViewerSaved, ViewerState, FileDiff, InstallScope, ItemUpdate, Marketplace, MarketplaceAccount, MarketplaceItemRef, MarketplaceSnapshot, ProjectSyncResult, SyncReport, HostConnection, CallerIdentity, PermissionReport, PolicyFile, HourlyEstimate, AwsWorkspaceConfig, Tier, EnvironmentScan, NetworkChoice, ModuleKind, Ec2Choice, Ec2Compute, Ec2InstanceTable, Ec2Capacity, SavedBundle, OpenedTerminal, WorkspaceTerminal, ReattachOutcome } from "./types";
 
 // Docker
 export const checkDocker = () => invoke<boolean>("check_docker");
@@ -235,13 +235,24 @@ export const openTerminalSession = (
   sessionName?: string,
   resumeSessionId?: string,
 ) =>
-  invoke<void>("open_terminal_session", { projectId, sessionId, sessionType, sessionName, resumeSessionId });
+  invoke<OpenedTerminal>("open_terminal_session", { projectId, sessionId, sessionType, sessionName, resumeSessionId });
 export const terminalInput = (sessionId: string, data: number[]) =>
   invoke<void>("terminal_input", { sessionId, data });
 export const terminalResize = (sessionId: string, cols: number, rows: number) =>
   invoke<void>("terminal_resize", { sessionId, cols, rows });
 export const closeTerminalSession = (sessionId: string) =>
   invoke<void>("close_terminal_session", { sessionId });
+/** AWS: the terminals running in the workspace (empty elsewhere). */
+export const listWorkspaceTerminals = (projectId: string) =>
+  invoke<WorkspaceTerminal[]>("list_workspace_terminals", { projectId });
+/** Attach a tab to a terminal still running in the workspace. `rows` (a
+ *  fresh xterm) replays its history first. Register the output listener
+ *  before calling. */
+export const reattachTerminalSession = (projectId: string, sessionId: string, rows: number | null) =>
+  invoke<ReattachOutcome>("reattach_terminal_session", { projectId, sessionId, rows });
+/** End a workspace terminal that has no tab here. */
+export const endWorkspaceTerminal = (projectId: string, sessionId: string) =>
+  invoke<void>("end_workspace_terminal", { projectId, sessionId });
 export const pasteImageToTerminal = (sessionId: string, imageData: number[]) =>
   invoke<string>("paste_image_to_terminal", { sessionId, imageData });
 export const uploadHostFileToTerminal = (sessionId: string, hostPath: string) =>

@@ -84,6 +84,14 @@ function discardInputQueue(sessionId: string): void {
   if (!q.draining) inputQueues.delete(sessionId);
 }
 
+/** Session ids whose `open_terminal_session` is in flight: a reconnect sync
+ *  listing the workspace meanwhile must not reopen them as a second tab. */
+const opening = new Set<string>();
+
+export function isOpening(sessionId: string): boolean {
+  return opening.has(sessionId);
+}
+
 export function useTerminal() {
   const { sessions, activeSessionId, addSession, removeSession, setActiveSession } =
     useAppState(
@@ -105,8 +113,30 @@ export function useTerminal() {
       resumeSessionId?: string,
     ) => {
       const sessionId = crypto.randomUUID();
-      await commands.openTerminalSession(projectId, sessionId, sessionType, sessionName, resumeSessionId);
-      addSession({ id: sessionId, projectId, projectName, sessionType, sessionName: sessionName ?? null });
+      opening.add(sessionId);
+      let opened;
+      try {
+        opened = await commands.openTerminalSession(projectId, sessionId, sessionType, sessionName, resumeSessionId);
+      } catch (e) {
+        opening.delete(sessionId);
+        throw e;
+      }
+      opening.delete(sessionId);
+      addSession({
+        id: sessionId,
+        projectId,
+        projectName,
+        sessionType,
+        sessionName: sessionName ?? null,
+        persistent: opened?.persistent ?? false,
+      });
+      if (opened?.notice) {
+        useAppState.getState().pushToast({
+          kind: "info",
+          message: opened.notice,
+          dedupeKey: `no-tmux-${projectId}`,
+        });
+      }
       return sessionId;
     },
     [addSession],
@@ -120,6 +150,9 @@ export function useTerminal() {
       const project = session ? projects.find((p) => p.id === session.projectId) : undefined;
 
       discardInputQueue(sessionId);
+      // A closed tab ends its session: the exit this causes must not read
+      // as a dropped connection to reattach.
+      useAppState.getState().updateSession(sessionId, { persistent: false, pendingReattach: false });
       await commands.closeTerminalSession(sessionId);
       removeSession(sessionId);
 

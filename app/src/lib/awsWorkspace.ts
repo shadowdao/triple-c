@@ -323,3 +323,11 @@ export const EC2_DOCKER_ACCESS_NOTE =
 export const EC2_VPN_HINT =
   "Grants NET_ADMIN, the /dev/net/tun device and src_valid_mark so a VPN client (PIA, WireGuard, OpenVPN) can build a tunnel inside the workspace, an ECS task on your own EC2 instance. Anything in the workspace can then reconfigure the task's own network stack; the instance's is untouched. Applies on the project's next start.";
 export const EC2_NO_CAPACITY = "Ask an admin to add EC2 capacity to your onboarding";
+
+/** Persistent terminals (`host/persistent.rs`): the cost of the user's goal
+ *  that a Claude session keeps working with the app closed. */
+export const PERSISTENT_TERMINALS_NOTE =
+  "Terminals keep running in the workspace when you close Triple-C. A Claude session left " +
+  "running keeps the workspace up (and billed) after you close the app — until it ends, you " +
+  "end it in Project Home → Sessions, you Stop, or the lifetime cap. Shells left open do not " +
+  "keep it up.";

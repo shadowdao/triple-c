@@ -1,9 +1,18 @@
 import { useCallback, useEffect, useState } from "react";
-import type { ClaudeSession, Project } from "../../../lib/types";
-import { listClaudeSessions } from "../../../lib/tauri-commands";
+import { useShallow } from "zustand/react/shallow";
+import type { ClaudeSession, Project, WorkspaceTerminal } from "../../../lib/types";
+import {
+  endWorkspaceTerminal,
+  listClaudeSessions,
+  listWorkspaceTerminals,
+} from "../../../lib/tauri-commands";
 import type { useProjectActions } from "../../../hooks/useProjectActions";
+import { useTerminal } from "../../../hooks/useTerminal";
+import { useAppState } from "../../../store/appState";
+import { isAwsProject } from "../../../lib/awsWorkspace";
+import { reattachTab, terminalLabel } from "../../../lib/persistentTerminals";
 import Button from "../../ui/Button";
-import { formatAge, formatBytes } from "./format";
+import { formatAge, formatBytes, formatElapsed } from "./format";
 
 interface Props {
   project: Project;
@@ -38,6 +47,7 @@ export default function SessionsTab({ project, actions }: Props) {
 
   return (
     <div className="p-4 max-w-4xl">
+      {isAwsProject(project) && running && <WorkspaceTerminals project={project} />}
       <div className="flex items-center justify-between mb-3">
         <p className="text-xs text-[var(--text-secondary)]">
           Conversations stored on this project&rsquo;s config volume. Resume opens a
@@ -86,5 +96,119 @@ export default function SessionsTab({ project, actions }: Props) {
         </ul>
       )}
     </div>
+  );
+}
+
+/**
+ * AWS: the terminals running in the workspace — the ones open here, the ones
+ * this app left detached, and any another machine or the web terminal
+ * opened. Reattach opens one in a tab; End stops it (and closes its tab).
+ */
+function WorkspaceTerminals({ project }: { project: Project }) {
+  const [terminals, setTerminals] = useState<WorkspaceTerminal[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [confirmEnd, setConfirmEnd] = useState<string | null>(null);
+  const openIds = useAppState(useShallow((s) => s.sessions.map((x) => x.id)));
+  const { close } = useTerminal();
+  const pushToast = useAppState((s) => s.pushToast);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    setError(null);
+    listWorkspaceTerminals(project.id)
+      .then(setTerminals)
+      .catch((e) => {
+        setTerminals([]);
+        setError(String(e));
+      })
+      .finally(() => setLoading(false));
+  }, [project.id]);
+
+  useEffect(load, [load]);
+
+  const isOpen = (id: string) => openIds.includes(id);
+
+  const reattach = (t: WorkspaceTerminal) => {
+    useAppState.getState().addSession(reattachTab(project.id, project.name, t));
+  };
+
+  const end = async (t: WorkspaceTerminal) => {
+    setConfirmEnd(null);
+    try {
+      if (isOpen(t.session_id)) await close(t.session_id);
+      else await endWorkspaceTerminal(project.id, t.session_id);
+    } catch (e) {
+      pushToast({ kind: "error", message: "Could not end that terminal", detail: String(e) });
+    }
+    load();
+  };
+
+  return (
+    <section className="mb-6" aria-labelledby="workspace-terminals-heading">
+      <div className="flex items-center justify-between mb-2">
+        <div>
+          <h3 id="workspace-terminals-heading" className="text-[13px] font-medium text-[var(--text-primary)]">
+            Terminals in the workspace
+          </h3>
+          <p className="text-xs text-[var(--text-secondary)]">
+            Terminals keep running in the workspace when Triple-C closes or loses its
+            connection. Closing a tab ends its terminal. A Claude session left running keeps
+            the workspace up until it ends, you end it here, you Stop, or the lifetime cap.
+          </p>
+        </div>
+        <Button onClick={load} disabled={loading}>
+          {loading ? "Refreshing…" : "Refresh"}
+        </Button>
+      </div>
+      {error ? (
+        <p className="text-[13px] text-[var(--text-secondary)]">{error}</p>
+      ) : terminals.length === 0 && !loading ? (
+        <p className="text-[13px] text-[var(--text-secondary)]">No terminals are running in the workspace.</p>
+      ) : (
+        <ul className="space-y-1" aria-label="Terminals in the workspace">
+          {terminals.map((t) => {
+            const open = isOpen(t.session_id);
+            const state = open ? "Open here" : t.attached ? "Attached elsewhere" : "Detached";
+            // The cost of a Claude that outlives the app: it keeps the
+            // workspace up (and billed) until it ends or is ended.
+            const keepsUp = !open && !t.attached && t.kind === "claude";
+            return (
+              <li
+                key={t.session_id}
+                className="flex items-center gap-3 px-3 py-2 bg-[var(--bg-secondary)] border border-[var(--border-color)] rounded-[var(--radius-control)]"
+              >
+                <div className="flex-1 min-w-0">
+                  <div className="text-[13px] text-[var(--text-primary)] truncate">{terminalLabel(t)}</div>
+                  <div className="text-xs text-[var(--text-secondary)] truncate">
+                    {t.kind === "claude" ? "Claude Code" : "Shell"} · {state} · started{" "}
+                    {formatElapsed(Date.now() - t.created_unix * 1000)}
+                    {t.known ? "" : " · opened elsewhere"}
+                  </div>
+                  {keepsUp && (
+                    <div className="text-xs text-[var(--warning)]">
+                      Keeps the workspace running while it runs — End it if you no longer need it.
+                    </div>
+                  )}
+                </div>
+                {!open && (
+                  <Button variant="primary" onClick={() => reattach(t)}>
+                    Reattach
+                  </Button>
+                )}
+                {confirmEnd === t.session_id ? (
+                  <>
+                    <Button variant="danger" onClick={() => void end(t)}>Confirm end</Button>
+                    <Button onClick={() => setConfirmEnd(null)}>Cancel</Button>
+                  </>
+                ) : (
+                  <Button onClick={() => setConfirmEnd(t.session_id)}>End</Button>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </section>
   );
 }

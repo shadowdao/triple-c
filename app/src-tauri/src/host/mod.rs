@@ -30,6 +30,7 @@
 pub mod agent;
 pub mod aws_host;
 pub mod lifecycle;
+pub mod persistent;
 pub mod port_forwards;
 pub mod sessions;
 pub mod ssm;

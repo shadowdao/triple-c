@@ -7,6 +7,7 @@ pub mod migration;
 pub mod note;
 pub mod project;
 pub mod settings_export;
+pub mod terminal;
 pub mod update_info;
 
 pub use app_settings::*;
@@ -17,4 +18,5 @@ pub use migration::*;
 pub use note::*;
 pub use project::*;
 pub use settings_export::*;
+pub use terminal::*;
 pub use update_info::*;

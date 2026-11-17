@@ -125,6 +125,8 @@ pub fn register(project_id: &str, tunnel: LiveTunnel) -> Option<LiveTunnel> {
         r.stopped.remove(tunnel.endpoint.base_url.as_str());
         r.stopped.remove(&unattached_id(project_id));
         r.pending.remove(project_id);
+        // A port reused by a new tunnel may reach another task's image.
+        super::persistent::forget_probe(tunnel.endpoint.base_url.as_str());
         r.live.insert(project_id.to_string(), tunnel)
     };
     notify();
@@ -197,6 +199,8 @@ pub fn register_if_current(
         r.stopped.remove(tunnel.endpoint.base_url.as_str());
         r.stopped.remove(&unattached_id(project_id));
         r.pending.remove(project_id);
+        // A port reused by a new tunnel may reach another task's image.
+        super::persistent::forget_probe(tunnel.endpoint.base_url.as_str());
         r.live.insert(project_id.to_string(), tunnel)
     };
     notify();

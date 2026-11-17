@@ -116,6 +116,8 @@ vi.mock("@xterm/addon-web-links", async (importOriginal) => {
  */
 
 const terminalInput = vi.fn(async () => {});
+/** `reattach_terminal_session`, for the persistent-terminal cases. */
+const reattachTerminalSession = vi.hoisted(() => vi.fn());
 
 vi.mock("../../lib/tauri-commands", () => ({
   terminalInput: (sessionId: string, bytes: number[]) =>
@@ -132,6 +134,7 @@ vi.mock("../../lib/tauri-commands", () => ({
   checkBrowserViewSupport: vi.fn(async () => containerEnv.detection),
   openUrlExternal: vi.fn(async () => {}),
   openFileViewer: vi.fn(async () => {}),
+  reattachTerminalSession: (...a: unknown[]) => reattachTerminalSession(...a),
 }));
 
 vi.mock("@tauri-apps/api/event", () => ({
@@ -2126,5 +2129,127 @@ describe("TerminalView — copying text out", () => {
     expect(writeText).toHaveBeenCalledTimes(1);
     expect(writeText.mock.calls[0][0]).toBe(term.getSelection());
     expect(writeText.mock.calls[0][0]).toContain("● The café’s");
+  });
+});
+
+describe("persistent AWS terminals", () => {
+  /** What the xterm shows, all rows of the active buffer. */
+  function screenText(): string {
+    const term = xterm.instances[0] as Terminal;
+    const b = term.buffer.active;
+    const rows: string[] = [];
+    for (let i = 0; i < b.length; i++) rows.push(b.getLine(i)?.translateToString(true) ?? "");
+    return rows.join("\n");
+  }
+
+  async function settle() {
+    await act(async () => {
+      for (let i = 0; i < 5; i++) await new Promise((r) => setTimeout(r, 0));
+    });
+  }
+
+  function mountPersistent(pendingReattach: boolean) {
+    useAppState.setState({
+      projects: [{ id: "p1", name: "api", status: "running", host_id: "h1" }] as never,
+      sessions: [
+        { id: "s1", projectId: "p1", projectName: "api", sessionType: "claude", sessionName: null, persistent: true, pendingReattach },
+      ],
+    });
+    return render(<TerminalView sessionId="s1" active />);
+  }
+
+  beforeEach(() => {
+    reattachTerminalSession.mockReset();
+  });
+
+  it("a reopened tab attaches only once its listeners are up, replaying history", async () => {
+    reattachTerminalSession.mockImplementation(async () => {
+      // The listener must already be there when the backend emits history.
+      expect(ptyOutput.listeners.has("terminal-output-s1")).toBe(true);
+      expect(ptyOutput.listeners.has("terminal-exit-s1")).toBe(true);
+      return { outcome: "reattached", kind: "claude", name: null };
+    });
+    mountPersistent(true);
+    await settle();
+    expect(reattachTerminalSession).toHaveBeenCalledTimes(1);
+    const [pid, sid, rows] = reattachTerminalSession.mock.calls[0];
+    expect([pid, sid]).toEqual(["p1", "s1"]);
+    expect(typeof rows).toBe("number");
+    expect(useAppState.getState().sessions[0].pendingReattach).toBe(false);
+  });
+
+  it("a lost connection reattaches without replaying, and a gone session ends the tab", async () => {
+    reattachTerminalSession.mockResolvedValue({ outcome: "reattached", kind: "claude", name: null });
+    mountPersistent(false);
+    await settle();
+    expect(reattachTerminalSession).not.toHaveBeenCalled();
+
+    const exit = ptyOutput.listeners.get("terminal-exit-s1");
+    if (!exit) throw new Error("no exit listener");
+    await act(async () => exit({ payload: [] }));
+    await settle();
+    expect(reattachTerminalSession).toHaveBeenCalledWith("p1", "s1", null);
+    expect(screenText()).not.toContain("[Session ended]");
+
+    // Long after that attach (a quick drop would back off first).
+    const later = Date.now() + 60_000;
+    const now = vi.spyOn(Date, "now").mockReturnValue(later);
+    reattachTerminalSession.mockResolvedValue({ outcome: "ended" });
+    await act(async () => exit({ payload: [] }));
+    await settle();
+    expect(screenText()).toContain("[Session ended]");
+    expect(useAppState.getState().sessions[0].persistent).toBe(false);
+    now.mockRestore();
+  });
+
+  it("stops reattaching a session that keeps dropping right after it attaches", async () => {
+    reattachTerminalSession.mockResolvedValue({ outcome: "reattached", kind: "claude", name: null });
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    mountPersistent(false);
+    await settle();
+    const exit = ptyOutput.listeners.get("terminal-exit-s1");
+    if (!exit) throw new Error("no exit listener");
+    for (let i = 0; i < 4; i++) {
+      await act(async () => exit({ payload: [] }));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(i === 0 ? 100 : 3000 * i + 100);
+      });
+      await settle();
+    }
+    // First drop reattaches at once; the next two are quick and back off;
+    // the third quick one stops.
+    expect(reattachTerminalSession).toHaveBeenCalledTimes(3);
+    expect(screenText()).toContain("keeps dropping");
+    vi.useRealTimers();
+  });
+
+  it("only the first chunk after a replay request is the replay", async () => {
+    reattachTerminalSession.mockImplementation(async () => {
+      const emit = ptyOutput.listeners.get("terminal-output-s1")!;
+      emit({ payload: Array.from(new TextEncoder().encode("old history\r\n")) });
+      return { outcome: "reattached", kind: "claude", name: null };
+    });
+    mountPersistent(true);
+    await settle();
+    expect(screenText()).toContain("old history");
+    // Live output now gets the URL detector again.
+    const emit = ptyOutput.listeners.get("terminal-output-s1")!;
+    await act(async () => {
+      emit({ payload: Array.from(new TextEncoder().encode(`\x1b]7777;open;${btoa("https://example.com/live")}\x07`)) });
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    await settle();
+    expect(document.querySelector(URL_TOAST_SELECTOR)).not.toBeNull();
+  });
+
+  it("an ordinary tab's exit just ends it", async () => {
+    mountSession("bash");
+    await settle();
+    const exit = ptyOutput.listeners.get("terminal-exit-s1");
+    if (!exit) throw new Error("no exit listener");
+    await act(async () => exit({ payload: [] }));
+    await settle();
+    expect(reattachTerminalSession).not.toHaveBeenCalled();
+    expect(screenText()).toContain("[Session ended]");
   });
 });

@@ -339,7 +339,39 @@ export interface TerminalSession {
   projectName: string;
   sessionType: "claude" | "bash";
   sessionName: string | null;
+  /** Runs in tmux in an AWS workspace and outlives the app
+   *  (`host/persistent.rs`): a lost connection reattaches instead of ending. */
+  persistent?: boolean;
+  /** Opened for a session already running in the workspace: the view
+   *  attaches (and replays its history) once its listeners are up. */
+  pendingReattach?: boolean;
 }
+
+/** `models/terminal.rs` (`host::persistent::TerminalKind`). */
+export type TerminalKind = "claude" | "bash";
+
+/** `open_terminal_session`'s answer. */
+export interface OpenedTerminal {
+  persistent: boolean;
+  /** Say once: the workspace image has no tmux. */
+  notice: string | null;
+}
+
+/** A terminal running in an AWS workspace (`list_workspace_terminals`). */
+export interface WorkspaceTerminal {
+  session_id: string;
+  kind: TerminalKind;
+  name: string | null;
+  created_unix: number;
+  attached: boolean;
+  /** This app opened it and reopens it on connect. */
+  known: boolean;
+}
+
+/** `reattach_terminal_session`'s answer. */
+export type ReattachOutcome =
+  | { outcome: "reattached"; kind: TerminalKind; name: string | null }
+  | { outcome: "ended" };
 
 export type ImageSource = "registry" | "local_build" | "custom";
 

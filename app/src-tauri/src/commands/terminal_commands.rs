@@ -1,8 +1,13 @@
 use tauri::{AppHandle, Emitter, State};
 
 use crate::commands::aws_commands;
+use crate::host::persistent::{self, TerminalKind};
 use crate::host::ContainerTarget;
-use crate::models::{Backend, BedrockAuthMethod, Project};
+use crate::models::{
+    Backend, BedrockAuthMethod, OpenedTerminal, Project, ProjectStatus, ReattachOutcome,
+    WorkspaceTerminal,
+};
+use crate::storage::terminal_store::{self, PersistedTerminal};
 use crate::AppState;
 
 /// Build the command to run in the container terminal.
@@ -145,6 +150,10 @@ fi
     ]
 }
 
+/// Open a terminal tab. On an AWS project whose image has tmux the command
+/// runs inside its own tmux server keyed by `session_id`
+/// (`host::persistent`), so it outlives the app; the tab is remembered so the
+/// app reopens it on its next connect.
 #[tauri::command]
 pub async fn open_terminal_session(
     project_id: String,
@@ -154,7 +163,7 @@ pub async fn open_terminal_session(
     resume_session_id: Option<String>,
     app_handle: AppHandle,
     state: State<'_, AppState>,
-) -> Result<(), String> {
+) -> Result<OpenedTerminal, String> {
     let project = state
         .projects_store
         .get(&project_id)
@@ -169,6 +178,7 @@ pub async fn open_terminal_session(
         crate::commands::inspect_commands::validate_session_id(id)?;
     }
 
+    let kind = if session_type.as_deref() == Some("bash") { TerminalKind::Bash } else { TerminalKind::Claude };
     let cmd = match session_type.as_deref() {
         Some("bash") if resume_session_id.is_some() => {
             return Err("Only a Claude session can resume a conversation".to_string());
@@ -186,6 +196,17 @@ pub async fn open_terminal_session(
     // environment (never the agent's). Empty for everything else.
     let env = crate::host::aws_host::terminal_env(&project, &state.settings_store.get()).await;
 
+    let plan = persistent::plan(
+        project.is_aws(),
+        &target,
+        &session_id,
+        kind,
+        session_name.as_deref(),
+        cmd,
+        env,
+    )
+    .await?;
+
     let output_event = format!("terminal-output-{}", session_id);
     let exit_event = format!("terminal-exit-{}", session_id);
     let app_handle_output = app_handle.clone();
@@ -196,8 +217,8 @@ pub async fn open_terminal_session(
         .create_session(
             &target,
             &session_id,
-            cmd,
-            env,
+            plan.cmd,
+            plan.env,
             move |data| {
                 let _ = app_handle_output.emit(&output_event, data);
             },
@@ -205,7 +226,19 @@ pub async fn open_terminal_session(
                 let _ = app_handle_exit.emit(&exit_event, ());
             }),
         )
-        .await
+        .await?;
+
+    if plan.persistent {
+        let entry = PersistedTerminal {
+            id: session_id.clone(),
+            kind,
+            name: persistent::clean_name(session_name.as_deref()),
+        };
+        if let Err(e) = terminal_store::add(&project_id, entry) {
+            log::warn!("Could not remember terminal {session_id}: {e}");
+        }
+    }
+    Ok(OpenedTerminal { persistent: plan.persistent, notice: plan.notice })
 }
 
 #[tauri::command]
@@ -227,6 +260,8 @@ pub async fn terminal_resize(
     state.exec_manager.resize(&session_id, cols, rows).await
 }
 
+/// Close a tab. A persistent AWS terminal is *ended* (its tmux server
+/// killed) and forgotten: closing a tab is the one gesture that ends one.
 #[tauri::command]
 pub async fn close_terminal_session(
     session_id: String,
@@ -235,8 +270,254 @@ pub async fn close_terminal_session(
     // Close audio bridge if it exists
     let audio_session_id = format!("audio-{}", session_id);
     state.exec_manager.close_session(&audio_session_id).await;
+    let session_target = state.exec_manager.get_target(&session_id).await.ok();
     // Close terminal session
     state.exec_manager.close_session(&session_id).await;
+
+    if let Some((project_id, _)) = terminal_store::find(&session_id) {
+        // A reattach of this tab still in flight must not remember it again.
+        mark_closed(&session_id);
+        if let Err(e) = terminal_store::remove(&session_id) {
+            log::warn!("Could not forget terminal {session_id}: {e}");
+        }
+        // The project's current tunnel first: the session's own endpoint is
+        // stale after a re-attach on a new port.
+        let target = state
+            .projects_store
+            .get(&project_id)
+            .and_then(|p| ContainerTarget::for_project(&p))
+            .or(session_target);
+        let ended = match target {
+            Some(t) => persistent::end(&t, &session_id).await,
+            None => Err("not connected".to_string()),
+        };
+        if let Err(e) = ended {
+            // Still running in the workspace (a leftover Claude would keep
+            // it up): end it at the next connect.
+            log::warn!("Terminal {session_id}: could not end it now ({e}); ending it at the next connect");
+            if let Err(e) = terminal_store::add_pending_end(&project_id, &session_id) {
+                log::warn!("Could not remember to end terminal {session_id}: {e}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Session ids whose tab was closed in this run of the app.
+fn closed_ids() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static C: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    C.get_or_init(Default::default)
+}
+
+fn mark_closed(session_id: &str) {
+    closed_ids().lock().unwrap_or_else(|e| e.into_inner()).insert(session_id.to_string());
+}
+
+fn was_closed(session_id: &str) -> bool {
+    closed_ids().lock().unwrap_or_else(|e| e.into_inner()).contains(session_id)
+}
+
+/// End the project's sessions whose tabs were closed while it could not be
+/// reached; returns the ones ended (or found gone).
+async fn end_pending(project_id: &str, target: &ContainerTarget, running: &[persistent::RunningSession]) -> Vec<String> {
+    let pending = terminal_store::pending_end(project_id);
+    let mut done = Vec::new();
+    for key in pending {
+        if !running.iter().any(|r| r.key == key) {
+            done.push(key);
+            continue;
+        }
+        match persistent::end(target, &key).await {
+            Ok(()) => done.push(key),
+            Err(e) => log::warn!("Could not end closed terminal {key}: {e}"),
+        }
+    }
+    if !done.is_empty() {
+        if let Err(e) = terminal_store::done_pending_end(project_id, &done) {
+            log::warn!("Could not update the terminals to end: {e}");
+        }
+    }
+    done
+}
+
+/// A connected AWS project's target, waiting for a re-attach in progress.
+async fn aws_target(project: &Project) -> Result<ContainerTarget, String> {
+    if !project.is_aws() {
+        return Err("Only AWS workspaces keep terminals".into());
+    }
+    if project.status != ProjectStatus::Running {
+        return Err(format!("“{}” is not running", project.name));
+    }
+    ContainerTarget::for_project_waiting(project)
+        .await
+        .ok_or_else(|| "Triple-C is not connected to the workspace".to_string())
+}
+
+/// The workspace's running terminals with what the app remembers of them,
+/// remembered ones first in the order they were opened. Prunes remembered
+/// entries the workspace no longer runs. Empty for a Docker project, a
+/// stopped one and an image without tmux.
+#[tauri::command]
+pub async fn list_workspace_terminals(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<WorkspaceTerminal>, String> {
+    let project = state
+        .projects_store
+        .get(&project_id)
+        .ok_or_else(|| format!("Project {} not found", project_id))?;
+    if !project.is_aws() || project.status != ProjectStatus::Running {
+        return Ok(Vec::new());
+    }
+    let target = aws_target(&project).await?;
+    // An `Err` (an unanswered probe or listing) says nothing about what runs:
+    // nothing is pruned or ended on it, and the caller asks again.
+    let mut running = persistent::list(&target).await?;
+    let ended = end_pending(&project_id, &target, &running).await;
+    running.retain(|r| !ended.contains(&r.key));
+    let keys = running.iter().map(|r| r.key.clone()).collect();
+    if let Err(e) = terminal_store::retain(&project_id, &keys) {
+        log::warn!("Could not prune remembered terminals: {e}");
+    }
+    Ok(merge_terminals(&terminal_store::list(&project_id), running))
+}
+
+/// Remembered sessions first (in their order), then the others oldest first.
+pub(crate) fn merge_terminals(
+    remembered: &[PersistedTerminal],
+    mut running: Vec<persistent::RunningSession>,
+) -> Vec<WorkspaceTerminal> {
+    running.sort_by_key(|r| {
+        (
+            remembered.iter().position(|m| m.id == r.key).unwrap_or(usize::MAX),
+            r.created_unix,
+        )
+    });
+    running
+        .into_iter()
+        .map(|r| {
+            let mine = remembered.iter().find(|m| m.id == r.key);
+            WorkspaceTerminal {
+                kind: mine.map(|m| m.kind).unwrap_or(r.kind),
+                name: mine.map(|m| m.name.clone()).unwrap_or(r.name),
+                known: mine.is_some(),
+                session_id: r.key,
+                created_unix: r.created_unix,
+                attached: r.attached,
+            }
+        })
+        .collect()
+}
+
+/// Attach a tab to a terminal still running in the workspace: a tab the app
+/// reopens after a restart or a dropped connection, or one picked in Project
+/// Home → Sessions. Never starts anything: a session that is gone is
+/// `Ended` (and forgotten). With `rows` (a fresh xterm), the pane's history
+/// is replayed into the tab's output first, so its scrollback comes back.
+/// The tab's output listener must be registered before this is called.
+#[tauri::command]
+pub async fn reattach_terminal_session(
+    project_id: String,
+    session_id: String,
+    rows: Option<u16>,
+    app_handle: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ReattachOutcome, String> {
+    persistent::validate_key(&session_id)?;
+    let project = state
+        .projects_store
+        .get(&project_id)
+        .ok_or_else(|| format!("Project {} not found", project_id))?;
+    if was_closed(&session_id) {
+        return Ok(ReattachOutcome::Ended);
+    }
+    let target = aws_target(&project).await?;
+    // Unanswered → `Err` (the tab retries); only a real "no tmux" ends it.
+    if !persistent::supported(&target).await? {
+        terminal_store::remove(&session_id).ok();
+        return Ok(ReattachOutcome::Ended);
+    }
+    if terminal_store::pending_end(&project_id).contains(&session_id) {
+        return Ok(ReattachOutcome::Ended);
+    }
+    let running = persistent::list(&target).await?;
+    let Some(found) = running.into_iter().find(|r| r.key == session_id) else {
+        if let Err(e) = terminal_store::remove(&session_id) {
+            log::warn!("Could not forget terminal {session_id}: {e}");
+        }
+        return Ok(ReattachOutcome::Ended);
+    };
+    let remembered = terminal_store::find(&session_id).filter(|(p, _)| *p == project_id);
+    let (kind, name) = match remembered {
+        Some((_, m)) => (m.kind, m.name),
+        None => (found.kind, found.name),
+    };
+
+    let output_event = format!("terminal-output-{}", session_id);
+    if let Some(rows) = rows {
+        // Exactly one chunk, empty when there is no history: the tab treats
+        // the first chunk after asking for a replay as the replay, so live
+        // output after it gets its URL/OSC/SSO handling again.
+        let bytes = persistent::history(&target, &session_id)
+            .await
+            .map(|h| persistent::replay_bytes(&h, rows))
+            .unwrap_or_default();
+        let _ = app_handle.emit(&output_event, bytes);
+    }
+
+    let exit_event = format!("terminal-exit-{}", session_id);
+    let app_handle_output = app_handle.clone();
+    let app_handle_exit = app_handle.clone();
+    state
+        .exec_manager
+        .create_session(
+            &target,
+            &session_id,
+            persistent::attach_cmd(&session_id)?,
+            persistent::client_env(Vec::new()),
+            move |data| {
+                let _ = app_handle_output.emit(&output_event, data);
+            },
+            Box::new(move || {
+                let _ = app_handle_exit.emit(&exit_event, ());
+            }),
+        )
+        .await?;
+
+    // Closed while this attach was under way: its close already ended (or
+    // queued the end of) the session; don't remember it again.
+    if was_closed(&session_id) {
+        state.exec_manager.close_session(&session_id).await;
+        return Ok(ReattachOutcome::Ended);
+    }
+    let entry = PersistedTerminal { id: session_id.clone(), kind, name: name.clone() };
+    if let Err(e) = terminal_store::add(&project_id, entry) {
+        log::warn!("Could not remember terminal {session_id}: {e}");
+    }
+    Ok(ReattachOutcome::Reattached { kind, name })
+}
+
+/// End a terminal running in the workspace that has no tab here (Project
+/// Home → Sessions → End). A tab's own close goes through
+/// `close_terminal_session`.
+#[tauri::command]
+pub async fn end_workspace_terminal(
+    project_id: String,
+    session_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    persistent::validate_key(&session_id)?;
+    let project = state
+        .projects_store
+        .get(&project_id)
+        .ok_or_else(|| format!("Project {} not found", project_id))?;
+    let target = aws_target(&project).await?;
+    state.exec_manager.close_session(&session_id).await;
+    persistent::end(&target, &session_id).await?;
+    if let Err(e) = terminal_store::remove(&session_id) {
+        log::warn!("Could not forget terminal {session_id}: {e}");
+    }
     Ok(())
 }
 
@@ -569,6 +850,40 @@ mod tests {
             cmd[2]
         );
         assert!(!cmd[2].contains(" -n "), "resume must not rename: {}", cmd[2]);
+    }
+
+    /// The app's own tabs come first in the order they were opened, with
+    /// the app's labels; sessions from elsewhere follow, oldest first, and
+    /// are not "known" (so they are listed, never auto-opened).
+    #[test]
+    fn workspace_terminals_merge_what_the_app_remembers_with_what_runs() {
+        use super::merge_terminals;
+        use crate::host::persistent::{RunningSession, TerminalKind};
+        use crate::storage::terminal_store::PersistedTerminal;
+        let run = |key: &str, kind, created, name: Option<&str>| RunningSession {
+            key: key.into(),
+            kind,
+            created_unix: created,
+            attached: false,
+            name: name.map(str::to_string),
+        };
+        let remembered = vec![
+            PersistedTerminal { id: "b".into(), kind: TerminalKind::Claude, name: Some("second".into()) },
+            PersistedTerminal { id: "a".into(), kind: TerminalKind::Bash, name: None },
+            PersistedTerminal { id: "gone".into(), kind: TerminalKind::Bash, name: None },
+        ];
+        let running = vec![
+            run("x", TerminalKind::Bash, 50, Some("web terminal")),
+            run("a", TerminalKind::Bash, 10, None),
+            run("w", TerminalKind::Claude, 5, None),
+            run("b", TerminalKind::Claude, 20, Some("tmux label")),
+        ];
+        let got = merge_terminals(&remembered, running);
+        let ids: Vec<_> = got.iter().map(|t| t.session_id.as_str()).collect();
+        assert_eq!(ids, ["b", "a", "w", "x"]);
+        assert!(got[0].known && got[1].known && !got[2].known && !got[3].known);
+        assert_eq!(got[0].name.as_deref(), Some("second"), "the app's label wins");
+        assert_eq!(got[3].name.as_deref(), Some("web terminal"));
     }
 
     #[test]

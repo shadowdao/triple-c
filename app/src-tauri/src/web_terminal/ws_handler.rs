@@ -85,8 +85,9 @@ pub async fn handle_connection(socket: WebSocket, state: Arc<WebTerminalState>) 
     // Channel for sending messages from session output tasks → WS writer
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ServerMessage>();
 
-    // Track session IDs owned by this connection for cleanup
-    let owned_sessions: Arc<tokio::sync::Mutex<Vec<String>>> =
+    // Session ids owned by this connection, with whether each is a
+    // persistent AWS terminal (tmux). A disconnect only detaches those.
+    let owned_sessions: Arc<tokio::sync::Mutex<Vec<(String, bool)>>> =
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
     // Writer task: serializes ServerMessages and sends as WS text frames
@@ -186,20 +187,27 @@ pub async fn handle_connection(socket: WebSocket, state: Arc<WebTerminalState>) 
             }
 
             ClientMessage::Close { session_id } => {
-                state.exec_manager.close_session(&session_id).await;
-                // Remove from owned list
-                owned_sessions
-                    .lock()
-                    .await
-                    .retain(|id| id != &session_id);
+                // Only a session this connection opened: the id is the tmux
+                // key of a persistent AWS terminal, which a close ends.
+                let owned = {
+                    let mut owned = owned_sessions.lock().await;
+                    let found = owned.iter().find(|(id, _)| id == &session_id).map(|(_, p)| *p);
+                    owned.retain(|(id, _)| id != &session_id);
+                    found
+                };
+                if let Some(persistent) = owned {
+                    close_owned(&state, &session_id, persistent).await;
+                }
             }
         }
     }
 
-    // Connection closed — clean up all owned sessions
+    // Connection closed — clean up all owned sessions. A persistent AWS
+    // terminal is only detached, like the desktop app's on exit: it keeps
+    // running and Project Home → Sessions lists it.
     log::info!("Web terminal WebSocket disconnected, cleaning up sessions");
     let sessions = owned_sessions.lock().await.clone();
-    for session_id in sessions {
+    for (session_id, _) in sessions {
         state.exec_manager.close_session(&session_id).await;
     }
 
@@ -278,13 +286,41 @@ fi
     vec!["bash".to_string(), "-c".to_string(), script]
 }
 
+/// A Close from the client: detach, and end a persistent terminal's tmux
+/// server (closing a tab is what ends one, as in the desktop app).
+async fn close_owned(state: &WebTerminalState, session_id: &str, persistent: bool) {
+    let target = state.exec_manager.get_target(session_id).await.ok();
+    state.exec_manager.close_session(session_id).await;
+    let Some(target) = target else { return };
+    let Some(key) = tmux_key_of(session_id) else { return };
+    if persistent {
+        if let Err(e) = crate::host::persistent::end(&target, key).await {
+            log::warn!("Web terminal: could not end terminal {session_id}: {e}");
+        }
+    }
+}
+
+/// The web terminal's exec ids are `web-<tmux key>`, never the bare key: the
+/// desktop app attaches to a workspace terminal under the bare key in the
+/// same `ExecSessionManager`, and sharing the id would make either front
+/// end's attach take over (or its close/disconnect end) the other's exec.
+const WEB_EXEC_PREFIX: &str = "web-";
+
+fn web_exec_id(key: &str) -> String {
+    format!("{WEB_EXEC_PREFIX}{key}")
+}
+
+fn tmux_key_of(exec_id: &str) -> Option<&str> {
+    exec_id.strip_prefix(WEB_EXEC_PREFIX)
+}
+
 /// Open a new terminal session for a project.
 async fn handle_open(
     state: &WebTerminalState,
     project_id: &str,
     session_type: Option<&str>,
     out_tx: &mpsc::UnboundedSender<ServerMessage>,
-    owned_sessions: &Arc<tokio::sync::Mutex<Vec<String>>>,
+    owned_sessions: &Arc<tokio::sync::Mutex<Vec<(String, bool)>>>,
 ) -> Result<(), String> {
     let project = state
         .projects_store
@@ -308,8 +344,32 @@ async fn handle_open(
     // environment (never the agent's). Empty for everything else.
     let env = crate::host::aws_host::terminal_env(&project, &state.settings_store.get()).await;
 
-    let session_id = uuid::Uuid::new_v4().to_string();
+    let key = uuid::Uuid::new_v4().to_string();
+    let session_id = web_exec_id(&key);
     let project_name = project.name.clone();
+
+    // AWS: in its own tmux server, like the desktop app's tabs
+    // (`host::persistent`), so a dropped connection only detaches it. Not
+    // remembered for the desktop app to reopen: it shows in Project Home →
+    // Sessions as a session running in the workspace.
+    let kind = if session_type == Some("bash") {
+        crate::host::persistent::TerminalKind::Bash
+    } else {
+        crate::host::persistent::TerminalKind::Claude
+    };
+    let plan = crate::host::persistent::plan(
+        project.is_aws(),
+        &container,
+        &key,
+        kind,
+        Some("web terminal"),
+        cmd,
+        env,
+    )
+    .await?;
+    if let Some(notice) = plan.notice.clone() {
+        let _ = out_tx.send(ServerMessage::Error { message: notice });
+    }
 
     // Set up output routing through the WS channel
     let out_tx_output = out_tx.clone();
@@ -335,15 +395,15 @@ async fn handle_open(
         .create_session(
             &container,
             &session_id,
-            cmd,
-            env,
+            plan.cmd,
+            plan.env,
             on_output,
             on_exit,
         )
         .await?;
 
     // Track this session for cleanup on disconnect
-    owned_sessions.lock().await.push(session_id.clone());
+    owned_sessions.lock().await.push((session_id.clone(), plan.persistent));
 
     let _ = out_tx.send(ServerMessage::Opened {
         session_id,
@@ -356,4 +416,23 @@ async fn handle_open(
     });
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A desktop reattach (exec id = the bare key) and the web terminal's own
+    /// exec of the same tmux session never share an `ExecSessionManager` id,
+    /// in either direction, and the web side maps back to the right key.
+    #[test]
+    fn web_and_desktop_execs_of_one_terminal_never_share_an_id() {
+        let key = "0b9c6f7e-1d2a-4c3b-9e8f-7a6b5c4d3e2f";
+        let web = web_exec_id(key);
+        assert_ne!(web, key, "a desktop reattach must not supersede the web exec");
+        assert_eq!(tmux_key_of(&web), Some(key));
+        // A desktop exec id is not one the web side would end or detach.
+        assert_eq!(tmux_key_of(key), None);
+        crate::host::persistent::validate_key(&web).unwrap();
+    }
 }

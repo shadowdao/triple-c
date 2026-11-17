@@ -322,7 +322,12 @@ RUN npx --yes playwright@latest --version \
     && npx --yes playwright@latest install-deps --dry-run chromium \
     && rm -rf /var/lib/apt/lists/* /root/.npm
 
-# ── Python 3 + pip + uv + ruff ──────────────────────────────────────────────
+# ── Python 3 + pip + uv + ruff (and tmux) ───────────────────────────────────
+# `tmux` rides this layer, the last apt layer and the cheapest to change: it
+# keeps AWS workspaces' terminals alive while the app is closed (one tmux
+# server per tab, app/src-tauri/src/host/persistent.rs, config
+# /etc/triple-c/tmux.conf below). Unused on Docker projects. +3 packages
+# (tmux, libevent-core, libutempter0), ~1.5 MB installed.
 ARG APT_REFRESH=
 RUN echo "apt refresh: ${APT_REFRESH:-unset}" \
     && for i in 1 2 3 4 5; do \
@@ -335,6 +340,7 @@ RUN echo "apt refresh: ${APT_REFRESH:-unset}" \
     python3 \
     python3-pip \
     python3-venv \
+    tmux \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Docker CLI (not daemon) ─────────────────────────────────────────────────
@@ -503,6 +509,11 @@ COPY triple-c-workspace-status /usr/local/bin/triple-c-workspace-status
 COPY triple-c-apply-connect /usr/local/bin/triple-c-apply-connect
 RUN chmod 755 /usr/local/bin/triple-c-wip-push /usr/local/bin/triple-c-idle-watch \
     /usr/local/bin/triple-c-workspace-status /usr/local/bin/triple-c-apply-connect
+# The tmux config every persistent AWS terminal runs with (`tmux -f`). Outside
+# /home/claude, which is seed-only, so an image update reaches it; the app
+# probes for it and runs terminals the old way without it.
+COPY triple-c-tmux.conf /etc/triple-c/tmux.conf
+RUN chmod 755 /etc/triple-c && chmod 644 /etc/triple-c/tmux.conf
 # Root-owned in /usr/local/bin: entrypoint.sh starts it as root (only when a
 # token is configured), and it rides the snapshot and migration like the other
 # shims here.
