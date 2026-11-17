@@ -1986,12 +1986,21 @@ mod environment {
         }
         // Groups (force: terminates their instances, ignores protection).
         let mut groups: Vec<String> = probe_groups.to_vec();
-        if let Ok(out) = asg.describe_auto_scaling_groups().send().await {
+        let mut next = None;
+        loop {
+            let Ok(out) = asg.describe_auto_scaling_groups().set_next_token(next.take()).send().await else {
+                eprintln!("cleanup: WARNING: could not list Auto Scaling groups; only the known ones are deleted");
+                break;
+            };
             for g in out.auto_scaling_groups() {
                 let n = g.auto_scaling_group_name().unwrap_or_default();
                 if n.starts_with(&prefix) && !groups.iter().any(|x| x == n) {
                     groups.push(n.to_string());
                 }
+            }
+            next = out.next_token().map(str::to_string);
+            if next.is_none() {
+                break;
             }
         }
         for g in &groups {
@@ -2007,13 +2016,14 @@ mod environment {
         }
         if !groups.is_empty() {
             for _ in 0..60 {
+                // A failed read is "not yet gone", never "gone".
                 let left = asg
                     .describe_auto_scaling_groups()
                     .set_auto_scaling_group_names(Some(groups.clone()))
                     .send()
                     .await
                     .map(|o| o.auto_scaling_groups().len())
-                    .unwrap_or(0);
+                    .unwrap_or(usize::MAX);
                 if left == 0 {
                     break;
                 }
@@ -3528,10 +3538,23 @@ log_stream_prefix, project_secret_name, task_family};
                     td.volumes().iter().map(|v| v.name().unwrap_or_default()).collect::<Vec<_>>()
                 );
 
+                // The cold start's first (ECS Exec off) task is gone: exactly one
+                // live task of the project on the user's cluster.
+                let family = crate::aws::tofu_modules::task_family(&name, &okey, &id);
+                let live = api.list_project_tasks(&rec.cluster_arn, &family).await.expect("list the project's tasks");
+                eprintln!("RESULT live tasks on the user's cluster after start 1: {live:?}");
+                assert_eq!(live, vec![task1.clone()], "exactly one live task");
+
                 // ── through the agent (ECS Exec port forward into the bridge task) ──
                 let (out, code) = sh(&target, "claude", "echo hello-from-ec2; id").await;
                 eprintln!("RESULT agent tunnel over ECS Exec into the bridge-mode task: exit {code}: {}", out.trim());
                 assert_eq!(code, 0, "{out}");
+                // E8: the sandbox is forced off in the task's settings.
+                let (settings_json, code) = sh(&target, "claude", "printenv CLAUDE_CODE_SETTINGS_JSON").await;
+                assert_eq!(code, 0, "no CLAUDE_CODE_SETTINGS_JSON");
+                let v: serde_json::Value = serde_json::from_str(settings_json.trim()).expect("settings JSON");
+                eprintln!("RESULT sandbox in the task's Claude Code settings: {}", v["sandbox"]);
+                assert_eq!(v["sandbox"]["enabled"], false, "the sandbox is off on EC2");
                 let (mut docker_ok, mut vpn_ok, mut src_valid_mark, mut bwrap_ok) = (true, true, true, false);
                 if !quick {
                     let (out, code) = sh(&target, "claude", "ls -l /var/run/docker.sock; docker ps 2>&1; docker version --format '{{.Server.Version}}' 2>&1").await;
@@ -3712,6 +3735,8 @@ log_stream_prefix, project_secret_name, task_family};
                 );
                 let _ = ws;
                 assert!(docker_ok, "docker ps failed as claude");
+                // E8, stable in every run: Docker's seccomp profile refuses it.
+                assert!(quick || !bwrap_ok, "bwrap worked in the task: revisit sandbox_allowed (E8)");
                 assert!(vpn_ok && src_valid_mark, "the VPN pieces are missing");
             });
             let body = async {
