@@ -12,7 +12,7 @@ import type {
 export const NOT_ON_AWS = "Not available on AWS (Fargate)";
 /** Q6: an AWS project's port mappings bind loopback only (Docker's bind 0.0.0.0). */
 export const AWS_PORTS_LOCALHOST_ONLY = "Reachable only from this machine (localhost)";
-/** R4: the AWS host forces Claude Code's sandbox off until it is verified on Fargate. */
+/** The AWS host forces Claude Code's sandbox off: bubblewrap can't run in an ECS task (Fargate P9, EC2 E8). */
 export const SANDBOX_OFF_ON_AWS = "Off on AWS for now";
 export const EPHEMERAL_WARNING =
   "Claude login and history are lost when the workspace stops.";

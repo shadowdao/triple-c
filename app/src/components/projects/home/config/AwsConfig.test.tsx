@@ -757,14 +757,16 @@ describe("HostSection — launch type (EC2)", () => {
 });
 
 describe("RuntimeSection on EC2", () => {
-  it("enables Docker access, VPN and the sandbox, and says Docker access is root on the instance", () => {
+  it("enables Docker access and VPN, keeps the sandbox off, and says Docker access is root on the instance", () => {
     render(<RuntimeSection project={ec2Project({ sandbox_mode_enabled: true })} save={save} disabled={false} />);
-    for (const name of ["Allow container spawning", "VPN support", "Sandbox mode"]) {
+    for (const name of ["Allow container spawning", "VPN support"]) {
       expect(toggle(name)).toBeEnabled();
     }
-    expect(toggle("Sandbox mode")).toHaveAttribute("aria-checked", "true");
+    // E8, measured live: bubblewrap can't run in an ECS task on EC2 either.
+    expect(toggle("Sandbox mode")).toBeDisabled();
+    expect(toggle("Sandbox mode")).toHaveAttribute("aria-checked", "false");
     expect(screen.getByText(/root on your own instance/)).toBeInTheDocument();
-    expect(screen.queryByText(/Off on AWS for now/)).toBeNull();
+    expect(screen.getByText(/Off on AWS for now/)).toBeInTheDocument();
   });
 });
 

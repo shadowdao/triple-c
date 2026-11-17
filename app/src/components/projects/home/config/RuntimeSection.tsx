@@ -29,9 +29,9 @@ export default function RuntimeSection({
   // Docker access and VPN need the user's own EC2 instance (not Fargate).
   const ec2 = aws && project.aws?.launch_type === "ec2";
   const noPrivileged = aws && !ec2;
-  // Fargate can't run Claude Code's sandbox (P9); the user's own EC2
-  // instance can (E8), so it follows the project there.
-  const sandboxOff = aws && !ec2;
+  // No ECS task can run Claude Code's sandbox: not on Fargate (P9), and not
+  // on the user's own EC2 instance either (E8, measured live).
+  const sandboxOff = aws;
   return (
     <>
       <ConfigGroup
@@ -49,7 +49,7 @@ export default function RuntimeSection({
           label="Sandbox mode"
           hint={
             sandboxOff
-              ? `${SANDBOX_OFF_ON_AWS}: Claude Code's bash sandbox has not been verified on Fargate yet, so an AWS workspace runs with it off whatever this says.`
+              ? `${SANDBOX_OFF_ON_AWS}: Claude Code's bash sandbox (bubblewrap) can't create its namespaces in an ECS task, on Fargate or EC2, so an AWS workspace runs with it off whatever this says.`
               : "Claude Code's bash sandbox (bubblewrap filesystem and network isolation). Triple-C is the source of truth: toggling this overrides any manual /sandbox configuration in the container's settings.json on next start."
           }
           control={

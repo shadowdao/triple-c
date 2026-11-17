@@ -146,11 +146,13 @@ fn is_registry_reference(name: &str) -> bool {
 pub type AwsEnv = (Vec<(String, String)>, Option<ResolvedCa>);
 
 /// Whether Claude Code's sandbox (bubblewrap) may run where `project`'s task
-/// runs — the one place this is decided. Not on Fargate (P9: it can't create
-/// namespaces there, verified live); allowed on the user's EC2 instances
-/// (E8: the ECS-optimized AMI permits user namespaces; the live test checks).
-pub fn sandbox_allowed(project: &Project) -> bool {
-    project.aws.as_ref().is_some_and(|a| a.launch_type == LaunchType::Ec2)
+/// runs — the one place this is decided. Not on AWS: Fargate can't create
+/// namespaces (P9), and neither can an ECS task on the user's EC2 instance
+/// (E8, measured live in phase 7: `bwrap --unshare-user` fails with "No
+/// permissions to create new namespace" — Docker's default seccomp profile
+/// refuses it without CAP_SYS_ADMIN, though the AMI allows user namespaces).
+pub fn sandbox_allowed(_project: &Project) -> bool {
+    false
 }
 
 /// The environment pairs an AWS task gets: [`workspace_env`] with the same
@@ -162,7 +164,7 @@ pub fn aws_env(project: &Project, settings: &AppSettings) -> Result<AwsEnv, Stri
     let mut p = project.clone();
     if p.sandbox_mode_enabled && !sandbox_allowed(project) {
         log::info!(
-            "Project {}: Claude Code's sandbox is turned off on AWS (not supported on Fargate)",
+            "Project {}: Claude Code's sandbox is turned off on AWS (bubblewrap can't run in an ECS task)",
             project.id
         );
         p.sandbox_mode_enabled = false;

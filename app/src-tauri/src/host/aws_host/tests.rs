@@ -613,17 +613,18 @@ fn the_sandbox_is_forced_off_on_aws() {
     assert!(!sandbox_allowed(&p));
 }
 
-/// E8: on the user's own EC2 instance the sandbox is left as the project
-/// says (bubblewrap's user namespaces work on the ECS-optimized AMI).
+/// E8, measured live (phase 7): bubblewrap can't create a user namespace
+/// in an ECS task on the ECS-optimized AMI either (Docker's default seccomp
+/// profile refuses it without CAP_SYS_ADMIN), so EC2 keeps it off too.
 #[test]
-fn the_sandbox_stays_on_for_an_ec2_project() {
+fn the_sandbox_is_forced_off_on_ec2_too() {
     let mut p = ec2_project();
     p.sandbox_mode_enabled = true;
-    assert!(sandbox_allowed(&p));
+    assert!(!sandbox_allowed(&p));
     let (pairs, _) = aws_env(&p, &AppSettings::default()).unwrap();
     let settings = &pairs.iter().find(|(k, _)| k == "CLAUDE_CODE_SETTINGS_JSON").unwrap().1;
     let v: serde_json::Value = serde_json::from_str(settings).unwrap();
-    assert_eq!(v["sandbox"]["enabled"], true, "{settings}");
+    assert_eq!(v["sandbox"]["enabled"], false, "{settings}");
 }
 
 #[test]
