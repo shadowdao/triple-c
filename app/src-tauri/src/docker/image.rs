@@ -14,6 +14,8 @@ const ENTRYPOINT: &str = include_str!("../../../../container/entrypoint.sh");
 /// `sync_host_ssh` block the tests below run.
 const ENTRYPOINT_LIB: &str = include_str!("../../../../container/entrypoint-lib.sh");
 const APPLY_CONNECT: &str = include_str!("../../../../container/triple-c-apply-connect");
+/// `/etc/triple-c/tmux.conf`: persistent AWS terminals (`host::persistent`).
+const TMUX_CONF: &str = include_str!("../../../../container/triple-c-tmux.conf");
 const SCHEDULER: &str = include_str!("../../../../container/triple-c-scheduler");
 const TASK_RUNNER: &str = include_str!("../../../../container/triple-c-task-runner");
 const OSC52_CLIPBOARD: &str = include_str!("../../../../container/osc52-clipboard");
@@ -247,6 +249,7 @@ fn create_build_context() -> Result<Vec<u8>, std::io::Error> {
         append_file_to_archive(&mut archive, "entrypoint.sh", ENTRYPOINT.as_bytes(), 0o755)?;
         append_file_to_archive(&mut archive, "entrypoint-lib.sh", ENTRYPOINT_LIB.as_bytes(), 0o644)?;
         append_file_to_archive(&mut archive, "triple-c-apply-connect", APPLY_CONNECT.as_bytes(), 0o755)?;
+        append_file_to_archive(&mut archive, "triple-c-tmux.conf", TMUX_CONF.as_bytes(), 0o644)?;
         append_file_to_archive(&mut archive, "triple-c-scheduler", SCHEDULER.as_bytes(), 0o755)?;
         append_file_to_archive(&mut archive, "triple-c-task-runner", TASK_RUNNER.as_bytes(), 0o755)?;
         append_file_to_archive(&mut archive, "osc52-clipboard", OSC52_CLIPBOARD.as_bytes(), 0o755)?;
