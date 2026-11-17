@@ -544,9 +544,39 @@ pub const EXEC_OFF: &str = "ECS started the task with ECS Exec turned off, so Tr
 const STOP_WAIT: Duration = Duration::from_secs(3 * 60);
 
 /// A start found the project's task with ECS Exec off and still waiting for
-/// an instance: another start is bringing one up.
+/// an instance, recently started: another start is bringing one up.
 pub const INSTANCE_RACE: &str = "Another start of this workspace is bringing up an EC2 \
-     instance; try again in a minute (once it is up, Start connects to it)";
+     instance; try again in a minute (once it is up, Start connects to it), or Stop the \
+     workspace to cancel it";
+
+/// The stop reason of a task a start replaced (one with ECS Exec off).
+pub const REPLACED_REASON: &str = "Replaced by another Triple-C start";
+
+/// How long past the EC2 placement wait an exec-off task still waiting for
+/// an instance counts as another start's, before it is taken as orphaned.
+const ORPHAN_MARGIN: Duration = Duration::from_secs(2 * 60);
+
+/// Whether an exec-off task still waiting for an instance is older than
+/// any start could still be waiting for it (`ec2_wait` + a margin): a
+/// crashed start's orphan. No creation time reads as fresh.
+fn is_orphaned(t: &TaskInfo, ec2_wait: WaitTiming, now_unix: i64) -> bool {
+    let limit = (ec2_wait.timeout + ORPHAN_MARGIN).as_secs() as i64;
+    t.created_unix.is_some_and(|c| now_unix - c > limit)
+}
+
+/// Why [`rerun_once_placed`] did not give a new task.
+enum RerunError {
+    /// A concurrent start's live task was found: record it, report
+    /// [`START_RACE`].
+    Race(TaskInfo),
+    Failed(String),
+}
+
+impl From<String> for RerunError {
+    fn from(e: String) -> Self {
+        RerunError::Failed(e)
+    }
+}
 
 /// Wait (at most `min(timeout, STOP_WAIT)`) until `arn` is STOPPED or gone.
 async fn wait_stopped<T: TaskApi>(tasks: &T, cluster: &str, arn: &str, timing: WaitTiming) -> Result<(), String> {
@@ -593,7 +623,7 @@ async fn rerun_once_placed<T: TaskApi>(
     task_def_arn: &str,
     timing: WaitTiming,
     progress: &(dyn Fn(&str) + Send + Sync),
-) -> Result<TaskInfo, String> {
+) -> Result<TaskInfo, RerunError> {
     let cluster = compute.cluster_arn.as_str();
     let deadline = tokio::time::Instant::now() + timing.timeout;
     let wanted = [first.to_string()];
@@ -607,13 +637,21 @@ async fn rerun_once_placed<T: TaskApi>(
             .into_iter()
             .find(|t| t.arn == first)
         else {
-            return Err(format!("The task {first} is no longer known to ECS; start the project again"));
+            return Err(format!("The task {first} is no longer known to ECS; start the project again").into());
         };
         if t.desired_status == "STOPPED" || t.last_status == "STOPPED" {
+            if t.stopped_reason.as_deref() == Some(REPLACED_REASON) {
+                return Err(RerunError::Failed(
+                    "Another start of this workspace replaced this one; Start again in a minute \
+                     to connect to it."
+                        .into(),
+                ));
+            }
             return Err(format!(
                 "The task stopped before an EC2 instance took it ({}); start the project again.",
                 t.stopped_reason.as_deref().unwrap_or("no reason given")
-            ));
+            )
+            .into());
         }
         if t.container_instance_arn.is_some() && t.desired_status == "RUNNING" {
             break;
@@ -627,7 +665,8 @@ async fn rerun_once_placed<T: TaskApi>(
                  why in the group's activity in the EC2 console).",
                 timing.timeout.as_secs() / 60,
                 if max == 1 { "" } else { "s" }
-            ));
+            )
+            .into());
         }
         tokio::time::sleep(timing.interval).await;
     }
@@ -643,11 +682,11 @@ async fn rerun_once_placed<T: TaskApi>(
         .await
         .map_err(|e| e.to_string())?;
     if start.reused {
-        return Err(START_RACE.into());
+        return Err(RerunError::Race(start.task));
     }
     if !start.task.exec_enabled {
         let _ = stop_created(tasks, cluster, &start.task.arn).await;
-        return Err(EXEC_OFF.into());
+        return Err(RerunError::Failed(EXEC_OFF.into()));
     }
     Ok(start.task)
 }
@@ -736,14 +775,19 @@ pub async fn start_core<T: TaskApi, W: WorkspaceApi, R: RuntimeApi, C: Connector
     // A task with ECS Exec off (a cold EC2 start that stopped halfway) can
     // never be attached to: stop it and start afresh.
     // One still waiting for an instance belongs to a start in progress.
+    // An old one no start can still be waiting for is an orphan (a crashed
+    // start): it is replaced like a placed one.
     if let Some(t) = existing.take_if(|t| !t.exec_enabled) {
-        if waiting_for_instance(&t) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        if waiting_for_instance(&t) && !is_orphaned(&t, inp.ec2_wait, now) {
             return Err(INSTANCE_RACE.into());
         }
         log::warn!("Project {}: its task {} has ECS Exec off; stopping it", project.id, t.arn);
         let cluster = task_cluster(&env, &t.arn);
         tasks
-            .stop_task(&cluster, &t.arn, STOP_REASON)
+            .stop_task(&cluster, &t.arn, REPLACED_REASON)
             .await
             .map_err(|e| format!("Could not stop the workspace's unreachable task {}: {e}", t.arn))?;
         wait_stopped(tasks, &cluster, &t.arn, timing_of(Some(1))).await?;
@@ -844,8 +888,13 @@ pub async fn start_core<T: TaskApi, W: WorkspaceApi, R: RuntimeApi, C: Connector
                     arn = t.arn;
                     record_task(&arn);
                 }
-                Err(e) => {
-                    let msg = if e == START_RACE { e } else { with_log_tail(tasks, &logs, &arn, e).await };
+                Err(RerunError::Race(winner)) => {
+                    // As on the first launch: the winner's task is the project's.
+                    record_task(&winner.arn);
+                    return Err(START_RACE.into());
+                }
+                Err(RerunError::Failed(e)) => {
+                    let msg = with_log_tail(tasks, &logs, &arn, e).await;
                     if stop_created(tasks, &cluster, &arn).await {
                         (inp.on_task)(None);
                     }

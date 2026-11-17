@@ -58,6 +58,7 @@ fn task(p: &Project, id: &str, last: &str, ready: bool) -> TaskInfo {
         runtime_id: ready.then(|| "rt-1".into()),
         container_instance_arn: None,
         exec_enabled: true,
+        created_unix: None,
         exec_agent_running: ready,
         exit_code: None,
         owner: Some(USER.into()),
@@ -98,6 +99,8 @@ struct Fake {
     rotated_by_loser: bool,
     /// StopTask is refused (expired credentials, say).
     stop_fails: bool,
+    /// StopTask is accepted but the task never reaches STOPPED.
+    stop_noop: bool,
     /// What `on_task` was told, in order.
     recorded: Mutex<Vec<Option<String>>>,
     /// `group stream limit` of each log read.
@@ -175,6 +178,9 @@ impl TaskApi for Fake {
             return Err(AwsError::Other { message: "ExpiredToken".into() });
         }
         // As ECS does: a stopped task is no longer live.
+        if self.stop_noop {
+            return Ok(());
+        }
         if let Some(t) = self.tasks.lock().unwrap().get_mut(arn) {
             t.desired_status = "STOPPED".into();
             t.last_status = "STOPPED".into();
@@ -1518,6 +1524,8 @@ async fn the_cold_reruns_launch_never_doubles_another_starts_task() {
     let (r, _) = start(&fake, &p).await;
     assert_eq!(r.err().unwrap(), START_RACE);
     assert_eq!(fake.calls().iter().filter(|c| *c == "run").count(), 1, "{:?}", fake.calls());
+    // The winner's task is recorded, as on the first launch's race.
+    assert_eq!(fake.recorded.lock().unwrap().last().cloned().flatten(), Some(ec2_task_arn("w1")));
 }
 
 #[tokio::test]
@@ -1538,6 +1546,82 @@ async fn an_execless_task_that_cannot_be_stopped_fails_the_start() {
     assert!(!fake.called("run"));
 }
 
+fn now_unix() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
+}
+
+/// An exec-off task still waiting for an instance, older than any start
+/// could still be waiting (a crashed start's orphan), is replaced; a fresh
+/// one is another start's.
+#[tokio::test]
+async fn an_orphaned_waiting_execless_task_is_replaced_and_a_fresh_one_is_left_alone() {
+    let mut p = ec2_project();
+    p.aws.as_mut().unwrap().task_arn = Some(ec2_task_arn("old"));
+    let waiting = |created: i64| TaskInfo {
+        exec_enabled: false,
+        created_unix: Some(created),
+        ..ec2_task(&p, "old", "PROVISIONING", false, false)
+    };
+    let fake_with = |t: TaskInfo| {
+        Fake {
+            user_record: Some(user_record_param()),
+            listed_by_cluster: Some(HashMap::from([(user_cluster_arn(), vec![ec2_task_arn("old")])])),
+            run: Some(ec2_task(&p, "new", "RUNNING", true, true)),
+            ..Default::default()
+        }
+        .with_task(t)
+    };
+    let fake = fake_with(waiting(now_unix() - 3600));
+    let (r, _) = start(&fake, &p).await;
+    assert_eq!(r.unwrap().task.arn, ec2_task_arn("new"));
+    assert!(fake.calls().contains(&format!("stop {} {REPLACED_REASON}", ec2_task_arn("old"))), "{:?}", fake.calls());
+
+    let fake = fake_with(waiting(now_unix()));
+    let (r, _) = start(&fake, &p).await;
+    let e = r.err().unwrap();
+    assert_eq!(e, INSTANCE_RACE);
+    assert!(e.contains("Stop"), "{e}");
+    assert!(!fake.called("run") && !fake.called("stop"));
+}
+
+#[tokio::test]
+async fn a_cold_start_whose_task_another_start_replaced_says_so() {
+    let p = ec2_project();
+    let execless = |last: &str| TaskInfo { exec_enabled: false, ..ec2_task(&p, "e1", last, false, false) };
+    let fake = Fake {
+        user_record: Some(user_record_param()),
+        runs: Mutex::new(vec![execless("PROVISIONING")]),
+        ..Default::default()
+    };
+    *fake.script.lock().unwrap() = vec![TaskInfo {
+        desired_status: "STOPPED".into(),
+        stopped_reason: Some(REPLACED_REASON.into()),
+        ..execless("PROVISIONING")
+    }];
+    let (r, _) = start(&fake, &p).await;
+    let e = r.err().unwrap();
+    assert!(e.starts_with("Another start of this workspace replaced this one"), "{e}");
+    assert_eq!(fake.calls().iter().filter(|c| *c == "run").count(), 1);
+}
+
+#[tokio::test]
+async fn an_execless_task_that_never_stops_fails_the_start_without_a_new_run() {
+    let mut p = ec2_project();
+    p.aws.as_mut().unwrap().task_arn = Some(ec2_task_arn("old"));
+    let old = TaskInfo { exec_enabled: false, ..ec2_task(&p, "old", "RUNNING", false, true) };
+    let fake = Fake {
+        user_record: Some(user_record_param()),
+        listed_by_cluster: Some(HashMap::from([(user_cluster_arn(), vec![ec2_task_arn("old")])])),
+        stop_noop: true,
+        ..Default::default()
+    }
+    .with_task(old);
+    let (r, _) = start(&fake, &p).await;
+    let e = r.err().unwrap();
+    assert!(e.contains("did not stop in time"), "{e}");
+    assert!(fake.called("stop") && !fake.called("run"));
+}
+
 #[tokio::test]
 async fn a_live_task_with_ecs_exec_off_is_stopped_and_replaced() {
     let mut p = ec2_project();
@@ -1553,7 +1637,7 @@ async fn a_live_task_with_ecs_exec_off_is_stopped_and_replaced() {
     let (r, _) = start(&fake, &p).await;
     assert_eq!(r.unwrap().task.arn, ec2_task_arn("new"));
     let calls = fake.calls();
-    let stop = calls.iter().position(|c| *c == format!("stop {} {STOP_REASON}", ec2_task_arn("old"))).expect("the old task is stopped");
+    let stop = calls.iter().position(|c| *c == format!("stop {} {REPLACED_REASON}", ec2_task_arn("old"))).expect("the old task is stopped");
     assert!(stop < calls.iter().position(|c| c == "run").unwrap(), "{calls:?}");
 }
 

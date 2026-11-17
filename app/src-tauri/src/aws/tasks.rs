@@ -71,6 +71,8 @@ pub struct TaskInfo {
     /// off on a RunTask that has to wait for an EC2 instance (verified live,
     /// phase 7), and such a task can never be reached.
     pub exec_enabled: bool,
+    /// When ECS created the task (Unix seconds), if it says.
+    pub created_unix: Option<i64>,
     /// The `workspace` container's exit code, once it has one.
     pub exit_code: Option<i32>,
     /// Its `triple-c:owner` / `triple-c:project` tags (DescribeTasks with
@@ -121,6 +123,7 @@ pub(crate) fn task_info(t: &Task) -> TaskInfo {
         runtime_id: workspace.and_then(|c| c.runtime_id()).map(str::to_string),
         container_instance_arn: t.container_instance_arn().map(str::to_string),
         exec_enabled: t.enable_execute_command(),
+        created_unix: t.created_at().map(|d| d.secs()),
         exec_agent_running: workspace.is_some_and(|c| {
             c.managed_agents().iter().any(|a| {
                 a.name() == Some(&ManagedAgentName::ExecuteCommandAgent)
