@@ -7,6 +7,8 @@ export interface Segment<T extends string> {
   hint?: string;
   /** Paint this segment with the caution treatment when selected. */
   caution?: boolean;
+  /** This segment can't be chosen (say why next to the control). */
+  disabled?: boolean;
 }
 
 interface Props<T extends string> {
@@ -35,12 +37,21 @@ export default function SegmentedControl<T extends string>({
 
   const move = (delta: number) => {
     const index = segments.findIndex((s) => s.value === value);
-    const next = segments[(index + delta + segments.length) % segments.length];
+    // The next segment that can be chosen; none other than this one: stay.
+    let next: Segment<T> | undefined;
+    for (let step = 1; step < segments.length; step++) {
+      const s = segments[(index + delta * step + segments.length * step) % segments.length];
+      if (!s.disabled) {
+        next = s;
+        break;
+      }
+    }
     if (!next) return;
-    onChange(next.value);
+    const target = next.value;
+    onChange(target);
     requestAnimationFrame(() => {
       groupRef.current
-        ?.querySelector<HTMLElement>(`[data-segment="${next.value}"]`)
+        ?.querySelector<HTMLElement>(`[data-segment="${target}"]`)
         ?.focus();
     });
   };
@@ -79,7 +90,7 @@ export default function SegmentedControl<T extends string>({
             data-segment={segment.value}
             aria-checked={selected}
             tabIndex={selected ? 0 : -1}
-            disabled={disabled}
+            disabled={disabled || segment.disabled}
             onClick={() => onChange(segment.value)}
             className={`h-6 px-2.5 text-xs font-medium rounded-[4px] transition-colors disabled:text-[var(--text-disabled)] disabled:hover:bg-transparent ${cls}`}
           >

@@ -1,0 +1,178 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "CreatePinnedGroups",
+      "Effect": "Allow",
+      "Action": [
+        "autoscaling:CreateAutoScalingGroup"
+      ],
+      "Resource": [
+        "arn:aws:autoscaling:*:*:autoScalingGroup:*:autoScalingGroupName/triple-c-*--u-*"
+      ],
+      "Condition": {
+        "Null": {
+          "aws:RequestTag/triple-c:component": "false",
+          "autoscaling:TargetGroupARNs": "true",
+          "autoscaling:LoadBalancerNames": "true"
+        },
+        "Bool": {
+          "autoscaling:LaunchTemplateVersionSpecified": "true"
+        },
+        "ForAllValues:StringEquals": {
+          "autoscaling:InstanceTypes": [
+            "m7i.large",
+            "m7i.xlarge",
+            "m7i.2xlarge",
+            "m7i.4xlarge",
+            "m7g.large",
+            "m7g.xlarge",
+            "m7g.2xlarge",
+            "m7g.4xlarge",
+            "c7i.large",
+            "c7i.xlarge",
+            "c7i.2xlarge",
+            "c7i.4xlarge",
+            "c7g.large",
+            "c7g.xlarge",
+            "c7g.2xlarge",
+            "c7g.4xlarge",
+            "r7i.large",
+            "r7i.xlarge",
+            "r7i.2xlarge",
+            "r7i.4xlarge",
+            "r7g.large",
+            "r7g.xlarge",
+            "r7g.2xlarge",
+            "r7g.4xlarge",
+            "t3.large",
+            "t3.xlarge",
+            "t3.2xlarge",
+            "t4g.large",
+            "t4g.xlarge",
+            "t4g.2xlarge"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "UpdatePinnedGroups",
+      "Effect": "Allow",
+      "Action": [
+        "autoscaling:UpdateAutoScalingGroup"
+      ],
+      "Resource": [
+        "arn:aws:autoscaling:*:*:autoScalingGroup:*:autoScalingGroupName/triple-c-*--u-*"
+      ],
+      "Condition": {
+        "Null": {
+          "aws:ResourceTag/triple-c:component": "false",
+          "autoscaling:TargetGroupARNs": "true",
+          "autoscaling:LoadBalancerNames": "true"
+        },
+        "BoolIfExists": {
+          "autoscaling:LaunchTemplateVersionSpecified": "true"
+        },
+        "ForAllValues:StringEquals": {
+          "autoscaling:InstanceTypes": [
+            "m7i.large",
+            "m7i.xlarge",
+            "m7i.2xlarge",
+            "m7i.4xlarge",
+            "m7g.large",
+            "m7g.xlarge",
+            "m7g.2xlarge",
+            "m7g.4xlarge",
+            "c7i.large",
+            "c7i.xlarge",
+            "c7i.2xlarge",
+            "c7i.4xlarge",
+            "c7g.large",
+            "c7g.xlarge",
+            "c7g.2xlarge",
+            "c7g.4xlarge",
+            "r7i.large",
+            "r7i.xlarge",
+            "r7i.2xlarge",
+            "r7i.4xlarge",
+            "r7g.large",
+            "r7g.xlarge",
+            "r7g.2xlarge",
+            "r7g.4xlarge",
+            "t3.large",
+            "t3.xlarge",
+            "t3.2xlarge",
+            "t4g.large",
+            "t4g.xlarge",
+            "t4g.2xlarge"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "ManageTripleCAutoScalingGroups",
+      "Effect": "Allow",
+      "Action": [
+        "autoscaling:SetInstanceProtection",
+        "autoscaling:CreateOrUpdateTags",
+        "autoscaling:DeleteTags",
+        "autoscaling:DeleteAutoScalingGroup"
+      ],
+      "Resource": [
+        "arn:aws:autoscaling:*:*:autoScalingGroup:*:autoScalingGroupName/triple-c-*--u-*"
+      ],
+      "Condition": {
+        "Null": {
+          "aws:ResourceTag/triple-c:component": "false"
+        }
+      }
+    },
+    {
+      "Sid": "CreateComputeServiceLinkedRoles",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateServiceLinkedRole"
+      ],
+      "Resource": [
+        "arn:aws:iam::*:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling*",
+        "arn:aws:iam::*:role/aws-service-role/ecs.amazonaws.com/AWSServiceRoleForECS*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "iam:AWSServiceName": [
+            "autoscaling.amazonaws.com",
+            "ecs.amazonaws.com"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "ManageTripleCInstanceProfiles",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateInstanceProfile",
+        "iam:DeleteInstanceProfile",
+        "iam:GetInstanceProfile",
+        "iam:AddRoleToInstanceProfile",
+        "iam:RemoveRoleFromInstanceProfile",
+        "iam:TagInstanceProfile",
+        "iam:UntagInstanceProfile",
+        "iam:ListInstanceProfileTags"
+      ],
+      "Resource": [
+        "arn:aws:iam::*:instance-profile/triple-c-*"
+      ]
+    },
+    {
+      "Sid": "ReadCompute",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:DescribeCapacityProviders",
+        "autoscaling:Describe*"
+      ],
+      "Resource": [
+        "*"
+      ]
+    }
+  ]
+}

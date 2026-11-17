@@ -1,12 +1,19 @@
 # The permissions boundary every role a Triple-C module creates must carry:
 # the most any such role may ever hold. One per account.
 
+locals {
+  # BOUNDARY_MODULE_VERSION in app/src-tauri/src/aws/tofu_modules.rs.
+  # 2: the instance role's ECS agent actions, on its own cluster (phase 7).
+  template_version = 2
+}
+
 provider "aws" {
   region = var.region
 
   default_tags {
     tags = {
-      "triple-c:component" = "boundary"
+      "triple-c:component"        = "boundary"
+      "triple-c:template-version" = tostring(local.template_version)
     }
   }
 }

@@ -166,6 +166,63 @@ fn environment_names_are_validated() {
 }
 
 #[test]
+fn ec2_user_tags_are_validated() {
+    for ok in ["alice", "Bob-2", "a", "x".repeat(32).as_str(), "a-b-c"] {
+        assert_eq!(validate_ec2_user_tag(ok), Ok(ok.to_string()), "{ok}");
+    }
+    for bad in [
+        "",
+        "-a",
+        "a-",
+        "a--b",
+        "a_b",
+        "a.b",
+        "a b",
+        "ä",
+        &"x".repeat(33),
+        "a/b",
+        "a*",
+    ] {
+        assert!(validate_ec2_user_tag(bad).is_err(), "{bad:?} accepted");
+    }
+}
+
+#[test]
+fn per_user_ec2_names_are_unambiguous_and_fit() {
+    assert_eq!(user_ec2_stem("dev", "alice"), "triple-c-dev--u-alice");
+    assert_eq!(
+        user_instance_role_name("dev", "0123456789ab"),
+        "triple-c-dev-0123456789ab-instance"
+    );
+    // The longest names fit: ECS 255, launch templates 128, Auto Scaling
+    // groups 255; roles and instance profiles 64.
+    let env = "a".repeat(20);
+    validate_environment_name(&env).unwrap();
+    let tag = "t".repeat(32);
+    assert!(user_ec2_stem(&env, &tag).len() <= 65);
+    assert!(user_instance_role_name(&env, "0123456789ab").len() <= 64);
+    // An environment cluster is never a per-user one, and one user's
+    // pattern never matches another's cluster: neither half holds `--`.
+    use crate::aws::policy_eval::glob;
+    for env in ["dev", "my-u-env", "u-x", "a-u"] {
+        validate_environment_name(env).unwrap();
+        assert!(
+            !glob("triple-c-*--u-*", &environment_cluster_name(env)),
+            "{env}"
+        );
+        assert!(glob("triple-c-*--u-*", &user_ec2_stem(env, "alice")));
+        assert!(glob("triple-c-*--u-alice", &user_ec2_stem(env, "alice")));
+        for other in ["bob", "bob-alice", "u-alice", "alicex", "xalice"] {
+            validate_ec2_user_tag(other).unwrap();
+            assert!(
+                !glob("triple-c-*--u-alice", &user_ec2_stem(env, other)),
+                "{env}/{other}"
+            );
+        }
+    }
+}
+
+#[test]
 fn the_environment_cluster_and_log_group_names_match_the_module() {
     assert_eq!(environment_cluster_name("dev"), "triple-c-dev");
     assert_eq!(environment_log_group("dev"), "/triple-c/dev");
@@ -348,7 +405,7 @@ fn the_onboarding_completion_output_waits_for_every_resource() {
 #[test]
 fn the_module_versions_agree() {
     assert_eq!(ENVIRONMENT_MODULE_VERSION, 2);
-    assert_eq!(ONBOARD_MODULE_VERSION, 1);
+    assert_eq!(ONBOARD_MODULE_VERSION, 2);
     let body = parsed(ModuleKind::Environment);
     let locals: Vec<_> = top_blocks(&body, "locals")
         .filter_map(|b| attr(&b.body, "template_version"))
@@ -569,7 +626,7 @@ fn every_variable_is_validated() {
 fn module_files_ship_the_lock_file() {
     for (kind, extra) in [
         (ModuleKind::Environment, &["network.tf"][..]),
-        (ModuleKind::UserOnboard, &["iam.tf", "efs.tf"][..]),
+        (ModuleKind::UserOnboard, &["iam.tf", "efs.tf", "ec2.tf"][..]),
         (ModuleKind::PermissionsBoundary, &[][..]),
     ] {
         let names: Vec<_> = module_files(kind).iter().map(|(n, _)| *n).collect();
@@ -680,12 +737,15 @@ fn environment_vars_cover_every_network_mode() {
 // The onboarding and permissions-boundary modules.
 // ---------------------------------------------------------------------------
 
-const ONBOARD_VARIABLES: [&str; 5] = [
+const ONBOARD_VARIABLES: [&str; 8] = [
     "environment_name",
     "region",
     "owner_id",
     "owner_key",
     "bedrock_on_task_role",
+    "ec2_instance_type",
+    "ec2_max_instances",
+    "ec2_user_tag",
 ];
 
 /// The boundary ARN every module-created role carries, as the module writes it.
@@ -837,15 +897,38 @@ fn every_onboarding_role_carries_the_boundary_and_owner_tag() {
             .count(),
         1
     );
+    // What default tags don't reach (a launch's instances and volumes, the
+    // group) gets them whole from `aws_default_tags`; the one other
+    // `triple-c:` tag is the instance role's cluster.
     for block in all_blocks(&body) {
         if block.identifier.as_str() == "default_tags" {
             continue;
         }
         for key in ["tags", "tags_all"] {
             if let Some(t) = attr(&block.body, key) {
+                if !matches!(t, Expression::Object(_)) {
+                    assert_eq!(
+                        render(t),
+                        "data.aws_default_tags.current[0].tags",
+                        "{:?}",
+                        block.labels
+                    );
+                    continue;
+                }
                 let keys = object_keys(t);
+                let allowed: &[&str] = if block
+                    .labels
+                    .iter()
+                    .map(|l| l.as_str())
+                    .eq(["aws_iam_role", "instance"])
+                {
+                    &["triple-c:cluster"]
+                } else {
+                    &[]
+                };
                 assert!(
-                    keys.iter().all(|k| !k.starts_with("triple-c:")),
+                    keys.iter()
+                        .all(|k| !k.starts_with("triple-c:") || allowed.contains(&k.as_str())),
                     "{:?} sets triple-c tags {keys:?}",
                     block.labels
                 );
@@ -853,14 +936,15 @@ fn every_onboarding_role_carries_the_boundary_and_owner_tag() {
         }
     }
 
-    // Exactly the two per-user roles, named as the app names them, each
+    // Exactly the per-user roles, named as the app names them, each
     // bounded; their permissions are inline only (nothing attached that the
     // module doesn't spell out).
     let roles = resources(&body, "aws_iam_role");
-    assert_eq!(roles.len(), 2, "task and exec roles");
+    assert_eq!(roles.len(), 3, "task, exec and instance roles");
     let key = owner_key("us-west-2", "AROAEXAMPLE:alice");
     let (task, exec) = user_role_names("dev", &key);
-    for (name, want) in [("task", task), ("exec", exec)] {
+    let instance = user_instance_role_name("dev", &key);
+    for (name, want) in [("task", task), ("exec", exec), ("instance", instance)] {
         let role = resource(&body, "aws_iam_role", name);
         let named = expand_locals(&body, &template_text(attr(&role.body, "name").unwrap()))
             .replace("${var.environment_name}", "dev")
@@ -881,7 +965,6 @@ fn every_onboarding_role_carries_the_boundary_and_owner_tag() {
         "aws_iam_policy_attachment",
         "aws_iam_policy",
         "aws_iam_user",
-        "aws_iam_instance_profile",
     ] {
         assert!(resources(&body, ty).is_empty(), "{ty} present");
     }
@@ -898,7 +981,12 @@ fn every_onboarding_role_carries_the_boundary_and_owner_tag() {
 #[test]
 fn role_trust_is_ecs_tasks_in_this_account_only() {
     let body = parsed(ModuleKind::UserOnboard);
+    let mut seen = 0;
     for role in resources(&body, "aws_iam_role") {
+        if label(role, 1) == Some("instance") {
+            continue; // EC2's: `the_instance_role_is_ec2s_and_runs_only_the_ecs_agent`
+        }
+        seen += 1;
         let trust = jsonencoded(role, "assume_role_policy");
         assert_eq!(
             statements(&trust),
@@ -916,6 +1004,7 @@ fn role_trust_is_ecs_tasks_in_this_account_only() {
             role.labels
         );
     }
+    assert_eq!(seen, 2);
 }
 
 #[test]
@@ -1097,13 +1186,14 @@ fn the_environment_security_group_gains_no_ingress() {
     assert_eq!(attr(&sg.body, "egress"), Some(&Expression::Array(vec![])));
     assert!(top_blocks(&sg.body, "egress").next().is_none());
 
-    // The environment's group is referenced only as that rule's source.
+    // The environment's group is referenced only as that rule's source and
+    // as the EC2 instances' group (which adds no rule to it).
     let text = tf_text(ModuleKind::UserOnboard);
-    assert_eq!(text.matches("local.env.security_group_id").count(), 1);
+    assert_eq!(text.matches("local.env.security_group_id").count(), 2);
     assert_eq!(
         text.matches("security_group_id").count(),
-        4,
-        "the rule, the record check and its message, and the efs group output"
+        5,
+        "the rule, the launch template, the record check and its message, and the efs group output"
     );
 }
 
@@ -1154,25 +1244,29 @@ fn exec_role_reads_only_its_owners_secrets() {
         json!({ "StringEquals": { "kms:ViaService": "secretsmanager.${var.region}.amazonaws.com" } })
     );
 
-    // Logs: the environment's log group only, for both roles.
+    // Logs, for both roles: streams are created in the environment's log
+    // group, but written only when they are the user's own
+    // (`<owner_key>/…`, as log_stream_prefix builds them); other users'
+    // streams share the group.
     let log_group = format!(
         "arn:{partition}:logs:${{var.region}}:{account}:log-group:${{local.env.log_group}}:*"
     );
+    let own_streams = format!(
+        "arn:{partition}:logs:${{var.region}}:{account}:log-group:${{local.env.log_group}}:log-stream:${{var.owner_key}}/*"
+    );
+    assert!(crate::aws::tofu_modules::log_stream_prefix("0123456789ab", "p").starts_with("0123456789ab/"));
     for role in ["exec", "task"] {
         let logs: Vec<_> = role_policies(&body, role)
             .iter()
             .flat_map(|p| statements(&jsonencoded(p, "policy")))
             .filter(|s| actions(s).iter().any(|a| a.starts_with("logs:")))
             .collect();
-        assert_eq!(logs.len(), 1, "{role}");
-        assert_eq!(
-            actions(&logs[0]),
-            BTreeSet::from([
-                "logs:CreateLogStream".to_string(),
-                "logs:PutLogEvents".to_string()
-            ])
-        );
-        assert_eq!(expand(&logs[0]["Resource"]), log_group, "{role}");
+        assert_eq!(logs.len(), 2, "{role}");
+        for (action, resource) in [("logs:CreateLogStream", &log_group), ("logs:PutLogEvents", &own_streams)] {
+            let st = logs.iter().find(|s| actions(s).contains(action)).unwrap();
+            assert_eq!(actions(st).len(), 1, "{role} {action}");
+            assert_eq!(&expand(&st["Resource"]), resource, "{role} {action}");
+        }
     }
 
     // The task role: exec channels, logs and its file system; Bedrock only
@@ -1217,8 +1311,9 @@ fn exec_role_reads_only_its_owners_secrets() {
 #[test]
 fn onboarding_reads_the_environment_only_from_its_record() {
     let body = parsed(ModuleKind::UserOnboard);
+    // The other parameter read is the public AMI id (EC2 capacity).
     let params: Vec<_> = top_blocks(&body, "data")
-        .filter(|b| label(b, 0) == Some("aws_ssm_parameter"))
+        .filter(|b| label(b, 0) == Some("aws_ssm_parameter") && label(b, 1) != Some("ecs_ami"))
         .collect();
     assert_eq!(params.len(), 1);
     assert_eq!(
@@ -1229,13 +1324,19 @@ fn onboarding_reads_the_environment_only_from_its_record() {
     // No remote state, no other reads of the environment's deployment.
     let text = tf_text(ModuleKind::UserOnboard);
     assert!(!text.contains("terraform_remote_state"));
-    assert!(resources(&body, "aws_ssm_parameter").is_empty());
+    // The one parameter it writes is the user's own record, not the
+    // environment's.
+    let written: Vec<_> = resources(&body, "aws_ssm_parameter")
+        .into_iter()
+        .filter_map(|b| label(b, 1))
+        .collect();
+    assert_eq!(written, ["user"]);
 }
 
 #[test]
 fn onboarding_vars_name_the_owner() {
     let owner = "AROAEXAMPLEID:alice@example.com";
-    let vars = onboarding_vars("dev", "us-west-2", owner);
+    let vars = onboarding_vars("dev", "us-west-2", owner, None).unwrap();
     assert_eq!(
         vars,
         json!({
@@ -1244,9 +1345,82 @@ fn onboarding_vars_name_the_owner() {
             "owner_id": owner,
             "owner_key": owner_key("us-west-2", owner),
             "bedrock_on_task_role": false,
+            "ec2_instance_type": "",
+            "ec2_max_instances": 1,
+            "ec2_user_tag": "",
         })
     );
+    // Without EC2 capacity the EC2 variables are the module's defaults, so
+    // the plan is the Fargate-only one.
     let body = parsed(ModuleKind::UserOnboard);
+    for (name, value) in [
+        ("ec2_instance_type", json!("")),
+        ("ec2_max_instances", json!(1)),
+        ("ec2_user_tag", json!("")),
+    ] {
+        let v = top_blocks(&body, "variable")
+            .find(|b| label(b, 0) == Some(name))
+            .unwrap();
+        assert_eq!(to_json(attr(&v.body, "default").unwrap()), value, "{name}");
+        assert_eq!(vars[name], value, "{name}");
+    }
+
+    let ec2 = Ec2Compute {
+        instance_type: "m7g.xlarge".into(),
+        max_instances: 3,
+        user_tag: "alice-1".into(),
+    };
+    let vars = onboarding_vars("dev", "us-west-2", owner, Some(&ec2)).unwrap();
+    assert_eq!(vars["ec2_instance_type"], "m7g.xlarge");
+    assert_eq!(vars["ec2_max_instances"], 3);
+    assert_eq!(vars["ec2_user_tag"], "alice-1");
+    for bad in [
+        Ec2Compute {
+            instance_type: "".into(),
+            ..ec2.clone()
+        },
+        Ec2Compute {
+            instance_type: "p5.48xlarge".into(),
+            ..ec2.clone()
+        },
+        Ec2Compute {
+            instance_type: "m7i.8xlarge".into(),
+            ..ec2.clone()
+        },
+        Ec2Compute {
+            instance_type: "t3.4xlarge".into(),
+            ..ec2.clone()
+        },
+        Ec2Compute {
+            max_instances: 0,
+            ..ec2.clone()
+        },
+        Ec2Compute {
+            max_instances: EC2_MAX_INSTANCES + 1,
+            ..ec2.clone()
+        },
+        Ec2Compute {
+            user_tag: "".into(),
+            ..ec2.clone()
+        },
+        Ec2Compute {
+            user_tag: "a--b".into(),
+            ..ec2.clone()
+        },
+        Ec2Compute {
+            user_tag: "-a".into(),
+            ..ec2.clone()
+        },
+        Ec2Compute {
+            user_tag: "x".repeat(33),
+            ..ec2.clone()
+        },
+    ] {
+        assert!(
+            onboarding_vars("dev", "us-west-2", owner, Some(&bad)).is_err(),
+            "{bad:?} accepted"
+        );
+    }
     let declared: BTreeSet<_> = top_blocks(&body, "variable")
         .filter_map(|b| label(b, 0))
         .collect();
@@ -1308,11 +1482,29 @@ fn boundary_vars_carry_the_shipped_boundary() {
     let tags = default_tags(&body);
     assert_eq!(
         object_keys(tags),
-        BTreeSet::from(["triple-c:component".to_string()])
+        BTreeSet::from([
+            "triple-c:component".to_string(),
+            "triple-c:template-version".to_string()
+        ])
     );
     assert_eq!(
         object_get(tags, "triple-c:component"),
         Some(&Expression::String("boundary".into()))
+    );
+}
+
+#[test]
+fn the_boundary_module_version_is_pinned() {
+    assert_eq!(BOUNDARY_MODULE_VERSION, 2);
+    let body = parsed(ModuleKind::PermissionsBoundary);
+    let version = local_def(&body, "template_version");
+    assert_eq!(version, &Expression::Number(BOUNDARY_MODULE_VERSION.into()));
+    let tag = object_get(default_tags(&body), "triple-c:template-version")
+        .expect("template-version default tag");
+    assert!(
+        render(tag).contains("local.template_version"),
+        "template-version tag is {}",
+        render(tag)
     );
 }
 
@@ -1537,6 +1729,81 @@ const BACKEND: &[Check] = &[
     call("s3:DeleteObject", USER_LOCK, IN_ACCOUNT),
 ];
 
+// The onboarding module's EC2 capacity (phase 7, E1–E5, E11) for the user
+// whose `triple-c-user` tag is `alice`: cluster, capacity provider, group and
+// launch template are `triple-c-<env>--u-<tag>`, the instance role and
+// profile `triple-c-<env>-<owner key>-instance` (pinned to the naming
+// functions by `the_ec2_call_table_uses_the_shared_names`).
+const USER_CLUSTER: &str = "arn:aws:ecs:{region}:{account}:cluster/triple-c-probe--u-alice";
+const CAPACITY_PROVIDER: &str =
+    "arn:aws:ecs:{region}:{account}:capacity-provider/triple-c-probe--u-alice";
+const LAUNCH_TEMPLATE: &str = "arn:aws:ec2:{region}:{account}:launch-template/lt-00000000000000000";
+const AUTO_SCALING_GROUP: &str = "arn:aws:autoscaling:{region}:{account}:autoScalingGroup:\
+     00000000-0000-0000-0000-000000000000:autoScalingGroupName/triple-c-probe--u-alice";
+const INSTANCE: &str = "arn:aws:ec2:{region}:{account}:instance/i-00000000000000000";
+const VOLUME: &str = "arn:aws:ec2:{region}:{account}:volume/vol-00000000000000000";
+const IMAGE: &str = "arn:aws:ec2:{region}::image/ami-00000000000000000";
+const INSTANCE_ROLE: &str = "arn:aws:iam::{account}:role/triple-c-probe-0123456789ab-instance";
+const INSTANCE_PROFILE: &str =
+    "arn:aws:iam::{account}:instance-profile/triple-c-probe-0123456789ab-instance";
+const AUTO_SCALING_SERVICE_ROLE: &str = "arn:aws:iam::{account}:role/aws-service-role/\
+     autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling";
+const ECS_SERVICE_ROLE: &str =
+    "arn:aws:iam::{account}:role/aws-service-role/ecs.amazonaws.com/AWSServiceRoleForECS";
+const AMI_PARAMETER: &str = "arn:aws:ssm:{region}::parameter/aws/service/ecs/optimized-ami/\
+     amazon-linux-2023/recommended/image_id";
+const ARM64_AMI_PARAMETER: &str = "arn:aws:ssm:{region}::parameter/aws/service/ecs/optimized-ami/\
+     amazon-linux-2023/arm64/recommended/image_id";
+const USER_RECORD: &str =
+    "arn:aws:ssm:{region}:{account}:parameter/triple-c/users/probe/0123456789ab";
+/// A launch from the user's launch template (what creating the group
+/// checks the caller for).
+const FROM_TEMPLATE: Context = &[(
+    "ec2:LaunchTemplate",
+    Literal("arn:aws:ec2:{region}:{account}:launch-template/lt-00000000000000000"),
+)];
+const LT_ARN: ContextValue =
+    Literal("arn:aws:ec2:{region}:{account}:launch-template/lt-00000000000000000");
+/// The template's tag specifications tag the instance and its volume.
+const TAGGED_INSTANCE: Context = &[
+    (REQUEST_COMPONENT, Literal("user-onboarding")),
+    ("ec2:LaunchTemplate", LT_ARN),
+    ("ec2:InstanceType", Literal("m7i.large")),
+];
+const TAGGED_VOLUME: Context = &[
+    (REQUEST_COMPONENT, Literal("user-onboarding")),
+    ("ec2:LaunchTemplate", LT_ARN),
+];
+/// The environment's tasks group, named in the template.
+const TEMPLATE_GROUP: Context = &[
+    ("ec2:LaunchTemplate", LT_ARN),
+    ("ec2:IsLaunchTemplateResource", Literal("true")),
+    (RESOURCE_COMPONENT, Literal("environment")),
+];
+const AMAZON_IMAGE: Context = &[
+    ("ec2:Owner", Literal("amazon")),
+    ("ec2:LaunchTemplate", LT_ARN),
+    ("ec2:IsLaunchTemplateResource", Literal("true")),
+];
+/// The group pins the template to a version (`latest_version`, never
+/// `$Latest`/`$Default`) and has no load balancer.
+const GROUP_CREATE: Context = &[
+    (REQUEST_COMPONENT, Literal("user-onboarding")),
+    (
+        "autoscaling:LaunchTemplateVersionSpecified",
+        Literal("true"),
+    ),
+];
+const GROUP_UPDATE: Context = &[
+    (RESOURCE_COMPONENT, Literal("user-onboarding")),
+    (
+        "autoscaling:LaunchTemplateVersionSpecified",
+        Literal("true"),
+    ),
+    ("autoscaling:InstanceTypes", Literal("m7i.large")),
+];
+const TO_EC2: Context = &[("iam:PassedToService", Literal("ec2.amazonaws.com"))];
+
 const MODULE_CALLS: &[(&str, &[Check])] = &[
     (
         "aws_ecs_cluster",
@@ -1553,14 +1820,35 @@ const MODULE_CALLS: &[(&str, &[Check])] = &[
             call("ecs:TagResource", CLUSTER, ENV_TAGGED),
             call("ecs:UntagResource", CLUSTER, ENV_TAGGED),
             call("ecs:DeleteCluster", CLUSTER, ENV_TAGGED),
+            // The user's own cluster (onboarding, EC2 capacity).
+            call("ecs:CreateCluster", USER_CLUSTER, USER_CREATE),
+            call(
+                "ecs:TagResource",
+                USER_CLUSTER,
+                &[("ecs:CreateAction", Literal("CreateCluster"))],
+            ),
+            call("ecs:DescribeClusters", USER_CLUSTER, NONE),
+            call("ecs:ListTagsForResource", USER_CLUSTER, NONE),
+            call("ecs:UpdateCluster", USER_CLUSTER, USER_TAGGED),
+            call("ecs:TagResource", USER_CLUSTER, USER_TAGGED),
+            call("ecs:UntagResource", USER_CLUSTER, USER_TAGGED),
+            call("ecs:DeleteCluster", USER_CLUSTER, USER_TAGGED),
         ],
     ),
     (
-        // Untaggable: authorized against the (named) cluster.
+        // Untaggable: authorized against the (named) cluster, and (a
+        // hypothesis) the user's capacity provider.
         "aws_ecs_cluster_capacity_providers",
         &[
             call("ecs:PutClusterCapacityProviders", CLUSTER, ENV_TAGGED),
             call("ecs:DescribeClusters", CLUSTER, NONE),
+            call("ecs:PutClusterCapacityProviders", USER_CLUSTER, USER_TAGGED),
+            call(
+                "ecs:PutClusterCapacityProviders",
+                CAPACITY_PROVIDER,
+                USER_TAGGED,
+            ),
+            call("ecs:DescribeClusters", USER_CLUSTER, NONE),
         ],
     ),
     (
@@ -1656,6 +1944,13 @@ const MODULE_CALLS: &[(&str, &[Check])] = &[
             call("ssm:ListTagsForResource", PARAMETER, NONE),
             call("ssm:RemoveTagsFromResource", PARAMETER, NONE),
             call("ssm:DeleteParameter", PARAMETER, NONE),
+            // The user's EC2 record (onboarding, E11).
+            call("ssm:PutParameter", USER_RECORD, USER_CREATE),
+            call("ssm:AddTagsToResource", USER_RECORD, USER_CREATE),
+            call("ssm:GetParameter", USER_RECORD, NONE),
+            call("ssm:ListTagsForResource", USER_RECORD, NONE),
+            call("ssm:RemoveTagsFromResource", USER_RECORD, NONE),
+            call("ssm:DeleteParameter", USER_RECORD, NONE),
         ],
     ),
     (
@@ -1846,6 +2141,14 @@ const MODULE_CALLS: &[(&str, &[Check])] = &[
             call("iam:UpdateRoleDescription", TASK_ROLE, NONE),
             call("iam:UntagRole", TASK_ROLE, NONE),
             call("iam:DeleteRole", EXEC_ROLE, NONE),
+            // The EC2 instance role, tagged `triple-c:cluster = <the user's
+            // cluster>`: the boundary keeps the ECS agent on that cluster.
+            call("iam:CreateRole", INSTANCE_ROLE, BOUNDED),
+            call("iam:TagRole", INSTANCE_ROLE, NONE),
+            call("iam:GetRole", INSTANCE_ROLE, NONE),
+            call("iam:ListInstanceProfilesForRole", INSTANCE_ROLE, NONE),
+            call("iam:UntagRole", INSTANCE_ROLE, NONE),
+            call("iam:DeleteRole", INSTANCE_ROLE, NONE),
         ],
     ),
     (
@@ -1855,6 +2158,131 @@ const MODULE_CALLS: &[(&str, &[Check])] = &[
             call("iam:PutRolePolicy", TASK_ROLE, BOUNDED),
             call("iam:GetRolePolicy", TASK_ROLE, NONE),
             call("iam:DeleteRolePolicy", EXEC_ROLE, BOUNDED),
+            call("iam:PutRolePolicy", INSTANCE_ROLE, BOUNDED),
+            call("iam:GetRolePolicy", INSTANCE_ROLE, NONE),
+            call("iam:DeleteRolePolicy", INSTANCE_ROLE, BOUNDED),
+        ],
+    ),
+    (
+        // Managed scaling runs as ECS's service-linked role, created on
+        // first use if the account has none.
+        "aws_ecs_capacity_provider",
+        &[
+            call("ecs:CreateCapacityProvider", CAPACITY_PROVIDER, USER_CREATE),
+            call(
+                "ecs:TagResource",
+                CAPACITY_PROVIDER,
+                &[("ecs:CreateAction", Literal("CreateCapacityProvider"))],
+            ),
+            call("ecs:DescribeCapacityProviders", "*", NONE),
+            call("ecs:ListTagsForResource", CAPACITY_PROVIDER, NONE),
+            call("ecs:UpdateCapacityProvider", CAPACITY_PROVIDER, USER_TAGGED),
+            call("ecs:TagResource", CAPACITY_PROVIDER, USER_TAGGED),
+            call("ecs:UntagResource", CAPACITY_PROVIDER, USER_TAGGED),
+            call("ecs:DeleteCapacityProvider", CAPACITY_PROVIDER, USER_TAGGED),
+            call(
+                "iam:CreateServiceLinkedRole",
+                ECS_SERVICE_ROLE,
+                &[("iam:AWSServiceName", Literal("ecs.amazonaws.com"))],
+            ),
+        ],
+    ),
+    (
+        "aws_launch_template",
+        &[
+            call("ec2:CreateLaunchTemplate", LAUNCH_TEMPLATE, USER_CREATE),
+            call(
+                "ec2:CreateTags",
+                LAUNCH_TEMPLATE,
+                created_by!("CreateLaunchTemplate"),
+            ),
+            call("ec2:DescribeLaunchTemplates", "*", NONE),
+            call("ec2:DescribeLaunchTemplateVersions", "*", NONE),
+            call(
+                "ec2:CreateLaunchTemplateVersion",
+                LAUNCH_TEMPLATE,
+                USER_TAGGED,
+            ),
+            call("ec2:CreateTags", LAUNCH_TEMPLATE, USER_TAGGED),
+            call("ec2:DeleteTags", LAUNCH_TEMPLATE, USER_TAGGED),
+            call("ec2:DeleteLaunchTemplate", LAUNCH_TEMPLATE, USER_TAGGED),
+        ],
+    ),
+    (
+        // Creating the group checks that the caller could launch its
+        // template (RunInstances with what the template names, the tags the
+        // launch puts on, the instance role passed to EC2). The group's own
+        // launches run as Auto Scaling's service-linked role. ASG tags are
+        // not the provider's default_tags: the module sets them per group.
+        // Deleting first drains the group (`force_delete` off): an update to
+        // 0 naming no template, scale-in protection cleared on its
+        // instances, then the wait for them to terminate.
+        "aws_autoscaling_group",
+        &[
+            call(
+                "autoscaling:CreateAutoScalingGroup",
+                AUTO_SCALING_GROUP,
+                GROUP_CREATE,
+            ),
+            call(
+                "iam:CreateServiceLinkedRole",
+                AUTO_SCALING_SERVICE_ROLE,
+                &[("iam:AWSServiceName", Literal("autoscaling.amazonaws.com"))],
+            ),
+            call("ec2:RunInstances", LAUNCH_TEMPLATE, USER_TAGGED),
+            call("ec2:RunInstances", INSTANCE, TAGGED_INSTANCE),
+            call("ec2:RunInstances", VOLUME, TAGGED_VOLUME),
+            call("ec2:RunInstances", ENI, FROM_TEMPLATE),
+            call("ec2:RunInstances", SUBNET, FROM_TEMPLATE),
+            call("ec2:RunInstances", SG, TEMPLATE_GROUP),
+            call("ec2:RunInstances", IMAGE, AMAZON_IMAGE),
+            call("ec2:CreateTags", INSTANCE, created_by!("RunInstances")),
+            call("ec2:CreateTags", VOLUME, created_by!("RunInstances")),
+            call("ec2:CreateTags", ENI, created_by!("RunInstances")),
+            call("iam:PassRole", INSTANCE_ROLE, TO_EC2),
+            call("autoscaling:DescribeAutoScalingGroups", "*", NONE),
+            call("autoscaling:DescribeScalingActivities", "*", NONE),
+            call(
+                "autoscaling:UpdateAutoScalingGroup",
+                AUTO_SCALING_GROUP,
+                GROUP_UPDATE,
+            ),
+            call(
+                "autoscaling:UpdateAutoScalingGroup",
+                AUTO_SCALING_GROUP,
+                USER_TAGGED,
+            ),
+            call(
+                "autoscaling:SetInstanceProtection",
+                AUTO_SCALING_GROUP,
+                USER_TAGGED,
+            ),
+            call(
+                "autoscaling:CreateOrUpdateTags",
+                AUTO_SCALING_GROUP,
+                USER_TAGGED,
+            ),
+            call("autoscaling:DeleteTags", AUTO_SCALING_GROUP, USER_TAGGED),
+            call(
+                "autoscaling:DeleteAutoScalingGroup",
+                AUTO_SCALING_GROUP,
+                USER_TAGGED,
+            ),
+        ],
+    ),
+    (
+        // Hypothesis: adding the role needs it passable to EC2.
+        "aws_iam_instance_profile",
+        &[
+            call("iam:CreateInstanceProfile", INSTANCE_PROFILE, NONE),
+            call("iam:TagInstanceProfile", INSTANCE_PROFILE, NONE),
+            call("iam:AddRoleToInstanceProfile", INSTANCE_PROFILE, NONE),
+            call("iam:PassRole", INSTANCE_ROLE, TO_EC2),
+            call("iam:GetInstanceProfile", INSTANCE_PROFILE, NONE),
+            call("iam:ListInstanceProfileTags", INSTANCE_PROFILE, NONE),
+            call("iam:UntagInstanceProfile", INSTANCE_PROFILE, NONE),
+            call("iam:RemoveRoleFromInstanceProfile", INSTANCE_PROFILE, NONE),
+            call("iam:DeleteInstanceProfile", INSTANCE_PROFILE, NONE),
         ],
     ),
     (
@@ -1862,13 +2290,20 @@ const MODULE_CALLS: &[(&str, &[Check])] = &[
         &[call("sts:GetCallerIdentity", "*", NONE)],
     ),
     ("data.aws_partition", &[]),
+    // The provider's own configuration: no call.
+    ("data.aws_default_tags", &[]),
     (
         "data.aws_availability_zones",
         &[call("ec2:DescribeAvailabilityZones", "*", NONE)],
     ),
     (
         "data.aws_ssm_parameter",
-        &[call("ssm:GetParameter", PARAMETER, NONE)],
+        &[
+            call("ssm:GetParameter", PARAMETER, NONE),
+            // The public ECS-optimized image ids (EC2 capacity).
+            call("ssm:GetParameter", AMI_PARAMETER, NONE),
+            call("ssm:GetParameter", ARM64_AMI_PARAMETER, NONE),
+        ],
     ),
     ("data.aws_subnet", &[call("ec2:DescribeSubnets", "*", NONE)]),
     ("backend.s3", BACKEND),
@@ -1904,6 +2339,17 @@ fn the_module_call_table_covers_every_type_the_modules_use() {
         "a type appears twice in MODULE_CALLS"
     );
     assert_eq!(module_types(), table);
+}
+
+#[test]
+fn the_ec2_call_table_uses_the_shared_names() {
+    let stem = user_ec2_stem(ENV, "alice");
+    assert!(USER_CLUSTER.ends_with(&format!("cluster/{stem}")));
+    assert!(CAPACITY_PROVIDER.ends_with(&format!("capacity-provider/{stem}")));
+    assert!(AUTO_SCALING_GROUP.ends_with(&format!("autoScalingGroupName/{stem}")));
+    let role = user_instance_role_name(ENV, OWNER_KEY);
+    assert!(INSTANCE_ROLE.ends_with(&format!("role/{role}")));
+    assert!(INSTANCE_PROFILE.ends_with(&format!("instance-profile/{role}")));
 }
 
 #[test]
@@ -1984,6 +2430,9 @@ const ONBOARD_SAMPLES: &[(&str, &str)] = &[
     ),
     ("${var.region}", "us-west-2"),
     ("${var.owner_id}", "AROAEXAMPLEME:alice@example.com"),
+    ("${var.owner_key}", "0123456789ab"),
+    ("${var.environment_name}", "probe"),
+    ("${var.ec2_user_tag}", "alice"),
     ("${local.env.log_group}", "/triple-c/probe"),
     (
         "${local.env.kms_key_arn}",
@@ -2033,6 +2482,16 @@ fn every_onboarding_role_stays_inside_the_boundary() {
             }
             let mut context: Vec<(&'static str, ContextValue)> =
                 vec![(RESOURCE_COMPONENT, Literal("user-onboarding"))];
+            // The instance role's sessions carry its `triple-c:cluster` tag.
+            if render(attr(&policy.body, "role").unwrap()) == "aws_iam_role.instance[0].id" {
+                let role = resource(&body, "aws_iam_role", "instance");
+                let tag = object_get(attr(&role.body, "tags").unwrap(), "triple-c:cluster")
+                    .expect("the instance role's cluster tag");
+                context.push((
+                    "aws:PrincipalTag/triple-c:cluster",
+                    Literal(leak(render_sample(&template_text(tag)))),
+                ));
+            }
             if let Some(cond) = stmt.get("Condition") {
                 for (op, entries) in cond.as_object().unwrap() {
                     assert_eq!(op, "StringEquals", "{:?}: unexpected {op}", policy.labels);
@@ -2063,7 +2522,7 @@ fn every_onboarding_role_stays_inside_the_boundary() {
             }
         }
     }
-    assert!(seen >= 15, "only {seen} role grants checked");
+    assert!(seen >= 25, "only {seen} role grants checked");
 }
 
 /// Admin write checks for calls the app makes itself, not the modules.
@@ -2076,10 +2535,10 @@ const APP_ONLY_WRITES: &[&str] = &[
     "s3:PutBucketPublicAccessBlock",
     "s3:PutBucketTagging",
     "s3:PutBucketPolicy",
-    // Workspaces (phase 5): task definitions and the roles they name.
+    // Workspaces (phase 5): task definitions and the roles they name
+    // (`iam:PassRole` is a module call too since phase 7: the instance role).
     "ecs:RegisterTaskDefinition",
     "ecs:DeregisterTaskDefinition",
-    "iam:PassRole",
     "iam:AttachRolePolicy",
     "iam:DetachRolePolicy",
     // The permission check itself.
@@ -2152,4 +2611,657 @@ fn the_lifetime_cap_maximum_is_the_same_in_rust_typescript_and_hcl() {
     // And the record parser's message.
     let envs = include_str!("../environments.rs");
     assert!(envs.contains(&format!("from 0 to {max}")));
+}
+
+// ---------------------------------------------------------------------------
+// The onboarding module's optional EC2 capacity (phase 7).
+// ---------------------------------------------------------------------------
+
+/// The onboarding module's EC2 file, parsed alone.
+fn ec2_body() -> Body {
+    let text = module_files(ModuleKind::UserOnboard)
+        .iter()
+        .find(|(n, _)| *n == "ec2.tf")
+        .expect("ec2.tf")
+        .1;
+    hcl::parse(text).unwrap()
+}
+
+/// The 30 instance types the app can size (`ec2_instance_spec`).
+fn supported_instance_types() -> BTreeSet<String> {
+    let mut known = BTreeSet::new();
+    for family in [
+        "m7i", "m7g", "c7i", "c7g", "r7i", "r7g", "t3", "t4g", "m7a", "p5", "g6",
+    ] {
+        for size in [
+            "medium", "large", "xlarge", "2xlarge", "4xlarge", "8xlarge", "48xlarge",
+        ] {
+            let t = format!("{family}.{size}");
+            if crate::models::project::ec2_instance_spec(&t).is_some() {
+                known.insert(t);
+            }
+        }
+    }
+    assert_eq!(known.len(), 30);
+    known
+}
+
+/// `render` without whitespace, for comparing short lists.
+fn flat(expr: &Expression) -> String {
+    render(expr).split_whitespace().collect()
+}
+
+fn one_block<'a>(body: &'a Body, ident: &str) -> &'a Block {
+    let found: Vec<_> = body
+        .blocks()
+        .filter(|b| b.identifier.as_str() == ident)
+        .collect();
+    assert_eq!(found.len(), 1, "one {ident} block");
+    found[0]
+}
+
+fn variable<'a>(body: &'a Body, name: &str) -> &'a Block {
+    top_blocks(body, "variable")
+        .find(|b| label(b, 0) == Some(name))
+        .unwrap_or_else(|| panic!("variable {name}"))
+}
+
+/// Without `ec2_instance_type` (the default) the module makes nothing for
+/// EC2: every resource and data source of ec2.tf is counted by it, and
+/// every other one is the version-1 set, unchanged (its rendered HCL is
+/// pinned), so a Fargate-only onboarding plans as before apart from the
+/// version tag.
+#[test]
+fn ec2_capacity_exists_only_with_an_instance_type() {
+    let body = parsed(ModuleKind::UserOnboard);
+    assert_eq!(
+        render(local_def(&body, "ec2")),
+        "var.ec2_instance_type != \"\""
+    );
+    assert_eq!(render(local_def(&body, "ec2_count")), "local.ec2 ? 1 : 0");
+    assert_eq!(
+        attr(&variable(&body, "ec2_instance_type").body, "default"),
+        Some(&Expression::String(String::new()))
+    );
+
+    let ec2 = ec2_body();
+    let mut gated = 0;
+    for b in ec2.blocks() {
+        if matches!(b.identifier.as_str(), "resource" | "data") {
+            assert_eq!(
+                attr(&b.body, "count").map(render).as_deref(),
+                Some("local.ec2_count"),
+                "{:?} is not counted by the instance type",
+                b.labels
+            );
+            gated += 1;
+        }
+    }
+    assert_eq!(gated, 11);
+
+    // Everything else: exactly version 1's resources, as they were, and its
+    // reads (the environment record's check gained `assign_public_ip`,
+    // which the launch template uses; checks change no plan).
+    let ec2_addrs: BTreeSet<String> = ec2
+        .blocks()
+        .filter(|b| matches!(b.identifier.as_str(), "resource" | "data"))
+        .map(|b| format!("{} {:?}", b.identifier.as_str(), b.labels))
+        .collect();
+    let mut rest = Vec::new();
+    let mut reads = BTreeSet::new();
+    for b in body.blocks() {
+        let addr = format!("{} {:?}", b.identifier.as_str(), b.labels);
+        if ec2_addrs.contains(&addr) {
+            continue;
+        }
+        match b.identifier.as_str() {
+            "resource" => rest.push(hcl::format::to_string(b).unwrap()),
+            "data" => {
+                reads.insert(format!("{}.{}", label(b, 0).unwrap(), label(b, 1).unwrap()));
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(rest.len(), 9, "version 1's 9 resources");
+    assert_eq!(
+        reads,
+        BTreeSet::from([
+            "aws_caller_identity.current".to_string(),
+            "aws_partition.current".to_string(),
+            "aws_ssm_parameter.environment".to_string(),
+            "aws_subnet.task".to_string(),
+        ])
+    );
+    let fingerprint = sha256_prefix(&rest.join("\n"));
+    assert_eq!(
+        fingerprint, FARGATE_ONBOARDING_FINGERPRINT,
+        "a version-1 resource changed: Fargate onboardings would plan differently"
+    );
+}
+
+/// `sha256_prefix` of the onboarding module's non-EC2 resources as of
+/// version 1 (rendered by hcl-rs, in file order), with one deliberate change
+/// since: the task and execution roles write logs only into the user's own
+/// streams (`<owner_key>/*`; was the whole log group). A role-policy update
+/// in place; awslogs streams were always under that prefix.
+const FARGATE_ONBOARDING_FINGERPRINT: &str = "ff89c565c117";
+
+#[test]
+fn ec2_names_are_the_shared_names() {
+    let body = parsed(ModuleKind::UserOnboard);
+    let env = "${var.environment_name}";
+    assert_eq!(
+        template_text(local_def(&body, "ec2_name")),
+        user_ec2_stem(env, "${var.ec2_user_tag}")
+    );
+    assert_eq!(
+        expand_locals(
+            &body,
+            &template_text(local_def(&body, "instance_role_name"))
+        ),
+        user_instance_role_name(env, "${var.owner_key}")
+    );
+    let ec2 = ec2_body();
+    for ty in [
+        "aws_ecs_cluster",
+        "aws_ecs_capacity_provider",
+        "aws_launch_template",
+        "aws_autoscaling_group",
+    ] {
+        let r = resource(&ec2, ty, "ec2");
+        assert_eq!(
+            render(attr(&r.body, "name").unwrap()),
+            "local.ec2_name",
+            "{ty}"
+        );
+    }
+    let role = resource(&ec2, "aws_iam_role", "instance");
+    assert_eq!(
+        render(attr(&role.body, "name").unwrap()),
+        "local.instance_role_name"
+    );
+    let profile = resource(&ec2, "aws_iam_instance_profile", "instance");
+    assert_eq!(
+        render(attr(&profile.body, "name").unwrap()),
+        "aws_iam_role.instance[0].name"
+    );
+    assert_eq!(
+        render(attr(&profile.body, "role").unwrap()),
+        "aws_iam_role.instance[0].name"
+    );
+}
+
+/// The EC2 variables follow the app's rules: the instance type is one of
+/// the 30 the app can size (the admin policy's lists, `policies.rs` pins
+/// those), 1 to 4 instances, the user tag as `validate_ec2_user_tag` and
+/// required with a type.
+#[test]
+fn ec2_variables_mirror_the_apps_rules() {
+    let body = parsed(ModuleKind::UserOnboard);
+    let ty = variable(&body, "ec2_instance_type");
+    let cond = render(attr(&one_block(&ty.body, "validation").body, "condition").unwrap());
+    let listed: BTreeSet<String> = cond
+        .split('"')
+        .filter(|s| s.contains('.') && !s.contains(' '))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(listed, supported_instance_types());
+    assert!(
+        cond.starts_with("var.ec2_instance_type == \"\" || contains(["),
+        "{cond}"
+    );
+
+    let max = variable(&body, "ec2_max_instances");
+    assert_eq!(
+        attr(&max.body, "default"),
+        Some(&Expression::Number(1.into()))
+    );
+    let cond = render(attr(&one_block(&max.body, "validation").body, "condition").unwrap());
+    assert!(
+        cond.contains(&format!("var.ec2_max_instances <= {EC2_MAX_INSTANCES}")),
+        "{cond}"
+    );
+    assert!(cond.contains("var.ec2_max_instances >= 1"), "{cond}");
+
+    let tag = variable(&body, "ec2_user_tag");
+    let conds: Vec<String> = top_blocks(&tag.body, "validation")
+        .map(|v| render(attr(&v.body, "condition").unwrap()))
+        .collect();
+    assert_eq!(conds.len(), 2);
+    for needle in [
+        "\"^[A-Za-z0-9-]{1,32}$\"",
+        "!startswith(var.ec2_user_tag, \"-\")",
+        "!endswith(var.ec2_user_tag, \"-\")",
+        "!strcontains(var.ec2_user_tag, \"--\")",
+    ] {
+        assert!(
+            conds[0].contains(needle),
+            "{needle} missing from {}",
+            conds[0]
+        );
+    }
+    assert_eq!(
+        conds[1],
+        "var.ec2_instance_type == \"\" || var.ec2_user_tag != \"\""
+    );
+}
+
+/// The image is the ECS-optimized Amazon Linux 2023 one for the type's
+/// architecture: arm64 for Graviton families (a `g` after the generation).
+#[test]
+fn the_ami_is_the_ecs_optimized_one_for_the_architecture() {
+    let body = parsed(ModuleKind::UserOnboard);
+    assert_eq!(
+        render(local_def(&body, "ec2_arm64")),
+        "can(regex(\"^[a-z]+[0-9]+g[a-z]*\\\\.\", var.ec2_instance_type))"
+    );
+    assert_eq!(
+        render(local_def(&body, "ecs_ami_parameter")),
+        "(local.ec2_arm64 ? \"/aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended/\
+         image_id\" : \"/aws/service/ecs/optimized-ami/amazon-linux-2023/recommended/image_id\")"
+    );
+    // What that rule says for the supported types.
+    for t in supported_instance_types() {
+        let family = t.split('.').next().unwrap();
+        let arm = matches!(family, "m7g" | "c7g" | "r7g" | "t4g");
+        let rule = family
+            .trim_start_matches(|c: char| c.is_ascii_lowercase())
+            .trim_start_matches(|c: char| c.is_ascii_digit())
+            .starts_with('g');
+        assert_eq!(rule, arm, "{t}");
+    }
+    let ec2 = ec2_body();
+    let ami = top_blocks(&ec2, "data")
+        .find(|b| label(b, 0) == Some("aws_ssm_parameter"))
+        .unwrap();
+    assert_eq!(
+        render(attr(&ami.body, "name").unwrap()),
+        "local.ecs_ami_parameter"
+    );
+    let lt = resource(&ec2, "aws_launch_template", "ec2");
+    assert_eq!(
+        render(attr(&lt.body, "image_id").unwrap()),
+        "data.aws_ssm_parameter.ecs_ami[0].insecure_value"
+    );
+}
+
+/// The launch template: the variable's type, IMDSv2 at one hop, an
+/// encrypted 50 GiB gp3 root volume, the environment's tasks group named in
+/// the template, the instance profile, the agent pointed at the user's
+/// cluster with task roles for bridge tasks, and the default tags on what a launch
+/// creates. Never a default-version change (no `ModifyLaunchTemplate`).
+#[test]
+fn the_launch_template_is_pinned() {
+    let ec2 = ec2_body();
+    let lt = resource(&ec2, "aws_launch_template", "ec2");
+    let b = &lt.body;
+    assert_eq!(
+        render(attr(b, "instance_type").unwrap()),
+        "var.ec2_instance_type"
+    );
+    for forbidden in [
+        "update_default_version",
+        "default_version",
+        "vpc_security_group_ids",
+    ] {
+        assert!(attr(b, forbidden).is_none(), "{forbidden}");
+    }
+    for forbidden in [
+        "instance_market_options",
+        "instance_requirements",
+        "placement",
+    ] {
+        assert!(top_blocks(b, forbidden).next().is_none(), "{forbidden}");
+    }
+
+    let md = &one_block(b, "metadata_options").body;
+    assert_eq!(
+        attr(md, "http_tokens"),
+        Some(&Expression::String("required".into()))
+    );
+    assert_eq!(
+        attr(md, "http_put_response_hop_limit"),
+        Some(&Expression::Number(1.into()))
+    );
+    assert_eq!(
+        attr(md, "http_endpoint"),
+        Some(&Expression::String("enabled".into()))
+    );
+
+    let bdm = &one_block(b, "block_device_mappings").body;
+    assert_eq!(
+        attr(bdm, "device_name"),
+        Some(&Expression::String("/dev/xvda".into()))
+    );
+    let ebs = &one_block(bdm, "ebs").body;
+    assert_eq!(
+        attr(ebs, "volume_size"),
+        Some(&Expression::Number(crate::aws::pricing::EC2_ROOT_VOLUME_GIB.into())),
+        "the cost estimate prices this root volume"
+    );
+    assert_eq!(
+        attr(ebs, "volume_type"),
+        Some(&Expression::String("gp3".into()))
+    );
+    assert_eq!(attr(ebs, "encrypted"), Some(&Expression::Bool(true)));
+    assert_eq!(
+        attr(ebs, "delete_on_termination"),
+        Some(&Expression::Bool(true))
+    );
+
+    let nic = &one_block(b, "network_interfaces").body;
+    assert_eq!(
+        flat(attr(nic, "security_groups").unwrap()),
+        "[local.env.security_group_id]"
+    );
+    assert_eq!(
+        render(attr(nic, "associate_public_ip_address").unwrap()),
+        "local.env.assign_public_ip"
+    );
+    assert!(
+        attr(nic, "subnet_id").is_none(),
+        "the group picks the subnet"
+    );
+
+    assert_eq!(
+        render(attr(&one_block(b, "iam_instance_profile").body, "name").unwrap()),
+        "aws_iam_instance_profile.instance[0].name"
+    );
+
+    let user_data = render(attr(b, "user_data").unwrap());
+    for needle in [
+        "#!/bin/bash",
+        ">>/etc/ecs/ecs.config",
+        "ECS_CLUSTER=${aws_ecs_cluster.ec2[0].name}\n",
+        // Bridge tasks (R2) get task-role credentials from the agent's
+        // endpoint; IMDS stays out of their reach at hop limit 1.
+        "ECS_ENABLE_TASK_IAM_ROLE=true\n",
+        // awslogs writes with the task's execution role (its own streams
+        // only), so the instance role needs no log rights.
+        "ECS_ENABLE_AWSLOGS_EXECUTIONROLE_OVERRIDE=true\n",
+    ] {
+        assert!(
+            user_data.contains(needle),
+            "{needle:?} missing from {user_data}"
+        );
+    }
+    // Bridge networking: no task ENIs, and no awsvpc-only settings.
+    assert!(!user_data.contains("ECS_ENABLE_TASK_ENI"), "{user_data}");
+    assert!(!user_data.contains("AWSVPC"), "{user_data}");
+
+    let specs: BTreeSet<String> = top_blocks(b, "tag_specifications")
+        .map(|t| {
+            assert_eq!(
+                render(attr(&t.body, "tags").unwrap()),
+                "data.aws_default_tags.current[0].tags"
+            );
+            match attr(&t.body, "resource_type") {
+                Some(Expression::String(s)) => s.clone(),
+                other => panic!("{other:?}"),
+            }
+        })
+        .collect();
+    assert_eq!(
+        specs,
+        BTreeSet::from([
+            "instance".into(),
+            "volume".into(),
+            "network-interface".into()
+        ])
+    );
+}
+
+/// The group: 0 to `ec2_max_instances`, desired left to ECS, protected from
+/// scale-in (ECS's managed termination protection decides), drained before
+/// deletion, on a fixed template version, in the environment's subnets, no
+/// load balancers, every default tag plus the one ECS adds.
+#[test]
+fn the_auto_scaling_group_is_pinned() {
+    let ec2 = ec2_body();
+    let asg = resource(&ec2, "aws_autoscaling_group", "ec2");
+    let b = &asg.body;
+    assert_eq!(attr(b, "min_size"), Some(&Expression::Number(0.into())));
+    assert_eq!(
+        render(attr(b, "max_size").unwrap()),
+        "var.ec2_max_instances"
+    );
+    assert!(attr(b, "desired_capacity").is_none());
+    assert_eq!(
+        attr(b, "protect_from_scale_in"),
+        Some(&Expression::Bool(true))
+    );
+    assert_eq!(attr(b, "force_delete"), Some(&Expression::Bool(false)));
+    assert_eq!(
+        render(attr(b, "vpc_zone_identifier").unwrap()),
+        "local.env.subnet_ids"
+    );
+    for forbidden in [
+        "target_group_arns",
+        "load_balancers",
+        "availability_zones",
+        "launch_configuration",
+    ] {
+        assert!(attr(b, forbidden).is_none(), "{forbidden}");
+    }
+    for forbidden in ["mixed_instances_policy", "warm_pool", "instance_refresh"] {
+        assert!(top_blocks(b, forbidden).next().is_none(), "{forbidden}");
+    }
+    let lt = &one_block(b, "launch_template").body;
+    assert_eq!(
+        render(attr(lt, "id").unwrap()),
+        "aws_launch_template.ec2[0].id"
+    );
+    assert_eq!(
+        render(attr(lt, "version").unwrap()),
+        "aws_launch_template.ec2[0].latest_version"
+    );
+    assert_eq!(
+        flat(attr(&one_block(b, "lifecycle").body, "ignore_changes").unwrap()),
+        "[desired_capacity]"
+    );
+
+    let dynamic = one_block(b, "dynamic");
+    assert_eq!(label(dynamic, 0), Some("tag"));
+    assert_eq!(
+        render(attr(&dynamic.body, "for_each").unwrap()),
+        "data.aws_default_tags.current[0].tags"
+    );
+    let content = &one_block(&dynamic.body, "content").body;
+    assert_eq!(render(attr(content, "key").unwrap()), "tag.key");
+    assert_eq!(render(attr(content, "value").unwrap()), "tag.value");
+    let tag = &one_block(b, "tag").body;
+    assert_eq!(
+        attr(tag, "key"),
+        Some(&Expression::String("AmazonECSManaged".into()))
+    );
+}
+
+/// The capacity provider and the cluster's provider list: exactly the
+/// user's provider, the default strategy, managed scaling to a full fleet
+/// one instance at a time.
+#[test]
+fn the_capacity_provider_scales_one_instance_at_a_time() {
+    let ec2 = ec2_body();
+    let cp = resource(&ec2, "aws_ecs_capacity_provider", "ec2");
+    let asgp = &one_block(&cp.body, "auto_scaling_group_provider").body;
+    assert_eq!(
+        render(attr(asgp, "auto_scaling_group_arn").unwrap()),
+        "aws_autoscaling_group.ec2[0].arn"
+    );
+    assert_eq!(
+        attr(asgp, "managed_termination_protection"),
+        Some(&Expression::String("ENABLED".into()))
+    );
+    let ms = &one_block(asgp, "managed_scaling").body;
+    assert_eq!(
+        attr(ms, "status"),
+        Some(&Expression::String("ENABLED".into()))
+    );
+    for (k, v) in [
+        ("target_capacity", 100),
+        ("minimum_scaling_step_size", 1),
+        ("maximum_scaling_step_size", 1),
+        ("instance_warmup_period", 60),
+    ] {
+        assert_eq!(attr(ms, k), Some(&Expression::Number(v.into())), "{k}");
+    }
+
+    let ccp = resource(&ec2, "aws_ecs_cluster_capacity_providers", "ec2");
+    assert_eq!(
+        render(attr(&ccp.body, "cluster_name").unwrap()),
+        "aws_ecs_cluster.ec2[0].name"
+    );
+    assert_eq!(
+        flat(attr(&ccp.body, "capacity_providers").unwrap()),
+        "[aws_ecs_capacity_provider.ec2[0].name]"
+    );
+    let strategy = &one_block(&ccp.body, "default_capacity_provider_strategy").body;
+    assert_eq!(
+        render(attr(strategy, "capacity_provider").unwrap()),
+        "aws_ecs_capacity_provider.ec2[0].name"
+    );
+    assert_eq!(
+        attr(strategy, "weight"),
+        Some(&Expression::Number(1.into()))
+    );
+}
+
+/// The instance role: trusted by EC2, bounded, tagged with the user's
+/// cluster (the boundary's fence), and granting exactly the ECS agent's
+/// calls on that cluster and its container instances, endpoint discovery,
+/// image pulls and the environment's logs. No Session Manager core: ECS
+/// Exec's channels run on the task role.
+#[test]
+fn the_instance_role_is_ec2s_and_runs_only_the_ecs_agent() {
+    let body = parsed(ModuleKind::UserOnboard);
+    let role = resource(&body, "aws_iam_role", "instance");
+    let trust = jsonencoded(&role, "assume_role_policy");
+    assert_eq!(
+        statements(&trust),
+        vec![json!({
+            "Effect": "Allow",
+            "Principal": { "Service": "ec2.amazonaws.com" },
+            "Action": "sts:AssumeRole",
+        })]
+    );
+    let tags = attr(&role.body, "tags").unwrap();
+    assert_eq!(
+        object_keys(tags),
+        BTreeSet::from(["triple-c:cluster".to_string()])
+    );
+    assert_eq!(
+        render(object_get(tags, "triple-c:cluster").unwrap()),
+        "local.ec2_name"
+    );
+
+    let policies = role_policies(&body, "instance[0]");
+    assert_eq!(policies.len(), 1);
+    let stmts = statements(&jsonencoded(&policies[0], "policy"));
+    let mut granted = BTreeSet::new();
+    let cluster =
+        "arn:${local.partition}:ecs:${var.region}:${local.account}:cluster/${local.ec2_name}";
+    let instances = "arn:${local.partition}:ecs:${var.region}:${local.account}:\
+                     container-instance/${local.ec2_name}/*";
+    for stmt in &stmts {
+        assert!(stmt.get("Condition").is_none());
+        let resources = eval::strings(&stmt["Resource"]);
+        for a in actions(stmt) {
+            if a.starts_with("ecs:") && a != "ecs:DiscoverPollEndpoint" {
+                assert_eq!(
+                    resources,
+                    vec![cluster.to_string(), instances.to_string()],
+                    "{a}"
+                );
+            }
+            if a == "ecs:DiscoverPollEndpoint" || a == "ecr:GetAuthorizationToken" {
+                assert_eq!(resources, vec!["*".to_string()], "{a}");
+            }
+            assert!(!a.starts_with("logs:"), "the instance role writes no logs: {a}");
+            granted.insert(a);
+        }
+    }
+    let want: BTreeSet<String> = [
+        "ecs:RegisterContainerInstance",
+        "ecs:DeregisterContainerInstance",
+        "ecs:Poll",
+        "ecs:StartTelemetrySession",
+        "ecs:Submit*",
+        "ecs:UpdateContainerInstancesState",
+        "ecs:DiscoverPollEndpoint",
+        "ecr:GetAuthorizationToken",
+        "ecr:BatchGetImage",
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:BatchCheckLayerAvailability",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    assert_eq!(granted, want);
+}
+
+/// The user record (E11): `/triple-c/users/<env>/<owner key>`, a String of
+/// exactly the schema-1 fields, written only with EC2 capacity and after
+/// the cluster has its provider.
+#[test]
+fn the_user_record_has_exactly_the_schema_fields() {
+    let ec2 = ec2_body();
+    let param = resource(&ec2, "aws_ssm_parameter", "user");
+    assert_eq!(
+        template_text(attr(&param.body, "name").unwrap()),
+        user_record_parameter_name("${var.environment_name}", "${var.owner_key}")
+    );
+    assert_eq!(
+        user_record_parameter_name("dev", "0123456789ab"),
+        "/triple-c/users/dev/0123456789ab"
+    );
+    assert!(USER_RECORD.ends_with(&format!(
+        "parameter{}",
+        user_record_parameter_name(ENV, OWNER_KEY)
+    )));
+    assert!(!user_record_parameter_name("dev", "x").starts_with(&environment_parameter_name("")));
+    assert_eq!(
+        attr(&param.body, "type"),
+        Some(&Expression::String("String".into()))
+    );
+    let value = jsonencoded(&param, "value");
+    let fields: BTreeSet<String> = value.as_object().unwrap().keys().cloned().collect();
+    assert_eq!(
+        fields,
+        USER_RECORD_FIELDS.iter().map(|s| s.to_string()).collect()
+    );
+    assert_eq!(value["schema"], 1);
+    assert_eq!(value["instance_type"], "${var.ec2_instance_type}");
+    assert_eq!(value["cluster_arn"], "${aws_ecs_cluster.ec2[0].arn}");
+    assert_eq!(
+        value["capacity_provider"],
+        "${aws_ecs_capacity_provider.ec2[0].name}"
+    );
+    assert_eq!(value["user_tag"], "${var.ec2_user_tag}");
+    assert_eq!(value["max_instances"], "${var.ec2_max_instances}");
+    assert_eq!(
+        flat(attr(&param.body, "depends_on").unwrap()),
+        "[aws_ecs_cluster_capacity_providers.ec2]"
+    );
+}
+
+/// Removing EC2 capacity tears it down in a safe order (see ec2.tf): the
+/// cluster outlives the launch template (its user data names the cluster),
+/// so every instance is gone before the cluster is deleted.
+#[test]
+fn the_cluster_outlives_its_instances() {
+    let ec2 = ec2_body();
+    let lt = resource(&ec2, "aws_launch_template", "ec2");
+    assert!(render(attr(&lt.body, "user_data").unwrap()).contains("aws_ecs_cluster.ec2[0].name"));
+    let asg = resource(&ec2, "aws_autoscaling_group", "ec2");
+    assert!(hcl::format::to_string(&asg)
+        .unwrap()
+        .contains("aws_launch_template.ec2[0].id"));
+    let cp = resource(&ec2, "aws_ecs_capacity_provider", "ec2");
+    assert!(hcl::format::to_string(&cp)
+        .unwrap()
+        .contains("aws_autoscaling_group.ec2[0].arn"));
+    let ccp = resource(&ec2, "aws_ecs_cluster_capacity_providers", "ec2");
+    assert!(hcl::format::to_string(&ccp)
+        .unwrap()
+        .contains("aws_ecs_capacity_provider.ec2[0].name"));
 }

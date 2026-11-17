@@ -2,6 +2,7 @@ import type {
   AwsWorkspaceConfig,
   DetectedEnvironment,
   GatewaySettings,
+  LaunchType,
   Project,
   RepoSource,
   UnsavedWork,
@@ -11,13 +12,20 @@ import type {
 export const NOT_ON_AWS = "Not available on AWS (Fargate)";
 /** Q6: an AWS project's port mappings bind loopback only (Docker's bind 0.0.0.0). */
 export const AWS_PORTS_LOCALHOST_ONLY = "Reachable only from this machine (localhost)";
-/** R4: the AWS host forces Claude Code's sandbox off until it is verified on Fargate. */
+/** The AWS host forces Claude Code's sandbox off: bubblewrap can't run in an ECS task (Fargate P9, EC2 E8). */
 export const SANDBOX_OFF_ON_AWS = "Off on AWS for now";
 export const EPHEMERAL_WARNING =
   "Claude login and history are lost when the workspace stops.";
 
 export function isAwsProject(p: Pick<Project, "host_id">): boolean {
   return p.host_id != null;
+}
+
+/** Whether Claude Code's sandbox actually runs for `p`: never on AWS (the
+ *  host forces it off there; Rust `aws_host::sandbox_allowed`), else the
+ *  project's setting. */
+export function sandboxEffective(p: Pick<Project, "host_id" | "sandbox_mode_enabled">): boolean {
+  return !isAwsProject(p) && p.sandbox_mode_enabled;
 }
 
 /** Fargate CPU sizes (units of 1/1024 vCPU). */
@@ -77,6 +85,7 @@ export function formatMemory(mib: number): string {
 /** Mirrors Rust `AwsWorkspaceConfig::default()`. */
 export function defaultAwsWorkspace(): AwsWorkspaceConfig {
   return {
+    launch_type: "fargate",
     cpu: 1024,
     memory_mib: 4096,
     arch: "x86_64",
@@ -197,6 +206,7 @@ export function gatewaySidecarProblem(
   project: Pick<Project, "backend" | "aws">,
   gateway: Pick<GatewaySettings, "models"> | null,
 ): string | null {
+  if (project.aws?.launch_type === "ec2") return EC2_NO_SIDECAR;
   if (project.backend !== "open_ai_compatible") {
     return "The LLM gateway sidecar needs the OpenAI Compatible backend.";
   }
@@ -237,3 +247,79 @@ export function localEndpointProblem(url: string, gatewayPort: number | null): s
   }
   return null;
 }
+
+/** What an EC2 instance leaves for a workspace's reservations (Rust `ec2_available`). */
+export interface Ec2Limits {
+  cpu: number;
+  memory_mib: number;
+}
+
+/** The largest Fargate CPU size at most `cpu` (the smallest when below them all). */
+function fargateCpuAtMost(cpu: number): number {
+  return [...FARGATE_CPUS].reverse().find((c) => c <= cpu) ?? FARGATE_CPUS[0];
+}
+
+/**
+ * The save patch for switching an AWS project's launch type — the one place
+ * the switch is made. Each side keeps only what Rust accepts there:
+ * - to Fargate: Docker access and VPN off (they need EC2), and the
+ *   reservations snapped to a Fargate CPU/memory pair;
+ * - to EC2: the gateway sidecar and Spot off (neither is available on EC2),
+ *   and the reservations lowered to what the instance leaves (`limits`, when
+ *   known).
+ */
+export function launchTypePatch(
+  project: Project,
+  launch_type: LaunchType,
+  limits: Ec2Limits | null = null,
+): Partial<Project> {
+  const aws: AwsWorkspaceConfig = { ...project.aws!, launch_type };
+  const patch: Partial<Project> = { aws };
+  if (launch_type === "ec2") {
+    aws.gateway_sidecar = false;
+    aws.spot = false;
+    if (limits) {
+      aws.cpu = Math.min(aws.cpu, limits.cpu);
+      aws.memory_mib = Math.min(aws.memory_mib, limits.memory_mib);
+    }
+  } else {
+    patch.allow_docker_access = false;
+    patch.vpn_support_enabled = false;
+    aws.cpu = fargateCpuAtMost(aws.cpu);
+    if (memoryError(aws.cpu, aws.memory_mib)) aws.memory_mib = nearestMemory(aws.cpu, aws.memory_mib);
+  }
+  return patch;
+}
+
+/**
+ * What a launch-type switch's [`launchTypePatch`] changed beyond the launch
+ * type, as one short line for Host settings (null: nothing else changed).
+ */
+export function launchTypeChanges(before: Project, patch: Partial<Project>): string | null {
+  const was = before.aws!;
+  const now = patch.aws!;
+  const changes: string[] = [];
+  if (now.cpu !== was.cpu) changes.push(`CPU ${was.cpu} → ${now.cpu} units`);
+  if (now.memory_mib !== was.memory_mib) changes.push(`memory ${was.memory_mib} → ${now.memory_mib} MiB`);
+  if (was.spot && !now.spot) changes.push("Spot turned off");
+  if (was.gateway_sidecar && !now.gateway_sidecar) changes.push("LLM gateway sidecar turned off");
+  if (before.allow_docker_access && patch.allow_docker_access === false) changes.push("Docker access turned off");
+  if (before.vpn_support_enabled && patch.vpn_support_enabled === false) changes.push("VPN support turned off");
+  if (changes.length === 0) return null;
+  const to = now.launch_type === "ec2" ? "EC2" : "Fargate";
+  return `Switched to ${to}: ${changes.join(", ")}.`;
+}
+
+/** Mirrors Rust `aws::workspace::EC2_NO_SIDECAR`. */
+export const EC2_NO_SIDECAR =
+  "The LLM gateway sidecar is not available on EC2 yet: turn it off, or run the project on Fargate";
+
+/** Host settings' notes for an EC2 project (phase 7). */
+export const EC2_SCALE_TO_ZERO_NOTE =
+  "Your instances scale to zero when no workspace is running, so the first start after idle boots an instance — about 3 minutes.";
+export const EC2_DOCKER_ACCESS_NOTE =
+  "Docker access mounts your instance's Docker socket: that is root on your own instance, which nobody else's workspace runs on.";
+/** RuntimeSection's VPN hint for an EC2 project: an ECS task, not a container the app recreates. */
+export const EC2_VPN_HINT =
+  "Grants NET_ADMIN, the /dev/net/tun device and src_valid_mark so a VPN client (PIA, WireGuard, OpenVPN) can build a tunnel inside the workspace, an ECS task on your own EC2 instance. Anything in the workspace can then reconfigure the task's own network stack; the instance's is untouched. Applies on the project's next start.";
+export const EC2_NO_CAPACITY = "Ask an admin to add EC2 capacity to your onboarding";

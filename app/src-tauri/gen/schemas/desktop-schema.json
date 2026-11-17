@@ -423,6 +423,12 @@
           "markdownDescription": "Enables the aws_cost_estimate command without any pre-configured scope."
         },
         {
+          "description": "Enables the aws_ec2_capacity command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-aws-ec2-capacity",
+          "markdownDescription": "Enables the aws_ec2_capacity command without any pre-configured scope."
+        },
+        {
           "description": "Enables the aws_environment_max_hours command without any pre-configured scope.",
           "type": "string",
           "const": "allow-aws-environment-max-hours",
@@ -645,6 +651,12 @@
           "markdownDescription": "Enables the download_container_file command without any pre-configured scope."
         },
         {
+          "description": "Enables the ec2_fit_problem command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-ec2-fit-problem",
+          "markdownDescription": "Enables the ec2_fit_problem command without any pre-configured scope."
+        },
+        {
           "description": "Enables the export_settings command without any pre-configured scope.",
           "type": "string",
           "const": "allow-export-settings",
@@ -823,6 +835,12 @@
           "type": "string",
           "const": "allow-list-container-files",
           "markdownDescription": "Enables the list_container_files command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the list_ec2_instance_types command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-list-ec2-instance-types",
+          "markdownDescription": "Enables the list_ec2_instance_types command without any pre-configured scope."
         },
         {
           "description": "Enables the list_marketplace_snapshots command without any pre-configured scope.",
@@ -1395,6 +1413,12 @@
           "markdownDescription": "Denies the aws_cost_estimate command without any pre-configured scope."
         },
         {
+          "description": "Denies the aws_ec2_capacity command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-aws-ec2-capacity",
+          "markdownDescription": "Denies the aws_ec2_capacity command without any pre-configured scope."
+        },
+        {
           "description": "Denies the aws_environment_max_hours command without any pre-configured scope.",
           "type": "string",
           "const": "deny-aws-environment-max-hours",
@@ -1617,6 +1641,12 @@
           "markdownDescription": "Denies the download_container_file command without any pre-configured scope."
         },
         {
+          "description": "Denies the ec2_fit_problem command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-ec2-fit-problem",
+          "markdownDescription": "Denies the ec2_fit_problem command without any pre-configured scope."
+        },
+        {
           "description": "Denies the export_settings command without any pre-configured scope.",
           "type": "string",
           "const": "deny-export-settings",
@@ -1795,6 +1825,12 @@
           "type": "string",
           "const": "deny-list-container-files",
           "markdownDescription": "Denies the list_container_files command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the list_ec2_instance_types command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-list-ec2-instance-types",
+          "markdownDescription": "Denies the list_ec2_instance_types command without any pre-configured scope."
         },
         {
           "description": "Denies the list_marketplace_snapshots command without any pre-configured scope.",

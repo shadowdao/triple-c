@@ -1,7 +1,15 @@
 import { useEffect, useRef, useState } from "react";
-import type { AwsWorkspaceConfig, HostConnection, Project, RepoSource } from "../../../../lib/types";
+import type {
+  AwsWorkspaceConfig,
+  Ec2Capacity,
+  HostConnection,
+  LaunchType,
+  Project,
+  RepoSource,
+} from "../../../../lib/types";
 import * as commands from "../../../../lib/tauri-commands";
 import { environmentMaxHours } from "../../../../lib/environmentMaxHours";
+import { useEc2Capacity } from "../../../../lib/ec2Capacity";
 import { useAppState } from "../../../../store/appState";
 import {
   COPY_AT_CONNECT_GATEWAY_NOTE,
@@ -16,6 +24,13 @@ import {
   setupScriptProblem,
   EFS_HINT,
   EPHEMERAL_WARNING,
+  EC2_DOCKER_ACCESS_NOTE,
+  EC2_NO_CAPACITY,
+  EC2_NO_SIDECAR,
+  EC2_SCALE_TO_ZERO_NOTE,
+  launchTypeChanges,
+  launchTypePatch,
+  type Ec2Limits,
   FARGATE_CPUS,
   defaultAwsWorkspace,
   formatCpu,
@@ -43,6 +58,21 @@ interface Props {
 const DEFAULT_IDLE_MINUTES = 60;
 const STILL_RUNNING = "The task is still running — stop it first.";
 
+/** Why EC2 can't be chosen, from what the user's record says (null: it can). */
+function ec2Unavailable(capacity: Ec2Capacity | null): string | null {
+  if (capacity === null) return "Checking your EC2 capacity in this environment…";
+  switch (capacity.state) {
+    case "ec2":
+      return null;
+    case "none":
+      return `You have no EC2 capacity in this environment. ${EC2_NO_CAPACITY}.`;
+    case "unusable":
+      return `Your EC2 capacity record can't be used (${capacity.reason}). ${EC2_NO_CAPACITY}.`;
+    case "unknown":
+      return "Could not read your EC2 capacity in this environment; EC2 is offered once it can be read.";
+  }
+}
+
 /**
  * Where an AWS project runs and what its Fargate task looks like. Only shown
  * for AWS projects; a local project's host is chosen when it is added.
@@ -55,6 +85,7 @@ export default function HostSection({ project, save, disabled }: Props) {
   const hosts = useAppState((s) => s.appSettings?.hosts ?? NO_HOSTS);
   const connection = hosts.find((h) => h.id === project.host_id);
 
+  const [cpuText, setCpuText] = useState(String(aws.cpu));
   const [memory, setMemory] = useState(String(aws.memory_mib));
   const [memoryProblem, setMemoryProblem] = useState<string | null>(null);
   const [ephemeral, setEphemeral] = useState(String(aws.ephemeral_gib));
@@ -66,12 +97,47 @@ export default function HostSection({ project, save, disabled }: Props) {
   const [setupProblem, setSetupProblem] = useState<string | null>(null);
   // The environment's advisory lifetime cap (Q8), from its record.
   const [maxHours, setMaxHours] = useState<number | null>(null);
+  // What the last launch-type switch changed besides the type (M6).
+  const [switchNote, setSwitchNote] = useState<string | null>(null);
 
   useEffect(() => {
+    setCpuText(String(aws.cpu));
     setMemory(String(aws.memory_mib));
     setEphemeral(String(aws.ephemeral_gib));
     setIdle(String(aws.idle_stop_minutes ?? DEFAULT_IDLE_MINUTES));
-  }, [aws.memory_mib, aws.ephemeral_gib, aws.idle_stop_minutes]);
+  }, [aws.cpu, aws.memory_mib, aws.ephemeral_gib, aws.idle_stop_minutes]);
+
+  // Phase 7: the user's own EC2 capacity in this environment (their record),
+  // which decides whether EC2 can be chosen and what it can reserve.
+  const capacity = useEc2Capacity(project);
+  const ec2 = aws.launch_type === "ec2";
+  const compute = capacity?.state === "ec2" ? capacity.compute : null;
+  const limits: Ec2Limits | null =
+    capacity?.state === "ec2" && capacity.available_cpu !== null && capacity.available_memory_mib !== null
+      ? { cpu: capacity.available_cpu, memory_mib: capacity.available_memory_mib }
+      : null;
+  const ec2Reason = ec2Unavailable(capacity);
+
+  // Once the instance type is known, check the stored reservations against
+  // it (Rust's fit rule): an instance type changed at onboarding, or a
+  // record that came back after a save, can leave them too big.
+  const checkedFit = useRef<string | null>(null);
+  useEffect(() => {
+    if (!ec2 || !compute) return;
+    const key = `${project.id}:${compute.instance_type}`;
+    if (checkedFit.current === key) return;
+    checkedFit.current = key;
+    let cancelled = false;
+    commands
+      .ec2FitProblem(latest.current.value, compute.instance_type)
+      .then((problem) => {
+        if (!cancelled && problem) setMemoryProblem(`The saved reservations no longer fit: ${problem}`);
+      })
+      .catch(() => {}); // The start checks again.
+    return () => {
+      cancelled = true;
+    };
+  }, [ec2, compute, project.id]);
 
   useEffect(() => {
     setSetupScript(aws.setup_script ?? "");
@@ -104,7 +170,11 @@ export default function HostSection({ project, save, disabled }: Props) {
   if (latest.current.base !== project.aws && latest.current.inFlight === 0) {
     latest.current = { base: project.aws, value: aws, inFlight: 0 };
   }
-  const saveAws = async (patch: Partial<AwsWorkspaceConfig>) => {
+  // Bumped by every save: a launch-type note only shows if no later save began.
+  const saveSeq = useRef(0);
+  const saveAws = async (patch: Partial<AwsWorkspaceConfig>, also: Partial<Project> = {}) => {
+    saveSeq.current += 1;
+    setSwitchNote(null);
     const l = latest.current;
     const next = { ...l.value, ...patch };
     l.value = next;
@@ -114,7 +184,7 @@ export default function HostSection({ project, save, disabled }: Props) {
       if (l.value === next) l.value = l.base ?? defaultAwsWorkspace();
     };
     try {
-      const ok = await save({ aws: next });
+      const ok = await save({ ...also, aws: next });
       if (!ok) refused();
       return ok;
     } catch (e) {
@@ -140,6 +210,50 @@ export default function HostSection({ project, save, disabled }: Props) {
   const keptWorkspaceFiles = aws.storage !== "efs" && !!aws.workspace_access_point_id;
   // Not `disabled` (which also allows Error): on AWS, Error can mean a live task.
   const stopped = project.status === "stopped";
+
+  // The launch-type switch: `launchTypePatch` keeps each side to what Rust
+  // accepts there (Docker/VPN, the sidecar, Spot, the sizes).
+  const switchLaunchType = (launch_type: LaunchType) => {
+    if (launch_type === latest.current.value.launch_type) return;
+    setMemoryProblem(null);
+    const before = { ...project, aws: latest.current.value };
+    const patch = launchTypePatch(before, launch_type, limits);
+    const note = launchTypeChanges(before, patch);
+    const { aws: next, ...also } = patch;
+    // Shown only once the save went through, and dropped by any later save.
+    const pending = saveAws(next!, also);
+    const seq = saveSeq.current;
+    void pending.then((ok) => {
+      if (ok && saveSeq.current === seq) setSwitchNote(note);
+    });
+  };
+
+  // EC2 reservations: positive whole numbers that fit the user's instance
+  // type — checked by Rust's own fit rule (`ec2_fit_problem`), so this never
+  // disagrees with the start.
+  const commitEc2Sizing = async () => {
+    const cpu = Number(cpuText);
+    const memory_mib = Number(memory);
+    const whole = (n: number) => Number.isInteger(n) && n > 0;
+    if (!whole(cpu) || !whole(memory_mib)) {
+      setMemoryProblem("The CPU and memory reservations must be positive whole numbers");
+      return;
+    }
+    if (compute) {
+      let problem: string | null = null;
+      try {
+        problem = await commands.ec2FitProblem({ ...aws, cpu, memory_mib }, compute.instance_type);
+      } catch {
+        problem = null; // The start checks again.
+      }
+      if (problem) {
+        setMemoryProblem(problem);
+        return;
+      }
+    }
+    setMemoryProblem(null);
+    if (cpu !== aws.cpu || memory_mib !== aws.memory_mib) void saveAws({ cpu, memory_mib });
+  };
 
   const commitMemory = () => {
     const value = Number(memory);
@@ -176,7 +290,11 @@ export default function HostSection({ project, save, disabled }: Props) {
   return (
     <ConfigGroup
       title="Host"
-      description="This project runs as an AWS Fargate task. Changes apply on its next start."
+      description={
+        ec2
+          ? "This project runs on your own EC2 instances, as an ECS task. Changes apply on its next start."
+          : "This project runs as an AWS Fargate task. Changes apply on its next start."
+      }
     >
       <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-[13px]">
         <dt className="text-[var(--text-secondary)]">Connection</dt>
@@ -200,79 +318,173 @@ export default function HostSection({ project, save, disabled }: Props) {
         </p>
       )}
 
-      <div className="flex flex-wrap gap-4">
-        <Field label="CPU">
-          {(id) => (
-            <select
-              id={id}
-              value={aws.cpu}
-              disabled={disabled}
-              className={selectClass}
-              onChange={(e) => {
-                const cpu = Number(e.target.value);
-                const memory_mib = memoryError(cpu, aws.memory_mib)
-                  ? nearestMemory(cpu, aws.memory_mib)
-                  : aws.memory_mib;
-                setMemoryProblem(null);
-                void saveAws({ cpu, memory_mib });
-              }}
-            >
-              {FARGATE_CPUS.filter(
-                // The gateway sidecar needs 1 vCPU / 2 GiB (Rust validates it too).
-                (c) => !aws.gateway_sidecar || c >= GATEWAY_SIDECAR_MIN_CPU,
-              ).map((c) => (
-                <option key={c} value={c}>
-                  {formatCpu(c)}
-                </option>
-              ))}
-            </select>
-          )}
-        </Field>
-        <Field
-          label="Memory (MiB)"
-          hint={(() => {
-            const opts = memoryOptions(aws.cpu);
-            return `${formatMemory(opts[0])} to ${formatMemory(opts[opts.length - 1])} with ${formatCpu(aws.cpu)}.`;
-          })()}
-        >
-          {(id) => (
-            <>
+      <div>
+        <span className="block text-[13px] font-medium text-[var(--text-primary)] mb-1">
+          Launch type
+        </span>
+        <SegmentedControl
+          label="Launch type"
+          value={aws.launch_type}
+          disabled={disabled}
+          onChange={switchLaunchType}
+          segments={[
+            { value: "fargate", label: "Fargate" },
+            {
+              value: "ec2",
+              label: compute ? `EC2 (your instance: ${compute.instance_type})` : "EC2",
+              disabled: !compute && !ec2,
+            },
+          ]}
+        />
+        {ec2Reason && (
+          <p
+            className={`mt-1 text-xs ${ec2 && capacity !== null && capacity.state !== "unknown" ? "text-[var(--warning)]" : "text-[var(--text-secondary)]"}`}
+          >
+            {ec2 && capacity !== null && capacity.state !== "unknown"
+              ? `This project can't start on EC2 now: ${ec2Reason} Or switch it to Fargate.`
+              : ec2Reason}
+          </p>
+        )}
+        {switchNote && (
+          <p role="status" className="mt-1 text-xs text-[var(--text-secondary)]">
+            {switchNote}
+          </p>
+        )}
+        {ec2 && (
+          <ul
+            role="note"
+            aria-label="On EC2"
+            className="mt-2 px-2 py-1.5 text-xs text-[var(--text-secondary)] bg-[var(--bg-secondary)] border border-[var(--border-color)] rounded-[var(--radius-control)] list-disc list-inside space-y-0.5"
+          >
+            <li>{EC2_SCALE_TO_ZERO_NOTE}</li>
+            <li>{EC2_DOCKER_ACCESS_NOTE}</li>
+            <li>{EC2_NO_SIDECAR}.</li>
+          </ul>
+        )}
+      </div>
+
+      {ec2 ? (
+        <div className="flex flex-wrap gap-4">
+          <Field
+            label="CPU reservation (units)"
+            hint={
+              limits && compute
+                ? `1024 units = 1 vCPU. Up to ${limits.cpu} on your ${compute.instance_type}.`
+                : "1024 units = 1 vCPU. It must fit your instance type."
+            }
+          >
+            {(id) => (
+              <input
+                id={id}
+                inputMode="numeric"
+                value={cpuText}
+                disabled={disabled}
+                aria-invalid={memoryProblem ? true : undefined}
+                onChange={(e) => setCpuText(e.target.value)}
+                onBlur={() => void commitEc2Sizing()}
+                onKeyDown={(e) => e.key === "Enter" && void commitEc2Sizing()}
+                className={`w-32 ${inputClass}`}
+              />
+            )}
+          </Field>
+          <Field
+            label="Memory reservation (MiB)"
+            hint={
+              limits && compute
+                ? `Up to ${limits.memory_mib} MiB on your ${compute.instance_type} (a tenth is kept for the instance).`
+                : "It must fit your instance type."
+            }
+          >
+            {(id) => (
               <input
                 id={id}
                 inputMode="numeric"
                 value={memory}
                 disabled={disabled}
-                list={`${id}-options`}
                 aria-invalid={memoryProblem ? true : undefined}
                 onChange={(e) => setMemory(e.target.value)}
-                onBlur={commitMemory}
-                onKeyDown={(e) => e.key === "Enter" && commitMemory()}
+                onBlur={() => void commitEc2Sizing()}
+                onKeyDown={(e) => e.key === "Enter" && void commitEc2Sizing()}
                 className={`w-32 ${inputClass}`}
               />
-              <datalist id={`${id}-options`}>
-                {memoryOptions(aws.cpu).map((m) => (
-                  <option key={m} value={m} />
-                ))}
-              </datalist>
-            </>
-          )}
-        </Field>
-        <div>
-          <span className="block text-[13px] font-medium text-[var(--text-primary)] mb-1">
-            Architecture
-          </span>
-          <SegmentedControl
-            label="Architecture"
-            value={aws.arch}
-            disabled={disabled}
-            onChange={(arch) => void saveAws({ arch })}
-            segments={[
-              { value: "x86_64", label: "x86_64" },
-              { value: "arm64", label: "ARM64 (Graviton)" },
-            ]}
-          />
+            )}
+          </Field>
         </div>
-      </div>
+      ) : (
+        <div className="flex flex-wrap gap-4">
+          <Field label="CPU">
+            {(id) => (
+              <select
+                id={id}
+                value={aws.cpu}
+                disabled={disabled}
+                className={selectClass}
+                onChange={(e) => {
+                  const cpu = Number(e.target.value);
+                  const memory_mib = memoryError(cpu, aws.memory_mib)
+                    ? nearestMemory(cpu, aws.memory_mib)
+                    : aws.memory_mib;
+                  setMemoryProblem(null);
+                  void saveAws({ cpu, memory_mib });
+                }}
+              >
+                {FARGATE_CPUS.filter(
+                  // The gateway sidecar needs 1 vCPU / 2 GiB (Rust validates it too).
+                  (c) => !aws.gateway_sidecar || c >= GATEWAY_SIDECAR_MIN_CPU,
+                ).map((c) => (
+                  <option key={c} value={c}>
+                    {formatCpu(c)}
+                  </option>
+                ))}
+              </select>
+            )}
+          </Field>
+          <Field
+            label="Memory (MiB)"
+            hint={(() => {
+              const opts = memoryOptions(aws.cpu);
+              return `${formatMemory(opts[0])} to ${formatMemory(opts[opts.length - 1])} with ${formatCpu(aws.cpu)}.`;
+            })()}
+          >
+            {(id) => (
+              <>
+                <input
+                  id={id}
+                  inputMode="numeric"
+                  value={memory}
+                  disabled={disabled}
+                  list={`${id}-options`}
+                  aria-invalid={memoryProblem ? true : undefined}
+                  onChange={(e) => setMemory(e.target.value)}
+                  onBlur={commitMemory}
+                  onKeyDown={(e) => e.key === "Enter" && commitMemory()}
+                  className={`w-32 ${inputClass}`}
+                />
+                <datalist id={`${id}-options`}>
+                  {memoryOptions(aws.cpu).map((m) => (
+                    <option key={m} value={m} />
+                  ))}
+                </datalist>
+              </>
+            )}
+          </Field>
+          <div>
+            <span className="block text-[13px] font-medium text-[var(--text-primary)] mb-1">
+              Architecture
+            </span>
+            <SegmentedControl
+              label="Architecture"
+              value={aws.arch}
+              disabled={disabled}
+              onChange={(arch) => void saveAws({ arch })}
+              segments={[
+                { value: "x86_64", label: "x86_64" },
+                { value: "arm64", label: "ARM64 (Graviton)" },
+              ]}
+            />
+          </div>
+        </div>
+      )}
       {memoryProblem && (
         <p role="alert" className="text-xs text-[var(--error)]">
           {memoryProblem}
@@ -328,60 +540,66 @@ export default function HostSection({ project, save, disabled }: Props) {
         )}
       </div>
 
-      <Field
-        label="Ephemeral storage (GiB)"
-        hint={
-          aws.storage === "efs"
-            ? "The task's local disk: 21 to 200 GiB. With EFS storage, /workspace is on EFS instead."
-            : "The task's local disk: 21 to 200 GiB. Repositories and builds live here."
-        }
-      >
-        {(id) => (
-          <input
-            id={id}
-            inputMode="numeric"
-            value={ephemeral}
-            disabled={disabled}
-            aria-invalid={ephemeralProblem ? true : undefined}
-            onChange={(e) => setEphemeral(e.target.value)}
-            onBlur={commitEphemeral}
-            className={`w-24 ${inputClass}`}
-          />
-        )}
-      </Field>
-      {ephemeralProblem && (
-        <p role="alert" className="text-xs text-[var(--error)]">
-          {ephemeralProblem}
-        </p>
-      )}
+      {!ec2 && (
+        <>
+          <Field
+            label="Ephemeral storage (GiB)"
+            hint={
+              aws.storage === "efs"
+                ? "The task's local disk: 21 to 200 GiB. With EFS storage, /workspace is on EFS instead."
+                : "The task's local disk: 21 to 200 GiB. Repositories and builds live here."
+            }
+          >
+            {(id) => (
+              <input
+                id={id}
+                inputMode="numeric"
+                value={ephemeral}
+                disabled={disabled}
+                aria-invalid={ephemeralProblem ? true : undefined}
+                onChange={(e) => setEphemeral(e.target.value)}
+                onBlur={commitEphemeral}
+                className={`w-24 ${inputClass}`}
+              />
+            )}
+          </Field>
+          {ephemeralProblem && (
+            <p role="alert" className="text-xs text-[var(--error)]">
+              {ephemeralProblem}
+            </p>
+          )}
 
-      <SwitchRow
-        label="Spot"
-        hint={
-          aws.wip_push_on_stop
-            ? "Runs on spare capacity at up to 70% off. AWS may reclaim it with two minutes' notice; the work-in-progress push below still runs."
-            : "Runs on spare capacity at up to 70% off. AWS may reclaim it with two minutes' notice, and with the work-in-progress push below off, unpushed work is lost."
-        }
-        control={
-          <Toggle
+          <SwitchRow
             label="Spot"
-            checked={aws.spot}
-            disabled={disabled}
-            onChange={(spot) => void saveAws({ spot })}
+            hint={
+              aws.wip_push_on_stop
+                ? "Runs on spare capacity at up to 70% off. AWS may reclaim it with two minutes' notice; the work-in-progress push below still runs."
+                : "Runs on spare capacity at up to 70% off. AWS may reclaim it with two minutes' notice, and with the work-in-progress push below off, unpushed work is lost."
+            }
+            control={
+              <Toggle
+                label="Spot"
+                checked={aws.spot}
+                disabled={disabled}
+                onChange={(spot) => void saveAws({ spot })}
+              />
+            }
           />
-        }
-      />
+        </>
+      )}
 
       <section aria-label="Estimated cost">
         <h3 className="text-[13px] font-medium text-[var(--text-primary)]">Estimated cost</h3>
         <p className="mt-0.5 mb-1 text-xs text-[var(--text-secondary)] leading-snug">
-          The on-demand Fargate price in this region for the CPU, memory, architecture and disk
-          above.
+          {ec2
+            ? `The on-demand price in this region of your EC2 instance${compute ? ` (${compute.instance_type})` : ""}, whatever this project reserves of it.`
+            : "The on-demand Fargate price in this region for the CPU, memory, architecture and disk above."}
         </p>
         <AwsCostEstimate
           connectionId={connection ? connection.id : null}
           region={project.aws_placement?.region}
           config={aws}
+          instanceType={compute?.instance_type ?? null}
         />
       </section>
 

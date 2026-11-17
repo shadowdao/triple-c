@@ -92,7 +92,11 @@ export interface RepoSource {
   folder: string;
 }
 
+export type LaunchType = "fargate" | "ec2";
+
 export interface AwsWorkspaceConfig {
+  /** Absent in old data = fargate. */
+  launch_type: LaunchType;
   cpu: number;
   memory_mib: number;
   arch: Arch;
@@ -1276,6 +1280,12 @@ export interface HourlyEstimate {
   note_spot: boolean;
   /** Hybrid or EFS storage: EFS is billed per GB-month, not in this figure. */
   efs_billed_separately: boolean;
+  /** EC2 (E10): the user's instance's on-demand price, whatever the project
+   *  reserves of it; instances scale to zero when no workspace is running. */
+  ec2_instance: boolean;
+  /** EC2: the figure includes the instance's 50 GiB gp3 root volume (its
+   *  price could be read). A public IPv4 address is never in it. */
+  root_volume_included: boolean;
 }
 
 export type Verdict = "allowed" | "denied" | "unverified";
@@ -1352,12 +1362,68 @@ export type EnvironmentState =
 /** `push_state`: push the state a failed run on this machine couldn't save (`errored.tfstate`) back to the bucket. */
 export type EnvironmentAction = "join" | "update" | "repair" | "destroy" | "follow" | "unlock" | "push_state";
 
-/** `incomplete`: the last onboarding run didn't finish (Join re-applies and finishes it). */
+/** A user's EC2 capacity in an environment: their validated user record (`aws::environments::UserCompute`). */
+export interface UserCompute {
+  instance_type: string;
+  max_instances: number;
+  /** The `triple-c-user` value the cluster is named after. */
+  user_tag: string;
+  cluster_arn: string;
+  capacity_provider: string;
+}
+
+/** `incomplete`: the last onboarding run didn't finish (Join re-applies and finishes it). `ec2`: the caller's recorded EC2 capacity, null for none. */
 export type OnboardingState =
-  | { state: "joined" }
+  | { state: "joined"; ec2: UserCompute | null }
   | { state: "not_joined" }
   | { state: "in_progress"; lock: LockInfo | null }
-  | { state: "incomplete"; lock: LockInfo | null };
+  | { state: "incomplete"; lock: LockInfo | null; ec2: UserCompute | null };
+
+/** EC2 capacity as the onboarding module takes it (`aws::tofu_modules::Ec2Compute`). */
+export interface Ec2Compute {
+  instance_type: string;
+  /** 1 to 4. */
+  max_instances: number;
+  /** The user's `triple-c-user` sign-in tag value. */
+  user_tag: string;
+}
+
+/** An onboarding's EC2 choice (`environment_commands::Ec2Choice`). */
+export type Ec2Choice = { kind: "none" } | ({ kind: "ec2" } & Ec2Compute);
+
+/** `host::aws_host::Ec2Capacity`: the user's EC2 capacity in an AWS project's
+ *  environment, for Host settings (phase 7). `available_*` are what the
+ *  instance leaves for one workspace (null for a type the app doesn't know). */
+export type Ec2Capacity =
+  | {
+      state: "ec2";
+      compute: UserCompute;
+      available_cpu: number | null;
+      available_memory_mib: number | null;
+    }
+  | { state: "none" }
+  | { state: "unusable"; reason: string }
+  | { state: "unknown" };
+
+/** One row of the app's built-in instance table (`models::project::Ec2InstanceType`). */
+export interface Ec2InstanceType {
+  instance_type: string;
+  arch: Arch;
+  vcpu: number;
+  memory_mib: number;
+}
+
+/** `environment_commands::SavedBundle`. */
+export interface SavedBundle {
+  folder: string;
+  /** An onboarding bundle's EC2 name looks taken (a warning; the README has the admin check). */
+  warning: string | null;
+}
+
+export interface Ec2InstanceTable {
+  default_type: string;
+  types: Ec2InstanceType[];
+}
 
 export type Knowable = "yes" | "no" | "unknown";
 

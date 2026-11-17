@@ -25,7 +25,7 @@ use aws_sdk_ecs::types::{
     ManagedAgentName, NetworkConfiguration, Tag, Task, TaskField,
 };
 
-use super::environments::EnvironmentInfo;
+use super::environments::{EnvironmentInfo, UserCompute};
 use super::error::{classify_sdk_error, AwsError};
 pub use super::tofu_modules::task_log_stream;
 use super::workspace::{workspace_tags, CONTAINER_NAME, TAG_OWNER, TAG_PROJECT};
@@ -62,8 +62,17 @@ pub struct TaskInfo {
     pub task_definition_arn: String,
     /// The `workspace` container's runtime id (needed for an SSM target).
     pub runtime_id: Option<String>,
+    /// The EC2 container instance the task was placed on; `None` on Fargate,
+    /// and on EC2 until an instance has room for it.
+    pub container_instance_arn: Option<String>,
     /// The `workspace` container's ExecuteCommandAgent is RUNNING.
     pub exec_agent_running: bool,
+    /// ECS Exec is on for the task (`enableExecuteCommand`). ECS turns it
+    /// off on a RunTask that has to wait for an EC2 instance (verified live,
+    /// phase 7), and such a task can never be reached.
+    pub exec_enabled: bool,
+    /// When ECS created the task (Unix seconds), if it says.
+    pub created_unix: Option<i64>,
     /// The `workspace` container's exit code, once it has one.
     pub exit_code: Option<i32>,
     /// Its `triple-c:owner` / `triple-c:project` tags (DescribeTasks with
@@ -112,6 +121,9 @@ pub(crate) fn task_info(t: &Task) -> TaskInfo {
         stopped_reason: t.stopped_reason().map(str::to_string),
         task_definition_arn: t.task_definition_arn().unwrap_or_default().to_string(),
         runtime_id: workspace.and_then(|c| c.runtime_id()).map(str::to_string),
+        container_instance_arn: t.container_instance_arn().map(str::to_string),
+        exec_enabled: t.enable_execute_command(),
+        created_unix: t.created_at().map(|d| d.secs()),
         exec_agent_running: workspace.is_some_and(|c| {
             c.managed_agents().iter().any(|a| {
                 a.name() == Some(&ManagedAgentName::ExecuteCommandAgent)
@@ -216,6 +228,65 @@ pub fn run_task_request(
     req.build().expect(BUILT)
 }
 
+/// Where a new task runs.
+#[derive(Debug, Clone, Copy)]
+pub enum RunOn<'a> {
+    /// The environment's cluster, Fargate (or `FARGATE_SPOT`).
+    Fargate { spot: bool },
+    /// The user's own cluster and capacity provider (phase 7), from their
+    /// record.
+    Ec2(&'a UserCompute),
+}
+
+impl RunOn<'_> {
+    /// The cluster a task runs on, and is looked for in.
+    pub fn cluster<'e>(&'e self, env: &'e EnvironmentInfo) -> &'e str {
+        match self {
+            RunOn::Fargate { .. } => &env.cluster_arn,
+            RunOn::Ec2(c) => &c.cluster_arn,
+        }
+    }
+}
+
+/// The RunTask request on the user's EC2 capacity: the exact revision, on
+/// their cluster, placed by their capacity provider (weight 1). No launch
+/// type (exclusive with a strategy) and no network configuration: EC2 tasks
+/// use `bridge` networking (ruling R2). ECS Exec, tags, the client token and
+/// no overrides as on Fargate (P1).
+pub fn ec2_run_task_request(
+    compute: &UserCompute,
+    task_def_arn: &str,
+    tags: &[(String, String)],
+) -> RunTaskInput {
+    const BUILT: &str = "every required field is set";
+    RunTaskInput::builder()
+        .cluster(&compute.cluster_arn)
+        .task_definition(task_def_arn)
+        .count(1)
+        .enable_execute_command(true)
+        .capacity_provider_strategy(
+            CapacityProviderStrategyItem::builder()
+                .capacity_provider(&compute.capacity_provider)
+                .weight(1)
+                .build()
+                .expect(BUILT),
+        )
+        .set_tags(Some(
+            tags.iter()
+                .map(|(k, v)| Tag::builder().key(k).value(v).build())
+                .collect(),
+        ))
+        .client_token(uuid::Uuid::new_v4().to_string())
+        .build()
+        .expect(BUILT)
+}
+
+/// RunTask refused on a per-user cluster: the workspace policy lets a caller
+/// run tasks only on the cluster named after their own `triple-c-user`
+/// principal tag.
+pub const EC2_TAG_MISMATCH: &str = "This EC2 capacity belongs to a different triple-c-user value \
+     than your sign-in's (or your sign-in has no triple-c-user tag). Ask an admin.";
+
 /// The family of `arn:...:task-definition/<family>:<revision>`, when the
 /// revision is a number. `None` for a bare family or anything else.
 pub fn revision_family(arn: &str) -> Option<&str> {
@@ -271,14 +342,15 @@ pub struct TaskStart {
 }
 
 /// The project's live task if there is one (Review Focus 2: never a second
-/// task for a project), else RunTask with the exact `task_def_arn`.
+/// task for a project), else RunTask with the exact `task_def_arn` where
+/// `run_on` says.
 pub async fn find_or_run<A: TaskApi>(
     api: &A,
     env: &EnvironmentInfo,
     owner_user_id: &str,
     project_id: &str,
     task_def_arn: &str,
-    spot: bool,
+    run_on: RunOn<'_>,
 ) -> Result<TaskStart, AwsError> {
     let family = revision_family(task_def_arn).ok_or_else(|| {
         other(format!(
@@ -291,18 +363,41 @@ pub async fn find_or_run<A: TaskApi>(
         )));
     }
     if let Some(task) =
-        find_project_task(api, &env.cluster_arn, family, owner_user_id, project_id).await?
+        find_project_task(api, run_on.cluster(env), family, owner_user_id, project_id).await?
     {
         return Ok(TaskStart { task, reused: true });
     }
     let tags = workspace_tags(owner_user_id, project_id, &env.name);
-    let task = api
-        .run_task(run_task_request(env, task_def_arn, spot, &tags))
-        .await?;
+    let task = match run_on {
+        RunOn::Fargate { spot } => {
+            api.run_task(run_task_request(env, task_def_arn, spot, &tags)).await?
+        }
+        RunOn::Ec2(compute) => api
+            .run_task(ec2_run_task_request(compute, task_def_arn, &tags))
+            .await
+            .map_err(ec2_run_error)?,
+    };
     Ok(TaskStart {
         task,
         reused: false,
     })
+}
+
+/// A RunTask error on the user's EC2 capacity, in its terms: access denied is
+/// the `triple-c-user` mismatch ([`EC2_TAG_MISMATCH`]); a placement failure
+/// (`RESOURCE:CPU`/`RESOURCE:MEMORY`) means no instance can take the task.
+pub fn ec2_run_error(e: AwsError) -> AwsError {
+    match e {
+        AwsError::AccessDenied { action, message } => AwsError::AccessDenied {
+            action,
+            message: format!("{EC2_TAG_MISMATCH} (AWS said: {message})"),
+        },
+        AwsError::Other { message } if message.contains("RESOURCE:") => other(format!(
+            "{message}. No instance of your EC2 capacity has room for this task: lower its CPU \
+             or memory reservation, or stop another EC2 workspace."
+        )),
+        e => e,
+    }
 }
 
 // ------------------------------------------------------------------ quotas
@@ -386,6 +481,30 @@ impl Default for WaitTiming {
     }
 }
 
+impl WaitTiming {
+    /// An EC2 task's wait: a cold start (capacity scaled to zero) launches
+    /// an instance and pulls the image before the task can run.
+    pub fn ec2() -> Self {
+        WaitTiming {
+            timeout: Duration::from_secs(10 * 60),
+            ..Self::default()
+        }
+    }
+}
+
+/// An EC2 task still waiting for an instance with room: ECS keeps it
+/// PROVISIONING (or PENDING) with no container instance while the capacity
+/// provider's managed scaling launches one. (A Fargate task never has a
+/// container instance, so ask this only of EC2 tasks.)
+pub fn waiting_for_instance(t: &TaskInfo) -> bool {
+    t.container_instance_arn.is_none()
+        && t.desired_status == "RUNNING"
+        && matches!(t.last_status.as_str(), "PROVISIONING" | "PENDING")
+}
+
+/// How a [`wait_ready`] timeout begins.
+pub const WAIT_TIMED_OUT: &str = "The task did not become ready within";
+
 /// Where a project's task logs go: the environment's log group and the
 /// project's `awslogs-stream-prefix` (Task 4's `log_stream_prefix`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -440,7 +559,7 @@ pub async fn wait_ready<A: TaskApi>(
         }
         if tokio::time::Instant::now() + timing.interval > deadline {
             return Err(other(format!(
-                "The task did not become ready within {} (last status {}{}). It may still \
+                "{WAIT_TIMED_OUT} {} (last status {}{}). It may still \
                  be starting; check the ECS console, or stop the project and start it again.",
                 describe_timeout(timing.timeout),
                 t.last_status,

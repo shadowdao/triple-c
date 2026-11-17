@@ -1225,6 +1225,10 @@ fn validate_gateway_sidecar_update(
     let Some(problem) = crate::aws::workspace::gateway_sidecar_problem(project, gateway) else {
         return Ok(());
     };
+    // Not on EC2 at all (bridge networking): refused whatever was stored.
+    if problem == crate::aws::workspace::EC2_NO_SIDECAR {
+        return Err(problem);
+    }
     let was_on = stored.aws.as_ref().is_some_and(|a| a.gateway_sidecar);
     if was_on && project.backend == crate::models::project::Backend::OpenAiCompatible {
         return Ok(());
@@ -1248,6 +1252,15 @@ fn validate_aws_update(
             crate::models::validate_region(&place.region)?;
             crate::aws::tofu_modules::validate_environment_name(&place.environment)?;
             crate::models::validate_aws_workspace(cfg)?;
+            // Docker access and VPN need the user's own instance (E6, E7).
+            if cfg.launch_type != crate::models::LaunchType::Ec2 {
+                if project.allow_docker_access {
+                    return Err("Docker access on AWS needs the EC2 launch type; turn it off first".into());
+                }
+                if project.vpn_support_enabled {
+                    return Err("VPN support on AWS needs the EC2 launch type; turn it off first".into());
+                }
+            }
             // Q6: forwarded over loopback, TCP only, never a reserved port
             // (rows the save adds or edits; everything when newly on AWS).
             crate::host::port_forwards::validate_aws_port_mappings_update(
@@ -1589,6 +1602,20 @@ fn emit_connect_warning(app_handle: &tauri::AppHandle, project_id: &str, name: &
     let _ = app_handle.emit("workspace-warning", connect_warning_payload(project_id, name, detail));
 }
 
+/// A start that an app restart interrupted (EC2 cold start): topic "start".
+fn emit_interrupted_warning(app_handle: &tauri::AppHandle, project_id: &str, name: &str, detail: &str) {
+    let _ = app_handle.emit("workspace-warning", interrupted_warning_payload(project_id, name, detail));
+}
+
+fn interrupted_warning_payload(project_id: &str, name: &str, detail: &str) -> serde_json::Value {
+    serde_json::json!({
+        "project_id": project_id,
+        "message": format!("“{name}”: a start was interrupted"),
+        "detail": detail,
+        "topic": "start",
+    })
+}
+
 fn connect_warning_payload(project_id: &str, name: &str, detail: &str) -> serde_json::Value {
     serde_json::json!({
         "project_id": project_id,
@@ -1644,6 +1671,29 @@ pub async fn aws_environment_max_hours(
     }
     let settings = state.settings_store.get();
     Ok(crate::host::aws_host::environment_max_hours(&project, &settings).await)
+}
+
+/// The caller's EC2 capacity in an AWS project's environment, for Host
+/// settings' launch-type control and reservation limits (phase 7). Never an
+/// error: a local project or a failed read is `unknown`.
+#[tauri::command]
+pub async fn aws_ec2_capacity(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<crate::host::aws_host::Ec2Capacity, String> {
+    let Some(project) = state.projects_store.get(&project_id).filter(|p| p.is_aws()) else {
+        return Ok(crate::host::aws_host::Ec2Capacity::Unknown);
+    };
+    let settings = state.settings_store.get();
+    Ok(crate::host::aws_host::ec2_capacity(&project, &settings).await)
+}
+
+/// Why `config`'s CPU/memory reservations don't fit `instance_type`, or
+/// null (`models::project::ec2_fit_problem`: the start's own rule, so Host
+/// settings never disagree with it).
+#[tauri::command]
+pub fn ec2_fit_problem(config: AwsWorkspaceConfig, instance_type: String) -> Option<String> {
+    crate::models::project::ec2_fit_problem(&config, &instance_type)
 }
 
 #[tauri::command]
@@ -2173,6 +2223,10 @@ pub async fn reconcile_aws_projects(
             let on_ports_warning = move |detail: String| {
                 emit_ports_warning(&ports_handle, &ports_id, &ports_name, &detail)
             };
+            let (int_handle, int_id, int_name) = (handle.clone(), id.clone(), name.clone());
+            let on_interrupted_warning = move |detail: String| {
+                emit_interrupted_warning(&int_handle, &int_id, &int_name, &detail)
+            };
             let on_connect_warning =
                 move |detail: String| emit_connect_warning(&handle, &id, &name, &detail);
             if tokio::time::timeout(
@@ -2183,6 +2237,7 @@ pub async fn reconcile_aws_projects(
                     store,
                     on_connect_warning,
                     on_ports_warning,
+                    on_interrupted_warning,
                 ),
             )
             .await
@@ -2212,6 +2267,16 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn the_interrupted_warning_has_its_own_topic_and_headline() {
+        let v = interrupted_warning_payload("p1", "demo", "retry");
+        assert_eq!(v["topic"], "start");
+        assert_eq!(v["detail"], "retry");
+        let m = v["message"].as_str().unwrap();
+        assert!(m.contains("demo") && m.contains("a start was interrupted"));
+        assert!(!m.contains("credentials"));
+    }
 
     // ── Pending-cleanup aging ────────────────────────────────────────────
 
@@ -2894,6 +2959,43 @@ mod tests {
         assert!(validate_gateway_sidecar_update(&on, &on, &half).is_ok());
         // Off: nothing to check.
         assert!(validate_gateway_sidecar_update(&off, &off, &half).is_ok());
+
+        // EC2 (bridge networking): refused even when it was already on.
+        let mut ec2 = on.clone();
+        ec2.aws.as_mut().unwrap().launch_type = crate::models::LaunchType::Ec2;
+        let e = validate_gateway_sidecar_update(&on, &ec2, &with_models).unwrap_err();
+        assert_eq!(e, crate::aws::workspace::EC2_NO_SIDECAR);
+        assert!(validate_gateway_sidecar_update(&ec2, &ec2, &with_models).is_err());
+        ec2.aws.as_mut().unwrap().gateway_sidecar = false;
+        assert!(validate_gateway_sidecar_update(&on, &ec2, &with_models).is_ok());
+    }
+
+    #[test]
+    fn docker_and_vpn_on_aws_need_the_ec2_launch_type() {
+        use crate::models::LaunchType;
+        let hosts = vec![host("h1")];
+        let stored = aws_project();
+        for (docker, vpn) in [(true, false), (false, true)] {
+            let mut p = stored.clone();
+            p.allow_docker_access = docker;
+            p.vpn_support_enabled = vpn;
+            assert!(validate_aws_update(&stored, &p, &hosts).is_err());
+            // Already stored that way on Fargate: still refused (no grandfathering).
+            assert!(validate_aws_update(&p, &p, &hosts).is_err());
+            // Ec2 -> Fargate with the flags still on: refused.
+            let mut ec2 = p.clone();
+            ec2.aws.as_mut().unwrap().launch_type = LaunchType::Ec2;
+            assert!(validate_aws_update(&ec2, &ec2, &hosts).is_ok());
+            assert!(validate_aws_update(&ec2, &p, &hosts).is_err());
+            // Local -> AWS(Fargate) with the flags on: refused.
+            let mut local = stored.clone();
+            local.host_id = None;
+            local.aws_placement = None;
+            local.aws = None;
+            local.allow_docker_access = docker;
+            local.vpn_support_enabled = vpn;
+            assert!(validate_aws_update(&local, &p, &hosts).is_err());
+        }
     }
 
     #[test]

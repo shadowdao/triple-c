@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Project, ProjectPath, NewProjectHost, RemoveProjectOptions, WipChoice, UnsavedWork, WorkspaceStatus, ProjectRemovalReport, ProjectResetOutcome, ContainerInfo, AppSettings, SettingsImportPreview, SettingsImportOutcome, UpdateInfo, ImageUpdateInfo, FileEntry, FileContents, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, BrowserPageState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo, UploadOutcome, Note, ViewerFile, ViewerPoll, ViewerSaved, ViewerState, FileDiff, InstallScope, ItemUpdate, Marketplace, MarketplaceAccount, MarketplaceItemRef, MarketplaceSnapshot, ProjectSyncResult, SyncReport, HostConnection, CallerIdentity, PermissionReport, PolicyFile, HourlyEstimate, AwsWorkspaceConfig, Tier, EnvironmentScan, NetworkChoice, ModuleKind } from "./types";
+import type { Project, ProjectPath, NewProjectHost, RemoveProjectOptions, WipChoice, UnsavedWork, WorkspaceStatus, ProjectRemovalReport, ProjectResetOutcome, ContainerInfo, AppSettings, SettingsImportPreview, SettingsImportOutcome, UpdateInfo, ImageUpdateInfo, FileEntry, FileContents, WebTerminalInfo, SttStatus, GatewayStatus, InstallOptions, ClaudeSession, ContainerCapabilities, ScheduledTask, ScheduledTaskInput, SchedulerNotification, AuthBridgeStatus, BrowserViewStatus, BrowserViewPopoutState, BrowserPageState, PlaywrightDetection, BrowserSetupOutcome, BrowserInstallTarget, ContainerStaleness, MigrationOptions, MigrationReport, MigrationState, ClearTokenOutcome, CaCertInfo, UploadOutcome, Note, ViewerFile, ViewerPoll, ViewerSaved, ViewerState, FileDiff, InstallScope, ItemUpdate, Marketplace, MarketplaceAccount, MarketplaceItemRef, MarketplaceSnapshot, ProjectSyncResult, SyncReport, HostConnection, CallerIdentity, PermissionReport, PolicyFile, HourlyEstimate, AwsWorkspaceConfig, Tier, EnvironmentScan, NetworkChoice, ModuleKind, Ec2Choice, Ec2Compute, Ec2InstanceTable, Ec2Capacity, SavedBundle } from "./types";
 
 // Docker
 export const checkDocker = () => invoke<boolean>("check_docker");
@@ -46,6 +46,11 @@ export const awsWorkspaceStatus = (projectId: string) =>
  *  null when it can't be read. Never rejects for a missing project. */
 export const awsEnvironmentMaxHours = (projectId: string) =>
   invoke<number | null>("aws_environment_max_hours", { projectId });
+export const awsEc2Capacity = (projectId: string) =>
+  invoke<Ec2Capacity>("aws_ec2_capacity", { projectId });
+/** Rust `ec2_fit_problem`: why the reservations don't fit `instanceType`, or null. */
+export const ec2FitProblem = (config: AwsWorkspaceConfig, instanceType: string) =>
+  invoke<string | null>("ec2_fit_problem", { config, instanceType });
 export const removeAwsResources = (projectId: string, discardData: boolean) =>
   invoke<Project>("remove_aws_resources", { projectId, discardData });
 export const rebuildProjectContainer = (projectId: string) =>
@@ -112,8 +117,13 @@ export const awsPolicyDocument = (tier: Tier) =>
 /** The estimated hourly cost of `config` on Fargate in `region`, signed with the project's
  *  connection. Never rejects for AWS reasons: `null` means "Estimate unavailable" (denied, offline,
  *  no connection). Rates are cached a day on disk. */
-export const awsCostEstimate = (connectionId: string, region: string, config: AwsWorkspaceConfig) =>
-  invoke<HourlyEstimate | null>("aws_cost_estimate", { connectionId, region, config });
+/** `instanceType`: an EC2 project's (the user's, from `awsEc2Capacity`); priced as that instance. */
+export const awsCostEstimate = (
+  connectionId: string,
+  region: string,
+  config: AwsWorkspaceConfig,
+  instanceType: string | null = null,
+) => invoke<HourlyEstimate | null>("aws_cost_estimate", { connectionId, region, config, instanceType });
 
 // AWS environments (OpenTofu). Reject with an `AwsError`. Starting commands (and follow) resolve
 // to an op id; progress arrives on the `AWS_DEPLOY_PROGRESS_EVENT` event (`DeployProgress`, in
@@ -163,18 +173,30 @@ export const cancelAwsDeployment = (connectionId: string, region: string, stateK
 /** Push `errored.tfstate` (a failed run's unsaved state) back to the bucket; resolves to an op id like a deploy. */
 export const pushAwsSavedState = (connectionId: string, region: string, stateKey: string) =>
   invoke<string>("push_aws_saved_state", { connectionId, region, stateKey });
-export const onboardAwsUser = (connectionId: string, region: string, environment: string) =>
-  invoke<string>("onboard_aws_user", { connectionId, region, environment });
+/** Omit `ec2` to keep the caller's recorded EC2 capacity (none without a record). */
+export const onboardAwsUser = (connectionId: string, region: string, environment: string, ec2?: Ec2Choice) =>
+  invoke<string>(
+    "onboard_aws_user",
+    ec2 === undefined ? { connectionId, region, environment } : { connectionId, region, environment, ec2 },
+  );
+export const listEc2InstanceTypes = () => invoke<Ec2InstanceTable>("list_ec2_instance_types");
 export const deployAwsPermissionsBoundary = (connectionId: string, region: string) =>
   invoke<string>("deploy_aws_permissions_boundary", { connectionId, region });
-/** Opens a folder picker in Rust; resolves to the folder written, or null if dismissed. */
+/** Opens a folder picker in Rust; resolves to the folder written (and, for an onboarding with EC2, a warning when its cluster name looks taken), or null if dismissed. */
 export const saveAwsAdminBundle = (
   connectionId: string,
   region: string,
   kind: ModuleKind,
-  options: { environment?: string; ownerId?: string; network?: NetworkChoice; maxWorkspaceHours?: number } = {},
+  options: {
+    environment?: string;
+    ownerId?: string;
+    network?: NetworkChoice;
+    maxWorkspaceHours?: number;
+    /** An onboarding bundle's EC2 capacity; null = none. */
+    ec2?: Ec2Compute | null;
+  } = {},
 ) =>
-  invoke<string | null>("save_aws_admin_bundle", {
+  invoke<SavedBundle | null>("save_aws_admin_bundle", {
     connectionId,
     region,
     kind,
@@ -182,6 +204,7 @@ export const saveAwsAdminBundle = (
     ownerId: options.ownerId ?? null,
     network: options.network ?? null,
     ...(options.maxWorkspaceHours === undefined ? {} : { maxWorkspaceHours: options.maxWorkspaceHours }),
+    ...(options.ec2 === undefined ? {} : { ec2: options.ec2 }),
   });
 /** Check a corporate CA path and report what would be installed. Never
  *  rejects for a bad path — the reason comes back in `error`. */

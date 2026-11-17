@@ -2666,3 +2666,91 @@ fn two_connects_at_once_never_mix_their_files() {
     assert_eq!(c.run(&["../../etc"]).status.code(), Some(2));
     assert_eq!(c.run(&[&a]).status.code(), Some(1));
 }
+
+// ------------------------------------------- Docker access and VPN (phase 7, EC2)
+
+/// The `docker_socket` block with the socket at `sock` and the account tools
+/// faked (they log to stdout): `getent` knows no group, so one is added.
+fn docker_socket_step(sock: &Path, aws: bool) -> Output {
+    let script = format!(
+        "getent() {{ return 2; }}\n\
+         groupadd() {{ echo \"groupadd $*\"; }}\n\
+         usermod() {{ echo \"usermod $*\"; }}\n\
+         triplec_aws={}\n{}",
+        u8::from(aws),
+        eblock("docker_socket").replace("/var/run/docker.sock", &sock.display().to_string())
+    );
+    bash(&script, &[], &[], &[])
+}
+
+fn unix_socket(path: &Path) -> std::os::unix::net::UnixListener {
+    std::os::unix::net::UnixListener::bind(path).expect("bind socket")
+}
+
+/// E6: an EC2 project's Docker access is its instance's socket, so the group
+/// step runs in aws mode too (it was Docker-only), and as before without one.
+#[test]
+fn the_docker_socket_group_step_runs_in_aws_mode_when_the_socket_exists() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sock = tmp.path().join("docker.sock");
+    let _listener = unix_socket(&sock);
+    let gid = fs::metadata(&sock).map(|m| std::os::unix::fs::MetadataExt::gid(&m)).unwrap();
+    for aws in [true, false] {
+        let out = docker_socket_step(&sock, aws);
+        let t = text(&out);
+        assert!(out.status.success(), "{t}");
+        assert!(t.contains(&format!("groupadd -g {gid} docker-host")), "aws={aws}: {t}");
+        assert!(t.contains("usermod -aG"), "aws={aws}: {t}");
+        assert!(t.trim_end().ends_with(" claude"), "aws={aws}: {t}");
+    }
+    // No socket (Fargate, or Docker access off): nothing happens.
+    let out = docker_socket_step(&tmp.path().join("absent.sock"), true);
+    assert!(out.status.success());
+    assert_eq!(text(&out), "");
+    // A regular file there is not a socket either.
+    let file = tmp.path().join("file.sock");
+    fs::write(&file, "").unwrap();
+    assert_eq!(text(&docker_socket_step(&file, true)), "");
+    assert!(!eblock("docker_socket").contains("triplec_aws"), "no aws gate");
+}
+
+/// The feature-skills block with the skill source and destination in `tmp`
+/// and `chown` switched off.
+fn feature_skills(tmp: &Path, vpn: &str) -> Output {
+    let src = tmp.join("opt-skills");
+    let dest = tmp.join("home-skills");
+    let script = format!(
+        "chown() {{ :; }}\ntriplec_aws=1\n{}\n[ -z \"${{VPN_SUPPORT_ENABLED+x}}\" ] && echo unset-ok",
+        eblock("feature_skills")
+            .replace("/opt/triple-c-skills", &src.display().to_string())
+            .replace("/home/claude/.claude/skills", &dest.display().to_string())
+    );
+    bash(&script, &[], &[("VPN_SUPPORT_ENABLED", vpn)], &[])
+}
+
+/// E7: in aws mode the VPN skill follows `VPN_SUPPORT_ENABLED` as on Docker
+/// (installed when 1, removed when 0), and the variable is gone after.
+#[test]
+fn the_vpn_skill_follows_vpn_support_in_aws_mode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("opt-skills/pia-vpn");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("SKILL.md"), "vpn").unwrap();
+    let dest = tmp.path().join("home-skills/pia-vpn/SKILL.md");
+
+    let out = feature_skills(tmp.path(), "1");
+    let t = text(&out);
+    assert!(t.contains("pia-vpn skill installed"), "{t}");
+    assert!(t.contains("unset-ok"), "{t}");
+    assert_eq!(fs::read_to_string(&dest).unwrap(), "vpn");
+
+    let t = text(&feature_skills(tmp.path(), "0"));
+    assert!(t.contains("pia-vpn skill removed"), "{t}");
+    assert!(!dest.exists());
+    // The call itself is not behind any mode check.
+    let call = ENTRYPOINT
+        .lines()
+        .find(|l| l.starts_with("install_feature_skill pia-vpn"))
+        .expect("the call");
+    assert!(!call.contains("triplec_aws"));
+}

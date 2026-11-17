@@ -69,7 +69,7 @@ export function environment(
     state: { state } as DetectedEnvironment["state"],
     actions: [],
     info: null,
-    onboarding: joined ? { state: "joined" } : { state: "not_joined" },
+    onboarding: joined ? { state: "joined", ec2: null } : { state: "not_joined" },
     onboarding_actions: [],
     onboarded_users: 1,
   };

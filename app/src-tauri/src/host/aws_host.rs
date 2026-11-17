@@ -1,6 +1,9 @@
-//! `ProjectHost::Aws`: a project's container is an ECS Fargate task in one
-//! of the account's environments, reached through an SSM port-forward to
-//! the in-task agent (`ssm.rs`, `agent.rs`).
+//! `ProjectHost::Aws`: a project's container is an ECS task in one of the
+//! account's environments — Fargate on the environment's cluster, or (phase
+//! 7, `LaunchType::Ec2`) on the user's own EC2 capacity, their per-user
+//! cluster from their record — reached through an SSM port-forward to the
+//! in-task agent (`ssm.rs`, `agent.rs`). A task's cluster is always read
+//! back from its ARN, so stop, reconcile and the watch need no record.
 //!
 //! Start: connection → `SdkConfig` → caller identity → environment record →
 //! onboarding → the project's live task, if there is one (its token is read
@@ -27,27 +30,30 @@ use super::tunnels::{self, LiveTunnel, TunnelHandle};
 use super::watch::{AwsTaskLookup, TaskGroup, WatchedTask};
 use super::ContainerTarget;
 use crate::aws::environments::EnvironmentInfo;
+use crate::aws::environments::UserRecord;
 use crate::aws::runtime::{
-    check_onboarded, cluster_arn_of_task, cluster_of_task, ensure_agent_token, read_agent_token,
-    read_environment,
+    check_onboarded, cluster_arn_of_task, cluster_of_task, ec2_cluster_of_task, project_task_clusters,
+    ensure_agent_token, read_agent_token, read_environment, read_user_record,
     remove_workspace_resources, wait_access_point, PollTiming, RemoveRequest, RuntimeApi,
     SdkRuntimeApi,
 };
 use crate::aws::tasks::{
-    find_or_run, find_project_task, stopped_among, task_log_stream, wait_ready, SdkTaskApi,
-    StopKind, TaskApi, TaskInfo, TaskLogs, WaitTiming, LOG_TAIL_LINES, STOP_REASON,
+    find_or_run, find_project_task, stopped_among, task_log_stream, wait_ready,
+    waiting_for_instance, WAIT_TIMED_OUT, RunOn, SdkTaskApi, StopKind, TaskApi, TaskInfo, TaskLogs, WaitTiming,
+    LOG_TAIL_LINES, STOP_REASON,
 };
 use crate::aws::tofu_modules::{
     environment_cluster_name, log_stream_prefix, owner_key, task_family,
 };
 use crate::aws::workspace::{
-    gateway_sidecar_problem, new_agent_token, prepare_workspace, GatewayPayload, SdkWorkspaceApi,
-    WorkspaceApi,
+    gateway_sidecar_problem, new_agent_token, no_ec2_capacity, prepare_workspace, GatewayPayload,
+    SdkWorkspaceApi, WorkspaceApi,
 };
 use crate::aws::{caller_identity, sdk_config, CallerIdentity};
 use crate::docker::ca_certs::{container_cert_name, ResolvedCa};
 use crate::models::app_settings::ImageSource;
 use crate::models::container_config::REGISTRY_IMAGE;
+use crate::models::project::LaunchType;
 use crate::models::{AppSettings, Project, ProjectStatus};
 use crate::storage::projects_store::ProjectsStore;
 use crate::storage::settings_store::SettingsStore;
@@ -58,6 +64,8 @@ pub const PROGRESS_READING: &str = "Reading environment…";
 pub const PROGRESS_PREPARING: &str = "Preparing workspace…";
 pub const PROGRESS_STARTING: &str = "Starting task…";
 pub const PROGRESS_WAITING: &str = "Waiting for the task (about 2 minutes)…";
+/// An EC2 task waiting for an instance with room (capacity scaled to zero).
+pub const PROGRESS_INSTANCE: &str = "Starting an instance (about 3 minutes)…";
 pub const PROGRESS_CONNECTING: &str = "Connecting…";
 
 /// A concurrent start won the RunTask race: the secret now holds a token
@@ -137,16 +145,26 @@ fn is_registry_reference(name: &str) -> bool {
 /// [`aws_env`]'s answer: the pairs, and the resolved CA whose files ship too.
 pub type AwsEnv = (Vec<(String, String)>, Option<ResolvedCa>);
 
+/// Whether Claude Code's sandbox (bubblewrap) may run where `project`'s task
+/// runs — the one place this is decided. Not on AWS: Fargate can't create
+/// namespaces (P9), and neither can an ECS task on the user's EC2 instance
+/// (E8, measured live in phase 7: `bwrap --unshare-user` fails with "No
+/// permissions to create new namespace" — Docker's default seccomp profile
+/// refuses it without CAP_SYS_ADMIN, though the AMI allows user namespaces).
+pub fn sandbox_allowed(_project: &Project) -> bool {
+    false
+}
+
 /// The environment pairs an AWS task gets: [`workspace_env`] with the same
-/// inputs Docker resolves, and Claude Code's sandbox forced off (R4: Fargate
-/// support for bubblewrap is unverified). Returns the resolved CA too.
+/// inputs Docker resolves, and Claude Code's sandbox forced off where
+/// [`sandbox_allowed`] says no. Returns the resolved CA too.
 ///
 /// [`workspace_env`]: crate::docker::workspace_env::workspace_env
 pub fn aws_env(project: &Project, settings: &AppSettings) -> Result<AwsEnv, String> {
     let mut p = project.clone();
-    if p.sandbox_mode_enabled {
+    if p.sandbox_mode_enabled && !sandbox_allowed(project) {
         log::info!(
-            "Project {}: Claude Code's sandbox is turned off on AWS (not yet supported on Fargate)",
+            "Project {}: Claude Code's sandbox is turned off on AWS (bubblewrap can't run in an ECS task)",
             project.id
         );
         p.sandbox_mode_enabled = false;
@@ -410,6 +428,9 @@ pub struct StartInputs<'a> {
     /// attaching to a running one never needs the provider key or models.
     pub gateway: &'a (dyn Fn() -> Result<Option<SidecarSecrets>, String> + Send + Sync),
     pub wait: WaitTiming,
+    /// The wait for a task on the user's EC2 capacity (an instance may have
+    /// to launch first: [`WaitTiming::ec2`]).
+    pub ec2_wait: WaitTiming,
     pub access_point_wait: PollTiming,
     /// Called as soon as the project has a task (found, or RunTask
     /// returned) so the store holds its ARN before the long wait — a crash
@@ -468,6 +489,236 @@ async fn stop_created<T: TaskApi>(api: &T, cluster: &str, arn: &str) -> bool {
     }
 }
 
+/// Wait for `arn` on `cluster`, telling the user when an EC2 task is waiting
+/// for an instance ([`PROGRESS_INSTANCE`], then [`PROGRESS_WAITING`] again
+/// once one has room). An EC2 task that never got an instance fails with
+/// what to check rather than ECS's last status.
+#[allow(clippy::too_many_arguments)]
+async fn wait_task<T: TaskApi>(
+    tasks: &T,
+    cluster: &str,
+    arn: &str,
+    logs: &TaskLogs,
+    timing: WaitTiming,
+    ec2: Option<u32>,
+    progress: &(dyn Fn(&str) + Send + Sync),
+) -> Result<TaskInfo, String> {
+    let waiting = std::sync::atomic::AtomicBool::new(false);
+    let r = wait_ready(tasks, cluster, arn, logs, timing, |t| {
+        if ec2.is_none() {
+            return;
+        }
+        let now = waiting_for_instance(t);
+        if now != waiting.swap(now, std::sync::atomic::Ordering::Relaxed) {
+            progress(if now { PROGRESS_INSTANCE } else { PROGRESS_WAITING });
+        }
+    })
+    .await;
+    match r {
+        Ok(t) => Ok(t),
+        Err(e)
+            if waiting.load(std::sync::atomic::Ordering::Relaxed)
+                && e.to_string().starts_with(WAIT_TIMED_OUT) =>
+        {
+            let max = ec2.unwrap_or(1);
+            Err(format!(
+                "No EC2 instance had room for the task within {} minutes. Your capacity may \
+                 already be running its maximum of {max} instance{} (stop another EC2 \
+                 workspace), or its Auto Scaling group could not launch one (an admin can see \
+                 why in the group's activity in the EC2 console).",
+                timing.timeout.as_secs() / 60,
+                if max == 1 { "" } else { "s" }
+            ))
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// What a start says when ECS ran its task with ECS Exec off even with an
+/// instance up (it should not happen; the task can't be reached).
+pub const EXEC_OFF: &str = "ECS started the task with ECS Exec turned off, so Triple-C can't \
+     reach it. Start the project again.";
+
+/// The most a start waits for a task it stopped to reach STOPPED before
+/// running another (its own budget, apart from the placement wait).
+const STOP_WAIT: Duration = Duration::from_secs(3 * 60);
+
+/// A start found the project's task with ECS Exec off and still waiting for
+/// an instance, recently started: another start is bringing one up.
+pub const INSTANCE_RACE: &str = "Another start of this workspace is bringing up an EC2 \
+     instance; try again in a minute (once it is up, Start connects to it), or Stop the \
+     workspace to cancel it";
+
+/// The stop reason of a task a start replaced (one with ECS Exec off).
+pub const REPLACED_REASON: &str = "Replaced by another Triple-C start";
+
+/// How long past the EC2 placement wait an exec-off task still waiting for
+/// an instance counts as another start's, before it is taken as orphaned.
+/// The task's age is ECS's `createdAt` against this machine's clock, so the
+/// margin also absorbs clock skew: a local clock more than this far ahead
+/// could take another start's waiting task for an orphan and replace it (the
+/// other start then says so: "Another start … replaced this one"); one far
+/// behind only delays the replacement. NTP-synced clocks are well inside it.
+const ORPHAN_MARGIN: Duration = Duration::from_secs(10 * 60);
+
+/// Seconds since the Unix epoch on this machine's clock (0 if it is before).
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// Whether an exec-off task still waiting for an instance is older than
+/// any start could still be waiting for it (`ec2_wait` + a margin): a
+/// crashed start's orphan. No creation time reads as fresh.
+fn is_orphaned(t: &TaskInfo, ec2_wait: WaitTiming, now_unix: i64) -> bool {
+    let limit = (ec2_wait.timeout + ORPHAN_MARGIN).as_secs() as i64;
+    t.created_unix.is_some_and(|c| now_unix - c > limit)
+}
+
+/// Why [`rerun_once_placed`] did not give a new task.
+enum RerunError {
+    /// A concurrent start's live task was found: record it, report
+    /// [`START_RACE`].
+    Race(TaskInfo),
+    Failed(String),
+}
+
+impl From<String> for RerunError {
+    fn from(e: String) -> Self {
+        RerunError::Failed(e)
+    }
+}
+
+/// Wait (at most `min(timeout, STOP_WAIT)`) until `arn` is STOPPED or gone.
+async fn wait_stopped<T: TaskApi>(tasks: &T, cluster: &str, arn: &str, timing: WaitTiming) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timing.timeout.min(STOP_WAIT);
+    let wanted = [arn.to_string()];
+    loop {
+        let gone = tasks
+            .describe(cluster, &wanted)
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|t| t.arn == arn)
+            .is_none_or(|t| t.last_status == "STOPPED");
+        if gone {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() + timing.interval > deadline {
+            return Err(format!(
+                "The task {arn} did not stop in time; start the project again in a minute."
+            ));
+        }
+        tokio::time::sleep(timing.interval).await;
+    }
+}
+
+/// A cold EC2 start's second RunTask. ECS turns `enableExecuteCommand` off
+/// on a RunTask that has to wait for an instance (PROVISIONING; verified
+/// live, phase 7) and the task keeps it off once placed, so it could never
+/// be reached. That first task still makes the capacity provider launch an
+/// instance: once an instance has taken it (and it is still meant to run),
+/// it is stopped and the task run again — through [`find_or_run`], so a
+/// concurrent start's task is never doubled ([`START_RACE`]) — now straight
+/// onto that instance with ECS Exec. A first task that stops by itself (a
+/// user's Stop, a failed placement) ends the start with its reason; nothing
+/// is run again. Returns the new task.
+#[allow(clippy::too_many_arguments)]
+async fn rerun_once_placed<T: TaskApi>(
+    tasks: &T,
+    env: &EnvironmentInfo,
+    owner: &str,
+    project_id: &str,
+    compute: &crate::aws::environments::UserCompute,
+    first: &str,
+    task_def_arn: &str,
+    timing: WaitTiming,
+    progress: &(dyn Fn(&str) + Send + Sync),
+) -> Result<TaskInfo, RerunError> {
+    let cluster = compute.cluster_arn.as_str();
+    let deadline = tokio::time::Instant::now() + timing.timeout;
+    let wanted = [first.to_string()];
+    progress(PROGRESS_INSTANCE);
+    // Until an instance has taken the first task.
+    loop {
+        let Some(t) = tasks
+            .describe(cluster, &wanted)
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|t| t.arn == first)
+        else {
+            return Err(format!("The task {first} is no longer known to ECS; start the project again").into());
+        };
+        if t.desired_status == "STOPPED" || t.last_status == "STOPPED" {
+            if t.stopped_reason.as_deref() == Some(REPLACED_REASON) {
+                return Err(RerunError::Failed(
+                    "Another start of this workspace replaced this one; Start again in a minute \
+                     to connect to it."
+                        .into(),
+                ));
+            }
+            return Err(format!(
+                "The task stopped before an EC2 instance took it ({}); start the project again.",
+                t.stopped_reason.as_deref().unwrap_or("no reason given")
+            )
+            .into());
+        }
+        if t.container_instance_arn.is_some() && t.desired_status == "RUNNING" {
+            break;
+        }
+        if tokio::time::Instant::now() + timing.interval > deadline {
+            let max = compute.max_instances;
+            return Err(format!(
+                "No EC2 instance had room for the task within {} minutes. Your capacity may \
+                 already be running its maximum of {max} instance{} (stop another EC2 \
+                 workspace), or its Auto Scaling group could not launch one (an admin can see \
+                 why in the group's activity in the EC2 console).",
+                timing.timeout.as_secs() / 60,
+                if max == 1 { "" } else { "s" }
+            )
+            .into());
+        }
+        tokio::time::sleep(timing.interval).await;
+    }
+    // Free its reservation before running again, or the second task would
+    // wait for an instance too.
+    tasks
+        .stop_task(cluster, first, STOP_REASON)
+        .await
+        .map_err(|e| e.to_string())?;
+    wait_stopped(tasks, cluster, first, timing).await?;
+    progress(PROGRESS_WAITING);
+    let start = find_or_run(tasks, env, owner, project_id, task_def_arn, RunOn::Ec2(compute))
+        .await
+        .map_err(|e| e.to_string())?;
+    if start.reused {
+        return Err(RerunError::Race(start.task));
+    }
+    if !start.task.exec_enabled {
+        let _ = stop_created(tasks, cluster, &start.task.arn).await;
+        return Err(RerunError::Failed(EXEC_OFF.into()));
+    }
+    Ok(start.task)
+}
+
+/// Where a project's task may be ([`project_task_clusters`]): the
+/// environment's cluster, the record's EC2 cluster, the stored task's.
+fn task_clusters(env: &EnvironmentInfo, record: Option<&UserRecord>, stored: Option<&str>) -> Vec<String> {
+    project_task_clusters(
+        &env.name,
+        env.cluster_arn.clone(),
+        record.and_then(UserRecord::valid).map(|c| c.cluster_arn.clone()),
+        stored,
+    )
+}
+
+/// The cluster (ARN) a task runs on, from its ARN.
+fn task_cluster(env: &EnvironmentInfo, task_arn: &str) -> String {
+    cluster_arn_of_task(task_arn).unwrap_or_else(|| env.cluster_arn.clone())
+}
+
 /// The start sequence; see the module docs.
 pub async fn start_core<T: TaskApi, W: WorkspaceApi, R: RuntimeApi, C: Connector>(
     tasks: &T,
@@ -496,9 +747,56 @@ pub async fn start_core<T: TaskApi, W: WorkspaceApi, R: RuntimeApi, C: Connector
         stream_prefix: log_stream_prefix(&ok, &project.id),
     };
 
-    let existing = find_project_task(tasks, &env.cluster_arn, &family, &inp.who.user_id, &project.id)
-        .await
-        .map_err(s)?;
+    // EC2 (phase 7): the user's record says where new tasks run. Read it
+    // only for EC2 projects; a Fargate start asks exactly what it did. A
+    // failed read still lets a live task (found in the environment's
+    // cluster or the stored task's) be attached; only a new run needs it.
+    let (record, record_err) = if cfg.launch_type == LaunchType::Ec2 {
+        match read_user_record(rt, &env.name, &ok, &inp.who.account, region).await {
+            Ok(r) => (Some(r), None),
+            Err(e) => {
+                log::warn!("Project {}: could not read the EC2 record ({e})", project.id);
+                (None, Some(format!("Could not read your EC2 capacity record: {e}")))
+            }
+        }
+    } else {
+        (None, None)
+    };
+    // The EC2 wait (and its progress) for a task on a per-user cluster.
+    let ec2_of = |task_arn: &str| {
+        ec2_cluster_of_task(&env.name, task_arn).map(|_| {
+            record.as_ref().and_then(UserRecord::valid).map_or(1, |c| c.max_instances)
+        })
+    };
+    let timing_of = |ec2: Option<u32>| if ec2.is_some() { inp.ec2_wait } else { inp.wait };
+
+    let stored = cfg.task_arn.as_deref();
+    let mut existing = None;
+    for cluster in task_clusters(&env, record.as_ref(), stored) {
+        existing = find_project_task(tasks, &cluster, &family, &inp.who.user_id, &project.id)
+            .await
+            .map_err(s)?;
+        if existing.is_some() {
+            break;
+        }
+    }
+    // A task with ECS Exec off (a cold EC2 start that stopped halfway) can
+    // never be attached to: stop it and start afresh.
+    // One still waiting for an instance belongs to a start in progress.
+    // An old one no start can still be waiting for is an orphan (a crashed
+    // start): it is replaced like a placed one.
+    if let Some(t) = existing.take_if(|t| !t.exec_enabled) {
+        if waiting_for_instance(&t) && !is_orphaned(&t, inp.ec2_wait, now_unix()) {
+            return Err(INSTANCE_RACE.into());
+        }
+        log::warn!("Project {}: its task {} has ECS Exec off; stopping it", project.id, t.arn);
+        let cluster = task_cluster(&env, &t.arn);
+        tasks
+            .stop_task(&cluster, &t.arn, REPLACED_REASON)
+            .await
+            .map_err(|e| format!("Could not stop the workspace's unreachable task {}: {e}", t.arn))?;
+        wait_stopped(tasks, &cluster, &t.arn, timing_of(Some(1))).await?;
+    }
 
     let (task, token, access_point_id, workspace_access_point_id, created) = if let Some(task) = existing {
         // Attach: never rotate a running task's token (P2).
@@ -511,12 +809,32 @@ pub async fn start_core<T: TaskApi, W: WorkspaceApi, R: RuntimeApi, C: Connector
         }));
         let token = read_agent_token(rt, &env.name, &ok, &project.id).await.map_err(s)?;
         progress(PROGRESS_WAITING);
-        let task = match wait_ready(tasks, &env.cluster_arn, &task.arn, &logs, inp.wait, |_| {}).await {
+        let ec2 = ec2_of(&task.arn);
+        let cluster = task_cluster(&env, &task.arn);
+        let task = match wait_task(tasks, &cluster, &task.arn, &logs, timing_of(ec2), ec2, progress).await {
             Ok(t) => t,
-            Err(e) => return Err(with_log_tail(tasks, &logs, &task.arn, e.to_string()).await),
+            Err(e) => return Err(with_log_tail(tasks, &logs, &task.arn, e).await),
         };
         (task, token, None, None, false)
     } else {
+        // Where the new task runs; an EC2 project without usable capacity
+        // (or whose record could not be read) fails here, before anything
+        // is written.
+        if let Some(e) = record_err {
+            return Err(e);
+        }
+        let run_on = match &record {
+            None => RunOn::Fargate { spot: cfg.spot },
+            Some(UserRecord::Valid(c)) => RunOn::Ec2(c),
+            Some(UserRecord::Absent) => return Err(no_ec2_capacity(&env.name)),
+            Some(UserRecord::Unusable(why)) => {
+                return Err(format!(
+                    "Your EC2 capacity record in {} can't be used ({why}); ask an admin to \
+                     re-apply your onboarding.",
+                    env.name
+                ))
+            }
+        };
         progress(PROGRESS_PREPARING);
         let sidecar = (inp.gateway)()?;
         let prepared = prepare_workspace(
@@ -529,6 +847,7 @@ pub async fn start_core<T: TaskApi, W: WorkspaceApi, R: RuntimeApi, C: Connector
             inp.custom_env_keys,
             inp.image,
             sidecar.as_ref().map(SidecarSecrets::payload),
+            record.as_ref().and_then(UserRecord::valid),
         )
         .await
         .map_err(s)?;
@@ -545,7 +864,7 @@ pub async fn start_core<T: TaskApi, W: WorkspaceApi, R: RuntimeApi, C: Connector
             &inp.who.user_id,
             &project.id,
             &prepared.task_definition_arn,
-            cfg.spot,
+            run_on,
         )
         .await
         .map_err(s)?;
@@ -560,19 +879,47 @@ pub async fn start_core<T: TaskApi, W: WorkspaceApi, R: RuntimeApi, C: Connector
             }));
             return Err(START_RACE.into());
         }
-        let arn = start.task.arn.clone();
-        (inp.on_task)(Some(&TaskRecord {
-            task_arn: arn.clone(),
-            access_point_id: prepared.access_point_id.clone(),
-            task_definition_arn: Some(prepared.task_definition_arn.clone()),
-            workspace_access_point_id: prepared.workspace_access_point_id.clone(),
-        }));
+        let mut arn = start.task.arn.clone();
+        let record_task = |arn: &str| {
+            (inp.on_task)(Some(&TaskRecord {
+                task_arn: arn.to_string(),
+                access_point_id: prepared.access_point_id.clone(),
+                task_definition_arn: Some(prepared.task_definition_arn.clone()),
+                workspace_access_point_id: prepared.workspace_access_point_id.clone(),
+            }))
+        };
+        record_task(&arn);
         progress(PROGRESS_WAITING);
-        let task = match wait_ready(tasks, &env.cluster_arn, &arn, &logs, inp.wait, |_| {}).await {
+        let cluster = run_on.cluster(&env).to_string();
+        if let (RunOn::Ec2(compute), false) = (run_on, start.task.exec_enabled) {
+            match rerun_once_placed(tasks, &env, &inp.who.user_id, &project.id, compute, &arn, &prepared.task_definition_arn, inp.ec2_wait, progress).await {
+                Ok(t) => {
+                    arn = t.arn;
+                    record_task(&arn);
+                }
+                Err(RerunError::Race(winner)) => {
+                    // As on the first launch: the winner's task is the project's.
+                    record_task(&winner.arn);
+                    return Err(START_RACE.into());
+                }
+                Err(RerunError::Failed(e)) => {
+                    let msg = with_log_tail(tasks, &logs, &arn, e).await;
+                    if stop_created(tasks, &cluster, &arn).await {
+                        (inp.on_task)(None);
+                    }
+                    return Err(msg);
+                }
+            }
+        }
+        let ec2 = match run_on {
+            RunOn::Ec2(c) => Some(c.max_instances),
+            RunOn::Fargate { .. } => None,
+        };
+        let task = match wait_task(tasks, &cluster, &arn, &logs, timing_of(ec2), ec2, progress).await {
             Ok(t) => t,
             Err(e) => {
-                let msg = with_log_tail(tasks, &logs, &arn, e.to_string()).await;
-                if stop_created(tasks, &env.cluster_arn, &arn).await {
+                let msg = with_log_tail(tasks, &logs, &arn, e).await;
+                if stop_created(tasks, &cluster, &arn).await {
                     (inp.on_task)(None);
                 }
                 return Err(msg);
@@ -617,7 +964,7 @@ pub async fn start_core<T: TaskApi, W: WorkspaceApi, R: RuntimeApi, C: Connector
             })
         }
         Err(e) => {
-            if created && stop_created(tasks, &env.cluster_arn, &task.arn).await {
+            if created && stop_created(tasks, &task_cluster(&env, &task.arn), &task.arn).await {
                 (inp.on_task)(None);
             }
             Err(e)
@@ -652,6 +999,60 @@ pub async fn environment_max_hours(project: &Project, settings: &AppSettings) ->
     };
     let info = tokio::time::timeout(std::time::Duration::from_secs(10), read).await.ok()??;
     Some(info.max_workspace_hours)
+}
+
+/// What Host settings know of the user's EC2 capacity in an AWS project's
+/// environment (phase 7): the launch-type control offers EC2 only with
+/// `Ec2`, and sizes the reservations against `available_*`
+/// ([`ec2_available`]; `None` for a type the app's table doesn't know).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Ec2Capacity {
+    Ec2 {
+        compute: crate::aws::environments::UserCompute,
+        available_cpu: Option<u32>,
+        available_memory_mib: Option<u32>,
+    },
+    /// No user record: no EC2 capacity in this environment.
+    None,
+    /// A record that can't be used (the reason names a field, never a value).
+    Unusable { reason: String },
+    /// It couldn't be read (offline, no connection, slow, a local project).
+    Unknown,
+}
+
+/// [`Ec2Capacity`] from a read of the user record (`None`: no read).
+pub fn ec2_capacity_from(read: Option<UserRecord>) -> Ec2Capacity {
+    match read {
+        Some(UserRecord::Valid(compute)) => {
+            let available = crate::models::project::ec2_available(&compute.instance_type);
+            Ec2Capacity::Ec2 {
+                available_cpu: available.map(|a| a.0),
+                available_memory_mib: available.map(|a| a.1),
+                compute,
+            }
+        }
+        Some(UserRecord::Absent) => Ec2Capacity::None,
+        Some(UserRecord::Unusable(reason)) => Ec2Capacity::Unusable { reason },
+        None => Ec2Capacity::Unknown,
+    }
+}
+
+/// The caller's EC2 capacity in `project`'s environment, from their user
+/// record. Never an error: anything that stops the read (10 s bound) is
+/// [`Ec2Capacity::Unknown`].
+pub async fn ec2_capacity(project: &Project, settings: &AppSettings) -> Ec2Capacity {
+    let read = async {
+        let placement = project.aws_placement.as_ref()?;
+        let (_, region, sdk) = project_sdk(project, settings).await.ok()?;
+        let who = caller_identity(&sdk).await.ok()?;
+        let ok = owner_key(&region, &who.user_id);
+        read_user_record(&SdkRuntimeApi::new(&sdk), &placement.environment, &ok, &who.account, &region)
+            .await
+            .map_err(|e| log::info!("Project {}: could not read the EC2 record ({e})", project.id))
+            .ok()
+    };
+    ec2_capacity_from(tokio::time::timeout(std::time::Duration::from_secs(10), read).await.ok().flatten())
 }
 
 /// `ProjectHost::Aws::ensure_started`.
@@ -730,6 +1131,7 @@ pub async fn ensure_started_with(
             image: &image,
             gateway: &sidecar,
             wait: WaitTiming::default(),
+            ec2_wait: WaitTiming::ec2(),
             access_point_wait: PollTiming::default(),
             on_task: &on_task,
         },
@@ -756,7 +1158,7 @@ pub async fn ensure_started_with(
         LiveTunnel {
             task: ecs,
             task_arn: started.task.arn.clone(),
-            cluster_arn: started.env.cluster_arn.clone(),
+            cluster_arn: task_cluster(&started.env, &started.task.arn),
             connection_id,
             region,
             sdk,
@@ -903,25 +1305,68 @@ pub async fn stop_endpoint(ep: &AgentEndpoint) -> Option<Result<(), String>> {
 /// Where to look for a project's live task when no ARN is stored (a crash
 /// before the store write, or a store from an older build).
 pub struct FindTask {
-    pub cluster: String,
+    /// The environment's cluster, then the user's EC2 cluster when known.
+    pub clusters: Vec<String>,
     pub family: String,
     pub owner_user_id: String,
     pub project_id: String,
 }
 
 impl FindTask {
-    fn new(project: &Project, region: &str, owner_user_id: &str) -> Self {
+    /// `ec2_cluster`: the user's EC2 cluster from their record, if they
+    /// have one ([`user_ec2_cluster`]); the stored task's per-user cluster
+    /// is added either way.
+    fn new(project: &Project, region: &str, owner_user_id: &str, ec2_cluster: Option<String>) -> Self {
         let env = project
             .aws_placement
             .as_ref()
             .map(|p| p.environment.clone())
             .unwrap_or_default();
         let ok = owner_key(region, owner_user_id);
+        let stored = project.aws.as_ref().and_then(|a| a.task_arn.as_deref());
+        let clusters = project_task_clusters(&env, environment_cluster_name(&env), ec2_cluster, stored);
         FindTask {
-            cluster: environment_cluster_name(&env),
+            clusters,
             family: task_family(&env, &ok, &project.id),
             owner_user_id: owner_user_id.to_string(),
             project_id: project.id.clone(),
+        }
+    }
+}
+
+/// The project's live task in any of `find`'s clusters.
+async fn find_in_clusters<T: TaskApi>(api: &T, find: &FindTask) -> Result<Option<TaskInfo>, String> {
+    for cluster in &find.clusters {
+        if let Some(t) =
+            find_project_task(api, cluster, &find.family, &find.owner_user_id, &find.project_id)
+                .await
+                .map_err(s)?
+        {
+            return Ok(Some(t));
+        }
+    }
+    Ok(None)
+}
+
+/// The user's EC2 cluster (ARN) for an EC2 project, from their record; `None`
+/// for a Fargate project, or when there is no usable record (best effort:
+/// only used to look for a task no ARN was stored for).
+pub async fn user_ec2_cluster<R: RuntimeApi>(
+    rt: &R,
+    project: &Project,
+    who: &CallerIdentity,
+    region: &str,
+) -> Option<String> {
+    if !project.aws.as_ref().is_some_and(|a| a.launch_type == LaunchType::Ec2) {
+        return None;
+    }
+    let env = &project.aws_placement.as_ref()?.environment;
+    match read_user_record(rt, env, &owner_key(region, &who.user_id), &who.account, region).await {
+        Ok(UserRecord::Valid(c)) => Some(c.cluster_arn),
+        Ok(_) => None,
+        Err(e) => {
+            log::warn!("Project {}: could not read the EC2 record ({e})", project.id);
+            None
         }
     }
 }
@@ -935,12 +1380,7 @@ async fn task_arn_or_find<T: TaskApi>(
     if let Some(a) = stored {
         return Ok(Some(a.to_string()));
     }
-    Ok(
-        find_project_task(api, &find.cluster, &find.family, &find.owner_user_id, &find.project_id)
-            .await
-            .map_err(s)?
-            .map(|t| t.arn),
-    )
+    Ok(find_in_clusters(api, find).await?.map(|t| t.arn))
 }
 
 /// Stop an AWS project's task: through its tunnel when there is one, else
@@ -960,7 +1400,8 @@ pub async fn stop_project(project: &Project, settings: &AppSettings) -> Result<(
         Some(a) => Some(a),
         None => {
             let who = caller_identity(&sdk).await.map_err(s)?;
-            task_arn_or_find(&api, None, &FindTask::new(project, &region, &who.user_id)).await?
+            let ec2 = user_ec2_cluster(&SdkRuntimeApi::new(&sdk), project, &who, &region).await;
+            task_arn_or_find(&api, None, &FindTask::new(project, &region, &who.user_id, ec2)).await?
         }
     };
     if let Some(arn) = arn {
@@ -987,10 +1428,12 @@ pub async fn remove_resources(
     let ok = owner_key(&region, &who.user_id);
     let env = project.aws_placement.as_ref().map(|p| p.environment.clone()).unwrap_or_default();
     let aws = project.aws.as_ref();
+    let rt = SdkRuntimeApi::new(&sdk);
+    let ec2_cluster = user_ec2_cluster(&rt, project, &who, &region).await;
     remove_workspace_resources(
         &SdkTaskApi::new(&sdk),
         &SdkWorkspaceApi::new(&sdk),
-        &SdkRuntimeApi::new(&sdk),
+        &rt,
         &RemoveRequest {
             env: &env,
             region: &region,
@@ -1001,6 +1444,7 @@ pub async fn remove_resources(
             stored_access_point_id: aws.and_then(|a| a.access_point_id.as_deref()),
             stored_workspace_access_point_id: aws
                 .and_then(|a| a.workspace_access_point_id.as_deref()),
+            ec2_cluster: ec2_cluster.as_deref(),
             discard_data,
         },
     )
@@ -1018,8 +1462,19 @@ pub enum Reconciled {
     /// The task is up (or on its way): re-open the tunnel.
     Live(Box<TaskInfo>),
     /// The task stopped, or ECS no longer knows it: the project is Stopped.
+    /// Also an EC2 task with ECS Exec off that could never be attached to
+    /// (placed, or orphaned): reconcile stopped it.
     Gone,
+    /// An EC2 task with ECS Exec off, still waiting for an instance and
+    /// recent: a start (perhaps this app's, before a restart) was
+    /// interrupted mid cold start. The project is Error, its ARN kept so
+    /// Stop still reaches the task; [`INTERRUPTED`] says what to do.
+    Interrupted,
 }
+
+/// What reconcile says about [`Reconciled::Interrupted`].
+pub const INTERRUPTED: &str = "A start of this workspace was interrupted while its EC2 \
+     instance came up; Start again (or Stop it).";
 
 /// Ask ECS about a project's task: the stored ARN, else (none stored) its
 /// live task found by family and tags.
@@ -1041,11 +1496,9 @@ pub async fn reconcile_task<T: TaskApi>(
     // or a crash before the store write) may have left the project a newer
     // one: look before calling it Gone (m3).
     if task_arn.is_some() {
-        if let Some(t) =
-            find_project_task(api, &find.cluster, &find.family, &find.owner_user_id, &find.project_id)
-                .await
-                .map_err(s)?
-                .filter(|t| t.arn != arn && is_live(t))
+        if let Some(t) = find_in_clusters(api, find)
+            .await?
+            .filter(|t| t.arn != arn && is_live(t))
         {
             return Ok(Reconciled::Live(Box::new(t)));
         }
@@ -1100,7 +1553,33 @@ pub async fn reconcile_project<T: TaskApi>(
     find: &FindTask,
 ) -> Result<Reconciled, String> {
     let arn = project.aws.as_ref().and_then(|a| a.task_arn.clone());
-    let r = reconcile_task(api, arn.as_deref(), find).await?;
+    let mut r = reconcile_task(api, arn.as_deref(), find).await?;
+    // A task with ECS Exec off can never be attached to (a cold EC2 start
+    // the app was closed during): never Running. Placed, or too old for any
+    // start to still wait for it → stop it (then it's Gone); still waiting
+    // and recent → Interrupted, left for a Start or Stop.
+    if let Reconciled::Live(t) = &r {
+        if !t.exec_enabled {
+            if waiting_for_instance(t) && !is_orphaned(t, WaitTiming::ec2(), now_unix()) {
+                if arn.as_deref() != Some(t.arn.as_str()) {
+                    record_task(store, &project.id, Some(&live_record(t)));
+                }
+                store.update_status(&project.id, ProjectStatus::Error)?;
+                return Ok(Reconciled::Interrupted);
+            }
+            log::warn!("Project {}: its task {} has ECS Exec off; stopping it", project.id, t.arn);
+            let cluster = cluster_of_task(&t.arn).ok_or_else(|| format!("{} is not a task ARN with a cluster", t.arn))?;
+            if let Err(e) = bounded_stop(api.stop_task(cluster, &t.arn, REPLACED_REASON)).await {
+                // It may still run: keep (or record) its ARN so Stop finds it.
+                if arn.as_deref() != Some(t.arn.as_str()) {
+                    record_task(store, &project.id, Some(&live_record(t)));
+                }
+                store.update_status(&project.id, ProjectStatus::Error)?;
+                return Err(format!("Could not stop the workspace's unreachable task {}: {e}", t.arn));
+            }
+            r = Reconciled::Gone;
+        }
+    }
     match &r {
         Reconciled::Gone => {
             store.update_status(&project.id, ProjectStatus::Stopped)?;
@@ -1108,23 +1587,26 @@ pub async fn reconcile_project<T: TaskApi>(
         }
         Reconciled::Live(t) => {
             if arn.as_deref() != Some(t.arn.as_str()) {
-                record_task(
-                    store,
-                    &project.id,
-                    Some(&TaskRecord {
-                        task_arn: t.arn.clone(),
-                        access_point_id: None,
-                        task_definition_arn: Some(t.task_definition_arn.clone()),
-                        workspace_access_point_id: None,
-                    }),
-                );
+                record_task(store, &project.id, Some(&live_record(t)));
             }
             if project.status != ProjectStatus::Running {
                 store.update_status(&project.id, ProjectStatus::Running)?;
             }
         }
+        Reconciled::Interrupted => {}
     }
     Ok(r)
+}
+
+/// The store record of a live task reconcile found (no access points: the
+/// stored ones stand).
+fn live_record(t: &TaskInfo) -> TaskRecord {
+    TaskRecord {
+        task_arn: t.arn.clone(),
+        access_point_id: None,
+        task_definition_arn: Some(t.task_definition_arn.clone()),
+        workspace_access_point_id: None,
+    }
 }
 
 /// `reconcile_project_statuses` for an AWS project: decide, and when the
@@ -1132,13 +1614,15 @@ pub async fn reconcile_project<T: TaskApi>(
 /// it through [`tunnels::wait_endpoint`]), then — copy-at-connect — copy the
 /// credentials in, calling `on_connect_warning` if that fails — after
 /// opening its port mappings (`on_ports_warning` for any that fail). Never
-/// blocks on the tunnel.
+/// blocks on the tunnel. `on_interrupted_warning` reports a start that an
+/// app restart interrupted ([`INTERRUPTED`]), on its own toast topic.
 pub async fn reconcile(
     project: &Project,
     settings: &AppSettings,
     store: Arc<ProjectsStore>,
     on_connect_warning: impl FnOnce(String) + Send + 'static,
     on_ports_warning: impl FnOnce(String) + Send + 'static,
+    on_interrupted_warning: impl FnOnce(String) + Send + 'static,
 ) {
     let (connection_id, region, sdk) = match project_sdk(project, settings).await {
         Ok(v) => v,
@@ -1155,7 +1639,8 @@ pub async fn reconcile(
         }
     };
     let api = SdkTaskApi::new(&sdk);
-    let find = FindTask::new(project, &region, &who.user_id);
+    let ec2 = user_ec2_cluster(&SdkRuntimeApi::new(&sdk), project, &who, &region).await;
+    let find = FindTask::new(project, &region, &who.user_id, ec2);
     match reconcile_project(&api, &store, project, &find).await {
         Ok(Reconciled::Live(task)) => {
             let generation = tunnels::begin_reattach(&project.id);
@@ -1187,6 +1672,10 @@ pub async fn reconcile(
         }
         Ok(Reconciled::Gone) => {
             log::info!("Project '{}' ({}): its task is gone — set to Stopped", project.name, project.id)
+        }
+        Ok(Reconciled::Interrupted) => {
+            log::info!("Project '{}' ({}): {INTERRUPTED}", project.name, project.id);
+            on_interrupted_warning(INTERRUPTED.to_string());
         }
         Err(e) => log::warn!("Project {}: could not check its task ({e}); status left as is", project.id),
     }
@@ -1227,14 +1716,26 @@ async fn reattach(
         .map_err(s)?;
     let token = read_agent_token(&rt, &env.name, &ok, &project.id).await.map_err(s)?;
     let logs = TaskLogs { group: env.log_group.clone(), stream_prefix: log_stream_prefix(&ok, &project.id) };
-    let task = wait_ready(&api, &env.cluster_arn, &task.arn, &logs, WaitTiming::default(), |_| {})
+    // An EC2 task may still be waiting for its instance after a restart.
+    let cluster = task_cluster(&env, &task.arn);
+    let timing = if ec2_cluster_of_task(&env.name, &task.arn).is_some() {
+        WaitTiming::ec2()
+    } else {
+        WaitTiming::default()
+    };
+    let task = wait_ready(&api, &cluster, &task.arn, &logs, timing, |_| {})
         .await
         .map_err(s)?;
+    // Reconcile never hands over an exec-off task; never wait on a tunnel
+    // ECS Exec can't open either.
+    if !task.exec_enabled {
+        return Err(format!("The task {} has ECS Exec off; Start the project again", task.arn));
+    }
     let (forward, endpoint) = SsmConnector { sdk: ctx.sdk.clone() }.connect(&task, &token).await?;
     let tunnel = LiveTunnel {
         task: ecs_task(&task)?,
         task_arn: task.arn.clone(),
-        cluster_arn: env.cluster_arn.clone(),
+        cluster_arn: cluster,
         connection_id: ctx.connection_id,
         region: ctx.region,
         sdk: ctx.sdk,

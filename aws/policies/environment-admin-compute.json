@@ -1,0 +1,230 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ManageTripleCCapacityProviders",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:CreateCapacityProvider",
+        "ecs:UpdateCapacityProvider",
+        "ecs:DeleteCapacityProvider",
+        "ecs:PutClusterCapacityProviders",
+        "ecs:TagResource",
+        "ecs:UntagResource",
+        "ecs:ListTagsForResource"
+      ],
+      "Resource": [
+        "arn:aws:ecs:*:*:capacity-provider/triple-c-*--u-*"
+      ]
+    },
+    {
+      "Sid": "CreateTaggedLaunchTemplates",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateLaunchTemplate"
+      ],
+      "Resource": [
+        "arn:aws:ec2:*:*:launch-template/*"
+      ],
+      "Condition": {
+        "Null": {
+          "aws:RequestTag/triple-c:component": "false"
+        }
+      }
+    },
+    {
+      "Sid": "TagComputeAtCreate",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateTags"
+      ],
+      "Resource": [
+        "arn:aws:ec2:*:*:launch-template/*",
+        "arn:aws:ec2:*:*:instance/*",
+        "arn:aws:ec2:*:*:volume/*",
+        "arn:aws:ec2:*:*:network-interface/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "ec2:CreateAction": [
+            "CreateLaunchTemplate",
+            "RunInstances"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "ManageAndUseTripleCLaunchTemplates",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateLaunchTemplateVersion",
+        "ec2:DeleteLaunchTemplate",
+        "ec2:CreateTags",
+        "ec2:DeleteTags",
+        "ec2:RunInstances"
+      ],
+      "Resource": [
+        "arn:aws:ec2:*:*:launch-template/*"
+      ],
+      "Condition": {
+        "Null": {
+          "aws:ResourceTag/triple-c:component": "false"
+        }
+      }
+    },
+    {
+      "Sid": "LaunchSupportedInstances",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:RunInstances"
+      ],
+      "Resource": [
+        "arn:aws:ec2:*:*:instance/*"
+      ],
+      "Condition": {
+        "Null": {
+          "aws:RequestTag/triple-c:component": "false"
+        },
+        "ArnLike": {
+          "ec2:LaunchTemplate": "arn:aws:ec2:*:*:launch-template/*"
+        },
+        "StringEquals": {
+          "ec2:InstanceType": [
+            "m7i.large",
+            "m7i.xlarge",
+            "m7i.2xlarge",
+            "m7i.4xlarge",
+            "m7g.large",
+            "m7g.xlarge",
+            "m7g.2xlarge",
+            "m7g.4xlarge",
+            "c7i.large",
+            "c7i.xlarge",
+            "c7i.2xlarge",
+            "c7i.4xlarge",
+            "c7g.large",
+            "c7g.xlarge",
+            "c7g.2xlarge",
+            "c7g.4xlarge",
+            "r7i.large",
+            "r7i.xlarge",
+            "r7i.2xlarge",
+            "r7i.4xlarge",
+            "r7g.large",
+            "r7g.xlarge",
+            "r7g.2xlarge",
+            "r7g.4xlarge",
+            "t3.large",
+            "t3.xlarge",
+            "t3.2xlarge",
+            "t4g.large",
+            "t4g.xlarge",
+            "t4g.2xlarge"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "LaunchTaggedVolumes",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:RunInstances"
+      ],
+      "Resource": [
+        "arn:aws:ec2:*:*:volume/*"
+      ],
+      "Condition": {
+        "Null": {
+          "aws:RequestTag/triple-c:component": "false"
+        },
+        "ArnLike": {
+          "ec2:LaunchTemplate": "arn:aws:ec2:*:*:launch-template/*"
+        }
+      }
+    },
+    {
+      "Sid": "LaunchIntoSubnets",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:RunInstances"
+      ],
+      "Resource": [
+        "arn:aws:ec2:*:*:network-interface/*",
+        "arn:aws:ec2:*:*:subnet/*"
+      ],
+      "Condition": {
+        "ArnLike": {
+          "ec2:LaunchTemplate": "arn:aws:ec2:*:*:launch-template/*"
+        }
+      }
+    },
+    {
+      "Sid": "LaunchWithTripleCGroups",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:RunInstances"
+      ],
+      "Resource": [
+        "arn:aws:ec2:*:*:security-group/*"
+      ],
+      "Condition": {
+        "ArnLike": {
+          "ec2:LaunchTemplate": "arn:aws:ec2:*:*:launch-template/*"
+        },
+        "Bool": {
+          "ec2:IsLaunchTemplateResource": "true"
+        },
+        "Null": {
+          "aws:ResourceTag/triple-c:component": "false"
+        }
+      }
+    },
+    {
+      "Sid": "LaunchAmazonImages",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:RunInstances"
+      ],
+      "Resource": [
+        "arn:aws:ec2:*::image/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "ec2:Owner": "amazon"
+        },
+        "ArnLike": {
+          "ec2:LaunchTemplate": "arn:aws:ec2:*:*:launch-template/*"
+        },
+        "Bool": {
+          "ec2:IsLaunchTemplateResource": "true"
+        }
+      }
+    },
+    {
+      "Sid": "PassInstanceRolesToEc2",
+      "Effect": "Allow",
+      "Action": [
+        "iam:PassRole"
+      ],
+      "Resource": [
+        "arn:aws:iam::*:role/triple-c-*-instance"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "iam:PassedToService": "ec2.amazonaws.com"
+        }
+      }
+    },
+    {
+      "Sid": "ReadEcsOptimizedAmis",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetParameter",
+        "ssm:GetParameters"
+      ],
+      "Resource": [
+        "arn:aws:ssm:*::parameter/aws/service/ecs/optimized-ami/*"
+      ]
+    }
+  ]
+}

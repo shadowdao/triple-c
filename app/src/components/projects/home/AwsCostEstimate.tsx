@@ -15,6 +15,8 @@ interface Props {
   connectionId: string | null;
   region: string | null | undefined;
   config: AwsWorkspaceConfig;
+  /** An EC2 project's instance type (the user's); null when unknown. */
+  instanceType?: string | null;
 }
 
 type State = { kind: "loading" } | { kind: "done"; estimate: HourlyEstimate | null };
@@ -25,21 +27,27 @@ type State = { kind: "loading" } | { kind: "done"; estimate: HourlyEstimate | nu
  * network or no connection reads "Estimate unavailable" — never an error toast, and nothing waits
  * on it. Re-asked only when a field that changes the price changes, after edits settle.
  */
-export default function AwsCostEstimate({ connectionId, region, config }: Props) {
+export default function AwsCostEstimate({ connectionId, region, config, instanceType = null }: Props) {
   const [state, setState] = useState<State>({ kind: "loading" });
-  const { cpu, memory_mib, arch, ephemeral_gib, spot, storage } = config;
+  const { launch_type, cpu, memory_mib, arch, ephemeral_gib, spot, storage } = config;
+  const ec2 = launch_type === "ec2";
   // Only what the backend prices or notes; the rest of the config is sent but changes nothing.
-  const key = JSON.stringify([connectionId, region, cpu, memory_mib, arch, ephemeral_gib, spot, storage]);
+  // An EC2 project is priced as its instance (E10): only the type and storage matter.
+  const key = JSON.stringify(
+    ec2
+      ? [connectionId, region, launch_type, instanceType, storage]
+      : [connectionId, region, launch_type, cpu, memory_mib, arch, ephemeral_gib, spot, storage],
+  );
 
   useEffect(() => {
-    if (!connectionId || !region) {
+    if (!connectionId || !region || (ec2 && !instanceType)) {
       setState({ kind: "done", estimate: null });
       return;
     }
     let cancelled = false;
     setState({ kind: "loading" });
     const timer = setTimeout(() => {
-      awsCostEstimate(connectionId, region, config)
+      awsCostEstimate(connectionId, region, config, ec2 ? instanceType : null)
         .catch(() => null)
         .then((estimate) => {
           if (!cancelled) setState({ kind: "done", estimate });
@@ -65,7 +73,17 @@ export default function AwsCostEstimate({ connectionId, region, config }: Props)
               }`
             : "Estimate unavailable"}
       </p>
-      {estimate && (
+      {estimate?.ec2_instance && (
+        <p className="text-[var(--text-secondary)]">
+          While your instance runs. Instances scale to zero when no workspace is running.
+          {estimate.root_volume_included
+            ? " Includes its 50 GiB gp3 root volume."
+            : " Its 50 GiB gp3 root volume (about $4 a month) is not included."}
+          {" In an environment with public networking, the instance's public IPv4 address adds $0.005/hour."}
+          {estimate.efs_billed_separately && " EFS storage is billed separately."}
+        </p>
+      )}
+      {estimate && !estimate.ec2_instance && (
         <p className="text-[var(--text-secondary)]">
           While the task runs; nothing while it is stopped.
           {estimate.efs_billed_separately && " EFS storage is billed separately."}

@@ -80,6 +80,9 @@ aws-runtime = { version = "1.10.4", default-features = false }
 # The default sleep and time source for the hand-built SdkConfig (no env/profile
 # loading); the version and feature already in the tree.
 aws-smithy-async = { version = "1.3.1", default-features = false, features = ["rt-tokio"] }
+# commands/environment_commands.rs: the pre-apply check that a user's EC2 names
+# (Auto Scaling group) are not another onboarding's (phase 7, R3).
+aws-sdk-autoscaling = { version = "1.144.0", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
 aws-sdk-s3 = { version = "1.159.0", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
 
 # aws/tofu.rs: `setsid` puts the detached OpenTofu runner in its own session,

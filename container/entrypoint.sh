@@ -459,6 +459,7 @@ fi
 # That case says so rather than returning silently: the toggle is on, the
 # capability is there, and the skill simply never appears — which is impossible
 # to work out from the outside.
+# >>> feature_skills
 install_feature_skill() {
     local _name="$1"
     local _enabled="$2"
@@ -509,6 +510,7 @@ install_feature_skill() {
 
 install_feature_skill pia-vpn "${VPN_SUPPORT_ENABLED:-0}"
 unset VPN_SUPPORT_ENABLED
+# <<< feature_skills
 
 # ── Claude Code settings ────────────────────────────────────────────────────
 # Apply the managed Claude Code settings to ~/.claude/settings.json, keeping
@@ -655,7 +657,10 @@ else
 fi
 
 # ── Docker socket permissions ────────────────────────────────────────────────
-if [ "$triplec_aws" != 1 ] && [ -S /var/run/docker.sock ]; then
+# Docker mode and AWS alike: an EC2 project with Docker access mounts its own
+# instance's socket here (phase 7 E6); Fargate never has one.
+# >>> docker_socket
+if [ -S /var/run/docker.sock ]; then
     DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)
     if ! getent group "$DOCKER_GID" > /dev/null 2>&1; then
         groupadd -g "$DOCKER_GID" docker-host
@@ -663,6 +668,7 @@ if [ "$triplec_aws" != 1 ] && [ -S /var/run/docker.sock ]; then
     DOCKER_GROUP=$(getent group "$DOCKER_GID" | cut -d: -f1)
     usermod -aG "$DOCKER_GROUP" claude
 fi
+# <<< docker_socket
 
 # ── Timezone setup ───────────────────────────────────────────────────────────
 if [ -n "${TZ:-}" ]; then

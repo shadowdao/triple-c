@@ -1,8 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import EnvironmentsPanel from "./EnvironmentsPanel";
+import JoinEnvironmentModal from "./JoinEnvironmentModal";
 import type { DeployProgress, EnvironmentScan } from "../../../lib/types";
-import { conn, env, info, progress, scan, tofuEvent } from "./testkit";
+import { compute, conn, env, info, instanceTable, progress, scan, tofuEvent } from "./testkit";
 
 const invoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
@@ -72,7 +73,7 @@ describe("EnvironmentsPanel", () => {
   });
 
   it("deploy is secondary when environments exist", async () => {
-    backend(() => scan({ environments: [env({ onboarding: { state: "joined" }, actions: [] })] }));
+    backend(() => scan({ environments: [env({ onboarding: { state: "joined", ec2: null }, actions: [] })] }));
     render(<EnvironmentsPanel connection={conn} tier="environment_admin" />);
     await open();
     const deploy = await screen.findByRole("button", { name: "Deploy a new environment" });
@@ -204,9 +205,10 @@ describe("EnvironmentsPanel", () => {
     backend(
       () => {
         detects += 1;
-        return scan({ environments: [env({ onboarding: detects > 1 ? { state: "joined" } : { state: "not_joined" } })] });
+        return scan({ environments: [env({ onboarding: detects > 1 ? { state: "joined", ec2: null } : { state: "not_joined" } })] });
       },
       async (cmd) => {
+        if (cmd === "list_ec2_instance_types") return instanceTable;
         if (cmd === "onboard_aws_user") {
           // The backend can emit before the invoke resolves: an old follower's
           // line (another op) and this run's first line.
@@ -220,9 +222,18 @@ describe("EnvironmentsPanel", () => {
     render(<EnvironmentsPanel connection={conn} tier="environment_admin" />);
     await open();
     fireEvent.click(await screen.findByRole("button", { name: "Join dev" }));
+    // The join dialog asks for EC2 capacity first; none is the default.
+    const dialog = screen.getByRole("dialog", { name: "Join dev" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Join" }));
     expect(await screen.findByText("Planning")).toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).toBeNull();
     expect(screen.queryByText("stale line")).toBeNull();
-    expect(invoke).toHaveBeenCalledWith("onboard_aws_user", { connectionId: "h1", region: "eu-west-1", environment: "dev" });
+    expect(invoke).toHaveBeenCalledWith("onboard_aws_user", {
+      connectionId: "h1",
+      region: "eu-west-1",
+      environment: "dev",
+      ec2: { kind: "none" },
+    });
     expect(screen.getByRole("button", { name: "Cancel deployment" })).toBeDisabled();
 
     emit(progress({ op_id: "op1", state_key: key, events: [tofuEvent("Creating...", { resource: "aws_iam_role.task", action: "create" })] }));
@@ -241,7 +252,7 @@ describe("EnvironmentsPanel", () => {
     backend(
       () => scan({ environments: [env()] }),
       (cmd) => {
-        if (cmd === "save_aws_admin_bundle") return "/home/me/onboard-dev";
+        if (cmd === "save_aws_admin_bundle") return { folder: "/home/me/onboard-dev", warning: null };
         throw new Error(`unexpected ${cmd}`);
       },
     );
@@ -261,11 +272,176 @@ describe("EnvironmentsPanel", () => {
         environment: "dev",
         ownerId: "AIDAEXAMPLEEXAMPLE01",
         network: null,
+        ec2: null,
       }),
     );
     expect(invoke.mock.calls.some((c) => c[0] === "onboard_aws_user")).toBe(false);
     fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
     expect(within(screen.getByTestId("env-dev")).getByText("Waiting for an admin to onboard you")).toBeInTheDocument();
+  });
+
+  it("an admin joins with EC2 capacity: a type from the table, max instances and their triple-c-user value", async () => {
+    backend(
+      () => scan({ environments: [env()] }),
+      (cmd) => {
+        if (cmd === "list_ec2_instance_types") return instanceTable;
+        if (cmd === "onboard_aws_user") return "op1";
+        throw new Error(`unexpected ${cmd}`);
+      },
+    );
+    render(<EnvironmentsPanel connection={conn} tier="environment_admin" />);
+    await open();
+    fireEvent.click(await screen.findByRole("button", { name: "Join dev" }));
+    const dialog = screen.getByRole("dialog", { name: "Join dev" });
+    fireEvent.click(within(dialog).getByRole("radio", { name: "My own EC2 instances" }));
+    const type = within(dialog).getByLabelText("Instance type") as HTMLSelectElement;
+    // The table's default, grouped by architecture.
+    await waitFor(() => expect(type.value).toBe("m7i.large"));
+    const groups = [...type.querySelectorAll("optgroup")].map((g) => g.label);
+    expect(groups).toEqual(["x86 (Intel)", "ARM (Graviton)"]);
+    expect(within(dialog).getByRole("option", { name: "m7g.large — 2 vCPU, 8 GiB" })).toBeInTheDocument();
+    expect(within(dialog).getByText(/admin set as your triple-c-user sign-in tag/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/fail to start with access denied/)).toBeInTheDocument();
+    // The value is required and validated.
+    const joinButton = within(dialog).getByRole("button", { name: "Join" });
+    expect(joinButton).toBeDisabled();
+    const tag = within(dialog).getByLabelText("Your triple-c-user value");
+    fireEvent.change(tag, { target: { value: "al--ice" } });
+    expect(within(dialog).getByText(/single hyphens/)).toBeInTheDocument();
+    expect(joinButton).toBeDisabled();
+    fireEvent.change(tag, { target: { value: "alice" } });
+    fireEvent.change(type, { target: { value: "m7g.large" } });
+    fireEvent.change(within(dialog).getByLabelText("Maximum instances"), { target: { value: "2" } });
+    fireEvent.click(joinButton);
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("onboard_aws_user", {
+        connectionId: "h1",
+        region: "eu-west-1",
+        environment: "dev",
+        ec2: { kind: "ec2", instance_type: "m7g.large", max_instances: 2, user_tag: "alice" },
+      }),
+    );
+  });
+
+  it("shows a joined user's compute, and a change starts from the recorded values", async () => {
+    backend(
+      () =>
+        scan({
+          environments: [
+            env({ onboarding: { state: "joined", ec2: compute() } }),
+            env({ name: "plain", onboarding: { state: "joined", ec2: null } }),
+          ],
+        }),
+      (cmd) => {
+        if (cmd === "list_ec2_instance_types") return instanceTable;
+        if (cmd === "onboard_aws_user") return "op1";
+        throw new Error(`unexpected ${cmd}`);
+      },
+    );
+    render(<EnvironmentsPanel connection={conn} tier="environment_admin" />);
+    await open();
+    expect(await screen.findByTestId("compute-dev")).toHaveTextContent(
+      "EC2 capacity: m7g.xlarge, up to 3 instances (triple-c-user alice)",
+    );
+    expect(screen.getByTestId("compute-plain")).toHaveTextContent("EC2 capacity: none (Fargate only)");
+    // Joined: no Join, but the capacity can be changed (a re-apply).
+    const row = screen.getByTestId("env-dev");
+    expect(within(row).queryByRole("button", { name: "Join dev" })).toBeNull();
+    fireEvent.click(within(row).getByRole("button", { name: "EC2 capacity in dev" }));
+    const dialog = screen.getByRole("dialog", { name: "EC2 capacity in dev" });
+    expect((within(dialog).getByLabelText("Instance type") as HTMLSelectElement).value).toBe("m7g.xlarge");
+    expect((within(dialog).getByLabelText("Maximum instances") as HTMLSelectElement).value).toBe("3");
+    expect((within(dialog).getByLabelText("Your triple-c-user value") as HTMLInputElement).value).toBe("alice");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Apply" }));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("onboard_aws_user", {
+        connectionId: "h1",
+        region: "eu-west-1",
+        environment: "dev",
+        ec2: { kind: "ec2", instance_type: "m7g.xlarge", max_instances: 3, user_tag: "alice" },
+      }),
+    );
+  });
+
+  it("finishing an incomplete onboarding starts from its record and says when it removes EC2", async () => {
+    backend(
+      () => scan({ environments: [env({ onboarding: { state: "incomplete", lock: null, ec2: compute() } })] }),
+      (cmd) => {
+        if (cmd === "list_ec2_instance_types") return instanceTable;
+        throw new Error(`unexpected ${cmd}`);
+      },
+    );
+    render(<EnvironmentsPanel connection={conn} tier="environment_admin" />);
+    await open();
+    fireEvent.click(await screen.findByRole("button", { name: "Join dev" }));
+    const dialog = screen.getByRole("dialog", { name: "Join dev" });
+    expect((within(dialog).getByLabelText("Your triple-c-user value") as HTMLInputElement).value).toBe("alice");
+    expect(within(dialog).queryByText(/This removes your EC2 capacity/)).toBeNull();
+    fireEvent.click(within(dialog).getByRole("radio", { name: "None (Fargate only)" }));
+    expect(within(dialog).getByText("This removes your EC2 capacity (m7g.xlarge) in dev.")).toBeInTheDocument();
+  });
+
+  it("an incomplete onboarding with no record warns that None removes half-built EC2 capacity", async () => {
+    backend(
+      () => scan({ environments: [env({ onboarding: { state: "incomplete", lock: null, ec2: null } })] }),
+      (cmd) => {
+        if (cmd === "list_ec2_instance_types") return instanceTable;
+        throw new Error(`unexpected ${cmd}`);
+      },
+    );
+    render(<EnvironmentsPanel connection={conn} tier="environment_admin" />);
+    await open();
+    fireEvent.click(await screen.findByRole("button", { name: "Join dev" }));
+    const dialog = screen.getByRole("dialog", { name: "Join dev" });
+    expect(within(dialog).getByRole("alert")).toHaveTextContent(
+      /didn't finish, and it may have built part of your EC2 capacity. Choosing None removes anything it built/,
+    );
+    fireEvent.click(within(dialog).getByRole("radio", { name: "My own EC2 instances" }));
+    expect(within(dialog).queryByText(/Choosing None removes/)).toBeNull();
+  });
+
+  it("with no record, the join starts from the EC2 capacity last chosen here", async () => {
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_ec2_instance_types") return instanceTable;
+      throw new Error(`unexpected ${cmd}`);
+    });
+    render(
+      <JoinEnvironmentModal
+        environment="dev"
+        region="eu-west-1"
+        recorded={null}
+        reapply={false}
+        incomplete
+        lastChoice={{ instance_type: "m7g.xlarge", max_instances: 2, user_tag: "alice" }}
+        onJoin={async () => null}
+        onClose={() => {}}
+      />,
+    );
+    const dialog = screen.getByRole("dialog", { name: "Join dev" });
+    expect((within(dialog).getByLabelText("Your triple-c-user value") as HTMLInputElement).value).toBe("alice");
+    expect(within(dialog).queryByText(/Choosing None removes/)).toBeNull();
+  });
+
+  it("a joined workspace user's capacity change is a bundle starting from their record", async () => {
+    backend(
+      () => scan({ environments: [env({ onboarding: { state: "joined", ec2: compute({ max_instances: 1 }) } })] }),
+      (cmd) => {
+        if (cmd === "list_ec2_instance_types") return instanceTable;
+        if (cmd === "save_aws_admin_bundle") return { folder: "/home/me/onboard-dev", warning: null };
+        throw new Error(`unexpected ${cmd}`);
+      },
+    );
+    render(<EnvironmentsPanel connection={conn} tier="workspace_user" />);
+    await open();
+    fireEvent.click(await screen.findByRole("button", { name: "EC2 capacity in dev" }));
+    const dialog = screen.getByRole("dialog", { name: "Onboarding bundle" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save bundle to folder…" }));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith(
+        "save_aws_admin_bundle",
+        expect.objectContaining({ ec2: { instance_type: "m7g.xlarge", max_instances: 1, user_tag: "alice" } }),
+      ),
+    );
   });
 
   it("follows a deployment running on this machine when opened, and cancels after confirming", async () => {
@@ -303,7 +479,7 @@ describe("EnvironmentsPanel", () => {
 
   it("Update pre-fills the environment's recorded cap and sends what is shown", async () => {
     backend(
-      () => scan({ environments: [env({ state: { state: "update_available" }, actions: ["join", "update"], info: { ...info("dev"), max_workspace_hours: 24 }, onboarding: { state: "joined" } })] }),
+      () => scan({ environments: [env({ state: { state: "update_available" }, actions: ["join", "update"], info: { ...info("dev"), max_workspace_hours: 24 }, onboarding: { state: "joined", ec2: null } })] }),
       async (cmd) => {
         if (cmd === "update_aws_environment") return "u1";
         throw new Error(`unexpected ${cmd}`);
@@ -326,7 +502,7 @@ describe("EnvironmentsPanel", () => {
 
   it("shows a failed run's errors in full", async () => {
     backend(
-      () => scan({ environments: [env({ state: { state: "update_available" }, actions: ["join", "update"], onboarding: { state: "joined" } })] }),
+      () => scan({ environments: [env({ state: { state: "update_available" }, actions: ["join", "update"], onboarding: { state: "joined", ec2: null } })] }),
       async (cmd) => {
         if (cmd === "update_aws_environment") return "u1";
         throw new Error(`unexpected ${cmd}`);
@@ -383,7 +559,7 @@ describe("EnvironmentsPanel", () => {
     expect(screen.queryByRole("button", { name: "Destroy dev" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Deploy a new environment" })).toBeNull();
     await act(async () =>
-      resolveUs(scan({ region: "us-east-1", environments: [env({ state: { state: "update_available" }, actions: ["update"], onboarding: { state: "joined" } })] })),
+      resolveUs(scan({ region: "us-east-1", environments: [env({ state: { state: "update_available" }, actions: ["update"], onboarding: { state: "joined", ec2: null } })] })),
     );
     fireEvent.click(await screen.findByRole("button", { name: "Update dev" }));
     fireEvent.click(within(screen.getByRole("dialog", { name: "Update dev" })).getByRole("button", { name: "Update" }));
@@ -399,7 +575,7 @@ describe("EnvironmentsPanel", () => {
     invoke.mockImplementation(async (cmd: string) => {
       if (cmd !== "detect_aws_environments") throw new Error(`unexpected ${cmd}`);
       calls += 1;
-      const found = scan({ environments: [env({ actions: ["join", "update"], onboarding: { state: "joined" } })] });
+      const found = scan({ environments: [env({ actions: ["join", "update"], onboarding: { state: "joined", ec2: null } })] });
       if (calls === 1) return found;
       return new Promise<EnvironmentScan>((r) => (release = () => r(found)));
     });
@@ -414,7 +590,7 @@ describe("EnvironmentsPanel", () => {
 
   it("a done that arrives before the invoke resolves is shown and re-detects", async () => {
     backend(
-      () => scan({ environments: [env({ state: { state: "update_available" }, actions: ["update"], onboarding: { state: "joined" } })] }),
+      () => scan({ environments: [env({ state: { state: "update_available" }, actions: ["update"], onboarding: { state: "joined", ec2: null } })] }),
       async (cmd) => {
         if (cmd === "update_aws_environment") {
           emit(progress({ op_id: "u1", events: [tofuEvent("Refreshing state")] }));
@@ -482,7 +658,7 @@ describe("EnvironmentsPanel", () => {
     backend(
       () =>
         scan({
-          environments: [env({ onboarding: { state: "incomplete", lock }, onboarding_actions: ["unlock"] })],
+          environments: [env({ onboarding: { state: "incomplete", lock, ec2: null }, onboarding_actions: ["unlock"] })],
         }),
       (cmd) => {
         if (cmd === "unlock_aws_state") return undefined;
@@ -515,7 +691,7 @@ describe("EnvironmentsPanel", () => {
         scan({
           environments: [
             env({ name: "a", state: { state: "incomplete", lock: null }, actions: ["push_state"], info: null, onboarding: null }),
-            env({ name: "b", onboarding: { state: "incomplete", lock: null }, onboarding_actions: ["push_state"] }),
+            env({ name: "b", onboarding: { state: "incomplete", lock: null, ec2: null }, onboarding_actions: ["push_state"] }),
           ],
         }),
       (cmd) => {

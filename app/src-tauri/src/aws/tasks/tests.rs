@@ -64,6 +64,9 @@ fn info(id: &str, last: &str) -> TaskInfo {
         stopped_reason: None,
         task_definition_arn: td_arn(3),
         runtime_id: None,
+        container_instance_arn: None,
+        exec_enabled: true,
+        created_unix: None,
         exec_agent_running: false,
         exit_code: None,
         owner: Some(USER.into()),
@@ -230,7 +233,7 @@ async fn an_existing_running_task_is_reused_and_nothing_is_run() {
         ..Default::default()
     }
     .describing(vec![vec![ready("t1")]]);
-    let got = find_or_run(&api, &env_info(), USER, PROJECT_ID, &td_arn(4), false)
+    let got = find_or_run(&api, &env_info(), USER, PROJECT_ID, &td_arn(4), RunOn::Fargate { spot: false })
         .await
         .unwrap();
     assert!(got.reused);
@@ -246,7 +249,7 @@ async fn a_pending_task_is_reused_too() {
         ..Default::default()
     }
     .describing(vec![vec![info("t1", "PENDING")]]);
-    let got = find_or_run(&api, &env_info(), USER, PROJECT_ID, &td_arn(3), false)
+    let got = find_or_run(&api, &env_info(), USER, PROJECT_ID, &td_arn(3), RunOn::Fargate { spot: false })
         .await
         .unwrap();
     assert!(got.reused);
@@ -272,7 +275,7 @@ async fn a_task_of_another_owner_or_project_in_the_family_is_never_reused() {
         ..Default::default()
     }
     .describing(vec![vec![foreign, other_project, untagged]]);
-    let got = find_or_run(&api, &env_info(), USER, PROJECT_ID, &td_arn(3), false)
+    let got = find_or_run(&api, &env_info(), USER, PROJECT_ID, &td_arn(3), RunOn::Fargate { spot: false })
         .await
         .unwrap();
     assert!(!got.reused);
@@ -289,7 +292,7 @@ async fn a_task_already_stopping_is_not_reused() {
         ..Default::default()
     }
     .describing(vec![vec![stopping, info("t2", "DEPROVISIONING")]]);
-    let got = find_or_run(&api, &env_info(), USER, PROJECT_ID, &td_arn(3), false)
+    let got = find_or_run(&api, &env_info(), USER, PROJECT_ID, &td_arn(3), RunOn::Fargate { spot: false })
         .await
         .unwrap();
     assert!(!got.reused);
@@ -312,7 +315,7 @@ async fn a_running_task_is_preferred_over_a_pending_one() {
 #[tokio::test]
 async fn nothing_listed_means_no_describe_and_a_run_with_the_exact_revision_and_tags() {
     let api = Fake::default();
-    let got = find_or_run(&api, &env_info(), USER, PROJECT_ID, &td_arn(7), true)
+    let got = find_or_run(&api, &env_info(), USER, PROJECT_ID, &td_arn(7), RunOn::Fargate { spot: true })
         .await
         .unwrap();
     assert!(!got.reused);
@@ -345,7 +348,7 @@ async fn a_bare_family_or_foreign_arn_is_refused_before_any_call() {
         format!("arn:aws:ecs:{REGION}:{ACCOUNT}:task-definition/{FAMILY}:latest"),
         "arn:aws:ecs:eu-west-1:1:task-definition/someone-else:1".to_string(),
     ] {
-        let err = find_or_run(&api, &env_info(), USER, PROJECT_ID, &bad, false)
+        let err = find_or_run(&api, &env_info(), USER, PROJECT_ID, &bad, RunOn::Fargate { spot: false })
             .await
             .unwrap_err();
         assert!(matches!(err, AwsError::Other { .. }), "{bad}: {err:?}");
@@ -358,7 +361,7 @@ async fn a_quota_refusal_is_reported_once_without_retrying() {
     let api = Fake::default().running(Err(quota_error(
         "You've reached the limit on the number of vCPUs you can run concurrently",
     )));
-    let err = find_or_run(&api, &env_info(), USER, PROJECT_ID, &td_arn(3), false)
+    let err = find_or_run(&api, &env_info(), USER, PROJECT_ID, &td_arn(3), RunOn::Fargate { spot: false })
         .await
         .unwrap_err();
     assert!(is_quota_error(&err));
@@ -747,4 +750,134 @@ fn task_info_reads_the_workspace_container_and_its_exec_agent() {
     assert_eq!(bare.runtime_id, None);
     assert_eq!(bare.exit_code, None);
     assert_eq!(bare.owner, None);
+}
+
+// ------------------------------------------------------------- EC2 (phase 7)
+
+fn user_cluster() -> String {
+    format!("arn:aws:ecs:{REGION}:{ACCOUNT}:cluster/triple-c-dev--u-alice")
+}
+
+fn compute() -> UserCompute {
+    UserCompute {
+        instance_type: "m7i.large".into(),
+        max_instances: 2,
+        user_tag: "alice".into(),
+        cluster_arn: user_cluster(),
+        capacity_provider: "triple-c-dev--u-alice".into(),
+    }
+}
+
+#[test]
+fn an_ec2_run_uses_the_users_cluster_and_capacity_provider_and_no_network() {
+    let c = compute();
+    let req = ec2_run_task_request(&c, &td_arn(3), &tags());
+    assert_eq!(req.cluster(), Some(user_cluster().as_str()));
+    assert_eq!(req.task_definition(), Some(td_arn(3).as_str()));
+    assert_eq!(req.launch_type(), None, "exclusive with a capacity provider strategy");
+    let strategy = req.capacity_provider_strategy();
+    assert_eq!(strategy.len(), 1);
+    assert_eq!(strategy[0].capacity_provider(), "triple-c-dev--u-alice");
+    assert_eq!(strategy[0].weight(), 1);
+    assert!(req.network_configuration().is_none(), "bridge networking (R2)");
+    assert_eq!(req.enable_execute_command(), Some(true));
+    assert_eq!(req.count(), Some(1));
+    assert!(req.client_token().is_some_and(|t| !t.is_empty()));
+    let got: Vec<(String, String)> = req
+        .tags()
+        .iter()
+        .map(|t| (t.key().unwrap().to_string(), t.value().unwrap().to_string()))
+        .collect();
+    assert_eq!(got, tags());
+    assert!(req.overrides().is_none());
+    assert!(req.propagate_tags().is_none());
+    assert!(req.enable_ecs_managed_tags().is_none());
+}
+
+#[tokio::test]
+async fn an_ec2_find_or_run_looks_and_runs_on_the_users_cluster() {
+    let api = Fake::default();
+    let c = compute();
+    let got = find_or_run(&api, &env_info(), USER, PROJECT_ID, &td_arn(3), RunOn::Ec2(&c))
+        .await
+        .unwrap();
+    assert!(!got.reused);
+    assert_eq!(api.calls(), vec![format!("list {} {FAMILY}", user_cluster()), "run".to_string()]);
+    let req = &api.run_requests.lock().unwrap()[0];
+    assert_eq!(req.cluster(), Some(user_cluster().as_str()));
+    assert_eq!(req.capacity_provider_strategy()[0].capacity_provider(), "triple-c-dev--u-alice");
+    assert_eq!(RunOn::Ec2(&c).cluster(&env_info()), user_cluster());
+    assert_eq!(RunOn::Fargate { spot: true }.cluster(&env_info()), cluster());
+}
+
+#[tokio::test]
+async fn access_denied_on_the_users_cluster_says_the_triple_c_user_value_is_wrong() {
+    let api = Fake::default().running(Err(AwsError::AccessDenied {
+        action: "ecs:RunTask".into(),
+        message: "not authorized to perform ecs:RunTask on cluster/triple-c-dev--u-alice".into(),
+    }));
+    let c = compute();
+    let e = find_or_run(&api, &env_info(), USER, PROJECT_ID, &td_arn(3), RunOn::Ec2(&c))
+        .await
+        .unwrap_err();
+    let AwsError::AccessDenied { action, message } = &e else { panic!("{e:?}") };
+    assert_eq!(action, "ecs:RunTask");
+    assert!(message.starts_with(EC2_TAG_MISMATCH), "{message}");
+    assert!(message.contains("not authorized"), "AWS's words are kept: {message}");
+    assert!(EC2_TAG_MISMATCH.contains("different triple-c-user value"));
+    assert!(EC2_TAG_MISMATCH.contains("Ask an admin"));
+
+    // The same refusal on Fargate is left as it is.
+    let api = Fake::default().running(Err(AwsError::AccessDenied {
+        action: "ecs:RunTask".into(),
+        message: "nope".into(),
+    }));
+    let e = find_or_run(&api, &env_info(), USER, PROJECT_ID, &td_arn(3), RunOn::Fargate { spot: false })
+        .await
+        .unwrap_err();
+    assert_eq!(e, AwsError::AccessDenied { action: "ecs:RunTask".into(), message: "nope".into() });
+}
+
+#[test]
+fn a_placement_failure_on_ec2_says_no_instance_has_room() {
+    let e = ec2_run_error(
+        run_task_outcome(Vec::new(), vec![(Some("RESOURCE:MEMORY".into()), None)]).unwrap_err(),
+    );
+    assert!(e.to_string().contains("RESOURCE:MEMORY"), "{e}");
+    assert!(e.to_string().contains("No instance of your EC2 capacity has room"), "{e}");
+    // Anything else passes through.
+    let q = quota_error("limit");
+    assert_eq!(ec2_run_error(q.clone()), q);
+}
+
+#[test]
+fn an_ec2_task_without_an_instance_is_waiting_for_one() {
+    let provisioning = info("t", "PROVISIONING");
+    assert!(waiting_for_instance(&provisioning));
+    assert!(waiting_for_instance(&info("t", "PENDING")));
+    let placed = TaskInfo {
+        container_instance_arn: Some(format!(
+            "arn:aws:ecs:{REGION}:{ACCOUNT}:container-instance/triple-c-dev--u-alice/abc"
+        )),
+        ..info("t", "PENDING")
+    };
+    assert!(!waiting_for_instance(&placed));
+    assert!(!waiting_for_instance(&info("t", "RUNNING")));
+    assert!(!waiting_for_instance(&info("t", "STOPPED")));
+    // The EC2 wait leaves room for an instance launch and an image pull.
+    assert_eq!(WaitTiming::ec2().timeout, Duration::from_secs(600));
+    assert_eq!(WaitTiming::ec2().interval, WaitTiming::default().interval);
+}
+
+#[test]
+fn task_info_reads_the_container_instance() {
+    let t = Task::builder()
+        .task_arn(task_arn("t"))
+        .container_instance_arn("arn:aws:ecs:eu-west-1:111122223333:container-instance/c/1")
+        .build();
+    assert_eq!(
+        task_info(&t).container_instance_arn.as_deref(),
+        Some("arn:aws:ecs:eu-west-1:111122223333:container-instance/c/1")
+    );
+    assert_eq!(task_info(&Task::builder().build()).container_instance_arn, None);
 }

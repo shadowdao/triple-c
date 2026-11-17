@@ -208,10 +208,11 @@ pub(crate) fn conditions_hold(stmt: &Value, req: &Request) -> bool {
         // A negated operator holds when the key is absent, and
         // otherwise when no value matches.
         let (matches, negated): (fn(&str, &str) -> bool, bool) = match base {
-            "StringEquals" => (|p, v| p == v, false),
+            // IAM's Bool compares "true"/"false"; the checks send strings.
+            "StringEquals" | "Bool" => (|p, v| p == v, false),
             "StringLike" | "ArnLike" => (glob, false),
             "StringNotEquals" => (|p, v| p == v, true),
-            "StringNotLike" => (glob, true),
+            "StringNotLike" | "ArnNotLike" => (glob, true),
             other => panic!("{}: unsupported condition operator {other}", sid(stmt)),
         };
         entries
@@ -266,6 +267,37 @@ mod tests {
         let literal = format!("arn:aws:ec2:*:*:{LITERAL_STAR}/{LITERAL_STAR}");
         assert!(glob(&literal, "arn:aws:ec2:us-west-2:1:*/*"));
         assert!(!glob(&literal, "arn:aws:ec2:us-west-2:1:elastic-ip/eipalloc-1"));
+    }
+
+    #[test]
+    fn bool_needs_the_key_and_bool_if_exists_does_not() {
+        let stmt = |op: &str| -> Value {
+            serde_json::json!({
+                "Sid": "T", "Effect": "Allow", "Action": "x:Y", "Resource": "*",
+                "Condition": { op: { "k:Pinned": "true" } }
+            })
+        };
+        let holds = |op: &str, context| {
+            let c = Check {
+                action: "x:Y",
+                resource: "*",
+                context,
+                write: true,
+            };
+            conditions_hold(
+                &stmt(op),
+                &Request {
+                    check: &c,
+                    caller: ME,
+                    owner: ME,
+                },
+            )
+        };
+        assert!(holds("Bool", &[("k:Pinned", Literal("true"))]));
+        assert!(!holds("Bool", &[("k:Pinned", Literal("false"))]));
+        assert!(!holds("Bool", &[]));
+        assert!(holds("BoolIfExists", &[]));
+        assert!(!holds("BoolIfExists", &[("k:Pinned", Literal("false"))]));
     }
 
     #[test]

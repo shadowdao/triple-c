@@ -29,8 +29,9 @@ use serde_json::{json, Map, Value};
 use super::error::{classify_sdk_error, AwsError};
 use super::identity::CallerIdentity;
 use super::tofu_modules::{
-    environment_parameter_name, owner_key, state_bucket_name, state_key, user_role_names,
-    validate_environment_name, Deployment, BOUNDARY_POLICY_NAME,
+    environment_parameter_name, owner_key, state_bucket_name, state_key, user_ec2_stem,
+    user_record_parameter_name, user_role_names, validate_ec2_user_tag, validate_environment_name,
+    Deployment, BOUNDARY_POLICY_NAME, EC2_MAX_INSTANCES,
 };
 use crate::models::host_connection::validate_supported_region;
 
@@ -309,15 +310,97 @@ pub enum EnvironmentAction {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum OnboardingState {
     /// Their task role exists and, where the bucket is readable, their state
-    /// records a finished apply (its `onboarding_complete` output).
-    Joined,
+    /// records a finished apply (its `onboarding_complete` output). `ec2` is
+    /// their EC2 capacity, from their user record.
+    Joined { ec2: Option<UserCompute> },
     NotJoined,
     /// A local runner, or a recent lock.
     InProgress { lock: Option<LockInfo> },
     /// The last onboarding run didn't finish: a stale lock, a failed run on
     /// this machine, or a state without the completion output. Join is a
-    /// re-apply and finishes it.
-    Incomplete { lock: Option<LockInfo> },
+    /// re-apply and finishes it; `ec2` is what their record still holds, so
+    /// the re-apply can keep it.
+    Incomplete {
+        lock: Option<LockInfo>,
+        ec2: Option<UserCompute>,
+    },
+}
+
+impl OnboardingState {
+    fn with_ec2(self, compute: Option<UserCompute>) -> Self {
+        match self {
+            OnboardingState::Joined { .. } => OnboardingState::Joined { ec2: compute },
+            OnboardingState::Incomplete { lock, .. } => OnboardingState::Incomplete { lock, ec2: compute },
+            other => other,
+        }
+    }
+}
+
+/// A user's EC2 capacity in one environment: their validated user record
+/// (`tofu_modules::user_record_parameter_name`). A missing record means no
+/// NEW EC2 runs there, not that nothing runs (teardown removes it first).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct UserCompute {
+    pub instance_type: String,
+    pub max_instances: u32,
+    /// The `triple-c-user` value the cluster is named after.
+    pub user_tag: String,
+    pub cluster_arn: String,
+    pub capacity_provider: String,
+}
+
+/// Validate a user record read from `user_record_parameter_name(env, …)`:
+/// schema 1, a type the app's table knows, 1 to `EC2_MAX_INSTANCES`
+/// instances (absent in records written before the field: 1), a valid user
+/// tag, and the cluster and capacity provider of exactly that tag's per-user
+/// names in `account` and `region`. The error names the field, never its
+/// value.
+pub fn parse_user_record(
+    env: &str,
+    value: &str,
+    account: &str,
+    region: &str,
+) -> Result<UserCompute, String> {
+    if value.len() > MAX_UNTRUSTED_BYTES {
+        return Err("the record is larger than 4 KiB".into());
+    }
+    let parsed: Value =
+        serde_json::from_str(value).map_err(|_| "the record is not JSON".to_string())?;
+    let obj = parsed
+        .as_object()
+        .ok_or_else(|| "the record is not a JSON object".to_string())?;
+    if field(obj, "schema")?.as_u64() != Some(RECORD_SCHEMA) {
+        return Err("schema is not 1".into());
+    }
+    let instance_type = str_field(obj, "instance_type")?;
+    if crate::models::project::ec2_instance_spec(instance_type).is_none() {
+        return Err("instance_type is not a supported instance type".into());
+    }
+    let max_instances = match obj.get("max_instances") {
+        None => 1,
+        Some(v) => v
+            .as_u64()
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|v| (1..=EC2_MAX_INSTANCES).contains(v))
+            .ok_or_else(|| format!("max_instances is not a number from 1 to {EC2_MAX_INSTANCES}"))?,
+    };
+    let user_tag = validate_ec2_user_tag(str_field(obj, "user_tag")?)
+        .map_err(|_| "user_tag is not a valid triple-c-user value".to_string())?;
+    let stem = user_ec2_stem(env, &user_tag);
+    let cluster_arn = str_field(obj, "cluster_arn")?;
+    if cluster_arn != format!("arn:aws:ecs:{region}:{account}:cluster/{stem}") {
+        return Err("cluster_arn is not this user's cluster in this account and region".into());
+    }
+    if str_field(obj, "capacity_provider")? != stem {
+        return Err("capacity_provider is not this user's capacity provider".into());
+    }
+    Ok(UserCompute {
+        instance_type: instance_type.to_string(),
+        max_instances,
+        user_tag,
+        cluster_arn: cluster_arn.to_string(),
+        capacity_provider: stem,
+    })
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq)]
@@ -565,9 +648,12 @@ fn onboarding_from_runs(
         Some(OnboardingState::InProgress { lock })
     } else if lock.is_some() {
         actions.push(Unlock);
-        Some(OnboardingState::Incomplete { lock })
+        Some(OnboardingState::Incomplete { lock, ec2: None })
     } else if run.failed || run.errored_state {
-        Some(OnboardingState::Incomplete { lock: None })
+        Some(OnboardingState::Incomplete {
+            lock: None,
+            ec2: None,
+        })
     } else {
         None
     };
@@ -597,6 +683,8 @@ pub trait DetectApi: Send + Sync {
         account: &str,
     ) -> impl Future<Output = Result<Knowable, AwsError>> + Send;
     fn role_exists(&self, name: &str) -> impl Future<Output = Result<Knowable, AwsError>> + Send;
+    /// An SSM String parameter (a user record).
+    fn parameter(&self, name: &str) -> impl Future<Output = Result<Param, AwsError>> + Send;
     /// A state object's contents, capped; `None` when it is missing, can't
     /// be read or is too large.
     fn state_document(
@@ -675,8 +763,13 @@ pub(crate) async fn scan_in_bucket<D: DetectApi>(
             // role), which is not Joined.
             None if objects.as_ref().is_some_and(|o| o.has_state(&user_state)) => {
                 match d.state_document(bucket, &user_state).await? {
-                    Some(text) if onboarding_complete(&text) => OnboardingState::Joined,
-                    _ => OnboardingState::Incomplete { lock: None },
+                    Some(text) if onboarding_complete(&text) => {
+                        OnboardingState::Joined { ec2: None }
+                    }
+                    _ => OnboardingState::Incomplete {
+                        lock: None,
+                        ec2: None,
+                    },
                 }
             }
             // Without a state here (a workspace user, who can't list the
@@ -685,11 +778,20 @@ pub(crate) async fn scan_in_bucket<D: DetectApi>(
             None => {
                 let (task_role, _) = user_role_names(&env.name, &key);
                 match d.role_exists(&task_role).await? {
-                    Knowable::Yes => OnboardingState::Joined,
+                    Knowable::Yes => OnboardingState::Joined { ec2: None },
                     Knowable::No | Knowable::Unknown => OnboardingState::NotJoined,
                 }
             }
         });
+        if let Some(state) = env.onboarding.take() {
+            let compute = match state {
+                OnboardingState::Joined { .. } | OnboardingState::Incomplete { .. } => {
+                    user_compute(d, &env.name, &key, &who.account, region).await?
+                }
+                _ => None,
+            };
+            env.onboarding = Some(state.with_ec2(compute));
+        }
     }
 
     Ok(EnvironmentScan {
@@ -701,6 +803,234 @@ pub(crate) async fn scan_in_bucket<D: DetectApi>(
         boundary,
         environments,
     })
+}
+
+/// An SSM parameter read: its value, missing, or this caller can't read it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Param {
+    Value(String),
+    Missing,
+    Denied,
+}
+
+/// A user record as read: none, valid, or present but unusable (unreadable
+/// or failing validation; the reason names a field, never a value).
+#[derive(Clone, Debug, PartialEq)]
+pub enum UserRecord {
+    Absent,
+    Valid(UserCompute),
+    Unusable(String),
+}
+
+impl UserRecord {
+    pub fn valid(&self) -> Option<&UserCompute> {
+        match self {
+            UserRecord::Valid(c) => Some(c),
+            _ => None,
+        }
+    }
+}
+
+/// [`UserRecord`] from a read of `user_record_parameter_name(env, …)`.
+pub fn user_record_from(read: Param, env: &str, account: &str, region: &str) -> UserRecord {
+    match read {
+        Param::Missing => UserRecord::Absent,
+        Param::Denied => UserRecord::Unusable("it can't be read with these credentials".into()),
+        Param::Value(text) => match parse_user_record(env, &text, account, region) {
+            Ok(c) => UserRecord::Valid(c),
+            Err(reason) => UserRecord::Unusable(reason),
+        },
+    }
+}
+
+/// The caller's EC2 capacity in `env` from their user record; `None` when
+/// there is no usable record (an unusable one is logged, never echoed).
+pub(crate) async fn user_compute<D: DetectApi>(
+    d: &D,
+    env: &str,
+    owner_key: &str,
+    account: &str,
+    region: &str,
+) -> Result<Option<UserCompute>, AwsError> {
+    let read = d.parameter(&user_record_parameter_name(env, owner_key)).await?;
+    match user_record_from(read, env, account, region) {
+        UserRecord::Valid(c) => Ok(Some(c)),
+        UserRecord::Absent => Ok(None),
+        UserRecord::Unusable(reason) => {
+            log::warn!("Ignoring the EC2 user record for environment {env}: {reason}");
+            Ok(None)
+        }
+    }
+}
+
+/// Who holds a per-user EC2 name (`tofu_modules::user_ec2_stem`): an ECS
+/// cluster or Auto Scaling group of that name and its `triple-c:owner` tag.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NameHolder {
+    /// "ECS cluster" or "Auto Scaling group".
+    pub kind: &'static str,
+    pub owner: Option<String>,
+}
+
+/// An ECS cluster or Auto Scaling group found by name: its status (clusters
+/// only) and tags.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct NamedResource {
+    pub status: Option<String>,
+    pub tags: Vec<(String, String)>,
+}
+
+/// What an onboarding apply asks AWS before it starts (R3): the caller's
+/// user record and whether the per-user EC2 names are taken. The cluster
+/// read needs `ecs:DescribeClusters` (tags included); the group read
+/// `autoscaling:DescribeAutoScalingGroups`, which only the environment-admin
+/// tier has.
+pub trait OnboardApi: Send + Sync {
+    fn parameter(&self, name: &str) -> impl Future<Output = Result<Param, AwsError>> + Send;
+    fn cluster(
+        &self,
+        name: &str,
+    ) -> impl Future<Output = Result<Option<NamedResource>, AwsError>> + Send;
+    fn group(
+        &self,
+        name: &str,
+    ) -> impl Future<Output = Result<Option<NamedResource>, AwsError>> + Send;
+}
+
+const OWNER_TAG: &str = "triple-c:owner";
+
+fn owner_of(r: &NamedResource) -> Option<String> {
+    r.tags
+        .iter()
+        .find(|(k, _)| k == OWNER_TAG)
+        .map(|(_, v)| v.clone())
+}
+
+/// The cluster holding `stem`, if any. Every status but INACTIVE (a deleted
+/// cluster) holds the name: PROVISIONING, DEPROVISIONING and FAILED too.
+pub async fn cluster_holder<A: OnboardApi>(
+    api: &A,
+    stem: &str,
+) -> Result<Option<NameHolder>, AwsError> {
+    Ok(api
+        .cluster(stem)
+        .await?
+        .filter(|c| c.status.as_deref() != Some("INACTIVE"))
+        .map(|c| NameHolder {
+            kind: "ECS cluster",
+            owner: owner_of(&c),
+        }))
+}
+
+/// Everything holding `stem`: its cluster and its Auto Scaling group.
+pub async fn ec2_name_holders<A: OnboardApi>(
+    api: &A,
+    stem: &str,
+) -> Result<Vec<NameHolder>, AwsError> {
+    let mut out: Vec<NameHolder> = cluster_holder(api, stem).await?.into_iter().collect();
+    if let Some(g) = api.group(stem).await? {
+        out.push(NameHolder {
+            kind: "Auto Scaling group",
+            owner: owner_of(&g),
+        });
+    }
+    Ok(out)
+}
+
+/// `ssm:GetParameter` as a [`Param`].
+pub(crate) async fn get_parameter(ssm: &aws_sdk_ssm::Client, name: &str) -> Result<Param, AwsError> {
+    let res = ssm
+        .get_parameter()
+        .name(name)
+        .with_decryption(false)
+        .send()
+        .await;
+    match res {
+        Ok(out) => Ok(out
+            .parameter()
+            .and_then(|p| p.value())
+            .map_or(Param::Missing, |v| Param::Value(v.to_string()))),
+        Err(e) if e.as_service_error().is_some_and(|s| s.is_parameter_not_found()) => {
+            Ok(Param::Missing)
+        }
+        Err(e) => {
+            let (code, status) = error_parts(&e);
+            match lookup_outcome(code.as_deref(), status) {
+                Lookup::Missing => Ok(Param::Missing),
+                Lookup::Denied => Ok(Param::Denied),
+                Lookup::Error => Err(classify_sdk_error("ssm:GetParameter", &e)),
+            }
+        }
+    }
+}
+
+/// The real [`OnboardApi`], from a connection's `SdkConfig`.
+pub struct SdkOnboardApi {
+    ssm: aws_sdk_ssm::Client,
+    ecs: aws_sdk_ecs::Client,
+    autoscaling: aws_sdk_autoscaling::Client,
+}
+
+impl SdkOnboardApi {
+    pub fn new(cfg: &SdkConfig) -> Self {
+        SdkOnboardApi {
+            ssm: aws_sdk_ssm::Client::new(cfg),
+            ecs: aws_sdk_ecs::Client::new(cfg),
+            autoscaling: aws_sdk_autoscaling::Client::new(cfg),
+        }
+    }
+}
+
+impl OnboardApi for SdkOnboardApi {
+    async fn parameter(&self, name: &str) -> Result<Param, AwsError> {
+        get_parameter(&self.ssm, name).await
+    }
+
+    async fn cluster(&self, name: &str) -> Result<Option<NamedResource>, AwsError> {
+        // A missing name is a `failures` entry, not an error.
+        let out = self
+            .ecs
+            .describe_clusters()
+            .clusters(name)
+            .include(aws_sdk_ecs::types::ClusterField::Tags)
+            .send()
+            .await
+            .map_err(|e| classify_sdk_error("ecs:DescribeClusters", &e))?;
+        Ok(out
+            .clusters()
+            .iter()
+            .find(|c| c.cluster_name() == Some(name))
+            .map(|c| NamedResource {
+                status: c.status().map(str::to_string),
+                tags: c
+                    .tags()
+                    .iter()
+                    .filter_map(|t| Some((t.key()?.to_string(), t.value()?.to_string())))
+                    .collect(),
+            }))
+    }
+
+    async fn group(&self, name: &str) -> Result<Option<NamedResource>, AwsError> {
+        let out = self
+            .autoscaling
+            .describe_auto_scaling_groups()
+            .auto_scaling_group_names(name)
+            .send()
+            .await
+            .map_err(|e| classify_sdk_error("autoscaling:DescribeAutoScalingGroups", &e))?;
+        Ok(out
+            .auto_scaling_groups()
+            .iter()
+            .find(|g| g.auto_scaling_group_name() == Some(name))
+            .map(|g| NamedResource {
+                status: None,
+                tags: g
+                    .tags()
+                    .iter()
+                    .filter_map(|t| Some((t.key()?.to_string(), t.value()?.to_string())))
+                    .collect(),
+            }))
+    }
 }
 
 /// An OpenTofu state that manages nothing (what `tofu destroy` leaves):
@@ -1013,6 +1343,10 @@ impl DetectApi for SdkDetectApi {
     async fn role_exists(&self, name: &str) -> Result<Knowable, AwsError> {
         let res = self.iam.get_role().role_name(name).send().await;
         knowable("iam:GetRole", res)
+    }
+
+    async fn parameter(&self, name: &str) -> Result<Param, AwsError> {
+        get_parameter(&self.ssm, name).await
     }
 
     async fn state_document(&self, bucket: &str, key: &str) -> Result<Option<String>, AwsError> {

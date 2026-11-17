@@ -6,13 +6,15 @@ import {
   hasWorkspaceFiles,
   environmentSelectable,
   gatewaySidecarProblem,
+  EC2_NO_SIDECAR,
+  launchTypePatch,
   memoryError,
   memoryOptions,
   nearestMemory,
   repoFolderFromUrl,
   stopGuardNeeded,
 } from "./awsWorkspace";
-import { environment } from "../test/awsFixtures";
+import { awsProject, environment } from "../test/awsFixtures";
 // Shared with the Rust validator (`models/project.rs`).
 import fargatePairs from "../test/fixtures/fargate-pairs.json";
 
@@ -103,5 +105,49 @@ describe("gatewaySidecarProblem", () => {
     expect(
       gatewaySidecarProblem({ backend: "open_ai_compatible", aws: { ...aws, cpu: 512, memory_mib: 2048 } }, models),
     ).toMatch(/1 vCPU and 2 GiB/);
+  });
+});
+
+describe("launchTypePatch (phase 7)", () => {
+  const base = () => {
+    const p = awsProject({ allow_docker_access: true, vpn_support_enabled: true });
+    return { ...p, aws: { ...p.aws!, gateway_sidecar: true, spot: true, cpu: 4096, memory_mib: 16384 } };
+  };
+
+  it("to EC2: keeps Docker/VPN, clears the sidecar and Spot, and fits the reservations to the instance", () => {
+    const patch = launchTypePatch(base(), "ec2", { cpu: 1920, memory_mib: 7373 });
+    expect(patch.allow_docker_access).toBeUndefined();
+    expect(patch.vpn_support_enabled).toBeUndefined();
+    expect(patch.aws).toMatchObject({ launch_type: "ec2", gateway_sidecar: false, spot: false, cpu: 1920, memory_mib: 7373 });
+    // Reservations that already fit stay; unknown limits change nothing.
+    const small = { ...base(), aws: { ...base().aws, cpu: 1024, memory_mib: 4096 } };
+    expect(launchTypePatch(small, "ec2", { cpu: 1920, memory_mib: 7373 }).aws).toMatchObject({ cpu: 1024, memory_mib: 4096 });
+    expect(launchTypePatch(base(), "ec2", null).aws).toMatchObject({ cpu: 4096, memory_mib: 16384 });
+  });
+
+  it("to Fargate: clears Docker/VPN and snaps the reservations to a Fargate pair", () => {
+    const p = base();
+    const ec2 = { ...p, aws: { ...p.aws, launch_type: "ec2" as const, cpu: 1920, memory_mib: 7373, spot: false } };
+    const patch = launchTypePatch(ec2, "fargate");
+    expect(patch).toMatchObject({ allow_docker_access: false, vpn_support_enabled: false });
+    expect(patch.aws).toMatchObject({ launch_type: "fargate", cpu: 1024, memory_mib: 7168 });
+    expect(memoryError(patch.aws!.cpu, patch.aws!.memory_mib)).toBeNull();
+    // Below the smallest Fargate size: the smallest.
+    const tiny = { ...ec2, aws: { ...ec2.aws, cpu: 100, memory_mib: 300 } };
+    expect(launchTypePatch(tiny, "fargate").aws).toMatchObject({ cpu: 256, memory_mib: 512 });
+    // A valid pair is kept.
+    const ok = { ...ec2, aws: { ...ec2.aws, cpu: 1024, memory_mib: 4096 } };
+    expect(launchTypePatch(ok, "fargate").aws).toMatchObject({ cpu: 1024, memory_mib: 4096 });
+  });
+
+  it("the sidecar is not available on EC2 (words it as Rust's EC2_NO_SIDECAR)", () => {
+    const p = { ...base(), backend: "open_ai_compatible" as const };
+    const ec2 = { ...p, aws: { ...p.aws, launch_type: "ec2" as const } };
+    const gw = { models: [{ name: "m", model_id: "x" }] } as never;
+    expect(gatewaySidecarProblem(ec2, gw)).toBe(EC2_NO_SIDECAR);
+    expect(EC2_NO_SIDECAR).toBe(
+      "The LLM gateway sidecar is not available on EC2 yet: turn it off, or run the project on Fargate",
+    );
+    expect(gatewaySidecarProblem(p, gw)).toBeNull();
   });
 });

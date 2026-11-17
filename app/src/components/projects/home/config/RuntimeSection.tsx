@@ -5,7 +5,14 @@ import PermissionModeControl, { permissionModePatch } from "../../PermissionMode
 import ClaudeInstructionsEditor from "../../ClaudeInstructionsEditor";
 import ClaudeCodeSettingsEditor from "../../ClaudeCodeSettingsEditor";
 import AuthBridgeRow from "./AuthBridgeRow";
-import { NOT_ON_AWS, SANDBOX_OFF_ON_AWS, isAwsProject } from "../../../../lib/awsWorkspace";
+import {
+  EC2_DOCKER_ACCESS_NOTE,
+  EC2_VPN_HINT,
+  NOT_ON_AWS,
+  SANDBOX_OFF_ON_AWS,
+  isAwsProject,
+  sandboxEffective,
+} from "../../../../lib/awsWorkspace";
 
 interface Props {
   project: Project;
@@ -21,6 +28,12 @@ export default function RuntimeSection({
   disabledReason,
 }: Props) {
   const aws = isAwsProject(project);
+  // Docker access and VPN need the user's own EC2 instance (not Fargate).
+  const ec2 = aws && project.aws?.launch_type === "ec2";
+  const noPrivileged = aws && !ec2;
+  // No ECS task can run Claude Code's sandbox: not on Fargate (P9), and not
+  // on the user's own EC2 instance either (E8, measured live).
+  const sandboxOff = aws;
   return (
     <>
       <ConfigGroup
@@ -37,15 +50,15 @@ export default function RuntimeSection({
         <SwitchRow
           label="Sandbox mode"
           hint={
-            aws
-              ? `${SANDBOX_OFF_ON_AWS}: Claude Code's bash sandbox has not been verified on Fargate yet, so an AWS workspace runs with it off whatever this says.`
+            sandboxOff
+              ? `${SANDBOX_OFF_ON_AWS}: Claude Code's bash sandbox (bubblewrap) can't create its namespaces in an ECS task, on Fargate or EC2, so an AWS workspace runs with it off whatever this says.`
               : "Claude Code's bash sandbox (bubblewrap filesystem and network isolation). Triple-C is the source of truth: toggling this overrides any manual /sandbox configuration in the container's settings.json on next start."
           }
           control={
             <Toggle
               label="Sandbox mode"
-              checked={aws ? false : project.sandbox_mode_enabled}
-              disabled={disabled || aws}
+              checked={sandboxEffective(project)}
+              disabled={disabled || sandboxOff}
               onChange={(v) => save({ sandbox_mode_enabled: v })}
             />
           }
@@ -54,15 +67,17 @@ export default function RuntimeSection({
         <SwitchRow
           label="Allow container spawning"
           hint={
-            aws
+            noPrivileged
               ? NOT_ON_AWS
-              : "Mounts the Docker socket so Claude can build and run Docker containers from inside the sandbox."
+              : ec2
+                ? `Mounts the Docker socket so Claude can build and run Docker containers from inside the workspace. ${EC2_DOCKER_ACCESS_NOTE}`
+                : "Mounts the Docker socket so Claude can build and run Docker containers from inside the sandbox."
           }
           control={
             <Toggle
               label="Allow container spawning"
-              checked={aws ? false : project.allow_docker_access}
-              disabled={disabled || aws}
+              checked={noPrivileged ? false : project.allow_docker_access}
+              disabled={disabled || noPrivileged}
               onChange={(v) => save({ allow_docker_access: v })}
             />
           }
@@ -70,12 +85,12 @@ export default function RuntimeSection({
 
         <SwitchRow
           label="VPN support"
-          hint={aws ? NOT_ON_AWS : "Grants NET_ADMIN and the /dev/net/tun device so a VPN client (PIA, WireGuard, OpenVPN) can build a tunnel inside the container. Without it a client installs and runs but its connection hangs until it times out. Anything in the container can then reconfigure the container's own network stack; the host's is untouched. Changing this recreates the container on its next start — the home and .claude volumes are preserved."}
+          hint={noPrivileged ? NOT_ON_AWS : ec2 ? EC2_VPN_HINT : "Grants NET_ADMIN and the /dev/net/tun device so a VPN client (PIA, WireGuard, OpenVPN) can build a tunnel inside the container. Without it a client installs and runs but its connection hangs until it times out. Anything in the container can then reconfigure the container's own network stack; the host's is untouched. Changing this recreates the container on its next start — the home and .claude volumes are preserved."}
           control={
             <Toggle
               label="VPN support"
-              checked={aws ? false : project.vpn_support_enabled}
-              disabled={disabled || aws}
+              checked={noPrivileged ? false : project.vpn_support_enabled}
+              disabled={disabled || noPrivileged}
               onChange={(v) => save({ vpn_support_enabled: v })}
             />
           }

@@ -102,6 +102,7 @@ fn sample_plan(storage: StorageMode) -> WorkspacePlan {
             .then(|| "fsap-4567efab".to_string()),
         tags: workspace_tags(USER, PROJECT_ID, "dev"),
         gateway_image: None,
+        ec2: None,
     }
 }
 
@@ -962,7 +963,7 @@ async fn prepare(
     p: &Project,
     env: &[(String, String)],
 ) -> Result<PreparedWorkspace, AwsError> {
-    prepare_workspace(fake, &who(), &env_info(), p, env, &[], &[], IMAGE, None).await
+    prepare_workspace(fake, &who(), &env_info(), p, env, &[], &[], IMAGE, None, None).await
 }
 
 #[tokio::test]
@@ -972,7 +973,7 @@ async fn prepare_puts_the_setup_script_and_the_environments_cap_in_the_secret() 
     p.aws.as_mut().unwrap().setup_script = Some("sudo apt-get install -y jq".into());
     let mut env = env_info();
     env.max_workspace_hours = 12;
-    prepare_workspace(&fake, &who(), &env, &p, &[], &[], &[], IMAGE, None).await.unwrap();
+    prepare_workspace(&fake, &who(), &env, &p, &[], &[], &[], IMAGE, None, None).await.unwrap();
     let m = payload_map(&fake.secrets.lock().unwrap()[0].2);
     assert_eq!(m["TRIPLEC_SETUP_SCRIPT"], "sudo apt-get install -y jq");
     assert_eq!(m["TRIPLEC_MAX_LIFETIME_MINUTES"], "720");
@@ -1397,6 +1398,7 @@ async fn files_travel_in_the_secret_only() {
         &[],
         IMAGE,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -1638,7 +1640,7 @@ async fn prepare_leaves_the_credentials_out_of_a_copy_at_connect_secret() {
     p.aws.as_mut().unwrap().secrets_delivery = crate::models::project::SecretsDelivery::CopyAtConnect;
     let files = vec![("ssh/id_ed25519".to_string(), b"PRIVATE KEY".to_vec())];
     let env = pairs(&[("GIT_TOKEN", "ghp_secret"), ("MINE", "x"), ("TZ", "UTC")]);
-    prepare_workspace(&fake, &who(), &env_info(), &p, &env, &files, &["MINE".to_string()], IMAGE, None)
+    prepare_workspace(&fake, &who(), &env_info(), &p, &env, &files, &["MINE".to_string()], IMAGE, None, None)
         .await
         .unwrap();
     let m = payload_map(&fake.secrets.lock().unwrap()[0].2);
@@ -1662,7 +1664,7 @@ async fn switching_to_copy_at_connect_replaces_a_secret_that_held_credentials() 
         Some(r#"{"GIT_TOKEN":"ghp_old","TRIPLEC_AGENT_TOKEN":"t","TZ":"UTC"}"#.into());
     *fake.pending_puts.lock().unwrap() = 2; // AWS still finishing the delete
     let env = pairs(&[("GIT_TOKEN", "ghp_new"), ("TZ", "UTC")]);
-    prepare_workspace(&fake, &who(), &env_info(), &copy_at_connect_project(), &env, &[], &[], IMAGE, None)
+    prepare_workspace(&fake, &who(), &env_info(), &copy_at_connect_project(), &env, &[], &[], IMAGE, None, None)
         .await
         .unwrap();
     assert_eq!(*fake.secret_reads.lock().unwrap(), 1, "read only once it exists");
@@ -1675,7 +1677,7 @@ async fn switching_to_copy_at_connect_replaces_a_secret_that_held_credentials() 
     *fake.existing_secret.lock().unwrap() = Some(
         r#"{"TRIPLEC_AGENT_TOKEN":"t","TRIPLEC_CREDENTIALS":"connect","TZ":"UTC","TRIPLEC_REPOS":"[]"}"#.into(),
     );
-    prepare_workspace(&fake, &who(), &env_info(), &copy_at_connect_project(), &env, &[], &[], IMAGE, None)
+    prepare_workspace(&fake, &who(), &env_info(), &copy_at_connect_project(), &env, &[], &[], IMAGE, None, None)
         .await
         .unwrap();
     assert!(fake.deleted_secrets.lock().unwrap().is_empty());
@@ -1684,7 +1686,7 @@ async fn switching_to_copy_at_connect_replaces_a_secret_that_held_credentials() 
     // No secret yet (a first start): created, never read — a read of a
     // secret that doesn't exist may be refused — nothing deleted.
     let fake = Fake::onboarded();
-    prepare_workspace(&fake, &who(), &env_info(), &copy_at_connect_project(), &env, &[], &[], IMAGE, None)
+    prepare_workspace(&fake, &who(), &env_info(), &copy_at_connect_project(), &env, &[], &[], IMAGE, None, None)
         .await
         .unwrap();
     assert_eq!(*fake.creates.lock().unwrap(), 1);
@@ -1737,7 +1739,7 @@ async fn the_start_after_a_timed_out_replace_retries_the_create() {
     let env = pairs(&[("TZ", "UTC")]);
     let fake = Fake::onboarded();
     *fake.pending_puts.lock().unwrap() = 3;
-    prepare_workspace(&fake, &who(), &env_info(), &copy_at_connect_project(), &env, &[], &[], IMAGE, None)
+    prepare_workspace(&fake, &who(), &env_info(), &copy_at_connect_project(), &env, &[], &[], IMAGE, None, None)
         .await
         .unwrap();
     assert_eq!(fake.secrets.lock().unwrap().len(), 1, "made once the name is free");
@@ -1752,7 +1754,7 @@ async fn the_start_after_a_timed_out_replace_retries_the_create() {
     // Still taken past the limit: try again in a minute, never "restore".
     let fake = Fake::onboarded();
     *fake.pending_puts.lock().unwrap() = 1000;
-    let e = prepare_workspace(&fake, &who(), &env_info(), &copy_at_connect_project(), &env, &[], &[], IMAGE, None)
+    let e = prepare_workspace(&fake, &who(), &env_info(), &copy_at_connect_project(), &env, &[], &[], IMAGE, None, None)
         .await
         .unwrap_err()
         .to_string();
@@ -1770,7 +1772,7 @@ async fn a_copy_at_connect_read_of_a_secret_being_deleted_is_retried() {
         r#"{"TRIPLEC_AGENT_TOKEN":"t","TRIPLEC_CREDENTIALS":"connect","TZ":"UTC","TRIPLEC_REPOS":"[]"}"#.into(),
     );
     *fake.pending_reads.lock().unwrap() = 3;
-    prepare_workspace(&fake, &who(), &env_info(), &copy_at_connect_project(), &env, &[], &[], IMAGE, None)
+    prepare_workspace(&fake, &who(), &env_info(), &copy_at_connect_project(), &env, &[], &[], IMAGE, None, None)
         .await
         .unwrap();
     assert_eq!(*fake.secret_reads.lock().unwrap(), 4);
@@ -1780,7 +1782,7 @@ async fn a_copy_at_connect_read_of_a_secret_being_deleted_is_retried() {
     let fake = Fake::onboarded();
     *fake.existing_secret.lock().unwrap() = Some(r#"{"TZ":"UTC"}"#.into());
     *fake.pending_reads.lock().unwrap() = 1000;
-    let e = prepare_workspace(&fake, &who(), &env_info(), &copy_at_connect_project(), &env, &[], &[], IMAGE, None)
+    let e = prepare_workspace(&fake, &who(), &env_info(), &copy_at_connect_project(), &env, &[], &[], IMAGE, None, None)
         .await
         .unwrap_err()
         .to_string();
@@ -1985,7 +1987,7 @@ fn sidecar_project() -> Project {
 async fn prepare_registers_the_sidecar_only_when_the_project_runs_it() {
     let fake = Fake::onboarded();
     let p = sidecar_project();
-    prepare_workspace(&fake, &who(), &env_info(), &p, &[], &[], &[], IMAGE, Some(gw()))
+    prepare_workspace(&fake, &who(), &env_info(), &p, &[], &[], &[], IMAGE, Some(gw()), None)
         .await
         .unwrap();
     assert_eq!(fake.registered.lock().unwrap()[0].container_definitions().len(), 2);
@@ -1994,7 +1996,7 @@ async fn prepare_registers_the_sidecar_only_when_the_project_runs_it() {
 
     // Toggle off: a payload handed in anyway is ignored.
     let fake = Fake::onboarded();
-    prepare_workspace(&fake, &who(), &env_info(), &project(StorageMode::Ephemeral), &[], &[], &[], IMAGE, Some(gw()))
+    prepare_workspace(&fake, &who(), &env_info(), &project(StorageMode::Ephemeral), &[], &[], &[], IMAGE, Some(gw()), None)
         .await
         .unwrap();
     assert_eq!(fake.registered.lock().unwrap()[0].container_definitions().len(), 1);
@@ -2006,7 +2008,7 @@ async fn prepare_registers_the_sidecar_only_when_the_project_runs_it() {
 async fn prepare_refuses_a_sidecar_without_its_payload_or_with_an_oversized_config() {
     let fake = Fake::onboarded();
     let p = sidecar_project();
-    let e = prepare_workspace(&fake, &who(), &env_info(), &p, &[], &[], &[], IMAGE, None)
+    let e = prepare_workspace(&fake, &who(), &env_info(), &p, &[], &[], &[], IMAGE, None, None)
         .await
         .unwrap_err();
     assert!(e.to_string().contains("gateway"), "{e}");
@@ -2021,6 +2023,7 @@ async fn prepare_refuses_a_sidecar_without_its_payload_or_with_an_oversized_conf
         &[],
         IMAGE,
         Some(GatewayPayload { config: &big, ..gw() }),
+        None,
     )
     .await
     .unwrap_err();
@@ -2035,6 +2038,7 @@ async fn prepare_refuses_a_sidecar_without_its_payload_or_with_an_oversized_conf
         &[],
         IMAGE,
         Some(GatewayPayload { api_key: " ", ..gw() }),
+        None,
     )
     .await
     .unwrap_err();
@@ -2083,4 +2087,223 @@ fn the_sidecars_token_is_not_a_leftover_credential_but_a_dropped_provider_key_is
     let off: BTreeMap<String, String> =
         [("TRIPLEC_AGENT_TOKEN", "t")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
     assert!(holds(sidecar_old, &off));
+}
+
+// ------------------------------------------------------------- EC2 (phase 7)
+
+fn ec2_sample(storage: StorageMode, docker_socket: bool, vpn: bool) -> WorkspacePlan {
+    WorkspacePlan { ec2: Some(Ec2Plan { docker_socket, vpn }), ..sample_plan(storage) }
+}
+
+fn compute(instance_type: &str) -> UserCompute {
+    UserCompute {
+        instance_type: instance_type.into(),
+        max_instances: 2,
+        user_tag: "alice".into(),
+        cluster_arn: format!("arn:aws:ecs:{REGION}:{ACCOUNT}:cluster/triple-c-dev--u-alice"),
+        capacity_provider: "triple-c-dev--u-alice".into(),
+    }
+}
+
+fn ec2_project(storage: StorageMode, cpu: u32, memory_mib: u32) -> Project {
+    let mut p = project(storage);
+    let a = p.aws.as_mut().unwrap();
+    a.launch_type = crate::models::LaunchType::Ec2;
+    a.cpu = cpu;
+    a.memory_mib = memory_mib;
+    p
+}
+
+#[test]
+fn an_ec2_request_is_bridge_mode_with_the_reservations_and_no_fargate_fields() {
+    for storage in [StorageMode::Ephemeral, StorageMode::Hybrid, StorageMode::Efs] {
+        let plan = ec2_sample(storage, false, false);
+        let req = task_definition_request(&plan);
+        assert_eq!(req.requires_compatibilities(), &[aws_sdk_ecs::types::Compatibility::Ec2]);
+        assert_eq!(req.network_mode(), Some(&aws_sdk_ecs::types::NetworkMode::Bridge));
+        assert_eq!((req.cpu(), req.memory()), (Some("1024"), Some("4096")));
+        assert!(req.runtime_platform().is_none(), "the instance's architecture decides");
+        assert!(req.ephemeral_storage().is_none(), "the instance's disk");
+        // Everything else as on Fargate: roles, tags, health check, stop
+        // timeout, init, logs, the EFS volumes and the fingerprint label.
+        let fargate = task_definition_request(&sample_plan(storage));
+        assert_eq!(req.task_role_arn(), fargate.task_role_arn());
+        assert_eq!(req.execution_role_arn(), fargate.execution_role_arn());
+        assert_eq!(req.tags(), fargate.tags());
+        assert_eq!(req.volumes(), fargate.volumes());
+        let (c, f) = (&req.container_definitions()[0], &fargate.container_definitions()[0]);
+        assert_eq!(c.health_check(), f.health_check());
+        assert_eq!(c.stop_timeout(), Some(STOP_TIMEOUT_SECS));
+        assert_eq!(c.mount_points(), f.mount_points());
+        assert_eq!(c.secrets(), f.secrets());
+        assert_eq!(c.environment(), f.environment());
+        assert_eq!(c.log_configuration(), f.log_configuration());
+        assert_eq!(c.linux_parameters(), f.linux_parameters(), "SYS_PTRACE and init only");
+        assert!(c.system_controls().is_empty());
+        assert!(c.port_mappings().is_empty());
+        assert_eq!(
+            c.docker_labels().unwrap().get(FINGERPRINT_LABEL),
+            Some(&workspace_fingerprint(&plan))
+        );
+        assert_ne!(workspace_fingerprint(&plan), workspace_fingerprint(&sample_plan(storage)));
+    }
+}
+
+#[test]
+fn an_ec2_request_for_each_toggle_combination() {
+    let mut fingerprints = std::collections::BTreeSet::new();
+    for (docker, vpn) in [(false, false), (true, false), (false, true), (true, true)] {
+        let plan = ec2_sample(StorageMode::Hybrid, docker, vpn);
+        let req = task_definition_request(&plan);
+        fingerprints.insert(workspace_fingerprint(&plan));
+        let c = &req.container_definitions()[0];
+        let lp = c.linux_parameters().unwrap();
+        assert_eq!(lp.init_process_enabled(), Some(true));
+
+        // E6: the instance's Docker socket at the same path.
+        let socket_volume: Vec<_> =
+            req.volumes().iter().filter(|v| v.name() == Some("docker-socket")).collect();
+        let socket_mount: Vec<_> = c
+            .mount_points()
+            .iter()
+            .filter(|m| m.container_path() == Some(DOCKER_SOCKET_PATH))
+            .collect();
+        if docker {
+            assert_eq!(socket_volume.len(), 1);
+            assert_eq!(
+                socket_volume[0].host().and_then(|h| h.source_path()),
+                Some("/var/run/docker.sock")
+            );
+            assert!(socket_volume[0].efs_volume_configuration().is_none());
+            assert_eq!(socket_mount.len(), 1);
+            assert_eq!(socket_mount[0].source_volume(), Some("docker-socket"));
+        } else {
+            assert!(socket_volume.is_empty() && socket_mount.is_empty());
+        }
+        // The home access point is mounted either way.
+        assert!(c.mount_points().iter().any(|m| m.container_path() == Some(HOME_MOUNT_PATH)));
+
+        // E7: the three VPN pieces, all or none, plus SYS_PTRACE as always.
+        let caps = lp.capabilities().unwrap().add();
+        let sysctls: Vec<(&str, &str)> = c
+            .system_controls()
+            .iter()
+            .map(|s| (s.namespace().unwrap(), s.value().unwrap()))
+            .collect();
+        if vpn {
+            assert_eq!(caps, ["SYS_PTRACE".to_string(), "NET_ADMIN".to_string()]);
+            assert_eq!(lp.devices().len(), 1);
+            let d = &lp.devices()[0];
+            assert_eq!((d.host_path(), d.container_path()), ("/dev/net/tun", Some("/dev/net/tun")));
+            use aws_sdk_ecs::types::DeviceCgroupPermission as P;
+            assert_eq!(d.permissions(), [P::Read, P::Write, P::Mknod]);
+            assert_eq!(sysctls, [("net.ipv4.conf.all.src_valid_mark", "1")]);
+        } else {
+            assert_eq!(caps, ["SYS_PTRACE".to_string()]);
+            assert!(lp.devices().is_empty() && sysctls.is_empty());
+        }
+    }
+    assert_eq!(fingerprints.len(), 4, "every combination is its own revision");
+}
+
+/// The VPN pieces are Docker's own (`vpn_host_config`), not a second list.
+#[test]
+fn the_ec2_vpn_pieces_are_the_docker_ones() {
+    let vpn = crate::docker::container::vpn_requirements();
+    assert_eq!(vpn.capabilities, ["NET_ADMIN"]);
+    assert_eq!(
+        vpn.devices,
+        [("/dev/net/tun".to_string(), "/dev/net/tun".to_string(), "rwm".to_string())]
+    );
+    assert_eq!(vpn.sysctls, [("net.ipv4.conf.all.src_valid_mark".to_string(), "1".to_string())]);
+}
+
+#[test]
+fn ec2_plan_checks_the_record_and_the_fit_and_carries_the_toggles() {
+    // Fargate: nothing, whatever the record says.
+    let fargate = project(StorageMode::Hybrid);
+    assert_eq!(ec2_plan(&fargate, "dev", None), Ok(None));
+    assert_eq!(ec2_plan(&fargate, "dev", Some(&compute("m7i.large"))), Ok(None));
+
+    // No record: the onboarding has no EC2 capacity (or it was removed).
+    let mut p = ec2_project(StorageMode::Hybrid, 1024, 4096);
+    let e = ec2_plan(&p, "dev", None).unwrap_err();
+    assert_eq!(
+        e,
+        "You have no EC2 capacity in dev; ask an admin to add it to your onboarding (or run the \
+         project on Fargate)."
+    );
+
+    // Fits: the toggles ride along.
+    p.allow_docker_access = true;
+    assert_eq!(
+        ec2_plan(&p, "dev", Some(&compute("m7i.large"))),
+        Ok(Some(Ec2Plan { docker_socket: true, vpn: false }))
+    );
+    p.vpn_support_enabled = true;
+    assert_eq!(
+        ec2_plan(&p, "dev", Some(&compute("m7i.large"))),
+        Ok(Some(Ec2Plan { docker_socket: true, vpn: true }))
+    );
+
+    // Too big: names what the instance has for a workspace (10 % memory
+    // margin: ECS registers less than the nominal 8 GiB).
+    let big = ec2_project(StorageMode::Hybrid, 2048, 8192);
+    let e = ec2_plan(&big, "dev", Some(&compute("m7i.large"))).unwrap_err();
+    assert!(e.contains("m7i.large"), "{e}");
+    assert!(e.contains("1920 CPU units, 7373 MiB"), "{e}");
+    assert!(ec2_plan(&big, "dev", Some(&compute("m7i.xlarge"))).is_ok());
+
+    // The gateway sidecar is not offered on EC2 (bridge networking).
+    let mut gw_on = ec2_project(StorageMode::Hybrid, 1024, 4096);
+    gw_on.aws.as_mut().unwrap().gateway_sidecar = true;
+    assert_eq!(ec2_plan(&gw_on, "dev", Some(&compute("m7i.large"))).unwrap_err(), EC2_NO_SIDECAR);
+}
+
+#[test]
+fn the_sidecar_is_refused_on_ec2() {
+    use crate::models::gateway_settings::{GatewayModel, GatewaySettings};
+    let models = GatewaySettings {
+        models: vec![GatewayModel { name: "gpt".into(), model_id: "gpt-5".into() }],
+        ..Default::default()
+    };
+    let mut p = ec2_project(StorageMode::Hybrid, 1024, 4096);
+    p.backend = crate::models::project::Backend::OpenAiCompatible;
+    p.aws.as_mut().unwrap().gateway_sidecar = true;
+    assert_eq!(gateway_sidecar_problem(&p, &models).as_deref(), Some(EC2_NO_SIDECAR));
+    p.aws.as_mut().unwrap().gateway_sidecar = false;
+    assert_eq!(gateway_sidecar_problem(&p, &models), None);
+}
+
+#[tokio::test]
+async fn an_ec2_project_registers_an_ec2_revision_on_the_users_instance() {
+    let fake = Fake::onboarded();
+    let mut p = ec2_project(StorageMode::Hybrid, 1024, 4096);
+    p.allow_docker_access = true;
+    let c = compute("m7i.large");
+    prepare_workspace(&fake, &who(), &env_info(), &p, &[], &[], &[], IMAGE, None, Some(&c))
+        .await
+        .unwrap();
+    let reg = fake.registered.lock().unwrap();
+    assert_eq!(reg.len(), 1);
+    assert_eq!(reg[0].requires_compatibilities(), &[aws_sdk_ecs::types::Compatibility::Ec2]);
+    assert_eq!(reg[0].network_mode(), Some(&aws_sdk_ecs::types::NetworkMode::Bridge));
+    assert!(reg[0].volumes().iter().any(|v| v.name() == Some("docker-socket")));
+}
+
+#[tokio::test]
+async fn an_ec2_project_without_capacity_or_room_fails_before_any_write() {
+    let p = ec2_project(StorageMode::Hybrid, 1024, 4096);
+    let fake = Fake::onboarded();
+    let e = prepare_workspace(&fake, &who(), &env_info(), &p, &[], &[], &[], IMAGE, None, None)
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("no EC2 capacity in dev"), "{e}");
+    let big = ec2_project(StorageMode::Hybrid, 2048, 8192);
+    let c = compute("m7i.large");
+    let e = prepare_workspace(&fake, &who(), &env_info(), &big, &[], &[], &[], IMAGE, None, Some(&c))
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("more than your EC2 instance type"), "{e}");
+    assert_eq!(fake.writes(), 0);
 }

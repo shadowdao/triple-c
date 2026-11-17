@@ -116,6 +116,55 @@
         "arn:aws:bedrock:*:*:inference-profile/*",
         "arn:aws:bedrock:*:*:application-inference-profile/*"
       ]
+    },
+    {
+      "Sid": "EcsAgentOnItsOwnCluster",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:RegisterContainerInstance",
+        "ecs:DeregisterContainerInstance",
+        "ecs:Poll",
+        "ecs:StartTelemetrySession",
+        "ecs:Submit*",
+        "ecs:UpdateContainerInstancesState"
+      ],
+      "Resource": [
+        "arn:aws:ecs:*:*:cluster/${aws:PrincipalTag/triple-c:cluster}",
+        "arn:aws:ecs:*:*:container-instance/${aws:PrincipalTag/triple-c:cluster}/*"
+      ],
+      "Condition": {
+        "StringLike": {
+          "aws:PrincipalTag/triple-c:cluster": "triple-c-*--u-*"
+        }
+      }
+    },
+    {
+      "Sid": "EcsAgentTagsItsInstance",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:TagResource"
+      ],
+      "Resource": [
+        "arn:aws:ecs:*:*:container-instance/${aws:PrincipalTag/triple-c:cluster}/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "ecs:CreateAction": "RegisterContainerInstance"
+        },
+        "StringLike": {
+          "aws:PrincipalTag/triple-c:cluster": "triple-c-*--u-*"
+        }
+      }
+    },
+    {
+      "Sid": "EcsAgentDiscovery",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:DiscoverPollEndpoint"
+      ],
+      "Resource": [
+        "*"
+      ]
     }
   ]
 }

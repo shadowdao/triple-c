@@ -642,6 +642,12 @@ async fn a_workspace_role_reads_fargate_prices_and_a_bare_role_cannot() {
         eprintln!("{}: x86 {x86:?}, ARM {arm:?}", e.region);
         assert!(x86.vcpu_hour > 0.0 && x86.gb_hour > 0.0 && x86.storage_gb_hour > 0.0);
         assert!(arm.vcpu_hour < x86.vcpu_hour, "ARM is cheaper per vCPU");
+        // E10: an EC2 instance type's on-demand price, with the same rights.
+        let m7i = super::pricing::fetch_ec2_price(&SdkPricingApi::new(&cfg), &e.region, "m7i.large")
+            .await
+            .expect("workspace role reads EC2 prices");
+        eprintln!("{}: m7i.large {m7i}/hour", e.region);
+        assert!(m7i > 0.0 && m7i < 1.0, "{m7i}");
 
         let bare = e.role("noprice", None, &[]).await;
         let cfg = sdk_config_for_keys(&e.assume_keys(&bare).await, PRICING_REGION);
@@ -1592,7 +1598,7 @@ mod environment {
                 .run(
                     ModuleKind::UserOnboard,
                     Deployment::User { env: &name, owner_key: &okey },
-                    &onboarding_vars(&name, &t.e.region, &owner),
+                    &onboarding_vars(&name, &t.e.region, &owner, None).unwrap(),
                     TofuOp::Apply,
                     t.keys_env(&keys),
                 )
@@ -1601,7 +1607,7 @@ mod environment {
             let found = t.scan(&cfg, &who).await;
             let env = found.environments.iter().find(|x| x.name == name).unwrap();
             // Joined from the state's onboarding_complete output, not just the role.
-            assert_eq!(env.onboarding, Some(OnboardingState::Joined), "{env:#?}");
+            assert_eq!(env.onboarding, Some(OnboardingState::Joined { ec2: None }), "{env:#?}");
             assert_eq!(env.onboarded_users, Some(1), "{env:#?}");
             let (task_role, exec_role) = user_role_names(&name, &okey);
             eprintln!("onboarded with region-scoped roles {task_role} / {exec_role}");
@@ -1643,7 +1649,7 @@ mod environment {
                 .run(
                     ModuleKind::UserOnboard,
                     Deployment::User { env: &name, owner_key: &okey },
-                    &onboarding_vars(&name, &t.e.region, &owner),
+                    &onboarding_vars(&name, &t.e.region, &owner, None).unwrap(),
                     TofuOp::Destroy,
                     t.keys_env(&keys),
                 )
@@ -1767,6 +1773,13 @@ mod environment {
         config_file_before: Option<Option<std::ffi::OsString>>,
         /// `TRIPLEC_E2E_ECR_REPO`: the throwaway repository to force-delete.
         ecr_repo: Option<String>,
+        /// Phase 7: the environment whose per-user EC2 capacity
+        /// (`triple-c-<env>--u-*`) the guard tears down, and the user's
+        /// owner key (instance role, user record).
+        ec2_env: Option<String>,
+        ec2_okey: Option<String>,
+        /// Auto Scaling groups a probe made outside that prefix.
+        probe_groups: Vec<String>,
     }
 
     /// The whole phase-5 body: a hang anywhere becomes a panic the guard
@@ -1795,6 +1808,9 @@ mod environment {
             Some(Some(v)) => std::env::set_var("AWS_CONFIG_FILE", v),
             Some(None) => std::env::remove_var("AWS_CONFIG_FILE"),
             None => {}
+        }
+        if let Some(env) = &p.ec2_env {
+            ec2_cleanup(e, env, p.ec2_okey.as_deref(), &p.probe_groups).await;
         }
         let ecs = aws_sdk_ecs::Client::new(&e.cfg);
         if let Some(cluster) = &p.cluster {
@@ -1912,6 +1928,211 @@ mod environment {
         }
     }
 
+    /// The AWS CLI as the e2e profile (`keys`: as that session instead):
+    /// (success, stdout, stderr). The app has no EC2 SDK crate.
+    async fn aws_cli(keys: Option<&AwsKeys>, region: &str, args: &[&str]) -> (bool, String, String) {
+        let mut cmd = tokio::process::Command::new("aws");
+        cmd.args(["--region", region, "--output", "json"]);
+        match keys {
+            None => {
+                cmd.args(["--profile", &super::var("TRIPLEC_AWS_E2E_PROFILE")]);
+            }
+            Some(k) => {
+                cmd.env_remove("AWS_PROFILE")
+                    .env("AWS_ACCESS_KEY_ID", &k.access_key_id)
+                    .env("AWS_SECRET_ACCESS_KEY", &k.secret_access_key);
+                match &k.session_token {
+                    Some(t) => cmd.env("AWS_SESSION_TOKEN", t),
+                    None => cmd.env_remove("AWS_SESSION_TOKEN"),
+                };
+            }
+        }
+        cmd.args(args);
+        match tokio::time::timeout(Duration::from_secs(120), cmd.output()).await {
+            Ok(Ok(o)) => (
+                o.status.success(),
+                String::from_utf8_lossy(&o.stdout).into_owned(),
+                String::from_utf8_lossy(&o.stderr).into_owned(),
+            ),
+            Ok(Err(err)) => (false, String::new(), format!("aws cli: {err}")),
+            Err(_) => (false, String::new(), "aws cli: timed out".into()),
+        }
+    }
+
+    /// Phase 7's guard, as the account admin: everything of `env`'s per-user
+    /// EC2 capacity (`triple-c-<env>--u-*`) and the probes' groups, so no
+    /// instance outlives a failed run. Tasks on the per-user clusters are
+    /// stopped, groups force-deleted (terminating their instances) and waited
+    /// for, leftover tagged instances terminated, then capacity providers,
+    /// container instances, clusters, launch templates, the user record and
+    /// the instance role/profile deleted. A resource already gone is fine
+    /// (the modules' destroy then finds nothing). Logs, never fails.
+    async fn ec2_cleanup(e: &E2e, env: &str, okey: Option<&str>, probe_groups: &[String]) {
+        let prefix = format!("triple-c-{env}--u-");
+        let ecs = aws_sdk_ecs::Client::new(&e.cfg);
+        let asg = aws_sdk_autoscaling::Client::new(&e.cfg);
+        // Tasks on the per-user clusters.
+        let mut clusters = Vec::new();
+        if let Ok(out) = ecs.list_clusters().send().await {
+            clusters.extend(out.cluster_arns().iter().filter(|a| a.contains(&format!(":cluster/{prefix}"))).cloned());
+        }
+        for cluster in &clusters {
+            if let Ok(out) = ecs.list_tasks().cluster(cluster).send().await {
+                for arn in out.task_arns() {
+                    eprintln!("cleanup: stopping EC2 task {arn}");
+                    let _ = ecs.stop_task().cluster(cluster).task(arn).reason("triple-c-e2e cleanup").send().await;
+                }
+            }
+        }
+        // Groups (force: terminates their instances, ignores protection).
+        let mut groups: Vec<String> = probe_groups.to_vec();
+        let mut next = None;
+        loop {
+            let Ok(out) = asg.describe_auto_scaling_groups().set_next_token(next.take()).send().await else {
+                eprintln!("cleanup: WARNING: could not list Auto Scaling groups; only the known ones are deleted");
+                break;
+            };
+            for g in out.auto_scaling_groups() {
+                let n = g.auto_scaling_group_name().unwrap_or_default();
+                if n.starts_with(&prefix) && !groups.iter().any(|x| x == n) {
+                    groups.push(n.to_string());
+                }
+            }
+            next = out.next_token().map(str::to_string);
+            if next.is_none() {
+                break;
+            }
+        }
+        for g in &groups {
+            match asg.delete_auto_scaling_group().auto_scaling_group_name(g).force_delete(true).send().await {
+                Ok(_) => eprintln!("cleanup: force-deleting Auto Scaling group {g}"),
+                Err(err) => {
+                    let msg = format!("{err:?}");
+                    if !msg.contains("not found") && !msg.contains("ValidationError") {
+                        eprintln!("cleanup: delete group {g}: {msg}");
+                    }
+                }
+            }
+        }
+        if !groups.is_empty() {
+            for _ in 0..60 {
+                // A failed read is "not yet gone", never "gone".
+                let left = asg
+                    .describe_auto_scaling_groups()
+                    .set_auto_scaling_group_names(Some(groups.clone()))
+                    .send()
+                    .await
+                    .map(|o| o.auto_scaling_groups().len())
+                    .unwrap_or(usize::MAX);
+                if left == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+        }
+        // Any instance still tagged with this environment.
+        let (ok_, out, err) = aws_cli(
+            None,
+            &e.region,
+            &[
+                "ec2", "describe-instances",
+                "--filters", &format!("Name=tag:triple-c:environment,Values={env}"),
+                "Name=instance-state-name,Values=pending,running,stopping,stopped",
+                "--query", "Reservations[].Instances[].InstanceId",
+            ],
+        )
+        .await;
+        if ok_ {
+            let ids: Vec<String> = serde_json::from_str(&out).unwrap_or_default();
+            if !ids.is_empty() {
+                let mut args = vec!["ec2", "terminate-instances", "--instance-ids"];
+                args.extend(ids.iter().map(String::as_str));
+                let r = aws_cli(None, &e.region, &args).await;
+                eprintln!("cleanup: terminate {ids:?}: ok {}", r.0);
+                let mut args = vec!["ec2", "wait", "instance-terminated", "--instance-ids"];
+                args.extend(ids.iter().map(String::as_str));
+                let _ = aws_cli(None, &e.region, &args).await;
+            }
+        } else {
+            eprintln!("cleanup: describe instances: {err}");
+        }
+        // Capacity providers: off their clusters, then deleted.
+        for cluster in &clusters {
+            let _ = ecs.put_cluster_capacity_providers().cluster(cluster).set_capacity_providers(Some(vec![])).set_default_capacity_provider_strategy(Some(vec![])).send().await;
+        }
+        if let Ok(out) = ecs.describe_capacity_providers().send().await {
+            for cp in out.capacity_providers() {
+                let n = cp.name().unwrap_or_default();
+                if n.starts_with(&prefix) && cp.status() != Some(&aws_sdk_ecs::types::CapacityProviderStatus::Inactive) {
+                    match ecs.delete_capacity_provider().capacity_provider(n).send().await {
+                        Ok(_) => eprintln!("cleanup: deleted capacity provider {n}"),
+                        Err(err) => eprintln!("cleanup: delete capacity provider {n}: {err:?}"),
+                    }
+                }
+            }
+        }
+        for cluster in &clusters {
+            if let Ok(out) = ecs.list_container_instances().cluster(cluster).send().await {
+                for ci in out.container_instance_arns() {
+                    let _ = ecs.deregister_container_instance().cluster(cluster).container_instance(ci).force(true).send().await;
+                }
+            }
+            // Busy (UpdateInProgress) while the provider detaches: retry.
+            for attempt in 0..12 {
+                match ecs.delete_cluster().cluster(cluster).send().await {
+                    Ok(_) => {
+                        eprintln!("cleanup: deleted cluster {cluster}");
+                        break;
+                    }
+                    Err(err) if attempt < 11 && format!("{err:?}").contains("UpdateInProgress") => {
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                    }
+                    Err(err) => {
+                        eprintln!("cleanup: delete cluster {cluster}: {err:?}");
+                        break;
+                    }
+                }
+            }
+        }
+        // Launch templates.
+        let (ok_, out, _) = aws_cli(
+            None,
+            &e.region,
+            &["ec2", "describe-launch-templates", "--filters", &format!("Name=launch-template-name,Values={prefix}*"), "--query", "LaunchTemplates[].LaunchTemplateName"],
+        )
+        .await;
+        if ok_ {
+            let names: Vec<String> = serde_json::from_str(&out).unwrap_or_default();
+            for n in names {
+                let r = aws_cli(None, &e.region, &["ec2", "delete-launch-template", "--launch-template-name", &n]).await;
+                eprintln!("cleanup: delete launch template {n}: ok {} {}", r.0, r.2.trim());
+            }
+        }
+        if let Some(okey) = okey {
+            let ssm = aws_sdk_ssm::Client::new(&e.cfg);
+            let param = crate::aws::tofu_modules::user_record_parameter_name(env, okey);
+            if ssm.delete_parameter().name(&param).send().await.is_ok() {
+                eprintln!("cleanup: deleted {param}");
+            }
+            let role = crate::aws::tofu_modules::user_instance_role_name(env, okey);
+            if e.iam.remove_role_from_instance_profile().instance_profile_name(&role).role_name(&role).send().await.is_ok() {
+                eprintln!("cleanup: removed {role} from its instance profile");
+            }
+            if e.iam.delete_instance_profile().instance_profile_name(&role).send().await.is_ok() {
+                eprintln!("cleanup: deleted instance profile {role}");
+            }
+            if let Ok(out) = e.iam.list_role_policies().role_name(&role).send().await {
+                for pn in out.policy_names() {
+                    let _ = e.iam.delete_role_policy().role_name(&role).policy_name(pn).send().await;
+                }
+                match e.iam.delete_role().role_name(&role).send().await {
+                    Ok(_) => eprintln!("cleanup: deleted role {role}"),
+                    Err(err) => eprintln!("cleanup: delete role {role}: {err:?}"),
+                }
+            }
+        }
+    }
+
     /// Poll `f` every `every` until it returns `Some`, or `None` after `within`.
     async fn poll<T, F, Fut>(within: Duration, every: Duration, mut f: F) -> Option<T>
     where
@@ -1954,6 +2175,8 @@ mod environment {
         conn: HostConnection,
         ws_cfg: SdkConfig,
         ws: CallerIdentity,
+        /// The environment admin role (fresh sessions via `Env::session`).
+        admin: Admin,
     }
 
     /// The workspace tests' common start: the environment (with
@@ -1967,6 +2190,7 @@ mod environment {
         p5: &std::sync::Mutex<Phase5>,
         image: &str,
         max_workspace_hours: u32,
+        ec2: Option<&crate::aws::tofu_modules::Ec2Compute>,
     ) -> Deployed {
         use crate::aws::tofu_modules::{environment_cluster_name, user_file_system_token};
 
@@ -1997,18 +2221,43 @@ mod environment {
         let fs_token = user_file_system_token(&name, &okey);
         p5_lock(p5).fs_token = Some(fs_token.clone());
 
-        // Onboarded by the admin (an onboarding from an admin bundle).
-        let (keys, _, _) = t.session(&admin).await;
+        // Onboarded by the admin (an onboarding from an admin bundle). With
+        // EC2 capacity (phase 7): the user's role carries the triple-c-user
+        // principal tag, and the vars come from the app's own pre-apply
+        // step (record, choice, name-collision check) as the admin.
+        let (keys, admin_cfg, _) = t.session(&admin).await;
+        let vars = match ec2 {
+            None => onboarding_vars(&name, &region, &owner, None).unwrap(),
+            Some(c) => {
+                use crate::aws::tofu_modules::EC2_USER_TAG_KEY;
+                use crate::commands::environment_commands::{prepare_onboarding, Ec2Choice};
+                t.e.tag_role(&user, EC2_USER_TAG_KEY, &c.user_tag).await;
+                {
+                    let mut g = p5_lock(p5);
+                    g.ec2_env = Some(name.clone());
+                    g.ec2_okey = Some(okey.clone());
+                }
+                let api = crate::aws::environments::SdkOnboardApi::new(&admin_cfg);
+                let t0 = std::time::Instant::now();
+                let vars = prepare_onboarding(&api, &name, &region, &t.e.account, &owner, Some(Ec2Choice::Ec2(c.clone())))
+                    .await
+                    .unwrap_or_else(|e| panic!("the pre-apply onboarding step: {e}"));
+                eprintln!("RESULT pre-apply EC2 collision check (free names) passed in {:?}: {vars}", t0.elapsed());
+                vars
+            }
+        };
+        let t0 = std::time::Instant::now();
         let (_, outcome, denied) = t
             .run(
                 ModuleKind::UserOnboard,
                 Deployment::User { env: &name, owner_key: &okey },
-                &onboarding_vars(&name, &region, &owner),
+                &vars,
                 TofuOp::Apply,
                 t.keys_env(&keys),
             )
             .await;
         assert_ok("onboard the workspace user", &outcome, &denied);
+        eprintln!("RESULT onboarding apply: {:?}", t0.elapsed());
         let (_, exec_role) = user_role_names(&name, &okey);
 
         // Test-only: pull from the throwaway private ECR repository.
@@ -2056,7 +2305,7 @@ mod environment {
         let ws = caller_identity(&ws_cfg).await.expect("workspace user identity");
         assert_eq!(ws.user_id, owner, "the profile session is the onboarded owner");
         eprintln!("workspace user: {}", ws.arn);
-        Deployed { region, name, owner, okey, fs_token, conn, ws_cfg, ws }
+        Deployed { region, name, owner, okey, fs_token, conn, ws_cfg, ws, admin }
     }
 
     /// Phase 5: a Fargate workspace's whole life through `ProjectHost::Aws`,
@@ -2113,8 +2362,8 @@ log_stream_prefix, project_secret_name, task_family};
             // Boxed: the body's state machine is far larger than a test
             // thread's 2 MiB stack once it is moved into the timeout.
             let inner = Box::pin(async {
-                let Deployed { region, name, owner, okey, fs_token, conn, ws_cfg, ws } =
-                    deploy_for_workspace_user(&t, &p5, &image, 0).await;
+                let Deployed { region, name, owner, okey, fs_token, conn, ws_cfg, ws, .. } =
+                    deploy_for_workspace_user(&t, &p5, &image, 0, None).await;
 
                 let mut settings = AppSettings::default();
                 settings.hosts = vec![conn];
@@ -2573,8 +2822,8 @@ log_stream_prefix, project_secret_name, task_family};
             let p5 = std::sync::Mutex::new(Phase5 { ecr_repo, ..Default::default() });
             let inner = Box::pin(async {
                 // ── 1. the environment carries the lifetime cap ──
-                let Deployed { region, name, owner: _, okey, fs_token: _, conn, ws_cfg, ws } =
-                    deploy_for_workspace_user(&t, &p5, &image, 1).await;
+                let Deployed { region, name, okey, conn, ws_cfg, ws, .. } =
+                    deploy_for_workspace_user(&t, &p5, &image, 1, None).await;
                 let env = crate::aws::runtime::read_environment(&SdkRuntimeApi::new(&ws_cfg), &name, &ws.account, &region)
                     .await
                     .expect("the environment record, as the workspace user");
@@ -2910,6 +3159,598 @@ log_stream_prefix, project_secret_name, task_family};
             let body = async {
                 if tokio::time::timeout(PHASE5_TIMEOUT, inner).await.is_err() {
                     panic!("the phase-6 body did not finish in {PHASE5_TIMEOUT:?}");
+                }
+            };
+            let result = std::panic::AssertUnwindSafe(body).catch_unwind().await;
+            let guard = std::mem::take(&mut *p5_lock(&p5));
+            phase5_cleanup(&t.e, &guard).await;
+            if let Err(panic) = result {
+                std::panic::resume_unwind(panic);
+            }
+        })
+        .await;
+    }
+
+    // ─────────────────────────────────────────────── phase 7: ECS on EC2
+
+    /// The phase-7 body: two cold starts, a scale-in wait (managed scaling
+    /// takes ~15 minutes to remove an idle instance) and three applies.
+    const PHASE7_TIMEOUT: Duration = Duration::from_secs(110 * 60);
+
+    /// A group's (instance count, desired capacity, `id:state` list) as the
+    /// account admin; `None` when it does not exist.
+    async fn group_size(asg: &aws_sdk_autoscaling::Client, name: &str) -> Option<(usize, i32, Vec<String>)> {
+        let out = asg.describe_auto_scaling_groups().auto_scaling_group_names(name).send().await.ok()?;
+        let g = out.auto_scaling_groups().first()?;
+        let ids = g
+            .instances()
+            .iter()
+            .map(|i| format!("{}:{}", i.instance_id().unwrap_or_default(), i.lifecycle_state().map(|s| s.as_str()).unwrap_or("?")))
+            .collect();
+        Some((g.instances().len(), g.desired_capacity().unwrap_or(-1), ids))
+    }
+
+    /// Instances still tagged with `env` and not terminated, as the account admin.
+    async fn live_env_instances(region: &str, env: &str) -> Vec<String> {
+        let (ok_, out, err) = aws_cli(
+            None,
+            region,
+            &[
+                "ec2", "describe-instances",
+                "--filters", &format!("Name=tag:triple-c:environment,Values={env}"),
+                "Name=instance-state-name,Values=pending,running,stopping,stopped,shutting-down",
+                "--query", "Reservations[].Instances[].[InstanceId,State.Name]",
+            ],
+        )
+        .await;
+        assert!(ok_, "describe-instances: {err}");
+        let rows: Vec<Vec<String>> = serde_json::from_str(&out).unwrap_or_default();
+        rows.into_iter().map(|r| r.join(":")).collect()
+    }
+
+    /// Phase 7: an EC2 project's whole life on the user's own capacity
+    /// (ECS on EC2, bridge networking, scale to zero), as a role holding
+    /// only the workspace files and carrying the `triple-c-user` principal
+    /// tag (a role tag: an assumed-role session's principal tags), onboarded
+    /// with `m7i.large`, at most 1 instance, by the environment admin
+    /// holding all four admin files. Run with `scripts/aws-e2e-workspace.sh`
+    /// and `TRIPLEC_E2E_TEST=aws::live_tests::environment::a_phase7_ec2_workspace_round_trips`.
+    ///
+    /// Covers: the onboarding's resources and its pre-apply collision check
+    /// (and its refusal for another owner); admin-tier probes of the
+    /// scaling file (`$Latest`, a pinned control, an unsupported type in a
+    /// template version, a capacity provider over a non-Triple-C group);
+    /// a cold start with Docker access, VPN and the sandbox on (instance
+    /// launch, ECS Exec port forward into the bridge-mode task), `docker
+    /// ps`, a WireGuard/TUN interface, `src_valid_mark`, bubblewrap, IMDS
+    /// and the agent's introspection port from the container; RunTask on
+    /// another user's cluster (the wrong-triple-c-user message); stop and
+    /// the scale-in to zero; a second start; removal; re-applying the
+    /// onboarding without EC2 (drain and delete with an instance still up);
+    /// offboarding and the environment's destroy, all as the admin tier.
+    /// Its guard (`ec2_cleanup`) force-deletes whatever EC2 capacity is
+    /// left. About one m7i.large instance-hour.
+    #[tokio::test]
+    #[ignore]
+    async fn a_phase7_ec2_workspace_round_trips() {
+        use crate::aws::environments::{OnboardApi, SdkOnboardApi, UserCompute, UserRecord};
+        use crate::aws::runtime::{read_user_record, SdkRuntimeApi};
+        use crate::aws::tasks::{ec2_run_error, ec2_run_task_request, SdkTaskApi, TaskApi, EC2_TAG_MISMATCH};
+        use crate::aws::tofu_modules::{user_ec2_stem, user_instance_role_name, Ec2Compute};
+        use crate::aws::workspace::workspace_tags;
+        use crate::commands::environment_commands::{prepare_onboarding, Ec2Choice};
+        use crate::host::aws_host::PROGRESS_INSTANCE;
+        use crate::host::lifecycle::ProjectHost;
+        use crate::models::app_settings::ImageSource;
+        use crate::models::project::{AwsPlacement, AwsWorkspaceConfig, LaunchType, StorageMode};
+        use crate::models::{AppSettings, Project};
+        use crate::storage::projects_store::ProjectsStore;
+
+        let image = super::var("TRIPLEC_E2E_IMAGE");
+        let ecr_repo = std::env::var("TRIPLEC_E2E_ECR_REPO").ok().filter(|r| !r.is_empty());
+        env_e2e(|t| async move {
+            let p5 = std::sync::Mutex::new(Phase5 { ecr_repo, ..Default::default() });
+            let inner = Box::pin(async {
+                // TRIPLEC_E2E_PHASE7_SHORT=1: the life cycle only (no probes, no
+                // in-container checks or isolation, no scale-in wait; the second
+                // start is then warm, on the instance still up).
+                let quick = std::env::var("TRIPLEC_E2E_PHASE7_SHORT").is_ok_and(|v| v == "1");
+                let short = uuid::Uuid::new_v4().simple().to_string();
+                let user_tag = format!("e2e{}", &short[..6]);
+                let compute = Ec2Compute { instance_type: "m7i.large".into(), max_instances: 1, user_tag: user_tag.clone() };
+                let Deployed { region, name, owner, okey, conn, ws_cfg, ws, admin, .. } =
+                    deploy_for_workspace_user(&t, &p5, &image, 0, Some(&compute)).await;
+                let account = t.e.account.clone();
+                let stem = user_ec2_stem(&name, &user_tag);
+                let asg_admin = aws_sdk_autoscaling::Client::new(&t.e.cfg);
+                let ecs_admin = aws_sdk_ecs::Client::new(&t.e.cfg);
+
+                // ── 1. what the onboarding made ──
+                let groups = ok("describe the group", asg_admin.describe_auto_scaling_groups().auto_scaling_group_names(&stem).send().await);
+                let group = groups.auto_scaling_groups().first().expect("the user's Auto Scaling group").clone();
+                let subnets = group.vpc_zone_identifier().unwrap_or_default().to_string();
+                let group_tags: Vec<(String, String)> = group
+                    .tags()
+                    .iter()
+                    .map(|t| (t.key().unwrap_or_default().to_string(), t.value().unwrap_or_default().to_string()))
+                    .collect();
+                eprintln!(
+                    "RESULT group {stem}: min {:?} max {:?} desired {:?}, template {:?}, protect {:?}, tags {group_tags:?}",
+                    group.min_size(),
+                    group.max_size(),
+                    group.desired_capacity(),
+                    group.launch_template().map(|l| (l.launch_template_name(), l.version())),
+                    group.new_instances_protected_from_scale_in()
+                );
+                assert_eq!((group.min_size(), group.max_size()), (Some(0), Some(1)));
+                let cl = ok(
+                    "describe the user's cluster",
+                    ecs_admin.describe_clusters().clusters(&stem).include(aws_sdk_ecs::types::ClusterField::Tags).send().await,
+                );
+                let cluster = cl.clusters().first().expect("the user's cluster");
+                eprintln!(
+                    "RESULT cluster {stem}: {:?}, providers {:?}, default strategy {:?}, tags {:?}",
+                    cluster.status(),
+                    cluster.capacity_providers(),
+                    cluster.default_capacity_provider_strategy().iter().map(|s| s.capacity_provider()).collect::<Vec<_>>(),
+                    cluster.tags().iter().map(|t| (t.key().unwrap_or_default(), t.value().unwrap_or_default())).collect::<Vec<_>>()
+                );
+                let cps = ok("describe the capacity provider", ecs_admin.describe_capacity_providers().capacity_providers(&stem).send().await);
+                let cp = cps.capacity_providers().first().expect("the capacity provider");
+                eprintln!(
+                    "RESULT capacity provider {stem}: {:?}, managed scaling {:?}, termination protection {:?}",
+                    cp.status(),
+                    cp.auto_scaling_group_provider().and_then(|a| a.managed_scaling()).map(|m| (m.status(), m.target_capacity())),
+                    cp.auto_scaling_group_provider().map(|a| a.managed_termination_protection())
+                );
+                let (_, lt, _) = aws_cli(
+                    None,
+                    &region,
+                    &["ec2", "describe-launch-template-versions", "--launch-template-name", &stem, "--query",
+                      "LaunchTemplateVersions[].[VersionNumber,LaunchTemplateData.InstanceType,LaunchTemplateData.ImageId,LaunchTemplateData.MetadataOptions]"],
+                )
+                .await;
+                eprintln!("RESULT launch template {stem}: {}", lt.split_whitespace().collect::<Vec<_>>().join(" "));
+                let role_name = user_instance_role_name(&name, &okey);
+                let prof = ok("get the instance profile", t.e.iam.get_instance_profile().instance_profile_name(&role_name).send().await);
+                eprintln!(
+                    "RESULT instance profile {role_name}: roles {:?}",
+                    prof.instance_profile().map(|p| p.roles().iter().map(|r| r.role_name().to_string()).collect::<Vec<_>>())
+                );
+                let record = read_user_record(&SdkRuntimeApi::new(&ws_cfg), &name, &okey, &account, &region).await.expect("read the user record");
+                eprintln!("RESULT user record, as the workspace user: {record:?}");
+                let Some(rec) = record.valid().cloned() else { panic!("the user record is not valid: {record:?}") };
+                assert_eq!((rec.instance_type.as_str(), rec.max_instances, rec.user_tag.as_str()), ("m7i.large", 1, user_tag.as_str()));
+                assert!(rec.cluster_arn.ends_with(&format!(":cluster/{stem}")), "{}", rec.cluster_arn);
+
+                // ── 1b / 6. the collision check's reads, and its refusal ──
+                let (akeys, acfg, _) = t.session(&admin).await;
+                let oapi = SdkOnboardApi::new(&acfg);
+                let held = oapi.cluster(&stem).await.expect("DescribeClusters include=TAGS as the admin tier");
+                eprintln!("RESULT DescribeClusters include=TAGS as the environment admin: {held:?}");
+                let held = held.expect("the cluster is found");
+                assert!(held.tags.iter().any(|(k, v)| k == "triple-c:owner" && *v == owner), "{held:?}");
+                let missing = oapi.cluster(&format!("{stem}zz")).await;
+                eprintln!("RESULT DescribeClusters on a missing name: {missing:?}");
+                assert!(matches!(missing, Ok(None)), "{missing:?}");
+                let missing_group = oapi.group(&format!("{stem}zz")).await;
+                eprintln!("RESULT DescribeAutoScalingGroups on a missing name: {missing_group:?}");
+                assert!(matches!(missing_group, Ok(None)), "{missing_group:?}");
+                let refused = prepare_onboarding(&oapi, &name, &region, &account, "AROAEXAMPLEOTHER0000:bob", Some(Ec2Choice::Ec2(compute.clone()))).await;
+                eprintln!("RESULT onboarding another owner with the same triple-c-user value: {refused:?}");
+                let refused = refused.expect_err("another owner's onboarding with the same tag is refused");
+                assert!(refused.to_string().contains("another onboarding"), "{refused}");
+
+                if !quick {
+                    // ── 6. the scaling file's open points, as the environment admin ──
+                    let asg_env = aws_sdk_autoscaling::Client::new(&acfg);
+                    let ecs_env = aws_sdk_ecs::Client::new(&acfg);
+                    let probe_tags = |n: &str| -> Vec<aws_sdk_autoscaling::types::Tag> {
+                        group_tags
+                            .iter()
+                            .filter(|(k, _)| k.starts_with("triple-c:"))
+                            .map(|(k, v)| {
+                                aws_sdk_autoscaling::types::Tag::builder()
+                                    .key(k)
+                                    .value(v)
+                                    .resource_id(n)
+                                    .resource_type("auto-scaling-group")
+                                    .propagate_at_launch(false)
+                                    .build()
+                            })
+                            .collect()
+                    };
+                    let create_group = |client: aws_sdk_autoscaling::Client, n: String, version: String, tags: Vec<aws_sdk_autoscaling::types::Tag>| {
+                        let subnets = subnets.clone();
+                        let lt_name = stem.clone();
+                        async move {
+                            client
+                                .create_auto_scaling_group()
+                                .auto_scaling_group_name(&n)
+                                .launch_template(
+                                    aws_sdk_autoscaling::types::LaunchTemplateSpecification::builder()
+                                        .launch_template_name(lt_name)
+                                        .version(version)
+                                        .build(),
+                                )
+                                .min_size(0)
+                                .max_size(0)
+                                .desired_capacity(0)
+                                .vpc_zone_identifier(subnets)
+                                .set_tags(Some(tags))
+                                .send()
+                                .await
+                                .map(|_| ())
+                                .map_err(|e| classify_sdk_error("autoscaling:CreateAutoScalingGroup", &e).to_string())
+                        }
+                    };
+                    let delete_group = |n: String| {
+                        let client = asg_admin.clone();
+                        async move {
+                            let _ = client.delete_auto_scaling_group().auto_scaling_group_name(&n).force_delete(true).send().await;
+                        }
+                    };
+                    // $Latest must be denied (LaunchTemplateVersionSpecified).
+                    let pa = format!("{stem}-pa");
+                    let r = create_group(asg_env.clone(), pa.clone(), "$Latest".into(), probe_tags(&pa)).await;
+                    eprintln!("RESULT probe: CreateAutoScalingGroup with $Latest as the environment admin: {r:?}");
+                    if r.is_ok() {
+                        eprintln!("RESULT WARNING: $Latest was allowed");
+                        delete_group(pa).await;
+                    }
+                    // The control: the same create pinned to version 1 is allowed
+                    // (InstanceTypes filled from the template).
+                    let pb = format!("{stem}-pb");
+                    let r = create_group(asg_env.clone(), pb.clone(), "1".into(), probe_tags(&pb)).await;
+                    eprintln!("RESULT probe: the same create pinned to version 1 (control): {r:?}");
+                    if r.is_ok() {
+                        let d = asg_env.delete_auto_scaling_group().auto_scaling_group_name(&pb).send().await;
+                        eprintln!("RESULT probe: DeleteAutoScalingGroup of it as the environment admin: {:?}", d.map(|_| ()).map_err(|e| classify_sdk_error("autoscaling:DeleteAutoScalingGroup", &e).to_string()));
+                        delete_group(pb).await;
+                    }
+                    // A template version naming an unsupported type, then a group pinned to it.
+                    let (made, out, err) = aws_cli(
+                        Some(&akeys),
+                        &region,
+                        &["ec2", "create-launch-template-version", "--launch-template-name", &stem, "--source-version", "1",
+                          "--launch-template-data", r#"{"InstanceType":"p5.48xlarge"}"#, "--query", "LaunchTemplateVersion.VersionNumber"],
+                    )
+                    .await;
+                    eprintln!("RESULT probe: CreateLaunchTemplateVersion with p5.48xlarge as the environment admin: ok {made} {} {}", out.trim(), err.trim());
+                    if made {
+                        let pc = format!("{stem}-pc");
+                        let r = create_group(asg_env.clone(), pc.clone(), out.trim().to_string(), probe_tags(&pc)).await;
+                        eprintln!("RESULT probe: CreateAutoScalingGroup pinned to the p5.48xlarge version: {r:?}");
+                        if r.is_ok() {
+                            eprintln!("RESULT WARNING: a group of an unsupported type was allowed");
+                            delete_group(pc).await;
+                        }
+                    }
+                    // A Triple-C capacity provider over a group that isn't Triple-C's.
+                    let foreign_group = format!("e2e-untagged-{}", &short[..10]);
+                    p5_lock(&p5).probe_groups.push(foreign_group.clone());
+                    let r = create_group(asg_admin.clone(), foreign_group.clone(), "1".into(), Vec::new()).await;
+                    eprintln!("RESULT probe: account admin creates the untagged group {foreign_group}: {r:?}");
+                    if r.is_ok() {
+                        let arn = ok("describe the untagged group", asg_admin.describe_auto_scaling_groups().auto_scaling_group_names(&foreign_group).send().await)
+                            .auto_scaling_groups()
+                            .first()
+                            .and_then(|g| g.auto_scaling_group_arn().map(str::to_string))
+                            .unwrap();
+                        let pd = format!("{stem}-pd");
+                        let r = ecs_env
+                            .create_capacity_provider()
+                            .name(&pd)
+                            .auto_scaling_group_provider(
+                                aws_sdk_ecs::types::AutoScalingGroupProvider::builder()
+                                    .auto_scaling_group_arn(arn)
+                                    .managed_termination_protection(aws_sdk_ecs::types::ManagedTerminationProtection::Disabled)
+                                    .build()
+                                    .unwrap(),
+                            )
+                            .set_tags(Some(
+                                group_tags
+                                    .iter()
+                                    .filter(|(k, _)| k.starts_with("triple-c:"))
+                                    .map(|(k, v)| aws_sdk_ecs::types::Tag::builder().key(k).value(v).build())
+                                    .collect(),
+                            ))
+                            .send()
+                            .await;
+                        eprintln!(
+                            "RESULT probe: CreateCapacityProvider {pd} over the untagged group, as the environment admin: {:?}",
+                            r.as_ref().map(|_| ()).map_err(|e| classify_sdk_error("ecs:CreateCapacityProvider", e).to_string())
+                        );
+                        if r.is_ok() {
+                            eprintln!("RESULT WARNING: a Triple-C capacity provider over a foreign group was allowed");
+                            let _ = ecs_admin.delete_capacity_provider().capacity_provider(&pd).send().await;
+                        }
+                        delete_group(foreign_group).await;
+                    }
+                }
+
+                // ── 2. start 1: cold, with an instance launch ──
+                let mut settings = AppSettings::default();
+                settings.hosts = vec![conn];
+                settings.image_source = ImageSource::Custom;
+                settings.custom_image_name = Some(image.clone());
+                let mut project = Project::new("e2e-ec2".into(), Vec::new());
+                project.host_id = Some("e2e-wsuser".into());
+                project.aws_placement = Some(AwsPlacement { region: region.clone(), environment: name.clone() });
+                project.allow_docker_access = true;
+                project.vpn_support_enabled = true;
+                project.sandbox_mode_enabled = true;
+                project.aws = Some(AwsWorkspaceConfig {
+                    launch_type: LaunchType::Ec2,
+                    cpu: 1024,
+                    memory_mib: 4096,
+                    storage: StorageMode::Hybrid,
+                    wip_push_on_stop: true,
+                    ..Default::default()
+                });
+                let id = project.id.clone();
+                {
+                    let mut g = p5_lock(&p5);
+                    g.project_id = Some(id.clone());
+                    g.secrets.push(crate::aws::tofu_modules::project_secret_name(&name, &okey, &id));
+                }
+                let store_dir = tempfile::tempdir().unwrap();
+                let store = ProjectsStore::over_file_for_test(store_dir.path().join("projects.json"), vec![project.clone()]);
+                let host = ProjectHost::for_project(&project);
+                let current = |store: &ProjectsStore| store.get(&id).unwrap();
+                let api = SdkTaskApi::new(&ws_cfg);
+                let steps: Arc<std::sync::Mutex<Vec<(Duration, String)>>> = Default::default();
+                let t0 = std::sync::Mutex::new(std::time::Instant::now());
+                let progress = |m: &str| {
+                    let at = t0.lock().unwrap().elapsed();
+                    eprintln!("  progress +{at:?}: {m}");
+                    steps.lock().unwrap().push((at, m.to_string()));
+                };
+
+                let started = host.ensure_started(&current(&store), &settings, &store, &progress).await;
+                if let Err(err) = &started {
+                    // Debugging aid: hold the workspace for an admin to look
+                    // at before the guard tears it down.
+                    let pause: u64 = std::env::var("TRIPLEC_E2E_PAUSE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+                    if pause > 0 {
+                        eprintln!("RESULT start 1 failed ({err}); pausing {pause}s for inspection (task {:?})", current(&store).aws.and_then(|a| a.task_arn));
+                        tokio::time::sleep(Duration::from_secs(pause)).await;
+                    }
+                }
+                let target = started.expect("EC2 start 1");
+                let first_start = t0.lock().unwrap().elapsed();
+                let s1: Vec<(Duration, String)> = std::mem::take(&mut *steps.lock().unwrap());
+                eprintln!("RESULT EC2 start 1 (cold, instance launch): {first_start:?}; steps {s1:?}");
+                assert!(s1.iter().any(|(_, m)| m == PROGRESS_INSTANCE), "no \"Starting an instance\" step: {s1:?}");
+                let aws1 = current(&store).aws.unwrap();
+                let task1 = aws1.task_arn.clone().expect("the task ARN is stored");
+                let revision1 = aws1.task_definition_arn.clone().expect("the revision is stored");
+                assert!(task1.contains(&format!(":task/{stem}/")), "the task runs on the user's cluster: {task1}");
+                let d = api.describe(&rec.cluster_arn, std::slice::from_ref(&task1)).await.expect("describe task 1");
+                eprintln!("RESULT task 1: {:?}", d.first().map(|t| (&t.last_status, &t.container_instance_arn)));
+                eprintln!("RESULT group after start 1: {:?}", group_size(&asg_admin, &stem).await);
+                let td = ok("describe revision 1", ecs_admin.describe_task_definition().task_definition(&revision1).send().await);
+                let td = td.task_definition().unwrap();
+                eprintln!(
+                    "RESULT revision 1: network {:?}, compat {:?}, volumes {:?}",
+                    td.network_mode(),
+                    td.requires_compatibilities(),
+                    td.volumes().iter().map(|v| v.name().unwrap_or_default()).collect::<Vec<_>>()
+                );
+
+                // The cold start's first (ECS Exec off) task is gone: exactly one
+                // live task of the project on the user's cluster.
+                let family = crate::aws::tofu_modules::task_family(&name, &okey, &id);
+                let live = api.list_project_tasks(&rec.cluster_arn, &family).await.expect("list the project's tasks");
+                eprintln!("RESULT live tasks on the user's cluster after start 1: {live:?}");
+                assert_eq!(live, vec![task1.clone()], "exactly one live task");
+
+                // ── through the agent (ECS Exec port forward into the bridge task) ──
+                let (out, code) = sh(&target, "claude", "echo hello-from-ec2; id").await;
+                eprintln!("RESULT agent tunnel over ECS Exec into the bridge-mode task: exit {code}: {}", out.trim());
+                assert_eq!(code, 0, "{out}");
+                // awslogs on EC2 writes with the execution role (the instance
+                // role has no log rights), into the user's own streams only.
+                let env_rec = crate::aws::runtime::read_environment(&SdkRuntimeApi::new(&ws_cfg), &name, &account, &region)
+                    .await
+                    .expect("the environment record, as the workspace user");
+                let stream = crate::aws::tasks::task_log_stream(&crate::aws::tofu_modules::log_stream_prefix(&okey, &id), &task1);
+                let log1 = api.log_tail(&env_rec.log_group, &stream, 20).await.expect("read task 1's log");
+                eprintln!("RESULT task 1 log ({stream}): {} lines, last {:?}", log1.len(), log1.last());
+                assert!(!log1.is_empty(), "task 1 wrote no log lines: awslogs could not write with the execution role");
+                // E8: the sandbox is forced off in the task's settings.
+                let (settings_json, code) = sh(&target, "claude", "printenv CLAUDE_CODE_SETTINGS_JSON").await;
+                assert_eq!(code, 0, "no CLAUDE_CODE_SETTINGS_JSON");
+                let v: serde_json::Value = serde_json::from_str(settings_json.trim()).expect("settings JSON");
+                eprintln!("RESULT sandbox in the task's Claude Code settings: {}", v["sandbox"]);
+                assert_eq!(v["sandbox"]["enabled"], false, "the sandbox is off on EC2");
+                let (mut docker_ok, mut vpn_ok, mut src_valid_mark, mut bwrap_ok) = (true, true, true, false);
+                if !quick {
+                    let (out, code) = sh(&target, "claude", "ls -l /var/run/docker.sock; docker ps 2>&1; docker version --format '{{.Server.Version}}' 2>&1").await;
+                    eprintln!("RESULT docker ps as claude (exit {code}):\n{}", out.trim());
+                    docker_ok = code == 0;
+                    let (out, code) = sh(
+                        &target,
+                        "root",
+                        "ip link add wg0 type wireguard && ip link show wg0 && ip link del wg0 && echo WG-OK; \
+                         ip tuntap add tun0 mode tun && ip link show tun0 && ip link del tun0 && echo TUN-OK; \
+                         ls -l /dev/net/tun; sysctl net.ipv4.conf.all.src_valid_mark; grep CapEff /proc/self/status",
+                    )
+                    .await;
+                    eprintln!("RESULT VPN pieces as root (exit {code}):\n{}", out.trim());
+                    let (sudo_out, _) = sh(&target, "claude", "sudo -n ip link add wg1 type wireguard && sudo -n ip link del wg1 && echo SUDO-WG-OK 2>&1").await;
+                    eprintln!("RESULT wireguard via sudo as claude: {}", sudo_out.trim());
+                    vpn_ok = out.contains("WG-OK") || out.contains("TUN-OK");
+                    src_valid_mark = out.contains("src_valid_mark = 1");
+                    let (bwrap, _) = sh(
+                        &target,
+                        "claude",
+                        "bwrap --unshare-user --ro-bind / / true 2>&1; echo \"unshare-user rc=$?\"; \
+                         bwrap --ro-bind / / --dev /dev --proc /proc --unshare-all --die-with-parent true 2>&1; echo \"unshare-all rc=$?\"; \
+                         cat /proc/sys/user/max_user_namespaces 2>&1; uname -r",
+                    )
+                    .await;
+                    eprintln!("RESULT E8 bwrap on EC2:\n{}", bwrap.trim());
+                    bwrap_ok = bwrap.contains("unshare-user rc=0");
+                    let (imds, _) = sh(
+                        &target,
+                        "claude",
+                        "tok=$(curl -s -m 3 -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60'); \
+                         echo \"token rc=$? len=${#tok}\"; \
+                         curl -s -m 3 -o /dev/null -w 'imdsv1 http=%{http_code}\\n' http://169.254.169.254/latest/meta-data/; \
+                         gw=$(ip route | awk '/default/ {print $3}'); echo \"gateway $gw\"; \
+                         for h in \"$gw\" 127.0.0.1; do curl -s -m 3 -o /dev/null -w \"introspection $h:51678 http=%{http_code}\\n\" http://$h:51678/v1/metadata; done; \
+                         curl -s -m 3 http://$gw:51678/v1/metadata | head -c 300; echo; \
+                         test -n \"$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI\" && curl -s -m 3 http://169.254.170.2$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI | grep -q AccessKeyId && echo TASK-ROLE-CREDS-OK || echo task-role-creds-missing",
+                    )
+                    .await;
+                    eprintln!("RESULT IMDS / introspection from the container:\n{}", imds.trim());
+                    assert!(imds.contains("len=0"), "the container got an IMDS token: {imds}");
+
+                    // ── 4. isolation: RunTask on another triple-c-user's cluster ──
+                    let other = format!("e2eother{}", &short[6..10]);
+                    let other_cluster = user_ec2_stem(&name, &other);
+                    let made = ok("admin creates another user's (empty) cluster", ecs_admin.create_cluster().cluster_name(&other_cluster).send().await);
+                    let other_arn = made.cluster().and_then(|c| c.cluster_arn()).unwrap().to_string();
+                    let fake = UserCompute {
+                        instance_type: "m7i.large".into(),
+                        max_instances: 1,
+                        user_tag: other.clone(),
+                        cluster_arn: other_arn.clone(),
+                        capacity_provider: other_cluster.clone(),
+                    };
+                    let r = api.run_task(ec2_run_task_request(&fake, &revision1, &workspace_tags(&owner, &id, &name))).await.map_err(ec2_run_error);
+                    eprintln!("RESULT RunTask on {other_cluster} as triple-c-user {user_tag}: {r:?}");
+                    match r {
+                        Err(crate::aws::error::AwsError::AccessDenied { message, .. }) => assert!(message.contains(EC2_TAG_MISMATCH), "{message}"),
+                        other => panic!("RunTask on another user's cluster: expected AccessDenied, got {other:?}"),
+                    }
+                    let _ = ecs_admin.delete_cluster().cluster(&other_arn).send().await;
+                }
+
+                // ── 5. stop 1, then the scale-in to zero ──
+                let t2 = std::time::Instant::now();
+                host.stop_project(&current(&store), &settings).await.expect("stop 1");
+                poll(Duration::from_secs(300), Duration::from_secs(5), || async {
+                    let d = api.describe(&rec.cluster_arn, std::slice::from_ref(&task1)).await.ok()?;
+                    (d.first()?.last_status == "STOPPED").then_some(())
+                })
+                .await
+                .expect("task 1 never stopped");
+                let stopped_after = t2.elapsed();
+                eprintln!("RESULT stop 1: STOPPED after {stopped_after:?}");
+                store.set_aws_runtime(&id, None, aws1.access_point_id.clone(), Some(revision1.clone()), None).unwrap();
+                let mut scale_in = Duration::ZERO;
+                if !quick {
+                    let mut last: Option<(usize, i32)> = None;
+                    let mut scaled = None;
+                    let deadline = std::time::Instant::now() + Duration::from_secs(40 * 60);
+                    while std::time::Instant::now() < deadline {
+                        let now = group_size(&asg_admin, &stem).await;
+                        let key = now.as_ref().map(|n| (n.0, n.1));
+                        if key != last {
+                            eprintln!("  group +{:?} after STOPPED: {now:?}", t2.elapsed() - stopped_after);
+                            last = key;
+                        }
+                        if key == Some((0, 0)) {
+                            scaled = Some(());
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                    }
+                    scale_in = t2.elapsed() - stopped_after;
+                    eprintln!("RESULT scale-in to 0 instances: {scaled:?} after {:.1} min from STOPPED", scale_in.as_secs_f64() / 60.0);
+                    assert!(scaled.is_some(), "the group did not scale back to zero within 40 minutes");
+                }
+
+                // ── start 2 ──
+                *t0.lock().unwrap() = std::time::Instant::now();
+                let target2 = host.ensure_started(&current(&store), &settings, &store, &progress).await.expect("EC2 start 2");
+                let second_start = t0.lock().unwrap().elapsed();
+                let s2: Vec<(Duration, String)> = std::mem::take(&mut *steps.lock().unwrap());
+                eprintln!("RESULT EC2 start 2 ({}): {second_start:?}; steps {s2:?}", if quick { "warm: right after stop 1" } else { "after scale-in" });
+                let (out, code) = sh(&target2, "claude", "echo again; docker ps -q | wc -l").await;
+                assert_eq!(code, 0, "{out}");
+                let aws2 = current(&store).aws.unwrap();
+                let task2 = aws2.task_arn.clone().unwrap();
+                host.stop_project(&current(&store), &settings).await.expect("stop 2");
+                poll(Duration::from_secs(300), Duration::from_secs(5), || async {
+                    let d = api.describe(&rec.cluster_arn, std::slice::from_ref(&task2)).await.ok()?;
+                    (d.first()?.last_status == "STOPPED").then_some(())
+                })
+                .await
+                .expect("task 2 never stopped");
+                store.set_aws_runtime(&id, None, aws2.access_point_id.clone(), aws2.task_definition_arn.clone(), None).unwrap();
+                let removed = host.remove_aws_resources(&current(&store), &settings, true).await;
+                eprintln!("RESULT remove_aws_resources: {:?}", removed.as_ref().map_err(|e| e.chars().take(400).collect::<String>()));
+                removed.expect("remove the project's resources");
+
+                // ── 7. the onboarding re-applied without EC2, an instance still up ──
+                eprintln!("RESULT group before the re-apply without EC2: {:?}", group_size(&asg_admin, &stem).await);
+                let (keys, acfg, _) = t.session(&admin).await;
+                let vars = prepare_onboarding(&SdkOnboardApi::new(&acfg), &name, &region, &account, &owner, Some(Ec2Choice::None))
+                    .await
+                    .expect("the pre-apply step without EC2");
+                let t5 = std::time::Instant::now();
+                let (_, outcome, denied) = t
+                    .run(ModuleKind::UserOnboard, Deployment::User { env: &name, owner_key: &okey }, &vars, TofuOp::Apply, t.keys_env(&keys))
+                    .await;
+                eprintln!("RESULT re-apply without EC2: {:?} in {:?}", outcome.summary, t5.elapsed());
+                assert_ok("re-apply the onboarding without EC2", &outcome, &denied);
+                let g = group_size(&asg_admin, &stem).await;
+                let inst = live_env_instances(&region, &name).await;
+                let cps = ecs_admin.describe_capacity_providers().capacity_providers(&stem).send().await;
+                let cl = ecs_admin.describe_clusters().clusters(&stem).send().await;
+                let (_, lt, lt_err) = aws_cli(None, &region, &["ec2", "describe-launch-templates", "--launch-template-names", &stem]).await;
+                let prof = t.e.iam.get_instance_profile().instance_profile_name(&role_name).send().await;
+                let role = t.e.iam.get_role().role_name(&role_name).send().await;
+                let record = read_user_record(&SdkRuntimeApi::new(&ws_cfg), &name, &okey, &account, &region).await;
+                eprintln!(
+                    "RESULT after the re-apply: group {g:?}; live instances {inst:?}; provider {:?}; cluster {:?}; template {} {}; profile gone {}; role gone {}; record {record:?}",
+                    cps.as_ref().map(|o| o.capacity_providers().iter().map(|c| c.status().cloned()).collect::<Vec<_>>()),
+                    cl.as_ref().map(|o| o.clusters().iter().map(|c| c.status().map(str::to_string)).collect::<Vec<_>>()),
+                    lt.trim().chars().take(100).collect::<String>(),
+                    lt_err.trim().chars().take(100).collect::<String>(),
+                    prof.is_err(),
+                    role.is_err(),
+                );
+                assert!(g.is_none(), "the group is gone");
+                assert!(inst.is_empty(), "no instance is left: {inst:?}");
+                assert!(prof.is_err() && role.is_err(), "the instance profile and role are gone");
+                assert!(matches!(record, Ok(UserRecord::Absent)), "{record:?}");
+
+                // ── offboard, then destroy the environment, as the environment admin ──
+                if let Some(role) = p5_lock(&p5).exec_role.take() {
+                    let _ = t.e.iam.delete_role_policy().role_name(&role).policy_name(ECR_POLICY).send().await;
+                }
+                let (keys, _, _) = t.session(&admin).await;
+                let (_, outcome, denied) = t
+                    .run(ModuleKind::UserOnboard, Deployment::User { env: &name, owner_key: &okey }, &vars, TofuOp::Destroy, t.keys_env(&keys))
+                    .await;
+                assert_ok("offboard", &outcome, &denied);
+                let (_, outcome, denied) = t
+                    .run(
+                        ModuleKind::Environment,
+                        Deployment::Environment(&name),
+                        &environment_vars(&name, &region, &NetworkChoice::Public, 0).unwrap(),
+                        TofuOp::Destroy,
+                        t.keys_env(&keys),
+                    )
+                    .await;
+                assert_ok("destroy the environment", &outcome, &denied);
+                eprintln!(
+                    "RESULT summary: docker {docker_ok}, vpn {vpn_ok}, src_valid_mark {src_valid_mark}, bwrap {bwrap_ok}, start1 {first_start:?}, scale-in {:.1} min, start2 {second_start:?}",
+                    scale_in.as_secs_f64() / 60.0
+                );
+                let _ = ws;
+                assert!(docker_ok, "docker ps failed as claude");
+                // E8, stable in every run: Docker's seccomp profile refuses it.
+                assert!(quick || !bwrap_ok, "bwrap worked in the task: revisit sandbox_allowed (E8)");
+                assert!(vpn_ok && src_valid_mark, "the VPN pieces are missing");
+            });
+            let body = async {
+                if tokio::time::timeout(PHASE7_TIMEOUT, inner).await.is_err() {
+                    panic!("the phase-7 body did not finish in {PHASE7_TIMEOUT:?}");
                 }
             };
             let result = std::panic::AssertUnwindSafe(body).catch_unwind().await;

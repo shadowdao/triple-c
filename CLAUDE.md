@@ -292,7 +292,7 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   when it drops, so an `AgentEndpoint` stays valid. The `StartSession` token goes to the plugin
   through its environment, never argv, and the plugin's environment is stripped of every
   inherited `AWS_*` variable before the session's own credentials are added.
-  `aws_host.rs` is `ProjectHost::Aws` (an ECS Fargate task per project; a running task is
+  `aws_host.rs` is `ProjectHost::Aws` (an ECS task per project, Fargate or, on the user's own instance, EC2; a running task is
   attached to with the token read back from its secret, never rotated; a task a failed start ran
   is stopped again) and `tunnels.rs` the registry of open tunnels by project — an AWS project's
   `ContainerTarget::for_project` is its tunnel's endpoint, its stored `container_id` is that
@@ -367,8 +367,11 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   push's snapshot), may push first (under an in-container `timeout`, since the agent does not kill an
   exec the client gave up on), then writes `pushed` or `discard` to `/run/triple-c/stop-reason`
   (root-owned; the entrypoint's TERM hook reads it, and the idle watcher writes `idle` or `lifetime`) so the hook
-  doesn't push twice; the marker is cleared if StopTask fails. Claude Code's sandbox is forced off in
-  the generated settings (bubblewrap can't create namespaces on Fargate, verified live).
+  doesn't push twice; the marker is cleared if StopTask fails. **Claude Code's sandbox is forced off
+  on every AWS project, Fargate and EC2** in the generated settings (`sandbox_allowed` is false; the
+  Runtime toggle is locked off, `sandboxEffective` in `awsWorkspace.ts`): bubblewrap fails on Fargate
+  and under Docker's default seccomp profile on EC2 too ("No permissions to create new namespace",
+  verified live), so a `sandbox_allowed` that said yes would only break every command.
   **LLM gateway sidecar** (`gateway_sidecar`, Q7): a second, `essential: false` container `gateway`
   (`docker::gateway::registry_image_ref`, digest-pinned, amd64+arm64; `memoryReservation` 512; no
   `environment`, no `dependsOn`) whose `secrets` are exactly `TRIPLEC_GATEWAY_{CONFIG,API_KEY,MASTER_KEY}`
@@ -384,6 +387,60 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   `FILTERS`) → per-region x86/ARM rates cached at `<data_dir>/triple-c/aws-pricing/<region>.json` for
   24 h; `aws_cost_estimate(connection_id, region, config)` never errors — denied/offline/slow (8 s) is
   `None` ("Estimate unavailable"), a failed region isn't re-asked for 5 min, a stale cache still answers.
+  EC2 projects (E10) pass `instance_type` (the user's, from `aws_ec2_capacity`): the `AmazonEC2`
+  on-demand Linux/shared-tenancy hourly price (`EC2_FILTERS`), cached as `<region>--ec2-<type>.json`
+  with the same rules — the instance's price, not the reservations — plus the 50 GiB gp3 root volume
+  (`GP3_FILTERS`, `<region>--ebs-gp3.json`, best effort: without it the note says it's missing;
+  `EC2_ROOT_VOLUME_GIB` is pinned to `ec2.tf`). A public IPv4 address ($0.005/h) is only in the note.
+  **ECS on EC2 (phase 7; `aws/terraform/user-onboard/ec2.tf`, `workspace.rs` `ec2_plan`, `aws_host.rs`).**
+  Opt-in per onboarding (`ec2_instance_type`); a project's `launch_type` is `Fargate | Ec2`. Why the
+  rules are what they are:
+  - **Per-user cluster `triple-c-<env>--u-<tag>`**, named by the principal tag `triple-c-user`
+    (`user_ec2_stem` in `tofu_modules.rs`, the only place). One capacity provider per cluster,
+    because `PutClusterCapacityProviders` replaces the list and two modules would undo each other on
+    a shared cluster. Environment names and tags never contain `--`, so `triple-c-*--u-*` matches
+    exactly the per-user clusters. **Two Denies in `workspace-user-tasks.json`** (`RunTask`/`StartTask`
+    on a `--u-*` cluster other than the caller's own, and on any when the caller has **no**
+    `triple-c-user` principal tag) are the whole isolation between EC2 users: don't loosen them, and
+    keep the missing-tag Deny (a variable that resolves to nothing must not fall through). A denial
+    maps to `EC2_TAG_MISMATCH` ("different triple-c-user value").
+  - **The instance role is scoped by its own cluster tag.** `triple-c-<env>-<owner_key>-instance`
+    (owner key, not user tag: role names are account-global) has only the ECS agent's calls, and the
+    **boundary** allows them on `cluster/${aws:PrincipalTag/triple-c:cluster}` (must match `--u-*`).
+    A Docker-access project is root on its instance and holds that role, so the tag is what stops it
+    registering the instance into someone else's cluster. No SSM core and **no log rights** on the
+    instance (awslogs writes with the execution role: `ECS_ENABLE_AWSLOGS_EXECUTIONROLE_OVERRIDE`).
+    The task and execution roles `PutLogEvents` only into `log-stream:<owner_key>/*` of the shared
+    log group, so `log_stream_prefix` must keep starting with the owner key. The boundary
+    is versioned (2): an account admin re-applies it once before anyone onboards with EC2.
+  - **Launch templates and groups are pinned to a numeric template version, and the admin policy
+    denies `$Latest`/`$Default`**: the admin's `iam:PassRole` and `ec2:RunInstances` checks look at the
+    template when it is created, and a version edited afterwards would carry any instance type or
+    role (a PassRole bypass). The type list (`ec2_instance_spec` in `models/project.rs`) lives in the
+    model table, the HCL variable and the policy (`ec2:InstanceType` in the compute file,
+    `autoscaling:InstanceTypes` twice in the scaling file); change all together. A template-only group
+    create sends no `autoscaling:InstanceTypes`, so don't add a `Null` condition on it (live-verified).
+  - **Bridge networking, not awsvpc (R2):** the instance is the user's alone, awsvpc tasks on EC2 get
+    no public IP, and bridge keeps IMDS out of reach with hop limit 1 (the agent on the host network
+    still reaches it). The ECS agent's introspection port (172.17.0.1:51678) stays reachable;
+    accepted. The gateway sidecar is refused on EC2 (no shared loopback).
+  - **Cold-start rerun + orphan rule.** ECS turns ECS Exec **off** for a task that has to wait for an
+    instance (the agent tunnel needs it), so the first RunTask only brings the instance up; once
+    placed, the app stops it, waits for STOPPED and runs again via `find_or_run` (so a concurrent
+    start never doubles a task: `START_RACE`), requiring exec on (`EXEC_OFF`). A found exec-off task
+    that is still waiting for an instance is another start's (`INSTANCE_RACE`) while younger than
+    `ec2_wait + ORPHAN_MARGIN`; older is an orphan, stopped (`REPLACED_REASON`) and replaced. Keep
+    both launches going through `find_or_run`.
+  - **Docker access = the instance's own socket**, mounted at `/var/run/docker.sock` (root on the
+    user's own instance, acceptable only because nobody else's task can land there); VPN =
+    `NET_ADMIN` + `/dev/net/tun` + `src_valid_mark`. A Fargate project can't keep either: switching
+    to Fargate clears both flags (`launchTypePatch`, R1).
+  - **Collision check before an apply** (`ec2_collision_refusal`, `prepare_onboarding`): the module
+    would adopt another user's cluster of the same name, so the app refuses a name owned by someone
+    else (resources' `triple-c:owner` tag, the user record `/triple-c/users/<env>/<owner_key>` as
+    fallback). Admin bundles carry the same check in `README.txt`.
+  - Scale to zero (min 0): the first start after ~17 min idle is cold (~3.5-4 min), warm ~20-30 s.
+    Re-applying onboarding without EC2 drains and deletes the group even with an instance running.
   **Environments are OpenTofu modules** (`aws/terraform/{environment,user-onboard,permissions-boundary}`;
   spec D2–D10). `tofu_modules.rs` embeds them and is the **only** place the shared names are built
   (environment, `/triple-c/environments/<env>` record, owner key — `sha256("<region>:<aws:userid>")`,
@@ -505,6 +562,10 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   The re-clone closes the apply lock's fd (a later connect never waits for it); `--prepare` takes it.
   The functions both scripts use live in `container/entrypoint-lib.sh`
   (`/usr/local/lib/triple-c/`), sourced by the entrypoint first; it only defines things.
+  **The Docker-socket group step** (`# >>> docker_socket`) runs in aws mode as well as Docker mode: an
+  EC2 project with Docker access mounts the instance's `/var/run/docker.sock`, and the step adds
+  `claude` to a group with the socket's gid (`docker-host` if none exists). Fargate never has the
+  socket, so it is inert there.
   **The `TRIPLEC_` env prefix is reserved** on both hosts (`RESERVED_ENV_PREFIXES`; `workspace.rs`
   drops custom variables in it): the entrypoint's settings live there.
 - **Browser runtime libraries are baked in; browser *binaries* are not.** A layer runs

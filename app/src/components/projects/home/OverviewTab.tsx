@@ -15,6 +15,7 @@ import ContainerMigrationBanner from "./ContainerMigrationBanner";
 import AwsWorkspaceStatusCard from "./AwsWorkspaceStatusCard";
 import AwsCostEstimate from "./AwsCostEstimate";
 import { isAwsProject } from "../../../lib/awsWorkspace";
+import { useEc2Capacity } from "../../../lib/ec2Capacity";
 import type { ContainerMigration } from "../../../hooks/useContainerMigration";
 import SaveIndicator from "../../ui/SaveIndicator";
 import Button from "../../ui/Button";
@@ -53,6 +54,11 @@ export default function OverviewTab({
   onOpenMigration,
 }: Props) {
   const [sessions, setSessions] = useState<ClaudeSession[]>([]);
+  // An EC2 project's estimate is its instance type's price (E10).
+  const ec2Capacity = useEc2Capacity(
+    project,
+    isAwsProject(project) && project.status === "running" && project.aws?.launch_type === "ec2",
+  );
   const [tasks, setTasks] = useState<ScheduledTask[]>([]);
   const [notificationCount, setNotificationCount] = useState(0);
   const running = project.status === "running";
@@ -152,6 +158,7 @@ export default function OverviewTab({
             connectionId={project.host_id}
             region={project.aws_placement?.region}
             config={project.aws}
+            instanceType={ec2Capacity?.state === "ec2" ? ec2Capacity.compute.instance_type : null}
           />
         </section>
       )}

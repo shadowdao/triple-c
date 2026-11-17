@@ -11,6 +11,7 @@ use crate::aws::permissions::{check_permissions, PermissionReport, SdkPermission
 use crate::aws::policies::{policy_files, Tier};
 use crate::aws::pricing::{self, HourlyEstimate, RatesCache, SdkPricingApi};
 use crate::aws::{caller_identity, sdk_config, sdk_config_for_keys, AwsError, CallerIdentity};
+use crate::models::project::{ec2_instance_spec, LaunchType};
 use crate::models::{
     validate_connection_name, validate_profile_name, validate_supported_region, AppSettings, AwsAuth,
     AwsWorkspaceConfig, HostConnection, HostKind,
@@ -322,18 +323,33 @@ fn pricing_cache() -> Option<&'static RatesCache> {
 /// error:** a bad region, a missing connection, a denied or slow call (8 s
 /// bound) or an unreadable price list is `None`, shown as "Estimate
 /// unavailable". Rates are cached a day per region.
+///
+/// An EC2 project (E10) is priced as `instance_type` (the user's, from their
+/// onboarding record, which the UI already holds): its on-demand hourly
+/// price, the same cache and back-off rules. No instance type, or one not in
+/// the app's table, is `None`.
 #[tauri::command]
 pub async fn aws_cost_estimate(
     connection_id: String,
     region: String,
     config: AwsWorkspaceConfig,
+    instance_type: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Option<HourlyEstimate>, String> {
     let Some(cache) = pricing_cache() else {
         return Ok(None);
     };
     let settings = state.settings_store.get();
-    Ok(cost_estimate(cache, &connection_id, &region, &config, &settings, SystemTime::now()).await)
+    Ok(cost_estimate(
+        cache,
+        &connection_id,
+        &region,
+        &config,
+        instance_type.as_deref(),
+        &settings,
+        SystemTime::now(),
+    )
+    .await)
 }
 
 async fn cost_estimate(
@@ -341,24 +357,41 @@ async fn cost_estimate(
     connection_id: &str,
     region: &str,
     config: &AwsWorkspaceConfig,
+    instance_type: Option<&str>,
     settings: &AppSettings,
     now: SystemTime,
 ) -> Option<HourlyEstimate> {
     let region = validate_supported_region(region).ok()?;
+    // Only now touch the connection (a keys connection reads the keychain),
+    // and inside the fetch's 8 s bound: reading a profile's credentials can
+    // hang as well (an SSO or process provider).
+    let api = || async {
+        let conn = aws_conn(connection_id, settings).ok()?;
+        let cfg = sdk_config(&conn, pricing::PRICING_REGION).await.ok()?;
+        Some(SdkPricingApi::new(&cfg))
+    };
+    if config.launch_type == LaunchType::Ec2 {
+        let instance_type = instance_type.filter(|t| ec2_instance_spec(t).is_some())?;
+        let instance = async {
+            match cache.read_ec2(&region, instance_type, now) {
+                Some((price, true)) => Some(price),
+                _ => {
+                    cache
+                        .ec2_price_with::<SdkPricingApi, _>(api(), &region, instance_type, now)
+                        .await
+                }
+            }
+        };
+        // The root volume's price is best effort: without it the estimate
+        // is the instance's alone (and says so).
+        let gp3 = cache.gp3_price_with::<SdkPricingApi, _>(api(), &region, now);
+        let (price, gp3) = tokio::join!(instance, gp3);
+        return Some(pricing::estimate_ec2(config, price?, gp3));
+    }
     let rates = match cache.read(&region, now) {
         Some((rates, true)) => Some(rates),
-        _ => {
-            // Only now touch the connection (a keys connection reads the
-            // keychain); without one, a stale cache still answers.
-            // Built inside the fetch's 8 s bound: reading a profile's
-            // credentials can hang as well (an SSO or process provider).
-            let api = async {
-                let conn = aws_conn(connection_id, settings).ok()?;
-                let cfg = sdk_config(&conn, pricing::PRICING_REGION).await.ok()?;
-                Some(SdkPricingApi::new(&cfg))
-            };
-            cache.rates_with::<SdkPricingApi, _>(api, &region, now).await
-        }
+        // Without a connection, a stale cache still answers.
+        _ => cache.rates_with::<SdkPricingApi, _>(api(), &region, now).await,
     }?;
     Some(pricing::estimate(config, &rates.for_arch(config.arch)?))
 }
@@ -604,7 +637,15 @@ mod tests {
     fn the_policy_document_is_every_file_of_the_tier() {
         let admin = aws_policy_document(Tier::EnvironmentAdmin);
         let names: Vec<&str> = admin.iter().map(|f| f.name.as_str()).collect();
-        assert_eq!(names, ["environment-admin.json", "environment-admin-network.json"]);
+        assert_eq!(
+            names,
+            [
+                "environment-admin.json",
+                "environment-admin-network.json",
+                "environment-admin-compute.json",
+                "environment-admin-scaling.json"
+            ]
+        );
         for f in &admin {
             serde_json::from_str::<serde_json::Value>(&f.json).expect("policy JSON");
         }
@@ -646,7 +687,7 @@ mod tests {
             spot: true,
             ..Default::default()
         };
-        let e = cost_estimate(&cache, "gone", "us-west-2", &config, &settings, now)
+        let e = cost_estimate(&cache, "gone", "us-west-2", &config, None, &settings, now)
             .await
             .expect("estimate");
         assert!((e.usd_per_hour - (0.04 + 2.0 * 0.004)).abs() < 1e-9);
@@ -656,7 +697,7 @@ mod tests {
             arch: crate::models::Arch::Arm64,
             ..config.clone()
         };
-        assert_eq!(cost_estimate(&cache, "gone", "us-west-2", &arm, &settings, now).await, None);
+        assert_eq!(cost_estimate(&cache, "gone", "us-west-2", &arm, None, &settings, now).await, None);
     }
 
     #[tokio::test]
@@ -667,11 +708,46 @@ mod tests {
         let config = AwsWorkspaceConfig::default();
         let now = SystemTime::now();
         // No cache and no such connection.
-        assert_eq!(cost_estimate(&cache, "gone", "us-west-2", &config, &settings, now).await, None);
+        assert_eq!(cost_estimate(&cache, "gone", "us-west-2", &config, None, &settings, now).await, None);
         // A region that isn't one (it would name the cache file).
         cache.write("us-west-2", &sample_rates(), now).unwrap();
         for bad in ["../us-west-2", "", "us-west-2/x"] {
-            assert_eq!(cost_estimate(&cache, "gone", bad, &config, &settings, now).await, None);
+            assert_eq!(cost_estimate(&cache, "gone", bad, &config, None, &settings, now).await, None);
         }
+    }
+
+    /// E10: an EC2 project is priced as the user's instance type, from the
+    /// same cache; without a known type there is no estimate.
+    #[tokio::test]
+    async fn an_ec2_projects_estimate_is_its_instance_types_price() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = RatesCache::new(dir.path().to_path_buf());
+        let now = SystemTime::now();
+        cache.write("us-west-2", &sample_rates(), now).unwrap();
+        cache.write_ec2("us-west-2", "m7i.large", 0.1008, now).unwrap();
+        let settings = AppSettings::default();
+        let config = AwsWorkspaceConfig {
+            launch_type: LaunchType::Ec2,
+            cpu: 1024,
+            memory_mib: 2048,
+            storage: crate::models::project::StorageMode::Ephemeral,
+            ..Default::default()
+        };
+        let e = cost_estimate(&cache, "gone", "us-west-2", &config, Some("m7i.large"), &settings, now)
+            .await
+            .expect("estimate");
+        assert!((e.usd_per_hour - 0.1008).abs() < 1e-9);
+        assert!(e.ec2_instance && !e.note_spot && !e.efs_billed_separately);
+        // No instance type, one not in the table, or one with no cached price
+        // (and no connection to ask): no estimate — never Fargate's.
+        for t in [None, Some("x9.huge"), Some("m7g.large")] {
+            assert_eq!(cost_estimate(&cache, "gone", "us-west-2", &config, t, &settings, now).await, None, "{t:?}");
+        }
+        // A Fargate project ignores an instance type.
+        let fargate = AwsWorkspaceConfig { launch_type: LaunchType::Fargate, ..config.clone() };
+        let f = cost_estimate(&cache, "gone", "us-west-2", &fargate, Some("m7i.large"), &settings, now)
+            .await
+            .expect("fargate");
+        assert!(!f.ec2_instance);
     }
 }

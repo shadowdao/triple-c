@@ -56,6 +56,9 @@ fn task(p: &Project, id: &str, last: &str, ready: bool) -> TaskInfo {
         stopped_reason: (last == "STOPPED").then(|| "Essential container exited".into()),
         task_definition_arn: format!("arn:aws:ecs:{REGION}:{ACCOUNT}:task-definition/{}:1", family(p)),
         runtime_id: ready.then(|| "rt-1".into()),
+        container_instance_arn: None,
+        exec_enabled: true,
+        created_unix: None,
         exec_agent_running: ready,
         exit_code: None,
         owner: Some(USER.into()),
@@ -85,6 +88,8 @@ struct Fake {
     tasks: Mutex<HashMap<String, TaskInfo>>,
     /// What RunTask starts.
     run: Option<TaskInfo>,
+    /// When non-empty, what successive RunTasks start (before `run`).
+    runs: Mutex<Vec<TaskInfo>>,
     logs: Vec<String>,
     role: Option<Knowable>,
     connect_fails: bool,
@@ -94,10 +99,27 @@ struct Fake {
     rotated_by_loser: bool,
     /// StopTask is refused (expired credentials, say).
     stop_fails: bool,
+    /// StopTask is accepted but the task never reaches STOPPED.
+    stop_noop: bool,
     /// What `on_task` was told, in order.
     recorded: Mutex<Vec<Option<String>>>,
     /// `group stream limit` of each log read.
     log_reads: Mutex<Vec<String>>,
+    /// The caller's EC2 record (absent by default).
+    user_record: Option<crate::aws::environments::Param>,
+    /// Reading the EC2 record fails (throttled, say).
+    user_record_fails: bool,
+    /// RunTask requests, in order.
+    run_requests: Mutex<Vec<RunTaskInput>>,
+    /// The clusters ListTasks / StopTask / DescribeTasks were asked about.
+    list_clusters: Mutex<Vec<String>>,
+    stop_clusters: Mutex<Vec<String>>,
+    describe_clusters: Mutex<Vec<String>>,
+    /// When set, ListTasks answers per cluster (empty for any other).
+    listed_by_cluster: Option<HashMap<String, Vec<String>>>,
+    /// Successive states of the run task, one per DescribeTasks (the last
+    /// repeats); overrides `tasks` for that ARN.
+    script: Mutex<Vec<TaskInfo>>,
 }
 
 impl Fake {
@@ -117,25 +139,53 @@ impl Fake {
 }
 
 impl TaskApi for Fake {
-    async fn run_task(&self, _req: RunTaskInput) -> Result<TaskInfo, AwsError> {
+    async fn run_task(&self, req: RunTaskInput) -> Result<TaskInfo, AwsError> {
         self.log("run");
-        let t = self.run.clone().expect("a run was expected");
+        self.run_requests.lock().unwrap().push(req);
+        let queued = {
+            let mut q = self.runs.lock().unwrap();
+            (!q.is_empty()).then(|| q.remove(0))
+        };
+        let t = queued.or_else(|| self.run.clone()).expect("a run was expected");
         self.tasks.lock().unwrap().insert(t.arn.clone(), t.clone());
         Ok(t)
     }
-    async fn describe(&self, _c: &str, arns: &[String]) -> Result<Vec<TaskInfo>, AwsError> {
+    async fn describe(&self, c: &str, arns: &[String]) -> Result<Vec<TaskInfo>, AwsError> {
+        self.describe_clusters.lock().unwrap().push(c.into());
+        {
+            let mut script = self.script.lock().unwrap();
+            if let Some(first) = script.first().cloned().filter(|t| arns.contains(&t.arn)) {
+                if script.len() > 1 {
+                    script.remove(0);
+                }
+                return Ok(vec![first]);
+            }
+        }
         let t = self.tasks.lock().unwrap();
         Ok(arns.iter().filter_map(|a| t.get(a).cloned()).collect())
     }
-    async fn list_project_tasks(&self, _c: &str, _f: &str) -> Result<Vec<String>, AwsError> {
+    async fn list_project_tasks(&self, c: &str, _f: &str) -> Result<Vec<String>, AwsError> {
         self.log("list");
+        self.list_clusters.lock().unwrap().push(c.into());
+        if let Some(by) = &self.listed_by_cluster {
+            return Ok(by.get(c).cloned().unwrap_or_default());
+        }
         let mut l = self.listed.lock().unwrap();
         Ok(if l.len() > 1 { l.remove(0) } else { l.first().cloned().unwrap_or_default() })
     }
-    async fn stop_task(&self, _c: &str, arn: &str, reason: &str) -> Result<(), AwsError> {
+    async fn stop_task(&self, c: &str, arn: &str, reason: &str) -> Result<(), AwsError> {
         self.log(format!("stop {arn} {reason}"));
+        self.stop_clusters.lock().unwrap().push(c.into());
         if self.stop_fails {
             return Err(AwsError::Other { message: "ExpiredToken".into() });
+        }
+        // As ECS does: a stopped task is no longer live.
+        if self.stop_noop {
+            return Ok(());
+        }
+        if let Some(t) = self.tasks.lock().unwrap().get_mut(arn) {
+            t.desired_status = "STOPPED".into();
+            t.last_status = "STOPPED".into();
         }
         Ok(())
     }
@@ -213,6 +263,13 @@ impl RuntimeApi for Fake {
         self.log(format!("record {env}"));
         Ok(Some(record()))
     }
+    async fn user_record(&self, env: &str, _owner_key: &str) -> Result<crate::aws::environments::Param, AwsError> {
+        self.log(format!("user-record {env}"));
+        if self.user_record_fails {
+            return Err(AwsError::Other { message: "Throttling".into() });
+        }
+        Ok(self.user_record.clone().unwrap_or(crate::aws::environments::Param::Missing))
+    }
     async fn role_exists(&self, _name: &str) -> Result<Knowable, AwsError> {
         self.log("role");
         Ok(self.role.clone().unwrap_or(Knowable::Yes))
@@ -281,6 +338,10 @@ fn inputs<'a>(
         image: REGISTRY_IMAGE,
         gateway: &no_gateway,
         wait: WaitTiming {
+            interval: Duration::from_millis(1),
+            timeout: Duration::from_millis(30),
+        },
+        ec2_wait: WaitTiming {
             interval: Duration::from_millis(1),
             timeout: Duration::from_millis(30),
         },
@@ -561,6 +622,21 @@ fn the_sandbox_is_forced_off_on_aws() {
     let settings = &pairs.iter().find(|(k, _)| k == "CLAUDE_CODE_SETTINGS_JSON").unwrap().1;
     let v: serde_json::Value = serde_json::from_str(settings).unwrap();
     assert_eq!(v["sandbox"]["enabled"], false, "{settings}");
+    assert!(!sandbox_allowed(&p));
+}
+
+/// E8, measured live (phase 7): bubblewrap can't create a user namespace
+/// in an ECS task on the ECS-optimized AMI either (Docker's default seccomp
+/// profile refuses it without CAP_SYS_ADMIN), so EC2 keeps it off too.
+#[test]
+fn the_sandbox_is_forced_off_on_ec2_too() {
+    let mut p = ec2_project();
+    p.sandbox_mode_enabled = true;
+    assert!(!sandbox_allowed(&p));
+    let (pairs, _) = aws_env(&p, &AppSettings::default()).unwrap();
+    let settings = &pairs.iter().find(|(k, _)| k == "CLAUDE_CODE_SETTINGS_JSON").unwrap().1;
+    let v: serde_json::Value = serde_json::from_str(settings).unwrap();
+    assert_eq!(v["sandbox"]["enabled"], false, "{settings}");
 }
 
 #[test]
@@ -636,7 +712,7 @@ async fn an_aws_projects_target_is_its_registered_tunnel() {
 }
 
 fn find(p: &Project) -> FindTask {
-    FindTask::new(p, REGION, USER)
+    FindTask::new(p, REGION, USER, None)
 }
 
 fn store_with(p: &Project) -> (tempfile::TempDir, ProjectsStore) {
@@ -1241,3 +1317,597 @@ mod gateway_sidecar_inputs {
     }
 }
 
+
+// ------------------------------------------------------------- EC2 (phase 7)
+
+const USER_CLUSTER: &str = "triple-c-dev--u-alice";
+
+fn user_cluster_arn() -> String {
+    format!("arn:aws:ecs:{REGION}:{ACCOUNT}:cluster/{USER_CLUSTER}")
+}
+
+fn ec2_task_arn(id: &str) -> String {
+    format!("arn:aws:ecs:{REGION}:{ACCOUNT}:task/{USER_CLUSTER}/{id}")
+}
+
+fn ec2_project() -> Project {
+    let mut p = aws_project(StorageMode::Ephemeral);
+    let a = p.aws.as_mut().unwrap();
+    a.launch_type = LaunchType::Ec2;
+    a.cpu = 1024;
+    a.memory_mib = 4096;
+    p
+}
+
+fn ec2_task(p: &Project, id: &str, last: &str, ready: bool, placed: bool) -> TaskInfo {
+    TaskInfo {
+        arn: ec2_task_arn(id),
+        container_instance_arn: placed.then(|| {
+            format!("arn:aws:ecs:{REGION}:{ACCOUNT}:container-instance/{USER_CLUSTER}/ci-1")
+        }),
+        ..task(p, id, last, ready)
+    }
+}
+
+fn user_record_param() -> crate::aws::environments::Param {
+    crate::aws::environments::Param::Value(
+        serde_json::json!({
+            "schema": 1, "instance_type": "m7i.large", "max_instances": 2, "user_tag": "alice",
+            "cluster_arn": user_cluster_arn(),
+            "capacity_provider": USER_CLUSTER,
+        })
+        .to_string(),
+    )
+}
+
+#[tokio::test]
+async fn an_ec2_start_runs_on_the_users_capacity_and_says_when_it_waits_for_an_instance() {
+    let p = ec2_project();
+    let fake = Fake {
+        user_record: Some(user_record_param()),
+        run: Some(ec2_task(&p, "e1", "PROVISIONING", false, false)),
+        ..Default::default()
+    };
+    // Cold start: no instance, then one is placed, then the task is up.
+    *fake.script.lock().unwrap() = vec![
+        ec2_task(&p, "e1", "PROVISIONING", false, false),
+        ec2_task(&p, "e1", "PROVISIONING", false, false),
+        ec2_task(&p, "e1", "PENDING", false, true),
+        ec2_task(&p, "e1", "RUNNING", true, true),
+    ];
+    let (r, steps) = start(&fake, &p).await;
+    let started = r.unwrap();
+    assert!(started.created);
+    assert_eq!(started.task.arn, ec2_task_arn("e1"));
+    assert_eq!(
+        steps,
+        vec![
+            PROGRESS_READING,
+            PROGRESS_PREPARING,
+            PROGRESS_STARTING,
+            PROGRESS_WAITING,
+            PROGRESS_INSTANCE,
+            PROGRESS_WAITING,
+            PROGRESS_CONNECTING
+        ]
+    );
+    assert_eq!(PROGRESS_INSTANCE, "Starting an instance (about 3 minutes)…");
+    // The record is read before anything is written; the project's task is
+    // looked for in both clusters, then once more where it will run.
+    let calls = fake.calls();
+    let pos = |c: &str| calls.iter().position(|x| x == c).unwrap();
+    assert!(pos("user-record dev") < pos("put-secret"), "{calls:?}");
+    assert_eq!(
+        *fake.list_clusters.lock().unwrap(),
+        [cluster_arn(), user_cluster_arn(), user_cluster_arn()]
+    );
+    let req = &fake.run_requests.lock().unwrap()[0];
+    assert_eq!(req.cluster(), Some(user_cluster_arn().as_str()));
+    assert_eq!(req.capacity_provider_strategy()[0].capacity_provider(), USER_CLUSTER);
+    assert!(req.network_configuration().is_none() && req.launch_type().is_none());
+    assert!(fake.describe_clusters.lock().unwrap().iter().all(|c| *c == user_cluster_arn()));
+}
+
+/// ECS turns ECS Exec off on a RunTask that has to wait for an instance
+/// (verified live): that task only brings the instance up; once placed it
+/// is stopped and the task run again, onto the instance, with ECS Exec.
+#[tokio::test]
+async fn a_cold_ec2_start_runs_the_task_again_once_an_instance_is_up() {
+    let p = ec2_project();
+    let execless = |last: &str, placed: bool| TaskInfo { exec_enabled: false, ..ec2_task(&p, "e1", last, false, placed) };
+    let fake = Fake {
+        user_record: Some(user_record_param()),
+        runs: Mutex::new(vec![execless("PROVISIONING", false), ec2_task(&p, "e9", "PENDING", false, true)]),
+        ..Default::default()
+    };
+    *fake.script.lock().unwrap() = vec![
+        execless("PROVISIONING", false),
+        execless("PENDING", true),
+        TaskInfo { desired_status: "STOPPED".into(), ..execless("PENDING", true) },
+        execless("STOPPED", true),
+        ec2_task(&p, "e9", "RUNNING", true, true),
+    ];
+    let (r, steps) = start(&fake, &p).await;
+    let started = r.unwrap();
+    assert_eq!(started.task.arn, ec2_task_arn("e9"));
+    let calls = fake.calls();
+    assert_eq!(calls.iter().filter(|c| *c == "run").count(), 2, "{calls:?}");
+    let stop = format!("stop {} {STOP_REASON}", ec2_task_arn("e1"));
+    let pos = |c: &str| calls.iter().rposition(|x| x == c).unwrap();
+    assert!(calls.iter().position(|c| *c == stop).unwrap() < pos("run"), "{calls:?}");
+    assert_eq!(*fake.stop_clusters.lock().unwrap(), [user_cluster_arn()]);
+    // Both requests ask for ECS Exec on the user's capacity.
+    for req in fake.run_requests.lock().unwrap().iter() {
+        assert_eq!(req.enable_execute_command(), Some(true));
+        assert_eq!(req.capacity_provider_strategy()[0].capacity_provider(), USER_CLUSTER);
+    }
+    // The second task is the one recorded.
+    assert_eq!(*fake.recorded.lock().unwrap(), vec![Some(ec2_task_arn("e1")), Some(ec2_task_arn("e9"))]);
+    assert_eq!(
+        steps,
+        vec![
+            PROGRESS_READING,
+            PROGRESS_PREPARING,
+            PROGRESS_STARTING,
+            PROGRESS_WAITING,
+            PROGRESS_INSTANCE,
+            PROGRESS_WAITING,
+            PROGRESS_CONNECTING
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_second_task_without_ecs_exec_is_stopped_and_reported() {
+    let p = ec2_project();
+    let execless = |id: &str, last: &str, placed: bool| TaskInfo { exec_enabled: false, ..ec2_task(&p, id, last, false, placed) };
+    let fake = Fake {
+        user_record: Some(user_record_param()),
+        runs: Mutex::new(vec![execless("e1", "PROVISIONING", false), execless("e9", "PENDING", true)]),
+        ..Default::default()
+    };
+    *fake.script.lock().unwrap() = vec![execless("e1", "PENDING", true), execless("e1", "STOPPED", true)];
+    let (r, _) = start(&fake, &p).await;
+    assert_eq!(r.err().unwrap().lines().next(), Some(EXEC_OFF));
+    let calls = fake.calls();
+    assert!(calls.contains(&format!("stop {} {STOP_REASON}", ec2_task_arn("e9"))), "{calls:?}");
+}
+
+#[tokio::test]
+async fn a_cold_ec2_task_stopped_before_placement_ends_the_start_with_its_reason() {
+    let p = ec2_project();
+    let execless = |last: &str| TaskInfo { exec_enabled: false, ..ec2_task(&p, "e1", last, false, false) };
+    let fake = Fake {
+        user_record: Some(user_record_param()),
+        runs: Mutex::new(vec![execless("PROVISIONING")]),
+        ..Default::default()
+    };
+    *fake.script.lock().unwrap() = vec![
+        execless("PROVISIONING"),
+        TaskInfo {
+            desired_status: "STOPPED".into(),
+            stopped_reason: Some("Task stopped by user".into()),
+            ..execless("PROVISIONING")
+        },
+    ];
+    let (r, _) = start(&fake, &p).await;
+    let e = r.err().unwrap();
+    assert!(e.contains("Task stopped by user"), "{e}");
+    assert_eq!(fake.calls().iter().filter(|c| *c == "run").count(), 1, "no second RunTask");
+}
+
+#[tokio::test]
+async fn an_execless_task_still_waiting_for_an_instance_is_another_starts() {
+    let mut p = ec2_project();
+    p.aws.as_mut().unwrap().task_arn = Some(ec2_task_arn("other"));
+    let other = TaskInfo { exec_enabled: false, ..ec2_task(&p, "other", "PROVISIONING", false, false) };
+    let fake = Fake {
+        user_record: Some(user_record_param()),
+        listed_by_cluster: Some(HashMap::from([(user_cluster_arn(), vec![ec2_task_arn("other")])])),
+        ..Default::default()
+    }
+    .with_task(other);
+    let (r, _) = start(&fake, &p).await;
+    assert_eq!(r.err().unwrap(), INSTANCE_RACE);
+    assert!(!fake.called("run") && !fake.called("stop"), "{:?}", fake.calls());
+}
+
+#[tokio::test]
+async fn the_cold_reruns_launch_never_doubles_another_starts_task() {
+    let p = ec2_project();
+    let execless = |last: &str, placed: bool| TaskInfo { exec_enabled: false, ..ec2_task(&p, "e1", last, false, placed) };
+    let winner = ec2_task(&p, "w1", "PENDING", false, true);
+    let fake = Fake {
+        user_record: Some(user_record_param()),
+        runs: Mutex::new(vec![execless("PROVISIONING", false)]),
+        // Nothing for the start's own finds; the winner's task by the rerun.
+        listed: Mutex::new(vec![vec![], vec![], vec![], vec![ec2_task_arn("w1")]]),
+        ..Default::default()
+    }
+    .with_task(winner);
+    *fake.script.lock().unwrap() = vec![execless("PENDING", true), execless("STOPPED", true)];
+    let (r, _) = start(&fake, &p).await;
+    assert_eq!(r.err().unwrap(), START_RACE);
+    assert_eq!(fake.calls().iter().filter(|c| *c == "run").count(), 1, "{:?}", fake.calls());
+    // The winner's task is recorded, as on the first launch's race.
+    assert_eq!(fake.recorded.lock().unwrap().last().cloned().flatten(), Some(ec2_task_arn("w1")));
+}
+
+#[tokio::test]
+async fn an_execless_task_that_cannot_be_stopped_fails_the_start() {
+    let mut p = ec2_project();
+    p.aws.as_mut().unwrap().task_arn = Some(ec2_task_arn("old"));
+    let old = TaskInfo { exec_enabled: false, ..ec2_task(&p, "old", "RUNNING", false, true) };
+    let fake = Fake {
+        user_record: Some(user_record_param()),
+        listed_by_cluster: Some(HashMap::from([(user_cluster_arn(), vec![ec2_task_arn("old")])])),
+        stop_fails: true,
+        ..Default::default()
+    }
+    .with_task(old);
+    let (r, _) = start(&fake, &p).await;
+    let e = r.err().unwrap();
+    assert!(e.contains("Could not stop") && e.contains("ExpiredToken"), "{e}");
+    assert!(!fake.called("run"));
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
+}
+
+/// An exec-off task still waiting for an instance, older than any start
+/// could still be waiting (a crashed start's orphan), is replaced; a fresh
+/// one is another start's.
+#[tokio::test]
+async fn an_orphaned_waiting_execless_task_is_replaced_and_a_fresh_one_is_left_alone() {
+    let mut p = ec2_project();
+    p.aws.as_mut().unwrap().task_arn = Some(ec2_task_arn("old"));
+    let waiting = |created: i64| TaskInfo {
+        exec_enabled: false,
+        created_unix: Some(created),
+        ..ec2_task(&p, "old", "PROVISIONING", false, false)
+    };
+    let fake_with = |t: TaskInfo| {
+        Fake {
+            user_record: Some(user_record_param()),
+            listed_by_cluster: Some(HashMap::from([(user_cluster_arn(), vec![ec2_task_arn("old")])])),
+            run: Some(ec2_task(&p, "new", "RUNNING", true, true)),
+            ..Default::default()
+        }
+        .with_task(t)
+    };
+    let fake = fake_with(waiting(now_unix() - 3600));
+    let (r, _) = start(&fake, &p).await;
+    assert_eq!(r.unwrap().task.arn, ec2_task_arn("new"));
+    assert!(fake.calls().contains(&format!("stop {} {REPLACED_REASON}", ec2_task_arn("old"))), "{:?}", fake.calls());
+
+    let fake = fake_with(waiting(now_unix()));
+    let (r, _) = start(&fake, &p).await;
+    let e = r.err().unwrap();
+    assert_eq!(e, INSTANCE_RACE);
+    assert!(e.contains("Stop"), "{e}");
+    assert!(!fake.called("run") && !fake.called("stop"));
+}
+
+#[tokio::test]
+async fn a_cold_start_whose_task_another_start_replaced_says_so() {
+    let p = ec2_project();
+    let execless = |last: &str| TaskInfo { exec_enabled: false, ..ec2_task(&p, "e1", last, false, false) };
+    let fake = Fake {
+        user_record: Some(user_record_param()),
+        runs: Mutex::new(vec![execless("PROVISIONING")]),
+        ..Default::default()
+    };
+    *fake.script.lock().unwrap() = vec![TaskInfo {
+        desired_status: "STOPPED".into(),
+        stopped_reason: Some(REPLACED_REASON.into()),
+        ..execless("PROVISIONING")
+    }];
+    let (r, _) = start(&fake, &p).await;
+    let e = r.err().unwrap();
+    assert!(e.starts_with("Another start of this workspace replaced this one"), "{e}");
+    assert_eq!(fake.calls().iter().filter(|c| *c == "run").count(), 1);
+}
+
+#[tokio::test]
+async fn an_execless_task_that_never_stops_fails_the_start_without_a_new_run() {
+    let mut p = ec2_project();
+    p.aws.as_mut().unwrap().task_arn = Some(ec2_task_arn("old"));
+    let old = TaskInfo { exec_enabled: false, ..ec2_task(&p, "old", "RUNNING", false, true) };
+    let fake = Fake {
+        user_record: Some(user_record_param()),
+        listed_by_cluster: Some(HashMap::from([(user_cluster_arn(), vec![ec2_task_arn("old")])])),
+        stop_noop: true,
+        ..Default::default()
+    }
+    .with_task(old);
+    let (r, _) = start(&fake, &p).await;
+    let e = r.err().unwrap();
+    assert!(e.contains("did not stop in time"), "{e}");
+    assert!(fake.called("stop") && !fake.called("run"));
+}
+
+#[tokio::test]
+async fn a_live_task_with_ecs_exec_off_is_stopped_and_replaced() {
+    let mut p = ec2_project();
+    p.aws.as_mut().unwrap().task_arn = Some(ec2_task_arn("old"));
+    let old = TaskInfo { exec_enabled: false, ..ec2_task(&p, "old", "RUNNING", false, true) };
+    let fake = Fake {
+        user_record: Some(user_record_param()),
+        listed_by_cluster: Some(HashMap::from([(user_cluster_arn(), vec![ec2_task_arn("old")])])),
+        run: Some(ec2_task(&p, "new", "RUNNING", true, true)),
+        ..Default::default()
+    }
+    .with_task(old);
+    let (r, _) = start(&fake, &p).await;
+    assert_eq!(r.unwrap().task.arn, ec2_task_arn("new"));
+    let calls = fake.calls();
+    let stop = calls.iter().position(|c| *c == format!("stop {} {REPLACED_REASON}", ec2_task_arn("old"))).expect("the old task is stopped");
+    assert!(stop < calls.iter().position(|c| c == "run").unwrap(), "{calls:?}");
+}
+
+#[tokio::test]
+async fn a_fargate_start_never_reads_the_ec2_record() {
+    let p = aws_project(StorageMode::Ephemeral);
+    let fake = Fake {
+        user_record: Some(user_record_param()),
+        run: Some(task(&p, "f1", "RUNNING", true)),
+        ..Default::default()
+    };
+    let (r, _) = start(&fake, &p).await;
+    r.unwrap();
+    assert!(!fake.called("user-record"));
+    assert_eq!(*fake.list_clusters.lock().unwrap(), [cluster_arn(), cluster_arn()]);
+}
+
+#[tokio::test]
+async fn an_ec2_start_without_capacity_says_so_before_anything_is_written() {
+    let p = ec2_project();
+    let fake = Fake::default();
+    let (r, _) = start(&fake, &p).await;
+    let e = r.err().unwrap();
+    assert_eq!(
+        e,
+        "You have no EC2 capacity in dev; ask an admin to add it to your onboarding (or run the \
+         project on Fargate)."
+    );
+    assert!(!fake.called("put-secret") && !fake.called("register") && !fake.called("run"));
+
+    // A record that can't be used is not mistaken for none.
+    let fake = Fake {
+        user_record: Some(crate::aws::environments::Param::Value("{}".into())),
+        ..Default::default()
+    };
+    let (r, _) = start(&fake, &p).await;
+    let e = r.err().unwrap();
+    assert!(e.contains("can't be used") && e.contains("re-apply your onboarding"), "{e}");
+    assert!(!fake.called("put-secret"));
+}
+
+#[tokio::test]
+async fn an_ec2_task_that_never_gets_an_instance_is_stopped_with_what_to_check() {
+    let p = ec2_project();
+    let fake = Fake {
+        user_record: Some(user_record_param()),
+        run: Some(ec2_task(&p, "e2", "PROVISIONING", false, false)),
+        ..Default::default()
+    };
+    let (r, steps) = start(&fake, &p).await;
+    let e = r.err().unwrap();
+    assert!(e.contains("No EC2 instance had room"), "{e}");
+    assert!(e.contains("maximum of 2 instances"), "{e}");
+    assert!(steps.contains(&PROGRESS_INSTANCE.to_string()));
+    assert!(fake.calls().contains(&format!("stop {} {STOP_REASON}", ec2_task_arn("e2"))));
+    assert_eq!(*fake.stop_clusters.lock().unwrap(), [user_cluster_arn()]);
+    assert_eq!(*fake.recorded.lock().unwrap(), vec![Some(ec2_task_arn("e2")), None]);
+}
+
+/// The record is gone (capacity removed) while the task still runs: the
+/// stored ARN leads to it, and attaching needs no record.
+#[tokio::test]
+async fn a_running_ec2_task_is_attached_to_even_after_the_record_is_gone() {
+    let mut p = ec2_project();
+    p.aws.as_mut().unwrap().task_arn = Some(ec2_task_arn("e3"));
+    let live = ec2_task(&p, "e3", "RUNNING", true, true);
+    let fake = Fake {
+        listed_by_cluster: Some(HashMap::from([(user_cluster_arn(), vec![live.arn.clone()])])),
+        ..Default::default()
+    }
+    .with_task(live);
+    let (r, _) = start(&fake, &p).await;
+    let started = r.unwrap();
+    assert!(!started.created);
+    assert_eq!(started.task.arn, ec2_task_arn("e3"));
+    assert!(!fake.called("run") && !fake.called("put-secret"));
+    assert_eq!(*fake.list_clusters.lock().unwrap(), [cluster_arn(), user_cluster_arn()]);
+    assert!(fake.describe_clusters.lock().unwrap().iter().all(|c| *c == user_cluster_arn()));
+}
+
+#[tokio::test]
+async fn an_ec2_projects_task_is_found_and_watched_on_the_users_cluster() {
+    // FindTask: the environment's cluster, the record's, and the stored
+    // task's per-user cluster, without repeats.
+    let mut p = ec2_project();
+    let f = FindTask::new(&p, REGION, USER, Some(user_cluster_arn()));
+    assert_eq!(f.clusters, ["triple-c-dev".to_string(), user_cluster_arn()]);
+    p.aws.as_mut().unwrap().task_arn = Some(ec2_task_arn("e4"));
+    assert_eq!(find(&p).clusters, ["triple-c-dev".to_string(), user_cluster_arn()]);
+    let f = FindTask::new(&p, REGION, USER, Some(user_cluster_arn()));
+    assert_eq!(f.clusters.len(), 2);
+
+    // Reconcile with no ARN stored finds the task on the user's cluster.
+    let mut orphan = ec2_project();
+    orphan.status = ProjectStatus::Running;
+    let live = ec2_task(&orphan, "e5", "RUNNING", true, true);
+    let fake = Fake {
+        listed_by_cluster: Some(HashMap::from([(user_cluster_arn(), vec![live.arn.clone()])])),
+        ..Default::default()
+    }
+    .with_task(live);
+    let (_d, store) = store_with(&orphan);
+    let find = FindTask::new(&orphan, REGION, USER, Some(user_cluster_arn()));
+    assert!(matches!(
+        reconcile_project(&fake, &store, &orphan, &find).await.unwrap(),
+        Reconciled::Live(_)
+    ));
+    assert_eq!(store.get(&orphan.id).unwrap().aws.unwrap().task_arn, Some(ec2_task_arn("e5")));
+
+    // The watch groups by the task's own cluster.
+    let mut running = ec2_project();
+    running.status = ProjectStatus::Running;
+    running.container_id = Some("http://127.0.0.1:61301/".into());
+    running.aws.as_mut().unwrap().task_arn = Some(ec2_task_arn("e6"));
+    let w = watched_task(&running).expect("watched");
+    assert_eq!(w.group.cluster_arn, user_cluster_arn());
+    let mut fargate = aws_project(StorageMode::Ephemeral);
+    fargate.status = ProjectStatus::Running;
+    fargate.container_id = Some("http://127.0.0.1:61302/".into());
+    fargate.aws.as_mut().unwrap().task_arn = Some(task_arn("f6"));
+    assert_ne!(watched_task(&fargate).unwrap().group, w.group);
+}
+
+#[tokio::test]
+async fn stopping_an_ec2_task_by_its_arn_uses_its_cluster() {
+    let fake = Fake::default();
+    stop_task_arn(&fake, &ec2_task_arn("e7")).await.unwrap();
+    assert_eq!(*fake.stop_clusters.lock().unwrap(), [USER_CLUSTER]);
+}
+
+/// E7: the entrypoint installs the VPN skill from `VPN_SUPPORT_ENABLED`, as
+/// on Docker; an EC2 project with VPN support gets `1`, Fargate `0`.
+#[test]
+fn vpn_support_reaches_an_ec2_workspace_as_on_docker() {
+    let vpn = |p: &Project| {
+        let (pairs, _) = aws_env(p, &AppSettings::default()).unwrap();
+        pairs.into_iter().find(|(k, _)| k == "VPN_SUPPORT_ENABLED").map(|(_, v)| v)
+    };
+    let mut p = ec2_project();
+    p.vpn_support_enabled = true;
+    assert_eq!(vpn(&p).as_deref(), Some("1"));
+    p.vpn_support_enabled = false;
+    assert_eq!(vpn(&p).as_deref(), Some("0"));
+    assert_eq!(vpn(&aws_project(StorageMode::Ephemeral)).as_deref(), Some("0"));
+}
+
+/// Host settings' view of the user's EC2 capacity: the record's compute with
+/// the fit limits, none, unusable (with the reason) or unknown.
+#[test]
+fn ec2_capacity_reads_as_host_settings_need_it() {
+    use crate::aws::environments::{UserCompute, UserRecord};
+    let compute = UserCompute {
+        instance_type: "m7i.large".into(),
+        max_instances: 1,
+        user_tag: "alice".into(),
+        cluster_arn: "arn:aws:ecs:us-west-2:123456789012:cluster/triple-c-dev--u-alice".into(),
+        capacity_provider: "triple-c-dev--u-alice".into(),
+    };
+    let c = ec2_capacity_from(Some(UserRecord::Valid(compute.clone())));
+    assert_eq!(
+        c,
+        Ec2Capacity::Ec2 { compute: compute.clone(), available_cpu: Some(1920), available_memory_mib: Some(7373) }
+    );
+    let v = serde_json::to_value(&c).unwrap();
+    assert_eq!(v["state"], "ec2");
+    assert_eq!(v["compute"]["instance_type"], "m7i.large");
+    assert_eq!(v["available_memory_mib"], 7373);
+    let unknown_type = UserCompute { instance_type: "x9.huge".into(), ..compute };
+    assert!(matches!(
+        ec2_capacity_from(Some(UserRecord::Valid(unknown_type))),
+        Ec2Capacity::Ec2 { available_cpu: None, available_memory_mib: None, .. }
+    ));
+    assert_eq!(serde_json::to_value(ec2_capacity_from(Some(UserRecord::Absent))).unwrap()["state"], "none");
+    let v = serde_json::to_value(ec2_capacity_from(Some(UserRecord::Unusable("schema is not 1".into())))).unwrap();
+    assert_eq!(v, serde_json::json!({ "state": "unusable", "reason": "schema is not 1" }));
+    assert_eq!(serde_json::to_value(ec2_capacity_from(None)).unwrap(), serde_json::json!({ "state": "unknown" }));
+}
+
+/// Reconcile never marks an exec-off task Running (an app restart during a
+/// cold EC2 start): a placed or orphaned one is stopped (its ARN cleared
+/// only once the stop succeeded); a recent one still waiting is Error with
+/// its ARN kept.
+#[tokio::test]
+async fn reconcile_never_attaches_to_a_task_with_ecs_exec_off() {
+    let mut p = ec2_project();
+    p.status = ProjectStatus::Running;
+    p.aws.as_mut().unwrap().task_arn = Some(ec2_task_arn("x"));
+    let execless = |last: &str, placed: bool, created: i64| TaskInfo {
+        exec_enabled: false,
+        created_unix: Some(created),
+        ..ec2_task(&p, "x", last, false, placed)
+    };
+    let find = FindTask::new(&p, REGION, USER, Some(user_cluster_arn()));
+    let stopped_with_replaced = |f: &Fake| f.calls().contains(&format!("stop {} {REPLACED_REASON}", ec2_task_arn("x")));
+
+    // Placed: stopped, Stopped, ARN cleared.
+    let fake = Fake::default().with_task(execless("PENDING", true, now_unix()));
+    let (_d, store) = store_with(&p);
+    assert_eq!(reconcile_project(&fake, &store, &p, &find).await.unwrap(), Reconciled::Gone);
+    assert!(stopped_with_replaced(&fake), "{:?}", fake.calls());
+    let after = store.get(&p.id).unwrap();
+    assert_eq!(after.status, ProjectStatus::Stopped);
+    assert_eq!(after.aws.unwrap().task_arn, None);
+
+    // Orphaned (still waiting, but older than any start waits): the same.
+    let fake = Fake::default().with_task(execless("PROVISIONING", false, now_unix() - 3600));
+    let (_d, store) = store_with(&p);
+    assert_eq!(reconcile_project(&fake, &store, &p, &find).await.unwrap(), Reconciled::Gone);
+    assert!(stopped_with_replaced(&fake));
+    assert_eq!(store.get(&p.id).unwrap().status, ProjectStatus::Stopped);
+
+    // The stop fails: Error, the ARN kept.
+    let fake = Fake { stop_fails: true, ..Default::default() }.with_task(execless("RUNNING", true, now_unix()));
+    let (_d, store) = store_with(&p);
+    let e = reconcile_project(&fake, &store, &p, &find).await.unwrap_err();
+    assert!(e.contains("Could not stop") && e.contains("ExpiredToken"), "{e}");
+    let after = store.get(&p.id).unwrap();
+    assert_eq!(after.status, ProjectStatus::Error);
+    assert_eq!(after.aws.unwrap().task_arn, Some(ec2_task_arn("x")));
+
+    // Recent and still waiting: Interrupted (Error), ARN kept, nothing stopped.
+    let fake = Fake::default().with_task(execless("PROVISIONING", false, now_unix() - 60));
+    let (_d, store) = store_with(&p);
+    assert_eq!(reconcile_project(&fake, &store, &p, &find).await.unwrap(), Reconciled::Interrupted);
+    assert!(!fake.called("stop"));
+    let after = store.get(&p.id).unwrap();
+    assert_eq!(after.status, ProjectStatus::Error);
+    assert_eq!(after.aws.unwrap().task_arn, Some(ec2_task_arn("x")));
+    assert!(INTERRUPTED.contains("Start again"));
+}
+
+#[test]
+fn an_orphan_is_older_than_the_ec2_wait_plus_ten_minutes() {
+    assert_eq!(ORPHAN_MARGIN, Duration::from_secs(10 * 60));
+    let p = ec2_project();
+    let at = |age: i64| TaskInfo { created_unix: Some(1_000_000 - age), ..ec2_task(&p, "o", "PROVISIONING", false, false) };
+    let wait = WaitTiming::ec2();
+    assert!(!is_orphaned(&at(19 * 60), wait, 1_000_000));
+    assert!(is_orphaned(&at(21 * 60), wait, 1_000_000));
+    assert!(!is_orphaned(&TaskInfo { created_unix: None, ..at(0) }, wait, 1_000_000));
+}
+
+/// A failed read of the EC2 record does not stop an attach: the stored
+/// task's cluster is still searched. Only a new run needs the record.
+#[tokio::test]
+async fn an_ec2_record_read_error_still_attaches_and_fails_only_a_new_run() {
+    let mut p = ec2_project();
+    p.aws.as_mut().unwrap().task_arn = Some(ec2_task_arn("e8"));
+    let live = ec2_task(&p, "e8", "RUNNING", true, true);
+    let fake = Fake {
+        user_record_fails: true,
+        listed_by_cluster: Some(HashMap::from([(user_cluster_arn(), vec![live.arn.clone()])])),
+        ..Default::default()
+    }
+    .with_task(live);
+    let (r, _) = start(&fake, &p).await;
+    let started = r.unwrap();
+    assert!(!started.created);
+    assert_eq!(started.task.arn, ec2_task_arn("e8"));
+    assert_eq!(*fake.list_clusters.lock().unwrap(), [cluster_arn(), user_cluster_arn()]);
+
+    // Nothing live: the start fails with the read error, before any write.
+    let fake = Fake { user_record_fails: true, ..Default::default() };
+    let (r, _) = start(&fake, &p).await;
+    let e = r.err().unwrap();
+    assert!(e.contains("Could not read your EC2 capacity record") && e.contains("Throttling"), "{e}");
+    assert!(!fake.called("put-secret") && !fake.called("run"));
+}

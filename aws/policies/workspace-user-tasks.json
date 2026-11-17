@@ -85,6 +85,44 @@
           "aws:ResourceTag/triple-c:component": "false"
         }
       }
+    },
+    {
+      "Sid": "RunOnlyOnOwnEc2Cluster",
+      "Effect": "Deny",
+      "Action": [
+        "ecs:RunTask",
+        "ecs:StartTask"
+      ],
+      "Resource": [
+        "*"
+      ],
+      "Condition": {
+        "ArnLike": {
+          "ecs:cluster": "arn:aws:ecs:*:*:cluster/triple-c-*--u-*"
+        },
+        "ArnNotLike": {
+          "ecs:cluster": "arn:aws:ecs:*:*:cluster/triple-c-*--u-${aws:PrincipalTag/triple-c-user}"
+        }
+      }
+    },
+    {
+      "Sid": "NoEc2ClusterWithoutUserTag",
+      "Effect": "Deny",
+      "Action": [
+        "ecs:RunTask",
+        "ecs:StartTask"
+      ],
+      "Resource": [
+        "*"
+      ],
+      "Condition": {
+        "ArnLike": {
+          "ecs:cluster": "arn:aws:ecs:*:*:cluster/triple-c-*--u-*"
+        },
+        "Null": {
+          "aws:PrincipalTag/triple-c-user": "true"
+        }
+      }
     }
   ]
 }
