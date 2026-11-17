@@ -112,6 +112,28 @@ pub fn ec2_cluster_of_task(env: &str, task_arn: &str) -> Option<String> {
         .and_then(|_| cluster_arn_of_task(task_arn))
 }
 
+/// Where a project's task may be: `env_cluster` (the environment's), then
+/// the user's EC2 cluster from their record, then the per-user cluster
+/// `stored_task_arn` names (the record may be gone while that task runs),
+/// without repeats.
+pub fn project_task_clusters(
+    env: &str,
+    env_cluster: String,
+    ec2_cluster: Option<String>,
+    stored_task_arn: Option<&str>,
+) -> Vec<String> {
+    let mut out = vec![env_cluster];
+    for c in [ec2_cluster, stored_task_arn.and_then(|a| ec2_cluster_of_task(env, a))]
+        .into_iter()
+        .flatten()
+    {
+        if !out.contains(&c) {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Whether the caller's task role exists in the environment: the onboarding
 /// signal a workspace user can read. A denied lookup is not an answer, so
 /// it is let through (RunTask will say what is wrong).
@@ -296,18 +318,12 @@ pub async fn remove_workspace_resources<T: TaskApi, W: WorkspaceApi, R: RuntimeA
     // 1. The task: in the environment's cluster, the user's EC2 cluster (the
     // record's, and the stored task's when that is a per-user cluster of
     // this environment — the record may be gone).
-    let mut clusters = vec![cluster.clone()];
-    for c in [
+    let clusters = project_task_clusters(
+        req.env,
+        cluster.clone(),
         req.ec2_cluster.map(str::to_string),
-        req.stored_task_arn.and_then(|a| ec2_cluster_of_task(req.env, a)),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if !clusters.contains(&c) {
-            clusters.push(c);
-        }
-    }
+        req.stored_task_arn,
+    );
     let mut to_stop: Vec<(String, String)> = Vec::new();
     for c in &clusters {
         if let Some(t) =
