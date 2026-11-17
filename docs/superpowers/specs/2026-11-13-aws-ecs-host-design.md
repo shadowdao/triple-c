@@ -834,6 +834,21 @@ detached runner, detection, self-onboarding, an update ("No changes"), destroy; 
   file-system policy accepted the just-created task role; conditional `DeleteObject` (`If-Match`)
   on the versioned bucket returns 412 on a stale ETag.
 
+- **ECS on EC2, measured 2026-11-16** (phase 7, `aws/README.md` "Phase 7: ECS on EC2"):
+  - A per-user capacity (cluster, capacity provider, Auto Scaling group at 0, launch template)
+    applies as the environment admin once the scaling file stops requiring
+    `autoscaling:InstanceTypes`. A template-only group create doesn't send it, so the create's
+    own launch check (`ec2:InstanceType`) is what holds the type.
+  - ECS turns `enableExecuteCommand` off on a RunTask that has to wait for an instance, so a cold
+    start runs the task a second time once the instance is up. A cold start takes about 4 minutes.
+  - Bridge networking works for the agent tunnel (ECS Exec port forward), Docker access (host
+    socket) and VPN (`NET_ADMIN`, `/dev/net/tun`, `src_valid_mark`).
+  - Bubblewrap **does not** work in an ECS task on EC2 either (Docker's seccomp profile), so the
+    sandbox stays off on AWS.
+  - IMDS gives a bridge container no token. The agent's introspection port is reachable from it
+    (metadata only).
+  - The `triple-c-user` principal tag (a role tag) confines RunTask to the user's own cluster.
+
 Still to verify: the `existing` network mode against a user's own VPC. Fargate tasks in the
 deployed environment were run in phase 5 (`aws/README.md`).
 

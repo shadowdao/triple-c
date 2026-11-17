@@ -554,66 +554,55 @@ aws iam attach-user-policy --user-name <user> \
   `containerOverrides`: every workspace user can read them through `ecs:Describe*` on `*`. Use
   Secrets Manager (`triple-c/*`) references instead.
 
-**Phase 7 (per-user EC2 capacity): still open until the live run (Task 7)**
+**Phase 7 (per-user EC2 capacity): the live run's answers (Task 7, 2026-11-16)**
 
-The unit tests' evaluator is not IAM; these points of the compute file and the boundary are
-expected, not verified:
+The unit tests' evaluator is not IAM. What the live run (see "Phase 7: ECS on EC2" below) settled,
+and what is still open:
 
-- **Creating an Auto Scaling group checks the caller's launch permissions.** Expected: a dry run
-  of `ec2:RunInstances` from the launch template as the admin, with `ec2:LaunchTemplate` set on
-  every resource, the template's own tags visible, `ec2:Owner = amazon` on the image, and
-  `iam:PassRole` of the instance role to `ec2.amazonaws.com`. If the dry run omits
-  `ec2:LaunchTemplate` on some resource, the group's create is denied and that statement needs
-  another condition.
-- **`iam:AddRoleToInstanceProfile`** is expected to need `iam:PassRole` of the role; which
-  `iam:PassedToService` IAM sends then (if any) is unknown, and only `ec2.amazonaws.com` is allowed.
-- **`ecs:PutClusterCapacityProviders`** may be authorized against the capacity provider as well as
-  the cluster (both are allowed); **`ecs:CreateCapacityProvider`** may check the caller's
-  `autoscaling:Describe*` on the group (allowed) or create ECS's service-linked role (allowed).
-- **Service-linked roles.** The Auto Scaling and ECS roles exist in most accounts already;
-  creating them is allowed only for those two services. Whether creating a group in an account
-  without one creates it as the caller (needing this grant) is not verified.
-- **The instance role's agent calls** (`ecs:Poll`, `StartTelemetrySession`,
-  `UpdateContainerInstancesState`) are expected to be authorized against
-  `container-instance/<cluster>/<id>` and the rest against the cluster; the boundary allows both.
-- **The public AMI parameter's ARN** has no account (`arn:aws:ssm:<region>::parameter/aws/…`);
-  `arn:aws:ssm:*::parameter/aws/service/ecs/optimized-ami/*` is expected to match it.
-- **Version pinning.** `autoscaling:LaunchTemplateVersionSpecified` is expected to be `true` for a
-  numeric version and `false` for `$Latest`/`$Default`, and absent on an update that names no
-  template (allowed by `BoolIfExists`, so the drain before destroy works). Probe: create a group
-  with `$Latest` as the admin; it must be denied.
-- **`ec2:IsLaunchTemplateResource`** is expected to be `true` on the image and security group the
-  template names, and `aws:RequestTag` to carry the template's tag specifications for the instance
-  and volume. If the group's launch check doesn't send either, that statement denies the create.
-- ~~**`autoscaling:InstanceTypes`** required on a group create.~~ **Verified live (phase 7):** a
-  template-only create sends **no** `autoscaling:InstanceTypes`, so the `Null: false` denied every
-  group (the first live onboarding failed on it); it is dropped. Creating a group runs the caller's
-  own `ec2:RunInstances` check on the template ("You are not authorized to use launch template"
-  otherwise), so `ec2:InstanceType` holds the type; a `MixedInstancesPolicy` override of an
-  unsupported type is denied by both checks.
-- **Instance types in templates.** `ec2:CreateLaunchTemplate`/`CreateLaunchTemplateVersion` are
-  not known to support `ec2:InstanceType` (not in the service authorization reference as I know
-  it), so a template may *name* any type; it can only be *launched* (directly or by a group) with a
-  supported one. Probe: create a version with `p5.48xlarge` and pin a group to it; the group
-  create must be denied.
-- **`aws:PrincipalTag/triple-c-user` from Identity Center** attributes for access control is
-  expected in the SSO session's request context, and `${aws:PrincipalTag/triple-c-user}` in
-  `ArnNotLike` to resolve from it. Probe: as a tagged and an untagged user, `RunTask` on a
-  per-user cluster.
-- **Tags at group create.** If `CreateAutoScalingGroup` with tags also needs
-  `autoscaling:CreateOrUpdateTags`, it is denied (that is allowed only on an already-tagged
-  group); then add it to the create statement with the same conditions.
-- **A `triple-c-*` capacity provider pointing at someone else's group.** Whether
-  `CreateCapacityProvider` checks the caller's rights on the named Auto Scaling group is unknown;
-  if it does not, an admin could put a non-Triple-C group under a Triple-C capacity provider (and
-  ECS's managed scaling would then scale it). Probe: create one naming an untagged group.
-- **`aws:PrincipalTag` for the instance role**: the role's session is expected to carry its role
-  tags, so `${aws:PrincipalTag/triple-c:cluster}` resolves for the agent's calls.
-- **IMDS and Docker access.** Tasks use `awsvpc`, with `ECS_AWSVPC_BLOCK_IMDS=true` and a hop
-  limit of 1 so a task can't read the instance role. A project with Docker access mounts the
-  host's socket, so its user can start a host-network container and read IMDS (and so the
-  instance role): accepted, since Docker access is root on the user's own instance; the boundary
-  keeps that role on the user's own cluster.
+- ✓ **Creating an Auto Scaling group checks the caller's launch permissions.** The onboarding's
+  group create as the environment admin (only the four admin files) passed with no denial. A group
+  pinned to a template version naming `p5.48xlarge` was refused with "You are not authorized to
+  use launch template", so the create does run the caller's `ec2:RunInstances` check, with
+  `ec2:LaunchTemplate`, `ec2:IsLaunchTemplateResource`, the template's tags and the instance role's
+  `iam:PassRole` all as the statements expect.
+- ✓ **`iam:AddRoleToInstanceProfile`, `ecs:PutClusterCapacityProviders`,
+  `ecs:CreateCapacityProvider`**, the public AMI parameter read, and tags at group create
+  (`autoscaling:CreateOrUpdateTags` was not needed separately): all passed in the real apply,
+  with no denial. Which context keys each one sent is not visible; the policy is not narrowed further.
+- — **Service-linked roles.** The test account already had both. Creating them as the admin is
+  still unverified.
+- ✓ **The instance role's agent calls**, under the boundary: the instance registered into the user's
+  cluster, polled, and ran tasks. ECR pulls through the execution role and logs worked too. So the
+  `triple-c:cluster` role tag resolves as `${aws:PrincipalTag/triple-c:cluster}`.
+- ✓ **Version pinning.** `$Latest` and `$Default` are denied, and a numeric version is allowed (a
+  probe group with min/max 0, created and deleted as the admin).
+- ✗→fixed **`autoscaling:InstanceTypes` required on a group create.** A template-only create sends
+  **no** `autoscaling:InstanceTypes`, so the `Null: false` denied every group (the first live
+  onboarding failed on it). It is dropped. Creating a group runs the caller's own
+  `ec2:RunInstances` check on the template, so `ec2:InstanceType` holds the type. A
+  `MixedInstancesPolicy` override of an unsupported type is denied by both checks
+  (`ForAllValues` on the key once present, and the launch check).
+- ✓ **Instance types in templates.** The admin *can* create a template version naming
+  `p5.48xlarge` (as expected, no condition key). A group pinned to it is denied by the launch check.
+- ✓ **`aws:PrincipalTag/triple-c-user`** from a **role tag**: the tagged workspace role's session
+  ran tasks on its own `--u-<tag>` cluster. `RunTask` on another `--u-<other>` cluster was denied,
+  and the app shows the wrong-triple-c-user message. — An Identity Center attribute and an
+  untagged user were not tried. The policy's tag test is the same for both, so this is expected
+  to hold.
+- ✓ **A `triple-c-*` capacity provider over someone else's group** is refused. ECS checks the
+  caller's `autoscaling:CreateOrUpdateTags` on the named group ("you do not have
+  autoscaling:CreateOrUpdateTags permissions to create tags on the Auto Scaling group"), which the
+  admin tier allows only on component-tagged `triple-c-*--u-*` groups.
+- **IMDS and Docker access.** EC2 tasks use `bridge` networking (R2), and the template sets IMDSv2
+  with a hop limit of 1. Live: from the workspace container, the token `PUT` gets no answer
+  (curl times out) and an IMDSv1 `GET` gets 401, so no instance-role credentials. The task role's
+  credentials (169.254.170.2) work. The ECS agent's introspection API **is** reachable on the
+  bridge gateway (`172.17.0.1:51678`, 200). It returns the cluster, the container instance and
+  the instance's tasks, and no credentials. That is accepted: the instance runs only its user's
+  tasks (E1). A project with Docker access has the host's socket (group `docker-host`, `docker
+  ps` works as `claude`), so its user can start a host-network container and read IMDS (and so the
+  instance role). That is accepted too: Docker access is root on the user's own instance, and
+  the boundary keeps that role on the user's own cluster.
 
 **Phase 6**
 
@@ -814,3 +803,44 @@ spend under $0.05.
 | Cost estimate | ✓ `fetch_rates` as the workspace user + `estimate`: $0.0495/hour for 1 vCPU / 2 GiB / 21 GiB x86, `efs_billed_separately` |
 | Removal with discard | ✓ `remove_aws_resources(…, true)` Ok; both access points gone; the secret deleted |
 | Cleanup | ✓ nothing `triple-c` left in us-west-2 (the run's environment KMS key pending deletion). The guard's task-definition retirement had never matched anything (ECS's `familyPrefix` is a whole family name); fixed, and 13 revisions earlier runs had left ACTIVE were deregistered and deleted |
+
+### Phase 7: ECS on EC2 (2026-11-16)
+
+```sh
+TRIPLEC_E2E_TEST=aws::live_tests::environment::a_phase7_ec2_workspace_round_trips \
+TRIPLEC_AWS_E2E_PROFILE=<admin profile> TRIPLEC_AWS_E2E_REGION=us-west-2 scripts/aws-e2e-workspace.sh
+```
+
+Same fixture as phase 5. The account admin applies the current boundary (the account had none,
+so it is created and destroyed again). The environment admin role holds all four admin files.
+The workspace role carries the role tag `triple-c-user=<tag>`, which an assumed-role session has
+as a principal tag. The admin onboards it with `m7i.large`, at most 1 instance, through the app's
+own pre-apply step (`prepare_onboarding`: record, choice, name-collision check). The project is
+EC2, Hybrid, 1024 CPU units / 4096 MiB reserved, with Docker access, VPN and sandbox mode on, and
+no repos. The guard (`ec2_cleanup`, as the account admin) stops the per-user clusters' tasks,
+force-deletes their groups (waiting until they are gone), terminates any instance tagged with the
+environment, then deletes capacity providers, container instances, clusters (retried while busy),
+launch templates, the user record and the instance role and profile. After that the fixture
+destroys the modules. `TRIPLEC_E2E_PAUSE_SECS` holds a failed first start for inspection before
+the guard runs.
+
+| Point | Result |
+|---|---|
+| Onboarding with EC2 | ✓ after the `InstanceTypes` fix (the first run's group create was denied, see above). Applied in 93 s: cluster `triple-c-<env>--u-<tag>` ACTIVE with exactly its capacity provider as the default strategy; group min 0, max 1, desired 0, template pinned to version 1, scale-in protection on, tagged with component/environment/owner/version; capacity provider with managed scaling at target 100 and managed termination protection; launch template `m7i.large`, the current ECS-optimized AL2023 AMI, IMDSv2 required, hop limit 1; instance profile holding the instance role; the user record reads `Valid` as the workspace user |
+| Collision check | ✓ `DescribeClusters include=TAGS` as the admin tier returns the cluster's `triple-c:owner` tag. A missing name answers `None` for both the cluster (a `failures` entry) and the group. Onboarding another owner with the same `triple-c-user` value is refused: "An ECS cluster named … already belongs to another onboarding" |
+| Admin-tier probes | ✓ `$Latest` denied; pinned version allowed and deleted; a `p5.48xlarge` template version created but a group pinned to it denied; a capacity provider over an untagged group denied (see "Phase 7" under Known gaps) |
+| **ECS Exec on a cold start** | ✗→fixed (app). ECS turns `enableExecuteCommand` **off** on a RunTask that has to wait for an instance (the task goes PROVISIONING behind the capacity provider). CloudTrail shows `true` in the request and `false` in the answer, and the task keeps it off once placed, so the ExecuteCommandAgent never starts and every cold start timed out ("ECS Exec agent not running yet"). The same RunTask with an instance up and room keeps it `true`, and one that has to wait gets `false` even with an instance up. A cold start now lets that first task bring the instance up. Once the task is placed, the app stops it, waits until it has stopped and runs the task again onto the instance (`rerun_once_placed`). A live task found with ECS Exec off is stopped and replaced |
+| Cold start | ✓ 249 s (run 4) and 203 s (run 5) from Start to connected. Run 4: RunTask at +4 s; "Starting an instance" until +186 s (instance launch, ECS registration and placement of the first task, which is then stopped); the second task ready and the tunnel at +248 s |
+| Agent tunnel, bridge mode | ✓ the ECS Exec port forward reaches the agent on the container's own loopback (`echo` through the agent as `claude`); the task definition is `bridge`/`EC2` with the `docker-socket` host volume |
+| Docker access | ✓ `/var/run/docker.sock` is `root:docker-host 0660`, and `claude` is in `docker-host`; `docker ps` as `claude` lists the workspace and the ECS agent (Docker 25.0.18) |
+| VPN | ✓ as root: `ip link add wg0 type wireguard` and `ip tuntap add tun0 mode tun` both work; `/dev/net/tun` is there; `net.ipv4.conf.all.src_valid_mark = 1`; `sudo ip link add … wireguard` works as `claude` |
+| E8 bubblewrap | ✗→decided. `bwrap --unshare-user` and `--unshare-all` fail with "No permissions to create new namespace", although the kernel (6.1, AL2023) allows user namespaces (`max_user_namespaces` 30937). Docker's default seccomp profile refuses `unshare` without `CAP_SYS_ADMIN`. The sandbox is kept off on EC2 as on Fargate (`sandbox_allowed`, the Runtime toggle) |
+| IMDS / introspection | see "IMDS and Docker access" above: no token (hop limit 1), IMDSv1 401, task-role credentials work, introspection reachable on the bridge gateway (metadata only) |
+| Isolation | ✓ `RunTask` on another user's cluster (`triple-c-<env>--u-<other>`, created empty by the admin) as the tagged workspace user is denied, and the app's error is the wrong-triple-c-user one ("This EC2 capacity belongs to a different triple-c-user value than your sign-in's …") |
+| Stop | ✓ STOPPED 6 s after `stop_project` |
+| Scale-in to zero | ✓ from the group's activity history (run 4). The task STOPPED at 00:55:42Z. At 01:11:08Z managed scaling's low alarm set desired capacity 1 → 0. Scale-in protection first held the instance ("all remaining instances are protected from scale-in"). ECS then removed it from the now-idle instance, which was terminated at 01:11:59–01:12:44Z. That is **about 15.5 minutes to the scale-in decision and 17 minutes until the instance is gone**. The cold start's scale-out is similar: the high alarm fired about 3 minutes after the RunTask, and the instance was running a minute later |
+| Second start | ✓ warm, right after stop 1 with the instance still up: 29 s (no instance wait, image cached, ECS Exec on at once). After a scale-in a start is cold again (≈ 3.5–4 min) |
+| Removal | ✓ `remove_aws_resources(…, true)` after stop 2: Ok (task, secret, access point) |
+| Re-apply without EC2, instance still up | ✓ `prepare_onboarding(…, None)` then the apply as the environment admin, 79 s: "0 added, 0 changed, 9 destroyed". The provider drained the group (the instance was InService, scale-in protected) and deleted it; after the apply no group, no live instance, capacity provider INACTIVE, cluster INACTIVE, launch template gone, instance profile and role gone, the user record Absent (as the workspace user). No denied action |
+| Offboard and destroy | ✓ as the environment admin: onboarding destroy (9) and environment destroy (15) with no denied action; the account admin's boundary destroy after |
+| Runs and cleanup | Five runs. Run 1: the `InstanceTypes` denial. Run 2: ECS Exec off on the cold start. Run 3: inspection over SSM (Session Manager core attached by hand to the instance role, boundary removed, both undone before the teardown), the ECS Exec diagnosis and the in-task checks. Run 4: everything to the scale-in, which the guard could not finish because the credentials expired. Run 5, `TRIPLEC_E2E_PHASE7_SHORT=1` (life cycle only): passed in 577 s. Every run's guard, or by hand with tofu destroy from the run's work folders once the credentials were renewed, left nothing: the final inventory of us-west-2 has no instance, group, launch template, Triple-C capacity provider, cluster, `triple-c*` role, policy or instance profile, `/triple-c` parameter, log group, ECR repository, file system, secret, task definition, VPC, state bucket or boundary. The environments' KMS keys are pending deletion (7 days). Spend: about 1.5 m7i.large instance-hours plus minutes of EFS and public IPv4, under $0.30 |
