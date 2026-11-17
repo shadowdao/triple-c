@@ -10,6 +10,7 @@ import {
   NOT_ON_AWS,
   SANDBOX_OFF_ON_AWS,
   isAwsProject,
+  sandboxEffective,
 } from "../../../../lib/awsWorkspace";
 
 interface Props {
@@ -55,7 +56,7 @@ export default function RuntimeSection({
           control={
             <Toggle
               label="Sandbox mode"
-              checked={sandboxOff ? false : project.sandbox_mode_enabled}
+              checked={sandboxEffective(project)}
               disabled={disabled || sandboxOff}
               onChange={(v) => save({ sandbox_mode_enabled: v })}
             />

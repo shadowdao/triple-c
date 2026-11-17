@@ -1,5 +1,6 @@
 import type { PermissionMode, Project } from "../../lib/types";
 import SegmentedControl, { type Segment } from "../ui/SegmentedControl";
+import { sandboxEffective } from "../../lib/awsWorkspace";
 
 export const PERMISSION_MODES: Segment<PermissionMode>[] = [
   { value: "plan", label: "Plan", hint: "Claude proposes a plan and makes no changes." },
@@ -56,7 +57,7 @@ export default function PermissionModeControl({
   disabledReason,
 }: Props) {
   const mode = effectivePermissionMode(project);
-  const sandboxOn = project.sandbox_mode_enabled;
+  const sandboxOn = sandboxEffective(project);
   const uncontainedBypass = mode === "bypass" && !sandboxOn;
 
   const segments = PERMISSION_MODES.map((segment) =>

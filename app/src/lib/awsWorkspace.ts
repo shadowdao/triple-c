@@ -21,6 +21,13 @@ export function isAwsProject(p: Pick<Project, "host_id">): boolean {
   return p.host_id != null;
 }
 
+/** Whether Claude Code's sandbox actually runs for `p`: never on AWS (the
+ *  host forces it off there; Rust `aws_host::sandbox_allowed`), else the
+ *  project's setting. */
+export function sandboxEffective(p: Pick<Project, "host_id" | "sandbox_mode_enabled">): boolean {
+  return !isAwsProject(p) && p.sandbox_mode_enabled;
+}
+
 /** Fargate CPU sizes (units of 1/1024 vCPU). */
 export const FARGATE_CPUS = [256, 512, 1024, 2048, 4096, 8192, 16384] as const;
 

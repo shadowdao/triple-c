@@ -149,4 +149,11 @@ describe("PermissionModeControl", () => {
       /Caution/i,
     );
   });
+
+  it("shows the sandbox OFF on an AWS project whatever the setting says", () => {
+    const aws = { ...baseProject, host_id: "aws-1", sandbox_mode_enabled: true, permission_mode: "bypass" as const };
+    render(<PermissionModeControl project={aws} onChange={vi.fn()} />);
+    expect(screen.getByTestId("sandbox-state")).toHaveTextContent(/Sandbox OFF/);
+    expect(screen.getByTestId("permission-mode-hint")).toHaveTextContent(/Caution/i);
+  });
 });
