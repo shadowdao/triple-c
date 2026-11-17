@@ -83,7 +83,7 @@ export default function DeployEnvironmentModal({
 
   const createBoundary = async () => {
     setBoundaryError(null);
-    const err = await boundary.start(BOUNDARY_STATE_KEY, region, "Permissions boundary", () =>
+    const err = await boundary.start(BOUNDARY_STATE_KEY, region, "boundary", "Permissions boundary", () =>
       deployAwsPermissionsBoundary(connectionId, region),
     );
     if (err?.kind === "access_denied") setBundle({ reason: awsErrorMessage(err) });

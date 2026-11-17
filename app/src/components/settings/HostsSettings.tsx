@@ -67,7 +67,7 @@ function ErrorLine({
       <span className="min-w-0 break-words">{awsErrorMessage(failure.error)}</span>
       {failure.error.kind === "sso_expired" && !onSignIn && (
         <span>
-          Sign in with <code>aws sso login --profile {failure.error.profile}</code> and try again.
+          Sign in with <code className="break-all">aws sso login --profile {failure.error.profile}</code> and try again.
         </span>
       )}
       {failure.error.kind === "sso_expired" && onSignIn && (

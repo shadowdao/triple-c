@@ -13,10 +13,18 @@ import Button from "../../ui/Button";
 import Modal from "../../ui/Modal";
 import StatusIndicator from "../../ui/StatusIndicator";
 
+/**
+ * What a run does. Decisions about a run (such as offering an admin bundle
+ * when AWS refuses it) key on this, never on its label: a follow of an
+ * existing environment's deploy is labelled like a new deploy.
+ */
+export type RunKind = "deploy" | "follow" | "repair" | "update" | "destroy" | "onboard" | "push" | "boundary";
+
 /** One OpenTofu run this view is showing: a start, or a follow of one already running. */
 export interface DeployRun {
   stateKey: string;
   region: string;
+  kind: RunKind;
   label: string;
   /** Null until the starting command resolves. */
   opId: string | null;
@@ -57,7 +65,13 @@ export function useDeployRuns(
   }, []);
 
   const start = useCallback(
-    async (stateKey: string, region: string, label: string, run: () => Promise<string>): Promise<AwsError | null> => {
+    async (
+      stateKey: string,
+      region: string,
+      kind: RunKind,
+      label: string,
+      run: () => Promise<string>,
+    ): Promise<AwsError | null> => {
       const k = runKey(region, stateKey);
       subs.current.get(k)?.unlisten?.();
       const sub: Subscription = { unlisten: null };
@@ -94,7 +108,7 @@ export function useDeployRuns(
 
       setRuns((prev) => ({
         ...prev,
-        [k]: { stateKey, region, label, opId: null, events: [], done: false, cancellable: false, result: null },
+        [k]: { stateKey, region, kind, label, opId: null, events: [], done: false, cancellable: false, result: null },
       }));
 
       const unlisten = await listen<ProgressPayload>(AWS_DEPLOY_PROGRESS_EVENT, ({ payload }) => {

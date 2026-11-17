@@ -168,6 +168,43 @@ describe("EnvironmentsPanel", () => {
     expect(within(screen.getByRole("dialog")).getByRole("button", { name: "Save bundle to folder…" })).toBeInTheDocument();
   });
 
+  it("never offers a new-environment bundle for a refused follow of an existing deploy", async () => {
+    const key = "environments/dev/terraform.tfstate";
+    backend(
+      () => scan({ environments: [env({ actions: ["follow"], state: { state: "ready" } })] }),
+      (cmd) => {
+        if (cmd === "follow_aws_deployment") return "f9";
+        throw new Error(`unexpected ${cmd}`);
+      },
+    );
+    render(<EnvironmentsPanel connection={conn} tier="workspace_user" />);
+    await open();
+    await waitFor(() => expect(invoke.mock.calls.some((c) => c[0] === "follow_aws_deployment")).toBe(true));
+    await screen.findByRole("region", { name: "Deploy of dev progress" });
+    emit(
+      progress({
+        op_id: "f9",
+        state_key: key,
+        events: [tofuEvent("AccessDenied: User is not authorized to perform ecs:UpdateService", { level: "error" })],
+      }),
+    );
+    emit(progress({ op_id: "f9", state_key: key, done: true, cancellable: false, result: { ok: false, exit_code: 1, summary: null } }));
+    expect(await screen.findByText(/Failed \(exit 1\)/)).toBeInTheDocument();
+    expect(screen.queryByTestId("denied-hint")).toBeNull();
+  });
+
+  it("marks the not-an-admin disclosure open or closed like the Environments toggle", async () => {
+    backend(() => scan());
+    render(<EnvironmentsPanel connection={conn} tier="workspace_user" />);
+    await open();
+    const options = await screen.findByTestId("not-admin-options");
+    const summary = options.querySelector("summary")!;
+    expect(summary).toHaveTextContent("▸");
+    (options as HTMLDetailsElement).open = true;
+    fireEvent(options, new Event("toggle"));
+    await waitFor(() => expect(summary).toHaveTextContent("▾"));
+  });
+
   it("shows a refused deploy's AWS message and offers the bundle", async () => {
     backend(
       () => scan(),

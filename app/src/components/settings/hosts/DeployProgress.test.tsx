@@ -29,10 +29,10 @@ describe("useDeployRuns", () => {
     const onDone = vi.fn();
     const { result } = renderHook(() => useDeployRuns(onDone));
     await act(async () => {
-      await result.current.start(KEY, "eu-west-1", "Deploy of main", async () => "eu");
+      await result.current.start(KEY, "eu-west-1", "deploy", "Deploy of main", async () => "eu");
     });
     await act(async () => {
-      await result.current.start(KEY, "us-east-1", "Deploy of main", async () => "us");
+      await result.current.start(KEY, "us-east-1", "deploy", "Deploy of main", async () => "us");
     });
     expect(handlers.size).toBe(2);
     emit(progress({ op_id: "eu", state_key: KEY, events: [tofuEvent("eu line")] }));
@@ -54,8 +54,8 @@ describe("useDeployRuns", () => {
   it("removes its progress listeners on unmount", async () => {
     const { result, unmount } = renderHook(() => useDeployRuns());
     await act(async () => {
-      await result.current.start(KEY, "eu-west-1", "Deploy of main", async () => "a");
-      await result.current.start("boundary/terraform.tfstate", "eu-west-1", "Boundary", async () => "b");
+      await result.current.start(KEY, "eu-west-1", "deploy", "Deploy of main", async () => "a");
+      await result.current.start("boundary/terraform.tfstate", "eu-west-1", "deploy", "Boundary", async () => "b");
     });
     expect(handlers.size).toBe(2);
     unmount();
@@ -66,7 +66,7 @@ describe("useDeployRuns", () => {
     const { result } = renderHook(() => useDeployRuns());
     let err: unknown;
     await act(async () => {
-      err = await result.current.start(KEY, "eu-west-1", "Deploy of main", async () => {
+      err = await result.current.start(KEY, "eu-west-1", "deploy", "Deploy of main", async () => {
         throw { kind: "other", message: "A deployment is already running" };
       });
     });
@@ -84,6 +84,7 @@ describe("DeployProgress layout", () => {
         run={{
           stateKey: KEY,
           region: "eu-west-1",
+          kind: "deploy",
           label: "Deploy of main",
           opId: "x",
           events: [],

@@ -44,8 +44,10 @@ export function awsErrorMessage(e: AwsError): string {
   }
 }
 
-// The codes `aws::error` maps to access_denied, and how AWS words a refusal in OpenTofu's output.
-const DENIED = /AccessDenied|UnauthorizedOperation|not authorized to perform|explicit deny/i;
+// The codes `aws::error` maps to access_denied, and how AWS words a refusal in
+// OpenTofu's output. A bare "explicit deny" is left out: an SCP or bucket
+// policy deny isn't something an admin bundle fixes.
+const DENIED = /AccessDenied|UnauthorizedOperation|not authorized to perform/i;
 
 /** Whether a line of OpenTofu output (or a run's summary) reads as AWS refusing a permission. */
 export function looksDenied(text: string | null | undefined): boolean {

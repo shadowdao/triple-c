@@ -36,5 +36,6 @@ describe("access denied", () => {
     expect(looksDenied("api error UnauthorizedOperation: You are not authorized")).toBe(true);
     expect(looksDenied("Error: creating VPC: VpcLimitExceeded")).toBe(false);
     expect(looksDenied(null)).toBe(false);
+    expect(looksDenied("blocked by an explicit deny in a service control policy")).toBe(false);
   });
 });

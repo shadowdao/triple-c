@@ -34,7 +34,7 @@ import AdminBundleModal from "./AdminBundleModal";
 import UpdateEnvironmentModal from "./UpdateEnvironmentModal";
 import DeployEnvironmentModal from "./DeployEnvironmentModal";
 import JoinEnvironmentModal from "./JoinEnvironmentModal";
-import DeployProgress, { runKey, useDeployRuns, type DeployRun } from "./DeployProgress";
+import DeployProgress, { runKey, useDeployRuns, type DeployRun, type RunKind } from "./DeployProgress";
 import PolicyFiles from "./PolicyFiles";
 import {
   COMMON_REGIONS,
@@ -134,18 +134,18 @@ const recordedEc2 = (e: DetectedEnvironment): UserCompute | null =>
 const rowKey = (region: string, name: string) => `${region}:${name}`;
 
 /**
- * A failed deploy or onboarding that AWS refused a permission for: the bundle
- * for an admin is the way on. Repairs and updates of an existing environment
- * aren't offered one (an admin bundle deploys a new environment).
+ * A failed new deploy or self-onboarding started here that AWS refused a
+ * permission for: the bundle for an admin is the way on. Only those two
+ * kinds: an environment bundle deploys a *new* environment, so a follow,
+ * repair or update of an existing one is never offered it.
  */
 function deniedRun(r: DeployRun): "environment" | "user_onboard" | null {
+  if (r.kind !== "deploy" && r.kind !== "onboard") return null;
   if (!r.done || !r.result || r.result.ok) return null;
   const denied =
     looksDenied(r.result.summary) || r.events.some((e) => e.level === "error" && looksDenied(e.message));
   if (!denied) return null;
-  if (r.stateKey.startsWith("users/")) return "user_onboard";
-  if (r.stateKey.startsWith("environments/") && r.label.startsWith("Deploy of ")) return "environment";
-  return null;
+  return r.kind === "deploy" ? "environment" : "user_onboard";
 }
 
 /** The environment a run's state key belongs to, if any. */
@@ -195,6 +195,7 @@ export default function EnvironmentsPanel({
   // onboarding that didn't finish has no record to start from.
   const lastEc2 = useRef(new Map<string, Ec2Compute>());
   const [copyNote, setCopyNote] = useState<string | null>(null);
+  const [notAdminOpen, setNotAdminOpen] = useState(false);
   const request = useRef(0);
   const followed = useRef(new Set<string>());
 
@@ -229,11 +230,18 @@ export default function EnvironmentsPanel({
 
   /** Start a run in `runRegion` (always the region of the scan the action came from). */
   const launch = useCallback(
-    async (runRegion: string, envName: string, stateKey: string, label: string, run: () => Promise<string>) => {
+    async (
+      runRegion: string,
+      envName: string,
+      stateKey: string,
+      kind: RunKind,
+      label: string,
+      run: () => Promise<string>,
+    ) => {
       const rk = rowKey(runRegion, envName);
       setRowErrors(({ [rk]: _gone, ...rest }) => rest);
       setPending((p) => ({ ...p, [rk]: true }));
-      const err = await start(stateKey, runRegion, label, run);
+      const err = await start(stateKey, runRegion, kind, label, run);
       setPending(({ [rk]: _gone, ...rest }) => rest);
       if (err) setRowErrors((r) => ({ ...r, [rk]: err }));
       return err;
@@ -249,7 +257,7 @@ export default function EnvironmentsPanel({
       const seen = runKey(scan.region, key);
       if (!runs[seen] && !followed.current.has(seen)) {
         followed.current.add(seen);
-        void launch(scan.region, name, key, label, () => followAwsDeployment(connection.id, scan.region, key));
+        void launch(scan.region, name, key, "follow", label, () => followAwsDeployment(connection.id, scan.region, key));
       }
     };
     for (const e of scan.environments) {
@@ -280,16 +288,16 @@ export default function EnvironmentsPanel({
   const stale = detecting || !current;
 
   const deploy = (runRegion: string, name: string, network: NetworkChoice, hours: number) =>
-    launch(runRegion, name, environmentStateKey(name), `Deploy of ${name}`, () =>
+    launch(runRegion, name, environmentStateKey(name), "deploy", `Deploy of ${name}`, () =>
       deployAwsEnvironment(connection.id, runRegion, name, network, hours),
     );
   // Without `hours`, the environment's recorded cap is kept.
   const repair = (runRegion: string, name: string, network?: NetworkChoice, hours?: number) =>
-    launch(runRegion, name, environmentStateKey(name), `Repair of ${name}`, () =>
+    launch(runRegion, name, environmentStateKey(name), "repair", `Repair of ${name}`, () =>
       repairAwsEnvironment(connection.id, runRegion, name, network, hours),
     );
   const update = (runRegion: string, name: string, hours: number) =>
-    launch(runRegion, name, environmentStateKey(name), `Update of ${name}`, () =>
+    launch(runRegion, name, environmentStateKey(name), "update", `Update of ${name}`, () =>
       updateAwsEnvironment(connection.id, runRegion, name, hours),
     );
 
@@ -315,7 +323,7 @@ export default function EnvironmentsPanel({
       const { kind: _kind, ...c } = ec2;
       lastEc2.current.set(key, c);
     } else lastEc2.current.delete(key);
-    return launch(j.region, j.name, j.stateKey, `Joining ${j.name}`, () => onboardAwsUser(connection.id, j.region, j.name, ec2));
+    return launch(j.region, j.name, j.stateKey, "onboard", `Joining ${j.name}`, () => onboardAwsUser(connection.id, j.region, j.name, ec2));
   };
 
   const rowRuns = (name: string) =>
@@ -337,7 +345,7 @@ export default function EnvironmentsPanel({
         {offer && (
           <div className="space-y-1.5 text-xs text-[var(--text-secondary)] leading-snug" data-testid="denied-hint">
             <p className="break-words">
-              AWS refused a permission this run needs (its message is above).{" "}
+              AWS refused a permission this run needs (its message is above). This may need an admin:{" "}
               {denied === "environment"
                 ? "An admin can deploy the environment for you from a bundle."
                 : "An admin can onboard you from a bundle."}
@@ -477,7 +485,7 @@ export default function EnvironmentsPanel({
                 disabled={busy}
                 aria-label={`Follow my onboarding to ${e.name}`}
                 onClick={() =>
-                  void launch(at, e.name, myKey, `Joining ${e.name}`, () => followAwsDeployment(connection.id, at, myKey))
+                  void launch(at, e.name, myKey, "follow", `Joining ${e.name}`, () => followAwsDeployment(connection.id, at, myKey))
                 }
               >
                 Follow
@@ -489,7 +497,7 @@ export default function EnvironmentsPanel({
                 disabled={busy}
                 aria-label={`Push saved state of my onboarding to ${e.name}`}
                 onClick={() =>
-                  void launch(at, e.name, myKey, `Push of the saved state of joining ${e.name}`, () =>
+                  void launch(at, e.name, myKey, "push", `Push of the saved state of joining ${e.name}`, () =>
                     pushAwsSavedState(connection.id, at, myKey),
                   )
                 }
@@ -515,7 +523,7 @@ export default function EnvironmentsPanel({
                 aria-label={`Push saved state of ${e.name}`}
                 onClick={() => {
                   const key = environmentStateKey(e.name);
-                  void launch(at, e.name, key, `Push of the saved state of ${e.name}`, () =>
+                  void launch(at, e.name, key, "push", `Push of the saved state of ${e.name}`, () =>
                     pushAwsSavedState(connection.id, at, key),
                   );
                 }}
@@ -530,7 +538,7 @@ export default function EnvironmentsPanel({
                 aria-label={`Follow ${e.name}`}
                 onClick={() => {
                   const key = environmentStateKey(e.name);
-                  void launch(at, e.name, key, `Deploy of ${e.name}`, () => followAwsDeployment(connection.id, at, key));
+                  void launch(at, e.name, key, "follow", `Deploy of ${e.name}`, () => followAwsDeployment(connection.id, at, key));
                 }}
               >
                 Follow
@@ -662,8 +670,14 @@ export default function EnvironmentsPanel({
                 </p>
               )}
               {!isAdmin && (
-                <details className="text-xs min-w-0" data-testid="not-admin-options">
-                  <summary className="cursor-pointer text-[var(--text-primary)] break-words">
+                <details
+                  className="text-xs min-w-0"
+                  data-testid="not-admin-options"
+                  open={notAdminOpen}
+                  onToggle={(ev) => setNotAdminOpen(ev.currentTarget.open)}
+                >
+                  <summary className="cursor-pointer list-none [&::-webkit-details-marker]:hidden text-[var(--text-primary)] break-words">
+                    <span aria-hidden="true" className="mr-1">{notAdminOpen ? "▾" : "▸"}</span>
                     Not an admin? Ask one to deploy it
                   </summary>
                   <div className="mt-1.5 space-y-2 min-w-0">
@@ -727,7 +741,7 @@ export default function EnvironmentsPanel({
           confirmLabel="Destroy"
           onClose={() => setDestroyOf(null)}
           onConfirm={() =>
-            launch(destroyOf.region, destroyOf.name, environmentStateKey(destroyOf.name), `Destroy of ${destroyOf.name}`, () =>
+            launch(destroyOf.region, destroyOf.name, environmentStateKey(destroyOf.name), "destroy", `Destroy of ${destroyOf.name}`, () =>
               destroyIncompleteAwsEnvironment(connection.id, destroyOf.region, destroyOf.name),
             )
           }
