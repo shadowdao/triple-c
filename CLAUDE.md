@@ -320,6 +320,42 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   (`tunnel::mapping_command`; no probe connection), and the first socat "Connection refused" per
   mapping is a `ports` warning ("nothing is listening on port N"). An idle listener makes no
   agent request; a connection carrying traffic is activity (keeps the workspace from idling).
+  **`persistent.rs` is persistent AWS terminals** (Docker projects never reach it): every tab on an
+  AWS project — Claude and bash, desktop and web terminal — runs its **unchanged** launch command
+  (update prelude and all, or `bash -l`) inside **its own tmux server**,
+  `tmux -L triple-c-<session id> -f /etc/triple-c/tmux.conf new-session -A -s <claude|bash> -- <cmd>`.
+  Rules, each for a reason:
+  - **One server per tab, never one shared server**: a server takes its environment from the
+    client that started it, so each tab keeps exactly its own `ExecSpec.env` (copy-at-connect
+    `terminal_env` pairs). Never `new-session -e` — that puts the values on argv (`ps`). A later
+    connect's new credentials do not reach a session already running (like any running process).
+    The client gets `TERM=xterm-256color` (the agent would default a tty to `xterm`, 8 colours).
+  - **The tab's session id is the tmux key** (validated `[A-Za-z0-9-]{1,64}`), remembered per
+    project in `storage/terminal_store.rs` (`terminal-sessions.json` beside `projects.json`; a
+    hint pruned by the workspace's own listing, cleared on Stop/Remove; not a `Project` field, for
+    the reason notes aren't). Same id after a restart, so `renamed_session_names` still applies.
+  - **Closing a tab ends the session** (`kill-server`); app exit, a dropped tunnel and the agent's
+    SIGHUP on a vanished client only **detach** (the server daemonised out of the client's
+    process group). **Reattach is `attach-session`, never `new-session -A`**: a session that
+    ended while the app was away must not come back as a fresh `claude` (and the update prelude
+    runs once, inside, never again on reattach).
+  - **Stop ends every tmux server** (`persistent::end_all`, bounded wait for the servers to go)
+    in the same `close_first` step that closes the tabs, **before** the stop guard's push
+    snapshot; the entrypoint's TERM hook does the same before its own push (`aws_end_terminals`).
+  - Probe (`command -v tmux` + the config) once per tunnel, cached by target id and forgotten in
+    `tunnels::register*`; without it the old launch runs and `open_terminal_session` returns a
+    one-time notice. Every tmux exec except the attach goes through `exec_oneshot_background`
+    (never idle-stop activity).
+  - Frontend: a persistent tab reattaches on exit (retrying while the tunnel comes back) and shows
+    "[Session ended]" only when the workspace says the session is gone or the project stopped;
+    `usePersistentTerminals` reopens this app's sessions once per connection (`id|container_id`)
+    without taking focus; a reopened tab calls `reattach_terminal_session` only after its output
+    *and* exit listeners are registered (history replay + tmux's first draw would be lost). Project
+    Home → Sessions lists every session in the workspace (web terminal and other machines too:
+    those are never auto-opened) with Reattach / End. `ExecSessionManager` ends an exec whose
+    session id was taken over without its exit callback (else a reattach loops on its own exit).
+  - The live check is `host::persistent::live_tests` (ignored; an agent image with tmux,
+    `TRIPLEC_PERSIST_E2E_IMAGE`).
   `agent.rs` reuses `docker/exec.rs`'s `OneshotOutput`, host-file reader and uid probe so the two
   variants cannot drift; an `Agent` target's token never appears in `Debug` or error text.
   **Container-interior code must go through `ContainerTarget`, never `docker::exec`, bollard or
@@ -571,6 +607,18 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   The re-clone closes the apply lock's fd (a later connect never waits for it); `--prepare` takes it.
   The functions both scripts use live in `container/entrypoint-lib.sh`
   (`/usr/local/lib/triple-c/`), sourced by the entrypoint first; it only defines things.
+  **Persistent terminals** (`host/persistent.rs`): the image has `tmux` (in the Python apt layer)
+  and `/etc/triple-c/tmux.conf` (`container/triple-c-tmux.conf`, outside the seed-only home): no
+  prefix key (Ctrl+B reaches Claude/readline), no status line, `escape-time 0` (ESC+CR stays one
+  Meta-Enter), no mouse, `window-size latest`, and three outer-terminal overrides that were each
+  **measured by feeding tmux's real output into xterm.js** — keep all three: `smcup@:rmcup@`
+  (draw in xterm.js's normal screen, so its scrollback, copy cleanup and link detection work),
+  `indn@` (tmux's CSI S scroll is a *delete* in xterm.js: 4 of 300 fast lines reached scrollback
+  with it, 300 without) and `clear=\E[H` (tmux sends `clear` when its client exits, which wiped
+  the session's last screen from the tab; its full redraws repaint every row anyway). The idle
+  watcher still sees `claude` inside tmux (`pgrep -x claude`; tmux's processes are `tmux:
+  server`/`tmux: client`), so a running Claude keeps the workspace up and a detached shell does
+  not; the lifetime cap still applies.
   **The Docker-socket group step** (`# >>> docker_socket`) runs in aws mode as well as Docker mode: an
   EC2 project with Docker access mounts the instance's `/var/run/docker.sock`, and the step adds
   `claude` to a group with the socket's gid (`docker-host` if none exists). Fargate never has the
@@ -767,7 +815,10 @@ friendly message one line before `exec claude` ran it. `-E 0` makes losing the r
 because the holder just did the work. The per-session copy is what forced the non-Bedrock path from a bare `["claude", ...]`
 argv into a `bash -c` wrapper — the flags and the session name are interpolated into a shell
 string now, so **anything added there must go through `shell_quote_arg`**. Bash sessions are
-deliberately untouched.
+deliberately untouched. On AWS that whole command (not a copy of it) becomes the argv of a tmux
+`new-session` (`host::persistent::new_session_cmd`), so it runs once per session, never on a
+reattach; tmux reads an argument that *ends* in `;` as a command separator, so the scripts keep
+ending in a newline (`new_session_cmd` refuses otherwise).
 
 ### Container Lifecycle
 
