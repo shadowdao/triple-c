@@ -539,21 +539,58 @@ async fn wait_task<T: TaskApi>(
 pub const EXEC_OFF: &str = "ECS started the task with ECS Exec turned off, so Triple-C can't \
      reach it. Start the project again.";
 
+/// The most a start waits for a task it stopped to reach STOPPED before
+/// running another (its own budget, apart from the placement wait).
+const STOP_WAIT: Duration = Duration::from_secs(3 * 60);
+
+/// A start found the project's task with ECS Exec off and still waiting for
+/// an instance: another start is bringing one up.
+pub const INSTANCE_RACE: &str = "Another start of this workspace is bringing up an EC2 \
+     instance; try again in a minute (once it is up, Start connects to it)";
+
+/// Wait (at most `min(timeout, STOP_WAIT)`) until `arn` is STOPPED or gone.
+async fn wait_stopped<T: TaskApi>(tasks: &T, cluster: &str, arn: &str, timing: WaitTiming) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timing.timeout.min(STOP_WAIT);
+    let wanted = [arn.to_string()];
+    loop {
+        let gone = tasks
+            .describe(cluster, &wanted)
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|t| t.arn == arn)
+            .is_none_or(|t| t.last_status == "STOPPED");
+        if gone {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() + timing.interval > deadline {
+            return Err(format!(
+                "The task {arn} did not stop in time; start the project again in a minute."
+            ));
+        }
+        tokio::time::sleep(timing.interval).await;
+    }
+}
+
 /// A cold EC2 start's second RunTask. ECS turns `enableExecuteCommand` off
 /// on a RunTask that has to wait for an instance (PROVISIONING; verified
 /// live, phase 7) and the task keeps it off once placed, so it could never
 /// be reached. That first task still makes the capacity provider launch an
-/// instance: once it is placed, it is stopped (it runs nothing yet) and the
-/// task run again, now straight onto that instance with ECS Exec. Returns
-/// the new task; the caller stops `first` itself if this fails before the
-/// stop.
+/// instance: once an instance has taken it (and it is still meant to run),
+/// it is stopped and the task run again — through [`find_or_run`], so a
+/// concurrent start's task is never doubled ([`START_RACE`]) — now straight
+/// onto that instance with ECS Exec. A first task that stops by itself (a
+/// user's Stop, a failed placement) ends the start with its reason; nothing
+/// is run again. Returns the new task.
 #[allow(clippy::too_many_arguments)]
 async fn rerun_once_placed<T: TaskApi>(
     tasks: &T,
+    env: &EnvironmentInfo,
+    owner: &str,
+    project_id: &str,
     compute: &crate::aws::environments::UserCompute,
     first: &str,
     task_def_arn: &str,
-    tags: &[(String, String)],
     timing: WaitTiming,
     progress: &(dyn Fn(&str) + Send + Sync),
 ) -> Result<TaskInfo, String> {
@@ -561,17 +598,25 @@ async fn rerun_once_placed<T: TaskApi>(
     let deadline = tokio::time::Instant::now() + timing.timeout;
     let wanted = [first.to_string()];
     progress(PROGRESS_INSTANCE);
-    // Until an instance has taken the first task (or it stopped).
+    // Until an instance has taken the first task.
     loop {
-        let t = tasks
+        let Some(t) = tasks
             .describe(cluster, &wanted)
             .await
             .map_err(|e| e.to_string())?
             .into_iter()
-            .find(|t| t.arn == first);
-        match t {
-            Some(t) if waiting_for_instance(&t) => {}
-            _ => break,
+            .find(|t| t.arn == first)
+        else {
+            return Err(format!("The task {first} is no longer known to ECS; start the project again"));
+        };
+        if t.desired_status == "STOPPED" || t.last_status == "STOPPED" {
+            return Err(format!(
+                "The task stopped before an EC2 instance took it ({}); start the project again.",
+                t.stopped_reason.as_deref().unwrap_or("no reason given")
+            ));
+        }
+        if t.container_instance_arn.is_some() && t.desired_status == "RUNNING" {
+            break;
         }
         if tokio::time::Instant::now() + timing.interval > deadline {
             let max = compute.max_instances;
@@ -592,36 +637,19 @@ async fn rerun_once_placed<T: TaskApi>(
         .stop_task(cluster, first, STOP_REASON)
         .await
         .map_err(|e| e.to_string())?;
-    loop {
-        let gone = tasks
-            .describe(cluster, &wanted)
-            .await
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .find(|t| t.arn == first)
-            .is_none_or(|t| t.last_status == "STOPPED");
-        if gone {
-            break;
-        }
-        if tokio::time::Instant::now() + timing.interval > deadline {
-            return Err(format!(
-                "The first task on the new EC2 instance did not stop within {} minutes; \
-                 start the project again.",
-                timing.timeout.as_secs() / 60
-            ));
-        }
-        tokio::time::sleep(timing.interval).await;
-    }
+    wait_stopped(tasks, cluster, first, timing).await?;
     progress(PROGRESS_WAITING);
-    let task = tasks
-        .run_task(crate::aws::tasks::ec2_run_task_request(compute, task_def_arn, tags))
+    let start = find_or_run(tasks, env, owner, project_id, task_def_arn, RunOn::Ec2(compute))
         .await
-        .map_err(|e| crate::aws::tasks::ec2_run_error(e).to_string())?;
-    if !task.exec_enabled {
-        let _ = stop_created(tasks, cluster, &task.arn).await;
+        .map_err(|e| e.to_string())?;
+    if start.reused {
+        return Err(START_RACE.into());
+    }
+    if !start.task.exec_enabled {
+        let _ = stop_created(tasks, cluster, &start.task.arn).await;
         return Err(EXEC_OFF.into());
     }
-    Ok(task)
+    Ok(start.task)
 }
 
 /// Where a project's task may be: the environment's cluster, the user's EC2
@@ -707,9 +735,18 @@ pub async fn start_core<T: TaskApi, W: WorkspaceApi, R: RuntimeApi, C: Connector
     }
     // A task with ECS Exec off (a cold EC2 start that stopped halfway) can
     // never be attached to: stop it and start afresh.
+    // One still waiting for an instance belongs to a start in progress.
     if let Some(t) = existing.take_if(|t| !t.exec_enabled) {
+        if waiting_for_instance(&t) {
+            return Err(INSTANCE_RACE.into());
+        }
         log::warn!("Project {}: its task {} has ECS Exec off; stopping it", project.id, t.arn);
-        let _ = stop_created(tasks, &task_cluster(&env, &t.arn), &t.arn).await;
+        let cluster = task_cluster(&env, &t.arn);
+        tasks
+            .stop_task(&cluster, &t.arn, STOP_REASON)
+            .await
+            .map_err(|e| format!("Could not stop the workspace's unreachable task {}: {e}", t.arn))?;
+        wait_stopped(tasks, &cluster, &t.arn, timing_of(Some(1))).await?;
     }
 
     let (task, token, access_point_id, workspace_access_point_id, created) = if let Some(task) = existing {
@@ -802,14 +839,13 @@ pub async fn start_core<T: TaskApi, W: WorkspaceApi, R: RuntimeApi, C: Connector
         progress(PROGRESS_WAITING);
         let cluster = run_on.cluster(&env).to_string();
         if let (RunOn::Ec2(compute), false) = (run_on, start.task.exec_enabled) {
-            let tags = crate::aws::workspace::workspace_tags(&inp.who.user_id, &project.id, &env.name);
-            match rerun_once_placed(tasks, compute, &arn, &prepared.task_definition_arn, &tags, inp.ec2_wait, progress).await {
+            match rerun_once_placed(tasks, &env, &inp.who.user_id, &project.id, compute, &arn, &prepared.task_definition_arn, inp.ec2_wait, progress).await {
                 Ok(t) => {
                     arn = t.arn;
                     record_task(&arn);
                 }
                 Err(e) => {
-                    let msg = with_log_tail(tasks, &logs, &arn, e).await;
+                    let msg = if e == START_RACE { e } else { with_log_tail(tasks, &logs, &arn, e).await };
                     if stop_created(tasks, &cluster, &arn).await {
                         (inp.on_task)(None);
                     }
