@@ -14,6 +14,8 @@
 
 #[path = "src/command_census.rs"]
 mod command_census;
+#[path = "src/sidecar_placeholder.rs"]
+mod sidecar_placeholder;
 
 use std::path::Path;
 
@@ -79,6 +81,7 @@ fn main() {
     }
 
     prune_permissions(&commands);
+    ensure_ssm_sidecar();
 
     // `AppManifest::commands` takes `&'static [&'static str]` and the struct is `Copy`, so
     // there is no owned form; leaking is fine in a process that exits right after.
@@ -204,5 +207,52 @@ fn check_tauri_config() {
     problems.sort();
     if !problems.is_empty() {
         fail("capabilities declared outside capabilities/", &problems, LAYOUT_HINT);
+    }
+}
+
+/// `bundle.externalBin` names `binaries/session-manager-plugin`, and tauri-build stops on a
+/// missing `binaries/session-manager-plugin-<target-triple>[.exe]` for every build, tests
+/// included. The real one comes from `scripts/fetch-ssm-plugin.sh` (`.ps1` on Windows), which
+/// CI runs before `tauri build`.
+///
+/// - **Release profile:** the real plugin is required. A missing file or a placeholder stops
+///   the build here, so a placeholder can never ship.
+/// - **Debug profile** (`cargo test`, `cargo check`, `tauri dev`): a missing file is replaced
+///   by a placeholder (`src/sidecar_placeholder.rs`) so no test run needs AWS's S3. The app's
+///   `find_plugin` skips a placeholder and falls back to an installed plugin.
+fn ensure_ssm_sidecar() {
+    let target = std::env::var("TARGET").expect("cargo sets TARGET");
+    let ext = if target.contains("windows") { ".exe" } else { "" };
+    let path = Path::new("binaries").join(format!("session-manager-plugin-{target}{ext}"));
+    println!("cargo:rerun-if-changed={}", path.display());
+    let release = std::env::var("PROFILE").as_deref() == Ok("release");
+    let head = std::fs::read(&path).ok().map(|b| sidecar_placeholder::is_placeholder(&b));
+    let fetch = if target.contains("windows") {
+        "scripts\\fetch-ssm-plugin.ps1"
+    } else {
+        "scripts/fetch-ssm-plugin.sh"
+    };
+    match (head, release) {
+        (Some(false), _) => {}
+        (state, true) => fail(
+            "the AWS Session Manager plugin sidecar is missing",
+            &[format!(
+                "{} is {} (release builds bundle the real plugin)",
+                path.display(),
+                if state.is_some() { "a debug-build placeholder" } else { "missing" }
+            )],
+            &format!("Run {fetch} {target} from the repository root first."),
+        ),
+        (None, false) => {
+            std::fs::create_dir_all("binaries").expect("create src-tauri/binaries");
+            std::fs::write(&path, sidecar_placeholder::contents())
+                .unwrap_or_else(|e| panic!("cannot write {}: {e}", path.display()));
+            println!(
+                "cargo:warning=no {} - wrote a placeholder (debug only; AWS workspaces use an \
+                 installed plugin). Run {fetch} to bundle the real one.",
+                path.display()
+            );
+        }
+        (Some(true), false) => {}
     }
 }
