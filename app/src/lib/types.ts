@@ -1283,6 +1283,9 @@ export interface HourlyEstimate {
   /** EC2 (E10): the user's instance's on-demand price, whatever the project
    *  reserves of it; instances scale to zero when no workspace is running. */
   ec2_instance: boolean;
+  /** EC2: the figure includes the instance's 50 GiB gp3 root volume (its
+   *  price could be read). A public IPv4 address is never in it. */
+  root_volume_included: boolean;
 }
 
 export type Verdict = "allowed" | "denied" | "unverified";

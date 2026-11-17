@@ -2936,7 +2936,8 @@ fn the_launch_template_is_pinned() {
     let ebs = &one_block(bdm, "ebs").body;
     assert_eq!(
         attr(ebs, "volume_size"),
-        Some(&Expression::Number(50.into()))
+        Some(&Expression::Number(crate::aws::pricing::EC2_ROOT_VOLUME_GIB.into())),
+        "the cost estimate prices this root volume"
     );
     assert_eq!(
         attr(ebs, "volume_type"),

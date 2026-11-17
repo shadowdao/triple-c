@@ -65,6 +65,22 @@ pub const EC2_FILTERS: &[(&str, &str, &str)] = &[
     ("TERM_MATCH", "licenseModel", "No License required"),
 ];
 
+/// `GetProducts` filters for gp3 EBS storage in `{region}`. Verified against
+/// the live API (2026-11-16): one row (`USW2-EBS:VolumeUsage.gp3`, $0.08 per
+/// GB-month).
+pub const GP3_FILTERS: &[(&str, &str, &str)] = &[
+    ("TERM_MATCH", "regionCode", "{region}"),
+    ("TERM_MATCH", "productFamily", "Storage"),
+    ("TERM_MATCH", "volumeApiName", "gp3"),
+];
+
+/// The EC2 instance's root volume (`ec2.tf`'s `volume_size`, gp3), billed
+/// while the instance exists.
+pub const EC2_ROOT_VOLUME_GIB: u32 = 50;
+
+/// Hours in a billing month, as AWS converts GB-month prices.
+pub const HOURS_PER_MONTH: f64 = 730.0;
+
 /// One `GetProducts` query: a service and its filters, values filled in.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Query {
@@ -100,6 +116,14 @@ pub fn ec2_query(region: &str, instance_type: &str) -> Query {
     }
 }
 
+/// The gp3 storage price of `region` ([`GP3_FILTERS`]).
+pub fn gp3_query(region: &str) -> Query {
+    Query {
+        service_code: EC2_SERVICE_CODE,
+        filters: fill(GP3_FILTERS, &[("region", region)]),
+    }
+}
+
 /// One architecture's on-demand rates in a region, in USD.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct FargateRates {
@@ -131,13 +155,17 @@ impl RegionRates {
 /// usually cheaper); EFS is billed per GB-month, not per hour
 /// (`efs_billed_separately`). `ec2_instance`: the figure is the user's EC2
 /// instance's hourly price, whatever the project reserves of it, and
-/// instances scale to zero when no workspace is running (E10).
+/// instances scale to zero when no workspace is running (E10);
+/// `root_volume_included`: it also has the instance's 50 GiB gp3 root
+/// volume (when its price could be read). An instance's public IPv4
+/// address (public-mode environments) is never in it.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct HourlyEstimate {
     pub usd_per_hour: f64,
     pub note_spot: bool,
     pub efs_billed_separately: bool,
     pub ec2_instance: bool,
+    pub root_volume_included: bool,
 }
 
 pub fn estimate(cfg: &AwsWorkspaceConfig, rates: &FargateRates) -> HourlyEstimate {
@@ -151,19 +179,42 @@ pub fn estimate(cfg: &AwsWorkspaceConfig, rates: &FargateRates) -> HourlyEstimat
         note_spot: cfg.spot,
         efs_billed_separately: cfg.storage != StorageMode::Ephemeral,
         ec2_instance: false,
+        root_volume_included: false,
     }
 }
 
 /// An EC2 project's estimate: its instance's on-demand hourly price — the
 /// instance is billed whole while it runs, so the reservations, the
-/// ephemeral size and Spot (none on EC2) change nothing.
-pub fn estimate_ec2(cfg: &AwsWorkspaceConfig, instance_usd_per_hour: f64) -> HourlyEstimate {
+/// ephemeral size and Spot (none on EC2) change nothing — plus its
+/// [`EC2_ROOT_VOLUME_GIB`] gp3 root volume at `gp3_usd_per_gb_month` (per
+/// hour, over [`HOURS_PER_MONTH`]) when that price is known.
+pub fn estimate_ec2(
+    cfg: &AwsWorkspaceConfig,
+    instance_usd_per_hour: f64,
+    gp3_usd_per_gb_month: Option<f64>,
+) -> HourlyEstimate {
+    let root = gp3_usd_per_gb_month.map(|p| f64::from(EC2_ROOT_VOLUME_GIB) * p / HOURS_PER_MONTH);
     HourlyEstimate {
-        usd_per_hour: instance_usd_per_hour,
+        usd_per_hour: instance_usd_per_hour + root.unwrap_or(0.0),
         note_spot: false,
         efs_billed_separately: cfg.storage != StorageMode::Ephemeral,
         ec2_instance: true,
+        root_volume_included: root.is_some(),
     }
+}
+
+/// The gp3 storage price per GB-month in a [`GP3_FILTERS`] price list for
+/// `region`; `None` when no row matches.
+pub fn parse_gp3_price(region: &str, items: &[String]) -> Option<f64> {
+    items.iter().find_map(|item| {
+        let product = serde_json::from_str::<Value>(item).ok()?;
+        let attrs = &product["product"]["attributes"];
+        let is = |k: &str, v: &str| attrs[k].as_str() == Some(v);
+        if !(is("regionCode", region) && is("volumeApiName", "gp3")) {
+            return None;
+        }
+        on_demand_usd(&product).filter(|p| *p > 0.0)
+    })
 }
 
 /// The on-demand hourly price of `instance_type` (Linux, shared tenancy) in
@@ -385,6 +436,12 @@ impl CacheKey {
             file: format!("{region}--ec2-{instance_type}.json"),
         }
     }
+    fn gp3(region: &str) -> Self {
+        Self {
+            key: format!("{region} gp3"),
+            file: format!("{region}--ebs-gp3.json"),
+        }
+    }
 }
 
 /// A cache file. `key` was `region` before EC2 prices were cached too (an
@@ -550,6 +607,21 @@ impl RatesCache {
         };
         let query = ec2_query(region, instance_type);
         self.cached::<A, B, _>(&CacheKey::ec2(region, instance_type), api, query, parse, now)
+            .await
+    }
+
+    /// [`Self::rates_with`] for `region`'s gp3 storage price per GB-month
+    /// (an EC2 instance's root volume).
+    pub async fn gp3_price_with<A: PricingApi, B: std::borrow::Borrow<A>>(
+        &self,
+        api: impl Future<Output = Option<B>>,
+        region: &str,
+        now: SystemTime,
+    ) -> Option<f64> {
+        let parse = |items: &[String]| {
+            parse_gp3_price(region, items).ok_or_else(|| format!("no gp3 price for {region} in the price list"))
+        };
+        self.cached::<A, B, _>(&CacheKey::gp3(region), api, gp3_query(region), parse, now)
             .await
     }
 

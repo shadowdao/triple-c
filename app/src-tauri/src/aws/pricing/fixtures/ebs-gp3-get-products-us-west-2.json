@@ -1,0 +1,6 @@
+{
+    "PriceList": [
+        "{\"product\":{\"productFamily\":\"Storage\",\"attributes\":{\"maxThroughputvolume\":\"2000 MiB/s\",\"volumeType\":\"General Purpose\",\"maxIopsvolume\":\"80000\",\"usagetype\":\"USW2-EBS:VolumeUsage.gp3\",\"locationType\":\"AWS Region\",\"maxVolumeSize\":\"64 TiB\",\"storageMedia\":\"SSD-backed\",\"regionCode\":\"us-west-2\",\"servicecode\":\"AmazonEC2\",\"volumeApiName\":\"gp3\",\"location\":\"US West (Oregon)\",\"servicename\":\"Amazon Elastic Compute Cloud\",\"operation\":\"\",\"group\":\"EBS Storage\"},\"sku\":\"BB8UJWJ4XPFJB95G\"},\"serviceCode\":\"AmazonEC2\",\"terms\":{\"OnDemand\":{\"BB8UJWJ4XPFJB95G.JRTCKXETXF\":{\"priceDimensions\":{\"BB8UJWJ4XPFJB95G.JRTCKXETXF.6YS6EN2CT7\":{\"unit\":\"GB-Mo\",\"endRange\":\"Inf\",\"description\":\"$0.08 per GB-month of General Purpose (gp3) provisioned storage - US West (Oregon)\",\"appliesTo\":[],\"rateCode\":\"BB8UJWJ4XPFJB95G.JRTCKXETXF.6YS6EN2CT7\",\"beginRange\":\"0\",\"pricePerUnit\":{\"USD\":\"0.0800000000\"}}},\"sku\":\"BB8UJWJ4XPFJB95G\",\"effectiveDate\":\"2026-11-01T00:00:00Z\",\"offerTermCode\":\"JRTCKXETXF\",\"termAttributes\":{}}}},\"version\":\"20261114012926\",\"publicationDate\":\"2026-11-14T01:29:26Z\"}"
+    ],
+    "FormatVersion": "aws_v1"
+}

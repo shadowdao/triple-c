@@ -389,7 +389,9 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   `None` ("Estimate unavailable"), a failed region isn't re-asked for 5 min, a stale cache still answers.
   EC2 projects (E10) pass `instance_type` (the user's, from `aws_ec2_capacity`): the `AmazonEC2`
   on-demand Linux/shared-tenancy hourly price (`EC2_FILTERS`), cached as `<region>--ec2-<type>.json`
-  with the same rules — the instance's price, not the reservations.
+  with the same rules — the instance's price, not the reservations — plus the 50 GiB gp3 root volume
+  (`GP3_FILTERS`, `<region>--ebs-gp3.json`, best effort: without it the note says it's missing;
+  `EC2_ROOT_VOLUME_GIB` is pinned to `ec2.tf`). A public IPv4 address ($0.005/h) is only in the note.
   **ECS on EC2 (phase 7; `aws/terraform/user-onboard/ec2.tf`, `workspace.rs` `ec2_plan`, `aws_host.rs`).**
   Opt-in per onboarding (`ec2_instance_type`); a project's `launch_type` is `Fargate | Ec2`. Why the
   rules are what they are:

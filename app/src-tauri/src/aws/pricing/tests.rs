@@ -514,15 +514,16 @@ fn the_ec2_filters_name_linux_shared_tenancy_on_demand_for_the_type() {
 
 #[test]
 fn an_ec2_estimate_is_the_instances_price_whatever_the_reservations() {
-    let small = estimate_ec2(&ec2_cfg(512, 1024, StorageMode::Ephemeral), M7I_LARGE);
-    let big = estimate_ec2(&ec2_cfg(1920, 7373, StorageMode::Ephemeral), M7I_LARGE);
+    let small = estimate_ec2(&ec2_cfg(512, 1024, StorageMode::Ephemeral), M7I_LARGE, None);
+    let big = estimate_ec2(&ec2_cfg(1920, 7373, StorageMode::Ephemeral), M7I_LARGE, None);
     assert!(close(small.usd_per_hour, 0.1008) && close(big.usd_per_hour, 0.1008));
     assert!(small.ec2_instance && !small.note_spot && !small.efs_billed_separately);
+    assert!(!small.root_volume_included);
     // Ephemeral size and Spot don't apply on EC2; EFS is still billed apart.
     let mut c = ec2_cfg(1024, 4096, StorageMode::Hybrid);
     c.ephemeral_gib = 200;
     c.spot = true;
-    let e = estimate_ec2(&c, M7G_LARGE);
+    let e = estimate_ec2(&c, M7G_LARGE, None);
     assert!(close(e.usd_per_hour, 0.0816));
     assert!(e.efs_billed_separately && !e.note_spot && e.ec2_instance);
     // Fargate estimates say they are not an instance's.
@@ -611,4 +612,38 @@ fn a_fargate_cache_file_written_before_ec2_prices_still_reads() {
     let old = serde_json::json!({ "region": "us-west-2", "fetched_at": T0, "rates": RATES });
     std::fs::write(c.dir().join("us-west-2.json"), old.to_string()).unwrap();
     assert_eq!(c.read("us-west-2", at(T0)), Some((RATES, true)));
+}
+
+const GP3_FIXTURE: &str = include_str!("fixtures/ebs-gp3-get-products-us-west-2.json");
+
+fn gp3_items() -> Vec<String> {
+    let v: Value = serde_json::from_str(GP3_FIXTURE).unwrap();
+    v["PriceList"].as_array().unwrap().iter().map(|s| s.as_str().unwrap().to_string()).collect()
+}
+
+/// The root volume (50 GiB gp3, `ec2.tf`) is in an EC2 estimate when its
+/// price is known: $0.08/GB-month in us-west-2 (recorded 2026-11-16) is
+/// 50 × 0.08 / 730 ≈ $0.0055/h on top of the instance.
+#[test]
+fn an_ec2_estimate_adds_the_gp3_root_volume_when_its_price_is_known() {
+    assert_eq!(parse_gp3_price("us-west-2", &gp3_items()), Some(0.08));
+    assert_eq!(parse_gp3_price("eu-west-1", &gp3_items()), None, "another region's row");
+    assert_eq!(parse_gp3_price("us-west-2", &ec2_items()), None, "not a gp3 row");
+    let e = estimate_ec2(&ec2_cfg(1024, 4096, StorageMode::Ephemeral), M7I_LARGE, Some(0.08));
+    assert!(close(e.usd_per_hour, 0.1008 + 50.0 * 0.08 / 730.0), "{}", e.usd_per_hour);
+    assert!(e.root_volume_included && e.ec2_instance);
+    assert_eq!(gp3_query("us-west-2").service_code, "AmazonEC2");
+}
+
+#[tokio::test]
+async fn the_gp3_price_is_fetched_once_and_cached_per_region() {
+    let (_d, c) = cache();
+    let api = FakeApi::answering(vec![Ok(Page { items: gp3_items(), next_token: None })]);
+    let price = c.gp3_price_with::<FakeApi, _>(async { Some(&api) }, "us-west-2", at(T0)).await;
+    assert_eq!(price, Some(0.08));
+    assert_eq!(api.queries.lock().unwrap()[0], gp3_query("us-west-2"));
+    assert!(c.dir().join("us-west-2--ebs-gp3.json").is_file());
+    let again = c.gp3_price_with::<FakeApi, _>(async { Some(&api) }, "us-west-2", at(T0 + 1)).await;
+    assert_eq!(again, Some(0.08));
+    assert_eq!(api.calls(), 1);
 }

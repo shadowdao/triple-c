@@ -46,6 +46,7 @@ describe("AwsCostEstimate", () => {
       note_spot: false,
       efs_billed_separately: false,
       ec2_instance: false,
+      root_volume_included: false,
     });
     const c = config();
     render(<AwsCostEstimate connectionId="c1" region="us-west-2" config={c} />);
@@ -63,6 +64,7 @@ describe("AwsCostEstimate", () => {
       note_spot: true,
       efs_billed_separately: true,
       ec2_instance: false,
+      root_volume_included: false,
     });
     render(
       <AwsCostEstimate
@@ -100,7 +102,7 @@ describe("AwsCostEstimate", () => {
   });
 
   it("asks once per settled change of a cost field, not for unrelated edits", async () => {
-    awsCostEstimate.mockResolvedValue({ usd_per_hour: 0.1, note_spot: false, efs_billed_separately: false, ec2_instance: false });
+    awsCostEstimate.mockResolvedValue({ usd_per_hour: 0.1, note_spot: false, efs_billed_separately: false, ec2_instance: false, root_volume_included: false });
     const { rerender } = render(<AwsCostEstimate connectionId="c1" region="us-west-2" config={config()} />);
     await settle();
     expect(awsCostEstimate).toHaveBeenCalledTimes(1);
@@ -118,8 +120,16 @@ describe("AwsCostEstimate", () => {
     expect(awsCostEstimate.mock.calls[1][2].cpu).toBe(4096);
   });
 
+  it("says when an EC2 estimate lacks the root volume's price", async () => {
+    awsCostEstimate.mockResolvedValue({ usd_per_hour: 0.1008, note_spot: false, efs_billed_separately: false, ec2_instance: true, root_volume_included: false });
+    render(<AwsCostEstimate connectionId="c1" region="us-west-2" config={config({ launch_type: "ec2" })} instanceType="m7i.large" />);
+    await settle();
+    expect(screen.getByText(/Its 50 GiB gp3 root volume \(about \$4 a month\) is not included/)).toBeInTheDocument();
+    expect(screen.getByText(/public IPv4 address adds/)).toBeInTheDocument();
+  });
+
   it("prices an EC2 project as its instance type, and says instances scale to zero", async () => {
-    awsCostEstimate.mockResolvedValue({ usd_per_hour: 0.1008, note_spot: false, efs_billed_separately: true, ec2_instance: true });
+    awsCostEstimate.mockResolvedValue({ usd_per_hour: 0.1008, note_spot: false, efs_billed_separately: true, ec2_instance: true, root_volume_included: true });
     const c = config({ launch_type: "ec2", storage: "hybrid" });
     const { rerender } = render(
       <AwsCostEstimate connectionId="c1" region="us-west-2" config={c} instanceType="m7i.large" />,
@@ -129,6 +139,8 @@ describe("AwsCostEstimate", () => {
     expect(screen.getByText("≈ $0.10/hour")).toBeInTheDocument();
     expect(screen.getByText(/Instances scale to zero when no workspace is running/)).toBeInTheDocument();
     expect(screen.getByText(/EFS storage is billed separately/)).toBeInTheDocument();
+    expect(screen.getByText(/Includes its 50 GiB gp3 root volume/)).toBeInTheDocument();
+    expect(screen.getByText(/public IPv4 address adds \$0.005\/hour/)).toBeInTheDocument();
     expect(screen.queryByText(/While the task runs/)).toBeNull();
     // The reservations don't change an instance's price: no new call.
     rerender(

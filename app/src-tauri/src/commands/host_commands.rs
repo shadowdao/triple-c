@@ -372,15 +372,21 @@ async fn cost_estimate(
     };
     if config.launch_type == LaunchType::Ec2 {
         let instance_type = instance_type.filter(|t| ec2_instance_spec(t).is_some())?;
-        let price = match cache.read_ec2(&region, instance_type, now) {
-            Some((price, true)) => price,
-            _ => {
-                cache
-                    .ec2_price_with::<SdkPricingApi, _>(api(), &region, instance_type, now)
-                    .await?
+        let instance = async {
+            match cache.read_ec2(&region, instance_type, now) {
+                Some((price, true)) => Some(price),
+                _ => {
+                    cache
+                        .ec2_price_with::<SdkPricingApi, _>(api(), &region, instance_type, now)
+                        .await
+                }
             }
         };
-        return Some(pricing::estimate_ec2(config, price));
+        // The root volume's price is best effort: without it the estimate
+        // is the instance's alone (and says so).
+        let gp3 = cache.gp3_price_with::<SdkPricingApi, _>(api(), &region, now);
+        let (price, gp3) = tokio::join!(instance, gp3);
+        return Some(pricing::estimate_ec2(config, price?, gp3));
     }
     let rates = match cache.read(&region, now) {
         Some((rates, true)) => Some(rates),

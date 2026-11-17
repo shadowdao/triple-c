@@ -76,6 +76,10 @@ export default function AwsCostEstimate({ connectionId, region, config, instance
       {estimate?.ec2_instance && (
         <p className="text-[var(--text-secondary)]">
           While your instance runs. Instances scale to zero when no workspace is running.
+          {estimate.root_volume_included
+            ? " Includes its 50 GiB gp3 root volume."
+            : " Its 50 GiB gp3 root volume (about $4 a month) is not included."}
+          {" In an environment with public networking, the instance's public IPv4 address adds $0.005/hour."}
           {estimate.efs_billed_separately && " EFS storage is billed separately."}
         </p>
       )}
