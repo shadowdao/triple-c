@@ -810,6 +810,7 @@ and the secret and removes the ECR policy; then the fixture destroys the modules
 | Bubblewrap (P9) | ✗ `bwrap --unshare-user` fails: "No permissions to create new namespace" (kernel 6.1, `max_user_namespaces` 16384, no `CAP_SYS_ADMIN` on Fargate). The sandbox stays off on AWS |
 | A revision per configuration | turning idle stop on adds a secret key, so the next start registers a new revision (by design) |
 | Removal (R8) | ✓ final run: `remove_aws_resources` succeeds; the secret is scheduled for deletion, the access point deleted, the revision left ACTIVE. Since R10 the secret is deleted without a recovery window (the test now asserts it is gone) |
+| Logs under the narrowed scope (2026-11-16, after phase 7's review) | ✓ re-run with the task and execution roles' `PutLogEvents` limited to `log-stream:<owner_key>/*` (`CreateLogStream` on the group): passed in 913 s; awslogs wrote both tasks' streams (the test reads and asserts task 1's and task 2's stop lines), cold start 109 s, idle stop exit 75; nothing left but the test secret already pending deletion |
 | Cleanup | ✓ nothing `triple-c` left in us-west-2; environment KMS keys pending deletion |
 
 ### Phase 6: the cost estimate's price reads (2026-11-16)
