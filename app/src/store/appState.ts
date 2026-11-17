@@ -129,7 +129,10 @@ interface AppState {
   // Terminal sessions
   sessions: TerminalSession[];
   activeSessionId: string | null;
-  addSession: (session: TerminalSession) => void;
+  /** Adds the tab and makes it current, unless `activate` is false (tabs
+   *  reopened in the background after a reconnect). */
+  addSession: (session: TerminalSession, opts?: { activate?: boolean }) => void;
+  updateSession: (id: string, patch: Partial<Omit<TerminalSession, "id">>) => void;
   removeSession: (id: string) => void;
   setActiveSession: (id: string | null) => void;
 
@@ -329,17 +332,24 @@ export const useAppState = create<AppState>((set) => ({
   // Terminal sessions
   sessions: [],
   activeSessionId: null,
-  addSession: (session) =>
+  addSession: (session, opts) =>
     set((state) => {
       const key = terminalTabKey(session.id);
+      const activate = opts?.activate ?? true;
       return {
-        sessions: [...state.sessions, session],
+        sessions: state.sessions.some((s) => s.id === session.id)
+          ? state.sessions.map((s) => (s.id === session.id ? session : s))
+          : [...state.sessions, session],
         tabOrder: state.tabOrder.includes(key)
           ? state.tabOrder
           : [...state.tabOrder, key],
-        ...activation(key),
+        ...(activate || state.activeTabKey === null ? activation(key) : {}),
       };
     }),
+  updateSession: (id, patch) =>
+    set((state) => ({
+      sessions: state.sessions.map((s) => (s.id === id ? { ...s, ...patch } : s)),
+    })),
   removeSession: (id) =>
     set((state) => {
       const key = terminalTabKey(id);

@@ -105,8 +105,22 @@ export function useTerminal() {
       resumeSessionId?: string,
     ) => {
       const sessionId = crypto.randomUUID();
-      await commands.openTerminalSession(projectId, sessionId, sessionType, sessionName, resumeSessionId);
-      addSession({ id: sessionId, projectId, projectName, sessionType, sessionName: sessionName ?? null });
+      const opened = await commands.openTerminalSession(projectId, sessionId, sessionType, sessionName, resumeSessionId);
+      addSession({
+        id: sessionId,
+        projectId,
+        projectName,
+        sessionType,
+        sessionName: sessionName ?? null,
+        persistent: opened?.persistent ?? false,
+      });
+      if (opened?.notice) {
+        useAppState.getState().pushToast({
+          kind: "info",
+          message: opened.notice,
+          dedupeKey: `no-tmux-${projectId}`,
+        });
+      }
       return sessionId;
     },
     [addSession],
@@ -120,6 +134,9 @@ export function useTerminal() {
       const project = session ? projects.find((p) => p.id === session.projectId) : undefined;
 
       discardInputQueue(sessionId);
+      // A closed tab ends its session: the exit this causes must not read
+      // as a dropped connection to reattach.
+      useAppState.getState().updateSession(sessionId, { persistent: false, pendingReattach: false });
       await commands.closeTerminalSession(sessionId);
       removeSession(sessionId);
 

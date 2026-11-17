@@ -37,6 +37,8 @@ import { decodeOsc52 } from "./osc52";
 import { resolveTerminalGpuRendering } from "../../lib/terminalRenderer";
 import TerminalContextMenu from "./TerminalContextMenu";
 import { createFilePathLinkProvider } from "./filePathLinkProvider";
+import { reattachTerminalSession } from "../../lib/tauri-commands";
+import { reattachWithRetry } from "../../lib/persistentTerminals";
 import type { FilePathMatch } from "../../lib/filePathLinks";
 
 interface Props {
@@ -751,6 +753,19 @@ export default function TerminalView({ sessionId, active }: Props) {
   const sessionTypeRef = useRef(sessionType);
   sessionTypeRef.current = sessionType;
 
+  // A persistent AWS terminal (tmux in the workspace): a lost connection
+  // reattaches rather than ending the tab, and a tab opened for a session
+  // already running attaches once its listeners are up. Refs, for the same
+  // reason as `sessionTypeRef`.
+  const persistent = useAppState(
+    (s) => s.sessions.find((sess) => sess.id === sessionId)?.persistent ?? false
+  );
+  const persistentRef = useRef(persistent);
+  persistentRef.current = persistent;
+  const pendingReattachRef = useRef(
+    useAppState.getState().sessions.find((sess) => sess.id === sessionId)?.pendingReattach ?? false
+  );
+
   // One toast slot, three producers: the container's explicit "open this in the
   // host browser" relay (OSC 7777), OSC 8 hyperlink targets, and the heuristic
   // long-URL detector. Sharing the slot keeps them from stacking on top of each
@@ -1342,8 +1357,16 @@ export default function TerminalView({ sessionId, active }: Props) {
     const SSO_MARKER = "###TRIPLE_C_SSO_REFRESH###";
     const textDecoder = new TextDecoder();
 
+    // While a reattach replays a session's history, its old URLs and markers
+    // must not pop toasts or trigger an SSO refresh again.
+    let replaying = false;
+
     const outputPromise = onOutput(sessionId, (data) => {
       if (aborted) return;
+      if (replaying) {
+        term.write(data, syncMouseCapture);
+        return;
+      }
       // Scrolling on new output is xterm's own job, and it already gets it
       // right: it follows the tail while the viewport is at the bottom and
       // holds position while you are reading further up. The manual
@@ -1372,13 +1395,85 @@ export default function TerminalView({ sessionId, active }: Props) {
       return unlisten;
     });
 
+    const ended = () => term.write("\r\n\x1b[33m[Session ended]\x1b[0m\r\n");
+
+    // Attach to the session in the workspace again: after a lost connection
+    // (`rows` null: the screen is still here) or for a freshly opened tab
+    // (`rows`: replay the history into scrollback first).
+    let reconnecting = false;
+    const reconnect = async (rows: number | null) => {
+      const pid = projectIdRef.current;
+      if (reconnecting || !pid) return;
+      reconnecting = true;
+      replaying = rows !== null;
+      let said = false;
+      const result = await reattachWithRetry({
+        reattach: () => reattachTerminalSession(pid, sessionId, rows),
+        stillWanted: () => {
+          const st = useAppState.getState();
+          return (
+            !aborted &&
+            (st.sessions.find((x) => x.id === sessionId)?.persistent ?? false) &&
+            st.projects.find((p) => p.id === pid)?.status === "running"
+          );
+        },
+        onRetrying: () => {
+          if (said || aborted) return;
+          said = true;
+          term.write("\r\n\x1b[33m[Connection lost — reconnecting…]\x1b[0m\r\n");
+        },
+      });
+      replaying = false;
+      reconnecting = false;
+      pendingReattachRef.current = false;
+      if (aborted) return;
+      const update = useAppState.getState().updateSession;
+      switch (result) {
+        case "reattached":
+          update(sessionId, { pendingReattach: false });
+          // tmux follows the newest client's size.
+          resize(sessionId, term.cols, term.rows).catch(() => {});
+          break;
+        case "ended":
+        case "cancelled":
+          update(sessionId, { persistent: false, pendingReattach: false });
+          ended();
+          break;
+        case "gave_up":
+          term.write(
+            "\r\n\x1b[33m[Disconnected. The session may still be running in the workspace: " +
+              "Project Home → Sessions can reattach it.]\x1b[0m\r\n",
+          );
+          break;
+      }
+    };
+
     const exitPromise = onExit(sessionId, () => {
       if (aborted) return;
-      term.write("\r\n\x1b[33m[Session ended]\x1b[0m\r\n");
+      if (persistentRef.current) {
+        void reconnect(null);
+        return;
+      }
+      ended();
     }).then((unlisten) => {
       if (aborted) unlisten();
       return unlisten;
     });
+
+    // A tab opened for a running session attaches only now, with both
+    // listeners registered, so neither its history nor tmux's first draw is
+    // lost.
+    if (pendingReattachRef.current) {
+      Promise.all([outputPromise, exitPromise]).then(() => {
+        if (aborted) return;
+        try {
+          fitAddon.fit();
+        } catch {
+          // Hidden tab: it is fitted (and tmux resized) when shown.
+        }
+        void reconnect(term.rows);
+      });
+    }
 
     // Handle resize (throttled via requestAnimationFrame to avoid excessive calls).
     // Skip resize work for hidden terminals — containerRef will have 0 dimensions.
