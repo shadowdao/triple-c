@@ -1321,6 +1321,53 @@ fn aws_stop_skips_its_push_when_the_app_already_pushed_or_the_user_declined() {
     assert_eq!(fs::read_to_string(&log).unwrap(), "--reason sigterm\n");
 }
 
+/// Persistent terminals (tmux) end before the hook's own push takes its
+/// snapshot, and only their servers: the socket prefix is the app's.
+#[test]
+fn aws_stop_ends_the_persistent_terminals_before_its_push() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("calls");
+    let bin = tmp.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let fake_push = write_script(
+        tmp.path(),
+        "triple-c-wip-push",
+        &format!("#!/bin/bash\necho \"push $*\" >> '{}'\n", log.display()),
+    );
+    write_script(&bin, "tmux", &format!("#!/bin/bash\necho \"tmux $*\" >> '{}'\n", log.display()));
+    // Two of ours and someone else's server in the same socket directory.
+    let socks = tmp.path().join("socks");
+    let dir = socks.join(format!("tmux-{}", unsafe { libc::getuid() }));
+    fs::create_dir_all(&dir).unwrap();
+    let mut keep = Vec::new();
+    for name in ["triple-c-aaa", "triple-c-bbb", "mine"] {
+        keep.push(std::os::unix::net::UnixListener::bind(dir.join(name)).unwrap());
+    }
+    let blocks = aws_blocks(&["aws_env", "aws_stop"])
+        .replace("/usr/local/bin/triple-c-wip-push", fake_push.to_str().unwrap())
+        .replace("/run/triple-c/stop-reason", tmp.path().join("reason").to_str().unwrap());
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let script = format!("{blocks}\naws_before_stop\n");
+    let env = [
+        ("TRIPLEC_HOST", "aws"),
+        ("TRIPLEC_WIP_PUSH", "1"),
+        ("PATH", path.as_str()),
+        ("TMUX_TMPDIR", socks.to_str().unwrap()),
+    ];
+    let out = bash(&script, &[], &env, &[]);
+    assert!(out.status.success(), "{}", text(&out));
+    let calls = fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        calls,
+        "tmux -L triple-c-aaa kill-server\ntmux -L triple-c-bbb kill-server\npush --reason sigterm\n"
+    );
+    drop(keep);
+    // The app's own Stop ends them with the same loop.
+    let app = crate::host::persistent::end_all_cmd().join(" ");
+    assert!(app.contains(r#"tmux -L "${s##*/}" kill-server"#) && app.contains("\"$d\"/triple-c-*"), "{app}");
+    assert!(block(ENTRYPOINT, "aws_stop").contains(r#"tmux -L "${s##*/}" kill-server"#));
+}
+
 #[test]
 fn the_idle_exit_status_is_the_one_the_app_reads() {
     assert!(

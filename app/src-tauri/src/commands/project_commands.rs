@@ -724,6 +724,7 @@ pub async fn remove_project(
         if let Some(target) = ContainerTarget::for_project(&project) {
             state.exec_manager.close_sessions_for_container(target.id()).await;
         }
+        crate::storage::terminal_store::clear(&project_id);
         let connection_exists = project
             .host_id
             .as_deref()
@@ -1752,6 +1753,9 @@ pub async fn stop_project_container(
             state.auth_bridge.stop(&project_id).await;
             if let Some(container) = guard_target.as_ref() {
                 state.exec_manager.close_sessions_for_container(container.id()).await;
+                // Closing the tabs only detaches persistent terminals: end
+                // their tmux servers too, before the push's snapshot.
+                crate::host::persistent::end_all(container).await;
             }
             if wip == Some(WipChoice::Push) {
                 emit_progress(&app_handle, &project_id, "Pushing unsaved work...");
@@ -1810,6 +1814,8 @@ pub async fn stop_project_container(
             )?;
         }
         state.projects_store.set_container_id(&project_id, None)?;
+        // Its terminals ended with the task.
+        crate::storage::terminal_store::clear(&project_id);
     } else if let Some(container) = ContainerTarget::for_project(&project) {
         // Close exec sessions for this project
         emit_progress(&app_handle, &project_id, "Stopping container...");
@@ -3231,6 +3237,14 @@ mod tests {
         let stop = &stop[..stop.find("\n}\n").unwrap()];
         let close = stop.find("close_sessions_for_container").unwrap();
         assert!(close < stop.find("aws_guard_before_stop(").unwrap());
+        // Closing a tab only detaches a persistent terminal: its tmux server
+        // is ended in the same step, before the push's snapshot.
+        let end_all = stop.find("persistent::end_all(container)").unwrap();
+        assert!(close < end_all && end_all < stop.find("aws_guard_before_stop(").unwrap());
+        let close_first = &stop[stop.find("let close_first = async").unwrap()..stop.find("let guarded").unwrap()];
+        assert!(close_first.contains("persistent::end_all"), "inside the step that runs first");
+        // A stopped task's terminals are gone: forgotten.
+        assert!(stop.find("terminal_store::clear").unwrap() > stop.find("stop_project(&project").unwrap());
         assert!(stop.find("auth_bridge.stop").unwrap() < stop.find("aws_guard_before_stop(").unwrap());
     }
 

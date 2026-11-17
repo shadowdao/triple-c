@@ -663,6 +663,12 @@
           "markdownDescription": "Enables the ec2_fit_problem command without any pre-configured scope."
         },
         {
+          "description": "Enables the end_workspace_terminal command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-end-workspace-terminal",
+          "markdownDescription": "Enables the end_workspace_terminal command without any pre-configured scope."
+        },
+        {
           "description": "Enables the export_settings command without any pre-configured scope.",
           "type": "string",
           "const": "allow-export-settings",
@@ -879,6 +885,12 @@
           "markdownDescription": "Enables the list_scheduled_tasks command without any pre-configured scope."
         },
         {
+          "description": "Enables the list_workspace_terminals command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-list-workspace-terminals",
+          "markdownDescription": "Enables the list_workspace_terminals command without any pre-configured scope."
+        },
+        {
           "description": "Enables the marketplace_gh_host_available command without any pre-configured scope.",
           "type": "string",
           "const": "allow-marketplace-gh-host-available",
@@ -973,6 +985,12 @@
           "type": "string",
           "const": "allow-read-container-file",
           "markdownDescription": "Enables the read_container_file command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the reattach_terminal_session command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-reattach-terminal-session",
+          "markdownDescription": "Enables the reattach_terminal_session command without any pre-configured scope."
         },
         {
           "description": "Enables the rebuild_project_container command without any pre-configured scope.",
@@ -1659,6 +1677,12 @@
           "markdownDescription": "Denies the ec2_fit_problem command without any pre-configured scope."
         },
         {
+          "description": "Denies the end_workspace_terminal command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-end-workspace-terminal",
+          "markdownDescription": "Denies the end_workspace_terminal command without any pre-configured scope."
+        },
+        {
           "description": "Denies the export_settings command without any pre-configured scope.",
           "type": "string",
           "const": "deny-export-settings",
@@ -1875,6 +1899,12 @@
           "markdownDescription": "Denies the list_scheduled_tasks command without any pre-configured scope."
         },
         {
+          "description": "Denies the list_workspace_terminals command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-list-workspace-terminals",
+          "markdownDescription": "Denies the list_workspace_terminals command without any pre-configured scope."
+        },
+        {
           "description": "Denies the marketplace_gh_host_available command without any pre-configured scope.",
           "type": "string",
           "const": "deny-marketplace-gh-host-available",
@@ -1969,6 +1999,12 @@
           "type": "string",
           "const": "deny-read-container-file",
           "markdownDescription": "Denies the read_container_file command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the reattach_terminal_session command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-reattach-terminal-session",
+          "markdownDescription": "Denies the reattach_terminal_session command without any pre-configured scope."
         },
         {
           "description": "Denies the rebuild_project_container command without any pre-configured scope.",

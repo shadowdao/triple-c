@@ -5,6 +5,7 @@
 
 use futures_util::StreamExt;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, Mutex};
@@ -22,6 +23,10 @@ pub struct ExecSession {
     pub target: ContainerTarget,
     pub input_tx: mpsc::UnboundedSender<Vec<u8>>,
     shutdown_tx: mpsc::Sender<()>,
+    /// Set when a new exec took this session id over (a persistent AWS
+    /// terminal re-attached): this one then ends without its exit callback,
+    /// so the tab is not told its session ended.
+    superseded: Arc<AtomicBool>,
 }
 
 impl ExecSession {
@@ -106,6 +111,8 @@ impl ExecSessionManager {
 
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+        let superseded = Arc::new(AtomicBool::new(false));
+        let superseded_reader = superseded.clone();
 
         // Output reader task
         let session_id_clone = session_id.to_string();
@@ -134,7 +141,9 @@ impl ExecSessionManager {
                     }
                 }
             }
-            on_exit();
+            if !superseded_reader.load(Ordering::SeqCst) {
+                on_exit();
+            }
             let _ = shutdown_tx_clone;
         });
 
@@ -153,12 +162,18 @@ impl ExecSessionManager {
             target: target.clone(),
             input_tx,
             shutdown_tx,
+            superseded,
         };
 
-        self.sessions
+        let old = self
+            .sessions
             .lock()
             .await
             .insert(session_id.to_string(), session);
+        if let Some(old) = old {
+            old.superseded.store(true, Ordering::SeqCst);
+            old.shutdown();
+        }
 
         Ok(())
     }

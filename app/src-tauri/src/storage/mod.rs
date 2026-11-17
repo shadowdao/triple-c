@@ -5,6 +5,7 @@ pub mod projects_store;
 pub mod secure;
 pub mod settings_crypto;
 pub mod settings_store;
+pub mod terminal_store;
 
 #[allow(unused_imports)]
 pub use projects_store::*;
