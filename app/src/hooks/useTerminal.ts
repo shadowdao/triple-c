@@ -84,6 +84,14 @@ function discardInputQueue(sessionId: string): void {
   if (!q.draining) inputQueues.delete(sessionId);
 }
 
+/** Session ids whose `open_terminal_session` is in flight: a reconnect sync
+ *  listing the workspace meanwhile must not reopen them as a second tab. */
+const opening = new Set<string>();
+
+export function isOpening(sessionId: string): boolean {
+  return opening.has(sessionId);
+}
+
 export function useTerminal() {
   const { sessions, activeSessionId, addSession, removeSession, setActiveSession } =
     useAppState(
@@ -105,7 +113,15 @@ export function useTerminal() {
       resumeSessionId?: string,
     ) => {
       const sessionId = crypto.randomUUID();
-      const opened = await commands.openTerminalSession(projectId, sessionId, sessionType, sessionName, resumeSessionId);
+      opening.add(sessionId);
+      let opened;
+      try {
+        opened = await commands.openTerminalSession(projectId, sessionId, sessionType, sessionName, resumeSessionId);
+      } catch (e) {
+        opening.delete(sessionId);
+        throw e;
+      }
+      opening.delete(sessionId);
       addSession({
         id: sessionId,
         projectId,

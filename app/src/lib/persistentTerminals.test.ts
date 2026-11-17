@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { reattachTab, reattachWithRetry, terminalLabel, terminalsToReopen } from "./persistentTerminals";
+import { nextReconnect, reattachTab, reattachWithRetry, terminalLabel, terminalsToReopen, RECONNECT_DELAY_MS } from "./persistentTerminals";
 import type { ReattachOutcome, WorkspaceTerminal } from "./types";
 
 const noSleep = () => Promise.resolve();
@@ -76,5 +76,17 @@ describe("which terminals come back as tabs", () => {
     });
     expect(terminalLabel(term("k", true, "claude"))).toBe("Claude Code");
     expect(terminalLabel(term("k", true, "bash"))).toBe("Shell");
+  });
+});
+
+describe("nextReconnect", () => {
+  it("reattaches at once after a long-lived attach, backs off on quick drops, then stops", () => {
+    expect(nextReconnect(0, 10_000, 0)).toEqual({ delayMs: 0, quickExits: 0 });
+    expect(nextReconnect(1_000, 60_000, 2)).toEqual({ delayMs: 0, quickExits: 0 });
+    let r = nextReconnect(1_000, 2_000, 0);
+    expect(r).toEqual({ delayMs: RECONNECT_DELAY_MS, quickExits: 1 });
+    r = nextReconnect(1_000, 2_000, r.quickExits);
+    expect(r).toEqual({ delayMs: RECONNECT_DELAY_MS * 2, quickExits: 2 });
+    expect(nextReconnect(1_000, 2_000, r.quickExits).delayMs).toBeNull();
   });
 });

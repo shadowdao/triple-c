@@ -43,6 +43,27 @@ export async function reattachWithRetry(opts: {
   return opts.stillWanted() ? "gave_up" : "cancelled";
 }
 
+/** An exit this soon after a successful reattach counts as a quick one. */
+export const QUICK_EXIT_MS = 5000;
+/** Quick exits in a row before a tab stops reattaching on its own. */
+export const MAX_QUICK_EXITS = 3;
+
+/**
+ * What a persistent tab does when its exec ends: reattach now (`delayMs` 0),
+ * after a back-off, or stop (`null`) when attaches keep dropping right after
+ * they succeed. `quickExits` is the new count to keep.
+ */
+export function nextReconnect(
+  lastReattachAt: number,
+  now: number,
+  quickExits: number,
+): { delayMs: number | null; quickExits: number } {
+  const quick = lastReattachAt > 0 && now - lastReattachAt < QUICK_EXIT_MS;
+  const count = quick ? quickExits + 1 : 0;
+  if (count >= MAX_QUICK_EXITS) return { delayMs: null, quickExits: count };
+  return { delayMs: count === 0 ? 0 : RECONNECT_DELAY_MS * count, quickExits: count };
+}
+
 /** The tab label a workspace terminal gets when nothing else names it. */
 export function terminalLabel(t: Pick<WorkspaceTerminal, "kind" | "name">): string {
   return t.name ?? (t.kind === "claude" ? "Claude Code" : "Shell");

@@ -232,6 +232,38 @@ lifetime_reached() {
     [ -n "$lifetime" ] && [ $(( $(date +%s) - started_at )) -ge $((lifetime * 60)) ]
 }
 
+# Persistent terminals (the app's tmux servers, app/src-tauri/src/host/persistent.rs)
+# would keep writing after the push's snapshot: end them, as their user,
+# before a lifetime-cap push (the stop is certain then; an idle stop has no
+# live terminal output to lose). Same script as entrypoint.sh's.
+end_terminals() {
+    command -v tmux >/dev/null 2>&1 || return 0
+    local script
+    # >>> end_terminals (app/src-tauri/src/host/persistent.rs END_ALL_SCRIPT, verbatim)
+    script=$(cat <<'TRIPLEC_END_TERMINALS'
+d="${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)"
+command -v tmux >/dev/null 2>&1 || exit 0
+pids=""
+for s in "$d"/triple-c-*; do
+  [ -S "$s" ] || continue
+  pids="$pids $(tmux -L "${s##*/}" list-panes -a -F '#{pane_pid}' 2>/dev/null)"
+  tmux -L "${s##*/}" kill-server 2>/dev/null
+done
+i=0
+while [ $i -lt 50 ]; do
+  alive=""
+  for p in $pids; do kill -0 "$p" 2>/dev/null && alive=1; done
+  pgrep -u "$(id -u)" -f '^tmux -L triple-c-' >/dev/null 2>&1 && alive=1
+  [ -n "$alive" ] || break
+  sleep 0.1; i=$((i + 1))
+done
+exit 0
+TRIPLEC_END_TERMINALS
+)
+    # <<< end_terminals
+    as_user sh -c "$script"
+}
+
 # The cap is reached: push (best effort) unless the app has decided already,
 # record "lifetime", signal the entrypoint and end.
 lifetime_stop() {
@@ -241,6 +273,7 @@ lifetime_stop() {
         pushed|discard)
             echo "triple-c-idle-watch: Triple-C is already stopping it — keeping its decision" ;;
         *)
+            end_terminals
             if [ "$wip_push" = 1 ]; then
                 echo "triple-c-idle-watch: pushing work in progress before the stop..."
                 as_user timeout -k 5 "$wip_timeout" "$wip_bin" --reason lifetime \

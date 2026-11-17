@@ -1153,12 +1153,17 @@ pub async fn update_project(
     // status change or a container id landing since `stored` was read is kept
     // rather than written over.
     let mappings_changed = stored.port_mappings != project.port_mappings;
+    let left_aws = stored.is_aws() && !project.is_aws();
     let saved = state
         .projects_store
         .update_restoring(project, restore_store_owned_fields)?;
 
     // AWS (Q6): a connected workspace's forwards follow the saved mappings
     // now — there is no container to recreate. Nothing when not connected.
+    if left_aws {
+        // Moved to Docker: its workspace terminals went with the task.
+        crate::storage::terminal_store::clear(&saved.id);
+    }
     if saved.is_aws() && mappings_changed {
         let warn = ports_warner(&app_handle, &saved.id, &saved.name);
         if let Some(detail) = crate::host::port_forwards::open_for_project(&state.projects_store, &saved.id, Some(warn)).await {

@@ -1359,13 +1359,19 @@ fn aws_stop_ends_the_persistent_terminals_before_its_push() {
     let calls = fs::read_to_string(&log).unwrap();
     assert_eq!(
         calls,
-        "tmux -L triple-c-aaa kill-server\ntmux -L triple-c-bbb kill-server\npush --reason sigterm\n"
+        "tmux -L triple-c-aaa list-panes -a -F #{pane_pid}\ntmux -L triple-c-aaa kill-server\n\
+         tmux -L triple-c-bbb list-panes -a -F #{pane_pid}\ntmux -L triple-c-bbb kill-server\n\
+         push --reason sigterm\n"
     );
     drop(keep);
-    // The app's own Stop ends them with the same loop.
-    let app = crate::host::persistent::end_all_cmd().join(" ");
-    assert!(app.contains(r#"tmux -L "${s##*/}" kill-server"#) && app.contains("\"$d\"/triple-c-*"), "{app}");
-    assert!(block(ENTRYPOINT, "aws_stop").contains(r#"tmux -L "${s##*/}" kill-server"#));
+    // The app's own Stop and the idle watcher's lifetime stop run the very
+    // same script.
+    let script = crate::host::persistent::END_ALL_SCRIPT;
+    assert!(block(ENTRYPOINT, "aws_stop").contains(script));
+    assert!(IDLE_WATCH.contains(script));
+    assert_eq!(crate::host::persistent::end_all_cmd()[2], script);
+    let lifetime = &IDLE_WATCH[IDLE_WATCH.find("lifetime_stop() {").unwrap()..];
+    assert!(lifetime.find("end_terminals").unwrap() < lifetime.find("--reason lifetime").unwrap());
 }
 
 #[test]

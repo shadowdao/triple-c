@@ -4,6 +4,7 @@ import { isAwsProject } from "../lib/awsWorkspace";
 import { listWorkspaceTerminals } from "../lib/tauri-commands";
 import { reattachTab, terminalsToReopen } from "../lib/persistentTerminals";
 import type { Project } from "../lib/types";
+import { isOpening } from "./useTerminal";
 
 /** Connections already synced this run, `<project id>|<target id>`: an AWS
  *  project's `container_id` is its tunnel's endpoint, new on every connect. */
@@ -30,7 +31,9 @@ export async function syncProjectTerminals(project: Project): Promise<number> {
   const running = await listWorkspaceTerminals(project.id);
   const state = useAppState.getState();
   const open = new Set(state.sessions.map((s) => s.id));
-  const reopen = terminalsToReopen(running, open);
+  // A tab being opened right now is listed (and remembered) before its
+  // own addSession lands: never a second copy of it.
+  const reopen = terminalsToReopen(running, open).filter((t) => !isOpening(t.session_id));
   for (const t of reopen) {
     state.addSession(reattachTab(project.id, project.name, t), { activate: false });
   }

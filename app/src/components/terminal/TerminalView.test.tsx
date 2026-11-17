@@ -2191,11 +2191,55 @@ describe("persistent AWS terminals", () => {
     expect(reattachTerminalSession).toHaveBeenCalledWith("p1", "s1", null);
     expect(screenText()).not.toContain("[Session ended]");
 
+    // Long after that attach (a quick drop would back off first).
+    const later = Date.now() + 60_000;
+    const now = vi.spyOn(Date, "now").mockReturnValue(later);
     reattachTerminalSession.mockResolvedValue({ outcome: "ended" });
     await act(async () => exit({ payload: [] }));
     await settle();
     expect(screenText()).toContain("[Session ended]");
     expect(useAppState.getState().sessions[0].persistent).toBe(false);
+    now.mockRestore();
+  });
+
+  it("stops reattaching a session that keeps dropping right after it attaches", async () => {
+    reattachTerminalSession.mockResolvedValue({ outcome: "reattached", kind: "claude", name: null });
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    mountPersistent(false);
+    await settle();
+    const exit = ptyOutput.listeners.get("terminal-exit-s1");
+    if (!exit) throw new Error("no exit listener");
+    for (let i = 0; i < 4; i++) {
+      await act(async () => exit({ payload: [] }));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(i === 0 ? 100 : 3000 * i + 100);
+      });
+      await settle();
+    }
+    // First drop reattaches at once; the next two are quick and back off;
+    // the third quick one stops.
+    expect(reattachTerminalSession).toHaveBeenCalledTimes(3);
+    expect(screenText()).toContain("keeps dropping");
+    vi.useRealTimers();
+  });
+
+  it("only the first chunk after a replay request is the replay", async () => {
+    reattachTerminalSession.mockImplementation(async () => {
+      const emit = ptyOutput.listeners.get("terminal-output-s1")!;
+      emit({ payload: Array.from(new TextEncoder().encode("old history\r\n")) });
+      return { outcome: "reattached", kind: "claude", name: null };
+    });
+    mountPersistent(true);
+    await settle();
+    expect(screenText()).toContain("old history");
+    // Live output now gets the URL detector again.
+    const emit = ptyOutput.listeners.get("terminal-output-s1")!;
+    await act(async () => {
+      emit({ payload: Array.from(new TextEncoder().encode(`\x1b]7777;open;${btoa("https://example.com/live")}\x07`)) });
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    await settle();
+    expect(document.querySelector(URL_TOAST_SELECTOR)).not.toBeNull();
   });
 
   it("an ordinary tab's exit just ends it", async () => {

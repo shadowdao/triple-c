@@ -28,6 +28,7 @@ import {
   EC2_NO_CAPACITY,
   EC2_NO_SIDECAR,
   EC2_SCALE_TO_ZERO_NOTE,
+  PERSISTENT_TERMINALS_NOTE,
   launchTypeChanges,
   launchTypePatch,
   type Ec2Limits,
@@ -317,6 +318,7 @@ export default function HostSection({ project, save, disabled }: Props) {
           This environment stops workspaces after {maxHours} h (advisory).
         </p>
       )}
+      <p className="text-xs text-[var(--text-secondary)]">{PERSISTENT_TERMINALS_NOTE}</p>
 
       <div>
         <span className="block text-[13px] font-medium text-[var(--text-primary)] mb-1">

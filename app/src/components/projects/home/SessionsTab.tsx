@@ -153,7 +153,8 @@ function WorkspaceTerminals({ project }: { project: Project }) {
           </h3>
           <p className="text-xs text-[var(--text-secondary)]">
             Terminals keep running in the workspace when Triple-C closes or loses its
-            connection. Closing a tab ends its terminal.
+            connection. Closing a tab ends its terminal. A Claude session left running keeps
+            the workspace up until it ends, you end it here, you Stop, or the lifetime cap.
           </p>
         </div>
         <Button onClick={load} disabled={loading}>
@@ -169,6 +170,9 @@ function WorkspaceTerminals({ project }: { project: Project }) {
           {terminals.map((t) => {
             const open = isOpen(t.session_id);
             const state = open ? "Open here" : t.attached ? "Attached elsewhere" : "Detached";
+            // The cost of a Claude that outlives the app: it keeps the
+            // workspace up (and billed) until it ends or is ended.
+            const keepsUp = !open && !t.attached && t.kind === "claude";
             return (
               <li
                 key={t.session_id}
@@ -181,6 +185,11 @@ function WorkspaceTerminals({ project }: { project: Project }) {
                     {formatElapsed(Date.now() - t.created_unix * 1000)}
                     {t.known ? "" : " · opened elsewhere"}
                   </div>
+                  {keepsUp && (
+                    <div className="text-xs text-[var(--warning)]">
+                      Keeps the workspace running while it runs — End it if you no longer need it.
+                    </div>
+                  )}
                 </div>
                 {!open && (
                   <Button variant="primary" onClick={() => reattach(t)}>

@@ -260,6 +260,10 @@ const RESERVED_ENV_PREFIXES: &[&str] = &["ANTHROPIC_", "AWS_", "GIT_", "HOST_", 
 /// value would silently outrank the keychain-held shared token and be invisible
 /// to the auth UI.
 const RESERVED_ENV_EXACT: &[&str] = &[
+    // Persistent AWS terminals (`host::persistent`): either would point a
+    // tab's tmux at another socket than the one the app lists and ends.
+    "TMUX",
+    "TMUX_TMPDIR",
     "CLAUDE_INSTRUCTIONS",
     "MCP_SERVERS_JSON",
     "CLAUDE_CODE_SETTINGS_JSON",

@@ -888,16 +888,30 @@ triplec_lifetime_exit=76
 # The app's own Stop does the same before its push.
 aws_end_terminals() {
     command -v tmux >/dev/null 2>&1 || return 0
-    _triplec_as_user sh -c '
-        d="${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)"
-        for s in "$d"/triple-c-*; do
-            [ -S "$s" ] && tmux -L "${s##*/}" kill-server 2>/dev/null
-        done
-        i=0
-        while pgrep -u "$(id -u)" -f "^tmux -L triple-c-" >/dev/null 2>&1 && [ $i -lt 50 ]; do
-            sleep 0.1; i=$((i + 1))
-        done
-        exit 0'
+    local script
+    # >>> end_terminals (app/src-tauri/src/host/persistent.rs END_ALL_SCRIPT, verbatim)
+    script=$(cat <<'TRIPLEC_END_TERMINALS'
+d="${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)"
+command -v tmux >/dev/null 2>&1 || exit 0
+pids=""
+for s in "$d"/triple-c-*; do
+  [ -S "$s" ] || continue
+  pids="$pids $(tmux -L "${s##*/}" list-panes -a -F '#{pane_pid}' 2>/dev/null)"
+  tmux -L "${s##*/}" kill-server 2>/dev/null
+done
+i=0
+while [ $i -lt 50 ]; do
+  alive=""
+  for p in $pids; do kill -0 "$p" 2>/dev/null && alive=1; done
+  pgrep -u "$(id -u)" -f '^tmux -L triple-c-' >/dev/null 2>&1 && alive=1
+  [ -n "$alive" ] || break
+  sleep 0.1; i=$((i + 1))
+done
+exit 0
+TRIPLEC_END_TERMINALS
+)
+    # <<< end_terminals
+    _triplec_as_user sh -c "$script"
 }
 aws_before_stop() {
     [ "${TRIPLEC_HOST:-}" = aws ] || return 0

@@ -117,7 +117,14 @@ async fn settle(store: &ProjectsStore, container: &ContainerTarget) -> Option<Pr
             return None;
         }
         match store.mark_exited(container_id, &seen, project_busy) {
-            ExitMark::Flipped(p) => return Some(*p),
+            ExitMark::Flipped(p) => {
+                // An AWS task that stopped by itself (idle, lifetime cap,
+                // crash) took its persistent terminals with it.
+                if p.is_aws() {
+                    crate::storage::terminal_store::clear(&p.id);
+                }
+                return Some(*p);
+            }
             ExitMark::NotApplicable => return None,
             // The store moved while the host was answering — possibly a stop and
             // start of this very container. The inspect is stale; ask again.

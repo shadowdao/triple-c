@@ -226,26 +226,32 @@ exit 0"#
 }
 
 /// End every session (Stop, before the WIP push's snapshot), then wait —
-/// bounded — until no tmux server of ours is left, so a pane's last writes
-/// land before the snapshot.
+/// bounded, 5 s — until the panes' processes (taken before the kill) and
+/// the servers are gone, so a pane's last writes land before the snapshot.
+/// The same script is `entrypoint.sh`'s `aws_end_terminals` and the idle
+/// watcher's (a test pins them together).
 pub fn end_all_cmd() -> Vec<String> {
-    vec![
-        "sh".into(),
-        "-c".into(),
-        format!(
-            r#"{SOCKET_DIR}
+    vec!["sh".into(), "-c".into(), END_ALL_SCRIPT.into()]
+}
+
+/// See [`end_all_cmd`].
+pub const END_ALL_SCRIPT: &str = r#"d="${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)"
 command -v tmux >/dev/null 2>&1 || exit 0
-for s in "$d"/{SOCKET_PREFIX}*; do
-  [ -S "$s" ] && tmux -L "${{s##*/}}" kill-server 2>/dev/null
+pids=""
+for s in "$d"/triple-c-*; do
+  [ -S "$s" ] || continue
+  pids="$pids $(tmux -L "${s##*/}" list-panes -a -F '#{pane_pid}' 2>/dev/null)"
+  tmux -L "${s##*/}" kill-server 2>/dev/null
 done
 i=0
-while pgrep -u "$(id -u)" -f '^tmux -L {SOCKET_PREFIX}' >/dev/null 2>&1 && [ $i -lt 50 ]; do
+while [ $i -lt 50 ]; do
+  alive=""
+  for p in $pids; do kill -0 "$p" 2>/dev/null && alive=1; done
+  pgrep -u "$(id -u)" -f '^tmux -L triple-c-' >/dev/null 2>&1 && alive=1
+  [ -n "$alive" ] || break
   sleep 0.1; i=$((i + 1))
 done
-exit 0"#
-        ),
-    ]
-}
+exit 0"#;
 
 /// A session found running in the workspace.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -276,8 +282,13 @@ pub fn parse_list(out: &str) -> Vec<RunningSession> {
 
 /// The exec environment of a tmux client: the caller's pairs (copy-at-connect
 /// credentials, which the server it starts inherits) plus [`OUTER_TERM`].
+/// `TMUX`/`TMUX_TMPDIR` are dropped (and reserved as custom variable
+/// names): either would point the client at another socket than the one the
+/// app lists and ends.
 pub fn client_env(mut env: Vec<String>) -> Vec<String> {
-    env.retain(|e| !e.starts_with("TERM="));
+    env.retain(|e| {
+        !e.starts_with("TERM=") && !e.starts_with("TMUX=") && !e.starts_with("TMUX_TMPDIR=")
+    });
     env.push(OUTER_TERM.to_string());
     env
 }
@@ -333,9 +344,13 @@ pub async fn probe(target: &ContainerTarget) -> Option<bool> {
     Some(supported)
 }
 
-/// [`probe`], an unanswered probe counting as no.
-pub async fn supported(target: &ContainerTarget) -> bool {
-    probe(target).await.unwrap_or(false)
+/// [`probe`] for callers that must not guess: an unanswered probe is an
+/// error (the caller retries), never "no tmux" — reading it as no would
+/// prune remembered sessions and end tabs whose Claude still runs.
+pub async fn supported(target: &ContainerTarget) -> Result<bool, String> {
+    probe(target)
+        .await
+        .ok_or_else(|| "The workspace did not answer whether it can keep terminals".to_string())
 }
 
 /// The "no tmux" notice, the first time it is asked for on a tunnel whose
@@ -404,11 +419,8 @@ pub async fn plan(
         return plan_with(false, false, None, key, kind, name, inner, env);
     }
     validate_key(key)?;
-    let ok = supported(target).await;
+    let ok = supported(target).await?;
     let notice = if ok { None } else { take_notice(target.id()) };
-    if !ok && notice.is_none() {
-        log::info!("Terminal {key}: not persistent (no tmux in the image, or it could not be asked)");
-    }
     plan_with(true, ok, notice, key, kind, name, inner, env)
 }
 
@@ -421,8 +433,9 @@ async fn small(target: &ContainerTarget, cmd: Vec<String>) -> Result<(String, i6
 }
 
 /// The sessions running in the workspace (none on an image without tmux).
+/// An `Err` (including an unanswered probe) says nothing about what runs.
 pub async fn list(target: &ContainerTarget) -> Result<Vec<RunningSession>, String> {
-    if !supported(target).await {
+    if !supported(target).await? {
         return Ok(Vec::new());
     }
     let (out, code) = small(target, list_cmd()).await?;

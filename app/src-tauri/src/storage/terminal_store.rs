@@ -42,6 +42,11 @@ struct File {
     version: u32,
     #[serde(default)]
     projects: BTreeMap<String, Vec<PersistedTerminal>>,
+    /// Tabs closed while the workspace could not be reached: their tmux
+    /// servers still run (a leftover Claude would keep a billed workspace
+    /// up), so they are ended at the next connect.
+    #[serde(default)]
+    pending_end: BTreeMap<String, Vec<String>>,
 }
 
 fn lock() -> &'static Mutex<()> {
@@ -78,6 +83,7 @@ fn load_file(dir: &Path) -> File {
 fn save_file(dir: &Path, mut file: File) -> Result<(), String> {
     file.version = FORMAT_VERSION;
     file.projects.retain(|_, v| !v.is_empty());
+    file.pending_end.retain(|_, v| !v.is_empty());
     let path = path_in(dir);
     let tmp = path.with_extension("json.tmp");
     let data = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
@@ -146,10 +152,38 @@ pub fn retain_in(dir: &Path, project_id: &str, running: &HashSet<String>) -> Res
     })
 }
 
-/// Forget all of a project's terminals (stopped, removed).
+/// Forget all of a project's terminals (stopped, removed, moved off AWS):
+/// remembered and pending-end alike.
 pub fn clear_in(dir: &Path, project_id: &str) -> Result<(), String> {
     edit_in(dir, |f| {
         f.projects.remove(project_id);
+        f.pending_end.remove(project_id);
+    })
+}
+
+/// Remember to end `session_id` at the project's next connect.
+pub fn add_pending_end_in(dir: &Path, project_id: &str, session_id: &str) -> Result<(), String> {
+    validate_key(session_id)?;
+    edit_in(dir, |f| {
+        let list = f.pending_end.entry(project_id.to_string()).or_default();
+        if !list.iter().any(|k| k == session_id) && list.len() < MAX_PER_PROJECT {
+            list.push(session_id.to_string());
+        }
+    })
+}
+
+/// The project's sessions waiting to be ended.
+pub fn pending_end_in(dir: &Path, project_id: &str) -> Vec<String> {
+    let _g = lock().lock().unwrap_or_else(|e| e.into_inner());
+    load_file(dir).pending_end.remove(project_id).unwrap_or_default()
+}
+
+/// They were ended (or are gone): stop remembering them.
+pub fn done_pending_end_in(dir: &Path, project_id: &str, ended: &[String]) -> Result<(), String> {
+    edit_in(dir, |f| {
+        if let Some(list) = f.pending_end.get_mut(project_id) {
+            list.retain(|k| !ended.contains(k));
+        }
     })
 }
 
@@ -173,6 +207,18 @@ pub fn find(session_id: &str) -> Option<(String, PersistedTerminal)> {
 
 pub fn retain(project_id: &str, running: &HashSet<String>) -> Result<(), String> {
     retain_in(&data_dir()?, project_id, running)
+}
+
+pub fn add_pending_end(project_id: &str, session_id: &str) -> Result<(), String> {
+    add_pending_end_in(&data_dir()?, project_id, session_id)
+}
+
+pub fn pending_end(project_id: &str) -> Vec<String> {
+    data_dir().map(|d| pending_end_in(&d, project_id)).unwrap_or_default()
+}
+
+pub fn done_pending_end(project_id: &str, ended: &[String]) -> Result<(), String> {
+    done_pending_end_in(&data_dir()?, project_id, ended)
 }
 
 /// Best effort: a failure is logged (the next listing prunes anyway).
@@ -225,6 +271,22 @@ mod tests {
         assert_eq!(list_in(&d, "p"), vec![t("c", TerminalKind::Bash, None)]);
         clear_in(&d, "p").unwrap();
         assert!(list_in(&d, "p").is_empty());
+    }
+
+    #[test]
+    fn a_tab_closed_while_disconnected_is_ended_at_the_next_connect() {
+        let d = dir("pending");
+        add_pending_end_in(&d, "p", "a-1").unwrap();
+        add_pending_end_in(&d, "p", "a-1").unwrap();
+        add_pending_end_in(&d, "p", "b-2").unwrap();
+        add_pending_end_in(&d, "q", "c-3").unwrap();
+        assert!(add_pending_end_in(&d, "p", "../x").is_err());
+        assert_eq!(pending_end_in(&d, "p"), ["a-1", "b-2"]);
+        done_pending_end_in(&d, "p", &["a-1".to_string()]).unwrap();
+        assert_eq!(pending_end_in(&d, "p"), ["b-2"]);
+        clear_in(&d, "p").unwrap();
+        assert!(pending_end_in(&d, "p").is_empty());
+        assert_eq!(pending_end_in(&d, "q"), ["c-3"], "per project");
     }
 
     #[test]

@@ -275,6 +275,8 @@ pub async fn close_terminal_session(
     state.exec_manager.close_session(&session_id).await;
 
     if let Some((project_id, _)) = terminal_store::find(&session_id) {
+        // A reattach of this tab still in flight must not remember it again.
+        mark_closed(&session_id);
         if let Err(e) = terminal_store::remove(&session_id) {
             log::warn!("Could not forget terminal {session_id}: {e}");
         }
@@ -285,19 +287,58 @@ pub async fn close_terminal_session(
             .get(&project_id)
             .and_then(|p| ContainerTarget::for_project(&p))
             .or(session_target);
-        match target {
-            Some(t) => {
-                if let Err(e) = persistent::end(&t, &session_id).await {
-                    log::warn!("Could not end terminal {session_id} in the workspace: {e}");
-                }
+        let ended = match target {
+            Some(t) => persistent::end(&t, &session_id).await,
+            None => Err("not connected".to_string()),
+        };
+        if let Err(e) = ended {
+            // Still running in the workspace (a leftover Claude would keep
+            // it up): end it at the next connect.
+            log::warn!("Terminal {session_id}: could not end it now ({e}); ending it at the next connect");
+            if let Err(e) = terminal_store::add_pending_end(&project_id, &session_id) {
+                log::warn!("Could not remember to end terminal {session_id}: {e}");
             }
-            None => log::warn!(
-                "Terminal {session_id}: not connected, so it keeps running in the workspace \
-                 (Project Home → Sessions lists it)"
-            ),
         }
     }
     Ok(())
+}
+
+/// Session ids whose tab was closed in this run of the app.
+fn closed_ids() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static C: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    C.get_or_init(Default::default)
+}
+
+fn mark_closed(session_id: &str) {
+    closed_ids().lock().unwrap_or_else(|e| e.into_inner()).insert(session_id.to_string());
+}
+
+fn was_closed(session_id: &str) -> bool {
+    closed_ids().lock().unwrap_or_else(|e| e.into_inner()).contains(session_id)
+}
+
+/// End the project's sessions whose tabs were closed while it could not be
+/// reached; returns the ones ended (or found gone).
+async fn end_pending(project_id: &str, target: &ContainerTarget, running: &[persistent::RunningSession]) -> Vec<String> {
+    let pending = terminal_store::pending_end(project_id);
+    let mut done = Vec::new();
+    for key in pending {
+        if !running.iter().any(|r| r.key == key) {
+            done.push(key);
+            continue;
+        }
+        match persistent::end(target, &key).await {
+            Ok(()) => done.push(key),
+            Err(e) => log::warn!("Could not end closed terminal {key}: {e}"),
+        }
+    }
+    if !done.is_empty() {
+        if let Err(e) = terminal_store::done_pending_end(project_id, &done) {
+            log::warn!("Could not update the terminals to end: {e}");
+        }
+    }
+    done
 }
 
 /// A connected AWS project's target, waiting for a re-attach in progress.
@@ -330,7 +371,11 @@ pub async fn list_workspace_terminals(
         return Ok(Vec::new());
     }
     let target = aws_target(&project).await?;
-    let running = persistent::list(&target).await?;
+    // An `Err` (an unanswered probe or listing) says nothing about what runs:
+    // nothing is pruned or ended on it, and the caller asks again.
+    let mut running = persistent::list(&target).await?;
+    let ended = end_pending(&project_id, &target, &running).await;
+    running.retain(|r| !ended.contains(&r.key));
     let keys = running.iter().map(|r| r.key.clone()).collect();
     if let Err(e) = terminal_store::retain(&project_id, &keys) {
         log::warn!("Could not prune remembered terminals: {e}");
@@ -384,9 +429,16 @@ pub async fn reattach_terminal_session(
         .projects_store
         .get(&project_id)
         .ok_or_else(|| format!("Project {} not found", project_id))?;
+    if was_closed(&session_id) {
+        return Ok(ReattachOutcome::Ended);
+    }
     let target = aws_target(&project).await?;
-    if !persistent::supported(&target).await {
+    // Unanswered → `Err` (the tab retries); only a real "no tmux" ends it.
+    if !persistent::supported(&target).await? {
         terminal_store::remove(&session_id).ok();
+        return Ok(ReattachOutcome::Ended);
+    }
+    if terminal_store::pending_end(&project_id).contains(&session_id) {
         return Ok(ReattachOutcome::Ended);
     }
     let running = persistent::list(&target).await?;
@@ -404,12 +456,14 @@ pub async fn reattach_terminal_session(
 
     let output_event = format!("terminal-output-{}", session_id);
     if let Some(rows) = rows {
-        if let Some(history) = persistent::history(&target, &session_id).await {
-            let bytes = persistent::replay_bytes(&history, rows);
-            if !bytes.is_empty() {
-                let _ = app_handle.emit(&output_event, bytes);
-            }
-        }
+        // Exactly one chunk, empty when there is no history: the tab treats
+        // the first chunk after asking for a replay as the replay, so live
+        // output after it gets its URL/OSC/SSO handling again.
+        let bytes = persistent::history(&target, &session_id)
+            .await
+            .map(|h| persistent::replay_bytes(&h, rows))
+            .unwrap_or_default();
+        let _ = app_handle.emit(&output_event, bytes);
     }
 
     let exit_event = format!("terminal-exit-{}", session_id);
@@ -431,6 +485,12 @@ pub async fn reattach_terminal_session(
         )
         .await?;
 
+    // Closed while this attach was under way: its close already ended (or
+    // queued the end of) the session; don't remember it again.
+    if was_closed(&session_id) {
+        state.exec_manager.close_session(&session_id).await;
+        return Ok(ReattachOutcome::Ended);
+    }
     let entry = PersistedTerminal { id: session_id.clone(), kind, name: name.clone() };
     if let Err(e) = terminal_store::add(&project_id, entry) {
         log::warn!("Could not remember terminal {session_id}: {e}");

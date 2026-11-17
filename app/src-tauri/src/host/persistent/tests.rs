@@ -161,3 +161,26 @@ fn the_image_ships_the_config_and_tmux() {
     assert!(df.contains("COPY triple-c-tmux.conf /etc/triple-c/tmux.conf"));
     assert!(df.lines().any(|l| l.trim() == "tmux \\"), "tmux in an apt layer");
 }
+
+/// An unanswered probe (a tunnel reopening) is an error, never "no tmux":
+/// read as no, the listing would prune every remembered tab and a reattach
+/// would end tabs whose Claude still runs.
+#[tokio::test]
+async fn an_unanswered_probe_is_an_error_not_a_no() {
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let target = ContainerTarget::Agent(
+        crate::host::AgentEndpoint::loopback(port, "x".repeat(64)),
+    );
+    assert_eq!(probe(&target).await, None);
+    assert!(supported(&target).await.is_err());
+    assert!(list(&target).await.is_err(), "no listing, so nothing to prune");
+    let planned = plan(true, &target, KEY, TerminalKind::Claude, None, claude_inner(), vec![]).await;
+    assert!(planned.is_err(), "not silently a non-persistent tab");
+    assert!(probes().lock().unwrap().get(target.id()).is_none(), "asked again next time");
+}
+
+#[test]
+fn the_client_env_drops_what_would_point_tmux_elsewhere() {
+    let env = client_env(vec!["TMUX=/tmp/x,1,0".into(), "TMUX_TMPDIR=/elsewhere".into(), "A=1".into()]);
+    assert_eq!(env, vec!["A=1".to_string(), OUTER_TERM.to_string()]);
+}

@@ -339,13 +339,30 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
     process group). **Reattach is `attach-session`, never `new-session -A`**: a session that
     ended while the app was away must not come back as a fresh `claude` (and the update prelude
     runs once, inside, never again on reattach).
-  - **Stop ends every tmux server** (`persistent::end_all`, bounded wait for the servers to go)
-    in the same `close_first` step that closes the tabs, **before** the stop guard's push
-    snapshot; the entrypoint's TERM hook does the same before its own push (`aws_end_terminals`).
-  - Probe (`command -v tmux` + the config) once per tunnel, cached by target id and forgotten in
-    `tunnels::register*`; without it the old launch runs and `open_terminal_session` returns a
-    one-time notice. Every tmux exec except the attach goes through `exec_oneshot_background`
-    (never idle-stop activity).
+  - **Stop ends every tmux server** (`persistent::END_ALL_SCRIPT`: the panes' pids are taken
+    before `kill-server`, then a bounded 5 s wait for them and the servers) in the same
+    `close_first` step that closes the tabs, **before** the stop guard's push snapshot. The
+    entrypoint's TERM hook (`aws_end_terminals`) and the idle watcher's lifetime-cap push run the
+    same script verbatim (a test pins all three). The store is cleared on Stop, Remove, a move to
+    Docker and a death-watch stop.
+  - **The probe** (`command -v tmux` + the config) runs once per tunnel, cached by target id and
+    forgotten in `tunnels::register*`, and is **three-state**: yes → persistent; a real no (an
+    image without tmux) → the old launch plus a one-time notice; **unanswered → `Err`**, never
+    "no" — read as no, a listing would prune every remembered tab and a reattach would end tabs
+    whose Claude still runs. Nothing is pruned or ended on an `Err`; the frontend asks again.
+    Every tmux exec except the attach goes through `exec_oneshot_background` (never idle-stop
+    activity). `TMUX`/`TMUX_TMPDIR` are dropped from the client env and reserved custom names.
+  - **A tab closed while disconnected** is queued (`terminal_store` `pending_end`) and ended at the
+    next connect (`list_workspace_terminals` runs it first); a reattach of a closed or queued id
+    is `Ended`, and a reattach that finishes after its tab closed does not remember it again.
+  - **The web terminal's exec ids are `web-<tmux key>`**, never the bare key the desktop uses:
+    sharing one `ExecSessionManager` id would let either front end's attach supersede the
+    other's exec (no exit callback, a frozen tab) or its close/disconnect end the other's.
+  - **Cost, by ruling:** a detached `claude` still counts for the idle watcher — that *is* the
+    feature (remote control keeps working with the app closed) — so a Claude left running keeps
+    the workspace up and billed until it ends, it is ended (Project Home → Sessions flags
+    detached Claude sessions, with End), Stop, or the lifetime cap. HostSection's notes say so
+    (`PERSISTENT_TERMINALS_NOTE`). A detached shell does not keep it up.
   - Frontend: a persistent tab reattaches on exit (retrying while the tunnel comes back) and shows
     "[Session ended]" only when the workspace says the session is gone or the project stopped;
     `usePersistentTerminals` reopens this app's sessions once per connection (`id|container_id`)

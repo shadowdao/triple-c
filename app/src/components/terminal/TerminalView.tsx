@@ -38,7 +38,7 @@ import { resolveTerminalGpuRendering } from "../../lib/terminalRenderer";
 import TerminalContextMenu from "./TerminalContextMenu";
 import { createFilePathLinkProvider } from "./filePathLinkProvider";
 import { reattachTerminalSession } from "../../lib/tauri-commands";
-import { reattachWithRetry } from "../../lib/persistentTerminals";
+import { nextReconnect, reattachWithRetry } from "../../lib/persistentTerminals";
 import type { FilePathMatch } from "../../lib/filePathLinks";
 
 interface Props {
@@ -1364,6 +1364,9 @@ export default function TerminalView({ sessionId, active }: Props) {
     const outputPromise = onOutput(sessionId, (data) => {
       if (aborted) return;
       if (replaying) {
+        // The backend sends a replay as exactly one chunk (empty when there
+        // is no history) before attaching: everything after it is live.
+        replaying = false;
         term.write(data, syncMouseCapture);
         return;
       }
@@ -1430,6 +1433,7 @@ export default function TerminalView({ sessionId, active }: Props) {
       const update = useAppState.getState().updateSession;
       switch (result) {
         case "reattached":
+          lastReattachAt = Date.now();
           update(sessionId, { pendingReattach: false });
           // tmux follows the newest client's size.
           resize(sessionId, term.cols, term.rows).catch(() => {});
@@ -1448,10 +1452,27 @@ export default function TerminalView({ sessionId, active }: Props) {
       }
     };
 
+    // An attach that keeps dropping right after it succeeds (a client that
+    // cannot stay attached) must not loop: back off, then stop.
+    let lastReattachAt = 0;
+    let quickExits = 0;
     const exitPromise = onExit(sessionId, () => {
       if (aborted) return;
       if (persistentRef.current) {
-        void reconnect(null);
+        const plan = nextReconnect(lastReattachAt, Date.now(), quickExits);
+        quickExits = plan.quickExits;
+        if (plan.delayMs === null) {
+          term.write(
+            "\r\n\x1b[33m[Disconnected: the session keeps dropping. It may still be running in " +
+              "the workspace: Project Home → Sessions can reattach or end it.]\x1b[0m\r\n",
+          );
+          return;
+        }
+        if (plan.delayMs === 0) void reconnect(null);
+        else
+          setTimeout(() => {
+            if (!aborted) void reconnect(null);
+          }, plan.delayMs);
         return;
       }
       ended();
