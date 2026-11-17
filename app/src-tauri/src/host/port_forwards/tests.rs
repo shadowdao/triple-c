@@ -198,7 +198,8 @@ async fn udp_reserved_and_duplicate_mappings_are_refused_per_mapping() {
     )
     .await;
     let errors: Vec<Option<&str>> = results.iter().map(|r| r.error.as_deref()).collect();
-    assert_eq!(errors.len(), 6, "an unfinished row is skipped: {errors:?}");
+    assert_eq!(errors.len(), 7, "{errors:?}");
+    assert_eq!(errors[6], Some("? → ?: incomplete, both ports are needed"), "skipped, not silently");
     assert!(errors[0].unwrap().contains("only TCP"), "{errors:?}");
     assert!(errors[1].is_none());
     assert!(errors[2].unwrap().contains("another mapping"), "{errors:?}");
@@ -433,6 +434,26 @@ async fn a_running_project_whose_mappings_cannot_open_is_never_silent() {
     // Only incomplete rows: nothing to say.
     let (_d, store) = aws_project_in_store(&p, ProjectStatus::Running, vec![tcp(0, 8080)]);
     assert_eq!(open_for_project(&store, &p, None).await, None);
+}
+
+#[tokio::test]
+async fn a_connect_warns_about_an_incomplete_row_and_opens_the_rest() {
+    use crate::models::ProjectStatus;
+    // The reported case: an older editor stored a new row as 0 → 0. The
+    // connect used to skip it in silence.
+    let p = pid("incomplete");
+    let port = free_port();
+    let (_d, store) =
+        aws_project_in_store(&p, ProjectStatus::Stopped, vec![tcp(0, 0), tcp(port, 8080), tcp(9000, 0)]);
+    let (_target, _fake, _) = connected_agent(&p).await;
+    store.update_status(&p, ProjectStatus::Running).unwrap();
+    let w = open_for_project(&store, &p, None).await.expect("a ports warning");
+    assert_eq!(
+        w,
+        "? → ?: incomplete, both ports are needed\n9000 → ?: incomplete, both ports are needed"
+    );
+    assert_eq!(open_ports(&p), vec![port]);
+    tunnels::close(&p).await;
 }
 
 #[tokio::test]

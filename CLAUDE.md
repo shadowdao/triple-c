@@ -311,7 +311,11 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   re-read the stored mappings under that lock; unchanged forwards are kept with their connections.
   Opened after every connect and on a save while connected; closed by every `tunnels::close*`
   path. A failing mapping is a `workspace-warning` (`topic: "ports"`), and so is a Running project
-  whose mappings could not be opened at all (no tunnel / tunnel replaced) — never silent. In the
+  whose mappings could not be opened at all (no tunnel / tunnel replaced) — never silent; a stored
+  row missing a port (0) is skipped with one too ("incomplete, both ports are needed").
+  `PortMappingsEditor` saves only complete rows (half-filled ones stay local, marked), adopts a
+  stored value only when it differs by value and no field in it has focus, and uses word
+  placeholders — a "8080" placeholder once read as a typed 8080 → 8080 that was saved as 0 → 0. In the
   workspace each connection picks `127.0.0.1` or `[::1]` from `/proc/net/tcp{,6}`
   (`tunnel::mapping_command`; no probe connection), and the first socat "Connection refused" per
   mapping is a `ports` warning ("nothing is listening on port N"). An idle listener makes no

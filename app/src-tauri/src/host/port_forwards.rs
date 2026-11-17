@@ -150,10 +150,21 @@ fn mapping_problem(m: &PortMapping, gateway_sidecar: bool) -> Option<String> {
     None
 }
 
-/// A row the editor saved before both its ports were typed (the editor
-/// saves on blur): nothing to check or forward yet, and nothing to say.
+/// A row stored without both its ports (an older editor saved a new row as
+/// 0 → 0 before anything was typed): nothing to check on save, and nothing
+/// to forward — but a connect says so ([`incomplete_warning`]), never silent.
 fn incomplete(m: &PortMapping) -> bool {
     m.host_port == 0 || m.container_port == 0
+}
+
+/// The `ports` warning line for a stored row a connect skips as incomplete.
+pub fn incomplete_warning(m: &PortMapping) -> String {
+    let port = |p: u16| if p == 0 { "?".to_string() } else { p.to_string() };
+    format!(
+        "{} → {}: incomplete, both ports are needed",
+        port(m.host_port),
+        port(m.container_port)
+    )
 }
 
 /// An AWS project's port mappings, checked in full: TCP only, no reserved
@@ -266,8 +277,10 @@ pub async fn open_latest(
     let mut results: Vec<PortForwardResult> = Vec::new();
     let mut wanted: Vec<(usize, u16, u16)> = Vec::new();
     let mut taken = HashSet::new();
-    for m in mappings.iter().filter(|m| !incomplete(m)) {
-        let error = if let Some(problem) = mapping_problem(m, gateway_sidecar) {
+    for m in &mappings {
+        let error = if incomplete(m) {
+            Some(incomplete_warning(m))
+        } else if let Some(problem) = mapping_problem(m, gateway_sidecar) {
             Some(problem)
         } else if !taken.insert(m.host_port) {
             Some(format!(
