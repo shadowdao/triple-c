@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { awsErrorMessage } from "../../../lib/aws-error";
-import type { AwsError, Ec2Choice, UserCompute } from "../../../lib/types";
+import type { AwsError, Ec2Choice, Ec2Compute, UserCompute } from "../../../lib/types";
 import Button from "../../ui/Button";
 import Modal from "../../ui/Modal";
 import Ec2CapacityFields from "./Ec2CapacityFields";
@@ -16,6 +16,8 @@ export default function JoinEnvironmentModal({
   region,
   recorded,
   reapply,
+  incomplete = false,
+  lastChoice = null,
   onJoin,
   onClose,
 }: {
@@ -25,11 +27,17 @@ export default function JoinEnvironmentModal({
   recorded: UserCompute | null;
   /** Already joined: this changes the onboarding's EC2 capacity. */
   reapply: boolean;
+  /** The last onboarding didn't finish (it may have built EC2 capacity
+   *  before writing the record). */
+  incomplete?: boolean;
+  /** The EC2 capacity last chosen here in this run of the app, if any:
+   *  the starting point when there is no record. */
+  lastChoice?: Ec2Compute | null;
   /** Starts the run; resolves to the command's error, or null once started. */
   onJoin: (ec2: Ec2Choice) => Promise<AwsError | null>;
   onClose: () => void;
 }) {
-  const [draft, setDraft] = useState<Ec2Draft>(() => ec2DraftFrom(recorded));
+  const [draft, setDraft] = useState<Ec2Draft>(() => ec2DraftFrom(recorded ?? lastChoice));
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<AwsError | null>(null);
   const picked = ec2FromDraft(draft);
@@ -72,6 +80,12 @@ export default function JoinEnvironmentModal({
         {recorded && !draft.enabled && (
           <p role="alert" className="text-[var(--warning)]">
             This removes your EC2 capacity ({recorded.instance_type}) in {environment}.
+          </p>
+        )}
+        {incomplete && !recorded && !draft.enabled && (
+          <p role="alert" className="text-[var(--warning)]">
+            Your last onboarding in {environment} didn't finish, and it may have built part of your EC2 capacity.
+            Choosing None removes anything it built; to keep it, choose your own EC2 instances with the same values.
           </p>
         )}
         {error && (

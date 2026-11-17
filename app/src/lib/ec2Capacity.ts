@@ -4,9 +4,13 @@ import type { Ec2Capacity, Project } from "./types";
 
 /** How long a user's EC2 capacity is reused before AWS is asked again. */
 export const EC2_CAPACITY_TTL_MS = 10 * 60 * 1000;
+/** The same for any other answer (`none`, `unusable`): an admin adding or
+ *  fixing the capacity shows up within a minute. */
+export const EC2_CAPACITY_SHORT_TTL_MS = 60 * 1000;
 
 interface Entry {
   at: number;
+  ttl: number;
   value: Promise<Ec2Capacity>;
 }
 
@@ -16,8 +20,10 @@ const cache = new Map<string, Entry>();
 
 /**
  * `aws_ec2_capacity`, cached per (connection, region, environment) for
- * [`EC2_CAPACITY_TTL_MS`]. A read in flight is shared; an `unknown` answer
- * (offline, slow) or a rejection is not kept, so the next mount asks again.
+ * [`EC2_CAPACITY_TTL_MS`] when the answer is `ec2`, and
+ * [`EC2_CAPACITY_SHORT_TTL_MS`] for `none` or `unusable`. A read in flight
+ * is shared; an `unknown` answer (offline, slow) or a rejection is not
+ * kept, so the next mount asks again.
  */
 export function ec2Capacity(
   projectId: string,
@@ -28,14 +34,17 @@ export function ec2Capacity(
 ): Promise<Ec2Capacity> {
   const key = JSON.stringify([connectionId, region, environment]);
   const hit = cache.get(key);
-  if (hit && now - hit.at < EC2_CAPACITY_TTL_MS) return hit.value;
+  if (hit && now - hit.at < hit.ttl) return hit.value;
   const value = Promise.resolve().then(() => commands.awsEc2Capacity(projectId));
-  const entry = { at: now, value };
+  const entry: Entry = { at: now, ttl: EC2_CAPACITY_TTL_MS, value };
   cache.set(key, entry);
   const forget = () => {
     if (cache.get(key) === entry) cache.delete(key);
   };
-  value.then((c) => c.state === "unknown" && forget(), forget);
+  value.then((c) => {
+    if (c.state === "unknown") forget();
+    else if (c.state !== "ec2") entry.ttl = EC2_CAPACITY_SHORT_TTL_MS;
+  }, forget);
   return value;
 }
 

@@ -40,6 +40,7 @@ beforeEach(() => {
   clearEnvironmentMaxHoursCache();
   clearEc2CapacityCache();
   awsEc2Capacity.mockImplementation(async () => NO_EC2);
+  ec2FitProblem.mockImplementation(async () => null);
 });
 
 function toggle(name: string) {
@@ -722,14 +723,21 @@ describe("HostSection — launch type (EC2)", () => {
 
   it("checks the reservations with the backend's fit rule before saving", async () => {
     awsEc2Capacity.mockImplementation(async () => M7I);
-    ec2FitProblem.mockResolvedValueOnce("This project reserves 1024 CPU units and 8000 MiB of memory, more than …");
+    ec2FitProblem.mockImplementation(async (config) =>
+      (config as { memory_mib: number }).memory_mib === 8000
+        ? "This project reserves 1024 CPU units and 8000 MiB of memory, more than …"
+        : null,
+    );
     renderHost(ec2Project());
     await waitFor(() => expect(screen.getByText(/Up to 1920/)).toBeInTheDocument());
+    // The load-time check found the stored 4096 MiB fits: no alert.
+    await waitFor(() => expect(ec2FitProblem).toHaveBeenCalledTimes(1));
+    expect(screen.queryByRole("alert")).toBeNull();
     const mem = screen.getByLabelText("Memory reservation (MiB)");
     fireEvent.change(mem, { target: { value: "8000" } });
     fireEvent.blur(mem);
     await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(/more than/));
-    expect(ec2FitProblem).toHaveBeenCalledWith(expect.objectContaining({ cpu: 1024, memory_mib: 8000 }), "m7i.large");
+    expect(ec2FitProblem).toHaveBeenLastCalledWith(expect.objectContaining({ cpu: 1024, memory_mib: 8000 }), "m7i.large");
     expect(save).not.toHaveBeenCalled();
 
     fireEvent.change(mem, { target: { value: "6000" } });
@@ -741,6 +749,55 @@ describe("HostSection — launch type (EC2)", () => {
     fireEvent.change(cpu, { target: { value: "0" } });
     fireEvent.blur(cpu);
     await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(/positive whole numbers/));
+  });
+
+  it("warns on load when the saved reservations no longer fit the instance type, once", async () => {
+    awsEc2Capacity.mockImplementation(async () => M7I);
+    ec2FitProblem.mockImplementation(async () => "This project reserves 4096 CPU units …, more than an m7i.large");
+    const p = ec2Project();
+    p.aws = { ...p.aws!, cpu: 4096 };
+    const { rerender } = renderHost(p);
+    await waitFor(() =>
+      expect(screen.getByRole("alert")).toHaveTextContent(/saved reservations no longer fit: .*more than an m7i.large/),
+    );
+    expect(ec2FitProblem).toHaveBeenCalledWith(expect.objectContaining({ cpu: 4096 }), "m7i.large");
+    rerender(<HostSection project={{ ...p }} save={save} disabled={false} />);
+    await act(async () => {});
+    expect(ec2FitProblem).toHaveBeenCalledTimes(1);
+    expect(save).not.toHaveBeenCalled();
+    cleanup();
+
+    // Fargate projects, and EC2 without a known instance type, aren't checked.
+    ec2FitProblem.mockClear();
+    renderHost(awsProject());
+    await waitFor(() => expect(ec2Segment()).toBeEnabled());
+    cleanup();
+    clearEc2CapacityCache();
+    awsEc2Capacity.mockImplementation(async () => NO_EC2);
+    renderHost(ec2Project());
+    await waitFor(() => expect(screen.getByText(/can't start on EC2 now/)).toBeInTheDocument());
+    expect(ec2FitProblem).not.toHaveBeenCalled();
+  });
+
+  it("says what a launch-type switch changed besides the type", async () => {
+    awsEc2Capacity.mockImplementation(async () => M7I);
+    const p = awsProject();
+    p.aws = { ...p.aws!, cpu: 4096, memory_mib: 16384, spot: true, gateway_sidecar: true };
+    renderHost(p);
+    await waitFor(() => expect(ec2Segment()).toBeEnabled());
+    fireEvent.click(ec2Segment());
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "Switched to EC2: CPU 4096 → 1920 units, memory 16384 → 7373 MiB, Spot turned off, LLM gateway sidecar turned off.",
+    );
+    cleanup();
+
+    const back = ec2Project({ allow_docker_access: true, vpn_support_enabled: true });
+    back.aws = { ...back.aws!, cpu: 1920, memory_mib: 7373 };
+    renderHost(back);
+    fireEvent.click(screen.getByRole("radio", { name: "Fargate" }));
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "Switched to Fargate: CPU 1920 → 1024 units, memory 7373 → 7168 MiB, Docker access turned off, VPN support turned off.",
+    );
   });
 
   it("prices an EC2 project as the user's instance type", async () => {
@@ -767,6 +824,12 @@ describe("RuntimeSection on EC2", () => {
     expect(toggle("Sandbox mode")).toHaveAttribute("aria-checked", "false");
     expect(screen.getByText(/root on your own instance/)).toBeInTheDocument();
     expect(screen.getByText(/Off on AWS for now/)).toBeInTheDocument();
+    // The VPN hint speaks of an ECS task on the user's instance, not of
+    // recreating a container or its volumes.
+    const vpn = screen.getByText(/VPN client \(PIA, WireGuard, OpenVPN\)/);
+    expect(vpn).toHaveTextContent(/an ECS task on your own EC2 instance/);
+    expect(vpn).toHaveTextContent(/next start/);
+    expect(vpn).not.toHaveTextContent(/recreates the container|volumes/);
   });
 });
 

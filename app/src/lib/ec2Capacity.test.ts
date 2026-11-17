@@ -18,7 +18,12 @@ vi.mock("./tauri-commands", () => ({
   awsEc2Capacity: (id: string) => awsEc2Capacity(id),
 }));
 
-import { EC2_CAPACITY_TTL_MS, clearEc2CapacityCache, ec2Capacity } from "./ec2Capacity";
+import {
+  EC2_CAPACITY_SHORT_TTL_MS,
+  EC2_CAPACITY_TTL_MS,
+  clearEc2CapacityCache,
+  ec2Capacity,
+} from "./ec2Capacity";
 
 describe("ec2Capacity", () => {
   beforeEach(() => {
@@ -34,6 +39,24 @@ describe("ec2Capacity", () => {
     expect(awsEc2Capacity).toHaveBeenCalledTimes(2);
     await ec2Capacity("p1", "c1", "eu-west-1", "dev", EC2_CAPACITY_TTL_MS);
     expect(awsEc2Capacity).toHaveBeenCalledTimes(3);
+  });
+
+  it("keeps none and unusable for a minute only, ec2 for ten", async () => {
+    expect(EC2_CAPACITY_SHORT_TTL_MS).toBe(60 * 1000);
+    expect(EC2_CAPACITY_TTL_MS).toBe(10 * 60 * 1000);
+    for (const answer of [{ state: "none" }, { state: "unusable", reason: "x" }] as Ec2Capacity[]) {
+      clearEc2CapacityCache();
+      awsEc2Capacity.mockClear();
+      awsEc2Capacity.mockResolvedValueOnce(answer);
+      expect(await ec2Capacity("p1", "c1", "eu-west-1", "dev", 0)).toEqual(answer);
+      await ec2Capacity("p1", "c1", "eu-west-1", "dev", EC2_CAPACITY_SHORT_TTL_MS - 1);
+      expect(awsEc2Capacity).toHaveBeenCalledTimes(1);
+      expect(await ec2Capacity("p1", "c1", "eu-west-1", "dev", EC2_CAPACITY_SHORT_TTL_MS)).toEqual(EC2);
+      expect(awsEc2Capacity).toHaveBeenCalledTimes(2);
+      // The ec2 answer that replaced it is kept for the long TTL.
+      await ec2Capacity("p1", "c1", "eu-west-1", "dev", EC2_CAPACITY_TTL_MS);
+      expect(awsEc2Capacity).toHaveBeenCalledTimes(2);
+    }
   });
 
   it("keeps none, but not unknown or a rejection", async () => {

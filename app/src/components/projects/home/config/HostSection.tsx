@@ -28,6 +28,7 @@ import {
   EC2_NO_CAPACITY,
   EC2_NO_SIDECAR,
   EC2_SCALE_TO_ZERO_NOTE,
+  launchTypeChanges,
   launchTypePatch,
   type Ec2Limits,
   FARGATE_CPUS,
@@ -96,6 +97,8 @@ export default function HostSection({ project, save, disabled }: Props) {
   const [setupProblem, setSetupProblem] = useState<string | null>(null);
   // The environment's advisory lifetime cap (Q8), from its record.
   const [maxHours, setMaxHours] = useState<number | null>(null);
+  // What the last launch-type switch changed besides the type (M6).
+  const [switchNote, setSwitchNote] = useState<string | null>(null);
 
   useEffect(() => {
     setCpuText(String(aws.cpu));
@@ -114,6 +117,27 @@ export default function HostSection({ project, save, disabled }: Props) {
       ? { cpu: capacity.available_cpu, memory_mib: capacity.available_memory_mib }
       : null;
   const ec2Reason = ec2Unavailable(capacity);
+
+  // Once the instance type is known, check the stored reservations against
+  // it (Rust's fit rule): an instance type changed at onboarding, or a
+  // record that came back after a save, can leave them too big.
+  const checkedFit = useRef<string | null>(null);
+  useEffect(() => {
+    if (!ec2 || !compute) return;
+    const key = `${project.id}:${compute.instance_type}`;
+    if (checkedFit.current === key) return;
+    checkedFit.current = key;
+    let cancelled = false;
+    commands
+      .ec2FitProblem(latest.current.value, compute.instance_type)
+      .then((problem) => {
+        if (!cancelled && problem) setMemoryProblem(`The saved reservations no longer fit: ${problem}`);
+      })
+      .catch(() => {}); // The start checks again.
+    return () => {
+      cancelled = true;
+    };
+  }, [ec2, compute, project.id]);
 
   useEffect(() => {
     setSetupScript(aws.setup_script ?? "");
@@ -188,11 +212,10 @@ export default function HostSection({ project, save, disabled }: Props) {
   const switchLaunchType = (launch_type: LaunchType) => {
     if (launch_type === latest.current.value.launch_type) return;
     setMemoryProblem(null);
-    const { aws: next, ...also } = launchTypePatch(
-      { ...project, aws: latest.current.value },
-      launch_type,
-      limits,
-    );
+    const before = { ...project, aws: latest.current.value };
+    const patch = launchTypePatch(before, launch_type, limits);
+    setSwitchNote(launchTypeChanges(before, patch));
+    const { aws: next, ...also } = patch;
     void saveAws(next!, also);
   };
 
@@ -313,6 +336,11 @@ export default function HostSection({ project, save, disabled }: Props) {
               : ec2Reason}
           </p>
         )}
+        {switchNote && (
+          <p role="status" className="mt-1 text-xs text-[var(--text-secondary)]">
+            {switchNote}
+          </p>
+        )}
         {ec2 && (
           <ul
             role="note"
@@ -374,79 +402,79 @@ export default function HostSection({ project, save, disabled }: Props) {
           </Field>
         </div>
       ) : (
-      <div className="flex flex-wrap gap-4">
-        <Field label="CPU">
-          {(id) => (
-            <select
-              id={id}
-              value={aws.cpu}
-              disabled={disabled}
-              className={selectClass}
-              onChange={(e) => {
-                const cpu = Number(e.target.value);
-                const memory_mib = memoryError(cpu, aws.memory_mib)
-                  ? nearestMemory(cpu, aws.memory_mib)
-                  : aws.memory_mib;
-                setMemoryProblem(null);
-                void saveAws({ cpu, memory_mib });
-              }}
-            >
-              {FARGATE_CPUS.filter(
-                // The gateway sidecar needs 1 vCPU / 2 GiB (Rust validates it too).
-                (c) => !aws.gateway_sidecar || c >= GATEWAY_SIDECAR_MIN_CPU,
-              ).map((c) => (
-                <option key={c} value={c}>
-                  {formatCpu(c)}
-                </option>
-              ))}
-            </select>
-          )}
-        </Field>
-        <Field
-          label="Memory (MiB)"
-          hint={(() => {
-            const opts = memoryOptions(aws.cpu);
-            return `${formatMemory(opts[0])} to ${formatMemory(opts[opts.length - 1])} with ${formatCpu(aws.cpu)}.`;
-          })()}
-        >
-          {(id) => (
-            <>
-              <input
+        <div className="flex flex-wrap gap-4">
+          <Field label="CPU">
+            {(id) => (
+              <select
                 id={id}
-                inputMode="numeric"
-                value={memory}
+                value={aws.cpu}
                 disabled={disabled}
-                list={`${id}-options`}
-                aria-invalid={memoryProblem ? true : undefined}
-                onChange={(e) => setMemory(e.target.value)}
-                onBlur={commitMemory}
-                onKeyDown={(e) => e.key === "Enter" && commitMemory()}
-                className={`w-32 ${inputClass}`}
-              />
-              <datalist id={`${id}-options`}>
-                {memoryOptions(aws.cpu).map((m) => (
-                  <option key={m} value={m} />
+                className={selectClass}
+                onChange={(e) => {
+                  const cpu = Number(e.target.value);
+                  const memory_mib = memoryError(cpu, aws.memory_mib)
+                    ? nearestMemory(cpu, aws.memory_mib)
+                    : aws.memory_mib;
+                  setMemoryProblem(null);
+                  void saveAws({ cpu, memory_mib });
+                }}
+              >
+                {FARGATE_CPUS.filter(
+                  // The gateway sidecar needs 1 vCPU / 2 GiB (Rust validates it too).
+                  (c) => !aws.gateway_sidecar || c >= GATEWAY_SIDECAR_MIN_CPU,
+                ).map((c) => (
+                  <option key={c} value={c}>
+                    {formatCpu(c)}
+                  </option>
                 ))}
-              </datalist>
-            </>
-          )}
-        </Field>
-        <div>
-          <span className="block text-[13px] font-medium text-[var(--text-primary)] mb-1">
-            Architecture
-          </span>
-          <SegmentedControl
-            label="Architecture"
-            value={aws.arch}
-            disabled={disabled}
-            onChange={(arch) => void saveAws({ arch })}
-            segments={[
-              { value: "x86_64", label: "x86_64" },
-              { value: "arm64", label: "ARM64 (Graviton)" },
-            ]}
-          />
+              </select>
+            )}
+          </Field>
+          <Field
+            label="Memory (MiB)"
+            hint={(() => {
+              const opts = memoryOptions(aws.cpu);
+              return `${formatMemory(opts[0])} to ${formatMemory(opts[opts.length - 1])} with ${formatCpu(aws.cpu)}.`;
+            })()}
+          >
+            {(id) => (
+              <>
+                <input
+                  id={id}
+                  inputMode="numeric"
+                  value={memory}
+                  disabled={disabled}
+                  list={`${id}-options`}
+                  aria-invalid={memoryProblem ? true : undefined}
+                  onChange={(e) => setMemory(e.target.value)}
+                  onBlur={commitMemory}
+                  onKeyDown={(e) => e.key === "Enter" && commitMemory()}
+                  className={`w-32 ${inputClass}`}
+                />
+                <datalist id={`${id}-options`}>
+                  {memoryOptions(aws.cpu).map((m) => (
+                    <option key={m} value={m} />
+                  ))}
+                </datalist>
+              </>
+            )}
+          </Field>
+          <div>
+            <span className="block text-[13px] font-medium text-[var(--text-primary)] mb-1">
+              Architecture
+            </span>
+            <SegmentedControl
+              label="Architecture"
+              value={aws.arch}
+              disabled={disabled}
+              onChange={(arch) => void saveAws({ arch })}
+              segments={[
+                { value: "x86_64", label: "x86_64" },
+                { value: "arm64", label: "ARM64 (Graviton)" },
+              ]}
+            />
+          </div>
         </div>
-      </div>
       )}
       {memoryProblem && (
         <p role="alert" className="text-xs text-[var(--error)]">
@@ -504,51 +532,51 @@ export default function HostSection({ project, save, disabled }: Props) {
       </div>
 
       {!ec2 && (
-      <>
-      <Field
-        label="Ephemeral storage (GiB)"
-        hint={
-          aws.storage === "efs"
-            ? "The task's local disk: 21 to 200 GiB. With EFS storage, /workspace is on EFS instead."
-            : "The task's local disk: 21 to 200 GiB. Repositories and builds live here."
-        }
-      >
-        {(id) => (
-          <input
-            id={id}
-            inputMode="numeric"
-            value={ephemeral}
-            disabled={disabled}
-            aria-invalid={ephemeralProblem ? true : undefined}
-            onChange={(e) => setEphemeral(e.target.value)}
-            onBlur={commitEphemeral}
-            className={`w-24 ${inputClass}`}
-          />
-        )}
-      </Field>
-      {ephemeralProblem && (
-        <p role="alert" className="text-xs text-[var(--error)]">
-          {ephemeralProblem}
-        </p>
-      )}
+        <>
+          <Field
+            label="Ephemeral storage (GiB)"
+            hint={
+              aws.storage === "efs"
+                ? "The task's local disk: 21 to 200 GiB. With EFS storage, /workspace is on EFS instead."
+                : "The task's local disk: 21 to 200 GiB. Repositories and builds live here."
+            }
+          >
+            {(id) => (
+              <input
+                id={id}
+                inputMode="numeric"
+                value={ephemeral}
+                disabled={disabled}
+                aria-invalid={ephemeralProblem ? true : undefined}
+                onChange={(e) => setEphemeral(e.target.value)}
+                onBlur={commitEphemeral}
+                className={`w-24 ${inputClass}`}
+              />
+            )}
+          </Field>
+          {ephemeralProblem && (
+            <p role="alert" className="text-xs text-[var(--error)]">
+              {ephemeralProblem}
+            </p>
+          )}
 
-      <SwitchRow
-        label="Spot"
-        hint={
-          aws.wip_push_on_stop
-            ? "Runs on spare capacity at up to 70% off. AWS may reclaim it with two minutes' notice; the work-in-progress push below still runs."
-            : "Runs on spare capacity at up to 70% off. AWS may reclaim it with two minutes' notice, and with the work-in-progress push below off, unpushed work is lost."
-        }
-        control={
-          <Toggle
+          <SwitchRow
             label="Spot"
-            checked={aws.spot}
-            disabled={disabled}
-            onChange={(spot) => void saveAws({ spot })}
+            hint={
+              aws.wip_push_on_stop
+                ? "Runs on spare capacity at up to 70% off. AWS may reclaim it with two minutes' notice; the work-in-progress push below still runs."
+                : "Runs on spare capacity at up to 70% off. AWS may reclaim it with two minutes' notice, and with the work-in-progress push below off, unpushed work is lost."
+            }
+            control={
+              <Toggle
+                label="Spot"
+                checked={aws.spot}
+                disabled={disabled}
+                onChange={(spot) => void saveAws({ spot })}
+              />
+            }
           />
-        }
-      />
-      </>
+        </>
       )}
 
       <section aria-label="Estimated cost">

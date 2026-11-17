@@ -16,6 +16,7 @@ import type {
   AwsError,
   DetectedEnvironment,
   Ec2Choice,
+  Ec2Compute,
   EnvironmentScan,
   HostConnection,
   LockInfo,
@@ -114,7 +115,15 @@ type Bundle = {
   recordedEc2?: UserCompute | null;
 };
 /** A self-onboarding (or its re-apply) waiting for its EC2 choice. */
-type JoinOf = { region: string; name: string; stateKey: string; recorded: UserCompute | null; reapply: boolean };
+type JoinOf = {
+  region: string;
+  name: string;
+  stateKey: string;
+  recorded: UserCompute | null;
+  reapply: boolean;
+  incomplete: boolean;
+  lastChoice: Ec2Compute | null;
+};
 
 /** The caller's recorded EC2 capacity in `e`, if any. */
 const recordedEc2 = (e: DetectedEnvironment): UserCompute | null =>
@@ -163,6 +172,9 @@ export default function EnvironmentsPanel({
   } | null>(null);
   const [bundle, setBundle] = useState<Bundle | null>(null);
   const [joinOf, setJoinOf] = useState<JoinOf | null>(null);
+  // The EC2 capacity last chosen per environment in this run of the app: an
+  // onboarding that didn't finish has no record to start from.
+  const lastEc2 = useRef(new Map<string, Ec2Compute>());
   const [copyNote, setCopyNote] = useState<string | null>(null);
   const request = useRef(0);
   const followed = useRef(new Set<string>());
@@ -273,6 +285,8 @@ export default function EnvironmentsPanel({
         stateKey: onboardingStateKey(e.name, found.owner_key),
         recorded,
         reapply: e.onboarding?.state === "joined",
+        incomplete: e.onboarding?.state === "incomplete",
+        lastChoice: lastEc2.current.get(rowKey(found.region, e.name)) ?? null,
       });
     } else {
       setBundle({
@@ -284,8 +298,14 @@ export default function EnvironmentsPanel({
       });
     }
   };
-  const runJoin = (j: JoinOf, ec2: Ec2Choice) =>
-    launch(j.region, j.name, j.stateKey, `Joining ${j.name}`, () => onboardAwsUser(connection.id, j.region, j.name, ec2));
+  const runJoin = (j: JoinOf, ec2: Ec2Choice) => {
+    const key = rowKey(j.region, j.name);
+    if (ec2.kind === "ec2") {
+      const { kind: _kind, ...c } = ec2;
+      lastEc2.current.set(key, c);
+    } else lastEc2.current.delete(key);
+    return launch(j.region, j.name, j.stateKey, `Joining ${j.name}`, () => onboardAwsUser(connection.id, j.region, j.name, ec2));
+  };
 
   const rowRuns = (name: string) =>
     Object.values(runs).filter((r) => r.region === current?.region && runEnvironment(r.stateKey) === name);
@@ -696,6 +716,8 @@ export default function EnvironmentsPanel({
           region={joinOf.region}
           recorded={joinOf.recorded}
           reapply={joinOf.reapply}
+          incomplete={joinOf.incomplete}
+          lastChoice={joinOf.lastChoice}
           onJoin={(ec2) => runJoin(joinOf, ec2)}
           onClose={() => setJoinOf(null)}
         />

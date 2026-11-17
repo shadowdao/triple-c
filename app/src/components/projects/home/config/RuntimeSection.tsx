@@ -7,6 +7,7 @@ import ClaudeCodeSettingsEditor from "../../ClaudeCodeSettingsEditor";
 import AuthBridgeRow from "./AuthBridgeRow";
 import {
   EC2_DOCKER_ACCESS_NOTE,
+  EC2_VPN_HINT,
   NOT_ON_AWS,
   SANDBOX_OFF_ON_AWS,
   isAwsProject,
@@ -84,7 +85,7 @@ export default function RuntimeSection({
 
         <SwitchRow
           label="VPN support"
-          hint={noPrivileged ? NOT_ON_AWS : "Grants NET_ADMIN and the /dev/net/tun device so a VPN client (PIA, WireGuard, OpenVPN) can build a tunnel inside the container. Without it a client installs and runs but its connection hangs until it times out. Anything in the container can then reconfigure the container's own network stack; the host's is untouched. Changing this recreates the container on its next start — the home and .claude volumes are preserved."}
+          hint={noPrivileged ? NOT_ON_AWS : ec2 ? EC2_VPN_HINT : "Grants NET_ADMIN and the /dev/net/tun device so a VPN client (PIA, WireGuard, OpenVPN) can build a tunnel inside the container. Without it a client installs and runs but its connection hangs until it times out. Anything in the container can then reconfigure the container's own network stack; the host's is untouched. Changing this recreates the container on its next start — the home and .claude volumes are preserved."}
           control={
             <Toggle
               label="VPN support"

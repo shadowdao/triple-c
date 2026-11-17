@@ -110,7 +110,9 @@ export interface Ec2Draft {
 }
 
 /** The picker's start: the recorded capacity (a re-apply keeps it), or none. */
-export function ec2DraftFrom(recorded: UserCompute | null | undefined): Ec2Draft {
+export function ec2DraftFrom(
+  recorded: Pick<UserCompute, "instance_type" | "max_instances" | "user_tag"> | null | undefined,
+): Ec2Draft {
   return recorded
     ? { enabled: true, instanceType: recorded.instance_type, maxInstances: recorded.max_instances, userTag: recorded.user_tag }
     : { enabled: false, instanceType: "", maxInstances: 1, userTag: "" };

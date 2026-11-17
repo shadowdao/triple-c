@@ -291,6 +291,25 @@ export function launchTypePatch(
   return patch;
 }
 
+/**
+ * What a launch-type switch's [`launchTypePatch`] changed beyond the launch
+ * type, as one short line for Host settings (null: nothing else changed).
+ */
+export function launchTypeChanges(before: Project, patch: Partial<Project>): string | null {
+  const was = before.aws!;
+  const now = patch.aws!;
+  const changes: string[] = [];
+  if (now.cpu !== was.cpu) changes.push(`CPU ${was.cpu} → ${now.cpu} units`);
+  if (now.memory_mib !== was.memory_mib) changes.push(`memory ${was.memory_mib} → ${now.memory_mib} MiB`);
+  if (was.spot && !now.spot) changes.push("Spot turned off");
+  if (was.gateway_sidecar && !now.gateway_sidecar) changes.push("LLM gateway sidecar turned off");
+  if (before.allow_docker_access && patch.allow_docker_access === false) changes.push("Docker access turned off");
+  if (before.vpn_support_enabled && patch.vpn_support_enabled === false) changes.push("VPN support turned off");
+  if (changes.length === 0) return null;
+  const to = now.launch_type === "ec2" ? "EC2" : "Fargate";
+  return `Switched to ${to}: ${changes.join(", ")}.`;
+}
+
 /** Mirrors Rust `aws::workspace::EC2_NO_SIDECAR`. */
 export const EC2_NO_SIDECAR =
   "The LLM gateway sidecar is not available on EC2 yet: turn it off, or run the project on Fargate";
@@ -300,4 +319,7 @@ export const EC2_SCALE_TO_ZERO_NOTE =
   "Your instances scale to zero when no workspace is running, so the first start after idle boots an instance — about 3 minutes.";
 export const EC2_DOCKER_ACCESS_NOTE =
   "Docker access mounts your instance's Docker socket: that is root on your own instance, which nobody else's workspace runs on.";
+/** RuntimeSection's VPN hint for an EC2 project: an ECS task, not a container the app recreates. */
+export const EC2_VPN_HINT =
+  "Grants NET_ADMIN, the /dev/net/tun device and src_valid_mark so a VPN client (PIA, WireGuard, OpenVPN) can build a tunnel inside the workspace, an ECS task on your own EC2 instance. Anything in the workspace can then reconfigure the task's own network stack; the instance's is untouched. Applies on the project's next start.";
 export const EC2_NO_CAPACITY = "Ask an admin to add EC2 capacity to your onboarding";

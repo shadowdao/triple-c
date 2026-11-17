@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import EnvironmentsPanel from "./EnvironmentsPanel";
+import JoinEnvironmentModal from "./JoinEnvironmentModal";
 import type { DeployProgress, EnvironmentScan } from "../../../lib/types";
 import { compute, conn, env, info, instanceTable, progress, scan, tofuEvent } from "./testkit";
 
@@ -378,6 +379,47 @@ describe("EnvironmentsPanel", () => {
     expect(within(dialog).queryByText(/This removes your EC2 capacity/)).toBeNull();
     fireEvent.click(within(dialog).getByRole("radio", { name: "None (Fargate only)" }));
     expect(within(dialog).getByText("This removes your EC2 capacity (m7g.xlarge) in dev.")).toBeInTheDocument();
+  });
+
+  it("an incomplete onboarding with no record warns that None removes half-built EC2 capacity", async () => {
+    backend(
+      () => scan({ environments: [env({ onboarding: { state: "incomplete", lock: null, ec2: null } })] }),
+      (cmd) => {
+        if (cmd === "list_ec2_instance_types") return instanceTable;
+        throw new Error(`unexpected ${cmd}`);
+      },
+    );
+    render(<EnvironmentsPanel connection={conn} tier="environment_admin" />);
+    await open();
+    fireEvent.click(await screen.findByRole("button", { name: "Join dev" }));
+    const dialog = screen.getByRole("dialog", { name: "Join dev" });
+    expect(within(dialog).getByRole("alert")).toHaveTextContent(
+      /didn't finish, and it may have built part of your EC2 capacity. Choosing None removes anything it built/,
+    );
+    fireEvent.click(within(dialog).getByRole("radio", { name: "My own EC2 instances" }));
+    expect(within(dialog).queryByText(/Choosing None removes/)).toBeNull();
+  });
+
+  it("with no record, the join starts from the EC2 capacity last chosen here", async () => {
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_ec2_instance_types") return instanceTable;
+      throw new Error(`unexpected ${cmd}`);
+    });
+    render(
+      <JoinEnvironmentModal
+        environment="dev"
+        region="eu-west-1"
+        recorded={null}
+        reapply={false}
+        incomplete
+        lastChoice={{ instance_type: "m7g.xlarge", max_instances: 2, user_tag: "alice" }}
+        onJoin={async () => null}
+        onClose={() => {}}
+      />,
+    );
+    const dialog = screen.getByRole("dialog", { name: "Join dev" });
+    expect((within(dialog).getByLabelText("Your triple-c-user value") as HTMLInputElement).value).toBe("alice");
+    expect(within(dialog).queryByText(/Choosing None removes/)).toBeNull();
   });
 
   it("a joined workspace user's capacity change is a bundle starting from their record", async () => {
