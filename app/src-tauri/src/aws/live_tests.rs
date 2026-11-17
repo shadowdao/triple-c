@@ -3549,6 +3549,15 @@ log_stream_prefix, project_secret_name, task_family};
                 let (out, code) = sh(&target, "claude", "echo hello-from-ec2; id").await;
                 eprintln!("RESULT agent tunnel over ECS Exec into the bridge-mode task: exit {code}: {}", out.trim());
                 assert_eq!(code, 0, "{out}");
+                // awslogs on EC2 writes with the execution role (the instance
+                // role has no log rights), into the user's own streams only.
+                let env_rec = crate::aws::runtime::read_environment(&SdkRuntimeApi::new(&ws_cfg), &name, &account, &region)
+                    .await
+                    .expect("the environment record, as the workspace user");
+                let stream = crate::aws::tasks::task_log_stream(&crate::aws::tofu_modules::log_stream_prefix(&okey, &id), &task1);
+                let log1 = api.log_tail(&env_rec.log_group, &stream, 20).await.expect("read task 1's log");
+                eprintln!("RESULT task 1 log ({stream}): {} lines, last {:?}", log1.len(), log1.last());
+                assert!(!log1.is_empty(), "task 1 wrote no log lines: awslogs could not write with the execution role");
                 // E8: the sandbox is forced off in the task's settings.
                 let (settings_json, code) = sh(&target, "claude", "printenv CLAUDE_CODE_SETTINGS_JSON").await;
                 assert_eq!(code, 0, "no CLAUDE_CODE_SETTINGS_JSON");

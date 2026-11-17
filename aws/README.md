@@ -588,7 +588,9 @@ aws iam attach-user-policy --user-name <user> \
 The unit tests' evaluator is not IAM. What the live run (see "Phase 7: ECS on EC2" below) settled.
 Still open for phase 7: an Identity Center attribute as the `triple-c-user` source and a user
 without the tag (only a role tag was used live), and creating the Auto Scaling and ECS
-service-linked roles as the admin (the test account had both). Everything else below is ✓:
+service-linked roles as the admin (the test account had both). The other points below were
+checked live; each one's mark gives its verdict (✓ as expected, ✗→fixed found wrong and fixed,
+— not verified):
 
 - ✓ **Creating an Auto Scaling group checks the caller's launch permissions.** The onboarding's
   group create as the environment admin (only the four admin files) passed with no denial. A group
@@ -638,6 +640,21 @@ service-linked roles as the admin (the test account had both). Everything else b
   ps` works as `claude`), so its user can start a host-network container and read IMDS (and so the
   instance role). That is accepted too: Docker access is root on the user's own instance, and
   the boundary keeps that role on the user's own cluster.
+- **Logs are written per user.** All users' tasks log into the environment's one log group
+  `/triple-c/<env>`. The instance role has **no** log rights: the template sets
+  `ECS_ENABLE_AWSLOGS_EXECUTIONROLE_OVERRIDE=true`, so the awslogs driver writes with the task's
+  execution role (the live run asserts the task's log has lines). The task and execution roles may
+  create streams in the group but `PutLogEvents` only into `log-stream:<owner_key>/*`, the prefix
+  every awslogs stream of theirs has (`<owner_key>/<project>/<container>/<task id>`), so no
+  user's container, instance or host-network container can write into another user's streams.
+  This also changed the version-1 (Fargate) task and execution role policies, in place.
+- **Orphaned cold-start tasks and clock skew.** A task with ECS Exec off still waiting for an
+  instance counts as another start's (the start says so and waits) until it is older than the EC2
+  placement wait (10 min) plus `ORPHAN_MARGIN` (10 min); after that a start or the app's startup
+  reconcile replaces it as an orphan. Its age is ECS's `createdAt` against the local clock, so a
+  local clock running more than 10 minutes fast could replace another machine's start mid cold
+  start (that start then reports it was replaced; Start again connects). A slow clock only
+  delays the replacement.
 
 **Phase 6**
 

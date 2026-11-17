@@ -1244,25 +1244,29 @@ fn exec_role_reads_only_its_owners_secrets() {
         json!({ "StringEquals": { "kms:ViaService": "secretsmanager.${var.region}.amazonaws.com" } })
     );
 
-    // Logs: the environment's log group only, for both roles.
+    // Logs, for both roles: streams are created in the environment's log
+    // group, but written only when they are the user's own
+    // (`<owner_key>/…`, as log_stream_prefix builds them); other users'
+    // streams share the group.
     let log_group = format!(
         "arn:{partition}:logs:${{var.region}}:{account}:log-group:${{local.env.log_group}}:*"
     );
+    let own_streams = format!(
+        "arn:{partition}:logs:${{var.region}}:{account}:log-group:${{local.env.log_group}}:log-stream:${{var.owner_key}}/*"
+    );
+    assert!(crate::aws::tofu_modules::log_stream_prefix("0123456789ab", "p").starts_with("0123456789ab/"));
     for role in ["exec", "task"] {
         let logs: Vec<_> = role_policies(&body, role)
             .iter()
             .flat_map(|p| statements(&jsonencoded(p, "policy")))
             .filter(|s| actions(s).iter().any(|a| a.starts_with("logs:")))
             .collect();
-        assert_eq!(logs.len(), 1, "{role}");
-        assert_eq!(
-            actions(&logs[0]),
-            BTreeSet::from([
-                "logs:CreateLogStream".to_string(),
-                "logs:PutLogEvents".to_string()
-            ])
-        );
-        assert_eq!(expand(&logs[0]["Resource"]), log_group, "{role}");
+        assert_eq!(logs.len(), 2, "{role}");
+        for (action, resource) in [("logs:CreateLogStream", &log_group), ("logs:PutLogEvents", &own_streams)] {
+            let st = logs.iter().find(|s| actions(s).contains(action)).unwrap();
+            assert_eq!(actions(st).len(), 1, "{role} {action}");
+            assert_eq!(&expand(&st["Resource"]), resource, "{role} {action}");
+        }
     }
 
     // The task role: exec channels, logs and its file system; Bedrock only
@@ -2426,6 +2430,7 @@ const ONBOARD_SAMPLES: &[(&str, &str)] = &[
     ),
     ("${var.region}", "us-west-2"),
     ("${var.owner_id}", "AROAEXAMPLEME:alice@example.com"),
+    ("${var.owner_key}", "0123456789ab"),
     ("${var.environment_name}", "probe"),
     ("${var.ec2_user_tag}", "alice"),
     ("${local.env.log_group}", "/triple-c/probe"),
@@ -2735,8 +2740,11 @@ fn ec2_capacity_exists_only_with_an_instance_type() {
 }
 
 /// `sha256_prefix` of the onboarding module's non-EC2 resources as of
-/// version 1 (rendered by hcl-rs, in file order).
-const FARGATE_ONBOARDING_FINGERPRINT: &str = "ab948d6ab8be";
+/// version 1 (rendered by hcl-rs, in file order), with one deliberate change
+/// since: the task and execution roles write logs only into the user's own
+/// streams (`<owner_key>/*`; was the whole log group). A role-policy update
+/// in place; awslogs streams were always under that prefix.
+const FARGATE_ONBOARDING_FINGERPRINT: &str = "ff89c565c117";
 
 #[test]
 fn ec2_names_are_the_shared_names() {
@@ -2967,6 +2975,9 @@ fn the_launch_template_is_pinned() {
         // Bridge tasks (R2) get task-role credentials from the agent's
         // endpoint; IMDS stays out of their reach at hop limit 1.
         "ECS_ENABLE_TASK_IAM_ROLE=true\n",
+        // awslogs writes with the task's execution role (its own streams
+        // only), so the instance role needs no log rights.
+        "ECS_ENABLE_AWSLOGS_EXECUTIONROLE_OVERRIDE=true\n",
     ] {
         assert!(
             user_data.contains(needle),
@@ -3164,9 +3175,7 @@ fn the_instance_role_is_ec2s_and_runs_only_the_ecs_agent() {
             if a == "ecs:DiscoverPollEndpoint" || a == "ecr:GetAuthorizationToken" {
                 assert_eq!(resources, vec!["*".to_string()], "{a}");
             }
-            if a.starts_with("logs:") {
-                assert_eq!(resources, vec!["${local.log_group_arn}".to_string()], "{a}");
-            }
+            assert!(!a.starts_with("logs:"), "the instance role writes no logs: {a}");
             granted.insert(a);
         }
     }
@@ -3182,8 +3191,6 @@ fn the_instance_role_is_ec2s_and_runs_only_the_ecs_agent() {
         "ecr:BatchGetImage",
         "ecr:GetDownloadUrlForLayer",
         "ecr:BatchCheckLayerAvailability",
-        "logs:CreateLogStream",
-        "logs:PutLogEvents",
     ]
     .into_iter()
     .map(String::from)

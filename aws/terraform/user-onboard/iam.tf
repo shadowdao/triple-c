@@ -37,10 +37,18 @@ resource "aws_iam_role_policy" "task" {
         Resource = "*"
       },
       {
-        Sid      = "WriteEnvironmentLogs"
+        # CreateLogStream is authorized on the log group; writing only into
+        # the user's own streams (other users' are in the same group).
+        Sid      = "CreateEnvironmentLogStreams"
         Effect   = "Allow"
-        Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]
+        Action   = ["logs:CreateLogStream"]
         Resource = local.log_group_arn
+      },
+      {
+        Sid      = "WriteOwnLogStreams"
+        Effect   = "Allow"
+        Action   = ["logs:PutLogEvents"]
+        Resource = local.own_log_streams_arn
       },
       {
         Sid      = "MountOwnFileSystem"
@@ -115,10 +123,18 @@ resource "aws_iam_role_policy" "exec" {
         }
       },
       {
-        Sid      = "WriteEnvironmentLogs"
+        # CreateLogStream is authorized on the log group; writing only into
+        # the user's own streams (other users' are in the same group).
+        Sid      = "CreateEnvironmentLogStreams"
         Effect   = "Allow"
-        Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]
+        Action   = ["logs:CreateLogStream"]
         Resource = local.log_group_arn
+      },
+      {
+        Sid      = "WriteOwnLogStreams"
+        Effect   = "Allow"
+        Action   = ["logs:PutLogEvents"]
+        Resource = local.own_log_streams_arn
       },
     ]
   })

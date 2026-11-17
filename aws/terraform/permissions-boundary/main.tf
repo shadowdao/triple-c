@@ -3,7 +3,7 @@
 
 locals {
   # BOUNDARY_MODULE_VERSION in app/src-tauri/src/aws/tofu_modules.rs.
-  # 2: the instance role's ECS agent and Session Manager actions (phase 7).
+  # 2: the instance role's ECS agent actions, on its own cluster (phase 7).
   template_version = 2
 }
 

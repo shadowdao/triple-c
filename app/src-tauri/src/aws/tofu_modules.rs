@@ -22,7 +22,7 @@ pub const ENVIRONMENT_MODULE_VERSION: u32 = 2;
 #[allow(dead_code)] // the onboarding module's version; checked against its HCL by a test
 pub const ONBOARD_MODULE_VERSION: u32 = 2;
 /// The same for the permissions-boundary module. 2: the instance role's ECS
-/// agent and Session Manager actions (phase 7, E4); an account admin
+/// agent actions, on its own cluster (phase 7, E4); an account admin
 /// re-applies the boundary once.
 #[allow(dead_code)] // checked against its HCL by a test; nothing reads the tag yet
 pub const BOUNDARY_MODULE_VERSION: u32 = 2;

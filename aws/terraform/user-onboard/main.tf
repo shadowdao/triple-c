@@ -16,6 +16,9 @@ locals {
 
   boundary_arn  = "arn:${local.partition}:iam::${local.account}:policy/triple-c-permissions-boundary"
   log_group_arn = "arn:${local.partition}:logs:${var.region}:${local.account}:log-group:${local.env.log_group}:*"
+  # The user's own streams in it: every awslogs stream of theirs is
+  # `<owner_key>/<project>/<container>/<task id>` (log_stream_prefix).
+  own_log_streams_arn = "arn:${local.partition}:logs:${var.region}:${local.account}:log-group:${local.env.log_group}:log-stream:${var.owner_key}/*"
 }
 
 provider "aws" {

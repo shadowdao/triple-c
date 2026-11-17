@@ -406,7 +406,10 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
     (owner key, not user tag: role names are account-global) has only the ECS agent's calls, and the
     **boundary** allows them on `cluster/${aws:PrincipalTag/triple-c:cluster}` (must match `--u-*`).
     A Docker-access project is root on its instance and holds that role, so the tag is what stops it
-    registering the instance into someone else's cluster. No SSM core on the instance. The boundary
+    registering the instance into someone else's cluster. No SSM core and **no log rights** on the
+    instance (awslogs writes with the execution role: `ECS_ENABLE_AWSLOGS_EXECUTIONROLE_OVERRIDE`).
+    The task and execution roles `PutLogEvents` only into `log-stream:<owner_key>/*` of the shared
+    log group, so `log_stream_prefix` must keep starting with the owner key. The boundary
     is versioned (2): an account admin re-applies it once before anyone onboards with EC2.
   - **Launch templates and groups are pinned to a numeric template version, and the admin policy
     denies `$Latest`/`$Default`**: the admin's `iam:PassRole` and `ec2:RunInstances` checks look at the

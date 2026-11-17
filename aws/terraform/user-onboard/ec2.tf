@@ -127,13 +127,6 @@ resource "aws_iam_role_policy" "instance" {
           "arn:${local.partition}:ecr:${var.region}:${local.account}:repository/triple-c/*",
         ]
       },
-      {
-        # The awslogs driver runs in the instance's Docker daemon.
-        Sid      = "WriteEnvironmentLogs"
-        Effect   = "Allow"
-        Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]
-        Resource = local.log_group_arn
-      },
     ]
   })
 }
@@ -194,6 +187,7 @@ resource "aws_launch_template" "ec2" {
     cat >>/etc/ecs/ecs.config <<'EOF'
     ECS_CLUSTER=${aws_ecs_cluster.ec2[0].name}
     ECS_ENABLE_TASK_IAM_ROLE=true
+    ECS_ENABLE_AWSLOGS_EXECUTIONROLE_OVERRIDE=true
     EOF
   EOT
   )
