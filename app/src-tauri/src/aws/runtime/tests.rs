@@ -277,6 +277,7 @@ fn live(id: &str) -> TaskInfo {
         ),
         runtime_id: None,
         container_instance_arn: None,
+        exec_enabled: true,
         exec_agent_running: false,
         exit_code: None,
         owner: Some(USER.into()),

@@ -67,6 +67,10 @@ pub struct TaskInfo {
     pub container_instance_arn: Option<String>,
     /// The `workspace` container's ExecuteCommandAgent is RUNNING.
     pub exec_agent_running: bool,
+    /// ECS Exec is on for the task (`enableExecuteCommand`). ECS turns it
+    /// off on a RunTask that has to wait for an EC2 instance (verified live,
+    /// phase 7), and such a task can never be reached.
+    pub exec_enabled: bool,
     /// The `workspace` container's exit code, once it has one.
     pub exit_code: Option<i32>,
     /// Its `triple-c:owner` / `triple-c:project` tags (DescribeTasks with
@@ -116,6 +120,7 @@ pub(crate) fn task_info(t: &Task) -> TaskInfo {
         task_definition_arn: t.task_definition_arn().unwrap_or_default().to_string(),
         runtime_id: workspace.and_then(|c| c.runtime_id()).map(str::to_string),
         container_instance_arn: t.container_instance_arn().map(str::to_string),
+        exec_enabled: t.enable_execute_command(),
         exec_agent_running: workspace.is_some_and(|c| {
             c.managed_agents().iter().any(|a| {
                 a.name() == Some(&ManagedAgentName::ExecuteCommandAgent)

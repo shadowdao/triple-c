@@ -57,6 +57,7 @@ fn task(p: &Project, id: &str, last: &str, ready: bool) -> TaskInfo {
         task_definition_arn: format!("arn:aws:ecs:{REGION}:{ACCOUNT}:task-definition/{}:1", family(p)),
         runtime_id: ready.then(|| "rt-1".into()),
         container_instance_arn: None,
+        exec_enabled: true,
         exec_agent_running: ready,
         exit_code: None,
         owner: Some(USER.into()),
@@ -86,6 +87,8 @@ struct Fake {
     tasks: Mutex<HashMap<String, TaskInfo>>,
     /// What RunTask starts.
     run: Option<TaskInfo>,
+    /// When non-empty, what successive RunTasks start (before `run`).
+    runs: Mutex<Vec<TaskInfo>>,
     logs: Vec<String>,
     role: Option<Knowable>,
     connect_fails: bool,
@@ -134,7 +137,11 @@ impl TaskApi for Fake {
     async fn run_task(&self, req: RunTaskInput) -> Result<TaskInfo, AwsError> {
         self.log("run");
         self.run_requests.lock().unwrap().push(req);
-        let t = self.run.clone().expect("a run was expected");
+        let queued = {
+            let mut q = self.runs.lock().unwrap();
+            (!q.is_empty()).then(|| q.remove(0))
+        };
+        let t = queued.or_else(|| self.run.clone()).expect("a run was expected");
         self.tasks.lock().unwrap().insert(t.arn.clone(), t.clone());
         Ok(t)
     }
@@ -166,6 +173,10 @@ impl TaskApi for Fake {
         self.stop_clusters.lock().unwrap().push(c.into());
         if self.stop_fails {
             return Err(AwsError::Other { message: "ExpiredToken".into() });
+        }
+        // As ECS does: a stopped task is no longer live.
+        if let Some(t) = self.tasks.lock().unwrap().get_mut(arn) {
+            t.desired_status = "STOPPED".into();
         }
         Ok(())
     }
@@ -1382,6 +1393,90 @@ async fn an_ec2_start_runs_on_the_users_capacity_and_says_when_it_waits_for_an_i
     assert_eq!(req.capacity_provider_strategy()[0].capacity_provider(), USER_CLUSTER);
     assert!(req.network_configuration().is_none() && req.launch_type().is_none());
     assert!(fake.describe_clusters.lock().unwrap().iter().all(|c| *c == user_cluster_arn()));
+}
+
+/// ECS turns ECS Exec off on a RunTask that has to wait for an instance
+/// (verified live): that task only brings the instance up; once placed it
+/// is stopped and the task run again, onto the instance, with ECS Exec.
+#[tokio::test]
+async fn a_cold_ec2_start_runs_the_task_again_once_an_instance_is_up() {
+    let p = ec2_project();
+    let execless = |last: &str, placed: bool| TaskInfo { exec_enabled: false, ..ec2_task(&p, "e1", last, false, placed) };
+    let fake = Fake {
+        user_record: Some(user_record_param()),
+        runs: Mutex::new(vec![execless("PROVISIONING", false), ec2_task(&p, "e9", "PENDING", false, true)]),
+        ..Default::default()
+    };
+    *fake.script.lock().unwrap() = vec![
+        execless("PROVISIONING", false),
+        execless("PENDING", true),
+        TaskInfo { desired_status: "STOPPED".into(), ..execless("PENDING", true) },
+        execless("STOPPED", true),
+        ec2_task(&p, "e9", "RUNNING", true, true),
+    ];
+    let (r, steps) = start(&fake, &p).await;
+    let started = r.unwrap();
+    assert_eq!(started.task.arn, ec2_task_arn("e9"));
+    let calls = fake.calls();
+    assert_eq!(calls.iter().filter(|c| *c == "run").count(), 2, "{calls:?}");
+    let stop = format!("stop {} {STOP_REASON}", ec2_task_arn("e1"));
+    let pos = |c: &str| calls.iter().rposition(|x| x == c).unwrap();
+    assert!(calls.iter().position(|c| *c == stop).unwrap() < pos("run"), "{calls:?}");
+    assert_eq!(*fake.stop_clusters.lock().unwrap(), [user_cluster_arn()]);
+    // Both requests ask for ECS Exec on the user's capacity.
+    for req in fake.run_requests.lock().unwrap().iter() {
+        assert_eq!(req.enable_execute_command(), Some(true));
+        assert_eq!(req.capacity_provider_strategy()[0].capacity_provider(), USER_CLUSTER);
+    }
+    // The second task is the one recorded.
+    assert_eq!(*fake.recorded.lock().unwrap(), vec![Some(ec2_task_arn("e1")), Some(ec2_task_arn("e9"))]);
+    assert_eq!(
+        steps,
+        vec![
+            PROGRESS_READING,
+            PROGRESS_PREPARING,
+            PROGRESS_STARTING,
+            PROGRESS_WAITING,
+            PROGRESS_INSTANCE,
+            PROGRESS_WAITING,
+            PROGRESS_CONNECTING
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_second_task_without_ecs_exec_is_stopped_and_reported() {
+    let p = ec2_project();
+    let execless = |id: &str, last: &str, placed: bool| TaskInfo { exec_enabled: false, ..ec2_task(&p, id, last, false, placed) };
+    let fake = Fake {
+        user_record: Some(user_record_param()),
+        runs: Mutex::new(vec![execless("e1", "PROVISIONING", false), execless("e9", "PENDING", true)]),
+        ..Default::default()
+    };
+    *fake.script.lock().unwrap() = vec![execless("e1", "PENDING", true), execless("e1", "STOPPED", true)];
+    let (r, _) = start(&fake, &p).await;
+    assert_eq!(r.err().unwrap().lines().next(), Some(EXEC_OFF));
+    let calls = fake.calls();
+    assert!(calls.contains(&format!("stop {} {STOP_REASON}", ec2_task_arn("e9"))), "{calls:?}");
+}
+
+#[tokio::test]
+async fn a_live_task_with_ecs_exec_off_is_stopped_and_replaced() {
+    let mut p = ec2_project();
+    p.aws.as_mut().unwrap().task_arn = Some(ec2_task_arn("old"));
+    let old = TaskInfo { exec_enabled: false, ..ec2_task(&p, "old", "RUNNING", false, true) };
+    let fake = Fake {
+        user_record: Some(user_record_param()),
+        listed_by_cluster: Some(HashMap::from([(user_cluster_arn(), vec![ec2_task_arn("old")])])),
+        run: Some(ec2_task(&p, "new", "RUNNING", true, true)),
+        ..Default::default()
+    }
+    .with_task(old);
+    let (r, _) = start(&fake, &p).await;
+    assert_eq!(r.unwrap().task.arn, ec2_task_arn("new"));
+    let calls = fake.calls();
+    let stop = calls.iter().position(|c| *c == format!("stop {} {STOP_REASON}", ec2_task_arn("old"))).expect("the old task is stopped");
+    assert!(stop < calls.iter().position(|c| c == "run").unwrap(), "{calls:?}");
 }
 
 #[tokio::test]
