@@ -11,7 +11,8 @@
 # each signature is metered (about 1000 a month), so those are skipped. The
 # allowlist below is the whole of what reaches users: the app binary, the MSI,
 # the NSIS installer, and the uninstaller makensis writes to the job's temp
-# directory. A file that already carries a valid signature is skipped too:
+# directory. The bundled session-manager-plugin sidecar is AWS-signed and is
+# refused rather than re-signed (see below). A file that already carries a valid signature is skipped too:
 # Tauri presents the app binary once per bundle type.
 #
 # This may run as 32-bit PowerShell: the NSIS uninstaller is signed from inside
@@ -45,6 +46,17 @@ try {
     if (-not (Test-Path -LiteralPath $Path)) { throw "No such file to sign: $Path" }
     $full = (Resolve-Path -LiteralPath $Path).ProviderPath
     Write-Log "== $full"
+
+    # The bundled AWS session-manager-plugin (bundle.externalBin) ships AWS's own
+    # signature and is deliberately never re-signed: fetch-ssm-plugin.ps1 checks it
+    # is AWS-signed and timestamped, and Tauri skips a sidecar `signtool verify /pa`
+    # accepts. Being asked to sign it means that check failed on this machine, so
+    # stop rather than put our name on it - or, via the allowlist below, skip it
+    # and ship it unsigned.
+    if ($full -match '\\binaries\\session-manager-plugin-[^\\]+\.exe$') {
+        Write-Log 'refused: the session-manager-plugin sidecar must carry AWS''s signature, not ours (see fetch-ssm-plugin.ps1)'
+        exit 1
+    }
 
     $ships = ($full -match '\\target\\release\\[^\\]+\.exe$') -or
              ($full -match '\\target\\release\\bundle\\(msi|nsis)\\[^\\]+\.(msi|exe)$') -or

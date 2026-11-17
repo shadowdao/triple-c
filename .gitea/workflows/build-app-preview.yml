@@ -334,7 +334,9 @@ jobs:
         run: npx vitest run
 
       # `--locked`: test against the committed Cargo.lock, never a re-resolved
-      # one, for the same reason the frontend uses `npm ci`.
+      # one, for the same reason the frontend uses `npm ci`. No plugin fetch
+      # here: a debug build gets a placeholder for the session-manager-plugin
+      # sidecar from build.rs, so tests never depend on AWS's S3.
       - name: Backend tests (cargo test)
         working-directory: ./app/src-tauri
         run: |
@@ -416,6 +418,9 @@ jobs:
             curl \
             wget \
             file \
+            gnupg \
+            gpgv \
+            unzip \
             xdg-utils
 
       - name: Install Rust stable
@@ -467,6 +472,13 @@ jobs:
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
           npx tauri --version || npm install @tauri-apps/cli
+
+      # The AWS Session Manager plugin, bundled as a sidecar (bundle.externalBin)
+      # so AWS workspaces work without the user installing it. Pinned version,
+      # SHA-256 and AWS's GPG signature checked; fails the job on any mismatch.
+      # A release build refuses to start without it (build.rs).
+      - name: Fetch the AWS Session Manager plugin
+        run: bash scripts/fetch-ssm-plugin.sh x86_64-unknown-linux-gnu
 
       - name: Build Tauri app
         working-directory: ./app
@@ -596,6 +608,15 @@ jobs:
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
           npx tauri --version || npm install @tauri-apps/cli
+
+      # The AWS Session Manager plugin sidecar (bundle.externalBin): both thin
+      # slices (tauri-build checks each arch it compiles) and the lipo'd
+      # universal one the bundler copies into Contents/MacOS. Pinned version and
+      # SHA-256s; fails the job on any mismatch. Not re-signed here: the app is
+      # not code-signed on macOS, so the plugin keeps AWS's Developer ID
+      # signature (with APPLE_* signing configured, Tauri would sign it too).
+      - name: Fetch the AWS Session Manager plugin
+        run: bash scripts/fetch-ssm-plugin.sh universal-apple-darwin
 
       - name: Build Tauri app (universal)
         working-directory: ./app
@@ -728,6 +749,13 @@ jobs:
         run: |
           set "PATH=%USERPROFILE%\.cargo\bin;C:\Program Files\nodejs;%PATH%"
           npm run build
+
+      # The AWS Session Manager plugin sidecar (bundle.externalBin). Pinned
+      # version and SHA-256s, and AWS's Authenticode signature required; fails
+      # the job on any mismatch. It ships under AWS's signature, not ours (see
+      # the script and windows-sign.ps1).
+      - name: Fetch the AWS Session Manager plugin
+        run: powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts\fetch-ssm-plugin.ps1
 
       - name: Build Tauri app
         working-directory: ./app
