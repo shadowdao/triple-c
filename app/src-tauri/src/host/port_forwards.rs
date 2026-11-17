@@ -11,7 +11,9 @@
 //! ## Two differences from Docker, both deliberate
 //!
 //! * **It reaches the workspace's loopback, not its network interface**
-//!   (`socat … TCP:127.0.0.1:<port>` inside the task). So a mapping can
+//!   (`socat` to `127.0.0.1:<port>`, or `[::1]:<port>` when only an IPv6
+//!   loopback/wildcard socket listens there — see
+//!   [`crate::auth_bridge::tunnel::mapping_command`]). So a mapping can
 //!   reach a service that bound loopback precisely to be private — which is
 //!   why the agent's port, the browser view's range and (when the project
 //!   runs it) the gateway sidecar's [`GATEWAY_SIDECAR_PORT`] are refused.
@@ -46,13 +48,24 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use crate::auth_bridge::proc_net::PortFamily;
 use crate::auth_bridge::tunnel::PortForward;
 use crate::auth_bridge::{RESERVED_CONTAINER_PORTS, RESERVED_HOST_PORTS};
 use crate::models::PortMapping;
 use crate::storage::projects_store::ProjectsStore;
 
 use super::ContainerTarget;
+
+/// Where a warning about a mapping goes after the open has returned: the
+/// first connection that finds nothing listening in the workspace.
+pub type PortsWarn = Arc<dyn Fn(String) + Send + Sync>;
+
+/// What the user is told when a mapping's workspace port has no listener.
+pub fn nothing_listening(host_port: u16, container_port: u16) -> String {
+    format!(
+        "localhost:{host_port}: nothing is listening on port {container_port} in the workspace \
+         (127.0.0.1 or ::1)"
+    )
+}
 
 /// What became of one mapping: `error` is `None` when its forward is open.
 #[derive(Debug, Clone, PartialEq)]
@@ -137,10 +150,21 @@ fn mapping_problem(m: &PortMapping, gateway_sidecar: bool) -> Option<String> {
     None
 }
 
-/// A row the editor saved before both its ports were typed (the editor
-/// saves on blur): nothing to check or forward yet, and nothing to say.
+/// A row stored without both its ports (an older editor saved a new row as
+/// 0 → 0 before anything was typed): nothing to check on save, and nothing
+/// to forward — but a connect says so ([`incomplete_warning`]), never silent.
 fn incomplete(m: &PortMapping) -> bool {
     m.host_port == 0 || m.container_port == 0
+}
+
+/// The `ports` warning line for a stored row a connect skips as incomplete.
+pub fn incomplete_warning(m: &PortMapping) -> String {
+    let port = |p: u16| if p == 0 { "?".to_string() } else { p.to_string() };
+    format!(
+        "{} → {}: incomplete, both ports are needed",
+        port(m.host_port),
+        port(m.container_port)
+    )
 }
 
 /// An AWS project's port mappings, checked in full: TCP only, no reserved
@@ -215,7 +239,7 @@ pub async fn open_for(
     mappings: &[PortMapping],
 ) -> Vec<PortForwardResult> {
     let mappings = mappings.to_vec();
-    open_latest(project_id, target, move || Some((mappings, false))).await
+    open_latest(project_id, target, None, move || Some((mappings, false))).await
 }
 
 /// Open the project's mappings into `target`, replacing the set it had.
@@ -232,21 +256,31 @@ pub async fn open_for(
 pub async fn open_latest(
     project_id: &str,
     target: &ContainerTarget,
+    warn: Option<PortsWarn>,
     read: impl FnOnce() -> Option<(Vec<PortMapping>, bool)> + Send,
 ) -> Vec<PortForwardResult> {
     let plock = project_lock(project_id);
     let _held = plock.lock().await;
     let Some((mappings, gateway_sidecar)) = read() else {
+        log::info!("Project {project_id}: no longer an AWS project; closing its port forwards");
         close_unlocked(project_id).await;
         return Vec::new();
     };
+    log::info!(
+        "Project {project_id}: opening port mappings into {} ({} stored, {} incomplete)",
+        target.id(),
+        mappings.len(),
+        mappings.iter().filter(|m| incomplete(m)).count()
+    );
 
     // What can be forwarded, in order; the first row wins a host port.
     let mut results: Vec<PortForwardResult> = Vec::new();
     let mut wanted: Vec<(usize, u16, u16)> = Vec::new();
     let mut taken = HashSet::new();
-    for m in mappings.iter().filter(|m| !incomplete(m)) {
-        let error = if let Some(problem) = mapping_problem(m, gateway_sidecar) {
+    for m in &mappings {
+        let error = if incomplete(m) {
+            Some(incomplete_warning(m))
+        } else if let Some(problem) = mapping_problem(m, gateway_sidecar) {
             Some(problem)
         } else if !taken.insert(m.host_port) {
             Some(format!(
@@ -284,7 +318,12 @@ pub async fn open_latest(
             opened.push(f);
             continue;
         }
-        match PortForward::bind_mapping(target.clone(), host_port, container_port, PortFamily::V4).await {
+        let on_refused = warn.clone().map(|w| {
+            let notice: crate::auth_bridge::tunnel::RefusedNotice =
+                Arc::new(move || w(nothing_listening(host_port, container_port)));
+            notice
+        });
+        match PortForward::bind_mapping(target.clone(), host_port, container_port, on_refused).await {
             Ok(fwd) => {
                 if let Some(w) = &fwd.ipv6_warning {
                     log::warn!("Project {project_id}: port mapping {host_port}: {w}");
@@ -313,9 +352,23 @@ pub async fn open_latest(
     // Checked *after* the set is registered: a tunnel close that ran before
     // this sees it gone here; one that runs after removes it itself.
     if !still_connected(project_id, target) {
+        log::warn!(
+            "Project {project_id}: the workspace's tunnel is no longer {} — closing the port forwards just opened",
+            target.id()
+        );
         close_unlocked(project_id).await;
         for r in results.iter_mut().filter(|r| r.error.is_none()) {
             r.error = Some("the workspace disconnected".into());
+        }
+    }
+    for r in &results {
+        match &r.error {
+            None => log::info!(
+                "Project {project_id}: port mapping localhost:{} → workspace port {} is open",
+                r.mapping.host_port,
+                r.mapping.container_port
+            ),
+            Some(e) => log::warn!("Project {project_id}: port mapping not open: {e}"),
         }
     }
     results
@@ -337,6 +390,9 @@ pub async fn close(project_id: &str) {
 async fn close_unlocked(project_id: &str) {
     let set = lock().remove(project_id);
     if let Some(set) = set {
+        if !set.forwards.is_empty() {
+            log::info!("Project {project_id}: closing {} port forward(s)", set.forwards.len());
+        }
         shutdown_all(set.forwards).await;
     }
 }
@@ -352,20 +408,38 @@ pub async fn close_all() {
 /// After a connect (or a save of the mappings while connected): open an
 /// AWS project's mappings, **as stored when the open runs**, into its
 /// connected workspace. The warning detail for the mappings that failed, if
-/// any did; `None` as well for a local project (Docker publishes its own) or
-/// a workspace that is not (or no longer) connected.
-pub async fn open_for_project(store: &ProjectsStore, project_id: &str) -> Option<String> {
+/// any did; `None` for a local project (Docker publishes its own), and for a
+/// workspace that is not (or no longer) connected **unless the project is
+/// Running** — mappings that should be open and aren't are never silent.
+/// `warn` receives the later "nothing is listening" notices.
+pub async fn open_for_project(
+    store: &ProjectsStore,
+    project_id: &str,
+    warn: Option<PortsWarn>,
+) -> Option<String> {
     let project = store.get(project_id).filter(|p| p.is_aws())?;
-    let target = ContainerTarget::Agent(super::tunnels::get_endpoint(&project.id)?);
-    let results = open_latest(project_id, &target, || {
+    let wanted = project.port_mappings.iter().filter(|m| !incomplete(m)).count();
+    let running = || {
+        store.get(project_id).is_some_and(|p| p.status == crate::models::ProjectStatus::Running)
+    };
+    let Some(endpoint) = super::tunnels::get_endpoint(&project.id) else {
+        log::info!("Project {project_id}: no tunnel to the workspace; {wanted} port mapping(s) not opened");
+        return (wanted > 0 && running()).then(|| {
+            "The workspace is not connected, so its port mappings were not opened. Start the \
+             project again."
+                .to_string()
+        });
+    };
+    let target = ContainerTarget::Agent(endpoint);
+    let results = open_latest(project_id, &target, warn, || {
         store.get(project_id).filter(|p| p.is_aws()).map(|p| {
             let gateway = p.aws.as_ref().is_some_and(|a| a.gateway_sidecar);
             (p.port_mappings, gateway)
         })
     })
     .await;
-    if !still_connected(project_id, &target) {
-        return None;
+    if !still_connected(project_id, &target) && !running() {
+        return None; // a Stop raced the open: nothing to say
     }
     failure_detail(&results)
 }

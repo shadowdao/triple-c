@@ -9,6 +9,12 @@ pub async fn check_docker() -> Result<bool, String> {
     docker::check_docker_available().await
 }
 
+/// Like `check_docker`, but says *why* Docker is unavailable.
+#[tauri::command]
+pub async fn check_docker_status() -> Result<docker::status::DockerStatus, String> {
+    Ok(docker::client::docker_status().await)
+}
+
 #[tauri::command]
 pub async fn check_image_exists(state: State<'_, AppState>) -> Result<bool, String> {
     let settings = state.settings_store.get();

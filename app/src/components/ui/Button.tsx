@@ -19,6 +19,11 @@ interface Props extends ButtonHTMLAttributes<HTMLButtonElement> {
   unavailable?: boolean;
   /** Why the button cannot be used. Required for `unavailable` to say anything. */
   unavailableReason?: string;
+  /**
+   * Let a long label wrap onto more lines instead of forcing the button (and
+   * its row) wider than a narrow container, such as the settings sidebar.
+   */
+  wrap?: boolean;
   /** React 19 passes `ref` as a prop; it lands on the `<button>` via `rest`. */
   ref?: Ref<HTMLButtonElement>;
 }
@@ -48,6 +53,12 @@ const SIZES: Record<ButtonSize, string> = {
   md: "h-8 px-3 text-[13px] gap-1.5",
 };
 
+/** `wrap`: the same sizes as a minimum height, so a second line can grow the button. */
+const WRAP_SIZES: Record<ButtonSize, string> = {
+  sm: "min-h-6 py-0.5 px-2 text-xs gap-1",
+  md: "min-h-8 py-1 px-3 text-[13px] gap-1.5",
+};
+
 export default function Button({
   variant = "secondary",
   size = "sm",
@@ -55,6 +66,7 @@ export default function Button({
   type = "button",
   unavailable = false,
   unavailableReason = "",
+  wrap = false,
   children,
   ...rest
 }: Props) {
@@ -71,7 +83,7 @@ export default function Button({
         type={type}
         {...rest}
         {...controlProps}
-        className={`inline-flex items-center justify-center whitespace-nowrap rounded-[var(--radius-control)] font-medium transition-colors disabled:cursor-not-allowed aria-disabled:cursor-not-allowed ${SIZES[size]} ${VARIANTS[variant]} ${className}`}
+        className={`inline-flex items-center justify-center ${wrap ? `whitespace-normal break-words text-left max-w-full min-w-0 ${WRAP_SIZES[size]}` : `whitespace-nowrap ${SIZES[size]}`} rounded-[var(--radius-control)] font-medium transition-colors disabled:cursor-not-allowed aria-disabled:cursor-not-allowed ${VARIANTS[variant]} ${className}`}
       >
         {children}
       </button>

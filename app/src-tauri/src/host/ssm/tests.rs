@@ -400,3 +400,135 @@ async fn the_keepalive_asks_for_health_without_a_token() {
     assert!(req.starts_with("GET /v1/health HTTP/1.1\r\n"), "{req}");
     assert!(!req.to_ascii_lowercase().contains("authorization"), "{req}");
 }
+
+// ── Finding the plugin ───────────────────────────────────────────────────────
+
+mod plugin_resolution {
+    use super::super::{resolve_plugin, PluginSearch, PLUGIN_FILE, PLUGIN_INSTALL_HINT};
+    use std::path::{Path, PathBuf};
+
+    /// A directory holding a fake plugin (contents are never run).
+    fn dir_with_plugin(root: &Path, name: &str) -> PathBuf {
+        let d = root.join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(PLUGIN_FILE), b"\x7fELF fake plugin").unwrap();
+        d
+    }
+
+    fn search(
+        override_path: Option<&Path>,
+        exe_dir: Option<&Path>,
+        path: &[&Path],
+        install: &[&Path],
+    ) -> PluginSearch {
+        PluginSearch {
+            override_path: override_path.map(|p| p.as_os_str().to_owned()),
+            exe_dir: exe_dir.map(Path::to_path_buf),
+            path_var: Some(std::env::join_paths(path).unwrap()),
+            install_dirs: install.iter().map(|p| p.to_path_buf()).collect(),
+        }
+    }
+
+    #[test]
+    fn the_override_wins_over_everything() {
+        let t = tempfile::tempdir().unwrap();
+        let chosen = t.path().join("my-plugin");
+        std::fs::write(&chosen, b"x").unwrap();
+        let bundled = dir_with_plugin(t.path(), "app");
+        let on_path = dir_with_plugin(t.path(), "path");
+        let s = search(Some(&chosen), Some(&bundled), &[&on_path], &[]);
+        assert_eq!(resolve_plugin(&s).unwrap(), chosen);
+    }
+
+    #[test]
+    fn an_override_naming_no_file_is_an_error_not_a_fallback() {
+        let t = tempfile::tempdir().unwrap();
+        let bundled = dir_with_plugin(t.path(), "app");
+        let s = search(Some(&t.path().join("missing")), Some(&bundled), &[], &[]);
+        let e = resolve_plugin(&s).unwrap_err();
+        assert!(e.contains("TRIPLEC_SSM_PLUGIN names"), "{e}");
+    }
+
+    #[test]
+    fn an_empty_override_is_ignored() {
+        let t = tempfile::tempdir().unwrap();
+        let bundled = dir_with_plugin(t.path(), "app");
+        let mut s = search(None, Some(&bundled), &[], &[]);
+        s.override_path = Some(std::ffi::OsString::new());
+        assert_eq!(resolve_plugin(&s).unwrap(), bundled.join(PLUGIN_FILE));
+    }
+
+    #[test]
+    fn the_bundled_sidecar_wins_over_path_and_installs() {
+        let t = tempfile::tempdir().unwrap();
+        let bundled = dir_with_plugin(t.path(), "app");
+        let on_path = dir_with_plugin(t.path(), "path");
+        let installed = dir_with_plugin(t.path(), "installed");
+        let s = search(None, Some(&bundled), &[&on_path], &[&installed]);
+        assert_eq!(resolve_plugin(&s).unwrap(), bundled.join(PLUGIN_FILE));
+    }
+
+    #[test]
+    fn without_a_sidecar_path_comes_before_the_install_locations() {
+        let t = tempfile::tempdir().unwrap();
+        let empty_app = t.path().join("app");
+        std::fs::create_dir_all(&empty_app).unwrap();
+        let first = t.path().join("path-first-empty");
+        std::fs::create_dir_all(&first).unwrap();
+        let on_path = dir_with_plugin(t.path(), "path");
+        let installed = dir_with_plugin(t.path(), "installed");
+        let s = search(None, Some(&empty_app), &[&first, &on_path], &[&installed]);
+        assert_eq!(resolve_plugin(&s).unwrap(), on_path.join(PLUGIN_FILE));
+
+        let s = search(None, Some(&empty_app), &[&first], &[&installed]);
+        assert_eq!(resolve_plugin(&s).unwrap(), installed.join(PLUGIN_FILE));
+    }
+
+    #[test]
+    fn a_debug_placeholder_beside_the_exe_is_skipped() {
+        let t = tempfile::tempdir().unwrap();
+        let app = t.path().join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join(PLUGIN_FILE), crate::sidecar_placeholder::contents()).unwrap();
+        let on_path = dir_with_plugin(t.path(), "path");
+        let s = search(None, Some(&app), &[&on_path], &[]);
+        assert_eq!(resolve_plugin(&s).unwrap(), on_path.join(PLUGIN_FILE));
+
+        // And with nothing else installed, the install hint, not the placeholder.
+        let s = search(None, Some(&app), &[], &[]);
+        assert_eq!(resolve_plugin(&s).unwrap_err(), PLUGIN_INSTALL_HINT);
+    }
+
+    #[test]
+    fn a_directory_named_like_the_plugin_is_not_a_plugin() {
+        let t = tempfile::tempdir().unwrap();
+        let app = t.path().join("app");
+        std::fs::create_dir_all(app.join(PLUGIN_FILE)).unwrap();
+        let installed = dir_with_plugin(t.path(), "installed");
+        let s = search(None, Some(&app), &[], &[&installed]);
+        assert_eq!(resolve_plugin(&s).unwrap(), installed.join(PLUGIN_FILE));
+    }
+
+    #[test]
+    fn nothing_anywhere_is_the_install_hint() {
+        let t = tempfile::tempdir().unwrap();
+        let s = search(None, None, &[t.path()], &[t.path()]);
+        let e = resolve_plugin(&s).unwrap_err();
+        assert!(e.contains("is not installed") && e.contains("docs.aws.amazon.com"), "{e}");
+    }
+
+    #[test]
+    fn the_bundled_name_is_what_tauri_gives_the_sidecar() {
+        // tauri-build/-bundler strip "-<target-triple>" from bundle.externalBin's
+        // "binaries/session-manager-plugin"; the .exe stays on Windows.
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../../../tauri.conf.json")).unwrap();
+        let bins = conf["bundle"]["externalBin"].as_array().expect("bundle.externalBin");
+        let stems: Vec<&str> = bins
+            .iter()
+            .map(|b| b.as_str().unwrap().rsplit('/').next().unwrap())
+            .collect();
+        let expected = PLUGIN_FILE.trim_end_matches(".exe");
+        assert!(stems.contains(&expected), "{stems:?} has no {expected}");
+    }
+}

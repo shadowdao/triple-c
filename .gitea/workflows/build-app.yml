@@ -227,6 +227,14 @@ jobs:
           export PATH="$HOME/.cargo/bin:$PATH"
           npx tauri --version || npm install @tauri-apps/cli
 
+      # The AWS Session Manager plugin, bundled as a sidecar (bundle.externalBin)
+      # so AWS workspaces work without the user installing it. Built here from
+      # AWS's Apache-2.0 source (pinned commit + archive SHA-256) with a pinned,
+      # hash-checked Go; the output must match a pinned SHA-256 (reproducible
+      # build). A release build refuses to start without it (build.rs).
+      - name: Build the AWS Session Manager plugin
+        run: bash scripts/build-ssm-plugin.sh x86_64-unknown-linux-gnu
+
       - name: Build Tauri app
         working-directory: ./app
         run: |
@@ -417,11 +425,35 @@ jobs:
           export PATH="$HOME/.cargo/bin:$PATH"
           npx tauri --version || npm install @tauri-apps/cli
 
+      # The AWS Session Manager plugin sidecar (bundle.externalBin), built from
+      # source (see build-ssm-plugin.sh): both thin slices (tauri-build checks
+      # each arch it compiles) and the lipo'd universal one the bundler copies
+      # into Contents/MacOS. Each must match its pinned SHA-256. Signed exactly
+      # like the app: Go ad-hoc signs the arm64 slice, and with APPLE_* signing
+      # configured Tauri would sign the sidecar with the app's identity.
+      - name: Build the AWS Session Manager plugin
+        run: bash scripts/build-ssm-plugin.sh universal-apple-darwin
+
       - name: Build Tauri app (universal)
         working-directory: ./app
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
           npx tauri build --target universal-apple-darwin
+
+      # The sidecar and its notices must be in the bundle Tauri made: the
+      # plugin in Contents/MacOS with both slices, THIRD_PARTY_NOTICES in
+      # Contents/Resources (bundle.resources).
+      - name: Check the bundled Session Manager plugin
+        run: |
+          app_dir="$(ls -d app/src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app | head -n1)"
+          [ -n "$app_dir" ] || { echo "no .app bundle"; exit 1; }
+          plugin="$app_dir/Contents/MacOS/session-manager-plugin"
+          [ -x "$plugin" ] || { echo "missing $plugin"; exit 1; }
+          archs="$(lipo -archs "$plugin")"
+          case " $archs " in *" x86_64 "*) ;; *) echo "plugin lacks x86_64 ($archs)"; exit 1 ;; esac
+          case " $archs " in *" arm64 "*) ;; *) echo "plugin lacks arm64 ($archs)"; exit 1 ;; esac
+          "$plugin" --version
+          [ -f "$app_dir/Contents/Resources/THIRD_PARTY_NOTICES" ] || { echo "missing Contents/Resources/THIRD_PARTY_NOTICES"; exit 1; }
 
       - name: Collect artifacts
         run: |
@@ -655,6 +687,13 @@ jobs:
         run: |
           set "PATH=%USERPROFILE%\.cargo\bin;C:\Program Files\nodejs;%PATH%"
           npm run build
+
+      # The AWS Session Manager plugin sidecar (bundle.externalBin), built from
+      # source (see build-ssm-plugin.ps1); must match its pinned SHA-256. It
+      # comes out unsigned, so Tauri hands it to the sign command and
+      # "Verify signatures" requires our signature on it in both installers.
+      - name: Build the AWS Session Manager plugin
+        run: powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts\build-ssm-plugin.ps1
 
       # Releases are signed with Azure Artifact Signing (scripts/windows-*.ps1).
       # The setup fetches the signing client and a job-local .NET runtime, and

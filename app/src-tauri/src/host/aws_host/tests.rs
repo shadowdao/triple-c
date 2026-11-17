@@ -93,6 +93,8 @@ struct Fake {
     logs: Vec<String>,
     role: Option<Knowable>,
     connect_fails: bool,
+    /// The connector times out waiting for the agent (an image without it).
+    agent_silent: bool,
     connect_tokens: Mutex<Vec<String>>,
     secret_json: Mutex<Option<String>>,
     /// A losing start rotates the secret's token while this one connects.
@@ -308,6 +310,9 @@ impl Connector for Fake {
             let mut v: serde_json::Value = serde_json::from_str(j.as_deref().unwrap()).unwrap();
             v["TRIPLEC_AGENT_TOKEN"] = "the-losers-token".into();
             *j = Some(v.to_string());
+        }
+        if self.agent_silent {
+            return Err(agent_silent_message(None));
         }
         if self.connect_fails {
             return Err("session-manager-plugin was not found".into());
@@ -584,6 +589,25 @@ async fn a_tunnel_failure_stops_a_task_this_start_ran_but_never_an_attached_one(
         vec![Some(task_arn("live"))],
         "an attached task stays recorded: it is still running"
     );
+}
+
+#[tokio::test]
+async fn a_silent_agent_names_the_image_and_the_edge_tag() {
+    let p = aws_project(StorageMode::Ephemeral);
+    let fake = Fake { run: Some(task(&p, "new", "RUNNING", true)), agent_silent: true, ..Default::default() };
+    let e = start(&fake, &p).await.0.err().unwrap();
+    assert!(e.contains(&format!("\"{REGISTRY_IMAGE}\"")), "{e}");
+    assert!(e.contains("older than this app's AWS support"), "{e}");
+    assert!(e.contains(":latest moves only when a release is cut"), "{e}");
+    assert!(e.contains("Settings → Docker → Custom image to ghcr.io/shadowdao/triple-c-sandbox:edge"), "{e}");
+}
+
+#[test]
+fn the_silent_agent_message_escapes_the_image_name() {
+    let m = agent_silent_message(Some("evil\"\nimage"));
+    assert!(m.contains(r#""evil\"\nimage""#), "{m}");
+    assert!(!m.contains('\n'));
+    assert!(agent_silent_message(None).contains("The workspace's image may be older"));
 }
 
 #[tokio::test]

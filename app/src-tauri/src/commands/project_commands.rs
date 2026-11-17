@@ -1159,7 +1159,8 @@ pub async fn update_project(
     // AWS (Q6): a connected workspace's forwards follow the saved mappings
     // now — there is no container to recreate. Nothing when not connected.
     if saved.is_aws() && mappings_changed {
-        if let Some(detail) = crate::host::port_forwards::open_for_project(&state.projects_store, &saved.id).await {
+        let warn = ports_warner(&app_handle, &saved.id, &saved.name);
+        if let Some(detail) = crate::host::port_forwards::open_for_project(&state.projects_store, &saved.id, Some(warn)).await {
             emit_ports_warning(&app_handle, &saved.id, &saved.name, &detail);
         }
     }
@@ -1551,7 +1552,8 @@ async fn start_project_container_locked(
     // AWS (Q6): the project's port mappings become loopback forwards into
     // the workspace; a mapping that can't open is a warning, the rest work.
     if project.is_aws() {
-        if let Some(detail) = crate::host::port_forwards::open_for_project(&state.projects_store, &project_id).await {
+        let warn = ports_warner(&app_handle, &project_id, &project.name);
+        if let Some(detail) = crate::host::port_forwards::open_for_project(&state.projects_store, &project_id, Some(warn)).await {
             emit_ports_warning(&app_handle, &project_id, &project.name, &detail);
         }
     }
@@ -1628,12 +1630,23 @@ fn connect_warning_payload(project_id: &str, name: &str, detail: &str) -> serde_
 /// Port mappings that could not be forwarded to a connected AWS workspace
 /// (Q6): a busy host port, a host port mapped twice. Same `workspace-warning`
 /// event, with its own `topic` so it does not replace the other warnings.
+/// Where a port mapping's later notices ("nothing is listening") go: the
+/// same `ports` warning toast.
+fn ports_warner(app_handle: &tauri::AppHandle, project_id: &str, name: &str) -> crate::host::port_forwards::PortsWarn {
+    let (handle, id, name) = (app_handle.clone(), project_id.to_string(), name.to_string());
+    std::sync::Arc::new(move |detail: String| emit_ports_warning(&handle, &id, &name, &detail))
+}
+
 fn emit_ports_warning(app_handle: &tauri::AppHandle, project_id: &str, name: &str, detail: &str) {
     let _ = app_handle.emit(
         "workspace-warning",
         serde_json::json!({
             "project_id": project_id,
-            "message": format!("“{name}”: some port mappings could not be opened"),
+            "message": if detail.contains("nothing is listening") {
+                format!("“{name}”: a port mapping found nothing listening in the workspace")
+            } else {
+                format!("“{name}”: some port mappings could not be opened")
+            },
             "detail": detail,
             "topic": "ports",
         }),
@@ -3344,20 +3357,21 @@ mod tests {
         let start = fn_body(src, "start_project_container_locked");
         let running = start.find("update_status(&project_id, ProjectStatus::Running)").unwrap();
         let open = start
-            .find("port_forwards::open_for_project(&state.projects_store, &project_id)")
+            .find("port_forwards::open_for_project(&state.projects_store, &project_id, Some(warn))")
             .expect("the start opens them");
         assert!(open > running);
         let guard = start[..open].rfind("if project.is_aws() {").expect("AWS-only");
-        assert!(start[guard..open].lines().count() <= 2);
+        assert!(start[guard..open].lines().count() <= 3);
+        assert!(start[guard..open].contains("let warn = ports_warner(&app_handle, &project_id, &project.name);"));
         assert!(start[open..].lines().nth(1).unwrap().contains("emit_ports_warning("));
         let update = fn_body(src, "update_project");
-        assert!(update.contains("port_forwards::open_for_project(&state.projects_store, &saved.id)"));
+        assert!(update.contains("port_forwards::open_for_project(&state.projects_store, &saved.id, Some(warn))"));
         let reconcile = fn_body(src, "reconcile_aws_projects");
         assert!(reconcile.contains("on_ports_warning,"));
         assert!(reconcile.contains("emit_ports_warning(&ports_handle, &ports_id, &ports_name, &detail)"));
         let aws_host = include_str!("../host/aws_host.rs");
         let reattached = aws_host.find("Ok(true) => {").unwrap();
-        let opened = aws_host.find("port_forwards::open_for_project(&store, &project.id)").unwrap();
+        let opened = aws_host.find("port_forwards::open_for_project(&store, &project.id, Some(warn.clone()))").unwrap();
         let pushed = aws_host[reattached..].find("connect::apply_connect(").unwrap() + reattached;
         assert!(reattached < opened && opened < pushed);
     }

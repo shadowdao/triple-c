@@ -374,9 +374,10 @@ pub(crate) fn ec2_collision_refusal(
 /// Everything a self-onboarding apply needs settled before it starts: the
 /// caller's record, the capacity ([`resolve_ec2`]), the module variables
 /// and, with EC2 capacity, the name check ([`ec2_collision_refusal`]).
-/// Check-then-apply leaves a narrow race (another admin creating the same
-/// names in between); only admins apply, and the module would then fail on
-/// create rather than adopt.
+/// Check-then-apply leaves a narrow race (someone else creating the same
+/// names in between); the module would then fail on create rather than
+/// adopt. Anyone may start this: there is no tier check in the app, and AWS
+/// refuses (mapped to `AccessDenied`) what the caller isn't permitted.
 pub(crate) async fn prepare_onboarding<A: OnboardApi>(
     api: &A,
     env: &str,

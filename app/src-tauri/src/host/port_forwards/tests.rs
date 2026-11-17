@@ -23,6 +23,8 @@ struct Fake {
     requests: AtomicUsize,
     /// The command of each attach.
     cmds: std::sync::Mutex<Vec<Vec<String>>>,
+    /// Answer every attach as socat finding nothing listening.
+    refuse: std::sync::atomic::AtomicBool,
 }
 
 async fn attach_ws(State(f): State<Arc<Fake>>, ws: WebSocketUpgrade) -> Response {
@@ -41,6 +43,14 @@ async fn echo(f: Arc<Fake>, mut ws: WebSocket) {
         .collect();
     f.cmds.lock().unwrap().push(cmd);
     let _ = ws.send(WsMessage::Text(r#"{"type":"started","exec_id":"a1"}"#.into())).await;
+    if f.refuse.load(Ordering::SeqCst) {
+        let mut err = vec![2u8];
+        err.extend_from_slice(b"socat[7] E connect(5, AF=2 127.0.0.1:8080, 16): Connection refused\n");
+        let _ = ws.send(WsMessage::Binary(err.into())).await;
+        let _ = ws.send(WsMessage::Text(r#"{"type":"exit","code":1}"#.into())).await;
+        let _ = ws.close().await;
+        return;
+    }
     while let Some(Ok(msg)) = ws.recv().await {
         match msg {
             WsMessage::Binary(b) => {
@@ -129,7 +139,7 @@ async fn a_busy_host_port_fails_its_mapping_alone_and_the_other_forwards() {
     assert_eq!(round_trip(free, b"ping").await, b"ping");
     assert_eq!(
         fake.cmds.lock().unwrap().as_slice(),
-        [vec!["socat".to_string(), "-".into(), "TCP:127.0.0.1:5432".into()]]
+        [crate::auth_bridge::tunnel::mapping_command(5432)]
     );
 
     // Stop / Remove / task death all close the tunnel: the mappings go too.
@@ -188,7 +198,8 @@ async fn udp_reserved_and_duplicate_mappings_are_refused_per_mapping() {
     )
     .await;
     let errors: Vec<Option<&str>> = results.iter().map(|r| r.error.as_deref()).collect();
-    assert_eq!(errors.len(), 6, "an unfinished row is skipped: {errors:?}");
+    assert_eq!(errors.len(), 7, "{errors:?}");
+    assert_eq!(errors[6], Some("? → ?: incomplete, both ports are needed"), "skipped, not silently");
     assert!(errors[0].unwrap().contains("only TCP"), "{errors:?}");
     assert!(errors[1].is_none());
     assert!(errors[2].unwrap().contains("another mapping"), "{errors:?}");
@@ -310,7 +321,7 @@ async fn overlapping_opens_converge_on_the_last_stored_set_without_false_errors(
         let mine = sets[i % sets.len()].clone();
         opens.push(tokio::spawn(async move {
             go2.wait().await;
-            open_latest(&p2, &t2, move || {
+            open_latest(&p2, &t2, None, move || {
                 let mut s = s2.lock().unwrap();
                 *s = mine; // this save lands, then its open reads the store
                 Some((s.clone(), false))
@@ -352,7 +363,7 @@ async fn a_save_keeps_unchanged_forwards_and_their_live_connections() {
     let r = open_for(&p, &target, &[tcp(a, 9090)]).await;
     assert!(r[0].error.is_none(), "{:?}", r[0].error);
     assert_eq!(round_trip(a, b"x").await, b"x");
-    assert_eq!(fake.cmds.lock().unwrap().last().unwrap()[2], "TCP:127.0.0.1:9090");
+    assert_eq!(fake.cmds.lock().unwrap().last().unwrap(), &crate::auth_bridge::tunnel::mapping_command(9090));
     assert!(port_is_free(b));
     tunnels::close(&p).await;
 }
@@ -371,9 +382,9 @@ async fn a_stored_project_is_read_when_the_open_runs() {
     let busy_port = busy.local_addr().unwrap().port();
     project.port_mappings = vec![tcp(port, 8080), tcp(busy_port, 8081)];
     let store = ProjectsStore::over_file_for_test(dir.path().join("projects.json"), vec![project]);
-    assert_eq!(open_for_project(&store, &p).await, None, "not connected: nothing, no warning");
+    assert_eq!(open_for_project(&store, &p, None).await, None, "not connected: nothing, no warning");
     let (_target, _, _) = connected_agent(&p).await;
-    let warning = open_for_project(&store, &p).await.expect("the busy port is reported");
+    let warning = open_for_project(&store, &p, None).await.expect("the busy port is reported");
     assert!(warning.contains(&busy_port.to_string()) && warning.contains("already in use"), "{warning}");
     assert_eq!(open_ports(&p), vec![port]);
     tunnels::close(&p).await;
@@ -386,11 +397,210 @@ async fn the_auth_bridges_forward_still_waits_for_a_client_to_speak() {
     let p = pid("bridge");
     let (target, fake, _) = connected_agent(&p).await;
     let port = free_port();
-    let mut fwd = PortForward::bind(target, port, port, PortFamily::V4).await.unwrap();
+    let mut fwd = PortForward::bind(target, port, port, crate::auth_bridge::proc_net::PortFamily::V4).await.unwrap();
     assert_eq!((fwd.port, fwd.container_port), (port, port));
     let _client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     assert_eq!(fake.requests.load(Ordering::SeqCst), 0);
     fwd.shutdown().await;
     tunnels::close(&p).await;
+}
+
+fn aws_project_in_store(p: &str, status: crate::models::ProjectStatus, mappings: Vec<PortMapping>) -> (tempfile::TempDir, ProjectsStore) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut project = crate::models::Project::new("x".into(), vec![]);
+    project.id = p.to_string();
+    project.host_id = Some("h1".into());
+    project.aws_placement =
+        Some(crate::models::AwsPlacement { region: "us-west-2".into(), environment: "dev".into() });
+    project.aws = Some(Default::default());
+    project.status = status;
+    project.port_mappings = mappings;
+    let store = ProjectsStore::over_file_for_test(dir.path().join("projects.json"), vec![project]);
+    (dir, store)
+}
+
+#[tokio::test]
+async fn a_running_project_whose_mappings_cannot_open_is_never_silent() {
+    use crate::models::ProjectStatus;
+    let p = pid("silent");
+    // Stopped (a save while stopped): nothing to open, nothing to say.
+    let (_d, store) = aws_project_in_store(&p, ProjectStatus::Stopped, vec![tcp(free_port(), 8080)]);
+    assert_eq!(open_for_project(&store, &p, None).await, None);
+    // Running with no tunnel: the mappings should be open and are not.
+    let (_d, store) = aws_project_in_store(&p, ProjectStatus::Running, vec![tcp(free_port(), 8080)]);
+    let w = open_for_project(&store, &p, None).await.expect("a warning");
+    assert!(w.contains("not connected"), "{w}");
+    // Only incomplete rows: nothing to say.
+    let (_d, store) = aws_project_in_store(&p, ProjectStatus::Running, vec![tcp(0, 8080)]);
+    assert_eq!(open_for_project(&store, &p, None).await, None);
+}
+
+#[tokio::test]
+async fn a_connect_warns_about_an_incomplete_row_and_opens_the_rest() {
+    use crate::models::ProjectStatus;
+    // The reported case: an older editor stored a new row as 0 → 0. The
+    // connect used to skip it in silence.
+    let p = pid("incomplete");
+    let port = free_port();
+    let (_d, store) =
+        aws_project_in_store(&p, ProjectStatus::Stopped, vec![tcp(0, 0), tcp(port, 8080), tcp(9000, 0)]);
+    let (_target, _fake, _) = connected_agent(&p).await;
+    store.update_status(&p, ProjectStatus::Running).unwrap();
+    let w = open_for_project(&store, &p, None).await.expect("a ports warning");
+    assert_eq!(
+        w,
+        "? → ?: incomplete, both ports are needed\n9000 → ?: incomplete, both ports are needed"
+    );
+    assert_eq!(open_ports(&p), vec![port]);
+    tunnels::close(&p).await;
+}
+
+#[tokio::test]
+async fn a_start_opens_a_listener_for_a_mapping_saved_before_it() {
+    use crate::models::ProjectStatus;
+    // The reported case: 8080 → 8080 saved while stopped, then a start
+    // registers the tunnel, sets Running and opens the mappings.
+    let p = pid("start");
+    let port = free_port();
+    let (_d, store) = aws_project_in_store(&p, ProjectStatus::Stopped, vec![tcp(port, 8080)]);
+    let (_target, fake, _) = connected_agent(&p).await;
+    store.update_status(&p, ProjectStatus::Running).unwrap();
+    assert_eq!(open_for_project(&store, &p, None).await, None);
+    assert_eq!(open_ports(&p), vec![port]);
+    assert_eq!(round_trip(port, b"ping").await, b"ping");
+    // Over IPv6 loopback too (`localhost` may resolve to ::1 first).
+    if let Ok(mut c) = TcpStream::connect(("::1", port)).await {
+        c.write_all(b"six").await.unwrap();
+        let mut buf = [0u8; 3];
+        c.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"six");
+    }
+    assert_eq!(fake.cmds.lock().unwrap()[0], crate::auth_bridge::tunnel::mapping_command(8080));
+    tunnels::close(&p).await;
+    assert!(port_is_free(port));
+}
+
+#[tokio::test]
+async fn nothing_listening_in_the_workspace_is_reported_once_per_mapping() {
+    use crate::models::ProjectStatus;
+    let p = pid("refused");
+    let port = free_port();
+    let (_d, store) = aws_project_in_store(&p, ProjectStatus::Running, vec![tcp(port, 8080)]);
+    let (_target, fake, _) = connected_agent(&p).await;
+    fake.refuse.store(true, Ordering::SeqCst);
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let s2 = seen.clone();
+    let warn: PortsWarn = Arc::new(move |d| s2.lock().unwrap().push(d));
+    assert_eq!(open_for_project(&store, &p, Some(warn)).await, None);
+    for _ in 0..3 {
+        let mut c = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut buf = Vec::new();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), c.read_to_end(&mut buf)).await;
+    }
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen, vec![nothing_listening(port, 8080)]);
+    assert!(seen[0].contains("nothing is listening on port 8080 in the workspace (127.0.0.1 or ::1)"));
+    tunnels::close(&p).await;
+}
+
+/// The reported case end to end against a **real** agent in a real
+/// container (no SSM; the tunnel is registered by hand): a mapping saved
+/// before the start, a Python server on `0.0.0.0:8080` (the user's), one on
+/// `[::1]` only, and a port nothing listens on. Needs Docker and an image
+/// whose entrypoint starts the agent (`TRIPLEC_AGENT_E2E_IMAGE`, default
+/// `ghcr.io/shadowdao/triple-c-sandbox:edge`).
+#[tokio::test]
+#[ignore = "needs a Docker daemon and an image whose entrypoint starts triple-c-agent"]
+async fn live_a_mapping_reaches_v4_and_v6_servers_in_a_real_workspace() {
+    use crate::models::ProjectStatus;
+    use std::process::Command;
+    use std::time::Duration;
+    let docker = |args: &[&str]| -> String {
+        let out = Command::new("docker").args(args).output().expect("docker cli");
+        assert!(out.status.success(), "docker {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let image = std::env::var("TRIPLEC_AGENT_E2E_IMAGE")
+        .unwrap_or_else(|_| "ghcr.io/shadowdao/triple-c-sandbox:edge".into());
+    let token = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
+    let name = format!("tc-ports-e2e-{}", uuid::Uuid::new_v4().simple());
+    docker(&[
+        "run", "-d", "--name", &name, "-w", "/workspace",
+        "-e", &format!("TRIPLEC_AGENT_TOKEN={token}"),
+        "-e", "TRIPLEC_AGENT_ADDR=0.0.0.0:47900",
+        "-p", "127.0.0.1::47900",
+        &image,
+    ]);
+    let p = pid("live");
+    let outcome = async {
+        let mapped = docker(&["port", &name, "47900/tcp"]);
+        let lport: u16 = mapped.lines().next().and_then(|l| l.rsplit(':').next()).and_then(|x| x.parse().ok()).unwrap();
+        let ip = docker(&["inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}", &name]);
+        let mut candidates = vec![AgentEndpoint::loopback(lport, token.clone())];
+        for a in ip.split_whitespace() {
+            candidates.push(AgentEndpoint::new(url::Url::parse(&format!("http://{a}:47900/")).unwrap(), token.clone()).unwrap());
+        }
+        let mut ep = None;
+        'wait: for _ in 0..240 {
+            for c in &candidates {
+                if ContainerTarget::Agent(c.clone()).is_running().await.unwrap_or(false) {
+                    ep = Some(c.clone());
+                    break 'wait;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let ep = ep.ok_or("agent never answered")?;
+        docker(&["exec", "-d", "-u", "claude", &name, "python3", "-m", "http.server", "8080", "--bind", "0.0.0.0"]);
+        docker(&["exec", "-d", "-u", "claude", &name, "python3", "-m", "http.server", "8081", "--bind", "::1"]);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let (h80, h81, h82) = (free_port(), free_port(), free_port());
+        let (_d, store) = aws_project_in_store(&p, ProjectStatus::Stopped, vec![tcp(h80, 8080), tcp(h81, 8081), tcp(h82, 8082)]);
+        // The start: tunnel registered, Running, then the open.
+        let mut t = tunnels::tests::fake_tunnel(lport, Arc::new(AtomicUsize::new(0)));
+        t.endpoint = ep;
+        tunnels::register(&p, t);
+        store.update_status(&p, ProjectStatus::Running).unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let s2 = seen.clone();
+        let warn: PortsWarn = Arc::new(move |d| s2.lock().unwrap().push(d));
+        if let Some(w) = open_for_project(&store, &p, Some(warn)).await {
+            return Err(format!("open warned: {w}"));
+        }
+        async fn get(addr: (&str, u16)) -> Result<String, String> {
+            let mut c = TcpStream::connect(addr).await.map_err(|e| format!("{addr:?}: {e}"))?;
+            c.write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n").await.map_err(|e| e.to_string())?;
+            let mut buf = Vec::new();
+            tokio::time::timeout(Duration::from_secs(20), c.read_to_end(&mut buf)).await.map_err(|_| "timeout".to_string())?.map_err(|e| e.to_string())?;
+            Ok(String::from_utf8_lossy(&buf).into_owned())
+        }
+        for (port, what) in [(h80, "0.0.0.0:8080"), (h81, "[::1]:8081")] {
+            for host in ["127.0.0.1", "::1"] {
+                let r = get((host, port)).await?;
+                if !r.starts_with("HTTP/1.0 200") {
+                    return Err(format!("{what} via {host}:{port}: {r:?}"));
+                }
+                eprintln!("{what} via {host}:{port}: 200");
+            }
+        }
+        let r = get(("127.0.0.1", h82)).await?;
+        if !r.is_empty() {
+            return Err(format!("nothing listens on 8082, yet: {r:?}"));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let seen = seen.lock().unwrap().clone();
+        if seen != vec![nothing_listening(h82, 8082)] {
+            return Err(format!("warnings: {seen:?}"));
+        }
+        Ok::<(), String>(())
+    }
+    .await;
+    tunnels::close(&p).await;
+    let logs = Command::new("docker").args(["logs", "--tail", "20", &name]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+    if let Err(e) = outcome {
+        panic!("{e}\n--- container log tail ---\n{logs}");
+    }
 }

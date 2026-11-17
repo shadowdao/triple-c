@@ -143,3 +143,7 @@ export function computeLine(c: UserCompute): string {
   const n = c.max_instances === 1 ? "1 instance" : `up to ${c.max_instances} instances`;
   return `${c.instance_type}, ${n} (triple-c-user ${c.user_tag})`;
 }
+
+/** Shown under an action whose permissions the check didn't confirm: AWS has the last word. */
+export const UNCONFIRMED_NOTE =
+  "Your permission check didn't confirm environment-admin rights; the deploy will stop with AWS's message if a permission is missing.";

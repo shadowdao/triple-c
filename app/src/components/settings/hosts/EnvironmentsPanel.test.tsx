@@ -81,7 +81,7 @@ describe("EnvironmentsPanel", () => {
     expect(within(screen.getByTestId("env-dev")).getByText("Joined")).toBeInTheDocument();
   });
 
-  it("offers an admin bundle instead of deploy for a workspace user with nothing found", async () => {
+  it("offers deploy to a workspace user too, with a note and the admin options under a disclosure", async () => {
     backend(
       () => scan(),
       (cmd) => {
@@ -91,22 +91,162 @@ describe("EnvironmentsPanel", () => {
     );
     render(<EnvironmentsPanel connection={conn} tier="workspace_user" />);
     await open();
-    expect(await screen.findByText(/needs an environment admin/)).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Deploy a new environment" })).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Show the environment-admin policies" }));
-    expect(await screen.findByText("environment-admin.json")).toBeInTheDocument();
+    const deploy = await screen.findByRole("button", { name: "Deploy a new environment" });
+    expect(deploy.className).toContain("--accent-emphasis");
+    expect(screen.getByTestId("deploy-unconfirmed-note")).toHaveTextContent(
+      "Your permission check didn't confirm environment-admin rights; the deploy will stop with AWS's message if a permission is missing.",
+    );
+    const options = screen.getByTestId("not-admin-options");
+    expect(options.tagName).toBe("DETAILS");
+    expect(within(options).getByText(/Not an admin\?/)).toBeInTheDocument();
+    fireEvent.click(within(options).getByRole("button", { name: "Show the environment-admin policies" }));
+    expect(await within(options).findByRole("button", { name: "Copy environment-admin.json" })).toBeInTheDocument();
     expect(invoke).toHaveBeenCalledWith("aws_policy_document", { tier: "environment_admin" });
-    fireEvent.click(screen.getByRole("button", { name: "Request an environment from an admin…" }));
+    fireEvent.click(within(options).getByRole("button", { name: "Request an environment from an admin…" }));
     const dialog = screen.getByRole("dialog");
     expect(within(dialog).getByRole("button", { name: "Save bundle to folder…" })).toBeInTheDocument();
   });
 
-  it("treats a connection with no permission report as not an admin", async () => {
+  it("opens the deploy form for a workspace user", async () => {
+    backend(() => scan());
+    render(<EnvironmentsPanel connection={conn} tier="workspace_user" />);
+    await open();
+    fireEvent.click(await screen.findByRole("button", { name: "Deploy a new environment" }));
+    expect(screen.getByRole("dialog", { name: "Deploy a new environment" })).toBeInTheDocument();
+  });
+
+  it("an admin sees deploy without the note or the not-an-admin options", async () => {
+    backend(() => scan());
+    render(<EnvironmentsPanel connection={conn} tier="environment_admin" />);
+    await open();
+    expect(await screen.findByRole("button", { name: "Deploy a new environment" })).toBeInTheDocument();
+    expect(screen.queryByTestId("deploy-unconfirmed-note")).toBeNull();
+    expect(screen.queryByTestId("not-admin-options")).toBeNull();
+  });
+
+  it("a connection with no permission report gets deploy with the note", async () => {
     backend(() => scan());
     render(<EnvironmentsPanel connection={conn} />);
     await open();
-    expect(await screen.findByRole("button", { name: "Request an environment from an admin…" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Deploy a new environment" })).toBeNull();
+    expect(await screen.findByRole("button", { name: "Deploy a new environment" })).toBeInTheDocument();
+    expect(screen.getByTestId("deploy-unconfirmed-note")).toBeInTheDocument();
+    expect(screen.getByText(/Run Check to see what your credentials can do/)).toBeInTheDocument();
+  });
+
+  it("shows the boundary note to anyone when the account has no boundary", async () => {
+    backend(() => scan({ boundary: "no" }));
+    render(<EnvironmentsPanel connection={conn} tier="workspace_user" />);
+    await open();
+    expect(await screen.findByText(/no Triple-C permissions boundary yet/)).toBeInTheDocument();
+  });
+
+  it("offers a bundle when AWS refuses a deploy run's permission", async () => {
+    backend(
+      () => scan(),
+      (cmd) => {
+        if (cmd === "deploy_aws_environment") return "d1";
+        throw new Error(`unexpected ${cmd}`);
+      },
+    );
+    render(<EnvironmentsPanel connection={conn} tier="workspace_user" />);
+    await open();
+    fireEvent.click(await screen.findByRole("button", { name: "Deploy a new environment" }));
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Deploy" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    const key = "environments/main/terraform.tfstate";
+    emit(
+      progress({
+        op_id: "d1",
+        state_key: key,
+        events: [tofuEvent("creating IAM Role: AccessDenied: User is not authorized to perform iam:CreateRole", { level: "error" })],
+      }),
+    );
+    emit(progress({ op_id: "d1", state_key: key, done: true, cancellable: false, result: { ok: false, exit_code: 1, summary: null } }));
+    const hint = await screen.findByTestId("denied-hint");
+    expect(hint).toHaveTextContent("AWS refused a permission");
+    fireEvent.click(within(hint).getByRole("button", { name: "Save a bundle for an admin…" }));
+    expect(within(screen.getByRole("dialog")).getByRole("button", { name: "Save bundle to folder…" })).toBeInTheDocument();
+  });
+
+  it("never offers a new-environment bundle for a refused follow of an existing deploy", async () => {
+    const key = "environments/dev/terraform.tfstate";
+    backend(
+      () => scan({ environments: [env({ actions: ["follow"], state: { state: "ready" } })] }),
+      (cmd) => {
+        if (cmd === "follow_aws_deployment") return "f9";
+        throw new Error(`unexpected ${cmd}`);
+      },
+    );
+    render(<EnvironmentsPanel connection={conn} tier="workspace_user" />);
+    await open();
+    await waitFor(() => expect(invoke.mock.calls.some((c) => c[0] === "follow_aws_deployment")).toBe(true));
+    await screen.findByRole("region", { name: "Deploy of dev progress" });
+    emit(
+      progress({
+        op_id: "f9",
+        state_key: key,
+        events: [tofuEvent("AccessDenied: User is not authorized to perform ecs:UpdateService", { level: "error" })],
+      }),
+    );
+    emit(progress({ op_id: "f9", state_key: key, done: true, cancellable: false, result: { ok: false, exit_code: 1, summary: null } }));
+    expect(await screen.findByText(/Failed \(exit 1\)/)).toBeInTheDocument();
+    expect(screen.queryByTestId("denied-hint")).toBeNull();
+  });
+
+  it("marks the not-an-admin disclosure open or closed like the Environments toggle", async () => {
+    backend(() => scan());
+    render(<EnvironmentsPanel connection={conn} tier="workspace_user" />);
+    await open();
+    const options = await screen.findByTestId("not-admin-options");
+    const summary = options.querySelector("summary")!;
+    expect(summary).toHaveTextContent("▸");
+    (options as HTMLDetailsElement).open = true;
+    fireEvent(options, new Event("toggle"));
+    await waitFor(() => expect(summary).toHaveTextContent("▾"));
+  });
+
+  it("shows a refused deploy's AWS message and offers the bundle", async () => {
+    backend(
+      () => scan(),
+      (cmd) => {
+        if (cmd === "deploy_aws_environment")
+          throw { kind: "access_denied", action: "s3:CreateBucket", message: "User is not authorized" };
+        throw new Error(`unexpected ${cmd}`);
+      },
+    );
+    render(<EnvironmentsPanel connection={conn} tier="workspace_user" />);
+    await open();
+    fireEvent.click(await screen.findByRole("button", { name: "Deploy a new environment" }));
+    const dialog = screen.getByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Deploy" }));
+    expect(await within(dialog).findByText("AWS denied s3:CreateBucket: User is not authorized")).toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save an environment bundle for an admin…" }));
+    expect(within(screen.getByRole("dialog")).getByRole("button", { name: "Save bundle to folder…" })).toBeInTheDocument();
+  });
+
+  it("keeps the key rows wrapping in a narrow sidebar", async () => {
+    backend(
+      () => scan({ environments: [env({ actions: ["join", "update", "repair"] })] }),
+      (cmd) => {
+        if (cmd === "aws_policy_document") return [{ name: "a.json", json: "{}" }, { name: "b.json", json: "{}" }];
+        throw new Error(`unexpected ${cmd}`);
+      },
+    );
+    render(<EnvironmentsPanel connection={conn} tier="workspace_user" />);
+    await open();
+    const row = await screen.findByTestId("env-row-dev");
+    expect(row.className).toContain("flex-wrap");
+    expect(row.firstElementChild?.className).toContain("min-w-0");
+    const actions = screen.getByTestId("env-actions-dev");
+    expect(actions.className).toContain("flex-wrap");
+    expect(actions.className).toContain("min-w-0");
+    expect(screen.getByTestId("region-row").className).toContain("flex-wrap");
+    expect(screen.getByRole("button", { name: "Deploy a new environment" }).className).toContain("whitespace-normal");
+    fireEvent.click(screen.getByRole("button", { name: "Show the environment-admin policies" }));
+    const grid = await screen.findByTestId("policy-copy-grid");
+    expect(grid.className).toContain("grid");
+    expect(grid.className).toContain("auto-fill");
+    for (const b of within(grid).getAllByRole("button")) expect(b.className).toContain("whitespace-normal");
   });
 
   it("an incomplete environment offers repair and destroy, destroy only after typing its name", async () => {
@@ -248,7 +388,43 @@ describe("EnvironmentsPanel", () => {
     expect(await within(screen.getByTestId("env-dev")).findByText("Joined")).toBeInTheDocument();
   });
 
-  it("a workspace user's join opens the onboarding bundle and waits for an admin", async () => {
+  it("a workspace user can join themselves, with the note", async () => {
+    backend(
+      () => scan({ environments: [env()] }),
+      (cmd) => {
+        if (cmd === "onboard_aws_user") return "j1";
+        throw new Error(`unexpected ${cmd}`);
+      },
+    );
+    render(<EnvironmentsPanel connection={conn} tier="workspace_user" />);
+    await open();
+    fireEvent.click(await screen.findByRole("button", { name: "Join dev" }));
+    const dialog = screen.getByRole("dialog", { name: "Join dev" });
+    expect(within(dialog).getByTestId("join-unconfirmed-note")).toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Join" }));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("onboard_aws_user", expect.objectContaining({ environment: "dev" })),
+    );
+  });
+
+  it("a refused join shows AWS's message and offers the onboarding bundle", async () => {
+    backend(
+      () => scan({ environments: [env()] }),
+      (cmd) => {
+        if (cmd === "onboard_aws_user") throw { kind: "access_denied", action: "s3:PutObject", message: "explicit deny" };
+        throw new Error(`unexpected ${cmd}`);
+      },
+    );
+    render(<EnvironmentsPanel connection={conn} tier="workspace_user" />);
+    await open();
+    fireEvent.click(await screen.findByRole("button", { name: "Join dev" }));
+    const dialog = screen.getByRole("dialog", { name: "Join dev" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Join" }));
+    expect(await within(dialog).findByText("AWS denied s3:PutObject: explicit deny")).toBeInTheDocument();
+    expect(within(dialog).getByText(/AWS refused this with your permissions/)).toBeInTheDocument();
+  });
+
+  it("a workspace user can switch the join to an onboarding bundle and then waits for an admin", async () => {
     backend(
       () => scan({ environments: [env()] }),
       (cmd) => {
@@ -259,6 +435,11 @@ describe("EnvironmentsPanel", () => {
     render(<EnvironmentsPanel connection={conn} tier="workspace_user" />);
     await open();
     fireEvent.click(await screen.findByRole("button", { name: "Join dev" }));
+    fireEvent.click(
+      within(screen.getByRole("dialog", { name: "Join dev" })).getByRole("button", {
+        name: "Save an onboarding bundle for an admin…",
+      }),
+    );
     const dialog = screen.getByRole("dialog");
     // Opening the bundle is not a request yet.
     expect(screen.queryByText("Waiting for an admin to onboard you")).toBeNull();
@@ -278,6 +459,14 @@ describe("EnvironmentsPanel", () => {
     expect(invoke.mock.calls.some((c) => c[0] === "onboard_aws_user")).toBe(false);
     fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
     expect(within(screen.getByTestId("env-dev")).getByText("Waiting for an admin to onboard you")).toBeInTheDocument();
+  });
+
+  it("an admin's join has no unconfirmed note", async () => {
+    backend(() => scan({ environments: [env()] }));
+    render(<EnvironmentsPanel connection={conn} tier="environment_admin" />);
+    await open();
+    fireEvent.click(await screen.findByRole("button", { name: "Join dev" }));
+    expect(within(screen.getByRole("dialog", { name: "Join dev" })).queryByTestId("join-unconfirmed-note")).toBeNull();
   });
 
   it("an admin joins with EC2 capacity: a type from the table, max instances and their triple-c-user value", async () => {
@@ -422,7 +611,7 @@ describe("EnvironmentsPanel", () => {
     expect(within(dialog).queryByText(/Choosing None removes/)).toBeNull();
   });
 
-  it("a joined workspace user's capacity change is a bundle starting from their record", async () => {
+  it("a joined workspace user's capacity bundle starts from their record", async () => {
     backend(
       () => scan({ environments: [env({ onboarding: { state: "joined", ec2: compute({ max_instances: 1 }) } })] }),
       (cmd) => {
@@ -434,6 +623,7 @@ describe("EnvironmentsPanel", () => {
     render(<EnvironmentsPanel connection={conn} tier="workspace_user" />);
     await open();
     fireEvent.click(await screen.findByRole("button", { name: "EC2 capacity in dev" }));
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Save an onboarding bundle for an admin…" }));
     const dialog = screen.getByRole("dialog", { name: "Onboarding bundle" });
     fireEvent.click(within(dialog).getByRole("button", { name: "Save bundle to folder…" }));
     await waitFor(() =>
@@ -525,6 +715,7 @@ describe("EnvironmentsPanel", () => {
     render(<EnvironmentsPanel connection={conn} tier="workspace_user" />);
     await open();
     fireEvent.click(await screen.findByRole("button", { name: "Join dev" }));
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Save an onboarding bundle for an admin…" }));
     fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Close" }));
     expect(screen.queryByText("Waiting for an admin to onboard you")).toBeNull();
     expect(within(screen.getByTestId("env-dev")).getByRole("button", { name: "Join dev" })).toHaveTextContent("Join");

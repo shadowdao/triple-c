@@ -513,6 +513,12 @@
           "markdownDescription": "Enables the check_docker command without any pre-configured scope."
         },
         {
+          "description": "Enables the check_docker_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-check-docker-status",
+          "markdownDescription": "Enables the check_docker_status command without any pre-configured scope."
+        },
+        {
           "description": "Enables the check_for_updates command without any pre-configured scope.",
           "type": "string",
           "const": "allow-check-for-updates",
@@ -1501,6 +1507,12 @@
           "type": "string",
           "const": "deny-check-docker",
           "markdownDescription": "Denies the check_docker command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the check_docker_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-check-docker-status",
+          "markdownDescription": "Denies the check_docker_status command without any pre-configured scope."
         },
         {
           "description": "Denies the check_for_updates command without any pre-configured scope.",

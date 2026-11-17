@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { act, renderHook } from "@testing-library/react";
-import { runKey, useDeployRuns } from "./DeployProgress";
+import { act, render, renderHook, screen } from "@testing-library/react";
+import DeployProgressView, { runKey, useDeployRuns } from "./DeployProgress";
 import type { DeployProgress } from "../../../lib/types";
 import { progress, tofuEvent } from "./testkit";
 
@@ -29,10 +29,10 @@ describe("useDeployRuns", () => {
     const onDone = vi.fn();
     const { result } = renderHook(() => useDeployRuns(onDone));
     await act(async () => {
-      await result.current.start(KEY, "eu-west-1", "Deploy of main", async () => "eu");
+      await result.current.start(KEY, "eu-west-1", "deploy", "Deploy of main", async () => "eu");
     });
     await act(async () => {
-      await result.current.start(KEY, "us-east-1", "Deploy of main", async () => "us");
+      await result.current.start(KEY, "us-east-1", "deploy", "Deploy of main", async () => "us");
     });
     expect(handlers.size).toBe(2);
     emit(progress({ op_id: "eu", state_key: KEY, events: [tofuEvent("eu line")] }));
@@ -54,8 +54,8 @@ describe("useDeployRuns", () => {
   it("removes its progress listeners on unmount", async () => {
     const { result, unmount } = renderHook(() => useDeployRuns());
     await act(async () => {
-      await result.current.start(KEY, "eu-west-1", "Deploy of main", async () => "a");
-      await result.current.start("boundary/terraform.tfstate", "eu-west-1", "Boundary", async () => "b");
+      await result.current.start(KEY, "eu-west-1", "deploy", "Deploy of main", async () => "a");
+      await result.current.start("boundary/terraform.tfstate", "eu-west-1", "deploy", "Boundary", async () => "b");
     });
     expect(handlers.size).toBe(2);
     unmount();
@@ -66,12 +66,37 @@ describe("useDeployRuns", () => {
     const { result } = renderHook(() => useDeployRuns());
     let err: unknown;
     await act(async () => {
-      err = await result.current.start(KEY, "eu-west-1", "Deploy of main", async () => {
+      err = await result.current.start(KEY, "eu-west-1", "deploy", "Deploy of main", async () => {
         throw { kind: "other", message: "A deployment is already running" };
       });
     });
     expect(err).toEqual({ kind: "other", message: "A deployment is already running" });
     expect(handlers.size).toBe(0);
     expect(result.current.runs).toEqual({});
+  });
+});
+
+describe("DeployProgress layout", () => {
+  it("wraps its header and a long failure summary", () => {
+    render(
+      <DeployProgressView
+        connectionId="h1"
+        run={{
+          stateKey: KEY,
+          region: "eu-west-1",
+          kind: "deploy",
+          label: "Deploy of main",
+          opId: "x",
+          events: [],
+          done: true,
+          cancellable: false,
+          result: { ok: false, exit_code: 1, summary: "a very long summary ".repeat(10) },
+        }}
+      />,
+    );
+    const header = screen.getByTestId("deploy-progress-header");
+    expect(header.className).toContain("flex-wrap");
+    expect(header.firstElementChild?.className).toContain("min-w-0");
+    expect(screen.getByRole("status").firstElementChild?.className).toContain("whitespace-normal");
   });
 });

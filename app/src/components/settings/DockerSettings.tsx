@@ -1,3 +1,4 @@
+import { dockerFailLabel } from "../../lib/dockerStatus";
 import { useState } from "react";
 import { useDocker } from "../../hooks/useDocker";
 import { useSettings } from "../../hooks/useSettings";
@@ -13,7 +14,7 @@ const IMAGE_SOURCE_OPTIONS: { value: ImageSource; label: string; description: st
 ];
 
 export default function DockerSettings() {
-  const { dockerAvailable, imageExists, checkDocker, checkImage, buildImage, pullImage } =
+  const { dockerAvailable, dockerStatus, imageExists, checkDocker, checkImage, buildImage, pullImage } =
     useDocker();
   const { appSettings, saveSettings } = useSettings();
   const [working, setWorking] = useState(false);
@@ -82,7 +83,7 @@ export default function DockerSettings() {
         <div className="flex items-center justify-between">
           <span className="text-[var(--text-secondary)]">Docker Status</span>
           <span className={dockerAvailable ? "text-[var(--success)]" : "text-[var(--error)]"}>
-            {dockerAvailable === null ? "Checking..." : dockerAvailable ? "Connected" : "Not Available"}
+            {dockerAvailable === null ? "Checking..." : dockerAvailable ? "Connected" : dockerFailLabel(dockerStatus)}
           </span>
         </div>
 

@@ -13,10 +13,18 @@ import Button from "../../ui/Button";
 import Modal from "../../ui/Modal";
 import StatusIndicator from "../../ui/StatusIndicator";
 
+/**
+ * What a run does. Decisions about a run (such as offering an admin bundle
+ * when AWS refuses it) key on this, never on its label: a follow of an
+ * existing environment's deploy is labelled like a new deploy.
+ */
+export type RunKind = "deploy" | "follow" | "repair" | "update" | "destroy" | "onboard" | "push" | "boundary";
+
 /** One OpenTofu run this view is showing: a start, or a follow of one already running. */
 export interface DeployRun {
   stateKey: string;
   region: string;
+  kind: RunKind;
   label: string;
   /** Null until the starting command resolves. */
   opId: string | null;
@@ -57,7 +65,13 @@ export function useDeployRuns(
   }, []);
 
   const start = useCallback(
-    async (stateKey: string, region: string, label: string, run: () => Promise<string>): Promise<AwsError | null> => {
+    async (
+      stateKey: string,
+      region: string,
+      kind: RunKind,
+      label: string,
+      run: () => Promise<string>,
+    ): Promise<AwsError | null> => {
       const k = runKey(region, stateKey);
       subs.current.get(k)?.unlisten?.();
       const sub: Subscription = { unlisten: null };
@@ -94,7 +108,7 @@ export function useDeployRuns(
 
       setRuns((prev) => ({
         ...prev,
-        [k]: { stateKey, region, label, opId: null, events: [], done: false, cancellable: false, result: null },
+        [k]: { stateKey, region, kind, label, opId: null, events: [], done: false, cancellable: false, result: null },
       }));
 
       const unlisten = await listen<ProgressPayload>(AWS_DEPLOY_PROGRESS_EVENT, ({ payload }) => {
@@ -146,7 +160,7 @@ function EventLine({ e }: { e: TofuEvent }) {
   return (
     <li className="text-xs leading-snug">
       {(e.resource || e.action) && (
-        <span className="mr-1.5">
+        <span className="mr-1.5 break-all">
           {e.resource && <span className="font-mono text-[var(--text-primary)]">{e.resource}</span>}
           {e.action && <span className="ml-1 text-[var(--text-secondary)]">{e.action}</span>}
         </span>
@@ -154,10 +168,10 @@ function EventLine({ e }: { e: TofuEvent }) {
       {isError ? (
         <>
           <span className="font-semibold text-[var(--error)]">Error: </span>
-          <pre className="whitespace-pre-wrap break-words font-mono text-[var(--error)]">{e.message}</pre>
+          <pre className="max-w-full overflow-x-auto whitespace-pre-wrap break-words font-mono text-[var(--error)]">{e.message}</pre>
         </>
       ) : (
-        <span className="text-[var(--text-secondary)]">{e.message}</span>
+        <span className="text-[var(--text-secondary)] break-words">{e.message}</span>
       )}
     </li>
   );
@@ -205,14 +219,14 @@ export default function DeployProgress({
   return (
     <section
       aria-label={`${run.label} progress`}
-      className="space-y-1.5 border border-[var(--border-color)] rounded-[var(--radius-control)] p-2 bg-[var(--bg-primary)]"
+      className="space-y-1.5 min-w-0 border border-[var(--border-color)] rounded-[var(--radius-control)] p-2 bg-[var(--bg-primary)]"
     >
-      <div className="flex items-center justify-between gap-2 flex-wrap">
-        <div className="flex items-center gap-2 text-xs">
-          <span className="font-medium text-[var(--text-primary)]">{run.label}</span>
+      <div className="flex items-center justify-between gap-2 flex-wrap" data-testid="deploy-progress-header">
+        <div className="flex items-center gap-2 text-xs flex-wrap min-w-0">
+          <span className="font-medium text-[var(--text-primary)] break-words min-w-0">{run.label}</span>
           {status && <StatusIndicator tone={status.tone} label={status.label} />}
         </div>
-        <div className="flex gap-1.5">
+        <div className="flex gap-1.5 flex-wrap">
           {!run.done && (
             <Button
               size="sm"
@@ -239,11 +253,12 @@ export default function DeployProgress({
         </ol>
       )}
       {run.done && run.result && (
-        <p role="status" className="text-xs">
+        <p role="status" className="text-xs break-words">
           {run.result.ok ? (
-            <StatusIndicator tone="ok" label={`Finished${run.result.summary ? `: ${run.result.summary}` : ""}`} />
+            <StatusIndicator wrap tone="ok" label={`Finished${run.result.summary ? `: ${run.result.summary}` : ""}`} />
           ) : (
             <StatusIndicator
+              wrap
               tone="error"
               label={`Failed (exit ${run.result.exit_code})${run.result.summary ? `: ${run.result.summary}` : ""}`}
             />
@@ -251,7 +266,7 @@ export default function DeployProgress({
         </p>
       )}
       {cancelError && !confirming && (
-        <p role="alert" className="text-xs text-[var(--error)]">
+        <p role="alert" className="text-xs text-[var(--error)] break-words">
           {awsErrorMessage(cancelError)}
         </p>
       )}

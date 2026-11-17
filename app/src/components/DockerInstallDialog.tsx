@@ -1,9 +1,78 @@
 import { useEffect, useState } from "react";
 import { useInstallHelper } from "../hooks/useInstallHelper";
 import { openUrlExternal } from "../lib/tauri-commands";
+import type { DockerStatus } from "../lib/types";
 import { useDocker } from "../hooks/useDocker";
 import Modal from "./ui/Modal";
 import Button from "./ui/Button";
+
+const AWS_NOTE = "AWS projects don't need local Docker and still work.";
+
+function Cmd({ children }: { children: string }) {
+  return (
+    <code className="block font-mono text-[var(--text-primary)] bg-[var(--bg-primary)] border border-[var(--border-color)] rounded-[var(--radius-control)] px-2 py-1 my-1 select-all break-all">
+      {children}
+    </code>
+  );
+}
+
+/** Guidance for a Docker that is installed but not answering. */
+function NotRunningHelp({ status }: { status: DockerStatus }) {
+  if (status.os === "linux") {
+    return (
+      <div className="text-xs text-[var(--text-secondary)] space-y-2">
+        <p>Start the daemon:</p>
+        <Cmd>sudo systemctl start docker</Cmd>
+        <p>
+          If systemd gave up restarting it (<span className="font-mono">start-limit-hit</span>),
+          clear that first, then start it again:
+        </p>
+        <Cmd>sudo systemctl reset-failed docker</Cmd>
+        <p>To see why it stopped:</p>
+        <Cmd>systemctl status docker</Cmd>
+        <Cmd>journalctl -u docker -b</Cmd>
+        <p>
+          To start it at every boot, use{" "}
+          <span className="font-mono">sudo systemctl enable --now docker</span>. Rootless Docker
+          runs as your user instead: <span className="font-mono">systemctl --user start docker</span>.
+        </p>
+      </div>
+    );
+  }
+  return (
+    <div className="text-xs text-[var(--text-secondary)] space-y-2">
+      <p>
+        Start <span className="text-[var(--text-primary)]">Docker Desktop</span> and wait until it
+        says the engine is running — the first start can take a minute. This dialog closes on its
+        own once Docker answers.
+      </p>
+    </div>
+  );
+}
+
+function NoPermissionHelp({ status }: { status: DockerStatus }) {
+  if (status.os === "linux") {
+    return (
+      <div className="text-xs text-[var(--text-secondary)] space-y-2">
+        <p>
+          Your user is not in the <span className="font-mono">docker</span> group, so the socket
+          refuses the connection. Add yourself:
+        </p>
+        <Cmd>sudo usermod -aG docker $USER</Cmd>
+        <p>Then log out and back in (or reboot) so the new group applies, and reopen Triple-C.</p>
+      </div>
+    );
+  }
+  return (
+    <div className="text-xs text-[var(--text-secondary)] space-y-2">
+      <p>
+        The Docker endpoint refused access. Make sure Docker Desktop is running for your user
+        {status.os === "windows" ? " and that your account is in the docker-users group" : ""}, then
+        re-check.
+      </p>
+    </div>
+  );
+}
 
 interface Props {
   onClose: () => void;
@@ -13,7 +82,7 @@ type Phase = "idle" | "installing" | "done" | "error";
 
 export default function DockerInstallDialog({ onClose }: Props) {
   const { options, loadOptions, runInstall } = useInstallHelper();
-  const { checkDocker } = useDocker();
+  const { checkDocker, dockerStatus } = useDocker();
   const [showManual, setShowManual] = useState(false);
   const [phase, setPhase] = useState<Phase>("idle");
   const [log, setLog] = useState<string[]>([]);
@@ -22,6 +91,13 @@ export default function DockerInstallDialog({ onClose }: Props) {
   useEffect(() => {
     loadOptions();
   }, [loadOptions]);
+
+  // Docker came up while the dialog was open (polling keeps `dockerStatus`
+  // current): nothing left to say. Not mid-install, whose notes still matter.
+  const running = dockerStatus?.state === "running";
+  useEffect(() => {
+    if (running && (phase === "idle" || phase === "error")) onClose();
+  }, [running, phase, onClose]);
 
   const handleInstall = async () => {
     setPhase("installing");
@@ -52,6 +128,50 @@ export default function DockerInstallDialog({ onClose }: Props) {
     if (available) onClose();
   };
 
+  const state = dockerStatus?.state ?? "not_installed";
+  const endpointLine = dockerStatus && (
+    <p className="text-[11px] text-[var(--text-secondary)] mt-3 break-all">
+      Tried <span className="font-mono">{dockerStatus.endpoint}</span>
+      {dockerStatus.detail ? <> — {dockerStatus.detail}</> : null}
+    </p>
+  );
+  const awsLine = (
+    <p className="text-[11px] text-[var(--text-secondary)] mt-2">{AWS_NOTE}</p>
+  );
+
+  if (dockerStatus && (state === "not_running" || state === "no_permission")) {
+    return (
+      <Modal
+        title={state === "not_running" ? "Docker is installed but not running" : "Docker is running but not accessible"}
+        onClose={onClose}
+        widthClassName="w-[34rem]"
+        footer={
+          <>
+            <Button variant="ghost" onClick={onClose}>
+              Dismiss
+            </Button>
+            <Button variant="primary" onClick={handleRecheck}>
+              Re-check
+            </Button>
+          </>
+        }
+      >
+        <p className="text-[13px] text-[var(--text-secondary)] mb-3">
+          {state === "not_running"
+            ? "Triple-C found Docker on this machine, but the Docker daemon is not answering. There is nothing to install."
+            : "The Docker daemon is up, but this user is not allowed to talk to it."}
+        </p>
+        {state === "not_running" ? (
+          <NotRunningHelp status={dockerStatus} />
+        ) : (
+          <NoPermissionHelp status={dockerStatus} />
+        )}
+        {endpointLine}
+        {awsLine}
+      </Modal>
+    );
+  }
+
   if (!options) {
     return null;
   }
@@ -61,7 +181,7 @@ export default function DockerInstallDialog({ onClose }: Props) {
 
   return (
     <Modal
-      title="Docker not detected"
+      title="Docker is not installed"
       onClose={onClose}
       widthClassName="w-[34rem]"
       // Closing mid-install would orphan a privileged installer.
@@ -80,6 +200,8 @@ export default function DockerInstallDialog({ onClose }: Props) {
         <span className="text-[var(--text-primary)]">{options.product_name}</span> for
         you, or you can follow the official instructions.
       </p>
+      {awsLine}
+      <div className="mb-4">{endpointLine}</div>
 
       {phase === "idle" && (
         <div className="flex flex-col gap-2">

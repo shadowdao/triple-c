@@ -15,6 +15,7 @@ mod logging;
 mod marketplace;
 mod models;
 mod project_lock;
+mod sidecar_placeholder;
 mod storage;
 pub mod url_open;
 pub mod web_terminal;
@@ -541,6 +542,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             // Docker
             commands::docker_commands::check_docker,
+            commands::docker_commands::check_docker_status,
             commands::docker_commands::check_image_exists,
             commands::docker_commands::build_image,
             commands::docker_commands::get_container_info,

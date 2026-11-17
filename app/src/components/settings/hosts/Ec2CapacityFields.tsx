@@ -48,6 +48,7 @@ export default function Ec2CapacityFields({
       <div className="text-[13px] font-medium text-[var(--text-primary)]">EC2 capacity</div>
       <SegmentedControl<"none" | "ec2">
         label="EC2 capacity"
+        className="flex-wrap max-w-full"
         value={value.enabled ? "ec2" : "none"}
         onChange={(v) => set({ enabled: v === "ec2" })}
         segments={[
