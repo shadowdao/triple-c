@@ -1614,13 +1614,15 @@ fn live_record(t: &TaskInfo) -> TaskRecord {
 /// it through [`tunnels::wait_endpoint`]), then — copy-at-connect — copy the
 /// credentials in, calling `on_connect_warning` if that fails — after
 /// opening its port mappings (`on_ports_warning` for any that fail). Never
-/// blocks on the tunnel.
+/// blocks on the tunnel. `on_interrupted_warning` reports a start that an
+/// app restart interrupted ([`INTERRUPTED`]), on its own toast topic.
 pub async fn reconcile(
     project: &Project,
     settings: &AppSettings,
     store: Arc<ProjectsStore>,
     on_connect_warning: impl FnOnce(String) + Send + 'static,
     on_ports_warning: impl FnOnce(String) + Send + 'static,
+    on_interrupted_warning: impl FnOnce(String) + Send + 'static,
 ) {
     let (connection_id, region, sdk) = match project_sdk(project, settings).await {
         Ok(v) => v,
@@ -1673,7 +1675,7 @@ pub async fn reconcile(
         }
         Ok(Reconciled::Interrupted) => {
             log::info!("Project '{}' ({}): {INTERRUPTED}", project.name, project.id);
-            on_connect_warning(INTERRUPTED.to_string());
+            on_interrupted_warning(INTERRUPTED.to_string());
         }
         Err(e) => log::warn!("Project {}: could not check its task ({e}); status left as is", project.id),
     }

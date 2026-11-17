@@ -647,6 +647,10 @@ checked live; each one's mark gives its verdict (✓ as expected, ✗→fixed fo
   create streams in the group but `PutLogEvents` only into `log-stream:<owner_key>/*`, the prefix
   every awslogs stream of theirs has (`<owner_key>/<project>/<container>/<task id>`), so no
   user's container, instance or host-network container can write into another user's streams.
+  Known limit: `logs:CreateLogStream` is authorized against the log group ARN only (the Service
+  Authorization Reference lists no log-stream resource type for it), so it cannot be scoped to
+  `log-stream:<owner_key>/*`. A user can therefore create a stream under another user's prefix
+  but cannot write events to it (`PutLogEvents` is scoped); the worst case is an empty stream.
   This also changed the version-1 (Fargate) task and execution role policies, in place.
 - **Orphaned cold-start tasks and clock skew.** A task with ECS Exec off still waiting for an
   instance counts as another start's (the start says so and waits) until it is older than the EC2

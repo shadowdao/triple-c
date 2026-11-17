@@ -1602,6 +1602,20 @@ fn emit_connect_warning(app_handle: &tauri::AppHandle, project_id: &str, name: &
     let _ = app_handle.emit("workspace-warning", connect_warning_payload(project_id, name, detail));
 }
 
+/// A start that an app restart interrupted (EC2 cold start): topic "start".
+fn emit_interrupted_warning(app_handle: &tauri::AppHandle, project_id: &str, name: &str, detail: &str) {
+    let _ = app_handle.emit("workspace-warning", interrupted_warning_payload(project_id, name, detail));
+}
+
+fn interrupted_warning_payload(project_id: &str, name: &str, detail: &str) -> serde_json::Value {
+    serde_json::json!({
+        "project_id": project_id,
+        "message": format!("“{name}”: a start was interrupted"),
+        "detail": detail,
+        "topic": "start",
+    })
+}
+
 fn connect_warning_payload(project_id: &str, name: &str, detail: &str) -> serde_json::Value {
     serde_json::json!({
         "project_id": project_id,
@@ -2209,6 +2223,10 @@ pub async fn reconcile_aws_projects(
             let on_ports_warning = move |detail: String| {
                 emit_ports_warning(&ports_handle, &ports_id, &ports_name, &detail)
             };
+            let (int_handle, int_id, int_name) = (handle.clone(), id.clone(), name.clone());
+            let on_interrupted_warning = move |detail: String| {
+                emit_interrupted_warning(&int_handle, &int_id, &int_name, &detail)
+            };
             let on_connect_warning =
                 move |detail: String| emit_connect_warning(&handle, &id, &name, &detail);
             if tokio::time::timeout(
@@ -2219,6 +2237,7 @@ pub async fn reconcile_aws_projects(
                     store,
                     on_connect_warning,
                     on_ports_warning,
+                    on_interrupted_warning,
                 ),
             )
             .await
@@ -2248,6 +2267,16 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn the_interrupted_warning_has_its_own_topic_and_headline() {
+        let v = interrupted_warning_payload("p1", "demo", "retry");
+        assert_eq!(v["topic"], "start");
+        assert_eq!(v["detail"], "retry");
+        let m = v["message"].as_str().unwrap();
+        assert!(m.contains("demo") && m.contains("a start was interrupted"));
+        assert!(!m.contains("credentials"));
+    }
 
     // ── Pending-cleanup aging ────────────────────────────────────────────
 

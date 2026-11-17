@@ -800,6 +800,47 @@ describe("HostSection — launch type (EC2)", () => {
     );
   });
 
+  const switchedProject = () => {
+    const p = awsProject();
+    p.aws = { ...p.aws!, cpu: 4096, memory_mib: 16384, spot: true, gateway_sidecar: true };
+    return p;
+  };
+
+  it("shows no switch note when the save was refused", async () => {
+    awsEc2Capacity.mockImplementation(async () => M7I);
+    renderHost(switchedProject());
+    await waitFor(() => expect(ec2Segment()).toBeEnabled());
+    save.mockResolvedValueOnce(false);
+    fireEvent.click(ec2Segment());
+    await waitFor(() => expect(save).toHaveBeenCalled());
+    await new Promise((r) => setTimeout(r, 0));
+    expect(screen.queryByText(/Switched to/)).toBeNull();
+  });
+
+  it("shows no switch note when the save fails", async () => {
+    awsEc2Capacity.mockImplementation(async () => M7I);
+    renderHost(switchedProject());
+    await waitFor(() => expect(ec2Segment()).toBeEnabled());
+    const unhandled = vi.fn();
+    process.on("unhandledRejection", unhandled);
+    save.mockRejectedValueOnce(new Error("boom"));
+    fireEvent.click(ec2Segment());
+    await waitFor(() => expect(save).toHaveBeenCalled());
+    await new Promise((r) => setTimeout(r, 0));
+    process.off("unhandledRejection", unhandled);
+    expect(screen.queryByText(/Switched to/)).toBeNull();
+  });
+
+  it("drops the switch note when another setting is saved afterwards", async () => {
+    awsEc2Capacity.mockImplementation(async () => M7I);
+    renderHost(switchedProject());
+    await waitFor(() => expect(ec2Segment()).toBeEnabled());
+    fireEvent.click(ec2Segment());
+    expect(await screen.findByText(/Switched to EC2/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("radio", { name: "Fargate" }));
+    await waitFor(() => expect(screen.queryByText(/Switched to EC2/)).toBeNull());
+  });
+
   it("prices an EC2 project as the user's instance type", async () => {
     awsEc2Capacity.mockImplementation(async () => M7I);
     useAppState.setState({

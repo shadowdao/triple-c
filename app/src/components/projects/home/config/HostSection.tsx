@@ -170,7 +170,11 @@ export default function HostSection({ project, save, disabled }: Props) {
   if (latest.current.base !== project.aws && latest.current.inFlight === 0) {
     latest.current = { base: project.aws, value: aws, inFlight: 0 };
   }
+  // Bumped by every save: a launch-type note only shows if no later save began.
+  const saveSeq = useRef(0);
   const saveAws = async (patch: Partial<AwsWorkspaceConfig>, also: Partial<Project> = {}) => {
+    saveSeq.current += 1;
+    setSwitchNote(null);
     const l = latest.current;
     const next = { ...l.value, ...patch };
     l.value = next;
@@ -214,9 +218,14 @@ export default function HostSection({ project, save, disabled }: Props) {
     setMemoryProblem(null);
     const before = { ...project, aws: latest.current.value };
     const patch = launchTypePatch(before, launch_type, limits);
-    setSwitchNote(launchTypeChanges(before, patch));
+    const note = launchTypeChanges(before, patch);
     const { aws: next, ...also } = patch;
-    void saveAws(next!, also);
+    // Shown only once the save went through, and dropped by any later save.
+    const pending = saveAws(next!, also);
+    const seq = saveSeq.current;
+    void pending.then((ok) => {
+      if (ok && saveSeq.current === seq) setSwitchNote(note);
+    });
   };
 
   // EC2 reservations: positive whole numbers that fit the user's instance
