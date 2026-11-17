@@ -36,6 +36,12 @@
       "icons/icon.icns",
       "icons/icon.png"
     ],
+    "externalBin": [
+      "binaries/session-manager-plugin"
+    ],
+    "resources": {
+      "THIRD_PARTY_NOTICES": "THIRD_PARTY_NOTICES"
+    },
     "linux": {
       "appimage": {
         "bundleMediaFramework": true

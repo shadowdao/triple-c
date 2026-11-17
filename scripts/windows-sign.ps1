@@ -10,9 +10,10 @@
 # extension DLLs candle/light load, the NSIS plugins makensis embeds - and
 # each signature is metered (about 1000 a month), so those are skipped. The
 # allowlist below is the whole of what reaches users: the app binary, the MSI,
-# the NSIS installer, and the uninstaller makensis writes to the job's temp
-# directory. A file that already carries a valid signature is skipped too:
-# Tauri presents the app binary once per bundle type.
+# the NSIS installer, the uninstaller makensis writes to the job's temp
+# directory, and the session-manager-plugin sidecar we build from source. A
+# file that already carries a valid signature is skipped too: Tauri presents
+# the app binary once per bundle type.
 #
 # This may run as 32-bit PowerShell: the NSIS uninstaller is signed from inside
 # makensis, which is 32-bit and resolves `powershell` to the SysWOW64 copy. So
@@ -46,7 +47,12 @@ try {
     $full = (Resolve-Path -LiteralPath $Path).ProviderPath
     Write-Log "== $full"
 
-    $ships = ($full -match '\\target\\release\\[^\\]+\.exe$') -or
+    # The bundled session-manager-plugin sidecar (bundle.externalBin), which we
+    # build from AWS's source (scripts/build-ssm-plugin.ps1) and so ship unsigned
+    # unless signed here. Tauri presents a sidecar to the sign command, in place
+    # under app\src-tauri\binaries, only when `signtool verify /pa` rejects it.
+    $ships = ($full -match '\\src-tauri\\binaries\\session-manager-plugin-x86_64-pc-windows-msvc\.exe$') -or
+             ($full -match '\\target\\release\\[^\\]+\.exe$') -or
              ($full -match '\\target\\release\\bundle\\(msi|nsis)\\[^\\]+\.(msi|exe)$') -or
              $full.StartsWith($env:TRIPLE_C_SIGN_TMP.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)
     if (-not $ships) {

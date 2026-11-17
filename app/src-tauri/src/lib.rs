@@ -15,6 +15,7 @@ mod logging;
 mod marketplace;
 mod models;
 mod project_lock;
+mod sidecar_placeholder;
 mod storage;
 pub mod url_open;
 pub mod web_terminal;

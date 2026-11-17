@@ -317,6 +317,22 @@ if [ "$pw_removed" = true ]; then
 fi
 [ -x "$out/usr/bin/triple-c" ] || fail "no executable usr/bin/triple-c."
 
+# The bundled AWS Session Manager plugin (bundle.externalBin, built from
+# source by build-ssm-plugin.sh) is what AWS workspaces connect through. Tauri copies it
+# beside the app binary with the target triple stripped, which is where
+# `host::ssm::find_plugin` looks. It must be the real plugin: an ELF, not the
+# placeholder a debug build writes (build.rs refuses that for release, and this
+# is the check on what actually shipped).
+plugin="$out/usr/bin/session-manager-plugin"
+[ -x "$plugin" ] || fail "no executable usr/bin/session-manager-plugin (the bundled AWS plugin)."
+[ "$(head -c 4 "$plugin" | od -An -c | tr -d ' ')" = "177ELF" ] \
+  || fail "usr/bin/session-manager-plugin is not an ELF binary (a placeholder?)."
+"$plugin" --version >/dev/null 2>&1 \
+  || fail "usr/bin/session-manager-plugin does not run (--version)."
+# Its license and notices travel with it (bundle.resources).
+notices=("$out"/usr/lib/*/THIRD_PARTY_NOTICES)
+[ -f "${notices[0]}" ] || fail "THIRD_PARTY_NOTICES is not in the image."
+
 # Every file readable by all, every program executable by all — what the
 # `chmod -R a+rX` before the repack promised (AppRun.wrapped used to ship 0770).
 # Files only: the AppImage runtime's --appimage-extract creates every

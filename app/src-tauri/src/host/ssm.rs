@@ -198,27 +198,48 @@ fn sdk_error(e: &(dyn std::error::Error + 'static)) -> String {
 
 // ── The plugin ───────────────────────────────────────────────────────────────
 
-/// Find `session-manager-plugin`: `TRIPLEC_SSM_PLUGIN` if set, then `PATH`,
-/// then where AWS's installers put it (the GUI app on macOS does not get the
-/// shell's `PATH`, so the install locations are not optional).
+/// The plugin's file name on this platform: what the bundle holds (Tauri strips the
+/// `-<target-triple>` suffix of `bundle.externalBin` when it copies the sidecar in) and what
+/// AWS's installers put on `PATH`.
+const PLUGIN_FILE: &str =
+    if cfg!(windows) { "session-manager-plugin.exe" } else { "session-manager-plugin" };
+
+const PLUGIN_INSTALL_HINT: &str = "The AWS Session Manager plugin (session-manager-plugin) is \
+    not installed. It is what connects to a workspace on AWS; install it from \
+    https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html";
+
+/// Find `session-manager-plugin`, in this order:
+///
+/// 1. `TRIPLEC_SSM_PLUGIN`, if set (an error if it names no file — an explicit choice is never
+///    silently replaced by another plugin);
+/// 2. **the copy bundled with the app** (`bundle.externalBin`), beside the app's own
+///    executable: `usr/bin` in the AppImage, `Contents/MacOS` in the macOS bundle, the install
+///    directory on Windows (and `target/<profile>` under `tauri dev`, where tauri-build copies
+///    it). A debug build's placeholder (`sidecar_placeholder`) is skipped;
+/// 3. `PATH`;
+/// 4. where AWS's installers put it (the GUI app on macOS does not get the shell's `PATH`, so
+///    the install locations are not optional).
+///
+/// 3 and 4 remain for dev builds without a fetched sidecar.
 pub fn find_plugin() -> Result<PathBuf, String> {
-    if let Some(p) = std::env::var_os("TRIPLEC_SSM_PLUGIN").filter(|p| !p.is_empty()) {
-        let p = PathBuf::from(p);
-        return if p.is_file() {
-            Ok(p)
-        } else {
-            Err(format!("TRIPLEC_SSM_PLUGIN names {}, which is not a file", p.display()))
-        };
-    }
-    let name = if cfg!(windows) { "session-manager-plugin.exe" } else { "session-manager-plugin" };
-    let on_path = std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).map(|d| d.join(name)).collect::<Vec<_>>())
-        .unwrap_or_default();
-    let installed: Vec<PathBuf> = if cfg!(windows) {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf));
+    resolve_plugin(&PluginSearch {
+        override_path: std::env::var_os("TRIPLEC_SSM_PLUGIN"),
+        exe_dir,
+        path_var: std::env::var_os("PATH"),
+        install_dirs: plugin_install_dirs(),
+    })
+}
+
+/// Where AWS's installers put the plugin, in the order they are tried.
+fn plugin_install_dirs() -> Vec<PathBuf> {
+    if cfg!(windows) {
         ["ProgramFiles", "ProgramFiles(x86)"]
             .iter()
             .filter_map(|v| std::env::var_os(v))
-            .map(|d| PathBuf::from(d).join(r"Amazon\SessionManagerPlugin\bin").join(name))
+            .map(|d| PathBuf::from(d).join(r"Amazon\SessionManagerPlugin\bin"))
             .collect()
     } else {
         [
@@ -228,19 +249,54 @@ pub fn find_plugin() -> Result<PathBuf, String> {
             "/usr/bin",
         ]
         .iter()
-        .map(|d| Path::new(d).join(name))
+        .map(PathBuf::from)
         .collect()
-    };
+    }
+}
+
+/// Everything [`find_plugin`] reads from the process, so the order is testable.
+struct PluginSearch {
+    override_path: Option<std::ffi::OsString>,
+    exe_dir: Option<PathBuf>,
+    path_var: Option<std::ffi::OsString>,
+    install_dirs: Vec<PathBuf>,
+}
+
+fn resolve_plugin(search: &PluginSearch) -> Result<PathBuf, String> {
+    if let Some(p) = search.override_path.as_ref().filter(|p| !p.is_empty()) {
+        let p = PathBuf::from(p);
+        return if p.is_file() {
+            Ok(p)
+        } else {
+            Err(format!("TRIPLEC_SSM_PLUGIN names {}, which is not a file", p.display()))
+        };
+    }
+    if let Some(bundled) = search.exe_dir.as_ref().map(|d| d.join(PLUGIN_FILE)) {
+        if bundled.is_file() && !is_sidecar_placeholder(&bundled) {
+            return Ok(bundled);
+        }
+    }
+    let on_path = search
+        .path_var
+        .as_ref()
+        .map(|paths| std::env::split_paths(paths).map(|d| d.join(PLUGIN_FILE)).collect::<Vec<_>>())
+        .unwrap_or_default();
     on_path
         .into_iter()
-        .chain(installed)
+        .chain(search.install_dirs.iter().map(|d| d.join(PLUGIN_FILE)))
         .find(|p| p.is_file())
-        .ok_or_else(|| {
-            "The AWS Session Manager plugin (session-manager-plugin) is not installed. It is \
-             what connects to a workspace on AWS; install it from \
-             https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html"
-                .to_string()
-        })
+        .ok_or_else(|| PLUGIN_INSTALL_HINT.to_string())
+}
+
+/// Whether `path` is the stand-in a debug build bundles when no real plugin was fetched.
+/// Unreadable counts as "not a placeholder": the spawn then reports the real error.
+fn is_sidecar_placeholder(path: &Path) -> bool {
+    use std::io::Read;
+    let mut head = [0u8; crate::sidecar_placeholder::MARKER.len()];
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut head))
+        .map(|()| crate::sidecar_placeholder::is_placeholder(&head))
+        .unwrap_or(false)
 }
 
 /// A running plugin process with a listener on the local port.
