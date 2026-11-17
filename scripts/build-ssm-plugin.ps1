@@ -57,6 +57,20 @@ if ((Test-Path -LiteralPath $dest) -and ((Get-Sha256 $dest) -eq $BinarySha)) {
 # is 260 for Windows PowerShell 5.1, tar.exe and the Go build alike.
 $work = Join-Path "$env:SystemDrive\" ('ssm-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
 New-Item -ItemType Directory -Path $work | Out-Null
+# A directory at the drive root inherits C:\'s ACL, where Authenticated Users
+# may create and modify files - another local user could swap the source, the
+# toolchain or the output between our checks and their use. So before anything
+# lands in it: no inheritance, full control for SYSTEM, Administrators and this
+# process's own user only. Mandatory on Windows; skipped only where there is no
+# Windows ACL (the Linux pwsh test path).
+if ($env:OS -eq 'Windows_NT') {
+    $me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    & icacls.exe $work /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' "*${me}:(OI)(CI)F" | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+        throw "icacls could not restrict $work ($LASTEXITCODE)"
+    }
+}
 $ProgressPreference = 'SilentlyContinue'
 try {
     $goZip = Join-Path $work 'go.zip'
@@ -124,6 +138,12 @@ try {
 
     New-Item -ItemType Directory -Force -Path $destDir | Out-Null
     Move-Item -LiteralPath $out -Destination $dest -Force
+    # And what landed is still what was checked.
+    $actual = Get-Sha256 $dest
+    if ($actual -ne $BinarySha) {
+        Remove-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue
+        throw "$dest changed after it was verified: got $actual, pinned $BinarySha"
+    }
     Write-Host "session-manager-plugin-$Triple.exe: session-manager-plugin $PluginVersion (unsigned; signed by the release build)"
 } finally {
     Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
