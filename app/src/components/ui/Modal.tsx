@@ -208,7 +208,7 @@ export default function Modal({
         </div>
 
         {footer && (
-          <div className="flex items-center justify-end gap-2 px-5 py-3 border-t border-[var(--border-color)] flex-shrink-0">
+          <div className="flex flex-wrap items-center justify-end gap-2 px-5 py-3 border-t border-[var(--border-color)] flex-shrink-0">
             {footer}
           </div>
         )}

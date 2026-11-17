@@ -74,4 +74,23 @@ describe("Button", () => {
     fireEvent.click(button);
     expect(onClick).toHaveBeenCalledTimes(1);
   });
+
+  it("wraps a long label only when asked", () => {
+    render(
+      <>
+        <Button>Short</Button>
+        <Button wrap size="md">
+          Request an environment from an admin…
+        </Button>
+      </>,
+    );
+    const plain = screen.getByRole("button", { name: "Short" });
+    expect(plain.className).toContain("whitespace-nowrap");
+    expect(plain.className).toContain("h-6");
+    const long = screen.getByRole("button", { name: "Request an environment from an admin…" });
+    expect(long.className).toContain("whitespace-normal");
+    expect(long.className).toContain("min-h-8");
+    expect(long.className).toContain("max-w-full");
+    expect(long.className).not.toMatch(/(^|\s)h-8(\s|$)/);
+  });
 });

@@ -64,7 +64,7 @@ function ErrorLine({
 }) {
   return (
     <div role="alert" className="text-xs text-[var(--error)] leading-snug flex items-center gap-2 flex-wrap">
-      <span>{awsErrorMessage(failure.error)}</span>
+      <span className="min-w-0 break-words">{awsErrorMessage(failure.error)}</span>
       {failure.error.kind === "sso_expired" && !onSignIn && (
         <span>
           Sign in with <code>aws sso login --profile {failure.error.profile}</code> and try again.
@@ -124,7 +124,7 @@ function PermissionReportView({ report }: { report: PermissionReport }) {
         >
           {badge}
         </span>
-        <span className="text-xs text-[var(--text-secondary)]">
+        <span className="min-w-0 break-all text-xs text-[var(--text-secondary)]" data-testid="report-identity">
           {report.identity.arn} · {report.region}
         </span>
       </div>
@@ -154,8 +154,8 @@ function PermissionReportView({ report }: { report: PermissionReport }) {
           </summary>
           <ul className="mt-1 space-y-0.5 pl-4">
             {t.results.map((r) => (
-              <li key={r.action} className="text-[var(--text-secondary)]">
-                <span className="font-mono">{r.action}</span> — {r.verdict}
+              <li key={r.action} className="text-[var(--text-secondary)] break-words">
+                <span className="font-mono break-all">{r.action}</span> — {r.verdict}
                 {r.note && (
                   <>
                     {" "}
@@ -263,7 +263,7 @@ function ConnectionRow({ host }: { host: HostConnection }) {
     <li
       ref={rowRef}
       data-testid={`host-${host.id}`}
-      className="border border-[var(--border-color)] rounded-[var(--radius-control)] p-2.5 space-y-1.5"
+      className="border border-[var(--border-color)] rounded-[var(--radius-control)] p-2.5 space-y-1.5 min-w-0"
     >
       {editing ? (
         <div className="space-y-2">
@@ -273,7 +273,7 @@ function ConnectionRow({ host }: { host: HostConnection }) {
               <input id={id} className={inputClass} list="aws-regions" value={region} onChange={(e) => setRegion(e.target.value)} />
             )}
           </Field>
-          <div className="flex gap-2">
+          <div className="flex gap-2 flex-wrap">
             <Button size="sm" variant="primary" onClick={save} disabled={busy || !name.trim() || !region.trim()}>
               Save changes
             </Button>
@@ -283,16 +283,16 @@ function ConnectionRow({ host }: { host: HostConnection }) {
           </div>
         </div>
       ) : (
-        <div className="flex items-start justify-between gap-2 flex-wrap">
+        <div className="flex items-start justify-between gap-2 flex-wrap" data-testid={`host-header-${host.id}`}>
           <div className="min-w-0">
-            <div className="text-[13px] font-medium text-[var(--text-primary)]">{host.name}</div>
-            <div className="text-xs text-[var(--text-secondary)]">
+            <div className="text-[13px] font-medium text-[var(--text-primary)] break-words">{host.name}</div>
+            <div className="text-xs text-[var(--text-secondary)] break-words">
               <span>{auth.method === "profile" ? `Profile: ${auth.name}` : "Access keys"}</span>
               {" · "}
               <span>{host.kind.default_region}</span>
             </div>
           </div>
-          <div className="flex gap-1.5">
+          <div className="flex gap-1.5 flex-wrap">
             <Button size="sm" onClick={runCheck} disabled={busy} aria-label={`Check ${host.name}`}>
               Check
             </Button>
@@ -309,7 +309,7 @@ function ConnectionRow({ host }: { host: HostConnection }) {
       )}
       {confirmRemove && (
         <div role="alertdialog" aria-label={`Remove ${host.name}?`} className="flex items-center gap-2 flex-wrap text-xs">
-          <span>Remove {host.name}? Its stored credentials are deleted.</span>
+          <span className="min-w-0 break-words">Remove {host.name}? Its stored credentials are deleted.</span>
           <Button data-focus="confirm-remove" size="sm" variant="danger" onClick={remove} disabled={busy} aria-label={`Confirm remove ${host.name}`}>
             Confirm remove
           </Button>
@@ -501,7 +501,7 @@ function AddConnectionForm() {
         {busy ? "Adding…" : "Add connection"}
       </Button>
       {signedInAs && (
-        <p role="status" className="text-xs text-[var(--success)]">
+        <p role="status" className="text-xs text-[var(--success)] break-all">
           Signed in as {signedInAs}
         </p>
       )}
@@ -516,7 +516,7 @@ export default function HostsSettings() {
   const { appSettings } = useSettings();
   const hosts = appSettings?.hosts ?? [];
   return (
-    <div className="space-y-3">
+    <div className="space-y-3 min-w-0">
       <p className="text-xs text-[var(--text-secondary)] leading-snug">
         Where project environments run. AWS connections check what your credentials can do, and find, deploy and join environments.
       </p>

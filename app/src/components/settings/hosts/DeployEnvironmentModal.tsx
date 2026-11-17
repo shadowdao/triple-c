@@ -30,6 +30,7 @@ export default function DeployEnvironmentModal({
   onClose,
   onDeploy,
   onDetect,
+  onBundle,
 }: {
   connectionId: string;
   region: string;
@@ -40,6 +41,8 @@ export default function DeployEnvironmentModal({
   /** Starts the run; resolves to the command's error, or null once started. */
   onDeploy: (name: string, network: NetworkChoice, maxWorkspaceHours: number) => Promise<AwsError | null>;
   onDetect: () => void;
+  /** Switch to an environment bundle for an admin (offered when AWS refuses the deploy). */
+  onBundle?: () => void;
 }) {
   const [name, setName] = useState("main");
   const [draft, setDraft] = useState<NetworkDraft>(DEFAULT_NETWORK);
@@ -125,18 +128,19 @@ export default function DeployEnvironmentModal({
           <div className="flex gap-2 flex-wrap">
             <Button
               size="md"
+              wrap
               variant="primary"
               onClick={createBoundary}
               disabled={!!boundaryRun && !boundaryRun.done}
             >
               Create the permissions boundary (needs an account administrator)
             </Button>
-            <Button size="md" onClick={() => setBundle({})}>
+            <Button size="md" wrap onClick={() => setBundle({})}>
               Save a bundle for an administrator instead
             </Button>
           </div>
           {boundaryError && (
-            <p role="alert" className="text-[var(--error)]">
+            <p role="alert" className="text-[var(--error)] break-words">
               {awsErrorMessage(boundaryError)}
             </p>
           )}
@@ -149,6 +153,7 @@ export default function DeployEnvironmentModal({
               </p>
               <Button
                 size="md"
+                wrap
                 onClick={() =>
                   setBundle({
                     reason: boundaryFailed.summary ?? `OpenTofu exited with code ${boundaryFailed.exit_code}`,
@@ -179,9 +184,17 @@ export default function DeployEnvironmentModal({
             First deploy downloads OpenTofu (~30 MB) and the AWS provider (~150 MB).
           </p>
           {error && (
-            <p role="alert" className="text-xs text-[var(--error)] leading-snug">
+            <p role="alert" className="text-xs text-[var(--error)] leading-snug break-words">
               {awsErrorMessage(error)}
             </p>
+          )}
+          {error?.kind === "access_denied" && onBundle && !repair && (
+            <div className="space-y-1.5 text-xs text-[var(--text-secondary)] leading-snug">
+              <p>An admin can deploy this environment for you from a bundle.</p>
+              <Button size="sm" wrap onClick={onBundle}>
+                Save an environment bundle for an admin…
+              </Button>
+            </div>
           )}
         </div>
       )}

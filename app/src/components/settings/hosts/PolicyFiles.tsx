@@ -28,12 +28,12 @@ export default function PolicyFiles({
 
   if (!files) {
     return (
-      <div className="space-y-1">
-        <Button size="sm" onClick={load}>
+      <div className="space-y-1 min-w-0">
+        <Button size="sm" wrap onClick={load}>
           {label}
         </Button>
         {error && (
-          <p role="alert" className="text-xs text-[var(--error)]">
+          <p role="alert" className="text-xs text-[var(--error)] break-words">
             {error}
           </p>
         )}
@@ -41,30 +41,38 @@ export default function PolicyFiles({
     );
   }
   return (
-    <div className="space-y-1 text-xs">
-      <p className="text-[var(--text-secondary)]">
+    <div className="space-y-1.5 text-xs min-w-0">
+      <p className="text-[var(--text-secondary)] leading-snug break-words">
         {tier === "workspace_user" ? "Workspace user" : "Environment admin"}:{" "}
         {files.length === 1
           ? "attach this file as a customer managed policy."
           : `Attach all ${files.length} files, each as its own customer managed policy.`}
       </p>
+      {/* One copy button per file, in a grid that drops to one column when narrow. */}
+      <div data-testid="policy-copy-grid" className="grid gap-1.5 grid-cols-[repeat(auto-fill,minmax(9rem,1fr))]">
+        {files.map((f) => (
+          <Button
+            key={f.name}
+            size="sm"
+            wrap
+            className="w-full justify-start break-all"
+            aria-label={`Copy ${f.name}`}
+            onClick={() => onCopy(f)}
+          >
+            Copy <span className="font-mono">{f.name}</span>
+          </Button>
+        ))}
+      </div>
       {files.map((f) => (
-        <div key={f.name} className="space-y-1">
-          <div className="flex items-center gap-2">
-            <span className="font-mono text-[var(--text-primary)]">{f.name}</span>
-            <Button size="sm" aria-label={`Copy ${f.name}`} onClick={() => onCopy(f)}>
-              Copy
-            </Button>
-          </div>
-          <details>
-            <summary className="cursor-pointer text-[var(--text-secondary)]">Show JSON</summary>
-            <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap break-all text-[var(--text-secondary)]">
-              {f.json}
-            </pre>
-          </details>
-        </div>
+        <details key={f.name} className="min-w-0">
+          <summary className="cursor-pointer text-[var(--text-secondary)] break-all">
+            Show JSON of <span className="font-mono">{f.name}</span>
+          </summary>
+          <pre className="mt-1 max-h-48 max-w-full overflow-auto whitespace-pre-wrap break-all text-[var(--text-secondary)]">
+            {f.json}
+          </pre>
+        </details>
       ))}
     </div>
   );
 }
-

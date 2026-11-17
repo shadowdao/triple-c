@@ -4,12 +4,13 @@ import type { AwsError, Ec2Choice, Ec2Compute, UserCompute } from "../../../lib/
 import Button from "../../ui/Button";
 import Modal from "../../ui/Modal";
 import Ec2CapacityFields from "./Ec2CapacityFields";
-import { ec2DraftFrom, ec2FromDraft, type Ec2Draft } from "./environmentFormat";
+import { ec2DraftFrom, ec2FromDraft, UNCONFIRMED_NOTE, type Ec2Draft } from "./environmentFormat";
 
 /**
- * Self-onboarding (environment admins): join an environment, or re-apply an
- * onboarding to change its EC2 capacity. Starts from the recorded capacity,
- * so a re-apply keeps it unless changed.
+ * Self-onboarding: join an environment, or re-apply an onboarding to change
+ * its EC2 capacity. Starts from the recorded capacity, so a re-apply keeps it
+ * unless changed. Open to anyone: AWS refuses the run when a permission is
+ * missing, and an onboarding bundle for an admin is the alternative.
  */
 export default function JoinEnvironmentModal({
   environment,
@@ -18,6 +19,8 @@ export default function JoinEnvironmentModal({
   reapply,
   incomplete = false,
   lastChoice = null,
+  confirmedAdmin = true,
+  onBundle,
   onJoin,
   onClose,
 }: {
@@ -33,6 +36,10 @@ export default function JoinEnvironmentModal({
   /** The EC2 capacity last chosen here in this run of the app, if any:
    *  the starting point when there is no record. */
   lastChoice?: Ec2Compute | null;
+  /** The permission check confirmed environment-admin rights; otherwise a note says AWS may refuse. */
+  confirmedAdmin?: boolean;
+  /** Switch to an onboarding bundle for an admin instead. */
+  onBundle?: () => void;
   /** Starts the run; resolves to the command's error, or null once started. */
   onJoin: (ec2: Ec2Choice) => Promise<AwsError | null>;
   onClose: () => void;
@@ -73,6 +80,7 @@ export default function JoinEnvironmentModal({
     >
       <div className="space-y-3 text-xs text-[var(--text-secondary)] leading-snug">
         {!reapply && <p>Joining creates your own task role and file system in {environment}.</p>}
+        {!confirmedAdmin && <p data-testid="join-unconfirmed-note">{UNCONFIRMED_NOTE}</p>}
         {recorded && (
           <p>Stop your EC2 workspaces before removing EC2 capacity or changing your triple-c-user value: that change can't finish while one runs.</p>
         )}
@@ -89,9 +97,21 @@ export default function JoinEnvironmentModal({
           </p>
         )}
         {error && (
-          <p role="alert" className="text-[var(--error)]">
+          <p role="alert" className="text-[var(--error)] break-words">
             {awsErrorMessage(error)}
           </p>
+        )}
+        {onBundle && (
+          <div className="space-y-1.5 pt-1 border-t border-[var(--border-color)]">
+            <p>
+              {error?.kind === "access_denied"
+                ? "AWS refused this with your permissions. An admin can onboard you from a bundle instead."
+                : "Can't onboard yourself? An admin can onboard you from a bundle."}
+            </p>
+            <Button size="sm" wrap onClick={onBundle}>
+              Save an onboarding bundle for an admin…
+            </Button>
+          </div>
         )}
       </div>
     </Modal>

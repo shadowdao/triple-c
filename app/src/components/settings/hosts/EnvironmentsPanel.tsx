@@ -10,7 +10,7 @@ import {
   unlockAwsState,
   updateAwsEnvironment,
 } from "../../../lib/tauri-commands";
-import { awsErrorMessage, toAwsError } from "../../../lib/aws-error";
+import { awsErrorMessage, looksDenied, toAwsError } from "../../../lib/aws-error";
 import { clearEc2CapacityCache } from "../../../lib/ec2Capacity";
 import type {
   AwsError,
@@ -45,6 +45,7 @@ import {
   onboardingStateKey,
   stateLock,
   stateStatus,
+  UNCONFIRMED_NOTE,
 } from "./environmentFormat";
 
 /** A typed confirmation: the action runs only once the environment's name is typed. */
@@ -118,6 +119,7 @@ type Bundle = {
 type JoinOf = {
   region: string;
   name: string;
+  ownerId: string;
   stateKey: string;
   recorded: UserCompute | null;
   reapply: boolean;
@@ -131,6 +133,21 @@ const recordedEc2 = (e: DetectedEnvironment): UserCompute | null =>
 /** A row-level key: the same environment name can exist in every region. */
 const rowKey = (region: string, name: string) => `${region}:${name}`;
 
+/**
+ * A failed deploy or onboarding that AWS refused a permission for: the bundle
+ * for an admin is the way on. Repairs and updates of an existing environment
+ * aren't offered one (an admin bundle deploys a new environment).
+ */
+function deniedRun(r: DeployRun): "environment" | "user_onboard" | null {
+  if (!r.done || !r.result || r.result.ok) return null;
+  const denied =
+    looksDenied(r.result.summary) || r.events.some((e) => e.level === "error" && looksDenied(e.message));
+  if (!denied) return null;
+  if (r.stateKey.startsWith("users/")) return "user_onboard";
+  if (r.stateKey.startsWith("environments/") && r.label.startsWith("Deploy of ")) return "environment";
+  return null;
+}
+
 /** The environment a run's state key belongs to, if any. */
 function runEnvironment(stateKey: string): string | null {
   const m = /^(?:environments|users)\/([^/]+)\//.exec(stateKey);
@@ -139,14 +156,16 @@ function runEnvironment(stateKey: string): string | null {
 
 /**
  * The environments a connection can reach in a region (spec §2): detection,
- * each environment's state and actions, and deploy/join for this caller's tier.
+ * each environment's state and actions, and deploy/join. Deploy and join are
+ * offered to anyone (AWS has the last word and its refusal is shown); an
+ * unconfirmed tier only adds a note and the bundle-for-an-admin alternative.
  */
 export default function EnvironmentsPanel({
   connection,
   tier,
 }: {
   connection: HostConnection;
-  /** The connection's last permission report; absent means unknown, treated as not an admin. */
+  /** The connection's last permission report; absent means unknown (not confirmed as an admin). */
   tier?: PermissionSummary;
 }) {
   const isAdmin = tier === "environment_admin";
@@ -274,30 +293,22 @@ export default function EnvironmentsPanel({
       updateAwsEnvironment(connection.id, runRegion, name, hours),
     );
 
-  // Join (or, once joined, a change of EC2 capacity): admins choose the
-  // capacity and apply it themselves; others get a bundle for an admin.
+  // Join (or, once joined, a change of EC2 capacity): anyone chooses the
+  // capacity and applies it; the modal offers a bundle for an admin instead.
   const join = (found: EnvironmentScan, e: DetectedEnvironment) => {
-    const recorded = recordedEc2(e);
-    if (isAdmin) {
-      setJoinOf({
-        region: found.region,
-        name: e.name,
-        stateKey: onboardingStateKey(e.name, found.owner_key),
-        recorded,
-        reapply: e.onboarding?.state === "joined",
-        incomplete: e.onboarding?.state === "incomplete",
-        lastChoice: lastEc2.current.get(rowKey(found.region, e.name)) ?? null,
-      });
-    } else {
-      setBundle({
-        kind: "user_onboard",
-        region: found.region,
-        environment: e.name,
-        ownerId: found.owner_id,
-        recordedEc2: recorded,
-      });
-    }
+    setJoinOf({
+      region: found.region,
+      name: e.name,
+      ownerId: found.owner_id,
+      stateKey: onboardingStateKey(e.name, found.owner_key),
+      recorded: recordedEc2(e),
+      reapply: e.onboarding?.state === "joined",
+      incomplete: e.onboarding?.state === "incomplete",
+      lastChoice: lastEc2.current.get(rowKey(found.region, e.name)) ?? null,
+    });
   };
+  const onboardBundle = (region: string, environment: string, ownerId: string, recorded: UserCompute | null) =>
+    setBundle({ kind: "user_onboard", region, environment, ownerId, recordedEc2: recorded });
   const runJoin = (j: JoinOf, ec2: Ec2Choice) => {
     const key = rowKey(j.region, j.name);
     if (ec2.kind === "ec2") {
@@ -313,14 +324,40 @@ export default function EnvironmentsPanel({
   const looseRuns = Object.values(runs).filter(
     (r) => r.region !== current?.region || !shown.has(runEnvironment(r.stateKey) ?? ""),
   );
-  const progress = (r: DeployRun) => (
-    <DeployProgress
-      key={runKey(r.region, r.stateKey)}
-      run={r}
-      connectionId={connection.id}
-      onDismiss={() => dismiss(runKey(r.region, r.stateKey))}
-    />
-  );
+  const progress = (r: DeployRun) => {
+    const denied = deniedRun(r);
+    const env = runEnvironment(r.stateKey);
+    const found = current?.region === r.region ? current : null;
+    const target = env && found ? found.environments.find((e) => e.name === env) : undefined;
+    const offer =
+      denied === "environment" ? true : denied === "user_onboard" ? !!(found && target) : false;
+    return (
+      <div key={runKey(r.region, r.stateKey)} className="space-y-1.5 min-w-0">
+        <DeployProgress run={r} connectionId={connection.id} onDismiss={() => dismiss(runKey(r.region, r.stateKey))} />
+        {offer && (
+          <div className="space-y-1.5 text-xs text-[var(--text-secondary)] leading-snug" data-testid="denied-hint">
+            <p className="break-words">
+              AWS refused a permission this run needs (its message is above).{" "}
+              {denied === "environment"
+                ? "An admin can deploy the environment for you from a bundle."
+                : "An admin can onboard you from a bundle."}
+            </p>
+            <Button
+              size="sm"
+              wrap
+              onClick={() =>
+                denied === "environment"
+                  ? setBundle({ kind: "environment", region: r.region })
+                  : found && target && onboardBundle(r.region, target.name, found.owner_id, recordedEc2(target))
+              }
+            >
+              Save a bundle for an admin…
+            </Button>
+          </div>
+        )}
+      </div>
+    );
+  };
 
   const envRow = (found: EnvironmentScan, e: DetectedEnvironment) => {
     const at = found.region;
@@ -349,10 +386,10 @@ export default function EnvironmentsPanel({
         data-testid={`env-${e.name}`}
         className="border border-[var(--border-color)] rounded-[var(--radius-control)] p-2 space-y-1.5"
       >
-        <div className="flex items-start justify-between gap-2 flex-wrap">
-          <div className="min-w-0 space-y-0.5 text-xs">
-            <div className="flex items-center gap-2 flex-wrap">
-              <span className="text-[13px] font-medium text-[var(--text-primary)]">{e.name}</span>
+        <div className="flex items-start justify-between gap-2 flex-wrap" data-testid={`env-row-${e.name}`}>
+          <div className="min-w-0 flex-1 basis-40 space-y-0.5 text-xs break-words">
+            <div className="flex items-center gap-2 flex-wrap min-w-0">
+              <span className="text-[13px] font-medium text-[var(--text-primary)] break-all">{e.name}</span>
               <StatusIndicator tone={status.tone} label={status.label} />
               {onboarding === "joined" && <StatusIndicator tone="ok" label="Joined" />}
               {onboarding === "in_progress" && <StatusIndicator tone="busy" label="Onboarding in progress" />}
@@ -407,11 +444,11 @@ export default function EnvironmentsPanel({
                 })()}
               </div>
             )}
-            {!isAdmin && isWaiting && onboarding !== "joined" && (
+            {isWaiting && onboarding !== "joined" && (
               <div className="text-[var(--text-secondary)]">Waiting for an admin to onboard you</div>
             )}
           </div>
-          <div className="flex gap-1.5 flex-wrap">
+          <div className="flex gap-1.5 flex-wrap min-w-0 max-w-full" data-testid={`env-actions-${e.name}`}>
             {has("join") && onboarding !== "joined" && onboarding !== "in_progress" && (
               <Button
                 size="sm"
@@ -420,17 +457,18 @@ export default function EnvironmentsPanel({
                 aria-label={`Join ${e.name}`}
                 onClick={() => join(found, e)}
               >
-                {!isAdmin && isWaiting ? "Show onboarding bundle" : "Join"}
+                Join
               </Button>
             )}
             {has("join") && onboarding === "joined" && (
               <Button
                 size="sm"
+                wrap
                 disabled={busy || joinBlocked}
                 aria-label={`EC2 capacity in ${e.name}`}
                 onClick={() => join(found, e)}
               >
-                {isAdmin ? "Change EC2 capacity" : "EC2 capacity bundle"}
+                Change EC2 capacity
               </Button>
             )}
             {mine("follow") && (
@@ -548,7 +586,7 @@ export default function EnvironmentsPanel({
           </div>
         </div>
         {rowError && (
-          <p role="alert" className="text-xs text-[var(--error)] leading-snug">
+          <p role="alert" className="text-xs text-[var(--error)] leading-snug break-words">
             {awsErrorMessage(rowError)}
           </p>
         )}
@@ -560,14 +598,14 @@ export default function EnvironmentsPanel({
   const nothingFound = !!current && current.environments.length === 0;
 
   return (
-    <div className="pt-1.5 space-y-2">
+    <div className="pt-1.5 space-y-2 min-w-0">
       <Button size="sm" variant="ghost" aria-expanded={open} onClick={() => setOpen((o) => !o)}>
         <span aria-hidden="true">{open ? "▾" : "▸"}</span>
         Environments
       </Button>
       {open && (
-        <div className="space-y-2 pl-1">
-          <div className="flex items-end gap-2 flex-wrap">
+        <div className="space-y-2 pl-1 min-w-0">
+          <div className="flex items-end gap-2 flex-wrap min-w-0" data-testid="region-row">
             <Field label="Region">
               {(id) => (
                 <select id={id} className={selectClass} value={region} onChange={(e) => setRegion(e.target.value)}>
@@ -589,11 +627,11 @@ export default function EnvironmentsPanel({
             </p>
           )}
           {detectError && (
-            <p role="alert" className="text-xs text-[var(--error)] leading-snug">
+            <p role="alert" className="text-xs text-[var(--error)] leading-snug break-words">
               {awsErrorMessage(detectError)}
             </p>
           )}
-          {current && isAdmin && current.boundary === "no" && (
+          {current && current.boundary === "no" && (
             <p className="text-xs text-[var(--text-secondary)] leading-snug">
               This account has no Triple-C permissions boundary yet; deploying creates it first.
             </p>
@@ -604,31 +642,47 @@ export default function EnvironmentsPanel({
           {nothingFound && (
             <p className="text-xs text-[var(--text-secondary)] leading-snug">
               No Triple-C environment in {current.region}.
-              {!isAdmin &&
-                " Deploying one needs an environment admin: attach the environment-admin policies to an identity, or send an admin a bundle to deploy."}
-              {!tier && " Run Check to find out whether you can deploy one yourself."}
+              {!tier && " Run Check to see what your credentials can do."}
             </p>
           )}
-          {current && isAdmin && (
-            <Button
-              size="md"
-              variant={nothingFound ? "primary" : "secondary"}
-              disabled={stale}
-              onClick={() => setDeployOpen(true)}
-            >
-              Deploy a new environment
-            </Button>
-          )}
-          {nothingFound && !isAdmin && (
-            <div className="space-y-2">
-              <PolicyFiles tier="environment_admin" label="Show the environment-admin policies" onCopy={copy} />
-              <Button size="md" disabled={stale} onClick={() => setBundle({ kind: "environment", region: current.region })}>
-                Request an environment from an admin…
+          {current && (
+            <div className="space-y-1.5 min-w-0" data-testid="deploy-section">
+              <Button
+                size="md"
+                wrap
+                variant={nothingFound ? "primary" : "secondary"}
+                disabled={stale}
+                onClick={() => setDeployOpen(true)}
+              >
+                Deploy a new environment
               </Button>
-              {copyNote && (
-                <p role="status" className="text-xs text-[var(--text-secondary)]">
-                  {copyNote}
+              {!isAdmin && (
+                <p className="text-xs text-[var(--text-secondary)] leading-snug break-words" data-testid="deploy-unconfirmed-note">
+                  {UNCONFIRMED_NOTE}
                 </p>
+              )}
+              {!isAdmin && (
+                <details className="text-xs min-w-0" data-testid="not-admin-options">
+                  <summary className="cursor-pointer text-[var(--text-primary)] break-words">
+                    Not an admin? Ask one to deploy it
+                  </summary>
+                  <div className="mt-1.5 space-y-2 min-w-0">
+                    <Button
+                      size="sm"
+                      wrap
+                      disabled={stale}
+                      onClick={() => setBundle({ kind: "environment", region: current.region })}
+                    >
+                      Request an environment from an admin…
+                    </Button>
+                    <PolicyFiles tier="environment_admin" label="Show the environment-admin policies" onCopy={copy} />
+                    {copyNote && (
+                      <p role="status" className="text-xs text-[var(--text-secondary)] break-words">
+                        {copyNote}
+                      </p>
+                    )}
+                  </div>
+                </details>
               )}
             </div>
           )}
@@ -649,6 +703,12 @@ export default function EnvironmentsPanel({
             repairOf ? repair(current.region, name, network, hours) : deploy(current.region, name, network, hours)
           }
           onDetect={() => void detect()}
+          onBundle={() => {
+            const at = current.region;
+            setDeployOpen(false);
+            setRepairOf(null);
+            setBundle({ kind: "environment", region: at });
+          }}
         />
       )}
       {updateOf && (
@@ -718,6 +778,12 @@ export default function EnvironmentsPanel({
           reapply={joinOf.reapply}
           incomplete={joinOf.incomplete}
           lastChoice={joinOf.lastChoice}
+          confirmedAdmin={isAdmin}
+          onBundle={() => {
+            const j = joinOf;
+            setJoinOf(null);
+            onboardBundle(j.region, j.name, j.ownerId, j.recorded);
+          }}
           onJoin={(ec2) => runJoin(joinOf, ec2)}
           onClose={() => setJoinOf(null)}
         />

@@ -28,6 +28,7 @@ export default function NetworkFields({
       <div className="text-[13px] font-medium text-[var(--text-primary)]">Network</div>
       <SegmentedControl<NetworkChoice["mode"]>
         label="Network"
+        className="flex-wrap max-w-full"
         value={value.mode}
         onChange={(mode) => set({ mode })}
         segments={[

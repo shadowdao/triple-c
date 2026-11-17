@@ -53,6 +53,8 @@ interface Props {
   iconOnly?: boolean;
   className?: string;
   title?: string;
+  /** Let a long label (a failure summary) wrap instead of overflowing its container. */
+  wrap?: boolean;
 }
 
 export default function StatusIndicator({
@@ -61,11 +63,12 @@ export default function StatusIndicator({
   iconOnly = false,
   className = "",
   title,
+  wrap = false,
 }: Props) {
   const style = TONES[tone];
   return (
     <span
-      className={`inline-flex items-center gap-1 whitespace-nowrap ${className}`}
+      className={`inline-flex gap-1 ${wrap ? "items-baseline whitespace-normal break-words min-w-0 max-w-full" : "items-center whitespace-nowrap"} ${className}`}
       title={title ?? label}
     >
       <span

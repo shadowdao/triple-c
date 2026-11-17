@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { act, renderHook } from "@testing-library/react";
-import { runKey, useDeployRuns } from "./DeployProgress";
+import { act, render, renderHook, screen } from "@testing-library/react";
+import DeployProgressView, { runKey, useDeployRuns } from "./DeployProgress";
 import type { DeployProgress } from "../../../lib/types";
 import { progress, tofuEvent } from "./testkit";
 
@@ -73,5 +73,29 @@ describe("useDeployRuns", () => {
     expect(err).toEqual({ kind: "other", message: "A deployment is already running" });
     expect(handlers.size).toBe(0);
     expect(result.current.runs).toEqual({});
+  });
+});
+
+describe("DeployProgress layout", () => {
+  it("wraps its header and a long failure summary", () => {
+    render(
+      <DeployProgressView
+        connectionId="h1"
+        run={{
+          stateKey: KEY,
+          region: "eu-west-1",
+          label: "Deploy of main",
+          opId: "x",
+          events: [],
+          done: true,
+          cancellable: false,
+          result: { ok: false, exit_code: 1, summary: "a very long summary ".repeat(10) },
+        }}
+      />,
+    );
+    const header = screen.getByTestId("deploy-progress-header");
+    expect(header.className).toContain("flex-wrap");
+    expect(header.firstElementChild?.className).toContain("min-w-0");
+    expect(screen.getByRole("status").firstElementChild?.className).toContain("whitespace-normal");
   });
 });

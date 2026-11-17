@@ -177,7 +177,7 @@ export default function AdminBundleModal({
               Saved to <code className="font-mono text-[var(--text-primary)] break-all">{saved}</code>
             </p>
             <p>From that folder, run:</p>
-            <pre className="font-mono text-[var(--text-primary)] bg-[var(--bg-primary)] border border-[var(--border-color)] rounded-[var(--radius-control)] p-2 whitespace-pre-wrap">
+            <pre className="font-mono text-[var(--text-primary)] bg-[var(--bg-primary)] border border-[var(--border-color)] rounded-[var(--radius-control)] p-2 whitespace-pre-wrap break-all max-w-full overflow-x-auto">
               {COMMANDS}
             </pre>
             <Button size="sm" onClick={copy}>
