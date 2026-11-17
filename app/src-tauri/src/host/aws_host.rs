@@ -374,6 +374,25 @@ fn refusal_message(e: &str) -> String {
     }
 }
 
+/// The edge image: what `main` builds, ahead of `:latest` between releases.
+const EDGE_IMAGE: &str = "ghcr.io/shadowdao/triple-c-sandbox:edge";
+
+/// What the user is told when the agent never answers through the tunnel.
+/// The usual cause is an image whose entrypoint predates AWS mode and never
+/// starts the agent: the registry's `:latest` moves only on a release.
+/// `image` is the one the task ran, when the caller knows it.
+fn agent_silent_message(image: Option<&str>) -> String {
+    let which = match image {
+        Some(i) => format!("The image \"{}\"", i.escape_debug()),
+        None => "The workspace's image".to_string(),
+    };
+    format!(
+        "The workspace's agent did not answer through the tunnel. {which} may be older than this \
+         app's AWS support: the registry's :latest moves only when a release is cut. Until then, \
+         set Settings → Docker → Custom image to {EDGE_IMAGE}, then start the project again."
+    )
+}
+
 /// Wait for the agent behind `ep` to answer. A refusal (wrong token) is
 /// final; silence is retried until [`HEALTH_TIMEOUT`].
 async fn wait_healthy(ep: &AgentEndpoint) -> Result<(), String> {
@@ -385,11 +404,7 @@ async fn wait_healthy(ep: &AgentEndpoint) -> Result<(), String> {
             Err(e) => return Err(refusal_message(&e)),
         }
         if tokio::time::Instant::now() + HEALTH_INTERVAL > deadline {
-            return Err(
-                "The workspace's agent did not answer through the tunnel. Check that the image \
-                 includes triple-c-agent, then start the project again."
-                    .into(),
-            );
+            return Err(agent_silent_message(None));
         }
         tokio::time::sleep(HEALTH_INTERVAL).await;
     }
@@ -967,7 +982,8 @@ pub async fn start_core<T: TaskApi, W: WorkspaceApi, R: RuntimeApi, C: Connector
             if created && stop_created(tasks, &task_cluster(&env, &task.arn), &task.arn).await {
                 (inp.on_task)(None);
             }
-            Err(e)
+            // Name the image this start ran (the connector doesn't know it).
+            Err(if e == agent_silent_message(None) { agent_silent_message(Some(inp.image)) } else { e })
         }
     }
 }
@@ -1621,7 +1637,7 @@ pub async fn reconcile(
     settings: &AppSettings,
     store: Arc<ProjectsStore>,
     on_connect_warning: impl FnOnce(String) + Send + 'static,
-    on_ports_warning: impl FnOnce(String) + Send + 'static,
+    on_ports_warning: impl Fn(String) + Send + Sync + 'static,
     on_interrupted_warning: impl FnOnce(String) + Send + 'static,
 ) {
     let (connection_id, region, sdk) = match project_sdk(project, settings).await {
@@ -1652,8 +1668,11 @@ pub async fn reconcile(
                     Ok(true) => {
                         // Q6: the port mappings' forwards, before the
                         // (slower) credential copy.
-                        if let Some(detail) = super::port_forwards::open_for_project(&store, &project.id).await {
-                            on_ports_warning(detail);
+                        let warn: super::port_forwards::PortsWarn = Arc::new(on_ports_warning);
+                        if let Some(detail) =
+                            super::port_forwards::open_for_project(&store, &project.id, Some(warn.clone())).await
+                        {
+                            warn(detail);
                         }
                         if let Err(e) = connect::apply_connect(&project, &settings).await {
                             log::warn!("Project {}: could not copy the credentials in: {e}", project.id);

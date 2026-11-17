@@ -54,6 +54,8 @@
 //! ([`IDLE_TIMEOUT`]).
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::host::{AttachedExec, ContainerTarget, ExecChunk};
@@ -158,19 +160,25 @@ impl PortForward {
         container_port: u16,
         family: PortFamily,
     ) -> Result<Self, std::io::Error> {
-        Self::bind_with(container, host_port, container_port, family, Gate::SignInCallback).await
+        Self::bind_with(container, host_port, container_port, family, Gate::SignInCallback, None).await
     }
 
     /// As [`bind`](Self::bind), for a project's port mapping on a host with
     /// no Docker port publishing (AWS): every connection is carried as is
     /// (see [`Gate::None`]).
+    ///
+    /// Inside the workspace each connection goes to whichever loopback
+    /// family has a listener on `container_port` ([`mapping_command`]), so a
+    /// server bound to `[::1]` only is reached as well as one on
+    /// `127.0.0.1`/`0.0.0.0`. `on_refused` is called (once per forward) the
+    /// first time a connection finds nothing listening there.
     pub async fn bind_mapping(
         container: ContainerTarget,
         host_port: u16,
         container_port: u16,
-        family: PortFamily,
+        on_refused: Option<RefusedNotice>,
     ) -> Result<Self, std::io::Error> {
-        Self::bind_with(container, host_port, container_port, family, Gate::None).await
+        Self::bind_with(container, host_port, container_port, PortFamily::Dual, Gate::None, on_refused).await
     }
 
     async fn bind_with(
@@ -179,6 +187,7 @@ impl PortForward {
         container_port: u16,
         family: PortFamily,
         gate: Gate,
+        on_refused: Option<RefusedNotice>,
     ) -> Result<Self, std::io::Error> {
         // SECURITY BOUNDARY: the host side binds loopback ONLY — 127.0.0.1 and
         // ::1, never 0.0.0.0 / ::. Everything reachable through this socket is
@@ -222,8 +231,12 @@ impl PortForward {
                 }
             };
 
-        let target = family.socat_target(container_port);
-        let task = tokio::spawn(accept_loop(container, port, target, v4, v6, gate));
+        let cmd = match gate {
+            Gate::SignInCallback => socat_command(&family.socat_target(container_port)),
+            Gate::None => mapping_command(container_port),
+        };
+        let refused = on_refused.map(|f| Arc::new(RefusedOnce { notice: f, fired: AtomicBool::new(false) }));
+        let task = tokio::spawn(accept_loop(container, port, cmd, v4, v6, gate, refused));
 
         Ok(Self {
             port,
@@ -273,10 +286,11 @@ impl Gate {
 async fn accept_loop(
     container: ContainerTarget,
     port: u16,
-    target: String,
+    cmd: Vec<String>,
     v4: TcpListener,
     v6: Option<TcpListener>,
     gate: Gate,
+    refused: Option<Arc<RefusedOnce>>,
 ) {
     let mut conns: JoinSet<()> = JoinSet::new();
 
@@ -313,17 +327,18 @@ async fn accept_loop(
                 match gate {
                     Gate::SignInCallback => conns.spawn(tunnel_connection(
                         container.clone(),
-                        target.clone(),
+                        cmd.clone(),
                         stream,
                         port,
                     )),
                     Gate::None => conns.spawn(tunnel_labelled(
                         gate.label(),
                         container.clone(),
-                        target.clone(),
+                        cmd.clone(),
                         stream,
                         port,
                         Vec::new(),
+                        refused.clone(),
                     )),
                 };
             }
@@ -353,7 +368,7 @@ async fn accept_optional(
 /// reaches the container at all — not even a `docker exec`.
 async fn tunnel_connection(
     container: ContainerTarget,
-    target: String,
+    cmd: Vec<String>,
     mut stream: TcpStream,
     port: u16,
 ) {
@@ -387,7 +402,7 @@ async fn tunnel_connection(
     }
 
     // The bytes already off the socket go back on the wire first, byte-exact.
-    tunnel_connection_with_prelude(container, target, stream, port, head.into_buffer()).await
+    tunnel_labelled("Auth bridge", container, cmd, stream, port, head.into_buffer(), None).await
 }
 
 /// What the first bytes of an accepted connection turned out to be.
@@ -586,19 +601,20 @@ pub async fn tunnel_connection_with_prelude(
     port: u16,
     prelude: Vec<u8>,
 ) {
-    tunnel_labelled("Auth bridge", container, target, stream, port, prelude).await
+    tunnel_labelled("Auth bridge", container, socat_command(&target), stream, port, prelude, None).await
 }
 
 /// [`tunnel_connection_with_prelude`], logging under `label`.
 async fn tunnel_labelled(
     label: &'static str,
     container: ContainerTarget,
-    target: String,
+    cmd: Vec<String>,
     stream: TcpStream,
     port: u16,
     prelude: Vec<u8>,
+    refused: Option<Arc<RefusedOnce>>,
 ) {
-    let cmd = vec!["socat".to_string(), "-".to_string(), target.clone()];
+    let target = cmd.last().cloned().unwrap_or_default();
 
     let AttachedExec {
         mut output,
@@ -673,6 +689,12 @@ async fn tunnel_labelled(
                 }
             }
             Ok(ExecChunk::StdErr(message)) => {
+                if let Some(r) = &refused {
+                    if is_connection_refused(&message) {
+                        log::warn!("{}: host port {}: nothing is listening in the workspace", label, port);
+                        r.fire();
+                    }
+                }
                 log::debug!(
                     "{}: socat stderr for port {}: {}", label,
                     port,
@@ -692,9 +714,112 @@ async fn tunnel_labelled(
     drop(upstream);
 }
 
+/// Called the first time a port mapping's connection finds nothing
+/// listening on its workspace port.
+pub type RefusedNotice = Arc<dyn Fn() + Send + Sync>;
+
+/// A [`RefusedNotice`] that fires once per forward.
+struct RefusedOnce {
+    notice: RefusedNotice,
+    fired: AtomicBool,
+}
+
+impl RefusedOnce {
+    fn fire(&self) {
+        if !self.fired.swap(true, Ordering::SeqCst) {
+            (self.notice)();
+        }
+    }
+}
+
+/// `socat` relaying stdio to `target`.
+fn socat_command(target: &str) -> Vec<String> {
+    vec!["socat".to_string(), "-".to_string(), target.to_string()]
+}
+
+/// Whether socat's stderr says the connect was refused (nothing listening).
+fn is_connection_refused(stderr: &[u8]) -> bool {
+    String::from_utf8_lossy(stderr).contains("Connection refused")
+}
+
+/// The in-workspace command of one port-mapping connection.
+///
+/// Docker publishes to the container's interface; a mapping reaches its
+/// loopback instead, where a server may listen on either family (Vite, or
+/// Node's `localhost` where it resolves to `::1`, listen on `[::1]` only).
+/// So the command picks, from `/proc/net/tcp{,6}` (the image has no `ss`),
+/// the family with a listener on `port`: `127.0.0.1` when one listens on
+/// `127.0.0.1` or `0.0.0.0`, else `[::1]` when one listens on `::1` or `::`.
+/// Nothing found: `127.0.0.1` anyway, and socat's "Connection refused" is
+/// what tells the host nothing listens. Reading `/proc` rather than trying
+/// a connect first means a server never sees a probe connection.
+pub(crate) fn mapping_command(port: u16) -> Vec<String> {
+    // `port` is a u16: interpolating it into the script is safe.
+    let script = format!(
+        "h=$(printf ':%04X' {port}); \
+         l() {{ awk -v a=\"$2$h\" -v b=\"$3$h\" '$4==\"0A\" && ($2==a || $2==b) {{f=1}} END {{exit !f}}' \"$1\" 2>/dev/null; }}; \
+         if l /proc/net/tcp 0100007F 00000000; then exec socat - TCP:127.0.0.1:{port}; fi; \
+         if l /proc/net/tcp6 00000000000000000000000001000000 00000000000000000000000000000000; \
+         then exec socat - TCP6:[::1]:{port}; fi; \
+         exec socat - TCP:127.0.0.1:{port}"
+    );
+    vec!["sh".to_string(), "-c".to_string(), script]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mapping_command_names_only_its_port_and_both_loopbacks() {
+        let cmd = mapping_command(8080);
+        assert_eq!(&cmd[..2], ["sh", "-c"]);
+        let s = &cmd[2];
+        assert!(s.contains("printf ':%04X' 8080"), "{s}");
+        assert!(s.contains("TCP:127.0.0.1:8080") && s.contains("TCP6:[::1]:8080"), "{s}");
+        // v4 first; the last resort is v4 too.
+        assert!(s.find("TCP:127.0.0.1").unwrap() < s.find("TCP6:[::1]").unwrap());
+        assert!(s.trim_end().ends_with("exec socat - TCP:127.0.0.1:8080"), "{s}");
+    }
+
+    #[test]
+    fn socats_refusal_is_recognised() {
+        assert!(is_connection_refused(
+            b"2026/11/17 10:00:00 socat[42] E connect(5, AF=2 127.0.0.1:8080, 16): Connection refused\n"
+        ));
+        assert!(!is_connection_refused(b"socat[42] N exiting with status 0"));
+    }
+
+    /// The command picks the family from `/proc/net/tcp{,6}`: run it against
+    /// real listeners where `sh`, `awk` and `socat` exist (skipped elsewhere).
+    #[tokio::test]
+    async fn a_mapping_command_reaches_a_v4_or_a_v6_only_listener() {
+        let have = |b: &str| std::process::Command::new("sh").args(["-c", &format!("command -v {b}")]).output()
+            .is_ok_and(|o| o.status.success());
+        if !(have("awk") && have("socat") && std::path::Path::new("/proc/net/tcp").exists()) {
+            eprintln!("skipped: needs sh, awk, socat and /proc/net");
+            return;
+        }
+        for addr in ["127.0.0.1:0", "[::1]:0"] {
+            let Ok(l) = TcpListener::bind(addr).await else { continue };
+            let port = l.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                if let Ok((mut s, _)) = l.accept().await {
+                    let _ = s.write_all(b"hello").await;
+                }
+            });
+            let cmd = mapping_command(port);
+            let out = tokio::process::Command::new(&cmd[0]).args(&cmd[1..])
+                .stdin(std::process::Stdio::null()).output().await.unwrap();
+            assert_eq!(String::from_utf8_lossy(&out.stdout), "hello", "{addr}: {}", String::from_utf8_lossy(&out.stderr));
+        }
+        // Nothing listening: refused, in socat's words.
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let cmd = mapping_command(port);
+        let out = tokio::process::Command::new(&cmd[0]).args(&cmd[1..])
+            .stdin(std::process::Stdio::null()).output().await.unwrap();
+        assert!(is_connection_refused(&out.stderr), "{}", String::from_utf8_lossy(&out.stderr));
+    }
 
     fn head(lines: &[&str]) -> String {
         format!("{}\r\n\r\n", lines.join("\r\n"))

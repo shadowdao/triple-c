@@ -310,7 +310,11 @@ docker exec stdout → tokio task → emit("terminal-output-{sessionId}") → li
   that would be refused is skipped with a warning at connect. Opens are serialised per project and
   re-read the stored mappings under that lock; unchanged forwards are kept with their connections.
   Opened after every connect and on a save while connected; closed by every `tunnels::close*`
-  path. A failing mapping is a `workspace-warning` (`topic: "ports"`). An idle listener makes no
+  path. A failing mapping is a `workspace-warning` (`topic: "ports"`), and so is a Running project
+  whose mappings could not be opened at all (no tunnel / tunnel replaced) — never silent. In the
+  workspace each connection picks `127.0.0.1` or `[::1]` from `/proc/net/tcp{,6}`
+  (`tunnel::mapping_command`; no probe connection), and the first socat "Connection refused" per
+  mapping is a `ports` warning ("nothing is listening on port N"). An idle listener makes no
   agent request; a connection carrying traffic is activity (keeps the workspace from idling).
   `agent.rs` reuses `docker/exec.rs`'s `OneshotOutput`, host-file reader and uid probe so the two
   variants cannot drift; an `Agent` target's token never appears in `Debug` or error text.
