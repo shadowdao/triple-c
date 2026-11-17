@@ -338,10 +338,11 @@ pub(crate) fn resolve_ec2(
 /// R3 (amended): an apply with EC2 capacity would adopt (or fail on) a
 /// per-user cluster or Auto Scaling group named `stem` that already exists.
 /// Each one found must be the caller's: its `triple-c:owner` tag (the
-/// module's default tags) is `owner_id`, or, failing that, the caller's
-/// record names the cluster. A half-built capacity of the caller's own (a
-/// failed apply that wrote no record yet) is therefore re-applied; one
-/// owned by someone else, or untagged, is refused.
+/// module's default tags) is `owner_id`, or, for an untagged one only, the
+/// caller's record names the cluster. A half-built capacity of the caller's
+/// own (a failed apply that wrote no record yet) is therefore re-applied;
+/// one tagged as someone else's is always refused (a record can't vouch for
+/// it), and an untagged one is refused unless the record names it.
 pub(crate) fn ec2_collision_refusal(
     stem: &str,
     holders: &[NameHolder],
@@ -351,8 +352,10 @@ pub(crate) fn ec2_collision_refusal(
     let suffix = format!(":cluster/{stem}");
     let recorded_here = recorded.is_some_and(|r| r.cluster_arn.ends_with(&suffix));
     for h in holders {
-        if h.owner.as_deref() == Some(owner_id) || recorded_here {
-            continue;
+        match h.owner.as_deref() {
+            Some(o) if o == owner_id => continue,
+            None if recorded_here => continue,
+            _ => {}
         }
         let whose = if h.owner.is_some() {
             "belongs to another onboarding"

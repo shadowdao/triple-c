@@ -752,10 +752,13 @@ fn ec2_names_held_by_another_owner_are_refused() {
     assert!(e.contains("triple-c-user"), "{e}");
     let e = ec2_collision_refusal(stem, &[cluster(Some(me)), group(None)], me, None).unwrap_err();
     assert!(e.contains("Auto Scaling group") && e.contains("isn't tagged"), "{e}");
-    // The record naming the cluster is the fallback for an untagged or
-    // differently tagged one.
+    // The record naming the cluster is the fallback for an untagged one
+    // only: one tagged as someone else's is refused even then.
     let mine = recorded("dev", "alice", 2);
-    assert!(ec2_collision_refusal(stem, &[cluster(None), group(Some("x"))], me, Some(&mine)).is_ok());
+    assert!(ec2_collision_refusal(stem, &[cluster(None), group(None)], me, Some(&mine)).is_ok());
+    assert!(ec2_collision_refusal(stem, &[cluster(None), group(Some(me))], me, Some(&mine)).is_ok());
+    let e = ec2_collision_refusal(stem, &[cluster(None), group(Some("x"))], me, Some(&mine)).unwrap_err();
+    assert!(e.contains("Auto Scaling group") && e.contains("another onboarding"), "{e}");
     // A record naming another cluster doesn't help.
     assert!(ec2_collision_refusal(stem, &[cluster(None)], me, Some(&recorded("dev", "bob", 1))).is_err());
     // A cluster that merely ends in the same text is not the same cluster.
